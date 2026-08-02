@@ -1,9 +1,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
-    io::{Cursor, Read},
+    io::{Cursor, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, mpsc as std_mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -119,7 +119,7 @@ struct Args {
     #[arg(long, default_value_t = DEFAULT_SHARD_UNCOMPRESSED_BYTES)]
     shard_uncompressed_bytes: usize,
 
-    /// Maximum parallelism for shard compression and writes.
+    /// Maximum parallelism for archive parsing, shard compression, and writes.
     #[arg(long, default_value_t = 4)]
     concurrency: usize,
 
@@ -284,6 +284,91 @@ struct PreparedRecordJobs {
     source_record_id: String,
     jobs: Vec<RecordJob>,
     has_unscoped: bool,
+}
+
+enum ArchiveEntryOutcome {
+    Ignored,
+    Oversized,
+    Malformed {
+        decompressed_json_bytes: u64,
+    },
+    Prepared {
+        decompressed_json_bytes: u64,
+        records: PreparedRecordJobs,
+    },
+}
+
+struct TimedArchiveEntry {
+    outcome: ArchiveEntryOutcome,
+    inflate_read: Duration,
+    json_prepare: Duration,
+}
+
+struct IndexedArchiveEntry {
+    index: usize,
+    result: Result<TimedArchiveEntry>,
+}
+
+#[derive(Debug, Default)]
+struct ArchiveWorkerTimings {
+    inflate_read: Duration,
+    json_prepare: Duration,
+}
+
+/// A clone gets an independent file cursor without reparsing ZIP metadata.
+/// Opening is lazy so a corpus that disappears after pinning remains an I/O
+/// error rather than making `Clone` panic.
+#[derive(Debug)]
+struct ReopenableFile {
+    path: Arc<PathBuf>,
+    file: Option<File>,
+    position: u64,
+}
+
+impl ReopenableFile {
+    fn open(path: PathBuf) -> std::io::Result<Self> {
+        let file = File::open(&path)?;
+        Ok(Self {
+            path: Arc::new(path),
+            file: Some(file),
+            position: 0,
+        })
+    }
+
+    fn file(&mut self) -> std::io::Result<&mut File> {
+        if self.file.is_none() {
+            let mut file = File::open(self.path.as_ref())?;
+            file.seek(SeekFrom::Start(self.position))?;
+            self.file = Some(file);
+        }
+        Ok(self.file.as_mut().expect("the file was opened above"))
+    }
+}
+
+impl Clone for ReopenableFile {
+    fn clone(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            file: None,
+            position: self.position,
+        }
+    }
+}
+
+impl Read for ReopenableFile {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.file()?.read(buffer)?;
+        self.position = self.position.saturating_add(read as u64);
+        Ok(read)
+    }
+}
+
+impl Seek for ReopenableFile {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        let position = self.file()?.seek(position)?;
+        self.position = position;
+        Ok(position)
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1350,7 +1435,7 @@ fn parse_archive(
     compression_workers: usize,
     sender: mpsc::Sender<PreparedShard>,
 ) -> Result<ParsingReport> {
-    let mut archive = zip::ZipArchive::new(File::open(path)?)?;
+    let archive = zip::ZipArchive::new(ReopenableFile::open(path)?)?;
     ensure!(
         archive.len() <= MAX_ARCHIVE_ENTRIES,
         "OSV archive has {} entries, exceeding the {MAX_ARCHIVE_ENTRIES} entry bound",
@@ -1365,82 +1450,81 @@ fn parse_archive(
     let mut compressor = ShardCompressor::start(compression_workers, sender)?;
 
     let parsing = (|| -> Result<ParsingReport> {
-        for index in 0..archive.len() {
-            let mut entry = archive.by_index(index)?;
-            if entry.is_dir() || !entry.name().ends_with(".json") {
-                continue;
-            }
-            report.json_documents += 1;
-            if report
-                .json_documents
-                .is_multiple_of(PARSE_PROGRESS_INTERVAL)
-            {
-                eprintln!(
-                    "event=osv_parse_progress json_documents={}",
-                    report.json_documents
-                );
-            }
-            if entry.size() > MAX_DOCUMENT_BYTES {
-                report.oversized_documents += 1;
-                continue;
-            }
-            let mut bytes = Vec::with_capacity(entry.size() as usize);
-            entry
-                .by_ref()
-                .take(MAX_DOCUMENT_BYTES + 1)
-                .read_to_end(&mut bytes)?;
-            if bytes.len() as u64 > MAX_DOCUMENT_BYTES {
-                report.oversized_documents += 1;
-                continue;
-            }
-            report.decompressed_json_bytes = report
-                .decompressed_json_bytes
-                .checked_add(bytes.len() as u64)
-                .context("OSV decompressed JSON byte count overflowed")?;
-            ensure!(
-                report.decompressed_json_bytes <= MAX_DECOMPRESSED_JSON_BYTES,
-                "OSV decompressed JSON exceeds the {MAX_DECOMPRESSED_JSON_BYTES} byte bound"
-            );
-            let document = match serde_json::from_slice::<Value>(&bytes) {
-                Ok(document) => document,
-                Err(_) => {
-                    report.malformed_documents += 1;
-                    continue;
+        let mut main_record_encode_shard_push = Duration::ZERO;
+        let worker_timings = consume_archive_entries_in_order(
+            archive,
+            compression_workers,
+            MAX_DOCUMENT_BYTES,
+            |_, outcome| {
+                if matches!(outcome, ArchiveEntryOutcome::Ignored) {
+                    return Ok(());
                 }
-            };
-            let prepared = match prepare_record_jobs(document) {
-                Ok(prepared) => prepared,
-                Err(_) => {
-                    report.malformed_documents += 1;
-                    continue;
+                report.json_documents += 1;
+                if report
+                    .json_documents
+                    .is_multiple_of(PARSE_PROGRESS_INTERVAL)
+                {
+                    eprintln!(
+                        "event=osv_parse_progress json_documents={}",
+                        report.json_documents
+                    );
                 }
-            };
-            let PreparedRecordJobs {
-                document,
-                source_record_id,
-                jobs,
-                has_unscoped,
-            } = prepared;
-            if has_unscoped {
-                report.unscoped_documents += 1;
-            }
-            for job in jobs {
-                let record = prepare_record(&document, &source_record_id, &job)
-                    .context("prepare OSV source record")?;
-                push_record_into_shards(
-                    record,
-                    target_bytes,
-                    &mut compressor,
-                    &mut builders,
-                    &mut next_indices,
-                )?;
-                report.normalised_source_records += 1;
-            }
-            report.accepted_source_documents += 1;
-        }
+                match outcome {
+                    ArchiveEntryOutcome::Ignored => unreachable!("ignored entries returned above"),
+                    ArchiveEntryOutcome::Oversized => {
+                        report.oversized_documents += 1;
+                    }
+                    ArchiveEntryOutcome::Malformed {
+                        decompressed_json_bytes,
+                    } => {
+                        add_decompressed_json_bytes(&mut report, decompressed_json_bytes)?;
+                        report.malformed_documents += 1;
+                    }
+                    ArchiveEntryOutcome::Prepared {
+                        decompressed_json_bytes,
+                        records,
+                    } => {
+                        add_decompressed_json_bytes(&mut report, decompressed_json_bytes)?;
+                        let PreparedRecordJobs {
+                            document,
+                            source_record_id,
+                            jobs,
+                            has_unscoped,
+                        } = records;
+                        if has_unscoped {
+                            report.unscoped_documents += 1;
+                        }
+                        let record_started = Instant::now();
+                        for job in jobs {
+                            let record = prepare_record(&document, &source_record_id, &job)
+                                .context("prepare OSV source record")?;
+                            push_record_into_shards(
+                                record,
+                                target_bytes,
+                                &mut compressor,
+                                &mut builders,
+                                &mut next_indices,
+                            )?;
+                            report.normalised_source_records += 1;
+                        }
+                        main_record_encode_shard_push += record_started.elapsed();
+                        report.accepted_source_documents += 1;
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        let final_push_started = Instant::now();
         for builder in builders.into_values() {
             compressor.submit(builder)?;
         }
+        main_record_encode_shard_push += final_push_started.elapsed();
+        eprintln!(
+            "event=osv_parse_phase_times worker_inflate_read_sum_seconds={:.3} worker_json_prepare_sum_seconds={:.3} main_record_encode_shard_push_seconds={:.3}",
+            worker_timings.inflate_read.as_secs_f64(),
+            worker_timings.json_prepare.as_secs_f64(),
+            main_record_encode_shard_push.as_secs_f64(),
+        );
         Ok(report)
     })();
     let compression = compressor.finish();
@@ -1451,6 +1535,188 @@ fn parse_archive(
             "OSV shard compression also failed: {compression_error:#}"
         ))),
     }
+}
+
+fn add_decompressed_json_bytes(report: &mut ParsingReport, additional: u64) -> Result<()> {
+    report.decompressed_json_bytes = report
+        .decompressed_json_bytes
+        .checked_add(additional)
+        .context("OSV decompressed JSON byte count overflowed")?;
+    ensure!(
+        report.decompressed_json_bytes <= MAX_DECOMPRESSED_JSON_BYTES,
+        "OSV decompressed JSON exceeds the {MAX_DECOMPRESSED_JSON_BYTES} byte bound"
+    );
+    Ok(())
+}
+
+fn consume_archive_entries_in_order<R, F>(
+    archive: zip::ZipArchive<R>,
+    requested_workers: usize,
+    maximum_document_bytes: u64,
+    mut consume: F,
+) -> Result<ArchiveWorkerTimings>
+where
+    R: Read + Seek + Clone + Send + 'static,
+    F: FnMut(usize, ArchiveEntryOutcome) -> Result<()>,
+{
+    ensure!(
+        requested_workers > 0,
+        "OSV archive parsing requires at least one worker"
+    );
+    let entry_count = archive.len();
+    if entry_count == 0 {
+        return Ok(ArchiveWorkerTimings::default());
+    }
+    let worker_count = requested_workers.min(entry_count);
+    let mut receivers = Vec::with_capacity(worker_count);
+    let mut workers = Vec::with_capacity(worker_count);
+    for worker_index in 0..worker_count {
+        let worker_archive = archive.clone();
+        let (sender, receiver) = std_mpsc::sync_channel(1);
+        let worker = match thread::Builder::new()
+            .name(format!("osv-archive-reader-{worker_index}"))
+            .spawn(move || {
+                archive_worker(
+                    worker_archive,
+                    worker_index,
+                    worker_count,
+                    maximum_document_bytes,
+                    sender,
+                )
+            }) {
+            Ok(worker) => worker,
+            Err(error) => {
+                drop(receiver);
+                drop(receivers);
+                let joining = join_archive_workers(workers);
+                return match joining {
+                    Ok(()) => Err(error).context("start OSV archive reader"),
+                    Err(join_error) => Err(join_error.context(format!(
+                        "starting an OSV archive reader also failed: {error}"
+                    ))),
+                };
+            }
+        };
+        receivers.push(receiver);
+        workers.push(worker);
+    }
+
+    let consuming = (|| -> Result<ArchiveWorkerTimings> {
+        let mut timings = ArchiveWorkerTimings::default();
+        for expected_index in 0..entry_count {
+            let worker_index = expected_index % worker_count;
+            let entry = receivers[worker_index].recv().with_context(|| {
+                format!("OSV archive reader {worker_index} stopped before entry {expected_index}")
+            })?;
+            ensure!(
+                entry.index == expected_index,
+                "OSV archive reader {worker_index} returned entry {}, expected {expected_index}",
+                entry.index
+            );
+            let entry = entry.result?;
+            timings.inflate_read += entry.inflate_read;
+            timings.json_prepare += entry.json_prepare;
+            consume(expected_index, entry.outcome)?;
+        }
+        Ok(timings)
+    })();
+    // A failed consumer must wake any worker blocked on its capacity-one
+    // result channel before we join it.
+    drop(receivers);
+    let joining = join_archive_workers(workers);
+    match (consuming, joining) {
+        (Ok(timings), Ok(())) => Ok(timings),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(worker_error)) => {
+            Err(error.context(format!("OSV archive worker also failed: {worker_error:#}")))
+        }
+    }
+}
+
+fn archive_worker<R: Read + Seek>(
+    mut archive: zip::ZipArchive<R>,
+    worker_index: usize,
+    worker_count: usize,
+    maximum_document_bytes: u64,
+    sender: std_mpsc::SyncSender<IndexedArchiveEntry>,
+) {
+    for index in (worker_index..archive.len()).step_by(worker_count) {
+        let result = read_archive_entry(&mut archive, index, maximum_document_bytes);
+        let failed = result.is_err();
+        if sender.send(IndexedArchiveEntry { index, result }).is_err() || failed {
+            return;
+        }
+    }
+}
+
+fn join_archive_workers(workers: Vec<thread::JoinHandle<()>>) -> Result<()> {
+    let mut first_panic = None;
+    for worker in workers {
+        if worker.join().is_err() && first_panic.is_none() {
+            first_panic = Some(anyhow::anyhow!("OSV archive reader panicked"));
+        }
+    }
+    match first_panic {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+fn read_archive_entry<R: Read + Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    index: usize,
+    maximum_document_bytes: u64,
+) -> Result<TimedArchiveEntry> {
+    let inflate_started = Instant::now();
+    let mut entry = archive.by_index(index)?;
+    if entry.is_dir() || !entry.name().ends_with(".json") {
+        return Ok(TimedArchiveEntry {
+            outcome: ArchiveEntryOutcome::Ignored,
+            inflate_read: inflate_started.elapsed(),
+            json_prepare: Duration::ZERO,
+        });
+    }
+    if entry.size() > maximum_document_bytes {
+        return Ok(TimedArchiveEntry {
+            outcome: ArchiveEntryOutcome::Oversized,
+            inflate_read: inflate_started.elapsed(),
+            json_prepare: Duration::ZERO,
+        });
+    }
+    let mut bytes = Vec::with_capacity(entry.size() as usize);
+    entry
+        .by_ref()
+        .take(maximum_document_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    let inflate_read = inflate_started.elapsed();
+    if bytes.len() as u64 > maximum_document_bytes {
+        return Ok(TimedArchiveEntry {
+            outcome: ArchiveEntryOutcome::Oversized,
+            inflate_read,
+            json_prepare: Duration::ZERO,
+        });
+    }
+
+    let decompressed_json_bytes = bytes.len() as u64;
+    let json_started = Instant::now();
+    let outcome = match serde_json::from_slice::<Value>(&bytes)
+        .ok()
+        .and_then(|document| prepare_record_jobs(document).ok())
+    {
+        Some(records) => ArchiveEntryOutcome::Prepared {
+            decompressed_json_bytes,
+            records,
+        },
+        None => ArchiveEntryOutcome::Malformed {
+            decompressed_json_bytes,
+        },
+    };
+    Ok(TimedArchiveEntry {
+        outcome,
+        inflate_read,
+        json_prepare: json_started.elapsed(),
+    })
 }
 
 fn push_record_into_shards(
@@ -1878,6 +2144,152 @@ fn emit_report(report: &QualificationReport<'_>, output: Option<&Path>) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        io::Write as _,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    fn test_archive(entries: &[(&str, &[u8])]) -> zip::ZipArchive<Cursor<Vec<u8>>> {
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (name, bytes) in entries {
+            writer.start_file(*name, options).unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        let mut bytes = writer.finish().unwrap();
+        bytes.set_position(0);
+        zip::ZipArchive::new(bytes).unwrap()
+    }
+
+    #[derive(Debug)]
+    struct PanicOnFirstCloneRead {
+        bytes: Cursor<Vec<u8>>,
+        clone_count: Arc<AtomicUsize>,
+        panic_on_read: bool,
+    }
+
+    impl PanicOnFirstCloneRead {
+        fn new(bytes: Cursor<Vec<u8>>) -> Self {
+            Self {
+                bytes,
+                clone_count: Arc::new(AtomicUsize::new(0)),
+                panic_on_read: false,
+            }
+        }
+    }
+
+    impl Clone for PanicOnFirstCloneRead {
+        fn clone(&self) -> Self {
+            let clone_index = self.clone_count.fetch_add(1, Ordering::Relaxed);
+            Self {
+                bytes: self.bytes.clone(),
+                clone_count: self.clone_count.clone(),
+                panic_on_read: clone_index == 0,
+            }
+        }
+    }
+
+    impl Read for PanicOnFirstCloneRead {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            assert!(!self.panic_on_read, "injected archive reader panic");
+            self.bytes.read(buffer)
+        }
+    }
+
+    impl Seek for PanicOnFirstCloneRead {
+        fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+            assert!(!self.panic_on_read, "injected archive reader panic");
+            self.bytes.seek(position)
+        }
+    }
+
+    #[test]
+    fn parallel_archive_workers_preserve_entry_order_and_classification() {
+        let archive = test_archive(&[
+            ("a.json", br#"{"id":"A"}"#),
+            ("notes.txt", b"ignored"),
+            ("broken.json", b"{"),
+            ("b.json", br#"{"id":"B","affected":[]}"#),
+            ("missing-id.json", br#"{"summary":"malformed"}"#),
+        ]);
+        let mut observed = Vec::new();
+        let timings = consume_archive_entries_in_order(archive, 4, 1024, |index, outcome| {
+            let classification = match outcome {
+                ArchiveEntryOutcome::Ignored => "ignored".to_string(),
+                ArchiveEntryOutcome::Oversized => "oversized".to_string(),
+                ArchiveEntryOutcome::Malformed { .. } => "malformed".to_string(),
+                ArchiveEntryOutcome::Prepared { records, .. } => {
+                    format!("prepared:{}", records.source_record_id)
+                }
+            };
+            observed.push((index, classification));
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            observed,
+            [
+                (0, "prepared:A".into()),
+                (1, "ignored".into()),
+                (2, "malformed".into()),
+                (3, "prepared:B".into()),
+                (4, "malformed".into()),
+            ]
+        );
+        assert!(timings.inflate_read > Duration::ZERO);
+        assert!(timings.json_prepare > Duration::ZERO);
+    }
+
+    #[test]
+    fn parallel_archive_workers_enforce_entry_and_total_decompressed_bounds() {
+        let archive = test_archive(&[("large.json", br#"{"id":"too-large"}"#)]);
+        let mut oversized = false;
+        consume_archive_entries_in_order(archive, 4, 8, |_, outcome| {
+            oversized = matches!(outcome, ArchiveEntryOutcome::Oversized);
+            Ok(())
+        })
+        .unwrap();
+        assert!(oversized);
+
+        let mut report = ParsingReport {
+            decompressed_json_bytes: MAX_DECOMPRESSED_JSON_BYTES,
+            ..ParsingReport::default()
+        };
+        let error = add_decompressed_json_bytes(&mut report, 1).unwrap_err();
+        assert!(error.to_string().contains("OSV decompressed JSON exceeds"));
+    }
+
+    #[test]
+    fn parallel_archive_consumer_error_cancels_bounded_workers() {
+        let archive = test_archive(&[
+            ("0.json", br#"{"id":"0"}"#),
+            ("1.json", br#"{"id":"1"}"#),
+            ("2.json", br#"{"id":"2"}"#),
+            ("3.json", br#"{"id":"3"}"#),
+            ("4.json", br#"{"id":"4"}"#),
+            ("5.json", br#"{"id":"5"}"#),
+            ("6.json", br#"{"id":"6"}"#),
+            ("7.json", br#"{"id":"7"}"#),
+        ]);
+        let error = consume_archive_entries_in_order(archive, 4, 1024, |index, _| {
+            ensure!(index < 2, "injected ordered consumer failure");
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "injected ordered consumer failure");
+    }
+
+    #[test]
+    fn parallel_archive_worker_panic_disconnects_without_hanging() {
+        let archive = test_archive(&[("0.json", br#"{"id":"0"}"#), ("1.json", br#"{"id":"1"}"#)]);
+        let mut bytes = archive.into_inner();
+        bytes.set_position(0);
+        let archive = zip::ZipArchive::new(PanicOnFirstCloneRead::new(bytes)).unwrap();
+        let error = consume_archive_entries_in_order(archive, 2, 1024, |_, _| Ok(())).unwrap_err();
+        assert!(format!("{error:#}").contains("OSV archive reader panicked"));
+    }
 
     #[derive(Serialize)]
     struct CloneReferenceContent<'a> {
