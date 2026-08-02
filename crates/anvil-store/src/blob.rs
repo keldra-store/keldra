@@ -1,5 +1,8 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -32,10 +35,12 @@ pub const AWAITING_PUBLISH: u8 = 1;
 #[derive(Clone, Debug)]
 pub struct BlobStore {
     root: PathBuf,
+    directory_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 pub struct BlobUpload {
     root: PathBuf,
+    directory_lock: Arc<tokio::sync::Mutex<()>>,
     temporary: PathBuf,
     file: Option<tokio::fs::File>,
     hasher: blake3::Hasher,
@@ -63,8 +68,16 @@ enum BlobReaderSource {
 impl BlobStore {
     pub async fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
-        tokio::fs::create_dir_all(&root).await?;
-        Ok(Self { root })
+        create_directory_all_durable(&root).await?;
+        // Also fences a root or hash-prefix entry left visible but not
+        // parent-synchronised by an older process before this store starts
+        // acknowledging writes.
+        sync_directory(parent_directory(&root)?).await?;
+        sync_directory(&root).await?;
+        Ok(Self {
+            root,
+            directory_lock: Arc::new(tokio::sync::Mutex::new(())),
+        })
     }
 
     pub async fn put(&self, bytes: &[u8]) -> Result<BlobRef> {
@@ -89,6 +102,7 @@ impl BlobStore {
             .with_context(|| format!("create blob staging file {}", temporary.display()))?;
         Ok(BlobUpload {
             root: self.root.clone(),
+            directory_lock: self.directory_lock.clone(),
             temporary,
             file: Some(file),
             hasher: blake3::Hasher::new(),
@@ -168,6 +182,51 @@ impl BlobStore {
         let encoded = hex::encode(hash);
         self.root.join(&encoded[..2]).join(encoded)
     }
+}
+
+fn parent_directory(path: &Path) -> Result<&Path> {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .or_else(|| (!path.is_absolute()).then_some(Path::new(".")))
+        .or_else(|| path.is_absolute().then_some(path))
+        .context("directory has no parent")
+}
+
+async fn sync_directory(path: &Path) -> Result<()> {
+    tokio::fs::File::open(path).await?.sync_all().await?;
+    Ok(())
+}
+
+/// Creates every missing component and synchronises the directory that names
+/// it before moving on to the next component.
+async fn create_directory_all_durable(path: &Path) -> Result<()> {
+    let mut missing = Vec::new();
+    let mut current = path.to_path_buf();
+    loop {
+        match tokio::fs::metadata(&current).await {
+            Ok(metadata) if metadata.is_dir() => break,
+            Ok(_) => bail!("{} exists but is not a directory", current.display()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(current.clone());
+                current = parent_directory(&current)?.to_path_buf();
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    for directory in missing.into_iter().rev() {
+        match tokio::fs::create_dir(&directory).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if !tokio::fs::metadata(&directory).await?.is_dir() {
+                    bail!("{} exists but is not a directory", directory.display());
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+        sync_directory(parent_directory(&directory)?).await?;
+    }
+    Ok(())
 }
 
 impl BlobReader {
@@ -274,7 +333,12 @@ impl BlobUpload {
         let encoded = hex::encode(reference.hash);
         let final_path = self.root.join(&encoded[..2]).join(encoded);
         let parent = final_path.parent().context("blob path has no parent")?;
-        tokio::fs::create_dir_all(parent).await?;
+        {
+            // A concurrent upload must not observe a newly created prefix and
+            // publish into it before the creator synchronises the blob root.
+            let _directory_guard = self.directory_lock.lock().await;
+            create_directory_all_durable(parent).await?;
+        }
         if tokio::fs::try_exists(&final_path).await? {
             tokio::fs::remove_file(&self.temporary).await?;
         } else {
@@ -293,15 +357,29 @@ impl BlobUpload {
 
 impl Drop for BlobUpload {
     fn drop(&mut self) {
-        if self.file.is_some() {
-            let _ = std::fs::remove_file(&self.temporary);
-        }
+        let _ = std::fs::remove_file(&self.temporary);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn open_and_first_put_establish_blob_directory_ancestry() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("nested").join("blobs");
+        let store = BlobStore::open(&root).await.unwrap();
+        let bytes = vec![0x3c; VERIFY_BUFFER_BYTES + 1];
+
+        let reference = store.put(&bytes).await.unwrap();
+
+        let encoded = hex::encode(reference.hash);
+        assert!(root.is_dir());
+        assert!(root.join(&encoded[..2]).is_dir());
+        assert!(root.join(&encoded[..2]).join(encoded).is_file());
+        assert_eq!(store.get(&reference).await.unwrap(), bytes);
+    }
 
     #[tokio::test]
     async fn concurrent_identical_uploads_publish_one_verified_blob() {
