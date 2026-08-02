@@ -2,7 +2,6 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
     io::{Cursor, Read},
-    panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     sync::Arc,
     thread,
@@ -27,9 +26,8 @@ use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, ValueEnum};
 use futures_util::{StreamExt as _, TryStreamExt as _, stream};
 use prost::Message as _;
-use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
-use serde::Serialize;
-use serde_json::Value;
+use serde::{Serialize, Serializer, ser::SerializeMap as _};
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use tokio::{sync::mpsc, task::JoinSet};
 use tonic::{
@@ -121,7 +119,7 @@ struct Args {
     #[arg(long, default_value_t = DEFAULT_SHARD_UNCOMPRESSED_BYTES)]
     shard_uncompressed_bytes: usize,
 
-    /// Maximum parallelism for each concurrent pipeline stage: record normalization, shard compression, and writes.
+    /// Maximum parallelism for shard compression and writes.
     #[arg(long, default_value_t = 4)]
     concurrency: usize,
 
@@ -198,8 +196,8 @@ struct SourceDefinition {
     enabled: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[cfg_attr(test, derive(serde::Deserialize))]
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 struct OsvSourceRecord {
     schema: String,
     source_id: String,
@@ -221,6 +219,33 @@ struct OsvSourceRecord {
     document: Value,
 }
 
+#[derive(Clone, Copy)]
+struct ScopedDocument<'a> {
+    base: &'a Map<String, Value>,
+    affected: &'a [Value],
+}
+
+impl Serialize for ScopedDocument<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(self.base.len() + 1))?;
+        let mut affected_written = false;
+        for (key, value) in self.base {
+            if !affected_written && key.as_str() > "affected" {
+                map.serialize_entry("affected", self.affected)?;
+                affected_written = true;
+            }
+            map.serialize_entry(key, value)?;
+        }
+        if !affected_written {
+            map.serialize_entry("affected", self.affected)?;
+        }
+        map.end()
+    }
+}
+
 #[derive(Serialize)]
 struct OsvSourceRecordContent<'a> {
     schema: &'static str,
@@ -237,7 +262,29 @@ struct OsvSourceRecordContent<'a> {
     summary: &'a Option<String>,
     details: &'a Option<String>,
     state: &'a str,
-    document: &'a Value,
+    document: ScopedDocument<'a>,
+}
+
+#[derive(Serialize)]
+struct OsvSourceRecordView<'a> {
+    schema: &'static str,
+    source_id: &'static str,
+    source_record_id: &'a str,
+    record_identity_hash: &'a str,
+    content_sha256: &'a str,
+    ecosystem: &'a str,
+    package: &'a str,
+    normalised_ecosystem: &'a str,
+    normalised_package: &'a str,
+    modified_at: &'a Option<String>,
+    modified_day: &'a str,
+    published_at: &'a Option<String>,
+    withdrawn: bool,
+    aliases: &'a [String],
+    summary: &'a Option<String>,
+    details: &'a Option<String>,
+    state: &'a str,
+    document: ScopedDocument<'a>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -249,51 +296,16 @@ struct PreparedRecord {
 
 #[derive(Debug)]
 struct RecordJob {
-    document: Arc<Value>,
-    source_record_id: Arc<str>,
     ecosystem: String,
     package: String,
     affected: Vec<Value>,
 }
 
-struct RecordJobs {
-    document: Arc<Value>,
-    source_record_id: Arc<str>,
-    package_groups: std::collections::btree_map::IntoIter<(String, String), Vec<Value>>,
-    unscoped: Option<Vec<Value>>,
-}
-
-impl Iterator for RecordJobs {
-    type Item = RecordJob;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if let Some(((ecosystem, package), affected)) = self.package_groups.next() {
-            return Some(RecordJob {
-                document: Arc::clone(&self.document),
-                source_record_id: Arc::clone(&self.source_record_id),
-                ecosystem,
-                package,
-                affected,
-            });
-        }
-        self.unscoped.take().map(|affected| RecordJob {
-            document: Arc::clone(&self.document),
-            source_record_id: Arc::clone(&self.source_record_id),
-            ecosystem: "unscoped".into(),
-            package: self.source_record_id.to_string(),
-            affected,
-        })
-    }
-}
-
 struct PreparedRecordJobs {
-    jobs: RecordJobs,
+    document: Value,
+    source_record_id: String,
+    jobs: Vec<RecordJob>,
     has_unscoped: bool,
-}
-
-struct RecordEncoder {
-    pool: ThreadPool,
-    pending: Vec<RecordJob>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -468,51 +480,6 @@ impl ShardBuilder {
             modified_day_min: self.modified_day_min.unwrap_or_else(|| "unknown".into()),
             modified_day_max: self.modified_day_max.unwrap_or_else(|| "unknown".into()),
         })
-    }
-}
-
-impl RecordEncoder {
-    fn start(worker_count: usize) -> Result<Self> {
-        ensure!(
-            worker_count > 0,
-            "record encoding requires at least one worker"
-        );
-        let pool = ThreadPoolBuilder::new()
-            .num_threads(worker_count)
-            .thread_name(|index| format!("osv-record-encoder-{index}"))
-            .build()
-            .context("start OSV record encoding workers")?;
-        Ok(Self {
-            pool,
-            pending: Vec::with_capacity(worker_count),
-        })
-    }
-
-    fn submit(&mut self, job: RecordJob) -> Result<Option<Vec<PreparedRecord>>> {
-        self.pending.push(job);
-        if self.pending.len() == self.pool.current_num_threads() {
-            self.flush().map(Some)
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn flush(&mut self) -> Result<Vec<PreparedRecord>> {
-        let worker_count = self.pool.current_num_threads();
-        ensure!(
-            self.pending.len() <= worker_count,
-            "OSV record encoding wave exceeded its worker bound"
-        );
-        let jobs = std::mem::replace(&mut self.pending, Vec::with_capacity(worker_count));
-        let ordered = catch_unwind(AssertUnwindSafe(|| {
-            self.pool
-                .install(|| jobs.into_par_iter().map(prepare_record).collect::<Vec<_>>())
-        }))
-        .map_err(|_| anyhow::anyhow!("OSV record encoding wave panicked"))?;
-        ordered
-            .into_iter()
-            .map(|record| record.context("prepare OSV source record"))
-            .collect()
     }
 }
 
@@ -1417,7 +1384,6 @@ fn parse_archive(
     };
     let mut builders = BTreeMap::<String, ShardBuilder>::new();
     let mut next_indices = BTreeMap::<String, u64>::new();
-    let mut encoder = RecordEncoder::start(compression_workers)?;
     let mut compressor = ShardCompressor::start(compression_workers, sender)?;
 
     let parsing = (|| -> Result<ParsingReport> {
@@ -1471,29 +1437,29 @@ fn parse_archive(
                     continue;
                 }
             };
-            if prepared.has_unscoped {
+            let PreparedRecordJobs {
+                document,
+                source_record_id,
+                jobs,
+                has_unscoped,
+            } = prepared;
+            if has_unscoped {
                 report.unscoped_documents += 1;
             }
-            for job in prepared.jobs {
-                if let Some(records) = encoder.submit(job)? {
-                    report.normalised_source_records += push_records_into_shards(
-                        records,
-                        target_bytes,
-                        &mut compressor,
-                        &mut builders,
-                        &mut next_indices,
-                    )?;
-                }
+            for job in jobs {
+                let record = prepare_record(&document, &source_record_id, &job)
+                    .context("prepare OSV source record")?;
+                push_record_into_shards(
+                    record,
+                    target_bytes,
+                    &mut compressor,
+                    &mut builders,
+                    &mut next_indices,
+                )?;
+                report.normalised_source_records += 1;
             }
             report.accepted_source_documents += 1;
         }
-        report.normalised_source_records += push_records_into_shards(
-            encoder.flush()?,
-            target_bytes,
-            &mut compressor,
-            &mut builders,
-            &mut next_indices,
-        )?;
         for builder in builders.into_values() {
             compressor.submit(builder)?;
         }
@@ -1507,20 +1473,6 @@ fn parse_archive(
             "OSV shard compression also failed: {compression_error:#}"
         ))),
     }
-}
-
-fn push_records_into_shards(
-    records: Vec<PreparedRecord>,
-    target_bytes: usize,
-    compressor: &mut ShardCompressor,
-    builders: &mut BTreeMap<String, ShardBuilder>,
-    next_indices: &mut BTreeMap<String, u64>,
-) -> Result<u64> {
-    let count = records.len() as u64;
-    for record in records {
-        push_record_into_shards(record, target_bytes, compressor, builders, next_indices)?;
-    }
-    Ok(count)
 }
 
 fn push_record_into_shards(
@@ -1576,13 +1528,25 @@ fn prepare_record_jobs(mut document: Value) -> Result<PreparedRecordJobs> {
     }
 
     let has_unscoped = package_groups.is_empty() || !unscoped.is_empty();
+    let mut jobs = package_groups
+        .into_iter()
+        .map(|((ecosystem, package), affected)| RecordJob {
+            ecosystem,
+            package,
+            affected,
+        })
+        .collect::<Vec<_>>();
+    if has_unscoped {
+        jobs.push(RecordJob {
+            ecosystem: "unscoped".into(),
+            package: source_record_id.clone(),
+            affected: unscoped,
+        });
+    }
     Ok(PreparedRecordJobs {
-        jobs: RecordJobs {
-            document: Arc::new(document),
-            source_record_id: Arc::from(source_record_id),
-            package_groups: package_groups.into_iter(),
-            unscoped: has_unscoped.then_some(unscoped),
-        },
+        document,
+        source_record_id,
+        jobs,
         has_unscoped,
     })
 }
@@ -1623,44 +1587,49 @@ fn normalize_package_name(ecosystem: &str, package: &str) -> String {
     }
 }
 
-fn prepare_record(job: RecordJob) -> Result<PreparedRecord> {
+fn prepare_record(
+    document: &Value,
+    source_record_id: &str,
+    job: &RecordJob,
+) -> Result<PreparedRecord> {
     let RecordJob {
-        document,
-        source_record_id,
         ecosystem,
         package,
         affected,
     } = job;
-    let mut scoped_document = document.as_ref().clone();
-    scoped_document
-        .as_object_mut()
-        .context("OSV document must be a JSON object")?
-        .insert("affected".into(), Value::Array(affected));
+    let base = document
+        .as_object()
+        .context("OSV document must be a JSON object")?;
+    ensure!(
+        !base.contains_key("affected"),
+        "OSV base document still contains affected"
+    );
+    let scoped_document = ScopedDocument { base, affected };
     let normalised_ecosystem = ecosystem.trim().to_ascii_lowercase();
-    let normalised_package = normalize_package_name(&ecosystem, &package);
+    let normalised_package = normalize_package_name(ecosystem, package);
     let record_identity_hash = digest_bytes(
         format!(
             "osv\0{}\0{normalised_ecosystem}\0{normalised_package}",
-            source_record_id.as_ref()
+            source_record_id
         )
         .as_bytes(),
     );
-    let modified_at = string_field(&document, "modified");
+    let modified_at = string_field(document, "modified");
     let modified_day = timestamp_day(modified_at.as_deref());
-    let published_at = string_field(&document, "published");
+    let published_at = string_field(document, "published");
     let withdrawn = document
         .get("withdrawn")
         .is_some_and(|value| !value.is_null());
-    let aliases = string_array(&document, "aliases");
-    let summary = string_field(&document, "summary");
-    let details = string_field(&document, "details");
+    let aliases = string_array(document, "aliases");
+    let summary = string_field(document, "summary");
+    let details = string_field(document, "details");
     let state = if withdrawn { "withdrawn" } else { "active" };
-    let content_sha256 = digest_bytes(&serde_json::to_vec(&OsvSourceRecordContent {
+    let content_sha256 = digest_json(&OsvSourceRecordContent {
         schema: "developer-defence.osv-source-record.v1",
         source_id: "osv",
-        source_record_id: source_record_id.as_ref(),
-        ecosystem: &ecosystem,
-        package: &package,
+        source_record_id,
+        ecosystem,
+        package,
         normalised_ecosystem: &normalised_ecosystem,
         normalised_package: &normalised_package,
         modified_at: &modified_at,
@@ -1670,26 +1639,26 @@ fn prepare_record(job: RecordJob) -> Result<PreparedRecord> {
         summary: &summary,
         details: &details,
         state,
-        document: &scoped_document,
-    })?);
-    let record = OsvSourceRecord {
-        schema: "developer-defence.osv-source-record.v1".into(),
-        source_id: "osv".into(),
-        source_record_id: source_record_id.to_string(),
-        record_identity_hash,
-        content_sha256,
+        document: scoped_document,
+    })?;
+    let record = OsvSourceRecordView {
+        schema: "developer-defence.osv-source-record.v1",
+        source_id: "osv",
+        source_record_id,
+        record_identity_hash: &record_identity_hash,
+        content_sha256: &content_sha256,
         ecosystem,
         package,
-        normalised_ecosystem: normalised_ecosystem.clone(),
-        normalised_package,
-        modified_at,
-        modified_day: modified_day.clone(),
-        published_at,
+        normalised_ecosystem: &normalised_ecosystem,
+        normalised_package: &normalised_package,
+        modified_at: &modified_at,
+        modified_day: &modified_day,
+        published_at: &published_at,
         withdrawn,
-        aliases,
-        summary,
-        details,
-        state: state.into(),
+        aliases: &aliases,
+        summary: &summary,
+        details: &details,
+        state,
         document: scoped_document,
     };
     Ok(PreparedRecord {
@@ -1876,6 +1845,12 @@ fn digest_bytes(value: &[u8]) -> String {
     hex::encode(Sha256::digest(value))
 }
 
+fn digest_json(value: &impl Serialize) -> Result<String> {
+    let mut digest = Sha256::new();
+    serde_json::to_writer(&mut digest, value)?;
+    Ok(hex::encode(digest.finalize()))
+}
+
 fn dd_immutable_json_payload<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec(&serde_json::to_value(value)?)?)
 }
@@ -1894,34 +1869,117 @@ fn emit_report(report: &QualificationReport<'_>, output: Option<&Path>) -> Resul
 mod tests {
     use super::*;
 
+    #[derive(Serialize)]
+    struct CloneReferenceContent<'a> {
+        schema: &'static str,
+        source_id: &'static str,
+        source_record_id: &'a str,
+        ecosystem: &'a str,
+        package: &'a str,
+        normalised_ecosystem: &'a str,
+        normalised_package: &'a str,
+        modified_at: &'a Option<String>,
+        published_at: &'a Option<String>,
+        withdrawn: bool,
+        aliases: &'a [String],
+        summary: &'a Option<String>,
+        details: &'a Option<String>,
+        state: &'a str,
+        document: &'a Value,
+    }
+
     fn prepare_records_serial(document: Value) -> Result<Vec<PreparedRecord>> {
-        prepare_record_jobs(document)?
-            .jobs
-            .map(prepare_record)
+        let PreparedRecordJobs {
+            document,
+            source_record_id,
+            jobs,
+            ..
+        } = prepare_record_jobs(document)?;
+        jobs.iter()
+            .map(|job| prepare_record(&document, &source_record_id, job))
             .collect()
     }
 
-    fn prepare_documents_parallel(
-        documents: Vec<Value>,
-        worker_count: usize,
-    ) -> Result<(Vec<PreparedRecord>, Vec<usize>)> {
-        let mut encoder = RecordEncoder::start(worker_count)?;
-        let mut records = Vec::new();
-        let mut wave_sizes = Vec::new();
-        for document in documents {
-            for job in prepare_record_jobs(document)?.jobs {
-                if let Some(wave) = encoder.submit(job)? {
-                    wave_sizes.push(wave.len());
-                    records.extend(wave);
-                }
-            }
-        }
-        let tail = encoder.flush()?;
-        if !tail.is_empty() {
-            wave_sizes.push(tail.len());
-            records.extend(tail);
-        }
-        Ok((records, wave_sizes))
+    fn prepare_records_clone_reference(document: Value) -> Result<Vec<PreparedRecord>> {
+        let PreparedRecordJobs {
+            document,
+            source_record_id,
+            jobs,
+            ..
+        } = prepare_record_jobs(document)?;
+        jobs.iter()
+            .map(|job| prepare_record_clone_reference(&document, &source_record_id, job))
+            .collect()
+    }
+
+    fn prepare_record_clone_reference(
+        document: &Value,
+        source_record_id: &str,
+        job: &RecordJob,
+    ) -> Result<PreparedRecord> {
+        let mut scoped_document = document.clone();
+        scoped_document
+            .as_object_mut()
+            .context("OSV document must be a JSON object")?
+            .insert("affected".into(), Value::Array(job.affected.clone()));
+        let normalised_ecosystem = job.ecosystem.trim().to_ascii_lowercase();
+        let normalised_package = normalize_package_name(&job.ecosystem, &job.package);
+        let record_identity_hash = digest_bytes(
+            format!("osv\0{source_record_id}\0{normalised_ecosystem}\0{normalised_package}")
+                .as_bytes(),
+        );
+        let modified_at = string_field(document, "modified");
+        let modified_day = timestamp_day(modified_at.as_deref());
+        let published_at = string_field(document, "published");
+        let withdrawn = document
+            .get("withdrawn")
+            .is_some_and(|value| !value.is_null());
+        let aliases = string_array(document, "aliases");
+        let summary = string_field(document, "summary");
+        let details = string_field(document, "details");
+        let state = if withdrawn { "withdrawn" } else { "active" };
+        let content_sha256 = digest_bytes(&serde_json::to_vec(&CloneReferenceContent {
+            schema: "developer-defence.osv-source-record.v1",
+            source_id: "osv",
+            source_record_id,
+            ecosystem: &job.ecosystem,
+            package: &job.package,
+            normalised_ecosystem: &normalised_ecosystem,
+            normalised_package: &normalised_package,
+            modified_at: &modified_at,
+            published_at: &published_at,
+            withdrawn,
+            aliases: &aliases,
+            summary: &summary,
+            details: &details,
+            state,
+            document: &scoped_document,
+        })?);
+        let record = OsvSourceRecord {
+            schema: "developer-defence.osv-source-record.v1".into(),
+            source_id: "osv".into(),
+            source_record_id: source_record_id.into(),
+            record_identity_hash,
+            content_sha256,
+            ecosystem: job.ecosystem.clone(),
+            package: job.package.clone(),
+            normalised_ecosystem: normalised_ecosystem.clone(),
+            normalised_package,
+            modified_at,
+            modified_day: modified_day.clone(),
+            published_at,
+            withdrawn,
+            aliases,
+            summary,
+            details,
+            state: state.into(),
+            document: scoped_document,
+        };
+        Ok(PreparedRecord {
+            encoded: serde_json::to_vec(&record)?,
+            normalised_ecosystem,
+            modified_day,
+        })
     }
 
     fn decode_record(prepared: &PreparedRecord) -> OsvSourceRecord {
@@ -2035,55 +2093,27 @@ mod tests {
     }
 
     #[test]
-    fn parallel_record_encoding_is_byte_identical_and_ordered_across_documents() {
-        let documents = (0..7)
-            .map(|index| {
-                serde_json::json!({
-                    "id": format!("GHSA-ordered-{index}"),
-                    "modified": "2026-07-14T12:00:00Z",
-                    "affected": [{
-                        "package": {"ecosystem": "npm", "name": format!("package-{index}")}
-                    }]
-                })
-            })
-            .collect::<Vec<_>>();
-        let expected = documents
-            .iter()
-            .cloned()
-            .flat_map(|document| prepare_records_serial(document).unwrap())
-            .collect::<Vec<_>>();
-        let (actual, wave_sizes) = prepare_documents_parallel(documents, 4).unwrap();
+    fn borrowed_record_encoding_matches_clone_reference_for_mixed_scopes() {
+        let document: Value = serde_json::from_str(
+            r#"{
+                "z": 1.0,
+                "summary": "mixed package and unscoped records",
+                "modified": "2026-07-14T12:00:00Z",
+                "id": "GHSA-mixed",
+                "affected": [
+                    {"package": {"ecosystem": "npm", "name": "Zed"}, "versions": ["1"]},
+                    {"versions": ["unscoped"]},
+                    {"package": {"ecosystem": "Cargo", "name": "crate-a"}, "versions": ["2"]},
+                    {"package": {"ecosystem": "npm", "name": "zed"}, "versions": ["3"]}
+                ],
+                "a": true
+            }"#,
+        )
+        .unwrap();
+        let expected = prepare_records_clone_reference(document.clone()).unwrap();
+        let actual = prepare_records_serial(document).unwrap();
 
         assert_eq!(actual, expected);
-        assert_eq!(wave_sizes, [4, 3]);
-        assert_eq!(
-            actual
-                .iter()
-                .map(decode_record)
-                .map(|record| record.source_record_id)
-                .collect::<Vec<_>>(),
-            (0..7)
-                .map(|index| format!("GHSA-ordered-{index}"))
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn record_encoding_preserves_package_then_unscoped_order() {
-        let document = serde_json::json!({
-            "id": "GHSA-mixed",
-            "affected": [
-                {"package": {"ecosystem": "npm", "name": "Zed"}, "versions": ["1"]},
-                {"versions": ["unscoped"]},
-                {"package": {"ecosystem": "Cargo", "name": "crate-a"}, "versions": ["2"]},
-                {"package": {"ecosystem": "npm", "name": "zed"}, "versions": ["3"]}
-            ]
-        });
-        let expected = prepare_records_serial(document.clone()).unwrap();
-        let (actual, wave_sizes) = prepare_documents_parallel(vec![document], 2).unwrap();
-
-        assert_eq!(actual, expected);
-        assert_eq!(wave_sizes, [2, 1]);
         let records = actual.iter().map(decode_record).collect::<Vec<_>>();
         assert_eq!(
             records
@@ -2097,48 +2127,21 @@ mod tests {
     }
 
     #[test]
-    fn record_encoding_bounds_large_fanout_to_one_worker_wave() {
-        let affected = (0..1_270)
-            .map(|index| {
-                serde_json::json!({
-                    "package": {"ecosystem": "npm", "name": format!("package-{index:04}")},
-                    "versions": ["1.0.0"]
-                })
-            })
-            .collect::<Vec<_>>();
-        let prepared = prepare_record_jobs(serde_json::json!({
-            "id": "GHSA-large-fanout",
-            "affected": affected
-        }))
+    fn scoped_document_emits_affected_at_its_lexical_map_position() {
+        let prepared = prepare_record_jobs(
+            serde_json::from_str(
+                r#"{"z":1.0,"middle":2,"id":"GHSA-lexical","affected":[{"versions":["1"]}],"a":1}"#,
+            )
+            .unwrap(),
+        )
         .unwrap();
-        let mut encoder = RecordEncoder::start(4).unwrap();
-        let mut total = 0;
-        let mut wave_sizes = Vec::new();
-        for job in prepared.jobs {
-            if let Some(wave) = encoder.submit(job).unwrap() {
-                wave_sizes.push(wave.len());
-                total += wave.len();
-            }
-            assert!(encoder.pending.len() < encoder.pool.current_num_threads());
-        }
-        let tail = encoder.flush().unwrap();
-        total += tail.len();
-        wave_sizes.push(tail.len());
-        assert_eq!(total, 1_270);
-        assert_eq!(wave_sizes.len(), 318);
-        assert!(wave_sizes.iter().all(|size| *size <= 4));
-        assert_eq!(wave_sizes.last(), Some(&2));
-    }
-
-    #[test]
-    fn record_encoding_rejects_zero_workers() {
-        let error = match RecordEncoder::start(0) {
-            Ok(_) => panic!("zero record encoding workers must be rejected"),
-            Err(error) => error,
+        let scoped = ScopedDocument {
+            base: prepared.document.as_object().unwrap(),
+            affected: &prepared.jobs[0].affected,
         };
         assert_eq!(
-            error.to_string(),
-            "record encoding requires at least one worker"
+            serde_json::to_vec(&scoped).unwrap(),
+            br#"{"a":1,"affected":[{"versions":["1"]}],"id":"GHSA-lexical","middle":2,"z":1.0}"#
         );
     }
 
@@ -2166,7 +2169,7 @@ mod tests {
         assert_eq!(npm.aliases, ["CVE-2026-1"]);
         assert_eq!(npm.modified_day, "2026-07-14");
         assert_eq!(npm.document["affected"].as_array().unwrap().len(), 2);
-        let content = OsvSourceRecordContent {
+        let content = CloneReferenceContent {
             schema: "developer-defence.osv-source-record.v1",
             source_id: "osv",
             source_record_id: &npm.source_record_id,
@@ -2185,6 +2188,56 @@ mod tests {
         };
         assert_eq!(
             npm.content_sha256,
+            digest_bytes(&serde_json::to_vec(&content).unwrap())
+        );
+    }
+
+    #[test]
+    fn streaming_content_digest_matches_materialised_json_bytes() {
+        let prepared = prepare_record_jobs(serde_json::json!({
+            "z": 1.0,
+            "published": "2026-07-13T12:00:00Z",
+            "modified": "2026-07-14T12:00:00Z",
+            "id": "GHSA-streaming-digest",
+            "aliases": ["CVE-2026-1"],
+            "affected": [{
+                "package": {"ecosystem": "npm", "name": "Example"},
+                "versions": ["1.0.0"]
+            }],
+            "a": true
+        }))
+        .unwrap();
+        let job = &prepared.jobs[0];
+        let normalised_ecosystem = job.ecosystem.trim().to_ascii_lowercase();
+        let normalised_package = normalize_package_name(&job.ecosystem, &job.package);
+        let modified_at = string_field(&prepared.document, "modified");
+        let published_at = string_field(&prepared.document, "published");
+        let aliases = string_array(&prepared.document, "aliases");
+        let summary = string_field(&prepared.document, "summary");
+        let details = string_field(&prepared.document, "details");
+        let content = OsvSourceRecordContent {
+            schema: "developer-defence.osv-source-record.v1",
+            source_id: "osv",
+            source_record_id: &prepared.source_record_id,
+            ecosystem: &job.ecosystem,
+            package: &job.package,
+            normalised_ecosystem: &normalised_ecosystem,
+            normalised_package: &normalised_package,
+            modified_at: &modified_at,
+            published_at: &published_at,
+            withdrawn: false,
+            aliases: &aliases,
+            summary: &summary,
+            details: &details,
+            state: "active",
+            document: ScopedDocument {
+                base: prepared.document.as_object().unwrap(),
+                affected: &job.affected,
+            },
+        };
+
+        assert_eq!(
+            digest_json(&content).unwrap(),
             digest_bytes(&serde_json::to_vec(&content).unwrap())
         );
     }
