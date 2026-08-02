@@ -163,7 +163,7 @@ impl BlobStore {
         Ok(())
     }
 
-    fn path(&self, hash: &[u8; 32]) -> PathBuf {
+    pub(crate) fn path(&self, hash: &[u8; 32]) -> PathBuf {
         let encoded = hex::encode(hash);
         self.root.join(&encoded[..2]).join(encoded)
     }

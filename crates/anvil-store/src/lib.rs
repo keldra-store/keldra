@@ -62,11 +62,12 @@ pub use reference_delta::{
     ReferenceDeltaBatch, ReferenceDeltaError,
 };
 pub use store::{
-    BatchGetSelection, DEFAULT_AWAITING_PUBLISH_TTL_SECONDS, DEFAULT_MUTATION_RECEIPT_MAX_BYTES,
-    DEFAULT_MUTATION_RECEIPT_MAX_ENTRIES, DEFAULT_MUTATION_RECEIPT_RETENTION_SECONDS,
-    ListObjectsPage, MAX_LIST_OBJECT_VERSIONS, MAX_LIST_OBJECTS, MutationReceiptRetention,
-    OpenedObject, ShardIdentity, ShardReader, ShardSealOutcome, ShardStoreError, Store,
-    StoreOptions,
+    BatchGetSelection, CompleteCopySealOutcome, DEFAULT_AWAITING_PUBLISH_TTL_SECONDS,
+    DEFAULT_MUTATION_RECEIPT_MAX_BYTES, DEFAULT_MUTATION_RECEIPT_MAX_ENTRIES,
+    DEFAULT_MUTATION_RECEIPT_RETENTION_SECONDS, ListObjectsPage, LocalPayloadPresence,
+    MAX_LIST_OBJECT_VERSIONS, MAX_LIST_OBJECTS, MutationReceiptRetention, OpenedObject,
+    PayloadArtifactState, PayloadStoreError, ShardIdentity, ShardReader, ShardSealOutcome,
+    ShardStoreError, Store, StoreOptions,
 };
 pub use watch::{
     DEFAULT_WATCH_MAX_BYTES, DEFAULT_WATCH_MAX_ENTRIES, InvalidationStateHint, LocalChange,

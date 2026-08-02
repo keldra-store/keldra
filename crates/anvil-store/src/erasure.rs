@@ -323,6 +323,32 @@ impl ErasureCodec {
         Ok(())
     }
 
+    /// Reconstruct from an ordinal-addressed subset of shard streams.
+    ///
+    /// This is the peer/coordinator-facing form of [`Self::reconstruct`]. It
+    /// keeps shard identity explicit while constructing the codec's sparse
+    /// ordinal vector, and rejects a repeated ordinal rather than silently
+    /// choosing one copy.
+    pub fn reconstruct_available<R: Read, W: Write>(
+        &self,
+        expected: &BlobRef,
+        shards: impl IntoIterator<Item = (u16, R)>,
+        output: &mut W,
+    ) -> Result<(), ErasureError> {
+        let mut ordinal_shards = std::iter::repeat_with(|| None)
+            .take(usize::from(self.profile.total_shards()))
+            .collect::<Vec<Option<R>>>();
+        for (ordinal, shard) in shards {
+            self.require_ordinal(ordinal)?;
+            let slot = &mut ordinal_shards[usize::from(ordinal)];
+            if slot.is_some() {
+                return Err(ErasureError::DuplicateShardOrdinal { ordinal });
+            }
+            *slot = Some(shard);
+        }
+        self.reconstruct(expected, &mut ordinal_shards, output)
+    }
+
     fn require_shard_count(&self, actual: usize) -> Result<(), ErasureError> {
         let expected = usize::from(self.profile.total_shards());
         if actual != expected {
@@ -527,6 +553,8 @@ pub enum ErasureError {
     WrongShardCount { expected: usize, actual: usize },
     #[error("shard ordinal {ordinal} is outside profile total {total}")]
     InvalidShardOrdinal { ordinal: u16, total: u16 },
+    #[error("shard ordinal {ordinal} was supplied more than once")]
+    DuplicateShardOrdinal { ordinal: u16 },
     #[error("unsupported fragment format {0}")]
     UnsupportedFragmentFormat(u16),
     #[error("shard {ordinal} header checksum does not match")]

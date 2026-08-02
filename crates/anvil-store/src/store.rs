@@ -731,11 +731,15 @@ impl Store {
 
 mod blob_references;
 mod mutations;
+mod payload;
 mod reads;
 mod reference_deltas;
 mod shards;
 mod watch_journal;
 
+pub use payload::{
+    CompleteCopySealOutcome, LocalPayloadPresence, PayloadArtifactState, PayloadStoreError,
+};
 pub use shards::{ShardIdentity, ShardReader, ShardSealOutcome, ShardStoreError};
 
 pub(crate) fn is_program_definition_path(path: &str) -> bool {

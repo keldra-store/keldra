@@ -7,7 +7,8 @@
 use std::collections::HashSet;
 
 use anvil_consensus::{ClusterId, NodeId};
-use anvil_store::{BlobRef, ErasureProfile, SMALL_BLOB_MAX_BYTES};
+use anvil_store::{BlobRef, Durability, ErasureProfile, SMALL_BLOB_MAX_BYTES};
+use thiserror::Error;
 
 use crate::placement::{PlacementNode, rank_nodes};
 
@@ -38,6 +39,136 @@ impl PayloadPlacement {
     pub(crate) fn is_under_redundant(&self) -> bool {
         self.available_count() < self.required_count()
     }
+
+    /// Enforce the response boundary using exact per-node durable evidence.
+    ///
+    /// Logical metadata always needs its independent quorum. Both durability
+    /// choices require the rank-zero upload coordinator's complete source;
+    /// `REPLICATED` additionally requires all selected small-copy owners or
+    /// `K + 1` correctly placed final shard ordinals.
+    pub(crate) fn require_ready(
+        &self,
+        durability: Durability,
+        metadata_quorum: bool,
+        evidence: &[NodePayloadEvidence],
+    ) -> Result<(), PayloadReadinessError> {
+        if !metadata_quorum {
+            return Err(PayloadReadinessError::MetadataQuorum);
+        }
+        ensure_distinct_node_evidence(evidence)?;
+        let coordinator = self
+            .coordinator()
+            .ok_or(PayloadReadinessError::CoordinatorSource)?;
+        if !evidence
+            .iter()
+            .any(|entry| entry.node_id == coordinator && entry.complete_copy)
+        {
+            return Err(PayloadReadinessError::CoordinatorSource);
+        }
+        if durability == Durability::Local {
+            return Ok(());
+        }
+
+        match self {
+            Self::Small(placement) => {
+                let durable = placement
+                    .owners
+                    .iter()
+                    .filter(|owner| {
+                        evidence
+                            .iter()
+                            .any(|entry| entry.node_id == **owner && entry.complete_copy)
+                    })
+                    .count();
+                if durable != placement.required_copies {
+                    return Err(PayloadReadinessError::CompleteCopies {
+                        required: placement.required_copies,
+                        durable,
+                    });
+                }
+            }
+            Self::Large(placement) => {
+                let durable = placement
+                    .shards
+                    .iter()
+                    .filter(|expected| {
+                        evidence.iter().any(|entry| {
+                            entry.node_id == expected.owner
+                                && entry.shard_ordinal == Some(expected.ordinal)
+                        })
+                    })
+                    .count();
+                if durable < placement.replicated_shards {
+                    return Err(PayloadReadinessError::FinalShards {
+                        required: placement.replicated_shards,
+                        durable,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn coordinator(&self) -> Option<NodeId> {
+        match self {
+            Self::Small(placement) => placement.owners.first().copied(),
+            Self::Large(placement) => placement.shards.first().map(|shard| shard.owner),
+        }
+    }
+}
+
+/// Durable artifact evidence returned by one exact placement owner.
+///
+/// One node can hold the coordinator's complete upload source and its one
+/// assigned final shard. It cannot claim multiple final ordinals in one
+/// record, preserving the distinct-owner placement invariant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NodePayloadEvidence {
+    node_id: NodeId,
+    complete_copy: bool,
+    shard_ordinal: Option<u16>,
+}
+
+impl NodePayloadEvidence {
+    pub(crate) const fn new(
+        node_id: NodeId,
+        complete_copy: bool,
+        shard_ordinal: Option<u16>,
+    ) -> Self {
+        Self {
+            node_id,
+            complete_copy,
+            shard_ordinal,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub(crate) enum PayloadReadinessError {
+    #[error("logical metadata quorum is not durable")]
+    MetadataQuorum,
+    #[error("rank-zero coordinator has not durably sealed the complete source")]
+    CoordinatorSource,
+    #[error("node {node_id:?} supplied contradictory payload evidence")]
+    ContradictoryNode { node_id: NodeId },
+    #[error("only {durable} of {required} required complete copies are durable")]
+    CompleteCopies { required: usize, durable: usize },
+    #[error("only {durable} of {required} required final shards are durable")]
+    FinalShards { required: usize, durable: usize },
+}
+
+fn ensure_distinct_node_evidence(
+    evidence: &[NodePayloadEvidence],
+) -> Result<(), PayloadReadinessError> {
+    let mut seen = HashSet::with_capacity(evidence.len());
+    for entry in evidence {
+        if !seen.insert(entry.node_id) {
+            return Err(PayloadReadinessError::ContradictoryNode {
+                node_id: entry.node_id,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Complete-copy owners for content of at most 64 KiB.
@@ -74,6 +205,7 @@ impl ShardPlacement {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct LargePayloadPlacement {
     required_shards: usize,
+    replicated_shards: usize,
     shards: Vec<ShardPlacement>,
 }
 
@@ -118,6 +250,7 @@ pub(crate) fn select_payload_placement(
             .collect();
         PayloadPlacement::Large(LargePayloadPlacement {
             required_shards,
+            replicated_shards: usize::from(profile.data_shards()) + 1,
             shards,
         })
     }
@@ -314,5 +447,135 @@ mod tests {
         assert!(!small.is_under_redundant());
         assert_eq!((large.required_count(), large.available_count()), (6, 6));
         assert!(!large.is_under_redundant());
+    }
+
+    #[test]
+    fn local_requires_metadata_and_the_rank_zero_complete_source_only() {
+        let placement = select_payload_placement(
+            PLACEMENT_KIND,
+            cluster_id(),
+            &content(SMALL_BLOB_MAX_BYTES as u64 + 1),
+            profile(),
+            &nodes(),
+        );
+        let coordinator = placement.coordinator().unwrap();
+        let source = [NodePayloadEvidence::new(coordinator, true, None)];
+
+        assert_eq!(
+            placement.require_ready(Durability::Local, false, &source),
+            Err(PayloadReadinessError::MetadataQuorum)
+        );
+        assert_eq!(
+            placement.require_ready(Durability::Local, true, &[]),
+            Err(PayloadReadinessError::CoordinatorSource)
+        );
+        assert_eq!(
+            placement.require_ready(Durability::Local, true, &source),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn replicated_small_requires_every_m_plus_one_selected_owner() {
+        let placement = select_payload_placement(
+            PLACEMENT_KIND,
+            cluster_id(),
+            &content(11),
+            profile(),
+            &nodes(),
+        );
+        let PayloadPlacement::Small(small) = &placement else {
+            panic!("expected small placement")
+        };
+        let mut evidence = small
+            .owners()
+            .iter()
+            .copied()
+            .map(|owner| NodePayloadEvidence::new(owner, true, None))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            placement.require_ready(Durability::Replicated, true, &evidence),
+            Ok(())
+        );
+        evidence.pop();
+        assert_eq!(
+            placement.require_ready(Durability::Replicated, true, &evidence),
+            Err(PayloadReadinessError::CompleteCopies {
+                required: 3,
+                durable: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn default_two_plus_one_requires_three_distinct_final_shards() {
+        let placement = select_payload_placement(
+            PLACEMENT_KIND,
+            cluster_id(),
+            &content(SMALL_BLOB_MAX_BYTES as u64 + 1),
+            ErasureProfile::default(),
+            &nodes(),
+        );
+        let PayloadPlacement::Large(large) = &placement else {
+            panic!("expected large placement")
+        };
+        assert_eq!(large.replicated_shards, 3);
+        let evidence = large
+            .shards()
+            .iter()
+            .map(|shard| {
+                NodePayloadEvidence::new(shard.owner(), shard.ordinal() == 0, Some(shard.ordinal()))
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            placement.require_ready(Durability::Replicated, true, &evidence),
+            Ok(())
+        );
+        assert_eq!(
+            placement.require_ready(Durability::Replicated, true, &evidence[..2]),
+            Err(PayloadReadinessError::FinalShards {
+                required: 3,
+                durable: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn wrong_ordinal_and_duplicate_node_evidence_never_inflate_readiness() {
+        let placement = select_payload_placement(
+            PLACEMENT_KIND,
+            cluster_id(),
+            &content(SMALL_BLOB_MAX_BYTES as u64 + 1),
+            ErasureProfile::default(),
+            &nodes(),
+        );
+        let PayloadPlacement::Large(large) = &placement else {
+            panic!("expected large placement")
+        };
+        let mut evidence = large
+            .shards()
+            .iter()
+            .map(|shard| {
+                NodePayloadEvidence::new(shard.owner(), shard.ordinal() == 0, Some(shard.ordinal()))
+            })
+            .collect::<Vec<_>>();
+        evidence[2].shard_ordinal = Some(1);
+        assert_eq!(
+            placement.require_ready(Durability::Replicated, true, &evidence),
+            Err(PayloadReadinessError::FinalShards {
+                required: 3,
+                durable: 2,
+            })
+        );
+
+        evidence.push(evidence[0]);
+        assert_eq!(
+            placement.require_ready(Durability::Replicated, true, &evidence),
+            Err(PayloadReadinessError::ContradictoryNode {
+                node_id: evidence[0].node_id,
+            })
+        );
     }
 }
