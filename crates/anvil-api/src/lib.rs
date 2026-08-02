@@ -14,7 +14,8 @@ mod tests {
             ObjectHead {
                 state: Some(object_head::State::Present(PresentObject {
                     version: 7,
-                    blob: None,
+                    content_hash: vec![7; 32],
+                    content_length: 99,
                     content_type: String::new(),
                 })),
             },
@@ -43,7 +44,15 @@ mod tests {
     #[test]
     fn schema_keeps_removed_capabilities_out() {
         let schema = include_str!("../proto/anvil.proto").to_ascii_lowercase();
-        for forbidden in ["partition", "transaction", "listprefix"] {
+        for forbidden in [
+            "rpc uploadblob",
+            "rpc publishobject",
+            "rpc putobject",
+            "message blobref",
+            "rpc listprefix",
+            "rpc begintransaction",
+            "rpc committransaction",
+        ] {
             assert!(!schema.contains(forbidden), "schema contains `{forbidden}`");
         }
 
@@ -55,8 +64,19 @@ mod tests {
         assert!(!schema.contains("message registerprogram"));
         assert!(schema.contains("objectaddress program"));
         assert!(schema.contains("_anvil/programs/{name}@{version}"));
+        assert!(schema.contains("rpc startput(putheader) returns (puttoken)"));
+        assert!(schema.contains("rpc put(stream putrequest) returns (puttoken)"));
+        assert!(schema.contains("rpc putend(puttoken) returns (mutationreceipt)"));
 
         for rpc in [
+            "rpc exchangeclientcredentials",
+            "rpc provisiontenant",
+            "rpc createapplication",
+            "rpc rotateapplicationcredential",
+            "rpc disableapplicationcredential",
+            "rpc createbucket",
+            "rpc grantapplicationrole",
+            "rpc revokeapplicationrole",
             "rpc putschema",
             "rpc bindschema",
             "rpc getbinding",
@@ -65,6 +85,11 @@ mod tests {
             "rpc readtuples",
             "rpc checkpermission",
             "rpc checkpermissions",
+            "rpc watchprefix",
+            "rpc listobjects",
+            "rpc deleteversion",
+            "rpc listobjectversions",
+            "rpc setbucketversioning",
         ] {
             assert!(schema.contains(rpc), "schema is missing `{rpc}`");
         }
@@ -75,9 +100,112 @@ mod tests {
             "zookie",
             "caveat",
             "publication_metadata",
+            "insecure_no_auth",
+            "api_token",
         ] {
             assert!(!schema.contains(forbidden), "schema contains `{forbidden}`");
         }
+    }
+
+    #[test]
+    fn object_surface_has_only_explicit_typed_mutations() {
+        use super::v1::{
+            BulkOperation, BulkPutIfVersionRequest, CreateBucketRequest, DeleteIfVersionRequest,
+            DeleteRequest, DeleteVersionRequest, DeleteVersionResponse, Durability,
+            ListObjectsRequest, ListObjectsResponse, ObjectAddress, ObjectVersioning, PutHeader,
+            PutIfVersionOperation, PutRequest, PutToken, bulk_operation, put_header,
+        };
+
+        let address = Some(ObjectAddress {
+            tenant: "acme".into(),
+            bucket: "objects".into(),
+            path: "one".into(),
+        });
+        let header = PutHeader {
+            address: address.clone(),
+            content_type: "application/json".into(),
+            command_id: "command-1".into(),
+            durability: Durability::Local as i32,
+            operation: Some(put_header::Operation::PutIfVersion(PutIfVersionOperation {
+                expected_version: 8,
+            })),
+        };
+        let frame = PutRequest {
+            token: Some(PutToken {
+                value: b"opaque".to_vec(),
+                expires_at: None,
+            }),
+            chunk: Vec::new(),
+        };
+        assert!(matches!(
+            header.operation,
+            Some(put_header::Operation::PutIfVersion(_))
+        ));
+        assert!(frame.chunk.is_empty());
+
+        let operations = [
+            bulk_operation::Operation::Put(Default::default()),
+            bulk_operation::Operation::PutIfAbsent(Default::default()),
+            bulk_operation::Operation::PutIfVersion(BulkPutIfVersionRequest::default()),
+            bulk_operation::Operation::PutImmutable(Default::default()),
+            bulk_operation::Operation::Delete(DeleteRequest {
+                address: address.clone(),
+                ..Default::default()
+            }),
+            bulk_operation::Operation::DeleteIfVersion(DeleteIfVersionRequest {
+                address: address.clone(),
+                expected_version: 8,
+                ..Default::default()
+            }),
+        ];
+        assert_eq!(
+            operations
+                .into_iter()
+                .map(|operation| BulkOperation {
+                    operation: Some(operation),
+                })
+                .count(),
+            6
+        );
+
+        let current_head_delete = DeleteIfVersionRequest {
+            address: address.clone(),
+            expected_version: 8,
+            ..Default::default()
+        };
+        let retained_version_delete = DeleteVersionRequest {
+            address,
+            version: 7,
+            ..Default::default()
+        };
+        assert_eq!(current_head_delete.expected_version, 8);
+        assert_eq!(retained_version_delete.version, 7);
+        let replaced_current = DeleteVersionResponse {
+            deleted: true,
+            replacement_tombstone_version: Some(9),
+        };
+        assert_eq!(replaced_current.replacement_tombstone_version, Some(9));
+        assert_eq!(
+            CreateBucketRequest::default().versioning,
+            ObjectVersioning::Unversioned as i32
+        );
+
+        let list_request = ListObjectsRequest {
+            tenant: "acme".into(),
+            bucket: "objects".into(),
+            prefix: "reports/".into(),
+            start_after: Some("reports/2025.json".into()),
+            limit: 100,
+        };
+        let list_response = ListObjectsResponse {
+            paths: vec!["reports/2026.json".into()],
+            has_more: false,
+        };
+        assert_eq!(
+            list_request.start_after.as_deref(),
+            Some("reports/2025.json")
+        );
+        assert_eq!(list_response.paths, vec!["reports/2026.json".to_owned()]);
     }
 
     #[test]
