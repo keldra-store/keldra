@@ -6,6 +6,7 @@ mod authz_service;
 mod bootstrap;
 mod cluster_startup;
 mod credential_service;
+mod distributed_list;
 mod join_bundle;
 mod mutable_record_quorum;
 mod mutable_record_replica_group;
