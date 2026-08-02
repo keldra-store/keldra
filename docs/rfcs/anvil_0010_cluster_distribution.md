@@ -1014,13 +1014,23 @@ LocalChange {
   offset
   change =
       ObjectHead { tenant_id, bucket_id, exact_path, path_version,
-                   kind = PUT | DELETE }
+                   kind = PUT | DELETE,
+                   reference_deltas = [{ blob_identity, change }] }
     | RetainedVersionDeleted { tenant_id, bucket_id, exact_path,
-                               deleted_version, resulting_head_version? }
+                               deleted_version, resulting_head_version?,
+                               reference_deltas = [{ blob_identity, change }] }
     | AggregateChanged { aggregate_kind, aggregate_key, revision }
-    | ContentLifecycleChanged { blob_identity, revision }
+    | ContentLifecycleChanged { blob_identity, revision,
+                                reference_deltas = [{ blob_identity, change }] }
 }
 ```
+
+`reference_deltas` contains only exact non-zero signed count effects caused by
+that committed change and is empty when content identity and retained-reference
+cardinality do not change. It is bounded by the containing operation. A source
+derives the destination-filtered batches in section 14.3 from these fields;
+it never attempts to reconstruct a deleted reference from current heads after
+the fact.
 
 The authoritative local mutation and its `LocalChange` are committed in the
 same RocksDB `WriteBatch`. Internal catch-up and handoff consumers can read all
