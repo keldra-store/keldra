@@ -128,22 +128,7 @@ impl BlobStore {
     /// memory.
     pub async fn open_verified(&self, reference: &BlobRef) -> Result<BlobReader> {
         let mut file = tokio::fs::File::open(self.path(&reference.hash)).await?;
-        let mut hasher = blake3::Hasher::new();
-        let mut length = 0_u64;
-        let mut buffer = vec![0_u8; VERIFY_BUFFER_BYTES];
-        loop {
-            let read = file.read(&mut buffer).await?;
-            if read == 0 {
-                break;
-            }
-            length = length
-                .checked_add(read as u64)
-                .context("blob length overflow")?;
-            hasher.update(&buffer[..read]);
-        }
-        if length != reference.length || hasher.finalize().as_bytes() != &reference.hash {
-            bail!("blob failed length or hash verification");
-        }
+        verify_open_blob(&mut file, reference).await?;
         file.seek(std::io::SeekFrom::Start(0)).await?;
         Ok(BlobReader {
             source: BlobReaderSource::File(file),
@@ -227,6 +212,36 @@ async fn create_directory_all_durable(path: &Path) -> Result<()> {
         sync_directory(parent_directory(&directory)?).await?;
     }
     Ok(())
+}
+
+async fn verify_open_blob(file: &mut tokio::fs::File, reference: &BlobRef) -> Result<()> {
+    let metadata = file.metadata().await?;
+    if !metadata.is_file() || metadata.len() != reference.length {
+        bail!("blob failed length or hash verification");
+    }
+    file.seek(std::io::SeekFrom::Start(0)).await?;
+    let mut hasher = blake3::Hasher::new();
+    let mut length = 0_u64;
+    let mut buffer = vec![0_u8; VERIFY_BUFFER_BYTES];
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        length = length
+            .checked_add(read as u64)
+            .context("blob length overflow")?;
+        hasher.update(&buffer[..read]);
+    }
+    if length != reference.length || hasher.finalize().as_bytes() != &reference.hash {
+        bail!("blob failed length or hash verification");
+    }
+    Ok(())
+}
+
+async fn verify_existing_blob(path: &Path, reference: &BlobRef) -> Result<()> {
+    let mut file = tokio::fs::File::open(path).await?;
+    verify_open_blob(&mut file, reference).await
 }
 
 impl BlobReader {
@@ -340,11 +355,13 @@ impl BlobUpload {
             create_directory_all_durable(parent).await?;
         }
         if tokio::fs::try_exists(&final_path).await? {
+            verify_existing_blob(&final_path, &reference).await?;
             tokio::fs::remove_file(&self.temporary).await?;
         } else {
             match tokio::fs::rename(&self.temporary, &final_path).await {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    verify_existing_blob(&final_path, &reference).await?;
                     tokio::fs::remove_file(&self.temporary).await?;
                 }
                 Err(error) => return Err(error.into()),
@@ -396,6 +413,44 @@ mod tests {
         let right = right.unwrap();
         assert_eq!(left, right);
         assert_eq!(store.get(&left).await.unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn existing_identical_blob_is_verified_before_deduplication() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = BlobStore::open(temporary.path()).await.unwrap();
+        let bytes = vec![0x4d; 2 * VERIFY_BUFFER_BYTES + 17];
+        let first = store.put(&bytes).await.unwrap();
+
+        let second = store.put(&bytes).await.unwrap();
+
+        assert_eq!(second, first);
+        assert_eq!(store.get(&second).await.unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn existing_same_length_corruption_is_rejected_without_repair() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = BlobStore::open(temporary.path()).await.unwrap();
+        let bytes = (0..(3 * VERIFY_BUFFER_BYTES + 17))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let reference = store.put(&bytes).await.unwrap();
+        let path = store.path(&reference.hash);
+        let mut corrupted = bytes.clone();
+        corrupted[VERIFY_BUFFER_BYTES + 3] ^= 0xff;
+        tokio::fs::write(&path, &corrupted).await.unwrap();
+
+        let error = store.put(&bytes).await.unwrap_err();
+
+        assert!(error.to_string().contains("failed length or hash"));
+        assert_eq!(tokio::fs::read(path).await.unwrap(), corrupted);
+        assert_eq!(
+            std::fs::read_dir(store.root().join(".staging"))
+                .unwrap()
+                .count(),
+            0
+        );
     }
 
     #[tokio::test]
