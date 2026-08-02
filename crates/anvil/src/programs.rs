@@ -1,8 +1,12 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
-use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+#[cfg(test)]
+use std::path::Path;
+#[cfg(test)]
+use std::time::Duration;
 
 use anvil_atomic_program::{
     CommandReceipt, EngineError, ExpandedProgramPath, InvocationContext, ObjectPath, ProgramInput,
@@ -23,7 +27,6 @@ use anyhow::{Context, Result, bail};
 use tonic::Status;
 use tracing::Instrument as _;
 
-const LEADER_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const MAX_PROGRAM_INPUT_BYTES: usize = 16 * 1024 * 1024;
 const PROGRAM_PATH_PREFIX: &str = "_anvil/programs/";
 const LOCAL_DURABILITY_CLASS: &str = "local";
@@ -52,31 +55,9 @@ pub(crate) struct InvokedProgramResult {
 }
 
 impl ProgramCoordinator {
-    pub async fn open(
-        store: Store,
-        data_dir: &Path,
-        node_id: u64,
-        max_commit_entries: u32,
-        max_commit_bytes: u64,
-    ) -> Result<Self> {
-        let node = NodeId(node_id);
-        let decisions = DecisionRaft::open(
-            data_dir.join("decisions"),
-            node_id,
-            max_commit_entries,
-            max_commit_bytes,
-        )
-        .await
-        .context("open bounded atomic decision Raft")?;
-        decisions
-            .ensure_one_node()
-            .await
-            .context("bootstrap one-node decision Raft")?;
-        decisions
-            .wait_for_leader(LEADER_TIMEOUT)
-            .await
-            .context("elect decision leader")?;
-
+    /// Attach the atomic-program coordinator to a Raft instance already
+    /// opened and initialized by the server runtime.
+    pub async fn start(store: Store, decisions: DecisionRaft, node: NodeId) -> Result<Self> {
         if decisions.state()?.executor().is_none() {
             let _nomination = expect_nomination(
                 decisions
@@ -104,13 +85,6 @@ impl ProgramCoordinator {
             .context("recover committed atomic-program bundles")?;
         coordinator.emit_bounded_state_metrics();
         Ok(coordinator)
-    }
-
-    pub async fn shutdown(&self) -> Result<()> {
-        self.decisions
-            .shutdown()
-            .await
-            .context("shut down decision Raft")
     }
 
     /// Execute only on the nominated node. The API layer performs Zanzibar
@@ -1016,7 +990,29 @@ mod tests {
     }
 
     async fn open_test_coordinator(store: Store, root: &Path) -> ProgramCoordinator {
-        ProgramCoordinator::open(store, root, 1, 8, 64 * 1024)
+        open_test_coordinator_with_limits(store, root, 8, 64 * 1024).await
+    }
+
+    async fn open_test_coordinator_with_limits(
+        store: Store,
+        root: &Path,
+        max_commit_entries: u32,
+        max_commit_bytes: u64,
+    ) -> ProgramCoordinator {
+        let decisions = DecisionRaft::open(
+            root.join("decisions"),
+            1,
+            max_commit_entries,
+            max_commit_bytes,
+        )
+        .await
+        .unwrap();
+        decisions.ensure_one_node().await.unwrap();
+        decisions
+            .wait_for_leader(Duration::from_secs(10))
+            .await
+            .unwrap();
+        ProgramCoordinator::start(store, decisions, NodeId(1))
             .await
             .unwrap()
     }
@@ -1079,7 +1075,7 @@ mod tests {
             first.replay_guarantee_expires_at_unix_millis
         );
         assert_eq!(replay.published_versions, first.published_versions);
-        coordinator.shutdown().await.unwrap();
+        coordinator.decisions.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -1087,9 +1083,8 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let (store, program_key, program_hash, first_input) =
             configured_program_store(temporary.path()).await;
-        let coordinator = ProgramCoordinator::open(store, temporary.path(), 1, 1, 64 * 1024)
-            .await
-            .unwrap();
+        let coordinator =
+            open_test_coordinator_with_limits(store, temporary.path(), 1, 64 * 1024).await;
 
         let mut input = serde_json::from_slice::<ProgramInput>(&first_input).unwrap();
         let mut previous_version: Option<u64> = None;
@@ -1121,7 +1116,7 @@ mod tests {
             assert_eq!(state.unfinalized_commit_len(), 0);
             assert_eq!(state.finalized_through(), Some(result.commit_log_index));
         }
-        coordinator.shutdown().await.unwrap();
+        coordinator.decisions.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -1178,7 +1173,7 @@ mod tests {
         let commit_cursor = committed.invocation.committed_batch.commit_cursor;
         drop(lease);
         drop(engine);
-        coordinator.shutdown().await.unwrap();
+        coordinator.decisions.shutdown().await.unwrap();
         drop(coordinator);
         drop(store);
 
@@ -1207,7 +1202,7 @@ mod tests {
         assert!(replay.replayed);
         assert_eq!(replay.commit_log_index, commit_cursor);
         assert_eq!(replay.receipt.outputs["value"], json!(1));
-        reopened.shutdown().await.unwrap();
+        reopened.decisions.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -1342,7 +1337,7 @@ mod tests {
         );
 
         drop(engine);
-        coordinator.shutdown().await.unwrap();
+        coordinator.decisions.shutdown().await.unwrap();
         drop(coordinator);
         drop(store);
 
@@ -1353,7 +1348,7 @@ mod tests {
         let state = reopened.decisions.state().unwrap();
         assert_eq!(state.finalized_through(), Some(second_cursor));
         assert_eq!(state.unfinalized_commit_len(), 0);
-        reopened.shutdown().await.unwrap();
+        reopened.decisions.shutdown().await.unwrap();
     }
 
     #[test]

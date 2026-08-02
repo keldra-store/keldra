@@ -17,7 +17,7 @@ use anvil_api::v1::administration_service_server::AdministrationServiceServer;
 use anvil_api::v1::authz_service_server::AuthzServiceServer;
 use anvil_api::v1::credential_service_server::CredentialServiceServer;
 use anvil_api::v1::object_service_server::ObjectServiceServer;
-use anvil_consensus::ATOMIC_REPLAY_RETENTION_MILLIS;
+use anvil_consensus::{ATOMIC_REPLAY_RETENTION_MILLIS, DecisionRaft, NodeId};
 use anvil_store::{MutationReceiptRetention, Store, StoreOptions, WatchRetention};
 use anyhow::{Context, Result};
 use tonic::transport::Server;
@@ -28,6 +28,7 @@ pub use v05::ObjectServiceImpl;
 
 const MAX_GRPC_MESSAGE_BYTES: usize = 72 * 1024 * 1024;
 const BLOB_GC_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const DECISION_LEADER_TIMEOUT: Duration = Duration::from_secs(10);
 // A maximum 1,000-item authorization batch can contain two maximum-size exact
 // paths per tuple plus identifiers and protobuf framing.
 const MIN_AUTHZ_BATCH_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
@@ -87,12 +88,26 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     )
     .await?;
     let authz_repository = store.authz();
-    let programs = programs::ProgramCoordinator::open(
-        store.clone(),
-        &config.data_dir,
+    let decisions = DecisionRaft::open(
+        config.data_dir.join("decisions"),
         u64::from(config.node_id),
         config.max_atomic_commit_entries,
         config.max_atomic_commit_bytes,
+    )
+    .await
+    .context("open bounded atomic decision Raft")?;
+    decisions
+        .ensure_one_node()
+        .await
+        .context("bootstrap one-node decision Raft")?;
+    decisions
+        .wait_for_leader(DECISION_LEADER_TIMEOUT)
+        .await
+        .context("elect decision leader")?;
+    let programs = programs::ProgramCoordinator::start(
+        store.clone(),
+        decisions.clone(),
+        NodeId(u64::from(config.node_id)),
     )
     .await?;
     // A committed bundle may have spent longer than the inactivity grace on
@@ -154,7 +169,10 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
             tracing::error!(%error, "blob garbage-collection task stopped unexpectedly");
         }
     }
-    let shutdown_result = programs.shutdown().await;
+    let shutdown_result = decisions
+        .shutdown()
+        .await
+        .context("shut down decision Raft");
     server_result?;
     shutdown_result
 }
