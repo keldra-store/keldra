@@ -59,6 +59,7 @@ image_gates() (
 
   local scratch
   scratch="$(mktemp -d)"
+  chmod 0755 "${scratch}"
   local container="anvil-v05-smoke-${$}"
   cleanup_image_gate() {
     docker rm --force "${container}" >/dev/null 2>&1 || true
