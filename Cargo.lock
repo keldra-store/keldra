@@ -177,6 +177,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "clap",
+ "getrandom 0.3.4",
  "governor",
  "hex",
  "jsonwebtoken",

@@ -89,6 +89,10 @@ service CredentialService {
 // same protected realm used by object and authorization requests, and each
 // resulting ownership or grant is an ordinary system-realm tuple.
 service AdministrationService {
+  // Prepares one JOINING node identity after system#manage_system
+  // authorization. The server writes a mode-0600 one-time bundle and returns
+  // its local path for the administrator to copy to the new node and delete.
+  rpc PrepareNode(PrepareNodeRequest) returns (PrepareNodeResponse);
   rpc ProvisionTenant(ProvisionTenantRequest) returns (ProvisionTenantResponse);
   rpc CreateApplication(CreateApplicationRequest) returns (ApplicationCredential);
   rpc RotateApplicationCredential(RotateApplicationCredentialRequest) returns (ApplicationCredential);
@@ -99,6 +103,26 @@ service AdministrationService {
   rpc SetBucketVersioning(SetBucketVersioningRequest) returns (SetBucketVersioningResponse);
   rpc GrantApplicationRole(ApplicationRoleRequest) returns (ApplicationRoleResponse);
   rpc RevokeApplicationRole(ApplicationRoleRequest) returns (ApplicationRoleResponse);
+}
+
+message PrepareNodeRequest {
+  // Stable Snowflake/Raft node identity in 1..=1023. Removed IDs are never
+  // reusable within the cluster.
+  uint32 node_id = 1;
+  // Connectable host:port advertised on the mandatory-mTLS peer network.
+  string peer_address = 2;
+  // Positive capacity ratio in millionths; 1000000 means 1.0.
+  uint32 storage_weight_millionths = 3;
+}
+
+message PrepareNodeResponse {
+  // Server-local mode-0600 file to copy to the configured joining node and
+  // delete after the copy. Private key or capability bytes are never returned
+  // in this protobuf response.
+  string join_bundle_path = 1;
+  bytes cluster_id = 2;
+  uint64 node_id = 3;
+  bytes peer_spki_sha256 = 4;
 }
 
 message ObjectAddress {

@@ -6,6 +6,7 @@ mod authz_service;
 mod bootstrap;
 mod cluster_startup;
 mod credential_service;
+mod join_bundle;
 mod mutable_record_quorum;
 mod mutable_record_replica_group;
 mod node_identity;
@@ -159,8 +160,11 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         config.atomic_program_timeout,
     );
     let authz_service = authz_service::AuthzServiceImpl::new(authz_repository);
-    let administration_service =
-        administration_service::AdministrationServiceImpl::new(store.clone());
+    let administration_service = administration_service::AdministrationServiceImpl::new(
+        store.clone(),
+        decisions.clone(),
+        config.data_dir.clone(),
+    );
     let request_rate_limits = RequestRateLimits::new(config.rate_limits);
     let credential_service = credential_service::CredentialServiceImpl::new(
         store.clone(),

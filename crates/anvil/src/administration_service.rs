@@ -1,7 +1,14 @@
 //! Typed administration backed by the protected Zanzibar system realm.
 
+use std::path::PathBuf;
+
 use anvil_api::v1 as api;
 use anvil_api::v1::administration_service_server::AdministrationService;
+use anvil_consensus::{
+    ApplyError, ApplyResult, CLUSTER_CONTROL_COMMAND_VERSION, CapabilityRange, Command,
+    DecisionRaft, DecisionRaftError, MAX_PEER_ADDRESS_BYTES, MembershipTransitionKind,
+    NodeDescriptor, NodeId, NodeState, PeerAddress, StateMachine,
+};
 use anvil_store::{
     ApplicationCredentialRequest, ApplicationRoleTarget, AuthzStoreError, BucketApplicationRole,
     CreateBucketRequest, CredentialMutationReceipt, CredentialRepositoryError,
@@ -12,24 +19,158 @@ use tonic::{Request, Response, Status};
 
 use crate::authentication::Caller;
 use crate::authorization::{StorageTenantPermission, SystemAuthorizer};
+use crate::join_bundle::{self, JoinBundle, JoinBundleError, JoinSeed};
 
-#[derive(Clone, Debug)]
+const PEER_PROTOCOL_VERSION: u16 = 1;
+const STORAGE_FORMAT_VERSION: u16 = 1;
+
+#[derive(Clone)]
 pub(crate) struct AdministrationServiceImpl {
     store: Store,
     system_authorizer: SystemAuthorizer,
+    decisions: DecisionRaft,
+    join_bundle_directory: PathBuf,
 }
 
 impl AdministrationServiceImpl {
-    pub(crate) fn new(store: Store) -> Self {
+    pub(crate) fn new(
+        store: Store,
+        decisions: DecisionRaft,
+        join_bundle_directory: PathBuf,
+    ) -> Self {
         Self {
             system_authorizer: SystemAuthorizer::new(store.authz()),
             store,
+            decisions,
+            join_bundle_directory,
         }
     }
 }
 
 #[tonic::async_trait]
 impl AdministrationService for AdministrationServiceImpl {
+    async fn prepare_node(
+        &self,
+        request: Request<api::PrepareNodeRequest>,
+    ) -> Result<Response<api::PrepareNodeResponse>, Status> {
+        let caller = caller(&request)?;
+        let request = request.into_inner();
+        let node_id = NodeId(u64::from(request.node_id));
+        let peer_address = parse_peer_address(request.peer_address)?;
+        if !(1..=1_023).contains(&node_id.0) {
+            return Err(Status::invalid_argument(
+                "node_id must be between 1 and 1023",
+            ));
+        }
+        if request.storage_weight_millionths == 0 {
+            return Err(Status::invalid_argument(
+                "storage_weight_millionths must be positive",
+            ));
+        }
+
+        let authorizer = self.system_authorizer.clone();
+        run(move || {
+            let system = authorizer.load().map_err(authz_status)?;
+            require_allowed(
+                system
+                    .allows_manage_system(caller.subject())
+                    .map_err(authz_evaluation_status)?,
+                "node preparation is not authorized",
+            )
+        })
+        .await?;
+
+        // The bundle is deliberately a node-local operator handoff file. Prove
+        // this node can commit before creating private material that a follower
+        // could only strand on its own disk.
+        self.decisions
+            .confirm_leadership()
+            .await
+            .map_err(decision_status)?;
+        let state = self.decisions.state().map_err(decision_status)?;
+        let cluster_id = state.cluster_id().ok_or_else(|| {
+            Status::failed_precondition("cluster identity has not been initialized")
+        })?;
+        let existing = preflight_node_preparation(
+            &state,
+            node_id,
+            &peer_address,
+            request.storage_weight_millionths,
+        )?;
+        let seeds = if existing.is_some() {
+            Vec::new()
+        } else {
+            active_join_seeds(&state)?
+        };
+        let directory = self.join_bundle_directory.clone();
+        let bundle_address = peer_address.clone();
+        let storage_weight_millionths = request.storage_weight_millionths;
+        let retry_existing = existing.is_some();
+        let (path, bundle) = run(move || {
+            let result = if retry_existing {
+                join_bundle::load_for_request(
+                    &directory,
+                    cluster_id,
+                    node_id,
+                    &bundle_address,
+                    storage_weight_millionths,
+                )
+            } else {
+                join_bundle::create_or_load(
+                    &directory,
+                    cluster_id,
+                    node_id,
+                    bundle_address,
+                    storage_weight_millionths,
+                    seeds,
+                )
+            };
+            result.map_err(join_bundle_status)
+        })
+        .await?;
+        let descriptor = joining_descriptor(&bundle)?;
+        if let Some(existing) = existing
+            && existing != descriptor
+        {
+            return Err(Status::failed_precondition(
+                "the retained JOINING descriptor differs from the prepared bundle",
+            ));
+        }
+
+        let committed = self
+            .decisions
+            .submit(Command::BeginAddNode {
+                format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+                descriptor,
+            })
+            .await
+            .map_err(decision_status)?;
+        match committed.result {
+            ApplyResult::MembershipTransitionBegun(transition)
+                if transition.kind == MembershipTransitionKind::Add
+                    && transition.node_id == node_id => {}
+            result => {
+                return Err(Status::internal(format!(
+                    "node preparation returned an unexpected result: {result:?}"
+                )));
+            }
+        }
+
+        let path = path.to_str().ok_or_else(|| {
+            Status::internal("join bundle path cannot be represented in the public response")
+        })?;
+        Ok(Response::new(api::PrepareNodeResponse {
+            join_bundle_path: path.to_owned(),
+            cluster_id: cluster_id.0.to_vec(),
+            node_id: node_id.0,
+            peer_spki_sha256: bundle
+                .peer_spki_sha256()
+                .map_err(join_bundle_status)?
+                .0
+                .to_vec(),
+        }))
+    }
+
     async fn provision_tenant(
         &self,
         request: Request<api::ProvisionTenantRequest>,
@@ -300,6 +441,109 @@ impl AdministrationServiceImpl {
     }
 }
 
+fn parse_peer_address(value: String) -> Result<PeerAddress, Status> {
+    if value.is_empty()
+        || value.len() > MAX_PEER_ADDRESS_BYTES
+        || value
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return Err(Status::invalid_argument(
+            "peer_address must contain 1 to 255 non-whitespace, non-control UTF-8 bytes",
+        ));
+    }
+    Ok(PeerAddress(value))
+}
+
+fn preflight_node_preparation(
+    state: &StateMachine,
+    node_id: NodeId,
+    peer_address: &PeerAddress,
+    storage_weight_millionths: u32,
+) -> Result<Option<NodeDescriptor>, Status> {
+    let cluster = state.cluster_control();
+    if let Some(existing) = cluster.nodes().get(&node_id) {
+        if existing.state != NodeState::Joining {
+            return Err(Status::already_exists("node ID is already active"));
+        }
+        let transition = cluster.transition().ok_or_else(|| {
+            Status::failed_precondition("JOINING descriptor has no ADD transition")
+        })?;
+        if transition.kind != MembershipTransitionKind::Add || transition.node_id != node_id {
+            return Err(Status::failed_precondition(
+                "another cluster membership transition is in progress",
+            ));
+        }
+        if &existing.peer_address != peer_address
+            || existing.storage_weight_millionths != storage_weight_millionths
+        {
+            return Err(Status::failed_precondition(
+                "the retained JOINING descriptor differs from the request",
+            ));
+        }
+        return Ok(Some(existing.clone()));
+    }
+    if cluster.used_node_ids().contains(node_id) {
+        return Err(Status::already_exists(
+            "node ID was previously admitted and cannot be reused",
+        ));
+    }
+    if cluster.transition().is_some() {
+        return Err(Status::failed_precondition(
+            "another cluster membership transition is in progress",
+        ));
+    }
+    if cluster
+        .nodes()
+        .values()
+        .any(|descriptor| &descriptor.peer_address == peer_address)
+    {
+        return Err(Status::already_exists("peer address is already admitted"));
+    }
+    Ok(None)
+}
+
+fn active_join_seeds(state: &StateMachine) -> Result<Vec<JoinSeed>, Status> {
+    let seeds = state
+        .cluster_control()
+        .nodes()
+        .values()
+        .filter(|descriptor| descriptor.state == NodeState::Active)
+        .map(|descriptor| JoinSeed {
+            node_id: descriptor.node_id,
+            peer_address: descriptor.peer_address.clone(),
+            current_peer_spki_sha256: descriptor.current_peer_spki_sha256,
+            overlap_peer_spki_sha256: descriptor.overlap_peer_spki_sha256,
+        })
+        .collect::<Vec<_>>();
+    if seeds.is_empty() {
+        return Err(Status::failed_precondition(
+            "cluster has no ACTIVE seed node",
+        ));
+    }
+    Ok(seeds)
+}
+
+fn joining_descriptor(bundle: &JoinBundle) -> Result<NodeDescriptor, Status> {
+    Ok(NodeDescriptor {
+        node_id: bundle.node_id,
+        peer_address: bundle.peer_address.clone(),
+        storage_weight_millionths: bundle.storage_weight_millionths,
+        state: NodeState::Joining,
+        current_peer_spki_sha256: bundle.peer_spki_sha256().map_err(join_bundle_status)?,
+        overlap_peer_spki_sha256: None,
+        join_capability_hash: Some(bundle.capability_hash()),
+        supported_protocol: CapabilityRange {
+            min: PEER_PROTOCOL_VERSION,
+            max: PEER_PROTOCOL_VERSION,
+        },
+        supported_storage_format: CapabilityRange {
+            min: STORAGE_FORMAT_VERSION,
+            max: STORAGE_FORMAT_VERSION,
+        },
+    })
+}
+
 fn require_manage_tenant_or_system(
     system: &crate::authorization::SystemAuthorization,
     caller: &Caller,
@@ -509,6 +753,59 @@ fn credential_store_status(error: CredentialRepositoryError) -> Status {
     }
 }
 
+fn decision_status(error: DecisionRaftError) -> Status {
+    match error {
+        DecisionRaftError::ForwardToLeader { .. } | DecisionRaftError::Unavailable(_) => {
+            Status::unavailable(error.to_string())
+        }
+        DecisionRaftError::LeaderTimeout | DecisionRaftError::SnapshotTimeout => {
+            Status::deadline_exceeded(error.to_string())
+        }
+        DecisionRaftError::Rejected(
+            ApplyError::NodeIdAlreadyUsed { .. }
+            | ApplyError::PeerAddressAlreadyUsed
+            | ApplyError::PeerSpkiAlreadyUsed
+            | ApplyError::JoinCapabilityAlreadyUsed,
+        ) => Status::already_exists(error.to_string()),
+        DecisionRaftError::Rejected(
+            ApplyError::InvalidNodeId
+            | ApplyError::InvalidPeerAddress
+            | ApplyError::InvalidStorageWeight
+            | ApplyError::InvalidCapabilityRange { .. }
+            | ApplyError::InvalidPeerSpki
+            | ApplyError::InvalidJoinCapabilityHash,
+        ) => Status::invalid_argument(error.to_string()),
+        DecisionRaftError::Rejected(_) => Status::failed_precondition(error.to_string()),
+        DecisionRaftError::InvalidNodeId | DecisionRaftError::Configuration(_) => {
+            Status::invalid_argument(error.to_string())
+        }
+        DecisionRaftError::Storage(_) | DecisionRaftError::StatePoisoned => {
+            Status::internal("cluster decision state could not be updated")
+        }
+    }
+}
+
+fn join_bundle_status(error: JoinBundleError) -> Status {
+    match error {
+        JoinBundleError::Conflict(message) => Status::failed_precondition(message),
+        JoinBundleError::AlreadyExists => {
+            Status::already_exists("join bundle path is already in use")
+        }
+        JoinBundleError::Invalid(message) => Status::failed_precondition(message),
+        JoinBundleError::UnsupportedFormat(_) => {
+            Status::failed_precondition("existing join bundle format is unsupported")
+        }
+        #[cfg(not(unix))]
+        JoinBundleError::UnsupportedPlatform => {
+            Status::failed_precondition("join bundle creation requires a Unix host")
+        }
+        JoinBundleError::Io(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Status::failed_precondition("prepared join bundle no longer exists")
+        }
+        JoinBundleError::Io(_) => Status::internal("join bundle could not be persisted"),
+    }
+}
+
 fn authz_status(error: AuthzStoreError) -> Status {
     let message = error.to_string();
     match error {
@@ -545,7 +842,15 @@ fn authz_evaluation_status(_error: anvil_authz::AuthorizationError) -> Status {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
+
     use anvil_api::v1::administration_service_server::AdministrationService;
+    use anvil_consensus::{
+        CapabilityRange, ClusterId, Command, JoinCapabilityHash, NodeDescriptor, NodeState,
+        PeerSpkiSha256,
+    };
     use anvil_store::{StoreOptions, SystemBootstrapRequest};
 
     use super::*;
@@ -564,7 +869,51 @@ mod tests {
                 client_secret: SECRET.into(),
             })
             .unwrap();
-        let service = AdministrationServiceImpl::new(store.clone());
+        let decisions = DecisionRaft::open(directory.path().join("decisions"), 1, 16, 64 * 1024)
+            .await
+            .unwrap();
+        decisions.ensure_one_node().await.unwrap();
+        decisions
+            .wait_for_leader(Duration::from_secs(5))
+            .await
+            .unwrap();
+        decisions
+            .submit(Command::InitializeCluster {
+                cluster_id: ClusterId([12; 16]),
+            })
+            .await
+            .unwrap();
+        let admitted = decisions
+            .submit(Command::BeginAddNode {
+                format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+                descriptor: NodeDescriptor {
+                    node_id: NodeId(1),
+                    peer_address: PeerAddress("anvil-local://1".into()),
+                    storage_weight_millionths: 1_000_000,
+                    state: NodeState::Joining,
+                    current_peer_spki_sha256: PeerSpkiSha256([1; 32]),
+                    overlap_peer_spki_sha256: None,
+                    join_capability_hash: Some(JoinCapabilityHash([1; 32])),
+                    supported_protocol: CapabilityRange { min: 1, max: 1 },
+                    supported_storage_format: CapabilityRange { min: 1, max: 1 },
+                },
+            })
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            decisions
+                .submit(Command::CompleteMembershipTransition {
+                    format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+                    started_log_index: admitted.log_index,
+                })
+                .await
+                .unwrap();
+        }
+        let service = AdministrationServiceImpl::new(
+            store.clone(),
+            decisions,
+            directory.path().to_path_buf(),
+        );
         (directory, store, service)
     }
 
@@ -574,6 +923,106 @@ mod tests {
             .extensions_mut()
             .insert(Caller::from_authenticated_application(tenant, app_id).unwrap());
         request
+    }
+
+    fn prepare_request() -> api::PrepareNodeRequest {
+        api::PrepareNodeRequest {
+            node_id: 2,
+            peer_address: "127.0.0.1:50062".into(),
+            storage_weight_millionths: 500_000,
+        }
+    }
+
+    #[tokio::test]
+    async fn prepare_node_is_authorized_private_redacted_and_exactly_retryable() {
+        let (_directory, _store, service) = service().await;
+        let first = service
+            .prepare_node(authenticated(
+                StorageTenantId::system(),
+                "bootstrap-app",
+                prepare_request(),
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(first.cluster_id, vec![12; 16]);
+        assert_eq!(first.node_id, 2);
+        assert_eq!(first.peer_spki_sha256.len(), 32);
+        let path = PathBuf::from(&first.join_bundle_path);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+        let encoded = std::fs::read(&path).unwrap();
+        let bundle = join_bundle::load(&path).unwrap();
+        let state = service.decisions.state().unwrap();
+        let descriptor = &state.cluster_control().nodes()[&NodeId(2)];
+        assert_eq!(descriptor.state, NodeState::Joining);
+        assert_eq!(
+            descriptor.current_peer_spki_sha256.0.to_vec(),
+            first.peer_spki_sha256
+        );
+        assert_eq!(
+            descriptor.join_capability_hash,
+            Some(bundle.capability_hash())
+        );
+        assert_ne!(
+            descriptor.join_capability_hash.unwrap().0,
+            bundle.capability()
+        );
+        assert_eq!(
+            state.cluster_control().transition().unwrap().node_id,
+            NodeId(2)
+        );
+
+        let retry = service
+            .prepare_node(authenticated(
+                StorageTenantId::system(),
+                "bootstrap-app",
+                prepare_request(),
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(retry, first);
+        assert_eq!(std::fs::read(&path).unwrap(), encoded);
+
+        let mut changed = prepare_request();
+        changed.storage_weight_millionths += 1;
+        let rejected = service
+            .prepare_node(authenticated(
+                StorageTenantId::system(),
+                "bootstrap-app",
+                changed,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(rejected.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(std::fs::read(path).unwrap(), encoded);
+    }
+
+    #[tokio::test]
+    async fn prepare_node_requires_manage_system_before_creating_private_material() {
+        let (directory, _store, service) = service().await;
+        let missing = service
+            .prepare_node(Request::new(prepare_request()))
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code(), tonic::Code::Unauthenticated);
+
+        let denied = service
+            .prepare_node(authenticated(
+                StorageTenantId::system(),
+                "not-an-admin",
+                prepare_request(),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+        assert!(!join_bundle::generated_path(directory.path(), NodeId(2)).exists());
+        let state = service.decisions.state().unwrap();
+        assert!(!state.cluster_control().nodes().contains_key(&NodeId(2)));
+        assert!(state.cluster_control().transition().is_none());
     }
 
     #[tokio::test]

@@ -30,8 +30,9 @@ anvil-store = { path = "../anvil-store" }
 anyhow = "1"
 blake3 = "1.8"
 clap = { version = "4.5", features = ["derive", "env"] }
-hex = "0.4"
+getrandom = "0.3"
 governor = "=0.10.4"
+hex = "0.4"
 jsonwebtoken = "9.3"
 libc = "0.2"
 opentelemetry = { version = "0.32", default-features = false, features = ["metrics", "trace"] }
