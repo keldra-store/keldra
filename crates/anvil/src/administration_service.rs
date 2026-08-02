@@ -91,70 +91,81 @@ impl AdministrationService for AdministrationServiceImpl {
         let cluster_id = state.cluster_id().ok_or_else(|| {
             Status::failed_precondition("cluster identity has not been initialized")
         })?;
-        let existing = preflight_node_preparation(
+        reconcile_committed_refresh(
+            &self.join_bundle_directory,
             &state,
             node_id,
             &peer_address,
             request.storage_weight_millionths,
         )?;
-        let seeds = if existing.is_some() {
-            Vec::new()
-        } else {
-            active_join_seeds(&state)?
-        };
-        let directory = self.join_bundle_directory.clone();
-        let bundle_address = peer_address.clone();
-        let storage_weight_millionths = request.storage_weight_millionths;
-        let retry_existing = existing.is_some();
-        let (path, bundle) = run(move || {
-            let result = if retry_existing {
-                join_bundle::load_for_request(
-                    &directory,
-                    cluster_id,
-                    node_id,
-                    &bundle_address,
-                    storage_weight_millionths,
-                )
-            } else {
-                join_bundle::create_or_load(
-                    &directory,
-                    cluster_id,
-                    node_id,
-                    bundle_address,
-                    storage_weight_millionths,
-                    seeds,
-                )
-            };
-            result.map_err(join_bundle_status)
-        })
-        .await?;
-        let descriptor = joining_descriptor(&bundle)?;
-        if let Some(existing) = existing
-            && existing != descriptor
-        {
-            return Err(Status::failed_precondition(
-                "the retained JOINING descriptor differs from the prepared bundle",
-            ));
-        }
-
-        let committed = self
+        let is_raft_member = self
             .decisions
-            .submit(Command::BeginAddNode {
-                format_version: CLUSTER_CONTROL_COMMAND_VERSION,
-                descriptor,
-            })
-            .await
-            .map_err(decision_status)?;
-        match committed.result {
-            ApplyResult::MembershipTransitionBegun(transition)
-                if transition.kind == MembershipTransitionKind::Add
-                    && transition.node_id == node_id => {}
-            result => {
-                return Err(Status::internal(format!(
-                    "node preparation returned an unexpected result: {result:?}"
-                )));
+            .committed_voter_ids()
+            .map_err(decision_status)?
+            .contains(&node_id)
+            || self
+                .decisions
+                .committed_learner_ids()
+                .map_err(decision_status)?
+                .contains(&node_id);
+        let existing = preflight_node_preparation(
+            &state,
+            node_id,
+            &peer_address,
+            request.storage_weight_millionths,
+            is_raft_member,
+        )?;
+        let seeds = active_join_seeds(&state)?;
+        let (path, bundle) = match existing {
+            None => {
+                let directory = self.join_bundle_directory.clone();
+                let bundle_address = peer_address.clone();
+                let storage_weight_millionths = request.storage_weight_millionths;
+                let (path, bundle) = run(move || {
+                    join_bundle::create_or_load(
+                        &directory,
+                        cluster_id,
+                        node_id,
+                        bundle_address,
+                        storage_weight_millionths,
+                        seeds,
+                    )
+                    .map_err(join_bundle_status)
+                })
+                .await?;
+                let descriptor = joining_descriptor(&bundle)?;
+                let committed = self
+                    .decisions
+                    .submit(Command::BeginAddNode {
+                        format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+                        descriptor,
+                    })
+                    .await
+                    .map_err(decision_status)?;
+                match committed.result {
+                    ApplyResult::MembershipTransitionBegun(transition)
+                        if transition.kind == MembershipTransitionKind::Add
+                            && transition.node_id == node_id => {}
+                    result => {
+                        return Err(Status::internal(format!(
+                            "node preparation returned an unexpected result: {result:?}"
+                        )));
+                    }
+                }
+                (path, bundle)
             }
-        }
+            Some(existing) => {
+                self.refresh_joining_preparation(
+                    cluster_id,
+                    node_id,
+                    peer_address.clone(),
+                    request.storage_weight_millionths,
+                    seeds,
+                    existing,
+                )
+                .await?
+            }
+        };
 
         let path = path.to_str().ok_or_else(|| {
             Status::internal("join bundle path cannot be represented in the public response")
@@ -439,6 +450,127 @@ impl AdministrationServiceImpl {
             replayed: receipt.replayed,
         }))
     }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn refresh_joining_preparation(
+        &self,
+        cluster_id: anvil_consensus::ClusterId,
+        node_id: NodeId,
+        peer_address: PeerAddress,
+        storage_weight_millionths: u32,
+        seeds: Vec<JoinSeed>,
+        existing: NodeDescriptor,
+    ) -> Result<(PathBuf, JoinBundle), Status> {
+        let current = match join_bundle::load_for_request(
+            &self.join_bundle_directory,
+            cluster_id,
+            node_id,
+            &peer_address,
+            storage_weight_millionths,
+        ) {
+            Ok(current) => Some(current),
+            // The operator is explicitly told to copy and delete this file.
+            // The committed descriptor retains the exact old public pair
+            // needed to fence one newly generated private preparation.
+            Err(JoinBundleError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(join_bundle_status(error)),
+        };
+        if let Some((_, current_bundle)) = &current
+            && joining_descriptor(current_bundle)? != existing
+        {
+            return Err(Status::failed_precondition(
+                "the retained JOINING descriptor differs from the prepared bundle",
+            ));
+        }
+        let mut prepared = match join_bundle::load_refresh(&self.join_bundle_directory, node_id) {
+            Ok(prepared) => Some(prepared),
+            Err(JoinBundleError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(join_bundle_status(error)),
+        };
+        if prepared.is_none()
+            && current
+                .as_ref()
+                .is_some_and(|(_, bundle)| bundle.seeds() == seeds.as_slice())
+        {
+            return Ok(current.expect("current bundle was checked above"));
+        }
+        if prepared
+            .as_ref()
+            .is_some_and(|(_, bundle)| bundle.seeds() != seeds.as_slice())
+        {
+            // This candidate was never committed and the ACTIVE seed view has
+            // moved again. It is safe to replace only because reconciliation
+            // above proved its pin/capability pair is not committed.
+            join_bundle::discard_refresh(&self.join_bundle_directory, node_id)
+                .map_err(join_bundle_status)?;
+            prepared = None;
+        }
+        let (_, replacement) = match prepared {
+            Some(prepared) => prepared,
+            None => join_bundle::prepare_refresh(
+                &self.join_bundle_directory,
+                cluster_id,
+                node_id,
+                peer_address,
+                storage_weight_millionths,
+                seeds,
+            )
+            .map_err(join_bundle_status)?,
+        };
+        let replacement_descriptor = joining_descriptor(&replacement)?;
+        let transition = self
+            .decisions
+            .state()
+            .map_err(decision_status)?
+            .cluster_control()
+            .transition()
+            .cloned()
+            .ok_or_else(|| {
+                Status::failed_precondition("JOINING descriptor has no ADD transition")
+            })?;
+        let committed = self
+            .decisions
+            .submit(Command::RefreshJoiningNodePreparation {
+                format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+                node_id,
+                started_log_index: transition.started_log_index,
+                expected_peer_spki_sha256: existing.current_peer_spki_sha256,
+                expected_join_capability_hash: existing.join_capability_hash.ok_or_else(|| {
+                    Status::failed_precondition("JOINING descriptor has no join capability")
+                })?,
+                replacement_peer_spki_sha256: replacement_descriptor.current_peer_spki_sha256,
+                replacement_join_capability_hash: replacement_descriptor
+                    .join_capability_hash
+                    .ok_or_else(|| {
+                        Status::failed_precondition("replacement has no join capability")
+                    })?,
+            })
+            .await;
+        let committed = match committed {
+            Ok(committed) => committed,
+            Err(
+                error @ DecisionRaftError::Rejected(ApplyError::JoiningNodeAlreadyRaftMember {
+                    ..
+                }),
+            ) => {
+                join_bundle::discard_refresh(&self.join_bundle_directory, node_id)
+                    .map_err(join_bundle_status)?;
+                return Err(decision_status(error));
+            }
+            Err(error) => return Err(decision_status(error)),
+        };
+        match committed.result {
+            ApplyResult::JoiningNodePreparationRefreshed(descriptor)
+                if descriptor == replacement_descriptor => {}
+            result => {
+                return Err(Status::internal(format!(
+                    "node preparation refresh returned an unexpected result: {result:?}"
+                )));
+            }
+        }
+        join_bundle::install_refresh(&self.join_bundle_directory, node_id, &replacement)
+            .map_err(join_bundle_status)
+    }
 }
 
 fn parse_peer_address(value: String) -> Result<PeerAddress, Status> {
@@ -460,11 +592,17 @@ fn preflight_node_preparation(
     node_id: NodeId,
     peer_address: &PeerAddress,
     storage_weight_millionths: u32,
+    is_raft_member: bool,
 ) -> Result<Option<NodeDescriptor>, Status> {
     let cluster = state.cluster_control();
     if let Some(existing) = cluster.nodes().get(&node_id) {
         if existing.state != NodeState::Joining {
-            return Err(Status::already_exists("node ID is already active"));
+            return Err(Status::failed_precondition("node ID is already active"));
+        }
+        if is_raft_member {
+            return Err(Status::failed_precondition(
+                "JOINING node is already in committed Raft membership",
+            ));
         }
         let transition = cluster.transition().ok_or_else(|| {
             Status::failed_precondition("JOINING descriptor has no ADD transition")
@@ -476,6 +614,18 @@ fn preflight_node_preparation(
         }
         if &existing.peer_address != peer_address
             || existing.storage_weight_millionths != storage_weight_millionths
+            || existing.supported_protocol
+                != (CapabilityRange {
+                    min: PEER_PROTOCOL_VERSION,
+                    max: PEER_PROTOCOL_VERSION,
+                })
+            || existing.supported_storage_format
+                != (CapabilityRange {
+                    min: STORAGE_FORMAT_VERSION,
+                    max: STORAGE_FORMAT_VERSION,
+                })
+            || existing.overlap_peer_spki_sha256.is_some()
+            || existing.join_capability_hash.is_none()
         {
             return Err(Status::failed_precondition(
                 "the retained JOINING descriptor differs from the request",
@@ -501,6 +651,69 @@ fn preflight_node_preparation(
         return Err(Status::already_exists("peer address is already admitted"));
     }
     Ok(None)
+}
+
+/// Finish a refresh whose Raft descriptor was committed before the process
+/// could rename the already-fsynced private bundle into place. The one
+/// deterministic temporary file is not a second state plane: only an exact
+/// committed public pin/capability pair authorizes its installation.
+fn reconcile_committed_refresh(
+    directory: &std::path::Path,
+    state: &StateMachine,
+    node_id: NodeId,
+    peer_address: &PeerAddress,
+    storage_weight_millionths: u32,
+) -> Result<(), Status> {
+    let (_, prepared) = match join_bundle::load_refresh(directory, node_id) {
+        Ok(prepared) => prepared,
+        Err(JoinBundleError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(());
+        }
+        Err(error) => return Err(join_bundle_status(error)),
+    };
+    let cluster_id = state
+        .cluster_id()
+        .ok_or_else(|| Status::failed_precondition("cluster identity has not been initialized"))?;
+    prepared
+        .ensure_request(cluster_id, node_id, peer_address, storage_weight_millionths)
+        .map_err(join_bundle_status)?;
+    let prepared_descriptor = joining_descriptor(&prepared)?;
+    let Some(committed) = state.cluster_control().nodes().get(&node_id) else {
+        // No Raft command can refer to this preparation. Remove the bounded
+        // orphan before an initial preparation reuses the node ID.
+        return join_bundle::discard_refresh(directory, node_id).map_err(join_bundle_status);
+    };
+    let stable_fields_match = committed.node_id == prepared_descriptor.node_id
+        && committed.peer_address == prepared_descriptor.peer_address
+        && committed.storage_weight_millionths == prepared_descriptor.storage_weight_millionths
+        && committed.supported_protocol == prepared_descriptor.supported_protocol
+        && committed.supported_storage_format == prepared_descriptor.supported_storage_format;
+    if !stable_fields_match {
+        return Err(Status::failed_precondition(
+            "prepared refresh differs from the committed node identity",
+        ));
+    }
+    if committed.current_peer_spki_sha256 != prepared_descriptor.current_peer_spki_sha256 {
+        // The replacement was fsynced but its Raft command did not commit.
+        // The normal retry path either proposes it or replaces it when the
+        // current ACTIVE seed descriptors have changed again.
+        return Ok(());
+    }
+    let capability_matches = match committed.state {
+        NodeState::Joining => {
+            committed.join_capability_hash == prepared_descriptor.join_capability_hash
+        }
+        // Activation consumes the join capability but retains the peer pin.
+        NodeState::Active => committed.join_capability_hash.is_none(),
+    };
+    if !capability_matches {
+        return Err(Status::failed_precondition(
+            "prepared refresh capability differs from committed state",
+        ));
+    }
+    join_bundle::install_refresh(directory, node_id, &prepared)
+        .map(|_| ())
+        .map_err(join_bundle_status)
 }
 
 fn active_join_seeds(state: &StateMachine) -> Result<Vec<JoinSeed>, Status> {
@@ -848,8 +1061,8 @@ mod tests {
 
     use anvil_api::v1::administration_service_server::AdministrationService;
     use anvil_consensus::{
-        CapabilityRange, ClusterId, Command, JoinCapabilityHash, NodeDescriptor, NodeState,
-        PeerSpkiSha256,
+        CapabilityRange, ClusterId, Command, CommittedPeerPins, JoinCapabilityHash, NodeDescriptor,
+        NodeState, PeerSpkiSha256,
     };
     use anvil_store::{StoreOptions, SystemBootstrapRequest};
 
@@ -999,6 +1212,185 @@ mod tests {
             .unwrap_err();
         assert_eq!(rejected.code(), tonic::Code::FailedPrecondition);
         assert_eq!(std::fs::read(path).unwrap(), encoded);
+    }
+
+    #[tokio::test]
+    async fn stale_joining_preparation_refreshes_only_unused_material_and_seed_view() {
+        let (directory, _store, service) = service().await;
+        let first = service
+            .prepare_node(authenticated(
+                StorageTenantId::system(),
+                "bootstrap-app",
+                prepare_request(),
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let first_path = PathBuf::from(&first.join_bundle_path);
+        let first_bundle = join_bundle::load(&first_path).unwrap();
+        // This is the documented operator handoff: copy the bundle to the new
+        // host, then delete the generated server-side file.
+        std::fs::remove_file(&first_path).unwrap();
+        std::fs::File::open(directory.path())
+            .unwrap()
+            .sync_all()
+            .unwrap();
+        let before = service.decisions.state().unwrap();
+        let original_descriptor = before.cluster_control().nodes()[&NodeId(2)].clone();
+        let original_transition = before.cluster_control().transition().cloned().unwrap();
+
+        let new_seed_pin = PeerSpkiSha256([99; 32]);
+        service
+            .decisions
+            .submit(Command::StagePeerSpkiOverlap {
+                format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+                node_id: NodeId(1),
+                expected_current: PeerSpkiSha256([1; 32]),
+                overlap: new_seed_pin,
+            })
+            .await
+            .unwrap();
+        let fresh_state = service.decisions.state().unwrap();
+        let fresh_seeds = active_join_seeds(&fresh_state).unwrap();
+
+        // Simulate a crash after fsyncing the candidate but before proposing
+        // the one replacement command. The API must reuse these exact bytes.
+        let (_, prepared) = join_bundle::prepare_refresh(
+            directory.path(),
+            ClusterId([12; 16]),
+            NodeId(2),
+            PeerAddress("127.0.0.1:50062".into()),
+            500_000,
+            fresh_seeds.clone(),
+        )
+        .unwrap();
+        let prepared_pin = prepared.peer_spki_sha256().unwrap();
+        let prepared_capability = prepared.capability_hash();
+
+        let refreshed = service
+            .prepare_node(authenticated(
+                StorageTenantId::system(),
+                "bootstrap-app",
+                prepare_request(),
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let refreshed_bundle = join_bundle::load(&first_path).unwrap();
+        assert_eq!(refreshed_bundle, prepared);
+        assert_eq!(refreshed_bundle.seeds(), fresh_seeds.as_slice());
+        assert!(!join_bundle::refresh_path(directory.path(), NodeId(2)).exists());
+        assert_ne!(refreshed.peer_spki_sha256, first.peer_spki_sha256);
+        assert_ne!(
+            refreshed_bundle.capability_hash(),
+            first_bundle.capability_hash()
+        );
+
+        let after = service.decisions.state().unwrap();
+        let replacement_descriptor = &after.cluster_control().nodes()[&NodeId(2)];
+        let mut expected = original_descriptor.clone();
+        expected.current_peer_spki_sha256 = prepared_pin;
+        expected.join_capability_hash = Some(prepared_capability);
+        assert_eq!(replacement_descriptor, &expected);
+        assert_eq!(
+            after.cluster_control().transition(),
+            Some(&original_transition),
+            "refresh must preserve the original ADD transition identity"
+        );
+        assert!(
+            !CommittedPeerPins {
+                current: replacement_descriptor.current_peer_spki_sha256,
+                overlap: replacement_descriptor.overlap_peer_spki_sha256,
+            }
+            .contains(original_descriptor.current_peer_spki_sha256)
+        );
+
+        let encoded = std::fs::read(&first_path).unwrap();
+        let exact_retry = service
+            .prepare_node(authenticated(
+                StorageTenantId::system(),
+                "bootstrap-app",
+                prepare_request(),
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(exact_retry, refreshed);
+        assert_eq!(std::fs::read(first_path).unwrap(), encoded);
+    }
+
+    #[tokio::test]
+    async fn committed_refresh_is_installed_after_restart_style_retry() {
+        let (directory, _store, service) = service().await;
+        let first = service
+            .prepare_node(authenticated(
+                StorageTenantId::system(),
+                "bootstrap-app",
+                prepare_request(),
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let final_path = PathBuf::from(&first.join_bundle_path);
+        let old_bytes = std::fs::read(&final_path).unwrap();
+        service
+            .decisions
+            .submit(Command::StagePeerSpkiOverlap {
+                format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+                node_id: NodeId(1),
+                expected_current: PeerSpkiSha256([1; 32]),
+                overlap: PeerSpkiSha256([98; 32]),
+            })
+            .await
+            .unwrap();
+        let state = service.decisions.state().unwrap();
+        let existing = state.cluster_control().nodes()[&NodeId(2)].clone();
+        let transition = state.cluster_control().transition().cloned().unwrap();
+        let (_, prepared) = join_bundle::prepare_refresh(
+            directory.path(),
+            ClusterId([12; 16]),
+            NodeId(2),
+            PeerAddress("127.0.0.1:50062".into()),
+            500_000,
+            active_join_seeds(&state).unwrap(),
+        )
+        .unwrap();
+        let replacement = joining_descriptor(&prepared).unwrap();
+        service
+            .decisions
+            .submit(Command::RefreshJoiningNodePreparation {
+                format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+                node_id: NodeId(2),
+                started_log_index: transition.started_log_index,
+                expected_peer_spki_sha256: existing.current_peer_spki_sha256,
+                expected_join_capability_hash: existing.join_capability_hash.unwrap(),
+                replacement_peer_spki_sha256: replacement.current_peer_spki_sha256,
+                replacement_join_capability_hash: replacement.join_capability_hash.unwrap(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&final_path).unwrap(), old_bytes);
+        assert!(join_bundle::refresh_path(directory.path(), NodeId(2)).exists());
+
+        let retried = service
+            .prepare_node(authenticated(
+                StorageTenantId::system(),
+                "bootstrap-app",
+                prepare_request(),
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            retried.peer_spki_sha256,
+            replacement.current_peer_spki_sha256.0.to_vec()
+        );
+        assert_eq!(join_bundle::load(&final_path).unwrap(), prepared);
+        assert!(!join_bundle::refresh_path(directory.path(), NodeId(2)).exists());
+        assert_eq!(
+            std::fs::metadata(final_path).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
     }
 
     #[tokio::test]

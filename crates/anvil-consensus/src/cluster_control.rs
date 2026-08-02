@@ -223,6 +223,84 @@ impl StateMachine {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn refresh_joining_node_preparation(
+        &mut self,
+        format_version: u16,
+        node_id: NodeId,
+        started_log_index: u64,
+        expected_peer_spki_sha256: PeerSpkiSha256,
+        expected_join_capability_hash: JoinCapabilityHash,
+        replacement_peer_spki_sha256: PeerSpkiSha256,
+        replacement_join_capability_hash: JoinCapabilityHash,
+    ) -> Result<ApplyResult, ApplyError> {
+        self.require_cluster_control(format_version)?;
+        validate_node_id(node_id)?;
+        validate_pin(expected_peer_spki_sha256)?;
+        validate_pin(replacement_peer_spki_sha256)?;
+        validate_join_capability(expected_join_capability_hash)?;
+        validate_join_capability(replacement_join_capability_hash)?;
+        let transition = self
+            .cluster_control
+            .transition
+            .as_ref()
+            .ok_or(ApplyError::NoMembershipTransition)?;
+        if transition.started_log_index != started_log_index {
+            return Err(ApplyError::MembershipTransitionFenceMismatch {
+                expected: transition.started_log_index,
+                requested: started_log_index,
+            });
+        }
+        if transition.kind != MembershipTransitionKind::Add || transition.node_id != node_id {
+            return Err(ApplyError::MembershipTransitionStateMismatch);
+        }
+        let descriptor = self
+            .cluster_control
+            .nodes
+            .get(&node_id)
+            .ok_or(ApplyError::NodeNotAdmitted { node_id })?;
+        if descriptor.state != NodeState::Joining || descriptor.overlap_peer_spki_sha256.is_some() {
+            return Err(ApplyError::MembershipTransitionStateMismatch);
+        }
+        if descriptor.current_peer_spki_sha256 == replacement_peer_spki_sha256
+            && descriptor.join_capability_hash == Some(replacement_join_capability_hash)
+        {
+            return Ok(ApplyResult::JoiningNodePreparationRefreshed(
+                descriptor.clone(),
+            ));
+        }
+        if expected_peer_spki_sha256 == replacement_peer_spki_sha256
+            || expected_join_capability_hash == replacement_join_capability_hash
+        {
+            return Err(ApplyError::JoiningPreparationUnchanged { node_id });
+        }
+        if descriptor.current_peer_spki_sha256 != expected_peer_spki_sha256
+            || descriptor.join_capability_hash != Some(expected_join_capability_hash)
+        {
+            return Err(ApplyError::JoiningPreparationPairMismatch { node_id });
+        }
+        ensure_pin_unique(
+            &self.cluster_control.nodes,
+            node_id,
+            replacement_peer_spki_sha256,
+        )?;
+        ensure_join_capability_unique(
+            &self.cluster_control.nodes,
+            node_id,
+            replacement_join_capability_hash,
+        )?;
+        let descriptor = self
+            .cluster_control
+            .nodes
+            .get_mut(&node_id)
+            .ok_or(ApplyError::MembershipTransitionStateMismatch)?;
+        descriptor.current_peer_spki_sha256 = replacement_peer_spki_sha256;
+        descriptor.join_capability_hash = Some(replacement_join_capability_hash);
+        Ok(ApplyResult::JoiningNodePreparationRefreshed(
+            descriptor.clone(),
+        ))
+    }
+
     pub(crate) fn stage_peer_spki_overlap(
         &mut self,
         format_version: u16,
@@ -492,6 +570,19 @@ fn ensure_pin_unique(
                 || descriptor.overlap_peer_spki_sha256 == Some(pin))
     }) {
         return Err(ApplyError::PeerSpkiAlreadyUsed);
+    }
+    Ok(())
+}
+
+fn ensure_join_capability_unique(
+    nodes: &std::collections::BTreeMap<NodeId, NodeDescriptor>,
+    node_id: NodeId,
+    capability: JoinCapabilityHash,
+) -> Result<(), ApplyError> {
+    if nodes.iter().any(|(other_id, descriptor)| {
+        *other_id != node_id && descriptor.join_capability_hash == Some(capability)
+    }) {
+        return Err(ApplyError::JoinCapabilityAlreadyUsed);
     }
     Ok(())
 }

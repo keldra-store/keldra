@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anvil_consensus::{
-    ApplyResult, CLUSTER_CONTROL_COMMAND_VERSION, CapabilityRange, ClusterId, Command,
+    ApplyError, ApplyResult, CLUSTER_CONTROL_COMMAND_VERSION, CapabilityRange, ClusterId, Command,
     DecisionRaft, DecisionRaftError, InMemoryPeerTransport, JoinCapabilityHash, NodeDescriptor,
     NodeId, NodeState, PeerAddress, PeerNode, PeerSpkiSha256,
 };
@@ -138,6 +138,28 @@ async fn fixed_voters_cover_one_two_three_and_four_active_nodes() {
             .await
             .unwrap();
 
+        if node_id == 2 {
+            let descriptor = leader.state().unwrap().cluster_control().nodes()[&NodeId(2)].clone();
+            let rejected = leader
+                .submit(Command::RefreshJoiningNodePreparation {
+                    format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+                    node_id: NodeId(2),
+                    started_log_index,
+                    expected_peer_spki_sha256: descriptor.current_peer_spki_sha256,
+                    expected_join_capability_hash: descriptor.join_capability_hash.unwrap(),
+                    replacement_peer_spki_sha256: PeerSpkiSha256([102; 32]),
+                    replacement_join_capability_hash: JoinCapabilityHash([103; 32]),
+                })
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                rejected,
+                DecisionRaftError::Rejected(ApplyError::JoiningNodeAlreadyRaftMember {
+                    node_id: NodeId(2)
+                })
+            ));
+        }
+
         // Catch-up is learner-only. Voter reconciliation is fenced until the
         // separate activation entry commits.
         assert!(
@@ -160,6 +182,26 @@ async fn fixed_voters_cover_one_two_three_and_four_active_nodes() {
         ));
 
         activate_and_finish(leader, started_log_index).await;
+        if node_id == 2 {
+            let rejected = leader
+                .submit(Command::RefreshJoiningNodePreparation {
+                    format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+                    node_id: NodeId(2),
+                    started_log_index,
+                    expected_peer_spki_sha256: PeerSpkiSha256([2; 32]),
+                    expected_join_capability_hash: JoinCapabilityHash([34; 32]),
+                    replacement_peer_spki_sha256: PeerSpkiSha256([102; 32]),
+                    replacement_join_capability_hash: JoinCapabilityHash([103; 32]),
+                })
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                rejected,
+                DecisionRaftError::Rejected(ApplyError::JoiningNodeAlreadyRaftMember {
+                    node_id: NodeId(2)
+                })
+            ));
+        }
         let expected = match node_id {
             2 => BTreeSet::from([NodeId(1), NodeId(2)]),
             3 | 4 => BTreeSet::from([NodeId(1), NodeId(2), NodeId(3)]),

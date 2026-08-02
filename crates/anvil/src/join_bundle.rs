@@ -127,6 +127,10 @@ impl JoinBundle {
         self.join_capability
     }
 
+    pub(crate) fn seeds(&self) -> &[JoinSeed] {
+        &self.seeds
+    }
+
     pub(crate) fn peer_spki_sha256(&self) -> Result<PeerSpkiSha256, JoinBundleError> {
         PeerTlsIdentity::from_pem(
             self.peer_identity.certificate_pem().as_bytes(),
@@ -146,7 +150,7 @@ impl JoinBundle {
         .map_err(|_| JoinBundleError::Invalid("peer identity is malformed"))
     }
 
-    fn ensure_request(
+    pub(crate) fn ensure_request(
         &self,
         cluster_id: ClusterId,
         node_id: NodeId,
@@ -231,6 +235,116 @@ pub(crate) fn load_for_request(
     Ok((path, existing))
 }
 
+/// Generate and fsync one bounded replacement before its descriptor pair is
+/// proposed to Raft. A retry reuses the exact private material already at the
+/// deterministic preparation path.
+pub(crate) fn prepare_refresh(
+    directory: &Path,
+    cluster_id: ClusterId,
+    node_id: NodeId,
+    peer_address: PeerAddress,
+    storage_weight_millionths: u32,
+    seeds: Vec<JoinSeed>,
+) -> Result<(PathBuf, JoinBundle), JoinBundleError> {
+    let path = refresh_path(directory, node_id);
+    match load(&path) {
+        Ok(existing) => {
+            existing.ensure_request(
+                cluster_id,
+                node_id,
+                &peer_address,
+                storage_weight_millionths,
+            )?;
+            return Ok((path, existing));
+        }
+        Err(JoinBundleError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let generated = JoinBundle::generate(
+        cluster_id,
+        node_id,
+        peer_address.clone(),
+        storage_weight_millionths,
+        seeds,
+    )?;
+    match write(&path, &generated) {
+        Ok(()) => Ok((path, generated)),
+        Err(JoinBundleError::AlreadyExists) => {
+            let existing = load(&path)?;
+            existing.ensure_request(
+                cluster_id,
+                node_id,
+                &peer_address,
+                storage_weight_millionths,
+            )?;
+            Ok((path, existing))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Atomically replace the operator bundle with the already-fsynced refresh.
+pub(crate) fn install_refresh(
+    directory: &Path,
+    node_id: NodeId,
+    expected: &JoinBundle,
+) -> Result<(PathBuf, JoinBundle), JoinBundleError> {
+    let prepared_path = refresh_path(directory, node_id);
+    let bundle = match load(&prepared_path) {
+        Ok(bundle) => bundle,
+        Err(JoinBundleError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+            return load_installed_refresh(directory, node_id, expected);
+        }
+        Err(error) => return Err(error),
+    };
+    if &bundle != expected {
+        return Err(JoinBundleError::Conflict(
+            "prepared refresh differs from the committed replacement",
+        ));
+    }
+    let final_path = generated_path(directory, node_id);
+    if let Err(error) = fs::rename(&prepared_path, &final_path) {
+        if error.kind() == io::ErrorKind::NotFound {
+            return load_installed_refresh(directory, node_id, expected);
+        }
+        return Err(error.into());
+    }
+    File::open(directory)?.sync_all()?;
+    Ok((final_path, bundle))
+}
+
+fn load_installed_refresh(
+    directory: &Path,
+    node_id: NodeId,
+    expected: &JoinBundle,
+) -> Result<(PathBuf, JoinBundle), JoinBundleError> {
+    let final_path = generated_path(directory, node_id);
+    let installed = load(&final_path)?;
+    if &installed != expected {
+        return Err(JoinBundleError::Conflict(
+            "installed refresh differs from the committed replacement",
+        ));
+    }
+    Ok((final_path, installed))
+}
+
+pub(crate) fn load_refresh(
+    directory: &Path,
+    node_id: NodeId,
+) -> Result<(PathBuf, JoinBundle), JoinBundleError> {
+    let path = refresh_path(directory, node_id);
+    load(&path).map(|bundle| (path, bundle))
+}
+
+pub(crate) fn discard_refresh(directory: &Path, node_id: NodeId) -> Result<(), JoinBundleError> {
+    let path = refresh_path(directory, node_id);
+    match fs::remove_file(path) {
+        Ok(()) => File::open(directory)?.sync_all().map_err(Into::into),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 pub(crate) fn write(path: &Path, bundle: &JoinBundle) -> Result<(), JoinBundleError> {
     validate(bundle)?;
     let encoded = encode(bundle)?;
@@ -287,6 +401,10 @@ pub(crate) fn consume(data_dir: &Path, bundle_path: &Path) -> Result<JoinBundle,
 
 pub(crate) fn generated_path(directory: &Path, node_id: NodeId) -> PathBuf {
     directory.join(format!("anvil-node-{}.join.json", node_id.0))
+}
+
+pub(crate) fn refresh_path(directory: &Path, node_id: NodeId) -> PathBuf {
+    directory.join(format!(".anvil-node-{}.join.refresh.tmp", node_id.0))
 }
 
 fn validate(bundle: &JoinBundle) -> Result<(), JoinBundleError> {

@@ -328,6 +328,23 @@ impl StateMachine {
                 format_version,
                 profile,
             } => self.bind_erasure_code_profile(*format_version, *profile),
+            Command::RefreshJoiningNodePreparation {
+                format_version,
+                node_id,
+                started_log_index,
+                expected_peer_spki_sha256,
+                expected_join_capability_hash,
+                replacement_peer_spki_sha256,
+                replacement_join_capability_hash,
+            } => self.refresh_joining_node_preparation(
+                *format_version,
+                *node_id,
+                *started_log_index,
+                *expected_peer_spki_sha256,
+                *expected_join_capability_hash,
+                *replacement_peer_spki_sha256,
+                *replacement_join_capability_hash,
+            ),
         }
     }
 
@@ -847,6 +864,12 @@ pub enum ApplyError {
     PeerOverlapAlreadySet { node_id: NodeId },
     #[error("node {node_id:?} peer pin pair does not match")]
     PeerPinPairMismatch { node_id: NodeId },
+    #[error("node {node_id:?} JOINING preparation pair does not match")]
+    JoiningPreparationPairMismatch { node_id: NodeId },
+    #[error("node {node_id:?} JOINING preparation replacement must change both identities")]
+    JoiningPreparationUnchanged { node_id: NodeId },
+    #[error("node {node_id:?} is already a committed Raft voter or learner")]
+    JoiningNodeAlreadyRaftMember { node_id: NodeId },
     #[error("JWT signing-key fingerprint must be non-zero")]
     InvalidJwtSigningKeyFingerprint,
     #[error("JWT signing-key fingerprint is already bound to another value")]

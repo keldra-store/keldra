@@ -142,6 +142,71 @@ fn add_is_bounded_fenced_and_sets_the_fixed_voter_target() {
 }
 
 #[test]
+fn joining_preparation_refresh_replaces_only_the_unused_pair_and_retries_exactly() {
+    let mut state = StateMachine::new(16, 64 * 1024).unwrap();
+    initialize(&mut state);
+    let original = joining(1);
+    begin_add(&mut state, 2, original.clone());
+    let transition = state.cluster_control().transition().cloned().unwrap();
+    let replacement_pin = PeerSpkiSha256([91; 32]);
+    let replacement_capability = JoinCapabilityHash([92; 32]);
+    let command = Command::RefreshJoiningNodePreparation {
+        format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+        node_id: NodeId(1),
+        started_log_index: transition.started_log_index,
+        expected_peer_spki_sha256: original.current_peer_spki_sha256,
+        expected_join_capability_hash: original.join_capability_hash.unwrap(),
+        replacement_peer_spki_sha256: replacement_pin,
+        replacement_join_capability_hash: replacement_capability,
+    };
+
+    let mut refreshed = None;
+    for log_index in [3, 4] {
+        let ApplyResult::JoiningNodePreparationRefreshed(descriptor) =
+            state.apply(log_id(log_index), &command).unwrap()
+        else {
+            panic!("refresh returned the wrong result")
+        };
+        assert_eq!(descriptor.current_peer_spki_sha256, replacement_pin);
+        assert_eq!(
+            descriptor.join_capability_hash,
+            Some(replacement_capability)
+        );
+        refreshed = Some(descriptor);
+    }
+    let refreshed = refreshed.unwrap();
+
+    let mut expected = original.clone();
+    expected.current_peer_spki_sha256 = replacement_pin;
+    expected.join_capability_hash = Some(replacement_capability);
+    assert_eq!(refreshed, expected);
+    assert_eq!(state.cluster_control().nodes()[&NodeId(1)], expected);
+    assert_eq!(
+        state.cluster_control().transition(),
+        Some(&transition),
+        "refresh must retain the ADD fence and target"
+    );
+
+    let before_rejection = state.clone();
+    assert_eq!(
+        state.apply(
+            log_id(5),
+            &Command::RefreshJoiningNodePreparation {
+                format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+                node_id: NodeId(1),
+                started_log_index: transition.started_log_index,
+                expected_peer_spki_sha256: original.current_peer_spki_sha256,
+                expected_join_capability_hash: original.join_capability_hash.unwrap(),
+                replacement_peer_spki_sha256: PeerSpkiSha256([93; 32]),
+                replacement_join_capability_hash: JoinCapabilityHash([94; 32]),
+            },
+        ),
+        Err(ApplyError::JoiningPreparationPairMismatch { node_id: NodeId(1) })
+    );
+    assert_eq!(state.cluster_control(), before_rejection.cluster_control());
+}
+
+#[test]
 fn active_placement_log_id_changes_only_with_active_placement() {
     let mut state = StateMachine::new(16, 64 * 1024).unwrap();
     initialize(&mut state);

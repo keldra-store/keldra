@@ -414,6 +414,17 @@ pub enum Command {
         format_version: u16,
         profile: ErasureCodeProfile,
     },
+    /// Replace only the unused private preparation for the current JOINING ADD.
+    /// The transition identity and every stable descriptor field are retained.
+    RefreshJoiningNodePreparation {
+        format_version: u16,
+        node_id: NodeId,
+        started_log_index: u64,
+        expected_peer_spki_sha256: PeerSpkiSha256,
+        expected_join_capability_hash: JoinCapabilityHash,
+        replacement_peer_spki_sha256: PeerSpkiSha256,
+        replacement_join_capability_hash: JoinCapabilityHash,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -429,4 +440,5 @@ pub enum ApplyResult {
     PeerSpkiChanged(NodeDescriptor),
     JwtSigningKeyFingerprintBound(JwtSigningKeyFingerprint),
     ErasureCodeProfileBound(ErasureCodeProfile),
+    JoiningNodePreparationRefreshed(NodeDescriptor),
 }

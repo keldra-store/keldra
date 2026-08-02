@@ -1116,7 +1116,8 @@ fn validate_membership_command(
         | Command::PromotePeerSpkiOverlap { .. }
         | Command::ClearPeerSpkiOverlap { .. }
         | Command::BindJwtSigningKeyFingerprint { .. }
-        | Command::BindErasureCodeProfile { .. } => None,
+        | Command::BindErasureCodeProfile { .. }
+        | Command::RefreshJoiningNodePreparation { .. } => None,
     };
     if let Some(executor) = executor
         && membership.membership().get_node(&executor.0).is_none()
@@ -1189,6 +1190,11 @@ fn validate_membership_command(
                 )?;
             }
         }
+    }
+    if let Command::RefreshJoiningNodePreparation { node_id, .. } = command
+        && membership.membership().get_node(&node_id.0).is_some()
+    {
+        return Err(ApplyError::JoiningNodeAlreadyRaftMember { node_id: *node_id });
     }
     Ok(())
 }
