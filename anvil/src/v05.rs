@@ -1,29 +1,45 @@
+use std::future::Future;
 use std::pin::Pin;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anvil_api::v1::batch_get_outcome::Outcome as BatchGetResult;
 use anvil_api::v1::object_chunk::Value as ObjectChunkValue;
 use anvil_api::v1::object_head::State as ObjectState;
 use anvil_api::v1::object_service_server::ObjectService;
-use anvil_api::v1::write_condition::Condition;
+use anvil_api::v1::object_version::State as ObjectVersionState;
+use anvil_api::v1::put_header::Operation as ApiPutOperation;
+use anvil_api::v1::watch_message::Message as WatchMessageValue;
+use anvil_api::v1::watch_prefix_request::Start as WatchStartValue;
 use anvil_api::v1::{
-    BatchGetObject, BatchGetOutcome, BatchGetRequest, BatchGetResponse, BlobRef as ApiBlobRef,
-    BucketPolicy, BulkOperation, BulkOutcome, BulkWriteRequest, BulkWriteResponse,
-    DeleteObjectRequest, DeletedObject, GetObjectRequest, HeadObjectRequest, InvokeProgramRequest,
-    InvokeProgramResponse, MutationFailure, MutationFailureCode,
-    MutationReceipt as ApiMutationReceipt, NeverExisted, ObjectAddress, ObjectChunk, ObjectHead,
-    PresentObject, PublishObjectRequest, PutObjectRequest, SetBucketPolicyRequest, UploadBlobChunk,
-    WriteCondition,
+    BatchGetObject, BatchGetOutcome, BatchGetRequest, BatchGetResponse, BucketPolicy,
+    BulkOperation, BulkOutcome, BulkPutIfVersionRequest, BulkPutRequest, BulkWriteRequest,
+    BulkWriteResponse, DeleteIfVersionRequest, DeleteRequest as ApiDeleteRequest,
+    DeleteVersionRequest, DeleteVersionResponse, DeletedObject, Durability as ApiDurability,
+    GetObjectRequest, HeadObjectRequest, InvokeProgramRequest, InvokeProgramResponse,
+    ListObjectVersionsRequest, ListObjectsRequest, ListObjectsResponse, MutationFailure,
+    MutationFailureCode, MutationReceipt as ApiMutationReceipt, NeverExisted, ObjectAddress,
+    ObjectChunk, ObjectHead, ObjectVersion, PresentObject, ProgramPathReceipt, PutHeader,
+    PutRequest as ApiPutRequest, PutToken, ReadFailure, ReadFailureCode, SetBucketPolicyRequest,
+    WatchCheckpoint, WatchInvalidation, WatchMessage, WatchPrefixRequest, WatchStateHint,
 };
+use anvil_atomic_program::{ExpandedProgramPath, MAX_OBJECT_PATH_BYTES};
 use anvil_store::{
-    AuthzStoreError, BatchOperation, BlobReader, BlobRef, DeleteRequest, MutationError,
-    MutationReceipt, ObjectKey, Precondition, PublishRequest, PutRequest, Store, Version,
-    VersionId,
+    AuthzStoreError, BatchOperation, BlobReader, BlobRef, BlobUpload,
+    DeleteRequest as StoreDeleteRequest, DeleteRetainedVersionOutcome,
+    Durability as StoreDurability, InvalidationStateHint, LocalInvalidation,
+    MAX_LIST_OBJECT_VERSIONS, MAX_LIST_OBJECTS, MAX_LOCAL_INVALIDATION_SCAN_RECORDS, MutationError,
+    MutationReceipt, ObjectKey, ObjectVersioning as StoreObjectVersioning, Precondition,
+    PublishRequest, PutMode, PutRequest as StorePutRequest, Store, Version, VersionId, WatchCursor,
+    WatchError, WatchJournalStatus, WatchScope, WatchStart,
 };
+use prost::Message as _;
+use serde::{Deserialize, Serialize};
 use tokio_stream::Stream;
 use tokio_stream::wrappers::ReceiverStream;
+use tonic::metadata::MetadataMap;
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::authentication::Caller;
+use crate::authentication::{Caller, JwtManager, PUT_TOKEN_LIFETIME};
 use crate::authorization::{ObjectPermission, SystemAuthorization, SystemAuthorizer};
 use crate::programs::ProgramCoordinator;
 
@@ -32,24 +48,35 @@ const MAX_BULK_ITEMS: usize = 1_000;
 const MAX_BULK_BYTES: usize = 64 * 1024 * 1024;
 const MAX_BATCH_GET_ITEMS: usize = 1_000;
 const MAX_BATCH_GET_BYTES: usize = 64 * 1024 * 1024;
-const LOCAL_DURABILITY_CLASS: &str = "local";
-const REPLICATED_DURABILITY_CLASS: &str = "replicated";
+const MAX_CONTENT_TYPE_BYTES: usize = 512;
+const DEFAULT_LIST_OBJECTS_LIMIT: usize = 100;
+const PUT_TOKEN_FORMAT_VERSION: u8 = 1;
 
 #[derive(Clone)]
 pub struct ObjectServiceImpl {
     store: Store,
     system_authorizer: SystemAuthorizer,
-    _programs: ProgramCoordinator,
+    programs: ProgramCoordinator,
+    jwt_manager: JwtManager,
     max_blob_bytes: u64,
+    atomic_program_timeout: Duration,
 }
 
 impl ObjectServiceImpl {
-    pub(crate) fn new(store: Store, programs: ProgramCoordinator, max_blob_bytes: u64) -> Self {
+    pub(crate) fn new(
+        store: Store,
+        programs: ProgramCoordinator,
+        jwt_manager: JwtManager,
+        max_blob_bytes: u64,
+        atomic_program_timeout: Duration,
+    ) -> Self {
         Self {
             system_authorizer: SystemAuthorizer::new(store.authz()),
             store,
-            _programs: programs,
+            programs,
+            jwt_manager,
             max_blob_bytes,
+            atomic_program_timeout,
         }
     }
 
@@ -62,83 +89,172 @@ impl ObjectServiceImpl {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalPutHeader {
+    tenant: String,
+    bucket: String,
+    path: String,
+    content_type: Option<String>,
+    command_id: String,
+    durability: TokenDurability,
+    operation: TokenPutOperation,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalPutCapability {
+    format_version: u8,
+    phase: PutTokenPhase,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PutTokenPhase {
+    Upload(UploadCapability),
+    Ready(ReadyCapability),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UploadCapability {
+    header: CanonicalPutHeader,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadyCapability {
+    header: CanonicalPutHeader,
+    blob_hash: [u8; 32],
+    blob_length: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TokenDurability {
+    Local,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TokenPutOperation {
+    Put,
+    PutIfAbsent,
+    PutIfVersion { expected_version: u64 },
+    PutImmutable,
+}
+
+#[derive(Clone, Debug)]
+struct PutMetadata {
+    key: ObjectKey,
+    content_type: Option<String>,
+    command_id: String,
+    durability: StoreDurability,
+    mode: PutMode,
+}
+
+#[derive(Debug)]
+struct ListObjectsQuery {
+    tenant: String,
+    bucket: String,
+    prefix: String,
+    start_after: Option<String>,
+    limit: usize,
+}
+
 type GetObjectStream =
     Pin<Box<dyn Stream<Item = Result<ObjectChunk, Status>> + Send + Sync + 'static>>;
+type ListObjectVersionsStream =
+    Pin<Box<dyn Stream<Item = Result<ObjectVersion, Status>> + Send + Sync + 'static>>;
+type WatchPrefixStream =
+    Pin<Box<dyn Stream<Item = Result<WatchMessage, Status>> + Send + Sync + 'static>>;
 
 #[tonic::async_trait]
 impl ObjectService for ObjectServiceImpl {
-    async fn upload_blob(
+    async fn start_put(&self, request: Request<PutHeader>) -> Result<Response<PutToken>, Status> {
+        let caller = authenticated_caller(&request)?;
+        let metadata = put_metadata(request.into_inner())?;
+        self.authorize_object(&caller, &metadata.key, ObjectPermission::Put)
+            .await?;
+        self.issue_upload_token(&caller, &metadata)
+            .map(Response::new)
+    }
+
+    async fn put(
         &self,
-        request: Request<Streaming<UploadBlobChunk>>,
-    ) -> Result<Response<ApiBlobRef>, Status> {
-        let _caller = authenticated_caller(&request)?;
+        request: Request<Streaming<ApiPutRequest>>,
+    ) -> Result<Response<PutToken>, Status> {
+        let caller = authenticated_caller(&request)?;
         let mut stream = request.into_inner();
+        let first = tokio::time::timeout(PUT_TOKEN_LIFETIME, stream.message())
+            .await
+            .map_err(|_| Status::deadline_exceeded("put stream inactivity lease expired"))??
+            .ok_or_else(|| Status::invalid_argument("put stream is empty"))?;
+        let token = required_put_token(first.token)?;
+        let capability = self.verify_put_token(&caller, &token)?;
+        let header = require_upload_phase(capability)?;
+        let metadata = header.to_metadata()?;
+        self.authorize_object(&caller, &metadata.key, ObjectPermission::Put)
+            .await?;
+
         let mut upload = self.store.begin_blob_upload().await.map_err(status)?;
         let mut length = 0_u64;
-        while let Some(chunk) = stream.message().await? {
-            length = length
-                .checked_add(chunk.bytes.len() as u64)
-                .ok_or_else(|| Status::resource_exhausted("blob length overflow"))?;
-            if length > self.max_blob_bytes {
-                return Err(Status::resource_exhausted("blob exceeds server limit"));
+        write_upload_chunk(&mut upload, &mut length, &first.chunk, self.max_blob_bytes).await?;
+        loop {
+            let frame = tokio::time::timeout(PUT_TOKEN_LIFETIME, stream.message())
+                .await
+                .map_err(|_| Status::deadline_exceeded("put stream inactivity lease expired"))??;
+            let Some(frame) = frame else {
+                break;
+            };
+            let frame_token = required_put_token(frame.token)?;
+            if frame_token != token {
+                return Err(Status::invalid_argument(
+                    "put stream contains a missing or different upload token",
+                ));
             }
-            upload.write(&chunk.bytes).await.map_err(internal)?;
+            write_upload_chunk(&mut upload, &mut length, &frame.chunk, self.max_blob_bytes).await?;
         }
-        let blob = upload.finish().await.map_err(internal)?;
-        Ok(Response::new(api_blob(&blob)))
+        let blob = self.store.seal_blob_upload(upload).await.map_err(status)?;
+        self.issue_ready_token(&caller, header, &blob)
+            .map(Response::new)
     }
 
-    async fn put_object(
+    async fn put_end(
         &self,
-        request: Request<PutObjectRequest>,
+        request: Request<PutToken>,
     ) -> Result<Response<ApiMutationReceipt>, Status> {
         let caller = authenticated_caller(&request)?;
-        let request = request.into_inner();
-        if request.bytes.len() as u64 > self.max_blob_bytes {
-            return Err(Status::resource_exhausted("object exceeds server limit"));
-        }
-        let request = put_request(request)?;
-        self.authorize_object(&caller, &request.key, ObjectPermission::Put)
+        let token = required_put_token(Some(request.into_inner()))?;
+        let capability = self.verify_put_token(&caller, &token)?;
+        let ready = require_ready_phase(capability)?;
+        let metadata = ready.header.to_metadata()?;
+        self.authorize_object(&caller, &metadata.key, ObjectPermission::Put)
             .await?;
         self.store
-            .put(request)
+            .publish(PublishRequest {
+                key: metadata.key,
+                blob: BlobRef {
+                    hash: ready.blob_hash,
+                    length: ready.blob_length,
+                },
+                content_type: metadata.content_type,
+                mode: metadata.mode,
+                command_id: Some(metadata.command_id),
+                durability: metadata.durability,
+            })
             .await
             .map(api_receipt)
             .map(Response::new)
             .map_err(status)
     }
 
-    async fn publish_object(
+    async fn delete(
         &self,
-        request: Request<PublishObjectRequest>,
+        request: Request<ApiDeleteRequest>,
     ) -> Result<Response<ApiMutationReceipt>, Status> {
         let caller = authenticated_caller(&request)?;
-        let request = request.into_inner();
-        if request
-            .blob
-            .as_ref()
-            .is_some_and(|blob| blob.length > self.max_blob_bytes)
-        {
-            return Err(Status::resource_exhausted("object exceeds server limit"));
-        }
-        let request = publish_request(request)?;
-        self.authorize_object(&caller, &request.key, ObjectPermission::Put)
-            .await?;
-        self.store
-            .publish(request)
-            .await
-            .map(api_receipt)
-            .map(Response::new)
-            .map_err(status)
-    }
-
-    async fn delete_object(
-        &self,
-        request: Request<DeleteObjectRequest>,
-    ) -> Result<Response<ApiMutationReceipt>, Status> {
-        let caller = authenticated_caller(&request)?;
-        let request = request.into_inner();
-        let request = delete_request(request)?;
+        let request = delete_request(request.into_inner(), Precondition::Any)?;
         self.authorize_object(&caller, &request.key, ObjectPermission::Delete)
             .await?;
         self.store
@@ -149,6 +265,43 @@ impl ObjectService for ObjectServiceImpl {
             .map_err(status)
     }
 
+    async fn delete_if_version(
+        &self,
+        request: Request<DeleteIfVersionRequest>,
+    ) -> Result<Response<ApiMutationReceipt>, Status> {
+        let caller = authenticated_caller(&request)?;
+        let request = request.into_inner();
+        let precondition = Precondition::Version(VersionId(request.expected_version));
+        let request = delete_if_version_request(request, precondition)?;
+        self.authorize_object(&caller, &request.key, ObjectPermission::Delete)
+            .await?;
+        self.store
+            .delete(request)
+            .await
+            .map(api_receipt)
+            .map(Response::new)
+            .map_err(status)
+    }
+
+    async fn delete_version(
+        &self,
+        request: Request<DeleteVersionRequest>,
+    ) -> Result<Response<DeleteVersionResponse>, Status> {
+        let caller = authenticated_caller(&request)?;
+        let request = request.into_inner();
+        let _durability = durability(request.durability)?;
+        let key = object_key(request.address)?;
+        self.authorize_object(&caller, &key, ObjectPermission::Delete)
+            .await?;
+        require_versioning_enabled(&self.store, &key)?;
+        let outcome = self
+            .store
+            .delete_retained_version(&key, VersionId(request.version))
+            .await
+            .map_err(status)?;
+        Ok(Response::new(api_delete_version_outcome(outcome)))
+    }
+
     async fn head_object(
         &self,
         request: Request<HeadObjectRequest>,
@@ -157,15 +310,58 @@ impl ObjectService for ObjectServiceImpl {
         let key = object_key(request.into_inner().address)?;
         self.authorize_object(&caller, &key, ObjectPermission::Get)
             .await?;
-        let Some(head) = self.store.head(&key).map_err(status)? else {
+        let Some(version) = self
+            .store
+            .current_version_metadata(&key)
+            .await
+            .map_err(status)?
+        else {
             return Ok(Response::new(never_existed()));
         };
-        let version = self
-            .store
-            .version_metadata(&key, head.version)
-            .map_err(status)?
-            .ok_or_else(|| Status::data_loss("object head references a missing version"))?;
-        Ok(Response::new(api_head(&version)))
+        Ok(Response::new(api_head(&version)?))
+    }
+
+    async fn list_objects(
+        &self,
+        request: Request<ListObjectsRequest>,
+    ) -> Result<Response<ListObjectsResponse>, Status> {
+        let caller = authenticated_caller(&request)?;
+        let query = list_objects_query(request.into_inner())?;
+        if caller.storage_tenant().as_str() != query.tenant.as_str() {
+            return Err(Status::permission_denied(
+                "object list does not belong to the authenticated tenant",
+            ));
+        }
+        let authorization = self.system_authorization().await?;
+        require_authorized(
+            authorization
+                .allows_bucket_objects(
+                    caller.subject(),
+                    &query.tenant,
+                    &query.bucket,
+                    ObjectPermission::Get,
+                )
+                .map_err(crate::authz_api::authz_status)?,
+            "bucket-wide object read is required for listing",
+        )?;
+
+        let store = self.store.clone();
+        let page = tokio::task::spawn_blocking(move || {
+            store.list_objects(
+                &query.tenant,
+                &query.bucket,
+                &query.prefix,
+                query.start_after.as_deref(),
+                query.limit,
+            )
+        })
+        .await
+        .map_err(|error| internal(format!("object listing worker failed: {error}")))?
+        .map_err(status)?;
+        Ok(Response::new(ListObjectsResponse {
+            paths: page.paths,
+            has_more: page.has_more,
+        }))
     }
 
     type GetObjectStream = GetObjectStream;
@@ -179,11 +375,23 @@ impl ObjectService for ObjectServiceImpl {
         let key = object_key(request.address)?;
         self.authorize_object(&caller, &key, ObjectPermission::Get)
             .await?;
+        if request.version.is_some() {
+            require_versioning_enabled(&self.store, &key)?;
+        }
         let selected = select_object_for_stream(&self.store, &key, request.version).await?;
         let (sender, receiver) = tokio::sync::mpsc::channel(8);
         tokio::spawn(async move {
             let (head, payload) = match selected {
-                Some(object) => (api_head(&object.version), object.payload),
+                Some(object) => {
+                    let head = match api_head(&object.version) {
+                        Ok(head) => head,
+                        Err(error) => {
+                            let _ = sender.send(Err(error)).await;
+                            return;
+                        }
+                    };
+                    (head, object.payload)
+                }
                 None => (never_existed(), SelectedPayload::Empty),
             };
             if sender
@@ -197,19 +405,6 @@ impl ObjectService for ObjectServiceImpl {
             }
             match payload {
                 SelectedPayload::Empty => {}
-                SelectedPayload::Inline(bytes) => {
-                    for bytes in bytes.chunks(OBJECT_CHUNK_BYTES) {
-                        if sender
-                            .send(Ok(ObjectChunk {
-                                value: Some(ObjectChunkValue::Bytes(bytes.to_vec())),
-                            }))
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                }
                 SelectedPayload::Blob(mut reader) => {
                     let mut bytes = vec![0_u8; OBJECT_CHUNK_BYTES];
                     loop {
@@ -237,69 +432,243 @@ impl ObjectService for ObjectServiceImpl {
         Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
     }
 
+    type ListObjectVersionsStream = ListObjectVersionsStream;
+
+    async fn list_object_versions(
+        &self,
+        request: Request<ListObjectVersionsRequest>,
+    ) -> Result<Response<Self::ListObjectVersionsStream>, Status> {
+        let caller = authenticated_caller(&request)?;
+        let key = object_key(request.into_inner().address)?;
+        self.authorize_object(&caller, &key, ObjectPermission::Get)
+            .await?;
+        require_versioning_enabled(&self.store, &key)?;
+
+        let store = self.store.clone();
+        let (sender, receiver) = tokio::sync::mpsc::channel(32);
+        tokio::spawn(async move {
+            let mut after = None;
+            loop {
+                let page_store = store.clone();
+                let page_key = key.clone();
+                let page = match tokio::task::spawn_blocking(move || {
+                    page_store.list_object_versions(&page_key, after, MAX_LIST_OBJECT_VERSIONS)
+                })
+                .await
+                {
+                    Ok(Ok(page)) => page,
+                    Ok(Err(error)) => {
+                        let _ = sender.send(Err(status(error))).await;
+                        return;
+                    }
+                    Err(error) => {
+                        let _ = sender
+                            .send(Err(internal(format!(
+                                "object-version listing worker failed: {error}"
+                            ))))
+                            .await;
+                        return;
+                    }
+                };
+                let complete = page.len() < MAX_LIST_OBJECT_VERSIONS;
+                for version in page {
+                    after = Some(version.id);
+                    let version = match api_object_version(&version) {
+                        Ok(version) => version,
+                        Err(error) => {
+                            let _ = sender.send(Err(error)).await;
+                            return;
+                        }
+                    };
+                    if sender.send(Ok(version)).await.is_err() {
+                        return;
+                    }
+                }
+                if complete {
+                    return;
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
+    }
+
     async fn bulk_write(
         &self,
         request: Request<BulkWriteRequest>,
     ) -> Result<Response<BulkWriteResponse>, Status> {
-        let caller = authenticated_caller(&request)?;
-        let operations = request.into_inner().operations;
-        validate_bulk_limits(&operations)?;
-        let authorization = self.system_authorization().await?;
+        let started = Instant::now();
+        let operation_count = request.get_ref().operations.len() as u64;
+        let encoded_bytes = request.get_ref().encoded_len() as u64;
+        let result = async {
+            let caller = authenticated_caller(&request)?;
+            let operations = request.into_inner().operations;
+            validate_bulk_limits(&operations)?;
+            let authorization = self.system_authorization().await?;
 
-        let mut accepted = Vec::with_capacity(operations.len());
-        let mut outcomes = Vec::new();
-        for (index, operation) in operations.into_iter().enumerate() {
-            match batch_operation(operation, self.max_blob_bytes) {
-                Ok(operation) => {
-                    match authorize_batch_operation(&authorization, &caller, &operation) {
-                        Ok(()) => accepted.push((index, operation)),
-                        Err(error) if error.code() == tonic::Code::PermissionDenied => {
-                            outcomes.push(BulkOutcome {
-                                index: index as u32,
-                                outcome: Some(anvil_api::v1::bulk_outcome::Outcome::Failure(
-                                    MutationFailure {
-                                        code: MutationFailureCode::AuthorizationDenied as i32,
-                                        message: error.message().to_owned(),
-                                        current_version: None,
-                                    },
-                                )),
-                            });
+            let mut accepted = Vec::with_capacity(operations.len());
+            let mut outcomes = Vec::new();
+            for (index, operation) in operations.into_iter().enumerate() {
+                match batch_operation(operation, self.max_blob_bytes) {
+                    Ok(operation) => {
+                        match authorize_batch_operation(&authorization, &caller, &operation) {
+                            Ok(()) => accepted.push((index, operation)),
+                            Err(error) if error.code() == tonic::Code::PermissionDenied => {
+                                outcomes.push(BulkOutcome {
+                                    index: index as u32,
+                                    outcome: Some(anvil_api::v1::bulk_outcome::Outcome::Failure(
+                                        MutationFailure {
+                                            code: MutationFailureCode::AuthorizationDenied as i32,
+                                            message: error.message().to_owned(),
+                                            current_version: None,
+                                        },
+                                    )),
+                                });
+                            }
+                            Err(error) => return Err(error),
                         }
-                        Err(error) => return Err(error),
                     }
-                }
-                Err(error) => outcomes.push(BulkOutcome {
-                    index: index as u32,
-                    outcome: Some(anvil_api::v1::bulk_outcome::Outcome::Failure(
-                        api_request_failure(error),
-                    )),
-                }),
-            }
-        }
-        let accepted_indices = accepted.iter().map(|(index, _)| *index).collect::<Vec<_>>();
-        let accepted_operations = accepted
-            .into_iter()
-            .map(|(_, operation)| operation)
-            .collect();
-        outcomes.extend(
-            self.store
-                .bulk_write(accepted_operations)
-                .await
-                .into_iter()
-                .map(|outcome| BulkOutcome {
-                    index: accepted_indices[outcome.index] as u32,
-                    outcome: Some(match outcome.result {
-                        Ok(receipt) => {
-                            anvil_api::v1::bulk_outcome::Outcome::Receipt(api_receipt(receipt))
-                        }
-                        Err(error) => {
-                            anvil_api::v1::bulk_outcome::Outcome::Failure(api_failure(error))
-                        }
+                    Err(error) => outcomes.push(BulkOutcome {
+                        index: index as u32,
+                        outcome: Some(anvil_api::v1::bulk_outcome::Outcome::Failure(
+                            api_request_failure(error),
+                        )),
                     }),
-                }),
-        );
-        outcomes.sort_unstable_by_key(|outcome| outcome.index);
-        Ok(Response::new(BulkWriteResponse { outcomes }))
+                }
+            }
+            let accepted_indices = accepted.iter().map(|(index, _)| *index).collect::<Vec<_>>();
+            let accepted_operations = accepted
+                .into_iter()
+                .map(|(_, operation)| operation)
+                .collect();
+            outcomes.extend(
+                self.store
+                    .bulk_write(accepted_operations)
+                    .await
+                    .into_iter()
+                    .map(|outcome| BulkOutcome {
+                        index: accepted_indices[outcome.index] as u32,
+                        outcome: Some(match outcome.result {
+                            Ok(receipt) => {
+                                anvil_api::v1::bulk_outcome::Outcome::Receipt(api_receipt(receipt))
+                            }
+                            Err(error) => {
+                                anvil_api::v1::bulk_outcome::Outcome::Failure(api_failure(error))
+                            }
+                        }),
+                    }),
+            );
+            outcomes.sort_unstable_by_key(|outcome| outcome.index);
+            Ok(Response::new(BulkWriteResponse { outcomes }))
+        }
+        .await;
+        record_bulk_write_metrics(operation_count, encoded_bytes, started.elapsed(), &result);
+        result
+    }
+
+    type WatchPrefixStream = WatchPrefixStream;
+
+    async fn watch_prefix(
+        &self,
+        request: Request<WatchPrefixRequest>,
+    ) -> Result<Response<Self::WatchPrefixStream>, Status> {
+        let caller = authenticated_caller(&request)?;
+        let request = request.into_inner();
+        let prefix = request
+            .prefix
+            .ok_or_else(|| Status::invalid_argument("watch prefix is required"))?;
+        let scope =
+            WatchScope::new(prefix.tenant, prefix.bucket, prefix.path).map_err(watch_status)?;
+        if caller.storage_tenant().as_str() != scope.tenant() {
+            return Err(Status::permission_denied(
+                "watch prefix does not belong to the authenticated tenant",
+            ));
+        }
+        let authorization = self.system_authorization().await?;
+        require_authorized(
+            authorization
+                .allows_bucket_objects(
+                    caller.subject(),
+                    scope.tenant(),
+                    scope.bucket(),
+                    ObjectPermission::Get,
+                )
+                .map_err(crate::authz_api::authz_status)?,
+            "bucket-wide object read is required for a prefix watch",
+        )?;
+        let start = match request.start {
+            Some(WatchStartValue::Now(_)) => WatchStart::Now,
+            Some(WatchStartValue::RetainedBeginning(_)) => WatchStart::RetainedBeginning,
+            Some(WatchStartValue::ResumeToken(token)) if !token.is_empty() => {
+                WatchStart::Resume(token)
+            }
+            Some(WatchStartValue::ResumeToken(_)) => {
+                return Err(Status::invalid_argument(
+                    "watch resume token must not be empty",
+                ));
+            }
+            None => {
+                return Err(Status::invalid_argument(
+                    "watch start must be NOW, retained beginning, or a resume token",
+                ));
+            }
+        };
+        let mut cursor = self
+            .store
+            .start_watch(&scope, start)
+            .map_err(watch_status)?;
+        observe_watch_journal(&self.store, cursor);
+        let store = self.store.clone();
+        let (sender, receiver) = tokio::sync::mpsc::channel(32);
+        tokio::spawn(async move {
+            let initial = watch_checkpoint_message(&store, &scope, cursor);
+            if send_watch(&sender, initial).await.is_err() {
+                return;
+            }
+            loop {
+                let page = match store
+                    .scan_watch_page(&scope, cursor, MAX_LOCAL_INVALIDATION_SCAN_RECORDS)
+                    .await
+                {
+                    Ok(page) => page,
+                    Err(error) => {
+                        let _ = sender.send(Err(watch_status(error))).await;
+                        return;
+                    }
+                };
+                if page.checkpoint.offset() != cursor.offset() {
+                    for invalidation in page.invalidations {
+                        if sender
+                            .send(Ok(WatchMessage {
+                                message: Some(WatchMessageValue::Invalidation(
+                                    api_watch_invalidation(invalidation),
+                                )),
+                            }))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    cursor = page.checkpoint;
+                    observe_watch_journal(&store, cursor);
+                    let checkpoint = watch_checkpoint_message(&store, &scope, cursor);
+                    if send_watch(&sender, checkpoint).await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                tokio::select! {
+                    result = store.wait_for_watch_change(cursor) => {
+                        if let Err(error) = result {
+                            let _ = sender.send(Err(watch_status(error))).await;
+                            return;
+                        }
+                    }
+                    () = sender.closed() => return,
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
     }
 
     async fn batch_get(
@@ -324,7 +693,10 @@ impl ObjectService for ObjectServiceImpl {
                     outcomes.push(BatchGetOutcome {
                         index: index as u32,
                         address,
-                        outcome: Some(BatchGetResult::Error(error.message().to_owned())),
+                        outcome: Some(BatchGetResult::Failure(ReadFailure {
+                            code: ReadFailureCode::Invalid as i32,
+                            message: error.message().to_owned(),
+                        })),
                     });
                     continue;
                 }
@@ -338,12 +710,32 @@ impl ObjectService for ObjectServiceImpl {
                     })
             });
             match authorization_result {
-                Ok(()) => accepted.push((index, key, request.version.map(VersionId))),
+                Ok(()) => {
+                    if request.version.is_some()
+                        && !bucket_versioning_enabled(&self.store, &key).map_err(status)?
+                    {
+                        outcomes.push(BatchGetOutcome {
+                            index: index as u32,
+                            address: Some(api_address(&key)),
+                            outcome: Some(BatchGetResult::Failure(ReadFailure {
+                                code: ReadFailureCode::VersioningDisabled as i32,
+                                message:
+                                    "exact-version reads require bucket versioning to be enabled"
+                                        .into(),
+                            })),
+                        });
+                        continue;
+                    }
+                    accepted.push((index, key, request.version.map(VersionId)));
+                }
                 Err(error) if error.code() == tonic::Code::PermissionDenied => {
                     outcomes.push(BatchGetOutcome {
                         index: index as u32,
                         address: Some(api_address(&key)),
-                        outcome: Some(BatchGetResult::Error(error.message().to_owned())),
+                        outcome: Some(BatchGetResult::Failure(ReadFailure {
+                            code: ReadFailureCode::AuthorizationDenied as i32,
+                            message: error.message().to_owned(),
+                        })),
                     });
                 }
                 Err(error) => return Err(error),
@@ -353,7 +745,7 @@ impl ObjectService for ObjectServiceImpl {
             .iter()
             .map(|(_, key, version)| (key.clone(), *version))
             .collect::<Vec<_>>();
-        let selection = self.store.select_batch_get(&requests);
+        let selection = self.store.select_batch_get(&requests).await;
         enforce_batch_get_payload_limit(selection.declared_present_payload_bytes())?;
         for (outcome, (index, key, requested_version)) in self
             .store
@@ -363,16 +755,25 @@ impl ObjectService for ObjectServiceImpl {
             .zip(accepted)
         {
             let outcome = match outcome {
-                Ok(Some(object)) => BatchGetResult::Object(BatchGetObject {
-                    head: Some(api_head(&object.version)),
-                    bytes: object.bytes,
-                }),
+                Ok(Some(object)) => match api_head(&object.version) {
+                    Ok(head) => BatchGetResult::Object(BatchGetObject {
+                        head: Some(head),
+                        bytes: object.bytes,
+                    }),
+                    Err(error) => BatchGetResult::Failure(ReadFailure {
+                        code: ReadFailureCode::DataLoss as i32,
+                        message: error.message().to_owned(),
+                    }),
+                },
                 Ok(None) if requested_version.is_none() => BatchGetResult::Object(BatchGetObject {
                     head: Some(never_existed()),
                     bytes: Vec::new(),
                 }),
-                Ok(None) => BatchGetResult::Error("requested version was not found".into()),
-                Err(error) => BatchGetResult::Error(error.to_string()),
+                Ok(None) => BatchGetResult::Failure(ReadFailure {
+                    code: ReadFailureCode::VersionNotFound as i32,
+                    message: "requested version was not found".into(),
+                }),
+                Err(error) => BatchGetResult::Failure(read_failure(error)),
             };
             outcomes.push(BatchGetOutcome {
                 index: index as u32,
@@ -408,7 +809,7 @@ impl ObjectService for ObjectServiceImpl {
                 &request.tenant,
                 &request.bucket,
                 anvil_store::BucketPolicy {
-                    create_once_prefixes: policy.immutable_path_prefixes.clone(),
+                    immutable_prefixes: policy.immutable_path_prefixes.clone(),
                     program_only_prefixes: policy.program_only_path_prefixes.clone(),
                 },
             )
@@ -421,16 +822,115 @@ impl ObjectService for ObjectServiceImpl {
         &self,
         request: Request<InvokeProgramRequest>,
     ) -> Result<Response<InvokeProgramResponse>, Status> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(effective_atomic_program_timeout(
+                request.metadata(),
+                self.atomic_program_timeout,
+            ))
+            .ok_or_else(|| Status::internal("configured atomic program timeout exceeds clock"))?;
         let caller = authenticated_caller(&request)?;
         let request = request.into_inner();
-        require_durability_class(&request.durability_class)?;
-        let program = object_key(request.program)?;
-        self.authorize_object(&caller, &program, ObjectPermission::Get)
-            .await?;
-        Err(Status::unimplemented(
-            "expanded program paths do not identify put versus delete authorization",
-        ))
+        let durability = durability(request.durability)?;
+        let program_address = request
+            .program
+            .clone()
+            .ok_or_else(|| Status::invalid_argument("program address is required"))?;
+        let program = object_key(Some(program_address.clone()))?;
+        let expected_program_hash = required_hash(&request.program_hash, "program_hash")?;
+        require_caller_tenant(&caller, &program)?;
+        let authorization = self.system_authorization().await?;
+        require_authorized(
+            authorization
+                .allows_object(caller.subject(), &program, ObjectPermission::Get)
+                .map_err(crate::authz_api::authz_status)?,
+            "program definition read is not authorized",
+        )?;
+
+        let invocation_id = request.invocation_id.clone();
+        let result = run_atomic_program_until(
+            deadline,
+            self.programs.invoke(
+                program,
+                expected_program_hash,
+                request.invocation_id,
+                &request.input_json,
+                durability_name(durability),
+                |dependency| authorize_program_dependency(&authorization, &caller, dependency),
+            ),
+        )
+        .await?;
+        let mut path_receipts = Vec::with_capacity(result.published_versions.len());
+        for (path, published) in result.published_versions {
+            path_receipts.push(ProgramPathReceipt {
+                address: Some(ObjectAddress {
+                    tenant: path.tenant,
+                    bucket: path.bucket,
+                    path: path.path,
+                }),
+                version: published.version.0,
+                deleted: published.deleted,
+            });
+        }
+        let output_json = serde_json::to_vec(&result.receipt.outputs)
+            .map_err(|error| internal(format!("encode atomic program output: {error}")))?;
+        let replay_expiration = UNIX_EPOCH
+            .checked_add(Duration::from_millis(
+                result.replay_guarantee_expires_at_unix_millis,
+            ))
+            .ok_or_else(|| Status::internal("atomic replay receipt expiry is out of range"))?;
+        let replay_guarantee_expires_at = Some(replay_expiration.into());
+        Ok(Response::new(InvokeProgramResponse {
+            invocation_id,
+            program: Some(program_address),
+            program_hash: result.program_hash.to_vec(),
+            executor_nomination_log_index: result.executor_nomination_log_index,
+            commit_log_index: result.commit_log_index,
+            path_receipts,
+            output_json,
+            replayed: result.replayed,
+            replay_guarantee_expires_at,
+        }))
     }
+}
+
+fn effective_atomic_program_timeout(metadata: &MetadataMap, server_maximum: Duration) -> Duration {
+    client_grpc_timeout(metadata).map_or(server_maximum, |client| client.min(server_maximum))
+}
+
+// Tonic enforces the same grpc-timeout grammar at the transport boundary. We
+// parse it here as well so InvokeProgram has one explicit absolute budget that
+// can be shorter than, but never longer than, the configured server maximum.
+fn client_grpc_timeout(metadata: &MetadataMap) -> Option<Duration> {
+    let encoded = metadata.get("grpc-timeout")?.to_str().ok()?;
+    if encoded.is_empty() {
+        return None;
+    }
+    let (value, unit) = encoded.split_at(encoded.len() - 1);
+    if value.is_empty() || value.len() > 8 {
+        return None;
+    }
+    let value = value.parse::<u64>().ok()?;
+    match unit {
+        "H" => Some(Duration::from_secs(value * 60 * 60)),
+        "M" => Some(Duration::from_secs(value * 60)),
+        "S" => Some(Duration::from_secs(value)),
+        "m" => Some(Duration::from_millis(value)),
+        "u" => Some(Duration::from_micros(value)),
+        "n" => Some(Duration::from_nanos(value)),
+        _ => None,
+    }
+}
+
+async fn run_atomic_program_until<T, F>(
+    deadline: tokio::time::Instant,
+    invocation: F,
+) -> Result<T, Status>
+where
+    F: Future<Output = Result<T, Status>>,
+{
+    tokio::time::timeout_at(deadline, invocation)
+        .await
+        .map_err(|_| Status::deadline_exceeded("atomic program execution deadline exceeded"))?
 }
 
 impl ObjectServiceImpl {
@@ -448,6 +948,134 @@ impl ObjectServiceImpl {
                 .map_err(crate::authz_api::authz_status)?,
             "object operation is not authorized",
         )
+    }
+
+    fn issue_upload_token(
+        &self,
+        caller: &Caller,
+        metadata: &PutMetadata,
+    ) -> Result<PutToken, Status> {
+        let operation = match metadata.mode {
+            PutMode::Put => TokenPutOperation::Put,
+            PutMode::PutIfAbsent => TokenPutOperation::PutIfAbsent,
+            PutMode::PutIfVersion(version) => TokenPutOperation::PutIfVersion {
+                expected_version: version.0,
+            },
+            PutMode::PutImmutable => TokenPutOperation::PutImmutable,
+        };
+        let header = CanonicalPutHeader {
+            tenant: metadata.key.tenant().to_owned(),
+            bucket: metadata.key.bucket().to_owned(),
+            path: metadata.key.path().to_owned(),
+            content_type: metadata.content_type.clone(),
+            command_id: metadata.command_id.clone(),
+            durability: token_durability(metadata.durability)?,
+            operation,
+        };
+        self.issue_put_capability(
+            caller,
+            CanonicalPutCapability {
+                format_version: PUT_TOKEN_FORMAT_VERSION,
+                phase: PutTokenPhase::Upload(UploadCapability { header }),
+            },
+        )
+    }
+
+    fn issue_ready_token(
+        &self,
+        caller: &Caller,
+        header: CanonicalPutHeader,
+        blob: &BlobRef,
+    ) -> Result<PutToken, Status> {
+        self.issue_put_capability(
+            caller,
+            CanonicalPutCapability {
+                format_version: PUT_TOKEN_FORMAT_VERSION,
+                phase: PutTokenPhase::Ready(ReadyCapability {
+                    header,
+                    blob_hash: blob.hash,
+                    blob_length: blob.length,
+                }),
+            },
+        )
+    }
+
+    fn issue_put_capability(
+        &self,
+        caller: &Caller,
+        capability: CanonicalPutCapability,
+    ) -> Result<PutToken, Status> {
+        let capability = serde_json::to_vec(&capability)
+            .map_err(|error| internal(format!("encode put capability: {error}")))?;
+        let (value, expires_at_unix_seconds) = self
+            .jwt_manager
+            .mint_put_token(caller, &capability, PUT_TOKEN_LIFETIME)
+            .map_err(|_| Status::internal("could not issue put token"))?;
+        let expires_at = UNIX_EPOCH
+            .checked_add(Duration::from_secs(expires_at_unix_seconds))
+            .ok_or_else(|| Status::internal("put token expiry is out of range"))?;
+        Ok(PutToken {
+            value: value.into_bytes(),
+            expires_at: Some(expires_at.into()),
+        })
+    }
+
+    fn verify_put_token(
+        &self,
+        caller: &Caller,
+        token: &PutToken,
+    ) -> Result<CanonicalPutCapability, Status> {
+        let value = std::str::from_utf8(&token.value)
+            .map_err(|_| Status::invalid_argument("put token is malformed"))?;
+        let claims = self
+            .jwt_manager
+            .verify_put_token(value)
+            .map_err(|_| Status::unauthenticated("put token is invalid or expired"))?;
+        if !claims.belongs_to(caller) {
+            return Err(Status::permission_denied(
+                "put token belongs to a different authenticated caller",
+            ));
+        }
+        let payload: CanonicalPutCapability = serde_json::from_slice(&claims.header)
+            .map_err(|_| Status::invalid_argument("put token capability is malformed"))?;
+        if payload.format_version != PUT_TOKEN_FORMAT_VERSION {
+            return Err(Status::invalid_argument("put token format is unsupported"));
+        }
+        let expires_at = token
+            .expires_at
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("put token expiry is missing"))?;
+        if expires_at.seconds < 0
+            || expires_at.nanos != 0
+            || expires_at.seconds as u64 != claims.expires_at_unix_seconds
+        {
+            return Err(Status::invalid_argument("put token expiry was modified"));
+        }
+        Ok(payload)
+    }
+}
+
+impl CanonicalPutHeader {
+    fn to_metadata(&self) -> Result<PutMetadata, Status> {
+        let mode = match self.operation {
+            TokenPutOperation::Put => PutMode::Put,
+            TokenPutOperation::PutIfAbsent => PutMode::PutIfAbsent,
+            TokenPutOperation::PutIfVersion { expected_version } => {
+                PutMode::PutIfVersion(VersionId(expected_version))
+            }
+            TokenPutOperation::PutImmutable => PutMode::PutImmutable,
+        };
+        let durability = match self.durability {
+            TokenDurability::Local => StoreDurability::Local,
+        };
+        Ok(PutMetadata {
+            key: ObjectKey::new(&self.tenant, &self.bucket, &self.path)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?,
+            content_type: self.content_type.clone(),
+            command_id: required_command_id(self.command_id.clone())?,
+            durability,
+            mode,
+        })
     }
 }
 
@@ -496,6 +1124,47 @@ fn authorize_batch_operation(
     )
 }
 
+fn authorize_program_dependency(
+    authorization: &SystemAuthorization,
+    caller: &Caller,
+    dependency: &ExpandedProgramPath,
+) -> Result<(), Status> {
+    let key = ObjectKey::new(
+        &dependency.path.tenant,
+        &dependency.path.bucket,
+        &dependency.path.path,
+    )
+    .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    require_caller_tenant(caller, &key)?;
+    for (required, permission, message) in [
+        (
+            dependency.intent.get,
+            ObjectPermission::Get,
+            "atomic program dependency read is not authorized",
+        ),
+        (
+            dependency.intent.put,
+            ObjectPermission::Put,
+            "atomic program dependency put is not authorized",
+        ),
+        (
+            dependency.intent.delete,
+            ObjectPermission::Delete,
+            "atomic program dependency delete is not authorized",
+        ),
+    ] {
+        if required {
+            require_authorized(
+                authorization
+                    .allows_object(caller.subject(), &key, permission)
+                    .map_err(crate::authz_api::authz_status)?,
+                message,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn authorization_store_status(error: AuthzStoreError) -> Status {
     match error {
         AuthzStoreError::MissingBinding(_, _) | AuthzStoreError::SchemaNotFound(_, _) => {
@@ -506,8 +1175,57 @@ fn authorization_store_status(error: AuthzStoreError) -> Status {
         AuthzStoreError::RevisionConflict { .. }
         | AuthzStoreError::BindingGenerationConflict { .. }
         | AuthzStoreError::RevisionNotAvailable { .. }
+        | AuthzStoreError::RevisionExpired { .. }
         | AuthzStoreError::OperationMismatch => Status::failed_precondition(error.to_string()),
+        AuthzStoreError::ReceiptCapacity => Status::resource_exhausted(error.to_string()),
         AuthzStoreError::Storage(_) => Status::internal(error.to_string()),
+    }
+}
+
+fn api_watch_invalidation(invalidation: LocalInvalidation) -> WatchInvalidation {
+    let state_hint = match invalidation.state_hint {
+        InvalidationStateHint::Present => WatchStateHint::Present,
+        InvalidationStateHint::Deleted => WatchStateHint::Deleted,
+    };
+    WatchInvalidation {
+        address: Some(api_address(&invalidation.key)),
+        minimum_path_version: invalidation.minimum_path_version.0,
+        state_hint: state_hint as i32,
+    }
+}
+
+fn watch_checkpoint_message(
+    store: &Store,
+    scope: &WatchScope,
+    cursor: anvil_store::WatchCursor,
+) -> Result<WatchMessage, Status> {
+    let resume_token = store
+        .watch_checkpoint(scope, cursor)
+        .map_err(watch_status)?;
+    Ok(WatchMessage {
+        message: Some(WatchMessageValue::Checkpoint(WatchCheckpoint {
+            resume_token,
+        })),
+    })
+}
+
+async fn send_watch(
+    sender: &tokio::sync::mpsc::Sender<Result<WatchMessage, Status>>,
+    message: Result<WatchMessage, Status>,
+) -> Result<(), ()> {
+    let terminal = message.is_err();
+    sender.send(message).await.map_err(|_| ())?;
+    if terminal { Err(()) } else { Ok(()) }
+}
+
+fn watch_status(error: WatchError) -> Status {
+    match &error {
+        WatchError::InvalidConfiguration(_) | WatchError::InvalidScope(_) => {
+            Status::invalid_argument(error.to_string())
+        }
+        WatchError::InvalidResumeToken => Status::invalid_argument(error.to_string()),
+        WatchError::ResumeExpired => Status::failed_precondition("RESUME_EXPIRED"),
+        WatchError::Storage(_) => Status::internal(error.to_string()),
     }
 }
 
@@ -518,7 +1236,6 @@ struct SelectedObject {
 
 enum SelectedPayload {
     Empty,
-    Inline(Vec<u8>),
     Blob(BlobReader),
 }
 
@@ -527,34 +1244,26 @@ async fn select_object_for_stream(
     key: &ObjectKey,
     requested_version: Option<u64>,
 ) -> Result<Option<SelectedObject>, Status> {
-    let version = match requested_version {
-        Some(version) => store
-            .version_metadata(key, VersionId(version))
-            .map_err(status)?
-            .ok_or_else(|| Status::not_found("requested version was not found"))?,
-        None => {
-            let Some(head) = store.head(key).map_err(status)? else {
-                return Ok(None);
-            };
-            store
-                .version_metadata(key, head.version)
-                .map_err(status)?
-                .ok_or_else(|| Status::data_loss("object head references a missing version"))?
-        }
+    let selected = store
+        .open_object(key, requested_version.map(VersionId))
+        .await
+        .map_err(status)?;
+    let Some(selected) = selected else {
+        return if requested_version.is_some() {
+            Err(Status::not_found("requested version was not found"))
+        } else {
+            Ok(None)
+        };
     };
-    let payload = match (&version.inline, &version.blob, version.deleted) {
-        (Some(inline), None, false) if inline.is_valid() => {
-            SelectedPayload::Inline(inline.bytes.clone())
-        }
-        (None, Some(blob), false) => {
-            SelectedPayload::Blob(store.open_blob(blob).await.map_err(status)?)
-        }
-        (None, None, true) => SelectedPayload::Empty,
-        _ => {
-            return Err(Status::internal("version has an invalid payload shape"));
-        }
+    let payload = match (selected.reader, selected.version.deleted) {
+        (Some(reader), false) => SelectedPayload::Blob(reader),
+        (None, true) => SelectedPayload::Empty,
+        _ => return Err(Status::internal("version has an invalid payload shape")),
     };
-    Ok(Some(SelectedObject { version, payload }))
+    Ok(Some(SelectedObject {
+        version: selected.version,
+        payload,
+    }))
 }
 
 fn validate_bulk_limits(operations: &[BulkOperation]) -> Result<(), Status> {
@@ -563,55 +1272,194 @@ fn validate_bulk_limits(operations: &[BulkOperation]) -> Result<(), Status> {
             "bulk contains more than {MAX_BULK_ITEMS} items"
         )));
     }
-    let mut payload_bytes = 0_usize;
-    for operation in operations {
-        if let Some(anvil_api::v1::bulk_operation::Operation::Put(request)) =
-            operation.operation.as_ref()
-        {
-            payload_bytes = payload_bytes
-                .checked_add(request.bytes.len())
-                .ok_or_else(|| Status::resource_exhausted("bulk payload overflow"))?;
+    enforce_bulk_encoded_limit(bulk_encoded_len(operations)?)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct BulkMetricCounts {
+    successful: u64,
+    failed: u64,
+    replayed: u64,
+}
+
+fn bulk_metric_counts(
+    operation_count: u64,
+    result: &Result<Response<BulkWriteResponse>, Status>,
+) -> BulkMetricCounts {
+    let Ok(response) = result else {
+        return BulkMetricCounts {
+            failed: operation_count,
+            ..Default::default()
+        };
+    };
+
+    let mut counts = BulkMetricCounts::default();
+    for outcome in &response.get_ref().outcomes {
+        match outcome.outcome.as_ref() {
+            Some(anvil_api::v1::bulk_outcome::Outcome::Receipt(receipt)) if receipt.replayed => {
+                counts.replayed += 1;
+            }
+            Some(anvil_api::v1::bulk_outcome::Outcome::Receipt(_)) => counts.successful += 1,
+            Some(anvil_api::v1::bulk_outcome::Outcome::Failure(_)) | None => counts.failed += 1,
         }
     }
-    if payload_bytes > MAX_BULK_BYTES {
+    let reported = counts.successful + counts.failed + counts.replayed;
+    counts.failed += operation_count.saturating_sub(reported);
+    counts
+}
+
+fn record_bulk_write_metrics(
+    operation_count: u64,
+    encoded_bytes: u64,
+    duration: Duration,
+    result: &Result<Response<BulkWriteResponse>, Status>,
+) {
+    let counts = bulk_metric_counts(operation_count, result);
+    tracing::info!(
+        monotonic_counter.anvil_bulk_operations_total = operation_count,
+        monotonic_counter.anvil_bulk_encoded_bytes_total = encoded_bytes,
+        monotonic_counter.anvil_bulk_successful_operations_total = counts.successful,
+        monotonic_counter.anvil_bulk_failed_operations_total = counts.failed,
+        monotonic_counter.anvil_bulk_replayed_operations_total = counts.replayed,
+        histogram.anvil_bulk_request_duration_seconds = duration.as_secs_f64(),
+        operation_count,
+        encoded_bytes,
+        successful = counts.successful,
+        failed = counts.failed,
+        replayed = counts.replayed,
+        "bulk write request completed"
+    );
+}
+
+fn observe_watch_journal(store: &Store, cursor: WatchCursor) {
+    match store.local_watch_status() {
+        Ok(status) => record_watch_journal_status(status, cursor.offset()),
+        Err(error) => {
+            tracing::warn!(%error, "watch journal metrics unavailable");
+        }
+    }
+}
+
+fn record_watch_journal_status(status: WatchJournalStatus, cursor_offset: u64) {
+    let Some(consumer_lag) = watch_consumer_lag(&status, cursor_offset) else {
+        tracing::warn!(
+            tail = status.tail,
+            cursor_offset,
+            "watch cursor is ahead of the local journal tail"
+        );
+        return;
+    };
+    tracing::info!(
+        gauge.anvil_watch_journal_retained_entries = status.retained_entries,
+        gauge.anvil_watch_journal_retained_bytes = status.retained_bytes,
+        histogram.anvil_watch_consumer_lag_entries = consumer_lag,
+        retained_entries = status.retained_entries,
+        retained_bytes = status.retained_bytes,
+        consumer_lag,
+        "watch journal observed"
+    );
+}
+
+fn watch_consumer_lag(status: &WatchJournalStatus, cursor_offset: u64) -> Option<u64> {
+    status.tail.checked_sub(cursor_offset)
+}
+
+fn bulk_encoded_len(operations: &[BulkOperation]) -> Result<usize, Status> {
+    let mut encoded_bytes = 0_usize;
+    for operation in operations {
+        let operation_bytes = operation.encoded_len();
+        encoded_bytes = encoded_bytes
+            .checked_add(1)
+            .and_then(|total| total.checked_add(protobuf_varint_len(operation_bytes)))
+            .and_then(|total| total.checked_add(operation_bytes))
+            .ok_or_else(|| Status::resource_exhausted("bulk encoded size overflow"))?;
+    }
+    Ok(encoded_bytes)
+}
+
+fn enforce_bulk_encoded_limit(encoded_bytes: usize) -> Result<(), Status> {
+    if encoded_bytes > MAX_BULK_BYTES {
         return Err(Status::resource_exhausted(format!(
-            "bulk payload exceeds {MAX_BULK_BYTES} bytes"
+            "bulk encoded request exceeds {MAX_BULK_BYTES} bytes"
         )));
     }
     Ok(())
 }
 
-fn put_request(request: PutObjectRequest) -> Result<PutRequest, Status> {
-    require_durability_class(&request.durability_class)?;
-    Ok(PutRequest {
+fn protobuf_varint_len(mut value: usize) -> usize {
+    let mut bytes = 1;
+    while value >= 0x80 {
+        value >>= 7;
+        bytes += 1;
+    }
+    bytes
+}
+
+fn put_metadata(request: PutHeader) -> Result<PutMetadata, Status> {
+    let mode = match request.operation {
+        Some(ApiPutOperation::Put(_)) => PutMode::Put,
+        Some(ApiPutOperation::PutIfAbsent(_)) => PutMode::PutIfAbsent,
+        Some(ApiPutOperation::PutIfVersion(request)) => {
+            PutMode::PutIfVersion(VersionId(request.expected_version))
+        }
+        Some(ApiPutOperation::PutImmutable(_)) => PutMode::PutImmutable,
+        None => return Err(Status::invalid_argument("put operation is required")),
+    };
+    Ok(PutMetadata {
+        key: object_key(request.address)?,
+        content_type: content_type(request.content_type)?,
+        command_id: required_command_id(request.command_id)?,
+        durability: durability(request.durability)?,
+        mode,
+    })
+}
+
+fn bulk_put_request(request: BulkPutRequest, mode: PutMode) -> Result<StorePutRequest, Status> {
+    Ok(StorePutRequest {
         key: object_key(request.address)?,
         bytes: request.bytes,
-        content_type: nonempty(request.content_type),
-        precondition: precondition(request.condition)?,
+        content_type: content_type(request.content_type)?,
+        mode,
         command_id: Some(required_command_id(request.command_id)?),
-        durability_class: request.durability_class,
+        durability: durability(request.durability)?,
     })
 }
 
-fn publish_request(request: PublishObjectRequest) -> Result<PublishRequest, Status> {
-    require_durability_class(&request.durability_class)?;
-    Ok(PublishRequest {
+fn bulk_put_if_version_request(
+    request: BulkPutIfVersionRequest,
+) -> Result<StorePutRequest, Status> {
+    let mode = PutMode::PutIfVersion(VersionId(request.expected_version));
+    Ok(StorePutRequest {
         key: object_key(request.address)?,
-        blob: blob(request.blob)?,
-        content_type: nonempty(request.content_type),
-        precondition: precondition(request.condition)?,
+        bytes: request.bytes,
+        content_type: content_type(request.content_type)?,
+        mode,
         command_id: Some(required_command_id(request.command_id)?),
-        durability_class: request.durability_class,
+        durability: durability(request.durability)?,
     })
 }
 
-fn delete_request(request: DeleteObjectRequest) -> Result<DeleteRequest, Status> {
-    require_durability_class(&request.durability_class)?;
-    Ok(DeleteRequest {
+fn delete_request(
+    request: ApiDeleteRequest,
+    precondition: Precondition,
+) -> Result<StoreDeleteRequest, Status> {
+    Ok(StoreDeleteRequest {
         key: object_key(request.address)?,
-        precondition: delete_precondition(request.condition)?,
+        precondition,
         command_id: Some(required_command_id(request.command_id)?),
-        durability_class: request.durability_class,
+        durability: durability(request.durability)?,
+    })
+}
+
+fn delete_if_version_request(
+    request: DeleteIfVersionRequest,
+    precondition: Precondition,
+) -> Result<StoreDeleteRequest, Status> {
+    Ok(StoreDeleteRequest {
+        key: object_key(request.address)?,
+        precondition,
+        command_id: Some(required_command_id(request.command_id)?),
+        durability: durability(request.durability)?,
     })
 }
 
@@ -619,30 +1467,42 @@ fn batch_operation(
     operation: BulkOperation,
     max_blob_bytes: u64,
 ) -> Result<BatchOperation, Status> {
-    match operation.operation {
+    let operation = match operation.operation {
         Some(anvil_api::v1::bulk_operation::Operation::Put(request)) => {
-            let request = put_request(request)?;
+            BatchOperation::Put(bulk_put_request(request, PutMode::Put)?)
+        }
+        Some(anvil_api::v1::bulk_operation::Operation::PutIfAbsent(request)) => {
+            BatchOperation::Put(bulk_put_request(request, PutMode::PutIfAbsent)?)
+        }
+        Some(anvil_api::v1::bulk_operation::Operation::PutIfVersion(request)) => {
+            BatchOperation::Put(bulk_put_if_version_request(request)?)
+        }
+        Some(anvil_api::v1::bulk_operation::Operation::PutImmutable(request)) => {
+            BatchOperation::Put(bulk_put_request(request, PutMode::PutImmutable)?)
+        }
+        Some(anvil_api::v1::bulk_operation::Operation::Delete(request)) => {
+            BatchOperation::Delete(delete_request(request, Precondition::Any)?)
+        }
+        Some(anvil_api::v1::bulk_operation::Operation::DeleteIfVersion(request)) => {
+            let version = VersionId(request.expected_version);
+            BatchOperation::Delete(delete_if_version_request(
+                request,
+                Precondition::Version(version),
+            )?)
+        }
+        None => return Err(Status::invalid_argument("bulk operation is required")),
+    };
+    match &operation {
+        BatchOperation::Put(request) => {
             if request.bytes.len() as u64 > max_blob_bytes {
                 return Err(Status::resource_exhausted(
                     "bulk put item exceeds the object-size limit",
                 ));
             }
-            Ok(BatchOperation::Put(request))
         }
-        Some(anvil_api::v1::bulk_operation::Operation::Publish(request)) => {
-            let request = publish_request(request)?;
-            if request.blob.length > max_blob_bytes {
-                return Err(Status::resource_exhausted(
-                    "bulk publish item exceeds the object-size limit",
-                ));
-            }
-            Ok(BatchOperation::Publish(request))
-        }
-        Some(anvil_api::v1::bulk_operation::Operation::Delete(request)) => {
-            delete_request(request).map(BatchOperation::Delete)
-        }
-        None => Err(Status::invalid_argument("bulk operation is required")),
+        BatchOperation::Publish(_) | BatchOperation::Delete(_) => {}
     }
+    Ok(operation)
 }
 
 fn api_request_failure(error: Status) -> MutationFailure {
@@ -664,65 +1524,111 @@ fn object_key(address: Option<ObjectAddress>) -> Result<ObjectKey, Status> {
         .map_err(|error| Status::invalid_argument(error.to_string()))
 }
 
-fn precondition(value: Option<WriteCondition>) -> Result<Precondition, Status> {
-    match value.and_then(|value| value.condition) {
-        None | Some(Condition::Any(true)) => Ok(Precondition::Any),
-        Some(Condition::Absent(true)) => Ok(Precondition::Absent),
-        Some(Condition::Version(version)) => Ok(Precondition::Version(VersionId(version))),
-        Some(_) => Err(Status::invalid_argument(
-            "boolean condition marker must be true",
-        )),
+fn list_objects_query(request: ListObjectsRequest) -> Result<ListObjectsQuery, Status> {
+    if request.prefix.len() > MAX_OBJECT_PATH_BYTES {
+        return Err(Status::invalid_argument(format!(
+            "list prefix exceeds {MAX_OBJECT_PATH_BYTES} UTF-8 bytes"
+        )));
     }
-}
-
-fn delete_precondition(value: Option<WriteCondition>) -> Result<Precondition, Status> {
-    let condition = precondition(value)?;
-    match condition {
-        Precondition::Any | Precondition::Version(_) => Ok(condition),
-        Precondition::Absent => Err(Status::invalid_argument(
-            "delete condition must be any or an exact version",
-        )),
-    }
-}
-
-fn blob(value: Option<ApiBlobRef>) -> Result<BlobRef, Status> {
-    let value = value.ok_or_else(|| Status::invalid_argument("blob reference is required"))?;
-    let hash: [u8; 32] = value
-        .blake3_hash
-        .try_into()
-        .map_err(|_| Status::invalid_argument("BLAKE3 hash must contain 32 bytes"))?;
-    Ok(BlobRef {
-        hash,
-        length: value.length,
+    let validation_path = request.start_after.as_deref().unwrap_or("_list");
+    ObjectKey::new(&request.tenant, &request.bucket, validation_path)
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    let limit = match request.limit as usize {
+        0 => DEFAULT_LIST_OBJECTS_LIMIT,
+        limit if limit <= MAX_LIST_OBJECTS => limit,
+        _ => {
+            return Err(Status::invalid_argument(format!(
+                "list limit must not exceed {MAX_LIST_OBJECTS}"
+            )));
+        }
+    };
+    Ok(ListObjectsQuery {
+        tenant: request.tenant,
+        bucket: request.bucket,
+        prefix: request.prefix,
+        start_after: request.start_after,
+        limit,
     })
 }
 
-fn api_blob(blob: &BlobRef) -> ApiBlobRef {
-    ApiBlobRef {
-        blake3_hash: blob.hash.to_vec(),
-        length: blob.length,
+fn required_hash(value: &[u8], name: &'static str) -> Result<[u8; 32], Status> {
+    let hash: [u8; 32] = value
+        .try_into()
+        .map_err(|_| Status::invalid_argument(format!("{name} must contain 32 bytes")))?;
+    if hash == [0; 32] {
+        return Err(Status::invalid_argument(format!(
+            "{name} must not be all zeroes"
+        )));
     }
+    Ok(hash)
 }
 
-fn api_head(version: &Version) -> ObjectHead {
+fn api_head(version: &Version) -> Result<ObjectHead, Status> {
     let state = if version.deleted {
         ObjectState::Deleted(DeletedObject {
             version: version.id.0,
         })
     } else {
-        let blob = version.blob.as_ref().map(api_blob).or_else(|| {
-            version.inline.as_ref().map(|inline| ApiBlobRef {
-                blake3_hash: inline.hash.to_vec(),
-                length: inline.length,
-            })
-        });
+        let blob = version
+            .blob
+            .as_ref()
+            .ok_or_else(|| Status::data_loss("live version has no payload reference"))?;
         ObjectState::Present(PresentObject {
             version: version.id.0,
-            blob,
+            content_hash: blob.hash.to_vec(),
+            content_length: blob.length,
             content_type: version.content_type.clone().unwrap_or_default(),
         })
     };
-    ObjectHead { state: Some(state) }
+    Ok(ObjectHead { state: Some(state) })
+}
+
+fn api_object_version(version: &Version) -> Result<ObjectVersion, Status> {
+    let state = match api_head(version)?.state {
+        Some(ObjectState::Present(present)) => ObjectVersionState::Present(present),
+        Some(ObjectState::Deleted(deleted)) => ObjectVersionState::Deleted(deleted),
+        Some(ObjectState::NeverExisted(_)) | None => {
+            return Err(Status::data_loss(
+                "stored version cannot have a never-existed state",
+            ));
+        }
+    };
+    Ok(ObjectVersion { state: Some(state) })
+}
+
+fn api_delete_version_outcome(outcome: DeleteRetainedVersionOutcome) -> DeleteVersionResponse {
+    match outcome {
+        DeleteRetainedVersionOutcome::NotFound => DeleteVersionResponse {
+            deleted: false,
+            replacement_tombstone_version: None,
+        },
+        DeleteRetainedVersionOutcome::DeletedNonCurrent => DeleteVersionResponse {
+            deleted: true,
+            replacement_tombstone_version: None,
+        },
+        DeleteRetainedVersionOutcome::ReplacedCurrentWithTombstone { version } => {
+            DeleteVersionResponse {
+                deleted: true,
+                replacement_tombstone_version: Some(version.0),
+            }
+        }
+    }
+}
+
+fn bucket_versioning_enabled(store: &Store, key: &ObjectKey) -> Result<bool, MutationError> {
+    store
+        .bucket_versioning(key.tenant(), key.bucket())
+        .map(|versioning| versioning == StoreObjectVersioning::Enabled)
+}
+
+fn require_versioning_enabled(store: &Store, key: &ObjectKey) -> Result<(), Status> {
+    if bucket_versioning_enabled(store, key).map_err(status)? {
+        Ok(())
+    } else {
+        Err(Status::failed_precondition(
+            "bucket versioning is not enabled",
+        ))
+    }
 }
 
 fn never_existed() -> ObjectHead {
@@ -732,12 +1638,17 @@ fn never_existed() -> ObjectHead {
 }
 
 fn api_receipt(receipt: MutationReceipt) -> ApiMutationReceipt {
+    let replay_guarantee_expires_at = UNIX_EPOCH
+        .checked_add(Duration::from_millis(
+            receipt.replay_guarantee_expires_at_unix_millis,
+        ))
+        .map(Into::into);
     ApiMutationReceipt {
         command_id: receipt.command_id.unwrap_or_default(),
-        fingerprint: receipt.fingerprint.to_vec(),
         version: receipt.version.0,
         deleted: receipt.deleted,
         replayed: receipt.replayed,
+        replay_guarantee_expires_at,
     }
 }
 
@@ -756,13 +1667,22 @@ fn api_failure(error: MutationError) -> MutationFailure {
             current.map(|value| value.0),
         ),
         MutationError::Immutable => (MutationFailureCode::Immutable, None),
+        MutationError::ImmutablePolicyRequired => {
+            (MutationFailureCode::ImmutablePolicyRequired, None)
+        }
         MutationError::ProgramConcurrencyViolation => {
             (MutationFailureCode::ProgramConcurrencyViolation, None)
         }
+        MutationError::CurrentTombstoneCannotBeDeleted => {
+            (MutationFailureCode::ConditionFailed, None)
+        }
+        MutationError::ObjectVersioningNotEnabled => (MutationFailureCode::ConditionFailed, None),
         MutationError::IdempotencyConflict => (MutationFailureCode::IdempotencyInputMismatch, None),
         MutationError::InvalidCommandId
         | MutationError::InvalidPolicy(_)
         | MutationError::BlobNotFound => (MutationFailureCode::Invalid, None),
+        MutationError::DurabilityUnavailable => (MutationFailureCode::DurabilityUnavailable, None),
+        MutationError::ReceiptCapacity => (MutationFailureCode::ResourceLimit, None),
         MutationError::Storage(_) => (MutationFailureCode::Internal, None),
     };
     MutationFailure {
@@ -774,30 +1694,117 @@ fn api_failure(error: MutationError) -> MutationFailure {
 
 fn status(error: MutationError) -> Status {
     match error {
+        MutationError::ProgramConcurrencyViolation => {
+            Status::failed_precondition(format!("PROGRAM_CONCURRENCY_VIOLATION: {error}"))
+        }
         MutationError::PreconditionFailed { .. }
         | MutationError::Immutable
-        | MutationError::ProgramConcurrencyViolation => {
+        | MutationError::ImmutablePolicyRequired
+        | MutationError::ObjectVersioningNotEnabled => {
             Status::failed_precondition(error.to_string())
         }
+        MutationError::CurrentTombstoneCannotBeDeleted => Status::failed_precondition(format!(
+            "CURRENT_TOMBSTONE_VERSION_CANNOT_BE_DELETED: {error}"
+        )),
         MutationError::IdempotencyConflict => Status::already_exists(error.to_string()),
         MutationError::InvalidCommandId | MutationError::InvalidPolicy(_) => {
             Status::invalid_argument(error.to_string())
         }
         MutationError::BlobNotFound => Status::not_found(error.to_string()),
+        MutationError::DurabilityUnavailable => {
+            Status::unavailable(format!("DURABILITY_UNAVAILABLE: {error}"))
+        }
+        MutationError::ReceiptCapacity => Status::resource_exhausted(error.to_string()),
         MutationError::Storage(_) => Status::internal(error.to_string()),
     }
 }
 
-fn require_durability_class(value: &str) -> Result<(), Status> {
-    match value {
-        LOCAL_DURABILITY_CLASS => Ok(()),
-        REPLICATED_DURABILITY_CLASS => Err(Status::unavailable(
-            "replicated durability is unavailable in Anvil 0.5.0",
+fn durability(value: i32) -> Result<StoreDurability, Status> {
+    match ApiDurability::try_from(value) {
+        Ok(ApiDurability::Local) => Ok(StoreDurability::Local),
+        Ok(ApiDurability::Replicated) => Err(Status::unavailable(
+            "DURABILITY_UNAVAILABLE: replicated durability is unavailable in Anvil 0.5.0",
         )),
-        _ => Err(Status::invalid_argument(
-            "durability_class must be exactly `local` or `replicated`",
+        Err(_) => Err(Status::invalid_argument("durability is unknown")),
+    }
+}
+
+fn token_durability(value: StoreDurability) -> Result<TokenDurability, Status> {
+    match value {
+        StoreDurability::Local => Ok(TokenDurability::Local),
+        StoreDurability::Replicated => Err(Status::unavailable(
+            "DURABILITY_UNAVAILABLE: replicated durability is unavailable in Anvil 0.5.0",
         )),
     }
+}
+
+fn durability_name(value: StoreDurability) -> &'static str {
+    match value {
+        StoreDurability::Local => "local",
+        StoreDurability::Replicated => "replicated",
+    }
+}
+
+fn read_failure(error: MutationError) -> ReadFailure {
+    let code = match &error {
+        MutationError::BlobNotFound => ReadFailureCode::DataLoss,
+        MutationError::ObjectVersioningNotEnabled => ReadFailureCode::VersioningDisabled,
+        MutationError::Storage(_) => ReadFailureCode::Internal,
+        MutationError::PreconditionFailed { .. }
+        | MutationError::Immutable
+        | MutationError::ImmutablePolicyRequired
+        | MutationError::ProgramConcurrencyViolation
+        | MutationError::CurrentTombstoneCannotBeDeleted
+        | MutationError::IdempotencyConflict
+        | MutationError::InvalidCommandId
+        | MutationError::DurabilityUnavailable
+        | MutationError::ReceiptCapacity
+        | MutationError::InvalidPolicy(_) => ReadFailureCode::Internal,
+    };
+    ReadFailure {
+        code: code as i32,
+        message: error.to_string(),
+    }
+}
+
+fn required_put_token(value: Option<PutToken>) -> Result<PutToken, Status> {
+    match value {
+        Some(token) if !token.value.is_empty() => Ok(token),
+        _ => Err(Status::invalid_argument("put token is required")),
+    }
+}
+
+fn require_upload_phase(capability: CanonicalPutCapability) -> Result<CanonicalPutHeader, Status> {
+    match capability.phase {
+        PutTokenPhase::Upload(upload) => Ok(upload.header),
+        PutTokenPhase::Ready(_) => Err(Status::failed_precondition(
+            "READY put token cannot start an upload",
+        )),
+    }
+}
+
+fn require_ready_phase(capability: CanonicalPutCapability) -> Result<ReadyCapability, Status> {
+    match capability.phase {
+        PutTokenPhase::Ready(ready) => Ok(ready),
+        PutTokenPhase::Upload(_) => Err(Status::failed_precondition(
+            "UPLOAD put token cannot publish an object",
+        )),
+    }
+}
+
+async fn write_upload_chunk(
+    upload: &mut BlobUpload,
+    length: &mut u64,
+    bytes: &[u8],
+    max_blob_bytes: u64,
+) -> Result<(), Status> {
+    *length = length
+        .checked_add(bytes.len() as u64)
+        .ok_or_else(|| Status::resource_exhausted("object length overflow"))?;
+    if *length > max_blob_bytes {
+        return Err(Status::resource_exhausted("object exceeds server limit"));
+    }
+    upload.write(bytes).await.map_err(internal)
 }
 
 fn enforce_batch_get_payload_limit(declared_payload_bytes: u64) -> Result<(), Status> {
@@ -813,17 +1820,32 @@ fn internal(error: impl std::fmt::Display) -> Status {
     Status::internal(error.to_string())
 }
 
-fn nonempty(value: String) -> Option<String> {
-    (!value.is_empty()).then_some(value)
+fn content_type(value: String) -> Result<Option<String>, Status> {
+    if value.len() > MAX_CONTENT_TYPE_BYTES {
+        Err(Status::invalid_argument(format!(
+            "content_type exceeds {MAX_CONTENT_TYPE_BYTES} UTF-8 bytes"
+        )))
+    } else {
+        Ok((!value.is_empty()).then_some(value))
+    }
 }
 
 fn required_command_id(value: String) -> Result<String, Status> {
-    nonempty(value).ok_or_else(|| Status::invalid_argument("command_id is required"))
+    if value.is_empty() || value.len() > 256 || value.contains('\0') {
+        Err(Status::invalid_argument(
+            "command_id must contain 1 to 256 bytes and no NUL",
+        ))
+    } else {
+        Ok(value)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anvil_api::v1::{
+        PutIfAbsentOperation, PutIfVersionOperation, PutImmutableOperation, PutOperation,
+    };
 
     fn address(path: &str) -> Option<ObjectAddress> {
         Some(ObjectAddress {
@@ -842,144 +1864,492 @@ mod tests {
         let deleted = Version {
             id: VersionId(9),
             blob: None,
-            inline: None,
             content_type: None,
             deleted: true,
             committed_at_unix_millis: 0,
         };
         assert!(matches!(
-            api_head(&deleted).state,
+            api_head(&deleted).unwrap().state,
             Some(ObjectState::Deleted(DeletedObject { version: 9 }))
         ));
     }
 
     #[test]
-    fn delete_rejects_the_put_only_absent_condition() {
-        let absent = WriteCondition {
-            condition: Some(Condition::Absent(true)),
-        };
-        assert_eq!(
-            delete_precondition(Some(absent)).unwrap_err().code(),
-            tonic::Code::InvalidArgument
-        );
+    fn list_objects_contract_defaults_and_bounds_its_stateless_page() {
+        let defaulted = list_objects_query(ListObjectsRequest {
+            tenant: "tenant".into(),
+            bucket: "bucket".into(),
+            prefix: "reports/".into(),
+            start_after: None,
+            limit: 0,
+        })
+        .unwrap();
+        assert_eq!(defaulted.limit, DEFAULT_LIST_OBJECTS_LIMIT);
+        assert_eq!(defaulted.prefix, "reports/");
 
-        let exact = WriteCondition {
-            condition: Some(Condition::Version(17)),
+        let bounded = list_objects_query(ListObjectsRequest {
+            tenant: "tenant".into(),
+            bucket: "bucket".into(),
+            prefix: String::new(),
+            start_after: Some("reports/last.json".into()),
+            limit: MAX_LIST_OBJECTS as u32,
+        })
+        .unwrap();
+        assert_eq!(bounded.start_after.as_deref(), Some("reports/last.json"));
+        assert_eq!(bounded.limit, MAX_LIST_OBJECTS);
+
+        let too_many = list_objects_query(ListObjectsRequest {
+            tenant: "tenant".into(),
+            bucket: "bucket".into(),
+            limit: MAX_LIST_OBJECTS as u32 + 1,
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert_eq!(too_many.code(), tonic::Code::InvalidArgument);
+        let empty_cursor = list_objects_query(ListObjectsRequest {
+            tenant: "tenant".into(),
+            bucket: "bucket".into(),
+            start_after: Some(String::new()),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert_eq!(empty_cursor.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn present_head_contains_public_hash_and_length_without_a_blob_reference() {
+        let present = Version {
+            id: VersionId(4),
+            blob: Some(BlobRef {
+                hash: *blake3::hash(b"payload").as_bytes(),
+                length: 7,
+            }),
+            content_type: Some("application/octet-stream".into()),
+            deleted: false,
+            committed_at_unix_millis: 0,
         };
+        let Some(ObjectState::Present(head)) = api_head(&present).unwrap().state else {
+            panic!("present version must produce a present head");
+        };
+        assert_eq!(head.version, 4);
         assert_eq!(
-            delete_precondition(Some(exact)).unwrap(),
-            Precondition::Version(VersionId(17))
+            head.content_hash.as_slice(),
+            blake3::hash(b"payload").as_bytes()
+        );
+        assert_eq!(head.content_length, 7);
+    }
+
+    #[test]
+    fn retained_version_metadata_and_delete_outcomes_preserve_public_semantics() {
+        let present = Version {
+            id: VersionId(4),
+            blob: Some(BlobRef {
+                hash: *blake3::hash(b"payload").as_bytes(),
+                length: 7,
+            }),
+            content_type: Some("application/octet-stream".into()),
+            deleted: false,
+            committed_at_unix_millis: 0,
+        };
+        assert!(matches!(
+            api_object_version(&present).unwrap().state,
+            Some(ObjectVersionState::Present(PresentObject {
+                version: 4,
+                ..
+            }))
+        ));
+
+        assert_eq!(
+            api_delete_version_outcome(DeleteRetainedVersionOutcome::NotFound),
+            DeleteVersionResponse {
+                deleted: false,
+                replacement_tombstone_version: None,
+            }
+        );
+        assert_eq!(
+            api_delete_version_outcome(DeleteRetainedVersionOutcome::DeletedNonCurrent),
+            DeleteVersionResponse {
+                deleted: true,
+                replacement_tombstone_version: None,
+            }
+        );
+        assert_eq!(
+            api_delete_version_outcome(
+                DeleteRetainedVersionOutcome::ReplacedCurrentWithTombstone {
+                    version: VersionId(12),
+                }
+            ),
+            DeleteVersionResponse {
+                deleted: true,
+                replacement_tombstone_version: Some(12),
+            }
         );
     }
 
     #[test]
-    fn invalid_bulk_item_is_reported_as_an_item_failure() {
-        let operation = BulkOperation {
-            operation: Some(anvil_api::v1::bulk_operation::Operation::Put(
-                PutObjectRequest {
-                    address: Some(ObjectAddress {
-                        tenant: "tenant".into(),
-                        bucket: "bucket".into(),
-                        path: "object".into(),
-                    }),
-                    bytes: vec![0; 2],
-                    command_id: "command".into(),
-                    durability_class: LOCAL_DURABILITY_CLASS.into(),
-                    ..Default::default()
-                },
-            )),
-        };
-
-        let error = batch_operation(operation, 1).unwrap_err();
-        let failure = api_request_failure(error);
-        assert_eq!(failure.code, MutationFailureCode::ResourceLimit as i32);
+    fn typed_put_operations_map_one_to_one_to_store_modes() {
+        let cases = [
+            (ApiPutOperation::Put(PutOperation {}), PutMode::Put),
+            (
+                ApiPutOperation::PutIfAbsent(PutIfAbsentOperation {}),
+                PutMode::PutIfAbsent,
+            ),
+            (
+                ApiPutOperation::PutIfVersion(PutIfVersionOperation {
+                    expected_version: 17,
+                }),
+                PutMode::PutIfVersion(VersionId(17)),
+            ),
+            (
+                ApiPutOperation::PutImmutable(PutImmutableOperation {}),
+                PutMode::PutImmutable,
+            ),
+        ];
+        for (operation, expected) in cases {
+            let metadata = put_metadata(PutHeader {
+                address: address("object"),
+                command_id: "command".into(),
+                operation: Some(operation),
+                ..Default::default()
+            })
+            .unwrap();
+            assert_eq!(metadata.mode, expected);
+            assert_eq!(metadata.durability, StoreDurability::Local);
+        }
     }
 
     #[test]
-    fn bulk_conversion_preserves_local_durability_class() {
-        let operations = [
+    fn put_requires_an_explicit_operation_and_command_id() {
+        let missing_operation = put_metadata(PutHeader {
+            address: address("object"),
+            command_id: "command".into(),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert_eq!(missing_operation.code(), tonic::Code::InvalidArgument);
+
+        let missing_command = put_metadata(PutHeader {
+            address: address("object"),
+            operation: Some(ApiPutOperation::Put(PutOperation {})),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert_eq!(missing_command.code(), tonic::Code::InvalidArgument);
+        assert!(required_command_id("a".repeat(256)).is_ok());
+        assert!(required_command_id("a".repeat(257)).is_err());
+        assert!(required_command_id("nul\0command".into()).is_err());
+    }
+
+    #[test]
+    fn content_type_is_bounded_by_utf8_bytes_before_a_put_token_can_be_issued() {
+        let exactly_512_bytes = "é".repeat(256);
+        let too_large = format!("{exactly_512_bytes}a");
+        assert_eq!(exactly_512_bytes.len(), MAX_CONTENT_TYPE_BYTES);
+        assert_eq!(too_large.len(), MAX_CONTENT_TYPE_BYTES + 1);
+
+        let accepted = put_metadata(PutHeader {
+            address: address("object"),
+            content_type: exactly_512_bytes.clone(),
+            command_id: "command".into(),
+            operation: Some(ApiPutOperation::Put(PutOperation {})),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            accepted.content_type.as_deref(),
+            Some(exactly_512_bytes.as_str())
+        );
+
+        let rejected = put_metadata(PutHeader {
+            address: address("object"),
+            content_type: too_large.clone(),
+            command_id: "command".into(),
+            operation: Some(ApiPutOperation::Put(PutOperation {})),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert_eq!(rejected.code(), tonic::Code::InvalidArgument);
+
+        let bulk_rejected = batch_operation(
             BulkOperation {
-                operation: Some(anvil_api::v1::bulk_operation::Operation::Put(
-                    PutObjectRequest {
-                        address: address("put"),
-                        bytes: b"value".to_vec(),
-                        command_id: "put-command".into(),
-                        durability_class: LOCAL_DURABILITY_CLASS.into(),
+                operation: Some(anvil_api::v1::bulk_operation::Operation::PutIfVersion(
+                    BulkPutIfVersionRequest {
+                        address: address("object"),
+                        content_type: too_large,
+                        command_id: "command".into(),
+                        expected_version: 1,
                         ..Default::default()
                     },
                 )),
             },
+            u64::MAX,
+        )
+        .unwrap_err();
+        assert_eq!(bulk_rejected.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn durability_is_a_closed_typed_choice() {
+        assert_eq!(durability(0).unwrap(), StoreDurability::Local);
+        assert_eq!(
+            durability(ApiDurability::Replicated as i32)
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unavailable
+        );
+        assert_eq!(
+            durability(99).unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+        let error = token_durability(StoreDurability::Replicated).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert!(error.message().starts_with("DURABILITY_UNAVAILABLE:"));
+
+        let error = put_metadata(PutHeader {
+            address: address("object"),
+            command_id: "command".into(),
+            durability: ApiDurability::Replicated as i32,
+            operation: Some(ApiPutOperation::Put(PutOperation {})),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert!(error.message().starts_with("DURABILITY_UNAVAILABLE:"));
+    }
+
+    #[test]
+    fn atomic_program_timeout_uses_the_shorter_client_or_server_budget() {
+        let server_maximum = Duration::from_secs(30);
+        let mut metadata = MetadataMap::new();
+        assert_eq!(
+            effective_atomic_program_timeout(&metadata, server_maximum),
+            server_maximum
+        );
+
+        metadata.insert("grpc-timeout", "250m".parse().unwrap());
+        assert_eq!(
+            effective_atomic_program_timeout(&metadata, server_maximum),
+            Duration::from_millis(250)
+        );
+
+        metadata.insert("grpc-timeout", "2M".parse().unwrap());
+        assert_eq!(
+            effective_atomic_program_timeout(&metadata, server_maximum),
+            server_maximum
+        );
+
+        metadata.insert("grpc-timeout", "invalid".parse().unwrap());
+        assert_eq!(
+            effective_atomic_program_timeout(&metadata, server_maximum),
+            server_maximum
+        );
+    }
+
+    #[tokio::test]
+    async fn atomic_program_timeout_returns_grpc_deadline_exceeded() {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(1);
+        let error = run_atomic_program_until(deadline, async {
+            std::future::pending::<Result<(), Status>>().await
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
+
+        let expected = Status::failed_precondition("program rejected");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let error = run_atomic_program_until(deadline, async { Err::<(), _>(expected) })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(error.message(), "program rejected");
+    }
+
+    #[test]
+    fn all_six_bulk_operations_are_explicit_and_zero_byte_puts_are_valid() {
+        let put = || BulkPutRequest {
+            address: address("object"),
+            command_id: "command".into(),
+            ..Default::default()
+        };
+        let operations = [
+            anvil_api::v1::bulk_operation::Operation::Put(put()),
+            anvil_api::v1::bulk_operation::Operation::PutIfAbsent(put()),
+            anvil_api::v1::bulk_operation::Operation::PutIfVersion(BulkPutIfVersionRequest {
+                address: address("object"),
+                command_id: "command".into(),
+                expected_version: 7,
+                ..Default::default()
+            }),
+            anvil_api::v1::bulk_operation::Operation::PutImmutable(put()),
+            anvil_api::v1::bulk_operation::Operation::Delete(ApiDeleteRequest {
+                address: address("object"),
+                command_id: "command".into(),
+                ..Default::default()
+            }),
+            anvil_api::v1::bulk_operation::Operation::DeleteIfVersion(DeleteIfVersionRequest {
+                address: address("object"),
+                command_id: "command".into(),
+                expected_version: 9,
+                ..Default::default()
+            }),
+        ];
+        let converted = operations
+            .into_iter()
+            .map(|operation| {
+                batch_operation(
+                    BulkOperation {
+                        operation: Some(operation),
+                    },
+                    0,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(converted[0], BatchOperation::Put(ref r) if r.mode == PutMode::Put));
+        assert!(
+            matches!(converted[1], BatchOperation::Put(ref r) if r.mode == PutMode::PutIfAbsent)
+        );
+        assert!(
+            matches!(converted[2], BatchOperation::Put(ref r) if r.mode == PutMode::PutIfVersion(VersionId(7)))
+        );
+        assert!(
+            matches!(converted[3], BatchOperation::Put(ref r) if r.mode == PutMode::PutImmutable)
+        );
+        assert!(
+            matches!(converted[4], BatchOperation::Delete(ref r) if r.precondition == Precondition::Any)
+        );
+        assert!(
+            matches!(converted[5], BatchOperation::Delete(ref r) if r.precondition == Precondition::Version(VersionId(9)))
+        );
+    }
+
+    #[test]
+    fn bulk_limit_accounts_for_every_encoded_operation_byte_without_cloning_payloads() {
+        let operations = vec![
             BulkOperation {
-                operation: Some(anvil_api::v1::bulk_operation::Operation::Publish(
-                    PublishObjectRequest {
-                        address: address("publish"),
-                        blob: Some(ApiBlobRef {
-                            blake3_hash: vec![7; 32],
-                            length: 5,
-                        }),
-                        command_id: "publish-command".into(),
-                        durability_class: LOCAL_DURABILITY_CLASS.into(),
-                        ..Default::default()
+                operation: Some(anvil_api::v1::bulk_operation::Operation::Put(
+                    BulkPutRequest {
+                        address: address("one"),
+                        bytes: vec![1, 2, 3],
+                        content_type: "application/json".into(),
+                        command_id: "put-one".into(),
+                        durability: ApiDurability::Local as i32,
                     },
                 )),
             },
             BulkOperation {
                 operation: Some(anvil_api::v1::bulk_operation::Operation::Delete(
-                    DeleteObjectRequest {
-                        address: address("delete"),
-                        command_id: "delete-command".into(),
-                        durability_class: LOCAL_DURABILITY_CLASS.into(),
-                        ..Default::default()
+                    ApiDeleteRequest {
+                        address: address("two"),
+                        command_id: "delete-two".into(),
+                        durability: ApiDurability::Local as i32,
                     },
                 )),
             },
         ];
-
-        let classes = operations
-            .into_iter()
-            .map(
-                |operation| match batch_operation(operation, u64::MAX).unwrap() {
-                    BatchOperation::Put(request) => request.durability_class,
-                    BatchOperation::Publish(request) => request.durability_class,
-                    BatchOperation::Delete(request) => request.durability_class,
-                },
-            )
-            .collect::<Vec<_>>();
-        assert_eq!(classes, ["local", "local", "local"]);
-    }
-
-    #[test]
-    fn durability_class_is_a_closed_exact_choice() {
-        assert!(require_durability_class(LOCAL_DURABILITY_CLASS).is_ok());
+        let expected = prost::Message::encoded_len(&BulkWriteRequest {
+            operations: operations.clone(),
+        });
+        let accounted = bulk_encoded_len(&operations).unwrap();
+        assert_eq!(accounted, expected);
+        assert!(
+            accounted > 3,
+            "metadata and protobuf framing must be counted"
+        );
+        assert!(enforce_bulk_encoded_limit(MAX_BULK_BYTES).is_ok());
         assert_eq!(
-            require_durability_class(REPLICATED_DURABILITY_CLASS)
+            enforce_bulk_encoded_limit(MAX_BULK_BYTES + 1)
                 .unwrap_err()
                 .code(),
-            tonic::Code::Unavailable
+            tonic::Code::ResourceExhausted
         );
-        for invalid in ["", " local", "local ", "LOCAL", "configured"] {
-            assert_eq!(
-                require_durability_class(invalid).unwrap_err().code(),
-                tonic::Code::InvalidArgument
-            );
-        }
     }
 
     #[test]
-    fn replicated_bulk_item_reports_durability_unavailable() {
+    fn bulk_metrics_partition_success_failure_and_replay_outcomes() {
+        let response = Ok(Response::new(BulkWriteResponse {
+            outcomes: vec![
+                BulkOutcome {
+                    index: 0,
+                    outcome: Some(anvil_api::v1::bulk_outcome::Outcome::Receipt(
+                        ApiMutationReceipt::default(),
+                    )),
+                },
+                BulkOutcome {
+                    index: 1,
+                    outcome: Some(anvil_api::v1::bulk_outcome::Outcome::Receipt(
+                        ApiMutationReceipt {
+                            replayed: true,
+                            ..Default::default()
+                        },
+                    )),
+                },
+                BulkOutcome {
+                    index: 2,
+                    outcome: Some(anvil_api::v1::bulk_outcome::Outcome::Failure(
+                        MutationFailure::default(),
+                    )),
+                },
+            ],
+        }));
+        assert_eq!(
+            bulk_metric_counts(3, &response),
+            BulkMetricCounts {
+                successful: 1,
+                failed: 1,
+                replayed: 1,
+            }
+        );
+
+        let failed_request = Err(Status::unavailable("store unavailable"));
+        assert_eq!(
+            bulk_metric_counts(3, &failed_request),
+            BulkMetricCounts {
+                successful: 0,
+                failed: 3,
+                replayed: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn watch_lag_is_an_observation_against_the_current_journal_tail() {
+        let status = WatchJournalStatus {
+            source_epoch: [0; 32],
+            tail: 19,
+            retention_floor: 4,
+            retained_entries: 15,
+            retained_bytes: 900,
+        };
+        assert_eq!(watch_consumer_lag(&status, 7), Some(12));
+        assert_eq!(watch_consumer_lag(&status, 20), None);
+    }
+
+    #[test]
+    fn oversized_and_replicated_bulk_items_have_typed_failures() {
         let operation = BulkOperation {
-            operation: Some(anvil_api::v1::bulk_operation::Operation::Delete(
-                DeleteObjectRequest {
-                    address: address("delete"),
-                    command_id: "delete-command".into(),
-                    durability_class: REPLICATED_DURABILITY_CLASS.into(),
+            operation: Some(anvil_api::v1::bulk_operation::Operation::Put(
+                BulkPutRequest {
+                    address: address("object"),
+                    bytes: vec![0; 2],
+                    command_id: "command".into(),
                     ..Default::default()
                 },
             )),
         };
+        let failure = api_request_failure(batch_operation(operation, 1).unwrap_err());
+        assert_eq!(failure.code, MutationFailureCode::ResourceLimit as i32);
 
-        let error = batch_operation(operation, u64::MAX).unwrap_err();
-        let failure = api_request_failure(error);
+        let operation = BulkOperation {
+            operation: Some(anvil_api::v1::bulk_operation::Operation::Delete(
+                ApiDeleteRequest {
+                    address: address("delete"),
+                    command_id: "delete-command".into(),
+                    durability: ApiDurability::Replicated as i32,
+                },
+            )),
+        };
+        let failure = api_request_failure(batch_operation(operation, u64::MAX).unwrap_err());
         assert_eq!(
             failure.code,
             MutationFailureCode::DurabilityUnavailable as i32
@@ -987,9 +2357,138 @@ mod tests {
     }
 
     #[test]
+    fn put_token_helper_rejects_missing_values() {
+        assert_eq!(
+            required_put_token(None).unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            required_put_token(Some(PutToken::default()))
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn canonical_token_header_preserves_caller_selected_operation() {
+        let header = CanonicalPutHeader {
+            tenant: "tenant".into(),
+            bucket: "bucket".into(),
+            path: "object".into(),
+            content_type: Some("application/json".into()),
+            command_id: "command".into(),
+            durability: TokenDurability::Local,
+            operation: TokenPutOperation::PutIfVersion {
+                expected_version: 31,
+            },
+        };
+        let metadata = header.to_metadata().unwrap();
+        assert_eq!(metadata.mode, PutMode::PutIfVersion(VersionId(31)));
+        assert_eq!(metadata.content_type.as_deref(), Some("application/json"));
+    }
+
+    #[test]
+    fn upload_and_ready_tokens_have_disjoint_strict_phases() {
+        let header = CanonicalPutHeader {
+            tenant: "tenant".into(),
+            bucket: "bucket".into(),
+            path: "object".into(),
+            content_type: None,
+            command_id: "command".into(),
+            durability: TokenDurability::Local,
+            operation: TokenPutOperation::Put,
+        };
+        let upload = CanonicalPutCapability {
+            format_version: PUT_TOKEN_FORMAT_VERSION,
+            phase: PutTokenPhase::Upload(UploadCapability {
+                header: header.clone(),
+            }),
+        };
+        let ready = CanonicalPutCapability {
+            format_version: PUT_TOKEN_FORMAT_VERSION,
+            phase: PutTokenPhase::Ready(ReadyCapability {
+                header,
+                blob_hash: [9; 32],
+                blob_length: 42,
+            }),
+        };
+        let upload: CanonicalPutCapability =
+            serde_json::from_slice(&serde_json::to_vec(&upload).unwrap()).unwrap();
+        let ready: CanonicalPutCapability =
+            serde_json::from_slice(&serde_json::to_vec(&ready).unwrap()).unwrap();
+        assert!(matches!(upload.phase, PutTokenPhase::Upload(_)));
+        assert!(matches!(ready.phase, PutTokenPhase::Ready(_)));
+        assert!(require_upload_phase(upload.clone()).is_ok());
+        assert_eq!(
+            require_ready_phase(upload).unwrap_err().code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert!(require_ready_phase(ready.clone()).is_ok());
+        assert_eq!(
+            require_upload_phase(ready).unwrap_err().code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert!(
+            serde_json::from_slice::<CanonicalPutCapability>(
+                br#"{"format_version":1,"phase":{"unknown":{}}}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn atomic_program_hash_is_exact_and_nonzero() {
+        assert_eq!(required_hash(&[7; 32], "program_hash").unwrap(), [7; 32]);
+        for invalid in [Vec::new(), vec![7; 31], vec![7; 33], vec![0; 32]] {
+            assert_eq!(
+                required_hash(&invalid, "program_hash").unwrap_err().code(),
+                tonic::Code::InvalidArgument
+            );
+        }
+    }
+
+    #[test]
     fn batch_get_payload_limit_accepts_the_boundary_and_rejects_larger_totals() {
         assert!(enforce_batch_get_payload_limit(MAX_BATCH_GET_BYTES as u64).is_ok());
         let error = enforce_batch_get_payload_limit(MAX_BATCH_GET_BYTES as u64 + 1).unwrap_err();
         assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+    }
+
+    #[test]
+    fn watch_errors_expose_a_stable_resume_expired_outcome() {
+        let expired = watch_status(WatchError::ResumeExpired);
+        assert_eq!(expired.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(expired.message(), "RESUME_EXPIRED");
+        assert_eq!(
+            watch_status(WatchError::InvalidResumeToken).code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn direct_program_only_writes_expose_the_stable_concurrency_outcome() {
+        let error = status(MutationError::ProgramConcurrencyViolation);
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            error
+                .message()
+                .starts_with("PROGRAM_CONCURRENCY_VIOLATION:")
+        );
+        assert_eq!(
+            api_failure(MutationError::ImmutablePolicyRequired).code,
+            MutationFailureCode::ImmutablePolicyRequired as i32
+        );
+    }
+
+    #[test]
+    fn current_tombstone_delete_exposes_the_stable_public_failure_name() {
+        let error = status(MutationError::CurrentTombstoneCannotBeDeleted);
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            error
+                .message()
+                .starts_with("CURRENT_TOMBSTONE_VERSION_CANNOT_BE_DELETED:")
+        );
     }
 }
