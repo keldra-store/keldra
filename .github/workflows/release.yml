@@ -2,7 +2,7 @@ name: Anvil Release
 
 on:
   push:
-    tags: ['v*']
+    tags: ['[0-9]*.[0-9]*.[0-9]*']
   workflow_dispatch:
     inputs:
       tag:
@@ -38,8 +38,8 @@ jobs:
         run: |
           set -euo pipefail
           tag="$REQUESTED_TAG"
-          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z._-]+)?$ ]]; then
-            echo "release tag must be a semantic v-prefixed version" >&2
+          if [[ ! "$tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z._-]+)?$ ]]; then
+            echo "release tag must be an unprefixed semantic version" >&2
             exit 1
           fi
           git fetch --force --no-tags origin "refs/tags/${tag}:refs/tags/${tag}"
@@ -48,7 +48,7 @@ jobs:
             git show "${commit}:Cargo.toml" |
               python3 -c 'import re,sys; text=sys.stdin.read(); print(re.search(r"(?ms)^\[workspace\.package\].*?^version\s*=\s*\"([^\"]+)\"", text).group(1))'
           )"
-          if [[ "$tag" != "v${workspace_version}" ]]; then
+          if [[ "$tag" != "${workspace_version}" ]]; then
             echo "release tag $tag does not match workspace version ${workspace_version}" >&2
             exit 1
           fi
@@ -117,20 +117,14 @@ jobs:
     env:
       ANVIL_IMAGE: anvil:release-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
       ANVIL_DOCKER_PLATFORM: ${{ matrix.platform }}
-      ANVIL_BUILD_PROFILE: release
-      ANVIL_USE_NATIVE_CARGO: '0'
-      CARGO_BUILD_JOBS: '8'
     strategy:
       fail-fast: false
-      max-parallel: 1
       matrix:
         include:
           - platform: linux/amd64
             arch: amd64
-            artifact: anvil-release-image-amd64
           - platform: linux/arm64
             arch: arm64
-            artifact: anvil-release-image-arm64
     steps:
       - name: Checkout release commit
         uses: actions/checkout@v4
@@ -142,59 +136,14 @@ jobs:
         with:
           platforms: amd64,arm64
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.14.1
-
-      - name: Install system build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            clang \
-            cmake \
-            libclang-dev \
-            pkg-config \
-            protobuf-compiler
-
-      - name: Cache Cargo dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: ${{ runner.os }}-release-cargo-v05-image-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-release-cargo-v05-image-${{ matrix.arch }}-
-
-      - name: Install pinned cross-build toolchain
-        run: |
-          if ! cargo-zigbuild --version 2>/dev/null | grep -Fxq 'cargo-zigbuild 0.20.1'; then
-            cargo install cargo-zigbuild --version 0.20.1 --locked --force
-          fi
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Build release image
         run: ./scripts/build-image.sh
 
       - name: Smoke release image through gRPC
         run: ./scripts/release-gates.sh image
-
-      - name: Export image artifact
-        run: docker save "$ANVIL_IMAGE" -o "${{ runner.temp }}/${{ matrix.artifact }}.tar"
-
-      - name: Upload image artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: ${{ runner.temp }}/${{ matrix.artifact }}.tar
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 2
 
       - name: Remove local image
         if: always()
@@ -214,16 +163,10 @@ jobs:
         with:
           ref: ${{ needs.release-context.outputs.commit }}
 
-      - name: Download release images
-        uses: actions/download-artifact@v4
+      - name: Set up emulation
+        uses: docker/setup-qemu-action@v3
         with:
-          pattern: anvil-release-image-*
-          path: ${{ runner.temp }}/anvil-images
-
-      - name: Load release images
-        run: |
-          docker load -i "${{ runner.temp }}/anvil-images/anvil-release-image-amd64/anvil-release-image-amd64.tar"
-          docker load -i "${{ runner.temp }}/anvil-images/anvil-release-image-arm64/anvil-release-image-arm64.tar"
+          platforms: amd64,arm64
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -242,21 +185,33 @@ jobs:
         run: |
           set -euo pipefail
           repository="ghcr.io/${GITHUB_REPOSITORY,,}"
-          amd64_local="anvil:release-amd64-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          arm64_local="anvil:release-arm64-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          amd64_image="${repository}:${RELEASE_TAG}-amd64"
-          arm64_image="${repository}:${RELEASE_TAG}-arm64"
           final_image="${repository}:${RELEASE_TAG}"
 
-          docker tag "$amd64_local" "$amd64_image"
-          docker tag "$arm64_local" "$arm64_image"
-          docker push "$amd64_image"
-          docker push "$arm64_image"
-          docker buildx imagetools create --tag "$final_image" "$amd64_image" "$arm64_image"
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --provenance=false \
+            --sbom=false \
+            --tag "$final_image" \
+            --push \
+            --file anvil/Dockerfile \
+            .
 
+          raw_manifest="$(docker buildx imagetools inspect --raw "$final_image")"
+          python3 -c '
+          import json, sys
+          manifest = json.load(sys.stdin)
+          platforms = sorted(
+              "{}/{}".format(
+                  item.get("platform", {}).get("os"),
+                  item.get("platform", {}).get("architecture"),
+              )
+              for item in manifest.get("manifests", [])
+          )
+          expected = ["linux/amd64", "linux/arm64"]
+          if platforms != expected:
+              raise SystemExit(f"published platforms {platforms!r} != {expected!r}")
+          ' <<<"$raw_manifest"
           inspection="$(docker buildx imagetools inspect "$final_image")"
-          grep -q 'linux/amd64' <<<"$inspection"
-          grep -q 'linux/arm64' <<<"$inspection"
           digest="$(awk '$1 == "Digest:" { print $2; exit }' <<<"$inspection")"
           if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
             echo "published image did not report a manifest digest" >&2

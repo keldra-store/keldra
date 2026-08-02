@@ -106,21 +106,14 @@ jobs:
     env:
       ANVIL_DOCKER_PLATFORM: ${{ matrix.platform }}
       ANVIL_IMAGE: anvil:test-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
-      ANVIL_BUILD_PROFILE: ci
-      ANVIL_USE_NATIVE_CARGO: '0'
-      ANVIL_RUNTIME_BASE: debian:trixie-slim
-      CARGO_BUILD_JOBS: '8'
     strategy:
       fail-fast: false
-      max-parallel: 1
       matrix:
         include:
           - platform: linux/amd64
             arch: amd64
-            artifact: anvil-test-image-amd64
           - platform: linux/arm64
             arch: arm64
-            artifact: anvil-test-image-arm64
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -130,59 +123,14 @@ jobs:
         with:
           platforms: amd64,arm64
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.14.1
-
-      - name: Install system build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            clang \
-            cmake \
-            libclang-dev \
-            pkg-config \
-            protobuf-compiler
-
-      - name: Cache Cargo dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: ${{ runner.os }}-cargo-v05-image-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-v05-image-${{ matrix.arch }}-
-
-      - name: Install pinned cross-build toolchain
-        run: |
-          if ! cargo-zigbuild --version 2>/dev/null | grep -Fxq 'cargo-zigbuild 0.20.1'; then
-            cargo install cargo-zigbuild --version 0.20.1 --locked --force
-          fi
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Build image
         run: ./scripts/build-image.sh
 
       - name: Smoke image through the 0.5 gRPC API
         run: ./scripts/release-gates.sh image
-
-      - name: Export image artifact
-        run: docker save "$ANVIL_IMAGE" -o "${{ runner.temp }}/${{ matrix.artifact }}.tar"
-
-      - name: Upload image artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: ${{ runner.temp }}/${{ matrix.artifact }}.tar
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 1
 
       - name: Remove local image
         if: always()
