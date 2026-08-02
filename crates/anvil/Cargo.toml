@@ -33,6 +33,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 hex = "0.4"
 governor = "=0.10.4"
 jsonwebtoken = "9.3"
+libc = "0.2"
 opentelemetry = { version = "0.32", default-features = false, features = ["metrics", "trace"] }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "metrics", "reqwest-blocking-client", "reqwest-rustls-webpki-roots", "trace"] }
 opentelemetry_sdk = { version = "0.32.1", default-features = false, features = ["metrics", "trace"] }

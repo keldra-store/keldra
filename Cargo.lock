@@ -171,6 +171,7 @@ dependencies = [
  "governor",
  "hex",
  "jsonwebtoken",
+ "libc",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",

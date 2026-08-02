@@ -7,6 +7,7 @@ mod bootstrap;
 mod credential_service;
 pub mod observability;
 mod programs;
+mod serving_fence;
 mod v05;
 
 use std::net::SocketAddr;
