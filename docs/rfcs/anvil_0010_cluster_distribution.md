@@ -251,10 +251,31 @@ The following rules are fixed:
 - joining nodes are excluded until activation commits; and
 - a membership operation uses one exact old and one exact proposed active set.
 
-The exact byte-to-`H` mapping and cross-platform logarithm implementation are
-unresolved in section 24. They must be specified with golden vectors before
-any persisted distributed placement is written. Platform-native floating-point
-behavior is not itself a placement specification.
+The placement calculation is an integer protocol. A weight is a positive
+integer number of millionths, where `1_000_000` means `1.0`. For node `n`,
+BLAKE3 derive-key mode uses context `anvil.storage/weighted-hrw/v1` and hashes
+this exact tuple:
+
+```text
+[placement_kind:u8]
+[cluster_id:16 bytes]
+[key_length:u64 BE]
+[key:key_length bytes]
+[node_id:u64 BE]
+```
+
+Interpreting the first eight digest bytes as an unsigned big-endian integer
+`r` defines the exact open-interval value `H = (2r + 1) / 2^65`. A fixed
+64-round integer binary-log calculation produces Q64.64 `-log2(H)`, clamped to
+one least-significant bit so the denominator is never zero. Multiplying every
+denominator by the constant `ln(2)` would leave the ranking unchanged, so this
+is exactly equivalent to the natural-log formula above.
+
+Two scores `weight_a / denominator_a` and `weight_b / denominator_b` are
+compared by `u128` cross multiplication. No division, platform floating point,
+or math dependency participates. Lower node ID wins an exactly equal
+quantized score. Frozen golden vectors are part of the placement format and
+must produce the same result on AMD64 and ARM64.
 
 Weights cannot defeat the distinct-fragment requirement. If a cluster has
 exactly `K+M` nodes, every large blob places one equal-sized fragment on every
@@ -321,16 +342,20 @@ closed. Exact immutable content reads by verified content identity may continue
 when doing so does not disclose a path or require a positive authorization
 decision.
 
-Membership cutover stops renewal for the old membership and waits the maximum
-old lease lifetime before any new owner may coordinate the changed keys. Thus
-an isolated former owner expires before a replacement begins accepting writes.
-The implementation must account conservatively for scheduling delay and clock
-behavior; wall-clock synchronization is not used for lease expiry.
+Membership cutover stops renewal for the old membership and waits three
+seconds before any new owner may coordinate the changed keys. Thus an isolated
+former owner's two-second lease expires, with one second of scheduler margin,
+before a replacement begins accepting writes.
 
-The lease lifetime, renewal margin, and precise monotonic-clock/drift contract
-are unresolved in section 24. A per-operation quorum check is not an implicit
-fallback: adopting one would materially change the latency architecture and
-requires approval.
+Leases are renewed every 500 milliseconds. On Linux their two-second local
+lifetime is measured with `CLOCK_BOOTTIME`, which continues across host
+suspend; wall-clock synchronization is never used. A renewal expires relative
+to the recipient's local timestamp taken immediately before sending the grant
+request, not when the response arrives, so network or scheduling delay cannot
+extend authority. A clock failure, term regression, membership mismatch, or
+overlong grant fails closed. A per-operation Raft `ReadIndex` is not a fallback:
+ordinary requests rely on the valid node-wide lease and do not add a quorum
+round trip.
 
 This mechanism is cluster-wide and constant in size. It does not create
 billions of path leases, placement epochs, or Raft log entries.
@@ -486,7 +511,7 @@ replicas(key) = WeightedHRW(key, active_members).take(min(3, active_count))
 coordinator   = replicas(key)[0]
 ```
 
-The proposed metadata acknowledgement threshold is:
+The metadata acknowledgement threshold is:
 
 ```text
 active_count = 1  -> 1 of 1
@@ -499,9 +524,9 @@ client's payload durability choice. A `LOCAL` payload write must not leave its
 head or tombstone on only one node: losing such a head could resurrect an older
 version and retroactively violate CAS.
 
-The `1/1`, `2/2`, then `2/3` rule is not yet accepted. In particular, the
-two-node behavior determines whether one unavailable node makes all mutations
-unavailable. This is unresolved in section 24.
+The `1/1`, `2/2`, then `2/3` rule is normative. A two-node cluster therefore
+stops accepting mutations when either node is unavailable instead of claiming
+node-loss safety it cannot provide.
 
 The coordinator holds the local exact-key lock, checks the precondition,
 observes the current version high watermark, allocates the next version, and
@@ -530,6 +555,14 @@ replica group before serving. A mutation whose response was lost may therefore
 be completed rather than discarded. Missing predecessor evidence,
 contradictory state, or the absence of the required read quorum is corruption
 or unavailability, never permission to choose an arbitrary record.
+
+Each candidate binds the active-membership log ID and serving fence, its unique
+monotonic version, predecessor, command ID, and bounded input fingerprint.
+There is no separate commit marker. A candidate present on only one replica and
+never acknowledged may be discarded when a quorum proves a different valid
+successor, while every acknowledged `2/3` candidate intersects every later
+read quorum. Retrying an unknown outcome uses the same command ID and either
+observes or completes the same mutation.
 
 Remote replication uses typed, versioned mutations. Peers never expose raw
 column-family reads or writes.
@@ -1053,19 +1086,7 @@ RFC. “Local” would then mean minimum readable data without a node-loss promi
 not literally storage on one machine. No encoder dependency or temporary
 whole-blob replication layout may be adopted before this decision.
 
-### 24.2 Normative weighted-HRW arithmetic
-
-The weighted formula is accepted, but the exact hash-to-open-unit-interval and
-deterministic logarithm implementation is not. The selected specification must:
-
-- produce identical rankings on AMD64 and ARM64;
-- define zero, one, rounding, overflow, and tie behavior;
-- avoid an unreviewed heavy dependency; and
-- ship golden vectors that every implementation can reproduce.
-
-No persisted distributed placement may precede this choice.
-
-### 24.3 Tenant-name canonicalization
+### 24.2 Tenant-name canonicalization
 
 Cluster-wide reservation and future mesh-wide uniqueness are accepted. The
 canonical input is not. Before distributed tenant creation ships, approval is
@@ -1073,35 +1094,7 @@ required for the exact case, character, Unicode/ASCII, normalization, display,
 confusable, and release/transfer rules. Bytewise uniqueness over inconsistent
 client spellings is not sufficient for the stated anti-phishing goal.
 
-### 24.4 Complete-record quorum and incomplete mutations
-
-The three-copy target is accepted, but the acknowledgement rule for clusters
-with one or two active nodes is not. The proposed rule is `1/1`, `2/2`, then
-`2/3`. It deliberately makes a two-node cluster unavailable for mutation when
-either node is unavailable rather than claiming node-loss safety it cannot
-provide.
-
-The recovery rule must also be explicit because there is no hidden commit
-marker. A KISS candidate is a quorum register: every candidate binds the
-serving fence, unique monotonic version, predecessor, command ID, and input
-fingerprint. A new coordinator reads a quorum, chooses the highest candidate
-whose predecessor chain is valid, and writes it to a quorum before serving. An
-operation that lost its response may therefore complete; a candidate visible
-only on an unavailable replica may be discarded and later overwritten. Any
-acknowledged `2/3` candidate intersects every read quorum and is recovered.
-Alternative commit markers or all-replica acknowledgement materially change
-the protocol and must not be introduced implicitly.
-
-### 24.5 Serving-lease clock contract
-
-The node-wide, quorum-backed serving lease is accepted. Its maximum lifetime,
-renewal cadence, scheduler allowance, oscillator-drift bound, and behavior
-across host suspend are not. A finite stale-owner exclusion interval requires
-an explicit clock contract. The implementation must not silently substitute a
-per-request Raft `ReadIndex`, because doing so adds a quorum round trip to the
-hot path the lease was chosen to avoid.
-
-### 24.6 Zanzibar aggregate and cross-aggregate administration
+### 24.3 Zanzibar aggregate and cross-aggregate administration
 
 The proposed KISS Zanzibar unit is one complete realm on three logical
 replicas, with checks and writes routed to its rank-zero coordinator. This
@@ -1116,7 +1109,7 @@ executor internally, or use another explicitly specified recovery protocol.
 They must not become an accidental raw cross-node RocksDB transaction or a
 partially visible sequence.
 
-### 24.7 Reference-delta delivery
+### 24.4 Reference-delta delivery
 
 Reference counts remain local to each selected complete copy or erasure-coded
 fragment, and the existing source journal is the only proposed ordered feed.
@@ -1127,14 +1120,14 @@ publication, use bounded state rather than one persistent reference ID per
 object version, and disable GC until a detected gap has been repaired or
 counts rebuilt.
 
-### 24.8 Voter target
+### 24.5 Voter target
 
 The release needs an exact voter policy. A candidate is three voters by default
 with an operator-selected five-voter genesis option, while additional active
 storage nodes remain learners. This changes quorum availability and peer cost
 and is not silently selected by the implementation.
 
-### 24.9 JWT signing-key consistency
+### 24.6 JWT signing-key consistency
 
 Every active node must validate and mint compatible public JWTs. Approval is
 required for whether Raft stores the expected signing-key fingerprint as
