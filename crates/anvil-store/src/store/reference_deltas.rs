@@ -1,5 +1,8 @@
 use super::*;
-use crate::{ReferenceDeltaApplied, ReferenceDeltaBatch, ReferenceDeltaError};
+use crate::{
+    DestinationReferenceArtifact, FRAGMENT_FORMAT_VERSION, ReferenceDeltaApplied,
+    ReferenceDeltaBatch, ReferenceDeltaError,
+};
 
 const REFERENCE_CURSOR_KEY_PREFIX: &[u8] = b"\x01reference_cursor/";
 
@@ -19,6 +22,14 @@ impl Store {
         if request.deltas.iter().any(|delta| delta.change == 0) {
             return Err(ReferenceDeltaError::ZeroChange);
         }
+        let deltas = request
+            .deltas
+            .into_iter()
+            .map(|delta| {
+                let key = artifact_lifecycle_key(&delta.artifact)?;
+                Ok((delta.artifact, key, delta.change))
+            })
+            .collect::<Result<Vec<_>, ReferenceDeltaError>>()?;
 
         let _commit_guard = self.commit_lock.lock().await;
         let cursor_key = reference_cursor_key(request.source);
@@ -45,16 +56,30 @@ impl Store {
 
         let now = now_unix_millis().map_err(ReferenceDeltaError::from)?;
         let mut states = PendingBlobReferences::new();
-        for delta in request.deltas {
-            let key = blob_reference_key(&delta.blob);
+        let mut verified_artifacts = BTreeSet::new();
+        for (artifact, key, change) in deltas {
             let state = match states.get(&key).copied() {
                 Some(state) => state,
                 None => self
                     .read_blob_reference_state(&key)
                     .map_err(ReferenceDeltaError::from)?
-                    .ok_or(ReferenceDeltaError::BlobNotFound)?,
+                    .ok_or(ReferenceDeltaError::ArtifactNotFound)?,
             };
-            let next = apply_reference_change(state, delta.change, now)?;
+            if change > 0 && verified_artifacts.insert(key.clone()) {
+                let exists = match &artifact {
+                    DestinationReferenceArtifact::CompleteBlob(reference) => self
+                        .contains_blob(reference)
+                        .await
+                        .map_err(ReferenceDeltaError::from)?,
+                    DestinationReferenceArtifact::Shard(identity) => self
+                        .contains_shard_artifact(identity)
+                        .map_err(|error| ReferenceDeltaError::Storage(error.to_string()))?,
+                };
+                if !exists {
+                    return Err(ReferenceDeltaError::ArtifactNotFound);
+                }
+            }
+            let next = apply_reference_change(state, change, now)?;
             states.insert(key, next);
         }
 
@@ -106,6 +131,20 @@ impl Store {
     }
 }
 
+fn artifact_lifecycle_key(
+    artifact: &DestinationReferenceArtifact,
+) -> Result<Vec<u8>, ReferenceDeltaError> {
+    match artifact {
+        DestinationReferenceArtifact::CompleteBlob(reference) => Ok(blob_reference_key(reference)),
+        DestinationReferenceArtifact::Shard(identity) => {
+            if identity.fragment_format_version() != FRAGMENT_FORMAT_VERSION {
+                return Err(ReferenceDeltaError::InvalidArtifact);
+            }
+            Ok(identity.encode().to_vec())
+        }
+    }
+}
+
 fn reference_cursor_key(source: SourceId) -> Vec<u8> {
     let mut key = Vec::with_capacity(
         REFERENCE_CURSOR_KEY_PREFIX.len() + size_of::<u16>() + source.source_epoch.len(),
@@ -152,8 +191,12 @@ fn apply_reference_change(
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
     use super::*;
-    use crate::{ReferenceDelta, StoreOptions};
+    use crate::{
+        DestinationReferenceDelta, ErasureCodec, ErasureProfile, ShardIdentity, StoreOptions,
+    };
 
     fn source() -> SourceId {
         SourceId {
@@ -167,11 +210,26 @@ mod tests {
             source: source(),
             after,
             through,
-            deltas: vec![ReferenceDelta {
-                blob: blob.clone(),
+            deltas: vec![DestinationReferenceDelta {
+                artifact: DestinationReferenceArtifact::CompleteBlob(blob.clone()),
                 change,
             }],
         }
+    }
+
+    fn encoded_shards(bytes: &[u8]) -> (ErasureCodec, BlobRef, Vec<Vec<u8>>) {
+        let codec = ErasureCodec::new(ErasureProfile::default()).unwrap();
+        let reference = BlobRef {
+            hash: *blake3::hash(bytes).as_bytes(),
+            length: bytes.len() as u64,
+        };
+        let mut shards = (0..codec.profile().total_shards())
+            .map(|_| Vec::new())
+            .collect::<Vec<_>>();
+        codec
+            .encode(Cursor::new(bytes), &reference, &mut shards)
+            .unwrap();
+        (codec, reference, shards)
     }
 
     #[tokio::test]
@@ -199,6 +257,92 @@ mod tests {
             .unwrap();
         assert!(replayed.replayed);
         assert_eq!(store.blob_reference_state(&blob).unwrap().unwrap(), state);
+    }
+
+    #[tokio::test]
+    async fn multiple_shard_ordinals_update_their_exact_lifecycle_records() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        let bytes = vec![0x61; SMALL_BLOB_MAX_BYTES + 31];
+        let (codec, reference, shards) = encoded_shards(&bytes);
+        let first = ShardIdentity::new(reference.clone(), 0);
+        let second = ShardIdentity::new(reference, 1);
+        store
+            .seal_shard(&codec, &first, Cursor::new(&shards[0]))
+            .await
+            .unwrap();
+        store
+            .seal_shard(&codec, &second, Cursor::new(&shards[1]))
+            .await
+            .unwrap();
+
+        store
+            .apply_reference_deltas(ReferenceDeltaBatch {
+                source: source(),
+                after: 0,
+                through: 1,
+                deltas: vec![
+                    DestinationReferenceDelta {
+                        artifact: DestinationReferenceArtifact::Shard(first.clone()),
+                        change: 1,
+                    },
+                    DestinationReferenceDelta {
+                        artifact: DestinationReferenceArtifact::Shard(second.clone()),
+                        change: 1,
+                    },
+                ],
+            })
+            .await
+            .unwrap();
+
+        for identity in [&first, &second] {
+            let state = store.shard_reference_state(identity).unwrap().unwrap();
+            assert_eq!(state.ref_count, 1);
+            assert_eq!(state.flags, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_copy_and_shard_commit_in_one_mixed_batch() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        let small = store.stage_blob(b"small complete copy").await.unwrap();
+        let bytes = vec![0x42; SMALL_BLOB_MAX_BYTES + 47];
+        let (codec, reference, shards) = encoded_shards(&bytes);
+        let shard = ShardIdentity::new(reference, 2);
+        store
+            .seal_shard(&codec, &shard, Cursor::new(&shards[2]))
+            .await
+            .unwrap();
+
+        store
+            .apply_reference_deltas(ReferenceDeltaBatch {
+                source: source(),
+                after: 0,
+                through: 8,
+                deltas: vec![
+                    DestinationReferenceDelta {
+                        artifact: DestinationReferenceArtifact::CompleteBlob(small.clone()),
+                        change: 1,
+                    },
+                    DestinationReferenceDelta {
+                        artifact: DestinationReferenceArtifact::Shard(shard.clone()),
+                        change: 1,
+                    },
+                ],
+            })
+            .await
+            .unwrap();
+
+        let small_state = store.blob_reference_state(&small).unwrap().unwrap();
+        let shard_state = store.shard_reference_state(&shard).unwrap().unwrap();
+        assert_eq!((small_state.ref_count, small_state.flags), (1, 0));
+        assert_eq!((shard_state.ref_count, shard_state.flags), (1, 0));
+        assert_eq!(store.reference_delta_cursor(source()).unwrap(), 8);
     }
 
     #[tokio::test]
@@ -262,5 +406,73 @@ mod tests {
                 .ref_count,
             1
         );
+    }
+
+    #[tokio::test]
+    async fn cursor_and_artifact_effects_survive_restart() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("store");
+        let blob;
+        {
+            let store = Store::open(StoreOptions::new(&root, 1)).await.unwrap();
+            blob = store.stage_blob(b"restart-safe copy").await.unwrap();
+            store
+                .apply_reference_deltas(batch(0, 4, &blob, 1))
+                .await
+                .unwrap();
+        }
+
+        {
+            let store = Store::open(StoreOptions::new(&root, 1)).await.unwrap();
+            let replayed = store
+                .apply_reference_deltas(batch(0, 4, &blob, 1))
+                .await
+                .unwrap();
+            assert!(replayed.replayed);
+            assert_eq!(
+                store
+                    .blob_reference_state(&blob)
+                    .unwrap()
+                    .unwrap()
+                    .ref_count,
+                1
+            );
+            store
+                .apply_reference_deltas(batch(4, 5, &blob, -1))
+                .await
+                .unwrap();
+        }
+
+        let store = Store::open(StoreOptions::new(&root, 1)).await.unwrap();
+        assert_eq!(store.reference_delta_cursor(source()).unwrap(), 5);
+        assert_eq!(
+            store
+                .blob_reference_state(&blob)
+                .unwrap()
+                .unwrap()
+                .ref_count,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn positive_effect_requires_the_complete_bytes_to_still_exist() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        let blob = store
+            .stage_blob(&vec![0x7c; SMALL_BLOB_MAX_BYTES + 1])
+            .await
+            .unwrap();
+        store.blobs.remove(&blob).unwrap();
+
+        assert_eq!(
+            store.apply_reference_deltas(batch(0, 1, &blob, 1)).await,
+            Err(ReferenceDeltaError::ArtifactNotFound)
+        );
+        assert_eq!(store.reference_delta_cursor(source()).unwrap(), 0);
+        let state = store.blob_reference_state(&blob).unwrap().unwrap();
+        assert_eq!((state.ref_count, state.flags), (1, AWAITING_PUBLISH));
     }
 }

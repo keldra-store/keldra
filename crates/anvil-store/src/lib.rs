@@ -56,7 +56,8 @@ pub use program::{
     ProgramStoreError, PublishedProgramVersion, StoreProgramEngine, VerifiedProgramDefinition,
 };
 pub use reference_delta::{
-    ReferenceDelta, ReferenceDeltaApplied, ReferenceDeltaBatch, ReferenceDeltaError,
+    DestinationReferenceArtifact, DestinationReferenceDelta, ReferenceDelta, ReferenceDeltaApplied,
+    ReferenceDeltaBatch, ReferenceDeltaError,
 };
 pub use store::{
     BatchGetSelection, DEFAULT_AWAITING_PUBLISH_TTL_SECONDS, DEFAULT_MUTATION_RECEIPT_MAX_BYTES,

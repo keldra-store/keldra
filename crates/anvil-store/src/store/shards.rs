@@ -3,6 +3,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::*;
@@ -13,7 +14,7 @@ const SHARD_IDENTITY_BYTES: usize = 2 + 32 + 8 + 2;
 static NEXT_SHARD_UPLOAD_ID: AtomicU64 = AtomicU64::new(1);
 
 /// The complete stable identity of one erasure-coded shard.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ShardIdentity {
     fragment_format_version: u16,
     blob: BlobRef,
@@ -261,6 +262,17 @@ impl Store {
     ) -> Result<Option<BlobReferenceState>, ShardStoreError> {
         self.read_blob_reference_state(&identity.encode())
             .map_err(shard_error)
+    }
+
+    pub(super) fn contains_shard_artifact(
+        &self,
+        identity: &ShardIdentity,
+    ) -> Result<bool, ShardStoreError> {
+        match std::fs::symlink_metadata(identity.path(self.blobs.root())) {
+            Ok(metadata) => Ok(metadata.file_type().is_file()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(shard_storage_error(error)),
+        }
     }
 
     /// Removes one local shard and its local lifecycle record.
