@@ -142,7 +142,8 @@ NodeDescriptor {
   storage_weight
   state = JOINING | ACTIVE
   current_peer_spki_sha256
-  next_peer_spki_sha256?
+  overlap_peer_spki_sha256?
+  join_capability_hash?
   supported_protocol_range
   supported_storage_format_range
 }
@@ -162,11 +163,18 @@ receive the committed Raft log, all participate in weighted-HRW storage, and
 all are eligible for atomic-executor nomination. Only voters determine Raft
 quorum.
 
-The cluster uses a small voter set and admits additional storage nodes as
-learners. A ready learner is promoted before a planned voter removal when that
-is required to preserve the configured voter target. An unreachable node is
-never automatically removed or replaced as a voter. The exact voter target
-and whether it is fixed or operator-selected are unresolved in section 24.
+The cluster has at most three voters and admits additional storage nodes as
+learners. One ACTIVE node is the sole voter, two ACTIVE nodes are both voters,
+and a cluster with three or more ACTIVE nodes has exactly three voters. A ready
+ACTIVE learner is promoted before a planned voter removal when that is required
+to preserve this target. A JOINING learner is never eligible for promotion,
+serving authority, placement, or atomic-executor nomination. An unreachable
+node is never automatically removed or replaced as a voter.
+
+Raft retains a fixed 1,024-bit record of every node ID ever admitted. Removing
+a descriptor never permits that ID to be reused. This bounded 128-byte record
+protects Snowflake versions, journal source identities, certificate pins, and
+placement from acquiring a second meaning.
 
 Reusing a node identity with a newly empty data directory is prohibited. Node
 identity participates in version allocation, source-journal identity,
@@ -331,6 +339,16 @@ There is no metadata-primary service. “Coordinator” means only the current
 rank-zero node for one exact logical key. The next ranked nodes hold that
 key's complete logical replicas where replication applies.
 
+Rank zero is the one authoritative primary during normal operation; replicas
+do not independently accept mutations. Raft fences which committed membership
+may coordinate, but it does not elect or record billions of per-key primaries.
+After rank-zero loss, the next coordinator is derived from the fenced
+membership and reconciles the complete replicas. The bounded mutation lineage
+in section 13 is necessary only to distinguish a coordinator that failed
+before replication, during quorum application, or after quorum application but
+before replying. Moving those per-key outcomes into Raft would violate its
+bounded control-plane role.
+
 Requests use stable tenant and bucket IDs after name resolution. Mutable names
 never enter object head or version keys. Existing head keys remain:
 
@@ -430,8 +448,8 @@ Anvil does not operate a certificate authority. Each node uses a self-signed
 certificate. After the TLS handshake proves possession of its private key, the
 receiver verifies:
 
-- the presented SPKI fingerprint matches the committed current or overlapping
-  next fingerprint for that node;
+- the presented SPKI fingerprint matches the committed current or overlap
+  fingerprint for that node;
 - the claimed node belongs to the same cluster;
 - its membership state permits the requested RPC; and
 - the receiver has applied at least the membership entry authorizing it.
@@ -458,12 +476,14 @@ Rotation never requires cluster downtime or an external PKI:
 1. The node generates and durably stores a new key and self-signed certificate.
 2. Over its currently authenticated connection it proposes the new SPKI
    fingerprint.
-3. Raft commits that fingerprint as `next`; peers now accept current or next.
+3. Raft commits that fingerprint as `overlap`; peers now accept current or
+   overlap.
 4. The cluster waits until every required active peer has applied the overlap.
-5. The node switches new connections to the next certificate and drains old
+5. The node switches new connections to the overlap certificate and drains old
    connections.
-6. Raft promotes `next` to `current` and retains the old fingerprint during a
-   bounded retirement overlap.
+6. One Raft command swaps the fields so the new fingerprint is `current` and
+   the old fingerprint is `overlap`. Peers on either side of this ordered
+   command still accept both pins.
 7. After required peers have applied promotion, Raft removes the old pin.
 
 Repeating any step is idempotent. A lost or compromised current private key
@@ -473,6 +493,16 @@ snapshots retain only the current bounded overlap, not rotation history.
 
 Public TLS remains deployable through an external terminator in 0.5.1. Peer
 TLS is mandatory and cannot be disabled.
+
+The implementation uses a small custom Rustls accept/connect layer around the
+existing Tonic peer protocol. It verifies the presented self-signed leaf
+against the descriptor's exact SPKI SHA-256 pins rather than introducing a
+cluster CA. Each peer RPC rechecks the authenticated node ID, current pin set,
+membership state, and permitted RPC class so a removed node cannot retain
+authority through an existing connection. TLS session resumption is disabled
+in this release. The approved dependency set is `tokio-rustls`,
+`rustls-webpki`, `sha2`, and `rcgen`, using the Rustls AWS-LC provider already
+present in the server dependency graph.
 
 ## 12. Formation, join, and system bootstrap
 
@@ -523,10 +553,18 @@ receive the system state before becoming ready. A 0.5.0 directory with a valid
 bootstrap marker converts that marker exactly once into the cluster's
 `COMPLETE` state and never creates a new administrator credential.
 
-Anvil's JWT signing key remains operator-supplied and never enters Raft or
-cluster state transfer. Whether the bounded signing-key fingerprint is
-committed as cluster configuration, or consistency is enforced through an
-operator-supplied cluster identity file, is unresolved in section 24.
+Anvil's JWT signing key remains operator-supplied and never enters Raft, a join
+bundle, or cluster state transfer. Genesis commits this domain-separated
+BLAKE3 fingerprint as immutable bounded cluster configuration:
+
+```text
+BLAKE3-DERIVE("anvil.auth/jwt-signing-key/v1", signing_secret)
+```
+
+A 0.5.0 in-place upgrade commits the first node's existing fingerprint once.
+Every joining or restarting node computes the fingerprint of its local
+mode-`0600` secret and fails before readiness when it differs. Online JWT
+signing-key rotation is not a 0.5.1 capability.
 
 ## 13. Complete logical replication of mutable records
 
@@ -583,13 +621,28 @@ be completed rather than discarded. Missing predecessor evidence,
 contradictory state, or the absence of the required read quorum is corruption
 or unavailability, never permission to choose an arbitrary record.
 
-Each candidate binds the active-membership log ID and serving fence, its unique
-monotonic version, predecessor, command ID, and bounded input fingerprint.
-There is no separate commit marker. A candidate present on only one replica and
-never acknowledged may be discarded when a quorum proves a different valid
-successor, while every acknowledged `2/3` candidate intersects every later
-read quorum. Retrying an unknown outcome uses the same command ID and either
-observes or completes the same mutation.
+Each candidate carries one versioned internal stamp:
+
+```text
+MutationStamp {
+  predecessor_version?
+  mutation_fingerprint
+  active_membership_log_id
+  serving_fence_term
+  source_id
+  source_journal_position
+}
+```
+
+The mutation fingerprint binds the command ID, bounded input fingerprint, and
+complete typed result; the raw command ID need not be repeated in every head.
+There is no separate commit marker or certification phase. A candidate present
+on only one replica and never acknowledged may be discarded when a quorum
+proves a different valid successor, while every acknowledged `2/3` candidate
+intersects every later read quorum. Retrying an unknown outcome uses the same
+command ID and either observes or completes the same mutation. Contradictory
+siblings without enough evidence fail unavailable rather than being ordered by
+version alone.
 
 Remote replication uses typed, versioned mutations. Peers never expose raw
 column-family reads or writes.
@@ -654,11 +707,16 @@ versions reference it.
 
 Payloads of at most 64 KiB remain raw values in `small_blobs`. This is a
 deliberate primary storage path, not a cache. Selected content owners hold
-complete copies. The upload receiver first stores the raw value with a
-synchronous RocksDB write. `LOCAL` accepts that one durable acknowledgement;
-`REPLICATED` waits for the configured number of distinct selected content
-owners. Both policies converge to the same selected-copy placement; `LOCAL`
-merely permits that copying to finish after the response.
+complete copies. The healthy final copy count is `M + 1`, derived from the
+cluster's committed erasure-code profile; there is no separate copy-count
+configuration. This gives complete small values the same configured
+node-failure tolerance as large values without multiplying them by `K`. The
+request's rank-zero coordinator first stores the raw value with a synchronous
+RocksDB write. `LOCAL` accepts that coordinator acknowledgement; copying to the
+remaining selected owners continues durably after the response. `REPLICATED`
+waits for all `M + 1` selected complete-copy owners. If there are too few
+ACTIVE nodes, `LOCAL` remains available and reports under-redundancy while
+`REPLICATED` is unavailable.
 
 No large-object implementation, index segment cache, or distributed feature
 may remove or bypass `small_blobs`.
@@ -701,16 +759,16 @@ does not store a second replica of that shard. The full set of different shards
 provides redundancy. Every ordinal is assigned to a distinct active node; an
 undersized cluster never silently co-locates shards and weakens the profile.
 
-The node receiving an upload first seals and verifies one complete
-content-addressed source blob in the ordinary byte plane. This is upload and
-repair source material, not another storage class or side plane. `LOCAL` may
-publish and return success after that node has durably stored the source and
-the mandatory logical-metadata quorum has committed. Encoding and placement of
-the standard shards then continue durably in the background. `REPLICATED`
-withholds publication and success until the configured standard shard set has
-durably acknowledged. Failure of the sole source after a `LOCAL` response but
-before placement completes may lose the payload; it never rolls metadata back
-or exposes an older version.
+The rank-zero coordinator accepting an upload first seals and verifies one
+complete content-addressed source blob in the ordinary byte plane. This is
+upload and repair source material, not another storage class or side plane.
+`LOCAL` may publish and return success after the coordinator has durably stored
+the source and the mandatory logical-metadata quorum has committed. Encoding
+and placement of the standard shards then continue durably in the background.
+`REPLICATED` withholds publication and success until the evidence required by
+section 24.1 is durable. Failure of the sole source after a `LOCAL` response
+but before placement completes may lose the payload; it never rolls metadata
+back or exposes an older version.
 
 Placement ranks distinct active nodes once for the blob identity and assigns
 shard ordinal `i` to rank `i`. A healthy read de-stripes the `K` systematic
@@ -720,11 +778,20 @@ length. Erasure parity is not a checksum: shard-local integrity evidence is
 checked before a shard is offered to the decoder. A corrupt or missing shard
 is repaired from any valid `K` onto its current owner.
 
+The codec is `reed-solomon-erasure` 6.0.0 in its normal pure-Rust
+configuration, without `simd-accel`. The fragment format freezes golden vectors
+so AMD64 and ARM64 produce identical bytes and a later implementation may be
+substituted only when it reproduces those vectors. Each versioned shard file
+stores its identity and inline CRC32C for every stored shard-stripe chunk; no
+sidecar or checksum column family is created. Invalid chunks are treated as
+missing before decode, and the reconstructed object's existing BLAKE3 hash and
+length remain the end-to-end verification.
+
 The default `2+1` profile uses 1.5 times the payload capacity and tolerates one
 missing shard. All three shards are required for a non-degraded write, so one
 unavailable owner pauses new `REPLICATED` writes under that profile. The exact
-non-default-profile acknowledgement rule and small-payload copy rule remain
-unresolved in section 24.
+meaning of fixed `2+1` acknowledgement evidence when the final profile is not
+`2+1` remains unresolved in section 24.
 
 `LOCAL` and `REPLICATED` are response-evidence choices, not persistent object
 durability classes. Content identity and final placement are identical under
@@ -756,14 +823,41 @@ version increments or decrements once. Same-content replacement in an
 unversioned bucket changes the path version but has zero net content delta.
 
 Reference mutations use the same bounded source journal described in section
-19; there is no second reference log. The proposed delivery protocol has every
-destination durably record one applied position per source and apply relevant
-reference deltas in source order. Retries at or below that position are
-ignored and a missing required position is repaired before GC is enabled. This
-keeps replay state proportional to cluster nodes rather than reference IDs
-proportional to objects. The exact protocol and its acknowledgement boundary
-remain unresolved in section 24 because they determine crash behavior between
-head publication and remote count application.
+19; there is no second reference log. Every content owner durably stores one
+`last_applied_reference_position` per stable source ID. A source sends a
+bounded batch naming an exclusive starting position, an inclusive through
+position, and the deltas relevant to that destination. The destination applies
+those deltas and advances its cursor in one RocksDB `WriteBatch`:
+
+- a batch at or below the durable cursor is an idempotent retry;
+- a batch starting exactly at the cursor applies once;
+- a batch starting beyond the cursor is a gap and fails closed; and
+- a decrement that would underflow is a gap or corruption, never a saturating
+  arithmetic operation.
+
+Cursor-advance batches may omit events irrelevant to that destination. This
+avoids broadcasting every object event to every node while still proving a
+contiguous source prefix. The ordinary internal RPC response only tells the
+source that the destination durably advanced; it is not a public receipt or
+watch acknowledgement. Source-side acknowledgement caches are derived and do
+not become authority.
+
+Before publishing a new reference, its available physical artifacts are
+sealed or touched with `AWAITING_PUBLISH` and a fresh `updated_at`. The head,
+version descriptor, mutation stamp, and source-journal event commit atomically
+on the coordinator and the typed metadata mutation reaches its mandatory
+logical-record quorum. `REPLICATED` also waits for every required new payload
+owner to hold its bytes and apply the positive reference effect. `LOCAL` does
+not wait for remote effects. Negative deltas continue asynchronously because a
+delay can retain excess bytes but cannot delete live content.
+
+The source journal compacts only through a prefix every required current
+destination has durably advanced beyond. If its configured bound is reached,
+affected reference-changing mutations stop rather than dropping events. A
+temporary source outage pauses GC until its tail is again proven current. An
+unrecoverable source-journal loss keeps GC disabled while authoritative version
+descriptors rebuild counts. This keeps replay state proportional to cluster
+nodes rather than reference IDs proportional to objects.
 
 Garbage collection runs only on the current content owner while it has a fresh
 serving lease. It performs the configured hourly scan and never removes content
@@ -779,8 +873,12 @@ is added merely to make that rebuild incremental.
 ## 15. Membership changes and rebalancing
 
 Only one membership or weight transition is active at a time. Raft stores one
-bounded transition description so a new leader can resume it; individual keys
-and progress inventories remain outside Raft.
+bounded transition containing its `ADD`, `REMOVE`, or `REWEIGHT` kind, the node
+ID, and the target weight when applicable. The transition's Raft log ID is its
+identity; there is no separately managed counter. A new leader derives which
+step remains from the descriptor and OpenRaft membership. Individual keys,
+copy progress, and progress inventories remain outside Raft and are recomputed
+when recovery needs them.
 
 ### 15.1 Adding a node
 
@@ -802,8 +900,8 @@ and progress inventories remain outside Raft.
 Planned removal performs the same calculation for hypothetical
 `active - removed node`, pre-copies changed ownership, replays the tail, pauses
 mutable traffic, expires old fences, commits removal, and resumes. If the node
-is a voter, a ready learner is promoted first when needed to preserve the
-configured voter target.
+is a voter, a ready ACTIVE learner is promoted first when needed to preserve
+the fixed target of at most three voters.
 
 Forced removal is an explicit authorized administrator action. It first checks
 that surviving complete-record replicas and payload fragments meet the promised
@@ -1142,19 +1240,26 @@ patch or parallel mechanism.
 ### 24.1 Payload acknowledgement thresholds
 
 The cluster profile now defaults to systematic Reed-Solomon `K=2, M=1` with a
-16-KiB stripe unit and is configurable only at genesis. `REPLICATED` under the
-default profile waits for all three distinct shard owners. `LOCAL` always
-means that the upload receiver has durably stored the complete input; it never
-weakens authoritative metadata replication or changes the required final
-placement. Standard placement after a `LOCAL` response is mandatory background
-work, not optional best effort.
+16-KiB stripe unit and is configurable only at genesis. `LOCAL` is resolved:
+the rank-zero coordinator accepting the request must durably seal the complete
+input, and the mandatory logical-metadata quorum must commit, before success.
+It never weakens authoritative metadata replication or changes the required
+final placement. Standard placement after a `LOCAL` response is mandatory
+background work, not optional best effort.
 
-Approval is also required for the acknowledgement threshold when an
-administrator selects `M > 1`, and for the matching complete-copy count for
-`REPLICATED` small payloads. Crash-safe continuation of standard placement
-after a `LOCAL` response and its reference deltas are part of section 24.4's
-unresolved delivery protocol. No codec dependency or shard-integrity format
-may be adopted before these decisions.
+Small payloads converge to `M + 1` complete copies and `REPLICATED` waits for
+all of them as defined in section 14.1. The pure-Rust codec and inline integrity
+format are also resolved.
+
+One clarification still blocks `REPLICATED` for a non-default final profile.
+Exactly three fragments of a final `K=4, M=2` encoding cannot reconstruct the
+object. Therefore "`REPLICATED` always means `2+1` regardless of eventual
+cluster EC configuration" must be resolved as either fixing the final fragment
+profile itself at `2+1`, or creating a distinct temporary recoverable
+representation before convergence. The implementation must not silently treat
+three arbitrary fragments of a profile with `K > 3` as a successful write.
+Crash-safe continuation after a response and reference deltas follow section
+14.3.
 
 ### 24.2 Tenant-name canonicalization
 
@@ -1178,33 +1283,6 @@ whether bounded administration operations use the existing singleton atomic
 executor internally, or use another explicitly specified recovery protocol.
 They must not become an accidental raw cross-node RocksDB transaction or a
 partially visible sequence.
-
-### 24.4 Reference-delta delivery
-
-Reference counts remain local to each selected complete copy, complete upload
-source, or erasure-coded shard, and the existing source journal is the only
-proposed ordered feed.
-Approval is still required for the exact acknowledgement and replay rule that
-couples a durable path-version change to increments and decrements on remote
-content owners. It must tolerate a coordinator crash on either side of head
-publication, use bounded state rather than one persistent reference ID per
-object version, and disable GC until a detected gap has been repaired or
-counts rebuilt.
-
-### 24.5 Voter target
-
-The release needs an exact voter policy. A candidate is three voters by default
-with an operator-selected five-voter genesis option, while additional active
-storage nodes remain learners. This changes quorum availability and peer cost
-and is not silently selected by the implementation.
-
-### 24.6 JWT signing-key consistency
-
-Every active node must validate and mint compatible public JWTs. Approval is
-required for whether Raft stores the expected signing-key fingerprint as
-bounded cluster configuration, or each node validates it against the same
-operator-managed cluster identity file. The secret key itself never enters
-Raft or peer state transfer in either design.
 
 ## 25. Upgrade behavior
 
