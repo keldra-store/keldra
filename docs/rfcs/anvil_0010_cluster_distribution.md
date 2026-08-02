@@ -29,8 +29,8 @@ The cluster has these deliberately different data treatments:
 - payloads of at most 64 KiB remain complete content-addressed values in the
   `small_blobs` RocksDB column family and are copied to their selected content
   owners;
-- larger payloads are erasure coded into distinct fragments, with each
-  fragment stored once on a different weighted-HRW-selected node;
+- larger payloads converge to erasure-coded shards on distinct
+  weighted-HRW-selected nodes regardless of acknowledgement policy;
 - Raft records only membership, node identity and weight, bootstrap state,
   atomic-executor nomination, compact atomic decisions, and other bounded
   cluster coordination state; and
@@ -601,7 +601,7 @@ column-family reads or writes.
 | `heads` | Current exact-path version or tombstone | Complete logical replicas by exact path |
 | `versions` | Immutable version descriptors | Same replica group as the exact path |
 | `small_blobs` | Raw content of at most 64 KiB | Complete content copies on selected content owners |
-| `blob_references` | Count, flags, and timestamps | Stored with every small copy or large fragment it governs |
+| `blob_references` | Count, flags, and timestamps | Stored with every small copy, complete upload source, or large shard it governs |
 | `bucket_options` | Version-retention configuration | Complete logical replicas by bucket |
 | `names` | Tenant and bucket name claims | Complete logical replicas by canonical claim |
 | `receipts` | Bounded mutation idempotency | Replicated with the governed mutation |
@@ -654,49 +654,90 @@ versions reference it.
 
 Payloads of at most 64 KiB remain raw values in `small_blobs`. This is a
 deliberate primary storage path, not a cache. Selected content owners hold
-complete copies. A local RocksDB synchronous write durably stores a copy; the
-request durability decides how many distinct selected content owners must
-acknowledge before publication.
+complete copies. The upload receiver first stores the raw value with a
+synchronous RocksDB write. `LOCAL` accepts that one durable acknowledgement;
+`REPLICATED` waits for the configured number of distinct selected content
+owners. Both policies converge to the same selected-copy placement; `LOCAL`
+merely permits that copying to finish after the response.
 
 No large-object implementation, index segment cache, or distributed feature
 may remove or bypass `small_blobs`.
 
 ### 14.2 Large payloads
 
-Larger payloads use one cluster-wide fixed erasure-code geometry:
+Larger payloads use one cluster-wide fixed erasure-code profile regardless of
+the request acknowledgement policy. The default profile is:
 
 ```text
-K data fragments
-M parity fragments
-K + M distinct fragment owners
+algorithm     = systematic Reed-Solomon Vandermonde
+K             = 2 data chunks
+M             = 1 coding chunk
+stripe_unit   = 16 KiB
+stripe_width  = K * stripe_unit
 ```
 
-The persisted fragment identity is only:
+This is Ceph's conventional systematic, fixed-stripe layout, not a custom
+byte-interleaving scheme. Each stripe takes `K` contiguous `stripe_unit`
+ranges from the object and computes `M` equal-sized coding chunks over them.
+Chunks of one ordinal, in stripe order, form that ordinal's stored shard.
+The final stripe is logically zero-padded for encoding; the known object
+length trims reconstruction and the zero tail need not be stored physically.
+
+The administrator may override `K`, `M`, and `stripe_unit` when creating the
+cluster. The genesis node commits the resulting bounded profile to Raft once.
+Joining nodes learn it from Raft and reject a conflicting local configuration.
+The profile is immutable for that fragment format. It is not repeated per
+object and there is no profile registry.
+
+The persisted shard identity is only:
 
 ```text
-[fragment_format_version][blob_hash][blob_length][fragment_ordinal]
+[fragment_format_version][blob_hash][blob_length][shard_ordinal]
 ```
 
-Stripe boundaries and encoder buffering are internal to each fragment stream.
-They do not enter placement keys, object descriptors, manifests, Raft, or a
-profile registry. A fragment owner stores its one fragment; it does not store a
-second replica of that fragment. The full set's different fragments provides
-redundancy.
+The cluster profile defines stripe boundaries; they do not enter placement
+keys, object descriptors, or manifests. A shard owner stores its one shard; it
+does not store a second replica of that shard. The full set of different shards
+provides redundancy. Every ordinal is assigned to a distinct active node; an
+undersized cluster never silently co-locates shards and weakens the profile.
+
+The node receiving an upload first seals and verifies one complete
+content-addressed source blob in the ordinary byte plane. This is upload and
+repair source material, not another storage class or side plane. `LOCAL` may
+publish and return success after that node has durably stored the source and
+the mandatory logical-metadata quorum has committed. Encoding and placement of
+the standard shards then continue durably in the background. `REPLICATED`
+withholds publication and success until the configured standard shard set has
+durably acknowledged. Failure of the sole source after a `LOCAL` response but
+before placement completes may lose the payload; it never rolls metadata back
+or exposes an older version.
 
 Placement ranks distinct active nodes once for the blob identity and assigns
-fragment ordinal `i` to rank `i`. A read obtains any `K` valid fragments,
-decodes the payload, and verifies the final hash and length. A corrupt or
-missing fragment is repaired from any valid `K` onto its current owner.
+shard ordinal `i` to rank `i`. A healthy read de-stripes the `K` systematic
+shards directly. A degraded read obtains any `K` independently verified
+shards, reconstructs the missing data, and verifies the final object BLAKE3 and
+length. Erasure parity is not a checksum: shard-local integrity evidence is
+checked before a shard is offered to the decoder. A corrupt or missing shard
+is repaired from any valid `K` onto its current owner.
 
-`K`, `M`, and the exact `LOCAL` and `REPLICATED` acknowledgement sets remain
-unresolved in section 24. Once selected for 0.5.1, the geometry is immutable
-for that cluster. Changing it is a future explicit re-encode operation under a
-new fragment format version, not a silent configuration edit.
+The default `2+1` profile uses 1.5 times the payload capacity and tolerates one
+missing shard. All three shards are required for a non-degraded write, so one
+unavailable owner pauses new `REPLICATED` writes under that profile. The exact
+non-default-profile acknowledgement rule and small-payload copy rule remain
+unresolved in section 24.
+
+`LOCAL` and `REPLICATED` are response-evidence choices, not persistent object
+durability classes. Content identity and final placement are identical under
+both. The complete upload source remains through the ordinary age-gated
+collection window after shard placement completes; it does not create a second
+logical content identity or a per-reference inventory. Changing a committed
+profile is a future explicit re-encode operation under a new fragment format
+version, not a configuration edit.
 
 ### 14.3 Reference counts and garbage collection
 
-Every complete small copy or large fragment stores its bytes and the same
-bounded lifecycle record:
+Every complete small copy, complete upload-source blob, or large shard stores
+its bytes and the same bounded lifecycle record:
 
 ```text
 BlobLifecycle {
@@ -1098,20 +1139,22 @@ and atomic finalization lag.
 Implementation must stop for approval at these boundaries rather than invent a
 patch or parallel mechanism.
 
-### 24.1 Erasure-code geometry and durability evidence
+### 24.1 Payload acknowledgement thresholds
 
-The exact `K` data and `M` parity counts are not yet selected. They determine
-minimum cluster size, usable capacity, node-failure tolerance, upload fanout,
-and repair cost. The complete-copy count and acknowledgement threshold for
-small payloads must be selected at the same time so `LOCAL` and `REPLICATED`
-have one comprehensible contract across the 64 KiB boundary.
+The cluster profile now defaults to systematic Reed-Solomon `K=2, M=1` with a
+16-KiB stripe unit and is configurable only at genesis. `REPLICATED` under the
+default profile waits for all three distinct shard owners. `LOCAL` always
+means that the upload receiver has durably stored the complete input; it never
+weakens authoritative metadata replication or changes the required final
+placement. Standard placement after a `LOCAL` response is mandatory background
+work, not optional best effort.
 
-The associated durability evidence must also be fixed. A coherent candidate is
-`K=2, M=1`, with `LOCAL` waiting for the two systematic fragments and
-`REPLICATED` waiting for all three, but that is not an accepted decision in this
-RFC. “Local” would then mean minimum readable data without a node-loss promise,
-not literally storage on one machine. No encoder dependency or temporary
-whole-blob replication layout may be adopted before this decision.
+Approval is also required for the acknowledgement threshold when an
+administrator selects `M > 1`, and for the matching complete-copy count for
+`REPLICATED` small payloads. Crash-safe continuation of standard placement
+after a `LOCAL` response and its reference deltas are part of section 24.4's
+unresolved delivery protocol. No codec dependency or shard-integrity format
+may be adopted before these decisions.
 
 ### 24.2 Tenant-name canonicalization
 
@@ -1138,8 +1181,9 @@ partially visible sequence.
 
 ### 24.4 Reference-delta delivery
 
-Reference counts remain local to each selected complete copy or erasure-coded
-fragment, and the existing source journal is the only proposed ordered feed.
+Reference counts remain local to each selected complete copy, complete upload
+source, or erasure-coded shard, and the existing source journal is the only
+proposed ordered feed.
 Approval is still required for the exact acknowledgement and replay rule that
 couples a durable path-version change to increments and decrements on remote
 content owners. It must tolerate a coordinator crash on either side of head
@@ -1245,8 +1289,8 @@ The design accepts several explicit trade-offs:
   transactional node;
 - mutable logical records pay a complete-record quorum cost because current
   truth, CAS, tombstones, and authorization require immediate failover;
-- large payloads use storage-efficient erasure coding rather than fragment
-  replication;
+- large payloads use storage-efficient erasure coding rather than shard
+  replication; `LOCAL` changes when success is returned, not final placement;
 - `ListObjects` and public watches fan out until later single-owner indexes
   exist;
 - membership cutover includes a short mutable-write pause instead of a
