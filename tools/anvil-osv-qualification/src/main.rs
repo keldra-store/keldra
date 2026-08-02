@@ -4,7 +4,7 @@ use std::{
     io::{Cursor, Read},
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
-    sync::{Arc, mpsc as thread_mpsc},
+    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
@@ -27,6 +27,7 @@ use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, ValueEnum};
 use futures_util::{StreamExt as _, TryStreamExt as _, stream};
 use prost::Message as _;
+use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -290,17 +291,9 @@ struct PreparedRecordJobs {
     has_unscoped: bool,
 }
 
-struct RecordWork {
-    job_index: u64,
-    job: RecordJob,
-}
-
 struct RecordEncoder {
-    inputs: Vec<thread_mpsc::SyncSender<RecordWork>>,
-    results: Vec<thread_mpsc::Receiver<Result<PreparedRecord>>>,
-    workers: Vec<thread::JoinHandle<()>>,
+    pool: ThreadPool,
     pending: Vec<RecordJob>,
-    next_job_index: u64,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -484,57 +477,20 @@ impl RecordEncoder {
             worker_count > 0,
             "record encoding requires at least one worker"
         );
-        let mut inputs = Vec::with_capacity(worker_count);
-        let mut results = Vec::with_capacity(worker_count);
-        let mut workers = Vec::<thread::JoinHandle<()>>::with_capacity(worker_count);
-        for worker_index in 0..worker_count {
-            let (input, jobs) = thread_mpsc::sync_channel::<RecordWork>(0);
-            let (worker_results, result) = thread_mpsc::sync_channel(0);
-            let worker = match thread::Builder::new()
-                .name(format!("osv-record-encoder-{worker_index}"))
-                .spawn(move || {
-                    while let Ok(work) = jobs.recv() {
-                        let result = match catch_unwind(AssertUnwindSafe(|| {
-                            prepare_record(work.job).context("encode OSV source record")
-                        })) {
-                            Ok(result) => result,
-                            Err(_) => Err(anyhow::anyhow!(
-                                "OSV record encoding worker panicked for job {}",
-                                work.job_index
-                            )),
-                        };
-                        if worker_results.send(result).is_err() {
-                            return;
-                        }
-                    }
-                }) {
-                Ok(worker) => worker,
-                Err(error) => {
-                    drop(input);
-                    inputs.clear();
-                    results.clear();
-                    for worker in workers {
-                        let _ = worker.join();
-                    }
-                    return Err(error).context("start OSV record encoding worker");
-                }
-            };
-            inputs.push(input);
-            results.push(result);
-            workers.push(worker);
-        }
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(worker_count)
+            .thread_name(|index| format!("osv-record-encoder-{index}"))
+            .build()
+            .context("start OSV record encoding workers")?;
         Ok(Self {
-            inputs,
-            results,
-            workers,
+            pool,
             pending: Vec::with_capacity(worker_count),
-            next_job_index: 0,
         })
     }
 
     fn submit(&mut self, job: RecordJob) -> Result<Option<Vec<PreparedRecord>>> {
         self.pending.push(job);
-        if self.pending.len() == self.inputs.len() {
+        if self.pending.len() == self.pool.current_num_threads() {
             self.flush().map(Some)
         } else {
             Ok(None)
@@ -542,50 +498,21 @@ impl RecordEncoder {
     }
 
     fn flush(&mut self) -> Result<Vec<PreparedRecord>> {
-        let submitted = self.pending.len();
+        let worker_count = self.pool.current_num_threads();
         ensure!(
-            submitted <= self.inputs.len(),
+            self.pending.len() <= worker_count,
             "OSV record encoding wave exceeded its worker bound"
         );
-        for (slot, job) in self.pending.drain(..).enumerate() {
-            let job_index = self.next_job_index;
-            self.next_job_index += 1;
-            self.inputs[slot]
-                .send(RecordWork { job_index, job })
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "OSV record encoding worker {slot} stopped before receiving job {job_index}"
-                    )
-                })?;
-        }
-
-        let mut ordered = Vec::with_capacity(submitted);
-        for (slot, results) in self.results.iter().take(submitted).enumerate() {
-            ordered.push(results.recv().unwrap_or_else(|_| {
-                Err(anyhow::anyhow!(
-                    "OSV record encoding worker {slot} stopped before completing its job"
-                ))
-            }));
-        }
+        let jobs = std::mem::replace(&mut self.pending, Vec::with_capacity(worker_count));
+        let ordered = catch_unwind(AssertUnwindSafe(|| {
+            self.pool
+                .install(|| jobs.into_par_iter().map(prepare_record).collect::<Vec<_>>())
+        }))
+        .map_err(|_| anyhow::anyhow!("OSV record encoding wave panicked"))?;
         ordered
             .into_iter()
             .map(|record| record.context("prepare OSV source record"))
             .collect()
-    }
-
-    fn finish(mut self) -> Result<()> {
-        self.inputs.clear();
-        self.results.clear();
-        let mut first_error = None;
-        for worker in std::mem::take(&mut self.workers) {
-            if worker.join().is_err() && first_error.is_none() {
-                first_error = Some(anyhow::anyhow!("OSV record encoding worker panicked"));
-            }
-        }
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
     }
 }
 
@@ -1572,15 +1499,7 @@ fn parse_archive(
         }
         Ok(report)
     })();
-    let encoding = encoder.finish();
     let compression = compressor.finish();
-    let parsing = match (parsing, encoding) {
-        (Ok(report), Ok(())) => Ok(report),
-        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
-        (Err(error), Err(encoding_error)) => Err(error.context(format!(
-            "OSV record encoding shutdown also failed: {encoding_error:#}"
-        ))),
-    };
     match (parsing, compression) {
         (Ok(report), Ok(())) => Ok(report),
         (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
@@ -2002,7 +1921,6 @@ mod tests {
             wave_sizes.push(tail.len());
             records.extend(tail);
         }
-        encoder.finish()?;
         Ok((records, wave_sizes))
     }
 
@@ -2201,13 +2119,11 @@ mod tests {
                 wave_sizes.push(wave.len());
                 total += wave.len();
             }
-            assert!(encoder.pending.len() < encoder.inputs.len());
+            assert!(encoder.pending.len() < encoder.pool.current_num_threads());
         }
         let tail = encoder.flush().unwrap();
         total += tail.len();
         wave_sizes.push(tail.len());
-        encoder.finish().unwrap();
-
         assert_eq!(total, 1_270);
         assert_eq!(wave_sizes.len(), 318);
         assert!(wave_sizes.iter().all(|size| *size <= 4));
