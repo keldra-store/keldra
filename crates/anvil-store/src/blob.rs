@@ -35,7 +35,7 @@ pub const AWAITING_PUBLISH: u8 = 1;
 #[derive(Clone, Debug)]
 pub struct BlobStore {
     root: PathBuf,
-    directory_lock: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) directory_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 pub struct BlobUpload {
@@ -184,7 +184,7 @@ async fn sync_directory(path: &Path) -> Result<()> {
 
 /// Creates every missing component and synchronises the directory that names
 /// it before moving on to the next component.
-async fn create_directory_all_durable(path: &Path) -> Result<()> {
+pub(crate) async fn create_directory_all_durable(path: &Path) -> Result<()> {
     let mut missing = Vec::new();
     let mut current = path.to_path_buf();
     loop {

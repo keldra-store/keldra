@@ -14,7 +14,8 @@ use thiserror::Error;
 use crate::BlobRef;
 
 const SHARD_MAGIC: &[u8; 8] = b"ANVLSHRD";
-const FRAGMENT_FORMAT_VERSION: u16 = 1;
+/// On-disk identity and framing version for erasure-coded fragments.
+pub const FRAGMENT_FORMAT_VERSION: u16 = 1;
 const HEADER_BODY_BYTES: usize = 8 + 2 + 32 + 8 + 2;
 const HEADER_BYTES: usize = HEADER_BODY_BYTES + 4;
 const FRAME_PREFIX_BYTES: usize = 4 + 4;

@@ -37,7 +37,7 @@ pub use bootstrap::{
 pub use clock::VersionClock;
 pub use erasure::{
     DEFAULT_ERASURE_DATA_SHARDS, DEFAULT_ERASURE_PARITY_SHARDS, DEFAULT_ERASURE_STRIPE_UNIT_BYTES,
-    ErasureCodec, ErasureError, ErasureProfile,
+    ErasureCodec, ErasureError, ErasureProfile, FRAGMENT_FORMAT_VERSION,
 };
 pub use key::ObjectKey;
 pub use model::{
@@ -59,7 +59,8 @@ pub use store::{
     BatchGetSelection, DEFAULT_AWAITING_PUBLISH_TTL_SECONDS, DEFAULT_MUTATION_RECEIPT_MAX_BYTES,
     DEFAULT_MUTATION_RECEIPT_MAX_ENTRIES, DEFAULT_MUTATION_RECEIPT_RETENTION_SECONDS,
     ListObjectsPage, MAX_LIST_OBJECT_VERSIONS, MAX_LIST_OBJECTS, MutationReceiptRetention,
-    OpenedObject, Store, StoreOptions,
+    OpenedObject, ShardIdentity, ShardReader, ShardSealOutcome, ShardStoreError, Store,
+    StoreOptions,
 };
 pub use watch::{
     DEFAULT_WATCH_MAX_BYTES, DEFAULT_WATCH_MAX_ENTRIES, InvalidationStateHint, LocalChange,

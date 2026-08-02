@@ -115,7 +115,6 @@ impl Store {
         let mut removed = 0_u64;
         for entry in self.db.iterator_cf(references, IteratorMode::Start) {
             let (key, encoded) = entry.map_err(storage_error)?;
-            let reference = blob_reference_from_key(&key)?;
             let state = decode_blob_reference_state(&encoded)?;
             if !blob_reference_is_garbage(state, now_unix_millis, self.awaiting_publish_ttl_millis)
             {
@@ -123,10 +122,16 @@ impl Store {
             }
 
             let mut batch = WriteBatch::default();
-            if is_small_blob(&reference) {
-                batch.delete_cf(self.cf(CF_SMALL_BLOBS)?, &key);
+            if key.len() == 32 + size_of::<u64>() {
+                let reference = blob_reference_from_key(&key)?;
+                if is_small_blob(&reference) {
+                    batch.delete_cf(self.cf(CF_SMALL_BLOBS)?, &key);
+                } else {
+                    self.blobs.remove(&reference).map_err(storage_error)?;
+                }
             } else {
-                self.blobs.remove(&reference).map_err(storage_error)?;
+                let identity = ShardIdentity::decode(&key).map_err(storage_error)?;
+                self.remove_shard_file(&identity)?;
             }
             batch.delete_cf(references, &key);
             let mut options = WriteOptions::default();
@@ -198,7 +203,6 @@ impl Store {
                         "blob shard directory contains a non-file entry".into(),
                     ));
                 }
-                let reference = blob_reference_from_file(&file, shard)?;
                 let modified = file
                     .metadata()
                     .map_err(storage_error)?
@@ -210,10 +214,29 @@ impl Store {
                 if now_unix_millis.saturating_sub(modified) < self.awaiting_publish_ttl_millis {
                     continue;
                 }
-                if !is_small_blob(&reference) && self.blob_reference_state(&reference)?.is_some() {
-                    continue;
+                let file_name = file.file_name();
+                let file_name = file_name.to_str().ok_or_else(|| {
+                    MutationError::Storage("blob file name is not valid UTF-8".into())
+                })?;
+                if file_name.len() == 64 {
+                    let reference = blob_reference_from_file(&file, shard)?;
+                    if !is_small_blob(&reference)
+                        && self.blob_reference_state(&reference)?.is_some()
+                    {
+                        continue;
+                    }
+                    self.blobs.remove(&reference).map_err(storage_error)?;
+                } else {
+                    let identity =
+                        ShardIdentity::decode_file_name(shard, file_name).map_err(storage_error)?;
+                    if self
+                        .read_blob_reference_state(&identity.encode())?
+                        .is_some()
+                    {
+                        continue;
+                    }
+                    self.remove_shard_file(&identity)?;
                 }
-                self.blobs.remove(&reference).map_err(storage_error)?;
                 removed = removed
                     .checked_add(1)
                     .ok_or_else(|| MutationError::Storage("blob GC count is exhausted".into()))?;
@@ -228,7 +251,15 @@ impl Store {
         now_unix_millis: u64,
     ) -> Result<Option<BlobReferenceState>, MutationError> {
         let key = blob_reference_key(reference);
-        let current = self.read_blob_reference_state(&key)?;
+        self.prepare_sealed_artifact_reservation(&key, now_unix_millis)
+    }
+
+    pub(super) fn prepare_sealed_artifact_reservation(
+        &self,
+        key: &[u8],
+        now_unix_millis: u64,
+    ) -> Result<Option<BlobReferenceState>, MutationError> {
+        let current = self.read_blob_reference_state(key)?;
         if let Some(current) = current {
             validate_blob_reference_state(current)?;
         }
@@ -262,15 +293,14 @@ impl Store {
         Ok(Some(next))
     }
 
-    pub(super) fn reserve_sealed_blob(
+    pub(super) fn reserve_sealed_artifact(
         &self,
-        reference: &BlobRef,
+        key: &[u8],
         now_unix_millis: u64,
-    ) -> Result<(), MutationError> {
-        let Some(next) = self.prepare_sealed_blob_reservation(reference, now_unix_millis)? else {
-            return Ok(());
-        };
-        let key = blob_reference_key(reference);
+    ) -> Result<BlobReferenceState, MutationError> {
+        let next = self
+            .prepare_sealed_artifact_reservation(key, now_unix_millis)?
+            .ok_or_else(|| MutationError::Storage("sealed lifecycle state is missing".into()))?;
         let mut options = WriteOptions::default();
         options.set_sync(self.sync_writes);
         self.db
@@ -280,7 +310,18 @@ impl Store {
                 encode_blob_reference_state(next),
                 &options,
             )
-            .map_err(storage_error)
+            .map_err(storage_error)?;
+        Ok(next)
+    }
+
+    pub(super) fn reserve_sealed_blob(
+        &self,
+        reference: &BlobRef,
+        now_unix_millis: u64,
+    ) -> Result<(), MutationError> {
+        let key = blob_reference_key(reference);
+        self.reserve_sealed_artifact(&key, now_unix_millis)
+            .map(|_| ())
     }
 
     fn persist_small_blob_seal(

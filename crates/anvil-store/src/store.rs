@@ -721,7 +721,10 @@ mod blob_references;
 mod mutations;
 mod reads;
 mod reference_deltas;
+mod shards;
 mod watch_journal;
+
+pub use shards::{ShardIdentity, ShardReader, ShardSealOutcome, ShardStoreError};
 
 pub(crate) fn is_program_definition_path(path: &str) -> bool {
     let Some(name_and_version) = path.strip_prefix(PROGRAM_DEFINITION_PREFIX) else {
