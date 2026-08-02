@@ -11,13 +11,15 @@ publish = false
 [dependencies]
 anvil-api = { path = "../../crates/anvil-api" }
 anyhow = "1"
+blake3 = "1.8"
 clap = { version = "4.5", features = ["derive"] }
 futures-util = "0.3"
 hex = "0.4"
+prost = "0.14"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_jcs = "0.2"
 sha2 = "0.10"
 tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "sync"] }
 tonic = { version = "0.14", features = ["transport"] }
 zip = { version = "6.0", default-features = false, features = ["deflate"] }
+zstd = "0.13"

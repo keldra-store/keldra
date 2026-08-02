@@ -1,5 +1,5 @@
 {
-  "schema": "anvil.perf.osv_import.v2",
+  "schema": "anvil.perf.osv_import.v3",
   "measured": false,
   "passed": false,
   "target_seconds": 150.0,
@@ -7,18 +7,27 @@
     "path": null,
     "expected_sha256": null,
     "observed_sha256": null,
-    "archive_bytes": null
+    "archive_bytes": null,
+    "snapshot_day": null,
+    "snapshot_id": null
   },
   "schema_shape": {
-    "developer_defence_schema": "developer-defence.source-raw-record-head.v1",
+    "source_definition_schema": "developer-defence.source-definition.v2",
+    "source_record_schema": "developer-defence.osv-source-record.v1",
+    "snapshot_manifest_schema": "developer-defence.osv-snapshot-manifest.v1",
     "source": "osv",
     "bucket": "dd-source-osv-raw",
-    "leaf_path": "raw/osv/{sha256(trimmed id)}/record.json",
-    "head_path": "raw/osv/{sha256(trimmed id)}/current.json",
-    "writes_per_source_record": 2,
+    "source_definition_path": "entities/source-definition/{sha256(source-definition\\0osv)}/current.json",
+    "shard_path": "shards/v1/{records_sha256[0..2]}/{records_sha256}.ndjson.zst",
+    "manifest_path": "snapshots/{snapshot_id}/manifest.json",
+    "shard_format": "developer-defence.osv-source-record.ndjson.v1",
+    "shard_compression": "zstd-6",
+    "manifest_is_authoritative": true,
+    "per_object_user_metadata": false,
     "phases": [
-      "bulk canonical raw leaves and retain returned versions",
-      "bulk canonical heads referring to those versions"
+      "write immutable source definition and compressed content-addressed shards",
+      "write immutable authoritative snapshot manifest with exact shard versions",
+      "verify every exact current object head"
     ]
   },
   "software": {
@@ -29,36 +38,45 @@
     "endpoint": null,
     "tenant": null,
     "bucket": "dd-source-osv-raw",
-    "durability_class": null,
+    "source_url": "https://osv-vulnerabilities.storage.googleapis.com/all.zip",
+    "source_cadence_hours": 6,
+    "durability_class": "local",
     "node_count": 1,
     "batch_size_operations": null,
     "maximum_batch_payload_bytes": null,
+    "shard_uncompressed_target_bytes": null,
     "write_concurrency": null,
     "verification_concurrency": null,
-    "clean_target_asserted": true
+    "clean_target_verified": true
   },
   "parsing": {
     "archive_entries": null,
     "json_documents": null,
-    "accepted_source_records_n": null,
+    "accepted_source_documents": null,
+    "normalised_source_records": null,
+    "unscoped_documents": null,
     "malformed_documents": null,
     "oversized_documents": null,
     "decompressed_json_bytes": null
   },
   "result": {
-    "source_records_n": null,
-    "logical_mutations_m": null,
-    "raw_payload_bytes": null,
-    "head_payload_bytes": null,
+    "source_documents": null,
+    "normalised_source_records": null,
+    "shard_objects": null,
+    "logical_mutations": null,
+    "source_definition_payload_bytes": null,
+    "shard_payload_bytes": null,
+    "manifest_payload_bytes": null,
     "total_payload_bytes": null,
-    "leaf_bulk_requests": null,
-    "head_bulk_requests": null,
+    "data_bulk_requests": null,
+    "manifest_bulk_requests": null,
     "bulk_requests": null,
     "batch_fill_average_operations": null,
     "replayed_mutations": null,
     "end_to_end_seconds": null,
-    "source_records_per_second": null,
-    "logical_mutations_per_second": null,
+    "source_documents_per_second": null,
+    "normalised_source_records_per_second": null,
+    "payload_mebibytes_per_second": null,
     "bulk_request_latency_ms": {
       "sample_count": null,
       "mean_ms": null,
@@ -66,14 +84,14 @@
       "p95_ms": null,
       "p99_ms": null
     },
-    "leaf_request_latency_ms": {
+    "data_request_latency_ms": {
       "sample_count": null,
       "mean_ms": null,
       "p50_ms": null,
       "p95_ms": null,
       "p99_ms": null
     },
-    "head_request_latency_ms": {
+    "manifest_request_latency_ms": {
       "sample_count": null,
       "mean_ms": null,
       "p50_ms": null,
@@ -87,9 +105,10 @@
     "duration_seconds": null
   },
   "limitations": [
-    "This qualifies Developer Defence's raw OSV leaf/head persistence shape; normalised shard construction and snapshot publication are outside this storage gate.",
-    "Anvil 0.5 accepts exactly local or replicated durability: local performs the write, replicated returns DURABILITY_UNAVAILABLE without mutation, and every other value is invalid. This single-node qualification uses local.",
-    "Independent verification uses current object heads and exact receipt versions; it does not download payload bytes again.",
-    "Anvil 0.5 has no list, count, or batch-head API: verification proves every expected exact version exists, but --confirm-clean-target remains the operator's assertion that no extra paths exist."
+    "The authoritative qualification shape is one source definition, immutable compressed content-addressed shards, and one immutable manifest; it deliberately does not create a raw object and mutable head for every upstream JSON document.",
+    "Shard attributes are carried by the authoritative manifest. Anvil 0.5.0 receives no per-object user metadata and this tool creates no metadata sidecar.",
+    "The required --snapshot-day and pinned archive hash determine the snapshot identity; the local clock never participates.",
+    "Anvil 0.5 accepts exactly local or replicated durability: local performs the write and replicated is unavailable in this single-node qualification.",
+    "Independent verification checks each current version, content length, content type, and BLAKE3 payload digest through HeadObject without downloading the payload again."
   ]
 }

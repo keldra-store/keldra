@@ -1,95 +1,102 @@
 # Anvil 0.5 OSV import qualification
 
-The executable `anvil-osv-qualification` measures the ordinary `BulkWrite`
-path against Developer Defence's real raw OSV object shape. It never invokes
-an atomic program.
+`anvil-osv-qualification` measures the complete authoritative Developer Defence
+OSV storage shape over Anvil 0.5 `BulkWrite`. It never invokes an atomic
+program and it does not create a raw object plus mutable head for every input
+document.
 
-This repository contains no OSV corpus and no measured result. A run is valid
-only when the operator explicitly supplies and hashes the corpus, identifies
-the Anvil revision, and points the tool at a clean single-node target.
+This repository contains no OSV corpus or measured result. A valid run pins the
+exact ZIP bytes, supplies the acquisition's explicit snapshot day, identifies
+the Anvil revision, and targets a clean single-node bucket.
 
 ## Qualified shape
 
-For each accepted JSON document, the tool reproduces the schema observed at
-Developer Defence revision
+The transform is pinned to Developer Defence revision
 `ac838a79e5b9fd4aed08d1ac7786e5374b01b733`:
 
-1. JCS-canonicalise the source JSON and write
-   `raw/osv/{sha256(trimmed id)}/record.json`.
-2. Retain the returned Anvil version, JCS-canonicalise a
-   `developer-defence.source-raw-record-head.v1` document referring to it, and
-   write `raw/osv/{sha256(trimmed id)}/current.json` with an absent
-   precondition.
+1. Write the immutable `developer-defence.source-definition.v2` document at
+   `entities/source-definition/{sha256("source-definition\0osv")}/current.json`.
+2. Apply Developer Defence's exact OSV package grouping, normalization,
+   derived fields, identities, and deterministic JSON serialization.
+3. Build partitioned
+   `developer-defence.osv-source-record.ndjson.v1` shards, including the final
+   newline; compress each with zstd level 6; and write it immutably at
+   `shards/v1/{records_sha256[0..2]}/{records_sha256}.ndjson.zst`.
+4. After exact shard versions are known, write the immutable
+   `developer-defence.osv-snapshot-manifest.v1` at
+   `snapshots/{snapshot_id}/manifest.json`.
 
-The dependency makes two bulk phases necessary: head payloads cannot be built
-until leaf receipts provide their versions. If `N` is the number of accepted
-source JSON documents, the logical mutation count is exactly `M = 2N`.
-Normalised shard construction and snapshot publication are intentionally not
-part of this storage qualification.
+The manifest is authoritative for partition, record count, compressed and
+uncompressed lengths, hashes, ecosystems, date bounds, object path, and exact
+Anvil version. Shard puts intentionally contain no user metadata, and the tool
+creates no metadata sidecar.
+
+The snapshot identity is
+`osv-{snapshot_day}-{first 24 hex characters of archive sha256}`. The required
+`--snapshot-day` is never inferred from the machine clock.
 
 ## Run the gate
 
-Build or start one Anvil node with an empty data directory. Then run:
+Create the exact `dd-source-osv-raw` bucket for the qualification application.
+It needs bucket list/get/put/manage-policy authority. Before the timer starts,
+the tool enables one-way versioning, installs immutable policy for the three
+path families above, and uses `ListObjects(limit=1)` to prove the bucket is
+empty.
 
 ```sh
 cargo run -p anvil-osv-qualification --release -- \
   --endpoint http://127.0.0.1:50051 \
-  --bearer-token-file /absolute/path/to/token \
+  --client-id dd-osv-qualification \
+  --client-secret-file /absolute/path/to/mode-0600-client-secret \
   --tenant dd-osv-qualification \
+  --bucket dd-source-osv-raw \
   --corpus /absolute/path/to/osv-corpus.zip \
   --corpus-sha256 <64-lowercase-hex-digits> \
+  --snapshot-day YYYY-MM-DD \
   --anvil-commit <40-hex-digit-revision> \
-  --durability-class local \
+  --durability local \
+  --shard-uncompressed-bytes 67108864 \
   --batch-size 256 \
+  --maximum-batch-payload-bytes 62914560 \
   --concurrency 4 \
   --confirm-clean-target \
   --output /absolute/path/to/result.json
 ```
 
-Omit `--bearer-token-file` only when the node was deliberately started without
-authentication. The token is neither printed nor stored in the report.
+The durable secret file must be a regular mode-`0600` file. It is used only to
+obtain a short-lived bearer token; neither secret nor token is printed or
+stored in the report.
 
-The tool verifies the ZIP hash before connecting. The 150-second timer includes
-ZIP reading, JSON parsing, JCS encoding, both write phases, every `BulkWrite`
-response. Hash verification, connection establishment, and post-ingest
-read-back are outside that timer. After the timed interval, bounded `HeadObject`
-calls verify that every leaf and head is current at the exact version returned
-by its receipt.
+Hash verification, authentication, bucket setup, the empty-target check, and
+post-ingest verification are outside the 150-second gate. The timer includes
+the source-definition write, ZIP reading, JSON transforms, NDJSON construction,
+zstd compression, every shard `BulkWrite`, and the authoritative manifest
+write.
 
-Anvil 0.5 currently has no list, count, or batch-head operation. Read-back can
-therefore prove that all expected `2N` exact versions exist, but cannot prove
-the absence of unrelated extra paths. `--confirm-clean-target` is the
-operator's explicit assertion covering that missing API capability.
+Batch construction is deterministic and bounded by operation count, aggregate
+payload bytes, and the actual encoded protobuf size. If one compressed shard
+exceeds the selected payload cap, the tool fails and asks for a smaller
+`--shard-uncompressed-bytes`; it does not silently switch storage shape.
 
-The process exits non-zero if the import exceeds 150 seconds, any item fails,
-any operation is replayed on the asserted-clean target, or read-back does not
-verify all `2N` objects. JSON is always printed for a completed measured run;
-`--output` writes the same report to a file.
+After the timer the tool checks every current source-definition, shard, and
+manifest head against the exact receipt version, content length, content type,
+and BLAKE3 payload digest. A completed run fails if it exceeds 150 seconds, an
+item fails, any mutation replays on the verified-empty target, or verification
+is incomplete.
 
-`durability_class` is a closed choice. Exact `local` performs the write with
-single-node durability and is the value used by this qualification. Exact
-`replicated` returns `DURABILITY_UNAVAILABLE` without a mutation in Anvil 0.5.0;
-every other value is invalid. The tool sends and records the selected value, and
-the timed response boundary includes the requested durability work.
+`durability` is a closed choice. `local` is the only valid single-node 0.5.0
+qualification mode. `replicated` remains part of the API but is unavailable on
+one node and is rejected before the run.
 
 ## Comparing batching
 
-Each batch size or concurrency point needs a fresh target because the head
-objects are create-only on first import. Retain one report per run and compare
-only identical corpus hashes, schema revisions, durability classes, Anvil
-revisions, and hardware.
-
-For any pinned corpus:
-
-```text
-required source records/second = N / 150
-required logical mutations/second = 2N / 150
-```
-
-Run with `--batch-size 1 --concurrency 1` to exercise the worst-case
-one-operation-per-request shape. Its reported mean and p50/p95/p99 request
-latencies show whether the 10 ms one-operation target is achievable; the hard
-qualification gate remains the full-corpus 150-second limit.
+Use a fresh bucket per point and compare only identical corpus hashes,
+snapshot days, Developer Defence schema revisions, shard thresholds,
+durability, Anvil revisions, and hardware. If a run produces `S` shard objects,
+the exact mutation count is `S + 2` (source definition plus shards plus
+manifest). The report separately records accepted input documents, normalized
+source records, compressed payload throughput, batch fill, and p50/p95/p99
+request latency.
 
 `baseline-manifest.json` is an unmeasured field template, not a performance
 claim. Never fill it with estimated or synthetic values.
