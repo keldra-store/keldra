@@ -7,6 +7,7 @@ mod bootstrap;
 mod cluster_startup;
 mod credential_service;
 mod mutable_record_quorum;
+mod mutable_record_replica_group;
 pub mod observability;
 mod placement;
 mod programs;
