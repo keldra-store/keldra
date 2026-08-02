@@ -2,30 +2,68 @@
 
 ## Prerequisites
 
-- Rust and Cargo
-- Docker and Docker Compose for containerized cluster checks
+- Rust 1.96.0 and Cargo
+- A C/C++ build toolchain, CMake, Clang/libclang, `pkg-config`, and the
+  Protobuf compiler and development headers
+- Docker with Buildx for image builds and smoke tests; QEMU is required when
+  building for a non-native architecture
 
-## Local Development
+## Workspace
 
-Anvil uses native on-disk state below `STORAGE_PATH`; no external metadata database is required.
+All workspace packages currently share version `0.5.0`:
 
-Run the canonical six-peer Docker cluster acceptance test:
+- server, CLI, and Rust client: `anvil-server`, `anvil-storage-cli`, and
+  `anvil-storage`;
+- core crates: `anvil-api`, `anvil-authz`, `anvil-atomic-program`,
+  `anvil-consensus`, and `anvil-store`;
+- qualification tooling: `anvil-osv-qualification`.
 
-```bash
-ANVIL_IMAGE=anvil:test ./scripts/release-gates.sh docker-mesh
+Anvil 0.5.0 is a single-node release with native on-disk state. It does not
+require an external metadata database or a Docker peer mesh.
+
+## Local Validation
+
+Run the same static and Rust gates used by CI:
+
+```sh
+./scripts/release-gates.sh static
+./scripts/release-gates.sh rust
+# Equivalent combined invocation:
+./scripts/release-gates.sh all
 ```
 
-The Docker harness bootstraps the committed CoreMeta lifecycle topology and
-uses each peer's authenticated gRPC endpoint. There is no separate discovery or
-gossip process to start.
+For a focused server, client, and CLI test run:
 
-Run focused checks:
-
-```bash
-cargo check -p anvil-storage-core
-cargo check -p anvil-storage
-cargo check -p anvil-storage-test-utils
-cargo check -p anvil-storage-storage --tests
+```sh
+./scripts/release-gates.sh server
 ```
 
-Run tests with the shared Cargo target directory managed by Cargo locking. Do not create ad-hoc target directories unless the task explicitly requires isolation.
+Build and smoke-test a native-architecture image:
+
+```sh
+ANVIL_IMAGE=anvil:test ./scripts/build-image.sh
+ANVIL_IMAGE=anvil:test ./scripts/release-gates.sh image
+```
+
+Before a release, repeat the image build and smoke test with
+`ANVIL_DOCKER_PLATFORM=linux/amd64` and `linux/arm64`, using a distinct local
+`ANVIL_IMAGE` tag for each architecture.
+
+## Release
+
+The release tag must be the exact, unprefixed workspace version. After the
+validated commit is pushed, maintainers publish `0.5.0` with:
+
+```sh
+validated_commit="$(git rev-parse HEAD)"
+git tag 0.5.0 "$validated_commit"
+git push origin refs/tags/0.5.0
+```
+
+The tag-triggered workflow reruns the static, Rust, and per-architecture image
+gates, then publishes the single multi-architecture image
+`ghcr.io/worka-ai/anvil:0.5.0` and creates the GitHub release. Do not publish
+public architecture-specific or `v`-prefixed image tags.
+
+Use Cargo's shared target directory and locking. Do not create ad-hoc target
+directories unless the task explicitly requires isolation.
