@@ -7,6 +7,7 @@
 
 mod codec;
 mod peer;
+mod peer_tls;
 mod raft;
 mod raft_storage;
 mod state_machine;
@@ -15,6 +16,11 @@ mod types;
 pub use peer::{
     InMemoryPeerTransport, PeerNode, PeerRpc, PeerRpcError, PeerRpcKind, PeerTransport,
     PeerTransportError, PeerTransportFuture,
+};
+pub use peer_tls::{
+    AcceptedPeerTls, AuthenticatedPeer, CommittedPeerPinProvider, CommittedPeerPins,
+    ConnectedPeerTls, DEFAULT_PEER_TLS_HANDSHAKE_TIMEOUT, PeerTlsAcceptor, PeerTlsConfig,
+    PeerTlsConnector, PeerTlsError, PeerTlsIdentity, authorize_peer_rpc, peer_spki_sha256,
 };
 pub use raft::{CommittedDecision, DecisionRaft, DecisionRaftError};
 pub use state_machine::{ApplyError, StateMachine};
