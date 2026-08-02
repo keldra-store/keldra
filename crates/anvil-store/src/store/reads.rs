@@ -371,6 +371,7 @@ impl Store {
                 serde_json::to_vec(&Head {
                     version: tombstone_id,
                     deleted: true,
+                    mutation_stamp: None,
                 })
                 .map_err(storage_error)?,
             );

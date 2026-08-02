@@ -1,4 +1,21 @@
 use super::*;
+use crate::model::{
+    CoordinatedObjectMutation, MUTATION_STAMP_FORMAT, MutationStamp, OBJECT_MUTATION_FORMAT,
+    ObjectMutation, ObjectMutationContext, ReplicaObjectMutationApplied,
+};
+
+#[derive(Clone, Copy)]
+struct DistributedEvaluationContext {
+    mutation: ObjectMutationContext,
+    source_id: SourceId,
+    source_journal_position: u64,
+}
+
+struct EvaluatedOperation {
+    receipt: MutationReceipt,
+    mutation: Option<ObjectMutation>,
+    reference_deltas: Vec<ReferenceDelta>,
+}
 
 impl Store {
     pub async fn put(&self, request: PutRequest) -> Result<MutationReceipt, MutationError> {
@@ -51,7 +68,7 @@ impl Store {
                 })
                 .clone();
             let result = match identity {
-                Ok(identity) => self.prepare(operation, identity).await,
+                Ok(identity) => self.prepare(operation, identity, false).await,
                 Err(error) => Err(error),
             };
             match result {
@@ -105,7 +122,6 @@ impl Store {
         let mut batch_high_watermark = None;
         let mut pending_changes = Vec::new();
         for (index, operation) in prepared {
-            let mut reference_deltas = Vec::new();
             let outcome = self
                 .evaluate_operation(
                     &operation,
@@ -120,26 +136,26 @@ impl Store {
                     &pruned_receipts,
                     &mut receipt_status,
                     now,
-                    &mut reference_deltas,
+                    None,
                 )
                 .await;
-            if let Ok(receipt) = &outcome
-                && !receipt.replayed
+            if let Ok(evaluated) = &outcome
+                && !evaluated.receipt.replayed
             {
                 batch_high_watermark = Some(
-                    batch_high_watermark.map_or(receipt.version, |current: VersionId| {
-                        current.max(receipt.version)
+                    batch_high_watermark.map_or(evaluated.receipt.version, |current: VersionId| {
+                        current.max(evaluated.receipt.version)
                     }),
                 );
                 pending_changes.push(PendingLocalChange::ObjectHead {
                     identity: operation.identity(),
                     exact_path: operation.key().path().to_owned(),
-                    path_version: receipt.version,
-                    deleted: receipt.deleted,
-                    reference_deltas,
+                    path_version: evaluated.receipt.version,
+                    deleted: evaluated.receipt.deleted,
+                    reference_deltas: evaluated.reference_deltas.clone(),
                 });
             }
-            results.insert(index, outcome);
+            results.insert(index, outcome.map(|evaluated| evaluated.receipt));
         }
 
         let persistence = (|| {
@@ -180,6 +196,293 @@ impl Store {
             .into_iter()
             .map(|(index, result)| BatchOutcome { index, result })
             .collect()
+    }
+
+    /// Evaluates and durably applies one exact-path mutation on its current
+    /// coordinator, returning the complete bounded result peers must apply.
+    /// Network routing, replica selection, and acknowledgement policy remain
+    /// outside the storage kernel.
+    pub async fn coordinate_object_mutation(
+        &self,
+        operation: BatchOperation,
+        context: ObjectMutationContext,
+    ) -> Result<CoordinatedObjectMutation, MutationError> {
+        if context.serving_fence_term == 0 {
+            return Err(MutationError::InvalidObjectMutation(
+                "serving-fence term must be non-zero".into(),
+            ));
+        }
+        let _policy_guard = self.policy_gate.read().await;
+        let logical_key = match &operation {
+            BatchOperation::Put(request) => &request.key,
+            BatchOperation::Publish(request) => &request.key,
+            BatchOperation::Delete(request) => &request.key,
+        };
+        let identity = self.resolve_bucket_identity(logical_key.tenant(), logical_key.bucket())?;
+        let prepared = self.prepare(operation, identity, true).await?;
+        if prepared.command_id().is_none() {
+            return Err(MutationError::InvalidCommandId);
+        }
+
+        let _path_guard = self
+            .ordinary_locks
+            .acquire(&[object_path(prepared.key())])
+            .await;
+        let _commit_guard = self.commit_lock.lock().await;
+        let source = self
+            .local_watch_status()
+            .map_err(|error| MutationError::Storage(error.to_string()))?;
+        let source_journal_position = source.tail.checked_add(1).ok_or_else(|| {
+            MutationError::Storage("local invalidation offset is exhausted".into())
+        })?;
+        let now = now_unix_millis()?;
+        let mut batch = WriteBatch::default();
+        let mut receipt_status = self.mutation_receipt_status()?;
+        let initial_receipt_status = receipt_status;
+        let pruned_receipts =
+            self.stage_expired_mutation_receipts(&mut batch, now, &mut receipt_status)?;
+        let mut pending_heads = BTreeMap::new();
+        let mut pending_versions = BTreeMap::new();
+        let mut pending_receipts = BTreeMap::new();
+        let mut pending_blob_references = PendingBlobReferences::new();
+        let mut pending_small_blobs = BTreeSet::new();
+        let mut policy_cache = BTreeMap::new();
+        let mut versioning_cache = BTreeMap::new();
+        let evaluated = self
+            .evaluate_operation(
+                &prepared,
+                &mut batch,
+                &mut pending_heads,
+                &mut pending_versions,
+                &mut pending_receipts,
+                &mut pending_blob_references,
+                &mut pending_small_blobs,
+                &mut policy_cache,
+                &mut versioning_cache,
+                &pruned_receipts,
+                &mut receipt_status,
+                now,
+                Some(DistributedEvaluationContext {
+                    mutation: context,
+                    source_id: source.source_id,
+                    source_journal_position,
+                }),
+            )
+            .await?;
+
+        let created = !evaluated.receipt.replayed;
+        if created {
+            let mutation = evaluated.mutation.as_ref().ok_or_else(|| {
+                MutationError::Storage("distributed mutation result is missing".into())
+            })?;
+            if mutation.stamp.source_journal_position != source_journal_position {
+                return Err(MutationError::Storage(
+                    "distributed mutation source position changed during evaluation".into(),
+                ));
+            }
+            self.stage_local_changes(
+                &mut batch,
+                &[PendingLocalChange::ObjectHead {
+                    identity,
+                    exact_path: prepared.key().path().to_owned(),
+                    path_version: evaluated.receipt.version,
+                    deleted: evaluated.receipt.deleted,
+                    reference_deltas: evaluated.reference_deltas.clone(),
+                }],
+            )?;
+            batch.put_cf(
+                self.cf(CF_METADATA)?,
+                VERSION_HIGH_WATERMARK_KEY,
+                serde_json::to_vec(&evaluated.receipt.version).map_err(storage_error)?,
+            );
+        }
+        if receipt_status != initial_receipt_status {
+            self.stage_mutation_receipt_status(&mut batch, receipt_status)?;
+        }
+        if !batch.is_empty() {
+            let mut options = WriteOptions::default();
+            options.set_sync(self.sync_writes);
+            self.db.write_opt(batch, &options).map_err(storage_error)?;
+        }
+        if created {
+            self.notify_local_invalidations();
+        }
+        Ok(CoordinatedObjectMutation {
+            receipt: evaluated.receipt,
+            mutation: evaluated.mutation,
+        })
+    }
+
+    /// Applies one coordinator-produced exact-path result to a complete
+    /// metadata replica. Content reference counts are deliberately not
+    /// changed here; their actual owners consume the ordered source journal.
+    pub async fn apply_object_mutation_replica(
+        &self,
+        mutation: &ObjectMutation,
+    ) -> Result<ReplicaObjectMutationApplied, MutationError> {
+        mutation.validate()?;
+        let identity = BucketIdentity {
+            tenant_id: TenantId(mutation.tenant_id),
+            bucket_id: BucketId(mutation.bucket_id),
+        };
+        let encoded_head_key = identity.head_key(&mutation.exact_path);
+        let encoded_version_key =
+            exact_version_key(identity, &mutation.exact_path, mutation.version.id);
+        let primary_receipt_key = receipt_key(identity, &mutation.command_id);
+        let _commit_guard = self.commit_lock.lock().await;
+        let now = now_unix_millis()?;
+
+        if let Some(existing) =
+            self.read_json::<StoredReceipt>(CF_RECEIPTS, &primary_receipt_key)?
+            && existing.expires_at_unix_millis > now
+        {
+            if existing.fingerprint != mutation.input_fingerprint
+                || existing.version != mutation.version.id
+                || existing.deleted != mutation.version.deleted
+                || existing.expires_at_unix_millis != mutation.receipt_expires_at_unix_millis
+                || existing.object_mutation.as_ref() != Some(mutation)
+            {
+                return Err(MutationError::ObjectMutationConflict);
+            }
+            return Ok(ReplicaObjectMutationApplied {
+                version: mutation.version.id,
+                replayed: true,
+            });
+        }
+
+        let current = self.head_by_storage_key(&encoded_head_key)?;
+        let mut already_applied = false;
+        match current.as_ref() {
+            None if mutation.stamp.predecessor_version.is_some() => {
+                return Err(MutationError::ObjectMutationLineageGap {
+                    current: None,
+                    predecessor: mutation.stamp.predecessor_version,
+                });
+            }
+            None => {}
+            Some(head) if head.version == mutation.version.id => {
+                let descriptor = self
+                    .read_json::<Version>(CF_VERSIONS, &encoded_version_key)?
+                    .ok_or_else(|| {
+                        MutationError::Storage(
+                            "replicated head references a missing version descriptor".into(),
+                        )
+                    })?;
+                if head.deleted == mutation.version.deleted
+                    && head.mutation_stamp == Some(mutation.stamp)
+                    && descriptor == mutation.version
+                {
+                    already_applied = true;
+                } else if head.mutation_stamp.is_some_and(|stamp| {
+                    stamp.predecessor_version == mutation.stamp.predecessor_version
+                }) {
+                    return Err(MutationError::ObjectMutationSibling {
+                        predecessor: mutation.stamp.predecessor_version,
+                    });
+                } else {
+                    return Err(MutationError::ObjectMutationConflict);
+                }
+            }
+            Some(head) if Some(head.version) == mutation.stamp.predecessor_version => {}
+            Some(head)
+                if head.mutation_stamp.is_some_and(|stamp| {
+                    stamp.predecessor_version == mutation.stamp.predecessor_version
+                }) =>
+            {
+                return Err(MutationError::ObjectMutationSibling {
+                    predecessor: mutation.stamp.predecessor_version,
+                });
+            }
+            Some(head) => {
+                return Err(MutationError::ObjectMutationLineageGap {
+                    current: Some(head.version),
+                    predecessor: mutation.stamp.predecessor_version,
+                });
+            }
+        }
+
+        if let Some(existing) = self.read_json::<Version>(CF_VERSIONS, &encoded_version_key)?
+            && existing != mutation.version
+        {
+            return Err(MutationError::ObjectMutationConflict);
+        }
+
+        let mut batch = WriteBatch::default();
+        let mut receipt_status = self.mutation_receipt_status()?;
+        let initial_receipt_status = receipt_status;
+        let pruned = self.stage_expired_mutation_receipts(&mut batch, now, &mut receipt_status)?;
+        if !pruned.contains(&primary_receipt_key)
+            && self
+                .read_json::<StoredReceipt>(CF_RECEIPTS, &primary_receipt_key)?
+                .is_some()
+        {
+            return Err(MutationError::ObjectMutationConflict);
+        }
+
+        if !already_applied {
+            if mutation.retire_predecessor {
+                let predecessor = mutation.stamp.predecessor_version.ok_or_else(|| {
+                    MutationError::InvalidObjectMutation(
+                        "retired predecessor is missing from mutation lineage".into(),
+                    )
+                })?;
+                batch.delete_cf(
+                    self.cf(CF_VERSIONS)?,
+                    exact_version_key(identity, &mutation.exact_path, predecessor),
+                );
+            }
+            batch.put_cf(
+                self.cf(CF_VERSIONS)?,
+                &encoded_version_key,
+                serde_json::to_vec(&mutation.version).map_err(storage_error)?,
+            );
+            batch.put_cf(
+                self.cf(CF_HEADS)?,
+                &encoded_head_key,
+                serde_json::to_vec(&Head {
+                    version: mutation.version.id,
+                    deleted: mutation.version.deleted,
+                    mutation_stamp: Some(mutation.stamp),
+                })
+                .map_err(storage_error)?,
+            );
+        }
+        if mutation.receipt_expires_at_unix_millis > now {
+            self.stage_stored_mutation_receipt(
+                &mut batch,
+                primary_receipt_key,
+                StoredReceipt {
+                    fingerprint: mutation.input_fingerprint,
+                    version: mutation.version.id,
+                    deleted: mutation.version.deleted,
+                    expires_at_unix_millis: mutation.receipt_expires_at_unix_millis,
+                    object_mutation: Some(mutation.clone()),
+                },
+                &mut receipt_status,
+                &mut BTreeMap::new(),
+            )?;
+        }
+        if receipt_status != initial_receipt_status {
+            self.stage_mutation_receipt_status(&mut batch, receipt_status)?;
+        }
+        let high_watermark = self
+            .read_json::<VersionId>(CF_METADATA, VERSION_HIGH_WATERMARK_KEY)?
+            .map_or(mutation.version.id, |current| {
+                current.max(mutation.version.id)
+            });
+        batch.put_cf(
+            self.cf(CF_METADATA)?,
+            VERSION_HIGH_WATERMARK_KEY,
+            serde_json::to_vec(&high_watermark).map_err(storage_error)?,
+        );
+        let mut options = WriteOptions::default();
+        options.set_sync(self.sync_writes);
+        self.db.write_opt(batch, &options).map_err(storage_error)?;
+        self.clock.observe(mutation.version.id);
+        Ok(ReplicaObjectMutationApplied {
+            version: mutation.version.id,
+            replayed: already_applied,
+        })
     }
 
     pub(crate) fn stage_local_changes(
@@ -388,13 +691,18 @@ impl Store {
         &self,
         operation: BatchOperation,
         identity: BucketIdentity,
+        distributed_coordination: bool,
     ) -> Result<PreparedOperation, MutationError> {
         match operation {
             BatchOperation::Put(mut request) => {
                 validate_command_id(request.command_id.as_deref())?;
-                require_local_durability(request.durability)?;
+                if !distributed_coordination {
+                    require_local_durability(request.durability)?;
+                }
                 let bytes = std::mem::take(&mut request.bytes);
-                let payload = if bytes.len() <= SMALL_BLOB_MAX_BYTES {
+                let payload = if distributed_coordination {
+                    PreparedPayload::Sealed(self.stage_blob(&bytes).await?)
+                } else if bytes.len() <= SMALL_BLOB_MAX_BYTES {
                     let reference = blob_reference_for_bytes(&bytes);
                     PreparedPayload::Small { reference, bytes }
                 } else {
@@ -416,7 +724,9 @@ impl Store {
             }
             BatchOperation::Publish(request) => {
                 validate_command_id(request.command_id.as_deref())?;
-                require_local_durability(request.durability)?;
+                if !distributed_coordination {
+                    require_local_durability(request.durability)?;
+                }
                 if !self.contains_blob(&request.blob).await? {
                     return Err(MutationError::BlobNotFound);
                 }
@@ -429,7 +739,9 @@ impl Store {
             }
             BatchOperation::Delete(request) => {
                 validate_command_id(request.command_id.as_deref())?;
-                require_local_durability(request.durability)?;
+                if !distributed_coordination {
+                    require_local_durability(request.durability)?;
+                }
                 let fingerprint = delete_fingerprint(&request, identity);
                 Ok(PreparedOperation::Delete {
                     request,
@@ -524,6 +836,7 @@ impl Store {
         fingerprint: [u8; 32],
         version: VersionId,
         deleted: bool,
+        object_mutation: Option<ObjectMutation>,
         now_unix_millis: u64,
         status: &mut MutationReceiptStatus,
         pending_receipts: &mut BTreeMap<Vec<u8>, StoredReceipt>,
@@ -539,9 +852,22 @@ impl Store {
             version,
             deleted,
             expires_at_unix_millis,
+            object_mutation,
         };
+        self.stage_stored_mutation_receipt(batch, primary_key, stored, status, pending_receipts)?;
+        Ok(expires_at_unix_millis)
+    }
+
+    fn stage_stored_mutation_receipt(
+        &self,
+        batch: &mut WriteBatch,
+        primary_key: Vec<u8>,
+        stored: StoredReceipt,
+        status: &mut MutationReceiptStatus,
+        pending_receipts: &mut BTreeMap<Vec<u8>, StoredReceipt>,
+    ) -> Result<(), MutationError> {
         let encoded = serde_json::to_vec(&stored).map_err(storage_error)?;
-        let expiry_key = receipt_expiry_key(expires_at_unix_millis, &primary_key)?;
+        let expiry_key = receipt_expiry_key(stored.expires_at_unix_millis, &primary_key)?;
         let logical_bytes =
             mutation_receipt_logical_bytes(primary_key.len(), encoded.len(), expiry_key.len());
         let next_entries = status
@@ -561,7 +887,7 @@ impl Store {
         pending_receipts.insert(primary_key, stored);
         status.entries = next_entries;
         status.bytes = next_bytes;
-        Ok(expires_at_unix_millis)
+        Ok(())
     }
 
     fn stage_mutation_receipt_status(
@@ -583,6 +909,7 @@ impl Store {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn evaluate_operation(
         &self,
         operation: &PreparedOperation,
@@ -597,8 +924,8 @@ impl Store {
         pruned_receipts: &BTreeSet<Vec<u8>>,
         receipt_status: &mut MutationReceiptStatus,
         now_unix_millis: u64,
-        reference_deltas: &mut Vec<ReferenceDelta>,
-    ) -> Result<MutationReceipt, MutationError> {
+        distributed: Option<DistributedEvaluationContext>,
+    ) -> Result<EvaluatedOperation, MutationError> {
         let key = operation.key();
         let encoded_key = operation.encoded_head_key();
         let receipt_key = operation
@@ -619,13 +946,17 @@ impl Store {
                 if existing.fingerprint != operation.fingerprint() {
                     return Err(MutationError::IdempotencyConflict);
                 }
-                return Ok(MutationReceipt {
-                    command_id: operation.command_id().map(str::to_owned),
-                    fingerprint: existing.fingerprint,
-                    version: existing.version,
-                    deleted: existing.deleted,
-                    replayed: true,
-                    replay_guarantee_expires_at_unix_millis: existing.expires_at_unix_millis,
+                return Ok(EvaluatedOperation {
+                    receipt: MutationReceipt {
+                        command_id: operation.command_id().map(str::to_owned),
+                        fingerprint: existing.fingerprint,
+                        version: existing.version,
+                        deleted: existing.deleted,
+                        replayed: true,
+                        replay_guarantee_expires_at_unix_millis: existing.expires_at_unix_millis,
+                    },
+                    mutation: existing.object_mutation,
+                    reference_deltas: Vec::new(),
                 });
             }
         }
@@ -689,47 +1020,52 @@ impl Store {
             }
             Some(_) | None => {}
         }
-        if matches!(operation.put_mode(), Some(PutMode::PutImmutable)) {
-            if let Some(current) = current.as_ref() {
-                let existing = current_version.as_ref().ok_or_else(|| {
-                    MutationError::Storage("head references a missing version".into())
-                })?;
-                let requested_payload = match operation {
-                    PreparedOperation::Put { payload, .. } => payload.reference().clone(),
-                    PreparedOperation::Publish { request, .. } => request.blob.clone(),
-                    PreparedOperation::Delete { .. } => unreachable!(),
-                };
-                let requested_content_type = match operation {
-                    PreparedOperation::Put { request, .. } => request.content_type.as_ref(),
-                    PreparedOperation::Publish { request, .. } => request.content_type.as_ref(),
-                    PreparedOperation::Delete { .. } => unreachable!(),
-                };
-                if !current.deleted
-                    && version_blob_reference(existing)?.as_ref() == Some(&requested_payload)
-                    && existing.content_type.as_ref() == requested_content_type
-                {
-                    let fingerprint = operation.fingerprint();
-                    let expires_at = self.stage_mutation_receipt(
-                        batch,
-                        receipt_key,
-                        fingerprint,
-                        current.version,
-                        false,
-                        now_unix_millis,
-                        receipt_status,
-                        pending_receipts,
-                    )?;
-                    return Ok(MutationReceipt {
+        if matches!(operation.put_mode(), Some(PutMode::PutImmutable))
+            && let Some(current) = current.as_ref()
+        {
+            let existing = current_version.as_ref().ok_or_else(|| {
+                MutationError::Storage("head references a missing version".into())
+            })?;
+            let requested_payload = match operation {
+                PreparedOperation::Put { payload, .. } => payload.reference().clone(),
+                PreparedOperation::Publish { request, .. } => request.blob.clone(),
+                PreparedOperation::Delete { .. } => unreachable!(),
+            };
+            let requested_content_type = match operation {
+                PreparedOperation::Put { request, .. } => request.content_type.as_ref(),
+                PreparedOperation::Publish { request, .. } => request.content_type.as_ref(),
+                PreparedOperation::Delete { .. } => unreachable!(),
+            };
+            if !current.deleted
+                && version_blob_reference(existing)?.as_ref() == Some(&requested_payload)
+                && existing.content_type.as_ref() == requested_content_type
+            {
+                let fingerprint = operation.fingerprint();
+                let expires_at = self.stage_mutation_receipt(
+                    batch,
+                    receipt_key,
+                    fingerprint,
+                    current.version,
+                    false,
+                    None,
+                    now_unix_millis,
+                    receipt_status,
+                    pending_receipts,
+                )?;
+                return Ok(EvaluatedOperation {
+                    receipt: MutationReceipt {
                         command_id: operation.command_id().map(str::to_owned),
                         fingerprint,
                         version: current.version,
                         deleted: false,
                         replayed: true,
                         replay_guarantee_expires_at_unix_millis: expires_at,
-                    });
-                }
-                return Err(MutationError::Immutable);
+                    },
+                    mutation: None,
+                    reference_deltas: Vec::new(),
+                });
             }
+            return Err(MutationError::Immutable);
         }
         check_precondition(operation.precondition(), current.as_ref())?;
 
@@ -757,42 +1093,110 @@ impl Store {
             deleted,
             committed_at_unix_millis: now_unix_millis,
         };
+        let fingerprint = operation.fingerprint();
+        let apply_content_lifecycle = distributed.is_none();
+        let old_blob = current_version
+            .as_ref()
+            .map(version_blob_reference)
+            .transpose()?
+            .flatten();
+        let references_changed = old_blob.as_ref() != new_blob.as_ref();
+        let mut reference_deltas = Vec::with_capacity(2);
+        if versioning == ObjectVersioning::Unversioned
+            && references_changed
+            && let Some(reference) = old_blob.as_ref()
+        {
+            reference_deltas.push(ReferenceDelta {
+                blob: reference.clone(),
+                change: -1,
+            });
+        }
+        if let Some(reference) = new_blob.as_ref()
+            && (versioning == ObjectVersioning::Enabled || references_changed)
+        {
+            reference_deltas.push(ReferenceDelta {
+                blob: reference.clone(),
+                change: 1,
+            });
+        }
+        let receipt_expires_at_unix_millis = if receipt_key.is_some() {
+            now_unix_millis
+                .checked_add(self.mutation_receipt_retention.retention_millis())
+                .ok_or_else(|| MutationError::Storage("mutation receipt expiry overflow".into()))?
+        } else {
+            0
+        };
+        let object_mutation = distributed
+            .map(|distributed| {
+                let command_id = operation
+                    .command_id()
+                    .ok_or(MutationError::InvalidCommandId)?;
+                let mut mutation = ObjectMutation {
+                    format: OBJECT_MUTATION_FORMAT,
+                    tenant_id: operation.identity().tenant_id.0,
+                    bucket_id: operation.identity().bucket_id.0,
+                    exact_path: key.path().to_owned(),
+                    command_id: command_id.to_owned(),
+                    input_fingerprint: fingerprint,
+                    version: version.clone(),
+                    retire_predecessor: versioning == ObjectVersioning::Unversioned
+                        && current.is_some(),
+                    receipt_expires_at_unix_millis,
+                    stamp: MutationStamp {
+                        format: MUTATION_STAMP_FORMAT,
+                        predecessor_version: current.as_ref().map(|head| head.version),
+                        mutation_fingerprint: [0; 32],
+                        active_placement_log_id: distributed.mutation.active_placement_log_id,
+                        serving_fence_term: distributed.mutation.serving_fence_term,
+                        source_id: distributed.source_id,
+                        source_journal_position: distributed.source_journal_position,
+                    },
+                    reference_deltas: reference_deltas.clone(),
+                };
+                mutation.set_computed_fingerprint();
+                mutation.validate()?;
+                Ok(mutation)
+            })
+            .transpose()?;
         let head = Head {
             version: id,
             deleted,
+            mutation_stamp: object_mutation.as_ref().map(|mutation| mutation.stamp),
         };
         let encoded_version = serde_json::to_vec(&version).map_err(storage_error)?;
         let encoded_head = serde_json::to_vec(&head).map_err(storage_error)?;
         let versions = self.cf(CF_VERSIONS)?;
         let heads = self.cf(CF_HEADS)?;
         let encoded_version_key = version_key(operation.identity(), key, id);
-        let fingerprint = operation.fingerprint();
-        let old_blob = current_version
-            .as_ref()
-            .map(version_blob_reference)
-            .transpose()?
-            .flatten();
         let mut blob_reference_updates = Vec::with_capacity(2);
-        let references_changed = old_blob.as_ref() != new_blob.as_ref();
-        if versioning == ObjectVersioning::Unversioned && references_changed {
-            if let Some(reference) = old_blob.as_ref() {
-                blob_reference_updates.push(self.prepare_blob_reference_retirement(
-                    reference,
-                    pending_blob_references,
-                    now_unix_millis,
-                )?);
-            }
+        if apply_content_lifecycle
+            && versioning == ObjectVersioning::Unversioned
+            && references_changed
+            && let Some(reference) = old_blob.as_ref()
+        {
+            blob_reference_updates.push(self.prepare_blob_reference_retirement(
+                reference,
+                pending_blob_references,
+                now_unix_millis,
+            )?);
         }
-        let small_blob_value = match operation {
-            PreparedOperation::Put { payload, .. } => match payload.small_bytes() {
-                Some(bytes) => {
-                    self.prepare_small_blob_value(payload.reference(), bytes, pending_small_blobs)?
-                }
-                None => None,
-            },
-            PreparedOperation::Publish { .. } | PreparedOperation::Delete { .. } => None,
+        let small_blob_value = if apply_content_lifecycle {
+            match operation {
+                PreparedOperation::Put { payload, .. } => match payload.small_bytes() {
+                    Some(bytes) => self.prepare_small_blob_value(
+                        payload.reference(),
+                        bytes,
+                        pending_small_blobs,
+                    )?,
+                    None => None,
+                },
+                PreparedOperation::Publish { .. } | PreparedOperation::Delete { .. } => None,
+            }
+        } else {
+            None
         };
-        if let Some(reference) = new_blob.as_ref()
+        if apply_content_lifecycle
+            && let Some(reference) = new_blob.as_ref()
             && (versioning == ObjectVersioning::Enabled || references_changed)
         {
             let update = match operation {
@@ -816,6 +1220,7 @@ impl Store {
             fingerprint,
             id,
             deleted,
+            object_mutation.clone(),
             now_unix_millis,
             receipt_status,
             pending_receipts,
@@ -826,22 +1231,6 @@ impl Store {
         }
         for (key, state) in blob_reference_updates {
             self.stage_blob_reference_update(batch, pending_blob_references, key, state)?;
-        }
-        if versioning == ObjectVersioning::Unversioned && references_changed {
-            if let Some(reference) = old_blob {
-                reference_deltas.push(ReferenceDelta {
-                    blob: reference,
-                    change: -1,
-                });
-            }
-        }
-        if let Some(reference) = new_blob
-            && (versioning == ObjectVersioning::Enabled || references_changed)
-        {
-            reference_deltas.push(ReferenceDelta {
-                blob: reference,
-                change: 1,
-            });
         }
         if versioning == ObjectVersioning::Unversioned
             && let Some(previous) = current_version.as_ref()
@@ -855,13 +1244,24 @@ impl Store {
         batch.put_cf(heads, &encoded_key, encoded_head);
         pending_heads.insert(encoded_key.clone(), head);
         pending_versions.insert(encoded_key, version);
-        Ok(MutationReceipt {
-            command_id: operation.command_id().map(str::to_owned),
-            fingerprint,
-            version: id,
-            deleted,
-            replayed: false,
-            replay_guarantee_expires_at_unix_millis: expires_at,
+        Ok(EvaluatedOperation {
+            receipt: MutationReceipt {
+                command_id: operation.command_id().map(str::to_owned),
+                fingerprint,
+                version: id,
+                deleted,
+                replayed: false,
+                replay_guarantee_expires_at_unix_millis: expires_at,
+            },
+            mutation: object_mutation,
+            reference_deltas,
         })
     }
+}
+
+fn exact_version_key(identity: BucketIdentity, exact_path: &str, version: VersionId) -> Vec<u8> {
+    let mut encoded = identity.head_key(exact_path);
+    encoded.push(0);
+    encoded.extend_from_slice(&version.0.to_be_bytes());
+    encoded
 }

@@ -506,6 +506,7 @@ async fn exact_head_is_rechecked_before_atomic_apply() {
         serde_json::to_vec(&Head {
             version: rogue_id,
             deleted: false,
+            mutation_stamp: None,
         })
         .unwrap(),
     );
@@ -788,6 +789,7 @@ async fn mutable_read_only_program_dependency_is_rejected_before_execution() {
         Some(Head {
             version: config.version,
             deleted: false,
+            mutation_stamp: None,
         })
     );
 }
@@ -869,6 +871,7 @@ async fn immutable_read_only_program_dependency_still_requires_program_only_poli
         Some(Head {
             version: config.version,
             deleted: false,
+            mutation_stamp: None,
         })
     );
 }

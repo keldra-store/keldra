@@ -1,4 +1,5 @@
 use super::*;
+use crate::{ObjectMutation, ObjectMutationContext, PlacementLogId, ReplicaObjectMutationApplied};
 
 #[tokio::test]
 async fn idempotency_is_checked_before_the_precondition() {
@@ -376,6 +377,7 @@ async fn prepared_put_keeps_small_bytes_in_memory_and_materializes_large_bytes()
         .prepare(
             BatchOperation::Put(put("first", &first_bytes, Precondition::Absent, "first")),
             identity,
+            false,
         )
         .await
         .unwrap();
@@ -399,6 +401,7 @@ async fn prepared_put_keeps_small_bytes_in_memory_and_materializes_large_bytes()
         .prepare(
             BatchOperation::Put(put("blob", &blob_bytes, Precondition::Absent, "blob")),
             identity,
+            false,
         )
         .await
         .unwrap();
@@ -416,6 +419,370 @@ async fn prepared_put_keeps_small_bytes_in_memory_and_materializes_large_bytes()
         }
         _ => panic!("large put was not durably materialized"),
     }
+}
+
+fn distributed_context(index: u64) -> ObjectMutationContext {
+    ObjectMutationContext {
+        active_placement_log_id: PlacementLogId { term: 7, index },
+        serving_fence_term: 7,
+    }
+}
+
+async fn two_stores(watch_entries: u64) -> (TempDir, Store, Store) {
+    let temporary = tempfile::tempdir().unwrap();
+    let watch_retention = WatchRetention::new(watch_entries, 1024 * 1024).unwrap();
+    let coordinator = Store::open(
+        StoreOptions::new(temporary.path().join("coordinator"), 1)
+            .with_watch_retention(watch_retention),
+    )
+    .await
+    .unwrap();
+    let replica = Store::open(
+        StoreOptions::new(temporary.path().join("replica"), 2)
+            .with_watch_retention(watch_retention),
+    )
+    .await
+    .unwrap();
+    (temporary, coordinator, replica)
+}
+
+fn mutation_identity(mutation: &ObjectMutation) -> BucketIdentity {
+    BucketIdentity {
+        tenant_id: TenantId(mutation.tenant_id),
+        bucket_id: BucketId(mutation.bucket_id),
+    }
+}
+
+fn mutation_version_key(mutation: &ObjectMutation) -> Vec<u8> {
+    let identity = mutation_identity(mutation);
+    let mut encoded = identity.head_key(&mutation.exact_path);
+    encoded.push(0);
+    encoded.extend_from_slice(&mutation.version.id.0.to_be_bytes());
+    encoded
+}
+
+fn assert_same_mutation_metadata(coordinator: &Store, replica: &Store, mutation: &ObjectMutation) {
+    let identity = mutation_identity(mutation);
+    let head_key = identity.head_key(&mutation.exact_path);
+    let version_key = mutation_version_key(mutation);
+    let receipt_key = receipt_key(identity, &mutation.command_id);
+    assert_eq!(
+        coordinator.read_json::<Head>(CF_HEADS, &head_key).unwrap(),
+        replica.read_json::<Head>(CF_HEADS, &head_key).unwrap()
+    );
+    assert_eq!(
+        coordinator
+            .read_json::<Version>(CF_VERSIONS, &version_key)
+            .unwrap(),
+        replica
+            .read_json::<Version>(CF_VERSIONS, &version_key)
+            .unwrap()
+    );
+    assert_eq!(
+        coordinator
+            .read_json::<StoredReceipt>(CF_RECEIPTS, &receipt_key)
+            .unwrap(),
+        replica
+            .read_json::<StoredReceipt>(CF_RECEIPTS, &receipt_key)
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn distributed_metadata_coordination_retains_only_awaiting_source_content() {
+    let (_temporary, coordinator, replica) = two_stores(16).await;
+    let cases = [
+        ("small-source", b"small source".to_vec()),
+        ("large-source", vec![0x5a; SMALL_BLOB_MAX_BYTES + 1]),
+    ];
+    for (index, (path, bytes)) in cases.into_iter().enumerate() {
+        let coordinated = coordinator
+            .coordinate_object_mutation(
+                BatchOperation::Put(put(
+                    path,
+                    &bytes,
+                    Precondition::Absent,
+                    &format!("source-{index}"),
+                )),
+                distributed_context(40),
+            )
+            .await
+            .unwrap();
+        let mutation = coordinated.mutation.unwrap();
+        let reference = mutation.version.blob.as_ref().unwrap();
+        assert_eq!(
+            mutation.reference_deltas,
+            vec![ReferenceDelta {
+                blob: reference.clone(),
+                change: 1,
+            }]
+        );
+        let source_state = coordinator
+            .blob_reference_state(reference)
+            .unwrap()
+            .unwrap();
+        assert_eq!(source_state.ref_count, 1);
+        assert_eq!(source_state.flags, AWAITING_PUBLISH);
+        assert_eq!(coordinator.read_blob_bytes(reference).await.unwrap(), bytes);
+
+        replica
+            .apply_object_mutation_replica(&mutation)
+            .await
+            .unwrap();
+        assert!(replica.blob_reference_state(reference).unwrap().is_none());
+        assert!(!replica.contains_blob(reference).await.unwrap());
+    }
+}
+
+#[tokio::test]
+async fn typed_mutation_replicates_exactly_and_retries_after_head_and_journal_move() {
+    let (_temporary, coordinator, replica) = two_stores(1).await;
+    let first_request = put(
+        "replicated",
+        b"first",
+        Precondition::Absent,
+        "first-command",
+    );
+    let first = coordinator
+        .coordinate_object_mutation(
+            BatchOperation::Put(first_request.clone()),
+            distributed_context(11),
+        )
+        .await
+        .unwrap();
+    let first_mutation = first.mutation.clone().unwrap();
+    assert_eq!(first_mutation.stamp.source_journal_position, 1);
+    assert!(!first.receipt.replayed);
+    assert_eq!(
+        replica
+            .apply_object_mutation_replica(&first_mutation)
+            .await
+            .unwrap(),
+        ReplicaObjectMutationApplied {
+            version: first_mutation.version.id,
+            replayed: false,
+        }
+    );
+    assert_same_mutation_metadata(&coordinator, &replica, &first_mutation);
+    assert_eq!(coordinator.local_watch_status().unwrap().tail, 1);
+    assert_eq!(replica.local_watch_status().unwrap().tail, 0);
+    assert!(
+        replica
+            .blob_reference_state(first_mutation.version.blob.as_ref().unwrap())
+            .unwrap()
+            .is_none()
+    );
+
+    let sequence_after_first_apply = replica.db.latest_sequence_number();
+    let retry = replica
+        .apply_object_mutation_replica(&first_mutation)
+        .await
+        .unwrap();
+    assert!(retry.replayed);
+    assert_eq!(
+        replica.db.latest_sequence_number(),
+        sequence_after_first_apply
+    );
+
+    coordinator
+        .advance_source_journal_safe_through(1)
+        .await
+        .unwrap();
+    let second = coordinator
+        .coordinate_object_mutation(
+            BatchOperation::Put(put(
+                "replicated",
+                b"second",
+                Precondition::Version(first_mutation.version.id),
+                "second-command",
+            )),
+            distributed_context(11),
+        )
+        .await
+        .unwrap();
+    let second_mutation = second.mutation.clone().unwrap();
+    assert_eq!(second_mutation.stamp.source_journal_position, 2);
+    replica
+        .apply_object_mutation_replica(&second_mutation)
+        .await
+        .unwrap();
+    assert_same_mutation_metadata(&coordinator, &replica, &second_mutation);
+    assert!(coordinator.read_local_change(1).unwrap().is_none());
+    assert!(
+        coordinator
+            .read_json::<Version>(CF_VERSIONS, &mutation_version_key(&first_mutation))
+            .unwrap()
+            .is_none()
+    );
+
+    let recovered = coordinator
+        .coordinate_object_mutation(BatchOperation::Put(first_request), distributed_context(11))
+        .await
+        .unwrap();
+    assert!(recovered.receipt.replayed);
+    assert_eq!(recovered.mutation, Some(first_mutation.clone()));
+    let replica_sequence = replica.db.latest_sequence_number();
+    assert!(
+        replica
+            .apply_object_mutation_replica(&first_mutation)
+            .await
+            .unwrap()
+            .replayed
+    );
+    assert_eq!(replica.db.latest_sequence_number(), replica_sequence);
+}
+
+#[tokio::test]
+async fn replica_rejects_lineage_gaps_and_contradictory_siblings() {
+    let (_temporary, coordinator, replica) = two_stores(16).await;
+    let first = coordinator
+        .coordinate_object_mutation(
+            BatchOperation::Put(put("lineage", b"one", Precondition::Absent, "one")),
+            distributed_context(21),
+        )
+        .await
+        .unwrap()
+        .mutation
+        .unwrap();
+    let second = coordinator
+        .coordinate_object_mutation(
+            BatchOperation::Put(put(
+                "lineage",
+                b"two",
+                Precondition::Version(first.version.id),
+                "two",
+            )),
+            distributed_context(21),
+        )
+        .await
+        .unwrap()
+        .mutation
+        .unwrap();
+
+    assert_eq!(
+        replica
+            .apply_object_mutation_replica(&second)
+            .await
+            .unwrap_err(),
+        MutationError::ObjectMutationLineageGap {
+            current: None,
+            predecessor: Some(first.version.id),
+        }
+    );
+    replica.apply_object_mutation_replica(&first).await.unwrap();
+    replica
+        .apply_object_mutation_replica(&second)
+        .await
+        .unwrap();
+
+    let mut sibling = second.clone();
+    sibling.command_id = "sibling".into();
+    sibling.version.id = VersionId(second.version.id.0.checked_add(1).unwrap());
+    sibling.version.committed_at_unix_millis = sibling
+        .version
+        .committed_at_unix_millis
+        .checked_add(1)
+        .unwrap();
+    sibling.stamp.source_journal_position += 1;
+    sibling.set_computed_fingerprint();
+    sibling.validate().unwrap();
+    assert_eq!(
+        replica
+            .apply_object_mutation_replica(&sibling)
+            .await
+            .unwrap_err(),
+        MutationError::ObjectMutationSibling {
+            predecessor: Some(first.version.id),
+        }
+    );
+}
+
+#[tokio::test]
+async fn first_typed_mutation_accepts_an_unstamped_050_baseline() {
+    let (_temporary, coordinator, replica) = two_stores(16).await;
+    let baseline = coordinator
+        .put(put(
+            "upgrade",
+            b"baseline",
+            Precondition::Absent,
+            "legacy-command",
+        ))
+        .await
+        .unwrap();
+    let logical_key = key("upgrade");
+    let identity = coordinator
+        .resolve_bucket_identity(logical_key.tenant(), logical_key.bucket())
+        .unwrap();
+    let baseline_head = coordinator.head(&logical_key).unwrap().unwrap();
+    assert_eq!(baseline_head.mutation_stamp, None);
+    let baseline_version = coordinator
+        .version_metadata(&logical_key, baseline.version)
+        .unwrap()
+        .unwrap();
+    let baseline_reference = baseline_version.blob.as_ref().unwrap();
+    let baseline_lifecycle = coordinator
+        .blob_reference_state(baseline_reference)
+        .unwrap()
+        .unwrap();
+    assert_eq!(baseline_lifecycle.flags, 0);
+    let mut seed = WriteBatch::default();
+    seed.put_cf(
+        replica.cf(CF_HEADS).unwrap(),
+        identity.head_key(logical_key.path()),
+        serde_json::to_vec(&baseline_head).unwrap(),
+    );
+    seed.put_cf(
+        replica.cf(CF_VERSIONS).unwrap(),
+        version_key(identity, &logical_key, baseline.version),
+        serde_json::to_vec(&baseline_version).unwrap(),
+    );
+    replica.db.write(seed).unwrap();
+
+    let typed = coordinator
+        .coordinate_object_mutation(
+            BatchOperation::Put(put(
+                "upgrade",
+                b"distributed",
+                Precondition::Version(baseline.version),
+                "typed-command",
+            )),
+            distributed_context(31),
+        )
+        .await
+        .unwrap()
+        .mutation
+        .unwrap();
+    assert_eq!(typed.stamp.predecessor_version, Some(baseline.version));
+    assert_eq!(
+        coordinator
+            .blob_reference_state(baseline_reference)
+            .unwrap()
+            .unwrap(),
+        baseline_lifecycle
+    );
+    let new_reference = typed.version.blob.as_ref().unwrap();
+    let new_lifecycle = coordinator
+        .blob_reference_state(new_reference)
+        .unwrap()
+        .unwrap();
+    assert_eq!(new_lifecycle.ref_count, 1);
+    assert_eq!(new_lifecycle.flags, AWAITING_PUBLISH);
+    replica.apply_object_mutation_replica(&typed).await.unwrap();
+    assert!(
+        replica
+            .blob_reference_state(new_reference)
+            .unwrap()
+            .is_none()
+    );
+    assert_same_mutation_metadata(&coordinator, &replica, &typed);
+    assert_eq!(
+        replica
+            .read_json::<Head>(CF_HEADS, &identity.head_key(logical_key.path()))
+            .unwrap()
+            .unwrap()
+            .mutation_stamp,
+        Some(typed.stamp)
+    );
 }
 
 #[tokio::test]

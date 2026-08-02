@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{BlobRef, ObjectKey};
+use anvil_atomic_program::MAX_OBJECT_PATH_BYTES;
+
+use crate::{BlobRef, ObjectKey, ReferenceDelta, SourceId};
 
 /// A bucket policy is deliberately small enough to validate on every write.
 pub const MAX_BUCKET_POLICY_PREFIXES: usize = 64;
@@ -13,10 +15,40 @@ pub const SMALL_BLOB_MAX_BYTES: usize = 64 * 1024;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct VersionId(pub u64);
 
+pub const MUTATION_STAMP_FORMAT: u16 = 1;
+pub const OBJECT_MUTATION_FORMAT: u16 = 1;
+pub const MAX_OBJECT_MUTATION_REFERENCE_DELTAS: usize = 2;
+pub const MAX_CONTENT_TYPE_BYTES: usize = 512;
+
+/// Consensus-neutral identity of the Raft entry that activated one placement
+/// view. It is the complete OpenRaft LogId shape without coupling the store to
+/// OpenRaft or the consensus crate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlacementLogId {
+    pub term: u64,
+    pub index: u64,
+}
+
+/// Bounded lineage attached to every distributed 0.5.1 object-head candidate.
+/// A missing stamp is reserved for an authoritative 0.5.0 committed baseline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MutationStamp {
+    pub format: u16,
+    pub predecessor_version: Option<VersionId>,
+    pub mutation_fingerprint: [u8; 32],
+    pub active_placement_log_id: PlacementLogId,
+    pub serving_fence_term: u64,
+    pub source_id: SourceId,
+    pub source_journal_position: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Head {
     pub version: VersionId,
     pub deleted: bool,
+    /// Released 0.5.0 heads omit this field and remain committed baselines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutation_stamp: Option<MutationStamp>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,6 +165,186 @@ pub struct MutationReceipt {
     pub replayed: bool,
     /// Zero only for internal callers that deliberately omitted a command ID.
     pub replay_guarantee_expires_at_unix_millis: u64,
+}
+
+/// Consensus-derived values needed to construct one distributed object
+/// mutation. The source identity and position are assigned by the store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObjectMutationContext {
+    pub active_placement_log_id: PlacementLogId,
+    pub serving_fence_term: u64,
+}
+
+/// One exact, bounded object mutation replicated between metadata owners.
+/// Payload bytes and raw RocksDB operations are deliberately absent.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectMutation {
+    pub format: u16,
+    pub tenant_id: u64,
+    pub bucket_id: u64,
+    pub exact_path: String,
+    pub command_id: String,
+    pub input_fingerprint: [u8; 32],
+    pub version: Version,
+    pub retire_predecessor: bool,
+    pub receipt_expires_at_unix_millis: u64,
+    pub stamp: MutationStamp,
+    pub reference_deltas: Vec<ReferenceDelta>,
+}
+
+impl ObjectMutation {
+    pub(crate) fn set_computed_fingerprint(&mut self) {
+        self.stamp.mutation_fingerprint = self.computed_fingerprint();
+    }
+
+    pub fn computed_fingerprint(&self) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"anvil.object-mutation.v1");
+        hash_u16(&mut hasher, self.format);
+        hash_u64(&mut hasher, self.tenant_id);
+        hash_u64(&mut hasher, self.bucket_id);
+        hash_bytes(&mut hasher, self.exact_path.as_bytes());
+        hash_bytes(&mut hasher, self.command_id.as_bytes());
+        hasher.update(&self.input_fingerprint);
+        hash_version(&mut hasher, &self.version);
+        hasher.update(&[u8::from(self.retire_predecessor)]);
+        hash_u64(&mut hasher, self.receipt_expires_at_unix_millis);
+        hash_u16(&mut hasher, self.stamp.format);
+        hash_optional_version(&mut hasher, self.stamp.predecessor_version);
+        hash_u64(&mut hasher, self.stamp.active_placement_log_id.term);
+        hash_u64(&mut hasher, self.stamp.active_placement_log_id.index);
+        hash_u64(&mut hasher, self.stamp.serving_fence_term);
+        hash_u16(&mut hasher, self.stamp.source_id.node_id);
+        hasher.update(&self.stamp.source_id.source_epoch);
+        hash_u64(&mut hasher, self.stamp.source_journal_position);
+        hash_u64(&mut hasher, self.reference_deltas.len() as u64);
+        for delta in &self.reference_deltas {
+            hash_blob(&mut hasher, &delta.blob);
+            hasher.update(&delta.change.to_be_bytes());
+        }
+        *hasher.finalize().as_bytes()
+    }
+
+    pub fn validate(&self) -> Result<(), MutationError> {
+        if self.format != OBJECT_MUTATION_FORMAT {
+            return Err(MutationError::InvalidObjectMutation(format!(
+                "unsupported object mutation format {}",
+                self.format
+            )));
+        }
+        if self.stamp.format != MUTATION_STAMP_FORMAT {
+            return Err(MutationError::InvalidObjectMutation(format!(
+                "unsupported mutation stamp format {}",
+                self.stamp.format
+            )));
+        }
+        if self.tenant_id == 0 || self.bucket_id == 0 {
+            return Err(MutationError::InvalidObjectMutation(
+                "stable tenant and bucket IDs must be non-zero".into(),
+            ));
+        }
+        validate_exact_path(&self.exact_path)?;
+        if self.command_id.is_empty()
+            || self.command_id.len() > 256
+            || self.command_id.contains('\0')
+        {
+            return Err(MutationError::InvalidObjectMutation(
+                "command ID must contain 1 to 256 bytes and no NUL".into(),
+            ));
+        }
+        if self.version.id.0 == 0
+            || self.version.deleted != self.version.blob.is_none()
+            || self
+                .version
+                .content_type
+                .as_ref()
+                .is_some_and(|value| value.len() > MAX_CONTENT_TYPE_BYTES)
+            || self.version.deleted && self.version.content_type.is_some()
+        {
+            return Err(MutationError::InvalidObjectMutation(
+                "new version descriptor is malformed".into(),
+            ));
+        }
+        if self.stamp.predecessor_version == Some(self.version.id)
+            || self
+                .stamp
+                .predecessor_version
+                .is_some_and(|predecessor| predecessor >= self.version.id)
+        {
+            return Err(MutationError::InvalidObjectMutation(
+                "new version must follow its predecessor".into(),
+            ));
+        }
+        if self.retire_predecessor && self.stamp.predecessor_version.is_none() {
+            return Err(MutationError::InvalidObjectMutation(
+                "predecessor retirement does not match mutation lineage".into(),
+            ));
+        }
+        if self.receipt_expires_at_unix_millis <= self.version.committed_at_unix_millis {
+            return Err(MutationError::InvalidObjectMutation(
+                "mutation receipt does not outlive the committed version".into(),
+            ));
+        }
+        if self.stamp.serving_fence_term == 0
+            || self.stamp.source_journal_position == 0
+            || self.stamp.source_id.node_id == 0
+            || self.stamp.source_id.source_epoch == [0; 32]
+        {
+            return Err(MutationError::InvalidObjectMutation(
+                "mutation serving fence or source identity is invalid".into(),
+            ));
+        }
+        if self.reference_deltas.len() > MAX_OBJECT_MUTATION_REFERENCE_DELTAS
+            || self
+                .reference_deltas
+                .iter()
+                .any(|delta| !matches!(delta.change, -1 | 1))
+        {
+            return Err(MutationError::InvalidObjectMutation(
+                "object mutation reference deltas are malformed".into(),
+            ));
+        }
+        for (index, delta) in self.reference_deltas.iter().enumerate() {
+            if self.reference_deltas[..index]
+                .iter()
+                .any(|earlier| earlier.blob == delta.blob)
+            {
+                return Err(MutationError::InvalidObjectMutation(
+                    "object mutation repeats one reference delta".into(),
+                ));
+            }
+        }
+        if self.stamp.mutation_fingerprint != self.computed_fingerprint() {
+            return Err(MutationError::InvalidObjectMutation(
+                "mutation fingerprint does not match its typed result".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn receipt(&self, replayed: bool) -> MutationReceipt {
+        MutationReceipt {
+            command_id: Some(self.command_id.clone()),
+            fingerprint: self.input_fingerprint,
+            version: self.version.id,
+            deleted: self.version.deleted,
+            replayed,
+            replay_guarantee_expires_at_unix_millis: self.receipt_expires_at_unix_millis,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CoordinatedObjectMutation {
+    pub receipt: MutationReceipt,
+    /// None only when evaluation was an idempotent or immutable semantic replay.
+    pub mutation: Option<ObjectMutation>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplicaObjectMutationApplied {
+    pub version: VersionId,
+    pub replayed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -256,6 +468,19 @@ pub enum MutationError {
     ReceiptCapacity,
     #[error("source journal capacity is exhausted before required consumers are durable")]
     SourceJournalCapacity,
+    #[error("invalid replicated object mutation: {0}")]
+    InvalidObjectMutation(String),
+    #[error(
+        "replicated object mutation has a lineage gap: local head {current:?}, incoming predecessor {predecessor:?}"
+    )]
+    ObjectMutationLineageGap {
+        current: Option<VersionId>,
+        predecessor: Option<VersionId>,
+    },
+    #[error("replicated object mutations are contradictory siblings of {predecessor:?}")]
+    ObjectMutationSibling { predecessor: Option<VersionId> },
+    #[error("replicated object mutation conflicts with its durable receipt or version")]
+    ObjectMutationConflict,
     #[error("object versioning is not enabled for this bucket")]
     ObjectVersioningNotEnabled,
     #[error("the current tombstone is the path's CAS/ABA fence and cannot be deleted")]
@@ -264,6 +489,78 @@ pub enum MutationError {
     InvalidPolicy(String),
     #[error("storage error: {0}")]
     Storage(String),
+}
+
+fn validate_exact_path(path: &str) -> Result<(), MutationError> {
+    if path.is_empty()
+        || path.len() > MAX_OBJECT_PATH_BYTES
+        || path.contains('\0')
+        || path.starts_with('/')
+        || path.ends_with('/')
+        || path
+            .split('/')
+            .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
+        || path.chars().any(char::is_control)
+    {
+        return Err(MutationError::InvalidObjectMutation(
+            "exact object path is not canonical".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn hash_version(hasher: &mut blake3::Hasher, version: &Version) {
+    hash_u64(hasher, version.id.0);
+    match &version.blob {
+        Some(blob) => {
+            hasher.update(&[1]);
+            hash_blob(hasher, blob);
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+    match &version.content_type {
+        Some(value) => {
+            hasher.update(&[1]);
+            hash_bytes(hasher, value.as_bytes());
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+    hasher.update(&[u8::from(version.deleted)]);
+    hash_u64(hasher, version.committed_at_unix_millis);
+}
+
+fn hash_blob(hasher: &mut blake3::Hasher, blob: &BlobRef) {
+    hasher.update(&blob.hash);
+    hash_u64(hasher, blob.length);
+}
+
+fn hash_optional_version(hasher: &mut blake3::Hasher, version: Option<VersionId>) {
+    match version {
+        Some(version) => {
+            hasher.update(&[1]);
+            hash_u64(hasher, version.0);
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+}
+
+fn hash_bytes(hasher: &mut blake3::Hasher, value: &[u8]) {
+    hash_u64(hasher, value.len() as u64);
+    hasher.update(value);
+}
+
+fn hash_u16(hasher: &mut blake3::Hasher, value: u16) {
+    hasher.update(&value.to_be_bytes());
+}
+
+fn hash_u64(hasher: &mut blake3::Hasher, value: u64) {
+    hasher.update(&value.to_be_bytes());
 }
 
 #[cfg(test)]

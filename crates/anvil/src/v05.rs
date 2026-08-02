@@ -1680,11 +1680,15 @@ fn api_failure(error: MutationError) -> MutationFailure {
         MutationError::IdempotencyConflict => (MutationFailureCode::IdempotencyInputMismatch, None),
         MutationError::InvalidCommandId
         | MutationError::InvalidPolicy(_)
+        | MutationError::InvalidObjectMutation(_)
         | MutationError::BlobNotFound => (MutationFailureCode::Invalid, None),
         MutationError::DurabilityUnavailable => (MutationFailureCode::DurabilityUnavailable, None),
         MutationError::ReceiptCapacity | MutationError::SourceJournalCapacity => {
             (MutationFailureCode::ResourceLimit, None)
         }
+        MutationError::ObjectMutationLineageGap { .. }
+        | MutationError::ObjectMutationSibling { .. }
+        | MutationError::ObjectMutationConflict => (MutationFailureCode::Internal, None),
         MutationError::Storage(_) => (MutationFailureCode::Internal, None),
     };
     MutationFailure {
@@ -1709,15 +1713,20 @@ fn status(error: MutationError) -> Status {
             "CURRENT_TOMBSTONE_VERSION_CANNOT_BE_DELETED: {error}"
         )),
         MutationError::IdempotencyConflict => Status::already_exists(error.to_string()),
-        MutationError::InvalidCommandId | MutationError::InvalidPolicy(_) => {
-            Status::invalid_argument(error.to_string())
-        }
+        MutationError::InvalidCommandId
+        | MutationError::InvalidPolicy(_)
+        | MutationError::InvalidObjectMutation(_) => Status::invalid_argument(error.to_string()),
         MutationError::BlobNotFound => Status::not_found(error.to_string()),
         MutationError::DurabilityUnavailable => {
             Status::unavailable(format!("DURABILITY_UNAVAILABLE: {error}"))
         }
         MutationError::ReceiptCapacity | MutationError::SourceJournalCapacity => {
             Status::resource_exhausted(error.to_string())
+        }
+        MutationError::ObjectMutationLineageGap { .. }
+        | MutationError::ObjectMutationSibling { .. }
+        | MutationError::ObjectMutationConflict => {
+            Status::unavailable(format!("MUTATION_REPLICA_UNAVAILABLE: {error}"))
         }
         MutationError::Storage(_) => Status::internal(error.to_string()),
     }
@@ -1761,9 +1770,13 @@ fn read_failure(error: MutationError) -> ReadFailure {
         | MutationError::CurrentTombstoneCannotBeDeleted
         | MutationError::IdempotencyConflict
         | MutationError::InvalidCommandId
+        | MutationError::InvalidObjectMutation(_)
         | MutationError::DurabilityUnavailable
         | MutationError::ReceiptCapacity
         | MutationError::SourceJournalCapacity
+        | MutationError::ObjectMutationLineageGap { .. }
+        | MutationError::ObjectMutationSibling { .. }
+        | MutationError::ObjectMutationConflict
         | MutationError::InvalidPolicy(_) => ReadFailureCode::Internal,
     };
     ReadFailure {

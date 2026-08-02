@@ -761,7 +761,8 @@ fn mutation_status(error: anvil_store::MutationError) -> Status {
             Status::already_exists(error.to_string())
         }
         anvil_store::MutationError::InvalidCommandId
-        | anvil_store::MutationError::InvalidPolicy(_) => {
+        | anvil_store::MutationError::InvalidPolicy(_)
+        | anvil_store::MutationError::InvalidObjectMutation(_) => {
             Status::invalid_argument(error.to_string())
         }
         anvil_store::MutationError::BlobNotFound => Status::not_found(error.to_string()),
@@ -771,6 +772,11 @@ fn mutation_status(error: anvil_store::MutationError) -> Status {
         anvil_store::MutationError::ReceiptCapacity
         | anvil_store::MutationError::SourceJournalCapacity => {
             Status::resource_exhausted(format!("RESOURCE_LIMIT: {error}"))
+        }
+        anvil_store::MutationError::ObjectMutationLineageGap { .. }
+        | anvil_store::MutationError::ObjectMutationSibling { .. }
+        | anvil_store::MutationError::ObjectMutationConflict => {
+            Status::unavailable(format!("MUTATION_REPLICA_UNAVAILABLE: {error}"))
         }
         anvil_store::MutationError::Storage(_) => Status::internal(error.to_string()),
     }

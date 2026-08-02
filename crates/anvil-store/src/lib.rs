@@ -41,10 +41,13 @@ pub use erasure::{
 };
 pub use key::ObjectKey;
 pub use model::{
-    BatchOperation, BatchOutcome, BucketPolicy, DeleteRequest, DeleteRetainedVersionOutcome,
-    Durability, Head, MAX_BUCKET_POLICY_PREFIX_BYTES, MAX_BUCKET_POLICY_PREFIXES, MutationError,
-    MutationReceipt, Object, ObjectVersioning, Precondition, PublishRequest, PutMode, PutRequest,
-    SMALL_BLOB_MAX_BYTES, Version, VersionId,
+    BatchOperation, BatchOutcome, BucketPolicy, CoordinatedObjectMutation, DeleteRequest,
+    DeleteRetainedVersionOutcome, Durability, Head, MAX_BUCKET_POLICY_PREFIX_BYTES,
+    MAX_BUCKET_POLICY_PREFIXES, MAX_CONTENT_TYPE_BYTES, MAX_OBJECT_MUTATION_REFERENCE_DELTAS,
+    MUTATION_STAMP_FORMAT, MutationError, MutationReceipt, MutationStamp, OBJECT_MUTATION_FORMAT,
+    Object, ObjectMutation, ObjectMutationContext, ObjectVersioning, PlacementLogId, Precondition,
+    PublishRequest, PutMode, PutRequest, ReplicaObjectMutationApplied, SMALL_BLOB_MAX_BYTES,
+    Version, VersionId,
 };
 pub use program::{
     AppliedProgramCommit, CommittedProgramResult, PreparedBundleHash, PreparedBundleRef,

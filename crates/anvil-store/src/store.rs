@@ -301,21 +301,29 @@ enum PreparedOperation {
 
 #[derive(Clone)]
 enum PreparedPayload {
-    Small { reference: BlobRef, bytes: Vec<u8> },
+    Small {
+        reference: BlobRef,
+        bytes: Vec<u8>,
+    },
     Large(BlobRef),
+    /// Complete ordinary awaiting-publication source retained while a
+    /// distributed metadata mutation is placed and delivered.
+    Sealed(BlobRef),
 }
 
 impl PreparedPayload {
     fn reference(&self) -> &BlobRef {
         match self {
-            Self::Small { reference, .. } | Self::Large(reference) => reference,
+            Self::Small { reference, .. } | Self::Large(reference) | Self::Sealed(reference) => {
+                reference
+            }
         }
     }
 
     fn small_bytes(&self) -> Option<&[u8]> {
         match self {
             Self::Small { bytes, .. } => Some(bytes),
-            Self::Large(_) => None,
+            Self::Large(_) | Self::Sealed(_) => None,
         }
     }
 }
@@ -374,12 +382,16 @@ impl PreparedOperation {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct StoredReceipt {
     fingerprint: [u8; 32],
     version: VersionId,
     deleted: bool,
     expires_at_unix_millis: u64,
+    /// Present for 0.5.1 distributed object mutations and bounded by this
+    /// receipt's existing expiry. Released 0.5.0 receipts decode as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    object_mutation: Option<crate::model::ObjectMutation>,
 }
 
 pub(crate) type PendingBlobReferences = BTreeMap<Vec<u8>, BlobReferenceState>;

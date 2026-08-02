@@ -1217,6 +1217,7 @@ impl Store {
                 serde_json::to_vec(&Head {
                     version: write.version.id,
                     deleted: write.version.deleted,
+                    mutation_stamp: None,
                 })
                 .map_err(program_storage_error)?,
             );
