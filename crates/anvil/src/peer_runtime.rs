@@ -141,13 +141,17 @@ pub(crate) async fn open(config: OpenPeerConfig<'_>) -> Result<(DecisionRaft, Pe
     let identity_exists = node_identity::identity_path(config.data_dir)
         .try_exists()
         .context("inspect local node identity path")?;
-    if !identity_exists && legacy_decision_state_exists(config.data_dir)? {
-        return legacy_identity_migration_required(config.data_dir, &config.peer_address);
-    }
+    let migrated_identity = if !identity_exists && legacy_decision_state_exists(config.data_dir)? {
+        migrate_released_identity(&config).await?
+    } else {
+        None
+    };
 
     let identity = if identity_exists {
         node_identity::load_for_node(config.data_dir, config.node_id)
             .context("load local node identity")?
+    } else if let Some(identity) = migrated_identity {
+        identity
     } else {
         anyhow::ensure!(
             config.run_system_bootstrap,
@@ -354,7 +358,7 @@ async fn admit_genesis_descriptor(
     {
         Ok(begin) => begin,
         Err(DecisionRaftError::Rejected(ApplyError::RaftMemberAddressMismatch { .. })) => {
-            migrate_legacy_peer_address(decisions, node_id, peer_address).await?;
+            migrate_legacy_peer_address(decisions, peer_address).await?;
             decisions
                 .submit(Command::BeginAddNode {
                     format_version: CLUSTER_CONTROL_COMMAND_VERSION,
@@ -460,26 +464,58 @@ fn legacy_decision_state_exists(data_dir: &Path) -> Result<bool> {
         .with_context(|| format!("inspect legacy decision state at {}", path.display()))
 }
 
-fn legacy_identity_migration_required<T>(data_dir: &Path, address: &PeerAddress) -> Result<T> {
-    bail!(
-        "released 0.5.0 decision state at {} requires its one-node Raft address to be migrated to {:?} before a peer identity can be generated",
-        data_dir.join("decisions").display(),
-        address.0
-    )
-}
-
-/// This is the sole call site for the narrow released-0.5.0 address migration.
-/// The consensus API will replace only the same sole member's `anvil-local://N`
-/// address through `ChangeMembers::SetNodes` before descriptor admission.
 async fn migrate_legacy_peer_address(
-    _decisions: &DecisionRaft,
-    _node_id: NodeId,
+    decisions: &DecisionRaft,
     peer_address: &PeerAddress,
 ) -> Result<()> {
-    bail!(
-        "released 0.5.0 one-node Raft address migration to {:?} is not linked yet",
-        peer_address.0
+    decisions
+        .migrate_released_single_node_address(peer_address.0.clone())
+        .await
+        .context("replace released one-node Raft peer address")
+}
+
+/// Open only the released one-node decision state long enough to bind its
+/// existing cluster identity to new private peer material and replace the
+/// synthetic `anvil-local://N` address. No public or peer listener is exposed
+/// during this bounded migration.
+async fn migrate_released_identity(
+    config: &OpenPeerConfig<'_>,
+) -> Result<Option<LocalNodeIdentity>> {
+    let decisions = DecisionRaft::open(
+        config.data_dir.join("decisions"),
+        config.node_id.0,
+        config.max_commit_entries,
+        config.max_commit_bytes,
     )
+    .await
+    .context("open released one-node decision state for peer migration")?;
+    if !decisions.is_initialized().await? {
+        decisions.shutdown().await?;
+        return Ok(None);
+    }
+    decisions
+        .wait_for_leader(config.leader_timeout)
+        .await
+        .context("elect released one-node leader for peer migration")?;
+    let state = decisions.state()?;
+    anyhow::ensure!(
+        state.cluster_control().nodes().is_empty(),
+        "node identity is missing from an already admitted cluster node"
+    );
+    let cluster_id = state
+        .cluster_id()
+        .context("released decision state has no committed cluster identity")?;
+    let identity = node_identity::generate(cluster_id, config.node_id)
+        .context("generate peer identity for released one-node state")?;
+    node_identity::create(config.data_dir, &identity)
+        .context("persist migrated mode-0600 node identity")?;
+    migrate_legacy_peer_address(&decisions, &config.peer_address).await?;
+    decisions.shutdown().await?;
+    tracing::info!(
+        path = %node_identity::identity_path(config.data_dir).display(),
+        "migrated released one-node state to its mode-0600 cluster identity"
+    );
+    Ok(Some(identity))
 }
 
 struct RaftCommittedPeerPins {
@@ -623,6 +659,56 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(25)).await;
         assert!(!peer_server.task_mut().is_finished());
         peer_server.shutdown().await.unwrap();
+        decisions.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn released_one_node_state_migrates_in_place_before_listening() {
+        let directory = tempfile::tempdir().unwrap();
+        let released = DecisionRaft::open(directory.path().join("decisions"), 1, 16, 64 * 1024)
+            .await
+            .unwrap();
+        released.ensure_one_node().await.unwrap();
+        released
+            .wait_for_leader(Duration::from_secs(10))
+            .await
+            .unwrap();
+        released
+            .submit(Command::InitializeCluster {
+                cluster_id: ClusterId([44; 16]),
+            })
+            .await
+            .unwrap();
+        released.shutdown().await.unwrap();
+        drop(released);
+
+        let advertised = PeerAddress("127.0.0.1:51052".into());
+        let (decisions, runtime) = open(OpenPeerConfig {
+            data_dir: directory.path(),
+            node_id: NodeId(1),
+            peer_address: advertised.clone(),
+            run_system_bootstrap: false,
+            max_commit_entries: 16,
+            max_commit_bytes: 64 * 1024,
+            leader_timeout: Duration::from_secs(10),
+        })
+        .await
+        .unwrap();
+
+        let identity = node_identity::load_for_node(directory.path(), NodeId(1)).unwrap();
+        assert_eq!(identity.cluster_id(), ClusterId([44; 16]));
+        let state = decisions.state().unwrap();
+        assert_eq!(state.cluster_id(), Some(ClusterId([44; 16])));
+        assert_eq!(
+            state.cluster_control().nodes()[&NodeId(1)].peer_address,
+            advertised
+        );
+        assert_eq!(
+            state.cluster_control().nodes()[&NodeId(1)].state,
+            NodeState::Active
+        );
+
+        drop(runtime);
         decisions.shutdown().await.unwrap();
     }
 }

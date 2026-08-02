@@ -71,6 +71,43 @@ async fn wait_until(mut condition: impl FnMut() -> bool) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn released_one_node_address_migrates_once_before_descriptor_admission() {
+    let directory = tempfile::tempdir().unwrap();
+    let raft = open(directory.path()).await;
+    raft.ensure_one_node().await.unwrap();
+    raft.wait_for_leader(Duration::from_secs(5)).await.unwrap();
+    raft.submit(Command::InitializeCluster {
+        cluster_id: ClusterId([31; 16]),
+    })
+    .await
+    .unwrap();
+
+    raft.migrate_released_single_node_address("127.0.0.1:50052")
+        .await
+        .unwrap();
+    // A response lost after the membership entry commits is an exact retry.
+    raft.migrate_released_single_node_address("127.0.0.1:50052")
+        .await
+        .unwrap();
+
+    let mut descriptor = joining_descriptor(1);
+    descriptor.peer_address = PeerAddress("127.0.0.1:50052".into());
+    raft.submit(Command::BeginAddNode {
+        format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+        descriptor,
+    })
+    .await
+    .unwrap();
+    assert!(
+        raft.migrate_released_single_node_address("127.0.0.1:50053")
+            .await
+            .is_err()
+    );
+
+    raft.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn successful_leader_quorum_proof_is_reused_only_while_fresh() {
     let directory = tempfile::tempdir().unwrap();
     let raft = open(directory.path()).await;

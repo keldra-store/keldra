@@ -9,9 +9,9 @@ use std::{
 };
 
 use openraft::{
-    AnyError, BasicNode, EntryPayload, ErrorSubject, ErrorVerb, LogId, LogState, OptionalSend,
-    RaftLogReader, RaftSnapshotBuilder, Snapshot, SnapshotMeta, StorageError, StorageIOError,
-    StoredMembership, Vote,
+    AnyError, BasicNode, ChangeMembers, EntryPayload, ErrorSubject, ErrorVerb, LogId, LogState,
+    OptionalSend, RaftLogReader, RaftSnapshotBuilder, Snapshot, SnapshotMeta, StorageError,
+    StorageIOError, StoredMembership, Vote,
     error::{CheckIsLeaderError, ClientWriteError, InitializeError, RaftError},
     storage::{LogFlushed, RaftLogStorage, RaftStateMachine},
 };
@@ -860,6 +860,69 @@ impl DecisionRaft {
             Ok(()) | Err(RaftError::APIError(InitializeError::NotAllowed(_))) => Ok(()),
             Err(error) => Err(DecisionRaftError::Unavailable(error.to_string())),
         }
+    }
+
+    /// Replace the synthetic address written by the released 0.5.0 one-node
+    /// bootstrap before admitting that same node's 0.5.1 descriptor.
+    ///
+    /// This is deliberately not a general address-update API. It accepts only
+    /// the sole local voter, no learners, no cluster descriptors, and the exact
+    /// `anvil-local://N` predecessor. An idempotent retry after the membership
+    /// entry commits accepts the requested address.
+    pub async fn migrate_released_single_node_address(
+        &self,
+        peer_address: impl Into<String>,
+    ) -> Result<(), DecisionRaftError> {
+        let peer_address = peer_address.into();
+        if peer_address.is_empty() {
+            return Err(DecisionRaftError::Configuration(
+                "replacement peer address must not be empty".into(),
+            ));
+        }
+
+        let current_address = {
+            let machine = self
+                .machine
+                .lock()
+                .map_err(|_| DecisionRaftError::StatePoisoned)?;
+            if !machine.decisions.cluster_control().nodes().is_empty() {
+                return Err(DecisionRaftError::Configuration(
+                    "released address migration is forbidden after node admission".into(),
+                ));
+            }
+            let membership = machine.membership.membership();
+            let voters = membership.voter_ids().collect::<Vec<_>>();
+            let nodes = membership.nodes().collect::<Vec<_>>();
+            if voters != [self.node_id] || nodes.len() != 1 || nodes[0].0 != &self.node_id {
+                return Err(DecisionRaftError::Configuration(
+                    "released address migration requires the sole local voter and no learners"
+                        .into(),
+                ));
+            }
+            nodes[0].1.addr.clone()
+        };
+
+        if current_address == peer_address {
+            return Ok(());
+        }
+        let expected = format!("anvil-local://{}", self.node_id);
+        if current_address != expected {
+            return Err(DecisionRaftError::Configuration(format!(
+                "released address migration expected {expected:?}, found {current_address:?}"
+            )));
+        }
+
+        self.raft
+            .change_membership(
+                ChangeMembers::SetNodes(BTreeMap::from([(
+                    self.node_id,
+                    BasicNode::new(peer_address),
+                )])),
+                true,
+            )
+            .await
+            .map(|_| ())
+            .map_err(map_client_write_error)
     }
 
     pub async fn submit(&self, command: Command) -> Result<CommittedDecision, DecisionRaftError> {
