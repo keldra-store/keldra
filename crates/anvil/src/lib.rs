@@ -7,6 +7,7 @@ mod bootstrap;
 mod credential_service;
 pub mod observability;
 mod mutable_record_quorum;
+mod placement;
 mod programs;
 mod serving_fence;
 mod v05;
