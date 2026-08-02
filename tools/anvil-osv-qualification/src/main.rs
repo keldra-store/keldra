@@ -3,7 +3,8 @@ use std::{
     fs::File,
     io::{Cursor, Read},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex, mpsc as std_mpsc},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -118,6 +119,7 @@ struct Args {
     #[arg(long, default_value_t = DEFAULT_SHARD_UNCOMPRESSED_BYTES)]
     shard_uncompressed_bytes: usize,
 
+    /// Maximum parallelism for each concurrent pipeline stage: shard compression and writes.
     #[arg(long, default_value_t = 4)]
     concurrency: usize,
 
@@ -240,7 +242,7 @@ struct PreparedRecord {
     record: OsvSourceRecord,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 struct PreparedShard {
     partition: String,
     shard_index: u64,
@@ -413,6 +415,91 @@ impl ShardBuilder {
             modified_day_min: self.modified_day_min.unwrap_or_else(|| "unknown".into()),
             modified_day_max: self.modified_day_max.unwrap_or_else(|| "unknown".into()),
         })
+    }
+}
+
+struct ShardCompressor {
+    sender: Option<std_mpsc::SyncSender<ShardBuilder>>,
+    workers: Vec<thread::JoinHandle<Result<()>>>,
+}
+
+impl ShardCompressor {
+    fn start(worker_count: usize, output: mpsc::Sender<PreparedShard>) -> Result<Self> {
+        ensure!(
+            worker_count > 0,
+            "shard compression requires at least one worker"
+        );
+        // A rendezvous channel gives each worker work directly. There is no
+        // queue of sealed 64 MiB builders in addition to the workers that are
+        // actively compressing one.
+        let (sender, receiver) = std_mpsc::sync_channel::<ShardBuilder>(0);
+        let receiver = Arc::new(Mutex::new(receiver));
+        let mut workers = Vec::with_capacity(worker_count);
+        for index in 0..worker_count {
+            let receiver = receiver.clone();
+            let output = output.clone();
+            let worker = thread::Builder::new()
+                .name(format!("osv-shard-compressor-{index}"))
+                .spawn(move || compress_shards(receiver, output))
+                .context("start OSV shard compression worker")?;
+            workers.push(worker);
+        }
+        drop(output);
+        Ok(Self {
+            sender: Some(sender),
+            workers,
+        })
+    }
+
+    fn submit(&self, builder: ShardBuilder) -> Result<()> {
+        self.sender
+            .as_ref()
+            .context("OSV shard compressor is already closed")?
+            .send(builder)
+            .map_err(|_| anyhow::anyhow!("OSV shard compression workers stopped unexpectedly"))
+    }
+
+    fn finish(mut self) -> Result<()> {
+        drop(self.sender.take());
+        let mut first_error = None;
+        for worker in self.workers {
+            match worker.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+                Err(_) => {
+                    if first_error.is_none() {
+                        first_error =
+                            Some(anyhow::anyhow!("OSV shard compression worker panicked"));
+                    }
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
+fn compress_shards(
+    receiver: Arc<Mutex<std_mpsc::Receiver<ShardBuilder>>>,
+    output: mpsc::Sender<PreparedShard>,
+) -> Result<()> {
+    loop {
+        let builder = {
+            let receiver = receiver
+                .lock()
+                .map_err(|_| anyhow::anyhow!("OSV shard compression queue was poisoned"))?;
+            match receiver.recv() {
+                Ok(builder) => builder,
+                Err(_) => return Ok(()),
+            }
+        };
+        let shard = builder.finish().context("compress OSV shard")?;
+        output
+            .blocking_send(shard)
+            .map_err(|_| anyhow::anyhow!("OSV shard consumer stopped before parsing completed"))?;
     }
 }
 
@@ -890,7 +977,10 @@ async fn run_data_phase(
     let (sender, mut receiver) = mpsc::channel(config.concurrency.saturating_mul(2).max(1));
     let corpus = config.corpus.clone();
     let target = config.shard_uncompressed_bytes;
-    let parser = tokio::task::spawn_blocking(move || parse_archive(corpus, target, sender));
+    let compression_workers = config.concurrency;
+    let parser = tokio::task::spawn_blocking(move || {
+        parse_archive(corpus, target, compression_workers, sender)
+    });
     let mut pending = JoinSet::new();
     let mut phase = DataPhaseResult::default();
     let mut batch = vec![source_definition_object(config)?];
@@ -1215,6 +1305,7 @@ fn snapshot_manifest(
 fn parse_archive(
     path: PathBuf,
     target_bytes: usize,
+    compression_workers: usize,
     sender: mpsc::Sender<PreparedShard>,
 ) -> Result<ParsingReport> {
     let mut archive = zip::ZipArchive::new(File::open(path)?)?;
@@ -1229,85 +1320,96 @@ fn parse_archive(
     };
     let mut builders = BTreeMap::<String, ShardBuilder>::new();
     let mut next_indices = BTreeMap::<String, u64>::new();
+    let compressor = ShardCompressor::start(compression_workers, sender)?;
 
-    for index in 0..archive.len() {
-        let mut entry = archive.by_index(index)?;
-        if entry.is_dir() || !entry.name().ends_with(".json") {
-            continue;
-        }
-        report.json_documents += 1;
-        if report
-            .json_documents
-            .is_multiple_of(PARSE_PROGRESS_INTERVAL)
-        {
-            eprintln!(
-                "event=osv_parse_progress json_documents={}",
-                report.json_documents
+    let parsing = (|| -> Result<ParsingReport> {
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index)?;
+            if entry.is_dir() || !entry.name().ends_with(".json") {
+                continue;
+            }
+            report.json_documents += 1;
+            if report
+                .json_documents
+                .is_multiple_of(PARSE_PROGRESS_INTERVAL)
+            {
+                eprintln!(
+                    "event=osv_parse_progress json_documents={}",
+                    report.json_documents
+                );
+            }
+            if entry.size() > MAX_DOCUMENT_BYTES {
+                report.oversized_documents += 1;
+                continue;
+            }
+            let mut bytes = Vec::with_capacity(entry.size() as usize);
+            entry
+                .by_ref()
+                .take(MAX_DOCUMENT_BYTES + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() as u64 > MAX_DOCUMENT_BYTES {
+                report.oversized_documents += 1;
+                continue;
+            }
+            report.decompressed_json_bytes = report
+                .decompressed_json_bytes
+                .checked_add(bytes.len() as u64)
+                .context("OSV decompressed JSON byte count overflowed")?;
+            ensure!(
+                report.decompressed_json_bytes <= MAX_DECOMPRESSED_JSON_BYTES,
+                "OSV decompressed JSON exceeds the {MAX_DECOMPRESSED_JSON_BYTES} byte bound"
             );
-        }
-        if entry.size() > MAX_DOCUMENT_BYTES {
-            report.oversized_documents += 1;
-            continue;
-        }
-        let mut bytes = Vec::with_capacity(entry.size() as usize);
-        entry
-            .by_ref()
-            .take(MAX_DOCUMENT_BYTES + 1)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > MAX_DOCUMENT_BYTES {
-            report.oversized_documents += 1;
-            continue;
-        }
-        report.decompressed_json_bytes = report
-            .decompressed_json_bytes
-            .checked_add(bytes.len() as u64)
-            .context("OSV decompressed JSON byte count overflowed")?;
-        ensure!(
-            report.decompressed_json_bytes <= MAX_DECOMPRESSED_JSON_BYTES,
-            "OSV decompressed JSON exceeds the {MAX_DECOMPRESSED_JSON_BYTES} byte bound"
-        );
-        let document = match serde_json::from_slice::<Value>(&bytes) {
-            Ok(document) => document,
-            Err(_) => {
-                report.malformed_documents += 1;
-                continue;
+            let document = match serde_json::from_slice::<Value>(&bytes) {
+                Ok(document) => document,
+                Err(_) => {
+                    report.malformed_documents += 1;
+                    continue;
+                }
+            };
+            let records = match prepare_records(document) {
+                Ok(records) => records,
+                Err(_) => {
+                    report.malformed_documents += 1;
+                    continue;
+                }
+            };
+            report.accepted_source_documents += 1;
+            if records
+                .iter()
+                .any(|record| record.record.ecosystem == "unscoped")
+            {
+                report.unscoped_documents += 1;
             }
-        };
-        let records = match prepare_records(document) {
-            Ok(records) => records,
-            Err(_) => {
-                report.malformed_documents += 1;
-                continue;
+            for prepared in records {
+                push_record_into_shards(
+                    prepared,
+                    target_bytes,
+                    &compressor,
+                    &mut builders,
+                    &mut next_indices,
+                )?;
+                report.normalised_source_records += 1;
             }
-        };
-        report.accepted_source_documents += 1;
-        if records
-            .iter()
-            .any(|record| record.record.ecosystem == "unscoped")
-        {
-            report.unscoped_documents += 1;
         }
-        for prepared in records {
-            push_record_into_shards(
-                prepared,
-                target_bytes,
-                &sender,
-                &mut builders,
-                &mut next_indices,
-            )?;
-            report.normalised_source_records += 1;
+        for builder in builders.into_values() {
+            compressor.submit(builder)?;
         }
+        Ok(report)
+    })();
+    let compression = compressor.finish();
+    match (parsing, compression) {
+        (Ok(report), Ok(())) => Ok(report),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(compression_error)) => Err(error.context(format!(
+            "OSV shard compression also failed: {compression_error:#}"
+        ))),
     }
-    for builder in builders.into_values() {
-        send_shard(&sender, builder.finish()?)?;
-    }
-    Ok(report)
 }
 
 fn push_record_into_shards(
     prepared: PreparedRecord,
     target_bytes: usize,
-    sender: &mpsc::Sender<PreparedShard>,
+    compressor: &ShardCompressor,
     builders: &mut BTreeMap<String, ShardBuilder>,
     next_indices: &mut BTreeMap<String, u64>,
 ) -> Result<()> {
@@ -1320,7 +1422,7 @@ fn push_record_into_shards(
         let completed = builders
             .remove(&partition)
             .expect("the partition builder was checked above");
-        send_shard(sender, completed.finish()?)?;
+        compressor.submit(completed)?;
     }
     let builder = builders.entry(partition.clone()).or_insert_with(|| {
         let index = next_indices.entry(partition.clone()).or_default();
@@ -1330,12 +1432,6 @@ fn push_record_into_shards(
     });
     builder.push(&prepared, &encoded);
     Ok(())
-}
-
-fn send_shard(sender: &mpsc::Sender<PreparedShard>, shard: PreparedShard) -> Result<()> {
-    sender
-        .blocking_send(shard)
-        .map_err(|_| anyhow::anyhow!("OSV shard consumer stopped before parsing completed"))
 }
 
 fn prepare_records(mut document: Value) -> Result<Vec<PreparedRecord>> {
@@ -1683,6 +1779,66 @@ fn emit_report(report: &QualificationReport<'_>, output: Option<&Path>) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_shard_builders() -> Vec<ShardBuilder> {
+        (0..6)
+            .map(|index| {
+                let prepared = prepare_records(serde_json::json!({
+                    "id": format!("GHSA-compression-{index}"),
+                    "modified": format!("2026-07-{:02}T12:00:00Z", index + 1),
+                    "details": "deterministic shard compression",
+                    "affected": [{
+                        "package": {"ecosystem": "npm", "name": format!("example-{index}")},
+                        "versions": ["1.0.0", "1.0.1"]
+                    }]
+                }))
+                .unwrap()
+                .remove(0);
+                let encoded = serde_json::to_vec(&prepared.record).unwrap();
+                let mut builder = ShardBuilder::new("npm".into(), index, 1024);
+                builder.push(&prepared, &encoded);
+                builder
+            })
+            .collect()
+    }
+
+    #[test]
+    fn parallel_shard_compression_is_byte_identical_to_serial() {
+        let expected = test_shard_builders()
+            .into_iter()
+            .map(ShardBuilder::finish)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let builders = test_shard_builders();
+        let (sender, mut receiver) = mpsc::channel(builders.len());
+        let compressor = ShardCompressor::start(3, sender).unwrap();
+        for builder in builders {
+            compressor.submit(builder).unwrap();
+        }
+        compressor.finish().unwrap();
+
+        let mut actual = Vec::new();
+        while let Some(shard) = receiver.blocking_recv() {
+            actual.push(shard);
+        }
+        actual.sort_unstable_by_key(|shard| shard.shard_index);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn shard_compression_worker_reports_a_stopped_consumer_without_hanging() {
+        let builder = test_shard_builders().remove(0);
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let compressor = ShardCompressor::start(1, sender).unwrap();
+        compressor.submit(builder).unwrap();
+        let error = compressor.finish().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("OSV shard consumer stopped before parsing completed")
+        );
+    }
 
     #[test]
     fn exact_developer_defence_transform_materialises_package_records() {
