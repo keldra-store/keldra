@@ -1,17 +1,14 @@
-#!/bin/bash
-# This script first cross-compiles the release binaries for Linux and then starts the Docker Compose cluster.
-# This is the recommended way to run the cluster locally.
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
-TARGET="x86_64-unknown-linux-gnu"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${repo_root}"
 
-echo "--- Building Anvil release binaries for ${TARGET} ---"
-cargo build --release -p anvil-server --bin anvil-server --target ${TARGET}
-cargo build --release -p anvil-storage-cli --bin anvil --bin anvil-admin --target ${TARGET}
+: "${ANVIL_TOKEN_SIGNING_KEY_FILE:?ANVIL_TOKEN_SIGNING_KEY_FILE must name a mode-0600 file}"
+export ANVIL_IMAGE="${ANVIL_IMAGE:-anvil:local}"
 
-# The docker-compose.yml file is now configured to look for release binaries.
-# We update its BINARY_PATH argument to ensure it finds the cross-compiled ones.
-echo "\n--- Building Docker image and starting cluster ---"
-docker compose up --build -d
+./scripts/build-image.sh
+docker compose -f anvil/docker-compose.yml up --detach
 
-echo "\n--- Cluster is starting. Run 'docker compose logs -f' to see logs. ---"
+echo "Anvil 0.5 is starting on ${ANVIL_LISTEN:-0.0.0.0:50051}."
+echo "Use 'docker compose -f anvil/docker-compose.yml logs --follow' to inspect it."

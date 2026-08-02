@@ -1,0 +1,937 @@
+syntax = "proto3";
+
+package anvil.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// The complete public Anvil 0.5.0 network contract. There is deliberately no
+// peer, transaction-lifecycle, detached-blob, index, or gateway service in this
+// release. Ordinary object calls are independent. Only InvokeProgram requests
+// atomic multi-path visibility.
+service ObjectService {
+  // The complete put header is unary so an upload stream can contain only
+  // payload chunks. Its typed operation selects Put, PutIfAbsent,
+  // PutIfVersion, or PutImmutable. The returned opaque token binds the
+  // authenticated caller, complete header, selected operation, and expiry.
+  // This contract does not require StartPut to create durable object state or
+  // hold a path lock. An unavailable durability is rejected here, before the
+  // client uploads any bytes; it is never silently downgraded.
+  rpc StartPut(PutHeader) returns (PutToken);
+
+  // Every request in this client stream carries the UPLOAD-phase token returned
+  // by exactly one StartPut call. Closing the stream seals the staged bytes but
+  // does not publish an object. The returned READY-phase token is the only
+  // token PutEnd accepts. A zero-byte object is one request containing the
+  // token and an empty chunk; an empty request stream is invalid.
+  rpc Put(stream PutRequest) returns (PutToken);
+
+  // The sole publication point for a sealed streamed upload. An UPLOAD token
+  // cannot call PutEnd and a READY token cannot start Put. PutEnd revalidates
+  // caller identity, current authorization, operation policy and final CAS.
+  rpc PutEnd(PutToken) returns (MutationReceipt);
+
+  // Publish the next tombstone version, including when the path never existed.
+  rpc Delete(DeleteRequest) returns (MutationReceipt);
+  // Publish the next tombstone only when the current live or tombstone head has
+  // exactly the supplied version.
+  rpc DeleteIfVersion(DeleteIfVersionRequest) returns (MutationReceipt);
+  // Permanently removes one exact retained version from a version-enabled
+  // bucket. A missing version is an idempotent successful no-op. Removing a
+  // non-current version leaves the head unchanged. Removing the current live
+  // version publishes a fresh monotonic tombstone; older retained versions
+  // never become current again. The current tombstone is the path's CAS/ABA
+  // fence and cannot be removed.
+  rpc DeleteVersion(DeleteVersionRequest) returns (DeleteVersionResponse);
+  rpc HeadObject(HeadObjectRequest) returns (ObjectHead);
+  // Returns one stateless page of current live paths in strict UTF-8 byte
+  // order. This is a read-committed view of one page, not a snapshot held
+  // across pages. Passing the last returned path as start_after resumes after
+  // it. The implementation scans the current-head keyspace directly; it does
+  // not require or maintain a side index.
+  rpc ListObjects(ListObjectsRequest) returns (ListObjectsResponse);
+  rpc GetObject(GetObjectRequest) returns (stream ObjectChunk);
+  // Streams retained metadata for one exact path in ascending version order.
+  // Payload bytes are never included and the server pages storage internally.
+  // This is a bounded-memory read-committed stream, not a snapshot of the
+  // entire version history.
+  rpc ListObjectVersions(ListObjectVersionsRequest) returns (stream ObjectVersion);
+  rpc BulkWrite(BulkWriteRequest) returns (BulkWriteResponse);
+  rpc BatchGet(BatchGetRequest) returns (BatchGetResponse);
+  rpc WatchPrefix(WatchPrefixRequest) returns (stream WatchMessage);
+  rpc SetBucketPolicy(SetBucketPolicyRequest) returns (BucketPolicy);
+  rpc InvokeProgram(InvokeProgramRequest) returns (InvokeProgramResponse);
+}
+
+// Realm-scoped Zanzibar authorization. Schemas are immutable tenant-owned
+// values; bindings and tuple sets are the mutable authorization state.
+service AuthzService {
+  rpc PutSchema(PutSchemaRequest) returns (PutSchemaResponse);
+  rpc BindSchema(BindSchemaRequest) returns (BindSchemaResponse);
+  rpc GetBinding(GetBindingRequest) returns (GetBindingResponse);
+  rpc GetSchema(GetSchemaRequest) returns (GetSchemaResponse);
+  rpc MutateTuples(MutateTuplesRequest) returns (MutateTuplesResponse);
+  rpc ReadTuples(ReadTuplesRequest) returns (ReadTuplesResponse);
+  rpc CheckPermission(CheckPermissionRequest) returns (CheckPermissionResponse);
+  rpc CheckPermissions(CheckPermissionsRequest) returns (CheckPermissionsResponse);
+}
+
+// Credential exchange is the only unauthenticated service. Long-lived client
+// credentials are verified against durable Anvil state and exchanged for a
+// short-lived bearer token. The deployment must protect this service with TLS
+// termination because the request contains a long-lived secret. Every other
+// public service is protected.
+service CredentialService {
+  rpc ExchangeClientCredentials(ExchangeClientCredentialsRequest) returns (AccessToken);
+}
+
+// Small, typed management operations for Anvil's protected system realm.
+// These RPCs do not bypass Zanzibar: each request is authorized against the
+// same protected realm used by object and authorization requests, and each
+// resulting ownership or grant is an ordinary system-realm tuple.
+service AdministrationService {
+  rpc ProvisionTenant(ProvisionTenantRequest) returns (ProvisionTenantResponse);
+  rpc CreateApplication(CreateApplicationRequest) returns (ApplicationCredential);
+  rpc RotateApplicationCredential(RotateApplicationCredentialRequest) returns (ApplicationCredential);
+  rpc DisableApplicationCredential(DisableApplicationCredentialRequest) returns (ApplicationCredentialState);
+  rpc CreateBucket(CreateBucketRequest) returns (CreateBucketResponse);
+  // Bucket versioning can move only from UNVERSIONED to ENABLED. Disabling a
+  // version-enabled bucket is deliberately unsupported.
+  rpc SetBucketVersioning(SetBucketVersioningRequest) returns (SetBucketVersioningResponse);
+  rpc GrantApplicationRole(ApplicationRoleRequest) returns (ApplicationRoleResponse);
+  rpc RevokeApplicationRole(ApplicationRoleRequest) returns (ApplicationRoleResponse);
+}
+
+message ObjectAddress {
+  string tenant = 1;
+  string bucket = 2;
+  string path = 3;
+}
+
+// LOCAL is the default for speed. REPLICATED is an explicit opt-in and part of
+// the stable API, but Anvil 0.5.0 returns DURABILITY_UNAVAILABLE without
+// publishing because it has one node. Unknown values are invalid.
+enum Durability {
+  DURABILITY_LOCAL = 0;
+  DURABILITY_REPLICATED = 1;
+}
+
+// UNVERSIONED is the meaningful zero/default: replacing or deleting a head
+// does not retain the predecessor for later reads. ENABLED retains versions
+// and is a one-way bucket capability.
+enum ObjectVersioning {
+  OBJECT_VERSIONING_UNVERSIONED = 0;
+  OBJECT_VERSIONING_ENABLED = 1;
+}
+
+// Complete metadata and operation for one addressed upload. A header never
+// contains payload bytes, a caller-supplied content hash, or a storage
+// reference. Exactly one operation must be selected.
+message PutHeader {
+  ObjectAddress address = 1;
+  // Empty means unspecified; otherwise at most 512 UTF-8 bytes.
+  string content_type = 2;
+  string command_id = 3;
+  Durability durability = 4;
+  oneof operation {
+    PutOperation put = 5;
+    PutIfAbsentOperation put_if_absent = 6;
+    PutIfVersionOperation put_if_version = 7;
+    PutImmutableOperation put_immutable = 8;
+  }
+}
+
+// Unconditional ordinary put: publish the next version of a MUTABLE path.
+message PutOperation {}
+
+// Create on a MUTABLE path only when no live value exists.
+message PutIfAbsentOperation {}
+
+// Publish on a MUTABLE path only when its current live or tombstone head has
+// exactly expected_version. The condition is checked when the completed upload
+// is published; StartPut does not reserve or lock the path while bytes arrive.
+message PutIfVersionOperation {
+  uint64 expected_version = 1;
+}
+
+// Create on an IMMUTABLE path. Identical existing content is an idempotent
+// replay; different existing content fails. This operation never changes path
+// policy.
+message PutImmutableOperation {}
+
+// Opaque upload capability returned by StartPut. Clients must not parse
+// `value`. A token is bound to its authenticated caller and one protocol phase.
+// StartPut returns an UPLOAD token; Put returns a fresh READY token for PutEnd.
+message PutToken {
+  bytes value = 1;
+  google.protobuf.Timestamp expires_at = 2;
+}
+
+// Protobuf cannot make a field unskippable on a hostile wire, so the server
+// rejects a missing/empty token. Unlike the old frame union, however, this
+// message has no header variant a normal client can send out of order. Every
+// request in one stream must carry the same token.
+message PutRequest {
+  PutToken token = 1;
+  bytes chunk = 2;
+}
+
+message DeleteRequest {
+  ObjectAddress address = 1;
+  string command_id = 2;
+  Durability durability = 3;
+}
+
+message DeleteIfVersionRequest {
+  ObjectAddress address = 1;
+  string command_id = 2;
+  Durability durability = 3;
+  uint64 expected_version = 4;
+}
+
+message DeleteVersionRequest {
+  ObjectAddress address = 1;
+  uint64 version = 2;
+  Durability durability = 3;
+}
+
+message DeleteVersionResponse {
+  bool deleted = 1;
+  // Present only when the target was the current live payload. Anvil removes
+  // that payload and publishes this fresh tombstone as the new head. Removing
+  // a non-current version never changes the head.
+  optional uint64 replacement_tombstone_version = 2;
+}
+
+message MutationReceipt {
+  string command_id = 1;
+  uint64 version = 2;
+  bool deleted = 3;
+  bool replayed = 4;
+  // The command ID is guaranteed replayable through this instant. Once the
+  // bounded receipt expires, the caller must reconcile against object state
+  // before retrying an operation whose duplicate execution would matter.
+  google.protobuf.Timestamp replay_guarantee_expires_at = 5;
+}
+
+message HeadObjectRequest {
+  ObjectAddress address = 1;
+}
+
+message ListObjectsRequest {
+  string tenant = 1;
+  string bucket = 2;
+  // Literal UTF-8 prefix, bounded by the maximum object-path byte length.
+  // Empty lists the whole bucket; '/' has no special delimiter meaning.
+  string prefix = 3;
+  // Exclusive full-path cursor. When present it must be a canonical object
+  // path. The request is stateless and carries no opaque continuation token.
+  optional string start_after = 4;
+  // Zero selects the default of 100. The maximum is 1000.
+  uint32 limit = 5;
+}
+
+message ListObjectsResponse {
+  // Current live paths only, in strict ascending UTF-8 byte order. No
+  // metadata, payload, common-prefix entries, or tombstones are returned.
+  repeated string paths = 1;
+  bool has_more = 2;
+}
+
+// Exact path state. A tombstone has a version and is not the same as a path
+// for which no version has ever existed.
+message ObjectHead {
+  oneof state {
+    PresentObject present = 1;
+    DeletedObject deleted = 2;
+    NeverExisted never_existed = 3;
+  }
+}
+
+message PresentObject {
+  uint64 version = 1;
+  bytes content_hash = 2;
+  uint64 content_length = 3;
+  string content_type = 4;
+}
+
+message DeletedObject {
+  uint64 version = 1;
+}
+
+message NeverExisted {}
+
+message GetObjectRequest {
+  ObjectAddress address = 1;
+  // Absence selects the current head. Presence selects that exact retained
+  // version and is valid only when bucket versioning is ENABLED.
+  optional uint64 version = 2;
+}
+
+// A GetObject stream begins with exactly one head. Bytes follow only for a
+// PresentObject state.
+message ObjectChunk {
+  oneof value {
+    ObjectHead head = 1;
+    bytes bytes = 2;
+  }
+}
+
+message ListObjectVersionsRequest {
+  ObjectAddress address = 1;
+}
+
+// Retained metadata for one live value or tombstone. NeverExisted is not a
+// version and therefore cannot occur in this stream.
+message ObjectVersion {
+  oneof state {
+    PresentObject present = 1;
+    DeletedObject deleted = 2;
+  }
+}
+
+// Bulk operations are independent. The server enforces finite item and byte
+// limits; one failed operation does not roll back another successful one.
+message BulkWriteRequest {
+  repeated BulkOperation operations = 1;
+}
+
+// Bulk puts carry their bounded payload inline because there is one enclosing
+// unary request. They use the same canonical operation identity and semantics
+// as the corresponding StartPut plus Put plus PutEnd sequence.
+message BulkPutRequest {
+  ObjectAddress address = 1;
+  bytes bytes = 2;
+  // Empty means unspecified; otherwise at most 512 UTF-8 bytes.
+  string content_type = 3;
+  string command_id = 4;
+  Durability durability = 5;
+}
+
+message BulkPutIfVersionRequest {
+  ObjectAddress address = 1;
+  bytes bytes = 2;
+  // Empty means unspecified; otherwise at most 512 UTF-8 bytes.
+  string content_type = 3;
+  string command_id = 4;
+  Durability durability = 5;
+  uint64 expected_version = 6;
+}
+
+message BulkOperation {
+  oneof operation {
+    BulkPutRequest put = 1;
+    BulkPutRequest put_if_absent = 2;
+    BulkPutIfVersionRequest put_if_version = 3;
+    BulkPutRequest put_immutable = 4;
+    DeleteRequest delete = 5;
+    DeleteIfVersionRequest delete_if_version = 6;
+  }
+}
+
+message BulkWriteResponse {
+  repeated BulkOutcome outcomes = 1;
+}
+
+message BulkOutcome {
+  uint32 index = 1;
+  oneof outcome {
+    MutationReceipt receipt = 2;
+    MutationFailure failure = 3;
+  }
+}
+
+message MutationFailure {
+  MutationFailureCode code = 1;
+  string message = 2;
+  optional uint64 current_version = 3;
+}
+
+enum MutationFailureCode {
+  MUTATION_FAILURE_CODE_UNSPECIFIED = 0;
+  MUTATION_FAILURE_CODE_CONDITION_FAILED = 1;
+  MUTATION_FAILURE_CODE_IMMUTABLE = 2;
+  MUTATION_FAILURE_CODE_IDEMPOTENCY_INPUT_MISMATCH = 3;
+  MUTATION_FAILURE_CODE_INVALID = 4;
+  MUTATION_FAILURE_CODE_INTERNAL = 5;
+  MUTATION_FAILURE_CODE_PROGRAM_CONCURRENCY_VIOLATION = 6;
+  MUTATION_FAILURE_CODE_DURABILITY_UNAVAILABLE = 7;
+  MUTATION_FAILURE_CODE_RESOURCE_LIMIT = 8;
+  MUTATION_FAILURE_CODE_AUTHORIZATION_DENIED = 9;
+  MUTATION_FAILURE_CODE_IMMUTABLE_POLICY_REQUIRED = 10;
+}
+
+// Batch reads are independent and bounded by server item and byte limits.
+message BatchGetRequest {
+  repeated GetObjectRequest objects = 1;
+}
+
+message BatchGetResponse {
+  repeated BatchGetOutcome outcomes = 1;
+}
+
+message BatchGetOutcome {
+  uint32 index = 1;
+  ObjectAddress address = 2;
+  oneof outcome {
+    BatchGetObject object = 3;
+    ReadFailure failure = 4;
+  }
+}
+
+message BatchGetObject {
+  ObjectHead head = 1;
+  // Empty for DeletedObject and NeverExisted. A present empty object is
+  // distinguished by its PresentObject head.
+  bytes bytes = 2;
+}
+
+message ReadFailure {
+  ReadFailureCode code = 1;
+  string message = 2;
+}
+
+enum ReadFailureCode {
+  READ_FAILURE_CODE_UNSPECIFIED = 0;
+  READ_FAILURE_CODE_INVALID = 1;
+  READ_FAILURE_CODE_AUTHORIZATION_DENIED = 2;
+  READ_FAILURE_CODE_VERSION_NOT_FOUND = 3;
+  READ_FAILURE_CODE_RESOURCE_LIMIT = 4;
+  READ_FAILURE_CODE_DATA_LOSS = 5;
+  READ_FAILURE_CODE_INTERNAL = 6;
+  READ_FAILURE_CODE_VERSIONING_DISABLED = 7;
+}
+
+// WatchPrefix is an unordered, at-least-once invalidation feed. Duplicates are
+// legal and rapid changes to one path may be coalesced; intermediate versions
+// are not promised. It carries no payload bytes and is not change-data-capture
+// or an audit log. A consumer must reread each path until it observes at least
+// minimum_path_version.
+message WatchPrefixRequest {
+  // `path` is a canonical path-segment prefix. Empty selects the whole bucket.
+  ObjectAddress prefix = 1;
+  oneof start {
+    WatchNow now = 2;
+    WatchRetainedBeginning retained_beginning = 3;
+    bytes resume_token = 4;
+  }
+}
+
+message WatchNow {}
+message WatchRetainedBeginning {}
+
+message WatchMessage {
+  oneof message {
+    WatchInvalidation invalidation = 1;
+    WatchCheckpoint checkpoint = 2;
+  }
+}
+
+message WatchInvalidation {
+  ObjectAddress address = 1;
+  uint64 minimum_path_version = 2;
+  WatchStateHint state_hint = 3;
+}
+
+enum WatchStateHint {
+  WATCH_STATE_HINT_UNSPECIFIED = 0;
+  WATCH_STATE_HINT_PRESENT = 1;
+  WATCH_STATE_HINT_DELETED = 2;
+}
+
+// Persist this opaque token only after every preceding invalidation has been
+// durably applied. Reconnecting from it may legally redeliver invalidations.
+message WatchCheckpoint {
+  bytes resume_token = 1;
+}
+
+message SetBucketPolicyRequest {
+  string tenant = 1;
+  string bucket = 2;
+  BucketPolicy policy = 3;
+}
+
+// Prefixes are bucket-relative. Anything below an immutable prefix is
+// write-once; anything below a program-only prefix is writable only through a
+// pinned atomic program. Overlap validation belongs to the server.
+message BucketPolicy {
+  repeated string immutable_path_prefixes = 1;
+  repeated string program_only_path_prefixes = 2;
+}
+
+// This is the only public operation in this service with atomic multi-path
+// visibility. A program definition is an ordinary immutable object at the
+// bucket-relative path `_anvil/programs/{name}@{version}`. It is
+// written through StartPut with PutImmutableOperation, followed by Put and
+// PutEnd, and is governed by the same path authorization as every other
+// object. The invocation pins that ordinary object's full address and content
+// hash.
+message InvokeProgramRequest {
+  ObjectAddress program = 1;
+  string invocation_id = 2;
+  // Exactly the 32-byte BLAKE3 hash returned by HeadObject for the pinned
+  // immutable program definition.
+  bytes program_hash = 3;
+  // UTF-8 JSON object containing arguments, inputs, blobs and bindings. Anvil
+  // validates and canonicalizes it before deriving the invocation fingerprint.
+  bytes input_json = 4;
+  Durability durability = 5;
+}
+
+message ProgramPathReceipt {
+  ObjectAddress address = 1;
+  uint64 version = 2;
+  bool deleted = 3;
+}
+
+message InvokeProgramResponse {
+  string invocation_id = 1;
+  ObjectAddress program = 2;
+  bytes program_hash = 3;
+  uint64 executor_nomination_log_index = 4;
+  uint64 commit_log_index = 5;
+  repeated ProgramPathReceipt path_receipts = 6;
+  // Canonical JSON object containing the pinned program's named outputs.
+  bytes output_json = 7;
+  bool replayed = 8;
+  google.protobuf.Timestamp replay_guarantee_expires_at = 9;
+}
+
+message ExchangeClientCredentialsRequest {
+  string client_id = 1;
+  string client_secret = 2;
+}
+
+message AccessToken {
+  string access_token = 1;
+  string token_type = 2;
+  uint64 expires_in_seconds = 3;
+}
+
+// Creates one storage tenant, its first owner application and that
+// application's credential in one durable metadata write. Only a caller with
+// system#manage_system may perform this operation.
+message ProvisionTenantRequest {
+  string storage_tenant = 1;
+  string owner_app_id = 2;
+  string owner_client_id = 3;
+  string owner_client_secret = 4;
+}
+
+message ProvisionTenantResponse {
+  ApplicationCredential credential = 1;
+  uint64 authorization_revision = 2;
+  bool replayed = 3;
+}
+
+// Application IDs and client IDs are cluster-wide authentication identities;
+// each is globally unique. An application has exactly one client credential
+// in 0.5.0. Supplying the same canonical application, client ID and secret is
+// an idempotent replay.
+message CreateApplicationRequest {
+  string app_id = 1;
+  string client_id = 2;
+  string client_secret = 3;
+}
+
+message ApplicationCredential {
+  string storage_tenant = 1;
+  string app_id = 2;
+  string client_id = 3;
+  bool active = 4;
+  bool replayed = 5;
+}
+
+message RotateApplicationCredentialRequest {
+  string app_id = 1;
+  string client_id = 2;
+  string client_secret = 3;
+}
+
+// Stops future exchanges. Access tokens already issued to this application
+// remain valid until their stated expiry.
+message DisableApplicationCredentialRequest {
+  string app_id = 1;
+  string client_id = 2;
+}
+
+message ApplicationCredentialState {
+  string storage_tenant = 1;
+  string app_id = 2;
+  string client_id = 3;
+  bool active = 4;
+  bool replayed = 5;
+}
+
+// A bucket's durable existence marker and first system-realm owner tuple are
+// written in one metadata batch. The caller becomes that owner.
+message CreateBucketRequest {
+  string bucket = 1;
+  ObjectVersioning versioning = 2;
+}
+
+message CreateBucketResponse {
+  string storage_tenant = 1;
+  string bucket = 2;
+  uint64 authorization_revision = 3;
+  bool replayed = 4;
+  ObjectVersioning versioning = 5;
+}
+
+// Only ENABLED is accepted. UNVERSIONED is selected at CreateBucket time by
+// omission/default and cannot be restored after versioning has been enabled.
+message SetBucketVersioningRequest {
+  string bucket = 1;
+  ObjectVersioning versioning = 2;
+}
+
+message SetBucketVersioningResponse {
+  string storage_tenant = 1;
+  string bucket = 2;
+  ObjectVersioning versioning = 3;
+  bool changed = 4;
+}
+
+message ApplicationRoleRequest {
+  string app_id = 1;
+  oneof target {
+    SystemApplicationRoleTarget system = 2;
+    TenantApplicationRoleTarget tenant = 3;
+    BucketApplicationRoleTarget bucket = 4;
+  }
+}
+
+message SystemApplicationRoleTarget {
+  SystemApplicationRole role = 1;
+}
+
+enum SystemApplicationRole {
+  SYSTEM_APPLICATION_ROLE_UNSPECIFIED = 0;
+  SYSTEM_APPLICATION_ROLE_ADMIN = 1;
+}
+
+message TenantApplicationRoleTarget {
+  TenantApplicationRole role = 1;
+}
+
+enum TenantApplicationRole {
+  TENANT_APPLICATION_ROLE_UNSPECIFIED = 0;
+  TENANT_APPLICATION_ROLE_OWNER = 1;
+  TENANT_APPLICATION_ROLE_ADMIN = 2;
+  TENANT_APPLICATION_ROLE_READER = 3;
+  TENANT_APPLICATION_ROLE_MANAGE_TENANT = 4;
+  TENANT_APPLICATION_ROLE_READ_TENANT = 5;
+  TENANT_APPLICATION_ROLE_MANAGE_BUCKETS = 6;
+  TENANT_APPLICATION_ROLE_MANAGE_AUTHZ = 7;
+}
+
+message BucketApplicationRoleTarget {
+  string bucket = 1;
+  BucketApplicationRole role = 2;
+}
+
+enum BucketApplicationRole {
+  BUCKET_APPLICATION_ROLE_UNSPECIFIED = 0;
+  BUCKET_APPLICATION_ROLE_OWNER = 1;
+  BUCKET_APPLICATION_ROLE_ADMIN = 2;
+  BUCKET_APPLICATION_ROLE_READER = 3;
+  BUCKET_APPLICATION_ROLE_WRITER = 4;
+  BUCKET_APPLICATION_ROLE_GET_OBJECT = 5;
+  BUCKET_APPLICATION_ROLE_PUT_OBJECT = 6;
+  BUCKET_APPLICATION_ROLE_DELETE_OBJECT = 7;
+  BUCKET_APPLICATION_ROLE_MANAGE_POLICY = 8;
+}
+
+message ApplicationRoleResponse {
+  uint64 authorization_revision = 1;
+  bool replayed = 2;
+}
+
+// The structural boundary for an authorization graph. `default` is the
+// conventional application realm. `_anvil/system` is deliberately
+// representable here because Anvil uses the same data model internally;
+// public calls targeting that reserved scope are rejected by the server. For
+// every public call, storage_tenant must equal the authenticated caller's
+// immutable storage tenant; spelling another tenant never changes identity.
+message AuthzScope {
+  string storage_tenant = 1;
+  string realm = 2;
+}
+
+// A canonical immutable schema identity. The server assigns the revision and
+// digest; clients never publish either as metadata.
+message SchemaRef {
+  string schema_id = 1;
+  uint64 schema_revision = 2;
+  bytes schema_digest = 3;
+}
+
+// Identifiers, namespaces, relations, schema IDs, and realm IDs are limited
+// to 256 UTF-8 bytes. Opaque object IDs and exact paths are limited to 4096
+// UTF-8 bytes. A realm is carried only by AuthzScope, never in a namespace.
+message ObjectRef {
+  string namespace = 1;
+  oneof id {
+    string opaque_id = 2;
+    ObjectAddress exact_path = 3;
+  }
+}
+
+message Userset {
+  ObjectRef object = 1;
+  string relation = 2;
+}
+
+// A tuple subject is either one typed object or one userset in the request's
+// realm. The reserved public principal is the object `app:_anvil/public`;
+// schemas must still opt into it with PublicSubjectSelector.
+message Subject {
+  oneof kind {
+    ObjectRef object = 1;
+    Userset userset = 2;
+  }
+}
+
+message NamespaceDefinition {
+  string name = 1;
+  repeated RelationDefinition relations = 2;
+}
+
+message RelationDefinition {
+  string name = 1;
+  oneof kind {
+    DirectRelation direct = 2;
+    Permission permission = 3;
+  }
+}
+
+// Direct relations are the only schema members that accept tuples.
+message DirectRelation {
+  repeated SubjectSelector allowed_subjects = 1;
+}
+
+// A permission is a bounded union of its rules and cannot accept tuples.
+message Permission {
+  repeated PermissionRule rules = 1;
+}
+
+message SubjectSelector {
+  oneof selector {
+    // Any canonical non-public object in this namespace.
+    AnyObjectSelector any_object = 1;
+    AnyUsersetSelector any_userset = 2;
+    Subject exact = 3;
+    SameResourceIdSelector same_resource_id = 4;
+    PublicSubjectSelector public = 5;
+  }
+}
+
+message AnyObjectSelector {
+  string namespace = 1;
+}
+
+message AnyUsersetSelector {
+  string namespace = 1;
+  string relation = 2;
+}
+
+message SameResourceIdSelector {
+  string namespace = 1;
+}
+
+message PublicSubjectSelector {}
+
+message PermissionRule {
+  oneof rule {
+    InheritRule inherit = 1;
+    TupleToUsersetRule tuple_to_userset = 2;
+  }
+}
+
+message InheritRule {
+  string relation = 1;
+}
+
+message TupleToUsersetRule {
+  string tuple_relation = 1;
+  string target_relation = 2;
+}
+
+// A 0.5 schema contains at most 256 namespaces, 256 members per namespace,
+// and 256 selectors or rules per member. Publication canonicalizes the body:
+// replaying identical content returns the same SchemaRef, while changed
+// content creates the next immutable revision for the schema ID.
+message PutSchemaRequest {
+  string schema_id = 1;
+  repeated NamespaceDefinition namespaces = 2;
+}
+
+message PutSchemaResponse {
+  SchemaRef schema_ref = 1;
+  // Tenant-wide authorization revision evaluated or advanced by this call.
+  uint64 revision = 2;
+  bool replayed = 3;
+}
+
+message SchemaBinding {
+  AuthzScope scope = 1;
+  SchemaRef schema_ref = 2;
+  uint64 generation = 3;
+}
+
+message BindSchemaRequest {
+  AuthzScope scope = 1;
+  SchemaRef schema_ref = 2;
+  // First binding accepts absence or zero. Rebinding requires the exact
+  // current generation.
+  optional uint64 expected_binding_generation = 3;
+}
+
+message BindSchemaResponse {
+  SchemaBinding binding = 1;
+  uint64 revision = 2;
+}
+
+message GetBindingRequest {
+  AuthzScope scope = 1;
+}
+
+message GetBindingResponse {
+  SchemaBinding binding = 1;
+}
+
+// Schema lookup is exact: callers obtain a complete immutable reference from
+// PutSchema or GetBinding rather than asking for an implicit latest revision.
+message GetSchemaRequest {
+  SchemaRef schema_ref = 1;
+}
+
+message GetSchemaResponse {
+  SchemaRef schema_ref = 1;
+  repeated NamespaceDefinition namespaces = 2;
+}
+
+message RelationTuple {
+  ObjectRef object = 1;
+  string relation = 2;
+  Subject subject = 3;
+}
+
+message TupleMutation {
+  oneof operation {
+    RelationTuple add = 1;
+    RelationTuple remove = 2;
+  }
+}
+
+// The non-empty batch is one all-or-nothing set mutation in one realm. Add
+// and remove are idempotent. The 0.5 hard limit is 1000 mutations and the
+// operation ID is limited to 128 UTF-8 bytes. Reusing an operation ID with a
+// different canonical input is rejected.
+message MutateTuplesRequest {
+  AuthzScope scope = 1;
+  string operation_id = 2;
+  // When present, this is an exact CAS against the tenant-wide authorization
+  // revision. A mismatch rejects the complete batch.
+  optional uint64 expected_revision = 3;
+  repeated TupleMutation mutations = 4;
+}
+
+message MutateTuplesResponse {
+  // One tenant-wide authorization revision covers the complete batch.
+  uint64 revision = 1;
+  bool replayed = 2;
+  // The operation ID is guaranteed replayable through this instant. Once it
+  // expires, the same ID may be treated as a new operation.
+  google.protobuf.Timestamp replay_guarantee_expires_at = 3;
+}
+
+// Object filters select either one namespace or one exact typed object.
+message ObjectFilter {
+  oneof selection {
+    string namespace = 1;
+    ObjectRef exact = 2;
+  }
+}
+
+// Omitted fields are wildcards. Supplying an exact Subject matches that typed
+// object or userset only.
+message TupleFilter {
+  ObjectFilter object = 1;
+  optional string relation = 2;
+  Subject subject = 3;
+}
+
+message AuthzConsistency {
+  // Latest evaluates the current authoritative revision. AtLeast evaluates
+  // current state only when it has reached the requested revision. Anvil 0.5
+  // retains only current authorization state: Exact(current) succeeds and an
+  // older exact revision fails with AUTHZ_REVISION_EXPIRED.
+  oneof requirement {
+    LatestConsistency latest = 1;
+    AtLeastRevision at_least = 2;
+    ExactRevision exact = 3;
+  }
+}
+
+message LatestConsistency {}
+
+message AtLeastRevision {
+  uint64 revision = 1;
+}
+
+message ExactRevision {
+  uint64 revision = 1;
+}
+
+// An absent consistency value means latest. page_size zero selects the server
+// default of 100; the 0.5 hard maximum is 1000. page_token is opaque and
+// limited to 128 KiB. A returned token pins its continuation to the same
+// filters and revision; a no-longer-current revision fails rather than moving.
+message ReadTuplesRequest {
+  AuthzScope scope = 1;
+  TupleFilter filter = 2;
+  AuthzConsistency consistency = 3;
+  uint32 page_size = 4;
+  string page_token = 5;
+}
+
+message ReadTuplesResponse {
+  repeated RelationTuple tuples = 1;
+  uint64 revision = 2;
+  string next_page_token = 3;
+}
+
+message PermissionCheck {
+  Subject subject = 1;
+  ObjectRef object = 2;
+  // May name either a direct relation or a derived permission.
+  string relation = 3;
+}
+
+message CheckPermissionRequest {
+  AuthzScope scope = 1;
+  PermissionCheck check = 2;
+  AuthzConsistency consistency = 3;
+}
+
+message CheckPermissionResponse {
+  bool allowed = 1;
+  uint64 revision = 2;
+}
+
+message PermissionResult {
+  bool allowed = 1;
+}
+
+// At most 1000 checks. The server pins one authoritative snapshot, so every
+// result is evaluated at the single returned revision and retains input order.
+message CheckPermissionsRequest {
+  AuthzScope scope = 1;
+  repeated PermissionCheck checks = 2;
+  AuthzConsistency consistency = 3;
+}
+
+message CheckPermissionsResponse {
+  repeated PermissionResult results = 1;
+  uint64 revision = 2;
+}

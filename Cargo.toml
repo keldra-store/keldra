@@ -5,23 +5,26 @@ members = [
     "anvil",
     "anvil-cli",
     "clients/rust",
-    "crates/anvil-mvcc-consensus",
-    "crates/anvil-mvcc-raft-model",
-    "documentation",
+    "crates/anvil-api",
+    "crates/anvil-authz",
+    "crates/anvil-atomic-program",
+    "crates/anvil-consensus",
+    "crates/anvil-store",
+    "tools/anvil-osv-qualification",
 ]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 readme = "README.md"
-description = "Native object store, index store, and witness layer"
-keywords = ["object-store", "storage", "search", "authorization"]
+description = "Opaque versioned object storage with bounded atomic programs"
+keywords = ["object-store", "storage", "compare-and-swap", "distributed-systems"]
 categories = ["database-implementations"]
 authors = ["Anvil maintainers <maintainers@anvil.storage>"]
 license = "Apache-2.0"
 homepage = "https://github.com/worka-ai/anvil"
 repository = "https://github.com/worka-ai/anvil"
-documentation = "https://github.com/worka-ai/anvil/tree/main/documentation"
+documentation = "https://github.com/worka-ai/anvil/blob/0.5.0/docs/rfcs/anvil_0009_atomic_programs.md"
 rust-version = "1.96.0"
 
 [profile.ci]

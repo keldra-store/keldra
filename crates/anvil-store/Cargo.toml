@@ -1,0 +1,29 @@
+[package]
+name = "anvil-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "The small versioned object kernel for Anvil"
+publish = false
+
+[dependencies]
+anvil-atomic-program = { path = "../anvil-atomic-program" }
+anvil-authz = { path = "../anvil-authz" }
+anyhow = "1"
+argon2 = "0.5.3"
+base64 = "0.22"
+blake3 = "1.8"
+hex = "0.4"
+getrandom = "0.3"
+rocksdb = { version = "0.24", default-features = false, features = ["bindgen-runtime"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+subtle = "2.6"
+thiserror = "2"
+tokio = { version = "1.47", features = ["fs", "io-util", "sync"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "time"] }

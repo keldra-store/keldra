@@ -1,0 +1,989 @@
+use std::net::{SocketAddr, TcpListener};
+use std::time::{Duration, Instant};
+
+use anvil::authentication::{JwtManager, RateLimitConfig};
+use anvil::{ServerConfig, serve};
+use anvil_api::v1::administration_service_client::AdministrationServiceClient;
+use anvil_api::v1::batch_get_outcome::Outcome as BatchOutcomeValue;
+use anvil_api::v1::bulk_operation::Operation as BulkOperationValue;
+use anvil_api::v1::bulk_outcome::Outcome as BulkOutcomeValue;
+use anvil_api::v1::object_head::State as HeadState;
+use anvil_api::v1::object_service_client::ObjectServiceClient;
+use anvil_api::v1::put_header::Operation as PutOperationValue;
+use anvil_api::v1::watch_message::Message as WatchMessageValue;
+use anvil_api::v1::watch_prefix_request::Start as WatchStart;
+use anvil_api::v1::{
+    BatchGetRequest, BucketPolicy, BulkOperation, BulkPutRequest, BulkWriteRequest,
+    DeleteIfVersionRequest, DeleteRequest, DeleteVersionRequest, Durability, GetObjectRequest,
+    HeadObjectRequest, InvokeProgramRequest, ListObjectVersionsRequest, ListObjectsRequest,
+    MutationFailureCode, ObjectAddress, ObjectVersioning as ApiObjectVersioning, PutHeader,
+    PutIfAbsentOperation, PutIfVersionOperation, PutImmutableOperation, PutOperation, PutRequest,
+    PutToken, SetBucketPolicyRequest, SetBucketVersioningRequest, WatchNow, WatchPrefixRequest,
+    WatchStateHint,
+};
+use anvil_authz::ObjectRef;
+use anvil_store::{
+    AuthzRevision, CreateBucketRequest, ObjectVersioning as StoreObjectVersioning,
+    ProvisionTenantRequest, StorageTenantId, Store, StoreOptions, SystemBootstrapRequest,
+};
+use tempfile::TempDir;
+use tonic::transport::{Channel, Endpoint};
+use tonic::{Code, Request, Response, Status};
+
+const SIGNING_KEY: &[u8] = b"anvil-public-object-surface-test-key";
+const OWNER_SECRET: &str = "owner-secret-0123456789abcdef0123456789abcdef";
+
+#[tokio::test]
+async fn every_object_rpc_rejects_an_unauthenticated_request() {
+    let fixture = Fixture::start().await;
+    let mut client = ObjectServiceClient::new(fixture.channel.clone());
+
+    assert_unauthenticated(client.start_put(PutHeader::default()).await);
+    assert_unauthenticated(
+        client
+            .put(tokio_stream::iter([PutRequest::default()]))
+            .await,
+    );
+    assert_unauthenticated(client.put_end(PutToken::default()).await);
+    assert_unauthenticated(client.delete(DeleteRequest::default()).await);
+    assert_unauthenticated(
+        client
+            .delete_if_version(DeleteIfVersionRequest::default())
+            .await,
+    );
+    assert_unauthenticated(client.delete_version(DeleteVersionRequest::default()).await);
+    assert_unauthenticated(client.head_object(HeadObjectRequest::default()).await);
+    assert_unauthenticated(client.list_objects(ListObjectsRequest::default()).await);
+    assert_unauthenticated(client.get_object(GetObjectRequest::default()).await);
+    assert_unauthenticated(
+        client
+            .list_object_versions(ListObjectVersionsRequest::default())
+            .await,
+    );
+    assert_unauthenticated(client.bulk_write(BulkWriteRequest::default()).await);
+    assert_unauthenticated(client.batch_get(BatchGetRequest::default()).await);
+    assert_unauthenticated(client.watch_prefix(WatchPrefixRequest::default()).await);
+    assert_unauthenticated(
+        client
+            .set_bucket_policy(SetBucketPolicyRequest::default())
+            .await,
+    );
+    assert_unauthenticated(client.invoke_program(InvokeProgramRequest::default()).await);
+
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn explicit_put_modes_cas_delete_head_batch_bulk_and_list_work_over_grpc() {
+    let fixture = Fixture::start().await;
+    let mut client = ObjectServiceClient::new(fixture.channel.clone());
+    let token = fixture.access_token.as_str();
+
+    let never = head(&mut client, &address("head/never"), token).await;
+    assert!(matches!(never.state, Some(HeadState::NeverExisted(_))));
+
+    let put_address = address("modes/put");
+    let put_first = put_object(
+        &mut client,
+        token,
+        put_address.clone(),
+        b"one",
+        "mode-put-one",
+        PutOperationValue::Put(PutOperation {}),
+    )
+    .await
+    .unwrap();
+    let put_second = put_object(
+        &mut client,
+        token,
+        put_address.clone(),
+        b"two",
+        "mode-put-two",
+        PutOperationValue::Put(PutOperation {}),
+    )
+    .await
+    .unwrap();
+    assert!(put_second.version > put_first.version);
+    let present = assert_present(head(&mut client, &put_address, token).await);
+    assert_eq!(present.version, put_second.version);
+    assert_eq!(present.content_length, 3);
+
+    let absent_address = address("modes/if-absent");
+    let absent = put_object(
+        &mut client,
+        token,
+        absent_address.clone(),
+        b"created",
+        "mode-absent-one",
+        PutOperationValue::PutIfAbsent(PutIfAbsentOperation {}),
+    )
+    .await
+    .unwrap();
+    let condition = put_object(
+        &mut client,
+        token,
+        absent_address,
+        b"must-not-replace",
+        "mode-absent-two",
+        PutOperationValue::PutIfAbsent(PutIfAbsentOperation {}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(condition.code(), Code::FailedPrecondition);
+
+    let cas_address = address("modes/if-version");
+    let cas_base = put_object(
+        &mut client,
+        token,
+        cas_address.clone(),
+        b"base",
+        "mode-cas-base",
+        PutOperationValue::Put(PutOperation {}),
+    )
+    .await
+    .unwrap();
+    let cas = put_object(
+        &mut client,
+        token,
+        cas_address.clone(),
+        b"replacement",
+        "mode-cas-replace",
+        PutOperationValue::PutIfVersion(PutIfVersionOperation {
+            expected_version: cas_base.version,
+        }),
+    )
+    .await
+    .unwrap();
+    let stale = put_object(
+        &mut client,
+        token,
+        cas_address,
+        b"stale",
+        "mode-cas-stale",
+        PutOperationValue::PutIfVersion(PutIfVersionOperation {
+            expected_version: cas_base.version,
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(stale.code(), Code::FailedPrecondition);
+    assert!(cas.version > cas_base.version);
+
+    let policy = client
+        .set_bucket_policy(authorized(
+            SetBucketPolicyRequest {
+                tenant: "acme".into(),
+                bucket: "objects".into(),
+                policy: Some(BucketPolicy {
+                    immutable_path_prefixes: vec!["immutable".into()],
+                    program_only_path_prefixes: Vec::new(),
+                }),
+            },
+            token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(policy.immutable_path_prefixes, ["immutable"]);
+    let immutable_address = address("immutable/entry");
+    let immutable = put_object(
+        &mut client,
+        token,
+        immutable_address.clone(),
+        b"write-once",
+        "mode-immutable-one",
+        PutOperationValue::PutImmutable(PutImmutableOperation {}),
+    )
+    .await
+    .unwrap();
+    let identical = put_object(
+        &mut client,
+        token,
+        immutable_address.clone(),
+        b"write-once",
+        "mode-immutable-identical",
+        PutOperationValue::PutImmutable(PutImmutableOperation {}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(identical.version, immutable.version);
+    assert!(identical.replayed);
+    let immutable_conflict = put_object(
+        &mut client,
+        token,
+        immutable_address,
+        b"different",
+        "mode-immutable-different",
+        PutOperationValue::PutImmutable(PutImmutableOperation {}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(immutable_conflict.code(), Code::FailedPrecondition);
+
+    let delete_address = address("delete/cas");
+    let before_delete = put_object(
+        &mut client,
+        token,
+        delete_address.clone(),
+        b"delete me",
+        "delete-cas-create",
+        PutOperationValue::Put(PutOperation {}),
+    )
+    .await
+    .unwrap();
+    let deleted = client
+        .delete_if_version(authorized(
+            DeleteIfVersionRequest {
+                address: Some(delete_address.clone()),
+                command_id: "delete-cas-exact".into(),
+                durability: Durability::Local as i32,
+                expected_version: before_delete.version,
+            },
+            token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(deleted.deleted);
+    assert!(deleted.version > before_delete.version);
+    assert_eq!(
+        assert_deleted(head(&mut client, &delete_address, token).await),
+        deleted.version
+    );
+    let stale_delete = client
+        .delete_if_version(authorized(
+            DeleteIfVersionRequest {
+                address: Some(delete_address.clone()),
+                command_id: "delete-cas-stale".into(),
+                durability: Durability::Local as i32,
+                expected_version: before_delete.version,
+            },
+            token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(stale_delete.code(), Code::FailedPrecondition);
+    let recreated = put_object(
+        &mut client,
+        token,
+        delete_address.clone(),
+        b"recreated",
+        "delete-cas-recreate",
+        PutOperationValue::PutIfVersion(PutIfVersionOperation {
+            expected_version: deleted.version,
+        }),
+    )
+    .await
+    .unwrap();
+    let unconditional = client
+        .delete(authorized(
+            DeleteRequest {
+                address: Some(delete_address.clone()),
+                command_id: "delete-unconditional".into(),
+                durability: Durability::Local as i32,
+            },
+            token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(unconditional.deleted);
+    assert!(unconditional.version > recreated.version);
+
+    let batch_live_address = address("batch/live");
+    put_object(
+        &mut client,
+        token,
+        batch_live_address.clone(),
+        b"batch-live",
+        "batch-live-put",
+        PutOperationValue::Put(PutOperation {}),
+    )
+    .await
+    .unwrap();
+    let batch_deleted_address = address("batch/deleted");
+    put_object(
+        &mut client,
+        token,
+        batch_deleted_address.clone(),
+        b"batch-deleted",
+        "batch-deleted-put",
+        PutOperationValue::Put(PutOperation {}),
+    )
+    .await
+    .unwrap();
+    client
+        .delete(authorized(
+            DeleteRequest {
+                address: Some(batch_deleted_address.clone()),
+                command_id: "batch-deleted-delete".into(),
+                durability: Durability::Local as i32,
+            },
+            token,
+        ))
+        .await
+        .unwrap();
+    let batch_never_address = address("batch/never");
+    let batch = client
+        .batch_get(authorized(
+            BatchGetRequest {
+                objects: vec![
+                    GetObjectRequest {
+                        address: Some(batch_live_address.clone()),
+                        version: None,
+                    },
+                    GetObjectRequest {
+                        address: Some(batch_deleted_address.clone()),
+                        version: None,
+                    },
+                    GetObjectRequest {
+                        address: Some(batch_never_address),
+                        version: None,
+                    },
+                ],
+            },
+            token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(batch.outcomes.len(), 3);
+    for (expected, outcome) in batch.outcomes.iter().enumerate() {
+        assert_eq!(outcome.index, expected as u32);
+    }
+    let Some(BatchOutcomeValue::Object(live)) = batch.outcomes[0].outcome.as_ref() else {
+        panic!("live batch read did not return an object");
+    };
+    assert_eq!(live.bytes, b"batch-live");
+    assert!(matches!(
+        live.head.as_ref().and_then(|head| head.state.as_ref()),
+        Some(HeadState::Present(_))
+    ));
+    let Some(BatchOutcomeValue::Object(deleted)) = batch.outcomes[1].outcome.as_ref() else {
+        panic!("deleted batch read did not return an object state");
+    };
+    assert!(deleted.bytes.is_empty());
+    assert!(matches!(
+        deleted.head.as_ref().and_then(|head| head.state.as_ref()),
+        Some(HeadState::Deleted(_))
+    ));
+    let Some(BatchOutcomeValue::Object(never)) = batch.outcomes[2].outcome.as_ref() else {
+        panic!("never-existed batch read did not return an object state");
+    };
+    assert!(never.bytes.is_empty());
+    assert!(matches!(
+        never.head.as_ref().and_then(|head| head.state.as_ref()),
+        Some(HeadState::NeverExisted(_))
+    ));
+
+    let bulk_existing_address = address("bulk/existing");
+    let bulk_existing = put_object(
+        &mut client,
+        token,
+        bulk_existing_address.clone(),
+        b"existing",
+        "bulk-existing-seed",
+        PutOperationValue::Put(PutOperation {}),
+    )
+    .await
+    .unwrap();
+    let bulk_new_address = address("bulk/new");
+    let bulk = client
+        .bulk_write(authorized(
+            BulkWriteRequest {
+                operations: vec![
+                    BulkOperation {
+                        operation: Some(BulkOperationValue::Put(bulk_put(
+                            bulk_new_address.clone(),
+                            b"new",
+                            "bulk-new-put",
+                        ))),
+                    },
+                    BulkOperation {
+                        operation: Some(BulkOperationValue::PutIfAbsent(bulk_put(
+                            bulk_existing_address.clone(),
+                            b"must-fail",
+                            "bulk-existing-absent",
+                        ))),
+                    },
+                    BulkOperation {
+                        operation: Some(BulkOperationValue::DeleteIfVersion(
+                            DeleteIfVersionRequest {
+                                address: Some(bulk_existing_address.clone()),
+                                command_id: "bulk-existing-delete".into(),
+                                durability: Durability::Local as i32,
+                                expected_version: bulk_existing.version,
+                            },
+                        )),
+                    },
+                ],
+            },
+            token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(bulk.outcomes.len(), 3);
+    let Some(BulkOutcomeValue::Receipt(created)) = bulk.outcomes[0].outcome.as_ref() else {
+        panic!("first independent bulk operation did not commit");
+    };
+    assert!(!created.deleted);
+    let Some(BulkOutcomeValue::Failure(failure)) = bulk.outcomes[1].outcome.as_ref() else {
+        panic!("failing independent bulk operation did not report a failure");
+    };
+    assert_eq!(
+        MutationFailureCode::try_from(failure.code).unwrap(),
+        MutationFailureCode::ConditionFailed
+    );
+    let Some(BulkOutcomeValue::Receipt(deleted)) = bulk.outcomes[2].outcome.as_ref() else {
+        panic!("third independent bulk operation did not commit");
+    };
+    assert!(deleted.deleted);
+    assert!(matches!(
+        head(&mut client, &bulk_new_address, token).await.state,
+        Some(HeadState::Present(_))
+    ));
+    assert!(matches!(
+        head(&mut client, &bulk_existing_address, token).await.state,
+        Some(HeadState::Deleted(_))
+    ));
+
+    for (path, command) in [
+        ("list/alpha", "list-alpha"),
+        ("list/bravo", "list-bravo"),
+        ("list/charlie", "list-charlie"),
+        ("list/delta", "list-delta"),
+        ("outside/echo", "list-outside"),
+    ] {
+        put_object(
+            &mut client,
+            token,
+            address(path),
+            path.as_bytes(),
+            command,
+            PutOperationValue::Put(PutOperation {}),
+        )
+        .await
+        .unwrap();
+    }
+    client
+        .delete(authorized(
+            DeleteRequest {
+                address: Some(address("list/bravo")),
+                command_id: "list-bravo-delete".into(),
+                durability: Durability::Local as i32,
+            },
+            token,
+        ))
+        .await
+        .unwrap();
+    let first_page = client
+        .list_objects(authorized(
+            ListObjectsRequest {
+                tenant: "acme".into(),
+                bucket: "objects".into(),
+                prefix: "list/".into(),
+                start_after: None,
+                limit: 2,
+            },
+            token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(first_page.paths, ["list/alpha", "list/charlie"]);
+    assert!(first_page.has_more);
+    let second_page = client
+        .list_objects(authorized(
+            ListObjectsRequest {
+                tenant: "acme".into(),
+                bucket: "objects".into(),
+                prefix: "list/".into(),
+                start_after: first_page.paths.last().cloned(),
+                limit: 2,
+            },
+            token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(second_page.paths, ["list/delta"]);
+    assert!(!second_page.has_more);
+
+    assert_ne!(absent.version, 0);
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn versioned_delete_version_never_resurrects_an_older_payload() {
+    let fixture = Fixture::start().await;
+    let token = fixture.access_token.as_str();
+    let mut administration = AdministrationServiceClient::new(fixture.channel.clone());
+    let enabled = administration
+        .set_bucket_versioning(authorized(
+            SetBucketVersioningRequest {
+                bucket: "objects".into(),
+                versioning: ApiObjectVersioning::Enabled as i32,
+            },
+            token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(enabled.changed);
+    assert_eq!(enabled.versioning, ApiObjectVersioning::Enabled as i32);
+
+    let mut client = ObjectServiceClient::new(fixture.channel.clone());
+    let object = address("versioned/document");
+    let first = put_object(
+        &mut client,
+        token,
+        object.clone(),
+        b"first",
+        "versioned-first",
+        PutOperationValue::Put(PutOperation {}),
+    )
+    .await
+    .unwrap();
+    let second = put_object(
+        &mut client,
+        token,
+        object.clone(),
+        b"second",
+        "versioned-second",
+        PutOperationValue::Put(PutOperation {}),
+    )
+    .await
+    .unwrap();
+    assert!(second.version > first.version);
+    assert_eq!(
+        list_version_ids(&mut client, &object, token).await,
+        [first.version, second.version]
+    );
+
+    let non_current = client
+        .delete_version(authorized(
+            DeleteVersionRequest {
+                address: Some(object.clone()),
+                version: first.version,
+                durability: Durability::Local as i32,
+            },
+            token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(non_current.deleted);
+    assert_eq!(non_current.replacement_tombstone_version, None);
+    assert_eq!(
+        assert_present(head(&mut client, &object, token).await).version,
+        second.version
+    );
+
+    let current = client
+        .delete_version(authorized(
+            DeleteVersionRequest {
+                address: Some(object.clone()),
+                version: second.version,
+                durability: Durability::Local as i32,
+            },
+            token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(current.deleted);
+    let tombstone = current
+        .replacement_tombstone_version
+        .expect("deleting the live head must publish a replacement tombstone");
+    assert!(tombstone > second.version);
+    assert_eq!(
+        assert_deleted(head(&mut client, &object, token).await),
+        tombstone
+    );
+    assert_eq!(
+        list_version_ids(&mut client, &object, token).await,
+        [tombstone]
+    );
+
+    let fence = client
+        .delete_version(authorized(
+            DeleteVersionRequest {
+                address: Some(object.clone()),
+                version: tombstone,
+                durability: Durability::Local as i32,
+            },
+            token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(fence.code(), Code::FailedPrecondition);
+    assert!(fence.message().contains("CURRENT_TOMBSTONE"));
+    assert_eq!(
+        assert_deleted(head(&mut client, &object, token).await),
+        tombstone
+    );
+
+    let missing = client
+        .delete_version(authorized(
+            DeleteVersionRequest {
+                address: Some(object),
+                version: u64::MAX,
+                durability: Durability::Local as i32,
+            },
+            token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!missing.deleted);
+    assert_eq!(missing.replacement_tombstone_version, None);
+
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn watch_prefix_streams_present_and_deleted_invalidations_with_checkpoints() {
+    let fixture = Fixture::start().await;
+    let token = fixture.access_token.as_str();
+    let watched = address("watched/item");
+    let mut watch_client = ObjectServiceClient::new(fixture.channel.clone());
+    let mut writer = ObjectServiceClient::new(fixture.channel.clone());
+    let mut watch = watch_client
+        .watch_prefix(authorized(
+            WatchPrefixRequest {
+                prefix: Some(address("watched")),
+                start: Some(WatchStart::Now(WatchNow {})),
+            },
+            token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+
+    let initial_checkpoint = checkpoint(next_watch(&mut watch).await);
+    assert!(!initial_checkpoint.is_empty());
+    let created = put_object(
+        &mut writer,
+        token,
+        watched.clone(),
+        b"watched",
+        "watch-create",
+        PutOperationValue::Put(PutOperation {}),
+    )
+    .await
+    .unwrap();
+    let present = invalidation(next_watch(&mut watch).await);
+    assert_eq!(present.address, Some(watched.clone()));
+    assert_eq!(present.minimum_path_version, created.version);
+    assert_eq!(
+        WatchStateHint::try_from(present.state_hint).unwrap(),
+        WatchStateHint::Present
+    );
+    let resume_token = checkpoint(next_watch(&mut watch).await);
+    assert!(!resume_token.is_empty());
+    drop(watch);
+
+    let mut resumed = watch_client
+        .watch_prefix(authorized(
+            WatchPrefixRequest {
+                prefix: Some(address("watched")),
+                start: Some(WatchStart::ResumeToken(resume_token)),
+            },
+            token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!checkpoint(next_watch(&mut resumed).await).is_empty());
+    let deleted = writer
+        .delete(authorized(
+            DeleteRequest {
+                address: Some(watched.clone()),
+                command_id: "watch-delete".into(),
+                durability: Durability::Local as i32,
+            },
+            token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let invalidated = invalidation(next_watch(&mut resumed).await);
+    assert_eq!(invalidated.address, Some(watched));
+    assert_eq!(invalidated.minimum_path_version, deleted.version);
+    assert_eq!(
+        WatchStateHint::try_from(invalidated.state_hint).unwrap(),
+        WatchStateHint::Deleted
+    );
+    assert!(!checkpoint(next_watch(&mut resumed).await).is_empty());
+
+    fixture.stop().await;
+}
+
+struct Fixture {
+    _directory: TempDir,
+    channel: Channel,
+    access_token: String,
+    server: tokio::task::JoinHandle<anyhow::Result<()>>,
+}
+
+impl Fixture {
+    async fn start() -> Self {
+        let directory = tempfile::tempdir().unwrap();
+        seed_authorized_bucket(&directory).await;
+        let token_manager = JwtManager::new(SIGNING_KEY).unwrap();
+        let access_token = token_manager
+            .mint(StorageTenantId::parse("acme").unwrap(), "owner-app")
+            .unwrap();
+        let listen = unused_loopback_address();
+        let server = tokio::spawn(serve(test_server_config(&directory, listen, token_manager)));
+        let channel = connect_when_ready(listen).await;
+        Self {
+            _directory: directory,
+            channel,
+            access_token,
+            server,
+        }
+    }
+
+    async fn stop(self) {
+        self.server.abort();
+        let _ = self.server.await;
+    }
+}
+
+async fn seed_authorized_bucket(directory: &TempDir) {
+    let store = Store::open(StoreOptions::new(directory.path(), 1))
+        .await
+        .unwrap();
+    store
+        .bootstrap_system(SystemBootstrapRequest {
+            app_id: "bootstrap-app".into(),
+            client_id: "bootstrap-client".into(),
+            client_secret: "bootstrap-secret-0123456789abcdef0123456789abcdef".into(),
+        })
+        .unwrap();
+    let owner = ObjectRef::opaque("app", "owner-app").unwrap();
+    store
+        .provision_tenant(ProvisionTenantRequest {
+            storage_tenant: StorageTenantId::parse("acme").unwrap(),
+            owner_app_id: "owner-app".into(),
+            owner_client_id: "owner-client".into(),
+            owner_client_secret: OWNER_SECRET.into(),
+            principal: ObjectRef::opaque("app", "bootstrap-app").unwrap(),
+            expected_authorization_revision: AuthzRevision(3),
+            expected_binding_generation: 1,
+        })
+        .unwrap();
+    store
+        .create_bucket(CreateBucketRequest {
+            storage_tenant: StorageTenantId::parse("acme").unwrap(),
+            bucket: "objects".into(),
+            owner: owner.clone(),
+            principal: owner,
+            expected_authorization_revision: AuthzRevision(4),
+            expected_binding_generation: 1,
+            versioning: StoreObjectVersioning::Unversioned,
+        })
+        .unwrap();
+}
+
+fn test_server_config(
+    directory: &TempDir,
+    listen: SocketAddr,
+    token_manager: JwtManager,
+) -> ServerConfig {
+    ServerConfig {
+        listen,
+        data_dir: directory.path().to_owned(),
+        run_system_bootstrap: false,
+        system_bootstrap_credential_output: None,
+        node_id: 1,
+        max_atomic_commit_entries: 128,
+        max_atomic_commit_bytes: 1024 * 1024,
+        atomic_program_timeout: Duration::from_secs(30),
+        token_manager,
+        rate_limits: RateLimitConfig::default(),
+        max_blob_bytes: 1024 * 1024,
+        awaiting_publish_ttl_seconds: anvil_store::DEFAULT_AWAITING_PUBLISH_TTL_SECONDS,
+        mutation_receipt_retention_seconds: 60,
+        max_mutation_receipt_entries: 512,
+        max_mutation_receipt_bytes: 1024 * 1024,
+        watch_max_entries: 512,
+        watch_max_bytes: 1024 * 1024,
+    }
+}
+
+fn unused_loopback_address() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap()
+}
+
+async fn connect_when_ready(listen: SocketAddr) -> Channel {
+    let endpoint = Endpoint::from_shared(format!("http://{listen}"))
+        .unwrap()
+        .connect_timeout(Duration::from_millis(100));
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        match endpoint.clone().connect().await {
+            Ok(channel) => return channel,
+            Err(_) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(error) => panic!("Anvil test server did not start: {error}"),
+        }
+    }
+}
+
+fn authorized<T>(value: T, access_token: &str) -> Request<T> {
+    let mut request = Request::new(value);
+    request.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {access_token}").parse().unwrap(),
+    );
+    request
+}
+
+fn assert_unauthenticated<T>(result: Result<Response<T>, Status>) {
+    match result {
+        Ok(_) => panic!("protected object RPC accepted an unauthenticated request"),
+        Err(status) => assert_eq!(status.code(), Code::Unauthenticated),
+    }
+}
+
+fn address(path: &str) -> ObjectAddress {
+    ObjectAddress {
+        tenant: "acme".into(),
+        bucket: "objects".into(),
+        path: path.into(),
+    }
+}
+
+async fn put_object(
+    client: &mut ObjectServiceClient<Channel>,
+    access_token: &str,
+    address: ObjectAddress,
+    bytes: &[u8],
+    command_id: &str,
+    operation: PutOperationValue,
+) -> Result<anvil_api::v1::MutationReceipt, Status> {
+    let upload = client
+        .start_put(authorized(
+            PutHeader {
+                address: Some(address),
+                content_type: "application/octet-stream".into(),
+                command_id: command_id.into(),
+                durability: Durability::Local as i32,
+                operation: Some(operation),
+            },
+            access_token,
+        ))
+        .await?
+        .into_inner();
+    let ready = client
+        .put(authorized(
+            tokio_stream::iter([PutRequest {
+                token: Some(upload),
+                chunk: bytes.to_vec(),
+            }]),
+            access_token,
+        ))
+        .await?
+        .into_inner();
+    client
+        .put_end(authorized(ready, access_token))
+        .await
+        .map(Response::into_inner)
+}
+
+async fn head(
+    client: &mut ObjectServiceClient<Channel>,
+    address: &ObjectAddress,
+    access_token: &str,
+) -> anvil_api::v1::ObjectHead {
+    client
+        .head_object(authorized(
+            HeadObjectRequest {
+                address: Some(address.clone()),
+            },
+            access_token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+}
+
+fn assert_present(head: anvil_api::v1::ObjectHead) -> anvil_api::v1::PresentObject {
+    let Some(HeadState::Present(present)) = head.state else {
+        panic!("object head was not present");
+    };
+    present
+}
+
+fn assert_deleted(head: anvil_api::v1::ObjectHead) -> u64 {
+    let Some(HeadState::Deleted(deleted)) = head.state else {
+        panic!("object head was not deleted");
+    };
+    deleted.version
+}
+
+fn bulk_put(address: ObjectAddress, bytes: &[u8], command_id: &str) -> BulkPutRequest {
+    BulkPutRequest {
+        address: Some(address),
+        bytes: bytes.to_vec(),
+        content_type: "application/octet-stream".into(),
+        command_id: command_id.into(),
+        durability: Durability::Local as i32,
+    }
+}
+
+async fn list_version_ids(
+    client: &mut ObjectServiceClient<Channel>,
+    address: &ObjectAddress,
+    access_token: &str,
+) -> Vec<u64> {
+    let mut stream = client
+        .list_object_versions(authorized(
+            ListObjectVersionsRequest {
+                address: Some(address.clone()),
+            },
+            access_token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut versions = Vec::new();
+    while let Some(version) = stream.message().await.unwrap() {
+        let id = match version.state {
+            Some(anvil_api::v1::object_version::State::Present(present)) => present.version,
+            Some(anvil_api::v1::object_version::State::Deleted(deleted)) => deleted.version,
+            None => panic!("version stream returned an empty state"),
+        };
+        versions.push(id);
+    }
+    versions
+}
+
+async fn next_watch(
+    stream: &mut tonic::Streaming<anvil_api::v1::WatchMessage>,
+) -> anvil_api::v1::WatchMessage {
+    tokio::time::timeout(Duration::from_secs(5), stream.message())
+        .await
+        .expect("watch message timed out")
+        .expect("watch stream failed")
+        .expect("watch stream ended")
+}
+
+fn checkpoint(message: anvil_api::v1::WatchMessage) -> Vec<u8> {
+    let Some(WatchMessageValue::Checkpoint(checkpoint)) = message.message else {
+        panic!("watch message was not a checkpoint");
+    };
+    checkpoint.resume_token
+}
+
+fn invalidation(message: anvil_api::v1::WatchMessage) -> anvil_api::v1::WatchInvalidation {
+    let Some(WatchMessageValue::Invalidation(invalidation)) = message.message else {
+        panic!("watch message was not an invalidation");
+    };
+    invalidation
+}

@@ -1,330 +1,217 @@
-#![recursion_limit = "512"]
+mod administration_service;
+pub mod authentication;
+mod authorization;
+mod authz_api;
+mod authz_service;
+mod bootstrap;
+mod credential_service;
+pub mod observability;
+mod programs;
+mod v05;
 
-use anyhow::Result;
-use axum::ServiceExt;
-use axum::serve::ListenerExt;
-use once_cell::sync::OnceCell;
-use std::time::Instant;
-use tonic::service;
-use tower::ServiceExt as TowerServiceExt;
-use tracing::{error, info};
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::time::Duration;
 
-// Re-export the core types for the binary and services to use.
-pub use anvil_core::*;
+use anvil_api::v1::administration_service_server::AdministrationServiceServer;
+use anvil_api::v1::authz_service_server::AuthzServiceServer;
+use anvil_api::v1::credential_service_server::CredentialServiceServer;
+use anvil_api::v1::object_service_server::ObjectServiceServer;
+use anvil_consensus::ATOMIC_REPLAY_RETENTION_MILLIS;
+use anvil_store::{MutationReceiptRetention, Store, StoreOptions, WatchRetention};
+use anyhow::{Context, Result};
+use tonic::transport::Server;
 
-// Modules that remain in the main anvil crate
-pub mod s3_gateway;
+use authentication::{JwtManager, RateLimitConfig, RequestRateLimits};
 
-pub mod s3_auth;
-mod startup_readiness;
+pub use v05::ObjectServiceImpl;
 
-pub async fn run(
-    listener: tokio::net::TcpListener,
-    admin_listener: tokio::net::TcpListener,
-    config: anvil_core::config::Config,
-) -> Result<()> {
-    config.validate_admin_listener_bind()?;
-    let personaldb_protocol_keyring =
-        anvil_core::personaldb_signing::PersonalDbProtocolKeyring::disabled();
-    let state = AppState::new(config, personaldb_protocol_keyring).await?;
+const MAX_GRPC_MESSAGE_BYTES: usize = 72 * 1024 * 1024;
+const BLOB_GC_INTERVAL: Duration = Duration::from_secs(60 * 60);
+// A maximum 1,000-item authorization batch can contain two maximum-size exact
+// paths per tuple plus identifiers and protobuf framing.
+const MIN_AUTHZ_BATCH_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+const _: () = assert!(MAX_GRPC_MESSAGE_BYTES >= MIN_AUTHZ_BATCH_MESSAGE_BYTES);
 
-    // Then start the node
-    start_node_with_admin_listener(listener, Some(admin_listener), state).await
+#[derive(Clone, Debug)]
+pub struct ServerConfig {
+    pub listen: SocketAddr,
+    pub data_dir: PathBuf,
+    pub run_system_bootstrap: bool,
+    pub system_bootstrap_credential_output: Option<PathBuf>,
+    pub node_id: u16,
+    pub max_atomic_commit_entries: u32,
+    pub max_atomic_commit_bytes: u64,
+    pub atomic_program_timeout: Duration,
+    pub token_manager: JwtManager,
+    pub rate_limits: RateLimitConfig,
+    pub max_blob_bytes: u64,
+    pub awaiting_publish_ttl_seconds: u64,
+    pub mutation_receipt_retention_seconds: u64,
+    pub max_mutation_receipt_entries: u64,
+    pub max_mutation_receipt_bytes: u64,
+    pub watch_max_entries: u64,
+    pub watch_max_bytes: u64,
 }
 
-pub async fn start_node(listener: tokio::net::TcpListener, state: AppState) -> Result<()> {
-    start_node_with_admin_listener(listener, None, state).await
+pub async fn serve(config: ServerConfig) -> Result<()> {
+    anyhow::ensure!(
+        !config.atomic_program_timeout.is_zero()
+            && tokio::time::Instant::now()
+                .checked_add(config.atomic_program_timeout)
+                .is_some(),
+        "atomic program timeout must be greater than zero and fit the server clock"
+    );
+    validate_atomic_replay_gc(config.awaiting_publish_ttl_seconds)?;
+    let watch_retention = WatchRetention::new(config.watch_max_entries, config.watch_max_bytes)
+        .context("validate watch retention")?;
+    let mutation_receipt_retention = MutationReceiptRetention::new(
+        config.mutation_receipt_retention_seconds,
+        config.max_mutation_receipt_entries,
+        config.max_mutation_receipt_bytes,
+    )
+    .context("validate mutation receipt retention")?;
+    let store = Store::open(
+        StoreOptions::new(&config.data_dir, config.node_id)
+            .with_watch_retention(watch_retention)
+            .with_mutation_receipt_retention(mutation_receipt_retention)
+            .with_awaiting_publish_ttl_seconds(config.awaiting_publish_ttl_seconds),
+    )
+    .await
+    .with_context(|| format!("open Anvil data at {}", config.data_dir.display()))?;
+    bootstrap::enforce(
+        &store,
+        &config.data_dir,
+        config.run_system_bootstrap,
+        config.system_bootstrap_credential_output.as_deref(),
+    )
+    .await?;
+    let authz_repository = store.authz();
+    let programs = programs::ProgramCoordinator::open(
+        store.clone(),
+        &config.data_dir,
+        u64::from(config.node_id),
+        config.max_atomic_commit_entries,
+        config.max_atomic_commit_bytes,
+    )
+    .await?;
+    // A committed bundle may have spent longer than the inactivity grace on
+    // disk while this process was down. Recovery must pin/finalize every Raft
+    // decision before startup GC considers ordinary awaiting blobs.
+    collect_blob_garbage(&store, "startup").await;
+    let object_service = ObjectServiceImpl::new(
+        store.clone(),
+        programs.clone(),
+        config.token_manager.clone(),
+        config.max_blob_bytes,
+        config.atomic_program_timeout,
+    );
+    let authz_service = authz_service::AuthzServiceImpl::new(authz_repository);
+    let administration_service =
+        administration_service::AdministrationServiceImpl::new(store.clone());
+    let request_rate_limits = RequestRateLimits::new(config.rate_limits);
+    let credential_service = credential_service::CredentialServiceImpl::new(
+        store.clone(),
+        config.token_manager.clone(),
+        request_rate_limits.clone(),
+    );
+    let object_service = ObjectServiceServer::new(object_service)
+        .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+        .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES);
+    let authz_service = AuthzServiceServer::new(authz_service)
+        .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+        .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES);
+    let tokens = config.token_manager;
+    let authenticate =
+        move |request: tonic::Request<()>| request_rate_limits.authenticate(&tokens, request);
+    let object_service =
+        tonic::service::interceptor::InterceptedService::new(object_service, authenticate.clone());
+    let authz_service =
+        tonic::service::interceptor::InterceptedService::new(authz_service, authenticate.clone());
+    let administration_service = tonic::service::interceptor::InterceptedService::new(
+        AdministrationServiceServer::new(administration_service),
+        authenticate,
+    );
+
+    let blob_gc_task = spawn_blob_gc(store);
+    tracing::info!(address = %config.listen, "Anvil 0.5 server listening");
+    let server_result = Server::builder()
+        .add_service(object_service)
+        .add_service(authz_service)
+        .add_service(administration_service)
+        // Deliberately not intercepted: this one service exchanges durable
+        // long-lived credentials for the bearer token used everywhere else.
+        .add_service(CredentialServiceServer::new(credential_service))
+        .serve_with_shutdown(config.listen, async {
+            if let Err(error) = tokio::signal::ctrl_c().await {
+                tracing::error!(%error, "failed to install shutdown signal");
+            }
+        })
+        .await;
+    blob_gc_task.abort();
+    if let Err(error) = blob_gc_task.await {
+        if !error.is_cancelled() {
+            tracing::error!(%error, "blob garbage-collection task stopped unexpectedly");
+        }
+    }
+    let shutdown_result = programs.shutdown().await;
+    server_result?;
+    shutdown_result
 }
 
-pub async fn start_node_with_admin_listener(
-    listener: tokio::net::TcpListener,
-    admin_listener: Option<tokio::net::TcpListener>,
-    state: AppState,
-) -> Result<()> {
-    // MVCC/OpenRaft bootstrap completed before AppState was returned. Public
-    // traffic remains closed until local ordered apply has caught up and the
-    // cluster-local system realm is visible.
-    let distributed_coremeta_recovery = state.config.requires_distributed_coremeta_recovery();
-    let _coremeta_recovery_task = state
-        .core_store
-        .start_coremeta_distributed_recovery(distributed_coremeta_recovery);
-    if distributed_coremeta_recovery {
-        let background_state = state.clone();
-        tokio::spawn(async move {
-            background_state
-                .core_store
-                .wait_for_coremeta_recovery_ready()
-                .await;
-            if let Err(error) = background_state.mvcc.start_background_work(
-                background_state.core_store.clone(),
-                background_state.observability.clone(),
-            ) {
-                error!(%error, "deferred MVCC background work failed to start");
-            }
-        });
-    }
-    let persisted_system_realm_ready = state.system_realm_is_bootstrapped()?;
-    // On a distributed node the marker alone is not enough: an existing
-    // marker still runs schema upgrade work, which can write CoreStore data.
-    // Re-admit it only after local CoreMeta history has reconciled.
-    let system_realm_ready = persisted_system_realm_ready && !distributed_coremeta_recovery;
-    let public_readiness =
-        startup_readiness::PublicReadiness::new(system_realm_ready, state.mvcc.clone());
-    let consensus_readiness = public_readiness.clone();
-    let consensus_mvcc = state.mvcc.clone();
-    tokio::spawn(async move {
-        loop {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                consensus_mvcc.confirm_cluster_commit_barrier(),
-            )
-            .await
-            {
-                Ok(Ok(commit_version)) => {
-                    while !consensus_mvcc.apply_worker_is_ready_at(commit_version) {
-                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                    }
-                    consensus_readiness.mark_consensus_ready(commit_version);
-                    break;
-                }
-                Ok(Err(error)) => {
-                    tracing::debug!(%error, "cluster readiness barrier is unavailable");
-                }
-                Err(_) => {
-                    tracing::debug!("cluster readiness barrier timed out");
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        }
-    });
-    if distributed_coremeta_recovery || !system_realm_ready {
-        let startup_state = state.clone();
-        let startup_readiness = public_readiness.clone();
-        tokio::spawn(async move {
-            loop {
-                if distributed_coremeta_recovery {
-                    // A persisted MVCC marker remains the public readiness
-                    // authority. Its idempotent schema upgrade must nevertheless
-                    // wait until local CoreMeta history is safe to extend.
-                    startup_state
-                        .core_store
-                        .wait_for_coremeta_recovery_ready()
-                        .await;
-                }
-                match startup_state.ensure_system_realm_bootstrapped().await {
-                    Ok(()) => {
-                        startup_readiness.mark_system_realm_ready();
-                        break;
-                    }
-                    Err(error) => {
-                        error!(%error, "deferred system realm bootstrap failed");
-                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                    }
-                }
-            }
-        });
-    }
-
-    if state.config.run_background_worker {
-        let worker_state = state.clone();
-        let worker_readiness = public_readiness.clone();
-        tokio::spawn(async move {
-            // Raft/MVCC and system-realm readiness admit the public plane.
-            // CoreStore maintenance additionally requires its local streamed
-            // metadata history to be reconciled before it replays durable
-            // jobs from a same-disk restart.
-            worker_readiness.wait_until_ready().await;
-            if distributed_coremeta_recovery {
-                worker_state
-                    .core_store
-                    .wait_for_coremeta_recovery_ready()
-                    .await;
-            }
-            // Queue scanning must share the worker capability and cancellation scope.
-            let worker = anvil_core::worker::run(
-                worker_state.persistence.clone(),
-                worker_state.core_store.clone(),
-                worker_state.jwt_manager.clone(),
-                worker_state.object_manager.clone(),
-                worker_state.secret_keyring.clone(),
-                worker_state.config.background_worker_concurrency,
-            );
-            let personaldb_postcommit = worker_state.clone().run_personaldb_postcommit_loop();
-            let git_source_postcommit = worker_state.clone().run_git_source_postcommit_loop();
-            let hf_ingestion_postcommit = worker_state.clone().run_hf_ingestion_postcommit_loop();
-            let object_link_finalization = worker_state.clone().run_object_link_finalization_loop();
-            tokio::select! {
-                result = worker => {
-                    if let Err(error) = result {
-                        error!("Worker process failed: {}", error);
-                    }
-                }
-                _ = personaldb_postcommit => unreachable!("PersonalDB postcommit worker completed"),
-                _ = git_source_postcommit => unreachable!("GitSource postcommit worker completed"),
-                _ = hf_ingestion_postcommit => unreachable!("HF ingestion postcommit worker completed"),
-                _ = object_link_finalization => unreachable!("object-link finalization worker completed"),
-            }
-        });
-    }
-
-    // --- Services ---
-    let state_clone = state.clone();
-    let auth_interceptor =
-        anvil_core::services::AuthInterceptorFn::new(move |req: tonic::Request<()>| {
-            middleware::auth_interceptor(req, &state_clone)
-        });
-
-    let mut grpc_router =
-        anvil_core::services::create_grpc_router(state.clone(), auth_interceptor.clone());
-
-    if let Some(ext) = ENTERPRISE_EXTENDER.get() {
-        grpc_router = ext(grpc_router, state.clone(), auth_interceptor.clone());
-    }
-
-    let grpc_axum = anvil_core::services::create_axum_router(grpc_router);
-    let admin_auth_state = state.clone();
-    let admin_auth_interceptor =
-        anvil_core::services::AuthInterceptorFn::new(move |req: tonic::Request<()>| {
-            middleware::admin_auth_interceptor(req, &admin_auth_state)
-        });
-    let admin_axum = admin_listener.as_ref().map(|_| {
-        anvil_core::services::create_admin_axum_router(
-            state.clone(),
-            admin_auth_interceptor.clone(),
-        )
-    });
-    let s3_app = s3_gateway::app(state.clone(), public_readiness.clone());
-
-    let app = tower::service_fn(move |req: axum::extract::Request| {
-        let grpc_router = grpc_axum.clone();
-        let s3_router = s3_app.clone();
-        let public_readiness = public_readiness.clone();
-
-        async move {
-            let started_at = Instant::now();
-            let method = req.method().to_string();
-            let path = req.uri().path().to_string();
-            let content_type = req
-                .headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_string();
-
-            let plane = if content_type.starts_with("application/grpc") {
-                "public-grpc"
-            } else {
-                "s3"
-            };
-            if !public_readiness.public_api_ready()
-                && !startup_readiness::may_bypass_public_readiness(
-                    &path,
-                    public_readiness.cluster_ready(),
-                )
-            {
-                return Ok(startup_readiness::unavailable_response(
-                    content_type.starts_with("application/grpc"),
-                ));
-            }
-            let mux_request_id = uuid::Uuid::new_v4().simple().to_string();
-            let context = vec![
-                ("mux_request_id".to_string(), mux_request_id.clone()),
-                ("plane".to_string(), plane.to_string()),
-                ("method".to_string(), method.clone()),
-                ("path".to_string(), path.clone()),
-            ];
-            let response = anvil_core::perf::with_context(context, async move {
-                if content_type.starts_with("application/grpc") {
-                    grpc_router.oneshot(req).await
-                } else {
-                    tracing::info!(
-                        "[gRPC Mux] Routing to S3 gateway for content-type: {}",
-                        content_type
-                    );
-                    s3_router.oneshot(req).await
-                }
-            })
-            .await;
-            let status = response
-                .as_ref()
-                .map(|response| response.status().as_u16().to_string())
-                .unwrap_or_else(|_| "service_error".to_string());
-            anvil_core::perf::record_duration(
-                "anvil_request_mux",
-                &[
-                    ("mux_request_id", mux_request_id.as_str()),
-                    ("plane", plane),
-                    ("method", method.as_str()),
-                    ("path", path.as_str()),
-                    ("status", status.as_str()),
-                ],
-                started_at.elapsed(),
-            );
-            response
-        }
-    });
-
-    let addr = listener.local_addr()?;
-    info!("Anvil server (gRPC & S3) listening on {}", addr);
-    let admin_addr = admin_listener
-        .as_ref()
-        .map(tokio::net::TcpListener::local_addr)
-        .transpose()?;
-    if let Some(admin_addr) = admin_addr {
-        info!("Anvil admin gRPC listener available on {}", admin_addr);
-    }
-
-    let server_task = tokio::spawn(async move {
-        let listener = listener.tap_io(|stream| {
-            if let Err(error) = stream.set_nodelay(true) {
-                tracing::warn!(%error, "failed to enable TCP_NODELAY on public connection");
-            }
-        });
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .await
-    });
-    let admin_server_task = admin_listener
-        .zip(admin_axum)
-        .map(|(admin_listener, admin_app)| {
-            tokio::spawn(async move {
-                let admin_listener = admin_listener.tap_io(|stream| {
-                    if let Err(error) = stream.set_nodelay(true) {
-                        tracing::warn!(%error, "failed to enable TCP_NODELAY on admin connection");
-                    }
-                });
-                axum::serve(admin_listener, admin_app.into_make_service()).await
-            })
-        });
-
-    // Run the public and optional admin gRPC servers concurrently.
-    if let Some(admin_server_task) = admin_server_task {
-        let (server_result, admin_result) = tokio::join!(server_task, admin_server_task);
-        server_result??;
-        admin_result??;
-    } else {
-        server_task.await??;
-    }
-
+fn validate_atomic_replay_gc(awaiting_publish_ttl_seconds: u64) -> Result<()> {
+    let blob_gc_inactivity_millis = awaiting_publish_ttl_seconds
+        .checked_mul(1_000)
+        .context("awaiting-publish blob TTL exceeds u64 milliseconds")?;
+    anyhow::ensure!(
+        blob_gc_inactivity_millis >= ATOMIC_REPLAY_RETENTION_MILLIS,
+        "awaiting-publish blob TTL must be at least the fixed 24-hour atomic replay window"
+    );
     Ok(())
 }
 
-static ENTERPRISE_EXTENDER: OnceCell<
-    fn(
-        service::Routes,
-        anvil_core::AppState,
-        anvil_core::services::AuthInterceptorFn,
-    ) -> service::Routes,
-> = OnceCell::new();
+fn spawn_blob_gc(store: Store) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let first_run = tokio::time::Instant::now() + BLOB_GC_INTERVAL;
+        let mut interval = tokio::time::interval_at(first_run, BLOB_GC_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            collect_blob_garbage(&store, "scheduled").await;
+        }
+    })
+}
 
-pub fn register_enterprise_extender(
-    f: fn(
-        service::Routes,
-        anvil_core::AppState,
-        anvil_core::services::AuthInterceptorFn,
-    ) -> service::Routes,
-) {
-    let _ = ENTERPRISE_EXTENDER.set(f);
+async fn collect_blob_garbage(store: &Store, trigger: &'static str) {
+    match store.collect_blob_garbage().await {
+        Ok(removed) => {
+            tracing::info!(
+                monotonic_counter.anvil_blob_gc_runs_total = 1_u64,
+                monotonic_counter.anvil_blob_gc_removed_total = removed,
+                trigger,
+                removed,
+                "blob garbage-collection pass completed"
+            );
+        }
+        Err(error) => {
+            tracing::error!(
+                monotonic_counter.anvil_blob_gc_failures_total = 1_u64,
+                trigger,
+                %error,
+                "blob garbage-collection pass failed"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_blob_gc_cannot_expire_before_atomic_replay() {
+        let replay_seconds = ATOMIC_REPLAY_RETENTION_MILLIS / 1_000;
+        assert!(validate_atomic_replay_gc(replay_seconds).is_ok());
+        assert!(validate_atomic_replay_gc(replay_seconds - 1).is_err());
+    }
 }

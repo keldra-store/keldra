@@ -1,171 +1,178 @@
 # Anvil
 
-Anvil is a production object storage platform with indexing, search, relationship authorisation, durable watches, and PersonalDB witnessing built into the storage layer.
+Anvil 0.5 is a small, versioned object store with an explicit opt-in layer for
+bounded atomic application commands.
 
-A normal object store can put bytes under a key and read them later. Product systems usually need much more: predictable path layouts, version history, metadata filters, full text search, vector retrieval, access checks on every result, live change streams, background repair evidence, static delivery, S3-compatible tooling, and a way to sync local-first SQLite applications without adding a separate database service. Anvil treats those capabilities as storage responsibilities instead of leaving every application to rebuild them.
+The storage kernel understands paths and opaque bytes. Every successful write
+creates an immutable version and moves one current head. It supports exact
+compare-and-swap, create-once namespaces, idempotent commands, independent bulk
+writes, content-addressed streaming uploads, and same-snapshot batch reads.
+`ListObjects` provides stateless pages of current live paths directly from the
+current-head keyspace.
 
-## Current Capabilities
+Applications that need several exact paths to change together write a bounded
+deterministic program as an immutable ordinary object below `_anvil/programs/`,
+then explicitly invoke that pinned object. The singleton executor locks its
+expanded paths locally in canonical order and evaluates against the latest
+committed state. A compact Raft decision makes an already durable prepared
+bundle visible. Raft never carries object bodies, path inventories, locks,
+waiters, or program definitions.
 
-- **Object storage:** tenants, buckets, keys, object versions, current pointers, delete markers, checksums, range reads, copy/delete operations, multipart flows, native gRPC APIs, and S3-compatible object access.
-- **CoreStore durability:** objects, metadata, indexes, authorisation records, PersonalDB state, mesh lifecycle records, gateway records, leases, audit events, and repair findings persist through immutable objects, ordered streams, and compare-and-swap refs.
-- **Indexes and search:** path indexes, metadata-filter indexes, typed JSON indexes, full text indexes, vector indexes, and hybrid indexes with documented selector, extractor, build-policy, query, diagnostics, pagination, and catch-up shapes.
-- **Authorisation:** public policy scopes for tenant app credentials, Zanzibar-style relationship authorisation for tenant product data, and private system-realm relations for the admin API.
-- **Watch streams:** cursor-based streams for source changes and derived maintenance so applications and background workers can catch up without rescanning everything.
-- **PersonalDB witnessing:** SQLite changeset validation, commit certificates, catch-up, snapshots, projection records, row metadata, and repair evidence for local-first applications.
-- **Gateways:** native public API, S3-compatible object access, static host-alias routing, object links, and CoreStore-backed gateway foundation records.
-- **Operations:** Docker-first server deployment, separate public/admin listeners, tenant and app provisioning, least-privilege grants, topology lifecycle, diagnostics, repair, audit listing, and release gates.
+`InvokeProgram` has one absolute execution budget covering lock acquisition,
+evaluation, commit and finalization. The startup-only maximum defaults to 30
+seconds and is configured with `ANVIL_ATOMIC_PROGRAM_TIMEOUT_SECONDS` or
+`--atomic-program-timeout-seconds`. A standard client gRPC deadline may shorten
+that budget but cannot extend it; expiry returns gRPC `DEADLINE_EXCEEDED`.
 
-## Architecture
+## Implementation status
 
-CoreStore is Anvil's durable boundary. It has three primitives:
+The complete 0.5.0 capability is in release qualification. The production
+surface includes authenticated object/CAS/bulk operations, immutable and
+`PROGRAM_ONLY` policy, typed Zanzibar administration and application realms,
+explicit bootstrap and credential exchange, public atomic-program invocation
+and recovery, and bounded resumable `WatchPrefix`. Functional release evidence
+includes the full local suite, crash/manual QA, and both container
+architectures. The pinned Developer Defence OSV import is the immediate
+post-release performance baseline; misses are profiled and corrected after the
+immutable 0.5.0 tag rather than delaying its functional release.
 
-| Primitive | Purpose |
-| --- | --- |
-| `CoreObject` | Immutable bytes: payloads, index segments, snapshots, source packs, gateway blobs. |
-| `CoreStream` | Ordered facts: object mutations, authz tuple logs, audit events, append records, PersonalDB commits. |
-| `CoreRef` | CAS heads: current object pointers, index generations, PersonalDB heads, routing state, leases. |
+## Deliberate 0.5 break
 
-Feature-specific formats still exist where useful, but durable truth goes through those primitives. S3 is a gateway, not the storage model. The native API, S3 gateway, search, watches, PersonalDB, and admin workflows all resolve back to Anvil tenants, buckets, resources, authorisation, and CoreStore records.
+There is no compatibility with the 0.4 transaction or MVCC API and no in-place
+upgrade from its storage format. The following concepts are gone:
 
-CoreStore is split into a metadata plane and a byte plane. CoreMeta uses RocksDB column families for metadata, heads, versions, transactions, index definitions, segment locators, authz rows, mesh records, leases, and other small control records. Tiny payloads may be inlined according to the inline payload policy. Larger durable bytes are written through the CoreStore byte pipeline and stored as erasure-coded shard data. Index segments, stream payloads, PersonalDB pages, gateway blobs, and object bodies all follow that same rule.
+- `BeginTransaction`, `CommitTransaction`, and `RollbackTransaction`;
+- transaction drafts and staged public writes;
+- certification, read sets, range observations, and snapshot versions;
+- arbitrary cross-partition atomic batches;
+- payloads or product rows in Raft.
 
-## Release Surfaces
+Export data through the old release and import it into a new 0.5 store.
 
-- **Server:** Docker image and release binaries. The server crate is not published to crates.io.
-- **Rust client:** `anvil-storage = "0.4.0"` on crates.io.
-- **CLIs:** `anvil` for tenant/public operations and `anvil-admin` for private admin-plane operations.
-- **Documentation:** Fission static site in `documentation/`, published by a separate docs workflow.
-- **Protocol bindings:** generated gRPC bindings are packaged with the Rust client.
+## API layers
 
-## Quick Start
+| Layer | Operations | Guarantee |
+| --- | --- | --- |
+| Opaque object core | `StartPut` → `Put` → `PutEnd`, `Delete`, `DeleteIfVersion` | Streamed bytes remain invisible until `PutEnd`; each publication moves one exact-path head |
+| Throughput | `BulkWrite`, `BatchGet` | Independent write outcomes; one read snapshot |
+| Discovery | `ListObjects` | Zanzibar-authorized lexical pages of current live paths |
+| Policy | create-once and `PROGRAM_ONLY` prefixes | Write-once children, or mutation admitted only through atomic programs |
+| Atomic programs | immutable object under `_anvil/programs/`, then `InvokeProgram` | One bounded deterministic state transition orchestrated by the nominated executor |
+| Invalidations | `WatchPrefix` | Bounded unordered at-least-once notice to reread current state |
+| Authorization | schemas, realms, tuples, checks and typed administration | Zanzibar evaluation at one explicit current revision |
+| Workflows | application-owned saga | External-service coordination |
 
-Anvil is Docker-first. Set `ANVIL_IMAGE` to the image published for the release you want to run, preferably pinned by tag or digest:
+Uploading an MP3 through `StartPut` and streaming `Put` is an ordinary blob
+operation. It does not invoke a program, and the staged bytes remain invisible.
+Only `PutEnd` publishes the object and changes its visible exact-path head.
+Sealed uploads reserve their content-addressed bytes for 24 hours by default.
+Anvil runs one full garbage-collection pass at startup and then hourly. Set
+`ANVIL_AWAITING_PUBLISH_TTL_SECONDS` (or
+`--awaiting-publish-ttl-seconds`) to change the unpublished inactivity limit;
+the value must be non-zero. Sealing identical content refreshes its
+`updated_at` value and therefore its inactivity deadline. Published content is
+retained by its reference count. Count-zero and awaiting-publication content is
+removed only after it has also been inactive for the configured threshold, so
+a valid ready upload can still publish deduplicated bytes after an intervening
+delete.
 
-```sh
-export ANVIL_IMAGE="ghcr.io/worka-ai/anvil:v0.4.0"
-docker pull "$ANVIL_IMAGE"
-```
+`ListObjects` uses a literal UTF-8 prefix, defaults to 100 paths per page, and
+accepts at most 1,000. Pass the last returned path back as the exclusive
+`start_after` cursor when `has_more` is true. Pages are read committed rather
+than one snapshot held across requests. The RocksDB `heads` column family uses
+`[format version][tenant ID][bucket ID][raw UTF-8 path]`, so the implementation
+seeks directly to the requested literal path prefix and stops at the end of
+that contiguous range. It maintains no duplicate listing projection or side
+index.
 
-For a real local setup, use the Docker tutorial because it also covers server secret material, first-start bootstrap, public/admin listener separation, and token flow:
+## Authentication
 
-```sh
-fission site serve --project-dir documentation
-# then open /tutorials/setup-local-anvil/
-```
+Every protected RPC accepts a one-hour bearer token minted by
+`ExchangeClientCredentials`. The exchange request contains a long-lived
+application secret, so production deployments must put the gRPC endpoint
+behind TLS termination. Plaintext transport is suitable only for a trusted
+local development loop.
 
-Add the Rust client to an application:
+The server requires `--token-signing-key-file` (or
+`ANVIL_TOKEN_SIGNING_KEY_FILE`) on every start. It must name a regular,
+non-symlink file with mode `0600` containing between 32 and 4096 key bytes.
+Anvil reads but never persists or logs this operator-managed key. The static
+shared API token and unauthenticated server mode do not exist in 0.5.
+Rotating or disabling an application credential stops future exchanges;
+already-issued tokens remain valid until their one-hour expiry.
 
-```toml
-[dependencies]
-anvil-storage = "0.4.0"
-```
+## Repository
 
-Use the client with a bearer token minted by Anvil:
+- `crates/anvil-store`: opaque version/head storage, blobs, CAS, policies and bulk operations.
+- `crates/anvil-atomic-program`: the one bounded JSON program interpreter.
+- `crates/anvil-consensus`: compact executor nomination and publication decisions.
+- `crates/anvil-api`: the single generated gRPC contract shared by server and clients.
+- `anvil`: server transport and integration.
+- `clients/rust`: thin authenticated Rust transport.
+- `docs/rfcs/anvil_0009_atomic_programs.md`: complete 0.5 architecture and invariants.
+- `docs/known-limitations.md`: explicit 0.5.0 limitations that operators and clients must account for.
 
-```rust
-use anvil_storage::{proto::ListBucketsRequest, AnvilClient};
-
-async fn example(
-    endpoint: String,
-    token: String,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let client = AnvilClient::connect_with_bearer(endpoint, token).await?;
-    let response = client.buckets().list_buckets(ListBucketsRequest {}).await?;
-    println!("{} buckets", response.into_inner().buckets.len());
-    Ok(())
-}
-```
-
-Existing S3-compatible tools can use the S3 gateway with Anvil-issued app credentials when the operation is object-shaped. Use the native API or Rust client for Anvil-specific features such as typed indexes, watches, PersonalDB, relationship authorisation, task leases, and repair workflows.
-
-## Documentation
-
-The documentation is organised as five books:
-
-- `documentation/content/learn/` teaches the concepts from first principles.
-- `documentation/content/architecture/` explains storage internals, CoreMeta, index formats, mesh transport, release status, and contributor rules.
-- `documentation/content/tutorials/` walks through concrete operations.
-- `documentation/content/operators/` covers deployment and production operation.
-- `documentation/content/reference/` documents the CLIs, authorisation action/resource strings, and index/query JSON shapes.
-
-Build and check the site locally:
-
-```sh
-fission site check --project-dir documentation --release
-fission site build --project-dir documentation --release
-```
-
-## Development Checks
-
-Run these before changing core behaviour or opening a release PR:
+## Development
 
 ```sh
 cargo fmt --all -- --check
-ANVIL_BUILD_PROFILE=release ANVIL_IMAGE=anvil:test ./scripts/build-image.sh
-./scripts/release-gates.sh
+cargo test --workspace
 ```
 
-`release-gates.sh` includes storage hardening checks, docs hardening, release-note rendering, the Fission documentation build, the Rust client publish dry run, Rust unit tests, server core integration tests, and Docker-backed integration groups. Each gate step prints start/finish timings and, where GNU `timeout` is available, is bounded by `ANVIL_GATE_STEP_TIMEOUT_SECONDS` (default `1800`). `build-image.sh` defaults to a ci-profile image for PR and local test turnaround; set `ANVIL_BUILD_PROFILE=release` when building release evidence. Security-sensitive changes should also include focused tests for the affected path before the full gate.
-
-PR CI runs `build-image.sh` once for a fast `linux/amd64` ci-profile test image. Release builds run `build-image.sh` for both `linux/amd64` and `linux/arm64` with `ANVIL_BUILD_PROFILE=release`. The script uses Zig/cargo-zigbuild by default so the Linux binaries are compatible with the runtime image instead of accidentally depending on the GitHub runner's newer glibc. Docker integration tests run against the `linux/amd64` artifact, while the `linux/arm64` artifact is built and smoke-checked before publication. The release workflow publishes architecture-specific GHCR tags and then creates the public multi-architecture tag from those tested artifacts.
-
-## Release Process
-
-The release flow is designed so PR and release testing use the same gates:
-
-1. Open a PR containing source, docs, workflow, README, and blog/release-note changes.
-2. Merge to `main` only after CI passes.
-3. Tag the release.
-4. Let the release workflow test the Docker image, publish the tested image, publish `anvil-storage` if the version is new, render release notes from the release blog post, and create the GitHub release.
-5. Let the independent documentation workflow publish the Fission static site from `documentation/`.
-
-See `documentation/content/operators/release-readiness-checklist.md` for the operator checklist and `documentation/content/architecture/release-status.md` for the release architecture status report.
-
-## License
-
-Anvil is licensed under the Apache 2.0 License. See `LICENSE`.
-
-## Docker-first local run shape
-
-A single-node local run is useful for learning the planes before building a larger topology. Keep the storage path on a volume, generate real secret material for anything you intend to keep, and remember that the admin listener is private even in local demos.
+Before creating the `0.5.0` Git tag, qualify both release images locally. The
+architecture-specific names below remain in the local Docker daemon; they are
+never pushed to GHCR.
 
 ```sh
-export ANVIL_IMAGE="ghcr.io/worka-ai/anvil:v0.4.0"
-export ANVIL_SECRET_ENCRYPTION_KEY="$(anvil-admin key generate-secret-encryption-key)"
+ANVIL_DOCKER_PLATFORM=linux/amd64 \
+ANVIL_IMAGE=anvil:0.5.0-local-amd64 \
+./scripts/build-image.sh
+ANVIL_IMAGE=anvil:0.5.0-local-amd64 ./scripts/release-gates.sh image
 
-docker run --rm \
-  --name anvil-local \
-  -p 127.0.0.1:50051:50051 \
-  -v anvil-local-data:/var/lib/anvil \
-  -e STORAGE_PATH=/var/lib/anvil \
-  -e MESH_ID=local \
-  -e NODE_ID=anvil-local \
-  -e REGION=local \
-  -e CELL_ID=local \
-  -e API_LISTEN_ADDR=0.0.0.0:50051 \
-  -e PUBLIC_API_ADDR=http://127.0.0.1:50051 \
-  -e ADMIN_LISTEN_ADDR=127.0.0.1:50052 \
-  -e JWT_SECRET="local-jwt-secret-change-me" \
-  -e ANVIL_SECRET_ENCRYPTION_KEY="$ANVIL_SECRET_ENCRYPTION_KEY" \
-  -e BOOTSTRAP_SYSTEM_ADMIN_APP_NAME=ops-admin \
-  -e BOOTSTRAP_SYSTEM_ADMIN_CREDENTIAL_OUTPUT_PATH=/var/lib/anvil/first-admin.json \
-  "$ANVIL_IMAGE"
+ANVIL_DOCKER_PLATFORM=linux/arm64 \
+ANVIL_IMAGE=anvil:0.5.0-local-arm64 \
+./scripts/build-image.sh
+ANVIL_IMAGE=anvil:0.5.0-local-arm64 ./scripts/release-gates.sh image
 ```
 
-PersonalDB asymmetric signing is an optional in-process capability of the Anvil
-server. It requires no signer sidecars, socket mounts, or signing
-manifest. A server with no PersonalDB signing keys starts normally and retains
-its object, stream, and index behavior. PersonalDB uses Ed25519 evidence only;
-PersonalDB operations that need a signature require an active, purpose-scoped
-key provisioned through the authenticated admin plane with
-`anvil-admin personal-db-signing-key`.
-See [Secrets and Key Management](documentation/content/operators/secrets-and-key-management.md#personaldb-protocol-signing-keys)
-for the custody and rotation model.
+Each image is compiled from source inside a `rust:1.96-trixie` builder for its
+target platform and runs on `debian:trixie-slim`. Release publication rebuilds
+the same Dockerfile as the single public multi-platform image
+`ghcr.io/worka-ai/anvil:0.5.0`. There are no public architecture-specific or
+`v`-prefixed image tags.
 
-After the container is ready, the host can reach only the public plane at `http://127.0.0.1:50051`. The admin listener is bound to loopback inside the container and is deliberately not published to the host. For local admin smoke tests, run `anvil-admin` with `docker exec` so the command executes inside that private boundary; for example, pass `ANVIL_AUTH_TOKEN` into the container and let the in-container CLI call `http://127.0.0.1:50052`.
+## First start
 
-Tenant applications should use only the public endpoint and the `anvil` CLI or Rust client. If a README example requires the admin CLI to read or write tenant objects, treat that as a documentation bug.
+Anvil has no insecure or static-token mode. Create an operator-managed signing
+key, keep it mode `0600`, and run bootstrap exactly once:
 
-## Plane quick reference
+```sh
+head -c 64 /dev/urandom > anvil-token-signing-key
+chmod 0600 anvil-token-signing-key
+anvil-server \
+  --data-dir ./anvil-data \
+  --token-signing-key-file ./anvil-token-signing-key \
+  --run-system-bootstrap
+```
 
-Use the public plane for tenant-owned resources: buckets, objects, object links, tenant application credentials, public policy delegation, relationship tuples, index definitions and queries, watches, append streams, task leases, PersonalDB groups, tenant diagnostics, and tenant repair. Use the admin plane for operator-owned resources: tenants, first application handover, server-side policy grants, secret-envelope rotation, regions, cells, nodes, routing projection repair, administrative diagnostics, and administrative audit. The two planes share authentication mechanics, but they do not share authorisation: public policy scopes do not grant system-realm admin relations.
+The server prints the exact generated credential path, normally
+`./anvil-data/system-bootstrap-credential.json`. Copy that mode-`0600` file to
+the operator's secret store and delete the generated copy after provisioning.
+The CLI exchanges it for a one-hour access token automatically:
+
+```sh
+ANVIL_NEW_CLIENT_SECRET='a-new-secret-containing-at-least-32-bytes' \
+anvil --credentials-file ./copied-bootstrap-credential.json \
+  provision-tenant acme acme-owner acme-owner-client
+
+ANVIL_CLIENT_ID=acme-owner-client \
+ANVIL_CLIENT_SECRET='a-new-secret-containing-at-least-32-bytes' \
+anvil create-bucket objects
+```
+
+Credential exchange carries a long-lived secret and requires TLS termination
+in production. The container runs as UID 10001; a bind-mounted signing key must
+therefore be readable by that UID while remaining mode `0600`, or be supplied
+by a secret mount that sets `uid=10001,mode=0600`.
+
+Anvil is licensed under Apache-2.0.

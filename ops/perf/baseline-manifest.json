@@ -1,112 +1,114 @@
 {
-  "schema": "anvil.perf.baseline_manifest.v1",
-  "dataset_id": "anvil-corestore-baseline-v1",
-  "seed": "anvil-corestore-baseline-v1-seed-42",
-  "hardware_profile": {
-    "name": "release-10-node-nvme",
-    "nodes": 10,
-    "cells": 5,
-    "regions": 1,
-    "disk_class": "nvme",
-    "network_gbps": 10
+  "schema": "anvil.perf.osv_import.v3",
+  "measured": false,
+  "passed": false,
+  "target_seconds": 150.0,
+  "corpus": {
+    "path": null,
+    "expected_sha256": null,
+    "observed_sha256": null,
+    "archive_bytes": null,
+    "snapshot_day": null,
+    "snapshot_id": null
   },
-  "warmup": {
-    "duration_seconds": 300,
-    "discard_metrics": true,
-    "sample_traces_per_scenario": 0
-  },
-  "run": {
-    "duration_seconds": 1800,
-    "discard_metrics": false,
-    "sample_traces_per_scenario": 1000
-  },
-  "object_distribution": {
-    "tenant_count": 100000,
-    "project_count": 1000,
-    "small_weights": {
-      "1KiB": 40,
-      "4KiB": 35,
-      "16KiB": 20,
-      "64KiB": 5
-    },
-    "medium_weights": {
-      "256KiB": 50,
-      "1MiB": 35,
-      "4MiB": 15
-    },
-    "large_weights": {
-      "128MiB": 80,
-      "1GiB": 19,
-      "5GiB": 1
-    },
-    "key_algorithm": "corestore-key-fixed-v1 mapped to /tenant/{tenant}/project/{project}/object/{ordinal}",
-    "metadata_algorithm": "deterministic tenant/project/content_type/day from seed and ordinal"
-  },
-  "query_corpus": {
-    "text_generator": "markov-fixed-v1",
-    "query_selector": "query-selector-fixed-v1",
-    "term_queries": 1000,
-    "boolean_queries": 1000,
-    "phrase_queries": 500,
-    "field_queries": 500,
-    "selectivity_buckets": [
-      0.0001,
-      0.001,
-      0.01,
-      0.1
+  "schema_shape": {
+    "source_definition_schema": "developer-defence.source-definition.v2",
+    "source_record_schema": "developer-defence.osv-source-record.v1",
+    "snapshot_manifest_schema": "developer-defence.osv-snapshot-manifest.v1",
+    "source": "osv",
+    "bucket": "dd-source-osv-raw",
+    "source_definition_path": "entities/source-definition/{sha256(source-definition\\0osv)}/current.json",
+    "shard_path": "shards/v1/{records_sha256[0..2]}/{records_sha256}.ndjson.zst",
+    "manifest_path": "snapshots/{snapshot_id}/manifest.json",
+    "shard_format": "developer-defence.osv-source-record.ndjson.v1",
+    "shard_compression": "zstd-6",
+    "manifest_is_authoritative": true,
+    "per_object_user_metadata": false,
+    "phases": [
+      "write immutable source definition and compressed content-addressed shards",
+      "write immutable authoritative snapshot manifest with exact shard versions",
+      "verify every exact current object head"
     ]
   },
-  "vector_corpus": {
-    "generator": "deterministic-normalized-random-v1",
-    "dimensions": [
-      384,
-      768
-    ],
-    "oracle_sample_size": 100000,
-    "recall_k": 20,
-    "distance": "cosine"
+  "software": {
+    "anvil_commit": null,
+    "developer_defence_schema_source_commit": "ac838a79e5b9fd4aed08d1ac7786e5374b01b733"
   },
-  "authz_graph": {
-    "generator": "authz-graph-fixed-v1",
-    "tenants": 100000,
-    "subjects": 1000000,
-    "objects": 10000000,
-    "direct_relation_ratio": 0.55,
-    "computed_userset_ratio": 0.3,
-    "tuple_to_userset_ratio": 0.15,
-    "max_traversal_depth": 8
+  "workload": {
+    "endpoint": null,
+    "tenant": null,
+    "bucket": "dd-source-osv-raw",
+    "source_url": "https://osv-vulnerabilities.storage.googleapis.com/all.zip",
+    "source_cadence_hours": 6,
+    "durability_class": "local",
+    "node_count": 1,
+    "batch_size_operations": null,
+    "maximum_batch_payload_bytes": null,
+    "shard_uncompressed_target_bytes": null,
+    "write_concurrency": null,
+    "verification_concurrency": null,
+    "clean_target_verified": true
   },
-  "personaldb": {
-    "generator": "personaldb-changeset-fixed-v1",
-    "groups": 10000,
-    "actors_per_group": 8,
-    "changeset_size_weights": {
-      "1KiB": 40,
-      "4KiB": 40,
-      "16KiB": 15,
-      "64KiB": 5
+  "parsing": {
+    "archive_entries": null,
+    "json_documents": null,
+    "accepted_source_documents": null,
+    "normalised_source_records": null,
+    "unscoped_documents": null,
+    "malformed_documents": null,
+    "oversized_documents": null,
+    "decompressed_json_bytes": null
+  },
+  "result": {
+    "source_documents": null,
+    "normalised_source_records": null,
+    "shard_objects": null,
+    "logical_mutations": null,
+    "source_definition_payload_bytes": null,
+    "shard_payload_bytes": null,
+    "manifest_payload_bytes": null,
+    "total_payload_bytes": null,
+    "data_bulk_requests": null,
+    "manifest_bulk_requests": null,
+    "bulk_requests": null,
+    "batch_fill_average_operations": null,
+    "replayed_mutations": null,
+    "end_to_end_seconds": null,
+    "source_documents_per_second": null,
+    "normalised_source_records_per_second": null,
+    "payload_mebibytes_per_second": null,
+    "bulk_request_latency_ms": {
+      "sample_count": null,
+      "mean_ms": null,
+      "p50_ms": null,
+      "p95_ms": null,
+      "p99_ms": null
     },
-    "conflict_ratio_bps": 300,
-    "snapshot_every_changesets": 1000
-  },
-  "references": {
-    "minio": {
-      "image": "minio/minio:RELEASE.2026-06-13T11-33-47Z",
-      "config": "single-node-nvme-or-distributed-matching-anvil",
-      "versioning": true
+    "data_request_latency_ms": {
+      "sample_count": null,
+      "mean_ms": null,
+      "p50_ms": null,
+      "p95_ms": null,
+      "p99_ms": null
     },
-    "external_comparisons": [
-      {
-        "name": "s3-compatible-cloud",
-        "required": false,
-        "skip_reason_required_when_absent": true
-      }
-    ]
+    "manifest_request_latency_ms": {
+      "sample_count": null,
+      "mean_ms": null,
+      "p50_ms": null,
+      "p95_ms": null,
+      "p99_ms": null
+    }
   },
-  "pass_fail": {
-    "object_thresholds": "section-26.2",
-    "non_object_thresholds": "section-26.3",
-    "regression_threshold_percent": 10,
-    "minimum_valid_samples_per_metric": 1000
-  }
+  "verification": {
+    "expected_object_count": null,
+    "verified_object_count": null,
+    "duration_seconds": null
+  },
+  "limitations": [
+    "The authoritative qualification shape is one source definition, immutable compressed content-addressed shards, and one immutable manifest; it deliberately does not create a raw object and mutable head for every upstream JSON document.",
+    "Shard attributes are carried by the authoritative manifest. Anvil 0.5.0 receives no per-object user metadata and this tool creates no metadata sidecar.",
+    "The required --snapshot-day and pinned archive hash determine the snapshot identity; the local clock never participates.",
+    "Anvil 0.5 accepts exactly local or replicated durability: local performs the write and replicated is unavailable in this single-node qualification.",
+    "Independent verification checks each current version, content length, content type, and BLAKE3 payload digest through HeadObject without downloading the payload again."
+  ]
 }

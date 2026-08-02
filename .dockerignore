@@ -2,3 +2,6 @@
 target/
 .git/
 anvil-data/
+clients/python/
+clients/typescript/
+tmp/

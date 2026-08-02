@@ -2,8 +2,7 @@ name: Anvil Release
 
 on:
   push:
-    tags:
-      - 'v*'
+    tags: ['[0-9]*.[0-9]*.[0-9]*']
   workflow_dispatch:
     inputs:
       tag:
@@ -18,16 +17,10 @@ concurrency:
   group: anvil-release
   cancel-in-progress: false
 
-env:
-  # Self-hosted runners keep this directory between jobs. Sharing Cargo's
-  # target directory avoids rebuilding the same workspace dependencies in the
-  # image, unit, server-core and Docker-gate stages.
-  CARGO_TARGET_DIR: /home/github-runner/.cache/anvil/cargo-target
-
 jobs:
   release-context:
     name: Resolve immutable release context
-    runs-on: [self-hosted, linux, x64, worka-builder-2]
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
       tag: ${{ steps.release.outputs.tag }}
@@ -40,619 +33,108 @@ jobs:
 
       - name: Resolve and validate release tag
         id: release
-        shell: bash
         env:
           REQUESTED_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
           tag="$REQUESTED_TAG"
-          if [[ ! "$tag" =~ ^v[0-9A-Za-z][0-9A-Za-z._-]{0,126}$ ]]; then
-            echo "release tag must be a v-prefixed Docker-compatible tag" >&2
+          if [[ ! "$tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z._-]+)?$ ]]; then
+            echo "release tag must be an unprefixed semantic version" >&2
             exit 1
           fi
-
           git fetch --force --no-tags origin "refs/tags/${tag}:refs/tags/${tag}"
           commit="$(git rev-parse --verify "refs/tags/${tag}^{commit}")"
-          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
-            event_commit="$(git rev-parse --verify "${GITHUB_SHA}^{commit}")"
-            if [[ "$tag" != "$GITHUB_REF_NAME" || "$commit" != "$event_commit" ]]; then
-              echo "tag-push context does not match resolved release tag" >&2
-              exit 1
-            fi
-          fi
-
           workspace_version="$(
             git show "${commit}:Cargo.toml" |
-              python3 -c 'import re, sys; text = sys.stdin.read(); print(re.search(r"(?ms)^\[workspace\.package\].*?^version\s*=\s*\"([^\"]+)\"", text).group(1))'
+              python3 -c 'import re,sys; text=sys.stdin.read(); print(re.search(r"(?ms)^\[workspace\.package\].*?^version\s*=\s*\"([^\"]+)\"", text).group(1))'
           )"
-          if [[ "$tag" != "v${workspace_version}" ]]; then
+          if [[ "$tag" != "${workspace_version}" ]]; then
             echo "release tag $tag does not match workspace version ${workspace_version}" >&2
             exit 1
           fi
+          if [[ "$GITHUB_EVENT_NAME" == "push" && "$commit" != "$GITHUB_SHA" ]]; then
+            echo "tag commit does not match the push event commit" >&2
+            exit 1
+          fi
+          printf 'tag=%s\ncommit=%s\n' "$tag" "$commit" >>"$GITHUB_OUTPUT"
 
-          printf 'tag=%s\ncommit=%s\n' "$tag" "$commit" >> "$GITHUB_OUTPUT"
-
-      - name: Checkout resolved release commit
+  validate:
+    name: Validate Anvil 0.5 release
+    needs: release-context
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      ANVIL_GATE_STEP_TIMEOUT_SECONDS: '5400'
+      ANVIL_RUST_TEST_THREADS: '8'
+      CARGO_BUILD_JOBS: '8'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - name: Checkout release commit
         uses: actions/checkout@v4
         with:
-          ref: ${{ steps.release.outputs.commit }}
+          ref: ${{ needs.release-context.outputs.commit }}
 
-      - name: Validate coordinated release metadata
-        env:
-          RELEASE_TAG: ${{ steps.release.outputs.tag }}
-          RELEASE_COMMIT: ${{ steps.release.outputs.commit }}
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Install system build dependencies
         run: |
-          scripts/render-release-notes.py \
-            --tag "$RELEASE_TAG" \
-            --docker-image "ghcr.io/${GITHUB_REPOSITORY}:${RELEASE_TAG}" \
-            --image-digest "sha256:preflight" \
-            --crate-version "anvil-storage ${RELEASE_TAG#v}" \
-            --commit-sha "$RELEASE_COMMIT" \
-            --docs-url "https://${GITHUB_REPOSITORY_OWNER}.github.io/anvil/" \
-            --output "${{ runner.temp }}/release-notes-preflight.md"
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            cmake \
+            libclang-dev \
+            pkg-config \
+            protobuf-compiler \
+            ripgrep
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-release-cargo-v05-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-release-cargo-v05-
+
+      - name: Run static gates
+        run: ./scripts/release-gates.sh static
+
+      - name: Run workspace tests
+        run: ./scripts/release-gates.sh rust
 
   build-image:
     name: Build release image (${{ matrix.platform }})
     needs: release-context
-    runs-on: [self-hosted, linux, x64, worka-builder-2]
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
     env:
-      ANVIL_BUILD_IMAGE: anvil:test-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+      ANVIL_IMAGE: anvil:release-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+      ANVIL_DOCKER_PLATFORM: ${{ matrix.platform }}
     strategy:
       fail-fast: false
-      max-parallel: 1
       matrix:
         include:
           - platform: linux/amd64
             arch: amd64
-            artifact: anvil-test-image-amd64
-            native_cargo: "0"
+            runner: ubuntu-24.04
           - platform: linux/arm64
             arch: arm64
-            artifact: anvil-test-image-arm64
-            native_cargo: "0"
+            runner: ubuntu-24.04-arm
     steps:
-      - name: Checkout repository
+      - name: Checkout release commit
         uses: actions/checkout@v4
         with:
           ref: ${{ needs.release-context.outputs.commit }}
-
-      - name: Set up emulation for image smoke checks
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: amd64,arm64
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.14.1
-
-      - name: Install system build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            clang \
-            cmake \
-            libclang-dev \
-            pkg-config \
-            libssl-dev \
-            protobuf-compiler \
-            ripgrep
-
-      - name: Cache Cargo dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: ${{ runner.os }}-release-cargo-v3-image-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-release-cargo-v3-image-${{ matrix.arch }}-
-
-      - name: Install pinned cross-build toolchain
-        shell: bash
-        run: |
-          set -euo pipefail
-          if ! cargo-zigbuild --version 2>/dev/null | grep -Fxq 'cargo-zigbuild 0.20.1'; then
-            cargo install cargo-zigbuild --version 0.20.1 --locked --force
-          fi
-
-          cargo_zigbuild_version="$(cargo-zigbuild --version)"
-          zig_path="$(command -v zig)"
-          zig_version="$("$zig_path" version)"
-          test "$cargo_zigbuild_version" = 'cargo-zigbuild 0.20.1'
-          test "$zig_version" = '0.14.1'
-
-          {
-            printf 'CARGO_ZIGBUILD_ZIG_PATH=%s\n' "$zig_path"
-            printf 'CARGO_ZIGBUILD_PYTHON_PATH=%s/anvil-no-python-zig-%s-%s\n' \
-              "$RUNNER_TEMP" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
-            printf 'CARGO_ZIGBUILD_CACHE_DIR=%s/anvil-cargo-zigbuild-%s-%s-%s\n' \
-              "$RUNNER_TEMP" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" '${{ matrix.arch }}'
-          } >> "$GITHUB_ENV"
-
-      - name: Discard arm64 artifacts from incompatible Zig versions
-        if: matrix.arch == 'arm64'
-        run: cargo clean --release --target aarch64-unknown-linux-gnu
-
-      - name: Build Docker image from host-built binaries
-        env:
-          ANVIL_IMAGE: ${{ env.ANVIL_BUILD_IMAGE }}
-          ANVIL_DOCKER_PLATFORM: ${{ matrix.platform }}
-          ANVIL_BUILD_PROFILE: release
-          ANVIL_USE_NATIVE_CARGO: ${{ matrix.native_cargo }}
-          CARGO_BUILD_JOBS: "8"
-        run: ./scripts/build-image.sh
-
-      - name: Smoke check image binaries
-        run: |
-          timeout 30s docker run --platform ${{ matrix.platform }} --rm "$ANVIL_BUILD_IMAGE" anvil-server --version
-          timeout 30s docker run --platform ${{ matrix.platform }} --rm "$ANVIL_BUILD_IMAGE" anvil --version
-          timeout 30s docker run --platform ${{ matrix.platform }} --rm "$ANVIL_BUILD_IMAGE" anvil-admin --version
-
-      - name: Export Docker image artifact
-        run: docker save "$ANVIL_BUILD_IMAGE" -o "${{ runner.temp }}/${{ matrix.artifact }}.tar"
-
-      - name: Upload Docker image artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: ${{ runner.temp }}/${{ matrix.artifact }}.tar
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 1
-
-      - name: Remove local Docker image
-        if: always()
-        run: |
-          if docker image inspect "$ANVIL_BUILD_IMAGE" >/dev/null 2>&1; then
-            docker image rm "$ANVIL_BUILD_IMAGE" || echo "::warning::Failed to remove $ANVIL_BUILD_IMAGE"
-          fi
-
-  static-and-docs:
-    name: Static gates and docs artifact
-    needs: release-context
-    runs-on: [self-hosted, linux, x64, worka-builder-2]
-    timeout-minutes: 45
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.release-context.outputs.commit }}
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install system build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            clang \
-            cmake \
-            libclang-dev \
-            pkg-config \
-            libssl-dev \
-            protobuf-compiler \
-            ripgrep
-
-      - name: Cache Cargo dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: ${{ runner.os }}-release-cargo-v2-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-release-cargo-v2-
-            ${{ runner.os }}-cargo-v2-
-
-      - name: Install Fission CLI
-        run: |
-          if ! command -v fission >/dev/null 2>&1; then
-            cargo install cargo-fission --version 0.4.1 --locked
-          fi
-
-      - name: Run static release gates
-        run: ./scripts/release-gates.sh static
-
-      - name: Upload documentation artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: documentation/target/fission/site
-
-  rust-unit:
-    name: Rust unit and client tests
-    needs: [release-context, build-image, static-and-docs]
-    runs-on: [self-hosted, linux, x64, worka-builder-2]
-    timeout-minutes: 120
-    env:
-      CARGO_BUILD_JOBS: "8"
-      CARGO_PROFILE_DEV_DEBUG: "0"
-      CARGO_PROFILE_TEST_DEBUG: "0"
-      ANVIL_GATE_STEP_TIMEOUT_SECONDS: "5400"
-      ANVIL_RUST_TEST_THREADS: "8"
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.release-context.outputs.commit }}
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install system build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            clang \
-            cmake \
-            libclang-dev \
-            pkg-config \
-            libssl-dev \
-            protobuf-compiler \
-            ripgrep
-
-      - name: Cache Cargo dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: ${{ runner.os }}-release-cargo-v2-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-release-cargo-v2-
-            ${{ runner.os }}-cargo-v2-
-
-      - name: Run Rust unit release gates
-        run: ./scripts/release-gates.sh rust
-
-  coremeta-performance:
-    name: CoreMeta ordered-access release performance gate
-    # Performance evidence is deliberately deferred from the 0.4.0 release
-    # boundary; functional and integrity gates remain required by publish.
-    needs: [release-context, rust-unit]
-    if: ${{ false }}
-    runs-on: [self-hosted, linux, x64, worka-builder-2]
-    timeout-minutes: 180
-    env:
-      CARGO_BUILD_JOBS: "8"
-      ANVIL_MACHINE_CLASS: "worka-builder-2-linux-x64"
-      ANVIL_GATE_STEP_TIMEOUT_SECONDS: "9900"
-      ANVIL_EXPECTED_GIT_COMMIT: ${{ needs.release-context.outputs.commit }}
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.release-context.outputs.commit }}
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install system build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            clang \
-            cmake \
-            libclang-dev \
-            pkg-config \
-            libssl-dev \
-            protobuf-compiler
-
-      - name: Cache Cargo dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: ${{ runner.os }}-release-cargo-v2-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-release-cargo-v2-
-            ${{ runner.os }}-cargo-v2-
-
-      - name: Run release CoreMeta performance gate
-        run: ./scripts/release-gates.sh perf-release
-
-      - name: Upload CoreMeta release performance evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: coremeta-performance-release
-          path: target/anvil/perf/mvcc/release/
-          if-no-files-found: error
-          retention-days: 90
-
-  server-core:
-    name: Server core integration tests
-    needs: [release-context, build-image, static-and-docs]
-    runs-on: [self-hosted, linux, x64, worka-builder-2]
-    timeout-minutes: 60
-    env:
-      CARGO_BUILD_JOBS: "8"
-      CARGO_PROFILE_DEV_DEBUG: "0"
-      CARGO_PROFILE_TEST_DEBUG: "0"
-      ANVIL_RUST_TEST_THREADS: "8"
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.release-context.outputs.commit }}
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install system build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            clang \
-            cmake \
-            libclang-dev \
-            pkg-config \
-            libssl-dev \
-            protobuf-compiler \
-            ripgrep
-
-      - name: Cache Cargo dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: ${{ runner.os }}-release-cargo-v2-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-release-cargo-v2-
-            ${{ runner.os }}-cargo-v2-
-
-      - name: Prebuild server integration test binaries
-        run: cargo test --no-run -p anvil-server --tests
-
-      - name: Run server core integration gates
-        run: ./scripts/release-gates.sh server-core
-
-  mvcc-e2e:
-    name: MVCC under Raft end-to-end acceptance
-    needs: [release-context, build-image, static-and-docs]
-    runs-on: [self-hosted, linux, x64, worka-builder-2]
-    timeout-minutes: 180
-    env:
-      CARGO_BUILD_JOBS: "8"
-      CARGO_PROFILE_DEV_DEBUG: "0"
-      CARGO_PROFILE_TEST_DEBUG: "0"
-      ANVIL_GATE_STEP_TIMEOUT_SECONDS: "5400"
-      ANVIL_RUST_TEST_THREADS: "1"
-      RUST_LOG: warn
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.release-context.outputs.commit }}
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install system build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            clang \
-            cmake \
-            libclang-dev \
-            pkg-config \
-            libssl-dev \
-            protobuf-compiler \
-            ripgrep
-
-      - name: Cache Cargo dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: ${{ runner.os }}-release-cargo-v2-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-release-cargo-v2-
-            ${{ runner.os }}-cargo-v2-
-
-      - name: Run native MVCC and transaction acceptance gates
-        run: ./scripts/release-gates.sh mvcc-e2e
-
-  docker-integration:
-    name: Docker integration tests (${{ matrix.group }})
-    if: ${{ false }}
-    needs: [release-context, build-image, server-core]
-    runs-on: [self-hosted, linux, x64, worka-builder-2]
-    timeout-minutes: 120
-    env:
-      CARGO_BUILD_JOBS: "8"
-      CARGO_PROFILE_DEV_DEBUG: "0"
-      CARGO_PROFILE_TEST_DEBUG: "0"
-      # The runner has 16 cores. Shared-cluster tests can fan out while the
-      # test-utils semaphore continues to cap isolated clusters at two.
-      ANVIL_DOCKER_TEST_THREADS: "8"
-      ANVIL_IMAGE: anvil:test-integration-amd64-${{ github.run_id }}-${{ github.run_attempt }}
-      ANVIL_DOCKER_TEST_PROJECT: anvil-release-${{ matrix.group }}-${{ github.run_id }}-${{ github.run_attempt }}
-      ANVIL_GATE_STEP_TIMEOUT_SECONDS: "5400"
-    strategy:
-      fail-fast: false
-      max-parallel: 1
-      matrix:
-        group: [docker-auth, docker-storage, docker-index, docker-mesh]
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.release-context.outputs.commit }}
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install system build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            clang \
-            cmake \
-            libclang-dev \
-            pkg-config \
-            libssl-dev \
-            protobuf-compiler
-
-      - name: Cache Cargo dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: ${{ runner.os }}-release-cargo-v2-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-release-cargo-v2-
-            ${{ runner.os }}-cargo-v2-
-
-      - name: Prebuild Docker integration test binaries
-        run: cargo test --no-run -p anvil-server -p anvil-storage-cli --tests
-
-      - name: Download amd64 Docker integration image artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: anvil-integration-image-amd64
-          path: ${{ runner.temp }}/anvil-integration-image-amd64
-
-      - name: Load amd64 Docker integration image
-        run: docker load -i "${{ runner.temp }}/anvil-integration-image-amd64/anvil-integration-image-amd64.tar"
-
-      - name: Run Docker integration release gates
-        run: ./scripts/release-gates.sh ${{ matrix.group }}
-
-      - name: Clean up Docker integration resources
-        if: always()
-        run: ./scripts/release-gates.sh docker-cleanup
-
-  publish:
-    name: Publish release artifacts
-    needs:
-      - release-context
-      - build-image
-      - static-and-docs
-      - rust-unit
-      - server-core
-      - mvcc-e2e
-    runs-on: [self-hosted, linux, x64, worka-builder-2]
-    timeout-minutes: 90
-    environment:
-      name: github-pages
-      url: ${{ steps.docs-deployment.outputs.page_url }}
-    permissions:
-      contents: write
-      packages: write
-      pages: write
-      id-token: write
-    env:
-      ANVIL_AMD64_IMAGE: anvil:test-amd64-${{ github.run_id }}-${{ github.run_attempt }}
-      ANVIL_ARM64_IMAGE: anvil:test-arm64-${{ github.run_id }}-${{ github.run_attempt }}
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.release-context.outputs.commit }}
-
-      - name: Verify release tag is still pinned
-        env:
-          RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
-          RELEASE_COMMIT: ${{ needs.release-context.outputs.commit }}
-        run: |
-          git fetch --force --no-tags origin \
-            "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
-          actual_commit="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
-          if [[ "$actual_commit" != "$RELEASE_COMMIT" ]]; then
-            echo "release tag moved after validation" >&2
-            exit 1
-          fi
-
-      - name: Require publishing credentials
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          if [[ -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
-            echo "CARGO_REGISTRY_TOKEN is required to publish anvil-storage" >&2
-            exit 1
-          fi
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install release publication dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            clang \
-            cmake \
-            jq \
-            libclang-dev \
-            libssl-dev \
-            pkg-config \
-            protobuf-compiler
-
-      - name: Cache Cargo dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: ${{ runner.os }}-release-cargo-v2-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-release-cargo-v2-
-            ${{ runner.os }}-cargo-v2-
-
-      - name: Download amd64 Docker image artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: anvil-test-image-amd64
-          path: ${{ runner.temp }}/anvil-image-amd64
-
-      - name: Download arm64 Docker image artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: anvil-test-image-arm64
-          path: ${{ runner.temp }}/anvil-image-arm64
-
-      - name: Load tested Docker image artifacts
-        run: |
-          docker load -i "${{ runner.temp }}/anvil-image-amd64/anvil-test-image-amd64.tar"
-          docker load -i "${{ runner.temp }}/anvil-image-arm64/anvil-test-image-arm64.tar"
-
-      - name: Configure GitHub Pages
-        uses: actions/configure-pages@v5
-
-      - name: Deploy documentation before release publication
-        id: docs-deployment
-        uses: actions/deploy-pages@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -664,86 +146,160 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Push tested multi-architecture Docker image
-        id: docker-push
-        shell: bash
-        run: |
-          tag="${{ needs.release-context.outputs.tag }}"
-          repo="ghcr.io/${{ github.repository }}"
-          image="${repo}:${tag}"
-          amd64_image="${repo}:${tag}-amd64"
-          arm64_image="${repo}:${tag}-arm64"
-          docker tag "$ANVIL_AMD64_IMAGE" "$amd64_image"
-          docker tag "$ANVIL_ARM64_IMAGE" "$arm64_image"
-          docker push "$amd64_image"
-          docker push "$arm64_image"
-          docker buildx imagetools create \
-            --tag "$image" \
-            "$amd64_image" \
-            "$arm64_image"
-          docker buildx imagetools create \
-            --tag "${repo}:latest" \
-            "$amd64_image" \
-            "$arm64_image"
-          inspection="$(docker buildx imagetools inspect "$image")"
-          printf '%s\n' "$inspection"
-          grep -q 'linux/amd64' <<<"$inspection"
-          grep -q 'linux/arm64' <<<"$inspection"
-          digest="$(awk '$1 == "Digest:" { print $2; exit }' <<<"$inspection")"
-          if [[ -z "$digest" || "$digest" != sha256:* ]]; then
-            echo "failed to resolve published image digest for $image" >&2
-            exit 1
-          fi
-          echo "image=$image" >> "$GITHUB_OUTPUT"
-          echo "digest=$digest" >> "$GITHUB_OUTPUT"
-
-      - name: Publish Rust client crate
-        shell: bash
+      - name: Build and push release image by digest
+        id: build
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          DIGEST_FILE: ${{ runner.temp }}/anvil-image-digest-${{ matrix.arch }}.txt
         run: |
-          if [[ -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
-            echo "CARGO_REGISTRY_TOKEN is required to publish anvil-storage" >&2
+          set -euo pipefail
+          repository="ghcr.io/${GITHUB_REPOSITORY,,}"
+          metadata_file="${RUNNER_TEMP}/anvil-image-metadata-${{ matrix.arch }}.json"
+
+          docker buildx build \
+            --platform "$ANVIL_DOCKER_PLATFORM" \
+            --provenance=false \
+            --sbom=false \
+            --output "type=image,name=${repository},push=true,push-by-digest=true,name-canonical=true" \
+            --metadata-file "$metadata_file" \
+            --file anvil/Dockerfile \
+            .
+
+          digest="$(
+            python3 -c '
+          import json, sys
+          with open(sys.argv[1], encoding="utf-8") as metadata:
+              print(json.load(metadata).get("containerimage.digest", ""))
+          ' "$metadata_file"
+          )"
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "native ${ANVIL_DOCKER_PLATFORM} build did not report a valid digest" >&2
             exit 1
           fi
-          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="anvil-storage") | .version')"
-          if scripts/crate-version-exists.py anvil-storage "$version"; then
-            echo "anvil-storage $version is already published; skipping cargo publish"
-          else
-            cargo publish -p anvil-storage --token "$CARGO_REGISTRY_TOKEN"
+          printf '%s\n' "$digest" >"$DIGEST_FILE"
+          printf 'repository=%s\ndigest=%s\n' "$repository" "$digest" >>"$GITHUB_OUTPUT"
+
+      - name: Pull exact release image digest
+        env:
+          IMAGE_REPOSITORY: ${{ steps.build.outputs.repository }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker pull --platform "$ANVIL_DOCKER_PLATFORM" "${IMAGE_REPOSITORY}@${IMAGE_DIGEST}"
+          docker tag "${IMAGE_REPOSITORY}@${IMAGE_DIGEST}" "$ANVIL_IMAGE"
+
+      - name: Smoke release image through gRPC
+        run: ./scripts/release-gates.sh image
+
+      - name: Upload tested release image digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: anvil-release-digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/anvil-image-digest-${{ matrix.arch }}.txt
+          if-no-files-found: error
+          retention-days: 2
+
+      - name: Remove local image
+        if: always()
+        env:
+          IMAGE_REPOSITORY: ${{ steps.build.outputs.repository }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          docker image rm "$ANVIL_IMAGE" || true
+          if [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            docker image rm "${IMAGE_REPOSITORY}@${IMAGE_DIGEST}" || true
           fi
 
-      - name: Render release notes from blog post
+  publish:
+    name: Publish Anvil 0.5 image and release
+    needs: [release-context, validate, build-image]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-context.outputs.commit }}
+
+      - name: Download tested release image digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: anvil-release-digest-*
+          path: ${{ runner.temp }}/anvil-image-digests
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish multi-architecture image
+        id: image
+        env:
+          RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
         run: |
-          scripts/render-release-notes.py \
-            --tag "${{ needs.release-context.outputs.tag }}" \
-            --docker-image "${{ steps.docker-push.outputs.image }}" \
-            --image-digest "${{ steps.docker-push.outputs.digest }}" \
-            --crate-version "anvil-storage $(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="anvil-storage") | .version')" \
-            --commit-sha "${{ needs.release-context.outputs.commit }}" \
-            --docs-url "https://${{ github.repository_owner }}.github.io/anvil/" \
-            --output release-notes.md
+          set -euo pipefail
+          repository="ghcr.io/${GITHUB_REPOSITORY,,}"
+          final_image="${repository}:${RELEASE_TAG}"
+          amd64_digest="$(tr -d '[:space:]' < \
+            "${RUNNER_TEMP}/anvil-image-digests/anvil-release-digest-amd64/anvil-image-digest-amd64.txt")"
+          arm64_digest="$(tr -d '[:space:]' < \
+            "${RUNNER_TEMP}/anvil-image-digests/anvil-release-digest-arm64/anvil-image-digest-arm64.txt")"
+
+          for digest in "$amd64_digest" "$arm64_digest"; do
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "tested release artifact did not contain a valid digest" >&2
+              exit 1
+            fi
+          done
+
+          docker buildx imagetools create \
+            --tag "$final_image" \
+            "${repository}@${amd64_digest}" \
+            "${repository}@${arm64_digest}"
+
+          raw_manifest="$(docker buildx imagetools inspect --raw "$final_image")"
+          AMD64_DIGEST="$amd64_digest" ARM64_DIGEST="$arm64_digest" python3 -c '
+          import json, os, sys
+          manifest = json.load(sys.stdin)
+          published = {
+              "{}/{}".format(
+                  item.get("platform", {}).get("os"),
+                  item.get("platform", {}).get("architecture"),
+              ): item.get("digest")
+              for item in manifest.get("manifests", [])
+          }
+          expected = {
+              "linux/amd64": os.environ["AMD64_DIGEST"],
+              "linux/arm64": os.environ["ARM64_DIGEST"],
+          }
+          if published != expected:
+              raise SystemExit(f"published platform digests {published!r} != {expected!r}")
+          ' <<<"$raw_manifest"
+          inspection="$(docker buildx imagetools inspect "$final_image")"
+          digest="$(awk '$1 == "Digest:" { print $2; exit }' <<<"$inspection")"
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "published image did not report a manifest digest" >&2
+            exit 1
+          fi
+          printf 'image=%s\ndigest=%s\n' "$final_image" "$digest" >>"$GITHUB_OUTPUT"
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.release-context.outputs.tag }}
-          body_path: release-notes.md
+          target_commitish: ${{ needs.release-context.outputs.commit }}
+          generate_release_notes: true
           make_latest: true
+          body: |
+            Anvil 0.5 is a breaking release of the minimal versioned object server.
 
-      - name: Remove local Docker images
-        if: always()
-        run: |
-          tag="${{ needs.release-context.outputs.tag }}"
-          repo="ghcr.io/${{ github.repository }}"
-          for image in \
-            "$ANVIL_AMD64_IMAGE" \
-            "$ANVIL_ARM64_IMAGE" \
-            "${repo}:${tag}" \
-            "${repo}:${tag}-amd64" \
-            "${repo}:${tag}-arm64" \
-            "${repo}:latest"; do
-            if docker image inspect "$image" >/dev/null 2>&1; then
-              docker image rm "$image" || echo "::warning::Failed to remove $image"
-            fi
-          done
+            - Image: `${{ steps.image.outputs.image }}`
+            - Manifest digest: `${{ steps.image.outputs.digest }}`
+            - Source commit: `${{ needs.release-context.outputs.commit }}`

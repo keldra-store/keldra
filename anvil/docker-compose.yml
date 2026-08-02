@@ -1,70 +1,27 @@
-version: "3.8"
-
-networks:
-  anvilnet:
-    driver: bridge
-
 services:
-  anvil1:
-    image: ghcr.io/anvil-storage/anvil:latest
+  anvil:
+    image: ${ANVIL_IMAGE:-ghcr.io/worka-ai/anvil:0.5.0}
     environment:
-      - RUST_LOG=info
-      - REGION=DOCKER_TEST
-      - JWT_SECRET=docker-test-secret
-      - ANVIL_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-      - API_LISTEN_ADDR=0.0.0.0:50051
-      - PUBLIC_API_ADDR=http://anvil1:50051
-      - STORAGE_PATH=/var/lib/anvil
+      RUST_LOG: ${RUST_LOG:-info}
+      ANVIL_LISTEN: 0.0.0.0:50051
+      ANVIL_DATA_DIR: /var/lib/anvil
+      ANVIL_NODE_ID: ${ANVIL_NODE_ID:-1}
+      ANVIL_TOKEN_SIGNING_KEY_FILE: /run/secrets/anvil-token-signing-key
+      ANVIL_RUN_SYSTEM_BOOTSTRAP: ${ANVIL_RUN_SYSTEM_BOOTSTRAP:-false}
+      ANVIL_MAX_ATOMIC_COMMIT_ENTRIES: ${ANVIL_MAX_ATOMIC_COMMIT_ENTRIES:-4096}
+      ANVIL_MAX_ATOMIC_COMMIT_BYTES: ${ANVIL_MAX_ATOMIC_COMMIT_BYTES:-16777216}
+      ANVIL_AWAITING_PUBLISH_TTL_SECONDS: ${ANVIL_AWAITING_PUBLISH_TTL_SECONDS:-86400}
+      ANVIL_MUTATION_RECEIPT_RETENTION_SECONDS: ${ANVIL_MUTATION_RECEIPT_RETENTION_SECONDS:-86400}
+      ANVIL_MAX_MUTATION_RECEIPT_ENTRIES: ${ANVIL_MAX_MUTATION_RECEIPT_ENTRIES:-2000000}
+      ANVIL_MAX_MUTATION_RECEIPT_BYTES: ${ANVIL_MAX_MUTATION_RECEIPT_BYTES:-536870912}
+      ANVIL_WATCH_MAX_ENTRIES: ${ANVIL_WATCH_MAX_ENTRIES:-1000000}
+      ANVIL_WATCH_MAX_BYTES: ${ANVIL_WATCH_MAX_BYTES:-536870912}
     ports:
       - "50051:50051"
     volumes:
-      - anvil1_data:/var/lib/anvil
-    networks: [anvilnet]
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:50051/ready"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-
-  anvil2:
-    image: ghcr.io/anvil-storage/anvil:latest
-    depends_on:
-      anvil1:
-        condition: service_started
-    environment:
-      - RUST_LOG=info
-      - REGION=DOCKER_TEST
-      - JWT_SECRET=docker-test-secret
-      - ANVIL_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-      - API_LISTEN_ADDR=0.0.0.0:50051
-      - PUBLIC_API_ADDR=http://anvil2:50051
-      - STORAGE_PATH=/var/lib/anvil
-    ports:
-      - "50052:50051"
-    volumes:
-      - anvil2_data:/var/lib/anvil
-    networks: [anvilnet]
-
-  anvil3:
-    image: ghcr.io/anvil-storage/anvil:latest
-    depends_on:
-      anvil1:
-        condition: service_started
-    environment:
-      - RUST_LOG=info
-      - REGION=DOCKER_TEST
-      - JWT_SECRET=docker-test-secret
-      - ANVIL_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-      - API_LISTEN_ADDR=0.0.0.0:50051
-      - PUBLIC_API_ADDR=http://anvil3:50051
-      - STORAGE_PATH=/var/lib/anvil
-    ports:
-      - "50053:50051"
-    volumes:
-      - anvil3_data:/var/lib/anvil
-    networks: [anvilnet]
+      - anvil_data:/var/lib/anvil
+      - ${ANVIL_TOKEN_SIGNING_KEY_FILE:?ANVIL_TOKEN_SIGNING_KEY_FILE must name a mode-0600 file}:/run/secrets/anvil-token-signing-key:ro
+    restart: unless-stopped
 
 volumes:
-  anvil1_data:
-  anvil2_data:
-  anvil3_data:
+  anvil_data:

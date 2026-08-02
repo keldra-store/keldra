@@ -1,679 +1,229 @@
-use std::fmt;
+//! Thin Rust transport for Anvil 0.5.
+//!
+//! Domain-specific retry loops deliberately do not live here. Callers send
+//! one-path CAS operations, independent bulk operations, or invoke a
+//! pinned atomic program.
 
+use anvil_api::v1::administration_service_client::AdministrationServiceClient;
+use anvil_api::v1::authz_service_client::AuthzServiceClient;
+use anvil_api::v1::credential_service_client::CredentialServiceClient;
+use anvil_api::v1::object_service_client::ObjectServiceClient;
+use anvil_api::v1::{
+    AccessToken, ExchangeClientCredentialsRequest, MutationReceipt, PutHeader, PutRequest,
+};
 use tonic::metadata::{Ascii, MetadataValue};
 use tonic::service::Interceptor;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Status};
 
-mod generated {
-    tonic::include_proto!("anvil");
+const MAX_MESSAGE_BYTES: usize = 72 * 1024 * 1024;
+
+pub use anvil_api::v1;
+
+#[derive(Clone)]
+pub struct BearerToken {
+    value: MetadataValue<Ascii>,
 }
 
-pub mod proto {
-    pub use super::generated::read_consistency;
-    pub use super::generated::{
-        AbortMultipartRequest, AbortMultipartResponse, AcquireTaskLeaseRequest, AnvilError,
-        AppendStreamRecordInfo, AppendStreamRecordRequest, AppendStreamRecordResponse,
-        ApplicationDescriptor, ApplyAuthzSchemaRequest, ApplyAuthzSchemaResponse,
-        AuditEventsResponse, AuthzAllowedSubject, AuthzMaterializationMode, AuthzNamespaceSchema,
-        AuthzRelationRule, AuthzRelationSchema, AuthzRevisionMode, AuthzSchemaMemberKind,
-        AuthzSchemaRef, AuthzScope, AuthzSubject, AuthzSubjectSelectorKind, AuthzTuple,
-        AuthzTupleMutation, BeginTransactionRequest, BeginTransactionResponse,
-        BindAuthzSchemaRequest, BindAuthzSchemaResponse, BoundaryDimension, BoundaryExtractionMode,
-        BoundaryMigrationMode, BoundaryMigrationStatus, BoundarySchemaRecord,
-        BoundarySchemaResponse, BoundarySource, BoundaryValue, Bucket, ByteRange,
-        CancelHfIngestionRequest, CancelHfIngestionResponse, CheckPermissionRequest,
-        CheckPermissionResponse, CheckPermissionsRequest, CheckPermissionsResponse,
-        CheckpointTaskLeaseRequest, CommitTaskLeaseRequest, CommitTaskLeaseResponse,
-        CommitTransactionRequest, CompareAndSwapManifestRequest, CompareAndSwapManifestResponse,
-        CompleteMultipartPart, CompleteMultipartRequest, CompleteMultipartResponse,
-        ComposeObjectRequest, ComposeObjectResponse, ComposeObjectSource, ConsistencyMode,
-        CopyObjectRequest, CopyObjectResponse, CreateAppendStreamRequest,
-        CreateAppendStreamResponse, CreateApplicationCredentialRequest, CreateBucketRequest,
-        CreateBucketResponse, CreateHfKeyRequest, CreateHfKeyResponse, CreateHostAliasRequest,
-        CreateIndexRequest, CreateObjectLinkRequest, CreatePersonalDbGroupRequest,
-        CreatePersonalDbProjectionRequest, DType, DeleteApplicationCredentialRequest,
-        DeleteApplicationCredentialResponse, DeleteBucketRequest, DeleteBucketResponse,
-        DeleteHfKeyRequest, DeleteHfKeyResponse, DeleteHostAliasRequest, DeleteObjectLinkRequest,
-        DeleteObjectRequest, DeleteObjectResponse, DisableIndexRequest, DropIndexRequest,
-        DropIndexResponse, ForceReleaseTaskLeaseRequest, ForceReleaseTaskLeaseResponse,
-        GetAccessTokenRequest, GetAccessTokenResponse, GetAuthzSchemaBindingRequest,
-        GetAuthzSchemaBindingResponse, GetAuthzSchemaRequest, GetAuthzSchemaResponse,
-        GetBoundaryMigrationRequest, GetBoundarySchemaRequest, GetBucketPolicyRequest,
-        GetBucketPolicyResponse, GetGitBlobByPathRequest, GetGitBlobByPathResponse,
-        GetGitObjectRequest, GetGitObjectResponse, GetHfIngestionStatusRequest,
-        GetHfIngestionStatusResponse, GetObjectRequest, GetObjectResponse,
-        GetPackageVersionRequest, GetPartitionMapRequest, GetPersonalDbGroupRequest,
-        GetPersonalDbProjectionRequest, GetStorageClassRequest, GetTensorChunk, GetTensorRequest,
-        GetTensorsRequest, GetTransactionRequest, GitBlobLocation, GitPackMetadata,
-        GitTreeEntryRecord, GrantAccessRequest, GrantAccessResponse, HeadObjectRequest,
-        HeadObjectResponse, HfKey, IndexBuildRecord, IndexDefinitionRecord,
-        IndexDefinitionResponse, IndexDiagnosticRecord, IndexKind, IndexMaintenanceMode,
-        IndexPolicySnapshotMode, IndexQueryHit, InitiateMultipartRequest,
-        InitiateMultipartResponse, LeaseFencePrecondition, ListAccessGrantsRequest,
-        ListAccessGrantsResponse, ListApplicationsRequest, ListApplicationsResponse,
-        ListAuditEventsRequest, ListAuthzObjectsRequest, ListAuthzObjectsResponse,
-        ListAuthzSubjectsRequest, ListAuthzSubjectsResponse, ListBucketsRequest,
-        ListBucketsResponse, ListGitTreeRequest, ListGitTreeResponse, ListHfKeysRequest,
-        ListHfKeysResponse, ListIndexDiagnosticsRequest, ListIndexDiagnosticsResponse,
-        ListIndexesRequest, ListIndexesResponse, ListObjectLinksRequest, ListObjectLinksResponse,
-        ListObjectVersionsRequest, ListObjectVersionsResponse, ListObjectsRequest,
-        ListObjectsResponse, ListPackageVersionsRequest, ListPackageVersionsResponse,
-        ListRepairFindingsRequest, ListRepairFindingsResponse, ListStorageClassesRequest,
-        ListStorageClassesResponse, ListTensorsRequest, ListTensorsResponse, ModelManifest,
-        MoveBucketRequest, MutationBatchAppendStreamRecord, MutationBatchCheckpointTaskLease,
-        MutationBatchCommitTaskLease, MutationBatchCompareAndSwapManifest,
-        MutationBatchDeleteObject, MutationBatchOperation, MutationBatchOperationReceipt,
-        MutationBatchPatchJsonObject, MutationBatchPutObject, MutationBatchRequest,
-        MutationBatchResponse, MutationResponse, MvccDurability, MvccReadConsistency,
-        NativeMutationContext, ObjectInfo, ObjectLinkResponse, ObjectMetadata, ObjectRef,
-        ObjectSummary, ObjectVersionPrecondition, ObjectVersionSummary, PackageVersion,
-        PageRequest, PageResponse, PartitionMap, PatchJsonObjectRequest, PatchJsonObjectResponse,
-        PersonalDbCatchUpEntry, PersonalDbCatchUpRequest, PersonalDbCatchUpResponse,
-        PersonalDbCommitCertificateRecord, PersonalDbCommittedHeadRecord,
-        PersonalDbGroupManifestRecord, PersonalDbGroupResponse, PersonalDbLogRecord,
-        PersonalDbProjectionResponse, PersonalDbSnapshotsHeadRecord, PersonalDbVoterAck,
-        PublicMutationContext, PutAuthzSchemaRequest, PutAuthzSchemaResponse,
-        PutBoundarySchemaRequest, PutBucketPolicyRequest, PutBucketPolicyResponse, PutCellRequest,
-        PutGitPackRequest, PutGitPackResponse, PutModelManifestRequest, PutModelManifestResponse,
-        PutNodeRequest, PutObjectRequest, PutObjectResponse, PutPackageBlobRequest,
-        PutPackageVersionRequest, PutRegionRequest, PutRegistryRefRequest, QueryIndexRequest,
-        QueryIndexResponse, QuerySpecRequest, QuerySpecResponse, ReadAppendStreamRequest,
-        ReadAppendStreamResponse, ReadAuthzTuplesRequest, ReadAuthzTuplesResponse, ReadConsistency,
-        ReadObjectLinkRequest, ReadTaskLeaseRequest, ReadTaskLeaseResponse,
-        RepairAuthzDerivedIndexRequest, RepairAuthzDerivedIndexResponse,
-        RepairDirectoryIndexRequest, RepairDirectoryIndexResponse, RepairFindingRecord,
-        RepairIndexRequest, RepairIndexResponse, RepairPersonalDbLogChainRequest,
-        RepairPersonalDbLogChainResponse, RepairSubjectRecord, RevokeAccessRequest,
-        RevokeAccessResponse, RollbackTransactionRequest, RollbackTransactionResponse,
-        RotateApplicationCredentialSecretRequest, SealAppendStreamSegmentRequest,
-        SealAppendStreamSegmentResponse, SetPublicAccessRequest, SetPublicAccessResponse,
-        StartBoundaryMigrationRequest, StartHfIngestionRequest, StartHfIngestionResponse,
-        StorageClassDescriptor, StorageClassResponse, SubmitPersonalDbChangesetRequest,
-        SubmitPersonalDbChangesetResponse, TailAppendStreamRequest, TailAppendStreamResponse,
-        TaskLease, TaskLeaseResponse, TenantScope, TensorIndexRow, TransactionStatus,
-        UpdateIndexRequest, UpdateObjectLinkRequest, UploadPartMetadata, UploadPartRequest,
-        UploadPartResponse, VerifyHostAliasRequest, WatchAuthzDerivedLagRequest,
-        WatchAuthzDerivedLagResponse, WatchAuthzNamespaceRequest, WatchAuthzNamespaceResponse,
-        WatchAuthzTupleLogRequest, WatchAuthzTupleLogResponse, WatchBucketMetadataRequest,
-        WatchBucketMetadataResponse, WatchEventEnvelope, WatchGitSourceRequest,
-        WatchGitSourceResponse, WatchIndexDefinitionRequest, WatchIndexDefinitionResponse,
-        WatchIndexPartitionRequest, WatchIndexPartitionResponse, WatchPersonalDbGroupRequest,
-        WatchPersonalDbGroupResponse, WatchPersonalDbProjectionRequest,
-        WatchPersonalDbProjectionResponse, WatchPrefixRequest, WatchPrefixResponse,
-        WatchVisibilityMode, WriteAuthzTupleRequest, WriteAuthzTupleResponse,
-        WriteAuthzTuplesRequest, WriteAuthzTuplesResponse, WriteOptions, WritePrecondition,
-        WriteResponse, WriteState, WriteVisibilityOptions, admin_service_client,
-        audit_service_client, auth_service_client, bucket_service_client,
-        coordination_service_client, get_object_response, git_source_service_client,
-        hf_ingestion_service_client, hugging_face_key_service_client, index_service_client,
-        mesh_control_service_client, model_manifest, model_service_client,
-        mutation_batch_operation, object_service_client, personal_db_service_client,
-        put_git_pack_request, put_object_request, registry_service_client, repair_service_client,
-        stream_service_client, transaction_service_client, upload_part_request, write_options,
-    };
-}
-
-#[derive(Clone, Default)]
-pub struct BearerInterceptor {
-    authorization: Option<MetadataValue<Ascii>>,
-}
-
-impl BearerInterceptor {
-    pub fn new(
-        token: impl AsRef<str>,
-    ) -> Result<Self, tonic::metadata::errors::InvalidMetadataValue> {
-        Ok(Self {
-            authorization: Some(bearer_metadata(token)?),
-        })
-    }
-
-    pub fn anonymous() -> Self {
-        Self {
-            authorization: None,
-        }
+impl BearerToken {
+    pub fn new(token: &str) -> Result<Self, tonic::metadata::errors::InvalidMetadataValue> {
+        format!("Bearer {token}")
+            .parse()
+            .map(|value| Self { value })
     }
 }
 
-impl Interceptor for BearerInterceptor {
+impl Interceptor for BearerToken {
     fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
-        if let Some(value) = &self.authorization {
-            request
-                .metadata_mut()
-                .insert("authorization", value.clone());
-        }
+        request
+            .metadata_mut()
+            .insert("authorization", self.value.clone());
         Ok(request)
     }
 }
 
-pub fn bearer_metadata(
-    token: impl AsRef<str>,
-) -> Result<MetadataValue<Ascii>, tonic::metadata::errors::InvalidMetadataValue> {
-    let mut value: MetadataValue<Ascii> = format!("Bearer {}", token.as_ref()).parse()?;
-    value.set_sensitive(true);
-    Ok(value)
-}
+pub type RawClient =
+    ObjectServiceClient<tonic::service::interceptor::InterceptedService<Channel, BearerToken>>;
+pub type RawAdministrationClient = AdministrationServiceClient<
+    tonic::service::interceptor::InterceptedService<Channel, BearerToken>,
+>;
+pub type RawAuthzClient =
+    AuthzServiceClient<tonic::service::interceptor::InterceptedService<Channel, BearerToken>>;
 
-pub fn native_context_with_transaction(
-    mut context: proto::NativeMutationContext,
-    transaction_id: impl Into<String>,
-) -> proto::NativeMutationContext {
-    context.transaction_id = Some(transaction_id.into());
-    context
-}
-
-pub fn write_options_with_transaction(
-    mut options: proto::WriteOptions,
-    transaction_id: impl Into<String>,
-) -> proto::WriteOptions {
-    options.execution = Some(proto::write_options::Execution::TransactionId(
-        transaction_id.into(),
-    ));
-    options
-}
-
-#[derive(Clone)]
-pub struct BeginTransaction {
-    request: proto::BeginTransactionRequest,
-}
-
-impl BeginTransaction {
-    pub fn new(
-        idempotency_key: impl Into<String>,
-        cluster_id: impl Into<String>,
-        ttl_ms: u64,
-        read_consistency: proto::MvccReadConsistency,
-        durability: proto::MvccDurability,
-    ) -> Self {
-        Self {
-            request: proto::BeginTransactionRequest {
-                idempotency_key: idempotency_key.into(),
-                ttl_ms,
-                read_consistency: read_consistency as i32,
-                cluster_id: cluster_id.into(),
-                durability: durability as i32,
-            },
-        }
-    }
-
-    pub fn into_proto(self) -> proto::BeginTransactionRequest {
-        self.request
-    }
-}
-
-impl From<BeginTransaction> for proto::BeginTransactionRequest {
-    fn from(value: BeginTransaction) -> Self {
-        value.into_proto()
-    }
-}
-
-impl tonic::IntoRequest<proto::BeginTransactionRequest> for BeginTransaction {
-    fn into_request(self) -> Request<proto::BeginTransactionRequest> {
-        Request::new(self.into_proto())
-    }
-}
-
-#[derive(Clone)]
-pub struct CommitTransaction {
-    request: proto::CommitTransactionRequest,
-}
-
-impl CommitTransaction {
-    pub fn new(transaction_id: impl Into<String>, cluster_id: impl Into<String>) -> Self {
-        Self {
-            request: proto::CommitTransactionRequest {
-                transaction_id: transaction_id.into(),
-                cluster_id: cluster_id.into(),
-            },
-        }
-    }
-
-    pub fn into_proto(self) -> proto::CommitTransactionRequest {
-        self.request
-    }
-}
-
-impl From<CommitTransaction> for proto::CommitTransactionRequest {
-    fn from(value: CommitTransaction) -> Self {
-        value.into_proto()
-    }
-}
-
-impl tonic::IntoRequest<proto::CommitTransactionRequest> for CommitTransaction {
-    fn into_request(self) -> Request<proto::CommitTransactionRequest> {
-        Request::new(self.into_proto())
-    }
-}
-
-#[derive(Clone)]
-pub struct RollbackTransaction {
-    request: proto::RollbackTransactionRequest,
-}
-
-impl RollbackTransaction {
-    pub fn new(
-        transaction_id: impl Into<String>,
-        cluster_id: impl Into<String>,
-        reason: impl Into<String>,
-    ) -> Self {
-        Self {
-            request: proto::RollbackTransactionRequest {
-                transaction_id: transaction_id.into(),
-                reason: reason.into(),
-                cluster_id: cluster_id.into(),
-            },
-        }
-    }
-
-    pub fn into_proto(self) -> proto::RollbackTransactionRequest {
-        self.request
-    }
-}
-
-impl From<RollbackTransaction> for proto::RollbackTransactionRequest {
-    fn from(value: RollbackTransaction) -> Self {
-        value.into_proto()
-    }
-}
-
-impl tonic::IntoRequest<proto::RollbackTransactionRequest> for RollbackTransaction {
-    fn into_request(self) -> Request<proto::RollbackTransactionRequest> {
-        Request::new(self.into_proto())
-    }
-}
-
-#[derive(Clone)]
-pub struct GetTransaction {
-    request: proto::GetTransactionRequest,
-}
-
-impl GetTransaction {
-    pub fn new(transaction_id: impl Into<String>, cluster_id: impl Into<String>) -> Self {
-        Self {
-            request: proto::GetTransactionRequest {
-                transaction_id: transaction_id.into(),
-                cluster_id: cluster_id.into(),
-            },
-        }
-    }
-
-    pub fn into_proto(self) -> proto::GetTransactionRequest {
-        self.request
-    }
-}
-
-impl From<GetTransaction> for proto::GetTransactionRequest {
-    fn from(value: GetTransaction) -> Self {
-        value.into_proto()
-    }
-}
-
-impl tonic::IntoRequest<proto::GetTransactionRequest> for GetTransaction {
-    fn into_request(self) -> Request<proto::GetTransactionRequest> {
-        Request::new(self.into_proto())
-    }
-}
-
-#[derive(Clone)]
-pub struct MutationBatch {
-    request: proto::MutationBatchRequest,
-}
-
-impl MutationBatch {
-    pub fn new(
-        bucket_name: impl Into<String>,
-        mutation_context: proto::NativeMutationContext,
-    ) -> Self {
-        Self {
-            request: proto::MutationBatchRequest {
-                bucket_name: bucket_name.into(),
-                mutation_context: Some(mutation_context),
-                precondition: None,
-                operations: Vec::new(),
-            },
-        }
-    }
-
-    pub fn with_precondition(mut self, precondition: proto::WritePrecondition) -> Self {
-        self.request.precondition = Some(precondition);
-        self
-    }
-
-    pub fn with_operations(
-        mut self,
-        operations: impl IntoIterator<Item = proto::MutationBatchOperation>,
-    ) -> Self {
-        self.request.operations = operations.into_iter().collect();
-        self
-    }
-
-    pub fn push_operation(mut self, operation: proto::MutationBatchOperation) -> Self {
-        self.request.operations.push(operation);
-        self
-    }
-
-    pub fn put_object(operation: proto::MutationBatchPutObject) -> proto::MutationBatchOperation {
-        proto::MutationBatchOperation {
-            op: Some(proto::mutation_batch_operation::Op::PutObject(operation)),
-        }
-    }
-
-    pub fn patch_json_object(
-        operation: proto::MutationBatchPatchJsonObject,
-    ) -> proto::MutationBatchOperation {
-        proto::MutationBatchOperation {
-            op: Some(proto::mutation_batch_operation::Op::PatchJsonObject(
-                operation,
-            )),
-        }
-    }
-
-    pub fn delete_object(
-        operation: proto::MutationBatchDeleteObject,
-    ) -> proto::MutationBatchOperation {
-        proto::MutationBatchOperation {
-            op: Some(proto::mutation_batch_operation::Op::DeleteObject(operation)),
-        }
-    }
-
-    pub fn append_stream_record(
-        operation: proto::MutationBatchAppendStreamRecord,
-    ) -> proto::MutationBatchOperation {
-        proto::MutationBatchOperation {
-            op: Some(proto::mutation_batch_operation::Op::AppendStreamRecord(
-                operation,
-            )),
-        }
-    }
-
-    pub fn checkpoint_task_lease(
-        operation: proto::MutationBatchCheckpointTaskLease,
-    ) -> proto::MutationBatchOperation {
-        proto::MutationBatchOperation {
-            op: Some(proto::mutation_batch_operation::Op::CheckpointTaskLease(
-                operation,
-            )),
-        }
-    }
-
-    pub fn commit_task_lease(
-        operation: proto::MutationBatchCommitTaskLease,
-    ) -> proto::MutationBatchOperation {
-        proto::MutationBatchOperation {
-            op: Some(proto::mutation_batch_operation::Op::CommitTaskLease(
-                operation,
-            )),
-        }
-    }
-
-    pub fn compare_and_swap_manifest(
-        operation: proto::MutationBatchCompareAndSwapManifest,
-    ) -> proto::MutationBatchOperation {
-        proto::MutationBatchOperation {
-            op: Some(proto::mutation_batch_operation::Op::CompareAndSwapManifest(
-                operation,
-            )),
-        }
-    }
-
-    pub fn into_proto(self) -> proto::MutationBatchRequest {
-        self.request
-    }
-}
-
-impl From<MutationBatch> for proto::MutationBatchRequest {
-    fn from(value: MutationBatch) -> Self {
-        value.into_proto()
-    }
-}
-
-impl tonic::IntoRequest<proto::MutationBatchRequest> for MutationBatch {
-    fn into_request(self) -> Request<proto::MutationBatchRequest> {
-        Request::new(self.into_proto())
-    }
-}
-
-pub type InterceptedChannel =
-    tonic::service::interceptor::InterceptedService<Channel, BearerInterceptor>;
-
-impl fmt::Debug for BearerInterceptor {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("BearerInterceptor")
-            .field(
-                "authorization",
-                &self.authorization.as_ref().map(|_| "<redacted>"),
-            )
-            .finish()
-    }
-}
-
-#[derive(Clone)]
-pub struct AnvilClient {
+pub fn object_client(
     channel: Channel,
-    interceptor: BearerInterceptor,
+    token: &str,
+) -> Result<RawClient, tonic::metadata::errors::InvalidMetadataValue> {
+    Ok(
+        ObjectServiceClient::with_interceptor(channel, BearerToken::new(token)?)
+            .max_encoding_message_size(MAX_MESSAGE_BYTES)
+            .max_decoding_message_size(MAX_MESSAGE_BYTES),
+    )
 }
 
-impl fmt::Debug for AnvilClient {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("AnvilClient")
-            .field("channel", &"<channel>")
-            .field("interceptor", &self.interceptor)
-            .finish()
-    }
+pub fn administration_client(
+    channel: Channel,
+    token: &str,
+) -> Result<RawAdministrationClient, tonic::metadata::errors::InvalidMetadataValue> {
+    Ok(
+        AdministrationServiceClient::with_interceptor(channel, BearerToken::new(token)?)
+            .max_encoding_message_size(MAX_MESSAGE_BYTES)
+            .max_decoding_message_size(MAX_MESSAGE_BYTES),
+    )
 }
 
-impl AnvilClient {
-    pub async fn connect<D>(endpoint: D) -> Result<Self, tonic::transport::Error>
-    where
-        D: TryInto<Endpoint>,
-        D::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-    {
-        let channel = Endpoint::new(endpoint)?.connect().await?;
-        Ok(Self::from_channel(channel))
-    }
+pub fn authz_client(
+    channel: Channel,
+    token: &str,
+) -> Result<RawAuthzClient, tonic::metadata::errors::InvalidMetadataValue> {
+    Ok(
+        AuthzServiceClient::with_interceptor(channel, BearerToken::new(token)?)
+            .max_encoding_message_size(MAX_MESSAGE_BYTES)
+            .max_decoding_message_size(MAX_MESSAGE_BYTES),
+    )
+}
 
-    pub async fn connect_with_bearer<D>(
-        endpoint: D,
-        token: impl AsRef<str>,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>>
-    where
-        D: TryInto<Endpoint>,
-        D::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-    {
-        let channel = Endpoint::new(endpoint)?.connect().await?;
-        Ok(Self::from_channel_with_bearer(channel, token)?)
-    }
+pub async fn connect(
+    endpoint: impl AsRef<str>,
+    token: &str,
+) -> Result<RawClient, Box<dyn std::error::Error + Send + Sync>> {
+    let channel = connect_channel(endpoint).await?;
+    Ok(object_client(channel, token)?)
+}
 
-    pub fn from_channel(channel: Channel) -> Self {
-        Self {
-            channel,
-            interceptor: BearerInterceptor::anonymous(),
-        }
-    }
+/// Opens the shared transport used by object, authorization and administration
+/// clients. Keeping credential exchange separate makes the one unauthenticated
+/// RPC explicit at call sites.
+pub async fn connect_channel(
+    endpoint: impl AsRef<str>,
+) -> Result<Channel, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(Endpoint::from_shared(endpoint.as_ref().to_owned())?
+        .connect()
+        .await?)
+}
 
-    pub fn from_channel_with_bearer(
-        channel: Channel,
-        token: impl AsRef<str>,
-    ) -> Result<Self, tonic::metadata::errors::InvalidMetadataValue> {
-        Ok(Self {
-            channel,
-            interceptor: BearerInterceptor::new(token)?,
+/// Exchanges one durable application credential for a short-lived bearer
+/// token. Production endpoints must be protected by TLS; the client secret is
+/// sent only in this request and is never retained by this transport.
+pub async fn exchange_client_credentials(
+    channel: Channel,
+    client_id: impl Into<String>,
+    client_secret: impl Into<String>,
+) -> Result<AccessToken, tonic::Status> {
+    CredentialServiceClient::new(channel)
+        .exchange_client_credentials(ExchangeClientCredentialsRequest {
+            client_id: client_id.into(),
+            client_secret: client_secret.into(),
         })
+        .await
+        .map(tonic::Response::into_inner)
+}
+
+/// Convenience for callers that want an object client directly from durable
+/// credentials. Long-lived applications should repeat exchange when their
+/// short-lived token expires, not persist the returned bearer token forever.
+pub async fn connect_with_credentials(
+    endpoint: impl AsRef<str>,
+    client_id: impl Into<String>,
+    client_secret: impl Into<String>,
+) -> Result<RawClient, Box<dyn std::error::Error + Send + Sync>> {
+    let channel = connect_channel(endpoint).await?;
+    let token = exchange_client_credentials(channel.clone(), client_id, client_secret).await?;
+    Ok(object_client(channel, &token.access_token)?)
+}
+
+/// Executes the public StartPut + Put + PutEnd flow for owned chunks.
+/// Empty input sends the required single empty chunk and therefore creates a
+/// valid zero-byte object. This helper is for already-owned, infallible input;
+/// a fallible file or network producer must cancel the in-flight RPC on source
+/// failure so a short read cannot become a clean end-of-stream publication.
+pub async fn put_chunks<I>(
+    client: &mut RawClient,
+    header: PutHeader,
+    chunks: I,
+) -> Result<MutationReceipt, tonic::Status>
+where
+    I: IntoIterator<Item = Vec<u8>>,
+    I::IntoIter: Send + 'static,
+{
+    let token = client.start_put(header).await?.into_inner();
+    let mut chunks = chunks.into_iter().peekable();
+    if chunks.peek().is_none() {
+        let ready = client
+            .put(tokio_stream::iter([PutRequest {
+                token: Some(token),
+                chunk: Vec::new(),
+            }]))
+            .await
+            .map(tonic::Response::into_inner)?;
+        return client.put_end(ready).await.map(tonic::Response::into_inner);
+    }
+    let requests = chunks.map(move |chunk| PutRequest {
+        token: Some(token.clone()),
+        chunk,
+    });
+    let ready = client
+        .put(tokio_stream::iter(requests))
+        .await
+        .map(tonic::Response::into_inner)?;
+    client.put_end(ready).await.map(tonic::Response::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use tonic::transport::Endpoint;
+
+    use super::v1::{
+        CreateBucketRequest, DeleteIfVersionRequest, DeleteVersionRequest, DeleteVersionResponse,
+        Durability, ObjectVersioning, PutHeader,
+    };
+    use super::{
+        MAX_MESSAGE_BYTES, RawAdministrationClient, RawAuthzClient, RawClient,
+        administration_client, authz_client, object_client,
+    };
+
+    #[test]
+    fn versioning_defaults_to_unversioned_and_delete_operations_stay_distinct() {
+        assert_eq!(
+            CreateBucketRequest::default().versioning,
+            ObjectVersioning::Unversioned as i32
+        );
+        let conditional_current_delete = DeleteIfVersionRequest {
+            expected_version: 9,
+            ..Default::default()
+        };
+        let retained_delete = DeleteVersionRequest {
+            version: 8,
+            ..Default::default()
+        };
+        assert_eq!(conditional_current_delete.expected_version, 9);
+        assert_eq!(retained_delete.version, 8);
+        assert_eq!(
+            DeleteVersionResponse {
+                deleted: true,
+                replacement_tombstone_version: Some(10),
+            }
+            .replacement_tombstone_version,
+            Some(10)
+        );
     }
 
-    pub fn admin(&self) -> proto::admin_service_client::AdminServiceClient<InterceptedChannel> {
-        proto::admin_service_client::AdminServiceClient::with_interceptor(
-            self.channel.clone(),
-            self.interceptor.clone(),
-        )
+    #[test]
+    fn replicated_durability_is_preserved_for_the_server_to_reject() {
+        let header = PutHeader {
+            durability: Durability::Replicated as i32,
+            ..Default::default()
+        };
+        assert_eq!(header.durability, Durability::Replicated as i32);
+        assert_ne!(header.durability, Durability::Local as i32);
     }
 
-    pub fn auth(&self) -> proto::auth_service_client::AuthServiceClient<InterceptedChannel> {
-        proto::auth_service_client::AuthServiceClient::with_interceptor(
-            self.channel.clone(),
-            self.interceptor.clone(),
-        )
-    }
-
-    pub fn coordination(
-        &self,
-    ) -> proto::coordination_service_client::CoordinationServiceClient<InterceptedChannel> {
-        proto::coordination_service_client::CoordinationServiceClient::with_interceptor(
-            self.channel.clone(),
-            self.interceptor.clone(),
-        )
-    }
-
-    pub fn buckets(&self) -> proto::bucket_service_client::BucketServiceClient<InterceptedChannel> {
-        proto::bucket_service_client::BucketServiceClient::with_interceptor(
-            self.channel.clone(),
-            self.interceptor.clone(),
-        )
-    }
-
-    pub fn objects(&self) -> proto::object_service_client::ObjectServiceClient<InterceptedChannel> {
-        proto::object_service_client::ObjectServiceClient::with_interceptor(
-            self.channel.clone(),
-            self.interceptor.clone(),
-        )
-    }
-
-    pub async fn put_boundary_schema(
-        &self,
-        request: impl tonic::IntoRequest<proto::PutBoundarySchemaRequest>,
-    ) -> Result<tonic::Response<proto::BoundarySchemaResponse>, Status> {
-        self.objects().put_boundary_schema(request).await
-    }
-
-    pub async fn get_boundary_schema(
-        &self,
-        request: impl tonic::IntoRequest<proto::GetBoundarySchemaRequest>,
-    ) -> Result<tonic::Response<proto::BoundarySchemaResponse>, Status> {
-        self.objects().get_boundary_schema(request).await
-    }
-
-    pub fn indexes(&self) -> proto::index_service_client::IndexServiceClient<InterceptedChannel> {
-        proto::index_service_client::IndexServiceClient::with_interceptor(
-            self.channel.clone(),
-            self.interceptor.clone(),
-        )
-    }
-
-    pub fn git_sources(
-        &self,
-    ) -> proto::git_source_service_client::GitSourceServiceClient<InterceptedChannel> {
-        proto::git_source_service_client::GitSourceServiceClient::with_interceptor(
-            self.channel.clone(),
-            self.interceptor.clone(),
-        )
-    }
-
-    pub fn personaldb(
-        &self,
-    ) -> proto::personal_db_service_client::PersonalDbServiceClient<InterceptedChannel> {
-        proto::personal_db_service_client::PersonalDbServiceClient::with_interceptor(
-            self.channel.clone(),
-            self.interceptor.clone(),
-        )
-    }
-
-    pub fn repair(&self) -> proto::repair_service_client::RepairServiceClient<InterceptedChannel> {
-        proto::repair_service_client::RepairServiceClient::with_interceptor(
-            self.channel.clone(),
-            self.interceptor.clone(),
-        )
-    }
-
-    pub fn hugging_face_keys(
-        &self,
-    ) -> proto::hugging_face_key_service_client::HuggingFaceKeyServiceClient<InterceptedChannel>
-    {
-        proto::hugging_face_key_service_client::HuggingFaceKeyServiceClient::with_interceptor(
-            self.channel.clone(),
-            self.interceptor.clone(),
-        )
-    }
-
-    pub fn hf_ingestion(
-        &self,
-    ) -> proto::hf_ingestion_service_client::HfIngestionServiceClient<InterceptedChannel> {
-        proto::hf_ingestion_service_client::HfIngestionServiceClient::with_interceptor(
-            self.channel.clone(),
-            self.interceptor.clone(),
-        )
-    }
-
-    pub fn models(&self) -> proto::model_service_client::ModelServiceClient<InterceptedChannel> {
-        proto::model_service_client::ModelServiceClient::with_interceptor(
-            self.channel.clone(),
-            self.interceptor.clone(),
-        )
-    }
-
-    pub fn transactions(
-        &self,
-    ) -> proto::transaction_service_client::TransactionServiceClient<InterceptedChannel> {
-        proto::transaction_service_client::TransactionServiceClient::with_interceptor(
-            self.channel.clone(),
-            self.interceptor.clone(),
-        )
-    }
-
-    pub async fn begin_transaction(
-        &self,
-        request: impl tonic::IntoRequest<proto::BeginTransactionRequest>,
-    ) -> Result<tonic::Response<proto::BeginTransactionResponse>, Status> {
-        self.transactions().begin_transaction(request).await
-    }
-
-    pub async fn commit_transaction(
-        &self,
-        request: impl tonic::IntoRequest<proto::CommitTransactionRequest>,
-    ) -> Result<tonic::Response<proto::WriteResponse>, Status> {
-        self.transactions().commit_transaction(request).await
-    }
-
-    pub async fn rollback_transaction(
-        &self,
-        request: impl tonic::IntoRequest<proto::RollbackTransactionRequest>,
-    ) -> Result<tonic::Response<proto::RollbackTransactionResponse>, Status> {
-        self.transactions().rollback_transaction(request).await
-    }
-
-    pub async fn get_transaction(
-        &self,
-        request: impl tonic::IntoRequest<proto::GetTransactionRequest>,
-    ) -> Result<tonic::Response<proto::TransactionStatus>, Status> {
-        self.transactions().get_transaction(request).await
-    }
-
-    pub async fn mutation_batch(
-        &self,
-        request: impl tonic::IntoRequest<proto::MutationBatchRequest>,
-    ) -> Result<tonic::Response<proto::MutationBatchResponse>, Status> {
-        self.objects().mutation_batch(request).await
-    }
-
-    pub async fn list_storage_classes(
-        &self,
-        request: impl tonic::IntoRequest<proto::ListStorageClassesRequest>,
-    ) -> Result<tonic::Response<proto::ListStorageClassesResponse>, Status> {
-        self.admin().list_storage_classes(request).await
-    }
-
-    pub async fn get_storage_class(
-        &self,
-        request: impl tonic::IntoRequest<proto::GetStorageClassRequest>,
-    ) -> Result<tonic::Response<proto::StorageClassResponse>, Status> {
-        self.admin().get_storage_class(request).await
-    }
-
-    pub fn audit(&self) -> proto::audit_service_client::AuditServiceClient<InterceptedChannel> {
-        proto::audit_service_client::AuditServiceClient::with_interceptor(
-            self.channel.clone(),
-            self.interceptor.clone(),
-        )
+    #[tokio::test]
+    async fn every_authenticated_service_constructor_uses_the_shared_transport_surface() {
+        assert_eq!(MAX_MESSAGE_BYTES, 72 * 1024 * 1024);
+        let channel = Endpoint::from_static("http://127.0.0.1:50051").connect_lazy();
+        let _: RawClient = object_client(channel.clone(), "token").unwrap();
+        let _: RawAuthzClient = authz_client(channel.clone(), "token").unwrap();
+        let _: RawAdministrationClient = administration_client(channel, "token").unwrap();
     }
 }
