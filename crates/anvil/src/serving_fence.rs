@@ -107,6 +107,7 @@ pub(crate) struct ServingFence<C = LinuxBootClock> {
     clock: C,
     current: ServingFenceIdentity,
     active: Option<ActiveGrant>,
+    next_renewal_at: Option<BootInstant>,
     last_clock_reading: Option<BootInstant>,
 }
 
@@ -116,6 +117,7 @@ impl<C: BootClock> ServingFence<C> {
             clock,
             current,
             active: None,
+            next_renewal_at: None,
             last_clock_reading: None,
         }
     }
@@ -140,16 +142,36 @@ impl<C: BootClock> ServingFence<C> {
             });
         }
 
+        let changed = self.current.raft_term != raft_term
+            || self.current.active_membership_log_index != active_membership_log_index;
         self.current.raft_term = raft_term;
         self.current.active_membership_log_index = active_membership_log_index;
+        if changed {
+            self.next_renewal_at = None;
+        }
         Ok(())
+    }
+
+    /// Whether the first request or the next fixed-cadence renewal should be
+    /// started now. A slow in-flight request never postpones the cadence.
+    pub(crate) fn renewal_due(&mut self) -> Result<bool, ServingFenceError> {
+        let Some(next_renewal_at) = self.next_renewal_at else {
+            return Ok(true);
+        };
+        Ok(self.read_clock()? >= next_renewal_at)
     }
 
     /// Captures the local start of a future grant round trip.
     pub(crate) fn start_grant_request(&mut self) -> Result<ServingGrantRequest, ServingFenceError> {
+        let started_at = self.read_clock()?;
+        self.next_renewal_at = Some(
+            started_at
+                .checked_add(SERVING_LEASE_RENEWAL_CADENCE)
+                .ok_or(ServingFenceError::ClockRangeExceeded)?,
+        );
         Ok(ServingGrantRequest {
             identity: self.current,
-            started_at: self.read_clock()?,
+            started_at,
         })
     }
 
@@ -470,6 +492,40 @@ mod tests {
         fence.validate().unwrap();
         clock.set(Duration::from_millis(2_500));
         assert_eq!(fence.validate(), Err(ServingFenceError::Expired));
+    }
+
+    #[test]
+    fn renewal_cadence_is_anchored_to_each_request_start() {
+        let clock = FakeBootClock::new();
+        let current = identity(5, 11);
+        let mut fence = ServingFence::new(clock.clone(), current);
+
+        assert_eq!(fence.renewal_due(), Ok(true));
+        let _first = fence.start_grant_request().unwrap();
+        clock.set(Duration::from_millis(499));
+        assert_eq!(fence.renewal_due(), Ok(false));
+        clock.set(SERVING_LEASE_RENEWAL_CADENCE);
+        assert_eq!(fence.renewal_due(), Ok(true));
+
+        let _second = fence.start_grant_request().unwrap();
+        clock.set(Duration::from_millis(999));
+        assert_eq!(fence.renewal_due(), Ok(false));
+        clock.set(Duration::from_millis(1_000));
+        assert_eq!(fence.renewal_due(), Ok(true));
+    }
+
+    #[test]
+    fn consensus_change_requests_a_fresh_grant_immediately() {
+        let clock = FakeBootClock::new();
+        let current = identity(5, 11);
+        let mut fence = ServingFence::new(clock.clone(), current);
+        let request = fence.start_grant_request().unwrap();
+        fence.accept_grant(request, grant(current)).unwrap();
+
+        clock.set(Duration::from_millis(100));
+        assert_eq!(fence.renewal_due(), Ok(false));
+        fence.observe_consensus(6, 12).unwrap();
+        assert_eq!(fence.renewal_due(), Ok(true));
     }
 
     #[test]
