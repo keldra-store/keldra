@@ -20,7 +20,7 @@ concurrency:
 jobs:
   release-context:
     name: Resolve immutable release context
-    runs-on: [self-hosted, linux, x64, worka-builder-2]
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
       tag: ${{ steps.release.outputs.tag }}
@@ -61,7 +61,7 @@ jobs:
   validate:
     name: Validate Anvil 0.5 release
     needs: release-context
-    runs-on: [self-hosted, linux, x64, worka-builder-2]
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
       ANVIL_GATE_STEP_TIMEOUT_SECONDS: '5400'
@@ -126,7 +126,7 @@ jobs:
         include:
           - platform: linux/amd64
             arch: amd64
-            runner: worka-builder-2
+            runner: ubuntu-24.04
           - platform: linux/arm64
             arch: arm64
             runner: ubuntu-24.04-arm
@@ -212,7 +212,7 @@ jobs:
   publish:
     name: Publish Anvil 0.5 image and release
     needs: [release-context, validate, build-image]
-    runs-on: [self-hosted, linux, x64, worka-builder-2]
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
       contents: write

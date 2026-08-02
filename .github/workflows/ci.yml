@@ -18,7 +18,7 @@ permissions:
 jobs:
   static:
     name: Static checks
-    runs-on: [self-hosted, linux, x64, worka-builder-2]
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - name: Checkout repository
@@ -59,7 +59,7 @@ jobs:
   rust:
     name: Anvil 0.5 workspace tests
     needs: static
-    runs-on: [self-hosted, linux, x64, worka-builder-2]
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
       ANVIL_GATE_STEP_TIMEOUT_SECONDS: '4800'
@@ -112,7 +112,7 @@ jobs:
         include:
           - platform: linux/amd64
             arch: amd64
-            runner: worka-builder-2
+            runner: ubuntu-24.04
           - platform: linux/arm64
             arch: arm64
             runner: ubuntu-24.04-arm

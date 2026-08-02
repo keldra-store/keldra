@@ -10,7 +10,7 @@ fi
 
 for required in \
   'final_image="${repository}:${RELEASE_TAG}"' \
-  'runner: worka-builder-2' \
+  'runner: ubuntu-24.04' \
   'runner: ubuntu-24.04-arm' \
   '--platform "$ANVIL_DOCKER_PLATFORM"' \
   '--provenance=false' \
