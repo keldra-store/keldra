@@ -242,6 +242,11 @@ impl DecisionRaft {
                 )));
             }
             let descriptor = &cluster.nodes()[&NodeId(node_id)];
+            if descriptor.state != NodeState::Joining {
+                return Err(DecisionRaftError::Configuration(format!(
+                    "node {node_id} is no longer JOINING"
+                )));
+            }
             if descriptor.peer_address.0 != node.address {
                 return Err(DecisionRaftError::Configuration(format!(
                     "node {node_id} address does not match its admitted descriptor"
@@ -275,18 +280,31 @@ impl DecisionRaft {
         let decisions = self.state()?;
         let cluster = decisions.cluster_control();
         if !cluster.nodes().is_empty() {
-            let expected_voters = cluster
-                .transition()
-                .filter(|transition| transition.kind == MembershipTransitionKind::Remove)
-                .map_or_else(
-                    || cluster.voter_target(),
-                    |_| {
-                        cluster
-                            .active_node_count()
-                            .saturating_sub(1)
-                            .min(crate::FIXED_VOTER_TARGET)
-                    },
-                );
+            let transition = cluster.transition().ok_or_else(|| {
+                DecisionRaftError::Configuration(
+                    "Raft voters change only during ADD activation or REMOVE".into(),
+                )
+            })?;
+            let expected_voters = match transition.kind {
+                MembershipTransitionKind::Add => {
+                    let descriptor = &cluster.nodes()[&transition.node_id];
+                    if descriptor.state != NodeState::Active {
+                        return Err(DecisionRaftError::Configuration(
+                            "a JOINING node cannot participate in a voter change".into(),
+                        ));
+                    }
+                    cluster.voter_target()
+                }
+                MembershipTransitionKind::Remove => cluster
+                    .active_node_count()
+                    .saturating_sub(1)
+                    .min(crate::FIXED_VOTER_TARGET),
+                MembershipTransitionKind::Reweight => {
+                    return Err(DecisionRaftError::Configuration(
+                        "REWEIGHT does not change Raft voters".into(),
+                    ));
+                }
+            };
             if voters.len() != expected_voters {
                 return Err(DecisionRaftError::Configuration(format!(
                     "cluster requires exactly {expected_voters} voters, not {}",

@@ -7,6 +7,7 @@
 
 mod cluster_control;
 mod codec;
+mod membership;
 mod peer;
 mod peer_tls;
 mod raft;

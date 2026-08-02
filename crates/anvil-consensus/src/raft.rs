@@ -950,6 +950,15 @@ impl DecisionRaft {
             .map_err(|_| DecisionRaftError::StatePoisoned)
     }
 
+    pub(crate) fn committed_membership(
+        &self,
+    ) -> Result<StoredMembership<u64, BasicNode>, DecisionRaftError> {
+        self.machine
+            .lock()
+            .map(|state| state.membership.clone())
+            .map_err(|_| DecisionRaftError::StatePoisoned)
+    }
+
     pub async fn wait_for_leader(&self, timeout: Duration) -> Result<u64, DecisionRaftError> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
