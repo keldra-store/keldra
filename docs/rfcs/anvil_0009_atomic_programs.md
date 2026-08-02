@@ -1,7 +1,6 @@
 # ANVIL-0009: Bounded Atomic Programs in the Anvil 0.5 Core
 
-Status: Accepted architecture for the Anvil 0.5.0 core. The explicitly listed
-architecture gaps must be closed before implementation is release-qualified.
+Status: Accepted architecture for the Anvil 0.5.0 core.
 
 Audience: Anvil implementors, client authors, operators, and reviewers
 
@@ -10,8 +9,8 @@ restoration or emulation of an earlier API.
 
 ## 1. Decision
 
-Anvil 0.5.0 is an exact-path, opaque, versioned object store with a deliberately
-small core:
+Anvil 0.5.0 is an exact-path, opaque object store with monotonic path versions
+and deliberately optional historical-version retention. Its core is small:
 
 - exact-path reads;
 - ordinary `Put`, `Delete`, and compare-and-swap;
@@ -104,7 +103,7 @@ There is no general transaction class between them.
 4. Keep application payloads and path cardinality out of Raft.
 5. Keep the executor fence valid in the 0.5.0 one-node topology and reusable by
    a later distributed capability without adding distributed locks.
-6. Keep Raft state and replay receipts explicitly bounded.
+6. Keep Raft state and committed-invocation replay explicitly bounded.
 7. Provide reliable invalidation watches without inventing a global event
    sequence.
 8. Ingest the pinned Developer Defence OSV corpus into the Developer Defence
@@ -152,6 +151,11 @@ that exact path, including across deletion and recreation. Clients use equality
 for CAS and may compare versions only when they belong to the same exact path;
 versions from different paths establish no order and are not transaction IDs.
 
+Version numbers and retained historical versions are separate concerns. Every
+successful head-changing mutation receives a fresh monotonic version number.
+Bucket versioning decides only whether a displaced payload version remains
+addressable and continues to hold a content reference.
+
 An exact-path read returns:
 
 ```text
@@ -180,7 +184,100 @@ Version(expected_version)
 `PutImmutable` is an `Absent` convenience with idempotent same-content replay.
 An existing different value is a conflict.
 
-### 5.1 Ordinary writes are not atomic programs
+`content_type` is optional opaque UTF-8 metadata limited to 512 encoded bytes.
+Bulk request byte limits count complete encoded operations—including addresses,
+conditions, command IDs, content types, and protobuf framing—not only payload
+bytes.
+
+### 5.1 Bucket versioning and permanent deletion
+
+Each bucket has one fixed version-retention mode:
+
+```text
+UNVERSIONED  default
+ENABLED      one-way opt-in
+```
+
+Enabling versioning is an authorised bucket-management operation. It is
+stored separately from path policy and cannot be disabled or suspended in
+0.5.0. Existing current values simply become the first retained values when
+the capability is enabled; enabling it does not rewrite their payloads or
+version numbers.
+
+In an `UNVERSIONED` bucket, publishing a replacement retires the displaced
+payload version and its content references in the same metadata batch that
+installs the new head. Deleting publishes a fresh tombstone and retires the
+displaced payload. Only the current head is addressable.
+
+In an `ENABLED` bucket, publishing a replacement retains the displaced
+version. A normal `Delete` publishes a fresh tombstone but retains every older
+payload and tombstone. `GetObject(version)` and `ListObjectVersions` are
+available only for such buckets.
+
+`DeleteVersion` is the explicit permanent-deletion operation for one retained
+version:
+
+- deleting a non-current version removes only that version and its content
+  references; the head does not change;
+- deleting the current live payload removes that version and atomically
+  publishes a fresh monotonic tombstone as the new head;
+- deleting the current tombstone fails with
+  `CURRENT_TOMBSTONE_VERSION_CANNOT_BE_DELETED`; and
+- a missing version is an idempotent no-op.
+
+An older version never becomes current merely because a newer version was
+permanently deleted. The fresh tombstone is the CAS and ABA fence: an old
+`PutIfVersion` expectation can never become true again after deletion. Any
+future restoration capability must publish a fresh version referring to the
+deduplicated content; 0.5.0 has no operation that repoints the head to an old
+version identity.
+
+Content reference counts describe retained logical payload versions, not
+unique byte copies. With versioning enabled, storing identical content as a
+new retained version increments its reference count while the bytes remain
+deduplicated. In an unversioned replacement, reference changes are calculated
+as exact old/new deltas: content present in both is unchanged, newly referenced
+content is incremented, and retired content is decremented. A same-content
+overwrite therefore advances the path version without changing the count.
+
+### 5.2 Current live path listing
+
+`ListObjects(prefix)` is a Zanzibar-authorized, unary paged read over one
+bucket's current heads. The prefix is literal UTF-8: it has no directory or
+common-prefix semantics, and an empty prefix selects the whole bucket. A page
+contains only strictly ascending live paths plus `has_more`; it never returns
+payload, hash, version, content type, tombstones, or an opaque cursor. The
+client resumes by sending the last path it already received as the exclusive
+`start_after` value. The default page size is 100 and the maximum is 1,000.
+
+Each page is read committed. One RocksDB snapshot supplies that page, but no
+snapshot is retained between requests. A later page may therefore include a
+newly committed path or omit one deleted after the preceding page. Because
+listing reveals child names, an exact-path read grant is insufficient: the
+caller must have bucket-wide `get_object` permission and the requested tenant
+must be the authenticated caller's storage tenant.
+
+0.5.0 reads the ordinary `heads` column family directly; there is no listing
+side index or side storage. Every head key is exactly
+`[format_version:u8][tenant_id:u64 BE][bucket_id:u64 BE][raw UTF-8 path]`.
+Mutable tenant and bucket names resolve through a separate versioned, typed
+name mapping at the request boundary; they never enter object keys. A RocksDB
+iterator can consequently seek straight to the requested
+`[version][tenant ID][bucket ID][literal path prefix]`, emit live paths in
+byte-lexical order, and stop as soon as that prefix no longer matches.
+Retained-version keys use that same base followed by one NUL terminator and a
+big-endian u64 version ID. Canonical paths already forbid NUL, so exact-path
+version iteration is unambiguous without length-prefixing the path.
+
+The `names` column family uses `[format_version][name_type][scope][name] ->
+u64 ID`: type 1 is a tenant with an empty scope, and type 2 is a bucket scoped
+by its tenant ID. Tenant and bucket records themselves are keyed by stable ID.
+IDs come from the same snowflake-style allocator as path versions, and the
+allocator high watermark is persisted in the provisioning batch. Renaming is
+not a 0.5.0 API, but a future rename therefore changes only name resolution,
+not any object key or listing range.
+
+### 5.3 Ordinary writes are not atomic programs
 
 Ordinary `Put`, `Delete`, and CAS publish one path. They do not:
 
@@ -194,7 +291,7 @@ Their implementation must still make one path's version/head change atomic and
 must durably couple the corresponding source invalidation with that change.
 That single-path storage property is not a transaction API.
 
-### 5.2 Durability choice
+### 5.4 Durability choice
 
 Every write request retains one per-request durability choice. It is a closed
 choice, not an opaque policy name:
@@ -207,8 +304,8 @@ REPLICATED
 `LOCAL` is the only satisfiable choice in the single-node 0.5.0 release. A
 successful response means the payload and authoritative metadata required by
 that operation have completed the node's configured synchronous durable write.
-For an atomic program, all prepared artifacts are locally durable before the
-one-node Raft group accepts `CommitBatch`.
+For an atomic program, every output blob and the prepared ordinary bundle blob
+are locally durable before the one-node Raft group accepts `CommitBatch`.
 
 `REPLICATED` is a valid stable request value but 0.5.0 returns
 `DURABILITY_UNAVAILABLE` without publishing the mutation because one node
@@ -221,7 +318,85 @@ number `N` of distinct storage nodes. The later capability must define the
 replica or erasure-fragment evidence precisely; accepting the enum today does
 not invent that evidence. Unknown durability values are invalid requests.
 
-### 5.3 Bulk transport
+#### 5.4.1 Shard placement, references, and garbage collection
+
+Byte-plane placement is a pure function of a shard identity and the current
+storage membership:
+
+```text
+owners = HRW(shard_id, current_storage_membership)
+```
+
+Every node can calculate the same owners. When membership changes, HRW changes
+the owner set and the shard record moves with its bytes. Raft does not store or
+decide shard assignments, placement epochs, payload hashes, reference counts,
+or garbage-collection work. In a later distributed capability, cluster
+membership is the only Raft-owned input to this placement calculation.
+
+Each HRW-selected owner stores shard bytes and one fixed 25-byte lifecycle
+record containing only:
+
+```text
+ShardRecord {
+  bytes
+  lifecycle = {
+    ref_count: u64
+    flags: u8 = { AWAITING_PUBLISH }
+    created_at_unix_millis: u64
+    updated_at_unix_millis: u64
+  }
+}
+```
+
+There is no per-shard list of reference IDs and no upload or preparation lease.
+`ref_count` records references to the shard, including a sealed reference that
+has not yet been published. `AWAITING_PUBLISH` marks that sealed but unpublished
+state. `created_at` records first creation; `updated_at` records the most recent
+lifecycle activity.
+
+Every immutable version descriptor contains only a content-addressed
+reference. Payload bytes are never copied inline into the descriptor. Anvil
+0.5.0 stores payloads of at most 64 KiB as raw bytes in a dedicated RocksDB
+column family keyed by `(content_hash, content_length)` and larger payloads in
+the filesystem byte plane under the same identity. The location is therefore
+deterministic and needs no placement row, reference-ID inventory, or per-value
+storage flag. Identical bytes have one physical representation in either
+plane.
+
+A bounded bulk write keeps small bytes in memory until validation is complete,
+then writes the deduplicated bytes, lifecycle changes, immutable descriptors,
+heads, receipts, and invalidations in one synchronous RocksDB batch. It does
+not fsync once per logical item. A streamed small upload seals its bytes and
+`AWAITING_PUBLISH` lifecycle in one synchronous batch before returning its
+ready token, then removes and synchronizes the temporary filesystem copy.
+Garbage collection removes eligible small bytes with their lifecycle metadata;
+large bytes use corresponding durable filesystem removal. Orphan scans cover
+both byte planes.
+
+The first successful seal stores `ref_count = 1`, sets `AWAITING_PUBLISH`, and
+updates `updated_at`. `PutEnd` publishes that already-counted reference by
+clearing `AWAITING_PUBLISH`; it does not increment `ref_count` again. Removal of
+a reference decrements the count.
+
+Garbage collection first applies one universal inactivity grace: it never
+removes a blob whose `updated_at` is less than the configured unpublished
+timeout old. After that threshold, a blob is eligible when either:
+
+- `ref_count == 0`; or
+- `AWAITING_PUBLISH` is set.
+
+The timeout is never measured from `created_at`, so sealing identical existing
+content and every reference-count change refresh the safety window. It is
+configurable and defaults to 24 hours. A valid `PutEnd` may republish still
+retained count-zero bytes during that window, restoring the count to one. This
+simple grace makes any number of identical uploads safe when they complete
+within the threshold without recording per-upload identities. Count, flags,
+and timestamps travel with the shard record during HRW rebalancing. After an
+ungraceful loss, garbage collection remains disabled for reconstructed shards
+until their counts have been rebuilt from authoritative object metadata. This
+rebuild does not add a reference-ID inventory to the shard record.
+
+### 5.5 Bulk transport
 
 `BulkWrite` carries many independent ordinary commands in one bounded request:
 
@@ -239,7 +414,7 @@ Bulk transport is the normal Developer Defence import path. Independent OSV
 records must not pay one RPC, one consensus round, or one fsync each merely
 because the importer was written as a loop.
 
-### 5.4 Path policy
+### 5.6 Path policy
 
 Path policies are capability admission rules:
 
@@ -267,7 +442,7 @@ return to ordinary mutation. A one-path atomic program remains a valid way to
 change such a path. Prefixes may select policy, but prefixes are never locks
 and are never expanded into Raft state.
 
-### 5.5 Core Zanzibar authorization
+### 5.7 Core Zanzibar authorization
 
 Zanzibar authorization is part of the 0.5 storage core. It is not an index,
 gateway, compatibility feature, or optional policy plug-in. Anvil uses the same
@@ -337,6 +512,14 @@ stable application subject installed as `Caller`. Protected typed provisioning
 operations create storage tenants, applications, buckets, and their validated
 system-realm ownership or grant tuples. They do not expose public mutation of
 the reserved system scope or add an administrator bypass.
+
+Every server start requires an operator-managed token-signing key through
+`--token-signing-key-file`. It must be a regular non-symlink file, mode `0600`,
+at most 4 KiB, and contain at least 32 bytes. Anvil reads it at startup and
+never persists or logs it. Every node that must accept the same tokens receives
+the same key through the operator's secret distribution mechanism. The
+credential-exchange RPC sends a long-lived secret and therefore requires TLS
+termination in production; 0.5.0 does not pretend cleartext gRPC is secure.
 
 An authorization realm is identified by:
 
@@ -408,7 +591,7 @@ the protected system realm. Subsequent authority comes from Zanzibar tuples,
 not from an `admin` flag. Schema publication is tenant-wide; realm binding and
 realm operations are authorized independently.
 
-#### 5.5.1 Schemas and bindings
+#### 5.7.1 Schemas and bindings
 
 A storage tenant owns immutable, canonical schema revisions:
 
@@ -441,7 +624,7 @@ The bounded schema language has:
 There are no caveats in 0.5.0. A hash field without stored expressions and
 request-context evaluation is not caveat support and is omitted.
 
-#### 5.5.2 Tuple batches, revisions, and checks
+#### 5.7.2 Tuple batches, revisions, and checks
 
 A tuple mutation batch belongs to one realm, contains at most the configured
 hard maximum, and applies all-or-nothing in one durable metadata write. Every
@@ -476,9 +659,9 @@ schema-less compatibility fallback.
 
 Authorization tuples and schema bodies are data-plane metadata, not Raft
 commands. They are stored and atomically updated beside other authoritative
-metadata. Raft may decide placement or leadership needed by the distributed
-metadata plane, but tuple cardinality, schema bodies, and permission walks do
-not enter the Raft log.
+metadata. A later distributed metadata plane derives placement from HRW over
+current storage membership; Raft carries no placement decisions. Tuple
+cardinality, schema bodies, and permission walks do not enter the Raft log.
 
 ## 6. Atomic programs
 
@@ -510,7 +693,6 @@ possible_write_path_templates[]
 maximum_path_count
 maximum_input_bytes
 maximum_value_bytes
-maximum_emitted_bytes
 maximum_execution_work
 ```
 
@@ -525,9 +707,8 @@ needed in output are explicit inputs or deterministic derivations from the
 invocation ID. Execution has hard path, byte, time, and work limits. It cannot
 make network calls or trigger external effects inside the commit.
 
-Whether the first implementation represents a program as a small interpreter
-definition or as a compiled built-in handler is an explicit architecture gap
-in section 16. Either representation must obey this same data-plane contract.
+The first implementation is the bounded JSON interpreter fixed in section 16.
+There is no compiled built-in handler or arbitrary-code alternative.
 
 ## 7. The singleton executor
 
@@ -577,9 +758,14 @@ Every expanded path is locked, including a path the program only reads. Since
 all such paths are `PROGRAM_ONLY`, every possible mutator uses this same table.
 Ordinary mutations fail admission rather than waiting on these locks.
 
-Sorted acquisition prevents local deadlock. Deadlines, cancellation, fair
-waiting, and hard execution limits bound contention. A crash needs no lock
-recovery.
+Sorted acquisition prevents local deadlock. One absolute invocation deadline
+covers lock acquisition, evaluation, commit, and finalization. Its
+startup-configured server maximum defaults to 30 seconds; a standard client
+gRPC deadline may shorten but never extend it. Expiry cancels the in-flight
+executor future, releases its local lock guards, and returns gRPC
+`DEADLINE_EXCEEDED`. Tokio's mutex wait queue is cancellation-safe and fair, so
+a cancelled waiter neither retains an already acquired lock nor blocks later
+waiters. A crash needs no lock recovery.
 
 The program reads current committed state only after it owns every lock.
 Therefore an invocation that waited behind another sees the earlier invocation's
@@ -598,17 +784,39 @@ While holding its exact-path locks, the current executor:
 2. reads every required committed head/value;
 3. executes the deterministic program;
 4. allocates the result version identities;
-5. creates every immutable payload and version descriptor;
-6. creates one canonical bundle describing all old-head expectations and new
-   heads;
-7. writes all payloads, descriptors, and the bundle to the byte plane in
-   an invisible prepared namespace; and
+5. seals every immutable output payload through the ordinary content-addressed
+   byte plane;
+6. creates one canonical bundle containing all old-head expectations, new
+   version descriptors, the command receipt, and the output payload
+   references;
+7. seals that bundle through the same ordinary content-addressed byte plane;
+   and
 8. waits until the configured durability class is satisfied.
 
-Nothing prepared is visible through ordinary reads. Preparation may be
-repeated by content hash. An unreferenced preparation is an orphan eligible for
-bounded garbage collection after its executor fence is stale or its preparation
-deadline passes.
+Nothing prepared is visible through ordinary object reads because no head
+points at it. There is no special preparation repository, column family, file
+class, reference scheme, or garbage collector. Output payloads and the bundle
+are ordinary opaque blobs and use the normal deterministic small or large byte
+plane with the normal fixed lifecycle record. Preparation may be repeated by
+content hash. Sealing records the first reference and sets
+`AWAITING_PUBLISH`.
+
+If no Raft decision names a preparation, its awaiting output payloads and
+bundle age out through the normal inactive-blob GC. If Raft commits, recovery
+loads the bundle by its ordinary `(content_hash, content_length)` reference.
+Finalization converts the output reservations into the exact retained
+object-version references and releases the temporary bundle reference. The
+bundle then reaches count zero and ages out through that same GC. A node always
+recovers its committed Raft tail before running startup blob GC, so a committed
+but unfinalized bundle cannot be removed merely because the node was offline
+longer than the inactivity threshold.
+
+The blob inactivity threshold must be at least the 24-hour atomic replay
+window. Finalization refreshes the released bundle's `updated_at`, so the
+ordinary count-zero blob remains readable for every unexpired replay promise.
+There is no receipt column family, bundle-release queue, special replay lease,
+or expiry-time decrement. Once the ordinary inactivity threshold passes,
+normal blob GC removes the count-zero bundle.
 
 For `LOCAL` in 0.5.0, the entire recoverable result is synchronously durable on
 the sole node before consensus. This protects process restart and ordinary
@@ -632,20 +840,25 @@ CommitBatch {
   program_hash
   executor_node_id
   executor_nomination_log_index
-  bundle_ref
+  bundle_ref = { content_hash, content_length }
   bundle_hash
-  durability_class
+  durability
   durability_evidence_hash
+  proposal_at_unix_millis
+  replay_expires_at_unix_millis
 }
 ```
 
 The command contains no object body, program definition, complete version
 descriptor, path list, or lock record. Before proposing it, the executor has
 already loaded the named program object, verified its content hash, and
-authorised its expanded paths. Raft validates the current nomination fence,
-invocation replay state still retained by the core, bounded command shape, and
-bundle/durability identities. It records the pinned object-path identity and
-content hash; it does not maintain or consult a program registry.
+authorised its expanded paths. The executor records its wall-clock proposal
+observation and the exact expiry 24 hours later in the command so every Raft
+apply performs identical expiry decisions. Raft validates the current
+nomination fence, invocation replay state still retained by the core, bounded
+command shape, exact expiry, and bundle/durability identities. It records the
+pinned object-path identity and content hash; it does not maintain or consult a
+program registry.
 
 The committed Raft log index `C` of `CommitBatch` is the batch's commit cursor.
 It is assigned by consensus, not by the client. Committing `CommitBatch` is the
@@ -654,7 +867,7 @@ predicate stamp, draft synchronization, or second decision.
 
 The executor releases locks only after `CommitBatch` commits or the invocation
 definitively fails. If its response is lost after commit, retry uses the bounded
-receipt described in section 10.
+committed invocation described in section 10.
 
 ## 9. Visibility and idempotent finalization
 
@@ -672,9 +885,12 @@ distributed capability must separately choose its follower freshness and proxy
 contract before adding followers.
 
 Finalization materialises committed versions and heads from the durable bundle
-into serving structures. In 0.5.0 the entire bundle, its receipt, and required
-invalidations are installed in one local atomic metadata write. Finalization is
-keyed by `(C, bundle_hash)` and is idempotent:
+into serving structures. In 0.5.0 the versions, heads, required invalidations,
+blob-reference changes, and one compact applied marker are installed in one
+local atomic metadata write. The applied marker contains only the commit cursor
+and fixed-size bundle, program, and durability identities; it never copies the
+command receipt, returned JSON, or path/version map. Finalization is keyed by
+`(C, bundle_hash)` and is idempotent:
 
 - repeating finalization produces the same versions and heads;
 - a conflicting bundle for `C` is corruption;
@@ -692,7 +908,7 @@ caller can read path A, an atomic batch can commit, and a later independent read
 of path B can see the new value. The atomic guarantee is that a serving view at
 one learned commit boundary does not expose a partial batch.
 
-## 10. Recovery, bounded Raft state, and receipts
+## 10. Recovery and bounded Raft state
 
 ### 10.1 Failure outcomes
 
@@ -702,7 +918,7 @@ one learned commit boundary does not expose a partial batch.
 | After partial preparation | No new state is visible; partial data is an orphan. |
 | After durable preparation but before `CommitBatch` | No new state is visible; retry may reuse the prepared content. |
 | After `CommitBatch` but before finalization | The batch is committed and visible logically; recovery fetches and finalizes the bundle. |
-| After finalization but before response | Retry returns the retained receipt. |
+| After finalization but before response | Retry reconstructs the exact original response from the retained committed invocation and ordinary bundle. |
 | Old executor proposes after renomination in a later distributed cluster | Raft rejects its stale nomination log index. |
 | A node cannot fetch a committed bundle | It must not serve a partial or falsely current view. |
 
@@ -717,11 +933,13 @@ FinalizedThrough { commit_log_index }
 
 In 0.5.0 the checkpoint advances monotonically only after the sole node has
 atomically installed every earlier `CommitBatch`, including versions, heads,
-receipt, and invalidations, and has durably advanced its applied commit cursor.
+invalidations, and the compact applied commit cursor.
 Once a checkpoint is included in a Raft snapshot, older batch commands may be
 compacted. The snapshot retains the current executor nomination,
-finalized-through index, and only the bounded replay state still inside its
-advertised window. A later distributed capability must define a new
+finalized-through index, and one authoritative bounded
+`committed_invocations` collection. `FinalizedThrough` removes entries only
+from the recovery tail; it does not erase unexpired replay entries. A later
+distributed capability must define a new
 cluster-wide finalized-through criterion before it adds followers.
 
 The tail has hard entry and byte limits. If finalization cannot advance and the
@@ -730,7 +948,7 @@ commits. It must not grow Raft without bound, discard recovery information, or
 pretend an unfinalized batch is safe. Independent ordinary object operations do
 not become transactions merely because atomic-program admission is stalled.
 
-### 10.3 Bounded invocation receipts
+### 10.3 Bounded committed-invocation replay
 
 Within the advertised replay window:
 
@@ -739,16 +957,23 @@ Within the advertised replay window:
 - the same invocation ID with different input fails; and
 - a lost response can be recovered without reapplying the program.
 
-Receipts are bounded by configured time and space limits. Every successful
-response reports the replay-guarantee expiry. After that point Anvil does not
+Committed invocation replay entries are retained in the Raft state machine for
+exactly 24 hours and are bounded to 4,096 entries and 16 MiB. Every successful
+response reports the replay-guarantee expiry. Unexpired entries are never
+evicted for capacity; new atomic commits receive backpressure instead. On each
+new `CommitBatch`, Raft deterministically removes entries whose committed
+expiry is at or before that command's proposal time, but only when those
+entries are already at or below `FinalizedThrough`. Expired entries may
+therefore remain harmlessly bounded until the next atomic commit. After the
+reported expiry Anvil does not
 promise that an old invocation can be distinguished from a new submission or
 that its original response can be reconstructed. A caller must not blindly
 retry an expired financial or otherwise non-repeatable operation; it must
 reconcile using domain state such as the immutable ledger-entry path.
 
-The exact safe treatment of an expired invocation ID is an open architecture
-gap in section 16. The RFC does not hide an unbounded receipt table behind the
-word idempotency.
+A retry loads and verifies the already ordinary prepared bundle named by the
+committed invocation and reconstructs the exact original result and published
+path versions from it. No local result copy is authoritative or required.
 
 ## 11. `WatchPrefix`: unordered invalidation, not CDC
 
@@ -830,6 +1055,12 @@ source's retention floor, or its source epoch is not current, the server
 returns `RESUME_EXPIRED` and requires a full prefix rebuild. It must not
 silently skip to the current tail.
 
+Starting a watch requires bucket-wide `get_object` authority because an exact
+grant on the prefix object cannot authorize disclosure of arbitrary children.
+Authentication and Zanzibar authorization are evaluated when the stream opens.
+0.5.0 does not poll for later token expiry or tuple revocation inside an
+already-open stream; reconnecting always reauthenticates and reauthorizes.
+
 This contract is sufficient for future current-state index builders: reread
 the latest path state, update or remove the derived row conditional on source
 version, and persist a checkpoint only after all prior work is durable. An
@@ -887,37 +1118,80 @@ balance waits, then reads balance 95 and recalculates. A command for another
 balance can execute concurrently at the same singleton because its locks do not
 overlap.
 
-A retry inside the receipt window returns the original result. After that
+A retry inside the replay window returns the original result. After that
 window, the immutable ledger path remains the domain-level evidence that
 `op-42` was already recorded.
 
 ## 13. Semantic API shapes
 
-These shapes define capability boundaries, not protobuf field numbers.
+These shapes define capability boundaries, not protobuf field numbers. Put
+setup is unary so a client cannot send a payload frame before its complete
+header; the payload itself is the only client stream.
 
 ```text
-Get {
-  tenant, bucket, path, version = CURRENT | specific
-}
-
-Put {
-  command_id, tenant, bucket, path, bytes,
-  condition = Any | Absent | Version(v),
+StartPut {
+  command_id, tenant, bucket, path, content_type,
+  operation = Put | PutIfAbsent | PutIfVersion(v) | PutImmutable,
   durability = LOCAL | REPLICATED
-}
+} -> UPLOAD PutToken
+
+Put(stream {
+  upload_token,
+  bytes
+}) -> READY PutToken
+
+PutEnd {
+  ready_token
+} -> MutationReceipt
 
 Delete {
   command_id, tenant, bucket, path,
-  condition = Any | Version(v),
   durability = LOCAL | REPLICATED
 }
 
+DeleteIfVersion {
+  command_id, tenant, bucket, path, expected_version,
+  durability = LOCAL | REPLICATED
+}
+
+DeleteVersion {
+  tenant, bucket, path, version,
+  durability = LOCAL | REPLICATED
+} -> { deleted, replacement_tombstone_version? }
+
+HeadObject { tenant, bucket, path }
+
+ListObjects {
+  tenant, bucket, literal_prefix, exclusive_start_after?, limit?
+} -> { live_paths[], has_more }
+
+GetObject {
+  tenant, bucket, path, retained_version?
+} -> stream { head | bytes }
+
+ListObjectVersions {
+  tenant, bucket, path
+} -> stream { retained_version_metadata }
+
+SetBucketVersioning {
+  bucket,
+  versioning = ENABLED
+}
+
 BulkWrite {
-  items[] = Put | Delete
+  items[] = Put | PutIfAbsent | PutIfVersion | PutImmutable |
+            Delete | DeleteIfVersion
+}
+
+BatchGet {
+  objects[] = { tenant, bucket, path, retained_version? }
 }
 ```
 
-None has `transaction_id`, `begin`, `stage`, or `commit` fields.
+`PutEnd` publishes exactly one ordinary path; it is not a transaction commit.
+None of these operations has a `transaction_id`, `begin`, staged mutation, or
+client commit field. `BulkWrite` and `BatchGet` are bounded transport batches,
+not atomic multi-path operations.
 
 Atomic program invocation is a separate explicit capability:
 
@@ -1020,7 +1294,8 @@ Anvil 0.5 is delivered as capabilities, not as layers of compatibility code.
 
 1. **0.5.0 Core:** opaque versioned objects, ordinary CAS/immutable/bulk
    writes, bounded atomic programs, executor nomination and recovery,
-   `WatchPrefix`, authentication, realm-scoped Zanzibar authorization,
+   direct current-head `ListObjects`, `WatchPrefix`, authentication,
+   realm-scoped Zanzibar authorization,
    single-node `LOCAL` durability, a stable unavailable `REPLICATED` request
    value, and required operator evidence.
 2. **Index capability release:** current-state indexes and their builders use
@@ -1101,36 +1376,60 @@ If the measured corpus cannot satisfy 150 seconds at the selected durability
 and hardware, the release fails. The target is not weakened by calling the
 remaining time background finalization.
 
-## 16. Architecture gaps that must be closed
+## 16. Fixed 0.5.0 bounded-state decisions
 
-The confirmed shape above intentionally does not invent answers to these
-remaining questions:
+The first release uses these deliberately small, closed rules:
 
-1. **Expanded authorization intent.** The executor must authorize reads, puts,
-   and deletes using their distinct system-realm permissions. The bounded
-   program representation must expose exact operation intent for every
-   expanded path rather than collapsing put and delete into one `ReadWrite`
-   label.
-2. **Expired invocation IDs.** Bounded receipts mean old replay evidence is
-   eventually gone. The API must decide whether expired IDs are recognisable
-   and rejected, carry a time/window component, or may be treated as new. It
-   must not claim indefinite idempotency without indefinite state.
-3. **Single-source watch retention.** The implementation must fix the 0.5.0
-   journal's entry/byte or time bounds, pruning trigger, durable source epoch,
-   and exact `RESUME_EXPIRED` boundary.
-4. **Program representation.** The first release must choose a small bounded
-   interpreter format or compiled built-in handlers. Canonical identity is
-   already the immutable program object's full address plus pinned content
-   hash; the implementation must not grow both representation mechanisms in
-   0.5.0.
-5. **Authorization retention.** Exact-revision checks and idempotent tuple
-   mutation receipts require finite advertised retention. The implementation
-   must fix the bounds, expired-revision result, pruning trigger, and recovery
-   rule without retaining every historical authorization state forever.
+1. **Expanded authorization intent.** Before any dependency lock or read, the
+   JSON interpreter derives conservative `get`, `put`, and `delete` flags for
+   every fully expanded exact path. The executor authorizes every true flag
+   through the protected Zanzibar realm. A path may require more than one
+   permission; unused declared write access does not invent one.
+2. **Expired invocation IDs.** Atomic committed-invocation replay entries are
+   retained in Raft for exactly 24 hours and are bounded to 4,096 entries and
+   16 MiB. A
+   successful response carries its exact replay-guarantee expiry. Unexpired
+   entries are never evicted to admit new work; the executor applies
+   backpressure instead. A new commit prunes expired entries at or below the
+   finalized-through cursor before capacity admission. After expiry and
+   pruning, the same invocation ID may be treated as a new invocation. There
+   is no permanent used-ID tombstone and no second local receipt store.
+3. **Single-source watch retention.** The local journal retains at most
+   1,000,000 invalidations and 512 MiB of logical key-plus-value bytes by
+   default. Every head-changing write appends its invalidation, prunes oldest
+   records as necessary, and advances the durable floor in the same RocksDB
+   batch as the head. A durable random source epoch and token-integrity key are
+   created once. Tokens bind epoch, configured bounds, tenant, bucket, exact
+   prefix, and offset. An authentic token below the floor, ahead of the tail,
+   from another epoch, or from another configured window returns exactly
+   `RESUME_EXPIRED`; malformed or scope-mismatched tokens are invalid input.
+4. **Program representation.** 0.5.0 has one representation: the bounded JSON
+   interpreter defined in this document. The immutable program object's full
+   address and pinned content hash are its canonical identity. There is no
+   second built-in-handler or arbitrary-code mechanism.
+5. **Authorization retention.** 0.5.0 retains only the current authoritative
+   authorization revision. `EXACT(current)` succeeds; once a newer revision
+   commits, the older request returns `AUTHZ_REVISION_EXPIRED` rather than
+   evaluating different state. Tuple-operation receipts use a 24-hour,
+   4,096-entry, 16-MiB window, advertise the exact expiry in successful
+   responses, prune expired receipts during the next receipt-bearing mutation,
+   and never evict an unexpired guarantee for capacity. After expiry the same
+   operation ID may be treated as new.
+6. **Blob inactivity grace.** The first seal writes `ref_count = 1` and
+   `AWAITING_PUBLISH`; `PutEnd` clears the flag without incrementing the count.
+   Neither a zero-count nor an awaiting blob is garbage until its configurable
+   inactivity timeout, 24 hours by default, has elapsed from `updated_at`, not
+   `created_at`. Sealing identical existing bytes and every count change
+   refreshes `updated_at`; `PutEnd` may revive retained count-zero bytes during
+   that window. No reference-ID list or temporary lease is retained.
+   Atomic-program staging sets the output and bundle `updated_at` timestamps
+   before `CommitBatch`. An unusually long staging, commit-gate, or earlier
+   recovery delay therefore reduces effective post-commit replay and recovery
+   retention by that delay. The normal path is expected to take milliseconds;
+   0.5.0 adds no pre-commit refresh, special lease, side state, or second clock.
 
-These are release blockers for the affected capability. They do not justify
-reintroducing transactions, path-derived routing, payloads in Raft, or
-unbounded logs.
+These bounds do not justify reintroducing transactions, path-derived routing,
+payloads in Raft, or unbounded logs.
 
 The later distributed capability separately must define replicated durability
 evidence for configured `N`, cluster-wide finalized-through evidence,
@@ -1143,6 +1442,18 @@ The 0.5.0 core is not release-qualified until tests demonstrate:
 
 - ordinary `Put`, `Delete`, CAS, and bulk have no transaction lifecycle;
 - bulk partial success and idempotent retry of unknown items;
+- unversioned same-content overwrite advances the monotonic path version
+  without changing the content reference count;
+- enabled versioning retains identical logical versions with one physical byte
+  copy and one reference per retained payload version;
+- normal versioned delete retains history, exact non-current deletion leaves
+  the head unchanged, and exact current-payload deletion installs a fresh
+  tombstone without making an older version current;
+- deleting the current tombstone is rejected and an old CAS version can never
+  become current again;
+- every immutable descriptor contains only a content reference, payloads at or
+  below 64 KiB use the RocksDB small-byte plane, and larger payloads use the
+  filesystem byte plane;
 - ordinary APIs reject `PROGRAM_ONLY` mutation specifically as
   `PROGRAM_CONCURRENCY_VIOLATION`;
 - all expanded mutable dependencies, including read-only dependencies, require
@@ -1172,6 +1483,10 @@ The 0.5.0 core is not release-qualified until tests demonstrate:
   bounds, fail-closed missing bindings, and same-revision batch checks;
 - exact-object authorization with structural bucket fallback and no mandatory
   parent tuple per stored object;
+- `ListObjects` requires bucket-wide read authority, excludes tombstones,
+  applies a literal prefix, returns strict lexical pages with correct
+  exclusive resume and `has_more`, and observes newly committed state between
+  page requests rather than promising a cross-page snapshot;
 - deterministic bounded path expansion and per-path authorisation;
 - canonical exact-path lock ordering, cancellation, and contention bounds;
 - the sole node nominates itself and every `CommitBatch` names that nomination
@@ -1182,19 +1497,27 @@ The 0.5.0 core is not release-qualified until tests demonstrate:
 - all-old/all-new visibility at the sole node's learned commit boundary;
 - idempotent finalization and corruption detection for conflicting bundles;
 - finalized-through compaction and hard backpressure at the Raft-tail bound;
-- bounded orphan cleanup and bounded receipt retention;
+- bounded byte cleanup using `ref_count`, `AWAITING_PUBLISH`, and the
+  `updated_at` timeout, plus bounded committed-invocation replay; count rebuild
+  after reconstructed distributed-shard loss remains evidence for the later
+  distribution capability described in section 5.4.1;
 - duplicate, coalesced, unordered, resumed, and expired watch behavior;
 - delete/recreate invalidation using monotonic path versions;
 - explicit rebuild after `RESUME_EXPIRED`; and
 - the pinned Developer Defence 150-second benchmark.
 
-Metrics expose executor nomination, lock wait, program execution,
-prepare bytes and latency, durability wait, Raft commit latency, unfinalized
-tail entries/bytes, finalized-through lag, finalization retries, orphan bytes,
-receipt-window usage, watch-journal retention/lag, bulk throughput, and
-end-to-end Developer Defence ingest time. Traces carry invocation ID, program
-hash, nomination log index, commit log index, and bundle hash without logging
-opaque payloads.
+Metrics expose executor nomination, combined program preparation latency,
+prepared bytes, Raft commit latency, unfinalized tail entries/bytes,
+finalization retries, garbage-collection runs/removals/failures, replay-window
+usage, watch-journal retention and observed consumer lag, and bulk operation,
+byte, outcome, and request-latency measurements. The qualification tool records
+end-to-end Developer Defence ingest time and throughput in its JSON report;
+those benchmark results are not OTLP process metrics. Exact lock-wait timing,
+separate durability-wait timing, finalized-through lag, and instantaneous
+orphan-byte inventory are explicit 0.5.0 limitations; Anvil does not add scans
+or durable side state solely to manufacture them. Traces carry a derived
+invocation hash, program hash, nomination log index, and commit log index
+without logging caller-selected IDs, paths, or opaque payloads.
 
 ## 18. Consequences
 
