@@ -8,7 +8,7 @@ use crate::{
     CommittedBatch, CommittedInvocation, ExecutorNomination, InvocationId,
     MAX_COMMITTED_INVOCATION_BYTES, MAX_COMMITTED_INVOCATIONS, NodeId, ProgramHash,
     ProgramPathHash, SYSTEM_BOOTSTRAP_VERSION, codec,
-    types::{ClusterId, SystemBootstrapState},
+    types::{ClusterId, MAX_RAFT_NODE_ID, SystemBootstrapState},
 };
 
 /// Pure deterministic state for Anvil's compact consensus log.
@@ -473,7 +473,7 @@ fn committed_invocation_entry_bytes(
 }
 
 fn validate_node(node: NodeId) -> Result<(), ApplyError> {
-    if node.0 == 0 {
+    if !(1..=MAX_RAFT_NODE_ID).contains(&node.0) {
         return Err(ApplyError::InvalidNodeId);
     }
     Ok(())
@@ -558,7 +558,7 @@ pub enum ApplyError {
     InvalidCommitEntryLimit,
     #[error("commit-tail byte limit must be non-zero")]
     InvalidCommitByteLimit,
-    #[error("node identity must be non-zero")]
+    #[error("node identity must be between 1 and 1023")]
     InvalidNodeId,
     #[error("node {executor:?} is not a current Raft voter or learner")]
     ExecutorNotCurrentMember { executor: NodeId },

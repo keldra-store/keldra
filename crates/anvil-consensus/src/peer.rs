@@ -23,9 +23,9 @@ use thiserror::Error;
 
 use crate::codec;
 use crate::raft::{DecisionRaft, DecisionRaftConfig, DecisionRaftError, map_client_write_error};
+use crate::types::MAX_RAFT_NODE_ID;
 
 const PEER_RPC_SCHEMA_VERSION: u16 = 1;
-const MAX_CLUSTER_NODE_ID: u64 = 1_023;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerNode {
@@ -245,7 +245,7 @@ impl DecisionRaft {
         if let Some(node_id) = voters
             .iter()
             .copied()
-            .find(|node_id| !(1..=MAX_CLUSTER_NODE_ID).contains(node_id))
+            .find(|node_id| !(1..=MAX_RAFT_NODE_ID).contains(node_id))
         {
             return Err(invalid_node_id(node_id));
         }
@@ -294,7 +294,7 @@ fn validate_members(members: &BTreeMap<u64, PeerNode>) -> Result<(), DecisionRaf
 }
 
 fn validate_node(node_id: u64, node: &PeerNode) -> Result<(), DecisionRaftError> {
-    if !(1..=MAX_CLUSTER_NODE_ID).contains(&node_id) {
+    if !(1..=MAX_RAFT_NODE_ID).contains(&node_id) {
         return Err(invalid_node_id(node_id));
     }
     if node.address.is_empty() {
@@ -307,7 +307,7 @@ fn validate_node(node_id: u64, node: &PeerNode) -> Result<(), DecisionRaftError>
 
 fn invalid_node_id(node_id: u64) -> DecisionRaftError {
     DecisionRaftError::Configuration(format!(
-        "peer node id {node_id} is outside the supported range 1..={MAX_CLUSTER_NODE_ID}"
+        "peer node id {node_id} is outside the supported range 1..={MAX_RAFT_NODE_ID}"
     ))
 }
 

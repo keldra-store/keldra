@@ -281,6 +281,15 @@ fn nomination_uses_the_committed_log_index_as_its_only_fence() {
         state.apply(20, &Command::NominateExecutor { executor: node(0) }),
         Err(ApplyError::InvalidNodeId)
     );
+    assert_eq!(
+        state.apply(
+            21,
+            &Command::NominateExecutor {
+                executor: node(1_024),
+            },
+        ),
+        Err(ApplyError::InvalidNodeId)
+    );
 }
 
 #[test]

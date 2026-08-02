@@ -266,3 +266,31 @@ async fn three_nodes_elect_replicate_add_learners_and_replace_a_failed_leader() 
     second.shutdown().await.unwrap();
     third.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn consensus_database_reopen_is_bound_to_its_first_local_node_id() {
+    let directory = tempfile::tempdir().unwrap();
+    let first = DecisionRaft::open(directory.path(), 7, 4, 64 * 1024)
+        .await
+        .unwrap();
+    first.shutdown().await.unwrap();
+    drop(first);
+
+    let mismatch = match DecisionRaft::open(directory.path(), 8, 4, 64 * 1024).await {
+        Ok(raft) => {
+            raft.shutdown().await.unwrap();
+            panic!("opening a bound consensus database under another node succeeded")
+        }
+        Err(error) => error,
+    };
+    assert!(matches!(
+        mismatch,
+        DecisionRaftError::Storage(message)
+            if message.contains("bound to Raft node 7, not requested node 8")
+    ));
+
+    let reopened = DecisionRaft::open(directory.path(), 7, 4, 64 * 1024)
+        .await
+        .unwrap();
+    reopened.shutdown().await.unwrap();
+}

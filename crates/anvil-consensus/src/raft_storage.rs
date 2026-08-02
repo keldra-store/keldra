@@ -19,6 +19,7 @@ const CF_META: &str = "raft_meta";
 const CF_APPLIED: &str = "applied_journal";
 
 const KEY_STORAGE_CONFIG: &[u8] = b"storage-config-v2";
+const KEY_LOCAL_NODE_ID: &[u8] = b"local-node-id";
 const KEY_VOTE: &[u8] = b"vote";
 const KEY_LAST_LOG_ID: &[u8] = b"last-log-id";
 const KEY_LAST_PURGED_LOG_ID: &[u8] = b"last-purged-log-id";
@@ -52,6 +53,8 @@ pub(crate) enum DurableStorageError {
         stored: StorageConfig,
         requested: StorageConfig,
     },
+    #[error("consensus database is bound to Raft node {stored}, not requested node {requested}")]
+    NodeIdentityMismatch { stored: u64, requested: u64 },
     #[error("Raft log append would create a hole: expected {expected}, received {received}")]
     LogHole { expected: u64, received: u64 },
     #[error("Raft log entries are not consecutive: {previous} then {next}")]
@@ -79,6 +82,7 @@ impl DurableStore {
     pub(crate) fn open(
         path: impl AsRef<Path>,
         requested: StorageConfig,
+        requested_node_id: u64,
     ) -> Result<Self, DurableStorageError> {
         let mut options = uncompressed_options();
         options.create_if_missing(true);
@@ -91,16 +95,30 @@ impl DurableStore {
             config: requested,
         };
 
-        match store.read_meta::<StorageConfig>(KEY_STORAGE_CONFIG)? {
-            Some(stored) if stored != requested => {
-                Err(DurableStorageError::ConfigurationMismatch { stored, requested })
-            }
-            Some(_) => Ok(store),
-            None => {
-                store.write_meta_sync(KEY_STORAGE_CONFIG, &requested)?;
-                Ok(store)
-            }
+        let stored_config = store.read_meta::<StorageConfig>(KEY_STORAGE_CONFIG)?;
+        if let Some(stored) = stored_config
+            && stored != requested
+        {
+            return Err(DurableStorageError::ConfigurationMismatch { stored, requested });
         }
+
+        let stored_node_id = store.read_meta::<u64>(KEY_LOCAL_NODE_ID)?;
+        if let Some(stored) = stored_node_id
+            && stored != requested_node_id
+        {
+            return Err(DurableStorageError::NodeIdentityMismatch {
+                stored,
+                requested: requested_node_id,
+            });
+        }
+
+        if stored_config.is_none() {
+            store.write_meta_sync(KEY_STORAGE_CONFIG, &requested)?;
+        }
+        if stored_node_id.is_none() {
+            store.write_meta_sync(KEY_LOCAL_NODE_ID, &requested_node_id)?;
+        }
+        Ok(store)
     }
 
     pub(crate) fn config(&self) -> StorageConfig {
@@ -447,7 +465,7 @@ mod tests {
     #[test]
     fn released_raw_records_open_without_migration() {
         let directory = tempfile::tempdir().unwrap();
-        let store = DurableStore::open(directory.path(), config()).unwrap();
+        let store = DurableStore::open(directory.path(), config(), 1).unwrap();
         let mut legacy = WriteBatch::default();
         legacy.put_cf(
             store.cf(CF_META).unwrap(),
@@ -460,10 +478,11 @@ mod tests {
             log_key(11),
             LEGACY_BLANK_LOG_ENTRY,
         );
+        legacy.delete_cf(store.cf(CF_META).unwrap(), KEY_LOCAL_NODE_ID);
         store.sync_write(legacy).unwrap();
         drop(store);
 
-        let reopened = DurableStore::open(directory.path(), config()).unwrap();
+        let reopened = DurableStore::open(directory.path(), config(), 9).unwrap();
         assert_eq!(
             reopened.last_log_id().unwrap(),
             Some(LogId::new(CommittedLeaderId::new(7, 1), 11))
@@ -472,12 +491,16 @@ mod tests {
             reopened.scan_logs(11..12).unwrap(),
             vec![blank_entry(7, 11)]
         );
+        assert_eq!(
+            reopened.read_meta::<u64>(KEY_LOCAL_NODE_ID).unwrap(),
+            Some(9)
+        );
     }
 
     #[test]
     fn new_storage_records_are_enveloped_without_changing_snapshot_bytes() {
         let directory = tempfile::tempdir().unwrap();
-        let store = DurableStore::open(directory.path(), config()).unwrap();
+        let store = DurableStore::open(directory.path(), config(), 1).unwrap();
 
         let raw_config = codec::encode(&config()).unwrap();
         let stored_config = store
@@ -487,6 +510,14 @@ mod tests {
             .unwrap();
         let expected_config = codec::wrap_record(&raw_config).unwrap();
         assert_eq!(&*stored_config, expected_config.as_slice());
+
+        let stored_node_id = store
+            .db
+            .get_cf(store.cf(CF_META).unwrap(), KEY_LOCAL_NODE_ID)
+            .unwrap()
+            .unwrap();
+        let expected_node_id = codec::encode_record(&1_u64).unwrap();
+        assert_eq!(&*stored_node_id, expected_node_id.as_slice());
 
         let entry = blank_entry(3, 0);
         store.append_logs(std::slice::from_ref(&entry)).unwrap();
@@ -517,5 +548,25 @@ mod tests {
         let expected_body = codec::wrap_record(&snapshot_body).unwrap();
         assert_eq!(&*stored_body, expected_body.as_slice());
         assert_eq!(store.load_snapshot().unwrap().unwrap().data, snapshot_body);
+    }
+
+    #[test]
+    fn reopen_rejects_a_different_local_raft_node_id() {
+        let directory = tempfile::tempdir().unwrap();
+        drop(DurableStore::open(directory.path(), config(), 17).unwrap());
+
+        let mismatch = match DurableStore::open(directory.path(), config(), 18) {
+            Ok(_) => panic!("opening a bound consensus database under another node succeeded"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            mismatch,
+            DurableStorageError::NodeIdentityMismatch {
+                stored: 17,
+                requested: 18
+            }
+        ));
+
+        drop(DurableStore::open(directory.path(), config(), 17).unwrap());
     }
 }

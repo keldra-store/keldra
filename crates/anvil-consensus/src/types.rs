@@ -4,6 +4,7 @@ pub const ATOMIC_REPLAY_RETENTION_MILLIS: u64 = 24 * 60 * 60 * 1_000;
 pub const MAX_COMMITTED_INVOCATIONS: u32 = 4_096;
 pub const MAX_COMMITTED_INVOCATION_BYTES: u64 = 16 * 1024 * 1024;
 pub const SYSTEM_BOOTSTRAP_VERSION: u16 = 1;
+pub(crate) const MAX_RAFT_NODE_ID: u64 = 1_023;
 
 /// Stable identity of one Raft voter or learner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

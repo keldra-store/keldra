@@ -22,6 +22,7 @@ use crate::{
     ApplyError, ApplyResult, Command, CommittedInvocation, ExecutorNomination, StateMachine, codec,
     peer::{PeerNetworkFactory, PeerTransport, UnreachablePeerTransport},
     raft_storage::{DurableSnapshot, DurableStorageError, DurableStore, RaftEntry, StorageConfig},
+    types::MAX_RAFT_NODE_ID,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -435,7 +436,7 @@ impl DecisionRaft {
         max_commit_bytes: u64,
         transport: Arc<dyn PeerTransport>,
     ) -> Result<Self, DecisionRaftError> {
-        if !(1..=1_023).contains(&node_id) {
+        if !(1..=MAX_RAFT_NODE_ID).contains(&node_id) {
             return Err(DecisionRaftError::InvalidNodeId);
         }
         StateMachine::new(max_commit_entries, max_commit_bytes)
@@ -444,7 +445,7 @@ impl DecisionRaft {
             max_commit_entries,
             max_commit_bytes,
         };
-        let store = DurableStore::open(path, storage_config)?;
+        let store = DurableStore::open(path, storage_config, node_id)?;
         let machine = Arc::new(Mutex::new(load_machine(&store)?));
         let config = openraft::Config {
             cluster_name: "anvil-decisions".into(),
