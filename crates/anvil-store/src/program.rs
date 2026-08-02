@@ -1,31 +1,26 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use anvil_atomic_program::{
-    AtomicProgramEngine, AtomicWriteBundle, CommandReceipt, EmissionPayload, EngineError,
-    ExecutionLease, ExpandedProgramPath, HeadPrecondition, InvocationContext, ObjectPath,
-    ObservedHead, ProgramDefinition, ProgramInvocation, ProgramSnapshot, StateReader, StoredValue,
+    AtomicProgramEngine, AtomicWriteBundle, CommandReceipt, EngineError, ExecutionLease,
+    ExpandedProgramPath, HeadPrecondition, InvocationContext, ObjectPath, ObservedHead,
+    ProgramDefinition, ProgramInvocation, ProgramSnapshot, StateReader, StoredValue,
     VersionedDocument,
 };
-use rocksdb::{DB, IteratorMode, WriteBatch, WriteOptions};
+use rocksdb::{WriteBatch, WriteOptions};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::key::BucketIdentity;
 use crate::store::{
-    CF_HEADS, CF_METADATA, CF_OUTBOX, CF_PROGRAM_ARTIFACTS, CF_PROGRAM_COMMITS, CF_VERSIONS,
-    VERSION_HIGH_WATERMARK_KEY, is_program_definition_path, now_unix_millis, version_key,
+    CF_HEADS, CF_METADATA, CF_VERSIONS, PendingBlobReferences, VERSION_HIGH_WATERMARK_KEY,
+    is_program_definition_path, now_unix_millis, version_blob_reference, version_key,
 };
-use crate::{BlobRef, Head, InlinePayload, MutationError, ObjectKey, Store, Version, VersionId};
+use crate::{BlobRef, Head, MutationError, ObjectKey, ObjectVersioning, Store, Version, VersionId};
 
-const PREPARED_BUNDLE_FORMAT: u16 = 2;
+const PREPARED_BUNDLE_FORMAT: u16 = 4;
 const DURABILITY_EVIDENCE_FORMAT: u16 = 1;
 const APPLIED_PROGRAM_COMMIT_KEY: &[u8] = b"applied_program_commit";
-const COMMIT_CURSOR_PREFIX: &[u8] = b"cursor/";
-const COMMIT_BUNDLE_PREFIX: &[u8] = b"bundle/";
-const ARTIFACT_PREFIX: u8 = b'a';
-const EVIDENCE_PREFIX: u8 = b'e';
 const LOCAL_DURABILITY_CLASS: &str = "local";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -48,10 +43,30 @@ impl std::fmt::Display for PreparedBundleHash {
     }
 }
 
-/// Opaque fixed-size reference to the root prepared-bundle artifact.
+/// Ordinary content-addressed reference to the one prepared bundle blob.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct PreparedBundleRef(pub [u8; 32]);
+pub struct PreparedBundleRef {
+    pub hash: [u8; 32],
+    pub length: u64,
+}
+
+impl From<BlobRef> for PreparedBundleRef {
+    fn from(reference: BlobRef) -> Self {
+        Self {
+            hash: reference.hash,
+            length: reference.length,
+        }
+    }
+}
+
+impl From<PreparedBundleRef> for BlobRef {
+    fn from(reference: PreparedBundleRef) -> Self {
+        Self {
+            hash: reference.hash,
+            length: reference.length,
+        }
+    }
+}
 
 /// Content identity of the configured remote durability class.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -64,94 +79,11 @@ impl ProgramDurabilityClassHash {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PreparedArtifactKind {
-    Payload,
-    VersionDescriptor,
-    Receipt,
-    Bundle,
-}
-
-impl PreparedArtifactKind {
-    fn tag(self) -> &'static [u8] {
-        match self {
-            Self::Payload => b"anvil.prepared-payload.v1",
-            Self::VersionDescriptor => b"anvil.prepared-version-descriptor.v1",
-            Self::Receipt => b"anvil.prepared-receipt.v1",
-            Self::Bundle => b"anvil.prepared-bundle.v2",
-        }
-    }
-
-    fn key_tag(self) -> u8 {
-        match self {
-            Self::Payload => 1,
-            Self::VersionDescriptor => 2,
-            Self::Receipt => 3,
-            Self::Bundle => 4,
-        }
-    }
-}
-
-/// One immutable, content-addressed preparation artifact.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct PreparedArtifactRef {
-    pub kind: PreparedArtifactKind,
-    pub hash: [u8; 32],
-    pub length: u64,
-}
-
-impl PreparedArtifactRef {
-    fn for_bytes(kind: PreparedArtifactKind, bytes: &[u8]) -> Self {
-        let hash = match kind {
-            PreparedArtifactKind::Payload => *blake3::hash(bytes).as_bytes(),
-            _ => tagged_hash(kind.tag(), bytes),
-        };
-        Self {
-            kind,
-            hash,
-            length: bytes.len() as u64,
-        }
-    }
-
-    fn verify(&self, bytes: &[u8]) -> bool {
-        self.length == bytes.len() as u64 && self.hash == Self::for_bytes(self.kind, bytes).hash
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PreparedArtifact {
-    pub reference: PreparedArtifactRef,
-    pub bytes: Vec<u8>,
-}
-
-impl PreparedArtifact {
-    fn new(kind: PreparedArtifactKind, bytes: Vec<u8>) -> Self {
-        Self {
-            reference: PreparedArtifactRef::for_bytes(kind, &bytes),
-            bytes,
-        }
-    }
-}
-
-/// The complete artifact set passed to the configured durability provider.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PreparedArtifactBatch {
-    pub bundle: PreparedArtifactRef,
-    pub manifest_hash: [u8; 32],
-    pub artifacts: Vec<PreparedArtifact>,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "scope", rename_all = "snake_case")]
 pub enum ProgramDurabilityScope {
-    /// The built-in repository persisted only on the executor. Consensus must
-    /// not treat this as surviving executor loss.
-    ExecutorLocal {
-        node_id: u16,
-        /// Whether the local RocksDB write was requested with WAL sync.
-        synced: bool,
-    },
+    /// The ordinary blob plane persisted the complete preparation locally.
+    ExecutorLocal { node_id: u16, synced: bool },
     /// An injected provider attests that the complete manifest is recoverable
     /// under its named remote durability class. This crate deliberately does
     /// not define that class's participants or replication rule.
@@ -161,11 +93,10 @@ pub enum ProgramDurabilityScope {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProgramDurabilityEvidence {
     pub format: u16,
-    pub bundle: PreparedArtifactRef,
-    pub manifest_hash: [u8; 32],
+    pub bundle: PreparedBundleRef,
     pub scope: ProgramDurabilityScope,
-    /// Opaque provider receipt. It is content-addressed outside Raft; Raft
-    /// carries only [`ProgramDurabilityEvidenceHash`].
+    /// Reserved for a later replicated byte-plane acknowledgement. It is
+    /// empty for 0.5.0 LOCAL and is never stored in a bespoke side plane.
     pub provider_receipt: Vec<u8>,
 }
 
@@ -191,30 +122,6 @@ impl std::fmt::Display for ProgramDurabilityEvidenceHash {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&hex::encode(self.0))
     }
-}
-
-pub type PreparedArtifactFuture<'a, T> =
-    Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>;
-
-/// Storage and durability boundary for prepared atomic-program artifacts.
-///
-/// `persist` must not return `ConfiguredRemote` until every artifact in the
-/// manifest can be fetched after executor loss under that provider's named
-/// durability class. It must also persist the returned evidence so another
-/// node can resolve it by hash. The participant/quorum rules are intentionally
-/// outside this crate.
-pub trait PreparedArtifactRepository: std::fmt::Debug + Send + Sync {
-    fn persist(
-        &self,
-        batch: PreparedArtifactBatch,
-    ) -> PreparedArtifactFuture<'_, ProgramDurabilityEvidence>;
-
-    fn load(&self, reference: PreparedArtifactRef) -> PreparedArtifactFuture<'_, Option<Vec<u8>>>;
-
-    fn load_evidence(
-        &self,
-        hash: ProgramDurabilityEvidenceHash,
-    ) -> PreparedArtifactFuture<'_, Option<ProgramDurabilityEvidence>>;
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -280,10 +187,10 @@ impl StoreProgramEngine {
                 .map_err(|error| EngineError::Read(error.to_string()))?;
             let path = dependency.path.path.as_str();
             if !policy.is_program_only(path) {
-                return Err(EngineError::InvalidInvocation(format!(
-                    "atomic-program dependency {:?} must use PROGRAM_ONLY policy",
-                    dependency.path
-                )));
+                return Err(EngineError::ProgramConcurrency {
+                    path: dependency.path.clone(),
+                    reason: "dependency must use PROGRAM_ONLY policy".into(),
+                });
             }
         }
         Ok(())
@@ -300,23 +207,27 @@ impl ProgramExecutionLease {
     }
 }
 
-/// Compact preparation descriptor. Object bodies, version descriptors, the
-/// receipt, the complete bundle, and full durability evidence live in the
-/// configured artifact repository rather than Raft.
+/// Compact preparation descriptor. Output bodies and the complete bundle are
+/// ordinary blob-plane objects; only their compact identities enter Raft.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreparedProgramBundle {
     pub hash: PreparedBundleHash,
     pub source_bundle_hash: PreparedBundleHash,
     pub program_hash: ProgramHash,
-    pub bundle: PreparedArtifactRef,
-    pub manifest_hash: [u8; 32],
+    pub bundle: PreparedBundleRef,
     pub durability_evidence_hash: ProgramDurabilityEvidenceHash,
     pub durability: ProgramDurabilityEvidence,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublishedProgramVersion {
+    pub version: VersionId,
+    pub deleted: bool,
+}
+
 impl PreparedProgramBundle {
     /// Returns evidence suitable for a cluster-safe `CommitBatch`. The
-    /// built-in executor-local repository always fails this check.
+    /// 0.5.0 executor-local byte plane always fails this check.
     pub fn remote_durability_evidence_hash(
         &self,
     ) -> Result<ProgramDurabilityEvidenceHash, ProgramStoreError> {
@@ -328,55 +239,23 @@ impl PreparedProgramBundle {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct AppliedProgramReceipt {
-    pub receipt: CommandReceipt,
-    pub bundle_ref: PreparedBundleRef,
-    pub bundle_hash: PreparedBundleHash,
-    pub program_hash: ProgramHash,
-    pub durability_class: ProgramDurabilityClassHash,
-    pub durability_evidence_hash: ProgramDurabilityEvidenceHash,
-    #[serde(with = "object_path_version_map")]
-    pub published_versions: BTreeMap<ObjectPath, VersionId>,
-    pub commit_cursor: u64,
-}
-
-mod object_path_version_map {
-    use std::collections::BTreeMap;
-
-    use anvil_atomic_program::ObjectPath;
-    use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
-
-    use crate::VersionId;
-
-    pub fn serialize<S: Serializer>(
-        values: &BTreeMap<ObjectPath, VersionId>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        values.iter().collect::<Vec<_>>().serialize(serializer)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<BTreeMap<ObjectPath, VersionId>, D::Error> {
-        let values = Vec::<(ObjectPath, VersionId)>::deserialize(deserializer)?;
-        let mut result = BTreeMap::new();
-        for (path, version) in values {
-            if result.insert(path, version).is_some() {
-                return Err(D::Error::custom("duplicate published program path"));
-            }
-        }
-        Ok(result)
-    }
-}
-
+/// The only local finalization marker. It deliberately contains no program
+/// output, object path, or command receipt: the ordinary prepared bundle and
+/// Raft's bounded committed-invocation entry are authoritative for replay.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppliedProgramCommit {
     pub commit_cursor: u64,
     pub bundle_ref: PreparedBundleRef,
     pub bundle_hash: PreparedBundleHash,
+    pub program_hash: ProgramHash,
     pub durability_class: ProgramDurabilityClassHash,
     pub durability_evidence_hash: ProgramDurabilityEvidenceHash,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommittedProgramResult {
+    pub receipt: CommandReceipt,
+    pub published_versions: BTreeMap<ObjectPath, PublishedProgramVersion>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -390,31 +269,12 @@ pub struct ProgramCommit {
     pub durability_evidence_hash: ProgramDurabilityEvidenceHash,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OutboxEntry {
-    pub effect_id: String,
-    pub route_id: String,
-    pub payload: OutboxPayload,
-    pub content_type: String,
-    pub bundle_hash: PreparedBundleHash,
-    pub commit_cursor: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
-pub enum OutboxPayload {
-    Inline(InlinePayload),
-    Blob(BlobRef),
-}
-
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum ProgramStoreError {
     #[error("invalid program definition: {0}")]
     InvalidDefinition(String),
     #[error("loaded program bytes do not match the expected immutable object hash")]
     ProgramHashMismatch,
-    #[error("content hash collision or corrupt hashed record")]
-    HashCollision,
     #[error("prepared bundle {0} was not found")]
     PreparedBundleNotFound(PreparedBundleHash),
     #[error("prepared bundle does not belong to this execution lease")]
@@ -440,18 +300,12 @@ pub enum ProgramStoreError {
     },
     #[error("commit cursor {cursor} is already bound to a different prepared bundle")]
     CommitCorruption { cursor: u64 },
-    #[error("prepared artifact is missing: {0:?}")]
-    ArtifactNotFound(PreparedArtifactRef),
-    #[error("prepared artifact failed content verification: {0:?}")]
-    ArtifactCorruption(PreparedArtifactRef),
-    #[error("durability evidence {0} was not found")]
-    DurabilityEvidenceNotFound(ProgramDurabilityEvidenceHash),
-    #[error("durability evidence does not bind the committed bundle and manifest")]
+    #[error("durability evidence does not bind the committed bundle")]
     DurabilityEvidenceMismatch,
     #[error("durability evidence class does not match the committed durability class")]
     DurabilityClassMismatch,
     #[error(
-        "prepared artifacts are durable only on the executor and cannot back a cluster-safe commit"
+        "prepared ordinary blobs are durable only on the executor and cannot back a cluster-safe commit"
     )]
     ExecutorLocalDurability,
     #[error("storage error: {0}")]
@@ -464,9 +318,8 @@ struct StoredPreparedBundle {
     source_bundle_hash: PreparedBundleHash,
     program_hash: ProgramHash,
     preconditions: Vec<HeadPrecondition>,
-    writes: Vec<PreparedArtifactRef>,
-    receipt: PreparedArtifactRef,
-    emissions: Vec<PreparedEmission>,
+    writes: Vec<PreparedVersionWrite>,
+    receipt: CommandReceipt,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -476,150 +329,11 @@ struct PreparedVersionWrite {
     version: Version,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-struct PreparedEmission {
-    effect_id: String,
-    route_id: String,
-    payload: PreparedArtifactRef,
-    content_type: String,
-}
-
 #[derive(Debug)]
 struct LoadedPreparedBundle {
-    bundle: PreparedArtifactRef,
+    bundle: PreparedBundleRef,
     record: StoredPreparedBundle,
-    writes: Vec<PreparedVersionWrite>,
-    write_payloads: Vec<Option<Vec<u8>>>,
-    receipt: CommandReceipt,
-    emission_payloads: Vec<Vec<u8>>,
     evidence: ProgramDurabilityEvidence,
-}
-
-#[derive(Debug)]
-pub(crate) struct LocalPreparedArtifactRepository {
-    db: Arc<DB>,
-    node_id: u16,
-    sync_writes: bool,
-    write_lock: tokio::sync::Mutex<()>,
-}
-
-impl LocalPreparedArtifactRepository {
-    pub(crate) fn new(db: Arc<DB>, node_id: u16, sync_writes: bool) -> Self {
-        Self {
-            db,
-            node_id,
-            sync_writes,
-            write_lock: tokio::sync::Mutex::new(()),
-        }
-    }
-
-    fn cf(&self) -> Result<&rocksdb::ColumnFamily, String> {
-        self.db
-            .cf_handle(CF_PROGRAM_ARTIFACTS)
-            .ok_or_else(|| format!("missing column family {CF_PROGRAM_ARTIFACTS}"))
-    }
-}
-
-impl PreparedArtifactRepository for LocalPreparedArtifactRepository {
-    fn persist(
-        &self,
-        batch: PreparedArtifactBatch,
-    ) -> PreparedArtifactFuture<'_, ProgramDurabilityEvidence> {
-        Box::pin(async move {
-            validate_artifact_batch(&batch).map_err(|error| error.to_string())?;
-            let evidence = ProgramDurabilityEvidence {
-                format: DURABILITY_EVIDENCE_FORMAT,
-                bundle: batch.bundle.clone(),
-                manifest_hash: batch.manifest_hash,
-                scope: ProgramDurabilityScope::ExecutorLocal {
-                    node_id: self.node_id,
-                    synced: self.sync_writes,
-                },
-                provider_receipt: Vec::new(),
-            };
-            let evidence_hash = evidence.hash().map_err(|error| error.to_string())?;
-            let evidence_bytes =
-                serde_json::to_vec(&evidence).map_err(|error| error.to_string())?;
-
-            let _guard = self.write_lock.lock().await;
-            let cf = self.cf()?;
-            let mut writes = WriteBatch::default();
-            for artifact in &batch.artifacts {
-                let key = artifact_key(&artifact.reference);
-                match self
-                    .db
-                    .get_cf(cf, &key)
-                    .map_err(|error| error.to_string())?
-                {
-                    Some(existing) if existing.as_slice() != artifact.bytes.as_slice() => {
-                        return Err("content-addressed prepared artifact collision".into());
-                    }
-                    Some(_) => {}
-                    None => writes.put_cf(cf, key, &artifact.bytes),
-                }
-            }
-
-            let evidence_key = evidence_key(evidence_hash);
-            match self
-                .db
-                .get_cf(cf, &evidence_key)
-                .map_err(|error| error.to_string())?
-            {
-                Some(existing) if existing.as_slice() != evidence_bytes.as_slice() => {
-                    return Err("content-addressed durability evidence collision".into());
-                }
-                Some(_) => {}
-                None => writes.put_cf(cf, evidence_key, evidence_bytes),
-            }
-
-            let mut options = WriteOptions::default();
-            options.set_sync(self.sync_writes);
-            self.db
-                .write_opt(writes, &options)
-                .map_err(|error| error.to_string())?;
-            Ok(evidence)
-        })
-    }
-
-    fn load(&self, reference: PreparedArtifactRef) -> PreparedArtifactFuture<'_, Option<Vec<u8>>> {
-        Box::pin(async move {
-            let value = self
-                .db
-                .get_cf(self.cf()?, artifact_key(&reference))
-                .map_err(|error| error.to_string())?
-                .map(|value| value.to_vec());
-            if value
-                .as_deref()
-                .is_some_and(|bytes| !reference.verify(bytes))
-            {
-                return Err("prepared artifact failed content verification".into());
-            }
-            Ok(value)
-        })
-    }
-
-    fn load_evidence(
-        &self,
-        hash: ProgramDurabilityEvidenceHash,
-    ) -> PreparedArtifactFuture<'_, Option<ProgramDurabilityEvidence>> {
-        Box::pin(async move {
-            let Some(encoded) = self
-                .db
-                .get_cf(self.cf()?, evidence_key(hash))
-                .map_err(|error| error.to_string())?
-            else {
-                return Ok(None);
-            };
-            let evidence = serde_json::from_slice::<ProgramDurabilityEvidence>(&encoded)
-                .map_err(|error| error.to_string())?;
-            if evidence.format != DURABILITY_EVIDENCE_FORMAT
-                || evidence.hash().map_err(|error| error.to_string())? != hash
-            {
-                return Err("durability evidence failed content verification".into());
-            }
-            Ok(Some(evidence))
-        })
-    }
 }
 
 impl ProgramHash {
@@ -671,72 +385,17 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
-
     use anvil_atomic_program::{
         Cardinality, DEFINITION_SCHEMA_VERSION, DocumentAccess, DocumentRef, DocumentSpec,
-        DocumentValueRef, DocumentView, EmissionDefinition, ExpectedHead, InputValue, IntegerType,
-        InvocationContext, JsonPointerRef, Operation, PathBinding, PathTemplate, PayloadSource,
-        ProgramCaps, ProgramInvocation, ReturnDefinition, ValueSource,
+        DocumentValueRef, DocumentView, ExpectedHead, InputValue, IntegerType, InvocationContext,
+        JsonPointerRef, Operation, PathBinding, PathTemplate, ProgramCaps, ProgramInvocation,
+        ReturnDefinition, ValueSource,
     };
     use serde_json::json;
     use tempfile::TempDir;
 
     use super::*;
-    use crate::{BucketPolicy, INLINE_PAYLOAD_MAX_BYTES, Precondition, PutRequest, StoreOptions};
-
-    #[derive(Debug, Default)]
-    struct MemoryRemoteRepository {
-        artifacts: Mutex<BTreeMap<PreparedArtifactRef, Vec<u8>>>,
-        evidence: Mutex<BTreeMap<ProgramDurabilityEvidenceHash, ProgramDurabilityEvidence>>,
-    }
-
-    impl PreparedArtifactRepository for MemoryRemoteRepository {
-        fn persist(
-            &self,
-            batch: PreparedArtifactBatch,
-        ) -> PreparedArtifactFuture<'_, ProgramDurabilityEvidence> {
-            Box::pin(async move {
-                validate_artifact_batch(&batch).map_err(|error| error.to_string())?;
-                let evidence = ProgramDurabilityEvidence {
-                    format: DURABILITY_EVIDENCE_FORMAT,
-                    bundle: batch.bundle,
-                    manifest_hash: batch.manifest_hash,
-                    scope: ProgramDurabilityScope::ConfiguredRemote {
-                        class: "test-remote".into(),
-                    },
-                    provider_receipt: b"opaque-test-attestation".to_vec(),
-                };
-                let hash = evidence.hash().map_err(|error| error.to_string())?;
-                let mut artifacts = self.artifacts.lock().unwrap();
-                for artifact in batch.artifacts {
-                    if let Some(existing) =
-                        artifacts.insert(artifact.reference.clone(), artifact.bytes.clone())
-                        && existing != artifact.bytes
-                    {
-                        return Err("test repository artifact collision".into());
-                    }
-                }
-                drop(artifacts);
-                self.evidence.lock().unwrap().insert(hash, evidence.clone());
-                Ok(evidence)
-            })
-        }
-
-        fn load(
-            &self,
-            reference: PreparedArtifactRef,
-        ) -> PreparedArtifactFuture<'_, Option<Vec<u8>>> {
-            Box::pin(async move { Ok(self.artifacts.lock().unwrap().get(&reference).cloned()) })
-        }
-
-        fn load_evidence(
-            &self,
-            hash: ProgramDurabilityEvidenceHash,
-        ) -> PreparedArtifactFuture<'_, Option<ProgramDurabilityEvidence>> {
-            Box::pin(async move { Ok(self.evidence.lock().unwrap().get(&hash).cloned()) })
-        }
-    }
+    use crate::{BucketPolicy, Durability, PutMode, PutRequest, StoreOptions};
 
     fn counter_path() -> ObjectPath {
         ObjectPath::new("tenant", "bucket", "managed/counter").unwrap()
@@ -771,26 +430,12 @@ mod tests {
                     view: DocumentView::Current,
                 },
             }],
-            emissions: vec![EmissionDefinition {
-                route_id: "counter.changed".into(),
-                payload: PayloadSource::Json {
-                    value: ValueSource::Document {
-                        source: DocumentValueRef {
-                            value: JsonPointerRef::new(counter, ""),
-                            view: DocumentView::Current,
-                        },
-                    },
-                },
-                content_type: "application/json".into(),
-            }],
             caps: ProgramCaps {
                 max_paths: 1,
                 max_writes: 1,
                 max_operations: 2,
-                max_emissions: 1,
-                max_input_bytes: INLINE_PAYLOAD_MAX_BYTES,
-                max_document_bytes: INLINE_PAYLOAD_MAX_BYTES,
-                max_emitted_bytes: INLINE_PAYLOAD_MAX_BYTES,
+                max_input_bytes: 64 * 1024,
+                max_document_bytes: 64 * 1024,
             },
         }
     }
@@ -827,8 +472,7 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let store = Store::open(StoreOptions::new(temporary.path(), 1))
             .await
-            .unwrap()
-            .with_prepared_artifact_repository(Arc::new(MemoryRemoteRepository::default()));
+            .unwrap();
         configure_policy(&store).await;
         (temporary, store, verified_definition())
     }
@@ -859,7 +503,6 @@ mod tests {
         definition.documents[0].allow_initial_json = false;
         definition.operations = vec![operation];
         definition.returns.clear();
-        definition.emissions.clear();
         let bytes = serde_json::to_vec(&definition).unwrap();
         let verified = VerifiedProgramDefinition::from_bytes(
             &bytes,
@@ -885,22 +528,19 @@ mod tests {
         previous_commit_cursor: Option<u64>,
         commit_cursor: u64,
     ) -> ProgramCommit {
-        let ProgramDurabilityScope::ConfiguredRemote { class } = &prepared.durability.scope else {
-            panic!("test commit requires configured remote durability evidence");
-        };
         ProgramCommit {
             previous_commit_cursor,
             commit_cursor,
-            bundle_ref: PreparedBundleRef(prepared.bundle.hash),
+            bundle_ref: prepared.bundle,
             bundle_hash: prepared.hash,
             program_hash: prepared.program_hash,
-            durability_class: ProgramDurabilityClassHash::for_class(class),
+            durability_class: ProgramDurabilityClassHash::for_class(LOCAL_DURABILITY_CLASS),
             durability_evidence_hash: prepared.durability_evidence_hash,
         }
     }
 
     #[tokio::test]
-    async fn built_in_repository_only_attests_executor_local_durability() {
+    async fn ordinary_blob_plane_attests_executor_local_durability() {
         let temporary = tempfile::tempdir().unwrap();
         let store = Store::open(StoreOptions::new(temporary.path(), 1))
             .await
@@ -931,7 +571,7 @@ mod tests {
         let wrong_class = ProgramCommit {
             previous_commit_cursor: None,
             commit_cursor: 1,
-            bundle_ref: PreparedBundleRef(prepared.bundle.hash),
+            bundle_ref: prepared.bundle,
             bundle_hash: prepared.hash,
             program_hash: prepared.program_hash,
             durability_class: ProgramDurabilityClassHash::for_class("replicated"),
@@ -946,11 +586,129 @@ mod tests {
             durability_class: ProgramDurabilityClassHash::for_class(LOCAL_DURABILITY_CLASS),
             ..wrong_class
         };
+        let before_apply = store.db.latest_sequence_number();
         let applied = store
-            .apply_program_bundle(lease, &prepared, local_commit)
+            .apply_program_bundle(lease, &prepared, local_commit.clone())
             .await
             .unwrap();
-        assert_eq!(store.applied_program_receipt(1).unwrap(), Some(applied));
+        let apply_batches = store
+            .db
+            .get_updates_since(before_apply)
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(apply_batches.len(), 1);
+        assert_eq!(
+            store.applied_program_commit().unwrap(),
+            Some(AppliedProgramCommit {
+                commit_cursor: 1,
+                bundle_ref: prepared.bundle,
+                bundle_hash: prepared.hash,
+                program_hash: prepared.program_hash,
+                durability_class: local_commit.durability_class,
+                durability_evidence_hash: prepared.durability_evidence_hash,
+            })
+        );
+        let marker = store
+            .raw_get(CF_METADATA, APPLIED_PROGRAM_COMMIT_KEY)
+            .unwrap()
+            .unwrap();
+        let marker = serde_json::from_slice::<serde_json::Value>(&marker).unwrap();
+        let marker_fields = marker
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            marker_fields,
+            BTreeSet::from([
+                "bundle_hash",
+                "bundle_ref",
+                "commit_cursor",
+                "durability_class",
+                "durability_evidence_hash",
+                "program_hash",
+            ])
+        );
+        let applied_key = object_key(&counter_path()).unwrap();
+        let applied_head = store.head(&applied_key).unwrap().unwrap();
+        let applied_version = store
+            .version_metadata(&applied_key, applied_head.version)
+            .unwrap()
+            .unwrap();
+        let applied_blob = applied_version.blob.unwrap();
+        let applied_blob_state = store.blob_reference_state(&applied_blob).unwrap().unwrap();
+        assert_eq!(applied_blob_state.ref_count, 1);
+        assert_eq!(applied_blob_state.flags, 0);
+        let bundle_blob = BlobRef::from(prepared.bundle);
+        let released_bundle = store.blob_reference_state(&bundle_blob).unwrap().unwrap();
+        assert_eq!(released_bundle.ref_count, 0);
+        assert_eq!(released_bundle.flags, 0);
+        assert!(
+            !store
+                .read_blob_bytes(&bundle_blob)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let invalidations = store.scan_local_invalidations(0, 10).unwrap();
+        assert_eq!(invalidations.len(), 1);
+        assert_eq!(invalidations[0].key, object_key(&counter_path()).unwrap());
+        assert_eq!(
+            invalidations[0].minimum_path_version,
+            store.head(&invalidations[0].key).unwrap().unwrap().version
+        );
+
+        // Recovery of an already-finalized commit must not append a duplicate
+        // invalidation. The compact commit marker, head and journal move together in
+        // the one local RocksDB WriteBatch above.
+        let replayed = store
+            .recover_program_bundle(ProgramCommit {
+                previous_commit_cursor: None,
+                commit_cursor: 1,
+                bundle_ref: prepared.bundle,
+                bundle_hash: prepared.hash,
+                program_hash: prepared.program_hash,
+                durability_class: ProgramDurabilityClassHash::for_class(LOCAL_DURABILITY_CLASS),
+                durability_evidence_hash: prepared.durability_evidence_hash,
+            })
+            .await
+            .unwrap();
+        assert_eq!(replayed, applied);
+        assert_eq!(store.local_invalidation_offset().unwrap(), 1);
+        assert_eq!(
+            store.blob_reference_state(&applied_blob).unwrap().unwrap(),
+            applied_blob_state
+        );
+
+        let replay_grace_millis = crate::DEFAULT_AWAITING_PUBLISH_TTL_SECONDS * 1_000;
+        assert_eq!(
+            store
+                .collect_blob_garbage_at(released_bundle.updated_at + replay_grace_millis - 1)
+                .unwrap(),
+            0
+        );
+        assert!(store.read_blob_bytes(&bundle_blob).await.is_ok());
+        assert_eq!(
+            store
+                .collect_blob_garbage_at(released_bundle.updated_at + replay_grace_millis)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store.read_blob_bytes(&bundle_blob).await.unwrap_err(),
+            MutationError::BlobNotFound
+        );
+    }
+
+    #[test]
+    fn replay_uses_no_local_receipt_column_family() {
+        assert!(
+            !crate::store::COLUMN_FAMILIES
+                .iter()
+                .any(|name| name.contains("program") || name.contains("replay"))
+        );
     }
 
     #[test]
@@ -969,7 +727,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_is_all_old_or_all_new_and_records_result_by_commit_cursor() {
+    async fn apply_is_all_old_or_all_new_and_records_only_the_compact_cursor() {
         let (_temporary, store, verified) = configured_store().await;
         let engine = store.program_engine(&verified).unwrap();
         let context = InvocationContext::new("tenant").unwrap();
@@ -989,20 +747,12 @@ mod tests {
             after.documents[&counter_path()].value,
             Some(StoredValue::Json(json!({"value": 1})))
         );
-        assert_eq!(
-            store.applied_program_receipt(1).unwrap(),
-            Some(first.clone())
-        );
-        assert!(matches!(
-            store.pending_outbox(10).unwrap()[0].payload,
-            OutboxPayload::Blob(_)
-        ));
-
+        assert_eq!(store.applied_program_commit_cursor().unwrap(), Some(1));
         let current_version = first.published_versions[&counter_path()];
         let second_invocation = invocation(
             "command-2",
             ExpectedHead::Version {
-                version: current_version.0.to_string(),
+                version: current_version.version.0.to_string(),
             },
         );
         let second_lease = engine.prepare(&context, &second_invocation).await.unwrap();
@@ -1012,7 +762,7 @@ mod tests {
             .apply_program_bundle(second_lease, &second_prepared, second_commit)
             .await
             .unwrap();
-        assert!(second.published_versions[&counter_path()] > current_version);
+        assert!(second.published_versions[&counter_path()].version > current_version.version);
         assert_eq!(
             snapshot(&store).await.documents[&counter_path()].value,
             Some(StoredValue::Json(json!({"value": 2})))
@@ -1029,9 +779,9 @@ mod tests {
                 key: object_key(&target).unwrap(),
                 bytes: serde_json::to_vec(&json!({"value": 1})).unwrap(),
                 content_type: Some("application/json".into()),
-                precondition: Precondition::Absent,
+                mode: PutMode::PutImmutable,
                 command_id: Some("install-victim".into()),
-                durability_class: "test-default".into(),
+                durability: Durability::Local,
             })
             .await
             .unwrap();
@@ -1108,24 +858,27 @@ mod tests {
         let rogue_id = store.clock.next().unwrap();
         let rogue = Version {
             id: rogue_id,
-            blob: None,
-            inline: Some(InlinePayload::new(
-                serde_json::to_vec(&json!({"value": 99})).unwrap(),
-            )),
+            blob: Some(BlobRef {
+                hash: [0x99; 32],
+                length: 1,
+            }),
             content_type: Some("application/json".into()),
             deleted: false,
             committed_at_unix_millis: now_unix_millis().unwrap(),
         };
         let key = object_key(&counter_path()).unwrap();
+        let identity = store
+            .resolve_bucket_identity(key.tenant(), key.bucket())
+            .unwrap();
         let mut batch = WriteBatch::default();
         batch.put_cf(
             store.program_cf(CF_VERSIONS).unwrap(),
-            version_key(&key, rogue_id),
+            version_key(identity, &key, rogue_id),
             serde_json::to_vec(&rogue).unwrap(),
         );
         batch.put_cf(
             store.program_cf(CF_HEADS).unwrap(),
-            key.encode(),
+            identity.head_key(key.path()),
             serde_json::to_vec(&Head {
                 version: rogue_id,
                 deleted: false,
@@ -1145,17 +898,15 @@ mod tests {
                 current: Some(rogue_id),
             }
         );
-        assert!(store.applied_program_receipt(1).unwrap().is_none());
+        assert!(store.applied_program_commit().unwrap().is_none());
     }
 
     #[tokio::test]
-    async fn prepared_artifacts_survive_reopen_for_recovery() {
+    async fn ordinary_prepared_blobs_survive_reopen_for_recovery() {
         let temporary = tempfile::tempdir().unwrap();
-        let repository = Arc::new(MemoryRemoteRepository::default());
         let store = Store::open(StoreOptions::new(temporary.path(), 1))
             .await
-            .unwrap()
-            .with_prepared_artifact_repository(repository.clone());
+            .unwrap();
         configure_policy(&store).await;
         let verified = verified_definition();
         let engine = store.program_engine(&verified).unwrap();
@@ -1171,11 +922,14 @@ mod tests {
 
         let reopened = Store::open(StoreOptions::new(temporary.path(), 1))
             .await
-            .unwrap()
-            .with_prepared_artifact_repository(repository);
+            .unwrap();
         assert_eq!(
             reopened
-                .prepared_program_bundle(prepared.hash, prepared.durability_evidence_hash)
+                .prepared_program_bundle(
+                    prepared.bundle,
+                    prepared.hash,
+                    prepared.durability_evidence_hash,
+                )
                 .await
                 .unwrap(),
             Some(prepared.clone())
@@ -1185,12 +939,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(applied.receipt.command_id, "recover");
-        assert_eq!(
-            reopened.applied_program_receipt(1).unwrap(),
-            Some(applied.clone())
-        );
-        assert_eq!(reopened.pending_outbox(10).unwrap().len(), 1);
         assert_eq!(reopened.applied_program_commit_cursor().unwrap(), Some(1));
+        let replayed = reopened
+            .committed_program_result(commit(&prepared, None, 1))
+            .await
+            .unwrap();
+        assert_eq!(replayed, applied);
     }
 
     #[tokio::test]
@@ -1208,7 +962,10 @@ mod tests {
         drop(lease.release());
 
         let mut wrong_reference = commit(&prepared, None, 1);
-        wrong_reference.bundle_ref = PreparedBundleRef([0x41; 32]);
+        wrong_reference.bundle_ref = PreparedBundleRef {
+            hash: [0x41; 32],
+            length: prepared.bundle.length,
+        };
         assert_eq!(
             store
                 .recover_program_bundle(wrong_reference)
@@ -1284,7 +1041,10 @@ mod tests {
         );
 
         let mut corrupt = commit(&prepared, None, 10);
-        corrupt.bundle_ref = PreparedBundleRef([8; 32]);
+        corrupt.bundle_ref = PreparedBundleRef {
+            hash: [8; 32],
+            length: prepared.bundle.length,
+        };
         assert_eq!(
             store.recover_program_bundle(corrupt).await.unwrap_err(),
             ProgramStoreError::CommitCorruption { cursor: 10 }
@@ -1338,53 +1098,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn injected_repository_can_attest_remote_recoverability() {
-        let temporary = tempfile::tempdir().unwrap();
-        let repository = Arc::new(MemoryRemoteRepository::default());
-        let store = Store::open(StoreOptions::new(temporary.path(), 1))
-            .await
-            .unwrap()
-            .with_prepared_artifact_repository(repository);
-        configure_policy(&store).await;
-        let program = verified_definition();
-        let engine = store.program_engine(&program).unwrap();
-        let lease = engine
-            .prepare(
-                &InvocationContext::new("tenant").unwrap(),
-                &invocation("remote", ExpectedHead::Absent),
-            )
-            .await
-            .unwrap();
-        let prepared = store.prepare_program_bundle(&lease).await.unwrap();
-
-        assert!(prepared.durability.is_remote_recoverable());
-        assert_eq!(
-            prepared.remote_durability_evidence_hash().unwrap(),
-            prepared.durability_evidence_hash
-        );
-        assert!(matches!(
-            prepared.durability.scope,
-            ProgramDurabilityScope::ConfiguredRemote { ref class }
-                if class == "test-remote"
-        ));
-    }
-
-    #[tokio::test]
     async fn mutable_read_only_program_dependency_is_rejected_before_execution() {
         let temporary = tempfile::tempdir().unwrap();
         let store = Store::open(StoreOptions::new(temporary.path(), 1))
             .await
-            .unwrap()
-            .with_prepared_artifact_repository(Arc::new(MemoryRemoteRepository::default()));
+            .unwrap();
         let config_path = ObjectPath::new("tenant", "bucket", "configuration/current").unwrap();
         let config = store
             .put(PutRequest {
                 key: object_key(&config_path).unwrap(),
                 bytes: serde_json::to_vec(&json!({"enabled": true})).unwrap(),
                 content_type: Some("application/json".into()),
-                precondition: Precondition::Absent,
+                mode: PutMode::PutIfAbsent,
                 command_id: Some("install-mutable-configuration".into()),
-                durability_class: "test-default".into(),
+                durability: Durability::Local,
             })
             .await
             .unwrap();
@@ -1427,8 +1154,8 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             error,
-            EngineError::InvalidInvocation(message)
-                if message.contains("configuration/current") && message.contains("PROGRAM_ONLY")
+            EngineError::ProgramConcurrency { path, reason }
+                if path.path == "configuration/current" && reason.contains("PROGRAM_ONLY")
         ));
         assert_eq!(
             store.head(&object_key(&counter_path()).unwrap()).unwrap(),
@@ -1448,17 +1175,16 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let store = Store::open(StoreOptions::new(temporary.path(), 1))
             .await
-            .unwrap()
-            .with_prepared_artifact_repository(Arc::new(MemoryRemoteRepository::default()));
+            .unwrap();
         let config_path = ObjectPath::new("tenant", "bucket", "configuration/current").unwrap();
         let config = store
             .put(PutRequest {
                 key: object_key(&config_path).unwrap(),
                 bytes: serde_json::to_vec(&json!({"enabled": true})).unwrap(),
                 content_type: Some("application/json".into()),
-                precondition: Precondition::Absent,
+                mode: PutMode::PutIfAbsent,
                 command_id: Some("install-configuration".into()),
-                durability_class: "test-default".into(),
+                durability: Durability::Local,
             })
             .await
             .unwrap();
@@ -1467,7 +1193,7 @@ mod tests {
                 "tenant",
                 "bucket",
                 BucketPolicy {
-                    create_once_prefixes: vec!["configuration".into()],
+                    immutable_prefixes: vec!["configuration".into()],
                     program_only_prefixes: vec!["managed".into()],
                 },
             )
@@ -1511,8 +1237,8 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             error,
-            EngineError::InvalidInvocation(message)
-                if message.contains("configuration/current") && message.contains("PROGRAM_ONLY")
+            EngineError::ProgramConcurrency { path, reason }
+                if path.path == "configuration/current" && reason.contains("PROGRAM_ONLY")
         ));
         assert_eq!(
             store.head(&object_key(&counter_path()).unwrap()).unwrap(),
@@ -1536,12 +1262,22 @@ impl StateReader for Store {
         let selected = {
             let snapshot = self.db.snapshot();
             let mut selected = Vec::with_capacity(document_paths.len());
+            let mut identity_cache =
+                BTreeMap::<(String, String), Result<BucketIdentity, String>>::new();
             for path in document_paths {
                 let key = object_key(path).map_err(|error| error.to_string())?;
+                let cache_key = (path.tenant.clone(), path.bucket.clone());
+                let identity = identity_cache
+                    .entry(cache_key)
+                    .or_insert_with(|| {
+                        self.resolve_bucket_identity(&path.tenant, &path.bucket)
+                            .map_err(|error| error.to_string())
+                    })
+                    .clone()?;
                 let head = snapshot
                     .get_cf(
                         self.cf(CF_HEADS).map_err(|error| error.to_string())?,
-                        key.encode(),
+                        identity.head_key(key.path()),
                     )
                     .map_err(|error| error.to_string())?
                     .map(|encoded| serde_json::from_slice::<Head>(&encoded))
@@ -1552,7 +1288,7 @@ impl StateReader for Store {
                         snapshot
                             .get_cf(
                                 self.cf(CF_VERSIONS).map_err(|error| error.to_string())?,
-                                version_key(&key, head.version),
+                                version_key(identity, &key, head.version),
                             )
                             .map_err(|error| error.to_string())?
                             .ok_or_else(|| "head references a missing version".to_owned())
@@ -1575,7 +1311,7 @@ impl StateReader for Store {
                 continue;
             };
             if version.deleted {
-                if version.blob.is_some() || version.inline.is_some() {
+                if version.blob.is_some() {
                     return Err("tombstone version unexpectedly has a payload".into());
                 }
                 documents.insert(
@@ -1588,14 +1324,12 @@ impl StateReader for Store {
                 );
                 continue;
             }
-            let bytes = match (&version.inline, &version.blob) {
-                (Some(inline), None) if inline.is_valid() => inline.bytes.clone(),
-                (None, Some(blob)) => self
-                    .blobs
-                    .get(blob)
+            let bytes = match &version.blob {
+                Some(blob) => self
+                    .read_blob_bytes(blob)
                     .await
                     .map_err(|error| error.to_string())?,
-                _ => return Err("live version has an invalid payload shape".into()),
+                None => return Err("live version has an invalid payload shape".into()),
             };
             let content_type = version
                 .content_type
@@ -1697,14 +1431,6 @@ fn validate_source_bundle(source: &AtomicWriteBundle) -> Result<(), ProgramStore
             "bundle outputs do not match command receipt".into(),
         ));
     }
-    let mut effects = BTreeSet::new();
-    for emission in &source.emissions {
-        if !effects.insert(&emission.effect_id) {
-            return Err(ProgramStoreError::InvalidBundle(
-                "duplicate emission effect id".into(),
-            ));
-        }
-    }
     Ok(())
 }
 
@@ -1714,38 +1440,40 @@ fn validate_prepared_record(record: &StoredPreparedBundle) -> Result<(), Program
             "unsupported prepared record format".into(),
         ));
     }
-    let mut preconditions = BTreeSet::new();
+    let mut preconditions = BTreeMap::new();
     for precondition in &record.preconditions {
         validate_observed_head(&precondition.expected)?;
-        if !preconditions.insert(precondition.path.clone()) {
+        if preconditions
+            .insert(precondition.path.clone(), precondition.expected.clone())
+            .is_some()
+        {
             return Err(ProgramStoreError::InvalidBundle(
                 "duplicate prepared precondition".into(),
             ));
         }
     }
-    if record
-        .writes
-        .iter()
-        .any(|reference| reference.kind != PreparedArtifactKind::VersionDescriptor)
-        || record.writes.iter().collect::<BTreeSet<_>>().len() != record.writes.len()
-    {
-        return Err(ProgramStoreError::InvalidBundle(
-            "prepared writes must be unique version-descriptor references".into(),
-        ));
-    }
-    if record.receipt.kind != PreparedArtifactKind::Receipt {
-        return Err(ProgramStoreError::InvalidBundle(
-            "prepared receipt reference has the wrong artifact kind".into(),
-        ));
-    }
-    let mut effects = BTreeSet::new();
-    if record.emissions.iter().any(|emission| {
-        !effects.insert(&emission.effect_id)
-            || emission.payload.kind != PreparedArtifactKind::Payload
-    }) {
-        return Err(ProgramStoreError::InvalidBundle(
-            "duplicate prepared effect id".into(),
-        ));
+    let mut write_paths = BTreeSet::new();
+    let mut version_ids = BTreeSet::new();
+    for write in &record.writes {
+        if preconditions.get(&write.path) != Some(&write.expected)
+            || !write_paths.insert(write.path.clone())
+            || !version_ids.insert(write.version.id)
+        {
+            return Err(ProgramStoreError::InvalidBundle(
+                "prepared write has no unique matching precondition or version".into(),
+            ));
+        }
+        let valid_tombstone = write.version.deleted
+            && write.version.blob.is_none()
+            && write.version.content_type.is_none();
+        let valid_live = !write.version.deleted
+            && write.version.blob.is_some()
+            && write.version.content_type.is_some();
+        if !valid_tombstone && !valid_live {
+            return Err(ProgramStoreError::InvalidBundle(
+                "prepared version has an invalid payload or tombstone shape".into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -1781,13 +1509,6 @@ fn encode_stored_value(value: &StoredValue) -> Result<Vec<u8>, ProgramStoreError
     }
 }
 
-fn encode_emission(payload: &EmissionPayload) -> Result<Vec<u8>, ProgramStoreError> {
-    match payload {
-        EmissionPayload::Json(value) => serde_json::to_vec(value).map_err(program_storage_error),
-        EmissionPayload::Opaque(value) => Ok(value.clone()),
-    }
-}
-
 fn is_json_content_type(content_type: &str) -> bool {
     content_type
         .split(';')
@@ -1800,105 +1521,32 @@ fn object_key(path: &ObjectPath) -> Result<ObjectKey, ProgramStoreError> {
         .map_err(|error| ProgramStoreError::InvalidBundle(error.to_string()))
 }
 
-fn artifact_key(reference: &PreparedArtifactRef) -> Vec<u8> {
-    let mut key = Vec::with_capacity(34);
-    key.push(ARTIFACT_PREFIX);
-    key.push(reference.kind.key_tag());
-    key.extend_from_slice(&reference.hash);
-    key
-}
-
-fn evidence_key(hash: ProgramDurabilityEvidenceHash) -> Vec<u8> {
-    let mut key = Vec::with_capacity(33);
-    key.push(EVIDENCE_PREFIX);
-    key.extend_from_slice(&hash.0);
-    key
-}
-
-fn commit_cursor_key(cursor: u64) -> Vec<u8> {
-    let mut key = Vec::with_capacity(COMMIT_CURSOR_PREFIX.len() + 8);
-    key.extend_from_slice(COMMIT_CURSOR_PREFIX);
-    key.extend_from_slice(&cursor.to_be_bytes());
-    key
-}
-
-fn commit_bundle_key(hash: PreparedBundleHash) -> Vec<u8> {
-    let mut key = Vec::with_capacity(COMMIT_BUNDLE_PREFIX.len() + 32);
-    key.extend_from_slice(COMMIT_BUNDLE_PREFIX);
-    key.extend_from_slice(&hash.0);
-    key
-}
-
-fn artifact_manifest_hash(
-    references: &[PreparedArtifactRef],
-) -> Result<[u8; 32], ProgramStoreError> {
-    let mut references = references.to_vec();
-    references.sort();
-    let encoded = serde_json::to_vec(&references).map_err(program_storage_error)?;
-    Ok(tagged_hash(
-        b"anvil.prepared-artifact-manifest.v1",
-        &encoded,
-    ))
-}
-
-fn validate_artifact_batch(batch: &PreparedArtifactBatch) -> Result<(), ProgramStoreError> {
-    if batch.bundle.kind != PreparedArtifactKind::Bundle {
-        return Err(ProgramStoreError::InvalidBundle(
-            "prepared root is not a bundle artifact".into(),
-        ));
+fn committed_result(record: &StoredPreparedBundle) -> CommittedProgramResult {
+    let published_versions = record
+        .writes
+        .iter()
+        .map(|write| {
+            (
+                write.path.clone(),
+                PublishedProgramVersion {
+                    version: write.version.id,
+                    deleted: write.version.deleted,
+                },
+            )
+        })
+        .collect();
+    CommittedProgramResult {
+        receipt: record.receipt.clone(),
+        published_versions,
     }
-    let mut identities = BTreeMap::new();
-    let mut references = Vec::with_capacity(batch.artifacts.len());
-    for artifact in &batch.artifacts {
-        if !artifact.reference.verify(&artifact.bytes) {
-            return Err(ProgramStoreError::ArtifactCorruption(
-                artifact.reference.clone(),
-            ));
-        }
-        let identity = (artifact.reference.kind, artifact.reference.hash);
-        if identities
-            .insert(identity, artifact.reference.length)
-            .is_some()
-        {
-            return Err(ProgramStoreError::InvalidBundle(
-                "prepared artifact manifest contains a duplicate artifact".into(),
-            ));
-        }
-        references.push(artifact.reference.clone());
-    }
-    if !references.contains(&batch.bundle) {
-        return Err(ProgramStoreError::InvalidBundle(
-            "prepared artifact manifest omits its root bundle".into(),
-        ));
-    }
-    if artifact_manifest_hash(&references)? != batch.manifest_hash {
-        return Err(ProgramStoreError::InvalidBundle(
-            "prepared artifact manifest hash does not match its contents".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn insert_artifact(
-    artifacts: &mut BTreeMap<PreparedArtifactRef, PreparedArtifact>,
-    artifact: PreparedArtifact,
-) -> Result<(), ProgramStoreError> {
-    if let Some(existing) = artifacts.get(&artifact.reference) {
-        if existing.bytes != artifact.bytes {
-            return Err(ProgramStoreError::HashCollision);
-        }
-        return Ok(());
-    }
-    artifacts.insert(artifact.reference.clone(), artifact);
-    Ok(())
 }
 
 fn validate_durability_evidence(
     evidence: &ProgramDurabilityEvidence,
 ) -> Result<(), ProgramStoreError> {
     if evidence.format != DURABILITY_EVIDENCE_FORMAT
-        || evidence.bundle.kind != PreparedArtifactKind::Bundle
-        || evidence.manifest_hash == [0; 32]
+        || evidence.bundle.hash == [0; 32]
+        || evidence.bundle.length == 0
         || matches!(
             &evidence.scope,
             ProgramDurabilityScope::ConfiguredRemote { class } if class.trim().is_empty()
@@ -1913,7 +1561,7 @@ fn verify_loaded_commit(
     loaded: &LoadedPreparedBundle,
     commit: &ProgramCommit,
 ) -> Result<(), ProgramStoreError> {
-    if PreparedBundleRef(loaded.bundle.hash) != commit.bundle_ref
+    if loaded.bundle != commit.bundle_ref
         || PreparedBundleHash(loaded.bundle.hash) != commit.bundle_hash
         || loaded.record.program_hash != commit.program_hash
         || loaded.evidence.hash()? != commit.durability_evidence_hash
@@ -1928,7 +1576,7 @@ fn verify_prepared_commit(
     prepared: &PreparedProgramBundle,
     commit: &ProgramCommit,
 ) -> Result<(), ProgramStoreError> {
-    if PreparedBundleRef(prepared.bundle.hash) != commit.bundle_ref
+    if prepared.bundle != commit.bundle_ref
         || prepared.hash != commit.bundle_hash
         || prepared.program_hash != commit.program_hash
         || prepared.durability_evidence_hash != commit.durability_evidence_hash
@@ -1961,50 +1609,6 @@ fn verify_commit_durability(
     Ok(())
 }
 
-fn validate_loaded_record(
-    record: &StoredPreparedBundle,
-    writes: &[PreparedVersionWrite],
-    _receipt: &CommandReceipt,
-) -> Result<(), ProgramStoreError> {
-    validate_prepared_record(record)?;
-    if writes.len() != record.writes.len() {
-        return Err(ProgramStoreError::InvalidBundle(
-            "prepared bundle did not resolve every version descriptor".into(),
-        ));
-    }
-    let preconditions = record
-        .preconditions
-        .iter()
-        .map(|precondition| (precondition.path.clone(), precondition.expected.clone()))
-        .collect::<BTreeMap<_, _>>();
-    let mut write_paths = BTreeSet::new();
-    let mut version_ids = BTreeSet::new();
-    for write in writes {
-        if preconditions.get(&write.path) != Some(&write.expected)
-            || !write_paths.insert(write.path.clone())
-            || !version_ids.insert(write.version.id)
-        {
-            return Err(ProgramStoreError::InvalidBundle(
-                "prepared write has no unique matching precondition or version".into(),
-            ));
-        }
-        let valid_tombstone = write.version.deleted
-            && write.version.blob.is_none()
-            && write.version.inline.is_none()
-            && write.version.content_type.is_none();
-        let valid_live = !write.version.deleted
-            && write.version.blob.is_some()
-            && write.version.inline.is_none()
-            && write.version.content_type.is_some();
-        if !valid_tombstone && !valid_live {
-            return Err(ProgramStoreError::InvalidBundle(
-                "prepared version has an invalid payload or tombstone shape".into(),
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn tagged_hash(tag: &[u8], bytes: &[u8]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(tag);
@@ -2031,7 +1635,7 @@ impl Store {
         lease: ProgramExecutionLease,
         prepared: &PreparedProgramBundle,
         commit: ProgramCommit,
-    ) -> Result<AppliedProgramReceipt, ProgramStoreError> {
+    ) -> Result<CommittedProgramResult, ProgramStoreError> {
         let result = async {
             let source = lease.bundle();
             let source_encoded = serde_json::to_vec(source).map_err(program_storage_error)?;
@@ -2043,22 +1647,27 @@ impl Store {
                 return Err(ProgramStoreError::PreparedBundleMismatch);
             }
             verify_prepared_commit(prepared, &commit)?;
-            if let Some(existing) = self.applied_program_at(commit.commit_cursor)? {
-                return self.match_applied_commit(existing, &commit);
-            }
+            let _commit_guard = self.commit_lock.lock().await;
             let loaded = self
-                .load_prepared_bundle(commit.bundle_hash, commit.durability_evidence_hash)
+                .load_prepared_bundle(
+                    commit.bundle_ref,
+                    commit.bundle_hash,
+                    commit.durability_evidence_hash,
+                )
                 .await?;
             if source_hash != loaded.record.source_bundle_hash
                 || prepared.bundle != loaded.bundle
-                || prepared.manifest_hash != loaded.evidence.manifest_hash
                 || prepared.durability != loaded.evidence
             {
                 return Err(ProgramStoreError::PreparedBundleMismatch);
             }
             verify_loaded_commit(&loaded, &commit)?;
-            self.materialize_prepared_payloads(&loaded).await?;
-            let _commit_guard = self.commit_lock.lock().await;
+            if let Some(existing) = self.applied_program_commit()?
+                && existing.commit_cursor == commit.commit_cursor
+            {
+                self.match_applied_commit(&existing, &commit)?;
+                return Ok(committed_result(&loaded.record));
+            }
             self.apply_prepared_record(&loaded, &commit)
         }
         .await;
@@ -2066,22 +1675,26 @@ impl Store {
         result
     }
 
-    /// Recovery path for a committed bundle. The repository must resolve both
-    /// hashes without relying on executor-local state if the commit claimed a
-    /// remote durability class.
+    /// Recovery path for a committed bundle in the ordinary blob plane.
     pub async fn recover_program_bundle(
         &self,
         commit: ProgramCommit,
-    ) -> Result<AppliedProgramReceipt, ProgramStoreError> {
+    ) -> Result<CommittedProgramResult, ProgramStoreError> {
         let _policy_guard = self.policy_gate.read().await;
-        if let Some(existing) = self.applied_program_at(commit.commit_cursor)? {
-            return self.match_applied_commit(existing, &commit);
+        if let Some(existing) = self.applied_program_commit()?
+            && existing.commit_cursor == commit.commit_cursor
+        {
+            self.match_applied_commit(&existing, &commit)?;
+            return self.committed_program_result(commit).await;
         }
         let loaded = self
-            .load_prepared_bundle(commit.bundle_hash, commit.durability_evidence_hash)
+            .load_prepared_bundle(
+                commit.bundle_ref,
+                commit.bundle_hash,
+                commit.durability_evidence_hash,
+            )
             .await?;
         verify_loaded_commit(&loaded, &commit)?;
-        self.materialize_prepared_payloads(&loaded).await?;
         let paths = loaded
             .record
             .preconditions
@@ -2090,14 +1703,40 @@ impl Store {
             .collect::<Vec<_>>();
         let _guard = self.program_locks.acquire(&paths).await;
         let _commit_guard = self.commit_lock.lock().await;
+        // Re-read and verify under the commit fence so GC cannot retire an
+        // awaiting output or bundle between verification and publication.
+        let loaded = self
+            .load_prepared_bundle(
+                commit.bundle_ref,
+                commit.bundle_hash,
+                commit.durability_evidence_hash,
+            )
+            .await?;
+        if let Some(existing) = self.applied_program_commit()?
+            && existing.commit_cursor == commit.commit_cursor
+        {
+            self.match_applied_commit(&existing, &commit)?;
+            return Ok(committed_result(&loaded.record));
+        }
         self.apply_prepared_record(&loaded, &commit)
     }
 
-    pub fn applied_program_receipt(
+    /// Reconstructs the exact public response from the ordinary prepared
+    /// bundle named by an authoritative committed-invocation entry in Raft.
+    /// No second local receipt or result copy is consulted.
+    pub async fn committed_program_result(
         &self,
-        commit_cursor: u64,
-    ) -> Result<Option<AppliedProgramReceipt>, ProgramStoreError> {
-        self.applied_program_at(commit_cursor)
+        commit: ProgramCommit,
+    ) -> Result<CommittedProgramResult, ProgramStoreError> {
+        let loaded = self
+            .load_prepared_bundle(
+                commit.bundle_ref,
+                commit.bundle_hash,
+                commit.durability_evidence_hash,
+            )
+            .await?;
+        verify_loaded_commit(&loaded, &commit)?;
+        Ok(committed_result(&loaded.record))
     }
 
     pub fn applied_program_commit(
@@ -2116,55 +1755,11 @@ impl Store {
         self.read_program_json(CF_METADATA, VERSION_HIGH_WATERMARK_KEY)
     }
 
-    pub fn outbox_entry(&self, effect_id: &str) -> Result<Option<OutboxEntry>, ProgramStoreError> {
-        self.read_program_json(CF_OUTBOX, effect_id.as_bytes())
-    }
-
-    pub fn pending_outbox(&self, limit: usize) -> Result<Vec<OutboxEntry>, ProgramStoreError> {
-        self.db
-            .iterator_cf(self.program_cf(CF_OUTBOX)?, IteratorMode::Start)
-            .take(limit)
-            .map(|item| {
-                let (_, encoded) = item.map_err(program_storage_error)?;
-                serde_json::from_slice(&encoded).map_err(program_storage_error)
-            })
-            .collect()
-    }
-
-    pub async fn outbox_payload(&self, entry: &OutboxEntry) -> Result<Vec<u8>, ProgramStoreError> {
-        match &entry.payload {
-            OutboxPayload::Inline(payload) if payload.is_valid() => Ok(payload.bytes.clone()),
-            OutboxPayload::Inline(_) => Err(ProgramStoreError::Storage(
-                "inline outbox payload failed hash or length verification".into(),
-            )),
-            OutboxPayload::Blob(blob) => self.blobs.get(blob).await.map_err(program_storage_error),
-        }
-    }
-
-    fn applied_program_at(
-        &self,
-        cursor: u64,
-    ) -> Result<Option<AppliedProgramReceipt>, ProgramStoreError> {
-        self.read_program_json(CF_PROGRAM_COMMITS, &commit_cursor_key(cursor))
-    }
-
     fn match_applied_commit(
         &self,
-        existing: AppliedProgramReceipt,
+        existing: &AppliedProgramCommit,
         requested: &ProgramCommit,
-    ) -> Result<AppliedProgramReceipt, ProgramStoreError> {
-        if let Some(tip) = self.applied_program_commit()?
-            && (existing.commit_cursor > tip.commit_cursor
-                || (existing.commit_cursor == tip.commit_cursor
-                    && (existing.bundle_ref != tip.bundle_ref
-                        || existing.bundle_hash != tip.bundle_hash
-                        || existing.durability_class != tip.durability_class
-                        || existing.durability_evidence_hash != tip.durability_evidence_hash)))
-        {
-            return Err(ProgramStoreError::CommitCorruption {
-                cursor: requested.commit_cursor,
-            });
-        }
+    ) -> Result<(), ProgramStoreError> {
         if existing.commit_cursor == requested.commit_cursor
             && existing.bundle_ref == requested.bundle_ref
             && existing.bundle_hash == requested.bundle_hash
@@ -2172,7 +1767,7 @@ impl Store {
             && existing.durability_class == requested.durability_class
             && existing.durability_evidence_hash == requested.durability_evidence_hash
         {
-            Ok(existing)
+            Ok(())
         } else {
             Err(ProgramStoreError::CommitCorruption {
                 cursor: requested.commit_cursor,
@@ -2180,144 +1775,71 @@ impl Store {
         }
     }
 
-    async fn load_artifact(
-        &self,
-        reference: &PreparedArtifactRef,
-    ) -> Result<Vec<u8>, ProgramStoreError> {
-        let bytes = self
-            .program_artifacts
-            .load(reference.clone())
-            .await
-            .map_err(program_storage_error)?
-            .ok_or_else(|| ProgramStoreError::ArtifactNotFound(reference.clone()))?;
-        if !reference.verify(&bytes) {
-            return Err(ProgramStoreError::ArtifactCorruption(reference.clone()));
-        }
-        Ok(bytes)
-    }
-
     async fn load_prepared_bundle(
         &self,
+        bundle: PreparedBundleRef,
         hash: PreparedBundleHash,
         evidence_hash: ProgramDurabilityEvidenceHash,
     ) -> Result<LoadedPreparedBundle, ProgramStoreError> {
-        let evidence = self
-            .program_artifacts
-            .load_evidence(evidence_hash)
-            .await
-            .map_err(program_storage_error)?
-            .ok_or(ProgramStoreError::DurabilityEvidenceNotFound(evidence_hash))?;
+        if bundle.hash != hash.0 || bundle.length == 0 {
+            return Err(ProgramStoreError::PreparedBundleMismatch);
+        }
+        let evidence = self.local_program_durability_evidence(bundle);
         validate_durability_evidence(&evidence)?;
-        if evidence.hash()? != evidence_hash
-            || evidence.bundle.kind != PreparedArtifactKind::Bundle
-            || evidence.bundle.hash != hash.0
-        {
+        if evidence.hash()? != evidence_hash {
             return Err(ProgramStoreError::DurabilityEvidenceMismatch);
         }
 
-        let bundle_bytes = self.load_artifact(&evidence.bundle).await?;
+        let bundle_reference = BlobRef::from(bundle);
+        let bundle_bytes = self
+            .read_blob_bytes(&bundle_reference)
+            .await
+            .map_err(|error| match error {
+                MutationError::BlobNotFound => ProgramStoreError::PreparedBundleNotFound(hash),
+                other => program_mutation_error(other),
+            })?;
         let record = serde_json::from_slice::<StoredPreparedBundle>(&bundle_bytes)
             .map_err(program_storage_error)?;
         validate_prepared_record(&record)?;
-
-        let mut references = vec![evidence.bundle.clone()];
-        let mut writes = Vec::with_capacity(record.writes.len());
-        let mut write_payloads = Vec::with_capacity(record.writes.len());
-        for reference in &record.writes {
-            let bytes = self.load_artifact(reference).await?;
-            let write = serde_json::from_slice::<PreparedVersionWrite>(&bytes)
-                .map_err(program_storage_error)?;
+        for write in &record.writes {
             if let Some(blob) = &write.version.blob {
-                let payload_ref = PreparedArtifactRef {
-                    kind: PreparedArtifactKind::Payload,
-                    hash: blob.hash,
-                    length: blob.length,
-                };
-                write_payloads.push(Some(self.load_artifact(&payload_ref).await?));
-                references.push(payload_ref);
-            } else {
-                write_payloads.push(None);
+                // `open_blob` verifies the ordinary byte plane without
+                // copying output payloads into the bundle.
+                self.open_blob(blob).await.map_err(program_mutation_error)?;
             }
-            references.push(reference.clone());
-            writes.push(write);
         }
-
-        let receipt_bytes = self.load_artifact(&record.receipt).await?;
-        let receipt = serde_json::from_slice::<CommandReceipt>(&receipt_bytes)
-            .map_err(program_storage_error)?;
-        references.push(record.receipt.clone());
-
-        let mut emission_payloads = Vec::with_capacity(record.emissions.len());
-        for emission in &record.emissions {
-            emission_payloads.push(self.load_artifact(&emission.payload).await?);
-            references.push(emission.payload.clone());
-        }
-        references.sort();
-        references.dedup();
-        if artifact_manifest_hash(&references)? != evidence.manifest_hash {
-            return Err(ProgramStoreError::DurabilityEvidenceMismatch);
-        }
-        validate_loaded_record(&record, &writes, &receipt)?;
 
         Ok(LoadedPreparedBundle {
-            bundle: evidence.bundle.clone(),
+            bundle,
             record,
-            writes,
-            write_payloads,
-            receipt,
-            emission_payloads,
             evidence,
         })
     }
 
-    async fn materialize_prepared_payloads(
+    fn local_program_durability_evidence(
         &self,
-        loaded: &LoadedPreparedBundle,
-    ) -> Result<(), ProgramStoreError> {
-        for (write, payload) in loaded.writes.iter().zip(&loaded.write_payloads) {
-            let (Some(expected), Some(bytes)) = (&write.version.blob, payload) else {
-                continue;
-            };
-            let reference = PreparedArtifactRef {
-                kind: PreparedArtifactKind::Payload,
-                hash: expected.hash,
-                length: expected.length,
-            };
-            let actual = self.blobs.put(bytes).await.map_err(program_storage_error)?;
-            if &actual != expected {
-                return Err(ProgramStoreError::ArtifactCorruption(reference));
-            }
+        bundle: PreparedBundleRef,
+    ) -> ProgramDurabilityEvidence {
+        ProgramDurabilityEvidence {
+            format: DURABILITY_EVIDENCE_FORMAT,
+            bundle,
+            scope: ProgramDurabilityScope::ExecutorLocal {
+                node_id: self.node_id,
+                synced: self.sync_writes,
+            },
+            provider_receipt: Vec::new(),
         }
-        for (emission, bytes) in loaded
-            .record
-            .emissions
-            .iter()
-            .zip(&loaded.emission_payloads)
-        {
-            let actual = self.blobs.put(bytes).await.map_err(program_storage_error)?;
-            if actual.hash != emission.payload.hash || actual.length != emission.payload.length {
-                return Err(ProgramStoreError::ArtifactCorruption(
-                    emission.payload.clone(),
-                ));
-            }
-        }
-        Ok(())
     }
 
     fn apply_prepared_record(
         &self,
         loaded: &LoadedPreparedBundle,
         commit: &ProgramCommit,
-    ) -> Result<AppliedProgramReceipt, ProgramStoreError> {
+    ) -> Result<CommittedProgramResult, ProgramStoreError> {
         let record = &loaded.record;
-        let hash = commit.bundle_hash;
         validate_prepared_record(record)?;
-        validate_loaded_record(record, &loaded.writes, &loaded.receipt)?;
         verify_loaded_commit(loaded, commit)?;
 
-        if let Some(existing) = self.applied_program_at(commit.commit_cursor)? {
-            return self.match_applied_commit(existing, commit);
-        }
         if commit.commit_cursor == 0
             || commit
                 .previous_commit_cursor
@@ -2328,21 +1850,11 @@ impl Store {
             ));
         }
         let applied_commit = self.applied_program_commit()?;
-        if let Some(tip) = &applied_commit {
-            let indexed = self.applied_program_at(tip.commit_cursor)?.ok_or(
-                ProgramStoreError::CommitCorruption {
-                    cursor: tip.commit_cursor,
-                },
-            )?;
-            if indexed.bundle_ref != tip.bundle_ref
-                || indexed.bundle_hash != tip.bundle_hash
-                || indexed.durability_class != tip.durability_class
-                || indexed.durability_evidence_hash != tip.durability_evidence_hash
-            {
-                return Err(ProgramStoreError::CommitCorruption {
-                    cursor: tip.commit_cursor,
-                });
-            }
+        if let Some(existing) = &applied_commit
+            && existing.commit_cursor == commit.commit_cursor
+        {
+            self.match_applied_commit(existing, commit)?;
+            return Ok(committed_result(record));
         }
         let local_predecessor = applied_commit.as_ref().map(|applied| applied.commit_cursor);
         if local_predecessor != commit.previous_commit_cursor {
@@ -2352,36 +1864,84 @@ impl Store {
                 requested: commit.commit_cursor,
             });
         }
-        if let Some(existing_cursor) =
-            self.read_program_json::<u64>(CF_PROGRAM_COMMITS, &commit_bundle_key(hash))?
-            && existing_cursor != commit.commit_cursor
-        {
-            return Err(ProgramStoreError::CommitCorruption {
-                cursor: commit.commit_cursor,
-            });
-        }
-
         if commit.program_hash != record.program_hash {
             return Err(ProgramStoreError::PreparedBundleMismatch);
         }
 
+        let mut identities = BTreeMap::<(String, String), BucketIdentity>::new();
+        for path in record
+            .preconditions
+            .iter()
+            .map(|precondition| &precondition.path)
+            .chain(record.writes.iter().map(|write| &write.path))
+        {
+            let cache_key = (path.tenant.clone(), path.bucket.clone());
+            if !identities.contains_key(&cache_key) {
+                let identity = self
+                    .resolve_bucket_identity(&path.tenant, &path.bucket)
+                    .map_err(program_mutation_error)?;
+                identities.insert(cache_key, identity);
+            }
+        }
         let mut current_heads = BTreeMap::new();
+        let mut current_versions = BTreeMap::new();
         for precondition in &record.preconditions {
             let key = object_key(&precondition.path)?;
-            let current = self.head(&key).map_err(program_mutation_error)?;
+            let identity = *identities
+                .get(&(
+                    precondition.path.tenant.clone(),
+                    precondition.path.bucket.clone(),
+                ))
+                .ok_or_else(|| {
+                    ProgramStoreError::Storage("precondition has no stable bucket identity".into())
+                })?;
+            let current = self
+                .head_by_storage_key(&identity.head_key(key.path()))
+                .map_err(program_mutation_error)?;
             if !head_matches(&precondition.expected, current.as_ref())? {
                 return Err(ProgramStoreError::PreconditionFailed {
                     path: precondition.path.clone(),
                     current: current.map(|head| head.version),
                 });
             }
+            let current_version = current
+                .as_ref()
+                .map(|head| {
+                    self.version_metadata_by_identity(identity, &key, head.version)
+                        .map_err(program_mutation_error)?
+                        .ok_or_else(|| {
+                            ProgramStoreError::Storage(
+                                "head references a missing version descriptor".into(),
+                            )
+                        })
+                })
+                .transpose()?;
+            if current_version
+                .as_ref()
+                .zip(current.as_ref())
+                .is_some_and(|(version, head)| {
+                    version.id != head.version || version.deleted != head.deleted
+                })
+            {
+                return Err(ProgramStoreError::Storage(
+                    "head and current version descriptor disagree".into(),
+                ));
+            }
             current_heads.insert(precondition.path.clone(), current);
+            current_versions.insert(precondition.path.clone(), current_version);
         }
 
-        for write in &loaded.writes {
+        let mut versioning_by_path = BTreeMap::new();
+        for write in &record.writes {
+            let identity = *identities
+                .get(&(write.path.tenant.clone(), write.path.bucket.clone()))
+                .ok_or_else(|| {
+                    ProgramStoreError::Storage("write has no stable bucket identity".into())
+                })?;
             let policy = self
-                .bucket_policy(&write.path.tenant, &write.path.bucket)
-                .map_err(program_mutation_error)?;
+                .bucket_policy_by_key(&identity.encode())
+                .map_err(program_mutation_error)?
+                .unwrap_or_default();
             if !policy.is_program_only(&write.path.path) {
                 return Err(ProgramStoreError::ProgramPolicy {
                     path: write.path.clone(),
@@ -2392,7 +1952,7 @@ impl Store {
                     path: write.path.clone(),
                 });
             }
-            if policy.is_create_once(&write.path.path)
+            if policy.is_immutable(&write.path.path)
                 && (write.version.deleted
                     || current_heads
                         .get(&write.path)
@@ -2402,92 +1962,144 @@ impl Store {
                     path: write.path.clone(),
                 });
             }
+            versioning_by_path.insert(
+                write.path.clone(),
+                self.bucket_versioning_by_key(&identity.encode())
+                    .map_err(program_mutation_error)?,
+            );
         }
-        for (emission, payload) in record.emissions.iter().zip(&loaded.emission_payloads) {
-            if let Some(existing) = self.outbox_entry(&emission.effect_id)? {
-                let expected = OutboxEntry {
-                    effect_id: emission.effect_id.clone(),
-                    route_id: emission.route_id.clone(),
-                    payload: OutboxPayload::Blob(BlobRef {
-                        hash: emission.payload.hash,
-                        length: emission.payload.length,
-                    }),
-                    content_type: emission.content_type.clone(),
-                    bundle_hash: hash,
-                    commit_cursor: commit.commit_cursor,
-                };
-                if existing != expected {
+        let result = committed_result(record);
+        let applied = AppliedProgramCommit {
+            commit_cursor: commit.commit_cursor,
+            bundle_ref: commit.bundle_ref,
+            bundle_hash: commit.bundle_hash,
+            program_hash: record.program_hash,
+            durability_class: commit.durability_class,
+            durability_evidence_hash: commit.durability_evidence_hash,
+        };
+
+        let mut batch = WriteBatch::default();
+        let mut invalidations = Vec::with_capacity(record.writes.len());
+        let mut pending_blob_references = PendingBlobReferences::new();
+        let publication_at_unix_millis = now_unix_millis().map_err(program_mutation_error)?;
+        for write in &record.writes {
+            let key = object_key(&write.path)?;
+            let identity = *identities
+                .get(&(write.path.tenant.clone(), write.path.bucket.clone()))
+                .ok_or_else(|| {
+                    ProgramStoreError::Storage("write has no stable bucket identity".into())
+                })?;
+            let version_bytes =
+                serde_json::to_vec(&write.version).map_err(program_storage_error)?;
+            let encoded_version_key = version_key(identity, &key, write.version.id);
+            let existing = self.raw_get(CF_VERSIONS, &encoded_version_key)?;
+            if let Some(existing) = &existing {
+                if existing.as_slice() != version_bytes.as_slice() {
                     return Err(ProgramStoreError::CommitCorruption {
                         cursor: commit.commit_cursor,
                     });
                 }
+            } else {
+                let versioning = *versioning_by_path.get(&write.path).ok_or_else(|| {
+                    ProgramStoreError::Storage("write has no bucket versioning decision".into())
+                })?;
+                let old_version = current_versions
+                    .get(&write.path)
+                    .ok_or_else(|| {
+                        ProgramStoreError::Storage(
+                            "write has no current-version observation".into(),
+                        )
+                    })?
+                    .as_ref();
+                let old_blob = old_version
+                    .map(version_blob_reference)
+                    .transpose()
+                    .map_err(program_mutation_error)?
+                    .flatten();
+                let new_blob =
+                    version_blob_reference(&write.version).map_err(program_mutation_error)?;
+                let references_changed = old_blob.as_ref() != new_blob.as_ref();
+                if versioning == ObjectVersioning::Unversioned && references_changed {
+                    if let Some(reference) = old_blob.as_ref() {
+                        let (reference_key, state) = self
+                            .prepare_blob_reference_retirement(
+                                reference,
+                                &pending_blob_references,
+                                publication_at_unix_millis,
+                            )
+                            .map_err(program_mutation_error)?;
+                        self.stage_blob_reference_update(
+                            &mut batch,
+                            &mut pending_blob_references,
+                            reference_key,
+                            state,
+                        )
+                        .map_err(program_mutation_error)?;
+                    }
+                }
+                if let Some(reference) = new_blob.as_ref()
+                    && (versioning == ObjectVersioning::Enabled || references_changed)
+                {
+                    let (reference_key, state) = self
+                        .prepare_blob_reference_publication(
+                            reference,
+                            &pending_blob_references,
+                            publication_at_unix_millis,
+                        )
+                        .map_err(program_mutation_error)?;
+                    self.stage_blob_reference_update(
+                        &mut batch,
+                        &mut pending_blob_references,
+                        reference_key,
+                        state,
+                    )
+                    .map_err(program_mutation_error)?;
+                }
+                if versioning == ObjectVersioning::Unversioned
+                    && let Some(previous) = old_version
+                {
+                    batch.delete_cf(
+                        self.program_cf(CF_VERSIONS)?,
+                        version_key(identity, &key, previous.id),
+                    );
+                }
             }
-            if payload.len() as u64 != emission.payload.length {
-                return Err(ProgramStoreError::ArtifactCorruption(
-                    emission.payload.clone(),
-                ));
-            }
-        }
-
-        let published_versions = loaded
-            .writes
-            .iter()
-            .map(|write| (write.path.clone(), write.version.id))
-            .collect::<BTreeMap<_, _>>();
-        let applied = AppliedProgramReceipt {
-            receipt: loaded.receipt.clone(),
-            bundle_ref: commit.bundle_ref,
-            bundle_hash: hash,
-            program_hash: record.program_hash,
-            durability_class: commit.durability_class,
-            durability_evidence_hash: commit.durability_evidence_hash,
-            published_versions,
-            commit_cursor: commit.commit_cursor,
-        };
-
-        let mut batch = WriteBatch::default();
-        for write in &loaded.writes {
-            let key = object_key(&write.path)?;
-            let version_bytes =
-                serde_json::to_vec(&write.version).map_err(program_storage_error)?;
-            let version_key = version_key(&key, write.version.id);
-            if let Some(existing) = self.raw_get(CF_VERSIONS, &version_key)?
-                && existing.as_slice() != version_bytes.as_slice()
-            {
-                return Err(ProgramStoreError::CommitCorruption {
-                    cursor: commit.commit_cursor,
-                });
-            }
-            batch.put_cf(self.program_cf(CF_VERSIONS)?, version_key, version_bytes);
+            batch.put_cf(
+                self.program_cf(CF_VERSIONS)?,
+                encoded_version_key,
+                version_bytes,
+            );
             batch.put_cf(
                 self.program_cf(CF_HEADS)?,
-                key.encode(),
+                identity.head_key(key.path()),
                 serde_json::to_vec(&Head {
                     version: write.version.id,
                     deleted: write.version.deleted,
                 })
                 .map_err(program_storage_error)?,
             );
+            invalidations.push((key, write.version.id, write.version.deleted));
         }
-        for emission in &record.emissions {
-            let entry = OutboxEntry {
-                effect_id: emission.effect_id.clone(),
-                route_id: emission.route_id.clone(),
-                payload: OutboxPayload::Blob(BlobRef {
-                    hash: emission.payload.hash,
-                    length: emission.payload.length,
-                }),
-                content_type: emission.content_type.clone(),
-                bundle_hash: hash,
-                commit_cursor: commit.commit_cursor,
-            };
-            batch.put_cf(
-                self.program_cf(CF_OUTBOX)?,
-                emission.effect_id.as_bytes(),
-                serde_json::to_vec(&entry).map_err(program_storage_error)?,
-            );
+        let bundle_reference = BlobRef::from(loaded.bundle);
+        if let Some((reference_key, state)) = self
+            .prepare_awaiting_blob_release(
+                &bundle_reference,
+                &pending_blob_references,
+                publication_at_unix_millis,
+            )
+            .map_err(program_mutation_error)?
+        {
+            self.stage_blob_reference_update(
+                &mut batch,
+                &mut pending_blob_references,
+                reference_key,
+                state,
+            )
+            .map_err(program_mutation_error)?;
         }
-        let allocated_high = loaded.writes.iter().map(|write| write.version.id).max();
+        self.stage_local_invalidations(&mut batch, &invalidations)
+            .map_err(program_mutation_error)?;
+        let allocated_high = record.writes.iter().map(|write| write.version.id).max();
         if let Some(allocated) = allocated_high {
             let persisted = self.version_high_watermark()?.unwrap_or(VersionId(0));
             let high = allocated.max(persisted);
@@ -2498,40 +2110,25 @@ impl Store {
             );
         }
         batch.put_cf(
-            self.program_cf(CF_PROGRAM_COMMITS)?,
-            commit_cursor_key(commit.commit_cursor),
-            serde_json::to_vec(&applied).map_err(program_storage_error)?,
-        );
-        batch.put_cf(
-            self.program_cf(CF_PROGRAM_COMMITS)?,
-            commit_bundle_key(hash),
-            serde_json::to_vec(&commit.commit_cursor).map_err(program_storage_error)?,
-        );
-        batch.put_cf(
             self.program_cf(CF_METADATA)?,
             APPLIED_PROGRAM_COMMIT_KEY,
-            serde_json::to_vec(&AppliedProgramCommit {
-                commit_cursor: commit.commit_cursor,
-                bundle_ref: commit.bundle_ref,
-                bundle_hash: hash,
-                durability_class: commit.durability_class,
-                durability_evidence_hash: commit.durability_evidence_hash,
-            })
-            .map_err(program_storage_error)?,
+            serde_json::to_vec(&applied).map_err(program_storage_error)?,
         );
         self.write_program_batch(batch)?;
+        if !invalidations.is_empty() {
+            self.notify_local_invalidations();
+        }
         if let Some(allocated) = allocated_high {
             self.clock.observe(allocated);
         }
-        Ok(applied)
+        Ok(result)
     }
 }
 
 impl Store {
-    /// Materialises interpreter output into immutable content-addressed
-    /// payload, version-descriptor, receipt, and root-bundle artifacts. The
-    /// returned evidence says whether that artifact set is merely
-    /// executor-local or remotely recoverable under an injected provider.
+    /// Seals every output and one complete descriptor bundle through the
+    /// ordinary blob plane. Nothing becomes visible until Raft commits the
+    /// returned compact bundle identity.
     pub async fn prepare_program_bundle(
         &self,
         lease: &ProgramExecutionLease,
@@ -2546,20 +2143,20 @@ impl Store {
         ));
 
         let committed_at_unix_millis = now_unix_millis().map_err(program_mutation_error)?;
-        let mut artifacts = BTreeMap::<PreparedArtifactRef, PreparedArtifact>::new();
         let mut writes = Vec::with_capacity(source.writes.len());
         let mut allocated_versions = Vec::with_capacity(source.writes.len());
         for write in &source.writes {
             let (blob, deleted) = match &write.value {
                 Some(value) => {
                     let bytes = encode_stored_value(value)?;
-                    let artifact = PreparedArtifact::new(PreparedArtifactKind::Payload, bytes);
-                    let blob = BlobRef {
-                        hash: artifact.reference.hash,
-                        length: artifact.reference.length,
-                    };
-                    insert_artifact(&mut artifacts, artifact)?;
-                    (Some(blob), false)
+                    (
+                        Some(
+                            self.stage_blob(&bytes)
+                                .await
+                                .map_err(program_mutation_error)?,
+                        ),
+                        false,
+                    )
                 }
                 None => (None, true),
             };
@@ -2571,39 +2168,13 @@ impl Store {
                 version: Version {
                     id: version_id,
                     blob,
-                    inline: None,
                     content_type: write.content_type.clone(),
                     deleted,
                     committed_at_unix_millis,
                 },
             };
-            let artifact = PreparedArtifact::new(
-                PreparedArtifactKind::VersionDescriptor,
-                serde_json::to_vec(&descriptor).map_err(program_storage_error)?,
-            );
-            writes.push(artifact.reference.clone());
-            insert_artifact(&mut artifacts, artifact)?;
+            writes.push(descriptor);
         }
-
-        let mut emissions = Vec::with_capacity(source.emissions.len());
-        for emission in &source.emissions {
-            let bytes = encode_emission(&emission.payload)?;
-            let payload = PreparedArtifact::new(PreparedArtifactKind::Payload, bytes);
-            emissions.push(PreparedEmission {
-                effect_id: emission.effect_id.clone(),
-                route_id: emission.route_id.clone(),
-                payload: payload.reference.clone(),
-                content_type: emission.content_type.clone(),
-            });
-            insert_artifact(&mut artifacts, payload)?;
-        }
-
-        let receipt = PreparedArtifact::new(
-            PreparedArtifactKind::Receipt,
-            serde_json::to_vec(&source.receipt).map_err(program_storage_error)?,
-        );
-        let receipt_ref = receipt.reference.clone();
-        insert_artifact(&mut artifacts, receipt)?;
 
         let record = StoredPreparedBundle {
             format: PREPARED_BUNDLE_FORMAT,
@@ -2611,29 +2182,16 @@ impl Store {
             program_hash: lease.program_hash,
             preconditions: source.head_preconditions.clone(),
             writes,
-            receipt: receipt_ref,
-            emissions,
+            receipt: source.receipt.clone(),
         };
         validate_prepared_record(&record)?;
-        let bundle = PreparedArtifact::new(
-            PreparedArtifactKind::Bundle,
-            serde_json::to_vec(&record).map_err(program_storage_error)?,
+        let bundle_bytes = serde_json::to_vec(&record).map_err(program_storage_error)?;
+        let bundle_ref = PreparedBundleRef::from(
+            self.stage_blob(&bundle_bytes)
+                .await
+                .map_err(program_mutation_error)?,
         );
-        let bundle_ref = bundle.reference.clone();
         let hash = PreparedBundleHash(bundle_ref.hash);
-        insert_artifact(&mut artifacts, bundle)?;
-        let artifacts = artifacts.into_values().collect::<Vec<_>>();
-        let references = artifacts
-            .iter()
-            .map(|artifact| artifact.reference.clone())
-            .collect::<Vec<_>>();
-        let manifest_hash = artifact_manifest_hash(&references)?;
-        let artifact_batch = PreparedArtifactBatch {
-            bundle: bundle_ref.clone(),
-            manifest_hash,
-            artifacts,
-        };
-        validate_artifact_batch(&artifact_batch)?;
 
         if let Some(allocated) = allocated_versions.into_iter().max() {
             let _commit_guard = self.commit_lock.lock().await;
@@ -2648,34 +2206,15 @@ impl Store {
             self.write_program_batch(batch)?;
         }
 
-        let durability = self
-            .program_artifacts
-            .persist(artifact_batch)
-            .await
-            .map_err(program_storage_error)?;
+        let durability = self.local_program_durability_evidence(bundle_ref);
         validate_durability_evidence(&durability)?;
-        if durability.bundle != bundle_ref || durability.manifest_hash != manifest_hash {
-            return Err(ProgramStoreError::DurabilityEvidenceMismatch);
-        }
         let durability_evidence_hash = durability.hash()?;
-        let recovered_evidence = self
-            .program_artifacts
-            .load_evidence(durability_evidence_hash)
-            .await
-            .map_err(program_storage_error)?
-            .ok_or(ProgramStoreError::DurabilityEvidenceNotFound(
-                durability_evidence_hash,
-            ))?;
-        if recovered_evidence != durability {
-            return Err(ProgramStoreError::DurabilityEvidenceMismatch);
-        }
 
         Ok(PreparedProgramBundle {
             hash,
             source_bundle_hash,
             program_hash: lease.program_hash,
             bundle: bundle_ref,
-            manifest_hash,
             durability_evidence_hash,
             durability,
         })
@@ -2683,11 +2222,12 @@ impl Store {
 
     pub async fn prepared_program_bundle(
         &self,
+        bundle: PreparedBundleRef,
         hash: PreparedBundleHash,
         durability_evidence_hash: ProgramDurabilityEvidenceHash,
     ) -> Result<Option<PreparedProgramBundle>, ProgramStoreError> {
         match self
-            .load_prepared_bundle(hash, durability_evidence_hash)
+            .load_prepared_bundle(bundle, hash, durability_evidence_hash)
             .await
         {
             Ok(loaded) => Ok(Some(PreparedProgramBundle {
@@ -2695,12 +2235,10 @@ impl Store {
                 source_bundle_hash: loaded.record.source_bundle_hash,
                 program_hash: loaded.record.program_hash,
                 bundle: loaded.bundle,
-                manifest_hash: loaded.evidence.manifest_hash,
                 durability_evidence_hash,
                 durability: loaded.evidence,
             })),
-            Err(ProgramStoreError::ArtifactNotFound(_))
-            | Err(ProgramStoreError::DurabilityEvidenceNotFound(_)) => Ok(None),
+            Err(ProgramStoreError::PreparedBundleNotFound(_)) => Ok(None),
             Err(error) => Err(error),
         }
     }
