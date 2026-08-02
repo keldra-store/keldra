@@ -15,6 +15,7 @@ categories.workspace = true
 
 [dependencies]
 anvil-api = { path = "../../crates/anvil-api" }
+tokio-stream = "0.1"
 tonic = { version = "0.14", default-features = false, features = ["transport", "tls-native-roots"] }
 
 [dev-dependencies]
