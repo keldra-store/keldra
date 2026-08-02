@@ -2,8 +2,9 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
     io::{Cursor, Read},
+    panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, mpsc as thread_mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -119,7 +120,7 @@ struct Args {
     #[arg(long, default_value_t = DEFAULT_SHARD_UNCOMPRESSED_BYTES)]
     shard_uncompressed_bytes: usize,
 
-    /// Maximum parallelism for each concurrent pipeline stage: shard compression and writes.
+    /// Maximum parallelism for each concurrent pipeline stage: record normalization, shard compression, and writes.
     #[arg(long, default_value_t = 4)]
     concurrency: usize,
 
@@ -197,6 +198,7 @@ struct SourceDefinition {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(serde::Deserialize))]
 struct OsvSourceRecord {
     schema: String,
     source_id: String,
@@ -237,9 +239,68 @@ struct OsvSourceRecordContent<'a> {
     document: &'a Value,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 struct PreparedRecord {
-    record: OsvSourceRecord,
+    encoded: Vec<u8>,
+    normalised_ecosystem: String,
+    modified_day: String,
+}
+
+#[derive(Debug)]
+struct RecordJob {
+    document: Arc<Value>,
+    source_record_id: Arc<str>,
+    ecosystem: String,
+    package: String,
+    affected: Vec<Value>,
+}
+
+struct RecordJobs {
+    document: Arc<Value>,
+    source_record_id: Arc<str>,
+    package_groups: std::collections::btree_map::IntoIter<(String, String), Vec<Value>>,
+    unscoped: Option<Vec<Value>>,
+}
+
+impl Iterator for RecordJobs {
+    type Item = RecordJob;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(((ecosystem, package), affected)) = self.package_groups.next() {
+            return Some(RecordJob {
+                document: Arc::clone(&self.document),
+                source_record_id: Arc::clone(&self.source_record_id),
+                ecosystem,
+                package,
+                affected,
+            });
+        }
+        self.unscoped.take().map(|affected| RecordJob {
+            document: Arc::clone(&self.document),
+            source_record_id: Arc::clone(&self.source_record_id),
+            ecosystem: "unscoped".into(),
+            package: self.source_record_id.to_string(),
+            affected,
+        })
+    }
+}
+
+struct PreparedRecordJobs {
+    jobs: RecordJobs,
+    has_unscoped: bool,
+}
+
+struct RecordWork {
+    job_index: u64,
+    job: RecordJob,
+}
+
+struct RecordEncoder {
+    inputs: Vec<thread_mpsc::SyncSender<RecordWork>>,
+    results: Vec<thread_mpsc::Receiver<Result<PreparedRecord>>>,
+    workers: Vec<thread::JoinHandle<()>>,
+    pending: Vec<RecordJob>,
+    next_job_index: u64,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -389,14 +450,13 @@ impl ShardBuilder {
             && self.payload.len().saturating_add(additional_bytes) > target_bytes
     }
 
-    fn push(&mut self, prepared: &PreparedRecord, encoded: &[u8]) {
-        let record = &prepared.record;
-        self.payload.extend_from_slice(encoded);
+    fn push(&mut self, prepared: PreparedRecord) {
+        self.payload.extend_from_slice(&prepared.encoded);
         self.payload.push(b'\n');
         self.source_record_count += 1;
-        self.ecosystems.insert(record.normalised_ecosystem.clone());
-        update_min(&mut self.modified_day_min, &record.modified_day);
-        update_max(&mut self.modified_day_max, &record.modified_day);
+        self.ecosystems.insert(prepared.normalised_ecosystem);
+        update_min(&mut self.modified_day_min, &prepared.modified_day);
+        update_max(&mut self.modified_day_max, &prepared.modified_day);
     }
 
     fn finish(self) -> Result<PreparedShard> {
@@ -415,6 +475,117 @@ impl ShardBuilder {
             modified_day_min: self.modified_day_min.unwrap_or_else(|| "unknown".into()),
             modified_day_max: self.modified_day_max.unwrap_or_else(|| "unknown".into()),
         })
+    }
+}
+
+impl RecordEncoder {
+    fn start(worker_count: usize) -> Result<Self> {
+        ensure!(
+            worker_count > 0,
+            "record encoding requires at least one worker"
+        );
+        let mut inputs = Vec::with_capacity(worker_count);
+        let mut results = Vec::with_capacity(worker_count);
+        let mut workers = Vec::<thread::JoinHandle<()>>::with_capacity(worker_count);
+        for worker_index in 0..worker_count {
+            let (input, jobs) = thread_mpsc::sync_channel::<RecordWork>(0);
+            let (worker_results, result) = thread_mpsc::sync_channel(0);
+            let worker = match thread::Builder::new()
+                .name(format!("osv-record-encoder-{worker_index}"))
+                .spawn(move || {
+                    while let Ok(work) = jobs.recv() {
+                        let result = match catch_unwind(AssertUnwindSafe(|| {
+                            prepare_record(work.job).context("encode OSV source record")
+                        })) {
+                            Ok(result) => result,
+                            Err(_) => Err(anyhow::anyhow!(
+                                "OSV record encoding worker panicked for job {}",
+                                work.job_index
+                            )),
+                        };
+                        if worker_results.send(result).is_err() {
+                            return;
+                        }
+                    }
+                }) {
+                Ok(worker) => worker,
+                Err(error) => {
+                    drop(input);
+                    inputs.clear();
+                    results.clear();
+                    for worker in workers {
+                        let _ = worker.join();
+                    }
+                    return Err(error).context("start OSV record encoding worker");
+                }
+            };
+            inputs.push(input);
+            results.push(result);
+            workers.push(worker);
+        }
+        Ok(Self {
+            inputs,
+            results,
+            workers,
+            pending: Vec::with_capacity(worker_count),
+            next_job_index: 0,
+        })
+    }
+
+    fn submit(&mut self, job: RecordJob) -> Result<Option<Vec<PreparedRecord>>> {
+        self.pending.push(job);
+        if self.pending.len() == self.inputs.len() {
+            self.flush().map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn flush(&mut self) -> Result<Vec<PreparedRecord>> {
+        let submitted = self.pending.len();
+        ensure!(
+            submitted <= self.inputs.len(),
+            "OSV record encoding wave exceeded its worker bound"
+        );
+        for (slot, job) in self.pending.drain(..).enumerate() {
+            let job_index = self.next_job_index;
+            self.next_job_index += 1;
+            self.inputs[slot]
+                .send(RecordWork { job_index, job })
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "OSV record encoding worker {slot} stopped before receiving job {job_index}"
+                    )
+                })?;
+        }
+
+        let mut ordered = Vec::with_capacity(submitted);
+        for (slot, results) in self.results.iter().take(submitted).enumerate() {
+            ordered.push(results.recv().unwrap_or_else(|_| {
+                Err(anyhow::anyhow!(
+                    "OSV record encoding worker {slot} stopped before completing its job"
+                ))
+            }));
+        }
+        ordered
+            .into_iter()
+            .map(|record| record.context("prepare OSV source record"))
+            .collect()
+    }
+
+    fn finish(mut self) -> Result<()> {
+        self.inputs.clear();
+        self.results.clear();
+        let mut first_error = None;
+        for worker in std::mem::take(&mut self.workers) {
+            if worker.join().is_err() && first_error.is_none() {
+                first_error = Some(anyhow::anyhow!("OSV record encoding worker panicked"));
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 }
 
@@ -1319,6 +1490,7 @@ fn parse_archive(
     };
     let mut builders = BTreeMap::<String, ShardBuilder>::new();
     let mut next_indices = BTreeMap::<String, u64>::new();
+    let mut encoder = RecordEncoder::start(compression_workers)?;
     let mut compressor = ShardCompressor::start(compression_workers, sender)?;
 
     let parsing = (|| -> Result<ParsingReport> {
@@ -1365,37 +1537,50 @@ fn parse_archive(
                     continue;
                 }
             };
-            let records = match prepare_records(document) {
-                Ok(records) => records,
+            let prepared = match prepare_record_jobs(document) {
+                Ok(prepared) => prepared,
                 Err(_) => {
                     report.malformed_documents += 1;
                     continue;
                 }
             };
-            report.accepted_source_documents += 1;
-            if records
-                .iter()
-                .any(|record| record.record.ecosystem == "unscoped")
-            {
+            if prepared.has_unscoped {
                 report.unscoped_documents += 1;
             }
-            for prepared in records {
-                push_record_into_shards(
-                    prepared,
-                    target_bytes,
-                    &mut compressor,
-                    &mut builders,
-                    &mut next_indices,
-                )?;
-                report.normalised_source_records += 1;
+            for job in prepared.jobs {
+                if let Some(records) = encoder.submit(job)? {
+                    report.normalised_source_records += push_records_into_shards(
+                        records,
+                        target_bytes,
+                        &mut compressor,
+                        &mut builders,
+                        &mut next_indices,
+                    )?;
+                }
             }
+            report.accepted_source_documents += 1;
         }
+        report.normalised_source_records += push_records_into_shards(
+            encoder.flush()?,
+            target_bytes,
+            &mut compressor,
+            &mut builders,
+            &mut next_indices,
+        )?;
         for builder in builders.into_values() {
             compressor.submit(builder)?;
         }
         Ok(report)
     })();
+    let encoding = encoder.finish();
     let compression = compressor.finish();
+    let parsing = match (parsing, encoding) {
+        (Ok(report), Ok(())) => Ok(report),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(encoding_error)) => Err(error.context(format!(
+            "OSV record encoding shutdown also failed: {encoding_error:#}"
+        ))),
+    };
     match (parsing, compression) {
         (Ok(report), Ok(())) => Ok(report),
         (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
@@ -1405,6 +1590,20 @@ fn parse_archive(
     }
 }
 
+fn push_records_into_shards(
+    records: Vec<PreparedRecord>,
+    target_bytes: usize,
+    compressor: &mut ShardCompressor,
+    builders: &mut BTreeMap<String, ShardBuilder>,
+    next_indices: &mut BTreeMap<String, u64>,
+) -> Result<u64> {
+    let count = records.len() as u64;
+    for record in records {
+        push_record_into_shards(record, target_bytes, compressor, builders, next_indices)?;
+    }
+    Ok(count)
+}
+
 fn push_record_into_shards(
     prepared: PreparedRecord,
     target_bytes: usize,
@@ -1412,11 +1611,10 @@ fn push_record_into_shards(
     builders: &mut BTreeMap<String, ShardBuilder>,
     next_indices: &mut BTreeMap<String, u64>,
 ) -> Result<()> {
-    let partition = storage_partition(&prepared.record.normalised_ecosystem).to_string();
-    let encoded = serde_json::to_vec(&prepared.record)?;
+    let partition = storage_partition(&prepared.normalised_ecosystem).to_string();
     if builders
         .get(&partition)
-        .is_some_and(|builder| builder.would_exceed(encoded.len() + 1, target_bytes))
+        .is_some_and(|builder| builder.would_exceed(prepared.encoded.len() + 1, target_bytes))
     {
         let completed = builders
             .remove(&partition)
@@ -1429,11 +1627,11 @@ fn push_record_into_shards(
         *index += 1;
         builder
     });
-    builder.push(&prepared, &encoded);
+    builder.push(prepared);
     Ok(())
 }
 
-fn prepare_records(mut document: Value) -> Result<Vec<PreparedRecord>> {
+fn prepare_record_jobs(mut document: Value) -> Result<PreparedRecordJobs> {
     let source_record_id = document
         .get("id")
         .and_then(Value::as_str)
@@ -1458,26 +1656,16 @@ fn prepare_records(mut document: Value) -> Result<Vec<PreparedRecord>> {
         }
     }
 
-    let mut records = Vec::with_capacity(package_groups.len() + usize::from(!unscoped.is_empty()));
-    for ((ecosystem, package), affected) in package_groups {
-        records.push(prepare_record(
-            &document,
-            &source_record_id,
-            ecosystem,
-            package,
-            affected,
-        )?);
-    }
-    if records.is_empty() || !unscoped.is_empty() {
-        records.push(prepare_record(
-            &document,
-            &source_record_id,
-            "unscoped".into(),
-            source_record_id.clone(),
-            unscoped,
-        )?);
-    }
-    Ok(records)
+    let has_unscoped = package_groups.is_empty() || !unscoped.is_empty();
+    Ok(PreparedRecordJobs {
+        jobs: RecordJobs {
+            document: Arc::new(document),
+            source_record_id: Arc::from(source_record_id),
+            package_groups: package_groups.into_iter(),
+            unscoped: has_unscoped.then_some(unscoped),
+        },
+        has_unscoped,
+    })
 }
 
 fn package_identity(affected: &Value) -> Option<(String, String)> {
@@ -1516,14 +1704,15 @@ fn normalize_package_name(ecosystem: &str, package: &str) -> String {
     }
 }
 
-fn prepare_record(
-    document: &Value,
-    source_record_id: &str,
-    ecosystem: String,
-    package: String,
-    affected: Vec<Value>,
-) -> Result<PreparedRecord> {
-    let mut scoped_document = document.clone();
+fn prepare_record(job: RecordJob) -> Result<PreparedRecord> {
+    let RecordJob {
+        document,
+        source_record_id,
+        ecosystem,
+        package,
+        affected,
+    } = job;
+    let mut scoped_document = document.as_ref().clone();
     scoped_document
         .as_object_mut()
         .context("OSV document must be a JSON object")?
@@ -1531,22 +1720,26 @@ fn prepare_record(
     let normalised_ecosystem = ecosystem.trim().to_ascii_lowercase();
     let normalised_package = normalize_package_name(&ecosystem, &package);
     let record_identity_hash = digest_bytes(
-        format!("osv\0{source_record_id}\0{normalised_ecosystem}\0{normalised_package}").as_bytes(),
+        format!(
+            "osv\0{}\0{normalised_ecosystem}\0{normalised_package}",
+            source_record_id.as_ref()
+        )
+        .as_bytes(),
     );
-    let modified_at = string_field(document, "modified");
+    let modified_at = string_field(&document, "modified");
     let modified_day = timestamp_day(modified_at.as_deref());
-    let published_at = string_field(document, "published");
+    let published_at = string_field(&document, "published");
     let withdrawn = document
         .get("withdrawn")
         .is_some_and(|value| !value.is_null());
-    let aliases = string_array(document, "aliases");
-    let summary = string_field(document, "summary");
-    let details = string_field(document, "details");
+    let aliases = string_array(&document, "aliases");
+    let summary = string_field(&document, "summary");
+    let details = string_field(&document, "details");
     let state = if withdrawn { "withdrawn" } else { "active" };
     let content_sha256 = digest_bytes(&serde_json::to_vec(&OsvSourceRecordContent {
         schema: "developer-defence.osv-source-record.v1",
         source_id: "osv",
-        source_record_id,
+        source_record_id: source_record_id.as_ref(),
         ecosystem: &ecosystem,
         package: &package,
         normalised_ecosystem: &normalised_ecosystem,
@@ -1560,27 +1753,30 @@ fn prepare_record(
         state,
         document: &scoped_document,
     })?);
+    let record = OsvSourceRecord {
+        schema: "developer-defence.osv-source-record.v1".into(),
+        source_id: "osv".into(),
+        source_record_id: source_record_id.to_string(),
+        record_identity_hash,
+        content_sha256,
+        ecosystem,
+        package,
+        normalised_ecosystem: normalised_ecosystem.clone(),
+        normalised_package,
+        modified_at,
+        modified_day: modified_day.clone(),
+        published_at,
+        withdrawn,
+        aliases,
+        summary,
+        details,
+        state: state.into(),
+        document: scoped_document,
+    };
     Ok(PreparedRecord {
-        record: OsvSourceRecord {
-            schema: "developer-defence.osv-source-record.v1".into(),
-            source_id: "osv".into(),
-            source_record_id: source_record_id.into(),
-            record_identity_hash,
-            content_sha256,
-            ecosystem,
-            package,
-            normalised_ecosystem,
-            normalised_package,
-            modified_at,
-            modified_day,
-            published_at,
-            withdrawn,
-            aliases,
-            summary,
-            details,
-            state: state.into(),
-            document: scoped_document,
-        },
+        encoded: serde_json::to_vec(&record)?,
+        normalised_ecosystem,
+        modified_day,
     })
 }
 
@@ -1779,10 +1975,45 @@ fn emit_report(report: &QualificationReport<'_>, output: Option<&Path>) -> Resul
 mod tests {
     use super::*;
 
+    fn prepare_records_serial(document: Value) -> Result<Vec<PreparedRecord>> {
+        prepare_record_jobs(document)?
+            .jobs
+            .map(prepare_record)
+            .collect()
+    }
+
+    fn prepare_documents_parallel(
+        documents: Vec<Value>,
+        worker_count: usize,
+    ) -> Result<(Vec<PreparedRecord>, Vec<usize>)> {
+        let mut encoder = RecordEncoder::start(worker_count)?;
+        let mut records = Vec::new();
+        let mut wave_sizes = Vec::new();
+        for document in documents {
+            for job in prepare_record_jobs(document)?.jobs {
+                if let Some(wave) = encoder.submit(job)? {
+                    wave_sizes.push(wave.len());
+                    records.extend(wave);
+                }
+            }
+        }
+        let tail = encoder.flush()?;
+        if !tail.is_empty() {
+            wave_sizes.push(tail.len());
+            records.extend(tail);
+        }
+        encoder.finish()?;
+        Ok((records, wave_sizes))
+    }
+
+    fn decode_record(prepared: &PreparedRecord) -> OsvSourceRecord {
+        serde_json::from_slice(&prepared.encoded).unwrap()
+    }
+
     fn test_shard_builders() -> Vec<ShardBuilder> {
         (0..6)
             .map(|index| {
-                let prepared = prepare_records(serde_json::json!({
+                let prepared = prepare_records_serial(serde_json::json!({
                     "id": format!("GHSA-compression-{index}"),
                     "modified": format!("2026-07-{:02}T12:00:00Z", index + 1),
                     "details": "deterministic shard compression",
@@ -1793,9 +2024,8 @@ mod tests {
                 }))
                 .unwrap()
                 .remove(0);
-                let encoded = serde_json::to_vec(&prepared.record).unwrap();
                 let mut builder = ShardBuilder::new("npm".into(), index, 1024);
-                builder.push(&prepared, &encoded);
+                builder.push(prepared);
                 builder
             })
             .collect()
@@ -1887,8 +2117,118 @@ mod tests {
     }
 
     #[test]
+    fn parallel_record_encoding_is_byte_identical_and_ordered_across_documents() {
+        let documents = (0..7)
+            .map(|index| {
+                serde_json::json!({
+                    "id": format!("GHSA-ordered-{index}"),
+                    "modified": "2026-07-14T12:00:00Z",
+                    "affected": [{
+                        "package": {"ecosystem": "npm", "name": format!("package-{index}")}
+                    }]
+                })
+            })
+            .collect::<Vec<_>>();
+        let expected = documents
+            .iter()
+            .cloned()
+            .flat_map(|document| prepare_records_serial(document).unwrap())
+            .collect::<Vec<_>>();
+        let (actual, wave_sizes) = prepare_documents_parallel(documents, 4).unwrap();
+
+        assert_eq!(actual, expected);
+        assert_eq!(wave_sizes, [4, 3]);
+        assert_eq!(
+            actual
+                .iter()
+                .map(decode_record)
+                .map(|record| record.source_record_id)
+                .collect::<Vec<_>>(),
+            (0..7)
+                .map(|index| format!("GHSA-ordered-{index}"))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn record_encoding_preserves_package_then_unscoped_order() {
+        let document = serde_json::json!({
+            "id": "GHSA-mixed",
+            "affected": [
+                {"package": {"ecosystem": "npm", "name": "Zed"}, "versions": ["1"]},
+                {"versions": ["unscoped"]},
+                {"package": {"ecosystem": "Cargo", "name": "crate-a"}, "versions": ["2"]},
+                {"package": {"ecosystem": "npm", "name": "zed"}, "versions": ["3"]}
+            ]
+        });
+        let expected = prepare_records_serial(document.clone()).unwrap();
+        let (actual, wave_sizes) = prepare_documents_parallel(vec![document], 2).unwrap();
+
+        assert_eq!(actual, expected);
+        assert_eq!(wave_sizes, [2, 1]);
+        let records = actual.iter().map(decode_record).collect::<Vec<_>>();
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.ecosystem.as_str())
+                .collect::<Vec<_>>(),
+            ["crates.io", "npm", "unscoped"]
+        );
+        assert_eq!(records[1].document["affected"].as_array().unwrap().len(), 2);
+        assert_eq!(records[2].document["affected"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn record_encoding_bounds_large_fanout_to_one_worker_wave() {
+        let affected = (0..1_270)
+            .map(|index| {
+                serde_json::json!({
+                    "package": {"ecosystem": "npm", "name": format!("package-{index:04}")},
+                    "versions": ["1.0.0"]
+                })
+            })
+            .collect::<Vec<_>>();
+        let prepared = prepare_record_jobs(serde_json::json!({
+            "id": "GHSA-large-fanout",
+            "affected": affected
+        }))
+        .unwrap();
+        let mut encoder = RecordEncoder::start(4).unwrap();
+        let mut total = 0;
+        let mut wave_sizes = Vec::new();
+        for job in prepared.jobs {
+            if let Some(wave) = encoder.submit(job).unwrap() {
+                wave_sizes.push(wave.len());
+                total += wave.len();
+            }
+            assert!(encoder.pending.len() < encoder.inputs.len());
+        }
+        let tail = encoder.flush().unwrap();
+        total += tail.len();
+        wave_sizes.push(tail.len());
+        encoder.finish().unwrap();
+
+        assert_eq!(total, 1_270);
+        assert_eq!(wave_sizes.len(), 318);
+        assert!(wave_sizes.iter().all(|size| *size <= 4));
+        assert_eq!(wave_sizes.last(), Some(&2));
+    }
+
+    #[test]
+    fn record_encoding_rejects_zero_workers() {
+        let error = match RecordEncoder::start(0) {
+            Ok(_) => panic!("zero record encoding workers must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            "record encoding requires at least one worker"
+        );
+    }
+
+    #[test]
     fn exact_developer_defence_transform_materialises_package_records() {
-        let records = prepare_records(serde_json::json!({
+        let records = prepare_records_serial(serde_json::json!({
             "id": "GHSA-test",
             "modified": "2026-07-14T12:00:00Z",
             "aliases": ["CVE-2026-1", "CVE-2026-1"],
@@ -1903,31 +2243,32 @@ mod tests {
         assert_eq!(records.len(), 2);
         let npm = records
             .iter()
-            .find(|record| record.record.ecosystem == "npm")
+            .map(decode_record)
+            .find(|record| record.ecosystem == "npm")
             .unwrap();
-        assert_eq!(npm.record.normalised_package, "example");
-        assert_eq!(npm.record.aliases, ["CVE-2026-1"]);
-        assert_eq!(npm.record.modified_day, "2026-07-14");
-        assert_eq!(npm.record.document["affected"].as_array().unwrap().len(), 2);
+        assert_eq!(npm.normalised_package, "example");
+        assert_eq!(npm.aliases, ["CVE-2026-1"]);
+        assert_eq!(npm.modified_day, "2026-07-14");
+        assert_eq!(npm.document["affected"].as_array().unwrap().len(), 2);
         let content = OsvSourceRecordContent {
             schema: "developer-defence.osv-source-record.v1",
             source_id: "osv",
-            source_record_id: &npm.record.source_record_id,
-            ecosystem: &npm.record.ecosystem,
-            package: &npm.record.package,
-            normalised_ecosystem: &npm.record.normalised_ecosystem,
-            normalised_package: &npm.record.normalised_package,
-            modified_at: &npm.record.modified_at,
-            published_at: &npm.record.published_at,
-            withdrawn: npm.record.withdrawn,
-            aliases: &npm.record.aliases,
-            summary: &npm.record.summary,
-            details: &npm.record.details,
-            state: &npm.record.state,
-            document: &npm.record.document,
+            source_record_id: &npm.source_record_id,
+            ecosystem: &npm.ecosystem,
+            package: &npm.package,
+            normalised_ecosystem: &npm.normalised_ecosystem,
+            normalised_package: &npm.normalised_package,
+            modified_at: &npm.modified_at,
+            published_at: &npm.published_at,
+            withdrawn: npm.withdrawn,
+            aliases: &npm.aliases,
+            summary: &npm.summary,
+            details: &npm.details,
+            state: &npm.state,
+            document: &npm.document,
         };
         assert_eq!(
-            npm.record.content_sha256,
+            npm.content_sha256,
             digest_bytes(&serde_json::to_vec(&content).unwrap())
         );
     }
@@ -1941,8 +2282,8 @@ mod tests {
             serde_json::from_str(r#"{"z":1.0,"id":"GHSA-canonical","a":1,"affected":[]}"#).unwrap();
         let second: Value =
             serde_json::from_str(r#"{"affected":[],"a":1,"id":"GHSA-canonical","z":1.0}"#).unwrap();
-        let first = prepare_records(first).unwrap().remove(0).record;
-        let second = prepare_records(second).unwrap().remove(0).record;
+        let first = decode_record(&prepare_records_serial(first).unwrap().remove(0));
+        let second = decode_record(&prepare_records_serial(second).unwrap().remove(0));
         assert_eq!(first, second);
 
         let scoped = serde_json::to_vec(&first.document).unwrap();
@@ -1954,14 +2295,13 @@ mod tests {
 
     #[test]
     fn shard_encoding_is_content_addressed_zstd_6_ndjson() {
-        let records = prepare_records(serde_json::json!({
+        let mut records = prepare_records_serial(serde_json::json!({
             "id": "GHSA-shard",
             "affected": [{"package": {"ecosystem": "npm", "name": "example"}}]
         }))
         .unwrap();
-        let encoded = serde_json::to_vec(&records[0].record).unwrap();
         let mut builder = ShardBuilder::new("npm".into(), 0, MIN_SHARD_UNCOMPRESSED_BYTES);
-        builder.push(&records[0], &encoded);
+        builder.push(records.remove(0));
         let shard = builder.finish().unwrap();
         let decoded = zstd::stream::decode_all(Cursor::new(&shard.encoded_payload)).unwrap();
 
