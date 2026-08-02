@@ -282,9 +282,9 @@ impl TonicPeerTransport {
             PeerRpcKind::AppendEntries => client.append_entries(request).await,
             PeerRpcKind::Vote => client.vote(request).await,
             PeerRpcKind::InstallSnapshot => client.install_snapshot(request).await,
-            PeerRpcKind::ServingLease => {
+            PeerRpcKind::ServingLease | PeerRpcKind::DataPlane | PeerRpcKind::StateTransfer => {
                 return Err(PeerTransportError::Protocol(
-                    "serving leases require the typed peer method".into(),
+                    "this RPC class requires a typed peer method".into(),
                 ));
             }
         }

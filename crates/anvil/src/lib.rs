@@ -6,6 +6,7 @@ mod authz_service;
 mod bootstrap;
 mod cluster_startup;
 mod credential_service;
+mod data_peer;
 mod distributed_list;
 mod join_bundle;
 mod mutable_record_quorum;
@@ -110,7 +111,13 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     // The private listener must be accepting before an existing multi-node
     // group can elect a leader after a coordinated restart.
     let mut peer_server = peer_runtime
-        .start(config.peer_listen, decisions.clone())
+        .start(
+            config.peer_listen,
+            decisions.clone(),
+            store.clone(),
+            config.erasure_profile,
+            config.atomic_program_timeout,
+        )
         .await?;
     decisions
         .wait_for_leader(DECISION_LEADER_TIMEOUT)

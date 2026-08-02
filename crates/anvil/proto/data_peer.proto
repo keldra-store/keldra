@@ -1,0 +1,127 @@
+syntax = "proto3";
+
+package anvil.data_peer.v1;
+
+// Every private operation carries the caller identity asserted by its mTLS
+// certificate. The server rechecks this tuple against freshly applied cluster
+// state for every RPC.
+message PeerContext {
+  uint32 schema_version = 1;
+  bytes cluster_id = 2;
+  uint64 source_node_id = 3;
+}
+
+message TypedMutationRequest {
+  PeerContext peer = 1;
+  bytes mutation_json = 2;
+}
+
+message ObjectMutationApplied {
+  uint32 schema_version = 1;
+  uint64 version = 2;
+  bool replayed = 3;
+}
+
+message AuthzRealmMutationApplied {
+  uint32 schema_version = 1;
+  uint64 revision = 2;
+  bool replayed = 3;
+}
+
+message ReferenceDeltaApplied {
+  uint32 schema_version = 1;
+  uint64 through = 2;
+  bool replayed = 3;
+}
+
+message ReferenceDeltaStatusRequest {
+  PeerContext peer = 1;
+  bytes source_id_json = 2;
+}
+
+message ReferenceDeltaStatus {
+  uint32 schema_version = 1;
+  uint64 through = 2;
+}
+
+message SourceJournalStatusRequest {
+  PeerContext peer = 1;
+}
+
+message SourceJournalStatus {
+  uint32 schema_version = 1;
+  bytes source_id_json = 2;
+  uint64 tail = 3;
+  uint64 retention_floor = 4;
+  uint64 retained_entries = 5;
+  uint64 retained_bytes = 6;
+}
+
+message SourceJournalReadRequest {
+  PeerContext peer = 1;
+  uint64 after_offset = 2;
+  uint32 limit = 3;
+}
+
+message SourceJournalPage {
+  uint32 schema_version = 1;
+  repeated bytes changes_json = 2;
+}
+
+message BlobIdentity {
+  bytes blake3 = 1;
+  uint64 length = 2;
+}
+
+message ContentRequest {
+  PeerContext peer = 1;
+  BlobIdentity blob = 2;
+}
+
+message ShardRequest {
+  PeerContext peer = 1;
+  uint32 fragment_format_version = 2;
+  BlobIdentity blob = 3;
+  uint32 ordinal = 4;
+}
+
+message ExistsResponse {
+  uint32 schema_version = 1;
+  bool exists = 2;
+}
+
+message ContentFrame {
+  uint32 schema_version = 1;
+  uint64 offset = 2;
+  bytes content = 3;
+  bool end = 4;
+}
+
+message SmallContentPutFrame {
+  PeerContext peer = 1;
+  BlobIdentity blob = 2;
+  uint64 offset = 3;
+  bytes content = 4;
+  bool end = 5;
+}
+
+message ContentStored {
+  uint32 schema_version = 1;
+}
+
+service DataPeer {
+  rpc ApplyObjectMutation(TypedMutationRequest) returns (ObjectMutationApplied);
+  rpc ApplyAuthzRealmMutation(TypedMutationRequest) returns (AuthzRealmMutationApplied);
+  rpc ApplyReferenceDeltas(TypedMutationRequest) returns (ReferenceDeltaApplied);
+  rpc GetReferenceDeltaStatus(ReferenceDeltaStatusRequest) returns (ReferenceDeltaStatus);
+
+  rpc GetSourceJournalStatus(SourceJournalStatusRequest) returns (SourceJournalStatus);
+  rpc ReadSourceJournal(SourceJournalReadRequest) returns (SourceJournalPage);
+
+  rpc SmallContentExists(ContentRequest) returns (ExistsResponse);
+  rpc GetSmallContent(ContentRequest) returns (stream ContentFrame);
+  rpc PutSmallContent(stream SmallContentPutFrame) returns (ContentStored);
+
+  rpc ShardExists(ShardRequest) returns (ExistsResponse);
+  rpc GetShard(ShardRequest) returns (stream ContentFrame);
+}

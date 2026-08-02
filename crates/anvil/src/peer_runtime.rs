@@ -16,12 +16,14 @@ use anvil_consensus::{
     NodeState, PeerAddress, PeerNode, PeerRpcKind, PeerSpkiSha256, PeerTlsAcceptor, PeerTlsConfig,
     PeerTlsConnector, PeerTlsError, PeerTlsIdentity, TonicPeerTransport, TonicRaftPeerService,
 };
+use anvil_store::{ErasureProfile, Store};
 use anyhow::{Context, Result, bail};
 use tonic::codegen::tokio_stream::StreamExt;
 use tonic::transport::Server;
 use tonic::transport::server::TcpIncoming;
 use uuid::Uuid;
 
+use crate::data_peer::{DataPeerService, DataPeerTransport};
 use crate::node_identity::{self, LocalNodeIdentity};
 
 const GENESIS_STORAGE_WEIGHT_MILLIONTHS: u32 = 1_000_000;
@@ -42,6 +44,11 @@ pub(crate) struct PeerRuntime {
     identity: Arc<PeerTlsIdentity>,
     pins: Arc<RaftCommittedPeerPins>,
     transport: TonicPeerTransport,
+    #[allow(
+        dead_code,
+        reason = "the distributed coordinators consume this transport in the immediately following integration slice"
+    )]
+    data_transport: DataPeerTransport,
     clear_pins_on_drop: bool,
 }
 
@@ -209,10 +216,21 @@ impl PeerRuntime {
         self.transport.clone()
     }
 
+    #[allow(
+        dead_code,
+        reason = "the distributed coordinators consume this transport in the immediately following integration slice"
+    )]
+    pub(crate) fn data_transport(&self) -> DataPeerTransport {
+        self.data_transport.clone()
+    }
+
     pub(crate) async fn start(
         mut self,
         peer_listen: SocketAddr,
         decisions: DecisionRaft,
+        store: Store,
+        erasure_profile: ErasureProfile,
+        maximum_unary_time: Duration,
     ) -> Result<PeerServerHandle> {
         anyhow::ensure!(
             peer_listen.port() != 0,
@@ -239,10 +257,18 @@ impl PeerRuntime {
                 }
             });
         let service = TonicRaftPeerService::new(decisions, self.pins.clone()).into_server();
+        let data_service = DataPeerService::new(
+            store,
+            self.pins.clone(),
+            erasure_profile,
+            maximum_unary_time,
+        )?
+        .into_server();
         let (shutdown, stopped) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
             Server::builder()
                 .add_service(service)
+                .add_service(data_service)
                 .serve_with_incoming_shutdown(incoming, async move {
                     let _ = stopped.await;
                 })
@@ -280,6 +306,9 @@ async fn open_with_identity(
     let connector =
         PeerTlsConnector::new(tls_identity.clone(), pins.clone(), PeerTlsConfig::default())
             .context("configure mandatory peer mTLS connector")?;
+    let data_transport =
+        DataPeerTransport::new(identity.cluster_id(), config.node_id, connector.clone())
+            .context("configure typed data-peer transport")?;
     let transport = TonicPeerTransport::new(identity.cluster_id(), config.node_id, connector)
         .context("configure private Raft transport")?;
     let decisions = DecisionRaft::open_with_transport(
@@ -298,6 +327,7 @@ async fn open_with_identity(
             identity: tls_identity,
             pins,
             transport,
+            data_transport,
             clear_pins_on_drop: true,
         },
     ))
@@ -582,16 +612,23 @@ impl CommittedPeerPinProvider for RaftCommittedPeerPins {
         if cluster_id != self.cluster_id {
             return None;
         }
-        if kind != PeerRpcKind::ServingLease {
-            return self.pins(node_id);
-        }
         let decisions = self.decisions.read().ok()?.clone()?;
         let state = decisions.state().ok()?;
         if state.cluster_id()? != self.cluster_id {
             return None;
         }
         let descriptor = state.cluster_control().nodes().get(&node_id)?;
-        (descriptor.state == NodeState::Active).then_some(CommittedPeerPins {
+        let allowed = match kind {
+            PeerRpcKind::StateTransfer => {
+                matches!(descriptor.state, NodeState::Active | NodeState::Joining)
+            }
+            PeerRpcKind::AppendEntries
+            | PeerRpcKind::Vote
+            | PeerRpcKind::InstallSnapshot
+            | PeerRpcKind::ServingLease
+            | PeerRpcKind::DataPlane => descriptor.state == NodeState::Active,
+        };
+        allowed.then_some(CommittedPeerPins {
             current: descriptor.current_peer_spki_sha256,
             overlap: descriptor.overlap_peer_spki_sha256,
         })
@@ -601,6 +638,8 @@ impl CommittedPeerPinProvider for RaftCommittedPeerPins {
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
+
+    use anvil_store::StoreOptions;
 
     use super::*;
     use crate::serving_fence::ServingFenceRuntime;
@@ -670,7 +709,19 @@ mod tests {
             0o600
         );
         let serving_transport = runtime.serving_transport();
-        let mut peer_server = runtime.start(peer_listen, decisions.clone()).await.unwrap();
+        let store = Store::open(StoreOptions::new(directory.path(), 1))
+            .await
+            .unwrap();
+        let mut peer_server = runtime
+            .start(
+                peer_listen,
+                decisions.clone(),
+                store,
+                ErasureProfile::default(),
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
         // Plain TCP cannot reach a Tonic handler, and one rejected handshake
         // must not take the private listener down.
         drop(tokio::net::TcpStream::connect(peer_listen).await.unwrap());
