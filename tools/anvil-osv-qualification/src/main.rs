@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
-    io::{Cursor, Read},
+    io::{Cursor, Read, Write},
     path::{Path, PathBuf},
     sync::Arc,
     thread,
@@ -246,6 +246,7 @@ impl Serialize for ScopedDocument<'_> {
     }
 }
 
+#[cfg(test)]
 #[derive(Serialize)]
 struct OsvSourceRecordContent<'a> {
     schema: &'static str,
@@ -256,28 +257,6 @@ struct OsvSourceRecordContent<'a> {
     normalised_ecosystem: &'a str,
     normalised_package: &'a str,
     modified_at: &'a Option<String>,
-    published_at: &'a Option<String>,
-    withdrawn: bool,
-    aliases: &'a [String],
-    summary: &'a Option<String>,
-    details: &'a Option<String>,
-    state: &'a str,
-    document: ScopedDocument<'a>,
-}
-
-#[derive(Serialize)]
-struct OsvSourceRecordView<'a> {
-    schema: &'static str,
-    source_id: &'static str,
-    source_record_id: &'a str,
-    record_identity_hash: &'a str,
-    content_sha256: &'a str,
-    ecosystem: &'a str,
-    package: &'a str,
-    normalised_ecosystem: &'a str,
-    normalised_package: &'a str,
-    modified_at: &'a Option<String>,
-    modified_day: &'a str,
     published_at: &'a Option<String>,
     withdrawn: bool,
     aliases: &'a [String],
@@ -1624,29 +1603,9 @@ fn prepare_record(
     let summary = string_field(document, "summary");
     let details = string_field(document, "details");
     let state = if withdrawn { "withdrawn" } else { "active" };
-    let content_sha256 = digest_json(&OsvSourceRecordContent {
-        schema: "developer-defence.osv-source-record.v1",
-        source_id: "osv",
-        source_record_id,
-        ecosystem,
-        package,
-        normalised_ecosystem: &normalised_ecosystem,
-        normalised_package: &normalised_package,
-        modified_at: &modified_at,
-        published_at: &published_at,
-        withdrawn,
-        aliases: &aliases,
-        summary: &summary,
-        details: &details,
-        state,
-        document: scoped_document,
-    })?;
-    let record = OsvSourceRecordView {
-        schema: "developer-defence.osv-source-record.v1",
-        source_id: "osv",
+    let encoded = encode_record(RecordFields {
         source_record_id,
         record_identity_hash: &record_identity_hash,
-        content_sha256: &content_sha256,
         ecosystem,
         package,
         normalised_ecosystem: &normalised_ecosystem,
@@ -1660,12 +1619,177 @@ fn prepare_record(
         details: &details,
         state,
         document: scoped_document,
-    };
+    })?;
     Ok(PreparedRecord {
-        encoded: serde_json::to_vec(&record)?,
+        encoded,
         normalised_ecosystem,
         modified_day,
     })
+}
+
+struct RecordFields<'a> {
+    source_record_id: &'a str,
+    record_identity_hash: &'a str,
+    ecosystem: &'a str,
+    package: &'a str,
+    normalised_ecosystem: &'a str,
+    normalised_package: &'a str,
+    modified_at: &'a Option<String>,
+    modified_day: &'a str,
+    published_at: &'a Option<String>,
+    withdrawn: bool,
+    aliases: &'a [String],
+    summary: &'a Option<String>,
+    details: &'a Option<String>,
+    state: &'a str,
+    document: ScopedDocument<'a>,
+}
+
+struct ContentTee<'a> {
+    encoded: &'a mut Vec<u8>,
+    digest: &'a mut Sha256,
+}
+
+impl Write for ContentTee<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.encoded.extend_from_slice(bytes);
+        self.digest.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn encode_record(fields: RecordFields<'_>) -> Result<Vec<u8>> {
+    let mut encoded = Vec::new();
+    let mut content_digest = Sha256::new();
+    write_shared_bytes(&mut encoded, &mut content_digest, b"{");
+    write_shared_json(
+        &mut encoded,
+        &mut content_digest,
+        b"\"schema\":",
+        "developer-defence.osv-source-record.v1",
+    )?;
+    write_shared_json(&mut encoded, &mut content_digest, b",\"source_id\":", "osv")?;
+    write_shared_json(
+        &mut encoded,
+        &mut content_digest,
+        b",\"source_record_id\":",
+        fields.source_record_id,
+    )?;
+    write_final_json(
+        &mut encoded,
+        b",\"record_identity_hash\":",
+        fields.record_identity_hash,
+    )?;
+    encoded.extend_from_slice(b",\"content_sha256\":\"");
+    let content_sha256 = encoded.len()..encoded.len() + 64;
+    encoded.resize(content_sha256.end, b'0');
+    encoded.push(b'"');
+    write_shared_json(
+        &mut encoded,
+        &mut content_digest,
+        b",\"ecosystem\":",
+        fields.ecosystem,
+    )?;
+    write_shared_json(
+        &mut encoded,
+        &mut content_digest,
+        b",\"package\":",
+        fields.package,
+    )?;
+    write_shared_json(
+        &mut encoded,
+        &mut content_digest,
+        b",\"normalised_ecosystem\":",
+        fields.normalised_ecosystem,
+    )?;
+    write_shared_json(
+        &mut encoded,
+        &mut content_digest,
+        b",\"normalised_package\":",
+        fields.normalised_package,
+    )?;
+    write_shared_json(
+        &mut encoded,
+        &mut content_digest,
+        b",\"modified_at\":",
+        fields.modified_at,
+    )?;
+    write_final_json(&mut encoded, b",\"modified_day\":", fields.modified_day)?;
+    write_shared_json(
+        &mut encoded,
+        &mut content_digest,
+        b",\"published_at\":",
+        fields.published_at,
+    )?;
+    write_shared_json(
+        &mut encoded,
+        &mut content_digest,
+        b",\"withdrawn\":",
+        &fields.withdrawn,
+    )?;
+    write_shared_json(
+        &mut encoded,
+        &mut content_digest,
+        b",\"aliases\":",
+        fields.aliases,
+    )?;
+    write_shared_json(
+        &mut encoded,
+        &mut content_digest,
+        b",\"summary\":",
+        fields.summary,
+    )?;
+    write_shared_json(
+        &mut encoded,
+        &mut content_digest,
+        b",\"details\":",
+        fields.details,
+    )?;
+    write_shared_json(
+        &mut encoded,
+        &mut content_digest,
+        b",\"state\":",
+        fields.state,
+    )?;
+    write_shared_json(
+        &mut encoded,
+        &mut content_digest,
+        b",\"document\":",
+        &fields.document,
+    )?;
+    write_shared_bytes(&mut encoded, &mut content_digest, b"}");
+    hex::encode_to_slice(content_digest.finalize(), &mut encoded[content_sha256])?;
+    Ok(encoded)
+}
+
+fn write_shared_bytes(encoded: &mut Vec<u8>, digest: &mut Sha256, bytes: &[u8]) {
+    encoded.extend_from_slice(bytes);
+    digest.update(bytes);
+}
+
+fn write_shared_json<T: Serialize + ?Sized>(
+    encoded: &mut Vec<u8>,
+    digest: &mut Sha256,
+    prefix: &[u8],
+    value: &T,
+) -> Result<()> {
+    write_shared_bytes(encoded, digest, prefix);
+    serde_json::to_writer(&mut ContentTee { encoded, digest }, value)?;
+    Ok(())
+}
+
+fn write_final_json<T: Serialize + ?Sized>(
+    encoded: &mut Vec<u8>,
+    prefix: &[u8],
+    value: &T,
+) -> Result<()> {
+    encoded.extend_from_slice(prefix);
+    serde_json::to_writer(encoded, value)?;
+    Ok(())
 }
 
 fn storage_partition(normalised_ecosystem: &str) -> &str {
@@ -2097,9 +2221,9 @@ mod tests {
         let document: Value = serde_json::from_str(
             r#"{
                 "z": 1.0,
-                "summary": "mixed package and unscoped records",
+                "summary": "mixed package, \"quoted\", and unicode Δ records",
                 "modified": "2026-07-14T12:00:00Z",
-                "id": "GHSA-mixed",
+                "id": "GHSA-mixed\\path",
                 "affected": [
                     {"package": {"ecosystem": "npm", "name": "Zed"}, "versions": ["1"]},
                     {"versions": ["unscoped"]},
