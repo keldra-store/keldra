@@ -4,8 +4,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    ApplyResult, Command, CommitBatch, CommitResult, CommittedBatch, ExecutorNomination,
-    InvocationId, InvocationReceipt, NodeId, ProgramHash, ProgramPathHash, codec,
+    ATOMIC_REPLAY_RETENTION_MILLIS, ApplyResult, Command, CommitBatch, CommitResult,
+    CommittedBatch, CommittedInvocation, ExecutorNomination, InvocationId,
+    MAX_COMMITTED_INVOCATION_BYTES, MAX_COMMITTED_INVOCATIONS, NodeId, ProgramHash,
+    ProgramPathHash, codec,
 };
 
 /// Pure deterministic state for Anvil's compact consensus log.
@@ -14,18 +16,16 @@ use crate::{
 /// OpenRaft adapter checks that a nominated executor is a current voter or
 /// learner using OpenRaft's committed membership before calling `apply`.
 ///
-/// Retained batch decisions are globally ordered by their original Raft log
-/// index and bounded by both configured entry and encoded-byte limits. Reaching
-/// either limit rejects new commits until externally safe finalization advances
-/// the checkpoint.
+/// Committed invocations are globally ordered by their original Raft log index.
+/// Configured bounds apply to the unfinalized recovery tail; fixed bounds apply
+/// to the independently retained replay window.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateMachine {
     max_commit_entries: u32,
     max_commit_bytes: u64,
     executor: Option<ExecutorNomination>,
-    commit_suffix: BTreeMap<u64, InvocationReceipt>,
-    invocation_cursors: BTreeMap<InvocationId, u64>,
-    commit_suffix_bytes: u64,
+    committed_invocations: BTreeMap<u64, CommittedInvocation>,
+    committed_invocation_bytes: u64,
     last_commit_cursor: Option<u64>,
     finalized_through: Option<u64>,
 }
@@ -39,13 +39,15 @@ impl StateMachine {
             return Err(ApplyError::InvalidCommitByteLimit);
         }
 
+        let committed_invocation_bytes =
+            codec::encoded_len(&BTreeMap::<u64, CommittedInvocation>::new())
+                .map_err(|_| ApplyError::CommittedInvocationEncodingFailed)?;
         Ok(Self {
             max_commit_entries,
             max_commit_bytes,
             executor: None,
-            commit_suffix: BTreeMap::new(),
-            invocation_cursors: BTreeMap::new(),
-            commit_suffix_bytes: 0,
+            committed_invocations: BTreeMap::new(),
+            committed_invocation_bytes,
             last_commit_cursor: None,
             finalized_through: None,
         })
@@ -63,28 +65,57 @@ impl StateMachine {
         self.executor
     }
 
-    pub fn invocation_receipt(&self, invocation_id: InvocationId) -> Option<InvocationReceipt> {
-        self.invocation_cursors
-            .get(&invocation_id)
-            .and_then(|cursor| self.commit_suffix.get(cursor))
+    pub fn replay_entry(
+        &self,
+        invocation_id: InvocationId,
+        now_unix_millis: u64,
+    ) -> Option<CommittedInvocation> {
+        self.committed_invocations
+            .values()
+            .find(|entry| entry.invocation_id == invocation_id)
+            .filter(|entry| entry.replay_expires_at_unix_millis > now_unix_millis)
             .copied()
     }
 
-    /// Retained decisions in their one global Raft commit order.
-    pub fn committed_batches(&self) -> impl Iterator<Item = InvocationReceipt> + '_ {
-        self.commit_suffix.values().copied()
+    /// Unfinalized decisions in their one global Raft commit order.
+    pub fn unfinalized_invocations(&self) -> impl Iterator<Item = CommittedInvocation> + '_ {
+        let finalized = self.finalized_through.unwrap_or(0);
+        self.committed_invocations
+            .range((
+                std::ops::Bound::Excluded(finalized),
+                std::ops::Bound::Unbounded,
+            ))
+            .map(|(_, invocation)| *invocation)
     }
 
-    pub fn committed_batch(&self, commit_cursor: u64) -> Option<InvocationReceipt> {
-        self.commit_suffix.get(&commit_cursor).copied()
+    pub fn committed_invocation(&self, commit_cursor: u64) -> Option<CommittedInvocation> {
+        self.committed_invocations.get(&commit_cursor).copied()
     }
 
-    pub fn commit_suffix_len(&self) -> u32 {
-        self.commit_suffix.len() as u32
+    pub fn unfinalized_commit_len(&self) -> u32 {
+        self.unfinalized_invocations().count() as u32
     }
 
-    pub fn commit_suffix_bytes(&self) -> u64 {
-        self.commit_suffix_bytes
+    pub fn unfinalized_commit_bytes(&self) -> Result<u64, ApplyError> {
+        let finalized = self.finalized_through.unwrap_or(0);
+        self.committed_invocations
+            .range((
+                std::ops::Bound::Excluded(finalized),
+                std::ops::Bound::Unbounded,
+            ))
+            .try_fold(0_u64, |total, (cursor, entry)| {
+                total
+                    .checked_add(committed_invocation_entry_bytes(*cursor, entry)?)
+                    .ok_or(ApplyError::CommitTailByteCountExhausted)
+            })
+    }
+
+    pub fn committed_invocation_len(&self) -> u32 {
+        self.committed_invocations.len() as u32
+    }
+
+    pub fn committed_invocation_bytes(&self) -> u64 {
+        self.committed_invocation_bytes
     }
 
     pub fn last_commit_cursor(&self) -> Option<u64> {
@@ -141,13 +172,20 @@ impl StateMachine {
         validate_commit_batch(batch)?;
         self.require_executor(batch.executor, batch.nomination_log_index)?;
 
-        if let Some(receipt) = self.invocation_receipt(batch.invocation_id) {
-            return replay(receipt, batch).map(|receipt| {
-                ApplyResult::BatchCommitted(CommitResult {
-                    receipt,
-                    replayed: true,
-                })
-            });
+        let expired = self.expired_finalized_cursors(batch.proposal_at_unix_millis);
+        self.prune_committed_invocations(&expired)?;
+        let existing = self
+            .committed_invocations
+            .iter()
+            .find(|(_, entry)| entry.invocation_id == batch.invocation_id)
+            .map(|(_, entry)| entry)
+            .copied();
+        if let Some(invocation) = existing {
+            let invocation = replay(invocation, batch)?;
+            return Ok(ApplyResult::BatchCommitted(CommitResult {
+                invocation,
+                replayed: true,
+            }));
         }
 
         if self
@@ -169,9 +207,11 @@ impl StateMachine {
             });
         }
 
-        let receipt = InvocationReceipt {
+        let invocation = CommittedInvocation {
             invocation_id: batch.invocation_id,
             input_fingerprint: batch.input_fingerprint,
+            proposal_at_unix_millis: batch.proposal_at_unix_millis,
+            replay_expires_at_unix_millis: batch.replay_expires_at_unix_millis,
             committed_batch: CommittedBatch {
                 commit_cursor: committed_log_index,
                 executor: batch.executor,
@@ -184,30 +224,45 @@ impl StateMachine {
                 durability_evidence_hash: batch.durability_evidence_hash,
             },
         };
-        let retained_bytes = retained_bytes(&receipt)?;
-        let next_entries = self.commit_suffix_len().saturating_add(1);
-        let next_bytes = self
-            .commit_suffix_bytes
-            .checked_add(retained_bytes)
+        let invocation_bytes = committed_invocation_entry_bytes(committed_log_index, &invocation)?;
+        let retained_entries = self.committed_invocation_len();
+        let retained_bytes = self.committed_invocation_bytes;
+        let next_replay_entries = retained_entries.saturating_add(1);
+        let next_replay_bytes = retained_bytes
+            .checked_add(invocation_bytes)
+            .ok_or(ApplyError::CommittedInvocationByteCountExhausted)?;
+        if next_replay_entries > MAX_COMMITTED_INVOCATIONS
+            || next_replay_bytes > MAX_COMMITTED_INVOCATION_BYTES
+        {
+            return Err(ApplyError::CommittedInvocationWindowFull {
+                entries: retained_entries,
+                bytes: retained_bytes,
+                required_bytes: invocation_bytes,
+            });
+        }
+
+        let tail_entries = self.unfinalized_commit_len().saturating_add(1);
+        let tail_bytes = self
+            .unfinalized_commit_bytes()?
+            .checked_add(invocation_bytes)
             .ok_or(ApplyError::CommitTailByteCountExhausted)?;
-        if next_entries > self.max_commit_entries || next_bytes > self.max_commit_bytes {
+        if tail_entries > self.max_commit_entries || tail_bytes > self.max_commit_bytes {
             return Err(ApplyError::CommitTailFull {
-                entries: self.commit_suffix_len(),
-                bytes: self.commit_suffix_bytes,
-                required_bytes: retained_bytes,
+                entries: self.unfinalized_commit_len(),
+                bytes: self.unfinalized_commit_bytes()?,
+                required_bytes: invocation_bytes,
                 max_entries: self.max_commit_entries,
                 max_bytes: self.max_commit_bytes,
             });
         }
 
-        self.commit_suffix.insert(committed_log_index, receipt);
-        self.invocation_cursors
-            .insert(batch.invocation_id, committed_log_index);
-        self.commit_suffix_bytes = next_bytes;
+        self.committed_invocations
+            .insert(committed_log_index, invocation);
+        self.committed_invocation_bytes = next_replay_bytes;
         self.last_commit_cursor = Some(committed_log_index);
 
         Ok(ApplyResult::BatchCommitted(CommitResult {
-            receipt,
+            invocation,
             replayed: false,
         }))
     }
@@ -230,8 +285,6 @@ impl StateMachine {
             if through_commit_cursor == current {
                 return Ok(ApplyResult::FinalizationAdvanced {
                     through_commit_cursor,
-                    pruned_entries: 0,
-                    pruned_bytes: 0,
                 });
             }
         }
@@ -246,30 +299,38 @@ impl StateMachine {
             });
         }
 
-        let pruned = self
-            .commit_suffix
-            .range(..=through_commit_cursor)
-            .map(|(cursor, receipt)| (*cursor, *receipt))
-            .collect::<Vec<_>>();
-        let mut pruned_bytes = 0_u64;
-        for (cursor, receipt) in &pruned {
-            pruned_bytes = pruned_bytes
-                .checked_add(retained_bytes(receipt)?)
-                .ok_or(ApplyError::CommitTailByteCountExhausted)?;
-            self.commit_suffix.remove(cursor);
-            self.invocation_cursors.remove(&receipt.invocation_id);
-        }
-        self.commit_suffix_bytes = self
-            .commit_suffix_bytes
-            .checked_sub(pruned_bytes)
-            .ok_or(ApplyError::CommitTailByteAccountingCorrupt)?;
         self.finalized_through = Some(through_commit_cursor);
 
         Ok(ApplyResult::FinalizationAdvanced {
             through_commit_cursor,
-            pruned_entries: pruned.len() as u32,
-            pruned_bytes,
         })
+    }
+
+    fn expired_finalized_cursors(&self, proposal_at_unix_millis: u64) -> Vec<u64> {
+        let Some(finalized) = self.finalized_through else {
+            return Vec::new();
+        };
+        self.committed_invocations
+            .range(..=finalized)
+            .filter_map(|(cursor, invocation)| {
+                (invocation.replay_expires_at_unix_millis <= proposal_at_unix_millis)
+                    .then_some(*cursor)
+            })
+            .collect()
+    }
+
+    fn prune_committed_invocations(&mut self, cursors: &[u64]) -> Result<(), ApplyError> {
+        for cursor in cursors {
+            let invocation = self
+                .committed_invocations
+                .remove(cursor)
+                .ok_or(ApplyError::CommittedInvocationAccountingCorrupt)?;
+            self.committed_invocation_bytes = self
+                .committed_invocation_bytes
+                .checked_sub(committed_invocation_entry_bytes(*cursor, &invocation)?)
+                .ok_or(ApplyError::CommittedInvocationAccountingCorrupt)?;
+        }
+        Ok(())
     }
 
     fn require_executor(
@@ -295,8 +356,12 @@ impl StateMachine {
     }
 }
 
-fn retained_bytes(receipt: &InvocationReceipt) -> Result<u64, ApplyError> {
-    codec::encoded_len(receipt).map_err(|_| ApplyError::CommitReceiptEncodingFailed)
+fn committed_invocation_entry_bytes(
+    commit_cursor: u64,
+    invocation: &CommittedInvocation,
+) -> Result<u64, ApplyError> {
+    codec::encoded_len(&(commit_cursor, invocation))
+        .map_err(|_| ApplyError::CommittedInvocationEncodingFailed)
 }
 
 fn validate_node(node: NodeId) -> Result<(), ApplyError> {
@@ -328,7 +393,7 @@ fn validate_commit_batch(batch: CommitBatch) -> Result<(), ApplyError> {
     if batch.input_fingerprint.0 == [0; 32] {
         return Err(ApplyError::InvalidInvocationFingerprint);
     }
-    if batch.bundle_ref.0 == [0; 32] {
+    if batch.bundle_ref.hash == [0; 32] || batch.bundle_ref.length == 0 {
         return Err(ApplyError::InvalidBundleRef);
     }
     if batch.bundle_hash.0 == [0; 32] {
@@ -340,13 +405,23 @@ fn validate_commit_batch(batch: CommitBatch) -> Result<(), ApplyError> {
     if batch.durability_evidence_hash.0 == [0; 32] {
         return Err(ApplyError::InvalidDurabilityEvidenceHash);
     }
+    if batch.proposal_at_unix_millis == 0 {
+        return Err(ApplyError::InvalidProposalTime);
+    }
+    if batch
+        .proposal_at_unix_millis
+        .checked_add(ATOMIC_REPLAY_RETENTION_MILLIS)
+        != Some(batch.replay_expires_at_unix_millis)
+    {
+        return Err(ApplyError::InvalidReplayExpiry);
+    }
     Ok(())
 }
 
 fn replay(
-    committed: InvocationReceipt,
+    committed: CommittedInvocation,
     requested: CommitBatch,
-) -> Result<InvocationReceipt, ApplyError> {
+) -> Result<CommittedInvocation, ApplyError> {
     if committed.committed_batch.program_path_hash != requested.program_path_hash
         || committed.committed_batch.program_hash != requested.program_hash
         || committed.input_fingerprint != requested.input_fingerprint
@@ -394,6 +469,10 @@ pub enum ApplyError {
     InvalidDurabilityClass,
     #[error("durability evidence hash must be non-zero")]
     InvalidDurabilityEvidenceHash,
+    #[error("commit proposal time must be non-zero")]
+    InvalidProposalTime,
+    #[error("commit replay expiry must be exactly 24 hours after proposal time")]
+    InvalidReplayExpiry,
     #[error("invocation {invocation_id:?} was already committed with different logical inputs")]
     IdempotencyConflict { invocation_id: InvocationId },
     #[error("commit cursor {requested} did not advance {current:?}")]
@@ -407,7 +486,7 @@ pub enum ApplyError {
         requested: u64,
     },
     #[error(
-        "commit tail is full: {entries}/{max_entries} entries and {bytes}/{max_bytes} bytes; new receipt requires {required_bytes} bytes"
+        "commit tail is full: {entries}/{max_entries} entries and {bytes}/{max_bytes} bytes; new invocation requires {required_bytes} bytes"
     )]
     CommitTailFull {
         entries: u32,
@@ -416,12 +495,22 @@ pub enum ApplyError {
         max_entries: u32,
         max_bytes: u64,
     },
+    #[error(
+        "committed invocation replay window is full: {entries}/{MAX_COMMITTED_INVOCATIONS} entries and {bytes}/{MAX_COMMITTED_INVOCATION_BYTES} bytes; new entry requires {required_bytes} bytes"
+    )]
+    CommittedInvocationWindowFull {
+        entries: u32,
+        bytes: u64,
+        required_bytes: u64,
+    },
     #[error("commit-tail byte count overflowed")]
     CommitTailByteCountExhausted,
-    #[error("commit-tail byte accounting is corrupt")]
-    CommitTailByteAccountingCorrupt,
-    #[error("committed receipt could not be measured by the consensus codec")]
-    CommitReceiptEncodingFailed,
+    #[error("committed-invocation byte count overflowed")]
+    CommittedInvocationByteCountExhausted,
+    #[error("committed-invocation accounting is corrupt")]
+    CommittedInvocationAccountingCorrupt,
+    #[error("committed invocation could not be measured by the consensus codec")]
+    CommittedInvocationEncodingFailed,
     #[error("there is no committed batch to finalize")]
     NoCommittedBatchToFinalize,
     #[error("finalized-through cursor {requested} regressed from {current}")]

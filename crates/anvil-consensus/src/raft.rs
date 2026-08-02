@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     fmt::Debug,
     io::Cursor,
     ops::RangeBounds,
@@ -8,14 +8,12 @@ use std::{
     time::Duration,
 };
 
-use async_trait::async_trait;
 use openraft::{
     AnyError, BasicNode, EntryPayload, ErrorSubject, ErrorVerb, LogId, LogState, OptionalSend,
     RaftLogReader, RaftSnapshotBuilder, Snapshot, SnapshotMeta, StorageError, StorageIOError,
     StoredMembership, Vote,
     error::{
-        ClientWriteError, InitializeError, InstallSnapshotError, NetworkError, RPCError, RaftError,
-        RemoteError, Unreachable,
+        ClientWriteError, InitializeError, InstallSnapshotError, RPCError, RaftError, Unreachable,
     },
     network::{RPCOption, RaftNetwork, RaftNetworkFactory},
     raft::{
@@ -24,7 +22,7 @@ use openraft::{
     },
     storage::{LogFlushed, RaftLogStorage, RaftStateMachine},
 };
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
@@ -77,84 +75,6 @@ impl MachineState {
     }
 }
 
-/// Address attached to an OpenRaft membership node.
-///
-/// Interpretation and connection management belong to the injected transport.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PeerNode {
-    pub address: String,
-}
-
-impl PeerNode {
-    pub fn new(address: impl Into<String>) -> Self {
-        Self {
-            address: address.into(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PeerRpcKind {
-    AppendEntries,
-    Vote,
-    InstallSnapshot,
-}
-
-/// Opaque OpenRaft protocol envelope carried by the application's transport.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PeerRpc {
-    pub schema_version: u16,
-    pub kind: PeerRpcKind,
-    pub payload: Vec<u8>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub enum PeerTransportError {
-    #[error("peer is unreachable: {0}")]
-    Unreachable(String),
-    #[error("peer protocol failed: {0}")]
-    Protocol(String),
-}
-
-/// Injectable transport for opaque peer protocol messages.
-#[async_trait]
-pub trait PeerTransport: Send + Sync + 'static {
-    async fn send(
-        &self,
-        target: u64,
-        node: &PeerNode,
-        rpc: PeerRpc,
-    ) -> Result<Vec<u8>, PeerTransportError>;
-}
-
-/// Useful for a single-node cluster, where no peer call should occur.
-#[derive(Debug, Default)]
-pub struct NoPeerTransport;
-
-#[async_trait]
-impl PeerTransport for NoPeerTransport {
-    async fn send(
-        &self,
-        target: u64,
-        _node: &PeerNode,
-        _rpc: PeerRpc,
-    ) -> Result<Vec<u8>, PeerTransportError> {
-        Err(PeerTransportError::Unreachable(format!(
-            "single-node transport has no peer {target}"
-        )))
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub enum PeerRpcError {
-    #[error("unsupported peer RPC schema {0}")]
-    UnsupportedSchema(u16),
-    #[error("peer RPC payload exceeds the compact consensus limit")]
-    PayloadTooLarge,
-    #[error("peer RPC codec error: {0}")]
-    Codec(String),
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum DecisionRaftError {
     #[error("Raft node identity must be non-zero")]
@@ -199,79 +119,45 @@ impl From<codec::CodecError> for DecisionRaftError {
     }
 }
 
-#[derive(Clone)]
-struct NetworkFactoryAdapter {
-    transport: Arc<dyn PeerTransport>,
-}
+/// OpenRaft requires a network factory even for a one-member group. This
+/// implementation is private and deliberately cannot carry a peer message.
+/// Any call into it means the 0.5.0 single-node invariant was violated.
+#[derive(Clone, Default)]
+struct SingleNodeNetworkFactory;
 
-struct NetworkAdapter {
-    transport: Arc<dyn PeerTransport>,
+struct UnreachablePeer {
     target: u64,
-    node: BasicNode,
 }
 
-impl RaftNetworkFactory<DecisionRaftConfig> for NetworkFactoryAdapter {
-    type Network = NetworkAdapter;
+impl RaftNetworkFactory<DecisionRaftConfig> for SingleNodeNetworkFactory {
+    type Network = UnreachablePeer;
 
-    async fn new_client(&mut self, target: u64, node: &BasicNode) -> Self::Network {
-        NetworkAdapter {
-            transport: self.transport.clone(),
-            target,
-            node: node.clone(),
-        }
+    async fn new_client(&mut self, target: u64, _node: &BasicNode) -> Self::Network {
+        UnreachablePeer { target }
     }
 }
 
-impl NetworkAdapter {
-    async fn call<Req, Resp, AppError>(
-        &mut self,
-        kind: PeerRpcKind,
-        request: &Req,
-    ) -> Result<Resp, RPCError<u64, BasicNode, RaftError<u64, AppError>>>
+impl UnreachablePeer {
+    fn reject<AppError>(&self) -> RPCError<u64, BasicNode, RaftError<u64, AppError>>
     where
-        Req: Serialize,
-        Resp: DeserializeOwned,
-        AppError: std::error::Error + Serialize + DeserializeOwned,
+        AppError: std::error::Error,
     {
-        let payload =
-            codec::encode(request).map_err(|error| RPCError::Network(NetworkError::new(&error)))?;
-        let response = self
-            .transport
-            .send(
-                self.target,
-                &PeerNode::new(self.node.addr.clone()),
-                PeerRpc {
-                    schema_version: 1,
-                    kind,
-                    payload,
-                },
-            )
-            .await
-            .map_err(|error| match error {
-                PeerTransportError::Unreachable(_) => {
-                    RPCError::Unreachable(Unreachable::new(&error))
-                }
-                PeerTransportError::Protocol(_) => RPCError::Network(NetworkError::new(&error)),
-            })?;
-        let remote: Result<Resp, RaftError<u64, AppError>> = codec::decode(&response)
-            .map_err(|error| RPCError::Network(NetworkError::new(&error)))?;
-        remote.map_err(|error| {
-            RPCError::RemoteError(RemoteError::new_with_node(
-                self.target,
-                self.node.clone(),
-                error,
-            ))
-        })
+        let error = std::io::Error::other(format!(
+            "Anvil 0.5.0 has one Raft member; peer {} is unreachable",
+            self.target
+        ));
+        RPCError::Unreachable(Unreachable::new(&error))
     }
 }
 
-impl RaftNetwork<DecisionRaftConfig> for NetworkAdapter {
+impl RaftNetwork<DecisionRaftConfig> for UnreachablePeer {
     async fn append_entries(
         &mut self,
         rpc: AppendEntriesRequest<DecisionRaftConfig>,
         _option: RPCOption,
     ) -> Result<AppendEntriesResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
-        self.call(PeerRpcKind::AppendEntries, &rpc).await
+        let _ = rpc;
+        Err(self.reject())
     }
 
     async fn install_snapshot(
@@ -282,7 +168,8 @@ impl RaftNetwork<DecisionRaftConfig> for NetworkAdapter {
         InstallSnapshotResponse<u64>,
         RPCError<u64, BasicNode, RaftError<u64, InstallSnapshotError>>,
     > {
-        self.call(PeerRpcKind::InstallSnapshot, &rpc).await
+        let _ = rpc;
+        Err(self.reject())
     }
 
     async fn vote(
@@ -290,7 +177,8 @@ impl RaftNetwork<DecisionRaftConfig> for NetworkAdapter {
         rpc: VoteRequest<u64>,
         _option: RPCOption,
     ) -> Result<VoteResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
-        self.call(PeerRpcKind::Vote, &rpc).await
+        let _ = rpc;
+        Err(self.reject())
     }
 }
 
@@ -550,7 +438,6 @@ impl DecisionRaft {
         node_id: u64,
         max_commit_entries: u32,
         max_commit_bytes: u64,
-        transport: Arc<dyn PeerTransport>,
     ) -> Result<Self, DecisionRaftError> {
         if node_id == 0 {
             return Err(DecisionRaftError::InvalidNodeId);
@@ -575,7 +462,7 @@ impl DecisionRaft {
         let raft = openraft::Raft::new(
             node_id,
             Arc::new(config),
-            NetworkFactoryAdapter { transport },
+            SingleNodeNetworkFactory,
             OpenRaftLogStore {
                 store: store.clone(),
             },
@@ -594,13 +481,9 @@ impl DecisionRaft {
         })
     }
 
-    pub async fn bootstrap_one_node(&self, node: PeerNode) -> Result<(), DecisionRaftError> {
-        self.ensure_one_node(node).await
-    }
-
     /// Initialize a pristine single-node cluster, or leave an already initialized
     /// cluster untouched. This is safe to call on every process start.
-    pub async fn ensure_one_node(&self, node: PeerNode) -> Result<(), DecisionRaftError> {
+    pub async fn ensure_one_node(&self) -> Result<(), DecisionRaftError> {
         if self
             .raft
             .is_initialized()
@@ -610,50 +493,14 @@ impl DecisionRaft {
             return Ok(());
         }
 
-        let members = BTreeMap::from([(self.node_id, BasicNode::new(node.address))]);
+        let members = BTreeMap::from([(
+            self.node_id,
+            BasicNode::new(format!("anvil-local://{}", self.node_id)),
+        )]);
         match self.raft.initialize(members).await {
             Ok(()) | Err(RaftError::APIError(InitializeError::NotAllowed(_))) => Ok(()),
             Err(error) => Err(DecisionRaftError::Unavailable(error.to_string())),
         }
-    }
-
-    pub async fn initialize(
-        &self,
-        members: BTreeMap<u64, PeerNode>,
-    ) -> Result<(), DecisionRaftError> {
-        let members = members
-            .into_iter()
-            .map(|(node_id, node)| (node_id, BasicNode::new(node.address)))
-            .collect::<BTreeMap<_, _>>();
-        self.raft
-            .initialize(members)
-            .await
-            .map_err(|error| DecisionRaftError::Unavailable(error.to_string()))
-    }
-
-    pub async fn add_learner(
-        &self,
-        node_id: u64,
-        node: PeerNode,
-        blocking: bool,
-    ) -> Result<(), DecisionRaftError> {
-        self.raft
-            .add_learner(node_id, BasicNode::new(node.address), blocking)
-            .await
-            .map(|_| ())
-            .map_err(map_client_write_error)
-    }
-
-    pub async fn change_membership(
-        &self,
-        voters: BTreeSet<u64>,
-        retain_removed_as_learners: bool,
-    ) -> Result<(), DecisionRaftError> {
-        self.raft
-            .change_membership(voters, retain_removed_as_learners)
-            .await
-            .map(|_| ())
-            .map_err(map_client_write_error)
     }
 
     pub async fn submit(&self, command: Command) -> Result<CommittedDecision, DecisionRaftError> {
@@ -717,30 +564,6 @@ impl DecisionRaft {
                 return Err(DecisionRaftError::SnapshotTimeout);
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
-
-    pub async fn handle_peer_rpc(&self, rpc: PeerRpc) -> Result<Vec<u8>, PeerRpcError> {
-        if rpc.schema_version != 1 {
-            return Err(PeerRpcError::UnsupportedSchema(rpc.schema_version));
-        }
-        if rpc.payload.len() > codec::MAX_ENCODED_BYTES {
-            return Err(PeerRpcError::PayloadTooLarge);
-        }
-        match rpc.kind {
-            PeerRpcKind::AppendEntries => {
-                let request: AppendEntriesRequest<DecisionRaftConfig> = decode_peer(&rpc.payload)?;
-                encode_peer(&self.raft.append_entries(request).await)
-            }
-            PeerRpcKind::Vote => {
-                let request: VoteRequest<u64> = decode_peer(&rpc.payload)?;
-                encode_peer(&self.raft.vote(request).await)
-            }
-            PeerRpcKind::InstallSnapshot => {
-                let request: InstallSnapshotRequest<DecisionRaftConfig> =
-                    decode_peer(&rpc.payload)?;
-                encode_peer(&self.raft.install_snapshot(request).await)
-            }
         }
     }
 
@@ -827,14 +650,6 @@ fn validate_membership_command(
         return Err(ApplyError::ExecutorNotCurrentMember { executor });
     }
     Ok(())
-}
-
-fn decode_peer<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, PeerRpcError> {
-    codec::decode(bytes).map_err(|error| PeerRpcError::Codec(error.to_string()))
-}
-
-fn encode_peer<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, PeerRpcError> {
-    codec::encode(value).map_err(|error| PeerRpcError::Codec(error.to_string()))
 }
 
 fn map_client_write_error(

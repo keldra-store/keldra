@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+pub const ATOMIC_REPLAY_RETENTION_MILLIS: u64 = 24 * 60 * 60 * 1_000;
+pub const MAX_COMMITTED_INVOCATIONS: u32 = 4_096;
+pub const MAX_COMMITTED_INVOCATION_BYTES: u64 = 16 * 1024 * 1024;
+
 /// Stable identity of one Raft voter or learner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct NodeId(pub u64);
@@ -15,12 +19,13 @@ pub struct ProgramPathHash(pub [u8; 32]);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ProgramHash(pub [u8; 32]);
 
-/// Opaque location of an immutable prepared bundle in the distributed byte plane.
-///
-/// The reference is fixed-size so one consensus command cannot carry an
-/// unbounded locator. Resolving the reference belongs to the storage layer.
+/// Ordinary content-addressed location of one immutable prepared bundle.
+/// Hash plus length is the complete fixed-size key used by the byte plane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct BundleRef(pub [u8; 32]);
+pub struct BundleRef {
+    pub hash: [u8; 32],
+    pub length: u64,
+}
 
 /// Content identity used to verify an externally stored prepared bundle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -71,6 +76,11 @@ pub struct CommitBatch {
     pub bundle_hash: BundleHash,
     pub durability_class: DurabilityClass,
     pub durability_evidence_hash: DurabilityEvidenceHash,
+    /// Executor wall-clock observation committed as data so every Raft apply
+    /// prunes the same replay entries.
+    pub proposal_at_unix_millis: u64,
+    /// Exactly `proposal_at_unix_millis + ATOMIC_REPLAY_RETENTION_MILLIS`.
+    pub replay_expires_at_unix_millis: u64,
 }
 
 /// One retained, globally ordered compact batch decision.
@@ -88,23 +98,21 @@ pub struct CommittedBatch {
     pub durability_evidence_hash: DurabilityEvidenceHash,
 }
 
-/// Replay receipt retained with one unfinalized commit reference.
-///
-/// The current core makes no time-based replay promise: `FinalizedThrough`
-/// removes this receipt together with its commit reference. A separate receipt
-/// window requires an explicit expiry design and is intentionally not implied
-/// by this type.
+/// One bounded committed invocation retained for replay independently of the
+/// recovery watermark.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct InvocationReceipt {
+pub struct CommittedInvocation {
     pub invocation_id: InvocationId,
     pub input_fingerprint: InvocationFingerprint,
+    pub proposal_at_unix_millis: u64,
+    pub replay_expires_at_unix_millis: u64,
     pub committed_batch: CommittedBatch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitResult {
-    pub receipt: InvocationReceipt,
-    /// `true` when the invocation was already present in the retained suffix.
+    pub invocation: CommittedInvocation,
+    /// `true` when the invocation was already present in the replay window.
     pub replayed: bool,
 }
 
@@ -120,10 +128,8 @@ pub enum Command {
         executor: NodeId,
     },
     CommitBatch(CommitBatch),
-    /// Prune committed batch references only after the caller has established
-    /// the RFC's external recoverable-finalization criterion. This also ends
-    /// the state machine's retained replay evidence for the pruned invocations;
-    /// no independent receipt TTL is implemented here.
+    /// Advance only the external recoverable-finalization watermark. Replay
+    /// entries remain until a later CommitBatch deterministically expires them.
     FinalizedThrough {
         executor: NodeId,
         nomination_log_index: u64,
@@ -135,9 +141,5 @@ pub enum Command {
 pub enum ApplyResult {
     ExecutorNominated(ExecutorNomination),
     BatchCommitted(CommitResult),
-    FinalizationAdvanced {
-        through_commit_cursor: u64,
-        pruned_entries: u32,
-        pruned_bytes: u64,
-    },
+    FinalizationAdvanced { through_commit_cursor: u64 },
 }

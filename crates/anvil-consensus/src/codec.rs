@@ -47,3 +47,40 @@ pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CodecError>
         .deserialize(bytes)
         .map_err(|error| CodecError::Invalid(error.to_string()))
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        BundleHash, BundleRef, Command, CommitBatch, DurabilityClass, DurabilityEvidenceHash,
+        InvocationFingerprint, InvocationId, NodeId, ProgramHash, ProgramPathHash,
+    };
+
+    use super::*;
+
+    #[test]
+    fn commit_batch_is_a_small_fixed_identity_record() {
+        let command = Command::CommitBatch(CommitBatch {
+            executor: NodeId(1),
+            nomination_log_index: 2,
+            program_path_hash: ProgramPathHash([3; 32]),
+            program_hash: ProgramHash([4; 32]),
+            invocation_id: InvocationId([5; 32]),
+            input_fingerprint: InvocationFingerprint([6; 32]),
+            bundle_ref: BundleRef {
+                hash: [7; 32],
+                length: 17,
+            },
+            bundle_hash: BundleHash([8; 32]),
+            durability_class: DurabilityClass([9; 32]),
+            durability_evidence_hash: DurabilityEvidenceHash([10; 32]),
+            proposal_at_unix_millis: 1_000,
+            replay_expires_at_unix_millis: 1_000 + crate::ATOMIC_REPLAY_RETENTION_MILLIS,
+        });
+
+        // The type contains only fixed-size identities and cursors. This
+        // regression bound makes accidentally adding an object body, path
+        // inventory, program definition, or prepared bundle immediately
+        // visible in the consensus crate's tests.
+        assert!(encode(&command).unwrap().len() < 512);
+    }
+}

@@ -1,7 +1,8 @@
 use anvil_consensus::{
-    ApplyError, ApplyResult, BundleHash, BundleRef, Command, CommitBatch, CommitResult,
-    DurabilityClass, DurabilityEvidenceHash, ExecutorNomination, InvocationFingerprint,
-    InvocationId, NodeId, ProgramHash, ProgramPathHash, StateMachine,
+    ATOMIC_REPLAY_RETENTION_MILLIS, ApplyError, ApplyResult, BundleHash, BundleRef, Command,
+    CommitBatch, CommitResult, DurabilityClass, DurabilityEvidenceHash, ExecutorNomination,
+    InvocationFingerprint, InvocationId, MAX_COMMITTED_INVOCATION_BYTES, MAX_COMMITTED_INVOCATIONS,
+    NodeId, ProgramHash, ProgramPathHash, StateMachine,
 };
 
 fn node(node_id: u64) -> NodeId {
@@ -35,10 +36,17 @@ fn batch(
         program_hash: program.object_hash,
         invocation_id: InvocationId([invocation; 32]),
         input_fingerprint: InvocationFingerprint([input; 32]),
-        bundle_ref: BundleRef([invocation.wrapping_add(1); 32]),
-        bundle_hash: BundleHash([invocation.wrapping_add(2); 32]),
+        bundle_ref: BundleRef {
+            hash: [invocation.wrapping_add(1).max(1); 32],
+            length: u64::from(invocation) + 1,
+        },
+        bundle_hash: BundleHash([invocation.wrapping_add(2).max(1); 32]),
         durability_class: DurabilityClass([2; 32]),
-        durability_evidence_hash: DurabilityEvidenceHash([invocation.wrapping_add(3); 32]),
+        durability_evidence_hash: DurabilityEvidenceHash([invocation.wrapping_add(3).max(1); 32]),
+        proposal_at_unix_millis: 1_000 + u64::from(invocation),
+        replay_expires_at_unix_millis: 1_000
+            + u64::from(invocation)
+            + ATOMIC_REPLAY_RETENTION_MILLIS,
     }
 }
 
@@ -79,8 +87,8 @@ fn configuration_requires_both_hard_bounds() {
     assert_eq!(state.max_commit_entries(), 8);
     assert_eq!(state.max_commit_bytes(), 64 * 1024);
     assert_eq!(state.executor(), None);
-    assert_eq!(state.commit_suffix_len(), 0);
-    assert_eq!(state.commit_suffix_bytes(), 0);
+    assert_eq!(state.unfinalized_commit_len(), 0);
+    assert_eq!(state.unfinalized_commit_bytes().unwrap(), 0);
     assert_eq!(state.finalized_through(), None);
 }
 
@@ -131,14 +139,14 @@ fn commit_is_fenced_by_the_current_executor_and_pins_an_external_program() {
         })
     );
     let committed = commit(&mut state, 7, batch(executor, 4, code, 1, 2)).unwrap();
-    assert_eq!(committed.receipt.committed_batch.commit_cursor, 7);
+    assert_eq!(committed.invocation.committed_batch.commit_cursor, 7);
     assert_eq!(state.last_commit_cursor(), Some(7));
     assert_eq!(
-        committed.receipt.committed_batch.program_path_hash,
+        committed.invocation.committed_batch.program_path_hash,
         code.path_hash
     );
     assert_eq!(
-        committed.receipt.committed_batch.program_hash,
+        committed.invocation.committed_batch.program_hash,
         code.object_hash
     );
 }
@@ -152,17 +160,17 @@ fn commits_are_globally_ordered_by_their_raft_indexes() {
 
     let first = commit(&mut state, 8, batch(executor, 3, code, 1, 11)).unwrap();
     let second = commit(&mut state, 13, batch(executor, 3, code, 2, 12)).unwrap();
-    assert_eq!(first.receipt.committed_batch.commit_cursor, 8);
-    assert_eq!(second.receipt.committed_batch.commit_cursor, 13);
+    assert_eq!(first.invocation.committed_batch.commit_cursor, 8);
+    assert_eq!(second.invocation.committed_batch.commit_cursor, 13);
     assert_eq!(
         state
-            .committed_batches()
-            .map(|receipt| receipt.committed_batch.commit_cursor)
+            .unfinalized_invocations()
+            .map(|invocation| invocation.committed_batch.commit_cursor)
             .collect::<Vec<_>>(),
         vec![8, 13]
     );
-    assert_eq!(state.committed_batch(8), Some(first.receipt));
-    assert_eq!(state.committed_batch(13), Some(second.receipt));
+    assert_eq!(state.committed_invocation(8), Some(first.invocation));
+    assert_eq!(state.committed_invocation(13), Some(second.invocation));
 }
 
 #[test]
@@ -179,24 +187,27 @@ fn idempotent_retry_returns_the_original_commit_cursor_after_renomination() {
 
     nominate(&mut state, 8, next_executor);
     let mut recovered = batch(next_executor, 8, code, 1, 21);
-    recovered.bundle_ref = BundleRef([88; 32]);
+    recovered.bundle_ref = BundleRef {
+        hash: [88; 32],
+        length: 88,
+    };
     recovered.bundle_hash = BundleHash([89; 32]);
     recovered.durability_class = DurabilityClass([90; 32]);
     recovered.durability_evidence_hash = DurabilityEvidenceHash([91; 32]);
     let replay = commit(&mut state, 9, recovered).unwrap();
     assert!(replay.replayed);
-    assert_eq!(replay.receipt, original.receipt);
-    assert_eq!(replay.receipt.committed_batch.commit_cursor, 7);
+    assert_eq!(replay.invocation, original.invocation);
+    assert_eq!(replay.invocation.committed_batch.commit_cursor, 7);
     assert_eq!(
-        replay.receipt.committed_batch.durability_class,
+        replay.invocation.committed_batch.durability_class,
         original_batch.durability_class
     );
     assert_eq!(
-        replay.receipt.committed_batch.durability_evidence_hash,
+        replay.invocation.committed_batch.durability_evidence_hash,
         original_batch.durability_evidence_hash
     );
     assert_eq!(state.last_commit_cursor(), Some(7));
-    assert_eq!(state.commit_suffix_len(), 1);
+    assert_eq!(state.unfinalized_commit_len(), 1);
 
     let conflicting = batch(next_executor, 8, code, 1, 22);
     assert_eq!(
@@ -228,14 +239,14 @@ fn stale_executor_cannot_even_replay_a_retained_commit() {
 }
 
 #[test]
-fn finalized_through_prunes_a_global_prefix_and_frees_capacity() {
+fn finalized_through_frees_recovery_capacity_but_retains_replay() {
     let mut state = StateMachine::new(2, 64 * 1024).unwrap();
     let executor = node(1);
     let code = program(1, 10);
     nominate(&mut state, 2, executor);
     let first = commit(&mut state, 5, batch(executor, 2, code, 1, 11)).unwrap();
     let second = commit(&mut state, 7, batch(executor, 2, code, 2, 12)).unwrap();
-    let bytes_before = state.commit_suffix_bytes();
+    let bytes_before = state.unfinalized_commit_bytes().unwrap();
 
     assert!(matches!(
         commit(&mut state, 8, batch(executor, 2, code, 3, 13)),
@@ -252,30 +263,118 @@ fn finalized_through_prunes_a_global_prefix_and_frees_capacity() {
             &Command::FinalizedThrough {
                 executor,
                 nomination_log_index: 2,
-                through_commit_cursor: first.receipt.committed_batch.commit_cursor,
+                through_commit_cursor: first.invocation.committed_batch.commit_cursor,
             },
         )
         .unwrap();
     let ApplyResult::FinalizationAdvanced {
         through_commit_cursor,
-        pruned_entries,
-        pruned_bytes,
     } = advanced
     else {
         unreachable!()
     };
     assert_eq!(through_commit_cursor, 5);
-    assert_eq!(pruned_entries, 1);
-    assert!(pruned_bytes > 0);
-    assert_eq!(state.commit_suffix_bytes(), bytes_before - pruned_bytes);
-    assert_eq!(state.invocation_receipt(first.receipt.invocation_id), None);
+    assert_eq!(state.unfinalized_commit_len(), 1);
+    assert!(state.unfinalized_commit_bytes().unwrap() < bytes_before);
     assert_eq!(
-        state.invocation_receipt(second.receipt.invocation_id),
-        Some(second.receipt)
+        state.replay_entry(first.invocation.invocation_id, 2_000),
+        Some(first.invocation)
+    );
+    assert_eq!(
+        state.replay_entry(second.invocation.invocation_id, 2_000),
+        Some(second.invocation)
     );
 
     let third = commit(&mut state, 10, batch(executor, 2, code, 3, 13)).unwrap();
-    assert_eq!(third.receipt.committed_batch.commit_cursor, 10);
+    assert_eq!(third.invocation.committed_batch.commit_cursor, 10);
+}
+
+#[test]
+fn next_commit_prunes_only_expired_finalized_replay_entries() {
+    let mut state = StateMachine::new(8, 64 * 1024).unwrap();
+    let executor = node(1);
+    let code = program(1, 10);
+    nominate(&mut state, 2, executor);
+    let first = commit(&mut state, 5, batch(executor, 2, code, 1, 11)).unwrap();
+    let first_expiry = first.invocation.replay_expires_at_unix_millis;
+    state
+        .apply(
+            6,
+            &Command::FinalizedThrough {
+                executor,
+                nomination_log_index: 2,
+                through_commit_cursor: 5,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(
+        state.replay_entry(first.invocation.invocation_id, first_expiry - 1),
+        Some(first.invocation)
+    );
+    assert_eq!(
+        state.replay_entry(first.invocation.invocation_id, first_expiry),
+        None
+    );
+    assert_eq!(state.committed_invocation_len(), 1);
+
+    let mut next = batch(executor, 2, code, 1, 12);
+    next.proposal_at_unix_millis = first_expiry;
+    next.replay_expires_at_unix_millis = first_expiry + ATOMIC_REPLAY_RETENTION_MILLIS;
+    commit(&mut state, 7, next).unwrap();
+    assert_eq!(state.committed_invocation(5), None);
+    assert_eq!(state.committed_invocation_len(), 1);
+}
+
+#[test]
+fn unexpired_committed_invocations_backpressure_at_the_fixed_entry_bound() {
+    let mut state = StateMachine::new(
+        MAX_COMMITTED_INVOCATIONS + 1,
+        MAX_COMMITTED_INVOCATION_BYTES,
+    )
+    .unwrap();
+    let executor = node(1);
+    let code = program(1, 10);
+    nominate(&mut state, 1, executor);
+    let mut log_index = 2_u64;
+
+    for sequence in 0..MAX_COMMITTED_INVOCATIONS {
+        let seed = (sequence % 254 + 1) as u8;
+        let mut candidate = batch(executor, 1, code, seed, seed.wrapping_add(1));
+        let mut invocation_id = [1_u8; 32];
+        invocation_id[..4].copy_from_slice(&sequence.to_be_bytes());
+        candidate.invocation_id = InvocationId(invocation_id);
+        candidate.proposal_at_unix_millis = 1_000 + u64::from(sequence);
+        candidate.replay_expires_at_unix_millis =
+            candidate.proposal_at_unix_millis + ATOMIC_REPLAY_RETENTION_MILLIS;
+        let committed = commit(&mut state, log_index, candidate).unwrap();
+        state
+            .apply(
+                log_index + 1,
+                &Command::FinalizedThrough {
+                    executor,
+                    nomination_log_index: 1,
+                    through_commit_cursor: committed.invocation.committed_batch.commit_cursor,
+                },
+            )
+            .unwrap();
+        log_index += 2;
+    }
+
+    assert_eq!(state.committed_invocation_len(), MAX_COMMITTED_INVOCATIONS);
+    assert!(state.committed_invocation_bytes() <= MAX_COMMITTED_INVOCATION_BYTES);
+    let mut overflow = batch(executor, 1, code, 255, 254);
+    overflow.invocation_id = InvocationId([0xfe; 32]);
+    overflow.proposal_at_unix_millis = 10_000;
+    overflow.replay_expires_at_unix_millis = 10_000 + ATOMIC_REPLAY_RETENTION_MILLIS;
+    assert!(matches!(
+        commit(&mut state, log_index, overflow),
+        Err(ApplyError::CommittedInvocationWindowFull {
+            entries: MAX_COMMITTED_INVOCATIONS,
+            ..
+        })
+    ));
+    assert_eq!(state.committed_invocation_len(), MAX_COMMITTED_INVOCATIONS);
 }
 
 #[test]
@@ -295,8 +394,8 @@ fn byte_bound_also_backpressures_without_mutating_state() {
             ..
         })
     ));
-    assert_eq!(state.commit_suffix_len(), 0);
-    assert_eq!(state.commit_suffix_bytes(), 0);
+    assert_eq!(state.unfinalized_commit_len(), 0);
+    assert_eq!(state.unfinalized_commit_bytes().unwrap(), 0);
     assert_eq!(state.last_commit_cursor(), None);
 }
 
@@ -372,7 +471,10 @@ fn malformed_compact_identifiers_are_rejected() {
     nominate(&mut state, 2, executor);
 
     let mut malformed = batch(executor, 2, code, 1, 11);
-    malformed.bundle_ref = BundleRef([0; 32]);
+    malformed.bundle_ref = BundleRef {
+        hash: [0; 32],
+        length: 1,
+    };
     assert_eq!(
         commit(&mut state, 4, malformed),
         Err(ApplyError::InvalidBundleRef)
@@ -388,5 +490,11 @@ fn malformed_compact_identifiers_are_rejected() {
     assert_eq!(
         commit(&mut state, 6, malformed),
         Err(ApplyError::InvalidDurabilityEvidenceHash)
+    );
+    malformed = batch(executor, 2, code, 1, 11);
+    malformed.replay_expires_at_unix_millis += 1;
+    assert_eq!(
+        commit(&mut state, 7, malformed),
+        Err(ApplyError::InvalidReplayExpiry)
     );
 }

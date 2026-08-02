@@ -1,9 +1,9 @@
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 use anvil_consensus::{
-    ApplyError, ApplyResult, BundleHash, BundleRef, Command, CommitBatch, DecisionRaft,
-    DecisionRaftError, DurabilityClass, DurabilityEvidenceHash, InvocationFingerprint,
-    InvocationId, NoPeerTransport, NodeId, PeerNode, ProgramHash, ProgramPathHash,
+    ATOMIC_REPLAY_RETENTION_MILLIS, ApplyError, ApplyResult, BundleHash, BundleRef, Command,
+    CommitBatch, DecisionRaft, DecisionRaftError, DurabilityClass, DurabilityEvidenceHash,
+    InvocationFingerprint, InvocationId, NodeId, ProgramHash, ProgramPathHash,
 };
 
 fn batch(nomination_log_index: u64, id: u8) -> CommitBatch {
@@ -14,27 +14,28 @@ fn batch(nomination_log_index: u64, id: u8) -> CommitBatch {
         program_hash: ProgramHash([4; 32]),
         invocation_id: InvocationId([id; 32]),
         input_fingerprint: InvocationFingerprint([id.wrapping_add(1); 32]),
-        bundle_ref: BundleRef([id.wrapping_add(2); 32]),
+        bundle_ref: BundleRef {
+            hash: [id.wrapping_add(2); 32],
+            length: u64::from(id) + 1,
+        },
         bundle_hash: BundleHash([id.wrapping_add(3); 32]),
         durability_class: DurabilityClass([2; 32]),
         durability_evidence_hash: DurabilityEvidenceHash([id.wrapping_add(4); 32]),
+        proposal_at_unix_millis: 1_000 + u64::from(id),
+        replay_expires_at_unix_millis: 1_000 + u64::from(id) + ATOMIC_REPLAY_RETENTION_MILLIS,
     }
 }
 
 async fn open(path: &std::path::Path) -> DecisionRaft {
-    DecisionRaft::open(path, 1, 4, 64 * 1024, Arc::new(NoPeerTransport))
-        .await
-        .unwrap()
+    DecisionRaft::open(path, 1, 4, 64 * 1024).await.unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_node_decisions_keep_original_commit_cursors_across_restart_and_snapshot() {
     let directory = tempfile::tempdir().unwrap();
-    let peer = PeerNode::new("node-1");
-
     let raft = open(directory.path()).await;
-    raft.ensure_one_node(peer.clone()).await.unwrap();
-    raft.ensure_one_node(peer.clone()).await.unwrap();
+    raft.ensure_one_node().await.unwrap();
+    raft.ensure_one_node().await.unwrap();
     assert_eq!(
         raft.wait_for_leader(Duration::from_secs(5)).await.unwrap(),
         1
@@ -73,7 +74,7 @@ async fn one_node_decisions_keep_original_commit_cursors_across_restart_and_snap
     };
     assert!(!first.replayed);
     assert_eq!(
-        first.receipt.committed_batch.commit_cursor,
+        first.invocation.committed_batch.commit_cursor,
         committed.log_index
     );
 
@@ -83,7 +84,7 @@ async fn one_node_decisions_keep_original_commit_cursors_across_restart_and_snap
     // No explicit snapshot was made: the state is rebuilt from the compact
     // applied journal, including the original commit cursor.
     let raft = open(directory.path()).await;
-    raft.bootstrap_one_node(peer.clone()).await.unwrap();
+    raft.ensure_one_node().await.unwrap();
     assert_eq!(
         raft.wait_for_leader(Duration::from_secs(5)).await.unwrap(),
         1
@@ -91,8 +92,8 @@ async fn one_node_decisions_keep_original_commit_cursors_across_restart_and_snap
     assert_eq!(
         raft.state()
             .unwrap()
-            .invocation_receipt(first_batch.invocation_id),
-        Some(first.receipt)
+            .replay_entry(first_batch.invocation_id, 2_000),
+        Some(first.invocation)
     );
 
     let replayed = raft
@@ -104,9 +105,9 @@ async fn one_node_decisions_keep_original_commit_cursors_across_restart_and_snap
         panic!("retry returned the wrong domain result")
     };
     assert!(replayed_result.replayed);
-    assert_eq!(replayed_result.receipt, first.receipt);
+    assert_eq!(replayed_result.invocation, first.invocation);
     assert_eq!(
-        replayed_result.receipt.committed_batch.commit_cursor,
+        replayed_result.invocation.committed_batch.commit_cursor,
         committed.log_index
     );
 
@@ -122,21 +123,21 @@ async fn one_node_decisions_keep_original_commit_cursors_across_restart_and_snap
     raft.submit(Command::FinalizedThrough {
         executor: NodeId(1),
         nomination_log_index: nomination.nomination_log_index,
-        through_commit_cursor: first.receipt.committed_batch.commit_cursor,
+        through_commit_cursor: first.invocation.committed_batch.commit_cursor,
     })
     .await
     .unwrap();
     assert_eq!(
         raft.state()
             .unwrap()
-            .invocation_receipt(first_batch.invocation_id),
-        None
+            .replay_entry(first_batch.invocation_id, 2_000),
+        Some(first.invocation)
     );
     assert_eq!(
         raft.state()
             .unwrap()
-            .invocation_receipt(second_batch.invocation_id),
-        Some(second.receipt)
+            .replay_entry(second_batch.invocation_id, 2_000),
+        Some(second.invocation)
     );
 
     raft.snapshot(Duration::from_secs(5)).await.unwrap();
@@ -144,17 +145,17 @@ async fn one_node_decisions_keep_original_commit_cursors_across_restart_and_snap
     drop(raft);
 
     let raft = open(directory.path()).await;
-    raft.ensure_one_node(peer).await.unwrap();
+    raft.ensure_one_node().await.unwrap();
     assert_eq!(
         raft.wait_for_leader(Duration::from_secs(5)).await.unwrap(),
         1
     );
     let state = raft.state().unwrap();
     assert_eq!(state.finalized_through(), Some(committed.log_index));
-    assert_eq!(state.commit_suffix_len(), 1);
+    assert_eq!(state.unfinalized_commit_len(), 1);
     assert_eq!(
-        state.invocation_receipt(second_batch.invocation_id),
-        Some(second.receipt)
+        state.replay_entry(second_batch.invocation_id, 2_000),
+        Some(second.invocation)
     );
     raft.shutdown().await.unwrap();
 }
