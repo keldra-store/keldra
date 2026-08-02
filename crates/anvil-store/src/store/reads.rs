@@ -1,0 +1,517 @@
+use super::*;
+
+impl Store {
+    pub fn head(&self, key: &ObjectKey) -> Result<Option<Head>, MutationError> {
+        self.head_by_storage_key(&self.head_storage_key(key)?)
+    }
+
+    pub(crate) fn head_by_storage_key(
+        &self,
+        encoded_key: &[u8],
+    ) -> Result<Option<Head>, MutationError> {
+        self.read_json(CF_HEADS, encoded_key)
+    }
+
+    /// Lists current live paths directly from the prefix-sortable head keys.
+    /// No listing projection or side index is maintained: the iterator seeks
+    /// to `[format][tenant ID][bucket ID][literal prefix]` and stops as soon as
+    /// that byte prefix no longer matches.
+    pub fn list_objects(
+        &self,
+        tenant: &str,
+        bucket: &str,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ListObjectsPage, MutationError> {
+        let limit = limit.min(MAX_LIST_OBJECTS);
+        if limit == 0 {
+            return Ok(ListObjectsPage {
+                paths: Vec::new(),
+                has_more: false,
+            });
+        }
+
+        let identity = self.resolve_bucket_identity(tenant, bucket)?;
+        let bucket_prefix = identity.encode();
+        let mut range_prefix = Vec::with_capacity(bucket_prefix.len() + prefix.len());
+        range_prefix.extend_from_slice(&bucket_prefix);
+        range_prefix.extend_from_slice(prefix.as_bytes());
+        let mut seek = range_prefix.clone();
+        if let Some(cursor) = start_after
+            && cursor.as_bytes() > prefix.as_bytes()
+        {
+            seek.truncate(bucket_prefix.len());
+            seek.extend_from_slice(cursor.as_bytes());
+        }
+        let snapshot = self.db.snapshot();
+        let mut paths = Vec::with_capacity(limit.saturating_add(1));
+        for entry in snapshot.iterator_cf(
+            self.cf(CF_HEADS)?,
+            IteratorMode::From(&seek, Direction::Forward),
+        ) {
+            let (stored_key, encoded_head) = entry.map_err(storage_error)?;
+            if !stored_key.starts_with(&range_prefix) {
+                break;
+            }
+            let path = identity
+                .decode_head_path(&stored_key)
+                .map_err(storage_error)?;
+            let head = serde_json::from_slice::<Head>(&encoded_head).map_err(storage_error)?;
+            if head.deleted || start_after.is_some_and(|cursor| path <= cursor) {
+                continue;
+            }
+            paths.push(path.to_owned());
+            if paths.len() > limit {
+                break;
+            }
+        }
+
+        let has_more = paths.len() > limit;
+        paths.truncate(limit);
+        Ok(ListObjectsPage { paths, has_more })
+    }
+
+    /// Returns the last durable offset in this store's local invalidation
+    /// journal. Zero means that no ordinary or atomic head change has been
+    /// appended.
+    pub async fn get(&self, key: &ObjectKey) -> Result<Option<Object>, MutationError> {
+        let identity = self.resolve_bucket_identity(key.tenant(), key.bucket())?;
+        let selected = {
+            let _commit_guard = self.commit_lock.lock().await;
+            let Some(head) = self.head_by_storage_key(&identity.head_key(key.path()))? else {
+                return Ok(None);
+            };
+            if head.deleted {
+                return Ok(None);
+            }
+            let version = self
+                .version_metadata_by_identity(identity, key, head.version)?
+                .ok_or_else(|| {
+                    MutationError::Storage("head references a missing version descriptor".into())
+                })?;
+            validate_selected_head(&head, &version)?;
+            version
+        };
+        self.materialize_selected_object(key, selected)
+            .await
+            .map(Some)
+    }
+
+    pub async fn get_version(
+        &self,
+        key: &ObjectKey,
+        version_id: VersionId,
+    ) -> Result<Option<Object>, MutationError> {
+        let identity = self.resolve_bucket_identity(key.tenant(), key.bucket())?;
+        if self.bucket_versioning_by_key(&identity.encode())? != ObjectVersioning::Enabled {
+            return Err(MutationError::ObjectVersioningNotEnabled);
+        }
+        let selected = {
+            let _commit_guard = self.commit_lock.lock().await;
+            let selected = self.version_metadata_by_identity(identity, key, version_id)?;
+            if let Some(version) = &selected {
+                validate_selected_version_id(version_id, version)?;
+            }
+            selected
+        };
+        match selected {
+            Some(version) => self
+                .materialize_selected_object(key, version)
+                .await
+                .map(Some),
+            None => Ok(None),
+        }
+    }
+
+    async fn materialize_selected_object(
+        &self,
+        key: &ObjectKey,
+        version: Version,
+    ) -> Result<Object, MutationError> {
+        let bytes = match (&version.blob, version.deleted) {
+            (Some(blob), false) => self.read_blob_bytes(blob).await?,
+            (None, true) => Vec::new(),
+            _ => {
+                return Err(MutationError::Storage(
+                    "version has an invalid payload shape".into(),
+                ));
+            }
+        };
+        Ok(Object {
+            key: key.clone(),
+            version,
+            bytes,
+        })
+    }
+
+    pub fn version_metadata(
+        &self,
+        key: &ObjectKey,
+        version_id: VersionId,
+    ) -> Result<Option<Version>, MutationError> {
+        let identity = self.resolve_bucket_identity(key.tenant(), key.bucket())?;
+        self.version_metadata_by_identity(identity, key, version_id)
+    }
+
+    pub(crate) fn version_metadata_by_identity(
+        &self,
+        identity: BucketIdentity,
+        key: &ObjectKey,
+        version_id: VersionId,
+    ) -> Result<Option<Version>, MutationError> {
+        self.read_json(CF_VERSIONS, &version_key(identity, key, version_id))
+    }
+
+    /// Returns the current descriptor without loading its payload.
+    ///
+    /// The head and descriptor are selected under the commit fence so an
+    /// unversioned replacement cannot retire the descriptor between the two
+    /// reads. This is the cheap metadata path used by `HeadObject`.
+    pub async fn current_version_metadata(
+        &self,
+        key: &ObjectKey,
+    ) -> Result<Option<Version>, MutationError> {
+        let identity = self.resolve_bucket_identity(key.tenant(), key.bucket())?;
+        let _commit_guard = self.commit_lock.lock().await;
+        let Some(head) = self.head_by_storage_key(&identity.head_key(key.path()))? else {
+            return Ok(None);
+        };
+        let version = self
+            .version_metadata_by_identity(identity, key, head.version)?
+            .ok_or_else(|| {
+                MutationError::Storage("head references a missing version descriptor".into())
+            })?;
+        validate_selected_head(&head, &version)?;
+        Ok(Some(version))
+    }
+
+    pub async fn open_object(
+        &self,
+        key: &ObjectKey,
+        requested_version: Option<VersionId>,
+    ) -> Result<Option<OpenedObject>, MutationError> {
+        let identity = self.resolve_bucket_identity(key.tenant(), key.bucket())?;
+        if requested_version.is_some()
+            && self.bucket_versioning_by_key(&identity.encode())? != ObjectVersioning::Enabled
+        {
+            return Err(MutationError::ObjectVersioningNotEnabled);
+        }
+        let version = {
+            let _commit_guard = self.commit_lock.lock().await;
+            let (version_id, selected_head) = match requested_version {
+                Some(version) => (version, None),
+                None => match self.head_by_storage_key(&identity.head_key(key.path()))? {
+                    Some(head) => (head.version, Some(head)),
+                    None => return Ok(None),
+                },
+            };
+            let Some(version) = self.version_metadata_by_identity(identity, key, version_id)?
+            else {
+                return if selected_head.is_some() {
+                    Err(MutationError::Storage(
+                        "head references a missing version descriptor".into(),
+                    ))
+                } else {
+                    Ok(None)
+                };
+            };
+            match &selected_head {
+                Some(head) => validate_selected_head(head, &version)?,
+                None => validate_selected_version_id(version_id, &version)?,
+            }
+            version
+        };
+        let reader = match version_blob_reference(&version)? {
+            Some(reference) => Some(self.open_blob(&reference).await?),
+            None => None,
+        };
+        Ok(Some(OpenedObject { version, reader }))
+    }
+
+    /// Lists retained descriptors for one exact path in ascending version
+    /// order. `after` is exclusive and the store always applies its own cap.
+    pub fn list_object_versions(
+        &self,
+        key: &ObjectKey,
+        after: Option<VersionId>,
+        limit: usize,
+    ) -> Result<Vec<Version>, MutationError> {
+        let identity = self.resolve_bucket_identity(key.tenant(), key.bucket())?;
+        if self.bucket_versioning_by_key(&identity.encode())? != ObjectVersioning::Enabled {
+            return Err(MutationError::ObjectVersioningNotEnabled);
+        }
+        let limit = limit.min(MAX_LIST_OBJECT_VERSIONS);
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let prefix = version_prefix(identity, key);
+        let start = after.map_or_else(
+            || prefix.clone(),
+            |version| version_key(identity, key, version),
+        );
+        let mut versions = Vec::with_capacity(limit);
+        for entry in self.db.iterator_cf(
+            self.cf(CF_VERSIONS)?,
+            IteratorMode::From(&start, Direction::Forward),
+        ) {
+            let (stored_key, encoded) = entry.map_err(storage_error)?;
+            if !stored_key.starts_with(&prefix) || stored_key.len() != prefix.len() + 8 {
+                break;
+            }
+            let stored_id = VersionId(u64::from_be_bytes(
+                stored_key[prefix.len()..]
+                    .try_into()
+                    .expect("retained version key length was checked"),
+            ));
+            if after.is_some_and(|after| stored_id <= after) {
+                continue;
+            }
+            let version = serde_json::from_slice::<Version>(&encoded).map_err(storage_error)?;
+            if version.id != stored_id {
+                return Err(MutationError::Storage(
+                    "retained version key and descriptor disagree".into(),
+                ));
+            }
+            version_blob_reference(&version)?;
+            versions.push(version);
+            if versions.len() == limit {
+                break;
+            }
+        }
+        Ok(versions)
+    }
+
+    pub async fn delete_retained_version(
+        &self,
+        key: &ObjectKey,
+        version_id: VersionId,
+    ) -> Result<DeleteRetainedVersionOutcome, MutationError> {
+        let identity = self.resolve_bucket_identity(key.tenant(), key.bucket())?;
+        if self.bucket_versioning_by_key(&identity.encode())? != ObjectVersioning::Enabled {
+            return Err(MutationError::ObjectVersioningNotEnabled);
+        }
+        let _policy_guard = self.policy_gate.read().await;
+        let _path_guard = self.ordinary_locks.acquire(&[object_path(key)]).await;
+        let _commit_guard = self.commit_lock.lock().await;
+        let policy = self
+            .bucket_policy_by_key(&identity.encode())?
+            .unwrap_or_default();
+        if policy.is_program_only(key.path()) && !is_program_definition_path(key.path()) {
+            return Err(MutationError::ProgramConcurrencyViolation);
+        }
+        if policy.is_immutable(key.path()) || is_program_definition_path(key.path()) {
+            return Err(MutationError::Immutable);
+        }
+        let Some(head) = self.head_by_storage_key(&identity.head_key(key.path()))? else {
+            return Ok(DeleteRetainedVersionOutcome::NotFound);
+        };
+        let Some(target) = self.version_metadata_by_identity(identity, key, version_id)? else {
+            if head.version == version_id {
+                return Err(MutationError::Storage(
+                    "head references a missing retained version".into(),
+                ));
+            }
+            return Ok(DeleteRetainedVersionOutcome::NotFound);
+        };
+        if target.id != version_id || target.deleted != (target.blob.is_none()) {
+            return Err(MutationError::Storage(
+                "retained version descriptor is malformed".into(),
+            ));
+        }
+
+        let mut batch = WriteBatch::default();
+        let mut pending_references = PendingBlobReferences::new();
+        if let Some(reference) = version_blob_reference(&target)? {
+            let (reference_key, state) = self.prepare_blob_reference_retirement(
+                &reference,
+                &pending_references,
+                now_unix_millis()?,
+            )?;
+            self.stage_blob_reference_update(
+                &mut batch,
+                &mut pending_references,
+                reference_key,
+                state,
+            )?;
+        }
+        batch.delete_cf(
+            self.cf(CF_VERSIONS)?,
+            version_key(identity, key, version_id),
+        );
+
+        let (outcome, invalidation) = if head.version != version_id {
+            (DeleteRetainedVersionOutcome::DeletedNonCurrent, None)
+        } else {
+            if target.deleted {
+                return Err(MutationError::CurrentTombstoneCannotBeDeleted);
+            }
+            let tombstone_id = self.clock.next().map_err(storage_error)?;
+            let tombstone = Version {
+                id: tombstone_id,
+                blob: None,
+                content_type: None,
+                deleted: true,
+                committed_at_unix_millis: now_unix_millis()?,
+            };
+            batch.put_cf(
+                self.cf(CF_VERSIONS)?,
+                version_key(identity, key, tombstone_id),
+                serde_json::to_vec(&tombstone).map_err(storage_error)?,
+            );
+            batch.put_cf(
+                self.cf(CF_HEADS)?,
+                identity.head_key(key.path()),
+                serde_json::to_vec(&Head {
+                    version: tombstone_id,
+                    deleted: true,
+                })
+                .map_err(storage_error)?,
+            );
+            batch.put_cf(
+                self.cf(CF_METADATA)?,
+                VERSION_HIGH_WATERMARK_KEY,
+                serde_json::to_vec(&tombstone_id).map_err(storage_error)?,
+            );
+            self.stage_local_invalidations(&mut batch, &[(key.clone(), tombstone_id, true)])?;
+            (
+                DeleteRetainedVersionOutcome::ReplacedCurrentWithTombstone {
+                    version: tombstone_id,
+                },
+                Some(tombstone_id),
+            )
+        };
+        let mut options = WriteOptions::default();
+        options.set_sync(self.sync_writes);
+        self.db.write_opt(batch, &options).map_err(storage_error)?;
+        if invalidation.is_some() {
+            self.notify_local_invalidations();
+        }
+        Ok(outcome)
+    }
+
+    /// Resolves every requested head and immutable version descriptor from one
+    /// local RocksDB snapshot without reading referenced blob payloads.
+    pub async fn select_batch_get(
+        &self,
+        requests: &[(ObjectKey, Option<VersionId>)],
+    ) -> BatchGetSelection {
+        let commit_guard = self.commit_lock.lock().await;
+        let entries = {
+            let snapshot = self.db.snapshot();
+            let mut identity_cache =
+                BTreeMap::<(String, String), Result<BucketIdentity, MutationError>>::new();
+            let mut entries = Vec::with_capacity(requests.len());
+            for (key, requested_version) in requests {
+                let cache_key = (key.tenant().to_owned(), key.bucket().to_owned());
+                let identity = identity_cache
+                    .entry(cache_key)
+                    .or_insert_with(|| self.resolve_bucket_identity(key.tenant(), key.bucket()))
+                    .clone();
+                let selected = identity.and_then(|identity| {
+                    let selected_head = match requested_version {
+                        Some(_) => {
+                            if self.bucket_versioning_by_key(&identity.encode())?
+                                != ObjectVersioning::Enabled
+                            {
+                                return Err(MutationError::ObjectVersioningNotEnabled);
+                            }
+                            None
+                        }
+                        None => snapshot
+                            .get_cf(self.cf(CF_HEADS)?, identity.head_key(key.path()))
+                            .map_err(storage_error)?
+                            .map(|bytes| {
+                                serde_json::from_slice::<Head>(&bytes).map_err(storage_error)
+                            })
+                            .transpose()?,
+                    };
+                    let version_id = requested_version
+                        .as_ref()
+                        .copied()
+                        .or_else(|| selected_head.as_ref().map(|head| head.version));
+                    let Some(version_id) = version_id else {
+                        return Ok(None);
+                    };
+                    let selected = snapshot
+                        .get_cf(
+                            self.cf(CF_VERSIONS)?,
+                            version_key(identity, key, version_id),
+                        )
+                        .map_err(storage_error)?
+                        .map(|bytes| {
+                            serde_json::from_slice::<Version>(&bytes).map_err(storage_error)
+                        })
+                        .transpose()?;
+                    let Some(version) = selected else {
+                        return if selected_head.is_some() {
+                            Err(MutationError::Storage(
+                                "head references a missing version descriptor".into(),
+                            ))
+                        } else {
+                            Ok(None)
+                        };
+                    };
+                    match &selected_head {
+                        Some(head) => validate_selected_head(head, &version)?,
+                        None => validate_selected_version_id(version_id, &version)?,
+                    }
+                    Ok(Some(version))
+                });
+                entries.push((key.clone(), selected));
+            }
+            entries
+        };
+        drop(commit_guard);
+        BatchGetSelection { entries }
+    }
+
+    /// Reads payloads for descriptors previously selected by
+    /// [`Store::select_batch_get`]. Immutable descriptors are materialised
+    /// after the short commit fence has already been released.
+    pub async fn read_batch_get_selection(
+        &self,
+        selection: BatchGetSelection,
+    ) -> Vec<Result<Option<Object>, MutationError>> {
+        let BatchGetSelection { entries } = selection;
+        let mut outcomes = Vec::with_capacity(entries.len());
+        for (key, version) in entries {
+            let outcome = match version {
+                Ok(Some(version)) => match (&version.blob, version.deleted) {
+                    (Some(blob), false) => self
+                        .read_blob_bytes(blob)
+                        .await
+                        .map(|bytes| {
+                            Some(Object {
+                                key,
+                                version,
+                                bytes,
+                            })
+                        })
+                        .map_err(storage_error),
+                    (None, true) => Ok(Some(Object {
+                        key,
+                        version,
+                        bytes: Vec::new(),
+                    })),
+                    _ => Err(MutationError::Storage(
+                        "version has an invalid payload shape".into(),
+                    )),
+                },
+                Ok(None) => Ok(None),
+                Err(error) => Err(error),
+            };
+            outcomes.push(outcome);
+        }
+        outcomes
+    }
+
+    /// Resolves one snapshot and materialises its selected payloads.
+    pub async fn batch_get(
+        &self,
+        requests: &[(ObjectKey, Option<VersionId>)],
+    ) -> Vec<Result<Option<Object>, MutationError>> {
+        let selection = self.select_batch_get(requests).await;
+        self.read_batch_get_selection(selection).await
+    }
+}
