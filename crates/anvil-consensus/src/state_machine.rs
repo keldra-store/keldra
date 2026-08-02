@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    ATOMIC_REPLAY_RETENTION_MILLIS, ApplyResult, Command, CommitBatch, CommitResult,
-    CommittedBatch, CommittedInvocation, ExecutorNomination, InvocationId,
+    ATOMIC_REPLAY_RETENTION_MILLIS, ApplyResult, ClusterControlState, Command, CommitBatch,
+    CommitResult, CommittedBatch, CommittedInvocation, ExecutorNomination, InvocationId,
     MAX_COMMITTED_INVOCATION_BYTES, MAX_COMMITTED_INVOCATIONS, NodeId, ProgramHash,
     ProgramPathHash, SYSTEM_BOOTSTRAP_VERSION, codec,
     types::{ClusterId, MAX_RAFT_NODE_ID, SystemBootstrapState},
@@ -24,8 +24,9 @@ use crate::{
 pub struct StateMachine {
     max_commit_entries: u32,
     max_commit_bytes: u64,
-    cluster_id: Option<ClusterId>,
+    pub(crate) cluster_id: Option<ClusterId>,
     system_bootstrap: SystemBootstrapState,
+    pub(crate) cluster_control: ClusterControlState,
     executor: Option<ExecutorNomination>,
     committed_invocations: BTreeMap<u64, CommittedInvocation>,
     committed_invocation_bytes: u64,
@@ -50,6 +51,7 @@ impl StateMachine {
             max_commit_bytes,
             cluster_id: None,
             system_bootstrap: SystemBootstrapState::Missing,
+            cluster_control: ClusterControlState::default(),
             executor: None,
             committed_invocations: BTreeMap::new(),
             committed_invocation_bytes,
@@ -76,6 +78,35 @@ impl StateMachine {
             max_commit_bytes,
             cluster_id: None,
             system_bootstrap: SystemBootstrapState::Missing,
+            cluster_control: ClusterControlState::default(),
+            executor,
+            committed_invocations,
+            committed_invocation_bytes,
+            last_commit_cursor,
+            finalized_through,
+        }
+    }
+
+    /// Convert the version-one enveloped snapshot written before bounded
+    /// cluster-control state was introduced.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_pre_cluster_control_snapshot(
+        max_commit_entries: u32,
+        max_commit_bytes: u64,
+        cluster_id: Option<ClusterId>,
+        system_bootstrap: SystemBootstrapState,
+        executor: Option<ExecutorNomination>,
+        committed_invocations: BTreeMap<u64, CommittedInvocation>,
+        committed_invocation_bytes: u64,
+        last_commit_cursor: Option<u64>,
+        finalized_through: Option<u64>,
+    ) -> Self {
+        Self {
+            max_commit_entries,
+            max_commit_bytes,
+            cluster_id,
+            system_bootstrap,
+            cluster_control: ClusterControlState::default(),
             executor,
             committed_invocations,
             committed_invocation_bytes,
@@ -98,6 +129,10 @@ impl StateMachine {
 
     pub fn system_bootstrap(&self) -> SystemBootstrapState {
         self.system_bootstrap
+    }
+
+    pub fn cluster_control(&self) -> &ClusterControlState {
+        &self.cluster_control
     }
 
     pub fn executor(&self) -> Option<ExecutorNomination> {
@@ -197,6 +232,66 @@ impl StateMachine {
                 *bootstrap_version,
                 committed_log_index,
             ),
+            Command::BeginAddNode {
+                format_version,
+                descriptor,
+            } => self.begin_add_node(*format_version, descriptor.clone(), committed_log_index),
+            Command::BeginRemoveNode {
+                format_version,
+                node_id,
+            } => self.begin_remove_node(*format_version, *node_id, committed_log_index),
+            Command::BeginReweightNode {
+                format_version,
+                node_id,
+                storage_weight_millionths,
+            } => self.begin_reweight_node(
+                *format_version,
+                *node_id,
+                *storage_weight_millionths,
+                committed_log_index,
+            ),
+            Command::CompleteMembershipTransition {
+                format_version,
+                started_log_index,
+            } => self.complete_membership_transition(*format_version, *started_log_index),
+            Command::StagePeerSpkiOverlap {
+                format_version,
+                node_id,
+                expected_current,
+                overlap,
+            } => {
+                self.stage_peer_spki_overlap(*format_version, *node_id, *expected_current, *overlap)
+            }
+            Command::PromotePeerSpkiOverlap {
+                format_version,
+                node_id,
+                expected_current,
+                expected_overlap,
+            } => self.promote_peer_spki_overlap(
+                *format_version,
+                *node_id,
+                *expected_current,
+                *expected_overlap,
+            ),
+            Command::ClearPeerSpkiOverlap {
+                format_version,
+                node_id,
+                expected_current,
+                expected_overlap,
+            } => self.clear_peer_spki_overlap(
+                *format_version,
+                *node_id,
+                *expected_current,
+                *expected_overlap,
+            ),
+            Command::BindJwtSigningKeyFingerprint {
+                format_version,
+                fingerprint,
+            } => self.bind_jwt_signing_key_fingerprint(*format_version, *fingerprint),
+            Command::BindErasureCodeProfile {
+                format_version,
+                profile,
+            } => self.bind_erasure_code_profile(*format_version, *profile),
         }
     }
 
@@ -562,6 +657,8 @@ pub enum ApplyError {
     InvalidNodeId,
     #[error("node {executor:?} is not a current Raft voter or learner")]
     ExecutorNotCurrentMember { executor: NodeId },
+    #[error("node {executor:?} is not an ACTIVE Raft voter or learner")]
+    ExecutorNotActiveMember { executor: NodeId },
     #[error("no atomic-program executor has been nominated")]
     ExecutorNotNominated,
     #[error("node {requested:?} is not current executor {current:?}")]
@@ -648,4 +745,80 @@ pub enum ApplyError {
     UnsupportedSystemBootstrapVersion { requested: u16 },
     #[error("system bootstrap is already complete at version {current}, not {requested}")]
     SystemBootstrapVersionConflict { current: u16, requested: u16 },
+    #[error("cluster-control command version {requested} is unsupported")]
+    UnsupportedClusterControlVersion { requested: u16 },
+    #[error("peer address must contain 1 to 255 non-whitespace, non-control UTF-8 bytes")]
+    InvalidPeerAddress,
+    #[error("storage weight must be a positive number of millionths")]
+    InvalidStorageWeight,
+    #[error("capability range {min}..={max} is invalid")]
+    InvalidCapabilityRange { min: u16, max: u16 },
+    #[error("peer SPKI SHA-256 fingerprint must be non-zero")]
+    InvalidPeerSpki,
+    #[error("join capability hash must be non-zero")]
+    InvalidJoinCapabilityHash,
+    #[error("a node admitted by ADD must be JOINING")]
+    AddedNodeMustBeJoining,
+    #[error("a JOINING node requires a single-use join capability hash")]
+    JoiningNodeRequiresCapability,
+    #[error("a JOINING node cannot have a peer-pin overlap")]
+    JoiningNodeCannotRotatePeerPin,
+    #[error("an ACTIVE node cannot retain a join capability hash")]
+    ActiveNodeRetainsJoinCapability,
+    #[error("node {node_id:?} was already used and cannot be admitted again")]
+    NodeIdAlreadyUsed { node_id: NodeId },
+    #[error("node {node_id:?} is not admitted")]
+    NodeNotAdmitted { node_id: NodeId },
+    #[error("node {node_id:?} is not ACTIVE")]
+    NodeNotActive { node_id: NodeId },
+    #[error("the last ACTIVE node cannot be removed")]
+    CannotRemoveLastActiveNode,
+    #[error("storage weight is unchanged")]
+    StorageWeightUnchanged,
+    #[error("membership transition at log {started_log_index} is already in progress")]
+    MembershipTransitionInProgress { started_log_index: u64 },
+    #[error("there is no membership transition")]
+    NoMembershipTransition,
+    #[error("membership transition fence is {expected}, not {requested}")]
+    MembershipTransitionFenceMismatch { expected: u64, requested: u64 },
+    #[error("membership transition no longer matches its node descriptor")]
+    MembershipTransitionStateMismatch,
+    #[error("node {node_id:?} is undergoing a membership transition")]
+    NodeMembershipTransitionInProgress { node_id: NodeId },
+    #[error("transition node {node_id:?} is not a current Raft voter or learner")]
+    TransitionNodeNotCurrentMember { node_id: NodeId },
+    #[error("node {node_id:?} cannot complete removal while it remains a Raft member")]
+    RemovingNodeIsStillMember { node_id: NodeId },
+    #[error("Raft voter target requires {expected} voters, not {actual}")]
+    VoterTargetMismatch { expected: u16, actual: u16 },
+    #[error("Raft voter {node_id:?} is not ACTIVE")]
+    VoterNotActive { node_id: NodeId },
+    #[error("peer address is already admitted")]
+    PeerAddressAlreadyUsed,
+    #[error("peer SPKI fingerprint is already admitted")]
+    PeerSpkiAlreadyUsed,
+    #[error("join capability hash is already admitted")]
+    JoinCapabilityAlreadyUsed,
+    #[error("current and overlap peer pins must differ")]
+    PeerPinsMustDiffer,
+    #[error("node {node_id:?} current peer pin does not match")]
+    PeerCurrentPinMismatch { node_id: NodeId },
+    #[error("node {node_id:?} already has another overlap peer pin")]
+    PeerOverlapAlreadySet { node_id: NodeId },
+    #[error("node {node_id:?} peer pin pair does not match")]
+    PeerPinPairMismatch { node_id: NodeId },
+    #[error("JWT signing-key fingerprint must be non-zero")]
+    InvalidJwtSigningKeyFingerprint,
+    #[error("JWT signing-key fingerprint is already bound to another value")]
+    JwtSigningKeyFingerprintConflict {
+        current: crate::JwtSigningKeyFingerprint,
+        requested: crate::JwtSigningKeyFingerprint,
+    },
+    #[error("erasure-code profile requires non-zero K, M, and stripe unit with K+M <= 256")]
+    InvalidErasureCodeProfile,
+    #[error("erasure-code profile is already bound to another value")]
+    ErasureCodeProfileConflict {
+        current: crate::ErasureCodeProfile,
+        requested: crate::ErasureCodeProfile,
+    },
 }

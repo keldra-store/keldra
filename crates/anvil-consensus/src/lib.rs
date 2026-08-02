@@ -5,6 +5,7 @@
 //! object paths, payloads, version descriptors, prepared bundles, locks,
 //! finalization evidence, and application data remain outside consensus.
 
+mod cluster_control;
 mod codec;
 mod peer;
 mod peer_tls;
@@ -25,9 +26,13 @@ pub use peer_tls::{
 pub use raft::{CommittedDecision, DecisionRaft, DecisionRaftError};
 pub use state_machine::{ApplyError, StateMachine};
 pub use types::{
-    ATOMIC_REPLAY_RETENTION_MILLIS, ApplyResult, BundleHash, BundleRef, ClusterId, Command,
+    ATOMIC_REPLAY_RETENTION_MILLIS, ApplyResult, BundleHash, BundleRef,
+    CLUSTER_CONTROL_COMMAND_VERSION, CapabilityRange, ClusterControlState, ClusterId, Command,
     CommitBatch, CommitResult, CommittedBatch, CommittedInvocation, DurabilityClass,
-    DurabilityEvidenceHash, ExecutorNomination, InvocationFingerprint, InvocationId,
-    MAX_COMMITTED_INVOCATION_BYTES, MAX_COMMITTED_INVOCATIONS, NodeId, ProgramHash,
-    ProgramPathHash, SYSTEM_BOOTSTRAP_VERSION, SystemBootstrapState,
+    DurabilityEvidenceHash, ErasureCodeProfile, ExecutorNomination, FIXED_VOTER_TARGET,
+    InvocationFingerprint, InvocationId, JoinCapabilityHash, JwtSigningKeyFingerprint,
+    MAX_COMMITTED_INVOCATION_BYTES, MAX_COMMITTED_INVOCATIONS, MAX_PEER_ADDRESS_BYTES,
+    MembershipTransition, MembershipTransitionKind, NodeDescriptor, NodeId, NodeState, PeerAddress,
+    PeerSpkiSha256, ProgramHash, ProgramPathHash, SYSTEM_BOOTSTRAP_VERSION, SystemBootstrapState,
+    UsedNodeIds,
 };
