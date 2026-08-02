@@ -1,6 +1,6 @@
 use anvil_consensus::{
     ApplyResult, CLUSTER_CONTROL_COMMAND_VERSION, ClusterId, Command, DecisionRaft,
-    ErasureCodeProfile, NodeId, SYSTEM_BOOTSTRAP_VERSION,
+    ErasureCodeProfile, JwtSigningKeyFingerprint, NodeId, SYSTEM_BOOTSTRAP_VERSION,
     SystemBootstrapState as ConsensusBootstrapState,
 };
 use anvil_store::{ErasureProfile, Store, SystemBootstrapState as LocalBootstrapState};
@@ -82,6 +82,42 @@ pub(crate) async fn ensure_erasure_code_profile(
     match committed.result {
         ApplyResult::ErasureCodeProfileBound(profile) if profile == requested => Ok(()),
         result => bail!("erasure-code profile command returned unexpected result {result:?}"),
+    }
+}
+
+/// Bind the operator-selected JWT material to this cluster without retaining
+/// the secret. An absent value is the released-0.5.0 migration case; every
+/// later startup must match the first committed fingerprint.
+pub(crate) async fn ensure_jwt_signing_key_fingerprint(
+    decisions: &DecisionRaft,
+    requested: JwtSigningKeyFingerprint,
+) -> Result<()> {
+    if let Some(committed) = decisions
+        .state()?
+        .cluster_control()
+        .jwt_signing_key_fingerprint()
+    {
+        anyhow::ensure!(
+            committed == requested,
+            "configured JWT signing key does not match the committed cluster fingerprint"
+        );
+        return Ok(());
+    }
+
+    let committed = decisions
+        .submit(Command::BindJwtSigningKeyFingerprint {
+            format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+            fingerprint: requested,
+        })
+        .await
+        .context("commit immutable JWT signing-key fingerprint")?;
+    match committed.result {
+        ApplyResult::JwtSigningKeyFingerprintBound(fingerprint) if fingerprint == requested => {
+            Ok(())
+        }
+        result => {
+            bail!("JWT signing-key fingerprint command returned unexpected result {result:?}")
+        }
     }
 }
 
@@ -316,6 +352,61 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("does not match the committed"));
+        decisions.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_absent_jwt_fingerprint_is_bound_and_restarts_fail_closed() {
+        let temporary = tempfile::tempdir().unwrap();
+        let expected = JwtSigningKeyFingerprint([21; 32]);
+        let mismatch = JwtSigningKeyFingerprint([22; 32]);
+        let decisions = DecisionRaft::open(temporary.path().join("decisions"), 1, 16, 64 * 1024)
+            .await
+            .unwrap();
+        decisions.ensure_one_node().await.unwrap();
+        decisions
+            .wait_for_leader(Duration::from_secs(10))
+            .await
+            .unwrap();
+        ensure_genesis_identity(&decisions).await.unwrap();
+        assert_eq!(
+            decisions
+                .state()
+                .unwrap()
+                .cluster_control()
+                .jwt_signing_key_fingerprint(),
+            None,
+            "released 0.5.0 state has no JWT fingerprint"
+        );
+        ensure_jwt_signing_key_fingerprint(&decisions, expected)
+            .await
+            .unwrap();
+        decisions.shutdown().await.unwrap();
+        drop(decisions);
+
+        let decisions = DecisionRaft::open(temporary.path().join("decisions"), 1, 16, 64 * 1024)
+            .await
+            .unwrap();
+        decisions.ensure_one_node().await.unwrap();
+        decisions
+            .wait_for_leader(Duration::from_secs(10))
+            .await
+            .unwrap();
+        ensure_jwt_signing_key_fingerprint(&decisions, expected)
+            .await
+            .unwrap();
+        let error = ensure_jwt_signing_key_fingerprint(&decisions, mismatch)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("does not match the committed"));
+        assert_eq!(
+            decisions
+                .state()
+                .unwrap()
+                .cluster_control()
+                .jwt_signing_key_fingerprint(),
+            Some(expected)
+        );
         decisions.shutdown().await.unwrap();
     }
 

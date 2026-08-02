@@ -115,6 +115,11 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         .context("elect decision leader")?;
     let cluster_id = cluster_startup::ensure_genesis_identity(&decisions).await?;
     tracing::info!(cluster.id = %hex::encode(cluster_id.0), "cluster identity is ready");
+    cluster_startup::ensure_jwt_signing_key_fingerprint(
+        &decisions,
+        config.token_manager.signing_key_fingerprint(),
+    )
+    .await?;
     cluster_startup::ensure_erasure_code_profile(&decisions, config.erasure_profile).await?;
     tracing::info!(
         erasure.data_shards = config.erasure_profile.data_shards(),

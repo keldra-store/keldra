@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anvil_authz::ObjectRef;
+use anvil_consensus::JwtSigningKeyFingerprint;
 use anvil_store::StorageTenantId;
 use governor::clock::Clock;
 use governor::{DefaultDirectRateLimiter, DefaultKeyedRateLimiter, Quota, RateLimiter};
@@ -31,6 +32,7 @@ const ACCESS_TOKEN_AUDIENCE: &str = "anvil-access";
 const ACCESS_TOKEN_PURPOSE: &str = "access";
 const PUT_TOKEN_AUDIENCE: &str = "anvil-put";
 const PUT_TOKEN_PURPOSE: &str = "put";
+const JWT_SIGNING_KEY_FINGERPRINT_CONTEXT: &str = "anvil.auth/jwt-signing-key/v1";
 
 /// Identity established from trusted credentials for one request.
 ///
@@ -307,6 +309,7 @@ pub struct JwtManager {
     decoding_key: Arc<DecodingKey>,
     access_validation: Arc<Validation>,
     put_validation: Arc<Validation>,
+    signing_key_fingerprint: JwtSigningKeyFingerprint,
 }
 
 impl std::fmt::Debug for JwtManager {
@@ -369,7 +372,17 @@ impl JwtManager {
             decoding_key: Arc::new(DecodingKey::from_secret(signing_secret)),
             access_validation: Arc::new(token_validation(ACCESS_TOKEN_AUDIENCE)),
             put_validation: Arc::new(token_validation(PUT_TOKEN_AUDIENCE)),
+            signing_key_fingerprint: JwtSigningKeyFingerprint(blake3::derive_key(
+                JWT_SIGNING_KEY_FINGERPRINT_CONTEXT,
+                signing_secret,
+            )),
         })
+    }
+
+    /// Bounded, domain-separated identity of the operator-held HS256 key.
+    /// The secret itself is never retained in cluster control state.
+    pub(crate) fn signing_key_fingerprint(&self) -> JwtSigningKeyFingerprint {
+        self.signing_key_fingerprint
     }
 
     /// Mints a one-hour access token after durable credentials have already
@@ -758,6 +771,30 @@ mod tests {
             JwtManager::new([7_u8; 31]),
             Err(AuthenticationError::SigningSecretTooShort)
         ));
+    }
+
+    #[test]
+    fn signing_key_fingerprint_is_domain_separated_and_stable() {
+        let first = JwtManager::new(TEST_SIGNING_SECRET).unwrap();
+        let same = JwtManager::new(TEST_SIGNING_SECRET).unwrap();
+        let other = JwtManager::new(b"fedcba9876543210fedcba9876543210").unwrap();
+
+        assert_eq!(
+            first.signing_key_fingerprint(),
+            same.signing_key_fingerprint()
+        );
+        assert_ne!(
+            first.signing_key_fingerprint(),
+            other.signing_key_fingerprint()
+        );
+        assert_eq!(
+            first.signing_key_fingerprint(),
+            JwtSigningKeyFingerprint(blake3::derive_key(
+                "anvil.auth/jwt-signing-key/v1",
+                TEST_SIGNING_SECRET,
+            ))
+        );
+        assert_ne!(first.signing_key_fingerprint().0, [0; 32]);
     }
 
     #[cfg(unix)]
