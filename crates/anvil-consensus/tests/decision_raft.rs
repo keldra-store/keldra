@@ -642,13 +642,25 @@ async fn snapshot_retains_cluster_control_and_immutable_genesis_values() {
     })
     .await
     .unwrap();
-    assert_eq!(
-        raft.state()
+    let active_placement_log_id = raft
+        .state()
+        .unwrap()
+        .cluster_control()
+        .active_placement_log_id()
+        .unwrap();
+    assert_eq!(active_placement_log_id.index, activated.log_index);
+    assert!(active_placement_log_id.leader_id.term > 0);
+    let mut last_log_index = activated.log_index;
+    for _ in 0..80 {
+        last_log_index = raft
+            .submit(Command::InitializeCluster {
+                cluster_id: ClusterId([12; 16]),
+            })
+            .await
             .unwrap()
-            .cluster_control()
-            .active_placement_log_id(),
-        Some(activated.log_index)
-    );
+            .log_index;
+    }
+    assert!(last_log_index > active_placement_log_id.index + 64);
     raft.snapshot(Duration::from_secs(5)).await.unwrap();
     raft.shutdown().await.unwrap();
     drop(raft);
@@ -674,7 +686,16 @@ async fn snapshot_retains_cluster_control_and_immutable_genesis_values() {
     assert!(state.cluster_control().transition().is_none());
     assert_eq!(
         state.cluster_control().active_placement_log_id(),
-        Some(activated.log_index)
+        Some(active_placement_log_id)
+    );
+    let reopened_placement_log_id = state.cluster_control().active_placement_log_id().unwrap();
+    assert_eq!(
+        reopened_placement_log_id.leader_id.term,
+        active_placement_log_id.leader_id.term
+    );
+    assert_eq!(
+        reopened_placement_log_id.index,
+        active_placement_log_id.index
     );
     raft.shutdown().await.unwrap();
 }

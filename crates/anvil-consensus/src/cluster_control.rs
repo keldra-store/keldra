@@ -3,6 +3,8 @@
 //! Raft retains only node descriptors, one small transition, used node IDs,
 //! and the JWT-key fingerprint. Data movement and progress remain outside it.
 
+use openraft::LogId;
+
 use crate::{
     ApplyError, ApplyResult, CLUSTER_CONTROL_COMMAND_VERSION, CapabilityRange, ErasureCodeProfile,
     JoinCapabilityHash, JwtSigningKeyFingerprint, MAX_PEER_ADDRESS_BYTES, MembershipTransition,
@@ -146,7 +148,7 @@ impl StateMachine {
         &mut self,
         format_version: u16,
         started_log_index: u64,
-        committed_log_index: u64,
+        committed_log_id: LogId<u64>,
     ) -> Result<ApplyResult, ApplyError> {
         self.require_cluster_control(format_version)?;
         let transition = self
@@ -211,7 +213,7 @@ impl StateMachine {
             }
         };
         if active_placement_changed {
-            self.cluster_control.active_placement_log_id = Some(committed_log_index);
+            self.cluster_control.active_placement_log_id = Some(committed_log_id);
         }
         if finished {
             self.cluster_control.transition = None;

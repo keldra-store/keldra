@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use openraft::LogId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -229,15 +230,17 @@ impl StateMachine {
         self.finalized_through
     }
 
-    /// Apply a command at its committed Raft log index.
+    /// Apply a command at its exact committed Raft log identity.
     ///
-    /// The index supplies both executor nominations and batch commit cursors;
-    /// neither is independently allocated by Anvil.
+    /// The full identity fences active placement. Its index also supplies
+    /// executor nominations and batch commit cursors; none is independently
+    /// allocated by Anvil.
     pub fn apply(
         &mut self,
-        committed_log_index: u64,
+        committed_log_id: LogId<u64>,
         command: &Command,
     ) -> Result<ApplyResult, ApplyError> {
+        let committed_log_index = committed_log_id.index;
         match command {
             Command::NominateExecutor { executor } => {
                 self.nominate_executor(*executor, committed_log_index)
@@ -285,7 +288,7 @@ impl StateMachine {
             } => self.complete_membership_transition(
                 *format_version,
                 *started_log_index,
-                committed_log_index,
+                committed_log_id,
             ),
             Command::StagePeerSpkiOverlap {
                 format_version,

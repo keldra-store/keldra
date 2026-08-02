@@ -1,3 +1,4 @@
+use openraft::LogId;
 use serde::{Deserialize, Serialize};
 
 pub const ATOMIC_REPLAY_RETENTION_MILLIS: u64 = 24 * 60 * 60 * 1_000;
@@ -142,7 +143,7 @@ pub struct ClusterControlState {
     pub(crate) transition: Option<MembershipTransition>,
     pub(crate) jwt_signing_key_fingerprint: Option<JwtSigningKeyFingerprint>,
     pub(crate) erasure_code_profile: Option<ErasureCodeProfile>,
-    pub(crate) active_placement_log_id: Option<u64>,
+    pub(crate) active_placement_log_id: Option<LogId<u64>>,
 }
 
 impl ClusterControlState {
@@ -166,11 +167,11 @@ impl ClusterControlState {
         self.erasure_code_profile
     }
 
-    /// Committed Raft log index of the latest change to active placement.
+    /// Exact committed Raft log identity of the latest active-placement change.
     ///
     /// `None` is fail-closed legacy state: no placement generation may be
     /// inferred from a snapshot's unrelated last-applied log index.
-    pub fn active_placement_log_id(&self) -> Option<u64> {
+    pub fn active_placement_log_id(&self) -> Option<LogId<u64>> {
         self.active_placement_log_id
     }
 

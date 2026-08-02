@@ -11,6 +11,7 @@ mod peer;
 mod peer_tls;
 mod raft;
 mod raft_storage;
+mod serving_lease;
 mod state_machine;
 mod tonic_peer;
 mod types;
@@ -27,6 +28,11 @@ pub use peer_tls::{
 pub use raft::{
     CommittedDecision, DecisionRaft, DecisionRaftError, LEADER_QUORUM_PROOF_MAX_AGE,
     LeaderQuorumProof,
+};
+pub use serving_lease::{
+    PendingServingLeaseRequest, SERVING_LEASE_CUTOVER_WAIT, SERVING_LEASE_MAX_LIFETIME,
+    SERVING_LEASE_RENEW_INTERVAL, ServingLease, ServingLeaseError, ServingLeaseGrant,
+    ServingLeaseRequest, ServingLeaseState,
 };
 pub use state_machine::{ApplyError, StateMachine};
 pub use tonic_peer::{TonicPeerTransport, TonicRaftPeerServer, TonicRaftPeerService};

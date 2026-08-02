@@ -4,6 +4,11 @@ use anvil_consensus::{
     InvocationFingerprint, InvocationId, MAX_COMMITTED_INVOCATION_BYTES, MAX_COMMITTED_INVOCATIONS,
     NodeId, ProgramHash, ProgramPathHash, StateMachine,
 };
+use openraft::{CommittedLeaderId, LogId};
+
+fn log_id(index: u64) -> LogId<u64> {
+    LogId::new(CommittedLeaderId::new(1, 1), index)
+}
 
 fn node(node_id: u64) -> NodeId {
     NodeId(node_id)
@@ -56,7 +61,7 @@ fn batch(
 
 fn nominate(state: &mut StateMachine, log_index: u64, executor: NodeId) -> ExecutorNomination {
     let result = state
-        .apply(log_index, &Command::NominateExecutor { executor })
+        .apply(log_id(log_index), &Command::NominateExecutor { executor })
         .unwrap();
     let ApplyResult::ExecutorNominated(nomination) = result else {
         unreachable!()
@@ -69,7 +74,7 @@ fn commit(
     log_index: u64,
     batch: CommitBatch,
 ) -> Result<CommitResult, ApplyError> {
-    let result = state.apply(log_index, &Command::CommitBatch(batch))?;
+    let result = state.apply(log_id(log_index), &Command::CommitBatch(batch))?;
     let ApplyResult::BatchCommitted(result) = result else {
         unreachable!()
     };
@@ -105,7 +110,7 @@ fn cluster_identity_is_validated_and_initialized_exactly_once() {
     let mut state = StateMachine::new(8, 64 * 1024).unwrap();
     assert_eq!(
         state.apply(
-            1,
+            log_id(1),
             &Command::InitializeCluster {
                 cluster_id: cluster(0).into(),
             },
@@ -117,7 +122,7 @@ fn cluster_identity_is_validated_and_initialized_exactly_once() {
     assert_eq!(
         state
             .apply(
-                2,
+                log_id(2),
                 &Command::InitializeCluster {
                     cluster_id: identity.into(),
                 },
@@ -134,7 +139,7 @@ fn cluster_identity_is_validated_and_initialized_exactly_once() {
     assert_eq!(
         state
             .apply(
-                3,
+                log_id(3),
                 &Command::InitializeCluster {
                     cluster_id: identity.into(),
                 },
@@ -148,7 +153,7 @@ fn cluster_identity_is_validated_and_initialized_exactly_once() {
     let conflicting = cluster(8);
     assert_eq!(
         state.apply(
-            4,
+            log_id(4),
             &Command::InitializeCluster {
                 cluster_id: conflicting.into(),
             },
@@ -170,7 +175,7 @@ fn system_bootstrap_completion_is_fenced_versioned_and_idempotent() {
 
     assert_eq!(
         state.apply(
-            2,
+            log_id(2),
             &Command::CompleteSystemBootstrap {
                 executor: first_executor,
                 nomination_log_index: 1,
@@ -182,7 +187,7 @@ fn system_bootstrap_completion_is_fenced_versioned_and_idempotent() {
 
     state
         .apply(
-            3,
+            log_id(3),
             &Command::InitializeCluster {
                 cluster_id: cluster(9).into(),
             },
@@ -190,7 +195,7 @@ fn system_bootstrap_completion_is_fenced_versioned_and_idempotent() {
         .unwrap();
     assert_eq!(
         state.apply(
-            4,
+            log_id(4),
             &Command::CompleteSystemBootstrap {
                 executor: first_executor,
                 nomination_log_index: 1,
@@ -201,7 +206,7 @@ fn system_bootstrap_completion_is_fenced_versioned_and_idempotent() {
     );
     assert_eq!(
         state.apply(
-            5,
+            log_id(5),
             &Command::CompleteSystemBootstrap {
                 executor: first_executor,
                 nomination_log_index: 2,
@@ -216,7 +221,7 @@ fn system_bootstrap_completion_is_fenced_versioned_and_idempotent() {
 
     let completed = state
         .apply(
-            6,
+            log_id(6),
             &Command::CompleteSystemBootstrap {
                 executor: first_executor,
                 nomination_log_index: 1,
@@ -234,7 +239,7 @@ fn system_bootstrap_completion_is_fenced_versioned_and_idempotent() {
     nominate(&mut state, 7, next_executor);
     let replayed = state
         .apply(
-            8,
+            log_id(8),
             &Command::CompleteSystemBootstrap {
                 executor: next_executor,
                 nomination_log_index: 7,
@@ -250,7 +255,7 @@ fn system_bootstrap_completion_is_fenced_versioned_and_idempotent() {
 
     assert_eq!(
         state.apply(
-            9,
+            log_id(9),
             &Command::CompleteSystemBootstrap {
                 executor: next_executor,
                 nomination_log_index: 7,
@@ -278,12 +283,12 @@ fn nomination_uses_the_committed_log_index_as_its_only_fence() {
     assert_eq!(state.executor(), Some(replacement));
     assert_eq!(replacement.nomination_log_index, 19);
     assert_eq!(
-        state.apply(20, &Command::NominateExecutor { executor: node(0) }),
+        state.apply(log_id(20), &Command::NominateExecutor { executor: node(0) }),
         Err(ApplyError::InvalidNodeId)
     );
     assert_eq!(
         state.apply(
-            21,
+            log_id(21),
             &Command::NominateExecutor {
                 executor: node(1_024),
             },
@@ -438,7 +443,7 @@ fn finalized_through_frees_recovery_capacity_but_retains_replay() {
 
     let advanced = state
         .apply(
-            9,
+            log_id(9),
             &Command::FinalizedThrough {
                 executor,
                 nomination_log_index: 2,
@@ -478,7 +483,7 @@ fn next_commit_prunes_only_expired_finalized_replay_entries() {
     let first_expiry = first.invocation.replay_expires_at_unix_millis;
     state
         .apply(
-            6,
+            log_id(6),
             &Command::FinalizedThrough {
                 executor,
                 nomination_log_index: 2,
@@ -529,7 +534,7 @@ fn unexpired_committed_invocations_backpressure_at_the_fixed_entry_bound() {
         let committed = commit(&mut state, log_index, candidate).unwrap();
         state
             .apply(
-                log_index + 1,
+                log_id(log_index + 1),
                 &Command::FinalizedThrough {
                     executor,
                     nomination_log_index: 1,
@@ -589,7 +594,7 @@ fn finalization_is_monotonic_bounded_and_fenced() {
 
     assert_eq!(
         state.apply(
-            10,
+            log_id(10),
             &Command::FinalizedThrough {
                 executor,
                 nomination_log_index: 1,
@@ -603,7 +608,7 @@ fn finalization_is_monotonic_bounded_and_fenced() {
     );
     assert_eq!(
         state.apply(
-            11,
+            log_id(11),
             &Command::FinalizedThrough {
                 executor,
                 nomination_log_index: 2,
@@ -617,7 +622,7 @@ fn finalization_is_monotonic_bounded_and_fenced() {
     );
     state
         .apply(
-            12,
+            log_id(12),
             &Command::FinalizedThrough {
                 executor,
                 nomination_log_index: 2,
@@ -627,7 +632,7 @@ fn finalization_is_monotonic_bounded_and_fenced() {
         .unwrap();
     assert_eq!(
         state.apply(
-            13,
+            log_id(13),
             &Command::FinalizedThrough {
                 executor,
                 nomination_log_index: 2,

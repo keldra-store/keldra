@@ -3,11 +3,16 @@ use anvil_consensus::{
     ErasureCodeProfile, JoinCapabilityHash, JwtSigningKeyFingerprint, MembershipTransitionKind,
     NodeDescriptor, NodeId, NodeState, PeerAddress, PeerSpkiSha256, StateMachine,
 };
+use openraft::{CommittedLeaderId, LogId};
+
+fn log_id(index: u64) -> LogId<u64> {
+    LogId::new(CommittedLeaderId::new(7, 3), index)
+}
 
 fn initialize(state: &mut StateMachine) {
     state
         .apply(
-            1,
+            log_id(1),
             &Command::InitializeCluster {
                 cluster_id: ClusterId([1; 16]),
             },
@@ -32,7 +37,7 @@ fn joining(node_id: u64) -> NodeDescriptor {
 fn begin_add(state: &mut StateMachine, log_index: u64, descriptor: NodeDescriptor) {
     let result = state
         .apply(
-            log_index,
+            log_id(log_index),
             &Command::BeginAddNode {
                 format_version: CLUSTER_CONTROL_COMMAND_VERSION,
                 descriptor: descriptor.clone(),
@@ -55,7 +60,7 @@ fn complete(state: &mut StateMachine, log_index: u64, started_log_index: u64) {
     assert_eq!(
         state
             .apply(
-                log_index,
+                log_id(log_index),
                 &Command::CompleteMembershipTransition {
                     format_version: CLUSTER_CONTROL_COMMAND_VERSION,
                     started_log_index,
@@ -70,7 +75,7 @@ fn admit(state: &mut StateMachine, begin_log: u64, node_id: u64) {
     begin_add(state, begin_log, joining(node_id));
     let transition = state
         .apply(
-            begin_log + 1,
+            log_id(begin_log + 1),
             &Command::CompleteMembershipTransition {
                 format_version: CLUSTER_CONTROL_COMMAND_VERSION,
                 started_log_index: begin_log,
@@ -97,7 +102,7 @@ fn add_is_bounded_fenced_and_sets_the_fixed_voter_target() {
     assert_eq!(cluster.nodes()[&NodeId(1)].state, NodeState::Joining);
     assert_eq!(
         state.apply(
-            3,
+            log_id(3),
             &Command::CompleteMembershipTransition {
                 format_version: CLUSTER_CONTROL_COMMAND_VERSION,
                 started_log_index: 99,
@@ -111,7 +116,7 @@ fn add_is_bounded_fenced_and_sets_the_fixed_voter_target() {
     assert!(matches!(
         state
             .apply(
-                4,
+                log_id(4),
                 &Command::CompleteMembershipTransition {
                     format_version: CLUSTER_CONTROL_COMMAND_VERSION,
                     started_log_index: 2,
@@ -147,7 +152,7 @@ fn active_placement_log_id_changes_only_with_active_placement() {
     assert_eq!(state.cluster_control().active_placement_log_id(), None);
     let replay = state
         .apply(
-            3,
+            log_id(3),
             &Command::BeginAddNode {
                 format_version: CLUSTER_CONTROL_COMMAND_VERSION,
                 descriptor: first,
@@ -164,7 +169,7 @@ fn active_placement_log_id_changes_only_with_active_placement() {
     assert!(matches!(
         state
             .apply(
-                4,
+                log_id(4),
                 &Command::CompleteMembershipTransition {
                     format_version: CLUSTER_CONTROL_COMMAND_VERSION,
                     started_log_index: 2,
@@ -173,44 +178,68 @@ fn active_placement_log_id_changes_only_with_active_placement() {
             .unwrap(),
         ApplyResult::MembershipTransitionAdvanced(_)
     ));
-    assert_eq!(state.cluster_control().active_placement_log_id(), Some(4));
+    assert_eq!(
+        state.cluster_control().active_placement_log_id(),
+        Some(log_id(4))
+    );
     complete(&mut state, 5, 2);
-    assert_eq!(state.cluster_control().active_placement_log_id(), Some(4));
+    assert_eq!(
+        state.cluster_control().active_placement_log_id(),
+        Some(log_id(4))
+    );
 
     begin_add(&mut state, 10, joining(2));
     state
         .apply(
-            11,
+            log_id(11),
             &Command::CompleteMembershipTransition {
                 format_version: CLUSTER_CONTROL_COMMAND_VERSION,
                 started_log_index: 10,
             },
         )
         .unwrap();
-    assert_eq!(state.cluster_control().active_placement_log_id(), Some(11));
+    assert_eq!(
+        state.cluster_control().active_placement_log_id(),
+        Some(log_id(11))
+    );
     complete(&mut state, 12, 10);
-    assert_eq!(state.cluster_control().active_placement_log_id(), Some(11));
+    assert_eq!(
+        state.cluster_control().active_placement_log_id(),
+        Some(log_id(11))
+    );
 
     let reweight = Command::BeginReweightNode {
         format_version: CLUSTER_CONTROL_COMMAND_VERSION,
         node_id: NodeId(1),
         storage_weight_millionths: 2_000_000,
     };
-    state.apply(20, &reweight).unwrap();
-    state.apply(21, &reweight).unwrap();
-    assert_eq!(state.cluster_control().active_placement_log_id(), Some(11));
+    state.apply(log_id(20), &reweight).unwrap();
+    state.apply(log_id(21), &reweight).unwrap();
+    assert_eq!(
+        state.cluster_control().active_placement_log_id(),
+        Some(log_id(11))
+    );
     complete(&mut state, 22, 20);
-    assert_eq!(state.cluster_control().active_placement_log_id(), Some(22));
+    assert_eq!(
+        state.cluster_control().active_placement_log_id(),
+        Some(log_id(22))
+    );
 
     let remove = Command::BeginRemoveNode {
         format_version: CLUSTER_CONTROL_COMMAND_VERSION,
         node_id: NodeId(1),
     };
-    state.apply(30, &remove).unwrap();
-    state.apply(31, &remove).unwrap();
-    assert_eq!(state.cluster_control().active_placement_log_id(), Some(22));
+    state.apply(log_id(30), &remove).unwrap();
+    state.apply(log_id(31), &remove).unwrap();
+    assert_eq!(
+        state.cluster_control().active_placement_log_id(),
+        Some(log_id(22))
+    );
     complete(&mut state, 32, 30);
-    assert_eq!(state.cluster_control().active_placement_log_id(), Some(32));
+    assert_eq!(
+        state.cluster_control().active_placement_log_id(),
+        Some(log_id(32))
+    );
 }
 
 #[test]
@@ -222,7 +251,7 @@ fn one_compact_transition_serializes_add_remove_and_reweight() {
 
     let begin = state
         .apply(
-            30,
+            log_id(30),
             &Command::BeginReweightNode {
                 format_version: CLUSTER_CONTROL_COMMAND_VERSION,
                 node_id: NodeId(1),
@@ -237,7 +266,7 @@ fn one_compact_transition_serializes_add_remove_and_reweight() {
     assert_eq!(reweight.target_weight_millionths, Some(2_000_000));
     assert!(matches!(
         state.apply(
-            31,
+            log_id(31),
             &Command::BeginRemoveNode {
                 format_version: CLUSTER_CONTROL_COMMAND_VERSION,
                 node_id: NodeId(2),
@@ -255,7 +284,7 @@ fn one_compact_transition_serializes_add_remove_and_reweight() {
 
     state
         .apply(
-            40,
+            log_id(40),
             &Command::BeginRemoveNode {
                 format_version: CLUSTER_CONTROL_COMMAND_VERSION,
                 node_id: NodeId(1),
@@ -267,7 +296,7 @@ fn one_compact_transition_serializes_add_remove_and_reweight() {
     assert!(state.cluster_control().used_node_ids().contains(NodeId(1)));
     assert_eq!(
         state.apply(
-            42,
+            log_id(42),
             &Command::BeginAddNode {
                 format_version: CLUSTER_CONTROL_COMMAND_VERSION,
                 descriptor: joining(1),
@@ -288,7 +317,7 @@ fn peer_pin_rotation_uses_exactly_current_and_overlap_slots() {
     for log_index in [4, 5] {
         state
             .apply(
-                log_index,
+                log_id(log_index),
                 &Command::StagePeerSpkiOverlap {
                     format_version: CLUSTER_CONTROL_COMMAND_VERSION,
                     node_id: NodeId(1),
@@ -305,7 +334,7 @@ fn peer_pin_rotation_uses_exactly_current_and_overlap_slots() {
     for log_index in [6, 7] {
         state
             .apply(
-                log_index,
+                log_id(log_index),
                 &Command::PromotePeerSpkiOverlap {
                     format_version: CLUSTER_CONTROL_COMMAND_VERSION,
                     node_id: NodeId(1),
@@ -322,7 +351,7 @@ fn peer_pin_rotation_uses_exactly_current_and_overlap_slots() {
     for log_index in [8, 9] {
         state
             .apply(
-                log_index,
+                log_id(log_index),
                 &Command::ClearPeerSpkiOverlap {
                     format_version: CLUSTER_CONTROL_COMMAND_VERSION,
                     node_id: NodeId(1),
@@ -349,7 +378,7 @@ fn jwt_fingerprint_binds_once_and_exact_retry_is_idempotent() {
     };
     for log_index in [2, 3] {
         assert_eq!(
-            state.apply(log_index, &command).unwrap(),
+            state.apply(log_id(log_index), &command).unwrap(),
             ApplyResult::JwtSigningKeyFingerprintBound(fingerprint)
         );
     }
@@ -359,7 +388,7 @@ fn jwt_fingerprint_binds_once_and_exact_retry_is_idempotent() {
     );
     assert!(matches!(
         state.apply(
-            4,
+            log_id(4),
             &Command::BindJwtSigningKeyFingerprint {
                 format_version: CLUSTER_CONTROL_COMMAND_VERSION,
                 fingerprint: JwtSigningKeyFingerprint([9; 32]),
@@ -384,7 +413,7 @@ fn erasure_profile_binds_once_without_a_registry() {
     };
     for log_index in [2, 3] {
         assert_eq!(
-            state.apply(log_index, &command).unwrap(),
+            state.apply(log_id(log_index), &command).unwrap(),
             ApplyResult::ErasureCodeProfileBound(profile)
         );
     }
@@ -394,7 +423,7 @@ fn erasure_profile_binds_once_without_a_registry() {
     );
     assert_eq!(
         state.apply(
-            4,
+            log_id(4),
             &Command::BindErasureCodeProfile {
                 format_version: CLUSTER_CONTROL_COMMAND_VERSION,
                 profile: ErasureCodeProfile {
@@ -407,7 +436,7 @@ fn erasure_profile_binds_once_without_a_registry() {
     );
     assert!(matches!(
         state.apply(
-            5,
+            log_id(5),
             &Command::BindErasureCodeProfile {
                 format_version: CLUSTER_CONTROL_COMMAND_VERSION,
                 profile: ErasureCodeProfile {
@@ -428,7 +457,7 @@ fn malformed_or_unversioned_admission_fails_closed() {
     let descriptor = joining(1);
     assert_eq!(
         state.apply(
-            2,
+            log_id(2),
             &Command::BeginAddNode {
                 format_version: CLUSTER_CONTROL_COMMAND_VERSION + 1,
                 descriptor: descriptor.clone(),
@@ -443,7 +472,7 @@ fn malformed_or_unversioned_admission_fails_closed() {
     invalid.peer_address = PeerAddress("x".repeat(256));
     assert_eq!(
         state.apply(
-            3,
+            log_id(3),
             &Command::BeginAddNode {
                 format_version: CLUSTER_CONTROL_COMMAND_VERSION,
                 descriptor: invalid,

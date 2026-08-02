@@ -409,6 +409,10 @@ fn quorum_proof_now() -> Result<QuorumProofInstant, DecisionRaftError> {
     Ok(QuorumProofInstant(Duration::new(seconds, nanoseconds)))
 }
 
+pub(crate) fn boot_time_now() -> Result<Duration, DecisionRaftError> {
+    quorum_proof_now().map(|instant| instant.0)
+}
+
 #[cfg(not(target_os = "linux"))]
 fn quorum_proof_now() -> Result<QuorumProofInstant, DecisionRaftError> {
     Err(DecisionRaftError::Unavailable(
@@ -998,7 +1002,7 @@ fn apply_entry(
         }
         EntryPayload::Normal(command) => {
             match validate_membership_command(&state.membership, &state.decisions, command)
-                .and_then(|()| state.decisions.apply(entry.log_id.index, command))
+                .and_then(|()| state.decisions.apply(entry.log_id, command))
             {
                 Ok(result) => DecisionApplyResult::Applied(result),
                 Err(error) => DecisionApplyResult::Rejected(error),
@@ -1321,10 +1325,19 @@ mod snapshot_compatibility_tests {
         );
 
         let mut current = MachineState::new(config).unwrap();
-        current.decisions.cluster_control.active_placement_log_id = Some(41);
+        current.decisions.cluster_control.active_placement_log_id =
+            Some(LogId::new(openraft::CommittedLeaderId::new(9, 3), 41));
         let current_record =
             codec::encode_record_at_version(&current, codec::SNAPSHOT_RECORD_FORMAT_V3).unwrap();
-        assert_eq!(decode_machine_snapshot(&current_record).unwrap(), current);
+        let decoded = decode_machine_snapshot(&current_record).unwrap();
+        assert_eq!(decoded, current);
+        let placement = decoded
+            .decisions
+            .cluster_control()
+            .active_placement_log_id()
+            .unwrap();
+        assert_eq!(placement.leader_id.term, 9);
+        assert_eq!(placement.index, 41);
 
         let unsupported =
             codec::encode_record_at_version(&current, codec::SNAPSHOT_RECORD_FORMAT_V3 + 1)
@@ -1354,7 +1367,7 @@ mod snapshot_compatibility_tests {
         state
             .decisions
             .apply(
-                0,
+                LogId::new(openraft::CommittedLeaderId::new(1, 1), 0),
                 &Command::InitializeCluster {
                     cluster_id: crate::ClusterId([1; 16]),
                 },
@@ -1363,7 +1376,7 @@ mod snapshot_compatibility_tests {
         state
             .decisions
             .apply(
-                1,
+                LogId::new(openraft::CommittedLeaderId::new(1, 1), 1),
                 &Command::BeginAddNode {
                     format_version: crate::CLUSTER_CONTROL_COMMAND_VERSION,
                     descriptor: crate::NodeDescriptor {
@@ -1384,7 +1397,7 @@ mod snapshot_compatibility_tests {
             state
                 .decisions
                 .apply(
-                    log_index,
+                    LogId::new(openraft::CommittedLeaderId::new(1, 1), log_index),
                     &Command::CompleteMembershipTransition {
                         format_version: crate::CLUSTER_CONTROL_COMMAND_VERSION,
                         started_log_index: 1,
