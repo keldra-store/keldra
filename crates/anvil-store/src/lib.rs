@@ -12,6 +12,7 @@ mod erasure;
 mod key;
 mod model;
 mod program;
+mod reference_delta;
 mod store;
 mod watch;
 
@@ -47,6 +48,9 @@ pub use program::{
     PreparedProgramBundle, ProgramCommit, ProgramDurabilityClassHash, ProgramDurabilityEvidence,
     ProgramDurabilityEvidenceHash, ProgramDurabilityScope, ProgramExecutionLease, ProgramHash,
     ProgramStoreError, PublishedProgramVersion, StoreProgramEngine, VerifiedProgramDefinition,
+};
+pub use reference_delta::{
+    ReferenceDelta, ReferenceDeltaApplied, ReferenceDeltaBatch, ReferenceDeltaError,
 };
 pub use store::{
     BatchGetSelection, DEFAULT_AWAITING_PUBLISH_TTL_SECONDS, DEFAULT_MUTATION_RECEIPT_MAX_BYTES,

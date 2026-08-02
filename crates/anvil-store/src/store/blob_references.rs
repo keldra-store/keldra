@@ -460,7 +460,7 @@ impl Store {
         Ok(())
     }
 
-    fn read_blob_reference_state(
+    pub(super) fn read_blob_reference_state(
         &self,
         key: &[u8],
     ) -> Result<Option<BlobReferenceState>, MutationError> {

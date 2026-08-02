@@ -140,7 +140,7 @@ pub struct WatchPage {
 }
 
 /// Stable identity for one node-local source journal incarnation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SourceId {
     pub node_id: u16,
     pub source_epoch: [u8; 32],

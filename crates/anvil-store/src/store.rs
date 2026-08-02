@@ -689,6 +689,7 @@ impl Store {
 
 mod blob_references;
 mod mutations;
+mod reference_deltas;
 mod reads;
 mod watch_journal;
 
