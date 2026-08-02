@@ -716,6 +716,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tenant_provisioning_rejects_noncanonical_spelling_without_claiming_an_alias() {
+        let (_directory, _store, service) = service().await;
+        let rejected = service
+            .provision_tenant(authenticated(
+                StorageTenantId::system(),
+                "bootstrap-app",
+                api::ProvisionTenantRequest {
+                    storage_tenant: "Acme".into(),
+                    owner_app_id: "owner".into(),
+                    owner_client_id: "owner-client".into(),
+                    owner_client_secret: SECRET.into(),
+                },
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(rejected.code(), tonic::Code::InvalidArgument);
+
+        let canonical = service
+            .provision_tenant(authenticated(
+                StorageTenantId::system(),
+                "bootstrap-app",
+                api::ProvisionTenantRequest {
+                    storage_tenant: "acme".into(),
+                    owner_app_id: "owner".into(),
+                    owner_client_id: "owner-client".into(),
+                    owner_client_secret: SECRET.into(),
+                },
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(canonical.credential.unwrap().storage_tenant, "acme");
+        assert!(!canonical.replayed);
+    }
+
+    #[tokio::test]
     async fn requests_without_identity_and_unprivileged_apps_fail_closed() {
         let (_directory, _store, service) = service().await;
         let missing = service

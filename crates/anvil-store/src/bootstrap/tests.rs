@@ -4,7 +4,7 @@ use tempfile::TempDir;
 
 use super::*;
 use crate::store::CF_BUCKET_OPTIONS;
-use crate::{AuthzConsistency, AuthzRevision, AuthzScope, StoreOptions};
+use crate::{AuthzConsistency, AuthzRevision, AuthzScope, SYSTEM_STORAGE_TENANT_ID, StoreOptions};
 
 const SECRET: &str = "secret-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -218,6 +218,62 @@ async fn tenant_provisioning_commits_owner_credential_marker_and_tuple_together(
             .unwrap(),
         AuthzRevision(4)
     );
+}
+
+#[tokio::test]
+async fn protected_system_tenant_cannot_be_provisioned_as_an_external_tenant() {
+    let (_directory, store) = store().await;
+    store
+        .bootstrap_system(request("bootstrap-app", "bootstrap-client"))
+        .unwrap();
+
+    assert!(matches!(
+        store.provision_tenant(provision_request(
+            SYSTEM_STORAGE_TENANT_ID,
+            "other-owner",
+            "other-client",
+            3,
+        )),
+        Err(CredentialRepositoryError::InvalidInput(message))
+            if message.contains("protected system tenant")
+    ));
+    assert!(store.credential("other-client").unwrap().is_none());
+}
+
+#[tokio::test]
+async fn retained_tenant_name_claim_prevents_reassignment_to_a_new_stable_tenant() {
+    let (_directory, store) = store().await;
+    store
+        .bootstrap_system(request("bootstrap-app", "bootstrap-client"))
+        .unwrap();
+    store
+        .provision_tenant(provision_request("acme", "owner-app", "owner-client", 3))
+        .unwrap();
+    let original_id = store.tenant_id_by_name("acme").unwrap().unwrap();
+
+    // Tenant release is not a 0.5.1 API. Model its only safe future storage
+    // shape: the name claim remains mapped to the original stable ID even if
+    // the live tenant record is absent or later replaced by a tombstone.
+    store
+        .db
+        .delete_cf(
+            store.cf(CF_METADATA).unwrap(),
+            tenant_record_key(original_id),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        store.provision_tenant(provision_request(
+            "acme",
+            "replacement-owner",
+            "replacement-client",
+            4,
+        )),
+        Err(CredentialRepositoryError::Storage(message))
+            if message.contains("missing stable-ID record")
+    ));
+    assert_eq!(store.tenant_id_by_name("acme").unwrap(), Some(original_id));
+    assert!(store.credential("replacement-client").unwrap().is_none());
 }
 
 #[tokio::test]

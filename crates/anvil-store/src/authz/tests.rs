@@ -747,3 +747,44 @@ fn ids_and_current_only_exact_consistency_are_deliberately_narrow() {
     assert_ne!(latest, at_least);
     assert_ne!(at_least, exact);
 }
+
+#[test]
+fn external_storage_tenants_are_exact_lowercase_ascii_dns_labels() {
+    for valid in ["a", "0", "acme", "acme-2"] {
+        let tenant = StorageTenantId::parse(valid).unwrap();
+        assert_eq!(tenant.as_str(), valid);
+    }
+    let boundary = "a".repeat(MAX_EXTERNAL_STORAGE_TENANT_BYTES);
+    let parsed_boundary = StorageTenantId::parse(boundary.as_str()).unwrap();
+    assert_eq!(parsed_boundary.as_str(), boundary.as_str());
+
+    for invalid in [
+        "",
+        "Acme",
+        "ACME",
+        "-acme",
+        "acme-",
+        "acme_example",
+        "acme.example",
+        "acmé",
+    ] {
+        assert!(
+            StorageTenantId::parse(invalid).is_err(),
+            "{invalid:?} must be rejected rather than normalized"
+        );
+    }
+    assert!(StorageTenantId::parse("a".repeat(MAX_EXTERNAL_STORAGE_TENANT_BYTES + 1)).is_err());
+}
+
+#[test]
+fn protected_system_storage_tenant_remains_representable_but_reserved() {
+    let parsed = StorageTenantId::parse(SYSTEM_STORAGE_TENANT_ID).unwrap();
+    assert_eq!(parsed, StorageTenantId::system());
+    assert!(parsed.is_system());
+
+    let encoded = serde_json::to_vec(&parsed).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<StorageTenantId>(&encoded).unwrap(),
+        parsed
+    );
+}

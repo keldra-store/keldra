@@ -511,6 +511,10 @@ message AccessToken {
 // application's credential in one durable metadata write. Only a caller with
 // system#manage_system may perform this operation.
 message ProvisionTenantRequest {
+  // Exact lowercase ASCII DNS label (1..63 bytes). The server rejects rather
+  // than normalizes other spellings. `_anvil` is reserved for Anvil's
+  // protected system tenant. Once claimed, a name remains bound to its first
+  // stable tenant identity even after any future tenant release.
   string storage_tenant = 1;
   string owner_app_id = 2;
   string owner_client_id = 3;

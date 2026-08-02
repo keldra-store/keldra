@@ -4,6 +4,8 @@ use anvil_atomic_program::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::authz::StorageTenantId;
+
 /// Persisted object-key encoding. The first byte of every identity-derived key
 /// makes later, explicit format migrations possible without guessing how an
 /// existing key was encoded.
@@ -123,9 +125,9 @@ impl ObjectKey {
         if self.path.len() > MAX_OBJECT_PATH_BYTES {
             return Err(ObjectKeyError::TooLong("path"));
         }
-        if [&self.tenant, &self.bucket]
-            .iter()
-            .any(|component| component.contains('/') || component.chars().any(char::is_control))
+        if StorageTenantId::parse(self.tenant.as_str()).is_err()
+            || self.bucket.contains('/')
+            || self.bucket.chars().any(char::is_control)
         {
             return Err(ObjectKeyError::NonCanonicalComponent);
         }
@@ -147,6 +149,8 @@ pub(crate) fn contains_reserved_anvil_segment(path: &str) -> bool {
     path.split('/').any(|segment| segment == "_anvil")
 }
 
+/// Permanent name claim. Its value is the first stable tenant ID assigned to
+/// `name`; tenant release must retain this key rather than make it assignable.
 pub(crate) fn tenant_name_key(name: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(2 + name.len());
     key.extend_from_slice(&[STORAGE_KEY_FORMAT_VERSION, TENANT_NAME_TYPE]);
@@ -247,6 +251,14 @@ mod tests {
             ObjectKey::new("other/tenant", "b", "a").unwrap_err(),
             ObjectKeyError::NonCanonicalComponent
         );
+        for tenant in ["Acme", "-acme", "acme-", "acme_example", "acmé"] {
+            assert_eq!(
+                ObjectKey::new(tenant, "b", "a").unwrap_err(),
+                ObjectKeyError::NonCanonicalComponent
+            );
+        }
+        assert!(ObjectKey::new("acme-2", "b", "a").is_ok());
+        assert!(ObjectKey::new(crate::SYSTEM_STORAGE_TENANT_ID, "b", "a").is_ok());
         assert_eq!(
             ObjectKey::new("t", "bad\nbucket", "a").unwrap_err(),
             ObjectKeyError::NonCanonicalComponent

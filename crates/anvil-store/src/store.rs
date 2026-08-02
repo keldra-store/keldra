@@ -27,8 +27,8 @@ use crate::{
     AWAITING_PUBLISH, BatchOperation, BatchOutcome, BlobReader, BlobRef, BlobReferenceState,
     BlobStore, BucketPolicy, DeleteRequest, DeleteRetainedVersionOutcome, Durability, Head,
     MutationError, MutationReceipt, Object, ObjectKey, ObjectVersioning, Precondition,
-    PublishRequest, PutMode, PutRequest, ReferenceDelta, SMALL_BLOB_MAX_BYTES, Version,
-    VersionClock, VersionId,
+    PublishRequest, PutMode, PutRequest, ReferenceDelta, SMALL_BLOB_MAX_BYTES, StorageTenantId,
+    Version, VersionClock, VersionId,
 };
 
 const PROGRAM_DEFINITION_PREFIX: &str = "_anvil/programs/";
@@ -454,6 +454,8 @@ impl Store {
         &self,
         tenant: &str,
     ) -> Result<Option<TenantId>, MutationError> {
+        StorageTenantId::parse(tenant)
+            .map_err(|error| MutationError::Storage(error.to_string()))?;
         self.db
             .get_cf(self.cf(CF_NAMES)?, tenant_name_key(tenant))
             .map_err(storage_error)?

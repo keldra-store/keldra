@@ -20,6 +20,7 @@ pub const SYSTEM_STORAGE_TENANT_ID: &str = "_anvil";
 pub const DEFAULT_AUTHZ_RECEIPT_RETENTION_SECONDS: u64 = 24 * 60 * 60;
 pub const DEFAULT_AUTHZ_RECEIPT_MAX_ENTRIES: usize = 4_096;
 pub const DEFAULT_AUTHZ_RECEIPT_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_EXTERNAL_STORAGE_TENANT_BYTES: usize = 63;
 const MAX_ID_BYTES: usize = 256;
 const MAX_OPERATION_ID_BYTES: usize = 128;
 
@@ -30,7 +31,7 @@ pub struct StorageTenantId(String);
 impl StorageTenantId {
     pub fn parse(value: impl Into<String>) -> Result<Self, AuthzStoreError> {
         let value = value.into();
-        validate_safe_component(&value, "storage tenant", MAX_ID_BYTES)?;
+        validate_storage_tenant(&value)?;
         Ok(Self(value))
     }
 
@@ -47,7 +48,7 @@ impl StorageTenantId {
     }
 
     fn validate(&self) -> Result<(), AuthzStoreError> {
-        validate_safe_component(self.as_str(), "storage tenant", MAX_ID_BYTES)
+        validate_storage_tenant(self.as_str())
     }
 }
 
@@ -1430,6 +1431,27 @@ fn validate_safe_component(
     {
         return Err(AuthzStoreError::InvalidInput(format!(
             "{label} must be one canonical component"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_storage_tenant(value: &str) -> Result<(), AuthzStoreError> {
+    if value == SYSTEM_STORAGE_TENANT_ID {
+        return Ok(());
+    }
+    let bytes = value.as_bytes();
+    let is_ascii_alphanumeric = |byte: &u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+    if bytes.is_empty()
+        || bytes.len() > MAX_EXTERNAL_STORAGE_TENANT_BYTES
+        || !bytes.first().is_some_and(is_ascii_alphanumeric)
+        || !bytes.last().is_some_and(is_ascii_alphanumeric)
+        || bytes
+            .iter()
+            .any(|byte| !is_ascii_alphanumeric(byte) && *byte != b'-')
+    {
+        return Err(AuthzStoreError::InvalidInput(format!(
+            "storage tenant must be a lowercase ASCII DNS label of at most {MAX_EXTERNAL_STORAGE_TENANT_BYTES} bytes"
         )));
     }
     Ok(())
