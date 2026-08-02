@@ -252,7 +252,7 @@ The following rules are fixed:
 - a membership operation uses one exact old and one exact proposed active set.
 
 The placement calculation is an integer protocol. A weight is a positive
-integer number of millionths, where `1_000_000` means `1.0`. For node `n`,
+`u32` number of millionths, where `1_000_000` means `1.0`. For node `n`,
 BLAKE3 derive-key mode uses context `anvil.storage/weighted-hrw/v1` and hashes
 this exact tuple:
 
@@ -270,6 +270,33 @@ Interpreting the first eight digest bytes as an unsigned big-endian integer
 one least-significant bit so the denominator is never zero. Multiplying every
 denominator by the constant `ln(2)` would leave the ranking unchanged, so this
 is exactly equivalent to the natural-log formula above.
+
+The binary-log calculation is fully integer and rounds the final denominator
+down:
+
+```text
+n = 2r + 1
+b = bit_length(n)
+integer = 66 - b
+z = n << (127 - b)                 # Q2.126 value in [1, 2)
+fraction = 0
+
+for output_bit = 63 down to 0:
+    square = z * z                 # exact 256-bit product
+    if square >= 2^253:
+        z = floor(square / 2^127)
+        fraction |= 1 << output_bit
+    else:
+        z = floor(square / 2^126)
+
+rounded_up = (integer << 64) - fraction
+denominator = rounded_up           if n == 1
+              max(1, rounded_up-1) otherwise
+```
+
+The final one-bit subtraction converts the truncated fractional logarithm's
+ceiling into a floor. An odd `n` other than one cannot be a power of two, so it
+always has a non-zero discarded remainder.
 
 Two scores `weight_a / denominator_a` and `weight_b / denominator_b` are
 compared by `u128` cross multiplication. No division, platform floating point,
