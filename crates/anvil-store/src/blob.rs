@@ -14,6 +14,21 @@ pub struct BlobRef {
     pub length: u64,
 }
 
+/// The only durable lifecycle metadata kept for one sealed blob.
+///
+/// Timestamps are Unix milliseconds. A set [`AWAITING_PUBLISH`] bit means the
+/// initial reference is a sealed-upload reservation rather than a published
+/// immutable version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlobReferenceState {
+    pub ref_count: u64,
+    pub flags: u8,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
+pub const AWAITING_PUBLISH: u8 = 1;
+
 #[derive(Clone, Debug)]
 pub struct BlobStore {
     root: PathBuf,
@@ -33,11 +48,16 @@ pub struct BlobUpload {
 /// this reader. Reads hash the file again so an unexpected mutation of a
 /// published blob is still detected while it is being consumed.
 pub struct BlobReader {
-    file: tokio::fs::File,
+    source: BlobReaderSource,
     reference: BlobRef,
     hasher: blake3::Hasher,
     position: u64,
     finished: bool,
+}
+
+enum BlobReaderSource {
+    File(tokio::fs::File),
+    Memory(Vec<u8>),
 }
 
 impl BlobStore {
@@ -112,7 +132,7 @@ impl BlobStore {
         }
         file.seek(std::io::SeekFrom::Start(0)).await?;
         Ok(BlobReader {
-            file,
+            source: BlobReaderSource::File(file),
             reference: reference.clone(),
             hasher: blake3::Hasher::new(),
             position: 0,
@@ -128,6 +148,22 @@ impl BlobStore {
         }
     }
 
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub(crate) fn remove(&self, reference: &BlobRef) -> Result<()> {
+        let path = self.path(&reference.hash);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let parent = path.parent().context("blob path has no parent")?;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    }
+
     fn path(&self, hash: &[u8; 32]) -> PathBuf {
         let encoded = hex::encode(hash);
         self.root.join(&encoded[..2]).join(encoded)
@@ -135,6 +171,21 @@ impl BlobStore {
 }
 
 impl BlobReader {
+    pub(crate) fn from_bytes(reference: &BlobRef, bytes: Vec<u8>) -> Result<Self> {
+        if bytes.len() as u64 != reference.length
+            || blake3::hash(&bytes).as_bytes() != &reference.hash
+        {
+            bail!("blob failed length or hash verification");
+        }
+        Ok(Self {
+            source: BlobReaderSource::Memory(bytes),
+            reference: reference.clone(),
+            hasher: blake3::Hasher::new(),
+            position: 0,
+            finished: false,
+        })
+    }
+
     /// Reads at most `buffer.len()` verified blob bytes.
     ///
     /// A return value of zero means the complete blob has been read. The
@@ -159,7 +210,17 @@ impl BlobReader {
 
         let read = usize::try_from(remaining.min(buffer.len() as u64))
             .context("blob chunk length does not fit in memory")?;
-        self.file.read_exact(&mut buffer[..read]).await?;
+        match &mut self.source {
+            BlobReaderSource::File(file) => {
+                file.read_exact(&mut buffer[..read]).await?;
+            }
+            BlobReaderSource::Memory(bytes) => {
+                let start = usize::try_from(self.position)
+                    .context("blob position does not fit in memory")?;
+                let end = start.checked_add(read).context("blob position overflow")?;
+                buffer[..read].copy_from_slice(&bytes[start..end]);
+            }
+        }
         self.hasher.update(&buffer[..read]);
         self.position += read as u64;
         if self.position == self.reference.length {
@@ -169,10 +230,14 @@ impl BlobReader {
     }
 
     async fn finish(&mut self) -> Result<()> {
-        let mut trailing = [0_u8; 1];
-        if self.file.read(&mut trailing).await? != 0
-            || self.hasher.finalize().as_bytes() != &self.reference.hash
-        {
+        let trailing = match &mut self.source {
+            BlobReaderSource::File(file) => {
+                let mut trailing = [0_u8; 1];
+                file.read(&mut trailing).await? != 0
+            }
+            BlobReaderSource::Memory(bytes) => bytes.len() as u64 != self.reference.length,
+        };
+        if trailing || self.hasher.finalize().as_bytes() != &self.reference.hash {
             bail!("blob changed after verification");
         }
         self.finished = true;

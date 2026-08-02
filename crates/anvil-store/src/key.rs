@@ -4,6 +4,53 @@ use anvil_atomic_program::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// Persisted object-key encoding. The first byte of every identity-derived key
+/// makes later, explicit format migrations possible without guessing how an
+/// existing key was encoded.
+pub(crate) const STORAGE_KEY_FORMAT_VERSION: u8 = 0x01;
+pub(crate) const TENANT_NAME_TYPE: u8 = 0x01;
+pub(crate) const BUCKET_NAME_TYPE: u8 = 0x02;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub(crate) struct TenantId(pub(crate) u64);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub(crate) struct BucketId(pub(crate) u64);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BucketIdentity {
+    pub(crate) tenant_id: TenantId,
+    pub(crate) bucket_id: BucketId,
+}
+
+impl BucketIdentity {
+    pub(crate) const ENCODED_BYTES: usize = 1 + size_of::<u64>() + size_of::<u64>();
+
+    pub(crate) fn encode(self) -> [u8; Self::ENCODED_BYTES] {
+        let mut encoded = [0_u8; Self::ENCODED_BYTES];
+        encoded[0] = STORAGE_KEY_FORMAT_VERSION;
+        encoded[1..9].copy_from_slice(&self.tenant_id.0.to_be_bytes());
+        encoded[9..17].copy_from_slice(&self.bucket_id.0.to_be_bytes());
+        encoded
+    }
+
+    pub(crate) fn head_key(self, path: &str) -> Vec<u8> {
+        let prefix = self.encode();
+        let mut encoded = Vec::with_capacity(prefix.len() + path.len());
+        encoded.extend_from_slice(&prefix);
+        encoded.extend_from_slice(path.as_bytes());
+        encoded
+    }
+
+    pub(crate) fn decode_head_path<'a>(self, encoded: &'a [u8]) -> Result<&'a str, ObjectKeyError> {
+        let prefix = self.encode();
+        let path = encoded
+            .strip_prefix(&prefix)
+            .ok_or(ObjectKeyError::MalformedStorageKey)?;
+        std::str::from_utf8(path).map_err(|_| ObjectKeyError::MalformedStorageKey)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ObjectKey {
     tenant: String,
@@ -23,6 +70,8 @@ pub enum ObjectKeyError {
     NonCanonicalPath,
     #[error("object key components must not contain NUL")]
     Nul,
+    #[error("persisted object key is malformed")]
+    MalformedStorageKey,
 }
 
 impl ObjectKey {
@@ -50,23 +99,6 @@ impl ObjectKey {
 
     pub fn path(&self) -> &str {
         &self.path
-    }
-
-    pub(crate) fn encode(&self) -> Vec<u8> {
-        let mut encoded =
-            Vec::with_capacity(2 + self.tenant.len() + 2 + self.bucket.len() + 4 + self.path.len());
-        push_u16_string(&mut encoded, &self.tenant);
-        push_u16_string(&mut encoded, &self.bucket);
-        encoded.extend_from_slice(&(self.path.len() as u32).to_be_bytes());
-        encoded.extend_from_slice(self.path.as_bytes());
-        encoded
-    }
-
-    pub(crate) fn bucket_key(&self) -> Vec<u8> {
-        let mut encoded = Vec::with_capacity(4 + self.tenant.len() + self.bucket.len());
-        push_u16_string(&mut encoded, &self.tenant);
-        push_u16_string(&mut encoded, &self.bucket);
-        encoded
     }
 
     fn validate(&self) -> Result<(), ObjectKeyError> {
@@ -111,9 +143,30 @@ impl ObjectKey {
     }
 }
 
-fn push_u16_string(output: &mut Vec<u8>, value: &str) {
-    output.extend_from_slice(&(value.len() as u16).to_be_bytes());
-    output.extend_from_slice(value.as_bytes());
+pub(crate) fn tenant_name_key(name: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(2 + name.len());
+    key.extend_from_slice(&[STORAGE_KEY_FORMAT_VERSION, TENANT_NAME_TYPE]);
+    key.extend_from_slice(name.as_bytes());
+    key
+}
+
+pub(crate) fn bucket_name_key(tenant_id: TenantId, name: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(2 + size_of::<u64>() + name.len());
+    key.extend_from_slice(&[STORAGE_KEY_FORMAT_VERSION, BUCKET_NAME_TYPE]);
+    key.extend_from_slice(&tenant_id.0.to_be_bytes());
+    key.extend_from_slice(name.as_bytes());
+    key
+}
+
+pub(crate) fn encode_identity_value(id: u64) -> [u8; size_of::<u64>()] {
+    id.to_be_bytes()
+}
+
+pub(crate) fn decode_identity_value(encoded: &[u8]) -> Result<u64, ObjectKeyError> {
+    let encoded: [u8; size_of::<u64>()] = encoded
+        .try_into()
+        .map_err(|_| ObjectKeyError::MalformedStorageKey)?;
+    Ok(u64::from_be_bytes(encoded))
 }
 
 #[cfg(test)]
@@ -121,10 +174,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn encoding_is_unambiguous() {
-        let left = ObjectKey::new("a", "bc", "d/e").unwrap();
-        let right = ObjectKey::new("ab", "c", "d/e").unwrap();
-        assert_ne!(left.encode(), right.encode());
+    fn stable_object_key_contains_only_format_ids_and_raw_path() {
+        let identity = BucketIdentity {
+            tenant_id: TenantId(0x0102_0304_0506_0708),
+            bucket_id: BucketId(0x1112_1314_1516_1718),
+        };
+        let encoded = identity.head_key("d/e");
+        assert_eq!(
+            encoded,
+            [
+                vec![STORAGE_KEY_FORMAT_VERSION],
+                0x0102_0304_0506_0708_u64.to_be_bytes().to_vec(),
+                0x1112_1314_1516_1718_u64.to_be_bytes().to_vec(),
+                b"d/e".to_vec(),
+            ]
+            .concat()
+        );
+        assert_eq!(identity.decode_head_path(&encoded).unwrap(), "d/e");
+    }
+
+    #[test]
+    fn name_keys_are_versioned_typed_and_bucket_names_are_tenant_scoped() {
+        assert_eq!(
+            tenant_name_key("acme"),
+            [vec![0x01, 0x01], b"acme".to_vec()].concat()
+        );
+        assert_eq!(
+            bucket_name_key(TenantId(7), "objects"),
+            [
+                vec![0x01, 0x02],
+                7_u64.to_be_bytes().to_vec(),
+                b"objects".to_vec(),
+            ]
+            .concat()
+        );
+        assert_ne!(
+            bucket_name_key(TenantId(7), "objects"),
+            bucket_name_key(TenantId(8), "objects")
+        );
     }
 
     #[test]

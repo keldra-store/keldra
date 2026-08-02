@@ -12,6 +12,7 @@ publish = false
 anvil-atomic-program = { path = "../anvil-atomic-program" }
 anvil-authz = { path = "../anvil-authz" }
 anyhow = "1"
+argon2 = "0.5.3"
 base64 = "0.22"
 blake3 = "1.8"
 hex = "0.4"
@@ -25,4 +26,4 @@ tokio = { version = "1.47", features = ["fs", "io-util", "sync"] }
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { version = "1.47", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "time"] }
