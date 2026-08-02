@@ -33,6 +33,42 @@ impl Store {
         }
 
         let identity = self.resolve_bucket_identity(tenant, bucket)?;
+        self.list_local_owned_objects(
+            identity.tenant_id.0,
+            identity.bucket_id.0,
+            prefix,
+            start_after,
+            limit,
+            |_, _, _| true,
+        )
+    }
+
+    /// Lists the current live heads held by this node for one stable bucket.
+    ///
+    /// The caller supplies the fenced placement decision for each exact path.
+    /// Keeping placement outside the storage kernel lets the same prefix scan
+    /// serve both a one-node store and one source of a cluster-wide merge.
+    pub fn list_local_owned_objects(
+        &self,
+        tenant_id: u64,
+        bucket_id: u64,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+        mut is_local_rank_zero: impl FnMut(u64, u64, &str) -> bool,
+    ) -> Result<ListObjectsPage, MutationError> {
+        let limit = limit.min(MAX_LIST_OBJECTS);
+        if limit == 0 {
+            return Ok(ListObjectsPage {
+                paths: Vec::new(),
+                has_more: false,
+            });
+        }
+
+        let identity = BucketIdentity {
+            tenant_id: TenantId(tenant_id),
+            bucket_id: BucketId(bucket_id),
+        };
         let bucket_prefix = identity.encode();
         let mut range_prefix = Vec::with_capacity(bucket_prefix.len() + prefix.len());
         range_prefix.extend_from_slice(&bucket_prefix);
@@ -61,6 +97,7 @@ impl Store {
             if head.deleted
                 || contains_reserved_anvil_segment(path)
                 || start_after.is_some_and(|cursor| path <= cursor)
+                || !is_local_rank_zero(tenant_id, bucket_id, path)
             {
                 continue;
             }

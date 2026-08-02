@@ -501,6 +501,113 @@ async fn list_objects_pages_are_read_committed_not_a_cross_page_snapshot() {
 }
 
 #[tokio::test]
+async fn local_cluster_listing_uses_stable_ids_and_excludes_non_owned_heads() {
+    let (_temporary, store) = store().await;
+    for (index, path) in [
+        "deep/prefix/a",
+        "deep/prefix/b",
+        "deep/prefix/deleted",
+        "deep/prefix/_anvil/meta.json",
+        "deep/sibling",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        store
+            .put(put(
+                path,
+                path.as_bytes(),
+                Precondition::Absent,
+                &format!("cluster-list-{index}"),
+            ))
+            .await
+            .unwrap();
+    }
+    store
+        .delete(DeleteRequest {
+            key: key("deep/prefix/deleted"),
+            precondition: Precondition::Any,
+            command_id: Some("cluster-list-delete".into()),
+            durability: Durability::Local,
+        })
+        .await
+        .unwrap();
+
+    let identity = store.resolve_bucket_identity("tenant", "bucket").unwrap();
+    let mut considered = Vec::new();
+    let page = store
+        .list_local_owned_objects(
+            identity.tenant_id.0,
+            identity.bucket_id.0,
+            "deep/prefix/",
+            None,
+            10,
+            |tenant_id, bucket_id, path| {
+                assert_eq!(tenant_id, identity.tenant_id.0);
+                assert_eq!(bucket_id, identity.bucket_id.0);
+                considered.push(path.to_owned());
+                path != "deep/prefix/b"
+            },
+        )
+        .unwrap();
+
+    assert_eq!(
+        considered,
+        ["deep/prefix/a", "deep/prefix/b"].map(str::to_owned)
+    );
+    assert_eq!(page.paths, vec!["deep/prefix/a".to_owned()]);
+    assert!(!page.has_more);
+}
+
+#[tokio::test]
+async fn local_cluster_listing_has_no_total_result_cap_across_pages() {
+    let (_temporary, store) = store().await;
+    let identity = store.resolve_bucket_identity("tenant", "bucket").unwrap();
+    let mut batch = WriteBatch::default();
+    for index in 0..(MAX_LIST_OBJECTS + 5) {
+        batch.put_cf(
+            store.cf(CF_HEADS).unwrap(),
+            identity.head_key(&format!("many/{index:04}")),
+            serde_json::to_vec(&Head {
+                version: VersionId(index as u64 + 1),
+                deleted: false,
+                mutation_stamp: None,
+            })
+            .unwrap(),
+        );
+    }
+    store.db.write(batch).unwrap();
+
+    let first = store
+        .list_local_owned_objects(
+            identity.tenant_id.0,
+            identity.bucket_id.0,
+            "many/",
+            None,
+            MAX_LIST_OBJECTS,
+            |_, _, _| true,
+        )
+        .unwrap();
+    assert_eq!(first.paths.len(), MAX_LIST_OBJECTS);
+    assert!(first.has_more);
+
+    let second = store
+        .list_local_owned_objects(
+            identity.tenant_id.0,
+            identity.bucket_id.0,
+            "many/",
+            first.paths.last().map(String::as_str),
+            MAX_LIST_OBJECTS,
+            |_, _, _| true,
+        )
+        .unwrap();
+    assert_eq!(second.paths.len(), 5);
+    assert_eq!(second.paths.first().map(String::as_str), Some("many/1000"));
+    assert_eq!(second.paths.last().map(String::as_str), Some("many/1004"));
+    assert!(!second.has_more);
+}
+
+#[tokio::test]
 async fn reopen_seeds_version_clock_above_persisted_high_watermark() {
     let temporary = tempfile::tempdir().unwrap();
     let store = Store::open(StoreOptions::new(temporary.path(), 1))
