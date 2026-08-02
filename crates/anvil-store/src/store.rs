@@ -277,20 +277,20 @@ enum PreparedOperation {
 #[derive(Clone)]
 enum PreparedPayload {
     Small { reference: BlobRef, bytes: Vec<u8> },
-    Sealed(BlobRef),
+    Large(BlobRef),
 }
 
 impl PreparedPayload {
     fn reference(&self) -> &BlobRef {
         match self {
-            Self::Small { reference, .. } | Self::Sealed(reference) => reference,
+            Self::Small { reference, .. } | Self::Large(reference) => reference,
         }
     }
 
     fn small_bytes(&self) -> Option<&[u8]> {
         match self {
             Self::Small { bytes, .. } => Some(bytes),
-            Self::Sealed(_) => None,
+            Self::Large(_) => None,
         }
     }
 }
@@ -1727,8 +1727,9 @@ impl Store {
         advance_blob_reference_publication(state, now_unix_millis).map(|state| (key, state))
     }
 
-    /// Publishes small bytes materialised by the same RocksDB batch as their
-    /// immutable version descriptor.
+    /// Publishes bytes materialised by an inline put. Small bytes join the
+    /// final RocksDB batch; large bytes are already durable in the byte plane.
+    /// Neither needs a separate awaiting-publication lifecycle write.
     fn prepare_materialized_blob_publication(
         &self,
         reference: &BlobRef,
@@ -2247,11 +2248,11 @@ impl Store {
                 validate_command_id(request.command_id.as_deref())?;
                 require_local_durability(request.durability)?;
                 let bytes = std::mem::take(&mut request.bytes);
-                let reference = blob_reference_for_bytes(&bytes);
                 let payload = if bytes.len() <= SMALL_BLOB_MAX_BYTES {
+                    let reference = blob_reference_for_bytes(&bytes);
                     PreparedPayload::Small { reference, bytes }
                 } else {
-                    PreparedPayload::Sealed(self.stage_blob(&bytes).await?)
+                    PreparedPayload::Large(self.blobs.put(&bytes).await.map_err(storage_error)?)
                 };
                 let fingerprint = put_fingerprint(
                     &identity.head_key(request.key.path()),
@@ -2648,18 +2649,16 @@ impl Store {
             && (versioning == ObjectVersioning::Enabled || references_changed)
         {
             let update = match operation {
-                PreparedOperation::Put { payload, .. } if payload.small_bytes().is_some() => self
-                    .prepare_materialized_blob_publication(
+                PreparedOperation::Put { .. } => self.prepare_materialized_blob_publication(
                     reference,
                     pending_blob_references,
                     now_unix_millis,
                 )?,
-                PreparedOperation::Put { .. } | PreparedOperation::Publish { .. } => self
-                    .prepare_blob_reference_publication(
-                        reference,
-                        pending_blob_references,
-                        now_unix_millis,
-                    )?,
+                PreparedOperation::Publish { .. } => self.prepare_blob_reference_publication(
+                    reference,
+                    pending_blob_references,
+                    now_unix_millis,
+                )?,
                 PreparedOperation::Delete { .. } => unreachable!(),
             };
             blob_reference_updates.push(update);
@@ -4704,7 +4703,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepared_put_keeps_small_bytes_in_memory_and_seals_large_bytes() {
+    async fn prepared_put_keeps_small_bytes_in_memory_and_materializes_large_bytes() {
         let (_temporary, store) = store().await;
         let identity = store.resolve_bucket_identity("tenant", "bucket").unwrap();
         let first_bytes = b"small payload".to_vec();
@@ -4730,6 +4729,7 @@ mod tests {
         }
 
         let blob_bytes = vec![9_u8; SMALL_BLOB_MAX_BYTES + 1];
+        let sequence_before_prepare = store.db.latest_sequence_number();
         let blob = store
             .prepare(
                 BatchOperation::Put(put("blob", &blob_bytes, Precondition::Absent, "blob")),
@@ -4740,15 +4740,99 @@ mod tests {
         match blob {
             PreparedOperation::Put {
                 request,
-                payload: PreparedPayload::Sealed(reference),
+                payload: PreparedPayload::Large(reference),
                 ..
             } => {
                 assert!(request.bytes.is_empty());
                 assert_eq!(reference.length, blob_bytes.len() as u64);
                 assert_eq!(store.blobs.get(&reference).await.unwrap(), blob_bytes);
+                assert!(store.blob_reference_state(&reference).unwrap().is_none());
+                assert_eq!(store.db.latest_sequence_number(), sequence_before_prepare);
             }
-            _ => panic!("large put was not prepared as a blob"),
+            _ => panic!("large put was not durably materialized"),
         }
+    }
+
+    #[tokio::test]
+    async fn bulk_publishes_identical_large_payloads_in_one_rocksdb_batch() {
+        let (temporary, store) = store().await;
+        store.resolve_bucket_identity("tenant", "bucket").unwrap();
+        let bytes = vec![0x5a; SMALL_BLOB_MAX_BYTES + 1];
+        let reference = blob_reference_for_bytes(&bytes);
+        let operations = vec![
+            BatchOperation::Put(put("first", &bytes, Precondition::Absent, "first-large")),
+            BatchOperation::Put(put("second", &bytes, Precondition::Absent, "second-large")),
+        ];
+        let before = store.db.latest_sequence_number();
+
+        let outcomes = store.bulk_write(operations).await;
+
+        assert!(outcomes.iter().all(|outcome| outcome.result.is_ok()));
+        let updates = store
+            .db
+            .get_updates_since(before)
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(updates.len(), 1);
+        let state = store.blob_reference_state(&reference).unwrap().unwrap();
+        assert_eq!(state.ref_count, 2);
+        assert_eq!(state.flags, 0);
+
+        drop(store);
+        let reopened = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        for path in ["first", "second"] {
+            assert_eq!(
+                reopened.get(&key(path)).await.unwrap().unwrap().bytes,
+                bytes
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_large_inline_put_leaves_only_an_age_gated_orphan() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(
+            StoreOptions::new(temporary.path(), 1).with_awaiting_publish_ttl_seconds(1),
+        )
+        .await
+        .unwrap();
+        store
+            .put(put("occupied", b"current", Precondition::Absent, "create"))
+            .await
+            .unwrap();
+        let bytes = vec![0x6b; SMALL_BLOB_MAX_BYTES + 1];
+        let reference = blob_reference_for_bytes(&bytes);
+
+        let rejected = store
+            .put(put(
+                "occupied",
+                &bytes,
+                Precondition::Absent,
+                "rejected-large",
+            ))
+            .await;
+
+        assert!(matches!(
+            rejected,
+            Err(MutationError::PreconditionFailed { .. })
+        ));
+        assert!(store.blob_reference_state(&reference).unwrap().is_none());
+        assert!(store.blobs.contains(&reference).await.unwrap());
+        let modified = blob_file_path(&store, &reference)
+            .metadata()
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert_eq!(store.collect_blob_garbage_at(modified + 999).unwrap(), 0);
+        assert!(store.blobs.contains(&reference).await.unwrap());
+        assert_eq!(store.collect_blob_garbage_at(modified + 1_000).unwrap(), 1);
+        assert!(!store.blobs.contains(&reference).await.unwrap());
     }
 
     #[tokio::test]
