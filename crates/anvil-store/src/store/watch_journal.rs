@@ -1,6 +1,62 @@
 use super::*;
 
 impl Store {
+    fn materialize_local_change(
+        &self,
+        stored: StoredLocalChange,
+    ) -> Result<LocalChange, MutationError> {
+        match stored {
+            StoredLocalChange::Current(change) => Ok(change),
+            StoredLocalChange::V050(invalidation) => {
+                let tenant_id = self
+                    .tenant_id_by_name(invalidation.key.tenant())?
+                    .ok_or_else(|| {
+                        MutationError::Storage(format!(
+                            "0.5.0 local invalidation tenant `{}` has no stable identity mapping",
+                            invalidation.key.tenant()
+                        ))
+                    })?;
+                let bucket_id = self
+                    .bucket_id_by_name(tenant_id, invalidation.key.bucket())?
+                    .ok_or_else(|| {
+                        MutationError::Storage(format!(
+                            "0.5.0 local invalidation bucket `{}/{}` has no stable identity mapping",
+                            invalidation.key.tenant(),
+                            invalidation.key.bucket()
+                        ))
+                    })?;
+                Ok(LocalChange::object_head(
+                    invalidation.offset,
+                    tenant_id.0,
+                    bucket_id.0,
+                    invalidation.key.path().to_owned(),
+                    invalidation.minimum_path_version,
+                    invalidation.state_hint == InvalidationStateHint::Deleted,
+                ))
+            }
+        }
+    }
+
+    fn decode_local_change_record(&self, encoded: &[u8]) -> Result<LocalChange, MutationError> {
+        let stored = decode_local_change(encoded).map_err(storage_error)?;
+        self.materialize_local_change(stored)
+    }
+
+    fn watch_scope_identity(&self, scope: &WatchScope) -> Result<BucketIdentity, WatchError> {
+        let tenant_id = self
+            .tenant_id_by_name(scope.tenant())
+            .map_err(|error| WatchError::Storage(error.to_string()))?
+            .ok_or_else(|| WatchError::Storage("watch tenant identity is missing".into()))?;
+        let bucket_id = self
+            .bucket_id_by_name(tenant_id, scope.bucket())
+            .map_err(|error| WatchError::Storage(error.to_string()))?
+            .ok_or_else(|| WatchError::Storage("watch bucket identity is missing".into()))?;
+        Ok(BucketIdentity {
+            tenant_id,
+            bucket_id,
+        })
+    }
+
     pub fn local_invalidation_offset(&self) -> Result<u64, MutationError> {
         let Some(encoded) = self
             .db
@@ -94,6 +150,7 @@ impl Store {
         limit: usize,
     ) -> Result<WatchPage, WatchError> {
         let _commit_guard = self.commit_lock.lock().await;
+        let scope_identity = self.watch_scope_identity(scope)?;
         let status = self.local_watch_status()?;
         if cursor.offset() < status.retention_floor || cursor.offset() > status.tail {
             return Err(WatchError::ResumeExpired);
@@ -130,15 +187,33 @@ impl Store {
                     "retained local invalidation offset {expected} is missing"
                 )));
             }
-            let invalidation = serde_json::from_slice::<LocalInvalidation>(&encoded)
+            let stored = decode_local_change(&encoded)
                 .map_err(|error| WatchError::Storage(error.to_string()))?;
-            if invalidation.offset != offset {
+            if stored.offset() != offset {
                 return Err(WatchError::Storage(
-                    "local invalidation key does not match its stored offset".into(),
+                    "local change key does not match its stored offset".into(),
                 ));
             }
-            if scope.contains(&invalidation.key) {
-                invalidations.push(invalidation);
+            let change = self
+                .materialize_local_change(stored)
+                .map_err(|error| WatchError::Storage(error.to_string()))?;
+            if let Some(head) = change.into_object_head()
+                && head.tenant_id == scope_identity.tenant_id.0
+                && head.bucket_id == scope_identity.bucket_id.0
+            {
+                let key = ObjectKey::new(scope.tenant(), scope.bucket(), head.exact_path)
+                    .map_err(|error| WatchError::Storage(error.to_string()))?;
+                if scope.contains(&key) {
+                    invalidations.push(LocalInvalidation {
+                        offset: head.offset,
+                        key,
+                        minimum_path_version: head.path_version,
+                        state_hint: match head.kind {
+                            ObjectHeadChangeKind::Put => InvalidationStateHint::Present,
+                            ObjectHeadChangeKind::Delete => InvalidationStateHint::Deleted,
+                        },
+                    });
+                }
             }
             records_seen += 1;
         }
@@ -174,11 +249,8 @@ impl Store {
         }
     }
 
-    /// Reads one exact source-local invalidation offset.
-    pub fn read_local_invalidation(
-        &self,
-        offset: u64,
-    ) -> Result<Option<LocalInvalidation>, MutationError> {
+    /// Reads one exact source-local change offset.
+    pub fn read_local_change(&self, offset: u64) -> Result<Option<LocalChange>, MutationError> {
         if offset == 0 {
             return Ok(None);
         }
@@ -189,23 +261,22 @@ impl Store {
         else {
             return Ok(None);
         };
-        let invalidation =
-            serde_json::from_slice::<LocalInvalidation>(&encoded).map_err(storage_error)?;
-        if invalidation.offset != offset {
+        let change = self.decode_local_change_record(&encoded)?;
+        if change.offset() != offset {
             return Err(MutationError::Storage(
-                "local invalidation key does not match its stored offset".into(),
+                "local change key does not match its stored offset".into(),
             ));
         }
-        Ok(Some(invalidation))
+        Ok(Some(change))
     }
 
-    /// Scans source-local invalidations after one offset in ascending local
-    /// order. The result is capped independently of the requested limit.
-    pub fn scan_local_invalidations(
+    /// Scans source-local changes after one offset in ascending local order.
+    /// The result is capped independently of the requested limit.
+    pub fn scan_local_changes(
         &self,
         after_offset: u64,
         limit: usize,
-    ) -> Result<Vec<LocalInvalidation>, MutationError> {
+    ) -> Result<Vec<LocalChange>, MutationError> {
         let limit = limit.min(MAX_LOCAL_INVALIDATION_SCAN_RECORDS);
         let Some(first_offset) = after_offset.checked_add(1).filter(|_| limit > 0) else {
             return Ok(Vec::new());
@@ -215,21 +286,67 @@ impl Store {
             self.cf(CF_LOCAL_INVALIDATIONS)?,
             IteratorMode::From(&first_key, Direction::Forward),
         );
-        let mut invalidations = Vec::with_capacity(limit);
+        let mut changes = Vec::with_capacity(limit);
         for entry in iterator.take(limit) {
             let (key, encoded) = entry.map_err(storage_error)?;
-            let stored_offset = offset_from_key(&key).ok_or_else(|| {
-                MutationError::Storage("local invalidation key is malformed".into())
-            })?;
-            let invalidation =
-                serde_json::from_slice::<LocalInvalidation>(&encoded).map_err(storage_error)?;
-            if invalidation.offset != stored_offset {
+            let stored_offset = offset_from_key(&key)
+                .ok_or_else(|| MutationError::Storage("local change key is malformed".into()))?;
+            let change = self.decode_local_change_record(&encoded)?;
+            if change.offset() != stored_offset {
                 return Err(MutationError::Storage(
-                    "local invalidation key does not match its stored offset".into(),
+                    "local change key does not match its stored offset".into(),
                 ));
             }
-            invalidations.push(invalidation);
+            changes.push(change);
         }
-        Ok(invalidations)
+        Ok(changes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn legacy_invalidation() -> LocalInvalidation {
+        LocalInvalidation::new(
+            7,
+            ObjectKey::new("tenant", "bucket", "documents/one").unwrap(),
+            VersionId(41),
+            false,
+        )
+    }
+
+    #[tokio::test]
+    async fn v050_names_are_resolved_through_existing_stable_identity_mappings() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        let identity = store
+            .install_test_bucket_identity("tenant", "bucket")
+            .unwrap();
+        let change = store
+            .materialize_local_change(StoredLocalChange::V050(legacy_invalidation()))
+            .unwrap()
+            .into_object_head()
+            .unwrap();
+
+        assert_eq!(change.tenant_id, identity.tenant_id.0);
+        assert_eq!(change.bucket_id, identity.bucket_id.0);
+        assert_eq!(change.exact_path, "documents/one");
+        assert_eq!(change.path_version, VersionId(41));
+        assert_eq!(change.kind, ObjectHeadChangeKind::Put);
+    }
+
+    #[tokio::test]
+    async fn v050_names_without_identity_mappings_fail_explicitly() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        let error = store
+            .materialize_local_change(StoredLocalChange::V050(legacy_invalidation()))
+            .unwrap_err();
+        assert!(error.to_string().contains("has no stable identity mapping"));
     }
 }

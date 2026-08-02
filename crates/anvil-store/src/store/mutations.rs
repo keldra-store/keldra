@@ -130,7 +130,8 @@ impl Store {
                     }),
                 );
                 pending_invalidations.push((
-                    operation.key().clone(),
+                    operation.identity(),
+                    operation.key().path().to_owned(),
                     receipt.version,
                     receipt.deleted,
                 ));
@@ -182,7 +183,7 @@ impl Store {
     pub(crate) fn stage_local_invalidations(
         &self,
         batch: &mut WriteBatch,
-        changes: &[(ObjectKey, VersionId, bool)],
+        changes: &[(BucketIdentity, String, VersionId, bool)],
     ) -> Result<(), MutationError> {
         if changes.is_empty() {
             return Ok(());
@@ -200,12 +201,19 @@ impl Store {
             IteratorMode::From(&first_old_key, Direction::Forward),
         );
         let mut appended = VecDeque::new();
-        for (key, version, deleted) in changes {
+        for (identity, exact_path, version, deleted) in changes {
             status.tail = status.tail.checked_add(1).ok_or_else(|| {
                 MutationError::Storage("local invalidation offset is exhausted".into())
             })?;
-            let invalidation = LocalInvalidation::new(status.tail, key.clone(), *version, *deleted);
-            let encoded = serde_json::to_vec(&invalidation).map_err(storage_error)?;
+            let change = LocalChange::object_head(
+                status.tail,
+                identity.tenant_id.0,
+                identity.bucket_id.0,
+                exact_path.clone(),
+                *version,
+                *deleted,
+            );
+            let encoded = encode_local_change(&change).map_err(storage_error)?;
             status.retained_entries = status.retained_entries.checked_add(1).ok_or_else(|| {
                 MutationError::Storage("local invalidation entry count is exhausted".into())
             })?;

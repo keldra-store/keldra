@@ -373,7 +373,10 @@ impl Store {
                 VERSION_HIGH_WATERMARK_KEY,
                 serde_json::to_vec(&tombstone_id).map_err(storage_error)?,
             );
-            self.stage_local_invalidations(&mut batch, &[(key.clone(), tombstone_id, true)])?;
+            self.stage_local_invalidations(
+                &mut batch,
+                &[(identity, key.path().to_owned(), tombstone_id, true)],
+            )?;
             (
                 DeleteRetainedVersionOutcome::ReplacedCurrentWithTombstone {
                     version: tombstone_id,

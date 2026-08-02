@@ -53,7 +53,7 @@ pub use store::{
     OpenedObject, Store, StoreOptions,
 };
 pub use watch::{
-    DEFAULT_WATCH_MAX_BYTES, DEFAULT_WATCH_MAX_ENTRIES, InvalidationStateHint, LocalInvalidation,
-    MAX_LOCAL_INVALIDATION_SCAN_RECORDS, WatchCursor, WatchError, WatchJournalStatus, WatchPage,
-    WatchRetention, WatchScope, WatchStart,
+    DEFAULT_WATCH_MAX_BYTES, DEFAULT_WATCH_MAX_ENTRIES, InvalidationStateHint, LocalChange,
+    LocalInvalidation, MAX_LOCAL_INVALIDATION_SCAN_RECORDS, ObjectHeadChange, ObjectHeadChangeKind,
+    WatchCursor, WatchError, WatchJournalStatus, WatchPage, WatchRetention, WatchScope, WatchStart,
 };

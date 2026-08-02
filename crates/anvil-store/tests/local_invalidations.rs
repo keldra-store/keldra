@@ -1,7 +1,7 @@
 use anvil_authz::ObjectRef;
 use anvil_store::{
     AuthzRevision, BatchOperation, CreateBucketRequest, DeleteRequest, Durability,
-    InvalidationStateHint, ObjectKey, ObjectVersioning, Precondition, ProvisionTenantRequest,
+    ObjectHeadChangeKind, ObjectKey, ObjectVersioning, Precondition, ProvisionTenantRequest,
     PutMode, PutRequest, StorageTenantId, Store, StoreOptions, SystemBootstrapRequest, WatchError,
     WatchRetention, WatchScope, WatchStart,
 };
@@ -78,20 +78,36 @@ async fn put_delete_and_replay_keep_one_durable_invalidation_per_head_change() {
     let deleted = store.delete(delete_request.clone()).await.unwrap();
 
     assert_eq!(store.local_invalidation_offset().unwrap(), 2);
-    let invalidations = store.scan_local_invalidations(0, 10).unwrap();
+    let changes = store.scan_local_changes(0, 10).unwrap();
+    assert_eq!(changes.len(), 2);
+    assert_eq!(changes[0].offset(), 1);
+    assert_eq!(changes[1].offset(), 2);
+    let invalidations = store
+        .scan_local_changes(0, 10)
+        .unwrap()
+        .into_iter()
+        .filter_map(|change| change.into_object_head())
+        .collect::<Vec<_>>();
     assert_eq!(invalidations.len(), 2);
     assert_eq!(invalidations[0].offset, 1);
-    assert_eq!(invalidations[0].key, key("record"));
-    assert_eq!(invalidations[0].minimum_path_version, created.version);
-    assert_eq!(invalidations[0].state_hint, InvalidationStateHint::Present);
+    assert_eq!(invalidations[0].exact_path, "record");
+    assert_eq!(invalidations[0].path_version, created.version);
+    assert_eq!(invalidations[0].kind, ObjectHeadChangeKind::Put);
     assert_eq!(invalidations[1].offset, 2);
-    assert_eq!(invalidations[1].minimum_path_version, deleted.version);
-    assert_eq!(invalidations[1].state_hint, InvalidationStateHint::Deleted);
+    assert_eq!(invalidations[1].path_version, deleted.version);
+    assert_eq!(invalidations[1].kind, ObjectHeadChangeKind::Delete);
+    assert_ne!(invalidations[0].tenant_id, 0);
+    assert_ne!(invalidations[0].bucket_id, 0);
+    assert_eq!(invalidations[0].tenant_id, invalidations[1].tenant_id);
+    assert_eq!(invalidations[0].bucket_id, invalidations[1].bucket_id);
     assert_eq!(
-        store.read_local_invalidation(2).unwrap(),
+        store
+            .read_local_change(2)
+            .unwrap()
+            .and_then(|change| change.into_object_head()),
         Some(invalidations[1].clone())
     );
-    assert!(store.read_local_invalidation(3).unwrap().is_none());
+    assert!(store.read_local_change(3).unwrap().is_none());
 
     drop(store);
     let reopened = Store::open(StoreOptions::new(temporary.path(), 1))
@@ -101,7 +117,7 @@ async fn put_delete_and_replay_keep_one_durable_invalidation_per_head_change() {
     assert!(reopened.put(put_request).await.unwrap().replayed);
     assert!(reopened.delete(delete_request).await.unwrap().replayed);
     assert_eq!(reopened.local_invalidation_offset().unwrap(), 2);
-    assert_eq!(reopened.scan_local_invalidations(0, 10).unwrap().len(), 2);
+    assert_eq!(reopened.scan_local_changes(0, 10).unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -127,14 +143,24 @@ async fn bulk_appends_only_successful_head_changes_and_bounds_scans() {
     assert!(outcomes[2].result.is_ok());
     assert_eq!(store.local_invalidation_offset().unwrap(), 2);
 
-    let first_page = store.scan_local_invalidations(0, 1).unwrap();
+    let first_page = store
+        .scan_local_changes(0, 1)
+        .unwrap()
+        .into_iter()
+        .filter_map(|change| change.into_object_head())
+        .collect::<Vec<_>>();
     assert_eq!(first_page.len(), 1);
     assert_eq!(first_page[0].offset, 1);
-    assert_eq!(first_page[0].key, key("a"));
-    let second_page = store.scan_local_invalidations(1, 10).unwrap();
+    assert_eq!(first_page[0].exact_path, "a");
+    let second_page = store
+        .scan_local_changes(1, 10)
+        .unwrap()
+        .into_iter()
+        .filter_map(|change| change.into_object_head())
+        .collect::<Vec<_>>();
     assert_eq!(second_page.len(), 1);
     assert_eq!(second_page[0].offset, 2);
-    assert_eq!(second_page[0].key, key("b"));
+    assert_eq!(second_page[0].exact_path, "b");
 
     let replay = store
         .bulk_write(vec![
@@ -149,7 +175,7 @@ async fn bulk_appends_only_successful_head_changes_and_bounds_scans() {
             .is_ok_and(|receipt| receipt.replayed)
     }));
     assert_eq!(store.local_invalidation_offset().unwrap(), 2);
-    assert_eq!(store.scan_local_invalidations(0, 10).unwrap().len(), 2);
+    assert_eq!(store.scan_local_changes(0, 10).unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -265,7 +291,7 @@ async fn entry_retention_prunes_in_the_head_batch_and_expires_stale_tokens() {
     assert_eq!(status.tail, 3);
     assert_eq!(status.retention_floor, 1);
     assert_eq!(status.retained_entries, 2);
-    assert!(store.read_local_invalidation(1).unwrap().is_none());
+    assert!(store.read_local_change(1).unwrap().is_none());
     assert_eq!(
         store
             .start_watch(&scope, WatchStart::Resume(stale))

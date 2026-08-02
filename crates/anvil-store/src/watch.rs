@@ -21,6 +21,7 @@ pub(crate) const LOCAL_INVALIDATION_TOKEN_KEY: &[u8] = b"local_invalidation_toke
 
 const WATCH_TOKEN_FORMAT: u16 = 1;
 const WATCH_TOKEN_MAX_ENCODED_BYTES: usize = 16 * 1024;
+const LOCAL_CHANGE_FORMAT: u16 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WatchRetention {
@@ -185,6 +186,7 @@ pub struct LocalInvalidation {
 }
 
 impl LocalInvalidation {
+    #[cfg(test)]
     pub(crate) fn new(offset: u64, key: ObjectKey, version: VersionId, deleted: bool) -> Self {
         Self {
             offset,
@@ -197,6 +199,142 @@ impl LocalInvalidation {
             },
         }
     }
+}
+
+/// The current state selected by one exact-path head mutation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectHeadChangeKind {
+    Put,
+    Delete,
+}
+
+/// Stable-ID form of one source-local object-head change.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectHeadChange {
+    pub offset: u64,
+    pub tenant_id: u64,
+    pub bucket_id: u64,
+    pub exact_path: String,
+    pub path_version: VersionId,
+    pub kind: ObjectHeadChangeKind,
+}
+
+/// One typed record in a source-local change journal.
+///
+/// Only object-head changes exist in 0.5.1's first storage slice. The enum is
+/// deliberately non-exhaustive so later typed changes can share the same
+/// ordered source journal without changing public Watch delivery.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+#[serde(tag = "kind", content = "record", rename_all = "snake_case")]
+pub enum LocalChange {
+    ObjectHead(ObjectHeadChange),
+}
+
+impl LocalChange {
+    pub(crate) fn object_head(
+        offset: u64,
+        tenant_id: u64,
+        bucket_id: u64,
+        exact_path: String,
+        path_version: VersionId,
+        deleted: bool,
+    ) -> Self {
+        Self::ObjectHead(ObjectHeadChange {
+            offset,
+            tenant_id,
+            bucket_id,
+            exact_path,
+            path_version,
+            kind: if deleted {
+                ObjectHeadChangeKind::Delete
+            } else {
+                ObjectHeadChangeKind::Put
+            },
+        })
+    }
+
+    pub fn offset(&self) -> u64 {
+        match self {
+            Self::ObjectHead(change) => change.offset,
+        }
+    }
+
+    /// Selects the subset exposed by public WatchPrefix.
+    ///
+    /// The wildcard is intentional: newly added source-change variants are
+    /// filtered while the caller still advances its source cursor.
+    #[allow(unreachable_patterns)]
+    pub fn into_object_head(self) -> Option<ObjectHeadChange> {
+        match self {
+            Self::ObjectHead(change) => Some(change),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct LocalChangeEnvelope {
+    format: u16,
+    change: LocalChange,
+}
+
+#[derive(Serialize)]
+struct LocalChangeEnvelopeRef<'a> {
+    format: u16,
+    change: &'a LocalChange,
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum LocalChangeCodecError {
+    #[error("local change record is malformed: {0}")]
+    Malformed(#[from] serde_json::Error),
+    #[error("unsupported local change format {0}")]
+    UnsupportedFormat(u16),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StoredLocalChange {
+    Current(LocalChange),
+    V050(LocalInvalidation),
+}
+
+impl StoredLocalChange {
+    pub(crate) fn offset(&self) -> u64 {
+        match self {
+            Self::Current(change) => change.offset(),
+            Self::V050(invalidation) => invalidation.offset,
+        }
+    }
+}
+
+pub(crate) fn encode_local_change(change: &LocalChange) -> Result<Vec<u8>, LocalChangeCodecError> {
+    serde_json::to_vec(&LocalChangeEnvelopeRef {
+        format: LOCAL_CHANGE_FORMAT,
+        change,
+    })
+    .map_err(Into::into)
+}
+
+pub(crate) fn decode_local_change(
+    encoded: &[u8],
+) -> Result<StoredLocalChange, LocalChangeCodecError> {
+    let value = serde_json::from_slice::<serde_json::Value>(encoded)?;
+    if value.get("format").is_some() {
+        let envelope = serde_json::from_value::<LocalChangeEnvelope>(value)?;
+        if envelope.format != LOCAL_CHANGE_FORMAT {
+            return Err(LocalChangeCodecError::UnsupportedFormat(envelope.format));
+        }
+        return Ok(StoredLocalChange::Current(envelope.change));
+    }
+
+    // Anvil 0.5.0 stored the object-head invalidation directly as JSON. There
+    // are only two possible records (present or deleted), both represented by
+    // this exact released type.
+    serde_json::from_value::<LocalInvalidation>(value)
+        .map(StoredLocalChange::V050)
+        .map_err(Into::into)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -377,6 +515,60 @@ mod tests {
         assert!(matches!(
             WatchRetention::new(1, 0).unwrap_err(),
             WatchError::InvalidConfiguration(_)
+        ));
+    }
+
+    #[test]
+    fn current_local_changes_have_an_explicit_format_and_type_tag() {
+        let expected =
+            LocalChange::object_head(7, 11, 12, "documents/one".into(), VersionId(41), false);
+        let encoded = encode_local_change(&expected).unwrap();
+        let value = serde_json::from_slice::<serde_json::Value>(&encoded).unwrap();
+        assert_eq!(value["format"], LOCAL_CHANGE_FORMAT);
+        assert_eq!(value["change"]["kind"], "object_head");
+        assert_eq!(
+            decode_local_change(&encoded).unwrap(),
+            StoredLocalChange::Current(expected)
+        );
+    }
+
+    #[test]
+    fn every_released_v050_invalidation_shape_decodes_as_an_object_head_change() {
+        let fixtures = [
+            (
+                br#"{"offset":7,"key":{"tenant":"tenant","bucket":"bucket","path":"documents/one"},"minimum_path_version":41,"state_hint":"present"}"#
+                    .as_slice(),
+                InvalidationStateHint::Present,
+            ),
+            (
+                br#"{"offset":8,"key":{"tenant":"tenant","bucket":"bucket","path":"documents/two"},"minimum_path_version":42,"state_hint":"deleted"}"#
+                    .as_slice(),
+                InvalidationStateHint::Deleted,
+            ),
+        ];
+
+        for (encoded, expected_hint) in fixtures {
+            let StoredLocalChange::V050(invalidation) = decode_local_change(encoded).unwrap()
+            else {
+                panic!("0.5.0 record decoded as a current envelope")
+            };
+            assert_eq!(invalidation.key.tenant(), "tenant");
+            assert_eq!(invalidation.key.bucket(), "bucket");
+            assert_eq!(invalidation.state_hint, expected_hint);
+        }
+    }
+
+    #[test]
+    fn unknown_local_change_formats_fail_instead_of_falling_back_to_v050() {
+        let change =
+            LocalChange::object_head(9, 11, 12, "documents/three".into(), VersionId(43), false);
+        let encoded = encode_local_change(&change).unwrap();
+        let mut value = serde_json::from_slice::<serde_json::Value>(&encoded).unwrap();
+        value["format"] = serde_json::json!(LOCAL_CHANGE_FORMAT + 1);
+        let encoded = serde_json::to_vec(&value).unwrap();
+        assert!(matches!(
+            decode_local_change(&encoded),
+            Err(LocalChangeCodecError::UnsupportedFormat(2))
         ));
     }
 }

@@ -1207,7 +1207,12 @@ impl Store {
                 })
                 .map_err(program_storage_error)?,
             );
-            invalidations.push((key, write.version.id, write.version.deleted));
+            invalidations.push((
+                identity,
+                key.path().to_owned(),
+                write.version.id,
+                write.version.deleted,
+            ));
         }
         let bundle_reference = BlobRef::from(loaded.bundle);
         if let Some((reference_key, state)) = self

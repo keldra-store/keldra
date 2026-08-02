@@ -15,11 +15,13 @@ use crate::key::{
     decode_identity_value, tenant_name_key,
 };
 use crate::watch::{
-    LOCAL_INVALIDATION_BYTES_KEY, LOCAL_INVALIDATION_COUNT_KEY, LOCAL_INVALIDATION_EPOCH_KEY,
-    LOCAL_INVALIDATION_FLOOR_KEY, LOCAL_INVALIDATION_OFFSET_KEY, LOCAL_INVALIDATION_TOKEN_KEY,
-    LocalInvalidation, MAX_LOCAL_INVALIDATION_SCAN_RECORDS, WatchCursor, WatchError,
-    WatchJournalStatus, WatchPage, WatchRetention, WatchScope, WatchStart, decode_resume_token,
-    encode_resume_token, invalidation_key, invalidation_record_bytes, offset_from_key,
+    InvalidationStateHint, LOCAL_INVALIDATION_BYTES_KEY, LOCAL_INVALIDATION_COUNT_KEY,
+    LOCAL_INVALIDATION_EPOCH_KEY, LOCAL_INVALIDATION_FLOOR_KEY, LOCAL_INVALIDATION_OFFSET_KEY,
+    LOCAL_INVALIDATION_TOKEN_KEY, LocalChange, LocalInvalidation,
+    MAX_LOCAL_INVALIDATION_SCAN_RECORDS, ObjectHeadChangeKind, StoredLocalChange, WatchCursor,
+    WatchError, WatchJournalStatus, WatchPage, WatchRetention, WatchScope, WatchStart,
+    decode_local_change, decode_resume_token, encode_local_change, encode_resume_token,
+    invalidation_key, invalidation_record_bytes, offset_from_key,
 };
 use crate::{
     AWAITING_PUBLISH, BatchOperation, BatchOutcome, BlobReader, BlobRef, BlobReferenceState,

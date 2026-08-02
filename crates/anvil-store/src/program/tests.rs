@@ -263,12 +263,18 @@ async fn ordinary_blob_plane_attests_executor_local_durability() {
             .unwrap()
             .is_empty()
     );
-    let invalidations = store.scan_local_invalidations(0, 10).unwrap();
+    let invalidations = store
+        .scan_local_changes(0, 10)
+        .unwrap()
+        .into_iter()
+        .filter_map(|change| change.into_object_head())
+        .collect::<Vec<_>>();
     assert_eq!(invalidations.len(), 1);
-    assert_eq!(invalidations[0].key, object_key(&counter_path()).unwrap());
+    let counter_key = object_key(&counter_path()).unwrap();
+    assert_eq!(invalidations[0].exact_path, counter_key.path());
     assert_eq!(
-        invalidations[0].minimum_path_version,
-        store.head(&invalidations[0].key).unwrap().unwrap().version
+        invalidations[0].path_version,
+        store.head(&counter_key).unwrap().unwrap().version
     );
 
     // Recovery of an already-finalized commit must not append a duplicate
