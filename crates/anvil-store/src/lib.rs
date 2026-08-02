@@ -10,6 +10,7 @@ mod bootstrap;
 mod clock;
 mod erasure;
 mod key;
+mod logical_record;
 mod model;
 mod program;
 mod reference_delta;
@@ -42,6 +43,12 @@ pub use erasure::{
     ErasureCodec, ErasureError, ErasureProfile, FRAGMENT_FORMAT_VERSION,
 };
 pub use key::ObjectKey;
+pub use logical_record::{
+    BaselineHash, LOGICAL_RECORD_FORMAT, LogicalApplicationRecord, LogicalBucketRecord,
+    LogicalCredentialRecord, LogicalRecordApplied, LogicalRecordCandidate, LogicalRecordError,
+    LogicalRecordId, LogicalRecordMutation, LogicalRecordMutationContext, LogicalRecordPredecessor,
+    LogicalRecordValue, LogicalTenantRecord, LogicalTenantSchema,
+};
 pub use model::{
     BatchOperation, BatchOutcome, BucketPolicy, CoordinatedObjectMutation, DeleteRequest,
     DeleteRetainedVersionOutcome, Durability, Head, MAX_BUCKET_POLICY_PREFIX_BYTES,

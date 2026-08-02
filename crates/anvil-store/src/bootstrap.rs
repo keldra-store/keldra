@@ -24,9 +24,9 @@ use crate::{
 pub const SYSTEM_BOOTSTRAP_VERSION: u16 = 1;
 pub const SYSTEM_SCHEMA_ID: &str = "anvil-system";
 const SYSTEM_BOOTSTRAP_MARKER_KEY: &[u8] = b"system_bootstrap_complete";
-const CREDENTIAL_FORMAT_VERSION: u16 = 2;
-const APPLICATION_FORMAT_VERSION: u16 = 1;
-const PROVISIONING_FORMAT_VERSION: u16 = 1;
+pub(crate) const CREDENTIAL_FORMAT_VERSION: u16 = 2;
+pub(crate) const APPLICATION_FORMAT_VERSION: u16 = 1;
+pub(crate) const PROVISIONING_FORMAT_VERSION: u16 = 1;
 const MIN_CLIENT_SECRET_BYTES: usize = 32;
 const MAX_CLIENT_SECRET_BYTES: usize = 4 * 1024;
 const MAX_CLIENT_ID_BYTES: usize = 256;
@@ -251,21 +251,21 @@ struct BootstrapMarker {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct StoredApplicationCredential {
-    format_version: u16,
-    app_id: String,
-    client_id: String,
-    storage_tenant: StorageTenantId,
-    active: bool,
-    verifier: StoredCredentialVerifier,
+pub(crate) struct StoredApplicationCredential {
+    pub(crate) format_version: u16,
+    pub(crate) app_id: String,
+    pub(crate) client_id: String,
+    pub(crate) storage_tenant: StorageTenantId,
+    pub(crate) active: bool,
+    pub(crate) verifier: StoredCredentialVerifier,
 }
 
 /// KDF identity and costs are durable data so a later release can add an
 /// explicit migration branch without guessing which verifier produced a
 /// credential record.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "algorithm", rename_all = "snake_case")]
-enum StoredCredentialVerifier {
+pub(crate) enum StoredCredentialVerifier {
     Argon2id {
         version: u32,
         memory_cost_kib: u32,
@@ -277,33 +277,57 @@ enum StoredCredentialVerifier {
     },
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct StoredApplication {
-    format_version: u16,
-    app_id: String,
-    client_id: String,
-    storage_tenant: StorageTenantId,
+impl fmt::Debug for StoredCredentialVerifier {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Argon2id {
+                version,
+                memory_cost_kib,
+                time_cost,
+                parallelism,
+                output_length,
+                ..
+            } => formatter
+                .debug_struct("Argon2id")
+                .field("version", version)
+                .field("memory_cost_kib", memory_cost_kib)
+                .field("time_cost", time_cost)
+                .field("parallelism", parallelism)
+                .field("output_length", output_length)
+                .field("salt", &"[REDACTED]")
+                .field("output", &"[REDACTED]")
+                .finish(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct StoredTenant {
-    format_version: u16,
-    tenant_id: TenantId,
-    storage_tenant: StorageTenantId,
-    owner_app_id: String,
-    owner_client_id: String,
-    authorization_revision: AuthzRevision,
+pub(crate) struct StoredApplication {
+    pub(crate) format_version: u16,
+    pub(crate) app_id: String,
+    pub(crate) client_id: String,
+    pub(crate) storage_tenant: StorageTenantId,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct StoredBucket {
-    format_version: u16,
-    tenant_id: TenantId,
-    bucket_id: BucketId,
-    storage_tenant: StorageTenantId,
-    bucket: String,
-    owner: ObjectRef,
-    authorization_revision: AuthzRevision,
+pub(crate) struct StoredTenant {
+    pub(crate) format_version: u16,
+    pub(crate) tenant_id: TenantId,
+    pub(crate) storage_tenant: StorageTenantId,
+    pub(crate) owner_app_id: String,
+    pub(crate) owner_client_id: String,
+    pub(crate) authorization_revision: AuthzRevision,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct StoredBucket {
+    pub(crate) format_version: u16,
+    pub(crate) tenant_id: TenantId,
+    pub(crate) bucket_id: BucketId,
+    pub(crate) storage_tenant: StorageTenantId,
+    pub(crate) bucket: String,
+    pub(crate) owner: ObjectRef,
+    pub(crate) authorization_revision: AuthzRevision,
 }
 
 impl Store {
@@ -1131,7 +1155,7 @@ fn validate_application_request(
     validate_client_secret(&request.client_secret)
 }
 
-fn validate_client_id(client_id: &str) -> Result<(), SystemBootstrapError> {
+pub(crate) fn validate_client_id(client_id: &str) -> Result<(), SystemBootstrapError> {
     if client_id.is_empty()
         || client_id.len() > MAX_CLIENT_ID_BYTES
         || matches!(client_id, "." | "..")
@@ -1160,7 +1184,7 @@ fn validate_client_secret(client_secret: &str) -> Result<(), CredentialRepositor
     Ok(())
 }
 
-fn credential_from_stored(
+pub(crate) fn credential_from_stored(
     stored: &StoredApplicationCredential,
 ) -> Result<ApplicationCredential, CredentialRepositoryError> {
     if stored.format_version != CREDENTIAL_FORMAT_VERSION {
@@ -1185,7 +1209,7 @@ fn credential_from_stored(
     })
 }
 
-fn validate_stored_application(
+pub(crate) fn validate_stored_application(
     stored: &StoredApplication,
     expected_tenant: &StorageTenantId,
     expected_app_id: &str,
@@ -1210,7 +1234,7 @@ fn validate_stored_application(
     Ok(())
 }
 
-fn validate_stored_tenant(
+pub(crate) fn validate_stored_tenant(
     stored: &StoredTenant,
     expected_id: TenantId,
     expected: &StorageTenantId,
@@ -1229,7 +1253,7 @@ fn validate_stored_tenant(
     validate_client_id(&stored.owner_client_id).map_err(storage_error)
 }
 
-fn validate_stored_bucket(
+pub(crate) fn validate_stored_bucket(
     stored: &StoredBucket,
     expected_identity: BucketIdentity,
     expected_tenant: &StorageTenantId,
@@ -1250,7 +1274,7 @@ fn validate_stored_bucket(
     validate_application_for_tenant(&stored.owner, expected_tenant)
 }
 
-fn application_ref(app_id: &str) -> Result<ObjectRef, CredentialRepositoryError> {
+pub(crate) fn application_ref(app_id: &str) -> Result<ObjectRef, CredentialRepositoryError> {
     let application = ObjectRef::opaque(APP_NAMESPACE, app_id)
         .map_err(|error| CredentialRepositoryError::InvalidInput(error.to_string()))?;
     if application.is_public() {
@@ -1415,7 +1439,7 @@ fn credential_matches(
     Ok(bool::from(candidate.ct_eq(output)))
 }
 
-fn validate_stored_credential_verifier(
+pub(crate) fn validate_stored_credential_verifier(
     verifier: &StoredCredentialVerifier,
 ) -> Result<(), CredentialRepositoryError> {
     match verifier {
@@ -1464,26 +1488,26 @@ fn burn_dummy_credential_verification(secret: &[u8]) -> Result<(), CredentialRep
     Ok(())
 }
 
-fn credential_key(client_id: &str) -> Vec<u8> {
+pub(crate) fn credential_key(client_id: &str) -> Vec<u8> {
     let mut key = b"client\0".to_vec();
     key.extend_from_slice(client_id.as_bytes());
     key
 }
 
-fn application_key(app_id: &str) -> Vec<u8> {
+pub(crate) fn application_key(app_id: &str) -> Vec<u8> {
     let mut key = b"application\0".to_vec();
     key.extend_from_slice(app_id.as_bytes());
     key
 }
 
-fn tenant_record_key(tenant_id: TenantId) -> Vec<u8> {
+pub(crate) fn tenant_record_key(tenant_id: TenantId) -> Vec<u8> {
     let mut key = Vec::with_capacity(2 + size_of::<u64>());
     key.extend_from_slice(&[crate::key::STORAGE_KEY_FORMAT_VERSION, TENANT_NAME_TYPE]);
     key.extend_from_slice(&tenant_id.0.to_be_bytes());
     key
 }
 
-fn bucket_record_key(identity: BucketIdentity) -> Vec<u8> {
+pub(crate) fn bucket_record_key(identity: BucketIdentity) -> Vec<u8> {
     let mut key = Vec::with_capacity(2 + 2 * size_of::<u64>());
     key.extend_from_slice(&[crate::key::STORAGE_KEY_FORMAT_VERSION, BUCKET_NAME_TYPE]);
     key.extend_from_slice(&identity.tenant_id.0.to_be_bytes());

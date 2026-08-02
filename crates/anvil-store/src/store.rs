@@ -12,8 +12,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::key::{
     BucketId, BucketIdentity, STORAGE_KEY_FORMAT_VERSION, TenantId, bucket_name_key,
-    contains_reserved_anvil_segment, decode_identity_value, tenant_name_key,
+    contains_reserved_anvil_segment, tenant_name_key,
 };
+use crate::logical_record::decode_current_value;
 use crate::watch::{
     InvalidationStateHint, LOCAL_INVALIDATION_BYTES_KEY, LOCAL_INVALIDATION_COUNT_KEY,
     LOCAL_INVALIDATION_EPOCH_KEY, LOCAL_INVALIDATION_FLOOR_KEY, LOCAL_INVALIDATION_OFFSET_KEY,
@@ -40,7 +41,7 @@ pub(crate) const CF_SMALL_BLOBS: &str = "small_blobs";
 pub(crate) const CF_BUCKET_OPTIONS: &str = "bucket_options";
 pub(crate) const CF_NAMES: &str = "names";
 const CF_RECEIPTS: &str = "receipts";
-const CF_POLICIES: &str = "policies";
+pub(crate) const CF_POLICIES: &str = "policies";
 const CF_LOCAL_INVALIDATIONS: &str = "local_invalidations";
 pub(crate) const CF_METADATA: &str = "metadata";
 pub(crate) const CF_AUTHZ_TENANTS: &str = "authz_tenants";
@@ -475,15 +476,23 @@ impl Store {
         &self,
         tenant: &str,
     ) -> Result<Option<TenantId>, MutationError> {
-        StorageTenantId::parse(tenant)
+        let storage_tenant = StorageTenantId::parse(tenant)
             .map_err(|error| MutationError::Storage(error.to_string()))?;
         self.db
             .get_cf(self.cf(CF_NAMES)?, tenant_name_key(tenant))
             .map_err(storage_error)?
             .map(|encoded| {
-                decode_identity_value(&encoded)
-                    .map(TenantId)
-                    .map_err(storage_error)
+                let id = crate::LogicalRecordId::TenantNameClaim {
+                    storage_tenant: storage_tenant.clone(),
+                };
+                match decode_current_value(&id, &encoded).map_err(storage_error)? {
+                    crate::LogicalRecordValue::TenantNameClaim { tenant_id, .. } => {
+                        Ok(TenantId(tenant_id))
+                    }
+                    _ => Err(MutationError::Storage(
+                        "tenant name claim has the wrong logical type".into(),
+                    )),
+                }
             })
             .transpose()
     }
@@ -497,9 +506,18 @@ impl Store {
             .get_cf(self.cf(CF_NAMES)?, bucket_name_key(tenant_id, bucket))
             .map_err(storage_error)?
             .map(|encoded| {
-                decode_identity_value(&encoded)
-                    .map(BucketId)
-                    .map_err(storage_error)
+                let id = crate::LogicalRecordId::BucketNameClaim {
+                    tenant_id: tenant_id.0,
+                    bucket: bucket.to_owned(),
+                };
+                match decode_current_value(&id, &encoded).map_err(storage_error)? {
+                    crate::LogicalRecordValue::BucketNameClaim { bucket_id, .. } => {
+                        Ok(BucketId(bucket_id))
+                    }
+                    _ => Err(MutationError::Storage(
+                        "bucket name claim has the wrong logical type".into(),
+                    )),
+                }
             })
             .transpose()
     }
@@ -529,6 +547,22 @@ impl Store {
             tenant_id,
             bucket_id,
         })
+    }
+
+    /// Resolves mutable tenant and bucket names to their permanent storage
+    /// identities without exposing RocksDB column families or key encodings.
+    pub fn resolve_bucket_ids(
+        &self,
+        tenant: &str,
+        bucket: &str,
+    ) -> Result<(u64, u64), MutationError> {
+        let identity = self.resolve_bucket_identity(tenant, bucket)?;
+        if identity.tenant_id.0 == 0 || identity.bucket_id.0 == 0 {
+            return Err(MutationError::Storage(
+                "stable tenant and bucket IDs must be non-zero".into(),
+            ));
+        }
+        Ok((identity.tenant_id.0, identity.bucket_id.0))
     }
 
     #[cfg(test)]
@@ -927,14 +961,14 @@ fn fail_prepared_operations(
         .collect()
 }
 
-fn encode_object_versioning(versioning: ObjectVersioning) -> [u8; 1] {
+pub(crate) fn encode_object_versioning(versioning: ObjectVersioning) -> [u8; 1] {
     [match versioning {
         ObjectVersioning::Unversioned => 0,
         ObjectVersioning::Enabled => 1,
     }]
 }
 
-fn decode_object_versioning(encoded: &[u8]) -> Result<ObjectVersioning, MutationError> {
+pub(crate) fn decode_object_versioning(encoded: &[u8]) -> Result<ObjectVersioning, MutationError> {
     match encoded {
         [0] => Ok(ObjectVersioning::Unversioned),
         [1] => Ok(ObjectVersioning::Enabled),

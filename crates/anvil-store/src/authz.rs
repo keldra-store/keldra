@@ -437,10 +437,10 @@ impl Store {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct StoredSchema {
-    schema_ref: SchemaRef,
-    schema: Schema,
-    published_at_revision: AuthzRevision,
+pub(crate) struct StoredSchema {
+    pub(crate) schema_ref: SchemaRef,
+    pub(crate) schema: Schema,
+    pub(crate) published_at_revision: AuthzRevision,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1566,7 +1566,7 @@ fn validate_stored_tuple_receipt_shape(stored: &StoredTupleReceipt) -> Result<()
     validate_principal(&stored.receipt.principal)
 }
 
-fn validate_stored_schema(
+pub(crate) fn validate_stored_schema(
     stored: &StoredSchema,
     expected: &SchemaRef,
     limits: AuthorizationLimits,
@@ -1675,7 +1675,7 @@ fn schema_latest_key(tenant: &StorageTenantId, schema_id: &SchemaId) -> Vec<u8> 
     key
 }
 
-fn schema_revision_key(tenant: &StorageTenantId, schema_ref: &SchemaRef) -> Vec<u8> {
+pub(crate) fn schema_revision_key(tenant: &StorageTenantId, schema_ref: &SchemaRef) -> Vec<u8> {
     let mut key = vec![b'S'];
     push_component(&mut key, tenant.as_str().as_bytes());
     push_component(&mut key, schema_ref.schema_id.as_str().as_bytes());
