@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::key::{
     BucketId, BucketIdentity, STORAGE_KEY_FORMAT_VERSION, TenantId, bucket_name_key,
-    decode_identity_value, tenant_name_key,
+    contains_reserved_anvil_segment, decode_identity_value, tenant_name_key,
 };
 use crate::watch::{
     InvalidationStateHint, LOCAL_INVALIDATION_BYTES_KEY, LOCAL_INVALIDATION_COUNT_KEY,

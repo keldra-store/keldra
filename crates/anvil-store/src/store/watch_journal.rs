@@ -203,7 +203,7 @@ impl Store {
             {
                 let key = ObjectKey::new(scope.tenant(), scope.bucket(), head.exact_path)
                     .map_err(|error| WatchError::Storage(error.to_string()))?;
-                if scope.contains(&key) {
+                if scope.contains(&key) && !contains_reserved_anvil_segment(key.path()) {
                     invalidations.push(LocalInvalidation {
                         offset: head.offset,
                         key,

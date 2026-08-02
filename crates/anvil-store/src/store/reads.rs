@@ -58,7 +58,10 @@ impl Store {
                 .decode_head_path(&stored_key)
                 .map_err(storage_error)?;
             let head = serde_json::from_slice::<Head>(&encoded_head).map_err(storage_error)?;
-            if head.deleted || start_after.is_some_and(|cursor| path <= cursor) {
+            if head.deleted
+                || contains_reserved_anvil_segment(path)
+                || start_after.is_some_and(|cursor| path <= cursor)
+            {
                 continue;
             }
             paths.push(path.to_owned());

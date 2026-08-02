@@ -143,6 +143,10 @@ impl ObjectKey {
     }
 }
 
+pub(crate) fn contains_reserved_anvil_segment(path: &str) -> bool {
+    path.split('/').any(|segment| segment == "_anvil")
+}
+
 pub(crate) fn tenant_name_key(name: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(2 + name.len());
     key.extend_from_slice(&[STORAGE_KEY_FORMAT_VERSION, TENANT_NAME_TYPE]);
@@ -228,6 +232,13 @@ mod tests {
             ObjectKey::new("t", "b", "a/../b").unwrap_err(),
             ObjectKeyError::NonCanonicalPath
         );
+    }
+
+    #[test]
+    fn reserved_anvil_paths_match_exact_segments_only() {
+        assert!(contains_reserved_anvil_segment("_anvil"));
+        assert!(contains_reserved_anvil_segment("a/_anvil/meta.json"));
+        assert!(!contains_reserved_anvil_segment("_anvilish"));
     }
 
     #[test]

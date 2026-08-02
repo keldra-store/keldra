@@ -340,9 +340,20 @@ async fn program_only_policy_reports_concurrency_violation_for_every_direct_writ
 #[tokio::test]
 async fn list_objects_seeks_the_stable_id_head_prefix_and_returns_lexical_live_pages() {
     let (_temporary, store) = store().await;
-    for (index, path) in ["z", "aa", "b", "foo", "foo/bar", "foobar", "foo/deleted"]
-        .into_iter()
-        .enumerate()
+    for (index, path) in [
+        "z",
+        "aa",
+        "b",
+        "foo",
+        "foo/bar",
+        "foobar",
+        "foo/deleted",
+        "_anvil",
+        "a/_anvil/meta.json",
+        "_anvilish",
+    ]
+    .into_iter()
+    .enumerate()
     {
         store
             .put(put(
@@ -400,7 +411,7 @@ async fn list_objects_seeks_the_stable_id_head_prefix_and_returns_lexical_live_p
         .unwrap();
     assert_eq!(
         all.paths,
-        ["aa", "b", "foo", "foo/bar", "foobar", "z"]
+        ["_anvilish", "aa", "b", "foo", "foo/bar", "foobar", "z"]
             .map(str::to_owned)
             .to_vec()
     );

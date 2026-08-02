@@ -267,6 +267,34 @@ async fn watch_starts_resume_and_checkpoint_across_unrelated_paths_and_restart()
 }
 
 #[tokio::test]
+async fn public_watch_hides_reserved_segments_and_advances_its_checkpoint() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = Store::open(StoreOptions::new(temporary.path(), 1))
+        .await
+        .unwrap();
+    seed_bucket_identity(&store);
+    let scope = WatchScope::new("tenant", "bucket", "").unwrap();
+    let cursor = store.start_watch(&scope, WatchStart::Now).unwrap();
+
+    for (path, command) in [
+        ("_anvil", "reserved-root"),
+        ("a/_anvil/meta.json", "reserved-descendant"),
+        ("_anvilish", "ordinary-path"),
+    ] {
+        store
+            .put(put(path, path.as_bytes(), command))
+            .await
+            .unwrap();
+    }
+
+    let page = store.scan_watch_page(&scope, cursor, 10).await.unwrap();
+    assert_eq!(page.checkpoint.offset(), 3);
+    assert_eq!(page.invalidations.len(), 1);
+    assert_eq!(page.invalidations[0].offset, 3);
+    assert_eq!(page.invalidations[0].key, key("_anvilish"));
+}
+
+#[tokio::test]
 async fn entry_retention_prunes_in_the_head_batch_and_expires_stale_tokens() {
     let temporary = tempfile::tempdir().unwrap();
     let store = Store::open(
