@@ -6,6 +6,7 @@ mod authz_service;
 mod bootstrap;
 mod credential_service;
 pub mod observability;
+mod mutable_record_quorum;
 mod programs;
 mod serving_fence;
 mod v05;
