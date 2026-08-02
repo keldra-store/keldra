@@ -372,6 +372,28 @@ pub enum AuthzStoreError {
     ReceiptCapacity,
     #[error("operation id is already bound to different tuple input")]
     OperationMismatch,
+    #[error("invalid replicated authorization realm mutation: {0}")]
+    InvalidRealmMutation(String),
+    #[error(
+        "replicated authorization realm mutation has a lineage gap: local revision {current:?}, incoming predecessor {predecessor:?}"
+    )]
+    RealmMutationLineageGap {
+        current: Option<AuthzRevision>,
+        predecessor: Option<AuthzRevision>,
+    },
+    #[error(
+        "replicated authorization realm mutation is stale: local revision {current:?}, incoming revision {incoming:?}"
+    )]
+    RealmMutationStale {
+        current: AuthzRevision,
+        incoming: AuthzRevision,
+    },
+    #[error(
+        "replicated authorization realm mutations are contradictory siblings of {predecessor:?}"
+    )]
+    RealmMutationSibling { predecessor: Option<AuthzRevision> },
+    #[error("replicated authorization realm mutation conflicts with durable state")]
+    RealmMutationConflict,
     #[error("authorization validation failed: {0}")]
     Authorization(#[from] anvil_authz::AuthorizationError),
     #[error("authorization storage failed: {0}")]
@@ -414,19 +436,19 @@ impl Store {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct StoredSchema {
     schema_ref: SchemaRef,
     schema: Schema,
     published_at_revision: AuthzRevision,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct StoredTuple {
     tuple: Tuple,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct StoredTupleReceipt {
     format: u16,
     operation_id: String,
@@ -434,6 +456,10 @@ struct StoredTupleReceipt {
     expires_at_unix_millis: u64,
     fingerprint: [u8; 32],
     receipt: TupleBatchReceipt,
+    /// Present only for coordinator-produced 0.5.1 realm mutations. Released
+    /// 0.5.0 receipts decode with this absent and remain valid local receipts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    realm_mutation: Option<AuthzRealmMutation>,
 }
 
 const STORED_TUPLE_RECEIPT_FORMAT: u16 = 1;
@@ -889,6 +915,7 @@ impl AuthzRepository {
                 expires_at_unix_millis: replay_guarantee_expires_at_unix_millis,
                 fingerprint,
                 receipt: receipt.clone(),
+                realm_mutation: None,
             };
             let encoded = encode_json(&stored)?;
             let encoded_bytes = receipt_record_bytes(&key, &encoded)?;
@@ -1704,3 +1731,6 @@ fn receipt_key(
 
 #[cfg(test)]
 mod tests;
+
+mod replication;
+pub use replication::*;

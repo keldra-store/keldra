@@ -1,0 +1,274 @@
+use anvil_authz::{
+    AllowedSubject, NamespaceDefinition, ObjectRef, RealmId, RelationDefinition, RewriteRule,
+    Schema, Tuple,
+};
+use tempfile::TempDir;
+
+use super::*;
+use crate::{AuthzConsistency, SchemaId, Store, StoreOptions};
+
+fn tenant() -> StorageTenantId {
+    StorageTenantId::parse("acme").unwrap()
+}
+
+fn scope() -> AuthzScope {
+    AuthzScope::new(tenant(), RealmId::parse("documents").unwrap()).unwrap()
+}
+
+fn principal(name: &str) -> ObjectRef {
+    ObjectRef::opaque("app", name).unwrap()
+}
+
+fn tuple(document: &str, user: &str) -> Tuple {
+    Tuple::new(
+        ObjectRef::opaque("document", document).unwrap(),
+        "viewer",
+        principal(user),
+    )
+}
+
+fn schema() -> Schema {
+    Schema::new([NamespaceDefinition::new(
+        "document",
+        [
+            RelationDefinition::direct("viewer", [AllowedSubject::any_object("app")]),
+            RelationDefinition::permission(
+                "view",
+                [RewriteRule::Inherit {
+                    relation: "viewer".into(),
+                }],
+            ),
+        ],
+    )])
+}
+
+fn context(command_id: &str, node_id: u16, position: u64) -> AuthzRealmMutationContext {
+    AuthzRealmMutationContext {
+        command_id: command_id.into(),
+        active_placement_log_id: PlacementLogId { term: 3, index: 9 },
+        serving_fence_term: 3,
+        source_id: SourceId {
+            node_id,
+            source_epoch: [node_id as u8; 32],
+        },
+        source_journal_position: position,
+    }
+}
+
+async fn stores() -> (TempDir, Store, Store) {
+    let root = tempfile::tempdir().unwrap();
+    let coordinator = Store::open(StoreOptions::new(root.path().join("coordinator"), 1))
+        .await
+        .unwrap();
+    let replica = Store::open(StoreOptions::new(root.path().join("replica"), 2))
+        .await
+        .unwrap();
+    (root, coordinator, replica)
+}
+
+fn publish(repository: &AuthzRepository) -> super::super::PublishedSchema {
+    repository
+        .publish_schema(super::super::PublishSchemaRequest {
+            storage_tenant: tenant(),
+            schema_id: SchemaId::parse("documents").unwrap(),
+            schema: schema(),
+            expected_revision: Some(AuthzRevision::ZERO),
+        })
+        .unwrap()
+}
+
+fn bind_request(schema_ref: super::super::SchemaRef) -> BindSchemaRequest {
+    BindSchemaRequest {
+        scope: scope(),
+        schema_ref,
+        expected_generation: Some(0),
+        expected_revision: Some(AuthzRevision(1)),
+    }
+}
+
+fn tuple_request(operation: &str, revision: u64, document: &str, user: &str) -> TupleBatchRequest {
+    TupleBatchRequest {
+        scope: scope(),
+        principal: principal("writer"),
+        expected_revision: Some(AuthzRevision(revision)),
+        expected_binding_generation: 1,
+        operation_id: Some(operation.into()),
+        mutations: vec![TupleMutation {
+            kind: TupleMutationKind::Add,
+            tuple: tuple(document, user),
+        }],
+    }
+}
+
+#[tokio::test]
+async fn complete_realm_mutations_apply_to_a_second_store_and_replay_exactly() {
+    let (_root, coordinator, replica) = stores().await;
+    let coordinator_repository = coordinator.authz();
+    let replica_repository = replica.authz();
+    let published = publish(&coordinator_repository);
+
+    let coordinated_binding = coordinator_repository
+        .coordinate_bind_schema_mutation(
+            bind_request(published.schema_ref.clone()),
+            context("bind-documents", 1, 1),
+        )
+        .unwrap();
+    let binding_mutation = coordinated_binding.mutation.unwrap();
+    assert_eq!(binding_mutation.stamp.predecessor_revision, None);
+    assert_eq!(replica.local_watch_status().unwrap().tail, 0);
+    let applied = replica_repository
+        .apply_authz_realm_mutation_replica(&binding_mutation)
+        .unwrap();
+    assert!(!applied.replayed);
+    assert_eq!(replica.local_watch_status().unwrap().tail, 0);
+    assert_eq!(
+        replica_repository
+            .get_schema(&tenant(), &published.schema_ref)
+            .unwrap(),
+        Some(canonical_schema(schema(), AuthorizationLimits::default()).unwrap())
+    );
+
+    let request = tuple_request("grant-alice", 2, "one", "alice");
+    let coordinated_tuple = coordinator_repository
+        .coordinate_tuple_mutation(request.clone(), context("grant-alice", 1, 2))
+        .unwrap();
+    let tuple_mutation = coordinated_tuple.mutation.clone().unwrap();
+    assert_eq!(
+        tuple_mutation.stamp.predecessor_revision,
+        Some(AuthzRevision(2))
+    );
+    let applied = replica_repository
+        .apply_authz_realm_mutation_replica(&tuple_mutation)
+        .unwrap();
+    assert!(!applied.replayed);
+    assert_eq!(replica.local_watch_status().unwrap().tail, 0);
+
+    let coordinator_snapshot = coordinator_repository
+        .realm_snapshot(&scope(), AuthzConsistency::Latest)
+        .unwrap();
+    let replica_snapshot = replica_repository
+        .realm_snapshot(&scope(), AuthzConsistency::Latest)
+        .unwrap();
+    assert_eq!(replica_snapshot, coordinator_snapshot);
+    assert_eq!(replica_snapshot.tuples, vec![tuple("one", "alice")]);
+
+    let sequence = replica_repository.db.latest_sequence_number();
+    let replay = replica_repository
+        .apply_authz_realm_mutation_replica(&tuple_mutation)
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replica_repository.db.latest_sequence_number(), sequence);
+
+    let coordinator_replay = coordinator_repository
+        .coordinate_tuple_mutation(request, context("grant-alice", 1, 99))
+        .unwrap();
+    assert!(matches!(
+        coordinator_replay.result,
+        CoordinatedAuthzRealmResult::Tuples(TupleBatchReceipt { replayed: true, .. })
+    ));
+    assert_eq!(coordinator_replay.mutation, Some(tuple_mutation));
+}
+
+#[tokio::test]
+async fn replicas_reject_gaps_stale_mutations_siblings_and_tampering() {
+    let (root, coordinator, replica) = stores().await;
+    let coordinator_repository = coordinator.authz();
+    let published = publish(&coordinator_repository);
+    let bind = coordinator_repository
+        .coordinate_bind_schema_mutation(
+            bind_request(published.schema_ref),
+            context("bind-documents", 1, 1),
+        )
+        .unwrap()
+        .mutation
+        .unwrap();
+    let first = coordinator_repository
+        .coordinate_tuple_mutation(
+            tuple_request("grant-alice", 2, "one", "alice"),
+            context("grant-alice", 1, 2),
+        )
+        .unwrap()
+        .mutation
+        .unwrap();
+    let second = coordinator_repository
+        .coordinate_tuple_mutation(
+            tuple_request("grant-bob", 3, "two", "bob"),
+            context("grant-bob", 1, 3),
+        )
+        .unwrap()
+        .mutation
+        .unwrap();
+
+    let replica_repository = replica.authz();
+    replica_repository
+        .apply_authz_realm_mutation_replica(&bind)
+        .unwrap();
+    assert!(matches!(
+        replica_repository.apply_authz_realm_mutation_replica(&second),
+        Err(AuthzStoreError::RealmMutationLineageGap {
+            current: Some(AuthzRevision(2)),
+            predecessor: Some(AuthzRevision(3)),
+        })
+    ));
+    replica_repository
+        .apply_authz_realm_mutation_replica(&first)
+        .unwrap();
+
+    let mut sibling = first.clone();
+    sibling.command_id = "grant-alice-sibling".into();
+    sibling.input_fingerprint = [17; 32];
+    sibling.set_computed_fingerprint();
+    sibling.validate().unwrap();
+    assert!(matches!(
+        replica_repository.apply_authz_realm_mutation_replica(&sibling),
+        Err(AuthzStoreError::RealmMutationSibling {
+            predecessor: Some(AuthzRevision(2)),
+        })
+    ));
+
+    replica_repository
+        .apply_authz_realm_mutation_replica(&second)
+        .unwrap();
+    assert!(matches!(
+        replica_repository.apply_authz_realm_mutation_replica(&bind),
+        Err(AuthzStoreError::RealmMutationStale { .. })
+    ));
+
+    let mut tampered = second;
+    tampered.input_fingerprint[0] ^= 1;
+    assert!(matches!(
+        tampered.validate(),
+        Err(AuthzStoreError::InvalidRealmMutation(_))
+    ));
+
+    let empty = Store::open(StoreOptions::new(root.path().join("empty"), 3))
+        .await
+        .unwrap();
+    assert!(matches!(
+        empty.authz().apply_authz_realm_mutation_replica(&first),
+        Err(AuthzStoreError::RealmMutationLineageGap {
+            current: None,
+            predecessor: Some(AuthzRevision(2)),
+        })
+    ));
+}
+
+#[test]
+fn released_unstamped_binding_json_decodes_as_a_committed_baseline() {
+    let binding = RealmBinding {
+        scope: scope(),
+        schema_ref: super::super::SchemaRef {
+            schema_id: SchemaId::parse("documents").unwrap(),
+            schema_revision: 1,
+            schema_digest: super::super::SchemaDigest([4; 32]),
+        },
+        generation: 1,
+        authz_revision: AuthzRevision(7),
+        tuple_count: 0,
+    };
+    let released = serde_json::to_vec(&binding).unwrap();
+    let decoded: StoredRealmBinding = serde_json::from_slice(&released).unwrap();
+    assert_eq!(decoded.binding, binding);
+    assert_eq!(decoded.mutation_stamp, None);
+    assert_eq!(decoded.aggregate_revision, None);
+}

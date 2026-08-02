@@ -17,13 +17,15 @@ mod store;
 mod watch;
 
 pub use authz::{
-    AtomicRealmBinding, AuthzBatchCheck, AuthzConsistency, AuthzRepository, AuthzRevision,
-    AuthzScope, AuthzStoreError, AuthzStoreLimits, BindSchemaRequest, BoundRealm,
-    DEFAULT_AUTHZ_RECEIPT_MAX_BYTES, DEFAULT_AUTHZ_RECEIPT_MAX_ENTRIES,
-    DEFAULT_AUTHZ_RECEIPT_RETENTION_SECONDS, ProtectedRealmOwnership, PublishSchemaRequest,
-    PublishedSchema, RealmBinding, RealmSnapshot, SYSTEM_STORAGE_TENANT_ID, SchemaDigest, SchemaId,
-    SchemaRef, StorageTenantId, TupleBatchReceipt, TupleBatchRequest, TupleMutation,
-    TupleMutationKind,
+    AUTHZ_REALM_MUTATION_FORMAT, AUTHZ_REALM_MUTATION_STAMP_FORMAT, AtomicRealmBinding,
+    AuthzBatchCheck, AuthzConsistency, AuthzRealmChange, AuthzRealmMutation,
+    AuthzRealmMutationContext, AuthzRealmMutationStamp, AuthzRealmSchema, AuthzRepository,
+    AuthzRevision, AuthzScope, AuthzStoreError, AuthzStoreLimits, BindSchemaRequest, BoundRealm,
+    CoordinatedAuthzRealmMutation, CoordinatedAuthzRealmResult, DEFAULT_AUTHZ_RECEIPT_MAX_BYTES,
+    DEFAULT_AUTHZ_RECEIPT_MAX_ENTRIES, DEFAULT_AUTHZ_RECEIPT_RETENTION_SECONDS,
+    ProtectedRealmOwnership, PublishSchemaRequest, PublishedSchema, RealmBinding, RealmSnapshot,
+    ReplicaAuthzRealmMutationApplied, SYSTEM_STORAGE_TENANT_ID, SchemaDigest, SchemaId, SchemaRef,
+    StorageTenantId, TupleBatchReceipt, TupleBatchRequest, TupleMutation, TupleMutationKind,
 };
 pub use blob::{AWAITING_PUBLISH, BlobReader, BlobRef, BlobReferenceState, BlobStore, BlobUpload};
 pub use bootstrap::{

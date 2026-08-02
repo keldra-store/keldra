@@ -531,6 +531,15 @@ fn authz_store_status(error: AuthzStoreError) -> Status {
         }
         AuthzStoreError::RevisionExpired { .. } => Status::failed_precondition(error.to_string()),
         AuthzStoreError::ReceiptCapacity => Status::resource_exhausted(error.to_string()),
+        AuthzStoreError::RealmMutationLineageGap { .. }
+        | AuthzStoreError::RealmMutationStale { .. }
+        | AuthzStoreError::RealmMutationSibling { .. }
+        | AuthzStoreError::RealmMutationConflict => {
+            Status::unavailable("authorization realm replica is not current")
+        }
+        AuthzStoreError::InvalidRealmMutation(_) => {
+            Status::internal("authorization replication input was invalid")
+        }
         AuthzStoreError::Storage(_) => Status::internal(error.to_string()),
     }
 }
