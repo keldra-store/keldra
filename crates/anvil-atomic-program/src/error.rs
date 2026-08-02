@@ -12,14 +12,14 @@ pub enum EngineError {
     Read(String),
     #[error("head precondition failed for {path:?}: {reason}")]
     HeadPrecondition { path: ObjectPath, reason: String },
+    #[error("program concurrency requirement failed for {path:?}: {reason}")]
+    ProgramConcurrency { path: ObjectPath, reason: String },
     #[error("assertion {index} failed: {reason}")]
     Assertion { index: usize, reason: String },
     #[error("operation {index} failed: {reason}")]
     Operation { index: usize, reason: String },
     #[error("return `{name}` failed: {reason}")]
     Return { name: String, reason: String },
-    #[error("emission {index} failed: {reason}")]
-    Emission { index: usize, reason: String },
     #[error("reader returned an invalid snapshot: {0}")]
     InvalidSnapshot(String),
     #[error("program execution limit exceeded: {0}")]

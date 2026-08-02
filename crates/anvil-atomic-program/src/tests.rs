@@ -155,23 +155,12 @@ fn definition() -> ProgramDefinition {
                 value: document_value("account", "/balance", DocumentView::Before),
             },
         ],
-        emissions: vec![EmissionDefinition {
-            route_id: "account.event-recorded".into(),
-            payload: PayloadSource::Json {
-                value: ValueSource::Document {
-                    source: document_value("ledger", "", DocumentView::Current),
-                },
-            },
-            content_type: "application/json".into(),
-        }],
         caps: ProgramCaps {
             max_paths: 5,
             max_writes: 4,
             max_operations: 16,
-            max_emissions: 1,
             max_input_bytes: 1024 * 1024,
             max_document_bytes: 1024 * 1024,
-            max_emitted_bytes: 1024 * 1024,
         },
     }
 }
@@ -291,17 +280,84 @@ fn expanded_paths_are_available_for_authorization_before_reads_or_locks() {
 
     assert_eq!(reads.load(Ordering::SeqCst), 0);
     assert_eq!(paths.len(), 3);
+    assert!(paths.iter().all(|candidate| candidate.intent.get));
+    assert!(paths.iter().all(|candidate| candidate.intent.put));
+    assert!(paths.iter().all(|candidate| !candidate.intent.delete));
+}
+
+#[test]
+fn expanded_intent_distinguishes_put_delete_and_unused_write_permission() {
+    let mut definition = definition();
+    definition.documents.push(DocumentSpec {
+        name: "deleted".into(),
+        path: PathTemplate::new("{tenant}", "objects", "deleted"),
+        cardinality: Cardinality::One,
+        access: DocumentAccess::ReadWrite,
+        allow_initial_json: false,
+    });
+    definition.documents.push(DocumentSpec {
+        name: "unused".into(),
+        path: PathTemplate::new("{tenant}", "objects", "unused"),
+        cardinality: Cardinality::One,
+        access: DocumentAccess::ReadWrite,
+        allow_initial_json: false,
+    });
+    definition.operations.push(Operation::RemoveValue {
+        target: pointer("deleted", ""),
+    });
+    definition.caps.max_paths = 7;
+    definition.caps.max_writes = 6;
+
+    let mut invocation = invocation();
+    invocation.bindings.insert(
+        "deleted".into(),
+        vec![PathBinding {
+            path: path("deleted"),
+            template_values: Default::default(),
+            expected_head: ExpectedHead::Any,
+            initial_json: None,
+        }],
+    );
+    invocation.bindings.insert(
+        "unused".into(),
+        vec![PathBinding {
+            path: path("unused"),
+            template_values: Default::default(),
+            expected_head: ExpectedHead::Any,
+            initial_json: None,
+        }],
+    );
+
+    let engine = AtomicProgramEngine::new(definition, TestReader::new(snapshot())).unwrap();
+    let paths = engine.expanded_paths(&context(), &invocation).unwrap();
+    let deleted = paths
+        .iter()
+        .find(|candidate| candidate.path.path == "deleted")
+        .unwrap();
     assert_eq!(
-        paths
-            .iter()
-            .filter(|candidate| candidate.access == DocumentAccess::ReadWrite)
-            .count(),
-        3
+        deleted.intent,
+        ProgramPathIntent {
+            get: true,
+            put: false,
+            delete: true,
+        }
+    );
+    let unused = paths
+        .iter()
+        .find(|candidate| candidate.path.path == "unused")
+        .unwrap();
+    assert_eq!(
+        unused.intent,
+        ProgramPathIntent {
+            get: true,
+            put: false,
+            delete: false,
+        }
     );
 }
 
 #[tokio::test]
-async fn evaluates_typed_updates_copy_views_and_durable_outputs() {
+async fn evaluates_typed_updates_copy_views_and_outputs() {
     let reader = TestReader::new(snapshot());
     let reader_handle = reader.clone();
     let engine = AtomicProgramEngine::new(definition(), reader).unwrap();
@@ -328,15 +384,6 @@ async fn evaluates_typed_updates_copy_views_and_durable_outputs() {
     assert_eq!(bundle.outputs["balance"], json!(75));
     assert_eq!(bundle.outputs["original_balance"], json!(100));
     assert_eq!(bundle.receipt.outputs, bundle.outputs);
-    assert_eq!(bundle.emissions.len(), 1);
-    assert_eq!(
-        bundle.receipt.emission_effect_ids,
-        vec![bundle.emissions[0].effect_id.clone()]
-    );
-    assert_eq!(
-        bundle.emissions[0].payload,
-        EmissionPayload::Json(json!({"balance_before": 100, "balance_after": 75}))
-    );
 
     let requested = reader_handle.requested.lock().unwrap().clone();
     assert!(requested.windows(2).all(|pair| pair[0] < pair[1]));
@@ -458,23 +505,23 @@ async fn rejects_unbounded_or_mismatched_bindings_before_reading() {
     assert_eq!(reader_handle.reads.load(Ordering::SeqCst), 0);
 }
 
-#[tokio::test]
-async fn effect_ids_are_scoped_to_the_full_program_object_path() {
-    let first = AtomicProgramEngine::new(definition(), TestReader::new(snapshot()))
+#[test]
+fn removed_emission_schema_is_rejected_instead_of_silently_ignored() {
+    let mut with_emissions = serde_json::to_value(definition()).unwrap();
+    with_emissions
+        .as_object_mut()
         .unwrap()
-        .prepare(&context(), &invocation())
-        .await
+        .insert("emissions".into(), json!([]));
+    let error = serde_json::from_value::<ProgramDefinition>(with_emissions).unwrap_err();
+    assert!(error.to_string().contains("unknown field `emissions`"));
+
+    let mut with_emission_cap = serde_json::to_value(definition()).unwrap();
+    with_emission_cap["caps"]
+        .as_object_mut()
         .unwrap()
-        .release();
-    let mut other_program_object = invocation();
-    other_program_object.program_path_hash = [0x22; 32];
-    let second = AtomicProgramEngine::new(definition(), TestReader::new(snapshot()))
-        .unwrap()
-        .prepare(&context(), &other_program_object)
-        .await
-        .unwrap()
-        .release();
-    assert_ne!(first.emissions[0].effect_id, second.emissions[0].effect_id);
+        .insert("max_emissions".into(), json!(1));
+    let error = serde_json::from_value::<ProgramDefinition>(with_emission_cap).unwrap_err();
+    assert!(error.to_string().contains("unknown field `max_emissions`"));
 }
 
 #[tokio::test]
@@ -516,6 +563,44 @@ async fn local_locks_are_canonical_and_serialize_reverse_order_requests() {
         .unwrap()
         .unwrap();
     assert_eq!(second.paths(), &[a, b]);
+}
+
+#[tokio::test]
+async fn cancelling_a_partial_lock_wait_releases_every_acquired_lock() {
+    let locks = LocalLockManager::default();
+    let a = path("a");
+    let b = path("b");
+    let held_b = locks.acquire(std::slice::from_ref(&b)).await;
+
+    let waiting_locks = locks.clone();
+    let waiting_a = a.clone();
+    let waiting_b = b.clone();
+    let waiting = tokio::spawn(async move { waiting_locks.acquire(&[waiting_a, waiting_b]).await });
+    tokio::task::yield_now().await;
+    assert!(
+        timeout(
+            Duration::from_millis(20),
+            locks.acquire(std::slice::from_ref(&a))
+        )
+        .await
+        .is_err(),
+        "the waiter must acquire the first canonical lock before blocking on the second"
+    );
+    waiting.abort();
+    assert!(waiting.await.unwrap_err().is_cancelled());
+
+    let acquired_a = timeout(
+        Duration::from_secs(1),
+        locks.acquire(std::slice::from_ref(&a)),
+    )
+    .await
+    .expect("cancelling the waiter must release its already-acquired first lock");
+    drop(acquired_a);
+    drop(held_b);
+
+    timeout(Duration::from_secs(1), locks.acquire(&[a, b]))
+        .await
+        .expect("cancelling the waiter must not leave either lock held");
 }
 
 #[test]

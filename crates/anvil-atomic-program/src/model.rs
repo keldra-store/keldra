@@ -83,10 +83,8 @@ pub struct ProgramCaps {
     pub max_paths: usize,
     pub max_writes: usize,
     pub max_operations: usize,
-    pub max_emissions: usize,
     pub max_input_bytes: usize,
     pub max_document_bytes: usize,
-    pub max_emitted_bytes: usize,
 }
 
 impl Default for ProgramCaps {
@@ -95,10 +93,8 @@ impl Default for ProgramCaps {
             max_paths: 16,
             max_writes: 16,
             max_operations: 64,
-            max_emissions: 8,
             max_input_bytes: 1024 * 1024,
             max_document_bytes: 1024 * 1024,
-            max_emitted_bytes: 1024 * 1024,
         }
     }
 }
@@ -135,13 +131,26 @@ pub enum DocumentAccess {
     ReadWrite,
 }
 
+/// Conservative authorization intent for one fully expanded path.
+///
+/// These flags are derived from the immutable program definition before any
+/// lock or read is taken. They describe every operation the bounded program
+/// can perform on this particular document reference, not merely the write it
+/// happens to produce for one invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProgramPathIntent {
+    pub get: bool,
+    pub put: bool,
+    pub delete: bool,
+}
+
 /// One fully expanded document path that the caller must authorize before
 /// locks or reads are taken. Zanzibar relation names remain an API-layer
 /// concern.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpandedProgramPath {
     pub path: ObjectPath,
-    pub access: DocumentAccess,
+    pub intent: ProgramPathIntent,
 }
 
 /// One named set of paths accepted by a program.
@@ -291,23 +300,6 @@ pub enum Operation {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum PayloadSource {
-    Json { value: ValueSource },
-    OpaqueInput { name: String },
-}
-
-/// `route_id` is an opaque durable-outbox routing key. Programs cannot name
-/// destination paths.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EmissionDefinition {
-    pub route_id: String,
-    pub payload: PayloadSource,
-    pub content_type: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReturnDefinition {
     pub name: String,
@@ -327,8 +319,6 @@ pub struct ProgramDefinition {
     pub operations: Vec<Operation>,
     #[serde(default)]
     pub returns: Vec<ReturnDefinition>,
-    #[serde(default)]
-    pub emissions: Vec<EmissionDefinition>,
     pub caps: ProgramCaps,
 }
 
@@ -453,21 +443,6 @@ pub struct VersionedWrite {
     pub content_type: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
-pub enum EmissionPayload {
-    Json(Value),
-    Opaque(Vec<u8>),
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct DurableEmission {
-    pub route_id: String,
-    pub effect_id: String,
-    pub payload: EmissionPayload,
-    pub content_type: String,
-}
-
 /// Stored atomically with document heads. It is the durable replay contract.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CommandReceipt {
@@ -476,7 +451,6 @@ pub struct CommandReceipt {
     pub command_id: String,
     pub input_fingerprint: String,
     pub outputs: BTreeMap<String, Value>,
-    pub emission_effect_ids: Vec<String>,
 }
 
 /// A storage-neutral atomic apply request produced after deterministic evaluation.
@@ -485,6 +459,5 @@ pub struct AtomicWriteBundle {
     pub head_preconditions: Vec<HeadPrecondition>,
     pub writes: Vec<VersionedWrite>,
     pub receipt: CommandReceipt,
-    pub emissions: Vec<DurableEmission>,
     pub outputs: BTreeMap<String, Value>,
 }

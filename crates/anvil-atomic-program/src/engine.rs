@@ -91,9 +91,12 @@ where
         let mut paths = resolved
             .documents
             .into_iter()
-            .map(|document| ExpandedProgramPath {
-                path: document.path,
-                access: document.access,
+            .map(|document| {
+                let intent = self.definition.path_intent(&document.reference);
+                ExpandedProgramPath {
+                    path: document.path,
+                    intent,
+                }
             })
             .collect::<Vec<_>>();
         paths.sort_by(|left, right| left.path.cmp(&right.path));
@@ -237,7 +240,6 @@ where
                 documents.push(ResolvedDocument {
                     reference,
                     path: expanded,
-                    access: spec.access,
                     expected_head: binding.expected_head.clone(),
                     initial_json: binding.initial_json.clone(),
                 });
@@ -308,40 +310,11 @@ where
             outputs.insert(returned.name.clone(), value);
         }
 
-        let mut emissions = Vec::with_capacity(self.definition.emissions.len());
-        for (index, emission) in self.definition.emissions.iter().enumerate() {
-            let payload = match &emission.payload {
-                PayloadSource::Json { value } => EmissionPayload::Json(
-                    value_source(value, invocation, resolved, &working)
-                        .map_err(|reason| EngineError::Emission { index, reason })?,
-                ),
-                PayloadSource::OpaqueInput { name } => {
-                    EmissionPayload::Opaque(invocation.blobs.get(name).cloned().ok_or_else(
-                        || EngineError::Emission {
-                            index,
-                            reason: format!("opaque input `{name}` is missing"),
-                        },
-                    )?)
-                }
-            };
-            emissions.push(DurableEmission {
-                route_id: emission.route_id.clone(),
-                effect_id: effect_id(invocation, index, &emission.route_id),
-                payload,
-                content_type: emission.content_type.clone(),
-            });
-        }
-        check_emission_limit(&self.definition.caps, &emissions)?;
-
         let receipt = CommandReceipt {
             program_path_hash: invocation.program_path_hash,
             command_id: invocation.command_id.clone(),
             input_fingerprint: invocation.input_fingerprint.clone(),
             outputs: outputs.clone(),
-            emission_effect_ids: emissions
-                .iter()
-                .map(|emission| emission.effect_id.clone())
-                .collect(),
         };
 
         let head_preconditions = working
@@ -366,13 +339,52 @@ where
             head_preconditions,
             writes,
             receipt,
-            emissions,
             outputs,
         }))
     }
 }
 
 impl ProgramDefinition {
+    fn path_intent(&self, reference: &DocumentRef) -> ProgramPathIntent {
+        let mut intent = ProgramPathIntent {
+            // Every expanded document participates in the one bulk snapshot
+            // and in the bundle's old-head preconditions.
+            get: true,
+            put: self
+                .documents
+                .iter()
+                .find(|document| document.name == reference.slot)
+                .is_some_and(|document| document.allow_initial_json),
+            delete: false,
+        };
+
+        for operation in &self.operations {
+            match operation {
+                Operation::SetValue { target, .. }
+                | Operation::CheckedIntegerAdd { target, .. }
+                | Operation::CopyValue { target, .. }
+                    if target.document == *reference =>
+                {
+                    intent.put = true;
+                }
+                Operation::RemoveValue { target } if target.document == *reference => {
+                    if target.pointer.is_empty() {
+                        intent.delete = true;
+                    } else {
+                        // Removing a non-root JSON pointer publishes the
+                        // edited document rather than a tombstone.
+                        intent.put = true;
+                    }
+                }
+                Operation::ReplaceOpaque { document, .. } if document == reference => {
+                    intent.put = true;
+                }
+                _ => {}
+            }
+        }
+        intent
+    }
+
     pub fn validate(&self) -> Result<(), EngineError> {
         if self.schema_version != DEFINITION_SCHEMA_VERSION {
             return Err(invalid_definition(format!(
@@ -400,14 +412,6 @@ impl ProgramDefinition {
                 self.caps.max_operations
             )));
         }
-        if self.emissions.len() > self.caps.max_emissions {
-            return Err(invalid_definition(format!(
-                "{} emissions exceed max_emissions {}",
-                self.emissions.len(),
-                self.caps.max_emissions
-            )));
-        }
-
         let mut slots = BTreeMap::new();
         let mut maximum_paths = 0usize;
         let mut maximum_writes = 0usize;
@@ -548,16 +552,6 @@ impl ProgramDefinition {
             }
             check_reference(&returned.value.value.document, false)?;
             json::validate_pointer(&returned.value.value.pointer).map_err(invalid_definition)?;
-        }
-        for emission in &self.emissions {
-            validate_identifier("emission route_id", &emission.route_id)?;
-            validate_content_type(&emission.content_type)?;
-            match &emission.payload {
-                PayloadSource::Json { value } => {
-                    validate_value_source(value, &check_reference)?;
-                }
-                PayloadSource::OpaqueInput { name } => validate_input_name(name)?,
-            }
         }
         Ok(())
     }
@@ -1027,31 +1021,6 @@ fn check_document_limits(
     Ok(())
 }
 
-fn check_emission_limit(
-    caps: &ProgramCaps,
-    emissions: &[DurableEmission],
-) -> Result<(), EngineError> {
-    let mut total = 0usize;
-    for emission in emissions {
-        let size = match &emission.payload {
-            EmissionPayload::Json(value) => serde_json::to_vec(value)
-                .map_err(|error| EngineError::LimitExceeded(error.to_string()))?
-                .len(),
-            EmissionPayload::Opaque(value) => value.len(),
-        };
-        total = total.checked_add(size).ok_or_else(|| {
-            EngineError::LimitExceeded("emitted payload byte count overflowed".into())
-        })?;
-    }
-    if total > caps.max_emitted_bytes {
-        return Err(EngineError::LimitExceeded(format!(
-            "emissions are {total} bytes; max_emitted_bytes is {}",
-            caps.max_emitted_bytes
-        )));
-    }
-    Ok(())
-}
-
 fn stored_value_size(value: &StoredValue) -> Result<usize, EngineError> {
     match value {
         StoredValue::Json(value) => serde_json::to_vec(value)
@@ -1149,18 +1118,6 @@ fn compare<T: Ord>(actual: T, expected: T, comparison: Comparison) -> bool {
     }
 }
 
-fn effect_id(invocation: &ProgramInvocation, index: usize, route: &str) -> String {
-    let program_path_hash = blake3::Hash::from_bytes(invocation.program_path_hash).to_hex();
-    format!(
-        "ap2:{program_path_hash}:{}:{}:{}:{}:{}",
-        invocation.command_id.len(),
-        invocation.command_id,
-        index,
-        route.len(),
-        route
-    )
-}
-
 fn invalid_definition(message: impl Into<String>) -> EngineError {
     EngineError::InvalidDefinition(message.into())
 }
@@ -1181,7 +1138,6 @@ struct ResolvedInvocation {
 struct ResolvedDocument {
     reference: DocumentRef,
     path: ObjectPath,
-    access: DocumentAccess,
     expected_head: ExpectedHead,
     initial_json: Option<Value>,
 }

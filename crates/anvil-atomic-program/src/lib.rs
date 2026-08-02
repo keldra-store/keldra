@@ -9,8 +9,7 @@
 //!
 //! The language cannot perform networking, read a clock, generate randomness,
 //! loop, discover paths from payloads, or execute arbitrary client code. Durable
-//! command receipts make a repeated command deterministic, while definition
-//! emission route IDs support a durable outbox managed outside this evaluator.
+//! command receipts make a repeated command deterministic.
 
 mod engine;
 mod error;
