@@ -14,9 +14,9 @@ use anvil_storage::v1::{
     BucketPolicy, CreateBucketRequest, DeleteIfVersionRequest, DeleteRequest, DeleteVersionRequest,
     Durability, GetObjectRequest, HeadObjectRequest, InvokeProgramRequest,
     ListObjectVersionsRequest, ListObjectsRequest, ObjectAddress, ObjectVersioning,
-    ProvisionTenantRequest, PutHeader, PutIfAbsentOperation, PutIfVersionOperation,
-    PutImmutableOperation, PutOperation as UnconditionalPutOperation, PutRequest,
-    SetBucketPolicyRequest, SetBucketVersioningRequest,
+    PrepareNodeRequest, ProvisionTenantRequest, PutHeader, PutIfAbsentOperation,
+    PutIfVersionOperation, PutImmutableOperation, PutOperation as UnconditionalPutOperation,
+    PutRequest, SetBucketPolicyRequest, SetBucketVersioningRequest,
 };
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -148,6 +148,13 @@ enum Command {
         owner_client_id: String,
         #[arg(long, env = "ANVIL_NEW_CLIENT_SECRET", hide_env_values = true)]
         owner_client_secret: String,
+    },
+    /// Generate one mode-0600 bundle for an authorized node join.
+    PrepareNode {
+        node_id: u32,
+        peer_address: String,
+        #[arg(long, default_value_t = 1_000_000)]
+        storage_weight_millionths: u32,
     },
     /// Create one bucket and make the authenticated application its owner.
     CreateBucket {
@@ -514,6 +521,27 @@ async fn main() -> Result<()> {
                 response.replayed,
             );
         }
+        Command::PrepareNode {
+            node_id,
+            peer_address,
+            storage_weight_millionths,
+        } => {
+            let response = administration
+                .prepare_node(PrepareNodeRequest {
+                    node_id,
+                    peer_address,
+                    storage_weight_millionths,
+                })
+                .await?
+                .into_inner();
+            println!(
+                "bundle={} cluster={} node={} peer_spki_sha256={}",
+                response.join_bundle_path,
+                lower_hex(&response.cluster_id),
+                response.node_id,
+                lower_hex(&response.peer_spki_sha256),
+            );
+        }
         Command::CreateBucket { bucket, versioning } => {
             let response = administration
                 .create_bucket(CreateBucketRequest {
@@ -816,6 +844,16 @@ fn parse_hex(value: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
+fn lower_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -929,6 +967,26 @@ mod tests {
         assert!(matches!(
             enable.command,
             Command::EnableBucketVersioning { ref bucket } if bucket == "objects"
+        ));
+
+        let prepare = Arguments::try_parse_from([
+            "anvil",
+            "--token",
+            "token",
+            "prepare-node",
+            "2",
+            "node-2.internal:50052",
+            "--storage-weight-millionths",
+            "500000",
+        ])
+        .unwrap();
+        assert!(matches!(
+            prepare.command,
+            Command::PrepareNode {
+                node_id: 2,
+                ref peer_address,
+                storage_weight_millionths: 500_000,
+            } if peer_address == "node-2.internal:50052"
         ));
     }
 
