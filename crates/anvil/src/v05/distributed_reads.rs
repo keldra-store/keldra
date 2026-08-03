@@ -1,6 +1,7 @@
 use std::io::Read;
 
 use anvil_store::{ObjectKey, ObjectPathSnapshot, VersionId};
+use tokio_stream::wrappers::ReceiverStream;
 
 use super::*;
 use crate::cluster_object_read::{ClusterObjectReader, ClusterOpenedObject};
@@ -124,7 +125,7 @@ pub(super) async fn read_batch_result(
     reader: &ClusterObjectReader,
     key: &ObjectKey,
     requested_version: Option<VersionId>,
-) -> Result<(BatchGetResult, u64), Status> {
+) -> Result<(BatchGetResult, u64, Option<u64>), Status> {
     let Some(object) = reader.open(key, requested_version).await? else {
         return if requested_version.is_some() {
             Ok((
@@ -133,6 +134,7 @@ pub(super) async fn read_batch_result(
                     message: "requested version was not found".into(),
                 }),
                 0,
+                None,
             ))
         } else {
             Ok((
@@ -141,10 +143,12 @@ pub(super) async fn read_batch_result(
                     bytes: Vec::new(),
                 }),
                 0,
+                None,
             ))
         };
     };
     let head = api_head(&object.version)?;
+    let program_commit_cursor = object.program_commit_cursor;
     let declared_length = object
         .version
         .blob
@@ -166,6 +170,7 @@ pub(super) async fn read_batch_result(
             bytes,
         }),
         declared_length,
+        program_commit_cursor,
     ))
 }
 

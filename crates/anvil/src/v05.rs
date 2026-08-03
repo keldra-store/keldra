@@ -1,5 +1,7 @@
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anvil_api::v1::batch_get_outcome::Outcome as BatchGetResult;
@@ -8,7 +10,6 @@ use anvil_api::v1::object_head::State as ObjectState;
 use anvil_api::v1::object_service_server::ObjectService;
 use anvil_api::v1::object_version::State as ObjectVersionState;
 use anvil_api::v1::put_header::Operation as ApiPutOperation;
-use anvil_api::v1::watch_message::Message as WatchMessageValue;
 use anvil_api::v1::watch_prefix_request::Start as WatchStartValue;
 use anvil_api::v1::{
     BatchGetObject, BatchGetOutcome, BatchGetRequest, BatchGetResponse, BucketPolicy,
@@ -18,33 +19,47 @@ use anvil_api::v1::{
     GetObjectRequest, HeadObjectRequest, InvokeProgramRequest, InvokeProgramResponse,
     ListObjectVersionsRequest, ListObjectsRequest, ListObjectsResponse, MutationFailure,
     MutationFailureCode, MutationReceipt as ApiMutationReceipt, NeverExisted, ObjectAddress,
-    ObjectChunk, ObjectHead, ObjectVersion, PresentObject, ProgramPathReceipt, PutHeader,
-    PutRequest as ApiPutRequest, PutToken, ReadFailure, ReadFailureCode, SetBucketPolicyRequest,
-    WatchCheckpoint, WatchInvalidation, WatchMessage, WatchPrefixRequest, WatchStateHint,
+    ObjectChunk, ObjectHead, ObjectVersion, PresentObject, PutHeader, PutRequest as ApiPutRequest,
+    PutToken, ReadFailure, ReadFailureCode, SetBucketPolicyRequest, WatchInvalidation,
+    WatchPrefixRequest, WatchStateHint,
 };
 use anvil_atomic_program::{ExpandedProgramPath, MAX_OBJECT_PATH_BYTES};
 use anvil_store::{
     AuthzStoreError, BatchOperation, BlobRef, BlobUpload, DeleteRequest as StoreDeleteRequest,
     DeleteRetainedVersionOutcome, Durability as StoreDurability, InvalidationStateHint,
-    LocalInvalidation, MAX_LIST_OBJECTS, MAX_LOCAL_INVALIDATION_SCAN_RECORDS, MutationError,
-    MutationReceipt, ObjectKey, ObjectVersioning as StoreObjectVersioning, Precondition,
-    PublishRequest, PutMode, PutRequest as StorePutRequest, Store, Version, VersionId, WatchCursor,
-    WatchError, WatchJournalStatus, WatchScope, WatchStart,
+    LocalInvalidation, MAX_LIST_OBJECTS, MutationError, MutationReceipt, ObjectKey,
+    ObjectVersioning as StoreObjectVersioning, Precondition, PublishRequest, PutMode,
+    PutRequest as StorePutRequest, Store, Version, VersionId, WatchError, WatchScope,
 };
 use prost::Message as _;
 use serde::{Deserialize, Serialize};
 use tokio_stream::Stream;
-use tokio_stream::wrappers::ReceiverStream;
 use tonic::metadata::MetadataMap;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::authentication::{Caller, JwtManager, PUT_TOKEN_LIFETIME};
+use crate::authoritative_system::AuthoritativeSystemAuthorization;
 use crate::authorization::{ObjectPermission, SystemAuthorization, SystemAuthorizer};
+use crate::bucket_governance::{
+    BucketGovernance, require_versioning_enabled as require_governance_versioning_enabled,
+};
 use crate::cluster_object_read::ClusterObjectReader;
+use crate::cluster_peer::ClusterPeerTransport;
+use crate::distributed_list::{DistributedObjectLister, OriginalBearer};
+use crate::distributed_watch::{DistributedWatch, DistributedWatchScope};
+use crate::logical_name_resolution::LogicalNameResolver;
 use crate::object_distribution::ObjectDistribution;
 use crate::programs::ProgramCoordinator;
 
+#[cfg(test)]
+use anvil_store::WatchJournalStatus;
+
+mod atomic_program;
+mod batch_get;
+mod bulk;
 mod distributed_reads;
+mod distributed_watch_stream;
+mod routed_writes;
 
 const OBJECT_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_BULK_ITEMS: usize = 1_000;
@@ -62,6 +77,12 @@ pub struct ObjectServiceImpl {
     programs: ProgramCoordinator,
     distribution: ObjectDistribution,
     reader: ClusterObjectReader,
+    cluster_peers: ClusterPeerTransport,
+    lister: DistributedObjectLister,
+    watch: Arc<DistributedWatch>,
+    name_resolver: LogicalNameResolver,
+    authoritative_system: AuthoritativeSystemAuthorization,
+    bucket_governance: BucketGovernance,
     jwt_manager: JwtManager,
     max_blob_bytes: u64,
     atomic_program_timeout: Duration,
@@ -73,6 +94,12 @@ impl ObjectServiceImpl {
         programs: ProgramCoordinator,
         distribution: ObjectDistribution,
         reader: ClusterObjectReader,
+        cluster_peers: ClusterPeerTransport,
+        lister: DistributedObjectLister,
+        watch: Arc<DistributedWatch>,
+        name_resolver: LogicalNameResolver,
+        authoritative_system: AuthoritativeSystemAuthorization,
+        bucket_governance: BucketGovernance,
         jwt_manager: JwtManager,
         max_blob_bytes: u64,
         atomic_program_timeout: Duration,
@@ -83,6 +110,12 @@ impl ObjectServiceImpl {
             programs,
             distribution,
             reader,
+            cluster_peers,
+            lister,
+            watch,
+            name_resolver,
+            authoritative_system,
+            bucket_governance,
             jwt_manager,
             max_blob_bytes,
             atomic_program_timeout,
@@ -177,8 +210,7 @@ type GetObjectStream =
     Pin<Box<dyn Stream<Item = Result<ObjectChunk, Status>> + Send + Sync + 'static>>;
 type ListObjectVersionsStream =
     Pin<Box<dyn Stream<Item = Result<ObjectVersion, Status>> + Send + Sync + 'static>>;
-type WatchPrefixStream =
-    Pin<Box<dyn Stream<Item = Result<WatchMessage, Status>> + Send + Sync + 'static>>;
+type WatchPrefixStream = distributed_watch_stream::ClusterWatchStream;
 
 #[tonic::async_trait]
 impl ObjectService for ObjectServiceImpl {
@@ -235,86 +267,201 @@ impl ObjectService for ObjectServiceImpl {
         &self,
         request: Request<PutToken>,
     ) -> Result<Response<ApiMutationReceipt>, Status> {
+        let peer_routed = request
+            .extensions()
+            .get::<routed_writes::RoutedDestination>()
+            .is_some();
         let caller = authenticated_caller(&request)?;
+        let bearer = OriginalBearer::from_metadata(request.metadata())?;
+        let remaining =
+            effective_atomic_program_timeout(request.metadata(), self.atomic_program_timeout);
         let token = required_put_token(Some(request.into_inner()))?;
         let capability = self.verify_put_token(&caller, &token)?;
         let ready = require_ready_phase(capability)?;
         let metadata = ready.header.to_metadata()?;
         self.authorize_object(&caller, &metadata.key, ObjectPermission::Put)
             .await?;
-        self.distribution
-            .publish_from_source(
-                PublishRequest {
-                    key: metadata.key,
-                    blob: BlobRef {
-                        hash: ready.blob_hash,
-                        length: ready.blob_length,
-                    },
-                    content_type: metadata.content_type,
-                    mode: metadata.mode,
-                    command_id: Some(metadata.command_id),
-                    durability: metadata.durability,
-                },
-                anvil_consensus::NodeId(ready.upload_source_node_id),
-            )
-            .await
-            .map(api_receipt)
-            .map(Response::new)
+        let publish = PublishRequest {
+            key: metadata.key,
+            blob: BlobRef {
+                hash: ready.blob_hash,
+                length: ready.blob_length,
+            },
+            content_type: metadata.content_type,
+            mode: metadata.mode,
+            command_id: Some(metadata.command_id),
+            durability: metadata.durability,
+        };
+        let receipt = match self.distribution.routing_target(&publish.key)? {
+            Some(_) if peer_routed => {
+                return Err(Status::failed_precondition(
+                    "a routed PutEnd reached a node that is not its coordinator",
+                ));
+            }
+            Some((target, address)) => {
+                self.cluster_peers
+                    .route_put_end(target, &address, bearer.signed_token(), token, remaining)
+                    .await?
+            }
+            None => {
+                let governance = self
+                    .bucket_governance
+                    .resolve(publish.key.tenant(), publish.key.bucket())
+                    .await?;
+                api_receipt(
+                    self.distribution
+                        .publish_from_source_with_governance(
+                            publish,
+                            anvil_consensus::NodeId(ready.upload_source_node_id),
+                            governance,
+                        )
+                        .await?,
+                )
+            }
+        };
+        Ok(Response::new(receipt))
     }
 
     async fn delete(
         &self,
         request: Request<ApiDeleteRequest>,
     ) -> Result<Response<ApiMutationReceipt>, Status> {
+        let peer_routed = request
+            .extensions()
+            .get::<routed_writes::RoutedDestination>()
+            .is_some();
         let caller = authenticated_caller(&request)?;
-        let request = delete_request(request.into_inner(), Precondition::Any)?;
-        self.authorize_object(&caller, &request.key, ObjectPermission::Delete)
+        let bearer = OriginalBearer::from_metadata(request.metadata())?;
+        let remaining =
+            effective_atomic_program_timeout(request.metadata(), self.atomic_program_timeout);
+        let api_request = request.into_inner();
+        let mutation = delete_request(api_request.clone(), Precondition::Any)?;
+        self.authorize_object(&caller, &mutation.key, ObjectPermission::Delete)
             .await?;
-        self.distribution
-            .mutate(BatchOperation::Delete(request))
-            .await
-            .map(api_receipt)
-            .map(Response::new)
+        let receipt = match self.distribution.routing_target(&mutation.key)? {
+            Some(_) if peer_routed => {
+                return Err(Status::failed_precondition(
+                    "a routed Delete reached a node that is not its coordinator",
+                ));
+            }
+            Some((target, address)) => {
+                self.cluster_peers
+                    .route_delete(
+                        target,
+                        &address,
+                        bearer.signed_token(),
+                        api_request,
+                        remaining,
+                    )
+                    .await?
+            }
+            None => api_receipt(
+                self.distribution
+                    .mutate(BatchOperation::Delete(mutation))
+                    .await?,
+            ),
+        };
+        Ok(Response::new(receipt))
     }
 
     async fn delete_if_version(
         &self,
         request: Request<DeleteIfVersionRequest>,
     ) -> Result<Response<ApiMutationReceipt>, Status> {
+        let peer_routed = request
+            .extensions()
+            .get::<routed_writes::RoutedDestination>()
+            .is_some();
         let caller = authenticated_caller(&request)?;
-        let request = request.into_inner();
-        let precondition = Precondition::Version(VersionId(request.expected_version));
-        let request = delete_if_version_request(request, precondition)?;
-        self.authorize_object(&caller, &request.key, ObjectPermission::Delete)
+        let bearer = OriginalBearer::from_metadata(request.metadata())?;
+        let remaining =
+            effective_atomic_program_timeout(request.metadata(), self.atomic_program_timeout);
+        let api_request = request.into_inner();
+        let precondition = Precondition::Version(VersionId(api_request.expected_version));
+        let mutation = delete_if_version_request(api_request.clone(), precondition)?;
+        self.authorize_object(&caller, &mutation.key, ObjectPermission::Delete)
             .await?;
-        self.distribution
-            .mutate(BatchOperation::Delete(request))
-            .await
-            .map(api_receipt)
-            .map(Response::new)
+        let receipt = match self.distribution.routing_target(&mutation.key)? {
+            Some(_) if peer_routed => {
+                return Err(Status::failed_precondition(
+                    "a routed DeleteIfVersion reached a node that is not its coordinator",
+                ));
+            }
+            Some((target, address)) => {
+                self.cluster_peers
+                    .route_delete_if_version(
+                        target,
+                        &address,
+                        bearer.signed_token(),
+                        api_request,
+                        remaining,
+                    )
+                    .await?
+            }
+            None => api_receipt(
+                self.distribution
+                    .mutate(BatchOperation::Delete(mutation))
+                    .await?,
+            ),
+        };
+        Ok(Response::new(receipt))
     }
 
     async fn delete_version(
         &self,
         request: Request<DeleteVersionRequest>,
     ) -> Result<Response<DeleteVersionResponse>, Status> {
+        let peer_routed = request
+            .extensions()
+            .get::<routed_writes::RoutedDestination>()
+            .is_some();
         let caller = authenticated_caller(&request)?;
-        let request = request.into_inner();
-        let _durability = durability(request.durability)?;
-        let key = object_key(request.address)?;
+        let bearer = OriginalBearer::from_metadata(request.metadata())?;
+        let remaining =
+            effective_atomic_program_timeout(request.metadata(), self.atomic_program_timeout);
+        let api_request = request.into_inner();
+        let _durability = durability(api_request.durability)?;
+        let key = object_key(api_request.address.clone())?;
         self.authorize_object(&caller, &key, ObjectPermission::Delete)
             .await?;
-        require_versioning_enabled(&self.store, &key)?;
-        if !self.distribution.is_single_node()? {
-            return Err(Status::failed_precondition(
-                "DeleteVersion is unavailable in a multi-node cluster until its typed replicated mutation is supported",
-            ));
-        }
-        let outcome = self
-            .store
-            .delete_retained_version(&key, VersionId(request.version))
-            .await
-            .map_err(status)?;
+        let governance = self
+            .bucket_governance
+            .resolve(key.tenant(), key.bucket())
+            .await?;
+        require_governance_versioning_enabled(&governance)?;
+        let outcome = match self.distribution.routing_target_stable(
+            &key,
+            governance.tenant_id,
+            governance.bucket_id,
+        )? {
+            Some(_) if peer_routed => {
+                return Err(Status::failed_precondition(
+                    "a routed DeleteVersion reached a node that is not its coordinator",
+                ));
+            }
+            Some((target, address)) => {
+                return self
+                    .cluster_peers
+                    .route_delete_version(
+                        target,
+                        &address,
+                        bearer.signed_token(),
+                        api_request,
+                        remaining,
+                    )
+                    .await
+                    .map(Response::new);
+            }
+            None => {
+                self.distribution
+                    .delete_retained_version_with_governance(
+                        &key,
+                        VersionId(api_request.version),
+                        governance,
+                    )
+                    .await?
+            }
+        };
         Ok(Response::new(api_delete_version_outcome(outcome)))
     }
 
@@ -322,14 +469,28 @@ impl ObjectService for ObjectServiceImpl {
         &self,
         request: Request<HeadObjectRequest>,
     ) -> Result<Response<ObjectHead>, Status> {
+        let deadline = request_deadline(request.metadata(), self.atomic_program_timeout)?;
         let caller = authenticated_caller(&request)?;
         let key = object_key(request.into_inner().address)?;
         self.authorize_object(&caller, &key, ObjectPermission::Get)
             .await?;
-        let Some(version) = self.reader.head(&key).await? else {
-            return Ok(Response::new(never_existed()));
-        };
-        Ok(Response::new(api_head(&version)?))
+        loop {
+            let (version, cursor) = self.reader.head_with_program_cursor(&key).await?;
+            match cursor {
+                Some(cursor) if !self.programs.cursor_is_visible(cursor)? => {
+                    self.programs
+                        .wait_for_cursor(cursor, deadline_remaining(deadline)?)
+                        .await?;
+                    continue;
+                }
+                _ => {
+                    return version.map_or_else(
+                        || Ok(Response::new(never_existed())),
+                        |version| api_head(&version).map(Response::new),
+                    );
+                }
+            }
+        }
     }
 
     async fn list_objects(
@@ -337,38 +498,30 @@ impl ObjectService for ObjectServiceImpl {
         request: Request<ListObjectsRequest>,
     ) -> Result<Response<ListObjectsResponse>, Status> {
         let caller = authenticated_caller(&request)?;
+        let bearer = OriginalBearer::from_metadata(request.metadata())?;
         let query = list_objects_query(request.into_inner())?;
         if caller.storage_tenant().as_str() != query.tenant.as_str() {
             return Err(Status::permission_denied(
                 "object list does not belong to the authenticated tenant",
             ));
         }
-        let authorization = self.system_authorization().await?;
-        require_authorized(
-            authorization
-                .allows_bucket_objects(
-                    caller.subject(),
-                    &query.tenant,
-                    &query.bucket,
-                    ObjectPermission::Get,
-                )
-                .map_err(crate::authz_api::authz_status)?,
-            "bucket-wide object read is required for listing",
-        )?;
-
-        let store = self.store.clone();
-        let page = tokio::task::spawn_blocking(move || {
-            store.list_objects(
+        let (tenant_id, bucket_id) = self
+            .name_resolver
+            .resolve_bucket_ids(&query.tenant, &query.bucket)
+            .await?;
+        let page = self
+            .lister
+            .list_objects(
+                bearer,
                 &query.tenant,
                 &query.bucket,
+                tenant_id,
+                bucket_id,
                 &query.prefix,
                 query.start_after.as_deref(),
                 query.limit,
             )
-        })
-        .await
-        .map_err(|error| internal(format!("object listing worker failed: {error}")))?
-        .map_err(status)?;
+            .await?;
         Ok(Response::new(ListObjectsResponse {
             paths: page.paths,
             has_more: page.has_more,
@@ -381,6 +534,7 @@ impl ObjectService for ObjectServiceImpl {
         &self,
         request: Request<GetObjectRequest>,
     ) -> Result<Response<Self::GetObjectStream>, Status> {
+        let deadline = request_deadline(request.metadata(), self.atomic_program_timeout)?;
         let caller = authenticated_caller(&request)?;
         let request = request.into_inner();
         let key = object_key(request.address)?;
@@ -389,11 +543,26 @@ impl ObjectService for ObjectServiceImpl {
         if request.version.is_some() {
             require_versioning_enabled(&self.store, &key)?;
         }
-        let selected = self
-            .reader
-            .open(&key, request.version.map(VersionId))
-            .await?;
-        distributed_reads::get_object_response(selected, request.version.is_some())
+        let requested_version = request.version.map(VersionId);
+        loop {
+            let selected = self.reader.open(&key, requested_version).await?;
+            let cursor = selected
+                .as_ref()
+                .and_then(|object| object.program_commit_cursor);
+            match cursor {
+                Some(cursor) if !self.programs.cursor_is_visible(cursor)? => {
+                    self.programs
+                        .wait_for_cursor(cursor, deadline_remaining(deadline)?)
+                        .await?;
+                }
+                _ => {
+                    return distributed_reads::get_object_response(
+                        selected,
+                        requested_version.is_some(),
+                    );
+                }
+            }
+        }
     }
 
     type ListObjectVersionsStream = ListObjectVersionsStream;
@@ -402,49 +571,67 @@ impl ObjectService for ObjectServiceImpl {
         &self,
         request: Request<ListObjectVersionsRequest>,
     ) -> Result<Response<Self::ListObjectVersionsStream>, Status> {
+        let deadline = request_deadline(request.metadata(), self.atomic_program_timeout)?;
         let caller = authenticated_caller(&request)?;
         let key = object_key(request.into_inner().address)?;
         self.authorize_object(&caller, &key, ObjectPermission::Get)
             .await?;
-        require_versioning_enabled(&self.store, &key)?;
+        let governance = self
+            .bucket_governance
+            .resolve(key.tenant(), key.bucket())
+            .await?;
+        require_governance_versioning_enabled(&governance)?;
 
-        let snapshot = self.distribution.reconciled_object_snapshot(&key).await?;
-        distributed_reads::list_object_versions_response(snapshot, &key)
+        loop {
+            let snapshot = self.distribution.reconciled_object_snapshot(&key).await?;
+            let cursor = snapshot.as_ref().and_then(|snapshot| {
+                snapshot
+                    .head
+                    .mutation_stamp
+                    .and_then(|stamp| stamp.program_commit_cursor)
+            });
+            match cursor {
+                Some(cursor) if !self.programs.cursor_is_visible(cursor)? => {
+                    self.programs
+                        .wait_for_cursor(cursor, deadline_remaining(deadline)?)
+                        .await?;
+                }
+                _ => return distributed_reads::list_object_versions_response(snapshot, &key),
+            }
+        }
     }
 
     async fn bulk_write(
         &self,
         request: Request<BulkWriteRequest>,
     ) -> Result<Response<BulkWriteResponse>, Status> {
+        let peer_routed = request
+            .extensions()
+            .get::<routed_writes::RoutedDestination>()
+            .is_some();
         let started = Instant::now();
         let operation_count = request.get_ref().operations.len() as u64;
         let encoded_bytes = request.get_ref().encoded_len() as u64;
         let result = async {
             let caller = authenticated_caller(&request)?;
+            let bearer = OriginalBearer::from_metadata(request.metadata())?;
+            let route_budget =
+                effective_atomic_program_timeout(request.metadata(), self.atomic_program_timeout);
             let operations = request.into_inner().operations;
             validate_bulk_limits(&operations)?;
-            let authorization = self.system_authorization().await?;
 
-            let mut accepted = Vec::with_capacity(operations.len());
+            let mut local = Vec::with_capacity(operations.len());
+            let mut remote =
+                BTreeMap::<anvil_consensus::NodeId, (String, Vec<(usize, BulkOperation)>)>::new();
             let mut outcomes = Vec::new();
+            let mut pending = Vec::with_capacity(operations.len());
             for (index, operation) in operations.into_iter().enumerate() {
+                let forwarded = operation.clone();
                 match batch_operation(operation, self.max_blob_bytes) {
-                    Ok(operation) => {
-                        match authorize_batch_operation(&authorization, &caller, &operation) {
-                            Ok(()) => accepted.push((index, operation)),
-                            Err(error) if error.code() == tonic::Code::PermissionDenied => {
-                                outcomes.push(BulkOutcome {
-                                    index: index as u32,
-                                    outcome: Some(anvil_api::v1::bulk_outcome::Outcome::Failure(
-                                        MutationFailure {
-                                            code: MutationFailureCode::AuthorizationDenied as i32,
-                                            message: error.message().to_owned(),
-                                            current_version: None,
-                                        },
-                                    )),
-                                });
-                            }
-                            Err(error) => return Err(error),
+                    Ok(mutation) => {
+                        match require_caller_tenant(&caller, batch_operation_key(&mutation)) {
+                            Ok(()) => pending.push((index, forwarded, mutation)),
+                            Err(error) => outcomes.push(bulk_authorization_failure(index, &error)),
                         }
                     }
                     Err(error) => outcomes.push(BulkOutcome {
@@ -455,28 +642,61 @@ impl ObjectService for ObjectServiceImpl {
                     }),
                 }
             }
-            let accepted_indices = accepted.iter().map(|(index, _)| *index).collect::<Vec<_>>();
-            let accepted_operations = accepted
-                .into_iter()
-                .map(|(_, operation)| operation)
-                .collect();
+            let authorization_requests = pending
+                .iter()
+                .map(|(_, _, mutation)| {
+                    (
+                        batch_operation_key(mutation).clone(),
+                        batch_operation_permission(mutation),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let allowed = if authorization_requests.is_empty() {
+                Vec::new()
+            } else {
+                self.authoritative_system
+                    .allows_objects(&caller, &authorization_requests)
+                    .await?
+            };
+            for ((index, forwarded, mutation), allowed) in pending.into_iter().zip(allowed) {
+                if !allowed {
+                    outcomes.push(bulk_authorization_failure(
+                        index,
+                        &Status::permission_denied("bulk object operation is not authorized"),
+                    ));
+                    continue;
+                }
+                match self
+                    .distribution
+                    .routing_target(batch_operation_key(&mutation))?
+                {
+                    Some((target, address)) => remote
+                        .entry(target)
+                        .or_insert_with(|| (address, Vec::new()))
+                        .1
+                        .push((index, forwarded)),
+                    None => local.push((index, mutation)),
+                }
+            }
+            let local_indices = local.iter().map(|(index, _)| *index).collect::<Vec<_>>();
+            let local_operations = local.into_iter().map(|(_, operation)| operation).collect();
+            if peer_routed && !remote.is_empty() {
+                return Err(Status::failed_precondition(
+                    "a routed bulk reached a node that is not every item's coordinator",
+                ));
+            }
             outcomes.extend(
-                self.distribution
-                    .mutate_many(accepted_operations)
-                    .await
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, result)| BulkOutcome {
-                        index: accepted_indices[index] as u32,
-                        outcome: Some(match result {
-                            Ok(receipt) => {
-                                anvil_api::v1::bulk_outcome::Outcome::Receipt(api_receipt(receipt))
-                            }
-                            Err(error) => anvil_api::v1::bulk_outcome::Outcome::Failure(
-                                api_request_failure(error),
-                            ),
-                        }),
-                    }),
+                bulk::execute_coordinator_groups(
+                    self.distribution.clone(),
+                    self.cluster_peers.clone(),
+                    local_indices,
+                    local_operations,
+                    remote,
+                    bearer.signed_token().to_owned(),
+                    started,
+                    route_budget,
+                )
+                .await?,
             );
             outcomes.sort_unstable_by_key(|outcome| outcome.index);
             Ok(Response::new(BulkWriteResponse { outcomes }))
@@ -493,6 +713,7 @@ impl ObjectService for ObjectServiceImpl {
         request: Request<WatchPrefixRequest>,
     ) -> Result<Response<Self::WatchPrefixStream>, Status> {
         let caller = authenticated_caller(&request)?;
+        let bearer = OriginalBearer::from_metadata(request.metadata())?;
         let request = request.into_inner();
         let prefix = request
             .prefix
@@ -504,23 +725,13 @@ impl ObjectService for ObjectServiceImpl {
                 "watch prefix does not belong to the authenticated tenant",
             ));
         }
-        let authorization = self.system_authorization().await?;
-        require_authorized(
-            authorization
-                .allows_bucket_objects(
-                    caller.subject(),
-                    scope.tenant(),
-                    scope.bucket(),
-                    ObjectPermission::Get,
-                )
-                .map_err(crate::authz_api::authz_status)?,
-            "bucket-wide object read is required for a prefix watch",
-        )?;
         let start = match request.start {
-            Some(WatchStartValue::Now(_)) => WatchStart::Now,
-            Some(WatchStartValue::RetainedBeginning(_)) => WatchStart::RetainedBeginning,
+            Some(WatchStartValue::Now(_)) => distributed_watch_stream::ClusterWatchStart::Now,
+            Some(WatchStartValue::RetainedBeginning(_)) => {
+                distributed_watch_stream::ClusterWatchStart::RetainedBeginning
+            }
             Some(WatchStartValue::ResumeToken(token)) if !token.is_empty() => {
-                WatchStart::Resume(token)
+                distributed_watch_stream::ClusterWatchStart::Resume(token)
             }
             Some(WatchStartValue::ResumeToken(_)) => {
                 return Err(Status::invalid_argument(
@@ -533,69 +744,21 @@ impl ObjectService for ObjectServiceImpl {
                 ));
             }
         };
-        let mut cursor = self
-            .store
-            .start_watch(&scope, start)
-            .map_err(watch_status)?;
-        observe_watch_journal(&self.store, cursor);
-        let store = self.store.clone();
-        let (sender, receiver) = tokio::sync::mpsc::channel(32);
-        tokio::spawn(async move {
-            let initial = watch_checkpoint_message(&store, &scope, cursor);
-            if send_watch(&sender, initial).await.is_err() {
-                return;
-            }
-            loop {
-                let page = match store
-                    .scan_watch_page(&scope, cursor, MAX_LOCAL_INVALIDATION_SCAN_RECORDS)
-                    .await
-                {
-                    Ok(page) => page,
-                    Err(error) => {
-                        let _ = sender.send(Err(watch_status(error))).await;
-                        return;
-                    }
-                };
-                if page.checkpoint.offset() != cursor.offset() {
-                    for invalidation in page.invalidations {
-                        if sender
-                            .send(Ok(WatchMessage {
-                                message: Some(WatchMessageValue::Invalidation(
-                                    api_watch_invalidation(invalidation),
-                                )),
-                            }))
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                    cursor = page.checkpoint;
-                    observe_watch_journal(&store, cursor);
-                    let checkpoint = watch_checkpoint_message(&store, &scope, cursor);
-                    if send_watch(&sender, checkpoint).await.is_err() {
-                        return;
-                    }
-                    continue;
-                }
-                tokio::select! {
-                    result = store.wait_for_watch_change(cursor) => {
-                        if let Err(error) = result {
-                            let _ = sender.send(Err(watch_status(error))).await;
-                            return;
-                        }
-                    }
-                    () = sender.closed() => return,
-                }
-            }
-        });
-        Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
+        let (tenant_id, bucket_id) = self
+            .name_resolver
+            .resolve_bucket_ids(scope.tenant(), scope.bucket())
+            .await?;
+        let distributed_scope = DistributedWatchScope::new(&scope, tenant_id, bucket_id)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        distributed_watch_stream::response(self.watch.clone(), distributed_scope, bearer, start)
+            .await
     }
 
     async fn batch_get(
         &self,
         request: Request<BatchGetRequest>,
     ) -> Result<Response<BatchGetResponse>, Status> {
+        let deadline = request_deadline(request.metadata(), self.atomic_program_timeout)?;
         let caller = authenticated_caller(&request)?;
         let objects = request.into_inner().objects;
         if objects.len() > MAX_BATCH_GET_ITEMS {
@@ -603,9 +766,9 @@ impl ObjectService for ObjectServiceImpl {
                 "batch read contains more than {MAX_BATCH_GET_ITEMS} items"
             )));
         }
-        let authorization = self.system_authorization().await?;
         let mut accepted = Vec::with_capacity(objects.len());
         let mut outcomes = Vec::new();
+        let mut pending = Vec::with_capacity(objects.len());
         for (index, request) in objects.into_iter().enumerate() {
             let address = request.address.clone();
             let key = match object_key(request.address) {
@@ -622,132 +785,134 @@ impl ObjectService for ObjectServiceImpl {
                     continue;
                 }
             };
-            let authorization_result = require_caller_tenant(&caller, &key).and_then(|()| {
-                authorization
-                    .allows_object(caller.subject(), &key, ObjectPermission::Get)
-                    .map_err(crate::authz_api::authz_status)
-                    .and_then(|allowed| {
-                        require_authorized(allowed, "object read is not authorized")
-                    })
-            });
-            match authorization_result {
-                Ok(()) => {
-                    if request.version.is_some()
-                        && !bucket_versioning_enabled(&self.store, &key).map_err(status)?
-                    {
-                        outcomes.push(BatchGetOutcome {
-                            index: index as u32,
-                            address: Some(api_address(&key)),
-                            outcome: Some(BatchGetResult::Failure(ReadFailure {
-                                code: ReadFailureCode::VersioningDisabled as i32,
-                                message:
-                                    "exact-version reads require bucket versioning to be enabled"
-                                        .into(),
-                            })),
-                        });
-                        continue;
-                    }
-                    accepted.push((index, key, request.version.map(VersionId)));
-                }
+            match require_caller_tenant(&caller, &key) {
+                Ok(()) => pending.push((index, key, request.version.map(VersionId))),
                 Err(error) if error.code() == tonic::Code::PermissionDenied => {
-                    outcomes.push(BatchGetOutcome {
-                        index: index as u32,
-                        address: Some(api_address(&key)),
-                        outcome: Some(BatchGetResult::Failure(ReadFailure {
-                            code: ReadFailureCode::AuthorizationDenied as i32,
-                            message: error.message().to_owned(),
-                        })),
-                    });
+                    outcomes.push(batch_get_authorization_failure(index, &key, &error));
                 }
                 Err(error) => return Err(error),
             }
         }
-        let mut selected = Vec::with_capacity(accepted.len());
-        let mut declared_payload_bytes = 0_u64;
-        for (index, key, requested_version) in accepted {
-            match self.distribution.reconciled_object_snapshot(&key).await {
-                Ok(snapshot) => match distributed_reads::declared_payload_length(
-                    snapshot.as_ref(),
+        let authorization_requests = pending
+            .iter()
+            .map(|(_, key, _)| (key.clone(), ObjectPermission::Get))
+            .collect::<Vec<_>>();
+        let allowed = if authorization_requests.is_empty() {
+            Vec::new()
+        } else {
+            self.authoritative_system
+                .allows_objects(&caller, &authorization_requests)
+                .await?
+        };
+        for ((index, key, requested_version), allowed) in pending.into_iter().zip(allowed) {
+            if !allowed {
+                outcomes.push(batch_get_authorization_failure(
+                    index,
                     &key,
-                    requested_version,
-                ) {
-                    Ok(length) => {
-                        declared_payload_bytes = declared_payload_bytes.saturating_add(length);
-                        selected.push((index, key, requested_version));
-                    }
-                    Err(error) => outcomes.push(BatchGetOutcome {
-                        index: index as u32,
-                        address: Some(api_address(&key)),
-                        outcome: Some(BatchGetResult::Failure(distributed_reads::status_failure(
-                            error,
-                        ))),
-                    }),
-                },
-                Err(error) => outcomes.push(BatchGetOutcome {
+                    &Status::permission_denied("object read is not authorized"),
+                ));
+                continue;
+            }
+            if requested_version.is_some()
+                && !bucket_versioning_enabled(&self.store, &key).map_err(status)?
+            {
+                outcomes.push(BatchGetOutcome {
                     index: index as u32,
                     address: Some(api_address(&key)),
-                    outcome: Some(BatchGetResult::Failure(distributed_reads::status_failure(
-                        error,
-                    ))),
-                }),
+                    outcome: Some(BatchGetResult::Failure(ReadFailure {
+                        code: ReadFailureCode::VersioningDisabled as i32,
+                        message: "exact-version reads require bucket versioning to be enabled"
+                            .into(),
+                    })),
+                });
+                continue;
             }
+            accepted.push((index, key, requested_version));
         }
-        enforce_batch_get_payload_limit(declared_payload_bytes)?;
-
-        let mut materialized_payload_bytes = 0_u64;
-        for (index, key, requested_version) in selected {
-            let outcome =
-                match distributed_reads::read_batch_result(&self.reader, &key, requested_version)
-                    .await
-                {
-                    Ok((outcome, length)) => {
-                        materialized_payload_bytes =
-                            materialized_payload_bytes.saturating_add(length);
-                        enforce_batch_get_payload_limit(materialized_payload_bytes)?;
-                        outcome
-                    }
-                    Err(error) => BatchGetResult::Failure(distributed_reads::status_failure(error)),
-                };
-            outcomes.push(BatchGetOutcome {
-                index: index as u32,
-                address: Some(api_address(&key)),
-                outcome: Some(outcome),
-            });
+        loop {
+            let (read_outcomes, cursor) = batch_get::read_accepted(
+                self.distribution.clone(),
+                self.reader.clone(),
+                accepted.clone(),
+                MAX_BATCH_GET_BYTES as u64,
+            )
+            .await?;
+            if let Some(cursor) = cursor
+                && !self.programs.cursor_is_visible(cursor)?
+            {
+                self.programs
+                    .wait_for_cursor(cursor, deadline_remaining(deadline)?)
+                    .await?;
+                continue;
+            }
+            outcomes.extend(read_outcomes);
+            outcomes.sort_unstable_by_key(|outcome| outcome.index);
+            return Ok(Response::new(BatchGetResponse { outcomes }));
         }
-        outcomes.sort_unstable_by_key(|outcome| outcome.index);
-        Ok(Response::new(BatchGetResponse { outcomes }))
     }
 
     async fn set_bucket_policy(
         &self,
         request: Request<SetBucketPolicyRequest>,
     ) -> Result<Response<BucketPolicy>, Status> {
+        let peer_routed = request
+            .extensions()
+            .get::<routed_writes::RoutedDestination>()
+            .is_some();
         let caller = authenticated_caller(&request)?;
-        let request = request.into_inner();
-        let policy = request
+        let bearer = OriginalBearer::from_metadata(request.metadata())?;
+        let remaining =
+            effective_atomic_program_timeout(request.metadata(), self.atomic_program_timeout);
+        let api_request = request.into_inner();
+        let policy = api_request
             .policy
+            .clone()
             .ok_or_else(|| Status::invalid_argument("policy is required"))?;
-        let key = ObjectKey::new(&request.tenant, &request.bucket, "_anvil/policy")
+        let key = ObjectKey::new(&api_request.tenant, &api_request.bucket, "_anvil/policy")
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         require_caller_tenant(&caller, &key)?;
-        let authorization = self.system_authorization().await?;
         require_authorized(
-            authorization
-                .allows_bucket_policy(caller.subject(), &request.tenant, &request.bucket)
-                .map_err(crate::authz_api::authz_status)?,
+            self.authoritative_system
+                .allows_bucket_policy(&caller, &api_request.tenant, &api_request.bucket)
+                .await?,
             "bucket policy mutation is not authorized",
         )?;
-        self.store
-            .set_bucket_policy(
-                &request.tenant,
-                &request.bucket,
-                anvil_store::BucketPolicy {
-                    immutable_prefixes: policy.immutable_path_prefixes.clone(),
-                    program_only_prefixes: policy.program_only_path_prefixes.clone(),
-                },
-            )
-            .await
-            .map_err(status)?;
+        let (tenant_id, bucket_id) = self
+            .name_resolver
+            .resolve_bucket_ids(&api_request.tenant, &api_request.bucket)
+            .await?;
+        match self.bucket_governance.policy_target(tenant_id, bucket_id)? {
+            Some(_) if peer_routed => {
+                return Err(Status::failed_precondition(
+                    "a routed SetBucketPolicy reached a node that is not its coordinator",
+                ));
+            }
+            Some(target) => {
+                return self
+                    .cluster_peers
+                    .route_set_bucket_policy(
+                        target.node_id,
+                        &target.address,
+                        bearer.signed_token(),
+                        api_request,
+                        remaining,
+                    )
+                    .await
+                    .map(Response::new);
+            }
+            None => {
+                self.bucket_governance
+                    .set_policy_local(
+                        tenant_id,
+                        bucket_id,
+                        anvil_store::BucketPolicy {
+                            immutable_prefixes: policy.immutable_path_prefixes.clone(),
+                            program_only_prefixes: policy.program_only_path_prefixes.clone(),
+                        },
+                    )
+                    .await?;
+            }
+        }
         Ok(Response::new(policy))
     }
 
@@ -755,79 +920,30 @@ impl ObjectService for ObjectServiceImpl {
         &self,
         request: Request<InvokeProgramRequest>,
     ) -> Result<Response<InvokeProgramResponse>, Status> {
-        let deadline = tokio::time::Instant::now()
-            .checked_add(effective_atomic_program_timeout(
-                request.metadata(),
-                self.atomic_program_timeout,
-            ))
-            .ok_or_else(|| Status::internal("configured atomic program timeout exceeds clock"))?;
-        let caller = authenticated_caller(&request)?;
-        let request = request.into_inner();
-        let durability = durability(request.durability)?;
-        let program_address = request
-            .program
-            .clone()
-            .ok_or_else(|| Status::invalid_argument("program address is required"))?;
-        let program = object_key(Some(program_address.clone()))?;
-        let expected_program_hash = required_hash(&request.program_hash, "program_hash")?;
-        require_caller_tenant(&caller, &program)?;
-        let authorization = self.system_authorization().await?;
-        require_authorized(
-            authorization
-                .allows_object(caller.subject(), &program, ObjectPermission::Get)
-                .map_err(crate::authz_api::authz_status)?,
-            "program definition read is not authorized",
-        )?;
-
-        let invocation_id = request.invocation_id.clone();
-        let result = run_atomic_program_until(
-            deadline,
-            self.programs.invoke(
-                program,
-                expected_program_hash,
-                request.invocation_id,
-                &request.input_json,
-                durability_name(durability),
-                |dependency| authorize_program_dependency(&authorization, &caller, dependency),
-            ),
-        )
-        .await?;
-        let mut path_receipts = Vec::with_capacity(result.published_versions.len());
-        for (path, published) in result.published_versions {
-            path_receipts.push(ProgramPathReceipt {
-                address: Some(ObjectAddress {
-                    tenant: path.tenant,
-                    bucket: path.bucket,
-                    path: path.path,
-                }),
-                version: published.version.0,
-                deleted: published.deleted,
-            });
-        }
-        let output_json = serde_json::to_vec(&result.receipt.outputs)
-            .map_err(|error| internal(format!("encode atomic program output: {error}")))?;
-        let replay_expiration = UNIX_EPOCH
-            .checked_add(Duration::from_millis(
-                result.replay_guarantee_expires_at_unix_millis,
-            ))
-            .ok_or_else(|| Status::internal("atomic replay receipt expiry is out of range"))?;
-        let replay_guarantee_expires_at = Some(replay_expiration.into());
-        Ok(Response::new(InvokeProgramResponse {
-            invocation_id,
-            program: Some(program_address),
-            program_hash: result.program_hash.to_vec(),
-            executor_nomination_log_index: result.executor_nomination_log_index,
-            commit_log_index: result.commit_log_index,
-            path_receipts,
-            output_json,
-            replayed: result.replayed,
-            replay_guarantee_expires_at,
-        }))
+        atomic_program::invoke(self, request).await
     }
 }
 
 fn effective_atomic_program_timeout(metadata: &MetadataMap, server_maximum: Duration) -> Duration {
     client_grpc_timeout(metadata).map_or(server_maximum, |client| client.min(server_maximum))
+}
+
+fn request_deadline(
+    metadata: &MetadataMap,
+    server_maximum: Duration,
+) -> Result<tokio::time::Instant, Status> {
+    tokio::time::Instant::now()
+        .checked_add(effective_atomic_program_timeout(metadata, server_maximum))
+        .ok_or_else(|| Status::internal("configured request timeout exceeds clock"))
+}
+
+fn deadline_remaining(deadline: tokio::time::Instant) -> Result<Duration, Status> {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        Err(Status::deadline_exceeded("request deadline exceeded"))
+    } else {
+        Ok(remaining)
+    }
 }
 
 // Tonic enforces the same grpc-timeout grammar at the transport boundary. We
@@ -874,11 +990,10 @@ impl ObjectServiceImpl {
         permission: ObjectPermission,
     ) -> Result<(), Status> {
         require_caller_tenant(caller, key)?;
-        let authorization = self.system_authorization().await?;
         require_authorized(
-            authorization
-                .allows_object(caller.subject(), key, permission)
-                .map_err(crate::authz_api::authz_status)?,
+            self.authoritative_system
+                .allows_object(caller, key, permission)
+                .await?,
             "object operation is not authorized",
         )
     }
@@ -1040,23 +1155,47 @@ fn require_authorized(allowed: bool, message: &'static str) -> Result<(), Status
     }
 }
 
-fn authorize_batch_operation(
-    authorization: &SystemAuthorization,
-    caller: &Caller,
-    operation: &BatchOperation,
-) -> Result<(), Status> {
-    let (key, permission) = match operation {
-        BatchOperation::Put(request) => (&request.key, ObjectPermission::Put),
-        BatchOperation::Publish(request) => (&request.key, ObjectPermission::Put),
-        BatchOperation::Delete(request) => (&request.key, ObjectPermission::Delete),
-    };
-    require_caller_tenant(caller, key)?;
-    require_authorized(
-        authorization
-            .allows_object(caller.subject(), key, permission)
-            .map_err(crate::authz_api::authz_status)?,
-        "bulk object operation is not authorized",
-    )
+fn batch_operation_permission(operation: &BatchOperation) -> ObjectPermission {
+    match operation {
+        BatchOperation::Put(_) | BatchOperation::Publish(_) => ObjectPermission::Put,
+        BatchOperation::Delete(_) => ObjectPermission::Delete,
+    }
+}
+
+fn batch_operation_key(operation: &BatchOperation) -> &ObjectKey {
+    match operation {
+        BatchOperation::Put(request) => &request.key,
+        BatchOperation::Publish(request) => &request.key,
+        BatchOperation::Delete(request) => &request.key,
+    }
+}
+
+fn bulk_authorization_failure(index: usize, error: &Status) -> BulkOutcome {
+    BulkOutcome {
+        index: index as u32,
+        outcome: Some(anvil_api::v1::bulk_outcome::Outcome::Failure(
+            MutationFailure {
+                code: MutationFailureCode::AuthorizationDenied as i32,
+                message: error.message().to_owned(),
+                current_version: None,
+            },
+        )),
+    }
+}
+
+fn batch_get_authorization_failure(
+    index: usize,
+    key: &ObjectKey,
+    error: &Status,
+) -> BatchGetOutcome {
+    BatchGetOutcome {
+        index: index as u32,
+        address: Some(api_address(key)),
+        outcome: Some(BatchGetResult::Failure(ReadFailure {
+            code: ReadFailureCode::AuthorizationDenied as i32,
+            message: error.message().to_owned(),
+        })),
+    }
 }
 
 fn authorize_program_dependency(
@@ -1100,6 +1239,47 @@ fn authorize_program_dependency(
     Ok(())
 }
 
+async fn authorize_program_dependencies_authoritatively(
+    authorization: &AuthoritativeSystemAuthorization,
+    governance: &BucketGovernance,
+    caller: &Caller,
+    dependencies: Vec<ExpandedProgramPath>,
+) -> Result<(), Status> {
+    let mut requests = Vec::new();
+    for dependency in dependencies {
+        let key = ObjectKey::new(
+            &dependency.path.tenant,
+            &dependency.path.bucket,
+            &dependency.path.path,
+        )
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        require_caller_tenant(caller, &key)?;
+        let policy = governance.resolve(key.tenant(), key.bucket()).await?;
+        if !policy.policy.is_program_only(key.path()) {
+            return Err(Status::failed_precondition(
+                "PROGRAM_CONCURRENCY_VIOLATION: every atomic program dependency must be PROGRAM_ONLY",
+            ));
+        }
+        for (required, permission) in [
+            (dependency.intent.get, ObjectPermission::Get),
+            (dependency.intent.put, ObjectPermission::Put),
+            (dependency.intent.delete, ObjectPermission::Delete),
+        ] {
+            if required {
+                requests.push((key.clone(), permission));
+            }
+        }
+    }
+    let allowed = authorization.allows_objects(caller, &requests).await?;
+    if allowed.into_iter().all(|allowed| allowed) {
+        Ok(())
+    } else {
+        Err(Status::permission_denied(
+            "atomic program dependency is not authorized",
+        ))
+    }
+}
+
 fn authorization_store_status(error: AuthzStoreError) -> Status {
     match error {
         AuthzStoreError::MissingBinding(_, _) | AuthzStoreError::SchemaNotFound(_, _) => {
@@ -1136,30 +1316,6 @@ fn api_watch_invalidation(invalidation: LocalInvalidation) -> WatchInvalidation 
         minimum_path_version: invalidation.minimum_path_version.0,
         state_hint: state_hint as i32,
     }
-}
-
-fn watch_checkpoint_message(
-    store: &Store,
-    scope: &WatchScope,
-    cursor: anvil_store::WatchCursor,
-) -> Result<WatchMessage, Status> {
-    let resume_token = store
-        .watch_checkpoint(scope, cursor)
-        .map_err(watch_status)?;
-    Ok(WatchMessage {
-        message: Some(WatchMessageValue::Checkpoint(WatchCheckpoint {
-            resume_token,
-        })),
-    })
-}
-
-async fn send_watch(
-    sender: &tokio::sync::mpsc::Sender<Result<WatchMessage, Status>>,
-    message: Result<WatchMessage, Status>,
-) -> Result<(), ()> {
-    let terminal = message.is_err();
-    sender.send(message).await.map_err(|_| ())?;
-    if terminal { Err(()) } else { Ok(()) }
 }
 
 fn watch_status(error: WatchError) -> Status {
@@ -1238,35 +1394,7 @@ fn record_bulk_write_metrics(
     );
 }
 
-fn observe_watch_journal(store: &Store, cursor: WatchCursor) {
-    match store.local_watch_status() {
-        Ok(status) => record_watch_journal_status(status, cursor.offset()),
-        Err(error) => {
-            tracing::warn!(%error, "watch journal metrics unavailable");
-        }
-    }
-}
-
-fn record_watch_journal_status(status: WatchJournalStatus, cursor_offset: u64) {
-    let Some(consumer_lag) = watch_consumer_lag(&status, cursor_offset) else {
-        tracing::warn!(
-            tail = status.tail,
-            cursor_offset,
-            "watch cursor is ahead of the local journal tail"
-        );
-        return;
-    };
-    tracing::info!(
-        gauge.anvil_watch_journal_retained_entries = status.retained_entries,
-        gauge.anvil_watch_journal_retained_bytes = status.retained_bytes,
-        histogram.anvil_watch_consumer_lag_entries = consumer_lag,
-        retained_entries = status.retained_entries,
-        retained_bytes = status.retained_bytes,
-        consumer_lag,
-        "watch journal observed"
-    );
-}
-
+#[cfg(test)]
 fn watch_consumer_lag(status: &WatchJournalStatus, cursor_offset: u64) -> Option<u64> {
     status.tail.checked_sub(cursor_offset)
 }

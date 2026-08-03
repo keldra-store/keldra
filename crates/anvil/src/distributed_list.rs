@@ -7,6 +7,7 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use anvil_atomic_program::MAX_OBJECT_PATH_BYTES;
 use anvil_authz::{ObjectRef, RealmId};
@@ -554,25 +555,30 @@ impl DistributedObjectLister {
             start_after.map(str::to_owned),
             limit,
         )?;
-        let page = gather_cluster_page(
-            self.local_node,
-            self.store.clone(),
-            Arc::new(placement),
-            self.peers.clone(),
-            self.authorization.clone(),
-            bearer,
-            query,
-        )
-        .await?;
+        loop {
+            let page = gather_cluster_page(
+                self.local_node,
+                self.store.clone(),
+                Arc::new(placement.clone()),
+                self.peers.clone(),
+                self.authorization.clone(),
+                bearer.clone(),
+                query.clone(),
+            )
+            .await?;
 
-        // A cutover after one source responded must not turn an old ownership
-        // set into a successful page.
-        if self.placement()?.fence() != page.placement_fence {
-            return Err(Status::unavailable(
-                "active placement changed while collecting the list page",
-            ));
+            // A cutover after one source responded must not turn an old ownership
+            // set into a successful page.
+            if self.placement()?.fence() != page.placement_fence {
+                return Err(Status::unavailable(
+                    "active placement changed while collecting the list page",
+                ));
+            }
+            if crate::programs::atomic_tail_is_clear(&self.decisions)? {
+                return Ok(page.page);
+            }
+            crate::programs::wait_for_atomic_tail(&self.decisions, Duration::from_secs(30)).await?;
         }
-        Ok(page.page)
     }
 
     fn placement(&self) -> Result<ClusterPlacement, Status> {
