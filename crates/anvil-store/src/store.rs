@@ -794,7 +794,9 @@ pub use object_snapshot::{
 };
 pub use reference_proofs::{
     MAX_REFERENCE_PROOF_EXPORT_BYTES, MAX_REFERENCE_PROOF_EXPORT_RECORDS,
-    ReferenceProofCursor, ReferenceProofExportError, ReferenceProofPage,
+    MAX_REFERENCE_PROOF_PRUNE_BYTES, MAX_REFERENCE_PROOF_PRUNE_RECORDS, ReferenceProofCursor,
+    ReferenceProofExportError, ReferenceProofPage, ReferenceProofPruneError,
+    ReferenceProofPruneResult,
 };
 pub use shards::{ShardIdentity, ShardReader, ShardSealOutcome, ShardStoreError};
 

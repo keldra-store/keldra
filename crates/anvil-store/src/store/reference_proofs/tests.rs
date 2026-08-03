@@ -56,7 +56,10 @@ async fn proof_export_enforces_record_and_byte_bounds_without_skipping() {
         .export_reference_proofs(None, 1, MAX_REFERENCE_PROOF_EXPORT_BYTES)
         .unwrap();
     assert_eq!(first.proofs.len(), 1);
-    let cursor = first.next_cursor.as_ref().expect("one record truncated the page");
+    let cursor = first
+        .next_cursor
+        .as_ref()
+        .expect("one record truncated the page");
     let second = source
         .export_reference_proofs(Some(cursor), 1, MAX_REFERENCE_PROOF_EXPORT_BYTES)
         .unwrap();
@@ -471,4 +474,251 @@ fn proof_keys_are_versioned_namespaced_and_fixed_width() {
     assert_eq!(&first[36..], &1_u64.to_be_bytes());
     assert_eq!(&last[36..], &u64::MAX.to_be_bytes());
     assert!(offset_from_key(&first).is_none());
+}
+
+async fn coordinated_proof(store: &Store, path: &str, command: &str) -> ReferenceProof {
+    let mutation = store
+        .coordinate_object_mutation(BatchOperation::Put(put(path, command)), context())
+        .await
+        .unwrap()
+        .mutation
+        .unwrap();
+    store
+        .read_reference_proof(
+            mutation.stamp.source_id,
+            mutation.stamp.source_journal_position,
+        )
+        .unwrap()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn prune_is_source_scoped_and_through_inclusive() {
+    let temporary = tempfile::tempdir().unwrap();
+    let first_source = Store::open(StoreOptions::new(temporary.path().join("first"), 1))
+        .await
+        .unwrap();
+    let second_source = Store::open(StoreOptions::new(temporary.path().join("second"), 2))
+        .await
+        .unwrap();
+    let replica = Store::open(StoreOptions::new(temporary.path().join("replica"), 3))
+        .await
+        .unwrap();
+    let first = coordinated_proof(&first_source, "first/1", "first-1").await;
+    let boundary = coordinated_proof(&first_source, "first/2", "first-2").await;
+    let after = coordinated_proof(&first_source, "first/3", "first-3").await;
+    let other = coordinated_proof(&second_source, "second/1", "second-1").await;
+    for proof in [&first, &boundary, &after, &other] {
+        replica
+            .install_quorum_reconciled_reference_proof(proof)
+            .await
+            .unwrap();
+    }
+
+    let result = replica
+        .prune_reference_proofs(
+            first.source_id,
+            boundary.offset(),
+            MAX_REFERENCE_PROOF_PRUNE_RECORDS,
+            MAX_REFERENCE_PROOF_PRUNE_BYTES,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.deleted_records, 2);
+    assert!(result.complete);
+    assert!(
+        replica
+            .read_reference_proof(first.source_id, first.offset())
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        replica
+            .read_reference_proof(boundary.source_id, boundary.offset())
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        replica
+            .read_reference_proof(after.source_id, after.offset())
+            .unwrap(),
+        Some(after)
+    );
+    assert_eq!(
+        replica
+            .read_reference_proof(other.source_id, other.offset())
+            .unwrap(),
+        Some(other)
+    );
+}
+
+#[tokio::test]
+async fn prune_pages_resume_after_reopen_without_a_persisted_cursor() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("paged");
+    let store = Store::open(StoreOptions::new(&path, 1)).await.unwrap();
+    let proofs = vec![
+        coordinated_proof(&store, "paged/1", "paged-1").await,
+        coordinated_proof(&store, "paged/2", "paged-2").await,
+        coordinated_proof(&store, "paged/3", "paged-3").await,
+    ];
+    let source = proofs[0].source_id;
+    let through = proofs[2].offset();
+    let required_bytes = REFERENCE_PROOF_KEY_BYTES as u64
+        + u64::try_from(encode_reference_proof(&proofs[0]).unwrap().len()).unwrap();
+    assert_eq!(
+        store
+            .prune_reference_proofs(source, through, 1, required_bytes - 1)
+            .await,
+        Err(ReferenceProofPruneError::RecordTooLarge { required_bytes })
+    );
+    assert_eq!(
+        store
+            .prune_reference_proofs(source, through, 0, required_bytes)
+            .await,
+        Err(ReferenceProofPruneError::InvalidLimits)
+    );
+
+    let first_page = store
+        .prune_reference_proofs(source, through, 1, MAX_REFERENCE_PROOF_PRUNE_BYTES)
+        .await
+        .unwrap();
+    assert_eq!(first_page.deleted_records, 1);
+    assert!(!first_page.complete);
+    drop(store);
+
+    let reopened = Store::open(StoreOptions::new(&path, 1)).await.unwrap();
+    let second_page = reopened
+        .prune_reference_proofs(source, through, 1, MAX_REFERENCE_PROOF_PRUNE_BYTES)
+        .await
+        .unwrap();
+    assert_eq!(second_page.deleted_records, 1);
+    assert!(!second_page.complete);
+    let final_page = reopened
+        .prune_reference_proofs(source, through, 1, MAX_REFERENCE_PROOF_PRUNE_BYTES)
+        .await
+        .unwrap();
+    assert_eq!(final_page.deleted_records, 1);
+    assert!(final_page.complete);
+    assert_eq!(
+        reopened
+            .prune_reference_proofs(source, through, 1, MAX_REFERENCE_PROOF_PRUNE_BYTES)
+            .await
+            .unwrap(),
+        ReferenceProofPruneResult {
+            complete: true,
+            ..ReferenceProofPruneResult::default()
+        }
+    );
+}
+
+#[tokio::test]
+async fn malformed_eligible_proof_aborts_the_whole_prune_page() {
+    let (_temporary, source, _replica) = stores().await;
+    let first = coordinated_proof(&source, "malformed/1", "malformed-1").await;
+    let second = coordinated_proof(&source, "malformed/2", "malformed-2").await;
+    source
+        .db
+        .put_cf(
+            source.cf(CF_LOCAL_INVALIDATIONS).unwrap(),
+            reference_proof_key(second.source_id, second.offset()),
+            b"not-a-reference-proof",
+        )
+        .unwrap();
+
+    assert!(matches!(
+        source
+            .prune_reference_proofs(
+                first.source_id,
+                second.offset(),
+                MAX_REFERENCE_PROOF_PRUNE_RECORDS,
+                MAX_REFERENCE_PROOF_PRUNE_BYTES,
+            )
+            .await,
+        Err(ReferenceProofPruneError::Storage(_))
+    ));
+    assert_eq!(
+        source
+            .read_reference_proof(first.source_id, first.offset())
+            .unwrap(),
+        Some(first)
+    );
+    assert!(
+        source
+            .read_reference_proof(second.source_id, second.offset())
+            .is_err()
+    );
+}
+
+#[derive(Default)]
+struct WalMutations {
+    puts: Vec<Vec<u8>>,
+    deletes: Vec<Vec<u8>>,
+}
+
+impl WriteBatchIteratorCf for WalMutations {
+    fn put_cf(&mut self, _cf_id: u32, key: &[u8], _value: &[u8]) {
+        self.puts.push(key.to_vec());
+    }
+
+    fn delete_cf(&mut self, _cf_id: u32, key: &[u8]) {
+        self.deletes.push(key.to_vec());
+    }
+
+    fn merge_cf(&mut self, _cf_id: u32, _key: &[u8], _value: &[u8]) {}
+}
+
+fn column_family_snapshot(store: &Store, name: &'static str) -> Vec<(Vec<u8>, Vec<u8>)> {
+    store
+        .db
+        .iterator_cf(store.cf(name).unwrap(), IteratorMode::Start)
+        .map(|entry| {
+            let (key, value) = entry.unwrap();
+            (key.to_vec(), value.to_vec())
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn prune_writes_only_proof_deletes_and_no_timestamp_or_side_state() {
+    let (_temporary, source, _replica) = stores().await;
+    let proof = coordinated_proof(&source, "side-state", "side-state").await;
+    let metadata_before = column_family_snapshot(&source, CF_METADATA);
+    let journal_status_before = source.local_watch_status().unwrap();
+    let sequence = source.db.latest_sequence_number();
+
+    let result = source
+        .prune_reference_proofs(
+            proof.source_id,
+            proof.offset(),
+            MAX_REFERENCE_PROOF_PRUNE_RECORDS,
+            MAX_REFERENCE_PROOF_PRUNE_BYTES,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.deleted_records, 1);
+    assert!(result.complete);
+    assert_eq!(
+        column_family_snapshot(&source, CF_METADATA),
+        metadata_before
+    );
+    assert_eq!(source.local_watch_status().unwrap(), journal_status_before);
+
+    let batches = source
+        .db
+        .get_updates_since(sequence)
+        .unwrap()
+        .map(|entry| {
+            let (_, batch) = entry.unwrap();
+            let mut mutations = WalMutations::default();
+            batch.iterate_cf(&mut mutations);
+            mutations
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(batches.len(), 1);
+    assert!(batches[0].puts.is_empty());
+    assert_eq!(
+        batches[0].deletes,
+        vec![reference_proof_key(proof.source_id, proof.offset()).to_vec()]
+    );
 }

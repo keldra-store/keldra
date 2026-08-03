@@ -8,6 +8,8 @@ use crate::watch::{
 
 pub const MAX_REFERENCE_PROOF_EXPORT_RECORDS: u32 = 1_000;
 pub const MAX_REFERENCE_PROOF_EXPORT_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_REFERENCE_PROOF_PRUNE_RECORDS: u32 = 1_000;
+pub const MAX_REFERENCE_PROOF_PRUNE_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ReferenceProofExportError {
@@ -17,6 +19,23 @@ pub enum ReferenceProofExportError {
     RecordTooLarge { required_bytes: u64 },
     #[error("reference-proof export storage failed: {0}")]
     Storage(String),
+}
+
+#[derive(Debug, Eq, PartialEq, thiserror::Error)]
+pub enum ReferenceProofPruneError {
+    #[error("reference-proof prune limits are invalid")]
+    InvalidLimits,
+    #[error("one reference proof requires {required_bytes} bytes, exceeding the prune page limit")]
+    RecordTooLarge { required_bytes: u64 },
+    #[error("reference-proof prune storage failed: {0}")]
+    Storage(String),
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReferenceProofPruneResult {
+    pub deleted_records: u32,
+    pub deleted_bytes: u64,
+    pub complete: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -49,13 +68,14 @@ impl Store {
         }
         let after = cursor
             .map(|cursor| {
-                validate_proof_coordinates(cursor.source, cursor.offset)
-                    .map_err(export_storage)?;
+                validate_proof_coordinates(cursor.source, cursor.offset).map_err(export_storage)?;
                 Ok(reference_proof_key(cursor.source, cursor.offset))
             })
             .transpose()?;
         let prefix = [crate::key::STORAGE_KEY_FORMAT_VERSION, 0xff];
-        let start = after.as_ref().map_or(prefix.as_slice(), |key| key.as_slice());
+        let start = after
+            .as_ref()
+            .map_or(prefix.as_slice(), |key| key.as_slice());
         let mut proofs = Vec::with_capacity(max_records as usize);
         let mut encoded_bytes = 0_u64;
         let mut last = None;
@@ -73,7 +93,10 @@ impl Store {
                     "reference-proof handoff key is malformed".into(),
                 ));
             }
-            if after.as_ref().is_some_and(|after| key.as_ref() <= after.as_slice()) {
+            if after
+                .as_ref()
+                .is_some_and(|after| key.as_ref() <= after.as_slice())
+            {
                 continue;
             }
             let proof = decode_reference_proof(&encoded).map_err(export_storage)?;
@@ -83,14 +106,10 @@ impl Store {
                     "reference-proof handoff key disagrees with its value".into(),
                 ));
             }
-            let proof_bytes = u64::try_from(
-                serde_json::to_vec(&proof)
-                    .map_err(export_storage)?
-                    .len(),
-            )
-            .map_err(|_| {
-                ReferenceProofExportError::Storage("reference-proof size overflow".into())
-            })?;
+            let proof_bytes =
+                u64::try_from(serde_json::to_vec(&proof).map_err(export_storage)?.len()).map_err(
+                    |_| ReferenceProofExportError::Storage("reference-proof size overflow".into()),
+                )?;
             if proof_bytes > MAX_REFERENCE_PROOF_EXPORT_BYTES
                 || (proofs.is_empty() && proof_bytes > max_bytes)
             {
@@ -114,6 +133,117 @@ impl Store {
         Ok(ReferenceProofPage {
             proofs,
             next_cursor: more.then_some(last.expect("a full proof page has a cursor")),
+        })
+    }
+
+    /// Deletes one bounded page of proofs from exactly one source prefix.
+    ///
+    /// `through_inclusive` must come from that source journal's durable
+    /// retention floor. The caller owns that distributed safety check; this
+    /// local primitive validates every selected key and value, then emits only
+    /// deletes in one synchronous RocksDB batch. It stores no cleanup cursor,
+    /// timestamp, or acknowledgement record. A retry starts at the same prefix
+    /// and naturally advances because prior keys are absent.
+    pub async fn prune_reference_proofs(
+        &self,
+        source: SourceId,
+        through_inclusive: u64,
+        max_records: u32,
+        max_bytes: u64,
+    ) -> Result<ReferenceProofPruneResult, ReferenceProofPruneError> {
+        validate_proof_source(source).map_err(ReferenceProofPruneError::Storage)?;
+        if max_records == 0
+            || max_records > MAX_REFERENCE_PROOF_PRUNE_RECORDS
+            || max_bytes == 0
+            || max_bytes > MAX_REFERENCE_PROOF_PRUNE_BYTES
+        {
+            return Err(ReferenceProofPruneError::InvalidLimits);
+        }
+        if through_inclusive == 0 {
+            return Ok(ReferenceProofPruneResult {
+                complete: true,
+                ..ReferenceProofPruneResult::default()
+            });
+        }
+
+        let _commit_guard = self.commit_lock.lock().await;
+        let column = self.cf(CF_LOCAL_INVALIDATIONS).map_err(prune_storage)?;
+        let prefix = reference_proof_source_prefix(source);
+        let first = reference_proof_key(source, 1);
+        let mut batch = WriteBatch::default();
+        let mut deleted_records = 0_u32;
+        let mut deleted_bytes = 0_u64;
+        let mut complete = true;
+
+        for entry in self.db.iterator_cf(
+            column,
+            IteratorMode::From(first.as_slice(), Direction::Forward),
+        ) {
+            let (key, encoded) = entry.map_err(prune_storage)?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            if key.len() != REFERENCE_PROOF_KEY_BYTES {
+                return Err(ReferenceProofPruneError::Storage(
+                    "reference-proof prune key is malformed".into(),
+                ));
+            }
+            let proof = decode_reference_proof(&encoded).map_err(prune_storage)?;
+            validate_stored_proof(&proof).map_err(ReferenceProofPruneError::Storage)?;
+            if proof.source_id != source
+                || reference_proof_key(proof.source_id, proof.offset()).as_slice() != key.as_ref()
+            {
+                return Err(ReferenceProofPruneError::Storage(
+                    "reference-proof prune key disagrees with its value".into(),
+                ));
+            }
+            if proof.offset() > through_inclusive {
+                break;
+            }
+
+            let record_bytes = u64::try_from(key.len())
+                .ok()
+                .and_then(|key_bytes| {
+                    u64::try_from(encoded.len())
+                        .ok()
+                        .and_then(|value_bytes| key_bytes.checked_add(value_bytes))
+                })
+                .ok_or_else(|| {
+                    ReferenceProofPruneError::Storage(
+                        "reference-proof prune byte count overflow".into(),
+                    )
+                })?;
+            if deleted_records == 0 && record_bytes > max_bytes {
+                return Err(ReferenceProofPruneError::RecordTooLarge {
+                    required_bytes: record_bytes,
+                });
+            }
+            if deleted_records == max_records
+                || deleted_bytes
+                    .checked_add(record_bytes)
+                    .is_none_or(|next| next > max_bytes)
+            {
+                complete = false;
+                break;
+            }
+            batch.delete_cf(column, key.as_ref());
+            deleted_records += 1;
+            deleted_bytes = deleted_bytes.checked_add(record_bytes).ok_or_else(|| {
+                ReferenceProofPruneError::Storage(
+                    "reference-proof prune byte count overflow".into(),
+                )
+            })?;
+        }
+
+        if deleted_records != 0 {
+            let mut options = WriteOptions::default();
+            options.set_sync(self.sync_writes);
+            self.db.write_opt(batch, &options).map_err(prune_storage)?;
+        }
+        Ok(ReferenceProofPruneResult {
+            deleted_records,
+            deleted_bytes,
+            complete,
         })
     }
 
@@ -225,6 +355,24 @@ fn export_storage(error: impl std::fmt::Display) -> ReferenceProofExportError {
     ReferenceProofExportError::Storage(error.to_string())
 }
 
+fn prune_storage(error: impl std::fmt::Display) -> ReferenceProofPruneError {
+    ReferenceProofPruneError::Storage(error.to_string())
+}
+
+fn validate_proof_source(source: SourceId) -> Result<(), String> {
+    if source.node_id == 0 || source.source_epoch == [0; 32] {
+        return Err("reference proof source identity is invalid".into());
+    }
+    Ok(())
+}
+
+fn reference_proof_source_prefix(source: SourceId) -> [u8; 36] {
+    let key = reference_proof_key(source, 1);
+    key[..36]
+        .try_into()
+        .expect("reference-proof source prefix has a fixed width")
+}
+
 fn proof_for_mutation(mutation: &ObjectMutation) -> Result<ReferenceProof, MutationError> {
     mutation.validate()?;
     let proof = ReferenceProof::new(
@@ -245,7 +393,7 @@ fn proof_for_mutation(mutation: &ObjectMutation) -> Result<ReferenceProof, Mutat
 }
 
 fn validate_proof_coordinates(source: SourceId, offset: u64) -> Result<(), MutationError> {
-    if source.node_id == 0 || source.source_epoch == [0; 32] || offset == 0 {
+    if validate_proof_source(source).is_err() || offset == 0 {
         return Err(MutationError::InvalidObjectMutation(
             "reference proof source identity or offset is invalid".into(),
         ));

@@ -5,6 +5,8 @@
 //! advances every ACTIVE destination through contiguous prefixes, and lets the
 //! store compact only through the minimum durable destination cursor.
 
+pub(crate) mod cleanup;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
