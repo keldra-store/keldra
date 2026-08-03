@@ -1,8 +1,7 @@
 //! Typed storage operations on Anvil's mandatory-mTLS private peer listener.
 //!
 //! This is deliberately not a RocksDB endpoint. Each method decodes one
-//! versioned logical store type and invokes the corresponding storage-kernel
-//! boundary. Operations without such a boundary are absent from the protocol.
+//! versioned logical store type and invokes the corresponding storage-kernel boundary.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -33,15 +32,20 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status, Streaming};
 
 mod errors;
+mod handoff;
+mod handoff_scope;
 mod object_snapshot;
 mod timeout;
+mod transport;
 mod typed_json;
 
 use errors::{map_mutation_error, map_payload_error, map_shard_error};
+use handoff_scope::{HandoffAuthority, HandoffTarget};
 use object_snapshot::{
     encode_object_snapshot, map_object_snapshot_error, require_object_snapshot_bound,
 };
 use timeout::effective_timeout;
+pub(crate) use transport::DataPeerTransport;
 use typed_json::{decode_typed, encode_page, encode_typed, require_typed_bound};
 
 pub(crate) mod wire {
@@ -59,6 +63,7 @@ pub(crate) struct DataPeerService {
     store: Store,
     pins: Arc<dyn CommittedPeerPinProvider>,
     codec: Arc<ErasureCodec>,
+    handoff: HandoffAuthority,
     maximum_unary_time: Duration,
     max_blob_bytes: u64,
 }
@@ -66,11 +71,51 @@ pub(crate) struct DataPeerService {
 pub(crate) type DataPeerServer = wire::data_peer_server::DataPeerServer<DataPeerService>;
 type ContentStream =
     Pin<Box<dyn tokio_stream::Stream<Item = Result<wire::ContentFrame, Status>> + Send>>;
+type AuthzRealmStream =
+    Pin<Box<dyn tokio_stream::Stream<Item = Result<wire::AuthzRealmFrame, Status>> + Send>>;
 
 impl DataPeerService {
     pub(crate) fn new(
         store: Store,
         pins: Arc<dyn CommittedPeerPinProvider>,
+        decisions: anvil_consensus::DecisionRaft,
+        local_node: NodeId,
+        profile: ErasureProfile,
+        maximum_unary_time: Duration,
+        max_blob_bytes: u64,
+    ) -> Result<Self, anyhow::Error> {
+        Self::validate_and_build(
+            store,
+            pins,
+            HandoffAuthority::raft(decisions, local_node),
+            profile,
+            maximum_unary_time,
+            max_blob_bytes,
+        )
+    }
+
+    #[cfg(test)]
+    fn new_test(
+        store: Store,
+        pins: Arc<dyn CommittedPeerPinProvider>,
+        profile: ErasureProfile,
+        maximum_unary_time: Duration,
+        max_blob_bytes: u64,
+    ) -> Result<Self, anyhow::Error> {
+        Self::validate_and_build(
+            store,
+            pins,
+            HandoffAuthority::reject(),
+            profile,
+            maximum_unary_time,
+            max_blob_bytes,
+        )
+    }
+
+    fn validate_and_build(
+        store: Store,
+        pins: Arc<dyn CommittedPeerPinProvider>,
+        handoff: HandoffAuthority,
         profile: ErasureProfile,
         maximum_unary_time: Duration,
         max_blob_bytes: u64,
@@ -91,6 +136,7 @@ impl DataPeerService {
             store,
             pins,
             codec: Arc::new(codec),
+            handoff,
             maximum_unary_time,
             max_blob_bytes,
         })
@@ -143,6 +189,15 @@ impl DataPeerService {
         .map_err(|_| Status::permission_denied("peer is not authorized for this RPC class"))
     }
 
+    fn validate_handoff(
+        &self,
+        caller: AuthenticatedPeer,
+        scope: Option<&wire::HandoffScope>,
+        target: HandoffTarget,
+    ) -> Result<(), Status> {
+        self.handoff.validate(caller, scope, target)
+    }
+
     async fn bounded<T>(
         &self,
         metadata: &MetadataMap,
@@ -160,6 +215,7 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
     type GetSmallContentStream = ContentStream;
     type GetCompleteSourceStream = ContentStream;
     type GetShardStream = ContentStream;
+    type GetAuthzRealmStream = AuthzRealmStream;
 
     async fn apply_object_mutation(
         &self,
@@ -786,529 +842,138 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
             already_present: outcome == ShardSealOutcome::AlreadyPresent,
         }))
     }
-}
 
-/// Cached mandatory-mTLS client for typed data-plane operations.
-#[derive(Clone)]
-#[allow(
-    dead_code,
-    reason = "the distributed coordinators consume this transport in the immediately following integration slice"
-)]
-pub(crate) struct DataPeerTransport {
-    cluster_id: ClusterId,
-    source_node_id: NodeId,
-    tls: PeerTlsConnector,
-    channels: Arc<Mutex<BTreeMap<u64, (String, Channel)>>>,
-}
-
-#[allow(
-    dead_code,
-    reason = "the distributed coordinators consume this transport in the immediately following integration slice"
-)]
-impl DataPeerTransport {
-    pub(crate) fn new(
-        cluster_id: ClusterId,
-        source_node_id: NodeId,
-        tls: PeerTlsConnector,
-    ) -> Result<Self, anyhow::Error> {
-        anyhow::ensure!(cluster_id.0 != [0; 16], "cluster id must not be all zero");
-        anyhow::ensure!(source_node_id.0 != 0, "source node id must not be zero");
-        Ok(Self {
-            cluster_id,
-            source_node_id,
-            tls,
-            channels: Arc::new(Mutex::new(BTreeMap::new())),
-        })
-    }
-
-    fn context(&self) -> wire::PeerContext {
-        wire::PeerContext {
-            schema_version: DATA_PEER_SCHEMA_VERSION,
-            cluster_id: self.cluster_id.into_bytes().to_vec(),
-            source_node_id: self.source_node_id.0,
-        }
-    }
-
-    pub(crate) fn peer_identity(&self) -> (ClusterId, NodeId) {
-        (self.cluster_id, self.source_node_id)
-    }
-
-    pub(crate) fn channel(&self, target: NodeId, address: &str) -> Result<Channel, Status> {
-        if target.0 == 0 {
-            return Err(Status::invalid_argument("target node id must not be zero"));
-        }
-        if address.is_empty() {
-            return Err(Status::invalid_argument("target peer address is empty"));
-        }
-        let mut channels = self
-            .channels
-            .lock()
-            .map_err(|_| Status::internal("data-peer channel lock is poisoned"))?;
-        if let Some((cached_address, channel)) = channels.get(&target.0)
-            && cached_address == address
-        {
-            return Ok(channel.clone());
-        }
-        let connector = DataPeerChannelConnector {
-            tls: self.tls.clone(),
-            target,
-            address: address.to_owned(),
-        };
-        let channel = Endpoint::from_static("http://anvil-peer.invalid")
-            .connect_with_connector_lazy(connector);
-        channels.insert(target.0, (address.to_owned(), channel.clone()));
-        Ok(channel)
-    }
-
-    fn client(
+    async fn export_object_records(
         &self,
-        target: NodeId,
-        address: &str,
-    ) -> Result<wire::data_peer_client::DataPeerClient<Channel>, Status> {
-        Ok(
-            wire::data_peer_client::DataPeerClient::new(self.channel(target, address)?)
-                .max_decoding_message_size(MAX_DATA_PEER_MESSAGE_BYTES)
-                .max_encoding_message_size(MAX_DATA_PEER_MESSAGE_BYTES),
-        )
+        request: Request<wire::HandoffPageRequest>,
+    ) -> Result<Response<wire::HandoffPage>, Status> {
+        handoff::export_object_records(self, request).await
     }
 
-    pub(crate) async fn apply_object_mutation(
+    async fn read_handoff_object_path_snapshot(
         &self,
-        target: NodeId,
-        address: &str,
-        mutation: &ObjectMutation,
-    ) -> Result<ReplicaObjectMutationApplied, Status> {
-        let response = self
-            .client(target, address)?
-            .apply_object_mutation(wire::TypedMutationRequest {
-                peer: Some(self.context()),
-                mutation_json: encode_typed(mutation)?,
-            })
-            .await?
-            .into_inner();
-        require_response_schema(response.schema_version)?;
-        Ok(ReplicaObjectMutationApplied {
-            version: anvil_store::VersionId(response.version),
-            replayed: response.replayed,
-        })
+        request: Request<wire::HandoffObjectPathSnapshotRequest>,
+    ) -> Result<Response<wire::ObjectPathSnapshotResponse>, Status> {
+        handoff::read_object_path_snapshot(self, request).await
     }
 
-    pub(crate) async fn apply_authz_realm_mutation(
+    async fn repair_handoff_object_path_snapshot(
         &self,
-        target: NodeId,
-        address: &str,
-        mutation: &AuthzRealmMutation,
-    ) -> Result<ReplicaAuthzRealmMutationApplied, Status> {
-        let response = self
-            .client(target, address)?
-            .apply_authz_realm_mutation(wire::TypedMutationRequest {
-                peer: Some(self.context()),
-                mutation_json: encode_typed(mutation)?,
-            })
-            .await?
-            .into_inner();
-        require_response_schema(response.schema_version)?;
-        Ok(ReplicaAuthzRealmMutationApplied {
-            revision: anvil_store::AuthzRevision(response.revision),
-            replayed: response.replayed,
-        })
+        request: Request<wire::RepairHandoffObjectPathSnapshotRequest>,
+    ) -> Result<Response<wire::ObjectPathSnapshotApplied>, Status> {
+        handoff::repair_object_path_snapshot(self, request).await
     }
 
-    pub(crate) async fn apply_reference_deltas(
+    async fn get_handoff_source_journal_status(
         &self,
-        target: NodeId,
-        address: &str,
-        mutation: &ReferenceDeltaBatch,
-    ) -> Result<ReferenceDeltaApplied, Status> {
-        let response = self
-            .client(target, address)?
-            .apply_reference_deltas(wire::TypedMutationRequest {
-                peer: Some(self.context()),
-                mutation_json: encode_typed(mutation)?,
-            })
-            .await?
-            .into_inner();
-        require_response_schema(response.schema_version)?;
-        Ok(ReferenceDeltaApplied {
-            through: response.through,
-            replayed: response.replayed,
-        })
+        request: Request<wire::HandoffSourceJournalStatusRequest>,
+    ) -> Result<Response<wire::SourceJournalStatus>, Status> {
+        handoff::source_journal_status(self, request).await
     }
 
-    pub(crate) async fn reference_delta_status(
+    async fn read_handoff_source_journal(
         &self,
-        target: NodeId,
-        address: &str,
-        source: SourceId,
-    ) -> Result<u64, Status> {
-        let response = self
-            .client(target, address)?
-            .get_reference_delta_status(wire::ReferenceDeltaStatusRequest {
-                peer: Some(self.context()),
-                source_id_json: encode_typed(&source)?,
-            })
-            .await?
-            .into_inner();
-        require_response_schema(response.schema_version)?;
-        Ok(response.through)
+        request: Request<wire::HandoffSourceJournalReadRequest>,
+    ) -> Result<Response<wire::SourceJournalPage>, Status> {
+        handoff::read_source_journal(self, request).await
     }
 
-    pub(crate) async fn source_journal_status(
+    async fn get_handoff_reference_cursor(
         &self,
-        target: NodeId,
-        address: &str,
-    ) -> Result<WatchJournalStatus, Status> {
-        let response = self
-            .client(target, address)?
-            .get_source_journal_status(wire::SourceJournalStatusRequest {
-                peer: Some(self.context()),
-            })
-            .await?
-            .into_inner();
-        require_response_schema(response.schema_version)?;
-        Ok(WatchJournalStatus {
-            source_id: decode_typed(&response.source_id_json)?,
-            tail: response.tail,
-            retention_floor: response.retention_floor,
-            retained_entries: response.retained_entries,
-            retained_bytes: response.retained_bytes,
-        })
+        request: Request<wire::HandoffReferenceCursorRequest>,
+    ) -> Result<Response<wire::ReferenceDeltaStatus>, Status> {
+        handoff::reference_cursor(self, request).await
     }
 
-    pub(crate) async fn read_source_journal(
+    async fn advance_handoff_reference_cursor(
         &self,
-        target: NodeId,
-        address: &str,
-        after_offset: u64,
-        limit: usize,
-    ) -> Result<Vec<LocalChange>, Status> {
-        let limit = u32::try_from(limit.min(MAX_LOCAL_INVALIDATION_SCAN_RECORDS))
-            .expect("source journal limit fits u32");
-        let response = self
-            .client(target, address)?
-            .read_source_journal(wire::SourceJournalReadRequest {
-                peer: Some(self.context()),
-                after_offset,
-                limit,
-            })
-            .await?
-            .into_inner();
-        require_response_schema(response.schema_version)?;
-        response
-            .changes_json
-            .iter()
-            .map(|encoded| decode_typed(encoded))
-            .collect()
+        request: Request<wire::HandoffReferenceCursorAdvanceRequest>,
+    ) -> Result<Response<wire::ReferenceDeltaApplied>, Status> {
+        handoff::advance_reference_cursor(self, request).await
     }
 
-    pub(crate) async fn small_content_exists(
+    async fn install_object_record(
         &self,
-        target: NodeId,
-        address: &str,
-        reference: &BlobRef,
-    ) -> Result<bool, Status> {
-        let response = self
-            .client(target, address)?
-            .small_content_exists(wire::ContentRequest {
-                peer: Some(self.context()),
-                blob: Some(wire_blob(reference)),
-            })
-            .await?
-            .into_inner();
-        require_response_schema(response.schema_version)?;
-        Ok(response.exists)
+        request: Request<wire::HandoffRecordRequest>,
+    ) -> Result<Response<wire::HandoffRecordApplied>, Status> {
+        handoff::install_object_record(self, request).await
     }
 
-    pub(crate) async fn put_small_content(
+    async fn export_logical_records(
         &self,
-        target: NodeId,
-        address: &str,
-        reference: &BlobRef,
-        bytes: &[u8],
-    ) -> Result<(), Status> {
-        if bytes.len() > anvil_store::SMALL_BLOB_MAX_BYTES
-            || bytes.len() as u64 != reference.length
-            || blake3::hash(bytes).as_bytes() != &reference.hash
-        {
-            return Err(Status::invalid_argument(
-                "small content does not match its immutable identity",
-            ));
-        }
-        let mut frames = Vec::new();
-        if bytes.is_empty() {
-            frames.push(wire::SmallContentPutFrame {
-                peer: Some(self.context()),
-                blob: Some(wire_blob(reference)),
-                offset: 0,
-                content: Vec::new(),
-                end: true,
-            });
-        } else {
-            for (index, content) in bytes.chunks(DATA_PEER_FRAME_BYTES).enumerate() {
-                let offset = index * DATA_PEER_FRAME_BYTES;
-                frames.push(wire::SmallContentPutFrame {
-                    peer: Some(self.context()),
-                    blob: Some(wire_blob(reference)),
-                    offset: offset as u64,
-                    content: content.to_vec(),
-                    end: offset + content.len() == bytes.len(),
-                });
-            }
-        }
-        let response = self
-            .client(target, address)?
-            .put_small_content(tokio_stream::iter(frames))
-            .await?
-            .into_inner();
-        require_response_schema(response.schema_version)
+        request: Request<wire::HandoffPageRequest>,
+    ) -> Result<Response<wire::HandoffPage>, Status> {
+        handoff::export_logical_records(self, request).await
     }
 
-    pub(crate) async fn get_small_content(
+    async fn install_logical_record(
         &self,
-        target: NodeId,
-        address: &str,
-        reference: &BlobRef,
-    ) -> Result<Vec<u8>, Status> {
-        if reference.length > anvil_store::SMALL_BLOB_MAX_BYTES as u64 {
-            return Err(Status::invalid_argument(
-                "content identity is not a small blob",
-            ));
-        }
-        let mut stream = self
-            .client(target, address)?
-            .get_small_content(wire::ContentRequest {
-                peer: Some(self.context()),
-                blob: Some(wire_blob(reference)),
-            })
-            .await?
-            .into_inner();
-        let mut bytes = Vec::with_capacity(reference.length as usize);
-        while let Some(frame) = stream.message().await? {
-            require_response_schema(frame.schema_version)?;
-            if frame.offset != bytes.len() as u64 || frame.content.len() > DATA_PEER_FRAME_BYTES {
-                return Err(Status::data_loss("small-content stream is not contiguous"));
-            }
-            bytes.extend_from_slice(&frame.content);
-            if bytes.len() > anvil_store::SMALL_BLOB_MAX_BYTES {
-                return Err(Status::resource_exhausted(
-                    "small-content response is too large",
-                ));
-            }
-            if frame.end {
-                if bytes.len() as u64 != reference.length
-                    || blake3::hash(&bytes).as_bytes() != &reference.hash
-                {
-                    return Err(Status::data_loss(
-                        "small-content response failed identity verification",
-                    ));
-                }
-                return Ok(bytes);
-            }
-        }
-        Err(Status::data_loss(
-            "small-content stream ended without an end frame",
-        ))
+        request: Request<wire::HandoffRecordRequest>,
+    ) -> Result<Response<wire::HandoffRecordApplied>, Status> {
+        handoff::install_logical_record(self, request).await
     }
 
-    pub(crate) async fn put_complete_source(
+    async fn read_logical_record(
         &self,
-        target: NodeId,
-        address: &str,
-        reference: &BlobRef,
-        mut reader: BlobReader,
-    ) -> Result<CompleteCopySealOutcome, Status> {
-        if reference.length <= anvil_store::SMALL_BLOB_MAX_BYTES as u64 {
-            return Err(Status::invalid_argument(
-                "complete-source operation requires a large blob",
-            ));
-        }
-        let (sender, receiver) = tokio::sync::mpsc::channel(2);
-        let context = self.context();
-        let blob = wire_blob(reference);
-        let producer = tokio::spawn(async move {
-            let mut offset = 0_u64;
-            let mut current = vec![0_u8; DATA_PEER_FRAME_BYTES];
-            let mut next = vec![0_u8; DATA_PEER_FRAME_BYTES];
-            let mut current_length = reader
-                .read(&mut current)
-                .await
-                .map_err(|error| Status::data_loss(error.to_string()))?;
-            loop {
-                let next_length = if current_length == 0 {
-                    0
-                } else {
-                    reader
-                        .read(&mut next)
-                        .await
-                        .map_err(|error| Status::data_loss(error.to_string()))?
-                };
-                let end = current_length == 0 || next_length == 0;
-                sender
-                    .send(wire::CompleteSourcePutFrame {
-                        peer: Some(context.clone()),
-                        blob: Some(blob.clone()),
-                        offset,
-                        content: current[..current_length].to_vec(),
-                        end,
-                    })
-                    .await
-                    .map_err(|_| Status::cancelled("complete-source peer stream closed"))?;
-                if end {
-                    return Ok::<(), Status>(());
-                }
-                offset += current_length as u64;
-                std::mem::swap(&mut current, &mut next);
-                current_length = next_length;
-            }
-        });
-        let response = self
-            .client(target, address)?
-            .put_complete_source(tokio_stream::wrappers::ReceiverStream::new(receiver))
-            .await;
-        producer.await.map_err(|error| {
-            Status::internal(format!("join complete-source producer: {error}"))
-        })??;
-        let response = response?.into_inner();
-        require_response_schema(response.schema_version)?;
-        Ok(if response.already_present {
-            CompleteCopySealOutcome::AlreadyPresent
-        } else {
-            CompleteCopySealOutcome::Created
-        })
+        request: Request<wire::LogicalRecordRequest>,
+    ) -> Result<Response<wire::LogicalRecordResponse>, Status> {
+        handoff::read_logical_record(self, request).await
     }
 
-    pub(crate) async fn get_complete_source(
+    async fn repair_logical_record(
         &self,
-        target: NodeId,
-        address: &str,
-        reference: &BlobRef,
-    ) -> Result<Streaming<wire::ContentFrame>, Status> {
-        if reference.length <= anvil_store::SMALL_BLOB_MAX_BYTES as u64 {
-            return Err(Status::invalid_argument(
-                "complete-source operation requires a large blob",
-            ));
-        }
-        self.client(target, address)?
-            .get_complete_source(wire::ContentRequest {
-                peer: Some(self.context()),
-                blob: Some(wire_blob(reference)),
-            })
-            .await
-            .map(Response::into_inner)
+        request: Request<wire::RepairLogicalRecordRequest>,
+    ) -> Result<Response<wire::HandoffRecordApplied>, Status> {
+        handoff::repair_logical_record(self, request).await
     }
 
-    pub(crate) async fn shard_exists(
+    async fn export_authz_realm_keys(
         &self,
-        target: NodeId,
-        address: &str,
-        identity: &ShardIdentity,
-    ) -> Result<bool, Status> {
-        let response = self
-            .client(target, address)?
-            .shard_exists(wire_shard(self.context(), identity))
-            .await?
-            .into_inner();
-        require_response_schema(response.schema_version)?;
-        Ok(response.exists)
+        request: Request<wire::HandoffPageRequest>,
+    ) -> Result<Response<wire::HandoffPage>, Status> {
+        handoff::export_authz_realm_keys(self, request).await
     }
 
-    pub(crate) async fn get_shard(
+    async fn read_authz_realm_manifest(
         &self,
-        target: NodeId,
-        address: &str,
-        identity: &ShardIdentity,
-    ) -> Result<Streaming<wire::ContentFrame>, Status> {
-        self.client(target, address)?
-            .get_shard(wire_shard(self.context(), identity))
-            .await
-            .map(Response::into_inner)
+        request: Request<wire::AuthzRealmRequest>,
+    ) -> Result<Response<wire::AuthzRealmManifest>, Status> {
+        handoff::read_authz_realm_manifest(self, request).await
     }
 
-    pub(crate) async fn put_shard<R>(
+    async fn repair_authz_realm_absence(
         &self,
-        target: NodeId,
-        address: &str,
-        identity: &ShardIdentity,
-        mut reader: R,
-    ) -> Result<ShardSealOutcome, Status>
-    where
-        R: Read + Send + 'static,
-    {
-        let (sender, receiver) = tokio::sync::mpsc::channel(2);
-        let shard = wire_shard(self.context(), identity);
-        let producer = tokio::task::spawn_blocking(move || {
-            let mut offset = 0_u64;
-            let mut current = vec![0_u8; DATA_PEER_FRAME_BYTES];
-            let mut next = vec![0_u8; DATA_PEER_FRAME_BYTES];
-            let mut current_length = reader.read(&mut current)?;
-            loop {
-                let next_length = if current_length == 0 {
-                    0
-                } else {
-                    reader.read(&mut next)?
-                };
-                let end = current_length == 0 || next_length == 0;
-                sender
-                    .blocking_send(wire::ShardPutFrame {
-                        shard: Some(shard.clone()),
-                        offset,
-                        content: current[..current_length].to_vec(),
-                        end,
-                    })
-                    .map_err(|_| {
-                        io::Error::new(io::ErrorKind::BrokenPipe, "shard peer stream closed")
-                    })?;
-                if end {
-                    return Ok::<(), io::Error>(());
-                }
-                offset += current_length as u64;
-                std::mem::swap(&mut current, &mut next);
-                current_length = next_length;
-            }
-        });
-        let response = self
-            .client(target, address)?
-            .put_shard(tokio_stream::wrappers::ReceiverStream::new(receiver))
-            .await;
-        producer
-            .await
-            .map_err(|error| Status::internal(format!("join shard producer: {error}")))?
-            .map_err(|error| Status::data_loss(error.to_string()))?;
-        let response = response?.into_inner();
-        require_response_schema(response.schema_version)?;
-        Ok(if response.already_present {
-            ShardSealOutcome::AlreadyPresent
-        } else {
-            ShardSealOutcome::Created
-        })
-    }
-}
-
-#[derive(Clone)]
-struct DataPeerChannelConnector {
-    tls: PeerTlsConnector,
-    target: NodeId,
-    address: String,
-}
-
-impl Service<Uri> for DataPeerChannelConnector {
-    type Response = TokioIo<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>;
-    type Error = PeerTlsError;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
-
-    fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
+        request: Request<wire::AuthzRealmRequest>,
+    ) -> Result<Response<wire::HandoffRecordApplied>, Status> {
+        handoff::repair_authz_realm_absence(self, request).await
     }
 
-    fn call(&mut self, _uri: Uri) -> Self::Future {
-        let tls = self.tls.clone();
-        let target = self.target;
-        let address = self.address.clone();
-        Box::pin(async move {
-            tls.connect(target, &address)
-                .await
-                .map(|peer| TokioIo::new(peer.stream))
-        })
+    async fn get_authz_realm(
+        &self,
+        request: Request<wire::AuthzRealmRequest>,
+    ) -> Result<Response<Self::GetAuthzRealmStream>, Status> {
+        handoff::get_authz_realm(self, request).await
+    }
+
+    async fn put_authz_realm(
+        &self,
+        request: Request<Streaming<wire::AuthzRealmPutFrame>>,
+    ) -> Result<Response<wire::HandoffRecordApplied>, Status> {
+        handoff::put_authz_realm(self, request).await
+    }
+
+    async fn export_payload_artifacts(
+        &self,
+        request: Request<wire::HandoffPageRequest>,
+    ) -> Result<Response<wire::HandoffPage>, Status> {
+        handoff::export_payload_artifacts(self, request).await
+    }
+
+    async fn install_payload_lifecycle(
+        &self,
+        request: Request<wire::HandoffRecordRequest>,
+    ) -> Result<Response<wire::HandoffRecordApplied>, Status> {
+        handoff::install_payload_lifecycle(self, request).await
     }
 }
 
@@ -1552,9 +1217,7 @@ mod tests {
             let nodes = self.nodes.read().ok()?;
             let (pins, state) = nodes.get(&node_id)?;
             let allowed = match kind {
-                PeerRpcKind::StateTransfer => {
-                    matches!(state, NodeState::Active | NodeState::Joining)
-                }
+                PeerRpcKind::JoinControl => matches!(state, NodeState::Active | NodeState::Joining),
                 _ => *state == NodeState::Active,
             };
             allowed.then_some(*pins)
@@ -1594,7 +1257,7 @@ mod tests {
                 }
             })
             .filter_map(|result| result.ok().map(Ok::<_, std::io::Error>));
-        let service = DataPeerService::new(
+        let service = DataPeerService::new_test(
             store,
             pins,
             ErasureProfile::default(),
@@ -1644,6 +1307,293 @@ mod tests {
         }
     }
 
+    #[test]
+    fn joining_callers_have_only_join_control_authority() {
+        let cluster_id = ClusterId(*b"join-control-tst");
+        let pins = TestPins::new(cluster_id);
+        pins.install(NodeId(2), PeerSpkiSha256([7; 32]), NodeState::Joining);
+        assert!(
+            pins.authorized_rpc_pins(cluster_id, NodeId(2), PeerRpcKind::JoinControl)
+                .is_some()
+        );
+        for denied in [
+            PeerRpcKind::AppendEntries,
+            PeerRpcKind::Vote,
+            PeerRpcKind::InstallSnapshot,
+            PeerRpcKind::ServingLease,
+            PeerRpcKind::DataPlane,
+            PeerRpcKind::StateTransfer,
+        ] {
+            assert!(
+                pins.authorized_rpc_pins(cluster_id, NodeId(2), denied)
+                    .is_none(),
+                "JOINING caller received {denied:?} authority"
+            );
+        }
+    }
+
+    async fn assert_joining_denied_by_every_rpc(transport: &DataPeerTransport, address: &str) {
+        let mut client = transport.client(NodeId(1), address).unwrap();
+        let peer = transport.context();
+        let typed = || wire::TypedMutationRequest {
+            peer: Some(peer.clone()),
+            mutation_json: Vec::new(),
+        };
+        let page = || wire::HandoffPageRequest {
+            peer: Some(peer.clone()),
+            cursor_json: Vec::new(),
+            max_records: 0,
+            max_bytes: 0,
+            handoff: None,
+        };
+        let record = || wire::HandoffRecordRequest {
+            peer: Some(peer.clone()),
+            record_json: Vec::new(),
+            handoff: None,
+        };
+        let content = || wire::ContentRequest {
+            peer: Some(peer.clone()),
+            blob: None,
+        };
+        let shard = || wire::ShardRequest {
+            peer: Some(peer.clone()),
+            fragment_format_version: 0,
+            blob: None,
+            ordinal: 0,
+        };
+        let realm = || wire::AuthzRealmRequest {
+            peer: Some(peer.clone()),
+            scope_json: Vec::new(),
+            handoff: None,
+        };
+        let mut denied = 0_usize;
+        macro_rules! require_denied {
+            ($operation:expr, $name:literal) => {
+                match $operation.await {
+                    Err(status) => {
+                        assert_eq!(
+                            status.code(),
+                            Code::PermissionDenied,
+                            "{} returned {status}",
+                            $name
+                        );
+                        denied += 1;
+                    }
+                    Ok(_) => panic!("{} accepted a JOINING caller", $name),
+                }
+            };
+        }
+
+        require_denied!(client.apply_object_mutation(typed()), "ApplyObjectMutation");
+        require_denied!(
+            client.read_object_path_snapshot(wire::ObjectPathSnapshotRequest {
+                peer: Some(peer.clone()),
+                tenant_id: 0,
+                bucket_id: 0,
+                exact_path: String::new(),
+            }),
+            "ReadObjectPathSnapshot"
+        );
+        require_denied!(
+            client.repair_object_path_snapshot(wire::RepairObjectPathSnapshotRequest {
+                peer: Some(peer.clone()),
+                tenant_id: 0,
+                bucket_id: 0,
+                exact_path: String::new(),
+                expected_snapshot_json: Vec::new(),
+                selected_snapshot_json: Vec::new(),
+            }),
+            "RepairObjectPathSnapshot"
+        );
+        require_denied!(
+            client.apply_authz_realm_mutation(typed()),
+            "ApplyAuthzRealmMutation"
+        );
+        require_denied!(
+            client.apply_reference_deltas(typed()),
+            "ApplyReferenceDeltas"
+        );
+        require_denied!(
+            client.get_reference_delta_status(wire::ReferenceDeltaStatusRequest {
+                peer: Some(peer.clone()),
+                source_id_json: Vec::new(),
+            }),
+            "GetReferenceDeltaStatus"
+        );
+        require_denied!(
+            client.get_source_journal_status(wire::SourceJournalStatusRequest {
+                peer: Some(peer.clone()),
+            }),
+            "GetSourceJournalStatus"
+        );
+        require_denied!(
+            client.read_source_journal(wire::SourceJournalReadRequest {
+                peer: Some(peer.clone()),
+                after_offset: 0,
+                limit: 0,
+            }),
+            "ReadSourceJournal"
+        );
+        require_denied!(client.small_content_exists(content()), "SmallContentExists");
+        require_denied!(client.get_small_content(content()), "GetSmallContent");
+        require_denied!(
+            client.put_small_content(tokio_stream::iter([wire::SmallContentPutFrame {
+                peer: Some(peer.clone()),
+                blob: None,
+                offset: 0,
+                content: Vec::new(),
+                end: true,
+            }])),
+            "PutSmallContent"
+        );
+        require_denied!(client.get_complete_source(content()), "GetCompleteSource");
+        require_denied!(
+            client.put_complete_source(tokio_stream::iter([wire::CompleteSourcePutFrame {
+                peer: Some(peer.clone()),
+                blob: None,
+                offset: 0,
+                content: Vec::new(),
+                end: true,
+            }])),
+            "PutCompleteSource"
+        );
+        require_denied!(client.shard_exists(shard()), "ShardExists");
+        require_denied!(client.get_shard(shard()), "GetShard");
+        require_denied!(
+            client.put_shard(tokio_stream::iter([wire::ShardPutFrame {
+                shard: Some(shard()),
+                offset: 0,
+                content: Vec::new(),
+                end: true,
+            }])),
+            "PutShard"
+        );
+        require_denied!(client.export_object_records(page()), "ExportObjectRecords");
+        require_denied!(
+            client.install_object_record(record()),
+            "InstallObjectRecord"
+        );
+        require_denied!(
+            client.read_handoff_object_path_snapshot(wire::HandoffObjectPathSnapshotRequest {
+                peer: Some(peer.clone()),
+                handoff: None,
+                tenant_id: 0,
+                bucket_id: 0,
+                exact_path: String::new(),
+            }),
+            "ReadHandoffObjectPathSnapshot"
+        );
+        require_denied!(
+            client.repair_handoff_object_path_snapshot(
+                wire::RepairHandoffObjectPathSnapshotRequest {
+                    peer: Some(peer.clone()),
+                    handoff: None,
+                    tenant_id: 0,
+                    bucket_id: 0,
+                    exact_path: String::new(),
+                    expected_snapshot_json: Vec::new(),
+                    selected_snapshot_json: Vec::new(),
+                }
+            ),
+            "RepairHandoffObjectPathSnapshot"
+        );
+        require_denied!(
+            client.get_handoff_source_journal_status(wire::HandoffSourceJournalStatusRequest {
+                peer: Some(peer.clone()),
+                handoff: None,
+            }),
+            "GetHandoffSourceJournalStatus"
+        );
+        require_denied!(
+            client.read_handoff_source_journal(wire::HandoffSourceJournalReadRequest {
+                peer: Some(peer.clone()),
+                handoff: None,
+                after_offset: 0,
+                limit: 0,
+            }),
+            "ReadHandoffSourceJournal"
+        );
+        require_denied!(
+            client.get_handoff_reference_cursor(wire::HandoffReferenceCursorRequest {
+                peer: Some(peer.clone()),
+                handoff: None,
+                source_id_json: Vec::new(),
+            }),
+            "GetHandoffReferenceCursor"
+        );
+        require_denied!(
+            client.advance_handoff_reference_cursor(wire::HandoffReferenceCursorAdvanceRequest {
+                peer: Some(peer.clone()),
+                handoff: None,
+                source_id_json: Vec::new(),
+                through: 0,
+            }),
+            "AdvanceHandoffReferenceCursor"
+        );
+        require_denied!(
+            client.export_logical_records(page()),
+            "ExportLogicalRecords"
+        );
+        require_denied!(
+            client.install_logical_record(record()),
+            "InstallLogicalRecord"
+        );
+        require_denied!(
+            client.read_logical_record(wire::LogicalRecordRequest {
+                peer: Some(peer.clone()),
+                id_json: Vec::new(),
+                handoff: None,
+            }),
+            "ReadLogicalRecord"
+        );
+        require_denied!(
+            client.repair_logical_record(wire::RepairLogicalRecordRequest {
+                peer: Some(peer.clone()),
+                id_json: Vec::new(),
+                present: false,
+                candidate_json: Vec::new(),
+                handoff: None,
+            }),
+            "RepairLogicalRecord"
+        );
+        require_denied!(
+            client.export_authz_realm_keys(page()),
+            "ExportAuthzRealmKeys"
+        );
+        require_denied!(
+            client.read_authz_realm_manifest(realm()),
+            "ReadAuthzRealmManifest"
+        );
+        require_denied!(
+            client.repair_authz_realm_absence(realm()),
+            "RepairAuthzRealmAbsence"
+        );
+        require_denied!(client.get_authz_realm(realm()), "GetAuthzRealm");
+        require_denied!(
+            client.put_authz_realm(tokio_stream::iter([wire::AuthzRealmPutFrame {
+                peer: Some(peer.clone()),
+                offset: 0,
+                content: Vec::new(),
+                end: true,
+                manifest_json: Vec::new(),
+                handoff: None,
+            }])),
+            "PutAuthzRealm"
+        );
+        require_denied!(
+            client.export_payload_artifacts(page()),
+            "ExportPayloadArtifacts"
+        );
+        require_denied!(
+            client.install_payload_lifecycle(record()),
+            "InstallPayloadLifecycle"
+        );
+        assert_eq!(
+            denied, 35,
+            "the DataPeer RPC list changed without updating this test"
+        );
+    }
+
     #[tokio::test]
     async fn real_mtls_binds_claimed_node_and_rechecks_rpc_class_and_membership() {
         let cluster_id = ClusterId(*b"data-peer-test01");
@@ -1664,29 +1614,25 @@ mod tests {
         let joining = DataPeerTransport::new(
             cluster_id,
             NodeId(2),
-            PeerTlsConnector::new(joining_id, pins.clone(), PeerTlsConfig::default()).unwrap(),
+            PeerTlsConnector::new(joining_id.clone(), pins.clone(), PeerTlsConfig::default())
+                .unwrap(),
         )
         .unwrap();
 
+        assert_joining_denied_by_every_rpc(&joining, &address).await;
+
+        pins.set_state(NodeId(2), NodeState::Active);
         let status = joining
             .source_journal_status(NodeId(1), &address)
             .await
             .unwrap();
         assert_eq!(status.source_id.node_id, 1);
-
         let empty = ReferenceDeltaBatch {
             source: status.source_id,
             after: 0,
             through: 0,
             deltas: Vec::new(),
         };
-        let denied = joining
-            .apply_reference_deltas(NodeId(1), &address, &empty)
-            .await
-            .unwrap_err();
-        assert_eq!(denied.code(), Code::PermissionDenied);
-
-        pins.set_state(NodeId(2), NodeState::Active);
         let applied = joining
             .apply_reference_deltas(NodeId(1), &address, &empty)
             .await
@@ -1706,6 +1652,28 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+
+        let mut raw_active = joining.client(NodeId(1), &address).unwrap();
+        let invalid = raw_active
+            .export_object_records(wire::HandoffPageRequest {
+                peer: Some(joining.context()),
+                cursor_json: Vec::new(),
+                max_records: 0,
+                max_bytes: 1,
+                handoff: None,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(invalid.code(), Code::InvalidArgument);
+        let oversized = raw_active
+            .install_object_record(wire::HandoffRecordRequest {
+                peer: Some(joining.context()),
+                record_json: vec![0; MAX_TYPED_MUTATION_BYTES + 1],
+                handoff: None,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(oversized.code(), Code::InvalidArgument);
 
         let tenant_id = 11;
         let bucket_id = 22;
@@ -1818,6 +1786,43 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(denied.code(), Code::PermissionDenied);
+
+        let wrong_cluster = DataPeerTransport::new(
+            ClusterId(*b"other-cluster-id"),
+            NodeId(2),
+            PeerTlsConnector::new(joining_id.clone(), pins.clone(), PeerTlsConfig::default())
+                .unwrap(),
+        )
+        .unwrap();
+        let denied = wrong_cluster
+            .source_journal_status(NodeId(1), &address)
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), Code::PermissionDenied);
+
+        let wrong_node = DataPeerTransport::new(
+            cluster_id,
+            NodeId(99),
+            PeerTlsConnector::new(joining_id, pins.clone(), PeerTlsConfig::default()).unwrap(),
+        )
+        .unwrap();
+        let denied = wrong_node
+            .source_journal_status(NodeId(1), &address)
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), Code::PermissionDenied);
+
+        let mut wrong_schema = joining.client(NodeId(1), &address).unwrap();
+        let denied = wrong_schema
+            .get_source_journal_status(wire::SourceJournalStatusRequest {
+                peer: Some(wire::PeerContext {
+                    schema_version: DATA_PEER_SCHEMA_VERSION + 1,
+                    ..joining.context()
+                }),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), Code::FailedPrecondition);
 
         pins.remove(NodeId(2));
         let denied = joining

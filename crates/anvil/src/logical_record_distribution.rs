@@ -484,7 +484,7 @@ struct CandidateEvidence {
 /// higher candidate still needs its predecessor link. Siblings are resolvable
 /// only when exactly one sibling itself has quorum evidence; missing links and
 /// ambiguous branches fail closed.
-fn highest_valid_candidate(
+pub(crate) fn highest_valid_candidate(
     observed: &[&Option<LogicalRecordCandidate>],
     required: usize,
 ) -> Result<Option<LogicalRecordCandidate>, Status> {

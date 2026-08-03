@@ -171,6 +171,20 @@ fn select_exact_quorum(
     required: usize,
     replica_count: usize,
 ) -> Result<Option<ObjectPathSnapshot>, Status> {
+    let snapshots = observations
+        .iter()
+        .map(|observation| observation.snapshot.clone())
+        .collect::<Vec<_>>();
+    select_object_snapshot_quorum(&snapshots, required, replica_count)
+}
+
+/// Pure complete-record selector shared by serving reads and typed ADD
+/// handoff. Missing replicas are explicit `None` observations.
+pub(crate) fn select_object_snapshot_quorum(
+    observations: &[Option<ObjectPathSnapshot>],
+    required: usize,
+    replica_count: usize,
+) -> Result<Option<ObjectPathSnapshot>, Status> {
     if required == 0 || required > replica_count || observations.len() < required {
         return Err(Status::unavailable(format!(
             "object metadata read reached {} of {} required replicas",
@@ -181,10 +195,10 @@ fn select_exact_quorum(
     for observation in observations {
         let agreeing = observations
             .iter()
-            .filter(|candidate| candidate.snapshot == observation.snapshot)
+            .filter(|candidate| *candidate == observation)
             .count();
         if agreeing >= required {
-            return Ok(observation.snapshot.clone());
+            return Ok(observation.clone());
         }
     }
     Err(Status::unavailable(

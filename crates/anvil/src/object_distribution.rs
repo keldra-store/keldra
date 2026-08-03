@@ -7,6 +7,8 @@
 
 mod quorum_read;
 
+pub(crate) use quorum_read::select_object_snapshot_quorum;
+
 use anvil_consensus::{DecisionRaft, NodeId};
 use anvil_store::{
     BatchOperation, BlobRef, CoordinatedObjectMutation, Durability, ErasureProfile, MutationError,

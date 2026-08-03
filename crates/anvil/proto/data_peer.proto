@@ -11,6 +11,14 @@ message PeerContext {
   uint64 source_node_id = 3;
 }
 
+// One exact in-progress ADD transition. Handoff RPCs are valid only while the
+// authenticated caller is the current Raft leader and this exact transition
+// remains locally applied.
+message HandoffScope {
+  uint64 joining_node_id = 1;
+  uint64 started_log_index = 2;
+}
+
 message TypedMutationRequest {
   PeerContext peer = 1;
   bytes mutation_json = 2;
@@ -165,6 +173,126 @@ message ShardStored {
   bool already_present = 2;
 }
 
+// Bounded typed state-transfer pages. `cursor_json` is empty at the start;
+// `page_json` carries the corresponding versioned storage-kernel page type.
+message HandoffPageRequest {
+  PeerContext peer = 1;
+  bytes cursor_json = 2;
+  uint32 max_records = 3;
+  uint64 max_bytes = 4;
+  HandoffScope handoff = 5;
+}
+
+message HandoffPage {
+  uint32 schema_version = 1;
+  bytes page_json = 2;
+}
+
+message HandoffRecordRequest {
+  PeerContext peer = 1;
+  bytes record_json = 2;
+  HandoffScope handoff = 3;
+}
+
+message HandoffRecordApplied {
+  uint32 schema_version = 1;
+  bool replayed = 2;
+}
+
+message LogicalRecordRequest {
+  PeerContext peer = 1;
+  bytes id_json = 2;
+  HandoffScope handoff = 3;
+}
+
+message LogicalRecordResponse {
+  uint32 schema_version = 1;
+  bool present = 2;
+  bytes candidate_json = 3;
+}
+
+message RepairLogicalRecordRequest {
+  PeerContext peer = 1;
+  bytes id_json = 2;
+  bool present = 3;
+  bytes candidate_json = 4;
+  HandoffScope handoff = 5;
+}
+
+message AuthzRealmRequest {
+  PeerContext peer = 1;
+  bytes scope_json = 2;
+  HandoffScope handoff = 3;
+}
+
+message AuthzRealmManifest {
+  uint32 schema_version = 1;
+  bool present = 2;
+  bytes manifest_json = 3;
+}
+
+// The first frame carries `manifest_json` and no content. Later frames carry
+// contiguous canonical aggregate bytes; exactly one final empty frame ends it.
+message AuthzRealmFrame {
+  uint32 schema_version = 1;
+  uint64 offset = 2;
+  bytes content = 3;
+  bool end = 4;
+  bytes manifest_json = 5;
+}
+
+message AuthzRealmPutFrame {
+  PeerContext peer = 1;
+  uint64 offset = 2;
+  bytes content = 3;
+  bool end = 4;
+  bytes manifest_json = 5;
+  HandoffScope handoff = 6;
+}
+
+message HandoffObjectPathSnapshotRequest {
+  PeerContext peer = 1;
+  HandoffScope handoff = 2;
+  uint64 tenant_id = 3;
+  uint64 bucket_id = 4;
+  string exact_path = 5;
+}
+
+message RepairHandoffObjectPathSnapshotRequest {
+  PeerContext peer = 1;
+  HandoffScope handoff = 2;
+  uint64 tenant_id = 3;
+  uint64 bucket_id = 4;
+  string exact_path = 5;
+  bytes expected_snapshot_json = 6;
+  bytes selected_snapshot_json = 7;
+}
+
+message HandoffSourceJournalStatusRequest {
+  PeerContext peer = 1;
+  HandoffScope handoff = 2;
+}
+
+message HandoffSourceJournalReadRequest {
+  PeerContext peer = 1;
+  HandoffScope handoff = 2;
+  uint64 after_offset = 3;
+  uint32 limit = 4;
+}
+
+message HandoffReferenceCursorRequest {
+  PeerContext peer = 1;
+  HandoffScope handoff = 2;
+  bytes source_id_json = 3;
+}
+
+message HandoffReferenceCursorAdvanceRequest {
+  PeerContext peer = 1;
+  HandoffScope handoff = 2;
+  bytes source_id_json = 3;
+  uint64 through = 4;
+}
+
 service DataPeer {
   rpc ApplyObjectMutation(TypedMutationRequest) returns (ObjectMutationApplied);
   rpc ReadObjectPathSnapshot(ObjectPathSnapshotRequest) returns (ObjectPathSnapshotResponse);
@@ -186,4 +314,24 @@ service DataPeer {
   rpc ShardExists(ShardRequest) returns (ExistsResponse);
   rpc GetShard(ShardRequest) returns (stream ContentFrame);
   rpc PutShard(stream ShardPutFrame) returns (ShardStored);
+
+  rpc ReadHandoffObjectPathSnapshot(HandoffObjectPathSnapshotRequest) returns (ObjectPathSnapshotResponse);
+  rpc RepairHandoffObjectPathSnapshot(RepairHandoffObjectPathSnapshotRequest) returns (ObjectPathSnapshotApplied);
+  rpc GetHandoffSourceJournalStatus(HandoffSourceJournalStatusRequest) returns (SourceJournalStatus);
+  rpc ReadHandoffSourceJournal(HandoffSourceJournalReadRequest) returns (SourceJournalPage);
+  rpc GetHandoffReferenceCursor(HandoffReferenceCursorRequest) returns (ReferenceDeltaStatus);
+  rpc AdvanceHandoffReferenceCursor(HandoffReferenceCursorAdvanceRequest) returns (ReferenceDeltaApplied);
+  rpc ExportObjectRecords(HandoffPageRequest) returns (HandoffPage);
+  rpc InstallObjectRecord(HandoffRecordRequest) returns (HandoffRecordApplied);
+  rpc ExportLogicalRecords(HandoffPageRequest) returns (HandoffPage);
+  rpc InstallLogicalRecord(HandoffRecordRequest) returns (HandoffRecordApplied);
+  rpc ReadLogicalRecord(LogicalRecordRequest) returns (LogicalRecordResponse);
+  rpc RepairLogicalRecord(RepairLogicalRecordRequest) returns (HandoffRecordApplied);
+  rpc ExportAuthzRealmKeys(HandoffPageRequest) returns (HandoffPage);
+  rpc ReadAuthzRealmManifest(AuthzRealmRequest) returns (AuthzRealmManifest);
+  rpc RepairAuthzRealmAbsence(AuthzRealmRequest) returns (HandoffRecordApplied);
+  rpc GetAuthzRealm(AuthzRealmRequest) returns (stream AuthzRealmFrame);
+  rpc PutAuthzRealm(stream AuthzRealmPutFrame) returns (HandoffRecordApplied);
+  rpc ExportPayloadArtifacts(HandoffPageRequest) returns (HandoffPage);
+  rpc InstallPayloadLifecycle(HandoffRecordRequest) returns (HandoffRecordApplied);
 }
