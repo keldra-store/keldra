@@ -54,6 +54,9 @@ services:
         source: ${ANVIL_QUALIFICATION_START_NODE:?ANVIL_QUALIFICATION_START_NODE must be set}
         target: /qualification/start-node.sh
         read_only: true
+      - type: bind
+        source: ${ANVIL_QUALIFICATION_DIR:?ANVIL_QUALIFICATION_DIR must be set}/artifacts
+        target: /qualification/artifacts
 
   anvil-3:
     <<: *anvil-service
@@ -77,3 +80,6 @@ services:
         source: ${ANVIL_QUALIFICATION_START_NODE:?ANVIL_QUALIFICATION_START_NODE must be set}
         target: /qualification/start-node.sh
         read_only: true
+      - type: bind
+        source: ${ANVIL_QUALIFICATION_DIR:?ANVIL_QUALIFICATION_DIR must be set}/artifacts
+        target: /qualification/artifacts

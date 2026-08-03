@@ -58,6 +58,14 @@ cleanup() {
   else
     compose down --volumes --remove-orphans >/dev/null 2>&1 || true
     if [[ "${ANVIL_QUALIFICATION_DIR}" == /tmp/anvil-v051-qualification.* ]]; then
+      docker run --rm --user 0 \
+        --volume "${ANVIL_QUALIFICATION_DIR}:/qualification" \
+        "${image_id}" rm -rf \
+          /qualification/node-1 \
+          /qualification/node-2 \
+          /qualification/node-3 \
+          /qualification/artifacts \
+          /qualification/token-signing-key >/dev/null 2>&1 || true
       rm -rf -- "${ANVIL_QUALIFICATION_DIR}"
     else
       echo "refusing to remove unexpected qualification path ${ANVIL_QUALIFICATION_DIR}" >&2
@@ -224,7 +232,7 @@ prepare_and_start_node() {
     return 1
   fi
 
-  local copied="${ANVIL_QUALIFICATION_DIR}/node-${node_id}/anvil-node-${node_id}.join.json"
+  local copied="${ANVIL_QUALIFICATION_DIR}/artifacts/anvil-node-${node_id}.join.json"
   compose cp "${source_service}:${bundle_path}" "${copied}"
   chmod 0600 "${copied}"
   docker run --rm --user 0 \
