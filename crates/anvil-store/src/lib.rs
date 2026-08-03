@@ -75,8 +75,10 @@ pub use store::{
     DEFAULT_MUTATION_RECEIPT_MAX_BYTES, DEFAULT_MUTATION_RECEIPT_MAX_ENTRIES,
     DEFAULT_MUTATION_RECEIPT_RETENTION_SECONDS, ListObjectsPage, LocalPayloadPresence,
     MAX_LIST_OBJECT_VERSIONS, MAX_LIST_OBJECTS, MutationReceiptRetention, OpenedObject,
-    PayloadArtifactState, PayloadStoreError, ShardIdentity, ShardReader, ShardSealOutcome,
-    ShardStoreError, Store, StoreOptions,
+    MAX_OBJECT_RECORD_EXPORT_BYTES, MAX_OBJECT_RECORD_EXPORT_RECORDS, ObjectPathSnapshot,
+    ObjectRecordCursor, ObjectRecordExport, ObjectRecordExportPage, ObjectSnapshotApplied,
+    ObjectSnapshotError, PayloadArtifactState, PayloadStoreError, ShardIdentity, ShardReader,
+    ShardSealOutcome, ShardStoreError, Store, StoreOptions,
 };
 pub use watch::{
     DEFAULT_WATCH_MAX_BYTES, DEFAULT_WATCH_MAX_ENTRIES, InvalidationStateHint, LocalChange,

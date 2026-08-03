@@ -769,7 +769,7 @@ impl Store {
         })
     }
 
-    fn stage_expired_mutation_receipts(
+    pub(super) fn stage_expired_mutation_receipts(
         &self,
         batch: &mut WriteBatch,
         now_unix_millis: u64,
@@ -858,7 +858,7 @@ impl Store {
         Ok(expires_at_unix_millis)
     }
 
-    fn stage_stored_mutation_receipt(
+    pub(super) fn stage_stored_mutation_receipt(
         &self,
         batch: &mut WriteBatch,
         primary_key: Vec<u8>,
@@ -890,7 +890,7 @@ impl Store {
         Ok(())
     }
 
-    fn stage_mutation_receipt_status(
+    pub(super) fn stage_mutation_receipt_status(
         &self,
         batch: &mut WriteBatch,
         status: MutationReceiptStatus,

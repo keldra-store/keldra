@@ -765,6 +765,7 @@ impl Store {
 
 mod blob_references;
 mod mutations;
+mod object_snapshot;
 mod payload;
 mod reads;
 mod reference_deltas;
@@ -773,6 +774,11 @@ mod watch_journal;
 
 pub use payload::{
     CompleteCopySealOutcome, LocalPayloadPresence, PayloadArtifactState, PayloadStoreError,
+};
+pub use object_snapshot::{
+    MAX_OBJECT_RECORD_EXPORT_BYTES, MAX_OBJECT_RECORD_EXPORT_RECORDS, ObjectPathSnapshot,
+    ObjectRecordCursor, ObjectRecordExport, ObjectRecordExportPage, ObjectSnapshotApplied,
+    ObjectSnapshotError,
 };
 pub use shards::{ShardIdentity, ShardReader, ShardSealOutcome, ShardStoreError};
 
