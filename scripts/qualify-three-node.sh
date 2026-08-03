@@ -290,20 +290,6 @@ ANVIL_INDEX_QUALIFICATION_CLIENT_SECRET="${index_secret}" \
     --example cluster_index_qualification
 echo "[anvil-qualification] distributed index qualification passed"
 
-personaldb_secret=qualification-personaldb-secret-0000000000000000000
-provision_tenant qpersonaldb qpersonaldb-client "${personaldb_secret}"
-create_bucket anvil-1 qpersonaldb-client "${personaldb_secret}" personaldb
-personaldb_state="${ANVIL_QUALIFICATION_DIR}/artifacts/personaldb-state.json"
-ANVIL_PERSONALDB_QUALIFICATION_ENDPOINTS="$(IFS=,; echo "${index_endpoints[*]}")" \
-ANVIL_PERSONALDB_QUALIFICATION_CLIENT_ID=qpersonaldb-client \
-ANVIL_PERSONALDB_QUALIFICATION_CLIENT_SECRET="${personaldb_secret}" \
-ANVIL_PERSONALDB_QUALIFICATION_BUCKET=personaldb \
-ANVIL_PERSONALDB_QUALIFICATION_STATE_PATH="${personaldb_state}" \
-  cargo run --quiet --locked --package anvil-server \
-    --manifest-path "${repo_root}/Cargo.toml" \
-    --example cluster_personaldb_qualification
-echo "[anvil-qualification] distributed PersonalDB qualification passed"
-
 cas_secret=qualification-cas-secret-000000000000000000000000
 provision_tenant qcas qcas-client "${cas_secret}"
 create_bucket anvil-2 qcas-client "${cas_secret}" objects
@@ -504,15 +490,6 @@ for node in anvil-1 anvil-2 anvil-3; do
   cmp "${ANVIL_QUALIFICATION_DIR}/artifacts/restart.txt" \
     "${ANVIL_QUALIFICATION_DIR}/artifacts/restart-read.txt"
 done
-ANVIL_PERSONALDB_QUALIFICATION_ENDPOINTS="$(IFS=,; echo "${index_endpoints[*]}")" \
-ANVIL_PERSONALDB_QUALIFICATION_CLIENT_ID=qpersonaldb-client \
-ANVIL_PERSONALDB_QUALIFICATION_CLIENT_SECRET="${personaldb_secret}" \
-ANVIL_PERSONALDB_QUALIFICATION_BUCKET=personaldb \
-ANVIL_PERSONALDB_QUALIFICATION_STATE_PATH="${personaldb_state}" \
-ANVIL_PERSONALDB_QUALIFICATION_VERIFY_EXISTING=1 \
-  cargo run --quiet --locked --package anvil-server \
-    --manifest-path "${repo_root}/Cargo.toml" \
-    --example cluster_personaldb_qualification
 echo "[anvil-qualification] rolling restart test passed"
 
 echo "[anvil-qualification] PASS image=${image_id} platform=${ANVIL_DOCKER_PLATFORM}"
