@@ -22,6 +22,10 @@ pub(crate) const LOCAL_INVALIDATION_TOKEN_KEY: &[u8] = b"local_invalidation_toke
 const WATCH_TOKEN_FORMAT: u16 = 1;
 const WATCH_TOKEN_MAX_ENCODED_BYTES: usize = 16 * 1024;
 const LOCAL_CHANGE_FORMAT: u16 = 1;
+const REFERENCE_PROOF_FORMAT: u16 = 1;
+const REFERENCE_PROOF_NAMESPACE: u8 = 0xff;
+pub(crate) const REFERENCE_PROOF_KEY_BYTES: usize =
+    1 + 1 + size_of::<u16>() + size_of::<[u8; 32]>() + size_of::<u64>();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WatchRetention {
@@ -259,6 +263,38 @@ pub enum LocalChange {
     RetainedVersionDeleted(RetainedVersionDeletedChange),
 }
 
+/// Exact object-mutation evidence copied to every complete metadata replica.
+///
+/// This is not a second event stream or a commit marker. It is the bounded
+/// source-journal change plus the fingerprint that already identifies the
+/// typed mutation which created it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReferenceProof {
+    format: u16,
+    pub source_id: SourceId,
+    pub mutation_fingerprint: [u8; 32],
+    pub change: LocalChange,
+}
+
+impl ReferenceProof {
+    pub(crate) fn new(
+        source_id: SourceId,
+        mutation_fingerprint: [u8; 32],
+        change: LocalChange,
+    ) -> Self {
+        Self {
+            format: REFERENCE_PROOF_FORMAT,
+            source_id,
+            mutation_fingerprint,
+            change,
+        }
+    }
+
+    pub fn offset(&self) -> u64 {
+        self.change.offset()
+    }
+}
+
 impl LocalChange {
     pub(crate) fn object_head(
         offset: u64,
@@ -352,6 +388,14 @@ pub(crate) enum LocalChangeCodecError {
     UnsupportedFormat(u16),
 }
 
+#[derive(Debug, Error)]
+pub(crate) enum ReferenceProofCodecError {
+    #[error("reference proof is malformed: {0}")]
+    Malformed(#[from] serde_json::Error),
+    #[error("unsupported reference proof format {0}")]
+    UnsupportedFormat(u16),
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum StoredLocalChange {
     Current(LocalChange),
@@ -393,6 +437,22 @@ pub(crate) fn decode_local_change(
     serde_json::from_value::<LocalInvalidation>(value)
         .map(StoredLocalChange::V050)
         .map_err(Into::into)
+}
+
+pub(crate) fn encode_reference_proof(
+    proof: &ReferenceProof,
+) -> Result<Vec<u8>, ReferenceProofCodecError> {
+    serde_json::to_vec(proof).map_err(Into::into)
+}
+
+pub(crate) fn decode_reference_proof(
+    encoded: &[u8],
+) -> Result<ReferenceProof, ReferenceProofCodecError> {
+    let proof = serde_json::from_slice::<ReferenceProof>(encoded)?;
+    if proof.format != REFERENCE_PROOF_FORMAT {
+        return Err(ReferenceProofCodecError::UnsupportedFormat(proof.format));
+    }
+    Ok(proof)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -477,6 +537,21 @@ pub(crate) fn decode_resume_token(
 
 pub(crate) fn invalidation_key(offset: u64) -> [u8; size_of::<u64>()] {
     offset.to_be_bytes()
+}
+
+/// Fixed-width proof key in the existing local-invalidation column family:
+/// storage format, proof namespace, source node, source epoch, source offset.
+pub(crate) fn reference_proof_key(
+    source: SourceId,
+    offset: u64,
+) -> [u8; REFERENCE_PROOF_KEY_BYTES] {
+    let mut key = [0_u8; REFERENCE_PROOF_KEY_BYTES];
+    key[0] = crate::key::STORAGE_KEY_FORMAT_VERSION;
+    key[1] = REFERENCE_PROOF_NAMESPACE;
+    key[2..4].copy_from_slice(&source.node_id.to_be_bytes());
+    key[4..36].copy_from_slice(&source.source_epoch);
+    key[36..44].copy_from_slice(&offset.to_be_bytes());
+    key
 }
 
 pub(crate) fn invalidation_record_bytes(encoded_value_bytes: usize) -> u64 {

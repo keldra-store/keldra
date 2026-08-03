@@ -87,6 +87,6 @@ pub use store::{
 pub use watch::{
     DEFAULT_WATCH_MAX_BYTES, DEFAULT_WATCH_MAX_ENTRIES, InvalidationStateHint, LocalChange,
     LocalInvalidation, MAX_LOCAL_INVALIDATION_SCAN_RECORDS, ObjectHeadChange, ObjectHeadChangeKind,
-    RetainedVersionDeletedChange, SourceId, WatchCursor, WatchError, WatchJournalStatus, WatchPage,
-    WatchRetention, WatchScope, WatchStart,
+    ReferenceProof, RetainedVersionDeletedChange, SourceId, WatchCursor, WatchError,
+    WatchJournalStatus, WatchPage, WatchRetention, WatchScope, WatchStart,
 };

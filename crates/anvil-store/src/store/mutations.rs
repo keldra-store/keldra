@@ -344,6 +344,9 @@ impl Store {
                 serde_json::to_vec(&evaluated.receipt.version).map_err(storage_error)?,
             );
         }
+        if let Some(mutation) = evaluated.mutation.as_ref() {
+            self.stage_object_mutation_reference_proof(&mut batch, mutation)?;
+        }
         if receipt_status != initial_receipt_status {
             self.stage_mutation_receipt_status(&mut batch, receipt_status)?;
         }
@@ -397,6 +400,8 @@ impl Store {
             false
         };
 
+        let mut batch = WriteBatch::default();
+        let proof_staged = self.stage_object_mutation_reference_proof(&mut batch, mutation)?;
         let current = self.head_by_storage_key(&encoded_head_key)?;
         let mut already_applied = false;
         match current.as_ref() {
@@ -419,7 +424,7 @@ impl Store {
                     && head.mutation_stamp == Some(mutation.stamp)
                     && descriptor == mutation.version
                 {
-                    if retained_identical_receipt {
+                    if retained_identical_receipt && !proof_staged {
                         return Ok(ReplicaObjectMutationApplied {
                             version: mutation.version.id,
                             replayed: true,
@@ -443,10 +448,13 @@ impl Store {
                         stamp.predecessor_version == Some(mutation.version.id)
                     }) =>
             {
-                return Ok(ReplicaObjectMutationApplied {
-                    version: mutation.version.id,
-                    replayed: true,
-                });
+                if !proof_staged {
+                    return Ok(ReplicaObjectMutationApplied {
+                        version: mutation.version.id,
+                        replayed: true,
+                    });
+                }
+                already_applied = true;
             }
             Some(head)
                 if head.mutation_stamp.is_some_and(|stamp| {
@@ -471,7 +479,6 @@ impl Store {
             return Err(MutationError::ObjectMutationConflict);
         }
 
-        let mut batch = WriteBatch::default();
         let mut receipt_status = self.mutation_receipt_status()?;
         let initial_receipt_status = receipt_status;
         let pruned = self.stage_expired_mutation_receipts(&mut batch, now, &mut receipt_status)?;

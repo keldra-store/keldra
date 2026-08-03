@@ -769,6 +769,7 @@ mod object_snapshot;
 mod payload;
 mod reads;
 mod reference_deltas;
+mod reference_proofs;
 mod shards;
 mod watch_journal;
 
