@@ -1,4 +1,4 @@
-name: ${ANVIL_QUALIFICATION_PROJECT:-anvil-v051-qualification}
+name: ${ANVIL_QUALIFICATION_PROJECT:-anvil-v052-qualification}
 
 x-anvil-environment: &anvil-environment
   RUST_LOG: ${RUST_LOG:-info}
@@ -13,6 +13,10 @@ x-anvil-service: &anvil-service
   platform: ${ANVIL_DOCKER_PLATFORM:-linux/amd64}
   restart: "no"
   stop_grace_period: 30s
+  # Random loopback ports let the test-only Rust qualification client exercise
+  # every public ingress without exposing a fixed host port.
+  ports:
+    - "127.0.0.1::50051"
 
 services:
   anvil-1:

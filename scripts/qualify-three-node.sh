@@ -4,7 +4,7 @@ set -Eeuo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 compose_file="${repo_root}/tests/cluster/docker-compose.yml"
 start_node="${repo_root}/tests/cluster/start-node.sh"
-requested_image="${ANVIL_IMAGE:-anvil:0.5.1}"
+requested_image="${ANVIL_IMAGE:-anvil:0.5.2}"
 
 case "${ANVIL_DOCKER_PLATFORM:-}" in
   "")
@@ -28,12 +28,16 @@ command -v docker >/dev/null 2>&1 || {
   echo "docker is required" >&2
   exit 2
 }
+command -v cargo >/dev/null 2>&1 || {
+  echo "cargo is required for the test-only index qualification client" >&2
+  exit 2
+}
 docker compose version >/dev/null
 
 image_id="$("${repo_root}/scripts/resolve-docker-image-id.sh" "${requested_image}")"
 export ANVIL_IMAGE="${image_id}"
-export ANVIL_QUALIFICATION_PROJECT="${ANVIL_QUALIFICATION_PROJECT:-anvil-v051-${$}}"
-export ANVIL_QUALIFICATION_DIR="$(mktemp -d /tmp/anvil-v051-qualification.XXXXXX)"
+export ANVIL_QUALIFICATION_PROJECT="${ANVIL_QUALIFICATION_PROJECT:-anvil-v052-${$}}"
+export ANVIL_QUALIFICATION_DIR="$(mktemp -d /tmp/anvil-v052-qualification.XXXXXX)"
 export ANVIL_QUALIFICATION_START_NODE="${start_node}"
 keep="${ANVIL_QUALIFICATION_KEEP:-0}"
 
@@ -57,7 +61,7 @@ cleanup() {
     echo "[anvil-qualification] retained files ${ANVIL_QUALIFICATION_DIR}" >&2
   else
     compose down --volumes --remove-orphans >/dev/null 2>&1 || true
-    if [[ "${ANVIL_QUALIFICATION_DIR}" == /tmp/anvil-v051-qualification.* ]]; then
+    if [[ "${ANVIL_QUALIFICATION_DIR}" == /tmp/anvil-v052-qualification.* ]]; then
       docker run --rm --user 0 \
         --volume "${ANVIL_QUALIFICATION_DIR}:/qualification" \
         "${image_id}" rm -rf \
@@ -266,6 +270,40 @@ prepare_and_start_node 3
 
 echo "[anvil-qualification] three-node cluster is ACTIVE"
 
+index_secret=qualification-index-secret-00000000000000000000000
+provision_tenant qindex qindex-client "${index_secret}"
+index_endpoints=()
+for index_node in anvil-1 anvil-2 anvil-3; do
+  published="$(compose port "${index_node}" 50051)"
+  if [[ ! "${published}" =~ ^127\.0\.0\.1:([1-9][0-9]*)$ ]]; then
+    echo "${index_node} returned an invalid loopback public endpoint: ${published}" >&2
+    exit 1
+  fi
+  index_endpoints+=("http://${published}")
+done
+ANVIL_INDEX_QUALIFICATION_ENDPOINTS="$(IFS=,; echo "${index_endpoints[*]}")" \
+ANVIL_INDEX_QUALIFICATION_TENANT=qindex \
+ANVIL_INDEX_QUALIFICATION_CLIENT_ID=qindex-client \
+ANVIL_INDEX_QUALIFICATION_CLIENT_SECRET="${index_secret}" \
+  cargo run --quiet --locked --package anvil-server \
+    --manifest-path "${repo_root}/Cargo.toml" \
+    --example cluster_index_qualification
+echo "[anvil-qualification] distributed index qualification passed"
+
+personaldb_secret=qualification-personaldb-secret-0000000000000000000
+provision_tenant qpersonaldb qpersonaldb-client "${personaldb_secret}"
+create_bucket anvil-1 qpersonaldb-client "${personaldb_secret}" personaldb
+personaldb_state="${ANVIL_QUALIFICATION_DIR}/artifacts/personaldb-state.json"
+ANVIL_PERSONALDB_QUALIFICATION_ENDPOINTS="$(IFS=,; echo "${index_endpoints[*]}")" \
+ANVIL_PERSONALDB_QUALIFICATION_CLIENT_ID=qpersonaldb-client \
+ANVIL_PERSONALDB_QUALIFICATION_CLIENT_SECRET="${personaldb_secret}" \
+ANVIL_PERSONALDB_QUALIFICATION_BUCKET=personaldb \
+ANVIL_PERSONALDB_QUALIFICATION_STATE_PATH="${personaldb_state}" \
+  cargo run --quiet --locked --package anvil-server \
+    --manifest-path "${repo_root}/Cargo.toml" \
+    --example cluster_personaldb_qualification
+echo "[anvil-qualification] distributed PersonalDB qualification passed"
+
 cas_secret=qualification-cas-secret-000000000000000000000000
 provision_tenant qcas qcas-client "${cas_secret}"
 create_bucket anvil-2 qcas-client "${cas_secret}" objects
@@ -466,6 +504,15 @@ for node in anvil-1 anvil-2 anvil-3; do
   cmp "${ANVIL_QUALIFICATION_DIR}/artifacts/restart.txt" \
     "${ANVIL_QUALIFICATION_DIR}/artifacts/restart-read.txt"
 done
+ANVIL_PERSONALDB_QUALIFICATION_ENDPOINTS="$(IFS=,; echo "${index_endpoints[*]}")" \
+ANVIL_PERSONALDB_QUALIFICATION_CLIENT_ID=qpersonaldb-client \
+ANVIL_PERSONALDB_QUALIFICATION_CLIENT_SECRET="${personaldb_secret}" \
+ANVIL_PERSONALDB_QUALIFICATION_BUCKET=personaldb \
+ANVIL_PERSONALDB_QUALIFICATION_STATE_PATH="${personaldb_state}" \
+ANVIL_PERSONALDB_QUALIFICATION_VERIFY_EXISTING=1 \
+  cargo run --quiet --locked --package anvil-server \
+    --manifest-path "${repo_root}/Cargo.toml" \
+    --example cluster_personaldb_qualification
 echo "[anvil-qualification] rolling restart test passed"
 
 echo "[anvil-qualification] PASS image=${image_id} platform=${ANVIL_DOCKER_PLATFORM}"
