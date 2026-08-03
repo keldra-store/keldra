@@ -39,8 +39,9 @@ pub use blob::{AWAITING_PUBLISH, BlobReader, BlobRef, BlobReferenceState, BlobSt
 pub use bootstrap::{
     ApplicationCredential, ApplicationCredentialRequest, ApplicationRoleTarget,
     BucketApplicationRole, CreateBucketReceipt, CreateBucketRequest, CredentialMutationReceipt,
-    CredentialRepository, CredentialRepositoryError, ProvisionTenantReceipt,
-    ProvisionTenantRequest, SYSTEM_BOOTSTRAP_VERSION, SYSTEM_SCHEMA_ID, SetApplicationRoleReceipt,
+    CredentialRepository, CredentialRepositoryError, PreparedBucketCreation,
+    PreparedTenantProvisioning, ProvisionTenantReceipt, ProvisionTenantRequest,
+    SYSTEM_BOOTSTRAP_VERSION, SYSTEM_SCHEMA_ID, SetApplicationRoleReceipt,
     SetApplicationRoleRequest, SystemApplicationRole, SystemBootstrapError, SystemBootstrapRequest,
     SystemBootstrapState, TenantApplicationRole, system_schema,
 };
@@ -93,8 +94,8 @@ pub use store::{
     ShardReader, ShardSealOutcome, ShardStoreError, Store, StoreOptions,
 };
 pub use watch::{
-    DEFAULT_WATCH_MAX_BYTES, DEFAULT_WATCH_MAX_ENTRIES, InvalidationStateHint, LocalChange,
-    LocalInvalidation, MAX_LOCAL_INVALIDATION_SCAN_RECORDS, ObjectHeadChange, ObjectHeadChangeKind,
-    ReferenceProof, RetainedVersionDeletedChange, SourceId, WatchCursor, WatchError,
-    WatchJournalStatus, WatchPage, WatchRetention, WatchScope, WatchStart,
+    AggregateChanged, AggregateKind, DEFAULT_WATCH_MAX_BYTES, DEFAULT_WATCH_MAX_ENTRIES,
+    InvalidationStateHint, LocalChange, LocalInvalidation, MAX_LOCAL_INVALIDATION_SCAN_RECORDS,
+    ObjectHeadChange, ObjectHeadChangeKind, ReferenceProof, RetainedVersionDeletedChange, SourceId,
+    WatchCursor, WatchError, WatchJournalStatus, WatchPage, WatchRetention, WatchScope, WatchStart,
 };

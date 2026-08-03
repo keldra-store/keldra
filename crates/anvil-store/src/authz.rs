@@ -255,7 +255,7 @@ pub struct TupleMutation {
     pub tuple: Tuple,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TupleBatchRequest {
     pub scope: AuthzScope,
     /// Authenticated caller fixed by the trusted server boundary. It scopes

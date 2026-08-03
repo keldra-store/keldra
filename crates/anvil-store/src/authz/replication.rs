@@ -330,6 +330,25 @@ impl AuthzRepository {
         request: TupleBatchRequest,
         context: AuthzRealmMutationContext,
     ) -> Result<CoordinatedAuthzRealmMutation, AuthzStoreError> {
+        let _guard = self.lock_writes()?;
+        let mut batch = WriteBatch::default();
+        let coordinated = self.stage_coordinated_tuple_mutation(request, context, &mut batch)?;
+        if !batch.is_empty() {
+            self.write(batch)?;
+        }
+        Ok(coordinated)
+    }
+
+    /// Stages one coordinator-owned tuple mutation into a caller-provided
+    /// RocksDB batch. The caller must hold this repository's write lock. This
+    /// is the storage boundary used to append the source-journal invalidation
+    /// atomically with the authoritative Zanzibar mutation.
+    pub(crate) fn stage_coordinated_tuple_mutation(
+        &self,
+        request: TupleBatchRequest,
+        context: AuthzRealmMutationContext,
+        batch: &mut WriteBatch,
+    ) -> Result<CoordinatedAuthzRealmMutation, AuthzStoreError> {
         self.validate_context(&context)?;
         if request.operation_id.as_deref() != Some(context.command_id.as_str()) {
             return Err(invalid_mutation(
@@ -338,7 +357,6 @@ impl AuthzRepository {
         }
         let canonical_mutations = self.validate_mutation_request(&request)?;
         let input_fingerprint = tuple_fingerprint(&request, &canonical_mutations)?;
-        let _guard = self.lock_writes()?;
         let predecessor = self.read_stored_binding(&request.scope)?.ok_or_else(|| {
             AuthzStoreError::MissingBinding(
                 request.scope.storage_tenant.clone(),
@@ -346,8 +364,7 @@ impl AuthzRepository {
             )
         })?;
         let predecessor_revision = self.stored_realm_revision(&request.scope, &predecessor)?;
-        let mut batch = WriteBatch::default();
-        let receipt = self.prepare_tuple_batch(&request, &mut batch)?;
+        let receipt = self.prepare_tuple_batch(&request, batch)?;
         if receipt.replayed {
             let mutation = self
                 .stored_tuple_receipt(&request, &context.command_id)?
@@ -392,9 +409,8 @@ impl AuthzRepository {
         mutation.set_computed_fingerprint();
         mutation
             .validate_with_limits(self.limits.max_mutations_per_batch, self.limits.evaluator)?;
-        self.stage_stamped_binding(&mut batch, &mutation)?;
-        self.stage_replicated_tuple_receipt(&mut batch, &mutation, created_at)?;
-        self.write(batch)?;
+        self.stage_stamped_binding(batch, &mutation)?;
+        self.stage_replicated_tuple_receipt(batch, &mutation, created_at)?;
         Ok(CoordinatedAuthzRealmMutation {
             result: CoordinatedAuthzRealmResult::Tuples(receipt),
             mutation: Some(mutation),

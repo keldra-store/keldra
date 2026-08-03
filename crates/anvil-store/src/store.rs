@@ -16,9 +16,9 @@ use crate::key::{
 };
 use crate::logical_record::decode_current_value;
 use crate::watch::{
-    InvalidationStateHint, LOCAL_INVALIDATION_BYTES_KEY, LOCAL_INVALIDATION_COUNT_KEY,
-    LOCAL_INVALIDATION_EPOCH_KEY, LOCAL_INVALIDATION_FLOOR_KEY, LOCAL_INVALIDATION_OFFSET_KEY,
-    LOCAL_INVALIDATION_TOKEN_KEY, LocalChange, LocalInvalidation,
+    AggregateKind, InvalidationStateHint, LOCAL_INVALIDATION_BYTES_KEY,
+    LOCAL_INVALIDATION_COUNT_KEY, LOCAL_INVALIDATION_EPOCH_KEY, LOCAL_INVALIDATION_FLOOR_KEY,
+    LOCAL_INVALIDATION_OFFSET_KEY, LOCAL_INVALIDATION_TOKEN_KEY, LocalChange, LocalInvalidation,
     MAX_LOCAL_INVALIDATION_SCAN_RECORDS, ObjectHeadChangeKind, SourceId, StoredLocalChange,
     WatchCursor, WatchError, WatchJournalStatus, WatchPage, WatchRetention, WatchScope, WatchStart,
     decode_local_change, decode_resume_token, encode_local_change, encode_resume_token,
@@ -147,6 +147,11 @@ pub(crate) enum PendingLocalChange {
         deleted_version: VersionId,
         resulting_head_version: Option<VersionId>,
         reference_deltas: Vec<ReferenceDelta>,
+    },
+    AggregateChanged {
+        aggregate_kind: AggregateKind,
+        aggregate_key: Vec<u8>,
+        revision: u64,
     },
 }
 
@@ -769,28 +774,29 @@ impl Store {
     }
 }
 
+mod authz_journal;
 mod blob_references;
-mod payload_handoff;
 mod mutations;
 mod object_snapshot;
 mod payload;
+mod payload_handoff;
 mod reads;
 mod reference_deltas;
 mod reference_proofs;
 mod shards;
 mod watch_journal;
 
+pub use object_snapshot::{
+    MAX_OBJECT_RECORD_EXPORT_BYTES, MAX_OBJECT_RECORD_EXPORT_RECORDS, ObjectPathSnapshot,
+    ObjectRecordCursor, ObjectRecordExport, ObjectRecordExportPage, ObjectSnapshotApplied,
+    ObjectSnapshotError,
+};
 pub use payload::{
     CompleteCopySealOutcome, LocalPayloadPresence, PayloadArtifactState, PayloadStoreError,
 };
 pub use payload_handoff::{
     MAX_PAYLOAD_HANDOFF_EXPORT_RECORDS, PayloadArtifactCursor, PayloadArtifactIdentity,
     PayloadArtifactSnapshot, PayloadArtifactSnapshotPage,
-};
-pub use object_snapshot::{
-    MAX_OBJECT_RECORD_EXPORT_BYTES, MAX_OBJECT_RECORD_EXPORT_RECORDS, ObjectPathSnapshot,
-    ObjectRecordCursor, ObjectRecordExport, ObjectRecordExportPage, ObjectSnapshotApplied,
-    ObjectSnapshotError,
 };
 pub use reference_proofs::{
     MAX_REFERENCE_PROOF_EXPORT_BYTES, MAX_REFERENCE_PROOF_EXPORT_RECORDS,

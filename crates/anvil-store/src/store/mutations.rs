@@ -616,6 +616,16 @@ impl Store {
                     *resulting_head_version,
                     reference_deltas.clone(),
                 ),
+                PendingLocalChange::AggregateChanged {
+                    aggregate_kind,
+                    aggregate_key,
+                    revision,
+                } => LocalChange::aggregate_changed(
+                    status.tail,
+                    *aggregate_kind,
+                    aggregate_key.clone(),
+                    *revision,
+                ),
             };
             let encoded = encode_local_change(&change).map_err(storage_error)?;
             status.retained_entries = status.retained_entries.checked_add(1).ok_or_else(|| {

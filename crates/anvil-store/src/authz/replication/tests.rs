@@ -5,7 +5,7 @@ use anvil_authz::{
 use tempfile::TempDir;
 
 use super::*;
-use crate::{AuthzConsistency, SchemaId, Store, StoreOptions};
+use crate::{AggregateKind, AuthzConsistency, LocalChange, SchemaId, Store, StoreOptions};
 
 fn tenant() -> StorageTenantId {
     StorageTenantId::parse("acme").unwrap()
@@ -167,6 +167,50 @@ async fn complete_realm_mutations_apply_to_a_second_store_and_replay_exactly() {
         CoordinatedAuthzRealmResult::Tuples(TupleBatchReceipt { replayed: true, .. })
     ));
     assert_eq!(coordinator_replay.mutation, Some(tuple_mutation));
+}
+
+#[tokio::test]
+async fn journaled_tuple_mutation_uses_the_actual_atomic_source_position() {
+    let (_root, coordinator, _replica) = stores().await;
+    let repository = coordinator.authz();
+    let published = publish(&repository);
+    repository
+        .coordinate_bind_schema_mutation(
+            bind_request(published.schema_ref),
+            context("bind-documents", 1, 7),
+        )
+        .unwrap();
+    let request = tuple_request("journaled-grant", 2, "one", "alice");
+    let placement = PlacementLogId { term: 8, index: 21 };
+
+    let coordinated = coordinator
+        .coordinate_journaled_authz_tuple_mutation(41, request.clone(), placement, 8)
+        .await
+        .unwrap();
+    let mutation = coordinated.mutation.as_ref().unwrap();
+    let status = coordinator.local_watch_status().unwrap();
+    assert_eq!(status.tail, 1);
+    assert_eq!(mutation.stamp.source_id, status.source_id);
+    assert_eq!(mutation.stamp.source_journal_position, 1);
+    let changes = coordinator.scan_local_changes(0, 10).unwrap();
+    let LocalChange::AggregateChanged(change) = &changes[0] else {
+        panic!("expected a Zanzibar aggregate invalidation");
+    };
+    assert_eq!(change.aggregate_kind, AggregateKind::ZanzibarRealm);
+    assert_eq!(change.revision, 3);
+    let mut expected_key = 41_u64.to_be_bytes().to_vec();
+    expected_key.extend_from_slice(&scope().handoff_order_key().unwrap());
+    assert_eq!(change.aggregate_key, expected_key);
+
+    let replay = coordinator
+        .coordinate_journaled_authz_tuple_mutation(41, request, placement, 8)
+        .await
+        .unwrap();
+    assert!(matches!(
+        replay.result,
+        CoordinatedAuthzRealmResult::Tuples(TupleBatchReceipt { replayed: true, .. })
+    ));
+    assert_eq!(coordinator.local_watch_status().unwrap().tail, 1);
 }
 
 #[tokio::test]
