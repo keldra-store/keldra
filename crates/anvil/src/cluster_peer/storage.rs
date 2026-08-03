@@ -28,6 +28,34 @@ struct SchemaReplicaQueryWire {
 impl wire::cluster_peer_server::ClusterPeer for ClusterPeerService {
     type ReadRealmAggregateStream = super::authz::RealmAggregateStream;
 
+    async fn publish_index_artifact(
+        &self,
+        request: Request<wire::PublishIndexArtifactRequest>,
+    ) -> Result<Response<wire::IndexArtifactPublished>, Status> {
+        self.publish_index_artifact_call(request).await
+    }
+
+    async fn delete_index_artifact(
+        &self,
+        request: Request<wire::DeleteIndexArtifactRequest>,
+    ) -> Result<Response<wire::IndexArtifactDeleted>, Status> {
+        self.delete_index_artifact_call(request).await
+    }
+
+    async fn scan_index_heads(
+        &self,
+        request: Request<wire::ScanIndexHeadsRequest>,
+    ) -> Result<Response<wire::IndexHeadScanPage>, Status> {
+        self.scan_index_heads_call(request).await
+    }
+
+    async fn route_index_query(
+        &self,
+        request: Request<wire::RouteIndexQueryRequest>,
+    ) -> Result<Response<wire::RoutedIndexQueryResponse>, Status> {
+        self.route_index_query_call(request).await
+    }
+
     async fn resolve_tenant_name(
         &self,
         request: Request<wire::ResolveTenantNameRequest>,
@@ -318,7 +346,7 @@ impl wire::cluster_peer_server::ClusterPeer for ClusterPeerService {
         let raw = request.get_ref();
         let limit = usize::try_from(raw.limit)
             .map_err(|_| Status::invalid_argument("list limit does not fit this node"))?;
-        let query = LocalListQuery::new(
+        let mut query = LocalListQuery::new(
             admitted.placement.fence(),
             raw.tenant.clone(),
             raw.bucket.clone(),
@@ -328,6 +356,12 @@ impl wire::cluster_peer_server::ClusterPeer for ClusterPeerService {
             raw.start_after.clone(),
             limit,
         )?;
+        if raw.include_index_definitions {
+            query = query.for_index_definitions()?;
+        }
+        if raw.include_personaldb_objects {
+            query = query.for_personaldb_objects()?;
+        }
         self.list_authorizer.authorize(&bearer, &query).await?;
         let deadline = Instant::now()
             .checked_add(admitted.timeout)
@@ -338,8 +372,8 @@ impl wire::cluster_peer_server::ClusterPeer for ClusterPeerService {
             let store = self.store.clone();
             let query = query.clone();
             let owned = bounded_blocking(visibility_remaining(deadline)?, move || {
-                let page = store
-                    .list_local_owned_objects(
+                let page = if query.includes_index_definitions() {
+                    store.list_local_owned_index_definitions(
                         query.tenant_id(),
                         query.bucket_id(),
                         query.prefix(),
@@ -350,7 +384,32 @@ impl wire::cluster_peer_server::ClusterPeer for ClusterPeerService {
                                 == Some(local_node)
                         },
                     )
-                    .map_err(|error| Status::failed_precondition(error.to_string()))?;
+                } else if query.includes_personaldb_objects() {
+                    store.list_local_owned_personaldb_objects(
+                        query.tenant_id(),
+                        query.bucket_id(),
+                        query.prefix(),
+                        query.start_after(),
+                        query.limit(),
+                        |tenant_id, bucket_id, path| {
+                            object_coordinator(&placement, tenant_id, bucket_id, path)
+                                == Some(local_node)
+                        },
+                    )
+                } else {
+                    store.list_local_owned_objects(
+                        query.tenant_id(),
+                        query.bucket_id(),
+                        query.prefix(),
+                        query.start_after(),
+                        query.limit(),
+                        |tenant_id, bucket_id, path| {
+                            object_coordinator(&placement, tenant_id, bucket_id, path)
+                                == Some(local_node)
+                        },
+                    )
+                }
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
                 Ok(OwnedListPage::new(local_node, placement.fence(), page))
             })
             .await?;
@@ -510,6 +569,48 @@ impl wire::cluster_peer_server::ClusterPeer for ClusterPeerService {
         request: Request<wire::RouteBulkWriteRequest>,
     ) -> Result<Response<anvil_api::v1::BulkWriteResponse>, Status> {
         self.route_bulk_write_call(request).await
+    }
+
+    async fn route_internal_delete_if_version(
+        &self,
+        request: Request<wire::RouteDeleteIfVersionRequest>,
+    ) -> Result<Response<anvil_api::v1::MutationReceipt>, Status> {
+        self.route_internal_delete_if_version_call(request).await
+    }
+
+    async fn route_internal_bulk_write(
+        &self,
+        request: Request<wire::RouteBulkWriteRequest>,
+    ) -> Result<Response<anvil_api::v1::BulkWriteResponse>, Status> {
+        self.route_internal_bulk_write_call(request).await
+    }
+
+    async fn route_personal_db_exchange(
+        &self,
+        request: Request<wire::RoutePersonalDbExchangeRequest>,
+    ) -> Result<Response<anvil_api::v1::PersonalDbExchangeResponse>, Status> {
+        self.route_personaldb_exchange_call(request).await
+    }
+
+    async fn route_personal_db_grant_leader_lease(
+        &self,
+        request: Request<wire::RoutePersonalDbGrantLeaderLeaseRequest>,
+    ) -> Result<Response<anvil_api::v1::PersonalDbGrantLeaderLeaseResponse>, Status> {
+        self.route_personaldb_grant_leader_lease_call(request).await
+    }
+
+    async fn route_personal_db_renew_leader_lease(
+        &self,
+        request: Request<wire::RoutePersonalDbRenewLeaderLeaseRequest>,
+    ) -> Result<Response<anvil_api::v1::PersonalDbRenewLeaderLeaseResponse>, Status> {
+        self.route_personaldb_renew_leader_lease_call(request).await
+    }
+
+    async fn route_personal_db_witness_commit(
+        &self,
+        request: Request<wire::RoutePersonalDbWitnessCommitRequest>,
+    ) -> Result<Response<anvil_api::v1::PersonalDbWitnessCommitResponse>, Status> {
+        self.route_personaldb_witness_commit_call(request).await
     }
 
     async fn route_authz_put_schema(
@@ -687,6 +788,13 @@ impl wire::cluster_peer_server::ClusterPeer for ClusterPeerService {
     ) -> Result<Response<wire::CoordinateSystemGrantResponse>, Status> {
         self.coordinate_system_grant_call(request).await
     }
+
+    async fn coordinate_personal_db_authorization(
+        &self,
+        request: Request<wire::CoordinatePersonalDbAuthorizationRequest>,
+    ) -> Result<Response<wire::CoordinatePersonalDbAuthorizationResponse>, Status> {
+        self.coordinate_personaldb_authorization_call(request).await
+    }
 }
 
 fn watch_authorization_query(
@@ -789,7 +897,7 @@ fn require_object_replica(
     Ok(())
 }
 
-fn object_coordinator(
+pub(super) fn object_coordinator(
     placement: &crate::cluster_placement::ClusterPlacement,
     tenant_id: u64,
     bucket_id: u64,

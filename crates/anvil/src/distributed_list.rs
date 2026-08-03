@@ -24,6 +24,8 @@ use crate::cluster_placement::ClusterPlacement;
 use crate::placement::PlacementKind;
 use crate::serving_fence::ServingAuthority;
 
+const PERSONALDB_OBJECT_PREFIX: &str = "_anvil/personaldb/v0/";
+
 /// The original signed access token, deliberately separate from every Debug
 /// or protobuf-derived listing type. Private transports carry it in encrypted
 /// gRPC metadata rather than serializing a caller or an authorization result.
@@ -56,6 +58,10 @@ impl OriginalBearer {
         Self(token.into())
     }
 
+    pub(crate) fn from_signed_token_for_peer(token: impl Into<Arc<str>>) -> Self {
+        Self(token.into())
+    }
+
     pub(crate) fn signed_token(&self) -> &str {
         &self.0
     }
@@ -76,6 +82,8 @@ pub(crate) struct LocalListQuery {
     prefix: String,
     start_after: Option<String>,
     limit: usize,
+    include_index_definitions: bool,
+    include_personaldb_objects: bool,
 }
 
 impl LocalListQuery {
@@ -132,6 +140,8 @@ impl LocalListQuery {
             prefix,
             start_after,
             limit,
+            include_index_definitions: false,
+            include_personaldb_objects: false,
         })
     }
 
@@ -165,6 +175,51 @@ impl LocalListQuery {
 
     pub(crate) const fn limit(&self) -> usize {
         self.limit
+    }
+
+    pub(crate) const fn includes_index_definitions(&self) -> bool {
+        self.include_index_definitions
+    }
+
+    pub(crate) fn for_index_definitions(mut self) -> Result<Self, Status> {
+        let suffix = self
+            .prefix
+            .strip_prefix("_anvil/indexes/definitions/")
+            .ok_or_else(|| {
+                Status::invalid_argument(
+                    "index-definition listing requires its exact reserved prefix",
+                )
+            })?;
+        if suffix.contains('/')
+            || self.start_after.as_ref().is_some_and(|path| {
+                crate::index_runtime::publication::index_definition_name(path).is_none()
+            })
+        {
+            return Err(Status::invalid_argument(
+                "index-definition listing cannot enumerate another reserved path",
+            ));
+        }
+        self.include_index_definitions = true;
+        Ok(self)
+    }
+
+    pub(crate) const fn includes_personaldb_objects(&self) -> bool {
+        self.include_personaldb_objects
+    }
+
+    pub(crate) fn for_personaldb_objects(mut self) -> Result<Self, Status> {
+        if !self.prefix.starts_with(PERSONALDB_OBJECT_PREFIX)
+            || self
+                .start_after
+                .as_ref()
+                .is_some_and(|path| !path.starts_with(PERSONALDB_OBJECT_PREFIX))
+        {
+            return Err(Status::invalid_argument(
+                "PersonalDB listing requires its exact reserved prefix",
+            ));
+        }
+        self.include_personaldb_objects = true;
+        Ok(self)
     }
 }
 
@@ -555,6 +610,71 @@ impl DistributedObjectLister {
             start_after.map(str::to_owned),
             limit,
         )?;
+        self.list_query(bearer, placement, query).await
+    }
+
+    /// Lists immutable index definitions only. The same bucket-level Zanzibar
+    /// check and cluster merge apply; public object listing cannot set this.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn list_index_definitions(
+        &self,
+        bearer: OriginalBearer,
+        tenant: &str,
+        bucket: &str,
+        tenant_id: u64,
+        bucket_id: u64,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ListObjectsPage, Status> {
+        let placement = self.placement()?;
+        let query = LocalListQuery::new(
+            placement.fence(),
+            tenant,
+            bucket,
+            tenant_id,
+            bucket_id,
+            prefix,
+            start_after.map(str::to_owned),
+            limit,
+        )?
+        .for_index_definitions()?;
+        self.list_query(bearer, placement, query).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn list_personaldb_objects(
+        &self,
+        bearer: OriginalBearer,
+        tenant: &str,
+        bucket: &str,
+        tenant_id: u64,
+        bucket_id: u64,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ListObjectsPage, Status> {
+        let placement = self.placement()?;
+        let query = LocalListQuery::new(
+            placement.fence(),
+            tenant,
+            bucket,
+            tenant_id,
+            bucket_id,
+            prefix,
+            start_after.map(str::to_owned),
+            limit,
+        )?
+        .for_personaldb_objects()?;
+        self.list_query(bearer, placement, query).await
+    }
+
+    async fn list_query(
+        &self,
+        bearer: OriginalBearer,
+        placement: ClusterPlacement,
+        query: LocalListQuery,
+    ) -> Result<ListObjectsPage, Status> {
         loop {
             let page = gather_cluster_page(
                 self.local_node,
@@ -664,7 +784,7 @@ async fn gather_cluster_page(
         if owned.page().paths.iter().any(|path| {
             path.len() > MAX_OBJECT_PATH_BYTES
                 || !path.starts_with(query.prefix())
-                || path.split('/').any(|segment| segment == "_anvil")
+                || !path_is_allowed_for_query(&query, path)
         }) {
             return Err(Status::unavailable(format!(
                 "ACTIVE node {} returned a path outside the requested public prefix",
@@ -685,6 +805,16 @@ async fn gather_cluster_page(
     })
 }
 
+fn path_is_allowed_for_query(query: &LocalListQuery, path: &str) -> bool {
+    if query.includes_index_definitions() {
+        crate::index_runtime::publication::index_definition_name(path).is_some()
+    } else if query.includes_personaldb_objects() {
+        path.starts_with(PERSONALDB_OBJECT_PREFIX)
+    } else {
+        !path.split('/').any(|segment| segment == "_anvil")
+    }
+}
+
 /// Produce one bounded page from one RocksDB snapshot and one exact placement.
 /// This is the only storage implementation used by both the local fast path
 /// and the private peer service.
@@ -702,8 +832,8 @@ fn local_owned_page(
     if !placement.active_node_ids().contains(&local_node) {
         return Err(Status::unavailable("list source is not ACTIVE"));
     }
-    let page = store
-        .list_local_owned_objects(
+    let page = if query.includes_index_definitions() {
+        store.list_local_owned_index_definitions(
             query.tenant_id(),
             query.bucket_id(),
             query.prefix(),
@@ -713,7 +843,30 @@ fn local_owned_page(
                 placement.object_owner(tenant_id, bucket_id, path) == Some(local_node)
             },
         )
-        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    } else if query.includes_personaldb_objects() {
+        store.list_local_owned_personaldb_objects(
+            query.tenant_id(),
+            query.bucket_id(),
+            query.prefix(),
+            query.start_after(),
+            query.limit(),
+            |tenant_id, bucket_id, path| {
+                placement.object_owner(tenant_id, bucket_id, path) == Some(local_node)
+            },
+        )
+    } else {
+        store.list_local_owned_objects(
+            query.tenant_id(),
+            query.bucket_id(),
+            query.prefix(),
+            query.start_after(),
+            query.limit(),
+            |tenant_id, bucket_id, path| {
+                placement.object_owner(tenant_id, bucket_id, path) == Some(local_node)
+            },
+        )
+    }
+    .map_err(|error| Status::failed_precondition(error.to_string()))?;
     Ok(OwnedListPage::new(local_node, placement.fence(), page))
 }
 
@@ -1042,6 +1195,30 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(malformed.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[test]
+    fn personaldb_reserved_paths_require_the_personaldb_listing_scope() {
+        let ordinary = LocalListQuery::new(
+            PlacementLogId { term: 1, index: 2 },
+            "tenant",
+            "bucket",
+            3,
+            4,
+            PERSONALDB_OBJECT_PREFIX,
+            None,
+            10,
+        )
+        .unwrap();
+        let personaldb = ordinary.clone().for_personaldb_objects().unwrap();
+        let personaldb_path = "_anvil/personaldb/v0/groups/database/head";
+
+        assert!(!path_is_allowed_for_query(&ordinary, personaldb_path));
+        assert!(path_is_allowed_for_query(&personaldb, personaldb_path));
+        assert!(!path_is_allowed_for_query(
+            &personaldb,
+            "_anvil/indexes/definitions/not-personaldb"
+        ));
     }
 
     #[test]

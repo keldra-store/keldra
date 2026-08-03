@@ -27,6 +27,9 @@ use tonic::{Request, Status};
 use crate::distributed_watch::{
     CHECKPOINT_AUDIENCE, CHECKPOINT_PURPOSE, WatchCheckpointClaims, WatchCheckpointCodec,
 };
+use crate::index_service::{
+    INDEX_PAGE_TOKEN_AUDIENCE, INDEX_PAGE_TOKEN_PURPOSE, IndexPageTokenClaims,
+};
 
 pub(crate) const ACCESS_TOKEN_LIFETIME: Duration = Duration::from_secs(60 * 60);
 pub const PUT_TOKEN_LIFETIME: Duration = Duration::from_secs(5 * 60);
@@ -314,7 +317,9 @@ pub struct JwtManager {
     access_validation: Arc<Validation>,
     put_validation: Arc<Validation>,
     watch_checkpoint_validation: Arc<Validation>,
+    index_page_validation: Arc<Validation>,
     signing_key_fingerprint: JwtSigningKeyFingerprint,
+    personaldb_witness_seed: Arc<[u8; 32]>,
 }
 
 impl std::fmt::Debug for JwtManager {
@@ -372,16 +377,22 @@ impl JwtManager {
         if signing_secret.len() < MIN_SIGNING_KEY_BYTES {
             return Err(AuthenticationError::SigningSecretTooShort);
         }
+        let personaldb_witness_seed = blake3::derive_key(
+            "anvil 0.5 PersonalDB witness Ed25519 seed v1",
+            signing_secret,
+        );
         Ok(Self {
             encoding_key: Arc::new(EncodingKey::from_secret(signing_secret)),
             decoding_key: Arc::new(DecodingKey::from_secret(signing_secret)),
             access_validation: Arc::new(token_validation(ACCESS_TOKEN_AUDIENCE)),
             put_validation: Arc::new(token_validation(PUT_TOKEN_AUDIENCE)),
             watch_checkpoint_validation: Arc::new(watch_checkpoint_validation()),
+            index_page_validation: Arc::new(index_page_validation()),
             signing_key_fingerprint: JwtSigningKeyFingerprint(blake3::derive_key(
                 JWT_SIGNING_KEY_FINGERPRINT_CONTEXT,
                 signing_secret,
             )),
+            personaldb_witness_seed: Arc::new(personaldb_witness_seed),
         })
     }
 
@@ -389,6 +400,15 @@ impl JwtManager {
     /// The secret itself is never retained in cluster control state.
     pub(crate) fn signing_key_fingerprint(&self) -> JwtSigningKeyFingerprint {
         self.signing_key_fingerprint
+    }
+
+    pub(crate) fn personaldb_witness_pkcs8_der(&self) -> Result<Vec<u8>, AuthenticationError> {
+        use ed25519_dalek::pkcs8::EncodePrivateKey;
+
+        ed25519_dalek::SigningKey::from_bytes(self.personaldb_witness_seed.as_ref())
+            .to_pkcs8_der()
+            .map(|document| document.as_bytes().to_vec())
+            .map_err(|error| AuthenticationError::SigningKeyFile(error.to_string()))
     }
 
     /// Mints a one-hour access token after durable credentials have already
@@ -506,6 +526,49 @@ impl JwtManager {
         })
     }
 
+    /// Sign one purpose-separated, non-expiring index continuation. Its
+    /// definition version, immutable generation, and Zanzibar revision bound
+    /// useful validity; generation retention eventually makes it unservable.
+    pub(crate) fn seal_index_page_token(
+        &self,
+        claims: &IndexPageTokenClaims,
+    ) -> Result<Vec<u8>, String> {
+        if !claims.has_valid_envelope() {
+            return Err("index page claims are invalid".into());
+        }
+        encode(
+            &Header::new(Algorithm::HS256),
+            claims,
+            self.encoding_key.as_ref(),
+        )
+        .map(String::into_bytes)
+        .map_err(|error| format!("index page token could not be encoded: {error}"))
+    }
+
+    /// Verify signature and the dedicated JWT audience before the index
+    /// service compares caller, definition, query, and cursor claims.
+    pub(crate) fn open_index_page_token(
+        &self,
+        token: &[u8],
+    ) -> Result<IndexPageTokenClaims, String> {
+        let token = std::str::from_utf8(token)
+            .map_err(|_| "index page token is not a UTF-8 JWT".to_owned())?;
+        let claims = decode::<IndexPageTokenClaims>(
+            token,
+            self.decoding_key.as_ref(),
+            self.index_page_validation.as_ref(),
+        )
+        .map_err(|error| format!("index page token could not be verified: {error}"))?
+        .claims;
+        if claims.aud != INDEX_PAGE_TOKEN_AUDIENCE
+            || claims.purpose != INDEX_PAGE_TOKEN_PURPOSE
+            || !claims.has_valid_envelope()
+        {
+            return Err("index page token has the wrong audience, purpose, or format".into());
+        }
+        Ok(claims)
+    }
+
     /// Verifies exactly one bearer token and installs its immutable caller on
     /// the tonic request. Apply this only to protected services; token exchange
     /// remains a separate unauthenticated service boundary.
@@ -582,6 +645,15 @@ fn watch_checkpoint_validation() -> Validation {
     validation.validate_exp = false;
     validation.set_required_spec_claims(&["aud"]);
     validation.set_audience(&[CHECKPOINT_AUDIENCE]);
+    validation
+}
+
+fn index_page_validation() -> Validation {
+    let mut validation = Validation::new(Algorithm::HS256);
+    validation.leeway = 0;
+    validation.validate_exp = false;
+    validation.set_required_spec_claims(&["aud"]);
+    validation.set_audience(&[INDEX_PAGE_TOKEN_AUDIENCE]);
     validation
 }
 
@@ -956,6 +1028,22 @@ mod tests {
             ))
         );
         assert_ne!(first.signing_key_fingerprint().0, [0; 32]);
+    }
+
+    #[test]
+    fn personaldb_witness_key_is_cluster_stable_and_domain_separated() {
+        let first = JwtManager::new(TEST_SIGNING_SECRET).unwrap();
+        let same = JwtManager::new(TEST_SIGNING_SECRET).unwrap();
+        let other = JwtManager::new(b"fedcba9876543210fedcba9876543210").unwrap();
+
+        assert_eq!(
+            first.personaldb_witness_pkcs8_der().unwrap(),
+            same.personaldb_witness_pkcs8_der().unwrap()
+        );
+        assert_ne!(
+            first.personaldb_witness_pkcs8_der().unwrap(),
+            other.personaldb_witness_pkcs8_der().unwrap()
+        );
     }
 
     #[cfg(unix)]

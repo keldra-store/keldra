@@ -3,6 +3,7 @@ syntax = "proto3";
 package anvil.cluster_peer.v1;
 
 import "anvil.proto";
+import "personaldb.proto";
 
 // Versioned identity and placement binding shared by every cluster operation.
 // The authenticated source is still established by mandatory mTLS; these
@@ -228,6 +229,8 @@ message LocalListRequest {
   string prefix = 6;
   optional string start_after = 7;
   uint32 limit = 8;
+  bool include_index_definitions = 9;
+  bool include_personaldb_objects = 10;
 }
 
 message LocalListPage {
@@ -419,9 +422,42 @@ message CoordinateSystemGrantResponse {
   bytes receipt_json = 2;
 }
 
+message CoordinatePersonalDbAuthorizationRequest {
+  PeerContext peer = 1;
+  uint64 stable_tenant_id = 2;
+  string storage_tenant = 3;
+  string owner_app_id = 4;
+}
+
+message CoordinatePersonalDbAuthorizationResponse {
+  uint32 schema_version = 1;
+  uint64 authorization_revision = 2;
+  bool replayed = 3;
+}
+
 message RouteInvokeProgramRequest {
   PeerContext peer = 1;
   anvil.v1.InvokeProgramRequest request = 2;
+}
+
+message RoutePersonalDbExchangeRequest {
+  PeerContext peer = 1;
+  anvil.v1.PersonalDbExchangeRequest request = 2;
+}
+
+message RoutePersonalDbGrantLeaderLeaseRequest {
+  PeerContext peer = 1;
+  anvil.v1.PersonalDbGrantLeaderLeaseRequest request = 2;
+}
+
+message RoutePersonalDbRenewLeaderLeaseRequest {
+  PeerContext peer = 1;
+  anvil.v1.PersonalDbRenewLeaderLeaseRequest request = 2;
+}
+
+message RoutePersonalDbWitnessCommitRequest {
+  PeerContext peer = 1;
+  anvil.v1.PersonalDbWitnessCommitRequest request = 2;
 }
 
 message ProgramStagePathRequest {
@@ -461,6 +497,121 @@ message ProgramPathFinalizationApplied {
   bool replayed = 3;
 }
 
+// Narrow internal route for one immutable index artifact or CAS current
+// pointer. The authenticated caller must be this index's current weighted-HRW
+// builder. Bytes remain on the ordinary upload-source node and the destination
+// enters the normal object coordinator pipeline.
+message PublishIndexArtifactRequest {
+  PeerContext peer = 1;
+  string storage_tenant = 2;
+  string bucket = 3;
+  uint64 tenant_id = 4;
+  uint64 bucket_id = 5;
+  uint64 index_id = 6;
+  string exact_path = 7;
+  bytes blob_blake3 = 8;
+  uint64 blob_length = 9;
+  optional uint64 expected_version = 10;
+  string command_id = 11;
+}
+
+message IndexArtifactPublished {
+  uint32 schema_version = 1;
+  uint64 version = 2;
+  bool replayed = 3;
+}
+
+// Deletes exactly one obsolete immutable generation artifact through the
+// ordinary DeleteIfVersion path. `current` and definitions are never valid.
+message DeleteIndexArtifactRequest {
+  PeerContext peer = 1;
+  string storage_tenant = 2;
+  string bucket = 3;
+  uint64 tenant_id = 4;
+  uint64 bucket_id = 5;
+  uint64 index_id = 6;
+  string exact_path = 7;
+  uint64 expected_version = 8;
+  string command_id = 9;
+}
+
+message IndexArtifactDeleted {
+  uint32 schema_version = 1;
+  uint64 version = 2;
+  bool replayed = 3;
+}
+
+message AllIndexDefinitionHeads {}
+
+message IndexGenerationHeads {
+  uint64 tenant_id = 1;
+  uint64 bucket_id = 2;
+  uint64 index_id = 3;
+}
+
+message IndexSourceObjectHeads {
+  uint64 tenant_id = 1;
+  uint64 bucket_id = 2;
+  string path_prefix = 3;
+}
+
+// A bounded current-head scan with exactly three legal scopes. Reserved
+// discovery remains limited to definitions or one numeric index generation.
+message ScanIndexHeadsRequest {
+  PeerContext peer = 1;
+  optional string cursor = 2;
+  oneof scope {
+    AllIndexDefinitionHeads definitions = 3;
+    IndexGenerationHeads generation = 4;
+    IndexSourceObjectHeads source_objects = 5;
+  }
+}
+
+message IndexHeadScanPage {
+  uint32 schema_version = 1;
+  uint64 source_node_id = 2;
+  bytes source_epoch = 3;
+  uint64 placement_term = 4;
+  uint64 placement_index = 5;
+  repeated bytes heads_json = 6;
+  optional string next_cursor = 7;
+}
+
+// One decoded, signed public continuation. The public JWT itself is verified
+// by ingress; the destination independently verifies the original bearer and
+// requires this Zanzibar revision to remain current before returning results.
+message RoutedIndexQueryResume {
+  uint64 generation = 1;
+  bytes last_position = 2;
+  uint64 authorization_revision = 3;
+}
+
+// A one-hop request to exactly one current weighted-HRW query replica. No
+// Caller or authorization decision crosses the wire. The original access JWT
+// is carried in gRPC metadata and verified again by the destination.
+message RouteIndexQueryRequest {
+  PeerContext peer = 1;
+  uint64 tenant_id = 2;
+  uint64 bucket_id = 3;
+  anvil.v1.IndexDefinition definition = 4;
+  anvil.v1.IndexQuery query = 5;
+  uint32 limit = 6;
+  optional RoutedIndexQueryResume resume = 7;
+}
+
+// Raw generation results. Public page tokens are minted only by public ingress
+// after its own final authorization pass; replicas return engine positions.
+message RoutedIndexQueryResponse {
+  uint32 schema_version = 1;
+  repeated anvil.v1.IndexQueryHit hits = 2;
+  anvil.v1.IndexFreshness freshness = 3;
+  optional bytes next_position = 4;
+  // The peer-routing fence is distinct from freshness. Freshness retains the
+  // fence under which the returned generation was built.
+  uint64 routing_placement_term = 5;
+  uint64 routing_placement_index = 6;
+}
+
 // This service is installed only on Anvil's mandatory-mTLS peer listener.
 // It exposes typed logical operations, never RocksDB keys, column-family
 // values, or a generic public-method tunnel.
@@ -489,6 +640,11 @@ service ClusterPeer {
   rpc RouteDelete(RouteDeleteRequest) returns (anvil.v1.MutationReceipt);
   rpc RouteDeleteIfVersion(RouteDeleteIfVersionRequest) returns (anvil.v1.MutationReceipt);
   rpc RouteBulkWrite(RouteBulkWriteRequest) returns (anvil.v1.BulkWriteResponse);
+  // Dedicated mandatory-mTLS routes for an in-process trusted adapter. The
+  // internal capability is reconstructed at the destination and is never a
+  // protobuf field or caller-controlled metadata value.
+  rpc RouteInternalDeleteIfVersion(RouteDeleteIfVersionRequest) returns (anvil.v1.MutationReceipt);
+  rpc RouteInternalBulkWrite(RouteBulkWriteRequest) returns (anvil.v1.BulkWriteResponse);
   rpc RouteProvisionTenant(RouteProvisionTenantRequest) returns (anvil.v1.ProvisionTenantResponse);
   rpc RouteCreateBucket(RouteCreateBucketRequest) returns (anvil.v1.CreateBucketResponse);
   rpc RouteCredentialExchange(RouteCredentialExchangeRequest) returns (anvil.v1.AccessToken);
@@ -498,6 +654,10 @@ service ClusterPeer {
   rpc RouteAdminSetBucketVersioning(RouteAdminSetBucketVersioningRequest) returns (anvil.v1.SetBucketVersioningResponse);
   rpc RouteAdminChangeApplicationRole(RouteAdminChangeApplicationRoleRequest) returns (anvil.v1.ApplicationRoleResponse);
   rpc RouteInvokeProgram(RouteInvokeProgramRequest) returns (anvil.v1.InvokeProgramResponse);
+  rpc RoutePersonalDbExchange(RoutePersonalDbExchangeRequest) returns (anvil.v1.PersonalDbExchangeResponse);
+  rpc RoutePersonalDbGrantLeaderLease(RoutePersonalDbGrantLeaderLeaseRequest) returns (anvil.v1.PersonalDbGrantLeaderLeaseResponse);
+  rpc RoutePersonalDbRenewLeaderLease(RoutePersonalDbRenewLeaderLeaseRequest) returns (anvil.v1.PersonalDbRenewLeaderLeaseResponse);
+  rpc RoutePersonalDbWitnessCommit(RoutePersonalDbWitnessCommitRequest) returns (anvil.v1.PersonalDbWitnessCommitResponse);
   rpc RouteAuthzPutSchema(RouteAuthzPutSchemaRequest) returns (anvil.v1.PutSchemaResponse);
   rpc RouteAuthzBindSchema(RouteAuthzBindSchemaRequest) returns (anvil.v1.BindSchemaResponse);
   rpc RouteAuthzGetBinding(RouteAuthzGetBindingRequest) returns (anvil.v1.GetBindingResponse);
@@ -513,7 +673,13 @@ service ClusterPeer {
   rpc CoordinateProgramPathFinalization(ProgramCoordinatePathFinalizationRequest) returns (ProgramCoordinatedPathFinalization);
   rpc ApplyProgramPathFinalization(ProgramApplyPathFinalizationRequest) returns (ProgramPathFinalizationApplied);
 
+  rpc PublishIndexArtifact(PublishIndexArtifactRequest) returns (IndexArtifactPublished);
+  rpc DeleteIndexArtifact(DeleteIndexArtifactRequest) returns (IndexArtifactDeleted);
+  rpc ScanIndexHeads(ScanIndexHeadsRequest) returns (IndexHeadScanPage);
+  rpc RouteIndexQuery(RouteIndexQueryRequest) returns (RoutedIndexQueryResponse);
+
   rpc CoordinateLogicalRecord(CoordinateLogicalRecordRequest) returns (CoordinateLogicalRecordResponse);
   rpc ReadCoordinatedLogicalRecord(CoordinatedLogicalReadRequest) returns (CoordinatedLogicalReadResponse);
   rpc CoordinateSystemGrant(CoordinateSystemGrantRequest) returns (CoordinateSystemGrantResponse);
+  rpc CoordinatePersonalDbAuthorization(CoordinatePersonalDbAuthorizationRequest) returns (CoordinatePersonalDbAuthorizationResponse);
 }

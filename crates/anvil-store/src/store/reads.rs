@@ -57,6 +57,87 @@ impl Store {
         limit: usize,
         mut is_local_rank_zero: impl FnMut(u64, u64, &str) -> bool,
     ) -> Result<ListObjectsPage, MutationError> {
+        self.list_local_owned_objects_with_scope(
+            tenant_id,
+            bucket_id,
+            prefix,
+            start_after,
+            limit,
+            ReservedListScope::Public,
+            &mut is_local_rank_zero,
+        )
+    }
+
+    /// Narrow internal scan for immutable index definitions only.
+    ///
+    /// This deliberately cannot enumerate any other reserved namespace.
+    pub fn list_local_owned_index_definitions(
+        &self,
+        tenant_id: u64,
+        bucket_id: u64,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+        mut is_local_rank_zero: impl FnMut(u64, u64, &str) -> bool,
+    ) -> Result<ListObjectsPage, MutationError> {
+        if !valid_index_definition_prefix(prefix)
+            || start_after.is_some_and(|path| !is_index_definition_path(path))
+        {
+            return Err(MutationError::InvalidObjectMutation(
+                "index-definition listing is restricted to its exact reserved namespace".into(),
+            ));
+        }
+        self.list_local_owned_objects_with_scope(
+            tenant_id,
+            bucket_id,
+            prefix,
+            start_after,
+            limit,
+            ReservedListScope::IndexDefinitions,
+            &mut is_local_rank_zero,
+        )
+    }
+
+    /// Narrow internal scan for PersonalDB's one reserved ordinary-object
+    /// namespace. No other `_anvil` path is made visible.
+    pub fn list_local_owned_personaldb_objects(
+        &self,
+        tenant_id: u64,
+        bucket_id: u64,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+        mut is_local_rank_zero: impl FnMut(u64, u64, &str) -> bool,
+    ) -> Result<ListObjectsPage, MutationError> {
+        if !prefix.starts_with(PERSONALDB_PREFIX)
+            || start_after.is_some_and(|path| !path.starts_with(PERSONALDB_PREFIX))
+        {
+            return Err(MutationError::InvalidObjectMutation(
+                "PersonalDB listing is restricted to its exact reserved namespace".into(),
+            ));
+        }
+        self.list_local_owned_objects_with_scope(
+            tenant_id,
+            bucket_id,
+            prefix,
+            start_after,
+            limit,
+            ReservedListScope::PersonalDb,
+            &mut is_local_rank_zero,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn list_local_owned_objects_with_scope(
+        &self,
+        tenant_id: u64,
+        bucket_id: u64,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+        reserved_scope: ReservedListScope,
+        is_local_rank_zero: &mut impl FnMut(u64, u64, &str) -> bool,
+    ) -> Result<ListObjectsPage, MutationError> {
         let limit = limit.min(MAX_LIST_OBJECTS);
         if limit == 0 {
             return Ok(ListObjectsPage {
@@ -95,7 +176,7 @@ impl Store {
                 .map_err(storage_error)?;
             let head = serde_json::from_slice::<Head>(&encoded_head).map_err(storage_error)?;
             if head.deleted
-                || contains_reserved_anvil_segment(path)
+                || (contains_reserved_anvil_segment(path) && !reserved_scope.allows(path))
                 || start_after.is_some_and(|cursor| path <= cursor)
                 || !is_local_rank_zero(tenant_id, bucket_id, path)
             {
@@ -573,4 +654,42 @@ impl Store {
         let selection = self.select_batch_get(requests).await;
         self.read_batch_get_selection(selection).await
     }
+}
+
+const INDEX_DEFINITION_PREFIX: &str = "_anvil/indexes/definitions/";
+const PERSONALDB_PREFIX: &str = "_anvil/personaldb/v0/";
+
+#[derive(Clone, Copy)]
+enum ReservedListScope {
+    Public,
+    IndexDefinitions,
+    PersonalDb,
+}
+
+impl ReservedListScope {
+    fn allows(self, path: &str) -> bool {
+        match self {
+            Self::Public => false,
+            Self::IndexDefinitions => is_index_definition_path(path),
+            Self::PersonalDb => path.starts_with(PERSONALDB_PREFIX),
+        }
+    }
+}
+
+fn valid_index_definition_prefix(prefix: &str) -> bool {
+    prefix
+        .strip_prefix(INDEX_DEFINITION_PREFIX)
+        .is_some_and(|suffix| !suffix.contains('/') && !suffix.contains('\0'))
+}
+
+fn is_index_definition_path(path: &str) -> bool {
+    path.strip_prefix(INDEX_DEFINITION_PREFIX)
+        .is_some_and(|name| {
+            !name.is_empty()
+                && name != "."
+                && name != ".."
+                && !name.contains('/')
+                && !name.contains('\0')
+                && !name.chars().any(char::is_control)
+        })
 }

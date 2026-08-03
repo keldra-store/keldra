@@ -26,10 +26,11 @@ use uuid::Uuid;
 
 use crate::cluster_peer::{
     ClusterPeerService, LateBoundDistributedControl, LateBoundFreshAuthorization,
-    RoutedAuthzHandlers, RoutedPublicHandlers,
+    RoutedAuthzHandlers, RoutedIndexQueryHandlers, RoutedPersonalDbHandlers, RoutedPublicHandlers,
 };
 use crate::data_peer::{DataPeerService, DataPeerTransport};
 use crate::distributed_list::LateBoundListAuthorizer;
+use crate::index_runtime::publication::LateBoundIndexArtifactPublication;
 use crate::join_peer::{
     JoinActivationGate, JoinBootstrapPins, JoinPeerService, JoinPeerTransport, TypedAddHandoff,
 };
@@ -70,6 +71,9 @@ pub(crate) struct PeerRuntime {
     distributed_control: LateBoundDistributedControl,
     name_resolution: LateBoundLogicalNameResolution,
     program_quiescence: LateBoundProgramQuiescence,
+    index_artifacts: LateBoundIndexArtifactPublication,
+    routed_index_queries: RoutedIndexQueryHandlers,
+    routed_personaldb: RoutedPersonalDbHandlers,
     join_transport: Option<JoinPeerTransport>,
     bootstrap_pins: Option<Arc<JoinBootstrapPins>>,
     clear_pins_on_drop: bool,
@@ -433,6 +437,18 @@ impl PeerRuntime {
         self.program_quiescence.clone()
     }
 
+    pub(crate) fn index_artifacts(&self) -> LateBoundIndexArtifactPublication {
+        self.index_artifacts.clone()
+    }
+
+    pub(crate) fn routed_index_query_handlers(&self) -> RoutedIndexQueryHandlers {
+        self.routed_index_queries.clone()
+    }
+
+    pub(crate) fn routed_personaldb_handlers(&self) -> RoutedPersonalDbHandlers {
+        self.routed_personaldb.clone()
+    }
+
     pub(crate) fn join_transport(&self) -> Option<JoinPeerTransport> {
         self.join_transport.clone()
     }
@@ -544,6 +560,9 @@ impl PeerRuntime {
             self.fresh_authorization.clone(),
             self.distributed_control.clone(),
             self.name_resolution.clone(),
+            self.index_artifacts.clone(),
+            self.routed_index_queries.clone(),
+            self.routed_personaldb.clone(),
             self.routed_public_handlers.clone(),
             self.routed_authz_handlers.clone(),
         )
@@ -656,6 +675,9 @@ async fn open_with_identity(
             distributed_control: LateBoundDistributedControl::default(),
             name_resolution: LateBoundLogicalNameResolution::default(),
             program_quiescence: LateBoundProgramQuiescence::default(),
+            index_artifacts: LateBoundIndexArtifactPublication::default(),
+            routed_index_queries: RoutedIndexQueryHandlers::default(),
+            routed_personaldb: RoutedPersonalDbHandlers::default(),
             join_transport,
             bootstrap_pins,
             clear_pins_on_drop: true,

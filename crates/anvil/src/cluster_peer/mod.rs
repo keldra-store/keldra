@@ -9,7 +9,10 @@ mod admission;
 mod authz;
 mod authz_transport;
 mod control;
+mod index_artifacts;
+mod index_queries;
 mod logical_names;
+mod personaldb;
 mod programs;
 mod public_authz;
 mod public_authz_transport;
@@ -24,6 +27,7 @@ use anvil_consensus::{CommittedPeerPinProvider, DecisionRaft, NodeId};
 use anvil_store::Store;
 
 use crate::distributed_list::AuthoritativeListAuthorizer;
+use crate::index_runtime::publication::LateBoundIndexArtifactPublication;
 use crate::logical_name_resolution::LateBoundLogicalNameResolution;
 
 pub(crate) mod wire {
@@ -32,6 +36,12 @@ pub(crate) mod wire {
 
 pub(crate) use authz::LateBoundFreshAuthorization;
 pub(crate) use control::LateBoundDistributedControl;
+pub(crate) use index_artifacts::{IndexCurrentHead, IndexHeadScanPage, IndexHeadScanScope};
+pub(crate) use index_queries::{
+    AuthorizedIndexQueryHandler, LocalIndexQueryExecutor, LocalIndexQueryRequest,
+    RoutedIndexQueryHandlers, RoutedIndexQueryRequest,
+};
+pub(crate) use personaldb::{RoutedPersonalDbHandler, RoutedPersonalDbHandlers};
 pub(crate) use public_authz::{RoutedAuthzHandler, RoutedAuthzHandlers};
 pub(crate) use routing::{RoutedCall, RoutedPublicHandler, RoutedPublicHandlers};
 pub(crate) use transport::ClusterPeerTransport;
@@ -51,6 +61,9 @@ pub(crate) struct ClusterPeerService {
     fresh_authorization: LateBoundFreshAuthorization,
     distributed_control: LateBoundDistributedControl,
     name_resolution: LateBoundLogicalNameResolution,
+    index_artifacts: LateBoundIndexArtifactPublication,
+    routed_index_queries: RoutedIndexQueryHandlers,
+    routed_personaldb: RoutedPersonalDbHandlers,
     routed: RoutedPublicHandlers,
     routed_authz: RoutedAuthzHandlers,
 }
@@ -68,6 +81,9 @@ impl ClusterPeerService {
         fresh_authorization: LateBoundFreshAuthorization,
         distributed_control: LateBoundDistributedControl,
         name_resolution: LateBoundLogicalNameResolution,
+        index_artifacts: LateBoundIndexArtifactPublication,
+        routed_index_queries: RoutedIndexQueryHandlers,
+        routed_personaldb: RoutedPersonalDbHandlers,
         routed: RoutedPublicHandlers,
         routed_authz: RoutedAuthzHandlers,
     ) -> Self {
@@ -80,6 +96,9 @@ impl ClusterPeerService {
             fresh_authorization,
             distributed_control,
             name_resolution,
+            index_artifacts,
+            routed_index_queries,
+            routed_personaldb,
             routed,
             routed_authz,
         }

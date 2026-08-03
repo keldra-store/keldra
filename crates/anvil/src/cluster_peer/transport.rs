@@ -2,8 +2,11 @@ use std::time::Duration;
 
 use anvil_api::v1::{
     BucketPolicy as ApiBucketPolicy, BulkWriteRequest, BulkWriteResponse, DeleteIfVersionRequest,
-    DeleteRequest, DeleteVersionRequest, DeleteVersionResponse, MutationReceipt, PutToken,
-    SetBucketPolicyRequest,
+    DeleteRequest, DeleteVersionRequest, DeleteVersionResponse, MutationReceipt,
+    PersonalDbExchangeRequest, PersonalDbExchangeResponse, PersonalDbGrantLeaderLeaseRequest,
+    PersonalDbGrantLeaderLeaseResponse, PersonalDbRenewLeaderLeaseRequest,
+    PersonalDbRenewLeaderLeaseResponse, PersonalDbWitnessCommitRequest,
+    PersonalDbWitnessCommitResponse, PutToken, SetBucketPolicyRequest,
 };
 use anvil_consensus::{DecisionRaft, NodeId};
 use anvil_store::{
@@ -30,6 +33,9 @@ use crate::distributed_watch::{
     ClusterWatchSources, DistributedWatchScope, WatchSourceError, WatchSourcePage,
     WatchSourceQuery, WatchSourceStatus,
 };
+use crate::index_runtime::publication::{
+    IndexArtifactDelete, IndexArtifactOutcome, IndexArtifactPublish,
+};
 use crate::logical_record_distribution::LogicalRecordReplicaTransport;
 use crate::reference_delivery::{ReferenceProofPeers, ReferenceProofRead};
 
@@ -43,6 +49,142 @@ pub(crate) struct ClusterPeerTransport {
 impl ClusterPeerTransport {
     pub(crate) fn new(data: DataPeerTransport, decisions: DecisionRaft) -> Self {
         Self { data, decisions }
+    }
+
+    pub(crate) async fn publish_index_artifact(
+        &self,
+        target: NodeId,
+        address: &str,
+        request: &IndexArtifactPublish,
+    ) -> Result<IndexArtifactOutcome, Status> {
+        let placement = self.placement()?;
+        let response = self
+            .client(target, address)?
+            .publish_index_artifact(wire::PublishIndexArtifactRequest {
+                peer: Some(self.context(placement.fence(), 0, MAX_CLUSTER_OPERATION_TIME)?),
+                storage_tenant: request.storage_tenant.clone(),
+                bucket: request.bucket.clone(),
+                tenant_id: request.tenant_id,
+                bucket_id: request.bucket_id,
+                index_id: request.index_id,
+                exact_path: request.exact_path.clone(),
+                blob_blake3: request.blob.hash.to_vec(),
+                blob_length: request.blob.length,
+                expected_version: request.expected_version.map(|version| version.0),
+                command_id: request.command_id.clone(),
+            })
+            .await?
+            .into_inner();
+        require_response_schema(response.schema_version)?;
+        nonzero_artifact_outcome(response.version, response.replayed)
+    }
+
+    pub(crate) async fn delete_index_artifact(
+        &self,
+        target: NodeId,
+        address: &str,
+        request: &IndexArtifactDelete,
+    ) -> Result<IndexArtifactOutcome, Status> {
+        let placement = self.placement()?;
+        let response = self
+            .client(target, address)?
+            .delete_index_artifact(wire::DeleteIndexArtifactRequest {
+                peer: Some(self.context(placement.fence(), 0, MAX_CLUSTER_OPERATION_TIME)?),
+                storage_tenant: request.storage_tenant.clone(),
+                bucket: request.bucket.clone(),
+                tenant_id: request.tenant_id,
+                bucket_id: request.bucket_id,
+                index_id: request.index_id,
+                exact_path: request.exact_path.clone(),
+                expected_version: request.expected_version.0,
+                command_id: request.command_id.clone(),
+            })
+            .await?
+            .into_inner();
+        require_response_schema(response.schema_version)?;
+        nonzero_artifact_outcome(response.version, response.replayed)
+    }
+
+    pub(crate) async fn scan_index_heads(
+        &self,
+        target: NodeId,
+        address: &str,
+        scope: super::IndexHeadScanScope,
+        cursor: Option<&anvil_store::ObjectRecordCursor>,
+    ) -> Result<super::IndexHeadScanPage, Status> {
+        let placement = self.placement()?;
+        let fence = placement.fence();
+        let scope = match scope {
+            super::IndexHeadScanScope::Definitions => {
+                wire::scan_index_heads_request::Scope::Definitions(wire::AllIndexDefinitionHeads {})
+            }
+            super::IndexHeadScanScope::Generation {
+                tenant_id,
+                bucket_id,
+                index_id,
+            } => wire::scan_index_heads_request::Scope::Generation(wire::IndexGenerationHeads {
+                tenant_id,
+                bucket_id,
+                index_id,
+            }),
+            super::IndexHeadScanScope::SourceObjects {
+                tenant_id,
+                bucket_id,
+                path_prefix,
+            } => {
+                wire::scan_index_heads_request::Scope::SourceObjects(wire::IndexSourceObjectHeads {
+                    tenant_id,
+                    bucket_id,
+                    path_prefix,
+                })
+            }
+        };
+        let response = self
+            .client(target, address)?
+            .scan_index_heads(wire::ScanIndexHeadsRequest {
+                peer: Some(self.context(fence, 0, MAX_CLUSTER_OPERATION_TIME)?),
+                cursor: cursor.map(|cursor| cursor.as_token().to_owned()),
+                scope: Some(scope),
+            })
+            .await?
+            .into_inner();
+        require_response_schema(response.schema_version)?;
+        if response.source_node_id != target.0
+            || response.placement_term != fence.term
+            || response.placement_index != fence.index
+        {
+            return Err(Status::data_loss(
+                "index head scan source or placement fence differs from the request",
+            ));
+        }
+        let source_epoch: [u8; 32] = response
+            .source_epoch
+            .try_into()
+            .map_err(|_| Status::data_loss("index head scan source epoch has the wrong length"))?;
+        let source_node = u16::try_from(response.source_node_id)
+            .map_err(|_| Status::data_loss("index head scan source node exceeds u16"))?;
+        let heads = response
+            .heads_json
+            .iter()
+            .map(|encoded| decode_json::<super::IndexCurrentHead>(encoded))
+            .collect::<Result<Vec<_>, _>>()?;
+        for head in &heads {
+            validate_index_head(head)?;
+        }
+        let next_cursor = response
+            .next_cursor
+            .map(anvil_store::ObjectRecordCursor::from_token)
+            .transpose()
+            .map_err(|error| Status::data_loss(error.to_string()))?;
+        Ok(super::IndexHeadScanPage {
+            source: SourceId {
+                node_id: source_node,
+                source_epoch,
+            },
+            placement_fence: fence,
+            heads,
+            next_cursor,
+        })
     }
 
     pub(crate) async fn apply_schema_publication(
@@ -170,6 +312,132 @@ impl ClusterPeerTransport {
         Ok(self
             .client(target, address)?
             .route_bulk_write(request)
+            .await?
+            .into_inner())
+    }
+
+    pub(crate) async fn route_internal_delete_if_version(
+        &self,
+        target: NodeId,
+        address: &str,
+        bearer: &str,
+        value: DeleteIfVersionRequest,
+        remaining: Duration,
+    ) -> Result<MutationReceipt, Status> {
+        let fence = self.placement()?.fence();
+        let mut request = Request::new(wire::RouteDeleteIfVersionRequest {
+            peer: Some(self.context(fence, 1, remaining)?),
+            request: Some(value),
+        });
+        add_bearer_and_timeout(&mut request, bearer, remaining)?;
+        Ok(self
+            .client(target, address)?
+            .route_internal_delete_if_version(request)
+            .await?
+            .into_inner())
+    }
+
+    pub(crate) async fn route_internal_bulk_write(
+        &self,
+        target: NodeId,
+        address: &str,
+        bearer: &str,
+        value: BulkWriteRequest,
+        remaining: Duration,
+    ) -> Result<BulkWriteResponse, Status> {
+        let fence = self.placement()?.fence();
+        let mut request = Request::new(wire::RouteBulkWriteRequest {
+            peer: Some(self.context(fence, 1, remaining)?),
+            request: Some(value),
+        });
+        add_bearer_and_timeout(&mut request, bearer, remaining)?;
+        Ok(self
+            .client(target, address)?
+            .route_internal_bulk_write(request)
+            .await?
+            .into_inner())
+    }
+
+    pub(crate) async fn route_personaldb_exchange(
+        &self,
+        target: NodeId,
+        address: &str,
+        bearer: &str,
+        value: PersonalDbExchangeRequest,
+        remaining: Duration,
+    ) -> Result<PersonalDbExchangeResponse, Status> {
+        let fence = self.placement()?.fence();
+        let mut request = Request::new(wire::RoutePersonalDbExchangeRequest {
+            peer: Some(self.context(fence, 1, remaining)?),
+            request: Some(value),
+        });
+        add_bearer_and_timeout(&mut request, bearer, remaining)?;
+        Ok(self
+            .client(target, address)?
+            .route_personal_db_exchange(request)
+            .await?
+            .into_inner())
+    }
+
+    pub(crate) async fn route_personaldb_grant_leader_lease(
+        &self,
+        target: NodeId,
+        address: &str,
+        bearer: &str,
+        value: PersonalDbGrantLeaderLeaseRequest,
+        remaining: Duration,
+    ) -> Result<PersonalDbGrantLeaderLeaseResponse, Status> {
+        let fence = self.placement()?.fence();
+        let mut request = Request::new(wire::RoutePersonalDbGrantLeaderLeaseRequest {
+            peer: Some(self.context(fence, 1, remaining)?),
+            request: Some(value),
+        });
+        add_bearer_and_timeout(&mut request, bearer, remaining)?;
+        Ok(self
+            .client(target, address)?
+            .route_personal_db_grant_leader_lease(request)
+            .await?
+            .into_inner())
+    }
+
+    pub(crate) async fn route_personaldb_renew_leader_lease(
+        &self,
+        target: NodeId,
+        address: &str,
+        bearer: &str,
+        value: PersonalDbRenewLeaderLeaseRequest,
+        remaining: Duration,
+    ) -> Result<PersonalDbRenewLeaderLeaseResponse, Status> {
+        let fence = self.placement()?.fence();
+        let mut request = Request::new(wire::RoutePersonalDbRenewLeaderLeaseRequest {
+            peer: Some(self.context(fence, 1, remaining)?),
+            request: Some(value),
+        });
+        add_bearer_and_timeout(&mut request, bearer, remaining)?;
+        Ok(self
+            .client(target, address)?
+            .route_personal_db_renew_leader_lease(request)
+            .await?
+            .into_inner())
+    }
+
+    pub(crate) async fn route_personaldb_witness_commit(
+        &self,
+        target: NodeId,
+        address: &str,
+        bearer: &str,
+        value: PersonalDbWitnessCommitRequest,
+        remaining: Duration,
+    ) -> Result<PersonalDbWitnessCommitResponse, Status> {
+        let fence = self.placement()?.fence();
+        let mut request = Request::new(wire::RoutePersonalDbWitnessCommitRequest {
+            peer: Some(self.context(fence, 1, remaining)?),
+            request: Some(value),
+        });
+        add_bearer_and_timeout(&mut request, bearer, remaining)?;
+        Ok(self
+            .client(target, address)?
+            .route_personal_db_witness_commit(request)
             .await?
             .into_inner())
     }
@@ -436,6 +704,39 @@ impl ClusterPeerTransport {
         decode_json(&response.receipt_json)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn coordinate_personaldb_authorization(
+        &self,
+        target: NodeId,
+        address: &str,
+        stable_tenant_id: u64,
+        storage_tenant: &str,
+        owner_app_id: &str,
+        remaining: Duration,
+    ) -> Result<(anvil_store::AuthzRevision, bool), Status> {
+        let fence = self.placement()?.fence();
+        let response = self
+            .client(target, address)?
+            .coordinate_personal_db_authorization(wire::CoordinatePersonalDbAuthorizationRequest {
+                peer: Some(self.context(fence, 0, remaining)?),
+                stable_tenant_id,
+                storage_tenant: storage_tenant.to_owned(),
+                owner_app_id: owner_app_id.to_owned(),
+            })
+            .await?
+            .into_inner();
+        require_response_schema(response.schema_version)?;
+        if response.authorization_revision == 0 {
+            return Err(Status::data_loss(
+                "PersonalDB authorization bootstrap returned a zero revision",
+            ));
+        }
+        Ok((
+            anvil_store::AuthzRevision(response.authorization_revision),
+            response.replayed,
+        ))
+    }
+
     pub(super) fn placement(&self) -> Result<ClusterPlacement, Status> {
         let state = self
             .decisions
@@ -621,6 +922,8 @@ impl ClusterListPeers for ClusterPeerTransport {
             start_after: query.start_after().map(str::to_owned),
             limit: u32::try_from(query.limit())
                 .map_err(|_| Status::invalid_argument("list limit exceeds u32"))?,
+            include_index_definitions: query.includes_index_definitions(),
+            include_personaldb_objects: query.includes_personaldb_objects(),
         });
         add_bearer_and_timeout(
             &mut request,
@@ -767,6 +1070,33 @@ fn decode_optional<T: serde::de::DeserializeOwned>(
             "typed peer response presence flag and value disagree",
         )),
     }
+}
+
+fn nonzero_artifact_outcome(version: u64, replayed: bool) -> Result<IndexArtifactOutcome, Status> {
+    if version == 0 {
+        return Err(Status::data_loss(
+            "index artifact mutation returned a zero version",
+        ));
+    }
+    Ok(IndexArtifactOutcome {
+        version: VersionId(version),
+        replayed,
+    })
+}
+
+fn validate_index_head(head: &super::IndexCurrentHead) -> Result<(), Status> {
+    if head.tenant_id == 0
+        || head.bucket_id == 0
+        || head.exact_path.is_empty()
+        || head.head.version.0 == 0
+        || head.head.version != head.version.id
+        || head.head.deleted != head.version.deleted
+    {
+        return Err(Status::data_loss(
+            "index head scan returned an invalid current-head snapshot",
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn add_bearer_and_timeout<T>(

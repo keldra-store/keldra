@@ -76,6 +76,24 @@ impl AuthoritativeSystemAuthorization {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
+        self.allows_objects_with_evidence(caller, requests)
+            .await
+            .map(|result| result.allowed)
+    }
+
+    /// The same exact-then-bucket evaluation as [`Self::allows_objects`], plus
+    /// the authoritative revision that must bind index pagination and result
+    /// filtering. This never accepts an ingress-supplied revision.
+    pub(crate) async fn allows_objects_with_evidence(
+        &self,
+        caller: &Caller,
+        requests: &[(ObjectKey, ObjectPermission)],
+    ) -> Result<FreshAuthorizationResult, Status> {
+        if requests.is_empty() {
+            return Err(Status::invalid_argument(
+                "authorization check batch must not be empty",
+            ));
+        }
         let mut exact = Vec::with_capacity(requests.len());
         let mut fallback = Vec::with_capacity(requests.len());
         for (key, permission) in requests {
@@ -94,7 +112,7 @@ impl AuthoritativeSystemAuthorization {
             .fresh_system_checks(AuthzConsistency::Latest, exact, bindings.clone())
             .await?;
         if first.allowed.iter().all(|allowed| *allowed) {
-            return Ok(first.allowed);
+            return Ok(first);
         }
 
         let denied = first
@@ -110,11 +128,22 @@ impl AuthoritativeSystemAuthorization {
                 bindings,
             )
             .await?;
+        if second.revision != first.revision
+            || second.binding_generation != first.binding_generation
+        {
+            return Err(Status::unavailable(
+                "authorization view changed while applying bucket fallbacks",
+            ));
+        }
         let mut allowed = first.allowed;
         for ((index, _), bucket_allowed) in denied.into_iter().zip(second.allowed) {
             allowed[index] = bucket_allowed;
         }
-        Ok(allowed)
+        Ok(FreshAuthorizationResult {
+            allowed,
+            revision: first.revision,
+            binding_generation: first.binding_generation,
+        })
     }
 
     pub(crate) async fn allows_object(
@@ -162,6 +191,80 @@ impl AuthoritativeSystemAuthorization {
     ) -> Result<FreshAuthorizationResult, Status> {
         self.fresh_system_checks(AuthzConsistency::Latest, vec![check], Vec::new())
             .await
+    }
+
+    /// Fresh check in one customer tenant's ordinary Zanzibar replica group.
+    /// PersonalDB uses a fixed tenant realm and database-group object; no
+    /// database assignment or authorization result is persisted in Raft.
+    pub(crate) async fn fresh_tenant_check(
+        &self,
+        stable_tenant_id: u64,
+        scope: AuthzScope,
+        check: AuthorizationCheck,
+    ) -> Result<FreshAuthorizationResult, Status> {
+        self.fresh_tenant_checks(stable_tenant_id, scope, vec![check])
+            .await
+    }
+
+    pub(crate) async fn fresh_tenant_checks(
+        &self,
+        stable_tenant_id: u64,
+        scope: AuthzScope,
+        checks: Vec<AuthorizationCheck>,
+    ) -> Result<FreshAuthorizationResult, Status> {
+        if checks.is_empty() {
+            return Err(Status::invalid_argument(
+                "authorization check batch must not be empty",
+            ));
+        }
+        let placement = self.placement()?;
+        let fence = placement.fence();
+        let group = MutableRecordReplicaGroup::select(
+            PlacementKind::ZanzibarRealm,
+            placement.cluster_id(),
+            &stable_tenant_id.to_be_bytes(),
+            placement.placement_nodes(),
+        )
+        .ok_or_else(|| Status::unavailable("cluster has no tenant Zanzibar replica"))?;
+        let coordinator = group.coordinator();
+        let result = if coordinator == self.local_node {
+            let (allowed, revision, binding_generation) = self
+                .zanzibar
+                .fresh_checks_with_generation(
+                    stable_tenant_id,
+                    scope,
+                    AuthzConsistency::Latest,
+                    checks.clone(),
+                )
+                .await?;
+            FreshAuthorizationResult {
+                allowed,
+                revision,
+                binding_generation,
+            }
+        } else {
+            let address = placement.address(coordinator).ok_or_else(|| {
+                Status::unavailable("tenant Zanzibar coordinator has no current peer address")
+            })?;
+            self.peers
+                .fresh_authorization_checks(
+                    coordinator,
+                    &address.0,
+                    stable_tenant_id,
+                    &scope,
+                    AuthzConsistency::Latest,
+                    &checks,
+                    &[],
+                    fence,
+                )
+                .await?
+        };
+        if self.placement()?.fence() != fence {
+            return Err(Status::unavailable(
+                "authorization placement changed during the request",
+            ));
+        }
+        Ok(result)
     }
 
     async fn stable_bucket_bindings(
@@ -281,6 +384,23 @@ impl AuthoritativeSystemAuthorization {
             .map_err(|_| Status::unavailable("applied cluster membership is unavailable"))?;
         ClusterPlacement::from_applied(&state)
             .map_err(|error| Status::unavailable(error.to_string()))
+    }
+}
+
+#[tonic::async_trait]
+impl crate::index_service::IndexAuthorization for AuthoritativeSystemAuthorization {
+    async fn allows_objects_with_evidence(
+        &self,
+        caller: &Caller,
+        requests: &[(ObjectKey, ObjectPermission)],
+    ) -> Result<crate::index_service::IndexAuthorizationEvidence, Status> {
+        let evidence =
+            AuthoritativeSystemAuthorization::allows_objects_with_evidence(self, caller, requests)
+                .await?;
+        Ok(crate::index_service::IndexAuthorizationEvidence {
+            allowed: evidence.allowed,
+            revision: evidence.revision.0,
+        })
     }
 }
 
