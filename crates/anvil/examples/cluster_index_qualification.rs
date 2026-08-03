@@ -239,7 +239,7 @@ async fn wait_for_queries(
         for client in clients.iter_mut() {
             match client.query_index(request.clone()).await {
                 Ok(response) => responses.push(response.into_inner()),
-                Err(status) if retryable(status.code()) => {
+                Err(status) if retryable(&status) => {
                     last = status.to_string();
                     responses.clear();
                     break;
@@ -391,14 +391,14 @@ fn request(case: &EngineCase) -> QueryIndexRequest {
     }
 }
 
-fn retryable(code: tonic::Code) -> bool {
+fn retryable(status: &tonic::Status) -> bool {
     matches!(
-        code,
+        status.code(),
         tonic::Code::Unavailable
             | tonic::Code::DeadlineExceeded
             | tonic::Code::NotFound
             | tonic::Code::FailedPrecondition
-    )
+    ) || (status.code() == tonic::Code::Cancelled && status.message() == "Timeout expired")
 }
 
 fn engine_cases() -> Vec<EngineCase> {
@@ -649,4 +649,25 @@ fn required(name: &str) -> TestResult<String> {
 
 fn invalid(message: impl Into<String>) -> Box<dyn Error + Send + Sync> {
     Box::new(io::Error::other(message.into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::retryable;
+
+    #[test]
+    fn retryable_statuses_include_only_transport_timeout_cancellation() {
+        assert!(retryable(&tonic::Status::unavailable("try another node")));
+        assert!(retryable(&tonic::Status::deadline_exceeded(
+            "request deadline exceeded"
+        )));
+        assert!(retryable(&tonic::Status::cancelled("Timeout expired")));
+
+        assert!(!retryable(&tonic::Status::cancelled(
+            "caller cancelled request"
+        )));
+        assert!(!retryable(&tonic::Status::invalid_argument(
+            "invalid query"
+        )));
+    }
 }
