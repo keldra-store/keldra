@@ -25,6 +25,10 @@ use crate::{
     types::{MAX_RAFT_NODE_ID, MembershipTransitionKind, NodeState},
 };
 
+const DECISION_HEARTBEAT_INTERVAL_MILLIS: u64 = 500;
+const DECISION_ELECTION_TIMEOUT_MIN_MILLIS: u64 = 2_000;
+const DECISION_ELECTION_TIMEOUT_MAX_MILLIS: u64 = 3_000;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 // The response is part of OpenRaft's persisted protocol. Boxing one variant
 // merely to reduce the enum's stack size would change its released encoding.
@@ -738,15 +742,7 @@ impl DecisionRaft {
         };
         let store = DurableStore::open(path, storage_config, node_id)?;
         let machine = Arc::new(Mutex::new(load_machine(&store)?));
-        let config = openraft::Config {
-            cluster_name: "anvil-decisions".into(),
-            max_payload_entries: 64,
-            snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(256),
-            max_in_snapshot_log_to_keep: 64,
-            ..Default::default()
-        }
-        .validate()
-        .map_err(|error| DecisionRaftError::Configuration(error.to_string()))?;
+        let config = decision_raft_config()?;
         let raft = openraft::Raft::new(
             node_id,
             Arc::new(config),
@@ -1008,6 +1004,21 @@ impl DecisionRaft {
             .await
             .map_err(|error| DecisionRaftError::Unavailable(error.to_string()))
     }
+}
+
+fn decision_raft_config() -> Result<openraft::Config, DecisionRaftError> {
+    openraft::Config {
+        cluster_name: "anvil-decisions".into(),
+        heartbeat_interval: DECISION_HEARTBEAT_INTERVAL_MILLIS,
+        election_timeout_min: DECISION_ELECTION_TIMEOUT_MIN_MILLIS,
+        election_timeout_max: DECISION_ELECTION_TIMEOUT_MAX_MILLIS,
+        max_payload_entries: 64,
+        snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(256),
+        max_in_snapshot_log_to_keep: 64,
+        ..Default::default()
+    }
+    .validate()
+    .map_err(|error| DecisionRaftError::Configuration(error.to_string()))
 }
 
 fn load_machine(store: &DurableStore) -> Result<MachineState, DecisionRaftError> {
@@ -1291,6 +1302,15 @@ mod snapshot_compatibility_tests {
     use openraft::Membership;
 
     use super::*;
+
+    #[test]
+    fn production_consensus_timing_has_docker_and_fsync_margin() {
+        let config = decision_raft_config().unwrap();
+
+        assert_eq!(config.heartbeat_interval, 500);
+        assert_eq!(config.election_timeout_min, 2_000);
+        assert_eq!(config.election_timeout_max, 3_000);
+    }
 
     #[test]
     fn snapshot_wire_migrates_raw_v050_and_enveloped_pre_cluster_control_state() {
