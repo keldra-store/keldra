@@ -2,7 +2,8 @@
 
 The official Rust client for Anvil. It provides authenticated object upload
 helpers and the complete generated Anvil 0.5 protocol, including object,
-authorization, administration, cluster-wide index, and PersonalDB v0 clients.
+authorization, administration, and cluster-wide index clients. PersonalDB
+support follows in the 0.5.3 capability release.
 
 ## Install
 
@@ -95,8 +96,7 @@ println!("published version: {}", receipt.version);
 ```
 
 All generated clients and messages are available under `anvil_storage::v1`,
-including `index_service_client::IndexServiceClient` and
-`personal_db_service_client::PersonalDbServiceClient`. Use `connect_channel`
-to share a transport and the public `BearerToken` interceptor to authenticate
-those generated clients. `object_client`, `authz_client`, and
+including `index_service_client::IndexServiceClient`. Use `connect_channel` to
+share a transport and the public `BearerToken` interceptor to authenticate
+generated clients. `object_client`, `authz_client`, and
 `administration_client` provide concise constructors for the core services.

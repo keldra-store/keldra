@@ -20,9 +20,8 @@ All workspace packages currently share version `0.5.2`:
 
 Anvil 0.5.2 runs as one flat cluster of capacity-weighted nodes with native
 on-disk state, cluster-managed mTLS between peers, cluster-wide derived
-indexes, and a PersonalDB v0 service over ordinary Anvil objects. It does not
-require an external metadata database, external PKI, or a second storage
-system.
+indexes, and no external metadata database, external PKI, or second storage
+system. PersonalDB is staged as the following 0.5.3 capability release.
 
 ## Local Validation
 

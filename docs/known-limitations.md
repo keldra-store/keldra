@@ -2,85 +2,19 @@
 
 ## Request deadline coverage in 0.5.2
 
-Index and PersonalDB unary requests use one absolute deadline: the shorter of
-the client `grpc-timeout` and the startup-configured 30-second maximum. That
-same remaining budget is propagated across object and peer calls. The maximum
-is deliberately not a transport-wide timeout because `Put` and `WatchPrefix`
-are long-lived streams. Local authorization, administration, and credential
-unary requests still rely on their client or external TLS terminator to supply
-a deadline in 0.5.2; extending the shared deadline wrapper to those existing
+Index unary requests use one absolute deadline: the shorter of the client
+`grpc-timeout` and the startup-configured 30-second maximum. That same
+remaining budget is propagated across object and peer calls. The maximum is
+deliberately not a transport-wide timeout because `Put` and `WatchPrefix` are
+long-lived streams. Local authorization, administration, and credential unary
+requests still rely on their client or external TLS terminator to supply a
+deadline in 0.5.2; extending the shared deadline wrapper to those existing
 services is deferred.
 
-## Minimum PersonalDB transport in 0.5.2
+## PersonalDB availability
 
-PersonalDB 0.5.2 runs the canonical PersonalDB v0 server state machine on the
-weighted-HRW primary for each database group. Its manifests, heads, log
-entries, certificates, payloads, and snapshots are ordinary Anvil objects
-below `_anvil/personaldb/v0/`; they use the normal inline or erasure-coded byte
-path and `REPLICATED` acknowledgement. There is no PersonalDB side store.
-
-The public session transport is a unary gRPC exchange carrying PersonalDB's
-canonical JSON `WireFrame`. The separate `GrantLeaderLease`,
-`RenewLeaderLease`, and `WitnessCommit` RPCs expose the canonical v0
-coordinator boundary with PersonalDB's own JSON types; Anvil does not maintain
-a second protocol schema. The exchange returns every response and notification
-frame produced for the initiating request in order. It does not yet retain a
-connection-level session directory across calls or push a broadcast to other
-connected clients. Clients can use normal catch-up requests to observe later
-commits; live cross-session subscription delivery is deferred.
-
-Every database-scoped exchange, catch-up, lease operation, and commit witness
-hydrates the predecessor-linked committed log from ordinary Anvil objects
-before it acts. Membership and the latest lease authority are retained together
-as one ordinary replicated object. A restart on the same primary restores that
-authority before granting, renewing, or witnessing. When HRW moves the group to
-another primary, the old authority is restored only as a monotonic floor: the
-former primary's lease cannot be renewed or used there, and a fresh grant
-advances the client-log epoch.
-
-The minimum coordinator boundary relies on the active server's exact lease ID,
-placement epoch, client-log epoch, lease generation, expiry, membership, and
-predecessor-linked committed head. Witness certificates are signed with the
-production Ed25519 witness key and verified during hydration. PersonalDB v0
-leader leases and voter acknowledgements themselves are not signed artifacts
-in this release, so 0.5.2 claims the configured single-client
-`StrictWitnessed` profile, not a cryptographic multi-client quorum protocol.
-
-Authorization is fresh Zanzibar evaluation in the caller's tenant realm named
-`personaldb`, using the PersonalDB v0 group permissions (`open`, `sync`,
-`witness_sensitive_submit`, `snapshot`, `attach`, and `administer`). Each check
-accepts either an exact
-`database_group:<stable bucket id>:<canonical database id>` grant or the
-tenant-wide `personaldb_tenant:<stable tenant id>` authority installed for the
-tenant owner during provisioning. The latter lets the owner create and
-administer new groups without pre-registering every database ID; applications
-can later receive narrower exact-group grants. A remotely routed request is
-checked at ingress and checked again at its mTLS destination. Because the
-canonical artifacts use the ordinary object pipeline, the caller also needs
-the corresponding object permissions on the selected bucket in this release.
-Row/resource changeset authorization beyond the v0 group-level hook is not
-added by Anvil 0.5.2.
-
-Every request names the bucket holding that database group's artifacts. Anvil
-does not add a separate authoritative database-to-bucket registry in 0.5.2.
-The same canonical database ID in another bucket is an independent group with
-independent placement, artifact history, and exact Zanzibar grants because its
-stable bucket ID is part of each identity.
-
-The production witness key is deterministically, domain-separately derived
-from the cluster-wide JWT signing secret whose fingerprint is already fenced
-in Raft. JWT signing-key rotation is not exposed in 0.5.2; a future rotation
-capability must retain the former PersonalDB public trust record while stored
-certificates can still reference it.
-
-The canonical PersonalDB v0 committed log contains an opaque SQLite changeset,
-its content metadata, hashes, log position, and certificate. It does not expose
-canonical row metadata or bind a row to an ordinary Anvil source object path
-and version. Anvil does not parse those opaque changesets or invent a second
-row feed in 0.5.2. Creating or updating a PersonalDB row-metadata index is
-therefore rejected as `UNIMPLEMENTED`; its retained engine format requires a
-non-zero ordinary source object path and version before any result can cross
-the public Zanzibar authorization boundary.
+PersonalDB is not part of the 0.5.2 index capability release. Its public
+protocol integration is staged for 0.5.3.
 
 ## Minimum index engines in 0.5.2
 
@@ -193,12 +127,6 @@ that guarantee on a one-node cluster, but rejects the first binding with
 rebound and used normally across the cluster. A later capability must add one
 bounded cross-Zanzibar operation before enabling first binding on multi-node
 clusters; 0.5.1 does not weaken the atomic ownership guarantee.
-
-The built-in `personaldb` tenant realm added in 0.5.2 is a narrow exception:
-tenant provisioning installs its fixed schema, first binding, tenant-owner
-tuple, and protected-system ownership grant through a deterministic journaled
-bootstrap. This does not provide a generic multi-node first-binding operation
-for caller-defined realms.
 
 ## Cluster lifecycle operations in 0.5.1
 

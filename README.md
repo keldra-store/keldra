@@ -35,16 +35,15 @@ surface includes authenticated object/CAS/bulk operations, immutable and
 explicit bootstrap and credential exchange, recoverable atomic-program
 invocation, and bounded resumable `WatchPrefix`.
 
-The 0.5.2 capability release adds cluster-wide derived indexes and the
-PersonalDB v0 protocol. Each index has one weighted-HRW builder and up to three
-weighted-HRW query replicas. Builders publish immutable generations through
-Anvil's ordinary object path, while query replicas materialize those files in
-a shared bounded memory/disk cache. The usable index kinds are path,
-object-head metadata, typed JSON, full text, exact vector, hybrid, Git source,
-and tensor. Queries return the latest available generation with source-checkpoint
-freshness evidence. PersonalDB selects a weighted-HRW primary independently for
-each database group and stores its canonical artifacts as ordinary replicated
-Anvil objects. The release is published as one AMD64/ARM64 container tag.
+The 0.5.2 capability release adds cluster-wide derived indexes. Each index has
+one weighted-HRW builder and up to three weighted-HRW query replicas. Builders
+publish immutable generations through Anvil's ordinary object path, while
+query replicas materialize those files in a shared bounded memory/disk cache.
+The usable index kinds are path, object-head metadata, typed JSON, full text,
+exact vector, hybrid, Git source, and tensor. Queries return the latest
+available generation with source-checkpoint freshness evidence. PersonalDB is
+the next capability release, planned for 0.5.3. The 0.5.2 release is published
+as one AMD64/ARM64 container tag.
 
 ## Deliberate 0.5 break
 
@@ -71,7 +70,6 @@ Export data through the old release and import it into a new 0.5 store.
 | Invalidations | `WatchPrefix` | Bounded unordered at-least-once notice to reread current state |
 | Authorization | schemas, realms, tuples, checks and typed administration | Zanzibar evaluation at one explicit current revision |
 | Derived indexes | `CreateIndex`, `UpdateIndex`, `GetIndex`, `ListIndexes`, `DeleteIndex`, `QueryIndex` | One immutable cluster-wide generation queried by an HRW-selected replica, with explicit freshness evidence |
-| PersonalDB | canonical PersonalDB v0 `Exchange`, leader-lease and witnessed-commit operations | Per-database-group HRW primary over ordinary replicated Anvil objects |
 | Workflows | application-owned saga | External-service coordination |
 
 Uploading an MP3 through `StartPut` and streaming `Put` is an ordinary blob

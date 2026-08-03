@@ -2,7 +2,7 @@
 name = "anvil-storage"
 version.workspace = true
 edition.workspace = true
-description = "Authenticated Rust client for Anvil objects, indexes, and PersonalDB"
+description = "Authenticated Rust client for Anvil objects and indexes"
 rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
