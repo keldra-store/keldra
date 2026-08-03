@@ -99,6 +99,16 @@ pub struct ServingLeaseState {
 #[derive(Clone, Default)]
 pub struct ServingLeaseIssuer {
     cutover: Arc<tokio::sync::Mutex<ServingLeaseCutover>>,
+    grant_fence: Arc<tokio::sync::RwLock<()>>,
+}
+
+/// RAII write fence that prevents every transient serving-lease grant.
+///
+/// Acquiring the fence waits for a grant already being formed to finish. A
+/// membership handoff can therefore begin its fixed expiry wait only after no
+/// further old-placement grant can escape.
+pub struct ServingLeaseGrantPause {
+    _guard: tokio::sync::OwnedRwLockWriteGuard<()>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -226,6 +236,13 @@ impl ServingLeaseIssuer {
         Self::default()
     }
 
+    /// Stop new lease grants until the returned guard is dropped.
+    pub async fn pause_grants(&self) -> ServingLeaseGrantPause {
+        ServingLeaseGrantPause {
+            _guard: self.grant_fence.clone().write_owned().await,
+        }
+    }
+
     /// Obtain a quorum-backed grant and withhold it until the fixed cutover
     /// wait for this exact leader term and placement has elapsed.
     pub async fn grant(
@@ -233,6 +250,10 @@ impl ServingLeaseIssuer {
         raft: &DecisionRaft,
         request: ServingLeaseRequest,
     ) -> Result<ServingLeaseGrant, ServingLeaseError> {
+        // Hold this read fence across both the quorum proof and response
+        // formation. Once `pause_grants` returns, every earlier grant has
+        // completed and no later grant can begin.
+        let _grant = self.grant_fence.clone().read_owned().await;
         let grant = raft.grant_serving_lease(request).await?;
         let now = BootTimeInstant::now()?;
         let identity = ServingLeaseIssuerIdentity {
@@ -392,6 +413,41 @@ pub enum ServingLeaseError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn grant_pause_blocks_later_grants_until_drop() {
+        let issuer = ServingLeaseIssuer::new();
+        let pause = issuer.pause_grants().await;
+        let fence = issuer.grant_fence.clone();
+        let blocked = tokio::spawn(async move { fence.read_owned().await });
+
+        tokio::task::yield_now().await;
+        assert!(!blocked.is_finished());
+        drop(pause);
+
+        tokio::time::timeout(Duration::from_secs(1), blocked)
+            .await
+            .expect("grant fence remained blocked after the pause ended")
+            .expect("grant-fence task panicked");
+    }
+
+    #[tokio::test]
+    async fn grant_pause_waits_for_an_existing_grant() {
+        let issuer = ServingLeaseIssuer::new();
+        let grant = issuer.grant_fence.clone().read_owned().await;
+        let pausing_issuer = issuer.clone();
+        let blocked = tokio::spawn(async move { pausing_issuer.pause_grants().await });
+
+        tokio::task::yield_now().await;
+        assert!(!blocked.is_finished());
+        drop(grant);
+
+        let pause = tokio::time::timeout(Duration::from_secs(1), blocked)
+            .await
+            .expect("pause did not acquire after the existing grant ended")
+            .expect("grant-pause task panicked");
+        drop(pause);
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stale_quorum_proof_cannot_emit_a_grant() {

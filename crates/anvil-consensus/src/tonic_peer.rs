@@ -50,10 +50,18 @@ pub type TonicRaftPeerServer = wire::raft_peer_server::RaftPeerServer<TonicRaftP
 
 impl TonicRaftPeerService {
     pub fn new(raft: DecisionRaft, pins: Arc<dyn CommittedPeerPinProvider>) -> Self {
+        Self::with_serving_lease_issuer(raft, pins, ServingLeaseIssuer::new())
+    }
+
+    pub fn with_serving_lease_issuer(
+        raft: DecisionRaft,
+        pins: Arc<dyn CommittedPeerPinProvider>,
+        serving_leases: ServingLeaseIssuer,
+    ) -> Self {
         Self {
             raft,
             pins,
-            serving_leases: ServingLeaseIssuer::new(),
+            serving_leases,
         }
     }
 
