@@ -277,6 +277,53 @@ cmp "${ANVIL_QUALIFICATION_DIR}/artifacts/cas.txt" \
   "${ANVIL_QUALIFICATION_DIR}/artifacts/cas-read.txt"
 echo "[anvil-qualification] cross-node CAS test passed"
 
+list_secret=qualification-list-secret-00000000000000000000000
+provision_tenant qlist qlist-client "${list_secret}"
+create_bucket anvil-3 qlist-client "${list_secret}" objects
+printf 'cluster-list\n' >"${ANVIL_QUALIFICATION_DIR}/artifacts/list.txt"
+chmod 0444 "${ANVIL_QUALIFICATION_DIR}/artifacts/list.txt"
+for item in alpha bravo charlie delta; do
+  case "${item}" in
+    alpha) list_node=anvil-1 ;;
+    bravo) list_node=anvil-2 ;;
+    charlie|delta) list_node=anvil-3 ;;
+  esac
+  run_cli "${list_node}" qlist-client "${list_secret}" \
+    put qlist objects "prefix/${item}.txt" /qualification/artifacts/list.txt \
+    --command-id "qlist-${item}" --durability replicated >/dev/null
+done
+expected_list=$'prefix/alpha.txt\nprefix/bravo.txt\nprefix/charlie.txt\nprefix/delta.txt'
+for list_node in anvil-1 anvil-2 anvil-3; do
+  actual_list="$(run_cli "${list_node}" qlist-client "${list_secret}" \
+    list qlist objects --prefix prefix/ --limit 100)"
+  if [[ "${actual_list}" != "${expected_list}" ]]; then
+    echo "${list_node} returned an incorrect distributed lexical list" >&2
+    printf 'expected:\n%s\nactual:\n%s\n' "${expected_list}" "${actual_list}" >&2
+    exit 1
+  fi
+done
+page_one="$(run_cli anvil-2 qlist-client "${list_secret}" \
+  list qlist objects --prefix prefix/ --limit 2 2>/dev/null)"
+page_two="$(run_cli anvil-1 qlist-client "${list_secret}" \
+  list qlist objects --prefix prefix/ --start-after prefix/bravo.txt --limit 2)"
+if [[ "${page_one}" != $'prefix/alpha.txt\nprefix/bravo.txt' \
+  || "${page_two}" != $'prefix/charlie.txt\nprefix/delta.txt' ]]; then
+  echo "distributed ListObjects pagination is incorrect" >&2
+  exit 1
+fi
+echo "[anvil-qualification] distributed listing and pagination test passed"
+
+watch_paths="$(run_cli anvil-3 qlist-client "${list_secret}" \
+  watch qlist objects --prefix prefix/ --retained --events 4 \
+  --idle-timeout-seconds 30 \
+  | cut -f2 | sort)"
+if [[ "${watch_paths}" != "${expected_list}" ]]; then
+  echo "distributed WatchPrefix did not replay the four retained paths" >&2
+  printf 'expected:\n%s\nactual:\n%s\n' "${expected_list}" "${watch_paths}" >&2
+  exit 1
+fi
+echo "[anvil-qualification] distributed retained watch test passed"
+
 ec_secret=qualification-ec-secret-0000000000000000000000000
 provision_tenant qec qec-client "${ec_secret}"
 create_bucket anvil-3 qec-client "${ec_secret}" objects
