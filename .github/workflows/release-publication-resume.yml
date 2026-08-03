@@ -146,7 +146,8 @@ jobs:
           generate_release_notes: true
           make_latest: true
           body: |
-            Anvil 0.5 is a breaking release of the minimal versioned object server.
+            Anvil 0.5.2 adds cluster-wide derived indexes and PersonalDB v0 to
+            the clustered versioned-object and atomic-program server.
 
             - Image: `${{ steps.image.outputs.image }}`
             - Manifest digest: `${{ steps.image.outputs.digest }}`

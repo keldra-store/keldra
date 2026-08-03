@@ -10,17 +10,19 @@
 
 ## Workspace
 
-All workspace packages currently share version `0.5.1`:
+All workspace packages currently share version `0.5.2`:
 
 - server, CLI, and Rust client: `anvil-server`, `anvil-storage-cli`, and
   `anvil-storage`;
 - core crates: `anvil-api`, `anvil-authz`, `anvil-atomic-program`,
-  `anvil-consensus`, and `anvil-store`;
+  `anvil-consensus`, `anvil-index`, and `anvil-store`;
 - qualification tooling: `anvil-osv-qualification`.
 
-Anvil 0.5.1 runs as one flat cluster of capacity-weighted nodes with native
-on-disk state and cluster-managed mTLS between peers. It does not require an
-external metadata database, external PKI, or a second storage system.
+Anvil 0.5.2 runs as one flat cluster of capacity-weighted nodes with native
+on-disk state, cluster-managed mTLS between peers, cluster-wide derived
+indexes, and a PersonalDB v0 service over ordinary Anvil objects. It does not
+require an external metadata database, external PKI, or a second storage
+system.
 
 ## Local Validation
 
@@ -56,12 +58,12 @@ Before a release, repeat the image build and smoke test with
 ## Release
 
 The release tag must be the exact, unprefixed workspace version. After the
-validated commit is pushed, maintainers publish `0.5.1` with:
+validated commit is pushed, maintainers publish `0.5.2` with:
 
 ```sh
 validated_commit="$(git rev-parse HEAD)"
-git tag 0.5.1 "$validated_commit"
-git push origin refs/tags/0.5.1
+git tag 0.5.2 "$validated_commit"
+git push origin refs/tags/0.5.2
 ```
 
 The tag-triggered workflow reruns the static, Rust, and per-architecture image
