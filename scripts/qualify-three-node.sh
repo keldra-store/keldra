@@ -408,7 +408,7 @@ if [[ -z "${program_hash}" ]]; then
   exit 1
 fi
 run_cli anvil-2 qatomic-client "${atomic_secret}" \
-  set-policy qatomic objects --program-only atomic/ >/dev/null
+  set-policy qatomic objects --program-only atomic >/dev/null
 program_output="$(run_cli anvil-3 qatomic-client "${atomic_secret}" \
   invoke-program qatomic objects _anvil/programs/qualification@1 \
   qatomic-invocation --program-hash "${program_hash}" \
