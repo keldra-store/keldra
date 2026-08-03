@@ -6,7 +6,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anvil_atomic_program::MAX_OBJECT_PATH_BYTES;
 use anvil_authz::{ObjectRef, RealmId};
@@ -51,7 +51,7 @@ impl OriginalBearer {
     }
 
     #[cfg(test)]
-    fn from_signed_token(token: impl Into<Arc<str>>) -> Self {
+    pub(crate) fn from_signed_token(token: impl Into<Arc<str>>) -> Self {
         Self(token.into())
     }
 
@@ -180,6 +180,42 @@ pub(crate) trait AuthoritativeListAuthorizer: Send + Sync + 'static {
         bearer: &OriginalBearer,
         query: &LocalListQuery,
     ) -> Result<(), Status>;
+}
+
+/// Fail-closed startup bridge for the private listener.
+///
+/// The mandatory-mTLS listener must accept join traffic before the serving
+/// fence and authoritative Zanzibar coordinator are ready. Listing requests
+/// therefore fail immediately until that already-approved authorizer is
+/// installed; no request is queued and no authorization result is cached.
+#[derive(Clone, Default)]
+pub(crate) struct LateBoundListAuthorizer {
+    inner: Arc<OnceLock<Arc<dyn AuthoritativeListAuthorizer>>>,
+}
+
+impl LateBoundListAuthorizer {
+    pub(crate) fn install(
+        &self,
+        authorizer: Arc<dyn AuthoritativeListAuthorizer>,
+    ) -> Result<(), Arc<dyn AuthoritativeListAuthorizer>> {
+        self.inner.set(authorizer)
+    }
+}
+
+#[tonic::async_trait]
+impl AuthoritativeListAuthorizer for LateBoundListAuthorizer {
+    async fn authorize(
+        &self,
+        bearer: &OriginalBearer,
+        query: &LocalListQuery,
+    ) -> Result<(), Status> {
+        let authorizer = self
+            .inner
+            .get()
+            .cloned()
+            .ok_or_else(|| Status::unavailable("list authorization is not ready"))?;
+        authorizer.authorize(bearer, query).await
+    }
 }
 
 /// The resource-bearing permission sent to the distributed Zanzibar owner.
@@ -936,6 +972,48 @@ mod tests {
                 has_more,
             },
         )
+    }
+
+    struct AllowList;
+
+    #[tonic::async_trait]
+    impl AuthoritativeListAuthorizer for AllowList {
+        async fn authorize(
+            &self,
+            _bearer: &OriginalBearer,
+            _query: &LocalListQuery,
+        ) -> Result<(), Status> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn late_bound_authorizer_fails_closed_then_installs_once() {
+        let authorizer = LateBoundListAuthorizer::default();
+        let bearer = OriginalBearer::from_signed_token("signed.jwt");
+        let query = LocalListQuery::new(
+            PlacementLogId { term: 1, index: 2 },
+            "tenant",
+            "bucket",
+            3,
+            4,
+            "",
+            None,
+            10,
+        )
+        .unwrap();
+
+        assert_eq!(
+            authorizer
+                .authorize(&bearer, &query)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unavailable
+        );
+        assert!(authorizer.install(Arc::new(AllowList)).is_ok());
+        authorizer.authorize(&bearer, &query).await.unwrap();
+        assert!(authorizer.install(Arc::new(AllowList)).is_err());
     }
 
     #[test]

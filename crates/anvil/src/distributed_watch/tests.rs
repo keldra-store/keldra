@@ -160,6 +160,8 @@ impl ClusterWatchSources for MemorySources {
         target: NodeId,
         _address: &str,
         membership_revision: PlacementLogId,
+        _bearer: OriginalBearer,
+        _scope: DistributedWatchScope,
     ) -> Result<WatchSourceStatus, WatchSourceError> {
         let journal = self.snapshot(target)?;
         if let Some(error) = journal.failure {
@@ -176,6 +178,7 @@ impl ClusterWatchSources for MemorySources {
         &self,
         target: NodeId,
         _address: &str,
+        _bearer: OriginalBearer,
         query: WatchSourceQuery,
     ) -> Result<WatchSourcePage, WatchSourceError> {
         let journal = self.snapshot(target)?;
@@ -263,12 +266,50 @@ fn scope(prefix: &str) -> DistributedWatchScope {
     .unwrap()
 }
 
+fn bearer() -> OriginalBearer {
+    OriginalBearer::from_signed_token("test-bearer")
+}
+
 fn watch(
     placement: Arc<dyn WatchPlacementAuthority>,
     sources: Arc<MemorySources>,
     codec: Arc<MemoryCodec>,
 ) -> DistributedWatch {
     DistributedWatch::new(placement, sources, codec).with_page_size(8)
+}
+
+#[tokio::test]
+async fn retained_beginning_starts_at_each_sources_retention_floor() {
+    let placement = Arc::new(MutablePlacement::new(placement(10, &[1, 2])));
+    let sources = Arc::new(MemorySources::default());
+    sources.insert(NodeId(1), 0);
+    sources.insert(NodeId(2), 0);
+    sources.append_head(NodeId(1), "old", ObjectHeadChangeKind::Put);
+    sources.append_head(NodeId(1), "retained", ObjectHeadChangeKind::Put);
+    sources.append_head(NodeId(2), "other", ObjectHeadChangeKind::Put);
+    sources.set_floor(NodeId(1), 1);
+    let codec = Arc::new(MemoryCodec::default());
+    let watch = watch(placement, sources, codec.clone());
+
+    let checkpoint = watch
+        .start_retained_beginning(scope(""), bearer())
+        .await
+        .unwrap();
+    let claims = codec.open(&checkpoint).unwrap();
+    assert_eq!(claims.sources[0].next_offset, 2);
+    assert_eq!(claims.sources[1].next_offset, 1);
+
+    let batch = watch
+        .poll_once(scope(""), &checkpoint, bearer())
+        .await
+        .unwrap();
+    let mut paths = batch
+        .invalidations
+        .iter()
+        .map(|invalidation| invalidation.key.path())
+        .collect::<Vec<_>>();
+    paths.sort_unstable();
+    assert_eq!(paths, ["other", "retained"]);
 }
 
 #[tokio::test]
@@ -280,7 +321,10 @@ async fn checkpoint_resumes_on_another_ingress_and_delivery_is_at_least_once() {
     sources.insert(NodeId(3), 15);
     let codec = Arc::new(MemoryCodec::default());
     let first_ingress = watch(placement.clone(), sources.clone(), codec.clone());
-    let checkpoint = first_ingress.start_now(scope("docs")).await.unwrap();
+    let checkpoint = first_ingress
+        .start_now(scope("docs"), bearer())
+        .await
+        .unwrap();
 
     sources.append_head(NodeId(1), "docs/slow", ObjectHeadChangeKind::Put);
     sources.append_head(NodeId(2), "docs/fast", ObjectHeadChangeKind::Delete);
@@ -288,7 +332,7 @@ async fn checkpoint_resumes_on_another_ingress_and_delivery_is_at_least_once() {
 
     let second_ingress = watch(placement, sources, codec);
     let batch = second_ingress
-        .poll_once(scope("docs"), &checkpoint)
+        .poll_once(scope("docs"), &checkpoint, bearer())
         .await
         .unwrap();
     assert_eq!(
@@ -306,7 +350,7 @@ async fn checkpoint_resumes_on_another_ingress_and_delivery_is_at_least_once() {
 
     // Reusing the last durably stored checkpoint replays the same events.
     let replay = second_ingress
-        .poll_once(scope("docs"), &checkpoint)
+        .poll_once(scope("docs"), &checkpoint, bearer())
         .await
         .unwrap();
     assert_eq!(replay.invalidations, batch.invalidations);
@@ -314,7 +358,7 @@ async fn checkpoint_resumes_on_another_ingress_and_delivery_is_at_least_once() {
     // The newly returned vector represents every source, including the source
     // whose only event was hidden by the reserved namespace filter.
     let caught_up = second_ingress
-        .poll_once(scope("docs"), &batch.checkpoint)
+        .poll_once(scope("docs"), &batch.checkpoint, bearer())
         .await
         .unwrap();
     assert!(caught_up.invalidations.is_empty());
@@ -328,7 +372,7 @@ async fn one_required_source_failure_never_returns_a_partial_batch() {
     sources.insert(NodeId(2), 1);
     let codec = Arc::new(MemoryCodec::default());
     let watch = watch(placement, sources.clone(), codec);
-    let checkpoint = watch.start_now(scope("")).await.unwrap();
+    let checkpoint = watch.start_now(scope(""), bearer()).await.unwrap();
     sources.append_head(NodeId(1), "visible", ObjectHeadChangeKind::Put);
     sources.fail(
         NodeId(2),
@@ -336,7 +380,10 @@ async fn one_required_source_failure_never_returns_a_partial_batch() {
     );
 
     assert_eq!(
-        watch.poll_once(scope(""), &checkpoint).await.unwrap_err(),
+        watch
+            .poll_once(scope(""), &checkpoint, bearer())
+            .await
+            .unwrap_err(),
         DistributedWatchError::SourceUnavailable {
             node_id: Some(NodeId(2)),
             message: "peer is down".into(),
@@ -351,11 +398,11 @@ async fn source_epoch_or_retention_floor_loss_expires_resume() {
     sources.insert(NodeId(1), 1);
     let codec = Arc::new(MemoryCodec::default());
     let watch = watch(placement, sources.clone(), codec);
-    let epoch_checkpoint = watch.start_now(scope("")).await.unwrap();
+    let epoch_checkpoint = watch.start_now(scope(""), bearer()).await.unwrap();
     sources.set_epoch(NodeId(1), [77; 32]);
     assert_eq!(
         watch
-            .poll_once(scope(""), &epoch_checkpoint)
+            .poll_once(scope(""), &epoch_checkpoint, bearer())
             .await
             .unwrap_err(),
         DistributedWatchError::ResumeExpired
@@ -363,13 +410,13 @@ async fn source_epoch_or_retention_floor_loss_expires_resume() {
 
     sources.set_epoch(NodeId(1), [1; 32]);
     sources.append_head(NodeId(1), "one", ObjectHeadChangeKind::Put);
-    let floor_checkpoint = watch.start_now(scope("")).await.unwrap();
+    let floor_checkpoint = watch.start_now(scope(""), bearer()).await.unwrap();
     sources.append_head(NodeId(1), "two", ObjectHeadChangeKind::Put);
     sources.append_head(NodeId(1), "three", ObjectHeadChangeKind::Put);
     sources.set_floor(NodeId(1), 2);
     assert_eq!(
         watch
-            .poll_once(scope(""), &floor_checkpoint)
+            .poll_once(scope(""), &floor_checkpoint, bearer())
             .await
             .unwrap_err(),
         DistributedWatchError::ResumeExpired
@@ -385,18 +432,21 @@ async fn membership_change_requires_evidence_for_every_new_required_source() {
     sources.insert(NodeId(3), 0);
     let codec = Arc::new(MemoryCodec::default());
     let watch = watch(authority.clone(), sources, codec.clone());
-    let original = watch.start_now(scope("")).await.unwrap();
+    let original = watch.start_now(scope(""), bearer()).await.unwrap();
 
     // Reweight/same-source cutover has complete vector evidence.
     authority.set(placement(11, &[1, 2]));
-    let reweighted = watch.poll_once(scope(""), &original).await.unwrap();
+    let reweighted = watch
+        .poll_once(scope(""), &original, bearer())
+        .await
+        .unwrap();
     let reweighted_claims = codec.open(&reweighted.checkpoint).unwrap();
     assert_eq!(reweighted_claims.membership_revision, revision(11));
 
     // Removal also has evidence for every source still required.
     authority.set(placement(12, &[1]));
     let removed = watch
-        .poll_once(scope(""), &reweighted.checkpoint)
+        .poll_once(scope(""), &reweighted.checkpoint, bearer())
         .await
         .unwrap();
     assert_eq!(codec.open(&removed.checkpoint).unwrap().sources.len(), 1);
@@ -405,7 +455,7 @@ async fn membership_change_requires_evidence_for_every_new_required_source() {
     authority.set(placement(13, &[1, 3]));
     assert_eq!(
         watch
-            .poll_once(scope(""), &removed.checkpoint)
+            .poll_once(scope(""), &removed.checkpoint, bearer())
             .await
             .unwrap_err(),
         DistributedWatchError::ResumeExpired
@@ -419,17 +469,20 @@ async fn tokens_are_opaque_integrity_checked_and_bound_to_scope_and_cluster() {
     sources.insert(NodeId(1), 0);
     let codec = Arc::new(MemoryCodec::default());
     let watch = watch(authority.clone(), sources, codec);
-    let checkpoint = watch.start_now(scope("docs")).await.unwrap();
+    let checkpoint = watch.start_now(scope("docs"), bearer()).await.unwrap();
 
     let mut modified = checkpoint.clone();
     modified.push(b'x');
     assert_eq!(
-        watch.poll_once(scope("docs"), &modified).await.unwrap_err(),
+        watch
+            .poll_once(scope("docs"), &modified, bearer())
+            .await
+            .unwrap_err(),
         DistributedWatchError::InvalidCheckpoint
     );
     assert_eq!(
         watch
-            .poll_once(scope("other"), &checkpoint)
+            .poll_once(scope("other"), &checkpoint, bearer())
             .await
             .unwrap_err(),
         DistributedWatchError::InvalidCheckpoint
@@ -445,7 +498,7 @@ async fn tokens_are_opaque_integrity_checked_and_bound_to_scope_and_cluster() {
     );
     assert_eq!(
         watch
-            .poll_once(scope("docs"), &checkpoint)
+            .poll_once(scope("docs"), &checkpoint, bearer())
             .await
             .unwrap_err(),
         DistributedWatchError::InvalidCheckpoint
@@ -463,7 +516,7 @@ async fn cutover_during_collection_fails_instead_of_returning_old_partial_state(
     let watch = watch(authority, sources, codec);
 
     assert_eq!(
-        watch.start_now(scope("")).await.unwrap_err(),
+        watch.start_now(scope(""), bearer()).await.unwrap_err(),
         DistributedWatchError::MembershipChanged
     );
 }
@@ -527,6 +580,8 @@ async fn malformed_filtered_page_fails_closed() {
             target: NodeId,
             _address: &str,
             revision: PlacementLogId,
+            _bearer: OriginalBearer,
+            _scope: DistributedWatchScope,
         ) -> Result<WatchSourceStatus, WatchSourceError> {
             Ok(WatchSourceStatus {
                 source_node: target,
@@ -548,6 +603,7 @@ async fn malformed_filtered_page_fails_closed() {
             &self,
             target: NodeId,
             _address: &str,
+            _bearer: OriginalBearer,
             query: WatchSourceQuery,
         ) -> Result<WatchSourcePage, WatchSourceError> {
             Ok(WatchSourcePage {
@@ -579,12 +635,12 @@ async fn malformed_filtered_page_fails_closed() {
     let good = Arc::new(MemorySources::default());
     good.insert(NodeId(1), 0);
     let checkpoint = watch(authority.clone(), good, codec.clone())
-        .start_now(scope("docs"))
+        .start_now(scope("docs"), bearer())
         .await
         .unwrap();
     let watch = DistributedWatch::new(authority, Arc::new(BadSource), codec);
     assert!(matches!(
-        watch.poll_once(scope("docs"), &checkpoint).await,
+        watch.poll_once(scope("docs"), &checkpoint, bearer()).await,
         Err(DistributedWatchError::InvalidSource {
             node_id: NodeId(1),
             ..

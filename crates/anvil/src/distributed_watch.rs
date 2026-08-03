@@ -18,6 +18,8 @@ use anvil_store::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::distributed_list::OriginalBearer;
+
 const CHECKPOINT_FORMAT: u16 = 1;
 pub(crate) const CHECKPOINT_AUDIENCE: &str = "anvil-watch-checkpoint";
 pub(crate) const CHECKPOINT_PURPOSE: &str = "anvil-watch-vector";
@@ -59,6 +61,26 @@ impl DistributedWatchScope {
             || path
                 .strip_prefix(&self.prefix)
                 .is_some_and(|suffix| suffix.starts_with('/'))
+    }
+
+    pub(crate) fn tenant(&self) -> &str {
+        &self.tenant
+    }
+
+    pub(crate) fn bucket(&self) -> &str {
+        &self.bucket
+    }
+
+    pub(crate) const fn tenant_id(&self) -> u64 {
+        self.tenant_id
+    }
+
+    pub(crate) const fn bucket_id(&self) -> u64 {
+        self.bucket_id
+    }
+
+    pub(crate) fn prefix(&self) -> &str {
+        &self.prefix
     }
 }
 
@@ -169,12 +191,15 @@ pub(crate) trait ClusterWatchSources: Send + Sync + 'static {
         target: NodeId,
         address: &str,
         membership_revision: PlacementLogId,
+        bearer: OriginalBearer,
+        scope: DistributedWatchScope,
     ) -> Result<WatchSourceStatus, WatchSourceError>;
 
     async fn read_page(
         &self,
         target: NodeId,
         address: &str,
+        bearer: OriginalBearer,
         query: WatchSourceQuery,
     ) -> Result<WatchSourcePage, WatchSourceError>;
 }
@@ -247,14 +272,38 @@ impl DistributedWatch {
     pub(crate) async fn start_now(
         &self,
         scope: DistributedWatchScope,
+        bearer: OriginalBearer,
+    ) -> Result<Vec<u8>, DistributedWatchError> {
+        self.start(scope, bearer, WatchInitialPosition::Now).await
+    }
+
+    /// Capture the first position still retained by every ACTIVE source.
+    pub(crate) async fn start_retained_beginning(
+        &self,
+        scope: DistributedWatchScope,
+        bearer: OriginalBearer,
+    ) -> Result<Vec<u8>, DistributedWatchError> {
+        self.start(scope, bearer, WatchInitialPosition::RetainedBeginning)
+            .await
+    }
+
+    async fn start(
+        &self,
+        scope: DistributedWatchScope,
+        bearer: OriginalBearer,
+        position: WatchInitialPosition,
     ) -> Result<Vec<u8>, DistributedWatchError> {
         let placement = self.current_placement()?;
         let mut tasks = tokio::task::JoinSet::new();
         for (node, address) in placement.sources.clone() {
             let sources = self.sources.clone();
             let revision = placement.membership_revision;
+            let bearer = bearer.clone();
+            let scope = scope.clone();
             tasks.spawn(async move {
-                let status = sources.status(node, &address, revision).await;
+                let status = sources
+                    .status(node, &address, revision, bearer, scope)
+                    .await;
                 (node, status)
             });
         }
@@ -277,12 +326,17 @@ impl DistributedWatch {
                 });
             }
             validate_status(node, &response.status)?;
-            let next_offset = response.status.tail.checked_add(1).ok_or_else(|| {
-                DistributedWatchError::InvalidSource {
-                    node_id: node,
-                    message: "source journal tail cannot advance".into(),
-                }
-            })?;
+            let cursor = match position {
+                WatchInitialPosition::Now => response.status.tail,
+                WatchInitialPosition::RetainedBeginning => response.status.retention_floor,
+            };
+            let next_offset =
+                cursor
+                    .checked_add(1)
+                    .ok_or_else(|| DistributedWatchError::InvalidSource {
+                        node_id: node,
+                        message: "source journal cursor cannot advance".into(),
+                    })?;
             if cursors
                 .insert(
                     node,
@@ -311,6 +365,7 @@ impl DistributedWatch {
         &self,
         scope: DistributedWatchScope,
         checkpoint: &[u8],
+        bearer: OriginalBearer,
     ) -> Result<DistributedWatchBatch, DistributedWatchError> {
         let placement = self.current_placement()?;
         let claims = self.open_checkpoint(checkpoint, &scope, placement.cluster_id)?;
@@ -319,6 +374,7 @@ impl DistributedWatch {
         for (node, address) in placement.sources.clone() {
             let cursor = cursors[&node];
             let sources = self.sources.clone();
+            let bearer = bearer.clone();
             let query = WatchSourceQuery {
                 membership_revision: placement.membership_revision,
                 expected_source: cursor.source,
@@ -327,7 +383,9 @@ impl DistributedWatch {
                 max_records: self.page_size,
             };
             tasks.spawn(async move {
-                let page = sources.read_page(node, &address, query.clone()).await;
+                let page = sources
+                    .read_page(node, &address, bearer, query.clone())
+                    .await;
                 (node, query, page)
             });
         }
@@ -420,6 +478,12 @@ impl DistributedWatch {
         validate_claim_vector(&claims)?;
         Ok(claims)
     }
+}
+
+#[derive(Clone, Copy)]
+enum WatchInitialPosition {
+    Now,
+    RetainedBeginning,
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
