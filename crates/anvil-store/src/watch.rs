@@ -293,6 +293,11 @@ impl ReferenceProof {
     pub fn offset(&self) -> u64 {
         self.change.offset()
     }
+
+    /// Canonical proof identity in source-and-offset iterator order.
+    pub fn handoff_order_key(&self) -> Vec<u8> {
+        reference_proof_key(self.source_id, self.offset()).to_vec()
+    }
 }
 
 impl LocalChange {

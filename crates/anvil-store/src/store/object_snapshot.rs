@@ -91,6 +91,32 @@ pub enum ObjectRecordExport {
 }
 
 impl ObjectRecordExport {
+    /// Canonical transfer order used by the bounded ADD-handoff merge.
+    ///
+    /// The leading byte preserves the export-domain order; the remainder is
+    /// the same stable storage identity used by the corresponding iterator.
+    /// It deliberately exposes no stored value or mutable display name.
+    pub fn handoff_order_key(&self) -> Result<Vec<u8>, ObjectSnapshotError> {
+        self.validate()?;
+        let (domain, key) = match self {
+            Self::ExactPath(record) => (
+                ObjectExportDomain::ExactPath,
+                stable_identity(record.tenant_id, record.bucket_id).head_key(&record.exact_path),
+            ),
+            Self::Receipt(mutation) => (
+                ObjectExportDomain::Receipt,
+                receipt_key(
+                    stable_identity(mutation.tenant_id, mutation.bucket_id),
+                    &mutation.command_id,
+                ),
+            ),
+        };
+        let mut ordered = Vec::with_capacity(key.len() + 1);
+        ordered.push(domain as u8);
+        ordered.extend_from_slice(&key);
+        Ok(ordered)
+    }
+
     pub fn tenant_id(&self) -> u64 {
         match self {
             Self::ExactPath(record) => record.tenant_id,

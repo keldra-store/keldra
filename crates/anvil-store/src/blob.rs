@@ -22,7 +22,7 @@ pub struct BlobRef {
 /// Timestamps are Unix milliseconds. A set [`AWAITING_PUBLISH`] bit means the
 /// initial reference is a sealed-upload reservation rather than a published
 /// immutable version.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobReferenceState {
     pub ref_count: u64,
     pub flags: u8,

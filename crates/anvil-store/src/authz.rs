@@ -93,6 +93,12 @@ impl AuthzScope {
         }
     }
 
+    /// Canonical realm-binding order used by bounded cluster handoff.
+    pub fn handoff_order_key(&self) -> Result<Vec<u8>, AuthzStoreError> {
+        self.validate()?;
+        Ok(binding_key(self))
+    }
+
     fn validate(&self) -> Result<(), AuthzStoreError> {
         self.storage_tenant.validate()?;
         RealmId::parse(self.realm.as_str())?;

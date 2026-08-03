@@ -208,6 +208,8 @@ pub struct AuthzRealmTransferManifest {
     pub format: u16,
     pub scope: AuthzScope,
     pub revision: AuthzRevision,
+    pub predecessor_revision: Option<AuthzRevision>,
+    pub mutation_fingerprint: Option<[u8; 32]>,
     pub encoded_bytes: u64,
     pub content_hash: [u8; 32],
 }
@@ -323,6 +325,12 @@ impl AuthzRepository {
             format: AUTHZ_REALM_TRANSFER_MANIFEST_FORMAT,
             scope: aggregate.scope,
             revision: aggregate.revision,
+            predecessor_revision: aggregate
+                .mutation_stamp
+                .and_then(|stamp| stamp.predecessor_revision),
+            mutation_fingerprint: aggregate
+                .mutation_stamp
+                .map(|stamp| stamp.mutation_fingerprint),
             encoded_bytes,
             content_hash,
         }))
@@ -812,6 +820,12 @@ fn canonical_manifest(
         format: AUTHZ_REALM_TRANSFER_MANIFEST_FORMAT,
         scope: aggregate.scope.clone(),
         revision: aggregate.revision,
+        predecessor_revision: aggregate
+            .mutation_stamp
+            .and_then(|stamp| stamp.predecessor_revision),
+        mutation_fingerprint: aggregate
+            .mutation_stamp
+            .map(|stamp| stamp.mutation_fingerprint),
         encoded_bytes,
         content_hash,
     })
@@ -827,6 +841,19 @@ fn validate_transfer_manifest(
         return Err(transfer_integrity(
             "unsupported format, zero revision, or empty stream",
         ));
+    }
+    match (manifest.predecessor_revision, manifest.mutation_fingerprint) {
+        (None, None) => {}
+        (predecessor, Some(fingerprint))
+            if fingerprint != [0; 32]
+                && predecessor.is_none_or(|revision| {
+                    revision != AuthzRevision::ZERO && revision < manifest.revision
+                }) => {}
+        _ => {
+            return Err(transfer_integrity(
+                "manifest has inconsistent realm lineage",
+            ));
+        }
     }
     manifest.scope.validate().map_err(transfer_integrity)
 }

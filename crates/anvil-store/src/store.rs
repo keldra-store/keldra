@@ -398,6 +398,12 @@ struct StoredReceipt {
 pub(crate) type PendingBlobReferences = BTreeMap<Vec<u8>, BlobReferenceState>;
 
 impl Store {
+    /// Configured local directory for anonymous, non-authoritative payload
+    /// work files. Callers must not create durable records in this directory.
+    pub fn payload_spool_directory(&self) -> &std::path::Path {
+        self.blobs.root()
+    }
+
     pub async fn open(options: StoreOptions) -> Result<Self> {
         WatchRetention::new(
             options.watch_retention.max_entries,
@@ -764,6 +770,7 @@ impl Store {
 }
 
 mod blob_references;
+mod payload_handoff;
 mod mutations;
 mod object_snapshot;
 mod payload;
@@ -776,10 +783,18 @@ mod watch_journal;
 pub use payload::{
     CompleteCopySealOutcome, LocalPayloadPresence, PayloadArtifactState, PayloadStoreError,
 };
+pub use payload_handoff::{
+    MAX_PAYLOAD_HANDOFF_EXPORT_RECORDS, PayloadArtifactCursor, PayloadArtifactIdentity,
+    PayloadArtifactSnapshot, PayloadArtifactSnapshotPage,
+};
 pub use object_snapshot::{
     MAX_OBJECT_RECORD_EXPORT_BYTES, MAX_OBJECT_RECORD_EXPORT_RECORDS, ObjectPathSnapshot,
     ObjectRecordCursor, ObjectRecordExport, ObjectRecordExportPage, ObjectSnapshotApplied,
     ObjectSnapshotError,
+};
+pub use reference_proofs::{
+    MAX_REFERENCE_PROOF_EXPORT_BYTES, MAX_REFERENCE_PROOF_EXPORT_RECORDS,
+    ReferenceProofCursor, ReferenceProofExportError, ReferenceProofPage,
 };
 pub use shards::{ShardIdentity, ShardReader, ShardSealOutcome, ShardStoreError};
 

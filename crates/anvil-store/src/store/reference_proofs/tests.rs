@@ -42,6 +42,41 @@ async fn stores() -> (tempfile::TempDir, Store, Store) {
     (temporary, source, replica)
 }
 
+#[tokio::test]
+async fn proof_export_enforces_record_and_byte_bounds_without_skipping() {
+    let (_temporary, source, _replica) = stores().await;
+    for (path, command) in [("page-a", "page-a"), ("page-b", "page-b")] {
+        source
+            .coordinate_object_mutation(BatchOperation::Put(put(path, command)), context())
+            .await
+            .unwrap();
+    }
+
+    let first = source
+        .export_reference_proofs(None, 1, MAX_REFERENCE_PROOF_EXPORT_BYTES)
+        .unwrap();
+    assert_eq!(first.proofs.len(), 1);
+    let cursor = first.next_cursor.as_ref().expect("one record truncated the page");
+    let second = source
+        .export_reference_proofs(Some(cursor), 1, MAX_REFERENCE_PROOF_EXPORT_BYTES)
+        .unwrap();
+    assert_eq!(second.proofs.len(), 1);
+    assert!(second.next_cursor.is_none());
+    assert_ne!(first.proofs[0], second.proofs[0]);
+
+    let required = serde_json::to_vec(&first.proofs[0]).unwrap().len() as u64;
+    assert_eq!(
+        source.export_reference_proofs(None, 1, required - 1),
+        Err(ReferenceProofExportError::RecordTooLarge {
+            required_bytes: required,
+        })
+    );
+    assert_eq!(
+        source.export_reference_proofs(None, 1, 0),
+        Err(ReferenceProofExportError::InvalidLimits)
+    );
+}
+
 fn wal_batches_since(store: &Store, sequence: u64) -> usize {
     store
         .db

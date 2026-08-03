@@ -78,6 +78,20 @@ pub struct LogicalRecordExport {
 }
 
 impl LogicalRecordExport {
+    /// Canonical transfer order shared by every bounded export stream.
+    pub fn handoff_order_key(&self) -> Result<Vec<u8>, LogicalRecordError> {
+        self.validate()?;
+        let domain = ExportDomain::for_id(&self.id);
+        let location = self.id.location()?;
+        if location.cf != domain.column_family() || !domain.matches(&location.key) {
+            return Err(storage("logical record location is not canonical"));
+        }
+        let mut ordered = Vec::with_capacity(location.key.len() + 1);
+        ordered.push(domain as u8);
+        ordered.extend_from_slice(&location.key);
+        Ok(ordered)
+    }
+
     pub fn validate(&self) -> Result<(), LogicalRecordError> {
         self.id.validate()?;
         match &self.candidate {
@@ -144,6 +158,20 @@ impl ExportDomain {
 
     fn from_byte(value: u8) -> Option<Self> {
         Self::ALL.into_iter().find(|domain| *domain as u8 == value)
+    }
+
+    fn for_id(id: &LogicalRecordId) -> Self {
+        match id {
+            LogicalRecordId::TenantNameClaim { .. } => Self::TenantNameClaim,
+            LogicalRecordId::BucketNameClaim { .. } => Self::BucketNameClaim,
+            LogicalRecordId::TenantRecord { .. } => Self::TenantRecord,
+            LogicalRecordId::BucketRecord { .. } => Self::BucketRecord,
+            LogicalRecordId::BucketOptions { .. } => Self::BucketOptions,
+            LogicalRecordId::BucketPolicy { .. } => Self::BucketPolicy,
+            LogicalRecordId::Application { .. } => Self::Application,
+            LogicalRecordId::Credential { .. } => Self::Credential,
+            LogicalRecordId::TenantSchema { .. } => Self::TenantSchema,
+        }
     }
 
     fn column_family(self) -> &'static str {
