@@ -1,0 +1,519 @@
+syntax = "proto3";
+
+package anvil.cluster_peer.v1;
+
+import "anvil.proto";
+
+// Versioned identity and placement binding shared by every cluster operation.
+// The authenticated source is still established by mandatory mTLS; these
+// fields bind that identity to the exact applied membership used by the
+// caller. hop_count is zero for replica/source operations and exactly one for
+// a routed public operation.
+message PeerContext {
+  uint32 schema_version = 1;
+  bytes cluster_id = 2;
+  uint64 source_node_id = 3;
+  uint64 placement_term = 4;
+  uint64 placement_index = 5;
+  uint32 hop_count = 6;
+  uint32 remaining_deadline_millis = 7;
+}
+
+message LogicalRecordReadRequest {
+  PeerContext peer = 1;
+  bytes id_json = 2;
+}
+
+message ResolveTenantNameRequest {
+  PeerContext peer = 1;
+  string storage_tenant = 2;
+}
+
+message ResolveTenantNameResult {
+  uint32 schema_version = 1;
+  bool present = 2;
+  uint64 tenant_id = 3;
+}
+
+message ResolveBucketNameRequest {
+  PeerContext peer = 1;
+  uint64 tenant_id = 2;
+  string bucket = 3;
+}
+
+message ResolveBucketNameResult {
+  uint32 schema_version = 1;
+  bool present = 2;
+  uint64 bucket_id = 3;
+}
+
+message LogicalRecordCandidate {
+  uint32 schema_version = 1;
+  bool present = 2;
+  bytes candidate_json = 3;
+}
+
+message LogicalRecordRepairRequest {
+  PeerContext peer = 1;
+  bytes id_json = 2;
+  bool present = 3;
+  bytes candidate_json = 4;
+}
+
+message LogicalRecordMutationRequest {
+  PeerContext peer = 1;
+  bytes mutation_json = 2;
+}
+
+message LogicalRecordApplied {
+  uint32 schema_version = 1;
+  uint64 record_version = 2;
+  bool replayed = 3;
+}
+
+message LogicalRecordSnapshotApplied {
+  uint32 schema_version = 1;
+  bool present = 2;
+  uint64 record_version = 3;
+  bool replayed = 4;
+}
+
+message SchemaPublicationApplyRequest {
+  PeerContext peer = 1;
+  uint64 stable_tenant_id = 2;
+  bytes mutation_json = 3;
+}
+
+message SchemaPublicationApplied {
+  uint32 schema_version = 1;
+  uint64 revision = 2;
+  bool replayed = 3;
+}
+
+message SchemaPublicationQueryRequest {
+  PeerContext peer = 1;
+  uint64 stable_tenant_id = 2;
+  bytes query_json = 3;
+}
+
+message RealmMutationApplyRequest {
+  PeerContext peer = 1;
+  uint64 stable_tenant_id = 2;
+  bytes mutation_json = 3;
+}
+
+message RealmMutationApplied {
+  uint32 schema_version = 1;
+  uint64 revision = 2;
+  bool replayed = 3;
+}
+
+message RealmCandidateReadRequest {
+  PeerContext peer = 1;
+  uint64 stable_tenant_id = 2;
+  bytes scope_json = 3;
+}
+
+message RealmCandidate {
+  uint32 schema_version = 1;
+  bool present = 2;
+  bytes manifest_json = 3;
+}
+
+message RealmAggregateReadRequest {
+  PeerContext peer = 1;
+  uint64 stable_tenant_id = 2;
+  bytes scope_json = 3;
+}
+
+message RealmAggregateFrame {
+  uint32 schema_version = 1;
+  uint64 offset = 2;
+  bytes content = 3;
+  bool end = 4;
+  bytes manifest_json = 5;
+}
+
+message RealmCandidateInstallFrame {
+  PeerContext peer = 1;
+  uint64 stable_tenant_id = 2;
+  bytes scope_json = 3;
+  bool present = 4;
+  bytes manifest_json = 5;
+  uint64 offset = 6;
+  bytes content = 7;
+  bool end = 8;
+}
+
+message RealmCandidateInstalled {
+  uint32 schema_version = 1;
+  uint64 revision = 2;
+  bool replayed = 3;
+  uint64 retained_receipts = 4;
+}
+
+enum AuthorizationConsistencyMode {
+  AUTHORIZATION_CONSISTENCY_LATEST = 0;
+  AUTHORIZATION_CONSISTENCY_AT_LEAST = 1;
+  AUTHORIZATION_CONSISTENCY_EXACT = 2;
+}
+
+message StableBucketBinding {
+  string storage_tenant = 1;
+  string bucket = 2;
+  uint64 expected_tenant_id = 3;
+  uint64 expected_bucket_id = 4;
+}
+
+message FreshAuthorizationCheckRequest {
+  PeerContext peer = 1;
+  uint64 stable_tenant_id = 2;
+  bytes scope_json = 3;
+  bytes check_json = 4;
+  AuthorizationConsistencyMode consistency = 5;
+  uint64 consistency_revision = 6;
+  optional StableBucketBinding stable_bucket = 7;
+}
+
+message FreshAuthorizationCheckResult {
+  uint32 schema_version = 1;
+  bool allowed = 2;
+  uint64 revision = 3;
+  uint64 binding_generation = 4;
+}
+
+message FreshAuthorizationChecksRequest {
+  PeerContext peer = 1;
+  uint64 stable_tenant_id = 2;
+  bytes scope_json = 3;
+  repeated bytes checks_json = 4;
+  AuthorizationConsistencyMode consistency = 5;
+  uint64 consistency_revision = 6;
+  repeated StableBucketBinding stable_buckets = 7;
+}
+
+message FreshAuthorizationChecksResult {
+  uint32 schema_version = 1;
+  repeated bool allowed = 2;
+  uint64 revision = 3;
+  uint64 binding_generation = 4;
+}
+
+message Exists {
+  uint32 schema_version = 1;
+  bool exists = 2;
+}
+
+message ReferenceProofReadRequest {
+  PeerContext peer = 1;
+  bytes source_id_json = 2;
+  uint64 source_offset = 3;
+  uint64 tenant_id = 4;
+  uint64 bucket_id = 5;
+  string exact_path = 6;
+}
+
+message ReferenceProofReadResponse {
+  uint32 schema_version = 1;
+  bool present = 2;
+  bytes proof_json = 3;
+}
+
+message LocalListRequest {
+  PeerContext peer = 1;
+  string tenant = 2;
+  string bucket = 3;
+  uint64 tenant_id = 4;
+  uint64 bucket_id = 5;
+  string prefix = 6;
+  optional string start_after = 7;
+  uint32 limit = 8;
+}
+
+message LocalListPage {
+  uint32 schema_version = 1;
+  uint64 source_node_id = 2;
+  uint64 placement_term = 3;
+  uint64 placement_index = 4;
+  repeated string paths = 5;
+  bool has_more = 6;
+}
+
+message WatchStatusRequest {
+  PeerContext peer = 1;
+  bytes scope_json = 2;
+}
+
+message WatchStatus {
+  uint32 schema_version = 1;
+  uint64 source_node_id = 2;
+  uint64 placement_term = 3;
+  uint64 placement_index = 4;
+  bytes source_id_json = 5;
+  uint64 tail = 6;
+  uint64 retention_floor = 7;
+  uint64 retained_entries = 8;
+  uint64 retained_bytes = 9;
+}
+
+message WatchPageRequest {
+  PeerContext peer = 1;
+  bytes expected_source_json = 2;
+  bytes scope_json = 3;
+  uint64 next_offset = 4;
+  uint32 max_records = 5;
+}
+
+message WatchPage {
+  uint32 schema_version = 1;
+  uint64 source_node_id = 2;
+  uint64 placement_term = 3;
+  uint64 placement_index = 4;
+  bytes source_id_json = 5;
+  uint64 tail = 6;
+  uint64 retention_floor = 7;
+  uint64 retained_entries = 8;
+  uint64 retained_bytes = 9;
+  uint64 next_offset = 10;
+  repeated bytes object_heads_json = 11;
+}
+
+message RoutePutEndRequest {
+  PeerContext peer = 1;
+  anvil.v1.PutToken request = 2;
+}
+
+message RouteDeleteRequest {
+  PeerContext peer = 1;
+  anvil.v1.DeleteRequest request = 2;
+}
+
+message RouteDeleteIfVersionRequest {
+  PeerContext peer = 1;
+  anvil.v1.DeleteIfVersionRequest request = 2;
+}
+
+message RouteBulkWriteRequest {
+  PeerContext peer = 1;
+  anvil.v1.BulkWriteRequest request = 2;
+}
+
+message RouteProvisionTenantRequest {
+  PeerContext peer = 1;
+  anvil.v1.ProvisionTenantRequest request = 2;
+}
+
+message RouteCreateBucketRequest {
+  PeerContext peer = 1;
+  anvil.v1.CreateBucketRequest request = 2;
+}
+
+message RouteCredentialExchangeRequest {
+  PeerContext peer = 1;
+  anvil.v1.ExchangeClientCredentialsRequest request = 2;
+}
+
+message RouteAdminCreateApplicationRequest {
+  PeerContext peer = 1;
+  anvil.v1.CreateApplicationRequest request = 2;
+}
+
+message RouteAdminRotateCredentialRequest {
+  PeerContext peer = 1;
+  anvil.v1.RotateApplicationCredentialRequest request = 2;
+}
+
+message RouteAdminDisableCredentialRequest {
+  PeerContext peer = 1;
+  anvil.v1.DisableApplicationCredentialRequest request = 2;
+}
+
+message RouteAdminSetBucketVersioningRequest {
+  PeerContext peer = 1;
+  anvil.v1.SetBucketVersioningRequest request = 2;
+}
+
+message RouteAdminChangeApplicationRoleRequest {
+  PeerContext peer = 1;
+  anvil.v1.ApplicationRoleRequest request = 2;
+  bool granted = 3;
+}
+
+message RouteAuthzPutSchemaRequest {
+  PeerContext peer = 1;
+  anvil.v1.PutSchemaRequest request = 2;
+}
+
+message RouteAuthzBindSchemaRequest {
+  PeerContext peer = 1;
+  anvil.v1.BindSchemaRequest request = 2;
+}
+
+message RouteAuthzGetBindingRequest {
+  PeerContext peer = 1;
+  anvil.v1.GetBindingRequest request = 2;
+}
+
+message RouteAuthzGetSchemaRequest {
+  PeerContext peer = 1;
+  anvil.v1.GetSchemaRequest request = 2;
+}
+
+message RouteAuthzMutateTuplesRequest {
+  PeerContext peer = 1;
+  anvil.v1.MutateTuplesRequest request = 2;
+}
+
+message RouteAuthzReadTuplesRequest {
+  PeerContext peer = 1;
+  anvil.v1.ReadTuplesRequest request = 2;
+}
+
+message RouteAuthzCheckPermissionRequest {
+  PeerContext peer = 1;
+  anvil.v1.CheckPermissionRequest request = 2;
+}
+
+message RouteAuthzCheckPermissionsRequest {
+  PeerContext peer = 1;
+  anvil.v1.CheckPermissionsRequest request = 2;
+}
+
+message RouteSetBucketPolicyRequest {
+  PeerContext peer = 1;
+  anvil.v1.SetBucketPolicyRequest request = 2;
+}
+
+message RouteDeleteVersionRequest {
+  PeerContext peer = 1;
+  anvil.v1.DeleteVersionRequest request = 2;
+}
+
+message CoordinateLogicalRecordRequest {
+  PeerContext peer = 1;
+  bytes typed_value_json = 2;
+}
+
+message CoordinateLogicalRecordResponse {
+  uint32 schema_version = 1;
+}
+
+message CoordinatedLogicalReadRequest {
+  PeerContext peer = 1;
+  bytes id_json = 2;
+}
+
+message CoordinatedLogicalReadResponse {
+  uint32 schema_version = 1;
+  bool present = 2;
+  bytes typed_value_json = 3;
+}
+
+message CoordinateSystemGrantRequest {
+  PeerContext peer = 1;
+  bytes tuple_batch_json = 2;
+}
+
+message CoordinateSystemGrantResponse {
+  uint32 schema_version = 1;
+  bytes receipt_json = 2;
+}
+
+message RouteInvokeProgramRequest {
+  PeerContext peer = 1;
+  anvil.v1.InvokeProgramRequest request = 2;
+}
+
+message ProgramStagePathRequest {
+  PeerContext peer = 1;
+  uint64 executor_nomination_log_index = 2;
+  bytes stage_json = 3;
+}
+
+message ProgramStagePathResponse {
+  uint32 schema_version = 1;
+  bytes stage_blob_hash = 2;
+  uint64 stage_blob_length = 3;
+}
+
+message ProgramCoordinatePathFinalizationRequest {
+  PeerContext peer = 1;
+  uint64 executor_nomination_log_index = 2;
+  uint64 commit_cursor = 3;
+  bytes stage_json = 4;
+}
+
+message ProgramCoordinatedPathFinalization {
+  uint32 schema_version = 1;
+  bytes mutation_json = 2;
+  bool replayed = 3;
+}
+
+message ProgramApplyPathFinalizationRequest {
+  PeerContext peer = 1;
+  uint64 executor_nomination_log_index = 2;
+  bytes mutation_json = 3;
+}
+
+message ProgramPathFinalizationApplied {
+  uint32 schema_version = 1;
+  uint64 version = 2;
+  bool replayed = 3;
+}
+
+// This service is installed only on Anvil's mandatory-mTLS peer listener.
+// It exposes typed logical operations, never RocksDB keys, column-family
+// values, or a generic public-method tunnel.
+service ClusterPeer {
+  rpc ResolveTenantName(ResolveTenantNameRequest) returns (ResolveTenantNameResult);
+  rpc ResolveBucketName(ResolveBucketNameRequest) returns (ResolveBucketNameResult);
+  rpc ReadLogicalRecord(LogicalRecordReadRequest) returns (LogicalRecordCandidate);
+  rpc RepairLogicalRecord(LogicalRecordRepairRequest) returns (LogicalRecordSnapshotApplied);
+  rpc ApplyLogicalRecord(LogicalRecordMutationRequest) returns (LogicalRecordApplied);
+
+  rpc ApplySchemaPublication(SchemaPublicationApplyRequest) returns (SchemaPublicationApplied);
+  rpc HasSchemaPublication(SchemaPublicationQueryRequest) returns (Exists);
+  rpc ApplyRealmMutation(RealmMutationApplyRequest) returns (RealmMutationApplied);
+  rpc ReadRealmCandidate(RealmCandidateReadRequest) returns (RealmCandidate);
+  rpc ReadRealmAggregate(RealmAggregateReadRequest) returns (stream RealmAggregateFrame);
+  rpc InstallRealmCandidate(stream RealmCandidateInstallFrame) returns (RealmCandidateInstalled);
+  rpc FreshAuthorizationCheck(FreshAuthorizationCheckRequest) returns (FreshAuthorizationCheckResult);
+  rpc FreshAuthorizationChecks(FreshAuthorizationChecksRequest) returns (FreshAuthorizationChecksResult);
+
+  rpc ReadReferenceProof(ReferenceProofReadRequest) returns (ReferenceProofReadResponse);
+  rpc ListLocalObjects(LocalListRequest) returns (LocalListPage);
+  rpc GetWatchStatus(WatchStatusRequest) returns (WatchStatus);
+  rpc ReadWatchPage(WatchPageRequest) returns (WatchPage);
+
+  rpc RoutePutEnd(RoutePutEndRequest) returns (anvil.v1.MutationReceipt);
+  rpc RouteDelete(RouteDeleteRequest) returns (anvil.v1.MutationReceipt);
+  rpc RouteDeleteIfVersion(RouteDeleteIfVersionRequest) returns (anvil.v1.MutationReceipt);
+  rpc RouteBulkWrite(RouteBulkWriteRequest) returns (anvil.v1.BulkWriteResponse);
+  rpc RouteProvisionTenant(RouteProvisionTenantRequest) returns (anvil.v1.ProvisionTenantResponse);
+  rpc RouteCreateBucket(RouteCreateBucketRequest) returns (anvil.v1.CreateBucketResponse);
+  rpc RouteCredentialExchange(RouteCredentialExchangeRequest) returns (anvil.v1.AccessToken);
+  rpc RouteAdminCreateApplication(RouteAdminCreateApplicationRequest) returns (anvil.v1.ApplicationCredential);
+  rpc RouteAdminRotateCredential(RouteAdminRotateCredentialRequest) returns (anvil.v1.ApplicationCredential);
+  rpc RouteAdminDisableCredential(RouteAdminDisableCredentialRequest) returns (anvil.v1.ApplicationCredentialState);
+  rpc RouteAdminSetBucketVersioning(RouteAdminSetBucketVersioningRequest) returns (anvil.v1.SetBucketVersioningResponse);
+  rpc RouteAdminChangeApplicationRole(RouteAdminChangeApplicationRoleRequest) returns (anvil.v1.ApplicationRoleResponse);
+  rpc RouteInvokeProgram(RouteInvokeProgramRequest) returns (anvil.v1.InvokeProgramResponse);
+  rpc RouteAuthzPutSchema(RouteAuthzPutSchemaRequest) returns (anvil.v1.PutSchemaResponse);
+  rpc RouteAuthzBindSchema(RouteAuthzBindSchemaRequest) returns (anvil.v1.BindSchemaResponse);
+  rpc RouteAuthzGetBinding(RouteAuthzGetBindingRequest) returns (anvil.v1.GetBindingResponse);
+  rpc RouteAuthzGetSchema(RouteAuthzGetSchemaRequest) returns (anvil.v1.GetSchemaResponse);
+  rpc RouteAuthzMutateTuples(RouteAuthzMutateTuplesRequest) returns (anvil.v1.MutateTuplesResponse);
+  rpc RouteAuthzReadTuples(RouteAuthzReadTuplesRequest) returns (anvil.v1.ReadTuplesResponse);
+  rpc RouteAuthzCheckPermission(RouteAuthzCheckPermissionRequest) returns (anvil.v1.CheckPermissionResponse);
+  rpc RouteAuthzCheckPermissions(RouteAuthzCheckPermissionsRequest) returns (anvil.v1.CheckPermissionsResponse);
+  rpc RouteSetBucketPolicy(RouteSetBucketPolicyRequest) returns (anvil.v1.BucketPolicy);
+  rpc RouteDeleteVersion(RouteDeleteVersionRequest) returns (anvil.v1.DeleteVersionResponse);
+
+  rpc StageProgramPath(ProgramStagePathRequest) returns (ProgramStagePathResponse);
+  rpc CoordinateProgramPathFinalization(ProgramCoordinatePathFinalizationRequest) returns (ProgramCoordinatedPathFinalization);
+  rpc ApplyProgramPathFinalization(ProgramApplyPathFinalizationRequest) returns (ProgramPathFinalizationApplied);
+
+  rpc CoordinateLogicalRecord(CoordinateLogicalRecordRequest) returns (CoordinateLogicalRecordResponse);
+  rpc ReadCoordinatedLogicalRecord(CoordinatedLogicalReadRequest) returns (CoordinatedLogicalReadResponse);
+  rpc CoordinateSystemGrant(CoordinateSystemGrantRequest) returns (CoordinateSystemGrantResponse);
+}

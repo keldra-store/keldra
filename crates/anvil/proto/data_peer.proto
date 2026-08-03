@@ -30,6 +30,12 @@ message ObjectMutationApplied {
   bool replayed = 3;
 }
 
+message RetainedVersionDeleteApplied {
+  uint32 schema_version = 1;
+  bytes outcome_json = 2;
+  bool replayed = 3;
+}
+
 message ObjectPathSnapshotRequest {
   PeerContext peer = 1;
   uint64 tenant_id = 2;
@@ -297,6 +303,7 @@ message HandoffReferenceCursorAdvanceRequest {
 
 service DataPeer {
   rpc ApplyObjectMutation(TypedMutationRequest) returns (ObjectMutationApplied);
+  rpc ApplyRetainedVersionDelete(TypedMutationRequest) returns (RetainedVersionDeleteApplied);
   rpc ReadObjectPathSnapshot(ObjectPathSnapshotRequest) returns (ObjectPathSnapshotResponse);
   rpc RepairObjectPathSnapshot(RepairObjectPathSnapshotRequest) returns (ObjectPathSnapshotApplied);
   rpc ApplyAuthzRealmMutation(TypedMutationRequest) returns (AuthzRealmMutationApplied);
