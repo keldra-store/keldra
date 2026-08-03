@@ -290,8 +290,25 @@ fn routed_responses_agree(responses: &[QueryIndexResponse]) -> bool {
     responses.windows(2).all(|pair| {
         pair[0].hits == pair[1].hits
             && pair[0].next_page_token == pair[1].next_page_token
-            && pair[0].freshness == pair[1].freshness
+            && stable_freshness_agrees(pair[0].freshness.as_ref(), pair[1].freshness.as_ref())
     })
+}
+
+fn stable_freshness_agrees(left: Option<&IndexFreshness>, right: Option<&IndexFreshness>) -> bool {
+    let (Some(left), Some(right)) = (left, right) else {
+        return false;
+    };
+    let mut left = left.clone();
+    let mut right = right.clone();
+    for source in &mut left.sources {
+        source.observed_tail = None;
+        source.lag_hint = 0;
+    }
+    for source in &mut right.sources {
+        source.observed_tail = None;
+        source.lag_hint = 0;
+    }
+    left == right
 }
 
 fn response_matches(
@@ -653,7 +670,50 @@ fn invalid(message: impl Into<String>) -> Box<dyn Error + Send + Sync> {
 
 #[cfg(test)]
 mod tests {
-    use super::retryable;
+    use anvil_storage::v1::{IndexFreshness, IndexSourceFreshness, QueryIndexResponse};
+
+    use super::{retryable, routed_responses_agree};
+
+    fn routed_response() -> QueryIndexResponse {
+        QueryIndexResponse {
+            hits: Vec::new(),
+            next_page_token: vec![1, 2, 3],
+            freshness: Some(IndexFreshness {
+                generation: 7,
+                published_at: None,
+                sources: vec![
+                    IndexSourceFreshness {
+                        node_id: 1,
+                        source_epoch: vec![1; 32],
+                        indexed_next_offset: 11,
+                        observed_tail: Some(12),
+                        lag_hint: 1,
+                    },
+                    IndexSourceFreshness {
+                        node_id: 2,
+                        source_epoch: vec![2; 32],
+                        indexed_next_offset: 21,
+                        observed_tail: Some(22),
+                        lag_hint: 1,
+                    },
+                ],
+                initial_build_complete: true,
+                rebuilding: false,
+                authorization_revision: 31,
+                placement_term: 4,
+                placement_index: 5,
+                index_id: 41,
+                definition_version: 3,
+            }),
+        }
+    }
+
+    fn assert_freshness_disagrees(mut mutate: impl FnMut(&mut QueryIndexResponse)) {
+        let baseline = routed_response();
+        let mut changed = baseline.clone();
+        mutate(&mut changed);
+        assert!(!routed_responses_agree(&[baseline, changed]));
+    }
 
     #[test]
     fn retryable_statuses_include_only_transport_timeout_cancellation() {
@@ -669,5 +729,70 @@ mod tests {
         assert!(!retryable(&tonic::Status::invalid_argument(
             "invalid query"
         )));
+    }
+
+    #[test]
+    fn routed_freshness_allows_only_live_source_observations_to_differ() {
+        let baseline = routed_response();
+        let mut changed = baseline.clone();
+        let sources = &mut changed.freshness.as_mut().unwrap().sources;
+        sources[0].observed_tail = Some(100);
+        sources[0].lag_hint = 89;
+        sources[1].observed_tail = None;
+        sources[1].lag_hint = 0;
+
+        assert!(routed_responses_agree(&[baseline, changed]));
+    }
+
+    #[test]
+    fn routed_freshness_requires_stable_identity_and_checkpoints() {
+        assert_freshness_disagrees(|response| {
+            response.freshness.as_mut().unwrap().generation += 1;
+        });
+        assert_freshness_disagrees(|response| {
+            response.freshness.as_mut().unwrap().published_at = Some(Default::default());
+        });
+        assert_freshness_disagrees(|response| {
+            response.freshness.as_mut().unwrap().initial_build_complete = false;
+        });
+        assert_freshness_disagrees(|response| {
+            response.freshness.as_mut().unwrap().rebuilding = true;
+        });
+        assert_freshness_disagrees(|response| {
+            response.freshness.as_mut().unwrap().authorization_revision += 1;
+        });
+        assert_freshness_disagrees(|response| {
+            response.freshness.as_mut().unwrap().placement_term += 1;
+        });
+        assert_freshness_disagrees(|response| {
+            response.freshness.as_mut().unwrap().placement_index += 1;
+        });
+        assert_freshness_disagrees(|response| {
+            response.freshness.as_mut().unwrap().index_id += 1;
+        });
+        assert_freshness_disagrees(|response| {
+            response.freshness.as_mut().unwrap().definition_version += 1;
+        });
+        assert_freshness_disagrees(|response| {
+            response.freshness.as_mut().unwrap().sources[0].node_id += 1;
+        });
+        assert_freshness_disagrees(|response| {
+            response.freshness.as_mut().unwrap().sources[0]
+                .source_epoch
+                .push(9);
+        });
+        assert_freshness_disagrees(|response| {
+            response.freshness.as_mut().unwrap().sources[0].indexed_next_offset += 1;
+        });
+        assert_freshness_disagrees(|response| {
+            response.freshness.as_mut().unwrap().sources.swap(0, 1);
+        });
+    }
+
+    #[test]
+    fn routed_responses_still_require_matching_results_and_freshness() {
+        assert_freshness_disagrees(|response| response.next_page_token.push(4));
+        assert_freshness_disagrees(|response| response.hits.push(Default::default()));
+        assert_freshness_disagrees(|response| response.freshness = None);
     }
 }
