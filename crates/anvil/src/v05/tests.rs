@@ -2,6 +2,8 @@ use super::*;
 use anvil_api::v1::{
     PutIfAbsentOperation, PutIfVersionOperation, PutImmutableOperation, PutOperation,
 };
+use anvil_store::{Head, ObjectPathSnapshot};
+use tokio_stream::StreamExt;
 
 fn address(path: &str) -> Option<ObjectAddress> {
     Some(ObjectAddress {
@@ -604,6 +606,109 @@ fn batch_get_payload_limit_accepts_the_boundary_and_rejects_larger_totals() {
     assert!(enforce_batch_get_payload_limit(MAX_BATCH_GET_BYTES as u64).is_ok());
     let error = enforce_batch_get_payload_limit(MAX_BATCH_GET_BYTES as u64 + 1).unwrap_err();
     assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+}
+
+#[test]
+fn distributed_batch_preflight_selects_current_and_exact_descriptors() {
+    let key = ObjectKey::new("tenant", "bucket", "object").unwrap();
+    let live = Version {
+        id: VersionId(4),
+        blob: Some(BlobRef {
+            hash: *blake3::hash(b"payload").as_bytes(),
+            length: 7,
+        }),
+        content_type: None,
+        deleted: false,
+        committed_at_unix_millis: 4,
+    };
+    let deleted = Version {
+        id: VersionId(5),
+        blob: None,
+        content_type: None,
+        deleted: true,
+        committed_at_unix_millis: 5,
+    };
+    let snapshot = ObjectPathSnapshot {
+        tenant_id: 11,
+        bucket_id: 12,
+        exact_path: key.path().into(),
+        head: Head {
+            version: deleted.id,
+            deleted: true,
+            mutation_stamp: None,
+        },
+        versions: vec![live, deleted],
+    };
+
+    assert_eq!(
+        distributed_reads::declared_payload_length(Some(&snapshot), &key, None).unwrap(),
+        0
+    );
+    assert_eq!(
+        distributed_reads::declared_payload_length(Some(&snapshot), &key, Some(VersionId(4)))
+            .unwrap(),
+        7
+    );
+    assert_eq!(
+        distributed_reads::declared_payload_length(Some(&snapshot), &key, Some(VersionId(99)))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn distributed_read_preflight_rejects_another_exact_path() {
+    let key = ObjectKey::new("tenant", "bucket", "object").unwrap();
+    let version = Version {
+        id: VersionId(4),
+        blob: None,
+        content_type: None,
+        deleted: true,
+        committed_at_unix_millis: 4,
+    };
+    let snapshot = ObjectPathSnapshot {
+        tenant_id: 11,
+        bucket_id: 12,
+        exact_path: "another".into(),
+        head: Head {
+            version: version.id,
+            deleted: true,
+            mutation_stamp: None,
+        },
+        versions: vec![version],
+    };
+
+    let error =
+        distributed_reads::declared_payload_length(Some(&snapshot), &key, None).unwrap_err();
+    assert_eq!(error.code(), tonic::Code::DataLoss);
+    assert_eq!(
+        distributed_reads::status_failure(error).code,
+        ReadFailureCode::DataLoss as i32
+    );
+}
+
+#[test]
+fn exact_get_missing_version_fails_before_opening_a_stream() {
+    let error = match distributed_reads::get_object_response(None, true) {
+        Err(error) => error,
+        Ok(_) => panic!("an exact missing version must fail before streaming"),
+    };
+    assert_eq!(error.code(), tonic::Code::NotFound);
+}
+
+#[tokio::test]
+async fn current_get_of_a_never_created_path_streams_only_the_head() {
+    let mut stream = distributed_reads::get_object_response(None, false)
+        .unwrap()
+        .into_inner();
+    let first = stream.next().await.unwrap().unwrap();
+    assert!(matches!(
+        first.value,
+        Some(ObjectChunkValue::Head(ObjectHead {
+            state: Some(ObjectState::NeverExisted(_))
+        }))
+    ));
+    assert!(stream.next().await.is_none());
 }
 
 #[test]

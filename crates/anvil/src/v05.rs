@@ -24,10 +24,9 @@ use anvil_api::v1::{
 };
 use anvil_atomic_program::{ExpandedProgramPath, MAX_OBJECT_PATH_BYTES};
 use anvil_store::{
-    AuthzStoreError, BatchOperation, BlobReader, BlobRef, BlobUpload,
-    DeleteRequest as StoreDeleteRequest, DeleteRetainedVersionOutcome,
-    Durability as StoreDurability, InvalidationStateHint, LocalInvalidation,
-    MAX_LIST_OBJECT_VERSIONS, MAX_LIST_OBJECTS, MAX_LOCAL_INVALIDATION_SCAN_RECORDS, MutationError,
+    AuthzStoreError, BatchOperation, BlobRef, BlobUpload, DeleteRequest as StoreDeleteRequest,
+    DeleteRetainedVersionOutcome, Durability as StoreDurability, InvalidationStateHint,
+    LocalInvalidation, MAX_LIST_OBJECTS, MAX_LOCAL_INVALIDATION_SCAN_RECORDS, MutationError,
     MutationReceipt, ObjectKey, ObjectVersioning as StoreObjectVersioning, Precondition,
     PublishRequest, PutMode, PutRequest as StorePutRequest, Store, Version, VersionId, WatchCursor,
     WatchError, WatchJournalStatus, WatchScope, WatchStart,
@@ -41,8 +40,11 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::authentication::{Caller, JwtManager, PUT_TOKEN_LIFETIME};
 use crate::authorization::{ObjectPermission, SystemAuthorization, SystemAuthorizer};
+use crate::cluster_object_read::ClusterObjectReader;
 use crate::object_distribution::ObjectDistribution;
 use crate::programs::ProgramCoordinator;
+
+mod distributed_reads;
 
 const OBJECT_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_BULK_ITEMS: usize = 1_000;
@@ -59,6 +61,7 @@ pub struct ObjectServiceImpl {
     system_authorizer: SystemAuthorizer,
     programs: ProgramCoordinator,
     distribution: ObjectDistribution,
+    reader: ClusterObjectReader,
     jwt_manager: JwtManager,
     max_blob_bytes: u64,
     atomic_program_timeout: Duration,
@@ -69,6 +72,7 @@ impl ObjectServiceImpl {
         store: Store,
         programs: ProgramCoordinator,
         distribution: ObjectDistribution,
+        reader: ClusterObjectReader,
         jwt_manager: JwtManager,
         max_blob_bytes: u64,
         atomic_program_timeout: Duration,
@@ -78,6 +82,7 @@ impl ObjectServiceImpl {
             store,
             programs,
             distribution,
+            reader,
             jwt_manager,
             max_blob_bytes,
             atomic_program_timeout,
@@ -300,6 +305,11 @@ impl ObjectService for ObjectServiceImpl {
         self.authorize_object(&caller, &key, ObjectPermission::Delete)
             .await?;
         require_versioning_enabled(&self.store, &key)?;
+        if !self.distribution.is_single_node()? {
+            return Err(Status::failed_precondition(
+                "DeleteVersion is unavailable in a multi-node cluster until its typed replicated mutation is supported",
+            ));
+        }
         let outcome = self
             .store
             .delete_retained_version(&key, VersionId(request.version))
@@ -316,12 +326,7 @@ impl ObjectService for ObjectServiceImpl {
         let key = object_key(request.into_inner().address)?;
         self.authorize_object(&caller, &key, ObjectPermission::Get)
             .await?;
-        let Some(version) = self
-            .store
-            .current_version_metadata(&key)
-            .await
-            .map_err(status)?
-        else {
+        let Some(version) = self.reader.head(&key).await? else {
             return Ok(Response::new(never_existed()));
         };
         Ok(Response::new(api_head(&version)?))
@@ -384,58 +389,11 @@ impl ObjectService for ObjectServiceImpl {
         if request.version.is_some() {
             require_versioning_enabled(&self.store, &key)?;
         }
-        let selected = select_object_for_stream(&self.store, &key, request.version).await?;
-        let (sender, receiver) = tokio::sync::mpsc::channel(8);
-        tokio::spawn(async move {
-            let (head, payload) = match selected {
-                Some(object) => {
-                    let head = match api_head(&object.version) {
-                        Ok(head) => head,
-                        Err(error) => {
-                            let _ = sender.send(Err(error)).await;
-                            return;
-                        }
-                    };
-                    (head, object.payload)
-                }
-                None => (never_existed(), SelectedPayload::Empty),
-            };
-            if sender
-                .send(Ok(ObjectChunk {
-                    value: Some(ObjectChunkValue::Head(head)),
-                }))
-                .await
-                .is_err()
-            {
-                return;
-            }
-            match payload {
-                SelectedPayload::Empty => {}
-                SelectedPayload::Blob(mut reader) => {
-                    let mut bytes = vec![0_u8; OBJECT_CHUNK_BYTES];
-                    loop {
-                        let read = match reader.read(&mut bytes).await {
-                            Ok(0) => break,
-                            Ok(read) => read,
-                            Err(error) => {
-                                let _ = sender.send(Err(internal(error))).await;
-                                return;
-                            }
-                        };
-                        if sender
-                            .send(Ok(ObjectChunk {
-                                value: Some(ObjectChunkValue::Bytes(bytes[..read].to_vec())),
-                            }))
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                }
-            }
-        });
-        Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
+        let selected = self
+            .reader
+            .open(&key, request.version.map(VersionId))
+            .await?;
+        distributed_reads::get_object_response(selected, request.version.is_some())
     }
 
     type ListObjectVersionsStream = ListObjectVersionsStream;
@@ -450,52 +408,8 @@ impl ObjectService for ObjectServiceImpl {
             .await?;
         require_versioning_enabled(&self.store, &key)?;
 
-        let store = self.store.clone();
-        let (sender, receiver) = tokio::sync::mpsc::channel(32);
-        tokio::spawn(async move {
-            let mut after = None;
-            loop {
-                let page_store = store.clone();
-                let page_key = key.clone();
-                let page = match tokio::task::spawn_blocking(move || {
-                    page_store.list_object_versions(&page_key, after, MAX_LIST_OBJECT_VERSIONS)
-                })
-                .await
-                {
-                    Ok(Ok(page)) => page,
-                    Ok(Err(error)) => {
-                        let _ = sender.send(Err(status(error))).await;
-                        return;
-                    }
-                    Err(error) => {
-                        let _ = sender
-                            .send(Err(internal(format!(
-                                "object-version listing worker failed: {error}"
-                            ))))
-                            .await;
-                        return;
-                    }
-                };
-                let complete = page.len() < MAX_LIST_OBJECT_VERSIONS;
-                for version in page {
-                    after = Some(version.id);
-                    let version = match api_object_version(&version) {
-                        Ok(version) => version,
-                        Err(error) => {
-                            let _ = sender.send(Err(error)).await;
-                            return;
-                        }
-                    };
-                    if sender.send(Ok(version)).await.is_err() {
-                        return;
-                    }
-                }
-                if complete {
-                    return;
-                }
-            }
-        });
-        Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
+        let snapshot = self.distribution.reconciled_object_snapshot(&key).await?;
+        distributed_reads::list_object_versions_response(snapshot, &key)
     }
 
     async fn bulk_write(
@@ -748,40 +662,52 @@ impl ObjectService for ObjectServiceImpl {
                 Err(error) => return Err(error),
             }
         }
-        let requests = accepted
-            .iter()
-            .map(|(_, key, version)| (key.clone(), *version))
-            .collect::<Vec<_>>();
-        let selection = self.store.select_batch_get(&requests).await;
-        enforce_batch_get_payload_limit(selection.declared_present_payload_bytes())?;
-        for (outcome, (index, key, requested_version)) in self
-            .store
-            .read_batch_get_selection(selection)
-            .await
-            .into_iter()
-            .zip(accepted)
-        {
-            let outcome = match outcome {
-                Ok(Some(object)) => match api_head(&object.version) {
-                    Ok(head) => BatchGetResult::Object(BatchGetObject {
-                        head: Some(head),
-                        bytes: object.bytes,
-                    }),
-                    Err(error) => BatchGetResult::Failure(ReadFailure {
-                        code: ReadFailureCode::DataLoss as i32,
-                        message: error.message().to_owned(),
+        let mut selected = Vec::with_capacity(accepted.len());
+        let mut declared_payload_bytes = 0_u64;
+        for (index, key, requested_version) in accepted {
+            match self.distribution.reconciled_object_snapshot(&key).await {
+                Ok(snapshot) => match distributed_reads::declared_payload_length(
+                    snapshot.as_ref(),
+                    &key,
+                    requested_version,
+                ) {
+                    Ok(length) => {
+                        declared_payload_bytes = declared_payload_bytes.saturating_add(length);
+                        selected.push((index, key, requested_version));
+                    }
+                    Err(error) => outcomes.push(BatchGetOutcome {
+                        index: index as u32,
+                        address: Some(api_address(&key)),
+                        outcome: Some(BatchGetResult::Failure(distributed_reads::status_failure(
+                            error,
+                        ))),
                     }),
                 },
-                Ok(None) if requested_version.is_none() => BatchGetResult::Object(BatchGetObject {
-                    head: Some(never_existed()),
-                    bytes: Vec::new(),
+                Err(error) => outcomes.push(BatchGetOutcome {
+                    index: index as u32,
+                    address: Some(api_address(&key)),
+                    outcome: Some(BatchGetResult::Failure(distributed_reads::status_failure(
+                        error,
+                    ))),
                 }),
-                Ok(None) => BatchGetResult::Failure(ReadFailure {
-                    code: ReadFailureCode::VersionNotFound as i32,
-                    message: "requested version was not found".into(),
-                }),
-                Err(error) => BatchGetResult::Failure(read_failure(error)),
-            };
+            }
+        }
+        enforce_batch_get_payload_limit(declared_payload_bytes)?;
+
+        let mut materialized_payload_bytes = 0_u64;
+        for (index, key, requested_version) in selected {
+            let outcome =
+                match distributed_reads::read_batch_result(&self.reader, &key, requested_version)
+                    .await
+                {
+                    Ok((outcome, length)) => {
+                        materialized_payload_bytes =
+                            materialized_payload_bytes.saturating_add(length);
+                        enforce_batch_get_payload_limit(materialized_payload_bytes)?;
+                        outcome
+                    }
+                    Err(error) => BatchGetResult::Failure(distributed_reads::status_failure(error)),
+                };
             outcomes.push(BatchGetOutcome {
                 index: index as u32,
                 address: Some(api_address(&key)),
@@ -1245,43 +1171,6 @@ fn watch_status(error: WatchError) -> Status {
         WatchError::ResumeExpired => Status::failed_precondition("RESUME_EXPIRED"),
         WatchError::Storage(_) => Status::internal(error.to_string()),
     }
-}
-
-struct SelectedObject {
-    version: Version,
-    payload: SelectedPayload,
-}
-
-enum SelectedPayload {
-    Empty,
-    Blob(BlobReader),
-}
-
-async fn select_object_for_stream(
-    store: &Store,
-    key: &ObjectKey,
-    requested_version: Option<u64>,
-) -> Result<Option<SelectedObject>, Status> {
-    let selected = store
-        .open_object(key, requested_version.map(VersionId))
-        .await
-        .map_err(status)?;
-    let Some(selected) = selected else {
-        return if requested_version.is_some() {
-            Err(Status::not_found("requested version was not found"))
-        } else {
-            Ok(None)
-        };
-    };
-    let payload = match (selected.reader, selected.version.deleted) {
-        (Some(reader), false) => SelectedPayload::Blob(reader),
-        (None, true) => SelectedPayload::Empty,
-        _ => return Err(Status::internal("version has an invalid payload shape")),
-    };
-    Ok(Some(SelectedObject {
-        version: selected.version,
-        payload,
-    }))
 }
 
 fn validate_bulk_limits(operations: &[BulkOperation]) -> Result<(), Status> {
@@ -1769,33 +1658,6 @@ fn durability_name(value: StoreDurability) -> &'static str {
     match value {
         StoreDurability::Local => "local",
         StoreDurability::Replicated => "replicated",
-    }
-}
-
-fn read_failure(error: MutationError) -> ReadFailure {
-    let code = match &error {
-        MutationError::BlobNotFound => ReadFailureCode::DataLoss,
-        MutationError::ObjectVersioningNotEnabled => ReadFailureCode::VersioningDisabled,
-        MutationError::Storage(_) => ReadFailureCode::Internal,
-        MutationError::PreconditionFailed { .. }
-        | MutationError::Immutable
-        | MutationError::ImmutablePolicyRequired
-        | MutationError::ProgramConcurrencyViolation
-        | MutationError::CurrentTombstoneCannotBeDeleted
-        | MutationError::IdempotencyConflict
-        | MutationError::InvalidCommandId
-        | MutationError::InvalidObjectMutation(_)
-        | MutationError::DurabilityUnavailable
-        | MutationError::ReceiptCapacity
-        | MutationError::SourceJournalCapacity
-        | MutationError::ObjectMutationLineageGap { .. }
-        | MutationError::ObjectMutationSibling { .. }
-        | MutationError::ObjectMutationConflict
-        | MutationError::InvalidPolicy(_) => ReadFailureCode::Internal,
-    };
-    ReadFailure {
-        code: code as i32,
-        message: error.to_string(),
     }
 }
 
