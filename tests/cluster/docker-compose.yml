@@ -1,0 +1,79 @@
+name: ${ANVIL_QUALIFICATION_PROJECT:-anvil-v051-qualification}
+
+x-anvil-environment: &anvil-environment
+  RUST_LOG: ${RUST_LOG:-info}
+  ANVIL_LISTEN: 0.0.0.0:50051
+  ANVIL_PEER_LISTEN: 0.0.0.0:50052
+  ANVIL_TOKEN_SIGNING_KEY_FILE: /run/secrets/anvil-token-signing-key
+  ANVIL_ERASURE_DATA_SHARDS: "2"
+  ANVIL_ERASURE_PARITY_SHARDS: "1"
+
+x-anvil-service: &anvil-service
+  image: ${ANVIL_IMAGE:?ANVIL_IMAGE must name the already-built qualification image}
+  platform: ${ANVIL_DOCKER_PLATFORM:-linux/amd64}
+  restart: "no"
+  stop_grace_period: 30s
+
+services:
+  anvil-1:
+    <<: *anvil-service
+    environment:
+      <<: *anvil-environment
+      ANVIL_NODE_ID: "1"
+      ANVIL_PEER_ADVERTISE: anvil-1:50052
+      ANVIL_DATA_DIR: /var/lib/anvil
+      ANVIL_RUN_SYSTEM_BOOTSTRAP: "true"
+    volumes:
+      - type: bind
+        source: ${ANVIL_QUALIFICATION_DIR:?ANVIL_QUALIFICATION_DIR must be set}/node-1
+        target: /var/lib/anvil
+      - type: bind
+        source: ${ANVIL_QUALIFICATION_DIR:?ANVIL_QUALIFICATION_DIR must be set}/token-signing-key
+        target: /run/secrets/anvil-token-signing-key
+        read_only: true
+
+  anvil-2:
+    <<: *anvil-service
+    entrypoint:
+      - /qualification/start-node.sh
+    environment:
+      <<: *anvil-environment
+      ANVIL_NODE_ID: "2"
+      ANVIL_PEER_ADVERTISE: anvil-2:50052
+      ANVIL_DATA_DIR: /var/lib/anvil
+      ANVIL_RUN_SYSTEM_BOOTSTRAP: "false"
+    volumes:
+      - type: bind
+        source: ${ANVIL_QUALIFICATION_DIR:?ANVIL_QUALIFICATION_DIR must be set}/node-2
+        target: /var/lib/anvil
+      - type: bind
+        source: ${ANVIL_QUALIFICATION_DIR:?ANVIL_QUALIFICATION_DIR must be set}/token-signing-key
+        target: /run/secrets/anvil-token-signing-key
+        read_only: true
+      - type: bind
+        source: ${ANVIL_QUALIFICATION_START_NODE:?ANVIL_QUALIFICATION_START_NODE must be set}
+        target: /qualification/start-node.sh
+        read_only: true
+
+  anvil-3:
+    <<: *anvil-service
+    entrypoint:
+      - /qualification/start-node.sh
+    environment:
+      <<: *anvil-environment
+      ANVIL_NODE_ID: "3"
+      ANVIL_PEER_ADVERTISE: anvil-3:50052
+      ANVIL_DATA_DIR: /var/lib/anvil
+      ANVIL_RUN_SYSTEM_BOOTSTRAP: "false"
+    volumes:
+      - type: bind
+        source: ${ANVIL_QUALIFICATION_DIR:?ANVIL_QUALIFICATION_DIR must be set}/node-3
+        target: /var/lib/anvil
+      - type: bind
+        source: ${ANVIL_QUALIFICATION_DIR:?ANVIL_QUALIFICATION_DIR must be set}/token-signing-key
+        target: /run/secrets/anvil-token-signing-key
+        read_only: true
+      - type: bind
+        source: ${ANVIL_QUALIFICATION_START_NODE:?ANVIL_QUALIFICATION_START_NODE must be set}
+        target: /qualification/start-node.sh
+        read_only: true
