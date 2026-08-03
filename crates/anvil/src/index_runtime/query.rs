@@ -9,7 +9,7 @@ use anvil_api::v1::{
 use anvil_index::full_text::{FullTextEngine, FullTextQuery};
 use anvil_index::hybrid::{HybridDefinition, HybridEngine, HybridQuery};
 use anvil_index::ordered::{PathEngine, PathQuery};
-use anvil_index::projections::{GitSourceEngine, PersonalDbRowEngine, TensorProjectionEngine};
+use anvil_index::projections::{GitSourceEngine, TensorProjectionEngine};
 use anvil_index::typed_json::{
     MetadataFilterEngine, ScalarValue, TypedField, TypedJsonDefinition, TypedJsonEngine,
     TypedOrder, TypedPredicate, TypedQuery,
@@ -196,10 +196,6 @@ pub(crate) async fn execute_query<D: IndexDirectoryRead>(
             )
             .await
         }
-        (
-            Some(Specification::PersonaldbRowMetadata(specification)),
-            Some(Query::PersonaldbRowMetadata(query)),
-        ) => query_personaldb(directory, specification, query, page_size, position).await,
         (Some(_), Some(_)) => Err(IndexError::InvalidQuery(
             "query kind does not match index kind".into(),
         )),
@@ -293,55 +289,6 @@ async fn query_git<D: IndexDirectoryRead>(
             .and_then(|record| record.get("tree_path")?.as_str().map(str::to_owned)),
     });
     Ok(EngineQueryPage { hits, next })
-}
-
-async fn query_personaldb<D: IndexDirectoryRead>(
-    directory: &D,
-    specification: &anvil_api::v1::PersonalDbRowMetadataIndexSpec,
-    query: &anvil_api::v1::PersonalDbRowMetadataIndexQuery,
-    page_size: usize,
-    position: IndexQueryPosition,
-) -> Result<EngineQueryPage, IndexError> {
-    let key = std::str::from_utf8(&query.primary_key)
-        .map_err(|_| IndexError::InvalidQuery("PersonalDB primary key must be UTF-8".into()))?;
-    let records = if query.prefix {
-        PersonalDbRowEngine::list_table(
-            directory,
-            &specification.database_id,
-            &specification.group_id,
-            &query.table,
-            key,
-            scan_limit(page_size, position.offset)?,
-        )
-        .await?
-    } else {
-        PersonalDbRowEngine::get(
-            directory,
-            &specification.database_id,
-            &specification.group_id,
-            &query.table,
-            key,
-        )
-        .await?
-        .into_iter()
-        .collect()
-    };
-    let hits = records
-        .into_iter()
-        .map(|record| {
-            let object_path = record.source_path.clone();
-            let object_version = record.source_version;
-            let fields_json = serde_json::to_vec(&record)
-                .map_err(|error| IndexError::Encode(error.to_string()))?;
-            Ok(EngineQueryHit {
-                object_path: Some(object_path),
-                object_version,
-                score: None,
-                fields_json,
-            })
-        })
-        .collect::<Result<Vec<_>, IndexError>>()?;
-    offset_page(hits, page_size, position)
 }
 
 async fn query_tensor<D: IndexDirectoryRead>(

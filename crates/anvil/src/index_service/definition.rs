@@ -289,9 +289,6 @@ fn validate_specification(specification: &IndexSpecification) -> Result<(), Stat
             }
             Ok(())
         }
-        Some(Specification::PersonaldbRowMetadata(_)) => Err(Status::unimplemented(
-            "PersonalDB v0 does not expose canonical row metadata with an ordinary Anvil source object path and version",
-        )),
         Some(Specification::GitSource(specification)) => {
             require_text(&specification.repository_id, "Git repository ID")
         }
@@ -310,7 +307,6 @@ fn kind_for(specification: &IndexSpecification) -> Result<IndexKind, Status> {
         Some(Specification::FullText(_)) => IndexKind::FullText,
         Some(Specification::Vector(_)) => IndexKind::Vector,
         Some(Specification::Hybrid(_)) => IndexKind::Hybrid,
-        Some(Specification::PersonaldbRowMetadata(_)) => IndexKind::PersonaldbRowMetadata,
         Some(Specification::GitSource(_)) => IndexKind::GitSource,
         Some(Specification::Tensor(_)) => IndexKind::Tensor,
         None => return Err(Status::data_loss("stored index specification is empty")),
@@ -428,9 +424,7 @@ pub(crate) fn validate_command_id(value: &str) -> Result<(), Status> {
 
 #[cfg(test)]
 mod tests {
-    use anvil_api::v1::{
-        PathIndexSpec, PersonalDbRowMetadataIndexSpec, TensorIndexSpec, index_specification,
-    };
+    use anvil_api::v1::{PathIndexSpec, TensorIndexSpec, index_specification};
 
     use super::*;
 
@@ -481,23 +475,6 @@ mod tests {
         assert!(path_matches_prefix("model/weights", "model/"));
         assert!(!path_matches_prefix("models/weights", "model"));
         assert!(!path_matches_prefix("model", "model/"));
-    }
-
-    #[test]
-    fn personaldb_rows_fail_closed_without_canonical_source_objects() {
-        let mut request = request();
-        request.specification = Some(IndexSpecification {
-            specification: Some(index_specification::Specification::PersonaldbRowMetadata(
-                PersonalDbRowMetadataIndexSpec {
-                    database_id: "db".into(),
-                    group_id: "group".into(),
-                },
-            )),
-        });
-        assert_eq!(
-            validate_create_definition(&request).unwrap_err().code(),
-            tonic::Code::Unimplemented
-        );
     }
 
     #[test]

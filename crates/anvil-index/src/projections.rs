@@ -1,5 +1,5 @@
-//! Ordered projection formats used by Git, PersonalDB, model tensors and
-//! Hugging Face manifests.
+//! Ordered projection formats used by Git, model tensors and Hugging Face
+//! manifests.
 
 use std::collections::BTreeMap;
 
@@ -10,7 +10,6 @@ use crate::{IndexArtifacts, IndexDirectoryRead, IndexError, PagedMap, PagedMapBu
 
 const GIT_PATH_FILE: &str = "git/by-path.map";
 const GIT_OBJECT_FILE: &str = "git/by-object.map";
-const PERSONALDB_ROW_FILE: &str = "personaldb/rows.map";
 const TENSOR_FILE: &str = "tensor/by-name.map";
 const HF_FILE: &str = "hugging-face/by-filename.map";
 
@@ -109,103 +108,6 @@ impl GitSourceEngine {
             .transpose()
             .map(Option::unwrap_or_default)
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PersonalDbRowRecord {
-    pub database_id: String,
-    pub group_id: String,
-    pub table: String,
-    pub primary_key: String,
-    pub row_version: u64,
-    /// Ordinary Anvil object whose Zanzibar policy governs this result.
-    pub source_path: String,
-    pub source_version: u64,
-    pub resource_type: String,
-    pub resource_id: String,
-    pub parent_resource_id: Option<String>,
-    pub creator: Option<String>,
-    pub owner: Option<String>,
-    pub policy_epoch: u64,
-}
-
-pub struct PersonalDbRowEngine;
-
-impl PersonalDbRowEngine {
-    pub fn build(
-        rows: impl IntoIterator<Item = PersonalDbRowRecord>,
-    ) -> Result<IndexArtifacts, IndexError> {
-        let mut map = PagedMapBuilder::default();
-        for row in rows {
-            validate_text("PersonalDB source path", &row.source_path)?;
-            if row.source_version == 0 {
-                return Err(IndexError::InvalidDefinition(
-                    "PersonalDB source version must be non-zero".into(),
-                ));
-            }
-            let key = personaldb_key(
-                &row.database_id,
-                &row.group_id,
-                &row.table,
-                &row.primary_key,
-            )?;
-            map.insert(key, encode(&row)?)?;
-        }
-        let mut artifacts = IndexArtifacts::default();
-        artifacts.insert(PERSONALDB_ROW_FILE, map.finish()?)?;
-        Ok(artifacts)
-    }
-
-    pub async fn get<D: IndexDirectoryRead>(
-        directory: &D,
-        database_id: &str,
-        group_id: &str,
-        table: &str,
-        primary_key: &str,
-    ) -> Result<Option<PersonalDbRowRecord>, IndexError> {
-        let map = PagedMap::open(directory.open_file(PERSONALDB_ROW_FILE).await?).await?;
-        map.get(&personaldb_key(database_id, group_id, table, primary_key)?)
-            .await?
-            .map(|bytes| decode(&bytes))
-            .transpose()
-    }
-
-    pub async fn list_table<D: IndexDirectoryRead>(
-        directory: &D,
-        database_id: &str,
-        group_id: &str,
-        table: &str,
-        primary_key_prefix: &str,
-        limit: usize,
-    ) -> Result<Vec<PersonalDbRowRecord>, IndexError> {
-        let map = PagedMap::open(directory.open_file(PERSONALDB_ROW_FILE).await?).await?;
-        let mut prefix = component_prefix(&[
-            database_id.as_bytes(),
-            group_id.as_bytes(),
-            table.as_bytes(),
-        ])?;
-        prefix.extend_from_slice(primary_key_prefix.as_bytes());
-        map.scan_prefix(&prefix, None, limit)
-            .await?
-            .into_iter()
-            .map(|(_, bytes)| decode(&bytes))
-            .collect()
-    }
-}
-
-fn personaldb_key(
-    database_id: &str,
-    group_id: &str,
-    table: &str,
-    primary_key: &str,
-) -> Result<Vec<u8>, IndexError> {
-    let mut key = component_prefix(&[
-        database_id.as_bytes(),
-        group_id.as_bytes(),
-        table.as_bytes(),
-    ])?;
-    key.extend_from_slice(primary_key.as_bytes());
-    Ok(key)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -391,36 +293,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn personaldb_and_internal_manifest_projections_are_queryable() {
-        let row = PersonalDbRowRecord {
-            database_id: "db".into(),
-            group_id: "group".into(),
-            table: "ledger".into(),
-            primary_key: "entry-1".into(),
-            row_version: 7,
-            source_path: "ledger/entry-1.json".into(),
-            source_version: 9,
-            resource_type: "ledger_entry".into(),
-            resource_id: "entry-1".into(),
-            parent_resource_id: Some("ledger-1".into()),
-            creator: Some("user:1".into()),
-            owner: Some("user:1".into()),
-            policy_epoch: 3,
-        };
-        let mut unaddressable = row.clone();
-        unaddressable.source_version = 0;
-        assert!(matches!(
-            PersonalDbRowEngine::build([unaddressable]),
-            Err(IndexError::InvalidDefinition(_))
-        ));
-        let rows = directory(PersonalDbRowEngine::build([row.clone()]).unwrap());
-        assert_eq!(
-            PersonalDbRowEngine::get(&rows, "db", "group", "ledger", "entry-1")
-                .await
-                .unwrap(),
-            Some(row)
-        );
-
+    async fn internal_tensor_projection_is_queryable() {
         let tensor = TensorRecord {
             model_id: "model".into(),
             tensor_name: "encoder.weight".into(),

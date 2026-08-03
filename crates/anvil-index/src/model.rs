@@ -9,7 +9,6 @@ pub enum IndexKind {
     FullText,
     Vector,
     Hybrid,
-    PersonalDbRowMetadata,
     GitSource,
     Tensor,
 }

@@ -152,7 +152,7 @@ enum IndexKind {
   INDEX_KIND_FULL_TEXT = 4;
   INDEX_KIND_VECTOR = 5;
   INDEX_KIND_HYBRID = 6;
-  INDEX_KIND_PERSONALDB_ROW_METADATA = 7;
+  reserved 7;
   INDEX_KIND_GIT_SOURCE = 8;
   INDEX_KIND_TENSOR = 9;
 }
@@ -205,11 +205,6 @@ message HybridIndexSpec {
   float vector_weight = 4;
 }
 
-message PersonalDbRowMetadataIndexSpec {
-  string database_id = 1;
-  string group_id = 2;
-}
-
 message GitSourceIndexSpec {
   string repository_id = 1;
 }
@@ -221,6 +216,7 @@ message TensorIndexSpec {
 }
 
 message IndexSpecification {
+  reserved 7;
   oneof specification {
     PathIndexSpec path = 1;
     MetadataFilterIndexSpec metadata_filter = 2;
@@ -228,7 +224,6 @@ message IndexSpecification {
     FullTextIndexSpec full_text = 4;
     VectorIndexSpec vector = 5;
     HybridIndexSpec hybrid = 6;
-    PersonalDbRowMetadataIndexSpec personaldb_row_metadata = 7;
     GitSourceIndexSpec git_source = 8;
     TensorIndexSpec tensor = 9;
   }
@@ -355,12 +350,6 @@ message HybridIndexQuery {
   repeated float vector = 2;
 }
 
-message PersonalDbRowMetadataIndexQuery {
-  string table = 1;
-  bytes primary_key = 2;
-  bool prefix = 3;
-}
-
 message GitSourceIndexQuery {
   string commit_id = 1;
   string tree_path = 2;
@@ -372,6 +361,7 @@ message TensorIndexQuery {
 }
 
 message IndexQuery {
+  reserved 7;
   oneof query {
     PathIndexQuery path = 1;
     MetadataFilterIndexQuery metadata_filter = 2;
@@ -379,7 +369,6 @@ message IndexQuery {
     FullTextIndexQuery full_text = 4;
     VectorIndexQuery vector = 5;
     HybridIndexQuery hybrid = 6;
-    PersonalDbRowMetadataIndexQuery personaldb_row_metadata = 7;
     GitSourceIndexQuery git_source = 8;
     TensorIndexQuery tensor = 9;
   }

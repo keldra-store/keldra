@@ -31,14 +31,6 @@ impl IndexObjectSnapshot {
         reader: &ClusterObjectReader,
     ) -> Result<Self, Status> {
         let specification = definition.specification()?;
-        if matches!(
-            specification.specification,
-            Some(Specification::PersonaldbRowMetadata(_))
-        ) {
-            return Err(Status::failed_precondition(
-                "PersonalDB row indexes use the canonical-log builder",
-            ));
-        }
         let heads = scanner
             .scan(IndexHeadScanScope::SourceObjects {
                 tenant_id,

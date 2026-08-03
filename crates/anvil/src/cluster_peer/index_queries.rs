@@ -474,10 +474,6 @@ fn validate_query_kind(definition: &IndexDefinition, query: &IndexQuery) -> Resu
             | (IndexKind::FullText, Some(IndexQueryValue::FullText(_)))
             | (IndexKind::Vector, Some(IndexQueryValue::Vector(_)))
             | (IndexKind::Hybrid, Some(IndexQueryValue::Hybrid(_)))
-            | (
-                IndexKind::PersonaldbRowMetadata,
-                Some(IndexQueryValue::PersonaldbRowMetadata(_))
-            )
             | (IndexKind::GitSource, Some(IndexQueryValue::GitSource(_)))
             | (IndexKind::Tensor, Some(IndexQueryValue::Tensor(_)))
     );

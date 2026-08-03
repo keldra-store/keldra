@@ -14,7 +14,7 @@ use anvil_index::hybrid::{HybridDefinition, HybridDocument, HybridEngine};
 use anvil_index::ordered::{PathDocument, PathEngine};
 use anvil_index::projections::{
     GitSourceEngine, GitSourceRecord, HuggingFaceManifestEngine, HuggingFaceManifestRecord,
-    PersonalDbRowEngine, PersonalDbRowRecord, TensorProjectionEngine, TensorRecord,
+    TensorProjectionEngine, TensorRecord,
 };
 use anvil_index::typed_json::{
     MetadataDocument, MetadataFilterEngine, TypedField, TypedJsonDefinition, TypedJsonDocument,
@@ -70,27 +70,10 @@ pub(crate) fn build_generation(
         Some(Specification::Tensor(specification)) => {
             build_tensor(&specification.model_id, objects)
         }
-        Some(Specification::PersonaldbRowMetadata(_)) => Err(IndexError::InvalidDefinition(
-            "PersonalDB row metadata is built from its canonical log, not object invalidations"
-                .into(),
-        )),
         None => Err(IndexError::InvalidDefinition(
             "index specification is required".into(),
         )),
     }
-}
-
-pub(crate) fn build_personaldb_rows(
-    rows: Vec<PersonalDbRowRecord>,
-) -> Result<BuiltIndexGeneration, IndexError> {
-    let accepted_objects = rows.len() as u64;
-    Ok(BuiltIndexGeneration {
-        artifacts: PersonalDbRowEngine::build(rows)?,
-        diagnostics: IndexBuildDiagnostics {
-            accepted_objects,
-            skipped_objects: 0,
-        },
-    })
 }
 
 pub(crate) fn build_tensor_projection(
