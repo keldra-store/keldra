@@ -10,13 +10,15 @@ use anvil_storage::v1::object_chunk::Value as ObjectChunkValue;
 use anvil_storage::v1::object_head::State as ObjectHeadState;
 use anvil_storage::v1::object_version::State as ObjectVersionState;
 use anvil_storage::v1::put_header::Operation as PutOperation;
+use anvil_storage::v1::watch_message::Message as WatchMessageValue;
 use anvil_storage::v1::{
     BucketPolicy, CreateBucketRequest, DeleteIfVersionRequest, DeleteRequest, DeleteVersionRequest,
     Durability, GetObjectRequest, HeadObjectRequest, InvokeProgramRequest,
     ListObjectVersionsRequest, ListObjectsRequest, ObjectAddress, ObjectVersioning,
     PrepareNodeRequest, ProvisionTenantRequest, PutHeader, PutIfAbsentOperation,
     PutIfVersionOperation, PutImmutableOperation, PutOperation as UnconditionalPutOperation,
-    PutRequest, SetBucketPolicyRequest, SetBucketVersioningRequest,
+    PutRequest, SetBucketPolicyRequest, SetBucketVersioningRequest, WatchNow, WatchPrefixRequest,
+    WatchRetainedBeginning, WatchStateHint,
 };
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -95,6 +97,22 @@ enum Command {
         start_after: Option<String>,
         #[arg(long, default_value_t = 100)]
         limit: u32,
+    },
+    /// Stream unordered, at-least-once invalidations below a path prefix.
+    Watch {
+        tenant: String,
+        bucket: String,
+        #[arg(long, default_value = "")]
+        prefix: String,
+        /// Replay the retained source-journal window instead of starting now.
+        #[arg(long)]
+        retained: bool,
+        /// Exit successfully after this many invalidations.
+        #[arg(long, default_value_t = 1)]
+        events: u32,
+        /// Fail if the stream makes no progress for this many seconds.
+        #[arg(long, default_value_t = 30)]
+        idle_timeout_seconds: u64,
     },
     Delete {
         tenant: String,
@@ -366,6 +384,59 @@ async fn main() -> Result<()> {
                     anyhow::anyhow!("server returned has_more without a continuation path")
                 })?;
                 eprintln!("more paths available; resume with --start-after {cursor:?}");
+            }
+        }
+        Command::Watch {
+            tenant,
+            bucket,
+            prefix,
+            retained,
+            events,
+            idle_timeout_seconds,
+        } => {
+            if events == 0 {
+                bail!("--events must be greater than zero");
+            }
+            if idle_timeout_seconds == 0 {
+                bail!("--idle-timeout-seconds must be greater than zero");
+            }
+            let start = if retained {
+                anvil_storage::v1::watch_prefix_request::Start::RetainedBeginning(
+                    WatchRetainedBeginning {},
+                )
+            } else {
+                anvil_storage::v1::watch_prefix_request::Start::Now(WatchNow {})
+            };
+            let mut stream = client
+                .watch_prefix(WatchPrefixRequest {
+                    prefix: Some(address(tenant, bucket, prefix)),
+                    start: Some(start),
+                })
+                .await?
+                .into_inner();
+            let idle = std::time::Duration::from_secs(idle_timeout_seconds);
+            let mut received = 0_u32;
+            while received < events {
+                let message = tokio::time::timeout(idle, stream.message())
+                    .await
+                    .context("watch stream made no progress before its idle timeout")??
+                    .context("watch stream ended before the requested invalidation count")?;
+                let Some(WatchMessageValue::Invalidation(invalidation)) = message.message else {
+                    continue;
+                };
+                let address = invalidation
+                    .address
+                    .context("watch invalidation has no object address")?;
+                let state = match WatchStateHint::try_from(invalidation.state_hint) {
+                    Ok(WatchStateHint::Present) => "present",
+                    Ok(WatchStateHint::Deleted) => "deleted",
+                    _ => bail!("watch invalidation has an unspecified state hint"),
+                };
+                println!(
+                    "{state}\t{}\t{}",
+                    address.path, invalidation.minimum_path_version
+                );
+                received += 1;
             }
         }
         Command::Delete {
