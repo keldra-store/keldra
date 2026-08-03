@@ -301,6 +301,11 @@ message HandoffSourceJournalStatusRequest {
   HandoffScope handoff = 2;
 }
 
+message CompleteSystemBootstrapHandoffRequest {
+  PeerContext peer = 1;
+  HandoffScope handoff = 2;
+}
+
 message HandoffSourceJournalReadRequest {
   PeerContext peer = 1;
   HandoffScope handoff = 2;
@@ -347,6 +352,7 @@ service DataPeer {
   rpc ReadHandoffObjectPathSnapshot(HandoffObjectPathSnapshotRequest) returns (ObjectPathSnapshotResponse);
   rpc RepairHandoffObjectPathSnapshot(RepairHandoffObjectPathSnapshotRequest) returns (ObjectPathSnapshotApplied);
   rpc GetHandoffSourceJournalStatus(HandoffSourceJournalStatusRequest) returns (SourceJournalStatus);
+  rpc CompleteSystemBootstrapHandoff(CompleteSystemBootstrapHandoffRequest) returns (HandoffRecordApplied);
   rpc ReadHandoffSourceJournal(HandoffSourceJournalReadRequest) returns (SourceJournalPage);
   rpc GetHandoffReferenceCursor(HandoffReferenceCursorRequest) returns (ReferenceDeltaStatus);
   rpc AdvanceHandoffReferenceCursor(HandoffReferenceCursorAdvanceRequest) returns (ReferenceDeltaApplied);

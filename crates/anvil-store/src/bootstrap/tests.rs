@@ -112,6 +112,23 @@ async fn bootstrap_installs_one_complete_system_state_batch() {
 }
 
 #[tokio::test]
+async fn completed_handoff_marker_is_durable_and_idempotent() {
+    let (_directory, store) = store().await;
+    assert_eq!(
+        store.system_bootstrap_state().unwrap(),
+        SystemBootstrapState::Missing
+    );
+    assert!(!store.complete_system_bootstrap_handoff().unwrap());
+    assert_eq!(
+        store.system_bootstrap_state().unwrap(),
+        SystemBootstrapState::Complete {
+            version: SYSTEM_BOOTSTRAP_VERSION,
+        }
+    );
+    assert!(store.complete_system_bootstrap_handoff().unwrap());
+}
+
+#[tokio::test]
 async fn repeat_bootstrap_is_rejected_without_minting_another_administrator() {
     let (_directory, store) = store().await;
     store

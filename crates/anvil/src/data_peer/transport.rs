@@ -640,6 +640,23 @@ impl DataPeerTransport {
         })
     }
 
+    pub(crate) async fn complete_system_bootstrap_handoff(
+        &self,
+        target: NodeId,
+        address: &str,
+    ) -> Result<bool, Status> {
+        let response = self
+            .client(target, address)?
+            .complete_system_bootstrap_handoff(wire::CompleteSystemBootstrapHandoffRequest {
+                peer: Some(self.context()),
+                handoff: Some(self.handoff()?),
+            })
+            .await?
+            .into_inner();
+        require_response_schema(response.schema_version)?;
+        Ok(response.replayed)
+    }
+
     pub(crate) async fn read_handoff_source_journal(
         &self,
         target: NodeId,

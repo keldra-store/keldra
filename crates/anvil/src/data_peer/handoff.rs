@@ -100,6 +100,22 @@ pub(super) async fn source_journal_status(
     }))
 }
 
+pub(super) async fn complete_system_bootstrap(
+    service: &DataPeerService,
+    mut request: Request<wire::CompleteSystemBootstrapHandoffRequest>,
+) -> Result<Response<wire::HandoffRecordApplied>, Status> {
+    let peer = request.get_ref().peer.clone();
+    let caller = service.authorize(&mut request, peer.as_ref(), PeerRpcKind::StateTransfer)?;
+    let handoff = request.get_ref().handoff.clone();
+    service.validate_handoff(caller, handoff.as_ref(), HandoffTarget::JoiningNode)?;
+    let store = service.store.clone();
+    let replayed = tokio::task::spawn_blocking(move || store.complete_system_bootstrap_handoff())
+        .await
+        .map_err(join_status)?
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    applied_response(replayed)
+}
+
 pub(super) async fn read_source_journal(
     service: &DataPeerService,
     mut request: Request<wire::HandoffSourceJournalReadRequest>,

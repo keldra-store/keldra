@@ -376,6 +376,13 @@ impl Store {
         self.credentials().bootstrap_system(request)
     }
 
+    /// Records that the protected identity was installed by a completed typed
+    /// cluster handoff. The handoff gate is responsible for proving that the
+    /// catalogue, realm, applications, and credentials are already durable.
+    pub fn complete_system_bootstrap_handoff(&self) -> Result<bool, SystemBootstrapError> {
+        self.credentials().complete_system_bootstrap_handoff()
+    }
+
     pub fn credential(
         &self,
         client_id: &str,
@@ -668,6 +675,29 @@ impl CredentialRepository {
         );
         authz.write(batch)?;
         Ok(())
+    }
+
+    pub fn complete_system_bootstrap_handoff(&self) -> Result<bool, SystemBootstrapError> {
+        let authz = self.store.authz();
+        let _guard = authz.lock_writes()?;
+        if matches!(
+            self.system_bootstrap_state()?,
+            SystemBootstrapState::Complete {
+                version: SYSTEM_BOOTSTRAP_VERSION
+            }
+        ) {
+            return Ok(true);
+        }
+        let mut batch = WriteBatch::default();
+        batch.put_cf(
+            self.cf(CF_METADATA)?,
+            SYSTEM_BOOTSTRAP_MARKER_KEY,
+            encode_json(&BootstrapMarker {
+                version: SYSTEM_BOOTSTRAP_VERSION,
+            })?,
+        );
+        authz.write(batch)?;
+        Ok(false)
     }
 
     pub fn provision_tenant(

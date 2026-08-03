@@ -831,6 +831,13 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
         handoff::source_journal_status(self, request).await
     }
 
+    async fn complete_system_bootstrap_handoff(
+        &self,
+        request: Request<wire::CompleteSystemBootstrapHandoffRequest>,
+    ) -> Result<Response<wire::HandoffRecordApplied>, Status> {
+        handoff::complete_system_bootstrap(self, request).await
+    }
+
     async fn read_handoff_source_journal(
         &self,
         request: Request<wire::HandoffSourceJournalReadRequest>,
@@ -1397,6 +1404,13 @@ mod tests {
             "GetHandoffSourceJournalStatus"
         );
         require_denied!(
+            client.complete_system_bootstrap_handoff(wire::CompleteSystemBootstrapHandoffRequest {
+                peer: Some(peer.clone()),
+                handoff: None,
+            }),
+            "CompleteSystemBootstrapHandoff"
+        );
+        require_denied!(
             client.read_handoff_source_journal(wire::HandoffSourceJournalReadRequest {
                 peer: Some(peer.clone()),
                 handoff: None,
@@ -1495,7 +1509,7 @@ mod tests {
             "InstallPayloadLifecycle"
         );
         assert_eq!(
-            denied, 37,
+            denied, 38,
             "the DataPeer RPC list changed without updating this test"
         );
     }

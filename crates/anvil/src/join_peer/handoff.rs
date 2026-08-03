@@ -9,7 +9,8 @@ use std::sync::Arc;
 
 use anvil_consensus::{
     ClusterId, DecisionRaft, MembershipTransition, MembershipTransitionKind, NodeDescriptor,
-    NodeId, NodeState, SERVING_LEASE_CUTOVER_WAIT, ServingLeaseIssuer,
+    NodeId, NodeState, SERVING_LEASE_CUTOVER_WAIT, SYSTEM_BOOTSTRAP_VERSION, ServingLeaseIssuer,
+    SystemBootstrapState,
 };
 use anvil_store::{
     ErasureProfile, LocalChange, MAX_LOCAL_INVALIDATION_SCAN_RECORDS, PlacementLogId, SourceId,
@@ -374,6 +375,25 @@ impl JoinActivationGate for TypedAddHandoff {
             ));
         }
         self.require_current(descriptor, transition).await?;
+        match self
+            .decisions
+            .state()
+            .map_err(|error| Status::unavailable(error.to_string()))?
+            .system_bootstrap()
+        {
+            SystemBootstrapState::Complete {
+                version: SYSTEM_BOOTSTRAP_VERSION,
+                ..
+            } => {}
+            _ => {
+                return Err(Status::failed_precondition(
+                    "cluster system bootstrap is not complete",
+                ));
+            }
+        }
+        peers
+            .complete_system_bootstrap_handoff(topology.joining.node_id, &topology.joining.address)
+            .await?;
         Ok(JoinActivationPermit::after_handoff(
             lease_pause,
             program_quiescence,
