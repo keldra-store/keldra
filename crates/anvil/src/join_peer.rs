@@ -27,6 +27,9 @@ use tonic::{Request, Response, Status};
 use crate::join_bundle::hash_capability;
 use crate::node_identity::{PendingJoinIdentity, PendingJoinSeed};
 
+mod handoff;
+pub(crate) use handoff::TypedAddHandoff;
+
 pub(crate) mod wire {
     tonic::include_proto!("anvil.join_peer.v1");
 }
@@ -77,7 +80,7 @@ impl JoinBootstrapPins {
                 kind,
                 PeerRpcKind::AppendEntries
                     | PeerRpcKind::InstallSnapshot
-                    | PeerRpcKind::StateTransfer
+                    | PeerRpcKind::JoinControl
             )
         {
             return None;
@@ -123,7 +126,34 @@ pub(crate) trait JoinActivationGate: Send + Sync + 'static {
         &self,
         descriptor: &NodeDescriptor,
         transition: &MembershipTransition,
-    ) -> Result<(), Status>;
+    ) -> Result<JoinActivationPermit, Status>;
+}
+
+/// Keeps old-placement lease grants paused across the Raft activation append.
+pub(crate) struct JoinActivationPermit {
+    _lease_pause: Option<anvil_consensus::ServingLeaseGrantPause>,
+}
+
+impl std::fmt::Debug for JoinActivationPermit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("JoinActivationPermit")
+            .field("lease_pause", &self._lease_pause.is_some())
+            .finish()
+    }
+}
+
+impl JoinActivationPermit {
+    pub(crate) fn after_handoff(pause: anvil_consensus::ServingLeaseGrantPause) -> Self {
+        Self {
+            _lease_pause: Some(pause),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_only() -> Self {
+        Self { _lease_pause: None }
+    }
 }
 
 pub(crate) struct RejectIncompleteHandoff;
@@ -134,7 +164,7 @@ impl JoinActivationGate for RejectIncompleteHandoff {
         &self,
         _descriptor: &NodeDescriptor,
         _transition: &MembershipTransition,
-    ) -> Result<(), Status> {
+    ) -> Result<JoinActivationPermit, Status> {
         Err(Status::failed_precondition(
             "typed ownership handoff has not completed",
         ))
@@ -193,7 +223,7 @@ impl JoinPeerService {
             self.pins.as_ref(),
             cluster_id,
             NodeId(envelope.source_node_id),
-            PeerRpcKind::StateTransfer,
+            PeerRpcKind::JoinControl,
             presented_pin,
         )
         .map_err(|_| Status::permission_denied("joining peer is not authorized"))?;
@@ -347,7 +377,8 @@ impl wire::join_peer_server::JoinPeer for JoinPeerService {
             ));
         }
         if descriptor.state == NodeState::Joining {
-            self.activation_gate
+            let activation_permit = self
+                .activation_gate
                 .ensure_handoff_complete(&descriptor, &transition)
                 .await?;
             let advanced = self
@@ -366,6 +397,10 @@ impl wire::join_peer_server::JoinPeer for JoinPeerService {
                     "ADD activation returned an unexpected result",
                 ));
             }
+            // The applied placement has changed, so an old request can no
+            // longer match a grant. Release the pause only after that durable
+            // boundary; normal issuer cutover handles the new placement.
+            drop(activation_permit);
         }
         self.decisions
             .apply_fixed_voters_for_transition(transition.started_log_index)
@@ -771,7 +806,7 @@ mod tests {
         for kind in [
             PeerRpcKind::AppendEntries,
             PeerRpcKind::InstallSnapshot,
-            PeerRpcKind::StateTransfer,
+            PeerRpcKind::JoinControl,
         ] {
             assert!(
                 pins.authorized_catch_up_pins(cluster_id, NodeId(1), kind)
@@ -782,6 +817,7 @@ mod tests {
             PeerRpcKind::Vote,
             PeerRpcKind::ServingLease,
             PeerRpcKind::DataPlane,
+            PeerRpcKind::StateTransfer,
         ] {
             assert!(
                 pins.authorized_catch_up_pins(cluster_id, NodeId(1), kind)
@@ -789,12 +825,8 @@ mod tests {
             );
         }
         assert!(
-            pins.authorized_catch_up_pins(
-                ClusterId([5; 16]),
-                NodeId(1),
-                PeerRpcKind::StateTransfer
-            )
-            .is_none()
+            pins.authorized_catch_up_pins(ClusterId([5; 16]), NodeId(1), PeerRpcKind::JoinControl)
+                .is_none()
         );
         pins.clear();
         assert!(pins.connection_pins(NodeId(1)).is_none());

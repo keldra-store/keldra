@@ -14,7 +14,8 @@ use anvil_consensus::{
     CommittedPeerPinProvider, CommittedPeerPins, DecisionRaft, DecisionRaftError,
     JoinCapabilityHash, MAX_PEER_ADDRESS_BYTES, MembershipTransitionKind, NodeDescriptor, NodeId,
     NodeState, PeerAddress, PeerNode, PeerRpcKind, PeerSpkiSha256, PeerTlsAcceptor, PeerTlsConfig,
-    PeerTlsConnector, PeerTlsError, PeerTlsIdentity, TonicPeerTransport, TonicRaftPeerService,
+    PeerTlsConnector, PeerTlsError, PeerTlsIdentity, ServingLeaseIssuer, TonicPeerTransport,
+    TonicRaftPeerService,
 };
 use anvil_store::{ErasureProfile, Store};
 use anyhow::{Context, Result, bail};
@@ -25,8 +26,7 @@ use uuid::Uuid;
 
 use crate::data_peer::{DataPeerService, DataPeerTransport};
 use crate::join_peer::{
-    JoinActivationGate, JoinBootstrapPins, JoinPeerService, JoinPeerTransport,
-    RejectIncompleteHandoff,
+    JoinActivationGate, JoinBootstrapPins, JoinPeerService, JoinPeerTransport, TypedAddHandoff,
 };
 use crate::node_identity::{self, LocalNodeIdentity};
 use crate::payload_distribution::PayloadPeerService;
@@ -411,6 +411,15 @@ impl PeerRuntime {
         maximum_unary_time: Duration,
         max_blob_bytes: u64,
     ) -> Result<PeerServerHandle> {
+        let leases = ServingLeaseIssuer::new();
+        let activation_gate = Arc::new(TypedAddHandoff::new(
+            self.node_id,
+            decisions.clone(),
+            store.clone(),
+            self.data_transport.clone(),
+            leases.clone(),
+            erasure_profile,
+        ));
         self.start_with_activation_gate(
             peer_listen,
             decisions,
@@ -418,7 +427,8 @@ impl PeerRuntime {
             erasure_profile,
             maximum_unary_time,
             max_blob_bytes,
-            Arc::new(RejectIncompleteHandoff),
+            leases,
+            activation_gate,
         )
         .await
     }
@@ -432,6 +442,7 @@ impl PeerRuntime {
         erasure_profile: ErasureProfile,
         maximum_unary_time: Duration,
         max_blob_bytes: u64,
+        leases: ServingLeaseIssuer,
         activation_gate: Arc<dyn JoinActivationGate>,
     ) -> Result<PeerServerHandle> {
         anyhow::ensure!(
@@ -458,7 +469,12 @@ impl PeerRuntime {
                     None
                 }
             });
-        let service = TonicRaftPeerService::new(decisions.clone(), self.pins.clone()).into_server();
+        let service = TonicRaftPeerService::with_serving_lease_issuer(
+            decisions.clone(),
+            self.pins.clone(),
+            leases,
+        )
+        .into_server();
         let payload_service = PayloadPeerService::new(
             self.node_id,
             store.clone(),
@@ -469,12 +485,18 @@ impl PeerRuntime {
             max_blob_bytes,
         )
         .into_server();
-        let join_service =
-            JoinPeerService::new(decisions, self.node_id, self.pins.clone(), activation_gate)
-                .into_server();
+        let join_service = JoinPeerService::new(
+            decisions.clone(),
+            self.node_id,
+            self.pins.clone(),
+            activation_gate,
+        )
+        .into_server();
         let data_service = DataPeerService::new(
             store,
             self.pins.clone(),
+            decisions,
+            self.node_id,
             erasure_profile,
             maximum_unary_time,
             max_blob_bytes,
@@ -950,14 +972,15 @@ impl CommittedPeerPinProvider for RaftCommittedPeerPins {
             }
             let descriptor = state.cluster_control().nodes().get(&node_id)?;
             let allowed = match kind {
-                PeerRpcKind::StateTransfer => {
+                PeerRpcKind::JoinControl => {
                     matches!(descriptor.state, NodeState::Active | NodeState::Joining)
                 }
                 PeerRpcKind::AppendEntries
                 | PeerRpcKind::Vote
                 | PeerRpcKind::InstallSnapshot
                 | PeerRpcKind::ServingLease
-                | PeerRpcKind::DataPlane => descriptor.state == NodeState::Active,
+                | PeerRpcKind::DataPlane
+                | PeerRpcKind::StateTransfer => descriptor.state == NodeState::Active,
             };
             return allowed.then_some(CommittedPeerPins {
                 current: descriptor.current_peer_spki_sha256,
@@ -988,8 +1011,8 @@ mod tests {
             &self,
             _descriptor: &NodeDescriptor,
             _transition: &anvil_consensus::MembershipTransition,
-        ) -> Result<(), tonic::Status> {
-            Ok(())
+        ) -> Result<crate::join_peer::JoinActivationPermit, tonic::Status> {
+            Ok(crate::join_peer::JoinActivationPermit::test_only())
         }
     }
 
@@ -1223,6 +1246,7 @@ mod tests {
                 ErasureProfile::default(),
                 Duration::from_secs(30),
                 16 * 1024 * 1024,
+                ServingLeaseIssuer::new(),
                 Arc::new(AllowCompletedHandoff),
             )
             .await
