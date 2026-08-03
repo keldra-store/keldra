@@ -37,6 +37,11 @@ mod payload_read;
 mod peer_runtime;
 mod placement;
 mod programs;
+#[allow(
+    dead_code,
+    reason = "transport-neutral delivery awaits the approved quorum-proof adapter"
+)]
+mod reference_delivery;
 mod serving_fence;
 mod v05;
 
