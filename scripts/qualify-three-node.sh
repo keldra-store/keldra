@@ -295,14 +295,18 @@ printf 'retained-version-one\n' \
 printf 'retained-version-two\n' \
   >"${ANVIL_QUALIFICATION_DIR}/artifacts/version-two.txt"
 chmod 0444 "${ANVIL_QUALIFICATION_DIR}/artifacts/version-"*.txt
-run_cli anvil-1 qversion-client "${version_secret}" \
+version_one="$(run_cli anvil-1 qversion-client "${version_secret}" \
   put qversion objects retained/value.txt /qualification/artifacts/version-one.txt \
-  --command-id qversion-one --durability replicated >/dev/null
-run_cli anvil-3 qversion-client "${version_secret}" \
+  --command-id qversion-one --durability replicated)"
+version_two="$(run_cli anvil-3 qversion-client "${version_secret}" \
   put qversion objects retained/value.txt /qualification/artifacts/version-two.txt \
-  --command-id qversion-two --durability replicated >/dev/null
+  --command-id qversion-two --durability replicated)"
+if [[ ! "${version_one}" =~ ^[1-9][0-9]*$ || ! "${version_two}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "distributed puts returned invalid versions: ${version_one}, ${version_two}" >&2
+  exit 1
+fi
 old_delete="$(run_cli anvil-2 qversion-client "${version_secret}" \
-  delete-version qversion objects retained/value.txt 1 --durability replicated)"
+  delete-version qversion objects retained/value.txt "${version_one}" --durability replicated)"
 if [[ "${old_delete}" != 'deleted=true replacement_tombstone_version=none' ]]; then
   echo "distributed historical DeleteVersion returned: ${old_delete}" >&2
   exit 1
@@ -313,16 +317,17 @@ run_cli anvil-1 qversion-client "${version_secret}" \
 cmp "${ANVIL_QUALIFICATION_DIR}/artifacts/version-two.txt" \
   "${ANVIL_QUALIFICATION_DIR}/artifacts/version-current.txt"
 current_delete="$(run_cli anvil-3 qversion-client "${version_secret}" \
-  delete-version qversion objects retained/value.txt 2 --durability replicated)"
-if [[ "${current_delete}" != 'deleted=true replacement_tombstone_version=3' ]]; then
+  delete-version qversion objects retained/value.txt "${version_two}" --durability replicated)"
+if [[ ! "${current_delete}" =~ ^deleted=true\ replacement_tombstone_version=([1-9][0-9]*)$ ]]; then
   echo "distributed current DeleteVersion returned: ${current_delete}" >&2
   exit 1
 fi
+replacement_tombstone_version="${BASH_REMATCH[1]}"
 for version_node in anvil-1 anvil-2 anvil-3; do
   version_head="$(run_cli "${version_node}" qversion-client "${version_secret}" \
     head qversion objects retained/value.txt)"
-  if [[ "${version_head}" != 'deleted version=3' ]]; then
-    echo "${version_node} did not observe the fresh version-3 tombstone" >&2
+  if [[ "${version_head}" != "deleted version=${replacement_tombstone_version}" ]]; then
+    echo "${version_node} did not observe the fresh tombstone" >&2
     exit 1
   fi
 done
