@@ -89,7 +89,7 @@ and BLAKE3 payload digest. A completed run fails if it exceeds 150 seconds, an
 item fails, any mutation replays on the verified-empty target, or verification
 is incomplete.
 
-`durability` is a closed choice. `local` is the only valid mode for this 0.5.1
+`durability` is a closed choice. `local` is the only valid mode for this 0.5.2
 qualification. `replicated` remains part of the API and requires enough active
 nodes for the configured erasure profile, so the tool rejects it before a run.
 
