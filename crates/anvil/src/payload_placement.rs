@@ -43,27 +43,25 @@ impl PayloadPlacement {
     /// Enforce the response boundary using exact per-node durable evidence.
     ///
     /// Logical metadata always needs its independent quorum. Both durability
-    /// choices require the rank-zero upload coordinator's complete source;
+    /// choices require the explicit upload source's complete content;
     /// `REPLICATED` additionally requires all selected small-copy owners or
     /// `K + 1` correctly placed final shard ordinals.
     pub(crate) fn require_ready(
         &self,
         durability: Durability,
         metadata_quorum: bool,
+        upload_source: NodeId,
         evidence: &[NodePayloadEvidence],
     ) -> Result<(), PayloadReadinessError> {
         if !metadata_quorum {
             return Err(PayloadReadinessError::MetadataQuorum);
         }
         ensure_distinct_node_evidence(evidence)?;
-        let coordinator = self
-            .coordinator()
-            .ok_or(PayloadReadinessError::CoordinatorSource)?;
         if !evidence
             .iter()
-            .any(|entry| entry.node_id == coordinator && entry.complete_copy)
+            .any(|entry| entry.node_id == upload_source && entry.complete_copy)
         {
-            return Err(PayloadReadinessError::CoordinatorSource);
+            return Err(PayloadReadinessError::UploadSource);
         }
         if durability == Durability::Local {
             return Ok(());
@@ -108,13 +106,6 @@ impl PayloadPlacement {
         }
         Ok(())
     }
-
-    fn coordinator(&self) -> Option<NodeId> {
-        match self {
-            Self::Small(placement) => placement.owners.first().copied(),
-            Self::Large(placement) => placement.shards.first().map(|shard| shard.owner),
-        }
-    }
 }
 
 /// Durable artifact evidence returned by one exact placement owner.
@@ -141,14 +132,26 @@ impl NodePayloadEvidence {
             shard_ordinal,
         }
     }
+
+    pub(crate) const fn node_id(self) -> NodeId {
+        self.node_id
+    }
+
+    pub(crate) const fn complete_copy(self) -> bool {
+        self.complete_copy
+    }
+
+    pub(crate) const fn shard_ordinal(self) -> Option<u16> {
+        self.shard_ordinal
+    }
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub(crate) enum PayloadReadinessError {
     #[error("logical metadata quorum is not durable")]
     MetadataQuorum,
-    #[error("rank-zero coordinator has not durably sealed the complete source")]
-    CoordinatorSource,
+    #[error("the upload source has not durably sealed the complete content")]
+    UploadSource,
     #[error("node {node_id:?} supplied contradictory payload evidence")]
     ContradictoryNode { node_id: NodeId },
     #[error("only {durable} of {required} required complete copies are durable")]
@@ -435,26 +438,26 @@ mod tests {
     }
 
     #[test]
-    fn local_requires_metadata_and_the_rank_zero_complete_source_only() {
+    fn local_requires_metadata_and_the_explicit_upload_source_only() {
         let placement = select_payload_placement(
             cluster_id(),
             &content(SMALL_BLOB_MAX_BYTES as u64 + 1),
             profile(),
             &nodes(),
         );
-        let coordinator = placement.coordinator().unwrap();
-        let source = [NodePayloadEvidence::new(coordinator, true, None)];
+        let upload_source = NodeId(97);
+        let source = [NodePayloadEvidence::new(upload_source, true, None)];
 
         assert_eq!(
-            placement.require_ready(Durability::Local, false, &source),
+            placement.require_ready(Durability::Local, false, upload_source, &source),
             Err(PayloadReadinessError::MetadataQuorum)
         );
         assert_eq!(
-            placement.require_ready(Durability::Local, true, &[]),
-            Err(PayloadReadinessError::CoordinatorSource)
+            placement.require_ready(Durability::Local, true, upload_source, &[]),
+            Err(PayloadReadinessError::UploadSource)
         );
         assert_eq!(
-            placement.require_ready(Durability::Local, true, &source),
+            placement.require_ready(Durability::Local, true, upload_source, &source),
             Ok(())
         );
     }
@@ -471,14 +474,15 @@ mod tests {
             .copied()
             .map(|owner| NodePayloadEvidence::new(owner, true, None))
             .collect::<Vec<_>>();
+        let upload_source = small.owners()[0];
 
         assert_eq!(
-            placement.require_ready(Durability::Replicated, true, &evidence),
+            placement.require_ready(Durability::Replicated, true, upload_source, &evidence),
             Ok(())
         );
         evidence.pop();
         assert_eq!(
-            placement.require_ready(Durability::Replicated, true, &evidence),
+            placement.require_ready(Durability::Replicated, true, upload_source, &evidence),
             Err(PayloadReadinessError::CompleteCopies {
                 required: 3,
                 durable: 2,
@@ -505,13 +509,14 @@ mod tests {
                 NodePayloadEvidence::new(shard.owner(), shard.ordinal() == 0, Some(shard.ordinal()))
             })
             .collect::<Vec<_>>();
+        let upload_source = large.shards()[0].owner();
 
         assert_eq!(
-            placement.require_ready(Durability::Replicated, true, &evidence),
+            placement.require_ready(Durability::Replicated, true, upload_source, &evidence),
             Ok(())
         );
         assert_eq!(
-            placement.require_ready(Durability::Replicated, true, &evidence[..2]),
+            placement.require_ready(Durability::Replicated, true, upload_source, &evidence[..2],),
             Err(PayloadReadinessError::FinalShards {
                 required: 3,
                 durable: 2,
@@ -537,9 +542,10 @@ mod tests {
                 NodePayloadEvidence::new(shard.owner(), shard.ordinal() == 0, Some(shard.ordinal()))
             })
             .collect::<Vec<_>>();
+        let upload_source = large.shards()[0].owner();
         evidence[2].shard_ordinal = Some(1);
         assert_eq!(
-            placement.require_ready(Durability::Replicated, true, &evidence),
+            placement.require_ready(Durability::Replicated, true, upload_source, &evidence),
             Err(PayloadReadinessError::FinalShards {
                 required: 3,
                 durable: 2,
@@ -548,7 +554,7 @@ mod tests {
 
         evidence.push(evidence[0]);
         assert_eq!(
-            placement.require_ready(Durability::Replicated, true, &evidence),
+            placement.require_ready(Durability::Replicated, true, upload_source, &evidence),
             Err(PayloadReadinessError::ContradictoryNode {
                 node_id: evidence[0].node_id,
             })

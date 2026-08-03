@@ -748,7 +748,11 @@ impl DataPeerTransport {
         }
     }
 
-    fn channel(&self, target: NodeId, address: &str) -> Result<Channel, Status> {
+    pub(crate) fn peer_identity(&self) -> (ClusterId, NodeId) {
+        (self.cluster_id, self.source_node_id)
+    }
+
+    pub(crate) fn channel(&self, target: NodeId, address: &str) -> Result<Channel, Status> {
         if target.0 == 0 {
             return Err(Status::invalid_argument("target node id must not be zero"));
         }

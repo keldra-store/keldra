@@ -15,6 +15,7 @@ mod mutable_record_quorum;
 mod mutable_record_replica_group;
 mod node_identity;
 pub mod observability;
+mod payload_distribution;
 mod payload_placement;
 mod peer_runtime;
 mod placement;
