@@ -370,7 +370,7 @@ fi
 echo "[anvil-qualification] distributed listing and pagination test passed"
 
 watch_paths="$(run_cli anvil-3 qlist-client "${list_secret}" \
-  watch qlist objects --prefix prefix/ --retained --events 4 \
+  watch qlist objects --prefix prefix --retained --events 4 \
   --idle-timeout-seconds 30 \
   | cut -f2 | sort)"
 if [[ "${watch_paths}" != "${expected_list}" ]]; then
