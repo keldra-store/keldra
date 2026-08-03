@@ -8,7 +8,10 @@ use serde_json::json;
 use tempfile::TempDir;
 
 use super::*;
-use crate::{BucketPolicy, Durability, PutMode, PutRequest, StoreOptions};
+use crate::{
+    BucketPolicy, Durability, LogicalRecordCandidate, LogicalRecordMutationContext,
+    LogicalRecordValue, ObjectVersioning, PlacementLogId, PutMode, PutRequest, StoreOptions,
+};
 
 fn counter_path() -> ObjectPath {
     ObjectPath::new("tenant", "bucket", "managed/counter").unwrap()
@@ -102,6 +105,42 @@ async fn configure_policy(store: &Store) {
         )
         .await
         .unwrap();
+}
+
+fn install_versioned_governance(store: &Store) {
+    let (tenant_id, bucket_id) = store.resolve_bucket_ids("tenant", "bucket").unwrap();
+    for value in [
+        LogicalRecordValue::BucketPolicy {
+            tenant_id,
+            bucket_id,
+            policy: BucketPolicy {
+                program_only_prefixes: vec!["managed".into()],
+                ..Default::default()
+            },
+        },
+        LogicalRecordValue::BucketOptions {
+            tenant_id,
+            bucket_id,
+            versioning: ObjectVersioning::Unversioned,
+        },
+    ] {
+        let id = value.id();
+        let mutation = store
+            .construct_logical_record_mutation(
+                value,
+                LogicalRecordMutationContext {
+                    record_version: store.allocate_logical_record_version().unwrap(),
+                    active_placement_log_id: PlacementLogId { term: 3, index: 7 },
+                    serving_fence_term: 3,
+                },
+            )
+            .unwrap();
+        store.commit_logical_record_mutation(&mutation).unwrap();
+        assert!(matches!(
+            store.logical_record_candidate(&id).unwrap(),
+            Some(LogicalRecordCandidate::Versioned(_))
+        ));
+    }
 }
 
 fn reserved_program_path_attempt(
@@ -883,6 +922,18 @@ async fn immutable_read_only_program_dependency_still_requires_program_only_poli
 #[tokio::test]
 async fn distributed_path_stage_is_invisible_until_commit_bound_finalization() {
     let (_temporary, store, program) = configured_store().await;
+    install_versioned_governance(&store);
+    assert_eq!(
+        store.bucket_policy("tenant", "bucket").unwrap(),
+        BucketPolicy {
+            program_only_prefixes: vec!["managed".into()],
+            ..Default::default()
+        }
+    );
+    assert_eq!(
+        store.bucket_versioning("tenant", "bucket").unwrap(),
+        ObjectVersioning::Unversioned
+    );
     let engine = store.program_engine(&program).unwrap();
     let lease = engine
         .prepare(

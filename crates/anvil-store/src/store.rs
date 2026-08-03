@@ -696,12 +696,30 @@ impl Store {
         &self,
         key: &[u8],
     ) -> Result<ObjectVersioning, MutationError> {
-        self.db
+        let Some(encoded) = self
+            .db
             .get_cf(self.cf(CF_BUCKET_OPTIONS)?, key)
             .map_err(storage_error)?
-            .map(|encoded| decode_object_versioning(&encoded))
-            .transpose()
-            .map(|versioning| versioning.unwrap_or_default())
+        else {
+            return Ok(ObjectVersioning::default());
+        };
+        let identity = BucketIdentity::decode(key).map_err(storage_error)?;
+        let id = crate::LogicalRecordId::BucketOptions {
+            tenant_id: identity.tenant_id.0,
+            bucket_id: identity.bucket_id.0,
+        };
+        match decode_current_value(&id, &encoded).map_err(storage_error)? {
+            crate::LogicalRecordValue::BucketOptions {
+                tenant_id,
+                bucket_id,
+                versioning,
+            } if tenant_id == identity.tenant_id.0 && bucket_id == identity.bucket_id.0 => {
+                Ok(versioning)
+            }
+            _ => Err(MutationError::Storage(
+                "bucket options have the wrong logical type or identity".into(),
+            )),
+        }
     }
 
     /// Enables retained object versions for one bucket. Absence is the
@@ -757,7 +775,30 @@ impl Store {
         #[cfg(test)]
         self.policy_lookup_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.read_json(CF_POLICIES, key)
+        let Some(encoded) = self
+            .db
+            .get_cf(self.cf(CF_POLICIES)?, key)
+            .map_err(storage_error)?
+        else {
+            return Ok(None);
+        };
+        let identity = BucketIdentity::decode(key).map_err(storage_error)?;
+        let id = crate::LogicalRecordId::BucketPolicy {
+            tenant_id: identity.tenant_id.0,
+            bucket_id: identity.bucket_id.0,
+        };
+        match decode_current_value(&id, &encoded).map_err(storage_error)? {
+            crate::LogicalRecordValue::BucketPolicy {
+                tenant_id,
+                bucket_id,
+                policy,
+            } if tenant_id == identity.tenant_id.0 && bucket_id == identity.bucket_id.0 => {
+                Ok(Some(policy))
+            }
+            _ => Err(MutationError::Storage(
+                "bucket policy has the wrong logical type or identity".into(),
+            )),
+        }
     }
 
     fn read_json<T: for<'de> Deserialize<'de>>(

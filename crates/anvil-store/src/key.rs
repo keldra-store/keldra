@@ -36,6 +36,29 @@ impl BucketIdentity {
         encoded
     }
 
+    pub(crate) fn decode(encoded: &[u8]) -> Result<Self, ObjectKeyError> {
+        let encoded: &[u8; Self::ENCODED_BYTES] = encoded
+            .try_into()
+            .map_err(|_| ObjectKeyError::MalformedStorageKey)?;
+        if encoded[0] != STORAGE_KEY_FORMAT_VERSION {
+            return Err(ObjectKeyError::MalformedStorageKey);
+        }
+        let tenant_id = u64::from_be_bytes(
+            encoded[1..9]
+                .try_into()
+                .map_err(|_| ObjectKeyError::MalformedStorageKey)?,
+        );
+        let bucket_id = u64::from_be_bytes(
+            encoded[9..17]
+                .try_into()
+                .map_err(|_| ObjectKeyError::MalformedStorageKey)?,
+        );
+        Ok(Self {
+            tenant_id: TenantId(tenant_id),
+            bucket_id: BucketId(bucket_id),
+        })
+    }
+
     pub(crate) fn head_key(self, path: &str) -> Vec<u8> {
         let prefix = self.encode();
         let mut encoded = Vec::with_capacity(prefix.len() + path.len());
@@ -187,6 +210,10 @@ mod tests {
             tenant_id: TenantId(0x0102_0304_0506_0708),
             bucket_id: BucketId(0x1112_1314_1516_1718),
         };
+        assert_eq!(
+            BucketIdentity::decode(&identity.encode()).unwrap(),
+            identity
+        );
         let encoded = identity.head_key("d/e");
         assert_eq!(
             encoded,
@@ -199,6 +226,24 @@ mod tests {
             .concat()
         );
         assert_eq!(identity.decode_head_path(&encoded).unwrap(), "d/e");
+    }
+
+    #[test]
+    fn bucket_identity_decode_rejects_other_formats_and_lengths() {
+        let identity = BucketIdentity {
+            tenant_id: TenantId(7),
+            bucket_id: BucketId(11),
+        };
+        let mut other_format = identity.encode();
+        other_format[0] = STORAGE_KEY_FORMAT_VERSION + 1;
+        assert_eq!(
+            BucketIdentity::decode(&other_format),
+            Err(ObjectKeyError::MalformedStorageKey)
+        );
+        assert_eq!(
+            BucketIdentity::decode(&identity.encode()[..16]),
+            Err(ObjectKeyError::MalformedStorageKey)
+        );
     }
 
     #[test]
