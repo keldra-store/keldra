@@ -90,6 +90,11 @@ impl HybridEngine {
         if query.limit == 0 {
             return Ok(Vec::new());
         }
+        if query.text.trim().is_empty() && query.vector.is_empty() {
+            return Err(IndexError::InvalidQuery(
+                "hybrid query needs text, a vector, or both".into(),
+            ));
+        }
         // The minimum engine evaluates every candidate before fusion. A later
         // threshold algorithm may make this faster, but a fixed per-side cap
         // could silently omit the true combined top-k.
@@ -115,11 +120,6 @@ impl HybridEngine {
             VectorEngine::query(directory, &definition.vector, query.vector, candidate_limit)
                 .await?
         };
-        if text_hits.is_empty() && vector_hits.is_empty() {
-            return Err(IndexError::InvalidQuery(
-                "hybrid query needs text, a vector, or both".into(),
-            ));
-        }
         let maximum_text = text_hits.iter().map(|hit| hit.score).fold(0.0f32, f32::max);
         let vector_range = vector_hits.iter().fold(None, |range, hit| match range {
             None => Some((hit.score, hit.score)),
@@ -234,5 +234,36 @@ mod tests {
         .unwrap();
         assert_eq!(hits[0].document.path, "/strong");
         assert!(hits[0].text_score.is_some() && hits[0].vector_score.is_some());
+    }
+
+    #[tokio::test]
+    async fn valid_query_against_empty_generation_returns_no_hits() {
+        let definition = HybridDefinition {
+            vector: VectorDefinition {
+                dimension: 2,
+                metric: VectorMetric::Cosine,
+            },
+            text_weight: 0.6,
+            vector_weight: 0.4,
+        };
+        let artifacts = HybridEngine::build(&definition, Vec::<HybridDocument>::new()).unwrap();
+        let directory =
+            MemoryDirectory::new(artifacts.into_files().map(|file| (file.name, file.bytes)));
+
+        let hits = HybridEngine::query(
+            &directory,
+            &definition,
+            HybridQuery {
+                text: "rust search",
+                vector: &[1.0, 0.0],
+                fields: &[],
+                phrase: false,
+                limit: 10,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(hits.is_empty());
     }
 }
