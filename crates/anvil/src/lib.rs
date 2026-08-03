@@ -10,6 +10,11 @@ mod cluster_startup;
 mod credential_service;
 mod data_peer;
 mod distributed_list;
+#[allow(
+    dead_code,
+    reason = "transport-neutral cluster watch awaits the approved peer and JWT adapters"
+)]
+mod distributed_watch;
 mod join_bundle;
 mod join_peer;
 #[allow(
