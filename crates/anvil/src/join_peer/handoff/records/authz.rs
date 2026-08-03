@@ -5,9 +5,7 @@ use anvil_store::{AuthzRealmCursor, AuthzScope};
 use tonic::Status;
 
 use super::{logical, quorum};
-use crate::authz_distribution::{
-    AuthzRealmReplicaCandidate, exact_quorum_candidate,
-};
+use crate::authz_distribution::{AuthzRealmReplicaCandidate, exact_quorum_candidate};
 use crate::data_peer::DataPeerTransport;
 use crate::join_peer::handoff::HandoffTopology;
 use crate::join_peer::handoff::merge::{MergeSource, next_key};

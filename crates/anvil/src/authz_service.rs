@@ -20,15 +20,19 @@ use crate::authz_api::{
     schema_ref_to_api, schema_to_api, tuple_filter_from_api, tuple_mutation_from_api, tuple_to_api,
 };
 
+mod distributed;
+pub(crate) use distributed::DistributedAuthzService;
+
 const DEFAULT_PAGE_SIZE: usize = 100;
 const MAX_PAGE_SIZE: usize = 1_000;
 const MAX_PAGE_TOKEN_BYTES: usize = 128 * 1024;
 const MAX_CHECKS: usize = 1_000;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct AuthzServiceImpl {
     repository: AuthzRepository,
     system_authorizer: SystemAuthorizer,
+    distributed: Option<std::sync::Arc<DistributedAuthzService>>,
 }
 
 impl AuthzServiceImpl {
@@ -36,7 +40,13 @@ impl AuthzServiceImpl {
         Self {
             system_authorizer: SystemAuthorizer::new(repository.clone()),
             repository,
+            distributed: None,
         }
+    }
+
+    pub(crate) fn with_distributed(mut self, distributed: DistributedAuthzService) -> Self {
+        self.distributed = Some(std::sync::Arc::new(distributed));
+        self
     }
 }
 
@@ -46,6 +56,9 @@ impl AuthzService for AuthzServiceImpl {
         &self,
         request: Request<api::PutSchemaRequest>,
     ) -> Result<Response<api::PutSchemaResponse>, Status> {
+        if let Some(distributed) = self.distributed.as_ref() {
+            return distributed.put_schema(request).await.map(Response::new);
+        }
         let caller = caller(&request)?;
         require_public_storage_tenant(&caller)?;
         let request = request.into_inner();
@@ -85,6 +98,9 @@ impl AuthzService for AuthzServiceImpl {
         &self,
         request: Request<api::BindSchemaRequest>,
     ) -> Result<Response<api::BindSchemaResponse>, Status> {
+        if let Some(distributed) = self.distributed.as_ref() {
+            return distributed.bind_schema(request).await.map(Response::new);
+        }
         let caller = caller(&request)?;
         let request = request.into_inner();
         let scope = public_scope_from_api(request.scope, caller.storage_tenant().as_str())?;
@@ -149,6 +165,9 @@ impl AuthzService for AuthzServiceImpl {
         &self,
         request: Request<api::GetBindingRequest>,
     ) -> Result<Response<api::GetBindingResponse>, Status> {
+        if let Some(distributed) = self.distributed.as_ref() {
+            return distributed.get_binding(request).await.map(Response::new);
+        }
         let caller = caller(&request)?;
         let scope =
             public_scope_from_api(request.into_inner().scope, caller.storage_tenant().as_str())?;
@@ -179,6 +198,9 @@ impl AuthzService for AuthzServiceImpl {
         &self,
         request: Request<api::GetSchemaRequest>,
     ) -> Result<Response<api::GetSchemaResponse>, Status> {
+        if let Some(distributed) = self.distributed.as_ref() {
+            return distributed.get_schema(request).await.map(Response::new);
+        }
         let caller = caller(&request)?;
         require_public_storage_tenant(&caller)?;
         let schema_ref = schema_ref_from_api(request.into_inner().schema_ref)?;
@@ -210,6 +232,9 @@ impl AuthzService for AuthzServiceImpl {
         &self,
         request: Request<api::MutateTuplesRequest>,
     ) -> Result<Response<api::MutateTuplesResponse>, Status> {
+        if let Some(distributed) = self.distributed.as_ref() {
+            return distributed.mutate_tuples(request).await.map(Response::new);
+        }
         let caller = caller(&request)?;
         let request = request.into_inner();
         let scope = public_scope_from_api(request.scope, caller.storage_tenant().as_str())?;
@@ -274,6 +299,9 @@ impl AuthzService for AuthzServiceImpl {
         &self,
         request: Request<api::ReadTuplesRequest>,
     ) -> Result<Response<api::ReadTuplesResponse>, Status> {
+        if let Some(distributed) = self.distributed.as_ref() {
+            return distributed.read_tuples(request).await.map(Response::new);
+        }
         let caller = caller(&request)?;
         let request = request.into_inner();
         let scope = public_scope_from_api(request.scope, caller.storage_tenant().as_str())?;
@@ -352,6 +380,12 @@ impl AuthzService for AuthzServiceImpl {
         &self,
         request: Request<api::CheckPermissionRequest>,
     ) -> Result<Response<api::CheckPermissionResponse>, Status> {
+        if let Some(distributed) = self.distributed.as_ref() {
+            return distributed
+                .check_permission(request)
+                .await
+                .map(Response::new);
+        }
         let caller = caller(&request)?;
         let request = request.into_inner();
         let scope = public_scope_from_api(request.scope, caller.storage_tenant().as_str())?;
@@ -389,6 +423,12 @@ impl AuthzService for AuthzServiceImpl {
         &self,
         request: Request<api::CheckPermissionsRequest>,
     ) -> Result<Response<api::CheckPermissionsResponse>, Status> {
+        if let Some(distributed) = self.distributed.as_ref() {
+            return distributed
+                .check_permissions(request)
+                .await
+                .map(Response::new);
+        }
         let caller = caller(&request)?;
         let request = request.into_inner();
         if request.checks.is_empty() {
@@ -435,7 +475,7 @@ impl AuthzService for AuthzServiceImpl {
     }
 }
 
-fn caller<T>(request: &Request<T>) -> Result<Caller, Status> {
+pub(super) fn caller<T>(request: &Request<T>) -> Result<Caller, Status> {
     request
         .extensions()
         .get::<Caller>()
@@ -443,7 +483,7 @@ fn caller<T>(request: &Request<T>) -> Result<Caller, Status> {
         .ok_or_else(|| Status::unauthenticated("authenticated caller identity is missing"))
 }
 
-fn require_public_storage_tenant(caller: &Caller) -> Result<(), Status> {
+pub(super) fn require_public_storage_tenant(caller: &Caller) -> Result<(), Status> {
     if caller.storage_tenant().is_system() {
         Err(Status::permission_denied(
             "the protected system authorization tenant is not public",
@@ -507,7 +547,7 @@ fn authz_service_status(error: AuthzServiceError) -> Status {
     }
 }
 
-fn binding_to_api(binding: &anvil_store::RealmBinding) -> api::SchemaBinding {
+pub(super) fn binding_to_api(binding: &anvil_store::RealmBinding) -> api::SchemaBinding {
     api::SchemaBinding {
         scope: Some(crate::authz_api::scope_to_api(&binding.scope)),
         schema_ref: Some(schema_ref_to_api(&binding.schema_ref)),
@@ -515,7 +555,7 @@ fn binding_to_api(binding: &anvil_store::RealmBinding) -> api::SchemaBinding {
     }
 }
 
-fn authz_store_status(error: AuthzStoreError) -> Status {
+pub(super) fn authz_store_status(error: AuthzStoreError) -> Status {
     match error {
         AuthzStoreError::InvalidInput(_) | AuthzStoreError::Authorization(_) => {
             Status::invalid_argument(error.to_string())
@@ -544,7 +584,7 @@ fn authz_store_status(error: AuthzStoreError) -> Status {
     }
 }
 
-fn normalize_page_size(value: u32) -> Result<usize, Status> {
+pub(super) fn normalize_page_size(value: u32) -> Result<usize, Status> {
     let value = if value == 0 {
         DEFAULT_PAGE_SIZE
     } else {
@@ -558,7 +598,7 @@ fn normalize_page_size(value: u32) -> Result<usize, Status> {
     Ok(value)
 }
 
-fn tuple_matches_filter(tuple: &Tuple, filter: &DomainTupleFilter) -> bool {
+pub(super) fn tuple_matches_filter(tuple: &Tuple, filter: &DomainTupleFilter) -> bool {
     let object_matches = match filter.object.as_ref() {
         None => true,
         Some(DomainObjectFilter::Namespace(namespace)) => tuple.object.namespace == *namespace,
@@ -593,7 +633,7 @@ enum PageObjectFilter<'a> {
     Exact(&'a ObjectRef),
 }
 
-fn page_fingerprint(
+pub(super) fn page_fingerprint(
     caller: &Caller,
     scope: &anvil_store::AuthzScope,
     filter: &DomainTupleFilter,
@@ -618,19 +658,19 @@ fn page_fingerprint(
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct PageToken {
+pub(super) struct PageToken {
     revision: AuthzRevision,
     offset: usize,
     fingerprint: [u8; 32],
 }
 
-fn encode_page_token(value: &PageToken) -> Result<String, Status> {
+pub(super) fn encode_page_token(value: &PageToken) -> Result<String, Status> {
     let bytes = serde_json::to_vec(value)
         .map_err(|error| Status::internal(format!("encode authorization page token: {error}")))?;
     Ok(hex::encode(bytes))
 }
 
-fn decode_page_token(value: &str) -> Result<Option<PageToken>, Status> {
+pub(super) fn decode_page_token(value: &str) -> Result<Option<PageToken>, Status> {
     if value.is_empty() {
         return Ok(None);
     }

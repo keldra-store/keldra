@@ -54,6 +54,7 @@ impl AuthzReplicaTransport for StoreTransport {
         &self,
         target: NodeId,
         _address: &str,
+        _stable_tenant_id: u64,
         mutation: &AuthzSchemaPublicationMutation,
     ) -> Result<ReplicaAuthzSchemaPublicationApplied, Status> {
         if self.failed_applies.read().unwrap().contains(&target) {
@@ -79,6 +80,7 @@ impl AuthzReplicaTransport for StoreTransport {
         &self,
         target: NodeId,
         _address: &str,
+        _stable_tenant_id: u64,
         query: &AuthzSchemaReplicaQuery,
     ) -> Result<bool, Status> {
         if self.failed_applies.read().unwrap().contains(&target) {
@@ -115,6 +117,7 @@ impl AuthzReplicaTransport for StoreTransport {
         &self,
         target: NodeId,
         _address: &str,
+        _stable_tenant_id: u64,
         mutation: &AuthzRealmMutation,
     ) -> Result<ReplicaAuthzRealmMutationApplied, Status> {
         if self.failed_applies.read().unwrap().contains(&target) {
@@ -130,6 +133,7 @@ impl AuthzReplicaTransport for StoreTransport {
         &self,
         target: NodeId,
         _address: &str,
+        _stable_tenant_id: u64,
         scope: &AuthzScope,
     ) -> Result<Option<AuthzRealmReplicaCandidate>, Status> {
         candidate(&self.store(target)?.authz(), scope)
@@ -139,6 +143,7 @@ impl AuthzReplicaTransport for StoreTransport {
         &self,
         target: NodeId,
         _address: &str,
+        _stable_tenant_id: u64,
         source: Option<(NodeId, String)>,
         scope: &AuthzScope,
         winner: Option<&AuthzRealmReplicaCandidate>,
@@ -280,7 +285,11 @@ fn replica_set_for_nodes(tenant_id: u64, node_ids: &[NodeId]) -> TenantReplicaSe
             address: format!("node-{}", node_id.0),
         })
         .collect();
-    TenantReplicaSet { group, endpoints }
+    TenantReplicaSet {
+        stable_tenant_id: tenant_id,
+        group,
+        endpoints,
+    }
 }
 
 async fn stores() -> (tempfile::TempDir, BTreeMap<NodeId, Store>) {

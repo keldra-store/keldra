@@ -10,6 +10,12 @@ pub(crate) const STORAGE_TENANT_NAMESPACE: &str = "storage_tenant";
 pub(crate) const BUCKET_NAMESPACE: &str = "bucket";
 pub(crate) const OBJECT_NAMESPACE: &str = "object";
 pub(crate) const AUTHZ_REALM_NAMESPACE: &str = "authz_realm";
+/// Stable ID assigned to the protected `_anvil` tenant during bootstrap.
+///
+/// Object addresses belong to customer tenants, but Anvil's own object and
+/// administration permissions are always evaluated in this one protected
+/// tenant-wide Zanzibar group.
+pub(crate) const SYSTEM_STABLE_TENANT_ID: u64 = 1;
 #[cfg(test)]
 pub(crate) const APP_NAMESPACE: &str = "app";
 
@@ -216,6 +222,62 @@ impl ObjectPermission {
     }
 }
 
+pub(crate) fn object_authorization_checks(
+    subject: &ObjectRef,
+    key: &ObjectKey,
+    permission: ObjectPermission,
+) -> anvil_authz::Result<[AuthorizationCheck; 2]> {
+    Ok([
+        AuthorizationCheck::new(
+            subject.clone(),
+            object_resource(key)?,
+            permission.object_relation(),
+        ),
+        AuthorizationCheck::new(
+            subject.clone(),
+            bucket_resource(key.tenant(), key.bucket())?,
+            permission.bucket_relation(),
+        ),
+    ])
+}
+
+pub(crate) fn bucket_policy_authorization_check(
+    subject: &ObjectRef,
+    tenant: &str,
+    bucket: &str,
+) -> anvil_authz::Result<AuthorizationCheck> {
+    Ok(AuthorizationCheck::new(
+        subject.clone(),
+        bucket_resource(tenant, bucket)?,
+        "manage_policy",
+    ))
+}
+
+pub(crate) fn realm_authorization_check(
+    subject: &ObjectRef,
+    tenant: &str,
+    realm: &anvil_authz::RealmId,
+    permission: RealmPermission,
+) -> anvil_authz::Result<AuthorizationCheck> {
+    Ok(AuthorizationCheck::new(
+        subject.clone(),
+        authz_realm_resource(tenant, realm)?,
+        permission.relation(),
+    ))
+}
+
+pub(crate) fn storage_tenant_authorization_check(
+    subject: &ObjectRef,
+    tenant: &str,
+    permission: StorageTenantPermission,
+) -> anvil_authz::Result<AuthorizationCheck> {
+    Ok(AuthorizationCheck::new(
+        subject.clone(),
+        storage_tenant_resource(tenant)?,
+        permission.relation(),
+    ))
+}
+
 #[cfg(test)]
 pub(crate) fn caller_subject(subject_id: &str) -> anvil_authz::Result<ObjectRef> {
     ObjectRef::opaque(APP_NAMESPACE, subject_id)
@@ -251,18 +313,11 @@ pub(crate) fn allows_object(
     key: &ObjectKey,
     permission: ObjectPermission,
 ) -> anvil_authz::Result<bool> {
-    if authorization.check(&AuthorizationCheck::new(
-        subject.clone(),
-        object_resource(key)?,
-        permission.object_relation(),
-    ))? {
+    let [exact, bucket] = object_authorization_checks(subject, key, permission)?;
+    if authorization.check(&exact)? {
         return Ok(true);
     }
-    authorization.check(&AuthorizationCheck::new(
-        subject.clone(),
-        bucket_resource(key.tenant(), key.bucket())?,
-        permission.bucket_relation(),
-    ))
+    authorization.check(&bucket)
 }
 
 pub(crate) fn allows_bucket_policy(
