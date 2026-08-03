@@ -63,6 +63,47 @@ pub enum PayloadStoreError {
 }
 
 impl Store {
+    /// Atomically publish one streamed complete large-object source only when
+    /// its final bytes match the caller's exact immutable identity.
+    ///
+    /// The upload already lives in the ordinary blob `.staging` directory.
+    /// No final path or lifecycle reservation is created for a mismatch.
+    pub async fn seal_complete_source_upload(
+        &self,
+        expected: &BlobRef,
+        upload: crate::BlobUpload,
+    ) -> Result<CompleteCopySealOutcome, PayloadStoreError> {
+        if is_small_blob(expected) {
+            return Err(PayloadStoreError::NotLarge);
+        }
+        let previous = self.complete_copy_state(expected).await?;
+        let actual = upload
+            .finish_expected(expected)
+            .await
+            .map_err(|error| PayloadStoreError::Storage(error.to_string()))?;
+        if &actual != expected {
+            return Err(PayloadStoreError::Storage(
+                "sealed complete source changed content identity".into(),
+            ));
+        }
+        let now = now_unix_millis()?;
+        let _commit_guard = self.commit_lock.lock().await;
+        if !self
+            .blobs
+            .contains(expected)
+            .await
+            .map_err(|error| PayloadStoreError::Storage(error.to_string()))?
+        {
+            return Err(PayloadStoreError::CompleteCopyMissing);
+        }
+        self.reserve_sealed_blob(expected, now)?;
+        Ok(if previous == PayloadArtifactState::Valid {
+            CompleteCopySealOutcome::AlreadyPresent
+        } else {
+            CompleteCopySealOutcome::Created
+        })
+    }
+
     /// Install one exact complete small-object copy in `small_blobs`.
     ///
     /// The supplied content identity is authoritative. Hash or length
@@ -355,6 +396,14 @@ mod tests {
             .encode_sealed_source(&codec, &reference, &mut encoded)
             .await
             .unwrap();
+        for (ordinal, bytes) in encoded.iter().enumerate() {
+            assert_eq!(
+                codec
+                    .encoded_shard_length(&reference, ordinal as u16)
+                    .unwrap(),
+                bytes.len() as u64
+            );
+        }
 
         for ordinal in [0, 2] {
             let identity = ShardIdentity::new(reference.clone(), ordinal);

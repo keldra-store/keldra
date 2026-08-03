@@ -153,6 +153,29 @@ impl ErasureCodec {
         self.profile
     }
 
+    /// Exact encoded byte length for one shard identity under this profile.
+    /// This lets framed peer ingress reject excess bytes before they can grow
+    /// an ordinary staging file without bound.
+    pub fn encoded_shard_length(
+        &self,
+        expected: &BlobRef,
+        ordinal: u16,
+    ) -> Result<u64, ErasureError> {
+        self.require_ordinal(ordinal)?;
+        let stripes = self.profile.stripe_count(expected.length);
+        let payload_bytes = if stripes == 0 {
+            0_u128
+        } else {
+            u128::from(stripes - 1) * u128::from(self.profile.stripe_unit)
+                + self
+                    .profile
+                    .chunk_length(expected.length, stripes - 1, ordinal) as u128
+        };
+        let encoded =
+            HEADER_BYTES as u128 + u128::from(stripes) * FRAME_PREFIX_BYTES as u128 + payload_bytes;
+        u64::try_from(encoded).map_err(|_| ErasureError::EncodedShardLengthOverflow { ordinal })
+    }
+
     /// Encode a complete source into one writer per shard ordinal.
     ///
     /// The source must have exactly the hash and length in `expected`. Writers
@@ -553,6 +576,8 @@ pub enum ErasureError {
     WrongShardCount { expected: usize, actual: usize },
     #[error("shard ordinal {ordinal} is outside profile total {total}")]
     InvalidShardOrdinal { ordinal: u16, total: u16 },
+    #[error("encoded shard {ordinal} length exceeds the supported u64 range")]
+    EncodedShardLengthOverflow { ordinal: u16 },
     #[error("shard ordinal {ordinal} was supplied more than once")]
     DuplicateShardOrdinal { ordinal: u16 },
     #[error("unsupported fragment format {0}")]

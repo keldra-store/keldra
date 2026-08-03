@@ -231,6 +231,7 @@ impl PeerRuntime {
         store: Store,
         erasure_profile: ErasureProfile,
         maximum_unary_time: Duration,
+        max_blob_bytes: u64,
     ) -> Result<PeerServerHandle> {
         anyhow::ensure!(
             peer_listen.port() != 0,
@@ -262,6 +263,7 @@ impl PeerRuntime {
             self.pins.clone(),
             erasure_profile,
             maximum_unary_time,
+            max_blob_bytes,
         )?
         .into_server();
         let (shutdown, stopped) = tokio::sync::oneshot::channel();
@@ -719,6 +721,7 @@ mod tests {
                 store,
                 ErasureProfile::default(),
                 Duration::from_secs(30),
+                16 * 1024 * 1024,
             )
             .await
             .unwrap();

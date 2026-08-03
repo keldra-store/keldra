@@ -335,6 +335,17 @@ impl BlobUpload {
     }
 
     pub async fn finish(mut self) -> Result<BlobRef> {
+        self.finish_inner(None).await
+    }
+
+    /// Finish only if the streamed bytes have the caller's exact immutable
+    /// identity. A mismatch removes the ordinary staging file without ever
+    /// publishing it under a different hash.
+    pub async fn finish_expected(mut self, expected: &BlobRef) -> Result<BlobRef> {
+        self.finish_inner(Some(expected)).await
+    }
+
+    async fn finish_inner(&mut self, expected: Option<&BlobRef>) -> Result<BlobRef> {
         let file = self
             .file
             .take()
@@ -345,6 +356,9 @@ impl BlobUpload {
             hash: *self.hasher.finalize().as_bytes(),
             length: self.length,
         };
+        if expected.is_some_and(|expected| expected != &reference) {
+            bail!("blob failed expected length or hash verification");
+        }
         let encoded = hex::encode(reference.hash);
         let final_path = self.root.join(&encoded[..2]).join(encoded);
         let parent = final_path.parent().context("blob path has no parent")?;
@@ -426,6 +440,28 @@ mod tests {
 
         assert_eq!(second, first);
         assert_eq!(store.get(&second).await.unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn expected_identity_mismatch_never_leaves_a_published_blob() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = BlobStore::open(temporary.path()).await.unwrap();
+        let expected_bytes = vec![0x2a; VERIFY_BUFFER_BYTES + 1];
+        let actual_bytes = vec![0x7c; VERIFY_BUFFER_BYTES + 1];
+        let expected = BlobRef {
+            hash: *blake3::hash(&expected_bytes).as_bytes(),
+            length: expected_bytes.len() as u64,
+        };
+        let actual = BlobRef {
+            hash: *blake3::hash(&actual_bytes).as_bytes(),
+            length: actual_bytes.len() as u64,
+        };
+        let mut upload = store.begin_upload().await.unwrap();
+        upload.write(&actual_bytes).await.unwrap();
+
+        assert!(upload.finish_expected(&expected).await.is_err());
+        assert!(!store.contains(&expected).await.unwrap());
+        assert!(!store.contains(&actual).await.unwrap());
     }
 
     #[tokio::test]

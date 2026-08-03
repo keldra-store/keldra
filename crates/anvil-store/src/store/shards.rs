@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::io::AsyncRead;
 
 use super::*;
 use crate::blob::create_directory_all_durable;
@@ -191,6 +192,58 @@ impl Store {
         drop(output);
         validate_shard_file(codec, identity, &temporary)?;
 
+        self.commit_staged_shard(codec, identity, &staging, &temporary, temporary_guard)
+            .await
+    }
+
+    /// Durably seals one already-encoded shard from an asynchronous source.
+    ///
+    /// This is the bounded-memory ingress used by peer streaming. It shares
+    /// the same staging, validation, atomic publish, and lifecycle path as
+    /// [`Store::seal_shard`].
+    pub async fn seal_shard_stream<R: AsyncRead + Unpin>(
+        &self,
+        codec: &ErasureCodec,
+        identity: &ShardIdentity,
+        mut encoded_shard: R,
+    ) -> Result<ShardSealOutcome, ShardStoreError> {
+        identity.validate_for(codec)?;
+        let staging = self.blobs.root().join(".staging");
+        create_directory_all_durable(&staging)
+            .await
+            .map_err(shard_storage_error)?;
+        let temporary = staging.join(format!(
+            "shard-{}-{}-{}.tmp",
+            std::process::id(),
+            NEXT_SHARD_UPLOAD_ID.fetch_add(1, Ordering::Relaxed),
+            hex::encode(identity.encode())
+        ));
+        let temporary_guard = TemporaryShard::new(temporary.clone());
+        let mut output = tokio::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+            .await
+            .map_err(shard_storage_error)?;
+        tokio::io::copy(&mut encoded_shard, &mut output)
+            .await
+            .map_err(shard_storage_error)?;
+        output.sync_all().await.map_err(shard_storage_error)?;
+        drop(output);
+        validate_shard_file(codec, identity, &temporary)?;
+
+        self.commit_staged_shard(codec, identity, &staging, &temporary, temporary_guard)
+            .await
+    }
+
+    async fn commit_staged_shard(
+        &self,
+        codec: &ErasureCodec,
+        identity: &ShardIdentity,
+        staging: &Path,
+        temporary: &Path,
+        temporary_guard: TemporaryShard,
+    ) -> Result<ShardSealOutcome, ShardStoreError> {
         let final_path = identity.path(self.blobs.root());
         let parent = final_path
             .parent()

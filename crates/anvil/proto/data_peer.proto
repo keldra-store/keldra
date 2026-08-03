@@ -109,6 +109,31 @@ message ContentStored {
   uint32 schema_version = 1;
 }
 
+message CompleteSourcePutFrame {
+  PeerContext peer = 1;
+  BlobIdentity blob = 2;
+  uint64 offset = 3;
+  bytes content = 4;
+  bool end = 5;
+}
+
+message CompleteSourceStored {
+  uint32 schema_version = 1;
+  bool already_present = 2;
+}
+
+message ShardPutFrame {
+  ShardRequest shard = 1;
+  uint64 offset = 2;
+  bytes content = 3;
+  bool end = 4;
+}
+
+message ShardStored {
+  uint32 schema_version = 1;
+  bool already_present = 2;
+}
+
 service DataPeer {
   rpc ApplyObjectMutation(TypedMutationRequest) returns (ObjectMutationApplied);
   rpc ApplyAuthzRealmMutation(TypedMutationRequest) returns (AuthzRealmMutationApplied);
@@ -122,6 +147,10 @@ service DataPeer {
   rpc GetSmallContent(ContentRequest) returns (stream ContentFrame);
   rpc PutSmallContent(stream SmallContentPutFrame) returns (ContentStored);
 
+  rpc GetCompleteSource(ContentRequest) returns (stream ContentFrame);
+  rpc PutCompleteSource(stream CompleteSourcePutFrame) returns (CompleteSourceStored);
+
   rpc ShardExists(ShardRequest) returns (ExistsResponse);
   rpc GetShard(ShardRequest) returns (stream ContentFrame);
+  rpc PutShard(stream ShardPutFrame) returns (ShardStored);
 }

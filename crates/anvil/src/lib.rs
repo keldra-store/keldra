@@ -117,6 +117,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
             store.clone(),
             config.erasure_profile,
             config.atomic_program_timeout,
+            config.max_blob_bytes,
         )
         .await?;
     decisions

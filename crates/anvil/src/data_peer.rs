@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::io::Read;
+use std::io::{self, Cursor, Read};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -17,13 +17,14 @@ use anvil_consensus::{
     PeerTlsConnector, PeerTlsError, authorize_peer_rpc,
 };
 use anvil_store::{
-    AuthzRealmMutation, BlobRef, ErasureCodec, ErasureProfile, FRAGMENT_FORMAT_VERSION,
-    LocalChange, MAX_LOCAL_INVALIDATION_SCAN_RECORDS, MutationError, ObjectMutation,
-    ReferenceDeltaApplied, ReferenceDeltaBatch, ReplicaAuthzRealmMutationApplied,
-    ReplicaObjectMutationApplied, ShardIdentity, ShardStoreError, SourceId, Store,
-    WatchJournalStatus,
+    AuthzRealmMutation, BlobReader, BlobRef, CompleteCopySealOutcome, ErasureCodec, ErasureProfile,
+    FRAGMENT_FORMAT_VERSION, LocalChange, MAX_LOCAL_INVALIDATION_SCAN_RECORDS, MutationError,
+    ObjectMutation, PayloadStoreError, ReferenceDeltaApplied, ReferenceDeltaBatch,
+    ReplicaAuthzRealmMutationApplied, ReplicaObjectMutationApplied, ShardIdentity,
+    ShardSealOutcome, ShardStoreError, SourceId, Store, WatchJournalStatus,
 };
 use hyper_util::rt::TokioIo;
+use tokio::io::AsyncWriteExt;
 use tonic::codegen::Service;
 use tonic::codegen::http::Uri;
 use tonic::metadata::MetadataMap;
@@ -45,6 +46,7 @@ pub(crate) struct DataPeerService {
     pins: Arc<dyn CommittedPeerPinProvider>,
     codec: Arc<ErasureCodec>,
     maximum_unary_time: Duration,
+    max_blob_bytes: u64,
 }
 
 pub(crate) type DataPeerServer = wire::data_peer_server::DataPeerServer<DataPeerService>;
@@ -57,6 +59,7 @@ impl DataPeerService {
         pins: Arc<dyn CommittedPeerPinProvider>,
         profile: ErasureProfile,
         maximum_unary_time: Duration,
+        max_blob_bytes: u64,
     ) -> Result<Self, anyhow::Error> {
         anyhow::ensure!(
             !maximum_unary_time.is_zero()
@@ -65,12 +68,17 @@ impl DataPeerService {
                     .is_some(),
             "private peer maximum unary time must be positive and fit the server clock"
         );
+        anyhow::ensure!(
+            max_blob_bytes > anvil_store::SMALL_BLOB_MAX_BYTES as u64,
+            "private peer maximum blob bytes must permit a large object"
+        );
         let codec = ErasureCodec::new(profile)?;
         Ok(Self {
             store,
             pins,
             codec: Arc::new(codec),
             maximum_unary_time,
+            max_blob_bytes,
         })
     }
 
@@ -136,6 +144,7 @@ impl DataPeerService {
 #[tonic::async_trait]
 impl wire::data_peer_server::DataPeer for DataPeerService {
     type GetSmallContentStream = ContentStream;
+    type GetCompleteSourceStream = ContentStream;
     type GetShardStream = ContentStream;
 
     async fn apply_object_mutation(
@@ -431,6 +440,94 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
         }
     }
 
+    async fn get_complete_source(
+        &self,
+        mut request: Request<wire::ContentRequest>,
+    ) -> Result<Response<Self::GetCompleteSourceStream>, Status> {
+        let peer = request.get_ref().peer.clone();
+        self.authorize(&mut request, peer.as_ref(), PeerRpcKind::StateTransfer)?;
+        let reference = parse_blob(request.get_ref().blob.as_ref())?;
+        require_large_blob(&reference, self.max_blob_bytes)?;
+        let metadata = request.metadata().clone();
+        let store = self.store.clone();
+        let reader = self
+            .bounded(&metadata, async move {
+                store
+                    .open_blob(&reference)
+                    .await
+                    .map_err(map_mutation_error)
+            })
+            .await?;
+        Ok(Response::new(stream_blob(reader)))
+    }
+
+    async fn put_complete_source(
+        &self,
+        request: Request<Streaming<wire::CompleteSourcePutFrame>>,
+    ) -> Result<Response<wire::CompleteSourceStored>, Status> {
+        let pin = request
+            .extensions()
+            .get::<PeerSpkiSha256>()
+            .copied()
+            .ok_or_else(|| Status::unauthenticated("peer mTLS identity is missing"))?;
+        let idle = effective_timeout(request.metadata(), self.maximum_unary_time);
+        let mut stream = request.into_inner();
+        let first = next_stream_message(&mut stream, idle, "complete-source stream").await?;
+        self.authorize_context(first.peer.as_ref(), pin, PeerRpcKind::DataPlane)?;
+        let expected_peer = first.peer.clone();
+        let expected_blob = first.blob.clone();
+        let expected = parse_blob(expected_blob.as_ref())?;
+        require_large_blob(&expected, self.max_blob_bytes)?;
+        let mut upload = tokio::time::timeout(idle, self.store.begin_blob_upload())
+            .await
+            .map_err(|_| Status::deadline_exceeded("complete-source staging made no progress"))?
+            .map_err(map_mutation_error)?;
+        let mut offset = 0_u64;
+        let mut current = Some(first);
+        loop {
+            let frame = match current.take() {
+                Some(frame) => frame,
+                None => next_stream_message(&mut stream, idle, "complete-source stream").await?,
+            };
+            self.authorize_context(frame.peer.as_ref(), pin, PeerRpcKind::DataPlane)?;
+            if frame.peer != expected_peer || frame.blob != expected_blob {
+                return Err(Status::invalid_argument(
+                    "complete-source identity changed within stream",
+                ));
+            }
+            validate_stream_frame(offset, &frame.content, frame.offset, frame.end)?;
+            offset = offset
+                .checked_add(frame.content.len() as u64)
+                .filter(|offset| *offset <= expected.length)
+                .ok_or_else(|| {
+                    Status::resource_exhausted("complete-source bytes exceed declared length")
+                })?;
+            tokio::time::timeout(idle, upload.write(&frame.content))
+                .await
+                .map_err(|_| Status::deadline_exceeded("complete-source staging made no progress"))?
+                .map_err(|error| Status::internal(error.to_string()))?;
+            if !frame.end {
+                continue;
+            }
+            if offset != expected.length {
+                return Err(Status::data_loss(
+                    "complete-source stream ended before its declared length",
+                ));
+            }
+            let outcome = tokio::time::timeout(
+                idle,
+                self.store.seal_complete_source_upload(&expected, upload),
+            )
+            .await
+            .map_err(|_| Status::deadline_exceeded("complete-source seal made no progress"))?
+            .map_err(map_payload_error)?;
+            return Ok(Response::new(wire::CompleteSourceStored {
+                schema_version: DATA_PEER_SCHEMA_VERSION,
+                already_present: outcome == CompleteCopySealOutcome::AlreadyPresent,
+            }));
+        }
+    }
+
     async fn shard_exists(
         &self,
         mut request: Request<wire::ShardRequest>,
@@ -439,6 +536,7 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
         self.authorize(&mut request, peer.as_ref(), PeerRpcKind::StateTransfer)?;
         let metadata = request.metadata().clone();
         let identity = parse_shard(&request.into_inner())?;
+        require_large_blob(identity.blob(), self.max_blob_bytes)?;
         let store = self.store.clone();
         let codec = self.codec.clone();
         let exists = self
@@ -466,6 +564,7 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
         self.authorize(&mut request, peer.as_ref(), PeerRpcKind::StateTransfer)?;
         let metadata = request.metadata().clone();
         let identity = parse_shard(&request.into_inner())?;
+        require_large_blob(identity.blob(), self.max_blob_bytes)?;
         let store = self.store.clone();
         let codec = self.codec.clone();
         let mut reader = self
@@ -503,6 +602,108 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
         Ok(Response::new(Box::pin(
             tokio_stream::wrappers::ReceiverStream::new(receiver),
         )))
+    }
+
+    async fn put_shard(
+        &self,
+        request: Request<Streaming<wire::ShardPutFrame>>,
+    ) -> Result<Response<wire::ShardStored>, Status> {
+        let pin = request
+            .extensions()
+            .get::<PeerSpkiSha256>()
+            .copied()
+            .ok_or_else(|| Status::unauthenticated("peer mTLS identity is missing"))?;
+        let idle = effective_timeout(request.metadata(), self.maximum_unary_time);
+        let mut stream = request.into_inner();
+        let first = next_stream_message(&mut stream, idle, "shard stream").await?;
+        let expected_request = first
+            .shard
+            .clone()
+            .ok_or_else(|| Status::invalid_argument("shard identity is required"))?;
+        self.authorize_context(expected_request.peer.as_ref(), pin, PeerRpcKind::DataPlane)?;
+        let identity = parse_shard(&expected_request)?;
+        require_large_blob(identity.blob(), self.max_blob_bytes)?;
+        let expected_length = self
+            .codec
+            .encoded_shard_length(identity.blob(), identity.ordinal())
+            .map_err(|error| map_shard_error(error.into()))?;
+
+        let (mut sender, receiver) = tokio::io::duplex(DATA_PEER_FRAME_BYTES * 2);
+        let store = self.store.clone();
+        let codec = self.codec.clone();
+        let seal_identity = identity.clone();
+        let seal = tokio::spawn(async move {
+            store
+                .seal_shard_stream(&codec, &seal_identity, receiver)
+                .await
+        });
+
+        let transfer = async {
+            let mut offset = 0_u64;
+            let mut current = Some(first);
+            loop {
+                let frame = match current.take() {
+                    Some(frame) => frame,
+                    None => next_stream_message(&mut stream, idle, "shard stream").await?,
+                };
+                let shard = frame
+                    .shard
+                    .as_ref()
+                    .ok_or_else(|| Status::invalid_argument("shard identity is required"))?;
+                self.authorize_context(shard.peer.as_ref(), pin, PeerRpcKind::DataPlane)?;
+                if shard != &expected_request {
+                    return Err(Status::invalid_argument(
+                        "shard identity changed within stream",
+                    ));
+                }
+                validate_stream_frame(offset, &frame.content, frame.offset, frame.end)?;
+                offset = offset
+                    .checked_add(frame.content.len() as u64)
+                    .filter(|offset| *offset <= expected_length)
+                    .ok_or_else(|| {
+                        Status::resource_exhausted("shard bytes exceed their encoded length")
+                    })?;
+                if !frame.content.is_empty() {
+                    tokio::time::timeout(idle, sender.write_all(&frame.content))
+                        .await
+                        .map_err(|_| Status::deadline_exceeded("shard staging made no progress"))?
+                        .map_err(|error| {
+                            Status::internal(format!("shard staging stopped unexpectedly: {error}"))
+                        })?;
+                }
+                if !frame.end {
+                    continue;
+                }
+                if offset != expected_length {
+                    return Err(Status::data_loss(
+                        "shard stream ended before its encoded length",
+                    ));
+                }
+                tokio::time::timeout(idle, sender.shutdown())
+                    .await
+                    .map_err(|_| Status::deadline_exceeded("shard staging made no progress"))?
+                    .map_err(|error| {
+                        Status::internal(format!("shard staging stopped unexpectedly: {error}"))
+                    })?;
+                return Ok(());
+            }
+        }
+        .await;
+
+        if let Err(status) = transfer {
+            drop(sender);
+            let _ = seal.await;
+            return Err(status);
+        }
+        drop(sender);
+        let outcome = seal
+            .await
+            .map_err(|error| Status::internal(format!("join shard seal: {error}")))?
+            .map_err(map_shard_error)?;
+        Ok(Response::new(wire::ShardStored {
+            schema_version: DATA_PEER_SCHEMA_VERSION,
+            already_present: outcome == ShardSealOutcome::AlreadyPresent,
+        }))
     }
 }
 
@@ -824,6 +1025,93 @@ impl DataPeerTransport {
         ))
     }
 
+    pub(crate) async fn put_complete_source(
+        &self,
+        target: NodeId,
+        address: &str,
+        reference: &BlobRef,
+        mut reader: BlobReader,
+    ) -> Result<CompleteCopySealOutcome, Status> {
+        if reference.length <= anvil_store::SMALL_BLOB_MAX_BYTES as u64 {
+            return Err(Status::invalid_argument(
+                "complete-source operation requires a large blob",
+            ));
+        }
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        let context = self.context();
+        let blob = wire_blob(reference);
+        let producer = tokio::spawn(async move {
+            let mut offset = 0_u64;
+            let mut current = vec![0_u8; DATA_PEER_FRAME_BYTES];
+            let mut next = vec![0_u8; DATA_PEER_FRAME_BYTES];
+            let mut current_length = reader
+                .read(&mut current)
+                .await
+                .map_err(|error| Status::data_loss(error.to_string()))?;
+            loop {
+                let next_length = if current_length == 0 {
+                    0
+                } else {
+                    reader
+                        .read(&mut next)
+                        .await
+                        .map_err(|error| Status::data_loss(error.to_string()))?
+                };
+                let end = current_length == 0 || next_length == 0;
+                sender
+                    .send(wire::CompleteSourcePutFrame {
+                        peer: Some(context.clone()),
+                        blob: Some(blob.clone()),
+                        offset,
+                        content: current[..current_length].to_vec(),
+                        end,
+                    })
+                    .await
+                    .map_err(|_| Status::cancelled("complete-source peer stream closed"))?;
+                if end {
+                    return Ok::<(), Status>(());
+                }
+                offset += current_length as u64;
+                std::mem::swap(&mut current, &mut next);
+                current_length = next_length;
+            }
+        });
+        let response = self
+            .client(target, address)?
+            .put_complete_source(tokio_stream::wrappers::ReceiverStream::new(receiver))
+            .await;
+        producer.await.map_err(|error| {
+            Status::internal(format!("join complete-source producer: {error}"))
+        })??;
+        let response = response?.into_inner();
+        require_response_schema(response.schema_version)?;
+        Ok(if response.already_present {
+            CompleteCopySealOutcome::AlreadyPresent
+        } else {
+            CompleteCopySealOutcome::Created
+        })
+    }
+
+    pub(crate) async fn get_complete_source(
+        &self,
+        target: NodeId,
+        address: &str,
+        reference: &BlobRef,
+    ) -> Result<Streaming<wire::ContentFrame>, Status> {
+        if reference.length <= anvil_store::SMALL_BLOB_MAX_BYTES as u64 {
+            return Err(Status::invalid_argument(
+                "complete-source operation requires a large blob",
+            ));
+        }
+        self.client(target, address)?
+            .get_complete_source(wire::ContentRequest {
+                peer: Some(self.context()),
+                blob: Some(wire_blob(reference)),
+            })
+            .await
+            .map(Response::into_inner)
+    }
+
     pub(crate) async fn shard_exists(
         &self,
         target: NodeId,
@@ -849,6 +1137,65 @@ impl DataPeerTransport {
             .get_shard(wire_shard(self.context(), identity))
             .await
             .map(Response::into_inner)
+    }
+
+    pub(crate) async fn put_shard<R>(
+        &self,
+        target: NodeId,
+        address: &str,
+        identity: &ShardIdentity,
+        mut reader: R,
+    ) -> Result<ShardSealOutcome, Status>
+    where
+        R: Read + Send + 'static,
+    {
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        let shard = wire_shard(self.context(), identity);
+        let producer = tokio::task::spawn_blocking(move || {
+            let mut offset = 0_u64;
+            let mut current = vec![0_u8; DATA_PEER_FRAME_BYTES];
+            let mut next = vec![0_u8; DATA_PEER_FRAME_BYTES];
+            let mut current_length = reader.read(&mut current)?;
+            loop {
+                let next_length = if current_length == 0 {
+                    0
+                } else {
+                    reader.read(&mut next)?
+                };
+                let end = current_length == 0 || next_length == 0;
+                sender
+                    .blocking_send(wire::ShardPutFrame {
+                        shard: Some(shard.clone()),
+                        offset,
+                        content: current[..current_length].to_vec(),
+                        end,
+                    })
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::BrokenPipe, "shard peer stream closed")
+                    })?;
+                if end {
+                    return Ok::<(), io::Error>(());
+                }
+                offset += current_length as u64;
+                std::mem::swap(&mut current, &mut next);
+                current_length = next_length;
+            }
+        });
+        let response = self
+            .client(target, address)?
+            .put_shard(tokio_stream::wrappers::ReceiverStream::new(receiver))
+            .await;
+        producer
+            .await
+            .map_err(|error| Status::internal(format!("join shard producer: {error}")))?
+            .map_err(|error| Status::data_loss(error.to_string()))?;
+        let response = response?.into_inner();
+        require_response_schema(response.schema_version)?;
+        Ok(if response.already_present {
+            ShardSealOutcome::AlreadyPresent
+        } else {
+            ShardSealOutcome::Created
+        })
     }
 }
 
@@ -878,6 +1225,84 @@ impl Service<Uri> for DataPeerChannelConnector {
                 .map(|peer| TokioIo::new(peer.stream))
         })
     }
+}
+
+fn stream_blob(mut reader: BlobReader) -> ContentStream {
+    let (sender, receiver) = tokio::sync::mpsc::channel(2);
+    tokio::spawn(async move {
+        let mut offset = 0_u64;
+        let mut buffer = vec![0_u8; DATA_PEER_FRAME_BYTES];
+        loop {
+            match reader.read(&mut buffer).await {
+                Ok(0) => {
+                    let _ = sender.send(Ok(content_end(offset))).await;
+                    break;
+                }
+                Ok(read) => {
+                    let frame = content_frame(offset, buffer[..read].to_vec());
+                    offset += read as u64;
+                    if sender.send(Ok(frame)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = sender.send(Err(Status::data_loss(error.to_string()))).await;
+                    break;
+                }
+            }
+        }
+    });
+    Box::pin(tokio_stream::wrappers::ReceiverStream::new(receiver))
+}
+
+async fn next_stream_message<T>(
+    stream: &mut Streaming<T>,
+    idle: Duration,
+    operation: &'static str,
+) -> Result<T, Status>
+where
+    T: prost::Message + Default,
+{
+    tokio::time::timeout(idle, stream.message())
+        .await
+        .map_err(|_| Status::deadline_exceeded(format!("{operation} made no progress")))??
+        .ok_or_else(|| Status::invalid_argument(format!("{operation} ended without end frame")))
+}
+
+fn validate_stream_frame(
+    expected_offset: u64,
+    content: &[u8],
+    actual_offset: u64,
+    end: bool,
+) -> Result<(), Status> {
+    if content.len() > DATA_PEER_FRAME_BYTES {
+        return Err(Status::resource_exhausted("peer frame exceeds 64 KiB"));
+    }
+    if actual_offset != expected_offset {
+        return Err(Status::invalid_argument(
+            "peer frame offset is not contiguous",
+        ));
+    }
+    if content.is_empty() && !end {
+        return Err(Status::invalid_argument(
+            "an empty peer frame must terminate its stream",
+        ));
+    }
+    Ok(())
+}
+
+fn require_large_blob(reference: &BlobRef, max_blob_bytes: u64) -> Result<(), Status> {
+    if reference.length <= anvil_store::SMALL_BLOB_MAX_BYTES as u64 {
+        return Err(Status::invalid_argument(
+            "operation requires content larger than 64 KiB",
+        ));
+    }
+    if reference.length > max_blob_bytes {
+        return Err(Status::resource_exhausted(
+            "content identity exceeds the configured maximum blob size",
+        ));
+    }
+    Ok(())
 }
 
 fn parse_cluster_id(encoded: &[u8]) -> Result<ClusterId, Status> {
@@ -1025,6 +1450,20 @@ fn map_shard_error(error: ShardStoreError) -> Status {
     }
 }
 
+fn map_payload_error(error: PayloadStoreError) -> Status {
+    match error {
+        PayloadStoreError::NotSmall | PayloadStoreError::NotLarge => {
+            Status::invalid_argument(error.to_string())
+        }
+        PayloadStoreError::CompleteCopyMissing => Status::not_found(error.to_string()),
+        PayloadStoreError::CompleteCopyCorrupt => Status::data_loss(error.to_string()),
+        PayloadStoreError::Mutation(error) => map_mutation_error(error),
+        PayloadStoreError::Shard(error) => map_shard_error(error),
+        PayloadStoreError::Erasure(error) => Status::failed_precondition(error.to_string()),
+        PayloadStoreError::Storage(_) => Status::internal(error.to_string()),
+    }
+}
+
 fn effective_timeout(metadata: &MetadataMap, server_maximum: Duration) -> Duration {
     client_grpc_timeout(metadata).map_or(server_maximum, |client| client.min(server_maximum))
 }
@@ -1166,6 +1605,7 @@ mod tests {
             pins,
             ErasureProfile::default(),
             Duration::from_secs(30),
+            16 * 1024 * 1024,
         )
         .unwrap()
         .into_server();
@@ -1180,6 +1620,34 @@ mod tests {
                 .unwrap();
         });
         (address, shutdown, task)
+    }
+
+    async fn collect_content(mut stream: Streaming<wire::ContentFrame>) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        while let Some(frame) = stream.message().await.unwrap() {
+            assert_eq!(frame.schema_version, DATA_PEER_SCHEMA_VERSION);
+            assert_eq!(frame.offset, bytes.len() as u64);
+            bytes.extend_from_slice(&frame.content);
+            if frame.end {
+                return bytes;
+            }
+        }
+        panic!("peer content stream ended without an end frame");
+    }
+
+    fn shard_frame(
+        transport: &DataPeerTransport,
+        identity: &ShardIdentity,
+        offset: u64,
+        content: &[u8],
+        end: bool,
+    ) -> wire::ShardPutFrame {
+        wire::ShardPutFrame {
+            shard: Some(wire_shard(transport.context(), identity)),
+            offset,
+            content: content.to_vec(),
+            end,
+        }
     }
 
     #[tokio::test]
@@ -1267,16 +1735,15 @@ mod tests {
                 .unwrap(),
             bytes
         );
-        assert!(
-            !joining
-                .shard_exists(
-                    NodeId(1),
-                    &address,
-                    &ShardIdentity::new(reference.clone(), 0),
-                )
-                .await
-                .unwrap()
-        );
+        let error = joining
+            .shard_exists(
+                NodeId(1),
+                &address,
+                &ShardIdentity::new(reference.clone(), 0),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::InvalidArgument);
 
         let mismatched = DataPeerTransport::new(
             cluster_id,
@@ -1299,5 +1766,168 @@ mod tests {
 
         let _ = shutdown.send(());
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn real_mtls_large_source_and_shard_streams_are_exact_and_restart_safe() {
+        let cluster_id = ClusterId(*b"peer-payload-tst");
+        let server_id = identity(cluster_id, NodeId(1));
+        let client_id = identity(cluster_id, NodeId(2));
+        let pins = Arc::new(TestPins::new(cluster_id));
+        pins.install(NodeId(1), server_id.spki_sha256(), NodeState::Active);
+        pins.install(NodeId(2), client_id.spki_sha256(), NodeState::Active);
+
+        let source_directory = tempfile::tempdir().unwrap();
+        let destination_directory = tempfile::tempdir().unwrap();
+        let destination_root = destination_directory.path().join("store");
+        let source_store = Store::open(StoreOptions::new(source_directory.path(), 2))
+            .await
+            .unwrap();
+        let destination = Store::open(StoreOptions::new(&destination_root, 1))
+            .await
+            .unwrap();
+        let source = (0..2 * DATA_PEER_FRAME_BYTES + 333)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let reference = source_store.stage_blob(&source).await.unwrap();
+        let codec = ErasureCodec::new(ErasureProfile::default()).unwrap();
+        let mut shards = vec![Vec::new(); usize::from(codec.profile().total_shards())];
+        source_store
+            .encode_sealed_source(&codec, &reference, &mut shards)
+            .await
+            .unwrap();
+
+        let (address, shutdown, server) =
+            start_server(server_id, pins.clone(), destination.clone()).await;
+        let address = address.to_string();
+        let transport = DataPeerTransport::new(
+            cluster_id,
+            NodeId(2),
+            PeerTlsConnector::new(client_id, pins, PeerTlsConfig::default()).unwrap(),
+        )
+        .unwrap();
+
+        let source_reader = source_store.open_blob(&reference).await.unwrap();
+        assert_eq!(
+            transport
+                .put_complete_source(NodeId(1), &address, &reference, source_reader)
+                .await
+                .unwrap(),
+            CompleteCopySealOutcome::Created
+        );
+        let retry_reader = source_store.open_blob(&reference).await.unwrap();
+        assert_eq!(
+            transport
+                .put_complete_source(NodeId(1), &address, &reference, retry_reader)
+                .await
+                .unwrap(),
+            CompleteCopySealOutcome::AlreadyPresent
+        );
+        assert_eq!(
+            collect_content(
+                transport
+                    .get_complete_source(NodeId(1), &address, &reference)
+                    .await
+                    .unwrap()
+            )
+            .await,
+            source
+        );
+
+        let first = ShardIdentity::new(reference.clone(), 0);
+        assert_eq!(
+            transport
+                .put_shard(NodeId(1), &address, &first, Cursor::new(shards[0].clone()),)
+                .await
+                .unwrap(),
+            ShardSealOutcome::Created
+        );
+        assert_eq!(
+            transport
+                .put_shard(NodeId(1), &address, &first, Cursor::new(shards[0].clone()),)
+                .await
+                .unwrap(),
+            ShardSealOutcome::AlreadyPresent
+        );
+        assert_eq!(
+            collect_content(
+                transport
+                    .get_shard(NodeId(1), &address, &first)
+                    .await
+                    .unwrap()
+            )
+            .await,
+            shards[0]
+        );
+
+        let second = ShardIdentity::new(reference.clone(), 1);
+        let mut corrupt = shards[1].clone();
+        *corrupt.last_mut().unwrap() ^= 0xff;
+        let error = transport
+            .put_shard(NodeId(1), &address, &second, Cursor::new(corrupt))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(
+            !transport
+                .shard_exists(NodeId(1), &address, &second)
+                .await
+                .unwrap()
+        );
+
+        let third = ShardIdentity::new(reference.clone(), 2);
+        let truncated = shards[2][..shards[2].len() - 1].to_vec();
+        let error = transport
+            .put_shard(NodeId(1), &address, &third, Cursor::new(truncated))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::DataLoss);
+        assert!(
+            !transport
+                .shard_exists(NodeId(1), &address, &third)
+                .await
+                .unwrap()
+        );
+
+        let error = transport
+            .client(NodeId(1), &address)
+            .unwrap()
+            .put_shard(tokio_stream::iter([
+                shard_frame(&transport, &second, 0, b"a", false),
+                shard_frame(&transport, &second, 2, b"b", false),
+            ]))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::InvalidArgument);
+
+        let error = transport
+            .client(NodeId(1), &address)
+            .unwrap()
+            .put_shard(tokio_stream::iter([
+                shard_frame(&transport, &second, 0, b"a", false),
+                shard_frame(&transport, &third, 1, b"b", false),
+            ]))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::InvalidArgument);
+
+        let _ = shutdown.send(());
+        server.await.unwrap();
+        drop(destination);
+        let reopened = Store::open(StoreOptions::new(&destination_root, 1))
+            .await
+            .unwrap();
+        let mut reader = reopened.open_blob(&reference).await.unwrap();
+        let mut recovered = Vec::new();
+        let mut buffer = vec![0_u8; DATA_PEER_FRAME_BYTES];
+        loop {
+            let read = reader.read(&mut buffer).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            recovered.extend_from_slice(&buffer[..read]);
+        }
+        assert_eq!(recovered, source);
+        assert!(reopened.get_shard(&codec, &first).is_ok());
     }
 }
