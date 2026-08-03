@@ -1734,3 +1734,6 @@ mod tests;
 
 mod replication;
 pub use replication::*;
+
+mod snapshot;
+pub use snapshot::*;

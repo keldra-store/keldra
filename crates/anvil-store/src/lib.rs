@@ -18,15 +18,19 @@ mod store;
 mod watch;
 
 pub use authz::{
-    AUTHZ_REALM_MUTATION_FORMAT, AUTHZ_REALM_MUTATION_STAMP_FORMAT, AtomicRealmBinding,
-    AuthzBatchCheck, AuthzConsistency, AuthzRealmChange, AuthzRealmMutation,
-    AuthzRealmMutationContext, AuthzRealmMutationStamp, AuthzRealmSchema, AuthzRepository,
-    AuthzRevision, AuthzScope, AuthzStoreError, AuthzStoreLimits, BindSchemaRequest, BoundRealm,
-    CoordinatedAuthzRealmMutation, CoordinatedAuthzRealmResult, DEFAULT_AUTHZ_RECEIPT_MAX_BYTES,
-    DEFAULT_AUTHZ_RECEIPT_MAX_ENTRIES, DEFAULT_AUTHZ_RECEIPT_RETENTION_SECONDS,
-    ProtectedRealmOwnership, PublishSchemaRequest, PublishedSchema, RealmBinding, RealmSnapshot,
-    ReplicaAuthzRealmMutationApplied, SYSTEM_STORAGE_TENANT_ID, SchemaDigest, SchemaId, SchemaRef,
-    StorageTenantId, TupleBatchReceipt, TupleBatchRequest, TupleMutation, TupleMutationKind,
+    AUTHZ_REALM_MUTATION_FORMAT, AUTHZ_REALM_MUTATION_STAMP_FORMAT, AUTHZ_REALM_SNAPSHOT_FORMAT,
+    AUTHZ_REALM_TRANSFER_MANIFEST_FORMAT, AtomicRealmBinding, AuthzBatchCheck, AuthzConsistency,
+    AuthzRealmAggregate, AuthzRealmChange, AuthzRealmCursor, AuthzRealmKeyPage, AuthzRealmMutation,
+    AuthzRealmMutationContext, AuthzRealmMutationStamp, AuthzRealmSchema,
+    AuthzRealmSnapshotApplied, AuthzRealmSnapshotError, AuthzRealmTransferManifest,
+    AuthzRepository, AuthzRevision, AuthzScope, AuthzStoreError, AuthzStoreLimits,
+    BindSchemaRequest, BoundRealm, CoordinatedAuthzRealmMutation, CoordinatedAuthzRealmResult,
+    DEFAULT_AUTHZ_RECEIPT_MAX_BYTES, DEFAULT_AUTHZ_RECEIPT_MAX_ENTRIES,
+    DEFAULT_AUTHZ_RECEIPT_RETENTION_SECONDS, MAX_AUTHZ_REALM_EXPORT_BYTES,
+    MAX_AUTHZ_REALM_EXPORT_RECORDS, ProtectedRealmOwnership, PublishSchemaRequest, PublishedSchema,
+    RealmBinding, RealmSnapshot, ReplicaAuthzRealmMutationApplied, SYSTEM_STORAGE_TENANT_ID,
+    SchemaDigest, SchemaId, SchemaRef, StorageTenantId, TupleBatchReceipt, TupleBatchRequest,
+    TupleMutation, TupleMutationKind,
 };
 pub use blob::{AWAITING_PUBLISH, BlobReader, BlobRef, BlobReferenceState, BlobStore, BlobUpload};
 pub use bootstrap::{
@@ -74,11 +78,11 @@ pub use store::{
     BatchGetSelection, CompleteCopySealOutcome, DEFAULT_AWAITING_PUBLISH_TTL_SECONDS,
     DEFAULT_MUTATION_RECEIPT_MAX_BYTES, DEFAULT_MUTATION_RECEIPT_MAX_ENTRIES,
     DEFAULT_MUTATION_RECEIPT_RETENTION_SECONDS, ListObjectsPage, LocalPayloadPresence,
-    MAX_LIST_OBJECT_VERSIONS, MAX_LIST_OBJECTS, MutationReceiptRetention, OpenedObject,
-    MAX_OBJECT_RECORD_EXPORT_BYTES, MAX_OBJECT_RECORD_EXPORT_RECORDS, ObjectPathSnapshot,
+    MAX_LIST_OBJECT_VERSIONS, MAX_LIST_OBJECTS, MAX_OBJECT_RECORD_EXPORT_BYTES,
+    MAX_OBJECT_RECORD_EXPORT_RECORDS, MutationReceiptRetention, ObjectPathSnapshot,
     ObjectRecordCursor, ObjectRecordExport, ObjectRecordExportPage, ObjectSnapshotApplied,
-    ObjectSnapshotError, PayloadArtifactState, PayloadStoreError, ShardIdentity, ShardReader,
-    ShardSealOutcome, ShardStoreError, Store, StoreOptions,
+    ObjectSnapshotError, OpenedObject, PayloadArtifactState, PayloadStoreError, ShardIdentity,
+    ShardReader, ShardSealOutcome, ShardStoreError, Store, StoreOptions,
 };
 pub use watch::{
     DEFAULT_WATCH_MAX_BYTES, DEFAULT_WATCH_MAX_ENTRIES, InvalidationStateHint, LocalChange,
