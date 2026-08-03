@@ -2,10 +2,11 @@
 
 use super::*;
 use anvil_store::{
-    AuthzRealmCursor, AuthzRealmKeyPage, AuthzRealmTransferManifest, AuthzScope,
-    LogicalRecordCandidate, LogicalRecordCursor, LogicalRecordExport, LogicalRecordExportPage,
-    LogicalRecordId, ObjectRecordCursor, ObjectRecordExport, ObjectRecordExportPage,
-    PayloadArtifactCursor, PayloadArtifactSnapshot, PayloadArtifactSnapshotPage,
+    AuthzRealmCursor, AuthzRealmKeyPage, AuthzRealmTransferManifest, AuthzSchemaCatalogue,
+    AuthzScope, LogicalRecordCandidate, LogicalRecordCursor, LogicalRecordExport,
+    LogicalRecordExportPage, LogicalRecordId, ObjectRecordCursor, ObjectRecordExport,
+    ObjectRecordExportPage, PayloadArtifactCursor, PayloadArtifactSnapshot,
+    PayloadArtifactSnapshotPage, StorageTenantId,
 };
 
 #[derive(Clone)]
@@ -822,6 +823,56 @@ impl DataPeerTransport {
             .await?
             .into_inner();
         decode_handoff_page(response)
+    }
+
+    pub(crate) async fn read_authz_schema_catalogue(
+        &self,
+        target: NodeId,
+        address: &str,
+        tenant: &StorageTenantId,
+    ) -> Result<Option<AuthzSchemaCatalogue>, Status> {
+        let response = self
+            .client(target, address)?
+            .read_authz_schema_catalogue(wire::AuthzSchemaCatalogueRequest {
+                peer: Some(self.context()),
+                storage_tenant: tenant.as_str().to_owned(),
+                handoff: Some(self.handoff()?),
+            })
+            .await?
+            .into_inner();
+        require_response_schema(response.schema_version)?;
+        require_typed_bound(&response.catalogue_json)?;
+        match (response.present, response.catalogue_json.is_empty()) {
+            (true, false) => decode_typed(&response.catalogue_json).map(Some),
+            (false, true) => Ok(None),
+            _ => Err(Status::data_loss(
+                "schema catalogue presence and payload disagree",
+            )),
+        }
+    }
+
+    pub(crate) async fn repair_authz_schema_catalogue(
+        &self,
+        target: NodeId,
+        address: &str,
+        tenant: &StorageTenantId,
+        catalogue: Option<&AuthzSchemaCatalogue>,
+    ) -> Result<bool, Status> {
+        let catalogue_json = catalogue.map(encode_typed).transpose()?.unwrap_or_default();
+        require_typed_bound(&catalogue_json)?;
+        let response = self
+            .client(target, address)?
+            .repair_authz_schema_catalogue(wire::RepairAuthzSchemaCatalogueRequest {
+                peer: Some(self.context()),
+                storage_tenant: tenant.as_str().to_owned(),
+                present: catalogue.is_some(),
+                catalogue_json,
+                handoff: Some(self.handoff()?),
+            })
+            .await?
+            .into_inner();
+        require_response_schema(response.schema_version)?;
+        Ok(response.replayed)
     }
 
     pub(crate) async fn authz_realm_manifest(

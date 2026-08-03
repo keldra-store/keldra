@@ -239,6 +239,26 @@ message AuthzRealmManifest {
   bytes manifest_json = 3;
 }
 
+message AuthzSchemaCatalogueRequest {
+  PeerContext peer = 1;
+  string storage_tenant = 2;
+  HandoffScope handoff = 3;
+}
+
+message AuthzSchemaCatalogueResponse {
+  uint32 schema_version = 1;
+  bool present = 2;
+  bytes catalogue_json = 3;
+}
+
+message RepairAuthzSchemaCatalogueRequest {
+  PeerContext peer = 1;
+  string storage_tenant = 2;
+  bool present = 3;
+  bytes catalogue_json = 4;
+  HandoffScope handoff = 5;
+}
+
 // The first frame carries `manifest_json` and no content. Later frames carry
 // contiguous canonical aggregate bytes; exactly one final empty frame ends it.
 message AuthzRealmFrame {
@@ -337,6 +357,8 @@ service DataPeer {
   rpc ReadLogicalRecord(LogicalRecordRequest) returns (LogicalRecordResponse);
   rpc RepairLogicalRecord(RepairLogicalRecordRequest) returns (HandoffRecordApplied);
   rpc ExportAuthzRealmKeys(HandoffPageRequest) returns (HandoffPage);
+  rpc ReadAuthzSchemaCatalogue(AuthzSchemaCatalogueRequest) returns (AuthzSchemaCatalogueResponse);
+  rpc RepairAuthzSchemaCatalogue(RepairAuthzSchemaCatalogueRequest) returns (HandoffRecordApplied);
   rpc ReadAuthzRealmManifest(AuthzRealmRequest) returns (AuthzRealmManifest);
   rpc RepairAuthzRealmAbsence(AuthzRealmRequest) returns (HandoffRecordApplied);
   rpc GetAuthzRealm(AuthzRealmRequest) returns (stream AuthzRealmFrame);

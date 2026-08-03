@@ -894,6 +894,20 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
         handoff::export_authz_realm_keys(self, request).await
     }
 
+    async fn read_authz_schema_catalogue(
+        &self,
+        request: Request<wire::AuthzSchemaCatalogueRequest>,
+    ) -> Result<Response<wire::AuthzSchemaCatalogueResponse>, Status> {
+        handoff::read_authz_schema_catalogue(self, request).await
+    }
+
+    async fn repair_authz_schema_catalogue(
+        &self,
+        request: Request<wire::RepairAuthzSchemaCatalogueRequest>,
+    ) -> Result<Response<wire::HandoffRecordApplied>, Status> {
+        handoff::repair_authz_schema_catalogue(self, request).await
+    }
+
     async fn read_authz_realm_manifest(
         &self,
         request: Request<wire::AuthzRealmRequest>,
@@ -1237,6 +1251,11 @@ mod tests {
             scope_json: Vec::new(),
             handoff: None,
         };
+        let catalogue = || wire::AuthzSchemaCatalogueRequest {
+            peer: Some(peer.clone()),
+            storage_tenant: "tenant".into(),
+            handoff: None,
+        };
         let mut denied = 0_usize;
         macro_rules! require_denied {
             ($operation:expr, $name:literal) => {
@@ -1434,6 +1453,20 @@ mod tests {
             "ExportAuthzRealmKeys"
         );
         require_denied!(
+            client.read_authz_schema_catalogue(catalogue()),
+            "ReadAuthzSchemaCatalogue"
+        );
+        require_denied!(
+            client.repair_authz_schema_catalogue(wire::RepairAuthzSchemaCatalogueRequest {
+                peer: Some(peer.clone()),
+                storage_tenant: "tenant".into(),
+                present: false,
+                catalogue_json: Vec::new(),
+                handoff: None,
+            }),
+            "RepairAuthzSchemaCatalogue"
+        );
+        require_denied!(
             client.read_authz_realm_manifest(realm()),
             "ReadAuthzRealmManifest"
         );
@@ -1462,7 +1495,7 @@ mod tests {
             "InstallPayloadLifecycle"
         );
         assert_eq!(
-            denied, 35,
+            denied, 37,
             "the DataPeer RPC list changed without updating this test"
         );
     }

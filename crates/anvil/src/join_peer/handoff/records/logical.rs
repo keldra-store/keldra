@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use anvil_consensus::NodeId;
 use anvil_store::{
-    LogicalRecordCandidate, LogicalRecordCursor, LogicalRecordExport, LogicalRecordId,
-    LogicalRecordValue, StorageTenantId,
+    AuthzSchemaCatalogue, LogicalRecordCandidate, LogicalRecordCursor, LogicalRecordExport,
+    LogicalRecordId, LogicalRecordValue, StorageTenantId,
 };
 use tonic::Status;
 
@@ -23,6 +23,7 @@ pub(super) async fn transfer(
         .cloned()
         .map(MergeSource::<LogicalRecordExport, LogicalRecordCursor>::new)
         .collect::<Vec<_>>();
+    let mut transferred_catalogue = None;
     loop {
         refill(&mut sources, peers).await?;
         let Some(key) = next_key(&sources) else {
@@ -34,7 +35,7 @@ pub(super) async fn transfer(
                 observed.insert(source.node_id(), record);
             }
         }
-        transfer_identity(topology, peers, observed).await?;
+        transfer_identity(topology, peers, observed, &mut transferred_catalogue).await?;
     }
 }
 
@@ -65,6 +66,7 @@ async fn transfer_identity(
     topology: &HandoffTopology,
     peers: &DataPeerTransport,
     observed: BTreeMap<NodeId, LogicalRecordExport>,
+    transferred_catalogue: &mut Option<StorageTenantId>,
 ) -> Result<(), Status> {
     let id = observed
         .values()
@@ -76,10 +78,12 @@ async fn transfer_identity(
             "logical handoff order key identifies contradictory records",
         ));
     }
-    if matches!(id, LogicalRecordId::TenantSchema { .. }) {
-        return Err(Status::failed_precondition(
-            "tenant-wide Zanzibar schema catalogue handoff is not installed",
-        ));
+    if let LogicalRecordId::TenantSchema { storage_tenant, .. } = &id {
+        if transferred_catalogue.as_ref() != Some(storage_tenant) {
+            transfer_schema_catalogue(topology, peers, storage_tenant).await?;
+            *transferred_catalogue = Some(storage_tenant.clone());
+        }
+        return Ok(());
     }
     let (kind, placement_key) = placement(&id)?;
     let old = topology.old_replicas(kind, &placement_key);
@@ -95,6 +99,82 @@ async fn transfer_identity(
         return Ok(());
     }
     repair_joiner(topology, peers, &id, selected.as_ref()).await
+}
+
+async fn transfer_schema_catalogue(
+    topology: &HandoffTopology,
+    peers: &DataPeerTransport,
+    storage_tenant: &StorageTenantId,
+) -> Result<(), Status> {
+    let tenant_id = resolve_tenant_id(topology, peers, storage_tenant).await?;
+    let key = tenant_id.to_be_bytes();
+    let old = topology.old_replicas(PlacementKind::ZanzibarRealm, &key);
+    let mut candidates = Vec::with_capacity(old.len());
+    for node in &old {
+        let address = topology
+            .address(*node)
+            .ok_or_else(|| Status::data_loss("schema catalogue replica has no peer address"))?;
+        let candidate = peers
+            .read_authz_schema_catalogue(*node, address, storage_tenant)
+            .await?;
+        if let Some(catalogue) = candidate.as_ref() {
+            catalogue
+                .validate()
+                .map_err(|error| Status::data_loss(error.to_string()))?;
+            if catalogue.storage_tenant != *storage_tenant {
+                return Err(Status::data_loss(
+                    "schema catalogue replica returned another tenant",
+                ));
+            }
+        }
+        candidates.push(candidate);
+    }
+    let selected = select_catalogue(&candidates, quorum(old.len())?)?;
+    if !topology
+        .new_replicas(PlacementKind::ZanzibarRealm, &key)
+        .contains(&topology.joining().node_id)
+    {
+        return Ok(());
+    }
+
+    let joining = topology.joining();
+    let current = peers
+        .read_authz_schema_catalogue(joining.node_id, &joining.address, storage_tenant)
+        .await?;
+    if current != selected {
+        peers
+            .repair_authz_schema_catalogue(
+                joining.node_id,
+                &joining.address,
+                storage_tenant,
+                selected.as_ref(),
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+fn select_catalogue(
+    candidates: &[Option<AuthzSchemaCatalogue>],
+    required: usize,
+) -> Result<Option<AuthzSchemaCatalogue>, Status> {
+    exact_quorum(candidates, required).ok_or_else(|| {
+        Status::unavailable("authorization schema catalogue has no exact read quorum")
+    })
+}
+
+fn exact_quorum<T: Clone + Eq>(candidates: &[Option<T>], required: usize) -> Option<Option<T>> {
+    if required == 0 {
+        return None;
+    }
+    candidates.iter().find_map(|candidate| {
+        (candidates
+            .iter()
+            .filter(|other| *other == candidate)
+            .count()
+            >= required)
+            .then(|| candidate.clone())
+    })
 }
 
 pub(super) async fn resolve_tenant_id(
@@ -196,5 +276,28 @@ fn placement(id: &LogicalRecordId) -> Result<(PlacementKind, Vec<u8>), Status> {
         LogicalRecordId::TenantSchema { .. } => Err(Status::failed_precondition(
             "TenantSchema belongs to the tenant-wide Zanzibar catalogue",
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::exact_quorum;
+
+    #[test]
+    fn exact_catalogue_quorum_selects_present_candidate() {
+        assert_eq!(
+            exact_quorum(&[Some(7_u8), Some(7), Some(9)], 2),
+            Some(Some(7))
+        );
+    }
+
+    #[test]
+    fn exact_catalogue_quorum_can_select_absence() {
+        assert_eq!(exact_quorum(&[None, Some(7_u8), None], 2), Some(None));
+    }
+
+    #[test]
+    fn exact_catalogue_quorum_fails_closed_without_agreement() {
+        assert_eq!(exact_quorum(&[Some(7_u8), Some(8), None], 2), None);
     }
 }

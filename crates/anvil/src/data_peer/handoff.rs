@@ -4,10 +4,10 @@
 use std::io::{self, Read, Write};
 
 use anvil_store::{
-    AuthzRealmCursor, AuthzRealmSnapshotError, AuthzRealmTransferManifest, AuthzScope,
-    LogicalRecordCandidate, LogicalRecordCursor, LogicalRecordError, LogicalRecordExport,
-    LogicalRecordId, ObjectRecordCursor, ObjectRecordExport, PayloadArtifactCursor,
-    PayloadArtifactSnapshot, ReferenceDeltaBatch, SourceId,
+    AuthzRealmCursor, AuthzRealmSnapshotError, AuthzRealmTransferManifest, AuthzSchemaCatalogue,
+    AuthzScope, AuthzStoreError, LogicalRecordCandidate, LogicalRecordCursor, LogicalRecordError,
+    LogicalRecordExport, LogicalRecordId, ObjectRecordCursor, ObjectRecordExport,
+    PayloadArtifactCursor, PayloadArtifactSnapshot, ReferenceDeltaBatch, SourceId, StorageTenantId,
 };
 
 use super::*;
@@ -354,6 +354,85 @@ pub(super) async fn export_authz_realm_keys(
     page_response(&page)
 }
 
+pub(super) async fn read_authz_schema_catalogue(
+    service: &DataPeerService,
+    mut request: Request<wire::AuthzSchemaCatalogueRequest>,
+) -> Result<Response<wire::AuthzSchemaCatalogueResponse>, Status> {
+    let peer = request.get_ref().peer.clone();
+    let caller = service.authorize(&mut request, peer.as_ref(), PeerRpcKind::StateTransfer)?;
+    service.validate_handoff(
+        caller,
+        request.get_ref().handoff.as_ref(),
+        HandoffTarget::AnyNode,
+    )?;
+    let tenant = StorageTenantId::parse(&request.get_ref().storage_tenant)
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    let repository = service.store.authz();
+    let catalogue =
+        tokio::task::spawn_blocking(move || repository.export_authz_schema_catalogue(&tenant))
+            .await
+            .map_err(join_status)?
+            .map_err(authz_store_status)?;
+    let catalogue_json = catalogue
+        .as_ref()
+        .map(encode_typed)
+        .transpose()?
+        .unwrap_or_default();
+    require_typed_bound(&catalogue_json)?;
+    Ok(Response::new(wire::AuthzSchemaCatalogueResponse {
+        schema_version: DATA_PEER_SCHEMA_VERSION,
+        present: catalogue.is_some(),
+        catalogue_json,
+    }))
+}
+
+pub(super) async fn repair_authz_schema_catalogue(
+    service: &DataPeerService,
+    mut request: Request<wire::RepairAuthzSchemaCatalogueRequest>,
+) -> Result<Response<wire::HandoffRecordApplied>, Status> {
+    let peer = request.get_ref().peer.clone();
+    let caller = service.authorize(&mut request, peer.as_ref(), PeerRpcKind::StateTransfer)?;
+    let handoff = request.get_ref().handoff.clone();
+    service.validate_handoff(caller, handoff.as_ref(), HandoffTarget::JoiningNode)?;
+    require_typed_bound(&request.get_ref().catalogue_json)?;
+    let tenant = StorageTenantId::parse(&request.get_ref().storage_tenant)
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    let catalogue: Option<AuthzSchemaCatalogue> = match (
+        request.get_ref().present,
+        request.get_ref().catalogue_json.is_empty(),
+    ) {
+        (true, false) => Some(decode_typed(&request.get_ref().catalogue_json)?),
+        (false, true) => None,
+        _ => {
+            return Err(Status::invalid_argument(
+                "schema catalogue presence and payload disagree",
+            ));
+        }
+    };
+    if catalogue
+        .as_ref()
+        .is_some_and(|catalogue| catalogue.storage_tenant != tenant)
+    {
+        return Err(Status::invalid_argument(
+            "schema catalogue belongs to another tenant",
+        ));
+    }
+    service.validate_handoff(caller, handoff.as_ref(), HandoffTarget::JoiningNode)?;
+    let repository = service.store.authz();
+    let replayed = tokio::task::spawn_blocking(move || {
+        let current = repository.export_authz_schema_catalogue(&tenant)?;
+        if current.as_ref() == catalogue.as_ref() {
+            return Ok(true);
+        }
+        repository.install_quorum_reconciled_authz_schema_catalogue(&tenant, catalogue.as_ref())?;
+        Ok::<bool, AuthzStoreError>(false)
+    })
+    .await
+    .map_err(join_status)?
+    .map_err(authz_store_status)?;
+    applied_response(replayed)
+}
+
 pub(super) async fn read_authz_realm_manifest(
     service: &DataPeerService,
     mut request: Request<wire::AuthzRealmRequest>,
@@ -659,6 +738,16 @@ fn authz_status(error: AuthzRealmSnapshotError) -> Status {
     match error {
         AuthzRealmSnapshotError::Store(_) => Status::internal(error.to_string()),
         AuthzRealmSnapshotError::TransferIntegrity(_) => Status::data_loss(error.to_string()),
+        _ => Status::failed_precondition(error.to_string()),
+    }
+}
+
+fn authz_store_status(error: AuthzStoreError) -> Status {
+    match error {
+        AuthzStoreError::Storage(_) => Status::internal(error.to_string()),
+        AuthzStoreError::RevisionNotAvailable { .. } | AuthzStoreError::ReceiptCapacity => {
+            Status::unavailable(error.to_string())
+        }
         _ => Status::failed_precondition(error.to_string()),
     }
 }
