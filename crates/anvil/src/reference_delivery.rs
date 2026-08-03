@@ -6,6 +6,9 @@
 //! store compact only through the minimum durable destination cursor.
 
 pub(crate) mod cleanup;
+mod runtime;
+
+pub(crate) use runtime::{ReferenceRuntime, ReferenceRuntimeHandle};
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -98,6 +101,28 @@ impl ReferencePlacement {
 
     fn address(&self, node: NodeId) -> Option<&str> {
         self.addresses.get(&node).map(String::as_str)
+    }
+}
+
+impl crate::payload_distribution::PayloadPlacementView for ReferencePlacement {
+    fn cluster_id(&self) -> ClusterId {
+        self.cluster_id()
+    }
+
+    fn fence(&self) -> anvil_store::PlacementLogId {
+        self.fence()
+    }
+
+    fn placement_nodes(&self) -> &[PlacementNode] {
+        self.placement_nodes()
+    }
+
+    fn active_node_ids(&self) -> Vec<NodeId> {
+        self.active_node_ids()
+    }
+
+    fn address(&self, node: NodeId) -> Option<&str> {
+        self.address(node)
     }
 }
 

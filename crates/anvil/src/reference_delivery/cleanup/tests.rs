@@ -3,8 +3,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anvil_store::{
-    Durability, ObjectKey, ObjectMutationContext, PublishRequest, PutMode, ReferenceProof,
-    SourceId, StoreOptions,
+    Durability, LogicalRecordMutationContext, LogicalRecordValue, ObjectKey, ObjectMutationContext,
+    PublishRequest, PutMode, ReferenceProof, SourceId, StorageTenantId, StoreOptions, VersionId,
 };
 
 use super::*;
@@ -97,6 +97,7 @@ fn status(source_id: SourceId, tail: u64, retention_floor: u64) -> WatchJournalS
 }
 
 async fn proof(store: &Store, path: &str, command: &str) -> ReferenceProof {
+    ensure_test_bucket_identity(store);
     let blob = store.stage_blob(command.as_bytes()).await.unwrap();
     let mutation = store
         .coordinate_distributed_publish(
@@ -124,6 +125,44 @@ async fn proof(store: &Store, path: &str, command: &str) -> ReferenceProof {
         )
         .unwrap()
         .unwrap()
+}
+
+fn ensure_test_bucket_identity(store: &Store) {
+    if store.resolve_bucket_ids("tenant", "bucket").is_ok() {
+        return;
+    }
+    let placement = PlacementLogId { term: 1, index: 1 };
+    for (record_version, typed_value) in [
+        (
+            100,
+            LogicalRecordValue::TenantNameClaim {
+                storage_tenant: StorageTenantId::parse("tenant").unwrap(),
+                tenant_id: 7,
+            },
+        ),
+        (
+            101,
+            LogicalRecordValue::BucketNameClaim {
+                tenant_id: 7,
+                bucket: "bucket".into(),
+                bucket_id: 11,
+            },
+        ),
+    ] {
+        let mutation = store
+            .construct_logical_record_mutation(
+                typed_value,
+                LogicalRecordMutationContext {
+                    record_version: VersionId(record_version),
+                    active_placement_log_id: placement,
+                    serving_fence_term: 1,
+                },
+            )
+            .unwrap();
+        store
+            .apply_logical_record_mutation_replica(&mutation)
+            .unwrap();
+    }
 }
 
 #[tokio::test]
