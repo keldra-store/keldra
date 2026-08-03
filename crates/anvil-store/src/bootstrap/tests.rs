@@ -221,6 +221,57 @@ async fn tenant_provisioning_commits_owner_credential_marker_and_tuple_together(
 }
 
 #[tokio::test]
+async fn distributed_tenant_plan_is_typed_and_has_no_storage_side_effects() {
+    let (_directory, store) = store().await;
+    store
+        .bootstrap_system(request("bootstrap-app", "bootstrap-client"))
+        .unwrap();
+
+    let prepared = store
+        .prepare_tenant_provisioning(
+            provision_request("acme", "owner-app", "owner-client", 3),
+            700,
+        )
+        .unwrap();
+
+    assert_eq!(prepared.tenant_id, 700);
+    assert_eq!(prepared.logical_records.len(), 4);
+    assert_eq!(prepared.grant.expected_revision, Some(AuthzRevision(3)));
+    assert_eq!(
+        prepared.grant.operation_id.as_deref(),
+        Some("provision-tenant-700")
+    );
+    assert_eq!(
+        store
+            .authz()
+            .tenant_revision(&StorageTenantId::system())
+            .unwrap(),
+        AuthzRevision(3)
+    );
+    for value in &prepared.logical_records {
+        assert!(
+            store
+                .logical_record_candidate(&value.id())
+                .unwrap()
+                .is_none()
+        );
+    }
+    let credential = prepared
+        .logical_records
+        .iter()
+        .find_map(|value| match value {
+            LogicalRecordValue::Credential(record) => Some(record),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        credential.verify_secret(SECRET).unwrap(),
+        Some(prepared.credential)
+    );
+    assert!(credential.verify_secret("wrong-secret").unwrap().is_none());
+}
+
+#[tokio::test]
 async fn protected_system_tenant_cannot_be_provisioned_as_an_external_tenant() {
     let (_directory, store) = store().await;
     store
@@ -544,6 +595,45 @@ async fn bucket_creation_and_role_changes_are_system_realm_tuple_batches() {
         "writer",
         app("owner-app"),
     )));
+}
+
+#[tokio::test]
+async fn distributed_bucket_plan_places_existence_before_its_grant() {
+    let (_directory, store) = store().await;
+    store
+        .bootstrap_system(request("bootstrap-app", "bootstrap-client"))
+        .unwrap();
+    let prepared = store
+        .prepare_bucket_creation(
+            CreateBucketRequest {
+                storage_tenant: tenant("acme"),
+                bucket: "objects".into(),
+                owner: app("owner-app"),
+                principal: app("owner-app"),
+                expected_authorization_revision: AuthzRevision(9),
+                expected_binding_generation: 1,
+                versioning: ObjectVersioning::Enabled,
+            },
+            700,
+            701,
+        )
+        .unwrap();
+
+    assert_eq!(prepared.bucket_id, 701);
+    assert_eq!(prepared.logical_records.len(), 3);
+    assert_eq!(prepared.grant.expected_revision, Some(AuthzRevision(9)));
+    assert_eq!(
+        prepared.grant.operation_id.as_deref(),
+        Some("create-bucket-700-701")
+    );
+    for value in &prepared.logical_records {
+        assert!(
+            store
+                .logical_record_candidate(&value.id())
+                .unwrap()
+                .is_none()
+        );
+    }
 }
 
 #[tokio::test]

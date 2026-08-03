@@ -16,7 +16,8 @@ use crate::key::{
 };
 use crate::store::{CF_CREDENTIALS, CF_METADATA, CF_NAMES, VERSION_HIGH_WATERMARK_KEY};
 use crate::{
-    AuthzConsistency, AuthzRevision, AuthzScope, AuthzStoreError, ObjectKey, ObjectVersioning,
+    AuthzConsistency, AuthzRevision, AuthzScope, AuthzStoreError, LogicalApplicationRecord,
+    LogicalBucketRecord, LogicalRecordValue, LogicalTenantRecord, ObjectKey, ObjectVersioning,
     SchemaId, StorageTenantId, Store, TupleBatchRequest, TupleMutation, TupleMutationKind,
     VersionId,
 };
@@ -28,7 +29,7 @@ pub(crate) const CREDENTIAL_FORMAT_VERSION: u16 = 2;
 pub(crate) const APPLICATION_FORMAT_VERSION: u16 = 1;
 pub(crate) const PROVISIONING_FORMAT_VERSION: u16 = 1;
 const MIN_CLIENT_SECRET_BYTES: usize = 32;
-const MAX_CLIENT_SECRET_BYTES: usize = 4 * 1024;
+pub(crate) const MAX_CLIENT_SECRET_BYTES: usize = 4 * 1024;
 const MAX_CLIENT_ID_BYTES: usize = 256;
 
 const SYSTEM_NAMESPACE: &str = "system";
@@ -135,6 +136,16 @@ pub struct ProvisionTenantReceipt {
     pub replayed: bool,
 }
 
+/// No-write result used by the cluster administration executor. The executor
+/// durably coordinates these typed logical records before applying `grant`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedTenantProvisioning {
+    pub tenant_id: u64,
+    pub credential: ApplicationCredential,
+    pub logical_records: Vec<LogicalRecordValue>,
+    pub grant: TupleBatchRequest,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreateBucketRequest {
     pub storage_tenant: StorageTenantId,
@@ -153,6 +164,15 @@ pub struct CreateBucketReceipt {
     pub authorization_revision: AuthzRevision,
     pub versioning: ObjectVersioning,
     pub replayed: bool,
+}
+
+/// No-write result used by the cluster administration executor. Bucket
+/// existence records are made durable before the authorization grant.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedBucketCreation {
+    pub bucket_id: u64,
+    pub logical_records: Vec<LogicalRecordValue>,
+    pub grant: TupleBatchRequest,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -379,6 +399,15 @@ impl Store {
         self.credentials().provision_tenant(request)
     }
 
+    pub fn prepare_tenant_provisioning(
+        &self,
+        request: ProvisionTenantRequest,
+        tenant_id: u64,
+    ) -> Result<PreparedTenantProvisioning, CredentialRepositoryError> {
+        self.credentials()
+            .prepare_tenant_provisioning(request, tenant_id)
+    }
+
     pub fn create_application(
         &self,
         request: ApplicationCredentialRequest,
@@ -419,6 +448,16 @@ impl Store {
         self.credentials().create_bucket(request)
     }
 
+    pub fn prepare_bucket_creation(
+        &self,
+        request: CreateBucketRequest,
+        tenant_id: u64,
+        bucket_id: u64,
+    ) -> Result<PreparedBucketCreation, CredentialRepositoryError> {
+        self.credentials()
+            .prepare_bucket_creation(request, tenant_id, bucket_id)
+    }
+
     pub fn set_application_role(
         &self,
         request: SetApplicationRoleRequest,
@@ -428,6 +467,142 @@ impl Store {
 }
 
 impl CredentialRepository {
+    pub fn prepare_tenant_provisioning(
+        &self,
+        request: ProvisionTenantRequest,
+        tenant_id: u64,
+    ) -> Result<PreparedTenantProvisioning, CredentialRepositoryError> {
+        if request.storage_tenant.is_system() {
+            return Err(CredentialRepositoryError::InvalidInput(
+                "the protected system tenant cannot be provisioned".into(),
+            ));
+        }
+        if tenant_id == 0 {
+            return Err(CredentialRepositoryError::InvalidInput(
+                "stable tenant ID must be non-zero".into(),
+            ));
+        }
+        validate_principal(&request.principal)?;
+        let owner = application_ref(&request.owner_app_id)?;
+        let application = ApplicationCredentialRequest {
+            storage_tenant: request.storage_tenant.clone(),
+            app_id: request.owner_app_id.clone(),
+            client_id: request.owner_client_id.clone(),
+            client_secret: request.owner_client_secret.clone(),
+        };
+        validate_application_request(&application)?;
+        let authorization_revision = next_admin_revision(request.expected_authorization_revision)?;
+        let stored_application = StoredApplication {
+            format_version: APPLICATION_FORMAT_VERSION,
+            app_id: application.app_id.clone(),
+            client_id: application.client_id.clone(),
+            storage_tenant: application.storage_tenant.clone(),
+        };
+        let stored_credential = StoredApplicationCredential {
+            format_version: CREDENTIAL_FORMAT_VERSION,
+            app_id: application.app_id.clone(),
+            client_id: application.client_id.clone(),
+            storage_tenant: application.storage_tenant.clone(),
+            active: true,
+            verifier: new_credential_verifier(application.client_secret.as_bytes())?,
+        };
+        let credential = credential_from_stored(&stored_credential)?;
+        let logical_records = vec![
+            LogicalRecordValue::TenantNameClaim {
+                storage_tenant: request.storage_tenant.clone(),
+                tenant_id,
+            },
+            LogicalRecordValue::TenantRecord(LogicalTenantRecord {
+                tenant_id,
+                storage_tenant: request.storage_tenant.clone(),
+                owner_app_id: request.owner_app_id,
+                owner_client_id: request.owner_client_id,
+                authorization_revision,
+            }),
+            LogicalRecordValue::Application(LogicalApplicationRecord::from(stored_application)),
+            LogicalRecordValue::Credential(stored_credential.into()),
+        ];
+        let grant = TupleBatchRequest {
+            scope: AuthzScope::system(),
+            principal: request.principal,
+            expected_revision: Some(request.expected_authorization_revision),
+            expected_binding_generation: request.expected_binding_generation,
+            operation_id: Some(format!("provision-tenant-{tenant_id}")),
+            mutations: vec![TupleMutation {
+                kind: TupleMutationKind::Add,
+                tuple: Tuple::new(tenant_resource(&request.storage_tenant)?, "owner", owner),
+            }],
+        };
+        Ok(PreparedTenantProvisioning {
+            tenant_id,
+            credential,
+            logical_records,
+            grant,
+        })
+    }
+
+    pub fn prepare_bucket_creation(
+        &self,
+        request: CreateBucketRequest,
+        tenant_id: u64,
+        bucket_id: u64,
+    ) -> Result<PreparedBucketCreation, CredentialRepositoryError> {
+        if request.storage_tenant.is_system() {
+            return Err(CredentialRepositoryError::InvalidInput(
+                "buckets cannot be created in the protected system tenant".into(),
+            ));
+        }
+        if tenant_id == 0 || bucket_id == 0 {
+            return Err(CredentialRepositoryError::InvalidInput(
+                "stable tenant and bucket IDs must be non-zero".into(),
+            ));
+        }
+        validate_principal(&request.principal)?;
+        validate_application_for_tenant(&request.owner, &request.storage_tenant)?;
+        validate_bucket(&request.storage_tenant, &request.bucket)?;
+        let authorization_revision = next_admin_revision(request.expected_authorization_revision)?;
+        let logical_records = vec![
+            LogicalRecordValue::BucketNameClaim {
+                tenant_id,
+                bucket: request.bucket.clone(),
+                bucket_id,
+            },
+            LogicalRecordValue::BucketRecord(LogicalBucketRecord {
+                tenant_id,
+                bucket_id,
+                storage_tenant: request.storage_tenant.clone(),
+                bucket: request.bucket.clone(),
+                owner: request.owner.clone(),
+                authorization_revision,
+            }),
+            LogicalRecordValue::BucketOptions {
+                tenant_id,
+                bucket_id,
+                versioning: request.versioning,
+            },
+        ];
+        let grant = TupleBatchRequest {
+            scope: AuthzScope::system(),
+            principal: request.principal,
+            expected_revision: Some(request.expected_authorization_revision),
+            expected_binding_generation: request.expected_binding_generation,
+            operation_id: Some(format!("create-bucket-{tenant_id}-{bucket_id}")),
+            mutations: vec![TupleMutation {
+                kind: TupleMutationKind::Add,
+                tuple: Tuple::new(
+                    bucket_resource(&request.storage_tenant, &request.bucket)?,
+                    "owner",
+                    request.owner,
+                ),
+            }],
+        };
+        Ok(PreparedBucketCreation {
+            bucket_id,
+            logical_records,
+            grant,
+        })
+    }
+
     pub fn system_bootstrap_state(&self) -> Result<SystemBootstrapState, SystemBootstrapError> {
         match self.read_marker()? {
             None => Ok(SystemBootstrapState::Missing),
@@ -1335,6 +1510,19 @@ fn require_system_revision(
     Ok(())
 }
 
+fn next_admin_revision(current: AuthzRevision) -> Result<AuthzRevision, CredentialRepositoryError> {
+    current
+        .0
+        .checked_add(1)
+        .filter(|revision| *revision != 0)
+        .map(AuthzRevision)
+        .ok_or_else(|| {
+            CredentialRepositoryError::Storage(
+                "authorization revision is exhausted during administration planning".into(),
+            )
+        })
+}
+
 fn tenant_resource(
     storage_tenant: &StorageTenantId,
 ) -> Result<ObjectRef, CredentialRepositoryError> {
@@ -1429,7 +1617,7 @@ fn new_credential_verifier(
     })
 }
 
-fn credential_matches(
+pub(crate) fn credential_matches(
     verifier: &StoredCredentialVerifier,
     secret: &[u8],
 ) -> Result<bool, CredentialRepositoryError> {

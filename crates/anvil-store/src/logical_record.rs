@@ -7,11 +7,12 @@ use thiserror::Error;
 
 use crate::authz::{StoredSchema, schema_revision_key, validate_stored_schema};
 use crate::bootstrap::{
-    APPLICATION_FORMAT_VERSION, CREDENTIAL_FORMAT_VERSION, PROVISIONING_FORMAT_VERSION,
-    StoredApplication, StoredApplicationCredential, StoredBucket, StoredCredentialVerifier,
-    StoredTenant, application_key, application_ref, bucket_record_key, credential_from_stored,
-    credential_key, tenant_record_key, validate_client_id, validate_stored_application,
-    validate_stored_bucket, validate_stored_credential_verifier, validate_stored_tenant,
+    APPLICATION_FORMAT_VERSION, CREDENTIAL_FORMAT_VERSION, MAX_CLIENT_SECRET_BYTES,
+    PROVISIONING_FORMAT_VERSION, StoredApplication, StoredApplicationCredential, StoredBucket,
+    StoredCredentialVerifier, StoredTenant, application_key, application_ref, bucket_record_key,
+    credential_from_stored, credential_key, credential_matches, tenant_record_key,
+    validate_client_id, validate_stored_application, validate_stored_bucket,
+    validate_stored_credential_verifier, validate_stored_tenant,
 };
 use crate::key::{
     BucketId, BucketIdentity, STORAGE_KEY_FORMAT_VERSION, TENANT_NAME_TYPE, TenantId,
@@ -128,6 +129,27 @@ impl LogicalCredentialRecord {
 
     pub fn active(&self) -> bool {
         self.active
+    }
+
+    /// Verify a secret against one quorum-selected credential without relying
+    /// on an unrelated local application replica.
+    pub fn verify_secret(
+        &self,
+        secret: &str,
+    ) -> Result<Option<crate::ApplicationCredential>, crate::CredentialRepositoryError> {
+        self.validate()?;
+        if secret.len() > MAX_CLIENT_SECRET_BYTES
+            || !self.active
+            || !credential_matches(&self.verifier, secret.as_bytes())?
+        {
+            return Ok(None);
+        }
+        credential_from_stored(&self.clone().into()).map(Some)
+    }
+
+    fn validate(&self) -> Result<(), crate::CredentialRepositoryError> {
+        validate_stored_credential_verifier(&self.verifier)?;
+        credential_from_stored(&self.clone().into()).map(|_| ())
     }
 }
 
