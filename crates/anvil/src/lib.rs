@@ -17,6 +17,9 @@ mod data_peer;
 mod distributed_control_plane;
 mod distributed_list;
 mod distributed_watch;
+mod index_config;
+mod index_runtime;
+mod index_service;
 mod join_bundle;
 mod join_peer;
 mod logical_name_resolution;
@@ -25,12 +28,14 @@ mod mutable_record_quorum;
 mod mutable_record_replica_group;
 mod node_identity;
 mod object_distribution;
+mod object_path_access;
 pub mod observability;
 mod payload_distribution;
 mod payload_placement;
 mod payload_read;
 mod payload_read_transport;
 mod peer_runtime;
+mod personaldb;
 mod placement;
 mod programs;
 #[allow(
@@ -49,7 +54,9 @@ use std::time::Duration;
 use anvil_api::v1::administration_service_server::AdministrationServiceServer;
 use anvil_api::v1::authz_service_server::AuthzServiceServer;
 use anvil_api::v1::credential_service_server::CredentialServiceServer;
+use anvil_api::v1::index_service_server::IndexServiceServer;
 use anvil_api::v1::object_service_server::ObjectServiceServer;
+use anvil_api::v1::personal_db_service_server::PersonalDbServiceServer;
 use anvil_consensus::{ATOMIC_REPLAY_RETENTION_MILLIS, NodeId};
 use anvil_store::{ErasureProfile, MutationReceiptRetention, Store, StoreOptions, WatchRetention};
 use anyhow::{Context, Result};
@@ -57,6 +64,7 @@ use tonic::transport::Server;
 
 use authentication::{JwtManager, RateLimitConfig, RequestRateLimits};
 
+pub use index_config::{IndexRuntimeConfig, IndexRuntimeConfigError};
 pub use v05::ObjectServiceImpl;
 
 const MAX_GRPC_MESSAGE_BYTES: usize = 72 * 1024 * 1024;
@@ -82,6 +90,7 @@ pub struct ServerConfig {
     pub atomic_program_timeout: Duration,
     pub token_manager: JwtManager,
     pub rate_limits: RateLimitConfig,
+    pub index_runtime: IndexRuntimeConfig,
     pub max_blob_bytes: u64,
     pub erasure_profile: ErasureProfile,
     pub awaiting_publish_ttl_seconds: u64,
@@ -137,11 +146,14 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         cluster_peer::ClusterPeerTransport::new(data_transport.clone(), decisions.clone());
     let routed_public_handlers = peer_runtime.routed_public_handlers();
     let routed_authz_handlers = peer_runtime.routed_authz_handlers();
+    let routed_index_query_handlers = peer_runtime.routed_index_query_handlers();
+    let routed_personaldb_handlers = peer_runtime.routed_personaldb_handlers();
     let list_authorizer_binding = peer_runtime.list_authorizer();
     let fresh_authorization_binding = peer_runtime.fresh_authorization();
     let distributed_control_binding = peer_runtime.distributed_control();
     let name_resolution_binding = peer_runtime.name_resolution();
     let program_quiescence_binding = peer_runtime.program_quiescence();
+    let index_artifacts_binding = peer_runtime.index_artifacts();
     let pending_join = peer_runtime.join_transport();
     // The private listener must be accepting before an existing multi-node
     // group can elect a leader after a coordinated restart.
@@ -211,7 +223,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         store.clone(),
         decisions.clone(),
         serving_fence.authority(),
-        data_transport,
+        data_transport.clone(),
         config.erasure_profile,
     );
     let object_reader = cluster_object_read::ClusterObjectReader::new(
@@ -294,6 +306,13 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         cluster_transport.clone(),
         name_resolver.clone(),
     );
+    let index_artifact_coordinator = index_runtime::publication::IndexArtifactCoordinator::new(
+        object_distribution.clone(),
+        bucket_governance.clone(),
+    );
+    index_artifacts_binding
+        .install(Arc::new(index_artifact_coordinator))
+        .map_err(|_| anyhow::anyhow!("index artifact coordinator was installed more than once"))?;
     let list_authorizer: Arc<dyn distributed_list::AuthoritativeListAuthorizer> =
         Arc::new(distributed_list::CoordinatedListAuthorizer::new(
             config.token_manager.clone(),
@@ -373,13 +392,38 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     // every current source tail locally applied. Recheck immediately before
     // the destructive scan in case placement changed after readiness.
     collect_blob_garbage_if_safe(&store, &reference_runtime_handle, "startup").await;
+    let index_runtime = index_runtime::runtime::start(
+        local_node,
+        decisions.clone(),
+        store.clone(),
+        data_transport,
+        cluster_transport.clone(),
+        object_distribution.clone(),
+        bucket_governance.clone(),
+        object_reader.clone(),
+        &config.data_dir,
+        config.index_runtime,
+    )
+    .await
+    .context("initialize distributed index runtime")?;
+    let index_authorization: Arc<dyn index_service::IndexAuthorization> =
+        Arc::new(authoritative_system.clone());
+    routed_index_query_handlers
+        .install(Arc::new(cluster_peer::AuthorizedIndexQueryHandler::new(
+            local_node,
+            config.token_manager.clone(),
+            name_resolver.clone(),
+            index_authorization.clone(),
+            index_runtime.local_queries.clone(),
+        )))
+        .map_err(|_| anyhow::anyhow!("routed index query handler was installed more than once"))?;
     let object_service = ObjectServiceImpl::new(
         store.clone(),
         programs.clone(),
         object_distribution,
         object_reader,
         cluster_transport.clone(),
-        object_lister,
+        object_lister.clone(),
         distributed_watch,
         name_resolver.clone(),
         authoritative_system.clone(),
@@ -388,6 +432,34 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         config.max_blob_bytes,
         config.atomic_program_timeout,
     );
+    let index_service = index_service::IndexServiceImpl::new(
+        object_service.clone(),
+        name_resolver.clone(),
+        index_service::IndexServiceDependencies {
+            definitions: index_runtime.definitions.clone(),
+            queries: index_runtime.queries.clone(),
+            authorization: index_authorization,
+            page_tokens: Arc::new(config.token_manager.clone()),
+        },
+        config.atomic_program_timeout,
+    );
+    let personaldb_resolver = personaldb::HrwPrimaryResolver::new(decisions.clone());
+    let personaldb_service = personaldb::PersonalDbServiceImpl::new(
+        local_node,
+        personaldb_resolver,
+        serving_fence.authority(),
+        object_service.clone(),
+        object_lister,
+        name_resolver.clone(),
+        authoritative_system.clone(),
+        cluster_transport.clone(),
+        config.token_manager.clone(),
+        config.atomic_program_timeout,
+    )
+    .context("initialize PersonalDB service")?;
+    routed_personaldb_handlers
+        .install(Arc::new(personaldb_service.clone()))
+        .map_err(|_| anyhow::anyhow!("routed PersonalDB handler was installed more than once"))?;
     routed_public_handlers
         .install(object_service.routed_public_handler())
         .map_err(|_| anyhow::anyhow!("routed public handler was installed more than once"))?;
@@ -424,7 +496,13 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     let object_service = ObjectServiceServer::new(object_service)
         .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES);
+    let index_service = IndexServiceServer::new(index_service)
+        .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+        .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES);
     let authz_service = AuthzServiceServer::new(authz_service)
+        .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+        .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES);
+    let personaldb_service = PersonalDbServiceServer::new(personaldb_service)
         .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES);
     let tokens = config.token_manager;
@@ -435,8 +513,14 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     };
     let object_service =
         tonic::service::interceptor::InterceptedService::new(object_service, authenticate.clone());
+    let index_service =
+        tonic::service::interceptor::InterceptedService::new(index_service, authenticate.clone());
     let authz_service =
         tonic::service::interceptor::InterceptedService::new(authz_service, authenticate.clone());
+    let personaldb_service = tonic::service::interceptor::InterceptedService::new(
+        personaldb_service,
+        authenticate.clone(),
+    );
     let administration_service = tonic::service::interceptor::InterceptedService::new(
         AdministrationServiceServer::new(administration_service),
         authenticate,
@@ -453,7 +537,9 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     let mut public_server = Box::pin(
         Server::builder()
             .add_service(object_service)
+            .add_service(index_service)
             .add_service(authz_service)
+            .add_service(personaldb_service)
             .add_service(administration_service)
             // Deliberately not bearer-authenticated: this service exchanges
             // durable long-lived credentials for that bearer token. It still

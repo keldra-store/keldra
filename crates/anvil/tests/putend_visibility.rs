@@ -171,6 +171,7 @@ fn test_server_config(
         atomic_program_timeout: Duration::from_secs(30),
         token_manager,
         rate_limits: RateLimitConfig::default(),
+        index_runtime: anvil::IndexRuntimeConfig::default(),
         max_blob_bytes: 1024 * 1024,
         erasure_profile: anvil_store::ErasureProfile::default(),
         awaiting_publish_ttl_seconds: anvil_store::DEFAULT_AWAITING_PUBLISH_TTL_SECONDS,

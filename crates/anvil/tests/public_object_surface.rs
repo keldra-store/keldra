@@ -7,6 +7,8 @@ use anvil_api::v1::administration_service_client::AdministrationServiceClient;
 use anvil_api::v1::batch_get_outcome::Outcome as BatchOutcomeValue;
 use anvil_api::v1::bulk_operation::Operation as BulkOperationValue;
 use anvil_api::v1::bulk_outcome::Outcome as BulkOutcomeValue;
+use anvil_api::v1::index_service_client::IndexServiceClient;
+use anvil_api::v1::index_specification::Specification as IndexSpecificationValue;
 use anvil_api::v1::object_head::State as HeadState;
 use anvil_api::v1::object_service_client::ObjectServiceClient;
 use anvil_api::v1::put_header::Operation as PutOperationValue;
@@ -14,11 +16,12 @@ use anvil_api::v1::watch_message::Message as WatchMessageValue;
 use anvil_api::v1::watch_prefix_request::Start as WatchStart;
 use anvil_api::v1::{
     BatchGetRequest, BucketPolicy, BulkOperation, BulkPutRequest, BulkWriteRequest,
-    DeleteIfVersionRequest, DeleteRequest, DeleteVersionRequest, Durability, GetObjectRequest,
-    HeadObjectRequest, InvokeProgramRequest, ListObjectVersionsRequest, ListObjectsRequest,
-    MutationFailureCode, ObjectAddress, ObjectVersioning as ApiObjectVersioning, PutHeader,
-    PutIfAbsentOperation, PutIfVersionOperation, PutImmutableOperation, PutOperation, PutRequest,
-    PutToken, SetBucketPolicyRequest, SetBucketVersioningRequest, WatchNow, WatchPrefixRequest,
+    CreateIndexRequest, DeleteIfVersionRequest, DeleteRequest, DeleteVersionRequest, Durability,
+    GetObjectRequest, HeadObjectRequest, IndexSpecification, InvokeProgramRequest,
+    ListObjectVersionsRequest, ListObjectsRequest, MutationFailureCode, ObjectAddress,
+    ObjectVersioning as ApiObjectVersioning, PathIndexSpec, PutHeader, PutIfAbsentOperation,
+    PutIfVersionOperation, PutImmutableOperation, PutOperation, PutRequest, PutToken,
+    SetBucketPolicyRequest, SetBucketVersioningRequest, WatchNow, WatchPrefixRequest,
     WatchStateHint,
 };
 use anvil_authz::ObjectRef;
@@ -69,6 +72,155 @@ async fn every_object_rpc_rejects_an_unauthenticated_request() {
             .await,
     );
     assert_unauthenticated(client.invoke_program(InvokeProgramRequest::default()).await);
+
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn raw_reserved_personaldb_objects_are_denied_but_trusted_adapters_still_work() {
+    let fixture = Fixture::start().await;
+    let token = fixture.access_token.as_str();
+    let reserved = address("_anvil/personaldb/v0/00");
+    let mut objects = ObjectServiceClient::new(fixture.channel.clone());
+
+    assert_permission_denied(
+        objects
+            .start_put(authorized(
+                PutHeader {
+                    address: Some(reserved.clone()),
+                    content_type: "application/octet-stream".into(),
+                    command_id: "raw-reserved-put".into(),
+                    durability: Durability::Local as i32,
+                    operation: Some(PutOperationValue::Put(PutOperation {})),
+                },
+                token,
+            ))
+            .await,
+    );
+    assert_permission_denied(
+        objects
+            .head_object(authorized(
+                HeadObjectRequest {
+                    address: Some(reserved.clone()),
+                },
+                token,
+            ))
+            .await,
+    );
+    assert_permission_denied(
+        objects
+            .get_object(authorized(
+                GetObjectRequest {
+                    address: Some(reserved.clone()),
+                    version: None,
+                },
+                token,
+            ))
+            .await,
+    );
+    assert_permission_denied(
+        objects
+            .delete(authorized(
+                DeleteRequest {
+                    address: Some(reserved.clone()),
+                    command_id: "raw-reserved-delete".into(),
+                    durability: Durability::Local as i32,
+                },
+                token,
+            ))
+            .await,
+    );
+
+    let bulk = objects
+        .bulk_write(authorized(
+            BulkWriteRequest {
+                operations: vec![BulkOperation {
+                    operation: Some(BulkOperationValue::Put(bulk_put(
+                        reserved.clone(),
+                        b"must not persist",
+                        "raw-reserved-bulk",
+                    ))),
+                }],
+            },
+            token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(matches!(
+        bulk.outcomes[0].outcome,
+        Some(BulkOutcomeValue::Failure(ref failure))
+            if failure.code == MutationFailureCode::AuthorizationDenied as i32
+    ));
+
+    let batch = objects
+        .batch_get(authorized(
+            BatchGetRequest {
+                objects: vec![GetObjectRequest {
+                    address: Some(reserved),
+                    version: None,
+                }],
+            },
+            token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(matches!(
+        batch.outcomes[0].outcome,
+        Some(BatchOutcomeValue::Failure(ref failure))
+            if failure.code == anvil_api::v1::ReadFailureCode::AuthorizationDenied as i32
+    ));
+
+    // The public IndexService is a trusted adapter: it may persist its
+    // definition through the same ordinary object pipeline, while callers
+    // still cannot address that reserved object through ObjectService.
+    let mut indexes = IndexServiceClient::new(fixture.channel.clone());
+    let definition = indexes
+        .create_index(authorized(
+            CreateIndexRequest {
+                bucket: "objects".into(),
+                name: "reserved-boundary".into(),
+                path_prefix: "docs/".into(),
+                content_type: String::new(),
+                specification: Some(IndexSpecification {
+                    specification: Some(IndexSpecificationValue::Path(PathIndexSpec {})),
+                }),
+                command_id: "create-reserved-boundary".into(),
+            },
+            token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_ne!(definition.version, 0);
+    assert_permission_denied(
+        objects
+            .head_object(authorized(
+                HeadObjectRequest {
+                    address: Some(address("_anvil/indexes/definitions/reserved-boundary")),
+                },
+                token,
+            ))
+            .await,
+    );
+
+    // Program definitions are the one Zanzibar-authorized public exception.
+    let program = address("_anvil/programs/reserved-boundary@1");
+    put_object(
+        &mut objects,
+        token,
+        program.clone(),
+        br#"{"steps":[]}"#,
+        "public-program-definition",
+        PutOperationValue::PutImmutable(PutImmutableOperation {}),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        head(&mut objects, &program, token).await.state,
+        Some(HeadState::Present(_))
+    ));
 
     fixture.stop().await;
 }
@@ -814,6 +966,7 @@ fn test_server_config(
         atomic_program_timeout: Duration::from_secs(30),
         token_manager,
         rate_limits: RateLimitConfig::default(),
+        index_runtime: anvil::IndexRuntimeConfig::default(),
         max_blob_bytes: 1024 * 1024,
         erasure_profile: anvil_store::ErasureProfile::default(),
         awaiting_publish_ttl_seconds: anvil_store::DEFAULT_AWAITING_PUBLISH_TTL_SECONDS,
@@ -859,6 +1012,13 @@ fn assert_unauthenticated<T>(result: Result<Response<T>, Status>) {
     match result {
         Ok(_) => panic!("protected object RPC accepted an unauthenticated request"),
         Err(status) => assert_eq!(status.code(), Code::Unauthenticated),
+    }
+}
+
+fn assert_permission_denied<T>(result: Result<Response<T>, Status>) {
+    match result {
+        Ok(_) => panic!("reserved object RPC accepted a raw public request"),
+        Err(status) => assert_eq!(status.code(), Code::PermissionDenied),
     }
 }
 

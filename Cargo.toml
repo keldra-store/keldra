@@ -9,6 +9,7 @@ members = [
     "crates/anvil-atomic-program",
     "crates/anvil-cli",
     "crates/anvil-consensus",
+    "crates/anvil-index",
     "crates/anvil-osv-qualification",
     "crates/anvil-store",
 ]

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use anvil::authentication::{JwtManager, RateLimitConfig, load_token_signing_key};
 use anvil::observability::{Observability, ObservabilityConfig};
-use anvil::{ServerConfig, serve};
+use anvil::{IndexRuntimeConfig, ServerConfig, serve};
 use anyhow::{Context, Result};
 use clap::Parser;
 
@@ -122,6 +122,46 @@ struct Arguments {
     )]
     rate_limit_keyed_cleanup_interval: NonZeroU64,
 
+    /// Shared disposable index disk-cache budget in bytes (default: 10 GiB).
+    #[arg(
+        long,
+        env = "ANVIL_INDEX_DISK_CACHE_BYTES",
+        default_value_t = IndexRuntimeConfig::DEFAULT_DISK_CACHE_BYTES
+    )]
+    index_disk_cache_bytes: u64,
+
+    /// Percentage of node memory shared by all materialised indexes (default: 10).
+    #[arg(
+        long,
+        env = "ANVIL_INDEX_MEMORY_PERCENT",
+        default_value_t = IndexRuntimeConfig::DEFAULT_MEMORY_PERCENT
+    )]
+    index_memory_percent: u8,
+
+    /// Maximum generations retained per index, including current (default: 3).
+    #[arg(
+        long,
+        env = "ANVIL_INDEX_MAX_RETAINED_GENERATIONS",
+        default_value_t = IndexRuntimeConfig::DEFAULT_MAX_RETAINED_GENERATIONS
+    )]
+    index_max_retained_generations: u32,
+
+    /// Maximum age of an obsolete index generation in hours (default: 24).
+    #[arg(
+        long,
+        env = "ANVIL_INDEX_MAX_GENERATION_AGE_HOURS",
+        default_value_t = IndexRuntimeConfig::DEFAULT_MAX_GENERATION_AGE_HOURS
+    )]
+    index_max_generation_age_hours: u64,
+
+    /// Maximum authoritative bytes retained across all generations per index (default: 50 GiB).
+    #[arg(
+        long,
+        env = "ANVIL_INDEX_MAX_RETAINED_GENERATION_BYTES",
+        default_value_t = IndexRuntimeConfig::DEFAULT_MAX_RETAINED_GENERATION_BYTES
+    )]
+    index_max_retained_generation_bytes: u64,
+
     #[arg(long, env = "ANVIL_MAX_BLOB_BYTES", default_value_t = 16 * 1024 * 1024 * 1024_u64)]
     max_blob_bytes: u64,
 
@@ -198,12 +238,24 @@ impl Arguments {
         )
         .context("validate erasure-code profile")
     }
+
+    fn index_runtime_config(&self) -> Result<IndexRuntimeConfig> {
+        IndexRuntimeConfig::new(
+            self.index_disk_cache_bytes,
+            self.index_memory_percent,
+            self.index_max_retained_generations,
+            self.index_max_generation_age_hours,
+            self.index_max_retained_generation_bytes,
+        )
+        .context("validate index runtime configuration")
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let arguments = Arguments::parse();
     let erasure_profile = arguments.erasure_profile()?;
+    let index_runtime = arguments.index_runtime_config()?;
     let signing_key =
         load_token_signing_key(&arguments.token_signing_key_file).with_context(|| {
             format!(
@@ -242,6 +294,7 @@ async fn main() -> Result<()> {
             credential_client_burst: arguments.rate_limit_credential_client_burst,
             keyed_cleanup_interval: arguments.rate_limit_keyed_cleanup_interval,
         },
+        index_runtime,
         max_blob_bytes: arguments.max_blob_bytes,
         erasure_profile,
         awaiting_publish_ttl_seconds: arguments.awaiting_publish_ttl_seconds,
@@ -270,6 +323,7 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory as _;
 
     fn parse(extra: &[&str]) -> Arguments {
         let mut arguments = vec![
@@ -343,6 +397,78 @@ mod tests {
         ] {
             let error = parse(&extra).erasure_profile().unwrap_err();
             assert!(error.to_string().contains("validate erasure-code profile"));
+        }
+    }
+
+    #[test]
+    fn index_runtime_defaults_are_wired_to_startup_configuration() {
+        assert_eq!(
+            parse(&[]).index_runtime_config().unwrap(),
+            IndexRuntimeConfig::default()
+        );
+    }
+
+    #[test]
+    fn index_runtime_accepts_explicit_operator_limits() {
+        let config = parse(&[
+            "--index-disk-cache-bytes",
+            "1048576",
+            "--index-memory-percent",
+            "25",
+            "--index-max-retained-generations",
+            "7",
+            "--index-max-generation-age-hours",
+            "48",
+            "--index-max-retained-generation-bytes",
+            "2097152",
+        ])
+        .index_runtime_config()
+        .unwrap();
+        assert_eq!(config.disk_cache_bytes(), 1_048_576);
+        assert_eq!(config.memory_percent(), 25);
+        assert_eq!(config.max_retained_generations(), 7);
+        assert_eq!(config.max_generation_age_hours(), 48);
+        assert_eq!(config.max_retained_generation_bytes(), 2_097_152);
+    }
+
+    #[test]
+    fn index_runtime_rejects_zero_and_out_of_range_limits() {
+        for extra in [
+            vec!["--index-disk-cache-bytes", "0"],
+            vec!["--index-memory-percent", "0"],
+            vec!["--index-memory-percent", "101"],
+            vec!["--index-max-retained-generations", "0"],
+            vec!["--index-max-generation-age-hours", "0"],
+            vec!["--index-max-retained-generation-bytes", "0"],
+        ] {
+            let error = parse(&extra).index_runtime_config().unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("validate index runtime configuration")
+            );
+        }
+    }
+
+    #[test]
+    fn index_runtime_defaults_and_meaning_are_visible_in_help() {
+        let help = Arguments::command().render_long_help().to_string();
+        for expected in [
+            "--index-disk-cache-bytes",
+            "default: 10 GiB",
+            "--index-memory-percent",
+            "default: 10",
+            "--index-max-retained-generations",
+            "including current",
+            "--index-max-generation-age-hours",
+            "default: 24",
+            "--index-max-retained-generation-bytes",
+            "default: 50 GiB",
+        ] {
+            assert!(
+                help.contains(expected),
+                "help omitted `{expected}`:\n{help}"
+            );
         }
     }
 }
