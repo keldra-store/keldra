@@ -26,7 +26,7 @@ pub(super) fn validate_and_pin(args: Args) -> Result<(RuntimeConfig, String, Str
     );
     ensure!(
         matches!(args.durability, DurabilityArgument::Local),
-        "the one-node Anvil 0.5.1 OSV qualification requires --durability local"
+        "the Anvil 0.5.1 OSV qualification requires --durability local"
     );
     ensure!(
         (1..=SERVER_MAX_BULK_ITEMS).contains(&args.batch_size),
@@ -66,9 +66,13 @@ pub(super) fn validate_and_pin(args: Args) -> Result<(RuntimeConfig, String, Str
     );
     let client_secret = read_client_secret(&args.client_secret_file)?;
     let snapshot_id = format!("osv-{}-{}", args.snapshot_day, &observed[..24]);
+    let (write_endpoints, write_node_count) =
+        resolve_write_endpoints(&args.endpoint, args.write_endpoints, args.concurrency)?;
     Ok((
         RuntimeConfig {
             endpoint: args.endpoint,
+            write_endpoints,
+            write_node_count,
             tenant: args.tenant,
             bucket: args.bucket,
             corpus_path_display: corpus.display().to_string(),
@@ -93,6 +97,25 @@ pub(super) fn validate_and_pin(args: Args) -> Result<(RuntimeConfig, String, Str
         args.client_id,
         client_secret,
     ))
+}
+
+pub(super) fn resolve_write_endpoints(
+    primary_endpoint: &str,
+    write_endpoints: Vec<String>,
+    default_concurrency: usize,
+) -> Result<(Vec<String>, u8)> {
+    if write_endpoints.is_empty() {
+        ensure!(default_concurrency > 0, "default write concurrency is zero");
+        return Ok((vec![primary_endpoint.to_owned(); default_concurrency], 1));
+    }
+    let distinct = write_endpoints.iter().collect::<BTreeSet<_>>();
+    ensure!(
+        distinct.len() == write_endpoints.len(),
+        "--write-endpoint values must be distinct"
+    );
+    let node_count = u8::try_from(write_endpoints.len())
+        .context("more than 255 --write-endpoint values were supplied")?;
+    Ok((write_endpoints, node_count))
 }
 
 fn validate_canonical(name: &str, value: &str) -> Result<()> {

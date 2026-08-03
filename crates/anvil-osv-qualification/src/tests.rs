@@ -617,13 +617,44 @@ fn deterministic_batch_boundary_honours_items_and_payload() {
 }
 
 #[test]
-fn one_node_qualification_accepts_only_local_durability() {
+fn qualification_accepts_only_local_durability() {
     assert!(<DurabilityArgument as clap::ValueEnum>::from_str("local", false).is_ok());
     for rejected in ["replicated", "quorum", "anything", " local", "local "] {
         let parsed = <DurabilityArgument as clap::ValueEnum>::from_str(rejected, false);
         let accepted = matches!(parsed, Ok(DurabilityArgument::Local));
         assert!(!accepted, "unexpectedly accepted {rejected:?}");
     }
+}
+
+#[test]
+fn write_endpoints_default_to_primary_and_preserve_explicit_order() {
+    assert_eq!(
+        resolve_write_endpoints("http://primary:50051", Vec::new(), 4).unwrap(),
+        (vec!["http://primary:50051".to_owned(); 4], 1,)
+    );
+    assert_eq!(
+        resolve_write_endpoints(
+            "http://primary:50051",
+            vec!["http://node-2:50051".into(), "http://node-1:50051".into(),],
+            4,
+        )
+        .unwrap(),
+        (
+            vec!["http://node-2:50051".into(), "http://node-1:50051".into(),],
+            2,
+        )
+    );
+}
+
+#[test]
+fn explicit_write_endpoints_must_be_distinct() {
+    let error = resolve_write_endpoints(
+        "http://primary:50051",
+        vec!["http://node-1:50051".into(), "http://node-1:50051".into()],
+        4,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("must be distinct"));
 }
 
 #[test]

@@ -6,7 +6,7 @@ object plus mutable head for every input document.
 
 This repository contains no OSV corpus or measured result. A valid run pins the
 exact ZIP bytes, supplies the acquisition's explicit snapshot day, identifies
-the Anvil revision, and targets a clean one-node bucket.
+the Anvil revision, and targets a clean bucket.
 
 ## Qualified shape
 
@@ -61,6 +61,13 @@ cargo run -p anvil-osv-qualification --release -- \
   --output /absolute/path/to/result.json
 ```
 
+`--concurrency` controls archive parsing and compression. To stripe data writes
+across a cluster, repeat `--write-endpoint` once per node. The qualifier keeps
+at most one `BulkWrite` request active on each configured endpoint; setup,
+manifest publication, and verification continue to use the primary `--endpoint`.
+Explicit endpoint values must be distinct. When no write endpoint is supplied,
+the original `--concurrency` number of write slots all use the primary endpoint.
+
 The durable secret file must be a regular mode-`0600` file. It is used only to
 obtain a short-lived bearer token; neither secret nor token is printed or
 stored in the report.
@@ -82,10 +89,9 @@ and BLAKE3 payload digest. A completed run fails if it exceeds 150 seconds, an
 item fails, any mutation replays on the verified-empty target, or verification
 is incomplete.
 
-`durability` is a closed choice. `local` is the only valid mode for this
-one-node 0.5.1 qualification. `replicated` remains part of the API and requires
-enough active nodes for the configured erasure profile, so the tool rejects it
-before a one-node run.
+`durability` is a closed choice. `local` is the only valid mode for this 0.5.1
+qualification. `replicated` remains part of the API and requires enough active
+nodes for the configured erasure profile, so the tool rejects it before a run.
 
 ## Comparing batching
 

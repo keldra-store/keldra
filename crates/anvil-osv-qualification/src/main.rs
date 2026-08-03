@@ -29,7 +29,7 @@ use prost::Message as _;
 use serde::{Serialize, Serializer, ser::SerializeMap as _};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use tokio::{sync::mpsc, task::JoinSet};
+use tokio::sync::mpsc;
 use tonic::{
     Request,
     metadata::{Ascii, MetadataValue},
@@ -37,8 +37,10 @@ use tonic::{
 };
 
 mod config;
+mod exclusive_tasks;
 
 use config::*;
+use exclusive_tasks::{ExclusiveTasks, connect_object_clients};
 
 const OSV_QUALIFICATION_BUCKET: &str = "anvil-osv-qualification";
 const DEFAULT_SOURCE_URL: &str = "https://osv-vulnerabilities.storage.googleapis.com/all.zip";
@@ -70,6 +72,11 @@ struct Args {
     /// URL of one clean Anvil 0.5 node, for example http://127.0.0.1:50051.
     #[arg(long)]
     endpoint: String,
+
+    /// An Anvil endpoint used for data writes. Repeat to stripe writes across nodes.
+    /// Defaults to --endpoint when absent.
+    #[arg(long = "write-endpoint")]
+    write_endpoints: Vec<String>,
 
     /// Durable application client ID used only to obtain a short-lived access token.
     #[arg(long)]
@@ -109,7 +116,7 @@ struct Args {
     #[arg(long, default_value_t = DEFAULT_SOURCE_CADENCE_HOURS)]
     source_cadence_hours: u16,
 
-    /// The one-node 0.5.1 qualification uses local acknowledgement.
+    /// The 0.5.1 qualification currently uses local acknowledgement.
     #[arg(long, value_enum, default_value = "local")]
     durability: DurabilityArgument,
 
@@ -123,7 +130,7 @@ struct Args {
     #[arg(long, default_value_t = DEFAULT_SHARD_UNCOMPRESSED_BYTES)]
     shard_uncompressed_bytes: usize,
 
-    /// Maximum parallelism for archive parsing, shard compression, and writes.
+    /// Maximum parallelism for archive parsing and shard compression.
     #[arg(long, default_value_t = 4)]
     concurrency: usize,
 
@@ -142,6 +149,8 @@ struct Args {
 #[derive(Debug)]
 struct RuntimeConfig {
     endpoint: String,
+    write_endpoints: Vec<String>,
+    write_node_count: u8,
     tenant: String,
     bucket: String,
     corpus: PathBuf,
@@ -650,10 +659,12 @@ async fn main() -> Result<()> {
     let client = ObjectServiceClient::new(channel.clone())
         .max_encoding_message_size(CLIENT_MESSAGE_BYTES)
         .max_decoding_message_size(CLIENT_MESSAGE_BYTES);
+    let write_clients =
+        connect_object_clients(&config.write_endpoints, CLIENT_MESSAGE_BYTES).await?;
     let versioning_changed = prepare_clean_bucket(&config, channel, client.clone()).await?;
 
     eprintln!(
-        "event=osv_qualification_start corpus={} sha256={} snapshot_day={} snapshot_id={} archive_bytes={} shard_uncompressed_bytes={} batch_size={} maximum_batch_payload_bytes={} concurrency={} versioning_changed={}",
+        "event=osv_qualification_start corpus={} sha256={} snapshot_day={} snapshot_id={} archive_bytes={} shard_uncompressed_bytes={} batch_size={} maximum_batch_payload_bytes={} concurrency={} write_endpoint_count={} versioning_changed={}",
         config.corpus_path_display,
         config.corpus_sha256,
         config.snapshot_day,
@@ -663,11 +674,12 @@ async fn main() -> Result<()> {
         config.batch_size,
         config.maximum_batch_payload_bytes,
         config.concurrency,
+        config.write_endpoints.len(),
         versioning_changed,
     );
 
     let ingest_started = Instant::now();
-    let (mut data, parsing) = run_data_phase(&config, client.clone()).await?;
+    let (mut data, parsing) = run_data_phase(&config, write_clients).await?;
     ensure!(
         parsing.accepted_source_documents > 0,
         "the pinned corpus contains no accepted OSV source documents"
@@ -780,11 +792,11 @@ async fn main() -> Result<()> {
             source_url: &config.source_url,
             source_cadence_hours: config.source_cadence_hours,
             durability_class: config.durability_name,
-            node_count: 1,
+            node_count: config.write_node_count,
             batch_size_operations: config.batch_size,
             maximum_batch_payload_bytes: config.maximum_batch_payload_bytes,
             shard_uncompressed_target_bytes: config.shard_uncompressed_bytes,
-            write_concurrency: config.concurrency,
+            write_concurrency: config.write_endpoints.len(),
             verification_concurrency: config.verification_concurrency,
             clean_target_verified: true,
         },
@@ -799,7 +811,7 @@ async fn main() -> Result<()> {
             "The authoritative qualification shape is one source definition, immutable compressed content-addressed shards, and one immutable manifest; it deliberately does not create a raw object and mutable head for every upstream JSON document.",
             "Shard attributes are carried by the authoritative manifest. Anvil 0.5.1 receives no per-object user metadata and this tool creates no metadata sidecar.",
             "The required --snapshot-day and pinned archive hash determine the snapshot identity; the local clock never participates.",
-            "Anvil 0.5 accepts local or replicated durability. This one-node qualification uses local acknowledgement; replicated acknowledgement requires enough active nodes for the configured erasure profile.",
+            "This qualification uses local acknowledgement. Repeated --write-endpoint values stripe independent data batches across nodes, while setup, manifest publication, and verification stay on the primary --endpoint.",
             "Independent verification checks each current version, content length, content type, and BLAKE3 payload digest through HeadObject without downloading the payload again.",
         ],
     };
@@ -914,7 +926,7 @@ async fn exchange_auth_value(
 
 async fn run_data_phase(
     config: &RuntimeConfig,
-    client: Client,
+    clients: Vec<Client>,
 ) -> Result<(DataPhaseResult, ParsingReport)> {
     let (sender, mut receiver) = mpsc::channel(config.concurrency.saturating_mul(2).max(1));
     let corpus = config.corpus.clone();
@@ -923,7 +935,7 @@ async fn run_data_phase(
     let parser = tokio::task::spawn_blocking(move || {
         parse_archive(corpus, target, compression_workers, sender)
     });
-    let mut pending = JoinSet::new();
+    let mut writers = ExclusiveTasks::new(clients);
     let mut phase = DataPhaseResult::default();
     let mut batch = vec![source_definition_object(config)?];
     let mut batch_payload_bytes = batch[0].payload.len();
@@ -944,11 +956,8 @@ async fn run_data_phase(
             config.batch_size,
             config.maximum_batch_payload_bytes,
         ) {
-            spawn_data_batch(config, &client, &mut pending, std::mem::take(&mut batch));
+            submit_data_batch(config, &mut writers, &mut phase, std::mem::take(&mut batch)).await?;
             batch_payload_bytes = 0;
-            if pending.len() >= config.concurrency {
-                collect_data_batch(pending.join_next().await, &mut phase)?;
-            }
         }
         batch_payload_bytes = batch_payload_bytes
             .checked_add(object.payload.len())
@@ -956,10 +965,11 @@ async fn run_data_phase(
         batch.push(object);
     }
     if !batch.is_empty() {
-        spawn_data_batch(config, &client, &mut pending, batch);
+        submit_data_batch(config, &mut writers, &mut phase, batch).await?;
     }
-    while let Some(completed) = pending.join_next().await {
-        collect_data_batch(Some(completed), &mut phase)?;
+    while let Some(completed) = writers.join_next().await {
+        let (_, completed) = completed.context("data request task panicked")?;
+        collect_data_batch(completed, &mut phase)?;
     }
     let parsing = parser.await.context("OSV parser task panicked")??;
     ensure!(
@@ -969,28 +979,36 @@ async fn run_data_phase(
     Ok((phase, parsing))
 }
 
-fn spawn_data_batch(
+async fn submit_data_batch(
     config: &RuntimeConfig,
-    client: &Client,
-    pending: &mut JoinSet<Result<BatchWriteResult>>,
+    writers: &mut ExclusiveTasks<Client, Result<BatchWriteResult>>,
+    phase: &mut DataPhaseResult,
     objects: Vec<PreparedObject>,
-) {
-    let client = client.clone();
+) -> Result<()> {
+    let (client, completed) = writers
+        .acquire()
+        .await
+        .context("data writer pool ended unexpectedly")?
+        .context("data request task panicked")?;
+    if let Some(completed) = completed {
+        collect_data_batch(completed, phase)?;
+    }
+    let request_client = client.clone();
     let auth = config.auth.clone();
     let tenant = Arc::<str>::from(config.tenant.as_str());
     let bucket = Arc::<str>::from(config.bucket.as_str());
     let durability = config.durability;
-    pending
-        .spawn(async move { send_batch(client, auth, tenant, bucket, durability, objects).await });
+    writers.spawn(client, async move {
+        send_batch(request_client, auth, tenant, bucket, durability, objects).await
+    });
+    Ok(())
 }
 
 fn collect_data_batch(
-    completed: Option<Result<Result<BatchWriteResult>, tokio::task::JoinError>>,
+    completed: Result<BatchWriteResult>,
     phase: &mut DataPhaseResult,
 ) -> Result<()> {
-    let completed = completed
-        .context("data request task set ended unexpectedly")?
-        .context("data request task panicked")??;
+    let completed = completed?;
     phase.request_count = phase.request_count.saturating_add(1);
     phase.latencies.push(completed.latency);
     for stored in completed.objects {
