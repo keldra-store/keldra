@@ -24,9 +24,25 @@ impl ObjectDistribution {
         key: &ObjectKey,
         expected_fence: PlacementLogId,
     ) -> Result<ObjectMutationContext, Status> {
-        self.reconciled_object_snapshot(key).await?;
+        let (tenant_id, bucket_id) = self
+            .store
+            .resolve_bucket_ids(key.tenant(), key.bucket())
+            .map_err(super::mutation_status)?;
+        self.reconcile_before_mutation_stable(key, tenant_id, bucket_id, expected_fence)
+            .await
+    }
+
+    pub(super) async fn reconcile_before_mutation_stable(
+        &self,
+        key: &ObjectKey,
+        tenant_id: u64,
+        bucket_id: u64,
+        expected_fence: PlacementLogId,
+    ) -> Result<ObjectMutationContext, Status> {
+        self.reconciled_object_snapshot_stable(key, tenant_id, bucket_id)
+            .await?;
         let placement = self.placement()?;
-        let group = self.replica_group(&placement, key)?;
+        let group = self.replica_group_stable(&placement, tenant_id, bucket_id, key)?;
         if placement.fence() != expected_fence || group.coordinator() != self.local_node {
             return Err(Status::unavailable(
                 "object placement changed while reconciling its mutation state",
@@ -49,16 +65,26 @@ impl ObjectDistribution {
         &self,
         key: &ObjectKey,
     ) -> Result<Option<ObjectPathSnapshot>, Status> {
+        let (tenant_id, bucket_id) = self
+            .store
+            .resolve_bucket_ids(key.tenant(), key.bucket())
+            .map_err(super::mutation_status)?;
+        self.reconciled_object_snapshot_stable(key, tenant_id, bucket_id)
+            .await
+    }
+
+    pub(crate) async fn reconciled_object_snapshot_stable(
+        &self,
+        key: &ObjectKey,
+        tenant_id: u64,
+        bucket_id: u64,
+    ) -> Result<Option<ObjectPathSnapshot>, Status> {
         let initial_fence = self.serving.mutation_context()?.active_placement_log_id;
         let placement = self.placement()?;
         if placement.fence() != initial_fence {
             return Err(changed_fence());
         }
-        let (tenant_id, bucket_id) = self
-            .store
-            .resolve_bucket_ids(key.tenant(), key.bucket())
-            .map_err(super::mutation_status)?;
-        let group = self.replica_group(&placement, key)?;
+        let group = self.replica_group_stable(&placement, tenant_id, bucket_id, key)?;
 
         let mut observations = Vec::with_capacity(group.replicas().len());
         let mut reads = tokio::task::JoinSet::new();

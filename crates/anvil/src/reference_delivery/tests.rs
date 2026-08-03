@@ -371,11 +371,11 @@ impl ProofFixture {
         publish(&source, "proof", b"proof payload", "proof-command").await;
         let source_id = source.local_watch_status().unwrap().source_id;
         let change = source
-            .scan_local_changes(0, 1)
+            .scan_local_changes(0, 8)
             .unwrap()
             .into_iter()
-            .next()
-            .expect("source change");
+            .find(|change| matches!(change, LocalChange::ObjectHead(_)))
+            .expect("source object-head change");
         let proof = source
             .read_reference_proof(source_id, change.offset())
             .unwrap()
@@ -504,6 +504,8 @@ async fn every_active_destination_advances_and_positive_bytes_arrive_first() {
         stores.stores.clone(),
         order.clone(),
     ));
+    let expected_tail = source.local_watch_status().unwrap().tail;
+    assert_eq!(expected_tail, 2);
     let progress = delivery(
         source.clone(),
         TestPlacement::new(view),
@@ -515,13 +517,16 @@ async fn every_active_destination_advances_and_positive_bytes_arrive_first() {
     .await
     .unwrap();
 
-    assert_eq!((progress.safe_through, progress.tail), (1, 1));
+    assert_eq!(
+        (progress.safe_through, progress.tail),
+        (expected_tail, expected_tail)
+    );
     for node in [NodeId(1), NodeId(2), NodeId(3)] {
         assert_eq!(
             stores.stores[&node]
                 .reference_delta_cursor(progress.source_id)
                 .unwrap(),
-            1
+            expected_tail
         );
     }
     let batches = destinations.batches.lock().unwrap();
@@ -541,13 +546,21 @@ async fn a_destination_gap_stops_before_any_delivery() {
     let directories = (0..3)
         .map(|_| tempfile::tempdir().unwrap())
         .collect::<Vec<_>>();
-    let retention = WatchRetention::new(1, 1024 * 1024).unwrap();
+    let retention = WatchRetention::new(2, 1024 * 1024).unwrap();
     let stores = Arc::new(open_paths(&[1, 2, 3], &directories, Some(retention)).await);
     let source = stores[&NodeId(1)].clone();
     publish(&source, "one", b"one", "one").await;
-    source.advance_source_journal_safe_through(1).await.unwrap();
+    let first_tail = source.local_watch_status().unwrap().tail;
+    assert_eq!(first_tail, 2);
+    source
+        .advance_source_journal_safe_through(first_tail)
+        .await
+        .unwrap();
     publish(&source, "two", b"two", "two").await;
-    assert_eq!(source.local_watch_status().unwrap().retention_floor, 1);
+    assert_eq!(
+        source.local_watch_status().unwrap().retention_floor,
+        first_tail
+    );
     let order = Arc::new(Mutex::new(Vec::new()));
     let destinations = Arc::new(TestDestinations::new(stores.clone(), order.clone()));
     let payloads = Arc::new(TestPayloads::new(source.clone(), stores, order));
@@ -565,9 +578,9 @@ async fn a_destination_gap_stops_before_any_delivery() {
         error,
         ReferenceDeliveryError::JournalGap {
             cursor: 0,
-            floor: 1,
+            floor,
             ..
-        }
+        } if floor == first_tail
     ));
 }
 
@@ -622,12 +635,16 @@ async fn restart_reconstructs_progress_from_durable_destination_cursors() {
         .map(|_| tempfile::tempdir().unwrap())
         .collect::<Vec<_>>();
     let source_id;
+    let expected_tail;
     {
         let stores = Arc::new(open_paths(&[1, 2, 3], &directories, None).await);
         let source = stores[&NodeId(1)].clone();
         publish(&source, "one", b"first", "first").await;
         publish(&source, "two", b"second", "second").await;
-        source_id = source.local_watch_status().unwrap().source_id;
+        let status = source.local_watch_status().unwrap();
+        source_id = status.source_id;
+        expected_tail = status.tail;
+        assert_eq!(expected_tail, 4);
         let order = Arc::new(Mutex::new(Vec::new()));
         let destinations = Arc::new(TestDestinations::new(stores.clone(), order.clone()));
         let payloads = Arc::new(TestPayloads::new(source.clone(), stores, order));
@@ -660,9 +677,12 @@ async fn restart_reconstructs_progress_from_durable_destination_cursors() {
     .deliver_once()
     .await
     .unwrap();
-    assert_eq!(progress.safe_through, 2);
+    assert_eq!(progress.safe_through, expected_tail);
     for store in stores.values() {
-        assert_eq!(store.reference_delta_cursor(source_id).unwrap(), 2);
+        assert_eq!(
+            store.reference_delta_cursor(source_id).unwrap(),
+            expected_tail
+        );
     }
 }
 
@@ -672,8 +692,12 @@ async fn an_unacknowledged_minority_negative_has_no_reference_effect() {
     let source = stores.stores[&NodeId(1)].clone();
     let old = publish(&source, "same", b"committed", "first").await;
     let replacement = publish(&source, "same", b"minority", "second").await;
+    let replacement_offset = source.local_watch_status().unwrap().tail;
     let commits = Arc::new(TestCommits::default());
-    commits.set(2, Ok(ReferenceCommitDisposition::DiscardedMinority));
+    commits.set(
+        replacement_offset,
+        Ok(ReferenceCommitDisposition::DiscardedMinority),
+    );
     let order = Arc::new(Mutex::new(Vec::new()));
     let destinations = Arc::new(TestDestinations::new(stores.stores.clone(), order.clone()));
     let payloads = Arc::new(TestPayloads::new(
@@ -725,8 +749,12 @@ async fn missing_lineage_never_advances_past_the_unproven_event() {
     let source = stores.stores[&NodeId(1)].clone();
     publish(&source, "one", b"one", "one").await;
     publish(&source, "two", b"two", "two").await;
+    let blocked_offset = source.local_watch_status().unwrap().tail;
     let commits = Arc::new(TestCommits::default());
-    commits.set(2, Err("retained descriptors do not carry ancestry".into()));
+    commits.set(
+        blocked_offset,
+        Err("retained descriptors do not carry ancestry".into()),
+    );
     let order = Arc::new(Mutex::new(Vec::new()));
     let destinations = Arc::new(TestDestinations::new(stores.stores.clone(), order.clone()));
     let payloads = Arc::new(TestPayloads::new(
@@ -746,11 +774,14 @@ async fn missing_lineage_never_advances_past_the_unproven_event() {
     .unwrap_err();
     assert!(matches!(
         error,
-        ReferenceDeliveryError::CommitProof { offset: 2, .. }
+        ReferenceDeliveryError::CommitProof { offset, .. } if offset == blocked_offset
     ));
     let source_id = source.local_watch_status().unwrap().source_id;
     for store in stores.stores.values() {
-        assert_eq!(store.reference_delta_cursor(source_id).unwrap(), 1);
+        assert_eq!(
+            store.reference_delta_cursor(source_id).unwrap(),
+            blocked_offset - 1
+        );
     }
 }
 
@@ -759,7 +790,7 @@ async fn compaction_uses_only_every_current_active_destination() {
     let directories = (0..4)
         .map(|_| tempfile::tempdir().unwrap())
         .collect::<Vec<_>>();
-    let retention = WatchRetention::new(2, 1024 * 1024).unwrap();
+    let retention = WatchRetention::new(8, 1024 * 1024).unwrap();
     let stores = Arc::new(open_paths(&[1, 2, 3, 4], &directories, Some(retention)).await);
     let source = stores[&NodeId(1)].clone();
     publish(&source, "one", b"one", "one").await;
@@ -779,10 +810,15 @@ async fn compaction_uses_only_every_current_active_destination() {
     assert!(runner.deliver_once().await.is_err());
 
     current.replace(placement(&[1, 2, 3], 2));
-    runner.deliver_once().await.unwrap();
+    let caught_up = runner.deliver_once().await.unwrap();
+    let before_third = source.local_watch_status().unwrap();
+    assert_eq!(caught_up.safe_through, before_third.tail);
     publish(&source, "three", b"three", "three").await;
     let status = source.local_watch_status().unwrap();
-    assert_eq!((status.tail, status.retention_floor), (3, 1));
+    assert_eq!(status.tail, before_third.tail + 2);
+    assert_eq!(status.retained_entries, 8);
+    assert_eq!(status.retention_floor, status.tail - 8);
+    assert!(status.retention_floor > 0);
 }
 
 #[tokio::test]

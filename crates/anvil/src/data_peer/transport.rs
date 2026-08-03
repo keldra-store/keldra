@@ -129,6 +129,27 @@ impl DataPeerTransport {
         })
     }
 
+    pub(crate) async fn apply_retained_version_delete(
+        &self,
+        target: NodeId,
+        address: &str,
+        mutation: &RetainedVersionDeleteMutation,
+    ) -> Result<anvil_store::ReplicaRetainedVersionDeleteApplied, Status> {
+        let response = self
+            .client(target, address)?
+            .apply_retained_version_delete(wire::TypedMutationRequest {
+                peer: Some(self.context()),
+                mutation_json: encode_typed(mutation)?,
+            })
+            .await?
+            .into_inner();
+        require_response_schema(response.schema_version)?;
+        Ok(anvil_store::ReplicaRetainedVersionDeleteApplied {
+            outcome: decode_typed(&response.outcome_json)?,
+            replayed: response.replayed,
+        })
+    }
+
     pub(crate) async fn apply_authz_realm_mutation(
         &self,
         target: NodeId,

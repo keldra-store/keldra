@@ -20,8 +20,8 @@ use anvil_store::{
     LocalChange, MAX_LOCAL_INVALIDATION_SCAN_RECORDS, MAX_OBJECT_RECORD_EXPORT_BYTES,
     MutationError, ObjectKey, ObjectMutation, ObjectPathSnapshot, ObjectSnapshotApplied,
     ObjectSnapshotError, PayloadStoreError, ReferenceDeltaApplied, ReferenceDeltaBatch,
-    ReplicaAuthzRealmMutationApplied, ReplicaObjectMutationApplied, ShardIdentity,
-    ShardSealOutcome, ShardStoreError, SourceId, Store, WatchJournalStatus,
+    ReplicaAuthzRealmMutationApplied, ReplicaObjectMutationApplied, RetainedVersionDeleteMutation,
+    ShardIdentity, ShardSealOutcome, ShardStoreError, SourceId, Store, WatchJournalStatus,
 };
 use hyper_util::rt::TokioIo;
 use tokio::io::AsyncWriteExt;
@@ -35,7 +35,9 @@ mod errors;
 mod handoff;
 mod handoff_scope;
 mod mutation_admission;
+mod object_mutation;
 mod object_snapshot;
+mod retained_version_delete;
 mod timeout;
 mod transport;
 mod typed_json;
@@ -234,113 +236,30 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
 
     async fn apply_object_mutation(
         &self,
-        mut request: Request<wire::TypedMutationRequest>,
+        request: Request<wire::TypedMutationRequest>,
     ) -> Result<Response<wire::ObjectMutationApplied>, Status> {
-        let peer = request.get_ref().peer.clone();
-        let peer = self.authorize(&mut request, peer.as_ref(), PeerRpcKind::DataPlane)?;
-        require_typed_bound(&request.get_ref().mutation_json)?;
-        let mutation: ObjectMutation = decode_typed(&request.get_ref().mutation_json)?;
-        let placement_fence = self.mutation_admission.object_mutation(peer, &mutation)?;
-        let metadata = request.metadata().clone();
-        let store = self.store.clone();
-        let admission = self.mutation_admission.clone();
-        let applied = self
-            .bounded(&metadata, async move {
-                admission.require_fence(placement_fence)?;
-                let applied = store
-                    .apply_object_mutation_replica(&mutation)
-                    .await
-                    .map_err(map_mutation_error)?;
-                admission.require_fence(placement_fence)?;
-                Ok(applied)
-            })
-            .await?;
-        Ok(Response::new(wire::ObjectMutationApplied {
-            schema_version: DATA_PEER_SCHEMA_VERSION,
-            version: applied.version.0,
-            replayed: applied.replayed,
-        }))
+        self.apply_object_mutation_call(request).await
+    }
+
+    async fn apply_retained_version_delete(
+        &self,
+        request: Request<wire::TypedMutationRequest>,
+    ) -> Result<Response<wire::RetainedVersionDeleteApplied>, Status> {
+        self.apply_retained_version_delete_call(request).await
     }
 
     async fn read_object_path_snapshot(
         &self,
-        mut request: Request<wire::ObjectPathSnapshotRequest>,
+        request: Request<wire::ObjectPathSnapshotRequest>,
     ) -> Result<Response<wire::ObjectPathSnapshotResponse>, Status> {
-        let peer = request.get_ref().peer.clone();
-        self.authorize(&mut request, peer.as_ref(), PeerRpcKind::DataPlane)?;
-        let metadata = request.metadata().clone();
-        let request = request.into_inner();
-        let store = self.store.clone();
-        let snapshot = self
-            .bounded(&metadata, async move {
-                tokio::task::spawn_blocking(move || {
-                    store.export_object_path_record(
-                        request.tenant_id,
-                        request.bucket_id,
-                        &request.exact_path,
-                    )
-                })
-                .await
-                .map_err(|error| Status::internal(format!("object snapshot read: {error}")))?
-                .map_err(map_object_snapshot_error)
-            })
-            .await?;
-        let snapshot_json = encode_object_snapshot(&snapshot)?;
-        Ok(Response::new(wire::ObjectPathSnapshotResponse {
-            schema_version: DATA_PEER_SCHEMA_VERSION,
-            snapshot_json,
-        }))
+        self.read_object_path_snapshot_call(request).await
     }
 
     async fn repair_object_path_snapshot(
         &self,
-        mut request: Request<wire::RepairObjectPathSnapshotRequest>,
+        request: Request<wire::RepairObjectPathSnapshotRequest>,
     ) -> Result<Response<wire::ObjectPathSnapshotApplied>, Status> {
-        let peer = request.get_ref().peer.clone();
-        let peer = self.authorize(&mut request, peer.as_ref(), PeerRpcKind::DataPlane)?;
-        let placement_fence = self.mutation_admission.object_repair(
-            peer,
-            request.get_ref().tenant_id,
-            request.get_ref().bucket_id,
-            &request.get_ref().exact_path,
-            anvil_store::PlacementLogId {
-                term: request.get_ref().placement_fence_term,
-                index: request.get_ref().placement_fence_index,
-            },
-        )?;
-        require_object_snapshot_bound(&request.get_ref().expected_snapshot_json)?;
-        require_object_snapshot_bound(&request.get_ref().selected_snapshot_json)?;
-        let expected: Option<ObjectPathSnapshot> =
-            decode_typed(&request.get_ref().expected_snapshot_json)?;
-        let selected: Option<ObjectPathSnapshot> =
-            decode_typed(&request.get_ref().selected_snapshot_json)?;
-        let metadata = request.metadata().clone();
-        let request = request.into_inner();
-        let store = self.store.clone();
-        let admission = self.mutation_admission.clone();
-        let applied = self
-            .bounded(&metadata, async move {
-                admission.require_fence(placement_fence)?;
-                let applied = store
-                    .repair_object_path_snapshot(
-                        request.tenant_id,
-                        request.bucket_id,
-                        &request.exact_path,
-                        expected.as_ref(),
-                        selected.as_ref(),
-                    )
-                    .await
-                    .map_err(map_object_snapshot_error)?;
-                admission.require_fence(placement_fence)?;
-                Ok(applied)
-            })
-            .await?;
-        Ok(Response::new(wire::ObjectPathSnapshotApplied {
-            schema_version: DATA_PEER_SCHEMA_VERSION,
-            present: applied.retained,
-            version: applied.version.map_or(0, |version| version.0),
-            replayed: applied.replayed,
-        }))
+        self.repair_object_path_snapshot_call(request).await
     }
 
     async fn apply_authz_realm_mutation(

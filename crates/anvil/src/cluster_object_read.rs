@@ -9,7 +9,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use anvil_store::{
-    ErasureError, ErasureProfile, ObjectKey, ObjectPathSnapshot, PlacementLogId, Version, VersionId,
+    BlobRef, ErasureError, ErasureProfile, ObjectKey, ObjectPathSnapshot, PlacementLogId, Version,
+    VersionId,
 };
 use tonic::Status;
 
@@ -27,6 +28,15 @@ trait ObjectReadMetadata: Send + Sync {
         key: &ObjectKey,
     ) -> Result<Option<ObjectPathSnapshot>, Status>;
 
+    async fn reconciled_snapshot_stable(
+        &self,
+        key: &ObjectKey,
+        _tenant_id: u64,
+        _bucket_id: u64,
+    ) -> Result<Option<ObjectPathSnapshot>, Status> {
+        self.reconciled_snapshot(key).await
+    }
+
     fn current_placement(&self) -> Result<Arc<dyn PayloadReadPlacementView>, Status>;
 
     fn require_current_fence(&self, expected: PlacementLogId) -> Result<(), Status>;
@@ -39,6 +49,16 @@ impl ObjectReadMetadata for ObjectDistribution {
         key: &ObjectKey,
     ) -> Result<Option<ObjectPathSnapshot>, Status> {
         self.reconciled_object_snapshot(key).await
+    }
+
+    async fn reconciled_snapshot_stable(
+        &self,
+        key: &ObjectKey,
+        tenant_id: u64,
+        bucket_id: u64,
+    ) -> Result<Option<ObjectPathSnapshot>, Status> {
+        self.reconciled_object_snapshot_stable(key, tenant_id, bucket_id)
+            .await
     }
 
     fn current_placement(&self) -> Result<Arc<dyn PayloadReadPlacementView>, Status> {
@@ -105,7 +125,29 @@ impl ClusterObjectReader {
     /// A tombstone is returned as a deleted descriptor; only a never-created
     /// path returns `None`.
     pub(crate) async fn head(&self, key: &ObjectKey) -> Result<Option<Version>, Status> {
+        Ok(self.head_with_program_cursor(key).await?.0)
+    }
+
+    pub(crate) async fn head_with_program_cursor(
+        &self,
+        key: &ObjectKey,
+    ) -> Result<(Option<Version>, Option<u64>), Status> {
         let (placement, snapshot) = self.stable_snapshot(key).await?;
+        let selected = select_descriptor(snapshot.as_ref(), key, Selection::Current)?;
+        let cursor = selected_program_cursor(snapshot.as_ref(), Selection::Current);
+        self.metadata.require_current_fence(placement.fence())?;
+        Ok((selected, cursor))
+    }
+
+    pub(crate) async fn head_stable(
+        &self,
+        key: &ObjectKey,
+        tenant_id: u64,
+        bucket_id: u64,
+    ) -> Result<Option<Version>, Status> {
+        let (placement, snapshot) = self
+            .stable_snapshot_with_ids(key, tenant_id, bucket_id)
+            .await?;
         let selected = select_descriptor(snapshot.as_ref(), key, Selection::Current)?;
         self.metadata.require_current_fence(placement.fence())?;
         Ok(selected)
@@ -120,11 +162,37 @@ impl ClusterObjectReader {
         requested_version: Option<VersionId>,
     ) -> Result<Option<ClusterOpenedObject>, Status> {
         let (placement, snapshot) = self.stable_snapshot(key).await?;
+        self.open_selected(key, requested_version, placement, snapshot)
+            .await
+    }
+
+    pub(crate) async fn open_stable(
+        &self,
+        key: &ObjectKey,
+        tenant_id: u64,
+        bucket_id: u64,
+        requested_version: Option<VersionId>,
+    ) -> Result<Option<ClusterOpenedObject>, Status> {
+        let (placement, snapshot) = self
+            .stable_snapshot_with_ids(key, tenant_id, bucket_id)
+            .await?;
+        self.open_selected(key, requested_version, placement, snapshot)
+            .await
+    }
+
+    async fn open_selected(
+        &self,
+        key: &ObjectKey,
+        requested_version: Option<VersionId>,
+        placement: Arc<dyn PayloadReadPlacementView>,
+        snapshot: Option<ObjectPathSnapshot>,
+    ) -> Result<Option<ClusterOpenedObject>, Status> {
         let selection = requested_version.map_or(Selection::Current, Selection::Exact);
         let Some(version) = select_descriptor(snapshot.as_ref(), key, selection)? else {
             self.metadata.require_current_fence(placement.fence())?;
             return Ok(None);
         };
+        let program_commit_cursor = selected_program_cursor(snapshot.as_ref(), selection);
 
         let payload = match (&version.blob, version.deleted) {
             (None, true) => None,
@@ -142,7 +210,55 @@ impl ClusterObjectReader {
             _ => return Err(Status::data_loss("version has an invalid payload shape")),
         };
         self.metadata.require_current_fence(placement.fence())?;
-        Ok(Some(ClusterOpenedObject { version, payload }))
+        Ok(Some(ClusterOpenedObject {
+            version,
+            payload,
+            program_commit_cursor,
+        }))
+    }
+
+    /// Reconstruct one ordinary content-addressed blob without inventing an
+    /// object path. Atomic recovery uses this for the complete prepared bundle
+    /// named by Raft.
+    pub(crate) async fn read_blob_bytes(&self, reference: &BlobRef) -> Result<Vec<u8>, Status> {
+        let placement = self.metadata.current_placement()?;
+        let shared = SharedOutputSpool::new(
+            self.spools
+                .create()
+                .map_err(|error| Status::internal(format!("create read spool: {error}")))?,
+        );
+        self.payload
+            .read(placement.as_ref(), reference, shared.clone())
+            .await
+            .map_err(payload_status)?;
+        self.metadata.require_current_fence(placement.fence())?;
+        let mut payload = shared.into_payload()?;
+        let mut bytes = Vec::new();
+        payload
+            .read_to_end(&mut bytes)
+            .map_err(|error| Status::internal(format!("read reconstructed blob: {error}")))?;
+        Ok(bytes)
+    }
+
+    async fn stable_snapshot_with_ids(
+        &self,
+        key: &ObjectKey,
+        tenant_id: u64,
+        bucket_id: u64,
+    ) -> Result<
+        (
+            Arc<dyn PayloadReadPlacementView>,
+            Option<ObjectPathSnapshot>,
+        ),
+        Status,
+    > {
+        let placement = self.metadata.current_placement()?;
+        let snapshot = self
+            .metadata
+            .reconciled_snapshot_stable(key, tenant_id, bucket_id)
+            .await?;
+        self.metadata.require_current_fence(placement.fence())?;
+        Ok((placement, snapshot))
     }
 
     async fn stable_snapshot(
@@ -168,6 +284,7 @@ impl ClusterObjectReader {
 pub(crate) struct ClusterOpenedObject {
     pub(crate) version: Version,
     pub(crate) payload: Option<ClusterReadPayload>,
+    pub(crate) program_commit_cursor: Option<u64>,
 }
 
 pub(crate) struct ClusterReadPayload {
@@ -223,6 +340,20 @@ fn select_descriptor(
         .iter()
         .find(|version| version.id == selected_id)
         .cloned())
+}
+
+fn selected_program_cursor(
+    snapshot: Option<&ObjectPathSnapshot>,
+    selection: Selection,
+) -> Option<u64> {
+    let snapshot = snapshot?;
+    let selected = match selection {
+        Selection::Current => snapshot.head.version,
+        Selection::Exact(version) => version,
+    };
+    (selected == snapshot.head.version)
+        .then(|| snapshot.head.mutation_stamp?.program_commit_cursor)
+        .flatten()
 }
 
 #[derive(Clone)]

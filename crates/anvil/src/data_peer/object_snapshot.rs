@@ -54,6 +54,89 @@ pub(super) fn map_object_snapshot_error(error: ObjectSnapshotError) -> Status {
     }
 }
 
+impl DataPeerService {
+    pub(super) async fn read_object_path_snapshot_call(
+        &self,
+        mut request: Request<wire::ObjectPathSnapshotRequest>,
+    ) -> Result<Response<wire::ObjectPathSnapshotResponse>, Status> {
+        let peer = request.get_ref().peer.clone();
+        self.authorize(&mut request, peer.as_ref(), PeerRpcKind::DataPlane)?;
+        let metadata = request.metadata().clone();
+        let request = request.into_inner();
+        let store = self.store.clone();
+        let snapshot = self
+            .bounded(&metadata, async move {
+                tokio::task::spawn_blocking(move || {
+                    store.export_object_path_record(
+                        request.tenant_id,
+                        request.bucket_id,
+                        &request.exact_path,
+                    )
+                })
+                .await
+                .map_err(|error| Status::internal(format!("object snapshot read: {error}")))?
+                .map_err(map_object_snapshot_error)
+            })
+            .await?;
+        let snapshot_json = encode_object_snapshot(&snapshot)?;
+        Ok(Response::new(wire::ObjectPathSnapshotResponse {
+            schema_version: DATA_PEER_SCHEMA_VERSION,
+            snapshot_json,
+        }))
+    }
+
+    pub(super) async fn repair_object_path_snapshot_call(
+        &self,
+        mut request: Request<wire::RepairObjectPathSnapshotRequest>,
+    ) -> Result<Response<wire::ObjectPathSnapshotApplied>, Status> {
+        let peer = request.get_ref().peer.clone();
+        let peer = self.authorize(&mut request, peer.as_ref(), PeerRpcKind::DataPlane)?;
+        let placement_fence = self.mutation_admission.object_repair(
+            peer,
+            request.get_ref().tenant_id,
+            request.get_ref().bucket_id,
+            &request.get_ref().exact_path,
+            anvil_store::PlacementLogId {
+                term: request.get_ref().placement_fence_term,
+                index: request.get_ref().placement_fence_index,
+            },
+        )?;
+        require_object_snapshot_bound(&request.get_ref().expected_snapshot_json)?;
+        require_object_snapshot_bound(&request.get_ref().selected_snapshot_json)?;
+        let expected: Option<ObjectPathSnapshot> =
+            decode_typed(&request.get_ref().expected_snapshot_json)?;
+        let selected: Option<ObjectPathSnapshot> =
+            decode_typed(&request.get_ref().selected_snapshot_json)?;
+        let metadata = request.metadata().clone();
+        let request = request.into_inner();
+        let store = self.store.clone();
+        let admission = self.mutation_admission.clone();
+        let applied = self
+            .bounded(&metadata, async move {
+                admission.require_fence(placement_fence)?;
+                let applied = store
+                    .repair_object_path_snapshot(
+                        request.tenant_id,
+                        request.bucket_id,
+                        &request.exact_path,
+                        expected.as_ref(),
+                        selected.as_ref(),
+                    )
+                    .await
+                    .map_err(map_object_snapshot_error)?;
+                admission.require_fence(placement_fence)?;
+                Ok(applied)
+            })
+            .await?;
+        Ok(Response::new(wire::ObjectPathSnapshotApplied {
+            schema_version: DATA_PEER_SCHEMA_VERSION,
+            present: applied.retained,
+            version: applied.version.map_or(0, |version| version.0),
+            replayed: applied.replayed,
+        }))
+    }
+}
+
 impl DataPeerTransport {
     pub(crate) async fn read_object_path_snapshot(
         &self,

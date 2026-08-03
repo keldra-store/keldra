@@ -5,7 +5,7 @@
 //! misaddressed mutations before touching the store.
 
 use anvil_consensus::{AuthenticatedPeer, ClusterId, DecisionRaft, NodeId};
-use anvil_store::{ObjectMutation, PlacementLogId, SourceId};
+use anvil_store::{ObjectMutation, PlacementLogId, RetainedVersionDeleteMutation, SourceId};
 use tonic::Status;
 
 use crate::cluster_placement::ClusterPlacement;
@@ -66,6 +66,21 @@ impl MutationAdmission {
         &self,
         peer: AuthenticatedPeer,
         mutation: &ObjectMutation,
+    ) -> Result<PlacementLogId, Status> {
+        self.object_mutation_facts(
+            peer,
+            mutation.tenant_id,
+            mutation.bucket_id,
+            &mutation.exact_path,
+            mutation.stamp.active_placement_log_id,
+            mutation.stamp.source_id,
+        )
+    }
+
+    pub(super) fn retained_version_delete(
+        &self,
+        peer: AuthenticatedPeer,
+        mutation: &RetainedVersionDeleteMutation,
     ) -> Result<PlacementLogId, Status> {
         self.object_mutation_facts(
             peer,

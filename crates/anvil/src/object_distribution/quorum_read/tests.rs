@@ -18,6 +18,7 @@ fn snapshot(version: u64, predecessor: Option<u64>, branch: u8) -> ObjectPathSna
             mutation_stamp: Some(MutationStamp {
                 format: MUTATION_STAMP_FORMAT,
                 predecessor_version: predecessor.map(VersionId),
+                program_commit_cursor: None,
                 mutation_fingerprint: [branch; 32],
                 active_placement_log_id: PlacementLogId {
                     term: 1,

@@ -43,6 +43,10 @@ pub(super) async fn replay_object_paths(
                     change.exact_path.clone(),
                 ));
             }
+            LocalChange::AggregateChanged(_) | LocalChange::ContentLifecycleChanged(_) => {
+                // The paused final `transfer_all` installs current complete
+                // aggregates and payload lifecycle; there is no object path to replay.
+            }
             _ => {
                 return Err(Status::failed_precondition(
                     "source journal contains an unsupported change kind",
