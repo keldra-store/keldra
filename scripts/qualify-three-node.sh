@@ -183,7 +183,7 @@ provision_tenant() {
     fi
     if output="$(ANVIL_NEW_CLIENT_SECRET="${client_secret}" \
       run_bootstrap_cli "${node}" provision-tenant \
-        "${tenant}" owner "${client_id}" 2>&1)"
+        "${tenant}" "${tenant}-owner" "${client_id}" 2>&1)"
     then
       grep -Fq "tenant=${tenant}" <<<"${output}" || {
         echo "tenant provisioning returned unexpected output: ${output}" >&2
