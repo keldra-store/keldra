@@ -12,7 +12,8 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anvil_consensus::{
-    ClusterId, NodeId, PeerSpkiSha256, PeerTlsAcceptor, PeerTlsConfig, PeerTlsIdentity,
+    ClusterId, MAX_PEER_ADDRESS_BYTES, NodeId, PeerAddress, PeerSpkiSha256, PeerTlsAcceptor,
+    PeerTlsConfig, PeerTlsIdentity,
 };
 use rcgen::{
     CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
@@ -26,13 +27,83 @@ pub(crate) const NODE_IDENTITY_FILE_NAME: &str = "node-identity.json";
 const NODE_IDENTITY_FORMAT_VERSION: u16 = 1;
 const MAX_NODE_ID: u64 = 1_023;
 const MAX_PEM_BYTES: usize = 64 * 1024;
-const MAX_IDENTITY_FILE_BYTES: u64 = 4 * MAX_PEM_BYTES as u64 + 4 * 1024;
+const MAX_IDENTITY_FILE_BYTES: u64 = 1024 * 1024;
+const MAX_JOIN_SEEDS: usize = 1_023;
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PersistedPeerIdentity {
     certificate_pem: String,
     private_key_pem: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PendingJoinSeed {
+    pub(crate) node_id: NodeId,
+    pub(crate) peer_address: PeerAddress,
+    pub(crate) current_peer_spki_sha256: PeerSpkiSha256,
+    pub(crate) overlap_peer_spki_sha256: Option<PeerSpkiSha256>,
+}
+
+/// Crash-safe, bounded material needed only until this node becomes ACTIVE.
+///
+/// The capability is deliberately persisted with the private node identity so
+/// consuming the operator-carried bundle cannot make a crash unrecoverable.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PendingJoinIdentity {
+    peer_address: PeerAddress,
+    storage_weight_millionths: u32,
+    seeds: Vec<PendingJoinSeed>,
+    join_capability: [u8; 32],
+}
+
+impl fmt::Debug for PendingJoinIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PendingJoinIdentity")
+            .field("peer_address", &self.peer_address)
+            .field("storage_weight_millionths", &self.storage_weight_millionths)
+            .field("seeds", &self.seeds)
+            .field("join_capability", &"<redacted>")
+            .finish()
+    }
+}
+
+impl PendingJoinIdentity {
+    pub(crate) fn new(
+        local_node_id: NodeId,
+        peer_address: PeerAddress,
+        storage_weight_millionths: u32,
+        seeds: Vec<PendingJoinSeed>,
+        join_capability: [u8; 32],
+    ) -> Result<Self, NodeIdentityError> {
+        let pending = Self {
+            peer_address,
+            storage_weight_millionths,
+            seeds,
+            join_capability,
+        };
+        validate_pending_join(local_node_id, &pending)?;
+        Ok(pending)
+    }
+
+    pub(crate) fn peer_address(&self) -> &PeerAddress {
+        &self.peer_address
+    }
+
+    pub(crate) fn storage_weight_millionths(&self) -> u32 {
+        self.storage_weight_millionths
+    }
+
+    pub(crate) fn seeds(&self) -> &[PendingJoinSeed] {
+        &self.seeds
+    }
+
+    pub(crate) fn capability(&self) -> [u8; 32] {
+        self.join_capability
+    }
 }
 
 impl fmt::Debug for PersistedPeerIdentity {
@@ -73,6 +144,7 @@ pub(crate) struct LocalNodeIdentity {
     node_id: NodeId,
     presented_peer_identity: PersistedPeerIdentity,
     overlap_peer_identity: Option<PersistedPeerIdentity>,
+    pending_join: Option<PendingJoinIdentity>,
 }
 
 impl fmt::Debug for LocalNodeIdentity {
@@ -83,6 +155,7 @@ impl fmt::Debug for LocalNodeIdentity {
             .field("node_id", &self.node_id)
             .field("presented_peer_identity", &self.presented_peer_identity)
             .field("overlap_peer_identity", &self.overlap_peer_identity)
+            .field("pending_join", &self.pending_join)
             .finish()
     }
 }
@@ -99,6 +172,7 @@ impl LocalNodeIdentity {
             node_id,
             presented_peer_identity,
             overlap_peer_identity,
+            pending_join: None,
         };
         validate_identity(&identity)?;
         Ok(identity)
@@ -119,6 +193,34 @@ impl LocalNodeIdentity {
     pub(crate) fn overlap_peer_identity(&self) -> Option<&PersistedPeerIdentity> {
         self.overlap_peer_identity.as_ref()
     }
+
+    pub(crate) fn pending_join(&self) -> Option<&PendingJoinIdentity> {
+        self.pending_join.as_ref()
+    }
+
+    pub(crate) fn with_pending_join(
+        mut self,
+        pending_join: PendingJoinIdentity,
+    ) -> Result<Self, NodeIdentityError> {
+        self.pending_join = Some(pending_join);
+        validate_identity(&self)?;
+        Ok(self)
+    }
+
+    fn with_optional_pending_join(
+        self,
+        pending_join: Option<PendingJoinIdentity>,
+    ) -> Result<Self, NodeIdentityError> {
+        match pending_join {
+            Some(pending_join) => self.with_pending_join(pending_join),
+            None => Ok(self),
+        }
+    }
+
+    fn without_pending_join(mut self) -> Self {
+        self.pending_join = None;
+        self
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -129,6 +231,8 @@ struct IdentityDocument {
     node_id: u64,
     presented_peer_identity: PersistedPeerIdentity,
     overlap_peer_identity: Option<PersistedPeerIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_join: Option<PendingJoinIdentity>,
 }
 
 impl From<&LocalNodeIdentity> for IdentityDocument {
@@ -139,6 +243,7 @@ impl From<&LocalNodeIdentity> for IdentityDocument {
             node_id: identity.node_id.0,
             presented_peer_identity: identity.presented_peer_identity.clone(),
             overlap_peer_identity: identity.overlap_peer_identity.clone(),
+            pending_join: identity.pending_join.clone(),
         }
     }
 }
@@ -281,6 +386,25 @@ pub(crate) fn replace(
     Ok(())
 }
 
+/// Remove the one-time join material only after ACTIVE membership is locally
+/// visible. Retrying after the atomic replacement is a no-op.
+pub(crate) fn clear_pending_join(
+    data_dir: &Path,
+    expected_cluster: ClusterId,
+    expected_node: NodeId,
+) -> Result<(), NodeIdentityError> {
+    let current = load(data_dir, expected_cluster, expected_node)?;
+    if current.pending_join.is_none() {
+        return Ok(());
+    }
+    replace(
+        data_dir,
+        expected_cluster,
+        expected_node,
+        &current.without_pending_join(),
+    )
+}
+
 fn validate_identity(identity: &LocalNodeIdentity) -> Result<(), NodeIdentityError> {
     if identity.cluster_id.0 == [0; 16] {
         return Err(NodeIdentityError::Invalid("cluster ID must not be zero"));
@@ -299,7 +423,59 @@ fn validate_identity(identity: &LocalNodeIdentity) -> Result<(), NodeIdentityErr
             ));
         }
     }
+    if let Some(pending) = &identity.pending_join {
+        if identity.overlap_peer_identity.is_some() {
+            return Err(NodeIdentityError::Invalid(
+                "a JOINING identity cannot contain rotation overlap material",
+            ));
+        }
+        validate_pending_join(identity.node_id, pending)?;
+    }
     Ok(())
+}
+
+fn validate_pending_join(
+    local_node_id: NodeId,
+    pending: &PendingJoinIdentity,
+) -> Result<(), NodeIdentityError> {
+    if pending.storage_weight_millionths == 0
+        || pending.join_capability == [0; 32]
+        || !valid_peer_address(&pending.peer_address)
+        || pending.seeds.is_empty()
+        || pending.seeds.len() > MAX_JOIN_SEEDS
+    {
+        return Err(NodeIdentityError::Invalid(
+            "pending join fields are outside their bounds",
+        ));
+    }
+    for (index, seed) in pending.seeds.iter().enumerate() {
+        if seed.node_id == local_node_id
+            || !(1..=MAX_NODE_ID).contains(&seed.node_id.0)
+            || !valid_peer_address(&seed.peer_address)
+            || seed.current_peer_spki_sha256.0 == [0; 32]
+            || seed.overlap_peer_spki_sha256 == Some(seed.current_peer_spki_sha256)
+            || seed
+                .overlap_peer_spki_sha256
+                .is_some_and(|pin| pin.0 == [0; 32])
+            || pending.seeds[..index]
+                .iter()
+                .any(|earlier| earlier.node_id == seed.node_id)
+        {
+            return Err(NodeIdentityError::Invalid(
+                "pending join seed set is invalid",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn valid_peer_address(address: &PeerAddress) -> bool {
+    !address.0.is_empty()
+        && address.0.len() <= MAX_PEER_ADDRESS_BYTES
+        && !address
+            .0
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
 }
 
 fn validate_peer_identity(
@@ -364,7 +540,8 @@ fn decode(encoded: &[u8]) -> Result<LocalNodeIdentity, NodeIdentityError> {
         NodeId(document.node_id),
         document.presented_peer_identity,
         document.overlap_peer_identity,
-    )
+    )?
+    .with_optional_pending_join(document.pending_join)
 }
 
 fn require_stable_identity(

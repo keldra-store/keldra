@@ -9,6 +9,7 @@ mod credential_service;
 mod data_peer;
 mod distributed_list;
 mod join_bundle;
+mod join_peer;
 mod mutable_record_quorum;
 mod mutable_record_replica_group;
 mod node_identity;
@@ -50,6 +51,7 @@ pub struct ServerConfig {
     pub listen: SocketAddr,
     pub peer_listen: SocketAddr,
     pub peer_advertise: Option<String>,
+    pub join_bundle: Option<PathBuf>,
     pub data_dir: PathBuf,
     pub run_system_bootstrap: bool,
     pub system_bootstrap_credential_output: Option<PathBuf>,
@@ -101,6 +103,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         data_dir: &config.data_dir,
         node_id: local_node,
         peer_address,
+        join_bundle: config.join_bundle.as_deref(),
         run_system_bootstrap: config.run_system_bootstrap,
         max_commit_entries: config.max_atomic_commit_entries,
         max_commit_bytes: config.max_atomic_commit_bytes,
@@ -108,6 +111,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     })
     .await?;
     let serving_transport = peer_runtime.serving_transport();
+    let pending_join = peer_runtime.join_transport();
     // The private listener must be accepting before an existing multi-node
     // group can elect a leader after a coordinated restart.
     let mut peer_server = peer_runtime
@@ -120,6 +124,16 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
             config.max_blob_bytes,
         )
         .await?;
+    if let Some(pending_join) = pending_join.as_ref() {
+        peer_runtime::complete_pending_join(
+            pending_join,
+            &decisions,
+            &config.data_dir,
+            DECISION_LEADER_TIMEOUT,
+        )
+        .await
+        .context("join existing cluster through typed ownership handoff")?;
+    }
     decisions
         .wait_for_leader(DECISION_LEADER_TIMEOUT)
         .await

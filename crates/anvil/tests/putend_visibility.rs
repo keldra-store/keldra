@@ -161,6 +161,7 @@ fn test_server_config(
         listen,
         peer_listen,
         peer_advertise: None,
+        join_bundle: None,
         data_dir: directory.path().to_owned(),
         run_system_bootstrap: true,
         system_bootstrap_credential_output: None,

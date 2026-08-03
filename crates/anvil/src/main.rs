@@ -20,6 +20,10 @@ struct Arguments {
     #[arg(long, env = "ANVIL_PEER_ADVERTISE")]
     peer_advertise: Option<String>,
 
+    /// Consume one operator-copied mode-0600 bundle to join an existing cluster.
+    #[arg(long, env = "ANVIL_JOIN_BUNDLE")]
+    join_bundle: Option<PathBuf>,
+
     #[arg(long, env = "ANVIL_DATA_DIR", default_value = "anvil-data")]
     data_dir: PathBuf,
 
@@ -216,6 +220,7 @@ async fn main() -> Result<()> {
         listen: arguments.listen,
         peer_listen: arguments.peer_listen,
         peer_advertise: arguments.peer_advertise,
+        join_bundle: arguments.join_bundle,
         data_dir: arguments.data_dir,
         run_system_bootstrap: arguments.run_system_bootstrap,
         system_bootstrap_credential_output: arguments.system_bootstrap_credential_output,

@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+package anvil.join_peer.v1;
+
+message JoinRequest {
+  uint32 schema_version = 1;
+  bytes cluster_id = 2;
+  uint64 source_node_id = 3;
+  bytes join_capability = 4;
+}
+
+message JoinSeed {
+  uint64 node_id = 1;
+  string peer_address = 2;
+  bytes current_peer_spki_sha256 = 3;
+  optional bytes overlap_peer_spki_sha256 = 4;
+}
+
+enum JoinState {
+  JOIN_STATE_UNSPECIFIED = 0;
+  JOIN_STATE_HANDOFF_REQUIRED = 1;
+  JOIN_STATE_ACTIVE = 2;
+  JOIN_STATE_REDIRECT = 3;
+}
+
+message JoinResponse {
+  uint32 schema_version = 1;
+  JoinState state = 2;
+  uint64 started_log_index = 3;
+  optional JoinSeed leader = 4;
+}
+
+// This service is private, bounded, and available only over Anvil's mandatory
+// mTLS peer listener. Catch-up cannot activate a node; activation is a separate
+// call made only after typed ownership handoff has completed.
+service JoinPeer {
+  rpc CatchUp(JoinRequest) returns (JoinResponse);
+  rpc Activate(JoinRequest) returns (JoinResponse);
+}

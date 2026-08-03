@@ -18,7 +18,9 @@ use anvil_consensus::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::node_identity::{LocalNodeIdentity, PersistedPeerIdentity};
+use crate::node_identity::{
+    LocalNodeIdentity, PendingJoinIdentity, PendingJoinSeed, PersistedPeerIdentity,
+};
 
 const JOIN_BUNDLE_FORMAT_VERSION: u16 = 1;
 const JOIN_CAPABILITY_CONTEXT: &str = "anvil.cluster/join-capability/v1";
@@ -117,10 +119,7 @@ impl JoinBundle {
     }
 
     pub(crate) fn capability_hash(&self) -> JoinCapabilityHash {
-        JoinCapabilityHash(blake3::derive_key(
-            JOIN_CAPABILITY_CONTEXT,
-            &self.join_capability,
-        ))
+        hash_capability(self.join_capability)
     }
 
     pub(crate) fn capability(&self) -> [u8; 32] {
@@ -141,13 +140,33 @@ impl JoinBundle {
     }
 
     pub(crate) fn local_identity(&self) -> Result<LocalNodeIdentity, JoinBundleError> {
-        LocalNodeIdentity::new(
+        let identity = LocalNodeIdentity::new(
             self.cluster_id,
             self.node_id,
             self.peer_identity.clone(),
             None,
         )
-        .map_err(|_| JoinBundleError::Invalid("peer identity is malformed"))
+        .map_err(|_| JoinBundleError::Invalid("peer identity is malformed"))?;
+        let pending = PendingJoinIdentity::new(
+            self.node_id,
+            self.peer_address.clone(),
+            self.storage_weight_millionths,
+            self.seeds
+                .iter()
+                .cloned()
+                .map(|seed| PendingJoinSeed {
+                    node_id: seed.node_id,
+                    peer_address: seed.peer_address,
+                    current_peer_spki_sha256: seed.current_peer_spki_sha256,
+                    overlap_peer_spki_sha256: seed.overlap_peer_spki_sha256,
+                })
+                .collect(),
+            self.join_capability,
+        )
+        .map_err(|_| JoinBundleError::Invalid("pending join material is malformed"))?;
+        identity
+            .with_pending_join(pending)
+            .map_err(|_| JoinBundleError::Invalid("pending join material is malformed"))
     }
 
     pub(crate) fn ensure_request(
@@ -171,6 +190,10 @@ impl JoinBundle {
         }
         Ok(())
     }
+}
+
+pub(crate) fn hash_capability(capability: [u8; 32]) -> JoinCapabilityHash {
+    JoinCapabilityHash(blake3::derive_key(JOIN_CAPABILITY_CONTEXT, &capability))
 }
 
 /// Create the deterministic bundle path exactly once, or load the same
@@ -600,6 +623,18 @@ mod tests {
         assert_eq!(
             crate::node_identity::load(&data, ClusterId([8; 16]), NodeId(3)).unwrap(),
             bundle.local_identity().unwrap()
+        );
+        let identity = crate::node_identity::load(&data, ClusterId([8; 16]), NodeId(3)).unwrap();
+        let pending = identity.pending_join().unwrap();
+        assert_eq!(pending.peer_address(), &bundle.peer_address);
+        assert_eq!(pending.capability(), bundle.capability());
+        assert!(!format!("{identity:?}").contains(&hex::encode(bundle.capability())));
+        crate::node_identity::clear_pending_join(&data, ClusterId([8; 16]), NodeId(3)).unwrap();
+        assert!(
+            crate::node_identity::load(&data, ClusterId([8; 16]), NodeId(3))
+                .unwrap()
+                .pending_join()
+                .is_none()
         );
     }
 

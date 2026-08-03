@@ -24,6 +24,10 @@ use tonic::transport::server::TcpIncoming;
 use uuid::Uuid;
 
 use crate::data_peer::{DataPeerService, DataPeerTransport};
+use crate::join_peer::{
+    JoinActivationGate, JoinBootstrapPins, JoinPeerService, JoinPeerTransport,
+    RejectIncompleteHandoff,
+};
 use crate::node_identity::{self, LocalNodeIdentity};
 
 const GENESIS_STORAGE_WEIGHT_MILLIONTHS: u32 = 1_000_000;
@@ -34,6 +38,7 @@ pub(crate) struct OpenPeerConfig<'a> {
     pub(crate) data_dir: &'a Path,
     pub(crate) node_id: NodeId,
     pub(crate) peer_address: PeerAddress,
+    pub(crate) join_bundle: Option<&'a Path>,
     pub(crate) run_system_bootstrap: bool,
     pub(crate) max_commit_entries: u32,
     pub(crate) max_commit_bytes: u64,
@@ -41,6 +46,7 @@ pub(crate) struct OpenPeerConfig<'a> {
 }
 
 pub(crate) struct PeerRuntime {
+    node_id: NodeId,
     identity: Arc<PeerTlsIdentity>,
     pins: Arc<RaftCommittedPeerPins>,
     transport: TonicPeerTransport,
@@ -49,6 +55,8 @@ pub(crate) struct PeerRuntime {
         reason = "the distributed coordinators consume this transport in the immediately following integration slice"
     )]
     data_transport: DataPeerTransport,
+    join_transport: Option<JoinPeerTransport>,
+    bootstrap_pins: Option<Arc<JoinBootstrapPins>>,
     clear_pins_on_drop: bool,
 }
 
@@ -149,35 +157,72 @@ pub(crate) async fn open(config: OpenPeerConfig<'_>) -> Result<(DecisionRaft, Pe
     let identity_exists = node_identity::identity_path(config.data_dir)
         .try_exists()
         .context("inspect local node identity path")?;
-    let migrated_identity = if !identity_exists && legacy_decision_state_exists(config.data_dir)? {
+    let decision_state_exists = legacy_decision_state_exists(config.data_dir)?;
+    if !identity_exists && decision_state_exists && config.join_bundle.is_some() {
+        bail!("a join bundle cannot be applied to an existing decision store");
+    }
+    let migrated_identity = if !identity_exists && decision_state_exists {
         migrate_released_identity(&config).await?
     } else {
         None
     };
 
+    let mut created_genesis_identity = false;
     let identity = if identity_exists {
-        node_identity::load_for_node(config.data_dir, config.node_id)
-            .context("load local node identity")?
+        match config.join_bundle {
+            Some(path) => crate::join_bundle::consume(config.data_dir, path)
+                .context("finish consuming copied join bundle")?
+                .local_identity()
+                .context("load consumed join identity")?,
+            None => node_identity::load_for_node(config.data_dir, config.node_id)
+                .context("load local node identity")?,
+        }
     } else if let Some(identity) = migrated_identity {
         identity
+    } else if let Some(path) = config.join_bundle {
+        if config.run_system_bootstrap {
+            tracing::warn!("--run-system-bootstrap is ignored when --join-bundle is supplied");
+        }
+        crate::join_bundle::consume(config.data_dir, path)
+            .context("consume copied mode-0600 join bundle")?
+            .local_identity()
+            .context("load consumed join identity")?
     } else {
         anyhow::ensure!(
             config.run_system_bootstrap,
-            "an empty node requires --run-system-bootstrap when no seed nodes are configured"
+            "an empty node requires --run-system-bootstrap or --join-bundle"
         );
         let cluster_id = ClusterId(*Uuid::new_v4().as_bytes());
         let identity = node_identity::generate(cluster_id, config.node_id)
             .context("generate local peer identity")?;
         node_identity::create(config.data_dir, &identity).context("persist local peer identity")?;
+        created_genesis_identity = true;
         tracing::info!(
             path = %node_identity::identity_path(config.data_dir).display(),
             "generated mode-0600 cluster node identity"
         );
         identity
     };
+    anyhow::ensure!(
+        identity.node_id() == config.node_id,
+        "copied join bundle node ID does not match --node-id"
+    );
+    if let Some(pending) = identity.pending_join() {
+        anyhow::ensure!(
+            pending.peer_address() == &config.peer_address,
+            "copied join bundle peer address does not match --peer-advertise"
+        );
+    }
 
-    let (decisions, runtime) = open_with_identity(&config, &identity).await?;
+    let (decisions, mut runtime) = open_with_identity(&config, &identity).await?;
     if !decisions.is_initialized().await? {
+        if identity.pending_join().is_some() {
+            return Ok((decisions, runtime));
+        }
+        anyhow::ensure!(
+            created_genesis_identity,
+            "an existing node identity cannot initialize a new Raft cluster"
+        );
         decisions
             .initialize_genesis(std::collections::BTreeMap::from([(
                 config.node_id.0,
@@ -185,6 +230,26 @@ pub(crate) async fn open(config: OpenPeerConfig<'_>) -> Result<(DecisionRaft, Pe
             )]))
             .await
             .context("initialize one-voter genesis Raft group")?;
+    }
+
+    if identity.pending_join().is_some() {
+        let state = decisions.state()?;
+        if state.cluster_id().is_none() {
+            return Ok((decisions, runtime));
+        }
+        validate_joining_restart_state(
+            &decisions,
+            &identity,
+            &config.peer_address,
+            runtime.identity.spki_sha256(),
+        )?;
+        let descriptor = &state.cluster_control().nodes()[&config.node_id];
+        if descriptor.state == NodeState::Joining {
+            return Ok((decisions, runtime));
+        }
+        node_identity::clear_pending_join(config.data_dir, identity.cluster_id(), config.node_id)
+            .context("clear consumed join capability after ACTIVE membership")?;
+        runtime.clear_join_bootstrap();
     }
 
     let state = decisions.state()?;
@@ -211,6 +276,107 @@ pub(crate) async fn open(config: OpenPeerConfig<'_>) -> Result<(DecisionRaft, Pe
     Ok((decisions, runtime))
 }
 
+/// Catch up one consumed join identity, request activation through the
+/// server-side typed-handoff gate, and clear the one-time capability only once
+/// ACTIVE is locally applied.
+pub(crate) async fn complete_pending_join(
+    transport: &JoinPeerTransport,
+    decisions: &DecisionRaft,
+    data_dir: &Path,
+    timeout: Duration,
+) -> Result<()> {
+    let transition = transport
+        .catch_up(timeout)
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let apply_deadline = tokio::time::Instant::now()
+        .checked_add(timeout)
+        .context("join timeout exceeds the process clock")?;
+    loop {
+        let state = decisions.state()?;
+        let exact = state
+            .cluster_control()
+            .nodes()
+            .get(&transition.node_id)
+            .is_some_and(|descriptor| descriptor.state == NodeState::Joining)
+            && state.cluster_control().transition() == Some(&transition);
+        if exact {
+            break;
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < apply_deadline,
+            "timed out waiting for the caught-up ADD transition to apply locally"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let identity = node_identity::load_for_node(data_dir, transition.node_id)
+        .context("reload caught-up JOINING identity")?;
+    let state = decisions.state()?;
+    let descriptor = state
+        .cluster_control()
+        .nodes()
+        .get(&transition.node_id)
+        .context("caught-up Raft state omitted the joining descriptor")?;
+    anyhow::ensure!(
+        descriptor.state == NodeState::Joining
+            && state.cluster_control().transition() == Some(&transition),
+        "caught-up Raft state does not contain the exact pending ADD transition"
+    );
+    validate_joining_restart_state(
+        decisions,
+        &identity,
+        pending_peer_address(&identity)?,
+        PeerTlsIdentity::from_pem(
+            identity
+                .presented_peer_identity()
+                .certificate_pem()
+                .as_bytes(),
+            identity
+                .presented_peer_identity()
+                .private_key_pem()
+                .as_bytes(),
+        )
+        .context("parse caught-up JOINING peer identity")?
+        .spki_sha256(),
+    )?;
+    transport.clear_bootstrap_pins();
+    transport
+        .activate(timeout)
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+
+    let deadline = tokio::time::Instant::now()
+        .checked_add(timeout)
+        .context("join timeout exceeds the process clock")?;
+    loop {
+        let state = decisions.state()?;
+        if state
+            .cluster_control()
+            .nodes()
+            .get(&transition.node_id)
+            .is_some_and(|descriptor| descriptor.state == NodeState::Active)
+            && state.cluster_control().transition().is_none()
+        {
+            break;
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for locally applied ACTIVE membership"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    node_identity::clear_pending_join(data_dir, identity.cluster_id(), transition.node_id)
+        .context("clear one-time join capability after ACTIVE membership")?;
+    Ok(())
+}
+
+fn pending_peer_address(identity: &LocalNodeIdentity) -> Result<&PeerAddress> {
+    identity
+        .pending_join()
+        .map(|pending| pending.peer_address())
+        .context("caught-up node identity has no pending join material")
+}
+
 impl PeerRuntime {
     pub(crate) fn serving_transport(&self) -> TonicPeerTransport {
         self.transport.clone()
@@ -224,7 +390,40 @@ impl PeerRuntime {
         self.data_transport.clone()
     }
 
+    pub(crate) fn join_transport(&self) -> Option<JoinPeerTransport> {
+        self.join_transport.clone()
+    }
+
+    fn clear_join_bootstrap(&mut self) {
+        if let Some(pins) = self.bootstrap_pins.take() {
+            pins.clear();
+        }
+        self.join_transport = None;
+    }
+
     pub(crate) async fn start(
+        self,
+        peer_listen: SocketAddr,
+        decisions: DecisionRaft,
+        store: Store,
+        erasure_profile: ErasureProfile,
+        maximum_unary_time: Duration,
+        max_blob_bytes: u64,
+    ) -> Result<PeerServerHandle> {
+        self.start_with_activation_gate(
+            peer_listen,
+            decisions,
+            store,
+            erasure_profile,
+            maximum_unary_time,
+            max_blob_bytes,
+            Arc::new(RejectIncompleteHandoff),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn start_with_activation_gate(
         mut self,
         peer_listen: SocketAddr,
         decisions: DecisionRaft,
@@ -232,6 +431,7 @@ impl PeerRuntime {
         erasure_profile: ErasureProfile,
         maximum_unary_time: Duration,
         max_blob_bytes: u64,
+        activation_gate: Arc<dyn JoinActivationGate>,
     ) -> Result<PeerServerHandle> {
         anyhow::ensure!(
             peer_listen.port() != 0,
@@ -257,7 +457,10 @@ impl PeerRuntime {
                     None
                 }
             });
-        let service = TonicRaftPeerService::new(decisions, self.pins.clone()).into_server();
+        let service = TonicRaftPeerService::new(decisions.clone(), self.pins.clone()).into_server();
+        let join_service =
+            JoinPeerService::new(decisions, self.node_id, self.pins.clone(), activation_gate)
+                .into_server();
         let data_service = DataPeerService::new(
             store,
             self.pins.clone(),
@@ -271,6 +474,7 @@ impl PeerRuntime {
             Server::builder()
                 .add_service(service)
                 .add_service(data_service)
+                .add_service(join_service)
                 .serve_with_incoming_shutdown(incoming, async move {
                     let _ = stopped.await;
                 })
@@ -304,13 +508,36 @@ async fn open_with_identity(
         )
         .context("parse persisted peer TLS identity")?,
     );
-    let pins = Arc::new(RaftCommittedPeerPins::new(identity.cluster_id()));
+    let bootstrap_pins = identity.pending_join().map(|pending| {
+        Arc::new(JoinBootstrapPins::new(
+            identity.cluster_id(),
+            pending.seeds(),
+        ))
+    });
+    let pins = Arc::new(RaftCommittedPeerPins::new(
+        identity.cluster_id(),
+        config.node_id,
+        bootstrap_pins.clone(),
+    ));
     let connector =
         PeerTlsConnector::new(tls_identity.clone(), pins.clone(), PeerTlsConfig::default())
             .context("configure mandatory peer mTLS connector")?;
     let data_transport =
         DataPeerTransport::new(identity.cluster_id(), config.node_id, connector.clone())
             .context("configure typed data-peer transport")?;
+    let join_transport = identity
+        .pending_join()
+        .cloned()
+        .zip(bootstrap_pins.clone())
+        .map(|(pending, bootstrap_pins)| {
+            JoinPeerTransport::new(
+                identity.cluster_id(),
+                config.node_id,
+                pending,
+                connector.clone(),
+                bootstrap_pins,
+            )
+        });
     let transport = TonicPeerTransport::new(identity.cluster_id(), config.node_id, connector)
         .context("configure private Raft transport")?;
     let decisions = DecisionRaft::open_with_transport(
@@ -326,10 +553,13 @@ async fn open_with_identity(
     Ok((
         decisions,
         PeerRuntime {
+            node_id: config.node_id,
             identity: tls_identity,
             pins,
             transport,
             data_transport,
+            join_transport,
+            bootstrap_pins,
             clear_pins_on_drop: true,
         },
     ))
@@ -487,6 +717,65 @@ fn validate_restart_state(
     Ok(())
 }
 
+fn validate_joining_restart_state(
+    decisions: &DecisionRaft,
+    identity: &LocalNodeIdentity,
+    configured_address: &PeerAddress,
+    presented_pin: PeerSpkiSha256,
+) -> Result<()> {
+    let pending = identity
+        .pending_join()
+        .context("JOINING restart has no persisted one-time join material")?;
+    let state = decisions.state()?;
+    anyhow::ensure!(
+        state.cluster_id() == Some(identity.cluster_id()),
+        "JOINING identity does not match the installed cluster snapshot"
+    );
+    let descriptor = state
+        .cluster_control()
+        .nodes()
+        .get(&identity.node_id())
+        .context("JOINING node has no committed cluster descriptor")?;
+    anyhow::ensure!(
+        descriptor.peer_address == *configured_address
+            && descriptor.peer_address == *pending.peer_address(),
+        "JOINING peer address differs from its committed descriptor"
+    );
+    anyhow::ensure!(
+        descriptor.storage_weight_millionths == pending.storage_weight_millionths(),
+        "JOINING storage weight differs from its committed descriptor"
+    );
+    anyhow::ensure!(
+        descriptor.current_peer_spki_sha256 == presented_pin,
+        "JOINING certificate differs from its committed descriptor"
+    );
+    match descriptor.state {
+        NodeState::Joining => {
+            anyhow::ensure!(
+                descriptor.join_capability_hash
+                    == Some(crate::join_bundle::hash_capability(pending.capability())),
+                "JOINING capability differs from its committed descriptor"
+            );
+            let transition = state
+                .cluster_control()
+                .transition()
+                .context("JOINING descriptor has no membership transition")?;
+            anyhow::ensure!(
+                transition.kind == MembershipTransitionKind::Add
+                    && transition.node_id == identity.node_id(),
+                "JOINING descriptor is not the current ADD transition"
+            );
+        }
+        NodeState::Active => {
+            anyhow::ensure!(
+                descriptor.join_capability_hash.is_none(),
+                "ACTIVE descriptor retained a join capability"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn genesis_transition_hash(node_id: NodeId, peer_pin: PeerSpkiSha256) -> JoinCapabilityHash {
     let mut hasher = blake3::Hasher::new_derive_key("anvil.cluster/genesis-transition/v1");
     hasher.update(&node_id.0.to_be_bytes());
@@ -556,14 +845,22 @@ async fn migrate_released_identity(
 
 struct RaftCommittedPeerPins {
     cluster_id: ClusterId,
+    local_node_id: NodeId,
     decisions: RwLock<Option<DecisionRaft>>,
+    bootstrap: Option<Arc<JoinBootstrapPins>>,
 }
 
 impl RaftCommittedPeerPins {
-    fn new(cluster_id: ClusterId) -> Self {
+    fn new(
+        cluster_id: ClusterId,
+        local_node_id: NodeId,
+        bootstrap: Option<Arc<JoinBootstrapPins>>,
+    ) -> Self {
         Self {
             cluster_id,
+            local_node_id,
             decisions: RwLock::new(None),
+            bootstrap,
         }
     }
 
@@ -586,23 +883,33 @@ impl RaftCommittedPeerPins {
         }
     }
 
-    fn pins(&self, node_id: NodeId) -> Option<CommittedPeerPins> {
+    fn committed_state(&self) -> Option<anvil_consensus::StateMachine> {
         let decisions = self.decisions.read().ok()?.clone()?;
-        let state = decisions.state().ok()?;
-        if state.cluster_id()? != self.cluster_id {
-            return None;
-        }
-        let descriptor = state.cluster_control().nodes().get(&node_id)?;
-        Some(CommittedPeerPins {
-            current: descriptor.current_peer_spki_sha256,
-            overlap: descriptor.overlap_peer_spki_sha256,
-        })
+        decisions.state().ok()
     }
 }
 
 impl CommittedPeerPinProvider for RaftCommittedPeerPins {
     fn connection_pins(&self, node_id: NodeId) -> Option<CommittedPeerPins> {
-        self.pins(node_id)
+        let state = self.committed_state()?;
+        if !state
+            .cluster_control()
+            .nodes()
+            .contains_key(&self.local_node_id)
+        {
+            return self.bootstrap.as_ref()?.connection_pins(node_id);
+        }
+        match state.cluster_id() {
+            Some(cluster_id) if cluster_id == self.cluster_id => {
+                let descriptor = state.cluster_control().nodes().get(&node_id)?;
+                Some(CommittedPeerPins {
+                    current: descriptor.current_peer_spki_sha256,
+                    overlap: descriptor.overlap_peer_spki_sha256,
+                })
+            }
+            Some(_) => None,
+            None => self.bootstrap.as_ref()?.connection_pins(node_id),
+        }
     }
 
     fn authorized_rpc_pins(
@@ -614,26 +921,40 @@ impl CommittedPeerPinProvider for RaftCommittedPeerPins {
         if cluster_id != self.cluster_id {
             return None;
         }
-        let decisions = self.decisions.read().ok()?.clone()?;
-        let state = decisions.state().ok()?;
-        if state.cluster_id()? != self.cluster_id {
-            return None;
+        let state = self.committed_state()?;
+        if !state
+            .cluster_control()
+            .nodes()
+            .contains_key(&self.local_node_id)
+        {
+            return self
+                .bootstrap
+                .as_ref()?
+                .authorized_catch_up_pins(cluster_id, node_id, kind);
         }
-        let descriptor = state.cluster_control().nodes().get(&node_id)?;
-        let allowed = match kind {
-            PeerRpcKind::StateTransfer => {
-                matches!(descriptor.state, NodeState::Active | NodeState::Joining)
+        if let Some(committed_cluster) = state.cluster_id() {
+            if committed_cluster != self.cluster_id {
+                return None;
             }
-            PeerRpcKind::AppendEntries
-            | PeerRpcKind::Vote
-            | PeerRpcKind::InstallSnapshot
-            | PeerRpcKind::ServingLease
-            | PeerRpcKind::DataPlane => descriptor.state == NodeState::Active,
-        };
-        allowed.then_some(CommittedPeerPins {
-            current: descriptor.current_peer_spki_sha256,
-            overlap: descriptor.overlap_peer_spki_sha256,
-        })
+            let descriptor = state.cluster_control().nodes().get(&node_id)?;
+            let allowed = match kind {
+                PeerRpcKind::StateTransfer => {
+                    matches!(descriptor.state, NodeState::Active | NodeState::Joining)
+                }
+                PeerRpcKind::AppendEntries
+                | PeerRpcKind::Vote
+                | PeerRpcKind::InstallSnapshot
+                | PeerRpcKind::ServingLease
+                | PeerRpcKind::DataPlane => descriptor.state == NodeState::Active,
+            };
+            return allowed.then_some(CommittedPeerPins {
+                current: descriptor.current_peer_spki_sha256,
+                overlap: descriptor.overlap_peer_spki_sha256,
+            });
+        }
+        self.bootstrap
+            .as_ref()?
+            .authorized_catch_up_pins(cluster_id, node_id, kind)
     }
 }
 
@@ -644,7 +965,26 @@ mod tests {
     use anvil_store::StoreOptions;
 
     use super::*;
+    use crate::join_bundle::{JoinBundle, JoinSeed};
     use crate::serving_fence::ServingFenceRuntime;
+
+    struct AllowCompletedHandoff;
+
+    #[tonic::async_trait]
+    impl JoinActivationGate for AllowCompletedHandoff {
+        async fn ensure_handoff_complete(
+            &self,
+            _descriptor: &NodeDescriptor,
+            _transition: &anvil_consensus::MembershipTransition,
+        ) -> Result<(), tonic::Status> {
+            Ok(())
+        }
+    }
+
+    fn unused_loopback() -> SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap()
+    }
 
     #[test]
     fn concrete_listener_is_the_default_advertised_address() {
@@ -684,10 +1024,14 @@ mod tests {
         let peer_listen = listener.local_addr().unwrap();
         drop(listener);
         let advertised = PeerAddress(peer_listen.to_string());
+        let store = Store::open(StoreOptions::new(directory.path(), 1))
+            .await
+            .unwrap();
         let (decisions, runtime) = open(OpenPeerConfig {
             data_dir: directory.path(),
             node_id: NodeId(1),
             peer_address: advertised.clone(),
+            join_bundle: None,
             run_system_bootstrap: true,
             max_commit_entries: 16,
             max_commit_bytes: 64 * 1024,
@@ -711,9 +1055,6 @@ mod tests {
             0o600
         );
         let serving_transport = runtime.serving_transport();
-        let store = Store::open(StoreOptions::new(directory.path(), 1))
-            .await
-            .unwrap();
         let mut peer_server = runtime
             .start(
                 peer_listen,
@@ -770,6 +1111,7 @@ mod tests {
             data_dir: directory.path(),
             node_id: NodeId(1),
             peer_address: advertised.clone(),
+            join_bundle: None,
             run_system_bootstrap: false,
             max_commit_entries: 16,
             max_commit_bytes: 64 * 1024,
@@ -793,5 +1135,147 @@ mod tests {
 
         drop(runtime);
         decisions.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn copied_bundle_joins_as_learner_then_activates_with_exact_fixed_voters() {
+        let first_directory = tempfile::tempdir().unwrap();
+        let second_directory = tempfile::tempdir().unwrap();
+        let first_address = unused_loopback();
+        let second_address = unused_loopback();
+        let first_peer = PeerAddress(first_address.to_string());
+        let second_peer = PeerAddress(second_address.to_string());
+        let first_store = Store::open(StoreOptions::new(first_directory.path(), 1))
+            .await
+            .unwrap();
+        let second_store = Store::open(StoreOptions::new(second_directory.path(), 2))
+            .await
+            .unwrap();
+
+        let (first_decisions, first_runtime) = open(OpenPeerConfig {
+            data_dir: first_directory.path(),
+            node_id: NodeId(1),
+            peer_address: first_peer.clone(),
+            join_bundle: None,
+            run_system_bootstrap: true,
+            max_commit_entries: 16,
+            max_commit_bytes: 64 * 1024,
+            leader_timeout: Duration::from_secs(10),
+        })
+        .await
+        .unwrap();
+        let cluster_id = first_decisions.state().unwrap().cluster_id().unwrap();
+        let first_pin = first_runtime.identity.spki_sha256();
+        let bundle = JoinBundle::generate(
+            cluster_id,
+            NodeId(2),
+            second_peer.clone(),
+            500_000,
+            vec![JoinSeed {
+                node_id: NodeId(1),
+                peer_address: first_peer.clone(),
+                current_peer_spki_sha256: first_pin,
+                overlap_peer_spki_sha256: None,
+            }],
+        )
+        .unwrap();
+        let copied_bundle = second_directory.path().join("copied-join.json");
+        crate::join_bundle::write(&copied_bundle, &bundle).unwrap();
+        let begun = first_decisions
+            .submit(Command::BeginAddNode {
+                format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+                descriptor: NodeDescriptor {
+                    node_id: NodeId(2),
+                    peer_address: second_peer.clone(),
+                    storage_weight_millionths: 500_000,
+                    state: NodeState::Joining,
+                    current_peer_spki_sha256: bundle.peer_spki_sha256().unwrap(),
+                    overlap_peer_spki_sha256: None,
+                    join_capability_hash: Some(bundle.capability_hash()),
+                    supported_protocol: CapabilityRange { min: 1, max: 1 },
+                    supported_storage_format: CapabilityRange { min: 1, max: 1 },
+                },
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            begun.result,
+            ApplyResult::MembershipTransitionBegun(_)
+        ));
+
+        let mut first_server = first_runtime
+            .start_with_activation_gate(
+                first_address,
+                first_decisions.clone(),
+                first_store,
+                ErasureProfile::default(),
+                Duration::from_secs(30),
+                16 * 1024 * 1024,
+                Arc::new(AllowCompletedHandoff),
+            )
+            .await
+            .unwrap();
+        let (second_decisions, second_runtime) = open(OpenPeerConfig {
+            data_dir: second_directory.path(),
+            node_id: NodeId(2),
+            peer_address: second_peer,
+            join_bundle: Some(&copied_bundle),
+            run_system_bootstrap: true,
+            max_commit_entries: 16,
+            max_commit_bytes: 64 * 1024,
+            leader_timeout: Duration::from_secs(10),
+        })
+        .await
+        .unwrap();
+        assert!(!copied_bundle.exists());
+        assert!(!second_decisions.is_initialized().await.unwrap());
+        let join = second_runtime.join_transport().unwrap();
+        let mut second_server = second_runtime
+            .start(
+                second_address,
+                second_decisions.clone(),
+                second_store,
+                ErasureProfile::default(),
+                Duration::from_secs(30),
+                16 * 1024 * 1024,
+            )
+            .await
+            .unwrap();
+
+        complete_pending_join(
+            &join,
+            &second_decisions,
+            second_directory.path(),
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            first_decisions.state().unwrap().cluster_control().nodes()[&NodeId(2)].state,
+            NodeState::Active
+        );
+        assert_eq!(
+            second_decisions.state().unwrap().cluster_control().nodes()[&NodeId(2)].state,
+            NodeState::Active
+        );
+        assert_eq!(
+            first_decisions.committed_voter_ids().unwrap(),
+            std::collections::BTreeSet::from([NodeId(1), NodeId(2)])
+        );
+        assert_eq!(
+            second_decisions.committed_voter_ids().unwrap(),
+            std::collections::BTreeSet::from([NodeId(1), NodeId(2)])
+        );
+        assert!(
+            node_identity::load_for_node(second_directory.path(), NodeId(2))
+                .unwrap()
+                .pending_join()
+                .is_none()
+        );
+
+        second_server.shutdown().await.unwrap();
+        first_server.shutdown().await.unwrap();
+        second_decisions.shutdown().await.unwrap();
+        first_decisions.shutdown().await.unwrap();
     }
 }
