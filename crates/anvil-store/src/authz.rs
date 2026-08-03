@@ -521,12 +521,25 @@ impl AuthzRepository {
         &self,
         request: PublishSchemaRequest,
     ) -> Result<PublishedSchema, AuthzStoreError> {
+        let _guard = self.lock_writes()?;
+        let mut batch = WriteBatch::default();
+        let (published, _) = self.prepare_schema_publication(request, &mut batch)?;
+        if !published.replayed {
+            self.write(batch)?;
+        }
+        Ok(published)
+    }
+
+    pub(crate) fn prepare_schema_publication(
+        &self,
+        request: PublishSchemaRequest,
+        batch: &mut WriteBatch,
+    ) -> Result<(PublishedSchema, Option<StoredSchema>), AuthzStoreError> {
         request.storage_tenant.validate()?;
         request.schema_id.validate()?;
         let canonical = canonical_schema(request.schema, self.limits.evaluator)?;
         let canonical_bytes = serde_json::to_vec(&canonical).map_err(storage_error)?;
         let digest = SchemaDigest(*blake3::hash(&canonical_bytes).as_bytes());
-        let _guard = self.lock_writes()?;
 
         if let Some(existing_ref) = self.read_json::<SchemaRef>(
             CF_AUTHZ_SCHEMAS,
@@ -538,11 +551,14 @@ impl AuthzRepository {
                     "authorization schema digest collision".into(),
                 ));
             }
-            return Ok(PublishedSchema {
-                schema_ref: existing_ref,
-                authz_revision: stored.published_at_revision,
-                replayed: true,
-            });
+            return Ok((
+                PublishedSchema {
+                    schema_ref: existing_ref,
+                    authz_revision: stored.published_at_revision,
+                    replayed: true,
+                },
+                None,
+            ));
         }
 
         let current = self.tenant_revision(&request.storage_tenant)?;
@@ -572,7 +588,6 @@ impl AuthzRepository {
             published_at_revision: authz_revision,
         };
 
-        let mut batch = WriteBatch::default();
         batch.put_cf(
             self.cf(CF_AUTHZ_SCHEMAS)?,
             schema_revision_key(&request.storage_tenant, &schema_ref),
@@ -592,13 +607,15 @@ impl AuthzRepository {
             ),
             encode_json(&schema_ref)?,
         );
-        self.stage_tenant_revision(&mut batch, &request.storage_tenant, authz_revision)?;
-        self.write(batch)?;
-        Ok(PublishedSchema {
-            schema_ref,
-            authz_revision,
-            replayed: false,
-        })
+        self.stage_tenant_revision(batch, &request.storage_tenant, authz_revision)?;
+        Ok((
+            PublishedSchema {
+                schema_ref,
+                authz_revision,
+                replayed: false,
+            },
+            Some(stored),
+        ))
     }
 
     pub fn bind_schema(&self, request: BindSchemaRequest) -> Result<BoundRealm, AuthzStoreError> {
@@ -1731,6 +1748,9 @@ fn receipt_key(
 
 #[cfg(test)]
 mod tests;
+
+mod catalogue;
+pub use catalogue::*;
 
 mod replication;
 pub use replication::*;
