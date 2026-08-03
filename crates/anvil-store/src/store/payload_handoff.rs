@@ -8,9 +8,13 @@ use rocksdb::{Direction, IteratorMode, WriteOptions};
 use serde::{Deserialize, Serialize};
 
 use super::*;
-use crate::ErasureCodec;
+use crate::{ErasureCodec, FRAGMENT_FORMAT_VERSION};
 
 pub const MAX_PAYLOAD_HANDOFF_EXPORT_RECORDS: u32 = 1_000;
+const COMPLETE_HANDOFF_KIND: u8 = 0;
+const SHARD_HANDOFF_KIND: u8 = 1;
+const COMPLETE_HANDOFF_KEY_BYTES: usize = 32 + size_of::<u64>() + 1;
+const SHARD_HANDOFF_KEY_BYTES: usize = COMPLETE_HANDOFF_KEY_BYTES + size_of::<u16>();
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "identity", rename_all = "snake_case")]
@@ -34,10 +38,27 @@ impl PayloadArtifactIdentity {
         }
     }
 
-    /// Canonical lifecycle-column-family key used only to merge bounded
-    /// handoff pages from several nodes in their existing iterator order.
+    /// Ephemeral blob-first key used only to merge bounded handoff pages.
+    ///
+    /// The persisted complete and shard keys have different layouts. This
+    /// normalized order keeps every artifact for one blob adjacent without
+    /// changing either durable layout.
     pub fn handoff_order_key(&self) -> Vec<u8> {
-        self.key()
+        let reference = self.blob();
+        let mut key = Vec::with_capacity(match self {
+            Self::Complete(_) => COMPLETE_HANDOFF_KEY_BYTES,
+            Self::Shard(_) => SHARD_HANDOFF_KEY_BYTES,
+        });
+        key.extend_from_slice(&reference.hash);
+        key.extend_from_slice(&reference.length.to_be_bytes());
+        match self {
+            Self::Complete(_) => key.push(COMPLETE_HANDOFF_KIND),
+            Self::Shard(identity) => {
+                key.push(SHARD_HANDOFF_KIND);
+                key.extend_from_slice(&identity.ordinal().to_be_bytes());
+            }
+        }
+        key
     }
 }
 
@@ -54,7 +75,9 @@ impl PayloadArtifactSnapshot {
         match &self.identity {
             PayloadArtifactIdentity::Complete(_) => {
                 if key.len() != 40 {
-                    return Err(storage_error("payload handoff has a malformed complete identity"));
+                    return Err(storage_error(
+                        "payload handoff has a malformed complete identity",
+                    ));
                 }
             }
             PayloadArtifactIdentity::Shard(_) => {
@@ -70,7 +93,7 @@ pub struct PayloadArtifactCursor(Vec<u8>);
 
 impl PayloadArtifactCursor {
     pub fn from_key(key: Vec<u8>) -> Result<Self, MutationError> {
-        decode_artifact_identity(&key)?;
+        decode_handoff_key(&key)?;
         Ok(Self(key))
     }
 }
@@ -83,7 +106,7 @@ pub struct PayloadArtifactSnapshotPage {
 
 impl Store {
     /// Enumerate the existing lifecycle column family without inventing a
-    /// placement inventory. The cursor is the last canonical artifact key.
+    /// placement inventory. The cursor is an ephemeral normalized order key.
     pub fn export_payload_artifact_snapshots(
         &self,
         cursor: Option<&PayloadArtifactCursor>,
@@ -92,33 +115,61 @@ impl Store {
         if max_records == 0 || max_records > MAX_PAYLOAD_HANDOFF_EXPORT_RECORDS {
             return Err(storage_error("payload handoff page limit is invalid"));
         }
-        if let Some(cursor) = cursor {
-            decode_artifact_identity(&cursor.0)?;
-        }
-        let start = cursor.map_or(&[][..], |cursor| cursor.0.as_slice());
+        let after = cursor
+            .map(|cursor| decode_handoff_key(&cursor.0))
+            .transpose()?;
+        let complete_start = after
+            .as_ref()
+            .map_or_else(Vec::new, |identity| blob_reference_key(identity.blob()));
+        let shard_start = after.as_ref().map_or_else(
+            || FRAGMENT_FORMAT_VERSION.to_be_bytes().to_vec(),
+            |identity| {
+                let ordinal = match identity {
+                    PayloadArtifactIdentity::Complete(_) => 0,
+                    PayloadArtifactIdentity::Shard(identity) => identity.ordinal(),
+                };
+                ShardIdentity::new(identity.blob().clone(), ordinal)
+                    .encode()
+                    .to_vec()
+            },
+        );
+        let family = self.cf(CF_BLOB_REFERENCES)?;
+        let mut completes = self.db.iterator_cf(
+            family,
+            IteratorMode::From(&complete_start, Direction::Forward),
+        );
+        let mut shards = self
+            .db
+            .iterator_cf(family, IteratorMode::From(&shard_start, Direction::Forward));
+        let after_key = cursor.map(|cursor| cursor.0.as_slice());
+        let mut next_complete = next_artifact(&mut completes, ArtifactKind::Complete, after_key)?;
+        let mut next_shard = next_artifact(&mut shards, ArtifactKind::Shard, after_key)?;
         let mut artifacts = Vec::with_capacity(max_records as usize);
         let mut last_key = None;
-        let mut has_more = false;
-        for entry in self.db.iterator_cf(
-            self.cf(CF_BLOB_REFERENCES)?,
-            IteratorMode::From(start, Direction::Forward),
-        ) {
-            let (key, encoded) = entry.map_err(storage_error)?;
-            if cursor.is_some_and(|cursor| key.as_ref() <= cursor.0.as_slice()) {
-                continue;
-            }
-            if artifacts.len() == max_records as usize {
-                has_more = true;
-                break;
-            }
-            let artifact = PayloadArtifactSnapshot {
-                identity: decode_artifact_identity(&key)?,
-                lifecycle: decode_blob_reference_state(&encoded)?,
+        while artifacts.len() < max_records as usize {
+            let take_complete = match (&next_complete, &next_shard) {
+                (Some(complete), Some(shard)) => complete.order_key < shard.order_key,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => break,
             };
-            artifact.validate()?;
-            last_key = Some(key.to_vec());
-            artifacts.push(artifact);
+            let next = if take_complete {
+                let next = next_complete
+                    .take()
+                    .expect("complete handoff candidate was selected");
+                next_complete = next_artifact(&mut completes, ArtifactKind::Complete, after_key)?;
+                next
+            } else {
+                let next = next_shard
+                    .take()
+                    .expect("shard handoff candidate was selected");
+                next_shard = next_artifact(&mut shards, ArtifactKind::Shard, after_key)?;
+                next
+            };
+            last_key = Some(next.order_key);
+            artifacts.push(next.artifact);
         }
+        let has_more = next_complete.is_some() || next_shard.is_some();
         Ok(PayloadArtifactSnapshotPage {
             artifacts,
             next_cursor: has_more
@@ -138,7 +189,10 @@ impl Store {
         artifact.validate()?;
         match &artifact.identity {
             PayloadArtifactIdentity::Complete(reference) => {
-                if self.complete_copy_state(reference).await.map_err(storage_error)?
+                if self
+                    .complete_copy_state(reference)
+                    .await
+                    .map_err(storage_error)?
                     != PayloadArtifactState::Valid
                 {
                     return Err(storage_error(
@@ -147,7 +201,8 @@ impl Store {
                 }
             }
             PayloadArtifactIdentity::Shard(identity) => {
-                self.validate_shard(codec, identity).map_err(storage_error)?;
+                self.validate_shard(codec, identity)
+                    .map_err(storage_error)?;
             }
         }
 
@@ -159,27 +214,110 @@ impl Store {
                 .get_cf(self.cf(CF_SMALL_BLOBS)?, &key)
                 .map_err(storage_error)?
                 .is_some(),
-            PayloadArtifactIdentity::Complete(reference) => {
-                self.blobs.contains(reference).await.map_err(storage_error)?
-            }
-            PayloadArtifactIdentity::Shard(identity) => {
-                self.contains_shard_artifact(identity).map_err(storage_error)?
-            }
+            PayloadArtifactIdentity::Complete(reference) => self
+                .blobs
+                .contains(reference)
+                .await
+                .map_err(storage_error)?,
+            PayloadArtifactIdentity::Shard(identity) => self
+                .contains_shard_artifact(identity)
+                .map_err(storage_error)?,
         };
         if !present {
             return Err(MutationError::BlobNotFound);
         }
         let mut options = WriteOptions::default();
         options.set_sync(self.sync_writes);
+        let lifecycle = match self
+            .db
+            .get_cf(self.cf(CF_BLOB_REFERENCES)?, &key)
+            .map_err(storage_error)?
+        {
+            Some(encoded) => {
+                let current = decode_blob_reference_state(&encoded)?;
+                BlobReferenceState {
+                    ref_count: artifact.lifecycle.ref_count,
+                    flags: artifact.lifecycle.flags,
+                    created_at: artifact.lifecycle.created_at.min(current.created_at),
+                    updated_at: artifact.lifecycle.updated_at.max(current.updated_at),
+                }
+            }
+            None => artifact.lifecycle,
+        };
         self.db
             .put_cf_opt(
                 self.cf(CF_BLOB_REFERENCES)?,
                 key,
-                encode_blob_reference_state(artifact.lifecycle),
+                encode_blob_reference_state(lifecycle),
                 &options,
             )
             .map_err(storage_error)
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ArtifactKind {
+    Complete,
+    Shard,
+}
+
+struct OrderedArtifact {
+    order_key: Vec<u8>,
+    artifact: PayloadArtifactSnapshot,
+}
+
+fn next_artifact(
+    entries: &mut impl Iterator<Item = Result<(Box<[u8]>, Box<[u8]>), rocksdb::Error>>,
+    wanted: ArtifactKind,
+    after: Option<&[u8]>,
+) -> Result<Option<OrderedArtifact>, MutationError> {
+    for entry in entries {
+        let (key, encoded) = entry.map_err(storage_error)?;
+        let kind = match key.len() {
+            40 => ArtifactKind::Complete,
+            44 => ArtifactKind::Shard,
+            _ => {
+                return Err(storage_error(
+                    "payload lifecycle key has a malformed identity",
+                ));
+            }
+        };
+        if kind != wanted {
+            continue;
+        }
+        let artifact = PayloadArtifactSnapshot {
+            identity: decode_artifact_identity(&key)?,
+            lifecycle: decode_blob_reference_state(&encoded)?,
+        };
+        artifact.validate()?;
+        let order_key = artifact.identity.handoff_order_key();
+        if after.is_some_and(|after| order_key.as_slice() <= after) {
+            continue;
+        }
+        return Ok(Some(OrderedArtifact {
+            order_key,
+            artifact,
+        }));
+    }
+    Ok(None)
+}
+
+fn decode_handoff_key(key: &[u8]) -> Result<PayloadArtifactIdentity, MutationError> {
+    if key.len() == COMPLETE_HANDOFF_KEY_BYTES && key[40] == COMPLETE_HANDOFF_KIND {
+        return blob_reference_from_key(&key[..40]).map(PayloadArtifactIdentity::Complete);
+    }
+    if key.len() == SHARD_HANDOFF_KEY_BYTES && key[40] == SHARD_HANDOFF_KIND {
+        let blob = blob_reference_from_key(&key[..40])?;
+        let ordinal = u16::from_be_bytes(
+            key[41..]
+                .try_into()
+                .expect("handoff shard ordinal width was checked"),
+        );
+        return Ok(PayloadArtifactIdentity::Shard(ShardIdentity::new(
+            blob, ordinal,
+        )));
+    }
+    Err(storage_error("payload handoff cursor is malformed"))
 }
 
 fn decode_artifact_identity(key: &[u8]) -> Result<PayloadArtifactIdentity, MutationError> {
@@ -188,7 +326,9 @@ fn decode_artifact_identity(key: &[u8]) -> Result<PayloadArtifactIdentity, Mutat
         44 => ShardIdentity::decode(key)
             .map(PayloadArtifactIdentity::Shard)
             .map_err(storage_error),
-        _ => Err(storage_error("payload lifecycle key has a malformed identity")),
+        _ => Err(storage_error(
+            "payload lifecycle key has a malformed identity",
+        )),
     }
 }
 
@@ -200,11 +340,15 @@ mod tests {
     use crate::{ErasureProfile, StoreOptions};
 
     #[tokio::test]
-    async fn handoff_preserves_exact_small_and_shard_lifecycle() {
+    async fn handoff_preserves_logical_state_without_regressing_timestamps() {
         let source_dir = tempfile::tempdir().unwrap();
         let target_dir = tempfile::tempdir().unwrap();
-        let source = Store::open(StoreOptions::new(source_dir.path(), 1)).await.unwrap();
-        let target = Store::open(StoreOptions::new(target_dir.path(), 2)).await.unwrap();
+        let source = Store::open(StoreOptions::new(source_dir.path(), 1))
+            .await
+            .unwrap();
+        let target = Store::open(StoreOptions::new(target_dir.path(), 2))
+            .await
+            .unwrap();
         let small = source.stage_blob(b"small handoff").await.unwrap();
         let large_bytes = vec![7_u8; SMALL_BLOB_MAX_BYTES + 1];
         let large = source.stage_blob(&large_bytes).await.unwrap();
@@ -220,9 +364,7 @@ mod tests {
             .await
             .unwrap();
 
-        let page = source
-            .export_payload_artifact_snapshots(None, 100)
-            .unwrap();
+        let page = source.export_payload_artifact_snapshots(None, 100).unwrap();
         let small_snapshot = page
             .artifacts
             .iter()
@@ -232,11 +374,29 @@ mod tests {
             .seal_small_copy(&small, b"small handoff")
             .await
             .unwrap();
+        let target_small_before = target.blob_reference_state(&small).unwrap().unwrap();
         target
             .install_payload_artifact_lifecycle(&codec, small_snapshot)
             .await
             .unwrap();
-        assert_eq!(target.blob_reference_state(&small).unwrap(), Some(small_snapshot.lifecycle));
+        let target_small_after = target.blob_reference_state(&small).unwrap().unwrap();
+        assert_eq!(
+            target_small_after.ref_count,
+            small_snapshot.lifecycle.ref_count
+        );
+        assert_eq!(target_small_after.flags, small_snapshot.lifecycle.flags);
+        assert_eq!(
+            target_small_after.created_at,
+            target_small_before
+                .created_at
+                .min(small_snapshot.lifecycle.created_at)
+        );
+        assert_eq!(
+            target_small_after.updated_at,
+            target_small_before
+                .updated_at
+                .max(small_snapshot.lifecycle.updated_at)
+        );
 
         let shard_snapshot = page
             .artifacts
@@ -247,13 +407,81 @@ mod tests {
             .seal_shard(&codec, &shard, Cursor::new(&shards[0]))
             .await
             .unwrap();
+        let target_shard_before = target.shard_reference_state(&shard).unwrap().unwrap();
         target
             .install_payload_artifact_lifecycle(&codec, shard_snapshot)
             .await
             .unwrap();
+        let target_shard_after = target.shard_reference_state(&shard).unwrap().unwrap();
         assert_eq!(
-            target.shard_reference_state(&shard).unwrap(),
-            Some(shard_snapshot.lifecycle)
+            target_shard_after.ref_count,
+            shard_snapshot.lifecycle.ref_count
+        );
+        assert_eq!(target_shard_after.flags, shard_snapshot.lifecycle.flags);
+        assert_eq!(
+            target_shard_after.created_at,
+            target_shard_before
+                .created_at
+                .min(shard_snapshot.lifecycle.created_at)
+        );
+        assert_eq!(
+            target_shard_after.updated_at,
+            target_shard_before
+                .updated_at
+                .max(shard_snapshot.lifecycle.updated_at)
+        );
+    }
+
+    #[tokio::test]
+    async fn payload_export_is_blob_first_across_one_record_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreOptions::new(dir.path(), 1)).await.unwrap();
+        let small = store.stage_blob(b"small page boundary").await.unwrap();
+        let large_bytes = vec![11_u8; SMALL_BLOB_MAX_BYTES + 1];
+        let large = store.stage_blob(&large_bytes).await.unwrap();
+        let codec = ErasureCodec::new(ErasureProfile::default()).unwrap();
+        let mut shards = vec![Vec::new(); usize::from(codec.profile().total_shards())];
+        store
+            .encode_sealed_source(&codec, &large, &mut shards)
+            .await
+            .unwrap();
+        for ordinal in 0..2 {
+            store
+                .seal_shard(
+                    &codec,
+                    &ShardIdentity::new(large.clone(), ordinal),
+                    Cursor::new(&shards[usize::from(ordinal)]),
+                )
+                .await
+                .unwrap();
+        }
+
+        let mut cursor = None;
+        let mut exported = Vec::new();
+        loop {
+            let page = store
+                .export_payload_artifact_snapshots(cursor.as_ref(), 1)
+                .unwrap();
+            assert!(page.artifacts.len() <= 1);
+            exported.extend(page.artifacts.into_iter().map(|entry| entry.identity));
+            let Some(next) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next);
+        }
+
+        let mut expected = vec![
+            PayloadArtifactIdentity::Complete(small),
+            PayloadArtifactIdentity::Complete(large.clone()),
+            PayloadArtifactIdentity::Shard(ShardIdentity::new(large.clone(), 0)),
+            PayloadArtifactIdentity::Shard(ShardIdentity::new(large, 1)),
+        ];
+        expected.sort_by_key(PayloadArtifactIdentity::handoff_order_key);
+        assert_eq!(exported, expected);
+        assert!(
+            exported
+                .windows(2)
+                .all(|pair| pair[0].handoff_order_key() < pair[1].handoff_order_key())
         );
     }
 
@@ -274,9 +502,11 @@ mod tests {
             },
         };
         let codec = ErasureCodec::new(ErasureProfile::default()).unwrap();
-        assert!(store
-            .install_payload_artifact_lifecycle(&codec, &artifact)
-            .await
-            .is_err());
+        assert!(
+            store
+                .install_payload_artifact_lifecycle(&codec, &artifact)
+                .await
+                .is_err()
+        );
     }
 }
