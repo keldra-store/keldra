@@ -19,6 +19,11 @@ mod object_distribution;
 pub mod observability;
 mod payload_distribution;
 mod payload_placement;
+#[allow(
+    dead_code,
+    reason = "distributed read core is wired through the private payload transport next"
+)]
+mod payload_read;
 mod peer_runtime;
 mod placement;
 mod programs;
