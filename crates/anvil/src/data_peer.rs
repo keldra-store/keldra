@@ -18,10 +18,11 @@ use anvil_consensus::{
 };
 use anvil_store::{
     AuthzRealmMutation, BlobReader, BlobRef, CompleteCopySealOutcome, ErasureCodec, ErasureProfile,
-    FRAGMENT_FORMAT_VERSION, LocalChange, MAX_LOCAL_INVALIDATION_SCAN_RECORDS, MutationError,
-    ObjectMutation, PayloadStoreError, ReferenceDeltaApplied, ReferenceDeltaBatch,
-    ReplicaAuthzRealmMutationApplied, ReplicaObjectMutationApplied, ShardIdentity,
-    ShardSealOutcome, ShardStoreError, SourceId, Store, WatchJournalStatus,
+    FRAGMENT_FORMAT_VERSION, LocalChange, MAX_LOCAL_INVALIDATION_SCAN_RECORDS,
+    MAX_OBJECT_RECORD_EXPORT_BYTES, MutationError, ObjectKey, ObjectMutation, ObjectPathSnapshot,
+    ObjectSnapshotApplied, ObjectSnapshotError, PayloadStoreError, ReferenceDeltaApplied,
+    ReferenceDeltaBatch, ReplicaAuthzRealmMutationApplied, ReplicaObjectMutationApplied,
+    ShardIdentity, ShardSealOutcome, ShardStoreError, SourceId, Store, WatchJournalStatus,
 };
 use hyper_util::rt::TokioIo;
 use tokio::io::AsyncWriteExt;
@@ -31,6 +32,18 @@ use tonic::metadata::MetadataMap;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status, Streaming};
 
+mod errors;
+mod object_snapshot;
+mod timeout;
+mod typed_json;
+
+use errors::{map_mutation_error, map_payload_error, map_shard_error};
+use object_snapshot::{
+    encode_object_snapshot, map_object_snapshot_error, require_object_snapshot_bound,
+};
+use timeout::effective_timeout;
+use typed_json::{decode_typed, encode_page, encode_typed, require_typed_bound};
+
 pub(crate) mod wire {
     tonic::include_proto!("anvil.data_peer.v1");
 }
@@ -38,7 +51,8 @@ pub(crate) mod wire {
 pub(crate) const DATA_PEER_SCHEMA_VERSION: u32 = 1;
 pub(crate) const DATA_PEER_FRAME_BYTES: usize = 64 * 1024;
 const MAX_TYPED_MUTATION_BYTES: usize = 16 * 1024 * 1024;
-const MAX_DATA_PEER_MESSAGE_BYTES: usize = MAX_TYPED_MUTATION_BYTES + 1024;
+const MAX_OBJECT_SNAPSHOT_BYTES: usize = MAX_OBJECT_RECORD_EXPORT_BYTES as usize;
+const MAX_DATA_PEER_MESSAGE_BYTES: usize = MAX_OBJECT_SNAPSHOT_BYTES + 1024;
 
 #[derive(Clone)]
 pub(crate) struct DataPeerService {
@@ -168,6 +182,73 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
         Ok(Response::new(wire::ObjectMutationApplied {
             schema_version: DATA_PEER_SCHEMA_VERSION,
             version: applied.version.0,
+            replayed: applied.replayed,
+        }))
+    }
+
+    async fn read_object_path_snapshot(
+        &self,
+        mut request: Request<wire::ObjectPathSnapshotRequest>,
+    ) -> Result<Response<wire::ObjectPathSnapshotResponse>, Status> {
+        let peer = request.get_ref().peer.clone();
+        self.authorize(&mut request, peer.as_ref(), PeerRpcKind::DataPlane)?;
+        let metadata = request.metadata().clone();
+        let request = request.into_inner();
+        let store = self.store.clone();
+        let snapshot = self
+            .bounded(&metadata, async move {
+                tokio::task::spawn_blocking(move || {
+                    store.export_object_path_record(
+                        request.tenant_id,
+                        request.bucket_id,
+                        &request.exact_path,
+                    )
+                })
+                .await
+                .map_err(|error| Status::internal(format!("object snapshot read: {error}")))?
+                .map_err(map_object_snapshot_error)
+            })
+            .await?;
+        let snapshot_json = encode_object_snapshot(&snapshot)?;
+        Ok(Response::new(wire::ObjectPathSnapshotResponse {
+            schema_version: DATA_PEER_SCHEMA_VERSION,
+            snapshot_json,
+        }))
+    }
+
+    async fn repair_object_path_snapshot(
+        &self,
+        mut request: Request<wire::RepairObjectPathSnapshotRequest>,
+    ) -> Result<Response<wire::ObjectPathSnapshotApplied>, Status> {
+        let peer = request.get_ref().peer.clone();
+        self.authorize(&mut request, peer.as_ref(), PeerRpcKind::DataPlane)?;
+        require_object_snapshot_bound(&request.get_ref().expected_snapshot_json)?;
+        require_object_snapshot_bound(&request.get_ref().selected_snapshot_json)?;
+        let expected: Option<ObjectPathSnapshot> =
+            decode_typed(&request.get_ref().expected_snapshot_json)?;
+        let selected: Option<ObjectPathSnapshot> =
+            decode_typed(&request.get_ref().selected_snapshot_json)?;
+        let metadata = request.metadata().clone();
+        let request = request.into_inner();
+        let store = self.store.clone();
+        let applied = self
+            .bounded(&metadata, async move {
+                store
+                    .repair_object_path_snapshot(
+                        request.tenant_id,
+                        request.bucket_id,
+                        &request.exact_path,
+                        expected.as_ref(),
+                        selected.as_ref(),
+                    )
+                    .await
+                    .map_err(map_object_snapshot_error)
+            })
+            .await?;
+        Ok(Response::new(wire::ObjectPathSnapshotApplied {
+            schema_version: DATA_PEER_SCHEMA_VERSION,
+            present: applied.retained,
+            version: applied.version.map_or(0, |version| version.0),
             replayed: applied.replayed,
         }))
     }
@@ -1383,39 +1464,6 @@ fn parse_shard(value: &wire::ShardRequest) -> Result<ShardIdentity, Status> {
     ))
 }
 
-fn require_typed_bound(encoded: &[u8]) -> Result<(), Status> {
-    if encoded.len() > MAX_TYPED_MUTATION_BYTES {
-        return Err(Status::resource_exhausted(
-            "typed mutation exceeds the private peer limit",
-        ));
-    }
-    Ok(())
-}
-
-fn decode_typed<T: serde::de::DeserializeOwned>(encoded: &[u8]) -> Result<T, Status> {
-    serde_json::from_slice(encoded)
-        .map_err(|error| Status::invalid_argument(format!("invalid typed peer payload: {error}")))
-}
-
-fn encode_typed<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, Status> {
-    serde_json::to_vec(value)
-        .map_err(|error| Status::internal(format!("encode typed peer payload: {error}")))
-}
-
-fn encode_page(changes: Vec<LocalChange>) -> Result<Vec<Vec<u8>>, Status> {
-    let mut encoded = Vec::with_capacity(changes.len());
-    let mut total = 0_usize;
-    for change in changes {
-        let item = encode_typed(&change)?;
-        total = total
-            .checked_add(item.len())
-            .filter(|total| *total <= MAX_TYPED_MUTATION_BYTES)
-            .ok_or_else(|| Status::resource_exhausted("source journal page exceeds peer limit"))?;
-        encoded.push(item);
-    }
-    Ok(encoded)
-}
-
 fn content_frame(offset: u64, content: Vec<u8>) -> wire::ContentFrame {
     wire::ContentFrame {
         schema_version: DATA_PEER_SCHEMA_VERSION,
@@ -1431,65 +1479,6 @@ fn content_end(offset: u64) -> wire::ContentFrame {
         offset,
         content: Vec::new(),
         end: true,
-    }
-}
-
-fn map_mutation_error(error: MutationError) -> Status {
-    match error {
-        MutationError::BlobNotFound => Status::not_found(error.to_string()),
-        MutationError::InvalidObjectMutation(_) | MutationError::InvalidCommandId => {
-            Status::invalid_argument(error.to_string())
-        }
-        MutationError::Storage(_) => Status::internal(error.to_string()),
-        _ => Status::failed_precondition(error.to_string()),
-    }
-}
-
-fn map_shard_error(error: ShardStoreError) -> Status {
-    match error {
-        ShardStoreError::NotFound => Status::not_found(error.to_string()),
-        ShardStoreError::MalformedIdentity => Status::invalid_argument(error.to_string()),
-        ShardStoreError::Storage(_) => Status::internal(error.to_string()),
-        _ => Status::failed_precondition(error.to_string()),
-    }
-}
-
-fn map_payload_error(error: PayloadStoreError) -> Status {
-    match error {
-        PayloadStoreError::NotSmall | PayloadStoreError::NotLarge => {
-            Status::invalid_argument(error.to_string())
-        }
-        PayloadStoreError::CompleteCopyMissing => Status::not_found(error.to_string()),
-        PayloadStoreError::CompleteCopyCorrupt => Status::data_loss(error.to_string()),
-        PayloadStoreError::Mutation(error) => map_mutation_error(error),
-        PayloadStoreError::Shard(error) => map_shard_error(error),
-        PayloadStoreError::Erasure(error) => Status::failed_precondition(error.to_string()),
-        PayloadStoreError::Storage(_) => Status::internal(error.to_string()),
-    }
-}
-
-fn effective_timeout(metadata: &MetadataMap, server_maximum: Duration) -> Duration {
-    client_grpc_timeout(metadata).map_or(server_maximum, |client| client.min(server_maximum))
-}
-
-fn client_grpc_timeout(metadata: &MetadataMap) -> Option<Duration> {
-    let encoded = metadata.get("grpc-timeout")?.to_str().ok()?;
-    if encoded.is_empty() {
-        return None;
-    }
-    let (value, unit) = encoded.split_at(encoded.len() - 1);
-    if value.is_empty() || value.len() > 8 {
-        return None;
-    }
-    let value = value.parse::<u64>().ok()?;
-    match unit {
-        "H" => Some(Duration::from_secs(value.checked_mul(60 * 60)?)),
-        "M" => Some(Duration::from_secs(value.checked_mul(60)?)),
-        "S" => Some(Duration::from_secs(value)),
-        "m" => Some(Duration::from_millis(value)),
-        "u" => Some(Duration::from_micros(value)),
-        "n" => Some(Duration::from_nanos(value)),
-        _ => None,
     }
 }
 
@@ -1716,6 +1705,74 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+
+        let tenant_id = 11;
+        let bucket_id = 22;
+        let exact_path = "peer-snapshot";
+        let snapshot = Some(ObjectPathSnapshot {
+            tenant_id,
+            bucket_id,
+            exact_path: exact_path.into(),
+            head: anvil_store::Head {
+                version: anvil_store::VersionId(1),
+                deleted: true,
+                mutation_stamp: None,
+            },
+            versions: vec![anvil_store::Version {
+                id: anvil_store::VersionId(1),
+                blob: None,
+                content_type: None,
+                deleted: true,
+                committed_at_unix_millis: 1,
+            }],
+        });
+        store
+            .repair_object_path_snapshot(tenant_id, bucket_id, exact_path, None, snapshot.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(
+            joining
+                .read_object_path_snapshot(NodeId(1), &address, tenant_id, bucket_id, exact_path,)
+                .await
+                .unwrap(),
+            snapshot
+        );
+        joining
+            .repair_object_path_snapshot(
+                NodeId(1),
+                &address,
+                tenant_id,
+                bucket_id,
+                exact_path,
+                snapshot.as_ref(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .export_object_path_record(tenant_id, bucket_id, exact_path)
+                .unwrap()
+                .is_none()
+        );
+        joining
+            .repair_object_path_snapshot(
+                NodeId(1),
+                &address,
+                tenant_id,
+                bucket_id,
+                exact_path,
+                None,
+                snapshot.as_ref(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .export_object_path_record(tenant_id, bucket_id, exact_path)
+                .unwrap(),
+            snapshot
         );
 
         let bytes = b"typed data peer over real mutual TLS";

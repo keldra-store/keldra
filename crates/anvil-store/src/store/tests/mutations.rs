@@ -688,6 +688,143 @@ async fn typed_mutation_replicates_exactly_and_retries_after_head_and_journal_mo
 }
 
 #[tokio::test]
+async fn minority_rollback_retry_reapplies_the_same_typed_mutation_to_quorum() {
+    let (_temporary, coordinator, replica) = two_stores(16).await;
+    let request = put(
+        "minority-retry",
+        b"value",
+        Precondition::Absent,
+        "minority-command",
+    );
+    let first = coordinator
+        .coordinate_object_mutation(
+            BatchOperation::Put(request.clone()),
+            distributed_context(19),
+        )
+        .await
+        .unwrap();
+    let mutation = first.mutation.unwrap();
+
+    let observed = coordinator
+        .export_object_path_record(mutation.tenant_id, mutation.bucket_id, &mutation.exact_path)
+        .unwrap();
+    coordinator
+        .repair_object_path_snapshot(
+            mutation.tenant_id,
+            mutation.bucket_id,
+            &mutation.exact_path,
+            observed.as_ref(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        coordinator
+            .export_object_path_record(
+                mutation.tenant_id,
+                mutation.bucket_id,
+                &mutation.exact_path,
+            )
+            .unwrap()
+            .is_none()
+    );
+
+    let retry = coordinator
+        .coordinate_object_mutation(BatchOperation::Put(request), distributed_context(19))
+        .await
+        .unwrap();
+    assert!(retry.receipt.replayed);
+    assert_eq!(retry.mutation.as_ref(), Some(&mutation));
+    assert!(
+        !coordinator
+            .apply_object_mutation_replica(&mutation)
+            .await
+            .unwrap()
+            .replayed
+    );
+    assert!(
+        !replica
+            .apply_object_mutation_replica(&mutation)
+            .await
+            .unwrap()
+            .replayed
+    );
+
+    let committed = coordinator
+        .export_object_path_record(mutation.tenant_id, mutation.bucket_id, &mutation.exact_path)
+        .unwrap();
+    assert_eq!(
+        replica
+            .export_object_path_record(
+                mutation.tenant_id,
+                mutation.bucket_id,
+                &mutation.exact_path,
+            )
+            .unwrap(),
+        committed
+    );
+}
+
+#[tokio::test]
+async fn receipt_replay_fails_closed_when_current_lineage_is_more_than_one_step_ahead() {
+    let (_temporary, coordinator, replica) = two_stores(16).await;
+    let first = coordinator
+        .coordinate_object_mutation(
+            BatchOperation::Put(put("bounded-lineage", b"one", Precondition::Absent, "one")),
+            distributed_context(20),
+        )
+        .await
+        .unwrap()
+        .mutation
+        .unwrap();
+    replica.apply_object_mutation_replica(&first).await.unwrap();
+    let second = coordinator
+        .coordinate_object_mutation(
+            BatchOperation::Put(put(
+                "bounded-lineage",
+                b"two",
+                Precondition::Version(first.version.id),
+                "two",
+            )),
+            distributed_context(20),
+        )
+        .await
+        .unwrap()
+        .mutation
+        .unwrap();
+    replica
+        .apply_object_mutation_replica(&second)
+        .await
+        .unwrap();
+    let third = coordinator
+        .coordinate_object_mutation(
+            BatchOperation::Put(put(
+                "bounded-lineage",
+                b"three",
+                Precondition::Version(second.version.id),
+                "three",
+            )),
+            distributed_context(20),
+        )
+        .await
+        .unwrap()
+        .mutation
+        .unwrap();
+    replica.apply_object_mutation_replica(&third).await.unwrap();
+
+    assert_eq!(
+        replica
+            .apply_object_mutation_replica(&first)
+            .await
+            .unwrap_err(),
+        MutationError::ObjectMutationLineageGap {
+            current: Some(third.version.id),
+            predecessor: first.stamp.predecessor_version,
+        }
+    );
+}
+
+#[tokio::test]
 async fn replica_rejects_lineage_gaps_and_contradictory_siblings() {
     let (_temporary, coordinator, replica) = two_stores(16).await;
     let first = coordinator

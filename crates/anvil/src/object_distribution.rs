@@ -5,6 +5,8 @@
 //! coordinates one exact path and the first three HRW owners hold complete
 //! logical replicas. Ownership itself is never persisted here or in Raft.
 
+mod quorum_read;
+
 use anvil_consensus::{DecisionRaft, NodeId};
 use anvil_store::{
     BatchOperation, BlobRef, CoordinatedObjectMutation, Durability, ErasureProfile, MutationError,
@@ -109,12 +111,9 @@ impl ObjectDistribution {
             .await
             .map_err(payload_status)?;
 
-        let context = self.serving.mutation_context()?;
-        if context.active_placement_log_id != placement.fence() {
-            return Err(Status::unavailable(
-                "serving fence changed while preparing the distributed payload",
-            ));
-        }
+        let context = self
+            .reconcile_before_mutation(&request.key, placement.fence())
+            .await?;
         let durability = request.durability;
         let coordinated = self
             .store
@@ -152,12 +151,9 @@ impl ObjectDistribution {
             )));
         }
 
-        let context = self.serving.mutation_context()?;
-        if context.active_placement_log_id != placement.fence() {
-            return Err(Status::unavailable(
-                "serving fence changed while selecting the object coordinator",
-            ));
-        }
+        let context = self
+            .reconcile_before_mutation(key, placement.fence())
+            .await?;
         let coordinated = self
             .store
             .coordinate_object_mutation(operation, context)
@@ -292,8 +288,15 @@ impl ObjectDistribution {
             // The local command receipt proved an exact idempotent replay.
             return Ok(());
         };
-        let mut durable = vec![self.local_node];
+        let mut durable = Vec::with_capacity(group.replicas().len());
         let mut failures = Vec::new();
+        match self.store.apply_object_mutation_replica(mutation).await {
+            Ok(applied) if applied.version == coordinated.receipt.version => {
+                durable.push(self.local_node);
+            }
+            Ok(_) => failures.push("local replica returned another version".into()),
+            Err(error) => failures.push(format!("local replica: {error}")),
+        }
         for node in group
             .replicas()
             .iter()

@@ -380,7 +380,7 @@ impl Store {
         let _commit_guard = self.commit_lock.lock().await;
         let now = now_unix_millis()?;
 
-        if let Some(existing) =
+        let retained_identical_receipt = if let Some(existing) =
             self.read_json::<StoredReceipt>(CF_RECEIPTS, &primary_receipt_key)?
             && existing.expires_at_unix_millis > now
         {
@@ -392,11 +392,10 @@ impl Store {
             {
                 return Err(MutationError::ObjectMutationConflict);
             }
-            return Ok(ReplicaObjectMutationApplied {
-                version: mutation.version.id,
-                replayed: true,
-            });
-        }
+            true
+        } else {
+            false
+        };
 
         let current = self.head_by_storage_key(&encoded_head_key)?;
         let mut already_applied = false;
@@ -420,6 +419,12 @@ impl Store {
                     && head.mutation_stamp == Some(mutation.stamp)
                     && descriptor == mutation.version
                 {
+                    if retained_identical_receipt {
+                        return Ok(ReplicaObjectMutationApplied {
+                            version: mutation.version.id,
+                            replayed: true,
+                        });
+                    }
                     already_applied = true;
                 } else if head.mutation_stamp.is_some_and(|stamp| {
                     stamp.predecessor_version == mutation.stamp.predecessor_version
@@ -432,6 +437,17 @@ impl Store {
                 }
             }
             Some(head) if Some(head.version) == mutation.stamp.predecessor_version => {}
+            Some(head)
+                if retained_identical_receipt
+                    && head.mutation_stamp.is_some_and(|stamp| {
+                        stamp.predecessor_version == Some(mutation.version.id)
+                    }) =>
+            {
+                return Ok(ReplicaObjectMutationApplied {
+                    version: mutation.version.id,
+                    replayed: true,
+                });
+            }
             Some(head)
                 if head.mutation_stamp.is_some_and(|stamp| {
                     stamp.predecessor_version == mutation.stamp.predecessor_version
@@ -459,7 +475,8 @@ impl Store {
         let mut receipt_status = self.mutation_receipt_status()?;
         let initial_receipt_status = receipt_status;
         let pruned = self.stage_expired_mutation_receipts(&mut batch, now, &mut receipt_status)?;
-        if !pruned.contains(&primary_receipt_key)
+        if !retained_identical_receipt
+            && !pruned.contains(&primary_receipt_key)
             && self
                 .read_json::<StoredReceipt>(CF_RECEIPTS, &primary_receipt_key)?
                 .is_some()
@@ -495,7 +512,7 @@ impl Store {
                 .map_err(storage_error)?,
             );
         }
-        if mutation.receipt_expires_at_unix_millis > now {
+        if !retained_identical_receipt && mutation.receipt_expires_at_unix_millis > now {
             self.stage_stored_mutation_receipt(
                 &mut batch,
                 primary_receipt_key,

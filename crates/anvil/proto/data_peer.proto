@@ -22,6 +22,37 @@ message ObjectMutationApplied {
   bool replayed = 3;
 }
 
+message ObjectPathSnapshotRequest {
+  PeerContext peer = 1;
+  uint64 tenant_id = 2;
+  uint64 bucket_id = 3;
+  string exact_path = 4;
+}
+
+// `snapshot_json` is the typed JSON encoding of
+// `Option<anvil_store::ObjectPathSnapshot>`; JSON null means the path is
+// absent. It never contains raw RocksDB keys or values.
+message ObjectPathSnapshotResponse {
+  uint32 schema_version = 1;
+  bytes snapshot_json = 2;
+}
+
+message RepairObjectPathSnapshotRequest {
+  PeerContext peer = 1;
+  uint64 tenant_id = 2;
+  uint64 bucket_id = 3;
+  string exact_path = 4;
+  bytes expected_snapshot_json = 5;
+  bytes selected_snapshot_json = 6;
+}
+
+message ObjectPathSnapshotApplied {
+  uint32 schema_version = 1;
+  bool present = 2;
+  uint64 version = 3;
+  bool replayed = 4;
+}
+
 message AuthzRealmMutationApplied {
   uint32 schema_version = 1;
   uint64 revision = 2;
@@ -136,6 +167,8 @@ message ShardStored {
 
 service DataPeer {
   rpc ApplyObjectMutation(TypedMutationRequest) returns (ObjectMutationApplied);
+  rpc ReadObjectPathSnapshot(ObjectPathSnapshotRequest) returns (ObjectPathSnapshotResponse);
+  rpc RepairObjectPathSnapshot(RepairObjectPathSnapshotRequest) returns (ObjectPathSnapshotApplied);
   rpc ApplyAuthzRealmMutation(TypedMutationRequest) returns (AuthzRealmMutationApplied);
   rpc ApplyReferenceDeltas(TypedMutationRequest) returns (ReferenceDeltaApplied);
   rpc GetReferenceDeltaStatus(ReferenceDeltaStatusRequest) returns (ReferenceDeltaStatus);

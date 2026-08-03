@@ -204,6 +204,8 @@ pub enum ObjectSnapshotError {
     InvalidRecord(String),
     #[error("object-state snapshot conflicts with an existing local value")]
     SnapshotConflict,
+    #[error("object-state repair observation is no longer current")]
+    RepairPreconditionFailed,
     #[error("object-state snapshot storage failed: {0}")]
     Storage(String),
 }
@@ -393,6 +395,88 @@ impl Store {
             ObjectRecordExport::ExactPath(record) => self.install_path_snapshot(record),
             ObjectRecordExport::Receipt(mutation) => self.install_receipt_snapshot(mutation),
         }
+    }
+
+    /// Replaces one exact-path replica with a state already selected by an
+    /// external read quorum. This is the read-repair boundary: it accepts a
+    /// missing state as well as an older, newer, or divergent observed state
+    /// and installs the complete selected head and retained-version set in one
+    /// synchronous RocksDB batch. The observed state is an exact compare
+    /// condition so a delayed repair cannot roll back a concurrent commit.
+    ///
+    /// Quorum selection and serving-fence validation deliberately remain in
+    /// the cluster layer. Repair emits no source-journal entry and applies no
+    /// content-reference effect.
+    pub async fn repair_object_path_snapshot(
+        &self,
+        tenant_id: u64,
+        bucket_id: u64,
+        exact_path: &str,
+        expected: Option<&ObjectPathSnapshot>,
+        selected: Option<&ObjectPathSnapshot>,
+    ) -> Result<ObjectSnapshotApplied, ObjectSnapshotError> {
+        require_nonzero(tenant_id, "tenant ID")?;
+        require_nonzero(bucket_id, "bucket ID")?;
+        validate_exact_path(exact_path)?;
+        for snapshot in [expected, selected].into_iter().flatten() {
+            validate_snapshot_request(snapshot, tenant_id, bucket_id, exact_path)?;
+        }
+
+        let _guard = self.commit_lock.lock().await;
+        let identity = stable_identity(tenant_id, bucket_id);
+        let head_key = identity.head_key(exact_path);
+        let current = self.current_path_snapshot(&head_key)?;
+        if current.as_ref() != expected {
+            return Err(ObjectSnapshotError::RepairPreconditionFailed);
+        }
+        if current.as_ref() == selected {
+            return Ok(ObjectSnapshotApplied {
+                version: selected.map(|snapshot| snapshot.head.version),
+                replayed: true,
+                retained: selected.is_some(),
+            });
+        }
+
+        let versions = self.cf(CF_VERSIONS).map_err(object_storage)?;
+        let version_prefix = version_prefix_for_head(&head_key);
+        let mut batch = WriteBatch::default();
+        batch.delete_cf(self.cf(CF_HEADS).map_err(object_storage)?, &head_key);
+        for item in self.db.iterator_cf(
+            versions,
+            IteratorMode::From(&version_prefix, Direction::Forward),
+        ) {
+            let (key, _) = item.map_err(object_storage)?;
+            if !key.starts_with(&version_prefix) {
+                break;
+            }
+            batch.delete_cf(versions, key);
+        }
+
+        if let Some(selected) = selected {
+            for version in &selected.versions {
+                batch.put_cf(
+                    versions,
+                    exact_version_key(&head_key, version.id),
+                    serde_json::to_vec(version).map_err(object_storage)?,
+                );
+            }
+            batch.put_cf(
+                self.cf(CF_HEADS).map_err(object_storage)?,
+                &head_key,
+                serde_json::to_vec(&selected.head).map_err(object_storage)?,
+            );
+            self.stage_object_high_watermark(&mut batch, selected.head.version)?;
+        }
+
+        self.write_object_snapshot_batch(batch)?;
+        if let Some(selected) = selected {
+            self.clock.observe(selected.head.version);
+        }
+        Ok(ObjectSnapshotApplied {
+            version: selected.map(|snapshot| snapshot.head.version),
+            replayed: false,
+            retained: selected.is_some(),
+        })
     }
 
     fn install_path_snapshot(
@@ -728,6 +812,24 @@ fn validate_exact_path(path: &str) -> Result<(), ObjectSnapshotError> {
     ObjectKey::new("t", "b", path)
         .map(|_| ())
         .map_err(|error| invalid_snapshot(error.to_string()))
+}
+
+fn validate_snapshot_request(
+    snapshot: &ObjectPathSnapshot,
+    tenant_id: u64,
+    bucket_id: u64,
+    exact_path: &str,
+) -> Result<(), ObjectSnapshotError> {
+    snapshot.validate()?;
+    if snapshot.tenant_id != tenant_id
+        || snapshot.bucket_id != bucket_id
+        || snapshot.exact_path != exact_path
+    {
+        return Err(invalid_snapshot(
+            "snapshot does not match the requested exact path",
+        ));
+    }
+    Ok(())
 }
 
 fn require_nonzero(value: u64, label: &str) -> Result<(), ObjectSnapshotError> {
