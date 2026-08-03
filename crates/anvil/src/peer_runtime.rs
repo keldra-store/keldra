@@ -29,6 +29,7 @@ use crate::join_peer::{
     RejectIncompleteHandoff,
 };
 use crate::node_identity::{self, LocalNodeIdentity};
+use crate::payload_distribution::PayloadPeerService;
 
 const GENESIS_STORAGE_WEIGHT_MILLIONTHS: u32 = 1_000_000;
 const PEER_PROTOCOL_VERSION: u16 = 1;
@@ -458,6 +459,16 @@ impl PeerRuntime {
                 }
             });
         let service = TonicRaftPeerService::new(decisions.clone(), self.pins.clone()).into_server();
+        let payload_service = PayloadPeerService::new(
+            self.node_id,
+            store.clone(),
+            self.data_transport.clone(),
+            erasure_profile,
+            decisions.clone(),
+            self.pins.clone(),
+            max_blob_bytes,
+        )
+        .into_server();
         let join_service =
             JoinPeerService::new(decisions, self.node_id, self.pins.clone(), activation_gate)
                 .into_server();
@@ -474,6 +485,7 @@ impl PeerRuntime {
             Server::builder()
                 .add_service(service)
                 .add_service(data_service)
+                .add_service(payload_service)
                 .add_service(join_service)
                 .serve_with_incoming_shutdown(incoming, async move {
                     let _ = stopped.await;
