@@ -10,6 +10,7 @@ use anvil_consensus::{
     ClusterId, DecisionRaft, NodeId, NodeState, PeerNode, SERVING_LEASE_RENEW_INTERVAL,
     ServingLeaseState, TonicPeerTransport,
 };
+use anvil_store::{ObjectMutationContext, PlacementLogId};
 use anyhow::{Context, Result, bail};
 use tonic::{Request, Status};
 
@@ -47,18 +48,44 @@ impl ServingAuthority {
     }
 
     pub(crate) fn has_valid_lease(&self) -> bool {
+        self.mutation_context().is_ok()
+    }
+
+    /// Capture the exact placement and leader term authorizing a mutable
+    /// coordinator operation. Callers carry this immutable value through the
+    /// typed mutation; a later renewal cannot silently change its fence.
+    pub(crate) fn mutation_context(&self) -> Result<ObjectMutationContext, Status> {
         let Ok(applied) = self.decisions.state() else {
-            return false;
+            return Err(Status::unavailable(
+                "the applied cluster state is unavailable",
+            ));
         };
         if applied.cluster_id() != Some(self.cluster_id) {
-            return false;
+            return Err(Status::unavailable(
+                "the applied cluster identity does not match the serving authority",
+            ));
         }
         let Some(placement) = applied.cluster_control().active_placement_log_id() else {
-            return false;
+            return Err(Status::unavailable(
+                "the active placement fence is unavailable",
+            ));
         };
-        self.state.write().is_ok_and(|mut state| {
+        let lease = {
+            let mut state = self
+                .state
+                .write()
+                .map_err(|_| Status::internal("serving-fence state lock is poisoned"))?;
             state.set_active_placement(placement);
-            state.has_valid_lease()
+            state.valid_lease().ok_or_else(|| {
+                Status::unavailable("this node does not hold a current serving fence")
+            })?
+        };
+        Ok(ObjectMutationContext {
+            active_placement_log_id: PlacementLogId {
+                term: placement.leader_id.term,
+                index: placement.index,
+            },
+            serving_fence_term: lease.raft_term(),
         })
     }
 }
@@ -256,6 +283,15 @@ mod tests {
         })
         .await
         .unwrap();
+        raft.apply_fixed_voters_for_transition(begun.log_index)
+            .await
+            .unwrap();
+        raft.submit(Command::CompleteMembershipTransition {
+            format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+            started_log_index: begun.log_index,
+        })
+        .await
+        .unwrap();
         let first = raft
             .state()
             .unwrap()
@@ -284,6 +320,16 @@ mod tests {
             .unwrap();
         drop(state);
         assert!(authority.require(Request::new(())).is_ok());
+        assert_eq!(
+            authority.mutation_context().unwrap(),
+            ObjectMutationContext {
+                active_placement_log_id: PlacementLogId {
+                    term: first.leader_id.term,
+                    index: first.index,
+                },
+                serving_fence_term: 4,
+            }
+        );
 
         let begun = raft
             .submit(Command::BeginReweightNode {

@@ -4,6 +4,7 @@ mod authorization;
 mod authz_api;
 mod authz_service;
 mod bootstrap;
+mod cluster_placement;
 mod cluster_startup;
 mod credential_service;
 mod data_peer;
