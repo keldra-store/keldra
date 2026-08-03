@@ -27,6 +27,17 @@ ordered reference startup checks complete. Normal process termination stops
 the public listener before the peer runtime and flushes the local store; it
 does not remove the node from committed membership.
 
+## Transient reference-delivery cursor skew in 0.5.1
+
+Under concurrent cluster activity, ordered reference delivery can transiently
+observe a destination cursor one position beyond the source-tail snapshot and
+pause that source until a later retry. Anvil fails closed while this condition
+exists: blob garbage collection remains disabled and source-journal entries
+remain retained, so acknowledged object data is not collected prematurely. A
+persistent condition can delay reference-count convergence and eventually
+apply bounded-journal write backpressure; it does not weaken `LOCAL` or
+`REPLICATED` acknowledgement guarantees.
+
 ## Tenant schema catalogue handoff in 0.5.1
 
 Node admission transfers each tenant's complete Zanzibar schema catalogue as
