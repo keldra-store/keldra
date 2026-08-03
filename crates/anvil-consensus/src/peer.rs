@@ -47,6 +47,9 @@ pub enum PeerRpcKind {
     InstallSnapshot,
     ServingLease,
     DataPlane,
+    /// Admission and catch-up control used only by the typed JoinPeer API.
+    JoinControl,
+    /// Leader-orchestrated typed storage transfer between ACTIVE peers.
     StateTransfer,
 }
 
@@ -388,9 +391,12 @@ impl DecisionRaft {
                     decode_peer(&rpc.payload)?;
                 encode_peer(&self.raft.install_snapshot(request).await)
             }
-            PeerRpcKind::ServingLease | PeerRpcKind::DataPlane | PeerRpcKind::StateTransfer => Err(
-                PeerRpcError::Codec("this RPC class uses a typed peer handler".into()),
-            ),
+            PeerRpcKind::ServingLease
+            | PeerRpcKind::DataPlane
+            | PeerRpcKind::JoinControl
+            | PeerRpcKind::StateTransfer => Err(PeerRpcError::Codec(
+                "this RPC class uses a typed peer handler".into(),
+            )),
         }
     }
 }
