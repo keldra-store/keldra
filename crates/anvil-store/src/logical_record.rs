@@ -14,11 +14,12 @@ use crate::bootstrap::{
     validate_stored_bucket, validate_stored_credential_verifier, validate_stored_tenant,
 };
 use crate::key::{
-    BucketId, BucketIdentity, TenantId, bucket_name_key, decode_identity_value, tenant_name_key,
+    BucketId, BucketIdentity, STORAGE_KEY_FORMAT_VERSION, TENANT_NAME_TYPE, TenantId,
+    bucket_name_key, decode_identity_value, tenant_name_key,
 };
 use crate::store::{
     CF_AUTHZ_SCHEMAS, CF_BUCKET_OPTIONS, CF_CREDENTIALS, CF_METADATA, CF_NAMES, CF_POLICIES,
-    VERSION_HIGH_WATERMARK_KEY, decode_object_versioning,
+    VERSION_HIGH_WATERMARK_KEY, decode_object_versioning, encode_object_versioning,
 };
 use crate::{
     AuthzRevision, AuthzStoreLimits, BucketPolicy, MutationError, ObjectKey, ObjectVersioning,
@@ -41,7 +42,7 @@ pub enum LogicalRecordPredecessor {
     VersionId(VersionId),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LogicalRecordId {
     TenantNameClaim {
         storage_tenant: StorageTenantId,
@@ -198,7 +199,7 @@ pub struct LogicalRecordMutation {
     pub typed_value: LogicalRecordValue,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LogicalRecordCandidate {
     Baseline {
         typed_value: LogicalRecordValue,
@@ -236,6 +237,14 @@ pub enum LogicalRecordError {
     Stale,
     #[error("logical record mutation or stored envelope failed integrity validation")]
     Tampered,
+    #[error("logical record export cursor is invalid")]
+    InvalidCursor,
+    #[error("logical record export limits are invalid: {0}")]
+    InvalidExportLimit(String),
+    #[error("one logical record requires {required_bytes} bytes, exceeding the page limit")]
+    ExportRecordTooLarge { required_bytes: u64 },
+    #[error("logical record snapshot conflicts with an existing local value")]
+    SnapshotConflict,
     #[error("logical record storage failed: {0}")]
     Storage(String),
 }
@@ -590,30 +599,11 @@ impl Store {
             _ => {}
         }
 
-        let encoded = canonical_bytes(mutation)?;
-        let mut batch = WriteBatch::default();
-        batch.put_cf(self.logical_record_cf(location.cf)?, location.key, encoded);
-        let high_watermark = self
-            .db
-            .get_cf(
-                self.logical_record_cf(CF_METADATA)?,
-                VERSION_HIGH_WATERMARK_KEY,
-            )
-            .map_err(storage)?
-            .map(|bytes| serde_json::from_slice::<VersionId>(&bytes).map_err(storage))
-            .transpose()?
-            .map_or(mutation.record_version, |current| {
-                current.max(mutation.record_version)
-            });
-        batch.put_cf(
-            self.logical_record_cf(CF_METADATA)?,
-            VERSION_HIGH_WATERMARK_KEY,
-            canonical_bytes(&high_watermark)?,
-        );
-        let mut options = WriteOptions::default();
-        options.set_sync(self.sync_writes);
-        self.db.write_opt(batch, &options).map_err(storage)?;
-        self.clock.observe(mutation.record_version);
+        self.write_logical_record(
+            &location,
+            canonical_bytes(mutation)?,
+            Some(mutation.record_version),
+        )?;
         Ok(LogicalRecordApplied {
             record_version: mutation.record_version,
             replayed: false,
@@ -627,6 +617,40 @@ impl Store {
         self.db
             .cf_handle(name)
             .ok_or_else(|| storage(format!("missing column family {name}")))
+    }
+
+    fn write_logical_record(
+        &self,
+        location: &RecordLocation,
+        encoded: Vec<u8>,
+        record_version: Option<VersionId>,
+    ) -> Result<(), LogicalRecordError> {
+        let mut batch = WriteBatch::default();
+        batch.put_cf(self.logical_record_cf(location.cf)?, &location.key, encoded);
+        if let Some(record_version) = record_version {
+            let high_watermark = self
+                .db
+                .get_cf(
+                    self.logical_record_cf(CF_METADATA)?,
+                    VERSION_HIGH_WATERMARK_KEY,
+                )
+                .map_err(storage)?
+                .map(|bytes| serde_json::from_slice::<VersionId>(&bytes).map_err(storage))
+                .transpose()?
+                .map_or(record_version, |current| current.max(record_version));
+            batch.put_cf(
+                self.logical_record_cf(CF_METADATA)?,
+                VERSION_HIGH_WATERMARK_KEY,
+                canonical_bytes(&high_watermark)?,
+            );
+        }
+        let mut options = WriteOptions::default();
+        options.set_sync(self.sync_writes);
+        self.db.write_opt(batch, &options).map_err(storage)?;
+        if let Some(record_version) = record_version {
+            self.clock.observe(record_version);
+        }
+        Ok(())
     }
 }
 
@@ -644,10 +668,7 @@ fn decode_candidate(
         return Ok(LogicalRecordCandidate::Versioned(mutation));
     }
     let typed_value = decode_baseline(id, bytes)?;
-    let baseline_hash = BaselineHash(blake3::derive_key(
-        BASELINE_HASH_DOMAIN,
-        &canonical_bytes(&typed_value)?,
-    ));
+    let baseline_hash = computed_baseline_hash(&typed_value)?;
     Ok(LogicalRecordCandidate::Baseline {
         typed_value,
         baseline_hash,
@@ -849,6 +870,15 @@ fn canonical_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, LogicalRecordErro
     serde_json::to_vec(value).map_err(storage)
 }
 
+fn computed_baseline_hash(
+    typed_value: &LogicalRecordValue,
+) -> Result<BaselineHash, LogicalRecordError> {
+    Ok(BaselineHash(blake3::derive_key(
+        BASELINE_HASH_DOMAIN,
+        &canonical_bytes(typed_value)?,
+    )))
+}
+
 fn decode_json<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, LogicalRecordError> {
     serde_json::from_slice(bytes).map_err(storage)
 }
@@ -964,6 +994,13 @@ impl From<MutationError> for LogicalRecordError {
         storage(error)
     }
 }
+
+mod export;
+pub use export::{
+    LogicalRecordCursor, LogicalRecordExport, LogicalRecordExportPage,
+    LogicalRecordSnapshotApplied, MAX_LOGICAL_RECORD_EXPORT_BYTES,
+    MAX_LOGICAL_RECORD_EXPORT_RECORDS,
+};
 
 #[cfg(test)]
 mod tests;

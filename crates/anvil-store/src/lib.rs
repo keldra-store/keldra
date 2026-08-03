@@ -45,9 +45,11 @@ pub use erasure::{
 pub use key::ObjectKey;
 pub use logical_record::{
     BaselineHash, LOGICAL_RECORD_FORMAT, LogicalApplicationRecord, LogicalBucketRecord,
-    LogicalCredentialRecord, LogicalRecordApplied, LogicalRecordCandidate, LogicalRecordError,
-    LogicalRecordId, LogicalRecordMutation, LogicalRecordMutationContext, LogicalRecordPredecessor,
-    LogicalRecordValue, LogicalTenantRecord, LogicalTenantSchema,
+    LogicalCredentialRecord, LogicalRecordApplied, LogicalRecordCandidate, LogicalRecordCursor,
+    LogicalRecordError, LogicalRecordExport, LogicalRecordExportPage, LogicalRecordId,
+    LogicalRecordMutation, LogicalRecordMutationContext, LogicalRecordPredecessor,
+    LogicalRecordSnapshotApplied, LogicalRecordValue, LogicalTenantRecord, LogicalTenantSchema,
+    MAX_LOGICAL_RECORD_EXPORT_BYTES, MAX_LOGICAL_RECORD_EXPORT_RECORDS,
 };
 pub use model::{
     BatchOperation, BatchOutcome, BucketPolicy, CoordinatedObjectMutation, DeleteRequest,
