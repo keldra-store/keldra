@@ -315,6 +315,7 @@ pub(crate) struct ReferenceRuntimeHandle {
     serving: ServingAuthority,
     destinations: StoreReferenceDestinations,
     reference_safe: Arc<AtomicBool>,
+    profile: ErasureProfile,
 }
 
 impl ReferenceRuntime {
@@ -436,6 +437,7 @@ impl ReferenceRuntime {
             serving,
             destinations,
             reference_safe,
+            profile,
         };
         (
             Self {
@@ -468,16 +470,42 @@ impl Drop for ReferenceRuntime {
 }
 
 impl ReferenceRuntimeHandle {
-    /// Waits without a data-size timeout until this node has reconstructed the
-    /// complete reference state needed to make local garbage collection safe.
-    /// Dropping this future cancels the wait without changing durable state.
-    pub(crate) async fn wait_until_safe(&self) {
+    /// Waits without a data-size timeout for exact reference safety, or for a
+    /// freshly fenced placement that is structurally too small to converge.
+    /// `true` permits GC; `false` permits only degraded LOCAL service. Dropping
+    /// this future cancels the wait without changing durable state.
+    pub(crate) async fn wait_until_startup_ready(&self) -> bool {
         loop {
             if self.gc_safe().await {
-                return;
+                return true;
+            }
+            if self.can_serve_under_redundant() {
+                return false;
             }
             tokio::time::sleep(READINESS_POLL_INTERVAL).await;
         }
+    }
+
+    /// A cluster smaller than the fixed erasure geometry cannot create every
+    /// distinct final shard. LOCAL requests are still allowed to rely on the
+    /// coordinator's complete source, but GC remains disabled until enough
+    /// nodes join and ordered reference delivery catches up.
+    fn can_serve_under_redundant(&self) -> bool {
+        if !self.serving.has_valid_lease() {
+            return false;
+        }
+        let Ok(state) = self.decisions.state() else {
+            return false;
+        };
+        if state.cluster_control().transition().is_some() {
+            return false;
+        }
+        let Ok(placement) = ClusterPlacement::from_applied(&state) else {
+            return false;
+        };
+        let active = placement.active_node_ids();
+        active.contains(&self.local_node)
+            && structurally_under_redundant(active.len(), self.profile)
     }
 
     /// GC is safe only after this destination has consumed the complete tail
@@ -540,6 +568,10 @@ fn source_is_fully_applied(expected_node: NodeId, status: WatchJournalStatus, cu
         && status.retention_floor <= status.tail
         && status.retained_entries == status.tail - status.retention_floor
         && cursor == status.tail
+}
+
+fn structurally_under_redundant(active_nodes: usize, profile: ErasureProfile) -> bool {
+    active_nodes < usize::from(profile.total_shards())
 }
 
 #[cfg(test)]
