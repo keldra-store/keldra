@@ -84,6 +84,7 @@ impl DataPeerTransport {
         &self,
         target: NodeId,
         address: &str,
+        placement_fence: anvil_store::PlacementLogId,
         tenant_id: u64,
         bucket_id: u64,
         exact_path: &str,
@@ -101,6 +102,8 @@ impl DataPeerTransport {
                 exact_path: exact_path.to_owned(),
                 expected_snapshot_json: encode_object_snapshot(&expected)?,
                 selected_snapshot_json: encode_object_snapshot(&selected)?,
+                placement_fence_term: placement_fence.term,
+                placement_fence_index: placement_fence.index,
             })
             .await?
             .into_inner();

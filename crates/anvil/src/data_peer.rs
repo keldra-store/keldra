@@ -17,11 +17,11 @@ use anvil_consensus::{
 };
 use anvil_store::{
     AuthzRealmMutation, BlobReader, BlobRef, CompleteCopySealOutcome, ErasureCodec, ErasureProfile,
-    FRAGMENT_FORMAT_VERSION, LocalChange, MAX_LOCAL_INVALIDATION_SCAN_RECORDS,
-    MAX_OBJECT_RECORD_EXPORT_BYTES, MutationError, ObjectKey, ObjectMutation, ObjectPathSnapshot,
-    ObjectSnapshotApplied, ObjectSnapshotError, PayloadStoreError, ReferenceDeltaApplied,
-    ReferenceDeltaBatch, ReplicaAuthzRealmMutationApplied, ReplicaObjectMutationApplied,
-    ShardIdentity, ShardSealOutcome, ShardStoreError, SourceId, Store, WatchJournalStatus,
+    LocalChange, MAX_LOCAL_INVALIDATION_SCAN_RECORDS, MAX_OBJECT_RECORD_EXPORT_BYTES,
+    MutationError, ObjectKey, ObjectMutation, ObjectPathSnapshot, ObjectSnapshotApplied,
+    ObjectSnapshotError, PayloadStoreError, ReferenceDeltaApplied, ReferenceDeltaBatch,
+    ReplicaAuthzRealmMutationApplied, ReplicaObjectMutationApplied, ShardIdentity,
+    ShardSealOutcome, ShardStoreError, SourceId, Store, WatchJournalStatus,
 };
 use hyper_util::rt::TokioIo;
 use tokio::io::AsyncWriteExt;
@@ -34,19 +34,26 @@ use tonic::{Request, Response, Status, Streaming};
 mod errors;
 mod handoff;
 mod handoff_scope;
+mod mutation_admission;
 mod object_snapshot;
 mod timeout;
 mod transport;
 mod typed_json;
+mod wire_value;
 
 use errors::{map_mutation_error, map_payload_error, map_shard_error};
 use handoff_scope::{HandoffAuthority, HandoffTarget};
+use mutation_admission::MutationAdmission;
 use object_snapshot::{
     encode_object_snapshot, map_object_snapshot_error, require_object_snapshot_bound,
 };
 use timeout::effective_timeout;
 pub(crate) use transport::DataPeerTransport;
 use typed_json::{decode_typed, encode_page, encode_typed, require_typed_bound};
+use wire_value::{
+    content_end, content_frame, parse_blob, parse_cluster_id, parse_shard, parse_small_blob,
+    require_response_schema, wire_blob, wire_shard,
+};
 
 pub(crate) mod wire {
     tonic::include_proto!("anvil.data_peer.v1");
@@ -64,6 +71,7 @@ pub(crate) struct DataPeerService {
     pins: Arc<dyn CommittedPeerPinProvider>,
     codec: Arc<ErasureCodec>,
     handoff: HandoffAuthority,
+    mutation_admission: MutationAdmission,
     maximum_unary_time: Duration,
     max_blob_bytes: u64,
 }
@@ -87,7 +95,8 @@ impl DataPeerService {
         Self::validate_and_build(
             store,
             pins,
-            HandoffAuthority::raft(decisions, local_node),
+            HandoffAuthority::raft(decisions.clone(), local_node),
+            MutationAdmission::raft(decisions, local_node),
             profile,
             maximum_unary_time,
             max_blob_bytes,
@@ -98,6 +107,9 @@ impl DataPeerService {
     fn new_test(
         store: Store,
         pins: Arc<dyn CommittedPeerPinProvider>,
+        cluster_id: ClusterId,
+        local_node: NodeId,
+        active_nodes: impl IntoIterator<Item = NodeId>,
         profile: ErasureProfile,
         maximum_unary_time: Duration,
         max_blob_bytes: u64,
@@ -106,6 +118,7 @@ impl DataPeerService {
             store,
             pins,
             HandoffAuthority::reject(),
+            MutationAdmission::fixed(cluster_id, local_node, active_nodes),
             profile,
             maximum_unary_time,
             max_blob_bytes,
@@ -116,6 +129,7 @@ impl DataPeerService {
         store: Store,
         pins: Arc<dyn CommittedPeerPinProvider>,
         handoff: HandoffAuthority,
+        mutation_admission: MutationAdmission,
         profile: ErasureProfile,
         maximum_unary_time: Duration,
         max_blob_bytes: u64,
@@ -137,6 +151,7 @@ impl DataPeerService {
             pins,
             codec: Arc::new(codec),
             handoff,
+            mutation_admission,
             maximum_unary_time,
             max_blob_bytes,
         })
@@ -222,17 +237,22 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
         mut request: Request<wire::TypedMutationRequest>,
     ) -> Result<Response<wire::ObjectMutationApplied>, Status> {
         let peer = request.get_ref().peer.clone();
-        self.authorize(&mut request, peer.as_ref(), PeerRpcKind::DataPlane)?;
+        let peer = self.authorize(&mut request, peer.as_ref(), PeerRpcKind::DataPlane)?;
         require_typed_bound(&request.get_ref().mutation_json)?;
         let mutation: ObjectMutation = decode_typed(&request.get_ref().mutation_json)?;
+        let placement_fence = self.mutation_admission.object_mutation(peer, &mutation)?;
         let metadata = request.metadata().clone();
         let store = self.store.clone();
+        let admission = self.mutation_admission.clone();
         let applied = self
             .bounded(&metadata, async move {
-                store
+                admission.require_fence(placement_fence)?;
+                let applied = store
                     .apply_object_mutation_replica(&mutation)
                     .await
-                    .map_err(map_mutation_error)
+                    .map_err(map_mutation_error)?;
+                admission.require_fence(placement_fence)?;
+                Ok(applied)
             })
             .await?;
         Ok(Response::new(wire::ObjectMutationApplied {
@@ -277,7 +297,17 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
         mut request: Request<wire::RepairObjectPathSnapshotRequest>,
     ) -> Result<Response<wire::ObjectPathSnapshotApplied>, Status> {
         let peer = request.get_ref().peer.clone();
-        self.authorize(&mut request, peer.as_ref(), PeerRpcKind::DataPlane)?;
+        let peer = self.authorize(&mut request, peer.as_ref(), PeerRpcKind::DataPlane)?;
+        let placement_fence = self.mutation_admission.object_repair(
+            peer,
+            request.get_ref().tenant_id,
+            request.get_ref().bucket_id,
+            &request.get_ref().exact_path,
+            anvil_store::PlacementLogId {
+                term: request.get_ref().placement_fence_term,
+                index: request.get_ref().placement_fence_index,
+            },
+        )?;
         require_object_snapshot_bound(&request.get_ref().expected_snapshot_json)?;
         require_object_snapshot_bound(&request.get_ref().selected_snapshot_json)?;
         let expected: Option<ObjectPathSnapshot> =
@@ -287,9 +317,11 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
         let metadata = request.metadata().clone();
         let request = request.into_inner();
         let store = self.store.clone();
+        let admission = self.mutation_admission.clone();
         let applied = self
             .bounded(&metadata, async move {
-                store
+                admission.require_fence(placement_fence)?;
+                let applied = store
                     .repair_object_path_snapshot(
                         request.tenant_id,
                         request.bucket_id,
@@ -298,7 +330,9 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
                         selected.as_ref(),
                     )
                     .await
-                    .map_err(map_object_snapshot_error)
+                    .map_err(map_object_snapshot_error)?;
+                admission.require_fence(placement_fence)?;
+                Ok(applied)
             })
             .await?;
         Ok(Response::new(wire::ObjectPathSnapshotApplied {
@@ -341,17 +375,24 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
         mut request: Request<wire::TypedMutationRequest>,
     ) -> Result<Response<wire::ReferenceDeltaApplied>, Status> {
         let peer = request.get_ref().peer.clone();
-        self.authorize(&mut request, peer.as_ref(), PeerRpcKind::DataPlane)?;
+        let peer = self.authorize(&mut request, peer.as_ref(), PeerRpcKind::DataPlane)?;
         require_typed_bound(&request.get_ref().mutation_json)?;
         let mutation: ReferenceDeltaBatch = decode_typed(&request.get_ref().mutation_json)?;
+        let placement_fence = self
+            .mutation_admission
+            .reference_deltas(peer, mutation.source)?;
         let metadata = request.metadata().clone();
         let store = self.store.clone();
+        let admission = self.mutation_admission.clone();
         let applied = self
             .bounded(&metadata, async move {
-                store
+                admission.require_fence(placement_fence)?;
+                let applied = store
                     .apply_reference_deltas(mutation)
                     .await
-                    .map_err(|error| Status::failed_precondition(error.to_string()))
+                    .map_err(|error| Status::failed_precondition(error.to_string()))?;
+                admission.require_fence(placement_fence)?;
+                Ok(applied)
             })
             .await?;
         Ok(Response::new(wire::ReferenceDeltaApplied {
@@ -1055,98 +1096,6 @@ fn require_large_blob(reference: &BlobRef, max_blob_bytes: u64) -> Result<(), St
     Ok(())
 }
 
-fn parse_cluster_id(encoded: &[u8]) -> Result<ClusterId, Status> {
-    let bytes = encoded
-        .try_into()
-        .map_err(|_| Status::invalid_argument("cluster id must contain exactly 16 bytes"))?;
-    Ok(ClusterId(bytes))
-}
-
-fn require_response_schema(schema_version: u32) -> Result<(), Status> {
-    if schema_version != DATA_PEER_SCHEMA_VERSION {
-        return Err(Status::failed_precondition(format!(
-            "peer returned unsupported data-peer schema {schema_version}"
-        )));
-    }
-    Ok(())
-}
-
-fn wire_blob(reference: &BlobRef) -> wire::BlobIdentity {
-    wire::BlobIdentity {
-        blake3: reference.hash.to_vec(),
-        length: reference.length,
-    }
-}
-
-#[allow(
-    dead_code,
-    reason = "used by the typed shard client when distributed payload orchestration is connected"
-)]
-fn wire_shard(context: wire::PeerContext, identity: &ShardIdentity) -> wire::ShardRequest {
-    wire::ShardRequest {
-        peer: Some(context),
-        fragment_format_version: u32::from(identity.fragment_format_version()),
-        blob: Some(wire_blob(identity.blob())),
-        ordinal: u32::from(identity.ordinal()),
-    }
-}
-
-fn parse_blob(value: Option<&wire::BlobIdentity>) -> Result<BlobRef, Status> {
-    let value = value.ok_or_else(|| Status::invalid_argument("blob identity is required"))?;
-    let hash =
-        value.blake3.as_slice().try_into().map_err(|_| {
-            Status::invalid_argument("BLAKE3 identity must contain exactly 32 bytes")
-        })?;
-    Ok(BlobRef {
-        hash,
-        length: value.length,
-    })
-}
-
-fn parse_small_blob(value: Option<&wire::BlobIdentity>) -> Result<BlobRef, Status> {
-    let reference = parse_blob(value)?;
-    if reference.length > anvil_store::SMALL_BLOB_MAX_BYTES as u64 {
-        return Err(Status::invalid_argument(
-            "content identity is not a small blob",
-        ));
-    }
-    Ok(reference)
-}
-
-fn parse_shard(value: &wire::ShardRequest) -> Result<ShardIdentity, Status> {
-    let fragment_format_version = u16::try_from(value.fragment_format_version)
-        .map_err(|_| Status::invalid_argument("fragment format does not fit u16"))?;
-    if fragment_format_version != FRAGMENT_FORMAT_VERSION {
-        return Err(Status::failed_precondition(format!(
-            "unsupported fragment format {fragment_format_version}"
-        )));
-    }
-    let ordinal = u16::try_from(value.ordinal)
-        .map_err(|_| Status::invalid_argument("shard ordinal does not fit u16"))?;
-    Ok(ShardIdentity::new(
-        parse_blob(value.blob.as_ref())?,
-        ordinal,
-    ))
-}
-
-fn content_frame(offset: u64, content: Vec<u8>) -> wire::ContentFrame {
-    wire::ContentFrame {
-        schema_version: DATA_PEER_SCHEMA_VERSION,
-        offset,
-        content,
-        end: false,
-    }
-}
-
-fn content_end(offset: u64) -> wire::ContentFrame {
-    wire::ContentFrame {
-        schema_version: DATA_PEER_SCHEMA_VERSION,
-        offset,
-        content: Vec::new(),
-        end: true,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -1259,7 +1208,10 @@ mod tests {
             .filter_map(|result| result.ok().map(Ok::<_, std::io::Error>));
         let service = DataPeerService::new_test(
             store,
-            pins,
+            pins.clone(),
+            pins.cluster_id,
+            NodeId(1),
+            [NodeId(1), NodeId(2)],
             ErasureProfile::default(),
             Duration::from_secs(30),
             16 * 1024 * 1024,
@@ -1402,6 +1354,8 @@ mod tests {
                 exact_path: String::new(),
                 expected_snapshot_json: Vec::new(),
                 selected_snapshot_json: Vec::new(),
+                placement_fence_term: 0,
+                placement_fence_index: 0,
             }),
             "RepairObjectPathSnapshot"
         );
@@ -1627,8 +1581,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status.source_id.node_id, 1);
-        let empty = ReferenceDeltaBatch {
+        let spoofed = ReferenceDeltaBatch {
             source: status.source_id,
+            after: 0,
+            through: 0,
+            deltas: Vec::new(),
+        };
+        let denied = joining
+            .apply_reference_deltas(NodeId(1), &address, &spoofed)
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), Code::PermissionDenied);
+        let client_source = SourceId {
+            node_id: 2,
+            source_epoch: [2; 32],
+        };
+        let empty = ReferenceDeltaBatch {
+            source: client_source,
             after: 0,
             through: 0,
             deltas: Vec::new(),
@@ -1640,7 +1609,7 @@ mod tests {
         assert_eq!(applied.through, 0);
         assert_eq!(
             joining
-                .reference_delta_status(NodeId(1), &address, status.source_id)
+                .reference_delta_status(NodeId(1), &address, client_source)
                 .await
                 .unwrap(),
             0
@@ -1678,6 +1647,7 @@ mod tests {
         let tenant_id = 11;
         let bucket_id = 22;
         let exact_path = "peer-snapshot";
+        let placement_fence = anvil_store::PlacementLogId { term: 1, index: 1 };
         let snapshot = Some(ObjectPathSnapshot {
             tenant_id,
             bucket_id,
@@ -1706,10 +1676,25 @@ mod tests {
                 .unwrap(),
             snapshot
         );
+        let stale = joining
+            .repair_object_path_snapshot(
+                NodeId(1),
+                &address,
+                anvil_store::PlacementLogId { term: 1, index: 0 },
+                tenant_id,
+                bucket_id,
+                exact_path,
+                snapshot.as_ref(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(stale.code(), Code::Unavailable);
         joining
             .repair_object_path_snapshot(
                 NodeId(1),
                 &address,
+                placement_fence,
                 tenant_id,
                 bucket_id,
                 exact_path,
@@ -1728,6 +1713,7 @@ mod tests {
             .repair_object_path_snapshot(
                 NodeId(1),
                 &address,
+                placement_fence,
                 tenant_id,
                 bucket_id,
                 exact_path,

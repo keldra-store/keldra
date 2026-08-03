@@ -150,7 +150,14 @@ impl ObjectDistribution {
         })?;
         self.peers
             .repair_object_path_snapshot(
-                node, &address.0, tenant_id, bucket_id, exact_path, expected, selected,
+                node,
+                &address.0,
+                placement.fence(),
+                tenant_id,
+                bucket_id,
+                exact_path,
+                expected,
+                selected,
             )
             .await?;
         Ok(())

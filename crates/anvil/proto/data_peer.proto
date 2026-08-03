@@ -52,6 +52,8 @@ message RepairObjectPathSnapshotRequest {
   string exact_path = 4;
   bytes expected_snapshot_json = 5;
   bytes selected_snapshot_json = 6;
+  uint64 placement_fence_term = 7;
+  uint64 placement_fence_index = 8;
 }
 
 message ObjectPathSnapshotApplied {
