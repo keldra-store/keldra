@@ -6,6 +6,11 @@ mod authz_api;
 mod authz_service;
 mod bootstrap;
 mod cluster_placement;
+#[allow(
+    dead_code,
+    reason = "cluster object reads are wired into the public 0.5.1 facade next"
+)]
+mod cluster_object_read;
 mod cluster_startup;
 mod credential_service;
 mod data_peer;

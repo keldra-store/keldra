@@ -6,6 +6,7 @@
 //! logical replicas. Ownership itself is never persisted here or in Raft.
 
 mod quorum_read;
+mod serving_read;
 
 pub(crate) use quorum_read::select_object_snapshot_quorum;
 
