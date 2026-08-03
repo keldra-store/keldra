@@ -252,6 +252,46 @@ async fn write_once_claims_reject_replacement_and_resolve_enveloped_ids() {
     );
 }
 
+#[tokio::test]
+async fn identical_released_write_once_baseline_can_be_stamped_once() {
+    let root = tempfile::tempdir().unwrap();
+    let store = open_store(&root, 1).await;
+    put_raw(
+        &store,
+        CF_NAMES,
+        &tenant_name_key("acme"),
+        &7_u64.to_be_bytes(),
+    );
+    let claim = LogicalRecordValue::TenantNameClaim {
+        storage_tenant: StorageTenantId::parse("acme").unwrap(),
+        tenant_id: 7,
+    };
+    assert_eq!(
+        store
+            .construct_logical_record_mutation(
+                LogicalRecordValue::TenantNameClaim {
+                    storage_tenant: StorageTenantId::parse("acme").unwrap(),
+                    tenant_id: 8,
+                },
+                context(99),
+            )
+            .unwrap_err(),
+        LogicalRecordError::Immutable
+    );
+    let mutation = store
+        .construct_logical_record_mutation(claim.clone(), context(100))
+        .unwrap();
+    assert!(matches!(
+        mutation.predecessor,
+        LogicalRecordPredecessor::BaselineHash(_)
+    ));
+    store.commit_logical_record_mutation(&mutation).unwrap();
+    assert_eq!(
+        store.logical_record_candidate(&claim.id()).unwrap(),
+        Some(LogicalRecordCandidate::Versioned(mutation))
+    );
+}
+
 #[test]
 fn credential_debug_never_displays_verifier_material() {
     let credential = LogicalCredentialRecord {

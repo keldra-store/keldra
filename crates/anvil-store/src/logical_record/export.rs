@@ -369,6 +369,61 @@ impl Store {
             replayed: false,
         })
     }
+
+    /// Replaces one exact logical record with the candidate proved by a
+    /// complete-record read quorum, or removes it when that quorum proved
+    /// absence. This is a trusted repair boundary, not an ordinary mutation:
+    /// callers must establish the exact quorum before invoking it.
+    pub fn repair_quorum_reconciled_logical_record(
+        &self,
+        id: &LogicalRecordId,
+        candidate: Option<&LogicalRecordCandidate>,
+    ) -> Result<LogicalRecordSnapshotApplied, LogicalRecordError> {
+        let location = id.location()?;
+        if let Some(candidate) = candidate {
+            LogicalRecordExport {
+                id: id.clone(),
+                candidate: candidate.clone(),
+            }
+            .validate()?;
+        }
+        let _guard = self
+            .authz_write_lock
+            .lock()
+            .map_err(|_| storage("logical-record write lock is poisoned"))?;
+        let current = self.logical_record_candidate(id)?;
+        if current.as_ref() == candidate {
+            return Ok(LogicalRecordSnapshotApplied {
+                record_version: candidate.and_then(candidate_version),
+                replayed: true,
+            });
+        }
+
+        let Some(candidate) = candidate else {
+            let mut batch = rocksdb::WriteBatch::default();
+            batch.delete_cf(self.logical_record_cf(location.cf)?, &location.key);
+            let mut options = rocksdb::WriteOptions::default();
+            options.set_sync(self.sync_writes);
+            self.db.write_opt(batch, &options).map_err(storage)?;
+            return Ok(LogicalRecordSnapshotApplied {
+                record_version: None,
+                replayed: false,
+            });
+        };
+        let (encoded, record_version) = match candidate {
+            LogicalRecordCandidate::Baseline { typed_value, .. } => {
+                (encode_baseline(typed_value)?, None)
+            }
+            LogicalRecordCandidate::Versioned(mutation) => {
+                (canonical_bytes(mutation)?, Some(mutation.record_version))
+            }
+        };
+        self.write_logical_record(&location, encoded, record_version)?;
+        Ok(LogicalRecordSnapshotApplied {
+            record_version,
+            replayed: false,
+        })
+    }
 }
 
 fn candidate_version(candidate: &LogicalRecordCandidate) -> Option<VersionId> {

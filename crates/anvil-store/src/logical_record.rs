@@ -482,6 +482,12 @@ struct RecordLocation {
 }
 
 impl Store {
+    /// Allocate the next node-scoped Snowflake version after a logical-record
+    /// coordinator has reconciled its current replica quorum.
+    pub fn allocate_logical_record_version(&self) -> Result<VersionId, LogicalRecordError> {
+        self.clock.next().map_err(storage)
+    }
+
     pub fn logical_record_candidate(
         &self,
         id: &LogicalRecordId,
@@ -507,8 +513,11 @@ impl Store {
         let id = typed_value.id();
         let predecessor = match self.logical_record_candidate(&id)? {
             None => LogicalRecordPredecessor::Absent,
-            Some(LogicalRecordCandidate::Baseline { baseline_hash, .. }) => {
-                if typed_value.is_write_once() {
+            Some(LogicalRecordCandidate::Baseline {
+                typed_value: existing,
+                baseline_hash,
+            }) => {
+                if typed_value.is_write_once() && existing != typed_value {
                     return Err(LogicalRecordError::Immutable);
                 }
                 LogicalRecordPredecessor::BaselineHash(baseline_hash)
@@ -572,8 +581,13 @@ impl Store {
                 replayed: true,
             });
         }
-        if mutation.typed_value.is_write_once() && current.is_some() {
-            return Err(LogicalRecordError::Immutable);
+        if mutation.typed_value.is_write_once() {
+            match current.as_ref() {
+                Some(LogicalRecordCandidate::Baseline { typed_value, .. })
+                    if typed_value == &mutation.typed_value => {}
+                Some(_) => return Err(LogicalRecordError::Immutable),
+                None => {}
+            }
         }
         match current.as_ref() {
             None if mutation.predecessor != LogicalRecordPredecessor::Absent => {

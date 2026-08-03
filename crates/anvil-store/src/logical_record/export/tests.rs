@@ -243,3 +243,56 @@ async fn quorum_reconciled_snapshot_installs_baselines_and_current_envelopes_onc
         LogicalRecordError::SnapshotConflict
     );
 }
+
+#[tokio::test]
+async fn trusted_quorum_repair_replaces_or_removes_exact_record_without_rewinding_clock() {
+    let winner_root = tempfile::tempdir().unwrap();
+    let winner_store = open_store(&winner_root, 1).await;
+    let winner = winner_store
+        .construct_logical_record_mutation(policy_value("winner"), context(100))
+        .unwrap();
+
+    let target_root = tempfile::tempdir().unwrap();
+    let target = open_store(&target_root, 2).await;
+    let minority = target
+        .construct_logical_record_mutation(policy_value("minority"), context(200))
+        .unwrap();
+    target.commit_logical_record_mutation(&minority).unwrap();
+
+    let id = winner.typed_value.id();
+    let candidate = LogicalRecordCandidate::Versioned(winner.clone());
+    let repaired = target
+        .repair_quorum_reconciled_logical_record(&id, Some(&candidate))
+        .unwrap();
+    assert_eq!(repaired.record_version, Some(VersionId(100)));
+    assert!(!repaired.replayed);
+    assert_eq!(
+        target.logical_record_candidate(&id).unwrap(),
+        Some(candidate.clone())
+    );
+    assert!(
+        target
+            .repair_quorum_reconciled_logical_record(&id, Some(&candidate))
+            .unwrap()
+            .replayed
+    );
+
+    assert!(
+        !target
+            .repair_quorum_reconciled_logical_record(&id, None)
+            .unwrap()
+            .replayed
+    );
+    assert_eq!(target.logical_record_candidate(&id).unwrap(), None);
+    assert!(
+        target
+            .repair_quorum_reconciled_logical_record(&id, None)
+            .unwrap()
+            .replayed
+    );
+    drop(target);
+
+    let reopened = open_store(&target_root, 2).await;
+    assert_eq!(reopened.logical_record_candidate(&id).unwrap(), None);
+    assert!(reopened.clock.next().unwrap() > VersionId(200));
+}
