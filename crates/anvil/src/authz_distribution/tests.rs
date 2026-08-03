@@ -19,6 +19,7 @@ use crate::placement::PlacementNode;
 struct StoreTransport {
     stores: BTreeMap<NodeId, Store>,
     failed_applies: RwLock<BTreeSet<NodeId>>,
+    lost_schema_apply_responses: RwLock<BTreeSet<NodeId>>,
 }
 
 impl StoreTransport {
@@ -31,6 +32,15 @@ impl StoreTransport {
         }
     }
 
+    fn set_lost_schema_apply_response(&self, node_id: NodeId, lost: bool) {
+        let mut responses = self.lost_schema_apply_responses.write().unwrap();
+        if lost {
+            responses.insert(node_id);
+        } else {
+            responses.remove(&node_id);
+        }
+    }
+
     fn store(&self, node_id: NodeId) -> Result<&Store, Status> {
         self.stores
             .get(&node_id)
@@ -40,6 +50,52 @@ impl StoreTransport {
 
 #[tonic::async_trait]
 impl AuthzReplicaTransport for StoreTransport {
+    async fn apply_schema_publication(
+        &self,
+        target: NodeId,
+        _address: &str,
+        mutation: &AuthzSchemaPublicationMutation,
+    ) -> Result<ReplicaAuthzSchemaPublicationApplied, Status> {
+        if self.failed_applies.read().unwrap().contains(&target) {
+            return Err(Status::unavailable("injected replica partition"));
+        }
+        let applied = self
+            .store(target)?
+            .authz()
+            .apply_schema_publication_replica(mutation)
+            .map_err(authz_status)?;
+        if self
+            .lost_schema_apply_responses
+            .read()
+            .unwrap()
+            .contains(&target)
+        {
+            return Err(Status::unavailable("injected lost apply response"));
+        }
+        Ok(applied)
+    }
+
+    async fn has_schema_publication(
+        &self,
+        target: NodeId,
+        _address: &str,
+        query: &AuthzSchemaReplicaQuery,
+    ) -> Result<bool, Status> {
+        if self.failed_applies.read().unwrap().contains(&target) {
+            return Err(Status::unavailable("injected replica partition"));
+        }
+        let repository = self.store(target)?.authz();
+        Ok(repository
+            .get_schema(&query.storage_tenant, &query.schema_ref)
+            .map_err(authz_status)?
+            .as_ref()
+            == Some(&query.schema)
+            && repository
+                .tenant_revision(&query.storage_tenant)
+                .map_err(authz_status)?
+                >= query.published_at_revision)
+    }
+
     async fn apply_realm_mutation(
         &self,
         target: NodeId,
@@ -185,9 +241,14 @@ fn tuple_request(operation: &str, revision: u64, document: &str) -> TupleBatchRe
 }
 
 fn replica_set(tenant_id: u64) -> TenantReplicaSet {
-    let nodes = [1_u64, 2, 3]
-        .into_iter()
-        .map(|node_id| PlacementNode::new(NodeId(node_id), NonZeroU32::new(1_000_000).unwrap()))
+    replica_set_for_nodes(tenant_id, &[NodeId(1), NodeId(2), NodeId(3)])
+}
+
+fn replica_set_for_nodes(tenant_id: u64, node_ids: &[NodeId]) -> TenantReplicaSet {
+    let nodes = node_ids
+        .iter()
+        .copied()
+        .map(|node_id| PlacementNode::new(node_id, NonZeroU32::new(1_000_000).unwrap()))
         .collect::<Vec<_>>();
     let group = MutableRecordReplicaGroup::select(
         PlacementKind::ZanzibarRealm,
@@ -208,9 +269,13 @@ fn replica_set(tenant_id: u64) -> TenantReplicaSet {
 }
 
 async fn stores() -> (tempfile::TempDir, BTreeMap<NodeId, Store>) {
+    stores_for(&[NodeId(1), NodeId(2), NodeId(3)]).await
+}
+
+async fn stores_for(node_ids: &[NodeId]) -> (tempfile::TempDir, BTreeMap<NodeId, Store>) {
     let root = tempfile::tempdir().unwrap();
     let mut stores = BTreeMap::new();
-    for node_id in [NodeId(1), NodeId(2), NodeId(3)] {
+    for node_id in node_ids.iter().copied() {
         stores.insert(
             node_id,
             Store::open(StoreOptions::new(
@@ -222,6 +287,230 @@ async fn stores() -> (tempfile::TempDir, BTreeMap<NodeId, Store>) {
         );
     }
     (root, stores)
+}
+
+fn publish_request(schema_id: &str) -> PublishSchemaRequest {
+    PublishSchemaRequest {
+        storage_tenant: tenant(),
+        schema_id: SchemaId::parse(schema_id).unwrap(),
+        schema: schema(),
+        expected_revision: Some(AuthzRevision::ZERO),
+    }
+}
+
+#[tokio::test]
+async fn schema_and_realm_mutations_use_the_same_tenant_replica_set() {
+    let nodes = [NodeId(1), NodeId(2), NodeId(3), NodeId(4), NodeId(5)];
+    let (_root, stores) = stores_for(&nodes).await;
+    let replicas = replica_set_for_nodes(42, &nodes);
+    let coordinator = replicas.group.coordinator();
+    let transport = Arc::new(StoreTransport {
+        stores: stores.clone(),
+        ..Default::default()
+    });
+    let core = AuthzDistributionCore {
+        local_node: coordinator,
+        repository: stores[&coordinator].authz(),
+        peers: transport,
+        coordinator_serial: Arc::new(tokio::sync::Mutex::new(())),
+    };
+
+    let publication = core
+        .repository
+        .coordinate_schema_publication(
+            publish_request("documents"),
+            context(coordinator, "publish-shared-group", 1),
+        )
+        .unwrap();
+    core.replicate_schema_publication(&replicas, &tenant(), &publication)
+        .await
+        .unwrap();
+    let realm = scope();
+    let binding = core
+        .repository
+        .coordinate_bind_schema_mutation(
+            BindSchemaRequest {
+                scope: realm.clone(),
+                schema_ref: publication.result.schema_ref.clone(),
+                expected_generation: Some(0),
+                expected_revision: Some(AuthzRevision(1)),
+            },
+            context(coordinator, "bind-shared-group", 2),
+        )
+        .unwrap();
+    core.replicate(&replicas, &realm, &binding).await.unwrap();
+
+    let selected = replicas
+        .group
+        .replicas()
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(selected.len(), 3);
+    for node in nodes {
+        let repository = stores[&node].authz();
+        let has_schema = repository
+            .get_schema(&tenant(), &publication.result.schema_ref)
+            .unwrap()
+            .is_some();
+        let has_realm = candidate(&repository, &realm).unwrap().is_some();
+        assert_eq!(has_schema, selected.contains(&node));
+        assert_eq!(has_realm, selected.contains(&node));
+    }
+}
+
+#[tokio::test]
+async fn schema_publication_obeys_one_one_two_two_and_two_three_quorums() {
+    let scenarios = [
+        (1_u64, 0_usize, true),
+        (2, 0, true),
+        (2, 1, false),
+        (3, 1, true),
+        (3, 2, false),
+    ];
+    for (node_count, failed_remotes, should_succeed) in scenarios {
+        let nodes = (1..=node_count).map(NodeId).collect::<Vec<_>>();
+        let (_root, stores) = stores_for(&nodes).await;
+        let replicas = replica_set_for_nodes(700 + node_count, &nodes);
+        let coordinator = replicas.group.coordinator();
+        let transport = Arc::new(StoreTransport {
+            stores: stores.clone(),
+            ..Default::default()
+        });
+        for node in replicas
+            .group
+            .replicas()
+            .iter()
+            .copied()
+            .filter(|node| *node != coordinator)
+            .take(failed_remotes)
+        {
+            transport.set_apply_failure(node, true);
+        }
+        let core = AuthzDistributionCore {
+            local_node: coordinator,
+            repository: stores[&coordinator].authz(),
+            peers: transport,
+            coordinator_serial: Arc::new(tokio::sync::Mutex::new(())),
+        };
+        let publication = core
+            .repository
+            .coordinate_schema_publication(
+                publish_request("quorum"),
+                context(coordinator, "publish-quorum", 1),
+            )
+            .unwrap();
+        assert_eq!(
+            core.replicate_schema_publication(&replicas, &tenant(), &publication)
+                .await
+                .is_ok(),
+            should_succeed,
+            "unexpected result for {node_count} nodes and {failed_remotes} failed remotes"
+        );
+    }
+}
+
+#[tokio::test]
+async fn lost_apply_response_and_digest_replay_prove_the_existing_quorum() {
+    let nodes = [NodeId(1), NodeId(2)];
+    let (_root, stores) = stores_for(&nodes).await;
+    let replicas = replica_set_for_nodes(808, &nodes);
+    let coordinator = replicas.group.coordinator();
+    let remote = replicas
+        .group
+        .replicas()
+        .iter()
+        .copied()
+        .find(|node| *node != coordinator)
+        .unwrap();
+    let transport = Arc::new(StoreTransport {
+        stores: stores.clone(),
+        ..Default::default()
+    });
+    transport.set_lost_schema_apply_response(remote, true);
+    let core = AuthzDistributionCore {
+        local_node: coordinator,
+        repository: stores[&coordinator].authz(),
+        peers: transport.clone(),
+        coordinator_serial: Arc::new(tokio::sync::Mutex::new(())),
+    };
+    let request = publish_request("lost-response");
+    let publication = core
+        .repository
+        .coordinate_schema_publication(request.clone(), context(coordinator, "publish-lost", 1))
+        .unwrap();
+    assert!(publication.mutation.is_some());
+    core.replicate_schema_publication(&replicas, &tenant(), &publication)
+        .await
+        .unwrap();
+    assert!(
+        stores[&remote]
+            .authz()
+            .apply_schema_publication_replica(publication.mutation.as_ref().unwrap())
+            .unwrap()
+            .replayed
+    );
+
+    let replay = core
+        .repository
+        .coordinate_schema_publication(request, context(coordinator, "client-retry", 2))
+        .unwrap();
+    assert!(replay.result.replayed);
+    assert!(replay.mutation.is_none());
+    core.replicate_schema_publication(&replicas, &tenant(), &replay)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn replay_without_an_existing_remote_copy_never_claims_quorum() {
+    let nodes = [NodeId(1), NodeId(2)];
+    let (_root, stores) = stores_for(&nodes).await;
+    let replicas = replica_set_for_nodes(909, &nodes);
+    let coordinator = replicas.group.coordinator();
+    let remote = replicas
+        .group
+        .replicas()
+        .iter()
+        .copied()
+        .find(|node| *node != coordinator)
+        .unwrap();
+    let transport = Arc::new(StoreTransport {
+        stores: stores.clone(),
+        ..Default::default()
+    });
+    transport.set_apply_failure(remote, true);
+    let core = AuthzDistributionCore {
+        local_node: coordinator,
+        repository: stores[&coordinator].authz(),
+        peers: transport.clone(),
+        coordinator_serial: Arc::new(tokio::sync::Mutex::new(())),
+    };
+    let request = publish_request("no-false-quorum");
+    let publication = core
+        .repository
+        .coordinate_schema_publication(
+            request.clone(),
+            context(coordinator, "publish-partitioned", 1),
+        )
+        .unwrap();
+    assert!(
+        core.replicate_schema_publication(&replicas, &tenant(), &publication)
+            .await
+            .is_err()
+    );
+
+    transport.set_apply_failure(remote, false);
+    let replay = core
+        .repository
+        .coordinate_schema_publication(request, context(coordinator, "retry-partitioned", 2))
+        .unwrap();
+    assert!(replay.mutation.is_none());
+    assert!(
+        core.replicate_schema_publication(&replicas, &tenant(), &replay)
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -458,6 +747,8 @@ fn all_realms_for_one_tenant_share_one_group_and_split_candidates_fail_closed() 
         format: anvil_store::AUTHZ_REALM_TRANSFER_MANIFEST_FORMAT,
         scope: scope.clone(),
         revision: AuthzRevision(revision),
+        predecessor_revision: Some(AuthzRevision(revision - 1)),
+        mutation_fingerprint: Some([hash; 32]),
         encoded_bytes: 1,
         content_hash: [hash; 32],
     };

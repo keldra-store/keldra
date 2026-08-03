@@ -6,13 +6,15 @@
 
 use std::sync::Arc;
 
-use anvil_authz::AuthorizationCheck;
+use anvil_authz::{AuthorizationCheck, Schema};
 use anvil_consensus::{DecisionRaft, NodeId};
 use anvil_store::{
     AuthzConsistency, AuthzRealmAggregate, AuthzRealmMutation, AuthzRealmMutationContext,
     AuthzRealmSnapshotApplied, AuthzRealmTransferManifest, AuthzRepository, AuthzRevision,
-    AuthzScope, AuthzStoreError, BindSchemaRequest, CoordinatedAuthzRealmMutation,
-    ReplicaAuthzRealmMutationApplied, TupleBatchRequest,
+    AuthzSchemaPublicationMutation, AuthzScope, AuthzStoreError, BindSchemaRequest,
+    CoordinatedAuthzRealmMutation, CoordinatedAuthzSchemaPublication, PublishSchemaRequest,
+    ReplicaAuthzRealmMutationApplied, ReplicaAuthzSchemaPublicationApplied, SchemaRef,
+    StorageTenantId, TupleBatchRequest,
 };
 use tonic::Status;
 
@@ -43,17 +45,24 @@ impl AuthzRealmReplicaCandidate {
             ));
         }
         Ok(Self {
+            predecessor_revision: manifest.predecessor_revision,
+            mutation_fingerprint: manifest.mutation_fingerprint,
             manifest,
-            predecessor_revision: aggregate
-                .mutation_stamp
-                .and_then(|stamp| stamp.predecessor_revision),
-            mutation_fingerprint: aggregate
-                .mutation_stamp
-                .map(|stamp| stamp.mutation_fingerprint),
         })
     }
 
-    fn validate_for(&self, scope: &AuthzScope) -> Result<(), Status> {
+    pub(crate) fn from_manifest(manifest: AuthzRealmTransferManifest) -> Result<Self, Status> {
+        let candidate = Self {
+            predecessor_revision: manifest.predecessor_revision,
+            mutation_fingerprint: manifest.mutation_fingerprint,
+            manifest,
+        };
+        let scope = candidate.manifest.scope.clone();
+        candidate.validate_for(&scope)?;
+        Ok(candidate)
+    }
+
+    pub(crate) fn validate_for(&self, scope: &AuthzScope) -> Result<(), Status> {
         if self.manifest.scope != *scope || self.manifest.revision == AuthzRevision::ZERO {
             return Err(Status::data_loss(
                 "authorization replica returned another realm or a zero revision",
@@ -81,6 +90,20 @@ impl AuthzRealmReplicaCandidate {
 /// explicitly quorum-reconciled install boundary.
 #[tonic::async_trait]
 pub(crate) trait AuthzReplicaTransport: Send + Sync + 'static {
+    async fn apply_schema_publication(
+        &self,
+        target: NodeId,
+        address: &str,
+        mutation: &AuthzSchemaPublicationMutation,
+    ) -> Result<ReplicaAuthzSchemaPublicationApplied, Status>;
+
+    async fn has_schema_publication(
+        &self,
+        target: NodeId,
+        address: &str,
+        query: &AuthzSchemaReplicaQuery,
+    ) -> Result<bool, Status>;
+
     async fn apply_realm_mutation(
         &self,
         target: NodeId,
@@ -103,6 +126,16 @@ pub(crate) trait AuthzReplicaTransport: Send + Sync + 'static {
         scope: &AuthzScope,
         winner: Option<&AuthzRealmReplicaCandidate>,
     ) -> Result<AuthzRealmSnapshotApplied, Status>;
+}
+
+/// Exact read-only proof used when an apply response or the original client
+/// response was lost. It transfers no catalogue and performs no repair.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AuthzSchemaReplicaQuery {
+    pub(crate) storage_tenant: StorageTenantId,
+    pub(crate) schema_ref: SchemaRef,
+    pub(crate) schema: Schema,
+    pub(crate) published_at_revision: AuthzRevision,
 }
 
 #[derive(Clone, Debug)]
@@ -163,6 +196,119 @@ struct AuthzDistributionCore {
 }
 
 impl AuthzDistributionCore {
+    async fn replicate_schema_publication(
+        &self,
+        replicas: &TenantReplicaSet,
+        storage_tenant: &StorageTenantId,
+        coordinated: &CoordinatedAuthzSchemaPublication,
+    ) -> Result<(), Status> {
+        let schema = self
+            .repository
+            .get_schema(storage_tenant, &coordinated.result.schema_ref)
+            .map_err(authz_status)?
+            .ok_or_else(|| Status::data_loss("coordinated schema revision is missing locally"))?;
+        let query = AuthzSchemaReplicaQuery {
+            storage_tenant: storage_tenant.clone(),
+            schema_ref: coordinated.result.schema_ref.clone(),
+            schema,
+            published_at_revision: coordinated.result.authz_revision,
+        };
+        if self
+            .repository
+            .tenant_revision(storage_tenant)
+            .map_err(authz_status)?
+            < query.published_at_revision
+        {
+            return Err(Status::data_loss(
+                "coordinated schema revision exceeds the local tenant revision",
+            ));
+        }
+        if let Some(mutation) = coordinated.mutation.as_ref()
+            && (mutation.storage_tenant != *storage_tenant
+                || mutation.schema.schema_ref != query.schema_ref
+                || mutation.schema.schema != query.schema
+                || mutation.revision() != query.published_at_revision)
+        {
+            return Err(Status::data_loss(
+                "coordinated schema mutation disagrees with its local result",
+            ));
+        }
+        if coordinated.mutation.is_none() && !coordinated.result.replayed {
+            return Err(Status::data_loss(
+                "new schema publication omitted its typed mutation",
+            ));
+        }
+
+        let mut durable = vec![self.local_node];
+        if let Some(mutation) = coordinated.mutation.as_ref() {
+            let mut tasks = tokio::task::JoinSet::new();
+            for endpoint in replicas
+                .endpoints
+                .iter()
+                .filter(|endpoint| endpoint.node_id != self.local_node)
+                .cloned()
+            {
+                let peers = self.peers.clone();
+                let mutation = mutation.clone();
+                tasks.spawn(async move {
+                    let result = peers
+                        .apply_schema_publication(endpoint.node_id, &endpoint.address, &mutation)
+                        .await;
+                    (endpoint.node_id, result)
+                });
+            }
+            while let Some(joined) = tasks.join_next().await {
+                let (node_id, result) = joined.map_err(|error| {
+                    Status::internal(format!("authorization schema peer task failed: {error}"))
+                })?;
+                if matches!(result, Ok(applied) if applied.revision == query.published_at_revision)
+                {
+                    durable.push(node_id);
+                }
+            }
+        }
+        if replicas.group.is_acknowledged_by(&durable) {
+            return Ok(());
+        }
+
+        // An apply may have committed even when its response was lost. A
+        // digest replay has no new mutation, so it uses the same exact proof.
+        // This proves durability only; it never copies or repairs a catalogue.
+        let mut tasks = tokio::task::JoinSet::new();
+        for endpoint in replicas
+            .endpoints
+            .iter()
+            .filter(|endpoint| !durable.contains(&endpoint.node_id))
+            .cloned()
+        {
+            let peers = self.peers.clone();
+            let query = query.clone();
+            tasks.spawn(async move {
+                let result = peers
+                    .has_schema_publication(endpoint.node_id, &endpoint.address, &query)
+                    .await;
+                (endpoint.node_id, result)
+            });
+        }
+        while let Some(joined) = tasks.join_next().await {
+            let (node_id, result) = joined.map_err(|error| {
+                Status::internal(format!("authorization schema proof task failed: {error}"))
+            })?;
+            if matches!(result, Ok(true)) {
+                durable.push(node_id);
+            }
+        }
+        if replicas.group.is_acknowledged_by(&durable) {
+            Ok(())
+        } else {
+            Err(Status::unavailable(format!(
+                "authorization schema publication reached {} of {} required replicas",
+                durable.len(),
+                replicas.group.required_acknowledgements()
+            )))
+        }
+    }
+
     async fn replicate(
         &self,
         replicas: &TenantReplicaSet,
@@ -387,6 +533,29 @@ impl ZanzibarDistribution {
         Ok(coordinated)
     }
 
+    pub(crate) async fn publish_schema(
+        &self,
+        stable_tenant_id: u64,
+        request: PublishSchemaRequest,
+        context: AuthzRealmMutationContext,
+    ) -> Result<CoordinatedAuthzSchemaPublication, Status> {
+        let _serial = self.core.coordinator_serial.lock().await;
+        let replicas = self.require_coordinator(stable_tenant_id)?;
+        self.require_context(&context, replicas.group.coordinator())?;
+        let storage_tenant = request.storage_tenant.clone();
+        let repository = self.core.repository.clone();
+        let coordinated = tokio::task::spawn_blocking(move || {
+            repository.coordinate_schema_publication(request, context)
+        })
+        .await
+        .map_err(|error| Status::internal(format!("authorization worker failed: {error}")))?
+        .map_err(authz_status)?;
+        self.core
+            .replicate_schema_publication(&replicas, &storage_tenant, &coordinated)
+            .await?;
+        Ok(coordinated)
+    }
+
     pub(crate) async fn mutate_tuples(
         &self,
         stable_tenant_id: u64,
@@ -462,7 +631,7 @@ impl ZanzibarDistribution {
     }
 }
 
-fn exact_quorum_candidate(
+pub(crate) fn exact_quorum_candidate(
     observed: &[&Option<AuthzRealmReplicaCandidate>],
     required: usize,
 ) -> Result<Option<AuthzRealmReplicaCandidate>, Status> {
