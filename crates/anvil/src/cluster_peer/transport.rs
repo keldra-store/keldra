@@ -2,11 +2,8 @@ use std::time::Duration;
 
 use anvil_api::v1::{
     BucketPolicy as ApiBucketPolicy, BulkWriteRequest, BulkWriteResponse, DeleteIfVersionRequest,
-    DeleteRequest, DeleteVersionRequest, DeleteVersionResponse, MutationReceipt,
-    PersonalDbExchangeRequest, PersonalDbExchangeResponse, PersonalDbGrantLeaderLeaseRequest,
-    PersonalDbGrantLeaderLeaseResponse, PersonalDbRenewLeaderLeaseRequest,
-    PersonalDbRenewLeaderLeaseResponse, PersonalDbWitnessCommitRequest,
-    PersonalDbWitnessCommitResponse, PutToken, SetBucketPolicyRequest,
+    DeleteRequest, DeleteVersionRequest, DeleteVersionResponse, MutationReceipt, PutToken,
+    SetBucketPolicyRequest,
 };
 use anvil_consensus::{DecisionRaft, NodeId};
 use anvil_store::{
@@ -358,90 +355,6 @@ impl ClusterPeerTransport {
             .into_inner())
     }
 
-    pub(crate) async fn route_personaldb_exchange(
-        &self,
-        target: NodeId,
-        address: &str,
-        bearer: &str,
-        value: PersonalDbExchangeRequest,
-        remaining: Duration,
-    ) -> Result<PersonalDbExchangeResponse, Status> {
-        let fence = self.placement()?.fence();
-        let mut request = Request::new(wire::RoutePersonalDbExchangeRequest {
-            peer: Some(self.context(fence, 1, remaining)?),
-            request: Some(value),
-        });
-        add_bearer_and_timeout(&mut request, bearer, remaining)?;
-        Ok(self
-            .client(target, address)?
-            .route_personal_db_exchange(request)
-            .await?
-            .into_inner())
-    }
-
-    pub(crate) async fn route_personaldb_grant_leader_lease(
-        &self,
-        target: NodeId,
-        address: &str,
-        bearer: &str,
-        value: PersonalDbGrantLeaderLeaseRequest,
-        remaining: Duration,
-    ) -> Result<PersonalDbGrantLeaderLeaseResponse, Status> {
-        let fence = self.placement()?.fence();
-        let mut request = Request::new(wire::RoutePersonalDbGrantLeaderLeaseRequest {
-            peer: Some(self.context(fence, 1, remaining)?),
-            request: Some(value),
-        });
-        add_bearer_and_timeout(&mut request, bearer, remaining)?;
-        Ok(self
-            .client(target, address)?
-            .route_personal_db_grant_leader_lease(request)
-            .await?
-            .into_inner())
-    }
-
-    pub(crate) async fn route_personaldb_renew_leader_lease(
-        &self,
-        target: NodeId,
-        address: &str,
-        bearer: &str,
-        value: PersonalDbRenewLeaderLeaseRequest,
-        remaining: Duration,
-    ) -> Result<PersonalDbRenewLeaderLeaseResponse, Status> {
-        let fence = self.placement()?.fence();
-        let mut request = Request::new(wire::RoutePersonalDbRenewLeaderLeaseRequest {
-            peer: Some(self.context(fence, 1, remaining)?),
-            request: Some(value),
-        });
-        add_bearer_and_timeout(&mut request, bearer, remaining)?;
-        Ok(self
-            .client(target, address)?
-            .route_personal_db_renew_leader_lease(request)
-            .await?
-            .into_inner())
-    }
-
-    pub(crate) async fn route_personaldb_witness_commit(
-        &self,
-        target: NodeId,
-        address: &str,
-        bearer: &str,
-        value: PersonalDbWitnessCommitRequest,
-        remaining: Duration,
-    ) -> Result<PersonalDbWitnessCommitResponse, Status> {
-        let fence = self.placement()?.fence();
-        let mut request = Request::new(wire::RoutePersonalDbWitnessCommitRequest {
-            peer: Some(self.context(fence, 1, remaining)?),
-            request: Some(value),
-        });
-        add_bearer_and_timeout(&mut request, bearer, remaining)?;
-        Ok(self
-            .client(target, address)?
-            .route_personal_db_witness_commit(request)
-            .await?
-            .into_inner())
-    }
-
     pub(crate) async fn route_set_bucket_policy(
         &self,
         target: NodeId,
@@ -704,39 +617,6 @@ impl ClusterPeerTransport {
         decode_json(&response.receipt_json)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn coordinate_personaldb_authorization(
-        &self,
-        target: NodeId,
-        address: &str,
-        stable_tenant_id: u64,
-        storage_tenant: &str,
-        owner_app_id: &str,
-        remaining: Duration,
-    ) -> Result<(anvil_store::AuthzRevision, bool), Status> {
-        let fence = self.placement()?.fence();
-        let response = self
-            .client(target, address)?
-            .coordinate_personal_db_authorization(wire::CoordinatePersonalDbAuthorizationRequest {
-                peer: Some(self.context(fence, 0, remaining)?),
-                stable_tenant_id,
-                storage_tenant: storage_tenant.to_owned(),
-                owner_app_id: owner_app_id.to_owned(),
-            })
-            .await?
-            .into_inner();
-        require_response_schema(response.schema_version)?;
-        if response.authorization_revision == 0 {
-            return Err(Status::data_loss(
-                "PersonalDB authorization bootstrap returned a zero revision",
-            ));
-        }
-        Ok((
-            anvil_store::AuthzRevision(response.authorization_revision),
-            response.replayed,
-        ))
-    }
-
     pub(super) fn placement(&self) -> Result<ClusterPlacement, Status> {
         let state = self
             .decisions
@@ -923,7 +803,6 @@ impl ClusterListPeers for ClusterPeerTransport {
             limit: u32::try_from(query.limit())
                 .map_err(|_| Status::invalid_argument("list limit exceeds u32"))?,
             include_index_definitions: query.includes_index_definitions(),
-            include_personaldb_objects: query.includes_personaldb_objects(),
         });
         add_bearer_and_timeout(
             &mut request,

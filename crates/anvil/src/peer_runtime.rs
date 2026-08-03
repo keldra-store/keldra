@@ -26,7 +26,7 @@ use uuid::Uuid;
 
 use crate::cluster_peer::{
     ClusterPeerService, LateBoundDistributedControl, LateBoundFreshAuthorization,
-    RoutedAuthzHandlers, RoutedIndexQueryHandlers, RoutedPersonalDbHandlers, RoutedPublicHandlers,
+    RoutedAuthzHandlers, RoutedIndexQueryHandlers, RoutedPublicHandlers,
 };
 use crate::data_peer::{DataPeerService, DataPeerTransport};
 use crate::distributed_list::LateBoundListAuthorizer;
@@ -73,7 +73,6 @@ pub(crate) struct PeerRuntime {
     program_quiescence: LateBoundProgramQuiescence,
     index_artifacts: LateBoundIndexArtifactPublication,
     routed_index_queries: RoutedIndexQueryHandlers,
-    routed_personaldb: RoutedPersonalDbHandlers,
     join_transport: Option<JoinPeerTransport>,
     bootstrap_pins: Option<Arc<JoinBootstrapPins>>,
     clear_pins_on_drop: bool,
@@ -445,10 +444,6 @@ impl PeerRuntime {
         self.routed_index_queries.clone()
     }
 
-    pub(crate) fn routed_personaldb_handlers(&self) -> RoutedPersonalDbHandlers {
-        self.routed_personaldb.clone()
-    }
-
     pub(crate) fn join_transport(&self) -> Option<JoinPeerTransport> {
         self.join_transport.clone()
     }
@@ -562,7 +557,6 @@ impl PeerRuntime {
             self.name_resolution.clone(),
             self.index_artifacts.clone(),
             self.routed_index_queries.clone(),
-            self.routed_personaldb.clone(),
             self.routed_public_handlers.clone(),
             self.routed_authz_handlers.clone(),
         )
@@ -677,7 +671,6 @@ async fn open_with_identity(
             program_quiescence: LateBoundProgramQuiescence::default(),
             index_artifacts: LateBoundIndexArtifactPublication::default(),
             routed_index_queries: RoutedIndexQueryHandlers::default(),
-            routed_personaldb: RoutedPersonalDbHandlers::default(),
             join_transport,
             bootstrap_pins,
             clear_pins_on_drop: true,

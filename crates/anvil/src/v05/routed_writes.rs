@@ -175,7 +175,7 @@ mod tests {
         let mut request = Request::new(());
         request.extensions_mut().insert(RoutedDestination);
         let access = object_path_access::access_for(&request);
-        let reserved = ObjectKey::new("tenant", "bucket", "_anvil/personaldb/v0/00").unwrap();
+        let reserved = ObjectKey::new("tenant", "bucket", "_anvil/internal/00").unwrap();
 
         assert_eq!(
             object_path_access::require_key(&access, &reserved)

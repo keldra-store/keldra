@@ -24,8 +24,6 @@ use crate::cluster_placement::ClusterPlacement;
 use crate::placement::PlacementKind;
 use crate::serving_fence::ServingAuthority;
 
-const PERSONALDB_OBJECT_PREFIX: &str = "_anvil/personaldb/v0/";
-
 /// The original signed access token, deliberately separate from every Debug
 /// or protobuf-derived listing type. Private transports carry it in encrypted
 /// gRPC metadata rather than serializing a caller or an authorization result.
@@ -58,10 +56,6 @@ impl OriginalBearer {
         Self(token.into())
     }
 
-    pub(crate) fn from_signed_token_for_peer(token: impl Into<Arc<str>>) -> Self {
-        Self(token.into())
-    }
-
     pub(crate) fn signed_token(&self) -> &str {
         &self.0
     }
@@ -83,7 +77,6 @@ pub(crate) struct LocalListQuery {
     start_after: Option<String>,
     limit: usize,
     include_index_definitions: bool,
-    include_personaldb_objects: bool,
 }
 
 impl LocalListQuery {
@@ -141,7 +134,6 @@ impl LocalListQuery {
             start_after,
             limit,
             include_index_definitions: false,
-            include_personaldb_objects: false,
         })
     }
 
@@ -200,25 +192,6 @@ impl LocalListQuery {
             ));
         }
         self.include_index_definitions = true;
-        Ok(self)
-    }
-
-    pub(crate) const fn includes_personaldb_objects(&self) -> bool {
-        self.include_personaldb_objects
-    }
-
-    pub(crate) fn for_personaldb_objects(mut self) -> Result<Self, Status> {
-        if !self.prefix.starts_with(PERSONALDB_OBJECT_PREFIX)
-            || self
-                .start_after
-                .as_ref()
-                .is_some_and(|path| !path.starts_with(PERSONALDB_OBJECT_PREFIX))
-        {
-            return Err(Status::invalid_argument(
-                "PersonalDB listing requires its exact reserved prefix",
-            ));
-        }
-        self.include_personaldb_objects = true;
         Ok(self)
     }
 }
@@ -642,33 +615,6 @@ impl DistributedObjectLister {
         self.list_query(bearer, placement, query).await
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn list_personaldb_objects(
-        &self,
-        bearer: OriginalBearer,
-        tenant: &str,
-        bucket: &str,
-        tenant_id: u64,
-        bucket_id: u64,
-        prefix: &str,
-        start_after: Option<&str>,
-        limit: usize,
-    ) -> Result<ListObjectsPage, Status> {
-        let placement = self.placement()?;
-        let query = LocalListQuery::new(
-            placement.fence(),
-            tenant,
-            bucket,
-            tenant_id,
-            bucket_id,
-            prefix,
-            start_after.map(str::to_owned),
-            limit,
-        )?
-        .for_personaldb_objects()?;
-        self.list_query(bearer, placement, query).await
-    }
-
     async fn list_query(
         &self,
         bearer: OriginalBearer,
@@ -808,8 +754,6 @@ async fn gather_cluster_page(
 fn path_is_allowed_for_query(query: &LocalListQuery, path: &str) -> bool {
     if query.includes_index_definitions() {
         crate::index_runtime::publication::index_definition_name(path).is_some()
-    } else if query.includes_personaldb_objects() {
-        path.starts_with(PERSONALDB_OBJECT_PREFIX)
     } else {
         !path.split('/').any(|segment| segment == "_anvil")
     }
@@ -834,17 +778,6 @@ fn local_owned_page(
     }
     let page = if query.includes_index_definitions() {
         store.list_local_owned_index_definitions(
-            query.tenant_id(),
-            query.bucket_id(),
-            query.prefix(),
-            query.start_after(),
-            query.limit(),
-            |tenant_id, bucket_id, path| {
-                placement.object_owner(tenant_id, bucket_id, path) == Some(local_node)
-            },
-        )
-    } else if query.includes_personaldb_objects() {
-        store.list_local_owned_personaldb_objects(
             query.tenant_id(),
             query.bucket_id(),
             query.prefix(),
@@ -1195,30 +1128,6 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(malformed.code(), tonic::Code::Unauthenticated);
-    }
-
-    #[test]
-    fn personaldb_reserved_paths_require_the_personaldb_listing_scope() {
-        let ordinary = LocalListQuery::new(
-            PlacementLogId { term: 1, index: 2 },
-            "tenant",
-            "bucket",
-            3,
-            4,
-            PERSONALDB_OBJECT_PREFIX,
-            None,
-            10,
-        )
-        .unwrap();
-        let personaldb = ordinary.clone().for_personaldb_objects().unwrap();
-        let personaldb_path = "_anvil/personaldb/v0/groups/database/head";
-
-        assert!(!path_is_allowed_for_query(&ordinary, personaldb_path));
-        assert!(path_is_allowed_for_query(&personaldb, personaldb_path));
-        assert!(!path_is_allowed_for_query(
-            &personaldb,
-            "_anvil/indexes/definitions/not-personaldb"
-        ));
     }
 
     #[test]

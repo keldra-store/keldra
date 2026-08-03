@@ -35,7 +35,6 @@ mod payload_placement;
 mod payload_read;
 mod payload_read_transport;
 mod peer_runtime;
-mod personaldb;
 mod placement;
 mod programs;
 #[allow(
@@ -56,7 +55,6 @@ use anvil_api::v1::authz_service_server::AuthzServiceServer;
 use anvil_api::v1::credential_service_server::CredentialServiceServer;
 use anvil_api::v1::index_service_server::IndexServiceServer;
 use anvil_api::v1::object_service_server::ObjectServiceServer;
-use anvil_api::v1::personal_db_service_server::PersonalDbServiceServer;
 use anvil_consensus::{ATOMIC_REPLAY_RETENTION_MILLIS, NodeId};
 use anvil_store::{ErasureProfile, MutationReceiptRetention, Store, StoreOptions, WatchRetention};
 use anyhow::{Context, Result};
@@ -147,7 +145,6 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     let routed_public_handlers = peer_runtime.routed_public_handlers();
     let routed_authz_handlers = peer_runtime.routed_authz_handlers();
     let routed_index_query_handlers = peer_runtime.routed_index_query_handlers();
-    let routed_personaldb_handlers = peer_runtime.routed_personaldb_handlers();
     let list_authorizer_binding = peer_runtime.list_authorizer();
     let fresh_authorization_binding = peer_runtime.fresh_authorization();
     let distributed_control_binding = peer_runtime.distributed_control();
@@ -443,23 +440,6 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         },
         config.atomic_program_timeout,
     );
-    let personaldb_resolver = personaldb::HrwPrimaryResolver::new(decisions.clone());
-    let personaldb_service = personaldb::PersonalDbServiceImpl::new(
-        local_node,
-        personaldb_resolver,
-        serving_fence.authority(),
-        object_service.clone(),
-        object_lister,
-        name_resolver.clone(),
-        authoritative_system.clone(),
-        cluster_transport.clone(),
-        config.token_manager.clone(),
-        config.atomic_program_timeout,
-    )
-    .context("initialize PersonalDB service")?;
-    routed_personaldb_handlers
-        .install(Arc::new(personaldb_service.clone()))
-        .map_err(|_| anyhow::anyhow!("routed PersonalDB handler was installed more than once"))?;
     routed_public_handlers
         .install(object_service.routed_public_handler())
         .map_err(|_| anyhow::anyhow!("routed public handler was installed more than once"))?;
@@ -502,9 +482,6 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     let authz_service = AuthzServiceServer::new(authz_service)
         .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES);
-    let personaldb_service = PersonalDbServiceServer::new(personaldb_service)
-        .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
-        .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES);
     let tokens = config.token_manager;
     let authenticated_authority = serving_fence.authority();
     let authenticate = move |request: tonic::Request<()>| {
@@ -517,10 +494,6 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         tonic::service::interceptor::InterceptedService::new(index_service, authenticate.clone());
     let authz_service =
         tonic::service::interceptor::InterceptedService::new(authz_service, authenticate.clone());
-    let personaldb_service = tonic::service::interceptor::InterceptedService::new(
-        personaldb_service,
-        authenticate.clone(),
-    );
     let administration_service = tonic::service::interceptor::InterceptedService::new(
         AdministrationServiceServer::new(administration_service),
         authenticate,
@@ -539,7 +512,6 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
             .add_service(object_service)
             .add_service(index_service)
             .add_service(authz_service)
-            .add_service(personaldb_service)
             .add_service(administration_service)
             // Deliberately not bearer-authenticated: this service exchanges
             // durable long-lived credentials for that bearer token. It still

@@ -77,10 +77,10 @@ async fn every_object_rpc_rejects_an_unauthenticated_request() {
 }
 
 #[tokio::test]
-async fn raw_reserved_personaldb_objects_are_denied_but_trusted_adapters_still_work() {
+async fn raw_reserved_objects_are_denied_but_trusted_adapters_still_work() {
     let fixture = Fixture::start().await;
     let token = fixture.access_token.as_str();
-    let reserved = address("_anvil/personaldb/v0/00");
+    let reserved = address("_anvil/internal/00");
     let mut objects = ObjectServiceClient::new(fixture.channel.clone());
 
     assert_permission_denied(

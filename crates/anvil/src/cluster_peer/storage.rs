@@ -359,9 +359,6 @@ impl wire::cluster_peer_server::ClusterPeer for ClusterPeerService {
         if raw.include_index_definitions {
             query = query.for_index_definitions()?;
         }
-        if raw.include_personaldb_objects {
-            query = query.for_personaldb_objects()?;
-        }
         self.list_authorizer.authorize(&bearer, &query).await?;
         let deadline = Instant::now()
             .checked_add(admitted.timeout)
@@ -374,18 +371,6 @@ impl wire::cluster_peer_server::ClusterPeer for ClusterPeerService {
             let owned = bounded_blocking(visibility_remaining(deadline)?, move || {
                 let page = if query.includes_index_definitions() {
                     store.list_local_owned_index_definitions(
-                        query.tenant_id(),
-                        query.bucket_id(),
-                        query.prefix(),
-                        query.start_after(),
-                        query.limit(),
-                        |tenant_id, bucket_id, path| {
-                            object_coordinator(&placement, tenant_id, bucket_id, path)
-                                == Some(local_node)
-                        },
-                    )
-                } else if query.includes_personaldb_objects() {
-                    store.list_local_owned_personaldb_objects(
                         query.tenant_id(),
                         query.bucket_id(),
                         query.prefix(),
@@ -585,34 +570,6 @@ impl wire::cluster_peer_server::ClusterPeer for ClusterPeerService {
         self.route_internal_bulk_write_call(request).await
     }
 
-    async fn route_personal_db_exchange(
-        &self,
-        request: Request<wire::RoutePersonalDbExchangeRequest>,
-    ) -> Result<Response<anvil_api::v1::PersonalDbExchangeResponse>, Status> {
-        self.route_personaldb_exchange_call(request).await
-    }
-
-    async fn route_personal_db_grant_leader_lease(
-        &self,
-        request: Request<wire::RoutePersonalDbGrantLeaderLeaseRequest>,
-    ) -> Result<Response<anvil_api::v1::PersonalDbGrantLeaderLeaseResponse>, Status> {
-        self.route_personaldb_grant_leader_lease_call(request).await
-    }
-
-    async fn route_personal_db_renew_leader_lease(
-        &self,
-        request: Request<wire::RoutePersonalDbRenewLeaderLeaseRequest>,
-    ) -> Result<Response<anvil_api::v1::PersonalDbRenewLeaderLeaseResponse>, Status> {
-        self.route_personaldb_renew_leader_lease_call(request).await
-    }
-
-    async fn route_personal_db_witness_commit(
-        &self,
-        request: Request<wire::RoutePersonalDbWitnessCommitRequest>,
-    ) -> Result<Response<anvil_api::v1::PersonalDbWitnessCommitResponse>, Status> {
-        self.route_personaldb_witness_commit_call(request).await
-    }
-
     async fn route_authz_put_schema(
         &self,
         request: Request<wire::RouteAuthzPutSchemaRequest>,
@@ -787,13 +744,6 @@ impl wire::cluster_peer_server::ClusterPeer for ClusterPeerService {
         request: Request<wire::CoordinateSystemGrantRequest>,
     ) -> Result<Response<wire::CoordinateSystemGrantResponse>, Status> {
         self.coordinate_system_grant_call(request).await
-    }
-
-    async fn coordinate_personal_db_authorization(
-        &self,
-        request: Request<wire::CoordinatePersonalDbAuthorizationRequest>,
-    ) -> Result<Response<wire::CoordinatePersonalDbAuthorizationResponse>, Status> {
-        self.coordinate_personaldb_authorization_call(request).await
     }
 }
 

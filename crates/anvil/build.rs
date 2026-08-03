@@ -3,7 +3,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=proto/cluster_peer.proto");
     println!("cargo:rerun-if-changed=proto/join_peer.proto");
     println!("cargo:rerun-if-changed=proto/payload_peer.proto");
-    println!("cargo:rerun-if-changed=../anvil-api/proto/personaldb.proto");
     tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)

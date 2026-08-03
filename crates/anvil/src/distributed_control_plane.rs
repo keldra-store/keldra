@@ -28,7 +28,6 @@ use crate::cluster_placement::ClusterPlacement;
 use crate::distributed_list::OriginalBearer;
 use crate::logical_record_distribution::LogicalRecordDistribution;
 use crate::mutable_record_replica_group::MutableRecordReplicaGroup;
-use crate::personaldb::PersonalDbAuthorizationBootstrap;
 use crate::placement::PlacementKind;
 use crate::serving_fence::ServingAuthority;
 
@@ -485,41 +484,8 @@ impl DistributedControlPlane {
             )
             .await?;
         let grant = self.apply_system_grant(prepared.grant).await?;
-        let personaldb = PersonalDbAuthorizationBootstrap::new(
-            prepared.tenant_id,
-            storage_tenant.clone(),
-            &request.owner_app_id,
-        )
-        .map_err(authz_status)?;
-        let (_, personaldb_replayed) = self
-            .bootstrap_personaldb_authorization(
-                prepared.tenant_id,
-                &storage_tenant,
-                &request.owner_app_id,
-            )
-            .await?;
-        let current_system = self
-            .authorize_system(
-                caller.subject(),
-                ObjectRef::opaque("system", anvil_store::SYSTEM_STORAGE_TENANT_ID)
-                    .map_err(authz_evaluation_status)?,
-                "manage_system",
-                "tenant provisioning is not authorized",
-            )
-            .await?;
-        let protected_grant = self
-            .apply_system_grant(
-                personaldb
-                    .protected_realm_grant(
-                        caller.subject().clone(),
-                        current_system.revision,
-                        current_system.binding_generation,
-                    )
-                    .map_err(authz_status)?,
-            )
-            .await?;
         self.require_local_executor()?;
-        let replayed = grant.replayed && personaldb_replayed && protected_grant.replayed;
+        let replayed = grant.replayed;
         Ok(api::ProvisionTenantResponse {
             credential: Some(api::ApplicationCredential {
                 storage_tenant: credential.storage_tenant.to_string(),
@@ -528,7 +494,7 @@ impl DistributedControlPlane {
                 active: credential.active,
                 replayed,
             }),
-            authorization_revision: protected_grant.authz_revision.0,
+            authorization_revision: grant.authz_revision.0,
             replayed,
         })
     }
@@ -1177,86 +1143,6 @@ impl DistributedControlPlane {
         Ok(receipt)
     }
 
-    async fn bootstrap_personaldb_authorization(
-        &self,
-        tenant_id: u64,
-        storage_tenant: &StorageTenantId,
-        owner_app_id: &str,
-    ) -> Result<(AuthzRevision, bool), Status> {
-        let Some(target) = self.tenant_realm_target(tenant_id)? else {
-            return self
-                .coordinate_personaldb_authorization(
-                    tenant_id,
-                    storage_tenant.clone(),
-                    owner_app_id.to_owned(),
-                )
-                .await;
-        };
-        let revision = self
-            .peers
-            .coordinate_personaldb_authorization(
-                target.node_id,
-                &target.address,
-                tenant_id,
-                storage_tenant.as_str(),
-                owner_app_id,
-                CONTROL_OPERATION_TIMEOUT,
-            )
-            .await?;
-        if self.tenant_realm_target(tenant_id)?.as_ref() != Some(&target) {
-            return Err(Status::unavailable(
-                "tenant Zanzibar placement changed during PersonalDB provisioning",
-            ));
-        }
-        Ok(revision)
-    }
-
-    pub(crate) async fn coordinate_personaldb_authorization(
-        &self,
-        tenant_id: u64,
-        storage_tenant: StorageTenantId,
-        owner_app_id: String,
-    ) -> Result<(AuthzRevision, bool), Status> {
-        self.require_local_tenant_realm_coordinator(tenant_id)?;
-        let plan = PersonalDbAuthorizationBootstrap::new(tenant_id, storage_tenant, &owner_app_id)
-            .map_err(authz_status)?;
-        let published = self
-            .zanzibar
-            .publish_schema_journaled(
-                tenant_id,
-                &self.store,
-                plan.publish_request().map_err(authz_status)?,
-            )
-            .await?;
-        let publication_replayed = published.result.replayed;
-        let bound = self
-            .zanzibar
-            .bind_schema_journaled(
-                tenant_id,
-                &self.store,
-                plan.bind_request(published.result.schema_ref),
-            )
-            .await?;
-        let CoordinatedAuthzRealmResult::Bound(bound) = bound.result else {
-            return Err(Status::internal(
-                "PersonalDB schema binding returned a tuple result",
-            ));
-        };
-        let binding_replayed = bound.replayed;
-        let owner = self
-            .zanzibar
-            .mutate_tuples_journaled(tenant_id, &self.store, plan.owner_request(&bound.binding))
-            .await?;
-        let CoordinatedAuthzRealmResult::Tuples(owner) = owner.result else {
-            return Err(Status::internal(
-                "PersonalDB owner grant returned a schema-binding result",
-            ));
-        };
-        self.require_local_tenant_realm_coordinator(tenant_id)?;
-        let replayed = publication_replayed && binding_replayed && owner.replayed;
-        Ok((owner.authz_revision, replayed))
-    }
-
     async fn authorize_application_management(
         &self,
         caller: &Caller,
@@ -1457,39 +1343,6 @@ impl DistributedControlPlane {
             address: address.0.clone(),
             placement_fence: placement.fence(),
         }))
-    }
-
-    fn tenant_realm_target(&self, tenant_id: u64) -> Result<Option<ControlTarget>, Status> {
-        let placement = self.placement()?;
-        let group = MutableRecordReplicaGroup::select(
-            PlacementKind::ZanzibarRealm,
-            placement.cluster_id(),
-            &tenant_id.to_be_bytes(),
-            placement.placement_nodes(),
-        )
-        .ok_or_else(|| Status::unavailable("cluster has no tenant Zanzibar replica"))?;
-        let node = group.coordinator();
-        if node == self.local_node {
-            return Ok(None);
-        }
-        let address = placement
-            .address(node)
-            .ok_or_else(|| Status::unavailable("tenant Zanzibar coordinator has no address"))?;
-        Ok(Some(ControlTarget {
-            node_id: node,
-            address: address.0.clone(),
-            placement_fence: placement.fence(),
-        }))
-    }
-
-    fn require_local_tenant_realm_coordinator(&self, tenant_id: u64) -> Result<(), Status> {
-        if self.tenant_realm_target(tenant_id)?.is_none() {
-            Ok(())
-        } else {
-            Err(Status::failed_precondition(
-                "PersonalDB authorization bootstrap did not reach the tenant Zanzibar coordinator",
-            ))
-        }
     }
 
     fn require_system_realm_coordinator(&self) -> Result<(), Status> {

@@ -3,7 +3,6 @@ syntax = "proto3";
 package anvil.cluster_peer.v1;
 
 import "anvil.proto";
-import "personaldb.proto";
 
 // Versioned identity and placement binding shared by every cluster operation.
 // The authenticated source is still established by mandatory mTLS; these
@@ -221,6 +220,7 @@ message ReferenceProofReadResponse {
 }
 
 message LocalListRequest {
+  reserved 10;
   PeerContext peer = 1;
   string tenant = 2;
   string bucket = 3;
@@ -230,7 +230,6 @@ message LocalListRequest {
   optional string start_after = 7;
   uint32 limit = 8;
   bool include_index_definitions = 9;
-  bool include_personaldb_objects = 10;
 }
 
 message LocalListPage {
@@ -422,42 +421,9 @@ message CoordinateSystemGrantResponse {
   bytes receipt_json = 2;
 }
 
-message CoordinatePersonalDbAuthorizationRequest {
-  PeerContext peer = 1;
-  uint64 stable_tenant_id = 2;
-  string storage_tenant = 3;
-  string owner_app_id = 4;
-}
-
-message CoordinatePersonalDbAuthorizationResponse {
-  uint32 schema_version = 1;
-  uint64 authorization_revision = 2;
-  bool replayed = 3;
-}
-
 message RouteInvokeProgramRequest {
   PeerContext peer = 1;
   anvil.v1.InvokeProgramRequest request = 2;
-}
-
-message RoutePersonalDbExchangeRequest {
-  PeerContext peer = 1;
-  anvil.v1.PersonalDbExchangeRequest request = 2;
-}
-
-message RoutePersonalDbGrantLeaderLeaseRequest {
-  PeerContext peer = 1;
-  anvil.v1.PersonalDbGrantLeaderLeaseRequest request = 2;
-}
-
-message RoutePersonalDbRenewLeaderLeaseRequest {
-  PeerContext peer = 1;
-  anvil.v1.PersonalDbRenewLeaderLeaseRequest request = 2;
-}
-
-message RoutePersonalDbWitnessCommitRequest {
-  PeerContext peer = 1;
-  anvil.v1.PersonalDbWitnessCommitRequest request = 2;
 }
 
 message ProgramStagePathRequest {
@@ -654,10 +620,6 @@ service ClusterPeer {
   rpc RouteAdminSetBucketVersioning(RouteAdminSetBucketVersioningRequest) returns (anvil.v1.SetBucketVersioningResponse);
   rpc RouteAdminChangeApplicationRole(RouteAdminChangeApplicationRoleRequest) returns (anvil.v1.ApplicationRoleResponse);
   rpc RouteInvokeProgram(RouteInvokeProgramRequest) returns (anvil.v1.InvokeProgramResponse);
-  rpc RoutePersonalDbExchange(RoutePersonalDbExchangeRequest) returns (anvil.v1.PersonalDbExchangeResponse);
-  rpc RoutePersonalDbGrantLeaderLease(RoutePersonalDbGrantLeaderLeaseRequest) returns (anvil.v1.PersonalDbGrantLeaderLeaseResponse);
-  rpc RoutePersonalDbRenewLeaderLease(RoutePersonalDbRenewLeaderLeaseRequest) returns (anvil.v1.PersonalDbRenewLeaderLeaseResponse);
-  rpc RoutePersonalDbWitnessCommit(RoutePersonalDbWitnessCommitRequest) returns (anvil.v1.PersonalDbWitnessCommitResponse);
   rpc RouteAuthzPutSchema(RouteAuthzPutSchemaRequest) returns (anvil.v1.PutSchemaResponse);
   rpc RouteAuthzBindSchema(RouteAuthzBindSchemaRequest) returns (anvil.v1.BindSchemaResponse);
   rpc RouteAuthzGetBinding(RouteAuthzGetBindingRequest) returns (anvil.v1.GetBindingResponse);
@@ -681,5 +643,4 @@ service ClusterPeer {
   rpc CoordinateLogicalRecord(CoordinateLogicalRecordRequest) returns (CoordinateLogicalRecordResponse);
   rpc ReadCoordinatedLogicalRecord(CoordinatedLogicalReadRequest) returns (CoordinatedLogicalReadResponse);
   rpc CoordinateSystemGrant(CoordinateSystemGrantRequest) returns (CoordinateSystemGrantResponse);
-  rpc CoordinatePersonalDbAuthorization(CoordinatePersonalDbAuthorizationRequest) returns (CoordinatePersonalDbAuthorizationResponse);
 }

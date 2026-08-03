@@ -98,35 +98,6 @@ impl Store {
         )
     }
 
-    /// Narrow internal scan for PersonalDB's one reserved ordinary-object
-    /// namespace. No other `_anvil` path is made visible.
-    pub fn list_local_owned_personaldb_objects(
-        &self,
-        tenant_id: u64,
-        bucket_id: u64,
-        prefix: &str,
-        start_after: Option<&str>,
-        limit: usize,
-        mut is_local_rank_zero: impl FnMut(u64, u64, &str) -> bool,
-    ) -> Result<ListObjectsPage, MutationError> {
-        if !prefix.starts_with(PERSONALDB_PREFIX)
-            || start_after.is_some_and(|path| !path.starts_with(PERSONALDB_PREFIX))
-        {
-            return Err(MutationError::InvalidObjectMutation(
-                "PersonalDB listing is restricted to its exact reserved namespace".into(),
-            ));
-        }
-        self.list_local_owned_objects_with_scope(
-            tenant_id,
-            bucket_id,
-            prefix,
-            start_after,
-            limit,
-            ReservedListScope::PersonalDb,
-            &mut is_local_rank_zero,
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn list_local_owned_objects_with_scope(
         &self,
@@ -657,13 +628,11 @@ impl Store {
 }
 
 const INDEX_DEFINITION_PREFIX: &str = "_anvil/indexes/definitions/";
-const PERSONALDB_PREFIX: &str = "_anvil/personaldb/v0/";
 
 #[derive(Clone, Copy)]
 enum ReservedListScope {
     Public,
     IndexDefinitions,
-    PersonalDb,
 }
 
 impl ReservedListScope {
@@ -671,7 +640,6 @@ impl ReservedListScope {
         match self {
             Self::Public => false,
             Self::IndexDefinitions => is_index_definition_path(path),
-            Self::PersonalDb => path.starts_with(PERSONALDB_PREFIX),
         }
     }
 }

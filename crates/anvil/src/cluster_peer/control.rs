@@ -285,39 +285,6 @@ impl ClusterPeerService {
         }))
     }
 
-    pub(super) async fn coordinate_personaldb_authorization_call(
-        &self,
-        request: Request<wire::CoordinatePersonalDbAuthorizationRequest>,
-    ) -> Result<Response<wire::CoordinatePersonalDbAuthorizationResponse>, Status> {
-        let admitted = self.admit(&request, request.get_ref().peer.as_ref(), 0)?;
-        self.require_executor_source(admitted.authenticated.node_id)?;
-        let value = request.get_ref();
-        let storage_tenant = anvil_store::StorageTenantId::parse(value.storage_tenant.clone())
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        let (revision, replayed) = tokio::time::timeout(
-            admitted.timeout,
-            self.distributed_control
-                .get()?
-                .coordinate_personaldb_authorization(
-                    value.stable_tenant_id,
-                    storage_tenant,
-                    value.owner_app_id.clone(),
-                ),
-        )
-        .await
-        .map_err(|_| {
-            Status::deadline_exceeded("PersonalDB authorization bootstrap deadline exceeded")
-        })??;
-        self.require_unchanged_control(admitted.placement.fence())?;
-        Ok(Response::new(
-            wire::CoordinatePersonalDbAuthorizationResponse {
-                schema_version: CLUSTER_PEER_SCHEMA_VERSION,
-                authorization_revision: revision.0,
-                replayed,
-            },
-        ))
-    }
-
     fn require_executor_source(&self, source: anvil_consensus::NodeId) -> Result<(), Status> {
         let state = self
             .decisions

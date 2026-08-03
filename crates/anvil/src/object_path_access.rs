@@ -34,11 +34,6 @@ pub(crate) fn access_for<T>(request: &Request<T>) -> ObjectPathAccess {
     }
 }
 
-/// Marks one request created by the PersonalDB adapter inside this process.
-pub(crate) fn mark_personaldb<T>(request: &mut Request<T>) {
-    request.extensions_mut().insert(InternalObjectRequest);
-}
-
 /// Marks one request created by the index lifecycle adapter inside this process.
 pub(crate) fn mark_index<T>(request: &mut Request<T>) {
     request.extensions_mut().insert(InternalObjectRequest);
@@ -116,7 +111,7 @@ mod tests {
             "_anvil/programs/import_osv@1@copy",
             "_anvil/indexes/definitions/by-path",
             "_anvil/indexes/7/current",
-            "_anvil/personaldb/v0/00",
+            "_anvil/internal/00",
             "objects/_anvil/meta.json",
         ] {
             assert_eq!(
@@ -125,15 +120,6 @@ mod tests {
                 "{path}"
             );
         }
-    }
-
-    #[test]
-    fn personaldb_marker_is_in_process_and_allows_reserved_adapter_access() {
-        let mut request = Request::new(());
-        mark_personaldb(&mut request);
-        let access = access_for(&request);
-        assert!(is_internal(&access));
-        assert!(require_key(&access, &key("_anvil/personaldb/v0/00")).is_ok());
     }
 
     #[test]

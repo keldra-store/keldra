@@ -319,7 +319,6 @@ pub struct JwtManager {
     watch_checkpoint_validation: Arc<Validation>,
     index_page_validation: Arc<Validation>,
     signing_key_fingerprint: JwtSigningKeyFingerprint,
-    personaldb_witness_seed: Arc<[u8; 32]>,
 }
 
 impl std::fmt::Debug for JwtManager {
@@ -377,10 +376,6 @@ impl JwtManager {
         if signing_secret.len() < MIN_SIGNING_KEY_BYTES {
             return Err(AuthenticationError::SigningSecretTooShort);
         }
-        let personaldb_witness_seed = blake3::derive_key(
-            "anvil 0.5 PersonalDB witness Ed25519 seed v1",
-            signing_secret,
-        );
         Ok(Self {
             encoding_key: Arc::new(EncodingKey::from_secret(signing_secret)),
             decoding_key: Arc::new(DecodingKey::from_secret(signing_secret)),
@@ -392,7 +387,6 @@ impl JwtManager {
                 JWT_SIGNING_KEY_FINGERPRINT_CONTEXT,
                 signing_secret,
             )),
-            personaldb_witness_seed: Arc::new(personaldb_witness_seed),
         })
     }
 
@@ -400,15 +394,6 @@ impl JwtManager {
     /// The secret itself is never retained in cluster control state.
     pub(crate) fn signing_key_fingerprint(&self) -> JwtSigningKeyFingerprint {
         self.signing_key_fingerprint
-    }
-
-    pub(crate) fn personaldb_witness_pkcs8_der(&self) -> Result<Vec<u8>, AuthenticationError> {
-        use ed25519_dalek::pkcs8::EncodePrivateKey;
-
-        ed25519_dalek::SigningKey::from_bytes(self.personaldb_witness_seed.as_ref())
-            .to_pkcs8_der()
-            .map(|document| document.as_bytes().to_vec())
-            .map_err(|error| AuthenticationError::SigningKeyFile(error.to_string()))
     }
 
     /// Mints a one-hour access token after durable credentials have already
@@ -1028,22 +1013,6 @@ mod tests {
             ))
         );
         assert_ne!(first.signing_key_fingerprint().0, [0; 32]);
-    }
-
-    #[test]
-    fn personaldb_witness_key_is_cluster_stable_and_domain_separated() {
-        let first = JwtManager::new(TEST_SIGNING_SECRET).unwrap();
-        let same = JwtManager::new(TEST_SIGNING_SECRET).unwrap();
-        let other = JwtManager::new(b"fedcba9876543210fedcba9876543210").unwrap();
-
-        assert_eq!(
-            first.personaldb_witness_pkcs8_der().unwrap(),
-            same.personaldb_witness_pkcs8_der().unwrap()
-        );
-        assert_ne!(
-            first.personaldb_witness_pkcs8_der().unwrap(),
-            other.personaldb_witness_pkcs8_der().unwrap()
-        );
     }
 
     #[cfg(unix)]

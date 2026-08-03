@@ -194,8 +194,6 @@ impl AuthoritativeSystemAuthorization {
     }
 
     /// Fresh check in one customer tenant's ordinary Zanzibar replica group.
-    /// PersonalDB uses a fixed tenant realm and database-group object; no
-    /// database assignment or authorization result is persisted in Raft.
     pub(crate) async fn fresh_tenant_check(
         &self,
         stable_tenant_id: u64,
