@@ -338,9 +338,11 @@ Placement is derived independently for each logical item:
 | Item | Placement key | Rank zero means |
 |---|---|---|
 | Tenant-name claim | canonical tenant name | mutation coordinator |
-| Tenant or bucket record | stable record ID | mutation coordinator |
+| Tenant record | stable tenant ID | mutation coordinator |
+| Bucket-name claim | stable tenant ID, canonical bucket name | mutation coordinator |
+| Bucket record, options, or policy | stable tenant ID, stable bucket ID | mutation coordinator |
 | Exact object state | tenant ID, bucket ID, exact path | path coordinator |
-| Zanzibar realm aggregate | tenant ID, realm ID | realm coordinator |
+| Zanzibar tenant group | stable tenant ID | tenant authorization coordinator |
 | Credential | stable application or credential ID | mutation coordinator |
 | Small content | content hash and length | first content owner |
 | Large fragment | blob identity and fragment ordinal | fragment owner |
@@ -963,16 +965,23 @@ tuples, revisions, receipts, application identities, and verifier records are
 typed authoritative data placed and replicated like other mutable RocksDB
 records. They do not enter Raft.
 
-The proposed KISS placement unit is the complete `(storage_tenant, realm)`
-aggregate, not each tuple or column-family key independently. Its rank-zero
-node serializes schema binding, tuple batches, revision changes, and checks;
-the next ranked nodes hold complete logical replicas of that same realm. A
-check therefore evaluates one coherent local revision and never scatters a
-Zanzibar graph across nodes. The protected system realm is one such aggregate.
-This aggregate boundary is normative. Bounded administration operations that
-must change it together with another placement aggregate execute through the
-existing Raft-nominated atomic executor. They do not introduce a second
-transaction coordinator or a raw cross-node RocksDB transaction.
+The KISS placement unit is one tenant-wide Zanzibar replica group selected by
+the stable tenant ID, not each tuple, schema, realm, or column-family key
+independently. Its rank-zero node serializes schema publication and binding,
+tuple batches, revision changes, and checks. The next ranked nodes store every
+complete realm aggregate for that tenant plus every immutable schema revision
+published by the tenant. A schema is stored once per selected replica, not
+once per realm, and a published but not yet bound schema is transferred and
+replicated with the same tenant group. A check therefore evaluates one
+coherent local realm revision without adding a schema-owner fetch or
+scattering a Zanzibar graph across nodes.
+
+The protected system realm belongs to the protected system tenant's ordinary
+tenant-wide Zanzibar group. This tenant-group boundary is normative. Bounded
+administration operations that must change it together with another placement
+aggregate execute through the existing Raft-nominated atomic executor. They do
+not introduce a second transaction coordinator or a raw cross-node RocksDB
+transaction.
 
 The realm coordinator, not only the public ingress, evaluates the current
 authoritative revision. A stale positive authorization cache can never grant.
@@ -1323,10 +1332,12 @@ reassigned to another stable tenant.
 
 ### 24.3 Zanzibar aggregate and cross-aggregate administration
 
-The proposed KISS Zanzibar unit is one complete realm on three logical
-replicas, with checks and writes routed to its rank-zero coordinator. This
-keeps a revision and graph local but makes the protected system realm one
-cluster-wide authorization coordinator.
+The KISS Zanzibar unit is one tenant-wide group on three logical replicas,
+selected solely by stable tenant ID. It contains each complete realm aggregate
+and every schema revision for that tenant, including schemas not yet bound to
+a realm. Checks and writes route to its rank-zero coordinator. This keeps each
+revision and graph local and makes the protected system realm part of the
+protected system tenant's ordinary authorization group.
 
 Provisioning can atomically change a name claim, tenant or bucket record,
 credential, and protected-realm tuples in the current one-node store. Those
