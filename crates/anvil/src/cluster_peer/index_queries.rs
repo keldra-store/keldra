@@ -198,7 +198,7 @@ impl RoutedIndexQueryHandler for AuthorizedIndexQueryHandler {
             limit,
             resume,
             Some(before.revision),
-            move |resume| {
+            move |resume, execute_limit| {
                 let executor = executor.clone();
                 let storage_tenant = storage_tenant.clone();
                 let definition = execute_definition.clone();
@@ -212,11 +212,11 @@ impl RoutedIndexQueryHandler for AuthorizedIndexQueryHandler {
                             bucket_id,
                             definition,
                             query,
-                            limit: 1,
+                            limit: execute_limit,
                             resume,
                         })
                         .await?;
-                    validate_result(&result, resumed.as_ref(), 1)?;
+                    validate_result(&result, resumed.as_ref(), execute_limit)?;
                     Ok(result)
                 }
             },

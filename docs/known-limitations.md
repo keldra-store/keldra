@@ -11,10 +11,11 @@ requests still rely on their client or external TLS terminator to supply a
 deadline in 0.5.2; extending the shared deadline wrapper to those existing
 services is deferred.
 
-Authorization-aware index pagination currently evaluates and authorizes one
-candidate at a time. A cold query during concurrent generation publication can
-therefore exhaust the 30-second request budget; the transport timeout is safely
-retryable, and pagination batching is deferred as a performance optimization.
+Authorization-aware index pagination batches the common case where every
+candidate is visible. If Zanzibar filters or reorders a candidate, Anvil falls
+back to a one-candidate scan so a continuation never exposes an unauthorized
+position. A large, heavily filtered cold query can therefore exhaust the
+30-second request budget; the transport timeout is safely retryable.
 
 ## PersonalDB availability
 

@@ -469,7 +469,7 @@ impl IndexServiceRpc for IndexServiceImpl {
                     limit,
                     resume,
                     None,
-                    move |resume| {
+                    move |resume, execute_limit| {
                         let queries = queries.clone();
                         let context = execute_context.clone();
                         let definition = execute_definition.clone();
@@ -483,11 +483,11 @@ impl IndexServiceRpc for IndexServiceImpl {
                                     bucket_id,
                                     definition,
                                     query,
-                                    limit: 1,
+                                    limit: execute_limit,
                                     resume,
                                 })
                                 .await?;
-                            validate_execution(&result, resumed.as_ref(), 1)?;
+                            validate_execution(&result, resumed.as_ref(), execute_limit)?;
                             Ok(result)
                         }
                     },
