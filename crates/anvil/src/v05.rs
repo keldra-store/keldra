@@ -41,6 +41,7 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::authentication::{Caller, JwtManager, PUT_TOKEN_LIFETIME};
 use crate::authorization::{ObjectPermission, SystemAuthorization, SystemAuthorizer};
+use crate::object_distribution::ObjectDistribution;
 use crate::programs::ProgramCoordinator;
 
 const OBJECT_CHUNK_BYTES: usize = 64 * 1024;
@@ -50,13 +51,14 @@ const MAX_BATCH_GET_ITEMS: usize = 1_000;
 const MAX_BATCH_GET_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CONTENT_TYPE_BYTES: usize = 512;
 const DEFAULT_LIST_OBJECTS_LIMIT: usize = 100;
-const PUT_TOKEN_FORMAT_VERSION: u8 = 1;
+const PUT_TOKEN_FORMAT_VERSION: u8 = 2;
 
 #[derive(Clone)]
 pub struct ObjectServiceImpl {
     store: Store,
     system_authorizer: SystemAuthorizer,
     programs: ProgramCoordinator,
+    distribution: ObjectDistribution,
     jwt_manager: JwtManager,
     max_blob_bytes: u64,
     atomic_program_timeout: Duration,
@@ -66,6 +68,7 @@ impl ObjectServiceImpl {
     pub(crate) fn new(
         store: Store,
         programs: ProgramCoordinator,
+        distribution: ObjectDistribution,
         jwt_manager: JwtManager,
         max_blob_bytes: u64,
         atomic_program_timeout: Duration,
@@ -74,6 +77,7 @@ impl ObjectServiceImpl {
             system_authorizer: SystemAuthorizer::new(store.authz()),
             store,
             programs,
+            distribution,
             jwt_manager,
             max_blob_bytes,
             atomic_program_timeout,
@@ -127,12 +131,14 @@ struct ReadyCapability {
     header: CanonicalPutHeader,
     blob_hash: [u8; 32],
     blob_length: u64,
+    upload_source_node_id: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum TokenDurability {
     Local,
+    Replicated,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -231,22 +237,24 @@ impl ObjectService for ObjectServiceImpl {
         let metadata = ready.header.to_metadata()?;
         self.authorize_object(&caller, &metadata.key, ObjectPermission::Put)
             .await?;
-        self.store
-            .publish(PublishRequest {
-                key: metadata.key,
-                blob: BlobRef {
-                    hash: ready.blob_hash,
-                    length: ready.blob_length,
+        self.distribution
+            .publish_from_source(
+                PublishRequest {
+                    key: metadata.key,
+                    blob: BlobRef {
+                        hash: ready.blob_hash,
+                        length: ready.blob_length,
+                    },
+                    content_type: metadata.content_type,
+                    mode: metadata.mode,
+                    command_id: Some(metadata.command_id),
+                    durability: metadata.durability,
                 },
-                content_type: metadata.content_type,
-                mode: metadata.mode,
-                command_id: Some(metadata.command_id),
-                durability: metadata.durability,
-            })
+                anvil_consensus::NodeId(ready.upload_source_node_id),
+            )
             .await
             .map(api_receipt)
             .map(Response::new)
-            .map_err(status)
     }
 
     async fn delete(
@@ -257,12 +265,11 @@ impl ObjectService for ObjectServiceImpl {
         let request = delete_request(request.into_inner(), Precondition::Any)?;
         self.authorize_object(&caller, &request.key, ObjectPermission::Delete)
             .await?;
-        self.store
-            .delete(request)
+        self.distribution
+            .mutate(BatchOperation::Delete(request))
             .await
             .map(api_receipt)
             .map(Response::new)
-            .map_err(status)
     }
 
     async fn delete_if_version(
@@ -275,12 +282,11 @@ impl ObjectService for ObjectServiceImpl {
         let request = delete_if_version_request(request, precondition)?;
         self.authorize_object(&caller, &request.key, ObjectPermission::Delete)
             .await?;
-        self.store
-            .delete(request)
+        self.distribution
+            .mutate(BatchOperation::Delete(request))
             .await
             .map(api_receipt)
             .map(Response::new)
-            .map_err(status)
     }
 
     async fn delete_version(
@@ -541,19 +547,20 @@ impl ObjectService for ObjectServiceImpl {
                 .map(|(_, operation)| operation)
                 .collect();
             outcomes.extend(
-                self.store
-                    .bulk_write(accepted_operations)
+                self.distribution
+                    .mutate_many(accepted_operations)
                     .await
                     .into_iter()
-                    .map(|outcome| BulkOutcome {
-                        index: accepted_indices[outcome.index] as u32,
-                        outcome: Some(match outcome.result {
+                    .enumerate()
+                    .map(|(index, result)| BulkOutcome {
+                        index: accepted_indices[index] as u32,
+                        outcome: Some(match result {
                             Ok(receipt) => {
                                 anvil_api::v1::bulk_outcome::Outcome::Receipt(api_receipt(receipt))
                             }
-                            Err(error) => {
-                                anvil_api::v1::bulk_outcome::Outcome::Failure(api_failure(error))
-                            }
+                            Err(error) => anvil_api::v1::bulk_outcome::Outcome::Failure(
+                                api_request_failure(error),
+                            ),
                         }),
                     }),
             );
@@ -995,6 +1002,7 @@ impl ObjectServiceImpl {
                     header,
                     blob_hash: blob.hash,
                     blob_length: blob.length,
+                    upload_source_node_id: self.distribution.local_node().0,
                 }),
             },
         )
@@ -1067,6 +1075,7 @@ impl CanonicalPutHeader {
         };
         let durability = match self.durability {
             TokenDurability::Local => StoreDurability::Local,
+            TokenDurability::Replicated => StoreDurability::Replicated,
         };
         Ok(PutMetadata {
             key: ObjectKey::new(&self.tenant, &self.bucket, &self.path)
@@ -1744,9 +1753,7 @@ fn status(error: MutationError) -> Status {
 fn durability(value: i32) -> Result<StoreDurability, Status> {
     match ApiDurability::try_from(value) {
         Ok(ApiDurability::Local) => Ok(StoreDurability::Local),
-        Ok(ApiDurability::Replicated) => Err(Status::unavailable(
-            "DURABILITY_UNAVAILABLE: replicated durability is unavailable in Anvil 0.5.0",
-        )),
+        Ok(ApiDurability::Replicated) => Ok(StoreDurability::Replicated),
         Err(_) => Err(Status::invalid_argument("durability is unknown")),
     }
 }
@@ -1754,9 +1761,7 @@ fn durability(value: i32) -> Result<StoreDurability, Status> {
 fn token_durability(value: StoreDurability) -> Result<TokenDurability, Status> {
     match value {
         StoreDurability::Local => Ok(TokenDurability::Local),
-        StoreDurability::Replicated => Err(Status::unavailable(
-            "DURABILITY_UNAVAILABLE: replicated durability is unavailable in Anvil 0.5.0",
-        )),
+        StoreDurability::Replicated => Ok(TokenDurability::Replicated),
     }
 }
 

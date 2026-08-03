@@ -246,29 +246,27 @@ fn content_type_is_bounded_by_utf8_bytes_before_a_put_token_can_be_issued() {
 fn durability_is_a_closed_typed_choice() {
     assert_eq!(durability(0).unwrap(), StoreDurability::Local);
     assert_eq!(
-        durability(ApiDurability::Replicated as i32)
-            .unwrap_err()
-            .code(),
-        tonic::Code::Unavailable
+        durability(ApiDurability::Replicated as i32).unwrap(),
+        StoreDurability::Replicated
     );
     assert_eq!(
         durability(99).unwrap_err().code(),
         tonic::Code::InvalidArgument
     );
-    let error = token_durability(StoreDurability::Replicated).unwrap_err();
-    assert_eq!(error.code(), tonic::Code::Unavailable);
-    assert!(error.message().starts_with("DURABILITY_UNAVAILABLE:"));
+    assert_eq!(
+        token_durability(StoreDurability::Replicated).unwrap(),
+        TokenDurability::Replicated
+    );
 
-    let error = put_metadata(PutHeader {
+    let metadata = put_metadata(PutHeader {
         address: address("object"),
         command_id: "command".into(),
         durability: ApiDurability::Replicated as i32,
         operation: Some(ApiPutOperation::Put(PutOperation {})),
         ..Default::default()
     })
-    .unwrap_err();
-    assert_eq!(error.code(), tonic::Code::Unavailable);
-    assert!(error.message().starts_with("DURABILITY_UNAVAILABLE:"));
+    .unwrap();
+    assert_eq!(metadata.durability, StoreDurability::Replicated);
 }
 
 #[test]
@@ -479,7 +477,7 @@ fn watch_lag_is_an_observation_against_the_current_journal_tail() {
 }
 
 #[test]
-fn oversized_and_replicated_bulk_items_have_typed_failures() {
+fn oversized_bulk_items_fail_and_replicated_durability_is_preserved() {
     let operation = BulkOperation {
         operation: Some(anvil_api::v1::bulk_operation::Operation::Put(
             BulkPutRequest {
@@ -502,11 +500,10 @@ fn oversized_and_replicated_bulk_items_have_typed_failures() {
             },
         )),
     };
-    let failure = api_request_failure(batch_operation(operation, u64::MAX).unwrap_err());
-    assert_eq!(
-        failure.code,
-        MutationFailureCode::DurabilityUnavailable as i32
-    );
+    let BatchOperation::Delete(request) = batch_operation(operation, u64::MAX).unwrap() else {
+        panic!("expected a delete operation")
+    };
+    assert_eq!(request.durability, StoreDurability::Replicated);
 }
 
 #[test]
@@ -564,6 +561,7 @@ fn upload_and_ready_tokens_have_disjoint_strict_phases() {
             header,
             blob_hash: [9; 32],
             blob_length: 42,
+            upload_source_node_id: 7,
         }),
     };
     let upload: CanonicalPutCapability =

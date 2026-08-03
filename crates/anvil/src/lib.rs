@@ -14,6 +14,7 @@ mod join_peer;
 mod mutable_record_quorum;
 mod mutable_record_replica_group;
 mod node_identity;
+mod object_distribution;
 pub mod observability;
 mod payload_distribution;
 mod payload_placement;
@@ -113,6 +114,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     })
     .await?;
     let serving_transport = peer_runtime.serving_transport();
+    let data_transport = peer_runtime.data_transport();
     let pending_join = peer_runtime.join_transport();
     // The private listener must be accepting before an existing multi-node
     // group can elect a leader after a coordinated restart.
@@ -161,6 +163,14 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     )
     .await
     .context("establish initial serving fence after cutover")?;
+    let object_distribution = object_distribution::ObjectDistribution::new(
+        local_node,
+        store.clone(),
+        decisions.clone(),
+        serving_fence.authority(),
+        data_transport,
+        config.erasure_profile,
+    );
     let programs =
         programs::ProgramCoordinator::start(store.clone(), decisions.clone(), local_node).await?;
     cluster_startup::reconcile_system_bootstrap(
@@ -180,6 +190,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     let object_service = ObjectServiceImpl::new(
         store.clone(),
         programs.clone(),
+        object_distribution,
         config.token_manager.clone(),
         config.max_blob_bytes,
         config.atomic_program_timeout,
