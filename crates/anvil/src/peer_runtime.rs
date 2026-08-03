@@ -24,12 +24,19 @@ use tonic::transport::Server;
 use tonic::transport::server::TcpIncoming;
 use uuid::Uuid;
 
+use crate::cluster_peer::{
+    ClusterPeerService, LateBoundDistributedControl, LateBoundFreshAuthorization,
+    RoutedAuthzHandlers, RoutedPublicHandlers,
+};
 use crate::data_peer::{DataPeerService, DataPeerTransport};
+use crate::distributed_list::LateBoundListAuthorizer;
 use crate::join_peer::{
     JoinActivationGate, JoinBootstrapPins, JoinPeerService, JoinPeerTransport, TypedAddHandoff,
 };
+use crate::logical_name_resolution::LateBoundLogicalNameResolution;
 use crate::node_identity::{self, LocalNodeIdentity};
 use crate::payload_distribution::PayloadPeerService;
+use crate::programs::LateBoundProgramQuiescence;
 
 const GENESIS_STORAGE_WEIGHT_MILLIONTHS: u32 = 1_000_000;
 const PEER_PROTOCOL_VERSION: u16 = 1;
@@ -56,6 +63,13 @@ pub(crate) struct PeerRuntime {
         reason = "the distributed coordinators consume this transport in the immediately following integration slice"
     )]
     data_transport: DataPeerTransport,
+    routed_public_handlers: RoutedPublicHandlers,
+    routed_authz_handlers: RoutedAuthzHandlers,
+    list_authorizer: LateBoundListAuthorizer,
+    fresh_authorization: LateBoundFreshAuthorization,
+    distributed_control: LateBoundDistributedControl,
+    name_resolution: LateBoundLogicalNameResolution,
+    program_quiescence: LateBoundProgramQuiescence,
     join_transport: Option<JoinPeerTransport>,
     bootstrap_pins: Option<Arc<JoinBootstrapPins>>,
     clear_pins_on_drop: bool,
@@ -391,6 +405,34 @@ impl PeerRuntime {
         self.data_transport.clone()
     }
 
+    pub(crate) fn routed_public_handlers(&self) -> RoutedPublicHandlers {
+        self.routed_public_handlers.clone()
+    }
+
+    pub(crate) fn routed_authz_handlers(&self) -> RoutedAuthzHandlers {
+        self.routed_authz_handlers.clone()
+    }
+
+    pub(crate) fn list_authorizer(&self) -> LateBoundListAuthorizer {
+        self.list_authorizer.clone()
+    }
+
+    pub(crate) fn fresh_authorization(&self) -> LateBoundFreshAuthorization {
+        self.fresh_authorization.clone()
+    }
+
+    pub(crate) fn distributed_control(&self) -> LateBoundDistributedControl {
+        self.distributed_control.clone()
+    }
+
+    pub(crate) fn name_resolution(&self) -> LateBoundLogicalNameResolution {
+        self.name_resolution.clone()
+    }
+
+    pub(crate) fn program_quiescence(&self) -> LateBoundProgramQuiescence {
+        self.program_quiescence.clone()
+    }
+
     pub(crate) fn join_transport(&self) -> Option<JoinPeerTransport> {
         self.join_transport.clone()
     }
@@ -418,6 +460,7 @@ impl PeerRuntime {
             store.clone(),
             self.data_transport.clone(),
             leases.clone(),
+            self.program_quiescence.clone(),
             erasure_profile,
         ));
         self.start_with_activation_gate(
@@ -492,6 +535,19 @@ impl PeerRuntime {
             activation_gate,
         )
         .into_server();
+        let cluster_service = ClusterPeerService::new(
+            self.node_id,
+            store.clone(),
+            decisions.clone(),
+            self.pins.clone(),
+            Arc::new(self.list_authorizer.clone()),
+            self.fresh_authorization.clone(),
+            self.distributed_control.clone(),
+            self.name_resolution.clone(),
+            self.routed_public_handlers.clone(),
+            self.routed_authz_handlers.clone(),
+        )
+        .into_server();
         let data_service = DataPeerService::new(
             store,
             self.pins.clone(),
@@ -509,6 +565,7 @@ impl PeerRuntime {
                 .add_service(data_service)
                 .add_service(payload_service)
                 .add_service(join_service)
+                .add_service(cluster_service)
                 .serve_with_incoming_shutdown(incoming, async move {
                     let _ = stopped.await;
                 })
@@ -592,6 +649,13 @@ async fn open_with_identity(
             pins,
             transport,
             data_transport,
+            routed_public_handlers: RoutedPublicHandlers::default(),
+            routed_authz_handlers: RoutedAuthzHandlers::default(),
+            list_authorizer: LateBoundListAuthorizer::default(),
+            fresh_authorization: LateBoundFreshAuthorization::default(),
+            distributed_control: LateBoundDistributedControl::default(),
+            name_resolution: LateBoundLogicalNameResolution::default(),
+            program_quiescence: LateBoundProgramQuiescence::default(),
             join_transport,
             bootstrap_pins,
             clear_pins_on_drop: true,

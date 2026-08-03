@@ -1,31 +1,25 @@
 mod administration_service;
 pub mod authentication;
+mod authoritative_system;
 mod authorization;
-mod authz_distribution;
 mod authz_api;
+mod authz_distribution;
 mod authz_service;
 mod bootstrap;
-mod cluster_placement;
-#[allow(
-    dead_code,
-    reason = "cluster object reads are wired into the public 0.5.1 facade next"
-)]
+mod bucket_governance;
+mod cluster_list_watch;
 mod cluster_object_read;
+mod cluster_peer;
+mod cluster_placement;
 mod cluster_startup;
 mod credential_service;
 mod data_peer;
+mod distributed_control_plane;
 mod distributed_list;
-#[allow(
-    dead_code,
-    reason = "transport-neutral cluster watch awaits the approved peer and JWT adapters"
-)]
 mod distributed_watch;
 mod join_bundle;
 mod join_peer;
-#[allow(
-    dead_code,
-    reason = "logical-record coordinator is wired through the private typed transport next"
-)]
+mod logical_name_resolution;
 mod logical_record_distribution;
 mod mutable_record_quorum;
 mod mutable_record_replica_group;
@@ -34,11 +28,8 @@ mod object_distribution;
 pub mod observability;
 mod payload_distribution;
 mod payload_placement;
-#[allow(
-    dead_code,
-    reason = "distributed read core is wired through the private payload transport next"
-)]
 mod payload_read;
+mod payload_read_transport;
 mod peer_runtime;
 mod placement;
 mod programs;
@@ -52,6 +43,7 @@ mod v05;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anvil_api::v1::administration_service_server::AdministrationServiceServer;
@@ -141,6 +133,15 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     .await?;
     let serving_transport = peer_runtime.serving_transport();
     let data_transport = peer_runtime.data_transport();
+    let cluster_transport =
+        cluster_peer::ClusterPeerTransport::new(data_transport.clone(), decisions.clone());
+    let routed_public_handlers = peer_runtime.routed_public_handlers();
+    let routed_authz_handlers = peer_runtime.routed_authz_handlers();
+    let list_authorizer_binding = peer_runtime.list_authorizer();
+    let fresh_authorization_binding = peer_runtime.fresh_authorization();
+    let distributed_control_binding = peer_runtime.distributed_control();
+    let name_resolution_binding = peer_runtime.name_resolution();
+    let program_quiescence_binding = peer_runtime.program_quiescence();
     let pending_join = peer_runtime.join_transport();
     // The private listener must be accepting before an existing multi-node
     // group can elect a leader after a coordinated restart.
@@ -189,6 +190,22 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     )
     .await
     .context("establish initial serving fence after cutover")?;
+    let (reference_runtime, reference_runtime_handle) = reference_delivery::ReferenceRuntime::start(
+        local_node,
+        store.clone(),
+        decisions.clone(),
+        serving_fence.authority(),
+        data_transport.clone(),
+        cluster_transport.clone(),
+        config.erasure_profile,
+    );
+    let payload_read_transport = payload_read_transport::StorePayloadReadTransport::new(
+        local_node,
+        store.clone(),
+        data_transport.clone(),
+        config.erasure_profile,
+    )
+    .context("initialize payload-read transport")?;
     let object_distribution = object_distribution::ObjectDistribution::new(
         local_node,
         store.clone(),
@@ -197,6 +214,13 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         data_transport,
         config.erasure_profile,
     );
+    let object_reader = cluster_object_read::ClusterObjectReader::new(
+        object_distribution.clone(),
+        config.erasure_profile,
+        std::sync::Arc::new(payload_read_transport),
+        &config.data_dir,
+    )
+    .context("initialize cluster object reader")?;
     let programs =
         programs::ProgramCoordinator::start(store.clone(), decisions.clone(), local_node).await?;
     cluster_startup::reconcile_system_bootstrap(
@@ -209,30 +233,194 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     )
     .await?;
     let authz_repository = store.authz();
-    // A committed bundle may have spent longer than the inactivity grace on
-    // disk while this process was down. Recovery must pin/finalize every Raft
-    // decision before startup GC considers ordinary awaiting blobs.
-    collect_blob_garbage(&store, "startup").await;
+    let logical_records = logical_record_distribution::LogicalRecordDistribution::new(
+        local_node,
+        store.clone(),
+        decisions.clone(),
+        serving_fence.authority(),
+        Arc::new(cluster_transport.clone()),
+    );
+    let name_resolver = logical_name_resolution::LogicalNameResolver::new(
+        logical_records.clone(),
+        cluster_transport.clone(),
+    );
+    name_resolution_binding
+        .install(Arc::new(name_resolver.clone()))
+        .map_err(|_| anyhow::anyhow!("logical name resolver was installed more than once"))?;
+    programs
+        .install_distributed(
+            object_reader.clone(),
+            object_distribution.clone(),
+            cluster_transport.clone(),
+            name_resolver.clone(),
+        )
+        .await
+        .context("initialize distributed atomic programs")?;
+    program_quiescence_binding
+        .install(programs.clone())
+        .map_err(|_| anyhow::anyhow!("atomic program quiescence was installed more than once"))?;
+    let zanzibar = Arc::new(authz_distribution::ZanzibarDistribution::new(
+        local_node,
+        authz_repository.clone(),
+        decisions.clone(),
+        serving_fence.authority(),
+        Arc::new(cluster_transport.clone()),
+    ));
+    fresh_authorization_binding
+        .install(zanzibar.clone())
+        .map_err(|_| anyhow::anyhow!("fresh Zanzibar handler was installed more than once"))?;
+    let distributed_control = Arc::new(distributed_control_plane::DistributedControlPlane::new(
+        local_node,
+        store.clone(),
+        decisions.clone(),
+        serving_fence.authority(),
+        logical_records.clone(),
+        zanzibar.clone(),
+        cluster_transport.clone(),
+        config.token_manager.clone(),
+    ));
+    distributed_control_binding
+        .install(distributed_control.clone())
+        .map_err(|_| anyhow::anyhow!("distributed control plane was installed more than once"))?;
+    let authoritative_system = authoritative_system::AuthoritativeSystemAuthorization::new(
+        local_node,
+        decisions.clone(),
+        zanzibar.clone(),
+        cluster_transport.clone(),
+        name_resolver.clone(),
+    );
+    let bucket_governance = bucket_governance::BucketGovernance::new(
+        logical_records,
+        cluster_transport.clone(),
+        name_resolver.clone(),
+    );
+    let list_authorizer: Arc<dyn distributed_list::AuthoritativeListAuthorizer> =
+        Arc::new(distributed_list::CoordinatedListAuthorizer::new(
+            config.token_manager.clone(),
+            Arc::new(cluster_transport.clone()),
+        ));
+    list_authorizer_binding
+        .install(list_authorizer.clone())
+        .map_err(|_| anyhow::anyhow!("list authorizer was installed more than once"))?;
+    let object_lister = distributed_list::DistributedObjectLister::new(
+        local_node,
+        store.clone(),
+        decisions.clone(),
+        Arc::new(cluster_transport.clone()),
+        list_authorizer.clone(),
+    );
+    let watch_sources = Arc::new(cluster_list_watch::ClusterWatchSourcesAdapter::new(
+        local_node,
+        store.clone(),
+        decisions.clone(),
+        cluster_transport.clone(),
+        list_authorizer,
+    ));
+    let distributed_watch = Arc::new(distributed_watch::DistributedWatch::new(
+        Arc::new(cluster_list_watch::DecisionWatchPlacement::new(
+            decisions.clone(),
+        )),
+        watch_sources,
+        Arc::new(config.token_manager.clone()),
+    ));
+    enum ReferenceStartup {
+        Ready,
+        Signal(std::io::Result<()>),
+        Peer(Result<Result<()>, tokio::task::JoinError>),
+    }
+    let reference_startup = tokio::select! {
+        reference_safe = reference_runtime_handle.wait_until_startup_ready() => {
+            if !reference_safe {
+                tracing::warn!(
+                    "cluster is smaller than its erasure profile; LOCAL service is available but reference reconstruction and blob GC remain paused"
+                );
+            }
+            ReferenceStartup::Ready
+        },
+        signal = tokio::signal::ctrl_c() => ReferenceStartup::Signal(signal),
+        peer = peer_server.task_mut() => ReferenceStartup::Peer(peer),
+    };
+    match reference_startup {
+        ReferenceStartup::Ready => {}
+        ReferenceStartup::Signal(signal) => {
+            reference_runtime.shutdown().await;
+            let peer = peer_server.shutdown().await;
+            serving_fence.shutdown().await;
+            let raft = decisions
+                .shutdown()
+                .await
+                .context("shut down decision Raft during startup");
+            signal.context("wait for shutdown signal during startup")?;
+            peer?;
+            raft?;
+            return Ok(());
+        }
+        ReferenceStartup::Peer(peer) => {
+            peer_server.record_completed();
+            reference_runtime.shutdown().await;
+            serving_fence.shutdown().await;
+            let raft = decisions
+                .shutdown()
+                .await
+                .context("shut down decision Raft after startup peer failure");
+            peer.context("join private peer server task during startup")?
+                .context("serve private peer listener during startup")?;
+            raft?;
+            return Ok(());
+        }
+    }
+    // No public request is accepted until ordered reference delivery proves
+    // every current source tail locally applied. Recheck immediately before
+    // the destructive scan in case placement changed after readiness.
+    collect_blob_garbage_if_safe(&store, &reference_runtime_handle, "startup").await;
     let object_service = ObjectServiceImpl::new(
         store.clone(),
         programs.clone(),
         object_distribution,
+        object_reader,
+        cluster_transport.clone(),
+        object_lister,
+        distributed_watch,
+        name_resolver.clone(),
+        authoritative_system.clone(),
+        bucket_governance,
         config.token_manager.clone(),
         config.max_blob_bytes,
         config.atomic_program_timeout,
     );
-    let authz_service = authz_service::AuthzServiceImpl::new(authz_repository);
+    routed_public_handlers
+        .install(object_service.routed_public_handler())
+        .map_err(|_| anyhow::anyhow!("routed public handler was installed more than once"))?;
+    let distributed_authz = authz_service::DistributedAuthzService::new(
+        local_node,
+        store.clone(),
+        decisions.clone(),
+        zanzibar,
+        cluster_transport.clone(),
+        name_resolver,
+        authoritative_system,
+        config.token_manager.clone(),
+    );
+    let authz_service =
+        authz_service::AuthzServiceImpl::new(authz_repository).with_distributed(distributed_authz);
+    routed_authz_handlers
+        .install(authz_service.routed_authz_handler())
+        .map_err(|_| {
+            anyhow::anyhow!("routed authorization handler was installed more than once")
+        })?;
     let administration_service = administration_service::AdministrationServiceImpl::new(
         store.clone(),
         decisions.clone(),
         config.data_dir.clone(),
-    );
+    )
+    .with_distributed(distributed_control.clone());
     let request_rate_limits = RequestRateLimits::new(config.rate_limits);
     let credential_service = credential_service::CredentialServiceImpl::new(
         store.clone(),
         config.token_manager.clone(),
         request_rate_limits.clone(),
-    );
+    )
+    .with_distributed(distributed_control);
     let object_service = ObjectServiceServer::new(object_service)
         .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES);
@@ -259,7 +447,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         move |request| credential_authority.require(request),
     );
 
-    let blob_gc_task = spawn_blob_gc(store);
+    let blob_gc_task = spawn_blob_gc(store, reference_runtime_handle);
     tracing::info!(address = %config.listen, "Anvil 0.5 server listening");
     let (stop_public, public_stopped) = tokio::sync::oneshot::channel();
     let mut public_server = Box::pin(
@@ -316,6 +504,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     {
         tracing::error!(%error, "blob garbage-collection task stopped unexpectedly");
     }
+    reference_runtime.shutdown().await;
     serving_fence.shutdown().await;
     let shutdown_result = decisions
         .shutdown()
@@ -336,16 +525,35 @@ fn validate_atomic_replay_gc(awaiting_publish_ttl_seconds: u64) -> Result<()> {
     Ok(())
 }
 
-fn spawn_blob_gc(store: Store) -> tokio::task::JoinHandle<()> {
+fn spawn_blob_gc(
+    store: Store,
+    references: reference_delivery::ReferenceRuntimeHandle,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let first_run = tokio::time::Instant::now() + BLOB_GC_INTERVAL;
         let mut interval = tokio::time::interval_at(first_run, BLOB_GC_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            collect_blob_garbage(&store, "scheduled").await;
+            collect_blob_garbage_if_safe(&store, &references, "scheduled").await;
         }
     })
+}
+
+async fn collect_blob_garbage_if_safe(
+    store: &Store,
+    references: &reference_delivery::ReferenceRuntimeHandle,
+    trigger: &'static str,
+) {
+    if !references.gc_safe().await {
+        tracing::warn!(
+            monotonic_counter.anvil_blob_gc_paused_total = 1_u64,
+            trigger,
+            "blob garbage collection paused until every ACTIVE source tail is current"
+        );
+        return;
+    }
+    collect_blob_garbage(store, trigger).await;
 }
 
 async fn collect_blob_garbage(store: &Store, trigger: &'static str) {
