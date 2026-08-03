@@ -349,8 +349,12 @@ async fn main() -> Result<()> {
                 .into_inner();
             match head.state {
                 Some(ObjectHeadState::Present(present)) => println!(
-                    "present version={} bytes={}",
-                    present.version, present.content_length
+                    "{}",
+                    present_head_line(
+                        present.version,
+                        present.content_length,
+                        &present.content_hash,
+                    )?
                 ),
                 Some(ObjectHeadState::Deleted(deleted)) => {
                     println!("deleted version={}", deleted.version)
@@ -925,11 +929,21 @@ fn lower_hex(bytes: &[u8]) -> String {
     encoded
 }
 
+fn present_head_line(version: u64, content_length: u64, content_hash: &[u8]) -> Result<String> {
+    if content_hash.len() != 32 {
+        bail!("present object has an invalid content hash");
+    }
+    Ok(format!(
+        "present version={version} bytes={content_length} blake3={}",
+        lower_hex(content_hash)
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         Arguments, Command, VersioningArgument, decode_bootstrap_credential, load_credential_file,
-        parse_hex, put_operation, versioning_name,
+        parse_hex, present_head_line, put_operation, versioning_name,
     };
     use anvil_storage::v1::put_header::Operation;
     use clap::Parser as _;
@@ -947,6 +961,15 @@ mod tests {
         ] {
             assert!(parse_hex(&invalid).is_err());
         }
+    }
+
+    #[test]
+    fn present_head_exposes_the_pinned_blake3_identity() {
+        assert_eq!(
+            present_head_line(7, 19, &[0xab; 32]).unwrap(),
+            format!("present version=7 bytes=19 blake3={}", "ab".repeat(32))
+        );
+        assert!(present_head_line(7, 19, &[0xab; 31]).is_err());
     }
 
     #[test]

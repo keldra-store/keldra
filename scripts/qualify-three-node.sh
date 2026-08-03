@@ -277,6 +277,49 @@ cmp "${ANVIL_QUALIFICATION_DIR}/artifacts/cas.txt" \
   "${ANVIL_QUALIFICATION_DIR}/artifacts/cas-read.txt"
 echo "[anvil-qualification] cross-node CAS test passed"
 
+version_secret=qualification-version-secret-00000000000000000000
+provision_tenant qversion qversion-client "${version_secret}"
+run_cli anvil-2 qversion-client "${version_secret}" \
+  create-bucket objects --versioning enabled \
+  | grep -Fq "bucket=objects versioning=enabled"
+printf 'retained-version-one\n' \
+  >"${ANVIL_QUALIFICATION_DIR}/artifacts/version-one.txt"
+printf 'retained-version-two\n' \
+  >"${ANVIL_QUALIFICATION_DIR}/artifacts/version-two.txt"
+chmod 0444 "${ANVIL_QUALIFICATION_DIR}/artifacts/version-"*.txt
+run_cli anvil-1 qversion-client "${version_secret}" \
+  put qversion objects retained/value.txt /qualification/artifacts/version-one.txt \
+  --command-id qversion-one --durability replicated >/dev/null
+run_cli anvil-3 qversion-client "${version_secret}" \
+  put qversion objects retained/value.txt /qualification/artifacts/version-two.txt \
+  --command-id qversion-two --durability replicated >/dev/null
+old_delete="$(run_cli anvil-2 qversion-client "${version_secret}" \
+  delete-version qversion objects retained/value.txt 1 --durability replicated)"
+if [[ "${old_delete}" != 'deleted=true replacement_tombstone_version=none' ]]; then
+  echo "distributed historical DeleteVersion returned: ${old_delete}" >&2
+  exit 1
+fi
+run_cli anvil-1 qversion-client "${version_secret}" \
+  get qversion objects retained/value.txt \
+  --output /qualification/artifacts/version-current.txt
+cmp "${ANVIL_QUALIFICATION_DIR}/artifacts/version-two.txt" \
+  "${ANVIL_QUALIFICATION_DIR}/artifacts/version-current.txt"
+current_delete="$(run_cli anvil-3 qversion-client "${version_secret}" \
+  delete-version qversion objects retained/value.txt 2 --durability replicated)"
+if [[ "${current_delete}" != 'deleted=true replacement_tombstone_version=3' ]]; then
+  echo "distributed current DeleteVersion returned: ${current_delete}" >&2
+  exit 1
+fi
+for version_node in anvil-1 anvil-2 anvil-3; do
+  version_head="$(run_cli "${version_node}" qversion-client "${version_secret}" \
+    head qversion objects retained/value.txt)"
+  if [[ "${version_head}" != 'deleted version=3' ]]; then
+    echo "${version_node} did not observe the fresh version-3 tombstone" >&2
+    exit 1
+  fi
+done
+echo "[anvil-qualification] distributed retained-version deletion test passed"
+
 list_secret=qualification-list-secret-00000000000000000000000
 provision_tenant qlist qlist-client "${list_secret}"
 create_bucket anvil-3 qlist-client "${list_secret}" objects
@@ -323,6 +366,57 @@ if [[ "${watch_paths}" != "${expected_list}" ]]; then
   exit 1
 fi
 echo "[anvil-qualification] distributed retained watch test passed"
+
+atomic_secret=qualification-atomic-secret-000000000000000000000
+provision_tenant qatomic qatomic-client "${atomic_secret}"
+create_bucket anvil-1 qatomic-client "${atomic_secret}" objects
+cat >"${ANVIL_QUALIFICATION_DIR}/artifacts/atomic-program.json" <<'JSON'
+{"schema_version":1,"documents":[{"name":"primary","path":{"tenant":"{tenant}","bucket":"objects","path":"atomic/primary.json"},"cardinality":"one","access":"read_write","allow_initial_json":true},{"name":"secondary","path":{"tenant":"{tenant}","bucket":"objects","path":"atomic/secondary.json"},"cardinality":"one","access":"read_write","allow_initial_json":true}],"assertions":[],"operations":[{"kind":"set_value","target":{"document":{"slot":"primary","index":0},"pointer":"/status"},"value":{"kind":"literal","value":"primary-committed"}},{"kind":"set_value","target":{"document":{"slot":"secondary","index":0},"pointer":"/status"},"value":{"kind":"literal","value":"secondary-committed"}}],"returns":[{"name":"primary_status","value":{"value":{"document":{"slot":"primary","index":0},"pointer":"/status"},"view":"current"}},{"name":"secondary_status","value":{"value":{"document":{"slot":"secondary","index":0},"pointer":"/status"},"view":"current"}}],"caps":{"max_paths":2,"max_writes":2,"max_operations":4,"max_input_bytes":4096,"max_document_bytes":4096}}
+JSON
+cat >"${ANVIL_QUALIFICATION_DIR}/artifacts/atomic-input.json" <<'JSON'
+{"bindings":{"primary":[{"path":{"tenant":"qatomic","bucket":"objects","path":"atomic/primary.json"},"template_values":{},"expected_head":{"kind":"absent"},"initial_json":{"status":"uncommitted"}}],"secondary":[{"path":{"tenant":"qatomic","bucket":"objects","path":"atomic/secondary.json"},"template_values":{},"expected_head":{"kind":"absent"},"initial_json":{"status":"uncommitted"}}]}}
+JSON
+printf '{"status":"primary-committed"}' \
+  >"${ANVIL_QUALIFICATION_DIR}/artifacts/atomic-primary.expected.json"
+printf '{"status":"secondary-committed"}' \
+  >"${ANVIL_QUALIFICATION_DIR}/artifacts/atomic-secondary.expected.json"
+chmod 0444 "${ANVIL_QUALIFICATION_DIR}/artifacts/atomic-"*.json
+run_cli anvil-1 qatomic-client "${atomic_secret}" \
+  put qatomic objects _anvil/programs/qualification@1 \
+  /qualification/artifacts/atomic-program.json \
+  --content-type application/json --command-id qatomic-install --immutable \
+  --durability replicated >/dev/null
+program_head="$(run_cli anvil-2 qatomic-client "${atomic_secret}" \
+  head qatomic objects _anvil/programs/qualification@1)"
+program_hash="$(sed -n 's/^present version=[0-9][0-9]* bytes=[0-9][0-9]* blake3=\([0-9a-f]\{64\}\)$/\1/p' \
+  <<<"${program_head}")"
+if [[ -z "${program_hash}" ]]; then
+  echo "program Head did not return its BLAKE3 identity: ${program_head}" >&2
+  exit 1
+fi
+run_cli anvil-2 qatomic-client "${atomic_secret}" \
+  set-policy qatomic objects --program-only atomic/ >/dev/null
+program_output="$(run_cli anvil-3 qatomic-client "${atomic_secret}" \
+  invoke-program qatomic objects _anvil/programs/qualification@1 \
+  qatomic-invocation --program-hash "${program_hash}" \
+  --durability replicated /qualification/artifacts/atomic-input.json)"
+if [[ "${program_output}" != \
+  '{"primary_status":"primary-committed","secondary_status":"secondary-committed"}' ]]; then
+  echo "atomic program returned unexpected output: ${program_output}" >&2
+  exit 1
+fi
+for atomic_node in anvil-1 anvil-2 anvil-3; do
+  for atomic_output in primary secondary; do
+    actual="${ANVIL_QUALIFICATION_DIR}/artifacts/atomic-${atomic_node}-${atomic_output}.json"
+    rm -f "${actual}"
+    run_cli "${atomic_node}" qatomic-client "${atomic_secret}" \
+      get qatomic objects "atomic/${atomic_output}.json" \
+      --output "/qualification/artifacts/atomic-${atomic_node}-${atomic_output}.json"
+    cmp "${ANVIL_QUALIFICATION_DIR}/artifacts/atomic-${atomic_output}.expected.json" \
+      "${actual}"
+  done
+done
+echo "[anvil-qualification] distributed atomic program test passed"
 
 ec_secret=qualification-ec-secret-0000000000000000000000000
 provision_tenant qec qec-client "${ec_secret}"
