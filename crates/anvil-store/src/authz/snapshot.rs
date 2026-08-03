@@ -367,39 +367,66 @@ impl AuthzRepository {
         self.install_quorum_reconciled_authz_realm(&aggregate)
     }
 
-    /// Installs one externally reconciled complete realm. Existing state must
-    /// be byte-for-byte logically equal; this method does not choose winners.
+    /// Installs one complete realm after the caller has already proved it as
+    /// the exact replica-quorum winner. This method does not choose winners.
     pub fn install_quorum_reconciled_authz_realm(
         &self,
         aggregate: &AuthzRealmAggregate,
     ) -> Result<AuthzRealmSnapshotApplied, AuthzRealmSnapshotError> {
-        aggregate.validate_with_repository_limits(
-            self.limits.evaluator,
-            self.limits.max_mutations_per_batch,
-        )?;
+        self.install_quorum_reconciled_authz_realm_candidate(&aggregate.scope, Some(aggregate))
+    }
+
+    /// Atomically installs the exact winner already proven by an external
+    /// replica quorum. This is deliberately not a general overwrite API: the
+    /// storage kernel chooses no winner and accepts no quorum evidence.
+    /// `None` removes a minority realm that lost to a quorum of absence.
+    pub fn install_quorum_reconciled_authz_realm_candidate(
+        &self,
+        scope: &AuthzScope,
+        aggregate: Option<&AuthzRealmAggregate>,
+    ) -> Result<AuthzRealmSnapshotApplied, AuthzRealmSnapshotError> {
+        scope.validate().map_err(invalid_aggregate)?;
+        if aggregate.is_some_and(|aggregate| aggregate.scope != *scope) {
+            return Err(invalid_aggregate(
+                "quorum winner belongs to another authorization realm",
+            ));
+        }
+        if let Some(aggregate) = aggregate {
+            aggregate.validate_with_repository_limits(
+                self.limits.evaluator,
+                self.limits.max_mutations_per_batch,
+            )?;
+        }
         let _guard = self.lock_writes()?;
         let now = current_unix_millis()?;
-        let mut incoming = aggregate.clone();
-        incoming
-            .receipts
-            .retain(|mutation| receipt_expiry(mutation) > now);
-        let snapshot = self.db.snapshot();
-        if let Some(existing) = self.read_realm_aggregate(&snapshot, &incoming.scope, now)? {
-            if existing == incoming {
-                return Ok(AuthzRealmSnapshotApplied {
-                    revision: incoming.revision,
-                    replayed: true,
-                    retained_receipts: incoming.receipts.len(),
-                });
-            }
-            return Err(AuthzRealmSnapshotError::SnapshotConflict);
+        let mut incoming = aggregate.cloned();
+        if let Some(incoming) = incoming.as_mut() {
+            incoming
+                .receipts
+                .retain(|mutation| receipt_expiry(mutation) > now);
         }
-        self.reject_partial_realm_state(&snapshot, &incoming.scope, now)?;
-        self.install_absent_realm(&incoming, now)?;
+        let snapshot = self.db.snapshot();
+        let existing = self.read_realm_aggregate(&snapshot, scope, now)?;
+        if existing == incoming {
+            return Ok(AuthzRealmSnapshotApplied {
+                revision: incoming
+                    .as_ref()
+                    .map_or(AuthzRevision::ZERO, |aggregate| aggregate.revision),
+                replayed: true,
+                retained_receipts: incoming
+                    .as_ref()
+                    .map_or(0, |aggregate| aggregate.receipts.len()),
+            });
+        }
+        self.replace_realm(scope, incoming.as_ref(), now)?;
         Ok(AuthzRealmSnapshotApplied {
-            revision: incoming.revision,
+            revision: incoming
+                .as_ref()
+                .map_or(AuthzRevision::ZERO, |aggregate| aggregate.revision),
             replayed: false,
-            retained_receipts: incoming.receipts.len(),
+            retained_receipts: incoming
+                .as_ref()
+                .map_or(0, |aggregate| aggregate.receipts.len()),
         })
     }
 
@@ -522,78 +549,80 @@ impl AuthzRepository {
         Ok(Some(aggregate))
     }
 
-    fn reject_partial_realm_state(
+    fn replace_realm(
         &self,
-        snapshot: &Snapshot<'_>,
         scope: &AuthzScope,
+        aggregate: Option<&AuthzRealmAggregate>,
         now: u64,
     ) -> Result<(), AuthzRealmSnapshotError> {
-        let prefix = tuple_prefix(scope);
-        if snapshot
-            .iterator_cf(
-                self.cf(CF_AUTHZ_TUPLES)?,
-                IteratorMode::From(&prefix, Direction::Forward),
-            )
-            .next()
-            .transpose()
-            .map_err(storage_error)?
-            .is_some_and(|(key, _)| key.starts_with(&prefix))
-        {
-            return Err(AuthzRealmSnapshotError::SnapshotConflict);
-        }
-        for item in snapshot.iterator_cf(self.cf(CF_AUTHZ_RECEIPTS)?, IteratorMode::Start) {
-            let (_, encoded) = item.map_err(storage_error)?;
-            let stored = decode_json::<StoredTupleReceipt>(&encoded)?;
-            validate_stored_tuple_receipt_shape(&stored).map_err(invalid_aggregate)?;
-            if stored.expires_at_unix_millis > now && stored.receipt.scope == *scope {
-                return Err(AuthzRealmSnapshotError::SnapshotConflict);
-            }
-        }
-        Ok(())
-    }
-
-    fn install_absent_realm(
-        &self,
-        aggregate: &AuthzRealmAggregate,
-        now: u64,
-    ) -> Result<(), AuthzRealmSnapshotError> {
-        let stored_schema = StoredSchema {
-            schema_ref: aggregate.schema.schema_ref.clone(),
-            schema: aggregate.schema.schema.clone(),
-            published_at_revision: aggregate.schema.published_at_revision,
-        };
-        let schema_key =
-            schema_revision_key(&aggregate.scope.storage_tenant, &stored_schema.schema_ref);
-        if let Some(existing) = self.read_json::<StoredSchema>(CF_AUTHZ_SCHEMAS, &schema_key)?
-            && existing != stored_schema
-        {
-            return Err(AuthzRealmSnapshotError::SnapshotConflict);
-        }
-        let digest_key = schema_digest_key(
-            &aggregate.scope.storage_tenant,
-            &stored_schema.schema_ref.schema_id,
-            stored_schema.schema_ref.schema_digest,
-        );
-        if let Some(existing) = self.read_json::<super::SchemaRef>(CF_AUTHZ_SCHEMAS, &digest_key)?
-            && existing != stored_schema.schema_ref
-        {
-            return Err(AuthzRealmSnapshotError::SnapshotConflict);
-        }
-
-        let mut encoded_receipts = Vec::with_capacity(aggregate.receipts.len());
-        for mutation in &aggregate.receipts {
-            let (key, stored) = stored_receipt_from_mutation(mutation)?;
-            if let Some(existing) = self.read_json::<StoredTupleReceipt>(CF_AUTHZ_RECEIPTS, &key)?
-                && existing.expires_at_unix_millis > now
+        let schema = aggregate.map(|aggregate| {
+            let stored = StoredSchema {
+                schema_ref: aggregate.schema.schema_ref.clone(),
+                schema: aggregate.schema.schema.clone(),
+                published_at_revision: aggregate.schema.published_at_revision,
+            };
+            let revision_key = schema_revision_key(&scope.storage_tenant, &stored.schema_ref);
+            let digest_key = schema_digest_key(
+                &scope.storage_tenant,
+                &stored.schema_ref.schema_id,
+                stored.schema_ref.schema_digest,
+            );
+            (stored, revision_key, digest_key)
+        });
+        if let Some((stored, revision_key, digest_key)) = schema.as_ref() {
+            if self
+                .read_json::<StoredSchema>(CF_AUTHZ_SCHEMAS, revision_key)?
+                .is_some_and(|existing| existing != *stored)
+                || self
+                    .read_json::<super::SchemaRef>(CF_AUTHZ_SCHEMAS, digest_key)?
+                    .is_some_and(|existing| existing != stored.schema_ref)
             {
                 return Err(AuthzRealmSnapshotError::SnapshotConflict);
             }
+        }
+
+        let mut encoded_receipts =
+            Vec::with_capacity(aggregate.map_or(0, |aggregate| aggregate.receipts.len()));
+        for mutation in aggregate
+            .into_iter()
+            .flat_map(|aggregate| &aggregate.receipts)
+        {
+            let (key, stored) = stored_receipt_from_mutation(mutation)?;
             let encoded = encode_json(&stored)?;
             encoded_receipts.push((key, encoded));
         }
-        let inventory = self.tuple_receipt_inventory(now)?;
-        let next_entries = inventory
-            .retained_entries
+        let mut retained_entries = 0_usize;
+        let mut retained_bytes = 0_u64;
+        let mut receipt_deletions = Vec::new();
+        for item in self
+            .db
+            .iterator_cf(self.cf(CF_AUTHZ_RECEIPTS)?, IteratorMode::Start)
+        {
+            let (key, encoded) = item.map_err(storage_error)?;
+            let stored = decode_json::<StoredTupleReceipt>(&encoded)?;
+            validate_stored_tuple_receipt_shape(&stored).map_err(invalid_aggregate)?;
+            let expected_key = receipt_key(
+                &stored.receipt.scope.storage_tenant,
+                &stored.receipt.principal,
+                &stored.operation_id,
+            )?;
+            if key.as_ref() != expected_key.as_slice() {
+                return Err(AuthzRealmSnapshotError::Store(AuthzStoreError::Storage(
+                    "authorization receipt key is inconsistent".into(),
+                )));
+            }
+            if stored.expires_at_unix_millis <= now || stored.receipt.scope == *scope {
+                receipt_deletions.push(key.to_vec());
+                continue;
+            }
+            retained_entries = retained_entries
+                .checked_add(1)
+                .ok_or(AuthzStoreError::ReceiptCapacity)?;
+            retained_bytes = retained_bytes
+                .checked_add(receipt_record_bytes(&key, &encoded)?)
+                .ok_or(AuthzStoreError::ReceiptCapacity)?;
+        }
+        let next_entries = retained_entries
             .checked_add(encoded_receipts.len())
             .ok_or(AuthzStoreError::ReceiptCapacity)?;
         let incoming_bytes = encoded_receipts
@@ -603,8 +632,7 @@ impl AuthzRepository {
                     .checked_add(receipt_record_bytes(key, value)?)
                     .ok_or(AuthzStoreError::ReceiptCapacity)
             })?;
-        let next_bytes = inventory
-            .retained_bytes
+        let next_bytes = retained_bytes
             .checked_add(incoming_bytes)
             .ok_or(AuthzStoreError::ReceiptCapacity)?;
         if next_entries > self.limits.max_receipt_entries
@@ -614,19 +642,40 @@ impl AuthzRepository {
         }
 
         let mut batch = WriteBatch::default();
+        batch.delete_cf(self.cf(CF_AUTHZ_BINDINGS)?, binding_key(scope));
+        let tuple_prefix = tuple_prefix(scope);
+        for item in self.db.iterator_cf(
+            self.cf(CF_AUTHZ_TUPLES)?,
+            IteratorMode::From(&tuple_prefix, Direction::Forward),
+        ) {
+            let (key, _) = item.map_err(storage_error)?;
+            if !key.starts_with(&tuple_prefix) {
+                break;
+            }
+            batch.delete_cf(self.cf(CF_AUTHZ_TUPLES)?, key);
+        }
+        for key in receipt_deletions {
+            batch.delete_cf(self.cf(CF_AUTHZ_RECEIPTS)?, key);
+        }
+        let Some(aggregate) = aggregate else {
+            self.write(batch)?;
+            return Ok(());
+        };
+        let (stored_schema, schema_key, digest_key) =
+            schema.expect("present aggregate has a prepared schema");
         batch.put_cf(
             self.cf(CF_AUTHZ_SCHEMAS)?,
-            &schema_key,
+            schema_key,
             encode_json(&stored_schema)?,
         );
         batch.put_cf(
             self.cf(CF_AUTHZ_SCHEMAS)?,
-            &digest_key,
+            digest_key,
             encode_json(&stored_schema.schema_ref)?,
         );
         batch.put_cf(
             self.cf(CF_AUTHZ_BINDINGS)?,
-            binding_key(&aggregate.scope),
+            binding_key(scope),
             encode_json(&StoredRealmBinding {
                 binding: aggregate.binding.clone(),
                 mutation_stamp: aggregate.mutation_stamp,
@@ -636,25 +685,18 @@ impl AuthzRepository {
         for tuple in &aggregate.tuples {
             batch.put_cf(
                 self.cf(CF_AUTHZ_TUPLES)?,
-                tuple_key(&aggregate.scope, tuple)?,
+                tuple_key(scope, tuple)?,
                 encode_json(&StoredTuple {
                     tuple: tuple.clone(),
                 })?,
             );
         }
-        for expired_key in inventory.expired_keys {
-            batch.delete_cf(self.cf(CF_AUTHZ_RECEIPTS)?, expired_key);
-        }
         for (key, encoded) in encoded_receipts {
             batch.put_cf(self.cf(CF_AUTHZ_RECEIPTS)?, key, encoded);
         }
-        let local_revision = self.tenant_revision(&aggregate.scope.storage_tenant)?;
+        let local_revision = self.tenant_revision(&scope.storage_tenant)?;
         if aggregate.revision > local_revision {
-            self.stage_tenant_revision(
-                &mut batch,
-                &aggregate.scope.storage_tenant,
-                aggregate.revision,
-            )?;
+            self.stage_tenant_revision(&mut batch, &scope.storage_tenant, aggregate.revision)?;
         }
         self.write(batch)?;
         Ok(())

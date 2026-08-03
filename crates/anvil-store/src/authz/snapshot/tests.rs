@@ -372,7 +372,7 @@ async fn streamed_transfer_rejects_integrity_failures_and_never_leaves_a_spool()
 }
 
 #[tokio::test]
-async fn install_rejects_conflicts_and_tampering() {
+async fn quorum_reconciled_install_replaces_stale_state_and_rejects_tampering() {
     let temporary = tempfile::tempdir().unwrap();
     let source = Store::open(StoreOptions::new(temporary.path().join("source"), 1))
         .await
@@ -398,14 +398,48 @@ async fn install_rejects_conflicts_and_tampering() {
             context("grant-newer", 5),
         )
         .unwrap();
+    let newest_mutation = source
+        .authz()
+        .coordinate_tuple_mutation(
+            tuple_request("documents", "grant-newest", 6, &[("five", "erin")]),
+            context("grant-newest", 6),
+        )
+        .unwrap()
+        .mutation
+        .unwrap();
     let newer = source
         .authz()
         .export_authz_realm(&scope("documents"))
         .unwrap()
         .unwrap();
     assert!(matches!(
+        target
+            .authz()
+            .apply_authz_realm_mutation_replica(&newest_mutation),
+        Err(AuthzStoreError::RealmMutationLineageGap { .. })
+    ));
+    assert_ne!(
+        target
+            .authz()
+            .export_authz_realm(&scope("documents"))
+            .unwrap(),
+        Some(newer.clone())
+    );
+    let applied = target
+        .authz()
+        .install_quorum_reconciled_authz_realm(&newer)
+        .unwrap();
+    assert!(!applied.replayed);
+    assert_eq!(
+        target
+            .authz()
+            .export_authz_realm(&scope("documents"))
+            .unwrap(),
+        Some(newer.clone())
+    );
+    assert!(matches!(
         target.authz().install_quorum_reconciled_authz_realm(&newer),
-        Err(AuthzRealmSnapshotError::SnapshotConflict)
+        Ok(AuthzRealmSnapshotApplied { replayed: true, .. })
     ));
 
     let mut unordered = initial.clone();
@@ -430,6 +464,82 @@ async fn install_rejects_conflicts_and_tampering() {
         bad_receipt.validate(),
         Err(AuthzRealmSnapshotError::InvalidAggregate(_))
     ));
+}
+
+#[tokio::test]
+async fn quorum_reconciled_install_replaces_a_minority_sibling_and_absence() {
+    let temporary = tempfile::tempdir().unwrap();
+    let template = Store::open(StoreOptions::new(temporary.path().join("template"), 1))
+        .await
+        .unwrap();
+    populate(&template.authz());
+    let initial = template
+        .authz()
+        .export_authz_realm(&scope("documents"))
+        .unwrap()
+        .unwrap();
+
+    let left = Store::open(StoreOptions::new(temporary.path().join("left"), 2))
+        .await
+        .unwrap();
+    let right = Store::open(StoreOptions::new(temporary.path().join("right"), 3))
+        .await
+        .unwrap();
+    for store in [&left, &right] {
+        store
+            .authz()
+            .install_quorum_reconciled_authz_realm(&initial)
+            .unwrap();
+    }
+    let left_mutation = left
+        .authz()
+        .coordinate_tuple_mutation(
+            tuple_request("documents", "left-sibling", 3, &[("left", "alice")]),
+            context("left-sibling", 7),
+        )
+        .unwrap()
+        .mutation
+        .unwrap();
+    let right_mutation = right
+        .authz()
+        .coordinate_tuple_mutation(
+            tuple_request("documents", "right-sibling", 3, &[("right", "bob")]),
+            context("right-sibling", 8),
+        )
+        .unwrap()
+        .mutation
+        .unwrap();
+    assert_eq!(left_mutation.revision(), right_mutation.revision());
+    assert!(matches!(
+        left.authz()
+            .apply_authz_realm_mutation_replica(&right_mutation),
+        Err(AuthzStoreError::RealmMutationSibling { .. })
+    ));
+
+    let winner = right
+        .authz()
+        .export_authz_realm(&scope("documents"))
+        .unwrap()
+        .unwrap();
+    left.authz()
+        .install_quorum_reconciled_authz_realm(&winner)
+        .unwrap();
+    assert_eq!(
+        left.authz()
+            .export_authz_realm(&scope("documents"))
+            .unwrap(),
+        Some(winner)
+    );
+
+    left.authz()
+        .install_quorum_reconciled_authz_realm_candidate(&scope("documents"), None)
+        .unwrap();
+    assert!(
+        left.authz()
+            .export_authz_realm(&scope("documents"))
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]

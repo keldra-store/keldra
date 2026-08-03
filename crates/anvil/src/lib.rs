@@ -1,6 +1,7 @@
 mod administration_service;
 pub mod authentication;
 mod authorization;
+mod authz_distribution;
 mod authz_api;
 mod authz_service;
 mod bootstrap;
