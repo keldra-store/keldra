@@ -124,6 +124,22 @@ cold-start work therefore grows with the number of index definitions. Anvil
 side plane; later releases can optimize discovery without changing the stored
 definition format.
 
+## Reference replay after a mixed 0.5.2 workload
+
+One published-image qualification run exposed a rolling-restart failure after
+the cluster had processed index generations, replicated overwrites, retained
+version deletion, and other mixed reference churn. The restarting node failed
+closed while ordered reference delivery repeatedly reported a
+`reference-delta count underflow`, so its public listener did not become ready
+within the 90-second qualification window. The other two ACTIVE nodes remained
+available, and the same rolling-restart gate had passed the earlier local
+AMD64 and ARM64 qualifications.
+
+Anvil 0.5.2 therefore does not claim that every mixed-workload rolling restart
+will recover without operator intervention. The failure did not affect clean
+three-node startup or the subsequent OSV ingestion qualification, but reference
+replay repair for this case remains deferred.
+
 ## First custom-realm binding in a multi-node 0.5.1 cluster
 
 The first schema binding for a custom Zanzibar realm must atomically create
