@@ -132,6 +132,7 @@ pub(crate) trait JoinActivationGate: Send + Sync + 'static {
 /// Keeps old-placement lease grants paused across the Raft activation append.
 pub(crate) struct JoinActivationPermit {
     _lease_pause: Option<anvil_consensus::ServingLeaseGrantPause>,
+    _program_quiescence: Option<crate::programs::ProgramQuiescenceGuard>,
 }
 
 impl std::fmt::Debug for JoinActivationPermit {
@@ -139,20 +140,28 @@ impl std::fmt::Debug for JoinActivationPermit {
         formatter
             .debug_struct("JoinActivationPermit")
             .field("lease_pause", &self._lease_pause.is_some())
+            .field("program_quiescence", &self._program_quiescence.is_some())
             .finish()
     }
 }
 
 impl JoinActivationPermit {
-    pub(crate) fn after_handoff(pause: anvil_consensus::ServingLeaseGrantPause) -> Self {
+    pub(crate) fn after_handoff(
+        pause: anvil_consensus::ServingLeaseGrantPause,
+        program_quiescence: crate::programs::ProgramQuiescenceGuard,
+    ) -> Self {
         Self {
             _lease_pause: Some(pause),
+            _program_quiescence: Some(program_quiescence),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn test_only() -> Self {
-        Self { _lease_pause: None }
+        Self {
+            _lease_pause: None,
+            _program_quiescence: None,
+        }
     }
 }
 

@@ -7,8 +7,8 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anvil_consensus::{
-    ClusterId, DecisionRaft, NodeId, NodeState, PeerNode, SERVING_LEASE_RENEW_INTERVAL,
-    ServingLeaseState, TonicPeerTransport,
+    ApplyResult, ClusterId, Command, DecisionRaft, NodeId, NodeState, PeerNode,
+    SERVING_LEASE_RENEW_INTERVAL, ServingLeaseState, StateMachine, TonicPeerTransport,
 };
 use anvil_store::{ObjectMutationContext, PlacementLogId};
 use anyhow::{Context, Result, bail};
@@ -214,6 +214,7 @@ async fn renew_once(
         descriptor.state == NodeState::Active,
         "current Raft leader is not ACTIVE"
     );
+    repair_executor_nomination(decisions, &state, NodeId(leader)).await?;
     let peer = PeerNode::new(descriptor.peer_address.0.clone());
     let pending = {
         let mut local = authority
@@ -236,6 +237,56 @@ async fn renew_once(
         .accept_grant(pending, grant)
         .context("accept current leader serving grant")?;
     Ok(())
+}
+
+/// Only the current ACTIVE leader repairs a missing or ineligible executor.
+/// NominateExecutor is the existing durable fence; no separate election state
+/// or timer is introduced.
+async fn repair_executor_nomination(
+    decisions: &DecisionRaft,
+    state: &StateMachine,
+    leader: NodeId,
+) -> Result<()> {
+    if executor_nominee(state, leader, NodeId(decisions.node_id())) != Some(leader) {
+        return Ok(());
+    }
+    let applied = decisions
+        .submit(Command::NominateExecutor { executor: leader })
+        .await
+        .context("repair atomic executor nomination")?;
+    anyhow::ensure!(
+        matches!(
+            applied.result,
+            ApplyResult::ExecutorNominated(nomination) if nomination.executor == leader
+        ),
+        "atomic executor nomination returned an unexpected result"
+    );
+    tracing::info!(
+        node_id = leader.0,
+        monotonic_counter.anvil_atomic_program_executor_nominations_total = 1_u64,
+        "ACTIVE Raft leader repaired the atomic executor nomination"
+    );
+    Ok(())
+}
+
+fn executor_nominee(state: &StateMachine, leader: NodeId, local: NodeId) -> Option<NodeId> {
+    if local != leader
+        || state
+            .cluster_control()
+            .nodes()
+            .get(&leader)
+            .is_none_or(|descriptor| descriptor.state != NodeState::Active)
+    {
+        return None;
+    }
+    let current_is_active = state.executor().is_some_and(|nomination| {
+        state
+            .cluster_control()
+            .nodes()
+            .get(&nomination.executor)
+            .is_some_and(|descriptor| descriptor.state == NodeState::Active)
+    });
+    (!current_is_active).then_some(leader)
 }
 
 #[cfg(test)]
@@ -298,6 +349,23 @@ mod tests {
             .cluster_control()
             .active_placement_log_id()
             .unwrap();
+        assert_eq!(
+            executor_nominee(&raft.state().unwrap(), NodeId(1), NodeId(1)),
+            Some(NodeId(1))
+        );
+        assert_eq!(
+            executor_nominee(&raft.state().unwrap(), NodeId(1), NodeId(2)),
+            None
+        );
+        raft.submit(Command::NominateExecutor {
+            executor: NodeId(1),
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            executor_nominee(&raft.state().unwrap(), NodeId(1), NodeId(1)),
+            None
+        );
         let state = ServingLeaseState::new(cluster_id, first);
         let authority = ServingAuthority::new(cluster_id, raft.clone(), state);
         assert_eq!(

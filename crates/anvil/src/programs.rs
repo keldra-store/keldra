@@ -1,12 +1,10 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
 use std::path::Path;
-#[cfg(test)]
-use std::time::Duration;
 
 use anvil_atomic_program::{
     CommandReceipt, EngineError, ExpandedProgramPath, InvocationContext, ObjectPath, ProgramInput,
@@ -27,10 +25,15 @@ use anyhow::{Context, Result, bail};
 use tonic::Status;
 use tracing::Instrument as _;
 
+mod distributed;
+
+use distributed::DistributedPrograms;
+
 pub(crate) const MAX_PROGRAM_INPUT_BYTES: usize = 16 * 1024 * 1024;
 const PROGRAM_PATH_PREFIX: &str = "_anvil/programs/";
 const LOCAL_DURABILITY_CLASS: &str = "local";
 const REPLICATED_DURABILITY_CLASS: &str = "replicated";
+const ATOMIC_VISIBILITY_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 #[derive(Clone)]
 pub(crate) struct ProgramCoordinator {
@@ -41,6 +44,35 @@ pub(crate) struct ProgramCoordinator {
     /// finalization. Program evaluation and exact-path locking remain
     /// concurrent before this short boundary.
     commit_gate: Arc<tokio::sync::Mutex<()>>,
+    distributed: Arc<std::sync::OnceLock<DistributedPrograms>>,
+}
+
+/// Late binding used by the private join listener, which must begin accepting
+/// connections before the distributed program coordinator can be assembled.
+#[derive(Clone, Default)]
+pub(crate) struct LateBoundProgramQuiescence {
+    coordinator: Arc<std::sync::OnceLock<ProgramCoordinator>>,
+}
+
+pub(crate) struct ProgramQuiescenceGuard {
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl LateBoundProgramQuiescence {
+    pub(crate) fn install(
+        &self,
+        coordinator: ProgramCoordinator,
+    ) -> Result<(), ProgramCoordinator> {
+        self.coordinator.set(coordinator)
+    }
+
+    pub(crate) async fn quiesce_for_membership(&self) -> Result<ProgramQuiescenceGuard, Status> {
+        self.coordinator
+            .get()
+            .ok_or_else(|| Status::unavailable("atomic program coordinator is not ready"))?
+            .quiesce_for_membership()
+            .await
+    }
 }
 
 #[derive(Debug)]
@@ -54,16 +86,165 @@ pub(crate) struct InvokedProgramResult {
     pub replay_guarantee_expires_at_unix_millis: u64,
 }
 
+/// True only when this node's applied Raft state has no committed atomic batch
+/// awaiting finalization. Callers perform their data read first and discard it
+/// when this returns false.
+pub(crate) fn atomic_tail_is_clear(decisions: &DecisionRaft) -> Result<bool, Status> {
+    let state = decisions.state().map_err(decision_status)?;
+    Ok(state.unfinalized_commit_len() == 0)
+}
+
+/// Wait for the locally applied atomic tail to become fully finalized. The
+/// caller must re-read data afterwards because its discarded snapshot may have
+/// been taken while only part of a batch was physically finalized.
+pub(crate) async fn wait_for_atomic_tail(
+    decisions: &DecisionRaft,
+    budget: Duration,
+) -> Result<(), Status> {
+    wait_for_visibility(budget, || atomic_tail_is_clear(decisions)).await
+}
+
+/// Fence one exact current-head read using the program cursor already carried
+/// by its mutation stamp. A node that has not yet applied that cursor waits;
+/// the head is exposed only after its applied Raft state includes the global
+/// FinalizedThrough decision.
+pub(crate) async fn wait_for_program_cursor(
+    decisions: &DecisionRaft,
+    cursor: Option<u64>,
+    budget: Duration,
+) -> Result<(), Status> {
+    let Some(cursor) = cursor else {
+        return Ok(());
+    };
+    if cursor == 0 {
+        return Err(Status::data_loss(
+            "atomic-program head carries a zero commit cursor",
+        ));
+    }
+    wait_for_visibility(budget, || program_cursor_is_visible(decisions, cursor)).await
+}
+
+pub(crate) fn program_cursor_is_visible(
+    decisions: &DecisionRaft,
+    cursor: u64,
+) -> Result<bool, Status> {
+    if cursor == 0 {
+        return Err(Status::data_loss(
+            "atomic-program head carries a zero commit cursor",
+        ));
+    }
+    let state = decisions.state().map_err(decision_status)?;
+    if state
+        .finalized_through()
+        .is_some_and(|finalized| finalized >= cursor)
+    {
+        return Ok(true);
+    }
+    if state.committed_invocation(cursor).is_some() {
+        return Ok(false);
+    }
+    if state
+        .last_commit_cursor()
+        .is_some_and(|last| last >= cursor)
+    {
+        return Err(Status::data_loss(
+            "atomic-program head names an unknown committed invocation",
+        ));
+    }
+    Ok(false)
+}
+
+async fn wait_for_visibility(
+    budget: Duration,
+    mut visible: impl FnMut() -> Result<bool, Status>,
+) -> Result<(), Status> {
+    let deadline = Instant::now()
+        .checked_add(budget)
+        .ok_or_else(|| Status::invalid_argument("visibility deadline overflowed"))?;
+    loop {
+        if visible()? {
+            return Ok(());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(Status::deadline_exceeded(
+                "atomic-program visibility deadline exceeded",
+            ));
+        }
+        tokio::time::sleep(remaining.min(ATOMIC_VISIBILITY_POLL_INTERVAL)).await;
+    }
+}
+
 impl ProgramCoordinator {
+    pub(crate) fn cursor_is_visible(&self, cursor: u64) -> Result<bool, Status> {
+        program_cursor_is_visible(&self.decisions, cursor)
+    }
+
+    pub(crate) async fn wait_for_cursor(
+        &self,
+        cursor: u64,
+        budget: Duration,
+    ) -> Result<(), Status> {
+        wait_for_program_cursor(&self.decisions, Some(cursor), budget).await
+    }
+
+    /// Stop local program commits across an ACTIVE-placement cutover. The
+    /// Raft leader first fences any previous executor nomination, then recovers
+    /// the bounded committed tail before returning the held local gate.
+    pub(crate) async fn quiesce_for_membership(&self) -> Result<ProgramQuiescenceGuard, Status> {
+        let guard = self.commit_gate.clone().lock_owned().await;
+        self.decisions
+            .confirm_leadership()
+            .await
+            .map_err(decision_status)?;
+        let state = self.decisions.state().map_err(decision_status)?;
+        let local = state.cluster_control().nodes().get(&self.node);
+        if local.is_none_or(|descriptor| descriptor.state != anvil_consensus::NodeState::Active) {
+            return Err(Status::failed_precondition(
+                "membership cutover leader is not an ACTIVE node",
+            ));
+        }
+        if state
+            .executor()
+            .is_none_or(|nomination| nomination.executor != self.node)
+        {
+            let nomination = self
+                .decisions
+                .submit(Command::NominateExecutor {
+                    executor: self.node,
+                })
+                .await
+                .map_err(decision_status)?;
+            expect_nomination(nomination.result, self.node).map_err(internal)?;
+        }
+        if self.distributed.get().is_some() {
+            self.recover_distributed_tail_locked().await?;
+        } else {
+            self.recover_committed_tail_locked()
+                .await
+                .map_err(internal)?;
+        }
+        if !atomic_tail_is_clear(&self.decisions)? {
+            return Err(Status::unavailable(
+                "atomic program tail is not finalized before membership cutover",
+            ));
+        }
+        self.decisions
+            .confirm_leadership()
+            .await
+            .map_err(decision_status)?;
+        Ok(ProgramQuiescenceGuard { _guard: guard })
+    }
+
     /// Attach the atomic-program coordinator to a Raft instance already
     /// opened and initialized by the server runtime.
     pub async fn start(store: Store, decisions: DecisionRaft, node: NodeId) -> Result<Self> {
-        if decisions.state()?.executor().is_none() {
+        if decisions.state()?.executor().is_none() && decisions.current_leader() == Some(node.0) {
             let _nomination = expect_nomination(
                 decisions
                     .submit(Command::NominateExecutor { executor: node })
                     .await
-                    .context("nominate the one-node atomic executor")?
+                    .context("nominate the leader as atomic executor")?
                     .result,
                 node,
             )?;
@@ -78,13 +259,55 @@ impl ProgramCoordinator {
             decisions,
             node,
             commit_gate: Arc::new(tokio::sync::Mutex::new(())),
+            distributed: Arc::new(std::sync::OnceLock::new()),
         };
-        coordinator
-            .recover_committed_tail()
-            .await
-            .context("recover committed atomic-program bundles")?;
+        if coordinator
+            .decisions
+            .state()?
+            .cluster_control()
+            .nodes()
+            .len()
+            <= 1
+        {
+            coordinator
+                .recover_committed_tail()
+                .await
+                .context("recover committed atomic-program bundles")?;
+        }
         coordinator.emit_bounded_state_metrics();
         Ok(coordinator)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn install_distributed(
+        &self,
+        reader: crate::cluster_object_read::ClusterObjectReader,
+        objects: crate::object_distribution::ObjectDistribution,
+        peers: crate::cluster_peer::ClusterPeerTransport,
+        names: crate::logical_name_resolution::LogicalNameResolver,
+    ) -> Result<()> {
+        self.distributed
+            .set(DistributedPrograms::new(
+                self.node,
+                self.store.clone(),
+                reader,
+                objects,
+                peers,
+                names,
+            ))
+            .map_err(|_| anyhow::anyhow!("distributed atomic programs were installed twice"))?;
+        if self
+            .decisions
+            .state()?
+            .executor()
+            .is_some_and(|nomination| nomination.executor == self.node)
+        {
+            let _guard = self.commit_gate.lock().await;
+            self.recover_distributed_tail_locked()
+                .await
+                .context("recover distributed atomic-program tail")?;
+        }
+        Ok(())
     }
 
     /// Execute only on the nominated node. The API layer performs Zanzibar
@@ -1178,6 +1401,7 @@ mod tests {
             .unwrap();
         let committed = expect_batch_committed(committed.result).unwrap();
         let commit_cursor = committed.invocation.committed_batch.commit_cursor;
+        assert!(!coordinator.cursor_is_visible(commit_cursor).unwrap());
         drop(lease);
         drop(engine);
         coordinator.decisions.shutdown().await.unwrap();
@@ -1191,6 +1415,7 @@ mod tests {
         let state = reopened.decisions.state().unwrap();
         assert_eq!(state.finalized_through(), Some(commit_cursor));
         assert_eq!(state.unfinalized_commit_len(), 0);
+        assert!(reopened.cursor_is_visible(commit_cursor).unwrap());
         assert_eq!(
             reopened_store.applied_program_commit_cursor().unwrap(),
             Some(commit_cursor)

@@ -781,6 +781,10 @@ impl DecisionRaft {
         self.raft.metrics().borrow().current_leader
     }
 
+    pub fn node_id(&self) -> u64 {
+        self.node_id
+    }
+
     /// Confirm that this node is the current leader through a linearizable
     /// voter-quorum round, reusing one successful proof for no more than 500
     /// milliseconds.

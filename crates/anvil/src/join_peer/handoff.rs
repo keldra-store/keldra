@@ -21,6 +21,7 @@ use super::{JoinActivationGate, JoinActivationPermit};
 use crate::data_peer::DataPeerTransport;
 use crate::payload_read::AnonymousPayloadReadSpools;
 use crate::placement::{PlacementKind, PlacementNode, rank_nodes};
+use crate::programs::LateBoundProgramQuiescence;
 
 mod merge;
 mod payload;
@@ -33,6 +34,7 @@ pub(crate) struct TypedAddHandoff {
     store: Store,
     peers: DataPeerTransport,
     leases: ServingLeaseIssuer,
+    programs: LateBoundProgramQuiescence,
     profile: ErasureProfile,
 }
 
@@ -66,6 +68,7 @@ impl TypedAddHandoff {
         store: Store,
         peers: DataPeerTransport,
         leases: ServingLeaseIssuer,
+        programs: LateBoundProgramQuiescence,
         profile: ErasureProfile,
     ) -> Self {
         Self {
@@ -74,6 +77,7 @@ impl TypedAddHandoff {
             store,
             peers,
             leases,
+            programs,
             profile,
         }
     }
@@ -339,6 +343,7 @@ impl JoinActivationGate for TypedAddHandoff {
         // Linearize the pause after every in-flight old grant has completed,
         // then allow the full two-second authority plus scheduler margin to
         // expire before taking the final stable snapshot.
+        let program_quiescence = self.programs.quiesce_for_membership().await?;
         let lease_pause = self.leases.pause_grants().await;
         tokio::time::sleep(SERVING_LEASE_CUTOVER_WAIT).await;
         self.require_current(descriptor, transition).await?;
@@ -369,7 +374,10 @@ impl JoinActivationGate for TypedAddHandoff {
             ));
         }
         self.require_current(descriptor, transition).await?;
-        Ok(JoinActivationPermit::after_handoff(lease_pause))
+        Ok(JoinActivationPermit::after_handoff(
+            lease_pause,
+            program_quiescence,
+        ))
     }
 }
 
