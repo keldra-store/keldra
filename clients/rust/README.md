@@ -7,7 +7,7 @@ generated Anvil 0.5 protocol types.
 ## Install
 
 ```sh
-cargo add anvil-storage@0.5.0
+cargo add anvil-storage@0.5.1
 cargo add tokio --features macros,rt-multi-thread
 ```
 

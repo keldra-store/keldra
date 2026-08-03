@@ -70,6 +70,7 @@ WORKDIR /var/lib/anvil
 # Mount a distinct mode-0600 signing key at the configured path. On the first
 # start only, set ANVIL_RUN_SYSTEM_BOOTSTRAP=true and then copy and delete the
 # generated /var/lib/anvil/system-bootstrap-credential.json file.
-EXPOSE 50051
+# Public gRPC and cluster-managed mTLS peer transport, respectively.
+EXPOSE 50051 50052
 
 CMD ["anvil-server"]

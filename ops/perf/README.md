@@ -6,7 +6,7 @@ object plus mutable head for every input document.
 
 This repository contains no OSV corpus or measured result. A valid run pins the
 exact ZIP bytes, supplies the acquisition's explicit snapshot day, identifies
-the Anvil revision, and targets a clean single-node bucket.
+the Anvil revision, and targets a clean one-node bucket.
 
 ## Qualified shape
 
@@ -82,9 +82,10 @@ and BLAKE3 payload digest. A completed run fails if it exceeds 150 seconds, an
 item fails, any mutation replays on the verified-empty target, or verification
 is incomplete.
 
-`durability` is a closed choice. `local` is the only valid single-node 0.5.0
-qualification mode. `replicated` remains part of the API but is unavailable on
-one node and is rejected before the run.
+`durability` is a closed choice. `local` is the only valid mode for this
+one-node 0.5.1 qualification. `replicated` remains part of the API and requires
+enough active nodes for the configured erasure profile, so the tool rejects it
+before a one-node run.
 
 ## Comparing batching
 

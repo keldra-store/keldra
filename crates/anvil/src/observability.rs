@@ -191,7 +191,7 @@ mod tests {
         );
         assert_eq!(
             resource.get(&Key::new("service.version")),
-            Some(Value::from("0.5.0"))
+            Some(Value::from("0.5.1"))
         );
         assert_eq!(resource.get(&Key::new("node.id")), Some(Value::I64(41)));
     }

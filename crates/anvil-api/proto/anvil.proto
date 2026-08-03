@@ -4,7 +4,7 @@ package anvil.v1;
 
 import "google/protobuf/timestamp.proto";
 
-// The complete public Anvil 0.5.0 network contract. There is deliberately no
+// The complete public Anvil 0.5 network contract. There is deliberately no
 // peer, transaction-lifecycle, detached-blob, index, or gateway service in this
 // release. Ordinary object calls are independent. Only InvokeProgram requests
 // atomic multi-path visibility.
@@ -131,9 +131,11 @@ message ObjectAddress {
   string path = 3;
 }
 
-// LOCAL is the default for speed. REPLICATED is an explicit opt-in and part of
-// the stable API, but Anvil 0.5.0 returns DURABILITY_UNAVAILABLE without
-// publishing because it has one node. Unknown values are invalid.
+// LOCAL is the default for speed: the ingress acknowledges after its durable
+// local write while normal placement continues. REPLICATED waits for the fixed
+// 2+1 payload layout (or the corresponding mutable-record quorum) before
+// acknowledging. A cluster that cannot satisfy the requested class returns
+// DURABILITY_UNAVAILABLE without publishing. Unknown values are invalid.
 enum Durability {
   DURABILITY_LOCAL = 0;
   DURABILITY_REPLICATED = 1;
@@ -553,7 +555,7 @@ message ProvisionTenantResponse {
 
 // Application IDs and client IDs are cluster-wide authentication identities;
 // each is globally unique. An application has exactly one client credential
-// in 0.5.0. Supplying the same canonical application, client ID and secret is
+// in Anvil 0.5. Supplying the same canonical application, client ID and secret is
 // an idempotent replay.
 message CreateApplicationRequest {
   string app_id = 1;

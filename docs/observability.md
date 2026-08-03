@@ -28,7 +28,7 @@ API.
 Metrics and traces share these resource attributes:
 
 - `service.name=anvil`
-- `service.version=0.5.0`
+- `service.version=0.5.1`
 - `node.id=<ANVIL_NODE_ID>`
 
 Trace export uses a dedicated worker with a 2,048-span queue and batches of at
@@ -71,7 +71,7 @@ The Anvil 0.5 process metric vocabulary covers:
 The OSV qualification tool separately writes a measured JSON
 report. It is benchmark output, not an OTLP process metric.
 
-Two requested signals are deliberately not approximated in 0.5.0.
+Two requested signals are deliberately not approximated in 0.5.1.
 The store does not expose an exact instantaneous orphan-byte/count inventory,
 and the atomic engine does not expose lock acquisition separately from its
 combined prepare operation. Anvil does not add full-store scans or new durable

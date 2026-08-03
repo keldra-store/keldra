@@ -617,7 +617,7 @@ fn deterministic_batch_boundary_honours_items_and_payload() {
 }
 
 #[test]
-fn single_node_qualification_accepts_only_local_durability() {
+fn one_node_qualification_accepts_only_local_durability() {
     assert!(<DurabilityArgument as clap::ValueEnum>::from_str("local", false).is_ok());
     for rejected in ["replicated", "quorum", "anything", " local", "local "] {
         let parsed = <DurabilityArgument as clap::ValueEnum>::from_str(rejected, false);

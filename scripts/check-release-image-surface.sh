@@ -71,5 +71,6 @@ fi
 
 grep -Fq 'FROM --platform=$TARGETPLATFORM rust:1.96-trixie AS builder' crates/anvil/Dockerfile
 grep -Fq 'FROM --platform=$TARGETPLATFORM debian:trixie-slim' crates/anvil/Dockerfile
+grep -Fq 'EXPOSE 50051 50052' crates/anvil/Dockerfile
 grep -Fq -- '--file crates/anvil/Dockerfile' scripts/build-image.sh
 grep -Fq -- '--file crates/anvil/Dockerfile' "${release_workflow}"

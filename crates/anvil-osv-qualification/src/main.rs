@@ -109,7 +109,7 @@ struct Args {
     #[arg(long, default_value_t = DEFAULT_SOURCE_CADENCE_HOURS)]
     source_cadence_hours: u16,
 
-    /// Replicated durability is unavailable in the single-node 0.5.0 gate.
+    /// The one-node 0.5.1 qualification uses local acknowledgement.
     #[arg(long, value_enum, default_value = "local")]
     durability: DurabilityArgument,
 
@@ -797,9 +797,9 @@ async fn main() -> Result<()> {
         },
         limitations: vec![
             "The authoritative qualification shape is one source definition, immutable compressed content-addressed shards, and one immutable manifest; it deliberately does not create a raw object and mutable head for every upstream JSON document.",
-            "Shard attributes are carried by the authoritative manifest. Anvil 0.5.0 receives no per-object user metadata and this tool creates no metadata sidecar.",
+            "Shard attributes are carried by the authoritative manifest. Anvil 0.5.1 receives no per-object user metadata and this tool creates no metadata sidecar.",
             "The required --snapshot-day and pinned archive hash determine the snapshot identity; the local clock never participates.",
-            "Anvil 0.5 accepts exactly local or replicated durability: local performs the write and replicated is unavailable in this single-node qualification.",
+            "Anvil 0.5 accepts local or replicated durability. This one-node qualification uses local acknowledgement; replicated acknowledgement requires enough active nodes for the configured erasure profile.",
             "Independent verification checks each current version, content length, content type, and BLAKE3 payload digest through HeadObject without downloading the payload again.",
         ],
     };

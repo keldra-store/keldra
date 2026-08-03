@@ -12,11 +12,11 @@ current-head keyspace.
 
 Applications that need several exact paths to change together write a bounded
 deterministic program as an immutable ordinary object below `_anvil/programs/`,
-then explicitly invoke that pinned object. The singleton executor locks its
-expanded paths locally in canonical order and evaluates against the latest
-committed state. A compact Raft decision makes an already durable prepared
-bundle visible. Raft never carries object bodies, path inventories, locks,
-waiters, or program definitions.
+then explicitly invoke that pinned object. The Raft-nominated executor
+serializes the invocation while exact-path coordinators prepare its writes on
+the ordinary distributed data plane. A compact Raft decision makes the already
+durable prepared bundle visible. Raft never carries object bodies, path
+inventories, locks, waiters, or program definitions.
 
 `InvokeProgram` has one absolute execution budget covering lock acquisition,
 evaluation, commit and finalization. The startup-only maximum defaults to 30
@@ -26,14 +26,16 @@ that budget but cannot extend it; expiry returns gRPC `DEADLINE_EXCEEDED`.
 
 ## Implementation status
 
-The complete 0.5.0 capability is released. The production
-surface includes authenticated object/CAS/bulk operations, immutable and
-`PROGRAM_ONLY` policy, typed Zanzibar administration and application realms,
-explicit bootstrap and credential exchange, public atomic-program invocation
-and recovery, and bounded resumable `WatchPrefix`. Functional release evidence
-includes the full local suite, crash/manual QA, and both container
-architectures. A pinned OSV import is the post-release performance baseline;
-misses are profiled and corrected without rewriting the immutable 0.5.0 tag.
+Anvil 0.5.1 adds one flat cluster of heterogeneous nodes without changing the
+public 0.5 object API. Any active node can accept a request. Compact control
+state stays in Raft, exact-key ownership is derived with capacity-weighted
+rendezvous hashing, mutable logical records are replicated, and large payloads
+use systematic erasure coding. The production surface includes authenticated
+object/CAS/bulk operations, immutable and `PROGRAM_ONLY` policy, typed Zanzibar
+administration and application realms, explicit bootstrap and credential
+exchange, recoverable atomic-program invocation, and bounded resumable
+`WatchPrefix`. The release is published as one AMD64/ARM64 container tag. A
+pinned one-node OSV import remains the post-release performance baseline.
 
 ## Deliberate 0.5 break
 
@@ -109,7 +111,8 @@ already-issued tokens remain valid until their one-hour expiry.
 - `crates/anvil`: server transport and integration.
 - `clients/rust`: thin authenticated Rust transport.
 - `docs/rfcs/anvil_0009_atomic_programs.md`: complete 0.5 architecture and invariants.
-- `docs/known-limitations.md`: explicit 0.5.0 limitations that operators and clients must account for.
+- `docs/rfcs/anvil_0010_cluster_distribution.md`: the flat-cluster distribution architecture.
+- `docs/known-limitations.md`: current 0.5.x operational boundaries.
 
 ## Development
 
@@ -118,32 +121,34 @@ cargo fmt --all -- --check
 cargo test --workspace
 ```
 
-Before creating the `0.5.0` Git tag, qualify both release images locally. The
+Before creating the `0.5.1` Git tag, qualify both release images locally. The
 architecture-specific names below remain in the local Docker daemon; they are
 never pushed to GHCR.
 
 ```sh
 ANVIL_DOCKER_PLATFORM=linux/amd64 \
-ANVIL_IMAGE=anvil:0.5.0-local-amd64 \
+ANVIL_IMAGE=anvil:0.5.1-local-amd64 \
 ./scripts/build-image.sh
-ANVIL_IMAGE=anvil:0.5.0-local-amd64 ./scripts/release-gates.sh image
+ANVIL_IMAGE=anvil:0.5.1-local-amd64 ./scripts/release-gates.sh image
 
 ANVIL_DOCKER_PLATFORM=linux/arm64 \
-ANVIL_IMAGE=anvil:0.5.0-local-arm64 \
+ANVIL_IMAGE=anvil:0.5.1-local-arm64 \
 ./scripts/build-image.sh
-ANVIL_IMAGE=anvil:0.5.0-local-arm64 ./scripts/release-gates.sh image
+ANVIL_IMAGE=anvil:0.5.1-local-arm64 ./scripts/release-gates.sh image
 ```
 
 Each image is compiled from source inside a `rust:1.96-trixie` builder for its
 target platform and runs on `debian:trixie-slim`. Release publication rebuilds
 the same Dockerfile as one public multi-platform image. Its repository follows
-`ghcr.io/OWNER/anvil:0.5.0`, where `OWNER` is the GitHub repository owner.
+`ghcr.io/OWNER/anvil:0.5.1`, where `OWNER` is the GitHub repository owner.
 There are no public architecture-specific or `v`-prefixed image tags.
 
 ## First start
 
 Anvil has no insecure or static-token mode. Create an operator-managed signing
-key, keep it mode `0600`, and run bootstrap exactly once:
+key, keep it mode `0600`, and bootstrap the first node exactly once. Additional
+nodes join with an authorized mode-`0600` bundle created by `prepare-node`; they
+never run system bootstrap independently.
 
 ```sh
 head -c 64 /dev/urandom > anvil-token-signing-key

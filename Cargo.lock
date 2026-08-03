@@ -95,7 +95,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-api"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "prost",
  "prost-types",
@@ -106,7 +106,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-atomic-program"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "blake3",
  "serde",
@@ -117,7 +117,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-authz"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -125,7 +125,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-consensus"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "bincode",
  "hyper-util",
@@ -147,7 +147,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-osv-qualification"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anvil-api",
  "anyhow",
@@ -167,7 +167,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-server"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anvil-api",
  "anvil-atomic-program",
@@ -206,7 +206,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-storage"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anvil-api",
  "tokio",
@@ -216,7 +216,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-storage-cli"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anvil-storage",
  "anyhow",
@@ -232,7 +232,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-store"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anvil-atomic-program",
  "anvil-authz",
