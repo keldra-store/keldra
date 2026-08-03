@@ -587,11 +587,14 @@ impl AuthzRepository {
             published_at_revision: schema.published_at_revision,
         };
         let revision_key = schema_revision_key(tenant, &stored.schema_ref);
-        if let Some(existing) = self.read_json::<StoredSchema>(CF_AUTHZ_SCHEMAS, &revision_key)?
-            && existing != stored
-        {
-            return Err(AuthzStoreError::RealmMutationConflict);
-        }
+        let revision_exists =
+            match self.read_json::<StoredSchema>(CF_AUTHZ_SCHEMAS, &revision_key)? {
+                Some(existing) if existing != stored => {
+                    return Err(AuthzStoreError::RealmMutationConflict);
+                }
+                Some(_) => true,
+                None => false,
+            };
         let digest_key = schema_digest_key(
             tenant,
             &stored.schema_ref.schema_id,
@@ -602,11 +605,13 @@ impl AuthzRepository {
         {
             return Err(AuthzStoreError::RealmMutationConflict);
         }
-        batch.put_cf(
-            self.cf(CF_AUTHZ_SCHEMAS)?,
-            revision_key,
-            encode_json(&stored)?,
-        );
+        if !revision_exists {
+            batch.put_cf(
+                self.cf(CF_AUTHZ_SCHEMAS)?,
+                revision_key,
+                encode_json(&stored)?,
+            );
+        }
         batch.put_cf(
             self.cf(CF_AUTHZ_SCHEMAS)?,
             digest_key,

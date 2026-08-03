@@ -136,6 +136,7 @@ pub(crate) struct AuthzSchemaReplicaQuery {
     pub(crate) schema_ref: SchemaRef,
     pub(crate) schema: Schema,
     pub(crate) published_at_revision: AuthzRevision,
+    pub(crate) publication_mutation: Option<AuthzSchemaPublicationMutation>,
 }
 
 #[derive(Clone, Debug)]
@@ -212,6 +213,7 @@ impl AuthzDistributionCore {
             schema_ref: coordinated.result.schema_ref.clone(),
             schema,
             published_at_revision: coordinated.result.authz_revision,
+            publication_mutation: coordinated.mutation.clone(),
         };
         if self
             .repository
@@ -225,8 +227,8 @@ impl AuthzDistributionCore {
         }
         if let Some(mutation) = coordinated.mutation.as_ref()
             && (mutation.storage_tenant != *storage_tenant
-                || mutation.schema.schema_ref != query.schema_ref
-                || mutation.schema.schema != query.schema
+                || mutation.schema_ref != query.schema_ref
+                || mutation.schema != query.schema
                 || mutation.revision() != query.published_at_revision)
         {
             return Err(Status::data_loss(

@@ -104,6 +104,93 @@ async fn unbound_revisions_replicate_and_digest_replay_is_preserved() {
 }
 
 #[tokio::test]
+async fn digest_retry_returns_the_exact_retained_publication_lineage() {
+    let (_root, source, _replica) = stores().await;
+    let source = source.authz();
+    let request = request("documents", schema("document"), 0);
+    let first = source
+        .coordinate_schema_publication(request.clone(), context("publish-original", 1))
+        .unwrap();
+    let original = first.mutation.clone().unwrap();
+
+    let retry = source
+        .coordinate_schema_publication(request, context("different-retry-context", 99))
+        .unwrap();
+    assert!(retry.result.replayed);
+    assert_eq!(retry.mutation, Some(original.clone()));
+
+    let catalogue = source
+        .export_authz_schema_catalogue(&tenant())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        catalogue.schemas[0].publication_mutation.as_ref(),
+        Some(&original)
+    );
+}
+
+#[tokio::test]
+async fn conflicting_schema_publication_replay_fails_closed() {
+    let (_root, source, replica) = stores().await;
+    let original = source
+        .authz()
+        .coordinate_schema_publication(
+            request("documents", schema("document"), 0),
+            context("publish-original", 1),
+        )
+        .unwrap()
+        .mutation
+        .unwrap();
+    let replica = replica.authz();
+    replica.apply_schema_publication_replica(&original).unwrap();
+
+    let mut sibling = original;
+    sibling.command_id = "publish-sibling".into();
+    sibling.set_computed_fingerprint();
+    sibling.validate().unwrap();
+    assert!(matches!(
+        replica.apply_schema_publication_replica(&sibling),
+        Err(AuthzStoreError::RealmMutationConflict)
+    ));
+}
+
+#[tokio::test]
+async fn legacy_schema_revision_decodes_and_survives_catalogue_handoff() {
+    let (_root, source, replica) = stores().await;
+    let source = source.authz();
+    let published = source
+        .publish_schema(request("documents", schema("document"), 0))
+        .unwrap();
+    let raw = source
+        .db
+        .get_cf(
+            source.cf(CF_AUTHZ_SCHEMAS).unwrap(),
+            schema_revision_key(&tenant(), &published.schema_ref),
+        )
+        .unwrap()
+        .unwrap();
+    assert!(
+        !String::from_utf8(raw)
+            .unwrap()
+            .contains("publication_mutation")
+    );
+
+    let catalogue = source
+        .export_authz_schema_catalogue(&tenant())
+        .unwrap()
+        .unwrap();
+    assert_eq!(catalogue.schemas[0].publication_mutation, None);
+    let replica = replica.authz();
+    replica
+        .install_quorum_reconciled_authz_schema_catalogue(&tenant(), Some(&catalogue))
+        .unwrap();
+    assert_eq!(
+        replica.export_authz_schema_catalogue(&tenant()).unwrap(),
+        Some(catalogue)
+    );
+}
+
+#[tokio::test]
 async fn exact_catalogue_install_removes_minority_entries_and_rebuilds_latest_keys() {
     let (_root, source, replica) = stores().await;
     let source = source.authz();

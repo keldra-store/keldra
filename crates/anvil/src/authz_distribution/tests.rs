@@ -85,7 +85,7 @@ impl AuthzReplicaTransport for StoreTransport {
             return Err(Status::unavailable("injected replica partition"));
         }
         let repository = self.store(target)?.authz();
-        Ok(repository
+        let schema_matches = repository
             .get_schema(&query.storage_tenant, &query.schema_ref)
             .map_err(authz_status)?
             .as_ref()
@@ -93,7 +93,22 @@ impl AuthzReplicaTransport for StoreTransport {
             && repository
                 .tenant_revision(&query.storage_tenant)
                 .map_err(authz_status)?
-                >= query.published_at_revision)
+                >= query.published_at_revision;
+        if !schema_matches {
+            return Ok(false);
+        }
+        let Some(expected) = query.publication_mutation.as_ref() else {
+            return Ok(true);
+        };
+        Ok(repository
+            .export_authz_schema_catalogue(&query.storage_tenant)
+            .map_err(authz_status)?
+            .into_iter()
+            .flat_map(|catalogue| catalogue.schemas)
+            .find(|revision| revision.schema_ref == query.schema_ref)
+            .and_then(|revision| revision.publication_mutation)
+            .as_ref()
+            == Some(expected))
     }
 
     async fn apply_realm_mutation(
@@ -439,7 +454,7 @@ async fn lost_apply_response_and_digest_replay_prove_the_existing_quorum() {
         .repository
         .coordinate_schema_publication(request.clone(), context(coordinator, "publish-lost", 1))
         .unwrap();
-    assert!(publication.mutation.is_some());
+    let original = publication.mutation.clone().unwrap();
     core.replicate_schema_publication(&replicas, &tenant(), &publication)
         .await
         .unwrap();
@@ -456,14 +471,14 @@ async fn lost_apply_response_and_digest_replay_prove_the_existing_quorum() {
         .coordinate_schema_publication(request, context(coordinator, "client-retry", 2))
         .unwrap();
     assert!(replay.result.replayed);
-    assert!(replay.mutation.is_none());
+    assert_eq!(replay.mutation, Some(original));
     core.replicate_schema_publication(&replicas, &tenant(), &replay)
         .await
         .unwrap();
 }
 
 #[tokio::test]
-async fn replay_without_an_existing_remote_copy_never_claims_quorum() {
+async fn replay_repairs_a_publication_after_total_remote_failure() {
     let nodes = [NodeId(1), NodeId(2)];
     let (_root, stores) = stores_for(&nodes).await;
     let replicas = replica_set_for_nodes(909, &nodes);
@@ -494,6 +509,7 @@ async fn replay_without_an_existing_remote_copy_never_claims_quorum() {
             context(coordinator, "publish-partitioned", 1),
         )
         .unwrap();
+    let original = publication.mutation.clone().unwrap();
     assert!(
         core.replicate_schema_publication(&replicas, &tenant(), &publication)
             .await
@@ -505,9 +521,56 @@ async fn replay_without_an_existing_remote_copy_never_claims_quorum() {
         .repository
         .coordinate_schema_publication(request, context(coordinator, "retry-partitioned", 2))
         .unwrap();
-    assert!(replay.mutation.is_none());
+    assert!(replay.result.replayed);
+    assert_eq!(replay.mutation, Some(original));
+    core.replicate_schema_publication(&replicas, &tenant(), &replay)
+        .await
+        .unwrap();
     assert!(
-        core.replicate_schema_publication(&replicas, &tenant(), &replay)
+        stores[&remote]
+            .authz()
+            .get_schema(&tenant(), &replay.result.schema_ref)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn conflicting_remote_publication_is_not_counted_as_durable() {
+    let nodes = [NodeId(1), NodeId(2)];
+    let (_root, stores) = stores_for(&nodes).await;
+    let replicas = replica_set_for_nodes(910, &nodes);
+    let coordinator = replicas.group.coordinator();
+    let remote = replicas
+        .group
+        .replicas()
+        .iter()
+        .copied()
+        .find(|node| *node != coordinator)
+        .unwrap();
+    let transport = Arc::new(StoreTransport {
+        stores: stores.clone(),
+        ..Default::default()
+    });
+    let core = AuthzDistributionCore {
+        local_node: coordinator,
+        repository: stores[&coordinator].authz(),
+        peers: transport,
+        coordinator_serial: Arc::new(tokio::sync::Mutex::new(())),
+    };
+    let request = publish_request("conflicting-lineage");
+    let original = core
+        .repository
+        .coordinate_schema_publication(request.clone(), context(coordinator, "publish-original", 1))
+        .unwrap();
+    let sibling = stores[&remote]
+        .authz()
+        .coordinate_schema_publication(request, context(remote, "publish-sibling", 1))
+        .unwrap();
+    assert_ne!(original.mutation, sibling.mutation);
+
+    assert!(
+        core.replicate_schema_publication(&replicas, &tenant(), &original)
             .await
             .is_err()
     );

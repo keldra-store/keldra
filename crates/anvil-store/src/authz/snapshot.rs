@@ -671,11 +671,16 @@ impl AuthzRepository {
         };
         let (stored_schema, schema_key, digest_key) =
             schema.expect("present aggregate has a prepared schema");
-        batch.put_cf(
-            self.cf(CF_AUTHZ_SCHEMAS)?,
-            schema_key,
-            encode_json(&stored_schema)?,
-        );
+        if self
+            .read_json::<StoredSchema>(CF_AUTHZ_SCHEMAS, &schema_key)?
+            .is_none()
+        {
+            batch.put_cf(
+                self.cf(CF_AUTHZ_SCHEMAS)?,
+                schema_key,
+                encode_json(&stored_schema)?,
+            );
+        }
         batch.put_cf(
             self.cf(CF_AUTHZ_SCHEMAS)?,
             digest_key,

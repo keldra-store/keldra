@@ -29,6 +29,10 @@ pub struct AuthzSchemaRevision {
     pub schema_ref: SchemaRef,
     pub schema: Schema,
     pub published_at_revision: AuthzRevision,
+    /// Exact coordinator mutation for 0.5.1+ publications. Released 0.5.0
+    /// revision values decode with this absent and remain baseline state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication_mutation: Option<AuthzSchemaPublicationMutation>,
 }
 
 impl From<StoredSchema> for AuthzSchemaRevision {
@@ -37,6 +41,7 @@ impl From<StoredSchema> for AuthzSchemaRevision {
             schema_ref: stored.schema_ref,
             schema: stored.schema,
             published_at_revision: stored.published_at_revision,
+            publication_mutation: None,
         }
     }
 }
@@ -86,6 +91,18 @@ impl AuthzSchemaCatalogue {
         for revision in &self.schemas {
             let stored = StoredSchema::from(revision);
             validate_stored_schema(&stored, &revision.schema_ref, limits)?;
+            if let Some(mutation) = revision.publication_mutation.as_ref() {
+                mutation.validate_with_limits(limits)?;
+                if mutation.storage_tenant != self.storage_tenant
+                    || mutation.schema_ref != revision.schema_ref
+                    || mutation.schema != revision.schema
+                    || mutation.published_at_revision != revision.published_at_revision
+                {
+                    return Err(invalid_publication(
+                        "retained publication mutation disagrees with its schema revision",
+                    ));
+                }
+            }
             if revision.published_at_revision == AuthzRevision::ZERO
                 || revision.published_at_revision > self.authz_revision
                 || !publication_revisions.insert(revision.published_at_revision)
@@ -157,13 +174,24 @@ pub struct AuthzSchemaPublicationMutation {
     pub format: u16,
     pub storage_tenant: StorageTenantId,
     pub command_id: String,
-    pub schema: AuthzSchemaRevision,
+    pub schema_ref: SchemaRef,
+    pub schema: Schema,
+    pub published_at_revision: AuthzRevision,
     pub stamp: AuthzSchemaPublicationStamp,
 }
 
 impl AuthzSchemaPublicationMutation {
     pub fn revision(&self) -> AuthzRevision {
-        self.schema.published_at_revision
+        self.published_at_revision
+    }
+
+    fn schema_revision(&self) -> AuthzSchemaRevision {
+        AuthzSchemaRevision {
+            schema_ref: self.schema_ref.clone(),
+            schema: self.schema.clone(),
+            published_at_revision: self.published_at_revision,
+            publication_mutation: None,
+        }
     }
 
     fn computed_fingerprint(&self) -> [u8; 32] {
@@ -171,7 +199,9 @@ impl AuthzSchemaPublicationMutation {
             self.format,
             &self.storage_tenant,
             &self.command_id,
+            &self.schema_ref,
             &self.schema,
+            self.published_at_revision,
             self.stamp.format,
             self.stamp.predecessor_revision,
             self.stamp.active_placement_log_id,
@@ -229,8 +259,8 @@ impl AuthzSchemaPublicationMutation {
                 "publication revision must immediately follow its predecessor",
             ));
         }
-        let stored = StoredSchema::from(&self.schema);
-        validate_stored_schema(&stored, &self.schema.schema_ref, limits)?;
+        let stored = StoredSchema::from(&self.schema_revision());
+        validate_stored_schema(&stored, &self.schema_ref, limits)?;
         if self.stamp.mutation_fingerprint != self.computed_fingerprint() {
             return Err(invalid_publication(
                 "publication fingerprint does not match its typed result",
@@ -270,9 +300,10 @@ impl AuthzRepository {
         let storage_tenant = request.storage_tenant.clone();
         let (result, stored) = self.prepare_schema_publication(request, &mut batch)?;
         let Some(stored) = stored else {
+            let revision = self.require_schema_revision(&storage_tenant, &result.schema_ref)?;
             return Ok(CoordinatedAuthzSchemaPublication {
                 result,
-                mutation: None,
+                mutation: revision.publication_mutation,
             });
         };
         let predecessor_revision = result
@@ -283,9 +314,11 @@ impl AuthzRepository {
             .map(AuthzRevision);
         let mut mutation = AuthzSchemaPublicationMutation {
             format: AUTHZ_SCHEMA_PUBLICATION_FORMAT,
-            storage_tenant,
+            storage_tenant: storage_tenant.clone(),
             command_id: context.command_id,
-            schema: stored.into(),
+            schema_ref: stored.schema_ref.clone(),
+            schema: stored.schema.clone(),
+            published_at_revision: stored.published_at_revision,
             stamp: AuthzSchemaPublicationStamp {
                 format: AUTHZ_SCHEMA_PUBLICATION_STAMP_FORMAT,
                 predecessor_revision,
@@ -298,6 +331,17 @@ impl AuthzRepository {
         };
         mutation.set_computed_fingerprint();
         mutation.validate_with_limits(self.limits.evaluator)?;
+        let revision = AuthzSchemaRevision {
+            schema_ref: stored.schema_ref,
+            schema: stored.schema,
+            published_at_revision: stored.published_at_revision,
+            publication_mutation: Some(mutation.clone()),
+        };
+        batch.put_cf(
+            self.cf(CF_AUTHZ_SCHEMAS)?,
+            schema_revision_key(&storage_tenant, &revision.schema_ref),
+            encode_json(&revision)?,
+        );
         self.write(batch)?;
         Ok(CoordinatedAuthzSchemaPublication {
             result,
@@ -311,20 +355,22 @@ impl AuthzRepository {
     ) -> Result<ReplicaAuthzSchemaPublicationApplied, AuthzStoreError> {
         mutation.validate_with_limits(self.limits.evaluator)?;
         let _guard = self.lock_writes()?;
-        let revision_key =
-            schema_revision_key(&mutation.storage_tenant, &mutation.schema.schema_ref);
-        if let Some(existing) = self.read_json::<StoredSchema>(CF_AUTHZ_SCHEMAS, &revision_key)? {
-            let expected = StoredSchema::from(&mutation.schema);
-            if existing != expected
+        let revision_key = schema_revision_key(&mutation.storage_tenant, &mutation.schema_ref);
+        if let Some(existing) =
+            self.read_json::<AuthzSchemaRevision>(CF_AUTHZ_SCHEMAS, &revision_key)?
+        {
+            let expected = mutation.schema_revision();
+            if StoredSchema::from(&existing) != StoredSchema::from(&expected)
+                || existing.publication_mutation.as_ref() != Some(mutation)
                 || self.tenant_revision(&mutation.storage_tenant)? < mutation.revision()
                 || self.read_json::<SchemaRef>(
                     CF_AUTHZ_SCHEMAS,
                     &schema_digest_key(
                         &mutation.storage_tenant,
-                        &mutation.schema.schema_ref.schema_id,
-                        mutation.schema.schema_ref.schema_digest,
+                        &mutation.schema_ref.schema_id,
+                        mutation.schema_ref.schema_digest,
                     ),
-                )? != Some(mutation.schema.schema_ref.clone())
+                )? != Some(mutation.schema_ref.clone())
             {
                 return Err(AuthzStoreError::RealmMutationConflict);
             }
@@ -350,20 +396,18 @@ impl AuthzRepository {
                 }
             });
         }
-        let latest_key = schema_latest_key(
-            &mutation.storage_tenant,
-            &mutation.schema.schema_ref.schema_id,
-        );
+        let latest_key =
+            schema_latest_key(&mutation.storage_tenant, &mutation.schema_ref.schema_id);
         let latest = self
             .read_json::<u64>(CF_AUTHZ_SCHEMAS, &latest_key)?
             .unwrap_or(0);
-        if latest.checked_add(1) != Some(mutation.schema.schema_ref.schema_revision) {
+        if latest.checked_add(1) != Some(mutation.schema_ref.schema_revision) {
             return Err(AuthzStoreError::RealmMutationConflict);
         }
         let digest_key = schema_digest_key(
             &mutation.storage_tenant,
-            &mutation.schema.schema_ref.schema_id,
-            mutation.schema.schema_ref.schema_digest,
+            &mutation.schema_ref.schema_id,
+            mutation.schema_ref.schema_digest,
         );
         if self
             .read_json::<SchemaRef>(CF_AUTHZ_SCHEMAS, &digest_key)?
@@ -375,17 +419,22 @@ impl AuthzRepository {
         batch.put_cf(
             self.cf(CF_AUTHZ_SCHEMAS)?,
             revision_key,
-            encode_json(&StoredSchema::from(&mutation.schema))?,
+            encode_json(&AuthzSchemaRevision {
+                schema_ref: mutation.schema_ref.clone(),
+                schema: mutation.schema.clone(),
+                published_at_revision: mutation.published_at_revision,
+                publication_mutation: Some(mutation.clone()),
+            })?,
         );
         batch.put_cf(
             self.cf(CF_AUTHZ_SCHEMAS)?,
             latest_key,
-            encode_json(&mutation.schema.schema_ref.schema_revision)?,
+            encode_json(&mutation.schema_ref.schema_revision)?,
         );
         batch.put_cf(
             self.cf(CF_AUTHZ_SCHEMAS)?,
             digest_key,
-            encode_json(&mutation.schema.schema_ref)?,
+            encode_json(&mutation.schema_ref)?,
         );
         self.stage_tenant_revision(&mut batch, &mutation.storage_tenant, mutation.revision())?;
         self.write(batch)?;
@@ -393,6 +442,37 @@ impl AuthzRepository {
             revision: mutation.revision(),
             replayed: false,
         })
+    }
+
+    fn require_schema_revision(
+        &self,
+        tenant: &StorageTenantId,
+        schema_ref: &SchemaRef,
+    ) -> Result<AuthzSchemaRevision, AuthzStoreError> {
+        let revision = self
+            .read_json::<AuthzSchemaRevision>(
+                CF_AUTHZ_SCHEMAS,
+                &schema_revision_key(tenant, schema_ref),
+            )?
+            .ok_or_else(|| {
+                AuthzStoreError::SchemaNotFound(
+                    schema_ref.schema_id.clone(),
+                    schema_ref.schema_revision,
+                )
+            })?;
+        let stored = StoredSchema::from(&revision);
+        validate_stored_schema(&stored, schema_ref, self.limits.evaluator)?;
+        if let Some(mutation) = revision.publication_mutation.as_ref() {
+            mutation.validate_with_limits(self.limits.evaluator)?;
+            if mutation.storage_tenant != *tenant
+                || mutation.schema_ref != revision.schema_ref
+                || mutation.schema != revision.schema
+                || mutation.published_at_revision != revision.published_at_revision
+            {
+                return Err(AuthzStoreError::RealmMutationConflict);
+            }
+        }
+        Ok(revision)
     }
 
     pub fn export_authz_schema_catalogue(
@@ -411,13 +491,15 @@ impl AuthzRepository {
             if !key.starts_with(&prefix) {
                 break;
             }
-            let stored = decode_json::<StoredSchema>(&value)?;
-            if schema_revision_key(tenant, &stored.schema_ref).as_slice() != key.as_ref() {
+            let revision = decode_json::<AuthzSchemaRevision>(&value)?;
+            let stored = StoredSchema::from(&revision);
+            validate_stored_schema(&stored, &revision.schema_ref, self.limits.evaluator)?;
+            if schema_revision_key(tenant, &revision.schema_ref).as_slice() != key.as_ref() {
                 return Err(AuthzStoreError::Storage(
                     "persisted schema revision key is inconsistent".into(),
                 ));
             }
-            schemas.push(stored.into());
+            schemas.push(revision);
         }
         schemas.sort_by(|left, right| {
             left.schema_ref
@@ -482,11 +564,10 @@ impl AuthzRepository {
         };
         let mut latest = BTreeMap::<SchemaId, u64>::new();
         for revision in &catalogue.schemas {
-            let stored = StoredSchema::from(revision);
             batch.put_cf(
                 self.cf(CF_AUTHZ_SCHEMAS)?,
                 schema_revision_key(tenant, &revision.schema_ref),
-                encode_json(&stored)?,
+                encode_json(revision)?,
             );
             batch.put_cf(
                 self.cf(CF_AUTHZ_SCHEMAS)?,
