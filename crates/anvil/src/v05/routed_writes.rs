@@ -11,6 +11,7 @@ use tonic::{Request, Status};
 
 use super::ObjectServiceImpl;
 use crate::cluster_peer::{RoutedCall, RoutedPublicHandler};
+use crate::object_path_access;
 
 /// Marks a request that has already made its one permitted peer hop.
 ///
@@ -35,7 +36,11 @@ impl ObjectServiceImpl {
 }
 
 impl RoutedObjectWrites {
-    fn authenticated_request<T>(&self, call: RoutedCall<T>) -> Result<Request<T>, Status> {
+    fn authenticated_request<T>(
+        &self,
+        call: RoutedCall<T>,
+        internal: bool,
+    ) -> Result<Request<T>, Status> {
         let bearer = call.bearer().to_owned();
         let caller = self
             .service
@@ -51,6 +56,9 @@ impl RoutedObjectWrites {
             .insert("authorization", authorization);
         request.extensions_mut().insert(caller);
         request.extensions_mut().insert(RoutedDestination);
+        if internal {
+            object_path_access::mark_internal_peer_route(&mut request);
+        }
         Ok(request)
     }
 }
@@ -59,7 +67,7 @@ impl RoutedObjectWrites {
 impl RoutedPublicHandler for RoutedObjectWrites {
     async fn put_end(&self, call: RoutedCall<PutToken>) -> Result<MutationReceipt, Status> {
         Ok(
-            ObjectService::put_end(&self.service, self.authenticated_request(call)?)
+            ObjectService::put_end(&self.service, self.authenticated_request(call, false)?)
                 .await?
                 .into_inner(),
         )
@@ -67,7 +75,7 @@ impl RoutedPublicHandler for RoutedObjectWrites {
 
     async fn delete(&self, call: RoutedCall<DeleteRequest>) -> Result<MutationReceipt, Status> {
         Ok(
-            ObjectService::delete(&self.service, self.authenticated_request(call)?)
+            ObjectService::delete(&self.service, self.authenticated_request(call, false)?)
                 .await?
                 .into_inner(),
         )
@@ -77,11 +85,12 @@ impl RoutedPublicHandler for RoutedObjectWrites {
         &self,
         call: RoutedCall<DeleteIfVersionRequest>,
     ) -> Result<MutationReceipt, Status> {
-        Ok(
-            ObjectService::delete_if_version(&self.service, self.authenticated_request(call)?)
-                .await?
-                .into_inner(),
+        Ok(ObjectService::delete_if_version(
+            &self.service,
+            self.authenticated_request(call, false)?,
         )
+        .await?
+        .into_inner())
     }
 
     async fn bulk_write(
@@ -89,7 +98,32 @@ impl RoutedPublicHandler for RoutedObjectWrites {
         call: RoutedCall<BulkWriteRequest>,
     ) -> Result<BulkWriteResponse, Status> {
         Ok(
-            ObjectService::bulk_write(&self.service, self.authenticated_request(call)?)
+            ObjectService::bulk_write(&self.service, self.authenticated_request(call, false)?)
+                .await?
+                .into_inner(),
+        )
+    }
+
+    async fn internal_delete_if_version(
+        &self,
+        call: RoutedCall<DeleteIfVersionRequest>,
+    ) -> Result<MutationReceipt, Status> {
+        Ok(
+            ObjectService::delete_if_version(
+                &self.service,
+                self.authenticated_request(call, true)?,
+            )
+            .await?
+            .into_inner(),
+        )
+    }
+
+    async fn internal_bulk_write(
+        &self,
+        call: RoutedCall<BulkWriteRequest>,
+    ) -> Result<BulkWriteResponse, Status> {
+        Ok(
+            ObjectService::bulk_write(&self.service, self.authenticated_request(call, true)?)
                 .await?
                 .into_inner(),
         )
@@ -99,11 +133,12 @@ impl RoutedPublicHandler for RoutedObjectWrites {
         &self,
         call: RoutedCall<SetBucketPolicyRequest>,
     ) -> Result<BucketPolicy, Status> {
-        Ok(
-            ObjectService::set_bucket_policy(&self.service, self.authenticated_request(call)?)
-                .await?
-                .into_inner(),
+        Ok(ObjectService::set_bucket_policy(
+            &self.service,
+            self.authenticated_request(call, false)?,
         )
+        .await?
+        .into_inner())
     }
 
     async fn delete_version(
@@ -111,7 +146,7 @@ impl RoutedPublicHandler for RoutedObjectWrites {
         call: RoutedCall<DeleteVersionRequest>,
     ) -> Result<DeleteVersionResponse, Status> {
         Ok(
-            ObjectService::delete_version(&self.service, self.authenticated_request(call)?)
+            ObjectService::delete_version(&self.service, self.authenticated_request(call, false)?)
                 .await?
                 .into_inner(),
         )
@@ -122,9 +157,31 @@ impl RoutedPublicHandler for RoutedObjectWrites {
         call: RoutedCall<InvokeProgramRequest>,
     ) -> Result<InvokeProgramResponse, Status> {
         Ok(
-            ObjectService::invoke_program(&self.service, self.authenticated_request(call)?)
+            ObjectService::invoke_program(&self.service, self.authenticated_request(call, false)?)
                 .await?
                 .into_inner(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use anvil_store::ObjectKey;
+
+    use super::*;
+
+    #[test]
+    fn ordinary_routed_public_marker_does_not_grant_reserved_access() {
+        let mut request = Request::new(());
+        request.extensions_mut().insert(RoutedDestination);
+        let access = object_path_access::access_for(&request);
+        let reserved = ObjectKey::new("tenant", "bucket", "_anvil/personaldb/v0/00").unwrap();
+
+        assert_eq!(
+            object_path_access::require_key(&access, &reserved)
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
     }
 }

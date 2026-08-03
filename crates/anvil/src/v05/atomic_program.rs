@@ -30,6 +30,7 @@ pub(super) async fn invoke(
         .clone()
         .ok_or_else(|| Status::invalid_argument("program address is required"))?;
     let program = object_key(Some(program_address.clone()))?;
+    object_path_access::require_public_key(&program)?;
     let expected_program_hash = required_hash(&api_request.program_hash, "program_hash")?;
     require_caller_tenant(&caller, &program)?;
     require_authorized(

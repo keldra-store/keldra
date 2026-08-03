@@ -49,6 +49,7 @@ use crate::distributed_list::{DistributedObjectLister, OriginalBearer};
 use crate::distributed_watch::{DistributedWatch, DistributedWatchScope};
 use crate::logical_name_resolution::LogicalNameResolver;
 use crate::object_distribution::ObjectDistribution;
+use crate::object_path_access;
 use crate::programs::ProgramCoordinator;
 
 #[cfg(test)]
@@ -216,7 +217,9 @@ type WatchPrefixStream = distributed_watch_stream::ClusterWatchStream;
 impl ObjectService for ObjectServiceImpl {
     async fn start_put(&self, request: Request<PutHeader>) -> Result<Response<PutToken>, Status> {
         let caller = authenticated_caller(&request)?;
+        let path_access = object_path_access::access_for(&request);
         let metadata = put_metadata(request.into_inner())?;
+        object_path_access::require_key(&path_access, &metadata.key)?;
         self.authorize_object(&caller, &metadata.key, ObjectPermission::Put)
             .await?;
         self.issue_upload_token(&caller, &metadata)
@@ -228,6 +231,7 @@ impl ObjectService for ObjectServiceImpl {
         request: Request<Streaming<ApiPutRequest>>,
     ) -> Result<Response<PutToken>, Status> {
         let caller = authenticated_caller(&request)?;
+        let path_access = object_path_access::access_for(&request);
         let mut stream = request.into_inner();
         let first = tokio::time::timeout(PUT_TOKEN_LIFETIME, stream.message())
             .await
@@ -237,6 +241,7 @@ impl ObjectService for ObjectServiceImpl {
         let capability = self.verify_put_token(&caller, &token)?;
         let header = require_upload_phase(capability)?;
         let metadata = header.to_metadata()?;
+        object_path_access::require_key(&path_access, &metadata.key)?;
         self.authorize_object(&caller, &metadata.key, ObjectPermission::Put)
             .await?;
 
@@ -272,6 +277,7 @@ impl ObjectService for ObjectServiceImpl {
             .get::<routed_writes::RoutedDestination>()
             .is_some();
         let caller = authenticated_caller(&request)?;
+        let path_access = object_path_access::access_for(&request);
         let bearer = OriginalBearer::from_metadata(request.metadata())?;
         let remaining =
             effective_atomic_program_timeout(request.metadata(), self.atomic_program_timeout);
@@ -279,6 +285,7 @@ impl ObjectService for ObjectServiceImpl {
         let capability = self.verify_put_token(&caller, &token)?;
         let ready = require_ready_phase(capability)?;
         let metadata = ready.header.to_metadata()?;
+        object_path_access::require_key(&path_access, &metadata.key)?;
         self.authorize_object(&caller, &metadata.key, ObjectPermission::Put)
             .await?;
         let publish = PublishRequest {
@@ -331,11 +338,13 @@ impl ObjectService for ObjectServiceImpl {
             .get::<routed_writes::RoutedDestination>()
             .is_some();
         let caller = authenticated_caller(&request)?;
+        let path_access = object_path_access::access_for(&request);
         let bearer = OriginalBearer::from_metadata(request.metadata())?;
         let remaining =
             effective_atomic_program_timeout(request.metadata(), self.atomic_program_timeout);
         let api_request = request.into_inner();
         let mutation = delete_request(api_request.clone(), Precondition::Any)?;
+        object_path_access::require_key(&path_access, &mutation.key)?;
         self.authorize_object(&caller, &mutation.key, ObjectPermission::Delete)
             .await?;
         let receipt = match self.distribution.routing_target(&mutation.key)? {
@@ -373,12 +382,14 @@ impl ObjectService for ObjectServiceImpl {
             .get::<routed_writes::RoutedDestination>()
             .is_some();
         let caller = authenticated_caller(&request)?;
+        let path_access = object_path_access::access_for(&request);
         let bearer = OriginalBearer::from_metadata(request.metadata())?;
         let remaining =
             effective_atomic_program_timeout(request.metadata(), self.atomic_program_timeout);
         let api_request = request.into_inner();
         let precondition = Precondition::Version(VersionId(api_request.expected_version));
         let mutation = delete_if_version_request(api_request.clone(), precondition)?;
+        object_path_access::require_key(&path_access, &mutation.key)?;
         self.authorize_object(&caller, &mutation.key, ObjectPermission::Delete)
             .await?;
         let receipt = match self.distribution.routing_target(&mutation.key)? {
@@ -388,15 +399,27 @@ impl ObjectService for ObjectServiceImpl {
                 ));
             }
             Some((target, address)) => {
-                self.cluster_peers
-                    .route_delete_if_version(
-                        target,
-                        &address,
-                        bearer.signed_token(),
-                        api_request,
-                        remaining,
-                    )
-                    .await?
+                if object_path_access::is_internal(&path_access) {
+                    self.cluster_peers
+                        .route_internal_delete_if_version(
+                            target,
+                            &address,
+                            bearer.signed_token(),
+                            api_request,
+                            remaining,
+                        )
+                        .await?
+                } else {
+                    self.cluster_peers
+                        .route_delete_if_version(
+                            target,
+                            &address,
+                            bearer.signed_token(),
+                            api_request,
+                            remaining,
+                        )
+                        .await?
+                }
             }
             None => api_receipt(
                 self.distribution
@@ -416,12 +439,14 @@ impl ObjectService for ObjectServiceImpl {
             .get::<routed_writes::RoutedDestination>()
             .is_some();
         let caller = authenticated_caller(&request)?;
+        let path_access = object_path_access::access_for(&request);
         let bearer = OriginalBearer::from_metadata(request.metadata())?;
         let remaining =
             effective_atomic_program_timeout(request.metadata(), self.atomic_program_timeout);
         let api_request = request.into_inner();
         let _durability = durability(api_request.durability)?;
         let key = object_key(api_request.address.clone())?;
+        object_path_access::require_key(&path_access, &key)?;
         self.authorize_object(&caller, &key, ObjectPermission::Delete)
             .await?;
         let governance = self
@@ -471,7 +496,9 @@ impl ObjectService for ObjectServiceImpl {
     ) -> Result<Response<ObjectHead>, Status> {
         let deadline = request_deadline(request.metadata(), self.atomic_program_timeout)?;
         let caller = authenticated_caller(&request)?;
+        let path_access = object_path_access::access_for(&request);
         let key = object_key(request.into_inner().address)?;
+        object_path_access::require_key(&path_access, &key)?;
         self.authorize_object(&caller, &key, ObjectPermission::Get)
             .await?;
         loop {
@@ -536,8 +563,10 @@ impl ObjectService for ObjectServiceImpl {
     ) -> Result<Response<Self::GetObjectStream>, Status> {
         let deadline = request_deadline(request.metadata(), self.atomic_program_timeout)?;
         let caller = authenticated_caller(&request)?;
+        let path_access = object_path_access::access_for(&request);
         let request = request.into_inner();
         let key = object_key(request.address)?;
+        object_path_access::require_key(&path_access, &key)?;
         self.authorize_object(&caller, &key, ObjectPermission::Get)
             .await?;
         if request.version.is_some() {
@@ -573,7 +602,9 @@ impl ObjectService for ObjectServiceImpl {
     ) -> Result<Response<Self::ListObjectVersionsStream>, Status> {
         let deadline = request_deadline(request.metadata(), self.atomic_program_timeout)?;
         let caller = authenticated_caller(&request)?;
+        let path_access = object_path_access::access_for(&request);
         let key = object_key(request.into_inner().address)?;
+        object_path_access::require_key(&path_access, &key)?;
         self.authorize_object(&caller, &key, ObjectPermission::Get)
             .await?;
         let governance = self
@@ -614,6 +645,7 @@ impl ObjectService for ObjectServiceImpl {
         let encoded_bytes = request.get_ref().encoded_len() as u64;
         let result = async {
             let caller = authenticated_caller(&request)?;
+            let path_access = object_path_access::access_for(&request);
             let bearer = OriginalBearer::from_metadata(request.metadata())?;
             let route_budget =
                 effective_atomic_program_timeout(request.metadata(), self.atomic_program_timeout);
@@ -629,7 +661,10 @@ impl ObjectService for ObjectServiceImpl {
                 let forwarded = operation.clone();
                 match batch_operation(operation, self.max_blob_bytes) {
                     Ok(mutation) => {
-                        match require_caller_tenant(&caller, batch_operation_key(&mutation)) {
+                        let key = batch_operation_key(&mutation);
+                        match object_path_access::require_key(&path_access, key)
+                            .and_then(|()| require_caller_tenant(&caller, key))
+                        {
                             Ok(()) => pending.push((index, forwarded, mutation)),
                             Err(error) => outcomes.push(bulk_authorization_failure(index, &error)),
                         }
@@ -693,6 +728,7 @@ impl ObjectService for ObjectServiceImpl {
                     local_operations,
                     remote,
                     bearer.signed_token().to_owned(),
+                    object_path_access::is_internal(&path_access),
                     started,
                     route_budget,
                 )
@@ -760,6 +796,7 @@ impl ObjectService for ObjectServiceImpl {
     ) -> Result<Response<BatchGetResponse>, Status> {
         let deadline = request_deadline(request.metadata(), self.atomic_program_timeout)?;
         let caller = authenticated_caller(&request)?;
+        let path_access = object_path_access::access_for(&request);
         let objects = request.into_inner().objects;
         if objects.len() > MAX_BATCH_GET_ITEMS {
             return Err(Status::resource_exhausted(format!(
@@ -785,6 +822,10 @@ impl ObjectService for ObjectServiceImpl {
                     continue;
                 }
             };
+            if let Err(error) = object_path_access::require_key(&path_access, &key) {
+                outcomes.push(batch_get_authorization_failure(index, &key, &error));
+                continue;
+            }
             match require_caller_tenant(&caller, &key) {
                 Ok(()) => pending.push((index, key, request.version.map(VersionId))),
                 Err(error) if error.code() == tonic::Code::PermissionDenied => {
@@ -928,7 +969,7 @@ fn effective_atomic_program_timeout(metadata: &MetadataMap, server_maximum: Dura
     client_grpc_timeout(metadata).map_or(server_maximum, |client| client.min(server_maximum))
 }
 
-fn request_deadline(
+pub(crate) fn request_deadline(
     metadata: &MetadataMap,
     server_maximum: Duration,
 ) -> Result<tokio::time::Instant, Status> {
@@ -937,7 +978,7 @@ fn request_deadline(
         .ok_or_else(|| Status::internal("configured request timeout exceeds clock"))
 }
 
-fn deadline_remaining(deadline: tokio::time::Instant) -> Result<Duration, Status> {
+pub(crate) fn deadline_remaining(deadline: tokio::time::Instant) -> Result<Duration, Status> {
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     if remaining.is_zero() {
         Err(Status::deadline_exceeded("request deadline exceeded"))
@@ -977,9 +1018,25 @@ async fn run_atomic_program_until<T, F>(
 where
     F: Future<Output = Result<T, Status>>,
 {
+    run_request_until(
+        deadline,
+        invocation,
+        "atomic program execution deadline exceeded",
+    )
+    .await
+}
+
+pub(crate) async fn run_request_until<T, F>(
+    deadline: tokio::time::Instant,
+    invocation: F,
+    timeout_message: &'static str,
+) -> Result<T, Status>
+where
+    F: Future<Output = Result<T, Status>>,
+{
     tokio::time::timeout_at(deadline, invocation)
         .await
-        .map_err(|_| Status::deadline_exceeded("atomic program execution deadline exceeded"))?
+        .map_err(|_| Status::deadline_exceeded(timeout_message))?
 }
 
 impl ObjectServiceImpl {
@@ -1209,6 +1266,7 @@ fn authorize_program_dependency(
         &dependency.path.path,
     )
     .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    object_path_access::require_public_key(&key)?;
     require_caller_tenant(caller, &key)?;
     for (required, permission, message) in [
         (
@@ -1253,6 +1311,7 @@ async fn authorize_program_dependencies_authoritatively(
             &dependency.path.path,
         )
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        object_path_access::require_public_key(&key)?;
         require_caller_tenant(caller, &key)?;
         let policy = governance.resolve(key.tenant(), key.bucket()).await?;
         if !policy.policy.is_program_only(key.path()) {

@@ -20,6 +20,7 @@ pub(super) async fn execute_coordinator_groups(
     local_operations: Vec<BatchOperation>,
     remote: BTreeMap<NodeId, (String, Vec<(usize, BulkOperation)>)>,
     bearer: String,
+    internal: bool,
     started: Instant,
     route_budget: Duration,
 ) -> Result<Vec<BulkOutcome>, Status> {
@@ -60,10 +61,16 @@ pub(super) async fn execute_coordinator_groups(
             .checked_sub(started.elapsed())
             .ok_or_else(|| Status::deadline_exceeded("bulk write routing deadline exceeded"))?;
         tasks.spawn(async move {
-            match peers
-                .route_bulk_write(target, &address, &bearer, request, remaining)
-                .await
-            {
+            let routed = if internal {
+                peers
+                    .route_internal_bulk_write(target, &address, &bearer, request, remaining)
+                    .await
+            } else {
+                peers
+                    .route_bulk_write(target, &address, &bearer, request, remaining)
+                    .await
+            };
+            match routed {
                 Ok(response) => remap_remote_outcomes(response.outcomes, &original_indices),
                 Err(error) => Ok(original_indices
                     .into_iter()

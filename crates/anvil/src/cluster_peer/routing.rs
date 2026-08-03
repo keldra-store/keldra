@@ -63,6 +63,14 @@ pub(crate) trait RoutedPublicHandler: Send + Sync + 'static {
         &self,
         call: RoutedCall<BulkWriteRequest>,
     ) -> Result<BulkWriteResponse, Status>;
+    async fn internal_delete_if_version(
+        &self,
+        call: RoutedCall<DeleteIfVersionRequest>,
+    ) -> Result<MutationReceipt, Status>;
+    async fn internal_bulk_write(
+        &self,
+        call: RoutedCall<BulkWriteRequest>,
+    ) -> Result<BulkWriteResponse, Status>;
     async fn set_bucket_policy(
         &self,
         call: RoutedCall<SetBucketPolicyRequest>,
@@ -185,6 +193,55 @@ impl ClusterPeerService {
         let response = tokio::time::timeout(timeout, self.routed.get()?.bulk_write(call))
             .await
             .map_err(|_| Status::deadline_exceeded("routed BulkWrite deadline exceeded"))??;
+        self.require_unchanged(fence)?;
+        Ok(Response::new(response))
+    }
+
+    pub(super) async fn route_internal_delete_if_version_call(
+        &self,
+        request: Request<wire::RouteDeleteIfVersionRequest>,
+    ) -> Result<Response<MutationReceipt>, Status> {
+        let (call, timeout) = self.routed_call(
+            &request,
+            request.get_ref().peer.as_ref(),
+            request.get_ref().request.clone().ok_or_else(|| {
+                Status::invalid_argument("internal DeleteIfVersion request is required")
+            })?,
+        )?;
+        let fence = call.placement_fence;
+        let response =
+            tokio::time::timeout(timeout, self.routed.get()?.internal_delete_if_version(call))
+                .await
+                .map_err(|_| {
+                    Status::deadline_exceeded("routed internal DeleteIfVersion deadline exceeded")
+                })??;
+        self.require_unchanged(fence)?;
+        Ok(Response::new(response))
+    }
+
+    pub(super) async fn route_internal_bulk_write_call(
+        &self,
+        request: Request<wire::RouteBulkWriteRequest>,
+    ) -> Result<Response<BulkWriteResponse>, Status> {
+        let bulk =
+            request.get_ref().request.clone().ok_or_else(|| {
+                Status::invalid_argument("internal BulkWrite request is required")
+            })?;
+        if bulk.operations.is_empty()
+            || bulk.operations.len() > MAX_ROUTED_BULK_ITEMS
+            || bulk.encoded_len() > MAX_ROUTED_BULK_BYTES
+        {
+            return Err(Status::resource_exhausted(
+                "routed internal bulk must contain 1..=1000 items within 64 MiB",
+            ));
+        }
+        let (call, timeout) = self.routed_call(&request, request.get_ref().peer.as_ref(), bulk)?;
+        let fence = call.placement_fence;
+        let response = tokio::time::timeout(timeout, self.routed.get()?.internal_bulk_write(call))
+            .await
+            .map_err(|_| {
+                Status::deadline_exceeded("routed internal BulkWrite deadline exceeded")
+            })??;
         self.require_unchanged(fence)?;
         Ok(Response::new(response))
     }
