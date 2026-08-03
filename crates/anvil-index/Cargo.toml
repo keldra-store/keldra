@@ -1,0 +1,17 @@
+[package]
+name = "anvil-index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Index formats and query engines for Anvil"
+publish = false
+
+[dependencies]
+blake3 = "1.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { version = "1.47", features = ["macros", "rt-multi-thread"] }
