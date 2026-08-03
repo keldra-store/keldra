@@ -535,6 +535,61 @@ async fn distributed_metadata_coordination_retains_only_awaiting_source_content(
 }
 
 #[tokio::test]
+async fn verified_distributed_publish_does_not_require_payload_on_path_coordinator() {
+    let (_temporary, coordinator, replica) = two_stores(16).await;
+    let reference = BlobRef {
+        hash: *blake3::hash(b"source lives on another active node").as_bytes(),
+        length: b"source lives on another active node".len() as u64,
+    };
+    let request = PublishRequest {
+        key: key("remote-source"),
+        blob: reference.clone(),
+        content_type: Some("application/octet-stream".into()),
+        mode: PutMode::PutIfAbsent,
+        command_id: Some("remote-source-command".into()),
+        durability: Durability::Replicated,
+    };
+
+    assert_eq!(
+        coordinator
+            .coordinate_object_mutation(
+                BatchOperation::Publish(request.clone()),
+                distributed_context(51),
+            )
+            .await
+            .unwrap_err(),
+        MutationError::BlobNotFound
+    );
+
+    let coordinated = coordinator
+        .coordinate_distributed_publish(request, distributed_context(51))
+        .await
+        .unwrap();
+    let mutation = coordinated.mutation.unwrap();
+    assert_eq!(mutation.version.blob, Some(reference.clone()));
+    assert_eq!(
+        mutation.reference_deltas,
+        [ReferenceDelta {
+            blob: reference.clone(),
+            change: 1,
+        }]
+    );
+    assert!(
+        coordinator
+            .blob_reference_state(&reference)
+            .unwrap()
+            .is_none()
+    );
+    assert!(!coordinator.contains_blob(&reference).await.unwrap());
+
+    replica
+        .apply_object_mutation_replica(&mutation)
+        .await
+        .unwrap();
+    assert_same_mutation_metadata(&coordinator, &replica, &mutation);
+}
+
+#[tokio::test]
 async fn typed_mutation_replicates_exactly_and_retries_after_head_and_journal_move() {
     let (_temporary, coordinator, replica) = two_stores(1).await;
     let first_request = put(

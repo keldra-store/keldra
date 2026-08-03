@@ -220,9 +220,57 @@ impl Store {
         };
         let identity = self.resolve_bucket_identity(logical_key.tenant(), logical_key.bucket())?;
         let prepared = self.prepare(operation, identity, true).await?;
+        self.coordinate_prepared_object_mutation(prepared, context)
+            .await
+    }
+
+    /// Coordinates a distributed publish whose payload evidence was verified
+    /// by the cluster layer on the current path coordinator.
+    ///
+    /// Unlike [`Store::coordinate_object_mutation`], this exact boundary does
+    /// not require the complete payload source to be present on the metadata
+    /// coordinator. Ordinary local publishes and every other operation retain
+    /// their existing local-byte check.
+    pub async fn coordinate_distributed_publish(
+        &self,
+        request: PublishRequest,
+        context: ObjectMutationContext,
+    ) -> Result<CoordinatedObjectMutation, MutationError> {
+        if context.serving_fence_term == 0 {
+            return Err(MutationError::InvalidObjectMutation(
+                "serving-fence term must be non-zero".into(),
+            ));
+        }
+        let _policy_guard = self.policy_gate.read().await;
+        let identity = self.resolve_bucket_identity(request.key.tenant(), request.key.bucket())?;
+        let prepared = self.prepare_verified_distributed_publish(request, identity)?;
+        self.coordinate_prepared_object_mutation(prepared, context)
+            .await
+    }
+
+    fn prepare_verified_distributed_publish(
+        &self,
+        request: PublishRequest,
+        identity: BucketIdentity,
+    ) -> Result<PreparedOperation, MutationError> {
+        validate_command_id(request.command_id.as_deref())?;
+        let fingerprint = publish_fingerprint(&request, identity);
+        Ok(PreparedOperation::Publish {
+            request,
+            identity,
+            fingerprint,
+        })
+    }
+
+    async fn coordinate_prepared_object_mutation(
+        &self,
+        prepared: PreparedOperation,
+        context: ObjectMutationContext,
+    ) -> Result<CoordinatedObjectMutation, MutationError> {
         if prepared.command_id().is_none() {
             return Err(MutationError::InvalidCommandId);
         }
+        let identity = prepared.identity();
 
         let _path_guard = self
             .ordinary_locks
