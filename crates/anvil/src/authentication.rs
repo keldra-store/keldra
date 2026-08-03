@@ -24,6 +24,10 @@ use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, deco
 use serde::{Deserialize, Serialize};
 use tonic::{Request, Status};
 
+use crate::distributed_watch::{
+    CHECKPOINT_AUDIENCE, CHECKPOINT_PURPOSE, WatchCheckpointClaims, WatchCheckpointCodec,
+};
+
 pub(crate) const ACCESS_TOKEN_LIFETIME: Duration = Duration::from_secs(60 * 60);
 pub const PUT_TOKEN_LIFETIME: Duration = Duration::from_secs(5 * 60);
 const MIN_SIGNING_KEY_BYTES: usize = 32;
@@ -309,6 +313,7 @@ pub struct JwtManager {
     decoding_key: Arc<DecodingKey>,
     access_validation: Arc<Validation>,
     put_validation: Arc<Validation>,
+    watch_checkpoint_validation: Arc<Validation>,
     signing_key_fingerprint: JwtSigningKeyFingerprint,
 }
 
@@ -372,6 +377,7 @@ impl JwtManager {
             decoding_key: Arc::new(DecodingKey::from_secret(signing_secret)),
             access_validation: Arc::new(token_validation(ACCESS_TOKEN_AUDIENCE)),
             put_validation: Arc::new(token_validation(PUT_TOKEN_AUDIENCE)),
+            watch_checkpoint_validation: Arc::new(watch_checkpoint_validation()),
             signing_key_fingerprint: JwtSigningKeyFingerprint(blake3::derive_key(
                 JWT_SIGNING_KEY_FINGERPRINT_CONTEXT,
                 signing_secret,
@@ -528,6 +534,37 @@ impl JwtManager {
     }
 }
 
+impl WatchCheckpointCodec for JwtManager {
+    fn seal(&self, claims: &WatchCheckpointClaims) -> Result<Vec<u8>, String> {
+        if claims.aud != CHECKPOINT_AUDIENCE || claims.purpose != CHECKPOINT_PURPOSE {
+            return Err("watch checkpoint has the wrong audience or purpose".into());
+        }
+        encode(
+            &Header::new(Algorithm::HS256),
+            claims,
+            self.encoding_key.as_ref(),
+        )
+        .map(String::into_bytes)
+        .map_err(|error| format!("watch checkpoint could not be encoded: {error}"))
+    }
+
+    fn open(&self, token: &[u8]) -> Result<WatchCheckpointClaims, String> {
+        let token = std::str::from_utf8(token)
+            .map_err(|_| "watch checkpoint is not a UTF-8 JWT".to_owned())?;
+        let claims = decode::<WatchCheckpointClaims>(
+            token,
+            self.decoding_key.as_ref(),
+            self.watch_checkpoint_validation.as_ref(),
+        )
+        .map_err(|error| format!("watch checkpoint could not be verified: {error}"))?
+        .claims;
+        if claims.aud != CHECKPOINT_AUDIENCE || claims.purpose != CHECKPOINT_PURPOSE {
+            return Err("watch checkpoint has the wrong audience or purpose".into());
+        }
+        Ok(claims)
+    }
+}
+
 fn token_validation(audience: &'static str) -> Validation {
     let mut validation = Validation::new(Algorithm::HS256);
     validation.leeway = 0;
@@ -536,6 +573,15 @@ fn token_validation(audience: &'static str) -> Validation {
     // mandatory during decoding.
     validation.set_required_spec_claims(&["exp", "sub", "aud"]);
     validation.set_audience(&[audience]);
+    validation
+}
+
+fn watch_checkpoint_validation() -> Validation {
+    let mut validation = Validation::new(Algorithm::HS256);
+    validation.leeway = 0;
+    validation.validate_exp = false;
+    validation.set_required_spec_claims(&["aud"]);
+    validation.set_audience(&[CHECKPOINT_AUDIENCE]);
     validation
 }
 
@@ -550,9 +596,13 @@ fn unix_seconds() -> Result<u64, AuthenticationError> {
 mod tests {
     use super::*;
     use anvil_authz::ObjectId;
+    use anvil_consensus::ClusterId;
+    use anvil_store::{PlacementLogId, SourceId, WatchScope};
     #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
     use tonic::metadata::MetadataValue;
+
+    use crate::distributed_watch::{DistributedWatchScope, WatchVectorEntry};
 
     const TEST_SIGNING_SECRET: &[u8; 32] = b"0123456789abcdef0123456789abcdef";
 
@@ -584,6 +634,117 @@ mod tests {
             MetadataValue::try_from(format!("Bearer {token}")).unwrap(),
         );
         request
+    }
+
+    fn watch_checkpoint_claims() -> WatchCheckpointClaims {
+        WatchCheckpointClaims {
+            format: 1,
+            aud: CHECKPOINT_AUDIENCE.into(),
+            purpose: CHECKPOINT_PURPOSE.into(),
+            cluster_id: ClusterId([9; 16]),
+            scope: DistributedWatchScope::new(
+                &WatchScope::new("tenant", "bucket", "docs").unwrap(),
+                11,
+                22,
+            )
+            .unwrap(),
+            membership_revision: PlacementLogId { term: 3, index: 7 },
+            sources: vec![WatchVectorEntry {
+                source: SourceId {
+                    node_id: 1,
+                    source_epoch: [4; 32],
+                },
+                next_offset: 19,
+            }],
+        }
+    }
+
+    fn sign_checkpoint(
+        manager: &JwtManager,
+        claims: &WatchCheckpointClaims,
+        algorithm: Algorithm,
+    ) -> Vec<u8> {
+        encode(
+            &Header::new(algorithm),
+            claims,
+            manager.encoding_key.as_ref(),
+        )
+        .unwrap()
+        .into_bytes()
+    }
+
+    #[test]
+    fn watch_checkpoint_round_trip_has_no_wall_clock_expiry() {
+        let manager = JwtManager::new(TEST_SIGNING_SECRET).unwrap();
+        let claims = watch_checkpoint_claims();
+
+        let token = manager.seal(&claims).unwrap();
+
+        assert_eq!(manager.open(&token).unwrap(), claims);
+        assert_ne!(token, serde_json::to_vec(&claims).unwrap());
+    }
+
+    #[test]
+    fn watch_checkpoint_rejects_another_signing_key() {
+        let issuer = JwtManager::new(TEST_SIGNING_SECRET).unwrap();
+        let verifier = JwtManager::new(b"fedcba9876543210fedcba9876543210").unwrap();
+        let token = issuer.seal(&watch_checkpoint_claims()).unwrap();
+
+        assert!(verifier.open(&token).is_err());
+    }
+
+    #[test]
+    fn watch_checkpoint_rejects_wrong_audience_and_purpose() {
+        let manager = JwtManager::new(TEST_SIGNING_SECRET).unwrap();
+        let mut wrong_audience = watch_checkpoint_claims();
+        wrong_audience.aud = ACCESS_TOKEN_AUDIENCE.into();
+        assert!(
+            manager
+                .open(&sign_checkpoint(
+                    &manager,
+                    &wrong_audience,
+                    Algorithm::HS256
+                ))
+                .is_err()
+        );
+
+        let mut wrong_purpose = watch_checkpoint_claims();
+        wrong_purpose.purpose = ACCESS_TOKEN_PURPOSE.into();
+        assert!(
+            manager
+                .open(&sign_checkpoint(&manager, &wrong_purpose, Algorithm::HS256))
+                .is_err()
+        );
+        assert!(manager.seal(&wrong_audience).is_err());
+        assert!(manager.seal(&wrong_purpose).is_err());
+    }
+
+    #[test]
+    fn watch_checkpoint_rejects_non_hs256_and_malformed_tokens() {
+        let manager = JwtManager::new(TEST_SIGNING_SECRET).unwrap();
+        let claims = watch_checkpoint_claims();
+        assert!(
+            manager
+                .open(&sign_checkpoint(&manager, &claims, Algorithm::HS384))
+                .is_err()
+        );
+        assert!(manager.open(b"not-a-jwt").is_err());
+        assert!(manager.open(&[0xff, 0xfe]).is_err());
+
+        let mut extra_claim = serde_json::to_value(&claims).unwrap();
+        extra_claim["unexpected"] = serde_json::Value::Bool(true);
+        let extra_claim = encode(
+            &Header::new(Algorithm::HS256),
+            &extra_claim,
+            manager.encoding_key.as_ref(),
+        )
+        .unwrap();
+        assert!(manager.open(extra_claim.as_bytes()).is_err());
+
+        let mut tampered = manager.seal(&claims).unwrap();
+        let last = tampered.last_mut().unwrap();
+        *last = if *last == b'a' { b'b' } else { b'a' };
+        assert!(manager.open(&tampered).is_err());
     }
 
     #[test]

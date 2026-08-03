@@ -19,10 +19,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const CHECKPOINT_FORMAT: u16 = 1;
-const CHECKPOINT_PURPOSE: &str = "anvil-watch-vector";
+pub(crate) const CHECKPOINT_AUDIENCE: &str = "anvil-watch-checkpoint";
+pub(crate) const CHECKPOINT_PURPOSE: &str = "anvil-watch-vector";
 
 /// The canonical public scope plus the stable IDs used in source journals.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct DistributedWatchScope {
     tenant: String,
     bucket: String,
@@ -180,8 +182,10 @@ pub(crate) trait ClusterWatchSources: Send + Sync + 'static {
 /// Claims sealed by the existing JWT subsystem in the production adapter.
 /// The core revalidates every semantic binding after opening the token.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct WatchCheckpointClaims {
     pub format: u16,
+    pub aud: String,
     pub purpose: String,
     pub cluster_id: ClusterId,
     pub scope: DistributedWatchScope,
@@ -190,6 +194,7 @@ pub(crate) struct WatchCheckpointClaims {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct WatchVectorEntry {
     pub source: SourceId,
     pub next_offset: u64,
@@ -381,6 +386,7 @@ impl DistributedWatch {
         self.checkpoints
             .seal(&WatchCheckpointClaims {
                 format: CHECKPOINT_FORMAT,
+                aud: CHECKPOINT_AUDIENCE.into(),
                 purpose: CHECKPOINT_PURPOSE.into(),
                 cluster_id: placement.cluster_id,
                 scope,
@@ -404,6 +410,7 @@ impl DistributedWatch {
             .open(token)
             .map_err(|_| DistributedWatchError::InvalidCheckpoint)?;
         if claims.format != CHECKPOINT_FORMAT
+            || claims.aud != CHECKPOINT_AUDIENCE
             || claims.purpose != CHECKPOINT_PURPOSE
             || claims.cluster_id != cluster_id
             || claims.scope != *scope
