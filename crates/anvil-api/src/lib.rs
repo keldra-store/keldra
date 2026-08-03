@@ -67,6 +67,19 @@ mod tests {
         assert!(schema.contains("rpc startput(putheader) returns (puttoken)"));
         assert!(schema.contains("rpc put(stream putrequest) returns (puttoken)"));
         assert!(schema.contains("rpc putend(puttoken) returns (mutationreceipt)"));
+        for rpc in [
+            "rpc createindex(createindexrequest)",
+            "rpc updateindex(updateindexrequest)",
+            "rpc getindex(getindexrequest)",
+            "rpc listindexes(listindexesrequest)",
+            "rpc deleteindex(deleteindexrequest)",
+            "rpc queryindex(queryindexrequest)",
+        ] {
+            assert!(schema.contains(rpc), "schema is missing `{rpc}`");
+        }
+        assert!(schema.contains("index_kind_tensor"));
+        assert!(schema.contains("tensorindexspec tensor"));
+        assert!(schema.contains("tensorindexquery tensor"));
 
         for rpc in [
             "rpc exchangeclientcredentials",
@@ -105,6 +118,50 @@ mod tests {
         ] {
             assert!(!schema.contains(forbidden), "schema contains `{forbidden}`");
         }
+    }
+
+    #[test]
+    fn generated_index_client_is_publicly_exposed() {
+        let _: Option<
+            super::v1::index_service_client::IndexServiceClient<tonic::transport::Channel>,
+        > = None;
+    }
+
+    #[test]
+    fn personaldb_transport_preserves_the_canonical_wire_frame() {
+        use super::v1::{
+            PersonalDbExchangeRequest, PersonalDbExchangeResponse,
+            PersonalDbGrantLeaderLeaseRequest, PersonalDbRenewLeaderLeaseRequest,
+            PersonalDbWitnessCommitRequest,
+        };
+
+        let request = PersonalDbExchangeRequest {
+            bucket: "personal".into(),
+            frame_json: br#"{"protocol_version":1}"#.to_vec(),
+        };
+        let response = PersonalDbExchangeResponse {
+            frame_json: vec![request.frame_json.clone()],
+        };
+        assert_eq!(response.frame_json, vec![request.frame_json]);
+
+        let grant = PersonalDbGrantLeaderLeaseRequest {
+            bucket: "personal".into(),
+            database_id_json: br#""database""#.to_vec(),
+            leader_replica_json: br#""replica""#.to_vec(),
+            duration_millis: 30_000,
+        };
+        let renew = PersonalDbRenewLeaderLeaseRequest {
+            bucket: grant.bucket.clone(),
+            leader_lease_json: br#"{"lease_generation":1}"#.to_vec(),
+            duration_millis: grant.duration_millis,
+        };
+        let witness = PersonalDbWitnessCommitRequest {
+            bucket: grant.bucket,
+            proposed_log_entry_json: br#"{"log_index":1}"#.to_vec(),
+            voter_ack_json: vec![br#"{"log_index":1}"#.to_vec()],
+        };
+        assert_eq!(renew.duration_millis, 30_000);
+        assert_eq!(witness.voter_ack_json.len(), 1);
     }
 
     #[test]
