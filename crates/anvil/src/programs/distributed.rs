@@ -69,6 +69,7 @@ impl super::ProgramCoordinator {
             &invocation_id,
             input_json,
             durability_class,
+            super::ProgramRuntimeTopology::Clustered,
         )?;
         let nomination = self.current_nomination()?;
         let distributed = self.distributed()?.clone();

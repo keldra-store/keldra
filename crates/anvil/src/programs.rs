@@ -33,6 +33,12 @@ pub(crate) const MAX_PROGRAM_INPUT_BYTES: usize = 16 * 1024 * 1024;
 const PROGRAM_PATH_PREFIX: &str = "_anvil/programs/";
 const LOCAL_DURABILITY_CLASS: &str = "local";
 const REPLICATED_DURABILITY_CLASS: &str = "replicated";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProgramRuntimeTopology {
+    OneNode,
+    Clustered,
+}
 const ATOMIC_VISIBILITY_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 #[derive(Clone)]
@@ -373,7 +379,13 @@ impl ProgramCoordinator {
             monotonic_counter.anvil_atomic_program_invocations_total = 1_u64,
             "atomic program invocation"
         );
-        validate_program_request(&program_key, &invocation_id, input_json, durability_class)?;
+        validate_program_request(
+            &program_key,
+            &invocation_id,
+            input_json,
+            durability_class,
+            ProgramRuntimeTopology::OneNode,
+        )?;
         let nomination = self.current_nomination()?;
         tracing::Span::current().record("nomination.log_index", nomination.nomination_log_index);
 
@@ -716,6 +728,7 @@ fn validate_program_request(
     invocation_id: &str,
     input_json: &[u8],
     durability_class: &str,
+    topology: ProgramRuntimeTopology,
 ) -> Result<(), Status> {
     if !key
         .path()
@@ -741,14 +754,18 @@ fn validate_program_request(
             "program input exceeds {MAX_PROGRAM_INPUT_BYTES} bytes"
         )));
     }
-    require_program_durability_class(durability_class)
+    require_program_durability_class(durability_class, topology)
 }
 
-fn require_program_durability_class(value: &str) -> Result<(), Status> {
+fn require_program_durability_class(
+    value: &str,
+    topology: ProgramRuntimeTopology,
+) -> Result<(), Status> {
     match value {
         LOCAL_DURABILITY_CLASS => Ok(()),
+        REPLICATED_DURABILITY_CLASS if topology == ProgramRuntimeTopology::Clustered => Ok(()),
         REPLICATED_DURABILITY_CLASS => Err(Status::unavailable(
-            "DURABILITY_UNAVAILABLE: replicated durability is unavailable in Anvil 0.5.0",
+            "DURABILITY_UNAVAILABLE: replicated durability is unavailable in a one-node cluster",
         )),
         _ => Err(Status::invalid_argument(
             "durability_class must be exactly `local` or `replicated`",
@@ -1603,30 +1620,77 @@ mod tests {
     fn only_nonempty_reserved_program_paths_are_accepted() {
         let valid = ObjectKey::new("tenant", "bucket", "_anvil/programs/import_osv@1").unwrap();
         assert!(
-            validate_program_request(&valid, "invoke-1", b"{}", LOCAL_DURABILITY_CLASS).is_ok()
+            validate_program_request(
+                &valid,
+                "invoke-1",
+                b"{}",
+                LOCAL_DURABILITY_CLASS,
+                ProgramRuntimeTopology::OneNode,
+            )
+            .is_ok()
         );
 
         let outside = ObjectKey::new("tenant", "bucket", "programs/import_osv@1").unwrap();
         assert!(
-            validate_program_request(&outside, "invoke-1", b"{}", LOCAL_DURABILITY_CLASS).is_err()
+            validate_program_request(
+                &outside,
+                "invoke-1",
+                b"{}",
+                LOCAL_DURABILITY_CLASS,
+                ProgramRuntimeTopology::OneNode,
+            )
+            .is_err()
         );
     }
 
     #[test]
     fn program_durability_class_is_a_closed_exact_choice() {
         let key = ObjectKey::new("tenant", "bucket", "_anvil/programs/import_osv@1").unwrap();
-        assert!(validate_program_request(&key, "invoke-1", b"{}", LOCAL_DURABILITY_CLASS).is_ok());
+        assert!(
+            validate_program_request(
+                &key,
+                "invoke-1",
+                b"{}",
+                LOCAL_DURABILITY_CLASS,
+                ProgramRuntimeTopology::OneNode,
+            )
+            .is_ok()
+        );
         assert_eq!(
-            validate_program_request(&key, "invoke-1", b"{}", REPLICATED_DURABILITY_CLASS,)
-                .unwrap_err()
-                .code(),
+            validate_program_request(
+                &key,
+                "invoke-1",
+                b"{}",
+                REPLICATED_DURABILITY_CLASS,
+                ProgramRuntimeTopology::OneNode,
+            )
+            .unwrap_err()
+            .code(),
             tonic::Code::Unavailable
         );
+        for supported in [LOCAL_DURABILITY_CLASS, REPLICATED_DURABILITY_CLASS] {
+            assert!(
+                validate_program_request(
+                    &key,
+                    "invoke-1",
+                    b"{}",
+                    supported,
+                    ProgramRuntimeTopology::Clustered,
+                )
+                .is_ok()
+            );
+        }
         for invalid in ["", " local", "local ", "LOCAL", "remote"] {
             assert_eq!(
-                validate_program_request(&key, "invoke-1", b"{}", invalid)
-                    .unwrap_err()
-                    .code(),
+                validate_program_request(
+                    &key,
+                    "invoke-1",
+                    b"{}",
+                    invalid,
+                    ProgramRuntimeTopology::Clustered,
+                )
+                .unwrap_err()
+                .code(),
                 tonic::Code::InvalidArgument
             );
         }
