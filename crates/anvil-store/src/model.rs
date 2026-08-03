@@ -17,6 +17,7 @@ pub struct VersionId(pub u64);
 
 pub const MUTATION_STAMP_FORMAT: u16 = 1;
 pub const OBJECT_MUTATION_FORMAT: u16 = 1;
+pub const RETAINED_VERSION_DELETE_FORMAT: u16 = 1;
 pub const MAX_OBJECT_MUTATION_REFERENCE_DELTAS: usize = 2;
 pub const MAX_CONTENT_TYPE_BYTES: usize = 512;
 
@@ -35,6 +36,11 @@ pub struct PlacementLogId {
 pub struct MutationStamp {
     pub format: u16,
     pub predecessor_version: Option<VersionId>,
+    /// Raft cursor for an explicitly atomic-program mutation. Ordinary object
+    /// mutations leave this absent. Readers use it only as a visibility fence;
+    /// it is not a second commit record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_commit_cursor: Option<u64>,
     pub mutation_fingerprint: [u8; 32],
     pub active_placement_log_id: PlacementLogId,
     pub serving_fence_term: u64,
@@ -175,6 +181,28 @@ pub struct ObjectMutationContext {
     pub serving_fence_term: u64,
 }
 
+/// Authoritative bucket-scoped inputs resolved from their complete logical
+/// replica group before an exact-path coordinator evaluates a mutation.
+/// These values are typed policy, not a cache or a second persistence plane.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObjectMutationGovernance {
+    pub tenant_id: u64,
+    pub bucket_id: u64,
+    pub versioning: ObjectVersioning,
+    pub policy: BucketPolicy,
+}
+
+impl ObjectMutationGovernance {
+    pub fn validate(&self) -> Result<(), MutationError> {
+        if self.tenant_id == 0 || self.bucket_id == 0 {
+            return Err(MutationError::InvalidPolicy(
+                "stable tenant and bucket IDs must be non-zero".into(),
+            ));
+        }
+        self.policy.validate()
+    }
+}
+
 /// One exact, bounded object mutation replicated between metadata owners.
 /// Payload bytes and raw RocksDB operations are deliberately absent.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,6 +239,7 @@ impl ObjectMutation {
         hash_u64(&mut hasher, self.receipt_expires_at_unix_millis);
         hash_u16(&mut hasher, self.stamp.format);
         hash_optional_version(&mut hasher, self.stamp.predecessor_version);
+        hash_optional_u64(&mut hasher, self.stamp.program_commit_cursor);
         hash_u64(&mut hasher, self.stamp.active_placement_log_id.term);
         hash_u64(&mut hasher, self.stamp.active_placement_log_id.index);
         hash_u64(&mut hasher, self.stamp.serving_fence_term);
@@ -280,6 +309,11 @@ impl ObjectMutation {
                 "predecessor retirement does not match mutation lineage".into(),
             ));
         }
+        if self.stamp.program_commit_cursor.is_some() {
+            return Err(MutationError::InvalidObjectMutation(
+                "ordinary object mutation carries an atomic-program commit cursor".into(),
+            ));
+        }
         if self.receipt_expires_at_unix_millis <= self.version.committed_at_unix_millis {
             return Err(MutationError::InvalidObjectMutation(
                 "mutation receipt does not outlive the committed version".into(),
@@ -341,13 +375,158 @@ pub struct CoordinatedObjectMutation {
     pub mutation: Option<ObjectMutation>,
 }
 
+/// One coordinator-selected deletion from a versioned path's immutable
+/// descriptor set. The typed expected head and target descriptor are the
+/// complete compare condition; replicas never infer lineage from arrival
+/// order.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetainedVersionDeleteMutation {
+    pub format: u16,
+    pub tenant_id: u64,
+    pub bucket_id: u64,
+    pub exact_path: String,
+    pub expected_head: Head,
+    pub target: Version,
+    pub replacement_tombstone: Option<Version>,
+    pub stamp: MutationStamp,
+    pub reference_deltas: Vec<ReferenceDelta>,
+}
+
+impl RetainedVersionDeleteMutation {
+    pub(crate) fn set_computed_fingerprint(&mut self) {
+        self.stamp.mutation_fingerprint = self.computed_fingerprint();
+    }
+
+    pub fn computed_fingerprint(&self) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"anvil.retained-version-delete.v1");
+        hash_u16(&mut hasher, self.format);
+        hash_u64(&mut hasher, self.tenant_id);
+        hash_u64(&mut hasher, self.bucket_id);
+        hash_bytes(&mut hasher, self.exact_path.as_bytes());
+        hash_head(&mut hasher, &self.expected_head);
+        hash_version(&mut hasher, &self.target);
+        match self.replacement_tombstone.as_ref() {
+            Some(version) => {
+                hasher.update(&[1]);
+                hash_version(&mut hasher, version);
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        }
+        hash_u16(&mut hasher, self.stamp.format);
+        hash_optional_version(&mut hasher, self.stamp.predecessor_version);
+        hash_optional_u64(&mut hasher, self.stamp.program_commit_cursor);
+        hash_u64(&mut hasher, self.stamp.active_placement_log_id.term);
+        hash_u64(&mut hasher, self.stamp.active_placement_log_id.index);
+        hash_u64(&mut hasher, self.stamp.serving_fence_term);
+        hash_u16(&mut hasher, self.stamp.source_id.node_id);
+        hasher.update(&self.stamp.source_id.source_epoch);
+        hash_u64(&mut hasher, self.stamp.source_journal_position);
+        hash_u64(&mut hasher, self.reference_deltas.len() as u64);
+        for delta in &self.reference_deltas {
+            hash_blob(&mut hasher, &delta.blob);
+            hasher.update(&delta.change.to_be_bytes());
+        }
+        *hasher.finalize().as_bytes()
+    }
+
+    pub fn validate(&self) -> Result<(), MutationError> {
+        if self.format != RETAINED_VERSION_DELETE_FORMAT {
+            return Err(MutationError::InvalidObjectMutation(format!(
+                "unsupported retained-version deletion format {}",
+                self.format
+            )));
+        }
+        if self.tenant_id == 0 || self.bucket_id == 0 {
+            return Err(MutationError::InvalidObjectMutation(
+                "stable tenant and bucket IDs must be non-zero".into(),
+            ));
+        }
+        ObjectKey::new("typed", "delete-version", &self.exact_path)
+            .map_err(|error| MutationError::InvalidObjectMutation(error.to_string()))?;
+        validate_version_descriptor(&self.target)?;
+        if self.expected_head.version.0 == 0
+            || self.stamp.format != MUTATION_STAMP_FORMAT
+            || self.stamp.predecessor_version != Some(self.expected_head.version)
+            || self.stamp.program_commit_cursor.is_some()
+            || self.stamp.serving_fence_term == 0
+            || self.stamp.source_id.node_id == 0
+            || self.stamp.source_id.source_epoch == [0; 32]
+            || self.stamp.source_journal_position == 0
+        {
+            return Err(MutationError::InvalidObjectMutation(
+                "retained-version deletion lineage or source is malformed".into(),
+            ));
+        }
+        match self.replacement_tombstone.as_ref() {
+            Some(replacement) => {
+                validate_version_descriptor(replacement)?;
+                if self.expected_head.version != self.target.id
+                    || self.expected_head.deleted != self.target.deleted
+                    || self.target.deleted
+                    || !replacement.deleted
+                    || replacement.id <= self.expected_head.version
+                {
+                    return Err(MutationError::InvalidObjectMutation(
+                        "current-version deletion replacement is malformed".into(),
+                    ));
+                }
+            }
+            None if self.expected_head.version == self.target.id => {
+                return Err(MutationError::InvalidObjectMutation(
+                    "current-version deletion requires a fresh tombstone".into(),
+                ));
+            }
+            None => {}
+        }
+        let expected_delta = self.target.blob.as_ref().map(|blob| ReferenceDelta {
+            blob: blob.clone(),
+            change: -1,
+        });
+        if self.reference_deltas.as_slice() != expected_delta.as_slice() {
+            return Err(MutationError::InvalidObjectMutation(
+                "retained-version deletion reference effect is malformed".into(),
+            ));
+        }
+        if self.stamp.mutation_fingerprint != self.computed_fingerprint() {
+            return Err(MutationError::InvalidObjectMutation(
+                "retained-version deletion fingerprint does not match".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn outcome(&self) -> DeleteRetainedVersionOutcome {
+        self.replacement_tombstone.as_ref().map_or(
+            DeleteRetainedVersionOutcome::DeletedNonCurrent,
+            |replacement| DeleteRetainedVersionOutcome::ReplacedCurrentWithTombstone {
+                version: replacement.id,
+            },
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CoordinatedRetainedVersionDelete {
+    pub outcome: DeleteRetainedVersionOutcome,
+    pub mutation: Option<RetainedVersionDeleteMutation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplicaRetainedVersionDeleteApplied {
+    pub outcome: DeleteRetainedVersionOutcome,
+    pub replayed: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReplicaObjectMutationApplied {
     pub version: VersionId,
     pub replayed: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeleteRetainedVersionOutcome {
     NotFound,
     DeletedNonCurrent,
@@ -533,6 +712,45 @@ fn hash_version(hasher: &mut blake3::Hasher, version: &Version) {
     hash_u64(hasher, version.committed_at_unix_millis);
 }
 
+fn hash_head(hasher: &mut blake3::Hasher, head: &Head) {
+    hash_u64(hasher, head.version.0);
+    hasher.update(&[u8::from(head.deleted)]);
+    match head.mutation_stamp {
+        Some(stamp) => {
+            hasher.update(&[1]);
+            hash_u16(hasher, stamp.format);
+            hash_optional_version(hasher, stamp.predecessor_version);
+            hash_optional_u64(hasher, stamp.program_commit_cursor);
+            hasher.update(&stamp.mutation_fingerprint);
+            hash_u64(hasher, stamp.active_placement_log_id.term);
+            hash_u64(hasher, stamp.active_placement_log_id.index);
+            hash_u64(hasher, stamp.serving_fence_term);
+            hash_u16(hasher, stamp.source_id.node_id);
+            hasher.update(&stamp.source_id.source_epoch);
+            hash_u64(hasher, stamp.source_journal_position);
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+}
+
+fn validate_version_descriptor(version: &Version) -> Result<(), MutationError> {
+    if version.id.0 == 0
+        || version.deleted != version.blob.is_none()
+        || version
+            .content_type
+            .as_ref()
+            .is_some_and(|value| value.len() > MAX_CONTENT_TYPE_BYTES)
+        || version.deleted && version.content_type.is_some()
+    {
+        return Err(MutationError::InvalidObjectMutation(
+            "version descriptor is malformed".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn hash_blob(hasher: &mut blake3::Hasher, blob: &BlobRef) {
     hasher.update(&blob.hash);
     hash_u64(hasher, blob.length);
@@ -543,6 +761,18 @@ fn hash_optional_version(hasher: &mut blake3::Hasher, version: Option<VersionId>
         Some(version) => {
             hasher.update(&[1]);
             hash_u64(hasher, version.0);
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+}
+
+fn hash_optional_u64(hasher: &mut blake3::Hasher, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            hasher.update(&[1]);
+            hash_u64(hasher, value);
         }
         None => {
             hasher.update(&[0]);

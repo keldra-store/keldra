@@ -1,10 +1,10 @@
 use super::*;
-use crate::ObjectMutation;
 use crate::model::MAX_OBJECT_MUTATION_REFERENCE_DELTAS;
 use crate::watch::{
     REFERENCE_PROOF_KEY_BYTES, ReferenceProof, decode_reference_proof, encode_reference_proof,
     reference_proof_key,
 };
+use crate::{ObjectMutation, RetainedVersionDeleteMutation};
 
 pub const MAX_REFERENCE_PROOF_EXPORT_RECORDS: u32 = 1_000;
 pub const MAX_REFERENCE_PROOF_EXPORT_BYTES: u64 = 64 * 1024 * 1024;
@@ -51,6 +51,35 @@ pub struct ReferenceProofPage {
 }
 
 impl Store {
+    pub(crate) fn stage_reference_proof_if_absent(
+        &self,
+        batch: &mut WriteBatch,
+        expected: &ReferenceProof,
+    ) -> Result<bool, MutationError> {
+        validate_stored_proof(expected).map_err(MutationError::InvalidObjectMutation)?;
+        if let Some(existing) = self.read_reference_proof(expected.source_id, expected.offset())? {
+            if existing != *expected {
+                return Err(MutationError::ObjectMutationConflict);
+            }
+            return Ok(false);
+        }
+        batch.put_cf(
+            self.cf(CF_LOCAL_INVALIDATIONS)?,
+            reference_proof_key(expected.source_id, expected.offset()),
+            encode_reference_proof(expected).map_err(storage_error)?,
+        );
+        Ok(true)
+    }
+
+    pub(crate) fn stage_retained_version_delete_reference_proof(
+        &self,
+        batch: &mut WriteBatch,
+        mutation: &RetainedVersionDeleteMutation,
+    ) -> Result<bool, MutationError> {
+        mutation.validate()?;
+        self.stage_reference_proof_if_absent(batch, &proof_for_retained_delete(mutation)?)
+    }
+
     /// Enumerates the retained fixed proof namespace in source/offset key
     /// order. It shares the existing journal column family and retention.
     pub fn export_reference_proofs(
@@ -336,18 +365,7 @@ impl Store {
         mutation: &ObjectMutation,
     ) -> Result<bool, MutationError> {
         let expected = proof_for_mutation(mutation)?;
-        if let Some(existing) = self.read_reference_proof(expected.source_id, expected.offset())? {
-            if existing != expected {
-                return Err(MutationError::ObjectMutationConflict);
-            }
-            return Ok(false);
-        }
-        batch.put_cf(
-            self.cf(CF_LOCAL_INVALIDATIONS)?,
-            reference_proof_key(expected.source_id, expected.offset()),
-            encode_reference_proof(&expected).map_err(storage_error)?,
-        );
-        Ok(true)
+        self.stage_reference_proof_if_absent(batch, &expected)
     }
 }
 
@@ -392,6 +410,30 @@ fn proof_for_mutation(mutation: &ObjectMutation) -> Result<ReferenceProof, Mutat
     Ok(proof)
 }
 
+fn proof_for_retained_delete(
+    mutation: &RetainedVersionDeleteMutation,
+) -> Result<ReferenceProof, MutationError> {
+    mutation.validate()?;
+    let proof = ReferenceProof::new(
+        mutation.stamp.source_id,
+        mutation.stamp.mutation_fingerprint,
+        LocalChange::retained_version_deleted(
+            mutation.stamp.source_journal_position,
+            mutation.tenant_id,
+            mutation.bucket_id,
+            mutation.exact_path.clone(),
+            mutation.target.id,
+            mutation
+                .replacement_tombstone
+                .as_ref()
+                .map(|replacement| replacement.id),
+            mutation.reference_deltas.clone(),
+        ),
+    );
+    validate_stored_proof(&proof).map_err(MutationError::InvalidObjectMutation)?;
+    Ok(proof)
+}
+
 fn validate_proof_coordinates(source: SourceId, offset: u64) -> Result<(), MutationError> {
     if validate_proof_source(source).is_err() || offset == 0 {
         return Err(MutationError::InvalidObjectMutation(
@@ -408,28 +450,47 @@ fn validate_stored_proof(proof: &ReferenceProof) -> Result<(), String> {
     {
         return Err("reference proof source identity or offset is invalid".into());
     }
-    let LocalChange::ObjectHead(change) = &proof.change else {
-        return Err("reference proof is not an object-head mutation".into());
+    let (tenant_id, bucket_id, exact_path, reference_deltas) = match &proof.change {
+        LocalChange::ObjectHead(change) => {
+            if change.path_version.0 == 0 {
+                return Err("reference proof path version is invalid".into());
+            }
+            (
+                change.tenant_id,
+                change.bucket_id,
+                change.exact_path.as_str(),
+                change.reference_deltas.as_slice(),
+            )
+        }
+        LocalChange::RetainedVersionDeleted(change) => {
+            if change.deleted_version.0 == 0
+                || change.resulting_head_version == Some(change.deleted_version)
+            {
+                return Err("reference proof retained-version identity is invalid".into());
+            }
+            (
+                change.tenant_id,
+                change.bucket_id,
+                change.exact_path.as_str(),
+                change.reference_deltas.as_slice(),
+            )
+        }
+        _ => return Err("reference proof is not an object metadata mutation".into()),
     };
-    if change.tenant_id == 0 || change.bucket_id == 0 || change.path_version.0 == 0 {
-        return Err("reference proof stable identity or path version is invalid".into());
+    if tenant_id == 0 || bucket_id == 0 {
+        return Err("reference proof stable identity is invalid".into());
     }
-    ObjectKey::new(
-        "reference-proof",
-        "reference-proof",
-        change.exact_path.clone(),
-    )
-    .map_err(|error| format!("reference proof path is invalid: {error}"))?;
-    if change.reference_deltas.len() > MAX_OBJECT_MUTATION_REFERENCE_DELTAS
-        || change
-            .reference_deltas
+    ObjectKey::new("reference-proof", "reference-proof", exact_path)
+        .map_err(|error| format!("reference proof path is invalid: {error}"))?;
+    if reference_deltas.len() > MAX_OBJECT_MUTATION_REFERENCE_DELTAS
+        || reference_deltas
             .iter()
             .any(|delta| !matches!(delta.change, -1 | 1))
     {
         return Err("reference proof deltas are malformed".into());
     }
-    for (index, delta) in change.reference_deltas.iter().enumerate() {
-        if change.reference_deltas[..index]
+    for (index, delta) in reference_deltas.iter().enumerate() {
+        if reference_deltas[..index]
             .iter()
             .any(|earlier| earlier.blob == delta.blob)
         {

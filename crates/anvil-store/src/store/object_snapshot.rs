@@ -164,6 +164,7 @@ impl ObjectPathSnapshot {
                 || stamp
                     .predecessor_version
                     .is_some_and(|predecessor| predecessor >= self.head.version)
+                || stamp.program_commit_cursor == Some(0)
                 || stamp.serving_fence_term == 0
                 || stamp.source_id.node_id == 0
                 || stamp.source_id.source_epoch == [0; 32]

@@ -58,6 +58,17 @@ async fn sealing_creates_one_reservation_and_reuse_only_refreshes_it() {
     assert_eq!(refreshed.flags, AWAITING_PUBLISH);
     assert_eq!(refreshed.created_at, first.created_at);
     assert_eq!(refreshed.updated_at, first.updated_at + 10);
+    let changes = store.scan_local_changes(0, 10).unwrap();
+    assert_eq!(changes.len(), 2);
+    for (change, expected_revision) in changes.iter().zip([first.updated_at, refreshed.updated_at])
+    {
+        let LocalChange::ContentLifecycleChanged(change) = change else {
+            panic!("sealed lifecycle update must be journaled")
+        };
+        assert_eq!(change.blob_identity, blob_reference_key(&blob));
+        assert_eq!(change.revision, expected_revision);
+        assert!(change.reference_deltas.is_empty());
+    }
 }
 
 #[tokio::test]

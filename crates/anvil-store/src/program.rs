@@ -22,6 +22,13 @@ use crate::{
     VersionId,
 };
 
+mod distributed;
+
+pub use distributed::{
+    CoordinatedProgramPathFinalization, ProgramPathMutation, ProgramPathStage,
+    ReplicaProgramPathApplied, path_stage_from_prepared,
+};
+
 const PREPARED_BUNDLE_FORMAT: u16 = 4;
 const DURABILITY_EVIDENCE_FORMAT: u16 = 1;
 const APPLIED_PROGRAM_COMMIT_KEY: &[u8] = b"applied_program_commit";
@@ -317,7 +324,7 @@ pub enum ProgramStoreError {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-struct StoredPreparedBundle {
+pub struct StoredPreparedBundle {
     format: u16,
     source_bundle_hash: PreparedBundleHash,
     program_hash: ProgramHash,
@@ -327,11 +334,16 @@ struct StoredPreparedBundle {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-struct PreparedVersionWrite {
+pub struct PreparedVersionWrite {
     path: ObjectPath,
     expected: ObservedHead,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_version: Option<Version>,
     version: Version,
 }
+
+pub type PreparedProgramRecord = StoredPreparedBundle;
+pub type PreparedProgramWrite = PreparedVersionWrite;
 
 #[derive(Debug)]
 struct LoadedPreparedBundle {
@@ -595,6 +607,18 @@ fn validate_prepared_record(record: &StoredPreparedBundle) -> Result<(), Program
             return Err(ProgramStoreError::InvalidBundle(
                 "prepared write has no unique matching precondition or version".into(),
             ));
+        }
+        if let Some(previous) = write.previous_version.as_ref() {
+            if !matches!(
+                &write.expected,
+                ObservedHead::Version { version }
+                    if version.parse::<u64>().ok() == Some(previous.id.0)
+                        && previous.id < write.version.id
+            ) {
+                return Err(ProgramStoreError::InvalidBundle(
+                    "prepared write predecessor does not match its observed head".into(),
+                ));
+            }
         }
         let valid_tombstone = write.version.deleted
             && write.version.blob.is_none()
@@ -1283,8 +1307,32 @@ impl Store {
         lease: &ProgramExecutionLease,
     ) -> Result<PreparedProgramBundle, ProgramStoreError> {
         let source = lease.bundle();
-        validate_source_bundle(source)?;
         self.validate_program_policies(source)?;
+        self.prepare_program_bundle_source(lease.program_hash, source, None)
+            .await
+    }
+
+    /// Distributed preparation uses the executor's shared exact-path lock
+    /// manager and an authoritative cluster reader rather than this node's
+    /// local reader. Path authorities validate `PROGRAM_ONLY` again while
+    /// staging, before any Raft visibility decision.
+    pub async fn prepare_distributed_program_bundle(
+        &self,
+        program_hash: ProgramHash,
+        source: &AtomicWriteBundle,
+        previous_versions: &BTreeMap<ObjectPath, Version>,
+    ) -> Result<PreparedProgramBundle, ProgramStoreError> {
+        self.prepare_program_bundle_source(program_hash, source, Some(previous_versions))
+            .await
+    }
+
+    async fn prepare_program_bundle_source(
+        &self,
+        program_hash: ProgramHash,
+        source: &AtomicWriteBundle,
+        previous_versions: Option<&BTreeMap<ObjectPath, Version>>,
+    ) -> Result<PreparedProgramBundle, ProgramStoreError> {
+        validate_source_bundle(source)?;
         let source_encoded = serde_json::to_vec(source).map_err(program_storage_error)?;
         let source_bundle_hash = PreparedBundleHash(tagged_hash(
             b"anvil.atomic-source-bundle.v1",
@@ -1314,6 +1362,8 @@ impl Store {
             let descriptor = PreparedVersionWrite {
                 path: write.path.clone(),
                 expected: write.expected.clone(),
+                previous_version: previous_versions
+                    .and_then(|versions| versions.get(&write.path).cloned()),
                 version: Version {
                     id: version_id,
                     blob,
@@ -1328,7 +1378,7 @@ impl Store {
         let record = StoredPreparedBundle {
             format: PREPARED_BUNDLE_FORMAT,
             source_bundle_hash,
-            program_hash: lease.program_hash,
+            program_hash,
             preconditions: source.head_preconditions.clone(),
             writes,
             receipt: source.receipt.clone(),
@@ -1362,7 +1412,7 @@ impl Store {
         Ok(PreparedProgramBundle {
             hash,
             source_bundle_hash,
-            program_hash: lease.program_hash,
+            program_hash,
             bundle: bundle_ref,
             durability_evidence_hash,
             durability,
@@ -1390,6 +1440,23 @@ impl Store {
             Err(ProgramStoreError::PreparedBundleNotFound(_)) => Ok(None),
             Err(error) => Err(error),
         }
+    }
+
+    pub async fn prepared_program_record(
+        &self,
+        prepared: &PreparedProgramBundle,
+    ) -> Result<PreparedProgramRecord, ProgramStoreError> {
+        let reference = BlobRef::from(prepared.bundle);
+        let bytes = self
+            .read_blob_bytes(&reference)
+            .await
+            .map_err(program_mutation_error)?;
+        PreparedProgramRecord::decode_distributed(
+            &bytes,
+            prepared.bundle,
+            prepared.hash,
+            prepared.program_hash,
+        )
     }
 
     fn validate_program_policies(

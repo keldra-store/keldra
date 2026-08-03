@@ -283,6 +283,7 @@ async fn ordinary_blob_plane_attests_executor_local_durability() {
         invalidations[0].path_version,
         store.head(&counter_key).unwrap().unwrap().version
     );
+    let journal_tail_before_replay = store.local_invalidation_offset().unwrap();
 
     // Recovery of an already-finalized commit must not append a duplicate
     // invalidation. The compact commit marker, head and journal move together in
@@ -300,7 +301,10 @@ async fn ordinary_blob_plane_attests_executor_local_durability() {
         .await
         .unwrap();
     assert_eq!(replayed, applied);
-    assert_eq!(store.local_invalidation_offset().unwrap(), 1);
+    assert_eq!(
+        store.local_invalidation_offset().unwrap(),
+        journal_tail_before_replay
+    );
     assert_eq!(
         store.blob_reference_state(&applied_blob).unwrap().unwrap(),
         applied_blob_state
@@ -874,4 +878,65 @@ async fn immutable_read_only_program_dependency_still_requires_program_only_poli
             mutation_stamp: None,
         })
     );
+}
+
+#[tokio::test]
+async fn distributed_path_stage_is_invisible_until_commit_bound_finalization() {
+    let (_temporary, store, program) = configured_store().await;
+    let engine = store.program_engine(&program).unwrap();
+    let lease = engine
+        .prepare(
+            &InvocationContext::new("tenant").unwrap(),
+            &invocation("distributed-stage", ExpectedHead::Absent),
+        )
+        .await
+        .unwrap();
+    let mut prepared = store
+        .prepare_distributed_program_bundle(program.hash, lease.bundle(), &BTreeMap::new())
+        .await
+        .unwrap();
+    prepared.attest_remote_durability("replicated").unwrap();
+    let record = store.prepared_program_record(&prepared).await.unwrap();
+    let (tenant_id, bucket_id) = store.resolve_bucket_ids("tenant", "bucket").unwrap();
+    let stage = path_stage_from_prepared(
+        &prepared,
+        record.writes().first().unwrap(),
+        tenant_id,
+        bucket_id,
+    )
+    .unwrap();
+
+    let persisted = store.persist_program_path_stage(&stage).await.unwrap();
+    assert_eq!(persisted, stage.blob_ref().unwrap());
+    assert_eq!(
+        store.head(&object_key(&counter_path()).unwrap()).unwrap(),
+        None
+    );
+
+    let finalized = store
+        .coordinate_program_path_finalization(
+            stage.clone(),
+            42,
+            crate::ObjectMutationContext {
+                active_placement_log_id: crate::PlacementLogId { term: 3, index: 7 },
+                serving_fence_term: 3,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(finalized.mutation.commit_cursor, 42);
+    assert_eq!(finalized.mutation.stamp.program_commit_cursor, Some(42));
+    let head = store
+        .head(&object_key(&counter_path()).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(head.version, stage.version.id);
+    assert_eq!(head.mutation_stamp.unwrap().program_commit_cursor, Some(42));
+
+    let replay = store
+        .apply_program_path_finalization_replica(&finalized.mutation)
+        .await
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.version, stage.version.id);
 }

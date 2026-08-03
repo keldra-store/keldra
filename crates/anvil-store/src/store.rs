@@ -153,6 +153,11 @@ pub(crate) enum PendingLocalChange {
         aggregate_key: Vec<u8>,
         revision: u64,
     },
+    ContentLifecycleChanged {
+        blob_identity: Vec<u8>,
+        revision: u64,
+        reference_deltas: Vec<ReferenceDelta>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -776,6 +781,7 @@ impl Store {
 
 mod authz_journal;
 mod blob_references;
+mod delete_version;
 mod mutations;
 mod object_snapshot;
 mod payload;

@@ -84,24 +84,37 @@ impl Store {
         }
 
         let mut batch = WriteBatch::default();
+        let mut lifecycle_changes = Vec::with_capacity(states.len());
         for (key, state) in states {
             batch.put_cf(
                 self.cf(CF_BLOB_REFERENCES)
                     .map_err(ReferenceDeltaError::from)?,
-                key,
+                &key,
                 encode_blob_reference_state(state),
             );
+            lifecycle_changes.push(PendingLocalChange::ContentLifecycleChanged {
+                blob_identity: key,
+                revision: state.updated_at,
+                // These are destination lifecycle invalidations. Re-emitting
+                // the source reference effects would apply them twice.
+                reference_deltas: Vec::new(),
+            });
         }
         batch.put_cf(
             self.cf(CF_METADATA).map_err(ReferenceDeltaError::from)?,
             cursor_key,
             request.through.to_be_bytes(),
         );
+        self.stage_local_changes(&mut batch, &lifecycle_changes)
+            .map_err(ReferenceDeltaError::from)?;
         let mut options = WriteOptions::default();
         options.set_sync(self.sync_writes);
         self.db
             .write_opt(batch, &options)
             .map_err(|error| ReferenceDeltaError::Storage(error.to_string()))?;
+        if !lifecycle_changes.is_empty() {
+            self.notify_local_invalidations();
+        }
 
         Ok(ReferenceDeltaApplied {
             through: request.through,
@@ -250,6 +263,12 @@ mod tests {
         let state = store.blob_reference_state(&blob).unwrap().unwrap();
         assert_eq!(state.ref_count, 1);
         assert_eq!(state.flags, 0);
+        let changes = store.scan_local_changes(0, 10).unwrap();
+        let Some(LocalChange::ContentLifecycleChanged(lifecycle)) = changes.last() else {
+            panic!("reference application must append a lifecycle invalidation")
+        };
+        assert_eq!(lifecycle.blob_identity, blob_reference_key(&blob));
+        assert!(lifecycle.reference_deltas.is_empty());
 
         let replayed = store
             .apply_reference_deltas(batch(0, 4, &blob, 1))
@@ -257,6 +276,7 @@ mod tests {
             .unwrap();
         assert!(replayed.replayed);
         assert_eq!(store.blob_reference_state(&blob).unwrap().unwrap(), state);
+        assert_eq!(store.scan_local_changes(0, 10).unwrap(), changes);
     }
 
     #[tokio::test]

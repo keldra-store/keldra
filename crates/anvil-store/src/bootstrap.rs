@@ -175,6 +175,14 @@ pub struct PreparedBucketCreation {
     pub grant: TupleBatchRequest,
 }
 
+/// No-write result used by the cluster administration executor for
+/// application creation and credential rotation/disable operations.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedApplicationCredential {
+    pub credential: ApplicationCredential,
+    pub logical_records: Vec<LogicalRecordValue>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SystemApplicationRole {
     Admin,
@@ -1308,6 +1316,8 @@ impl CredentialRepository {
         })
     }
 }
+
+mod distributed;
 
 fn validate_bootstrap_request(
     request: &SystemBootstrapRequest,

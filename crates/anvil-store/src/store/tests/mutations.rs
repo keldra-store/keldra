@@ -591,7 +591,7 @@ async fn verified_distributed_publish_does_not_require_payload_on_path_coordinat
 
 #[tokio::test]
 async fn typed_mutation_replicates_exactly_and_retries_after_head_and_journal_move() {
-    let (_temporary, coordinator, replica) = two_stores(1).await;
+    let (_temporary, coordinator, replica) = two_stores(2).await;
     let first_request = put(
         "replicated",
         b"first",
@@ -606,7 +606,7 @@ async fn typed_mutation_replicates_exactly_and_retries_after_head_and_journal_mo
         .await
         .unwrap();
     let first_mutation = first.mutation.clone().unwrap();
-    assert_eq!(first_mutation.stamp.source_journal_position, 1);
+    assert_eq!(first_mutation.stamp.source_journal_position, 2);
     assert!(!first.receipt.replayed);
     assert_eq!(
         replica
@@ -619,7 +619,7 @@ async fn typed_mutation_replicates_exactly_and_retries_after_head_and_journal_mo
         }
     );
     assert_same_mutation_metadata(&coordinator, &replica, &first_mutation);
-    assert_eq!(coordinator.local_watch_status().unwrap().tail, 1);
+    assert_eq!(coordinator.local_watch_status().unwrap().tail, 2);
     assert_eq!(replica.local_watch_status().unwrap().tail, 0);
     assert!(
         replica
@@ -640,7 +640,7 @@ async fn typed_mutation_replicates_exactly_and_retries_after_head_and_journal_mo
     );
 
     coordinator
-        .advance_source_journal_safe_through(1)
+        .advance_source_journal_safe_through(2)
         .await
         .unwrap();
     let second = coordinator
@@ -656,19 +656,28 @@ async fn typed_mutation_replicates_exactly_and_retries_after_head_and_journal_mo
         .await
         .unwrap();
     let second_mutation = second.mutation.clone().unwrap();
-    assert_eq!(second_mutation.stamp.source_journal_position, 2);
+    assert_eq!(second_mutation.stamp.source_journal_position, 4);
     replica
         .apply_object_mutation_replica(&second_mutation)
         .await
         .unwrap();
     assert_same_mutation_metadata(&coordinator, &replica, &second_mutation);
-    assert!(coordinator.read_local_change(1).unwrap().is_none());
+    assert!(
+        coordinator
+            .read_local_change(first_mutation.stamp.source_journal_position)
+            .unwrap()
+            .is_none()
+    );
     assert!(
         coordinator
             .read_json::<Version>(CF_VERSIONS, &mutation_version_key(&first_mutation))
             .unwrap()
             .is_none()
     );
+    coordinator
+        .advance_source_journal_safe_through(second_mutation.stamp.source_journal_position)
+        .await
+        .unwrap();
 
     let recovered = coordinator
         .coordinate_object_mutation(BatchOperation::Put(first_request), distributed_context(11))

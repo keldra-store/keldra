@@ -2,7 +2,7 @@ use argon2::{Params, Version};
 use tempfile::TempDir;
 
 use super::*;
-use crate::StoreOptions;
+use crate::{LocalChange, StoreOptions};
 
 async fn open_store(root: &TempDir, node_id: u16) -> Store {
     Store::open(StoreOptions::new(root.path(), node_id))
@@ -154,6 +154,40 @@ async fn baseline_mutation_constructs_without_commit_then_replays_after_restart(
         reopened.logical_record_candidate(&policy_id()).unwrap(),
         Some(LogicalRecordCandidate::Versioned(mutation))
     );
+}
+
+#[tokio::test]
+async fn journaled_logical_mutation_commits_one_typed_aggregate_change() {
+    let root = tempfile::tempdir().unwrap();
+    let store = open_store(&root, 1).await;
+    let mutation = store
+        .construct_logical_record_mutation(policy_value(&["ledger"], &[]), context(100))
+        .unwrap();
+
+    let applied = store
+        .apply_logical_record_mutation_journaled(&mutation)
+        .await
+        .unwrap();
+    assert!(!applied.replayed);
+    let changes = store.scan_local_changes(0, 10).unwrap();
+    let [LocalChange::AggregateChanged(change)] = changes.as_slice() else {
+        panic!("expected one logical-record aggregate change")
+    };
+    assert_eq!(change.aggregate_kind, AggregateKind::LogicalRecord);
+    assert_eq!(change.revision, 100);
+    assert_eq!(
+        serde_json::from_slice::<LogicalRecordId>(&change.aggregate_key).unwrap(),
+        policy_id()
+    );
+
+    assert!(
+        store
+            .apply_logical_record_mutation_journaled(&mutation)
+            .await
+            .unwrap()
+            .replayed
+    );
+    assert_eq!(store.scan_local_changes(0, 10).unwrap().len(), 1);
 }
 
 #[tokio::test]

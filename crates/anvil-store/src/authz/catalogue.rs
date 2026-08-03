@@ -294,11 +294,25 @@ impl AuthzRepository {
         request: PublishSchemaRequest,
         context: AuthzRealmMutationContext,
     ) -> Result<CoordinatedAuthzSchemaPublication, AuthzStoreError> {
-        validate_publication_context(&context, self.limits.max_operation_id_bytes)?;
         let _guard = self.lock_writes()?;
         let mut batch = WriteBatch::default();
+        let coordinated =
+            self.stage_coordinated_schema_publication(request, context, &mut batch)?;
+        if !batch.is_empty() {
+            self.write(batch)?;
+        }
+        Ok(coordinated)
+    }
+
+    pub(crate) fn stage_coordinated_schema_publication(
+        &self,
+        request: PublishSchemaRequest,
+        context: AuthzRealmMutationContext,
+        batch: &mut WriteBatch,
+    ) -> Result<CoordinatedAuthzSchemaPublication, AuthzStoreError> {
+        validate_publication_context(&context, self.limits.max_operation_id_bytes)?;
         let storage_tenant = request.storage_tenant.clone();
-        let (result, stored) = self.prepare_schema_publication(request, &mut batch)?;
+        let (result, stored) = self.prepare_schema_publication(request, batch)?;
         let Some(stored) = stored else {
             let revision = self.require_schema_revision(&storage_tenant, &result.schema_ref)?;
             return Ok(CoordinatedAuthzSchemaPublication {
@@ -342,7 +356,6 @@ impl AuthzRepository {
             schema_revision_key(&storage_tenant, &revision.schema_ref),
             encode_json(&revision)?,
         );
-        self.write(batch)?;
         Ok(CoordinatedAuthzSchemaPublication {
             result,
             mutation: Some(mutation),

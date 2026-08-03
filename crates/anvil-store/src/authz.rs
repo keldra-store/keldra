@@ -857,6 +857,7 @@ impl AuthzRepository {
             self.limits.evaluator,
         )?;
         let mut tuple_count = binding.tuple_count;
+        let mut changed = false;
         for mutation in &canonical_mutations {
             let key = tuple_key(&request.scope, &mutation.tuple)?;
             let existing = self.read_json::<StoredTuple>(CF_AUTHZ_TUPLES, &key)?;
@@ -873,22 +874,24 @@ impl AuthzRepository {
                         tuple_count = tuple_count.checked_add(1).ok_or_else(|| {
                             AuthzStoreError::Storage("authorization tuple count overflow".into())
                         })?;
+                        changed = true;
+                        batch.put_cf(
+                            self.cf(CF_AUTHZ_TUPLES)?,
+                            key,
+                            encode_json(&StoredTuple {
+                                tuple: mutation.tuple.clone(),
+                            })?,
+                        );
                     }
-                    batch.put_cf(
-                        self.cf(CF_AUTHZ_TUPLES)?,
-                        key,
-                        encode_json(&StoredTuple {
-                            tuple: mutation.tuple.clone(),
-                        })?,
-                    );
                 }
                 TupleMutationKind::Remove => {
                     if existing.is_some() {
                         tuple_count = tuple_count.checked_sub(1).ok_or_else(|| {
                             AuthzStoreError::Storage("authorization tuple count underflow".into())
                         })?;
+                        changed = true;
+                        batch.delete_cf(self.cf(CF_AUTHZ_TUPLES)?, key);
                     }
-                    batch.delete_cf(self.cf(CF_AUTHZ_TUPLES)?, key);
                 }
             }
         }
@@ -897,6 +900,17 @@ impl AuthzRepository {
                 "realm would contain {tuple_count} tuples, exceeding {}",
                 self.limits.evaluator.max_tuples
             )));
+        }
+        if !changed && request.operation_id.is_none() {
+            return Ok(TupleBatchReceipt {
+                scope: request.scope.clone(),
+                principal: request.principal.clone(),
+                authz_revision: current,
+                binding_generation: binding.generation,
+                mutation_count: canonical_mutations.len(),
+                replayed: true,
+                replay_guarantee_expires_at_unix_millis: 0,
+            });
         }
 
         let authz_revision = next_revision(current)?;

@@ -39,9 +39,9 @@ pub use blob::{AWAITING_PUBLISH, BlobReader, BlobRef, BlobReferenceState, BlobSt
 pub use bootstrap::{
     ApplicationCredential, ApplicationCredentialRequest, ApplicationRoleTarget,
     BucketApplicationRole, CreateBucketReceipt, CreateBucketRequest, CredentialMutationReceipt,
-    CredentialRepository, CredentialRepositoryError, PreparedBucketCreation,
-    PreparedTenantProvisioning, ProvisionTenantReceipt, ProvisionTenantRequest,
-    SYSTEM_BOOTSTRAP_VERSION, SYSTEM_SCHEMA_ID, SetApplicationRoleReceipt,
+    CredentialRepository, CredentialRepositoryError, PreparedApplicationCredential,
+    PreparedBucketCreation, PreparedTenantProvisioning, ProvisionTenantReceipt,
+    ProvisionTenantRequest, SYSTEM_BOOTSTRAP_VERSION, SYSTEM_SCHEMA_ID, SetApplicationRoleReceipt,
     SetApplicationRoleRequest, SystemApplicationRole, SystemBootstrapError, SystemBootstrapRequest,
     SystemBootstrapState, TenantApplicationRole, system_schema,
 };
@@ -60,19 +60,24 @@ pub use logical_record::{
     MAX_LOGICAL_RECORD_EXPORT_BYTES, MAX_LOGICAL_RECORD_EXPORT_RECORDS,
 };
 pub use model::{
-    BatchOperation, BatchOutcome, BucketPolicy, CoordinatedObjectMutation, DeleteRequest,
-    DeleteRetainedVersionOutcome, Durability, Head, MAX_BUCKET_POLICY_PREFIX_BYTES,
-    MAX_BUCKET_POLICY_PREFIXES, MAX_CONTENT_TYPE_BYTES, MAX_OBJECT_MUTATION_REFERENCE_DELTAS,
-    MUTATION_STAMP_FORMAT, MutationError, MutationReceipt, MutationStamp, OBJECT_MUTATION_FORMAT,
-    Object, ObjectMutation, ObjectMutationContext, ObjectVersioning, PlacementLogId, Precondition,
-    PublishRequest, PutMode, PutRequest, ReplicaObjectMutationApplied, SMALL_BLOB_MAX_BYTES,
+    BatchOperation, BatchOutcome, BucketPolicy, CoordinatedObjectMutation,
+    CoordinatedRetainedVersionDelete, DeleteRequest, DeleteRetainedVersionOutcome, Durability,
+    Head, MAX_BUCKET_POLICY_PREFIX_BYTES, MAX_BUCKET_POLICY_PREFIXES, MAX_CONTENT_TYPE_BYTES,
+    MAX_OBJECT_MUTATION_REFERENCE_DELTAS, MUTATION_STAMP_FORMAT, MutationError, MutationReceipt,
+    MutationStamp, OBJECT_MUTATION_FORMAT, Object, ObjectMutation, ObjectMutationContext,
+    ObjectMutationGovernance, ObjectVersioning, PlacementLogId, Precondition, PublishRequest,
+    PutMode, PutRequest, RETAINED_VERSION_DELETE_FORMAT, ReplicaObjectMutationApplied,
+    ReplicaRetainedVersionDeleteApplied, RetainedVersionDeleteMutation, SMALL_BLOB_MAX_BYTES,
     Version, VersionId,
 };
 pub use program::{
-    AppliedProgramCommit, CommittedProgramResult, PreparedBundleHash, PreparedBundleRef,
-    PreparedProgramBundle, ProgramCommit, ProgramDurabilityClassHash, ProgramDurabilityEvidence,
+    AppliedProgramCommit, CommittedProgramResult, CoordinatedProgramPathFinalization,
+    PreparedBundleHash, PreparedBundleRef, PreparedProgramBundle, PreparedProgramRecord,
+    PreparedProgramWrite, ProgramCommit, ProgramDurabilityClassHash, ProgramDurabilityEvidence,
     ProgramDurabilityEvidenceHash, ProgramDurabilityScope, ProgramExecutionLease, ProgramHash,
-    ProgramStoreError, PublishedProgramVersion, StoreProgramEngine, VerifiedProgramDefinition,
+    ProgramPathMutation, ProgramPathStage, ProgramStoreError, PublishedProgramVersion,
+    ReplicaProgramPathApplied, StoreProgramEngine, VerifiedProgramDefinition,
+    path_stage_from_prepared,
 };
 pub use reference_delta::{
     DestinationReferenceArtifact, DestinationReferenceDelta, ReferenceDelta, ReferenceDeltaApplied,
@@ -94,8 +99,9 @@ pub use store::{
     ShardReader, ShardSealOutcome, ShardStoreError, Store, StoreOptions,
 };
 pub use watch::{
-    AggregateChanged, AggregateKind, DEFAULT_WATCH_MAX_BYTES, DEFAULT_WATCH_MAX_ENTRIES,
-    InvalidationStateHint, LocalChange, LocalInvalidation, MAX_LOCAL_INVALIDATION_SCAN_RECORDS,
-    ObjectHeadChange, ObjectHeadChangeKind, ReferenceProof, RetainedVersionDeletedChange, SourceId,
-    WatchCursor, WatchError, WatchJournalStatus, WatchPage, WatchRetention, WatchScope, WatchStart,
+    AggregateChanged, AggregateKind, ContentLifecycleChanged, DEFAULT_WATCH_MAX_BYTES,
+    DEFAULT_WATCH_MAX_ENTRIES, InvalidationStateHint, LocalChange, LocalInvalidation,
+    MAX_LOCAL_INVALIDATION_SCAN_RECORDS, ObjectHeadChange, ObjectHeadChangeKind, ReferenceProof,
+    RetainedVersionDeletedChange, SourceId, WatchCursor, WatchError, WatchJournalStatus, WatchPage,
+    WatchRetention, WatchScope, WatchStart,
 };

@@ -307,6 +307,78 @@ async fn tuple_batches_are_atomic_replayable_and_principal_scoped() {
 }
 
 #[tokio::test]
+async fn internal_tuple_set_operations_do_not_advance_revision_when_already_satisfied() {
+    let (_directory, store) = store().await;
+    let repository = store.authz();
+    let acme = tenant("acme");
+    let realm = scope("acme", "default");
+    let published = publish(
+        &repository,
+        acme.clone(),
+        "documents",
+        document_schema(false),
+        AuthzRevision::ZERO,
+    );
+    bind(
+        &repository,
+        realm.clone(),
+        published.schema_ref,
+        AuthzRevision(1),
+    );
+
+    let existing = viewer_tuple("one", "alice");
+    let applied = repository
+        .mutate_tuples(TupleBatchRequest {
+            scope: realm.clone(),
+            principal: principal("writer"),
+            expected_revision: Some(AuthzRevision(2)),
+            expected_binding_generation: 1,
+            operation_id: None,
+            mutations: vec![TupleMutation {
+                kind: TupleMutationKind::Add,
+                tuple: existing.clone(),
+            }],
+        })
+        .unwrap();
+    assert_eq!(applied.authz_revision, AuthzRevision(3));
+    assert!(!applied.replayed);
+
+    for mutation in [
+        TupleMutation {
+            kind: TupleMutationKind::Add,
+            tuple: existing,
+        },
+        TupleMutation {
+            kind: TupleMutationKind::Remove,
+            tuple: viewer_tuple("missing", "nobody"),
+        },
+    ] {
+        let replay = repository
+            .mutate_tuples(TupleBatchRequest {
+                scope: realm.clone(),
+                principal: principal("writer"),
+                expected_revision: Some(AuthzRevision(3)),
+                expected_binding_generation: 1,
+                operation_id: None,
+                mutations: vec![mutation],
+            })
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.authz_revision, AuthzRevision(3));
+    }
+
+    assert_eq!(repository.tenant_revision(&acme).unwrap(), AuthzRevision(3));
+    assert_eq!(
+        repository
+            .realm_snapshot(&realm, AuthzConsistency::Latest)
+            .unwrap()
+            .tuples
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn unexpired_tuple_receipts_are_never_evicted_to_admit_new_work() {
     let (_directory, store) = store().await;
     let mut limits = AuthzStoreLimits::default();

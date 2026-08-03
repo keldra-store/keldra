@@ -1,7 +1,7 @@
 use super::*;
 use crate::model::{
     CoordinatedObjectMutation, MUTATION_STAMP_FORMAT, MutationStamp, OBJECT_MUTATION_FORMAT,
-    ObjectMutation, ObjectMutationContext, ReplicaObjectMutationApplied,
+    ObjectMutation, ObjectMutationContext, ObjectMutationGovernance, ReplicaObjectMutationApplied,
 };
 
 #[derive(Clone, Copy)]
@@ -42,10 +42,33 @@ impl Store {
             .result
     }
 
+    /// Preserve the one-node physical WriteBatch path while evaluating the
+    /// coordinator-reconciled bucket options supplied by the cluster layer.
+    pub async fn mutate_with_governance(
+        &self,
+        operation: BatchOperation,
+        governance: ObjectMutationGovernance,
+    ) -> Result<MutationReceipt, MutationError> {
+        governance.validate()?;
+        self.bulk_write_inner(vec![operation], Some(governance))
+            .await
+            .pop()
+            .expect("one operation has one outcome")
+            .result
+    }
+
     /// Evaluates independent operations in request order and persists all
     /// successful outcomes with one physical RocksDB write. A failed
     /// precondition is an item result, not a reason to retry the whole bulk.
     pub async fn bulk_write(&self, operations: Vec<BatchOperation>) -> Vec<BatchOutcome> {
+        self.bulk_write_inner(operations, None).await
+    }
+
+    async fn bulk_write_inner(
+        &self,
+        operations: Vec<BatchOperation>,
+        governance: Option<ObjectMutationGovernance>,
+    ) -> Vec<BatchOutcome> {
         let _policy_guard = self.policy_gate.read().await;
         let mut prepared = Vec::with_capacity(operations.len());
         let mut early = BTreeMap::new();
@@ -57,16 +80,26 @@ impl Store {
                 BatchOperation::Publish(request) => &request.key,
                 BatchOperation::Delete(request) => &request.key,
             };
-            let cache_key = (
-                logical_key.tenant().to_owned(),
-                logical_key.bucket().to_owned(),
+            let identity = governance.as_ref().map_or_else(
+                || {
+                    let cache_key = (
+                        logical_key.tenant().to_owned(),
+                        logical_key.bucket().to_owned(),
+                    );
+                    identity_cache
+                        .entry(cache_key)
+                        .or_insert_with(|| {
+                            self.resolve_bucket_identity(logical_key.tenant(), logical_key.bucket())
+                        })
+                        .clone()
+                },
+                |governance| {
+                    Ok(BucketIdentity {
+                        tenant_id: TenantId(governance.tenant_id),
+                        bucket_id: BucketId(governance.bucket_id),
+                    })
+                },
             );
-            let identity = identity_cache
-                .entry(cache_key)
-                .or_insert_with(|| {
-                    self.resolve_bucket_identity(logical_key.tenant(), logical_key.bucket())
-                })
-                .clone();
             let result = match identity {
                 Ok(identity) => self.prepare(operation, identity, false).await,
                 Err(error) => Err(error),
@@ -118,6 +151,16 @@ impl Store {
         let mut policy_cache = BTreeMap::<Vec<u8>, Result<BucketPolicy, MutationError>>::new();
         let mut versioning_cache =
             BTreeMap::<Vec<u8>, Result<ObjectVersioning, MutationError>>::new();
+        if let Some(governance) = governance {
+            let identity = BucketIdentity {
+                tenant_id: TenantId(governance.tenant_id),
+                bucket_id: BucketId(governance.bucket_id),
+            }
+            .encode()
+            .to_vec();
+            policy_cache.insert(identity.clone(), Ok(governance.policy));
+            versioning_cache.insert(identity, Ok(governance.versioning));
+        }
         let mut results = BTreeMap::<usize, Result<MutationReceipt, MutationError>>::new();
         let mut batch_high_watermark = None;
         let mut pending_changes = Vec::new();
@@ -219,8 +262,36 @@ impl Store {
             BatchOperation::Delete(request) => &request.key,
         };
         let identity = self.resolve_bucket_identity(logical_key.tenant(), logical_key.bucket())?;
+        let governance = ObjectMutationGovernance {
+            tenant_id: identity.tenant_id.0,
+            bucket_id: identity.bucket_id.0,
+            versioning: self.bucket_versioning_by_key(&identity.encode())?,
+            policy: self
+                .bucket_policy_by_key(&identity.encode())?
+                .unwrap_or_default(),
+        };
+        self.coordinate_object_mutation_with_governance(operation, governance, context)
+            .await
+    }
+
+    pub async fn coordinate_object_mutation_with_governance(
+        &self,
+        operation: BatchOperation,
+        governance: ObjectMutationGovernance,
+        context: ObjectMutationContext,
+    ) -> Result<CoordinatedObjectMutation, MutationError> {
+        if context.serving_fence_term == 0 {
+            return Err(MutationError::InvalidObjectMutation(
+                "serving-fence term must be non-zero".into(),
+            ));
+        }
+        governance.validate()?;
+        let identity = BucketIdentity {
+            tenant_id: TenantId(governance.tenant_id),
+            bucket_id: BucketId(governance.bucket_id),
+        };
         let prepared = self.prepare(operation, identity, true).await?;
-        self.coordinate_prepared_object_mutation(prepared, context)
+        self.coordinate_prepared_object_mutation(prepared, context, governance)
             .await
     }
 
@@ -243,8 +314,36 @@ impl Store {
         }
         let _policy_guard = self.policy_gate.read().await;
         let identity = self.resolve_bucket_identity(request.key.tenant(), request.key.bucket())?;
+        let governance = ObjectMutationGovernance {
+            tenant_id: identity.tenant_id.0,
+            bucket_id: identity.bucket_id.0,
+            versioning: self.bucket_versioning_by_key(&identity.encode())?,
+            policy: self
+                .bucket_policy_by_key(&identity.encode())?
+                .unwrap_or_default(),
+        };
+        self.coordinate_distributed_publish_with_governance(request, governance, context)
+            .await
+    }
+
+    pub async fn coordinate_distributed_publish_with_governance(
+        &self,
+        request: PublishRequest,
+        governance: ObjectMutationGovernance,
+        context: ObjectMutationContext,
+    ) -> Result<CoordinatedObjectMutation, MutationError> {
+        if context.serving_fence_term == 0 {
+            return Err(MutationError::InvalidObjectMutation(
+                "serving-fence term must be non-zero".into(),
+            ));
+        }
+        governance.validate()?;
+        let identity = BucketIdentity {
+            tenant_id: TenantId(governance.tenant_id),
+            bucket_id: BucketId(governance.bucket_id),
+        };
         let prepared = self.prepare_verified_distributed_publish(request, identity)?;
-        self.coordinate_prepared_object_mutation(prepared, context)
+        self.coordinate_prepared_object_mutation(prepared, context, governance)
             .await
     }
 
@@ -266,6 +365,7 @@ impl Store {
         &self,
         prepared: PreparedOperation,
         context: ObjectMutationContext,
+        governance: ObjectMutationGovernance,
     ) -> Result<CoordinatedObjectMutation, MutationError> {
         if prepared.command_id().is_none() {
             return Err(MutationError::InvalidCommandId);
@@ -294,8 +394,9 @@ impl Store {
         let mut pending_receipts = BTreeMap::new();
         let mut pending_blob_references = PendingBlobReferences::new();
         let mut pending_small_blobs = BTreeSet::new();
-        let mut policy_cache = BTreeMap::new();
-        let mut versioning_cache = BTreeMap::new();
+        let encoded_bucket = prepared.identity().encode().to_vec();
+        let mut policy_cache = BTreeMap::from([(encoded_bucket.clone(), Ok(governance.policy))]);
+        let mut versioning_cache = BTreeMap::from([(encoded_bucket, Ok(governance.versioning))]);
         let evaluated = self
             .evaluate_operation(
                 &prepared,
@@ -625,6 +726,16 @@ impl Store {
                     *aggregate_kind,
                     aggregate_key.clone(),
                     *revision,
+                ),
+                PendingLocalChange::ContentLifecycleChanged {
+                    blob_identity,
+                    revision,
+                    reference_deltas,
+                } => LocalChange::content_lifecycle_changed(
+                    status.tail,
+                    blob_identity.clone(),
+                    *revision,
+                    reference_deltas.clone(),
                 ),
             };
             let encoded = encode_local_change(&change).map_err(storage_error)?;
@@ -1227,6 +1338,7 @@ impl Store {
                     stamp: MutationStamp {
                         format: MUTATION_STAMP_FORMAT,
                         predecessor_version: current.as_ref().map(|head| head.version),
+                        program_commit_cursor: None,
                         mutation_fingerprint: [0; 32],
                         active_placement_log_id: distributed.mutation.active_placement_log_id,
                         serving_fence_term: distributed.mutation.serving_fence_term,

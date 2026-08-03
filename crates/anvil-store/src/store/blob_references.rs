@@ -121,22 +121,49 @@ impl Store {
                 continue;
             }
 
+            enum PhysicalRemoval {
+                None,
+                Blob(BlobRef),
+                Shard(ShardIdentity),
+            }
             let mut batch = WriteBatch::default();
-            if key.len() == 32 + size_of::<u64>() {
+            let physical = if key.len() == 32 + size_of::<u64>() {
                 let reference = blob_reference_from_key(&key)?;
                 if is_small_blob(&reference) {
                     batch.delete_cf(self.cf(CF_SMALL_BLOBS)?, &key);
+                    PhysicalRemoval::None
                 } else {
-                    self.blobs.remove(&reference).map_err(storage_error)?;
+                    PhysicalRemoval::Blob(reference)
                 }
             } else {
                 let identity = ShardIdentity::decode(&key).map_err(storage_error)?;
-                self.remove_shard_file(&identity)?;
-            }
+                PhysicalRemoval::Shard(identity)
+            };
             batch.delete_cf(references, &key);
+            self.stage_local_changes(
+                &mut batch,
+                &[PendingLocalChange::ContentLifecycleChanged {
+                    blob_identity: key.to_vec(),
+                    revision: now_unix_millis,
+                    reference_deltas: Vec::new(),
+                }],
+            )?;
             let mut options = WriteOptions::default();
             options.set_sync(self.sync_writes);
             self.db.write_opt(batch, &options).map_err(storage_error)?;
+            self.notify_local_invalidations();
+            // Metadata and its invalidation become durable first. A crash or
+            // filesystem error now leaves only an untracked physical orphan,
+            // which the existing age-gated orphan scan safely removes.
+            match physical {
+                PhysicalRemoval::None => {}
+                PhysicalRemoval::Blob(reference) => {
+                    self.blobs.remove(&reference).map_err(storage_error)?;
+                }
+                PhysicalRemoval::Shard(identity) => {
+                    self.remove_shard_file(&identity)?;
+                }
+            }
             removed = removed
                 .checked_add(1)
                 .ok_or_else(|| MutationError::Storage("blob GC count is exhausted".into()))?;
@@ -301,16 +328,24 @@ impl Store {
         let next = self
             .prepare_sealed_artifact_reservation(key, now_unix_millis)?
             .ok_or_else(|| MutationError::Storage("sealed lifecycle state is missing".into()))?;
+        let mut batch = WriteBatch::default();
+        batch.put_cf(
+            self.cf(CF_BLOB_REFERENCES)?,
+            key,
+            encode_blob_reference_state(next),
+        );
+        self.stage_local_changes(
+            &mut batch,
+            &[PendingLocalChange::ContentLifecycleChanged {
+                blob_identity: key.to_vec(),
+                revision: next.updated_at,
+                reference_deltas: Vec::new(),
+            }],
+        )?;
         let mut options = WriteOptions::default();
         options.set_sync(self.sync_writes);
-        self.db
-            .put_cf_opt(
-                self.cf(CF_BLOB_REFERENCES)?,
-                key,
-                encode_blob_reference_state(next),
-                &options,
-            )
-            .map_err(storage_error)?;
+        self.db.write_opt(batch, &options).map_err(storage_error)?;
+        self.notify_local_invalidations();
         Ok(next)
     }
 
@@ -343,12 +378,22 @@ impl Store {
         }
         batch.put_cf(
             self.cf(CF_BLOB_REFERENCES)?,
-            key,
+            &key,
             encode_blob_reference_state(state),
         );
+        self.stage_local_changes(
+            &mut batch,
+            &[PendingLocalChange::ContentLifecycleChanged {
+                blob_identity: key,
+                revision: state.updated_at,
+                reference_deltas: Vec::new(),
+            }],
+        )?;
         let mut options = WriteOptions::default();
         options.set_sync(self.sync_writes);
-        self.db.write_opt(batch, &options).map_err(storage_error)
+        self.db.write_opt(batch, &options).map_err(storage_error)?;
+        self.notify_local_invalidations();
+        Ok(())
     }
 
     pub(crate) fn prepare_blob_reference_publication(

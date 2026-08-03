@@ -280,13 +280,26 @@ impl AuthzRepository {
         request: BindSchemaRequest,
         context: AuthzRealmMutationContext,
     ) -> Result<CoordinatedAuthzRealmMutation, AuthzStoreError> {
+        let _guard = self.lock_writes()?;
+        let mut batch = WriteBatch::default();
+        let coordinated = self.stage_coordinated_bind_schema(request, context, &mut batch)?;
+        if !batch.is_empty() {
+            self.write(batch)?;
+        }
+        Ok(coordinated)
+    }
+
+    pub(crate) fn stage_coordinated_bind_schema(
+        &self,
+        request: BindSchemaRequest,
+        context: AuthzRealmMutationContext,
+        batch: &mut WriteBatch,
+    ) -> Result<CoordinatedAuthzRealmMutation, AuthzStoreError> {
         self.validate_context(&context)?;
         request.scope.validate()?;
         let input_fingerprint = bind_input_fingerprint(&request)?;
-        let _guard = self.lock_writes()?;
         let predecessor = self.read_stored_binding(&request.scope)?;
-        let mut batch = WriteBatch::default();
-        let bound = self.prepare_binding(&request, false, &mut batch)?;
+        let bound = self.prepare_binding(&request, false, batch)?;
         if bound.replayed {
             return Ok(CoordinatedAuthzRealmMutation {
                 result: CoordinatedAuthzRealmResult::Bound(bound),
@@ -317,8 +330,7 @@ impl AuthzRepository {
         mutation.set_computed_fingerprint();
         mutation
             .validate_with_limits(self.limits.max_mutations_per_batch, self.limits.evaluator)?;
-        self.stage_stamped_binding(&mut batch, &mutation)?;
-        self.write(batch)?;
+        self.stage_stamped_binding(batch, &mutation)?;
         Ok(CoordinatedAuthzRealmMutation {
             result: CoordinatedAuthzRealmResult::Bound(bound),
             mutation: Some(mutation),

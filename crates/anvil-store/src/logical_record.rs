@@ -20,11 +20,12 @@ use crate::key::{
 };
 use crate::store::{
     CF_AUTHZ_SCHEMAS, CF_BUCKET_OPTIONS, CF_CREDENTIALS, CF_METADATA, CF_NAMES, CF_POLICIES,
-    VERSION_HIGH_WATERMARK_KEY, decode_object_versioning, encode_object_versioning,
+    PendingLocalChange, VERSION_HIGH_WATERMARK_KEY, decode_object_versioning,
+    encode_object_versioning,
 };
 use crate::{
-    AuthzRevision, AuthzStoreLimits, BucketPolicy, MutationError, ObjectKey, ObjectVersioning,
-    PlacementLogId, SchemaRef, StorageTenantId, Store, VersionId,
+    AggregateKind, AuthzRevision, AuthzStoreLimits, BucketPolicy, MutationError, ObjectKey,
+    ObjectVersioning, PlacementLogId, SchemaRef, StorageTenantId, Store, VersionId,
 };
 
 pub const LOGICAL_RECORD_FORMAT: u16 = 1;
@@ -572,7 +573,21 @@ impl Store {
         &self,
         mutation: &LogicalRecordMutation,
     ) -> Result<LogicalRecordApplied, LogicalRecordError> {
-        self.apply_logical_record_mutation(mutation)
+        self.apply_logical_record_mutation(mutation, false)
+    }
+
+    /// Applies a normal distributed logical-record mutation and appends its
+    /// compact source invalidation in the same synchronous RocksDB batch.
+    pub async fn apply_logical_record_mutation_journaled(
+        &self,
+        mutation: &LogicalRecordMutation,
+    ) -> Result<LogicalRecordApplied, LogicalRecordError> {
+        let _commit_guard = self.commit_lock.lock().await;
+        let applied = self.apply_logical_record_mutation(mutation, true)?;
+        if !applied.replayed {
+            self.notify_local_invalidations();
+        }
+        Ok(applied)
     }
 
     /// Local coordinator commits use exactly the replica apply path.
@@ -580,12 +595,13 @@ impl Store {
         &self,
         mutation: &LogicalRecordMutation,
     ) -> Result<LogicalRecordApplied, LogicalRecordError> {
-        self.apply_logical_record_mutation(mutation)
+        self.apply_logical_record_mutation(mutation, false)
     }
 
     fn apply_logical_record_mutation(
         &self,
         mutation: &LogicalRecordMutation,
+        journal: bool,
     ) -> Result<LogicalRecordApplied, LogicalRecordError> {
         mutation.validate()?;
         let id = mutation.typed_value.id();
@@ -635,10 +651,20 @@ impl Store {
             _ => {}
         }
 
-        self.write_logical_record(
+        let change = if journal {
+            Some(PendingLocalChange::AggregateChanged {
+                aggregate_kind: AggregateKind::LogicalRecord,
+                aggregate_key: canonical_bytes(&id)?,
+                revision: mutation.record_version.0,
+            })
+        } else {
+            None
+        };
+        self.write_logical_record_with_change(
             &location,
             canonical_bytes(mutation)?,
             Some(mutation.record_version),
+            change.as_ref(),
         )?;
         Ok(LogicalRecordApplied {
             record_version: mutation.record_version,
@@ -661,6 +687,16 @@ impl Store {
         encoded: Vec<u8>,
         record_version: Option<VersionId>,
     ) -> Result<(), LogicalRecordError> {
+        self.write_logical_record_with_change(location, encoded, record_version, None)
+    }
+
+    fn write_logical_record_with_change(
+        &self,
+        location: &RecordLocation,
+        encoded: Vec<u8>,
+        record_version: Option<VersionId>,
+        change: Option<&PendingLocalChange>,
+    ) -> Result<(), LogicalRecordError> {
         let mut batch = WriteBatch::default();
         batch.put_cf(self.logical_record_cf(location.cf)?, &location.key, encoded);
         if let Some(record_version) = record_version {
@@ -679,6 +715,10 @@ impl Store {
                 VERSION_HIGH_WATERMARK_KEY,
                 canonical_bytes(&high_watermark)?,
             );
+        }
+        if let Some(change) = change {
+            self.stage_local_changes(&mut batch, std::slice::from_ref(change))
+                .map_err(storage)?;
         }
         let mut options = WriteOptions::default();
         options.set_sync(self.sync_writes);

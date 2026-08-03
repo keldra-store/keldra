@@ -256,6 +256,7 @@ pub struct RetainedVersionDeletedChange {
 #[serde(rename_all = "snake_case")]
 pub enum AggregateKind {
     ZanzibarRealm,
+    LogicalRecord,
 }
 
 /// Compact invalidation for a non-object mutable aggregate.
@@ -265,6 +266,17 @@ pub struct AggregateChanged {
     pub aggregate_kind: AggregateKind,
     pub aggregate_key: Vec<u8>,
     pub revision: u64,
+}
+
+/// Change to one content lifecycle record. Internal handoff consumers fetch
+/// the current typed state by `blob_identity`; public watches filter it out.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentLifecycleChanged {
+    pub offset: u64,
+    pub blob_identity: Vec<u8>,
+    pub revision: u64,
+    #[serde(default)]
+    pub reference_deltas: Vec<ReferenceDelta>,
 }
 
 /// One typed record in a source-local change journal.
@@ -278,6 +290,7 @@ pub enum LocalChange {
     ObjectHead(ObjectHeadChange),
     RetainedVersionDeleted(RetainedVersionDeletedChange),
     AggregateChanged(AggregateChanged),
+    ContentLifecycleChanged(ContentLifecycleChanged),
 }
 
 /// Exact object-mutation evidence copied to every complete metadata replica.
@@ -376,11 +389,26 @@ impl LocalChange {
         })
     }
 
+    pub(crate) fn content_lifecycle_changed(
+        offset: u64,
+        blob_identity: Vec<u8>,
+        revision: u64,
+        reference_deltas: Vec<ReferenceDelta>,
+    ) -> Self {
+        Self::ContentLifecycleChanged(ContentLifecycleChanged {
+            offset,
+            blob_identity,
+            revision,
+            reference_deltas,
+        })
+    }
+
     pub fn offset(&self) -> u64 {
         match self {
             Self::ObjectHead(change) => change.offset,
             Self::RetainedVersionDeleted(change) => change.offset,
             Self::AggregateChanged(change) => change.offset,
+            Self::ContentLifecycleChanged(change) => change.offset,
         }
     }
 
@@ -389,6 +417,7 @@ impl LocalChange {
             Self::ObjectHead(change) => &change.reference_deltas,
             Self::RetainedVersionDeleted(change) => &change.reference_deltas,
             Self::AggregateChanged(_) => &[],
+            Self::ContentLifecycleChanged(change) => &change.reference_deltas,
         }
     }
 
@@ -402,6 +431,7 @@ impl LocalChange {
             Self::ObjectHead(change) => Some(change),
             Self::RetainedVersionDeleted(_) => None,
             Self::AggregateChanged(_) => None,
+            Self::ContentLifecycleChanged(_) => None,
             _ => None,
         }
     }
