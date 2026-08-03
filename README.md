@@ -26,16 +26,25 @@ that budget but cannot extend it; expiry returns gRPC `DEADLINE_EXCEEDED`.
 
 ## Implementation status
 
-Anvil 0.5.1 adds one flat cluster of heterogeneous nodes without changing the
-public 0.5 object API. Any active node can accept a request. Compact control
-state stays in Raft, exact-key ownership is derived with capacity-weighted
-rendezvous hashing, mutable logical records are replicated, and large payloads
-use systematic erasure coding. The production surface includes authenticated
-object/CAS/bulk operations, immutable and `PROGRAM_ONLY` policy, typed Zanzibar
-administration and application realms, explicit bootstrap and credential
-exchange, recoverable atomic-program invocation, and bounded resumable
-`WatchPrefix`. The release is published as one AMD64/ARM64 container tag. A
-pinned one-node OSV import remains the post-release performance baseline.
+Anvil 0.5.2 runs one flat cluster of heterogeneous nodes. Any active node can
+accept a request. Compact control state stays in Raft, exact-key ownership is
+derived with capacity-weighted rendezvous hashing, mutable logical records are
+replicated, and large payloads use systematic erasure coding. The production
+surface includes authenticated object/CAS/bulk operations, immutable and
+`PROGRAM_ONLY` policy, typed Zanzibar administration and application realms,
+explicit bootstrap and credential exchange, recoverable atomic-program
+invocation, and bounded resumable `WatchPrefix`.
+
+The 0.5.2 capability release adds cluster-wide derived indexes and the
+PersonalDB v0 protocol. Each index has one weighted-HRW builder and up to three
+weighted-HRW query replicas. Builders publish immutable generations through
+Anvil's ordinary object path, while query replicas materialize those files in
+a shared bounded memory/disk cache. The usable index kinds are path,
+object-head metadata, typed JSON, full text, exact vector, hybrid, Git source,
+and tensor. Queries return the latest available generation with source-checkpoint
+freshness evidence. PersonalDB selects a weighted-HRW primary independently for
+each database group and stores its canonical artifacts as ordinary replicated
+Anvil objects. The release is published as one AMD64/ARM64 container tag.
 
 ## Deliberate 0.5 break
 
@@ -61,6 +70,8 @@ Export data through the old release and import it into a new 0.5 store.
 | Atomic programs | immutable object under `_anvil/programs/`, then `InvokeProgram` | One bounded deterministic state transition orchestrated by the nominated executor |
 | Invalidations | `WatchPrefix` | Bounded unordered at-least-once notice to reread current state |
 | Authorization | schemas, realms, tuples, checks and typed administration | Zanzibar evaluation at one explicit current revision |
+| Derived indexes | `CreateIndex`, `UpdateIndex`, `GetIndex`, `ListIndexes`, `DeleteIndex`, `QueryIndex` | One immutable cluster-wide generation queried by an HRW-selected replica, with explicit freshness evidence |
+| PersonalDB | canonical PersonalDB v0 `Exchange`, leader-lease and witnessed-commit operations | Per-database-group HRW primary over ordinary replicated Anvil objects |
 | Workflows | application-owned saga | External-service coordination |
 
 Uploading an MP3 through `StartPut` and streaming `Put` is an ordinary blob
@@ -107,6 +118,7 @@ already-issued tokens remain valid until their one-hour expiry.
 - `crates/anvil-store`: opaque version/head storage, blobs, CAS, policies and bulk operations.
 - `crates/anvil-atomic-program`: the one bounded JSON program interpreter.
 - `crates/anvil-consensus`: compact executor nomination and publication decisions.
+- `crates/anvil-index`: versioned index formats and query engines over Anvil's async index-file interface.
 - `crates/anvil-api`: the single generated gRPC contract shared by server and clients.
 - `crates/anvil`: server transport and integration.
 - `clients/rust`: thin authenticated Rust transport.
@@ -121,26 +133,26 @@ cargo fmt --all -- --check
 cargo test --workspace
 ```
 
-Before creating the `0.5.1` Git tag, qualify both release images locally. The
+Before creating the `0.5.2` Git tag, qualify both release images locally. The
 architecture-specific names below remain in the local Docker daemon; they are
 never pushed to GHCR.
 
 ```sh
 ANVIL_DOCKER_PLATFORM=linux/amd64 \
-ANVIL_IMAGE=anvil:0.5.1-local-amd64 \
+ANVIL_IMAGE=anvil:0.5.2-local-amd64 \
 ./scripts/build-image.sh
-ANVIL_IMAGE=anvil:0.5.1-local-amd64 ./scripts/release-gates.sh image
+ANVIL_IMAGE=anvil:0.5.2-local-amd64 ./scripts/release-gates.sh image
 
 ANVIL_DOCKER_PLATFORM=linux/arm64 \
-ANVIL_IMAGE=anvil:0.5.1-local-arm64 \
+ANVIL_IMAGE=anvil:0.5.2-local-arm64 \
 ./scripts/build-image.sh
-ANVIL_IMAGE=anvil:0.5.1-local-arm64 ./scripts/release-gates.sh image
+ANVIL_IMAGE=anvil:0.5.2-local-arm64 ./scripts/release-gates.sh image
 ```
 
 Each image is compiled from source inside a `rust:1.96-trixie` builder for its
 target platform and runs on `debian:trixie-slim`. Release publication rebuilds
 the same Dockerfile as one public multi-platform image. Its repository follows
-`ghcr.io/OWNER/anvil:0.5.1`, where `OWNER` is the GitHub repository owner.
+`ghcr.io/OWNER/anvil:0.5.2`, where `OWNER` is the GitHub repository owner.
 There are no public architecture-specific or `v`-prefixed image tags.
 
 ## First start
