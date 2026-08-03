@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::io::{self, Cursor, Read};
+use std::io::{self, Read};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -1492,6 +1492,7 @@ fn client_grpc_timeout(metadata: &MetadataMap) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::io::Cursor;
     use std::sync::{Arc, RwLock};
 
     use anvil_consensus::{
