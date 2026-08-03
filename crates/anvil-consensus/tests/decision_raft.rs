@@ -60,7 +60,9 @@ async fn open_peer(
 }
 
 async fn wait_until(mut condition: impl FnMut() -> bool) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    // Allow more than one production 2--3 second election window so the test
+    // verifies convergence without depending on the removed sub-second timing.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while !condition() {
         assert!(
             tokio::time::Instant::now() < deadline,
