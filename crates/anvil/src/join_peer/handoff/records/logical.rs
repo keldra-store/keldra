@@ -8,6 +8,7 @@ use anvil_store::{
 use tonic::Status;
 
 use super::{quorum, tenant_name_placement_key};
+use crate::authorization::SYSTEM_STABLE_TENANT_ID;
 use crate::data_peer::DataPeerTransport;
 use crate::join_peer::handoff::HandoffTopology;
 use crate::join_peer::handoff::merge::{MergeSource, next_key};
@@ -182,6 +183,9 @@ pub(super) async fn resolve_tenant_id(
     peers: &DataPeerTransport,
     storage_tenant: &StorageTenantId,
 ) -> Result<u64, Status> {
+    if storage_tenant.is_system() {
+        return Ok(SYSTEM_STABLE_TENANT_ID);
+    }
     let id = LogicalRecordId::TenantNameClaim {
         storage_tenant: storage_tenant.clone(),
     };
