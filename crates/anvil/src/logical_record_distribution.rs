@@ -60,6 +60,13 @@ struct LogicalRecordRoute {
     serving_fence_term: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LogicalRecordReadTarget {
+    pub(crate) node_id: NodeId,
+    pub(crate) address: String,
+    pub(crate) placement_fence: anvil_store::PlacementLogId,
+}
+
 #[derive(Clone)]
 struct LogicalRecordDistributionCore {
     local_node: NodeId,
@@ -255,7 +262,8 @@ impl LogicalRecordDistributionCore {
     ) -> Result<LogicalRecordApplied, Status> {
         let local = self
             .store
-            .apply_logical_record_mutation_replica(mutation)
+            .apply_logical_record_mutation_journaled(mutation)
+            .await
             .map_err(logical_record_status)?;
         if local.record_version != mutation.record_version {
             return Err(Status::data_loss(
@@ -347,6 +355,61 @@ impl LogicalRecordDistribution {
                 self.require_current_route(&id, &route)
             })
             .await
+    }
+
+    /// Reconcile one complete logical record at its current HRW coordinator.
+    /// No replica-local or cached value is exposed through this boundary.
+    pub(crate) async fn read(
+        &self,
+        id: &LogicalRecordId,
+    ) -> Result<Option<LogicalRecordValue>, Status> {
+        let _serial = self.core.coordinator_serial.lock().await;
+        let route = self.route(id)?;
+        if route.group.coordinator() != self.local_node {
+            return Err(Status::failed_precondition(format!(
+                "logical record is coordinated by node {}",
+                route.group.coordinator().0
+            )));
+        }
+        self.require_current_route(id, &route)?;
+        let candidate = self.core.reconcile(&route, id).await?;
+        self.require_current_route(id, &route)?;
+        Ok(candidate.map(|candidate| candidate.typed_value().clone()))
+    }
+
+    pub(crate) fn read_target(
+        &self,
+        id: &LogicalRecordId,
+    ) -> Result<Option<LogicalRecordReadTarget>, Status> {
+        let route = self.route(id)?;
+        let coordinator = route.group.coordinator();
+        if coordinator == self.local_node {
+            return Ok(None);
+        }
+        let endpoint = route
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.node_id == coordinator)
+            .ok_or_else(|| Status::unavailable("logical-record coordinator has no endpoint"))?;
+        Ok(Some(LogicalRecordReadTarget {
+            node_id: coordinator,
+            address: endpoint.address.clone(),
+            placement_fence: route.active_placement_log_id,
+        }))
+    }
+
+    pub(crate) fn require_read_target(
+        &self,
+        id: &LogicalRecordId,
+        expected: &LogicalRecordReadTarget,
+    ) -> Result<(), Status> {
+        if self.read_target(id)?.as_ref() == Some(expected) {
+            Ok(())
+        } else {
+            Err(Status::unavailable(
+                "logical-record placement changed during name resolution",
+            ))
+        }
     }
 
     fn require_current_route(

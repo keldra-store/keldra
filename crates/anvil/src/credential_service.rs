@@ -1,17 +1,21 @@
 //! Unauthenticated exchange of durable application credentials for short-lived tokens.
 
+use std::sync::Arc;
+
 use anvil_api::v1 as api;
 use anvil_api::v1::credential_service_server::CredentialService;
 use anvil_store::{CredentialRepositoryError, Store};
 use tonic::{Request, Response, Status};
 
 use crate::authentication::{ACCESS_TOKEN_LIFETIME, JwtManager, RequestRateLimits};
+use crate::distributed_control_plane::DistributedControlPlane;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct CredentialServiceImpl {
     store: Store,
     tokens: JwtManager,
     rate_limits: RequestRateLimits,
+    distributed: Option<Arc<DistributedControlPlane>>,
 }
 
 impl CredentialServiceImpl {
@@ -20,7 +24,13 @@ impl CredentialServiceImpl {
             store,
             tokens,
             rate_limits,
+            distributed: None,
         }
+    }
+
+    pub(crate) fn with_distributed(mut self, distributed: Arc<DistributedControlPlane>) -> Self {
+        self.distributed = Some(distributed);
+        self
     }
 }
 
@@ -33,6 +43,12 @@ impl CredentialService for CredentialServiceImpl {
         let request = request.into_inner();
         self.rate_limits
             .check_credential_exchange(&request.client_id)?;
+        if let Some(distributed) = self.distributed.as_ref() {
+            return distributed
+                .exchange_client_credentials(request)
+                .await
+                .map(Response::new);
+        }
         let store = self.store.clone();
         let verified = tokio::task::spawn_blocking(move || {
             store.verify_credential(&request.client_id, &request.client_secret)

@@ -1,6 +1,7 @@
 //! Typed administration backed by the protected Zanzibar system realm.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anvil_api::v1 as api;
 use anvil_api::v1::administration_service_server::AdministrationService;
@@ -19,6 +20,8 @@ use tonic::{Request, Response, Status};
 
 use crate::authentication::Caller;
 use crate::authorization::{StorageTenantPermission, SystemAuthorizer};
+use crate::distributed_control_plane::DistributedControlPlane;
+use crate::distributed_list::OriginalBearer;
 use crate::join_bundle::{self, JoinBundle, JoinBundleError, JoinSeed};
 
 const PEER_PROTOCOL_VERSION: u16 = 1;
@@ -30,6 +33,7 @@ pub(crate) struct AdministrationServiceImpl {
     system_authorizer: SystemAuthorizer,
     decisions: DecisionRaft,
     join_bundle_directory: PathBuf,
+    distributed: Option<Arc<DistributedControlPlane>>,
 }
 
 impl AdministrationServiceImpl {
@@ -43,7 +47,13 @@ impl AdministrationServiceImpl {
             store,
             decisions,
             join_bundle_directory,
+            distributed: None,
         }
+    }
+
+    pub(crate) fn with_distributed(mut self, distributed: Arc<DistributedControlPlane>) -> Self {
+        self.distributed = Some(distributed);
+        self
     }
 }
 
@@ -68,17 +78,21 @@ impl AdministrationService for AdministrationServiceImpl {
             ));
         }
 
-        let authorizer = self.system_authorizer.clone();
-        run(move || {
-            let system = authorizer.load().map_err(authz_status)?;
-            require_allowed(
-                system
-                    .allows_manage_system(caller.subject())
-                    .map_err(authz_evaluation_status)?,
-                "node preparation is not authorized",
-            )
-        })
-        .await?;
+        if let Some(distributed) = self.distributed.as_ref() {
+            distributed.authorize_node_preparation(&caller).await?;
+        } else {
+            let authorizer = self.system_authorizer.clone();
+            run(move || {
+                let system = authorizer.load().map_err(authz_status)?;
+                require_allowed(
+                    system
+                        .allows_manage_system(caller.subject())
+                        .map_err(authz_evaluation_status)?,
+                    "node preparation is not authorized",
+                )
+            })
+            .await?;
+        }
 
         // The bundle is deliberately a node-local operator handoff file. Prove
         // this node can commit before creating private material that a follower
@@ -187,6 +201,13 @@ impl AdministrationService for AdministrationServiceImpl {
         request: Request<api::ProvisionTenantRequest>,
     ) -> Result<Response<api::ProvisionTenantResponse>, Status> {
         let caller = caller(&request)?;
+        if let Some(distributed) = self.distributed.as_ref() {
+            let bearer = OriginalBearer::from_metadata(request.metadata())?;
+            let response = distributed
+                .provision_tenant(caller, bearer, request.into_inner())
+                .await?;
+            return Ok(Response::new(response));
+        }
         let request = request.into_inner();
         let storage_tenant =
             StorageTenantId::parse(request.storage_tenant).map_err(authz_status)?;
@@ -225,6 +246,13 @@ impl AdministrationService for AdministrationServiceImpl {
         request: Request<api::CreateApplicationRequest>,
     ) -> Result<Response<api::ApplicationCredential>, Status> {
         let caller = caller(&request)?;
+        if let Some(distributed) = self.distributed.as_ref() {
+            let bearer = OriginalBearer::from_metadata(request.metadata())?;
+            let response = distributed
+                .create_application(caller, bearer, request.into_inner())
+                .await?;
+            return Ok(Response::new(response));
+        }
         let request = request.into_inner();
         let store = self.store.clone();
         let authorizer = self.system_authorizer.clone();
@@ -255,6 +283,13 @@ impl AdministrationService for AdministrationServiceImpl {
         request: Request<api::RotateApplicationCredentialRequest>,
     ) -> Result<Response<api::ApplicationCredential>, Status> {
         let caller = caller(&request)?;
+        if let Some(distributed) = self.distributed.as_ref() {
+            let bearer = OriginalBearer::from_metadata(request.metadata())?;
+            let response = distributed
+                .rotate_application_credential(caller, bearer, request.into_inner())
+                .await?;
+            return Ok(Response::new(response));
+        }
         let request = request.into_inner();
         let store = self.store.clone();
         let authorizer = self.system_authorizer.clone();
@@ -285,6 +320,13 @@ impl AdministrationService for AdministrationServiceImpl {
         request: Request<api::DisableApplicationCredentialRequest>,
     ) -> Result<Response<api::ApplicationCredentialState>, Status> {
         let caller = caller(&request)?;
+        if let Some(distributed) = self.distributed.as_ref() {
+            let bearer = OriginalBearer::from_metadata(request.metadata())?;
+            let response = distributed
+                .disable_application_credential(caller, bearer, request.into_inner())
+                .await?;
+            return Ok(Response::new(response));
+        }
         let request = request.into_inner();
         let store = self.store.clone();
         let authorizer = self.system_authorizer.clone();
@@ -313,6 +355,13 @@ impl AdministrationService for AdministrationServiceImpl {
             return Err(Status::invalid_argument(
                 "buckets cannot be created in the protected system tenant",
             ));
+        }
+        if let Some(distributed) = self.distributed.as_ref() {
+            let bearer = OriginalBearer::from_metadata(request.metadata())?;
+            let response = distributed
+                .create_bucket(caller, bearer, request.into_inner())
+                .await?;
+            return Ok(Response::new(response));
         }
         let request = request.into_inner();
         let versioning = versioning_from_api(request.versioning)?;
@@ -361,6 +410,13 @@ impl AdministrationService for AdministrationServiceImpl {
             return Err(Status::invalid_argument(
                 "buckets cannot exist in the protected system tenant",
             ));
+        }
+        if let Some(distributed) = self.distributed.as_ref() {
+            let bearer = OriginalBearer::from_metadata(request.metadata())?;
+            let response = distributed
+                .set_bucket_versioning(caller, bearer, request.into_inner())
+                .await?;
+            return Ok(Response::new(response));
         }
         let request = request.into_inner();
         let requested = versioning_from_api(request.versioning)?;
@@ -425,6 +481,13 @@ impl AdministrationServiceImpl {
         granted: bool,
     ) -> Result<Response<api::ApplicationRoleResponse>, Status> {
         let caller = caller(&request)?;
+        if let Some(distributed) = self.distributed.as_ref() {
+            let bearer = OriginalBearer::from_metadata(request.metadata())?;
+            let response = distributed
+                .change_application_role(caller, bearer, request.into_inner(), granted)
+                .await?;
+            return Ok(Response::new(response));
+        }
         let request = request.into_inner();
         let target = role_target_from_api(request.target)?;
         let store = self.store.clone();
@@ -825,7 +888,7 @@ fn require_role_management(
     require_allowed(allowed, "application role management is not authorized")
 }
 
-fn role_target_from_api(
+pub(crate) fn role_target_from_api(
     target: Option<api::application_role_request::Target>,
 ) -> Result<ApplicationRoleTarget, Status> {
     match target.ok_or_else(|| Status::invalid_argument("role target is required"))? {
