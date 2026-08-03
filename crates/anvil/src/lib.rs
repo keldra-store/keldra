@@ -12,6 +12,11 @@ mod data_peer;
 mod distributed_list;
 mod join_bundle;
 mod join_peer;
+#[allow(
+    dead_code,
+    reason = "logical-record coordinator is wired through the private typed transport next"
+)]
+mod logical_record_distribution;
 mod mutable_record_quorum;
 mod mutable_record_replica_group;
 mod node_identity;
