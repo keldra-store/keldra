@@ -27,13 +27,14 @@ ordered reference startup checks complete. Normal process termination stops
 the public listener before the peer runtime and flushes the local store; it
 does not remove the node from committed membership.
 
-## Tenant-schema records in 0.5.1
+## Tenant schema catalogue handoff in 0.5.1
 
-The reserved distributed `TenantSchema` logical-record variant is not served
-in 0.5.1. No public 0.5.1 operation creates or consumes that record type;
-tenant names, buckets, object policies, credentials, and Zanzibar schemas use
-their implemented typed records. A later capability that introduces tenant
-schema metadata must add its explicit coordinator and handoff behavior first.
+Node admission transfers each tenant's complete Zanzibar schema catalogue as
+one typed private handoff unit; individual `TenantSchema` records are discovery
+keys and are never independently repaired. The 0.5.1 private typed-message
+limit bounds one encoded catalogue to 16 MiB. Admission fails closed if a
+catalogue exceeds that size. A later release can stream unusually large
+catalogues without changing their storage format or quorum semantics.
 
 ## Coordinator error detail in 0.5.1
 
