@@ -689,6 +689,13 @@ impl wire::cluster_peer_server::ClusterPeer for ClusterPeerService {
         self.route_admin_set_bucket_versioning_call(request).await
     }
 
+    async fn route_admin_set_bucket_public_read(
+        &self,
+        request: Request<wire::RouteAdminSetBucketPublicReadRequest>,
+    ) -> Result<Response<anvil_api::v1::SetBucketPublicReadResponse>, Status> {
+        self.route_admin_set_bucket_public_read_call(request).await
+    }
+
     async fn route_admin_change_application_role(
         &self,
         request: Request<wire::RouteAdminChangeApplicationRoleRequest>,

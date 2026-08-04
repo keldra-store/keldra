@@ -14,7 +14,8 @@ use anvil_store::{
     ApplicationCredentialRequest, ApplicationRoleTarget, AuthzStoreError, BucketApplicationRole,
     CreateBucketRequest, CredentialMutationReceipt, CredentialRepositoryError,
     ObjectVersioning as StoreObjectVersioning, ProvisionTenantRequest, SetApplicationRoleRequest,
-    StorageTenantId, Store, SystemApplicationRole, TenantApplicationRole,
+    SetBucketPublicReadRequest, StorageTenantId, Store, SystemApplicationRole,
+    TenantApplicationRole,
 };
 use tonic::{Request, Response, Status};
 
@@ -456,6 +457,61 @@ impl AdministrationService for AdministrationServiceImpl {
             bucket: response_bucket,
             versioning: api::ObjectVersioning::Enabled as i32,
             changed,
+        }))
+    }
+
+    async fn set_bucket_public_read(
+        &self,
+        request: Request<api::SetBucketPublicReadRequest>,
+    ) -> Result<Response<api::SetBucketPublicReadResponse>, Status> {
+        let caller = caller(&request)?;
+        if caller.storage_tenant().is_system() {
+            return Err(Status::invalid_argument(
+                "buckets cannot exist in the protected system tenant",
+            ));
+        }
+        if let Some(distributed) = self.distributed.as_ref() {
+            let bearer = OriginalBearer::from_metadata(request.metadata())?;
+            let response = distributed
+                .set_bucket_public_read(caller, bearer, request.into_inner())
+                .await?;
+            return Ok(Response::new(response));
+        }
+        let request = request.into_inner();
+        let storage_tenant = caller.storage_tenant().clone();
+        let bucket = request.bucket;
+        let enabled = request.enabled;
+        let store = self.store.clone();
+        let authorizer = self.system_authorizer.clone();
+        let receipt = run(move || {
+            let system = authorizer.load().map_err(authz_status)?;
+            require_allowed(
+                system
+                    .allows_bucket_policy(caller.subject(), storage_tenant.as_str(), &bucket)
+                    .map_err(authz_evaluation_status)?,
+                "public bucket policy management is not authorized",
+            )?;
+            let tenant = storage_tenant.clone();
+            let response_bucket = bucket.clone();
+            store
+                .set_bucket_public_read(SetBucketPublicReadRequest {
+                    storage_tenant,
+                    bucket,
+                    enabled,
+                    principal: caller.subject().clone(),
+                    expected_authorization_revision: system.revision,
+                    expected_binding_generation: system.binding_generation,
+                })
+                .map(|receipt| (tenant, response_bucket, receipt))
+                .map_err(credential_store_status)
+        })
+        .await?;
+        Ok(Response::new(api::SetBucketPublicReadResponse {
+            storage_tenant: receipt.0.to_string(),
+            bucket: receipt.1,
+            enabled,
+            authorization_revision: receipt.2.authorization_revision.0,
+            replayed: receipt.2.replayed,
         }))
     }
 
@@ -1620,6 +1676,61 @@ mod tests {
             .into_inner();
         assert_eq!(revoked.authorization_revision, 7);
         assert!(!revoked.replayed);
+        let denied_public = service
+            .set_bucket_public_read(authenticated(
+                StorageTenantId::parse("acme").unwrap(),
+                "worker",
+                api::SetBucketPublicReadRequest {
+                    bucket: "objects".into(),
+                    enabled: true,
+                },
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(denied_public.code(), tonic::Code::PermissionDenied);
+        let public = service
+            .set_bucket_public_read(authenticated(
+                StorageTenantId::parse("acme").unwrap(),
+                "acme-owner",
+                api::SetBucketPublicReadRequest {
+                    bucket: "objects".into(),
+                    enabled: true,
+                },
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(public.authorization_revision, 8);
+        assert!(public.enabled);
+        assert!(!public.replayed);
+        let replay = service
+            .set_bucket_public_read(authenticated(
+                StorageTenantId::parse("acme").unwrap(),
+                "acme-owner",
+                api::SetBucketPublicReadRequest {
+                    bucket: "objects".into(),
+                    enabled: true,
+                },
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(replay.authorization_revision, 8);
+        assert!(replay.replayed);
+        let private = service
+            .set_bucket_public_read(authenticated(
+                StorageTenantId::parse("acme").unwrap(),
+                "acme-owner",
+                api::SetBucketPublicReadRequest {
+                    bucket: "objects".into(),
+                    enabled: false,
+                },
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(private.authorization_revision, 9);
+        assert!(!private.enabled);
         assert!(
             store
                 .application(&StorageTenantId::parse("acme").unwrap(), "worker")

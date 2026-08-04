@@ -6,6 +6,9 @@ pub const DEFAULT_REALM_ID: &str = "default";
 pub const SYSTEM_REALM_ID: &str = "_anvil/system";
 pub const PUBLIC_SUBJECT_NAMESPACE: &str = "app";
 pub const PUBLIC_SUBJECT_ID: &str = "_anvil/public";
+/// Reserved non-credentialed application identity used at the public service
+/// boundary when a request omits authentication.
+pub const ANONYMOUS_SUBJECT_ID: &str = "_anvil/anonymous";
 
 pub const MAX_REALM_ID_BYTES: usize = 256;
 pub const MAX_NAMESPACE_BYTES: usize = 256;
@@ -238,6 +241,18 @@ impl ObjectRef {
             namespace: PUBLIC_SUBJECT_NAMESPACE.to_owned(),
             id: ObjectId::Opaque(PUBLIC_SUBJECT_ID.to_owned()),
         }
+    }
+
+    pub fn anonymous() -> Self {
+        Self {
+            namespace: PUBLIC_SUBJECT_NAMESPACE.to_owned(),
+            id: ObjectId::Opaque(ANONYMOUS_SUBJECT_ID.to_owned()),
+        }
+    }
+
+    pub fn is_anonymous(&self) -> bool {
+        self.namespace == PUBLIC_SUBJECT_NAMESPACE
+            && self.id == ObjectId::Opaque(ANONYMOUS_SUBJECT_ID.to_owned())
     }
 
     pub fn is_public(&self) -> bool {

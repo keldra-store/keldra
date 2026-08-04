@@ -497,6 +497,28 @@ async fn application_ids_and_client_ids_are_globally_unique_authentication_subje
 }
 
 #[tokio::test]
+async fn anonymous_subject_cannot_be_claimed_as_an_application() {
+    let (_directory, store) = store().await;
+    store
+        .bootstrap_system(request("bootstrap-app", "bootstrap-client"))
+        .unwrap();
+
+    let rejected = store.provision_tenant(ProvisionTenantRequest {
+        storage_tenant: tenant("acme"),
+        owner_app_id: anvil_authz::ANONYMOUS_SUBJECT_ID.into(),
+        owner_client_id: "acme-client".into(),
+        owner_client_secret: SECRET.into(),
+        principal: app("bootstrap-app"),
+        expected_authorization_revision: AuthzRevision(3),
+        expected_binding_generation: 1,
+    });
+    assert!(matches!(
+        rejected,
+        Err(CredentialRepositoryError::InvalidInput(_))
+    ));
+}
+
+#[tokio::test]
 async fn bucket_creation_and_role_changes_are_system_realm_tuple_batches() {
     let (_directory, store) = store().await;
     store
@@ -598,6 +620,29 @@ async fn bucket_creation_and_role_changes_are_system_realm_tuple_batches() {
             .authorization_revision,
         AuthzRevision(7)
     );
+    let public = SetBucketPublicReadRequest {
+        storage_tenant: tenant("acme"),
+        bucket: "objects".into(),
+        enabled: true,
+        principal: app("owner-app"),
+        expected_authorization_revision: AuthzRevision(7),
+        expected_binding_generation: 1,
+    };
+    let enabled = store.set_bucket_public_read(public.clone()).unwrap();
+    assert_eq!(enabled.authorization_revision, AuthzRevision(8));
+    let mut replay = public.clone();
+    replay.expected_authorization_revision = AuthzRevision(8);
+    assert!(store.set_bucket_public_read(replay).unwrap().replayed);
+    let mut disabled = public;
+    disabled.enabled = false;
+    disabled.expected_authorization_revision = AuthzRevision(8);
+    assert_eq!(
+        store
+            .set_bucket_public_read(disabled)
+            .unwrap()
+            .authorization_revision,
+        AuthzRevision(9)
+    );
     let snapshot = store
         .authz()
         .realm_snapshot(&AuthzScope::system(), AuthzConsistency::Latest)
@@ -611,6 +656,11 @@ async fn bucket_creation_and_role_changes_are_system_realm_tuple_batches() {
         bucket_resource(&tenant("acme"), "objects").unwrap(),
         "writer",
         app("owner-app"),
+    )));
+    assert!(!snapshot.tuples.contains(&Tuple::new(
+        bucket_resource(&tenant("acme"), "objects").unwrap(),
+        "reader",
+        ObjectRef::anonymous(),
     )));
 }
 

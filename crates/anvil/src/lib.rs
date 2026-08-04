@@ -483,13 +483,20 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES);
     let tokens = config.token_manager;
+    let object_tokens = tokens.clone();
+    let object_rate_limits = request_rate_limits.clone();
+    let object_authority = serving_fence.authority();
+    let authenticate_object = move |request: tonic::Request<()>| {
+        let request = object_authority.require(request)?;
+        object_rate_limits.authenticate_object(&object_tokens, request)
+    };
     let authenticated_authority = serving_fence.authority();
     let authenticate = move |request: tonic::Request<()>| {
         let request = authenticated_authority.require(request)?;
         request_rate_limits.authenticate(&tokens, request)
     };
     let object_service =
-        tonic::service::interceptor::InterceptedService::new(object_service, authenticate.clone());
+        tonic::service::interceptor::InterceptedService::new(object_service, authenticate_object);
     let index_service =
         tonic::service::interceptor::InterceptedService::new(index_service, authenticate.clone());
     let authz_service =

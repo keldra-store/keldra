@@ -18,14 +18,15 @@ use anvil_store::{
 use thiserror::Error;
 use tonic::{Status, metadata::MetadataMap};
 
-use crate::authentication::JwtManager;
+use crate::authentication::{Caller, JwtManager};
 use crate::authorization::{ObjectPermission, SystemAuthorizer};
 use crate::cluster_placement::ClusterPlacement;
 use crate::placement::PlacementKind;
 use crate::serving_fence::ServingAuthority;
 
-/// The original signed access token, deliberately separate from every Debug
-/// or protobuf-derived listing type. Private transports carry it in encrypted
+/// Original request authority for a distributed object read, deliberately
+/// separate from every Debug or protobuf-derived listing type. Private mTLS
+/// transports carry either the signed bearer or the fixed anonymous marker in
 /// gRPC metadata rather than serializing a caller or an authorization result.
 #[derive(Clone)]
 pub(crate) struct OriginalBearer(Arc<str>);
@@ -51,6 +52,13 @@ impl OriginalBearer {
         Ok(Self(Arc::from(token)))
     }
 
+    /// Private mTLS routing marker for the public ingress identity. It is not
+    /// accepted by the public JWT interceptor and carries no authority of its
+    /// own; every source still evaluates Zanzibar for `app:_anvil/anonymous`.
+    pub(crate) fn anonymous() -> Self {
+        Self(Arc::from(anvil_authz::ANONYMOUS_SUBJECT_ID))
+    }
+
     #[cfg(test)]
     pub(crate) fn from_signed_token(token: impl Into<Arc<str>>) -> Self {
         Self(token.into())
@@ -58,6 +66,10 @@ impl OriginalBearer {
 
     pub(crate) fn signed_token(&self) -> &str {
         &self.0
+    }
+
+    pub(crate) fn is_anonymous(&self) -> bool {
+        self.0.as_ref() == anvil_authz::ANONYMOUS_SUBJECT_ID
     }
 }
 
@@ -302,10 +314,16 @@ impl AuthoritativeListAuthorizer for CoordinatedListAuthorizer {
         bearer: &OriginalBearer,
         query: &LocalListQuery,
     ) -> Result<(), Status> {
-        let caller = self
-            .tokens
-            .verify(bearer.signed_token())
-            .map_err(|_| Status::unauthenticated("the bearer token is invalid or expired"))?;
+        let caller = if bearer.is_anonymous() {
+            Caller::from_anonymous(
+                StorageTenantId::parse(query.tenant())
+                    .map_err(|error| Status::invalid_argument(error.to_string()))?,
+            )
+        } else {
+            self.tokens
+                .verify(bearer.signed_token())
+                .map_err(|_| Status::unauthenticated("the bearer token is invalid or expired"))?
+        };
         if caller.storage_tenant().as_str() != query.tenant() {
             return Err(Status::permission_denied(
                 "object list does not belong to the authenticated tenant",
@@ -1079,6 +1097,26 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct CaptureListAuthorization {
+        seen: Mutex<Vec<(StorageTenantId, ObjectRef)>>,
+    }
+
+    #[tonic::async_trait]
+    impl TenantAuthorizationCoordinator for CaptureListAuthorization {
+        async fn allows(
+            &self,
+            storage_tenant: StorageTenantId,
+            _realm: RealmId,
+            subject: ObjectRef,
+            _permission: ListAuthorizationPermission,
+            _placement_fence: PlacementLogId,
+        ) -> Result<bool, Status> {
+            self.seen.lock().unwrap().push((storage_tenant, subject));
+            Ok(true)
+        }
+    }
+
     #[tokio::test]
     async fn late_bound_authorizer_fails_closed_then_installs_once() {
         let authorizer = LateBoundListAuthorizer::default();
@@ -1128,6 +1166,38 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(malformed.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn anonymous_list_still_runs_the_source_side_zanzibar_check() {
+        let captured = Arc::new(CaptureListAuthorization::default());
+        let authorizer = CoordinatedListAuthorizer::new(
+            JwtManager::new(b"anonymous-list-secret-0123456789abcdef").unwrap(),
+            captured.clone(),
+        );
+        let query = LocalListQuery::new(
+            PlacementLogId { term: 1, index: 2 },
+            "tenant",
+            "bucket",
+            3,
+            4,
+            "",
+            None,
+            10,
+        )
+        .unwrap();
+
+        let bearer = OriginalBearer::anonymous();
+        assert!(bearer.is_anonymous());
+        authorizer.authorize(&bearer, &query).await.unwrap();
+
+        assert_eq!(
+            captured.seen.lock().unwrap().as_slice(),
+            &[(
+                StorageTenantId::parse("tenant").unwrap(),
+                ObjectRef::anonymous(),
+            )]
+        );
     }
 
     #[test]

@@ -75,6 +75,19 @@ fn list_objects_contract_defaults_and_bounds_its_stateless_page() {
 }
 
 #[test]
+fn anonymous_object_identity_is_not_accepted_by_mutation_helpers() {
+    let mut request = Request::new(());
+    request
+        .extensions_mut()
+        .insert(crate::authentication::AnonymousObjectRequest);
+
+    assert_eq!(
+        authenticated_caller(&request).unwrap_err().code(),
+        tonic::Code::Unauthenticated
+    );
+}
+
+#[test]
 fn present_head_contains_public_hash_and_length_without_a_blob_reference() {
     let present = Version {
         id: VersionId(4),

@@ -60,7 +60,10 @@ mod batch_get;
 mod bulk;
 mod distributed_reads;
 mod distributed_watch_stream;
+mod read_identity;
 mod routed_writes;
+
+use read_identity::ObjectReadIdentity;
 
 const OBJECT_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_BULK_ITEMS: usize = 1_000;
@@ -495,9 +498,10 @@ impl ObjectService for ObjectServiceImpl {
         request: Request<HeadObjectRequest>,
     ) -> Result<Response<ObjectHead>, Status> {
         let deadline = request_deadline(request.metadata(), self.atomic_program_timeout)?;
-        let caller = authenticated_caller(&request)?;
+        let identity = ObjectReadIdentity::from_request(&request)?;
         let path_access = object_path_access::access_for(&request);
         let key = object_key(request.into_inner().address)?;
+        let caller = identity.caller_for_tenant(key.tenant())?;
         object_path_access::require_key(&path_access, &key)?;
         self.authorize_object(&caller, &key, ObjectPermission::Get)
             .await?;
@@ -524,9 +528,10 @@ impl ObjectService for ObjectServiceImpl {
         &self,
         request: Request<ListObjectsRequest>,
     ) -> Result<Response<ListObjectsResponse>, Status> {
-        let caller = authenticated_caller(&request)?;
-        let bearer = OriginalBearer::from_metadata(request.metadata())?;
+        let identity = ObjectReadIdentity::from_request(&request)?;
+        let bearer = identity.original_bearer(request.metadata())?;
         let query = list_objects_query(request.into_inner())?;
+        let caller = identity.caller_for_tenant(&query.tenant)?;
         if caller.storage_tenant().as_str() != query.tenant.as_str() {
             return Err(Status::permission_denied(
                 "object list does not belong to the authenticated tenant",
@@ -562,10 +567,11 @@ impl ObjectService for ObjectServiceImpl {
         request: Request<GetObjectRequest>,
     ) -> Result<Response<Self::GetObjectStream>, Status> {
         let deadline = request_deadline(request.metadata(), self.atomic_program_timeout)?;
-        let caller = authenticated_caller(&request)?;
+        let identity = ObjectReadIdentity::from_request(&request)?;
         let path_access = object_path_access::access_for(&request);
         let request = request.into_inner();
         let key = object_key(request.address)?;
+        let caller = identity.caller_for_tenant(key.tenant())?;
         object_path_access::require_key(&path_access, &key)?;
         self.authorize_object(&caller, &key, ObjectPermission::Get)
             .await?;
@@ -601,9 +607,10 @@ impl ObjectService for ObjectServiceImpl {
         request: Request<ListObjectVersionsRequest>,
     ) -> Result<Response<Self::ListObjectVersionsStream>, Status> {
         let deadline = request_deadline(request.metadata(), self.atomic_program_timeout)?;
-        let caller = authenticated_caller(&request)?;
+        let identity = ObjectReadIdentity::from_request(&request)?;
         let path_access = object_path_access::access_for(&request);
         let key = object_key(request.into_inner().address)?;
+        let caller = identity.caller_for_tenant(key.tenant())?;
         object_path_access::require_key(&path_access, &key)?;
         self.authorize_object(&caller, &key, ObjectPermission::Get)
             .await?;
@@ -795,7 +802,7 @@ impl ObjectService for ObjectServiceImpl {
         request: Request<BatchGetRequest>,
     ) -> Result<Response<BatchGetResponse>, Status> {
         let deadline = request_deadline(request.metadata(), self.atomic_program_timeout)?;
-        let caller = authenticated_caller(&request)?;
+        let identity = ObjectReadIdentity::from_request(&request)?;
         let path_access = object_path_access::access_for(&request);
         let objects = request.into_inner().objects;
         if objects.len() > MAX_BATCH_GET_ITEMS {
@@ -806,6 +813,7 @@ impl ObjectService for ObjectServiceImpl {
         let mut accepted = Vec::with_capacity(objects.len());
         let mut outcomes = Vec::new();
         let mut pending = Vec::with_capacity(objects.len());
+        let mut caller = None::<Caller>;
         for (index, request) in objects.into_iter().enumerate() {
             let address = request.address.clone();
             let key = match object_key(request.address) {
@@ -826,7 +834,9 @@ impl ObjectService for ObjectServiceImpl {
                 outcomes.push(batch_get_authorization_failure(index, &key, &error));
                 continue;
             }
-            match require_caller_tenant(&caller, &key) {
+            let candidate = identity.caller_for_tenant(key.tenant())?;
+            let caller = caller.get_or_insert(candidate);
+            match require_caller_tenant(caller, &key) {
                 Ok(()) => pending.push((index, key, request.version.map(VersionId))),
                 Err(error) if error.code() == tonic::Code::PermissionDenied => {
                     outcomes.push(batch_get_authorization_failure(index, &key, &error));
@@ -842,7 +852,12 @@ impl ObjectService for ObjectServiceImpl {
             Vec::new()
         } else {
             self.authoritative_system
-                .allows_objects(&caller, &authorization_requests)
+                .allows_objects(
+                    caller
+                        .as_ref()
+                        .ok_or_else(|| Status::internal("batch read caller is missing"))?,
+                    &authorization_requests,
+                )
                 .await?
         };
         for ((index, key, requested_version), allowed) in pending.into_iter().zip(allowed) {

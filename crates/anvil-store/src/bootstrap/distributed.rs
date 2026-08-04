@@ -1,6 +1,17 @@
 use super::*;
 use crate::LogicalCredentialRecord;
 
+pub(super) fn public_bucket_reader_tuple(
+    storage_tenant: &StorageTenantId,
+    bucket: &str,
+) -> Result<Tuple, CredentialRepositoryError> {
+    Ok(Tuple::new(
+        bucket_resource(storage_tenant, bucket)?,
+        "reader",
+        ObjectRef::anonymous(),
+    ))
+}
+
 impl Store {
     /// Constructs a new application and credential without changing storage.
     pub fn prepare_application_creation(
@@ -32,6 +43,16 @@ impl Store {
         request: SetApplicationRoleRequest,
     ) -> Result<TupleBatchRequest, CredentialRepositoryError> {
         self.credentials().prepare_application_role_change(request)
+    }
+
+    /// Constructs the one protected-system tuple that controls anonymous
+    /// reads for a bucket without creating a credentialed application.
+    pub fn prepare_bucket_public_read_change(
+        &self,
+        request: SetBucketPublicReadRequest,
+    ) -> Result<TupleBatchRequest, CredentialRepositoryError> {
+        self.credentials()
+            .prepare_bucket_public_read_change(request)
     }
 }
 
@@ -105,6 +126,33 @@ impl CredentialRepository {
                     TupleMutationKind::Remove
                 },
                 tuple: Tuple::new(resource, relation, application),
+            }],
+        })
+    }
+
+    pub fn prepare_bucket_public_read_change(
+        &self,
+        request: SetBucketPublicReadRequest,
+    ) -> Result<TupleBatchRequest, CredentialRepositoryError> {
+        validate_principal(&request.principal)?;
+        if request.storage_tenant.is_system() {
+            return Err(CredentialRepositoryError::InvalidInput(
+                "the protected system tenant has no buckets".into(),
+            ));
+        }
+        Ok(TupleBatchRequest {
+            scope: AuthzScope::system(),
+            principal: request.principal,
+            expected_revision: Some(request.expected_authorization_revision),
+            expected_binding_generation: request.expected_binding_generation,
+            operation_id: None,
+            mutations: vec![TupleMutation {
+                kind: if request.enabled {
+                    TupleMutationKind::Add
+                } else {
+                    TupleMutationKind::Remove
+                },
+                tuple: public_bucket_reader_tuple(&request.storage_tenant, &request.bucket)?,
             }],
         })
     }

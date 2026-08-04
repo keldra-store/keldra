@@ -114,6 +114,11 @@ service AdministrationService {
   // Bucket versioning can move only from UNVERSIONED to ENABLED. Disabling a
   // version-enabled bucket is deliberately unsupported.
   rpc SetBucketVersioning(SetBucketVersioningRequest) returns (SetBucketVersioningResponse);
+  // Enables or disables unauthenticated GET/list access for one bucket. The
+  // server represents anonymous readers as the reserved Zanzibar subject
+  // app:_anvil/anonymous; this does not create a manageable application and can
+  // never grant write access.
+  rpc SetBucketPublicRead(SetBucketPublicReadRequest) returns (SetBucketPublicReadResponse);
   rpc GrantApplicationRole(ApplicationRoleRequest) returns (ApplicationRoleResponse);
   rpc RevokeApplicationRole(ApplicationRoleRequest) returns (ApplicationRoleResponse);
 }
@@ -913,6 +918,19 @@ message SetBucketVersioningResponse {
   string bucket = 2;
   ObjectVersioning versioning = 3;
   bool changed = 4;
+}
+
+message SetBucketPublicReadRequest {
+  string bucket = 1;
+  bool enabled = 2;
+}
+
+message SetBucketPublicReadResponse {
+  string storage_tenant = 1;
+  string bucket = 2;
+  bool enabled = 3;
+  uint64 authorization_revision = 4;
+  bool replayed = 5;
 }
 
 message ApplicationRoleRequest {

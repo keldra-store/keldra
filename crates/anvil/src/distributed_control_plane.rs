@@ -15,8 +15,8 @@ use anvil_store::{
     ApplicationCredentialRequest, ApplicationRoleTarget, AuthzConsistency, AuthzRevision,
     AuthzScope, CoordinatedAuthzRealmResult, CreateBucketRequest, LogicalApplicationRecord,
     LogicalCredentialRecord, LogicalRecordId, LogicalRecordValue, ObjectVersioning, PlacementLogId,
-    ProvisionTenantRequest, SetApplicationRoleRequest, StorageTenantId, Store, TupleBatchReceipt,
-    TupleBatchRequest,
+    ProvisionTenantRequest, SetApplicationRoleRequest, SetBucketPublicReadRequest, StorageTenantId,
+    Store, TupleBatchReceipt, TupleBatchRequest,
 };
 use tonic::Status;
 
@@ -261,6 +261,37 @@ impl DistributedControlPlane {
         let caller = self.verify_routed_bearer(bearer)?;
         self.require_local_executor()?;
         self.execute_set_bucket_versioning(caller, request).await
+    }
+
+    pub(crate) async fn set_bucket_public_read(
+        &self,
+        caller: Caller,
+        bearer: OriginalBearer,
+        request: api::SetBucketPublicReadRequest,
+    ) -> Result<api::SetBucketPublicReadResponse, Status> {
+        if let Some(target) = self.executor_target()? {
+            return self
+                .peers
+                .route_admin_set_bucket_public_read(
+                    target.node_id,
+                    &target.address,
+                    bearer.signed_token(),
+                    request,
+                    CONTROL_OPERATION_TIMEOUT,
+                )
+                .await;
+        }
+        self.execute_set_bucket_public_read(caller, request).await
+    }
+
+    pub(crate) async fn execute_routed_set_bucket_public_read(
+        &self,
+        bearer: &str,
+        request: api::SetBucketPublicReadRequest,
+    ) -> Result<api::SetBucketPublicReadResponse, Status> {
+        let caller = self.verify_routed_bearer(bearer)?;
+        self.require_local_executor()?;
+        self.execute_set_bucket_public_read(caller, request).await
     }
 
     pub(crate) async fn change_application_role(
@@ -856,6 +887,53 @@ impl DistributedControlPlane {
             bucket: request.bucket,
             versioning: api::ObjectVersioning::Enabled as i32,
             changed,
+        })
+    }
+
+    async fn execute_set_bucket_public_read(
+        &self,
+        caller: Caller,
+        request: api::SetBucketPublicReadRequest,
+    ) -> Result<api::SetBucketPublicReadResponse, Status> {
+        self.require_local_executor()?;
+        let _serial = self.administration_serial.lock().await;
+        self.require_local_executor()?;
+        if caller.storage_tenant().is_system() {
+            return Err(Status::invalid_argument(
+                "buckets cannot exist in the protected system tenant",
+            ));
+        }
+        let storage_tenant = caller.storage_tenant().clone();
+        let authorization = self
+            .authorize_system(
+                caller.subject(),
+                bucket_resource(storage_tenant.as_str(), &request.bucket)
+                    .map_err(authz_evaluation_status)?,
+                "manage_policy",
+                "public bucket policy management is not authorized",
+            )
+            .await?;
+        self.require_bucket_identity(&storage_tenant, &request.bucket)
+            .await?;
+        let grant = self
+            .store
+            .prepare_bucket_public_read_change(SetBucketPublicReadRequest {
+                storage_tenant: storage_tenant.clone(),
+                bucket: request.bucket.clone(),
+                enabled: request.enabled,
+                principal: caller.subject().clone(),
+                expected_authorization_revision: authorization.revision,
+                expected_binding_generation: authorization.binding_generation,
+            })
+            .map_err(credential_status)?;
+        let receipt = self.apply_system_grant(grant).await?;
+        self.require_local_executor()?;
+        Ok(api::SetBucketPublicReadResponse {
+            storage_tenant: storage_tenant.to_string(),
+            bucket: request.bucket,
+            enabled: request.enabled,
+            authorization_revision: receipt.authz_revision.0,
+            replayed: receipt.replayed,
         })
     }
 

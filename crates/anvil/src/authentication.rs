@@ -51,6 +51,13 @@ pub struct Caller {
     subject: ObjectRef,
 }
 
+/// Explicit ingress marker for an Object-service request that omitted the
+/// authorization header. Read RPCs bind this global anonymous principal to the
+/// tenant named by the requested object before evaluating Zanzibar. Other
+/// services and Object-service mutations continue to require a [`Caller`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AnonymousObjectRequest;
+
 /// Explicit server rate-limit policy. All values are non-zero so a deployed
 /// server cannot accidentally construct a disabled or unusable GCRA quota.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,6 +143,40 @@ impl RequestRateLimits {
         request: Request<T>,
     ) -> Result<Request<T>, Status> {
         check_direct(&self.global, "server")?;
+        self.authenticate_after_global_limit(tokens, request)
+    }
+
+    /// Applies the normal authenticated path when a bearer is present. A
+    /// genuinely missing header is retained as an explicit anonymous marker;
+    /// malformed, duplicate, invalid and expired supplied bearers still fail.
+    /// This interceptor is installed only on the Object service.
+    pub fn authenticate_object<T>(
+        &self,
+        tokens: &JwtManager,
+        mut request: Request<T>,
+    ) -> Result<Request<T>, Status> {
+        check_direct(&self.global, "server")?;
+        if request
+            .metadata()
+            .get_all("authorization")
+            .iter()
+            .next()
+            .is_none()
+        {
+            let anonymous = Caller::from_anonymous(StorageTenantId::system());
+            check_keyed(&self.authenticated, &anonymous, "anonymous caller")?;
+            self.retain_authenticated_recently();
+            request.extensions_mut().insert(AnonymousObjectRequest);
+            return Ok(request);
+        }
+        self.authenticate_after_global_limit(tokens, request)
+    }
+
+    fn authenticate_after_global_limit<T>(
+        &self,
+        tokens: &JwtManager,
+        request: Request<T>,
+    ) -> Result<Request<T>, Status> {
         let request = tokens.authenticate(request)?;
         let caller = request
             .extensions()
@@ -216,15 +257,22 @@ impl Caller {
     ) -> Result<Self, AuthenticationError> {
         let subject = ObjectRef::opaque("app", app_id.into())
             .map_err(|error| AuthenticationError::InvalidIdentity(error.to_string()))?;
-        if subject.is_public() {
+        if subject.is_public() || subject.is_anonymous() {
             return Err(AuthenticationError::InvalidIdentity(
-                "the reserved public subject cannot authenticate".into(),
+                "reserved non-credentialed subjects cannot authenticate".into(),
             ));
         }
         Ok(Self {
             storage_tenant,
             subject,
         })
+    }
+
+    pub(crate) fn from_anonymous(storage_tenant: StorageTenantId) -> Self {
+        Self {
+            storage_tenant,
+            subject: ObjectRef::anonymous(),
+        }
     }
 }
 
@@ -834,6 +882,79 @@ mod tests {
     }
 
     #[test]
+    fn object_interceptor_maps_only_a_missing_header_to_anonymous() {
+        let manager = JwtManager::new(TEST_SIGNING_SECRET).unwrap();
+
+        let anonymous = RequestRateLimits::new(test_rate_config())
+            .authenticate_object(&manager, Request::new(()))
+            .unwrap();
+        assert!(
+            anonymous
+                .extensions()
+                .get::<AnonymousObjectRequest>()
+                .is_some()
+        );
+        assert!(anonymous.extensions().get::<Caller>().is_none());
+
+        let authenticated = RequestRateLimits::new(test_rate_config())
+            .authenticate_object(&manager, bearer_request(&manager, "acme", "app-7"))
+            .unwrap();
+        assert!(
+            authenticated
+                .extensions()
+                .get::<AnonymousObjectRequest>()
+                .is_none()
+        );
+        assert_eq!(
+            authenticated
+                .extensions()
+                .get::<Caller>()
+                .unwrap()
+                .subject()
+                .id,
+            ObjectId::Opaque("app-7".to_owned())
+        );
+    }
+
+    #[test]
+    fn object_interceptor_rejects_every_supplied_invalid_bearer() {
+        let manager = JwtManager::new(TEST_SIGNING_SECRET).unwrap();
+        for value in ["not-bearer", "Bearer ", "Bearer not-a-jwt"] {
+            let mut request = Request::new(());
+            request
+                .metadata_mut()
+                .insert("authorization", value.parse().unwrap());
+            let error = RequestRateLimits::new(test_rate_config())
+                .authenticate_object(&manager, request)
+                .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::Unauthenticated, "{value}");
+        }
+
+        let token = manager.mint(tenant("acme"), "app-7").unwrap();
+        let value = MetadataValue::try_from(format!("Bearer {token}")).unwrap();
+        let mut duplicate = Request::new(());
+        duplicate
+            .metadata_mut()
+            .append("authorization", value.clone());
+        duplicate.metadata_mut().append("authorization", value);
+        assert_eq!(
+            RequestRateLimits::new(test_rate_config())
+                .authenticate_object(&manager, duplicate)
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unauthenticated
+        );
+    }
+
+    #[test]
+    fn anonymous_caller_is_the_uncredentialed_reserved_application() {
+        let caller = Caller::from_anonymous(tenant("acme"));
+        assert_eq!(caller.storage_tenant(), &tenant("acme"));
+        assert_eq!(caller.subject(), &ObjectRef::anonymous());
+        assert!(caller.subject().is_anonymous());
+    }
+
+    #[test]
     fn wrong_key_missing_token_and_duplicate_headers_fail_closed() {
         let issuer = JwtManager::new(TEST_SIGNING_SECRET).unwrap();
         let verifier = JwtManager::new(b"fedcba9876543210fedcba9876543210").unwrap();
@@ -975,6 +1096,11 @@ mod tests {
         assert!(
             manager
                 .mint(tenant("acme"), anvil_authz::PUBLIC_SUBJECT_ID)
+                .is_err()
+        );
+        assert!(
+            manager
+                .mint(tenant("acme"), anvil_authz::ANONYMOUS_SUBJECT_ID)
                 .is_err()
         );
     }

@@ -193,6 +193,29 @@ impl ClusterPeerService {
         Ok(Response::new(response))
     }
 
+    pub(super) async fn route_admin_set_bucket_public_read_call(
+        &self,
+        request: Request<wire::RouteAdminSetBucketPublicReadRequest>,
+    ) -> Result<Response<anvil_api::v1::SetBucketPublicReadResponse>, Status> {
+        let admitted = self.admit(&request, request.get_ref().peer.as_ref(), 1)?;
+        let bearer = OriginalBearer::from_metadata(request.metadata())?;
+        let value =
+            request.get_ref().request.clone().ok_or_else(|| {
+                Status::invalid_argument("SetBucketPublicRead request is required")
+            })?;
+        let fence = admitted.placement.fence();
+        let response = tokio::time::timeout(
+            admitted.timeout,
+            self.distributed_control
+                .get()?
+                .execute_routed_set_bucket_public_read(bearer.signed_token(), value),
+        )
+        .await
+        .map_err(|_| Status::deadline_exceeded("routed SetBucketPublicRead deadline exceeded"))??;
+        self.require_unchanged_control(fence)?;
+        Ok(Response::new(response))
+    }
+
     pub(super) async fn route_admin_change_application_role_call(
         &self,
         request: Request<wire::RouteAdminChangeApplicationRoleRequest>,

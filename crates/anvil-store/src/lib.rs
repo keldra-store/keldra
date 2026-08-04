@@ -42,8 +42,9 @@ pub use bootstrap::{
     CredentialRepository, CredentialRepositoryError, PreparedApplicationCredential,
     PreparedBucketCreation, PreparedTenantProvisioning, ProvisionTenantReceipt,
     ProvisionTenantRequest, SYSTEM_BOOTSTRAP_VERSION, SYSTEM_SCHEMA_ID, SetApplicationRoleReceipt,
-    SetApplicationRoleRequest, SystemApplicationRole, SystemBootstrapError, SystemBootstrapRequest,
-    SystemBootstrapState, TenantApplicationRole, system_schema,
+    SetApplicationRoleRequest, SetBucketPublicReadRequest, SystemApplicationRole,
+    SystemBootstrapError, SystemBootstrapRequest, SystemBootstrapState, TenantApplicationRole,
+    system_schema,
 };
 pub use clock::VersionClock;
 pub use erasure::{

@@ -335,6 +335,11 @@ message RouteAdminSetBucketVersioningRequest {
   anvil.v1.SetBucketVersioningRequest request = 2;
 }
 
+message RouteAdminSetBucketPublicReadRequest {
+  PeerContext peer = 1;
+  anvil.v1.SetBucketPublicReadRequest request = 2;
+}
+
 message RouteAdminChangeApplicationRoleRequest {
   PeerContext peer = 1;
   anvil.v1.ApplicationRoleRequest request = 2;
@@ -618,6 +623,7 @@ service ClusterPeer {
   rpc RouteAdminRotateCredential(RouteAdminRotateCredentialRequest) returns (anvil.v1.ApplicationCredential);
   rpc RouteAdminDisableCredential(RouteAdminDisableCredentialRequest) returns (anvil.v1.ApplicationCredentialState);
   rpc RouteAdminSetBucketVersioning(RouteAdminSetBucketVersioningRequest) returns (anvil.v1.SetBucketVersioningResponse);
+  rpc RouteAdminSetBucketPublicRead(RouteAdminSetBucketPublicReadRequest) returns (anvil.v1.SetBucketPublicReadResponse);
   rpc RouteAdminChangeApplicationRole(RouteAdminChangeApplicationRoleRequest) returns (anvil.v1.ApplicationRoleResponse);
   rpc RouteInvokeProgram(RouteInvokeProgramRequest) returns (anvil.v1.InvokeProgramResponse);
   rpc RouteAuthzPutSchema(RouteAuthzPutSchemaRequest) returns (anvil.v1.PutSchemaResponse);

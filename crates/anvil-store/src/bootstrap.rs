@@ -233,6 +233,16 @@ pub struct SetApplicationRoleRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SetBucketPublicReadRequest {
+    pub storage_tenant: StorageTenantId,
+    pub bucket: String,
+    pub enabled: bool,
+    pub principal: ObjectRef,
+    pub expected_authorization_revision: AuthzRevision,
+    pub expected_binding_generation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SetApplicationRoleReceipt {
     pub authorization_revision: AuthzRevision,
     pub replayed: bool,
@@ -478,6 +488,13 @@ impl Store {
         request: SetApplicationRoleRequest,
     ) -> Result<SetApplicationRoleReceipt, CredentialRepositoryError> {
         self.credentials().set_application_role(request)
+    }
+
+    pub fn set_bucket_public_read(
+        &self,
+        request: SetBucketPublicReadRequest,
+    ) -> Result<SetApplicationRoleReceipt, CredentialRepositoryError> {
+        self.credentials().set_bucket_public_read(request)
     }
 }
 
@@ -1087,6 +1104,78 @@ impl CredentialRepository {
         })
     }
 
+    pub fn set_bucket_public_read(
+        &self,
+        request: SetBucketPublicReadRequest,
+    ) -> Result<SetApplicationRoleReceipt, CredentialRepositoryError> {
+        validate_principal(&request.principal)?;
+        if request.storage_tenant.is_system() {
+            return Err(CredentialRepositoryError::InvalidInput(
+                "the protected system tenant has no buckets".into(),
+            ));
+        }
+        let identity = self
+            .store
+            .resolve_bucket_identity(request.storage_tenant.as_str(), &request.bucket)
+            .map_err(|_| {
+                CredentialRepositoryError::NotFound(format!(
+                    "bucket {}/{}",
+                    request.storage_tenant, request.bucket
+                ))
+            })?;
+        let existing = self
+            .read_json::<StoredBucket>(CF_METADATA, &bucket_record_key(identity))?
+            .ok_or_else(|| {
+                CredentialRepositoryError::NotFound(format!(
+                    "bucket {}/{}",
+                    request.storage_tenant, request.bucket
+                ))
+            })?;
+        validate_stored_bucket(
+            &existing,
+            identity,
+            &request.storage_tenant,
+            &request.bucket,
+        )?;
+        let tuple =
+            distributed::public_bucket_reader_tuple(&request.storage_tenant, &request.bucket)?;
+        let authz = self.store.authz();
+        let _guard = authz.lock_writes()?;
+        require_system_revision(&authz, request.expected_authorization_revision)?;
+        let snapshot = authz.realm_snapshot(&AuthzScope::system(), AuthzConsistency::Latest)?;
+        let present = snapshot.tuples.iter().any(|existing| existing == &tuple);
+        if present == request.enabled {
+            return Ok(SetApplicationRoleReceipt {
+                authorization_revision: snapshot.revision,
+                replayed: true,
+            });
+        }
+        let mut batch = WriteBatch::default();
+        let receipt = authz.prepare_tuple_batch(
+            &TupleBatchRequest {
+                scope: AuthzScope::system(),
+                principal: request.principal,
+                expected_revision: Some(request.expected_authorization_revision),
+                expected_binding_generation: request.expected_binding_generation,
+                operation_id: None,
+                mutations: vec![TupleMutation {
+                    kind: if request.enabled {
+                        TupleMutationKind::Add
+                    } else {
+                        TupleMutationKind::Remove
+                    },
+                    tuple,
+                }],
+            },
+            &mut batch,
+        )?;
+        authz.write(batch)?;
+        Ok(SetApplicationRoleReceipt {
+            authorization_revision: receipt.authz_revision,
+            replayed: false,
+        })
+    }
+
     pub fn credential(
         &self,
         client_id: &str,
@@ -1492,9 +1581,9 @@ pub(crate) fn validate_stored_bucket(
 pub(crate) fn application_ref(app_id: &str) -> Result<ObjectRef, CredentialRepositoryError> {
     let application = ObjectRef::opaque(APP_NAMESPACE, app_id)
         .map_err(|error| CredentialRepositoryError::InvalidInput(error.to_string()))?;
-    if application.is_public() {
+    if application.is_public() || application.is_anonymous() {
         return Err(CredentialRepositoryError::InvalidInput(
-            "application cannot be the reserved public subject".into(),
+            "application cannot use a reserved Anvil subject".into(),
         ));
     }
     Ok(application)

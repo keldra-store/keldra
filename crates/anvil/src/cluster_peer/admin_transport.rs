@@ -92,6 +92,27 @@ impl ClusterPeerTransport {
             .into_inner())
     }
 
+    pub(crate) async fn route_admin_set_bucket_public_read(
+        &self,
+        target: NodeId,
+        address: &str,
+        bearer: &str,
+        value: api::SetBucketPublicReadRequest,
+        remaining: Duration,
+    ) -> Result<api::SetBucketPublicReadResponse, Status> {
+        let fence = self.placement()?.fence();
+        let mut request = Request::new(wire::RouteAdminSetBucketPublicReadRequest {
+            peer: Some(self.context(fence, 1, remaining)?),
+            request: Some(value),
+        });
+        add_bearer_and_timeout(&mut request, bearer, remaining)?;
+        Ok(self
+            .client(target, address)?
+            .route_admin_set_bucket_public_read(request)
+            .await?
+            .into_inner())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn route_admin_change_application_role(
         &self,
