@@ -1,192 +1,191 @@
 # Anvil
 
-Anvil 0.5 is a small, versioned object store with an explicit opt-in layer for
-bounded atomic application commands.
+Distributed object storage for application state.
 
-The storage kernel understands paths and opaque bytes. Every successful write
-creates an immutable version and moves one current head. It supports exact
-compare-and-swap, create-once namespaces, idempotent commands, independent bulk
-writes, content-addressed streaming uploads, and same-snapshot batch reads.
-`ListObjects` provides stateless pages of current live paths directly from the
-current-head keyspace.
+Anvil stores opaque bytes at stable paths and gives applications the
+coordination primitives they usually have to build around object storage:
+streaming uploads, exact compare-and-swap, immutable namespaces, Zanzibar
+authorization, opt-in atomic programs, and materialized search indexes. Run it
+as one process for development or as a capacity-weighted cluster with
+erasure-coded payloads.
 
-Applications that need several exact paths to change together write a bounded
-deterministic program as an immutable ordinary object below `_anvil/programs/`,
-then explicitly invoke that pinned object. The Raft-nominated executor
-serializes the invocation while exact-path coordinators prepare its writes on
-the ordinary distributed data plane. A compact Raft decision makes the already
-durable prepared bundle visible. Raft never carries object bodies, path
-inventories, locks, waiters, or program definitions.
+- **Application-shaped primitives.** Use CAS, bulk writes, same-snapshot batch
+  reads, prefix listing, watches, version retention, and bounded multi-object
+  programs from one API.
+- **One secure API on every node.** Any active node can accept a request. JWT
+  authentication and Zanzibar authorization protect object, index, and
+  administration operations.
+- **Search without operating another database.** Anvil builds immutable,
+  cluster-wide index generations and reports exactly how fresh every result is.
 
-`InvokeProgram` has one absolute execution budget covering lock acquisition,
-evaluation, commit and finalization. The startup-only maximum defaults to 30
-seconds and is configured with `ANVIL_ATOMIC_PROGRAM_TIMEOUT_SECONDS` or
-`--atomic-program-timeout-seconds`. A standard client gRPC deadline may shorten
-that budget but cannot extend it; expiry returns gRPC `DEADLINE_EXCEEDED`.
+## Capabilities
 
-## Implementation status
-
-Anvil 0.5.2 runs one flat cluster of heterogeneous nodes. Any active node can
-accept a request. Compact control state stays in Raft, exact-key ownership is
-derived with capacity-weighted rendezvous hashing, mutable logical records are
-replicated, and large payloads use systematic erasure coding. The production
-surface includes authenticated object/CAS/bulk operations, immutable and
-`PROGRAM_ONLY` policy, typed Zanzibar administration and application realms,
-explicit bootstrap and credential exchange, recoverable atomic-program
-invocation, and bounded resumable `WatchPrefix`.
-
-The 0.5.2 capability release adds cluster-wide derived indexes. Each index has
-one weighted-HRW builder and up to three weighted-HRW query replicas. Builders
-publish immutable generations through Anvil's ordinary object path, while
-query replicas materialize those files in a shared bounded memory/disk cache.
-The usable index kinds are path, object-head metadata, typed JSON, full text,
-exact vector, hybrid, Git source, and tensor. Queries return the latest
-available generation with source-checkpoint freshness evidence. PersonalDB is
-the next capability release, planned for 0.5.3. The 0.5.2 release is published
-as one AMD64/ARM64 container tag.
-
-## Deliberate 0.5 break
-
-There is no compatibility with the 0.4 transaction or MVCC API and no in-place
-upgrade from its storage format. The following concepts are gone:
-
-- `BeginTransaction`, `CommitTransaction`, and `RollbackTransaction`;
-- transaction drafts and staged public writes;
-- certification, read sets, range observations, and snapshot versions;
-- arbitrary cross-partition atomic batches;
-- payloads or product rows in Raft.
-
-Export data through the old release and import it into a new 0.5 store.
-
-## API layers
-
-| Layer | Operations | Guarantee |
+| Capability | Status | What it provides |
 | --- | --- | --- |
-| Opaque object core | `StartPut` → `Put` → `PutEnd`, `Delete`, `DeleteIfVersion` | Streamed bytes remain invisible until `PutEnd`; each publication moves one exact-path head |
-| Throughput | `BulkWrite`, `BatchGet` | Independent write outcomes; one read snapshot |
-| Discovery | `ListObjects` | Zanzibar-authorized lexical pages of current live paths |
-| Policy | create-once and `PROGRAM_ONLY` prefixes | Write-once children, or mutation admitted only through atomic programs |
-| Atomic programs | immutable object under `_anvil/programs/`, then `InvokeProgram` | One bounded deterministic state transition orchestrated by the nominated executor |
-| Invalidations | `WatchPrefix` | Bounded unordered at-least-once notice to reread current state |
-| Authorization | schemas, realms, tuples, checks and typed administration | Zanzibar evaluation at one explicit current revision |
-| Derived indexes | `CreateIndex`, `UpdateIndex`, `GetIndex`, `ListIndexes`, `DeleteIndex`, `QueryIndex` | One immutable cluster-wide generation queried by an HRW-selected replica, with explicit freshness evidence |
-| Workflows | application-owned saga | External-service coordination |
+| Object storage | Available | Streaming puts, content-addressed deduplication, CAS, bulk writes, batch reads, deletes, optional version retention, and prefix listing |
+| Authorization | Available | Credentials, application realms, Zanzibar schemas, tuples, checks, and protected administration |
+| Application invariants | Available | Immutable path prefixes, `PROGRAM_ONLY` data, and bounded deterministic atomic programs |
+| Change notification | Available | Bounded, resumable `WatchPrefix` invalidations |
+| Distributed cluster | Available | Any-node ingress, capacity-weighted rendezvous placement, cluster-managed peer mTLS, replicated metadata, and configurable erasure coding |
+| Derived indexes | Available | Path, object metadata, typed JSON, full text, vector, hybrid, Git-source, and tensor indexes |
+| Rust client | Available | Authenticated transport, streaming upload helpers, and the complete generated gRPC API |
+| Container image | Available | One `0.5.2` tag for Linux AMD64 and ARM64 |
+| PersonalDB | Next: 0.5.3 | Authorized server-built projections, snapshots, catch-up, and synchronization |
+| S3 and Git gateways | Planned | Native S3 clients and Git push/pull over the Anvil object core |
+| Network plugins | Planned | Independently deployed integrations over public and authenticated peer APIs |
 
-Uploading an MP3 through `StartPut` and streaming `Put` is an ordinary blob
-operation. It does not invoke a program, and the staged bytes remain invisible.
-Only `PutEnd` publishes the object and changes its visible exact-path head.
-Sealed uploads reserve their content-addressed bytes for 24 hours by default.
-Anvil runs one full garbage-collection pass at startup and then hourly. Set
-`ANVIL_AWAITING_PUBLISH_TTL_SECONDS` (or
-`--awaiting-publish-ttl-seconds`) to change the unpublished inactivity limit;
-the value must be non-zero. Sealing identical content refreshes its
-`updated_at` value and therefore its inactivity deadline. Published content is
-retained by its reference count. Count-zero and awaiting-publication content is
-removed only after it has also been inactive for the configured threshold, so
-a valid ready upload can still publish deduplicated bytes after an intervening
-delete.
+## Start a development node
 
-`ListObjects` uses a literal UTF-8 prefix, defaults to 100 paths per page, and
-accepts at most 1,000. Pass the last returned path back as the exclusive
-`start_after` cursor when `has_more` is true. Pages are read committed rather
-than one snapshot held across requests. The RocksDB `heads` column family uses
-`[format version][tenant ID][bucket ID][raw UTF-8 path]`, so the implementation
-seeks directly to the requested literal path prefix and stops at the end of
-that contiguous range. It maintains no duplicate listing projection or side
-index.
+The published image contains both `anvil-server` and the `anvil` CLI. From a
+clone of this repository:
 
-## Authentication
+```sh
+export ANVIL_IMAGE=ghcr.io/worka-ai/anvil:0.5.2
 
-Every protected RPC accepts a one-hour bearer token minted by
-`ExchangeClientCredentials`. The exchange request contains a long-lived
-application secret, so production deployments must put the gRPC endpoint
-behind TLS termination. Plaintext transport is suitable only for a trusted
-local development loop.
+mkdir -p .anvil
+head -c 64 /dev/urandom > .anvil/token-signing-key
+chmod 0600 .anvil/token-signing-key
 
-The server requires `--token-signing-key-file` (or
-`ANVIL_TOKEN_SIGNING_KEY_FILE`) on every start. It must name a regular,
-non-symlink file with mode `0600` containing between 32 and 4096 key bytes.
-Anvil reads but never persists or logs this operator-managed key. The static
-shared API token and unauthenticated server mode do not exist in 0.5.
-Rotating or disabling an application credential stops future exchanges;
-already-issued tokens remain valid until their one-hour expiry.
+# The image runs as UID 10001 and the server requires this key to remain 0600.
+docker run --rm --user 0 \
+  -v "$PWD/.anvil/token-signing-key:/key" \
+  "$ANVIL_IMAGE" chown 10001:10001 /key
 
-## Repository
+ANVIL_TOKEN_SIGNING_KEY_FILE="$PWD/.anvil/token-signing-key" \
+ANVIL_RUN_SYSTEM_BOOTSTRAP=true \
+docker compose -f crates/anvil/docker-compose.yml up -d
+```
 
-- `crates/anvil-store`: opaque version/head storage, blobs, CAS, policies and bulk operations.
-- `crates/anvil-atomic-program`: the one bounded JSON program interpreter.
-- `crates/anvil-consensus`: compact executor nomination and publication decisions.
-- `crates/anvil-index`: versioned index formats and query engines over Anvil's async index-file interface.
-- `crates/anvil-api`: the single generated gRPC contract shared by server and clients.
-- `crates/anvil`: server transport and integration.
-- `clients/rust`: thin authenticated Rust transport.
-- `docs/rfcs/anvil_0009_atomic_programs.md`: complete 0.5 architecture and invariants.
-- `docs/rfcs/anvil_0010_cluster_distribution.md`: the flat-cluster distribution architecture.
-- `docs/known-limitations.md`: current 0.5.x operational boundaries.
+Bootstrap creates a mode-`0600` operator credential inside the data volume.
+Use it once to create the first tenant and application credential:
 
-## Development
+```sh
+docker compose -f crates/anvil/docker-compose.yml exec \
+  -e ANVIL_NEW_CLIENT_SECRET='replace-with-at-least-32-bytes' anvil \
+  anvil --endpoint http://127.0.0.1:50051 \
+  --credentials-file /var/lib/anvil/system-bootstrap-credential.json \
+  provision-tenant example example-owner example-client
+
+docker compose -f crates/anvil/docker-compose.yml exec \
+  -e ANVIL_CLIENT_ID=example-client \
+  -e ANVIL_CLIENT_SECRET='replace-with-at-least-32-bytes' anvil \
+  anvil --endpoint http://127.0.0.1:50051 create-bucket objects
+```
+
+Copy the generated bootstrap credential to the operator's secret store, then
+delete that generated copy. The application endpoint is now available at
+`http://127.0.0.1:50051`.
+
+## Use the Rust client
+
+```sh
+cargo add anvil-storage@0.5.2
+cargo add tokio --features macros,rt-multi-thread
+```
+
+```rust,no_run
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut objects = anvil_storage::connect_with_credentials(
+        "http://127.0.0.1:50051",
+        "example-client",
+        "replace-with-at-least-32-bytes",
+    )
+    .await?;
+
+    // `objects` is an authenticated ObjectService client. Generated request
+    // types and every public service client live under `anvil_storage::v1`.
+    let _ = &mut objects;
+    Ok(())
+}
+```
+
+See the [Rust client guide](clients/rust/README.md) for object reads, streaming
+uploads, CAS, and access to the generated authorization, administration, and
+index clients.
+
+## Run a three-node cluster
+
+The local cluster qualification starts three real nodes, admits joiners with
+one-use bundles, establishes peer mTLS, exercises replicated and erasure-coded
+storage, queries every index type, and performs a rolling restart:
+
+```sh
+ANVIL_IMAGE=ghcr.io/worka-ai/anvil:0.5.2 \
+  ./scripts/qualify-three-node.sh
+```
+
+Production formation uses the same short sequence:
+
+1. Start the first node with `--run-system-bootstrap`, a stable
+   `--peer-advertise` address, durable storage, and the operator-managed JWT
+   signing key.
+2. From an authorized active node, run
+   `anvil prepare-node <node-id> <peer-address>`.
+3. Copy the generated mode-`0600` join bundle to that node and start it with
+   `anvil-server --join-bundle <path>`.
+4. Repeat for additional nodes. Configure each node's storage weight to match
+   its usable capacity; Anvil moves only ownership affected by the change.
+
+The public gRPC endpoint can sit behind an ordinary TLS terminator. Peer
+traffic uses certificates created and rotated by the cluster.
+
+## Public API
+
+Anvil publishes one versioned protobuf contract with five services:
+
+| Service | Purpose |
+| --- | --- |
+| `ObjectService` | Streaming puts, CAS, bulk and batch operations, reads, versions, listing, watches, policies, and atomic programs |
+| `IndexService` | Create, update, inspect, list, delete, and query cluster-wide indexes |
+| `AuthzService` | Zanzibar realms, schemas, relationships, bindings, and authorization checks |
+| `AdministrationService` | Protected tenant, bucket, credential, and cluster lifecycle operations |
+| `CredentialService` | Exchange long-lived application credentials for short-lived bearer tokens |
+
+The protobuf definitions are in
+[`crates/anvil-api/proto/anvil.proto`](crates/anvil-api/proto/anvil.proto).
+
+## Architecture
+
+Every successful object write creates an immutable version and moves one
+current exact-path head. Small values stay inline; large values are split into
+content-addressed erasure-coded shards. Mutable records are replicated, while
+compact cluster membership and atomic-publication decisions are agreed through
+Raft. Object bodies, path inventories, locks, and index files never enter the
+Raft log.
+
+Atomic programs are explicitly selected for the small part of an application
+that needs multi-path visibility. Ordinary uploads—including large media—stay
+on the direct object path. Index builders consume the cluster's ordered source
+journals, publish immutable index files as ordinary Anvil objects, and let up
+to three query replicas materialize them through a shared bounded cache.
+
+The architectural contracts are documented in
+[ANVIL-0009](docs/rfcs/anvil_0009_atomic_programs.md) and
+[ANVIL-0010](docs/rfcs/anvil_0010_cluster_distribution.md).
+
+## Build and test
+
+Anvil requires Rust 1.96 or newer.
 
 ```sh
 cargo fmt --all -- --check
 cargo test --workspace
 ```
 
-Before creating the `0.5.2` Git tag, qualify both release images locally. The
-architecture-specific names below remain in the local Docker daemon; they are
-never pushed to GHCR.
+Build and qualify the container locally with:
 
 ```sh
-ANVIL_DOCKER_PLATFORM=linux/amd64 \
-ANVIL_IMAGE=anvil:0.5.2-local-amd64 \
-./scripts/build-image.sh
-ANVIL_IMAGE=anvil:0.5.2-local-amd64 ./scripts/release-gates.sh image
-
-ANVIL_DOCKER_PLATFORM=linux/arm64 \
-ANVIL_IMAGE=anvil:0.5.2-local-arm64 \
-./scripts/build-image.sh
-ANVIL_IMAGE=anvil:0.5.2-local-arm64 ./scripts/release-gates.sh image
+ANVIL_IMAGE=anvil:local ./scripts/build-image.sh
+ANVIL_IMAGE=anvil:local ./scripts/release-gates.sh image
+ANVIL_IMAGE=anvil:local ./scripts/qualify-three-node.sh
 ```
 
-Each image is compiled from source inside a `rust:1.96-trixie` builder for its
-target platform and runs on `debian:trixie-slim`. Release publication rebuilds
-the same Dockerfile as one public multi-platform image. Its repository follows
-`ghcr.io/OWNER/anvil:0.5.2`, where `OWNER` is the GitHub repository owner.
-There are no public architecture-specific or `v`-prefixed image tags.
+## Operational notes
 
-## First start
+Anvil 0.5 uses a new API and storage format; migrate 0.4 data by export and
+import. The public gRPC endpoint currently relies on external TLS termination.
+See [known limitations](docs/known-limitations.md) for the current operational
+boundaries.
 
-Anvil has no insecure or static-token mode. Create an operator-managed signing
-key, keep it mode `0600`, and bootstrap the first node exactly once. Additional
-nodes join with an authorized mode-`0600` bundle created by `prepare-node`; they
-never run system bootstrap independently.
-
-```sh
-head -c 64 /dev/urandom > anvil-token-signing-key
-chmod 0600 anvil-token-signing-key
-anvil-server \
-  --data-dir ./anvil-data \
-  --token-signing-key-file ./anvil-token-signing-key \
-  --run-system-bootstrap
-```
-
-The server prints the exact generated credential path, normally
-`./anvil-data/system-bootstrap-credential.json`. Copy that mode-`0600` file to
-the operator's secret store and delete the generated copy after provisioning.
-The CLI exchanges it for a one-hour access token automatically:
-
-```sh
-ANVIL_NEW_CLIENT_SECRET='a-new-secret-containing-at-least-32-bytes' \
-anvil --credentials-file ./copied-bootstrap-credential.json \
-  provision-tenant acme acme-owner acme-owner-client
-
-ANVIL_CLIENT_ID=acme-owner-client \
-ANVIL_CLIENT_SECRET='a-new-secret-containing-at-least-32-bytes' \
-anvil create-bucket objects
-```
-
-Credential exchange carries a long-lived secret and requires TLS termination
-in production. The container runs as UID 10001; a bind-mounted signing key must
-therefore be readable by that UID while remaining mode `0600`, or be supplied
-by a secret mount that sets `uid=10001,mode=0600`.
-
-Anvil is licensed under Apache-2.0.
+Apache-2.0 licensed.
