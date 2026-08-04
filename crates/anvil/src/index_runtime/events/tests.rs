@@ -80,6 +80,7 @@ fn change(node: u16, offset: u64) -> LocalChange {
         path_version: VersionId(offset),
         kind: ObjectHeadChangeKind::Put,
         reference_deltas: Vec::<ReferenceDelta>::new(),
+        accounting_transition: None,
     })
 }
 

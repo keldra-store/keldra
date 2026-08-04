@@ -4,7 +4,7 @@ set -Eeuo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 compose_file="${repo_root}/tests/cluster/docker-compose.yml"
 start_node="${repo_root}/tests/cluster/start-node.sh"
-requested_image="${ANVIL_IMAGE:-anvil:0.5.2}"
+requested_image="${ANVIL_IMAGE:-anvil:0.5.3}"
 
 case "${ANVIL_DOCKER_PLATFORM:-}" in
   "")
@@ -32,12 +32,16 @@ command -v cargo >/dev/null 2>&1 || {
   echo "cargo is required for the test-only index qualification client" >&2
   exit 2
 }
+command -v git >/dev/null 2>&1 || {
+  echo "git is required for the smart HTTP gateway qualification" >&2
+  exit 2
+}
 docker compose version >/dev/null
 
 image_id="$("${repo_root}/scripts/resolve-docker-image-id.sh" "${requested_image}")"
 export ANVIL_IMAGE="${image_id}"
-export ANVIL_QUALIFICATION_PROJECT="${ANVIL_QUALIFICATION_PROJECT:-anvil-v052-${$}}"
-export ANVIL_QUALIFICATION_DIR="$(mktemp -d /tmp/anvil-v052-qualification.XXXXXX)"
+export ANVIL_QUALIFICATION_PROJECT="${ANVIL_QUALIFICATION_PROJECT:-anvil-v053-${$}}"
+export ANVIL_QUALIFICATION_DIR="$(mktemp -d /tmp/anvil-v053-qualification.XXXXXX)"
 export ANVIL_QUALIFICATION_START_NODE="${start_node}"
 keep="${ANVIL_QUALIFICATION_KEEP:-0}"
 
@@ -61,7 +65,7 @@ cleanup() {
     echo "[anvil-qualification] retained files ${ANVIL_QUALIFICATION_DIR}" >&2
   else
     compose down --volumes --remove-orphans >/dev/null 2>&1 || true
-    if [[ "${ANVIL_QUALIFICATION_DIR}" == /tmp/anvil-v052-qualification.* ]]; then
+    if [[ "${ANVIL_QUALIFICATION_DIR}" == /tmp/anvil-v053-qualification.* ]]; then
       docker run --rm --user 0 \
         --volume "${ANVIL_QUALIFICATION_DIR}:/qualification" \
         "${image_id}" rm -rf \
@@ -260,6 +264,50 @@ expect_failure() {
   fi
 }
 
+run_git_qualification() {
+  local tenant=qgit
+  local client_id=qgit-client
+  local client_secret=qualification-git-secret-0000000000000000000000000
+  local bucket="git-three-${$}"
+  local git_root="${ANVIL_QUALIFICATION_DIR}/git"
+  local source_repository="${git_root}/source"
+  local authenticated_clone="${git_root}/authenticated-clone"
+  local public_clone="${git_root}/public-clone"
+  local push_url="${gateway_endpoints[0]}/git/${tenant}/${bucket}/qualification.git"
+  local authenticated_clone_url="${gateway_endpoints[1]}/git/${tenant}/${bucket}/qualification.git"
+  local public_clone_url="${gateway_endpoints[2]}/git/${tenant}/${bucket}/qualification.git"
+  local authorization
+
+  provision_tenant "${tenant}" "${client_id}" "${client_secret}"
+  create_bucket anvil-1 "${client_id}" "${client_secret}" "${bucket}"
+
+  mkdir -p "${git_root}"
+  git init --quiet --initial-branch=main "${source_repository}"
+  git -C "${source_repository}" config user.name "Anvil Qualification"
+  git -C "${source_repository}" config user.email "qualification@example.invalid"
+  printf 'three-node smart HTTP gateway\n' >"${source_repository}/README.md"
+  git -C "${source_repository}" add README.md
+  git -C "${source_repository}" commit --quiet -m initial
+
+  authorization="$(
+    printf '%s:%s' "${client_id}" "${client_secret}" | base64 | tr -d '\n'
+  )"
+  git -C "${source_repository}" \
+    -c "http.extraHeader=Authorization: Basic ${authorization}" \
+    push --quiet "${push_url}" main
+  git -c "http.extraHeader=Authorization: Basic ${authorization}" \
+    clone --quiet --branch main "${authenticated_clone_url}" \
+      "${authenticated_clone}"
+  cmp "${source_repository}/README.md" "${authenticated_clone}/README.md"
+
+  run_cli anvil-3 "${client_id}" "${client_secret}" \
+    set-bucket-public-read "${bucket}" enabled >/dev/null
+  git clone --quiet --branch main "${public_clone_url}" "${public_clone}"
+  cmp "${source_repository}/README.md" "${public_clone}/README.md"
+
+  echo "[anvil-qualification] cross-node Git push, authenticated clone, and public clone passed"
+}
+
 wait_for_bootstrap
 provision_tenant qprobe qprobe-client \
   qualification-probe-secret-000000000000000000000000
@@ -272,16 +320,16 @@ echo "[anvil-qualification] three-node cluster is ACTIVE"
 
 index_secret=qualification-index-secret-00000000000000000000000
 provision_tenant qindex qindex-client "${index_secret}"
-index_endpoints=()
+public_endpoints=()
 for index_node in anvil-1 anvil-2 anvil-3; do
   published="$(compose port "${index_node}" 50051)"
   if [[ ! "${published}" =~ ^127\.0\.0\.1:([1-9][0-9]*)$ ]]; then
     echo "${index_node} returned an invalid loopback public endpoint: ${published}" >&2
     exit 1
   fi
-  index_endpoints+=("http://${published}")
+  public_endpoints+=("http://${published}")
 done
-ANVIL_INDEX_QUALIFICATION_ENDPOINTS="$(IFS=,; echo "${index_endpoints[*]}")" \
+ANVIL_INDEX_QUALIFICATION_ENDPOINTS="$(IFS=,; echo "${public_endpoints[*]}")" \
 ANVIL_INDEX_QUALIFICATION_TENANT=qindex \
 ANVIL_INDEX_QUALIFICATION_CLIENT_ID=qindex-client \
 ANVIL_INDEX_QUALIFICATION_CLIENT_SECRET="${index_secret}" \
@@ -289,6 +337,50 @@ ANVIL_INDEX_QUALIFICATION_CLIENT_SECRET="${index_secret}" \
     --manifest-path "${repo_root}/Cargo.toml" \
     --example cluster_index_qualification
 echo "[anvil-qualification] distributed index qualification passed"
+
+accounting_secret=qualification-accounting-secret-000000000000000000000
+provision_tenant qaccounting qaccounting-client "${accounting_secret}"
+ANVIL_ACCOUNTING_QUALIFICATION_ENDPOINTS="$(IFS=,; echo "${public_endpoints[*]}")" \
+ANVIL_ACCOUNTING_QUALIFICATION_TENANT=qaccounting \
+ANVIL_ACCOUNTING_QUALIFICATION_BUCKET="accounting-three-${$}" \
+ANVIL_ACCOUNTING_QUALIFICATION_CLIENT_ID=qaccounting-client \
+ANVIL_ACCOUNTING_QUALIFICATION_CLIENT_SECRET="${accounting_secret}" \
+  cargo run --quiet --locked --package anvil-server \
+    --manifest-path "${repo_root}/Cargo.toml" \
+    --example accounting_qualification
+echo "[anvil-qualification] distributed accounting qualification passed"
+
+personaldb_secret=qualification-personaldb-secret-0000000000000000000
+provision_tenant qpersonaldb qpersonaldb-client "${personaldb_secret}"
+ANVIL_PERSONALDB_QUALIFICATION_ENDPOINTS="$(IFS=,; echo "${public_endpoints[*]}")" \
+ANVIL_PERSONALDB_QUALIFICATION_TENANT=qpersonaldb \
+ANVIL_PERSONALDB_QUALIFICATION_CLIENT_ID=qpersonaldb-client \
+ANVIL_PERSONALDB_QUALIFICATION_CLIENT_SECRET="${personaldb_secret}" \
+  cargo run --quiet --locked --package anvil-server \
+    --manifest-path "${repo_root}/Cargo.toml" \
+    --example personaldb_qualification
+echo "[anvil-qualification] distributed PersonalDB qualification passed"
+
+s3_secret=qualification-s3-secret-00000000000000000000000000
+provision_tenant qs3 qs3-client "${s3_secret}"
+gateway_endpoints=()
+for s3_node in anvil-1 anvil-2 anvil-3; do
+  published="$(compose port "${s3_node}" 50053)"
+  if [[ ! "${published}" =~ ^127\.0\.0\.1:([1-9][0-9]*)$ ]]; then
+    echo "${s3_node} returned an invalid loopback gateway endpoint: ${published}" >&2
+    exit 1
+  fi
+  gateway_endpoints+=("http://${published}")
+done
+ANVIL_S3_QUALIFICATION_ENDPOINTS="$(IFS=,; echo "${gateway_endpoints[*]}")" \
+ANVIL_S3_QUALIFICATION_CLIENT_ID=qs3-client \
+ANVIL_S3_QUALIFICATION_CLIENT_SECRET="${s3_secret}" \
+ANVIL_S3_QUALIFICATION_BUCKET="s3-three-${$}" \
+  cargo run --quiet --locked --package anvil-server \
+    --manifest-path "${repo_root}/Cargo.toml" \
+    --example s3_qualification
+echo "[anvil-qualification] distributed official AWS SDK S3 qualification passed"
+run_git_qualification
 
 cas_secret=qualification-cas-secret-000000000000000000000000
 provision_tenant qcas qcas-client "${cas_secret}"

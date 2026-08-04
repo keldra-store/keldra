@@ -116,7 +116,7 @@ struct Args {
     #[arg(long, default_value_t = DEFAULT_SOURCE_CADENCE_HOURS)]
     source_cadence_hours: u16,
 
-    /// The 0.5.2 qualification currently uses local acknowledgement.
+    /// The 0.5.3 qualification currently uses local acknowledgement.
     #[arg(long, value_enum, default_value = "local")]
     durability: DurabilityArgument,
 
@@ -809,7 +809,7 @@ async fn main() -> Result<()> {
         },
         limitations: vec![
             "The authoritative qualification shape is one source definition, immutable compressed content-addressed shards, and one immutable manifest; it deliberately does not create a raw object and mutable head for every upstream JSON document.",
-            "Shard attributes are carried by the authoritative manifest. Anvil 0.5.2 receives no per-object user metadata and this tool creates no metadata sidecar.",
+            "Shard attributes are carried by the authoritative manifest. Anvil 0.5.3 receives no per-object user metadata and this tool creates no metadata sidecar.",
             "The required --snapshot-day and pinned archive hash determine the snapshot identity; the local clock never participates.",
             "This qualification uses local acknowledgement. Repeated --write-endpoint values stripe independent data batches across nodes, while setup, manifest publication, and verification stay on the primary --endpoint.",
             "Independent verification checks each current version, content length, content type, and BLAKE3 payload digest through HeadObject without downloading the payload again.",

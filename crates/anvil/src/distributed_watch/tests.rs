@@ -118,6 +118,7 @@ impl MemorySources {
                 path_version: VersionId(100 + offset),
                 kind,
                 reference_deltas: Vec::new(),
+                accounting_transition: None,
             }));
     }
 
@@ -532,6 +533,7 @@ fn public_filter_keeps_only_matching_object_heads() {
             path_version: VersionId(1),
             kind: ObjectHeadChangeKind::Put,
             reference_deltas: Vec::new(),
+            accounting_transition: None,
         }),
         LocalChange::RetainedVersionDeleted(RetainedVersionDeletedChange {
             offset: 2,
@@ -541,6 +543,7 @@ fn public_filter_keeps_only_matching_object_heads() {
             deleted_version: VersionId(1),
             resulting_head_version: Some(VersionId(2)),
             reference_deltas: Vec::new(),
+            accounting_transition: None,
         }),
         LocalChange::ObjectHead(ObjectHeadChange {
             offset: 3,
@@ -550,6 +553,7 @@ fn public_filter_keeps_only_matching_object_heads() {
             path_version: VersionId(3),
             kind: ObjectHeadChangeKind::Put,
             reference_deltas: Vec::new(),
+            accounting_transition: None,
         }),
         LocalChange::ObjectHead(ObjectHeadChange {
             offset: 4,
@@ -559,6 +563,7 @@ fn public_filter_keeps_only_matching_object_heads() {
             path_version: VersionId(4),
             kind: ObjectHeadChangeKind::Put,
             reference_deltas: Vec::new(),
+            accounting_transition: None,
         }),
     ];
 
@@ -625,6 +630,7 @@ async fn malformed_filtered_page_fails_closed() {
                     path_version: VersionId(1),
                     kind: ObjectHeadChangeKind::Put,
                     reference_deltas: Vec::new(),
+                    accounting_transition: None,
                 }],
             })
         }

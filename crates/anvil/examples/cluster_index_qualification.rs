@@ -1,4 +1,4 @@
-//! Test-only client for the three-node Docker qualification harness.
+//! Public-API index qualification for one- and three-node Docker harnesses.
 
 use std::collections::BTreeSet;
 use std::env;
@@ -52,8 +52,10 @@ async fn main() -> TestResult<()> {
         .split(',')
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    if endpoints.len() != 3 {
-        return Err(invalid("qualification requires exactly three endpoints"));
+    if !matches!(endpoints.len(), 1 | 3) {
+        return Err(invalid(
+            "index qualification requires either one or three endpoints",
+        ));
     }
     let tenant = required("ANVIL_INDEX_QUALIFICATION_TENANT")?;
     let client_id = required("ANVIL_INDEX_QUALIFICATION_CLIENT_ID")?;
@@ -84,9 +86,10 @@ async fn main() -> TestResult<()> {
 
     let cases = engine_cases();
     let mut definitions = Vec::new();
+    let endpoint_count = endpoints.len();
     for (position, case) in cases.iter().enumerate() {
-        create_bucket(&mut administrators[position % 3], case.bucket).await?;
-        let definition = indexes[position % 3]
+        create_bucket(&mut administrators[position % endpoint_count], case.bucket).await?;
+        let definition = indexes[position % endpoint_count]
             .create_index(CreateIndexRequest {
                 bucket: case.bucket.into(),
                 name: case.name.into(),
@@ -115,6 +118,7 @@ async fn main() -> TestResult<()> {
             0,
             &expected_paths,
             false,
+            endpoints.len(),
         )
         .await?;
         baseline.push(require_freshness(&responses[0])?.clone());
@@ -149,17 +153,19 @@ async fn main() -> TestResult<()> {
             case.documents.len() as u64,
             &expected,
             case.expects_scores,
+            endpoints.len(),
         )
         .await?;
         require_checkpoint_advance(
             before,
             require_freshness(&responses[0])?,
-            case.min_advanced_sources,
+            case.min_advanced_sources.min(endpoints.len()),
         )?;
     }
 
     println!(
-        "three-node index qualification passed: {} engines, {} writes",
+        "index qualification passed on {} node(s): {} engines, {} writes",
+        endpoints.len(),
         cases.len(),
         write_number
     );
@@ -231,6 +237,7 @@ async fn wait_for_queries(
     indexed_objects: u64,
     expected_paths: &BTreeSet<&str>,
     expects_scores: bool,
+    expected_sources: usize,
 ) -> TestResult<Vec<QueryIndexResponse>> {
     let deadline = Instant::now() + WAIT_LIMIT;
     let mut last = String::new();
@@ -257,6 +264,7 @@ async fn wait_for_queries(
                     indexed_objects,
                     expected_paths,
                     expects_scores,
+                    expected_sources,
                 )
             })
             && routed_responses_agree(&responses)
@@ -319,6 +327,7 @@ fn response_matches(
     indexed_objects: u64,
     expected_paths: &BTreeSet<&str>,
     expects_scores: bool,
+    expected_sources: usize,
 ) -> bool {
     let Some(freshness) = response.freshness.as_ref() else {
         return false;
@@ -331,18 +340,21 @@ fn response_matches(
         || freshness.definition_version != definition_version
         || freshness.placement_term == 0
         || freshness.placement_index == 0
-        || freshness.sources.len() != 3
+        || freshness.sources.len() != expected_sources
         || freshness.authorization_revision == 0
     {
         return false;
     }
-    if freshness
+    let source_ids = freshness
         .sources
         .iter()
-        .enumerate()
-        .any(|(position, source)| {
-            source.node_id != (position + 1) as u64 || source.source_epoch.len() != 32
-        })
+        .map(|source| source.node_id)
+        .collect::<BTreeSet<_>>();
+    if source_ids.len() != expected_sources
+        || freshness
+            .sources
+            .iter()
+            .any(|source| source.node_id == 0 || source.source_epoch.len() != 32)
     {
         return false;
     }

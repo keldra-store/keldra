@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 
 use anvil::authentication::{JwtManager, RateLimitConfig};
 use anvil::{ServerConfig, serve};
+use anvil_api::v1::accounting_service_client::AccountingServiceClient;
 use anvil_api::v1::administration_service_client::AdministrationServiceClient;
 use anvil_api::v1::batch_get_outcome::Outcome as BatchOutcomeValue;
 use anvil_api::v1::bulk_operation::Operation as BulkOperationValue;
@@ -16,13 +17,14 @@ use anvil_api::v1::watch_message::Message as WatchMessageValue;
 use anvil_api::v1::watch_prefix_request::Start as WatchStart;
 use anvil_api::v1::{
     BatchGetRequest, BucketPolicy, BulkOperation, BulkPutRequest, BulkWriteRequest,
-    CreateIndexRequest, DeleteIfVersionRequest, DeleteRequest, DeleteVersionRequest, Durability,
+    CreateIndexRequest, DeleteIfVersionRequest, DeleteRequest, DeleteVersionRequest,
+    DisableAccountingRequest, Durability, EnableAccountingRequest, GetAccountingRequest,
     GetObjectRequest, HeadObjectRequest, IndexSpecification, InvokeProgramRequest,
     ListObjectVersionsRequest, ListObjectsRequest, MutationFailureCode, ObjectAddress,
     ObjectVersioning as ApiObjectVersioning, PathIndexSpec, PutHeader, PutIfAbsentOperation,
     PutIfVersionOperation, PutImmutableOperation, PutOperation, PutRequest, PutToken,
-    SetBucketPolicyRequest, SetBucketVersioningRequest, WatchNow, WatchPrefixRequest,
-    WatchStateHint,
+    ReadFailureCode, SetBucketPolicyRequest, SetBucketVersioningRequest, WatchNow,
+    WatchPrefixRequest, WatchStateHint,
 };
 use anvil_authz::ObjectRef;
 use anvil_store::{
@@ -37,7 +39,7 @@ const SIGNING_KEY: &[u8] = b"anvil-public-object-surface-test-key";
 const OWNER_SECRET: &str = "owner-secret-0123456789abcdef0123456789abcdef";
 
 #[tokio::test]
-async fn every_object_rpc_rejects_an_unauthenticated_request() {
+async fn object_rpc_authentication_distinguishes_anonymous_reads_from_protected_operations() {
     let fixture = Fixture::start().await;
     let mut client = ObjectServiceClient::new(fixture.channel.clone());
 
@@ -55,16 +57,7 @@ async fn every_object_rpc_rejects_an_unauthenticated_request() {
             .await,
     );
     assert_unauthenticated(client.delete_version(DeleteVersionRequest::default()).await);
-    assert_unauthenticated(client.head_object(HeadObjectRequest::default()).await);
-    assert_unauthenticated(client.list_objects(ListObjectsRequest::default()).await);
-    assert_unauthenticated(client.get_object(GetObjectRequest::default()).await);
-    assert_unauthenticated(
-        client
-            .list_object_versions(ListObjectVersionsRequest::default())
-            .await,
-    );
     assert_unauthenticated(client.bulk_write(BulkWriteRequest::default()).await);
-    assert_unauthenticated(client.batch_get(BatchGetRequest::default()).await);
     assert_unauthenticated(client.watch_prefix(WatchPrefixRequest::default()).await);
     assert_unauthenticated(
         client
@@ -72,6 +65,155 @@ async fn every_object_rpc_rejects_an_unauthenticated_request() {
             .await,
     );
     assert_unauthenticated(client.invoke_program(InvokeProgramRequest::default()).await);
+
+    let private_object = address("private/read.txt");
+    assert_permission_denied(
+        client
+            .head_object(HeadObjectRequest {
+                address: Some(private_object.clone()),
+            })
+            .await,
+    );
+    assert_permission_denied(
+        client
+            .list_objects(ListObjectsRequest {
+                tenant: "acme".into(),
+                bucket: "objects".into(),
+                prefix: "private/".into(),
+                start_after: None,
+                limit: 100,
+            })
+            .await,
+    );
+    assert_permission_denied(
+        client
+            .get_object(GetObjectRequest {
+                address: Some(private_object.clone()),
+                version: None,
+            })
+            .await,
+    );
+    assert_permission_denied(
+        client
+            .list_object_versions(ListObjectVersionsRequest {
+                address: Some(private_object.clone()),
+            })
+            .await,
+    );
+
+    let batch = client
+        .batch_get(BatchGetRequest {
+            objects: vec![GetObjectRequest {
+                address: Some(private_object.clone()),
+                version: None,
+            }],
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(matches!(
+        batch.outcomes.as_slice(),
+        [outcome]
+            if matches!(
+                &outcome.outcome,
+                Some(BatchOutcomeValue::Failure(failure))
+                    if failure.code == ReadFailureCode::AuthorizationDenied as i32
+            )
+    ));
+
+    let mut invalid_bearer = Request::new(HeadObjectRequest {
+        address: Some(private_object),
+    });
+    invalid_bearer
+        .metadata_mut()
+        .insert("authorization", "Bearer not-a-valid-jwt".parse().unwrap());
+    assert_unauthenticated(client.head_object(invalid_bearer).await);
+
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn public_accounting_lifecycle_materializes_scalar_usage() {
+    let fixture = Fixture::start().await;
+    let token = fixture.access_token.as_str();
+    let mut accounting = AccountingServiceClient::new(fixture.channel.clone());
+    let mut objects = ObjectServiceClient::new(fixture.channel.clone());
+
+    let definition = accounting
+        .enable_accounting(authorized(
+            EnableAccountingRequest {
+                bucket: "objects".into(),
+                path_prefix: "billable".into(),
+                command_id: "accounting-enable-billable".into(),
+            },
+            token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_ne!(definition.accounting_id, 0);
+    assert_ne!(definition.version, 0);
+
+    // Definition discovery is deliberately asynchronous. Once discovered,
+    // the public traffic meter and scalar worker consume the same definition.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let payload = b"billable payload";
+    put_object(
+        &mut objects,
+        token,
+        address("billable/one.bin"),
+        payload,
+        "accounting-billable-put",
+        PutOperationValue::Put(PutOperation {}),
+    )
+    .await
+    .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let snapshot = accounting
+            .get_accounting(authorized(
+                GetAccountingRequest {
+                    bucket: "objects".into(),
+                    path_prefix: "billable".into(),
+                },
+                token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        if snapshot.object_count == 1
+            && snapshot.logical_stored_bytes == payload.len() as u64
+            && snapshot.accepted_inbound_bytes >= payload.len() as u64
+            && snapshot
+                .freshness
+                .as_ref()
+                .is_some_and(|value| value.complete)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "accounting rollup did not converge"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let disabled = accounting
+        .disable_accounting(authorized(
+            DisableAccountingRequest {
+                bucket: "objects".into(),
+                path_prefix: "billable".into(),
+                expected_version: definition.version,
+                command_id: "accounting-disable-billable".into(),
+            },
+            token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(disabled.disabled);
+    assert_ne!(disabled.tombstone_version, 0);
 
     fixture.stop().await;
 }
@@ -955,6 +1097,7 @@ fn test_server_config(
     ServerConfig {
         listen,
         peer_listen,
+        gateway_listen: None,
         peer_advertise: None,
         join_bundle: None,
         data_dir: directory.path().to_owned(),

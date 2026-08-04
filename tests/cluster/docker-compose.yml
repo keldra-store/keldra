@@ -1,8 +1,9 @@
-name: ${ANVIL_QUALIFICATION_PROJECT:-anvil-v052-qualification}
+name: ${ANVIL_QUALIFICATION_PROJECT:-anvil-v053-qualification}
 
 x-anvil-environment: &anvil-environment
   RUST_LOG: ${RUST_LOG:-info}
   ANVIL_LISTEN: 0.0.0.0:50051
+  ANVIL_GATEWAY_LISTEN: 0.0.0.0:50053
   ANVIL_PEER_LISTEN: 0.0.0.0:50052
   ANVIL_TOKEN_SIGNING_KEY_FILE: /run/secrets/anvil-token-signing-key
   ANVIL_ERASURE_DATA_SHARDS: "2"
@@ -17,6 +18,7 @@ x-anvil-service: &anvil-service
   # every public ingress without exposing a fixed host port.
   ports:
     - "127.0.0.1::50051"
+    - "127.0.0.1::50053"
 
 services:
   anvil-1:
