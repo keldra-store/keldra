@@ -74,8 +74,11 @@ async fn real_git_client_pushes_pulls_and_clones_a_public_repository() {
         b"hello from Anvil Git\n"
     );
 
-    fixture.enable_public_read().await;
     let public = format!("http://{}/git/acme/repositories/demo.git", fixture.gateway);
+    let denied_clone = work.path().join("denied-clone");
+    git_fails(["clone", "--branch", "master", &public, path(&denied_clone)]).await;
+
+    fixture.enable_public_read().await;
     let public_clone = work.path().join("public-clone");
     git_ok(["clone", "--branch", "master", &public, path(&public_clone)]).await;
     assert_eq!(
@@ -336,6 +339,22 @@ async fn git_ok<const N: usize>(arguments: [&str; N]) -> Output {
     assert!(
         output.status.success(),
         "git failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+async fn git_fails<const N: usize>(arguments: [&str; N]) -> Output {
+    let output = tokio::process::Command::new("git")
+        .args(arguments)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "private Git operation unexpectedly succeeded:\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );

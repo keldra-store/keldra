@@ -230,6 +230,7 @@ run_git_qualification() {
   local git_root="${qualification_dir}/git"
   local source_repository="${git_root}/source"
   local authenticated_clone="${git_root}/authenticated-clone"
+  local denied_clone="${git_root}/denied-clone"
   local public_clone="${git_root}/public-clone"
   local git_url="${gateway_endpoint}/git/${tenant}/${bucket}/qualification.git"
   local authorization
@@ -258,6 +259,12 @@ run_git_qualification() {
   git -c "http.extraHeader=Authorization: Basic ${authorization}" \
     clone --quiet --branch main "${git_url}" "${authenticated_clone}"
   cmp "${source_repository}/README.md" "${authenticated_clone}/README.md"
+
+  if GIT_TERMINAL_PROMPT=0 git clone --quiet --branch main \
+    "${git_url}" "${denied_clone}" >/dev/null 2>&1; then
+    echo "private Git repository allowed an anonymous clone" >&2
+    return 1
+  fi
 
   docker exec \
     --env "ANVIL_CLIENT_ID=${owner_client}" \

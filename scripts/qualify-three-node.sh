@@ -272,6 +272,7 @@ run_git_qualification() {
   local git_root="${ANVIL_QUALIFICATION_DIR}/git"
   local source_repository="${git_root}/source"
   local authenticated_clone="${git_root}/authenticated-clone"
+  local denied_clone="${git_root}/denied-clone"
   local public_clone="${git_root}/public-clone"
   local push_url="${gateway_endpoints[0]}/git/${tenant}/${bucket}/qualification.git"
   local authenticated_clone_url="${gateway_endpoints[1]}/git/${tenant}/${bucket}/qualification.git"
@@ -299,6 +300,12 @@ run_git_qualification() {
     clone --quiet --branch main "${authenticated_clone_url}" \
       "${authenticated_clone}"
   cmp "${source_repository}/README.md" "${authenticated_clone}/README.md"
+
+  if GIT_TERMINAL_PROMPT=0 git clone --quiet --branch main \
+    "${public_clone_url}" "${denied_clone}" >/dev/null 2>&1; then
+    echo "private Git repository allowed an anonymous clone" >&2
+    return 1
+  fi
 
   run_cli anvil-3 "${client_id}" "${client_secret}" \
     set-bucket-public-read "${bucket}" enabled >/dev/null
