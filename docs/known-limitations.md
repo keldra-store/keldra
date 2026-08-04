@@ -1,5 +1,30 @@
 # Anvil 0.5.x known limitations
 
+## Usage accounting in 0.5.3
+
+Accounting transfer totals describe payload bytes accepted for upload and
+selected for download; they are not wire-exact cancellation counters. A native
+`GetObject` records the selected object's declared payload length before the
+response stream is fully consumed, so a client that disconnects early can be
+charged for bytes it did not receive. The S3 gateway records inbound bytes only
+after a successful `PutEnd`. Failed, disconnected, and replayed requests can
+therefore differ from socket-level traffic. Applications should use these
+figures for product usage bands rather than network-forensics reconciliation.
+
+Each node buffers transfer deltas briefly before writing its cumulative source
+object. A process failure in that interval can undercount traffic. Enabling an
+accounting prefix is discovered asynchronously on other nodes, so traffic sent
+there immediately after `EnableAccounting` can also precede the local meter.
+The returned freshness structure describes object-journal coverage; it does
+not claim wire-exact transfer capture.
+
+An accounting worker uses a bounded-memory current-head scan only for its
+initial baseline or after retained journal evidence is unavailable. The 0.5.3
+scan is paged rather than one cluster-wide snapshot. Sustained writes racing a
+cold multi-page baseline can therefore require a later operator restart during
+a quiet interval to establish an exact base. The steady-state path is ordered,
+incremental, and does not retain one in-memory entry per object.
+
 ## Request deadline coverage in 0.5.2
 
 Index unary requests use one absolute deadline: the shorter of the client
@@ -17,10 +42,34 @@ back to a one-candidate scan so a continuation never exposes an unauthorized
 position. A large, heavily filtered cold query can therefore exhaust the
 30-second request budget; the transport timeout is safely retryable.
 
-## PersonalDB availability
+## Minimum PersonalDB surface in 0.5.3
 
-PersonalDB is not part of the 0.5.2 index capability release. Its public
-protocol integration is staged for 0.5.3.
+PersonalDB 0.5.3 provides source, standalone and bounded mirror-projection
+groups; predecessor-linked append and catch-up; explicit projection
+materialisation; snapshots; signed protocol evidence; and tenant-scoped group
+roles. Projection materialisation supports only the deterministic mirror mode
+in this release. More specialised application projections remain future
+capabilities.
+
+Client proposal, voter acknowledgement and admission evidence is retained in
+each witnessed commit certificate, but 0.5.3 only checks that those opaque
+values are present. It does not yet evaluate an application-specific voter or
+admission trust policy before witnessing the commit.
+
+A group mutation writes its immutable payload and certificate objects before
+publishing the new committed head with CAS. If ACTIVE cluster membership were
+changed between those steps, a retry on the newly selected group primary could
+produce different placement evidence for the same log position and find the
+old immutable preparation. Public online membership transitions remain
+unavailable in this release; operators must not inject internal membership
+commands while PersonalDB mutations are in flight.
+
+`ListPersonalDbGroups` applies per-group Zanzibar authorization while scanning
+ordinary manifest objects. It keeps scanning internally until the requested
+authorized page is full or the source is exhausted, and continuation metadata
+is derived only from an authorized result. A bucket containing many groups
+that the caller cannot see can therefore require substantial scan and
+authorization work before the call returns.
 
 ## Minimum index engines in 0.5.2
 
@@ -206,6 +255,64 @@ Anvil 0.5.0 accepts the bounded `content_type` header but does not accept
 arbitrary caller-defined metadata on an object version. Applications that need
 descriptive or index input fields must currently carry them in their payload or
 in an application-owned manifest.
+
+## S3 gateway surface in 0.5.3
+
+The optional S3-compatible HTTP listener implements path-style CreateBucket,
+HeadBucket, PutObject, GetObject, HeadObject, DeleteObject and ListObjectsV2.
+It does not yet implement ListBuckets, DeleteBucket, multipart upload, copy,
+delimiter/common-prefix grouping, presigned query authentication, virtual-host
+bucket routing, object tags, ACLs, lifecycle configuration or website APIs.
+Applications needing those operations must use Anvil's native API or wait for
+a later gateway capability.
+
+Authenticated requests derive the tenant from the client credential, so an
+S3 client uses ordinary `/bucket/key` path-style requests. An unsigned public
+read has no credential from which to derive a tenant and therefore uses
+`/tenant/bucket/key`; public ListObjectsV2 similarly uses `/tenant/bucket`.
+
+SigV4 verification needs plaintext-equivalent signing material, whereas
+pre-0.5.3 Anvil credentials intentionally retained only an Argon2id verifier.
+New and rotated credentials contain an AES-256-GCM envelope in their existing
+replicated credential record. Its key is domain-separated from the cluster JWT
+signing material and its associated data binds tenant, application and client
+identity. Existing credentials continue to work unchanged with gRPC but must
+be rotated once before S3 use. Anvil never stores this material in a separate
+column family or side plane.
+
+PutObject accepts a signed SHA-256 payload or the fully chained
+`STREAMING-AWS4-HMAC-SHA256-PAYLOAD` aws-chunked form and verifies the decoded
+bytes before publication. Other aws-chunked trailer/checksum variants are
+reported as unsupported rather than accepting unbound payload bytes.
+
+## Git smart HTTP gateway in 0.5.3
+
+The shared HTTP listener supports Git smart HTTP push and pull at
+`/git/{tenant}/{bucket}/{repository}.git`. Basic authentication exchanges the
+application client ID and secret through Anvil's normal credential path;
+Bearer authentication accepts a normal Anvil access token. Pulls may omit
+credentials only when current Zanzibar policy permits anonymous reads for the
+bucket. Every push is Zanzibar-authorized and publishes one authoritative Git
+bundle as an ordinary object below the protected `_anvil/git` namespace using
+`PutIfAbsent` or `PutIfVersion`.
+
+Anvil 0.5.3 deliberately uses `git-http-backend` and a disposable node-local
+bare-repository cache. Each request rematerializes the repository from the
+authoritative bundle, and each successful push rewrites the complete bundle.
+The first implementation serializes Git CGI requests per node. Request bodies,
+CGI responses and the bundle being published are buffered in memory and are
+bounded by the configured object maximum where Anvil controls the input; Git's
+CGI response itself does not yet have an independent streaming limit. These
+costs make this surface suitable for ordinary small-repository workflows,
+not yet for very large repositories or high-concurrency Git hosting.
+
+Concurrent pushes on different gateway nodes are protected by the bundle
+object CAS, so one cannot silently overwrite the other. The losing client gets
+an HTTP conflict after its local receive-pack completes and must fetch then
+retry; 0.5.3 does not translate that late CAS conflict into a polished Git
+receive-pack status. Git gateway transfer bytes are not yet included in path
+accounting, and internal derived bundle writes are intentionally not billed as
+client object ingress.
 
 ## Atomic preparation and the blob inactivity clock
 

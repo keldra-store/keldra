@@ -3,8 +3,7 @@
 The official Rust client is published as
 [`anvil-storage`](https://crates.io/crates/anvil-storage). It provides
 authenticated access to Anvil's object, authorization, administration, bulk,
-watch, atomic-program, and cluster-wide index APIs. PersonalDB support follows
-in the 0.5.3 capability release.
+watch, atomic-program, cluster-wide index, accounting, and PersonalDB APIs.
 
 See the [Rust client quickstart](rust/README.md) for a copy-and-paste example.
 
