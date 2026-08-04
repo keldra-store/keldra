@@ -285,6 +285,151 @@ canonical `personaldb-protocol` frames, while `MaterializeProjection` derives
 projection output server-side. The complete public workflow is executable in
 [`crates/anvil/examples/personaldb_qualification.rs`](crates/anvil/examples/personaldb_qualification.rs).
 
+## Track billable usage
+
+Accounting is opt-in for a whole bucket or one path prefix. Anvil maintains the
+aggregate asynchronously and authorizes both configuration and reads through
+Zanzibar. Each snapshot reports current object count and logical stored bytes,
+cumulative accepted inbound and served outbound bytes, and a source checkpoint
+so billing code can judge freshness.
+
+Use an empty `path_prefix` for the whole bucket, or a canonical prefix such as
+`customers/acme` for one application's billing boundary:
+
+```rust,no_run
+use anvil_storage::{BearerToken, connect_channel, exchange_client_credentials};
+use anvil_storage::v1::accounting_service_client::AccountingServiceClient;
+use anvil_storage::v1::{EnableAccountingRequest, GetAccountingRequest};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let channel = connect_channel("http://127.0.0.1:50051").await?;
+    let token = exchange_client_credentials(
+        channel.clone(),
+        "example-client",
+        std::env::var("ANVIL_OWNER_SECRET")?,
+    )
+    .await?;
+    let mut accounting = AccountingServiceClient::with_interceptor(
+        channel,
+        BearerToken::new(&token.access_token)?,
+    );
+
+    accounting
+        .enable_accounting(EnableAccountingRequest {
+            bucket: "objects".into(),
+            path_prefix: "customers/acme".into(),
+            command_id: "enable-acme-accounting".into(),
+        })
+        .await?;
+
+    // Query after application traffic; freshness identifies the exact source
+    // journal checkpoints included by the asynchronous aggregate.
+    let usage = accounting
+        .get_accounting(GetAccountingRequest {
+            bucket: "objects".into(),
+            path_prefix: "customers/acme".into(),
+        })
+        .await?
+        .into_inner();
+    println!(
+        "{} objects, {} stored bytes, {} bytes in, {} bytes out; freshness={:?}",
+        usage.object_count,
+        usage.logical_stored_bytes,
+        usage.accepted_inbound_bytes,
+        usage.served_outbound_bytes,
+        usage.freshness,
+    );
+    Ok(())
+}
+```
+
+The complete enable, traffic, convergence, and disable flow is executable in
+[`crates/anvil/examples/accounting_qualification.rs`](crates/anvil/examples/accounting_qualification.rs).
+
+## Use the S3 endpoint
+
+The HTTP gateway on port `50053` accepts standard SigV4 path-style requests.
+Use an Anvil application `client_id` as the AWS access-key ID and its
+`client_secret` as the AWS secret-access key; Zanzibar still decides what that
+application may do.
+
+With the AWS CLI installed, the owner application created above can exercise
+the minimum S3 surface directly:
+
+```sh
+export AWS_ACCESS_KEY_ID=example-client
+export AWS_SECRET_ACCESS_KEY="$ANVIL_OWNER_SECRET"
+export AWS_DEFAULT_REGION=eu-west-2
+export ANVIL_S3_ENDPOINT=http://127.0.0.1:50053
+
+aws --endpoint-url "$ANVIL_S3_ENDPOINT" s3api create-bucket \
+  --bucket s3-demo
+printf 'hello through S3\n' > anvil-data/s3-hello.txt
+aws --endpoint-url "$ANVIL_S3_ENDPOINT" s3api put-object \
+  --bucket s3-demo --key greetings/hello.txt \
+  --content-type text/plain --body anvil-data/s3-hello.txt
+aws --endpoint-url "$ANVIL_S3_ENDPOINT" s3api head-object \
+  --bucket s3-demo --key greetings/hello.txt
+aws --endpoint-url "$ANVIL_S3_ENDPOINT" s3api get-object \
+  --bucket s3-demo --key greetings/hello.txt anvil-data/s3-downloaded.txt
+cmp anvil-data/s3-hello.txt anvil-data/s3-downloaded.txt
+aws --endpoint-url "$ANVIL_S3_ENDPOINT" s3api list-objects-v2 \
+  --bucket s3-demo --prefix greetings/
+aws --endpoint-url "$ANVIL_S3_ENDPOINT" s3api delete-object \
+  --bucket s3-demo --key greetings/hello.txt
+```
+
+The same endpoint works with the official AWS SDKs. The Rust SDK qualification
+uses one or three public gateways and verifies every returned byte in
+[`crates/anvil/examples/s3_qualification.rs`](crates/anvil/examples/s3_qualification.rs).
+
+## Push and clone Git repositories
+
+Anvil serves Git's smart HTTP protocol at
+`/git/<tenant>/<bucket>/<repository>.git` on the same port `50053` gateway.
+The first authenticated push creates the repository; subsequent pushes use CAS
+when publishing its ordinary Anvil bundle object. Basic authentication accepts
+the same application client ID and secret used by the gRPC and S3 APIs.
+
+```sh
+mkdir -p anvil-data/git-demo
+git -C anvil-data/git-demo init --initial-branch=main
+git -C anvil-data/git-demo config user.name "Anvil Example"
+git -C anvil-data/git-demo config user.email "anvil@example.invalid"
+printf '# Stored in Anvil\n' > anvil-data/git-demo/README.md
+git -C anvil-data/git-demo add README.md
+git -C anvil-data/git-demo commit -m initial
+
+export ANVIL_GIT_URL=http://127.0.0.1:50053/git/example/objects/demo.git
+export ANVIL_GIT_AUTH="$(printf '%s:%s' example-client "$ANVIL_OWNER_SECRET" | base64 | tr -d '\n')"
+git -C anvil-data/git-demo \
+  -c "http.extraHeader=Authorization: Basic $ANVIL_GIT_AUTH" \
+  push "$ANVIL_GIT_URL" main
+git -c "http.extraHeader=Authorization: Basic $ANVIL_GIT_AUTH" \
+  clone --branch main "$ANVIL_GIT_URL" anvil-data/authenticated-clone
+git -C anvil-data/authenticated-clone \
+  -c "http.extraHeader=Authorization: Basic $ANVIL_GIT_AUTH" pull
+```
+
+To make pulls and clones public, enable public reads for the repository's
+bucket through the authorized command shown below, then omit the authentication
+header:
+
+```sh
+docker compose -f crates/anvil/docker-compose.yml exec \
+  -e ANVIL_CLIENT_ID=example-client \
+  -e ANVIL_CLIENT_SECRET="$ANVIL_OWNER_SECRET" anvil \
+  anvil --endpoint http://127.0.0.1:50051 \
+  set-bucket-public-read objects enabled
+
+git clone --branch main "$ANVIL_GIT_URL" anvil-data/public-clone
+```
+
+Push always requires an authorized application. A real-client push, pull, and
+public-clone qualification is kept in
+[`crates/anvil/tests/git_gateway.rs`](crates/anvil/tests/git_gateway.rs).
+
 ## Authorization model
 
 Authorization is enforced on the API; deployment topology is not a security
