@@ -109,6 +109,7 @@ impl PersonalDbObjects {
         command_id: String,
     ) -> Result<ConditionalWrite, Status> {
         let address = address(scope, suffix)?;
+        let durability = personaldb_write_durability(self.service.is_single_node()?);
         self.write(
             scope,
             Operation::PutIfAbsent(BulkPutRequest {
@@ -116,7 +117,7 @@ impl PersonalDbObjects {
                 bytes,
                 content_type: "application/octet-stream".into(),
                 command_id,
-                durability: Durability::Replicated as i32,
+                durability: durability as i32,
             }),
         )
         .await
@@ -131,6 +132,7 @@ impl PersonalDbObjects {
         command_id: String,
     ) -> Result<ConditionalWrite, Status> {
         let address = address(scope, suffix)?;
+        let durability = personaldb_write_durability(self.service.is_single_node()?);
         self.write(
             scope,
             Operation::PutIfVersion(BulkPutIfVersionRequest {
@@ -138,7 +140,7 @@ impl PersonalDbObjects {
                 bytes,
                 content_type: "application/octet-stream".into(),
                 command_id,
-                durability: Durability::Replicated as i32,
+                durability: durability as i32,
                 expected_version,
             }),
         )
@@ -181,6 +183,14 @@ impl PersonalDbObjects {
     }
 }
 
+fn personaldb_write_durability(single_node: bool) -> Durability {
+    if single_node {
+        Durability::Local
+    } else {
+        Durability::Replicated
+    }
+}
+
 fn address(scope: &GroupScope, suffix: &str) -> Result<ObjectAddress, Status> {
     let key = scope.storage_key(suffix)?;
     Ok(ObjectAddress {
@@ -201,4 +211,15 @@ fn authenticated<T>(scope: &GroupScope, value: T) -> Result<Request<T>, Status> 
     request.extensions_mut().insert(scope.caller.clone());
     object_path_access::mark_personaldb(&mut request);
     Ok(request)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Durability, personaldb_write_durability};
+
+    #[test]
+    fn personaldb_internal_writes_use_only_satisfiable_topology_durability() {
+        assert_eq!(personaldb_write_durability(true), Durability::Local);
+        assert_eq!(personaldb_write_durability(false), Durability::Replicated);
+    }
 }

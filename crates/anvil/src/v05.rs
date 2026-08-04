@@ -140,6 +140,10 @@ impl ObjectServiceImpl {
             .record_inbound(key.tenant(), key.bucket(), key.path(), bytes);
     }
 
+    pub(crate) fn is_single_node(&self) -> Result<bool, Status> {
+        self.distribution.is_single_node()
+    }
+
     async fn system_authorization(&self) -> Result<SystemAuthorization, Status> {
         let authorizer = self.system_authorizer.clone();
         tokio::task::spawn_blocking(move || authorizer.load())
