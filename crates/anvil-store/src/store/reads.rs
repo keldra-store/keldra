@@ -98,6 +98,36 @@ impl Store {
         )
     }
 
+    /// Narrow internal scan for published PersonalDB group manifests only.
+    /// Hidden preparation objects and every other reserved namespace remain
+    /// impossible to enumerate through this entry point.
+    pub fn list_local_owned_personaldb_manifests(
+        &self,
+        tenant_id: u64,
+        bucket_id: u64,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+        mut is_local_rank_zero: impl FnMut(u64, u64, &str) -> bool,
+    ) -> Result<ListObjectsPage, MutationError> {
+        if prefix != PERSONALDB_MANIFEST_PREFIX
+            || start_after.is_some_and(|path| !is_personaldb_manifest_path(path))
+        {
+            return Err(MutationError::InvalidObjectMutation(
+                "PersonalDB listing is restricted to published group manifests".into(),
+            ));
+        }
+        self.list_local_owned_objects_with_scope(
+            tenant_id,
+            bucket_id,
+            prefix,
+            start_after,
+            limit,
+            ReservedListScope::PersonalDbManifests,
+            &mut is_local_rank_zero,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn list_local_owned_objects_with_scope(
         &self,
@@ -480,6 +510,12 @@ impl Store {
                     path_version: tombstone_id,
                     deleted: true,
                     reference_deltas: Vec::new(),
+                    // The retained-version event carries the live-head
+                    // decrement.  Mark the companion tombstone event as an
+                    // explicit no-op so accounting consumers do not mistake
+                    // it for an old journal entry that lacks transition
+                    // evidence and unnecessarily rebuild their baseline.
+                    accounting_transition: Some(AccountingHeadTransition::new(None, None)),
                 }),
             )
         };
@@ -489,6 +525,11 @@ impl Store {
             deleted_version: version_id,
             resulting_head_version,
             reference_deltas,
+            accounting_transition: Some(if resulting_head_version.is_some() {
+                AccountingHeadTransition::new(target.blob.as_ref().map(|blob| blob.length), None)
+            } else {
+                AccountingHeadTransition::new(None, None)
+            }),
         }];
         if let Some(head_change) = head_change {
             changes.push(head_change);
@@ -628,11 +669,13 @@ impl Store {
 }
 
 const INDEX_DEFINITION_PREFIX: &str = "_anvil/indexes/definitions/";
+const PERSONALDB_MANIFEST_PREFIX: &str = "_anvil/personaldb/v1/";
 
 #[derive(Clone, Copy)]
 enum ReservedListScope {
     Public,
     IndexDefinitions,
+    PersonalDbManifests,
 }
 
 impl ReservedListScope {
@@ -640,6 +683,7 @@ impl ReservedListScope {
         match self {
             Self::Public => false,
             Self::IndexDefinitions => is_index_definition_path(path),
+            Self::PersonalDbManifests => is_personaldb_manifest_path(path),
         }
     }
 }
@@ -660,4 +704,25 @@ fn is_index_definition_path(path: &str) -> bool {
                 && !name.contains('\0')
                 && !name.chars().any(char::is_control)
         })
+}
+
+fn is_personaldb_manifest_path(path: &str) -> bool {
+    let Some(remainder) = path
+        .strip_prefix(PERSONALDB_MANIFEST_PREFIX)
+        .and_then(|path| path.strip_suffix("/manifest.json"))
+    else {
+        return false;
+    };
+    let Some((database, group)) = remainder.split_once('/') else {
+        return false;
+    };
+    !database.is_empty()
+        && !group.is_empty()
+        && !group.contains('/')
+        && database.len() <= 256
+        && group.len() <= 256
+        && database.len() % 2 == 0
+        && group.len() % 2 == 0
+        && database.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && group.bytes().all(|byte| byte.is_ascii_hexdigit())
 }

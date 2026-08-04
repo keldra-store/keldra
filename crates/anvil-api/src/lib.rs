@@ -129,6 +129,31 @@ mod tests {
     }
 
     #[test]
+    fn generated_personaldb_client_is_publicly_exposed() {
+        let _: Option<
+            super::v1::personal_db_service_client::PersonalDbServiceClient<
+                tonic::transport::Channel,
+            >,
+        > = None;
+
+        let schema = include_str!("../proto/personaldb.proto").to_ascii_lowercase();
+        for rpc in [
+            "rpc creategroup(",
+            "rpc describegroup(",
+            "rpc listgroups(",
+            "rpc grantgrouprole(",
+            "rpc revokegrouprole(",
+            "rpc appendentry(",
+            "rpc materializeprojection(",
+            "rpc catchup(",
+            "rpc registersnapshot(",
+            "rpc getsnapshot(",
+        ] {
+            assert!(schema.contains(rpc), "PersonalDB schema is missing `{rpc}`");
+        }
+    }
+
+    #[test]
     fn object_surface_has_only_explicit_typed_mutations() {
         use super::v1::{
             BulkOperation, BulkPutIfVersionRequest, CreateBucketRequest, DeleteIfVersionRequest,

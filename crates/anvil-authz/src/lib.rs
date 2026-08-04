@@ -19,9 +19,9 @@ pub use evaluator::Authorization;
 pub use model::{
     ANONYMOUS_SUBJECT_ID, AllowedSubject, AuthorizationCheck, AuthorizationError,
     AuthorizationLimits, DEFAULT_REALM_ID, ExactPath, MAX_NAMESPACE_BYTES, MAX_PATH_BYTES,
-    NamespaceDefinition, ObjectId, ObjectRef, PUBLIC_SUBJECT_ID, PUBLIC_SUBJECT_NAMESPACE, RealmId,
-    RelationDefinition, RelationKind, RewriteRule, SYSTEM_REALM_ID, Schema, Tuple, TupleSubject,
-    UsersetRef,
+    NamespaceDefinition, ObjectId, ObjectRef, PERSONALDB_REALM_ID, PUBLIC_SUBJECT_ID,
+    PUBLIC_SUBJECT_NAMESPACE, RealmId, RelationDefinition, RelationKind, RewriteRule,
+    SYSTEM_REALM_ID, Schema, Tuple, TupleSubject, UsersetRef,
 };
 
 pub type Result<T> = std::result::Result<T, AuthorizationError>;

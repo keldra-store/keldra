@@ -39,6 +39,19 @@ pub(crate) fn mark_index<T>(request: &mut Request<T>) {
     request.extensions_mut().insert(InternalObjectRequest);
 }
 
+/// Marks one request created by the in-process PersonalDB adapter. The marker
+/// has no wire representation; the mandatory-mTLS internal bulk route restores
+/// the same capability after independently authenticating the peer.
+pub(crate) fn mark_personaldb<T>(request: &mut Request<T>) {
+    request.extensions_mut().insert(InternalObjectRequest);
+}
+
+/// Marks a request issued by a protocol gateway after that gateway has
+/// validated its exact reserved namespace and retained Zanzibar authorization.
+pub(crate) fn mark_gateway<T>(request: &mut Request<T>) {
+    request.extensions_mut().insert(InternalObjectRequest);
+}
+
 /// Restores the in-process marker only on the dedicated mandatory-mTLS
 /// internal route. Ordinary routed-public calls never invoke this function.
 pub(crate) fn mark_internal_peer_route<T>(request: &mut Request<T>) {

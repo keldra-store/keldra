@@ -1,0 +1,181 @@
+syntax = "proto3";
+
+package anvil.v1;
+
+// PersonalDB stores its canonical protocol evidence and SQLite changesets as
+// ordinary Anvil objects. The server witnesses one predecessor-linked history
+// per database group; it does not execute application SQL.
+service PersonalDbService {
+  rpc CreateGroup(CreatePersonalDbGroupRequest) returns (PersonalDbGroup);
+  rpc DescribeGroup(DescribePersonalDbGroupRequest) returns (PersonalDbGroup);
+  rpc ListGroups(ListPersonalDbGroupsRequest) returns (ListPersonalDbGroupsResponse);
+  rpc GrantGroupRole(ChangePersonalDbGroupRoleRequest) returns (PersonalDbGroupRoleChange);
+  rpc RevokeGroupRole(ChangePersonalDbGroupRoleRequest) returns (PersonalDbGroupRoleChange);
+  rpc AppendEntry(AppendPersonalDbEntryRequest) returns (PersonalDbCommit);
+  // Projection materialisation is explicit. An authorised caller selects a
+  // source checkpoint; Anvil derives, signs and commits the bounded mirror
+  // output. The caller never supplies projection changesets.
+  rpc MaterializeProjection(MaterializePersonalDbProjectionRequest) returns (PersonalDbMaterialization);
+  rpc CatchUp(PersonalDbCatchUpRequest) returns (stream PersonalDbCanonicalFrame);
+  rpc RegisterSnapshot(RegisterPersonalDbSnapshotRequest) returns (PersonalDbSnapshot);
+  rpc GetSnapshot(GetPersonalDbSnapshotRequest) returns (stream PersonalDbCanonicalFrame);
+}
+
+enum PersonalDbGroupKind {
+  PERSONAL_DB_GROUP_KIND_UNSPECIFIED = 0;
+  PERSONAL_DB_GROUP_KIND_SOURCE = 1;
+  PERSONAL_DB_GROUP_KIND_PROJECTION = 2;
+  PERSONAL_DB_GROUP_KIND_STANDALONE = 3;
+}
+
+message CreatePersonalDbGroupRequest {
+  string bucket = 1;
+  string database_id = 2;
+  string group_id = 3;
+  PersonalDbGroupKind kind = 4;
+  bytes schema_hash_sha256 = 5;
+  // Required only for a projection group. Anvil supports the deliberately
+  // bounded mirror template in 0.5.3 and produces its output from source log
+  // entries; callers never submit projection changesets.
+  PersonalDbMirrorProjectionDefinition mirror_projection = 6;
+  string command_id = 7;
+}
+
+message PersonalDbMirrorProjectionDefinition {
+  string source_bucket = 1;
+  string source_database_id = 2;
+  string source_group_id = 3;
+}
+
+message DescribePersonalDbGroupRequest {
+  string bucket = 1;
+  string database_id = 2;
+  string group_id = 3;
+}
+
+message PersonalDbGroup {
+  // Canonical personaldb-protocol GroupDescriptor bytes.
+  bytes descriptor = 1;
+  // Canonical JSON PublicKeyTrustRecord values required to verify descriptors,
+  // commit evidence, projection derivations and snapshots returned by Anvil.
+  repeated bytes trust_records_json = 2;
+  bool replayed = 3;
+}
+
+message ListPersonalDbGroupsRequest {
+  string bucket = 1;
+  string page_token = 2;
+  uint32 limit = 3;
+}
+
+message ListPersonalDbGroupsResponse {
+  repeated PersonalDbGroup groups = 1;
+  string next_page_token = 2;
+}
+
+enum PersonalDbGroupRole {
+  PERSONAL_DB_GROUP_ROLE_UNSPECIFIED = 0;
+  PERSONAL_DB_GROUP_ROLE_READER = 1;
+  PERSONAL_DB_GROUP_ROLE_WRITER = 2;
+  PERSONAL_DB_GROUP_ROLE_MATERIALIZER = 3;
+  PERSONAL_DB_GROUP_ROLE_MANAGER = 4;
+}
+
+message ChangePersonalDbGroupRoleRequest {
+  string bucket = 1;
+  string database_id = 2;
+  string group_id = 3;
+  string app_id = 4;
+  PersonalDbGroupRole role = 5;
+  string command_id = 6;
+}
+
+message PersonalDbGroupRoleChange {
+  uint64 authorization_revision = 1;
+  bool replayed = 2;
+}
+
+message AppendPersonalDbEntryRequest {
+  string bucket = 1;
+  string database_id = 2;
+  string group_id = 3;
+  uint64 expected_log_index = 4;
+  bytes expected_log_hash_sha256 = 5;
+  bytes changeset = 6;
+  bytes client_proposal_hash_sha256 = 7;
+  bytes database_state_root_sha256 = 8;
+  bytes schema_hash_sha256 = 9;
+  uint64 membership_revision = 10;
+  uint64 client_log_epoch = 11;
+  bytes signed_client_proposal = 12;
+  repeated bytes signed_voter_acknowledgements = 13;
+  bytes signed_proposal_admission = 14;
+  string command_id = 15;
+}
+
+message MaterializePersonalDbProjectionRequest {
+  string bucket = 1;
+  string database_id = 2;
+  string group_id = 3;
+  uint64 through_source_log_index = 4;
+  bytes through_source_log_hash_sha256 = 5;
+  uint32 max_entries = 6;
+  uint64 max_bytes = 7;
+  string command_id = 8;
+}
+
+message PersonalDbMaterialization {
+  repeated PersonalDbCommit commits = 1;
+  uint64 source_log_index = 2;
+  bytes source_log_hash_sha256 = 3;
+}
+
+message PersonalDbCommit {
+  bytes commit_certificate = 1;
+  bytes committed_head = 2;
+  bool replayed = 3;
+}
+
+message PersonalDbCatchUpRequest {
+  string bucket = 1;
+  string database_id = 2;
+  string group_id = 3;
+  string request_id = 4;
+  string projection_profile_id = 5;
+  uint64 from_log_index = 6;
+  bytes from_log_hash_sha256 = 7;
+  bytes expected_schema_hash_sha256 = 8;
+  optional bytes expected_projection_definition_hash_sha256 = 9;
+  uint32 max_entries = 10;
+  uint64 max_bytes = 11;
+}
+
+message PersonalDbCanonicalFrame {
+  // Canonical PersonalDbSyncFrameV1 or PersonalDbSnapshotFrameV1 bytes.
+  bytes value = 1;
+}
+
+message RegisterPersonalDbSnapshotRequest {
+  string bucket = 1;
+  string database_id = 2;
+  string group_id = 3;
+  // Canonical unsigned SnapshotTargetManifestV1 bytes.
+  bytes manifest = 4;
+  bytes snapshot = 5;
+  string command_id = 6;
+}
+
+message PersonalDbSnapshot {
+  bytes signed_manifest = 1;
+  bool replayed = 2;
+}
+
+message GetPersonalDbSnapshotRequest {
+  string bucket = 1;
+  string database_id = 2;
+  string group_id = 3;
+  string request_id = 4;
+  string snapshot_id = 5;
+  uint64 start_offset = 6;
+  uint64 max_bytes = 7;
+}

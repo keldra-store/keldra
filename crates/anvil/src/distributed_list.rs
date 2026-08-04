@@ -59,7 +59,6 @@ impl OriginalBearer {
         Self(Arc::from(anvil_authz::ANONYMOUS_SUBJECT_ID))
     }
 
-    #[cfg(test)]
     pub(crate) fn from_signed_token(token: impl Into<Arc<str>>) -> Self {
         Self(token.into())
     }
@@ -89,6 +88,7 @@ pub(crate) struct LocalListQuery {
     start_after: Option<String>,
     limit: usize,
     include_index_definitions: bool,
+    include_personaldb_manifests: bool,
 }
 
 impl LocalListQuery {
@@ -146,6 +146,7 @@ impl LocalListQuery {
             start_after,
             limit,
             include_index_definitions: false,
+            include_personaldb_manifests: false,
         })
     }
 
@@ -185,6 +186,10 @@ impl LocalListQuery {
         self.include_index_definitions
     }
 
+    pub(crate) const fn includes_personaldb_manifests(&self) -> bool {
+        self.include_personaldb_manifests
+    }
+
     pub(crate) fn for_index_definitions(mut self) -> Result<Self, Status> {
         let suffix = self
             .prefix
@@ -204,6 +209,21 @@ impl LocalListQuery {
             ));
         }
         self.include_index_definitions = true;
+        Ok(self)
+    }
+
+    pub(crate) fn for_personaldb_manifests(mut self) -> Result<Self, Status> {
+        if self.prefix != crate::personaldb::MANIFEST_ROOT_PREFIX
+            || self
+                .start_after
+                .as_ref()
+                .is_some_and(|path| crate::personaldb::parse_manifest_object_path(path).is_err())
+        {
+            return Err(Status::invalid_argument(
+                "PersonalDB listing is restricted to published group manifests",
+            ));
+        }
+        self.include_personaldb_manifests = true;
         Ok(self)
     }
 }
@@ -328,6 +348,13 @@ impl AuthoritativeListAuthorizer for CoordinatedListAuthorizer {
             return Err(Status::permission_denied(
                 "object list does not belong to the authenticated tenant",
             ));
+        }
+        // This reserved scan is consumed only by the in-process PersonalDB
+        // service. That service performs a fresh per-group Zanzibar check
+        // before returning any descriptor to the caller. Requiring a
+        // bucket-wide grant here would incorrectly hide exact group roles.
+        if query.includes_personaldb_manifests() {
+            return Ok(());
         }
         let allowed = self
             .coordinator
@@ -633,6 +660,32 @@ impl DistributedObjectLister {
         self.list_query(bearer, placement, query).await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn list_personaldb_manifests(
+        &self,
+        bearer: OriginalBearer,
+        tenant: &str,
+        bucket: &str,
+        tenant_id: u64,
+        bucket_id: u64,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ListObjectsPage, Status> {
+        let placement = self.placement()?;
+        let query = LocalListQuery::new(
+            placement.fence(),
+            tenant,
+            bucket,
+            tenant_id,
+            bucket_id,
+            crate::personaldb::MANIFEST_ROOT_PREFIX,
+            start_after.map(str::to_owned),
+            limit,
+        )?
+        .for_personaldb_manifests()?;
+        self.list_query(bearer, placement, query).await
+    }
+
     async fn list_query(
         &self,
         bearer: OriginalBearer,
@@ -772,6 +825,8 @@ async fn gather_cluster_page(
 fn path_is_allowed_for_query(query: &LocalListQuery, path: &str) -> bool {
     if query.includes_index_definitions() {
         crate::index_runtime::publication::index_definition_name(path).is_some()
+    } else if query.includes_personaldb_manifests() {
+        crate::personaldb::parse_manifest_object_path(path).is_ok()
     } else {
         !path.split('/').any(|segment| segment == "_anvil")
     }
@@ -796,6 +851,17 @@ fn local_owned_page(
     }
     let page = if query.includes_index_definitions() {
         store.list_local_owned_index_definitions(
+            query.tenant_id(),
+            query.bucket_id(),
+            query.prefix(),
+            query.start_after(),
+            query.limit(),
+            |tenant_id, bucket_id, path| {
+                placement.object_owner(tenant_id, bucket_id, path) == Some(local_node)
+            },
+        )
+    } else if query.includes_personaldb_manifests() {
+        store.list_local_owned_personaldb_manifests(
             query.tenant_id(),
             query.bucket_id(),
             query.prefix(),

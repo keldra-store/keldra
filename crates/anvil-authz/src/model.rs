@@ -4,6 +4,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 pub const DEFAULT_REALM_ID: &str = "default";
 pub const SYSTEM_REALM_ID: &str = "_anvil/system";
+pub const PERSONALDB_REALM_ID: &str = "_anvil-personaldb";
 pub const PUBLIC_SUBJECT_NAMESPACE: &str = "app";
 pub const PUBLIC_SUBJECT_ID: &str = "_anvil/public";
 /// Reserved non-credentialed application identity used at the public service

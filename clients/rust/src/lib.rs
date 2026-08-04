@@ -1,12 +1,13 @@
 //! Authenticated Rust client for Anvil 0.5 object storage.
 //!
-//! The crate provides ready-to-use object, authorization, and administration
-//! clients, upload helpers, and the complete generated protocol surface.
+//! The crate provides ready-to-use object, authorization, administration, and
+//! PersonalDB clients, upload helpers, and the complete generated protocol surface.
 
 use anvil_api::v1::administration_service_client::AdministrationServiceClient;
 use anvil_api::v1::authz_service_client::AuthzServiceClient;
 use anvil_api::v1::credential_service_client::CredentialServiceClient;
 use anvil_api::v1::object_service_client::ObjectServiceClient;
+use anvil_api::v1::personal_db_service_client::PersonalDbServiceClient;
 use anvil_api::v1::{
     AccessToken, ExchangeClientCredentialsRequest, MutationReceipt, PutHeader, PutRequest,
 };
@@ -48,6 +49,8 @@ pub type RawAdministrationClient = AdministrationServiceClient<
 >;
 pub type RawAuthzClient =
     AuthzServiceClient<tonic::service::interceptor::InterceptedService<Channel, BearerToken>>;
+pub type RawPersonalDbClient =
+    PersonalDbServiceClient<tonic::service::interceptor::InterceptedService<Channel, BearerToken>>;
 
 pub fn object_client(
     channel: Channel,
@@ -82,6 +85,17 @@ pub fn authz_client(
     )
 }
 
+pub fn personaldb_client(
+    channel: Channel,
+    token: &str,
+) -> Result<RawPersonalDbClient, tonic::metadata::errors::InvalidMetadataValue> {
+    Ok(
+        PersonalDbServiceClient::with_interceptor(channel, BearerToken::new(token)?)
+            .max_encoding_message_size(MAX_MESSAGE_BYTES)
+            .max_decoding_message_size(MAX_MESSAGE_BYTES),
+    )
+}
+
 pub async fn connect(
     endpoint: impl AsRef<str>,
     token: &str,
@@ -90,9 +104,9 @@ pub async fn connect(
     Ok(object_client(channel, token)?)
 }
 
-/// Opens the shared transport used by object, authorization and administration
-/// clients. Keeping credential exchange separate makes the one unauthenticated
-/// RPC explicit at call sites.
+/// Opens the shared transport used by object, PersonalDB, authorization and
+/// administration clients. Keeping credential exchange separate makes the one
+/// unauthenticated RPC explicit at call sites.
 pub async fn connect_channel(
     endpoint: impl AsRef<str>,
 ) -> Result<Channel, Box<dyn std::error::Error + Send + Sync>> {
@@ -177,8 +191,8 @@ mod tests {
         Durability, ObjectVersioning, PutHeader,
     };
     use super::{
-        MAX_MESSAGE_BYTES, RawAdministrationClient, RawAuthzClient, RawClient,
-        administration_client, authz_client, object_client,
+        MAX_MESSAGE_BYTES, RawAdministrationClient, RawAuthzClient, RawClient, RawPersonalDbClient,
+        administration_client, authz_client, object_client, personaldb_client,
     };
 
     #[test]
@@ -223,6 +237,7 @@ mod tests {
         let channel = Endpoint::from_static("http://127.0.0.1:50051").connect_lazy();
         let _: RawClient = object_client(channel.clone(), "token").unwrap();
         let _: RawAuthzClient = authz_client(channel.clone(), "token").unwrap();
-        let _: RawAdministrationClient = administration_client(channel, "token").unwrap();
+        let _: RawAdministrationClient = administration_client(channel.clone(), "token").unwrap();
+        let _: RawPersonalDbClient = personaldb_client(channel, "token").unwrap();
     }
 }

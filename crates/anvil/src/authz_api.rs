@@ -47,9 +47,12 @@ pub(crate) fn public_scope_from_api(
     let value = required(value, "authorization scope")?;
     require_caller_tenant(&value, trusted_storage_tenant)?;
     let (storage_tenant, realm) = parse_scope_parts(value)?;
-    if storage_tenant.is_system() || realm.is_system() {
+    if storage_tenant.is_system()
+        || realm.is_system()
+        || realm.as_str() == anvil_authz::PERSONALDB_REALM_ID
+    {
         return Err(Status::permission_denied(
-            "the protected system authorization scope is not public",
+            "the protected authorization scope is not public",
         ));
     }
     ScopedRealm::new(storage_tenant, realm).map_err(store_input_status)
@@ -510,6 +513,17 @@ mod tests {
 
         let mismatch = public_scope_from_api(Some(custom), "other").unwrap_err();
         assert_eq!(mismatch.code(), Code::PermissionDenied);
+
+        let personaldb = api::AuthzScope {
+            storage_tenant: "acme".into(),
+            realm: anvil_authz::PERSONALDB_REALM_ID.into(),
+        };
+        assert_eq!(
+            public_scope_from_api(Some(personaldb), "acme")
+                .unwrap_err()
+                .code(),
+            Code::PermissionDenied
+        );
 
         let system = api::AuthzScope {
             storage_tenant: anvil_store::SYSTEM_STORAGE_TENANT_ID.into(),
