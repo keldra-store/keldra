@@ -189,6 +189,23 @@ will recover without operator intervention. The failure did not affect clean
 three-node startup or the subsequent OSV ingestion qualification, but reference
 replay repair for this case remains deferred.
 
+## One-node reference proofs in 0.5.3
+
+The one-node object fast path applies content-reference counts in the same
+local RocksDB batch as the object mutation and appends the corresponding
+source-journal event, but it does not persist the distributed reference proof
+required by ordered reference delivery. Delivery therefore fails closed at
+the first such event: reference-journal compaction and blob garbage collection
+remain paused, and the bounded journal can eventually apply write
+backpressure. Object reads and index freshness are unaffected because index
+builders consume the source journal independently and re-read current heads.
+
+An installation that has accepted one-node object writes does not yet support
+online expansion to multiple nodes with reference reconciliation. Repairing
+that transition without double-applying the already-local reference effects is
+deferred; 0.5.3 does not weaken the proof or reference-count guarantees to
+hide the gap.
+
 ## First custom-realm binding in a multi-node 0.5.1 cluster
 
 The first schema binding for a custom Zanzibar realm must atomically create
