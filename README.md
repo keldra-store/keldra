@@ -21,7 +21,7 @@ rendezvous hashing.
 | Distributed clusters | 0.5.1 | Any-node ingress, peer mTLS, replicated metadata, weighted placement, and 2+1 erasure-coded payload durability |
 | Materialized indexes | 0.5.2 | Path, object metadata, typed JSON, full text, vector, hybrid, Git-source, and tensor indexes |
 | Rust client | 0.5.2 | Credential exchange, authenticated clients, streaming upload helpers, and the complete generated gRPC API |
-| PersonalDB, public reads, accounting, S3 and Git | 0.5.3 | Next capability release |
+| PersonalDB, public reads, accounting, S3 and Git | 0.5.3 | Protocol-native PersonalDB groups and projections, authorized usage aggregates, opt-in anonymous reads, and standard S3/Git gateways |
 | Java client | — | TODO |
 | Python client | — | TODO |
 | Node.js client | — | TODO |
@@ -41,7 +41,7 @@ repository are required.
 ### 1. Start a development node
 
 ```sh
-export ANVIL_IMAGE=ghcr.io/worka-ai/anvil:0.5.2
+export ANVIL_IMAGE=ghcr.io/worka-ai/anvil:0.5.3
 export ANVIL_TOKEN_SIGNING_KEY_FILE="$PWD/anvil-data/token-signing-key"
 
 mkdir -p anvil-data
@@ -153,7 +153,7 @@ Zanzibar-authorized object addressed by `(tenant, bucket, path)`.
 ## Use the Rust client
 
 ```sh
-cargo add anvil-storage@0.5.2
+cargo add anvil-storage@0.5.3
 cargo add tokio --features macros,rt-multi-thread
 ```
 
@@ -218,6 +218,73 @@ the generated service clients let an application share one transport across
 object, index, authorization, and administration calls. The focused Rust guide
 is at [clients/rust/README.md](clients/rust/README.md).
 
+## Create a PersonalDB group
+
+PersonalDB gives an application a witnessed, predecessor-linked log for SQLite
+changesets. Source and standalone groups accept authorized appends; projection
+groups are materialized explicitly from a source group. Group roles are
+Zanzibar-authorized independently of ordinary object traffic.
+
+Add the public client and canonical protocol types:
+
+```sh
+cargo add anvil-storage@0.5.3 personaldb-protocol@0.2.2 serde_json
+```
+
+Use the same application credential created above to create a source group and
+verify Anvil's signed descriptor:
+
+```rust,no_run
+use anvil_storage::v1::{CreatePersonalDbGroupRequest, PersonalDbGroupKind};
+use personaldb_protocol::{
+    GroupDescriptor, PublicKeyTrustRecord, PublicKeyTrustStore, Sha256Digest,
+};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let channel = anvil_storage::connect_channel("http://127.0.0.1:50051").await?;
+    let token = anvil_storage::exchange_client_credentials(
+        channel.clone(),
+        "example-client",
+        std::env::var("ANVIL_OWNER_SECRET")?,
+    )
+    .await?;
+    let mut personaldb = anvil_storage::personaldb_client(channel, &token.access_token)?;
+
+    let group = personaldb
+        .create_group(CreatePersonalDbGroupRequest {
+            bucket: "objects".into(),
+            database_id: "main".into(),
+            group_id: "primary".into(),
+            kind: PersonalDbGroupKind::Source as i32,
+            schema_hash_sha256: Sha256Digest::hash(b"application-schema-v1")
+                .as_bytes()
+                .to_vec(),
+            mirror_projection: None,
+            command_id: "create-main-primary".into(),
+        })
+        .await?
+        .into_inner();
+
+    let records = group
+        .trust_records_json
+        .iter()
+        .map(|bytes| serde_json::from_slice::<PublicKeyTrustRecord>(bytes))
+        .collect::<Result<Vec<_>, _>>()?;
+    let trust = PublicKeyTrustStore::from_records(records)?;
+    let descriptor = GroupDescriptor::decode_canonical(&group.descriptor)?;
+    descriptor.verify(&trust)?;
+    println!("created {}", descriptor.group_id());
+    Ok(())
+}
+```
+
+`AppendEntry` advances the exact committed predecessor and carries the SQLite
+changeset plus client, voter, and admission evidence. `CatchUp` streams
+canonical `personaldb-protocol` frames, while `MaterializeProjection` derives
+projection output server-side. The complete public workflow is executable in
+[`crates/anvil/examples/personaldb_qualification.rs`](crates/anvil/examples/personaldb_qualification.rs).
+
 ## Authorization model
 
 Authorization is enforced on the API; deployment topology is not a security
@@ -238,12 +305,22 @@ Tenant roles are `owner`, `admin`, `reader`, `manage_tenant`, `read_tenant`,
 may delegate the narrowest useful role to another application; index results
 are authorization-filtered before they are returned.
 
-In the `0.5.3` capability release, a bucket owner can enable public reads with
-`AdministrationService.SetBucketPublicRead`. A request with no bearer token is
-then evaluated as Anvil's built-in, unmanageable anonymous application. It may
-read only where the owner explicitly granted that bucket policy. Supplying an
-invalid token remains an authentication error, and anonymous callers never
-bypass Zanzibar or gain write, index-management, or administration access.
+A bucket owner can enable public reads with the CLI or
+`AdministrationService.SetBucketPublicRead`:
+
+```sh
+docker compose -f crates/anvil/docker-compose.yml exec \
+  -e ANVIL_CLIENT_ID=example-client \
+  -e ANVIL_CLIENT_SECRET="$ANVIL_OWNER_SECRET" anvil \
+  anvil --endpoint http://127.0.0.1:50051 \
+  set-bucket-public-read objects enabled
+```
+
+A request with no bearer token is then evaluated as Anvil's built-in,
+unmanageable anonymous application. It may read only where the owner
+explicitly granted that bucket policy. Supplying an invalid token remains an
+authentication error, and anonymous callers never bypass Zanzibar or gain
+write, index-management, or administration access.
 
 ## Compare-and-swap and immutable data
 
@@ -390,7 +467,7 @@ bundles, establishes peer mTLS, exercises replicated and erasure-coded storage,
 queries every index type, and performs a rolling restart:
 
 ```sh
-ANVIL_IMAGE=ghcr.io/worka-ai/anvil:0.5.2 \
+ANVIL_IMAGE=ghcr.io/worka-ai/anvil:0.5.3 \
   ./scripts/qualify-three-node.sh
 ```
 
@@ -416,11 +493,14 @@ uses mandatory certificates created and rotated by the cluster.
 | `CredentialService` | Exchange durable application credentials for short-lived bearer tokens |
 | `ObjectService` | Streaming writes, CAS, bulk/batch operations, reads, versions, listing, watches, policies, and atomic programs |
 | `IndexService` | Create, update, inspect, list, delete, and query materialized indexes |
+| `PersonalDbService` | Create and authorize database groups, append protocol evidence, explicitly materialize projections, catch up, and transfer snapshots |
+| `AccountingService` | Enable and query authorization-protected bucket or path-prefix usage aggregates |
 | `AuthzService` | Manage customer Zanzibar realms, schemas, relationships, bindings, and checks |
 | `AdministrationService` | Protected tenant, bucket, credential, role, and cluster lifecycle |
 
-The versioned contract is
-[`crates/anvil-api/proto/anvil.proto`](crates/anvil-api/proto/anvil.proto).
+The versioned contracts are
+[`anvil.proto`](crates/anvil-api/proto/anvil.proto) and
+[`personaldb.proto`](crates/anvil-api/proto/personaldb.proto).
 
 ## Architecture in one page
 
