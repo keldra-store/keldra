@@ -113,12 +113,26 @@ impl CredentialRepository {
         validate_principal(&request.principal)?;
         let application = application_ref(&request.app_id)?;
         let (resource, relation) = role_tuple_parts(&request.storage_tenant, &request.target)?;
+        let revision = request.expected_authorization_revision.0.to_be_bytes();
+        let granted = [u8::from(request.granted)];
+        let resource_bytes = serde_json::to_vec(&resource)
+            .map_err(|error| CredentialRepositoryError::Storage(error.to_string()))?;
         Ok(TupleBatchRequest {
             scope: AuthzScope::system(),
             principal: request.principal,
             expected_revision: Some(request.expected_authorization_revision),
             expected_binding_generation: request.expected_binding_generation,
-            operation_id: None,
+            operation_id: Some(mutation_operation_id(
+                "application-role",
+                &[
+                    request.storage_tenant.as_str().as_bytes(),
+                    request.app_id.as_bytes(),
+                    &resource_bytes,
+                    relation.as_bytes(),
+                    &granted,
+                    &revision,
+                ],
+            )),
             mutations: vec![TupleMutation {
                 kind: if request.granted {
                     TupleMutationKind::Add
@@ -145,7 +159,15 @@ impl CredentialRepository {
             principal: request.principal,
             expected_revision: Some(request.expected_authorization_revision),
             expected_binding_generation: request.expected_binding_generation,
-            operation_id: None,
+            operation_id: Some(mutation_operation_id(
+                "bucket-public-read",
+                &[
+                    request.storage_tenant.as_str().as_bytes(),
+                    request.bucket.as_bytes(),
+                    &[u8::from(request.enabled)],
+                    &request.expected_authorization_revision.0.to_be_bytes(),
+                ],
+            )),
             mutations: vec![TupleMutation {
                 kind: if request.enabled {
                     TupleMutationKind::Add
@@ -158,6 +180,16 @@ impl CredentialRepository {
     }
 }
 
+fn mutation_operation_id(prefix: &str, parts: &[&[u8]]) -> String {
+    let mut hash = blake3::Hasher::new_derive_key("anvil.system-mutation-operation-id/v1");
+    hash.update(prefix.as_bytes());
+    for part in parts {
+        hash.update(&(part.len() as u64).to_be_bytes());
+        hash.update(part);
+    }
+    format!("{prefix}-{}", hash.finalize().to_hex())
+}
+
 fn stored_credential(
     request: &ApplicationCredentialRequest,
 ) -> Result<StoredApplicationCredential, CredentialRepositoryError> {
@@ -168,6 +200,7 @@ fn stored_credential(
         storage_tenant: request.storage_tenant.clone(),
         active: true,
         verifier: new_credential_verifier(request.client_secret.as_bytes())?,
+        sigv4_secret: None,
     })
 }
 
@@ -247,5 +280,70 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn public_read_toggle_operation_identity_tracks_its_predecessor() {
+        let (_root, store) = store().await;
+        let request = |revision, enabled| SetBucketPublicReadRequest {
+            storage_tenant: StorageTenantId::parse("acme").unwrap(),
+            bucket: "objects".into(),
+            enabled,
+            principal: anvil_authz::ObjectRef::opaque("app", "owner").unwrap(),
+            expected_authorization_revision: crate::AuthzRevision(revision),
+            expected_binding_generation: 1,
+        };
+        let first_enable = store
+            .prepare_bucket_public_read_change(request(7, true))
+            .unwrap()
+            .operation_id
+            .unwrap();
+        let disable = store
+            .prepare_bucket_public_read_change(request(8, false))
+            .unwrap()
+            .operation_id
+            .unwrap();
+        let second_enable = store
+            .prepare_bucket_public_read_change(request(9, true))
+            .unwrap()
+            .operation_id
+            .unwrap();
+
+        assert_ne!(first_enable, disable);
+        assert_ne!(first_enable, second_enable);
+        assert_ne!(disable, second_enable);
+    }
+
+    #[tokio::test]
+    async fn application_role_operation_identity_tracks_target_action_and_predecessor() {
+        let (_root, store) = store().await;
+        let request = |revision, granted, role| SetApplicationRoleRequest {
+            storage_tenant: StorageTenantId::parse("acme").unwrap(),
+            app_id: "worker".into(),
+            target: ApplicationRoleTarget::Tenant(role),
+            granted,
+            principal: anvil_authz::ObjectRef::opaque("app", "owner").unwrap(),
+            expected_authorization_revision: crate::AuthzRevision(revision),
+            expected_binding_generation: 1,
+        };
+        let reader = store
+            .prepare_application_role_change(request(7, true, TenantApplicationRole::Reader))
+            .unwrap()
+            .operation_id
+            .unwrap();
+        let revoked = store
+            .prepare_application_role_change(request(8, false, TenantApplicationRole::Reader))
+            .unwrap()
+            .operation_id
+            .unwrap();
+        let admin = store
+            .prepare_application_role_change(request(9, true, TenantApplicationRole::Admin))
+            .unwrap()
+            .operation_id
+            .unwrap();
+
+        assert_ne!(reader, revoked);
+        assert_ne!(reader, admin);
+        assert_ne!(revoked, admin);
     }
 }

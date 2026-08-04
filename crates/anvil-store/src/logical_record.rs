@@ -113,6 +113,7 @@ pub struct LogicalCredentialRecord {
     storage_tenant: StorageTenantId,
     active: bool,
     verifier: StoredCredentialVerifier,
+    sigv4_secret: Option<crate::CredentialSecretEnvelope>,
 }
 
 impl LogicalCredentialRecord {
@@ -130,6 +131,14 @@ impl LogicalCredentialRecord {
 
     pub fn active(&self) -> bool {
         self.active
+    }
+
+    pub fn sigv4_secret(&self) -> Option<&crate::CredentialSecretEnvelope> {
+        self.sigv4_secret.as_ref()
+    }
+
+    pub fn install_sigv4_secret(&mut self, envelope: crate::CredentialSecretEnvelope) {
+        self.sigv4_secret = Some(envelope);
     }
 
     /// Verify a secret against one quorum-selected credential without relying
@@ -150,6 +159,11 @@ impl LogicalCredentialRecord {
 
     fn validate(&self) -> Result<(), crate::CredentialRepositoryError> {
         validate_stored_credential_verifier(&self.verifier)?;
+        if let Some(envelope) = self.sigv4_secret.as_ref() {
+            envelope
+                .validate()
+                .map_err(|message| crate::CredentialRepositoryError::Storage(message.into()))?;
+        }
         credential_from_stored(&self.clone().into()).map(|_| ())
     }
 }
@@ -1048,6 +1062,7 @@ impl From<StoredApplicationCredential> for LogicalCredentialRecord {
             storage_tenant: stored.storage_tenant,
             active: stored.active,
             verifier: stored.verifier,
+            sigv4_secret: stored.sigv4_secret,
         }
     }
 }
@@ -1061,6 +1076,7 @@ impl From<LogicalCredentialRecord> for StoredApplicationCredential {
             storage_tenant: record.storage_tenant,
             active: record.active,
             verifier: record.verifier,
+            sigv4_secret: record.sigv4_secret,
         }
     }
 }

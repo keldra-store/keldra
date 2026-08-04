@@ -6,18 +6,22 @@ use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
+use anvil_storage::v1::application_role_request::Target as ApplicationRoleTarget;
 use anvil_storage::v1::object_chunk::Value as ObjectChunkValue;
 use anvil_storage::v1::object_head::State as ObjectHeadState;
 use anvil_storage::v1::object_version::State as ObjectVersionState;
 use anvil_storage::v1::put_header::Operation as PutOperation;
 use anvil_storage::v1::watch_message::Message as WatchMessageValue;
 use anvil_storage::v1::{
-    BucketPolicy, CreateBucketRequest, DeleteIfVersionRequest, DeleteRequest, DeleteVersionRequest,
-    Durability, GetObjectRequest, HeadObjectRequest, InvokeProgramRequest,
-    ListObjectVersionsRequest, ListObjectsRequest, ObjectAddress, ObjectVersioning,
-    PrepareNodeRequest, ProvisionTenantRequest, PutHeader, PutIfAbsentOperation,
-    PutIfVersionOperation, PutImmutableOperation, PutOperation as UnconditionalPutOperation,
-    PutRequest, SetBucketPolicyRequest, SetBucketVersioningRequest, WatchNow, WatchPrefixRequest,
+    ApplicationRoleRequest, BucketApplicationRole, BucketApplicationRoleTarget, BucketPolicy,
+    CreateApplicationRequest, CreateBucketRequest, DeleteIfVersionRequest, DeleteRequest,
+    DeleteVersionRequest, DisableApplicationCredentialRequest, Durability, GetObjectRequest,
+    HeadObjectRequest, InvokeProgramRequest, ListObjectVersionsRequest, ListObjectsRequest,
+    ObjectAddress, ObjectVersioning, PrepareNodeRequest, ProvisionTenantRequest, PutHeader,
+    PutIfAbsentOperation, PutIfVersionOperation, PutImmutableOperation,
+    PutOperation as UnconditionalPutOperation, PutRequest, RotateApplicationCredentialRequest,
+    SetBucketPolicyRequest, SetBucketPublicReadRequest, SetBucketVersioningRequest,
+    TenantApplicationRole, TenantApplicationRoleTarget, WatchNow, WatchPrefixRequest,
     WatchRetainedBeginning, WatchStateHint,
 };
 use anyhow::{Context, Result, bail};
@@ -167,6 +171,48 @@ enum Command {
         #[arg(long, env = "ANVIL_NEW_CLIENT_SECRET", hide_env_values = true)]
         owner_client_secret: String,
     },
+    /// Create another application credential in the authenticated tenant.
+    CreateApplication {
+        app_id: String,
+        client_id: String,
+        #[arg(long, env = "ANVIL_NEW_CLIENT_SECRET", hide_env_values = true)]
+        client_secret: String,
+    },
+    /// Replace one application's credential secret and keep its identity.
+    RotateApplicationCredential {
+        app_id: String,
+        client_id: String,
+        #[arg(long, env = "ANVIL_NEW_CLIENT_SECRET", hide_env_values = true)]
+        client_secret: String,
+    },
+    /// Stop future token exchanges for an application credential.
+    DisableApplicationCredential { app_id: String, client_id: String },
+    /// Grant one tenant-wide role to an application.
+    GrantTenantRole {
+        app_id: String,
+        #[arg(value_enum)]
+        role: TenantRoleArgument,
+    },
+    /// Revoke one tenant-wide role from an application.
+    RevokeTenantRole {
+        app_id: String,
+        #[arg(value_enum)]
+        role: TenantRoleArgument,
+    },
+    /// Grant one bucket role to an application.
+    GrantBucketRole {
+        app_id: String,
+        bucket: String,
+        #[arg(value_enum)]
+        role: BucketRoleArgument,
+    },
+    /// Revoke one bucket role from an application.
+    RevokeBucketRole {
+        app_id: String,
+        bucket: String,
+        #[arg(value_enum)]
+        role: BucketRoleArgument,
+    },
     /// Generate one mode-0600 bundle for an authorized node join.
     PrepareNode {
         node_id: u32,
@@ -182,6 +228,12 @@ enum Command {
     },
     /// Permanently enable retained object versions for one existing bucket.
     EnableBucketVersioning { bucket: String },
+    /// Enable or disable Zanzibar-governed anonymous reads for a bucket.
+    SetBucketPublicRead {
+        bucket: String,
+        #[arg(value_enum)]
+        access: PublicReadArgument,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -203,6 +255,72 @@ impl From<DurabilityArgument> for i32 {
 enum VersioningArgument {
     Unversioned,
     Enabled,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum PublicReadArgument {
+    Enabled,
+    Disabled,
+}
+
+impl PublicReadArgument {
+    const fn enabled(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum TenantRoleArgument {
+    Owner,
+    Admin,
+    Reader,
+    ManageTenant,
+    ReadTenant,
+    ManageBuckets,
+    ManageAuthz,
+}
+
+impl From<TenantRoleArgument> for i32 {
+    fn from(value: TenantRoleArgument) -> Self {
+        match value {
+            TenantRoleArgument::Owner => TenantApplicationRole::Owner,
+            TenantRoleArgument::Admin => TenantApplicationRole::Admin,
+            TenantRoleArgument::Reader => TenantApplicationRole::Reader,
+            TenantRoleArgument::ManageTenant => TenantApplicationRole::ManageTenant,
+            TenantRoleArgument::ReadTenant => TenantApplicationRole::ReadTenant,
+            TenantRoleArgument::ManageBuckets => TenantApplicationRole::ManageBuckets,
+            TenantRoleArgument::ManageAuthz => TenantApplicationRole::ManageAuthz,
+        }
+        .into()
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum BucketRoleArgument {
+    Owner,
+    Admin,
+    Reader,
+    Writer,
+    GetObject,
+    PutObject,
+    DeleteObject,
+    ManagePolicy,
+}
+
+impl From<BucketRoleArgument> for i32 {
+    fn from(value: BucketRoleArgument) -> Self {
+        match value {
+            BucketRoleArgument::Owner => BucketApplicationRole::Owner,
+            BucketRoleArgument::Admin => BucketApplicationRole::Admin,
+            BucketRoleArgument::Reader => BucketApplicationRole::Reader,
+            BucketRoleArgument::Writer => BucketApplicationRole::Writer,
+            BucketRoleArgument::GetObject => BucketApplicationRole::GetObject,
+            BucketRoleArgument::PutObject => BucketApplicationRole::PutObject,
+            BucketRoleArgument::DeleteObject => BucketApplicationRole::DeleteObject,
+            BucketRoleArgument::ManagePolicy => BucketApplicationRole::ManagePolicy,
+        }
+        .into()
+    }
 }
 
 impl From<VersioningArgument> for i32 {
@@ -596,6 +714,93 @@ async fn main() -> Result<()> {
                 response.replayed,
             );
         }
+        Command::CreateApplication {
+            app_id,
+            client_id,
+            client_secret,
+        } => {
+            let credential = administration
+                .create_application(CreateApplicationRequest {
+                    app_id,
+                    client_id,
+                    client_secret,
+                })
+                .await?
+                .into_inner();
+            print_credential(&credential);
+        }
+        Command::RotateApplicationCredential {
+            app_id,
+            client_id,
+            client_secret,
+        } => {
+            let credential = administration
+                .rotate_application_credential(RotateApplicationCredentialRequest {
+                    app_id,
+                    client_id,
+                    client_secret,
+                })
+                .await?
+                .into_inner();
+            print_credential(&credential);
+        }
+        Command::DisableApplicationCredential { app_id, client_id } => {
+            let credential = administration
+                .disable_application_credential(DisableApplicationCredentialRequest {
+                    app_id,
+                    client_id,
+                })
+                .await?
+                .into_inner();
+            println!(
+                "tenant={} app={} client={} active={} replayed={}",
+                credential.storage_tenant,
+                credential.app_id,
+                credential.client_id,
+                credential.active,
+                credential.replayed,
+            );
+        }
+        Command::GrantTenantRole { app_id, role } => {
+            print_role_change(
+                administration
+                    .grant_application_role(tenant_role_request(app_id, role))
+                    .await?
+                    .into_inner(),
+            );
+        }
+        Command::RevokeTenantRole { app_id, role } => {
+            print_role_change(
+                administration
+                    .revoke_application_role(tenant_role_request(app_id, role))
+                    .await?
+                    .into_inner(),
+            );
+        }
+        Command::GrantBucketRole {
+            app_id,
+            bucket,
+            role,
+        } => {
+            print_role_change(
+                administration
+                    .grant_application_role(bucket_role_request(app_id, bucket, role))
+                    .await?
+                    .into_inner(),
+            );
+        }
+        Command::RevokeBucketRole {
+            app_id,
+            bucket,
+            role,
+        } => {
+            print_role_change(
+                administration
+                    .revoke_application_role(bucket_role_request(app_id, bucket, role))
+                    .await?
+                    .into_inner(),
+            );
+        }
         Command::PrepareNode {
             node_id,
             peer_address,
@@ -651,8 +856,66 @@ async fn main() -> Result<()> {
                 response.changed,
             );
         }
+        Command::SetBucketPublicRead { bucket, access } => {
+            let response = administration
+                .set_bucket_public_read(SetBucketPublicReadRequest {
+                    bucket,
+                    enabled: access.enabled(),
+                })
+                .await?
+                .into_inner();
+            println!(
+                "tenant={} bucket={} public_read={} revision={} replayed={}",
+                response.storage_tenant,
+                response.bucket,
+                response.enabled,
+                response.authorization_revision,
+                response.replayed,
+            );
+        }
     }
     Ok(())
+}
+
+fn tenant_role_request(app_id: String, role: TenantRoleArgument) -> ApplicationRoleRequest {
+    ApplicationRoleRequest {
+        app_id,
+        target: Some(ApplicationRoleTarget::Tenant(TenantApplicationRoleTarget {
+            role: role.into(),
+        })),
+    }
+}
+
+fn bucket_role_request(
+    app_id: String,
+    bucket: String,
+    role: BucketRoleArgument,
+) -> ApplicationRoleRequest {
+    ApplicationRoleRequest {
+        app_id,
+        target: Some(ApplicationRoleTarget::Bucket(BucketApplicationRoleTarget {
+            bucket,
+            role: role.into(),
+        })),
+    }
+}
+
+fn print_credential(credential: &anvil_storage::v1::ApplicationCredential) {
+    println!(
+        "tenant={} app={} client={} active={} replayed={}",
+        credential.storage_tenant,
+        credential.app_id,
+        credential.client_id,
+        credential.active,
+        credential.replayed,
+    );
+}
+
+fn print_role_change(response: anvil_storage::v1::ApplicationRoleResponse) {
+    println!(
+        "revision={} replayed={}",
+        response.authorization_revision, response.replayed,
+    );
 }
 
 async fn resolve_access_token(
@@ -942,8 +1205,9 @@ fn present_head_line(version: u64, content_length: u64, content_hash: &[u8]) -> 
 #[cfg(test)]
 mod tests {
     use super::{
-        Arguments, Command, VersioningArgument, decode_bootstrap_credential, load_credential_file,
-        parse_hex, present_head_line, put_operation, versioning_name,
+        Arguments, BucketRoleArgument, Command, PublicReadArgument, TenantRoleArgument,
+        VersioningArgument, decode_bootstrap_credential, load_credential_file, parse_hex,
+        present_head_line, put_operation, versioning_name,
     };
     use anvil_storage::v1::put_header::Operation;
     use clap::Parser as _;
@@ -1063,6 +1327,23 @@ mod tests {
             Command::EnableBucketVersioning { ref bucket } if bucket == "objects"
         ));
 
+        let public = Arguments::try_parse_from([
+            "anvil",
+            "--token",
+            "token",
+            "set-bucket-public-read",
+            "objects",
+            "enabled",
+        ])
+        .unwrap();
+        assert!(matches!(
+            public.command,
+            Command::SetBucketPublicRead {
+                ref bucket,
+                access: PublicReadArgument::Enabled,
+            } if bucket == "objects"
+        ));
+
         let prepare = Arguments::try_parse_from([
             "anvil",
             "--token",
@@ -1081,6 +1362,60 @@ mod tests {
                 ref peer_address,
                 storage_weight_millionths: 500_000,
             } if peer_address == "node-2.internal:50052"
+        ));
+    }
+
+    #[test]
+    fn application_lifecycle_and_role_commands_are_explicit() {
+        let create = Arguments::try_parse_from([
+            "anvil",
+            "--token",
+            "token",
+            "create-application",
+            "worker",
+            "client-worker",
+            "--client-secret",
+            "secret",
+        ])
+        .unwrap();
+        assert!(matches!(
+            create.command,
+            Command::CreateApplication { ref app_id, .. } if app_id == "worker"
+        ));
+
+        let tenant = Arguments::try_parse_from([
+            "anvil",
+            "--token",
+            "token",
+            "grant-tenant-role",
+            "worker",
+            "reader",
+        ])
+        .unwrap();
+        assert!(matches!(
+            tenant.command,
+            Command::GrantTenantRole {
+                role: TenantRoleArgument::Reader,
+                ..
+            }
+        ));
+
+        let bucket = Arguments::try_parse_from([
+            "anvil",
+            "--token",
+            "token",
+            "grant-bucket-role",
+            "worker",
+            "objects",
+            "put-object",
+        ])
+        .unwrap();
+        assert!(matches!(
+            bucket.command,
+            Command::GrantBucketRole {
+                role: BucketRoleArgument::PutObject,
+                ..
+            }
         ));
     }
 

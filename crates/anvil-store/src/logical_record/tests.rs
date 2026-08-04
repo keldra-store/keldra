@@ -342,6 +342,7 @@ fn credential_debug_never_displays_verifier_material() {
             salt: [0xA5; 32],
             output: [0x5A; 32],
         },
+        sigv4_secret: None,
     };
     let rendered = format!("{credential:?}");
     assert!(rendered.contains("[REDACTED]"));

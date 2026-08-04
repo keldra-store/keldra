@@ -8,6 +8,7 @@ mod authz;
 mod blob;
 mod bootstrap;
 mod clock;
+mod credential_secret;
 mod erasure;
 mod key;
 mod logical_record;
@@ -47,6 +48,7 @@ pub use bootstrap::{
     system_schema,
 };
 pub use clock::VersionClock;
+pub use credential_secret::CredentialSecretEnvelope;
 pub use erasure::{
     DEFAULT_ERASURE_DATA_SHARDS, DEFAULT_ERASURE_PARITY_SHARDS, DEFAULT_ERASURE_STRIPE_UNIT_BYTES,
     ErasureCodec, ErasureError, ErasureProfile, FRAGMENT_FORMAT_VERSION,
@@ -100,9 +102,9 @@ pub use store::{
     ShardReader, ShardSealOutcome, ShardStoreError, Store, StoreOptions,
 };
 pub use watch::{
-    AggregateChanged, AggregateKind, ContentLifecycleChanged, DEFAULT_WATCH_MAX_BYTES,
-    DEFAULT_WATCH_MAX_ENTRIES, InvalidationStateHint, LocalChange, LocalInvalidation,
-    MAX_LOCAL_INVALIDATION_SCAN_RECORDS, ObjectHeadChange, ObjectHeadChangeKind, ReferenceProof,
-    RetainedVersionDeletedChange, SourceId, WatchCursor, WatchError, WatchJournalStatus, WatchPage,
-    WatchRetention, WatchScope, WatchStart,
+    AccountingHeadTransition, AggregateChanged, AggregateKind, ContentLifecycleChanged,
+    DEFAULT_WATCH_MAX_BYTES, DEFAULT_WATCH_MAX_ENTRIES, InvalidationStateHint, LocalChange,
+    LocalInvalidation, MAX_LOCAL_INVALIDATION_SCAN_RECORDS, ObjectHeadChange, ObjectHeadChangeKind,
+    ReferenceProof, RetainedVersionDeletedChange, SourceId, WatchCursor, WatchError,
+    WatchJournalStatus, WatchPage, WatchRetention, WatchScope, WatchStart,
 };
