@@ -37,6 +37,7 @@ use tokio_stream::Stream;
 use tonic::metadata::MetadataMap;
 use tonic::{Request, Response, Status, Streaming};
 
+use crate::accounting::AccountingTraffic;
 use crate::authentication::{Caller, JwtManager, PUT_TOKEN_LIFETIME};
 use crate::authoritative_system::AuthoritativeSystemAuthorization;
 use crate::authorization::{ObjectPermission, SystemAuthorization, SystemAuthorizer};
@@ -60,10 +61,15 @@ mod batch_get;
 mod bulk;
 mod distributed_reads;
 mod distributed_watch_stream;
+mod gateway;
+mod mutation_failures;
 mod read_identity;
 mod routed_writes;
 
+use mutation_failures::{api_failure, api_request_failure};
 use read_identity::ObjectReadIdentity;
+
+pub(crate) use gateway::{GatewayIdentity, GatewayObjectAdapter, GatewayPutMode, GatewayPutResult};
 
 const OBJECT_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_BULK_ITEMS: usize = 1_000;
@@ -88,6 +94,7 @@ pub struct ObjectServiceImpl {
     authoritative_system: AuthoritativeSystemAuthorization,
     bucket_governance: BucketGovernance,
     jwt_manager: JwtManager,
+    accounting_traffic: AccountingTraffic,
     max_blob_bytes: u64,
     atomic_program_timeout: Duration,
 }
@@ -105,6 +112,7 @@ impl ObjectServiceImpl {
         authoritative_system: AuthoritativeSystemAuthorization,
         bucket_governance: BucketGovernance,
         jwt_manager: JwtManager,
+        accounting_traffic: AccountingTraffic,
         max_blob_bytes: u64,
         atomic_program_timeout: Duration,
     ) -> Self {
@@ -121,9 +129,15 @@ impl ObjectServiceImpl {
             authoritative_system,
             bucket_governance,
             jwt_manager,
+            accounting_traffic,
             max_blob_bytes,
             atomic_program_timeout,
         }
+    }
+
+    pub(crate) fn record_gateway_ingress(&self, key: &ObjectKey, bytes: u64) {
+        self.accounting_traffic
+            .record_inbound(key.tenant(), key.bucket(), key.path(), bytes);
     }
 
     async fn system_authorization(&self) -> Result<SystemAuthorization, Status> {
@@ -210,7 +224,7 @@ struct ListObjectsQuery {
     limit: usize,
 }
 
-type GetObjectStream =
+pub(crate) type GetObjectStream =
     Pin<Box<dyn Stream<Item = Result<ObjectChunk, Status>> + Send + Sync + 'static>>;
 type ListObjectVersionsStream =
     Pin<Box<dyn Stream<Item = Result<ObjectVersion, Status>> + Send + Sync + 'static>>;
@@ -267,6 +281,14 @@ impl ObjectService for ObjectServiceImpl {
             write_upload_chunk(&mut upload, &mut length, &frame.chunk, self.max_blob_bytes).await?;
         }
         let blob = self.store.seal_blob_upload(upload).await.map_err(status)?;
+        if !object_path_access::is_internal(&path_access) {
+            self.accounting_traffic.record_inbound(
+                metadata.key.tenant(),
+                metadata.key.bucket(),
+                metadata.key.path(),
+                length,
+            );
+        }
         self.issue_ready_token(&caller, header, &blob)
             .map(Response::new)
     }
@@ -309,9 +331,21 @@ impl ObjectService for ObjectServiceImpl {
                 ));
             }
             Some((target, address)) => {
-                self.cluster_peers
-                    .route_put_end(target, &address, bearer.signed_token(), token, remaining)
-                    .await?
+                if object_path_access::is_internal(&path_access) {
+                    self.cluster_peers
+                        .route_internal_put_end(
+                            target,
+                            &address,
+                            bearer.signed_token(),
+                            token,
+                            remaining,
+                        )
+                        .await?
+                } else {
+                    self.cluster_peers
+                        .route_put_end(target, &address, bearer.signed_token(), token, remaining)
+                        .await?
+                }
             }
             None => {
                 let governance = self
@@ -573,12 +607,15 @@ impl ObjectService for ObjectServiceImpl {
         let key = object_key(request.address)?;
         let caller = identity.caller_for_tenant(key.tenant())?;
         object_path_access::require_key(&path_access, &key)?;
-        self.authorize_object(&caller, &key, ObjectPermission::Get)
-            .await?;
+        if !object_path_access::is_internal(&path_access) {
+            self.authorize_object(&caller, &key, ObjectPermission::Get)
+                .await?;
+        }
         if request.version.is_some() {
             require_versioning_enabled(&self.store, &key)?;
         }
         let requested_version = request.version.map(VersionId);
+        let meter_public = !object_path_access::is_internal(&path_access);
         loop {
             let selected = self.reader.open(&key, requested_version).await?;
             let cursor = selected
@@ -591,6 +628,19 @@ impl ObjectService for ObjectServiceImpl {
                         .await?;
                 }
                 _ => {
+                    if meter_public
+                        && let Some(bytes) = selected
+                            .as_ref()
+                            .and_then(|object| object.version.blob.as_ref())
+                            .map(|blob| blob.length)
+                    {
+                        self.accounting_traffic.record_outbound(
+                            key.tenant(),
+                            key.bucket(),
+                            key.path(),
+                            bytes,
+                        );
+                    }
                     return distributed_reads::get_object_response(
                         selected,
                         requested_version.is_some(),
@@ -653,6 +703,7 @@ impl ObjectService for ObjectServiceImpl {
         let result = async {
             let caller = authenticated_caller(&request)?;
             let path_access = object_path_access::access_for(&request);
+            let meter_public = !peer_routed && !object_path_access::is_internal(&path_access);
             let bearer = OriginalBearer::from_metadata(request.metadata())?;
             let route_budget =
                 effective_atomic_program_timeout(request.metadata(), self.atomic_program_timeout);
@@ -693,7 +744,9 @@ impl ObjectService for ObjectServiceImpl {
                     )
                 })
                 .collect::<Vec<_>>();
-            let allowed = if authorization_requests.is_empty() {
+            let allowed = if object_path_access::is_internal(&path_access) {
+                vec![true; authorization_requests.len()]
+            } else if authorization_requests.is_empty() {
                 Vec::new()
             } else {
                 self.authoritative_system
@@ -707,6 +760,14 @@ impl ObjectService for ObjectServiceImpl {
                         &Status::permission_denied("bulk object operation is not authorized"),
                     ));
                     continue;
+                }
+                if meter_public && let BatchOperation::Put(put) = &mutation {
+                    self.accounting_traffic.record_inbound(
+                        put.key.tenant(),
+                        put.key.bucket(),
+                        put.key.path(),
+                        put.bytes.len() as u64,
+                    );
                 }
                 match self
                     .distribution
@@ -804,6 +865,7 @@ impl ObjectService for ObjectServiceImpl {
         let deadline = request_deadline(request.metadata(), self.atomic_program_timeout)?;
         let identity = ObjectReadIdentity::from_request(&request)?;
         let path_access = object_path_access::access_for(&request);
+        let meter_public = !object_path_access::is_internal(&path_access);
         let objects = request.into_inner().objects;
         if objects.len() > MAX_BATCH_GET_ITEMS {
             return Err(Status::resource_exhausted(format!(
@@ -903,6 +965,21 @@ impl ObjectService for ObjectServiceImpl {
             }
             outcomes.extend(read_outcomes);
             outcomes.sort_unstable_by_key(|outcome| outcome.index);
+            if meter_public {
+                for outcome in &outcomes {
+                    let (Some(address), Some(BatchGetResult::Object(object))) =
+                        (&outcome.address, &outcome.outcome)
+                    else {
+                        continue;
+                    };
+                    self.accounting_traffic.record_outbound(
+                        &address.tenant,
+                        &address.bucket,
+                        &address.path,
+                        object.bytes.len() as u64,
+                    );
+                }
+            }
             return Ok(Response::new(BatchGetResponse { outcomes }));
         }
     }
@@ -1614,19 +1691,6 @@ fn batch_operation(
     Ok(operation)
 }
 
-fn api_request_failure(error: Status) -> MutationFailure {
-    let code = match error.code() {
-        tonic::Code::ResourceExhausted => MutationFailureCode::ResourceLimit,
-        tonic::Code::Unavailable => MutationFailureCode::DurabilityUnavailable,
-        _ => MutationFailureCode::Invalid,
-    };
-    MutationFailure {
-        code: code as i32,
-        message: error.message().to_owned(),
-        current_version: None,
-    }
-}
-
 fn object_key(address: Option<ObjectAddress>) -> Result<ObjectKey, Status> {
     let address = address.ok_or_else(|| Status::invalid_argument("object address is required"))?;
     ObjectKey::new(address.tenant, address.bucket, address.path)
@@ -1766,44 +1830,6 @@ fn api_address(key: &ObjectKey) -> ObjectAddress {
         tenant: key.tenant().into(),
         bucket: key.bucket().into(),
         path: key.path().into(),
-    }
-}
-
-fn api_failure(error: MutationError) -> MutationFailure {
-    let (code, current_version) = match &error {
-        MutationError::PreconditionFailed { current } => (
-            MutationFailureCode::ConditionFailed,
-            current.map(|value| value.0),
-        ),
-        MutationError::Immutable => (MutationFailureCode::Immutable, None),
-        MutationError::ImmutablePolicyRequired => {
-            (MutationFailureCode::ImmutablePolicyRequired, None)
-        }
-        MutationError::ProgramConcurrencyViolation => {
-            (MutationFailureCode::ProgramConcurrencyViolation, None)
-        }
-        MutationError::CurrentTombstoneCannotBeDeleted => {
-            (MutationFailureCode::ConditionFailed, None)
-        }
-        MutationError::ObjectVersioningNotEnabled => (MutationFailureCode::ConditionFailed, None),
-        MutationError::IdempotencyConflict => (MutationFailureCode::IdempotencyInputMismatch, None),
-        MutationError::InvalidCommandId
-        | MutationError::InvalidPolicy(_)
-        | MutationError::InvalidObjectMutation(_)
-        | MutationError::BlobNotFound => (MutationFailureCode::Invalid, None),
-        MutationError::DurabilityUnavailable => (MutationFailureCode::DurabilityUnavailable, None),
-        MutationError::ReceiptCapacity | MutationError::SourceJournalCapacity => {
-            (MutationFailureCode::ResourceLimit, None)
-        }
-        MutationError::ObjectMutationLineageGap { .. }
-        | MutationError::ObjectMutationSibling { .. }
-        | MutationError::ObjectMutationConflict => (MutationFailureCode::Internal, None),
-        MutationError::Storage(_) => (MutationFailureCode::Internal, None),
-    };
-    MutationFailure {
-        code: code as i32,
-        message: error.to_string(),
-        current_version,
     }
 }
 

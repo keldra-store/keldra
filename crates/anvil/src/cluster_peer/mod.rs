@@ -4,6 +4,7 @@
 //! applied placement fence on every request and exposes logical operations,
 //! never RocksDB column-family keys or values.
 
+mod accounting;
 mod admin_transport;
 mod admission;
 mod authz;
@@ -12,6 +13,7 @@ mod control;
 mod index_artifacts;
 mod index_queries;
 mod logical_names;
+mod personaldb;
 mod programs;
 mod public_authz;
 mod public_authz_transport;
@@ -28,11 +30,15 @@ use anvil_store::Store;
 use crate::distributed_list::AuthoritativeListAuthorizer;
 use crate::index_runtime::publication::LateBoundIndexArtifactPublication;
 use crate::logical_name_resolution::LateBoundLogicalNameResolution;
+use crate::personaldb::RoutedPersonalDbHandlers;
 
 pub(crate) mod wire {
     tonic::include_proto!("anvil.cluster_peer.v1");
 }
 
+pub(crate) use accounting::{
+    AccountingTrafficFlush, RoutedAccountingHandler, RoutedAccountingHandlers,
+};
 pub(crate) use authz::LateBoundFreshAuthorization;
 pub(crate) use control::LateBoundDistributedControl;
 pub(crate) use index_artifacts::{IndexCurrentHead, IndexHeadScanPage, IndexHeadScanScope};
@@ -61,6 +67,8 @@ pub(crate) struct ClusterPeerService {
     name_resolution: LateBoundLogicalNameResolution,
     index_artifacts: LateBoundIndexArtifactPublication,
     routed_index_queries: RoutedIndexQueryHandlers,
+    routed_accounting: RoutedAccountingHandlers,
+    routed_personaldb: RoutedPersonalDbHandlers,
     routed: RoutedPublicHandlers,
     routed_authz: RoutedAuthzHandlers,
 }
@@ -80,6 +88,8 @@ impl ClusterPeerService {
         name_resolution: LateBoundLogicalNameResolution,
         index_artifacts: LateBoundIndexArtifactPublication,
         routed_index_queries: RoutedIndexQueryHandlers,
+        routed_accounting: RoutedAccountingHandlers,
+        routed_personaldb: RoutedPersonalDbHandlers,
         routed: RoutedPublicHandlers,
         routed_authz: RoutedAuthzHandlers,
     ) -> Self {
@@ -94,6 +104,8 @@ impl ClusterPeerService {
             name_resolution,
             index_artifacts,
             routed_index_queries,
+            routed_accounting,
+            routed_personaldb,
             routed,
             routed_authz,
         }

@@ -15,9 +15,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use aes_gcm::aead::{Aead, Payload};
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use anvil_authz::ObjectRef;
 use anvil_consensus::JwtSigningKeyFingerprint;
-use anvil_store::StorageTenantId;
+use anvil_store::{CredentialSecretEnvelope, StorageTenantId};
 use governor::clock::Clock;
 use governor::{DefaultDirectRateLimiter, DefaultKeyedRateLimiter, Quota, RateLimiter};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
@@ -40,6 +42,9 @@ const ACCESS_TOKEN_PURPOSE: &str = "access";
 const PUT_TOKEN_AUDIENCE: &str = "anvil-put";
 const PUT_TOKEN_PURPOSE: &str = "put";
 const JWT_SIGNING_KEY_FINGERPRINT_CONTEXT: &str = "anvil.auth/jwt-signing-key/v1";
+const CREDENTIAL_ENVELOPE_KEY_CONTEXT: &str = "anvil.auth/s3-credential-envelope/aes256gcm/v1";
+const PERSONALDB_SIGNING_MASTER_CONTEXT: &str = "anvil.personaldb/signing-master/v1";
+const CREDENTIAL_ENVELOPE_AAD_VERSION: u8 = 1;
 
 /// Identity established from trusted credentials for one request.
 ///
@@ -144,6 +149,16 @@ impl RequestRateLimits {
     ) -> Result<Request<T>, Status> {
         check_direct(&self.global, "server")?;
         self.authenticate_after_global_limit(tokens, request)
+    }
+
+    pub(crate) fn check_gateway_global(&self) -> Result<(), Status> {
+        check_direct(&self.global, "server")
+    }
+
+    pub(crate) fn check_gateway_identity(&self, caller: &Caller) -> Result<(), Status> {
+        check_keyed(&self.authenticated, caller, "authenticated caller")?;
+        self.retain_authenticated_recently();
+        Ok(())
     }
 
     /// Applies the normal authenticated path when a bearer is present. A
@@ -251,6 +266,19 @@ impl Caller {
         &self.subject
     }
 
+    pub(crate) fn authenticated_app_id(&self) -> Result<&str, AuthenticationError> {
+        match &self.subject.id {
+            anvil_authz::ObjectId::Opaque(app_id)
+                if !self.subject.is_public() && !self.subject.is_anonymous() =>
+            {
+                Ok(app_id)
+            }
+            _ => Err(AuthenticationError::InvalidIdentity(
+                "caller is not an authenticated application".into(),
+            )),
+        }
+    }
+
     pub(crate) fn from_authenticated_application(
         storage_tenant: StorageTenantId,
         app_id: impl Into<String>,
@@ -300,6 +328,8 @@ pub enum AuthenticationError {
     Verify(#[source] jsonwebtoken::errors::Error),
     #[error("token signing key file is invalid: {0}")]
     SigningKeyFile(String),
+    #[error("credential secret envelope could not be processed")]
+    CredentialEnvelope,
 }
 
 /// Loads a bounded operator-managed key without accepting a symbolic link.
@@ -367,6 +397,27 @@ pub struct JwtManager {
     watch_checkpoint_validation: Arc<Validation>,
     index_page_validation: Arc<Validation>,
     signing_key_fingerprint: JwtSigningKeyFingerprint,
+    credential_envelope_key: Arc<[u8; 32]>,
+    personaldb_signing_master: Arc<[u8; 32]>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PersonalDbSigningPurpose {
+    GroupControl,
+    ProjectionBuilder,
+    Snapshot,
+    Witness,
+}
+
+impl PersonalDbSigningPurpose {
+    const fn context(self) -> &'static str {
+        match self {
+            Self::GroupControl => "anvil.personaldb/group-control/ed25519/v1",
+            Self::ProjectionBuilder => "anvil.personaldb/projection-builder/ed25519/v1",
+            Self::Snapshot => "anvil.personaldb/snapshot/ed25519/v1",
+            Self::Witness => "anvil.personaldb/witness/ed25519/v1",
+        }
+    }
 }
 
 impl std::fmt::Debug for JwtManager {
@@ -435,7 +486,66 @@ impl JwtManager {
                 JWT_SIGNING_KEY_FINGERPRINT_CONTEXT,
                 signing_secret,
             )),
+            credential_envelope_key: Arc::new(blake3::derive_key(
+                CREDENTIAL_ENVELOPE_KEY_CONTEXT,
+                signing_secret,
+            )),
+            personaldb_signing_master: Arc::new(blake3::derive_key(
+                PERSONALDB_SIGNING_MASTER_CONTEXT,
+                signing_secret,
+            )),
         })
+    }
+
+    pub(crate) fn personaldb_signing_seed(&self, purpose: PersonalDbSigningPurpose) -> [u8; 32] {
+        blake3::derive_key(purpose.context(), self.personaldb_signing_master.as_ref())
+    }
+
+    pub(crate) fn seal_sigv4_secret(
+        &self,
+        storage_tenant: &StorageTenantId,
+        app_id: &str,
+        client_id: &str,
+        secret: &str,
+    ) -> Result<CredentialSecretEnvelope, AuthenticationError> {
+        let cipher = Aes256Gcm::new_from_slice(self.credential_envelope_key.as_ref())
+            .map_err(|_| AuthenticationError::CredentialEnvelope)?;
+        let mut nonce = [0_u8; 12];
+        getrandom::fill(&mut nonce).map_err(|_| AuthenticationError::CredentialEnvelope)?;
+        let aad = credential_envelope_aad(storage_tenant, app_id, client_id)?;
+        let ciphertext = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: secret.as_bytes(),
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| AuthenticationError::CredentialEnvelope)?;
+        CredentialSecretEnvelope::new(nonce, ciphertext)
+            .map_err(|_| AuthenticationError::CredentialEnvelope)
+    }
+
+    pub(crate) fn open_sigv4_secret(
+        &self,
+        storage_tenant: &StorageTenantId,
+        app_id: &str,
+        client_id: &str,
+        envelope: &CredentialSecretEnvelope,
+    ) -> Result<String, AuthenticationError> {
+        let cipher = Aes256Gcm::new_from_slice(self.credential_envelope_key.as_ref())
+            .map_err(|_| AuthenticationError::CredentialEnvelope)?;
+        let aad = credential_envelope_aad(storage_tenant, app_id, client_id)?;
+        let plaintext = cipher
+            .decrypt(
+                Nonce::from_slice(envelope.nonce()),
+                Payload {
+                    msg: envelope.ciphertext(),
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| AuthenticationError::CredentialEnvelope)?;
+        String::from_utf8(plaintext).map_err(|_| AuthenticationError::CredentialEnvelope)
     }
 
     /// Bounded, domain-separated identity of the operator-held HS256 key.
@@ -659,6 +769,21 @@ impl WatchCheckpointCodec for JwtManager {
         }
         Ok(claims)
     }
+}
+
+fn credential_envelope_aad(
+    storage_tenant: &StorageTenantId,
+    app_id: &str,
+    client_id: &str,
+) -> Result<Vec<u8>, AuthenticationError> {
+    let mut aad = vec![CREDENTIAL_ENVELOPE_AAD_VERSION];
+    for component in [storage_tenant.as_str(), app_id, client_id] {
+        let length =
+            u32::try_from(component.len()).map_err(|_| AuthenticationError::CredentialEnvelope)?;
+        aad.extend_from_slice(&length.to_be_bytes());
+        aad.extend_from_slice(component.as_bytes());
+    }
+    Ok(aad)
 }
 
 fn token_validation(audience: &'static str) -> Validation {
@@ -1013,6 +1138,40 @@ mod tests {
         assert_eq!(repeated.code(), tonic::Code::ResourceExhausted);
         assert!(repeated.message().contains("client credential"));
         limits.check_credential_exchange("client-b").unwrap();
+    }
+
+    #[test]
+    fn sigv4_secret_envelope_is_randomized_and_identity_authenticated() {
+        let manager = JwtManager::new(TEST_SIGNING_SECRET).unwrap();
+        let tenant = tenant("acme");
+        let first = manager
+            .seal_sigv4_secret(
+                &tenant,
+                "app",
+                "client",
+                "a-secret-with-at-least-32-bytes!!",
+            )
+            .unwrap();
+        let second = manager
+            .seal_sigv4_secret(
+                &tenant,
+                "app",
+                "client",
+                "a-secret-with-at-least-32-bytes!!",
+            )
+            .unwrap();
+        assert_ne!(first.nonce(), second.nonce());
+        assert_eq!(
+            manager
+                .open_sigv4_secret(&tenant, "app", "client", &first)
+                .unwrap(),
+            "a-secret-with-at-least-32-bytes!!"
+        );
+        assert!(
+            manager
+                .open_sigv4_secret(&tenant, "another-app", "client", &first)
+                .is_err()
+        );
     }
 
     #[test]

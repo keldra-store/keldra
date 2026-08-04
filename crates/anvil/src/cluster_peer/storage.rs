@@ -56,6 +56,77 @@ impl wire::cluster_peer_server::ClusterPeer for ClusterPeerService {
         self.route_index_query_call(request).await
     }
 
+    async fn route_create_personal_db_group(
+        &self,
+        request: Request<wire::RouteCreatePersonalDbGroupRequest>,
+    ) -> Result<Response<anvil_api::v1::PersonalDbGroup>, Status> {
+        self.route_create_personaldb_group_call(request).await
+    }
+
+    async fn route_change_personal_db_group_role(
+        &self,
+        request: Request<wire::RouteChangePersonalDbGroupRoleRequest>,
+    ) -> Result<Response<anvil_api::v1::PersonalDbGroupRoleChange>, Status> {
+        self.route_change_personaldb_group_role_call(request).await
+    }
+
+    async fn route_append_personal_db_entry(
+        &self,
+        request: Request<wire::RouteAppendPersonalDbEntryRequest>,
+    ) -> Result<Response<anvil_api::v1::PersonalDbCommit>, Status> {
+        self.route_append_personaldb_entry_call(request).await
+    }
+
+    async fn route_materialize_personal_db_projection(
+        &self,
+        request: Request<wire::RouteMaterializePersonalDbProjectionRequest>,
+    ) -> Result<Response<anvil_api::v1::PersonalDbMaterialization>, Status> {
+        self.route_materialize_personaldb_projection_call(request)
+            .await
+    }
+
+    async fn route_register_personal_db_snapshot(
+        &self,
+        request: Request<wire::RouteRegisterPersonalDbSnapshotRequest>,
+    ) -> Result<Response<anvil_api::v1::PersonalDbSnapshot>, Status> {
+        self.route_register_personaldb_snapshot_call(request).await
+    }
+
+    async fn apply_personal_db_role(
+        &self,
+        request: Request<wire::ApplyPersonalDbRoleRequest>,
+    ) -> Result<Response<anvil_api::v1::PersonalDbGroupRoleChange>, Status> {
+        self.apply_personaldb_role_call(request).await
+    }
+
+    async fn route_enable_accounting(
+        &self,
+        request: Request<wire::RouteEnableAccountingRequest>,
+    ) -> Result<Response<anvil_api::v1::AccountingDefinition>, Status> {
+        self.route_enable_accounting_call(request).await
+    }
+
+    async fn route_disable_accounting(
+        &self,
+        request: Request<wire::RouteDisableAccountingRequest>,
+    ) -> Result<Response<anvil_api::v1::DisableAccountingResponse>, Status> {
+        self.route_disable_accounting_call(request).await
+    }
+
+    async fn route_get_accounting(
+        &self,
+        request: Request<wire::RouteGetAccountingRequest>,
+    ) -> Result<Response<anvil_api::v1::AccountingSnapshot>, Status> {
+        self.route_get_accounting_call(request).await
+    }
+
+    async fn flush_accounting_traffic(
+        &self,
+        request: Request<wire::FlushAccountingTrafficRequest>,
+    ) -> Result<Response<wire::FlushAccountingTrafficResponse>, Status> {
+        self.flush_accounting_traffic_call(request).await
+    }
+
     async fn resolve_tenant_name(
         &self,
         request: Request<wire::ResolveTenantNameRequest>,
@@ -359,6 +430,14 @@ impl wire::cluster_peer_server::ClusterPeer for ClusterPeerService {
         if raw.include_index_definitions {
             query = query.for_index_definitions()?;
         }
+        if raw.include_personaldb_manifests {
+            if raw.include_index_definitions {
+                return Err(Status::invalid_argument(
+                    "a local list request may select only one reserved scope",
+                ));
+            }
+            query = query.for_personaldb_manifests()?;
+        }
         self.list_authorizer.authorize(&bearer, &query).await?;
         let deadline = Instant::now()
             .checked_add(admitted.timeout)
@@ -371,6 +450,18 @@ impl wire::cluster_peer_server::ClusterPeer for ClusterPeerService {
             let owned = bounded_blocking(visibility_remaining(deadline)?, move || {
                 let page = if query.includes_index_definitions() {
                     store.list_local_owned_index_definitions(
+                        query.tenant_id(),
+                        query.bucket_id(),
+                        query.prefix(),
+                        query.start_after(),
+                        query.limit(),
+                        |tenant_id, bucket_id, path| {
+                            object_coordinator(&placement, tenant_id, bucket_id, path)
+                                == Some(local_node)
+                        },
+                    )
+                } else if query.includes_personaldb_manifests() {
+                    store.list_local_owned_personaldb_manifests(
                         query.tenant_id(),
                         query.bucket_id(),
                         query.prefix(),
@@ -561,6 +652,13 @@ impl wire::cluster_peer_server::ClusterPeer for ClusterPeerService {
         request: Request<wire::RouteDeleteIfVersionRequest>,
     ) -> Result<Response<anvil_api::v1::MutationReceipt>, Status> {
         self.route_internal_delete_if_version_call(request).await
+    }
+
+    async fn route_internal_put_end(
+        &self,
+        request: Request<wire::RoutePutEndRequest>,
+    ) -> Result<Response<anvil_api::v1::MutationReceipt>, Status> {
+        self.route_internal_put_end_call(request).await
     }
 
     async fn route_internal_bulk_write(

@@ -118,6 +118,17 @@ impl RoutedPublicHandler for RoutedObjectWrites {
         )
     }
 
+    async fn internal_put_end(
+        &self,
+        call: RoutedCall<PutToken>,
+    ) -> Result<MutationReceipt, Status> {
+        Ok(
+            ObjectService::put_end(&self.service, self.authenticated_request(call, true)?)
+                .await?
+                .into_inner(),
+        )
+    }
+
     async fn internal_bulk_write(
         &self,
         call: RoutedCall<BulkWriteRequest>,

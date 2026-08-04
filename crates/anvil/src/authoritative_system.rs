@@ -168,6 +168,22 @@ impl AuthoritativeSystemAuthorization {
                 "bucket policy does not belong to the authenticated tenant",
             ));
         }
+        self.allows_bucket_policy_with_evidence(caller, tenant, bucket)
+            .await
+            .map(|result| result.allowed[0])
+    }
+
+    pub(crate) async fn allows_bucket_policy_with_evidence(
+        &self,
+        caller: &Caller,
+        tenant: &str,
+        bucket: &str,
+    ) -> Result<FreshAuthorizationResult, Status> {
+        if tenant != caller.storage_tenant().as_str() {
+            return Err(Status::permission_denied(
+                "bucket policy does not belong to the authenticated tenant",
+            ));
+        }
         let (tenant_id, bucket_id) = self.names.resolve_bucket_ids(tenant, bucket).await?;
         let check = bucket_policy_authorization_check(caller.subject(), tenant, bucket)
             .map_err(crate::authz_api::authz_status)?;
@@ -182,7 +198,6 @@ impl AuthoritativeSystemAuthorization {
             }],
         )
         .await
-        .map(|result| result.allowed[0])
     }
 
     pub(crate) async fn fresh_system_check(

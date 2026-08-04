@@ -1,8 +1,10 @@
 use std::time::Duration;
 
 use anvil_api::v1::{
-    BucketPolicy as ApiBucketPolicy, BulkWriteRequest, BulkWriteResponse, DeleteIfVersionRequest,
-    DeleteRequest, DeleteVersionRequest, DeleteVersionResponse, MutationReceipt, PutToken,
+    AccountingDefinition, AccountingSnapshot, BucketPolicy as ApiBucketPolicy, BulkWriteRequest,
+    BulkWriteResponse, DeleteIfVersionRequest, DeleteRequest, DeleteVersionRequest,
+    DeleteVersionResponse, DisableAccountingRequest, DisableAccountingResponse,
+    EnableAccountingRequest, GetAccountingRequest, MutationReceipt, PutToken,
     SetBucketPolicyRequest,
 };
 use anvil_consensus::{DecisionRaft, NodeId};
@@ -44,6 +46,92 @@ pub(crate) struct ClusterPeerTransport {
 }
 
 impl ClusterPeerTransport {
+    pub(crate) async fn route_enable_accounting(
+        &self,
+        target: NodeId,
+        address: &str,
+        bearer: &str,
+        value: EnableAccountingRequest,
+        remaining: Duration,
+    ) -> Result<AccountingDefinition, Status> {
+        let fence = self.placement()?.fence();
+        let mut request = Request::new(wire::RouteEnableAccountingRequest {
+            peer: Some(self.context(fence, 1, remaining)?),
+            request: Some(value),
+        });
+        add_bearer_and_timeout(&mut request, bearer, remaining)?;
+        Ok(self
+            .client(target, address)?
+            .route_enable_accounting(request)
+            .await?
+            .into_inner())
+    }
+
+    pub(crate) async fn route_disable_accounting(
+        &self,
+        target: NodeId,
+        address: &str,
+        bearer: &str,
+        value: DisableAccountingRequest,
+        remaining: Duration,
+    ) -> Result<DisableAccountingResponse, Status> {
+        let fence = self.placement()?.fence();
+        let mut request = Request::new(wire::RouteDisableAccountingRequest {
+            peer: Some(self.context(fence, 1, remaining)?),
+            request: Some(value),
+        });
+        add_bearer_and_timeout(&mut request, bearer, remaining)?;
+        Ok(self
+            .client(target, address)?
+            .route_disable_accounting(request)
+            .await?
+            .into_inner())
+    }
+
+    pub(crate) async fn route_get_accounting(
+        &self,
+        target: NodeId,
+        address: &str,
+        bearer: &str,
+        value: GetAccountingRequest,
+        remaining: Duration,
+    ) -> Result<AccountingSnapshot, Status> {
+        let fence = self.placement()?.fence();
+        let mut request = Request::new(wire::RouteGetAccountingRequest {
+            peer: Some(self.context(fence, 1, remaining)?),
+            request: Some(value),
+        });
+        add_bearer_and_timeout(&mut request, bearer, remaining)?;
+        Ok(self
+            .client(target, address)?
+            .route_get_accounting(request)
+            .await?
+            .into_inner())
+    }
+
+    pub(crate) async fn flush_accounting_traffic(
+        &self,
+        target: NodeId,
+        address: &str,
+        value: &super::AccountingTrafficFlush,
+    ) -> Result<bool, Status> {
+        let placement = self.placement()?;
+        let response = self
+            .client(target, address)?
+            .flush_accounting_traffic(wire::FlushAccountingTrafficRequest {
+                peer: Some(self.context(placement.fence(), 0, MAX_CLUSTER_OPERATION_TIME)?),
+                accounting_id: value.accounting_id,
+                source_node_id: value.source_node.0,
+                accepted_inbound_bytes: value.accepted_inbound_bytes,
+                served_outbound_bytes: value.served_outbound_bytes,
+                flush_id: value.flush_id.clone(),
+            })
+            .await?
+            .into_inner();
+        require_response_schema(response.schema_version)?;
+        Ok(response.replayed)
+    }
+
     pub(crate) fn new(data: DataPeerTransport, decisions: DecisionRaft) -> Self {
         Self { data, decisions }
     }
@@ -115,6 +203,11 @@ impl ClusterPeerTransport {
             super::IndexHeadScanScope::Definitions => {
                 wire::scan_index_heads_request::Scope::Definitions(wire::AllIndexDefinitionHeads {})
             }
+            super::IndexHeadScanScope::AccountingDefinitions => {
+                wire::scan_index_heads_request::Scope::AccountingDefinitions(
+                    wire::AllAccountingDefinitionHeads {},
+                )
+            }
             super::IndexHeadScanScope::Generation {
                 tenant_id,
                 bucket_id,
@@ -135,6 +228,17 @@ impl ClusterPeerTransport {
                     path_prefix,
                 })
             }
+            super::IndexHeadScanScope::AccountingSourceObjects {
+                tenant_id,
+                bucket_id,
+                path_prefix,
+            } => wire::scan_index_heads_request::Scope::AccountingSourceObjects(
+                wire::AccountingSourceObjectHeads {
+                    tenant_id,
+                    bucket_id,
+                    path_prefix,
+                },
+            ),
         };
         let response = self
             .client(target, address)?
@@ -246,6 +350,27 @@ impl ClusterPeerTransport {
         Ok(self
             .client(target, address)?
             .route_put_end(request)
+            .await?
+            .into_inner())
+    }
+
+    pub(crate) async fn route_internal_put_end(
+        &self,
+        target: NodeId,
+        address: &str,
+        bearer: &str,
+        value: PutToken,
+        remaining: Duration,
+    ) -> Result<MutationReceipt, Status> {
+        let fence = self.placement()?.fence();
+        let mut request = Request::new(wire::RoutePutEndRequest {
+            peer: Some(self.context(fence, 1, remaining)?),
+            request: Some(value),
+        });
+        add_bearer_and_timeout(&mut request, bearer, remaining)?;
+        Ok(self
+            .client(target, address)?
+            .route_internal_put_end(request)
             .await?
             .into_inner())
     }
@@ -803,6 +928,7 @@ impl ClusterListPeers for ClusterPeerTransport {
             limit: u32::try_from(query.limit())
                 .map_err(|_| Status::invalid_argument("list limit exceeds u32"))?,
             include_index_definitions: query.includes_index_definitions(),
+            include_personaldb_manifests: query.includes_personaldb_manifests(),
         });
         add_bearer_and_timeout(
             &mut request,

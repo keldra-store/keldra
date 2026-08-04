@@ -432,7 +432,7 @@ impl DistributedControlPlane {
             storage_tenant: storage_tenant.clone(),
         };
         let existing = self.read_record(&name_id).await?;
-        let prepared = if let Some(existing) = existing {
+        let mut prepared = if let Some(existing) = existing {
             let LogicalRecordValue::TenantNameClaim { tenant_id, .. } = existing else {
                 return Err(Status::data_loss(
                     "tenant-name claim has the wrong typed value",
@@ -502,6 +502,14 @@ impl DistributedControlPlane {
                 .map_err(credential_status)?
         };
 
+        install_sigv4_secret(
+            &self.tokens,
+            &mut prepared.logical_records,
+            &storage_tenant,
+            &request.owner_app_id,
+            &request.owner_client_id,
+            &request.owner_client_secret,
+        )?;
         for value in prepared.logical_records.iter().cloned() {
             self.ensure_administration_record(value, Some(&request.owner_client_secret))
                 .await?;
@@ -689,7 +697,7 @@ impl DistributedControlPlane {
         {
             return Ok(credential_to_api(credential, true));
         }
-        let prepared = self
+        let mut prepared = self
             .store
             .prepare_application_creation(ApplicationCredentialRequest {
                 storage_tenant: storage_tenant.clone(),
@@ -698,6 +706,14 @@ impl DistributedControlPlane {
                 client_secret: request.client_secret.clone(),
             })
             .map_err(credential_status)?;
+        install_sigv4_secret(
+            &self.tokens,
+            &mut prepared.logical_records,
+            &storage_tenant,
+            &request.app_id,
+            &request.client_id,
+            &request.client_secret,
+        )?;
         for value in prepared.logical_records {
             self.ensure_administration_record(value, Some(&request.client_secret))
                 .await?;
@@ -758,7 +774,7 @@ impl DistributedControlPlane {
         {
             return Ok(credential_to_api(credential, true));
         }
-        let prepared = self
+        let mut prepared = self
             .store
             .prepare_credential_rotation(ApplicationCredentialRequest {
                 storage_tenant: storage_tenant.clone(),
@@ -767,6 +783,14 @@ impl DistributedControlPlane {
                 client_secret: request.client_secret.clone(),
             })
             .map_err(credential_status)?;
+        install_sigv4_secret(
+            &self.tokens,
+            &mut prepared.logical_records,
+            &storage_tenant,
+            &request.app_id,
+            &request.client_id,
+            &request.client_secret,
+        )?;
         let value =
             prepared.logical_records.into_iter().next().ok_or_else(|| {
                 Status::internal("credential rotation produced no logical record")
@@ -1032,6 +1056,41 @@ impl DistributedControlPlane {
         })
     }
 
+    /// Reads the current quorum-selected application credential for a SigV4
+    /// verifier. The returned record contains only its encrypted secret
+    /// envelope; decryption remains local to the authenticated HTTP ingress.
+    pub(crate) async fn resolve_sigv4_credential(
+        &self,
+        client_id: &str,
+    ) -> Result<LogicalCredentialRecord, Status> {
+        let value = self
+            .read_record(&LogicalRecordId::Credential {
+                client_id: client_id.to_owned(),
+            })
+            .await?
+            .ok_or_else(invalid_credentials)?;
+        let LogicalRecordValue::Credential(credential) = value else {
+            return Err(Status::data_loss("credential record has the wrong type"));
+        };
+        if !credential.active() {
+            return Err(invalid_credentials());
+        }
+        let application = self
+            .read_record(&LogicalRecordId::Application {
+                app_id: credential.app_id().to_owned(),
+            })
+            .await?;
+        match application {
+            Some(LogicalRecordValue::Application(record))
+                if record.app_id == credential.app_id()
+                    && record.client_id == credential.client_id()
+                    && record.storage_tenant == *credential.storage_tenant() => {}
+            Some(_) => return Err(Status::data_loss("application and credential disagree")),
+            None => return Err(invalid_credentials()),
+        }
+        Ok(credential)
+    }
+
     async fn require_identity_absent(&self, app_id: &str, client_id: &str) -> Result<(), Status> {
         if self
             .read_record(&LogicalRecordId::Application {
@@ -1201,7 +1260,7 @@ impl DistributedControlPlane {
         })
     }
 
-    async fn apply_system_grant(
+    pub(crate) async fn apply_system_grant(
         &self,
         request: TupleBatchRequest,
     ) -> Result<TupleBatchReceipt, Status> {
@@ -1219,6 +1278,29 @@ impl DistributedControlPlane {
             .await?;
         self.require_same_system_realm_target(&target)?;
         Ok(receipt)
+    }
+
+    pub(crate) async fn require_personaldb_application(
+        &self,
+        storage_tenant: &StorageTenantId,
+        app_id: &str,
+    ) -> Result<(), Status> {
+        match self
+            .read_record(&LogicalRecordId::Application {
+                app_id: app_id.to_owned(),
+            })
+            .await?
+        {
+            Some(LogicalRecordValue::Application(application))
+                if application.storage_tenant == *storage_tenant =>
+            {
+                Ok(())
+            }
+            Some(LogicalRecordValue::Application(_)) | None => {
+                Err(Status::not_found("application does not exist"))
+            }
+            Some(_) => Err(Status::data_loss("application record has the wrong type")),
+        }
     }
 
     async fn authorize_application_management(
@@ -1563,6 +1645,37 @@ fn credential_to_api(
         active: credential.active,
         replayed,
     }
+}
+
+fn install_sigv4_secret(
+    tokens: &JwtManager,
+    records: &mut [LogicalRecordValue],
+    storage_tenant: &StorageTenantId,
+    app_id: &str,
+    client_id: &str,
+    secret: &str,
+) -> Result<(), Status> {
+    let envelope = tokens
+        .seal_sigv4_secret(storage_tenant, app_id, client_id, secret)
+        .map_err(|_| Status::internal("SigV4 credential envelope could not be sealed"))?;
+    let mut installed = false;
+    for record in records {
+        if let LogicalRecordValue::Credential(credential) = record {
+            if installed {
+                return Err(Status::internal(
+                    "credential preparation produced duplicate credential records",
+                ));
+            }
+            credential.install_sigv4_secret(envelope.clone());
+            installed = true;
+        }
+    }
+    if !installed {
+        return Err(Status::internal(
+            "credential preparation produced no credential record",
+        ));
+    }
+    Ok(())
 }
 
 fn credential_state_to_api(

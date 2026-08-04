@@ -63,6 +63,8 @@ pub(crate) trait RoutedPublicHandler: Send + Sync + 'static {
         &self,
         call: RoutedCall<BulkWriteRequest>,
     ) -> Result<BulkWriteResponse, Status>;
+    async fn internal_put_end(&self, call: RoutedCall<PutToken>)
+    -> Result<MutationReceipt, Status>;
     async fn internal_delete_if_version(
         &self,
         call: RoutedCall<DeleteIfVersionRequest>,
@@ -215,6 +217,26 @@ impl ClusterPeerService {
                 .map_err(|_| {
                     Status::deadline_exceeded("routed internal DeleteIfVersion deadline exceeded")
                 })??;
+        self.require_unchanged(fence)?;
+        Ok(Response::new(response))
+    }
+
+    pub(super) async fn route_internal_put_end_call(
+        &self,
+        request: Request<wire::RoutePutEndRequest>,
+    ) -> Result<Response<MutationReceipt>, Status> {
+        let (call, timeout) =
+            self.routed_call(
+                &request,
+                request.get_ref().peer.as_ref(),
+                request.get_ref().request.clone().ok_or_else(|| {
+                    Status::invalid_argument("internal PutEnd request is required")
+                })?,
+            )?;
+        let fence = call.placement_fence;
+        let response = tokio::time::timeout(timeout, self.routed.get()?.internal_put_end(call))
+            .await
+            .map_err(|_| Status::deadline_exceeded("routed internal PutEnd deadline exceeded"))??;
         self.require_unchanged(fence)?;
         Ok(Response::new(response))
     }
