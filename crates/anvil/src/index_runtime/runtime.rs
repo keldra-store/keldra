@@ -40,6 +40,9 @@ pub(crate) struct RunningIndexRuntime {
     pub(crate) definitions: Arc<dyn IndexDefinitionLister>,
     pub(crate) queries: Arc<dyn IndexQueryExecutor>,
     pub(crate) local_queries: Arc<dyn LocalIndexQueryExecutor>,
+    pub(crate) event_router: IndexEventRouter,
+    pub(crate) scanner: ClusterIndexScanner,
+    pub(crate) artifact_router: IndexArtifactRouter,
     _definition_discovery: tokio::task::JoinHandle<()>,
     _event_router: IndexEventRouterTask,
     _builders: IndexBuilderManagerTask,
@@ -118,14 +121,14 @@ pub(crate) async fn start(
         artifact_router.clone(),
     );
     let generation_retention =
-        IndexGenerationRetention::new(scanner.clone(), artifact_router, config);
+        IndexGenerationRetention::new(scanner.clone(), artifact_router.clone(), config);
     let builders = IndexBuilderManagerTask::start(
         local_node,
         decisions,
         catalog.clone(),
         IndexBuilderDependencies {
-            router: event_router,
-            scanner,
+            router: event_router.clone(),
+            scanner: scanner.clone(),
             reader,
             publisher,
             retention: generation_retention,
@@ -136,6 +139,9 @@ pub(crate) async fn start(
         definitions: Arc::new(catalog),
         queries,
         local_queries,
+        event_router,
+        scanner,
+        artifact_router,
         _definition_discovery: definition_discovery,
         _event_router: event_router_task,
         _builders: builders,

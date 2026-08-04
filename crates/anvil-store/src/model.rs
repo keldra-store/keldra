@@ -218,6 +218,8 @@ pub struct ObjectMutation {
     pub receipt_expires_at_unix_millis: u64,
     pub stamp: MutationStamp,
     pub reference_deltas: Vec<ReferenceDelta>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accounting_transition: Option<crate::AccountingHeadTransition>,
 }
 
 impl ObjectMutation {
@@ -250,6 +252,11 @@ impl ObjectMutation {
         for delta in &self.reference_deltas {
             hash_blob(&mut hasher, &delta.blob);
             hasher.update(&delta.change.to_be_bytes());
+        }
+        if let Some(transition) = self.accounting_transition {
+            hasher.update(b"anvil.accounting-head-transition.v1");
+            hash_optional_u64(&mut hasher, transition.previous_live_length);
+            hash_optional_u64(&mut hasher, transition.current_live_length);
         }
         *hasher.finalize().as_bytes()
     }
@@ -345,6 +352,20 @@ impl ObjectMutation {
             {
                 return Err(MutationError::InvalidObjectMutation(
                     "object mutation repeats one reference delta".into(),
+                ));
+            }
+        }
+        if let Some(transition) = self.accounting_transition {
+            transition
+                .validate()
+                .map_err(|error| MutationError::InvalidObjectMutation(error.into()))?;
+            let current_live_length = self.version.blob.as_ref().map(|blob| blob.length);
+            if transition.current_live_length != current_live_length
+                || (self.stamp.predecessor_version.is_none()
+                    && transition.previous_live_length.is_some())
+            {
+                return Err(MutationError::InvalidObjectMutation(
+                    "accounting head-transition does not match mutation lineage".into(),
                 ));
             }
         }

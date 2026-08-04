@@ -21,12 +21,18 @@ const INDEX_HEAD_SCAN_MAX_BYTES: u64 = 8 * 1024 * 1024;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum IndexHeadScanScope {
     Definitions,
+    AccountingDefinitions,
     Generation {
         tenant_id: u64,
         bucket_id: u64,
         index_id: u64,
     },
     SourceObjects {
+        tenant_id: u64,
+        bucket_id: u64,
+        path_prefix: String,
+    },
+    AccountingSourceObjects {
         tenant_id: u64,
         bucket_id: u64,
         path_prefix: String,
@@ -164,6 +170,9 @@ impl IndexHeadScanScope {
     fn matches(&self, snapshot: &ObjectPathSnapshot) -> bool {
         match self {
             Self::Definitions => index_definition_name(&snapshot.exact_path).is_some(),
+            Self::AccountingDefinitions => {
+                crate::accounting::definition_id_from_path(&snapshot.exact_path).is_some()
+            }
             Self::Generation {
                 tenant_id,
                 bucket_id,
@@ -184,11 +193,24 @@ impl IndexHeadScanScope {
                     && path_matches_prefix(&snapshot.exact_path, path_prefix)
                     && !contains_reserved_segment(&snapshot.exact_path)
             }
+            Self::AccountingSourceObjects {
+                tenant_id,
+                bucket_id,
+                path_prefix,
+            } => {
+                snapshot.tenant_id == *tenant_id
+                    && snapshot.bucket_id == *bucket_id
+                    && !snapshot.head.deleted
+                    && crate::accounting::includes_path(path_prefix, &snapshot.exact_path)
+            }
         }
     }
 
     fn is_source_objects(&self) -> bool {
-        matches!(self, Self::SourceObjects { .. })
+        matches!(
+            self,
+            Self::SourceObjects { .. } | Self::AccountingSourceObjects { .. }
+        )
     }
 }
 
@@ -256,6 +278,9 @@ fn decode_scan_scope(request: &wire::ScanIndexHeadsRequest) -> Result<IndexHeadS
         Some(wire::scan_index_heads_request::Scope::Definitions(_)) => {
             Ok(IndexHeadScanScope::Definitions)
         }
+        Some(wire::scan_index_heads_request::Scope::AccountingDefinitions(_)) => {
+            Ok(IndexHeadScanScope::AccountingDefinitions)
+        }
         Some(wire::scan_index_heads_request::Scope::Generation(scope))
             if scope.tenant_id != 0 && scope.bucket_id != 0 && scope.index_id != 0 =>
         {
@@ -282,6 +307,22 @@ fn decode_scan_scope(request: &wire::ScanIndexHeadsRequest) -> Result<IndexHeadS
         Some(wire::scan_index_heads_request::Scope::SourceObjects(_)) => {
             Err(Status::invalid_argument(
                 "index source-object stable IDs and ordinary path prefix are invalid",
+            ))
+        }
+        Some(wire::scan_index_heads_request::Scope::AccountingSourceObjects(scope))
+            if scope.tenant_id != 0
+                && scope.bucket_id != 0
+                && valid_source_prefix(&scope.path_prefix) =>
+        {
+            Ok(IndexHeadScanScope::AccountingSourceObjects {
+                tenant_id: scope.tenant_id,
+                bucket_id: scope.bucket_id,
+                path_prefix: scope.path_prefix.clone(),
+            })
+        }
+        Some(wire::scan_index_heads_request::Scope::AccountingSourceObjects(_)) => {
+            Err(Status::invalid_argument(
+                "accounting source-object stable IDs and ordinary path prefix are invalid",
             ))
         }
         None => Err(Status::invalid_argument(

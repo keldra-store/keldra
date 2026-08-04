@@ -18,9 +18,15 @@ use crate::store::{
     version_blob_reference, version_key,
 };
 use crate::{
-    BlobRef, Head, MutationError, ObjectKey, ObjectVersioning, ReferenceDelta, Store, Version,
-    VersionId,
+    AccountingHeadTransition, BlobRef, Head, MutationError, ObjectKey, ObjectVersioning,
+    ReferenceDelta, Store, Version, VersionId,
 };
+
+fn live_version_length(version: &Version) -> Option<u64> {
+    (!version.deleted)
+        .then(|| version.blob.as_ref().map(|blob| blob.length))
+        .flatten()
+}
 
 mod distributed;
 
@@ -1149,6 +1155,16 @@ impl Store {
                 })?;
             let version_bytes =
                 serde_json::to_vec(&write.version).map_err(program_storage_error)?;
+            let old_version = current_versions
+                .get(&write.path)
+                .ok_or_else(|| {
+                    ProgramStoreError::Storage("write has no current-version observation".into())
+                })?
+                .as_ref();
+            let accounting_transition = AccountingHeadTransition::new(
+                old_version.and_then(live_version_length),
+                live_version_length(&write.version),
+            );
             let encoded_version_key = version_key(identity, &key, write.version.id);
             let existing = self.raw_get(CF_VERSIONS, &encoded_version_key)?;
             if let Some(existing) = &existing {
@@ -1161,14 +1177,6 @@ impl Store {
                 let versioning = *versioning_by_path.get(&write.path).ok_or_else(|| {
                     ProgramStoreError::Storage("write has no bucket versioning decision".into())
                 })?;
-                let old_version = current_versions
-                    .get(&write.path)
-                    .ok_or_else(|| {
-                        ProgramStoreError::Storage(
-                            "write has no current-version observation".into(),
-                        )
-                    })?
-                    .as_ref();
                 let old_blob = old_version
                     .map(version_blob_reference)
                     .transpose()
@@ -1251,6 +1259,7 @@ impl Store {
                 path_version: write.version.id,
                 deleted: write.version.deleted,
                 reference_deltas,
+                accounting_transition: Some(accounting_transition),
             });
         }
         let bundle_reference = BlobRef::from(loaded.bundle);

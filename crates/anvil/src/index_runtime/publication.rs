@@ -17,6 +17,7 @@ use crate::object_distribution::ObjectDistribution;
 use super::placement::{IndexIdentity, IndexPlacement};
 
 const INDEX_ARTIFACT_CONTENT_TYPE: &str = "application/vnd.anvil.index-artifact";
+const ACCOUNTING_ARTIFACT_CONTENT_TYPE: &str = "application/vnd.anvil.accounting+json";
 
 #[derive(Clone, Debug)]
 pub(crate) struct IndexArtifactPublish {
@@ -94,7 +95,11 @@ impl IndexArtifactPublish {
             (ArtifactPathKind::Current, Some(VersionId(0))) => Err(Status::invalid_argument(
                 "index current-pointer expected version must be non-zero",
             )),
-            (ArtifactPathKind::Current, _) | (ArtifactPathKind::Immutable, None) => Ok(kind),
+            (ArtifactPathKind::AccountingMutable, Some(VersionId(0))) => Err(
+                Status::invalid_argument("accounting artifact expected version must be non-zero"),
+            ),
+            (ArtifactPathKind::Current | ArtifactPathKind::AccountingMutable, _)
+            | (ArtifactPathKind::Immutable, None) => Ok(kind),
             (ArtifactPathKind::Immutable, Some(_)) => Err(Status::invalid_argument(
                 "immutable index generation artifacts cannot be replaced",
             )),
@@ -106,6 +111,7 @@ impl IndexArtifactPublish {
 enum ArtifactPathKind {
     Current,
     Immutable,
+    AccountingMutable,
 }
 
 /// Destination-side late-bound handler on the mandatory-mTLS listener.
@@ -365,9 +371,28 @@ impl IndexArtifactPublication for IndexArtifactCoordinator {
         }
         self.validate_builder(authenticated_builder, &placement, identity, &key)?;
         let mode = match (kind, request.expected_version) {
-            (ArtifactPathKind::Current, Some(version)) => PutMode::PutIfVersion(version),
-            (ArtifactPathKind::Current | ArtifactPathKind::Immutable, None) => PutMode::PutIfAbsent,
+            (ArtifactPathKind::Current | ArtifactPathKind::AccountingMutable, Some(version)) => {
+                PutMode::PutIfVersion(version)
+            }
+            (
+                ArtifactPathKind::Current
+                | ArtifactPathKind::Immutable
+                | ArtifactPathKind::AccountingMutable,
+                None,
+            ) => PutMode::PutIfAbsent,
             (ArtifactPathKind::Immutable, Some(_)) => unreachable!("validated above"),
+        };
+        let content_type = match kind {
+            ArtifactPathKind::AccountingMutable => ACCOUNTING_ARTIFACT_CONTENT_TYPE,
+            ArtifactPathKind::Current | ArtifactPathKind::Immutable => INDEX_ARTIFACT_CONTENT_TYPE,
+        };
+        let durability = match kind {
+            // Accounting artifacts remain ordinary placed objects. LOCAL is
+            // only their acknowledgement threshold, so a one-node deployment
+            // can use accounting while normal placement still converges as
+            // nodes become available.
+            ArtifactPathKind::AccountingMutable => Durability::Local,
+            ArtifactPathKind::Current | ArtifactPathKind::Immutable => Durability::Replicated,
         };
         let receipt = self
             .objects
@@ -375,10 +400,10 @@ impl IndexArtifactPublication for IndexArtifactCoordinator {
                 PublishRequest {
                     key,
                     blob: request.blob,
-                    content_type: Some(INDEX_ARTIFACT_CONTENT_TYPE.into()),
+                    content_type: Some(content_type.into()),
                     mode,
                     command_id: Some(request.command_id),
-                    durability: Durability::Replicated,
+                    durability,
                 },
                 authenticated_builder,
                 governance,
@@ -426,6 +451,10 @@ impl IndexArtifactPublication for IndexArtifactCoordinator {
                 replayed: true,
             });
         }
+        let durability = match kind {
+            ArtifactPathKind::AccountingMutable => Durability::Local,
+            ArtifactPathKind::Current | ArtifactPathKind::Immutable => Durability::Replicated,
+        };
         let receipt = self
             .objects
             .mutate_with_governance(
@@ -433,7 +462,7 @@ impl IndexArtifactPublication for IndexArtifactCoordinator {
                     key,
                     precondition: Precondition::Version(request.expected_version),
                     command_id: Some(request.command_id),
-                    durability: Durability::Replicated,
+                    durability,
                 }),
                 governance,
             )
@@ -468,6 +497,9 @@ fn retained_delete_outcome(
 }
 
 fn parse_artifact_path(path: &str, expected_index: u64) -> Result<ArtifactPathKind, Status> {
+    if crate::accounting::is_artifact_path(path, expected_index) {
+        return Ok(ArtifactPathKind::AccountingMutable);
+    }
     let parts = path.split('/').collect::<Vec<_>>();
     if parts.len() < 4
         || parts[0] != "_anvil"

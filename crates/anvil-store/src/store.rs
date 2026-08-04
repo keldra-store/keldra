@@ -25,11 +25,11 @@ use crate::watch::{
     invalidation_key, invalidation_record_bytes, offset_from_key,
 };
 use crate::{
-    AWAITING_PUBLISH, BatchOperation, BatchOutcome, BlobReader, BlobRef, BlobReferenceState,
-    BlobStore, BucketPolicy, DeleteRequest, DeleteRetainedVersionOutcome, Durability, Head,
-    MutationError, MutationReceipt, Object, ObjectKey, ObjectVersioning, Precondition,
-    PublishRequest, PutMode, PutRequest, ReferenceDelta, SMALL_BLOB_MAX_BYTES, StorageTenantId,
-    Version, VersionClock, VersionId,
+    AWAITING_PUBLISH, AccountingHeadTransition, BatchOperation, BatchOutcome, BlobReader, BlobRef,
+    BlobReferenceState, BlobStore, BucketPolicy, DeleteRequest, DeleteRetainedVersionOutcome,
+    Durability, Head, MutationError, MutationReceipt, Object, ObjectKey, ObjectVersioning,
+    Precondition, PublishRequest, PutMode, PutRequest, ReferenceDelta, SMALL_BLOB_MAX_BYTES,
+    StorageTenantId, Version, VersionClock, VersionId,
 };
 
 const PROGRAM_DEFINITION_PREFIX: &str = "_anvil/programs/";
@@ -140,6 +140,7 @@ pub(crate) enum PendingLocalChange {
         path_version: VersionId,
         deleted: bool,
         reference_deltas: Vec<ReferenceDelta>,
+        accounting_transition: Option<crate::AccountingHeadTransition>,
     },
     RetainedVersionDeleted {
         identity: BucketIdentity,
@@ -147,6 +148,7 @@ pub(crate) enum PendingLocalChange {
         deleted_version: VersionId,
         resulting_head_version: Option<VersionId>,
         reference_deltas: Vec<ReferenceDelta>,
+        accounting_transition: Option<crate::AccountingHeadTransition>,
     },
     AggregateChanged {
         aggregate_kind: AggregateKind,

@@ -431,6 +431,7 @@ impl Store {
                     path_version: stage.version.id,
                     deleted: stage.version.deleted,
                     reference_deltas: mutation.reference_deltas.clone(),
+                    accounting_transition: Some(stage_accounting_transition(stage)),
                 }],
             )
             .map_err(program_mutation_error)?;
@@ -559,7 +560,18 @@ fn program_reference_proof(mutation: &ProgramPathMutation) -> ReferenceProof {
             mutation.stage.version.id,
             mutation.stage.version.deleted,
             mutation.reference_deltas.clone(),
+            Some(stage_accounting_transition(&mutation.stage)),
         ),
+    )
+}
+
+fn stage_accounting_transition(stage: &ProgramPathStage) -> AccountingHeadTransition {
+    AccountingHeadTransition::new(
+        stage
+            .previous_version
+            .as_ref()
+            .and_then(|version| version.blob.as_ref().map(|blob| blob.length)),
+        stage.version.blob.as_ref().map(|blob| blob.length),
     )
 }
 

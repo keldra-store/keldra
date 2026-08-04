@@ -15,6 +15,7 @@ struct EvaluatedOperation {
     receipt: MutationReceipt,
     mutation: Option<ObjectMutation>,
     reference_deltas: Vec<ReferenceDelta>,
+    accounting_transition: Option<AccountingHeadTransition>,
 }
 
 impl Store {
@@ -196,6 +197,7 @@ impl Store {
                     path_version: evaluated.receipt.version,
                     deleted: evaluated.receipt.deleted,
                     reference_deltas: evaluated.reference_deltas.clone(),
+                    accounting_transition: evaluated.accounting_transition,
                 });
             }
             results.insert(index, outcome.map(|evaluated| evaluated.receipt));
@@ -437,6 +439,7 @@ impl Store {
                     path_version: evaluated.receipt.version,
                     deleted: evaluated.receipt.deleted,
                     reference_deltas: evaluated.reference_deltas.clone(),
+                    accounting_transition: evaluated.accounting_transition,
                 }],
             )?;
             batch.put_cf(
@@ -693,6 +696,7 @@ impl Store {
                     path_version,
                     deleted,
                     reference_deltas,
+                    accounting_transition,
                 } => LocalChange::object_head(
                     status.tail,
                     identity.tenant_id.0,
@@ -701,6 +705,7 @@ impl Store {
                     *path_version,
                     *deleted,
                     reference_deltas.clone(),
+                    *accounting_transition,
                 ),
                 PendingLocalChange::RetainedVersionDeleted {
                     identity,
@@ -708,6 +713,7 @@ impl Store {
                     deleted_version,
                     resulting_head_version,
                     reference_deltas,
+                    accounting_transition,
                 } => LocalChange::retained_version_deleted(
                     status.tail,
                     identity.tenant_id.0,
@@ -716,6 +722,7 @@ impl Store {
                     *deleted_version,
                     *resulting_head_version,
                     reference_deltas.clone(),
+                    *accounting_transition,
                 ),
                 PendingLocalChange::AggregateChanged {
                     aggregate_kind,
@@ -1150,6 +1157,7 @@ impl Store {
                     },
                     mutation: existing.object_mutation,
                     reference_deltas: Vec::new(),
+                    accounting_transition: None,
                 });
             }
         }
@@ -1256,6 +1264,7 @@ impl Store {
                     },
                     mutation: None,
                     reference_deltas: Vec::new(),
+                    accounting_transition: None,
                 });
             }
             return Err(MutationError::Immutable);
@@ -1286,6 +1295,10 @@ impl Store {
             deleted,
             committed_at_unix_millis: now_unix_millis,
         };
+        let accounting_transition = AccountingHeadTransition::new(
+            current_version.as_ref().and_then(live_version_length),
+            live_version_length(&version),
+        );
         let fingerprint = operation.fingerprint();
         let apply_content_lifecycle = distributed.is_none();
         let old_blob = current_version
@@ -1346,6 +1359,7 @@ impl Store {
                         source_journal_position: distributed.source_journal_position,
                     },
                     reference_deltas: reference_deltas.clone(),
+                    accounting_transition: Some(accounting_transition),
                 };
                 mutation.set_computed_fingerprint();
                 mutation.validate()?;
@@ -1449,8 +1463,15 @@ impl Store {
             },
             mutation: object_mutation,
             reference_deltas,
+            accounting_transition: Some(accounting_transition),
         })
     }
+}
+
+fn live_version_length(version: &Version) -> Option<u64> {
+    (!version.deleted)
+        .then(|| version.blob.as_ref().map(|blob| blob.length))
+        .flatten()
 }
 
 fn exact_version_key(identity: BucketIdentity, exact_path: &str, version: VersionId) -> Vec<u8> {

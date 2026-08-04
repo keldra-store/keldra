@@ -118,6 +118,14 @@ impl Store {
                     .as_ref()
                     .map(|version| version.id),
                 reference_deltas: mutation.reference_deltas.clone(),
+                accounting_transition: Some(if mutation.replacement_tombstone.is_some() {
+                    AccountingHeadTransition::new(
+                        mutation.target.blob.as_ref().map(|blob| blob.length),
+                        None,
+                    )
+                } else {
+                    AccountingHeadTransition::new(None, None)
+                }),
             }],
         )?;
         self.stage_retained_version_delete_reference_proof(&mut batch, &mutation)?;

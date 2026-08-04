@@ -404,6 +404,7 @@ fn proof_for_mutation(mutation: &ObjectMutation) -> Result<ReferenceProof, Mutat
             mutation.version.id,
             mutation.version.deleted,
             mutation.reference_deltas.clone(),
+            mutation.accounting_transition,
         ),
     );
     validate_stored_proof(&proof).map_err(MutationError::InvalidObjectMutation)?;
@@ -428,6 +429,14 @@ fn proof_for_retained_delete(
                 .as_ref()
                 .map(|replacement| replacement.id),
             mutation.reference_deltas.clone(),
+            Some(if mutation.replacement_tombstone.is_some() {
+                AccountingHeadTransition::new(
+                    mutation.target.blob.as_ref().map(|blob| blob.length),
+                    None,
+                )
+            } else {
+                AccountingHeadTransition::new(None, None)
+            }),
         ),
     );
     validate_stored_proof(&proof).map_err(MutationError::InvalidObjectMutation)?;

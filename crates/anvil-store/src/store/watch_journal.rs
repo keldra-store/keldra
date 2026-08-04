@@ -65,6 +65,7 @@ impl Store {
                     invalidation.minimum_path_version,
                     invalidation.state_hint == InvalidationStateHint::Deleted,
                     Vec::new(),
+                    None,
                 ))
             }
         }

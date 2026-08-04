@@ -220,6 +220,37 @@ pub enum ObjectHeadChangeKind {
     Delete,
 }
 
+/// Compact evidence needed by aggregate consumers to advance exact current-
+/// head totals without retaining one entry per object path. Released journal
+/// records omit this field; consumers must rescan and rebase when they meet
+/// such an entry rather than guessing its transition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountingHeadTransition {
+    format: u8,
+    pub previous_live_length: Option<u64>,
+    pub current_live_length: Option<u64>,
+}
+
+impl AccountingHeadTransition {
+    pub const FORMAT: u8 = 1;
+
+    pub fn new(previous_live_length: Option<u64>, current_live_length: Option<u64>) -> Self {
+        Self {
+            format: Self::FORMAT,
+            previous_live_length,
+            current_live_length,
+        }
+    }
+
+    pub fn validate(self) -> Result<(), &'static str> {
+        if self.format == Self::FORMAT {
+            Ok(())
+        } else {
+            Err("unsupported accounting head-transition format")
+        }
+    }
+}
+
 /// Stable-ID form of one source-local object-head change.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObjectHeadChange {
@@ -234,6 +265,8 @@ pub struct ObjectHeadChange {
     /// same ordered source journal.
     #[serde(default)]
     pub reference_deltas: Vec<ReferenceDelta>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accounting_transition: Option<AccountingHeadTransition>,
 }
 
 /// Deletion of one retained immutable descriptor that did not necessarily
@@ -248,6 +281,8 @@ pub struct RetainedVersionDeletedChange {
     pub resulting_head_version: Option<VersionId>,
     #[serde(default)]
     pub reference_deltas: Vec<ReferenceDelta>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accounting_transition: Option<AccountingHeadTransition>,
 }
 
 /// Typed mutable aggregate whose current state must be fetched by internal
@@ -339,6 +374,7 @@ impl LocalChange {
         path_version: VersionId,
         deleted: bool,
         reference_deltas: Vec<ReferenceDelta>,
+        accounting_transition: Option<AccountingHeadTransition>,
     ) -> Self {
         Self::ObjectHead(ObjectHeadChange {
             offset,
@@ -352,6 +388,7 @@ impl LocalChange {
                 ObjectHeadChangeKind::Put
             },
             reference_deltas,
+            accounting_transition,
         })
     }
 
@@ -363,6 +400,7 @@ impl LocalChange {
         deleted_version: VersionId,
         resulting_head_version: Option<VersionId>,
         reference_deltas: Vec<ReferenceDelta>,
+        accounting_transition: Option<AccountingHeadTransition>,
     ) -> Self {
         Self::RetainedVersionDeleted(RetainedVersionDeletedChange {
             offset,
@@ -372,6 +410,7 @@ impl LocalChange {
             deleted_version,
             resulting_head_version,
             reference_deltas,
+            accounting_transition,
         })
     }
 
@@ -730,6 +769,7 @@ mod tests {
             VersionId(41),
             false,
             Vec::new(),
+            None,
         );
         let encoded = encode_local_change(&expected).unwrap();
         let value = serde_json::from_slice::<serde_json::Value>(&encoded).unwrap();
@@ -777,6 +817,7 @@ mod tests {
             VersionId(43),
             false,
             Vec::new(),
+            None,
         );
         let encoded = encode_local_change(&change).unwrap();
         let mut value = serde_json::from_slice::<serde_json::Value>(&encoded).unwrap();
