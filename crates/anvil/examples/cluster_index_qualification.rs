@@ -126,6 +126,7 @@ async fn main() -> TestResult<()> {
 
     let mut write_number = 0_u64;
     let object_client_count = objects.len();
+    let source_durability = qualification_durability(endpoint_count);
     for case in &cases {
         for (path, bytes) in &case.documents {
             let client = &mut objects[(write_number as usize) % object_client_count];
@@ -136,6 +137,7 @@ async fn main() -> TestResult<()> {
                 path,
                 bytes,
                 &format!("qualification-write-{write_number}"),
+                source_durability,
             )
             .await?;
             write_number += 1;
@@ -204,6 +206,7 @@ async fn put_json(
     path: &str,
     bytes: &[u8],
     command_id: &str,
+    durability: Durability,
 ) -> TestResult<()> {
     let receipt = put_chunks(
         client,
@@ -215,7 +218,7 @@ async fn put_json(
             }),
             content_type: CONTENT_TYPE.into(),
             command_id: command_id.into(),
-            durability: Durability::Replicated as i32,
+            durability: durability as i32,
             operation: Some(PutOperationValue::Put(PutOperation {})),
         },
         [bytes.to_vec()],
@@ -225,6 +228,14 @@ async fn put_json(
         return Err(invalid("index source write returned an invalid receipt"));
     }
     Ok(())
+}
+
+fn qualification_durability(endpoint_count: usize) -> Durability {
+    if endpoint_count == 1 {
+        Durability::Local
+    } else {
+        Durability::Replicated
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -682,9 +693,15 @@ fn invalid(message: impl Into<String>) -> Box<dyn Error + Send + Sync> {
 
 #[cfg(test)]
 mod tests {
-    use anvil_storage::v1::{IndexFreshness, IndexSourceFreshness, QueryIndexResponse};
+    use anvil_storage::v1::{Durability, IndexFreshness, IndexSourceFreshness, QueryIndexResponse};
 
-    use super::{retryable, routed_responses_agree};
+    use super::{qualification_durability, retryable, routed_responses_agree};
+
+    #[test]
+    fn source_writes_request_only_satisfiable_topology_durability() {
+        assert_eq!(qualification_durability(1), Durability::Local);
+        assert_eq!(qualification_durability(3), Durability::Replicated);
+    }
 
     fn routed_response() -> QueryIndexResponse {
         QueryIndexResponse {

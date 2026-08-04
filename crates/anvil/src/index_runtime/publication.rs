@@ -386,14 +386,7 @@ impl IndexArtifactPublication for IndexArtifactCoordinator {
             ArtifactPathKind::AccountingMutable => ACCOUNTING_ARTIFACT_CONTENT_TYPE,
             ArtifactPathKind::Current | ArtifactPathKind::Immutable => INDEX_ARTIFACT_CONTENT_TYPE,
         };
-        let durability = match kind {
-            // Accounting artifacts remain ordinary placed objects. LOCAL is
-            // only their acknowledgement threshold, so a one-node deployment
-            // can use accounting while normal placement still converges as
-            // nodes become available.
-            ArtifactPathKind::AccountingMutable => Durability::Local,
-            ArtifactPathKind::Current | ArtifactPathKind::Immutable => Durability::Replicated,
-        };
+        let durability = artifact_durability(kind, placement.placement_nodes().len());
         let receipt = self
             .objects
             .publish_from_source_with_governance(
@@ -451,10 +444,7 @@ impl IndexArtifactPublication for IndexArtifactCoordinator {
                 replayed: true,
             });
         }
-        let durability = match kind {
-            ArtifactPathKind::AccountingMutable => Durability::Local,
-            ArtifactPathKind::Current | ArtifactPathKind::Immutable => Durability::Replicated,
-        };
+        let durability = artifact_durability(kind, placement.placement_nodes().len());
         let receipt = self
             .objects
             .mutate_with_governance(
@@ -493,6 +483,22 @@ fn retained_delete_outcome(
                 replayed: false,
             }
         }
+    }
+}
+
+fn artifact_durability(kind: ArtifactPathKind, active_nodes: usize) -> Durability {
+    match kind {
+        // Accounting artifacts remain ordinary placed objects. LOCAL is only
+        // their acknowledgement threshold while normal placement converges.
+        ArtifactPathKind::AccountingMutable => Durability::Local,
+        // A one-node topology cannot honestly satisfy REPLICATED.
+        // Once more than one node is ACTIVE, keep the stronger request and let
+        // the ordinary object path fail closed unless its exact requirements
+        // can be met.
+        ArtifactPathKind::Current | ArtifactPathKind::Immutable if active_nodes == 1 => {
+            Durability::Local
+        }
+        ArtifactPathKind::Current | ArtifactPathKind::Immutable => Durability::Replicated,
     }
 }
 
@@ -641,5 +647,28 @@ mod tests {
         assert_eq!(current_path(4), "_anvil/indexes/4/current");
         assert!(parse_artifact_path(&generation_manifest_path(4, 9), 4).is_ok());
         assert!(parse_artifact_path(&generation_segment_path(4, 9, [3; 32], 2), 4).is_ok());
+    }
+
+    #[test]
+    fn one_node_index_publication_uses_local_acknowledgement() {
+        for kind in [ArtifactPathKind::Current, ArtifactPathKind::Immutable] {
+            assert_eq!(artifact_durability(kind, 1), Durability::Local);
+        }
+    }
+
+    #[test]
+    fn clustered_index_publication_keeps_replicated_acknowledgement() {
+        for active_nodes in [2, 3, 5] {
+            for kind in [ArtifactPathKind::Current, ArtifactPathKind::Immutable] {
+                assert_eq!(
+                    artifact_durability(kind, active_nodes),
+                    Durability::Replicated
+                );
+            }
+        }
+        assert_eq!(
+            artifact_durability(ArtifactPathKind::AccountingMutable, 3),
+            Durability::Local
+        );
     }
 }
