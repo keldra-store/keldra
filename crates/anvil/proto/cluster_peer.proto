@@ -3,6 +3,7 @@ syntax = "proto3";
 package anvil.cluster_peer.v1;
 
 import "anvil.proto";
+import "personaldb.proto";
 
 // Versioned identity and placement binding shared by every cluster operation.
 // The authenticated source is still established by mandatory mTLS; these
@@ -220,7 +221,6 @@ message ReferenceProofReadResponse {
 }
 
 message LocalListRequest {
-  reserved 10;
   PeerContext peer = 1;
   string tenant = 2;
   string bucket = 3;
@@ -230,6 +230,7 @@ message LocalListRequest {
   optional string start_after = 7;
   uint32 limit = 8;
   bool include_index_definitions = 9;
+  bool include_personaldb_manifests = 11;
 }
 
 message LocalListPage {
@@ -513,6 +514,7 @@ message IndexArtifactDeleted {
 }
 
 message AllIndexDefinitionHeads {}
+message AllAccountingDefinitionHeads {}
 
 message IndexGenerationHeads {
   uint64 tenant_id = 1;
@@ -526,8 +528,14 @@ message IndexSourceObjectHeads {
   string path_prefix = 3;
 }
 
-// A bounded current-head scan with exactly three legal scopes. Reserved
-// discovery remains limited to definitions or one numeric index generation.
+message AccountingSourceObjectHeads {
+  uint64 tenant_id = 1;
+  uint64 bucket_id = 2;
+  string path_prefix = 3;
+}
+
+// A bounded current-head scan with explicit derived-view scopes. Reserved
+// discovery remains limited to exact Anvil-owned definition namespaces.
 message ScanIndexHeadsRequest {
   PeerContext peer = 1;
   optional string cursor = 2;
@@ -535,6 +543,8 @@ message ScanIndexHeadsRequest {
     AllIndexDefinitionHeads definitions = 3;
     IndexGenerationHeads generation = 4;
     IndexSourceObjectHeads source_objects = 5;
+    AllAccountingDefinitionHeads accounting_definitions = 6;
+    AccountingSourceObjectHeads accounting_source_objects = 7;
   }
 }
 
@@ -583,6 +593,70 @@ message RoutedIndexQueryResponse {
   uint64 routing_placement_index = 6;
 }
 
+message RouteCreatePersonalDbGroupRequest {
+  PeerContext peer = 1;
+  anvil.v1.CreatePersonalDbGroupRequest request = 2;
+}
+
+message RouteChangePersonalDbGroupRoleRequest {
+  PeerContext peer = 1;
+  anvil.v1.ChangePersonalDbGroupRoleRequest request = 2;
+  bool granted = 3;
+}
+
+message RouteAppendPersonalDbEntryRequest {
+  PeerContext peer = 1;
+  anvil.v1.AppendPersonalDbEntryRequest request = 2;
+}
+
+message RouteMaterializePersonalDbProjectionRequest {
+  PeerContext peer = 1;
+  anvil.v1.MaterializePersonalDbProjectionRequest request = 2;
+}
+
+message RouteRegisterPersonalDbSnapshotRequest {
+  PeerContext peer = 1;
+  anvil.v1.RegisterPersonalDbSnapshotRequest request = 2;
+}
+
+message ApplyPersonalDbRoleRequest {
+  PeerContext peer = 1;
+  uint64 tenant_id = 2;
+  uint64 bucket_id = 3;
+  anvil.v1.ChangePersonalDbGroupRoleRequest request = 4;
+  bool granted = 5;
+  bool creator_owner = 6;
+}
+
+message RouteEnableAccountingRequest {
+  PeerContext peer = 1;
+  anvil.v1.EnableAccountingRequest request = 2;
+}
+
+message RouteDisableAccountingRequest {
+  PeerContext peer = 1;
+  anvil.v1.DisableAccountingRequest request = 2;
+}
+
+message RouteGetAccountingRequest {
+  PeerContext peer = 1;
+  anvil.v1.GetAccountingRequest request = 2;
+}
+
+message FlushAccountingTrafficRequest {
+  PeerContext peer = 1;
+  uint64 accounting_id = 2;
+  uint64 source_node_id = 3;
+  uint64 accepted_inbound_bytes = 4;
+  uint64 served_outbound_bytes = 5;
+  string flush_id = 6;
+}
+
+message FlushAccountingTrafficResponse {
+  uint32 schema_version = 1;
+  bool replayed = 2;
+}
+
 // This service is installed only on Anvil's mandatory-mTLS peer listener.
 // It exposes typed logical operations, never RocksDB keys, column-family
 // values, or a generic public-method tunnel.
@@ -614,6 +688,7 @@ service ClusterPeer {
   // Dedicated mandatory-mTLS routes for an in-process trusted adapter. The
   // internal capability is reconstructed at the destination and is never a
   // protobuf field or caller-controlled metadata value.
+  rpc RouteInternalPutEnd(RoutePutEndRequest) returns (anvil.v1.MutationReceipt);
   rpc RouteInternalDeleteIfVersion(RouteDeleteIfVersionRequest) returns (anvil.v1.MutationReceipt);
   rpc RouteInternalBulkWrite(RouteBulkWriteRequest) returns (anvil.v1.BulkWriteResponse);
   rpc RouteProvisionTenant(RouteProvisionTenantRequest) returns (anvil.v1.ProvisionTenantResponse);
@@ -645,6 +720,16 @@ service ClusterPeer {
   rpc DeleteIndexArtifact(DeleteIndexArtifactRequest) returns (IndexArtifactDeleted);
   rpc ScanIndexHeads(ScanIndexHeadsRequest) returns (IndexHeadScanPage);
   rpc RouteIndexQuery(RouteIndexQueryRequest) returns (RoutedIndexQueryResponse);
+  rpc RouteCreatePersonalDbGroup(RouteCreatePersonalDbGroupRequest) returns (anvil.v1.PersonalDbGroup);
+  rpc RouteChangePersonalDbGroupRole(RouteChangePersonalDbGroupRoleRequest) returns (anvil.v1.PersonalDbGroupRoleChange);
+  rpc RouteAppendPersonalDbEntry(RouteAppendPersonalDbEntryRequest) returns (anvil.v1.PersonalDbCommit);
+  rpc RouteMaterializePersonalDbProjection(RouteMaterializePersonalDbProjectionRequest) returns (anvil.v1.PersonalDbMaterialization);
+  rpc RouteRegisterPersonalDbSnapshot(RouteRegisterPersonalDbSnapshotRequest) returns (anvil.v1.PersonalDbSnapshot);
+  rpc ApplyPersonalDbRole(ApplyPersonalDbRoleRequest) returns (anvil.v1.PersonalDbGroupRoleChange);
+  rpc RouteEnableAccounting(RouteEnableAccountingRequest) returns (anvil.v1.AccountingDefinition);
+  rpc RouteDisableAccounting(RouteDisableAccountingRequest) returns (anvil.v1.DisableAccountingResponse);
+  rpc RouteGetAccounting(RouteGetAccountingRequest) returns (anvil.v1.AccountingSnapshot);
+  rpc FlushAccountingTraffic(FlushAccountingTrafficRequest) returns (FlushAccountingTrafficResponse);
 
   rpc CoordinateLogicalRecord(CoordinateLogicalRecordRequest) returns (CoordinateLogicalRecordResponse);
   rpc ReadCoordinatedLogicalRecord(CoordinatedLogicalReadRequest) returns (CoordinatedLogicalReadResponse);

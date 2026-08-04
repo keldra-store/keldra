@@ -88,6 +88,15 @@ service IndexService {
   rpc QueryIndex(QueryIndexRequest) returns (QueryIndexResponse);
 }
 
+// Asynchronous usage aggregates backed by ordinary objects. Bucket accounting
+// uses an empty path_prefix; finer-grained accounting is enabled explicitly for
+// one canonical path prefix. Configuration and query remain Zanzibar checked.
+service AccountingService {
+  rpc EnableAccounting(EnableAccountingRequest) returns (AccountingDefinition);
+  rpc DisableAccounting(DisableAccountingRequest) returns (DisableAccountingResponse);
+  rpc GetAccounting(GetAccountingRequest) returns (AccountingSnapshot);
+}
+
 // Credential exchange is the only unauthenticated service. Long-lived client
 // credentials are verified against durable Anvil state and exchanged for a
 // short-lived bearer token. The deployment must protect this service with TLS
@@ -428,6 +437,64 @@ message QueryIndexResponse {
   repeated IndexQueryHit hits = 1;
   bytes next_page_token = 2;
   IndexFreshness freshness = 3;
+}
+
+message EnableAccountingRequest {
+  string bucket = 1;
+  // Empty selects the whole bucket. A non-empty value selects the exact path
+  // and its slash-delimited children.
+  string path_prefix = 2;
+  string command_id = 3;
+}
+
+message DisableAccountingRequest {
+  string bucket = 1;
+  string path_prefix = 2;
+  uint64 expected_version = 3;
+  string command_id = 4;
+}
+
+message GetAccountingRequest {
+  string bucket = 1;
+  string path_prefix = 2;
+}
+
+message AccountingDefinition {
+  string storage_tenant = 1;
+  string bucket = 2;
+  string path_prefix = 3;
+  uint64 accounting_id = 4;
+  uint64 version = 5;
+}
+
+message DisableAccountingResponse {
+  bool disabled = 1;
+  uint64 tombstone_version = 2;
+  bool replayed = 3;
+}
+
+message AccountingSourceCheckpoint {
+  uint64 node_id = 1;
+  bytes source_epoch = 2;
+  // Highest source-local journal offset included in the aggregate.
+  uint64 through_offset = 3;
+}
+
+message AccountingFreshness {
+  google.protobuf.Timestamp refreshed_at = 1;
+  repeated AccountingSourceCheckpoint sources = 2;
+  // False only when retained source history was unavailable and the worker
+  // had to establish a new current-state baseline.
+  bool complete = 3;
+}
+
+message AccountingSnapshot {
+  AccountingDefinition definition = 1;
+  uint64 logical_stored_bytes = 2;
+  uint64 object_count = 3;
+  uint64 accepted_inbound_bytes = 4;
+  uint64 served_outbound_bytes = 5;
+  AccountingFreshness freshness = 6;
 }
 
 // LOCAL is the default for speed: the ingress acknowledges after its durable
