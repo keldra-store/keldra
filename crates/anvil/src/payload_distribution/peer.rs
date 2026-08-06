@@ -346,7 +346,8 @@ fn distribution_status(error: PayloadDistributionError) -> Status {
         | PayloadDistributionError::OwnerArtifactMissing { .. }
         | PayloadDistributionError::OwnerArtifactThreshold { .. }
         | PayloadDistributionError::Peer { .. }
-        | PayloadDistributionError::Encoding(_) => Status::unavailable(error.to_string()),
+        | PayloadDistributionError::Encoding(_)
+        | PayloadDistributionError::CompleteSource(_) => Status::unavailable(error.to_string()),
         PayloadDistributionError::Store(_) | PayloadDistributionError::Erasure(_) => {
             Status::internal(error.to_string())
         }

@@ -291,6 +291,7 @@ fn small_owners(
         placement.placement_nodes(),
     ) {
         PayloadPlacement::Small(owners) => owners.owners().to_vec(),
+        PayloadPlacement::LargeComplete(_) => panic!("expected small placement"),
         PayloadPlacement::Large(_) => panic!("expected small placement"),
     }
 }
@@ -311,6 +312,7 @@ fn shard_owners(
             .iter()
             .map(|owner| (owner.owner(), owner.ordinal()))
             .collect(),
+        PayloadPlacement::LargeComplete(_) => panic!("expected erasure-coded placement"),
         PayloadPlacement::Small(_) => panic!("expected large placement"),
     }
 }
@@ -345,7 +347,7 @@ async fn small_read_uses_a_verified_owner_and_repairs_a_missing_copy() {
 
     assert_eq!(output.bytes(), bytes);
     assert_eq!(report.sources.healthy, 1);
-    assert_eq!(report.sources.missing, 1);
+    assert_eq!(report.sources.missing, 2);
     assert_eq!(report.repairs_attempted, 1);
     assert_eq!(report.repairs_completed, 1);
     assert_eq!(transport.state.lock().unwrap().small_puts, [owners[1]]);

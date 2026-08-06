@@ -16,6 +16,10 @@ use crate::placement::{PlacementKind, PlacementNode, rank_nodes};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PayloadPlacement {
     Small(SmallPayloadPlacement),
+    /// A large payload kept as complete content-addressed copies while the
+    /// committed ACTIVE membership cannot place every erasure ordinal on a
+    /// distinct node.
+    LargeComplete(CompletePayloadPlacement),
     Large(LargePayloadPlacement),
 }
 
@@ -24,6 +28,7 @@ impl PayloadPlacement {
     pub(crate) fn required_count(&self) -> usize {
         match self {
             Self::Small(placement) => placement.required_copies,
+            Self::LargeComplete(placement) => placement.required_copies,
             Self::Large(placement) => placement.required_shards,
         }
     }
@@ -32,6 +37,7 @@ impl PayloadPlacement {
     pub(crate) fn available_count(&self) -> usize {
         match self {
             Self::Small(placement) => placement.owners.len(),
+            Self::LargeComplete(placement) => placement.owners.len(),
             Self::Large(placement) => placement.shards.len(),
         }
     }
@@ -44,8 +50,9 @@ impl PayloadPlacement {
     ///
     /// Logical metadata always needs its independent quorum. Both durability
     /// choices require the explicit upload source's complete content;
-    /// `REPLICATED` additionally requires all selected small-copy owners or
-    /// `K + 1` correctly placed final shard ordinals.
+    /// `REPLICATED` additionally requires all selected small-copy owners, two
+    /// selected complete owners for an undersized large payload, or `K + 1`
+    /// correctly placed final shard ordinals.
     pub(crate) fn require_ready(
         &self,
         durability: Durability,
@@ -78,9 +85,33 @@ impl PayloadPlacement {
                             .any(|entry| entry.node_id == **owner && entry.complete_copy)
                     })
                     .count();
-                if durable != placement.required_copies {
+                // Final placement converges to M+1 copies. In an undersized
+                // membership, REPLICATED waits for every available selected
+                // owner but still requires two distinct copies so one owner
+                // can be lost.
+                let required = placement.owners.len().max(2);
+                if durable < required {
+                    return Err(PayloadReadinessError::CompleteCopies { required, durable });
+                }
+            }
+            Self::LargeComplete(placement) => {
+                let durable = placement
+                    .owners
+                    .iter()
+                    .filter(|owner| {
+                        evidence
+                            .iter()
+                            .any(|entry| entry.node_id == **owner && entry.complete_copy)
+                    })
+                    .count();
+                // In the complete-copy fallback, REPLICATED proves that one
+                // selected owner may be lost. Background placement still
+                // converges to M+1 copies when the undersized membership has
+                // that many nodes.
+                const REQUIRED_REPLICATED_COPIES: usize = 2;
+                if durable < REQUIRED_REPLICATED_COPIES {
                     return Err(PayloadReadinessError::CompleteCopies {
-                        required: placement.required_copies,
+                        required: REQUIRED_REPLICATED_COPIES,
                         durable,
                     });
                 }
@@ -187,6 +218,19 @@ impl SmallPayloadPlacement {
     }
 }
 
+/// Complete-copy owners for a large payload in an undersized cluster.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CompletePayloadPlacement {
+    required_copies: usize,
+    owners: Vec<NodeId>,
+}
+
+impl CompletePayloadPlacement {
+    pub(crate) fn owners(&self) -> &[NodeId] {
+        &self.owners
+    }
+}
+
 /// One large-payload shard ordinal and its distinct owner.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ShardPlacement {
@@ -241,6 +285,13 @@ pub(crate) fn select_payload_placement(
         let required_copies = usize::from(profile.parity_shards()) + 1;
         let owners = ranked.into_iter().take(required_copies).collect();
         PayloadPlacement::Small(SmallPayloadPlacement {
+            required_copies,
+            owners,
+        })
+    } else if ranked.len() < usize::from(profile.total_shards()) {
+        let required_copies = usize::from(profile.parity_shards()) + 1;
+        let owners = ranked.into_iter().take(required_copies).collect();
+        PayloadPlacement::LargeComplete(CompletePayloadPlacement {
             required_copies,
             owners,
         })
@@ -343,6 +394,13 @@ mod tests {
             .collect()
     }
 
+    fn large_complete_owners(placement: PayloadPlacement) -> Vec<u64> {
+        let PayloadPlacement::LargeComplete(placement) = placement else {
+            panic!("expected large complete-copy placement")
+        };
+        placement.owners().iter().map(|owner| owner.0).collect()
+    }
+
     #[test]
     fn small_weighted_vector_is_frozen_and_input_order_independent() {
         let content = content(SMALL_BLOB_MAX_BYTES as u64);
@@ -373,7 +431,7 @@ mod tests {
     }
 
     #[test]
-    fn insufficient_membership_reports_both_layouts_under_redundant() {
+    fn insufficient_membership_uses_complete_copies_for_large_payloads() {
         let active = [node(2, 1_000_000), node(5, 2_000_000)];
         let small = select_payload_placement(cluster_id(), &content(17), profile(), &active);
         let large = select_payload_placement(
@@ -385,15 +443,9 @@ mod tests {
 
         assert_eq!((small.required_count(), small.available_count()), (3, 2));
         assert!(small.is_under_redundant());
-        assert_eq!((large.required_count(), large.available_count()), (6, 2));
+        assert_eq!((large.required_count(), large.available_count()), (3, 2));
         assert!(large.is_under_redundant());
-        assert_eq!(
-            large_assignments(large)
-                .into_iter()
-                .map(|(ordinal, _)| ordinal)
-                .collect::<Vec<_>>(),
-            [0, 1]
-        );
+        assert_eq!(large_complete_owners(large).len(), 2);
     }
 
     #[test]
@@ -410,14 +462,11 @@ mod tests {
             profile(),
             &active,
         );
-        let assignments = large_assignments(placement);
-        let owners = assignments
-            .iter()
-            .map(|(_, owner)| *owner)
-            .collect::<HashSet<_>>();
+        let owners = large_complete_owners(placement);
+        let distinct = owners.iter().copied().collect::<HashSet<_>>();
 
-        assert_eq!(assignments.len(), 3);
-        assert_eq!(owners.len(), assignments.len());
+        assert_eq!(owners.len(), 3);
+        assert_eq!(distinct.len(), owners.len());
     }
 
     #[test]
@@ -491,6 +540,45 @@ mod tests {
     }
 
     #[test]
+    fn replicated_small_uses_every_available_owner_below_m_plus_one() {
+        let active = [node(2, 1_000_000), node(5, 1_000_000)];
+        let placement = select_payload_placement(
+            cluster_id(),
+            &content(11),
+            ErasureProfile::new(4, 2, 16 * 1024).unwrap(),
+            &active,
+        );
+        let PayloadPlacement::Small(small) = &placement else {
+            panic!("expected small placement")
+        };
+        let evidence = small
+            .owners()
+            .iter()
+            .copied()
+            .map(|owner| NodePayloadEvidence::new(owner, true, None))
+            .collect::<Vec<_>>();
+
+        assert_eq!(small.required_copies, 3);
+        assert_eq!(small.owners().len(), 2);
+        assert_eq!(
+            placement.require_ready(Durability::Replicated, true, small.owners()[0], &evidence,),
+            Ok(())
+        );
+        assert_eq!(
+            placement.require_ready(
+                Durability::Replicated,
+                true,
+                small.owners()[0],
+                &evidence[..1],
+            ),
+            Err(PayloadReadinessError::CompleteCopies {
+                required: 2,
+                durable: 1,
+            })
+        );
+    }
+
+    #[test]
     fn default_two_plus_one_requires_three_distinct_final_shards() {
         let placement = select_payload_placement(
             cluster_id(),
@@ -521,6 +609,75 @@ mod tests {
                 required: 3,
                 durable: 2,
             })
+        );
+    }
+
+    #[test]
+    fn default_profile_grows_from_one_to_two_complete_copies_then_shards() {
+        let reference = content(SMALL_BLOB_MAX_BYTES as u64 + 1);
+        let one = [node(2, 1_000_000)];
+        let two = [node(2, 1_000_000), node(5, 1_000_000)];
+        let three = [node(2, 1_000_000), node(5, 1_000_000), node(11, 1_000_000)];
+
+        assert_eq!(
+            large_complete_owners(select_payload_placement(
+                cluster_id(),
+                &reference,
+                ErasureProfile::default(),
+                &one,
+            )),
+            [2]
+        );
+        assert_eq!(
+            large_complete_owners(select_payload_placement(
+                cluster_id(),
+                &reference,
+                ErasureProfile::default(),
+                &two,
+            ))
+            .len(),
+            2
+        );
+        assert_eq!(
+            large_assignments(select_payload_placement(
+                cluster_id(),
+                &reference,
+                ErasureProfile::default(),
+                &three,
+            ))
+            .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn large_complete_replicated_requires_two_distinct_selected_copies() {
+        let reference = content(SMALL_BLOB_MAX_BYTES as u64 + 1);
+        let active = [node(2, 1_000_000), node(5, 1_000_000)];
+        let placement =
+            select_payload_placement(cluster_id(), &reference, ErasureProfile::default(), &active);
+        let PayloadPlacement::LargeComplete(complete) = &placement else {
+            panic!("expected complete-copy fallback")
+        };
+        let upload_source = complete.owners()[0];
+        let one = [NodePayloadEvidence::new(upload_source, true, None)];
+
+        assert_eq!(
+            placement.require_ready(Durability::Replicated, true, upload_source, &one),
+            Err(PayloadReadinessError::CompleteCopies {
+                required: 2,
+                durable: 1,
+            })
+        );
+        let two = complete
+            .owners()
+            .iter()
+            .copied()
+            .map(|owner| NodePayloadEvidence::new(owner, true, None))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            placement.require_ready(Durability::Replicated, true, upload_source, &two),
+            Ok(())
         );
     }
 

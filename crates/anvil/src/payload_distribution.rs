@@ -12,14 +12,14 @@ use std::sync::{Arc, mpsc};
 
 use anvil_consensus::{ClusterId, NodeId};
 use anvil_store::{
-    BlobRef, Durability, ErasureCodec, ErasureProfile, PayloadArtifactState, ShardIdentity,
-    ShardSealOutcome, Store,
+    BlobReader, BlobRef, Durability, ErasureCodec, ErasureProfile, PayloadArtifactState,
+    ShardIdentity, ShardSealOutcome, Store,
 };
 use thiserror::Error;
-use tonic::Status;
+use tonic::{Code, Status};
 
 use crate::cluster_placement::ClusterPlacement;
-use crate::data_peer::DataPeerTransport;
+use crate::data_peer::{DATA_PEER_FRAME_BYTES, DATA_PEER_SCHEMA_VERSION, DataPeerTransport};
 use crate::payload_placement::{
     NodePayloadEvidence, PayloadPlacement, PayloadReadinessError, select_payload_placement,
 };
@@ -127,6 +127,21 @@ pub(crate) trait PayloadArtifactPeers: Send + Sync {
         reference: &BlobRef,
     ) -> Result<bool, Status>;
 
+    async fn put_complete(
+        &self,
+        target: NodeId,
+        address: &str,
+        reference: &BlobRef,
+        source: BlobReader,
+    ) -> Result<(), Status>;
+
+    async fn complete_exists(
+        &self,
+        target: NodeId,
+        address: &str,
+        reference: &BlobRef,
+    ) -> Result<bool, Status>;
+
     async fn put_shard(
         &self,
         target: NodeId,
@@ -163,6 +178,57 @@ impl PayloadArtifactPeers for DataPeerTransport {
         reference: &BlobRef,
     ) -> Result<bool, Status> {
         self.small_content_exists(target, address, reference).await
+    }
+
+    async fn put_complete(
+        &self,
+        target: NodeId,
+        address: &str,
+        reference: &BlobRef,
+        source: BlobReader,
+    ) -> Result<(), Status> {
+        self.put_complete_source(target, address, reference, source)
+            .await
+            .map(|_| ())
+    }
+
+    async fn complete_exists(
+        &self,
+        target: NodeId,
+        address: &str,
+        reference: &BlobRef,
+    ) -> Result<bool, Status> {
+        let mut stream = match self.get_complete_source(target, address, reference).await {
+            Ok(stream) => stream,
+            Err(status) if status.code() == Code::NotFound => return Ok(false),
+            Err(status) => return Err(status),
+        };
+        let mut offset = 0_u64;
+        let mut hasher = blake3::Hasher::new();
+        while let Some(frame) = stream.message().await? {
+            let next = offset
+                .checked_add(frame.content.len() as u64)
+                .ok_or_else(|| Status::data_loss("complete-copy response offset overflowed"))?;
+            if frame.schema_version != DATA_PEER_SCHEMA_VERSION
+                || frame.offset != offset
+                || frame.content.len() > DATA_PEER_FRAME_BYTES
+                || next > reference.length
+            {
+                return Err(Status::data_loss(
+                    "complete-copy response is not a bounded contiguous stream",
+                ));
+            }
+            hasher.update(&frame.content);
+            offset = next;
+            if frame.end {
+                return Ok(
+                    offset == reference.length && hasher.finalize().as_bytes() == &reference.hash
+                );
+            }
+        }
+        Err(Status::data_loss(
+            "complete-copy response ended without a final frame",
+        ))
     }
 
     async fn put_shard(
@@ -249,6 +315,20 @@ impl PayloadDistribution {
                             .or_insert((true, None));
                     }
                 }
+                PayloadPlacement::LargeComplete(complete) => {
+                    for owner in complete.owners() {
+                        if self
+                            .install_complete(placement, *owner, reference)
+                            .await
+                            .is_ok()
+                        {
+                            artifacts
+                                .entry(*owner)
+                                .and_modify(|entry| entry.0 = true)
+                                .or_insert((true, None));
+                        }
+                    }
+                }
                 PayloadPlacement::Large(large) => {
                     for (node, ordinal) in self
                         .encode_and_install_shards(placement, reference, large.shards())
@@ -313,6 +393,26 @@ impl PayloadDistribution {
                     }
                 }
             }
+            PayloadPlacement::LargeComplete(complete) => {
+                let mut verified = 0_usize;
+                for owner in complete.owners() {
+                    if evidence
+                        .artifacts
+                        .iter()
+                        .any(|entry| entry.node_id() == *owner && entry.complete_copy())
+                        && self.complete_exists(placement, *owner, reference).await?
+                    {
+                        verified += 1;
+                    }
+                }
+                if verified < 2 {
+                    return Err(PayloadDistributionError::OwnerArtifactThreshold {
+                        kind: "complete copies",
+                        required: 2,
+                        verified,
+                    });
+                }
+            }
             PayloadPlacement::Large(large) => {
                 let mut verified = 0_usize;
                 for shard in large.shards() {
@@ -332,6 +432,7 @@ impl PayloadDistribution {
                 }
                 if verified < usize::from(self.profile.data_shards()) + 1 {
                     return Err(PayloadDistributionError::OwnerArtifactThreshold {
+                        kind: "shards",
                         required: usize::from(self.profile.data_shards()) + 1,
                         verified,
                     });
@@ -373,6 +474,30 @@ impl PayloadDistribution {
         Ok(())
     }
 
+    async fn install_complete(
+        &self,
+        placement: &(impl PayloadPlacementView + ?Sized),
+        owner: NodeId,
+        reference: &BlobRef,
+    ) -> Result<(), PayloadDistributionError> {
+        if owner == self.local_node {
+            return match self.store.complete_copy_state(reference).await? {
+                PayloadArtifactState::Valid => Ok(()),
+                PayloadArtifactState::Missing => Err(PayloadDistributionError::UploadSourceMissing),
+                PayloadArtifactState::Corrupt => Err(PayloadDistributionError::UploadSourceCorrupt),
+            };
+        }
+        let source = self
+            .store
+            .open_blob(reference)
+            .await
+            .map_err(|error| PayloadDistributionError::CompleteSource(error.to_string()))?;
+        self.peers
+            .put_complete(owner, peer_address(placement, owner)?, reference, source)
+            .await
+            .map_err(|status| peer_error(owner, status))
+    }
+
     async fn small_exists(
         &self,
         placement: &(impl PayloadPlacementView + ?Sized),
@@ -386,6 +511,23 @@ impl PayloadDistribution {
         }
         self.peers
             .small_exists(owner, peer_address(placement, owner)?, reference)
+            .await
+            .map_err(|status| peer_error(owner, status))
+    }
+
+    async fn complete_exists(
+        &self,
+        placement: &(impl PayloadPlacementView + ?Sized),
+        owner: NodeId,
+        reference: &BlobRef,
+    ) -> Result<bool, PayloadDistributionError> {
+        if owner == self.local_node {
+            return Ok(
+                self.store.complete_copy_state(reference).await? == PayloadArtifactState::Valid
+            );
+        }
+        self.peers
+            .complete_exists(owner, peer_address(placement, owner)?, reference)
             .await
             .map_err(|status| peer_error(owner, status))
     }
@@ -574,12 +716,18 @@ pub(crate) enum PayloadDistributionError {
     OwnerAddressMissing { node: NodeId },
     #[error("payload owner node {node:?} is missing its required artifact")]
     OwnerArtifactMissing { node: NodeId },
-    #[error("only {verified} of {required} required shard owners verified their artifacts")]
-    OwnerArtifactThreshold { required: usize, verified: usize },
+    #[error("only {verified} of {required} required {kind} verified their artifacts")]
+    OwnerArtifactThreshold {
+        kind: &'static str,
+        required: usize,
+        verified: usize,
+    },
     #[error("payload peer node {node:?} failed: {message}")]
     Peer { node: NodeId, message: String },
     #[error("payload encoding failed: {0}")]
     Encoding(String),
+    #[error("complete payload source failed: {0}")]
+    CompleteSource(String),
     #[error("crash continuation cannot locate an upload source without an approved mechanism")]
     SourceLocationUnavailable,
     #[error(transparent)]
@@ -609,14 +757,19 @@ mod tests {
 
     impl TestPlacement {
         fn three_nodes() -> Self {
-            let ids = [NodeId(1), NodeId(2), NodeId(3)];
+            Self::with_nodes(&[NodeId(1), NodeId(2), NodeId(3)])
+        }
+
+        fn with_nodes(ids: &[NodeId]) -> Self {
             Self {
                 nodes: ids
-                    .into_iter()
+                    .iter()
+                    .copied()
                     .map(|node| PlacementNode::new(node, NonZeroU32::new(1_000_000).unwrap()))
                     .collect(),
                 addresses: ids
-                    .into_iter()
+                    .iter()
+                    .copied()
                     .map(|node| (node, format!("node-{}:50052", node.0)))
                     .collect(),
             }
@@ -692,6 +845,49 @@ mod tests {
         }
 
         async fn small_exists(
+            &self,
+            target: NodeId,
+            _address: &str,
+            reference: &BlobRef,
+        ) -> Result<bool, Status> {
+            self.available(target)?
+                .complete_copy_state(reference)
+                .await
+                .map(|state| state == PayloadArtifactState::Valid)
+                .map_err(|error| Status::internal(error.to_string()))
+        }
+
+        async fn put_complete(
+            &self,
+            target: NodeId,
+            _address: &str,
+            reference: &BlobRef,
+            mut source: BlobReader,
+        ) -> Result<(), Status> {
+            let mut bytes = Vec::new();
+            let mut frame = [0_u8; 16 * 1024];
+            loop {
+                let read = source
+                    .read(&mut frame)
+                    .await
+                    .map_err(|error| Status::data_loss(error.to_string()))?;
+                if read == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&frame[..read]);
+            }
+            let stored = self
+                .available(target)?
+                .stage_blob(&bytes)
+                .await
+                .map_err(|error| Status::internal(error.to_string()))?;
+            if stored != *reference {
+                return Err(Status::data_loss("complete-copy identity changed"));
+            }
+            Ok(())
+        }
+
+        async fn complete_exists(
             &self,
             target: NodeId,
             _address: &str,
@@ -871,6 +1067,77 @@ mod tests {
             ordinals.insert(presence.shard_ordinals()[0]);
         }
         assert_eq!(ordinals, BTreeSet::from([0, 1, 2]));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn one_node_large_local_uses_complete_copy_and_replicated_fails_closed() {
+        let temporary = tempfile::tempdir().unwrap();
+        let stores = stores(temporary.path()).await;
+        let source = stores[&NodeId(1)].clone();
+        let reference = source
+            .stage_blob(&vec![0x5a; SMALL_BLOB_MAX_BYTES + 1])
+            .await
+            .unwrap();
+        let peers = Arc::new(TestPeers::new(stores));
+        let distribution =
+            PayloadDistribution::new(NodeId(1), source, peers, ErasureProfile::default());
+        let placement = TestPlacement::with_nodes(&[NodeId(1)]);
+
+        distribution
+            .prepare_on_upload_source(&placement, &reference, Durability::Local)
+            .await
+            .unwrap();
+        assert!(matches!(
+            distribution
+                .prepare_on_upload_source(&placement, &reference, Durability::Replicated)
+                .await,
+            Err(PayloadDistributionError::Readiness(
+                PayloadReadinessError::CompleteCopies {
+                    required: 2,
+                    durable: 1,
+                }
+            ))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_node_large_replicated_installs_and_verifies_two_complete_copies() {
+        let temporary = tempfile::tempdir().unwrap();
+        let stores = stores(temporary.path()).await;
+        let bytes = vec![0x39; SMALL_BLOB_MAX_BYTES + 1];
+        let source = stores[&NodeId(2)].clone();
+        let reference = source.stage_blob(&bytes).await.unwrap();
+        let peers = Arc::new(TestPeers::new(stores.clone()));
+        let placement = TestPlacement::with_nodes(&[NodeId(1), NodeId(2)]);
+        let source_distribution =
+            PayloadDistribution::new(NodeId(2), source, peers.clone(), ErasureProfile::default());
+        let coordinator = PayloadDistribution::new(
+            NodeId(1),
+            stores[&NodeId(1)].clone(),
+            peers,
+            ErasureProfile::default(),
+        );
+
+        let evidence = source_distribution
+            .prepare_on_upload_source(&placement, &reference, Durability::Replicated)
+            .await
+            .unwrap();
+        coordinator
+            .verify_on_path_coordinator(
+                &placement,
+                &reference,
+                Durability::Replicated,
+                NodeId(2),
+                &evidence,
+            )
+            .await
+            .unwrap();
+        for node in [NodeId(1), NodeId(2)] {
+            assert_eq!(
+                stores[&node].complete_copy_state(&reference).await.unwrap(),
+                PayloadArtifactState::Valid
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

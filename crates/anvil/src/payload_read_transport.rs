@@ -92,6 +92,93 @@ impl PayloadReadTransport for StorePayloadReadTransport {
         }
     }
 
+    async fn get_complete(
+        &self,
+        _fence: PlacementLogId,
+        target: NodeId,
+        address: &str,
+        reference: &BlobRef,
+        destination: &mut (dyn Write + Send),
+    ) -> Result<(), PayloadReadTransportError> {
+        if self.is_local(target) {
+            match self
+                .store
+                .complete_copy_state(reference)
+                .await
+                .map_err(map_payload_error)?
+            {
+                anvil_store::PayloadArtifactState::Valid => {}
+                anvil_store::PayloadArtifactState::Missing => {
+                    return Err(PayloadReadTransportError::NotFound);
+                }
+                anvil_store::PayloadArtifactState::Corrupt => {
+                    return Err(PayloadReadTransportError::InvalidArtifact(
+                        "local complete payload failed integrity verification".into(),
+                    ));
+                }
+            }
+            let mut reader = self
+                .store
+                .open_blob(reference)
+                .await
+                .map_err(|error| PayloadReadTransportError::Unavailable(error.to_string()))?;
+            let mut frame = [0_u8; DATA_PEER_FRAME_BYTES];
+            loop {
+                let read = reader.read(&mut frame).await.map_err(|error| {
+                    PayloadReadTransportError::InvalidArtifact(error.to_string())
+                })?;
+                if read == 0 {
+                    return Ok(());
+                }
+                destination
+                    .write_all(&frame[..read])
+                    .map_err(|error| PayloadReadTransportError::Destination(error.to_string()))?;
+            }
+        }
+
+        let mut stream = self
+            .peers
+            .get_complete_source(target, address, reference)
+            .await
+            .map_err(map_peer_error)?;
+        let mut offset = 0_u64;
+        while let Some(frame) = stream.message().await.map_err(map_peer_error)? {
+            if frame.schema_version != DATA_PEER_SCHEMA_VERSION
+                || frame.offset != offset
+                || frame.content.len() > DATA_PEER_FRAME_BYTES
+                || (frame.content.is_empty() && !frame.end)
+            {
+                return Err(PayloadReadTransportError::InvalidArtifact(
+                    "peer complete-payload stream is malformed".into(),
+                ));
+            }
+            let next = offset
+                .checked_add(frame.content.len() as u64)
+                .filter(|next| *next <= reference.length)
+                .ok_or_else(|| {
+                    PayloadReadTransportError::InvalidArtifact(
+                        "peer complete-payload stream exceeds its declared length".into(),
+                    )
+                })?;
+            destination
+                .write_all(&frame.content)
+                .map_err(|error| PayloadReadTransportError::Destination(error.to_string()))?;
+            offset = next;
+            if frame.end {
+                return if offset == reference.length {
+                    Ok(())
+                } else {
+                    Err(PayloadReadTransportError::InvalidArtifact(
+                        "peer complete-payload stream ended at another length".into(),
+                    ))
+                };
+            }
+        }
+        Err(PayloadReadTransportError::InvalidArtifact(
+            "peer complete-payload stream ended without a final frame".into(),
+        ))
+    }
+
     async fn get_shard(
         &self,
         _fence: PlacementLogId,

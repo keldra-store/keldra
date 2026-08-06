@@ -30,6 +30,10 @@ use crate::placement::{PlacementKind, PlacementNode};
 pub(crate) enum ReferenceCommitDisposition {
     /// The event selected the committed head, or is proven to be its ancestor.
     CommittedOrAncestor,
+    /// A legacy one-node event applied its reference effects in the same local
+    /// RocksDB batch as the journal append. Advancing the destination cursor
+    /// must not replay those effects.
+    AlreadyAppliedLocally,
     /// A quorum proved that this unacknowledged candidate was not selected.
     DiscardedMinority,
 }
@@ -166,8 +170,21 @@ impl ReferenceCommitAuthority for QuorumReferenceCommitAuthority {
         let expected = self
             .source
             .read_reference_proof(source, change.offset())
-            .map_err(|error| format!("source reference proof is unavailable: {error}"))?
-            .ok_or_else(|| "source reference proof is missing".to_owned())?;
+            .map_err(|error| format!("source reference proof is unavailable: {error}"))?;
+        let Some(expected) = expected else {
+            let local_source = self
+                .source
+                .local_watch_status()
+                .map_err(|error| format!("local source identity is unavailable: {error}"))?
+                .source_id;
+            let only_active_source = started.active_node_ids().as_slice()
+                == [NodeId(u64::from(source.node_id))]
+                && local_source == source;
+            if only_active_source && matches!(change, LocalChange::ObjectHead(_)) {
+                return Ok(ReferenceCommitDisposition::AlreadyAppliedLocally);
+            }
+            return Err("source reference proof is missing".to_owned());
+        };
         if expected.source_id != source
             || expected.offset() != change.offset()
             || expected.change != *change
@@ -422,7 +439,11 @@ impl ReferenceDelivery {
                     break;
                 }
             };
-            if disposition == ReferenceCommitDisposition::DiscardedMinority {
+            if matches!(
+                disposition,
+                ReferenceCommitDisposition::DiscardedMinority
+                    | ReferenceCommitDisposition::AlreadyAppliedLocally
+            ) {
                 routed.push((change.offset(), BTreeMap::new()));
                 continue;
             }
@@ -607,6 +628,19 @@ fn route_effects(
             placement.placement_nodes(),
         ) {
             PayloadPlacement::Small(selected) => {
+                for owner in selected.owners() {
+                    routed
+                        .entry(*owner)
+                        .or_default()
+                        .push(DestinationReferenceDelta {
+                            artifact: DestinationReferenceArtifact::CompleteBlob(
+                                delta.blob.clone(),
+                            ),
+                            change: delta.change,
+                        });
+                }
+            }
+            PayloadPlacement::LargeComplete(selected) => {
                 for owner in selected.owners() {
                     routed
                         .entry(*owner)

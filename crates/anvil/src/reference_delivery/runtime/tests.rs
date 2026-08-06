@@ -49,12 +49,3 @@ async fn stop_interrupts_a_long_worker_delay() {
     stop.send(true).unwrap();
     assert!(waiter.await.unwrap());
 }
-
-#[test]
-fn startup_degrades_only_when_distinct_final_shards_are_impossible() {
-    let profile = ErasureProfile::default();
-    assert!(structurally_under_redundant(1, profile));
-    assert!(structurally_under_redundant(2, profile));
-    assert!(!structurally_under_redundant(3, profile));
-    assert!(!structurally_under_redundant(8, profile));
-}

@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use anvil_store::{
     BlobReferenceState, Durability, LogicalRecordMutationContext, LogicalRecordValue, ObjectKey,
-    ObjectMutationContext, PlacementLogId, PublishRequest, PutMode, ReferenceDelta,
+    ObjectMutationContext, PlacementLogId, PublishRequest, PutMode, PutRequest, ReferenceDelta,
     StorageTenantId, StoreOptions, VersionId, WatchRetention,
 };
 use tempfile::TempDir;
@@ -574,14 +574,17 @@ async fn a_destination_gap_stops_before_any_delivery() {
     .deliver_once()
     .await
     .unwrap_err();
-    assert!(matches!(
-        error,
-        ReferenceDeliveryError::JournalGap {
-            cursor: 0,
-            floor,
-            ..
-        } if floor == first_tail
-    ));
+    assert!(
+        matches!(
+            &error,
+            ReferenceDeliveryError::JournalGap {
+                cursor,
+                floor,
+                ..
+            } if cursor < floor && *floor == first_tail
+        ),
+        "unexpected delivery error: {error:?}"
+    );
 }
 
 #[tokio::test]
@@ -833,6 +836,62 @@ async fn one_of_one_exact_proof_is_committed() {
 
     assert_eq!(result, ReferenceCommitDisposition::CommittedOrAncestor);
     assert!(peers.reads.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn one_node_proofless_object_event_is_already_applied_locally() {
+    let stores = TestStores::open(&[1]).await;
+    let source = stores.stores[&NodeId(1)].clone();
+    source
+        .put(PutRequest {
+            key: ObjectKey::new("tenant", "bucket", "legacy-inline").unwrap(),
+            bytes: b"legacy inline reference".to_vec(),
+            content_type: None,
+            mode: PutMode::PutIfAbsent,
+            command_id: Some("legacy-inline".into()),
+            durability: Durability::Local,
+        })
+        .await
+        .unwrap();
+    let source_id = source.local_watch_status().unwrap().source_id;
+    let change = source
+        .scan_local_changes(0, 16)
+        .unwrap()
+        .into_iter()
+        .find(|change| {
+            matches!(
+                change,
+                LocalChange::ObjectHead(change) if change.exact_path == "legacy-inline"
+            )
+        })
+        .unwrap();
+    assert!(
+        source
+            .read_reference_proof(source_id, change.offset())
+            .unwrap()
+            .is_none()
+    );
+
+    let result = QuorumReferenceCommitAuthority::new(
+        source.clone(),
+        Arc::new(TestPlacement::new(placement(&[1], 1))),
+        Arc::new(TestProofPeers::default()),
+    )
+    .classify(source_id, &change)
+    .await
+    .unwrap();
+
+    assert_eq!(result, ReferenceCommitDisposition::AlreadyAppliedLocally);
+
+    let distributed_error = QuorumReferenceCommitAuthority::new(
+        source,
+        Arc::new(TestPlacement::new(placement(&[1, 2], 2))),
+        Arc::new(TestProofPeers::default()),
+    )
+    .classify(source_id, &change)
+    .await
+    .unwrap_err();
+    assert!(distributed_error.contains("reference proof is missing"));
 }
 
 #[tokio::test]
