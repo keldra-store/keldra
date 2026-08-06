@@ -56,14 +56,6 @@ each witnessed commit certificate, but 0.5.3 only checks that those opaque
 values are present. It does not yet evaluate an application-specific voter or
 admission trust policy before witnessing the commit.
 
-A group mutation writes its immutable payload and certificate objects before
-publishing the new committed head with CAS. If ACTIVE cluster membership were
-changed between those steps, a retry on the newly selected group primary could
-produce different placement evidence for the same log position and find the
-old immutable preparation. Public online membership transitions remain
-unavailable in this release; operators must not inject internal membership
-commands while PersonalDB mutations are in flight.
-
 `ListPersonalDbGroups` applies per-group Zanzibar authorization while scanning
 ordinary manifest objects. It keeps scanning internally until the requested
 authorized page is full or the source is exhausted, and continuation metadata
@@ -189,22 +181,56 @@ will recover without operator intervention. The failure did not affect clean
 three-node startup or the subsequent OSV ingestion qualification, but reference
 replay repair for this case remains deferred.
 
-## One-node reference proofs in 0.5.3
+## Legacy one-node reference journal recovery
 
-The one-node object fast path applies content-reference counts in the same
-local RocksDB batch as the object mutation and appends the corresponding
-source-journal event, but it does not persist the distributed reference proof
-required by ordered reference delivery. Delivery therefore fails closed at
-the first such event: reference-journal compaction and blob garbage collection
-remain paused, and the bounded journal can eventually apply write
-backpressure. Object reads and index freshness are unaffected because index
-builders consume the source journal independently and re-read current heads.
+The upgrade recovery path accepts a proofless 0.5.3 object-head event only when
+its source is local and that source is still the sole committed ACTIVE node. It
+recognizes that the one-node fast path already applied the reference effect and
+advances the cursor without applying the count again. Every other missing-proof
+case continues to fail closed.
 
-An installation that has accepted one-node object writes does not yet support
-online expansion to multiple nodes with reference reconciliation. Repairing
-that transition without double-applying the already-local reference effects is
-deferred; 0.5.3 does not weaken the proof or reference-count guarantees to
-hide the gap.
+Consequently, an existing one-node installation must complete startup reference
+reconciliation before beginning an online ADD. Once it has, large objects use
+complete replicas while membership is undersized and the normal typed handoff
+supports online growth from one to two to three ACTIVE nodes. Skipping that
+ordered recovery boundary is unsupported; it does not cause Anvil to infer or
+weaken reference-proof semantics.
+
+## Online ADD boundaries in 0.5.4
+
+An online ADD briefly pauses mutable public and peer operations for the final
+handoff snapshot. A large upload may finish sending its bytes before that
+pause, then receive retryable `UNAVAILABLE` when it attempts `PutEnd` during the
+cutover. Retrying the upload after the membership operation completes is safe;
+unpublished prepared bytes remain subject to the ordinary 24-hour GC grace.
+
+ADD copies the new metadata replica set but does not proactively remove every
+former metadata replica in 0.5.4. Those extra records are not authoritative and
+do not affect reads or quorum decisions, but consume additional disk
+proportional to moved records until a later maintenance capability retires
+them.
+
+Large complete-copy reads in an undersized membership use any valid ACTIVE
+copy but do not proactively reconstruct a missing selected complete replica.
+A successful `REPLICATED` write still proves two distinct durable copies, and
+the typed ADD handoff restores the selected placement when another node joins.
+
+Read repair can recreate an artifact after manual loss or corruption before
+its local authoritative lifecycle record has arrived. That artifact remains
+`AWAITING_PUBLISH` and is eligible for ordinary GC after 24 hours if reference
+delivery or a membership handoff never reinstalls the lifecycle. Normal writes
+and normal online growth install the lifecycle and are unaffected.
+
+In a two-node cluster with object versioning enabled, an explicit deletion of
+a non-current retained version can become unavailable if the coordinator's
+local commit succeeds but its peer apply fails. That operation changes the
+retained descriptor set without advancing the stamped head, so the `2/2` read
+cannot prove which complete snapshot is the direct successor and fails closed
+instead of guessing. Ordinary puts, overwrites, whole-object deletes, current
+version deletion, one-node operation, and `2/3` clusters are unaffected.
+Applications that require this maintenance operation should defer it while a
+cluster has exactly two ACTIVE nodes; a later capability can add explicit
+lineage for retained-history maintenance.
 
 ## First custom-realm binding in a multi-node 0.5.1 cluster
 
@@ -216,17 +242,17 @@ rebound and used normally across the cluster. A later capability must add one
 bounded cross-Zanzibar operation before enabling first binding on multi-node
 clusters; 0.5.1 does not weaken the atomic ownership guarantee.
 
-## Cluster lifecycle operations in 0.5.1
+## Cluster lifecycle operations
 
-Anvil 0.5.1 supports genesis, authorized node preparation, learner catch-up,
-typed ownership handoff, and activation for ordinary cluster formation. The
-bounded Raft state machine also validates removal, capacity-reweight, and peer
-certificate-overlap transitions, but 0.5.1 does not expose public operations
-that start those transitions because their corresponding online ownership
-handoff and live TLS-reload orchestration are not yet complete. Operators must
-not submit those internal Raft commands directly.
+Anvil supports genesis, authorized node preparation, learner catch-up, typed
+ownership handoff, and online ADD activation for ordinary cluster formation.
+The bounded Raft state machine also validates removal, capacity-reweight, and
+peer-certificate-overlap transitions, but 0.5.4 does not expose public
+operations that start those transitions because their corresponding online
+ownership handoff and live TLS-reload orchestration are not yet complete.
+Operators must not submit those internal Raft commands directly.
 
-There is no public drain or detailed cluster-health RPC in 0.5.1. Public
+There is no public drain or detailed cluster-health RPC in 0.5.4. Public
 listener availability is the readiness boundary: Anvil binds it only after
 membership, serving-fence, bootstrap, authorization, atomic recovery, and
 ordered reference startup checks complete. Normal process termination stops

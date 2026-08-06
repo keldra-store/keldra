@@ -29,8 +29,9 @@ The cluster has these deliberately different data treatments:
 - payloads of at most 64 KiB remain complete content-addressed values in the
   `small_blobs` RocksDB column family and are copied to their selected content
   owners;
-- larger payloads converge to erasure-coded shards on distinct
-  weighted-HRW-selected nodes regardless of acknowledgement policy;
+- larger payloads use complete replicas while the committed ACTIVE membership
+  is too small to place the genesis erasure profile, then converge to
+  erasure-coded shards on distinct weighted-HRW-selected nodes once it can;
 - Raft records only membership, node identity and weight, bootstrap state,
   atomic-executor nomination, compact atomic decisions, and other bounded
   cluster coordination state; and
@@ -746,16 +747,16 @@ versions reference it.
 
 Payloads of at most 64 KiB remain raw values in `small_blobs`. This is a
 deliberate primary storage path, not a cache. Selected content owners hold
-complete copies. The healthy final copy count is `M + 1`, derived from the
-cluster's committed erasure-code profile; there is no separate copy-count
-configuration. This gives complete small values the same configured
-node-failure tolerance as large values without multiplying them by `K`. The
-request's rank-zero coordinator first stores the raw value with a synchronous
-RocksDB write. `LOCAL` accepts that coordinator acknowledgement; copying to the
-remaining selected owners continues durably after the response. `REPLICATED`
-waits for all `M + 1` selected complete-copy owners. If there are too few
-ACTIVE nodes, `LOCAL` remains available and reports under-redundancy while
-`REPLICATED` is unavailable.
+complete copies. The healthy final copy count is `min(N, M + 1)`, where `N` is
+the committed ACTIVE-node count and `M` comes from the cluster's committed
+erasure-code profile; there is no separate copy-count configuration. This gives
+complete small values the available configured node-failure tolerance as large
+values without multiplying them by `K`. The request's rank-zero coordinator
+first stores the raw value with a synchronous RocksDB write. `LOCAL` accepts
+that coordinator acknowledgement; copying to the remaining selected owners
+continues durably after the response. `REPLICATED` requires two distinct
+complete copies and therefore remains unavailable with only one ACTIVE node.
+With two or more ACTIVE nodes it waits for every selected copy up to `M + 1`.
 
 No large-object implementation, index segment cache, or distributed feature
 may remove or bypass `small_blobs`.
@@ -797,17 +798,21 @@ keys, object descriptors, or manifests. A shard owner stores its one shard; it
 does not store a second replica of that shard. The full set of different shards
 provides redundancy. Every ordinal is assigned to a distinct active node; an
 undersized cluster never silently co-locates shards and weakens the profile.
+Instead, when `N < K + M`, a large payload is stored as
+`min(N, M + 1)` complete content-addressed replicas on distinct weighted-HRW
+owners. The committed profile does not change and no alternative per-object
+profile is recorded.
 
 The rank-zero coordinator accepting an upload first seals and verifies one
 complete content-addressed source blob in the ordinary byte plane. This is
 upload and repair source material, not another storage class or side plane.
 `LOCAL` may publish and return success after the coordinator has durably stored
-the source and the mandatory logical-metadata quorum has committed. Encoding
-and placement of the standard shards then continue durably in the background.
-`REPLICATED` withholds publication and success until the evidence required by
-section 24.1 is durable. Failure of the sole source after a `LOCAL` response
-but before placement completes may lose the payload; it never rolls metadata
-back or exposes an older version.
+the source and the mandatory logical-metadata quorum has committed. Copy or
+shard placement then continues durably in the background according to the
+current ACTIVE membership. `REPLICATED` withholds publication and success until
+the evidence required by section 24.1 is durable. Failure of the sole source
+after a one-node `LOCAL` response but before another node joins may lose the
+payload; it never rolls metadata back or exposes an older version.
 
 Placement ranks distinct active nodes once for the blob identity and assigns
 shard ordinal `i` to rank `i`. A healthy read de-stripes the `K` systematic
@@ -827,10 +832,12 @@ missing before decode, and the reconstructed object's existing BLAKE3 hash and
 length remain the end-to-end verification.
 
 The default `2+1` profile uses 1.5 times the payload capacity and tolerates one
-missing shard. All three shards are required for a non-degraded write, so one
-unavailable owner pauses new `REPLICATED` writes under that profile. The exact
-general rule is `K+1` durable final shards before a `REPLICATED` success, as
-fixed in section 24.1; background placement still converges to `K+M`.
+missing shard once three nodes are ACTIVE. All three shards are required for a
+non-degraded write, while `REPLICATED` requires `K + 1` durable final shards as
+fixed in section 24.1. With two ACTIVE nodes, the same profile instead places
+two complete replicas and `REPLICATED` waits for both. With one ACTIVE node,
+`LOCAL` is available and `REPLICATED` is not. Background placement converges to
+the complete-copy target or all `K + M` shards for the current membership.
 
 `LOCAL` and `REPLICATED` are response-evidence choices, not persistent object
 durability classes. Content identity and final placement are identical under
@@ -899,6 +906,14 @@ unrecoverable source-journal loss keeps GC disabled while authoritative version
 descriptors rebuild counts. This keeps replay state proportional to cluster
 nodes rather than reference IDs proportional to objects.
 
+A legacy 0.5.3 one-node object mutation applied its reference effect in the
+same RocksDB batch as its source-journal append but did not persist a
+distributed reference proof. During upgrade, while that source is still the
+only committed ACTIVE node, recovery recognizes the exact local object-head
+event as already applied and advances the local reference cursor without
+applying its count a second time. Missing proofs remain invalid in every other
+topology or for any event that cannot be identified as that legacy local case.
+
 Garbage collection runs only on the current content owner while it has a fresh
 serving lease. It performs the configured hourly scan and never removes content
 whose `updated_at` is younger than the configured grace, defaulting to 24
@@ -934,6 +949,12 @@ when recovery needs them.
 8. Commit `ACTIVE` membership and the stable weight in Raft.
 9. Grant leases for the new membership and resume traffic.
 10. Keep former copies through the normal grace before GC removes them.
+
+For the default `2+1` profile, this gives an online sequence of one complete
+copy at one ACTIVE node, two complete copies at two ACTIVE nodes, and `2+1`
+erasure shards at three or more ACTIVE nodes. The ADD handoff copies or encodes
+and verifies the new placement before the membership cutover; requests keep the
+same object identity throughout.
 
 ### 15.2 Removing a node
 
@@ -1313,16 +1334,20 @@ It never weakens authoritative metadata replication or changes the required
 final placement. Standard placement after a `LOCAL` response is mandatory
 background work, not optional best effort.
 
-Small payloads converge to `M + 1` complete copies and `REPLICATED` waits for
-all of them as defined in section 14.1. The pure-Rust codec and inline integrity
-format are also resolved.
+Small payloads converge to `min(N, M + 1)` complete copies. `REPLICATED`
+requires at least two ACTIVE nodes and waits for every selected copy as defined
+in section 14.1. The pure-Rust codec and inline integrity format are also
+resolved.
 
-For a large payload, `REPLICATED` waits for `K + 1` distinct final shards. This
-is the general form of the default profile's `2+1`: enough final shards to
-reconstruct after one selected owner is lost. It creates no temporary encoding
-or second payload representation. Placement still converges to all `K + M`
-final shards. Crash-safe continuation after a response and reference deltas
-follow section 14.3.
+For a large payload with at least `K + M` ACTIVE nodes, `REPLICATED` waits for
+`K + 1` distinct final shards. This is the general form of the default
+profile's `2+1`: enough final shards to reconstruct after one selected owner is
+lost. With fewer nodes, large payloads use `min(N, M + 1)` complete replicas;
+`REPLICATED` requires and waits for two distinct complete copies. These are
+membership-derived physical representations of one content identity, not
+different durability classes or per-object profiles. Placement still converges
+to the applicable complete-copy target or all `K + M` final shards. Crash-safe
+continuation after a response and reference deltas follow section 14.3.
 
 ### 24.2 Tenant-name canonicalization
 
