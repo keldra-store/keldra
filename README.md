@@ -22,6 +22,7 @@ rendezvous hashing.
 | Materialized indexes | 0.5.2 | Path, object metadata, typed JSON, full text, vector, hybrid, Git-source, and tensor indexes |
 | Rust client | 0.5.2 | Credential exchange, authenticated clients, streaming upload helpers, and the complete generated gRPC API |
 | PersonalDB, public reads, accounting, S3 and Git | 0.5.3 | Protocol-native PersonalDB groups and projections, authorized usage aggregates, opt-in anonymous reads, and standard S3/Git gateways |
+| Online cluster growth | 0.5.4 | Large objects use complete replicas below the configured erasure width, then move online to the fixed erasure profile as nodes join |
 | Java client | — | TODO |
 | Python client | — | TODO |
 | Node.js client | — | TODO |
@@ -41,7 +42,7 @@ repository are required.
 ### 1. Start a development node
 
 ```sh
-export ANVIL_IMAGE=ghcr.io/worka-ai/anvil:0.5.3
+export ANVIL_IMAGE=ghcr.io/worka-ai/anvil:0.5.4
 export ANVIL_TOKEN_SIGNING_KEY_FILE="$PWD/anvil-data/token-signing-key"
 
 mkdir -p anvil-data
@@ -153,7 +154,7 @@ Zanzibar-authorized object addressed by `(tenant, bucket, path)`.
 ## Use the Rust client
 
 ```sh
-cargo add anvil-storage@0.5.3
+cargo add anvil-storage@0.5.4
 cargo add tokio --features macros,rt-multi-thread
 ```
 
@@ -228,7 +229,7 @@ Zanzibar-authorized independently of ordinary object traffic.
 Add the public client and canonical protocol types:
 
 ```sh
-cargo add anvil-storage@0.5.3 personaldb-protocol@0.2.2 serde_json
+cargo add anvil-storage@0.5.4 personaldb-protocol@0.2.2 serde_json
 ```
 
 Use the same application credential created above to create a source group and
@@ -612,7 +613,7 @@ bundles, establishes peer mTLS, exercises replicated and erasure-coded storage,
 queries every index type, and performs a rolling restart:
 
 ```sh
-ANVIL_IMAGE=ghcr.io/worka-ai/anvil:0.5.3 \
+ANVIL_IMAGE=ghcr.io/worka-ai/anvil:0.5.4 \
   ./scripts/qualify-three-node.sh
 ```
 
@@ -651,9 +652,11 @@ The versioned contracts are
 
 Every successful write creates immutable content and advances one current
 exact-path head. Values up to 64 KiB remain inline in a RocksDB column family;
-larger values are content-addressed and erasure coded. Mutable records are
-replicated. Compact cluster membership and atomic-publication decisions use
-Raft; object bodies, path inventories, program locks, and index files do not.
+larger values are content-addressed, use complete copies while the cluster is
+smaller than its fixed erasure width, and move online to erasure-coded shards
+as nodes join. Mutable records are replicated. Compact cluster membership and
+atomic-publication decisions use Raft; object bodies, path inventories, program
+locks, and index files do not.
 
 Names resolve to stable numeric IDs, so renaming human-facing identifiers does
 not rewrite every storage key. Ordered per-node source journals feed watches,
