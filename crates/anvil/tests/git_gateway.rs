@@ -106,12 +106,10 @@ impl Fixture {
         let tokens = JwtManager::new(SIGNING_KEY).unwrap();
         let listen = unused_loopback_address();
         let peer = distinct_address(&[listen]);
-        let gateway = distinct_address(&[listen, peer]);
         let server = tokio::spawn(serve(test_server_config(
             &directory,
             listen,
             peer,
-            gateway,
             tokens.clone(),
         )));
         let grpc = connect_when_ready(listen).await;
@@ -124,11 +122,11 @@ impl Fixture {
             .mint(StorageTenantId::parse("acme").unwrap(), "owner-app")
             .unwrap();
         retry_bucket(&mut administration, &owner).await;
-        wait_for_http(gateway).await;
+        wait_for_http(listen).await;
         Self {
             _directory: directory,
             grpc,
-            gateway,
+            gateway: listen,
             tokens,
             server,
         }
@@ -232,13 +230,11 @@ fn test_server_config(
     directory: &TempDir,
     listen: SocketAddr,
     peer_listen: SocketAddr,
-    gateway: SocketAddr,
     token_manager: JwtManager,
 ) -> ServerConfig {
     ServerConfig {
         listen,
         peer_listen,
-        gateway_listen: Some(gateway),
         peer_advertise: None,
         join_bundle: None,
         data_dir: directory.path().to_owned(),

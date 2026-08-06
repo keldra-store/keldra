@@ -17,10 +17,6 @@ struct Arguments {
     #[arg(long, env = "ANVIL_PEER_LISTEN", default_value = "127.0.0.1:50052")]
     peer_listen: SocketAddr,
 
-    /// Optional shared HTTP ingress for protocol gateways such as S3.
-    #[arg(long, env = "ANVIL_GATEWAY_LISTEN")]
-    gateway_listen: Option<SocketAddr>,
-
     #[arg(long, env = "ANVIL_PEER_ADVERTISE")]
     peer_advertise: Option<String>,
 
@@ -275,7 +271,6 @@ async fn main() -> Result<()> {
     let server_result = serve(ServerConfig {
         listen: arguments.listen,
         peer_listen: arguments.peer_listen,
-        gateway_listen: arguments.gateway_listen,
         peer_advertise: arguments.peer_advertise,
         join_bundle: arguments.join_bundle,
         data_dir: arguments.data_dir,

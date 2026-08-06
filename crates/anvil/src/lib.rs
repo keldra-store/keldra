@@ -67,7 +67,6 @@ use anvil_api::v1::personal_db_service_server::PersonalDbServiceServer;
 use anvil_consensus::{ATOMIC_REPLAY_RETENTION_MILLIS, NodeId};
 use anvil_store::{ErasureProfile, MutationReceiptRetention, Store, StoreOptions, WatchRetention};
 use anyhow::{Context, Result};
-use tonic::transport::Server;
 
 use authentication::{JwtManager, RateLimitConfig, RequestRateLimits};
 use mutation_admission::{AdmissionSurface, MutationAdmissionService};
@@ -87,7 +86,6 @@ const _: () = assert!(MAX_GRPC_MESSAGE_BYTES >= MIN_AUTHZ_BATCH_MESSAGE_BYTES);
 pub struct ServerConfig {
     pub listen: SocketAddr,
     pub peer_listen: SocketAddr,
-    pub gateway_listen: Option<SocketAddr>,
     pub peer_advertise: Option<String>,
     pub join_bundle: Option<PathBuf>,
     pub data_dir: PathBuf,
@@ -508,31 +506,27 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         .install(personaldb_service.routed_handler())
         .map_err(|_| anyhow::anyhow!("routed PersonalDB handler was installed more than once"))?;
     let request_rate_limits = RequestRateLimits::new(config.rate_limits);
-    let gateway_state = config.gateway_listen.map(|_| {
-        let objects = v05::GatewayObjectAdapter::new(object_service.clone());
-        (
-            s3::S3State {
-                objects: objects.clone(),
-                control: distributed_control.clone(),
-                tokens: config.token_manager.clone(),
-                rate_limits: request_rate_limits.clone(),
-                serving: serving_fence.authority(),
-                mutation_admission: mutation_admission.clone(),
-            },
-            git_gateway::GitGatewayState {
-                objects,
-                control: distributed_control.clone(),
-                tokens: config.token_manager.clone(),
-                rate_limits: request_rate_limits.clone(),
-                serving: serving_fence.authority(),
-                mutation_admission: mutation_admission.clone(),
-                cache_root: config.data_dir.join("gateway-cache/git"),
-                max_request_bytes: config.max_blob_bytes,
-                lock: Arc::new(tokio::sync::Mutex::new(())),
-                basic_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            },
-        )
-    });
+    let gateway_objects = v05::GatewayObjectAdapter::new(object_service.clone());
+    let s3_state = s3::S3State {
+        objects: gateway_objects.clone(),
+        control: distributed_control.clone(),
+        tokens: config.token_manager.clone(),
+        rate_limits: request_rate_limits.clone(),
+        serving: serving_fence.authority(),
+        mutation_admission: mutation_admission.clone(),
+    };
+    let git_state = git_gateway::GitGatewayState {
+        objects: gateway_objects,
+        control: distributed_control.clone(),
+        tokens: config.token_manager.clone(),
+        rate_limits: request_rate_limits.clone(),
+        serving: serving_fence.authority(),
+        mutation_admission: mutation_admission.clone(),
+        cache_root: config.data_dir.join("gateway-cache/git"),
+        max_request_bytes: config.max_blob_bytes,
+        lock: Arc::new(tokio::sync::Mutex::new(())),
+        basic_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+    };
     routed_public_handlers
         .install(object_service.routed_public_handler())
         .map_err(|_| anyhow::anyhow!("routed public handler was installed more than once"))?;
@@ -653,18 +647,22 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         AdmissionSurface::Public,
     );
 
-    let mut gateway_server = match (config.gateway_listen, gateway_state) {
-        (Some(address), Some((s3_state, git_state))) => Some(
-            http_gateway::HttpGatewayServer::start(
-                address,
-                s3::router(s3_state).merge(git_gateway::router(git_state)),
-            )
+    let grpc_router = tonic::service::Routes::new(object_service)
+        .add_service(index_service)
+        .add_service(personaldb_service)
+        .add_service(accounting_service)
+        .add_service(authz_service)
+        .add_service(administration_service)
+        // Deliberately not bearer-authenticated: this service exchanges
+        // durable long-lived credentials for that bearer token. It still
+        // requires the node-wide serving fence.
+        .add_service(credential_service)
+        .into_axum_router();
+    let gateway_router = s3::router(s3_state).merge(git_gateway::router(git_state));
+    let mut public_server =
+        http_gateway::PublicServer::start(config.listen, grpc_router, gateway_router)
             .await
-            .context("start HTTP protocol gateway")?,
-        ),
-        (None, None) => None,
-        _ => unreachable!("gateway configuration and state are built together"),
-    };
+            .context("start public gRPC, S3, and Git listener")?;
     let payload_gc = payload_gc::PayloadGarbageCollector::new(
         local_node,
         store.clone(),
@@ -674,87 +672,40 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         config.erasure_profile,
     );
     let blob_gc_task = spawn_blob_gc(store, reference_runtime_handle, payload_gc);
-    tracing::info!(address = %config.listen, "Anvil 0.5 server listening");
-    let (stop_public, public_stopped) = tokio::sync::oneshot::channel();
-    let mut public_server = Box::pin(
-        Server::builder()
-            .add_service(object_service)
-            .add_service(index_service)
-            .add_service(personaldb_service)
-            .add_service(accounting_service)
-            .add_service(authz_service)
-            .add_service(administration_service)
-            // Deliberately not bearer-authenticated: this service exchanges
-            // durable long-lived credentials for that bearer token. It still
-            // requires the node-wide serving fence.
-            .add_service(credential_service)
-            .serve_with_shutdown(config.listen, async move {
-                let _ = public_stopped.await;
-            }),
-    );
     enum FirstStop {
         Signal(std::io::Result<()>),
-        Public(Result<(), tonic::transport::Error>),
+        Public(Result<Result<()>, tokio::task::JoinError>),
         Peer(Result<Result<()>, tokio::task::JoinError>),
-        Gateway(Result<Result<()>, tokio::task::JoinError>),
     }
-    let first_stop = if let Some(gateway) = gateway_server.as_mut() {
-        tokio::select! {
-            signal = tokio::signal::ctrl_c() => FirstStop::Signal(signal),
-            public = &mut public_server => FirstStop::Public(public),
-            peer = peer_server.task_mut() => FirstStop::Peer(peer),
-            gateway = gateway.task_mut() => FirstStop::Gateway(gateway),
-        }
-    } else {
-        tokio::select! {
-            signal = tokio::signal::ctrl_c() => FirstStop::Signal(signal),
-            public = &mut public_server => FirstStop::Public(public),
-            peer = peer_server.task_mut() => FirstStop::Peer(peer),
-        }
+    let first_stop = tokio::select! {
+        signal = tokio::signal::ctrl_c() => FirstStop::Signal(signal),
+        public = public_server.task_mut() => FirstStop::Public(public),
+        peer = peer_server.task_mut() => FirstStop::Peer(peer),
     };
     let server_result = match first_stop {
         FirstStop::Signal(signal) => {
-            let _ = stop_public.send(());
-            let public = public_server.await.context("serve public listener");
-            let gateway = shutdown_http_gateway(gateway_server.take()).await;
+            let public = public_server.shutdown().await;
             let peer = peer_server.shutdown().await;
             signal.context("wait for shutdown signal")?;
             public?;
-            gateway?;
             peer
         }
         FirstStop::Public(public) => {
-            let gateway = shutdown_http_gateway(gateway_server.take()).await;
+            public_server.record_completed();
             let peer = peer_server.shutdown().await;
-            public.context("serve public listener")?;
-            gateway?;
+            public
+                .context("join public server task")?
+                .context("serve public listener")?;
             peer
         }
         FirstStop::Peer(peer) => {
             peer_server.record_completed();
-            let _ = stop_public.send(());
-            let public = public_server.await.context("serve public listener");
-            let gateway = shutdown_http_gateway(gateway_server.take()).await;
+            let public = public_server.shutdown().await;
             let peer = peer
                 .context("join private peer server task")?
                 .context("serve private peer listener");
             peer?;
-            gateway?;
             public
-        }
-        FirstStop::Gateway(gateway) => {
-            gateway_server
-                .as_mut()
-                .expect("gateway completed only when configured")
-                .record_completed();
-            let _ = stop_public.send(());
-            let public = public_server.await.context("serve public listener");
-            let peer = peer_server.shutdown().await;
-            gateway
-                .context("join HTTP gateway task")?
-                .context("serve HTTP gateway listener")?;
-            public?;
-            peer
         }
     };
     blob_gc_task.abort();
@@ -771,13 +722,6 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         .context("shut down decision Raft");
     server_result?;
     shutdown_result
-}
-
-async fn shutdown_http_gateway(gateway: Option<http_gateway::HttpGatewayServer>) -> Result<()> {
-    match gateway {
-        Some(gateway) => gateway.shutdown().await,
-        None => Ok(()),
-    }
 }
 
 fn validate_atomic_replay_gc(awaiting_publish_ttl_seconds: u64) -> Result<()> {

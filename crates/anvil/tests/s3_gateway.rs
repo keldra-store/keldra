@@ -45,6 +45,34 @@ async fn official_client_exercises_minimum_s3_surface_and_public_read() {
         .send()
         .await
         .expect("official S3 client uploads a second object");
+    client
+        .put_object()
+        .bucket("objects")
+        .key("wire/grpc-payload.bin")
+        .content_type("application/grpc")
+        .body(ByteStream::from_static(b"opaque grpc media bytes"))
+        .send()
+        .await
+        .expect("S3 content type does not select the gRPC router");
+
+    let grpc_media = client
+        .get_object()
+        .bucket("objects")
+        .key("wire/grpc-payload.bin")
+        .send()
+        .await
+        .expect("official S3 client reads the gRPC-media object");
+    assert_eq!(grpc_media.content_type(), Some("application/grpc"));
+    assert_eq!(
+        grpc_media
+            .body
+            .collect()
+            .await
+            .expect("gRPC-media object body streams")
+            .into_bytes()
+            .as_ref(),
+        b"opaque grpc media bytes"
+    );
 
     let head = client
         .head_object()
@@ -135,12 +163,10 @@ impl Fixture {
         let tokens = JwtManager::new(SIGNING_KEY).unwrap();
         let listen = unused_loopback_address();
         let peer = distinct_address(&[listen]);
-        let gateway = distinct_address(&[listen, peer]);
         let server = tokio::spawn(serve(test_server_config(
             &directory,
             listen,
             peer,
-            gateway,
             tokens.clone(),
         )));
         let grpc = connect_when_ready(listen).await;
@@ -175,11 +201,11 @@ impl Fixture {
                 Err(error) => panic!("provision tenant through distributed control: {error}"),
             }
         }
-        wait_for_http(gateway).await;
+        wait_for_http(listen).await;
         Self {
             _directory: directory,
             grpc,
-            gateway,
+            gateway: listen,
             tokens,
             server,
         }
@@ -243,13 +269,11 @@ fn test_server_config(
     directory: &TempDir,
     listen: SocketAddr,
     peer_listen: SocketAddr,
-    gateway: SocketAddr,
     token_manager: JwtManager,
 ) -> ServerConfig {
     ServerConfig {
         listen,
         peer_listen,
-        gateway_listen: Some(gateway),
         peer_advertise: None,
         join_bundle: None,
         data_dir: directory.path().to_owned(),

@@ -1097,7 +1097,6 @@ fn test_server_config(
     ServerConfig {
         listen,
         peer_listen,
-        gateway_listen: None,
         peer_advertise: None,
         join_bundle: None,
         data_dir: directory.path().to_owned(),
