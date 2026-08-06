@@ -374,17 +374,17 @@ impl ReferenceDelivery {
             .placement
             .current()
             .map_err(ReferenceDeliveryError::Placement)?;
-        let status = self
+        let initial_status = self
             .source
             .local_watch_status()
             .map_err(|error| ReferenceDeliveryError::Source(error.to_string()))?;
         let active = active_destinations(&placement)?;
         if !active
             .iter()
-            .any(|destination| destination.node.0 == u64::from(status.source_id.node_id))
+            .any(|destination| destination.node.0 == u64::from(initial_status.source_id.node_id))
         {
             return Err(ReferenceDeliveryError::SourceNotActive {
-                source_id: status.source_id,
+                source_id: initial_status.source_id,
             });
         }
 
@@ -392,36 +392,53 @@ impl ReferenceDelivery {
         for destination in &active {
             let cursor = self
                 .destinations
-                .cursor(destination.node, &destination.address, status.source_id)
+                .cursor(
+                    destination.node,
+                    &destination.address,
+                    initial_status.source_id,
+                )
                 .await
                 .map_err(|message| ReferenceDeliveryError::Destination {
                     node: destination.node,
                     message,
                 })?;
-            validate_cursor(
-                destination.node,
-                cursor,
-                status.retention_floor,
-                status.tail,
-            )?;
             cursors.insert(destination.node, cursor);
+        }
+
+        // Cursor reads may await peer RPCs while this source appends another
+        // event. Validate the observations against a status captured after
+        // those awaits, not against the stale status from before them.
+        let status = self
+            .source
+            .local_watch_status()
+            .map_err(|error| ReferenceDeliveryError::Source(error.to_string()))?;
+        if status.source_id != initial_status.source_id {
+            return Err(ReferenceDeliveryError::Source(
+                "source journal identity changed during reference cursor reads".into(),
+            ));
+        }
+        for (node, cursor) in &cursors {
+            validate_cursor(*node, *cursor, status.retention_floor, status.tail)?;
         }
         let slowest = cursors.values().copied().min().unwrap_or(status.tail);
         if slowest == status.tail {
-            self.finish_compaction(&placement, status.source_id, status.tail, &cursors)
+            let final_tail = self
+                .finish_compaction(&placement, status.source_id, &cursors)
                 .await?;
             return Ok(ReferenceDeliveryProgress {
                 source_id: status.source_id,
                 safe_through: status.tail,
-                tail: status.tail,
+                tail: final_tail,
             });
         }
 
         let changes = self
             .source
             .scan_local_changes(slowest, self.page_size)
-            .map_err(|error| ReferenceDeliveryError::Source(error.to_string()))?;
-        let mut routed = Vec::with_capacity(changes.len());
+            .map_err(|error| ReferenceDeliveryError::Source(error.to_string()))?
+            .into_iter()
+            .take_while(|change| change.offset() <= status.tail);
+        let mut routed = Vec::with_capacity(self.page_size);
         let mut prepared = Vec::new();
         let mut blocked = None;
         for change in changes {
@@ -524,7 +541,7 @@ impl ReferenceDelivery {
                     }
                 }
             }
-            self.finish_compaction(&placement, status.source_id, status.tail, &cursors)
+            self.finish_compaction(&placement, status.source_id, &cursors)
                 .await?;
             if let Some(error) = first_failure {
                 return Err(error);
@@ -533,10 +550,19 @@ impl ReferenceDelivery {
         if let Some(error) = blocked {
             return Err(error);
         }
+        let final_tail = self
+            .source
+            .local_watch_status()
+            .map_err(|error| ReferenceDeliveryError::Source(error.to_string()))?;
+        if final_tail.source_id != status.source_id {
+            return Err(ReferenceDeliveryError::Source(
+                "source journal identity changed during reference delivery".into(),
+            ));
+        }
         Ok(ReferenceDeliveryProgress {
             source_id: status.source_id,
             safe_through: cursors.values().copied().min().unwrap_or(through),
-            tail: status.tail,
+            tail: final_tail.tail,
         })
     }
 
@@ -544,9 +570,8 @@ impl ReferenceDelivery {
         &self,
         started: &ReferencePlacement,
         source: SourceId,
-        tail: u64,
         cursors: &BTreeMap<NodeId, u64>,
-    ) -> Result<(), ReferenceDeliveryError> {
+    ) -> Result<u64, ReferenceDeliveryError> {
         let current = self
             .placement
             .current()
@@ -556,18 +581,28 @@ impl ReferenceDelivery {
         {
             return Err(ReferenceDeliveryError::PlacementChanged);
         }
-        let safe = cursors.values().copied().min().unwrap_or(tail);
-        if safe > tail {
+        let status = self
+            .source
+            .local_watch_status()
+            .map_err(|error| ReferenceDeliveryError::Source(error.to_string()))?;
+        if status.source_id != source {
+            return Err(ReferenceDeliveryError::Source(
+                "source journal identity changed before reference compaction".into(),
+            ));
+        }
+        let safe = cursors.values().copied().min().unwrap_or(status.tail);
+        if safe > status.tail {
             return Err(ReferenceDeliveryError::CursorAhead {
                 node: NodeId(u64::from(source.node_id)),
                 cursor: safe,
-                tail,
+                tail: status.tail,
             });
         }
         self.source
             .advance_source_journal_safe_through(safe)
             .await
-            .map_err(|error| ReferenceDeliveryError::Source(error.to_string()))
+            .map_err(|error| ReferenceDeliveryError::Source(error.to_string()))?;
+        Ok(status.tail)
     }
 }
 

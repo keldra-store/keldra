@@ -141,6 +141,7 @@ impl ReferenceProofPeers for TestProofPeers {
 struct TestDestinations {
     stores: Arc<BTreeMap<NodeId, Store>>,
     fail_once: Arc<Mutex<BTreeSet<NodeId>>>,
+    advance_source_on_cursor: Arc<Mutex<Option<(Store, Vec<u8>)>>>,
     batches: Arc<Mutex<Vec<(NodeId, ReferenceDeltaBatch)>>>,
     order: Arc<Mutex<Vec<String>>>,
 }
@@ -150,6 +151,7 @@ impl TestDestinations {
         Self {
             stores,
             fail_once: Arc::new(Mutex::new(BTreeSet::new())),
+            advance_source_on_cursor: Arc::new(Mutex::new(None)),
             batches: Arc::new(Mutex::new(Vec::new())),
             order,
         }
@@ -161,11 +163,29 @@ impl TestDestinations {
             .expect("test failure lock")
             .insert(node);
     }
+
+    fn advance_source_on_next_cursor(&self, source: Store, bytes: &[u8]) {
+        *self
+            .advance_source_on_cursor
+            .lock()
+            .expect("test source-advance lock") = Some((source, bytes.to_vec()));
+    }
 }
 
 #[tonic::async_trait]
 impl ReferenceDestinations for TestDestinations {
     async fn cursor(&self, node: NodeId, _address: &str, source: SourceId) -> Result<u64, String> {
+        let advance = self
+            .advance_source_on_cursor
+            .lock()
+            .expect("test source-advance lock")
+            .take();
+        if let Some((store, bytes)) = advance {
+            store
+                .stage_blob(&bytes)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
         self.stores[&node]
             .reference_delta_cursor(source)
             .map_err(|error| error.to_string())
@@ -517,10 +537,8 @@ async fn every_active_destination_advances_and_positive_bytes_arrive_first() {
     .await
     .unwrap();
 
-    assert_eq!(
-        (progress.safe_through, progress.tail),
-        (expected_tail, expected_tail)
-    );
+    assert_eq!(progress.safe_through, expected_tail);
+    assert_eq!(progress.tail, source.local_watch_status().unwrap().tail);
     for node in [NodeId(1), NodeId(2), NodeId(3)] {
         assert_eq!(
             stores.stores[&node]
@@ -539,6 +557,70 @@ async fn every_active_destination_advances_and_positive_bytes_arrive_first() {
     let order = order.lock().unwrap();
     assert_eq!(order.first().map(String::as_str), Some("prepare"));
     assert!(order[1..].iter().all(|entry| entry.starts_with("apply:")));
+}
+
+#[tokio::test]
+async fn cursor_reads_are_validated_against_a_fresh_source_tail() {
+    let stores = TestStores::open(&[1, 2, 3]).await;
+    let source = stores.stores[&NodeId(1)].clone();
+    let blob = publish(&source, "one", b"first payload", "first").await;
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let destinations = Arc::new(TestDestinations::new(stores.stores.clone(), order.clone()));
+    let payloads = Arc::new(TestPayloads::new(
+        source.clone(),
+        stores.stores.clone(),
+        order,
+    ));
+    let runner = delivery(
+        source.clone(),
+        TestPlacement::new(placement(&[1, 2, 3], 1)),
+        Arc::new(TestCommits::default()),
+        destinations.clone(),
+        payloads,
+    );
+    loop {
+        let progress = runner.deliver_once().await.unwrap();
+        if progress.safe_through == progress.tail {
+            break;
+        }
+    }
+    let initial_status = source.local_watch_status().unwrap();
+    for store in stores.stores.values() {
+        assert_eq!(
+            store
+                .reference_delta_cursor(initial_status.source_id)
+                .unwrap(),
+            initial_status.tail
+        );
+    }
+    assert_eq!(
+        lifecycle(&stores.stores[&NodeId(1)], &blob)
+            .unwrap()
+            .ref_count,
+        1
+    );
+
+    destinations.advance_source_on_next_cursor(source.clone(), b"concurrent sealed payload");
+    let progress = runner.deliver_once().await.unwrap();
+
+    let final_status = source.local_watch_status().unwrap();
+    assert_eq!(final_status.tail, initial_status.tail + 1);
+    assert_eq!(progress.tail, final_status.tail);
+    assert_eq!(progress.safe_through, final_status.tail);
+    for store in stores.stores.values() {
+        assert_eq!(
+            store
+                .reference_delta_cursor(final_status.source_id)
+                .unwrap(),
+            final_status.tail
+        );
+    }
+    assert_eq!(
+        lifecycle(&stores.stores[&NodeId(1)], &blob)
+            .unwrap()
+            .ref_count,
+        1
+    );
 }
 
 #[tokio::test]
