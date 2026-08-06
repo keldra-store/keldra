@@ -515,6 +515,7 @@ echo "[anvil-qualification] two-node read succeeded without node 1's complete bl
 # not a second logical reference to the preexisting deduplicated blob.
 cp "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-large.bin" \
   "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-two-large.bin"
+chmod 0644 "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-two-large.bin"
 printf '\001' | dd \
   of="${ANVIL_QUALIFICATION_DIR}/artifacts/growth-two-large.bin" \
   bs=1 seek=0 count=1 conv=notrunc status=none
