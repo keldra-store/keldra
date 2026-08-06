@@ -253,6 +253,100 @@ impl Store {
             )
             .map_err(storage_error)
     }
+
+    /// Retire one physical artifact which the caller has proved is no longer
+    /// selected by the current cluster placement.
+    ///
+    /// The caller-supplied fence check runs while the ordinary store commit
+    /// lock is held. The lifecycle must still exactly match the snapshot the
+    /// caller inspected; a concurrent touch or reference change makes this a
+    /// harmless no-op. Retirement does not remove bytes. It starts the normal
+    /// inactivity grace, after which ordinary blob garbage collection performs
+    /// the physical removal.
+    pub async fn retire_payload_artifact_if_unchanged<F>(
+        &self,
+        expected: &PayloadArtifactSnapshot,
+        placement_is_still_current: F,
+    ) -> Result<bool, MutationError>
+    where
+        F: FnOnce() -> bool,
+    {
+        self.retire_payload_artifact_if_unchanged_inner(expected, None, placement_is_still_current)
+            .await
+    }
+
+    async fn retire_payload_artifact_if_unchanged_at<F>(
+        &self,
+        expected: &PayloadArtifactSnapshot,
+        now_unix_millis: u64,
+        placement_is_still_current: F,
+    ) -> Result<bool, MutationError>
+    where
+        F: FnOnce() -> bool,
+    {
+        self.retire_payload_artifact_if_unchanged_inner(
+            expected,
+            Some(now_unix_millis),
+            placement_is_still_current,
+        )
+        .await
+    }
+
+    async fn retire_payload_artifact_if_unchanged_inner<F>(
+        &self,
+        expected: &PayloadArtifactSnapshot,
+        fixed_now_unix_millis: Option<u64>,
+        placement_is_still_current: F,
+    ) -> Result<bool, MutationError>
+    where
+        F: FnOnce() -> bool,
+    {
+        expected.validate()?;
+        let _guard = self.commit_lock.lock().await;
+        let key = expected.identity.key();
+        let Some(encoded) = self
+            .db
+            .get_cf(self.cf(CF_BLOB_REFERENCES)?, &key)
+            .map_err(storage_error)?
+        else {
+            return Ok(false);
+        };
+        let current = decode_blob_reference_state(&encoded)?;
+        if current != expected.lifecycle
+            || (current.ref_count == 0 && current.flags == 0)
+            || !placement_is_still_current()
+        {
+            return Ok(false);
+        }
+        let now_unix_millis = fixed_now_unix_millis.map_or_else(now_unix_millis, Ok)?;
+
+        let retired = BlobReferenceState {
+            ref_count: 0,
+            flags: 0,
+            created_at: current.created_at,
+            updated_at: current.updated_at.max(now_unix_millis),
+        };
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put_cf(
+            self.cf(CF_BLOB_REFERENCES)?,
+            &key,
+            encode_blob_reference_state(retired),
+        );
+        self.stage_local_changes(
+            &mut batch,
+            &[PendingLocalChange::ContentLifecycleChanged {
+                blob_identity: key,
+                revision: retired.updated_at,
+                reference_deltas: Vec::new(),
+            }],
+            LocalReferenceEffects::NoReferenceEffects,
+        )?;
+        let mut options = WriteOptions::default();
+        options.set_sync(self.sync_writes);
+        self.db.write_opt(batch, &options).map_err(storage_error)?;
+        self.notify_local_invalidations();
+        Ok(true)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -508,5 +602,67 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn former_artifact_retirement_is_fenced_exact_and_age_gated() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Store::open(StoreOptions::new(dir.path(), 1).with_awaiting_publish_ttl_seconds(1))
+                .await
+                .unwrap();
+        let bytes = vec![19_u8; SMALL_BLOB_MAX_BYTES + 1];
+        let reference = store.stage_blob(&bytes).await.unwrap();
+        let initial = store.blob_reference_state(&reference).unwrap().unwrap();
+        let observed = PayloadArtifactSnapshot {
+            identity: PayloadArtifactIdentity::Complete(reference.clone()),
+            lifecycle: initial,
+        };
+
+        assert!(
+            !store
+                .retire_payload_artifact_if_unchanged_at(&observed, initial.updated_at + 10, || {
+                    false
+                })
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store.blob_reference_state(&reference).unwrap(),
+            Some(initial)
+        );
+
+        assert!(
+            store
+                .retire_payload_artifact_if_unchanged_at(&observed, initial.updated_at + 20, || {
+                    true
+                })
+                .await
+                .unwrap()
+        );
+        let retired = store.blob_reference_state(&reference).unwrap().unwrap();
+        assert_eq!((retired.ref_count, retired.flags), (0, 0));
+        assert_eq!(retired.updated_at, initial.updated_at + 20);
+
+        assert!(
+            !store
+                .retire_payload_artifact_if_unchanged_at(&observed, initial.updated_at + 30, || {
+                    true
+                })
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store.collect_blob_garbage_at(retired.updated_at).unwrap(),
+            0
+        );
+        assert!(store.contains_blob(&reference).await.unwrap());
+        assert_eq!(
+            store
+                .collect_blob_garbage_at(retired.updated_at + 1_000)
+                .unwrap(),
+            1
+        );
+        assert!(!store.contains_blob(&reference).await.unwrap());
     }
 }
