@@ -1,4 +1,4 @@
-//! Exact complete-record quorum reads and read repair.
+//! Complete-record quorum reads and read repair.
 
 use anvil_consensus::NodeId;
 use anvil_store::{
@@ -55,9 +55,9 @@ impl ObjectDistribution {
         Ok(context)
     }
 
-    /// Reads the selected exact-path replica group, requires exact agreement
-    /// from its fixed 1/1, 2/2, or 2/3 quorum, and repairs every responding
-    /// minority before returning the complete selected snapshot.
+    /// Reads the selected exact-path replica group, requires quorum agreement
+    /// from its fixed 1/1, 2/2, or 2/3 replica set, and repairs every
+    /// responding minority before returning the complete selected snapshot.
     ///
     /// This is the cluster read hook for HeadObject, GetObject, BatchGet, and
     /// any internal consumer that needs authoritative current object state.
@@ -126,7 +126,7 @@ impl ObjectDistribution {
             }
         }
 
-        let selected = select_exact_quorum(
+        let selected = select_quorum_snapshot(
             &observations,
             group.required_acknowledgements(),
             group.replicas().len(),
@@ -199,7 +199,7 @@ impl ObjectDistribution {
     }
 }
 
-fn select_exact_quorum(
+fn select_quorum_snapshot(
     observations: &[ReplicaObservation],
     required: usize,
     replica_count: usize,
@@ -212,7 +212,13 @@ fn select_exact_quorum(
 }
 
 /// Pure complete-record selector shared by serving reads and typed ADD
-/// handoff. Missing replicas are explicit `None` observations.
+/// handoff. Missing objects are explicit `None` observations.
+///
+/// Exact quorum agreement always wins. A two-replica group is the one case
+/// where a write can durably reach one replica but return an unknown outcome:
+/// with both replicas readable, the stamped direct successor is then the only
+/// state that can complete that interrupted write. Gaps, siblings, and
+/// unrelated object identities remain unavailable rather than being guessed.
 pub(crate) fn select_object_snapshot_quorum(
     observations: &[Option<ObjectPathSnapshot>],
     required: usize,
@@ -226,6 +232,9 @@ pub(crate) fn select_object_snapshot_quorum(
         )));
     }
     for observation in observations {
+        if let Some(snapshot) = observation {
+            snapshot.validate().map_err(snapshot_status)?;
+        }
         let agreeing = observations
             .iter()
             .filter(|candidate| *candidate == observation)
@@ -234,9 +243,40 @@ pub(crate) fn select_object_snapshot_quorum(
             return Ok(observation.clone());
         }
     }
+
+    if required == 2 && replica_count == 2 && observations.len() == 2 {
+        if is_direct_successor(&observations[0], &observations[1]) {
+            return Ok(observations[1].clone());
+        }
+        if is_direct_successor(&observations[1], &observations[0]) {
+            return Ok(observations[0].clone());
+        }
+    }
+
     Err(Status::unavailable(
-        "object replicas have no exact complete-record quorum",
+        "object replicas have neither an exact quorum nor one direct predecessor-linked successor",
     ))
+}
+
+fn is_direct_successor(
+    predecessor: &Option<ObjectPathSnapshot>,
+    candidate: &Option<ObjectPathSnapshot>,
+) -> bool {
+    let Some(candidate) = candidate else {
+        return false;
+    };
+    let Some(stamp) = candidate.head.mutation_stamp else {
+        return false;
+    };
+    match predecessor {
+        None => stamp.predecessor_version.is_none(),
+        Some(predecessor) => {
+            predecessor.tenant_id == candidate.tenant_id
+                && predecessor.bucket_id == candidate.bucket_id
+                && predecessor.exact_path == candidate.exact_path
+                && stamp.predecessor_version == Some(predecessor.head.version)
+        }
+    }
 }
 
 fn changed_fence() -> Status {

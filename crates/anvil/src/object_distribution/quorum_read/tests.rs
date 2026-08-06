@@ -93,7 +93,7 @@ async fn reconcile_stores(
             snapshot: read(store),
         })
         .collect::<Vec<_>>();
-    let selected = select_exact_quorum(&observations, required, stores.len())?;
+    let selected = select_quorum_snapshot(&observations, required, stores.len())?;
     for (store, observation) in stores.iter().zip(&observations) {
         if observation.snapshot != selected {
             install(store, selected.as_ref()).await;
@@ -112,7 +112,7 @@ async fn one_of_one_selects_the_complete_local_state() {
 }
 
 #[tokio::test]
-async fn two_of_two_requires_exact_complete_state() {
+async fn two_of_two_repairs_one_direct_predecessor() {
     let (_root, stores) = stores(2).await;
     let expected = snapshot(2, Some(1), 2);
     for store in &stores {
@@ -121,9 +121,25 @@ async fn two_of_two_requires_exact_complete_state() {
     assert_eq!(reconcile_stores(&stores, 2).await.unwrap(), Some(expected));
 
     install(&stores[1], Some(&baseline())).await;
+    let selected = reconcile_stores(&stores, 2).await.unwrap();
+    assert_eq!(selected, read(&stores[0]));
+    assert_eq!(read(&stores[0]), read(&stores[1]));
+}
+
+#[tokio::test]
+async fn two_of_two_repairs_absence_to_the_first_stamped_version() {
+    let (_root, stores) = stores(2).await;
+    let first = snapshot(1, None, 1);
+    install(&stores[0], Some(&first)).await;
+
     assert_eq!(
-        reconcile_stores(&stores, 2).await.unwrap_err().code(),
-        Code::Unavailable
+        reconcile_stores(&stores, 2).await.unwrap(),
+        Some(first.clone())
+    );
+    assert!(
+        stores
+            .iter()
+            .all(|store| read(store) == Some(first.clone()))
     );
 }
 
@@ -218,6 +234,20 @@ async fn sibling_or_lineage_gap_without_exact_quorum_fails_unavailable() {
     install(&stores[1], Some(&gap)).await;
     assert_eq!(
         reconcile_stores(&stores, 2).await.unwrap_err().code(),
+        Code::Unavailable
+    );
+}
+
+#[test]
+fn direct_lineage_never_crosses_object_identity() {
+    let predecessor = baseline();
+    let mut unrelated = snapshot(2, Some(1), 2);
+    unrelated.exact_path = "another/object".into();
+
+    assert_eq!(
+        select_object_snapshot_quorum(&[Some(predecessor), Some(unrelated)], 2, 2)
+            .unwrap_err()
+            .code(),
         Code::Unavailable
     );
 }
