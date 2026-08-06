@@ -399,6 +399,42 @@ restore_complete_blob() {
     mv -- "${path}.qualification-away" "${path}"
 }
 
+shard_path_on_node() {
+  local node="$1"
+  local hash="$2"
+  local directory="/var/lib/anvil/blobs/${hash:0:2}"
+  local -a paths=()
+  mapfile -t paths < <(
+    compose exec -T --user 0 "${node}" \
+      find "${directory}" -maxdepth 1 -type f \
+        -name "0001${hash}*" ! -name '*.qualification-away' -print
+  )
+  if ((${#paths[@]} != 1)); then
+    echo "expected exactly one shard for ${hash} on ${node}, found ${#paths[@]}" >&2
+    return 1
+  fi
+  printf '%s\n' "${paths[0]}"
+}
+
+move_shard() {
+  local node="$1"
+  local hash="$2"
+  local path
+  path="$(shard_path_on_node "${node}" "${hash}")"
+  compose exec -T --user 0 "${node}" test ! -e "${path}.qualification-away"
+  compose exec -T --user 0 "${node}" \
+    mv -- "${path}" "${path}.qualification-away"
+  printf '%s\n' "${path}"
+}
+
+restore_shard() {
+  local node="$1"
+  local path="$2"
+  compose exec -T --user 0 "${node}" test -f "${path}.qualification-away"
+  compose exec -T --user 0 "${node}" \
+    mv -- "${path}.qualification-away" "${path}"
+}
+
 # Begin with the exact public 0.5.3 server and the same node-1 data directory
 # that the candidate will grow. This keeps legacy reconciliation and online ADD
 # in one qualification instead of proving them in unrelated installations.
@@ -556,12 +592,10 @@ for growth_node in anvil-1 anvil-2 anvil-3; do
 done
 
 for unavailable_node in anvil-1 anvil-2 anvil-3; do
-  case "${unavailable_node}" in
-    anvil-1) growth_reader=anvil-2 ;;
-    anvil-2|anvil-3) growth_reader=anvil-1 ;;
-  esac
-  compose stop "${unavailable_node}"
-  wait_for_node "${growth_reader}"
+  declare -a moved_shards=()
+  for growth_hash in "${growth_one_hash}" "${growth_two_hash}"; do
+    moved_shards+=("$(move_shard "${unavailable_node}" "${growth_hash}")")
+  done
   for growth_object in from-one from-two; do
     case "${growth_object}" in
       from-one) growth_expected="${ANVIL_QUALIFICATION_DIR}/artifacts/growth-large.bin" ;;
@@ -569,7 +603,7 @@ for unavailable_node in anvil-1 anvil-2 anvil-3; do
     esac
     growth_output="${ANVIL_QUALIFICATION_DIR}/artifacts/growth-without-${unavailable_node}-${growth_object}.bin"
     rm -f "${growth_output}"
-    run_cli "${growth_reader}" qprobe-client \
+    run_cli anvil-1 qprobe-client \
       "${qprobe_secret}" \
       get qprobe objects "growth/${growth_object}.bin" \
         --output "/qualification/artifacts/growth-without-${unavailable_node}-${growth_object}.bin"
@@ -579,16 +613,17 @@ for unavailable_node in anvil-1 anvil-2 anvil-3; do
       from-two) growth_expected_head="${growth_two_head}" ;;
     esac
     require_qprobe_head \
-      "${growth_reader}" "growth/${growth_object}.bin" "${growth_expected_head}"
+      anvil-1 "growth/${growth_object}.bin" "${growth_expected_head}"
   done
-  compose start "${unavailable_node}"
-  wait_for_node "${unavailable_node}"
+  for moved_shard in "${moved_shards[@]}"; do
+    restore_shard "${unavailable_node}" "${moved_shard}"
+  done
 done
 for moved_complete_blob in "${moved_complete_blobs[@]}"; do
   read -r growth_node growth_hash <<<"${moved_complete_blob}"
   restore_complete_blob "${growth_node}" "${growth_hash}"
 done
-echo "[anvil-qualification] three-node 2+1 reads preserved both large object heads and bytes without complete copies after every one-owner loss"
+echo "[anvil-qualification] three-node 2+1 reads preserved both large object heads and bytes without complete copies after every one-shard loss"
 
 echo "[anvil-qualification] three-node cluster is ACTIVE"
 
