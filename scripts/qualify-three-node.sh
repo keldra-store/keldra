@@ -4,7 +4,8 @@ set -Eeuo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 compose_file="${repo_root}/tests/cluster/docker-compose.yml"
 start_node="${repo_root}/tests/cluster/start-node.sh"
-requested_image="${ANVIL_IMAGE:-anvil:0.5.3}"
+requested_image="${ANVIL_IMAGE:-anvil:0.5.4}"
+legacy_image=ghcr.io/worka-ai/anvil:0.5.3
 
 case "${ANVIL_DOCKER_PLATFORM:-}" in
   "")
@@ -39,9 +40,15 @@ command -v git >/dev/null 2>&1 || {
 docker compose version >/dev/null
 
 image_id="$("${repo_root}/scripts/resolve-docker-image-id.sh" "${requested_image}")"
-export ANVIL_IMAGE="${image_id}"
-export ANVIL_QUALIFICATION_PROJECT="${ANVIL_QUALIFICATION_PROJECT:-anvil-v053-${$}}"
-export ANVIL_QUALIFICATION_DIR="$(mktemp -d /tmp/anvil-v053-qualification.XXXXXX)"
+docker pull --platform "${ANVIL_DOCKER_PLATFORM}" "${legacy_image}" >/dev/null
+legacy_image_id="$("${repo_root}/scripts/resolve-docker-image-id.sh" "${legacy_image}")"
+if [[ "${legacy_image_id}" == "${image_id}" ]]; then
+  echo "candidate image resolves to the released 0.5.3 image" >&2
+  exit 2
+fi
+export ANVIL_IMAGE="${legacy_image_id}"
+export ANVIL_QUALIFICATION_PROJECT="${ANVIL_QUALIFICATION_PROJECT:-anvil-v054-${$}}"
+export ANVIL_QUALIFICATION_DIR="$(mktemp -d /tmp/anvil-v054-qualification.XXXXXX)"
 export ANVIL_QUALIFICATION_START_NODE="${start_node}"
 keep="${ANVIL_QUALIFICATION_KEEP:-0}"
 
@@ -50,6 +57,22 @@ compose() {
     --project-name "${ANVIL_QUALIFICATION_PROJECT}" \
     --file "${compose_file}" \
     "$@"
+}
+
+require_service_image() {
+  local service="$1"
+  local expected_image="$2"
+  local label="$3"
+  local container
+  local actual_image
+  container="$(compose ps --quiet "${service}")"
+  actual_image="$(docker inspect --format '{{.Image}}' "${container}")"
+  if [[ "${actual_image}" != "${expected_image}" ]]; then
+    echo "${service} did not start from the exact ${label} image" >&2
+    echo "expected: ${expected_image}" >&2
+    echo "actual:   ${actual_image}" >&2
+    return 1
+  fi
 }
 
 cleanup() {
@@ -65,7 +88,7 @@ cleanup() {
     echo "[anvil-qualification] retained files ${ANVIL_QUALIFICATION_DIR}" >&2
   else
     compose down --volumes --remove-orphans >/dev/null 2>&1 || true
-    if [[ "${ANVIL_QUALIFICATION_DIR}" == /tmp/anvil-v053-qualification.* ]]; then
+    if [[ "${ANVIL_QUALIFICATION_DIR}" == /tmp/anvil-v054-qualification.* ]]; then
       docker run --rm --user 0 \
         --volume "${ANVIL_QUALIFICATION_DIR}:/qualification" \
         "${image_id}" rm -rf \
@@ -113,6 +136,7 @@ docker run --rm --user 0 \
 
 compose config --quiet
 compose up --detach anvil-1
+require_service_image anvil-1 "${legacy_image_id}" "public 0.5.3"
 
 network="${ANVIL_QUALIFICATION_PROJECT}_default"
 
@@ -316,12 +340,254 @@ run_git_qualification() {
 }
 
 wait_for_bootstrap
-provision_tenant qprobe qprobe-client \
-  qualification-probe-secret-000000000000000000000000
+qprobe_secret=qualification-probe-secret-000000000000000000000000
+provision_tenant qprobe qprobe-client "${qprobe_secret}"
 create_bucket anvil-1 qprobe-client \
-  qualification-probe-secret-000000000000000000000000 objects
+  "${qprobe_secret}" objects
+
+require_qprobe_head() {
+  local node="$1"
+  local path="$2"
+  local expected="$3"
+  local actual
+  actual="$(run_cli "${node}" qprobe-client "${qprobe_secret}" \
+    head qprobe objects "${path}")"
+  if [[ "${actual}" != "${expected}" ]]; then
+    echo "${node} changed the object head for ${path} during upgrade or cluster growth" >&2
+    echo "expected: ${expected}" >&2
+    echo "actual:   ${actual}" >&2
+    return 1
+  fi
+}
+
+head_blake3() {
+  local head="$1"
+  local hash
+  hash="$(sed -n \
+    's/^present version=[0-9][0-9]* bytes=[0-9][0-9]* blake3=\([0-9a-f]\{64\}\)$/\1/p' \
+    <<<"${head}")"
+  if [[ -z "${hash}" ]]; then
+    echo "Head returned an invalid present-object identity: ${head}" >&2
+    return 1
+  fi
+  printf '%s\n' "${hash}"
+}
+
+complete_blob_path() {
+  local hash="$1"
+  printf '/var/lib/anvil/blobs/%s/%s\n' "${hash:0:2}" "${hash}"
+}
+
+move_complete_blob() {
+  local node="$1"
+  local hash="$2"
+  local path
+  path="$(complete_blob_path "${hash}")"
+  compose exec -T --user 0 "${node}" test -f "${path}"
+  compose exec -T --user 0 "${node}" test ! -e "${path}.qualification-away"
+  compose exec -T --user 0 "${node}" \
+    mv -- "${path}" "${path}.qualification-away"
+}
+
+restore_complete_blob() {
+  local node="$1"
+  local hash="$2"
+  local path
+  path="$(complete_blob_path "${hash}")"
+  compose exec -T --user 0 "${node}" test -f "${path}.qualification-away"
+  compose exec -T --user 0 "${node}" \
+    mv -- "${path}.qualification-away" "${path}"
+}
+
+# Begin with the exact public 0.5.3 server and the same node-1 data directory
+# that the candidate will grow. This keeps legacy reconciliation and online ADD
+# in one qualification instead of proving them in unrelated installations.
+printf 'public-0.5.3-object\n' \
+  >"${ANVIL_QUALIFICATION_DIR}/artifacts/legacy-before-growth.txt"
+chmod 0444 "${ANVIL_QUALIFICATION_DIR}/artifacts/legacy-before-growth.txt"
+run_cli anvil-1 qprobe-client "${qprobe_secret}" \
+  put qprobe objects legacy/before-growth.txt \
+    /qualification/artifacts/legacy-before-growth.txt \
+    --command-id qprobe-legacy-before-growth --durability local \
+    --if-absent >/dev/null
+legacy_head="$(run_cli anvil-1 qprobe-client "${qprobe_secret}" \
+  head qprobe objects legacy/before-growth.txt)"
+run_cli anvil-1 qprobe-client "${qprobe_secret}" \
+  get qprobe objects legacy/before-growth.txt \
+    --output /qualification/artifacts/legacy-before-growth-read.txt
+cmp "${ANVIL_QUALIFICATION_DIR}/artifacts/legacy-before-growth.txt" \
+  "${ANVIL_QUALIFICATION_DIR}/artifacts/legacy-before-growth-read.txt"
+echo "[anvil-qualification] exact public 0.5.3 node created and read the legacy object"
+
+export ANVIL_IMAGE="${image_id}"
+compose up --detach --force-recreate anvil-1
+require_service_image anvil-1 "${image_id}" candidate
+wait_for_node anvil-1
+rm -f "${ANVIL_QUALIFICATION_DIR}/artifacts/legacy-before-growth-read.txt"
+run_cli anvil-1 qprobe-client "${qprobe_secret}" \
+  get qprobe objects legacy/before-growth.txt \
+    --output /qualification/artifacts/legacy-before-growth-read.txt
+cmp "${ANVIL_QUALIFICATION_DIR}/artifacts/legacy-before-growth.txt" \
+  "${ANVIL_QUALIFICATION_DIR}/artifacts/legacy-before-growth-read.txt"
+require_qprobe_head anvil-1 legacy/before-growth.txt "${legacy_head}"
+echo "[anvil-qualification] candidate recovered the same 0.5.3 node-1 data directory"
+
+# Exercise the exact online growth path with a payload that cannot use the
+# inline RocksDB representation. The object is created before either joining
+# node exists and must remain readable after both membership cutovers.
+dd if=/dev/zero \
+  of="${ANVIL_QUALIFICATION_DIR}/artifacts/growth-large.bin" \
+  bs=1M count=2 status=none
+cp "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-large.bin" \
+  "${ANVIL_QUALIFICATION_DIR}/artifacts/one-node-replicated-rejected.bin"
+printf '\177' | dd \
+  of="${ANVIL_QUALIFICATION_DIR}/artifacts/one-node-replicated-rejected.bin" \
+  bs=1 seek=0 count=1 conv=notrunc status=none
+chmod 0444 \
+  "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-large.bin" \
+  "${ANVIL_QUALIFICATION_DIR}/artifacts/one-node-replicated-rejected.bin"
+expect_failure "one-node REPLICATED large Put" \
+  run_cli anvil-1 qprobe-client "${qprobe_secret}" \
+    put qprobe objects growth/replicated-must-fail.bin \
+      /qualification/artifacts/one-node-replicated-rejected.bin \
+      --command-id qprobe-one-node-replicated-rejected \
+      --durability replicated --if-absent
+rejected_head="$(run_cli anvil-1 qprobe-client "${qprobe_secret}" \
+  head qprobe objects growth/replicated-must-fail.bin)"
+if [[ "${rejected_head}" != "never-existed" ]]; then
+  echo "failed one-node REPLICATED Put published an object head: ${rejected_head}" >&2
+  exit 1
+fi
+echo "[anvil-qualification] one-node REPLICATED large Put failed closed without a head"
+run_cli anvil-1 qprobe-client \
+  "${qprobe_secret}" \
+  put qprobe objects growth/from-one.bin \
+    /qualification/artifacts/growth-large.bin \
+    --command-id qprobe-growth-one --durability local >/dev/null
+growth_one_head="$(run_cli anvil-1 qprobe-client "${qprobe_secret}" \
+  head qprobe objects growth/from-one.bin)"
+run_cli anvil-1 qprobe-client \
+  "${qprobe_secret}" \
+  get qprobe objects growth/from-one.bin \
+    --output /qualification/artifacts/growth-one-read.bin
+cmp "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-large.bin" \
+  "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-one-read.bin"
+echo "[anvil-qualification] one-node large-object read passed"
+
+# Restart the exact installation that will grow. This proves the durable
+# one-node representation and reference-journal recovery before ADD begins.
+compose restart anvil-1
+wait_for_node anvil-1
+rm -f "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-one-read.bin"
+run_cli anvil-1 qprobe-client \
+  "${qprobe_secret}" \
+  get qprobe objects growth/from-one.bin \
+    --output /qualification/artifacts/growth-one-read.bin
+cmp "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-large.bin" \
+  "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-one-read.bin"
+require_qprobe_head anvil-1 growth/from-one.bin "${growth_one_head}"
+echo "[anvil-qualification] one-node large object survived restart before growth"
+
 prepare_and_start_node 2
+
+growth_one_two_node_head="$(run_cli anvil-2 qprobe-client "${qprobe_secret}" \
+  head qprobe objects growth/from-one.bin)"
+if [[ "${growth_one_two_node_head}" != "${growth_one_head}" ]]; then
+  echo "node 2 observed another head for the one-node object after ADD" >&2
+  echo "expected: ${growth_one_head}" >&2
+  echo "actual:   ${growth_one_two_node_head}" >&2
+  exit 1
+fi
+growth_one_hash="$(head_blake3 "${growth_one_two_node_head}")"
+move_complete_blob anvil-1 "${growth_one_hash}"
+rm -f "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-one-read.bin"
+run_cli anvil-2 qprobe-client \
+  "${qprobe_secret}" \
+  get qprobe objects growth/from-one.bin \
+    --output /qualification/artifacts/growth-one-read.bin
+restore_complete_blob anvil-1 "${growth_one_hash}"
+cmp "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-large.bin" \
+  "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-one-read.bin"
+require_qprobe_head anvil-2 growth/from-one.bin "${growth_one_head}"
+echo "[anvil-qualification] two-node read succeeded without node 1's complete blob"
+
+# Use a different content identity so this is a real two-node payload write,
+# not a second logical reference to the preexisting deduplicated blob.
+cp "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-large.bin" \
+  "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-two-large.bin"
+printf '\001' | dd \
+  of="${ANVIL_QUALIFICATION_DIR}/artifacts/growth-two-large.bin" \
+  bs=1 seek=0 count=1 conv=notrunc status=none
+chmod 0444 "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-two-large.bin"
+run_cli anvil-2 qprobe-client \
+  "${qprobe_secret}" \
+  put qprobe objects growth/from-two.bin \
+    /qualification/artifacts/growth-two-large.bin \
+    --command-id qprobe-growth-two --durability replicated >/dev/null
+growth_two_head="$(run_cli anvil-2 qprobe-client "${qprobe_secret}" \
+  head qprobe objects growth/from-two.bin)"
+growth_two_hash="$(head_blake3 "${growth_two_head}")"
+move_complete_blob anvil-2 "${growth_two_hash}"
+run_cli anvil-1 qprobe-client \
+  "${qprobe_secret}" \
+  get qprobe objects growth/from-two.bin \
+    --output /qualification/artifacts/growth-two-read.bin
+restore_complete_blob anvil-2 "${growth_two_hash}"
+cmp "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-two-large.bin" \
+  "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-two-read.bin"
+require_qprobe_head anvil-1 growth/from-two.bin "${growth_two_head}"
+echo "[anvil-qualification] two-node REPLICATED read succeeded without its ingress copy"
+
 prepare_and_start_node 3
+
+declare -a moved_complete_blobs=()
+for growth_node in anvil-1 anvil-2 anvil-3; do
+  for growth_hash in "${growth_one_hash}" "${growth_two_hash}"; do
+    growth_complete_path="$(complete_blob_path "${growth_hash}")"
+    if compose exec -T --user 0 "${growth_node}" test -f "${growth_complete_path}"; then
+      move_complete_blob "${growth_node}" "${growth_hash}"
+      moved_complete_blobs+=("${growth_node} ${growth_hash}")
+    else
+      compose exec -T --user 0 "${growth_node}" \
+        test ! -e "${growth_complete_path}.qualification-away"
+    fi
+  done
+done
+
+for unavailable_node in anvil-1 anvil-2 anvil-3; do
+  case "${unavailable_node}" in
+    anvil-1) growth_reader=anvil-2 ;;
+    anvil-2|anvil-3) growth_reader=anvil-1 ;;
+  esac
+  compose stop "${unavailable_node}"
+  wait_for_node "${growth_reader}"
+  for growth_object in from-one from-two; do
+    case "${growth_object}" in
+      from-one) growth_expected="${ANVIL_QUALIFICATION_DIR}/artifacts/growth-large.bin" ;;
+      from-two) growth_expected="${ANVIL_QUALIFICATION_DIR}/artifacts/growth-two-large.bin" ;;
+    esac
+    growth_output="${ANVIL_QUALIFICATION_DIR}/artifacts/growth-without-${unavailable_node}-${growth_object}.bin"
+    rm -f "${growth_output}"
+    run_cli "${growth_reader}" qprobe-client \
+      "${qprobe_secret}" \
+      get qprobe objects "growth/${growth_object}.bin" \
+        --output "/qualification/artifacts/growth-without-${unavailable_node}-${growth_object}.bin"
+    cmp "${growth_expected}" "${growth_output}"
+    case "${growth_object}" in
+      from-one) growth_expected_head="${growth_one_head}" ;;
+      from-two) growth_expected_head="${growth_two_head}" ;;
+    esac
+    require_qprobe_head \
+      "${growth_reader}" "growth/${growth_object}.bin" "${growth_expected_head}"
+  done
+  compose start "${unavailable_node}"
+  wait_for_node "${unavailable_node}"
+done
+for moved_complete_blob in "${moved_complete_blobs[@]}"; do
+  read -r growth_node growth_hash <<<"${moved_complete_blob}"
+  restore_complete_blob "${growth_node}" "${growth_hash}"
+done
+echo "[anvil-qualification] three-node 2+1 reads preserved both large object heads and bytes without complete copies after every one-owner loss"
 
 echo "[anvil-qualification] three-node cluster is ACTIVE"
 
@@ -588,7 +854,27 @@ for node in anvil-1 anvil-2 anvil-3; do
     --output /qualification/artifacts/restart-read.txt
   cmp "${ANVIL_QUALIFICATION_DIR}/artifacts/restart.txt" \
     "${ANVIL_QUALIFICATION_DIR}/artifacts/restart-read.txt"
+  for growth_object in from-one from-two; do
+    case "${growth_object}" in
+      from-one)
+        growth_expected="${ANVIL_QUALIFICATION_DIR}/artifacts/growth-large.bin"
+        growth_expected_head="${growth_one_head}"
+        ;;
+      from-two)
+        growth_expected="${ANVIL_QUALIFICATION_DIR}/artifacts/growth-two-large.bin"
+        growth_expected_head="${growth_two_head}"
+        ;;
+    esac
+    growth_output="${ANVIL_QUALIFICATION_DIR}/artifacts/restart-${node}-${growth_object}.bin"
+    rm -f "${growth_output}"
+    run_cli "${node}" qprobe-client "${qprobe_secret}" \
+      get qprobe objects "growth/${growth_object}.bin" \
+        --output "/qualification/artifacts/restart-${node}-${growth_object}.bin"
+    cmp "${growth_expected}" "${growth_output}"
+    require_qprobe_head \
+      "${node}" "growth/${growth_object}.bin" "${growth_expected_head}"
+  done
 done
-echo "[anvil-qualification] rolling restart test passed"
+echo "[anvil-qualification] rolling restart preserved ordinary and grown large objects"
 
 echo "[anvil-qualification] PASS image=${image_id} platform=${ANVIL_DOCKER_PLATFORM}"

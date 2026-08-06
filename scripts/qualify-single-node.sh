@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-requested_image="${ANVIL_IMAGE:-anvil:0.5.3}"
+requested_image="${ANVIL_IMAGE:-anvil:0.5.4}"
 keep="${ANVIL_QUALIFICATION_KEEP:-0}"
 
 case "${ANVIL_DOCKER_PLATFORM:-}" in
@@ -37,9 +37,9 @@ command -v git >/dev/null 2>&1 || {
 }
 
 image_id="$("${repo_root}/scripts/resolve-docker-image-id.sh" "${requested_image}")"
-qualification_dir="$(mktemp -d /tmp/anvil-v053-single-qualification.XXXXXX)"
+qualification_dir="$(mktemp -d /tmp/anvil-v054-single-qualification.XXXXXX)"
 qualification_suffix="${qualification_dir##*.}"
-container_name="anvil-v053-single-${qualification_suffix}"
+container_name="anvil-v054-single-${qualification_suffix}"
 data_dir="${qualification_dir}/data"
 signing_key="${qualification_dir}/token-signing-key"
 container_started=0
@@ -62,7 +62,7 @@ cleanup() {
   if ((container_started == 1)); then
     docker rm --force "${container_name}" >/dev/null 2>&1 || true
   fi
-  if [[ "${qualification_dir}" == /tmp/anvil-v053-single-qualification.* ]]; then
+  if [[ "${qualification_dir}" == /tmp/anvil-v054-single-qualification.* ]]; then
     docker run --rm --user 0 \
       --volume "${qualification_dir}:/qualification" \
       "${image_id}" rm -rf \
@@ -214,6 +214,74 @@ run_personaldb_qualification() {
   echo "[anvil-single-qualification] PersonalDB qualification passed"
 }
 
+run_large_object_qualification() {
+  local bucket="large-single-${$}"
+  local input="${qualification_dir}/large-input.bin"
+  local before_restart="${qualification_dir}/large-before-restart.bin"
+  local after_restart="${qualification_dir}/large-after-restart.bin"
+  local command=(
+    docker exec
+    --env "ANVIL_CLIENT_ID=${owner_client}"
+    --env "ANVIL_CLIENT_SECRET=${owner_secret}"
+    "${container_name}"
+    anvil --endpoint http://127.0.0.1:50051
+  )
+
+  dd if=/dev/zero of="${input}" bs=1M count=2 status=none
+  chmod 0444 "${input}"
+  docker cp "${input}" "${container_name}:/tmp/anvil-large-input.bin"
+  "${command[@]}" create-bucket "${bucket}" | grep -Fq "bucket=${bucket}"
+
+  # One node cannot prove survival of one owner loss. REPLICATED must fail
+  # closed without publishing a head; callers can explicitly choose LOCAL.
+  if "${command[@]}" put "${tenant}" "${bucket}" fixtures/replicated.bin \
+    /tmp/anvil-large-input.bin --command-id single-large-replicated \
+    --durability replicated --if-absent >/dev/null 2>&1
+  then
+    echo "single-node large REPLICATED put unexpectedly succeeded" >&2
+    return 1
+  fi
+  local failed_head
+  failed_head="$("${command[@]}" head \
+    "${tenant}" "${bucket}" fixtures/replicated.bin)"
+  if [[ "${failed_head}" != "never-existed" ]]; then
+    echo "failed REPLICATED put published an object head: ${failed_head}" >&2
+    return 1
+  fi
+
+  "${command[@]}" put "${tenant}" "${bucket}" fixtures/large.bin \
+    /tmp/anvil-large-input.bin --command-id single-large --durability local \
+    --if-absent >/dev/null
+  "${command[@]}" get "${tenant}" "${bucket}" fixtures/large.bin \
+    --output /tmp/anvil-large-before-restart.bin
+  docker cp "${container_name}:/tmp/anvil-large-before-restart.bin" "${before_restart}"
+  cmp "${input}" "${before_restart}"
+
+  docker restart "${container_name}" >/dev/null
+  local attempt
+  for attempt in $(seq 1 90); do
+    if "${command[@]}" head "${tenant}" "${bucket}" fixtures/large.bin \
+      >/dev/null 2>&1
+    then
+      break
+    fi
+    if ((attempt == 90)); then
+      echo "single-node server did not recover the large object after restart" >&2
+      return 1
+    fi
+    sleep 1
+  done
+  "${command[@]}" get "${tenant}" "${bucket}" fixtures/large.bin \
+    --output /tmp/anvil-large-after-restart.bin
+  docker cp "${container_name}:/tmp/anvil-large-after-restart.bin" "${after_restart}"
+  cmp "${input}" "${after_restart}"
+  docker exec --user 0 "${container_name}" rm -f \
+    /tmp/anvil-large-input.bin \
+    /tmp/anvil-large-before-restart.bin \
+    /tmp/anvil-large-after-restart.bin
+  echo "[anvil-single-qualification] large LOCAL object survived restart; REPLICATED failed closed"
+}
+
 run_s3_qualification() {
   ANVIL_S3_QUALIFICATION_ENDPOINTS="${gateway_endpoint}" \
   ANVIL_S3_QUALIFICATION_CLIENT_ID="${s3_client}" \
@@ -298,6 +366,7 @@ export ANVIL_SINGLE_QUALIFICATION_GRPC_ENDPOINT="${grpc_endpoint}"
 export ANVIL_SINGLE_QUALIFICATION_GATEWAY_ENDPOINT="${gateway_endpoint}"
 
 echo "[anvil-single-qualification] node ready gRPC=${grpc_endpoint} gateway=${gateway_endpoint}"
+run_large_object_qualification
 run_public_read_qualification
 run_index_qualification
 run_accounting_qualification
