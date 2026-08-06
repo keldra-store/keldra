@@ -25,6 +25,7 @@ pub(crate) struct GitGatewayState {
     pub(crate) tokens: JwtManager,
     pub(crate) rate_limits: RequestRateLimits,
     pub(crate) serving: ServingAuthority,
+    pub(crate) mutation_admission: crate::mutation_admission::MutationAdmission,
     pub(crate) cache_root: PathBuf,
     pub(crate) max_request_bytes: u64,
     pub(crate) lock: Arc<tokio::sync::Mutex<()>>,
@@ -67,6 +68,14 @@ async fn handle(
     {
         return GitError::from_status(error).into_response();
     }
+    let _mutation_permit = if target.operation.is_push() {
+        match state.mutation_admission.enter() {
+            Ok(permit) => Some(permit),
+            Err(error) => return GitError::from_status(error).into_response(),
+        }
+    } else {
+        None
+    };
 
     // The 0.5.3 cache is disposable and one process-wide lock keeps a CGI
     // request plus its bundle CAS coherent without inventing a lock service.

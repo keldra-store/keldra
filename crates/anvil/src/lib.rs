@@ -29,11 +29,13 @@ mod logical_name_resolution;
 mod logical_record_distribution;
 mod mutable_record_quorum;
 mod mutable_record_replica_group;
+mod mutation_admission;
 mod node_identity;
 mod object_distribution;
 mod object_path_access;
 pub mod observability;
 mod payload_distribution;
+mod payload_gc;
 mod payload_placement;
 mod payload_read;
 mod payload_read_transport;
@@ -68,6 +70,7 @@ use anyhow::{Context, Result};
 use tonic::transport::Server;
 
 use authentication::{JwtManager, RateLimitConfig, RequestRateLimits};
+use mutation_admission::{AdmissionSurface, MutationAdmissionService};
 
 pub use index_config::{IndexRuntimeConfig, IndexRuntimeConfigError};
 pub use v05::ObjectServiceImpl;
@@ -162,6 +165,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     let program_quiescence_binding = peer_runtime.program_quiescence();
     let index_artifacts_binding = peer_runtime.index_artifacts();
     let pending_join = peer_runtime.join_transport();
+    let mutation_admission = peer_runtime.mutation_admission();
     // The private listener must be accepting before an existing multi-node
     // group can elect a leader after a coordinated restart.
     let mut peer_server = peer_runtime
@@ -179,6 +183,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
             pending_join,
             &decisions,
             &config.data_dir,
+            config.erasure_profile,
             DECISION_LEADER_TIMEOUT,
         )
         .await
@@ -217,7 +222,50 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         data_transport.clone(),
         cluster_transport.clone(),
         config.erasure_profile,
+        mutation_admission.clone(),
     );
+    // Ordered reference effects and their cursor must be recovered before any
+    // startup component can create another journal entry. In particular,
+    // program recovery must not race a cursor left behind by a 0.5.3 node.
+    enum ReferenceStartup {
+        Ready,
+        Signal(std::io::Result<()>),
+        Peer(Result<Result<()>, tokio::task::JoinError>),
+    }
+    let reference_startup = tokio::select! {
+        _ = reference_runtime_handle.wait_until_startup_ready() => ReferenceStartup::Ready,
+        signal = tokio::signal::ctrl_c() => ReferenceStartup::Signal(signal),
+        peer = peer_server.task_mut() => ReferenceStartup::Peer(peer),
+    };
+    match reference_startup {
+        ReferenceStartup::Ready => {}
+        ReferenceStartup::Signal(signal) => {
+            reference_runtime.shutdown().await;
+            let peer = peer_server.shutdown().await;
+            serving_fence.shutdown().await;
+            let raft = decisions
+                .shutdown()
+                .await
+                .context("shut down decision Raft during startup");
+            signal.context("wait for shutdown signal during startup")?;
+            peer?;
+            raft?;
+            return Ok(());
+        }
+        ReferenceStartup::Peer(peer) => {
+            peer_server.record_completed();
+            reference_runtime.shutdown().await;
+            serving_fence.shutdown().await;
+            let raft = decisions
+                .shutdown()
+                .await
+                .context("shut down decision Raft after startup peer failure");
+            peer.context("join private peer server task during startup")?
+                .context("serve private peer listener during startup")?;
+            raft?;
+            return Ok(());
+        }
+    }
     let payload_read_transport = payload_read_transport::StorePayloadReadTransport::new(
         local_node,
         store.clone(),
@@ -232,6 +280,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         serving_fence.authority(),
         data_transport.clone(),
         config.erasure_profile,
+        mutation_admission.clone(),
     );
     let object_reader = cluster_object_read::ClusterObjectReader::new(
         object_distribution.clone(),
@@ -258,6 +307,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         decisions.clone(),
         serving_fence.authority(),
         Arc::new(cluster_transport.clone()),
+        mutation_admission.clone(),
     );
     let name_resolver = logical_name_resolution::LogicalNameResolver::new(
         logical_records.clone(),
@@ -284,6 +334,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         decisions.clone(),
         serving_fence.authority(),
         Arc::new(cluster_transport.clone()),
+        mutation_admission.clone(),
     ));
     fresh_authorization_binding
         .install(zanzibar.clone())
@@ -349,52 +400,6 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         watch_sources,
         Arc::new(config.token_manager.clone()),
     ));
-    enum ReferenceStartup {
-        Ready,
-        Signal(std::io::Result<()>),
-        Peer(Result<Result<()>, tokio::task::JoinError>),
-    }
-    let reference_startup = tokio::select! {
-        reference_safe = reference_runtime_handle.wait_until_startup_ready() => {
-            if !reference_safe {
-                tracing::warn!(
-                    "cluster is smaller than its erasure profile; LOCAL service is available but reference reconstruction and blob GC remain paused"
-                );
-            }
-            ReferenceStartup::Ready
-        },
-        signal = tokio::signal::ctrl_c() => ReferenceStartup::Signal(signal),
-        peer = peer_server.task_mut() => ReferenceStartup::Peer(peer),
-    };
-    match reference_startup {
-        ReferenceStartup::Ready => {}
-        ReferenceStartup::Signal(signal) => {
-            reference_runtime.shutdown().await;
-            let peer = peer_server.shutdown().await;
-            serving_fence.shutdown().await;
-            let raft = decisions
-                .shutdown()
-                .await
-                .context("shut down decision Raft during startup");
-            signal.context("wait for shutdown signal during startup")?;
-            peer?;
-            raft?;
-            return Ok(());
-        }
-        ReferenceStartup::Peer(peer) => {
-            peer_server.record_completed();
-            reference_runtime.shutdown().await;
-            serving_fence.shutdown().await;
-            let raft = decisions
-                .shutdown()
-                .await
-                .context("shut down decision Raft after startup peer failure");
-            peer.context("join private peer server task during startup")?
-                .context("serve private peer listener during startup")?;
-            raft?;
-            return Ok(());
-        }
-    }
     // No public request is accepted until ordered reference delivery proves
     // every current source tail locally applied. Recheck immediately before
     // the destructive scan in case placement changed after readiness.
@@ -403,7 +408,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         local_node,
         decisions.clone(),
         store.clone(),
-        data_transport,
+        data_transport.clone(),
         cluster_transport.clone(),
         object_distribution.clone(),
         bucket_governance.clone(),
@@ -512,6 +517,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
                 tokens: config.token_manager.clone(),
                 rate_limits: request_rate_limits.clone(),
                 serving: serving_fence.authority(),
+                mutation_admission: mutation_admission.clone(),
             },
             git_gateway::GitGatewayState {
                 objects,
@@ -519,6 +525,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
                 tokens: config.token_manager.clone(),
                 rate_limits: request_rate_limits.clone(),
                 serving: serving_fence.authority(),
+                mutation_admission: mutation_admission.clone(),
                 cache_root: config.data_dir.join("gateway-cache/git"),
                 max_request_bytes: config.max_blob_bytes,
                 lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -610,6 +617,42 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         move |request| credential_authority.require(request),
     );
 
+    let object_service = MutationAdmissionService::new(
+        object_service,
+        mutation_admission.clone(),
+        AdmissionSurface::Public,
+    );
+    let index_service = MutationAdmissionService::new(
+        index_service,
+        mutation_admission.clone(),
+        AdmissionSurface::Public,
+    );
+    let personaldb_service = MutationAdmissionService::new(
+        personaldb_service,
+        mutation_admission.clone(),
+        AdmissionSurface::Public,
+    );
+    let accounting_service = MutationAdmissionService::new(
+        accounting_service,
+        mutation_admission.clone(),
+        AdmissionSurface::Public,
+    );
+    let authz_service = MutationAdmissionService::new(
+        authz_service,
+        mutation_admission.clone(),
+        AdmissionSurface::Public,
+    );
+    let administration_service = MutationAdmissionService::new(
+        administration_service,
+        mutation_admission.clone(),
+        AdmissionSurface::Public,
+    );
+    let credential_service = MutationAdmissionService::new(
+        credential_service,
+        mutation_admission,
+        AdmissionSurface::Public,
+    );
+
     let mut gateway_server = match (config.gateway_listen, gateway_state) {
         (Some(address), Some((s3_state, git_state))) => Some(
             http_gateway::HttpGatewayServer::start(
@@ -622,7 +665,15 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         (None, None) => None,
         _ => unreachable!("gateway configuration and state are built together"),
     };
-    let blob_gc_task = spawn_blob_gc(store, reference_runtime_handle);
+    let payload_gc = payload_gc::PayloadGarbageCollector::new(
+        local_node,
+        store.clone(),
+        decisions.clone(),
+        data_transport,
+        reference_runtime_handle.clone(),
+        config.erasure_profile,
+    );
+    let blob_gc_task = spawn_blob_gc(store, reference_runtime_handle, payload_gc);
     tracing::info!(address = %config.listen, "Anvil 0.5 server listening");
     let (stop_public, public_stopped) = tokio::sync::oneshot::channel();
     let mut public_server = Box::pin(
@@ -743,6 +794,7 @@ fn validate_atomic_replay_gc(awaiting_publish_ttl_seconds: u64) -> Result<()> {
 fn spawn_blob_gc(
     store: Store,
     references: reference_delivery::ReferenceRuntimeHandle,
+    payloads: payload_gc::PayloadGarbageCollector,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let first_run = tokio::time::Instant::now() + BLOB_GC_INTERVAL;
@@ -750,6 +802,18 @@ fn spawn_blob_gc(
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
+            match payloads.run_once().await {
+                Ok(retired) if retired > 0 => {
+                    tracing::info!(
+                        retired,
+                        "former payload artifacts entered the ordinary GC grace window"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "former payload-artifact retirement paused");
+                }
+            }
             collect_blob_garbage_if_safe(&store, &references, "scheduled").await;
         }
     })

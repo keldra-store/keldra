@@ -31,6 +31,7 @@ pub(crate) struct S3State {
     pub(crate) tokens: JwtManager,
     pub(crate) rate_limits: RequestRateLimits,
     pub(crate) serving: ServingAuthority,
+    pub(crate) mutation_admission: crate::mutation_admission::MutationAdmission,
 }
 
 pub(crate) fn router(state: S3State) -> Router {
@@ -145,6 +146,10 @@ fn object_address(
 }
 
 async fn create_bucket(state: &S3State, identity: &GatewayIdentity, bucket: String) -> Response {
+    let _permit = match state.mutation_admission.enter() {
+        Ok(permit) => permit,
+        Err(error) => return status_error(error, "ServiceUnavailable").into_response(),
+    };
     let Some(caller) = identity.caller().cloned() else {
         return S3Error::access_denied("Bucket creation requires credentials").into_response();
     };
@@ -342,6 +347,10 @@ async fn put_object(
     if identity.caller().is_none() {
         return S3Error::access_denied("Object writes require credentials").into_response();
     }
+    let _permit = match state.mutation_admission.enter() {
+        Ok(permit) => permit,
+        Err(error) => return status_error(error, "ServiceUnavailable").into_response(),
+    };
     let mode = match put_mode(state, identity, &key, request.headers()).await {
         Ok(mode) => mode,
         Err(error) => return error.into_response(),
@@ -432,6 +441,10 @@ async fn delete_object(state: &S3State, identity: &GatewayIdentity, key: ObjectK
     if identity.caller().is_none() {
         return S3Error::access_denied("Object deletion requires credentials").into_response();
     }
+    let _permit = match state.mutation_admission.enter() {
+        Ok(permit) => permit,
+        Err(error) => return status_error(error, "ServiceUnavailable").into_response(),
+    };
     match state
         .objects
         .delete(

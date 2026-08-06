@@ -131,36 +131,70 @@ pub(crate) trait JoinActivationGate: Send + Sync + 'static {
 
 /// Keeps old-placement lease grants paused across the Raft activation append.
 pub(crate) struct JoinActivationPermit {
+    _handoff_single_flight: Option<tokio::sync::OwnedMutexGuard<()>>,
     _lease_pause: Option<anvil_consensus::ServingLeaseGrantPause>,
     _program_quiescence: Option<crate::programs::ProgramQuiescenceGuard>,
+    _local_mutation_drain: Option<crate::mutation_admission::MutationDrain>,
+    _remote_mutation_drains: Vec<crate::data_peer::RemoteMutationDrain>,
 }
 
 impl std::fmt::Debug for JoinActivationPermit {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("JoinActivationPermit")
+            .field(
+                "handoff_single_flight",
+                &self._handoff_single_flight.is_some(),
+            )
             .field("lease_pause", &self._lease_pause.is_some())
             .field("program_quiescence", &self._program_quiescence.is_some())
+            .field(
+                "local_mutation_drain",
+                &self._local_mutation_drain.is_some(),
+            )
+            .field(
+                "remote_mutation_drains",
+                &self._remote_mutation_drains.len(),
+            )
             .finish()
     }
 }
 
 impl JoinActivationPermit {
     pub(crate) fn after_handoff(
+        handoff_single_flight: tokio::sync::OwnedMutexGuard<()>,
         pause: anvil_consensus::ServingLeaseGrantPause,
         program_quiescence: crate::programs::ProgramQuiescenceGuard,
+        local_mutation_drain: crate::mutation_admission::MutationDrain,
+        remote_mutation_drains: Vec<crate::data_peer::RemoteMutationDrain>,
     ) -> Self {
         Self {
+            _handoff_single_flight: Some(handoff_single_flight),
             _lease_pause: Some(pause),
             _program_quiescence: Some(program_quiescence),
+            _local_mutation_drain: Some(local_mutation_drain),
+            _remote_mutation_drains: remote_mutation_drains,
         }
+    }
+
+    async fn release(&mut self) -> Result<(), Status> {
+        for remote in &mut self._remote_mutation_drains {
+            remote.release().await?;
+        }
+        if let Some(local) = self._local_mutation_drain.take() {
+            local.release();
+        }
+        Ok(())
     }
 
     #[cfg(test)]
     pub(crate) fn test_only() -> Self {
         Self {
+            _handoff_single_flight: None,
             _lease_pause: None,
             _program_quiescence: None,
+            _local_mutation_drain: None,
+            _remote_mutation_drains: Vec::new(),
         }
     }
 }
@@ -336,6 +370,16 @@ impl wire::join_peer_server::JoinPeer for JoinPeerService {
         let (peer, capability) = self.authorize(&mut request)?;
         let (descriptor, transition) = self.validate_admission(peer, capability)?;
         if descriptor.state == NodeState::Active {
+            if let Some(transition) = transition.as_ref()
+                && transition.kind == MembershipTransitionKind::Add
+                && transition.node_id == descriptor.node_id
+            {
+                return Ok(Response::new(response(
+                    wire::JoinState::HandoffRequired,
+                    transition.started_log_index,
+                    None,
+                )));
+            }
             return Ok(Response::new(response(wire::JoinState::Active, 0, None)));
         }
         if let Some(redirect) = self.redirect()? {
@@ -386,7 +430,7 @@ impl wire::join_peer_server::JoinPeer for JoinPeerService {
             ));
         }
         if descriptor.state == NodeState::Joining {
-            let activation_permit = self
+            let mut activation_permit = self
                 .activation_gate
                 .ensure_handoff_complete(&descriptor, &transition)
                 .await?;
@@ -409,7 +453,7 @@ impl wire::join_peer_server::JoinPeer for JoinPeerService {
             // The applied placement has changed, so an old request can no
             // longer match a grant. Release the pause only after that durable
             // boundary; normal issuer cutover handles the new placement.
-            drop(activation_permit);
+            activation_permit.release().await?;
         }
         self.decisions
             .apply_fixed_voters_for_transition(transition.started_log_index)
@@ -472,9 +516,11 @@ impl JoinPeerTransport {
         maximum_time: Duration,
     ) -> Result<MembershipTransition, Status> {
         let response = self
-            .discover(maximum_time, |mut client, request| async move {
-                client.catch_up(request).await
-            })
+            .discover(
+                maximum_time,
+                JoinRequestLifetime::Bounded,
+                |mut client, request| async move { client.catch_up(request).await },
+            )
             .await?;
         if response.state() == wire::JoinState::Active {
             return Err(Status::already_exists("node is already ACTIVE"));
@@ -494,9 +540,11 @@ impl JoinPeerTransport {
 
     pub(crate) async fn activate(&self, maximum_time: Duration) -> Result<(), Status> {
         let response = self
-            .discover(maximum_time, |mut client, request| async move {
-                client.activate(request).await
-            })
+            .discover(
+                maximum_time,
+                JoinRequestLifetime::Progressing,
+                |mut client, request| async move { client.activate(request).await },
+            )
             .await?;
         if response.state() != wire::JoinState::Active {
             return Err(Status::failed_precondition(
@@ -513,6 +561,7 @@ impl JoinPeerTransport {
     async fn discover<F, Fut>(
         &self,
         maximum_time: Duration,
+        request_lifetime: JoinRequestLifetime,
         operation: F,
     ) -> Result<wire::JoinResponse, Status>
     where
@@ -544,7 +593,12 @@ impl JoinPeerTransport {
                 }
             };
             let mut request = Request::new(self.request());
-            request.set_timeout(remaining);
+            // Catch-up is bounded control work. Activation owns a progressing
+            // typed handoff whose individual peer transfers enforce their own
+            // progress/idle limits; a total gRPC deadline here would make any
+            // installation taking longer than this discovery budget unable to
+            // grow.
+            apply_request_lifetime(&mut request, request_lifetime, remaining);
             match operation(client, request).await {
                 Ok(response) => {
                     let response = response.into_inner();
@@ -602,6 +656,22 @@ impl JoinPeerTransport {
             .connect_with_connector_lazy(connector);
         channels.insert(target, (address.to_owned(), channel.clone()));
         Ok(channel)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JoinRequestLifetime {
+    Bounded,
+    Progressing,
+}
+
+fn apply_request_lifetime(
+    request: &mut Request<wire::JoinRequest>,
+    lifetime: JoinRequestLifetime,
+    remaining: Duration,
+) {
+    if lifetime == JoinRequestLifetime::Bounded {
+        request.set_timeout(remaining);
     }
 }
 
@@ -866,6 +936,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn progressing_activation_has_no_total_grpc_deadline() {
+        let mut bounded = Request::new(wire::JoinRequest::default());
+        apply_request_lifetime(
+            &mut bounded,
+            JoinRequestLifetime::Bounded,
+            Duration::from_secs(10),
+        );
+        assert!(bounded.metadata().contains_key("grpc-timeout"));
+
+        let mut progressing = Request::new(wire::JoinRequest::default());
+        apply_request_lifetime(
+            &mut progressing,
+            JoinRequestLifetime::Progressing,
+            Duration::from_secs(10),
+        );
+        assert!(!progressing.metadata().contains_key("grpc-timeout"));
+    }
+
     #[tokio::test]
     async fn activation_gate_fails_closed_until_typed_handoff_exists() {
         let descriptor = joining_descriptor([9; 32]);
@@ -880,5 +969,22 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn activation_permit_holds_the_handoff_single_flight() {
+        let single_flight = Arc::new(tokio::sync::Mutex::new(()));
+        let guard = single_flight.clone().lock_owned().await;
+        let permit = JoinActivationPermit {
+            _handoff_single_flight: Some(guard),
+            _lease_pause: None,
+            _program_quiescence: None,
+            _local_mutation_drain: None,
+            _remote_mutation_drains: Vec::new(),
+        };
+
+        assert!(single_flight.clone().try_lock_owned().is_err());
+        drop(permit);
+        assert!(single_flight.try_lock_owned().is_ok());
     }
 }

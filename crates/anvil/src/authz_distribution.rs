@@ -553,6 +553,7 @@ pub(crate) struct ZanzibarDistribution {
     decisions: DecisionRaft,
     serving: ServingAuthority,
     core: AuthzDistributionCore,
+    mutation_admission: crate::mutation_admission::MutationAdmission,
 }
 
 impl ZanzibarDistribution {
@@ -562,6 +563,7 @@ impl ZanzibarDistribution {
         decisions: DecisionRaft,
         serving: ServingAuthority,
         peers: Arc<dyn AuthzReplicaTransport>,
+        mutation_admission: crate::mutation_admission::MutationAdmission,
     ) -> Self {
         Self {
             local_node,
@@ -573,6 +575,7 @@ impl ZanzibarDistribution {
                 peers,
                 coordinator_serial: Arc::new(tokio::sync::Mutex::new(())),
             },
+            mutation_admission,
         }
     }
 
@@ -583,6 +586,7 @@ impl ZanzibarDistribution {
         context: AuthzRealmMutationContext,
     ) -> Result<CoordinatedAuthzRealmMutation, Status> {
         let _serial = self.core.coordinator_serial.lock().await;
+        let _permit = self.mutation_admission.enter()?;
         let mut replicas = self.require_coordinator(stable_tenant_id)?;
         self.require_context(&context, replicas.group.coordinator())?;
         let scope = request.scope.clone();
@@ -607,6 +611,7 @@ impl ZanzibarDistribution {
         request: BindSchemaRequest,
     ) -> Result<CoordinatedAuthzRealmMutation, Status> {
         let _serial = self.core.coordinator_serial.lock().await;
+        let _permit = self.mutation_admission.enter()?;
         let mut replicas = self.require_coordinator(stable_tenant_id)?;
         let serving = self.serving.mutation_context()?;
         let scope = request.scope.clone();
@@ -638,6 +643,7 @@ impl ZanzibarDistribution {
         context: AuthzRealmMutationContext,
     ) -> Result<CoordinatedAuthzSchemaPublication, Status> {
         let _serial = self.core.coordinator_serial.lock().await;
+        let _permit = self.mutation_admission.enter()?;
         let replicas = self.require_coordinator(stable_tenant_id)?;
         self.require_context(&context, replicas.group.coordinator())?;
         let storage_tenant = request.storage_tenant.clone();
@@ -661,6 +667,7 @@ impl ZanzibarDistribution {
         request: PublishSchemaRequest,
     ) -> Result<CoordinatedAuthzSchemaPublication, Status> {
         let _serial = self.core.coordinator_serial.lock().await;
+        let _permit = self.mutation_admission.enter()?;
         let replicas = self.require_coordinator(stable_tenant_id)?;
         let serving = self.serving.mutation_context()?;
         let storage_tenant = request.storage_tenant.clone();
@@ -706,6 +713,7 @@ impl ZanzibarDistribution {
         context: AuthzRealmMutationContext,
     ) -> Result<CoordinatedAuthzRealmMutation, Status> {
         let _serial = self.core.coordinator_serial.lock().await;
+        let _permit = self.mutation_admission.enter()?;
         let mut replicas = self.require_coordinator(stable_tenant_id)?;
         self.require_context(&context, replicas.group.coordinator())?;
         let scope = request.scope.clone();
@@ -732,6 +740,7 @@ impl ZanzibarDistribution {
         request: TupleBatchRequest,
     ) -> Result<CoordinatedAuthzRealmMutation, Status> {
         let _serial = self.core.coordinator_serial.lock().await;
+        let _permit = self.mutation_admission.enter()?;
         let mut replicas = self.require_coordinator(stable_tenant_id)?;
         let serving = self.serving.mutation_context()?;
         let scope = request.scope.clone();

@@ -5,6 +5,7 @@ impl DataPeerService {
         &self,
         mut request: Request<wire::TypedMutationRequest>,
     ) -> Result<Response<wire::ObjectMutationApplied>, Status> {
+        let _permit = self.cutover_admission.enter_continuation()?;
         let peer = request.get_ref().peer.clone();
         let peer = self.authorize(&mut request, peer.as_ref(), PeerRpcKind::DataPlane)?;
         require_typed_bound(&request.get_ref().mutation_json)?;

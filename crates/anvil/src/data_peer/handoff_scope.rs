@@ -26,6 +26,7 @@ enum HandoffAuthoritySource {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum HandoffTarget {
     AnyNode,
+    ActiveNode,
     JoiningNode,
 }
 
@@ -73,6 +74,7 @@ impl HandoffAuthority {
                     decisions.current_leader().map(NodeId),
                     state.cluster_control().transition(),
                     state.cluster_control().nodes().get(&joining),
+                    state.cluster_control().nodes().get(local_node),
                     scope,
                     target,
                 )
@@ -83,6 +85,54 @@ impl HandoffAuthority {
             )),
         }
     }
+
+    pub(super) fn validate_mutation_drain_release(
+        &self,
+        caller: AuthenticatedPeer,
+        scope: &wire::HandoffScope,
+    ) -> Result<(), Status> {
+        match &self.source {
+            HandoffAuthoritySource::Raft { decisions, .. } => {
+                if decisions.current_leader().map(NodeId) != Some(caller.node_id) {
+                    return Err(Status::permission_denied(
+                        "mutation-drain release caller is not the current Raft leader",
+                    ));
+                }
+                let state = decisions
+                    .state()
+                    .map_err(|error| Status::unavailable(error.to_string()))?;
+                let transition = state.cluster_control().transition().ok_or_else(|| {
+                    Status::failed_precondition("the ADD transition is already complete")
+                })?;
+                if transition.kind != MembershipTransitionKind::Add
+                    || transition.node_id.0 != scope.joining_node_id
+                    || transition.started_log_index != scope.started_log_index
+                {
+                    return Err(Status::failed_precondition(
+                        "mutation-drain release does not match the current ADD transition",
+                    ));
+                }
+                Ok(())
+            }
+            #[cfg(test)]
+            HandoffAuthoritySource::Reject => Err(Status::failed_precondition(
+                "no ADD handoff is active in this test service",
+            )),
+        }
+    }
+
+    pub(super) fn monitor_mutation_drain(
+        &self,
+        admission: crate::mutation_admission::MutationAdmission,
+        identity: crate::mutation_admission::DrainIdentity,
+    ) {
+        let decisions = match &self.source {
+            HandoffAuthoritySource::Raft { decisions, .. } => decisions,
+            #[cfg(test)]
+            HandoffAuthoritySource::Reject => return,
+        };
+        admission.monitor_add(decisions.clone(), identity);
+    }
 }
 
 fn validate_facts(
@@ -91,6 +141,7 @@ fn validate_facts(
     current_leader: Option<NodeId>,
     transition: Option<&MembershipTransition>,
     descriptor: Option<&NodeDescriptor>,
+    local_descriptor: Option<&NodeDescriptor>,
     scope: &wire::HandoffScope,
     target: HandoffTarget,
 ) -> Result<(), Status> {
@@ -122,6 +173,13 @@ fn validate_facts(
             "handoff install was sent to a node other than its JOINING target",
         ));
     }
+    if target == HandoffTarget::ActiveNode
+        && local_descriptor.is_none_or(|descriptor| descriptor.state != NodeState::Active)
+    {
+        return Err(Status::failed_precondition(
+            "handoff drain was sent to a node outside old ACTIVE membership",
+        ));
+    }
     Ok(())
 }
 
@@ -143,6 +201,13 @@ mod tests {
             supported_protocol: CapabilityRange { min: 1, max: 1 },
             supported_storage_format: CapabilityRange { min: 1, max: 1 },
         }
+    }
+
+    fn active_descriptor(node_id: NodeId) -> NodeDescriptor {
+        let mut descriptor = descriptor(node_id);
+        descriptor.state = NodeState::Active;
+        descriptor.join_capability_hash = None;
+        descriptor
     }
 
     fn transition() -> MembershipTransition {
@@ -169,6 +234,7 @@ mod tests {
             Some(NodeId(1)),
             Some(&transition()),
             Some(&descriptor(NodeId(2))),
+            Some(&descriptor(NodeId(2))),
             &scope(),
             HandoffTarget::JoiningNode,
         )
@@ -185,6 +251,7 @@ mod tests {
             Some(NodeId(1)),
             Some(&transition()),
             Some(&descriptor(NodeId(2))),
+            Some(&descriptor(NodeId(2))),
             &old,
             HandoffTarget::JoiningNode,
         )
@@ -200,6 +267,7 @@ mod tests {
             Some(NodeId(1)),
             Some(&transition()),
             Some(&descriptor(NodeId(2))),
+            Some(&descriptor(NodeId(2))),
             &scope(),
             HandoffTarget::JoiningNode,
         )
@@ -212,10 +280,40 @@ mod tests {
             Some(NodeId(1)),
             Some(&transition()),
             Some(&descriptor(NodeId(2))),
+            Some(&descriptor(NodeId(3))),
             &scope(),
             HandoffTarget::JoiningNode,
         )
         .unwrap_err();
         assert_eq!(wrong_target.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[test]
+    fn drain_authority_is_exactly_the_old_active_placement() {
+        validate_facts(
+            NodeId(1),
+            NodeId(1),
+            Some(NodeId(1)),
+            Some(&transition()),
+            Some(&descriptor(NodeId(2))),
+            Some(&active_descriptor(NodeId(1))),
+            &scope(),
+            HandoffTarget::ActiveNode,
+        )
+        .unwrap();
+
+        let activated = active_descriptor(NodeId(2));
+        let error = validate_facts(
+            NodeId(1),
+            NodeId(1),
+            Some(NodeId(1)),
+            Some(&transition()),
+            Some(&activated),
+            Some(&active_descriptor(NodeId(1))),
+            &scope(),
+            HandoffTarget::ActiveNode,
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     }
 }

@@ -19,6 +19,15 @@ message HandoffScope {
   uint64 started_log_index = 2;
 }
 
+message MutationDrainRequest {
+  PeerContext peer = 1;
+  HandoffScope handoff = 2;
+}
+
+message MutationDrained {
+  uint32 schema_version = 1;
+}
+
 message TypedMutationRequest {
   PeerContext peer = 1;
   bytes mutation_json = 2;
@@ -327,6 +336,8 @@ message HandoffReferenceCursorAdvanceRequest {
 }
 
 service DataPeer {
+  rpc DrainMutations(MutationDrainRequest) returns (MutationDrained);
+  rpc ReleaseMutationDrain(MutationDrainRequest) returns (MutationDrained);
   rpc ApplyObjectMutation(TypedMutationRequest) returns (ObjectMutationApplied);
   rpc ApplyRetainedVersionDelete(TypedMutationRequest) returns (RetainedVersionDeleteApplied);
   rpc ReadObjectPathSnapshot(ObjectPathSnapshotRequest) returns (ObjectPathSnapshotResponse);

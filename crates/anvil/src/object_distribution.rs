@@ -36,6 +36,7 @@ pub(crate) struct ObjectDistribution {
     peers: DataPeerTransport,
     payload: PayloadDistribution,
     payload_peers: PayloadPeerTransport,
+    mutation_admission: crate::mutation_admission::MutationAdmission,
 }
 
 impl ObjectDistribution {
@@ -46,6 +47,7 @@ impl ObjectDistribution {
         serving: ServingAuthority,
         peers: DataPeerTransport,
         erasure_profile: ErasureProfile,
+        mutation_admission: crate::mutation_admission::MutationAdmission,
     ) -> Self {
         let payload = PayloadDistribution::new(
             local_node,
@@ -62,6 +64,7 @@ impl ObjectDistribution {
             peers,
             payload,
             payload_peers,
+            mutation_admission,
         }
     }
 
@@ -111,6 +114,7 @@ impl ObjectDistribution {
                     "the ready capability names another upload source",
                 ));
             }
+            let _permit = self.mutation_admission.enter()?;
             return self
                 .store
                 .mutate_with_governance(BatchOperation::Publish(request), governance)
@@ -151,6 +155,7 @@ impl ObjectDistribution {
             .await
             .map_err(payload_status)?;
 
+        let _permit = self.mutation_admission.enter()?;
         let context = self
             .reconcile_before_mutation_stable(
                 &request.key,
@@ -208,6 +213,7 @@ impl ObjectDistribution {
         governance.validate().map_err(mutation_status)?;
         let placement = self.placement()?;
         if placement.active_node_ids().len() == 1 {
+            let _permit = self.mutation_admission.enter()?;
             return self
                 .store
                 .mutate_with_governance(operation, governance)
@@ -240,6 +246,7 @@ impl ObjectDistribution {
             )));
         }
 
+        let _permit = self.mutation_admission.enter()?;
         let context = self
             .reconcile_before_mutation_stable(
                 key,
@@ -266,9 +273,10 @@ impl ObjectDistribution {
         governance.validate().map_err(mutation_status)?;
         let placement = self.placement()?;
         if placement.active_node_ids().len() == 1 {
+            let _permit = self.mutation_admission.enter()?;
             return self
                 .store
-                .coordinate_retained_version_delete(
+                .coordinate_local_retained_version_delete(
                     key,
                     version,
                     governance,
@@ -286,6 +294,7 @@ impl ObjectDistribution {
                 group.coordinator().0
             )));
         }
+        let _permit = self.mutation_admission.enter()?;
         let context = self
             .reconcile_before_mutation_stable(
                 key,
@@ -312,13 +321,16 @@ impl ObjectDistribution {
         operations: Vec<BatchOperation>,
     ) -> Vec<Result<MutationReceipt, Status>> {
         match self.is_single_node() {
-            Ok(true) => self
-                .store
-                .bulk_write(operations)
-                .await
-                .into_iter()
-                .map(|outcome| outcome.result.map_err(mutation_status))
-                .collect(),
+            Ok(true) => match self.mutation_admission.enter() {
+                Ok(_permit) => self
+                    .store
+                    .bulk_write(operations)
+                    .await
+                    .into_iter()
+                    .map(|outcome| outcome.result.map_err(mutation_status))
+                    .collect(),
+                Err(error) => (0..operations.len()).map(|_| Err(error.clone())).collect(),
+            },
             Ok(false) => {
                 let mut outcomes = Vec::with_capacity(operations.len());
                 for operation in operations {
@@ -730,7 +742,8 @@ fn payload_status(error: PayloadDistributionError) -> Status {
         | PayloadDistributionError::OwnerArtifactMissing { .. }
         | PayloadDistributionError::OwnerArtifactThreshold { .. }
         | PayloadDistributionError::Peer { .. }
-        | PayloadDistributionError::Encoding(_) => Status::unavailable(error.to_string()),
+        | PayloadDistributionError::Encoding(_)
+        | PayloadDistributionError::CompleteSource(_) => Status::unavailable(error.to_string()),
         PayloadDistributionError::Store(_) | PayloadDistributionError::Erasure(_) => {
             Status::internal(error.to_string())
         }

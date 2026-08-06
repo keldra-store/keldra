@@ -8,6 +8,7 @@ use anvil_store::{
     ObjectRecordExportPage, PayloadArtifactCursor, PayloadArtifactSnapshot,
     PayloadArtifactSnapshotPage, StorageTenantId,
 };
+use std::task::{Context, Poll};
 
 #[derive(Clone)]
 #[allow(
@@ -20,6 +21,26 @@ pub(crate) struct DataPeerTransport {
     tls: PeerTlsConnector,
     channels: Arc<Mutex<BTreeMap<u64, (String, Channel)>>>,
     handoff: Option<wire::HandoffScope>,
+}
+
+pub(crate) struct RemoteMutationDrain {
+    transport: DataPeerTransport,
+    target: NodeId,
+    address: String,
+    released: bool,
+}
+
+impl RemoteMutationDrain {
+    pub(crate) async fn release(&mut self) -> Result<(), Status> {
+        if self.released {
+            return Ok(());
+        }
+        self.transport
+            .release_mutation_drain(self.target, &self.address)
+            .await?;
+        self.released = true;
+        Ok(())
+    }
 }
 
 #[allow(
@@ -56,6 +77,48 @@ impl DataPeerTransport {
         self.handoff
             .clone()
             .ok_or_else(|| Status::failed_precondition("data transport is not handoff-scoped"))
+    }
+
+    pub(crate) fn handoff_scope(&self) -> Option<wire::HandoffScope> {
+        self.handoff.clone()
+    }
+
+    pub(crate) async fn drain_mutations(
+        &self,
+        target: NodeId,
+        address: &str,
+    ) -> Result<RemoteMutationDrain, Status> {
+        let drained = self
+            .client(target, address)?
+            .drain_mutations(wire::MutationDrainRequest {
+                peer: Some(self.context()),
+                handoff: Some(self.handoff()?),
+            })
+            .await?
+            .into_inner();
+        require_response_schema(drained.schema_version)?;
+        Ok(RemoteMutationDrain {
+            transport: self.clone(),
+            target,
+            address: address.to_owned(),
+            released: false,
+        })
+    }
+
+    pub(crate) async fn release_mutation_drain(
+        &self,
+        target: NodeId,
+        address: &str,
+    ) -> Result<(), Status> {
+        let released = self
+            .client(target, address)?
+            .release_mutation_drain(wire::MutationDrainRequest {
+                peer: Some(self.context()),
+                handoff: Some(self.handoff()?),
+            })
+            .await?
+            .into_inner();
+        require_response_schema(released.schema_version)
     }
 
     pub(super) fn context(&self) -> wire::PeerContext {
@@ -425,6 +488,92 @@ impl DataPeerTransport {
             .await;
         producer.await.map_err(|error| {
             Status::internal(format!("join complete-source producer: {error}"))
+        })??;
+        let response = response?.into_inner();
+        require_response_schema(response.schema_version)?;
+        Ok(if response.already_present {
+            CompleteCopySealOutcome::AlreadyPresent
+        } else {
+            CompleteCopySealOutcome::Created
+        })
+    }
+
+    /// Forward one verified complete large payload between ordinary owners.
+    ///
+    /// The source and destination retain responsibility for validating the
+    /// immutable content identity. This coordinator only validates and
+    /// forwards bounded frames; it never buffers the complete payload.
+    pub(crate) async fn copy_complete_source(
+        &self,
+        source: NodeId,
+        source_address: &str,
+        target: NodeId,
+        target_address: &str,
+        reference: &BlobRef,
+    ) -> Result<CompleteCopySealOutcome, Status> {
+        if reference.length <= anvil_store::SMALL_BLOB_MAX_BYTES as u64 {
+            return Err(Status::invalid_argument(
+                "complete-source operation requires a large blob",
+            ));
+        }
+        let mut source_stream = self
+            .client(source, source_address)?
+            .get_complete_source(wire::ContentRequest {
+                peer: Some(self.context()),
+                blob: Some(wire_blob(reference)),
+            })
+            .await?
+            .into_inner();
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        let context = self.context();
+        let blob = wire_blob(reference);
+        let expected_length = reference.length;
+        let producer = tokio::spawn(async move {
+            let mut offset = 0_u64;
+            while let Some(frame) = source_stream.message().await? {
+                require_response_schema(frame.schema_version)?;
+                if frame.offset != offset
+                    || frame.content.len() > DATA_PEER_FRAME_BYTES
+                    || (frame.content.is_empty() && !frame.end)
+                {
+                    return Err(Status::data_loss(
+                        "complete-source stream is not contiguous",
+                    ));
+                }
+                let next_offset = offset
+                    .checked_add(frame.content.len() as u64)
+                    .filter(|next| *next <= expected_length)
+                    .ok_or_else(|| Status::resource_exhausted("complete-source stream overflow"))?;
+                if frame.end && next_offset != expected_length {
+                    return Err(Status::data_loss(
+                        "complete-source stream ended at another length",
+                    ));
+                }
+                sender
+                    .send(wire::CompleteSourcePutFrame {
+                        peer: Some(context.clone()),
+                        blob: Some(blob.clone()),
+                        offset: frame.offset,
+                        content: frame.content,
+                        end: frame.end,
+                    })
+                    .await
+                    .map_err(|_| Status::cancelled("complete-source destination stream closed"))?;
+                offset = next_offset;
+                if frame.end {
+                    return Ok::<(), Status>(());
+                }
+            }
+            Err(Status::data_loss(
+                "complete-source stream ended without a final frame",
+            ))
+        });
+        let response = self
+            .client(target, target_address)?
+            .put_complete_source(tokio_stream::wrappers::ReceiverStream::new(receiver))
+            .await;
+        producer.await.map_err(|error| {
+            Status::internal(format!("complete-source forwarding task failed: {error}"))
         })??;
         let response = response?.into_inner();
         require_response_schema(response.schema_version)?;

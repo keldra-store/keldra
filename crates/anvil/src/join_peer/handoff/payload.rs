@@ -138,6 +138,30 @@ pub(super) async fn transfer_all(
                 )
                 .await?;
             }
+            (PayloadPlacement::LargeComplete(old), PayloadPlacement::LargeComplete(new)) => {
+                transfer_large_complete(
+                    topology,
+                    peers,
+                    &reference,
+                    &artifacts,
+                    old.owners(),
+                    new.owners(),
+                )
+                .await?;
+            }
+            (PayloadPlacement::LargeComplete(old), PayloadPlacement::Large(new)) => {
+                transfer_complete_to_shards(
+                    topology,
+                    peers,
+                    profile,
+                    &reference,
+                    &artifacts,
+                    old.owners(),
+                    new.shards(),
+                    spools.clone(),
+                )
+                .await?;
+            }
             (PayloadPlacement::Large(old), PayloadPlacement::Large(new)) => {
                 transfer_large(
                     topology,
@@ -150,6 +174,11 @@ pub(super) async fn transfer_all(
                     spools.clone(),
                 )
                 .await?;
+            }
+            (PayloadPlacement::Large(_), PayloadPlacement::LargeComplete(_)) => {
+                return Err(Status::failed_precondition(
+                    "an ADD handoff cannot reduce erasure placement to complete copies",
+                ));
             }
             _ => {
                 return Err(Status::data_loss(
@@ -243,9 +272,6 @@ async fn transfer_small(
     new_owners: &[NodeId],
 ) -> Result<(), Status> {
     let (source, source_artifact) = select_complete_source(topology, artifacts, old_owners)?;
-    if source_artifact.lifecycle.ref_count == 0 {
-        return Ok(());
-    }
     let source_value = lifecycle_value(source_artifact.lifecycle);
     require_matching_complete_lifecycle(artifacts, old_owners, source_value)?;
     let lifecycle = merge_lifecycle_timestamps(
@@ -255,6 +281,12 @@ async fn transfer_small(
             .values()
             .map(|artifact| artifact.lifecycle),
     );
+    if lifecycle.ref_count == 0 {
+        return reconcile_zero_complete(
+            topology, peers, reference, artifacts, new_owners, lifecycle,
+        )
+        .await;
+    }
     let bytes = peers
         .get_small_content(
             source,
@@ -266,16 +298,26 @@ async fn transfer_small(
         .await?;
 
     for target in new_owners {
+        let address = topology
+            .address(*target)
+            .ok_or_else(|| Status::data_loss("small payload target has no address"))?;
         if artifacts
             .complete
             .get(target)
             .is_some_and(|entry| entry.lifecycle == lifecycle)
         {
+            peers
+                .install_payload_lifecycle(
+                    *target,
+                    address,
+                    &PayloadArtifactSnapshot {
+                        identity: PayloadArtifactIdentity::Complete(reference.clone()),
+                        lifecycle,
+                    },
+                )
+                .await?;
             continue;
         }
-        let address = topology
-            .address(*target)
-            .ok_or_else(|| Status::data_loss("small payload target has no address"))?;
         peers
             .put_small_content(*target, address, reference, &bytes)
             .await?;
@@ -293,6 +335,227 @@ async fn transfer_small(
     Ok(())
 }
 
+async fn transfer_large_complete(
+    topology: &HandoffTopology,
+    peers: &DataPeerTransport,
+    reference: &BlobRef,
+    artifacts: &BlobArtifacts,
+    old_owners: &[NodeId],
+    new_owners: &[NodeId],
+) -> Result<(), Status> {
+    let (source, source_artifact) = select_complete_source(topology, artifacts, old_owners)?;
+    let source_value = lifecycle_value(source_artifact.lifecycle);
+    require_matching_complete_lifecycle(artifacts, old_owners, source_value)?;
+    let lifecycle = merge_lifecycle_timestamps(
+        source_artifact.lifecycle,
+        artifacts
+            .complete
+            .values()
+            .map(|artifact| artifact.lifecycle),
+    );
+    if lifecycle.ref_count == 0 {
+        return reconcile_zero_complete(
+            topology, peers, reference, artifacts, new_owners, lifecycle,
+        )
+        .await;
+    }
+    let source_address = topology
+        .address(source)
+        .ok_or_else(|| Status::data_loss("large complete source has no address"))?;
+
+    for target in new_owners {
+        let target_address = topology
+            .address(*target)
+            .ok_or_else(|| Status::data_loss("large complete target has no address"))?;
+        let exact = artifacts
+            .complete
+            .get(target)
+            .is_some_and(|entry| entry.lifecycle == lifecycle);
+        if !exact && *target != source {
+            peers
+                .copy_complete_source(source, source_address, *target, target_address, reference)
+                .await?;
+        }
+        peers
+            .install_payload_lifecycle(
+                *target,
+                target_address,
+                &PayloadArtifactSnapshot {
+                    identity: PayloadArtifactIdentity::Complete(reference.clone()),
+                    lifecycle,
+                },
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+async fn transfer_complete_to_shards(
+    topology: &HandoffTopology,
+    peers: &DataPeerTransport,
+    profile: ErasureProfile,
+    reference: &BlobRef,
+    artifacts: &BlobArtifacts,
+    old_owners: &[NodeId],
+    new_shards: &[crate::payload_placement::ShardPlacement],
+    spools: Arc<dyn PayloadReadSpoolFactory>,
+) -> Result<(), Status> {
+    let (source, source_artifact) = select_complete_source(topology, artifacts, old_owners)?;
+    let selected = lifecycle_value(source_artifact.lifecycle);
+    require_matching_complete_lifecycle(artifacts, old_owners, selected)?;
+    let lifecycle = merge_lifecycle_timestamps(
+        source_artifact.lifecycle,
+        artifacts
+            .complete
+            .values()
+            .map(|artifact| artifact.lifecycle),
+    );
+    if lifecycle.ref_count == 0 {
+        return reconcile_zero_shards(topology, peers, reference, artifacts, new_shards, lifecycle)
+            .await;
+    }
+    let missing = new_shards
+        .iter()
+        .copied()
+        .filter(|placement| {
+            !artifacts
+                .shards
+                .contains_key(&(placement.owner(), placement.ordinal()))
+        })
+        .collect::<Vec<_>>();
+    let mut encoded = if missing.is_empty() {
+        BTreeMap::new()
+    } else {
+        encode_complete_source(
+            topology, peers, profile, reference, source, &missing, spools,
+        )
+        .await?
+    };
+
+    for placement in new_shards {
+        let target = placement.owner();
+        let ordinal = placement.ordinal();
+        let identity = ShardIdentity::new(reference.clone(), ordinal);
+        let target_address = topology
+            .address(target)
+            .ok_or_else(|| Status::data_loss("large payload target has no address"))?;
+        if let Some(spool) = encoded.remove(&ordinal) {
+            peers
+                .put_shard(
+                    target,
+                    target_address,
+                    &identity,
+                    Box::new(OwnedSpoolReader(spool)),
+                )
+                .await?;
+        }
+        peers
+            .install_payload_lifecycle(
+                target,
+                target_address,
+                &PayloadArtifactSnapshot {
+                    identity: PayloadArtifactIdentity::Shard(identity),
+                    lifecycle,
+                },
+            )
+            .await?;
+    }
+    if !encoded.is_empty() {
+        return Err(Status::internal(
+            "complete-to-erasure handoff retained an unassigned shard",
+        ));
+    }
+    Ok(())
+}
+
+async fn encode_complete_source(
+    topology: &HandoffTopology,
+    peers: &DataPeerTransport,
+    profile: ErasureProfile,
+    reference: &BlobRef,
+    source: NodeId,
+    missing: &[crate::payload_placement::ShardPlacement],
+    spools: Arc<dyn PayloadReadSpoolFactory>,
+) -> Result<BTreeMap<u16, Box<dyn PayloadReadSpool>>, Status> {
+    let mut complete = spools
+        .create()
+        .map_err(|error| Status::internal(format!("create handoff source spool: {error}")))?;
+    let source_address = topology
+        .address(source)
+        .ok_or_else(|| Status::data_loss("large complete source has no address"))?;
+    let mut stream = peers
+        .get_complete_source(source, source_address, reference)
+        .await?;
+    let mut offset = 0_u64;
+    let mut hasher = blake3::Hasher::new();
+    let mut ended = false;
+    while let Some(frame) = stream.message().await? {
+        if frame.schema_version != DATA_PEER_SCHEMA_VERSION
+            || frame.offset != offset
+            || frame.content.len() > DATA_PEER_FRAME_BYTES
+            || (frame.content.is_empty() && !frame.end)
+        {
+            return Err(Status::data_loss(
+                "complete handoff source stream is malformed",
+            ));
+        }
+        let next = offset
+            .checked_add(frame.content.len() as u64)
+            .filter(|next| *next <= reference.length)
+            .ok_or_else(|| Status::data_loss("complete handoff source length overflow"))?;
+        complete
+            .write_all(&frame.content)
+            .map_err(|error| Status::internal(format!("write handoff source spool: {error}")))?;
+        hasher.update(&frame.content);
+        offset = next;
+        if frame.end {
+            ended = true;
+            break;
+        }
+    }
+    if !ended || offset != reference.length || hasher.finalize().as_bytes() != &reference.hash {
+        return Err(Status::data_loss(
+            "complete handoff source failed immutable identity verification",
+        ));
+    }
+
+    let mut outputs = (0..usize::from(profile.total_shards()))
+        .map(|_| EncodeOutput::Discard(io::sink()))
+        .collect::<Vec<_>>();
+    for placement in missing {
+        let ordinal = usize::from(placement.ordinal());
+        if ordinal >= outputs.len() || matches!(&outputs[ordinal], EncodeOutput::Target(_)) {
+            return Err(Status::data_loss(
+                "complete-to-erasure handoff has an invalid shard assignment",
+            ));
+        }
+        outputs[ordinal] =
+            EncodeOutput::Target(Some(spools.create().map_err(|error| {
+                Status::internal(format!("create encoded shard spool: {error}"))
+            })?));
+    }
+    let codec = ErasureCodec::new(profile)
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    let expected = reference.clone();
+    tokio::task::spawn_blocking(move || {
+        complete.seek(SeekFrom::Start(0))?;
+        codec
+            .encode(&mut *complete, &expected, &mut outputs)
+            .map_err(io::Error::other)?;
+        let mut encoded = BTreeMap::new();
+        for (ordinal, output) in outputs.into_iter().enumerate() {
+            if let EncodeOutput::Target(Some(mut spool)) = output {
+                spool.seek(SeekFrom::Start(0))?;
+                encoded.insert(ordinal as u16, spool);
+            }
+        }
+        Ok::<_, io::Error>(encoded)
+    })
+    .await
+    .map_err(|error| Status::internal(format!("join shard encoder: {error}")))?
+    .map_err(|error| Status::data_loss(error.to_string()))
+}
+
 fn select_complete_source<'a>(
     topology: &HandoffTopology,
     artifacts: &'a BlobArtifacts,
@@ -307,7 +570,7 @@ fn select_complete_source<'a>(
                 .get(node)
                 .map(|artifact| (*node, artifact))
         })
-        .ok_or_else(|| Status::unavailable("small payload has no complete ACTIVE source"))
+        .ok_or_else(|| Status::unavailable("payload has no complete ACTIVE source"))
 }
 
 fn require_matching_complete_lifecycle(
@@ -321,11 +584,101 @@ fn require_matching_complete_lifecycle(
         };
         if lifecycle_value(artifact.lifecycle) != selected {
             return Err(Status::data_loss(
-                "small payload owners disagree on reference count or flags",
+                "complete payload owners disagree on reference count or flags",
             ));
         }
     }
     Ok(())
+}
+
+async fn reconcile_zero_complete(
+    topology: &HandoffTopology,
+    peers: &DataPeerTransport,
+    reference: &BlobRef,
+    artifacts: &BlobArtifacts,
+    new_owners: &[NodeId],
+    lifecycle: BlobReferenceState,
+) -> Result<(), Status> {
+    for (target, artifact) in existing_complete_targets(reference, artifacts, new_owners, lifecycle)
+    {
+        let address = topology
+            .address(target)
+            .ok_or_else(|| Status::data_loss("zero-count complete target has no address"))?;
+        peers
+            .install_payload_lifecycle(target, address, &artifact)
+            .await?;
+    }
+    Ok(())
+}
+
+fn existing_complete_targets(
+    reference: &BlobRef,
+    artifacts: &BlobArtifacts,
+    owners: &[NodeId],
+    lifecycle: BlobReferenceState,
+) -> Vec<(NodeId, PayloadArtifactSnapshot)> {
+    owners
+        .iter()
+        .copied()
+        .filter(|owner| artifacts.complete.contains_key(owner))
+        .map(|owner| {
+            (
+                owner,
+                PayloadArtifactSnapshot {
+                    identity: PayloadArtifactIdentity::Complete(reference.clone()),
+                    lifecycle,
+                },
+            )
+        })
+        .collect()
+}
+
+async fn reconcile_zero_shards(
+    topology: &HandoffTopology,
+    peers: &DataPeerTransport,
+    reference: &BlobRef,
+    artifacts: &BlobArtifacts,
+    new_shards: &[crate::payload_placement::ShardPlacement],
+    lifecycle: BlobReferenceState,
+) -> Result<(), Status> {
+    for (target, artifact) in existing_shard_targets(reference, artifacts, new_shards, lifecycle) {
+        let address = topology
+            .address(target)
+            .ok_or_else(|| Status::data_loss("zero-count shard target has no address"))?;
+        peers
+            .install_payload_lifecycle(target, address, &artifact)
+            .await?;
+    }
+    Ok(())
+}
+
+fn existing_shard_targets(
+    reference: &BlobRef,
+    artifacts: &BlobArtifacts,
+    placements: &[crate::payload_placement::ShardPlacement],
+    lifecycle: BlobReferenceState,
+) -> Vec<(NodeId, PayloadArtifactSnapshot)> {
+    placements
+        .iter()
+        .copied()
+        .filter(|placement| {
+            artifacts
+                .shards
+                .contains_key(&(placement.owner(), placement.ordinal()))
+        })
+        .map(|placement| {
+            (
+                placement.owner(),
+                PayloadArtifactSnapshot {
+                    identity: PayloadArtifactIdentity::Shard(ShardIdentity::new(
+                        reference.clone(),
+                        placement.ordinal(),
+                    )),
+                    lifecycle,
+                },
+            )
+        })
+        .collect()
 }
 
 async fn transfer_large(
@@ -339,57 +692,57 @@ async fn transfer_large(
     spools: Arc<dyn PayloadReadSpoolFactory>,
 ) -> Result<(), Status> {
     let selected_lifecycle = select_shard_lifecycle(artifacts, old_shards)?;
-    if selected_lifecycle.ref_count == 0 {
-        return Ok(());
-    }
     let selected = lifecycle_value(selected_lifecycle);
     require_matching_shard_lifecycle(artifacts, old_shards, selected)?;
     let lifecycle = merge_lifecycle_timestamps(
         selected_lifecycle,
         artifacts.shards.values().map(|artifact| artifact.lifecycle),
     );
+    if lifecycle.ref_count == 0 {
+        return reconcile_zero_shards(topology, peers, reference, artifacts, new_shards, lifecycle)
+            .await;
+    }
 
     for placement in new_shards {
         let target = placement.owner();
         let ordinal = placement.ordinal();
-        if artifacts
-            .shards
-            .get(&(target, ordinal))
-            .is_some_and(|entry| entry.lifecycle == lifecycle)
-        {
-            continue;
-        }
         let identity = ShardIdentity::new(reference.clone(), ordinal);
         let target_address = topology
             .address(target)
             .ok_or_else(|| Status::data_loss("large payload target has no address"))?;
-        if let Some(source) = topology.active().iter().find(|endpoint| {
-            artifacts
-                .shards
-                .get(&(endpoint.node_id, ordinal))
-                .is_some_and(|entry| lifecycle_value(entry.lifecycle) == selected)
-        }) {
-            peers
-                .copy_shard(
-                    source.node_id,
-                    &source.address,
+        let exact = artifacts
+            .shards
+            .get(&(target, ordinal))
+            .is_some_and(|entry| entry.lifecycle == lifecycle);
+        if !exact {
+            if let Some(source) = topology.active().iter().find(|endpoint| {
+                artifacts
+                    .shards
+                    .get(&(endpoint.node_id, ordinal))
+                    .is_some_and(|entry| lifecycle_value(entry.lifecycle) == selected)
+            }) {
+                peers
+                    .copy_shard(
+                        source.node_id,
+                        &source.address,
+                        target,
+                        target_address,
+                        &identity,
+                    )
+                    .await?;
+            } else {
+                rebuild_shard(
+                    topology,
+                    peers,
+                    profile,
+                    reference,
                     target,
                     target_address,
                     &identity,
+                    spools.clone(),
                 )
                 .await?;
-        } else {
-            rebuild_shard(
-                topology,
-                peers,
-                profile,
-                reference,
-                target,
-                target_address,
-                &identity,
-                spools.clone(),
-            )
-            .await?;
+            }
         }
         peers
             .install_payload_lifecycle(
@@ -685,6 +1038,14 @@ impl Write for SharedSpool {
     }
 }
 
+struct OwnedSpoolReader(Box<dyn PayloadReadSpool>);
+
+impl Read for OwnedSpoolReader {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        self.0.read(bytes)
+    }
+}
+
 enum EncodeOutput {
     Target(Option<Box<dyn PayloadReadSpool>>),
     Discard(io::Sink),
@@ -710,8 +1071,11 @@ impl Write for EncodeOutput {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU32;
+
     use super::*;
     use crate::join_peer::handoff::HandoffEndpoint;
+    use crate::placement::PlacementNode;
 
     fn reference(byte: u8) -> BlobRef {
         BlobRef {
@@ -977,5 +1341,70 @@ mod tests {
         assert_eq!(merged.flags, 0);
         assert_eq!(merged.created_at, 10);
         assert_eq!(merged.updated_at, 90);
+    }
+
+    #[test]
+    fn zero_count_retry_reconciles_only_artifacts_already_created() {
+        let reference = BlobRef {
+            hash: [9; 32],
+            length: anvil_store::SMALL_BLOB_MAX_BYTES as u64 + 1,
+        };
+        let stale = PayloadArtifactSnapshot {
+            identity: PayloadArtifactIdentity::Complete(reference.clone()),
+            lifecycle: BlobReferenceState {
+                ref_count: 1,
+                flags: 0,
+                created_at: 1,
+                updated_at: 2,
+            },
+        };
+        let mut artifacts = BlobArtifacts::default();
+        artifacts.reference = Some(reference.clone());
+        artifacts.complete.insert(NodeId(2), stale);
+        let zero = BlobReferenceState {
+            ref_count: 0,
+            flags: 0,
+            created_at: 1,
+            updated_at: 3,
+        };
+
+        let complete =
+            existing_complete_targets(&reference, &artifacts, &[NodeId(1), NodeId(2)], zero);
+        assert_eq!(complete.len(), 1);
+        assert_eq!(complete[0].0, NodeId(2));
+        assert_eq!(complete[0].1.lifecycle, zero);
+
+        let nodes = [NodeId(1), NodeId(2), NodeId(3)]
+            .map(|node| PlacementNode::new(node, NonZeroU32::new(1_000_000).unwrap()));
+        let PayloadPlacement::Large(placement) = select_payload_placement(
+            anvil_consensus::ClusterId(*b"handoff-retry-v1"),
+            &reference,
+            ErasureProfile::default(),
+            &nodes,
+        ) else {
+            panic!("three nodes must select default erasure placement")
+        };
+        let present = placement.shards()[1];
+        artifacts.shards.insert(
+            (present.owner(), present.ordinal()),
+            PayloadArtifactSnapshot {
+                identity: PayloadArtifactIdentity::Shard(ShardIdentity::new(
+                    reference.clone(),
+                    present.ordinal(),
+                )),
+                lifecycle: BlobReferenceState {
+                    ref_count: 1,
+                    ..zero
+                },
+            },
+        );
+        let shards = existing_shard_targets(&reference, &artifacts, placement.shards(), zero);
+        assert_eq!(shards.len(), 1);
+        assert_eq!(shards[0].0, present.owner());
+        assert_eq!(shards[0].1.lifecycle, zero);
+        assert_eq!(
+            shards[0].1.identity,
+            PayloadArtifactIdentity::Shard(ShardIdentity::new(reference, present.ordinal()))
+        );
     }
 }

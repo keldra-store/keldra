@@ -151,6 +151,7 @@ async fn fixture(active_count: usize) -> Fixture {
         store: stores[&local_node].clone(),
         peers: transport.clone(),
         coordinator_serial: Arc::new(tokio::sync::Mutex::new(())),
+        mutation_admission: crate::mutation_admission::MutationAdmission::new(),
     };
     Fixture {
         _root: root,

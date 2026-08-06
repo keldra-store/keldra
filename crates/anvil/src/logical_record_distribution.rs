@@ -76,6 +76,7 @@ struct LogicalRecordDistributionCore {
     /// sufficient to serialize every reconcile/mutate sequence handled by
     /// this process without a per-record lock registry.
     coordinator_serial: Arc<tokio::sync::Mutex<()>>,
+    mutation_admission: crate::mutation_admission::MutationAdmission,
 }
 
 impl LogicalRecordDistributionCore {
@@ -89,6 +90,7 @@ impl LogicalRecordDistributionCore {
         F: FnMut() -> Result<(), Status> + Send,
     {
         let _serial = self.coordinator_serial.lock().await;
+        let _permit = self.mutation_admission.enter()?;
         require_current_fence()?;
         let id = typed_value.id();
         let current = self.reconcile(route, &id).await?;
@@ -324,6 +326,7 @@ impl LogicalRecordDistribution {
         decisions: DecisionRaft,
         serving: ServingAuthority,
         peers: Arc<dyn LogicalRecordReplicaTransport>,
+        mutation_admission: crate::mutation_admission::MutationAdmission,
     ) -> Self {
         Self {
             local_node,
@@ -334,6 +337,7 @@ impl LogicalRecordDistribution {
                 store,
                 peers,
                 coordinator_serial: Arc::new(tokio::sync::Mutex::new(())),
+                mutation_admission,
             },
         }
     }

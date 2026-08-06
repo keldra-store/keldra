@@ -12,10 +12,10 @@ use std::time::Duration;
 use anvil_consensus::{
     ApplyError, ApplyResult, CLUSTER_CONTROL_COMMAND_VERSION, CapabilityRange, ClusterId, Command,
     CommittedPeerPinProvider, CommittedPeerPins, DecisionRaft, DecisionRaftError,
-    JoinCapabilityHash, MAX_PEER_ADDRESS_BYTES, MembershipTransitionKind, NodeDescriptor, NodeId,
-    NodeState, PeerAddress, PeerNode, PeerRpcKind, PeerSpkiSha256, PeerTlsAcceptor, PeerTlsConfig,
-    PeerTlsConnector, PeerTlsError, PeerTlsIdentity, ServingLeaseIssuer, TonicPeerTransport,
-    TonicRaftPeerService,
+    ErasureCodeProfile, JoinCapabilityHash, MAX_PEER_ADDRESS_BYTES, MembershipTransitionKind,
+    NodeDescriptor, NodeId, NodeState, PeerAddress, PeerNode, PeerRpcKind, PeerSpkiSha256,
+    PeerTlsAcceptor, PeerTlsConfig, PeerTlsConnector, PeerTlsError, PeerTlsIdentity,
+    ServingLeaseIssuer, TonicPeerTransport, TonicRaftPeerService,
 };
 use anvil_store::{ErasureProfile, Store};
 use anyhow::{Context, Result, bail};
@@ -35,6 +35,7 @@ use crate::join_peer::{
     JoinActivationGate, JoinBootstrapPins, JoinPeerService, JoinPeerTransport, TypedAddHandoff,
 };
 use crate::logical_name_resolution::LateBoundLogicalNameResolution;
+use crate::mutation_admission::{AdmissionSurface, MutationAdmission, MutationAdmissionService};
 use crate::node_identity::{self, LocalNodeIdentity};
 use crate::payload_distribution::PayloadPeerService;
 use crate::personaldb::RoutedPersonalDbHandlers;
@@ -76,6 +77,7 @@ pub(crate) struct PeerRuntime {
     routed_index_queries: RoutedIndexQueryHandlers,
     routed_accounting: RoutedAccountingHandlers,
     routed_personaldb: RoutedPersonalDbHandlers,
+    mutation_admission: MutationAdmission,
     join_transport: Option<JoinPeerTransport>,
     bootstrap_pins: Option<Arc<JoinBootstrapPins>>,
     clear_pins_on_drop: bool,
@@ -268,6 +270,13 @@ pub(crate) async fn open(config: OpenPeerConfig<'_>) -> Result<(DecisionRaft, Pe
         if descriptor.state == NodeState::Joining {
             return Ok((decisions, runtime));
         }
+        if state.cluster_control().transition().is_some() {
+            // The first ADD completion makes the descriptor ACTIVE before the
+            // fixed-voter update and final transition completion. Retain the
+            // one-time join material so restart can resume that exact Raft
+            // transition instead of stranding it half-finished.
+            return Ok((decisions, runtime));
+        }
         node_identity::clear_pending_join(config.data_dir, identity.cluster_id(), config.node_id)
             .context("clear consumed join capability after ACTIVE membership")?;
         runtime.clear_join_bootstrap();
@@ -304,6 +313,7 @@ pub(crate) async fn complete_pending_join(
     transport: &JoinPeerTransport,
     decisions: &DecisionRaft,
     data_dir: &Path,
+    expected_erasure_profile: ErasureProfile,
     timeout: Duration,
 ) -> Result<()> {
     let transition = transport
@@ -319,7 +329,9 @@ pub(crate) async fn complete_pending_join(
             .cluster_control()
             .nodes()
             .get(&transition.node_id)
-            .is_some_and(|descriptor| descriptor.state == NodeState::Joining)
+            .is_some_and(|descriptor| {
+                matches!(descriptor.state, NodeState::Joining | NodeState::Active)
+            })
             && state.cluster_control().transition() == Some(&transition);
         if exact {
             break;
@@ -333,13 +345,17 @@ pub(crate) async fn complete_pending_join(
     let identity = node_identity::load_for_node(data_dir, transition.node_id)
         .context("reload caught-up JOINING identity")?;
     let state = decisions.state()?;
+    require_committed_erasure_profile(
+        state.cluster_control().erasure_code_profile(),
+        expected_erasure_profile,
+    )?;
     let descriptor = state
         .cluster_control()
         .nodes()
         .get(&transition.node_id)
         .context("caught-up Raft state omitted the joining descriptor")?;
     anyhow::ensure!(
-        descriptor.state == NodeState::Joining
+        matches!(descriptor.state, NodeState::Joining | NodeState::Active)
             && state.cluster_control().transition() == Some(&transition),
         "caught-up Raft state does not contain the exact pending ADD transition"
     );
@@ -388,6 +404,29 @@ pub(crate) async fn complete_pending_join(
     }
     node_identity::clear_pending_join(data_dir, identity.cluster_id(), transition.node_id)
         .context("clear one-time join capability after ACTIVE membership")?;
+    Ok(())
+}
+
+fn require_committed_erasure_profile(
+    committed: Option<ErasureCodeProfile>,
+    expected: ErasureProfile,
+) -> Result<()> {
+    let committed = committed.context("caught-up cluster has no committed erasure-code profile")?;
+    let expected = ErasureCodeProfile {
+        data_shards: expected.data_shards(),
+        parity_shards: expected.parity_shards(),
+        stripe_unit: expected.stripe_unit(),
+    };
+    anyhow::ensure!(
+        committed == expected,
+        "joining node erasure-code profile {}+{} with {}-byte stripes does not match the committed cluster profile {}+{} with {}-byte stripes",
+        expected.data_shards,
+        expected.parity_shards,
+        expected.stripe_unit,
+        committed.data_shards,
+        committed.parity_shards,
+        committed.stripe_unit,
+    );
     Ok(())
 }
 
@@ -459,6 +498,10 @@ impl PeerRuntime {
         self.join_transport.clone()
     }
 
+    pub(crate) fn mutation_admission(&self) -> MutationAdmission {
+        self.mutation_admission.clone()
+    }
+
     fn clear_join_bootstrap(&mut self) {
         if let Some(pins) = self.bootstrap_pins.take() {
             pins.clear();
@@ -475,6 +518,10 @@ impl PeerRuntime {
         maximum_unary_time: Duration,
         max_blob_bytes: u64,
     ) -> Result<PeerServerHandle> {
+        if let Some(identity) = self.mutation_admission.drain_identity() {
+            self.mutation_admission
+                .monitor_add(decisions.clone(), identity);
+        }
         let leases = ServingLeaseIssuer::new();
         let activation_gate = Arc::new(TypedAddHandoff::new(
             self.node_id,
@@ -483,6 +530,7 @@ impl PeerRuntime {
             self.data_transport.clone(),
             leases.clone(),
             self.program_quiescence.clone(),
+            self.mutation_admission.clone(),
             erasure_profile,
         ));
         self.start_with_activation_gate(
@@ -574,6 +622,11 @@ impl PeerRuntime {
             self.routed_authz_handlers.clone(),
         )
         .into_server();
+        let cluster_service = MutationAdmissionService::new(
+            cluster_service,
+            self.mutation_admission.clone(),
+            AdmissionSurface::ClusterPeer,
+        );
         let data_service = DataPeerService::new(
             store,
             self.pins.clone(),
@@ -582,6 +635,7 @@ impl PeerRuntime {
             erasure_profile,
             maximum_unary_time,
             max_blob_bytes,
+            self.mutation_admission.clone(),
         )?
         .into_server();
         let (shutdown, stopped) = tokio::sync::oneshot::channel();
@@ -667,6 +721,7 @@ async fn open_with_identity(
     .await
     .context("open bounded decision Raft with private transport")?;
     pins.install(decisions.clone())?;
+    let mutation_admission = initial_mutation_admission(&decisions)?;
     Ok((
         decisions,
         PeerRuntime {
@@ -686,11 +741,37 @@ async fn open_with_identity(
             routed_index_queries: RoutedIndexQueryHandlers::default(),
             routed_accounting: RoutedAccountingHandlers::default(),
             routed_personaldb: RoutedPersonalDbHandlers::default(),
+            mutation_admission,
             join_transport,
             bootstrap_pins,
             clear_pins_on_drop: true,
         },
     ))
+}
+
+fn initial_mutation_admission(decisions: &DecisionRaft) -> Result<MutationAdmission> {
+    let state = decisions
+        .state()
+        .context("read initial mutation admission")?;
+    let identity = state
+        .cluster_control()
+        .transition()
+        .filter(|transition| transition.kind == MembershipTransitionKind::Add)
+        .filter(|transition| {
+            state
+                .cluster_control()
+                .nodes()
+                .get(&transition.node_id)
+                .is_some_and(|descriptor| descriptor.state == NodeState::Joining)
+        })
+        .map(|transition| crate::mutation_admission::DrainIdentity {
+            joining_node_id: transition.node_id.0,
+            started_log_index: transition.started_log_index,
+        });
+    Ok(match identity {
+        Some(identity) => MutationAdmission::new_closed(identity),
+        None => MutationAdmission::new(),
+    })
 }
 
 async fn ensure_cluster_identity(decisions: &DecisionRaft, expected: ClusterId) -> Result<()> {
@@ -899,6 +980,13 @@ fn validate_joining_restart_state(
                 descriptor.join_capability_hash.is_none(),
                 "ACTIVE descriptor retained a join capability"
             );
+            if let Some(transition) = state.cluster_control().transition() {
+                anyhow::ensure!(
+                    transition.kind == MembershipTransitionKind::Add
+                        && transition.node_id == identity.node_id(),
+                    "ACTIVE pending join does not match the unfinished ADD transition"
+                );
+            }
         }
     }
     Ok(())
@@ -1146,6 +1234,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn joining_node_requires_the_exact_committed_erasure_profile() {
+        let expected = ErasureProfile::default();
+        let committed = ErasureCodeProfile {
+            data_shards: expected.data_shards(),
+            parity_shards: expected.parity_shards(),
+            stripe_unit: expected.stripe_unit(),
+        };
+        assert!(require_committed_erasure_profile(Some(committed), expected).is_ok());
+        assert!(require_committed_erasure_profile(None, expected).is_err());
+
+        let mismatched = ErasureCodeProfile {
+            data_shards: 4,
+            parity_shards: 2,
+            stripe_unit: expected.stripe_unit(),
+        };
+        let error = require_committed_erasure_profile(Some(mismatched), expected).unwrap_err();
+        assert!(error.to_string().contains("does not match"));
+    }
+
     #[tokio::test]
     async fn fresh_genesis_persists_identity_and_active_descriptor() {
         let directory = tempfile::tempdir().unwrap();
@@ -1267,7 +1375,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn copied_bundle_joins_as_learner_then_activates_with_exact_fixed_voters() {
+    async fn copied_bundle_resumes_an_add_after_the_descriptor_became_active() {
         let first_directory = tempfile::tempdir().unwrap();
         let second_directory = tempfile::tempdir().unwrap();
         let first_address = unused_loopback();
@@ -1291,6 +1399,12 @@ mod tests {
             max_commit_bytes: 64 * 1024,
             leader_timeout: Duration::from_secs(10),
         })
+        .await
+        .unwrap();
+        crate::cluster_startup::ensure_erasure_code_profile(
+            &first_decisions,
+            ErasureProfile::default(),
+        )
         .await
         .unwrap();
         let cluster_id = first_decisions.state().unwrap().cluster_id().unwrap();
@@ -1348,7 +1462,7 @@ mod tests {
         let (second_decisions, second_runtime) = open(OpenPeerConfig {
             data_dir: second_directory.path(),
             node_id: NodeId(2),
-            peer_address: second_peer,
+            peer_address: second_peer.clone(),
             join_bundle: Some(&copied_bundle),
             run_system_bootstrap: true,
             max_commit_entries: 16,
@@ -1372,10 +1486,89 @@ mod tests {
             .await
             .unwrap();
 
+        let transition = join.catch_up(Duration::from_secs(10)).await.unwrap();
+        let catch_up_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let state = second_decisions.state().unwrap();
+            if state.cluster_control().transition() == Some(&transition)
+                && state.cluster_control().nodes()[&NodeId(2)].state == NodeState::Joining
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < catch_up_deadline,
+                "joining descriptor did not apply before simulated activation crash"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let advanced = first_decisions
+            .submit(Command::CompleteMembershipTransition {
+                format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+                started_log_index: transition.started_log_index,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            advanced.result,
+            ApplyResult::MembershipTransitionAdvanced(_)
+        ));
+        let active_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let state = second_decisions.state().unwrap();
+            if state.cluster_control().transition() == Some(&transition)
+                && state.cluster_control().nodes()[&NodeId(2)].state == NodeState::Active
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < active_deadline,
+                "half-completed ADD did not apply before resume"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        second_server.shutdown().await.unwrap();
+        second_decisions.shutdown().await.unwrap();
+        // Rust keeps a shadowed binding alive while evaluating the new
+        // initializer. Drop every old handle before reopening the same
+        // RocksDB-backed Raft directory in this in-process restart test.
+        drop(second_server);
+        drop(second_decisions);
+        let (second_decisions, second_runtime) = open(OpenPeerConfig {
+            data_dir: second_directory.path(),
+            node_id: NodeId(2),
+            peer_address: second_peer,
+            join_bundle: None,
+            run_system_bootstrap: false,
+            max_commit_entries: 16,
+            max_commit_bytes: 64 * 1024,
+            leader_timeout: Duration::from_secs(10),
+        })
+        .await
+        .unwrap();
+        let join = second_runtime
+            .join_transport()
+            .expect("unfinished ACTIVE ADD must retain its join transport");
+        let second_store = Store::open(StoreOptions::new(second_directory.path(), 2))
+            .await
+            .unwrap();
+        let mut second_server = second_runtime
+            .start(
+                second_address,
+                second_decisions.clone(),
+                second_store,
+                ErasureProfile::default(),
+                Duration::from_secs(30),
+                16 * 1024 * 1024,
+            )
+            .await
+            .unwrap();
+
         complete_pending_join(
             &join,
             &second_decisions,
             second_directory.path(),
+            ErasureProfile::default(),
             Duration::from_secs(10),
         )
         .await

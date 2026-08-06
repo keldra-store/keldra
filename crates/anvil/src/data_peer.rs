@@ -8,7 +8,6 @@ use std::future::Future;
 use std::io::{self, Read};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
 use std::time::Duration;
 
 use anvil_consensus::{
@@ -31,6 +30,7 @@ use tonic::metadata::MetadataMap;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status, Streaming};
 
+mod cutover;
 mod errors;
 mod handoff;
 mod handoff_scope;
@@ -50,7 +50,7 @@ use object_snapshot::{
     encode_object_snapshot, map_object_snapshot_error, require_object_snapshot_bound,
 };
 use timeout::effective_timeout;
-pub(crate) use transport::DataPeerTransport;
+pub(crate) use transport::{DataPeerTransport, RemoteMutationDrain};
 use typed_json::{decode_typed, encode_page, encode_typed, require_typed_bound};
 use wire_value::{
     content_end, content_frame, parse_blob, parse_cluster_id, parse_shard, parse_small_blob,
@@ -74,6 +74,7 @@ pub(crate) struct DataPeerService {
     codec: Arc<ErasureCodec>,
     handoff: HandoffAuthority,
     mutation_admission: MutationAdmission,
+    cutover_admission: crate::mutation_admission::MutationAdmission,
     maximum_unary_time: Duration,
     max_blob_bytes: u64,
 }
@@ -93,6 +94,7 @@ impl DataPeerService {
         profile: ErasureProfile,
         maximum_unary_time: Duration,
         max_blob_bytes: u64,
+        cutover_admission: crate::mutation_admission::MutationAdmission,
     ) -> Result<Self, anyhow::Error> {
         Self::validate_and_build(
             store,
@@ -102,6 +104,7 @@ impl DataPeerService {
             profile,
             maximum_unary_time,
             max_blob_bytes,
+            cutover_admission,
         )
     }
 
@@ -124,6 +127,7 @@ impl DataPeerService {
             profile,
             maximum_unary_time,
             max_blob_bytes,
+            crate::mutation_admission::MutationAdmission::new(),
         )
     }
 
@@ -135,6 +139,7 @@ impl DataPeerService {
         profile: ErasureProfile,
         maximum_unary_time: Duration,
         max_blob_bytes: u64,
+        cutover_admission: crate::mutation_admission::MutationAdmission,
     ) -> Result<Self, anyhow::Error> {
         anyhow::ensure!(
             !maximum_unary_time.is_zero()
@@ -154,6 +159,7 @@ impl DataPeerService {
             codec: Arc::new(codec),
             handoff,
             mutation_admission,
+            cutover_admission,
             maximum_unary_time,
             max_blob_bytes,
         })
@@ -229,6 +235,20 @@ impl DataPeerService {
 
 #[tonic::async_trait]
 impl wire::data_peer_server::DataPeer for DataPeerService {
+    async fn drain_mutations(
+        &self,
+        request: Request<wire::MutationDrainRequest>,
+    ) -> Result<Response<wire::MutationDrained>, Status> {
+        cutover::drain_mutations(self, request).await
+    }
+
+    async fn release_mutation_drain(
+        &self,
+        request: Request<wire::MutationDrainRequest>,
+    ) -> Result<Response<wire::MutationDrained>, Status> {
+        cutover::release_mutation_drain(self, request)
+    }
+
     type GetSmallContentStream = ContentStream;
     type GetCompleteSourceStream = ContentStream;
     type GetShardStream = ContentStream;
@@ -266,6 +286,7 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
         &self,
         mut request: Request<wire::TypedMutationRequest>,
     ) -> Result<Response<wire::AuthzRealmMutationApplied>, Status> {
+        let _permit = self.cutover_admission.enter_continuation()?;
         let peer = request.get_ref().peer.clone();
         self.authorize(&mut request, peer.as_ref(), PeerRpcKind::DataPlane)?;
         require_typed_bound(&request.get_ref().mutation_json)?;
@@ -293,6 +314,7 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
         &self,
         mut request: Request<wire::TypedMutationRequest>,
     ) -> Result<Response<wire::ReferenceDeltaApplied>, Status> {
+        let _permit = self.cutover_admission.enter_continuation()?;
         let peer = request.get_ref().peer.clone();
         let peer = self.authorize(&mut request, peer.as_ref(), PeerRpcKind::DataPlane)?;
         require_typed_bound(&request.get_ref().mutation_json)?;
@@ -1281,6 +1303,12 @@ mod tests {
             };
         }
 
+        let d = || wire::MutationDrainRequest {
+            peer: Some(peer.clone()),
+            handoff: None,
+        };
+        require_denied!(client.drain_mutations(d()), "DrainMutations");
+        require_denied!(client.release_mutation_drain(d()), "ReleaseMutationDrain");
         require_denied!(client.apply_object_mutation(typed()), "ApplyObjectMutation");
         require_denied!(
             client.read_object_path_snapshot(wire::ObjectPathSnapshotRequest {
@@ -1509,7 +1537,7 @@ mod tests {
             "InstallPayloadLifecycle"
         );
         assert_eq!(
-            denied, 38,
+            denied, 40,
             "the DataPeer RPC list changed without updating this test"
         );
     }
@@ -1816,6 +1844,9 @@ mod tests {
             .await
             .unwrap();
 
+        let (source_address, source_shutdown, source_server) =
+            start_server(client_id.clone(), pins.clone(), source_store.clone()).await;
+        let source_address = source_address.to_string();
         let (address, shutdown, server) =
             start_server(server_id, pins.clone(), destination.clone()).await;
         let address = address.to_string();
@@ -1826,13 +1857,28 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(
+            transport
+                .copy_complete_source(NodeId(2), &source_address, NodeId(1), &address, &reference,)
+                .await
+                .unwrap(),
+            CompleteCopySealOutcome::Created
+        );
+        assert_eq!(
+            transport
+                .copy_complete_source(NodeId(2), &source_address, NodeId(1), &address, &reference,)
+                .await
+                .unwrap(),
+            CompleteCopySealOutcome::AlreadyPresent
+        );
+
         let source_reader = source_store.open_blob(&reference).await.unwrap();
         assert_eq!(
             transport
                 .put_complete_source(NodeId(1), &address, &reference, source_reader)
                 .await
                 .unwrap(),
-            CompleteCopySealOutcome::Created
+            CompleteCopySealOutcome::AlreadyPresent
         );
         let retry_reader = source_store.open_blob(&reference).await.unwrap();
         assert_eq!(
@@ -1932,6 +1978,8 @@ mod tests {
 
         let _ = shutdown.send(());
         server.await.unwrap();
+        let _ = source_shutdown.send(());
+        source_server.await.unwrap();
         drop(destination);
         let reopened = Store::open(StoreOptions::new(&destination_root, 1))
             .await
