@@ -6,6 +6,13 @@ x-anvil-environment: &anvil-environment
   ANVIL_GATEWAY_LISTEN: 0.0.0.0:50053
   ANVIL_PEER_LISTEN: 0.0.0.0:50052
   ANVIL_TOKEN_SIGNING_KEY_FILE: /run/secrets/anvil-token-signing-key
+  # Qualification starts a fresh CLI process for each operation, so every
+  # operation performs a credential exchange. Keep production defaults out of
+  # the way while the rate limiter itself remains covered by focused tests.
+  ANVIL_RATE_LIMIT_CREDENTIAL_GLOBAL_PER_MINUTE: "6000"
+  ANVIL_RATE_LIMIT_CREDENTIAL_GLOBAL_BURST: "1000"
+  ANVIL_RATE_LIMIT_CREDENTIAL_CLIENT_PER_MINUTE: "600"
+  ANVIL_RATE_LIMIT_CREDENTIAL_CLIENT_BURST: "100"
   ANVIL_ERASURE_DATA_SHARDS: "2"
   ANVIL_ERASURE_PARITY_SHARDS: "1"
 

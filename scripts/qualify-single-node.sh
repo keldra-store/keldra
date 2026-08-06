@@ -100,6 +100,10 @@ docker run --detach \
   --env ANVIL_DATA_DIR=/var/lib/anvil \
   --env ANVIL_NODE_ID=1 \
   --env ANVIL_TOKEN_SIGNING_KEY_FILE=/run/secrets/anvil-token-signing-key \
+  --env ANVIL_RATE_LIMIT_CREDENTIAL_GLOBAL_PER_MINUTE=6000 \
+  --env ANVIL_RATE_LIMIT_CREDENTIAL_GLOBAL_BURST=1000 \
+  --env ANVIL_RATE_LIMIT_CREDENTIAL_CLIENT_PER_MINUTE=600 \
+  --env ANVIL_RATE_LIMIT_CREDENTIAL_CLIENT_BURST=100 \
   --env ANVIL_RUN_SYSTEM_BOOTSTRAP=true \
   --volume "${data_dir}:/var/lib/anvil" \
   --volume "${signing_key}:/run/secrets/anvil-token-signing-key:ro" \
@@ -271,6 +275,10 @@ run_large_object_qualification() {
     fi
     sleep 1
   done
+  grpc_endpoint="$(published_endpoint 50051 gRPC)"
+  gateway_endpoint="$(published_endpoint 50053 gateway)"
+  export ANVIL_SINGLE_QUALIFICATION_GRPC_ENDPOINT="${grpc_endpoint}"
+  export ANVIL_SINGLE_QUALIFICATION_GATEWAY_ENDPOINT="${gateway_endpoint}"
   "${command[@]}" get "${tenant}" "${bucket}" fixtures/large.bin \
     --output /tmp/anvil-large-after-restart.bin
   docker cp "${container_name}:/tmp/anvil-large-after-restart.bin" "${after_restart}"
