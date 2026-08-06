@@ -433,6 +433,7 @@ impl Store {
                     reference_deltas: mutation.reference_deltas.clone(),
                     accounting_transition: Some(stage_accounting_transition(stage)),
                 }],
+                LocalReferenceEffects::Deferred,
             )
             .map_err(program_mutation_error)?;
         }

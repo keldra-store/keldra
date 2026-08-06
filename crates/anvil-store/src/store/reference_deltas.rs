@@ -105,8 +105,12 @@ impl Store {
             cursor_key,
             request.through.to_be_bytes(),
         );
-        self.stage_local_changes(&mut batch, &lifecycle_changes)
-            .map_err(ReferenceDeltaError::from)?;
+        self.stage_local_changes(
+            &mut batch,
+            &lifecycle_changes,
+            LocalReferenceEffects::Deferred,
+        )
+        .map_err(ReferenceDeltaError::from)?;
         let mut options = WriteOptions::default();
         options.set_sync(self.sync_writes);
         self.db
@@ -141,6 +145,20 @@ impl Store {
             ReferenceDeltaError::Storage("reference-delta cursor is malformed".into())
         })?;
         Ok(u64::from_be_bytes(bytes))
+    }
+
+    pub(crate) fn stage_reference_delta_cursor(
+        &self,
+        batch: &mut WriteBatch,
+        source: SourceId,
+        through: u64,
+    ) -> Result<(), MutationError> {
+        batch.put_cf(
+            self.cf(CF_METADATA)?,
+            reference_cursor_key(source),
+            through.to_be_bytes(),
+        );
+        Ok(())
     }
 }
 

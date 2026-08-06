@@ -16,6 +16,44 @@ impl Store {
         governance: ObjectMutationGovernance,
         context: ObjectMutationContext,
     ) -> Result<CoordinatedRetainedVersionDelete, MutationError> {
+        self.coordinate_retained_version_delete_inner(
+            key,
+            version_id,
+            governance,
+            context,
+            LocalReferenceEffects::Deferred,
+        )
+        .await
+    }
+
+    /// Select and commit a retained-version deletion whose reference effect is
+    /// applied on this same node. The cluster layer must select this explicit
+    /// entrypoint only for the one-node topology.
+    pub async fn coordinate_local_retained_version_delete(
+        &self,
+        key: &ObjectKey,
+        version_id: VersionId,
+        governance: ObjectMutationGovernance,
+        context: ObjectMutationContext,
+    ) -> Result<CoordinatedRetainedVersionDelete, MutationError> {
+        self.coordinate_retained_version_delete_inner(
+            key,
+            version_id,
+            governance,
+            context,
+            LocalReferenceEffects::AppliedInline,
+        )
+        .await
+    }
+
+    async fn coordinate_retained_version_delete_inner(
+        &self,
+        key: &ObjectKey,
+        version_id: VersionId,
+        governance: ObjectMutationGovernance,
+        context: ObjectMutationContext,
+        reference_effects: LocalReferenceEffects,
+    ) -> Result<CoordinatedRetainedVersionDelete, MutationError> {
         governance.validate()?;
         if governance.versioning != ObjectVersioning::Enabled {
             return Err(MutationError::ObjectVersioningNotEnabled);
@@ -106,6 +144,19 @@ impl Store {
         mutation.validate()?;
 
         let mut batch = WriteBatch::default();
+        if reference_effects == LocalReferenceEffects::AppliedInline
+            && let Some(reference) = mutation.target.blob.as_ref()
+        {
+            let mut pending_references = PendingBlobReferences::new();
+            let (reference_key, state) =
+                self.prepare_blob_reference_retirement(reference, &pending_references, now)?;
+            self.stage_blob_reference_update(
+                &mut batch,
+                &mut pending_references,
+                reference_key,
+                state,
+            )?;
+        }
         self.stage_retained_version_delete(&mut batch, &mutation)?;
         self.stage_local_changes(
             &mut batch,
@@ -127,8 +178,11 @@ impl Store {
                     AccountingHeadTransition::new(None, None)
                 }),
             }],
+            reference_effects,
         )?;
-        self.stage_retained_version_delete_reference_proof(&mut batch, &mutation)?;
+        if reference_effects == LocalReferenceEffects::Deferred {
+            self.stage_retained_version_delete_reference_proof(&mut batch, &mutation)?;
+        }
         self.write_retained_version_delete(batch)?;
         if let Some(replacement) = mutation.replacement_tombstone.as_ref() {
             self.clock.observe(replacement.id);
@@ -404,5 +458,87 @@ mod tests {
                 .export_object_path_record(tenant_id, bucket_id, key().path())
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn local_delete_applies_its_reference_effect_and_cursor_atomically() {
+        let (_source_dir, source) = open(1).await;
+        source
+            .enable_bucket_versioning("tenant", "bucket")
+            .await
+            .unwrap();
+        let first = source
+            .put(put(b"first", PutMode::PutIfAbsent, "first"))
+            .await
+            .unwrap();
+        source
+            .put(put(
+                b"second",
+                PutMode::PutIfVersion(first.version),
+                "second",
+            ))
+            .await
+            .unwrap();
+        let first_version = source
+            .version_metadata(&key(), first.version)
+            .unwrap()
+            .unwrap();
+        let first_blob = first_version.blob.unwrap();
+        assert_eq!(
+            source
+                .blob_reference_state(&first_blob)
+                .unwrap()
+                .unwrap()
+                .ref_count,
+            1
+        );
+        let (tenant_id, bucket_id) = source.resolve_bucket_ids("tenant", "bucket").unwrap();
+        let governance = ObjectMutationGovernance {
+            tenant_id,
+            bucket_id,
+            versioning: ObjectVersioning::Enabled,
+            policy: BucketPolicy::default(),
+        };
+        let context = ObjectMutationContext {
+            active_placement_log_id: PlacementLogId { term: 4, index: 9 },
+            serving_fence_term: 4,
+        };
+        let before = source.db.latest_sequence_number();
+
+        let coordinated = source
+            .coordinate_local_retained_version_delete(&key(), first.version, governance, context)
+            .await
+            .unwrap();
+
+        let mutation = coordinated.mutation.unwrap();
+        assert_eq!(
+            source
+                .blob_reference_state(&first_blob)
+                .unwrap()
+                .unwrap()
+                .ref_count,
+            0
+        );
+        assert!(
+            source
+                .read_reference_proof(
+                    mutation.stamp.source_id,
+                    mutation.stamp.source_journal_position,
+                )
+                .unwrap()
+                .is_none()
+        );
+        let journal = source.local_watch_status().unwrap();
+        assert_eq!(
+            source.reference_delta_cursor(journal.source_id).unwrap(),
+            journal.tail
+        );
+        let batches = source
+            .db
+            .get_updates_since(before)
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(batches.len(), 1);
     }
 }

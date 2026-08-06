@@ -323,6 +323,11 @@ async fn ordinary_blob_plane_attests_executor_local_durability() {
         store.head(&counter_key).unwrap().unwrap().version
     );
     let journal_tail_before_replay = store.local_invalidation_offset().unwrap();
+    let journal = store.local_watch_status().unwrap();
+    assert_eq!(
+        store.reference_delta_cursor(journal.source_id).unwrap(),
+        journal.tail
+    );
 
     // Recovery of an already-finalized commit must not append a duplicate
     // invalidation. The compact commit marker, head and journal move together in

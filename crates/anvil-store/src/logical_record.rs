@@ -20,8 +20,8 @@ use crate::key::{
 };
 use crate::store::{
     CF_AUTHZ_SCHEMAS, CF_BUCKET_OPTIONS, CF_CREDENTIALS, CF_METADATA, CF_NAMES, CF_POLICIES,
-    PendingLocalChange, VERSION_HIGH_WATERMARK_KEY, decode_object_versioning,
-    encode_object_versioning,
+    LocalReferenceEffects, PendingLocalChange, VERSION_HIGH_WATERMARK_KEY,
+    decode_object_versioning, encode_object_versioning,
 };
 use crate::{
     AggregateKind, AuthzRevision, AuthzStoreLimits, BucketPolicy, MutationError, ObjectKey,
@@ -731,8 +731,12 @@ impl Store {
             );
         }
         if let Some(change) = change {
-            self.stage_local_changes(&mut batch, std::slice::from_ref(change))
-                .map_err(storage)?;
+            self.stage_local_changes(
+                &mut batch,
+                std::slice::from_ref(change),
+                LocalReferenceEffects::NoReferenceEffects,
+            )
+            .map_err(storage)?;
         }
         let mut options = WriteOptions::default();
         options.set_sync(self.sync_writes);

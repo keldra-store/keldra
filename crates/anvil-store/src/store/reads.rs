@@ -534,7 +534,7 @@ impl Store {
         if let Some(head_change) = head_change {
             changes.push(head_change);
         }
-        self.stage_local_changes(&mut batch, &changes)?;
+        self.stage_local_changes(&mut batch, &changes, LocalReferenceEffects::AppliedInline)?;
         let mut options = WriteOptions::default();
         options.set_sync(self.sync_writes);
         self.db.write_opt(batch, &options).map_err(storage_error)?;

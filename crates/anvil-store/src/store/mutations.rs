@@ -207,7 +207,11 @@ impl Store {
             if receipt_status != initial_receipt_status {
                 self.stage_mutation_receipt_status(&mut batch, receipt_status)?;
             }
-            self.stage_local_changes(&mut batch, &pending_changes)?;
+            self.stage_local_changes(
+                &mut batch,
+                &pending_changes,
+                LocalReferenceEffects::AppliedInline,
+            )?;
             if let Some(high_watermark) = batch_high_watermark {
                 batch.put_cf(
                     self.cf(CF_METADATA)?,
@@ -441,6 +445,7 @@ impl Store {
                     reference_deltas: evaluated.reference_deltas.clone(),
                     accounting_transition: evaluated.accounting_transition,
                 }],
+                LocalReferenceEffects::Deferred,
             )?;
             batch.put_cf(
                 self.cf(CF_METADATA)?,
@@ -665,6 +670,7 @@ impl Store {
         &self,
         batch: &mut WriteBatch,
         changes: &[PendingLocalChange],
+        reference_effects: LocalReferenceEffects,
     ) -> Result<(), MutationError> {
         if changes.is_empty() {
             return Ok(());
@@ -676,6 +682,41 @@ impl Store {
             .local_watch_status()
             .map_err(|error| MutationError::Storage(error.to_string()))?;
         let old_tail = status.tail;
+        let cursor = self
+            .reference_delta_cursor(status.source_id)
+            .map_err(|error| {
+                MutationError::Storage(format!(
+                    "cannot read local reference cursor before source-journal append: {error}"
+                ))
+            })?;
+        if cursor > old_tail {
+            return Err(MutationError::Storage(format!(
+                "local reference cursor {cursor} is ahead of source-journal tail {old_tail}"
+            )));
+        }
+        let local_reference_cursor = match reference_effects {
+            LocalReferenceEffects::AppliedInline => {
+                if cursor != old_tail {
+                    return Err(MutationError::Storage(format!(
+                        "local reference cursor {cursor} does not match source-journal tail {old_tail}"
+                    )));
+                }
+                Some(status.source_id)
+            }
+            LocalReferenceEffects::NoReferenceEffects => {
+                if changes
+                    .iter()
+                    .any(PendingLocalChange::has_reference_effects)
+                {
+                    return Err(MutationError::Storage(
+                        "source-journal append declared no reference effects but carried a reference delta"
+                            .into(),
+                    ));
+                }
+                (cursor == old_tail).then_some(status.source_id)
+            }
+            LocalReferenceEffects::Deferred => None,
+        };
         let safe_through = self
             .source_journal_safe_through
             .load(std::sync::atomic::Ordering::Acquire);
@@ -815,6 +856,9 @@ impl Store {
             LOCAL_INVALIDATION_BYTES_KEY,
             status.retained_bytes.to_be_bytes(),
         );
+        if let Some(source) = local_reference_cursor {
+            self.stage_reference_delta_cursor(batch, source, status.tail)?;
+        }
         Ok(())
     }
 

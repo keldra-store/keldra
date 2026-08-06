@@ -333,9 +333,10 @@ async fn bulk_wal_contains_one_high_watermark_and_replay_adds_no_write() {
     updates[0].1.iterate_cf(&mut counter);
     // Three small raw values, blob lifecycle records, versions, heads, receipts,
     // receipt-expiry indexes and invalidations, plus one version watermark,
-    // four watch counters and two receipt counters. All metadata moves in
-    // this one physical batch rather than once per mutation.
-    assert_eq!(counter.puts, 28);
+    // four watch counters, the locally-applied reference cursor and two
+    // receipt counters. All metadata moves in this one physical batch rather
+    // than once per mutation.
+    assert_eq!(counter.puts, 29);
     assert_eq!(counter.high_watermark_puts, 1);
     assert_eq!(counter.invalidation_metadata_puts, 4);
     assert_eq!(counter.receipt_metadata_puts, 2);
@@ -1011,6 +1012,11 @@ async fn bulk_publishes_identical_large_payloads_in_one_rocksdb_batch() {
     let state = store.blob_reference_state(&reference).unwrap().unwrap();
     assert_eq!(state.ref_count, 2);
     assert_eq!(state.flags, 0);
+    let journal = store.local_watch_status().unwrap();
+    assert_eq!(
+        store.reference_delta_cursor(journal.source_id).unwrap(),
+        journal.tail
+    );
 
     drop(store);
     let reopened = Store::open(StoreOptions::new(temporary.path(), 1))
@@ -1022,6 +1028,43 @@ async fn bulk_publishes_identical_large_payloads_in_one_rocksdb_batch() {
             bytes
         );
     }
+}
+
+#[tokio::test]
+async fn locally_applied_reference_effect_and_source_cursor_share_one_batch() {
+    let (_temporary, store) = store().await;
+    store.resolve_bucket_identity("tenant", "bucket").unwrap();
+    let bytes = vec![0x35; SMALL_BLOB_MAX_BYTES + 1];
+    let reference = blob_reference_for_bytes(&bytes);
+    let before = store.db.latest_sequence_number();
+
+    store
+        .put(put("cursor", &bytes, Precondition::Absent, "cursor-write"))
+        .await
+        .unwrap();
+
+    let batches = store
+        .db
+        .get_updates_since(before)
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    // The complete payload file is sealed before the one metadata commit;
+    // object publication, count, journal entry and cursor are one WAL batch.
+    assert_eq!(batches.len(), 1);
+    assert_eq!(
+        store
+            .blob_reference_state(&reference)
+            .unwrap()
+            .unwrap()
+            .ref_count,
+        1
+    );
+    let journal = store.local_watch_status().unwrap();
+    assert_eq!(
+        store.reference_delta_cursor(journal.source_id).unwrap(),
+        journal.tail
+    );
 }
 
 #[tokio::test]

@@ -13,8 +13,8 @@ use thiserror::Error;
 
 use crate::key::BucketIdentity;
 use crate::store::{
-    CF_HEADS, CF_METADATA, CF_VERSIONS, PendingBlobReferences, PendingLocalChange,
-    VERSION_HIGH_WATERMARK_KEY, is_program_definition_path, now_unix_millis,
+    CF_HEADS, CF_METADATA, CF_VERSIONS, LocalReferenceEffects, PendingBlobReferences,
+    PendingLocalChange, VERSION_HIGH_WATERMARK_KEY, is_program_definition_path, now_unix_millis,
     version_blob_reference, version_key,
 };
 use crate::{
@@ -1279,7 +1279,7 @@ impl Store {
             )
             .map_err(program_mutation_error)?;
         }
-        self.stage_local_changes(&mut batch, &changes)
+        self.stage_local_changes(&mut batch, &changes, LocalReferenceEffects::AppliedInline)
             .map_err(program_mutation_error)?;
         let allocated_high = record.writes.iter().map(|write| write.version.id).max();
         if let Some(allocated) = allocated_high {

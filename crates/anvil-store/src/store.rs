@@ -162,6 +162,34 @@ pub(crate) enum PendingLocalChange {
     },
 }
 
+/// Declares whether the reference effects carried by a source-journal append
+/// were applied by the same RocksDB batch. Keeping this explicit prevents the
+/// storage kernel from guessing whether its caller selected the one-node or
+/// distributed mutation path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LocalReferenceEffects {
+    AppliedInline,
+    NoReferenceEffects,
+    Deferred,
+}
+
+impl PendingLocalChange {
+    fn has_reference_effects(&self) -> bool {
+        match self {
+            Self::ObjectHead {
+                reference_deltas, ..
+            }
+            | Self::RetainedVersionDeleted {
+                reference_deltas, ..
+            }
+            | Self::ContentLifecycleChanged {
+                reference_deltas, ..
+            } => !reference_deltas.is_empty(),
+            Self::AggregateChanged { .. } => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct StoreOptions {
     pub root: PathBuf,

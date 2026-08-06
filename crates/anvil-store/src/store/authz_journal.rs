@@ -198,6 +198,7 @@ impl Store {
                 aggregate_key,
                 revision,
             }],
+            LocalReferenceEffects::NoReferenceEffects,
         )
         .map_err(|error| AuthzStoreError::Storage(error.to_string()))?;
         repository.write(batch)?;
@@ -223,6 +224,7 @@ impl Store {
                 aggregate_key,
                 revision,
             }],
+            LocalReferenceEffects::NoReferenceEffects,
         )
         .map_err(|error| AuthzStoreError::Storage(error.to_string()))
     }

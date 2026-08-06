@@ -147,6 +147,7 @@ impl Store {
                     revision: now_unix_millis,
                     reference_deltas: Vec::new(),
                 }],
+                LocalReferenceEffects::NoReferenceEffects,
             )?;
             let mut options = WriteOptions::default();
             options.set_sync(self.sync_writes);
@@ -341,6 +342,7 @@ impl Store {
                 revision: next.updated_at,
                 reference_deltas: Vec::new(),
             }],
+            LocalReferenceEffects::NoReferenceEffects,
         )?;
         let mut options = WriteOptions::default();
         options.set_sync(self.sync_writes);
@@ -388,6 +390,7 @@ impl Store {
                 revision: state.updated_at,
                 reference_deltas: Vec::new(),
             }],
+            LocalReferenceEffects::NoReferenceEffects,
         )?;
         let mut options = WriteOptions::default();
         options.set_sync(self.sync_writes);
