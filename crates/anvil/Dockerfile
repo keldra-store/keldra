@@ -54,7 +54,6 @@ COPY --from=builder /usr/local/anvil-build/anvil-server /usr/local/bin/anvil-ser
 COPY --from=builder /usr/local/anvil-build/anvil /usr/local/bin/anvil
 
 ENV ANVIL_LISTEN=0.0.0.0:50051 \
-    ANVIL_GATEWAY_LISTEN=0.0.0.0:50053 \
     ANVIL_DATA_DIR=/var/lib/anvil \
     ANVIL_NODE_ID=1 \
     ANVIL_TOKEN_SIGNING_KEY_FILE=/run/secrets/anvil-token-signing-key \
@@ -72,7 +71,7 @@ WORKDIR /var/lib/anvil
 # Mount a distinct mode-0600 signing key at the configured path. On the first
 # start only, set ANVIL_RUN_SYSTEM_BOOTSTRAP=true and then copy and delete the
 # generated /var/lib/anvil/system-bootstrap-credential.json file.
-# Public gRPC and cluster-managed mTLS peer transport, respectively.
-EXPOSE 50051 50052 50053
+# Public gRPC, S3 and Git share 50051. Cluster-managed mTLS peers use 50052.
+EXPOSE 50051 50052
 
 CMD ["anvil-server"]

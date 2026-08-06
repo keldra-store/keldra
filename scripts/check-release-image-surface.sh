@@ -71,6 +71,18 @@ fi
 
 grep -Fq 'FROM --platform=$TARGETPLATFORM rust:1.96-trixie AS builder' crates/anvil/Dockerfile
 grep -Fq 'FROM --platform=$TARGETPLATFORM debian:trixie-slim' crates/anvil/Dockerfile
-grep -Fq 'EXPOSE 50051 50052' crates/anvil/Dockerfile
+grep -Fxq 'EXPOSE 50051 50052' crates/anvil/Dockerfile
+if grep -REn 'ANVIL_GATEWAY_LISTEN|50053' \
+  crates/anvil/src \
+  crates/anvil/Dockerfile \
+  crates/anvil/docker-compose.yml \
+  tests/cluster/docker-compose.yml \
+  scripts/qualify-single-node.sh \
+  scripts/qualify-three-node.sh \
+  README.md
+then
+  echo "release deployment and qualification surfaces must use one public port" >&2
+  exit 1
+fi
 grep -Fq -- '--file crates/anvil/Dockerfile' scripts/build-image.sh
 grep -Fq -- '--file crates/anvil/Dockerfile' "${release_workflow}"

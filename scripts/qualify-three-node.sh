@@ -4,8 +4,8 @@ set -Eeuo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 compose_file="${repo_root}/tests/cluster/docker-compose.yml"
 start_node="${repo_root}/tests/cluster/start-node.sh"
-requested_image="${ANVIL_IMAGE:-anvil:0.5.4}"
-legacy_image=ghcr.io/worka-ai/anvil:0.5.3
+requested_image="${ANVIL_IMAGE:-anvil:0.5.5}"
+legacy_image=ghcr.io/worka-ai/anvil:0.5.4
 
 case "${ANVIL_DOCKER_PLATFORM:-}" in
   "")
@@ -43,12 +43,12 @@ image_id="$("${repo_root}/scripts/resolve-docker-image-id.sh" "${requested_image
 docker pull --platform "${ANVIL_DOCKER_PLATFORM}" "${legacy_image}" >/dev/null
 legacy_image_id="$("${repo_root}/scripts/resolve-docker-image-id.sh" "${legacy_image}")"
 if [[ "${legacy_image_id}" == "${image_id}" ]]; then
-  echo "candidate image resolves to the released 0.5.3 image" >&2
+  echo "candidate image resolves to the released 0.5.4 image" >&2
   exit 2
 fi
 export ANVIL_IMAGE="${legacy_image_id}"
-export ANVIL_QUALIFICATION_PROJECT="${ANVIL_QUALIFICATION_PROJECT:-anvil-v054-${$}}"
-export ANVIL_QUALIFICATION_DIR="$(mktemp -d /tmp/anvil-v054-qualification.XXXXXX)"
+export ANVIL_QUALIFICATION_PROJECT="${ANVIL_QUALIFICATION_PROJECT:-anvil-v055-${$}}"
+export ANVIL_QUALIFICATION_DIR="$(mktemp -d /tmp/anvil-v055-qualification.XXXXXX)"
 export ANVIL_QUALIFICATION_START_NODE="${start_node}"
 keep="${ANVIL_QUALIFICATION_KEEP:-0}"
 
@@ -88,7 +88,7 @@ cleanup() {
     echo "[anvil-qualification] retained files ${ANVIL_QUALIFICATION_DIR}" >&2
   else
     compose down --volumes --remove-orphans >/dev/null 2>&1 || true
-    if [[ "${ANVIL_QUALIFICATION_DIR}" == /tmp/anvil-v054-qualification.* ]]; then
+    if [[ "${ANVIL_QUALIFICATION_DIR}" == /tmp/anvil-v055-qualification.* ]]; then
       docker run --rm --user 0 \
         --volume "${ANVIL_QUALIFICATION_DIR}:/qualification" \
         "${image_id}" rm -rf \
@@ -136,7 +136,7 @@ docker run --rm --user 0 \
 
 compose config --quiet
 compose up --detach anvil-1
-require_service_image anvil-1 "${legacy_image_id}" "public 0.5.3"
+require_service_image anvil-1 "${legacy_image_id}" "public 0.5.4"
 
 network="${ANVIL_QUALIFICATION_PROJECT}_default"
 
@@ -298,9 +298,9 @@ run_git_qualification() {
   local authenticated_clone="${git_root}/authenticated-clone"
   local denied_clone="${git_root}/denied-clone"
   local public_clone="${git_root}/public-clone"
-  local push_url="${gateway_endpoints[0]}/git/${tenant}/${bucket}/qualification.git"
-  local authenticated_clone_url="${gateway_endpoints[1]}/git/${tenant}/${bucket}/qualification.git"
-  local public_clone_url="${gateway_endpoints[2]}/git/${tenant}/${bucket}/qualification.git"
+  local push_url="${public_endpoints[0]}/git/${tenant}/${bucket}/qualification.git"
+  local authenticated_clone_url="${public_endpoints[1]}/git/${tenant}/${bucket}/qualification.git"
+  local public_clone_url="${public_endpoints[2]}/git/${tenant}/${bucket}/qualification.git"
   local authorization
 
   provision_tenant "${tenant}" "${client_id}" "${client_secret}"
@@ -435,10 +435,10 @@ restore_shard() {
     mv -- "${path}.qualification-away" "${path}"
 }
 
-# Begin with the exact public 0.5.3 server and the same node-1 data directory
+# Begin with the exact public 0.5.4 server and the same node-1 data directory
 # that the candidate will grow. This keeps legacy reconciliation and online ADD
 # in one qualification instead of proving them in unrelated installations.
-printf 'public-0.5.3-object\n' \
+printf 'public-0.5.4-object\n' \
   >"${ANVIL_QUALIFICATION_DIR}/artifacts/legacy-before-growth.txt"
 chmod 0444 "${ANVIL_QUALIFICATION_DIR}/artifacts/legacy-before-growth.txt"
 run_cli anvil-1 qprobe-client "${qprobe_secret}" \
@@ -453,7 +453,7 @@ run_cli anvil-1 qprobe-client "${qprobe_secret}" \
     --output /qualification/artifacts/legacy-before-growth-read.txt
 cmp "${ANVIL_QUALIFICATION_DIR}/artifacts/legacy-before-growth.txt" \
   "${ANVIL_QUALIFICATION_DIR}/artifacts/legacy-before-growth-read.txt"
-echo "[anvil-qualification] exact public 0.5.3 node created and read the legacy object"
+echo "[anvil-qualification] exact public 0.5.4 node created and read the legacy object"
 
 export ANVIL_IMAGE="${image_id}"
 compose up --detach --force-recreate anvil-1
@@ -466,7 +466,7 @@ run_cli anvil-1 qprobe-client "${qprobe_secret}" \
 cmp "${ANVIL_QUALIFICATION_DIR}/artifacts/legacy-before-growth.txt" \
   "${ANVIL_QUALIFICATION_DIR}/artifacts/legacy-before-growth-read.txt"
 require_qprobe_head anvil-1 legacy/before-growth.txt "${legacy_head}"
-echo "[anvil-qualification] candidate recovered the same 0.5.3 node-1 data directory"
+echo "[anvil-qualification] candidate recovered the same 0.5.4 node-1 data directory"
 
 # Exercise the exact online growth path with a payload that cannot use the
 # inline RocksDB representation. The object is created before either joining
@@ -672,16 +672,7 @@ echo "[anvil-qualification] distributed PersonalDB qualification passed"
 
 s3_secret=qualification-s3-secret-00000000000000000000000000
 provision_tenant qs3 qs3-client "${s3_secret}"
-gateway_endpoints=()
-for s3_node in anvil-1 anvil-2 anvil-3; do
-  published="$(compose port "${s3_node}" 50053)"
-  if [[ ! "${published}" =~ ^127\.0\.0\.1:([1-9][0-9]*)$ ]]; then
-    echo "${s3_node} returned an invalid loopback gateway endpoint: ${published}" >&2
-    exit 1
-  fi
-  gateway_endpoints+=("http://${published}")
-done
-ANVIL_S3_QUALIFICATION_ENDPOINTS="$(IFS=,; echo "${gateway_endpoints[*]}")" \
+ANVIL_S3_QUALIFICATION_ENDPOINTS="$(IFS=,; echo "${public_endpoints[*]}")" \
 ANVIL_S3_QUALIFICATION_CLIENT_ID=qs3-client \
 ANVIL_S3_QUALIFICATION_CLIENT_SECRET="${s3_secret}" \
 ANVIL_S3_QUALIFICATION_BUCKET="s3-three-${$}" \

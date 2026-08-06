@@ -301,8 +301,9 @@ in an application-owned manifest.
 
 ## S3 gateway surface in 0.5.3
 
-The optional S3-compatible HTTP listener implements path-style CreateBucket,
-HeadBucket, PutObject, GetObject, HeadObject, DeleteObject and ListObjectsV2.
+The shared public listener implements path-style CreateBucket, HeadBucket,
+PutObject, GetObject, HeadObject, DeleteObject and ListObjectsV2 alongside the
+native gRPC API.
 It does not yet implement ListBuckets, DeleteBucket, multipart upload, copy,
 delimiter/common-prefix grouping, presigned query authentication, virtual-host
 bucket routing, object tags, ACLs, lifecycle configuration or website APIs.
@@ -330,7 +331,7 @@ reported as unsupported rather than accepting unbound payload bytes.
 
 ## Git smart HTTP gateway in 0.5.3
 
-The shared HTTP listener supports Git smart HTTP push and pull at
+The shared public listener supports Git smart HTTP push and pull at
 `/git/{tenant}/{bucket}/{repository}.git`. Basic authentication exchanges the
 application client ID and secret through Anvil's normal credential path;
 Bearer authentication accepts a normal Anvil access token. Pulls may omit

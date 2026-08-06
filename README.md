@@ -23,6 +23,7 @@ rendezvous hashing.
 | Rust client | 0.5.2 | Credential exchange, authenticated clients, streaming upload helpers, and the complete generated gRPC API |
 | PersonalDB, public reads, accounting, S3 and Git | 0.5.3 | Protocol-native PersonalDB groups and projections, authorized usage aggregates, opt-in anonymous reads, and standard S3/Git gateways |
 | Online cluster growth | 0.5.4 | Large objects use complete replicas below the configured erasure width, then move online to the fixed erasure profile as nodes join |
+| Shared public listener | 0.5.5 | Native gRPC, S3, Git, and administrative APIs share one authorized public endpoint; peer mTLS remains isolated |
 | Java client | — | TODO |
 | Python client | — | TODO |
 | Node.js client | — | TODO |
@@ -42,7 +43,7 @@ repository are required.
 ### 1. Start a development node
 
 ```sh
-export ANVIL_IMAGE=ghcr.io/worka-ai/anvil:0.5.4
+export ANVIL_IMAGE=ghcr.io/worka-ai/anvil:0.5.5
 export ANVIL_TOKEN_SIGNING_KEY_FILE="$PWD/anvil-data/token-signing-key"
 
 mkdir -p anvil-data
@@ -154,7 +155,7 @@ Zanzibar-authorized object addressed by `(tenant, bucket, path)`.
 ## Use the Rust client
 
 ```sh
-cargo add anvil-storage@0.5.4
+cargo add anvil-storage@0.5.5
 cargo add tokio --features macros,rt-multi-thread
 ```
 
@@ -229,7 +230,7 @@ Zanzibar-authorized independently of ordinary object traffic.
 Add the public client and canonical protocol types:
 
 ```sh
-cargo add anvil-storage@0.5.4 personaldb-protocol@0.2.2 serde_json
+cargo add anvil-storage@0.5.5 personaldb-protocol@0.2.2 serde_json
 ```
 
 Use the same application credential created above to create a source group and
@@ -350,10 +351,10 @@ The complete enable, traffic, convergence, and disable flow is executable in
 
 ## Use the S3 endpoint
 
-The HTTP gateway on port `50053` accepts standard SigV4 path-style requests.
-Use an Anvil application `client_id` as the AWS access-key ID and its
-`client_secret` as the AWS secret-access key; Zanzibar still decides what that
-application may do.
+The public endpoint on port `50051` accepts both native gRPC and standard
+SigV4 path-style S3 requests. Use an Anvil application `client_id` as the AWS
+access-key ID and its `client_secret` as the AWS secret-access key; Zanzibar
+still decides what that application may do.
 
 With the AWS CLI installed, the owner application created above can exercise
 the minimum S3 surface directly:
@@ -362,7 +363,7 @@ the minimum S3 surface directly:
 export AWS_ACCESS_KEY_ID=example-client
 export AWS_SECRET_ACCESS_KEY="$ANVIL_OWNER_SECRET"
 export AWS_DEFAULT_REGION=eu-west-2
-export ANVIL_S3_ENDPOINT=http://127.0.0.1:50053
+export ANVIL_S3_ENDPOINT=http://127.0.0.1:50051
 
 aws --endpoint-url "$ANVIL_S3_ENDPOINT" s3api create-bucket \
   --bucket s3-demo
@@ -382,13 +383,13 @@ aws --endpoint-url "$ANVIL_S3_ENDPOINT" s3api delete-object \
 ```
 
 The same endpoint works with the official AWS SDKs. The Rust SDK qualification
-uses one or three public gateways and verifies every returned byte in
+uses one or three public endpoints and verifies every returned byte in
 [`crates/anvil/examples/s3_qualification.rs`](crates/anvil/examples/s3_qualification.rs).
 
 ## Push and clone Git repositories
 
 Anvil serves Git's smart HTTP protocol at
-`/git/<tenant>/<bucket>/<repository>.git` on the same port `50053` gateway.
+`/git/<tenant>/<bucket>/<repository>.git` on the same public port `50051`.
 The first authenticated push creates the repository; subsequent pushes use CAS
 when publishing its ordinary Anvil bundle object. Basic authentication accepts
 the same application client ID and secret used by the gRPC and S3 APIs.
@@ -402,7 +403,7 @@ printf '# Stored in Anvil\n' > anvil-data/git-demo/README.md
 git -C anvil-data/git-demo add README.md
 git -C anvil-data/git-demo commit -m initial
 
-export ANVIL_GIT_URL=http://127.0.0.1:50053/git/example/objects/demo.git
+export ANVIL_GIT_URL=http://127.0.0.1:50051/git/example/objects/demo.git
 export ANVIL_GIT_AUTH="$(printf '%s:%s' example-client "$ANVIL_OWNER_SECRET" | base64 | tr -d '\n')"
 git -C anvil-data/git-demo \
   -c "http.extraHeader=Authorization: Basic $ANVIL_GIT_AUTH" \
@@ -613,7 +614,7 @@ bundles, establishes peer mTLS, exercises replicated and erasure-coded storage,
 queries every index type, and performs a rolling restart:
 
 ```sh
-ANVIL_IMAGE=ghcr.io/worka-ai/anvil:0.5.4 \
+ANVIL_IMAGE=ghcr.io/worka-ai/anvil:0.5.5 \
   ./scripts/qualify-three-node.sh
 ```
 

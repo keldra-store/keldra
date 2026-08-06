@@ -1,10 +1,9 @@
 services:
   anvil:
-    image: ${ANVIL_IMAGE:-anvil:0.5.4}
+    image: ${ANVIL_IMAGE:-anvil:0.5.5}
     environment:
       RUST_LOG: ${RUST_LOG:-info}
       ANVIL_LISTEN: 0.0.0.0:50051
-      ANVIL_GATEWAY_LISTEN: 0.0.0.0:50053
       ANVIL_DATA_DIR: /var/lib/anvil
       ANVIL_NODE_ID: ${ANVIL_NODE_ID:-1}
       ANVIL_TOKEN_SIGNING_KEY_FILE: /run/secrets/anvil-token-signing-key
@@ -19,7 +18,6 @@ services:
       ANVIL_WATCH_MAX_BYTES: ${ANVIL_WATCH_MAX_BYTES:-536870912}
     ports:
       - "50051:50051"
-      - "50053:50053"
     volumes:
       - anvil_data:/var/lib/anvil
       - ${ANVIL_TOKEN_SIGNING_KEY_FILE:?ANVIL_TOKEN_SIGNING_KEY_FILE must name a mode-0600 file}:/run/secrets/anvil-token-signing-key:ro

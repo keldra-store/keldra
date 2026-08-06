@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-requested_image="${ANVIL_IMAGE:-anvil:0.5.4}"
+requested_image="${ANVIL_IMAGE:-anvil:0.5.5}"
 keep="${ANVIL_QUALIFICATION_KEEP:-0}"
 
 case "${ANVIL_DOCKER_PLATFORM:-}" in
@@ -37,9 +37,9 @@ command -v git >/dev/null 2>&1 || {
 }
 
 image_id="$("${repo_root}/scripts/resolve-docker-image-id.sh" "${requested_image}")"
-qualification_dir="$(mktemp -d /tmp/anvil-v054-single-qualification.XXXXXX)"
+qualification_dir="$(mktemp -d /tmp/anvil-v055-single-qualification.XXXXXX)"
 qualification_suffix="${qualification_dir##*.}"
-container_name="anvil-v054-single-${qualification_suffix}"
+container_name="anvil-v055-single-${qualification_suffix}"
 data_dir="${qualification_dir}/data"
 signing_key="${qualification_dir}/token-signing-key"
 container_started=0
@@ -62,7 +62,7 @@ cleanup() {
   if ((container_started == 1)); then
     docker rm --force "${container_name}" >/dev/null 2>&1 || true
   fi
-  if [[ "${qualification_dir}" == /tmp/anvil-v054-single-qualification.* ]]; then
+  if [[ "${qualification_dir}" == /tmp/anvil-v055-single-qualification.* ]]; then
     docker run --rm --user 0 \
       --volume "${qualification_dir}:/qualification" \
       "${image_id}" rm -rf \
@@ -92,10 +92,8 @@ docker run --detach \
   --name "${container_name}" \
   --platform "${platform}" \
   --publish 127.0.0.1::50051 \
-  --publish 127.0.0.1::50053 \
   --env RUST_LOG="${RUST_LOG:-info}" \
   --env ANVIL_LISTEN=0.0.0.0:50051 \
-  --env ANVIL_GATEWAY_LISTEN=0.0.0.0:50053 \
   --env ANVIL_PEER_LISTEN=127.0.0.1:50052 \
   --env ANVIL_DATA_DIR=/var/lib/anvil \
   --env ANVIL_NODE_ID=1 \
@@ -173,7 +171,7 @@ published_endpoint() {
 }
 
 run_public_read_qualification() {
-  ANVIL_PUBLIC_QUALIFICATION_ENDPOINTS="${grpc_endpoint}" \
+  ANVIL_PUBLIC_QUALIFICATION_ENDPOINTS="${public_endpoint}" \
   ANVIL_PUBLIC_QUALIFICATION_TENANT="${tenant}" \
   ANVIL_PUBLIC_QUALIFICATION_BUCKET=single-public-read \
   ANVIL_PUBLIC_QUALIFICATION_CLIENT_ID="${owner_client}" \
@@ -185,7 +183,7 @@ run_public_read_qualification() {
 }
 
 run_index_qualification() {
-  ANVIL_INDEX_QUALIFICATION_ENDPOINTS="${grpc_endpoint}" \
+  ANVIL_INDEX_QUALIFICATION_ENDPOINTS="${public_endpoint}" \
   ANVIL_INDEX_QUALIFICATION_TENANT="${tenant}" \
   ANVIL_INDEX_QUALIFICATION_CLIENT_ID="${owner_client}" \
   ANVIL_INDEX_QUALIFICATION_CLIENT_SECRET="${owner_secret}" \
@@ -196,7 +194,7 @@ run_index_qualification() {
 }
 
 run_accounting_qualification() {
-  ANVIL_ACCOUNTING_QUALIFICATION_ENDPOINTS="${grpc_endpoint}" \
+  ANVIL_ACCOUNTING_QUALIFICATION_ENDPOINTS="${public_endpoint}" \
   ANVIL_ACCOUNTING_QUALIFICATION_TENANT="${tenant}" \
   ANVIL_ACCOUNTING_QUALIFICATION_BUCKET="single-accounting-${$}" \
   ANVIL_ACCOUNTING_QUALIFICATION_CLIENT_ID="${owner_client}" \
@@ -208,7 +206,7 @@ run_accounting_qualification() {
 }
 
 run_personaldb_qualification() {
-  ANVIL_PERSONALDB_QUALIFICATION_ENDPOINTS="${grpc_endpoint}" \
+  ANVIL_PERSONALDB_QUALIFICATION_ENDPOINTS="${public_endpoint}" \
   ANVIL_PERSONALDB_QUALIFICATION_TENANT="${tenant}" \
   ANVIL_PERSONALDB_QUALIFICATION_CLIENT_ID="${owner_client}" \
   ANVIL_PERSONALDB_QUALIFICATION_CLIENT_SECRET="${owner_secret}" \
@@ -275,10 +273,7 @@ run_large_object_qualification() {
     fi
     sleep 1
   done
-  grpc_endpoint="$(published_endpoint 50051 gRPC)"
-  gateway_endpoint="$(published_endpoint 50053 gateway)"
-  export ANVIL_SINGLE_QUALIFICATION_GRPC_ENDPOINT="${grpc_endpoint}"
-  export ANVIL_SINGLE_QUALIFICATION_GATEWAY_ENDPOINT="${gateway_endpoint}"
+  public_endpoint="$(published_endpoint 50051 public)"
   "${command[@]}" get "${tenant}" "${bucket}" fixtures/large.bin \
     --output /tmp/anvil-large-after-restart.bin
   docker cp "${container_name}:/tmp/anvil-large-after-restart.bin" "${after_restart}"
@@ -291,7 +286,7 @@ run_large_object_qualification() {
 }
 
 run_s3_qualification() {
-  ANVIL_S3_QUALIFICATION_ENDPOINTS="${gateway_endpoint}" \
+  ANVIL_S3_QUALIFICATION_ENDPOINTS="${public_endpoint}" \
   ANVIL_S3_QUALIFICATION_CLIENT_ID="${s3_client}" \
   ANVIL_S3_QUALIFICATION_CLIENT_SECRET="${s3_secret}" \
   ANVIL_S3_QUALIFICATION_BUCKET="s3-single-${$}" \
@@ -308,7 +303,7 @@ run_git_qualification() {
   local authenticated_clone="${git_root}/authenticated-clone"
   local denied_clone="${git_root}/denied-clone"
   local public_clone="${git_root}/public-clone"
-  local git_url="${gateway_endpoint}/git/${tenant}/${bucket}/qualification.git"
+  local git_url="${public_endpoint}/git/${tenant}/${bucket}/qualification.git"
   local authorization
 
   docker exec \
@@ -368,12 +363,9 @@ s3_client=qsingle-s3-client
 s3_secret=qualification-single-s3-secret-000000000000000000000
 provision_owner "${s3_tenant}" "${s3_app}" "${s3_client}" "${s3_secret}"
 
-grpc_endpoint="$(published_endpoint 50051 gRPC)"
-gateway_endpoint="$(published_endpoint 50053 gateway)"
-export ANVIL_SINGLE_QUALIFICATION_GRPC_ENDPOINT="${grpc_endpoint}"
-export ANVIL_SINGLE_QUALIFICATION_GATEWAY_ENDPOINT="${gateway_endpoint}"
+public_endpoint="$(published_endpoint 50051 public)"
 
-echo "[anvil-single-qualification] node ready gRPC=${grpc_endpoint} gateway=${gateway_endpoint}"
+echo "[anvil-single-qualification] node ready public=${public_endpoint}"
 run_large_object_qualification
 run_public_read_qualification
 run_index_qualification

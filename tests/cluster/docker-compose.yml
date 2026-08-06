@@ -1,9 +1,8 @@
-name: ${ANVIL_QUALIFICATION_PROJECT:-anvil-v054-qualification}
+name: ${ANVIL_QUALIFICATION_PROJECT:-anvil-v055-qualification}
 
 x-anvil-environment: &anvil-environment
   RUST_LOG: ${RUST_LOG:-info}
   ANVIL_LISTEN: 0.0.0.0:50051
-  ANVIL_GATEWAY_LISTEN: 0.0.0.0:50053
   ANVIL_PEER_LISTEN: 0.0.0.0:50052
   ANVIL_TOKEN_SIGNING_KEY_FILE: /run/secrets/anvil-token-signing-key
   # Qualification starts a fresh CLI process for each operation, so every
@@ -21,11 +20,10 @@ x-anvil-service: &anvil-service
   platform: ${ANVIL_DOCKER_PLATFORM:-linux/amd64}
   restart: "no"
   stop_grace_period: 30s
-  # Random loopback ports let the test-only Rust qualification client exercise
-  # every public ingress without exposing a fixed host port.
+  # One random loopback port exercises gRPC, S3 and Git through the shared
+  # public listener without exposing a fixed host port.
   ports:
     - "127.0.0.1::50051"
-    - "127.0.0.1::50053"
 
 services:
   anvil-1:
