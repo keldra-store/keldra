@@ -8,7 +8,7 @@ clients.
 ## Install
 
 ```sh
-cargo add anvil-storage@0.5.4
+cargo add anvil-storage@0.5.5
 cargo add tokio --features macros,rt-multi-thread
 ```
 
