@@ -1,7 +1,12 @@
 
 target/
 .git/
+.idea/
+.DS_Store
+**/.DS_Store
 anvil-data/
+**/anvil-data/
+docs/decisions/*.local.md
 clients/python/
 clients/typescript/
 tmp/

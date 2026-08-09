@@ -21,7 +21,7 @@ WORKDIR /usr/src/anvil
 
 COPY . .
 
-# Build the 0.5 server and CLI in release mode. BuildKit cache mounts keep
+# Build the 0.6 server and CLI in release mode. BuildKit cache mounts keep
 # Cargo's registry, git checkout cache, and target directory outside the image
 # layer so repeat local/CI Docker builds reuse compiled dependencies.
 RUN --mount=type=cache,id=anvil-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
@@ -47,11 +47,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd --uid 10001 --no-create-home --home-dir /var/lib/anvil --shell /usr/sbin/nologin anvil \
-    && install -d -o anvil -g anvil /var/lib/anvil
+    && install -d -o anvil -g anvil /var/lib/anvil \
+    && install -d /usr/share/doc/anvil
 
 # Copy the compiled binaries from the builder stage.
 COPY --from=builder /usr/local/anvil-build/anvil-server /usr/local/bin/anvil-server
 COPY --from=builder /usr/local/anvil-build/anvil /usr/local/bin/anvil
+COPY --from=builder /usr/src/anvil/LICENSE /usr/share/doc/anvil/LICENSE
+COPY --from=builder /usr/src/anvil/docs/dependency-licenses.md /usr/share/doc/anvil/dependency-licenses.md
 
 ENV ANVIL_LISTEN=0.0.0.0:50051 \
     ANVIL_DATA_DIR=/var/lib/anvil \

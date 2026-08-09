@@ -61,6 +61,21 @@ if [[ -e crates/anvil/Dockerfile.prebuilt ]]; then
   exit 1
 fi
 
+for excluded_context in \
+  '.git/' \
+  '.idea/' \
+  '.DS_Store' \
+  '**/.DS_Store' \
+  '**/anvil-data/' \
+  'docs/decisions/*.local.md' \
+  'tmp/'
+do
+  if ! grep -Fxq -- "${excluded_context}" .dockerignore; then
+    echo "Docker build context may include private local state: ${excluded_context}" >&2
+    exit 1
+  fi
+done
+
 if grep -REn \
   'Dockerfile\.prebuilt|cargo-zigbuild|zigbuild|tmp/docker-bin|ANVIL_ZIG_TARGET|ANVIL_USE_NATIVE_CARGO|ANVIL_RUNTIME_BASE' \
   .github/workflows scripts/build-image.sh README.md .dockerignore crates/anvil/build-and-run.sh
