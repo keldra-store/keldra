@@ -10,7 +10,7 @@
 
 ## Workspace
 
-All workspace packages currently share version `0.5.5`:
+All workspace packages currently share version `0.6.0`:
 
 - server, CLI, and Rust client: `anvil-server`, `anvil-storage-cli`, and
   `anvil-storage`;
@@ -18,12 +18,12 @@ All workspace packages currently share version `0.5.5`:
   `anvil-consensus`, `anvil-index`, and `anvil-store`;
 - qualification tooling: `anvil-osv-qualification`.
 
-Anvil 0.5.5 runs as one flat cluster of capacity-weighted nodes with native
+Anvil 0.6.0 runs as one flat cluster of capacity-weighted nodes with native
 on-disk state, cluster-managed mTLS between peers, cluster-wide derived
-indexes, and no external metadata database, external PKI, or second storage
-system. It includes PersonalDB, accounting, S3 and Git gateways, and online
-growth from one node to the configured erasure width. Native gRPC, S3, Git,
-and administrative APIs share one authorized public listener.
+streaming indexes, and no external metadata database, external PKI, or second
+storage system. It includes PersonalDB, accounting, S3 and Git gateways, and
+online growth from one node to the configured erasure width. Native gRPC, S3,
+Git, and administrative APIs share one authorized public listener.
 
 ## Local Validation
 
@@ -59,12 +59,12 @@ Before a release, repeat the image build and smoke test with
 ## Release
 
 The release tag must be the exact, unprefixed workspace version. After the
-validated commit is pushed, maintainers publish `0.5.5` with:
+validated commit is pushed, maintainers publish `0.6.0` with:
 
 ```sh
 validated_commit="$(git rev-parse HEAD)"
-git tag 0.5.5 "$validated_commit"
-git push origin refs/tags/0.5.5
+git tag 0.6.0 "$validated_commit"
+git push origin refs/tags/0.6.0
 ```
 
 The tag-triggered workflow reruns the static, Rust, and per-architecture image

@@ -59,7 +59,7 @@ jobs:
           printf 'tag=%s\ncommit=%s\n' "$tag" "$commit" >>"$GITHUB_OUTPUT"
 
   validate:
-    name: Validate Anvil 0.5 release
+    name: Validate Anvil 0.6 release
     needs: release-context
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -99,9 +99,9 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-          key: ${{ runner.os }}-release-cargo-v05-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-release-cargo-v06-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-release-cargo-v05-
+            ${{ runner.os }}-release-cargo-v06-
 
       - name: Run static gates
         run: ./scripts/release-gates.sh static
@@ -210,7 +210,7 @@ jobs:
           fi
 
   publish:
-    name: Publish Anvil 0.5 image and release
+    name: Publish Anvil 0.6 image and release
     needs: [release-context, validate, build-image]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -298,9 +298,12 @@ jobs:
           generate_release_notes: true
           make_latest: true
           body: |
-            Anvil 0.5.5 serves native gRPC, S3, Git, and administrative APIs
-            through one authorized public listener while keeping peer mTLS on
-            its dedicated internal listener.
+            Anvil 0.6.0 replaces corpus-sized index rebuilds with bounded
+            streaming immutable runs, `sux`-based merged structures, lazy
+            materialization, and one shared memory budget per index kind.
+
+            Index format 2 is a clean break: existing source objects remain
+            authoritative, while index definitions are recreated and rebuilt.
 
             - Image: `${{ steps.image.outputs.image }}`
             - Manifest digest: `${{ steps.image.outputs.digest }}`

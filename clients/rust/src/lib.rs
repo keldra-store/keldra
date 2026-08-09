@@ -1,4 +1,4 @@
-//! Authenticated Rust client for Anvil 0.5 object storage.
+//! Authenticated Rust client for Anvil 0.6 object storage.
 //!
 //! The crate provides ready-to-use object, authorization, administration, and
 //! PersonalDB clients, upload helpers, and the complete generated protocol surface.

@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing 0.5 release tag to publish
+        description: Existing 0.6 release tag to publish
         required: true
         type: string
       expected_commit:
@@ -31,7 +31,7 @@ concurrency:
 
 jobs:
   publish:
-    name: Resume 0.5 publication from validated image
+    name: Resume 0.6 publication from validated image
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -89,7 +89,7 @@ jobs:
           )"
           required_jobs=(
             'Resolve immutable release context'
-            'Validate Anvil 0.5 release'
+            'Validate Anvil 0.6 release'
             'Build release image (linux/amd64)'
             'Build release image (linux/arm64)'
           )
@@ -146,9 +146,12 @@ jobs:
           generate_release_notes: true
           make_latest: true
           body: |
-            Anvil 0.5.5 serves native gRPC, S3, Git, and administrative APIs
-            through one authorized public listener while keeping peer mTLS on
-            its dedicated internal listener.
+            Anvil 0.6.0 replaces corpus-sized index rebuilds with bounded
+            streaming immutable runs, `sux`-based merged structures, lazy
+            materialization, and one shared memory budget per index kind.
+
+            Index format 2 is a clean break: existing source objects remain
+            authoritative, while index definitions are recreated and rebuilt.
 
             - Image: `${{ steps.image.outputs.image }}`
             - Manifest digest: `${{ steps.image.outputs.digest }}`

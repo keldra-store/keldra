@@ -49,15 +49,15 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-          key: ${{ runner.os }}-cargo-v05-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-v06-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-v05-
+            ${{ runner.os }}-cargo-v06-
 
       - name: Run static release gates
         run: ./scripts/release-gates.sh static
 
   rust:
-    name: Anvil 0.5 workspace tests
+    name: Anvil 0.6 workspace tests
     needs: static
     runs-on: ubuntu-24.04
     timeout-minutes: 90
@@ -91,9 +91,9 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-          key: ${{ runner.os }}-cargo-v05-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-v06-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-v05-
+            ${{ runner.os }}-cargo-v06-
 
       - name: Run workspace tests
         run: ./scripts/release-gates.sh rust
@@ -126,7 +126,7 @@ jobs:
       - name: Build image
         run: ./scripts/build-image.sh
 
-      - name: Smoke image through the 0.5 gRPC API
+      - name: Smoke image through the 0.6 gRPC API
         run: ./scripts/release-gates.sh image
 
       - name: Remove local image

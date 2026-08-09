@@ -1,4 +1,4 @@
-name: ${ANVIL_QUALIFICATION_PROJECT:-anvil-v055-qualification}
+name: ${ANVIL_QUALIFICATION_PROJECT:-anvil-v060-qualification}
 
 x-anvil-environment: &anvil-environment
   RUST_LOG: ${RUST_LOG:-info}

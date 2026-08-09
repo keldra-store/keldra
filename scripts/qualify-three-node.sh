@@ -4,8 +4,7 @@ set -Eeuo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 compose_file="${repo_root}/tests/cluster/docker-compose.yml"
 start_node="${repo_root}/tests/cluster/start-node.sh"
-requested_image="${ANVIL_IMAGE:-anvil:0.5.5}"
-legacy_image=ghcr.io/worka-ai/anvil:0.5.4
+requested_image="${ANVIL_IMAGE:-anvil:0.6.0}"
 
 case "${ANVIL_DOCKER_PLATFORM:-}" in
   "")
@@ -40,15 +39,24 @@ command -v git >/dev/null 2>&1 || {
 docker compose version >/dev/null
 
 image_id="$("${repo_root}/scripts/resolve-docker-image-id.sh" "${requested_image}")"
-docker pull --platform "${ANVIL_DOCKER_PLATFORM}" "${legacy_image}" >/dev/null
-legacy_image_id="$("${repo_root}/scripts/resolve-docker-image-id.sh" "${legacy_image}")"
-if [[ "${legacy_image_id}" == "${image_id}" ]]; then
-  echo "candidate image resolves to the released 0.5.4 image" >&2
+server_version="$(
+  docker run --rm --platform "${ANVIL_DOCKER_PLATFORM}" \
+    "${image_id}" anvil-server --version
+)"
+client_version="$(
+  docker run --rm --platform "${ANVIL_DOCKER_PLATFORM}" \
+    "${image_id}" anvil --version
+)"
+if [[ "${server_version}" != "anvil-server 0.6.0" \
+  || "${client_version}" != "anvil 0.6.0" ]]; then
+  echo "qualification requires the exact Anvil 0.6.0 image" >&2
+  echo "server: ${server_version}" >&2
+  echo "client: ${client_version}" >&2
   exit 2
 fi
-export ANVIL_IMAGE="${legacy_image_id}"
-export ANVIL_QUALIFICATION_PROJECT="${ANVIL_QUALIFICATION_PROJECT:-anvil-v055-${$}}"
-export ANVIL_QUALIFICATION_DIR="$(mktemp -d /tmp/anvil-v055-qualification.XXXXXX)"
+export ANVIL_IMAGE="${image_id}"
+export ANVIL_QUALIFICATION_PROJECT="${ANVIL_QUALIFICATION_PROJECT:-anvil-v060-${$}}"
+export ANVIL_QUALIFICATION_DIR="$(mktemp -d /var/tmp/anvil-v060-qualification.XXXXXX)"
 export ANVIL_QUALIFICATION_START_NODE="${start_node}"
 keep="${ANVIL_QUALIFICATION_KEEP:-0}"
 
@@ -88,7 +96,7 @@ cleanup() {
     echo "[anvil-qualification] retained files ${ANVIL_QUALIFICATION_DIR}" >&2
   else
     compose down --volumes --remove-orphans >/dev/null 2>&1 || true
-    if [[ "${ANVIL_QUALIFICATION_DIR}" == /tmp/anvil-v055-qualification.* ]]; then
+    if [[ "${ANVIL_QUALIFICATION_DIR}" == /var/tmp/anvil-v060-qualification.* ]]; then
       docker run --rm --user 0 \
         --volume "${ANVIL_QUALIFICATION_DIR}:/qualification" \
         "${image_id}" rm -rf \
@@ -136,7 +144,7 @@ docker run --rm --user 0 \
 
 compose config --quiet
 compose up --detach anvil-1
-require_service_image anvil-1 "${legacy_image_id}" "public 0.5.4"
+require_service_image anvil-1 "${image_id}" candidate
 
 network="${ANVIL_QUALIFICATION_PROJECT}_default"
 
@@ -353,7 +361,7 @@ require_qprobe_head() {
   actual="$(run_cli "${node}" qprobe-client "${qprobe_secret}" \
     head qprobe objects "${path}")"
   if [[ "${actual}" != "${expected}" ]]; then
-    echo "${node} changed the object head for ${path} during upgrade or cluster growth" >&2
+    echo "${node} changed the object head for ${path} during cluster growth" >&2
     echo "expected: ${expected}" >&2
     echo "actual:   ${actual}" >&2
     return 1
@@ -434,39 +442,6 @@ restore_shard() {
   compose exec -T --user 0 "${node}" \
     mv -- "${path}.qualification-away" "${path}"
 }
-
-# Begin with the exact public 0.5.4 server and the same node-1 data directory
-# that the candidate will grow. This keeps legacy reconciliation and online ADD
-# in one qualification instead of proving them in unrelated installations.
-printf 'public-0.5.4-object\n' \
-  >"${ANVIL_QUALIFICATION_DIR}/artifacts/legacy-before-growth.txt"
-chmod 0444 "${ANVIL_QUALIFICATION_DIR}/artifacts/legacy-before-growth.txt"
-run_cli anvil-1 qprobe-client "${qprobe_secret}" \
-  put qprobe objects legacy/before-growth.txt \
-    /qualification/artifacts/legacy-before-growth.txt \
-    --command-id qprobe-legacy-before-growth --durability local \
-    --if-absent >/dev/null
-legacy_head="$(run_cli anvil-1 qprobe-client "${qprobe_secret}" \
-  head qprobe objects legacy/before-growth.txt)"
-run_cli anvil-1 qprobe-client "${qprobe_secret}" \
-  get qprobe objects legacy/before-growth.txt \
-    --output /qualification/artifacts/legacy-before-growth-read.txt
-cmp "${ANVIL_QUALIFICATION_DIR}/artifacts/legacy-before-growth.txt" \
-  "${ANVIL_QUALIFICATION_DIR}/artifacts/legacy-before-growth-read.txt"
-echo "[anvil-qualification] exact public 0.5.4 node created and read the legacy object"
-
-export ANVIL_IMAGE="${image_id}"
-compose up --detach --force-recreate anvil-1
-require_service_image anvil-1 "${image_id}" candidate
-wait_for_node anvil-1
-rm -f "${ANVIL_QUALIFICATION_DIR}/artifacts/legacy-before-growth-read.txt"
-run_cli anvil-1 qprobe-client "${qprobe_secret}" \
-  get qprobe objects legacy/before-growth.txt \
-    --output /qualification/artifacts/legacy-before-growth-read.txt
-cmp "${ANVIL_QUALIFICATION_DIR}/artifacts/legacy-before-growth.txt" \
-  "${ANVIL_QUALIFICATION_DIR}/artifacts/legacy-before-growth-read.txt"
-require_qprobe_head anvil-1 legacy/before-growth.txt "${legacy_head}"
-echo "[anvil-qualification] candidate recovered the same 0.5.4 node-1 data directory"
 
 # Exercise the exact online growth path with a payload that cannot use the
 # inline RocksDB representation. The object is created before either joining

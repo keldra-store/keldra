@@ -10,5 +10,5 @@ export ANVIL_IMAGE="${ANVIL_IMAGE:-anvil:local}"
 ./scripts/build-image.sh
 docker compose -f crates/anvil/docker-compose.yml up --detach
 
-echo "Anvil 0.5 is starting on ${ANVIL_LISTEN:-0.0.0.0:50051}."
+echo "Anvil 0.6 is starting on ${ANVIL_LISTEN:-0.0.0.0:50051}."
 echo "Use 'docker compose -f crates/anvil/docker-compose.yml logs --follow' to inspect it."

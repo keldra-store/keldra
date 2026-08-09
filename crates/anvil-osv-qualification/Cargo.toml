@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Executable OSV import qualification for Anvil 0.5"
+description = "Executable OSV import qualification for Anvil 0.6"
 publish = false
 
 [dependencies]

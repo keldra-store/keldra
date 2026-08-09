@@ -1,6 +1,6 @@
 # anvil-api
 
-Generated Rust messages and gRPC clients for the Anvil 0.5 protocol.
+Generated Rust messages and gRPC clients for the Anvil 0.6 protocol.
 
 Most applications should depend on
 [`anvil-storage`](https://crates.io/crates/anvil-storage), which adds
