@@ -18,11 +18,12 @@ use crate::logical_record::decode_current_value;
 use crate::watch::{
     AggregateKind, InvalidationStateHint, LOCAL_INVALIDATION_BYTES_KEY,
     LOCAL_INVALIDATION_COUNT_KEY, LOCAL_INVALIDATION_EPOCH_KEY, LOCAL_INVALIDATION_FLOOR_KEY,
-    LOCAL_INVALIDATION_OFFSET_KEY, LOCAL_INVALIDATION_TOKEN_KEY, LocalChange, LocalInvalidation,
-    MAX_LOCAL_INVALIDATION_SCAN_RECORDS, ObjectHeadChangeKind, SourceId, StoredLocalChange,
-    WatchCursor, WatchError, WatchJournalStatus, WatchPage, WatchRetention, WatchScope, WatchStart,
-    decode_local_change, decode_resume_token, encode_local_change, encode_resume_token,
-    invalidation_key, invalidation_record_bytes, offset_from_key,
+    LOCAL_INVALIDATION_OFFSET_KEY, LOCAL_INVALIDATION_TOKEN_KEY, LocalChange, LocalChangePage,
+    LocalInvalidation, MAX_LOCAL_INVALIDATION_SCAN_RECORDS, ObjectHeadChangeKind,
+    OversizeLocalChange, SourceId, StoredLocalChange, WatchCursor, WatchError, WatchJournalStatus,
+    WatchPage, WatchRetention, WatchScope, WatchStart, decode_local_change, decode_resume_token,
+    encode_local_change, encode_resume_token, invalidation_key, invalidation_record_bytes,
+    offset_from_key,
 };
 use crate::{
     AWAITING_PUBLISH, AccountingHeadTransition, BatchOperation, BatchOutcome, BlobReader, BlobRef,
@@ -855,6 +856,7 @@ mod blob_references;
 mod delete_version;
 mod mutations;
 mod object_snapshot;
+mod object_snapshot_scan;
 mod payload;
 mod payload_handoff;
 mod reads;
@@ -867,6 +869,10 @@ pub use object_snapshot::{
     MAX_OBJECT_RECORD_EXPORT_BYTES, MAX_OBJECT_RECORD_EXPORT_RECORDS, ObjectPathSnapshot,
     ObjectRecordCursor, ObjectRecordExport, ObjectRecordExportPage, ObjectSnapshotApplied,
     ObjectSnapshotError,
+};
+pub use object_snapshot_scan::{
+    CurrentHeadCursor, CurrentObjectSnapshot, CurrentObjectSnapshotFrame,
+    CurrentObjectSnapshotPage, CurrentObjectSnapshotScan,
 };
 pub use payload::{
     CompleteCopySealOutcome, LocalPayloadPresence, PayloadArtifactState, PayloadStoreError,

@@ -38,6 +38,7 @@ mod mutation_admission;
 mod object_mutation;
 mod object_snapshot;
 mod retained_version_delete;
+mod source_journal;
 mod timeout;
 mod transport;
 mod typed_json;
@@ -368,55 +369,16 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
 
     async fn get_source_journal_status(
         &self,
-        mut request: Request<wire::SourceJournalStatusRequest>,
+        request: Request<wire::SourceJournalStatusRequest>,
     ) -> Result<Response<wire::SourceJournalStatus>, Status> {
-        let peer = request.get_ref().peer.clone();
-        self.authorize(&mut request, peer.as_ref(), PeerRpcKind::StateTransfer)?;
-        let metadata = request.metadata().clone();
-        let store = self.store.clone();
-        let status = self
-            .bounded(&metadata, async move {
-                tokio::task::spawn_blocking(move || store.local_watch_status())
-                    .await
-                    .map_err(|error| Status::internal(format!("join journal status: {error}")))?
-                    .map_err(|error| Status::failed_precondition(error.to_string()))
-            })
-            .await?;
-        Ok(Response::new(wire::SourceJournalStatus {
-            schema_version: DATA_PEER_SCHEMA_VERSION,
-            source_id_json: encode_typed(&status.source_id)?,
-            tail: status.tail,
-            retention_floor: status.retention_floor,
-            retained_entries: status.retained_entries,
-            retained_bytes: status.retained_bytes,
-        }))
+        source_journal::status(self, request).await
     }
 
     async fn read_source_journal(
         &self,
-        mut request: Request<wire::SourceJournalReadRequest>,
+        request: Request<wire::SourceJournalReadRequest>,
     ) -> Result<Response<wire::SourceJournalPage>, Status> {
-        let peer = request.get_ref().peer.clone();
-        self.authorize(&mut request, peer.as_ref(), PeerRpcKind::StateTransfer)?;
-        let after = request.get_ref().after_offset;
-        let limit = usize::try_from(request.get_ref().limit)
-            .unwrap_or(usize::MAX)
-            .min(MAX_LOCAL_INVALIDATION_SCAN_RECORDS);
-        let metadata = request.metadata().clone();
-        let store = self.store.clone();
-        let changes = self
-            .bounded(&metadata, async move {
-                tokio::task::spawn_blocking(move || store.scan_local_changes(after, limit))
-                    .await
-                    .map_err(|error| Status::internal(format!("join journal read: {error}")))?
-                    .map_err(map_mutation_error)
-            })
-            .await?;
-        let changes_json = encode_page(changes)?;
-        Ok(Response::new(wire::SourceJournalPage {
-            schema_version: DATA_PEER_SCHEMA_VERSION,
-            changes_json,
-        }))
+        source_journal::read(self, request).await
     }
 
     async fn small_content_exists(
@@ -1358,6 +1320,7 @@ mod tests {
                 peer: Some(peer.clone()),
                 after_offset: 0,
                 limit: 0,
+                max_bytes: 1,
             }),
             "ReadSourceJournal"
         );
@@ -1444,6 +1407,7 @@ mod tests {
                 handoff: None,
                 after_offset: 0,
                 limit: 0,
+                max_bytes: 1,
             }),
             "ReadHandoffSourceJournal"
         );
@@ -1608,11 +1572,23 @@ mod tests {
                 .unwrap(),
             0
         );
+        let journal = joining
+            .source_journal_status(NodeId(1), &address)
+            .await
+            .unwrap();
         assert!(
             joining
-                .read_source_journal(NodeId(1), &address, 0, 16)
+                .read_source_journal(
+                    NodeId(1),
+                    &address,
+                    journal.source_id,
+                    0,
+                    16,
+                    MAX_TYPED_MUTATION_BYTES as u64,
+                )
                 .await
                 .unwrap()
+                .changes
                 .is_empty()
         );
 

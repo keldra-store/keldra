@@ -667,7 +667,7 @@ impl Store {
     }
 }
 
-fn validate_limits(max_records: u32, max_bytes: u64) -> Result<(), ObjectSnapshotError> {
+pub(super) fn validate_limits(max_records: u32, max_bytes: u64) -> Result<(), ObjectSnapshotError> {
     if max_records == 0
         || max_records > MAX_OBJECT_RECORD_EXPORT_RECORDS
         || max_bytes == 0

@@ -328,6 +328,23 @@ pub enum LocalChange {
     ContentLifecycleChanged(ContentLifecycleChanged),
 }
 
+/// One source-local journal page admitted under an explicit encoded-byte cap.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalChangePage {
+    pub source_id: SourceId,
+    pub changes: Vec<LocalChange>,
+    pub encoded_bytes: u64,
+    /// Present only when the first unread record cannot fit by itself. The
+    /// record is not returned and the caller's cursor must not advance.
+    pub oversize: Option<OversizeLocalChange>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OversizeLocalChange {
+    pub offset: u64,
+    pub encoded_bytes: u64,
+}
+
 /// Exact object-mutation evidence copied to every complete metadata replica.
 ///
 /// This is not a second event stream or a commit marker. It is the bounded

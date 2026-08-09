@@ -314,6 +314,29 @@ impl Store {
         after_offset: u64,
         limit: usize,
     ) -> Result<Vec<LocalChange>, MutationError> {
+        Ok(self
+            .scan_local_changes_bounded(after_offset, limit, u64::MAX)?
+            .changes)
+    }
+
+    /// Scans source-local changes without retaining a page larger than the
+    /// caller's encoded-byte allowance.
+    ///
+    /// A nonempty prefix is returned when the following record would exceed
+    /// `max_bytes`. If the first unread record alone exceeds the bound, its
+    /// offset and required bytes are reported without returning or advancing
+    /// past that record.
+    pub fn scan_local_changes_bounded(
+        &self,
+        after_offset: u64,
+        limit: usize,
+        max_bytes: u64,
+    ) -> Result<LocalChangePage, MutationError> {
+        if max_bytes == 0 {
+            return Err(MutationError::Storage(
+                "local change scan byte limit must be positive".into(),
+            ));
+        }
         let status = self
             .local_watch_status()
             .map_err(|error| MutationError::Storage(error.to_string()))?;
@@ -331,7 +354,12 @@ impl Store {
         }
         let limit = limit.min(MAX_LOCAL_INVALIDATION_SCAN_RECORDS);
         if limit == 0 || after_offset == status.tail {
-            return Ok(Vec::new());
+            return Ok(LocalChangePage {
+                source_id: status.source_id,
+                changes: Vec::new(),
+                encoded_bytes: 0,
+                oversize: None,
+            });
         }
         let first_offset = after_offset + 1;
         let through = after_offset.saturating_add(limit as u64).min(status.tail);
@@ -343,6 +371,8 @@ impl Store {
             IteratorMode::From(&first_key, Direction::Forward),
         );
         let mut changes = Vec::with_capacity(expected_records);
+        let mut encoded_bytes = 0_u64;
+        let mut stopped_at_byte_limit = false;
         for entry in iterator.take(expected_records) {
             let (key, encoded) = entry.map_err(storage_error)?;
             let stored_offset = offset_from_key(&key)
@@ -359,15 +389,63 @@ impl Store {
                     "local change key does not match its stored offset".into(),
                 ));
             }
+            let change_bytes = encoded_change_len(&change)?;
+            let projected = encoded_bytes.checked_add(change_bytes).ok_or_else(|| {
+                MutationError::Storage("local change page length overflow".into())
+            })?;
+            if projected > max_bytes && changes.is_empty() {
+                return Ok(LocalChangePage {
+                    source_id: status.source_id,
+                    changes,
+                    encoded_bytes: 0,
+                    oversize: Some(OversizeLocalChange {
+                        offset: stored_offset,
+                        encoded_bytes: change_bytes,
+                    }),
+                });
+            }
+            if projected > max_bytes {
+                stopped_at_byte_limit = true;
+                break;
+            }
+            encoded_bytes = projected;
             changes.push(change);
         }
-        if changes.len() != expected_records {
+        if !stopped_at_byte_limit && changes.len() != expected_records {
             let missing = first_offset + changes.len() as u64;
             return Err(MutationError::Storage(format!(
                 "local change offset {missing} is missing"
             )));
         }
-        Ok(changes)
+        Ok(LocalChangePage {
+            source_id: status.source_id,
+            changes,
+            encoded_bytes,
+            oversize: None,
+        })
+    }
+}
+
+fn encoded_change_len(change: &LocalChange) -> Result<u64, MutationError> {
+    let mut counter = ChangeByteCounter(0);
+    serde_json::to_writer(&mut counter, change)
+        .map_err(|error| MutationError::Storage(format!("encode local change: {error}")))?;
+    Ok(counter.0)
+}
+
+struct ChangeByteCounter(u64);
+
+impl std::io::Write for ChangeByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| std::io::Error::other("local change length overflow"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -450,6 +528,72 @@ mod tests {
             error
                 .to_string()
                 .contains("local change offset 2 is missing")
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_local_change_scan_stops_before_the_next_record() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        for index in 1..=2 {
+            store
+                .put(PutRequest {
+                    key: ObjectKey::new("tenant", "bucket", format!("object-{index}")).unwrap(),
+                    bytes: vec![index],
+                    content_type: None,
+                    mode: PutMode::PutIfAbsent,
+                    command_id: Some(format!("bounded-put-{index}")),
+                    durability: Durability::Local,
+                })
+                .await
+                .unwrap();
+        }
+        let first = store.read_local_change(1).unwrap().unwrap();
+        let first_bytes = encoded_change_len(&first).unwrap();
+
+        let page = store.scan_local_changes_bounded(0, 2, first_bytes).unwrap();
+        assert_eq!(page.changes, vec![first]);
+        assert_eq!(page.encoded_bytes, first_bytes);
+        assert_eq!(page.oversize, None);
+
+        let second = store.scan_local_changes_bounded(1, 2, first_bytes).unwrap();
+        assert_eq!(second.changes.len(), 1);
+        assert_eq!(second.changes[0].offset(), 2);
+    }
+
+    #[tokio::test]
+    async fn bounded_local_change_scan_reports_one_oversize_record_without_returning_it() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        store
+            .put(PutRequest {
+                key: ObjectKey::new("tenant", "bucket", "oversize").unwrap(),
+                bytes: vec![1],
+                content_type: None,
+                mode: PutMode::PutIfAbsent,
+                command_id: Some("oversize-put".into()),
+                durability: Durability::Local,
+            })
+            .await
+            .unwrap();
+        let first = store.read_local_change(1).unwrap().unwrap();
+        let first_bytes = encoded_change_len(&first).unwrap();
+
+        let page = store
+            .scan_local_changes_bounded(0, 1, first_bytes - 1)
+            .unwrap();
+        assert!(page.changes.is_empty());
+        assert_eq!(page.encoded_bytes, 0);
+        assert_eq!(
+            page.oversize,
+            Some(OversizeLocalChange {
+                offset: 1,
+                encoded_bytes: first_bytes,
+            })
         );
     }
 

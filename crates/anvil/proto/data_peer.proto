@@ -117,11 +117,16 @@ message SourceJournalReadRequest {
   PeerContext peer = 1;
   uint64 after_offset = 2;
   uint32 limit = 3;
+  uint64 max_bytes = 4;
 }
 
 message SourceJournalPage {
   uint32 schema_version = 1;
   repeated bytes changes_json = 2;
+  uint64 encoded_bytes = 3;
+  uint64 oversize_offset = 4;
+  uint64 oversize_encoded_bytes = 5;
+  bytes source_id_json = 6;
 }
 
 message BlobIdentity {
@@ -320,6 +325,7 @@ message HandoffSourceJournalReadRequest {
   HandoffScope handoff = 2;
   uint64 after_offset = 3;
   uint32 limit = 4;
+  uint64 max_bytes = 5;
 }
 
 message HandoffReferenceCursorRequest {

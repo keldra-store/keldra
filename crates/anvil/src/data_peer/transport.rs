@@ -3,9 +3,9 @@
 use super::*;
 use anvil_store::{
     AuthzRealmCursor, AuthzRealmKeyPage, AuthzRealmTransferManifest, AuthzSchemaCatalogue,
-    AuthzScope, LogicalRecordCandidate, LogicalRecordCursor, LogicalRecordExport,
+    AuthzScope, LocalChangePage, LogicalRecordCandidate, LogicalRecordCursor, LogicalRecordExport,
     LogicalRecordExportPage, LogicalRecordId, ObjectRecordCursor, ObjectRecordExport,
-    ObjectRecordExportPage, PayloadArtifactCursor, PayloadArtifactSnapshot,
+    ObjectRecordExportPage, OversizeLocalChange, PayloadArtifactCursor, PayloadArtifactSnapshot,
     PayloadArtifactSnapshotPage, StorageTenantId,
 };
 use std::task::{Context, Poll};
@@ -300,9 +300,12 @@ impl DataPeerTransport {
         &self,
         target: NodeId,
         address: &str,
+        expected_source: SourceId,
         after_offset: u64,
         limit: usize,
-    ) -> Result<Vec<LocalChange>, Status> {
+        max_bytes: u64,
+    ) -> Result<LocalChangePage, Status> {
+        require_source_page_limit(max_bytes)?;
         let limit = u32::try_from(limit.min(MAX_LOCAL_INVALIDATION_SCAN_RECORDS))
             .expect("source journal limit fits u32");
         let response = self
@@ -311,15 +314,11 @@ impl DataPeerTransport {
                 peer: Some(self.context()),
                 after_offset,
                 limit,
+                max_bytes,
             })
             .await?
             .into_inner();
-        require_response_schema(response.schema_version)?;
-        response
-            .changes_json
-            .iter()
-            .map(|encoded| decode_typed(encoded))
-            .collect()
+        decode_source_journal_page(response, Some(expected_source), after_offset, max_bytes)
     }
 
     pub(crate) async fn small_content_exists(
@@ -822,15 +821,23 @@ impl DataPeerTransport {
                 handoff: Some(self.handoff()?),
                 after_offset,
                 limit,
+                max_bytes: MAX_TYPED_MUTATION_BYTES as u64,
             })
             .await?
             .into_inner();
-        require_response_schema(response.schema_version)?;
-        response
-            .changes_json
-            .iter()
-            .map(|encoded| decode_typed(encoded))
-            .collect()
+        let page = decode_source_journal_page(
+            response,
+            None,
+            after_offset,
+            MAX_TYPED_MUTATION_BYTES as u64,
+        )?;
+        if let Some(oversize) = page.oversize {
+            return Err(Status::resource_exhausted(format!(
+                "source journal record {} requires {} bytes",
+                oversize.offset, oversize.encoded_bytes
+            )));
+        }
+        Ok(page.changes)
     }
 
     pub(crate) async fn handoff_reference_cursor(
@@ -1284,6 +1291,89 @@ impl DataPeerTransport {
     }
 }
 
+fn require_source_page_limit(max_bytes: u64) -> Result<(), Status> {
+    if max_bytes == 0 || max_bytes > MAX_TYPED_MUTATION_BYTES as u64 {
+        return Err(Status::invalid_argument(
+            "source journal byte limit is outside the private peer bound",
+        ));
+    }
+    Ok(())
+}
+
+fn decode_source_journal_page(
+    response: wire::SourceJournalPage,
+    expected_source: Option<SourceId>,
+    after_offset: u64,
+    max_bytes: u64,
+) -> Result<LocalChangePage, Status> {
+    require_response_schema(response.schema_version)?;
+    require_source_page_limit(max_bytes)?;
+    let source_id: SourceId = decode_typed(&response.source_id_json)?;
+    if source_id.node_id == 0
+        || source_id.source_epoch == [0; 32]
+        || expected_source.is_some_and(|expected| expected != source_id)
+    {
+        return Err(Status::data_loss(
+            "source journal page came from another source epoch",
+        ));
+    }
+    let actual_bytes = response
+        .changes_json
+        .iter()
+        .try_fold(0_u64, |total, encoded| {
+            total.checked_add(encoded.len() as u64)
+        })
+        .ok_or_else(|| Status::data_loss("source journal page byte count overflow"))?;
+    if actual_bytes != response.encoded_bytes || actual_bytes > max_bytes {
+        return Err(Status::data_loss(
+            "source journal page exceeded or misstated its byte bound",
+        ));
+    }
+    let first_unread = after_offset
+        .checked_add(1)
+        .ok_or_else(|| Status::data_loss("source journal offset overflow"))?;
+    let oversize = match (response.oversize_offset, response.oversize_encoded_bytes) {
+        (0, 0) => None,
+        (offset, bytes)
+            if offset == first_unread
+                && bytes > max_bytes
+                && response.changes_json.is_empty()
+                && response.encoded_bytes == 0 =>
+        {
+            Some(OversizeLocalChange {
+                offset,
+                encoded_bytes: bytes,
+            })
+        }
+        _ => {
+            return Err(Status::data_loss(
+                "source journal oversize-record evidence is malformed",
+            ));
+        }
+    };
+    let changes = response
+        .changes_json
+        .iter()
+        .map(|encoded| decode_typed(encoded))
+        .collect::<Result<Vec<LocalChange>, _>>()?;
+    for (index, change) in changes.iter().enumerate() {
+        let expected = after_offset
+            .checked_add(index as u64 + 1)
+            .ok_or_else(|| Status::data_loss("source journal offset overflow"))?;
+        if change.offset() != expected {
+            return Err(Status::data_loss(
+                "source journal page offsets are not contiguous",
+            ));
+        }
+    }
+    Ok(LocalChangePage {
+        source_id,
+        changes,
+        encoded_bytes: response.encoded_bytes,
+        oversize,
+    })
+}
+
 #[derive(Clone, Copy)]
 enum HandoffInstallKind {
     Object,
@@ -1338,5 +1428,72 @@ impl Service<Uri> for DataPeerChannelConnector {
                 .await
                 .map(|peer| TokioIo::new(peer.stream))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use anvil_store::{ObjectHeadChange, ObjectHeadChangeKind, VersionId};
+
+    use super::*;
+
+    fn source() -> SourceId {
+        SourceId {
+            node_id: 2,
+            source_epoch: [7; 32],
+        }
+    }
+
+    fn change(offset: u64) -> LocalChange {
+        LocalChange::ObjectHead(ObjectHeadChange {
+            offset,
+            tenant_id: 3,
+            bucket_id: 4,
+            exact_path: format!("objects/{offset}"),
+            path_version: VersionId(offset),
+            kind: ObjectHeadChangeKind::Put,
+            reference_deltas: Vec::new(),
+            accounting_transition: None,
+        })
+    }
+
+    #[test]
+    fn peer_page_preserves_the_advertised_byte_bound_and_source_epoch() {
+        let encoded = encode_typed(&change(8)).unwrap();
+        let response = wire::SourceJournalPage {
+            schema_version: DATA_PEER_SCHEMA_VERSION,
+            encoded_bytes: encoded.len() as u64,
+            changes_json: vec![encoded],
+            oversize_offset: 0,
+            oversize_encoded_bytes: 0,
+            source_id_json: encode_typed(&source()).unwrap(),
+        };
+
+        let page = decode_source_journal_page(response, Some(source()), 7, 4096).unwrap();
+        assert_eq!(page.source_id, source());
+        assert_eq!(page.changes, vec![change(8)]);
+        assert!(page.oversize.is_none());
+    }
+
+    #[test]
+    fn peer_page_accepts_only_a_single_unreturned_oversize_record() {
+        let response = wire::SourceJournalPage {
+            schema_version: DATA_PEER_SCHEMA_VERSION,
+            changes_json: Vec::new(),
+            encoded_bytes: 0,
+            oversize_offset: 8,
+            oversize_encoded_bytes: 4097,
+            source_id_json: encode_typed(&source()).unwrap(),
+        };
+
+        let page = decode_source_journal_page(response, Some(source()), 7, 4096).unwrap();
+        assert_eq!(
+            page.oversize,
+            Some(OversizeLocalChange {
+                offset: 8,
+                encoded_bytes: 4097,
+            })
+        );
+        assert!(page.changes.is_empty());
     }
 }

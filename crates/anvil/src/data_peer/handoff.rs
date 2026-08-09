@@ -131,15 +131,16 @@ pub(super) async fn read_source_journal(
     let limit = usize::try_from(request.get_ref().limit)
         .unwrap_or(usize::MAX)
         .min(MAX_LOCAL_INVALIDATION_SCAN_RECORDS);
+    let max_bytes = request.get_ref().max_bytes;
+    source_journal::require_page_bound(max_bytes)?;
     let store = service.store.clone();
-    let changes = tokio::task::spawn_blocking(move || store.scan_local_changes(after, limit))
-        .await
-        .map_err(join_status)?
-        .map_err(map_mutation_error)?;
-    Ok(Response::new(wire::SourceJournalPage {
-        schema_version: DATA_PEER_SCHEMA_VERSION,
-        changes_json: encode_page(changes)?,
-    }))
+    let page = tokio::task::spawn_blocking(move || {
+        store.scan_local_changes_bounded(after, limit, max_bytes)
+    })
+    .await
+    .map_err(join_status)?
+    .map_err(map_mutation_error)?;
+    source_journal::encode_page_response(page)
 }
 
 pub(super) async fn reference_cursor(
