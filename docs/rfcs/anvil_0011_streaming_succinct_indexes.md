@@ -978,7 +978,9 @@ Using one three-node Docker Compose cluster and isolated tenants/buckets:
 - wait for the one HRW builder to consume every source journal;
 - create, page, mutate and query every kind through public endpoints;
 - verify Zanzibar denial, explicit public access and revocation;
-- verify published index artifacts use `REPLICATED` acknowledgement; and
+- verify published index artifacts use `REPLICATED` acknowledgement when at
+  least two ACTIVE nodes exist, and `LOCAL` acknowledgement on a one-node
+  cluster; and
 - perform a rolling restart while preserving complete published generations.
 
 Unit tests independently cover journal gaps, incomplete atomic barriers,
