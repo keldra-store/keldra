@@ -24,11 +24,12 @@ rendezvous hashing.
 | PersonalDB, public reads, accounting, S3 and Git | 0.5.3 | Protocol-native PersonalDB groups and projections, authorized usage aggregates, opt-in anonymous reads, and standard S3/Git gateways |
 | Online cluster growth | 0.5.4 | Large objects use complete replicas below the configured erasure width, then move online to the fixed erasure profile as nodes join |
 | Shared public listener | 0.5.5 | Native gRPC, S3, Git, and administrative APIs share one authorized public endpoint; peer mTLS remains isolated |
+| Streaming succinct indexes | 0.6.0 | Bounded per-kind construction memory, incremental immutable runs, streaming compaction, `sux`-based merged structures, and lazy block materialization |
 | Java client | — | TODO |
 | Python client | — | TODO |
 | Node.js client | — | TODO |
 | Ruby client | — | TODO |
-| Network plugins | — | Planned after 0.5.3 |
+| Network plugins | — | Planned |
 
 The published container is a single multi-platform image for Linux AMD64 and
 ARM64.
@@ -43,7 +44,7 @@ repository are required.
 ### 1. Start a development node
 
 ```sh
-export ANVIL_IMAGE=ghcr.io/worka-ai/anvil:0.5.5
+export ANVIL_IMAGE=ghcr.io/worka-ai/anvil:0.6.0
 export ANVIL_TOKEN_SIGNING_KEY_FILE="$PWD/anvil-data/token-signing-key"
 
 mkdir -p anvil-data
@@ -155,7 +156,7 @@ Zanzibar-authorized object addressed by `(tenant, bucket, path)`.
 ## Use the Rust client
 
 ```sh
-cargo add anvil-storage@0.5.5
+cargo add anvil-storage@0.6.0
 cargo add tokio --features macros,rt-multi-thread
 ```
 
@@ -230,7 +231,7 @@ Zanzibar-authorized independently of ordinary object traffic.
 Add the public client and canonical protocol types:
 
 ```sh
-cargo add anvil-storage@0.5.5 personaldb-protocol@0.2.2 serde_json
+cargo add anvil-storage@0.6.0 personaldb-protocol@0.2.2 serde_json
 ```
 
 Use the same application credential created above to create a source group and
@@ -469,6 +470,12 @@ explicitly granted that bucket policy. Supplying an invalid token remains an
 authentication error, and anonymous callers never bypass Zanzibar or gain
 write, index-management, or administration access.
 
+`QueryIndex` is the one index RPC that also accepts a missing bearer. An
+anonymous query must set `QueryIndexRequest.tenant`; an authenticated query may
+leave it empty because the signed token supplies the tenant. Supplying a tenant
+with an authenticated query never changes identity—it must match the token.
+Index creation, updates, discovery, and deletion always require credentials.
+
 ## Compare-and-swap and immutable data
 
 Anvil exposes separate operations so intent is visible in code:
@@ -509,11 +516,26 @@ executable in
 ## Create and query indexes
 
 Indexes are bucket-local definitions scoped by an optional path prefix and
-content type. One cluster writer consumes every node's ordered source journal,
-publishes immutable index generations through the ordinary object store, and
-up to three HRW-selected query replicas materialize them through a bounded
-cache. Query responses always include freshness evidence; a newly created or
-busy index may return a valid partial generation while it catches up.
+content type. Each definition's HRW-selected writer consumes every node's
+ordered source journal, flushes bounded immutable runs, compacts them as a
+stream into succinct merged structures, and publishes complete generations
+through the ordinary object store. Up to three HRW-selected query replicas
+materialize only the blocks a query needs through the shared bounded cache.
+Construction memory is capped per index kind across the whole process, so
+corpus size does not become builder heap. Query responses always include
+freshness evidence; while a new complete generation is building, Anvil
+continues serving the preceding complete generation rather than exposing a
+partial one.
+
+The startup default is 64 MiB of construction memory for each index kind,
+shared by every local definition of that kind, with four process-owned Rayon
+workers. Set `ANVIL_INDEX_BUILDER_MEMORY_BYTES_PER_KIND` and
+`ANVIL_INDEX_RAYON_WORKERS` (or the equivalent command-line flags) to fit the
+node. Cache limits remain separate: `ANVIL_INDEX_DISK_CACHE_BYTES` controls the
+shared disposable disk cache and `ANVIL_INDEX_MEMORY_PERCENT` caps aggregate
+in-flight block materialization. Immutable cache files are read through mmap,
+allowing the operating system to retain clean hot pages and reclaim them under
+pressure.
 
 Construct an authenticated index client from the same token used for objects:
 
@@ -593,6 +615,7 @@ let response = indexes.query_index(QueryIndexRequest {
     }),
     limit: 100,
     page_token: vec![],
+    tenant: String::new(), // inferred from the authenticated caller
 }).await?.into_inner();
 
 for hit in response.hits {
@@ -614,7 +637,7 @@ bundles, establishes peer mTLS, exercises replicated and erasure-coded storage,
 queries every index type, and performs a rolling restart:
 
 ```sh
-ANVIL_IMAGE=ghcr.io/worka-ai/anvil:0.5.5 \
+ANVIL_IMAGE=ghcr.io/worka-ai/anvil:0.6.0 \
   ./scripts/qualify-three-node.sh
 ```
 
@@ -667,7 +690,9 @@ acceleration, not another authoritative storage plane.
 
 The architecture contracts live in
 [ANVIL-0009](docs/rfcs/anvil_0009_atomic_programs.md) and
-[ANVIL-0010](docs/rfcs/anvil_0010_cluster_distribution.md).
+[ANVIL-0010](docs/rfcs/anvil_0010_cluster_distribution.md). The clean-break,
+bounded index architecture is specified by
+[ANVIL-0011](docs/rfcs/anvil_0011_streaming_succinct_indexes.md).
 
 ## Build and qualify
 
@@ -683,11 +708,39 @@ Build and qualify the container locally before CI:
 ```sh
 ANVIL_IMAGE=anvil:local ./scripts/build-image.sh
 ANVIL_IMAGE=anvil:local ./scripts/release-gates.sh image
+ANVIL_IMAGE=anvil:local ./scripts/qualify-single-node.sh
 ANVIL_IMAGE=anvil:local ./scripts/qualify-three-node.sh
 ```
 
-Anvil 0.5 has a new API and storage format; migrate 0.4 data by export and
-import. Current operational boundaries are collected in the
+The production-shaped index qualification generates 839,980 private-data-free
+JSON objects with 12 indexed fields, verifies every live path and version after
+updates and deletes, and records phase-by-phase RSS and anonymous-memory peaks.
+It requires an explicit process target, the server's configured per-kind
+budget, and an accepted maximum anonymous-memory increase so the run fails
+rather than merely reporting an unbounded build:
+
+```sh
+ANVIL_V06_RESOURCE_ENDPOINTS=http://127.0.0.1:50051 \
+ANVIL_V06_RESOURCE_TENANT=qualification \
+ANVIL_V06_RESOURCE_BUCKET=index-resource \
+ANVIL_V06_RESOURCE_CLIENT_ID=qualification-client \
+ANVIL_V06_RESOURCE_CLIENT_SECRET="$ANVIL_QUALIFICATION_SECRET" \
+ANVIL_V06_RESOURCE_CONTAINERS=anvil \
+ANVIL_V06_KIND_BUDGET_BYTES=67108864 \
+ANVIL_V06_INDEX_RAYON_WORKERS=4 \
+ANVIL_V06_MAX_ANONYMOUS_GROWTH_BYTES=536870912 \
+  cargo run --release --locked -p anvil-server \
+    --example v06_index_resource_qualification
+```
+
+The pinned `sux` and Rayon features, resolved versions and license choices are
+recorded in [the index dependency record](docs/dependency-licenses.md).
+
+Anvil 0.6 uses index format 2 and deliberately does not read or migrate 0.5
+index definitions, artifacts, caches, or page tokens. Recreate definitions to
+build new indexes from authoritative source objects. Core 0.4 data still moves
+to the 0.5+ object format by export and import. Current operational boundaries
+are collected in the
 [known limitations](docs/known-limitations.md).
 
 Apache-2.0 licensed.

@@ -1,4 +1,104 @@
-# Anvil 0.5.x known limitations
+# Anvil known limitations
+
+## Streaming indexes in 0.6.0
+
+Index format 2 is a clean break. Anvil 0.6 does not read, migrate, dual-write or
+fall back to 0.5 index definitions, artifacts, cache entries or page tokens.
+Authoritative source objects are unaffected; recreate each definition to build
+its new index.
+
+The first succinct engines deliberately keep their existing minimum query
+surface. Full text has one Unicode-aware lowercase tokenizer but no stemming,
+fuzzy matching, synonyms or configurable filters. Vector search remains an
+exact scan, so its cost is linear in the selected vectors. Hybrid evaluates its
+full-text and vector candidates before deterministic fusion. Git Source and
+Tensor remain manifest projections rather than general Git or model-serving
+engines. These are query-feature and performance limits, not weaker
+authorization or visibility semantics.
+
+Index definitions remain ordinary objects rather than a second authoritative
+catalogue. Rebuilding a node's disposable assignment cache therefore scans the
+reserved definition prefix. Query materialization remains disposable and cold
+queries may fetch index blocks before executing. A query always includes
+freshness evidence and continues to serve the preceding complete generation
+while its writer builds the next one.
+
+One source mutation whose selected payload and required seal workspace cannot
+fit the configured per-kind construction budget cannot be indexed. The writer
+keeps the preceding complete generation and retries after configuration or
+source data changes; other object and index kinds remain available.
+
+Format-2 encoded data and routing blocks are capped at 512 KiB and routing
+fanout is 32. A decoder may use approximately 4 MiB in aggregate for the owned
+representation of one block. Full-text position lists are split across blocks,
+but one Typed JSON scalar projection or one Git Source/Tensor record group must
+fit one block in 0.6.0. The writer rejects an oversized row before it enters a
+mutable run, does not advance the source checkpoint, and keeps serving the
+preceding complete generation. Splitting that application record across
+ordinary source objects is the current workaround.
+
+Each level contains at most four runs. A fifth run triggers compaction of the
+four oldest inputs into one run at the next level. Fixed compaction admission
+includes `4 * (512 KiB encoded + approximately 4 MiB decoded)` before work
+starts, so many immutable runs cannot multiply one compaction's anonymous
+memory. A compaction still has to scan its inputs and exact vector query cost
+remains linear; these are bounded latency costs rather than unbounded memory.
+
+The first merged representation uses `sux` Elias–Fano sequences and rear-coded
+dictionaries where those structures directly fit an engine. It does not yet
+emit ranked dense bit vectors. Full-text scoring uses bounded per-posting term
+frequency and field length rather than generation-wide BM25 statistics, and
+exact vector scoring is sequential within each fetched block. These affect
+index size, ranking quality and query throughput, not path/version visibility,
+freshness, durability or Zanzibar filtering.
+
+Format-2 cache reads remain mmap-backed and do not copy immutable blocks into a
+second managed heap cache. `ANVIL_INDEX_MEMORY_PERCENT` bounds aggregate
+in-flight block materialization; clean mapped pages are retained or reclaimed
+by the operating system. The first engines use bounded demand reads and only
+explicit prefetch, without format-specific cache-retention priorities. This can
+increase cold-query I/O but cannot change authoritative index bytes or results.
+
+Stable index identity, definition version, source checkpoint, atomic watermark
+and build diagnostics are bound once by the immutable generation manifest. A
+run root contains its kind, level, path/version state, component descriptors,
+hashes and statistics but does not duplicate those generation-level fields.
+Consequently a run is opened only through its validated manifest; it is not a
+standalone interchange artifact.
+
+A not-yet-published run build or compaction must seal and publish its earliest
+staged block before the ordinary awaiting-publish GC age, 24 hours by default.
+If it exceeds that window, the writer retries from the last complete
+generation. L0 work is bounded and the production qualification is far below
+this interval; support for a single compaction lasting longer than the GC age
+is deferred. No partial run becomes query-visible.
+
+An index builder admits at most three outbound rebuild snapshots per index
+kind, but a source node does not yet impose a second process-wide ceiling on
+the total inbound snapshot sessions requested by all trusted cluster peers.
+Each live source snapshot owns one bounded RocksDB snapshot thread and sends a
+frame only after receiving pull credit, so corpus bytes do not queue in heap;
+nevertheless, a cluster with many simultaneous cold definitions can retain
+many thread stacks on one source. Operators should stage mass definition
+creation or temporarily reduce the number of active builders. A source-wide
+admission queue is deferred until production measurements justify its policy.
+
+Unsupported or corrupt format-2 derived objects are rejected when discovery or
+generation loading encounters them. Startup does not scan every dormant object
+under the reserved index prefix. An invalid candidate cannot replace the
+current generation. If an already-published current pointer or manifest is
+later found corrupt, that definition is unavailable, reports the failure and
+retries rather than preventing unrelated object storage from starting. Delete
+and recreate that definition to rebuild it from authoritative source objects.
+
+The implementation dependencies and their selected license options are
+recorded in [the Anvil 0.6 index dependency record](dependency-licenses.md).
+
+## Capabilities introduced in 0.5.x
+
+The following limits are grouped by the release which introduced each
+capability. Unless a newer section above explicitly replaces one, they remain
+the current boundary.
 
 ## Usage accounting in 0.5.3
 
@@ -63,7 +163,11 @@ is derived only from an authorized result. A bucket containing many groups
 that the caller cannot see can therefore require substantial scan and
 authorization work before the call returns.
 
-## Minimum index engines in 0.5.2
+## Historical 0.5.2 index implementation (replaced in 0.6.0)
+
+This section records the behavior of the released 0.5.2 index implementation.
+Its whole-generation builder, page-map format and source router are removed in
+0.6.0; the current boundaries are described above.
 
 The first 0.5.2 index engines intentionally provide a small, usable query
 surface rather than every optimization commonly found in a dedicated search

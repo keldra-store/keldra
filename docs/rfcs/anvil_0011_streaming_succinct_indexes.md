@@ -21,7 +21,7 @@ cluster source journals and snapshot barriers
   -> immutable write-optimized L0 segments
   -> streaming size-tiered compaction
   -> immutable quasi-succinct merged segments
-  -> REPLICATED ordinary Anvil objects
+  -> ordinary Anvil objects with the strongest available acknowledgement
   -> one CAS-published generation manifest
 ```
 
@@ -53,6 +53,13 @@ succinct structures and adopts [Rayon](https://github.com/rayon-rs/rayon) for
 bounded CPU parallelism. Both dependencies are approved for this design.
 Rayon work must still hold the same byte-budget permits as synchronous work;
 parallelism is never an escape from memory accounting.
+
+The 0.6.0 dependency is pinned to `sux = 0.14.0` with default features disabled
+and only its `rayon` feature enabled. Anvil uses the Apache-2.0 option of
+`sux`'s `Apache-2.0 OR LGPL-2.1-or-later` license. This deliberately excludes
+its unrelated Flate, Zstandard, Serde and epserde features. The resolved Rayon
+version is 1.12.0 under its `MIT OR Apache-2.0` license. `Cargo.lock` is the
+complete reproducible transitive dependency record.
 
 ## 2. Why the index must be replaced
 
@@ -155,8 +162,9 @@ BM25-style ranking and phrase queries.
    scatter/gather query plan.
 5. Index definitions, segments, components, blocks, manifests and current
    pointers use ordinary Anvil objects and ordinary reference accounting.
-6. Every artifact named by a published generation has completed `REPLICATED`
-   acknowledgement before the current pointer can name it.
+6. Every artifact named by a published generation has completed the artifact
+   acknowledgement defined in Section 14 before the current pointer can name
+   it.
 7. Publication is one compare-and-swap of the current pointer. Before that CAS,
    a partially uploaded segment or compaction output is invisible to queries.
 8. A query is pinned to one immutable generation, definition version,
@@ -228,10 +236,13 @@ evidence and publishes generations for a definition.
 **Mutable builder** is bounded temporary state used to invert or order a small
 batch of changes. It is not authority and is lost safely on process failure.
 
-**Segment** is an immutable, independently queryable set of changes or compacted
-state. An L0 segment is write optimized; a merged segment is read optimized.
+**Run** (also called a segment in the indexing literature) is an immutable,
+independently queryable set of changes or compacted state. An L0 run is write
+optimized; a merged run is read optimized. This RFC uses “segment” when
+discussing the general indexing technique, while format-2 paths and concrete
+artifact identities use `run`.
 
-**Component** is one semantic portion of a segment, such as a term dictionary,
+**Component** is one semantic portion of a run, such as a term dictionary,
 posting stream, path/version directory, positions, vector values or live-state
 changes.
 
@@ -240,13 +251,13 @@ bounded range of one component. An index block is not an erasure-code shard.
 The ordinary Anvil byte plane may erasure-code the block's payload.
 
 **Generation manifest** is the immutable description of the exact active
-segment set and source coverage presented to queries.
+run set and source coverage presented to queries.
 
 **Current pointer** is the small mutable ordinary object whose CAS publishes
 one immutable generation manifest.
 
 **L0** is the first, cheap immutable representation flushed from a mutable
-builder. **L1+** are increasingly large quasi-succinct segments produced by
+builder. **L1+** are increasingly large quasi-succinct runs produced by
 streaming compaction.
 
 ## 8. Placement and authority
@@ -319,7 +330,7 @@ One `TypeBuildPool` exists per kind. It owns:
 - a byte semaphore for mutable records, dictionaries, sort buffers, output
   blocks and engine-specific temporary arrays;
 - a FIFO round-robin queue of definitions with available source work;
-- a fixed Rayon worker allowance shared by the kind; and
+- access to the one fixed process-owned Rayon pool shared across kinds; and
 - per-definition progress and waiting-time metrics.
 
 Work is pull based. A builder first obtains a bounded byte lease and only then
@@ -331,9 +342,10 @@ reserve the whole pool across a yield when peers are waiting.
 
 Every capacity-growing collection must be charged before reserving memory.
 Variable-sized payloads are parsed or tokenized as streams. Sorting uses
-bounded runs. A single hot term or very large selected value is split across
-independently encoded posting/value blocks; it is never allowed to force a
-corpus-sized allocation.
+bounded runs. A single hot term is split across independently encoded posting
+blocks. A selected typed or projection group which has no unambiguous split
+semantics in 0.6.0 is rejected before builder admission instead of forcing a
+large allocation or silently changing its query meaning.
 
 One source payload or one derived mutation can itself be larger than the
 configured kind budget. The 0.6.0 KISS behavior is fail closed: the builder
@@ -347,14 +359,20 @@ changing authority or publication semantics.
 When the budget cannot admit the minimum useful quantum, the builder waits and
 exports the reason. When an L0 builder reaches its lease, configured record
 target or publication interval, it coalesces same-path changes and flushes.
-If an index reaches its configured L0 fanout, compaction takes priority and new
-events remain in their bounded source journals. If that delay outlives journal
-retention, the correct fallback is a bounded complete rebuild.
+Each level admits at most four runs. When a fifth run makes a level overfull,
+compaction of the four oldest runs takes priority and new events remain in their
+bounded source journals. If that delay outlives journal retention, the correct
+fallback is a bounded complete rebuild.
 
-Rayon uses a process-owned fixed thread pool. Tasks are submitted only after
-the submitting operation owns their memory permits. No index builds a private
-unbounded Rayon pool, and code does not rely on Rayon's global pool for
-resource isolation.
+Rayon uses a process-owned fixed thread pool. In 0.6.0 it performs the
+CPU-heavy, non-async source projection that can consume an entire admitted
+payload. Seal and compaction keep their asynchronous ordinary-object sinks and
+run on the index writer task, but their synchronous work is cut at the fixed
+512 KiB block boundary and yields whenever a block is read or emitted. This
+avoids an executor bridge which would either block a Rayon thread on async I/O
+or introduce another buffering channel. Tasks submitted to Rayon hold the same
+memory permits as the caller. No index builds a private unbounded Rayon pool,
+and code does not rely on Rayon's global pool for resource isolation.
 
 ## 11. Immutable L0 segments
 
@@ -386,38 +404,55 @@ the batch, including deletes. A live entry maps to one segment-local document
 ordinal. Kind-specific components refer to that ordinal rather than repeating
 the tenant, bucket, path and version in every posting.
 
-The segment also records:
+The run root and its component descriptors record:
 
-- format and engine kind;
-- stable index and definition version;
-- level and immutable segment identity;
-- minimum and maximum path and kind-specific routing keys;
-- input checkpoint span and atomic finalized watermark;
-- document, change, tombstone and component counts;
-- component/block descriptors and hashes; and
-- diagnostics for accepted and skipped source objects.
+- format, engine kind and level;
+- mutation, live-document and version-range statistics;
+- minimum and maximum component routing keys; and
+- component/block descriptors and hashes.
+
+The immutable generation manifest binds those roots to the stable index ID,
+definition version, complete input checkpoint vector, atomic finalized
+watermark and accepted/skipped diagnostics once. Runs are never opened outside
+that validated manifest. Keeping generation-level identity at that one
+authority avoids duplicating mutable-generation context in every immutable run
+without weakening validation.
 
 An L0 segment is queryable immediately. It need not wait for compaction.
 
 ## 12. Streaming compaction and quasi-succinct segments
 
-Compaction is size tiered. Each level has a bounded segment fanout. When a level
-exceeds its fanout, the builder selects a contiguous oldest run from that level
-and streams it into the next level. The active manifest therefore has a bounded
-number of segments per level and logarithmic growth in levels.
+Compaction is size tiered with a fixed four-run fanout. A level may contain at
+most four runs. When the fifth arrives, the builder selects the four oldest
+contiguous runs from that level and streams them into one run at the next
+level. One compaction therefore has exactly four inputs and one output. The
+unselected newest run remains at its level. Cascading compaction applies the
+same rule at every higher level, so the active manifest has a bounded number of
+runs per level and logarithmic growth in levels.
 
 Inputs remain immutable and queryable throughout compaction. The merger uses
 k-way iterators over sorted component blocks. It retains only iterator state,
 one bounded output block and engine-specific small statistics. It never opens
 all input bytes into memory.
 
+The fixed 0.6 profile caps each encoded component or routing block at 512 KiB
+and uses routing fanout 32. Decoding one input block may expand its several
+owned arrays, strings and records; their aggregate decoded-block allowance is
+approximately 4 MiB. Fixed compaction admission therefore covers all four
+inputs as `4 * (512 KiB encoded + approximately 4 MiB decoded)`, for a 16 MiB
+aggregate decoded-input bound. Output and
+routing construction remain covered by the same exported fixed-workspace plan,
+and the compactor still holds the process-wide per-kind budget permit. It may
+not admit a fifth input or treat mmap-backed bytes as uncharged memory.
+
 For monotone sequences, compaction first obtains the element count and upper
 bound from block headers or one bounded counting pass, then performs an encoding
-pass into a `sux` Elias-Fano structure. Dense sets may use a ranked bit vector
-when its measured encoded size is smaller. Term/path dictionaries may use
-prefix-omission string lists. Offset arrays, cumulative counts, sparse live
-sets and posting document IDs use the suitable succinct structure rather than
-one universal codec.
+pass into a `sux` Elias-Fano structure. Term/path dictionaries may use
+prefix-omission string lists. The initial 0.6 profile uses those two structures
+where they directly improve merged runs; ranked dense bit vectors remain a
+format-2 optimization rather than a release requirement. Offset arrays,
+cumulative counts, sparse live sets and posting document IDs use the suitable
+codec rather than one universal representation.
 
 Compaction removes older versions shadowed within its input span and preserves
 the greatest path version, including a tombstone. It never drops the path-change
@@ -431,17 +466,25 @@ posting blocks. Directories are themselves blocked and have a small root whose
 ranges identify the child blocks needed for a lookup.
 
 Only after every replacement component and its segment manifest has completed
-`REPLICATED` acknowledgement may the builder propose a new generation which
-removes the input segments and adds the replacement. Failed or losing CAS
-outputs are unreachable immutable objects handled by ordinary retention and
-reference GC.
+the artifact acknowledgement defined in Section 14 may the builder propose a
+new generation which removes the input segments and adds the replacement.
+Failed or losing CAS outputs are unreachable immutable objects handled by
+ordinary retention and reference GC.
 
 ## 13. Format v2
 
-The new family is index format `2`. Every generation manifest, segment
-manifest, component root and component block carries the format number and a
-typed component identifier. A component block has an unambiguous magic value,
-fixed-width lengths, bounds, element counts and BLAKE3 integrity identity.
+The new family is index format `2`. Every generation manifest, run root,
+component root and component block carries the format number or format-2 magic
+and a typed component identifier. A component block has an unambiguous magic
+value, fixed-width lengths, bounds, element counts and BLAKE3 integrity
+identity.
+
+The encoded block ceiling is 512 KiB, including the component envelope, and a
+routing node has at most 32 descriptors. These constants keep even maximum
+path-key routing nodes below the encoded ceiling and make the compaction
+workspace independent of corpus size. Decoders validate both encoded bounds
+and the approximately 4 MiB aggregate owned-decoding allowance before
+reserving element arrays.
 
 Durable numeric arrays use fixed-width unsigned or signed integers in little-
 endian order. They never serialize `usize`, pointer values, Rust enum layout or
@@ -459,33 +502,57 @@ it does not reinterpret old bytes.
 The format-2 reserved paths are:
 
 ```text
-_anvil/indexes/definitions/{index_name}
+_anvil/indexes/v2/definitions/{index_name}
 _anvil/indexes/v2/{index_id}/runs/{run_hash}/...
 _anvil/indexes/v2/{index_id}/manifests/{manifest_hash}
 _anvil/indexes/v2/{index_id}/current
 ```
 
-Component and manifest paths are content addressed, so an abandoned candidate
-cannot collide with a later retry of the same logical generation number. Exact
-helper spelling below a run path is an implementation detail, but the current
-pointer always names one immutable generation manifest. Format-1 paths are
-never probed and there is no dual-write path.
+The run hash is not known while its component blocks are being streamed. Each
+bounded block is therefore first sealed with the existing `stage_blob`
+primitive. That is the ordinary content-addressed byte plane and its existing
+awaiting-publish lifecycle, not an index scratch store or side plane. The
+builder retains only the returned hash, length and range in its bounded routing
+tree. Once the final small root determines `run_hash`, the publisher traverses
+that staged tree and publishes each existing `BlobRef`, without rereading the
+source or retaining a block inventory, beneath the final run path with the
+artifact acknowledgement defined in Section 14. It publishes the root last.
+Different runs get different ordinary object paths even when block bytes
+deduplicate, so ordinary reference counting remains exact and per-run retention
+needs no global mark set. A failed unfinished build leaves only ordinary
+awaiting-publish blobs or unreachable immutable run paths, handled by the
+existing age-bounded GC.
+
+Component, run and manifest paths are content addressed, so an abandoned
+candidate cannot collide with a later retry of the same logical generation
+number. Exact helper spelling below a run path remains an implementation
+detail. The current pointer always names one immutable generation manifest.
+Format-1 paths are never probed and there is no dual-write path.
 
 ## 14. Ordinary-object publication
+
+Artifact publication requests `REPLICATED` acknowledgement whenever at least
+two ACTIVE nodes exist. A one-node cluster has no remote node which can supply
+that acknowledgement, so it requests `LOCAL` and proceeds only after the sole
+node has durably stored the ordinary object. This is an acknowledgement-timing
+exception, not a second placement or storage format: inline versus erasure-
+coded storage, later replication and online cluster growth continue to follow
+the ordinary object rules. Once a second node is ACTIVE, subsequent index
+artifact publication uses `REPLICATED`.
 
 Publishing a new L0 batch or compaction result follows one sequence:
 
 1. encode bounded component blocks;
-2. write each block as an immutable ordinary object with `REPLICATED`
-   acknowledgement;
-3. write the immutable component roots and segment manifest with `REPLICATED`
-   acknowledgement;
+2. stage each block in the ordinary content-addressed byte plane;
+3. once the root determines the run hash, traverse the staged tree and publish
+   every block, component root and run root beneath the final run path with the
+   selected artifact acknowledgement, publishing the root last;
 4. write the immutable generation manifest containing the complete active
-   segment set and complete source checkpoint vector with `REPLICATED`
+   segment set and complete source checkpoint vector with the selected artifact
    acknowledgement;
 5. revalidate builder placement, definition version and atomic watermark; and
 6. CAS `_anvil/indexes/v2/{index_id}/current` from the exact previously observed
-   object version to the new generation, also using `REPLICATED`
+   object version to the new generation, also using the selected artifact
    acknowledgement.
 
 The CAS is the sole index-publication point. There is no index commit log,
@@ -504,7 +571,7 @@ IndexGenerationManifestV2 {
   placement_fence
   atomic_finalized_through
   source_checkpoint_vector
-  ordered_active_segments
+  ordered_active_runs
   visible_document_count
   accepted_and_skipped_diagnostics
   authoritative_bytes
@@ -534,15 +601,12 @@ Segment routing filters and path ranges avoid most exact dictionary probes.
 Static filters may reject absence but are never accepted as proof of membership;
 an exact path and version comparison follows every positive filter result.
 
-For full-text statistics, a live update records signed document-count,
-document-length and term-frequency-statistic deltas. The builder obtains the
-old forward term vector from the published index view before emitting negative
-deltas. When one path changes repeatedly in a batch, its bounded change record
-retains that original baseline and only replaces the final new projection.
-Retained object history is not required. Compaction sums and validates those
-deltas. Relevant generation-wide BM25 statistics are obtained by summing the
-compact per-segment term entries, not by holding a global term map in the
-generation manifest.
+The initial full-text engine stores term frequency, field length and optional
+positions in each posting and computes a deterministic bounded local score. It
+does not hold a generation-wide statistics map while building. Forward term
+vectors and signed generation-wide BM25 statistic deltas can be added as
+format-2 components later; they are a ranking-quality optimization, not part of
+path/version visibility or publication correctness.
 
 An engine produces candidates lazily. Visibility filtering occurs before
 authorization and before a hit is emitted. Top-k engines continue pulling until
@@ -552,7 +616,8 @@ authorization filtering.
 
 ## 16. Atomic-program visibility
 
-The event router exposes only a complete atomic-program finalized watermark.
+The pull-based journal collector exposes only a complete atomic-program
+finalized watermark.
 A mutable builder may observe partial invalidations, but it cannot publish a
 generation whose source vector passes an atomic commit until every path from
 that commit is visible in authoritative current state and represented by the
@@ -598,17 +663,23 @@ are applied during construction and query routing before an engine examines
 kind-specific data. A definition for `/tenant/123` does not include
 `/tenant/1234`.
 
-Every management and query request is authenticated and Zanzibar authorized.
-Anvil checks the coarse index/bucket capability first. Segment path ranges,
-definition scope and query predicates then eliminate impossible candidates.
-Remaining exact object results are checked in bounded Zanzibar batches at the
-generation's authorization revision. If a batch contains denials or reordered
-answers, iteration continues without exposing an unauthorized path, count,
-continuation position or score.
+Every management request is authenticated and Zanzibar authorized. A query may
+instead omit credentials, in which case it must name its tenant explicitly and
+Anvil binds it to the fixed anonymous subject. Authenticated queries may omit
+the tenant; a supplied tenant must match the signed identity. Anvil checks the
+coarse index/bucket capability first. Segment path ranges, definition scope and
+query predicates then eliminate impossible candidates. Remaining exact object
+results are checked in bounded Zanzibar batches at the generation's
+authorization revision. If a batch contains denials or reordered answers,
+iteration continues without exposing an unauthorized path, count, continuation
+position or score.
 
 Anonymous callers remain the ordinary implicit anonymous subject and receive
 results only where public-read relationships explicitly grant them. Failed or
-malformed authentication never degrades to anonymous.
+malformed authentication never degrades to anonymous. When execution is routed
+to another query replica, mandatory mTLS carries only the original signed JWT
+or the fixed anonymous marker plus the requested tenant; the replica rebuilds
+identity, validates the tenant against its stable ID and evaluates Zanzibar.
 
 Authorization state is not copied into an authoritative per-index ACL plane.
 Any future disposable authorization accelerator must be revision bound and
@@ -617,11 +688,14 @@ must fail closed; it is outside this release.
 ## 19. Cache and materialization policy
 
 All locally assigned indexes share the existing node-wide index disk-cache and
-memory-cache budgets. Per-kind construction budgets do not create per-index
-caches. The cache manager, not an engine, owns fetching, verification, pinning,
-prefetch and eviction.
+in-flight materialization-memory budgets. Per-kind construction budgets do not
+create per-index caches. The cache manager, not an engine, owns fetching,
+verification, pinning, prefetch and eviction. Initial 0.6 reads remain
+mmap-backed instead of copying a mapped block into a second managed heap tier;
+the operating system may retain clean mapped pages and reclaim them under
+pressure.
 
-Each engine supplies declarative hints:
+The cache API admits declarative hints for:
 
 - root or routing block: retain and prefetch;
 - sequential posting/position block: prefetch next after demonstrated
@@ -629,6 +703,10 @@ Each engine supplies declarative hints:
 - random vector/value block: do not speculative-prefetch;
 - one-shot merge input: low retention priority; and
 - output block being sealed: do not admit as a query-cache duplicate.
+
+The initial engines perform bounded demand reads and explicit prefetch only;
+format-specific retention priorities are a disposable-cache optimization and
+may be wired without changing authoritative artifacts or query results.
 
 Hints may improve cost but never alter correctness or authority. A complete
 small index may remain warm in memory. A larger index transparently exchanges
@@ -680,12 +758,14 @@ generation exists.
 ### 21.2 Metadata filter
 
 The fixed head projection—path, version, content type, content length, content
-hash and commit time—is streamed into a segment-local document table. Each
-configured field has a sorted typed-value dictionary and posting lists over
-segment-local document ordinals. Sparse postings use Elias-Fano; dense postings
-use ranked bitvectors. Equality, `IN`, prefix and range predicates seek only
-relevant value blocks and intersect lazy posting iterators. Path/version
-visibility and Zanzibar filtering happen before hits are emitted.
+hash and commit time—is streamed into a segment-local document table. The
+initial format writes canonical typed rows by document ordinal and a second,
+sorted routed-key component for configured field values. L1+ ordinal columns
+use Elias-Fano; routed string keys use prefix-delta encoding. Equality, `IN`,
+prefix and range predicates seek the relevant routed-key blocks and then
+validate the referenced row. Ranked dense bit vectors remain a later format-2
+optimization rather than an initial representation. Path/version visibility
+and Zanzibar filtering happen before hits are emitted.
 
 ### 21.3 Typed JSON
 
@@ -693,10 +773,12 @@ The builder incrementally parses only configured JSON pointers and does not
 retain complete documents. Canonical scalar keys include an explicit JSON type
 so `1`, `"1"`, `true` and `null` do not collide. Arrays may contribute several
 values but a document ordinal appears once in final results. L0 uses sorted
-scalar runs; merged segments use prefix-compressed string dictionaries,
-fixed-width numeric columns, Elias-Fano sparse postings and ranked dense sets.
-Range and ordered queries k-way merge value iterators without collecting the
-whole result domain.
+scalar runs. Merged runs store canonical selected values in ordinal rows,
+Elias-Fano-compressed ordinal columns and prefix-delta routed scalar keys.
+Range and ordered queries k-way merge bounded iterators without collecting the
+whole result domain. One selected mutation whose canonical row cannot fit a
+format-2 leaf is rejected before builder admission; the previous complete
+generation and source checkpoint remain current.
 
 ### 21.4 Full text
 
@@ -706,16 +788,16 @@ postings. Merged segments separate:
 
 - term dictionary and posting-block routing;
 - document pointers;
-- counts and document lengths;
-- optional positions for phrase queries;
-- forward term vectors used to subtract statistics on replacement; and
-- signed document-frequency and length-statistic deltas.
+- per-posting term frequency and field length; and
+- optional bounded positions for phrase queries.
 
 Document pointers, counts, cumulative position offsets and positions use
 quasi-succinct sequences where appropriate. A non-phrase Boolean query never
-fetches positions. `advance_to` performs successor operations over Elias-Fano
-postings. BM25-style scoring uses generation-wide statistics obtained by
-summing relevant segment deltas and retains only a bounded top-k heap.
+materializes positions. `advance_to` performs successor operations over
+Elias-Fano postings. The initial score is deterministic and local to each
+posting, using term frequency and field length, and retains only a bounded
+top-k heap. Forward term vectors and signed generation-wide BM25 statistic
+deltas are possible later format-2 components; they are not part of 0.6.0.
 
 ### 21.5 Vector
 
@@ -727,9 +809,11 @@ succinct ordinals, offsets and live-state structures around them.
 
 A query streams vector blocks, computes cosine, dot-product or Euclidean score,
 filters stale versions and maintains a bounded top-k heap. It does not load all
-vectors or add a mutable HNSW graph. Parallel block scoring uses the fixed Rayon
-pool and budgeted query buffers. Approximate ANN can be a later immutable
-segment component without changing publication or cache authority.
+vectors or add a mutable HNSW graph. Initial scoring within a decoded block is
+sequential and bounded; the process-owned Rayon pool is used for admitted
+source projection work rather than as an unaccounted query allocator.
+Approximate ANN or parallel scoring can be a later immutable segment component
+without changing publication or cache authority.
 
 ### 21.6 Hybrid
 
@@ -745,21 +829,23 @@ generation never pairs text from one source barrier with vectors from another.
 
 The fixed repository definition projects immutable commit, tree-path and object
 relationships. L0 contains sorted commit/path/object tuples. Merged segments
-use prefix-compressed tree paths, Elias-Fano offsets and posting lists from
-object IDs to their locations. Exact commit/path lookup seeks one key range;
-prefix tree lookup streams the contiguous path range; object lookup streams
-its compact locations. Object bodies remain ordinary Anvil objects and are not
-copied into the index.
+store payload records under succinct document ordinals and use prefix-delta
+routed keys for commit/path and object-ID lookup. Exact commit/path lookup seeks
+one key range; prefix tree lookup streams the contiguous path range; object
+lookup streams its locations. One source projection group must fit a format-2
+leaf in 0.6.0 and is rejected before admission otherwise. Object bodies remain
+ordinary Anvil objects and are not copied into the index.
 
 ### 21.8 Tensor
 
 The fixed model definition projects tensor names, shapes, data types and source
 object locations. L0 sorts `(model_id, tensor_name)` records. Merged segments
-use a prefix-compressed tensor-name dictionary, Elias-Fano offsets and compact
-fixed-width shape/type columns. Exact lookup loads the relevant dictionary and
-record block, then returns the authoritative source path/version subject to
-visibility and authorization. Tensor payload bytes remain in their ordinary
-objects.
+store canonical record groups under Elias-Fano-compressed document ordinals and
+use prefix-delta routed tensor keys. Exact lookup loads the relevant routed key
+and record block, then returns the authoritative source path/version subject to
+visibility and authorization. One source projection group must fit a format-2
+leaf in 0.6.0 and is rejected before admission otherwise. Tensor payload bytes
+remain in their ordinary objects.
 
 ## 22. Mutable API versus truly mutable storage
 
@@ -805,7 +891,7 @@ The 0.6 server exposes startup configuration for:
 - construction-memory bytes per `IndexKind` (one value applied to each kind in
   0.6.0, with one independent pool per kind);
 - fixed index Rayon worker count;
-- index disk-cache bytes and memory-cache bytes;
+- index disk-cache bytes and in-flight materialization-memory percentage;
 - retained generation count, age and authoritative-byte limits.
 
 Builder and query replica routing remains derived from active membership and
@@ -846,37 +932,36 @@ credentials or proprietary path contents.
 
 ### 26.1 Format and engine tests
 
-Every kind has tests for:
+The common format and the eight engines collectively test:
 
-- empty, one-record, multi-block and multi-segment generations;
-- L0 query equivalence before and after one or more compactions;
-- overwrite, tombstone, recreate and version-enabled retained history;
-- stale cross-source invalidation and duplicate replay;
-- corrupt headers, hashes, bounds, offsets and rank/select support data;
-- pagination pinned to an immutable generation;
-- unauthorized candidates before, within and after an authorized page;
-- builder crash at every publication step; and
-- deterministic output from the same ordered logical input.
+- empty, one-record, multi-block and multi-run generations where the engine
+  supports a collection result;
+- L0 query equivalence before and after compaction;
+- overwrite, tombstone, duplicate replay and latest-version visibility;
+- corrupt headers, hashes, bounds, counts, routing support and succinct select
+  support;
+- deterministic output from the same ordered logical input;
+- native, generation-bound continuation for every pageable result shape; and
+- rejection of format-1 definitions, generations and page-token positions.
 
-Golden format fixtures are read on AMD64 and ARM64. A block written on either
-architecture must produce identical bytes and query results on the other.
+The durable codec uses explicit fixed-width little-endian fields and tests
+deterministic byte output. The release images and public qualification run on
+both AMD64 and ARM64; no native Rust layout is persisted.
 
 ### 26.2 Resource tests
 
-For each kind:
+Shared budget, codec, routing and compaction tests prove the fixed encoded and
+decoded ceilings, four-input fan-in, FIFO admission and three same-kind clients
+making progress without multiplying the kind limit. Engine tests cover the
+kind-specific high-risk cases: hot full-text positions, large typed values,
+vectors and indivisible Git/Tensor projections.
 
-1. configure a deliberately small construction budget;
-2. build a source larger than that budget;
-3. prove the charged peak never exceeds the configured limit;
-4. observe multiple flushes/blocks rather than one complete allocation;
-5. run at least three same-kind indexes concurrently and prove round-robin
-   progress without multiplying the kind limit;
-6. include one hot key/term/value large enough to require block splitting; and
-7. compact while ingest and cold queries continue.
-
-Process RSS is sampled alongside charged bytes to catch unaccounted or
-allocator-retained corpus-linear growth. The acceptance criterion is a bounded
-plateau with documented fixed overhead, not merely absence of an OOM.
+The production-shaped qualification then samples process RSS and anonymous RSS
+while a 12-field Typed JSON index consumes a corpus much larger than its
+configured kind budget. It must produce multiple bounded runs, compact them,
+and plateau below the explicitly accepted process-memory increase. This
+representative process test complements, rather than duplicates, the public
+functional matrix for all eight kinds.
 
 ### 26.3 Public single-node tests
 
@@ -889,15 +974,17 @@ freshness and Zanzibar denial behavior.
 
 Using one three-node Docker Compose cluster and isolated tenants/buckets:
 
-- send source writes through every node;
-- prove the one HRW builder consumes every source journal;
-- query every kind through non-owner ingress nodes;
-- stop one query replica and route to another without result divergence;
-- move builder assignment through an online membership change;
-- kill the builder during L0 upload, compaction and current-pointer CAS;
-- lose a retained journal range and prove rebuild rather than silent skip;
-- verify every published component met `REPLICATED` durability; and
-- verify no query fans out to independent index partitions.
+- send source writes through all three ingress nodes;
+- wait for the one HRW builder to consume every source journal;
+- create, page, mutate and query every kind through public endpoints;
+- verify Zanzibar denial, explicit public access and revocation;
+- verify published index artifacts use `REPLICATED` acknowledgement; and
+- perform a rolling restart while preserving complete published generations.
+
+Unit tests independently cover journal gaps, incomplete atomic barriers,
+stale placement fences, publication CAS loss and failure before current-pointer
+publication. Exhaustive process-kill injection at every block-upload and CAS
+instruction boundary is not a 0.6.0 release gate.
 
 ### 26.5 Production-shaped qualification
 
@@ -943,8 +1030,15 @@ supported core-store upgrade may recreate index definitions and rebuild format
 This RFC does not require retaining any 0.5.x index definition or permitting a
 mixed 0.5/0.6 cluster.
 
-Startup and peer admission reject unsupported index-format state explicitly.
-They do not silently ignore an old current pointer and return empty results.
+Every reader rejects an unsupported format encountered inside the v2 namespace
+explicitly. Discovery rejects unsupported definitions; generation loading
+rejects unsupported current pointers, manifests, roots and blocks. An invalid
+candidate is never CAS-published, so the preceding valid generation stays
+current. Corruption of an already-published current pointer makes that one
+definition unavailable and causes its builder to report and retry. Anvil does
+not add a cluster-wide startup scan merely to discover dormant corrupt derived
+objects. The implementation never probes a format-1 current pointer and never
+mistakes it for an empty v2 index.
 
 ## 28. Release acceptance
 
@@ -952,8 +1046,9 @@ Anvil 0.6.0 is ready to tag only when:
 
 1. the old index implementation and dependencies used only by it are removed;
 2. `sux` and Rayon licenses, features and locked dependency trees are recorded;
-3. every supported kind passes the format, resource, public single-node and
-   public three-node matrices;
+3. every supported kind passes its format/engine tests and the public
+   single-node and public three-node matrices, while shared resource tests and
+   the production-shaped run validate the common hard-memory machinery;
 4. the clean-break rejection tests pass and no legacy index reader remains;
 5. the production-shaped qualification passes under an explicit memory cap;
 6. formatting, Clippy, file-size enforcement, locked workspace tests and both
