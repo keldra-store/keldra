@@ -275,6 +275,7 @@ impl Store {
             .await
     }
 
+    #[cfg(test)]
     async fn retire_payload_artifact_if_unchanged_at<F>(
         &self,
         expected: &PayloadArtifactSnapshot,

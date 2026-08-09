@@ -8,8 +8,7 @@
 use anvil_consensus::{DecisionRaft, NodeId};
 use anvil_store::{
     ErasureCodec, ErasureProfile, MAX_PAYLOAD_HANDOFF_EXPORT_RECORDS, PayloadArtifactCursor,
-    PayloadArtifactIdentity, PayloadArtifactSnapshot, PayloadArtifactState, PlacementLogId,
-    ShardIdentity, Store,
+    PayloadArtifactIdentity, PayloadArtifactState, PlacementLogId, ShardIdentity, Store,
 };
 use thiserror::Error;
 

@@ -66,10 +66,12 @@ mod mutation_failures;
 mod read_identity;
 mod routed_writes;
 
-use mutation_failures::{api_failure, api_request_failure};
+#[cfg(test)]
+use mutation_failures::api_failure;
+use mutation_failures::api_request_failure;
 use read_identity::ObjectReadIdentity;
 
-pub(crate) use gateway::{GatewayIdentity, GatewayObjectAdapter, GatewayPutMode, GatewayPutResult};
+pub(crate) use gateway::{GatewayIdentity, GatewayObjectAdapter, GatewayPutMode};
 
 const OBJECT_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_BULK_ITEMS: usize = 1_000;
