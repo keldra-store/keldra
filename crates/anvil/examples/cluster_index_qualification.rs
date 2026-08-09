@@ -11,21 +11,24 @@ use anvil_storage::v1::index_service_client::IndexServiceClient;
 use anvil_storage::v1::index_specification::Specification as SpecificationValue;
 use anvil_storage::v1::put_header::Operation as PutOperationValue;
 use anvil_storage::v1::{
-    CreateBucketRequest, CreateIndexRequest, Durability, FullTextField, FullTextIndexQuery,
-    FullTextIndexSpec, GitSourceIndexQuery, GitSourceIndexSpec, HybridIndexQuery, HybridIndexSpec,
-    IndexField, IndexFreshness, IndexPredicate, IndexPredicateOperator, IndexQuery, IndexQueryHit,
-    IndexSpecification, MetadataFilterIndexQuery, MetadataFilterIndexSpec, ObjectAddress,
-    ObjectVersioning, PathIndexQuery, PathIndexSpec, PutHeader, PutOperation, QueryIndexRequest,
-    QueryIndexResponse, TensorIndexQuery, TensorIndexSpec, TypedJsonIndexQuery, TypedJsonIndexSpec,
-    VectorIndexQuery, VectorIndexSpec, VectorMetric,
+    CreateApplicationRequest, CreateBucketRequest, CreateIndexRequest, DeleteRequest, Durability,
+    FullTextField, FullTextIndexQuery, FullTextIndexSpec, GetIndexRequest, GitSourceIndexQuery,
+    GitSourceIndexSpec, HybridIndexQuery, HybridIndexSpec, IndexField, IndexFreshness,
+    IndexPredicate, IndexPredicateOperator, IndexQuery, IndexQueryHit, IndexSpecification,
+    MetadataFilterIndexQuery, MetadataFilterIndexSpec, ObjectAddress, ObjectVersioning,
+    PathIndexQuery, PathIndexSpec, PutHeader, PutOperation, QueryIndexRequest, QueryIndexResponse,
+    SetBucketPublicReadRequest, TensorIndexQuery, TensorIndexSpec, TypedJsonIndexQuery,
+    TypedJsonIndexSpec, VectorIndexQuery, VectorIndexSpec, VectorMetric,
 };
 use anvil_storage::{
     BearerToken, RawAdministrationClient, RawClient, administration_client, connect_channel,
     exchange_client_credentials, object_client, put_chunks,
 };
 use tokio::time::{Instant, sleep};
+use tonic::metadata::MetadataValue;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
+use tonic::{Code, Request};
 
 type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 type IndexClient = IndexServiceClient<InterceptedService<Channel, BearerToken>>;
@@ -42,6 +45,8 @@ struct EngineCase {
     query: IndexQuery,
     documents: Vec<(&'static str, &'static [u8])>,
     expected_paths: Vec<&'static str>,
+    replacement: (&'static str, &'static [u8]),
+    delete_path: &'static str,
     expects_scores: bool,
     min_advanced_sources: usize,
 }
@@ -144,6 +149,7 @@ async fn main() -> TestResult<()> {
         }
     }
 
+    let mut first_generations = Vec::new();
     for ((case, definition), before) in cases.iter().zip(&definitions).zip(&baseline) {
         let expected = case.expected_paths.iter().copied().collect::<BTreeSet<_>>();
         let responses = wait_for_queries(
@@ -163,10 +169,110 @@ async fn main() -> TestResult<()> {
             require_freshness(&responses[0])?,
             case.min_advanced_sources.min(endpoints.len()),
         )?;
+        first_generations.push(responses[0].clone());
+    }
+
+    for (case, expected_response) in cases.iter().zip(&first_generations) {
+        let expected = case
+            .expected_paths
+            .iter()
+            .map(|path| (*path).to_owned())
+            .collect::<BTreeSet<_>>();
+        for client in &mut indexes {
+            let paged =
+                collect_paginated_paths(client, case, require_freshness(expected_response)?)
+                    .await?;
+            if paged != expected {
+                return Err(invalid(format!(
+                    "{} pagination returned {paged:?}, expected {expected:?}",
+                    case.name
+                )));
+            }
+        }
+    }
+
+    qualify_zanzibar_denial(
+        &mut administrators[0],
+        channels[0].clone(),
+        &tenant,
+        &cases[0],
+    )
+    .await?;
+    qualify_anonymous_query(
+        &mut administrators[0],
+        &channels,
+        &tenant,
+        &cases[0],
+        &first_generations[0],
+    )
+    .await?;
+
+    for (case_number, case) in cases.iter().enumerate() {
+        let put_client = &mut objects[(write_number as usize) % object_client_count];
+        put_json(
+            put_client,
+            &tenant,
+            case.bucket,
+            case.replacement.0,
+            case.replacement.1,
+            &format!("qualification-replace-{case_number}"),
+            source_durability,
+        )
+        .await?;
+        write_number += 1;
+
+        let delete_client = &mut objects[(write_number as usize) % object_client_count];
+        let receipt = delete_client
+            .delete(DeleteRequest {
+                address: Some(ObjectAddress {
+                    tenant: tenant.clone(),
+                    bucket: case.bucket.into(),
+                    path: case.delete_path.into(),
+                }),
+                command_id: format!("qualification-delete-{case_number}"),
+                durability: source_durability as i32,
+            })
+            .await?
+            .into_inner();
+        if !receipt.deleted || receipt.version == 0 {
+            return Err(invalid("index source delete returned an invalid receipt"));
+        }
+        write_number += 1;
+    }
+
+    for ((case, definition), before) in cases.iter().zip(&definitions).zip(&first_generations) {
+        let expected = case
+            .expected_paths
+            .iter()
+            .copied()
+            .filter(|path| *path != case.delete_path)
+            .collect::<BTreeSet<_>>();
+        let before_freshness = require_freshness(before)?;
+        let before_replacement_version = hit_version(before, case.replacement.0)?;
+        let responses = wait_for_queries(
+            &mut indexes,
+            request(case),
+            definition.index_id,
+            definition.version,
+            before_freshness.generation,
+            case.documents.len() as u64 + 2,
+            &expected,
+            case.expects_scores,
+            endpoints.len(),
+        )
+        .await?;
+        let after_replacement_version = hit_version(&responses[0], case.replacement.0)?;
+        if after_replacement_version <= before_replacement_version {
+            return Err(invalid(format!(
+                "{} replacement remained on version {before_replacement_version}",
+                case.name
+            )));
+        }
+        require_checkpoint_advance(before_freshness, require_freshness(&responses[0])?, 1)?;
     }
 
     println!(
-        "index qualification passed on {} node(s): {} engines, {} writes",
+        "index qualification passed on {} node(s): {} engines, {} put/delete mutations",
         endpoints.len(),
         cases.len(),
         write_number
@@ -197,6 +303,174 @@ async fn create_bucket(client: &mut RawAdministrationClient, bucket: &str) -> Te
         return Err(invalid("bucket creation returned another bucket"));
     }
     Ok(())
+}
+
+async fn qualify_zanzibar_denial(
+    administrator: &mut RawAdministrationClient,
+    channel: Channel,
+    tenant: &str,
+    case: &EngineCase,
+) -> TestResult<()> {
+    let app_id = format!("{tenant}-index-denied");
+    let client_id = format!("{tenant}-index-denied-client");
+    let client_secret = "qualification-index-denied-secret-with-at-least-32-bytes";
+    let credential = administrator
+        .create_application(CreateApplicationRequest {
+            app_id: app_id.clone(),
+            client_id: client_id.clone(),
+            client_secret: client_secret.into(),
+        })
+        .await?
+        .into_inner();
+    if credential.storage_tenant != tenant
+        || credential.app_id != app_id
+        || credential.client_id != client_id
+        || !credential.active
+    {
+        return Err(invalid(
+            "unprivileged application creation returned another identity",
+        ));
+    }
+    let denied_token = exchange_client_credentials(channel.clone(), client_id, client_secret)
+        .await?
+        .access_token;
+    let mut denied = index_client(channel, &denied_token)?;
+    let status = denied
+        .query_index(request(case))
+        .await
+        .expect_err("unprivileged application unexpectedly queried an index");
+    if status.code() != Code::PermissionDenied {
+        return Err(invalid(format!(
+            "unprivileged index query returned {:?}, expected PermissionDenied",
+            status.code()
+        )));
+    }
+    Ok(())
+}
+
+async fn qualify_anonymous_query(
+    administrator: &mut RawAdministrationClient,
+    channels: &[Channel],
+    tenant: &str,
+    case: &EngineCase,
+    expected: &QueryIndexResponse,
+) -> TestResult<()> {
+    let query = anonymous_request(case, tenant);
+    let mut public = public_index_client(channels[0].clone());
+    assert_status(
+        public
+            .query_index(query.clone())
+            .await
+            .expect_err("a private index unexpectedly allowed anonymous query")
+            .code(),
+        Code::PermissionDenied,
+        "private anonymous index query",
+    )?;
+
+    let mut missing_tenant = query.clone();
+    missing_tenant.tenant.clear();
+    assert_status(
+        public
+            .query_index(missing_tenant)
+            .await
+            .expect_err("anonymous index query unexpectedly inferred a tenant")
+            .code(),
+        Code::InvalidArgument,
+        "anonymous index query without tenant",
+    )?;
+    assert_status(
+        public
+            .get_index(GetIndexRequest {
+                bucket: case.bucket.into(),
+                name: case.name.into(),
+            })
+            .await
+            .expect_err("anonymous index management unexpectedly succeeded")
+            .code(),
+        Code::Unauthenticated,
+        "anonymous index management",
+    )?;
+
+    let mut invalid_request = Request::new(query.clone());
+    invalid_request.metadata_mut().insert(
+        "authorization",
+        MetadataValue::try_from("Bearer invalid-index-token")?,
+    );
+    assert_status(
+        public
+            .query_index(invalid_request)
+            .await
+            .expect_err("an invalid bearer unexpectedly degraded to anonymous")
+            .code(),
+        Code::Unauthenticated,
+        "invalid index bearer",
+    )?;
+
+    administrator
+        .set_bucket_public_read(SetBucketPublicReadRequest {
+            bucket: case.bucket.into(),
+            enabled: true,
+        })
+        .await?;
+    let expected_paths = expected
+        .hits
+        .iter()
+        .filter_map(hit_path)
+        .collect::<BTreeSet<_>>();
+    for channel in channels {
+        let response = public_index_client(channel.clone())
+            .query_index(query.clone())
+            .await?
+            .into_inner();
+        let actual_paths = response
+            .hits
+            .iter()
+            .filter_map(hit_path)
+            .collect::<BTreeSet<_>>();
+        if actual_paths != expected_paths || response.freshness.is_none() {
+            return Err(invalid(format!(
+                "anonymous index query returned {actual_paths:?}, expected {expected_paths:?}"
+            )));
+        }
+    }
+
+    administrator
+        .set_bucket_public_read(SetBucketPublicReadRequest {
+            bucket: case.bucket.into(),
+            enabled: false,
+        })
+        .await?;
+    assert_status(
+        public_index_client(channels[0].clone())
+            .query_index(query)
+            .await
+            .expect_err("revoked anonymous index query unexpectedly succeeded")
+            .code(),
+        Code::PermissionDenied,
+        "revoked anonymous index query",
+    )
+}
+
+fn public_index_client(channel: Channel) -> IndexServiceClient<Channel> {
+    IndexServiceClient::new(channel)
+        .max_encoding_message_size(72 * 1024 * 1024)
+        .max_decoding_message_size(72 * 1024 * 1024)
+}
+
+fn anonymous_request(case: &EngineCase, tenant: &str) -> QueryIndexRequest {
+    let mut request = request(case);
+    request.tenant = tenant.into();
+    request
+}
+
+fn assert_status(actual: Code, expected: Code, context: &str) -> TestResult<()> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(invalid(format!(
+            "{context} returned {actual:?}, expected {expected:?}"
+        )))
+    }
 }
 
 async fn put_json(
@@ -421,6 +695,15 @@ fn hit_path(hit: &IndexQueryHit) -> Option<&str> {
     hit.address.as_ref().map(|address| address.path.as_str())
 }
 
+fn hit_version(response: &QueryIndexResponse, path: &str) -> TestResult<u64> {
+    response
+        .hits
+        .iter()
+        .find(|hit| hit_path(hit) == Some(path))
+        .map(|hit| hit.object_version)
+        .ok_or_else(|| invalid(format!("index response omitted expected path {path}")))
+}
+
 fn request(case: &EngineCase) -> QueryIndexRequest {
     QueryIndexRequest {
         bucket: case.bucket.into(),
@@ -428,6 +711,49 @@ fn request(case: &EngineCase) -> QueryIndexRequest {
         query: Some(case.query.clone()),
         limit: 100,
         page_token: Vec::new(),
+        tenant: String::new(),
+    }
+}
+
+async fn collect_paginated_paths(
+    client: &mut IndexClient,
+    case: &EngineCase,
+    expected_freshness: &IndexFreshness,
+) -> TestResult<BTreeSet<String>> {
+    let mut request = request(case);
+    request.limit = 1;
+    let mut paths = BTreeSet::new();
+    let mut previous_token = Vec::new();
+    loop {
+        request.page_token = previous_token.clone();
+        let response = client.query_index(request.clone()).await?.into_inner();
+        let freshness = require_freshness(&response)?;
+        if !stable_freshness_agrees(Some(expected_freshness), Some(freshness)) {
+            return Err(invalid(format!(
+                "{} pagination changed its pinned generation",
+                case.name
+            )));
+        }
+        for hit in &response.hits {
+            let path = hit_path(hit)
+                .ok_or_else(|| invalid("paginated index hit omitted its object address"))?;
+            if !paths.insert(path.to_owned()) {
+                return Err(invalid(format!(
+                    "{} pagination returned duplicate path {path}",
+                    case.name
+                )));
+            }
+        }
+        if response.next_page_token.is_empty() {
+            return Ok(paths);
+        }
+        if response.next_page_token == previous_token {
+            return Err(invalid(format!(
+                "{} pagination returned a non-advancing token",
+                case.name
+            )));
+        }
+        previous_token = response.next_page_token;
     }
 }
 
@@ -479,6 +805,8 @@ fn engine_cases() -> Vec<EngineCase> {
                 "docs/k.json",
                 "docs/l.json",
             ],
+            replacement: ("docs/a.json", br#"{"value":"a-replaced"}"#),
+            delete_path: "docs/b.json",
             expects_scores: false,
             min_advanced_sources: 3,
         },
@@ -505,6 +833,11 @@ fn engine_cases() -> Vec<EngineCase> {
                 ("docs/active-b.json", br#"{"status":"active"}"#),
             ],
             expected_paths: vec!["docs/active-a.json", "docs/active-b.json"],
+            replacement: (
+                "docs/active-a.json",
+                br#"{"status":"active","revision":2}"#,
+            ),
+            delete_path: "docs/active-b.json",
             expects_scores: false,
             min_advanced_sources: 1,
         },
@@ -529,6 +862,8 @@ fn engine_cases() -> Vec<EngineCase> {
                 ("docs/keep-b.json", br#"{"value":"c"}"#),
             ],
             expected_paths: vec!["docs/keep-a.json", "docs/keep-b.json"],
+            replacement: ("docs/keep-a.json", br#"{"value":"a-replaced"}"#),
+            delete_path: "docs/keep-b.json",
             expects_scores: false,
             min_advanced_sources: 1,
         },
@@ -554,6 +889,11 @@ fn engine_cases() -> Vec<EngineCase> {
                 ("docs/journal-b.json", br#"{"body":"a durable journal"}"#),
             ],
             expected_paths: vec!["docs/journal-a.json", "docs/journal-b.json"],
+            replacement: (
+                "docs/journal-a.json",
+                br#"{"body":"durable journal replacement"}"#,
+            ),
+            delete_path: "docs/journal-b.json",
             expects_scores: true,
             min_advanced_sources: 1,
         },
@@ -566,6 +906,11 @@ fn engine_cases() -> Vec<EngineCase> {
             })),
             documents: semantic_documents(),
             expected_paths: semantic_paths(),
+            replacement: (
+                "docs/rust.json",
+                br#"{"title":"rust search replacement","embedding":[0.9,0.1,0.0]}"#,
+            ),
+            delete_path: "docs/storage.json",
             expects_scores: true,
             min_advanced_sources: 1,
         },
@@ -589,6 +934,11 @@ fn engine_cases() -> Vec<EngineCase> {
             })),
             documents: semantic_documents(),
             expected_paths: semantic_paths(),
+            replacement: (
+                "docs/rust.json",
+                br#"{"title":"rust search replacement","embedding":[0.9,0.1,0.0]}"#,
+            ),
+            delete_path: "docs/storage.json",
             expects_scores: true,
             min_advanced_sources: 1,
         },
@@ -614,6 +964,11 @@ fn engine_cases() -> Vec<EngineCase> {
                 ),
             ],
             expected_paths: vec!["docs/git-lib.json", "docs/git-main.json"],
+            replacement: (
+                "docs/git-lib.json",
+                br#"{"repository_id":"qualification-repository","commit_id":"qualification-commit","tree_path":"src/lib.rs","object_id":"3333333333333333333333333333333333333333","pack_path":"docs/git-lib.json","pack_version":2,"offset":256,"length":192}"#,
+            ),
+            delete_path: "docs/git-main.json",
             expects_scores: false,
             min_advanced_sources: 1,
         },
@@ -635,8 +990,20 @@ fn engine_cases() -> Vec<EngineCase> {
                     "docs/tensor-decoder.json",
                     br#"{"model_id":"qualification-model","tensor_name":"decoder.bias","source_path":"docs/tensor-decoder.json","source_version":1,"offset":128,"length":32,"dtype":"f32","shape":[8]}"#,
                 ),
+                (
+                    "docs/tensor-encoder-copy.json",
+                    br#"{"model_id":"qualification-model","tensor_name":"encoder.weight","source_path":"docs/tensor-encoder-copy.json","source_version":1,"offset":160,"length":128,"dtype":"f32","shape":[8,4]}"#,
+                ),
             ],
-            expected_paths: vec!["docs/tensor-encoder.json"],
+            expected_paths: vec![
+                "docs/tensor-encoder-copy.json",
+                "docs/tensor-encoder.json",
+            ],
+            replacement: (
+                "docs/tensor-encoder.json",
+                br#"{"model_id":"qualification-model","tensor_name":"encoder.weight","source_path":"docs/tensor-encoder.json","source_version":2,"offset":288,"length":128,"dtype":"f32","shape":[8,4]}"#,
+            ),
+            delete_path: "docs/tensor-encoder-copy.json",
             expects_scores: false,
             min_advanced_sources: 1,
         },
@@ -693,9 +1060,60 @@ fn invalid(message: impl Into<String>) -> Box<dyn Error + Send + Sync> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use anvil_storage::v1::{Durability, IndexFreshness, IndexSourceFreshness, QueryIndexResponse};
 
-    use super::{qualification_durability, retryable, routed_responses_agree};
+    use super::{
+        SpecificationValue, engine_cases, qualification_durability, retryable,
+        routed_responses_agree,
+    };
+
+    #[test]
+    fn public_matrix_covers_all_eight_kinds_and_real_pagination() {
+        let cases = engine_cases();
+        let kinds = cases
+            .iter()
+            .map(|case| {
+                match case
+                    .specification
+                    .specification
+                    .as_ref()
+                    .expect("qualification specification")
+                {
+                    SpecificationValue::Path(_) => "path",
+                    SpecificationValue::MetadataFilter(_) => "metadata_filter",
+                    SpecificationValue::TypedJson(_) => "typed_json",
+                    SpecificationValue::FullText(_) => "full_text",
+                    SpecificationValue::Vector(_) => "vector",
+                    SpecificationValue::Hybrid(_) => "hybrid",
+                    SpecificationValue::GitSource(_) => "git_source",
+                    SpecificationValue::Tensor(_) => "tensor",
+                }
+            })
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            kinds,
+            BTreeSet::from([
+                "full_text",
+                "git_source",
+                "hybrid",
+                "metadata_filter",
+                "path",
+                "tensor",
+                "typed_json",
+                "vector",
+            ])
+        );
+        assert_eq!(cases.len(), kinds.len());
+        for case in cases {
+            assert!(case.expected_paths.len() > 1, "{} must paginate", case.name);
+            assert!(case.expected_paths.contains(&case.replacement.0));
+            assert!(case.expected_paths.contains(&case.delete_path));
+            assert_ne!(case.replacement.0, case.delete_path);
+        }
+    }
 
     #[test]
     fn source_writes_request_only_satisfiable_topology_durability() {
