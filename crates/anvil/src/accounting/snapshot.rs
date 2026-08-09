@@ -2,7 +2,7 @@ use anvil_store::{AccountingHeadTransition, LocalChange, ReferenceDelta};
 use tonic::Status;
 
 use crate::cluster_peer::IndexHeadScanScope;
-use crate::index_runtime::events::IndexJournalBatch;
+use crate::index_runtime::events::IndexJournalPage;
 use crate::index_runtime::scanner::ClusterIndexScanner;
 
 use super::{LoadedAccountingDefinition, includes_path};
@@ -21,18 +21,16 @@ impl AccountingObjectSnapshot {
         definition: &LoadedAccountingDefinition,
         scanner: &ClusterIndexScanner,
     ) -> Result<Self, Status> {
-        let heads = scanner
-            .scan(IndexHeadScanScope::AccountingSourceObjects {
-                tenant_id: definition.tenant_id,
-                bucket_id: definition.bucket_id,
-                path_prefix: definition.stored.path_prefix.clone(),
-            })
-            .await?;
-        heads
-            .into_iter()
-            .try_fold(Self::default(), |mut total, head| {
+        let mut scan = scanner.begin(IndexHeadScanScope::AccountingSourceObjects {
+            tenant_id: definition.tenant_id,
+            bucket_id: definition.bucket_id,
+            path_prefix: definition.stored.path_prefix.clone(),
+        })?;
+        let mut total = Self::default();
+        while let Some(heads) = scan.next_page().await? {
+            for head in heads {
                 if !includes_path(&definition.stored.path_prefix, &head.exact_path) {
-                    return Ok(total);
+                    continue;
                 }
                 // Logical stored bytes include every retained live payload version,
                 // not physical EC/replica overhead. Current tombstones contribute
@@ -54,18 +52,19 @@ impl AccountingObjectSnapshot {
                         Status::resource_exhausted("accounting object baseline overflow")
                     })?;
                 }
-                Ok(total)
-            })
+            }
+        }
+        Ok(total)
     }
 
     pub(crate) fn apply(
         &mut self,
         definition: &LoadedAccountingDefinition,
-        batch: &IndexJournalBatch,
+        page: &IndexJournalPage,
     ) -> Result<bool, AccountingAdvanceError> {
         let mut next = *self;
         let mut changed = false;
-        for change in &batch.changes {
+        for change in &page.changes {
             match &change.change {
                 LocalChange::ObjectHead(head)
                     if head.tenant_id == definition.tenant_id

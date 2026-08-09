@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 #[derive(Debug, Parser)]
-#[command(name = "anvil-server", version, about = "Anvil 0.5 object server")]
+#[command(name = "anvil-server", version, about = "Anvil 0.6 object server")]
 struct Arguments {
     #[arg(long, env = "ANVIL_LISTEN", default_value = "127.0.0.1:50051")]
     listen: SocketAddr,
@@ -130,13 +130,29 @@ struct Arguments {
     )]
     index_disk_cache_bytes: u64,
 
-    /// Percentage of node memory shared by all materialised indexes (default: 10).
+    /// Percentage of node memory bounding concurrent index block materialization (default: 10).
     #[arg(
         long,
         env = "ANVIL_INDEX_MEMORY_PERCENT",
         default_value_t = IndexRuntimeConfig::DEFAULT_MEMORY_PERCENT
     )]
     index_memory_percent: u8,
+
+    /// Hard aggregate build/compaction heap budget for each index kind (default: 64 MiB).
+    #[arg(
+        long,
+        env = "ANVIL_INDEX_BUILDER_MEMORY_BYTES_PER_KIND",
+        default_value_t = IndexRuntimeConfig::DEFAULT_BUILDER_MEMORY_BYTES_PER_KIND
+    )]
+    index_builder_memory_bytes_per_kind: u64,
+
+    /// Threads in Anvil's process-owned index CPU pool (default: 4).
+    #[arg(
+        long,
+        env = "ANVIL_INDEX_RAYON_WORKERS",
+        default_value_t = IndexRuntimeConfig::DEFAULT_RAYON_WORKERS
+    )]
+    index_rayon_workers: u32,
 
     /// Maximum generations retained per index, including current (default: 3).
     #[arg(
@@ -243,6 +259,8 @@ impl Arguments {
         IndexRuntimeConfig::new(
             self.index_disk_cache_bytes,
             self.index_memory_percent,
+            self.index_builder_memory_bytes_per_kind,
+            self.index_rayon_workers,
             self.index_max_retained_generations,
             self.index_max_generation_age_hours,
             self.index_max_retained_generation_bytes,
@@ -415,6 +433,10 @@ mod tests {
             "1048576",
             "--index-memory-percent",
             "25",
+            "--index-builder-memory-bytes-per-kind",
+            "33554432",
+            "--index-rayon-workers",
+            "6",
             "--index-max-retained-generations",
             "7",
             "--index-max-generation-age-hours",
@@ -426,6 +448,8 @@ mod tests {
         .unwrap();
         assert_eq!(config.disk_cache_bytes(), 1_048_576);
         assert_eq!(config.memory_percent(), 25);
+        assert_eq!(config.builder_memory_bytes_per_kind(), 33_554_432);
+        assert_eq!(config.rayon_workers(), 6);
         assert_eq!(config.max_retained_generations(), 7);
         assert_eq!(config.max_generation_age_hours(), 48);
         assert_eq!(config.max_retained_generation_bytes(), 2_097_152);
@@ -437,6 +461,8 @@ mod tests {
             vec!["--index-disk-cache-bytes", "0"],
             vec!["--index-memory-percent", "0"],
             vec!["--index-memory-percent", "101"],
+            vec!["--index-builder-memory-bytes-per-kind", "0"],
+            vec!["--index-rayon-workers", "0"],
             vec!["--index-max-retained-generations", "0"],
             vec!["--index-max-generation-age-hours", "0"],
             vec!["--index-max-retained-generation-bytes", "0"],
@@ -458,6 +484,10 @@ mod tests {
             "default: 10 GiB",
             "--index-memory-percent",
             "default: 10",
+            "--index-builder-memory-bytes-per-kind",
+            "default: 64 MiB",
+            "--index-rayon-workers",
+            "default: 4",
             "--index-max-retained-generations",
             "including current",
             "--index-max-generation-age-hours",

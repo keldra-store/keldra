@@ -37,7 +37,7 @@ impl CatalogDefinition {
             ));
         }
         let expected = definition_path(&self.stored.name)?;
-        if expected != format!("_anvil/indexes/definitions/{}", self.stored.name) {
+        if expected != format!("_anvil/indexes/v2/definitions/{}", self.stored.name) {
             return Err(Status::data_loss(
                 "index definition cache path is not canonical",
             ));
@@ -92,12 +92,43 @@ impl IndexCatalog {
             .collect())
     }
 
-    pub(crate) fn get(
+    pub(crate) fn upsert(&self, definition: CatalogDefinition) -> Result<(), Status> {
+        definition.validate()?;
+        let key = CatalogKey {
+            tenant_id: definition.tenant_id,
+            bucket_id: definition.bucket_id,
+            name: definition.stored.name.clone(),
+        };
+        self.inner
+            .write()
+            .map_err(|_| Status::internal("index definition cache lock is poisoned"))?
+            .insert(key, definition);
+        Ok(())
+    }
+
+    pub(crate) fn remove(&self, tenant_id: u64, bucket_id: u64, name: &str) -> Result<(), Status> {
+        self.inner
+            .write()
+            .map_err(|_| Status::internal("index definition cache lock is poisoned"))?
+            .remove(&CatalogKey {
+                tenant_id,
+                bucket_id,
+                name: name.to_owned(),
+            });
+        Ok(())
+    }
+
+    /// Revalidate the disposable catalog immediately before publication.
+    /// A replaced or removed definition must never acquire a new current
+    /// generation merely because its former builder task has not yet stopped.
+    pub(crate) fn is_current(
         &self,
         tenant_id: u64,
         bucket_id: u64,
         name: &str,
-    ) -> Result<Option<CatalogDefinition>, Status> {
+        index_id: u64,
+        object_version: u64,
+    ) -> Result<bool, Status> {
         Ok(self
             .inner
             .read()
@@ -107,7 +138,10 @@ impl IndexCatalog {
                 bucket_id,
                 name: name.to_owned(),
             })
-            .cloned())
+            .is_some_and(|definition| {
+                definition.stored.index_id == index_id
+                    && definition.object_version == object_version
+            }))
     }
 }
 

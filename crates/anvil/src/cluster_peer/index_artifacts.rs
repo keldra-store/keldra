@@ -1,5 +1,6 @@
 use anvil_store::{
-    BlobRef, Head, ObjectPathSnapshot, ObjectRecordCursor, ObjectRecordExport, Version, VersionId,
+    BlobRef, CurrentHeadCursor, CurrentObjectSnapshot, Head, ObjectPathSnapshot,
+    ObjectRecordCursor, ObjectRecordExport, Version, VersionId,
 };
 use serde::{Deserialize, Serialize};
 use tonic::{Request, Response, Status};
@@ -26,6 +27,12 @@ pub(crate) enum IndexHeadScanScope {
         tenant_id: u64,
         bucket_id: u64,
         index_id: u64,
+    },
+    Run {
+        tenant_id: u64,
+        bucket_id: u64,
+        index_id: u64,
+        run_hash: [u8; 32],
     },
     SourceObjects {
         tenant_id: u64,
@@ -110,46 +117,108 @@ impl ClusterPeerService {
     ) -> Result<Response<wire::IndexHeadScanPage>, Status> {
         let admitted = self.admit(&request, request.get_ref().peer.as_ref(), 0)?;
         let scope = decode_scan_scope(request.get_ref())?;
-        let cursor = request
-            .get_ref()
-            .cursor
-            .as_ref()
-            .map(ObjectRecordCursor::from_token)
-            .transpose()
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let fence = admitted.placement.fence();
         let store = self.store.clone();
-        let page = bounded_blocking(admitted.timeout, move || {
-            store
-                .export_object_records(
-                    cursor.as_ref(),
-                    INDEX_HEAD_SCAN_MAX_RECORDS,
-                    INDEX_HEAD_SCAN_MAX_BYTES,
-                )
-                .map_err(|error| Status::internal(error.to_string()))
-        })
-        .await?;
+        let (heads, next_cursor) = if requires_retained_versions(&scope) {
+            let cursor = request
+                .get_ref()
+                .cursor
+                .clone()
+                .map(ObjectRecordCursor::from_token)
+                .transpose()
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            let page = bounded_blocking(admitted.timeout, move || {
+                store
+                    .export_object_records(
+                        cursor.as_ref(),
+                        INDEX_HEAD_SCAN_MAX_RECORDS,
+                        INDEX_HEAD_SCAN_MAX_BYTES,
+                    )
+                    .map_err(|error| Status::internal(error.to_string()))
+            })
+            .await?;
+            let heads = page
+                .records
+                .into_iter()
+                .filter_map(|record| match record {
+                    ObjectRecordExport::ExactPath(snapshot) => Some(snapshot),
+                    ObjectRecordExport::Receipt(_) => None,
+                })
+                .filter(|snapshot| {
+                    include_snapshot(
+                        &scope,
+                        snapshot,
+                        self.local_node,
+                        source_object_coordinator(&scope, snapshot, &admitted.placement),
+                    )
+                })
+                .map(current_head)
+                .collect::<Result<Vec<_>, _>>()?;
+            (
+                heads,
+                page.next_cursor.map(|cursor| cursor.as_token().to_owned()),
+            )
+        } else {
+            let cursor = request
+                .get_ref()
+                .cursor
+                .clone()
+                .map(CurrentHeadCursor::from_token)
+                .transpose()
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            let page = if let Some((tenant_id, bucket_id, prefix)) = scope.prefix() {
+                bounded_blocking(admitted.timeout, move || {
+                    store
+                        .export_current_heads_by_prefix(
+                            tenant_id,
+                            bucket_id,
+                            &prefix,
+                            cursor.as_ref(),
+                            INDEX_HEAD_SCAN_MAX_RECORDS,
+                            INDEX_HEAD_SCAN_MAX_BYTES,
+                        )
+                        .map_err(|error| Status::internal(error.to_string()))
+                })
+                .await?
+            } else {
+                // The accepted cold definition discovery cost is the one remaining
+                // global scan: head keys cannot seek a path suffix until stable
+                // tenant and bucket IDs are known. Steady-state discovery uses the
+                // ordered source journals. It scans current heads only: retained
+                // versions and receipts are not part of definition discovery.
+                bounded_blocking(admitted.timeout, move || {
+                    store
+                        .export_all_current_heads(
+                            cursor.as_ref(),
+                            INDEX_HEAD_SCAN_MAX_RECORDS,
+                            INDEX_HEAD_SCAN_MAX_BYTES,
+                        )
+                        .map_err(|error| Status::internal(error.to_string()))
+                })
+                .await?
+            };
+            let heads = page
+                .heads
+                .into_iter()
+                .filter(|snapshot| {
+                    include_current_snapshot(
+                        &scope,
+                        snapshot,
+                        self.local_node,
+                        source_current_coordinator(&scope, snapshot, &admitted.placement),
+                    )
+                })
+                .map(current_object_head)
+                .collect::<Vec<_>>();
+            (
+                heads,
+                page.next_cursor.map(|cursor| cursor.as_token().to_owned()),
+            )
+        };
         let status = self
             .store
             .local_watch_status()
             .map_err(|error| Status::internal(error.to_string()))?;
-        let heads = page
-            .records
-            .into_iter()
-            .filter_map(|record| match record {
-                ObjectRecordExport::ExactPath(snapshot)
-                    if include_snapshot(
-                        &scope,
-                        &snapshot,
-                        self.local_node,
-                        source_object_coordinator(&scope, &snapshot, &admitted.placement),
-                    ) =>
-                {
-                    Some(current_head(snapshot))
-                }
-                ObjectRecordExport::ExactPath(_) | ObjectRecordExport::Receipt(_) => None,
-            })
-            .collect::<Result<Vec<_>, _>>()?;
         self.require_unchanged(fence)?;
         Ok(Response::new(wire::IndexHeadScanPage {
             schema_version: CLUSTER_PEER_SCHEMA_VERSION,
@@ -161,9 +230,16 @@ impl ClusterPeerService {
                 .iter()
                 .map(super::encode_json)
                 .collect::<Result<_, _>>()?,
-            next_cursor: page.next_cursor.map(|cursor| cursor.as_token().to_owned()),
+            next_cursor,
         }))
     }
+}
+
+fn requires_retained_versions(scope: &IndexHeadScanScope) -> bool {
+    matches!(
+        scope,
+        IndexHeadScanScope::Generation { .. } | IndexHeadScanScope::AccountingSourceObjects { .. }
+    )
 }
 
 impl IndexHeadScanScope {
@@ -180,6 +256,22 @@ impl IndexHeadScanScope {
             } => {
                 snapshot.tenant_id == *tenant_id
                     && snapshot.bucket_id == *bucket_id
+                    && is_index_recovery_path(&snapshot.exact_path, *index_id)
+            }
+            Self::Run {
+                tenant_id,
+                bucket_id,
+                index_id,
+                run_hash,
+            } => {
+                snapshot.tenant_id == *tenant_id
+                    && snapshot.bucket_id == *bucket_id
+                    && snapshot
+                        .exact_path
+                        .strip_prefix(&crate::index_runtime::publication::run_prefix(
+                            *index_id, *run_hash,
+                        ))
+                        .is_some_and(|suffix| suffix == "root" || suffix.starts_with("blocks/"))
                     && is_index_recovery_path(&snapshot.exact_path, *index_id)
             }
             Self::SourceObjects {
@@ -206,11 +298,49 @@ impl IndexHeadScanScope {
         }
     }
 
-    fn is_source_objects(&self) -> bool {
+    fn requires_coordinator_filter(&self) -> bool {
         matches!(
             self,
-            Self::SourceObjects { .. } | Self::AccountingSourceObjects { .. }
+            Self::Generation { .. }
+                | Self::Run { .. }
+                | Self::SourceObjects { .. }
+                | Self::AccountingSourceObjects { .. }
         )
+    }
+
+    fn prefix(&self) -> Option<(u64, u64, String)> {
+        match self {
+            Self::Generation {
+                tenant_id,
+                bucket_id,
+                index_id,
+            } => Some((
+                *tenant_id,
+                *bucket_id,
+                format!("_anvil/indexes/v2/{index_id}/"),
+            )),
+            Self::Run {
+                tenant_id,
+                bucket_id,
+                index_id,
+                run_hash,
+            } => Some((
+                *tenant_id,
+                *bucket_id,
+                crate::index_runtime::publication::run_prefix(*index_id, *run_hash),
+            )),
+            Self::SourceObjects {
+                tenant_id,
+                bucket_id,
+                path_prefix,
+            }
+            | Self::AccountingSourceObjects {
+                tenant_id,
+                bucket_id,
+                path_prefix,
+            } => Some((*tenant_id, *bucket_id, path_prefix.clone())),
+            Self::Definitions | Self::AccountingDefinitions => None,
+        }
     }
 }
 
@@ -221,7 +351,7 @@ fn include_snapshot(
     source_coordinator: Option<NodeId>,
 ) -> bool {
     scope.matches(snapshot)
-        && (!scope.is_source_objects() || source_coordinator == Some(local_node))
+        && (!scope.requires_coordinator_filter() || source_coordinator == Some(local_node))
 }
 
 fn source_object_coordinator(
@@ -229,7 +359,7 @@ fn source_object_coordinator(
     snapshot: &ObjectPathSnapshot,
     placement: &crate::cluster_placement::ClusterPlacement,
 ) -> Option<NodeId> {
-    if !scope.is_source_objects() {
+    if !scope.requires_coordinator_filter() {
         return None;
     }
     object_coordinator(
@@ -240,11 +370,88 @@ fn source_object_coordinator(
     )
 }
 
-fn contains_reserved_segment(path: &str) -> bool {
+fn include_current_snapshot(
+    scope: &IndexHeadScanScope,
+    snapshot: &CurrentObjectSnapshot,
+    local_node: NodeId,
+    source_coordinator: Option<NodeId>,
+) -> bool {
+    let matches = match scope {
+        IndexHeadScanScope::Generation {
+            tenant_id,
+            bucket_id,
+            index_id,
+        } => {
+            snapshot.tenant_id == *tenant_id
+                && snapshot.bucket_id == *bucket_id
+                && is_index_recovery_path(&snapshot.exact_path, *index_id)
+        }
+        IndexHeadScanScope::Run {
+            tenant_id,
+            bucket_id,
+            index_id,
+            run_hash,
+        } => {
+            snapshot.tenant_id == *tenant_id
+                && snapshot.bucket_id == *bucket_id
+                && snapshot
+                    .exact_path
+                    .strip_prefix(&crate::index_runtime::publication::run_prefix(
+                        *index_id, *run_hash,
+                    ))
+                    .is_some_and(|suffix| suffix == "root" || suffix.starts_with("blocks/"))
+                && is_index_recovery_path(&snapshot.exact_path, *index_id)
+        }
+        IndexHeadScanScope::SourceObjects {
+            tenant_id,
+            bucket_id,
+            path_prefix,
+        } => {
+            snapshot.tenant_id == *tenant_id
+                && snapshot.bucket_id == *bucket_id
+                && !snapshot.head.deleted
+                && path_matches_prefix(&snapshot.exact_path, path_prefix)
+                && !contains_reserved_segment(&snapshot.exact_path)
+        }
+        IndexHeadScanScope::AccountingSourceObjects {
+            tenant_id,
+            bucket_id,
+            path_prefix,
+        } => {
+            snapshot.tenant_id == *tenant_id
+                && snapshot.bucket_id == *bucket_id
+                && !snapshot.head.deleted
+                && crate::accounting::includes_path(path_prefix, &snapshot.exact_path)
+        }
+        IndexHeadScanScope::Definitions => index_definition_name(&snapshot.exact_path).is_some(),
+        IndexHeadScanScope::AccountingDefinitions => {
+            crate::accounting::definition_id_from_path(&snapshot.exact_path).is_some()
+        }
+    };
+    matches && (!scope.requires_coordinator_filter() || source_coordinator == Some(local_node))
+}
+
+fn source_current_coordinator(
+    scope: &IndexHeadScanScope,
+    snapshot: &CurrentObjectSnapshot,
+    placement: &crate::cluster_placement::ClusterPlacement,
+) -> Option<NodeId> {
+    if !scope.requires_coordinator_filter() {
+        return None;
+    }
+    object_coordinator(
+        placement,
+        snapshot.tenant_id,
+        snapshot.bucket_id,
+        &snapshot.exact_path,
+    )
+}
+
+pub(super) fn contains_reserved_segment(path: &str) -> bool {
     path.split('/').any(|segment| segment == "_anvil")
 }
 
-fn valid_source_prefix(prefix: &str) -> bool {
+pub(super) fn valid_source_prefix(prefix: &str) -> bool {
     let path = prefix.strip_suffix('/').unwrap_or(prefix);
     prefix.len() <= MAX_OBJECT_PATH_BYTES
         && !prefix.starts_with('/')
@@ -273,6 +480,17 @@ fn current_head(snapshot: ObjectPathSnapshot) -> Result<IndexCurrentHead, Status
     })
 }
 
+fn current_object_head(snapshot: CurrentObjectSnapshot) -> IndexCurrentHead {
+    IndexCurrentHead {
+        tenant_id: snapshot.tenant_id,
+        bucket_id: snapshot.bucket_id,
+        exact_path: snapshot.exact_path,
+        head: snapshot.head,
+        versions: vec![snapshot.version.clone()],
+        version: snapshot.version,
+    }
+}
+
 fn decode_scan_scope(request: &wire::ScanIndexHeadsRequest) -> Result<IndexHeadScanScope, Status> {
     match request.scope.as_ref() {
         Some(wire::scan_index_heads_request::Scope::Definitions(_)) => {
@@ -293,6 +511,26 @@ fn decode_scan_scope(request: &wire::ScanIndexHeadsRequest) -> Result<IndexHeadS
         Some(wire::scan_index_heads_request::Scope::Generation(_)) => Err(
             Status::invalid_argument("index generation scan stable IDs must be non-zero"),
         ),
+        Some(wire::scan_index_heads_request::Scope::Run(scope))
+            if scope.tenant_id != 0
+                && scope.bucket_id != 0
+                && scope.index_id != 0
+                && scope.run_blake3.len() == 32 =>
+        {
+            let run_hash: [u8; 32] =
+                scope.run_blake3.as_slice().try_into().map_err(|_| {
+                    Status::invalid_argument("index run hash must contain 32 bytes")
+                })?;
+            Ok(IndexHeadScanScope::Run {
+                tenant_id: scope.tenant_id,
+                bucket_id: scope.bucket_id,
+                index_id: scope.index_id,
+                run_hash,
+            })
+        }
+        Some(wire::scan_index_heads_request::Scope::Run(_)) => Err(Status::invalid_argument(
+            "index run scan stable IDs and hash must be non-empty",
+        )),
         Some(wire::scan_index_heads_request::Scope::SourceObjects(scope))
             if scope.tenant_id != 0
                 && scope.bucket_id != 0
@@ -401,12 +639,15 @@ mod tests {
 
     #[test]
     fn scan_scopes_cannot_become_arbitrary_prefix_scans() {
-        let definition = snapshot(4, 5, "_anvil/indexes/definitions/search");
-        let generation = snapshot(4, 5, "_anvil/indexes/9/generations/2/manifest");
-        let current = snapshot(4, 5, "_anvil/indexes/9/current");
+        let definition = snapshot(4, 5, "_anvil/indexes/v2/definitions/search");
+        let legacy_definition = snapshot(4, 5, "_anvil/indexes/definitions/search");
+        let digest = "a".repeat(64);
+        let generation = snapshot(4, 5, &format!("_anvil/indexes/v2/9/manifests/{digest}"));
+        let current = snapshot(4, 5, "_anvil/indexes/v2/9/current");
         let unrelated = snapshot(4, 5, "ordinary/path");
 
         assert!(IndexHeadScanScope::Definitions.matches(&definition));
+        assert!(!IndexHeadScanScope::Definitions.matches(&legacy_definition));
         assert!(!IndexHeadScanScope::Definitions.matches(&generation));
         let scoped = IndexHeadScanScope::Generation {
             tenant_id: 4,
@@ -417,6 +658,32 @@ mod tests {
         assert!(scoped.matches(&current));
         assert!(!scoped.matches(&definition));
         assert!(!scoped.matches(&unrelated));
+        let run_hash = [3; 32];
+        let run_root = snapshot(
+            4,
+            5,
+            &crate::index_runtime::publication::run_root_path(9, run_hash),
+        );
+        let adjacent = snapshot(
+            4,
+            5,
+            &format!(
+                "{}extra",
+                crate::index_runtime::publication::run_root_path(9, run_hash)
+            ),
+        );
+        let run = IndexHeadScanScope::Run {
+            tenant_id: 4,
+            bucket_id: 5,
+            index_id: 9,
+            run_hash,
+        };
+        assert!(run.matches(&run_root));
+        assert!(!run.matches(&adjacent));
+        assert_eq!(
+            run.prefix().unwrap().2,
+            crate::index_runtime::publication::run_prefix(9, run_hash)
+        );
         assert!(
             !IndexHeadScanScope::Generation {
                 tenant_id: 4,
@@ -429,7 +696,7 @@ mod tests {
 
     #[test]
     fn scan_returns_only_the_current_descriptor() {
-        let mut source = snapshot(4, 5, "_anvil/indexes/9/current");
+        let mut source = snapshot(4, 5, "_anvil/indexes/v2/9/current");
         source.versions.insert(
             0,
             Version {
@@ -447,6 +714,42 @@ mod tests {
         let selected = current_head(source).unwrap();
         assert_eq!(selected.head.version, VersionId(7));
         assert_eq!(selected.version.id, VersionId(7));
+    }
+
+    #[test]
+    fn versioned_accounting_baseline_keeps_every_retained_payload_descriptor() {
+        let mut source = snapshot(4, 5, "customers/one.json");
+        source.versions.insert(
+            0,
+            Version {
+                id: VersionId(6),
+                blob: Some(BlobRef {
+                    hash: [1; 32],
+                    length: 10,
+                }),
+                content_type: None,
+                deleted: false,
+                committed_at_unix_millis: 1,
+            },
+        );
+        let scope = IndexHeadScanScope::AccountingSourceObjects {
+            tenant_id: 4,
+            bucket_id: 5,
+            path_prefix: "customers/".into(),
+        };
+
+        assert!(requires_retained_versions(&scope));
+        let selected = current_head(source).unwrap();
+        assert_eq!(selected.versions.len(), 2);
+        assert_eq!(
+            selected
+                .versions
+                .iter()
+                .filter_map(|version| version.blob.as_ref())
+                .map(|blob| blob.length)
+                .sum::<u64>(),
+            22
+        );
     }
 
     #[test]

@@ -153,6 +153,28 @@ impl ClusterObjectReader {
         Ok(selected)
     }
 
+    /// Returns the reconciled stable-ID metadata snapshot under one placement
+    /// fence without fetching payload bytes. Derived-view builders use its
+    /// mutation stamp to prove a reread does not pass their captured journal
+    /// target before opening the immutable BlobRef directly.
+    pub(crate) async fn current_snapshot_stable(
+        &self,
+        key: &ObjectKey,
+        tenant_id: u64,
+        bucket_id: u64,
+    ) -> Result<Option<ObjectPathSnapshot>, Status> {
+        let (placement, snapshot) = self
+            .stable_snapshot_with_ids(key, tenant_id, bucket_id)
+            .await?;
+        if let Some(snapshot) = &snapshot {
+            snapshot
+                .validate()
+                .map_err(|error| Status::data_loss(error.to_string()))?;
+        }
+        self.metadata.require_current_fence(placement.fence())?;
+        Ok(snapshot)
+    }
+
     /// Selects current or exact-version metadata and reconstructs live bytes
     /// into an anonymous file. The file remains private until the final fence
     /// check succeeds.
@@ -221,6 +243,20 @@ impl ClusterObjectReader {
     /// object path. Atomic recovery uses this for the complete prepared bundle
     /// named by Raft.
     pub(crate) async fn read_blob_bytes(&self, reference: &BlobRef) -> Result<Vec<u8>, Status> {
+        let mut payload = self.open_blob_payload(reference).await?;
+        let mut bytes = Vec::new();
+        payload
+            .read_to_end(&mut bytes)
+            .map_err(|error| Status::internal(format!("read reconstructed blob: {error}")))?;
+        Ok(bytes)
+    }
+
+    /// Reconstructs one immutable blob into the existing anonymous file spool
+    /// without copying it into a corpus-sized `Vec`.
+    pub(crate) async fn open_blob_payload(
+        &self,
+        reference: &BlobRef,
+    ) -> Result<ClusterReadPayload, Status> {
         let placement = self.metadata.current_placement()?;
         let shared = SharedOutputSpool::new(
             self.spools
@@ -232,12 +268,7 @@ impl ClusterObjectReader {
             .await
             .map_err(payload_status)?;
         self.metadata.require_current_fence(placement.fence())?;
-        let mut payload = shared.into_payload()?;
-        let mut bytes = Vec::new();
-        payload
-            .read_to_end(&mut bytes)
-            .map_err(|error| Status::internal(format!("read reconstructed blob: {error}")))?;
-        Ok(bytes)
+        shared.into_payload()
     }
 
     async fn stable_snapshot_with_ids(

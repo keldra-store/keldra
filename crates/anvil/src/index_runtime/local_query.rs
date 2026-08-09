@@ -1,6 +1,7 @@
-//! Local execution against one immutable, ordinary-object-backed generation.
+//! Local execution against one pinned immutable v2 manifest.
 
 use std::io::Read;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anvil_api::v1::{IndexFreshness, IndexQueryHit, IndexSourceFreshness, ObjectAddress};
@@ -13,23 +14,26 @@ use crate::index_service::ExecutedIndexQuery;
 
 use super::cache::{IndexCache, IndexCacheError, IndexSegmentFetcher, IndexSegmentId};
 use super::directory::ManifestIndexDirectory;
-use super::events::IndexEventRouter;
-use super::generation::{IndexCurrentPointer, IndexGenerationManifest};
-use super::publication::{current_path, generation_manifest_path};
+use super::engine::kind_for_specification;
+use super::events::{IndexBarrier, IndexEventJournal};
+use super::generation::{
+    IndexCurrentPointer, IndexGenerationManifest, ManifestReference, ManifestRun,
+};
+use super::publication::{current_path, manifest_path};
 use super::query::{IndexQueryPosition, execute_query};
 
 #[derive(Clone)]
 pub(crate) struct LocalGenerationQueryExecutor {
     reader: ClusterObjectReader,
     cache: IndexCache,
-    events: IndexEventRouter,
+    events: Arc<IndexEventJournal>,
 }
 
 impl LocalGenerationQueryExecutor {
     pub(crate) fn new(
         reader: ClusterObjectReader,
         cache: IndexCache,
-        events: IndexEventRouter,
+        events: Arc<IndexEventJournal>,
     ) -> Self {
         Self {
             reader,
@@ -39,7 +43,34 @@ impl LocalGenerationQueryExecutor {
     }
 
     async fn execute(&self, request: LocalIndexQueryRequest) -> Result<ExecutedIndexQuery, Status> {
-        let observed = self.events.current_barrier().await;
+        let started = std::time::Instant::now();
+        let kind = request
+            .definition
+            .specification
+            .as_ref()
+            .and_then(|specification| kind_for_specification(specification).ok());
+        let result = self.execute_inner(request).await;
+        if let Some(kind) = kind {
+            let returned = result
+                .as_ref()
+                .map_or(0_u64, |executed| executed.hits.len() as u64);
+            tracing::info!(
+                index.kind = ?kind,
+                histogram.anvil_index_query_duration_seconds = started.elapsed().as_secs_f64(),
+                histogram.anvil_index_query_returned_hits = returned,
+                "local index query completed"
+            );
+        }
+        result
+    }
+
+    async fn execute_inner(
+        &self,
+        request: LocalIndexQueryRequest,
+    ) -> Result<ExecutedIndexQuery, Status> {
+        // Query execution is replica-local. Freshness may use a barrier already
+        // observed by background work, but never fans out source-status RPCs.
+        let observed = query_observed_barrier(&self.events);
         let requested_generation = request.resume.as_ref().map(|resume| resume.generation);
         let Some(loaded) = self
             .load_generation(
@@ -57,7 +88,7 @@ impl LocalGenerationQueryExecutor {
                 freshness: empty_freshness(
                     request.definition.index_id,
                     request.definition.version,
-                    &observed,
+                    observed.as_ref(),
                 ),
                 next_position: None,
             });
@@ -71,9 +102,20 @@ impl LocalGenerationQueryExecutor {
             }
             return Ok(ExecutedIndexQuery {
                 hits: Vec::new(),
-                freshness: freshness(&loaded, &observed, false)?,
+                freshness: freshness(&loaded, observed.as_ref(), false)?,
                 next_position: None,
             });
+        }
+        let specification = request
+            .definition
+            .specification
+            .as_ref()
+            .ok_or_else(|| Status::data_loss("index definition has no specification"))?;
+        let expected_kind = kind_for_specification(specification).map_err(index_status)?;
+        if expected_kind != loaded.manifest.kind {
+            return Err(Status::data_loss(
+                "index manifest kind differs from its definition",
+            ));
         }
         let position = request
             .resume
@@ -84,15 +126,14 @@ impl LocalGenerationQueryExecutor {
             })
             .transpose()?
             .unwrap_or_default();
-        let specification = request
-            .definition
-            .specification
-            .as_ref()
-            .ok_or_else(|| Status::data_loss("index definition has no specification"))?;
-        let directory = ManifestIndexDirectory::open(self.cache.clone(), &loaded.manifest)
+        let directories = loaded
+            .runs
+            .iter()
+            .map(|run| ManifestIndexDirectory::open(self.cache.clone(), run))
+            .collect::<Result<Vec<_>, _>>()
             .map_err(index_status)?;
         let page = execute_query(
-            &directory,
+            &directories,
             specification,
             &request.query,
             request.limit,
@@ -123,7 +164,7 @@ impl LocalGenerationQueryExecutor {
             .transpose()?;
         Ok(ExecutedIndexQuery {
             hits,
-            freshness: freshness(&loaded, &observed, true)?,
+            freshness: freshness(&loaded, observed.as_ref(), true)?,
             next_position,
         })
     }
@@ -138,76 +179,93 @@ impl LocalGenerationQueryExecutor {
         index_id: u64,
         exact_generation: Option<u64>,
     ) -> Result<Option<LoadedGeneration>, Status> {
-        match exact_generation {
-            Some(generation) => {
-                let path = generation_manifest_path(index_id, generation);
-                let key = ObjectKey::new(tenant, bucket, &path)
-                    .map_err(|error| Status::internal(error.to_string()))?;
-                let Some(opened) = self
-                    .reader
-                    .open_stable(&key, tenant_id, bucket_id, None)
-                    .await?
-                else {
-                    return Err(Status::failed_precondition(
-                        "requested index generation is no longer retained",
-                    ));
-                };
-                if opened.version.deleted {
-                    return Err(Status::failed_precondition(
-                        "requested index generation is no longer retained",
-                    ));
-                }
-                let bytes = read_payload(opened.payload, "index generation manifest")?;
-                let manifest = IndexGenerationManifest::decode(&bytes)
-                    .map_err(|error| Status::data_loss(error.to_string()))?;
-                if manifest.index_id != index_id || manifest.generation != generation {
-                    return Err(Status::data_loss(
-                        "index generation manifest identity is invalid",
-                    ));
-                }
-                Ok(Some(LoadedGeneration {
-                    published_at_unix_millis: opened.version.committed_at_unix_millis,
-                    manifest,
-                }))
-            }
-            None => {
-                let key = ObjectKey::new(tenant, bucket, &current_path(index_id))
-                    .map_err(|error| Status::internal(error.to_string()))?;
-                let Some(opened) = self
-                    .reader
-                    .open_stable(&key, tenant_id, bucket_id, None)
-                    .await?
-                else {
-                    return Ok(None);
-                };
-                if opened.version.deleted {
-                    return Ok(None);
-                }
-                let pointer_bytes = read_payload(opened.payload, "current index pointer")?;
-                let pointer = IndexCurrentPointer::decode(&pointer_bytes)
-                    .map_err(|error| Status::data_loss(error.to_string()))?;
-                if pointer.index_id != index_id {
-                    return Err(Status::data_loss(
-                        "current index pointer belongs to another index",
-                    ));
-                }
-                let manifest_bytes = self.reader.read_blob_bytes(&pointer.manifest_blob).await?;
-                let manifest = IndexGenerationManifest::decode(&manifest_bytes)
-                    .map_err(|error| Status::data_loss(error.to_string()))?;
-                if manifest.index_id != index_id
-                    || manifest.generation != pointer.generation
-                    || manifest.definition_version != pointer.definition_version
-                {
-                    return Err(Status::data_loss(
-                        "current pointer and generation manifest disagree",
-                    ));
-                }
-                Ok(Some(LoadedGeneration {
-                    published_at_unix_millis: pointer.published_at_unix_millis,
-                    manifest,
-                }))
-            }
+        let key = ObjectKey::new(tenant, bucket, current_path(index_id))
+            .map_err(|error| Status::internal(error.to_string()))?;
+        let Some(opened) = self
+            .reader
+            .open_stable(&key, tenant_id, bucket_id, None)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if opened.version.deleted {
+            return Ok(None);
         }
+        let pointer_bytes = read_payload(opened.payload, "current index pointer")?;
+        let pointer = IndexCurrentPointer::decode(&pointer_bytes)
+            .map_err(|error| Status::data_loss(error.to_string()))?;
+        if pointer.index_id != index_id {
+            return Err(Status::data_loss(
+                "current index pointer belongs to another index",
+            ));
+        }
+        let mut published_at = pointer.published_at_unix_millis;
+        let mut manifest = self
+            .read_manifest_blob(index_id, &pointer.manifest_path, &pointer.manifest_blob)
+            .await?;
+        let requested = exact_generation.unwrap_or(pointer.generation);
+        if requested > pointer.generation {
+            return Err(Status::failed_precondition(
+                "requested index generation was never published",
+            ));
+        }
+        while manifest.generation > requested {
+            let previous = manifest.previous.as_ref().ok_or_else(|| {
+                Status::failed_precondition("requested index generation is no longer retained")
+            })?;
+            published_at = previous.published_at_unix_millis;
+            manifest = self.read_manifest_reference(index_id, previous).await?;
+        }
+        if manifest.generation != requested {
+            return Err(Status::failed_precondition(
+                "requested index generation is no longer retained",
+            ));
+        }
+
+        // Engine query order is newest first; manifest persistence is ascending
+        // so sequence validation and deterministic CAS bytes stay simple.
+        let runs = manifest.runs.iter().rev().cloned().collect();
+        Ok(Some(LoadedGeneration {
+            manifest,
+            runs,
+            published_at_unix_millis: published_at,
+        }))
+    }
+
+    async fn read_manifest_reference(
+        &self,
+        index_id: u64,
+        reference: &ManifestReference,
+    ) -> Result<IndexGenerationManifest, Status> {
+        let manifest = self
+            .read_manifest_blob(index_id, &reference.path, &reference.blob)
+            .await?;
+        if manifest.generation != reference.generation
+            || manifest.definition_version != reference.definition_version
+        {
+            return Err(Status::data_loss(
+                "index manifest predecessor identity differs from its reference",
+            ));
+        }
+        Ok(manifest)
+    }
+
+    async fn read_manifest_blob(
+        &self,
+        index_id: u64,
+        path: &str,
+        blob: &BlobRef,
+    ) -> Result<IndexGenerationManifest, Status> {
+        if path != manifest_path(index_id, blob.hash) {
+            return Err(Status::data_loss("index manifest path is not canonical"));
+        }
+        let bytes = self.reader.read_blob_bytes(blob).await?;
+        let manifest = IndexGenerationManifest::decode(&bytes)
+            .map_err(|error| Status::data_loss(error.to_string()))?;
+        if manifest.index_id != index_id {
+            return Err(Status::data_loss("index manifest belongs to another index"));
+        }
+        Ok(manifest)
     }
 }
 
@@ -247,6 +305,8 @@ impl IndexSegmentFetcher for ClusterIndexSegmentFetcher {
 
 struct LoadedGeneration {
     manifest: IndexGenerationManifest,
+    /// Newest first, matching the engine's deterministic version tie-break.
+    runs: Vec<ManifestRun>,
     published_at_unix_millis: u64,
 }
 
@@ -266,7 +326,7 @@ fn read_payload(
 
 fn freshness(
     generation: &LoadedGeneration,
-    observed: &super::events::IndexBarrier,
+    observed: Option<&IndexBarrier>,
     initial_build_complete: bool,
 ) -> Result<IndexFreshness, Status> {
     let indexed = generation
@@ -276,35 +336,35 @@ fn freshness(
         .map(|source| (source.node_id, source))
         .collect::<std::collections::BTreeMap<_, _>>();
     let observed_sources = observed
-        .sources
-        .iter()
-        .map(|(node, cursor)| (node.0, cursor))
-        .collect::<std::collections::BTreeMap<_, _>>();
+        .map(|barrier| {
+            barrier
+                .sources
+                .iter()
+                .map(|(node, cursor)| (node.0, cursor))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
     let mut node_ids = indexed.keys().copied().collect::<Vec<_>>();
     node_ids.extend(observed_sources.keys().copied());
     node_ids.sort_unstable();
     node_ids.dedup();
-    let mut rebuilding = generation.manifest.placement_fence != observed.fence;
+    let mut rebuilding =
+        observed.is_some_and(|barrier| generation.manifest.placement_fence != barrier.fence);
     let sources = node_ids
         .into_iter()
         .map(
             |node_id| match (indexed.get(&node_id), observed_sources.get(&node_id)) {
                 (Some(indexed), Some(observed)) if indexed.source == observed.source => {
-                    let lag_hint = observed.next_offset.saturating_sub(indexed.next_offset);
-                    // The source cursor is cluster-wide, so this is an upper bound
-                    // that may include unrelated objects and reserved artifacts.
-                    // Ordinary lag is evidence, not proof that this index is being
-                    // rebuilt; only a fence/source-vector mismatch sets that flag.
                     IndexSourceFreshness {
                         node_id,
                         source_epoch: indexed.source.source_epoch.to_vec(),
                         indexed_next_offset: indexed.next_offset,
                         observed_tail: observed.next_offset.checked_sub(1),
-                        lag_hint,
+                        lag_hint: observed.next_offset.saturating_sub(indexed.next_offset),
                     }
                 }
                 (Some(indexed), _) => {
-                    rebuilding = true;
+                    rebuilding |= observed.is_some();
                     IndexSourceFreshness {
                         node_id,
                         source_epoch: indexed.source.source_epoch.to_vec(),
@@ -344,11 +404,11 @@ fn freshness(
 fn empty_freshness(
     index_id: u64,
     definition_version: u64,
-    observed: &super::events::IndexBarrier,
+    observed: Option<&IndexBarrier>,
 ) -> IndexFreshness {
     let sources = observed
-        .sources
-        .iter()
+        .into_iter()
+        .flat_map(|barrier| &barrier.sources)
         .map(|(node, cursor)| IndexSourceFreshness {
             node_id: node.0,
             source_epoch: cursor.source.source_epoch.to_vec(),
@@ -371,6 +431,10 @@ fn empty_freshness(
     }
 }
 
+fn query_observed_barrier(events: &IndexEventJournal) -> Option<IndexBarrier> {
+    events.last_observed_barrier()
+}
+
 fn publication_time(unix_millis: u64) -> Result<std::time::SystemTime, Status> {
     std::time::UNIX_EPOCH
         .checked_add(Duration::from_millis(unix_millis))
@@ -385,6 +449,39 @@ fn index_status(error: anvil_index::IndexError) -> Status {
 mod tests {
     use super::*;
 
+    struct PanicAuthority;
+
+    impl super::super::events::IndexEventAuthority for PanicAuthority {
+        fn current(&self) -> Result<super::super::events::IndexEventPlacement, String> {
+            panic!("query attempted to consult cluster event authority")
+        }
+    }
+
+    struct PanicSources;
+
+    #[tonic::async_trait]
+    impl super::super::events::IndexEventSources for PanicSources {
+        async fn status(
+            &self,
+            _source: &super::super::events::IndexSource,
+        ) -> Result<anvil_store::WatchJournalStatus, super::super::events::IndexEventError>
+        {
+            panic!("query attempted a source status RPC")
+        }
+
+        async fn read_page(
+            &self,
+            _source: &super::super::events::IndexSource,
+            _expected_source: anvil_store::SourceId,
+            _after_offset: u64,
+            _limit: usize,
+            _max_bytes: u64,
+        ) -> Result<super::super::events::IndexSourcePage, super::super::events::IndexEventError>
+        {
+            panic!("query attempted a source journal RPC")
+        }
+    }
+
     #[test]
     fn millisecond_timestamp_is_exact() {
         let value = publication_time(1_234)
@@ -392,5 +489,11 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap();
         assert_eq!(value, Duration::from_millis(1_234));
+    }
+
+    #[test]
+    fn query_freshness_never_polls_cluster_sources() {
+        let events = IndexEventJournal::new(Arc::new(PanicAuthority), Arc::new(PanicSources));
+        assert!(query_observed_barrier(&events).is_none());
     }
 }

@@ -507,40 +507,27 @@ fn parse_artifact_path(path: &str, expected_index: u64) -> Result<ArtifactPathKi
         return Ok(ArtifactPathKind::AccountingMutable);
     }
     let parts = path.split('/').collect::<Vec<_>>();
-    if parts.len() < 4
+    if parts.len() < 5
         || parts[0] != "_anvil"
         || parts[1] != "indexes"
-        || parse_canonical_u64(parts[2]) != Some(expected_index)
+        || parts[2] != "v2"
+        || parse_canonical_u64(parts[3]) != Some(expected_index)
     {
         return Err(Status::invalid_argument(
             "index artifact path is outside its reserved index namespace",
         ));
     }
     match parts.as_slice() {
-        [_, _, _, "current"] => Ok(ArtifactPathKind::Current),
-        [_, _, _, "generations", generation, "manifest"]
-            if parse_canonical_u64(generation).is_some() =>
-        {
+        [_, _, _, _, "current"] => Ok(ArtifactPathKind::Current),
+        [_, _, _, _, "manifests", digest] if valid_digest(digest) => {
             Ok(ArtifactPathKind::Immutable)
         }
-        [
-            _,
-            _,
-            _,
-            "generations",
-            generation,
-            "files",
-            file,
-            "segments",
-            ordinal,
-        ] if parse_canonical_u64(generation).is_some()
-            && valid_file_id(file)
-            && parse_canonical_u64(ordinal).is_some() =>
-        {
+        [_, _, _, _, "runs", run, "root"] if valid_digest(run) => Ok(ArtifactPathKind::Immutable),
+        [_, _, _, _, "runs", run, "blocks", block] if valid_digest(run) && valid_digest(block) => {
             Ok(ArtifactPathKind::Immutable)
         }
         _ => Err(Status::invalid_argument(
-            "index artifact path does not name current, a manifest, or a file segment",
+            "index artifact path does not name a v2 current pointer, manifest, run, or component",
         )),
     }
 }
@@ -550,7 +537,7 @@ fn parse_canonical_u64(value: &str) -> Option<u64> {
     (parsed != 0 && parsed.to_string() == value).then_some(parsed)
 }
 
-fn valid_file_id(value: &str) -> bool {
+fn valid_digest(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
@@ -560,7 +547,9 @@ fn valid_file_id(value: &str) -> bool {
 pub(crate) fn index_definition_name(path: &str) -> Option<&str> {
     let parts = path.split('/').collect::<Vec<_>>();
     match parts.as_slice() {
-        ["_anvil", "indexes", "definitions", name] if valid_definition_name(name) => Some(name),
+        ["_anvil", "indexes", "v2", "definitions", name] if valid_definition_name(name) => {
+            Some(name)
+        }
         _ => None,
     }
 }
@@ -569,28 +558,85 @@ fn valid_definition_name(name: &str) -> bool {
     !name.is_empty() && name != "." && name != ".." && !name.contains('\0')
 }
 
-pub(crate) fn definition_prefix() -> &'static str {
-    "_anvil/indexes/definitions/"
+pub(crate) fn manifest_path(index_id: u64, digest: [u8; 32]) -> String {
+    format!(
+        "_anvil/indexes/v2/{index_id}/manifests/{}",
+        hex::encode(digest)
+    )
 }
 
-pub(crate) fn generation_manifest_path(index_id: u64, generation: u64) -> String {
-    format!("_anvil/indexes/{index_id}/generations/{generation}/manifest")
+pub(crate) fn run_root_path(index_id: u64, run_digest: [u8; 32]) -> String {
+    format!("{}root", run_prefix(index_id, run_digest))
 }
 
-pub(crate) fn generation_segment_path(
+pub(crate) fn run_prefix(index_id: u64, run_digest: [u8; 32]) -> String {
+    format!(
+        "_anvil/indexes/v2/{index_id}/runs/{}/",
+        hex::encode(run_digest)
+    )
+}
+
+/// Extract a run identity only from one canonical format-2 root/block path.
+/// Prefix retention uses this instead of textual starts-with matching so an
+/// adjacent digest or an extra slash cannot widen a deletion scope.
+pub(crate) fn run_hash_from_artifact_path(index_id: u64, path: &str) -> Option<[u8; 32]> {
+    let parts = path.split('/').collect::<Vec<_>>();
+    let digest = match parts.as_slice() {
+        [
+            "_anvil",
+            "indexes",
+            "v2",
+            encoded_index,
+            "runs",
+            digest,
+            "root",
+        ] if parse_canonical_u64(encoded_index) == Some(index_id) && valid_digest(digest) => {
+            *digest
+        }
+        [
+            "_anvil",
+            "indexes",
+            "v2",
+            encoded_index,
+            "runs",
+            run,
+            "blocks",
+            block,
+        ] if parse_canonical_u64(encoded_index) == Some(index_id)
+            && valid_digest(run)
+            && valid_digest(block) =>
+        {
+            *run
+        }
+        _ => return None,
+    };
+    let decoded = hex::decode(digest).ok()?;
+    decoded.try_into().ok()
+}
+
+pub(crate) fn is_manifest_artifact_path(index_id: u64, path: &str) -> bool {
+    let parts = path.split('/').collect::<Vec<_>>();
+    matches!(
+        parts.as_slice(),
+        ["_anvil", "indexes", "v2", encoded_index, "manifests", digest]
+            if parse_canonical_u64(encoded_index) == Some(index_id) && valid_digest(digest)
+    )
+}
+
+pub(crate) fn run_block_path(
     index_id: u64,
-    generation: u64,
-    file_id: [u8; 32],
-    ordinal: u64,
+    run_digest: [u8; 32],
+    block_digest: [u8; 32],
 ) -> String {
     format!(
-        "_anvil/indexes/{index_id}/generations/{generation}/files/{}/segments/{ordinal}",
-        hex::encode(file_id)
+        "{}blocks/{}",
+        run_prefix(index_id, run_digest),
+        hex::encode(block_digest)
     )
 }
 
 pub(crate) fn current_path(index_id: u64) -> String {
-    format!("_anvil/indexes/{index_id}/current")
+    format!("_anvil/indexes/v2/{index_id}/current")
 }
 
 pub(crate) fn is_index_recovery_path(path: &str, index_id: u64) -> bool {
@@ -604,25 +650,26 @@ mod tests {
     #[test]
     fn only_exact_reserved_artifact_shapes_are_accepted() {
         assert_eq!(
-            parse_artifact_path("_anvil/indexes/7/current", 7).unwrap(),
+            parse_artifact_path("_anvil/indexes/v2/7/current", 7).unwrap(),
             ArtifactPathKind::Current
         );
+        let digest = "a".repeat(64);
         assert_eq!(
-            parse_artifact_path("_anvil/indexes/7/generations/8/manifest", 7).unwrap(),
+            parse_artifact_path(&format!("_anvil/indexes/v2/7/manifests/{digest}"), 7).unwrap(),
             ArtifactPathKind::Immutable
         );
-        let file = "a".repeat(64);
         assert!(
             parse_artifact_path(
-                &format!("_anvil/indexes/7/generations/8/files/{file}/segments/1"),
+                &format!("_anvil/indexes/v2/7/runs/{digest}/blocks/{digest}"),
                 7
             )
             .is_ok()
         );
         for invalid in [
-            "_anvil/indexes/7/definition",
-            "_anvil/indexes/7/generations/8/files/name/segments/1",
-            "_anvil/indexes/07/current",
+            "_anvil/indexes/v2/7/definition",
+            "_anvil/indexes/v2/7/runs/name/descriptor",
+            "_anvil/indexes/v2/07/current",
+            "_anvil/indexes/7/current",
             "ordinary/path",
         ] {
             assert!(parse_artifact_path(invalid, 7).is_err(), "{invalid}");
@@ -632,21 +679,49 @@ mod tests {
     #[test]
     fn definition_discovery_accepts_only_the_dedicated_path_shape() {
         assert_eq!(
-            index_definition_name("_anvil/indexes/definitions/search"),
+            index_definition_name("_anvil/indexes/v2/definitions/search"),
             Some("search")
         );
-        assert_eq!(index_definition_name("_anvil/indexes/12/definition"), None);
         assert_eq!(
-            index_definition_name("_anvil/indexes/definitions/a/b"),
+            index_definition_name("_anvil/indexes/v2/12/definition"),
+            None
+        );
+        assert_eq!(
+            index_definition_name("_anvil/indexes/v2/definitions/a/b"),
             None
         );
     }
 
     #[test]
     fn generated_paths_round_trip_through_validation() {
-        assert_eq!(current_path(4), "_anvil/indexes/4/current");
-        assert!(parse_artifact_path(&generation_manifest_path(4, 9), 4).is_ok());
-        assert!(parse_artifact_path(&generation_segment_path(4, 9, [3; 32], 2), 4).is_ok());
+        assert_eq!(current_path(4), "_anvil/indexes/v2/4/current");
+        assert!(parse_artifact_path(&manifest_path(4, [2; 32]), 4).is_ok());
+        assert!(parse_artifact_path(&run_root_path(4, [3; 32]), 4).is_ok());
+        assert!(parse_artifact_path(&run_block_path(4, [3; 32], [4; 32]), 4).is_ok());
+        assert_eq!(
+            run_hash_from_artifact_path(4, &run_root_path(4, [3; 32])),
+            Some([3; 32])
+        );
+        assert_eq!(
+            run_hash_from_artifact_path(4, &run_block_path(4, [3; 32], [4; 32])),
+            Some([3; 32])
+        );
+        assert!(is_manifest_artifact_path(4, &manifest_path(4, [2; 32])));
+    }
+
+    #[test]
+    fn run_retention_parser_is_slash_safe_and_v2_only() {
+        let digest = hex::encode([3; 32]);
+        for invalid in [
+            format!("_anvil/indexes/v2/4/runs/{digest}"),
+            format!("_anvil/indexes/v2/4/runs/{digest}/"),
+            format!("_anvil/indexes/v2/4/runs/{digest}/root/extra"),
+            format!("_anvil/indexes/v2/4/runs/{digest}0/root"),
+            format!("_anvil/indexes/4/runs/{digest}/root"),
+            format!("_anvil/indexes/v2/04/runs/{digest}/root"),
+        ] {
+            assert_eq!(run_hash_from_artifact_path(4, &invalid), None, "{invalid}");
+        }
     }
 
     #[test]

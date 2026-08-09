@@ -23,15 +23,26 @@ impl ClusterPeerService {
         context: Option<&wire::PeerContext>,
         expected_hop: u32,
     ) -> Result<AdmittedPeer, Status> {
+        self.admit_with_timeout_limit(request, context, expected_hop, MAX_CLUSTER_OPERATION_TIME)
+    }
+
+    pub(super) fn admit_with_timeout_limit<T>(
+        &self,
+        request: &Request<T>,
+        context: Option<&wire::PeerContext>,
+        expected_hop: u32,
+        max_timeout: Duration,
+    ) -> Result<AdmittedPeer, Status> {
         let pin = request
             .extensions()
             .get::<PeerSpkiSha256>()
             .copied()
             .ok_or_else(|| Status::unauthenticated("peer mTLS identity is missing"))?;
-        self.admit_pin(
+        self.admit_pin_with_timeout_limit(
             pin,
             context.ok_or_else(|| Status::invalid_argument("peer context is required"))?,
             expected_hop,
+            max_timeout,
         )
     }
 
@@ -41,7 +52,17 @@ impl ClusterPeerService {
         context: &wire::PeerContext,
         expected_hop: u32,
     ) -> Result<AdmittedPeer, Status> {
-        validate_context(context, expected_hop)?;
+        self.admit_pin_with_timeout_limit(pin, context, expected_hop, MAX_CLUSTER_OPERATION_TIME)
+    }
+
+    pub(super) fn admit_pin_with_timeout_limit(
+        &self,
+        pin: PeerSpkiSha256,
+        context: &wire::PeerContext,
+        expected_hop: u32,
+        max_timeout: Duration,
+    ) -> Result<AdmittedPeer, Status> {
+        validate_context_with_timeout_limit(context, expected_hop, max_timeout)?;
         let cluster_id = parse_cluster_id(&context.cluster_id)?;
         let source = NodeId(context.source_node_id);
         let authenticated = authorize_peer_rpc(
@@ -83,6 +104,14 @@ pub(super) fn validate_context(
     context: &wire::PeerContext,
     expected_hop: u32,
 ) -> Result<(), Status> {
+    validate_context_with_timeout_limit(context, expected_hop, MAX_CLUSTER_OPERATION_TIME)
+}
+
+pub(super) fn validate_context_with_timeout_limit(
+    context: &wire::PeerContext,
+    expected_hop: u32,
+    max_timeout: Duration,
+) -> Result<(), Status> {
     if context.schema_version != CLUSTER_PEER_SCHEMA_VERSION {
         return Err(Status::failed_precondition(format!(
             "unsupported cluster-peer schema {}",
@@ -99,9 +128,9 @@ pub(super) fn validate_context(
         ));
     }
     let deadline = Duration::from_millis(u64::from(context.remaining_deadline_millis));
-    if deadline.is_zero() || deadline > MAX_CLUSTER_OPERATION_TIME {
+    if deadline.is_zero() || deadline > max_timeout {
         return Err(Status::invalid_argument(
-            "remaining cluster-operation deadline must be within 1ms..=30s",
+            "remaining cluster-operation deadline exceeds this operation's internal limit",
         ));
     }
     Ok(())

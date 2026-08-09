@@ -1,22 +1,22 @@
-//! Immutable generation manifests over ordinary Anvil object identities.
+//! Version-2 immutable logical-run and generation manifests.
 
+use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anvil_store::{BlobRef, PlacementLogId, SourceId};
+use anvil_index::{IndexKind, RunDescriptor};
+use anvil_store::{BlobRef, PlacementLogId, SourceId, VersionId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::engine::{BuiltIndexGeneration, IndexBuildDiagnostics};
 use super::events::IndexBarrier;
-use super::publication::{generation_manifest_path, generation_segment_path};
+use super::publication::{manifest_path, run_root_path};
 
-const GENERATION_MANIFEST_FORMAT: u16 = 1;
-const CURRENT_POINTER_FORMAT: u16 = 1;
-/// Fixed minimum-product logical cache segment size. This is unrelated to an
-/// erasure-code shard or stripe and can change in a later file generation.
-pub(crate) const DEFAULT_INDEX_SEGMENT_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const INDEX_MANIFEST_FORMAT: u16 = 2;
+pub(crate) const INDEX_CURRENT_FORMAT: u16 = 2;
+pub(crate) const MAX_RUNS_PER_LEVEL: usize = 4;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ManifestSourceCheckpoint {
     pub node_id: u64,
     pub source: SourceId,
@@ -24,51 +24,156 @@ pub(crate) struct ManifestSourceCheckpoint {
     pub next_offset: u64,
 }
 
+/// One logical run. Its root recursively names every independently published
+/// block, so neither this manifest nor runtime heap grows with block count.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) struct ManifestSegment {
-    pub logical_offset: u64,
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManifestRun {
+    /// Monotonic source-state order. Larger values are newer.
+    pub sequence: u64,
+    pub level: u8,
+    pub root_path: String,
+    pub root_blob: BlobRef,
+    pub root_object_version: VersionId,
+    pub mutation_count: u64,
+    pub live_document_count: u64,
+    pub minimum_version: u64,
+    pub maximum_version: u64,
+    /// Root plus every recursively referenced block in this run.
+    pub authoritative_bytes: u64,
+}
+
+impl ManifestRun {
+    pub(crate) fn from_descriptor(
+        index_id: u64,
+        sequence: u64,
+        descriptor: &RunDescriptor,
+        root_blob: BlobRef,
+        root_object_version: VersionId,
+    ) -> Result<Self, GenerationError> {
+        let value = Self {
+            sequence,
+            level: descriptor.level,
+            root_path: run_root_path(index_id, descriptor.hash),
+            root_blob,
+            root_object_version,
+            mutation_count: descriptor.mutation_count,
+            live_document_count: descriptor.live_document_count,
+            minimum_version: descriptor.minimum_version,
+            maximum_version: descriptor.maximum_version,
+            authoritative_bytes: descriptor.encoded_bytes,
+        };
+        value.validate(index_id)?;
+        Ok(value)
+    }
+
+    fn validate(&self, index_id: u64) -> Result<(), GenerationError> {
+        if self.sequence == 0
+            || self.root_blob.length == 0
+            || self.root_object_version.0 == 0
+            || self.mutation_count == 0
+            || self.live_document_count > self.mutation_count
+            || self.maximum_version < self.minimum_version
+            || self.authoritative_bytes < self.root_blob.length
+            || self.root_path != run_root_path(index_id, self.root_blob.hash)
+        {
+            return Err(GenerationError::InvalidRun(
+                "logical run identity, statistics, or root reference is invalid".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManifestReference {
+    pub generation: u64,
+    pub definition_version: u64,
+    pub path: String,
     pub blob: BlobRef,
-    pub object_path: String,
+    pub object_version: VersionId,
+    pub published_at_unix_millis: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) struct ManifestFile {
-    pub name: String,
-    pub file_blake3: [u8; 32],
-    pub logical_length: u64,
-    pub segments: Vec<ManifestSegment>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct IndexGenerationManifest {
     format: u16,
     pub index_id: u64,
     pub generation: u64,
     pub definition_version: u64,
+    pub kind: IndexKind,
     pub placement_fence: PlacementLogId,
     pub atomic_finalized_through: Option<u64>,
     pub sources: Vec<ManifestSourceCheckpoint>,
-    pub files: Vec<ManifestFile>,
+    /// Strictly increasing source-state order. Queries visit this in reverse.
+    pub runs: Vec<ManifestRun>,
+    pub previous: Option<ManifestReference>,
     pub accepted_objects: u64,
     pub skipped_objects: u64,
     pub authoritative_bytes: u64,
 }
 
 impl IndexGenerationManifest {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        index_id: u64,
+        generation: u64,
+        definition_version: u64,
+        kind: IndexKind,
+        barrier: &IndexBarrier,
+        runs: Vec<ManifestRun>,
+        previous: Option<ManifestReference>,
+        accepted_objects: u64,
+        skipped_objects: u64,
+    ) -> Result<Self, GenerationError> {
+        let authoritative_bytes = runs.iter().try_fold(0_u64, |total, run| {
+            total
+                .checked_add(run.authoritative_bytes)
+                .ok_or(GenerationError::LengthOverflow)
+        })?;
+        let value = Self {
+            format: INDEX_MANIFEST_FORMAT,
+            index_id,
+            generation,
+            definition_version,
+            kind,
+            placement_fence: barrier.fence,
+            atomic_finalized_through: barrier.atomic.finalized_through(),
+            sources: barrier
+                .sources
+                .iter()
+                .map(|(node, cursor)| ManifestSourceCheckpoint {
+                    node_id: node.0,
+                    source: cursor.source,
+                    next_offset: cursor.next_offset,
+                })
+                .collect(),
+            runs,
+            previous,
+            accepted_objects,
+            skipped_objects,
+            authoritative_bytes,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
     pub(crate) fn encode(&self) -> Result<Vec<u8>, GenerationError> {
         self.validate()?;
         serde_json::to_vec(self).map_err(|error| GenerationError::Encode(error.to_string()))
     }
 
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, GenerationError> {
-        let manifest: Self = serde_json::from_slice(bytes)
+        let value: Self = serde_json::from_slice(bytes)
             .map_err(|error| GenerationError::Decode(error.to_string()))?;
-        manifest.validate()?;
-        Ok(manifest)
+        value.validate()?;
+        Ok(value)
     }
 
     pub(crate) fn validate(&self) -> Result<(), GenerationError> {
-        if self.format != GENERATION_MANIFEST_FORMAT
+        if self.format != INDEX_MANIFEST_FORMAT
             || self.index_id == 0
             || self.generation == 0
             || self.definition_version == 0
@@ -76,7 +181,7 @@ impl IndexGenerationManifest {
             || self.placement_fence.index == 0
         {
             return Err(GenerationError::InvalidManifest(
-                "generation identity or fence is invalid".into(),
+                "manifest identity or placement fence is invalid".into(),
             ));
         }
         let mut previous_node = None;
@@ -91,43 +196,78 @@ impl IndexGenerationManifest {
             }
             previous_node = Some(source.node_id);
         }
+        let mut levels = BTreeMap::<u8, usize>::new();
+        let mut previous_sequence = None;
         let mut total = 0_u64;
-        for file in &self.files {
-            if file.name.is_empty() || file.logical_length == 0 || file.segments.is_empty() {
+        for run in &self.runs {
+            run.validate(self.index_id)?;
+            if previous_sequence.is_some_and(|previous| previous >= run.sequence) {
                 return Err(GenerationError::InvalidManifest(
-                    "generation file is empty".into(),
+                    "logical runs are not strictly source ordered".into(),
                 ));
             }
-            let mut expected = 0_u64;
-            for segment in &file.segments {
-                if segment.logical_offset != expected || segment.blob.length == 0 {
-                    return Err(GenerationError::InvalidManifest(
-                        "generation file segments are not contiguous".into(),
-                    ));
-                }
-                expected = expected
-                    .checked_add(segment.blob.length)
-                    .ok_or(GenerationError::LengthOverflow)?;
-                total = total
-                    .checked_add(segment.blob.length)
-                    .ok_or(GenerationError::LengthOverflow)?;
-            }
-            if expected != file.logical_length {
+            let count = levels.entry(run.level).or_default();
+            *count += 1;
+            if *count > MAX_RUNS_PER_LEVEL {
                 return Err(GenerationError::InvalidManifest(
-                    "generation file length differs from its segments".into(),
+                    "one logical run level exceeds its four-run bound".into(),
                 ));
             }
+            total = total
+                .checked_add(run.authoritative_bytes)
+                .ok_or(GenerationError::LengthOverflow)?;
+            previous_sequence = Some(run.sequence);
         }
         if total != self.authoritative_bytes {
             return Err(GenerationError::InvalidManifest(
-                "generation authoritative byte count is invalid".into(),
+                "manifest authoritative byte count is invalid".into(),
             ));
         }
+        if let Some(previous) = &self.previous {
+            if previous.generation == 0
+                || previous.generation >= self.generation
+                || previous.definition_version == 0
+                || previous.blob.length == 0
+                || previous.object_version.0 == 0
+                || previous.published_at_unix_millis == 0
+                || previous.path != manifest_path(self.index_id, previous.blob.hash)
+            {
+                return Err(GenerationError::InvalidManifest(
+                    "manifest predecessor is invalid".into(),
+                ));
+            }
+        }
         Ok(())
+    }
+
+    pub(crate) fn barrier(&self) -> Result<IndexBarrier, GenerationError> {
+        let sources = self
+            .sources
+            .iter()
+            .map(|source| {
+                (
+                    anvil_consensus::NodeId(source.node_id),
+                    super::events::IndexSourceCursor {
+                        source: source.source,
+                        next_offset: source.next_offset,
+                    },
+                )
+            })
+            .collect();
+        Ok(IndexBarrier {
+            fence: self.placement_fence,
+            atomic: super::events::AtomicProgramWatermark::new(
+                self.atomic_finalized_through,
+                self.atomic_finalized_through,
+                0,
+            ),
+            sources,
+        })
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct IndexCurrentPointer {
     format: u16,
     pub index_id: u64,
@@ -135,6 +275,7 @@ pub(crate) struct IndexCurrentPointer {
     pub definition_version: u64,
     pub manifest_path: String,
     pub manifest_blob: BlobRef,
+    pub manifest_object_version: VersionId,
     pub published_at_unix_millis: u64,
 }
 
@@ -142,6 +283,7 @@ impl IndexCurrentPointer {
     pub(crate) fn new(
         manifest: &IndexGenerationManifest,
         manifest_blob: BlobRef,
+        manifest_object_version: VersionId,
         published_at: SystemTime,
     ) -> Result<Self, GenerationError> {
         let published_at_unix_millis = u64::try_from(
@@ -152,12 +294,13 @@ impl IndexCurrentPointer {
         )
         .map_err(|_| GenerationError::TimestampOverflow)?;
         let value = Self {
-            format: CURRENT_POINTER_FORMAT,
+            format: INDEX_CURRENT_FORMAT,
             index_id: manifest.index_id,
             generation: manifest.generation,
             definition_version: manifest.definition_version,
-            manifest_path: generation_manifest_path(manifest.index_id, manifest.generation),
+            manifest_path: manifest_path(manifest.index_id, manifest_blob.hash),
             manifest_blob,
+            manifest_object_version,
             published_at_unix_millis,
         };
         value.validate()?;
@@ -170,20 +313,32 @@ impl IndexCurrentPointer {
     }
 
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, GenerationError> {
-        let pointer: Self = serde_json::from_slice(bytes)
+        let value: Self = serde_json::from_slice(bytes)
             .map_err(|error| GenerationError::Decode(error.to_string()))?;
-        pointer.validate()?;
-        Ok(pointer)
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub(crate) fn as_manifest_reference(&self) -> ManifestReference {
+        ManifestReference {
+            generation: self.generation,
+            definition_version: self.definition_version,
+            path: self.manifest_path.clone(),
+            blob: self.manifest_blob.clone(),
+            object_version: self.manifest_object_version,
+            published_at_unix_millis: self.published_at_unix_millis,
+        }
     }
 
     fn validate(&self) -> Result<(), GenerationError> {
-        if self.format != CURRENT_POINTER_FORMAT
+        if self.format != INDEX_CURRENT_FORMAT
             || self.index_id == 0
             || self.generation == 0
             || self.definition_version == 0
             || self.manifest_blob.length == 0
+            || self.manifest_object_version.0 == 0
             || self.published_at_unix_millis == 0
-            || self.manifest_path != generation_manifest_path(self.index_id, self.generation)
+            || self.manifest_path != manifest_path(self.index_id, self.manifest_blob.hash)
         {
             return Err(GenerationError::InvalidPointer);
         }
@@ -191,153 +346,35 @@ impl IndexCurrentPointer {
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct PreparedIndexGeneration {
-    pub manifest: IndexGenerationManifest,
-    /// Segment bytes in the same file/segment order as `manifest`.
-    pub segment_bytes: Vec<Vec<Vec<u8>>>,
-}
-
-impl PreparedIndexGeneration {
-    pub(crate) fn prepare(
-        index_id: u64,
-        generation: u64,
-        definition_version: u64,
-        barrier: &IndexBarrier,
-        built: BuiltIndexGeneration,
-        segment_bytes: usize,
-    ) -> Result<Self, GenerationError> {
-        if segment_bytes == 0 {
-            return Err(GenerationError::ZeroSegmentBytes);
-        }
-        let diagnostics = built.diagnostics;
-        let mut files = Vec::new();
-        let mut all_bytes = Vec::new();
-        let mut authoritative_bytes = 0_u64;
-        for generated in built.artifacts.into_files() {
-            if generated.bytes.is_empty() {
-                return Err(GenerationError::EmptyGeneratedFile(generated.name));
-            }
-            let file_blake3 = *blake3::hash(&generated.bytes).as_bytes();
-            let logical_length = generated.bytes.len() as u64;
-            let mut offset = 0_u64;
-            let mut descriptors = Vec::new();
-            let mut bytes = Vec::new();
-            for (index, segment) in generated.bytes.chunks(segment_bytes).enumerate() {
-                let blob = BlobRef {
-                    hash: *blake3::hash(segment).as_bytes(),
-                    length: segment.len() as u64,
-                };
-                let ordinal = u64::try_from(index)
-                    .map_err(|_| GenerationError::LengthOverflow)?
-                    .checked_add(1)
-                    .ok_or(GenerationError::LengthOverflow)?;
-                descriptors.push(ManifestSegment {
-                    logical_offset: offset,
-                    object_path: generation_segment_path(
-                        index_id,
-                        generation,
-                        file_blake3,
-                        ordinal,
-                    ),
-                    blob: blob.clone(),
-                });
-                offset = offset
-                    .checked_add(blob.length)
-                    .ok_or(GenerationError::LengthOverflow)?;
-                authoritative_bytes = authoritative_bytes
-                    .checked_add(blob.length)
-                    .ok_or(GenerationError::LengthOverflow)?;
-                bytes.push(segment.to_vec());
-            }
-            files.push(ManifestFile {
-                name: generated.name,
-                file_blake3,
-                logical_length,
-                segments: descriptors,
-            });
-            all_bytes.push(bytes);
-        }
-        files.sort_by(|left, right| left.name.cmp(&right.name));
-        // `all_bytes` was produced in engine artifact order, which is already
-        // BTreeMap order. Assert the invariant before publication relies on it.
-        debug_assert!(files.windows(2).all(|pair| pair[0].name < pair[1].name));
-        let sources = barrier
-            .sources
-            .iter()
-            .map(|(node, cursor)| ManifestSourceCheckpoint {
-                node_id: node.0,
-                source: cursor.source,
-                next_offset: cursor.next_offset,
-            })
-            .collect();
-        let manifest = IndexGenerationManifest {
-            format: GENERATION_MANIFEST_FORMAT,
-            index_id,
-            generation,
-            definition_version,
-            placement_fence: barrier.fence,
-            atomic_finalized_through: barrier.atomic.finalized_through(),
-            sources,
-            files,
-            accepted_objects: diagnostics.accepted_objects,
-            skipped_objects: diagnostics.skipped_objects,
-            authoritative_bytes,
-        };
-        manifest.validate()?;
-        Ok(Self {
-            manifest,
-            segment_bytes: all_bytes,
-        })
-    }
-
-    pub(crate) fn diagnostics(&self) -> IndexBuildDiagnostics {
-        IndexBuildDiagnostics {
-            accepted_objects: self.manifest.accepted_objects,
-            skipped_objects: self.manifest.skipped_objects,
-        }
-    }
-}
-
 #[derive(Debug, Error, Eq, PartialEq)]
 pub(crate) enum GenerationError {
+    #[error("index logical run is invalid: {0}")]
+    InvalidRun(String),
     #[error("index generation manifest is invalid: {0}")]
     InvalidManifest(String),
-    #[error("index current pointer is invalid")]
+    #[error("index current pointer is invalid or uses an unsupported format")]
     InvalidPointer,
-    #[error("index generation contains an empty file `{0}`")]
-    EmptyGeneratedFile(String),
-    #[error("index logical segment byte target must be positive")]
-    ZeroSegmentBytes,
     #[error("index generation length overflow")]
     LengthOverflow,
     #[error("system clock predates the Unix epoch")]
     ClockBeforeEpoch,
     #[error("index publication timestamp overflow")]
     TimestampOverflow,
-    #[error("encode index generation: {0}")]
+    #[error("encode index v2 object: {0}")]
     Encode(String),
-    #[error("decode index generation: {0}")]
+    #[error("decode index v2 object: {0}")]
     Decode(String),
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use anvil_consensus::NodeId;
-    use anvil_index::IndexArtifacts;
 
     use super::*;
     use crate::index_runtime::events::{AtomicProgramWatermark, IndexSourceCursor};
 
-    #[test]
-    fn files_are_split_into_independently_addressable_logical_segments() {
-        let mut artifacts = IndexArtifacts::default();
-        artifacts
-            .insert("path/entries.map", vec![1, 2, 3, 4, 5])
-            .unwrap();
-        let barrier = IndexBarrier {
+    fn barrier() -> IndexBarrier {
+        IndexBarrier {
             fence: PlacementLogId { term: 2, index: 7 },
             atomic: AtomicProgramWatermark::new(Some(9), Some(9), 0),
             sources: BTreeMap::from([(
@@ -350,28 +387,91 @@ mod tests {
                     next_offset: 12,
                 },
             )]),
-        };
-        let prepared = PreparedIndexGeneration::prepare(
-            4,
-            5,
-            6,
-            &barrier,
-            BuiltIndexGeneration {
-                artifacts,
-                diagnostics: IndexBuildDiagnostics {
-                    accepted_objects: 1,
-                    skipped_objects: 0,
-                },
+        }
+    }
+
+    fn run(sequence: u64, level: u8) -> ManifestRun {
+        let digest = [sequence as u8; 32];
+        ManifestRun {
+            sequence,
+            level,
+            root_path: run_root_path(4, digest),
+            root_blob: BlobRef {
+                hash: digest,
+                length: 10,
             },
+            root_object_version: VersionId(sequence + 5),
+            mutation_count: 2,
+            live_document_count: 2,
+            minimum_version: 1,
+            maximum_version: 2,
+            authoritative_bytes: 20,
+        }
+    }
+
+    #[test]
+    fn v2_pointer_and_manifest_round_trip() {
+        let manifest = IndexGenerationManifest::new(
+            4,
+            1,
+            8,
+            IndexKind::Path,
+            &barrier(),
+            vec![run(1, 0)],
+            None,
             2,
+            0,
         )
         .unwrap();
-        assert_eq!(prepared.manifest.files[0].segments.len(), 3);
-        assert_eq!(prepared.manifest.authoritative_bytes, 5);
-        assert_eq!(prepared.segment_bytes[0], [vec![1, 2], vec![3, 4], vec![5]]);
+        let encoded = manifest.encode().unwrap();
+        assert_eq!(IndexGenerationManifest::decode(&encoded).unwrap(), manifest);
+        let blob = BlobRef {
+            hash: *blake3::hash(&encoded).as_bytes(),
+            length: encoded.len() as u64,
+        };
+        let pointer = IndexCurrentPointer::new(
+            &manifest,
+            blob,
+            VersionId(9),
+            UNIX_EPOCH + std::time::Duration::from_secs(1),
+        )
+        .unwrap();
         assert_eq!(
-            IndexGenerationManifest::decode(&prepared.manifest.encode().unwrap()).unwrap(),
-            prepared.manifest
+            IndexCurrentPointer::decode(&pointer.encode().unwrap()).unwrap(),
+            pointer
         );
+    }
+
+    #[test]
+    fn fan_in_is_bounded_per_level_not_for_the_whole_index() {
+        let runs = (1..=8)
+            .map(|sequence| run(sequence, u8::from(sequence > 4)))
+            .collect();
+        assert!(
+            IndexGenerationManifest::new(4, 1, 8, IndexKind::Path, &barrier(), runs, None, 8, 0,)
+                .is_ok()
+        );
+        let too_many = (1..=5).map(|sequence| run(sequence, 0)).collect();
+        assert!(
+            IndexGenerationManifest::new(
+                4,
+                1,
+                8,
+                IndexKind::Path,
+                &barrier(),
+                too_many,
+                None,
+                5,
+                0,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn v1_values_are_rejected_not_interpreted() {
+        let old = br#"{"format":1,"index_id":1,"generation":1}"#;
+        assert!(IndexGenerationManifest::decode(old).is_err());
+        assert!(IndexCurrentPointer::decode(old).is_err());
     }
 }

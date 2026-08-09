@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anvil_consensus::{DecisionRaft, NodeId};
@@ -10,7 +11,9 @@ use tonic::Status;
 
 use crate::cluster_object_read::ClusterObjectReader;
 use crate::cluster_placement::ClusterPlacement;
-use crate::index_runtime::events::{IndexBarrier, IndexEventCatchUp, IndexEventRouter};
+use crate::index_runtime::events::{
+    IndexBarrier, IndexEventJournal, IndexJournalPage, MAX_INDEX_EVENT_PAGE_BYTES,
+};
 use crate::index_runtime::placement::{IndexIdentity, IndexPlacement};
 use crate::index_runtime::scanner::ClusterIndexScanner;
 
@@ -116,7 +119,7 @@ struct RunningWorker {
 
 #[derive(Clone)]
 pub(crate) struct AccountingBuilderDependencies {
-    pub(crate) router: IndexEventRouter,
+    pub(crate) journal: Arc<IndexEventJournal>,
     pub(crate) scanner: ClusterIndexScanner,
     pub(crate) reader: ClusterObjectReader,
     pub(crate) publisher: AccountingPublisher,
@@ -129,58 +132,73 @@ async fn run_worker(
     loop {
         match build_from_scan(&definition, &dependencies).await {
             Ok((mut snapshot, mut through)) => loop {
-                match dependencies.router.changes_after(&through).await {
-                    IndexEventCatchUp::Available {
-                        batches,
-                        through: latest,
-                    } => {
-                        let mut dirty = false;
-                        let mut failed = false;
-                        for batch in batches {
-                            let traffic_changed = batch
-                                .changes
-                                .iter()
-                                .any(|change| traffic_source_change(&definition, &change.change));
-                            match snapshot.apply(&definition, &batch) {
-                                Ok(changed) => dirty |= changed || traffic_changed,
-                                Err(error) => {
-                                    tracing::info!(
-                                        accounting.id = definition.stored.accounting_id,
-                                        %error,
-                                        "accounting transition evidence requires a current-head rebase"
-                                    );
-                                    failed = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if failed {
-                            break;
-                        }
-                        through = latest;
-                        if dirty
-                            && let Err(error) =
-                                publish_snapshot(&definition, &dependencies, snapshot, &through)
-                                    .await
-                        {
-                            tracing::warn!(
-                                accounting.id = definition.stored.accounting_id,
-                                %error,
-                                "accounting rollup publication failed; rebasing before retry"
-                            );
-                            break;
-                        }
-                        tokio::time::sleep(IDLE_INTERVAL).await;
-                    }
-                    IndexEventCatchUp::RescanRequired { reason, .. } => {
+                let target = match dependencies.journal.capture_barrier().await {
+                    Ok(target) => target,
+                    Err(error) => {
                         tracing::info!(
                             accounting.id = definition.stored.accounting_id,
-                            ?reason,
-                            "accounting event history requires a current-head rebase"
+                            %error,
+                            "accounting cannot capture a complete journal barrier"
                         );
                         break;
                     }
+                };
+                let mut dirty = false;
+                let mut failed = false;
+                while through != target {
+                    let page = match dependencies
+                        .journal
+                        .next_page(&through, &target, MAX_INDEX_EVENT_PAGE_BYTES)
+                        .await
+                    {
+                        Ok(Some(page)) => page,
+                        Ok(None) => break,
+                        Err(error) => {
+                            tracing::info!(
+                                accounting.id = definition.stored.accounting_id,
+                                %error,
+                                "accounting journal evidence requires a current-head rebase"
+                            );
+                            failed = true;
+                            break;
+                        }
+                    };
+                    match apply_page(&definition, &mut snapshot, &page) {
+                        Ok(changed) => dirty |= changed,
+                        Err(error) => {
+                            tracing::info!(
+                                accounting.id = definition.stored.accounting_id,
+                                %error,
+                                "accounting transition evidence requires a current-head rebase"
+                            );
+                            failed = true;
+                            break;
+                        }
+                    }
+                    through = page.through;
                 }
+                if failed {
+                    break;
+                }
+                if through != target {
+                    tracing::info!(
+                        accounting.id = definition.stored.accounting_id,
+                        "accounting journal stopped before its captured barrier"
+                    );
+                    break;
+                }
+                if dirty
+                    && let Err(error) =
+                        publish_snapshot(&definition, &dependencies, snapshot, &through).await
+                {
+                    tracing::warn!(
+                        accounting.id = definition.stored.accounting_id,
+                        %error,
+                        "accounting rollup publication failed; rebasing before retry"
+                    );
+                    break;
+                }
+                tokio::time::sleep(IDLE_INTERVAL).await;
             },
             Err(error) => {
                 tracing::warn!(
@@ -198,30 +216,47 @@ async fn build_from_scan(
     definition: &LoadedAccountingDefinition,
     dependencies: &AccountingBuilderDependencies,
 ) -> Result<(AccountingObjectSnapshot, IndexBarrier), Status> {
-    let mut through = dependencies.router.current_barrier().await;
+    let mut through = dependencies
+        .journal
+        .capture_barrier()
+        .await
+        .map_err(|error| Status::unavailable(error.to_string()))?;
     let mut snapshot = AccountingObjectSnapshot::initial(definition, &dependencies.scanner).await?;
-    match dependencies.router.changes_after(&through).await {
-        IndexEventCatchUp::Available {
-            batches,
-            through: latest,
-        } => {
-            for batch in batches {
-                snapshot.apply(definition, &batch).map_err(|error| {
-                    Status::unavailable(format!(
-                        "accounting baseline transition evidence is unavailable: {error}"
-                    ))
-                })?;
-            }
-            through = latest;
-        }
-        IndexEventCatchUp::RescanRequired { .. } => {
-            return Err(Status::unavailable(
-                "accounting event history changed during the baseline scan",
-            ));
-        }
+    let target = dependencies
+        .journal
+        .capture_barrier()
+        .await
+        .map_err(|error| Status::unavailable(error.to_string()))?;
+    while through != target {
+        let page = dependencies
+            .journal
+            .next_page(&through, &target, MAX_INDEX_EVENT_PAGE_BYTES)
+            .await
+            .map_err(|error| Status::unavailable(error.to_string()))?
+            .ok_or_else(|| {
+                Status::unavailable("accounting journal stopped before its captured barrier")
+            })?;
+        apply_page(definition, &mut snapshot, &page).map_err(|error| {
+            Status::unavailable(format!(
+                "accounting baseline transition evidence is unavailable: {error}"
+            ))
+        })?;
+        through = page.through;
     }
     publish_snapshot(definition, dependencies, snapshot, &through).await?;
     Ok((snapshot, through))
+}
+
+fn apply_page(
+    definition: &LoadedAccountingDefinition,
+    snapshot: &mut AccountingObjectSnapshot,
+    page: &IndexJournalPage,
+) -> Result<bool, super::snapshot::AccountingAdvanceError> {
+    let traffic_changed = page
+        .changes
+        .iter()
+        .any(|change| traffic_source_change(definition, &change.change));
+    Ok(snapshot.apply(definition, page)? || traffic_changed)
 }
 
 async fn publish_snapshot(

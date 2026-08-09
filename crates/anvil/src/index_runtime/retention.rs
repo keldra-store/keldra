@@ -1,21 +1,31 @@
-//! Configured count/age/byte retention for obsolete immutable generations.
+//! Bounded generation retention over ordinary format-2 index objects.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anvil_store::VersionId;
 use tonic::Status;
 
+use crate::cluster_object_read::ClusterObjectReader;
 use crate::cluster_peer::IndexHeadScanScope;
 use crate::index_config::IndexRuntimeConfig;
 use crate::index_service::StoredIndexDefinition;
 
-use super::publication::{IndexArtifactDelete, IndexArtifactRouter, current_path};
+use super::generation::{IndexGenerationManifest, ManifestReference};
+use super::publication::{
+    IndexArtifactDelete, IndexArtifactRouter, current_path, is_manifest_artifact_path,
+    run_hash_from_artifact_path,
+};
+use super::publisher::PublishedGeneration;
 use super::scanner::ClusterIndexScanner;
+
+const UNREACHABLE_ARTIFACT_SAFETY_MILLIS: u64 = 24 * 60 * 60 * 1_000;
+const PUBLIC_REQUEST_SAFETY_MILLIS: u64 = 30 * 1_000;
 
 #[derive(Clone)]
 pub(crate) struct IndexGenerationRetention {
     scanner: ClusterIndexScanner,
+    reader: ClusterObjectReader,
     artifacts: IndexArtifactRouter,
     config: IndexRuntimeConfig,
 }
@@ -23,207 +33,350 @@ pub(crate) struct IndexGenerationRetention {
 impl IndexGenerationRetention {
     pub(crate) fn new(
         scanner: ClusterIndexScanner,
+        reader: ClusterObjectReader,
         artifacts: IndexArtifactRouter,
         config: IndexRuntimeConfig,
     ) -> Self {
         Self {
             scanner,
+            reader,
             artifacts,
             config,
         }
     }
 
+    /// Keep the newest predecessor prefix admitted by all configured bounds.
+    /// Once any bound is reached, every older predecessor is obsolete. The
+    /// current generation is unconditional and can never be selected.
     pub(crate) async fn collect(
         &self,
         definition: &StoredIndexDefinition,
         tenant_id: u64,
         bucket_id: u64,
-        current_generation: u64,
+        current: &PublishedGeneration,
     ) -> Result<u64, Status> {
-        let heads = self
-            .scanner
-            .scan(IndexHeadScanScope::Generation {
-                tenant_id,
-                bucket_id,
-                index_id: definition.index_id,
-            })
-            .await?;
-        let mut generations = BTreeMap::<u64, RetainedGeneration>::new();
-        let current_pointer_path = current_path(definition.index_id);
-        let mut superseded_current_pointers = Vec::new();
-        for head in heads {
-            if head.exact_path == current_pointer_path {
-                superseded_current_pointers.extend(superseded_current_pointer_artifacts(&head));
-                continue;
-            }
-            if head.head.deleted || head.version.deleted {
-                continue;
-            }
-            let Some(generation) = generation_from_path(definition.index_id, &head.exact_path)
-            else {
-                continue;
-            };
-            let bytes = head.version.blob.as_ref().map_or(0, |blob| blob.length);
-            let retained = generations.entry(generation).or_default();
-            retained.bytes = retained.bytes.saturating_add(bytes);
-            retained.newest_commit_millis = retained
-                .newest_commit_millis
-                .max(head.version.committed_at_unix_millis);
-            retained.artifacts.push(RetainedArtifact {
-                path: head.exact_path,
-                version: head.version.id,
-            });
-        }
-        let selected = select_obsolete(
-            &generations,
-            current_generation,
-            self.config,
-            now_unix_millis()?,
-        );
+        require_current_identity(definition, current)?;
+        let now = now_unix_millis()?;
+        let mut retained = RetainedArtifacts::default();
+        retained.insert(&current.pointer.manifest_path, &current.manifest);
+        let mut retained_count = 1_u32;
+        let mut retained_bytes = current.manifest.authoritative_bytes;
+        let mut obsolete = false;
         let mut deleted = 0_u64;
-        for generation in selected {
-            let Some(retained) = generations.get(&generation) else {
-                continue;
-            };
-            for artifact in &retained.artifacts {
-                self.artifacts
-                    .delete(IndexArtifactDelete {
-                        storage_tenant: definition.tenant.clone(),
-                        bucket: definition.bucket.clone(),
-                        tenant_id,
-                        bucket_id,
-                        index_id: definition.index_id,
-                        exact_path: artifact.path.clone(),
-                        expected_version: artifact.version,
-                        command_id: delete_command(definition.index_id, generation, &artifact.path),
-                    })
-                    .await?;
+        let mut successor_published_at = current.pointer.published_at_unix_millis;
+        let mut previous = current.manifest.previous.clone();
+        let mut expected_below = current.manifest.generation;
+
+        while let Some(reference) = previous {
+            validate_predecessor(&reference, expected_below, definition.index_id)?;
+            let manifest = self.load_manifest(definition.index_id, &reference).await?;
+            let within_bounds = !obsolete
+                && retain_predecessor(
+                    retained_count,
+                    retained_bytes,
+                    &reference,
+                    &manifest,
+                    now,
+                    self.config,
+                );
+            if within_bounds {
+                retained.insert(&reference.path, &manifest);
+                retained_count = retained_count.saturating_add(1);
+                retained_bytes = retained_bytes
+                    .checked_add(manifest.authoritative_bytes)
+                    .ok_or_else(|| {
+                        Status::resource_exhausted("retained index generation bytes overflow")
+                    })?;
+            } else {
+                obsolete = true;
+                // A request that pinned this generation immediately before its
+                // successor published still has the full public deadline to
+                // finish. Unknown/unreachable candidates use the longer 24h
+                // safety in the sweep below.
+                if now.saturating_sub(successor_published_at) >= PUBLIC_REQUEST_SAFETY_MILLIS {
+                    deleted = deleted.saturating_add(
+                        self.delete_obsolete_generation(
+                            definition,
+                            tenant_id,
+                            bucket_id,
+                            &reference,
+                            &manifest,
+                            &retained.run_hashes,
+                        )
+                        .await?,
+                    );
+                }
+            }
+            successor_published_at = reference.published_at_unix_millis;
+            expected_below = manifest.generation;
+            previous = manifest.previous.clone();
+        }
+
+        deleted = deleted.saturating_add(
+            self.sweep_unreachable(definition, tenant_id, bucket_id, &retained, now)
+                .await?,
+        );
+        Ok(deleted)
+    }
+
+    async fn load_manifest(
+        &self,
+        index_id: u64,
+        reference: &ManifestReference,
+    ) -> Result<IndexGenerationManifest, Status> {
+        let bytes = self.reader.read_blob_bytes(&reference.blob).await?;
+        let manifest = IndexGenerationManifest::decode(&bytes)
+            .map_err(|error| Status::data_loss(error.to_string()))?;
+        if manifest.index_id != index_id
+            || manifest.generation != reference.generation
+            || manifest.definition_version != reference.definition_version
+        {
+            return Err(Status::data_loss(
+                "index predecessor manifest identity differs from its reference",
+            ));
+        }
+        Ok(manifest)
+    }
+
+    async fn delete_obsolete_generation(
+        &self,
+        definition: &StoredIndexDefinition,
+        tenant_id: u64,
+        bucket_id: u64,
+        reference: &ManifestReference,
+        manifest: &IndexGenerationManifest,
+        retained_runs: &BTreeSet<[u8; 32]>,
+    ) -> Result<u64, Status> {
+        let mut deleted = 0_u64;
+        for run in &manifest.runs {
+            if !retained_runs.contains(&run.root_blob.hash) {
+                deleted = deleted.saturating_add(
+                    self.delete_run(definition, tenant_id, bucket_id, run.root_blob.hash)
+                        .await?,
+                );
+            }
+        }
+        self.delete_exact(
+            definition,
+            tenant_id,
+            bucket_id,
+            &reference.path,
+            reference.object_version,
+            "manifest",
+        )
+        .await?;
+        Ok(deleted.saturating_add(1))
+    }
+
+    async fn delete_run(
+        &self,
+        definition: &StoredIndexDefinition,
+        tenant_id: u64,
+        bucket_id: u64,
+        run_hash: [u8; 32],
+    ) -> Result<u64, Status> {
+        let mut scan = self.scanner.begin(IndexHeadScanScope::Run {
+            tenant_id,
+            bucket_id,
+            index_id: definition.index_id,
+            run_hash,
+        })?;
+        let mut deleted = 0_u64;
+        while let Some(heads) = scan.next_page().await? {
+            for head in heads {
+                if head.head.deleted || head.version.deleted {
+                    continue;
+                }
+                self.delete_exact(
+                    definition,
+                    tenant_id,
+                    bucket_id,
+                    &head.exact_path,
+                    head.version.id,
+                    "run",
+                )
+                .await?;
                 deleted = deleted.saturating_add(1);
             }
         }
-        // Versioned buckets retain every replaced `current` pointer. Those
-        // historical pointer blobs are never queryable: a query binds the
-        // current pointer once and then opens the immutable generation named
-        // by it. Retire them through the same exact-version object path used
-        // for every other versioned object, leaving the live pointer intact.
-        for artifact in superseded_current_pointers {
-            self.artifacts
-                .delete(IndexArtifactDelete {
-                    storage_tenant: definition.tenant.clone(),
-                    bucket: definition.bucket.clone(),
+        Ok(deleted)
+    }
+
+    async fn sweep_unreachable(
+        &self,
+        definition: &StoredIndexDefinition,
+        tenant_id: u64,
+        bucket_id: u64,
+        retained: &RetainedArtifacts,
+        now: u64,
+    ) -> Result<u64, Status> {
+        let mut scan = self.scanner.begin(IndexHeadScanScope::Generation {
+            tenant_id,
+            bucket_id,
+            index_id: definition.index_id,
+        })?;
+        let mut deleted = 0_u64;
+        let current = current_path(definition.index_id);
+        while let Some(heads) = scan.next_page().await? {
+            for head in heads {
+                if head.exact_path == current {
+                    for version in head.versions.iter().filter(|version| {
+                        version.id != head.head.version
+                            && !version.deleted
+                            && version.blob.is_some()
+                    }) {
+                        self.delete_exact(
+                            definition,
+                            tenant_id,
+                            bucket_id,
+                            &head.exact_path,
+                            version.id,
+                            "current",
+                        )
+                        .await?;
+                        deleted = deleted.saturating_add(1);
+                    }
+                    continue;
+                }
+                if head.head.deleted || head.version.deleted {
+                    continue;
+                }
+                let age = now.saturating_sub(head.version.committed_at_unix_millis);
+                if age < UNREACHABLE_ARTIFACT_SAFETY_MILLIS {
+                    continue;
+                }
+                let retained_path =
+                    if is_manifest_artifact_path(definition.index_id, &head.exact_path) {
+                        retained.manifest_paths.contains(&head.exact_path)
+                    } else if let Some(run_hash) =
+                        run_hash_from_artifact_path(definition.index_id, &head.exact_path)
+                    {
+                        retained.run_hashes.contains(&run_hash)
+                    } else {
+                        true
+                    };
+                if retained_path {
+                    continue;
+                }
+                self.delete_exact(
+                    definition,
                     tenant_id,
                     bucket_id,
-                    index_id: definition.index_id,
-                    exact_path: artifact.path,
-                    expected_version: artifact.version,
-                    command_id: current_pointer_delete_command(
-                        definition.index_id,
-                        artifact.version,
-                    ),
-                })
+                    &head.exact_path,
+                    head.version.id,
+                    "unreachable",
+                )
                 .await?;
-            deleted = deleted.saturating_add(1);
+                deleted = deleted.saturating_add(1);
+            }
         }
         Ok(deleted)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn delete_exact(
+        &self,
+        definition: &StoredIndexDefinition,
+        tenant_id: u64,
+        bucket_id: u64,
+        path: &str,
+        version: VersionId,
+        class: &str,
+    ) -> Result<(), Status> {
+        self.artifacts
+            .delete(IndexArtifactDelete {
+                storage_tenant: definition.tenant.clone(),
+                bucket: definition.bucket.clone(),
+                tenant_id,
+                bucket_id,
+                index_id: definition.index_id,
+                exact_path: path.to_owned(),
+                expected_version: version,
+                command_id: delete_command(definition.index_id, version, class, path),
+            })
+            .await?;
+        Ok(())
     }
 }
 
 #[derive(Default)]
-struct RetainedGeneration {
-    bytes: u64,
-    newest_commit_millis: u64,
-    artifacts: Vec<RetainedArtifact>,
+struct RetainedArtifacts {
+    manifest_paths: BTreeSet<String>,
+    run_hashes: BTreeSet<[u8; 32]>,
 }
 
-struct RetainedArtifact {
-    path: String,
-    version: VersionId,
-}
-
-fn superseded_current_pointer_artifacts(
-    head: &crate::cluster_peer::IndexCurrentHead,
-) -> Vec<RetainedArtifact> {
-    head.versions
-        .iter()
-        .filter(|version| {
-            version.id != head.head.version && !version.deleted && version.blob.is_some()
-        })
-        .map(|version| RetainedArtifact {
-            path: head.exact_path.clone(),
-            version: version.id,
-        })
-        .collect()
-}
-
-fn select_obsolete(
-    generations: &BTreeMap<u64, RetainedGeneration>,
-    current: u64,
-    config: IndexRuntimeConfig,
-    now_millis: u64,
-) -> BTreeSet<u64> {
-    let mut selected = BTreeSet::new();
-    let age_millis = config
-        .max_generation_age_hours()
-        .saturating_mul(60 * 60 * 1_000);
-    for (generation, retained) in generations {
-        if *generation != current
-            && now_millis.saturating_sub(retained.newest_commit_millis) >= age_millis
-        {
-            selected.insert(*generation);
-        }
+impl RetainedArtifacts {
+    fn insert(&mut self, path: &str, manifest: &IndexGenerationManifest) {
+        self.manifest_paths.insert(path.to_owned());
+        self.run_hashes
+            .extend(manifest.runs.iter().map(|run| run.root_blob.hash));
     }
-
-    let max_count = config.max_retained_generations() as usize;
-    let mut remaining_count = generations.len().saturating_sub(selected.len());
-    for generation in generations.keys() {
-        if remaining_count <= max_count {
-            break;
-        }
-        if *generation != current && selected.insert(*generation) {
-            remaining_count -= 1;
-        }
-    }
-
-    let mut remaining_bytes = generations
-        .iter()
-        .filter(|(generation, _)| !selected.contains(generation))
-        .fold(0_u64, |total, (_, retained)| {
-            total.saturating_add(retained.bytes)
-        });
-    for (generation, retained) in generations {
-        if remaining_bytes <= config.max_retained_generation_bytes() {
-            break;
-        }
-        if *generation != current && selected.insert(*generation) {
-            remaining_bytes = remaining_bytes.saturating_sub(retained.bytes);
-        }
-    }
-    selected
 }
 
-fn generation_from_path(index_id: u64, path: &str) -> Option<u64> {
-    let mut parts = path.split('/');
-    if parts.next()? != "_anvil"
-        || parts.next()? != "indexes"
-        || parts.next()?.parse::<u64>().ok()? != index_id
-        || parts.next()? != "generations"
+fn require_current_identity(
+    definition: &StoredIndexDefinition,
+    current: &PublishedGeneration,
+) -> Result<(), Status> {
+    if current.pointer.index_id != definition.index_id
+        || current.manifest.index_id != definition.index_id
+        || current.pointer.generation != current.manifest.generation
+        || current.pointer.definition_version != current.manifest.definition_version
+        || current.pointer.manifest_path
+            != super::publication::manifest_path(
+                definition.index_id,
+                current.pointer.manifest_blob.hash,
+            )
     {
-        return None;
+        return Err(Status::data_loss(
+            "current index pointer and manifest identity differ during retention",
+        ));
     }
-    let generation = parts.next()?.parse::<u64>().ok()?;
-    (generation != 0).then_some(generation)
+    Ok(())
 }
 
-fn delete_command(index_id: u64, generation: u64, path: &str) -> String {
-    let digest = blake3::hash(path.as_bytes());
+fn validate_predecessor(
+    reference: &ManifestReference,
+    expected_below: u64,
+    index_id: u64,
+) -> Result<(), Status> {
+    if reference.generation >= expected_below
+        || reference.path != super::publication::manifest_path(index_id, reference.blob.hash)
+    {
+        return Err(Status::data_loss(
+            "index predecessor chain is non-canonical or cyclic",
+        ));
+    }
+    Ok(())
+}
+
+fn retain_predecessor(
+    retained_count: u32,
+    retained_bytes: u64,
+    reference: &ManifestReference,
+    manifest: &IndexGenerationManifest,
+    now: u64,
+    config: IndexRuntimeConfig,
+) -> bool {
+    let within_count = retained_count < config.max_retained_generations();
+    let within_age = now.saturating_sub(reference.published_at_unix_millis)
+        < config
+            .max_generation_age_hours()
+            .saturating_mul(60 * 60 * 1_000);
+    let within_bytes = retained_bytes
+        .checked_add(manifest.authoritative_bytes)
+        .is_some_and(|total| total <= config.max_retained_generation_bytes());
+    within_count && within_age && within_bytes
+}
+
+fn delete_command(index_id: u64, version: VersionId, class: &str, path: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(class.as_bytes());
+    hasher.update(path.as_bytes());
+    hasher.update(&version.0.to_be_bytes());
     format!(
-        "index-gc-{index_id}-{generation}-{}",
-        &digest.to_hex().as_str()[..16]
+        "index-v2-gc-{index_id}-{}",
+        &hasher.finalize().to_hex().as_str()[..24]
     )
-}
-
-fn current_pointer_delete_command(index_id: u64, version: VersionId) -> String {
-    format!("index-current-gc-{index_id}-{}", version.0)
 }
 
 fn now_unix_millis() -> Result<u64, Status> {
@@ -238,64 +391,128 @@ fn now_unix_millis() -> Result<u64, Status> {
 
 #[cfg(test)]
 mod tests {
-    use anvil_store::{BlobRef, Head, Version};
+    use anvil_store::{BlobRef, PlacementLogId, SourceId};
 
     use super::*;
+    use crate::index_runtime::events::{AtomicProgramWatermark, IndexBarrier, IndexSourceCursor};
+    use crate::index_runtime::generation::{IndexGenerationManifest, ManifestRun};
 
-    fn retained(bytes: u64, committed: u64) -> RetainedGeneration {
-        RetainedGeneration {
-            bytes,
-            newest_commit_millis: committed,
-            artifacts: Vec::new(),
-        }
+    fn config(count: u32, age: u64, bytes: u64) -> IndexRuntimeConfig {
+        IndexRuntimeConfig::new(1, 1, 64 * 1024 * 1024, 1, count, age, bytes).unwrap()
     }
 
-    #[test]
-    fn first_count_age_or_bytes_limit_selects_oldest_but_never_current() {
-        let values = BTreeMap::from([
-            (1, retained(40, 1)),
-            (2, retained(40, 90_000_000)),
-            (3, retained(40, 90_000_000)),
-        ]);
-        let config = IndexRuntimeConfig::new(1, 1, 2, 24, 70).unwrap();
-        let selected = select_obsolete(&values, 3, config, 100_000_000);
-        assert!(selected.contains(&1));
-        assert!(selected.contains(&2));
-        assert!(!selected.contains(&3));
-    }
-
-    #[test]
-    fn only_historical_live_current_pointer_blobs_are_retired() {
-        let version = |id: u64, blob: bool, deleted: bool| Version {
-            id: VersionId(id),
-            blob: blob.then_some(BlobRef {
-                hash: [id as u8; 32],
-                length: 1,
-            }),
-            content_type: None,
-            deleted,
-            committed_at_unix_millis: id,
+    fn manifest(generation: u64, bytes: u64, run_hash: [u8; 32]) -> IndexGenerationManifest {
+        let barrier = IndexBarrier {
+            fence: PlacementLogId { term: 1, index: 1 },
+            atomic: AtomicProgramWatermark::new(None, None, 0),
+            sources: [(
+                anvil_consensus::NodeId(1),
+                IndexSourceCursor {
+                    source: SourceId {
+                        node_id: 1,
+                        source_epoch: [1; 32],
+                    },
+                    next_offset: 1,
+                },
+            )]
+            .into_iter()
+            .collect(),
         };
-        let head = crate::cluster_peer::IndexCurrentHead {
-            tenant_id: 1,
-            bucket_id: 2,
-            exact_path: current_path(3),
-            head: Head {
-                version: VersionId(4),
-                deleted: false,
-                mutation_stamp: None,
+        IndexGenerationManifest::new(
+            9,
+            generation,
+            1,
+            anvil_index::IndexKind::Path,
+            &barrier,
+            vec![ManifestRun {
+                sequence: generation,
+                level: 0,
+                root_path: super::super::publication::run_root_path(9, run_hash),
+                root_blob: BlobRef {
+                    hash: run_hash,
+                    length: 10,
+                },
+                root_object_version: VersionId(generation),
+                mutation_count: 1,
+                live_document_count: 1,
+                minimum_version: 1,
+                maximum_version: 1,
+                authoritative_bytes: bytes,
+            }],
+            None,
+            1,
+            0,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn first_count_age_or_byte_bound_stops_the_retained_prefix() {
+        let candidate = manifest(2, 40, [2; 32]);
+        let reference = ManifestReference {
+            generation: 2,
+            definition_version: 1,
+            path: super::super::publication::manifest_path(9, [8; 32]),
+            blob: BlobRef {
+                hash: [8; 32],
+                length: 10,
             },
-            version: version(4, true, false),
-            versions: vec![
-                version(1, true, false),
-                version(2, false, true),
-                version(3, false, false),
-                version(4, true, false),
-            ],
+            object_version: VersionId(2),
+            published_at_unix_millis: 90_000_000,
         };
-        let selected = superseded_current_pointer_artifacts(&head);
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].path, current_path(3));
-        assert_eq!(selected[0].version, VersionId(1));
+        assert!(!retain_predecessor(
+            2,
+            40,
+            &reference,
+            &candidate,
+            100_000_000,
+            config(2, 24, 100)
+        ));
+        assert!(!retain_predecessor(
+            1,
+            40,
+            &reference,
+            &candidate,
+            200_000_001,
+            config(3, 24, 100)
+        ));
+        assert!(!retain_predecessor(
+            1,
+            70,
+            &reference,
+            &candidate,
+            100_000_000,
+            config(3, 24, 100)
+        ));
+    }
+
+    #[test]
+    fn retained_run_identity_is_path_scoped_even_when_block_content_is_shared() {
+        let retained = manifest(3, 100, [3; 32]);
+        let obsolete = manifest(2, 100, [2; 32]);
+        let shared_block_hash = [7; 32];
+        let retained_block = super::super::publication::run_block_path(
+            9,
+            retained.runs[0].root_blob.hash,
+            shared_block_hash,
+        );
+        let obsolete_block = super::super::publication::run_block_path(
+            9,
+            obsolete.runs[0].root_blob.hash,
+            shared_block_hash,
+        );
+        let mut kept = RetainedArtifacts::default();
+        kept.insert("retained-manifest", &retained);
+
+        assert!(
+            kept.run_hashes
+                .contains(&run_hash_from_artifact_path(9, &retained_block).unwrap())
+        );
+        assert!(
+            !kept
+                .run_hashes
+                .contains(&run_hash_from_artifact_path(9, &obsolete_block).unwrap())
+        );
+        assert_ne!(retained_block, obsolete_block);
     }
 }

@@ -1,13 +1,14 @@
-//! Fenced cluster scans used for cold index discovery and initial builds.
+//! Fenced, pull-based cluster scans for cold discovery and rebuilds.
 
 use std::collections::BTreeMap;
 
 use anvil_consensus::{DecisionRaft, NodeId};
-use anvil_store::ObjectRecordCursor;
+use anvil_store::{ObjectRecordCursor, PlacementLogId, SourceId};
 use tonic::Status;
 
 use crate::cluster_peer::{
     ClusterPeerTransport, IndexCurrentHead, IndexHeadScanPage, IndexHeadScanScope,
+    IndexSourceSnapshot, IndexSourceSnapshotHead,
 };
 use crate::cluster_placement::ClusterPlacement;
 
@@ -22,29 +23,44 @@ impl ClusterIndexScanner {
         Self { decisions, peers }
     }
 
+    /// Begin a scan without fetching a page. The caller can therefore obtain
+    /// its memory permit before every `next_page` call.
+    pub(crate) fn begin(&self, scope: IndexHeadScanScope) -> Result<ClusterIndexScan, Status> {
+        let placement = self.placement()?;
+        let fence = placement.fence();
+        let nodes = placement
+            .active_node_ids()
+            .into_iter()
+            .map(|node| {
+                let address = placement
+                    .address(node)
+                    .ok_or_else(|| Status::unavailable("ACTIVE index scan source has no address"))?
+                    .0
+                    .clone();
+                Ok(ScanNode { node, address })
+            })
+            .collect::<Result<Vec<_>, Status>>()?;
+        Ok(ClusterIndexScan {
+            scanner: self.clone(),
+            scope,
+            fence,
+            nodes,
+            node_index: 0,
+            cursor: None,
+            finished: false,
+        })
+    }
+
+    /// Compatibility helper for the few cold/control-plane scans whose result
+    /// is deliberately small. Index source rebuilds use `begin` directly.
     pub(crate) async fn scan(
         &self,
         scope: IndexHeadScanScope,
     ) -> Result<Vec<IndexCurrentHead>, Status> {
-        let placement = self.placement()?;
-        let fence = placement.fence();
-        let mut tasks = tokio::task::JoinSet::new();
-        for node in placement.active_node_ids() {
-            let address = placement
-                .address(node)
-                .ok_or_else(|| Status::unavailable("ACTIVE index scan source has no address"))?
-                .0
-                .clone();
-            let peers = self.peers.clone();
-            let scope = scope.clone();
-            tasks.spawn(async move { scan_source(peers, node, address, scope).await });
-        }
-
+        let mut scan = self.begin(scope)?;
         let mut selected = BTreeMap::<(u64, u64, String), IndexCurrentHead>::new();
-        while let Some(joined) = tasks.join_next().await {
-            for head in joined
-                .map_err(|error| Status::internal(format!("index scan task failed: {error}")))??
-            {
+        while let Some(page) = scan.next_page().await? {
+            for head in page {
                 let key = (head.tenant_id, head.bucket_id, head.exact_path.clone());
                 match selected.get(&key) {
                     Some(existing)
@@ -56,12 +72,99 @@ impl ClusterIndexScanner {
                 }
             }
         }
-        if self.placement()?.fence() != fence {
+        Ok(selected.into_values().collect())
+    }
+
+    /// Open one snapshot-bound current-head stream for every ACTIVE source.
+    ///
+    /// Every stream is opened before the first frame is consumed so its source
+    /// epoch and captured journal tail form one rebuild boundary. Frames are
+    /// then pulled from one source at a time; the runtime never buffers a page
+    /// for every node while waiting for its construction-memory permit.
+    pub(crate) async fn begin_source_snapshot(
+        &self,
+        tenant_id: u64,
+        bucket_id: u64,
+        path_prefix: String,
+        max_frame_bytes: u64,
+    ) -> Result<ClusterIndexSourceSnapshot, Status> {
+        let placement = self.placement()?;
+        let fence = placement.fence();
+        let sources = placement
+            .active_node_ids()
+            .into_iter()
+            .map(|node| {
+                let address = placement
+                    .address(node)
+                    .ok_or_else(|| {
+                        Status::unavailable("ACTIVE index snapshot source has no address")
+                    })?
+                    .0
+                    .clone();
+                Ok((node, address))
+            })
+            .collect::<Result<Vec<_>, Status>>()?;
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for (node, address) in sources {
+            let peers = self.peers.clone();
+            let path_prefix = path_prefix.clone();
+            tasks.spawn(async move {
+                let snapshot = peers
+                    .scan_index_source_snapshot(
+                        node,
+                        &address,
+                        tenant_id,
+                        bucket_id,
+                        path_prefix,
+                        max_frame_bytes,
+                    )
+                    .await;
+                (node, snapshot)
+            });
+        }
+
+        let mut opened = BTreeMap::new();
+        while let Some(joined) = tasks.join_next().await {
+            let (node, snapshot) = joined.map_err(|error| {
+                Status::internal(format!("index snapshot task failed: {error}"))
+            })?;
+            let snapshot = snapshot?;
+            if snapshot.placement_fence() != fence || u64::from(snapshot.source().node_id) != node.0
+            {
+                return Err(Status::data_loss(
+                    "index source snapshot identity or placement fence is inconsistent",
+                ));
+            }
+            if opened.insert(node, snapshot).is_some() {
+                return Err(Status::data_loss(
+                    "index source snapshot returned a duplicate ACTIVE source",
+                ));
+            }
+        }
+        if opened.len() != placement.active_node_ids().len() {
             return Err(Status::unavailable(
-                "cluster placement changed during index scan",
+                "not every ACTIVE source opened an index source snapshot",
             ));
         }
-        Ok(selected.into_values().collect())
+        self.require_fence(fence)?;
+
+        let checkpoints = opened
+            .iter()
+            .map(|(&node, snapshot)| IndexSnapshotSourceCheckpoint {
+                node,
+                source: snapshot.source(),
+                captured_tail: snapshot.captured_tail(),
+            })
+            .collect();
+        Ok(ClusterIndexSourceSnapshot {
+            scanner: self.clone(),
+            fence,
+            checkpoints,
+            snapshots: opened.into_values().collect(),
+            source_index: 0,
+            finished: false,
+        })
     }
 
     fn placement(&self) -> Result<ClusterPlacement, Status> {
@@ -72,33 +175,132 @@ impl ClusterIndexScanner {
         ClusterPlacement::from_applied(&state)
             .map_err(|error| Status::unavailable(error.to_string()))
     }
+
+    fn require_fence(&self, expected: anvil_store::PlacementLogId) -> Result<(), Status> {
+        if self.placement()?.fence() != expected {
+            return Err(Status::unavailable(
+                "cluster placement changed during index scan",
+            ));
+        }
+        Ok(())
+    }
 }
 
-async fn scan_source(
-    peers: ClusterPeerTransport,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct IndexSnapshotSourceCheckpoint {
+    pub(crate) node: NodeId,
+    pub(crate) source: SourceId,
+    pub(crate) captured_tail: u64,
+}
+
+/// Pull cursor over a complete set of source-local snapshot streams.
+pub(crate) struct ClusterIndexSourceSnapshot {
+    scanner: ClusterIndexScanner,
+    fence: PlacementLogId,
+    checkpoints: Vec<IndexSnapshotSourceCheckpoint>,
+    snapshots: Vec<IndexSourceSnapshot>,
+    source_index: usize,
+    finished: bool,
+}
+
+impl ClusterIndexSourceSnapshot {
+    pub(crate) fn placement_fence(&self) -> PlacementLogId {
+        self.fence
+    }
+
+    pub(crate) fn checkpoints(&self) -> &[IndexSnapshotSourceCheckpoint] {
+        &self.checkpoints
+    }
+
+    pub(crate) async fn next_frame(
+        &mut self,
+    ) -> Result<Option<Vec<IndexSourceSnapshotHead>>, Status> {
+        if self.finished {
+            return Ok(None);
+        }
+        loop {
+            let Some(snapshot) = self.snapshots.get_mut(self.source_index) else {
+                self.scanner.require_fence(self.fence)?;
+                self.finished = true;
+                return Ok(None);
+            };
+            match snapshot.next_frame().await? {
+                Some(frame) => {
+                    self.scanner.require_fence(self.fence)?;
+                    return Ok(Some(frame));
+                }
+                None => self.source_index += 1,
+            }
+        }
+    }
+}
+
+struct ScanNode {
     node: NodeId,
     address: String,
+}
+
+/// Sequential page cursor over all ACTIVE sources.
+///
+/// Sequential fetch is intentional: it prevents one page per node being held
+/// while the builder is waiting for its aggregate memory budget.
+pub(crate) struct ClusterIndexScan {
+    scanner: ClusterIndexScanner,
     scope: IndexHeadScanScope,
-) -> Result<Vec<IndexCurrentHead>, Status> {
-    let mut cursor: Option<ObjectRecordCursor> = None;
-    let mut heads = Vec::new();
-    loop {
-        let IndexHeadScanPage {
-            heads: page,
-            next_cursor,
-            ..
-        } = peers
-            .scan_index_heads(node, &address, scope.clone(), cursor.as_ref())
-            .await?;
-        heads.extend(page);
-        match next_cursor {
-            Some(next) if cursor.as_ref().is_some_and(|current| current == &next) => {
-                return Err(Status::data_loss(
-                    "index scan source returned a non-advancing cursor",
+    fence: anvil_store::PlacementLogId,
+    nodes: Vec<ScanNode>,
+    node_index: usize,
+    cursor: Option<ObjectRecordCursor>,
+    finished: bool,
+}
+
+impl ClusterIndexScan {
+    pub(crate) async fn next_page(&mut self) -> Result<Option<Vec<IndexCurrentHead>>, Status> {
+        if self.finished {
+            return Ok(None);
+        }
+        loop {
+            let Some(source) = self.nodes.get(self.node_index) else {
+                self.scanner.require_fence(self.fence)?;
+                self.finished = true;
+                return Ok(None);
+            };
+            let IndexHeadScanPage {
+                heads,
+                next_cursor,
+                placement_fence,
+                ..
+            } = self
+                .scanner
+                .peers
+                .scan_index_heads(
+                    source.node,
+                    &source.address,
+                    self.scope.clone(),
+                    self.cursor.as_ref(),
+                )
+                .await?;
+            if placement_fence != self.fence {
+                return Err(Status::unavailable(
+                    "index scan source used another placement fence",
                 ));
             }
-            Some(next) => cursor = Some(next),
-            None => return Ok(heads),
+            match next_cursor {
+                Some(next) if self.cursor.as_ref().is_some_and(|current| current == &next) => {
+                    return Err(Status::data_loss(
+                        "index scan source returned a non-advancing cursor",
+                    ));
+                }
+                Some(next) => self.cursor = Some(next),
+                None => {
+                    self.node_index += 1;
+                    self.cursor = None;
+                }
+            }
+            self.scanner.require_fence(self.fence)?;
+            if !heads.is_empty() {
+                return Ok(Some(heads));
+            }
         }
     }
 }

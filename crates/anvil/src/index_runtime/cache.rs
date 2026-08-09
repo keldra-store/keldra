@@ -4,17 +4,19 @@
 //! mappings can be deleted at any time and are reconstructed through the
 //! supplied segment fetcher.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use memmap2::Mmap;
 use thiserror::Error;
+use tokio::sync::Notify;
 
-const CACHE_FORMAT_DIRECTORY: &str = "v1";
+const CACHE_FORMAT_DIRECTORY: &str = "v2";
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct IndexSegmentId {
@@ -30,49 +32,6 @@ impl IndexSegmentId {
             ));
         }
         Ok(Self { blake3, length })
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct IndexSegment {
-    pub logical_offset: u64,
-    pub id: IndexSegmentId,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct IndexFileLayout {
-    segments: Vec<IndexSegment>,
-    logical_length: u64,
-}
-
-impl IndexFileLayout {
-    pub(crate) fn new(segments: Vec<IndexSegment>) -> Result<Self, IndexCacheError> {
-        let mut expected = 0_u64;
-        for segment in &segments {
-            if segment.logical_offset != expected {
-                return Err(IndexCacheError::InvalidLayout(
-                    "index file segments must be contiguous and ordered".into(),
-                ));
-            }
-            expected = expected.checked_add(segment.id.length).ok_or_else(|| {
-                IndexCacheError::InvalidLayout("index file length overflow".into())
-            })?;
-        }
-        Ok(Self {
-            segments,
-            logical_length: expected,
-        })
-    }
-
-    fn segment_at(&self, offset: u64) -> Option<IndexSegment> {
-        if offset >= self.logical_length {
-            return None;
-        }
-        let index = self
-            .segments
-            .partition_point(|segment| segment.logical_offset <= offset)
-            .checked_sub(1)?;
-        self.segments.get(index).copied()
     }
 }
 
@@ -110,20 +69,229 @@ struct IndexCacheInner {
     directory: PathBuf,
     config: IndexCacheConfig,
     fetcher: Arc<dyn IndexSegmentFetcher>,
+    fetch_budget: CacheFetchBudget,
     state: Mutex<CacheState>,
+}
+
+#[derive(Clone)]
+struct CacheFetchBudget {
+    inner: Arc<CacheFetchBudgetInner>,
+}
+
+struct CacheFetchBudgetInner {
+    limit: u64,
+    state: Mutex<CacheFetchBudgetState>,
+    changed: Notify,
+}
+
+#[derive(Default)]
+struct CacheFetchBudgetState {
+    used: u64,
+    next_ticket: u64,
+    waiters: VecDeque<(u64, u64)>,
+}
+
+impl CacheFetchBudget {
+    fn new(limit: u64) -> Self {
+        Self {
+            inner: Arc::new(CacheFetchBudgetInner {
+                limit,
+                state: Mutex::new(CacheFetchBudgetState::default()),
+                changed: Notify::new(),
+            }),
+        }
+    }
+
+    async fn acquire(&self, requested: u64) -> CacheFetchPermit {
+        // One block larger than the configured in-flight memory budget is
+        // still readable, but occupies the whole fetch allowance by itself.
+        let charged = requested.min(self.inner.limit);
+        let ticket = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let ticket = state.next_ticket;
+            state.next_ticket = state.next_ticket.wrapping_add(1);
+            state.waiters.push_back((ticket, charged));
+            ticket
+        };
+        let mut queued = CacheFetchWaiter {
+            budget: self.clone(),
+            ticket: Some(ticket),
+        };
+        loop {
+            let changed = self.inner.changed.notified();
+            let admitted = {
+                let mut state = self
+                    .inner
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if state
+                    .waiters
+                    .front()
+                    .is_some_and(|(front, _)| *front == ticket)
+                    && state.used <= self.inner.limit.saturating_sub(charged)
+                {
+                    state.waiters.pop_front();
+                    state.used += charged;
+                    tracing::info!(
+                        gauge.anvil_index_cache_fetch_admitted_bytes = state.used,
+                        gauge.anvil_index_cache_fetch_waiting = state.waiters.len() as u64,
+                        "index cache fetch budget state"
+                    );
+                    true
+                } else {
+                    false
+                }
+            };
+            if admitted {
+                queued.ticket = None;
+                self.inner.changed.notify_waiters();
+                return CacheFetchPermit {
+                    budget: self.clone(),
+                    charged,
+                };
+            }
+            changed.await;
+        }
+    }
+}
+
+struct CacheFetchWaiter {
+    budget: CacheFetchBudget,
+    ticket: Option<u64>,
+}
+
+impl Drop for CacheFetchWaiter {
+    fn drop(&mut self) {
+        let Some(ticket) = self.ticket else {
+            return;
+        };
+        let mut state = self
+            .budget
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(index) = state
+            .waiters
+            .iter()
+            .position(|(waiting, _)| *waiting == ticket)
+        {
+            state.waiters.remove(index);
+        }
+        drop(state);
+        self.budget.inner.changed.notify_waiters();
+    }
+}
+
+struct CacheFetchPermit {
+    budget: CacheFetchBudget,
+    charged: u64,
+}
+
+impl Drop for CacheFetchPermit {
+    fn drop(&mut self) {
+        let mut state = self
+            .budget
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.used = state.used.saturating_sub(self.charged);
+        tracing::info!(
+            gauge.anvil_index_cache_fetch_admitted_bytes = state.used,
+            gauge.anvil_index_cache_fetch_waiting = state.waiters.len() as u64,
+            "index cache fetch budget state"
+        );
+        drop(state);
+        self.budget.inner.changed.notify_waiters();
+    }
 }
 
 #[derive(Default)]
 struct CacheState {
     entries: BTreeMap<IndexSegmentId, CacheEntry>,
+    in_flight: BTreeMap<IndexSegmentId, Arc<CacheFlight>>,
     clock: u64,
     disk_bytes: u64,
-    memory_bytes: u64,
+    in_flight_bytes: u64,
+}
+
+struct CacheFlight {
+    complete: AtomicBool,
+    changed: Notify,
+}
+
+struct CacheFlightLeader {
+    cache: IndexCache,
+    id: IndexSegmentId,
+    flight: Arc<CacheFlight>,
+    active: bool,
+}
+
+impl CacheFlightLeader {
+    fn new(cache: IndexCache, id: IndexSegmentId, flight: Arc<CacheFlight>) -> Self {
+        Self {
+            cache,
+            id,
+            flight,
+            active: true,
+        }
+    }
+
+    fn disarm(mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for CacheFlightLeader {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        if let Ok(mut state) = self.cache.inner.state.lock()
+            && state
+                .in_flight
+                .get(&self.id)
+                .is_some_and(|registered| Arc::ptr_eq(registered, &self.flight))
+        {
+            state.in_flight.remove(&self.id);
+            state.in_flight_bytes = state.in_flight_bytes.saturating_sub(self.id.length);
+        }
+        self.flight.finish();
+    }
+}
+
+impl CacheFlight {
+    fn new() -> Self {
+        Self {
+            complete: AtomicBool::new(false),
+            changed: Notify::new(),
+        }
+    }
+
+    async fn wait(&self) {
+        loop {
+            let changed = self.changed.notified();
+            if self.complete.load(Ordering::Acquire) {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    fn finish(&self) {
+        self.complete.store(true, Ordering::Release);
+        self.changed.notify_waiters();
+    }
 }
 
 struct CacheEntry {
     mapped: Arc<Mmap>,
-    memory: Option<Arc<[u8]>>,
     path: PathBuf,
     touched: u64,
 }
@@ -135,65 +303,133 @@ impl IndexCache {
         fetcher: Arc<dyn IndexSegmentFetcher>,
     ) -> Result<Self, IndexCacheError> {
         let directory = directory.as_ref().join(CACHE_FORMAT_DIRECTORY);
-        fs::create_dir_all(&directory).map_err(IndexCacheError::Io)?;
+        reset_disposable_cache(&directory)?;
         Ok(Self {
             inner: Arc::new(IndexCacheInner {
                 directory,
                 config,
                 fetcher,
+                fetch_budget: CacheFetchBudget::new(config.memory_bytes),
                 state: Mutex::new(CacheState::default()),
             }),
         })
     }
 
-    pub(crate) fn open(&self, layout: IndexFileLayout) -> IndexFile {
+    pub(crate) fn open(&self, id: IndexSegmentId) -> IndexFile {
         IndexFile {
             cache: self.clone(),
-            layout: Arc::new(layout),
+            id,
         }
     }
 
     async fn materialize(&self, id: IndexSegmentId) -> Result<Arc<Mmap>, IndexCacheError> {
-        if let Some(mapped) = self.cached(id)? {
-            return Ok(mapped);
-        }
+        loop {
+            if let Some(mapped) = self.cached(id)? {
+                tracing::info!(
+                    monotonic_counter.anvil_index_cache_hits_total = 1_u64,
+                    monotonic_counter.anvil_index_cache_hit_bytes_total = id.length,
+                    "index cache hit"
+                );
+                return Ok(mapped);
+            }
 
-        // Concurrent cold misses may duplicate one fetch in this first bounded
-        // implementation. Content identity plus atomic rename keeps the result
-        // correct; request coalescing is a documented optimization gap.
+            let (flight, leader, in_flight_bytes) = {
+                let mut state = self
+                    .inner
+                    .state
+                    .lock()
+                    .map_err(|_| IndexCacheError::Poisoned)?;
+                if let Some(existing) = state.entries.get(&id) {
+                    return Ok(existing.mapped.clone());
+                }
+                if let Some(flight) = state.in_flight.get(&id) {
+                    (flight.clone(), false, state.in_flight_bytes)
+                } else {
+                    let flight = Arc::new(CacheFlight::new());
+                    state.in_flight.insert(id, flight.clone());
+                    state.in_flight_bytes = state.in_flight_bytes.saturating_add(id.length);
+                    (flight, true, state.in_flight_bytes)
+                }
+            };
+            tracing::info!(
+                monotonic_counter.anvil_index_cache_misses_total = 1_u64,
+                gauge.anvil_index_cache_fetch_in_flight_bytes = in_flight_bytes,
+                "index cache miss"
+            );
+            if !leader {
+                tracing::info!(
+                    monotonic_counter.anvil_index_cache_coalesced_total = 1_u64,
+                    "index cache cold miss coalesced"
+                );
+                flight.wait().await;
+                continue;
+            }
+            let flight_leader = CacheFlightLeader::new(self.clone(), id, flight.clone());
+
+            let fetched = self.fetch_and_map(id).await;
+            let (result, evicted_bytes, snapshot) = {
+                let mut state = self
+                    .inner
+                    .state
+                    .lock()
+                    .map_err(|_| IndexCacheError::Poisoned)?;
+                state.in_flight.remove(&id);
+                state.in_flight_bytes = state.in_flight_bytes.saturating_sub(id.length);
+                let mut evicted_bytes = 0_u64;
+                let result = fetched.map(|mapped| {
+                    let mapped = Arc::new(mapped);
+                    state.clock = state.clock.wrapping_add(1);
+                    let touched = state.clock;
+                    state.disk_bytes = state.disk_bytes.saturating_add(id.length);
+                    state.entries.insert(
+                        id,
+                        CacheEntry {
+                            mapped: mapped.clone(),
+                            path: cache_path(&self.inner.directory, id),
+                            touched,
+                        },
+                    );
+                    evicted_bytes = evict_unpinned_disk(&mut state, self.inner.config.disk_bytes);
+                    mapped
+                });
+                (result, evicted_bytes, cache_snapshot(&state))
+            };
+            flight.finish();
+            flight_leader.disarm();
+            emit_cache_snapshot(snapshot);
+            if evicted_bytes != 0 {
+                tracing::info!(
+                    monotonic_counter.anvil_index_cache_eviction_bytes_total = evicted_bytes,
+                    "index cache blocks evicted"
+                );
+            }
+            return result;
+        }
+    }
+
+    async fn fetch_and_map(&self, id: IndexSegmentId) -> Result<Mmap, IndexCacheError> {
+        let _fetch_permit = self.inner.fetch_budget.acquire(id.length).await;
+        tracing::info!(
+            monotonic_counter.anvil_index_cache_fetches_total = 1_u64,
+            "index cache block fetch"
+        );
         let bytes = self.inner.fetcher.fetch(id).await?;
-        verify_bytes(id, &bytes)?;
+        if let Err(error) = verify_bytes(id, &bytes) {
+            tracing::info!(
+                monotonic_counter.anvil_index_cache_verification_failures_total = 1_u64,
+                "index cache block verification failed"
+            );
+            return Err(error);
+        }
+        tracing::info!(
+            monotonic_counter.anvil_index_cache_fetch_bytes_total = id.length,
+            "index cache block fetched"
+        );
         let directory = self.inner.directory.clone();
         let path = cache_path(&directory, id);
-        let mapped =
-            tokio::task::spawn_blocking(move || persist_and_map(&directory, &path, id, &bytes))
-                .await
-                .map_err(|error| IndexCacheError::Task(error.to_string()))??;
-        let mapped = Arc::new(mapped);
-
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .map_err(|_| IndexCacheError::Poisoned)?;
-        state.clock = state.clock.wrapping_add(1);
-        let touched = state.clock;
-        if let Some(existing) = state.entries.get_mut(&id) {
-            existing.touched = touched;
-            return Ok(existing.mapped.clone());
-        }
-        state.disk_bytes = state.disk_bytes.saturating_add(id.length);
-        state.entries.insert(
-            id,
-            CacheEntry {
-                mapped: mapped.clone(),
-                memory: None,
-                path: cache_path(&self.inner.directory, id),
-                touched,
-            },
-        );
-        evict_unpinned_disk(&mut state, self.inner.config.disk_bytes);
-        Ok(mapped)
+        tokio::task::spawn_blocking(move || persist_and_map(&directory, &path, id, &bytes))
+            .await
+            .map_err(|error| IndexCacheError::Task(error.to_string()))?
     }
 
     fn cached(&self, id: IndexSegmentId) -> Result<Option<Arc<Mmap>>, IndexCacheError> {
@@ -208,107 +444,24 @@ impl IndexCache {
             entry.touched = touched;
             entry.mapped.clone()
         });
-        evict_unpinned_memory(&mut state, self.inner.config.memory_bytes);
-        evict_unpinned_disk(&mut state, self.inner.config.disk_bytes);
+        let disk_evicted = evict_unpinned_disk(&mut state, self.inner.config.disk_bytes);
+        let snapshot = cache_snapshot(&state);
+        drop(state);
+        emit_cache_snapshot(snapshot);
+        if disk_evicted != 0 {
+            tracing::info!(
+                monotonic_counter.anvil_index_cache_eviction_bytes_total = disk_evicted,
+                "index cache blocks evicted"
+            );
+        }
         Ok(selected)
-    }
-
-    async fn backing(&self, id: IndexSegmentId) -> Result<IndexSliceBacking, IndexCacheError> {
-        let mapped = self.materialize(id).await?;
-        if id.length > self.inner.config.memory_bytes {
-            return Ok(IndexSliceBacking::Mapped(mapped));
-        }
-
-        let cached_memory = {
-            let mut state = self
-                .inner
-                .state
-                .lock()
-                .map_err(|_| IndexCacheError::Poisoned)?;
-            state.clock = state.clock.wrapping_add(1);
-            let touched = state.clock;
-            if let Some(entry) = state.entries.get_mut(&id) {
-                entry.touched = touched;
-                let selected = entry.memory.clone();
-                evict_unpinned_memory(&mut state, self.inner.config.memory_bytes);
-                selected
-            } else {
-                None
-            }
-        };
-        if let Some(memory) = cached_memory {
-            return Ok(IndexSliceBacking::Memory(memory));
-        }
-
-        let source = mapped.clone();
-        let memory = tokio::task::spawn_blocking(move || Arc::<[u8]>::from(&source[..]))
-            .await
-            .map_err(|error| IndexCacheError::Task(error.to_string()))?;
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .map_err(|_| IndexCacheError::Poisoned)?;
-        state.clock = state.clock.wrapping_add(1);
-        let touched = state.clock;
-        let selected = match state.entries.get_mut(&id) {
-            Some(entry) => {
-                entry.touched = touched;
-                if let Some(existing) = &entry.memory {
-                    existing.clone()
-                } else {
-                    entry.memory = Some(memory.clone());
-                    state.memory_bytes = state.memory_bytes.saturating_add(id.length);
-                    memory
-                }
-            }
-            None => return Ok(IndexSliceBacking::Mapped(mapped)),
-        };
-        evict_unpinned_memory(&mut state, self.inner.config.memory_bytes);
-        Ok(IndexSliceBacking::Memory(selected))
     }
 }
 
 #[derive(Clone)]
 pub(crate) struct IndexFile {
     cache: IndexCache,
-    layout: Arc<IndexFileLayout>,
-}
-
-#[derive(Clone)]
-pub(crate) struct IndexDirectory {
-    cache: IndexCache,
-    files: Arc<BTreeMap<String, IndexFileLayout>>,
-}
-
-impl IndexDirectory {
-    pub(crate) fn new(
-        cache: IndexCache,
-        files: BTreeMap<String, IndexFileLayout>,
-    ) -> Result<Self, IndexCacheError> {
-        if files.is_empty() || files.keys().any(|name| !valid_file_name(name)) {
-            return Err(IndexCacheError::InvalidLayout(
-                "index directory requires canonical relative file names".into(),
-            ));
-        }
-        Ok(Self {
-            cache,
-            files: Arc::new(files),
-        })
-    }
-}
-
-impl anvil_index::IndexDirectoryRead for IndexDirectory {
-    type File = IndexFile;
-
-    async fn open_file(&self, name: &str) -> Result<Self::File, anvil_index::IndexError> {
-        let layout = self
-            .files
-            .get(name)
-            .cloned()
-            .ok_or_else(|| anvil_index::IndexError::FileNotFound(name.to_owned()))?;
-        Ok(self.cache.open(layout))
-    }
+    id: IndexSegmentId,
 }
 
 impl IndexFile {
@@ -324,14 +477,12 @@ impl IndexFile {
         if max_length == 0 {
             return Ok(IndexSlice::empty());
         }
-        let Some(segment) = self.layout.segment_at(offset) else {
+        if offset >= self.id.length {
             return Ok(IndexSlice::empty());
-        };
-        let backing = self.cache.backing(segment.id).await?;
-        let within = usize::try_from(offset - segment.logical_offset)
-            .map_err(|_| IndexCacheError::AddressSpace)?;
+        }
+        let backing = self.cache.materialize(self.id).await?;
+        let within = usize::try_from(offset).map_err(|_| IndexCacheError::AddressSpace)?;
         let available = backing
-            .data()
             .len()
             .checked_sub(within)
             .ok_or(IndexCacheError::CorruptCache)?;
@@ -341,32 +492,6 @@ impl IndexFile {
             start: within,
             end: within + length,
         })
-    }
-
-    pub(crate) async fn prefetch(
-        &self,
-        offset: u64,
-        max_length: usize,
-    ) -> Result<(), IndexCacheError> {
-        let mut next = offset;
-        let mut remaining = max_length as u64;
-        while remaining > 0 {
-            let Some(segment) = self.layout.segment_at(next) else {
-                break;
-            };
-            self.cache.materialize(segment.id).await?;
-            let available = segment
-                .logical_offset
-                .checked_add(segment.id.length)
-                .and_then(|end| end.checked_sub(next))
-                .ok_or(IndexCacheError::CorruptCache)?;
-            let consumed = available.min(remaining);
-            next = next
-                .checked_add(consumed)
-                .ok_or(IndexCacheError::AddressSpace)?;
-            remaining -= consumed;
-        }
-        Ok(())
     }
 }
 
@@ -390,24 +515,9 @@ impl anvil_index::IndexFileRead for IndexFile {
 /// clone of this value is dropped.
 #[derive(Clone)]
 pub(crate) struct IndexSlice {
-    backing: Option<IndexSliceBacking>,
+    backing: Option<Arc<Mmap>>,
     start: usize,
     end: usize,
-}
-
-#[derive(Clone)]
-enum IndexSliceBacking {
-    Mapped(Arc<Mmap>),
-    Memory(Arc<[u8]>),
-}
-
-impl IndexSliceBacking {
-    fn data(&self) -> &[u8] {
-        match self {
-            Self::Mapped(mapped) => mapped,
-            Self::Memory(memory) => memory,
-        }
-    }
 }
 
 impl IndexSlice {
@@ -422,12 +532,12 @@ impl IndexSlice {
     pub(crate) fn data(&self) -> &[u8] {
         self.backing
             .as_ref()
-            .map_or(&[], |backing| &backing.data()[self.start..self.end])
+            .map_or(&[], |backing| &backing[self.start..self.end])
     }
 
     #[cfg(test)]
-    fn is_memory_backed(&self) -> bool {
-        matches!(&self.backing, Some(IndexSliceBacking::Memory(_)))
+    fn is_mmap_backed(&self) -> bool {
+        self.backing.is_some()
     }
 }
 
@@ -449,14 +559,13 @@ fn cache_path(directory: &Path, id: IndexSegmentId) -> PathBuf {
     directory.join(format!("{}-{}", hex::encode(id.blake3), id.length))
 }
 
-fn valid_file_name(name: &str) -> bool {
-    !name.is_empty()
-        && !name.starts_with('/')
-        && !name.ends_with('/')
-        && !name
-            .split('/')
-            .any(|segment| segment.is_empty() || segment == "..")
-        && !name.contains('\0')
+fn reset_disposable_cache(directory: &Path) -> Result<(), IndexCacheError> {
+    match fs::remove_dir_all(directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(IndexCacheError::Io(error)),
+    }
+    fs::create_dir_all(directory).map_err(IndexCacheError::Io)
 }
 
 fn persist_and_map(
@@ -465,32 +574,40 @@ fn persist_and_map(
     id: IndexSegmentId,
     bytes: &[u8],
 ) -> Result<Mmap, IndexCacheError> {
-    if !path.exists() {
-        let temporary = directory.join(format!(
-            ".{}-{}-{}.tmp",
-            hex::encode(id.blake3),
-            id.length,
-            uuid::Uuid::new_v4()
-        ));
-        let result = (|| {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary)?;
-            file.write_all(bytes)?;
-            file.sync_all()?;
-            match fs::rename(&temporary, path) {
-                Ok(()) => Ok(()),
-                Err(_error) if path.exists() => Ok(()),
-                Err(error) => Err(error),
-            }
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
+    if path.exists() {
+        match map_verified_cache_file(path, id) {
+            Ok(mapped) => return Ok(mapped),
+            Err(IndexCacheError::CorruptCache) => {}
+            Err(error) => return Err(error),
         }
-        result.map_err(IndexCacheError::Io)?;
     }
 
+    let temporary = directory.join(format!(
+        ".{}-{}-{}.tmp",
+        hex::encode(id.blake3),
+        id.length,
+        uuid::Uuid::new_v4()
+    ));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        // Replacing an existing corrupt cache file is atomic. Authoritative
+        // bytes remain the ordinary object fetched and verified by the caller.
+        fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result.map_err(IndexCacheError::Io)?;
+
+    map_verified_cache_file(path, id)
+}
+
+fn map_verified_cache_file(path: &Path, id: IndexSegmentId) -> Result<Mmap, IndexCacheError> {
     let mut file = File::open(path).map_err(IndexCacheError::Io)?;
     let metadata = file.metadata().map_err(IndexCacheError::Io)?;
     if metadata.len() != id.length {
@@ -521,42 +638,13 @@ fn verify_bytes(id: IndexSegmentId, bytes: &[u8]) -> Result<(), IndexCacheError>
     Ok(())
 }
 
-fn evict_unpinned_memory(state: &mut CacheState, budget: u64) {
-    while state.memory_bytes > budget {
-        let candidate = state
-            .entries
-            .iter()
-            .filter(|(_, entry)| {
-                entry
-                    .memory
-                    .as_ref()
-                    .is_some_and(|memory| Arc::strong_count(memory) == 1)
-            })
-            .min_by_key(|(_, entry)| entry.touched)
-            .map(|(id, _)| *id);
-        let Some(candidate) = candidate else {
-            break;
-        };
-        if let Some(entry) = state.entries.get_mut(&candidate)
-            && entry.memory.take().is_some()
-        {
-            state.memory_bytes = state.memory_bytes.saturating_sub(candidate.length);
-        }
-    }
-}
-
-fn evict_unpinned_disk(state: &mut CacheState, budget: u64) {
+fn evict_unpinned_disk(state: &mut CacheState, budget: u64) -> u64 {
+    let mut evicted = 0_u64;
     while state.disk_bytes > budget {
         let candidate = state
             .entries
             .iter()
-            .filter(|(_, entry)| {
-                Arc::strong_count(&entry.mapped) == 1
-                    && entry
-                        .memory
-                        .as_ref()
-                        .is_none_or(|memory| Arc::strong_count(memory) == 1)
-            })
+            .filter(|(_, entry)| Arc::strong_count(&entry.mapped) == 1)
             .min_by_key(|(_, entry)| entry.touched)
             .map(|(id, _)| *id);
         let Some(candidate) = candidate else {
@@ -564,12 +652,41 @@ fn evict_unpinned_disk(state: &mut CacheState, budget: u64) {
         };
         if let Some(entry) = state.entries.remove(&candidate) {
             state.disk_bytes = state.disk_bytes.saturating_sub(candidate.length);
-            if entry.memory.is_some() {
-                state.memory_bytes = state.memory_bytes.saturating_sub(candidate.length);
-            }
             let _ = fs::remove_file(entry.path);
+            evicted = evicted.saturating_add(candidate.length);
         }
     }
+    evicted
+}
+
+#[derive(Clone, Copy)]
+struct CacheSnapshot {
+    disk_bytes: u64,
+    in_flight_bytes: u64,
+    open_mappings: u64,
+}
+
+fn cache_snapshot(state: &CacheState) -> CacheSnapshot {
+    CacheSnapshot {
+        disk_bytes: state.disk_bytes,
+        in_flight_bytes: state.in_flight_bytes,
+        open_mappings: state
+            .entries
+            .values()
+            .filter(|entry| Arc::strong_count(&entry.mapped) > 1)
+            .count() as u64,
+    }
+}
+
+fn emit_cache_snapshot(snapshot: CacheSnapshot) {
+    tracing::info!(
+        gauge.anvil_index_cache_disk_bytes = snapshot.disk_bytes,
+        gauge.anvil_index_cache_memory_bytes = 0_u64,
+        gauge.anvil_index_cache_fetch_in_flight_bytes = snapshot.in_flight_bytes,
+        gauge.anvil_index_cache_open_mappings = snapshot.open_mappings,
+        gauge.anvil_index_cache_pinned_decoded_bytes = 0_u64,
+        "index cache state"
+    );
 }
 
 #[derive(Debug, Error)]

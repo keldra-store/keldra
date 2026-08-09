@@ -352,7 +352,7 @@ impl ClusterPeerService {
             Ok(())
         } else {
             Err(Status::unavailable(
-                "active placement changed during routed public operation",
+                "active placement changed during cluster operation",
             ))
         }
     }

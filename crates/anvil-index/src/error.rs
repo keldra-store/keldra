@@ -24,6 +24,8 @@ pub enum IndexError {
     Decode(String),
     #[error("index I/O failed: {0}")]
     Io(String),
+    #[error("index memory limit is {limit} bytes but this operation needs {needed} bytes")]
+    ResourceLimit { needed: usize, limit: usize },
 }
 
 impl From<serde_json::Error> for IndexError {

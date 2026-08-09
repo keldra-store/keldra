@@ -1,7 +1,8 @@
 //! One-hop execution on a weighted-HRW index query replica.
 //!
-//! The peer protocol carries the original signed bearer and raw query inputs.
-//! It never carries a serialized caller or an authorization decision.
+//! The peer protocol carries the original signed bearer or fixed anonymous
+//! marker plus raw query inputs. It never carries a serialized caller or an
+//! authorization decision.
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -9,7 +10,7 @@ use std::time::Duration;
 use anvil_api::v1::index_query::Query as IndexQueryValue;
 use anvil_api::v1::{IndexDefinition, IndexKind, IndexQuery, IndexQueryHit};
 use anvil_consensus::NodeId;
-use anvil_store::{ObjectKey, PlacementLogId};
+use anvil_store::{ObjectKey, PlacementLogId, StorageTenantId};
 use tonic::{Request, Response, Status};
 
 use super::transport::add_bearer_and_timeout;
@@ -32,6 +33,7 @@ const MAX_QUERY_HITS: usize = 1_000;
 
 #[derive(Clone, Debug)]
 pub(crate) struct RoutedIndexQueryRequest {
+    pub(crate) storage_tenant: String,
     pub(crate) tenant_id: u64,
     pub(crate) bucket_id: u64,
     pub(crate) definition: IndexDefinition,
@@ -43,8 +45,8 @@ pub(crate) struct RoutedIndexQueryRequest {
 #[derive(Clone, Debug)]
 pub(crate) struct LocalIndexQueryRequest {
     /// Verified tenant name used only for constructing ordinary object addresses.
-    /// This is reconstructed from the signed bearer at the destination and is
-    /// deliberately absent from the peer wire request.
+    /// The destination binds it to the signed bearer or fixed anonymous marker,
+    /// then verifies that its current stable ID matches `tenant_id`.
     pub(crate) storage_tenant: String,
     pub(crate) tenant_id: u64,
     pub(crate) bucket_id: u64,
@@ -64,19 +66,8 @@ pub(crate) trait LocalIndexQueryExecutor: Send + Sync + 'static {
 
 pub(crate) struct RoutedIndexQueryCall {
     bearer: Arc<str>,
-    source_node: NodeId,
     placement: ClusterPlacement,
     request: RoutedIndexQueryRequest,
-}
-
-impl RoutedIndexQueryCall {
-    pub(crate) const fn source_node(&self) -> NodeId {
-        self.source_node
-    }
-
-    pub(crate) const fn placement_fence(&self) -> PlacementLogId {
-        self.placement.fence()
-    }
 }
 
 #[tonic::async_trait]
@@ -144,9 +135,7 @@ impl RoutedIndexQueryHandler for AuthorizedIndexQueryHandler {
             call.request.bucket_id,
             call.request.definition.index_id,
         )?;
-        let caller = self.tokens.verify(&call.bearer).map_err(|_| {
-            Status::unauthenticated("the routed bearer token is invalid or expired")
-        })?;
+        let caller = routed_caller(&self.tokens, &call.bearer, &call.request.storage_tenant)?;
         let tenant = caller.storage_tenant().as_str();
         let resolved = self
             .names
@@ -279,7 +268,6 @@ impl ClusterPeerService {
                 .get()?
                 .execute(RoutedIndexQueryCall {
                     bearer: Arc::from(bearer.signed_token()),
-                    source_node: admitted.authenticated.node_id,
                     placement: admitted.placement,
                     request: value,
                 }),
@@ -343,6 +331,7 @@ fn request_to_wire(
         .map_err(|_| Status::invalid_argument("index query limit does not fit u32"))?;
     Ok(wire::RouteIndexQueryRequest {
         peer: Some(peer),
+        storage_tenant: request.storage_tenant,
         tenant_id: request.tenant_id,
         bucket_id: request.bucket_id,
         definition: Some(request.definition),
@@ -360,6 +349,7 @@ fn request_from_wire(
     request: &wire::RouteIndexQueryRequest,
 ) -> Result<RoutedIndexQueryRequest, Status> {
     let value = RoutedIndexQueryRequest {
+        storage_tenant: request.storage_tenant.clone(),
         tenant_id: request.tenant_id,
         bucket_id: request.bucket_id,
         definition: request
@@ -412,6 +402,8 @@ fn response_from_wire(
 }
 
 fn validate_request(request: &RoutedIndexQueryRequest) -> Result<(), Status> {
+    StorageTenantId::parse(&request.storage_tenant)
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
     if request.tenant_id == 0
         || request.bucket_id == 0
         || request.definition.index_id == 0
@@ -439,6 +431,29 @@ fn validate_request(request: &RoutedIndexQueryRequest) -> Result<(), Status> {
         }
     }
     Ok(())
+}
+
+fn routed_caller(
+    tokens: &JwtManager,
+    bearer: &str,
+    storage_tenant: &str,
+) -> Result<crate::authentication::Caller, Status> {
+    let routed = OriginalBearer::from_signed_token(bearer);
+    let caller = if routed.is_anonymous() {
+        let tenant = StorageTenantId::parse(storage_tenant)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        crate::authentication::Caller::from_anonymous(tenant)
+    } else {
+        tokens
+            .verify(routed.signed_token())
+            .map_err(|_| Status::unauthenticated("the routed bearer token is invalid or expired"))?
+    };
+    if caller.storage_tenant().as_str() != storage_tenant {
+        return Err(Status::permission_denied(
+            "routed index query does not belong to the authenticated tenant",
+        ));
+    }
+    Ok(caller)
 }
 
 fn validate_result(
@@ -565,6 +580,7 @@ mod tests {
 
     fn request() -> RoutedIndexQueryRequest {
         RoutedIndexQueryRequest {
+            storage_tenant: "tenant".into(),
             tenant_id: 7,
             bucket_id: 9,
             definition: IndexDefinition {
@@ -613,6 +629,7 @@ mod tests {
         let decoded = request_from_wire(&wire).unwrap();
 
         assert_eq!(decoded.tenant_id, value.tenant_id);
+        assert_eq!(decoded.storage_tenant, value.storage_tenant);
         assert_eq!(decoded.bucket_id, value.bucket_id);
         assert_eq!(decoded.definition, value.definition);
         assert_eq!(decoded.query, value.query);
@@ -632,6 +649,29 @@ mod tests {
         }));
         invalid.definition.kind = IndexKind::Vector as i32;
         assert!(validate_request(&invalid).is_err());
+
+        invalid = request();
+        invalid.storage_tenant.clear();
+        assert!(validate_request(&invalid).is_err());
+    }
+
+    #[test]
+    fn routed_anonymous_marker_reconstructs_only_the_named_tenant() {
+        let tokens = JwtManager::new(b"anonymous-index-route-secret-0123456789").unwrap();
+        let anonymous =
+            routed_caller(&tokens, anvil_authz::ANONYMOUS_SUBJECT_ID, "tenant").unwrap();
+        assert_eq!(anonymous.storage_tenant().as_str(), "tenant");
+        assert_eq!(anonymous.subject(), &anvil_authz::ObjectRef::anonymous());
+
+        let token = tokens
+            .mint(StorageTenantId::parse("tenant").unwrap(), "reader")
+            .unwrap();
+        assert_eq!(
+            routed_caller(&tokens, &token, "another")
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
     }
 
     #[test]

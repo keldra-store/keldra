@@ -1,8 +1,10 @@
 use tonic::metadata::{MetadataMap, MetadataValue};
 
-use super::admission::validate_context;
+use super::admission::{validate_context, validate_context_with_timeout_limit};
 use super::routing::test_bearer;
-use super::{CLUSTER_PEER_SCHEMA_VERSION, decode_json, encode_json, wire};
+use super::{
+    CLUSTER_PEER_SCHEMA_VERSION, MAX_INDEX_SOURCE_SNAPSHOT_TIME, decode_json, encode_json, wire,
+};
 
 #[test]
 fn routed_bearer_is_metadata_only_and_exact() {
@@ -63,6 +65,23 @@ fn admission_rejects_unversioned_identity_and_unbounded_deadline() {
     assert_eq!(
         validate_context(&context, 0).unwrap_err().code(),
         tonic::Code::InvalidArgument
+    );
+}
+
+#[test]
+fn snapshot_scan_has_a_bounded_internal_deadline_beyond_public_requests() {
+    let context = wire::PeerContext {
+        schema_version: CLUSTER_PEER_SCHEMA_VERSION,
+        cluster_id: vec![7; 16],
+        source_node_id: 3,
+        placement_term: 4,
+        placement_index: 9,
+        hop_count: 0,
+        remaining_deadline_millis: 60_000,
+    };
+    assert!(validate_context(&context, 0).is_err());
+    assert!(
+        validate_context_with_timeout_limit(&context, 0, MAX_INDEX_SOURCE_SNAPSHOT_TIME,).is_ok()
     );
 }
 

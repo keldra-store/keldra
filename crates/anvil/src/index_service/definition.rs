@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use tonic::Status;
 
-const STORED_DEFINITION_FORMAT: u16 = 1;
-const DEFINITION_PREFIX: &str = "_anvil/indexes/definitions/";
+const STORED_DEFINITION_FORMAT: u16 = 2;
+const DEFINITION_PREFIX: &str = "_anvil/indexes/v2/definitions/";
 const MAX_INDEX_NAME_BYTES: usize = 128;
 const MAX_CONTENT_TYPE_BYTES: usize = 512;
 const MAX_COMMAND_ID_BYTES: usize = 256;
@@ -452,12 +452,22 @@ mod tests {
         );
         assert_eq!(
             definition_path("by-path").unwrap(),
-            "_anvil/indexes/definitions/by-path"
+            "_anvil/indexes/v2/definitions/by-path"
         );
         assert_eq!(
             derive_index_id(7, 9, "by-path", "create-index").unwrap(),
             derive_index_id(7, 9, "by-path", "create-index").unwrap()
         );
+    }
+
+    #[test]
+    fn format_one_definition_is_not_a_compatibility_input() {
+        let stored = StoredIndexDefinition::create("tenant".into(), request(), 44).unwrap();
+        let mut encoded = serde_json::to_value(stored).unwrap();
+        encoded["format"] = serde_json::json!(1);
+        let error =
+            StoredIndexDefinition::decode(&serde_json::to_vec(&encoded).unwrap()).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::DataLoss);
     }
 
     #[test]

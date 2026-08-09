@@ -4,7 +4,7 @@ package anvil.v1;
 
 import "google/protobuf/timestamp.proto";
 
-// The public Anvil 0.5 network contract. Peer and storage-coordination services
+// The public Anvil 0.6 network contract. Peer and storage-coordination services
 // remain private. Ordinary object calls are independent. Only InvokeProgram
 // requests atomic multi-path visibility; indexes are asynchronous derived views
 // over the same visible object state.
@@ -85,6 +85,9 @@ service IndexService {
   rpc GetIndex(GetIndexRequest) returns (IndexDefinition);
   rpc ListIndexes(ListIndexesRequest) returns (ListIndexesResponse);
   rpc DeleteIndex(DeleteIndexRequest) returns (DeleteIndexResponse);
+  // The only Index RPC that may omit authentication. An anonymous query must
+  // name its tenant explicitly and is still filtered by Zanzibar public-read
+  // relationships. A supplied credential is always validated.
   rpc QueryIndex(QueryIndexRequest) returns (QueryIndexResponse);
 }
 
@@ -97,11 +100,12 @@ service AccountingService {
   rpc GetAccounting(GetAccountingRequest) returns (AccountingSnapshot);
 }
 
-// Credential exchange is the only unauthenticated service. Long-lived client
+// Credential exchange is the only unauthenticated mutation. Long-lived client
 // credentials are verified against durable Anvil state and exchanged for a
 // short-lived bearer token. The deployment must protect this service with TLS
-// termination because the request contains a long-lived secret. Every other
-// public service is protected.
+// termination because the request contains a long-lived secret. QueryIndex may
+// also omit credentials, but then represents the caller as the fixed anonymous
+// subject and still requires an explicit Zanzibar public-read grant.
 service CredentialService {
   rpc ExchangeClientCredentials(ExchangeClientCredentialsRequest) returns (AccessToken);
 }
@@ -395,6 +399,9 @@ message QueryIndexRequest {
   // Zero selects 100. The maximum is 1000.
   uint32 limit = 4;
   bytes page_token = 5;
+  // Required for anonymous queries because no credential supplies a tenant.
+  // Authenticated callers may omit it; when supplied it must match their token.
+  string tenant = 6;
 }
 
 message IndexQueryHit {
@@ -921,7 +928,7 @@ message ProvisionTenantResponse {
 
 // Application IDs and client IDs are cluster-wide authentication identities;
 // each is globally unique. An application has exactly one client credential
-// in Anvil 0.5. Supplying the same canonical application, client ID and secret is
+// in Anvil 0.6. Supplying the same canonical application, client ID and secret is
 // an idempotent replay.
 message CreateApplicationRequest {
   string app_id = 1;
@@ -1272,7 +1279,7 @@ message TupleFilter {
 
 message AuthzConsistency {
   // Latest evaluates the current authoritative revision. AtLeast evaluates
-  // current state only when it has reached the requested revision. Anvil 0.5
+  // current state only when it has reached the requested revision. Anvil 0.6
   // retains only current authorization state: Exact(current) succeeds and an
   // older exact revision fails with AUTHZ_REVISION_EXPIRED.
   oneof requirement {

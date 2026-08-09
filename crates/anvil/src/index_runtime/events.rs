@@ -1,30 +1,26 @@
-//! All-source journal barriers for one index-builder node.
+//! Pull-based all-source journal barriers for one index builder.
 //!
-//! Every object coordinator owns one source-local ordered journal. The index
-//! builder reads the local source directly and every other ACTIVE source over
-//! mandatory mTLS. A generation may publish only after consuming one complete
-//! vector barrier. Cross-source order is deliberately neither invented nor
-//! required: builders reread current heads and compare exact path versions.
+//! Builders read a bounded page only after obtaining their per-kind memory
+//! permit. There is no node-local fan-out inbox: a complete source vector is
+//! authoritative only when a manifest CAS publishes every prepared run.
 
 use std::collections::BTreeMap;
+use std::io;
 use std::sync::Arc;
 
 use anvil_consensus::{DecisionRaft, NodeId};
 use anvil_store::{
-    LocalChange, MAX_LOCAL_INVALIDATION_SCAN_RECORDS, PlacementLogId, SourceId, Store,
-    WatchJournalStatus,
+    LocalChange, MAX_LOCAL_INVALIDATION_SCAN_RECORDS, OversizeLocalChange, PlacementLogId,
+    SourceId, Store, WatchJournalStatus,
 };
 use thiserror::Error;
 
 use crate::cluster_placement::ClusterPlacement;
 use crate::data_peer::DataPeerTransport;
 
-mod router;
-
-pub(crate) use router::{
-    IndexEventCatchUp, IndexEventRouter, IndexEventRouterError, IndexEventRouterRetention,
-    IndexEventRouterTask,
-};
+/// The private peer journal codec already rejects pages larger than this.
+/// Applying the same bound to local pages keeps both paths equivalent.
+pub(crate) const MAX_INDEX_EVENT_PAGE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// The globally replicated atomic-program publication watermark.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -55,8 +51,6 @@ impl AtomicProgramWatermark {
         self.finalized_through
     }
 
-    /// A current head created by a later atomic commit must be deferred until
-    /// a later all-source barrier. Ordinary heads carry no program cursor.
     pub(crate) fn permits(self, program_commit_cursor: Option<u64>) -> bool {
         match program_commit_cursor {
             None => true,
@@ -73,7 +67,6 @@ pub(crate) struct IndexSource {
     pub address: String,
 }
 
-/// One applied ACTIVE membership and atomic-program state snapshot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct IndexEventPlacement {
     pub fence: PlacementLogId,
@@ -130,6 +123,8 @@ impl IndexEventAuthority for DecisionIndexEventAuthority {
 pub(crate) struct IndexSourcePage {
     pub source_id: SourceId,
     pub changes: Vec<LocalChange>,
+    pub encoded_bytes: u64,
+    pub oversize: Option<OversizeLocalChange>,
 }
 
 #[tonic::async_trait]
@@ -142,6 +137,7 @@ pub(crate) trait IndexEventSources: Send + Sync + 'static {
         expected_source: SourceId,
         after_offset: u64,
         limit: usize,
+        max_bytes: u64,
     ) -> Result<IndexSourcePage, IndexEventError>;
 }
 
@@ -169,22 +165,13 @@ impl IndexEventSources for ClusterIndexEventSources {
             let store = self.store.clone();
             return tokio::task::spawn_blocking(move || store.local_watch_status())
                 .await
-                .map_err(|error| IndexEventError::Source {
-                    node: source.node,
-                    message: error.to_string(),
-                })?
-                .map_err(|error| IndexEventError::Source {
-                    node: source.node,
-                    message: error.to_string(),
-                });
+                .map_err(|error| source_error(source.node, error))?
+                .map_err(|error| source_error(source.node, error));
         }
         self.peers
             .source_journal_status(source.node, &source.address)
             .await
-            .map_err(|error| IndexEventError::Source {
-                node: source.node,
-                message: error.to_string(),
-            })
+            .map_err(|error| source_error(source.node, error))
     }
 
     async fn read_page(
@@ -193,43 +180,52 @@ impl IndexEventSources for ClusterIndexEventSources {
         expected_source: SourceId,
         after_offset: u64,
         limit: usize,
+        max_bytes: u64,
     ) -> Result<IndexSourcePage, IndexEventError> {
-        let changes = if source.node == self.local_node {
+        let page = if source.node == self.local_node {
             let store = self.store.clone();
-            tokio::task::spawn_blocking(move || store.scan_local_changes(after_offset, limit))
-                .await
-                .map_err(|error| IndexEventError::Source {
-                    node: source.node,
-                    message: error.to_string(),
-                })?
-                .map_err(|error| IndexEventError::Source {
-                    node: source.node,
-                    message: error.to_string(),
-                })?
+            tokio::task::spawn_blocking(move || {
+                store.scan_local_changes_bounded(after_offset, limit, max_bytes)
+            })
+            .await
+            .map_err(|error| source_error(source.node, error))?
+            .map_err(|error| source_error(source.node, error))?
         } else {
             self.peers
-                .read_source_journal(source.node, &source.address, after_offset, limit)
+                .read_source_journal(
+                    source.node,
+                    &source.address,
+                    expected_source,
+                    after_offset,
+                    limit,
+                    max_bytes,
+                )
                 .await
-                .map_err(|error| IndexEventError::Source {
-                    node: source.node,
-                    message: error.to_string(),
-                })?
+                .map_err(|error| source_error(source.node, error))?
         };
         Ok(IndexSourcePage {
-            source_id: expected_source,
-            changes,
+            source_id: page.source_id,
+            changes: page.changes,
+            encoded_bytes: page.encoded_bytes,
+            oversize: page.oversize,
         })
+    }
+}
+
+fn source_error(node: NodeId, error: impl std::fmt::Display) -> IndexEventError {
+    IndexEventError::Source {
+        node,
+        message: error.to_string(),
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct IndexSourceCursor {
     pub source: SourceId,
-    /// First source offset not included in the checkpoint.
+    /// First source-local journal offset not represented by the checkpoint.
     pub next_offset: u64,
 }
 
-/// Complete cluster-wide generation boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct IndexBarrier {
     pub fence: PlacementLogId,
@@ -240,22 +236,22 @@ pub(crate) struct IndexBarrier {
 #[derive(Clone, Debug)]
 pub(crate) struct IndexJournalChange {
     pub node: NodeId,
-    pub source: SourceId,
     pub change: LocalChange,
 }
 
+/// One bounded source-local page and the exact cursor after that page.
 #[derive(Clone, Debug)]
-pub(crate) struct IndexJournalBatch {
+pub(crate) struct IndexJournalPage {
     pub changes: Vec<IndexJournalChange>,
     pub through: IndexBarrier,
+    pub encoded_bytes: u64,
 }
 
-/// Stateless all-source collector. A node-level router uses one instance to
-/// read each source once and fan the returned invalidations to local builders.
 pub(crate) struct IndexEventJournal {
     authority: Arc<dyn IndexEventAuthority>,
     sources: Arc<dyn IndexEventSources>,
     page_size: usize,
+    observed: std::sync::RwLock<Option<IndexBarrier>>,
 }
 
 impl IndexEventJournal {
@@ -267,6 +263,7 @@ impl IndexEventJournal {
             authority,
             sources,
             page_size: MAX_LOCAL_INVALIDATION_SCAN_RECORDS,
+            observed: std::sync::RwLock::new(None),
         }
     }
 
@@ -276,9 +273,6 @@ impl IndexEventJournal {
         self
     }
 
-    /// Capture every ACTIVE source tail under one unchanged, fully finalized
-    /// atomic-program watermark. A concurrent atomic commit makes the caller
-    /// retry rather than creating a partially atomic boundary.
     pub(crate) async fn capture_barrier(&self) -> Result<IndexBarrier, IndexEventError> {
         let before = self
             .authority
@@ -302,15 +296,14 @@ impl IndexEventJournal {
                 joined.map_err(|error| IndexEventError::Task(error.to_string()))?;
             let status = result?;
             validate_status(source.node, &status)?;
-            let next_offset = status
-                .tail
-                .checked_add(1)
-                .ok_or(IndexEventError::OffsetOverflow(source.node))?;
             cursors.insert(
                 source.node,
                 IndexSourceCursor {
                     source: status.source_id,
-                    next_offset,
+                    next_offset: status
+                        .tail
+                        .checked_add(1)
+                        .ok_or(IndexEventError::OffsetOverflow(source.node))?,
                 },
             );
         }
@@ -325,40 +318,212 @@ impl IndexEventJournal {
         if cursors.len() != before.sources.len() {
             return Err(IndexEventError::IncompleteSources);
         }
-        Ok(IndexBarrier {
+        let barrier = IndexBarrier {
             fence: before.fence,
             atomic: before.atomic,
             sources: cursors,
-        })
+        };
+        *self
+            .observed
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(barrier.clone());
+        Ok(barrier)
     }
 
-    /// Drain every source from `from` through exactly `target`. Results are
-    /// returned only if every source succeeds and retains the same epoch.
-    pub(crate) async fn drain(
+    pub(crate) fn last_observed_barrier(&self) -> Option<IndexBarrier> {
+        self.observed
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Revalidate the authority named by a completed candidate immediately
+    /// before its current-pointer CAS. Later ordinary writes may make the
+    /// candidate stale, but cannot invalidate it; a membership/source epoch or
+    /// atomic-program watermark change does invalidate the candidate.
+    pub(crate) async fn validate_publication_barrier(
         &self,
-        from: &IndexBarrier,
-        target: IndexBarrier,
-    ) -> Result<IndexJournalBatch, IndexEventError> {
+        candidate: &IndexBarrier,
+    ) -> Result<(), IndexEventError> {
+        let observed = self.capture_barrier().await?;
+        if observed.fence != candidate.fence || observed.atomic != candidate.atomic {
+            return Err(IndexEventError::BarrierChanged);
+        }
+        if observed.sources.len() != candidate.sources.len()
+            || candidate.sources.iter().any(|(node, cursor)| {
+                observed.sources.get(node).is_none_or(|latest| {
+                    latest.source != cursor.source || latest.next_offset < cursor.next_offset
+                })
+            })
+        {
+            return Err(IndexEventError::IncompleteSources);
+        }
+        Ok(())
+    }
+
+    /// Bind source-local RocksDB snapshot tails to the current membership and
+    /// complete atomic-program watermark.
+    ///
+    /// The snapshot transport already proves each `(source, tail)` pair came
+    /// from one held RocksDB snapshot. This final authority check proves the
+    /// complete set belongs to the same ACTIVE membership fence before a
+    /// rebuild consumes any frames.
+    pub(crate) fn barrier_from_snapshot_tails(
+        &self,
+        fence: PlacementLogId,
+        tails: &[(NodeId, SourceId, u64)],
+    ) -> Result<IndexBarrier, IndexEventError> {
         let placement = self
             .authority
             .current()
             .map_err(IndexEventError::Placement)?;
-        require_compatible(from, &target, &placement)?;
-
-        let mut tasks = tokio::task::JoinSet::new();
-        for source in placement.sources.iter().cloned() {
-            let start = from.sources[&source.node];
-            let through = target.sources[&source.node];
-            let sources = self.sources.clone();
-            let page_size = self.page_size;
-            tasks.spawn(
-                async move { drain_source(sources, source, start, through, page_size).await },
+        if placement.fence != fence || !placement.atomic.is_clear() {
+            return Err(IndexEventError::BarrierChanged);
+        }
+        let expected = placement
+            .sources
+            .iter()
+            .map(|source| source.node)
+            .collect::<Vec<_>>();
+        let mut cursors = BTreeMap::new();
+        for &(node, source, tail) in tails {
+            if u64::from(source.node_id) != node.0 || cursors.contains_key(&node) {
+                return Err(IndexEventError::IncompleteSources);
+            }
+            cursors.insert(
+                node,
+                IndexSourceCursor {
+                    source,
+                    next_offset: tail
+                        .checked_add(1)
+                        .ok_or(IndexEventError::OffsetOverflow(node))?,
+                },
             );
         }
+        if cursors.keys().copied().collect::<Vec<_>>() != expected {
+            return Err(IndexEventError::IncompleteSources);
+        }
+        let barrier = IndexBarrier {
+            fence,
+            atomic: placement.atomic,
+            sources: cursors,
+        };
+        *self
+            .observed
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(barrier.clone());
+        Ok(barrier)
+    }
 
-        let mut changes = Vec::new();
-        while let Some(joined) = tasks.join_next().await {
-            changes.extend(joined.map_err(|error| IndexEventError::Task(error.to_string()))??);
+    /// Pull at most one byte-bounded page from the first source still behind.
+    ///
+    /// The caller advances to `page.through` only after durably preparing the
+    /// corresponding mutation run. Returning `None` proves the complete target
+    /// vector under the same placement and atomic watermark.
+    pub(crate) async fn next_page(
+        &self,
+        from: &IndexBarrier,
+        target: &IndexBarrier,
+        max_bytes: u64,
+    ) -> Result<Option<IndexJournalPage>, IndexEventError> {
+        if max_bytes == 0 {
+            return Err(IndexEventError::ZeroPageByteLimit);
+        }
+        let placement = self
+            .authority
+            .current()
+            .map_err(IndexEventError::Placement)?;
+        require_compatible(from, target, &placement)?;
+        let Some(source) = placement.sources.iter().find(|source| {
+            from.sources[&source.node].next_offset < target.sources[&source.node].next_offset
+        }) else {
+            if from != target {
+                return Err(IndexEventError::IncompleteSources);
+            }
+            return Ok(None);
+        };
+
+        let start = from.sources[&source.node];
+        let through = target.sources[&source.node];
+        let status_before = self.sources.status(source).await?;
+        validate_status(source.node, &status_before)?;
+        if status_before.source_id != start.source
+            || start.next_offset.saturating_sub(1) < status_before.retention_floor
+        {
+            return Err(IndexEventError::SourceEpochChanged(source.node));
+        }
+        let remaining = usize::try_from(through.next_offset - start.next_offset)
+            .unwrap_or(usize::MAX)
+            .min(self.page_size);
+        let after = start
+            .next_offset
+            .checked_sub(1)
+            .ok_or(IndexEventError::CheckpointMismatch(source.node))?;
+        let page = self
+            .sources
+            .read_page(source, start.source, after, remaining, max_bytes)
+            .await?;
+        if page.source_id != start.source {
+            return Err(IndexEventError::SourceEpochChanged(source.node));
+        }
+        if let Some(oversize) = page.oversize {
+            if !page.changes.is_empty()
+                || page.encoded_bytes != 0
+                || oversize.offset != start.next_offset
+            {
+                return Err(IndexEventError::NonContiguousSource(source.node));
+            }
+            return Err(IndexEventError::PageBytesExceeded {
+                bytes: oversize.encoded_bytes,
+                limit: max_bytes,
+            });
+        }
+        if page.changes.is_empty() {
+            return Err(IndexEventError::SourceEpochChanged(source.node));
+        }
+
+        let mut next = start.next_offset;
+        let mut encoded_bytes = 0_u64;
+        let mut changes = Vec::with_capacity(page.changes.len());
+        for change in page.changes {
+            if change.offset() != next || next >= through.next_offset {
+                return Err(IndexEventError::NonContiguousSource(source.node));
+            }
+            let bytes = encoded_len(&change)?;
+            let projected = encoded_bytes
+                .checked_add(bytes)
+                .ok_or(IndexEventError::PageLengthOverflow)?;
+            if projected > max_bytes && changes.is_empty() {
+                return Err(IndexEventError::PageBytesExceeded {
+                    bytes: projected,
+                    limit: max_bytes,
+                });
+            }
+            if projected > max_bytes {
+                break;
+            }
+            encoded_bytes = projected;
+            changes.push(IndexJournalChange {
+                node: source.node,
+                change,
+            });
+            next = next
+                .checked_add(1)
+                .ok_or(IndexEventError::OffsetOverflow(source.node))?;
+        }
+        if encoded_bytes != page.encoded_bytes {
+            return Err(IndexEventError::PageLengthMismatch {
+                measured: encoded_bytes,
+                reported: page.encoded_bytes,
+            });
+        }
+
+        let status_after = self.sources.status(source).await?;
+        validate_status(source.node, &status_after)?;
+        if status_after.source_id != start.source
+            || status_after.tail.saturating_add(1) < through.next_offset
+        {
+            return Err(IndexEventError::SourceEpochChanged(source.node));
         }
         if self
             .authority
@@ -368,56 +533,47 @@ impl IndexEventJournal {
         {
             return Err(IndexEventError::BarrierChanged);
         }
-        Ok(IndexJournalBatch {
+        let mut advanced = from.clone();
+        advanced.sources.get_mut(&source.node).unwrap().next_offset = next;
+        if advanced
+            .sources
+            .iter()
+            .all(|(node, cursor)| cursor.next_offset == target.sources[node].next_offset)
+        {
+            // The complete source vector, not an individual page, crosses an
+            // atomic-program watermark. This is the publication boundary that
+            // prevents a partially indexed atomic batch.
+            advanced.atomic = target.atomic;
+        }
+        Ok(Some(IndexJournalPage {
             changes,
-            through: target,
-        })
+            through: advanced,
+            encoded_bytes,
+        }))
     }
 }
 
-async fn drain_source(
-    sources: Arc<dyn IndexEventSources>,
-    source: IndexSource,
-    start: IndexSourceCursor,
-    through: IndexSourceCursor,
-    page_size: usize,
-) -> Result<Vec<IndexJournalChange>, IndexEventError> {
-    if start.source != through.source || start.next_offset > through.next_offset {
-        return Err(IndexEventError::CheckpointMismatch(source.node));
+fn encoded_len(change: &LocalChange) -> Result<u64, IndexEventError> {
+    let mut counter = ByteCounter(0);
+    serde_json::to_writer(&mut counter, change)
+        .map_err(|error| IndexEventError::Encode(error.to_string()))?;
+    Ok(counter.0)
+}
+
+struct ByteCounter(u64);
+
+impl io::Write for ByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| io::Error::other("index event byte count overflow"))?;
+        Ok(bytes.len())
     }
-    let mut next = start.next_offset;
-    let mut returned = Vec::new();
-    while next < through.next_offset {
-        let remaining = usize::try_from(through.next_offset - next).unwrap_or(usize::MAX);
-        let after = next
-            .checked_sub(1)
-            .ok_or(IndexEventError::CheckpointMismatch(source.node))?;
-        let page = sources
-            .read_page(&source, start.source, after, page_size.min(remaining))
-            .await?;
-        if page.source_id != start.source || page.changes.is_empty() {
-            return Err(IndexEventError::SourceEpochChanged(source.node));
-        }
-        for change in page.changes {
-            if change.offset() != next || next >= through.next_offset {
-                return Err(IndexEventError::NonContiguousSource(source.node));
-            }
-            returned.push(IndexJournalChange {
-                node: source.node,
-                source: start.source,
-                change,
-            });
-            next = next
-                .checked_add(1)
-                .ok_or(IndexEventError::OffsetOverflow(source.node))?;
-        }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
-    let status = sources.status(&source).await?;
-    validate_status(source.node, &status)?;
-    if status.source_id != start.source || status.tail.saturating_add(1) < through.next_offset {
-        return Err(IndexEventError::SourceEpochChanged(source.node));
-    }
-    Ok(returned)
 }
 
 fn require_compatible(
@@ -438,6 +594,10 @@ fn require_compatible(
         .collect::<Vec<_>>();
     if from.sources.keys().copied().collect::<Vec<_>>() != expected
         || target.sources.keys().copied().collect::<Vec<_>>() != expected
+        || from.sources.iter().any(|(node, cursor)| {
+            cursor.source != target.sources[node].source
+                || cursor.next_offset > target.sources[node].next_offset
+        })
     {
         return Err(IndexEventError::IncompleteSources);
     }
@@ -460,7 +620,7 @@ pub(crate) enum IndexEventError {
     Placement(String),
     #[error("an atomic program is awaiting finalization")]
     AtomicProgramInProgress,
-    #[error("membership or atomic-program state changed while collecting an index barrier")]
+    #[error("membership or atomic-program state changed while collecting index events")]
     BarrierChanged,
     #[error("not every ACTIVE source participated in the index barrier")]
     IncompleteSources,
@@ -472,12 +632,22 @@ pub(crate) enum IndexEventError {
     InvalidSourceStatus(NodeId),
     #[error("index checkpoint is incompatible at source {0:?}")]
     CheckpointMismatch(NodeId),
-    #[error("index source {0:?} changed epoch while being drained")]
+    #[error("index source {0:?} changed epoch or lost retained history")]
     SourceEpochChanged(NodeId),
     #[error("index source {0:?} returned non-contiguous offsets")]
     NonContiguousSource(NodeId),
     #[error("index source {0:?} exhausted its offset space")]
     OffsetOverflow(NodeId),
+    #[error("index event page byte limit must be positive")]
+    ZeroPageByteLimit,
+    #[error("index event page requires {bytes} bytes but is capped at {limit} bytes")]
+    PageBytesExceeded { bytes: u64, limit: u64 },
+    #[error("index event page length overflow")]
+    PageLengthOverflow,
+    #[error("index event page measured {measured} bytes but its source reported {reported}")]
+    PageLengthMismatch { measured: u64, reported: u64 },
+    #[error("measure index event: {0}")]
+    Encode(String),
 }
 
 #[cfg(test)]

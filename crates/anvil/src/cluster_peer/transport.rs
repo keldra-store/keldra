@@ -22,7 +22,7 @@ use tonic::{Request, Status};
 use super::storage::{list_page_from_wire, schema_query_json};
 use super::{
     CLUSTER_PEER_SCHEMA_VERSION, MAX_CLUSTER_OPERATION_TIME, MAX_CLUSTER_PEER_MESSAGE_BYTES,
-    decode_json, encode_json, require_response_schema, wire,
+    MAX_INDEX_SOURCE_SNAPSHOT_TIME, decode_json, encode_json, require_response_schema, wire,
 };
 use crate::authz_distribution::AuthzSchemaReplicaQuery;
 use crate::cluster_placement::ClusterPlacement;
@@ -217,6 +217,17 @@ impl ClusterPeerTransport {
                 bucket_id,
                 index_id,
             }),
+            super::IndexHeadScanScope::Run {
+                tenant_id,
+                bucket_id,
+                index_id,
+                run_hash,
+            } => wire::scan_index_heads_request::Scope::Run(wire::IndexRunHeads {
+                tenant_id,
+                bucket_id,
+                index_id,
+                run_blake3: run_hash.to_vec(),
+            }),
             super::IndexHeadScanScope::SourceObjects {
                 tenant_id,
                 bucket_id,
@@ -286,6 +297,71 @@ impl ClusterPeerTransport {
             heads,
             next_cursor,
         })
+    }
+
+    pub(crate) async fn scan_index_source_snapshot(
+        &self,
+        target: NodeId,
+        address: &str,
+        tenant_id: u64,
+        bucket_id: u64,
+        path_prefix: String,
+        max_frame_bytes: u64,
+    ) -> Result<super::IndexSourceSnapshot, Status> {
+        super::index_snapshot::require_snapshot_frame_bound(max_frame_bytes)?;
+        let placement = self.placement()?;
+        let fence = placement.fence();
+        let deadline = tokio::time::Instant::now() + MAX_INDEX_SOURCE_SNAPSHOT_TIME;
+        let (requests, receiver) = tokio::sync::mpsc::channel(1);
+        requests
+            .send(wire::IndexSourceSnapshotRequest {
+                command: Some(wire::index_source_snapshot_request::Command::Begin(
+                    wire::IndexSourceSnapshotBegin {
+                        peer: Some(self.context_with_timeout_limit(
+                            fence,
+                            0,
+                            MAX_INDEX_SOURCE_SNAPSHOT_TIME,
+                            MAX_INDEX_SOURCE_SNAPSHOT_TIME,
+                        )?),
+                        tenant_id,
+                        bucket_id,
+                        path_prefix,
+                        max_frame_bytes,
+                    },
+                )),
+            })
+            .await
+            .map_err(|_| Status::unavailable("index snapshot request stream closed"))?;
+        let mut request = Request::new(tokio_stream::wrappers::ReceiverStream::new(receiver));
+        request.set_timeout(MAX_INDEX_SOURCE_SNAPSHOT_TIME);
+        let mut stream = self
+            .client(target, address)?
+            .scan_index_source_snapshot(request)
+            .await?
+            .into_inner();
+        let response = tokio::time::timeout_at(deadline, stream.message())
+            .await
+            .map_err(|_| Status::deadline_exceeded("index source snapshot deadline exceeded"))??
+            .ok_or_else(|| {
+                Status::data_loss("index source snapshot returned no acknowledgement")
+            })?;
+        let begun = match response.event {
+            Some(wire::index_source_snapshot_response::Event::Begun(begun)) => begun,
+            Some(wire::index_source_snapshot_response::Event::Frame(_)) | None => {
+                return Err(Status::data_loss(
+                    "index source snapshot did not begin with an acknowledgement",
+                ));
+            }
+        };
+        super::index_snapshot::open_client_snapshot(
+            target,
+            self.decisions.clone(),
+            fence,
+            requests,
+            stream,
+            begun,
+            deadline,
+        )
     }
 
     pub(crate) async fn apply_schema_publication(
@@ -757,13 +833,23 @@ impl ClusterPeerTransport {
         hop_count: u32,
         remaining: Duration,
     ) -> Result<wire::PeerContext, Status> {
+        self.context_with_timeout_limit(expected, hop_count, remaining, MAX_CLUSTER_OPERATION_TIME)
+    }
+
+    fn context_with_timeout_limit(
+        &self,
+        expected: PlacementLogId,
+        hop_count: u32,
+        remaining: Duration,
+        max_timeout: Duration,
+    ) -> Result<wire::PeerContext, Status> {
         let placement = self.placement()?;
         if placement.fence() != expected {
             return Err(Status::unavailable(
                 "active placement differs from the operation fence",
             ));
         }
-        let millis = remaining.min(MAX_CLUSTER_OPERATION_TIME).as_millis().max(1);
+        let millis = remaining.min(max_timeout).as_millis().max(1);
         let remaining_deadline_millis = u32::try_from(millis)
             .map_err(|_| Status::invalid_argument("cluster deadline is too large"))?;
         let (cluster_id, source_node_id) = self.data.peer_identity();

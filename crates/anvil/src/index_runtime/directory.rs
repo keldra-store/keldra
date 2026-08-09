@@ -1,59 +1,34 @@
-//! Engine directory view over one validated immutable generation manifest.
+//! Lazy cache-backed directory for one immutable v2 logical run.
 
-use std::collections::BTreeMap;
+use anvil_index::{BlockDescriptor, IndexDirectoryRead, IndexError};
 
-use anvil_index::{IndexDirectoryRead, IndexError};
-
-use super::cache::{IndexCache, IndexFile, IndexFileLayout, IndexSegment, IndexSegmentId};
-use super::generation::IndexGenerationManifest;
+use super::cache::{IndexCache, IndexFile, IndexSegmentId};
+use super::generation::ManifestRun;
 
 #[derive(Clone)]
 pub(crate) struct ManifestIndexDirectory {
-    files: BTreeMap<String, IndexFile>,
+    cache: IndexCache,
+    root: IndexSegmentId,
 }
 
 impl ManifestIndexDirectory {
-    pub(crate) fn open(
-        cache: IndexCache,
-        manifest: &IndexGenerationManifest,
-    ) -> Result<Self, IndexError> {
-        manifest
-            .validate()
+    pub(crate) fn open(cache: IndexCache, run: &ManifestRun) -> Result<Self, IndexError> {
+        let root = IndexSegmentId::new(run.root_blob.hash, run.root_blob.length)
             .map_err(|error| IndexError::InvalidDefinition(error.to_string()))?;
-        let mut files = BTreeMap::new();
-        for file in &manifest.files {
-            let segments = file
-                .segments
-                .iter()
-                .map(|segment| {
-                    let id = IndexSegmentId::new(segment.blob.hash, segment.blob.length)
-                        .map_err(|error| IndexError::InvalidDefinition(error.to_string()))?;
-                    Ok(IndexSegment {
-                        logical_offset: segment.logical_offset,
-                        id,
-                    })
-                })
-                .collect::<Result<Vec<_>, IndexError>>()?;
-            let layout = IndexFileLayout::new(segments)
-                .map_err(|error| IndexError::InvalidDefinition(error.to_string()))?;
-            let opened = cache.open(layout);
-            if files.insert(file.name.clone(), opened).is_some() {
-                return Err(IndexError::InvalidDefinition(
-                    "generation repeats an index file name".into(),
-                ));
-            }
-        }
-        Ok(Self { files })
+        Ok(Self { cache, root })
     }
 }
 
 impl IndexDirectoryRead for ManifestIndexDirectory {
     type File = IndexFile;
 
-    async fn open_file(&self, name: &str) -> Result<Self::File, IndexError> {
-        self.files
-            .get(name)
-            .cloned()
-            .ok_or_else(|| IndexError::FileNotFound(name.to_owned()))
+    async fn open_root(&self) -> Result<Self::File, IndexError> {
+        Ok(self.cache.open(self.root))
+    }
+
+    async fn open_block(&self, descriptor: &BlockDescriptor) -> Result<Self::File, IndexError> {
+        let id = IndexSegmentId::new(descriptor.hash, descriptor.encoded_bytes)
+            .map_err(|error| IndexError::InvalidDefinition(error.to_string()))?;
+        Ok(self.cache.open(id))
     }
 }

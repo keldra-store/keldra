@@ -433,7 +433,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         store.clone(),
         object_reader.clone(),
         index_runtime.scanner.clone(),
-        index_runtime.event_router.clone(),
+        index_runtime.event_journal.clone(),
         index_runtime.artifact_router.clone(),
     )
     .await
@@ -582,6 +582,13 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         let request = object_authority.require(request)?;
         object_rate_limits.authenticate_object(&object_tokens, request)
     };
+    let index_tokens = tokens.clone();
+    let index_rate_limits = request_rate_limits.clone();
+    let index_authority = serving_fence.authority();
+    let authenticate_index = move |request: tonic::Request<()>| {
+        let request = index_authority.require(request)?;
+        index_rate_limits.authenticate_index(&index_tokens, request)
+    };
     let authenticated_authority = serving_fence.authority();
     let authenticate = move |request: tonic::Request<()>| {
         let request = authenticated_authority.require(request)?;
@@ -590,7 +597,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     let object_service =
         tonic::service::interceptor::InterceptedService::new(object_service, authenticate_object);
     let index_service =
-        tonic::service::interceptor::InterceptedService::new(index_service, authenticate.clone());
+        tonic::service::interceptor::InterceptedService::new(index_service, authenticate_index);
     let personaldb_service = tonic::service::interceptor::InterceptedService::new(
         personaldb_service,
         authenticate.clone(),

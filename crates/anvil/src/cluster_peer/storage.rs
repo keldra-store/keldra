@@ -27,6 +27,7 @@ struct SchemaReplicaQueryWire {
 #[tonic::async_trait]
 impl wire::cluster_peer_server::ClusterPeer for ClusterPeerService {
     type ReadRealmAggregateStream = super::authz::RealmAggregateStream;
+    type ScanIndexSourceSnapshotStream = super::index_snapshot::IndexSourceSnapshotRpcStream;
 
     async fn publish_index_artifact(
         &self,
@@ -47,6 +48,13 @@ impl wire::cluster_peer_server::ClusterPeer for ClusterPeerService {
         request: Request<wire::ScanIndexHeadsRequest>,
     ) -> Result<Response<wire::IndexHeadScanPage>, Status> {
         self.scan_index_heads_call(request).await
+    }
+
+    async fn scan_index_source_snapshot(
+        &self,
+        request: Request<tonic::Streaming<wire::IndexSourceSnapshotRequest>>,
+    ) -> Result<Response<Self::ScanIndexSourceSnapshotStream>, Status> {
+        self.scan_index_source_snapshot_call(request).await
     }
 
     async fn route_index_query(

@@ -10,7 +10,7 @@ use super::boundary::{IndexPageCursor, IndexPageTokenBinding, IndexPageTokenCode
 
 pub(crate) const INDEX_PAGE_TOKEN_AUDIENCE: &str = "anvil-index-page";
 pub(crate) const INDEX_PAGE_TOKEN_PURPOSE: &str = "index-page";
-const INDEX_PAGE_TOKEN_FORMAT: u8 = 1;
+const INDEX_PAGE_TOKEN_FORMAT: u8 = 2;
 
 /// Strongly typed private JWT claims. There is deliberately no expiry: the
 /// referenced immutable generation, definition version, and exact Zanzibar

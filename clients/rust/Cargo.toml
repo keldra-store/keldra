@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 description = "Authenticated Rust client for Anvil objects and indexes"
 rust-version.workspace = true
-license.workspace = true
+license-file = "../../LICENSE"
 homepage.workspace = true
 documentation = "https://docs.rs/anvil-storage"
 readme = "README.md"
@@ -13,7 +13,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-anvil-api = { version = "0.5.5", path = "../../crates/anvil-api" }
+anvil-api = { version = "0.6.0", path = "../../crates/anvil-api" }
 tokio-stream = "0.1"
 tonic = { version = "0.14", default-features = false, features = ["transport", "tls-native-roots"] }
 

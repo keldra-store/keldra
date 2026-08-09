@@ -12,6 +12,7 @@ mod authz_transport;
 mod control;
 mod index_artifacts;
 mod index_queries;
+mod index_snapshot;
 mod logical_names;
 mod personaldb;
 mod programs;
@@ -46,6 +47,7 @@ pub(crate) use index_queries::{
     AuthorizedIndexQueryHandler, LocalIndexQueryExecutor, LocalIndexQueryRequest,
     RoutedIndexQueryHandlers, RoutedIndexQueryRequest,
 };
+pub(crate) use index_snapshot::{IndexSourceSnapshot, IndexSourceSnapshotHead};
 pub(crate) use public_authz::{RoutedAuthzHandler, RoutedAuthzHandlers};
 pub(crate) use routing::{RoutedCall, RoutedPublicHandler, RoutedPublicHandlers};
 pub(crate) use transport::ClusterPeerTransport;
@@ -53,6 +55,7 @@ pub(crate) use transport::ClusterPeerTransport;
 pub(crate) const CLUSTER_PEER_SCHEMA_VERSION: u32 = 1;
 const MAX_CLUSTER_PEER_MESSAGE_BYTES: usize = 64 * 1024 * 1024 + 64 * 1024;
 const MAX_CLUSTER_OPERATION_TIME: Duration = Duration::from_secs(30);
+const MAX_INDEX_SOURCE_SNAPSHOT_TIME: Duration = Duration::from_secs(60 * 60);
 const MAX_TYPED_JSON_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone)]

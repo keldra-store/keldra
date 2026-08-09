@@ -6,24 +6,72 @@ use anvil_api::v1::{
     IndexOrderDirection, IndexPredicate, IndexPredicateOperator, IndexQuery, IndexSpecification,
     VectorMetric as ApiVectorMetric,
 };
-use anvil_index::full_text::{FullTextEngine, FullTextQuery};
-use anvil_index::hybrid::{HybridDefinition, HybridEngine, HybridQuery};
+use anvil_index::full_text::{FullTextEngine, FullTextQuery, FullTextQueryCursor};
+use anvil_index::hybrid::{HybridDefinition, HybridEngine, HybridQuery, HybridQueryCursor};
 use anvil_index::ordered::{PathEngine, PathQuery};
 use anvil_index::projections::{GitSourceEngine, TensorProjectionEngine};
 use anvil_index::typed_json::{
     MetadataFilterEngine, ScalarValue, TypedField, TypedJsonDefinition, TypedJsonEngine,
-    TypedOrder, TypedPredicate, TypedQuery,
+    TypedOrder, TypedPredicate, TypedQuery, TypedQueryCursor,
 };
-use anvil_index::vector::{VectorDefinition, VectorEngine, VectorMetric};
+use anvil_index::vector::{VectorDefinition, VectorEngine, VectorMetric, VectorQueryCursor};
 use anvil_index::{IndexDirectoryRead, IndexError};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+const INDEX_QUERY_POSITION_FORMAT: u8 = 2;
+
+/// Engine-native continuation state carried inside the signed public page
+/// token. The outer token binds these bytes to the immutable generation,
+/// definition, query, and authorization revision.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct IndexQueryPosition {
-    /// Number of globally ordered hits already returned for score/order scans.
-    pub offset: u64,
-    /// Exact last path for engines with a native ordered seek.
-    pub after_path: Option<String>,
+    format: u8,
+    cursor: Option<IndexQueryCursor>,
+}
+
+impl Default for IndexQueryPosition {
+    fn default() -> Self {
+        Self {
+            format: INDEX_QUERY_POSITION_FORMAT,
+            cursor: None,
+        }
+    }
+}
+
+impl IndexQueryPosition {
+    fn after(cursor: IndexQueryCursor) -> Self {
+        Self {
+            format: INDEX_QUERY_POSITION_FORMAT,
+            cursor: Some(cursor),
+        }
+    }
+
+    fn validate(&self) -> Result<(), IndexError> {
+        if self.format == INDEX_QUERY_POSITION_FORMAT {
+            Ok(())
+        } else {
+            Err(IndexError::InvalidQuery(
+                "index page position uses an unsupported format".into(),
+            ))
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "engine",
+    content = "position",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+enum IndexQueryCursor {
+    Path { after_path: String },
+    Git { after_path: String },
+    Typed(TypedQueryCursor),
+    FullText(FullTextQueryCursor),
+    Vector(VectorQueryCursor),
+    Hybrid(HybridQueryCursor),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -41,12 +89,13 @@ pub(crate) struct EngineQueryPage {
 }
 
 pub(crate) async fn execute_query<D: IndexDirectoryRead>(
-    directory: &D,
+    segments: &[D],
     specification: &IndexSpecification,
     query: &IndexQuery,
     page_size: usize,
     position: IndexQueryPosition,
 ) -> Result<EngineQueryPage, IndexError> {
+    position.validate()?;
     if page_size == 0 {
         return Ok(EngineQueryPage {
             hits: Vec::new(),
@@ -55,57 +104,49 @@ pub(crate) async fn execute_query<D: IndexDirectoryRead>(
     }
     match (specification.specification.as_ref(), query.query.as_ref()) {
         (Some(Specification::Path(_)), Some(Query::Path(query))) => {
-            query_path(directory, query, page_size, position).await
+            query_path(segments, query, page_size, position).await
         }
         (
             Some(Specification::MetadataFilter(specification)),
             Some(Query::MetadataFilter(query)),
         ) => {
             let definition = metadata_definition(&specification.fields);
-            let query = typed_query(
-                &query.predicates,
-                &[],
-                scan_limit(page_size, position.offset)?,
-            )?;
-            let hits = MetadataFilterEngine::query(directory, &definition, &query).await?;
-            typed_page(hits, page_size, position)
+            let query = typed_query(&query.predicates, &[], page_limit(page_size)?)?;
+            let hits = MetadataFilterEngine::query_after(
+                segments,
+                &definition,
+                &query,
+                typed_cursor(&position)?,
+            )
+            .await?;
+            typed_page(hits, &query.order, page_size)
         }
         (Some(Specification::TypedJson(specification)), Some(Query::TypedJson(query))) => {
             let definition = typed_definition(&specification.fields);
-            let query = typed_query(
-                &query.predicates,
-                &query.order,
-                scan_limit(page_size, position.offset)?,
-            )?;
-            let hits = TypedJsonEngine::query(directory, &definition, &query).await?;
-            typed_page(hits, page_size, position)
+            let query = typed_query(&query.predicates, &query.order, page_limit(page_size)?)?;
+            let hits = TypedJsonEngine::query_after(
+                segments,
+                &definition,
+                &query,
+                typed_cursor(&position)?,
+            )
+            .await?;
+            typed_page(hits, &query.order, page_size)
         }
         (Some(Specification::FullText(_)), Some(Query::FullText(query))) => {
-            let hits = FullTextEngine::query(
-                directory,
+            let hits = FullTextEngine::query_after(
+                segments,
                 FullTextQuery {
                     text: &query.text,
                     fields: &[],
                     phrase: query.phrase,
                     match_all_terms: false,
-                    limit: scan_limit(page_size, position.offset)?,
+                    limit: page_limit(page_size)?,
                 },
+                full_text_cursor(&position)?,
             )
-            .await?
-            .into_iter()
-            .map(|hit| {
-                Ok(EngineQueryHit {
-                    object_path: Some(hit.document.path),
-                    object_version: hit.document.version,
-                    score: Some(hit.score),
-                    fields_json: serde_json::to_vec(&serde_json::json!({
-                        "matched_terms": hit.matched_terms,
-                    }))
-                    .map_err(|error| IndexError::Encode(error.to_string()))?,
-                })
-            })
-            .collect::<Result<Vec<_>, IndexError>>()?;
-            offset_page(hits, page_size, position)
+            .await?;
+            full_text_page(hits, page_size)
         }
         (Some(Specification::Vector(specification)), Some(Query::Vector(query))) => {
             let definition = vector_definition(specification)?;
@@ -114,22 +155,15 @@ pub(crate) async fn execute_query<D: IndexDirectoryRead>(
                 definition.dimension,
                 specification.normalize,
             )?;
-            let hits = VectorEngine::query(
-                directory,
+            let hits = VectorEngine::query_after(
+                segments,
                 &definition,
                 &values,
-                scan_limit(page_size, position.offset)?,
+                page_limit(page_size)?,
+                vector_cursor(&position)?,
             )
-            .await?
-            .into_iter()
-            .map(|hit| EngineQueryHit {
-                object_path: Some(hit.document.path),
-                object_version: hit.document.version,
-                score: Some(hit.score),
-                fields_json: Vec::new(),
-            })
-            .collect();
-            offset_page(hits, page_size, position)
+            .await?;
+            vector_page(hits, page_size)
         }
         (Some(Specification::Hybrid(specification)), Some(Query::Hybrid(query))) => {
             let vector = specification.vector.as_ref().ok_or_else(|| {
@@ -149,37 +183,24 @@ pub(crate) async fn execute_query<D: IndexDirectoryRead>(
                     vector.normalize,
                 )?
             };
-            let hits = HybridEngine::query(
-                directory,
+            let hits = HybridEngine::query_after(
+                segments,
                 &definition,
                 HybridQuery {
                     text: &query.text,
                     vector: &values,
                     fields: &[],
                     phrase: false,
-                    limit: scan_limit(page_size, position.offset)?,
+                    limit: page_limit(page_size)?,
                 },
+                hybrid_cursor(&position)?,
             )
-            .await?
-            .into_iter()
-            .map(|hit| {
-                Ok(EngineQueryHit {
-                    object_path: Some(hit.document.path),
-                    object_version: hit.document.version,
-                    score: Some(hit.score),
-                    fields_json: serde_json::to_vec(&serde_json::json!({
-                        "text_score": hit.text_score,
-                        "vector_score": hit.vector_score,
-                    }))
-                    .map_err(|error| IndexError::Encode(error.to_string()))?,
-                })
-            })
-            .collect::<Result<Vec<_>, IndexError>>()?;
-            offset_page(hits, page_size, position)
+            .await?;
+            hybrid_page(hits, page_size)
         }
         (Some(Specification::GitSource(specification)), Some(Query::GitSource(query))) => {
             query_git(
-                directory,
+                segments,
                 &specification.repository_id,
                 query,
                 page_size,
@@ -189,7 +210,7 @@ pub(crate) async fn execute_query<D: IndexDirectoryRead>(
         }
         (Some(Specification::Tensor(specification)), Some(Query::Tensor(query))) => {
             query_tensor(
-                directory,
+                segments,
                 &specification.model_id,
                 &query.tensor_name,
                 position,
@@ -206,22 +227,103 @@ pub(crate) async fn execute_query<D: IndexDirectoryRead>(
     }
 }
 
+fn full_text_page(
+    hits: Vec<anvil_index::full_text::FullTextHit>,
+    page_size: usize,
+) -> Result<EngineQueryPage, IndexError> {
+    let has_more = hits.len() > page_size;
+    let selected = hits.into_iter().take(page_size).collect::<Vec<_>>();
+    let next = has_more.then(|| {
+        IndexQueryPosition::after(IndexQueryCursor::FullText(FullTextQueryCursor::from_hit(
+            selected.last().expect("a nonempty page has a last hit"),
+        )))
+    });
+    let hits = selected
+        .into_iter()
+        .map(|hit| {
+            Ok(EngineQueryHit {
+                object_path: Some(hit.document.path),
+                object_version: hit.document.version,
+                score: Some(hit.score),
+                fields_json: serde_json::to_vec(&serde_json::json!({
+                    "matched_terms": hit.matched_terms,
+                }))
+                .map_err(|error| IndexError::Encode(error.to_string()))?,
+            })
+        })
+        .collect::<Result<Vec<_>, IndexError>>()?;
+    Ok(EngineQueryPage { hits, next })
+}
+
+fn vector_page(
+    hits: Vec<anvil_index::vector::VectorHit>,
+    page_size: usize,
+) -> Result<EngineQueryPage, IndexError> {
+    let has_more = hits.len() > page_size;
+    let selected = hits.into_iter().take(page_size).collect::<Vec<_>>();
+    let next = has_more.then(|| {
+        IndexQueryPosition::after(IndexQueryCursor::Vector(VectorQueryCursor::from_hit(
+            selected.last().expect("a nonempty page has a last hit"),
+        )))
+    });
+    let hits = selected
+        .into_iter()
+        .map(|hit| EngineQueryHit {
+            object_path: Some(hit.document.path),
+            object_version: hit.document.version,
+            score: Some(hit.score),
+            fields_json: Vec::new(),
+        })
+        .collect();
+    Ok(EngineQueryPage { hits, next })
+}
+
+fn hybrid_page(
+    hits: Vec<anvil_index::hybrid::HybridHit>,
+    page_size: usize,
+) -> Result<EngineQueryPage, IndexError> {
+    let has_more = hits.len() > page_size;
+    let selected = hits.into_iter().take(page_size).collect::<Vec<_>>();
+    let next = has_more.then(|| {
+        IndexQueryPosition::after(IndexQueryCursor::Hybrid(HybridQueryCursor::from_hit(
+            selected.last().expect("a nonempty page has a last hit"),
+        )))
+    });
+    let hits = selected
+        .into_iter()
+        .map(|hit| {
+            Ok(EngineQueryHit {
+                object_path: Some(hit.document.path),
+                object_version: hit.document.version,
+                score: Some(hit.score),
+                fields_json: serde_json::to_vec(&serde_json::json!({
+                    "text_score": hit.text_score,
+                    "vector_score": hit.vector_score,
+                }))
+                .map_err(|error| IndexError::Encode(error.to_string()))?,
+            })
+        })
+        .collect::<Result<Vec<_>, IndexError>>()?;
+    Ok(EngineQueryPage { hits, next })
+}
+
 async fn query_path<D: IndexDirectoryRead>(
-    directory: &D,
+    segments: &[D],
     query: &anvil_api::v1::PathIndexQuery,
     page_size: usize,
     position: IndexQueryPosition,
 ) -> Result<EngineQueryPage, IndexError> {
-    let after = position
-        .after_path
-        .as_deref()
-        .or(query.start_after.as_deref());
+    let after = match position.cursor.as_ref() {
+        None => query.start_after.as_deref(),
+        Some(IndexQueryCursor::Path { after_path }) => Some(after_path.as_str()),
+        Some(_) => return Err(cursor_kind_mismatch()),
+    };
     let documents = PathEngine::query(
-        directory,
+        segments,
         PathQuery {
             prefix: &query.prefix,
             after_path: after,
-            limit: page_size.saturating_add(1),
+            limit: page_limit(page_size)?,
         },
     )
     .await?;
@@ -236,40 +338,58 @@ async fn query_path<D: IndexDirectoryRead>(
             fields_json: Vec::new(),
         })
         .collect::<Vec<_>>();
-    let next = has_more.then(|| IndexQueryPosition {
-        offset: position.offset.saturating_add(hits.len() as u64),
-        after_path: hits.last().and_then(|hit| hit.object_path.clone()),
+    let next = has_more.then(|| {
+        IndexQueryPosition::after(IndexQueryCursor::Path {
+            after_path: hits
+                .last()
+                .and_then(|hit| hit.object_path.clone())
+                .expect("a nonempty page has a last path"),
+        })
     });
     Ok(EngineQueryPage { hits, next })
 }
 
 async fn query_git<D: IndexDirectoryRead>(
-    directory: &D,
+    segments: &[D],
     repository_id: &str,
     query: &anvil_api::v1::GitSourceIndexQuery,
     page_size: usize,
     position: IndexQueryPosition,
 ) -> Result<EngineQueryPage, IndexError> {
+    let after_path = match position.cursor.as_ref() {
+        None => None,
+        Some(IndexQueryCursor::Git { after_path }) if query.prefix => Some(after_path.as_str()),
+        Some(_) => return Err(cursor_kind_mismatch()),
+    };
     let records = if query.prefix {
         GitSourceEngine::list_tree(
-            directory,
+            segments,
             repository_id,
             &query.commit_id,
             &query.tree_path,
-            position.after_path.as_deref(),
-            page_size.saturating_add(1),
+            after_path,
+            page_limit(page_size)?,
         )
         .await?
     } else {
-        GitSourceEngine::get_by_path(directory, repository_id, &query.commit_id, &query.tree_path)
+        GitSourceEngine::get_by_path(segments, repository_id, &query.commit_id, &query.tree_path)
             .await?
             .into_iter()
             .collect()
     };
     let has_more = records.len() > page_size;
-    let hits = records
+    let selected = records.into_iter().take(page_size).collect::<Vec<_>>();
+    let next = has_more.then(|| {
+        IndexQueryPosition::after(IndexQueryCursor::Git {
+            after_path: selected
+                .last()
+                .expect("a nonempty page has a last record")
+                .tree_path
+                .clone(),
+        })
+    });
+    let hits = selected
         .into_iter()
-        .take(page_size)
         .map(|record| {
             let fields_json = serde_json::to_vec(&record)
                 .map_err(|error| IndexError::Encode(error.to_string()))?;
@@ -281,29 +401,19 @@ async fn query_git<D: IndexDirectoryRead>(
             })
         })
         .collect::<Result<Vec<_>, IndexError>>()?;
-    let next = has_more.then(|| IndexQueryPosition {
-        offset: position.offset.saturating_add(hits.len() as u64),
-        after_path: hits
-            .last()
-            .and_then(|hit| serde_json::from_slice::<serde_json::Value>(&hit.fields_json).ok())
-            .and_then(|record| record.get("tree_path")?.as_str().map(str::to_owned)),
-    });
     Ok(EngineQueryPage { hits, next })
 }
 
 async fn query_tensor<D: IndexDirectoryRead>(
-    directory: &D,
+    segments: &[D],
     model_id: &str,
     tensor_name: &str,
     position: IndexQueryPosition,
 ) -> Result<EngineQueryPage, IndexError> {
-    if position.offset > 0 {
-        return Ok(EngineQueryPage {
-            hits: Vec::new(),
-            next: None,
-        });
+    if position.cursor.is_some() {
+        return Err(cursor_kind_mismatch());
     }
-    let hits = TensorProjectionEngine::get(directory, model_id, tensor_name)
+    let hits = TensorProjectionEngine::get(segments, model_id, tensor_name)
         .await?
         .into_iter()
         .map(|record| {
@@ -324,10 +434,18 @@ async fn query_tensor<D: IndexDirectoryRead>(
 
 fn typed_page(
     hits: Vec<anvil_index::typed_json::TypedHit>,
+    order: &[TypedOrder],
     page_size: usize,
-    position: IndexQueryPosition,
 ) -> Result<EngineQueryPage, IndexError> {
-    let hits = hits
+    let has_more = hits.len() > page_size;
+    let selected = hits.into_iter().take(page_size).collect::<Vec<_>>();
+    let next = has_more.then(|| {
+        IndexQueryPosition::after(IndexQueryCursor::Typed(TypedQueryCursor::from_hit(
+            selected.last().expect("a nonempty page has a last hit"),
+            order,
+        )))
+    });
+    let hits = selected
         .into_iter()
         .map(|hit| {
             let fields_json = serde_json::to_vec(&hit.fields)
@@ -340,29 +458,45 @@ fn typed_page(
             })
         })
         .collect::<Result<Vec<_>, IndexError>>()?;
-    offset_page(hits, page_size, position)
+    Ok(EngineQueryPage { hits, next })
 }
 
-fn offset_page(
-    hits: Vec<EngineQueryHit>,
-    page_size: usize,
-    position: IndexQueryPosition,
-) -> Result<EngineQueryPage, IndexError> {
-    let offset = usize::try_from(position.offset).map_err(|_| IndexError::OffsetOverflow)?;
-    let has_more = hits.len() > offset.saturating_add(page_size);
-    let selected = hits
-        .into_iter()
-        .skip(offset)
-        .take(page_size)
-        .collect::<Vec<_>>();
-    let next = has_more.then(|| IndexQueryPosition {
-        offset: position.offset.saturating_add(selected.len() as u64),
-        after_path: None,
-    });
-    Ok(EngineQueryPage {
-        hits: selected,
-        next,
-    })
+fn typed_cursor(position: &IndexQueryPosition) -> Result<Option<&TypedQueryCursor>, IndexError> {
+    match position.cursor.as_ref() {
+        None => Ok(None),
+        Some(IndexQueryCursor::Typed(cursor)) => Ok(Some(cursor)),
+        Some(_) => Err(cursor_kind_mismatch()),
+    }
+}
+
+fn full_text_cursor(
+    position: &IndexQueryPosition,
+) -> Result<Option<&FullTextQueryCursor>, IndexError> {
+    match position.cursor.as_ref() {
+        None => Ok(None),
+        Some(IndexQueryCursor::FullText(cursor)) => Ok(Some(cursor)),
+        Some(_) => Err(cursor_kind_mismatch()),
+    }
+}
+
+fn vector_cursor(position: &IndexQueryPosition) -> Result<Option<&VectorQueryCursor>, IndexError> {
+    match position.cursor.as_ref() {
+        None => Ok(None),
+        Some(IndexQueryCursor::Vector(cursor)) => Ok(Some(cursor)),
+        Some(_) => Err(cursor_kind_mismatch()),
+    }
+}
+
+fn hybrid_cursor(position: &IndexQueryPosition) -> Result<Option<&HybridQueryCursor>, IndexError> {
+    match position.cursor.as_ref() {
+        None => Ok(None),
+        Some(IndexQueryCursor::Hybrid(cursor)) => Ok(Some(cursor)),
+        Some(_) => Err(cursor_kind_mismatch()),
+    }
+}
+
+fn cursor_kind_mismatch() -> IndexError {
+    IndexError::InvalidQuery("index page position does not match the query kind".into())
 }
 
 fn typed_query(
@@ -524,12 +658,8 @@ fn normalize_query_vector(
     Ok(values)
 }
 
-fn scan_limit(page_size: usize, offset: u64) -> Result<usize, IndexError> {
-    usize::try_from(offset)
-        .map_err(|_| IndexError::OffsetOverflow)?
-        .checked_add(page_size)
-        .and_then(|limit| limit.checked_add(1))
-        .ok_or(IndexError::OffsetOverflow)
+fn page_limit(page_size: usize) -> Result<usize, IndexError> {
+    page_size.checked_add(1).ok_or(IndexError::OffsetOverflow)
 }
 
 fn effective_weight(value: f32) -> f32 {
@@ -542,11 +672,16 @@ mod tests {
     use std::sync::Arc;
 
     use anvil_api::v1::{
-        PathIndexQuery, PathIndexSpec, TensorIndexQuery, TensorIndexSpec, index_query,
-        index_specification,
+        PathIndexQuery, PathIndexSpec, TensorIndexQuery, TensorIndexSpec, VectorIndexQuery,
+        VectorIndexSpec, index_query, index_specification,
     };
-    use anvil_index::ordered::PathDocument;
-    use anvil_index::projections::TensorRecord;
+    use anvil_index::ordered::{PathDocument, PathSegmentBuilder};
+    use anvil_index::projections::{TensorDocument, TensorRecord, TensorSegmentBuilder};
+    use anvil_index::vector::{VectorDocument, VectorSegmentBuilder};
+    use anvil_index::{
+        BlockDescriptor, DocumentRef, GeneratedBlock, IndexBlockSink, IndexMutation,
+        SegmentBuildOptions,
+    };
 
     use super::*;
 
@@ -567,45 +702,79 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct MemoryDirectory(Arc<BTreeMap<String, MemoryFile>>);
+    struct MemoryDirectory {
+        root: MemoryFile,
+        blocks: Arc<BTreeMap<[u8; 32], MemoryFile>>,
+    }
 
     impl MemoryDirectory {
-        fn new(files: impl IntoIterator<Item = (String, Vec<u8>)>) -> Self {
-            Self(Arc::new(
-                files
-                    .into_iter()
-                    .map(|(name, bytes)| (name, MemoryFile(bytes.into())))
-                    .collect(),
-            ))
+        fn from_sealed_run(sink: MemoryBlockSink, root: GeneratedBlock) -> Self {
+            let (_, root) = root.into_parts();
+            Self {
+                root: MemoryFile(root.into()),
+                blocks: Arc::new(
+                    sink.blocks
+                        .into_iter()
+                        .map(|(hash, bytes)| (hash, MemoryFile(bytes.into())))
+                        .collect(),
+                ),
+            }
         }
     }
 
     impl IndexDirectoryRead for MemoryDirectory {
         type File = MemoryFile;
 
-        async fn open_file(&self, name: &str) -> Result<Self::File, IndexError> {
-            self.0
-                .get(name)
+        async fn open_root(&self) -> Result<Self::File, IndexError> {
+            Ok(self.root.clone())
+        }
+
+        async fn open_block(&self, descriptor: &BlockDescriptor) -> Result<Self::File, IndexError> {
+            self.blocks
+                .get(&descriptor.hash)
                 .cloned()
-                .ok_or_else(|| IndexError::FileNotFound(name.into()))
+                .ok_or_else(|| IndexError::FileNotFound(descriptor.logical_name()))
+        }
+    }
+
+    #[derive(Default)]
+    struct MemoryBlockSink {
+        blocks: BTreeMap<[u8; 32], Vec<u8>>,
+    }
+
+    impl IndexBlockSink for MemoryBlockSink {
+        async fn emit(&mut self, block: GeneratedBlock) -> Result<(), IndexError> {
+            let (descriptor, bytes) = block.into_parts();
+            if let Some(existing) = self.blocks.get(&descriptor.hash) {
+                if existing == &bytes {
+                    return Ok(());
+                }
+                return Err(IndexError::Integrity);
+            }
+            self.blocks.insert(descriptor.hash, bytes);
+            Ok(())
         }
     }
 
     #[tokio::test]
     async fn path_pages_resume_by_exact_last_path() {
-        let artifacts = PathEngine::build([
-            PathDocument {
-                path: "a".into(),
-                version: 1,
-            },
-            PathDocument {
-                path: "b".into(),
-                version: 2,
-            },
-        ])
-        .unwrap();
-        let directory =
-            MemoryDirectory::new(artifacts.into_files().map(|file| (file.name, file.bytes)));
+        let mut builder = PathSegmentBuilder::new(SegmentBuildOptions::new(4096).unwrap()).unwrap();
+        for (path, version) in [("a", 1), ("b", 2)] {
+            assert!(matches!(
+                builder
+                    .try_push(IndexMutation::Upsert(PathDocument {
+                        document: DocumentRef {
+                            path: path.into(),
+                            version,
+                        },
+                    }))
+                    .unwrap(),
+                anvil_index::SegmentPush::Accepted
+            ));
+        }
+        let mut sink = MemoryBlockSink::default();
+        let run = builder.seal(&mut sink).await.unwrap().unwrap();
+        let directory = MemoryDirectory::from_sealed_run(sink, run.into_root());
         let specification = IndexSpecification {
             specification: Some(index_specification::Specification::Path(PathIndexSpec {})),
         };
@@ -616,7 +785,7 @@ mod tests {
             })),
         };
         let first = execute_query(
-            &directory,
+            std::slice::from_ref(&directory),
             &specification,
             &query,
             1,
@@ -625,27 +794,142 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(first.hits[0].object_path.as_deref(), Some("a"));
-        let second = execute_query(&directory, &specification, &query, 1, first.next.unwrap())
-            .await
-            .unwrap();
+        let encoded = serde_json::to_vec(first.next.as_ref().unwrap()).unwrap();
+        let encoded_value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(encoded_value["format"], INDEX_QUERY_POSITION_FORMAT);
+        assert!(encoded_value.get("offset").is_none());
+        let position = serde_json::from_slice(&encoded).unwrap();
+        let second = execute_query(
+            std::slice::from_ref(&directory),
+            &specification,
+            &query,
+            1,
+            position,
+        )
+        .await
+        .unwrap();
         assert_eq!(second.hits[0].object_path.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn format_two_position_rejects_removed_offset_shape() {
+        assert!(
+            serde_json::from_slice::<IndexQueryPosition>(br#"{"offset":1,"after_path":"a"}"#)
+                .is_err()
+        );
+        let wrong_format = IndexQueryPosition {
+            format: 1,
+            cursor: None,
+        };
+        assert!(wrong_format.validate().is_err());
+    }
+
+    #[tokio::test]
+    async fn vector_pages_resume_by_engine_score_and_document_cursor() {
+        let definition = VectorDefinition {
+            dimension: 2,
+            metric: VectorMetric::DotProduct,
+        };
+        let mut builder =
+            VectorSegmentBuilder::new(definition, SegmentBuildOptions::new(4096).unwrap()).unwrap();
+        for (path, values) in [
+            ("a", vec![1.0, 0.0]),
+            ("b", vec![0.8, 0.2]),
+            ("c", vec![0.0, 1.0]),
+        ] {
+            assert!(matches!(
+                builder
+                    .try_push(IndexMutation::Upsert(VectorDocument {
+                        document: DocumentRef {
+                            path: path.into(),
+                            version: 1,
+                        },
+                        values,
+                    }))
+                    .unwrap(),
+                anvil_index::SegmentPush::Accepted
+            ));
+        }
+        let mut sink = MemoryBlockSink::default();
+        let run = builder.seal(&mut sink).await.unwrap().unwrap();
+        let directory = MemoryDirectory::from_sealed_run(sink, run.into_root());
+        let specification = IndexSpecification {
+            specification: Some(index_specification::Specification::Vector(
+                VectorIndexSpec {
+                    json_pointer: "/embedding".into(),
+                    dimensions: 2,
+                    metric: ApiVectorMetric::Dot as i32,
+                    normalize: false,
+                },
+            )),
+        };
+        let query = IndexQuery {
+            query: Some(index_query::Query::Vector(VectorIndexQuery {
+                values: vec![1.0, 0.0],
+            })),
+        };
+
+        let first = execute_query(
+            std::slice::from_ref(&directory),
+            &specification,
+            &query,
+            1,
+            IndexQueryPosition::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.hits[0].object_path.as_deref(), Some("a"));
+        let second = execute_query(
+            std::slice::from_ref(&directory),
+            &specification,
+            &query,
+            1,
+            first.next.unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.hits[0].object_path.as_deref(), Some("b"));
+        let third = execute_query(
+            std::slice::from_ref(&directory),
+            &specification,
+            &query,
+            1,
+            second.next.unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(third.hits[0].object_path.as_deref(), Some("c"));
+        assert!(third.next.is_none());
     }
 
     #[tokio::test]
     async fn tensor_query_returns_the_referenced_ordinary_object() {
-        let artifacts = TensorProjectionEngine::build([TensorRecord {
-            model_id: "model-a".into(),
-            tensor_name: "encoder.weight".into(),
-            source_path: "weights/model-a.bin".into(),
-            source_version: 9,
-            offset: 128,
-            length: 256,
-            dtype: "f32".into(),
-            shape: vec![8, 8],
-        }])
-        .unwrap();
-        let directory =
-            MemoryDirectory::new(artifacts.into_files().map(|file| (file.name, file.bytes)));
+        let mut builder =
+            TensorSegmentBuilder::new(SegmentBuildOptions::new(4096).unwrap()).unwrap();
+        assert!(matches!(
+            builder
+                .try_push(IndexMutation::Upsert(TensorDocument {
+                    document: DocumentRef {
+                        path: "tensor-manifest.json".into(),
+                        version: 1,
+                    },
+                    records: vec![TensorRecord {
+                        model_id: "model-a".into(),
+                        tensor_name: "encoder.weight".into(),
+                        source_path: "weights/model-a.bin".into(),
+                        source_version: 9,
+                        offset: 128,
+                        length: 256,
+                        dtype: "f32".into(),
+                        shape: vec![8, 8],
+                    }],
+                }))
+                .unwrap(),
+            anvil_index::SegmentPush::Accepted
+        ));
+        let mut sink = MemoryBlockSink::default();
+        let run = builder.seal(&mut sink).await.unwrap().unwrap();
+        let directory = MemoryDirectory::from_sealed_run(sink, run.into_root());
         let specification = IndexSpecification {
             specification: Some(index_specification::Specification::Tensor(
                 TensorIndexSpec {
@@ -659,7 +943,7 @@ mod tests {
             })),
         };
         let page = execute_query(
-            &directory,
+            std::slice::from_ref(&directory),
             &specification,
             &query,
             10,

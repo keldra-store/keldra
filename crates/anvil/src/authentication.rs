@@ -63,6 +63,12 @@ pub struct Caller {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AnonymousObjectRequest;
 
+/// Explicit ingress marker for an Index-service request that omitted the
+/// authorization header. Only `QueryIndex` consumes this marker; every index
+/// management RPC continues to require an authenticated [`Caller`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AnonymousIndexRequest;
+
 /// Explicit server rate-limit policy. All values are non-zero so a deployed
 /// server cannot accidentally construct a disabled or unusable GCRA quota.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -182,6 +188,31 @@ impl RequestRateLimits {
             check_keyed(&self.authenticated, &anonymous, "anonymous caller")?;
             self.retain_authenticated_recently();
             request.extensions_mut().insert(AnonymousObjectRequest);
+            return Ok(request);
+        }
+        self.authenticate_after_global_limit(tokens, request)
+    }
+
+    /// Applies the normal authenticated path when a bearer is present and
+    /// marks a genuinely missing bearer for `QueryIndex` to bind to its
+    /// explicit tenant. Other Index-service handlers do not accept the marker.
+    pub fn authenticate_index<T>(
+        &self,
+        tokens: &JwtManager,
+        mut request: Request<T>,
+    ) -> Result<Request<T>, Status> {
+        check_direct(&self.global, "server")?;
+        if request
+            .metadata()
+            .get_all("authorization")
+            .iter()
+            .next()
+            .is_none()
+        {
+            let anonymous = Caller::from_anonymous(StorageTenantId::system());
+            check_keyed(&self.authenticated, &anonymous, "anonymous caller")?;
+            self.retain_authenticated_recently();
+            request.extensions_mut().insert(AnonymousIndexRequest);
             return Ok(request);
         }
         self.authenticate_after_global_limit(tokens, request)
@@ -1069,6 +1100,56 @@ mod tests {
                 .code(),
             tonic::Code::Unauthenticated
         );
+    }
+
+    #[test]
+    fn index_interceptor_marks_only_a_missing_header_as_anonymous() {
+        let manager = JwtManager::new(TEST_SIGNING_SECRET).unwrap();
+
+        let anonymous = RequestRateLimits::new(test_rate_config())
+            .authenticate_index(&manager, Request::new(()))
+            .unwrap();
+        assert!(
+            anonymous
+                .extensions()
+                .get::<AnonymousIndexRequest>()
+                .is_some()
+        );
+        assert!(anonymous.extensions().get::<Caller>().is_none());
+
+        let authenticated = RequestRateLimits::new(test_rate_config())
+            .authenticate_index(&manager, bearer_request(&manager, "acme", "app-7"))
+            .unwrap();
+        assert!(
+            authenticated
+                .extensions()
+                .get::<AnonymousIndexRequest>()
+                .is_none()
+        );
+        assert_eq!(
+            authenticated
+                .extensions()
+                .get::<Caller>()
+                .unwrap()
+                .subject()
+                .id,
+            ObjectId::Opaque("app-7".to_owned())
+        );
+    }
+
+    #[test]
+    fn index_interceptor_never_degrades_a_supplied_bad_bearer() {
+        let manager = JwtManager::new(TEST_SIGNING_SECRET).unwrap();
+        for value in ["not-bearer", "Bearer ", "Bearer not-a-jwt"] {
+            let mut request = Request::new(());
+            request
+                .metadata_mut()
+                .insert("authorization", value.parse().unwrap());
+            let error = RequestRateLimits::new(test_rate_config())
+                .authenticate_index(&manager, request)
+                .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::Unauthenticated, "{value}");
+        }
     }
 
     #[test]

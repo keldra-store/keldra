@@ -668,7 +668,7 @@ impl Store {
     }
 }
 
-const INDEX_DEFINITION_PREFIX: &str = "_anvil/indexes/definitions/";
+const INDEX_DEFINITION_PREFIX: &str = "_anvil/indexes/v2/definitions/";
 const PERSONALDB_MANIFEST_PREFIX: &str = "_anvil/personaldb/v1/";
 
 #[derive(Clone, Copy)]

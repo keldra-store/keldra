@@ -1,12 +1,14 @@
 //! Construction and lifetime of the accounting catalog and workers.
 
+use std::sync::Arc;
+
 use anvil_consensus::{DecisionRaft, NodeId};
 use anvil_store::Store;
 use anyhow::{Context, Result};
 
 use crate::cluster_object_read::ClusterObjectReader;
 use crate::cluster_peer::ClusterPeerTransport;
-use crate::index_runtime::events::IndexEventRouter;
+use crate::index_runtime::events::IndexEventJournal;
 use crate::index_runtime::publication::IndexArtifactRouter;
 use crate::index_runtime::scanner::ClusterIndexScanner;
 
@@ -62,7 +64,7 @@ pub(crate) async fn start(
     store: Store,
     reader: ClusterObjectReader,
     scanner: ClusterIndexScanner,
-    event_router: IndexEventRouter,
+    event_journal: Arc<IndexEventJournal>,
     artifacts: IndexArtifactRouter,
 ) -> Result<RunningAccountingRuntime> {
     let catalog = AccountingCatalog::default();
@@ -79,7 +81,7 @@ pub(crate) async fn start(
         decisions,
         catalog.clone(),
         AccountingBuilderDependencies {
-            router: event_router,
+            journal: event_journal,
             scanner,
             reader,
             publisher: publisher.clone(),

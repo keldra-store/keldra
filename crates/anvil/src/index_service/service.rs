@@ -16,12 +16,12 @@ use anvil_api::v1::{
     IndexQueryHit, ListIndexesRequest, ListIndexesResponse, MutationFailure, MutationFailureCode,
     MutationReceipt, ObjectAddress, QueryIndexRequest, QueryIndexResponse, UpdateIndexRequest,
 };
-use anvil_store::ObjectKey;
+use anvil_store::{ObjectKey, StorageTenantId};
 use prost::Message;
 use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status};
 
-use crate::authentication::Caller;
+use crate::authentication::{AnonymousIndexRequest, Caller};
 use crate::authorization::ObjectPermission;
 use crate::distributed_list::OriginalBearer;
 use crate::logical_name_resolution::LogicalNameResolver;
@@ -427,7 +427,8 @@ impl IndexServiceRpc for IndexServiceImpl {
         run_request_until(
             deadline,
             async {
-                let context = request_context(&request, deadline)?;
+                let context =
+                    query_request_context(&request, request.get_ref().tenant.as_str(), deadline)?;
                 let request = request.into_inner();
                 let query = request
                     .query
@@ -549,6 +550,59 @@ fn request_context<T>(
         .cloned()
         .ok_or_else(|| Status::unauthenticated("authenticated caller identity is missing"))?;
     let bearer = OriginalBearer::from_metadata(request.metadata())?;
+    Ok(IndexRequestContext::new(
+        caller,
+        bearer,
+        request.metadata().clone(),
+        deadline,
+    ))
+}
+
+fn query_request_context<T>(
+    request: &Request<T>,
+    requested_tenant: &str,
+    deadline: tokio::time::Instant,
+) -> Result<IndexRequestContext, Status> {
+    let (caller, bearer) = match (
+        request.extensions().get::<Caller>(),
+        request.extensions().get::<AnonymousIndexRequest>(),
+    ) {
+        (Some(caller), None) => {
+            if !requested_tenant.is_empty() && requested_tenant != caller.storage_tenant().as_str()
+            {
+                return Err(Status::permission_denied(
+                    "index query does not belong to the authenticated tenant",
+                ));
+            }
+            (
+                caller.clone(),
+                OriginalBearer::from_metadata(request.metadata())?,
+            )
+        }
+        (None, Some(_)) => {
+            if request.metadata().get("authorization").is_some() {
+                return Err(Status::unauthenticated(
+                    "anonymous index request unexpectedly supplied authorization",
+                ));
+            }
+            if requested_tenant.is_empty() {
+                return Err(Status::invalid_argument(
+                    "tenant is required for an anonymous index query",
+                ));
+            }
+            let tenant = StorageTenantId::parse(requested_tenant)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            (Caller::from_anonymous(tenant), OriginalBearer::anonymous())
+        }
+        (Some(_), Some(_)) => {
+            return Err(Status::internal(
+                "index request contains contradictory caller identities",
+            ));
+        }
+        (None, None) => {
+            return Err(Status::unauthenticated("request identity is missing"));
+        }
+    };
     Ok(IndexRequestContext::new(
         caller,
         bearer,
@@ -930,7 +984,57 @@ mod tests {
             request.metadata().get("authorization")
         );
         assert_eq!(forwarded.extensions().get::<Caller>(), Some(&caller));
-        assert_eq!(context.signed_bearer(), "signed-token");
+        assert_eq!(context.routed_bearer(), "signed-token");
+    }
+
+    #[test]
+    fn authenticated_query_tenant_is_optional_but_cannot_cross_tenants() {
+        let caller = caller();
+        let mut request = Request::new(());
+        request.metadata_mut().insert(
+            "authorization",
+            MetadataValue::try_from("Bearer signed-token").unwrap(),
+        );
+        request.extensions_mut().insert(caller.clone());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+
+        let omitted = query_request_context(&request, "", deadline).unwrap();
+        assert_eq!(omitted.caller(), &caller);
+        let explicit = query_request_context(&request, "tenant", deadline).unwrap();
+        assert_eq!(explicit.caller(), &caller);
+        assert_eq!(
+            query_request_context(&request, "another", deadline)
+                .err()
+                .unwrap()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn anonymous_query_requires_and_binds_an_explicit_tenant() {
+        let mut request = Request::new(());
+        request.extensions_mut().insert(AnonymousIndexRequest);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+
+        let context = query_request_context(&request, "tenant", deadline).unwrap();
+        assert_eq!(context.caller().storage_tenant().as_str(), "tenant");
+        assert_eq!(
+            context.caller().subject(),
+            &anvil_authz::ObjectRef::anonymous()
+        );
+        assert_eq!(context.routed_bearer(), anvil_authz::ANONYMOUS_SUBJECT_ID);
+        assert_eq!(
+            query_request_context(&request, "", deadline)
+                .err()
+                .unwrap()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            request_context(&request, deadline).err().unwrap().code(),
+            tonic::Code::Unauthenticated
+        );
     }
 
     #[test]

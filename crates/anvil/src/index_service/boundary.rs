@@ -15,9 +15,10 @@ use crate::authentication::Caller;
 use crate::authorization::ObjectPermission;
 use crate::distributed_list::OriginalBearer;
 
-/// Authenticated context retained when the public service calls into a query
-/// replica. The original signed token, rather than a serialized `Caller`, is
-/// what a remote node must verify again on the mandatory-mTLS listener.
+/// Authorized context retained when the public service calls into a query
+/// replica. The original signed token or fixed anonymous marker, rather than a
+/// serialized `Caller`, crosses the mandatory-mTLS listener. A remote node
+/// reconstructs identity and evaluates Zanzibar independently.
 #[derive(Clone)]
 pub(crate) struct IndexRequestContext {
     caller: Caller,
@@ -45,7 +46,7 @@ impl IndexRequestContext {
         &self.caller
     }
 
-    pub(crate) fn signed_bearer(&self) -> &str {
+    pub(crate) fn routed_bearer(&self) -> &str {
         self.bearer.signed_token()
     }
 

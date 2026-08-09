@@ -1,4 +1,4 @@
-//! Construction of the shared index cache, source router, builders and queries.
+//! Construction of the shared index cache, source journals, builders and queries.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -16,14 +16,13 @@ use crate::index_service::{IndexDefinitionLister, IndexQueryExecutor};
 use crate::object_distribution::ObjectDistribution;
 use anvil_store::Store;
 
+use super::budget::IndexMemoryBudgets;
 use super::cache::{IndexCache, IndexCacheConfig};
 use super::catalog::IndexCatalog;
-use super::discovery::IndexDefinitionDiscovery;
+use super::cpu::IndexCpuPool;
+use super::discovery::{IndexDefinitionDiscovery, capture_then_refresh};
 use super::distributed_query::DistributedIndexQueryExecutor;
-use super::events::{
-    ClusterIndexEventSources, DecisionIndexEventAuthority, IndexEventJournal, IndexEventRouter,
-    IndexEventRouterRetention, IndexEventRouterTask,
-};
+use super::events::{ClusterIndexEventSources, DecisionIndexEventAuthority, IndexEventJournal};
 use super::local_query::{ClusterIndexSegmentFetcher, LocalGenerationQueryExecutor};
 use super::manager::{IndexBuilderDependencies, IndexBuilderManagerTask};
 use super::publication::{IndexArtifactCoordinator, IndexArtifactRouter};
@@ -31,20 +30,17 @@ use super::publisher::IndexGenerationPublisher;
 use super::retention::IndexGenerationRetention;
 use super::scanner::ClusterIndexScanner;
 
-const EVENT_ROUTER_MAX_BATCHES: usize = 1_024;
-const EVENT_ROUTER_MAX_CHANGES: usize = 1_000_000;
-const EVENT_ROUTER_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const EVENT_ROUTER_START_TIMEOUT: Duration = Duration::from_secs(30);
+const JOURNAL_START_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+const JOURNAL_START_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) struct RunningIndexRuntime {
     pub(crate) definitions: Arc<dyn IndexDefinitionLister>,
     pub(crate) queries: Arc<dyn IndexQueryExecutor>,
     pub(crate) local_queries: Arc<dyn LocalIndexQueryExecutor>,
-    pub(crate) event_router: IndexEventRouter,
+    pub(crate) event_journal: Arc<IndexEventJournal>,
     pub(crate) scanner: ClusterIndexScanner,
     pub(crate) artifact_router: IndexArtifactRouter,
     _definition_discovery: tokio::task::JoinHandle<()>,
-    _event_router: IndexEventRouterTask,
     _builders: IndexBuilderManagerTask,
 }
 
@@ -68,14 +64,6 @@ pub(crate) async fn start(
     config: IndexRuntimeConfig,
 ) -> Result<RunningIndexRuntime> {
     let scanner = ClusterIndexScanner::new(decisions.clone(), cluster_peers.clone());
-    let catalog = IndexCatalog::default();
-    let discovery = IndexDefinitionDiscovery::new(scanner.clone(), reader.clone(), catalog.clone());
-    discovery
-        .refresh()
-        .await
-        .context("perform initial index definition discovery")?;
-    let definition_discovery = discovery.spawn();
-
     let journal = Arc::new(IndexEventJournal::new(
         Arc::new(DecisionIndexEventAuthority::new(decisions.clone())),
         Arc::new(ClusterIndexEventSources::new(
@@ -84,15 +72,15 @@ pub(crate) async fn start(
             data_peers,
         )),
     ));
-    let retention =
-        IndexEventRouterRetention::new(EVENT_ROUTER_MAX_BATCHES, EVENT_ROUTER_MAX_CHANGES)
-            .context("validate index event-router retention")?;
-    let (event_router, event_router_task) = tokio::time::timeout(
-        EVENT_ROUTER_START_TIMEOUT,
-        start_event_router(journal, retention),
+    let catalog = IndexCatalog::default();
+    let discovery = IndexDefinitionDiscovery::new(scanner.clone(), reader.clone(), catalog.clone());
+    let initial_definition_barrier = tokio::time::timeout(
+        JOURNAL_START_TIMEOUT,
+        capture_initial_definitions(&discovery, &journal),
     )
     .await
-    .context("index event router did not reach a clear cluster barrier")??;
+    .context("index journals did not reach a clear initial definition barrier")??;
+    let definition_discovery = discovery.spawn(journal.clone(), initial_definition_barrier);
 
     let memory_bytes = index_memory_budget(config.memory_percent())?;
     let cache = IndexCache::new(
@@ -103,7 +91,7 @@ pub(crate) async fn start(
     )
     .context("initialize disposable index cache")?;
     let local_queries: Arc<dyn LocalIndexQueryExecutor> = Arc::new(
-        LocalGenerationQueryExecutor::new(reader.clone(), cache, event_router.clone()),
+        LocalGenerationQueryExecutor::new(reader.clone(), cache.clone(), journal.clone()),
     );
     let queries: Arc<dyn IndexQueryExecutor> = Arc::new(DistributedIndexQueryExecutor::new(
         local_node,
@@ -114,24 +102,31 @@ pub(crate) async fn start(
 
     let coordinator = IndexArtifactCoordinator::new(objects.clone(), governance);
     let artifact_router = IndexArtifactRouter::new(local_node, coordinator, objects, cluster_peers);
-    let publisher = IndexGenerationPublisher::new(
-        store,
-        reader.clone(),
+    let publisher = IndexGenerationPublisher::new(store, reader.clone(), artifact_router.clone());
+    let generation_retention = IndexGenerationRetention::new(
         scanner.clone(),
+        reader.clone(),
         artifact_router.clone(),
+        config,
     );
-    let generation_retention =
-        IndexGenerationRetention::new(scanner.clone(), artifact_router.clone(), config);
+    let budgets = IndexMemoryBudgets::new(config.builder_memory_bytes_per_kind())
+        .context("validate per-kind index construction budgets")?;
+    let cpu = IndexCpuPool::new(config.rayon_workers())
+        .context("initialize the fixed index Rayon pool")?;
     let builders = IndexBuilderManagerTask::start(
         local_node,
         decisions,
         catalog.clone(),
         IndexBuilderDependencies {
-            router: event_router.clone(),
+            catalog: catalog.clone(),
+            journal: journal.clone(),
             scanner: scanner.clone(),
             reader,
             publisher,
             retention: generation_retention,
+            cache,
+            budgets,
+            cpu,
         },
     );
 
@@ -139,27 +134,24 @@ pub(crate) async fn start(
         definitions: Arc::new(catalog),
         queries,
         local_queries,
-        event_router,
+        event_journal: journal,
         scanner,
         artifact_router,
         _definition_discovery: definition_discovery,
-        _event_router: event_router_task,
         _builders: builders,
     })
 }
 
-async fn start_event_router(
-    journal: Arc<IndexEventJournal>,
-    retention: IndexEventRouterRetention,
-) -> Result<(IndexEventRouter, IndexEventRouterTask), super::events::IndexEventRouterError> {
+async fn capture_initial_definitions(
+    discovery: &IndexDefinitionDiscovery,
+    journal: &IndexEventJournal,
+) -> Result<super::events::IndexBarrier, tonic::Status> {
     loop {
-        match IndexEventRouter::start(journal.clone(), retention, EVENT_ROUTER_POLL_INTERVAL).await
-        {
-            Ok(runtime) => return Ok(runtime),
-            Err(super::events::IndexEventRouterError::Journal(
-                super::events::IndexEventError::AtomicProgramInProgress
-                | super::events::IndexEventError::BarrierChanged,
-            )) => tokio::time::sleep(EVENT_ROUTER_POLL_INTERVAL).await,
+        match capture_then_refresh(discovery, journal).await {
+            Ok(barrier) => return Ok(barrier),
+            Err(error) if error.code() == tonic::Code::Unavailable => {
+                tokio::time::sleep(JOURNAL_START_RETRY_INTERVAL).await;
+            }
             Err(error) => return Err(error),
         }
     }
@@ -168,13 +160,13 @@ async fn start_event_router(
 fn index_memory_budget(percent: u8) -> Result<u64> {
     let total = cgroup_memory_limit()
         .or_else(host_memory_bytes)
-        .context("determine physical memory for index cache budget")?;
+        .context("determine physical memory for index materialization budget")?;
     let bytes = (u128::from(total) * u128::from(percent) / 100)
         .try_into()
-        .context("index memory cache budget exceeds u64")?;
+        .context("index materialization budget exceeds u64")?;
     anyhow::ensure!(
         bytes > 0,
-        "index memory cache budget resolved to zero bytes"
+        "index materialization budget resolved to zero bytes"
     );
     Ok(bytes)
 }

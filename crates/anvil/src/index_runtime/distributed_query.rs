@@ -62,6 +62,12 @@ impl IndexQueryExecutor for DistributedIndexQueryExecutor {
         let replicas = assignment.query_replicas();
         let target = replicas[replica_offset(&request, replicas.len())];
         let routed = RoutedIndexQueryRequest {
+            storage_tenant: request
+                .context
+                .caller()
+                .storage_tenant()
+                .as_str()
+                .to_owned(),
             tenant_id: request.tenant_id,
             bucket_id: request.bucket_id,
             definition: request.definition.clone(),
@@ -94,7 +100,7 @@ impl IndexQueryExecutor for DistributedIndexQueryExecutor {
                 .route_index_query(
                     target,
                     &address.0,
-                    request.context.signed_bearer(),
+                    request.context.routed_bearer(),
                     routed,
                     request.context.remaining()?,
                 )
@@ -114,7 +120,7 @@ fn replica_offset(request: &ExecuteIndexQuery, replica_count: usize) -> usize {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"anvil.index/query-replica/v1");
     hasher.update(&request.definition.index_id.to_be_bytes());
-    hasher.update(request.context.signed_bearer().as_bytes());
+    hasher.update(request.context.routed_bearer().as_bytes());
     hasher.update(&request.query.encode_to_vec());
     let mut value = [0_u8; 8];
     value.copy_from_slice(&hasher.finalize().as_bytes()[..8]);
