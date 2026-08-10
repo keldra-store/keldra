@@ -1038,7 +1038,7 @@ fn engine_cases() -> Vec<EngineCase> {
             documents: vec![
                 (
                     "docs/tensor-encoder.json",
-                    br#"{"model_id":"qualification-model","tensor_name":"encoder.weight","source_path":"docs/tensor-encoder.json","source_version":1,"offset":0,"length":128,"dtype":"f32","shape":[8,4]}"#,
+                    br#"{"model_id":"qualification-model","tensor_name":"encoder.shadow","source_path":"docs/tensor-encoder.json","source_version":1,"offset":0,"length":128,"dtype":"f32","shape":[8,4]}"#,
                 ),
                 (
                     "docs/tensor-decoder.json",
@@ -1049,15 +1049,12 @@ fn engine_cases() -> Vec<EngineCase> {
                     br#"{"model_id":"qualification-model","tensor_name":"encoder.weight","source_path":"docs/tensor-encoder-copy.json","source_version":1,"offset":160,"length":128,"dtype":"f32","shape":[8,4]}"#,
                 ),
             ],
-            expected_paths: vec![
-                "docs/tensor-encoder-copy.json",
-                "docs/tensor-encoder.json",
-            ],
+            expected_paths: vec!["docs/tensor-encoder-copy.json"],
             replacement: (
-                "docs/tensor-encoder.json",
-                br#"{"model_id":"qualification-model","tensor_name":"encoder.weight","source_path":"docs/tensor-encoder.json","source_version":2,"offset":288,"length":128,"dtype":"f32","shape":[8,4]}"#,
+                "docs/tensor-encoder-copy.json",
+                br#"{"model_id":"qualification-model","tensor_name":"encoder.weight","source_path":"docs/tensor-encoder-copy.json","source_version":2,"offset":288,"length":128,"dtype":"f32","shape":[8,4]}"#,
             ),
-            delete_path: "docs/tensor-encoder-copy.json",
+            delete_path: "docs/tensor-decoder.json",
             expects_scores: false,
             min_advanced_sources: 1,
         },
@@ -1162,10 +1159,23 @@ mod tests {
         );
         assert_eq!(cases.len(), kinds.len());
         for case in cases {
-            assert!(case.expected_paths.len() > 1, "{} must paginate", case.name);
+            assert!(!case.expected_paths.is_empty());
             assert!(case.expected_paths.contains(&case.replacement.0));
-            assert!(case.expected_paths.contains(&case.delete_path));
             assert_ne!(case.replacement.0, case.delete_path);
+            if !matches!(
+                case.specification.specification,
+                Some(SpecificationValue::Tensor(_))
+            ) {
+                assert!(case.expected_paths.len() > 1, "{} must paginate", case.name);
+                assert!(case.expected_paths.contains(&case.delete_path));
+            } else {
+                assert_eq!(
+                    case.expected_paths.len(),
+                    1,
+                    "{} is an exact lookup",
+                    case.name
+                );
+            }
         }
     }
 
