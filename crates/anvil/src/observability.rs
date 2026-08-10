@@ -19,6 +19,8 @@ const TRACE_QUEUE_SIZE: usize = 2_048;
 const TRACE_EXPORT_BATCH_SIZE: usize = 512;
 const METRIC_CARDINALITY_LIMIT: usize = 128;
 const OTLP_EXPORT_TIMEOUT: Duration = Duration::from_secs(5);
+const OTLP_TRACES_PATH: &str = "/v1/traces";
+const OTLP_METRICS_PATH: &str = "/v1/metrics";
 
 /// Startup-only observability settings.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -91,17 +93,19 @@ struct TelemetryProviders {
 impl TelemetryProviders {
     fn build(endpoint: &str, node_id: u16) -> Result<Self> {
         let resource = telemetry_resource(node_id);
+        let trace_endpoint = otlp_signal_endpoint(endpoint, OTLP_TRACES_PATH);
+        let metric_endpoint = otlp_signal_endpoint(endpoint, OTLP_METRICS_PATH);
         let span_exporter = opentelemetry_otlp::SpanExporter::builder()
             .with_http()
             .with_protocol(Protocol::HttpBinary)
-            .with_endpoint(endpoint)
+            .with_endpoint(trace_endpoint)
             .with_timeout(OTLP_EXPORT_TIMEOUT)
             .build()
             .context("configure OTLP trace exporter")?;
         let metric_exporter = opentelemetry_otlp::MetricExporter::builder()
             .with_http()
             .with_protocol(Protocol::HttpBinary)
-            .with_endpoint(endpoint)
+            .with_endpoint(metric_endpoint)
             .with_timeout(OTLP_EXPORT_TIMEOUT)
             .build()
             .context("configure OTLP metric exporter")?;
@@ -155,6 +159,10 @@ fn configured_endpoint(endpoint: Option<&str>) -> Option<&str> {
     endpoint.map(str::trim).filter(|value| !value.is_empty())
 }
 
+fn otlp_signal_endpoint(base: &str, signal_path: &str) -> String {
+    format!("{}{}", base.trim_end_matches('/'), signal_path)
+}
+
 fn telemetry_resource(node_id: u16) -> Resource {
     Resource::builder_empty()
         .with_service_name(SERVICE_NAME)
@@ -167,7 +175,14 @@ fn telemetry_resource(node_id: u16) -> Resource {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use axum::Router;
+    use axum::extract::{Request, State};
+    use axum::http::StatusCode;
     use opentelemetry::Key;
+    use opentelemetry::metrics::MeterProvider as _;
+    use opentelemetry::trace::{Span as _, Tracer as _};
 
     use super::*;
 
@@ -183,6 +198,22 @@ mod tests {
     }
 
     #[test]
+    fn signal_paths_are_appended_to_the_generic_endpoint() {
+        assert_eq!(
+            otlp_signal_endpoint("http://collector:4318", OTLP_TRACES_PATH),
+            "http://collector:4318/v1/traces"
+        );
+        assert_eq!(
+            otlp_signal_endpoint("http://collector:4318/", OTLP_METRICS_PATH),
+            "http://collector:4318/v1/metrics"
+        );
+        assert_eq!(
+            otlp_signal_endpoint("http://collector:4318/otlp/", OTLP_TRACES_PATH),
+            "http://collector:4318/otlp/v1/traces"
+        );
+    }
+
+    #[test]
     fn resource_identifies_service_version_and_node() {
         let resource = telemetry_resource(41);
         assert_eq!(
@@ -191,7 +222,7 @@ mod tests {
         );
         assert_eq!(
             resource.get(&Key::new("service.version")),
-            Some(Value::from("0.6.0"))
+            Some(Value::from(env!("CARGO_PKG_VERSION")))
         );
         assert_eq!(resource.get(&Key::new("node.id")), Some(Value::I64(41)));
     }
@@ -207,5 +238,56 @@ mod tests {
     #[tokio::test]
     async fn disabled_shutdown_needs_no_provider_or_collector() {
         Observability { providers: None }.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exporters_post_to_signal_specific_paths() {
+        type Requests = Arc<Mutex<Vec<(String, String)>>>;
+
+        async fn record_request(State(requests): State<Requests>, request: Request) -> StatusCode {
+            requests.lock().unwrap().push((
+                request.method().as_str().to_owned(),
+                request.uri().path().to_owned(),
+            ));
+            StatusCode::OK
+        }
+
+        let requests = Requests::default();
+        let app = Router::new()
+            .fallback(record_request)
+            .with_state(requests.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let providers = TelemetryProviders::build(&format!("http://{address}/"), 7).unwrap();
+        let tracer = providers.tracer_provider.tracer("route-test");
+        tracer.start("route-test-span").end();
+        providers
+            .meter_provider
+            .meter("route-test")
+            .u64_counter("route_test_counter")
+            .build()
+            .add(1, &[]);
+
+        tokio::task::spawn_blocking(move || providers.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut requests = requests.lock().unwrap().clone();
+        requests.sort();
+        assert_eq!(
+            requests,
+            vec![
+                ("POST".to_owned(), OTLP_METRICS_PATH.to_owned()),
+                ("POST".to_owned(), OTLP_TRACES_PATH.to_owned()),
+            ]
+        );
+
+        server.abort();
+        let _ = server.await;
     }
 }
