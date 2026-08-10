@@ -3,9 +3,10 @@ use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex, RwLock};
 
 use anvil_store::{
-    BlobReferenceState, Durability, LogicalRecordMutationContext, LogicalRecordValue, ObjectKey,
-    ObjectMutationContext, PlacementLogId, PublishRequest, PutMode, PutRequest, ReferenceDelta,
-    StorageTenantId, StoreOptions, VersionId, WatchRetention,
+    BatchOperation, BlobReferenceState, DeleteRequest, Durability, LogicalRecordMutationContext,
+    LogicalRecordValue, ObjectHeadChangeKind, ObjectKey, ObjectMutationContext, PlacementLogId,
+    Precondition, PublishRequest, PutMode, PutRequest, ReferenceDelta, StorageTenantId,
+    StoreOptions, VersionId, WatchRetention,
 };
 use tempfile::TempDir;
 
@@ -772,17 +773,30 @@ async fn restart_reconstructs_progress_from_durable_destination_cursors() {
 }
 
 #[tokio::test]
-async fn an_unacknowledged_minority_negative_has_no_reference_effect() {
+async fn absence_only_blocks_reference_delivery_until_a_replica_confirms() {
     let stores = TestStores::open(&[1, 2, 3]).await;
     let source = stores.stores[&NodeId(1)].clone();
-    let old = publish(&source, "same", b"committed", "first").await;
-    let replacement = publish(&source, "same", b"minority", "second").await;
-    let replacement_offset = source.local_watch_status().unwrap().tail;
-    let commits = Arc::new(TestCommits::default());
-    commits.set(
-        replacement_offset,
-        Ok(ReferenceCommitDisposition::DiscardedMinority),
-    );
+    let blob = publish(&source, "same", b"committed", "first").await;
+    let source_id = source.local_watch_status().unwrap().source_id;
+    let create = source
+        .scan_local_changes(0, 8)
+        .unwrap()
+        .into_iter()
+        .find(|change| matches!(change, LocalChange::ObjectHead(_)))
+        .expect("source object-head change");
+    let create_proof = source
+        .read_reference_proof(source_id, create.offset())
+        .unwrap()
+        .expect("source create proof");
+    let current = TestPlacement::new(placement(&[1, 2, 3], 1));
+    let peers = Arc::new(TestProofPeers::default());
+    peers.respond(NodeId(2), Ok(None));
+    peers.respond(NodeId(3), Ok(None));
+    let commits = Arc::new(QuorumReferenceCommitAuthority::new(
+        source.clone(),
+        Arc::new(current.clone()),
+        peers.clone(),
+    ));
     let order = Arc::new(Mutex::new(Vec::new()));
     let destinations = Arc::new(TestDestinations::new(stores.stores.clone(), order.clone()));
     let payloads = Arc::new(TestPayloads::new(
@@ -791,40 +805,84 @@ async fn an_unacknowledged_minority_negative_has_no_reference_effect() {
         order,
     ));
     let calls = payloads.clone();
-    delivery(
-        source,
-        TestPlacement::new(placement(&[1, 2, 3], 1)),
+    let runner = ReferenceDelivery::new(
+        source.clone(),
+        Arc::new(current.clone()),
         commits,
-        destinations,
+        destinations.clone(),
         payloads,
-    )
-    .deliver_once()
-    .await
-    .unwrap();
+        ErasureProfile::default(),
+    );
 
-    assert_eq!(*calls.calls.lock().unwrap(), [old.clone()]);
-    let old_routes = route_effects(
-        &placement(&[1, 2, 3], 1),
-        ErasureProfile::default(),
-        &[ReferenceDelta {
-            blob: old.clone(),
-            change: 1,
-        }],
-    );
-    for owner in old_routes.keys() {
-        assert_eq!(lifecycle(&stores.stores[owner], &old).unwrap().ref_count, 1);
+    let error = runner.deliver_once().await.unwrap_err();
+    assert!(matches!(
+        error,
+        ReferenceDeliveryError::CommitProof { offset, .. } if offset == create.offset()
+    ));
+    for store in stores.stores.values() {
+        assert_eq!(
+            store.reference_delta_cursor(source_id).unwrap(),
+            create.offset() - 1
+        );
     }
-    let replacement_routes = route_effects(
-        &placement(&[1, 2, 3], 1),
+    assert!(calls.calls.lock().unwrap().is_empty());
+
+    peers.respond(NodeId(2), Ok(Some(create_proof)));
+    runner.deliver_once().await.unwrap();
+
+    assert_eq!(*calls.calls.lock().unwrap(), [blob.clone()]);
+    let routes = route_effects(
+        &current.current().unwrap(),
         ErasureProfile::default(),
         &[ReferenceDelta {
-            blob: replacement.clone(),
+            blob: blob.clone(),
             change: 1,
         }],
     );
-    for owner in replacement_routes.keys() {
-        let state = lifecycle(&stores.stores[owner], &replacement);
-        assert!(state.is_none_or(|state| state.flags & anvil_store::AWAITING_PUBLISH != 0));
+    for owner in routes.keys() {
+        let state = lifecycle(&stores.stores[owner], &blob).unwrap();
+        assert_eq!(state.ref_count, 1);
+        assert_eq!(state.flags & anvil_store::AWAITING_PUBLISH, 0);
+    }
+
+    source
+        .coordinate_object_mutation(
+            BatchOperation::Delete(DeleteRequest {
+                key: ObjectKey::new("tenant", "bucket", "same").unwrap(),
+                precondition: Precondition::Any,
+                command_id: Some("delete".into()),
+                durability: Durability::Local,
+            }),
+            ObjectMutationContext {
+                active_placement_log_id: PlacementLogId { term: 1, index: 1 },
+                serving_fence_term: 1,
+            },
+        )
+        .await
+        .unwrap();
+    let delete = source
+        .scan_local_changes(create.offset(), 8)
+        .unwrap()
+        .into_iter()
+        .find(|change| {
+            matches!(
+                change,
+                LocalChange::ObjectHead(change) if change.kind == ObjectHeadChangeKind::Delete
+            )
+        })
+        .expect("source delete change");
+    let delete_proof = source
+        .read_reference_proof(source_id, delete.offset())
+        .unwrap()
+        .expect("source delete proof");
+    peers.respond(NodeId(2), Ok(Some(delete_proof)));
+    runner.deliver_once().await.unwrap();
+
+    for owner in routes.keys() {
+        assert_eq!(
+            lifecycle(&stores.stores[owner], &blob).unwrap().ref_count,
+            0
+        );
     }
 }
 
@@ -1025,18 +1083,18 @@ async fn two_of_three_exact_proofs_win_over_one_absence() {
 }
 
 #[tokio::test]
-async fn two_of_three_exact_absences_discard_a_minority_proof() {
+async fn two_of_three_exact_absences_do_not_prove_discard() {
     let fixture = ProofFixture::open().await;
     let peers = Arc::new(TestProofPeers::default());
     peers.respond(NodeId(2), Ok(None));
     peers.respond(NodeId(3), Ok(None));
-    let result = fixture
+    let error = fixture
         .authority(TestPlacement::new(placement(&[1, 2, 3], 1)), peers)
         .classify(fixture.source_id, &fixture.change)
         .await
-        .unwrap();
+        .unwrap_err();
 
-    assert_eq!(result, ReferenceCommitDisposition::DiscardedMinority);
+    assert!(error.contains("unresolved between 1 exact and 2 absent"));
 }
 
 #[tokio::test]

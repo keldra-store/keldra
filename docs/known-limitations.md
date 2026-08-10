@@ -269,21 +269,29 @@ cold-start work therefore grows with the number of index definitions. Anvil
 side plane; later releases can optimize discovery without changing the stored
 definition format.
 
-## Reference replay after a mixed 0.5.2 workload
+## Failed minority metadata candidates
 
-One published-image qualification run exposed a rolling-restart failure after
-the cluster had processed index generations, replicated overwrites, retained
-version deletion, and other mixed reference churn. The restarting node failed
-closed while ordered reference delivery repeatedly reported a
-`reference-delta count underflow`, so its public listener did not become ready
-within the 90-second qualification window. The other two ACTIVE nodes remained
-available, and the same rolling-restart gate had passed the earlier local
-AMD64 and ARM64 qualifications.
+A mutation can be durably present on fewer than its required logical-record
+replicas if the remaining replicas become unavailable after the coordinator's
+local commit. When no quorum can prove either that exact candidate or a
+different valid successor, ordered reference delivery cannot determine whether
+the candidate's journal effect is authoritative. Anvil fails closed at that
+source position: destination cursors do not advance beyond it, the source
+journal prefix is retained, and reference garbage collection remains disabled
+for the affected work. If the retained journal reaches its configured bound,
+later mutations that need to append a source event receive backpressure.
 
-Anvil 0.5.2 therefore does not claim that every mixed-workload rolling restart
-will recover without operator intervention. The failure did not affect clean
-three-node startup or the subsequent OSV ingestion qualification, but reference
-replay repair for this case remains deferred.
+A quorum reporting only that the candidate is absent is not enough to discard
+it because a previously issued replica apply may still complete. Mutations
+already proven by a metadata quorum and other ACTIVE nodes remain unaffected;
+Anvil does not trade reference correctness for recovery availability.
+
+After metadata quorum is available again, retrying the unknown-outcome
+operation with the same command ID allows the deterministic candidate to
+complete. Restoring a replica that holds the required lineage can likewise
+provide the missing proof. If neither the original candidate nor a
+quorum-proven valid successor can be recovered, Anvil 0.6.0 has no unsafe
+operator bypass; automatic lineage reconciliation for that case is deferred.
 
 ## Legacy one-node reference journal recovery
 

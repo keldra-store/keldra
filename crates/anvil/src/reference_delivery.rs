@@ -34,8 +34,6 @@ pub(crate) enum ReferenceCommitDisposition {
     /// RocksDB batch as the journal append. Advancing the destination cursor
     /// must not replay those effects.
     AlreadyAppliedLocally,
-    /// A quorum proved that this unacknowledged candidate was not selected.
-    DiscardedMinority,
 }
 
 /// Exact-path quorum proof. Missing lineage must return an error; delivery may
@@ -134,8 +132,9 @@ impl crate::payload_distribution::PayloadPlacementView for ReferencePlacement {
 ///
 /// The source's own proof supplies the exact value being reconciled. Current
 /// object placement then determines the complete replica group to read. This
-/// deliberately makes no version or lineage inference: only exact equality or
-/// exact absence can satisfy a quorum.
+/// deliberately makes no version or lineage inference. Exact equality can
+/// prove commitment; exact absence is only an observation and cannot prove
+/// that a different candidate committed.
 pub(crate) struct QuorumReferenceCommitAuthority {
     source: Store,
     placement: Arc<dyn ReferencePlacementAuthority>,
@@ -254,9 +253,6 @@ impl ReferenceCommitAuthority for QuorumReferenceCommitAuthority {
         let quorum = group.required_acknowledgements();
         if exact >= quorum {
             return Ok(ReferenceCommitDisposition::CommittedOrAncestor);
-        }
-        if absent >= quorum {
-            return Ok(ReferenceCommitDisposition::DiscardedMinority);
         }
         if exact + absent < quorum {
             return Err(format!(
@@ -456,11 +452,7 @@ impl ReferenceDelivery {
                     break;
                 }
             };
-            if matches!(
-                disposition,
-                ReferenceCommitDisposition::DiscardedMinority
-                    | ReferenceCommitDisposition::AlreadyAppliedLocally
-            ) {
+            if disposition == ReferenceCommitDisposition::AlreadyAppliedLocally {
                 routed.push((change.offset(), BTreeMap::new()));
                 continue;
             }
