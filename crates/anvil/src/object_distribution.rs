@@ -10,6 +10,8 @@ mod serving_read;
 
 pub(crate) use quorum_read::select_object_snapshot_quorum;
 
+use std::time::Duration;
+
 use anvil_consensus::{DecisionRaft, NodeId};
 use anvil_store::{
     BatchOperation, BlobRef, CoordinatedObjectMutation, CoordinatedRetainedVersionDelete,
@@ -24,7 +26,9 @@ use crate::mutable_record_replica_group::MutableRecordReplicaGroup;
 use crate::payload_distribution::{
     PayloadDistribution, PayloadDistributionError, PayloadPeerTransport,
 };
+use crate::payload_placement::select_payload_placement;
 use crate::placement::PlacementKind;
+use crate::reference_delivery::ReferenceRuntimeHandle;
 use crate::serving_fence::ServingAuthority;
 
 #[derive(Clone)]
@@ -36,6 +40,9 @@ pub(crate) struct ObjectDistribution {
     peers: DataPeerTransport,
     payload: PayloadDistribution,
     payload_peers: PayloadPeerTransport,
+    erasure_profile: ErasureProfile,
+    references: ReferenceRuntimeHandle,
+    reference_acknowledgement_timeout: Duration,
     mutation_admission: crate::mutation_admission::MutationAdmission,
 }
 
@@ -47,6 +54,8 @@ impl ObjectDistribution {
         serving: ServingAuthority,
         peers: DataPeerTransport,
         erasure_profile: ErasureProfile,
+        references: ReferenceRuntimeHandle,
+        reference_acknowledgement_timeout: Duration,
         mutation_admission: crate::mutation_admission::MutationAdmission,
     ) -> Self {
         let payload = PayloadDistribution::new(
@@ -64,6 +73,9 @@ impl ObjectDistribution {
             peers,
             payload,
             payload_peers,
+            erasure_profile,
+            references,
+            reference_acknowledgement_timeout,
             mutation_admission,
         }
     }
@@ -172,8 +184,12 @@ impl ObjectDistribution {
             .map_err(mutation_status)?;
         self.replicate(&placement, &group, &coordinated).await?;
 
-        if durability == Durability::Local {
-            self.continue_payload_placement(upload_source, reference);
+        match durability {
+            Durability::Local => self.continue_payload_placement(upload_source, reference),
+            Durability::Replicated => {
+                self.wait_for_replicated_reference(&placement, &reference, &evidence, &coordinated)
+                    .await?;
+            }
         }
         Ok(coordinated.receipt)
     }
@@ -516,6 +532,42 @@ impl ObjectDistribution {
                 );
             }
         });
+    }
+
+    async fn wait_for_replicated_reference(
+        &self,
+        placement: &ClusterPlacement,
+        reference: &BlobRef,
+        evidence: &crate::payload_distribution::PreparedPayloadEvidence,
+        coordinated: &CoordinatedObjectMutation,
+    ) -> Result<(), Status> {
+        let Some(mutation) = coordinated.mutation.as_ref() else {
+            return Ok(());
+        };
+        if !mutation
+            .reference_deltas
+            .iter()
+            .any(|delta| delta.change > 0 && delta.blob == *reference)
+        {
+            return Ok(());
+        }
+        let owners = select_payload_placement(
+            placement.cluster_id(),
+            reference,
+            self.erasure_profile,
+            placement.placement_nodes(),
+        )
+        .replicated_reference_owners(evidence.artifacts())
+        .map_err(|error| payload_status(error.into()))?;
+        self.references
+            .wait_for_reference_effects(
+                placement,
+                mutation.stamp.source_id,
+                mutation.stamp.source_journal_position,
+                &owners,
+                self.reference_acknowledgement_timeout,
+            )
+            .await
     }
 
     fn replica_group(

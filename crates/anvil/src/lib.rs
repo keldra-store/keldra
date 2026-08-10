@@ -278,6 +278,8 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         serving_fence.authority(),
         data_transport.clone(),
         config.erasure_profile,
+        reference_runtime_handle.clone(),
+        config.atomic_program_timeout,
         mutation_admission.clone(),
     );
     let object_reader = cluster_object_read::ClusterObjectReader::new(

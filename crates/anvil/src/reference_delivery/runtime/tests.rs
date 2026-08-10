@@ -40,6 +40,13 @@ fn gc_rejects_another_or_malformed_source() {
     assert!(!source_is_fully_applied(NodeId(3), invalid_count, 11));
 }
 
+#[test]
+fn replicated_acknowledgement_requires_every_selected_cursor() {
+    assert!(reference_cursors_reached(&[9, 10, 12], 9));
+    assert!(!reference_cursors_reached(&[9, 8, 12], 9));
+    assert!(!reference_cursors_reached(&[], 9));
+}
+
 #[tokio::test]
 async fn stop_interrupts_a_long_worker_delay() {
     let (stop, mut signal) = tokio::sync::watch::channel(false);

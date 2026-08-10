@@ -10,7 +10,7 @@ use anvil_store::{
     BlobRef, Durability, ErasureProfile, PayloadArtifactState, ReferenceDeltaApplied,
     ReferenceDeltaBatch, SourceId, Store, WatchJournalStatus,
 };
-use tonic::Code;
+use tonic::{Code, Status};
 
 use super::cleanup::{
     ActiveReferenceSource, ReferenceProofCleanup, ReferenceProofCleanupPlacement,
@@ -126,7 +126,7 @@ impl ReferenceDestinations for StoreReferenceDestinations {
     ) -> Result<ReferenceDeltaApplied, String> {
         let _permit = self
             .mutation_admission
-            .enter()
+            .enter_continuation()
             .map_err(|error| error.to_string())?;
         if node == self.local_node {
             return self
@@ -475,6 +475,120 @@ impl Drop for ReferenceRuntime {
 }
 
 impl ReferenceRuntimeHandle {
+    /// Wait until the exact physical owners used to satisfy a `REPLICATED`
+    /// payload response have durably consumed the corresponding positive
+    /// reference effect. The destination cursor and reference mutation are
+    /// committed by one RocksDB batch, so the cursor is the acknowledgement;
+    /// no second record or side protocol is needed.
+    pub(crate) async fn wait_for_reference_effects(
+        &self,
+        expected_placement: &ClusterPlacement,
+        source: SourceId,
+        through: u64,
+        owners: &[NodeId],
+        maximum: Duration,
+    ) -> Result<(), Status> {
+        if through == 0 || owners.is_empty() || maximum.is_zero() {
+            return Err(Status::internal(
+                "replicated reference acknowledgement is malformed",
+            ));
+        }
+        tokio::time::timeout(maximum, async {
+            loop {
+                if self
+                    .reference_effects_applied(expected_placement, source, through, owners)
+                    .await?
+                {
+                    return Ok(());
+                }
+                tokio::time::sleep(READINESS_POLL_INTERVAL).await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            Status::deadline_exceeded("replicated reference acknowledgement deadline exceeded")
+        })?
+    }
+
+    async fn reference_effects_applied(
+        &self,
+        expected_placement: &ClusterPlacement,
+        source: SourceId,
+        through: u64,
+        owners: &[NodeId],
+    ) -> Result<bool, Status> {
+        let destinations = self.reference_owner_addresses(expected_placement, owners)?;
+        let mut cursors = Vec::with_capacity(destinations.len());
+        for (node, address) in destinations {
+            match self.destinations.cursor(node, &address, source).await {
+                Ok(cursor) => cursors.push(cursor),
+                Err(error) => {
+                    tracing::debug!(
+                        destination.node = node.0,
+                        %error,
+                        "replicated reference acknowledgement is not ready"
+                    );
+                    return Ok(false);
+                }
+            }
+        }
+        // Cursor RPCs await peer I/O. Recheck the authority after those awaits
+        // before accepting their observations.
+        self.reference_owner_addresses(expected_placement, owners)?;
+        Ok(reference_cursors_reached(&cursors, through))
+    }
+
+    fn reference_owner_addresses(
+        &self,
+        expected: &ClusterPlacement,
+        owners: &[NodeId],
+    ) -> Result<Vec<(NodeId, String)>, Status> {
+        if !self.serving.has_valid_lease() {
+            return Err(Status::unavailable(
+                "serving fence expired during replicated reference acknowledgement",
+            ));
+        }
+        let state = self.decisions.state().map_err(|_| {
+            Status::unavailable(
+                "applied cluster membership is unavailable during reference acknowledgement",
+            )
+        })?;
+        let current = ClusterPlacement::from_applied(&state)
+            .map_err(|error| Status::unavailable(error.to_string()))?;
+        if current.fence() != expected.fence()
+            || current.active_node_ids() != expected.active_node_ids()
+        {
+            return Err(Status::unavailable(
+                "payload placement changed during replicated reference acknowledgement",
+            ));
+        }
+        owners
+            .iter()
+            .copied()
+            .map(|node| {
+                let expected_address = expected.address(node).ok_or_else(|| {
+                    Status::internal(format!(
+                        "replicated reference owner {} was absent from its placement",
+                        node.0
+                    ))
+                })?;
+                let current_address = current.address(node).ok_or_else(|| {
+                    Status::unavailable(format!(
+                        "replicated reference owner {} is no longer ACTIVE",
+                        node.0
+                    ))
+                })?;
+                if current_address != expected_address {
+                    return Err(Status::unavailable(format!(
+                        "replicated reference owner {} changed address",
+                        node.0
+                    )));
+                }
+                Ok((node, current_address.0.clone()))
+            })
+            .collect()
+    }
+
     /// Waits without a data-size timeout for exact reference safety. Complete
     /// replicas let an undersized membership converge normally, so startup no
     /// longer bypasses reconciliation merely because it cannot place K+M
@@ -530,6 +644,10 @@ impl ReferenceRuntimeHandle {
             && self.reference_safe.load(Ordering::Acquire)
             && self.serving.has_valid_lease()
     }
+}
+
+fn reference_cursors_reached(cursors: &[u64], through: u64) -> bool {
+    !cursors.is_empty() && cursors.iter().all(|cursor| *cursor >= through)
 }
 
 async fn wait_for_stop(stop: &mut tokio::sync::watch::Receiver<bool>, delay: Duration) -> bool {

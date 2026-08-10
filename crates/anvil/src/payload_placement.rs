@@ -137,6 +137,84 @@ impl PayloadPlacement {
         }
         Ok(())
     }
+
+    /// Exact physical owners whose positive reference effect must be durable
+    /// before a `REPLICATED` publish can be acknowledged.
+    ///
+    /// This deliberately selects only the owners which supplied the response
+    /// evidence already verified by the path coordinator. Waiting for every
+    /// ACTIVE node would silently strengthen the payload acknowledgement
+    /// contract and make unrelated node outages block a publish.
+    pub(crate) fn replicated_reference_owners(
+        &self,
+        evidence: &[NodePayloadEvidence],
+    ) -> Result<Vec<NodeId>, PayloadReadinessError> {
+        ensure_distinct_node_evidence(evidence)?;
+        match self {
+            Self::Small(placement) => {
+                let owners = placement
+                    .owners
+                    .iter()
+                    .copied()
+                    .filter(|owner| {
+                        evidence
+                            .iter()
+                            .any(|entry| entry.node_id == *owner && entry.complete_copy)
+                    })
+                    .collect::<Vec<_>>();
+                let required = placement.owners.len().max(2);
+                if owners.len() < required {
+                    return Err(PayloadReadinessError::CompleteCopies {
+                        required,
+                        durable: owners.len(),
+                    });
+                }
+                Ok(owners)
+            }
+            Self::LargeComplete(placement) => {
+                const REQUIRED_REPLICATED_COPIES: usize = 2;
+                let owners = placement
+                    .owners
+                    .iter()
+                    .copied()
+                    .filter(|owner| {
+                        evidence
+                            .iter()
+                            .any(|entry| entry.node_id == *owner && entry.complete_copy)
+                    })
+                    .take(REQUIRED_REPLICATED_COPIES)
+                    .collect::<Vec<_>>();
+                if owners.len() < REQUIRED_REPLICATED_COPIES {
+                    return Err(PayloadReadinessError::CompleteCopies {
+                        required: REQUIRED_REPLICATED_COPIES,
+                        durable: owners.len(),
+                    });
+                }
+                Ok(owners)
+            }
+            Self::Large(placement) => {
+                let owners = placement
+                    .shards
+                    .iter()
+                    .filter(|shard| {
+                        evidence.iter().any(|entry| {
+                            entry.node_id == shard.owner
+                                && entry.shard_ordinal == Some(shard.ordinal)
+                        })
+                    })
+                    .map(|shard| shard.owner)
+                    .take(placement.replicated_shards)
+                    .collect::<Vec<_>>();
+                if owners.len() < placement.replicated_shards {
+                    return Err(PayloadReadinessError::FinalShards {
+                        required: placement.replicated_shards,
+                        durable: owners.len(),
+                    });
+                }
+                Ok(owners)
+            }
+        }
+    }
 }
 
 /// Durable artifact evidence returned by one exact placement owner.
@@ -715,6 +793,81 @@ mod tests {
             Err(PayloadReadinessError::ContradictoryNode {
                 node_id: evidence[0].node_id,
             })
+        );
+    }
+
+    #[test]
+    fn replicated_reference_owners_match_the_small_response_evidence() {
+        let placement = select_payload_placement(cluster_id(), &content(11), profile(), &nodes());
+        let PayloadPlacement::Small(small) = &placement else {
+            panic!("expected small placement")
+        };
+        let mut evidence = small
+            .owners()
+            .iter()
+            .rev()
+            .copied()
+            .map(|owner| NodePayloadEvidence::new(owner, true, None))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            placement.replicated_reference_owners(&evidence).unwrap(),
+            small.owners()
+        );
+        evidence.pop();
+        assert!(placement.replicated_reference_owners(&evidence).is_err());
+    }
+
+    #[test]
+    fn replicated_reference_owners_choose_two_evidence_backed_complete_copies() {
+        let active = [node(2, 1_000_000), node(5, 1_000_000), node(11, 1_000_000)];
+        let placement = select_payload_placement(
+            cluster_id(),
+            &content(SMALL_BLOB_MAX_BYTES as u64 + 1),
+            profile(),
+            &active,
+        );
+        let PayloadPlacement::LargeComplete(complete) = &placement else {
+            panic!("expected complete-copy fallback")
+        };
+        let evidence = complete
+            .owners()
+            .iter()
+            .skip(1)
+            .copied()
+            .map(|owner| NodePayloadEvidence::new(owner, true, None))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            placement.replicated_reference_owners(&evidence).unwrap(),
+            &complete.owners()[1..3]
+        );
+    }
+
+    #[test]
+    fn replicated_reference_owners_choose_k_plus_one_evidence_backed_shards() {
+        let placement = select_payload_placement(
+            cluster_id(),
+            &content(SMALL_BLOB_MAX_BYTES as u64 + 1),
+            profile(),
+            &nodes(),
+        );
+        let PayloadPlacement::Large(large) = &placement else {
+            panic!("expected erasure placement")
+        };
+        let evidence = large
+            .shards()
+            .iter()
+            .skip(1)
+            .map(|shard| NodePayloadEvidence::new(shard.owner(), false, Some(shard.ordinal())))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            placement.replicated_reference_owners(&evidence).unwrap(),
+            large.shards()[1..6]
+                .iter()
+                .map(|shard| shard.owner())
+                .collect::<Vec<_>>()
         );
     }
 }
