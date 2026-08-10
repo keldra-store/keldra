@@ -77,6 +77,12 @@ async fn main() -> TestResult<()> {
     // the disposable traffic-meter assignment asynchronously.
     tokio::time::sleep(Duration::from_secs(3)).await;
 
+    // Do not race the worker's cold current-head baseline. A complete zero
+    // rollup proves both definitions have established their journal boundary;
+    // every following object transition must then be applied incrementally.
+    wait_for(&mut accounting, &bucket, "", 0, 0, 0, 0).await?;
+    wait_for(&mut accounting, &bucket, "billable", 0, 0, 0, 0).await?;
+
     let mut expected_bytes = 0_u64;
     let mut addresses = Vec::new();
     for index in 0..objects.len() {
