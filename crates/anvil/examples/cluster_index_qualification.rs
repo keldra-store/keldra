@@ -242,6 +242,7 @@ async fn main() -> TestResult<()> {
         write_number += 1;
     }
 
+    let mut mutation_generations = Vec::with_capacity(cases.len());
     for ((case, definition), before) in cases.iter().zip(&definitions).zip(&first_generations) {
         let expected = case
             .expected_paths
@@ -271,7 +272,53 @@ async fn main() -> TestResult<()> {
             )));
         }
         require_checkpoint_advance(before_freshness, require_freshness(&responses[0])?, 1)?;
+        mutation_generations.push(responses[0].clone());
     }
+
+    let tensor_position = cases
+        .iter()
+        .position(|case| {
+            matches!(
+                case.specification.specification.as_ref(),
+                Some(SpecificationValue::Tensor(_))
+            )
+        })
+        .ok_or_else(|| invalid("index qualification omitted the Tensor engine"))?;
+    let tensor_case = &cases[tensor_position];
+    let before_tensor_delete = require_freshness(&mutation_generations[tensor_position])?.clone();
+    let delete_client = &mut objects[(write_number as usize) % object_client_count];
+    let receipt = delete_client
+        .delete(DeleteRequest {
+            address: Some(ObjectAddress {
+                tenant: tenant.clone(),
+                bucket: tensor_case.bucket.into(),
+                path: tensor_case.replacement.0.into(),
+            }),
+            command_id: "qualification-delete-tensor-result".into(),
+            durability: source_durability as i32,
+        })
+        .await?
+        .into_inner();
+    if !receipt.deleted || receipt.version == 0 {
+        return Err(invalid(
+            "tensor index source delete returned an invalid receipt",
+        ));
+    }
+    write_number += 1;
+    let expected = BTreeSet::new();
+    let responses = wait_for_queries(
+        &mut indexes,
+        request(tensor_case),
+        definitions[tensor_position].index_id,
+        definitions[tensor_position].version,
+        before_tensor_delete.generation,
+        tensor_case.documents.len() as u64 + 3,
+        &expected,
+        tensor_case.expects_scores,
+        endpoints.len(),
+    )
+    .await?;
+    require_checkpoint_advance(&before_tensor_delete, require_freshness(&responses[0])?, 1)?;
 
     if env::var("ANVIL_INDEX_QUALIFICATION_REQUIRE_QUIESCENCE").is_ok_and(|value| value == "1") {
         require_generation_quiescence(&mut indexes[0], &cases[0]).await?;
