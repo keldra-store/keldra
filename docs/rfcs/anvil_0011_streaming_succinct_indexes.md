@@ -1,6 +1,6 @@
 # ANVIL-0011: Streaming Succinct Indexes in Anvil 0.6.0
 
-Status: Accepted architecture for the Anvil 0.6.0 index subsystem.
+Status: Superseded by ANVIL-0012.
 
 Audience: Anvil implementors, operators, client authors, and reviewers
 
