@@ -28,6 +28,10 @@ use crate::{
 const DECISION_HEARTBEAT_INTERVAL_MILLIS: u64 = 500;
 const DECISION_ELECTION_TIMEOUT_MIN_MILLIS: u64 = 2_000;
 const DECISION_ELECTION_TIMEOUT_MAX_MILLIS: u64 = 3_000;
+// OpenRaft awaits its core shutdown, but its detached state-machine worker can
+// retain the RocksDB handle briefly while an in-process restart begins.
+const SAME_PROCESS_LOCK_MAX_RETRIES: usize = 100;
+const SAME_PROCESS_LOCK_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 // The response is part of OpenRaft's persisted protocol. Boxing one variant
@@ -740,7 +744,7 @@ impl DecisionRaft {
             max_commit_entries,
             max_commit_bytes,
         };
-        let store = DurableStore::open(path, storage_config, node_id)?;
+        let store = open_durable_store(path.as_ref(), storage_config, node_id).await?;
         let machine = Arc::new(Mutex::new(load_machine(&store)?));
         let config = decision_raft_config()?;
         let raft = openraft::Raft::new(
@@ -1004,6 +1008,37 @@ impl DecisionRaft {
             .await
             .map_err(|error| DecisionRaftError::Unavailable(error.to_string()))
     }
+}
+
+async fn open_durable_store(
+    path: &Path,
+    storage_config: StorageConfig,
+    node_id: u64,
+) -> Result<DurableStore, DecisionRaftError> {
+    let mut retries = 0;
+    loop {
+        match DurableStore::open(path, storage_config, node_id) {
+            Ok(store) => return Ok(store),
+            Err(error)
+                if retries < SAME_PROCESS_LOCK_MAX_RETRIES
+                    && is_same_process_lock_error(&error) =>
+            {
+                retries += 1;
+                tokio::task::yield_now().await;
+                tokio::time::sleep(SAME_PROCESS_LOCK_RETRY_DELAY).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn is_same_process_lock_error(error: &DurableStorageError) -> bool {
+    let DurableStorageError::Rocks(error) = error else {
+        return false;
+    };
+    let message = error.as_ref();
+    message.starts_with("IO error: lock hold by current process, acquire time ")
+        && message.ends_with("/LOCK: No locks available")
 }
 
 fn decision_raft_config() -> Result<openraft::Config, DecisionRaftError> {
@@ -1293,6 +1328,50 @@ fn read_error(error: DurableStorageError) -> StorageError<u64> {
 
 fn write_error(error: DurableStorageError) -> StorageError<u64> {
     storage_error(ErrorSubject::Store, ErrorVerb::Write, error)
+}
+
+#[cfg(test)]
+mod open_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_retries_the_exact_transient_same_process_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage_config = StorageConfig {
+            max_commit_entries: 4,
+            max_commit_bytes: 64 * 1024,
+        };
+        let held = DurableStore::open(directory.path(), storage_config, 1).unwrap();
+
+        let conflict = match DurableStore::open(directory.path(), storage_config, 1) {
+            Ok(_) => panic!("a second RocksDB handle acquired the same process-local lock"),
+            Err(error) => error,
+        };
+        assert!(is_same_process_lock_error(&conflict));
+
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            drop(held);
+        });
+        let reopened = open_durable_store(directory.path(), storage_config, 1)
+            .await
+            .unwrap();
+        release.await.unwrap();
+        drop(reopened);
+
+        let mismatched = StorageConfig {
+            max_commit_entries: 5,
+            ..storage_config
+        };
+        let error = match open_durable_store(directory.path(), mismatched, 1).await {
+            Ok(_) => panic!("a mismatched storage configuration was accepted"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            DecisionRaftError::Storage(message) if message.contains("not requested")
+        ));
+    }
 }
 
 #[cfg(test)]
