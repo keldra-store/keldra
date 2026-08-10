@@ -35,6 +35,8 @@ type IndexClient = IndexServiceClient<InterceptedService<Channel, BearerToken>>;
 
 const WAIT_LIMIT: Duration = Duration::from_secs(90);
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
+const GENERATION_QUIET_WINDOW: Duration = Duration::from_secs(3);
+const GENERATION_QUIET_LIMIT: Duration = Duration::from_secs(12);
 const CONTENT_TYPE: &str = "application/json";
 
 #[derive(Clone)]
@@ -271,6 +273,10 @@ async fn main() -> TestResult<()> {
         require_checkpoint_advance(before_freshness, require_freshness(&responses[0])?, 1)?;
     }
 
+    if env::var("ANVIL_INDEX_QUALIFICATION_REQUIRE_QUIESCENCE").is_ok_and(|value| value == "1") {
+        require_generation_quiescence(&mut indexes[0], &cases[0]).await?;
+    }
+
     println!(
         "index qualification passed on {} node(s): {} engines, {} put/delete mutations",
         endpoints.len(),
@@ -278,6 +284,54 @@ async fn main() -> TestResult<()> {
         write_number
     );
     Ok(())
+}
+
+async fn require_generation_quiescence(
+    client: &mut IndexClient,
+    case: &EngineCase,
+) -> TestResult<()> {
+    let deadline = Instant::now() + GENERATION_QUIET_LIMIT;
+    let mut observed_generation = None;
+    let mut stable_since = Instant::now();
+    let mut advances = 0_u64;
+
+    loop {
+        let response = client.query_index(request(case)).await?.into_inner();
+        let generation = require_freshness(&response)?.generation;
+        if generation == 0 {
+            return Err(invalid(
+                "index generation disappeared while checking quiescence",
+            ));
+        }
+        match observed_generation {
+            Some(previous) if previous == generation => {}
+            Some(_) => {
+                observed_generation = Some(generation);
+                stable_since = Instant::now();
+                advances = advances.saturating_add(1);
+            }
+            None => {
+                observed_generation = Some(generation);
+                stable_since = Instant::now();
+            }
+        }
+
+        if stable_since.elapsed() >= GENERATION_QUIET_WINDOW {
+            println!(
+                "index generation {generation} remained stable for {} seconds",
+                GENERATION_QUIET_WINDOW.as_secs()
+            );
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(invalid(format!(
+                "index generation did not quiesce without source mutations: \
+                 observed {advances} advances in {} seconds (latest generation {generation})",
+                GENERATION_QUIET_LIMIT.as_secs()
+            )));
+        }
+        sleep(POLL_INTERVAL).await;
+    }
 }
 
 fn index_client(

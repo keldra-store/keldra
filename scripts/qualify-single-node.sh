@@ -101,7 +101,7 @@ docker run --detach \
   --name "${container_name}" \
   --platform "${platform}" \
   --publish 127.0.0.1::50051 \
-  --env RUST_LOG="${RUST_LOG:-info}" \
+  --env RUST_LOG=info \
   --env ANVIL_LISTEN=0.0.0.0:50051 \
   --env ANVIL_PEER_LISTEN=127.0.0.1:50052 \
   --env ANVIL_DATA_DIR=/var/lib/anvil \
@@ -111,6 +111,7 @@ docker run --detach \
   --env ANVIL_RATE_LIMIT_CREDENTIAL_GLOBAL_BURST=1000 \
   --env ANVIL_RATE_LIMIT_CREDENTIAL_CLIENT_PER_MINUTE=600 \
   --env ANVIL_RATE_LIMIT_CREDENTIAL_CLIENT_BURST=100 \
+  --env ANVIL_INDEX_MAX_RETAINED_GENERATIONS=1 \
   --env ANVIL_RUN_SYSTEM_BOOTSTRAP=true \
   --volume "${data_dir}:/var/lib/anvil" \
   --volume "${signing_key}:/run/secrets/anvil-token-signing-key:ro" \
@@ -196,10 +197,43 @@ run_index_qualification() {
   ANVIL_INDEX_QUALIFICATION_TENANT="${tenant}" \
   ANVIL_INDEX_QUALIFICATION_CLIENT_ID="${owner_client}" \
   ANVIL_INDEX_QUALIFICATION_CLIENT_SECRET="${owner_secret}" \
+  ANVIL_INDEX_QUALIFICATION_REQUIRE_QUIESCENCE=1 \
     cargo run --quiet --locked --package anvil-server \
       --manifest-path "${repo_root}/Cargo.toml" \
       --example cluster_index_qualification
   echo "[anvil-single-qualification] all-eight-index qualification passed"
+}
+
+assert_index_retention_converged() {
+  local deadline=$((SECONDS + 65))
+  local completed
+  local deferred
+  while true; do
+    deferred="$(
+      docker logs "${container_name}" 2>&1 \
+        | grep -E 'obsolete index cleanup( reload)? deferred' \
+        | tail -n 1 || true
+    )"
+    if [[ -n "${deferred}" ]]; then
+      echo "single-node index retention reported deferred cleanup" >&2
+      printf '%s\n' "${deferred}" >&2
+      return 1
+    fi
+    completed="$(
+      docker logs "${container_name}" 2>&1 \
+        | grep -F 'idle obsolete index cleanup completed' \
+        | tail -n 1 || true
+    )"
+    if [[ -n "${completed}" ]]; then
+      echo "[anvil-single-qualification] idle obsolete index cleanup converged"
+      return 0
+    fi
+    if ((SECONDS >= deadline)); then
+      echo "single-node index retention did not complete within 65 seconds" >&2
+      return 1
+    fi
+    sleep 1
+  done
 }
 
 run_accounting_qualification() {
@@ -382,5 +416,6 @@ run_accounting_qualification
 run_personaldb_qualification
 run_s3_qualification
 run_git_qualification
+assert_index_retention_converged
 
 echo "[anvil-single-qualification] PASS image=${image_id} platform=${platform}"
