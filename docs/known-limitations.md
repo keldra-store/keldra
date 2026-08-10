@@ -1,5 +1,18 @@
 # Anvil known limitations
 
+## Sparse index coordination in 0.7.0
+
+Stored-byte and object-count accounting is derived from authoritative object
+state and remains exact at each reported complete checkpoint. Inbound and
+outbound byte totals are bounded usage telemetry rather than a financial
+ledger. Each ingress node buffers small idempotent batches and sends them to
+the weighted-HRW matcher for the affected bucket. A process loss before
+acknowledgement, bounded-queue exhaustion, or the short propagation interval
+after an accounting definition or matcher changes can omit traffic bytes.
+Anvil reports dropped batches and bytes; supported-load qualification requires
+both to remain zero. These windows do not affect stored objects, stored-byte
+totals, object counts, authorization, references, or index correctness.
+
 ## Streaming indexes in 0.6.0
 
 Index format 2 is a clean break. Anvil 0.6 does not read, migrate, dual-write or
