@@ -224,8 +224,9 @@ async fn main() -> TestResult<()> {
         write_number += 1;
 
         let delete_client = &mut objects[(write_number as usize) % object_client_count];
-        let receipt = delete_client
-            .delete(DeleteRequest {
+        delete_object(
+            delete_client,
+            DeleteRequest {
                 address: Some(ObjectAddress {
                     tenant: tenant.clone(),
                     bucket: case.bucket.into(),
@@ -233,12 +234,10 @@ async fn main() -> TestResult<()> {
                 }),
                 command_id: format!("qualification-delete-{case_number}"),
                 durability: source_durability as i32,
-            })
-            .await?
-            .into_inner();
-        if !receipt.deleted || receipt.version == 0 {
-            return Err(invalid("index source delete returned an invalid receipt"));
-        }
+            },
+            "index source delete",
+        )
+        .await?;
         write_number += 1;
     }
 
@@ -287,8 +286,9 @@ async fn main() -> TestResult<()> {
     let tensor_case = &cases[tensor_position];
     let before_tensor_delete = require_freshness(&mutation_generations[tensor_position])?.clone();
     let delete_client = &mut objects[(write_number as usize) % object_client_count];
-    let receipt = delete_client
-        .delete(DeleteRequest {
+    delete_object(
+        delete_client,
+        DeleteRequest {
             address: Some(ObjectAddress {
                 tenant: tenant.clone(),
                 bucket: tensor_case.bucket.into(),
@@ -296,14 +296,10 @@ async fn main() -> TestResult<()> {
             }),
             command_id: "qualification-delete-tensor-result".into(),
             durability: source_durability as i32,
-        })
-        .await?
-        .into_inner();
-    if !receipt.deleted || receipt.version == 0 {
-        return Err(invalid(
-            "tensor index source delete returned an invalid receipt",
-        ));
-    }
+        },
+        "tensor index source delete",
+    )
+    .await?;
     write_number += 1;
     let expected = BTreeSet::new();
     let responses = wait_for_queries(
@@ -605,6 +601,29 @@ async fn put_json(
     Ok(())
 }
 
+async fn delete_object(
+    client: &mut RawClient,
+    request: DeleteRequest,
+    context: &str,
+) -> TestResult<()> {
+    let deadline = Instant::now() + WAIT_LIMIT;
+    loop {
+        match client.delete(request.clone()).await {
+            Ok(response) => {
+                let receipt = response.into_inner();
+                if !receipt.deleted || receipt.version == 0 {
+                    return Err(invalid(format!("{context} returned an invalid receipt")));
+                }
+                return Ok(());
+            }
+            Err(status) if retryable_transport(&status) && Instant::now() < deadline => {
+                sleep(POLL_INTERVAL).await;
+            }
+            Err(status) => return Err(invalid(format!("{context} failed: {status}"))),
+        }
+    }
+}
+
 fn qualification_durability(endpoint_count: usize) -> Durability {
     if endpoint_count == 1 {
         Durability::Local
@@ -823,11 +842,12 @@ async fn collect_paginated_paths(
 ) -> TestResult<BTreeSet<String>> {
     let mut request = request(case);
     request.limit = 1;
+    let deadline = Instant::now() + WAIT_LIMIT;
     let mut paths = BTreeSet::new();
     let mut previous_token = Vec::new();
     loop {
         request.page_token = previous_token.clone();
-        let response = client.query_index(request.clone()).await?.into_inner();
+        let response = query_index_page(client, request.clone(), case.name, &deadline).await?;
         let freshness = require_freshness(&response)?;
         if !stable_freshness_agrees(Some(expected_freshness), Some(freshness)) {
             return Err(invalid(format!(
@@ -858,13 +878,38 @@ async fn collect_paginated_paths(
     }
 }
 
+async fn query_index_page(
+    client: &mut IndexClient,
+    request: QueryIndexRequest,
+    index_name: &str,
+    deadline: &Instant,
+) -> TestResult<QueryIndexResponse> {
+    loop {
+        match client.query_index(request.clone()).await {
+            Ok(response) => return Ok(response.into_inner()),
+            Err(status) if retryable_transport(&status) && Instant::now() < *deadline => {
+                sleep(POLL_INTERVAL).await;
+            }
+            Err(status) => {
+                return Err(invalid(format!(
+                    "{index_name} pagination query failed: {status}"
+                )));
+            }
+        }
+    }
+}
+
 fn retryable(status: &tonic::Status) -> bool {
     matches!(
         status.code(),
-        tonic::Code::Unavailable
-            | tonic::Code::DeadlineExceeded
-            | tonic::Code::NotFound
-            | tonic::Code::FailedPrecondition
+        tonic::Code::NotFound | tonic::Code::FailedPrecondition
+    ) || retryable_transport(status)
+}
+
+fn retryable_transport(status: &tonic::Status) -> bool {
+    matches!(
+        status.code(),
+        tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
     ) || (status.code() == tonic::Code::Cancelled && status.message() == "Timeout expired")
 }
 
@@ -1163,7 +1208,7 @@ mod tests {
     use anvil_storage::v1::{Durability, IndexFreshness, IndexSourceFreshness, QueryIndexResponse};
 
     use super::{
-        SpecificationValue, engine_cases, qualification_durability, retryable,
+        SpecificationValue, engine_cases, qualification_durability, retryable, retryable_transport,
         routed_responses_agree,
     };
 
@@ -1286,6 +1331,22 @@ mod tests {
         )));
         assert!(!retryable(&tonic::Status::invalid_argument(
             "invalid query"
+        )));
+
+        assert!(retryable_transport(&tonic::Status::unavailable(
+            "serving fence expired"
+        )));
+        assert!(retryable_transport(&tonic::Status::deadline_exceeded(
+            "unknown mutation outcome"
+        )));
+        assert!(retryable_transport(&tonic::Status::cancelled(
+            "Timeout expired"
+        )));
+        assert!(!retryable_transport(&tonic::Status::not_found(
+            "object missing"
+        )));
+        assert!(!retryable_transport(&tonic::Status::failed_precondition(
+            "mutation rejected"
         )));
     }
 
