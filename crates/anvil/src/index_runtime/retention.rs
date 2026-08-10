@@ -1,9 +1,10 @@
 //! Bounded generation retention over ordinary format-2 index objects.
 
 use std::collections::BTreeSet;
+use std::io::Read;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anvil_store::VersionId;
+use anvil_store::{ObjectKey, VersionId};
 use tonic::Status;
 
 use crate::cluster_object_read::ClusterObjectReader;
@@ -69,7 +70,13 @@ impl IndexGenerationRetention {
 
         while let Some(reference) = previous {
             validate_predecessor(&reference, expected_below, definition.index_id)?;
-            let manifest = self.load_manifest(definition.index_id, &reference).await?;
+            let manifest = match self
+                .load_manifest(definition, tenant_id, bucket_id, &reference)
+                .await?
+            {
+                LoadedPredecessor::Present(manifest) => manifest,
+                LoadedPredecessor::PreviouslyPruned => break,
+            };
             let within_bounds = !obsolete
                 && retain_predecessor(
                     retained_count,
@@ -121,13 +128,40 @@ impl IndexGenerationRetention {
 
     async fn load_manifest(
         &self,
-        index_id: u64,
+        definition: &StoredIndexDefinition,
+        tenant_id: u64,
+        bucket_id: u64,
         reference: &ManifestReference,
-    ) -> Result<IndexGenerationManifest, Status> {
-        let bytes = self.reader.read_blob_bytes(&reference.blob).await?;
+    ) -> Result<LoadedPredecessor, Status> {
+        let key = ObjectKey::new(&definition.tenant, &definition.bucket, &reference.path)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        let Some(mut opened) = self
+            .reader
+            .open_stable(&key, tenant_id, bucket_id, Some(reference.object_version))
+            .await?
+        else {
+            let current = self.reader.head_stable(&key, tenant_id, bucket_id).await?;
+            return classify_absent_predecessor(reference.object_version, current.as_ref());
+        };
+        if opened.version.id != reference.object_version
+            || opened.version.deleted
+            || opened.version.blob.as_ref() != Some(&reference.blob)
+        {
+            return Err(Status::data_loss(
+                "index predecessor object differs from its manifest reference",
+            ));
+        }
+        let mut payload = opened
+            .payload
+            .take()
+            .ok_or_else(|| Status::data_loss("live index predecessor manifest has no payload"))?;
+        let mut bytes = Vec::new();
+        payload.read_to_end(&mut bytes).map_err(|error| {
+            Status::internal(format!("read index predecessor manifest: {error}"))
+        })?;
         let manifest = IndexGenerationManifest::decode(&bytes)
             .map_err(|error| Status::data_loss(error.to_string()))?;
-        if manifest.index_id != index_id
+        if manifest.index_id != definition.index_id
             || manifest.generation != reference.generation
             || manifest.definition_version != reference.definition_version
         {
@@ -135,7 +169,7 @@ impl IndexGenerationRetention {
                 "index predecessor manifest identity differs from its reference",
             ));
         }
-        Ok(manifest)
+        Ok(LoadedPredecessor::Present(manifest))
     }
 
     async fn delete_obsolete_generation(
@@ -299,6 +333,36 @@ impl IndexGenerationRetention {
     }
 }
 
+enum LoadedPredecessor {
+    Present(IndexGenerationManifest),
+    PreviouslyPruned,
+}
+
+fn classify_absent_predecessor(
+    referenced_version: VersionId,
+    current: Option<&anvil_store::Version>,
+) -> Result<LoadedPredecessor, Status> {
+    // The caller has already validated the content-addressed v2 manifest path
+    // and proved that its exact referenced descriptor is absent. Public
+    // object mutations cannot address this reserved path, so a newer,
+    // payload-free current tombstone can only be the durable result of the
+    // internal artifact retention delete. No mutation stamp is required in
+    // the one-node fast path, where ordinary local heads deliberately omit it.
+    match current {
+        Some(version)
+            if version.id > referenced_version && version.deleted && version.blob.is_none() =>
+        {
+            Ok(LoadedPredecessor::PreviouslyPruned)
+        }
+        Some(_) => Err(Status::data_loss(
+            "index predecessor version is absent while its object path remains live",
+        )),
+        None => Err(Status::data_loss(
+            "index predecessor version disappeared without a retention tombstone",
+        )),
+    }
+}
+
 #[derive(Default)]
 struct RetainedArtifacts {
     manifest_paths: BTreeSet<String>,
@@ -391,7 +455,8 @@ fn now_unix_millis() -> Result<u64, Status> {
 
 #[cfg(test)]
 mod tests {
-    use anvil_store::{BlobRef, PlacementLogId, SourceId};
+    use anvil_store::{BlobRef, PlacementLogId, SourceId, Version};
+    use tonic::Code;
 
     use super::*;
     use crate::index_runtime::events::{AtomicProgramWatermark, IndexBarrier, IndexSourceCursor};
@@ -514,5 +579,54 @@ mod tests {
                 .contains(&run_hash_from_artifact_path(9, &obsolete_block).unwrap())
         );
         assert_ne!(retained_block, obsolete_block);
+    }
+
+    #[test]
+    fn repeated_collection_stops_at_a_proven_pruned_predecessor() {
+        let referenced = VersionId(41);
+        let tombstone = Version {
+            id: VersionId(42),
+            blob: None,
+            content_type: None,
+            deleted: true,
+            committed_at_unix_millis: 100,
+        };
+
+        for _ in 0..2 {
+            assert!(matches!(
+                classify_absent_predecessor(referenced, Some(&tombstone)),
+                Ok(LoadedPredecessor::PreviouslyPruned)
+            ));
+        }
+    }
+
+    #[test]
+    fn absent_live_or_unmarked_predecessors_fail_closed() {
+        let referenced = VersionId(41);
+        let live = Version {
+            id: VersionId(42),
+            blob: Some(BlobRef {
+                hash: [4; 32],
+                length: 10,
+            }),
+            content_type: None,
+            deleted: false,
+            committed_at_unix_millis: 100,
+        };
+        let stale_tombstone = Version {
+            id: referenced,
+            blob: None,
+            content_type: None,
+            deleted: true,
+            committed_at_unix_millis: 100,
+        };
+
+        for current in [Some(&live), Some(&stale_tombstone), None] {
+            let error = match classify_absent_predecessor(referenced, current) {
+                Ok(_) => panic!("unproven predecessor pruning must fail closed"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code(), Code::DataLoss);
+        }
     }
 }
