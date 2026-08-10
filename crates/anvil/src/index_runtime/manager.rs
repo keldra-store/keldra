@@ -9,7 +9,7 @@ use anvil_consensus::{DecisionRaft, NodeId};
 use anvil_index::{
     DocumentRef, FIXED_INDEX_SEAL_WORKSPACE_BYTES, IndexError, IndexKind, SegmentMemoryPlan,
 };
-use anvil_store::{Head, LocalChange, ObjectKey};
+use anvil_store::{Head, LocalChange, ObjectKey, VersionId};
 use tonic::Status;
 
 use crate::cluster_object_read::ClusterObjectReader;
@@ -37,6 +37,7 @@ use super::scanner::ClusterIndexScanner;
 const ASSIGNMENT_INTERVAL: Duration = Duration::from_secs(2);
 const BUILDER_IDLE_INTERVAL: Duration = Duration::from_millis(100);
 const BUILDER_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+const RETENTION_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_SOURCE_WIRE_BYTES: u64 = 4 * 1024 * 1024;
 const DECODED_SOURCE_MULTIPLIER: u64 = 4;
 
@@ -156,6 +157,8 @@ pub(crate) struct IndexBuilderDependencies {
 }
 
 async fn run_builder(definition: CatalogDefinition, dependencies: IndexBuilderDependencies) {
+    let mut observed = None;
+    let mut retention_retry_deadline = next_retention_retry(tokio::time::Instant::now());
     loop {
         let specification = match definition.stored.specification() {
             Ok(value) => value,
@@ -171,9 +174,31 @@ async fn run_builder(definition: CatalogDefinition, dependencies: IndexBuilderDe
                 return;
             }
         };
-        match build_once(&definition, &specification, kind, &dependencies).await {
-            Ok(BuildProgress::Idle) => tokio::time::sleep(BUILDER_IDLE_INTERVAL).await,
-            Ok(BuildProgress::Published) => tokio::task::yield_now().await,
+        match build_once(
+            &definition,
+            &specification,
+            kind,
+            observed.as_ref(),
+            &dependencies,
+        )
+        .await
+        {
+            Ok(BuildProgress::Idle(progress)) => {
+                observed = Some(progress);
+                retry_retention_if_due(
+                    &definition,
+                    kind,
+                    &dependencies,
+                    &mut retention_retry_deadline,
+                )
+                .await;
+                tokio::time::sleep(BUILDER_IDLE_INTERVAL).await;
+            }
+            Ok(BuildProgress::Published) => {
+                observed = None;
+                retention_retry_deadline = next_retention_retry(tokio::time::Instant::now());
+                tokio::task::yield_now().await;
+            }
             Err(error) => {
                 tracing::warn!(
                     index.id = definition.stored.index_id,
@@ -181,14 +206,86 @@ async fn run_builder(definition: CatalogDefinition, dependencies: IndexBuilderDe
                     %error,
                     "index build attempt failed; prior generation remains current"
                 );
+                retry_retention_if_due(
+                    &definition,
+                    kind,
+                    &dependencies,
+                    &mut retention_retry_deadline,
+                )
+                .await;
                 tokio::time::sleep(BUILDER_RETRY_INTERVAL).await;
             }
         }
     }
 }
 
+fn next_retention_retry(now: tokio::time::Instant) -> tokio::time::Instant {
+    now + RETENTION_RETRY_INTERVAL
+}
+
+fn retention_retry_due(now: tokio::time::Instant, next_retry: tokio::time::Instant) -> bool {
+    now >= next_retry
+}
+
+async fn retry_retention_if_due(
+    definition: &CatalogDefinition,
+    kind: IndexKind,
+    dependencies: &IndexBuilderDependencies,
+    next_retry: &mut tokio::time::Instant,
+) {
+    if !retention_retry_due(tokio::time::Instant::now(), *next_retry) {
+        return;
+    }
+    retry_retention(definition, kind, dependencies).await;
+    *next_retry = next_retention_retry(tokio::time::Instant::now());
+}
+
+async fn retry_retention(
+    definition: &CatalogDefinition,
+    kind: IndexKind,
+    dependencies: &IndexBuilderDependencies,
+) {
+    let current = dependencies
+        .publisher
+        .load_current(
+            &definition.stored,
+            definition.tenant_id,
+            definition.bucket_id,
+        )
+        .await;
+    match current {
+        Ok(Some(current)) => {
+            collect_obsolete_generation_artifacts(
+                definition,
+                kind,
+                &current,
+                dependencies,
+                "periodic",
+            )
+            .await;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(
+                index.id = definition.stored.index_id,
+                index.kind = ?kind,
+                %error,
+                "periodic obsolete index cleanup reload deferred"
+            );
+        }
+    }
+}
+
+// This progress is deliberately task-local: a restart may safely rescan ignored
+// reserved-artifact journal entries from the published generation barrier.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ObservedGenerationProgress {
+    current_object_version: VersionId,
+    barrier: IndexBarrier,
+}
+
 enum BuildProgress {
-    Idle,
+    Idle(ObservedGenerationProgress),
     Published,
 }
 
@@ -196,6 +293,7 @@ async fn build_once(
     definition: &CatalogDefinition,
     specification: &IndexSpecification,
     kind: IndexKind,
+    observed: Option<&ObservedGenerationProgress>,
     dependencies: &IndexBuilderDependencies,
 ) -> Result<BuildProgress, Status> {
     let current = dependencies
@@ -215,10 +313,14 @@ async fn build_once(
             .capture_barrier()
             .await
             .map_err(event_status)?;
-        let from = current.manifest.barrier().map_err(generation_status)?;
+        let published = current.manifest.barrier().map_err(generation_status)?;
+        let from = incremental_start(current.current_object_version, &published, observed).clone();
         if barriers_can_advance(&from, &target) {
             if from == target {
-                return Ok(BuildProgress::Idle);
+                return Ok(BuildProgress::Idle(ObservedGenerationProgress {
+                    current_object_version: current.current_object_version,
+                    barrier: target,
+                }));
             }
             let advanced = advance_generation(
                 definition,
@@ -254,6 +356,19 @@ async fn build_once(
         dependencies,
     )
     .await
+}
+
+fn incremental_start<'a>(
+    current_object_version: VersionId,
+    published: &'a IndexBarrier,
+    observed: Option<&'a ObservedGenerationProgress>,
+) -> &'a IndexBarrier {
+    observed
+        .filter(|progress| {
+            progress.current_object_version == current_object_version
+                && barriers_can_advance(published, &progress.barrier)
+        })
+        .map_or(published, |progress| &progress.barrier)
 }
 
 fn barriers_can_advance(from: &IndexBarrier, target: &IndexBarrier) -> bool {
@@ -345,7 +460,7 @@ async fn rebuild_generation(
         .await
         .map_err(event_status)?;
     emit_source_lag(kind, &through, &target);
-    catch_up(
+    let _ = catch_up(
         definition,
         specification,
         kind,
@@ -371,7 +486,7 @@ async fn advance_generation(
     let budget = dependencies.budgets.for_kind(kind);
     let mut candidate = CandidateGeneration::incremental(current);
     emit_source_lag(kind, &through, &target);
-    catch_up(
+    let changed = catch_up(
         definition,
         specification,
         kind,
@@ -382,6 +497,12 @@ async fn advance_generation(
         dependencies,
     )
     .await?;
+    if !changed {
+        return Ok(BuildProgress::Idle(ObservedGenerationProgress {
+            current_object_version: current.current_object_version,
+            barrier: through,
+        }));
+    }
     publish_candidate(
         definition,
         kind,
@@ -402,8 +523,9 @@ async fn catch_up(
     candidate: &mut CandidateGeneration,
     budget: &IndexMemoryBudget,
     dependencies: &IndexBuilderDependencies,
-) -> Result<(), Status> {
+) -> Result<bool, Status> {
     let page_bytes = source_wire_limit(budget.limit());
+    let mut changed = false;
     loop {
         let permit = budget
             .acquire(budget.limit())
@@ -419,7 +541,7 @@ async fn catch_up(
             break;
         };
         let plan = work_plan(budget, page.encoded_bytes)?;
-        process_journal_page(
+        changed |= process_journal_page(
             definition,
             specification,
             kind,
@@ -448,7 +570,7 @@ async fn catch_up(
             "index catch-up did not reach its complete source barrier",
         ));
     }
-    Ok(())
+    Ok(changed)
 }
 
 struct CandidateGeneration {
@@ -558,39 +680,14 @@ async fn process_journal_page(
     plan: SegmentMemoryPlan,
     candidate: &mut CandidateGeneration,
     dependencies: &IndexBuilderDependencies,
-) -> Result<(), Status> {
-    let mut paths = BTreeMap::<String, u64>::new();
-    for entry in &page.changes {
-        let (tenant_id, bucket_id, path, version) = match &entry.change {
-            LocalChange::ObjectHead(change) => (
-                change.tenant_id,
-                change.bucket_id,
-                &change.exact_path,
-                change.path_version.0,
-            ),
-            LocalChange::RetainedVersionDeleted(change) => (
-                change.tenant_id,
-                change.bucket_id,
-                &change.exact_path,
-                change
-                    .resulting_head_version
-                    .unwrap_or(change.deleted_version)
-                    .0,
-            ),
-            LocalChange::AggregateChanged(_) | LocalChange::ContentLifecycleChanged(_) => continue,
-            _ => continue,
-        };
-        if tenant_id == definition.tenant_id
-            && bucket_id == definition.bucket_id
-            && path_matches_prefix(path, &definition.stored.path_prefix)
-            && !contains_reserved_segment(path)
-        {
-            paths
-                .entry(path.clone())
-                .and_modify(|selected| *selected = (*selected).max(version))
-                .or_insert(version);
-        }
-    }
+) -> Result<bool, Status> {
+    let paths = journal_source_paths(
+        definition.tenant_id,
+        definition.bucket_id,
+        &definition.stored.path_prefix,
+        page,
+    );
+    let changed = !paths.is_empty();
 
     let mut builder = EngineSegmentBuilder::new(specification, plan).map_err(index_status)?;
     for (path, fallback_version) in paths {
@@ -623,7 +720,49 @@ async fn process_journal_page(
         )
         .await?;
     }
-    flush_builder(definition, kind, builder, candidate, dependencies).await
+    flush_builder(definition, kind, builder, candidate, dependencies).await?;
+    Ok(changed)
+}
+
+fn journal_source_paths(
+    tenant_id: u64,
+    bucket_id: u64,
+    path_prefix: &str,
+    page: &IndexJournalPage,
+) -> BTreeMap<String, u64> {
+    let mut paths = BTreeMap::<String, u64>::new();
+    for entry in &page.changes {
+        let (change_tenant_id, change_bucket_id, path, version) = match &entry.change {
+            LocalChange::ObjectHead(change) => (
+                change.tenant_id,
+                change.bucket_id,
+                &change.exact_path,
+                change.path_version.0,
+            ),
+            LocalChange::RetainedVersionDeleted(change) => (
+                change.tenant_id,
+                change.bucket_id,
+                &change.exact_path,
+                change
+                    .resulting_head_version
+                    .unwrap_or(change.deleted_version)
+                    .0,
+            ),
+            LocalChange::AggregateChanged(_) | LocalChange::ContentLifecycleChanged(_) => continue,
+            _ => continue,
+        };
+        if change_tenant_id == tenant_id
+            && change_bucket_id == bucket_id
+            && path_matches_prefix(path, path_prefix)
+            && !contains_reserved_segment(path)
+        {
+            paths
+                .entry(path.clone())
+                .and_modify(|selected| *selected = (*selected).max(version))
+                .or_insert(version);
+        }
+    }
+    paths
 }
 
 async fn load_target_source(
@@ -945,19 +1084,63 @@ async fn publish_candidate(
         monotonic_counter.anvil_index_publication_cas_total = 1_u64,
         "index generation published"
     );
-    if let Err(error) = dependencies
+    collect_obsolete_generation_artifacts(
+        definition,
+        kind,
+        &published,
+        dependencies,
+        "publication",
+    )
+    .await;
+    Ok(BuildProgress::Published)
+}
+
+async fn collect_obsolete_generation_artifacts(
+    definition: &CatalogDefinition,
+    kind: IndexKind,
+    current: &PublishedGeneration,
+    dependencies: &IndexBuilderDependencies,
+    trigger: &'static str,
+) {
+    match dependencies
         .retention
         .collect(
             &definition.stored,
             definition.tenant_id,
             definition.bucket_id,
-            &published,
+            current,
         )
         .await
     {
-        tracing::warn!(index.kind = ?kind, %error, "obsolete index cleanup deferred");
+        Ok(deleted) if deleted > 0 && trigger == "periodic" => {
+            tracing::info!(
+                index.id = definition.stored.index_id,
+                index.kind = ?kind,
+                index.cleanup.trigger = trigger,
+                monotonic_counter.anvil_index_retention_artifacts_deleted_total = deleted,
+                "idle obsolete index cleanup completed"
+            );
+        }
+        Ok(deleted) if deleted > 0 => {
+            tracing::info!(
+                index.id = definition.stored.index_id,
+                index.kind = ?kind,
+                index.cleanup.trigger = trigger,
+                monotonic_counter.anvil_index_retention_artifacts_deleted_total = deleted,
+                "obsolete index cleanup completed"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(
+                index.id = definition.stored.index_id,
+                index.kind = ?kind,
+                index.cleanup.trigger = trigger,
+                %error,
+                "obsolete index cleanup deferred"
+            );
+        }
     }
-    Ok(BuildProgress::Published)
 }
 
 fn source_matches_definition(
@@ -1147,7 +1330,14 @@ fn generation_status(error: super::generation::GenerationError) -> Status {
 
 #[cfg(test)]
 mod tests {
+    use anvil_store::{
+        ObjectHeadChange, ObjectHeadChangeKind, PlacementLogId, SourceId, VersionId,
+    };
+
     use super::*;
+    use crate::index_runtime::events::{
+        AtomicProgramWatermark, IndexJournalChange, IndexSourceCursor,
+    };
 
     fn run(sequence: u64, level: u8) -> ManifestRun {
         ManifestRun {
@@ -1167,6 +1357,54 @@ mod tests {
         }
     }
 
+    fn barrier(next_offset: u64) -> IndexBarrier {
+        IndexBarrier {
+            fence: PlacementLogId { term: 3, index: 7 },
+            atomic: AtomicProgramWatermark::new(None, None, 0),
+            sources: [(
+                NodeId(1),
+                IndexSourceCursor {
+                    source: SourceId {
+                        node_id: 1,
+                        source_epoch: [1; 32],
+                    },
+                    next_offset,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        }
+    }
+
+    fn journal_change(
+        tenant_id: u64,
+        bucket_id: u64,
+        path: &str,
+        offset: u64,
+    ) -> IndexJournalChange {
+        IndexJournalChange {
+            node: NodeId(1),
+            change: LocalChange::ObjectHead(ObjectHeadChange {
+                offset,
+                tenant_id,
+                bucket_id,
+                exact_path: path.to_owned(),
+                path_version: VersionId(offset),
+                kind: ObjectHeadChangeKind::Put,
+                reference_deltas: Vec::new(),
+                accounting_transition: None,
+            }),
+        }
+    }
+
+    fn journal_page(changes: Vec<IndexJournalChange>, next_offset: u64) -> IndexJournalPage {
+        IndexJournalPage {
+            changes,
+            through: barrier(next_offset),
+            encoded_bytes: 1,
+        }
+    }
+
     #[test]
     fn compaction_replacement_uses_newest_input_sequence() {
         let inputs = (1..=4).map(|sequence| run(sequence, 0)).collect::<Vec<_>>();
@@ -1180,6 +1418,78 @@ mod tests {
     fn reserved_segment_matching_is_not_a_string_prefix_guess() {
         assert!(contains_reserved_segment("a/_anvil/meta.json"));
         assert!(!contains_reserved_segment("a/_anvilish/meta.json"));
+    }
+
+    #[test]
+    fn reserved_artifact_pages_have_no_generation_source_changes() {
+        let page = journal_page(
+            vec![
+                journal_change(1, 2, "_anvil/indexes/v2/9/current", 11),
+                journal_change(
+                    1,
+                    2,
+                    "_anvil/indexes/v2/9/manifests/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    12,
+                ),
+            ],
+            13,
+        );
+
+        assert!(journal_source_paths(1, 2, "", &page).is_empty());
+    }
+
+    #[test]
+    fn observed_artifact_progress_is_reused_for_the_next_real_mutation() {
+        let published = barrier(10);
+        let observed = ObservedGenerationProgress {
+            current_object_version: VersionId(7),
+            barrier: barrier(13),
+        };
+        let next_target = barrier(14);
+
+        let start = incremental_start(VersionId(7), &published, Some(&observed));
+        assert_eq!(start, &observed.barrier);
+        assert!(barriers_can_advance(start, &next_target));
+        assert_eq!(start.sources[&NodeId(1)].next_offset, 13);
+        assert_eq!(next_target.sources[&NodeId(1)].next_offset, 14);
+
+        let page = journal_page(vec![journal_change(1, 2, "records/real.json", 13)], 14);
+        assert_eq!(
+            journal_source_paths(1, 2, "records/", &page),
+            BTreeMap::from([("records/real.json".to_owned(), 13)])
+        );
+    }
+
+    #[test]
+    fn observed_progress_does_not_cross_a_current_pointer_change() {
+        let published = barrier(20);
+        let observed = ObservedGenerationProgress {
+            current_object_version: VersionId(7),
+            barrier: barrier(24),
+        };
+
+        assert_eq!(
+            incremental_start(VersionId(8), &published, Some(&observed)),
+            &published
+        );
+    }
+
+    #[test]
+    fn retention_retry_rearms_at_the_bounded_interval() {
+        let started = tokio::time::Instant::now();
+        let first_retry = next_retention_retry(started);
+        assert_eq!(
+            first_retry.saturating_duration_since(started),
+            RETENTION_RETRY_INTERVAL
+        );
+        assert!(!retention_retry_due(started, first_retry));
+        assert!(retention_retry_due(first_retry, first_retry));
+
+        let second_retry = next_retention_retry(first_retry);
+        assert_eq!(
+            second_retry.saturating_duration_since(first_retry),
+            RETENTION_RETRY_INTERVAL
+        );
     }
 
     #[test]
