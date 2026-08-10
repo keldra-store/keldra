@@ -25,6 +25,7 @@ rendezvous hashing.
 | Online cluster growth | 0.5.4 | Large objects use complete replicas below the configured erasure width, then move online to the fixed erasure profile as nodes join |
 | Shared public listener | 0.5.5 | Native gRPC, S3, Git, and administrative APIs share one authorized public endpoint; peer mTLS remains isolated |
 | Streaming succinct indexes | 0.6.0 | Bounded per-kind construction memory, incremental immutable runs, streaming compaction, `sux`-based merged structures, and lazy block materialization |
+| Sparse index coordination | 0.7.0 | Non-blocking startup, transactional definition locators, routed change journals, scoped recovery, resumable accounting, and budgeted maintenance |
 | Java client | — | TODO |
 | Python client | — | TODO |
 | Node.js client | — | TODO |
@@ -736,11 +737,9 @@ ANVIL_V06_MAX_ANONYMOUS_GROWTH_BYTES=536870912 \
 The pinned `sux` and Rayon features, resolved versions and license choices are
 recorded in [the index dependency record](docs/dependency-licenses.md).
 
-Anvil 0.6 uses index format 2 and deliberately does not read or migrate 0.5
-index definitions, artifacts, caches, or page tokens. Recreate definitions to
-build new indexes from authoritative source objects. Core 0.4 data still moves
-to the 0.5+ object format by export and import. Current operational boundaries
-are collected in the
+Anvil 0.7 deployments start with new volumes. Index definitions and generated
+artifacts are rebuilt from authoritative source objects rather than migrated
+from earlier releases. Current operational boundaries are collected in the
 [known limitations](docs/known-limitations.md).
 
 Apache-2.0 licensed.
