@@ -1,4 +1,4 @@
-//! Generated Rust types for the Anvil 0.6 gRPC API.
+//! Generated Rust types for the Anvil 0.7 gRPC API.
 
 pub mod v1 {
     tonic::include_proto!("anvil.v1");

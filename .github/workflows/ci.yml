@@ -49,9 +49,9 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-          key: ${{ runner.os }}-cargo-v06-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-v07-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-v06-
+            ${{ runner.os }}-cargo-v07-
 
       - name: Run static release gates
         run: ./scripts/release-gates.sh static
@@ -91,9 +91,9 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-          key: ${{ runner.os }}-cargo-v06-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-v07-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-v06-
+            ${{ runner.os }}-cargo-v07-
 
       - name: Run workspace tests
         run: ./scripts/release-gates.sh rust

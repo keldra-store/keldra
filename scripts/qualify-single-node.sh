@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-requested_image="${ANVIL_IMAGE:-anvil:0.6.1}"
+requested_image="${ANVIL_IMAGE:-anvil:0.7.0}"
 keep="${ANVIL_QUALIFICATION_KEEP:-0}"
 
 case "${ANVIL_DOCKER_PLATFORM:-}" in
@@ -39,16 +39,16 @@ command -v git >/dev/null 2>&1 || {
 image_id="$("${repo_root}/scripts/resolve-docker-image-id.sh" "${requested_image}")"
 server_version="$(docker run --rm --platform "${platform}" "${image_id}" anvil-server --version)"
 client_version="$(docker run --rm --platform "${platform}" "${image_id}" anvil --version)"
-if [[ "${server_version}" != "anvil-server 0.6.1" \
-  || "${client_version}" != "anvil 0.6.1" ]]; then
-  echo "qualification requires the exact Anvil 0.6.1 image" >&2
+if [[ "${server_version}" != "anvil-server 0.7.0" \
+  || "${client_version}" != "anvil 0.7.0" ]]; then
+  echo "qualification requires the exact Anvil 0.7.0 image" >&2
   echo "server: ${server_version}" >&2
   echo "client: ${client_version}" >&2
   exit 2
 fi
-qualification_dir="$(mktemp -d /var/tmp/anvil-v061-single-qualification.XXXXXX)"
+qualification_dir="$(mktemp -d /var/tmp/anvil-v070-single-qualification.XXXXXX)"
 qualification_suffix="${qualification_dir##*.}"
-container_name="anvil-v061-single-${qualification_suffix}"
+container_name="anvil-v070-single-${qualification_suffix}"
 data_dir="${qualification_dir}/data"
 signing_key="${qualification_dir}/token-signing-key"
 container_started=0
@@ -71,7 +71,7 @@ cleanup() {
   if ((container_started == 1)); then
     docker rm --force "${container_name}" >/dev/null 2>&1 || true
   fi
-  if [[ "${qualification_dir}" == /var/tmp/anvil-v061-single-qualification.* ]]; then
+  if [[ "${qualification_dir}" == /var/tmp/anvil-v070-single-qualification.* ]]; then
     docker run --rm --user 0 \
       --volume "${qualification_dir}:/qualification" \
       "${image_id}" rm -rf \

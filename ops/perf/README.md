@@ -1,6 +1,6 @@
-# Anvil 0.6 OSV import qualification
+# Anvil 0.7 OSV import qualification
 
-`anvil-osv-qualification` measures a deterministic OSV import over Anvil 0.6
+`anvil-osv-qualification` measures a deterministic OSV import over Anvil 0.7
 `BulkWrite`. It never invokes an atomic program and it does not create a raw
 object plus mutable head for every input document.
 

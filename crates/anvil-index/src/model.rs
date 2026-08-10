@@ -87,7 +87,7 @@ impl SegmentMemoryPlan {
     }
 }
 
-/// The eight index capabilities supported by Anvil 0.6.
+/// The eight index capabilities supported by Anvil 0.7.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 #[serde(rename_all = "snake_case")]

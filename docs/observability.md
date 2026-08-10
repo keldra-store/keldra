@@ -1,4 +1,4 @@
-# Anvil 0.6 observability
+# Anvil 0.7 observability
 
 Anvil always writes its structured `tracing` logs to stdout. OTLP export is an
 optional startup setting and carries metrics and traces only; logs remain on
@@ -28,7 +28,7 @@ API.
 Metrics and traces share these resource attributes:
 
 - `service.name=anvil`
-- `service.version=0.6.1`
+- `service.version=0.7.0`
 - `node.id=<ANVIL_NODE_ID>`
 
 Trace export uses a dedicated worker with a 2,048-span queue and batches of at
@@ -55,7 +55,7 @@ needed to join a single invocation's work; caller-selected invocation IDs,
 opaque program input, paths, and object payload bytes are never span fields or
 events.
 
-The Anvil 0.6 process metric vocabulary covers:
+The Anvil 0.7 process metric vocabulary covers:
 
 - executor nomination count;
 - atomic-program invocation counts, total and combined preparation latency,

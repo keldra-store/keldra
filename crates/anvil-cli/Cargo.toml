@@ -2,7 +2,7 @@
 name = "anvil-storage-cli"
 version.workspace = true
 edition.workspace = true
-description = "Command-line client for Anvil 0.6"
+description = "Command-line client for Anvil 0.7"
 rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true

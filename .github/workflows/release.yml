@@ -59,7 +59,7 @@ jobs:
           printf 'tag=%s\ncommit=%s\n' "$tag" "$commit" >>"$GITHUB_OUTPUT"
 
   validate:
-    name: Validate Anvil 0.6 release
+    name: Validate Anvil 0.7 release
     needs: release-context
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -99,9 +99,9 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-          key: ${{ runner.os }}-release-cargo-v06-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-release-cargo-v07-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-release-cargo-v06-
+            ${{ runner.os }}-release-cargo-v07-
 
       - name: Run static gates
         run: ./scripts/release-gates.sh static
@@ -210,7 +210,7 @@ jobs:
           fi
 
   publish:
-    name: Publish Anvil 0.6 image and release
+    name: Publish Anvil 0.7 image and release
     needs: [release-context, validate, build-image]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -298,9 +298,9 @@ jobs:
           generate_release_notes: true
           make_latest: true
           body: |
-            Anvil 0.6.1 fixes OTLP/HTTP signal routing: a configured collector
-            base URL now exports metrics to `/v1/metrics` and traces to
-            `/v1/traces`.
+            Anvil 0.7.0 replaces corpus-wide index discovery and recovery with
+            sparse transactional definition state, routed source-journal
+            changes, bounded scoped recovery, and non-blocking service startup.
 
             - Image: `${{ steps.image.outputs.image }}`
             - Manifest digest: `${{ steps.image.outputs.digest }}`

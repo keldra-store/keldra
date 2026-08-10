@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing 0.6 release tag to publish
+        description: Existing 0.7 release tag to publish
         required: true
         type: string
       expected_commit:
@@ -89,7 +89,7 @@ jobs:
           )"
           required_jobs=(
             'Resolve immutable release context'
-            'Validate Anvil 0.6 release'
+            'Validate Anvil 0.7 release'
             'Build release image (linux/amd64)'
             'Build release image (linux/arm64)'
           )
@@ -146,9 +146,9 @@ jobs:
           generate_release_notes: true
           make_latest: true
           body: |
-            Anvil 0.6.1 fixes OTLP/HTTP signal routing: a configured collector
-            base URL now exports metrics to `/v1/metrics` and traces to
-            `/v1/traces`.
+            Anvil 0.7.0 replaces corpus-wide index discovery and recovery with
+            sparse transactional definition state, routed source-journal
+            changes, bounded scoped recovery, and non-blocking service startup.
 
             - Image: `${{ steps.image.outputs.image }}`
             - Manifest digest: `${{ steps.image.outputs.digest }}`

@@ -34,17 +34,17 @@ static_gates() {
 
 rust_gates() {
   local test_threads="${ANVIL_RUST_TEST_THREADS:-4}"
-  run_step "Anvil 0.6 workspace Clippy" cargo clippy --locked --workspace \
+  run_step "Anvil 0.7 workspace Clippy" cargo clippy --locked --workspace \
     --all-targets \
     --no-deps
-  run_step "Anvil 0.6 workspace tests" cargo test --locked --workspace --all-targets -- \
+  run_step "Anvil 0.7 workspace tests" cargo test --locked --workspace --all-targets -- \
     --nocapture \
     --test-threads="${test_threads}"
 }
 
 server_gates() {
   local test_threads="${ANVIL_RUST_TEST_THREADS:-4}"
-  run_step "Anvil 0.6 server, client, and CLI tests" cargo test --locked \
+  run_step "Anvil 0.7 server, client, and CLI tests" cargo test --locked \
     -p anvil-server \
     -p anvil-storage \
     -p anvil-storage-cli \
@@ -64,7 +64,7 @@ image_gates() (
   local scratch
   scratch="$(mktemp -d)"
   chmod 0755 "${scratch}"
-  local container="anvil-v06-smoke-${$}"
+  local container="anvil-v07-smoke-${$}"
   cleanup_image_gate() {
     docker rm --force "${container}" >/dev/null 2>&1 || true
     docker run --rm --user 0 --volume "${scratch}:/smoke" "${image}" \
@@ -79,7 +79,7 @@ image_gates() (
   chmod 0600 "${scratch}/signing-key"
   docker run --rm --user 0 --volume "${scratch}:/smoke" "${image}" \
     chown 10001:10001 /smoke/signing-key
-  printf 'anvil-0.6-smoke\n' >"${scratch}/payload"
+  printf 'anvil-0.7-smoke\n' >"${scratch}/payload"
   chmod 0444 "${scratch}/payload"
   docker run --detach --name "${container}" \
     --env ANVIL_LISTEN=0.0.0.0:50051 \
@@ -151,7 +151,7 @@ image_gates() (
       anvil --endpoint http://127.0.0.1:50051 \
       get smoke objects hello
   )"
-  if [[ "${value}" != 'anvil-0.6-smoke' ]]; then
+  if [[ "${value}" != 'anvil-0.7-smoke' ]]; then
     echo "image smoke read returned unexpected bytes" >&2
     return 1
   fi

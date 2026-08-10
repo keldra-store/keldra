@@ -2,7 +2,7 @@
 name = "anvil-server"
 version.workspace = true
 edition.workspace = true
-description = "The Anvil 0.6 object server"
+description = "The Anvil 0.7 object server"
 rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
