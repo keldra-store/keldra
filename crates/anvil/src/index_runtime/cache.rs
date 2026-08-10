@@ -325,7 +325,7 @@ impl IndexCache {
     async fn materialize(&self, id: IndexSegmentId) -> Result<Arc<Mmap>, IndexCacheError> {
         loop {
             if let Some(mapped) = self.cached(id)? {
-                tracing::info!(
+                tracing::debug!(
                     monotonic_counter.anvil_index_cache_hits_total = 1_u64,
                     monotonic_counter.anvil_index_cache_hit_bytes_total = id.length,
                     "index cache hit"
@@ -445,9 +445,11 @@ impl IndexCache {
             entry.mapped.clone()
         });
         let disk_evicted = evict_unpinned_disk(&mut state, self.inner.config.disk_bytes);
-        let snapshot = cache_snapshot(&state);
+        let snapshot = (disk_evicted != 0).then(|| cache_snapshot(&state));
         drop(state);
-        emit_cache_snapshot(snapshot);
+        if let Some(snapshot) = snapshot {
+            emit_cache_snapshot(snapshot);
+        }
         if disk_evicted != 0 {
             tracing::info!(
                 monotonic_counter.anvil_index_cache_eviction_bytes_total = disk_evicted,
@@ -670,16 +672,12 @@ fn cache_snapshot(state: &CacheState) -> CacheSnapshot {
     CacheSnapshot {
         disk_bytes: state.disk_bytes,
         in_flight_bytes: state.in_flight_bytes,
-        open_mappings: state
-            .entries
-            .values()
-            .filter(|entry| Arc::strong_count(&entry.mapped) > 1)
-            .count() as u64,
+        open_mappings: state.entries.len() as u64,
     }
 }
 
 fn emit_cache_snapshot(snapshot: CacheSnapshot) {
-    tracing::info!(
+    tracing::debug!(
         gauge.anvil_index_cache_disk_bytes = snapshot.disk_bytes,
         gauge.anvil_index_cache_memory_bytes = 0_u64,
         gauge.anvil_index_cache_fetch_in_flight_bytes = snapshot.in_flight_bytes,
