@@ -400,10 +400,19 @@ boundary without a cluster-wide frozen snapshot:
 8. publish only when membership, source identities, source positions, and the
    atomic watermark form one complete barrier.
 
-The scan API uses stable `(tenant_id, bucket_id, path)` ordering and a
-snapshot-bound opaque cursor. It returns only relevant head versions, not
+The index scan API uses stable `(tenant_id, bucket_id, path)` ordering and a
+snapshot-bound opaque cursor. It returns only current head versions, not
 mutation receipts. A held RocksDB snapshot prevents later pages from changing
 beneath the scan.
+
+Accounting must include every retained payload version when bucket versioning
+is enabled. Its scoped snapshot stream is therefore independently paged in
+stable `(tenant_id, bucket_id, path, version)` order. Each frame carries one
+version descriptor plus the small current-head state needed to count the path
+as one live object. It never materializes all retained versions of one path in
+a `Vec`: one path with millions of versions must obey the same frame and memory
+limits as millions of paths. Unversioned buckets naturally expose only the
+current retained descriptor through this stream.
 
 A large scan uses a per-frame inactivity deadline. It has no wall-clock deadline
 proportional to total corpus size. Membership or source-epoch change cancels the
@@ -436,6 +445,55 @@ The preceding rollup remains available with stale freshness until replacement.
 Normal accounting work is `O(relevant changes)`. First build and gap recovery
 are `O(objects in the explicitly configured scope)`. Unrelated tenants and
 buckets cost zero.
+
+### 11.1 Ingress traffic matching
+
+Stored-byte and object-count accounting is derived from authoritative object
+state and routed journal evidence and remains exact at a reported complete
+barrier. Inbound and outbound byte accounting is deliberately bounded
+best-effort usage telemetry; it is not a financial-ledger guarantee.
+
+An arbitrary public ingress must not hold every accounting definition merely to
+match one request path. Weighted HRW therefore derives one **accounting matcher**
+for each stable numeric `(tenant_id, bucket_id)` from committed ACTIVE
+membership. The assignment is disposable and never enters Raft.
+
+Each ingress:
+
+1. records completed public ingress/egress byte deltas as bounded entries keyed
+   by stable bucket IDs and exact path;
+2. groups entries into bounded batches with one stable retry identity;
+3. sends each batch to that bucket's current matcher over the authenticated peer
+   path; and
+4. retains it for bounded retry until the matcher acknowledges it or the local
+   process loses its disposable queue.
+
+The matcher lazily prefix-loads only that bucket's ordinary accounting
+definitions, follows sparse accounting-definition changes for the bucket, and
+evicts idle bucket match state under a shared bound. It applies segment-aware
+path-prefix matching once, aggregates by definition, and uses the existing
+idempotent per-definition traffic-source publication path to the definition's
+rank-zero worker. A membership change causes the ingress to rederive and retry
+against the new matcher. Duplicate batch delivery cannot double count because
+the stable batch identity derives stable per-definition flush identities.
+
+This adds no authoritative traffic log, per-bucket Raft record, global
+definition catalogue, or durable matcher assignment. The accepted consequence
+is that a small amount of traffic may be absent from reported bandwidth during:
+
+- ingress process failure before an in-memory batch is acknowledged;
+- bounded queue exhaustion under sustained overload; or
+- the short interval while an enable, disable, or matcher reassignment reaches
+  the disposable bucket cache.
+
+Those windows affect bandwidth totals only. They never alter stored-byte,
+object-count, object, reference, authorization, or index correctness. Anvil
+exports dropped batch and byte counts, pending bytes, oldest pending age,
+matcher retries, cache generation/age, and definition-propagation lag. Queue
+exhaustion is never silent. Release qualification must show zero drops under the
+supported production-shaped workload; deployments requiring legally exact
+network billing need an external request ledger rather than treating this
+telemetry as one.
 
 ## 12. Builder memory, immutable runs, and compaction
 
@@ -668,6 +726,8 @@ OTLP metrics and traces expose, without payloads or mutable names:
 - configured, leased, peak, and waiting construction bytes by kind;
 - builder flushes, run levels, compaction input/output, and publication CAS;
 - accounting rollup age and source lag;
+- accounting traffic pending/dropped batches and bytes, oldest pending age,
+  matcher retries, bucket-cache age, and definition-propagation lag;
 - maintenance cursor, candidates, records, bytes, lock time, and unlink time;
 - cache hits, misses, lazy validations, refetches, and evictions; and
 - query latency, fetched blocks, candidates, stale rejections, and authorization
@@ -715,8 +775,14 @@ credentials, tokens, or proprietary path names.
 - Accounting resumes the persisted rollup cursor after restart and does not run
   a baseline.
 - A mutation racing the last baseline page appears exactly once after catch-up.
+- A single path with more retained versions than one page is counted through
+  `(path, version)` cursors without a corpus-sized allocation.
 - Large scoped baselines continue while frames make progress beyond the former
   fixed total deadline.
+- Traffic entering through every node reaches the derived bucket matcher,
+  overlapping accounting prefixes receive one idempotent delta each, retries do
+  not double count, matcher failover drains pending batches, and supported-load
+  qualification reports zero dropped batches/bytes.
 
 ### 21.4 Maintenance and cache tests
 
