@@ -44,7 +44,7 @@ repository are required.
 ### 1. Start a development node
 
 ```sh
-export ANVIL_IMAGE=ghcr.io/worka-ai/anvil:0.6.0
+export ANVIL_IMAGE=ghcr.io/worka-ai/anvil:0.6.1
 export ANVIL_TOKEN_SIGNING_KEY_FILE="$PWD/anvil-data/token-signing-key"
 
 mkdir -p anvil-data
@@ -637,7 +637,7 @@ bundles, establishes peer mTLS, exercises replicated and erasure-coded storage,
 queries every index type, and performs a rolling restart:
 
 ```sh
-ANVIL_IMAGE=ghcr.io/worka-ai/anvil:0.6.0 \
+ANVIL_IMAGE=ghcr.io/worka-ai/anvil:0.6.1 \
   ./scripts/qualify-three-node.sh
 ```
 

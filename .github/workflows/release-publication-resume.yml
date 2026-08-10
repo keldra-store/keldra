@@ -146,12 +146,9 @@ jobs:
           generate_release_notes: true
           make_latest: true
           body: |
-            Anvil 0.6.0 replaces corpus-sized index rebuilds with bounded
-            streaming immutable runs, `sux`-based merged structures, lazy
-            materialization, and one shared memory budget per index kind.
-
-            Index format 2 is a clean break: existing source objects remain
-            authoritative, while index definitions are recreated and rebuilt.
+            Anvil 0.6.1 fixes OTLP/HTTP signal routing: a configured collector
+            base URL now exports metrics to `/v1/metrics` and traces to
+            `/v1/traces`.
 
             - Image: `${{ steps.image.outputs.image }}`
             - Manifest digest: `${{ steps.image.outputs.digest }}`

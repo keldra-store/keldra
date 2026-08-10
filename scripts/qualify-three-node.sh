@@ -4,7 +4,7 @@ set -Eeuo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 compose_file="${repo_root}/tests/cluster/docker-compose.yml"
 start_node="${repo_root}/tests/cluster/start-node.sh"
-requested_image="${ANVIL_IMAGE:-anvil:0.6.0}"
+requested_image="${ANVIL_IMAGE:-anvil:0.6.1}"
 
 case "${ANVIL_DOCKER_PLATFORM:-}" in
   "")
@@ -47,16 +47,16 @@ client_version="$(
   docker run --rm --platform "${ANVIL_DOCKER_PLATFORM}" \
     "${image_id}" anvil --version
 )"
-if [[ "${server_version}" != "anvil-server 0.6.0" \
-  || "${client_version}" != "anvil 0.6.0" ]]; then
-  echo "qualification requires the exact Anvil 0.6.0 image" >&2
+if [[ "${server_version}" != "anvil-server 0.6.1" \
+  || "${client_version}" != "anvil 0.6.1" ]]; then
+  echo "qualification requires the exact Anvil 0.6.1 image" >&2
   echo "server: ${server_version}" >&2
   echo "client: ${client_version}" >&2
   exit 2
 fi
 export ANVIL_IMAGE="${image_id}"
-export ANVIL_QUALIFICATION_PROJECT="${ANVIL_QUALIFICATION_PROJECT:-anvil-v060-${$}}"
-export ANVIL_QUALIFICATION_DIR="$(mktemp -d /var/tmp/anvil-v060-qualification.XXXXXX)"
+export ANVIL_QUALIFICATION_PROJECT="${ANVIL_QUALIFICATION_PROJECT:-anvil-v061-${$}}"
+export ANVIL_QUALIFICATION_DIR="$(mktemp -d /var/tmp/anvil-v061-qualification.XXXXXX)"
 export ANVIL_QUALIFICATION_START_NODE="${start_node}"
 keep="${ANVIL_QUALIFICATION_KEEP:-0}"
 
@@ -96,7 +96,7 @@ cleanup() {
     echo "[anvil-qualification] retained files ${ANVIL_QUALIFICATION_DIR}" >&2
   else
     compose down --volumes --remove-orphans >/dev/null 2>&1 || true
-    if [[ "${ANVIL_QUALIFICATION_DIR}" == /var/tmp/anvil-v060-qualification.* ]]; then
+    if [[ "${ANVIL_QUALIFICATION_DIR}" == /var/tmp/anvil-v061-qualification.* ]]; then
       docker run --rm --user 0 \
         --volume "${ANVIL_QUALIFICATION_DIR}:/qualification" \
         "${image_id}" rm -rf \
