@@ -7,7 +7,7 @@ keep="${ANVIL_QUALIFICATION_KEEP:-0}"
 qualification_mode="${ANVIL_QUALIFICATION_MODE:-smoke}"
 index_disk_cache_bytes="${ANVIL_QUALIFICATION_INDEX_DISK_CACHE_BYTES:-268435456}"
 index_memory_percent="${ANVIL_QUALIFICATION_INDEX_MEMORY_PERCENT:-5}"
-index_kind_budget_bytes="${ANVIL_QUALIFICATION_INDEX_KIND_BUDGET_BYTES:-33554432}"
+index_kind_budget_bytes="${ANVIL_QUALIFICATION_INDEX_KIND_BUDGET_BYTES:-67108864}"
 index_rayon_workers="${ANVIL_QUALIFICATION_INDEX_RAYON_WORKERS:-2}"
 # The default is a fast smoke. Set this to 839980 for the full
 # production-shaped, twelve-field corpus used by the resource qualification.

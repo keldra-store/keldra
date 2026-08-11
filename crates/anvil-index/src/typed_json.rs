@@ -15,7 +15,7 @@ use crate::run::{
 use crate::segment::{
     DEFAULT_COMPONENT_BLOCK_BYTES, DocumentComponentWriter, DocumentRecord, DocumentState,
     MutationBuffer, PATH_CHANGES_TAG, PathChange, PathComponentWriter, PathRunCursor,
-    document_by_ordinal, is_latest_live, path_change_in_tree,
+    document_by_ordinal, is_latest_live,
 };
 use crate::succinct::{decode_elias_fano_with_budget, encode_elias_fano};
 use crate::{
@@ -29,6 +29,14 @@ const KEYS_TAG: u8 = 21;
 #[path = "typed_json/query.rs"]
 mod query;
 use query::query_typed;
+
+#[path = "typed_json/compaction_cache.rs"]
+mod compaction_cache;
+use compaction_cache::CompactionPointCache;
+
+#[cfg(test)]
+#[path = "typed_json/compaction_cache_tests.rs"]
+mod compaction_cache_tests;
 
 macro_rules! builder_state {
     () => {
@@ -565,7 +573,7 @@ impl TypedPayload {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct TypedRow {
     ordinal: u64,
     payload: TypedPayload,
@@ -898,6 +906,7 @@ where
     let mut paths = PathComponentWriter::new(kind, output_level, target_block_bytes);
     let mut documents = DocumentComponentWriter::new(kind, output_level, target_block_bytes);
     let mut typed = TypedComponentWriter::new(kind, output_level, target_block_bytes);
+    let mut point_cache = CompactionPointCache::default();
     let mut mutation_count = 0u64;
     let mut live = 0u64;
     let mut minimum_version = u64::MAX;
@@ -935,12 +944,14 @@ where
             let old_ordinal = winner
                 .document_ordinal
                 .ok_or(IndexError::InvalidFormat("live typed row has no ordinal"))?;
-            let source_document =
-                document_by_ordinal(&runs[winner_run], &views[winner_run], old_ordinal).await?;
+            let source_document = point_cache
+                .document(&runs[winner_run], &views[winner_run], old_ordinal)
+                .await?;
             if source_document != winner.document {
                 return Err(IndexError::InvalidFormat("typed document mismatch"));
             }
-            let payload = typed_row(&runs[winner_run], &views[winner_run], old_ordinal)
+            let payload = point_cache
+                .typed(&runs[winner_run], &views[winner_run], old_ordinal)
                 .await?
                 .payload;
             let ordinal = live;
@@ -969,12 +980,15 @@ where
             "typed compaction produced no changes".into(),
         ));
     }
+    drop(current);
+    drop(cursors);
     let path_tree = paths.finish(sink).await?;
     let path_root = path_tree.root.clone();
     let mut components = vec![path_tree];
     if live > 0 {
         components.push(documents.finish(sink).await?);
         components.push(typed.finish(sink).await?);
+        drop(point_cache);
         if let Some(tree) = merge_typed_keys(
             runs,
             &views,
@@ -1015,6 +1029,7 @@ where
     D: IndexDirectoryRead,
     S: IndexBlockSink + IndexDirectoryRead,
 {
+    let mut point_cache = CompactionPointCache::default();
     let mut cursors = runs
         .iter()
         .zip(views)
@@ -1052,7 +1067,9 @@ where
                     continue;
                 };
                 documents[run_index] = Some(
-                    document_by_ordinal(&runs[run_index], &views[run_index], row.ordinal).await?,
+                    point_cache
+                        .document(&runs[run_index], &views[run_index], row.ordinal)
+                        .await?,
                 );
             }
             let path = documents
@@ -1091,7 +1108,7 @@ where
                         .await?;
                 }
             }
-            let Some(output) = path_change_in_tree(&*sink, output_path_root, &path).await? else {
+            let Some(output) = point_cache.path(&*sink, output_path_root, &path).await? else {
                 return Err(IndexError::InvalidFormat(
                     "compacted path missing from staged output",
                 ));

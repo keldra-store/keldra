@@ -33,13 +33,14 @@ pub const MAX_INDEX_ROUTING_WORKSPACE_BYTES: usize =
         + 4
         + MAX_RUN_COMPONENTS * (8 + MAX_DESCRIPTOR_ENCODED_BYTES);
 /// One bounded row batch, codec input/output arrays, one move-only emitted
-/// object, and the four encoded-plus-decoded input blocks retained by
-/// compaction. Engine-specific derived state is charged separately at no more
-/// than its admitted resident mutation bytes.
+/// object, and the nine encoded-plus-decoded leaves retained by four-way
+/// compaction: four sequential cursor leaves plus four point-read input leaves
+/// and one staged-output point leaf. Engine-specific derived state is charged
+/// separately at no more than its admitted resident mutation bytes.
 pub const FIXED_INDEX_SEAL_WORKSPACE_BYTES: usize = MAX_INDEX_ROUTING_WORKSPACE_BYTES
     + 5 * MAX_INDEX_BLOCK_BYTES
-    + 4 * (MAX_INDEX_BLOCK_BYTES + MAX_INDEX_DECODED_BLOCK_BYTES);
-pub const MIN_INDEX_KIND_MEMORY_BYTES: usize = 32 * 1024 * 1024;
+    + 9 * (MAX_INDEX_BLOCK_BYTES + MAX_INDEX_DECODED_BLOCK_BYTES);
+pub const MIN_INDEX_KIND_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 
 /// Conservative partition of one process-wide per-kind construction budget.
 /// At seal time the resident mutations remain live, derived engine state may
@@ -245,7 +246,7 @@ mod tests {
     fn fixed_routing_objects_fit_the_block_ceiling() {
         assert!(MAX_INDEX_ROUTING_BLOCK_BYTES <= MAX_INDEX_BLOCK_BYTES);
         assert!(FIXED_INDEX_SEAL_WORKSPACE_BYTES < MIN_INDEX_KIND_MEMORY_BYTES);
-        assert_eq!(4 * MAX_INDEX_DECODED_BLOCK_BYTES, 16 * 1024 * 1024);
+        assert_eq!(9 * MAX_INDEX_DECODED_BLOCK_BYTES, 36 * 1024 * 1024);
     }
 
     #[test]
