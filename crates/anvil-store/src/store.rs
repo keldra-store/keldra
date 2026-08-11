@@ -6,7 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anvil_atomic_program::{LocalLockManager, ObjectPath};
 use anyhow::{Context, Result};
 use rocksdb::{
-    ColumnFamilyDescriptor, DB, Direction, IteratorMode, Options, WriteBatch, WriteOptions,
+    BlockBasedOptions, Cache, ColumnFamilyDescriptor, DB, DEFAULT_COLUMN_FAMILY_NAME, Direction,
+    IteratorMode, Options, WriteBatch, WriteBufferManager, WriteOptions,
 };
 use serde::{Deserialize, Serialize};
 
@@ -35,6 +36,25 @@ use crate::{
 
 const PROGRAM_DEFINITION_PREFIX: &str = "_anvil/programs/";
 const DEFINITION_ASSIGNMENT_NOTIFICATION_CAPACITY: usize = 64;
+
+// RocksDB otherwise allocates one 64 MiB write buffer and one independent
+// block cache per column family. Anvil's metadata workload writes several
+// families together, so those defaults multiply native memory without buying
+// useful locality. These process-local resources are shared by every metadata
+// column family, including RocksDB's unused default family:
+//
+// - 64 MiB keeps frequently-read table blocks warm without one cache per CF;
+// - 128 MiB bounds all mutable and immutable memtables and stalls writers when
+//   flush pressure reaches that soft limit; and
+// - 16 MiB per memtable lets eight active families share the global allowance
+//   before the manager must flush, while avoiding the default 64 MiB per CF.
+//
+// The two dominant configurable native pools therefore total 192 MiB. This
+// leaves 320 MiB of the 512 MiB qualification allowance for table readers,
+// compaction buffers, allocator slack, and the rest of the process.
+const METADATA_BLOCK_CACHE_BYTES: usize = 64 * 1024 * 1024;
+const METADATA_WRITE_BUFFER_MANAGER_BYTES: usize = 128 * 1024 * 1024;
+const METADATA_COLUMN_FAMILY_WRITE_BUFFER_BYTES: usize = 16 * 1024 * 1024;
 
 pub(crate) const CF_HEADS: &str = "heads";
 pub(crate) const CF_VERSIONS: &str = "versions";
@@ -86,6 +106,34 @@ pub(crate) const COLUMN_FAMILIES: &[&str] = &[
     CF_DEFINITION_STATE,
     CF_JOURNAL_ROUTES,
 ];
+
+struct MetadataMemoryResources {
+    block_cache: Cache,
+    write_buffer_manager: WriteBufferManager,
+}
+
+impl MetadataMemoryResources {
+    fn new() -> Self {
+        Self {
+            block_cache: Cache::new_lru_cache(METADATA_BLOCK_CACHE_BYTES),
+            write_buffer_manager: WriteBufferManager::new_write_buffer_manager(
+                METADATA_WRITE_BUFFER_MANAGER_BYTES,
+                true,
+            ),
+        }
+    }
+
+    fn column_family_options(&self) -> Options {
+        let mut table = BlockBasedOptions::default();
+        table.set_block_cache(&self.block_cache);
+
+        let mut options = Options::default();
+        options.set_block_based_table_factory(&table);
+        options.set_write_buffer_manager(&self.write_buffer_manager);
+        options.set_write_buffer_size(METADATA_COLUMN_FAMILY_WRITE_BUFFER_BYTES);
+        options
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MutationReceiptRetention {
@@ -242,6 +290,10 @@ impl StoreOptions {
 #[derive(Clone)]
 pub struct Store {
     pub(crate) db: Arc<DB>,
+    // Keep the shared native resources alive for exactly as long as the DB.
+    // RocksDB also retains shared ownership internally; this field makes that
+    // lifetime and the one-resource-per-Store contract explicit.
+    _metadata_memory: Arc<MetadataMemoryResources>,
     pub(crate) blobs: BlobStore,
     pub(crate) clock: Arc<VersionClock>,
     /// Serialises ordinary one-path mutations while their RocksDB batch is
@@ -476,9 +528,10 @@ impl Store {
         let mut db_options = Options::default();
         db_options.create_if_missing(true);
         db_options.create_missing_column_families(true);
-        let descriptors = COLUMN_FAMILIES
-            .iter()
-            .map(|name| ColumnFamilyDescriptor::new(*name, Options::default()))
+        let metadata_memory = Arc::new(MetadataMemoryResources::new());
+        let descriptors = std::iter::once(DEFAULT_COLUMN_FAMILY_NAME)
+            .chain(COLUMN_FAMILIES.iter().copied())
+            .map(|name| ColumnFamilyDescriptor::new(name, metadata_memory.column_family_options()))
             .collect::<Vec<_>>();
         let db = DB::open_cf_descriptors(&db_options, &metadata_path, descriptors)
             .with_context(|| format!("open Anvil metadata at {}", metadata_path.display()))?;
@@ -495,6 +548,7 @@ impl Store {
         let db = Arc::new(db);
         let store = Self {
             db,
+            _metadata_memory: metadata_memory,
             blobs: BlobStore::open(options.root.join("blobs")).await?,
             clock: Arc::new(VersionClock::with_high_watermark(
                 options.node_id,
