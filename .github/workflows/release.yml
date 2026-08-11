@@ -239,6 +239,19 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Verify release tag is still pinned
+        env:
+          RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
+          EXPECTED_COMMIT: ${{ needs.release-context.outputs.commit }}
+        run: |
+          set -euo pipefail
+          git fetch --force --no-tags origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          actual_commit="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
+          if [[ "$actual_commit" != "$EXPECTED_COMMIT" ]]; then
+            echo "release tag moved after validation: ${actual_commit} != ${EXPECTED_COMMIT}" >&2
+            exit 1
+          fi
+
       - name: Publish multi-architecture image
         id: image
         env:
@@ -289,6 +302,19 @@ jobs:
             exit 1
           fi
           printf 'image=%s\ndigest=%s\n' "$final_image" "$digest" >>"$GITHUB_OUTPUT"
+
+      - name: Verify release tag before GitHub publication
+        env:
+          RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
+          EXPECTED_COMMIT: ${{ needs.release-context.outputs.commit }}
+        run: |
+          set -euo pipefail
+          git fetch --force --no-tags origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          actual_commit="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
+          if [[ "$actual_commit" != "$EXPECTED_COMMIT" ]]; then
+            echo "release tag moved during publication: ${actual_commit} != ${EXPECTED_COMMIT}" >&2
+            exit 1
+          fi
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2

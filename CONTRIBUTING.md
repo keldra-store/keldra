@@ -56,6 +56,15 @@ Before a release, repeat the image build and smoke test with
 `ANVIL_DOCKER_PLATFORM=linux/amd64` and `linux/arm64`, using a distinct local
 `ANVIL_IMAGE` tag for each architecture.
 
+Inspect and verify the two publishable crate archives locally before tagging:
+
+```sh
+cargo package --locked -p anvil-api --list
+cargo package --locked -p anvil-storage --list
+cargo package --locked -p anvil-api
+cargo package --locked -p anvil-storage
+```
+
 ## Release
 
 The release tag must be the exact, unprefixed workspace version. After the
@@ -71,6 +80,22 @@ The tag-triggered workflow reruns the static, Rust, and per-architecture image
 gates, then publishes the single multi-architecture image for the repository
 and creates the GitHub release. Do not publish
 public architecture-specific or `v`-prefixed image tags.
+
+Publish the crates from the same validated commit. `anvil-storage` depends on
+the exact `anvil-api` release, so publish and verify the API crate before the
+client crate:
+
+```sh
+cargo publish --locked -p anvil-api
+cargo info anvil-api@0.7.0
+
+cargo publish --locked -p anvil-storage
+cargo info anvil-storage@0.7.0
+```
+
+Do not publish `anvil-storage` until `cargo info anvil-api@0.7.0` resolves from
+crates.io. After both commands succeed, run both `cargo info` checks again and
+confirm that each reports version `0.7.0` from crates.io.
 
 Use Cargo's shared target directory and locking. Do not create ad-hoc target
 directories unless the task explicitly requires isolation.

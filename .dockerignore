@@ -2,6 +2,10 @@
 target/
 .git/
 .idea/
+.env
+**/.env
+.tmp/
+**/.tmp/
 .DS_Store
 **/.DS_Store
 anvil-data/

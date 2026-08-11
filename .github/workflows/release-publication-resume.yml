@@ -31,7 +31,7 @@ concurrency:
 
 jobs:
   publish:
-    name: Resume 0.6 publication from validated image
+    name: Resume 0.7 publication from validated image
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -110,6 +110,15 @@ jobs:
         with:
           ref: ${{ inputs.expected_commit }}
 
+      - name: Download tested release image digests
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+          pattern: anvil-release-digest-*
+          path: ${{ runner.temp }}/anvil-image-digests
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -128,9 +137,42 @@ jobs:
         run: |
           set -euo pipefail
           image="ghcr.io/${GITHUB_REPOSITORY,,}:${RELEASE_TAG}"
+          amd64_digest="$(tr -d '[:space:]' < \
+            "${RUNNER_TEMP}/anvil-image-digests/anvil-release-digest-amd64/anvil-image-digest-amd64.txt")"
+          arm64_digest="$(tr -d '[:space:]' < \
+            "${RUNNER_TEMP}/anvil-image-digests/anvil-release-digest-arm64/anvil-image-digest-arm64.txt")"
+          for digest in "$amd64_digest" "$arm64_digest" "$EXPECTED_IMAGE_DIGEST"; do
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "release evidence did not contain a valid image digest" >&2
+              exit 1
+            fi
+          done
+
+          raw_manifest="$(docker buildx imagetools inspect --raw "$image")"
+          AMD64_DIGEST="$amd64_digest" ARM64_DIGEST="$arm64_digest" python3 -c '
+          import json, os, sys
+          manifest = json.load(sys.stdin)
+          published = sorted(
+              (
+                  "{}/{}".format(
+                      item.get("platform", {}).get("os"),
+                      item.get("platform", {}).get("architecture"),
+                  ),
+                  item.get("digest"),
+              )
+              for item in manifest.get("manifests", [])
+          )
+          expected = sorted(
+              [
+                  ("linux/amd64", os.environ["AMD64_DIGEST"]),
+                  ("linux/arm64", os.environ["ARM64_DIGEST"]),
+              ]
+          )
+          if published != expected:
+              raise SystemExit(f"published platform digests {published!r} != {expected!r}")
+          ' <<<"$raw_manifest"
+
           inspection="$(docker buildx imagetools inspect "$image")"
-          grep -q 'linux/amd64' <<<"$inspection"
-          grep -q 'linux/arm64' <<<"$inspection"
           digest="$(awk '$1 == "Digest:" { print $2; exit }' <<<"$inspection")"
           if [[ "$digest" != "$EXPECTED_IMAGE_DIGEST" ]]; then
             echo "published image digest does not match validation evidence" >&2

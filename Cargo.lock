@@ -167,7 +167,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-api"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "prost",
  "prost-types",
@@ -178,7 +178,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-atomic-program"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "blake3",
  "serde",
@@ -189,7 +189,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-authz"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -197,7 +197,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-consensus"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "bincode",
  "hyper-util",
@@ -219,7 +219,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-index"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "blake3",
  "serde",
@@ -231,7 +231,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-osv-qualification"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "anvil-api",
  "anyhow",
@@ -251,7 +251,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-server"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "aes-gcm",
  "anvil-api",
@@ -312,7 +312,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-storage"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "anvil-api",
  "tokio",
@@ -322,7 +322,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-storage-cli"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "anvil-storage",
  "anyhow",
@@ -338,7 +338,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-store"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "anvil-atomic-program",
  "anvil-authz",
@@ -357,6 +357,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
