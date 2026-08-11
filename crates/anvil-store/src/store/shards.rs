@@ -661,9 +661,18 @@ mod tests {
             .unwrap()
             .updated_at;
 
-        assert_eq!(store.collect_blob_garbage_at(updated_at + 999).unwrap(), 0);
         assert_eq!(
-            store.collect_blob_garbage_at(updated_at + 1_000).unwrap(),
+            store
+                .collect_blob_garbage_at(updated_at + 999)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .collect_blob_garbage_at(updated_at + 1_000)
+                .await
+                .unwrap(),
             1
         );
         assert!(store.shard_reference_state(&identity).unwrap().is_none());

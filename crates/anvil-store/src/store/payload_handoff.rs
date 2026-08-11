@@ -654,13 +654,17 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(
-            store.collect_blob_garbage_at(retired.updated_at).unwrap(),
+            store
+                .collect_blob_garbage_at(retired.updated_at)
+                .await
+                .unwrap(),
             0
         );
         assert!(store.contains_blob(&reference).await.unwrap());
         assert_eq!(
             store
                 .collect_blob_garbage_at(retired.updated_at + 1_000)
+                .await
                 .unwrap(),
             1
         );

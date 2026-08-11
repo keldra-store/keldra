@@ -1,4 +1,5 @@
 use super::*;
+use crate::{BlobGcBudget, BlobGcCursor};
 
 #[test]
 fn blob_reference_state_is_exactly_twenty_five_bytes() {
@@ -103,7 +104,7 @@ async fn streamed_seal_finishes_byte_plane_io_before_waiting_for_commit_fence() 
 }
 
 #[tokio::test]
-async fn streamed_seal_fails_cleanly_when_gc_wins_before_reservation() {
+async fn concurrent_seal_refresh_prevents_a_selected_blob_from_being_collected() {
     let temporary = tempfile::tempdir().unwrap();
     let store =
         Store::open(StoreOptions::new(temporary.path(), 1).with_awaiting_publish_ttl_seconds(1))
@@ -129,7 +130,10 @@ async fn streamed_seal_fails_cleanly_when_gc_wins_before_reservation() {
 
     let mut upload = store.begin_blob_upload().await.unwrap();
     upload.write(&bytes).await.unwrap();
-    let commit_guard = store.commit_lock.lock().await;
+    // GC may discover this exact zero-reference state without holding the
+    // commit fence. A concurrent seal that refreshes the lifecycle record must
+    // win the exact reread and keep the bytes reachable.
+    let selected = retired;
     let sealing_store = store.clone();
     let sealing = tokio::spawn(async move { sealing_store.seal_blob_upload(upload).await });
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -147,20 +151,21 @@ async fn streamed_seal_fails_cleanly_when_gc_wins_before_reservation() {
     .await
     .expect("physical deduplication must finish before seal waits for the commit fence");
 
-    assert_eq!(
-        store
-            .collect_blob_garbage_at(retired.updated_at + store.awaiting_publish_ttl_millis)
-            .unwrap(),
-        1
+    assert_eq!(sealing.await.unwrap().unwrap(), blob);
+    assert!(
+        !store
+            .remove_blob_gc_reference_if_unchanged(
+                &blob_reference_key(&blob),
+                selected,
+                selected.updated_at + store.awaiting_publish_ttl_millis,
+            )
+            .await
+            .unwrap()
     );
-    drop(commit_guard);
-
-    assert_eq!(
-        sealing.await.unwrap().unwrap_err(),
-        MutationError::BlobNotFound
-    );
-    assert!(store.blob_reference_state(&blob).unwrap().is_none());
-    assert!(!store.contains_blob(&blob).await.unwrap());
+    let refreshed = store.blob_reference_state(&blob).unwrap().unwrap();
+    assert_eq!(refreshed.ref_count, 1);
+    assert_eq!(refreshed.flags, AWAITING_PUBLISH);
+    assert!(store.contains_blob(&blob).await.unwrap());
 }
 
 #[tokio::test]
@@ -268,6 +273,7 @@ async fn retirement_reaches_zero_but_gc_waits_for_the_inactivity_ttl() {
     assert_eq!(
         store
             .collect_blob_garbage_at(retired.updated_at + store.awaiting_publish_ttl_millis - 1,)
+            .await
             .unwrap(),
         0
     );
@@ -275,11 +281,55 @@ async fn retirement_reaches_zero_but_gc_waits_for_the_inactivity_ttl() {
     assert_eq!(
         store
             .collect_blob_garbage_at(retired.updated_at + store.awaiting_publish_ttl_millis,)
+            .await
             .unwrap(),
         1
     );
     assert!(store.blob_reference_state(&blob).unwrap().is_none());
     assert!(!store.contains_blob(&blob).await.unwrap());
+}
+
+#[tokio::test]
+async fn blob_gc_cursor_spreads_collection_across_hard_record_budgets() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store =
+        Store::open(StoreOptions::new(temporary.path(), 1).with_awaiting_publish_ttl_seconds(1))
+            .await
+            .unwrap();
+    let first = store.stage_blob(b"bounded garbage one").await.unwrap();
+    let second = store.stage_blob(b"bounded garbage two").await.unwrap();
+    let now = [first, second]
+        .iter()
+        .map(|reference| {
+            store
+                .blob_reference_state(reference)
+                .unwrap()
+                .unwrap()
+                .updated_at
+        })
+        .max()
+        .unwrap()
+        + store.awaiting_publish_ttl_millis;
+    let budget = BlobGcBudget::new(1, 1_024, std::time::Duration::from_secs(1)).unwrap();
+    let mut cursor = BlobGcCursor::default();
+
+    let first_tick = store
+        .collect_blob_garbage_tick_at(&mut cursor, budget, now)
+        .await
+        .unwrap();
+    assert_eq!(first_tick.inspected_records, 1);
+    assert!(first_tick.inspected_bytes <= budget.max_bytes);
+    assert_eq!(first_tick.removed, 1);
+    assert!(!first_tick.cycle_complete);
+
+    let second_tick = store
+        .collect_blob_garbage_tick_at(&mut cursor, budget, now)
+        .await
+        .unwrap();
+    assert_eq!(second_tick.inspected_records, 1);
+    assert!(second_tick.inspected_bytes <= budget.max_bytes);
+    assert_eq!(second_tick.removed, 1);
+    assert!(!second_tick.cycle_complete);
 }
 
 #[tokio::test]
@@ -294,6 +344,7 @@ async fn gc_uses_awaiting_inactivity_and_removes_untracked_crash_files() {
     assert_eq!(
         store
             .collect_blob_garbage_at(state.updated_at + 999)
+            .await
             .unwrap(),
         0
     );
@@ -301,6 +352,7 @@ async fn gc_uses_awaiting_inactivity_and_removes_untracked_crash_files() {
     assert_eq!(
         store
             .collect_blob_garbage_at(state.updated_at + 1_000)
+            .await
             .unwrap(),
         1
     );
@@ -326,12 +378,14 @@ async fn gc_uses_awaiting_inactivity_and_removes_untracked_crash_files() {
     assert_eq!(
         store
             .collect_blob_garbage_at(orphan_modified + 999)
+            .await
             .unwrap(),
         0
     );
     assert_eq!(
         store
             .collect_blob_garbage_at(orphan_modified + 1_000)
+            .await
             .unwrap(),
         1
     );
@@ -362,6 +416,7 @@ async fn gc_uses_awaiting_inactivity_and_removes_untracked_crash_files() {
     assert_eq!(
         store
             .collect_blob_garbage_at(transition_modified + 1_000)
+            .await
             .unwrap(),
         1
     );
@@ -381,6 +436,7 @@ async fn gc_uses_awaiting_inactivity_and_removes_untracked_crash_files() {
     assert_eq!(
         store
             .collect_blob_garbage_at(modified + store.awaiting_publish_ttl_millis)
+            .await
             .unwrap(),
         1
     );
@@ -439,6 +495,7 @@ async fn identical_seals_share_one_reservation_and_zero_count_content_can_be_reu
     assert_eq!(
         store
             .collect_blob_garbage_at(retired.updated_at + 999)
+            .await
             .unwrap(),
         0
     );
