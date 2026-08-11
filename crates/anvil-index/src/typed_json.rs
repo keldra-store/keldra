@@ -26,6 +26,10 @@ use crate::{
 pub(crate) const ROWS_TAG: u8 = 20;
 const KEYS_TAG: u8 = 21;
 
+#[path = "typed_json/query.rs"]
+mod query;
+use query::query_typed;
+
 macro_rules! builder_state {
     () => {
         pub fn resident_bytes(&self) -> usize {
@@ -765,82 +769,6 @@ async fn typed_row<D: IndexDirectoryRead>(
     Ok(rows.into_iter().nth(index).unwrap())
 }
 
-async fn query_typed<D: IndexDirectoryRead>(
-    runs: &[D],
-    definition: &TypedJsonDefinition,
-    query: &TypedQuery,
-    kind: IndexKind,
-    after: Option<&TypedQueryCursor>,
-) -> Result<Vec<TypedHit>, IndexError> {
-    validate_query(definition, query)?;
-    validate_typed_cursor(after, query)?;
-    if query.limit == 0 || runs.is_empty() {
-        return Ok(Vec::new());
-    }
-    let views = open_views(runs, kind).await?;
-    let mut hits = Vec::with_capacity(query.limit.min(128));
-    let driver = query_driver_prefix(&query.predicates)?;
-    for (run, view) in runs.iter().zip(&views) {
-        if let Some(prefix) = &driver {
-            let Some(root) = view.component_optional(KEYS_TAG) else {
-                continue;
-            };
-            let mut cursor = RoutedCursor::new(run, root.clone(), Some(prefix.clone()));
-            while let Some(key) = cursor.next().await? {
-                let row = typed_row(run, view, key.ordinal).await?;
-                if !row.payload.matches_key(&key.primary, key.position)? {
-                    return Err(IndexError::InvalidFormat("typed routed key mismatch"));
-                }
-                consider_typed_row(runs, &views, run, view, row, query, after, &mut hits).await?;
-            }
-        } else {
-            let Some(root) = view.component_optional(ROWS_TAG) else {
-                continue;
-            };
-            let mut cursor = TypedCursor::new(run, root.clone());
-            while let Some(row) = cursor.next().await? {
-                consider_typed_row(runs, &views, run, view, row, query, after, &mut hits).await?;
-            }
-        }
-    }
-    hits.sort_by(|left, right| compare_hits(left, right, &query.order));
-    Ok(hits)
-}
-
-async fn consider_typed_row<D: IndexDirectoryRead>(
-    runs: &[D],
-    views: &[RunView],
-    run: &D,
-    view: &RunView,
-    row: TypedRow,
-    query: &TypedQuery,
-    after: Option<&TypedQueryCursor>,
-    hits: &mut Vec<TypedHit>,
-) -> Result<(), IndexError> {
-    if !query
-        .predicates
-        .iter()
-        .all(|predicate| row_accepts(&row.payload.fields, predicate))
-    {
-        return Ok(());
-    }
-    let document = document_by_ordinal(run, view, row.ordinal).await?;
-    if !is_latest_live(runs, views, &document).await? {
-        return Ok(());
-    }
-    let hit = TypedHit {
-        document,
-        fields: row.payload.fields,
-    };
-    if after.is_some_and(|cursor| {
-        compare_hit_to_cursor(&hit, cursor, &query.order) != Ordering::Greater
-    }) {
-        return Ok(());
-    }
-    insert_bounded(hits, hit, query.limit, &query.order);
-    Ok(())
-}
-
 async fn seal_typed<T, S>(
     kind: IndexKind,
     buffer: MutationBuffer<T>,
@@ -1446,18 +1374,6 @@ fn validate_typed_cursor(
     Ok(())
 }
 
-fn insert_bounded(hits: &mut Vec<TypedHit>, hit: TypedHit, limit: usize, order: &[TypedOrder]) {
-    if hits
-        .iter()
-        .any(|existing| existing.document == hit.document)
-    {
-        return;
-    }
-    hits.push(hit);
-    hits.sort_by(|left, right| compare_hits(left, right, order));
-    hits.truncate(limit);
-}
-
 fn encode_scalar(output: &mut Encoder, value: &ScalarValue) -> Result<(), IndexError> {
     match value {
         ScalarValue::Null => output.u8(0),
@@ -1967,4 +1883,6 @@ mod tests {
             Err(IndexError::ResourceLimit { .. })
         ));
     }
+
+    include!("typed_json/query_bounds_tests.rs");
 }

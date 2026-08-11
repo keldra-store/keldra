@@ -2,12 +2,13 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
 use crate::full_text::{
     Candidate, RunCandidateCursor, TermCursor, TextComponentWriter, TextPosting,
-    estimate_text_fields, merge_text_component, tokenize, validate_fields,
+    estimate_text_fields, merge_text_component, query_terms, tokenize, validate_fields,
 };
 use crate::run::{ComponentTree, LeafCursor, RunStatistics, RunView, open_views, seal_run_root};
 use crate::segment::{
@@ -297,22 +298,13 @@ impl HybridEngine {
                 IndexError::InvalidQuery("hybrid query vector has the wrong dimension".into())
             })?;
         }
-        let phrase_terms = tokenize(query.text)
-            .into_iter()
-            .map(|(term, _)| term)
-            .collect::<Vec<_>>();
+        let (phrase_terms, unique_terms) = query_terms(query.text, query.phrase)?;
         if !query.text.trim().is_empty() && phrase_terms.is_empty() && query.vector.is_empty() {
             return Err(IndexError::InvalidQuery(
                 "hybrid text contains no indexable terms".into(),
             ));
         }
-        let unique_terms = phrase_terms
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let selected_fields = query.fields.iter().cloned().collect::<BTreeSet<_>>();
+        let selected_fields = Arc::new(query.fields.iter().cloned().collect::<BTreeSet<_>>());
         let views = open_views(runs, IndexKind::Hybrid).await?;
         let mut maximum_text = 0.0f32;
         let mut vector_range = None::<(f32, f32)>;
@@ -326,7 +318,7 @@ impl HybridEngine {
                 definition,
                 &phrase_terms,
                 &unique_terms,
-                selected_fields.clone(),
+                Arc::clone(&selected_fields),
                 query.phrase,
                 query.vector,
             )
@@ -375,7 +367,7 @@ impl HybridEngine {
                 definition,
                 &phrase_terms,
                 &unique_terms,
-                selected_fields.clone(),
+                Arc::clone(&selected_fields),
                 query.phrase,
                 query.vector,
             )
@@ -574,7 +566,7 @@ impl<'a, D: IndexDirectoryRead> HybridScoreCursor<'a, D> {
         definition: &'a HybridDefinition,
         phrase_terms: &[String],
         unique_terms: &[String],
-        selected_fields: BTreeSet<String>,
+        selected_fields: Arc<BTreeSet<String>>,
         phrase: bool,
         query_vector: &'a [f32],
     ) -> Result<Self, IndexError> {
@@ -597,7 +589,7 @@ impl<'a, D: IndexDirectoryRead> HybridScoreCursor<'a, D> {
                         run,
                         root.clone(),
                         term.clone(),
-                        selected_fields.clone(),
+                        Arc::clone(&selected_fields),
                         phrase,
                     )
                 })
@@ -1084,4 +1076,6 @@ mod tests {
         assert_eq!(first_sink.len(), second_sink.len());
         assert!(first_sink.len() > 10);
     }
+
+    include!("hybrid/query_bounds_tests.rs");
 }

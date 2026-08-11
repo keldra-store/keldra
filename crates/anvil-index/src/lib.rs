@@ -10,6 +10,7 @@ mod codec;
 mod error;
 mod io;
 mod model;
+mod query_bounds;
 mod routed;
 mod run;
 mod segment;

@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::codec::{Decoder, Encoder, encode_component};
+use crate::query_bounds::replace_retained_bytes;
 use crate::routed::{
     ROUTED_ROW_RESIDENT_OVERHEAD_BYTES, RoutedComponentWriter, RoutedCursor, RoutedRow,
 };
@@ -153,12 +154,7 @@ impl GitSourceEngine {
                     continue;
                 }
                 let payload = ordinal_row::<D, GitPayload>(run, view, row.ordinal).await?;
-                let record = payload
-                    .payload
-                    .0
-                    .get(row.position as usize)
-                    .cloned()
-                    .ok_or(IndexError::InvalidFormat("Git key record slot"))?;
+                let record = take_git_record(payload, row.position)?;
                 if git_path_primary(&record)? != row.primary {
                     return Err(IndexError::InvalidFormat("Git path key mismatch"));
                 }
@@ -192,7 +188,8 @@ impl GitSourceEngine {
         }
         let views = open_views(runs, IndexKind::GitSource).await?;
         let prefix = composite_prefix(&[repository_id, commit_id, tree_prefix], false)?;
-        let mut selected = BTreeMap::<String, (DocumentRef, GitSourceRecord)>::new();
+        let mut selected = BTreeMap::<String, RetainedGitRecord>::new();
+        let mut retained_bytes = 0usize;
         for (run, view) in runs.iter().zip(&views) {
             let Some(root) = view.component_optional(PRIMARY_KEY_TAG) else {
                 continue;
@@ -204,12 +201,7 @@ impl GitSourceEngine {
                     continue;
                 }
                 let payload = ordinal_row::<D, GitPayload>(run, view, row.ordinal).await?;
-                let record = payload
-                    .payload
-                    .0
-                    .get(row.position as usize)
-                    .cloned()
-                    .ok_or(IndexError::InvalidFormat("Git key record slot"))?;
+                let record = take_git_record(payload, row.position)?;
                 if git_path_primary(&record)? != row.primary {
                     return Err(IndexError::InvalidFormat("Git path key mismatch"));
                 }
@@ -219,16 +211,26 @@ impl GitSourceEngine {
                 let path = record.tree_path.clone();
                 if selected
                     .get(&path)
-                    .is_none_or(|(current, _)| newer_projection_document(&document, current))
+                    .is_none_or(|current| newer_projection_document(&document, &current.document))
                 {
-                    selected.insert(path, (document, record));
-                    if selected.len() > limit {
-                        selected.pop_last();
-                    }
+                    let value = RetainedGitRecord::new(document, record, path.len());
+                    let added = value.resident_bytes;
+                    let replaced = selected.insert(path, value);
+                    let mut removed = replaced.as_ref().map_or(0, |value| value.resident_bytes);
+                    removed = removed.saturating_add(
+                        (selected.len() > limit)
+                            .then(|| {
+                                selected
+                                    .pop_last()
+                                    .map_or(0, |(_, value)| value.resident_bytes)
+                            })
+                            .unwrap_or(0),
+                    );
+                    retained_bytes = replace_retained_bytes(retained_bytes, added, removed)?;
                 }
             }
         }
-        Ok(selected.into_values().map(|(_, record)| record).collect())
+        Ok(selected.into_values().map(|value| value.record).collect())
     }
 
     pub async fn get_object<D: IndexDirectoryRead>(
@@ -244,7 +246,8 @@ impl GitSourceEngine {
         }
         let views = open_views(runs, IndexKind::GitSource).await?;
         let prefix = composite_prefix(&[repository_id, object_id], true)?;
-        let mut selected = BTreeMap::<(String, String), (DocumentRef, GitSourceRecord)>::new();
+        let mut selected = BTreeMap::<(String, String), RetainedGitRecord>::new();
+        let mut retained_bytes = 0usize;
         for (run, view) in runs.iter().zip(&views) {
             let Some(root) = view.component_optional(SECONDARY_KEY_TAG) else {
                 continue;
@@ -256,28 +259,37 @@ impl GitSourceEngine {
                     continue;
                 }
                 let payload = ordinal_row::<D, GitPayload>(run, view, row.ordinal).await?;
-                let record = payload
-                    .payload
-                    .0
-                    .get(row.position as usize)
-                    .cloned()
-                    .ok_or(IndexError::InvalidFormat("Git key record slot"))?;
+                let record = take_git_record(payload, row.position)?;
                 if git_object_primary(&record)? != row.primary {
                     return Err(IndexError::InvalidFormat("Git object key mismatch"));
                 }
                 let key = (record.commit_id.clone(), record.tree_path.clone());
                 if selected
                     .get(&key)
-                    .is_none_or(|(current, _)| newer_projection_document(&document, current))
+                    .is_none_or(|current| newer_projection_document(&document, &current.document))
                 {
-                    selected.insert(key, (document, record));
-                    if selected.len() > limit {
-                        selected.pop_last();
-                    }
+                    let value = RetainedGitRecord::new(
+                        document,
+                        record,
+                        key.0.len().saturating_add(key.1.len()),
+                    );
+                    let added = value.resident_bytes;
+                    let replaced = selected.insert(key, value);
+                    let mut removed = replaced.map_or(0, |value| value.resident_bytes);
+                    removed = removed.saturating_add(
+                        (selected.len() > limit)
+                            .then(|| {
+                                selected
+                                    .pop_last()
+                                    .map_or(0, |(_, value)| value.resident_bytes)
+                            })
+                            .unwrap_or(0),
+                    );
+                    retained_bytes = replace_retained_bytes(retained_bytes, added, removed)?;
                 }
             }
         }
-        Ok(selected.into_values().map(|(_, record)| record).collect())
+        Ok(selected.into_values().map(|value| value.record).collect())
     }
 
     pub async fn merge_runs<D, S>(
@@ -298,6 +310,37 @@ impl GitSourceEngine {
         )
         .await
     }
+}
+
+struct RetainedGitRecord {
+    document: DocumentRef,
+    record: GitSourceRecord,
+    resident_bytes: usize,
+}
+
+impl RetainedGitRecord {
+    fn new(document: DocumentRef, record: GitSourceRecord, key_bytes: usize) -> Self {
+        let resident_bytes = std::mem::size_of::<Self>()
+            .saturating_add(document.path.len())
+            .saturating_add(GitPayload::record_bytes(&record))
+            .saturating_add(key_bytes);
+        Self {
+            document,
+            record,
+            resident_bytes,
+        }
+    }
+}
+
+fn take_git_record(
+    row: OrdinalRow<GitPayload>,
+    position: u32,
+) -> Result<GitSourceRecord, IndexError> {
+    row.payload
+        .0
+        .into_iter()
+        .nth(position as usize)
+        .ok_or(IndexError::InvalidFormat("Git key record slot"))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1674,4 +1717,6 @@ mod tests {
         assert!(matches!(result, Err(IndexError::ResourceLimit { .. })));
         assert!(builder.is_empty());
     }
+
+    include!("projections/query_bounds_tests.rs");
 }

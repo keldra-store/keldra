@@ -442,7 +442,18 @@ fn publication_time(unix_millis: u64) -> Result<std::time::SystemTime, Status> {
 }
 
 fn index_status(error: anvil_index::IndexError) -> Status {
-    Status::failed_precondition(error.to_string())
+    match error {
+        anvil_index::IndexError::InvalidQuery(_) => Status::invalid_argument(error.to_string()),
+        anvil_index::IndexError::ResourceLimit { .. } => {
+            Status::resource_exhausted(error.to_string())
+        }
+        anvil_index::IndexError::InvalidDefinition(_) => {
+            Status::failed_precondition(error.to_string())
+        }
+        anvil_index::IndexError::Io(_) => Status::unavailable(error.to_string()),
+        anvil_index::IndexError::Encode(_) => Status::internal(error.to_string()),
+        _ => Status::data_loss(error.to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -474,6 +485,9 @@ mod tests {
             _source: &super::super::events::IndexSource,
             _expected_source: anvil_store::SourceId,
             _after_offset: u64,
+            _target_offset: u64,
+            _tenant_id: u64,
+            _bucket_id: u64,
             _limit: usize,
             _max_bytes: u64,
         ) -> Result<super::super::events::IndexSourcePage, super::super::events::IndexEventError>
@@ -495,5 +509,29 @@ mod tests {
     fn query_freshness_never_polls_cluster_sources() {
         let events = IndexEventJournal::new(Arc::new(PanicAuthority), Arc::new(PanicSources));
         assert!(query_observed_barrier(&events).is_none());
+    }
+
+    #[test]
+    fn query_failures_preserve_public_status_semantics() {
+        assert_eq!(
+            index_status(anvil_index::IndexError::InvalidQuery("bad query".into())).code(),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            index_status(anvil_index::IndexError::ResourceLimit {
+                needed: 2,
+                limit: 1,
+            })
+            .code(),
+            tonic::Code::ResourceExhausted
+        );
+        assert_eq!(
+            index_status(anvil_index::IndexError::Integrity).code(),
+            tonic::Code::DataLoss
+        );
+        assert_eq!(
+            index_status(anvil_index::IndexError::Encode("failed".into())).code(),
+            tonic::Code::Internal
+        );
     }
 }

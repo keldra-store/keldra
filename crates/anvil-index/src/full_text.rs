@@ -2,6 +2,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -30,6 +31,7 @@ const MAX_TOKEN_CHARS: usize = 128;
 const MAX_FIELD_BYTES: usize = 256;
 const POSTING_CHARGE_BYTES: usize = 256;
 const MAX_PHRASE_POSITION_BYTES: usize = crate::MAX_INDEX_BLOCK_BYTES;
+pub(crate) const MAX_QUERY_TERM_CURSORS: usize = crate::INDEX_ROUTING_FANOUT;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FullTextDocument {
@@ -215,22 +217,13 @@ impl FullTextEngine {
         if query.limit == 0 || runs.is_empty() {
             return Ok(Vec::new());
         }
-        let phrase_terms = tokenize(query.text)
-            .into_iter()
-            .map(|(term, _)| term)
-            .collect::<Vec<_>>();
+        let (phrase_terms, unique_terms) = query_terms(query.text, query.phrase)?;
         if phrase_terms.is_empty() {
             return Err(IndexError::InvalidQuery(
                 "full-text query contains no indexable terms".into(),
             ));
         }
-        let unique_terms = phrase_terms
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let selected_fields = query.fields.iter().cloned().collect::<BTreeSet<_>>();
+        let selected_fields = Arc::new(query.fields.iter().cloned().collect::<BTreeSet<_>>());
         let views = open_views(runs, IndexKind::FullText).await?;
         let mut hits = Vec::with_capacity(query.limit.min(128));
         for (run, view) in runs.iter().zip(&views) {
@@ -243,7 +236,7 @@ impl FullTextEngine {
                     run,
                     root.clone(),
                     term.clone(),
-                    selected_fields.clone(),
+                    Arc::clone(&selected_fields),
                     query.phrase,
                 ));
             }
@@ -804,7 +797,7 @@ pub(crate) struct TermCursor<'a, D> {
     term: String,
     lower: Vec<u8>,
     upper: Option<Vec<u8>>,
-    fields: BTreeSet<String>,
+    fields: Arc<BTreeSet<String>>,
     collect_positions: bool,
     rows: Vec<TextPostingRow>,
     next_row: usize,
@@ -816,7 +809,7 @@ impl<'a, D: IndexDirectoryRead> TermCursor<'a, D> {
         directory: &'a D,
         root: BlockDescriptor,
         term: String,
-        fields: BTreeSet<String>,
+        fields: Arc<BTreeSet<String>>,
         collect_positions: bool,
     ) -> Self {
         let lower = term_lower(&term);
@@ -1278,6 +1271,46 @@ pub(crate) fn tokenize(text: &str) -> Vec<(String, u32)> {
     output
 }
 
+/// Tokenizes query text while bounding both phrase state and the number of
+/// independently decoded posting cursors. Non-phrase repetition does not
+/// create another cursor; phrase repetition does retain sequence position.
+pub(crate) fn query_terms(
+    text: &str,
+    phrase: bool,
+) -> Result<(Vec<String>, Vec<String>), IndexError> {
+    let mut phrase_terms = Vec::new();
+    let mut unique_terms = BTreeSet::new();
+    let mut token = String::new();
+    for character in text.chars().chain(std::iter::once(' ')) {
+        if character.is_alphanumeric() && token.chars().count() < MAX_TOKEN_CHARS {
+            token.extend(character.to_lowercase());
+        } else if !token.is_empty() {
+            if phrase && phrase_terms.len() == MAX_QUERY_TERM_CURSORS {
+                return Err(query_term_limit(MAX_QUERY_TERM_CURSORS + 1));
+            }
+            if phrase {
+                phrase_terms.push(token.clone());
+            }
+            unique_terms.insert(std::mem::take(&mut token));
+            if unique_terms.len() > MAX_QUERY_TERM_CURSORS {
+                return Err(query_term_limit(unique_terms.len()));
+            }
+        }
+    }
+    let unique_terms = unique_terms.into_iter().collect::<Vec<_>>();
+    if !phrase {
+        phrase_terms.clone_from(&unique_terms);
+    }
+    Ok((phrase_terms, unique_terms))
+}
+
+fn query_term_limit(terms: usize) -> IndexError {
+    IndexError::ResourceLimit {
+        needed: terms.saturating_mul(crate::MAX_INDEX_DECODED_BLOCK_BYTES),
+        limit: MAX_QUERY_TERM_CURSORS.saturating_mul(crate::MAX_INDEX_DECODED_BLOCK_BYTES),
+    }
+}
+
 pub(crate) fn estimate_text_fields(fields: &BTreeMap<String, String>) -> usize {
     fields.iter().fold(0usize, |bytes, (field, text)| {
         let (token_count, token_bytes) = estimate_tokens(text);
@@ -1657,4 +1690,6 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].score, 1.0);
     }
+
+    include!("full_text/query_bounds_tests.rs");
 }
