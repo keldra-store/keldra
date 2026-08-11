@@ -9,14 +9,19 @@ use crate::{BlockDescriptor, DocumentRef, IndexDirectoryRead, IndexError};
 
 use super::{VectorDefinition, VectorRow, ordinal_key, read_vector_block_parallel};
 
-// Path cursors already retain one decoded leaf for each of four inputs. Five
-// shared document/vector point leaves keep the complete lane at nine retained
-// decoded leaves; misses remain correct and merely evict the least-recent leaf.
-const MAX_CACHED_LEAVES: usize = 5;
+// Six source leaves plus four path cursors leave two decoded-allocation slots
+// for the writer's retained output batch and an incoming moved row during a
+// flush.
+const MAX_CACHED_LEAVES: usize = 6;
 
 enum CachedRows {
     Documents(Vec<DocumentRecord>),
-    Vectors(Vec<VectorRow>),
+    Vectors(Vec<CachedVectorRow>),
+}
+
+struct CachedVectorRow {
+    ordinal: u64,
+    values: Option<Vec<f32>>,
 }
 
 struct CachedLeaf {
@@ -88,20 +93,21 @@ impl VectorCompactionPointCache {
         if let Some(index) =
             self.cached_leaf(root, &key, |rows| matches!(rows, CachedRows::Vectors(_)))
         {
-            let CachedRows::Vectors(rows) = &self.touch(index).rows else {
+            let CachedRows::Vectors(rows) = &mut self.touch(index).rows else {
                 unreachable!("cache variant was checked")
             };
-            return vector_in_rows(rows, ordinal);
+            return take_vector_in_rows(rows, ordinal);
         }
 
         self.reserve_miss_slot();
         let descriptor = find_leaf(directory, root, &key)
             .await?
             .ok_or(IndexError::InvalidFormat("missing vector ordinal"))?;
-        let rows =
+        let mut rows = cache_vector_rows(
             read_vector_block_parallel(directory, &descriptor, definition, executor, progress)
-                .await?;
-        let values = vector_in_rows(&rows, ordinal)?;
+                .await?,
+        );
+        let values = take_vector_in_rows(&mut rows, ordinal)?;
         self.insert(CachedLeaf {
             root_hash: root.hash,
             descriptor,
@@ -124,13 +130,13 @@ impl VectorCompactionPointCache {
         })
     }
 
-    fn touch(&mut self, index: usize) -> &CachedLeaf {
+    fn touch(&mut self, index: usize) -> &mut CachedLeaf {
         let leaf = self
             .leaves
             .remove(index)
             .expect("cache index came from this deque");
         self.leaves.push_back(leaf);
-        self.leaves.back().expect("touched leaf was reinserted")
+        self.leaves.back_mut().expect("touched leaf was reinserted")
     }
 
     fn reserve_miss_slot(&mut self) {
@@ -151,8 +157,81 @@ fn document_in_rows(rows: &[DocumentRecord], ordinal: u64) -> Result<DocumentRef
         .map_err(|_| IndexError::InvalidFormat("missing document ordinal"))
 }
 
-fn vector_in_rows(rows: &[VectorRow], ordinal: u64) -> Result<Vec<f32>, IndexError> {
-    rows.binary_search_by_key(&ordinal, |row| row.ordinal)
-        .map(|index| rows[index].values.clone())
-        .map_err(|_| IndexError::InvalidFormat("missing vector ordinal"))
+fn cache_vector_rows(rows: Vec<VectorRow>) -> Vec<CachedVectorRow> {
+    rows.into_iter()
+        .map(|row| CachedVectorRow {
+            ordinal: row.ordinal,
+            values: Some(row.values),
+        })
+        .collect()
+}
+
+fn take_vector_in_rows(rows: &mut [CachedVectorRow], ordinal: u64) -> Result<Vec<f32>, IndexError> {
+    let index = rows
+        .binary_search_by_key(&ordinal, |row| row.ordinal)
+        .map_err(|_| IndexError::InvalidFormat("missing vector ordinal"))?;
+    rows[index]
+        .values
+        .take()
+        .ok_or(IndexError::InvalidFormat("vector ordinal already consumed"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ComponentCodec, IndexKind};
+
+    #[test]
+    fn point_cache_reserves_two_moved_payload_slots() {
+        let mut cache = VectorCompactionPointCache::default();
+        for value in 0..(MAX_CACHED_LEAVES + 3) {
+            cache.reserve_miss_slot();
+            cache.insert(CachedLeaf {
+                root_hash: [value as u8; 32],
+                descriptor: descriptor(value as u8),
+                rows: CachedRows::Documents(vec![DocumentRecord {
+                    ordinal: value as u64,
+                    document: DocumentRef {
+                        path: format!("/{value}"),
+                        version: 1,
+                    },
+                }]),
+            });
+            assert!(cache.leaves.len() <= MAX_CACHED_LEAVES);
+        }
+        assert_eq!(MAX_CACHED_LEAVES, 6);
+        assert_eq!(cache.leaves.len(), 6);
+        assert_eq!(cache.leaves.front().unwrap().root_hash, [3; 32]);
+    }
+
+    #[test]
+    fn vector_payload_is_consumed_exactly_once_without_cloning() {
+        let expected = vec![1.0, 2.0, 3.0];
+        let expected_allocation = expected.as_ptr();
+        let mut rows = cache_vector_rows(vec![VectorRow {
+            ordinal: 7,
+            values: expected,
+        }]);
+
+        let values = take_vector_in_rows(&mut rows, 7).unwrap();
+        assert_eq!(values.as_ptr(), expected_allocation);
+        assert!(matches!(
+            take_vector_in_rows(&mut rows, 7),
+            Err(IndexError::InvalidFormat("vector ordinal already consumed"))
+        ));
+    }
+
+    fn descriptor(value: u8) -> BlockDescriptor {
+        BlockDescriptor {
+            kind: IndexKind::Vector,
+            component_tag: DOCUMENTS_TAG,
+            codec: ComponentCodec::FixedRows,
+            routing_height: 0,
+            minimum_key: vec![value],
+            maximum_key: vec![value],
+            element_count: 1,
+            encoded_bytes: 1,
+            hash: [value; 32],
+        }
+    }
 }

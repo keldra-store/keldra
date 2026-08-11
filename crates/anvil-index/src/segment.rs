@@ -174,7 +174,13 @@ impl PathComponentWriter {
         row: PathChange,
         sink: &mut S,
     ) -> Result<(), IndexError> {
-        let row_bytes = row.document.path.len().saturating_add(32);
+        let encoded_row_bytes = row.document.path.len().saturating_add(32);
+        let resident_row_bytes = row
+            .document
+            .path
+            .capacity()
+            .saturating_add(2 * std::mem::size_of::<PathChange>());
+        let row_bytes = encoded_row_bytes.max(resident_row_bytes);
         if !self.rows.is_empty()
             && self.estimated_bytes.saturating_add(row_bytes) > self.target_bytes
         {
@@ -383,7 +389,13 @@ impl DocumentComponentWriter {
                 "document ordinals must be contiguous from the writer base".into(),
             ));
         }
-        let row_bytes = row.document.path.len().saturating_add(24);
+        let encoded_row_bytes = row.document.path.len().saturating_add(24);
+        let resident_row_bytes = row
+            .document
+            .path
+            .capacity()
+            .saturating_add(2 * std::mem::size_of::<DocumentRecord>());
+        let row_bytes = encoded_row_bytes.max(resident_row_bytes);
         if !self.rows.is_empty()
             && self.estimated_bytes.saturating_add(row_bytes) > self.target_bytes
         {

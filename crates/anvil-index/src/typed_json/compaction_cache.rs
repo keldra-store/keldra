@@ -10,22 +10,29 @@ use crate::segment::{
 use crate::{BlockDescriptor, DocumentRef, IndexDirectoryRead, IndexError};
 
 use super::{
-    ROWS_TAG, TypedRow, ordinal_key, parallel_compaction::read_typed_block_parallel,
+    ROWS_TAG, TypedPayload, TypedRow, ordinal_key, parallel_compaction::read_typed_block_parallel,
     read_typed_block,
 };
 
-/// A source-payload lane alternates document and typed-row point reads. Five
-/// decoded leaves bound that reuse without exceeding the charged lane set.
-const MAX_SOURCE_PAYLOAD_LEAVES: usize = 5;
+/// Six source leaves plus four path cursors leave two decoded-allocation slots
+/// for the writer's retained output batch and an incoming moved row during a
+/// flush.
+const MAX_SOURCE_PAYLOAD_LEAVES: usize = 6;
 /// A routed-key merge can have one document leaf hot for each of four inputs.
 const MAX_INPUT_DOCUMENT_LEAVES: usize = 4;
-/// Output-path lookup is independent and needs only its current staged leaf.
-const MAX_STAGED_OUTPUT_PATH_LEAVES: usize = 1;
+/// Routed keys are not globally ordered by path. Four staged-output leaves are
+/// a bounded locality window for paths revisited across successive key groups.
+const MAX_STAGED_OUTPUT_PATH_LEAVES: usize = 4;
 
 enum CachedRows {
     Documents(Vec<DocumentRecord>),
     Paths(Vec<PathChange>),
-    Typed(Vec<TypedRow>),
+    Typed(Vec<CachedTypedRow>),
+}
+
+struct CachedTypedRow {
+    ordinal: u64,
+    payload: Option<TypedPayload>,
 }
 
 struct CachedLeaf {
@@ -153,18 +160,18 @@ impl CompactionPointCache {
             self.cached_leaf(root, &key, |rows| matches!(rows, CachedRows::Typed(_)))
         {
             let leaf = self.touch(index);
-            let CachedRows::Typed(rows) = &leaf.rows else {
+            let CachedRows::Typed(rows) = &mut leaf.rows else {
                 unreachable!("cache variant was checked")
             };
-            return typed_in_rows(rows, ordinal);
+            return take_typed_in_rows(rows, ordinal);
         }
 
         self.reserve_miss_slot();
         let descriptor = find_leaf(directory, root, &key)
             .await?
             .ok_or(IndexError::InvalidFormat("missing typed ordinal"))?;
-        let rows = read_typed_block(directory, &descriptor).await?;
-        let row = typed_in_rows(&rows, ordinal)?;
+        let mut rows = cache_typed_rows(read_typed_block(directory, &descriptor).await?);
+        let row = take_typed_in_rows(&mut rows, ordinal)?;
         self.insert(CachedLeaf {
             root_hash: root.hash,
             descriptor,
@@ -193,18 +200,20 @@ impl CompactionPointCache {
             self.cached_leaf(root, &key, |rows| matches!(rows, CachedRows::Typed(_)))
         {
             let leaf = self.touch(index);
-            let CachedRows::Typed(rows) = &leaf.rows else {
+            let CachedRows::Typed(rows) = &mut leaf.rows else {
                 unreachable!("cache variant was checked")
             };
-            return typed_in_rows(rows, ordinal);
+            return take_typed_in_rows(rows, ordinal);
         }
 
         self.reserve_miss_slot();
         let descriptor = find_leaf(directory, root, &key)
             .await?
             .ok_or(IndexError::InvalidFormat("missing typed ordinal"))?;
-        let rows = read_typed_block_parallel(directory, &descriptor, executor, progress).await?;
-        let row = typed_in_rows(&rows, ordinal)?;
+        let mut rows = cache_typed_rows(
+            read_typed_block_parallel(directory, &descriptor, executor, progress).await?,
+        );
+        let row = take_typed_in_rows(&mut rows, ordinal)?;
         self.insert(CachedLeaf {
             root_hash: root.hash,
             descriptor,
@@ -297,13 +306,15 @@ impl CompactionPointCache {
         })
     }
 
-    fn touch(&mut self, index: usize) -> &CachedLeaf {
+    fn touch(&mut self, index: usize) -> &mut CachedLeaf {
         let leaf = self
             .leaves
             .remove(index)
             .expect("cache index came from this deque");
         self.leaves.push_back(leaf);
-        self.leaves.back().expect("the touched leaf was reinserted")
+        self.leaves
+            .back_mut()
+            .expect("the touched leaf was reinserted")
     }
 
     fn insert(&mut self, leaf: CachedLeaf) {
@@ -328,11 +339,24 @@ fn document_in_rows(rows: &[DocumentRecord], ordinal: u64) -> Result<DocumentRef
     Ok(rows[index].document.clone())
 }
 
-fn typed_in_rows(rows: &[TypedRow], ordinal: u64) -> Result<TypedRow, IndexError> {
+fn cache_typed_rows(rows: Vec<TypedRow>) -> Vec<CachedTypedRow> {
+    rows.into_iter()
+        .map(|row| CachedTypedRow {
+            ordinal: row.ordinal,
+            payload: Some(row.payload),
+        })
+        .collect()
+}
+
+fn take_typed_in_rows(rows: &mut [CachedTypedRow], ordinal: u64) -> Result<TypedRow, IndexError> {
     let index = rows
         .binary_search_by_key(&ordinal, |row| row.ordinal)
         .map_err(|_| IndexError::InvalidFormat("missing typed ordinal"))?;
-    Ok(rows[index].clone())
+    let payload = rows[index]
+        .payload
+        .take()
+        .ok_or(IndexError::InvalidFormat("typed ordinal already consumed"))?;
+    Ok(TypedRow { ordinal, payload })
 }
 
 fn path_in_rows(rows: &[PathChange], path: &str) -> Option<PathChange> {

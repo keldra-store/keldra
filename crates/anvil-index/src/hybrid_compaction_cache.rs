@@ -10,10 +10,10 @@ use crate::segment::{
 };
 use crate::{BlockDescriptor, DocumentRef, IndexDirectoryRead, IndexError};
 
-// Four text cursors retain their current decoded leaves. Bound the shared
-// document/input-path/output-path reuse set to five more leaves so one lane
-// never retains more than the nine leaves covered by its workspace charge.
-const MAX_CACHED_LEAVES: usize = 5;
+// Four text cursors retain their current decoded leaves. The shared cache keeps
+// four input documents, four input paths, and the current staged-output path
+// hot, for the worst-case thirteen retained decoded leaves in one lane.
+const MAX_CACHED_LEAVES: usize = 9;
 
 enum CachedRows {
     Documents(Vec<DocumentRecord>),
@@ -179,4 +179,47 @@ fn path_in_rows(rows: &[PathChange], path: &str) -> Option<PathChange> {
     rows.binary_search_by(|row| row.document.path.as_str().cmp(path))
         .ok()
         .map(|index| rows[index].clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ComponentCodec, IndexKind};
+
+    #[test]
+    fn point_cache_retains_exactly_nine_shared_leaves() {
+        let mut cache = HybridCompactionPointCache::default();
+        for value in 0..(MAX_CACHED_LEAVES + 3) {
+            cache.reserve_miss_slot();
+            cache.insert(CachedLeaf {
+                root_hash: [value as u8; 32],
+                descriptor: descriptor(value as u8),
+                rows: CachedRows::Documents(vec![DocumentRecord {
+                    ordinal: value as u64,
+                    document: DocumentRef {
+                        path: format!("/{value}"),
+                        version: 1,
+                    },
+                }]),
+            });
+            assert!(cache.leaves.len() <= MAX_CACHED_LEAVES);
+        }
+        assert_eq!(MAX_CACHED_LEAVES, 9);
+        assert_eq!(cache.leaves.len(), 9);
+        assert_eq!(cache.leaves.front().unwrap().root_hash, [3; 32]);
+    }
+
+    fn descriptor(value: u8) -> BlockDescriptor {
+        BlockDescriptor {
+            kind: IndexKind::Hybrid,
+            component_tag: DOCUMENTS_TAG,
+            codec: ComponentCodec::FixedRows,
+            routing_height: 0,
+            minimum_key: vec![value],
+            maximum_key: vec![value],
+            element_count: 1,
+            encoded_bytes: 1,
+            hash: [value; 32],
+        }
+    }
 }

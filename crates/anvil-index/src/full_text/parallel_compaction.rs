@@ -42,6 +42,7 @@ where
             "full-text compaction requires input runs and an L1+ output level".into(),
         ));
     }
+    crate::compaction::validate_parallel_compaction_fan_in(runs.len())?;
     let views = open_views(runs, IndexKind::FullText).await?;
     let (path_tree, document_tree, statistics) = merge_common_components_parallel(
         runs,

@@ -558,6 +558,7 @@ impl TensorProjectionEngine {
 
 trait ProjectionPayload: Sized {
     fn encoded_bytes(&self) -> usize;
+    fn resident_bytes(&self) -> usize;
     fn encode(&self, output: &mut Encoder) -> Result<(), IndexError>;
     fn decode(decoder: &mut Decoder<'_>) -> Result<Self, IndexError>;
     fn key_tags() -> &'static [u8];
@@ -618,6 +619,23 @@ impl ProjectionPayload for GitPayload {
         self.0.iter().fold(4usize, |size, record| {
             size.saturating_add(Self::record_bytes(record))
         })
+    }
+
+    fn resident_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(
+                self.0
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<GitSourceRecord>()),
+            )
+            .saturating_add(self.0.iter().fold(0usize, |bytes, record| {
+                bytes
+                    .saturating_add(record.repository_id.capacity())
+                    .saturating_add(record.commit_id.capacity())
+                    .saturating_add(record.tree_path.capacity())
+                    .saturating_add(record.object_id.capacity())
+                    .saturating_add(record.pack_path.capacity())
+            }))
     }
 
     fn encode(&self, output: &mut Encoder) -> Result<(), IndexError> {
@@ -698,6 +716,28 @@ impl ProjectionPayload for TensorPayload {
         self.0.iter().fold(4usize, |size, record| {
             size.saturating_add(Self::record_bytes(record))
         })
+    }
+
+    fn resident_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(
+                self.0
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<TensorRecord>()),
+            )
+            .saturating_add(self.0.iter().fold(0usize, |bytes, record| {
+                bytes
+                    .saturating_add(record.model_id.capacity())
+                    .saturating_add(record.tensor_name.capacity())
+                    .saturating_add(record.source_path.capacity())
+                    .saturating_add(record.dtype.capacity())
+                    .saturating_add(
+                        record
+                            .shape
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<u64>()),
+                    )
+            }))
     }
 
     fn encode(&self, output: &mut Encoder) -> Result<(), IndexError> {
@@ -785,6 +825,7 @@ struct OrdinalComponentWriter<T> {
     level: u8,
     target_bytes: usize,
     estimated_bytes: usize,
+    resident_bytes: usize,
     rows: Vec<OrdinalRow<T>>,
     tree: crate::run::RoutingTreeBuilder,
 }
@@ -796,6 +837,7 @@ impl<T: ProjectionPayload> OrdinalComponentWriter<T> {
             level,
             target_bytes: target_bytes.max(256),
             estimated_bytes: 0,
+            resident_bytes: 0,
             rows: Vec::new(),
             tree: crate::run::RoutingTreeBuilder::new(kind, RECORDS_TAG),
         }
@@ -807,8 +849,20 @@ impl<T: ProjectionPayload> OrdinalComponentWriter<T> {
         sink: &mut S,
     ) -> Result<(), IndexError> {
         let row_bytes = row.payload.encoded_bytes().saturating_add(16);
+        let row_resident_bytes = row
+            .payload
+            .resident_bytes()
+            .saturating_add(2 * std::mem::size_of::<OrdinalRow<T>>());
+        if row_resident_bytes > crate::MAX_INDEX_DECODED_BLOCK_BYTES {
+            return Err(IndexError::ResourceLimit {
+                needed: row_resident_bytes,
+                limit: crate::MAX_INDEX_DECODED_BLOCK_BYTES,
+            });
+        }
         if !self.rows.is_empty()
-            && self.estimated_bytes.saturating_add(row_bytes) > self.target_bytes
+            && (self.estimated_bytes.saturating_add(row_bytes) > self.target_bytes
+                || self.resident_bytes.saturating_add(row_resident_bytes)
+                    > crate::MAX_INDEX_DECODED_BLOCK_BYTES)
         {
             self.flush(sink).await?;
         }
@@ -820,6 +874,7 @@ impl<T: ProjectionPayload> OrdinalComponentWriter<T> {
             return Err(IndexError::UnsortedRecords);
         }
         self.estimated_bytes = self.estimated_bytes.saturating_add(row_bytes);
+        self.resident_bytes = self.resident_bytes.saturating_add(row_resident_bytes);
         self.rows.push(row);
         Ok(())
     }
@@ -830,6 +885,7 @@ impl<T: ProjectionPayload> OrdinalComponentWriter<T> {
         }
         let rows = std::mem::take(&mut self.rows);
         self.estimated_bytes = 0;
+        self.resident_bytes = 0;
         let codec = if self.level == 0 {
             ComponentCodec::FixedRows
         } else {

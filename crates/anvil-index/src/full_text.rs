@@ -32,6 +32,8 @@ use crate::{
 pub(crate) const FULL_TEXT_POSTINGS_TAG: u8 = 30;
 const MAX_TOKEN_CHARS: usize = 128;
 const MAX_FIELD_BYTES: usize = 256;
+pub(crate) const MAX_TEXT_POSTING_KEY_BYTES: usize =
+    MAX_TOKEN_CHARS * 4 + MAX_FIELD_BYTES + 1 + 8 + 1 + 4;
 const POSTING_CHARGE_BYTES: usize = 256;
 const MAX_PHRASE_POSITION_BYTES: usize = crate::MAX_INDEX_BLOCK_BYTES;
 pub(crate) const MAX_QUERY_TERM_CURSORS: usize = crate::INDEX_ROUTING_FANOUT;
@@ -837,8 +839,7 @@ fn validate_text_rows(rows: Vec<TextPostingRow>) -> Result<Vec<TextPostingRow>, 
 pub(crate) struct TextRowCursor<'a, D> {
     directory: &'a D,
     leaves: LeafCursor<'a, D>,
-    rows: Vec<TextPostingRow>,
-    next_row: usize,
+    rows: std::vec::IntoIter<TextPostingRow>,
     range: Option<crate::compaction::KeyRange>,
 }
 
@@ -847,8 +848,7 @@ impl<'a, D: IndexDirectoryRead> TextRowCursor<'a, D> {
         Self {
             directory,
             leaves: LeafCursor::new(directory, root),
-            rows: Vec::new(),
-            next_row: 0,
+            rows: Vec::new().into_iter(),
             range: None,
         }
     }
@@ -861,16 +861,14 @@ impl<'a, D: IndexDirectoryRead> TextRowCursor<'a, D> {
         Self {
             directory,
             leaves: LeafCursor::in_range(directory, root, range.clone()),
-            rows: Vec::new(),
-            next_row: 0,
+            rows: Vec::new().into_iter(),
             range: Some(range),
         }
     }
 
     pub(crate) async fn next(&mut self) -> Result<Option<TextPostingRow>, IndexError> {
         loop {
-            if let Some(row) = self.rows.get(self.next_row).cloned() {
-                self.next_row += 1;
+            if let Some(row) = self.rows.next() {
                 if self
                     .range
                     .as_ref()
@@ -880,11 +878,16 @@ impl<'a, D: IndexDirectoryRead> TextRowCursor<'a, D> {
                 }
                 continue;
             }
+            // Drop the exhausted leaf allocation before fetching its
+            // replacement. Rows already returned by this cursor own their
+            // position vectors; no decoded copy remains behind here.
+            self.rows = Vec::new().into_iter();
             let Some(descriptor) = self.leaves.next().await? else {
                 return Ok(None);
             };
-            self.rows = read_text_block(self.directory, &descriptor).await?;
-            self.next_row = 0;
+            self.rows = read_text_block(self.directory, &descriptor)
+                .await?
+                .into_iter();
         }
     }
 
@@ -894,8 +897,7 @@ impl<'a, D: IndexDirectoryRead> TextRowCursor<'a, D> {
         progress: &crate::compaction::CompactionProgress,
     ) -> Result<Option<TextPostingRow>, IndexError> {
         loop {
-            if let Some(row) = self.rows.get(self.next_row).cloned() {
-                self.next_row += 1;
+            if let Some(row) = self.rows.next() {
                 if self
                     .range
                     .as_ref()
@@ -907,13 +909,13 @@ impl<'a, D: IndexDirectoryRead> TextRowCursor<'a, D> {
             }
             // Release the exhausted decoded leaf before fetching/decoding its
             // replacement so the lane never retains both at once.
-            self.rows = Vec::new();
+            self.rows = Vec::new().into_iter();
             let Some(descriptor) = self.leaves.next().await? else {
                 return Ok(None);
             };
-            self.rows =
-                read_text_block_parallel(self.directory, &descriptor, executor, progress).await?;
-            self.next_row = 0;
+            self.rows = read_text_block_parallel(self.directory, &descriptor, executor, progress)
+                .await?
+                .into_iter();
         }
     }
 }
@@ -1829,6 +1831,39 @@ mod tests {
         );
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].score, 1.0);
+    }
+
+    #[tokio::test]
+    async fn text_row_cursor_moves_position_storage_out_of_the_decoded_leaf() {
+        let sink = MemoryBlockSink::default();
+        let directory = sink.directory();
+        let root = BlockDescriptor {
+            kind: IndexKind::FullText,
+            component_tag: FULL_TEXT_POSTINGS_TAG,
+            codec: ComponentCodec::GapPostings,
+            routing_height: 0,
+            minimum_key: b"unused".to_vec(),
+            maximum_key: b"unused".to_vec(),
+            element_count: 1,
+            encoded_bytes: 1,
+            hash: [0; 32],
+        };
+        let positions = vec![1, 3, 5];
+        let positions_allocation = positions.as_ptr();
+        let mut cursor = TextRowCursor::new(&directory, root);
+        cursor.rows = vec![TextPostingRow {
+            term: "term".into(),
+            ordinal: 0,
+            field: "body".into(),
+            field_length: 6,
+            part: 0,
+            positions,
+        }]
+        .into_iter();
+
+        let row = cursor.next().await.unwrap().unwrap();
+        assert_eq!(row.positions.as_ptr(), positions_allocation);
+        assert!(cursor.rows.as_slice().is_empty());
     }
 
     include!("full_text/query_bounds_tests.rs");

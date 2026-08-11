@@ -12,14 +12,24 @@ use crate::{BlockDescriptor, DocumentRef, IndexDirectoryRead, IndexError};
 use super::parallel_compaction::read_projection_block_parallel;
 use super::{OrdinalRow, ProjectionPayload, RECORDS_TAG, ordinal_key};
 
-const MAX_SOURCE_PAYLOAD_LEAVES: usize = 5;
+// Six source leaves plus four path cursors leave two decoded-allocation slots
+// for the writer's retained output batch and an incoming moved row during a
+// flush.
+const MAX_SOURCE_PAYLOAD_LEAVES: usize = 6;
 const MAX_INPUT_DOCUMENT_LEAVES: usize = 4;
-const MAX_STAGED_OUTPUT_PATH_LEAVES: usize = 1;
+// Routed keys are not globally ordered by path. Four staged-output leaves are
+// a bounded locality window for paths revisited across successive key groups.
+const MAX_STAGED_OUTPUT_PATH_LEAVES: usize = 4;
 
 enum CachedRows<T> {
     Documents(Vec<DocumentRecord>),
     Paths(Vec<PathChange>),
-    Projections(Vec<OrdinalRow<T>>),
+    Projections(Vec<CachedProjectionRow<T>>),
+}
+
+struct CachedProjectionRow<T> {
+    ordinal: u64,
+    payload: Option<T>,
 }
 
 struct CachedLeaf<T> {
@@ -44,7 +54,7 @@ impl<T> Default for ProjectionPointCache<T> {
 
 impl<T> ProjectionPointCache<T>
 where
-    T: ProjectionPayload + Clone + Send + 'static,
+    T: ProjectionPayload + Send + 'static,
 {
     pub(super) fn input_documents() -> Self {
         Self::with_limit(MAX_INPUT_DOCUMENT_LEAVES)
@@ -116,18 +126,19 @@ where
         if let Some(index) = self.cached_leaf(root, &key, |rows| {
             matches!(rows, CachedRows::Projections(_))
         }) {
-            let CachedRows::Projections(rows) = &self.touch(index).rows else {
+            let CachedRows::Projections(rows) = &mut self.touch(index).rows else {
                 unreachable!("cache variant was checked")
             };
-            return projection_in_rows(rows, ordinal);
+            return take_projection_in_rows(rows, ordinal);
         }
         self.reserve_miss_slot();
         let descriptor = find_leaf(directory, root, &key)
             .await?
             .ok_or(IndexError::InvalidFormat("missing projection ordinal"))?;
-        let rows =
-            read_projection_block_parallel(directory, &descriptor, executor, progress).await?;
-        let projection = projection_in_rows(&rows, ordinal)?;
+        let mut rows = cache_projection_rows(
+            read_projection_block_parallel(directory, &descriptor, executor, progress).await?,
+        );
+        let projection = take_projection_in_rows(&mut rows, ordinal)?;
         self.insert(CachedLeaf {
             root_hash: root.hash,
             descriptor,
@@ -185,13 +196,13 @@ where
         })
     }
 
-    fn touch(&mut self, index: usize) -> &CachedLeaf<T> {
+    fn touch(&mut self, index: usize) -> &mut CachedLeaf<T> {
         let leaf = self
             .leaves
             .remove(index)
             .expect("cache index came from this deque");
         self.leaves.push_back(leaf);
-        self.leaves.back().expect("touched leaf was reinserted")
+        self.leaves.back_mut().expect("touched leaf was reinserted")
     }
 
     fn insert(&mut self, leaf: CachedLeaf<T>) {
@@ -213,11 +224,25 @@ fn document_in_rows(rows: &[DocumentRecord], ordinal: u64) -> Result<DocumentRef
     Ok(rows[index].document.clone())
 }
 
-fn projection_in_rows<T: Clone>(rows: &[OrdinalRow<T>], ordinal: u64) -> Result<T, IndexError> {
+fn cache_projection_rows<T>(rows: Vec<OrdinalRow<T>>) -> Vec<CachedProjectionRow<T>> {
+    rows.into_iter()
+        .map(|row| CachedProjectionRow {
+            ordinal: row.ordinal,
+            payload: Some(row.payload),
+        })
+        .collect()
+}
+
+fn take_projection_in_rows<T>(
+    rows: &mut [CachedProjectionRow<T>],
+    ordinal: u64,
+) -> Result<T, IndexError> {
     let index = rows
         .binary_search_by_key(&ordinal, |row| row.ordinal)
         .map_err(|_| IndexError::InvalidFormat("missing projection ordinal"))?;
-    Ok(rows[index].payload.clone())
+    rows[index].payload.take().ok_or(IndexError::InvalidFormat(
+        "projection ordinal already consumed",
+    ))
 }
 
 fn path_in_rows(rows: &[PathChange], path: &str) -> Option<PathChange> {
@@ -225,4 +250,41 @@ fn path_in_rows(rows: &[PathChange], path: &str) -> Option<PathChange> {
         .binary_search_by(|row| row.document.path.as_str().cmp(path))
         .ok()?;
     Some(rows[index].clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn projection_caches_cover_the_four_input_phase_working_sets() {
+        let source = ProjectionPointCache::<super::super::GitPayload>::default();
+        let input = ProjectionPointCache::<super::super::GitPayload>::input_documents();
+        let output = ProjectionPointCache::<super::super::GitPayload>::staged_output_paths();
+
+        assert_eq!(source.max_leaves, 6);
+        assert_eq!(input.max_leaves, 4);
+        assert_eq!(output.max_leaves, 4);
+    }
+
+    #[test]
+    fn projection_payload_is_consumed_once_without_a_clone_bound() {
+        struct NonClonePayload(Vec<u8>);
+
+        let expected = vec![1, 2, 3];
+        let expected_allocation = expected.as_ptr();
+        let mut rows = vec![CachedProjectionRow {
+            ordinal: 9,
+            payload: Some(NonClonePayload(expected)),
+        }];
+
+        let payload = take_projection_in_rows(&mut rows, 9).unwrap();
+        assert_eq!(payload.0.as_ptr(), expected_allocation);
+        assert!(matches!(
+            take_projection_in_rows(&mut rows, 9),
+            Err(IndexError::InvalidFormat(
+                "projection ordinal already consumed"
+            ))
+        ));
+    }
 }

@@ -12,21 +12,125 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Poll, Waker};
 
-use crate::{BlockDescriptor, FIXED_INDEX_SEAL_WORKSPACE_BYTES, IndexError};
+use crate::full_text::MAX_TEXT_POSTING_KEY_BYTES;
+use crate::model::{
+    MAX_RUN_ROOT_WORKSPACE_BYTES, MAX_RUN_VIEW_WORKSPACE_BYTES, routing_descriptor_workspace_bytes,
+    routing_page_workspace_bytes, routing_traversal_workspace_bytes,
+};
+use crate::{
+    BlockDescriptor, IndexError, MAX_INDEX_BLOCK_BYTES, MAX_INDEX_DECODED_BLOCK_BYTES,
+    MAX_INDEX_ROUTING_KEY_BYTES,
+};
 
-/// Shared root assembly, run metadata, and first-lane workspace. The fixed seal
-/// workspace's nine encoded-plus-decoded leaf pairs cover either nine retained
-/// decoded leaves or eight retained leaves while the ninth is fetched/decoded.
-/// Its separate codec/output and routing allowances cover the lane writer and
-/// ordered coordinator, so the first lane needs no hidden surplus.
-pub const COMPACTION_SHARED_WORKSPACE_BYTES: usize = FIXED_INDEX_SEAL_WORKSPACE_BYTES;
+pub(crate) const MAX_COMPACTION_INPUT_RUNS: usize = 4;
+const ORDINAL_ROUTING_KEY_BYTES: usize = 8;
+const COMPACTION_CODEC_AND_OUTPUT_BUFFERS: usize = 5;
+const SOURCE_PHASE_RETAINED_DECODED_LEAVES: usize = 12;
+const TEXT_PHASE_RETAINED_DECODED_LEAVES: usize = 13;
+const CACHED_LEAF_METADATA_OVERHEAD_BYTES: usize = 128;
+const KEY_RANGE_METADATA_OVERHEAD_BYTES: usize = 128;
+const MAX_LANE_KEY_RANGE_COPIES: usize = MAX_COMPACTION_INPUT_RUNS * 2 + 4;
+const MAX_ROOT_DESCRIPTOR_COPIES: usize = MAX_COMPACTION_INPUT_RUNS * 4;
+const MAX_CURRENT_ROW_COPIES: usize = MAX_COMPACTION_INPUT_RUNS * 4;
+const CONTAINER_AND_TASK_OVERHEAD_BYTES: usize = 512 * 1024;
+
+const ENUMERATED_COMPACTION_METADATA_BYTES: usize = MAX_COMPACTION_INPUT_RUNS
+    * MAX_RUN_VIEW_WORKSPACE_BYTES
+    + TEXT_PHASE_RETAINED_DECODED_LEAVES
+        * (routing_descriptor_workspace_bytes(MAX_INDEX_ROUTING_KEY_BYTES)
+            + CACHED_LEAF_METADATA_OVERHEAD_BYTES)
+    + MAX_LANE_KEY_RANGE_COPIES
+        * (2 * MAX_INDEX_ROUTING_KEY_BYTES + KEY_RANGE_METADATA_OVERHEAD_BYTES)
+    + MAX_ROOT_DESCRIPTOR_COPIES * routing_descriptor_workspace_bytes(MAX_INDEX_ROUTING_KEY_BYTES)
+    + MAX_CURRENT_ROW_COPIES * (MAX_INDEX_ROUTING_KEY_BYTES + 128)
+    + CONTAINER_AND_TASK_OVERHEAD_BYTES;
+
+// Covers all four shared input RunViews using resident BTreeMap/descriptor
+// sizes, cached-leaf descriptors, range/root/current-row copies, and bounded
+// Vec/Arc/task bookkeeping. Charging it to every lane is conservative because
+// the RunViews and range plan are shared by the whole compaction.
+const COMPACTION_METADATA_WORKSPACE_BYTES: usize = 2 * 1024 * 1024;
+const _: () = assert!(ENUMERATED_COMPACTION_METADATA_BYTES <= COMPACTION_METADATA_WORKSPACE_BYTES);
+
+const fn retained_leaf_workspace_bytes(decoded_leaves: usize) -> usize {
+    decoded_leaves * MAX_INDEX_DECODED_BLOCK_BYTES + MAX_INDEX_BLOCK_BYTES
+}
+
+const COMMON_COMPACTION_WORKSPACE_BYTES: usize =
+    COMPACTION_CODEC_AND_OUTPUT_BUFFERS * MAX_INDEX_BLOCK_BYTES + MAX_RUN_ROOT_WORKSPACE_BYTES;
+const COMPLETE_COMMON_COMPACTION_WORKSPACE_BYTES: usize =
+    COMMON_COMPACTION_WORKSPACE_BYTES + COMPACTION_METADATA_WORKSPACE_BYTES;
+
+// Path/document/payload phases retain four path cursors while streaming one
+// path-keyed output tree and two ordinal-keyed output trees.
+const SOURCE_PHASE_WORKSPACE_BYTES: usize = COMPLETE_COMMON_COMPACTION_WORKSPACE_BYTES
+    + retained_leaf_workspace_bytes(SOURCE_PHASE_RETAINED_DECODED_LEAVES)
+    + MAX_COMPACTION_INPUT_RUNS * routing_traversal_workspace_bytes(MAX_INDEX_ROUTING_KEY_BYTES)
+    + routing_traversal_workspace_bytes(MAX_INDEX_ROUTING_KEY_BYTES)
+    + 2 * routing_traversal_workspace_bytes(ORDINAL_ROUTING_KEY_BYTES)
+    + routing_page_workspace_bytes(MAX_INDEX_ROUTING_KEY_BYTES)
+    + 2 * routing_page_workspace_bytes(ORDINAL_ROUTING_KEY_BYTES);
+
+// Routed phases retain four maximum-key cursors and one maximum-key output
+// tree. Point reads traverse at most one additional decoded routing page.
+const ROUTED_PHASE_WORKSPACE_BYTES: usize = COMPLETE_COMMON_COMPACTION_WORKSPACE_BYTES
+    + retained_leaf_workspace_bytes(SOURCE_PHASE_RETAINED_DECODED_LEAVES)
+    + (MAX_COMPACTION_INPUT_RUNS + 1)
+        * routing_traversal_workspace_bytes(MAX_INDEX_ROUTING_KEY_BYTES)
+    + routing_page_workspace_bytes(MAX_INDEX_ROUTING_KEY_BYTES);
+
+// Full-text and hybrid posting phases retain thirteen decoded data leaves, but
+// their canonical posting routing keys are much smaller than object paths.
+const TEXT_PHASE_WORKSPACE_BYTES: usize = COMPLETE_COMMON_COMPACTION_WORKSPACE_BYTES
+    + retained_leaf_workspace_bytes(TEXT_PHASE_RETAINED_DECODED_LEAVES)
+    + (MAX_COMPACTION_INPUT_RUNS + 1)
+        * routing_traversal_workspace_bytes(MAX_TEXT_POSTING_KEY_BYTES)
+    + routing_page_workspace_bytes(MAX_INDEX_ROUTING_KEY_BYTES);
+
+const MAX_COMPACTION_PHASE_WORKSPACE_BYTES: usize =
+    if SOURCE_PHASE_WORKSPACE_BYTES > ROUTED_PHASE_WORKSPACE_BYTES {
+        if SOURCE_PHASE_WORKSPACE_BYTES > TEXT_PHASE_WORKSPACE_BYTES {
+            SOURCE_PHASE_WORKSPACE_BYTES
+        } else {
+            TEXT_PHASE_WORKSPACE_BYTES
+        }
+    } else if ROUTED_PHASE_WORKSPACE_BYTES > TEXT_PHASE_WORKSPACE_BYTES {
+        ROUTED_PHASE_WORKSPACE_BYTES
+    } else {
+        TEXT_PHASE_WORKSPACE_BYTES
+    };
+
+/// One complete lane is hard-capped at 64 MiB. Four lanes therefore fit
+/// exactly within the approved 256 MiB per-kind construction budget.
+const COMPLETE_COMPACTION_LANE_WORKSPACE_BYTES: usize = 64 * 1024 * 1024;
+const _: () =
+    assert!(MAX_COMPACTION_PHASE_WORKSPACE_BYTES <= COMPLETE_COMPACTION_LANE_WORKSPACE_BYTES);
+
+/// Shared root assembly, run metadata, and one complete first-lane workspace.
+pub const COMPACTION_SHARED_WORKSPACE_BYTES: usize = COMPLETE_COMPACTION_LANE_WORKSPACE_BYTES;
 /// Conservative workspace added for every lane after the first.
 ///
-/// Every additional lane is charged an independent fixed seal workspace: nine
-/// retained decoded leaves plus its complete codec/output/routing allowance.
-/// This is slightly larger than ten leaf pairs, so configured lane counts can
-/// never borrow a small uncharged routing surplus from the first lane.
-pub const COMPACTION_INCREMENTAL_LANE_WORKSPACE_BYTES: usize = FIXED_INDEX_SEAL_WORKSPACE_BYTES;
+/// Every additional lane is charged the same complete phase maximum.
+pub const COMPACTION_INCREMENTAL_LANE_WORKSPACE_BYTES: usize =
+    COMPLETE_COMPACTION_LANE_WORKSPACE_BYTES;
+
+/// Reject fan-in that exceeds the resident-set proof used by every parallel
+/// merger. The runtime selects at most four runs, but the engine entrypoints
+/// enforce the same boundary so direct callers cannot silently exceed it.
+pub(crate) fn validate_parallel_compaction_fan_in(run_count: usize) -> Result<(), IndexError> {
+    if run_count == 0 {
+        return Err(IndexError::InvalidDefinition(
+            "parallel compaction requires at least one input run".into(),
+        ));
+    }
+    if run_count > MAX_COMPACTION_INPUT_RUNS {
+        return Err(IndexError::ResourceLimit {
+            needed: run_count,
+            limit: MAX_COMPACTION_INPUT_RUNS,
+        });
+    }
+    Ok(())
+}
 
 /// Validated per-compaction parallelism admitted by the process-wide kind pool.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1019,12 +1123,46 @@ mod tests {
     }
 
     #[test]
+    fn parallel_compaction_fan_in_matches_the_resident_set_proof() {
+        assert!(validate_parallel_compaction_fan_in(0).is_err());
+        assert!(validate_parallel_compaction_fan_in(1).is_ok());
+        assert!(validate_parallel_compaction_fan_in(4).is_ok());
+        assert!(matches!(
+            validate_parallel_compaction_fan_in(5),
+            Err(IndexError::ResourceLimit {
+                needed: 5,
+                limit: 4
+            })
+        ));
+    }
+
+    #[test]
+    fn every_phase_fits_the_complete_lane_workspace() {
+        assert!(ENUMERATED_COMPACTION_METADATA_BYTES <= COMPACTION_METADATA_WORKSPACE_BYTES);
+        assert!(SOURCE_PHASE_WORKSPACE_BYTES <= COMPLETE_COMPACTION_LANE_WORKSPACE_BYTES);
+        assert!(ROUTED_PHASE_WORKSPACE_BYTES <= COMPLETE_COMPACTION_LANE_WORKSPACE_BYTES);
+        assert!(TEXT_PHASE_WORKSPACE_BYTES <= COMPLETE_COMPACTION_LANE_WORKSPACE_BYTES);
+        assert_eq!(
+            MAX_COMPACTION_PHASE_WORKSPACE_BYTES,
+            SOURCE_PHASE_WORKSPACE_BYTES
+        );
+        assert_eq!(
+            COMPACTION_SHARED_WORKSPACE_BYTES,
+            COMPLETE_COMPACTION_LANE_WORKSPACE_BYTES
+        );
+        assert_eq!(
+            COMPACTION_INCREMENTAL_LANE_WORKSPACE_BYTES,
+            COMPLETE_COMPACTION_LANE_WORKSPACE_BYTES
+        );
+    }
+
+    #[test]
     fn default_budget_admits_four_complete_lanes_at_the_exact_boundary() {
         let default_budget = 256 * 1024 * 1024;
         let admitted = CompactionParallelism::for_budget(4, 4, default_budget).unwrap();
         assert_eq!(admitted.max_lanes(), 4);
         let required = admitted.admitted_bytes().unwrap();
-        assert!(required <= default_budget as usize);
+        assert_eq!(required, default_budget as usize);
         assert_eq!(
             CompactionParallelism::for_budget(4, 4, required as u64)
                 .unwrap()

@@ -243,6 +243,7 @@ impl PathEngine {
                 "path compaction requires input runs and an L1+ output level".into(),
             ));
         }
+        crate::compaction::validate_parallel_compaction_fan_in(runs.len())?;
         let views = open_views(runs, IndexKind::Path).await?;
         let roots = views
             .iter()

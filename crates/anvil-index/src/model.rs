@@ -18,28 +18,56 @@ const COMPONENT_HEADER_BYTES: usize = 54;
 const DESCRIPTOR_FIXED_BYTES: usize = 4 + 8 + 16 + 32;
 const MAX_DESCRIPTOR_ENCODED_BYTES: usize =
     DESCRIPTOR_FIXED_BYTES + 2 * MAX_INDEX_ROUTING_KEY_BYTES;
-const MAX_DESCRIPTOR_RESIDENT_BYTES: usize = 256 + 2 * MAX_INDEX_ROUTING_KEY_BYTES;
+const DESCRIPTOR_RESIDENT_FIXED_BYTES: usize = 256;
+const MAX_DESCRIPTOR_RESIDENT_BYTES: usize =
+    DESCRIPTOR_RESIDENT_FIXED_BYTES + 2 * MAX_INDEX_ROUTING_KEY_BYTES;
+
+pub(crate) const fn routing_descriptor_workspace_bytes(maximum_key_bytes: usize) -> usize {
+    DESCRIPTOR_RESIDENT_FIXED_BYTES + 2 * maximum_key_bytes
+}
+
+pub(crate) const fn routing_page_workspace_bytes(maximum_key_bytes: usize) -> usize {
+    INDEX_ROUTING_FANOUT * routing_descriptor_workspace_bytes(maximum_key_bytes)
+}
+
+pub(crate) const fn routing_traversal_workspace_bytes(maximum_key_bytes: usize) -> usize {
+    MAX_INDEX_ROUTING_HEIGHT * routing_page_workspace_bytes(maximum_key_bytes)
+}
 
 /// Largest canonical routing object at the fixed format-2 fanout.
 pub const MAX_INDEX_ROUTING_BLOCK_BYTES: usize =
     COMPONENT_HEADER_BYTES + 1 + 4 + INDEX_ROUTING_FANOUT * MAX_DESCRIPTOR_ENCODED_BYTES;
+pub(crate) const MAX_RUN_ROOT_WORKSPACE_BYTES: usize = COMPONENT_HEADER_BYTES
+    + 1
+    + 4 * 8
+    + 4
+    + MAX_RUN_COMPONENTS * (8 + MAX_DESCRIPTOR_ENCODED_BYTES);
+const RUN_VIEW_ENTRY_RESIDENT_OVERHEAD_BYTES: usize = 256;
+pub(crate) const MAX_RUN_VIEW_WORKSPACE_BYTES: usize = 256
+    + MAX_RUN_COMPONENTS
+        * (8 + routing_descriptor_workspace_bytes(MAX_INDEX_ROUTING_KEY_BYTES)
+            + RUN_VIEW_ENTRY_RESIDENT_OVERHEAD_BYTES);
 /// Fixed routing-descriptor and run-root workspace retained while streaming a
 /// component. This uses the maximum supported height and key size.
 pub const MAX_INDEX_ROUTING_WORKSPACE_BYTES: usize =
     MAX_INDEX_ROUTING_HEIGHT * INDEX_ROUTING_FANOUT * MAX_DESCRIPTOR_RESIDENT_BYTES
-        + COMPONENT_HEADER_BYTES
-        + 1
-        + 4 * 8
-        + 4
-        + MAX_RUN_COMPONENTS * (8 + MAX_DESCRIPTOR_ENCODED_BYTES);
+        + MAX_RUN_ROOT_WORKSPACE_BYTES;
+/// The fixed leaf workspace is charged as twelve encoded-plus-decoded pairs.
+const COMPACTION_CHARGED_LEAF_PAIRS: usize = 12;
+/// Full-text and hybrid compaction have the largest retained decoded set:
+/// four cursor leaves plus nine point-read leaves.
+const MAX_COMPACTION_RETAINED_DECODED_LEAVES: usize = 13;
+/// A miss can hold one encoded input block while decoding it.
+const MAX_COMPACTION_TRANSIENT_ENCODED_LEAVES: usize = 1;
+
 /// One bounded row batch, codec input/output arrays, one move-only emitted
-/// object, and the nine encoded-plus-decoded leaves retained by four-way
-/// compaction: four sequential cursor leaves plus four point-read input leaves
-/// and one staged-output point leaf. Engine-specific derived state is charged
+/// object, and a 54 MiB leaf workspace. Twelve encoded-plus-decoded pairs
+/// safely cover the worst phase's thirteen retained decoded leaves plus one
+/// transient encoded block. Engine-specific derived state is charged
 /// separately at no more than its admitted resident mutation bytes.
 pub const FIXED_INDEX_SEAL_WORKSPACE_BYTES: usize = MAX_INDEX_ROUTING_WORKSPACE_BYTES
     + 5 * MAX_INDEX_BLOCK_BYTES
-    + 9 * (MAX_INDEX_BLOCK_BYTES + MAX_INDEX_DECODED_BLOCK_BYTES);
+    + COMPACTION_CHARGED_LEAF_PAIRS * (MAX_INDEX_BLOCK_BYTES + MAX_INDEX_DECODED_BLOCK_BYTES);
 pub const MIN_INDEX_KIND_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 
 /// Conservative partition of one process-wide per-kind construction budget.
@@ -246,7 +274,20 @@ mod tests {
     fn fixed_routing_objects_fit_the_block_ceiling() {
         assert!(MAX_INDEX_ROUTING_BLOCK_BYTES <= MAX_INDEX_BLOCK_BYTES);
         assert!(FIXED_INDEX_SEAL_WORKSPACE_BYTES < MIN_INDEX_KIND_MEMORY_BYTES);
-        assert_eq!(9 * MAX_INDEX_DECODED_BLOCK_BYTES, 36 * 1024 * 1024);
+        assert_eq!(
+            routing_traversal_workspace_bytes(MAX_INDEX_ROUTING_KEY_BYTES)
+                + MAX_RUN_ROOT_WORKSPACE_BYTES,
+            MAX_INDEX_ROUTING_WORKSPACE_BYTES
+        );
+        let charged_leaf_workspace =
+            COMPACTION_CHARGED_LEAF_PAIRS * (MAX_INDEX_BLOCK_BYTES + MAX_INDEX_DECODED_BLOCK_BYTES);
+        let worst_retained_and_transient = MAX_COMPACTION_RETAINED_DECODED_LEAVES
+            * MAX_INDEX_DECODED_BLOCK_BYTES
+            + MAX_COMPACTION_TRANSIENT_ENCODED_LEAVES * MAX_INDEX_BLOCK_BYTES;
+        assert_eq!(COMPACTION_CHARGED_LEAF_PAIRS, 12);
+        assert_eq!(MAX_COMPACTION_RETAINED_DECODED_LEAVES, 13);
+        assert_eq!(charged_leaf_workspace, 54 * 1024 * 1024);
+        assert!(charged_leaf_workspace >= worst_retained_and_transient);
     }
 
     #[test]

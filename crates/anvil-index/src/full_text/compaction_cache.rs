@@ -10,11 +10,11 @@ use crate::segment::{
 };
 use crate::{BlockDescriptor, DocumentRef, IndexDirectoryRead, IndexError};
 
-/// The lane budget admits four input point-read leaves at a time plus one
-/// staged-output path leaf. Document and path reads share this LRU, so changing
-/// lookup phase evicts old input leaves instead of silently increasing the
-/// working set. Streaming posting cursors own their separately charged leaves.
-const MAX_INPUT_LEAVES: usize = 4;
+/// The posting phase can retain one document and one source-path leaf for each
+/// of four inputs. Its separate output cache retains one staged path leaf at
+/// the same time. Streaming posting cursors own their separately charged
+/// leaves.
+const MAX_INPUT_LEAVES: usize = 8;
 const MAX_STAGED_OUTPUT_LEAVES: usize = 1;
 
 enum CachedRows {
@@ -221,6 +221,8 @@ mod tests {
 
     #[test]
     fn point_cache_never_retains_more_than_its_charged_leaf_count() {
+        assert_eq!(MAX_INPUT_LEAVES, 8);
+        assert_eq!(MAX_STAGED_OUTPUT_LEAVES, 1);
         assert_cache_limit(FullTextPointCache::input(), MAX_INPUT_LEAVES);
         assert_cache_limit(
             FullTextPointCache::staged_output(),

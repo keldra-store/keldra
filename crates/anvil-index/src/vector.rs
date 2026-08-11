@@ -371,6 +371,7 @@ impl VectorEngine {
                 "vector compaction requires input runs and an L1+ output level".into(),
             ));
         }
+        crate::compaction::validate_parallel_compaction_fan_in(runs.len())?;
         let (path_tree, document_tree, vector_tree, statistics) = merge_vector_components_parallel(
             runs,
             IndexKind::Vector,
@@ -843,6 +844,7 @@ pub(crate) struct VectorComponentWriter {
     dimension: usize,
     target_bytes: usize,
     estimated_bytes: usize,
+    resident_bytes: usize,
     rows: Vec<VectorRow>,
     tree: RoutingTreeBuilder,
 }
@@ -862,6 +864,7 @@ impl VectorComponentWriter {
             dimension,
             target_bytes: target_bytes.max(256),
             estimated_bytes: 0,
+            resident_bytes: 0,
             rows: Vec::new(),
             tree: RoutingTreeBuilder::new(kind, component_tag),
         }
@@ -881,12 +884,26 @@ impl VectorComponentWriter {
             return Err(IndexError::UnsortedRecords);
         }
         let row_bytes = row.values.len().saturating_mul(4).saturating_add(8);
+        let row_resident_bytes = row
+            .values
+            .capacity()
+            .saturating_mul(std::mem::size_of::<f32>())
+            .saturating_add(2 * std::mem::size_of::<VectorRow>());
+        if row_resident_bytes > crate::MAX_INDEX_DECODED_BLOCK_BYTES {
+            return Err(IndexError::ResourceLimit {
+                needed: row_resident_bytes,
+                limit: crate::MAX_INDEX_DECODED_BLOCK_BYTES,
+            });
+        }
         if !self.rows.is_empty()
-            && self.estimated_bytes.saturating_add(row_bytes) > self.target_bytes
+            && (self.estimated_bytes.saturating_add(row_bytes) > self.target_bytes
+                || self.resident_bytes.saturating_add(row_resident_bytes)
+                    > crate::MAX_INDEX_DECODED_BLOCK_BYTES)
         {
             self.flush(sink).await?;
         }
         self.estimated_bytes = self.estimated_bytes.saturating_add(row_bytes);
+        self.resident_bytes = self.resident_bytes.saturating_add(row_resident_bytes);
         self.rows.push(row);
         Ok(())
     }
@@ -897,6 +914,7 @@ impl VectorComponentWriter {
         }
         let rows = std::mem::take(&mut self.rows);
         self.estimated_bytes = 0;
+        self.resident_bytes = 0;
         let first = ordinal_key(rows.first().unwrap().ordinal);
         let last = ordinal_key(rows.last().unwrap().ordinal);
         let body = encode_vector_rows(&rows, self.dimension, self.level > 0)?;

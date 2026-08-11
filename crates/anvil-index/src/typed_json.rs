@@ -20,11 +20,15 @@ use crate::segment::{
 use crate::succinct::{decode_elias_fano_with_budget, encode_elias_fano};
 use crate::{
     ComponentCodec, DocumentRef, IndexBlockSink, IndexDirectoryRead, IndexError, IndexKind,
-    IndexMutation, SealedRun, SegmentBuildOptions, SegmentPush,
+    IndexMutation, MAX_INDEX_DECODED_BLOCK_BYTES, SealedRun, SegmentBuildOptions, SegmentPush,
 };
 
 pub(crate) const ROWS_TAG: u8 = 20;
 const KEYS_TAG: u8 = 21;
+const ELIAS_FANO_DECODED_FIXED_BYTES: usize = 256;
+// Two words remain in the decoded sequence; one more conservatively covers
+// low/high-word and sample construction while that sequence is built.
+const ELIAS_FANO_DECODED_BYTES_PER_VALUE: usize = 3 * std::mem::size_of::<u64>();
 
 #[path = "typed_json/query.rs"]
 mod query;
@@ -561,6 +565,26 @@ impl TypedPayload {
         })
     }
 
+    fn decoded_resident_bytes(&self) -> usize {
+        self.fields.iter().fold(0usize, |size, (field, values)| {
+            let values_bytes = values.iter().fold(
+                values
+                    .len()
+                    .saturating_mul(std::mem::size_of::<ScalarValue>()),
+                |size, value| {
+                    size.saturating_add(match value {
+                        ScalarValue::String(value) => value.len(),
+                        ScalarValue::Null | ScalarValue::Boolean(_) | ScalarValue::Number(_) => 0,
+                    })
+                },
+            );
+            size.saturating_add(std::mem::size_of::<(String, Vec<ScalarValue>)>())
+                .saturating_add(64)
+                .saturating_add(field.len())
+                .saturating_add(values_bytes)
+        })
+    }
+
     fn encode(&self, output: &mut Encoder) -> Result<(), IndexError> {
         output.u32(self.fields.len())?;
         for (field, values) in &self.fields {
@@ -643,6 +667,7 @@ struct TypedComponentWriter {
     level: u8,
     target_bytes: usize,
     estimated_bytes: usize,
+    decoded_resident_bytes: usize,
     rows: Vec<TypedRow>,
     tree: crate::run::RoutingTreeBuilder,
 }
@@ -654,6 +679,7 @@ impl TypedComponentWriter {
             level,
             target_bytes: target_bytes.max(256),
             estimated_bytes: 0,
+            decoded_resident_bytes: 0,
             rows: Vec::new(),
             tree: crate::run::RoutingTreeBuilder::new(kind, ROWS_TAG),
         }
@@ -665,8 +691,23 @@ impl TypedComponentWriter {
         sink: &mut S,
     ) -> Result<(), IndexError> {
         let row_bytes = row.payload.encoded_bytes().saturating_add(16);
+        let row_decoded_resident_bytes =
+            std::mem::size_of::<TypedRow>().saturating_add(row.payload.decoded_resident_bytes());
+        let single_row_decoded_bytes =
+            row_decoded_resident_bytes.saturating_add(self.ordinal_decode_resident_bytes(1));
+        if single_row_decoded_bytes > MAX_INDEX_DECODED_BLOCK_BYTES {
+            return Err(IndexError::ResourceLimit {
+                needed: single_row_decoded_bytes,
+                limit: MAX_INDEX_DECODED_BLOCK_BYTES,
+            });
+        }
+        let next_decoded_resident_bytes = self
+            .decoded_resident_bytes
+            .saturating_add(row_decoded_resident_bytes)
+            .saturating_add(self.ordinal_decode_resident_bytes(self.rows.len().saturating_add(1)));
         if !self.rows.is_empty()
-            && self.estimated_bytes.saturating_add(row_bytes) > self.target_bytes
+            && (self.estimated_bytes.saturating_add(row_bytes) > self.target_bytes
+                || next_decoded_resident_bytes > MAX_INDEX_DECODED_BLOCK_BYTES)
         {
             self.flush(sink).await?;
         }
@@ -678,8 +719,20 @@ impl TypedComponentWriter {
             return Err(IndexError::UnsortedRecords);
         }
         self.estimated_bytes = self.estimated_bytes.saturating_add(row_bytes);
+        self.decoded_resident_bytes = self
+            .decoded_resident_bytes
+            .saturating_add(row_decoded_resident_bytes);
         self.rows.push(row);
         Ok(())
+    }
+
+    fn ordinal_decode_resident_bytes(&self, row_count: usize) -> usize {
+        if self.level == 0 || row_count == 0 {
+            0
+        } else {
+            ELIAS_FANO_DECODED_FIXED_BYTES
+                .saturating_add(row_count.saturating_mul(ELIAS_FANO_DECODED_BYTES_PER_VALUE))
+        }
     }
 
     async fn flush<S: IndexBlockSink>(&mut self, sink: &mut S) -> Result<(), IndexError> {
@@ -688,6 +741,7 @@ impl TypedComponentWriter {
         }
         let rows = std::mem::take(&mut self.rows);
         self.estimated_bytes = 0;
+        self.decoded_resident_bytes = 0;
         let codec = if self.level == 0 {
             ComponentCodec::FixedRows
         } else {
@@ -1922,44 +1976,7 @@ mod tests {
         assert!(builder.resident_bytes() <= options.max_resident_bytes);
     }
 
-    #[test]
-    fn metadata_builder_rejects_a_source_larger_than_its_budget() {
-        let mut builder =
-            MetadataSegmentBuilder::new(definition(), SegmentBuildOptions::new(256).unwrap())
-                .unwrap();
-        let fields = selected(vec![ScalarValue::String("x".repeat(1024))], 1.0);
-        assert!(matches!(
-            builder.try_push(IndexMutation::Upsert(MetadataDocument {
-                document: DocumentRef {
-                    path: "/oversized".into(),
-                    version: 1,
-                },
-                fields,
-            })),
-            Err(IndexError::ResourceLimit { .. })
-        ));
-    }
-
-    #[test]
-    fn corrupt_typed_row_count_is_rejected_before_allocation() {
-        assert_eq!(
-            decode_typed_rows(&u32::MAX.to_le_bytes(), ComponentCodec::FixedRows).unwrap_err(),
-            IndexError::InvalidFormat("index component element count")
-        );
-    }
-
-    #[test]
-    fn typed_row_too_large_for_one_block_fails_before_admission() {
-        let values = (0..1_100)
-            .map(|index| ScalarValue::String(format!("{index:04}{}", "x".repeat(3_996))))
-            .collect();
-        let fields = BTreeMap::from([("status".into(), values)]);
-        assert!(matches!(
-            preflight_typed_row(&fields),
-            Err(IndexError::ResourceLimit { .. })
-        ));
-    }
-
+    include!("typed_json/writer_resident_tests.rs");
     include!("typed_json/query_bounds_tests.rs");
     include!("typed_json/parallel_compaction_tests.rs");
 }

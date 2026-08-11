@@ -793,8 +793,23 @@ pub(crate) fn decode_descriptor(decoder: &mut Decoder<'_>) -> Result<BlockDescri
     let kind = IndexKind::from_tag(decoder.u8()?)?;
     let codec = ComponentCodec::from_tag(decoder.u8()?)?;
     let routing_height = decoder.u8()?;
-    let minimum_key = decoder.bytes()?.to_vec();
-    let maximum_key = decoder.bytes()?.to_vec();
+    let maximum_key_bytes = match (kind, component_tag) {
+        (IndexKind::FullText, crate::full_text::FULL_TEXT_POSTINGS_TAG)
+        | (IndexKind::Hybrid, crate::hybrid::HYBRID_TEXT_TAG) => {
+            crate::full_text::MAX_TEXT_POSTING_KEY_BYTES
+        }
+        _ => crate::MAX_INDEX_ROUTING_KEY_BYTES,
+    };
+    let minimum_key = decoder.bytes()?;
+    if minimum_key.len() > maximum_key_bytes {
+        return Err(IndexError::InvalidFormat("block descriptor bounds"));
+    }
+    let minimum_key = minimum_key.to_vec();
+    let maximum_key = decoder.bytes()?;
+    if maximum_key.len() > maximum_key_bytes {
+        return Err(IndexError::InvalidFormat("block descriptor bounds"));
+    }
+    let maximum_key = maximum_key.to_vec();
     let element_count = decoder.u64()?;
     let encoded_bytes = decoder.u64()?;
     let hash = decoder.fixed(32)?.try_into().unwrap();
@@ -802,8 +817,6 @@ pub(crate) fn decode_descriptor(decoder: &mut Decoder<'_>) -> Result<BlockDescri
         || encoded_bytes == 0
         || encoded_bytes > MAX_INDEX_BLOCK_BYTES as u64
         || usize::from(routing_height) > MAX_INDEX_ROUTING_HEIGHT
-        || minimum_key.len() > crate::MAX_INDEX_ROUTING_KEY_BYTES
-        || maximum_key.len() > crate::MAX_INDEX_ROUTING_KEY_BYTES
         || minimum_key > maximum_key
     {
         return Err(IndexError::InvalidFormat("block descriptor bounds"));
@@ -863,6 +876,118 @@ mod tests {
         let bytes = encoded.finish();
         assert_eq!(
             decode_descriptor(&mut Decoder::new(&bytes)).unwrap_err(),
+            IndexError::InvalidFormat("block descriptor bounds")
+        );
+    }
+
+    #[test]
+    fn text_posting_roots_reject_oversized_keys_before_entering_run_views() {
+        for (kind, component_tag) in [
+            (
+                IndexKind::FullText,
+                crate::full_text::FULL_TEXT_POSTINGS_TAG,
+            ),
+            (IndexKind::Hybrid, crate::hybrid::HYBRID_TEXT_TAG),
+        ] {
+            for oversized_minimum in [false, true] {
+                let oversized = vec![b'x'; crate::full_text::MAX_TEXT_POSTING_KEY_BYTES + 1];
+                let (minimum_key, maximum_key) = if oversized_minimum {
+                    (oversized.clone(), oversized)
+                } else {
+                    (b"a".to_vec(), oversized)
+                };
+                let mut body = Encoder::default();
+                body.u8(0);
+                body.u64(1);
+                body.u64(0);
+                body.u64(1);
+                body.u64(1);
+                body.u32(2).unwrap();
+                body.u64(1);
+                encode_descriptor(
+                    &mut body,
+                    &BlockDescriptor {
+                        kind,
+                        component_tag: crate::segment::PATH_CHANGES_TAG,
+                        codec: ComponentCodec::FixedRows,
+                        routing_height: 0,
+                        minimum_key: b"a".to_vec(),
+                        maximum_key: b"a".to_vec(),
+                        element_count: 1,
+                        encoded_bytes: 1,
+                        hash: [0; 32],
+                    },
+                )
+                .unwrap();
+                body.u64(1);
+                encode_descriptor(
+                    &mut body,
+                    &BlockDescriptor {
+                        kind,
+                        component_tag,
+                        codec: ComponentCodec::GapPostings,
+                        routing_height: 0,
+                        minimum_key,
+                        maximum_key,
+                        element_count: 1,
+                        encoded_bytes: 1,
+                        hash: [0; 32],
+                    },
+                )
+                .unwrap();
+
+                assert_eq!(
+                    decode_run_root(&body.finish(), kind, 1, None).unwrap_err(),
+                    IndexError::InvalidFormat("block descriptor bounds")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn text_leaf_cursor_rejects_oversized_interior_routing_child() {
+        let oversized = vec![b'x'; crate::full_text::MAX_TEXT_POSTING_KEY_BYTES + 1];
+        let child = BlockDescriptor {
+            kind: IndexKind::FullText,
+            component_tag: crate::full_text::FULL_TEXT_POSTINGS_TAG,
+            codec: ComponentCodec::FixedRows,
+            routing_height: 1,
+            minimum_key: oversized.clone(),
+            maximum_key: oversized,
+            element_count: 1,
+            encoded_bytes: 1,
+            hash: [0; 32],
+        };
+        let mut body = Encoder::default();
+        body.u8(crate::full_text::FULL_TEXT_POSTINGS_TAG);
+        body.u32(1).unwrap();
+        encode_descriptor(&mut body, &child).unwrap();
+        let bytes = encode_component(
+            IndexKind::FullText,
+            ROUTING_TAG,
+            ComponentCodec::FixedRows,
+            body.finish(),
+        )
+        .unwrap();
+        let page = GeneratedBlock::new(
+            IndexKind::FullText,
+            crate::full_text::FULL_TEXT_POSTINGS_TAG,
+            ComponentCodec::FixedRows,
+            2,
+            b"a".to_vec(),
+            b"a".to_vec(),
+            1,
+            bytes,
+        )
+        .unwrap();
+        let root = page.descriptor().clone();
+        let mut sink = MemoryBlockSink::default();
+        sink.emit(page).await.unwrap();
+        let directory = sink.directory();
+        let mut cursor = LeafCursor::new(&directory, root);
+
+        assert_eq!(
+            cursor.next().await.unwrap_err(),
             IndexError::InvalidFormat("block descriptor bounds")
         );
     }

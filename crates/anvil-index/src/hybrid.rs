@@ -38,7 +38,7 @@ use crate::{
 
 use compaction_cache::HybridCompactionPointCache;
 
-const HYBRID_TEXT_TAG: u8 = 50;
+pub(crate) const HYBRID_TEXT_TAG: u8 = 50;
 pub(crate) const HYBRID_VECTOR_TAG: u8 = 51;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -496,6 +496,7 @@ impl HybridEngine {
                 "hybrid compaction requires input runs and an L1+ output level".into(),
             ));
         }
+        crate::compaction::validate_parallel_compaction_fan_in(runs.len())?;
         let (path_tree, document_tree, vector_tree, statistics) = merge_vector_components_parallel(
             runs,
             IndexKind::Hybrid,
