@@ -598,6 +598,35 @@ bounded mutable builder coalesces repeated exact paths and flushes a sorted L0
 run. Every run contains a path/version change directory so later runs can shadow
 older live values and deletes correctly.
 
+Source framing is not an L0-run boundary. For every index kind, one scheduled
+builder turn reuses the same mutable builder across sequential source units. It
+reuses the existing source-wire cap as a scheduling quantum, capped at 4 MiB
+and equal to 4 MiB under the default budget. Journal catch-up coalesces the
+ordered pages of at most 1,024 entries and reduces each next pull's byte credit
+so the journal work cannot cross that quantum. Snapshot rebuild coalesces the
+ordered frames of at most 128 records. A snapshot stream has fixed frame
+credit, so the turn may cross the quantum only by its final frame. Both the
+prior source descriptions and that frame are each at most 4 MiB, so their
+encoded total is strictly less than 8 MiB while only one bounded frame is
+resident at a time.
+
+At smaller supported per-kind budgets, source credit preserves the mutable
+builder half of the non-fixed memory plan before deriving the decoded-source
+allowance. Source framing must not consume the budget merely because it is read
+first. After the final source unit, sealing may make a run level overfull; the
+candidate re-enters the ordinary compaction gate until every level is valid
+before complete-generation publication.
+
+A full builder seals its full L0 run and replaces it without sealing the new
+partial builder. The partial builder seals only when the source-work quantum is
+reached or that source phase ends; the turn then yields the per-kind lease where
+more source work remains. It does not flush merely because a 1,024-entry journal
+page or 128-record snapshot frame ended. Transport-sized pages therefore do not
+create pathological page-sized L0 runs, and the fixed quantum prevents one
+definition from retaining a kind's construction lease indefinitely. This is a
+scheduling and memory-accounting correction only; it does not change an API,
+durable index format, publication authority, or source of truth.
+
 Compaction is size tiered with four-input fan-in. It k-way merges immutable
 component iterators while retaining only iterator state, decoded input blocks,
 and one bounded output block. Merged monotone structures use appropriate `sux`
@@ -639,6 +668,23 @@ budget charges the first lane and ordered root-assembly workspace once, then
 one bounded reader/writer workspace for each additional lane. No lane creates a
 private execution pool, unbounded queue, complete in-memory range, or a second
 persistence path.
+
+Four-input compaction byte-accounts each engine's complete phase-local cache
+working set rather than assuming cache misses are free. This includes the
+current cursor leaves, input document and kind-specific payload leaves, routed
+output lookups, and one transient encoded block where applicable. Phases may
+reuse the same charged workspace, but no decoded leaf retained concurrently is
+left outside the charge. The fixed per-lane workspace remains small enough that
+four complete lanes fit within the default 256 MiB budget for one kind; reducing
+that budget automatically reduces effective lanes instead of allowing hidden
+memory growth.
+
+Parallel mergers accept at most the four input runs covered by that proof.
+Rich typed, vector, projection, and posting payload allocations move from
+decoded input ownership into bounded output writers rather than being cloned;
+the cache reserves separate decoded-allocation slots for the retained output
+batch and the incoming row during a flush. Output writers cap both encoded and
+decoded-resident batches.
 
 The default profile is four Rayon workers, four compaction lanes per kind, and
 256 MiB of construction memory per kind. Across all eight kinds that is a 2 GiB
@@ -939,6 +985,14 @@ upload work does not produce success logs.
   including empty ranges and overflow rejection.
 - Effective-lane tests independently cover the configured, Rayon-worker,
   available-range, and per-kind-memory limits.
+- Source-work quantum tests cover multiple 1,024-entry journal pages sharing one
+  builder turn, exact journal credit, whole-change deferral, and the bounded
+  overshoot of fixed-credit 128-record snapshot frames. Release-corpus
+  qualification exercises source end, generation publication, L0 and
+  compaction telemetry, and the bounded build window through the shared path.
+- Four-input compaction cache tests prove that every concurrently retained
+  decoded or transient encoded leaf is covered by the per-lane byte charge and
+  that the default 256 MiB per-kind budget still admits four lanes.
 - Writes through all three cluster ingress nodes reach one builder.
 - A real journal gap performs one scoped snapshot and never reads another bucket.
 - Atomic-program paths publish in one complete generation/rollup barrier.

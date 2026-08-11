@@ -38,6 +38,15 @@ delays core serving, and the preceding complete generation remains current.
 Catch-up and publication state use retryable cursors and are retained across
 transient failures; only the in-progress scoped baseline work is repeated.
 
+Catch-up source pages containing no changes for the selected bucket consume no
+byte credit. If many ACTIVE source journals advance without any route for that
+bucket, one builder turn can therefore retain its per-kind lease while it walks
+those empty pages; fairness in that case is proportional to ACTIVE source count
+rather than the byte quantum. Memory, checkpoints, publication, and index
+results remain bounded and correct. Operators can avoid an extreme startup
+burst by staging very large membership changes; a separate record-count credit
+is deferred until production evidence justifies it.
+
 ## Streaming indexes in 0.6.0
 
 Index format 2 is a clean break. Anvil 0.6 does not read, migrate, dual-write or
