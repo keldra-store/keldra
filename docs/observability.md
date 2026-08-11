@@ -68,6 +68,57 @@ The Anvil 0.7 process metric vocabulary covers:
   successful, failed, and replayed operation counts, and request latency; and
 - blob garbage-collection run, removal, and failure counts.
 
+Index runtime metrics use only the bounded `index.kind` attribute. Builder
+failure metrics may also use the closed `builder.phase` or `recovery.action`
+values, and range-aware compaction measurements carry the bounded
+`compaction.lane_limit_reason=configured|workers|budget|ranges` value. Index,
+tenant, and bucket IDs are deliberately absent from metrics.
+
+Construction memory is split into configuration, admission, and observed
+builder state:
+
+- `anvil_index_construction_configured_bytes`,
+  `anvil_index_construction_leased_bytes`,
+  `anvil_index_construction_peak_leased_bytes`, and
+  `anvil_index_construction_waiting` describe each kind's shared admission
+  pool;
+- `anvil_index_construction_resident_bytes` and
+  `anvil_index_construction_workspace_bytes` describe the builder involved in
+  a completed flush. Leased bytes are a budget reservation; they are not
+  reported as resident memory.
+
+Compaction admission reports
+`anvil_index_compaction_configured_lanes`,
+`anvil_index_compaction_worker_limit`,
+`anvil_index_compaction_budget_limit`, shared and incremental workspace bytes,
+admitted workspace bytes, and leased bytes. Once the engine has planned its
+deterministic key ranges, progress and terminal events report
+`anvil_index_compaction_effective_lanes` as the minimum of configured lanes,
+workers, budget-admitted lanes, and `anvil_index_compaction_range_limit`. They
+also report active and waiting lanes, ranges total and completed, selected
+input runs/records/bytes, actual input records/read bytes/blocks, output
+records/bytes/blocks, elapsed time, last-progress age, attempts, failures, and
+duration. The corresponding cumulative `*_total` instruments make records,
+bytes, blocks, and completed-range rates directly queryable with the metrics
+backend's rate function. Input/output ratios are not published as a progress
+percentage because compaction can discard superseded records and change the
+encoded byte count.
+
+Rebuild and catch-up expose overlap-safe active counters, cumulative
+records/bytes and frames/pages, elapsed and last-progress-age gauges, terminal
+records/bytes/work-unit and duration histograms, and failure counters. Builder
+failures, selected recovery actions, retries, and fail-closed outcomes use the
+`anvil_index_builder_*` counters. Publication exposes generation, presence,
+age, freshness, source lag, CAS success/failure, and publication duration; a
+successful publication resets age and source lag to zero and marks the
+generation fresh.
+
+`anvil.index.builder` and `anvil.index.compaction` are phase-lifetime spans.
+They contain stable numeric index, tenant, and bucket IDs for investigation,
+plus the same progress snapshots and terminal outcome. A phase emits at start,
+at most one heartbeat every 30 seconds, and at completion or failure; it does
+not emit per-record, per-frame, or per-block logs.
+
 The OSV qualification tool separately writes a measured JSON
 report. It is benchmark output, not an OTLP process metric.
 

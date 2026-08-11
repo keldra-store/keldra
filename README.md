@@ -528,15 +528,25 @@ freshness evidence; while a new complete generation is building, Anvil
 continues serving the preceding complete generation rather than exposing a
 partial one.
 
-The startup default is 64 MiB of construction memory for each index kind,
-shared by every local definition of that kind, with four process-owned Rayon
-workers. Set `ANVIL_INDEX_BUILDER_MEMORY_BYTES_PER_KIND` and
-`ANVIL_INDEX_RAYON_WORKERS` (or the equivalent command-line flags) to fit the
-node. Cache limits remain separate: `ANVIL_INDEX_DISK_CACHE_BYTES` controls the
-shared disposable disk cache and `ANVIL_INDEX_MEMORY_PERCENT` caps aggregate
-in-flight block materialization. Immutable cache files are read through mmap,
-allowing the operating system to retain clean hot pages and reclaim them under
-pressure.
+The startup default is 256 MiB of construction memory and at most four
+compaction lanes for each index kind, shared by every local definition of that
+kind, with four Rayon workers across the process. Set
+`ANVIL_INDEX_BUILDER_MEMORY_BYTES_PER_KIND` for the common memory fallback and
+`ANVIL_INDEX_RAYON_WORKERS` for the process-wide worker ceiling. Every kind can
+override the fallback and lane cap independently with
+`ANVIL_INDEX_<KIND>_BUILDER_MEMORY_BYTES` and
+`ANVIL_INDEX_<KIND>_COMPACTION_MAX_LANES`, where `<KIND>` is `PATH`,
+`METADATA_FILTER`, `TYPED_JSON`, `FULL_TEXT`, `VECTOR`, `HYBRID`, `GIT_SOURCE`,
+or `TENSOR`.
+
+Actual compaction concurrency is the minimum of that kind's configured cap,
+the process worker ceiling, the number of deterministic key ranges, and the
+memory admission `1 + floor((kind budget - shared workspace) / incremental
+lane workspace)`. A cap of one preserves the sequential merge path. Cache
+limits remain separate: `ANVIL_INDEX_DISK_CACHE_BYTES` controls the shared
+disposable disk cache and `ANVIL_INDEX_MEMORY_PERCENT` caps aggregate in-flight
+block materialization. Immutable cache files are read through mmap, allowing
+the operating system to retain clean hot pages and reclaim them under pressure.
 
 Construct an authenticated index client from the same token used for objects:
 
@@ -709,8 +719,14 @@ Build and qualify the container locally before CI:
 ```sh
 ANVIL_IMAGE=anvil:local ./scripts/build-image.sh
 ANVIL_IMAGE=anvil:local ./scripts/release-gates.sh image
-ANVIL_IMAGE=anvil:local ./scripts/qualify-single-node.sh
-ANVIL_IMAGE=anvil:local ./scripts/qualify-three-node.sh
+ANVIL_QUALIFICATION_MODE=release \
+ANVIL_QUALIFICATION_INDEX_KIND_BUDGET_BYTES=268435456 \
+ANVIL_QUALIFICATION_INDEX_COMPACTION_MAX_LANES=4 \
+ANVIL_QUALIFICATION_INDEX_RAYON_WORKERS=4 \
+ANVIL_QUALIFICATION_INDEX_MAX_ANONYMOUS_GROWTH_BYTES=2147483648 \
+  ANVIL_IMAGE=anvil:local ./scripts/qualify-single-node.sh
+ANVIL_QUALIFICATION_MODE=release \
+  ANVIL_IMAGE=anvil:local ./scripts/qualify-three-node.sh
 ```
 
 The production-shaped index qualification generates 839,980 private-data-free
@@ -727,9 +743,9 @@ ANVIL_V06_RESOURCE_BUCKET=index-resource \
 ANVIL_V06_RESOURCE_CLIENT_ID=qualification-client \
 ANVIL_V06_RESOURCE_CLIENT_SECRET="$ANVIL_QUALIFICATION_SECRET" \
 ANVIL_V06_RESOURCE_CONTAINERS=anvil \
-ANVIL_V06_KIND_BUDGET_BYTES=67108864 \
+ANVIL_V06_KIND_BUDGET_BYTES=268435456 \
 ANVIL_V06_INDEX_RAYON_WORKERS=4 \
-ANVIL_V06_MAX_ANONYMOUS_GROWTH_BYTES=536870912 \
+ANVIL_V06_MAX_ANONYMOUS_GROWTH_BYTES=2147483648 \
   cargo run --release --locked -p anvil-server \
     --example v06_index_resource_qualification
 ```

@@ -605,6 +605,48 @@ Elias-Fano/rank/select representations. Inputs remain queryable until every
 replacement object has met artifact durability and a new generation wins its
 current-pointer CAS.
 
+Every index kind uses deterministic range-striped compaction. The merger
+divides a component's ordered key space into non-overlapping half-open ranges,
+and gives each admitted lane one bounded range-local component writer. Lanes
+seal their own immutable leaf and routing blocks and stage those blocks
+concurrently through the ordinary object path. A lane returns only its bounded
+range summary and completed component subtree; it does not stream its complete
+range through a serial output writer.
+
+Components that refer to one dense document-ordinal space use two bounded
+passes. The first pass counts live documents in each range. One ordered prefix
+sum then assigns every lane its dense ordinal base, and the second pass writes
+`base + local_ordinal`. Components without that cross-range requirement write
+in one pass. This preserves dense, non-overlapping ordinals without retaining a
+corpus-sized map or serializing block construction.
+
+After all lanes finish, one coordinator validates their summaries and assembles
+the range subtrees in key order, promoting shorter trees with ordinary routing
+pages where necessary. A fixed range plan therefore produces deterministic
+ordered range output regardless of task completion order. Its leaf and routing
+block boundaries need not be byte-identical to a one-lane run because each
+range is sealed independently. No range is independently visible: the complete
+replacement remains invisible until the existing single generation CAS
+succeeds.
+
+One process-owned Rayon pool is shared by Path, Metadata Filter, Typed JSON,
+Full Text, Vector, Hybrid, Git Source, and Tensor compaction. Each kind has an
+independent maximum-lane setting and an independent byte-budget override; the
+common per-kind setting is only their fallback. Effective lanes are the minimum
+of the kind's configured ceiling, process Rayon workers, deterministic ranges
+available, and lanes affordable within that kind's existing shared budget. The
+budget charges the first lane and ordered root-assembly workspace once, then
+one bounded reader/writer workspace for each additional lane. No lane creates a
+private execution pool, unbounded queue, complete in-memory range, or a second
+persistence path.
+
+The default profile is four Rayon workers, four compaction lanes per kind, and
+256 MiB of construction memory per kind. Across all eight kinds that is a 2 GiB
+aggregate construction ceiling when every pool is simultaneously saturated.
+Operators may reduce or raise each kind independently without changing index
+correctness or durable bytes; setting a kind to one lane selects the sequential
+execution profile.
+
 The public API therefore appears mutable while durable index storage stays
 immutable. Anvil does not add mutable distributed index pages, another WAL, or
 an index-specific replication plane.
@@ -820,8 +862,13 @@ OTLP metrics and traces expose, without payloads or mutable names:
 - startup head-scan count, which must remain zero;
 - scoped snapshot records/bytes, last-progress time, and journal suffix lag;
 - complete membership/source/atomic barrier state;
-- configured, leased, peak, and waiting construction bytes by kind;
-- builder flushes, run levels, compaction input/output, and publication CAS;
+- configured, leased, resident, workspace, peak, and waiting construction bytes
+  by kind;
+- builder flushes, run levels, publication CAS, and generation freshness;
+- compaction configured/effective/active/waiting lanes, limiting factor, level,
+  ranges total/completed, input records/blocks/bytes, output
+  records/blocks/bytes, duration, last-progress age, failures, and retries by
+  kind;
 - accounting rollup age and source lag;
 - accounting traffic pending/dropped batches and bytes, oldest pending age,
   matcher retries, bucket-cache age, and definition-propagation lag;
@@ -833,6 +880,12 @@ OTLP metrics and traces expose, without payloads or mutable names:
 Logs may identify stable numeric tenant, bucket, and definition IDs. They never
 log definition bodies, source payloads, selected JSON values, query vectors,
 credentials, tokens, or proprietary path names.
+
+Long-running rebuild, catch-up, compaction, and publication phases have trace
+spans carrying stable numeric identities and bounded progress fields. Metrics
+use only low-cardinality kind, phase, level, outcome, and limiting-factor
+labels. Stable IDs are never metric labels, and ordinary per-object index or
+upload work does not produce success logs.
 
 ## 21. Validation matrix
 
@@ -874,6 +927,18 @@ credentials, tokens, or proprietary path names.
 - Each supported index kind performs initial build, routed incremental update,
   overwrite, tombstone, compaction, pagination, and query after restart through
   the public API.
+- For every index kind, one-lane and four-lane compaction over the same runs
+  produce the same logical ordered records, run statistics, and query results.
+  Four-lane component descriptors are ordered, disjoint, and independently
+  validated; their block boundaries and hashes need not equal a one-lane run.
+- Repeating a fixed range plan with deliberately reordered lane completion
+  produces the same range-local output and ordered subtree assembly.
+- A failed, cancelled, or stalled stripe cannot publish a partial replacement;
+  the coordinator fails the compaction and terminates every sibling lane.
+- Dense-ordinal engines verify both pass-one counts and pass-two ordinal bases,
+  including empty ranges and overflow rejection.
+- Effective-lane tests independently cover the configured, Rayon-worker,
+  available-range, and per-kind-memory limits.
 - Writes through all three cluster ingress nodes reach one builder.
 - A real journal gap performs one scoped snapshot and never reads another bucket.
 - Atomic-program paths publish in one complete generation/rollup barrier.

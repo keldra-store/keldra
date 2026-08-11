@@ -76,11 +76,26 @@ preceding complete generation. Splitting that application record across
 ordinary source objects is the current workaround.
 
 Each level contains at most four runs. A fifth run triggers compaction of the
-four oldest inputs into one run at the next level. Fixed compaction admission
-includes `4 * (512 KiB encoded + approximately 4 MiB decoded)` before work
-starts, so many immutable runs cannot multiply one compaction's anonymous
-memory. A compaction still has to scan its inputs and exact vector query cost
-remains linear; these are bounded latency costs rather than unbounded memory.
+four oldest inputs into one run at the next level. Anvil 0.7 divides every
+index kind's merge into deterministic, non-overlapping key ranges and prepares
+up to four ranges concurrently by default. The actual lane count is capped by
+that kind's configured lane limit, the process Rayon workers, the ranges
+available in that component, and its shared construction-memory pool. A narrow
+key space can therefore use fewer lanes, and a one-lane configuration preserves
+the sequential path. Each lane owns a bounded writer and stages immutable
+range-local blocks concurrently through the ordinary object path. Components
+that need globally dense document ordinals first count each range, derive dense
+bases with an ordered prefix sum, and then scan the ranges again while writing;
+those components therefore pay a bounded two-pass input-read cost.
+
+The coordinator validates completed range summaries and assembles their
+subtrees in key order before the one complete-generation publication CAS. A
+fixed range plan has deterministic ordered output, but independently sealed
+ranges may have different leaf and routing block boundaries from a one-lane
+run; logical records and query results remain equivalent. No range becomes
+visible independently. A compaction still has to scan its inputs and exact
+vector query cost remains linear; these are bounded latency costs rather than
+unbounded memory.
 
 The first merged representation uses `sux` Elias–Fano sequences and rear-coded
 dictionaries where those structures directly fit an engine. It does not yet
