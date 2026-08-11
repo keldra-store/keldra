@@ -4,7 +4,9 @@
 //! map. It has no protobuf representation and is never inferred from caller
 //! input, bearer claims, or an ordinary routed-public peer request.
 
-use anvil_store::ObjectKey;
+use std::collections::BTreeMap;
+
+use anvil_store::{DefinitionMutationIntent, ObjectKey};
 use tonic::{Request, Status};
 
 const PROGRAM_DEFINITION_PREFIX: &str = "_anvil/programs/";
@@ -23,6 +25,7 @@ struct InternalObjectRequest;
 /// Its fields are private so another module cannot manufacture internal access.
 pub(crate) struct ObjectPathAccess {
     internal: bool,
+    definition_intents: BTreeMap<usize, DefinitionMutationIntent>,
 }
 
 pub(crate) fn access_for<T>(request: &Request<T>) -> ObjectPathAccess {
@@ -31,12 +34,38 @@ pub(crate) fn access_for<T>(request: &Request<T>) -> ObjectPathAccess {
             .extensions()
             .get::<InternalObjectRequest>()
             .is_some(),
+        definition_intents: request
+            .extensions()
+            .get::<DefinitionMutationIntents>()
+            .map(|intents| intents.0.clone())
+            .unwrap_or_default(),
     }
 }
+
+#[derive(Clone, Debug, Default)]
+struct DefinitionMutationIntents(BTreeMap<usize, DefinitionMutationIntent>);
 
 /// Marks one request created by the index lifecycle adapter inside this process.
 pub(crate) fn mark_index<T>(request: &mut Request<T>) {
     request.extensions_mut().insert(InternalObjectRequest);
+}
+
+/// Marks one exact operation issued by the trusted index lifecycle service.
+///
+/// The evidence is process-local and cannot be supplied by a public client.
+/// When the path coordinator is remote, the authenticated private peer route
+/// carries the same typed fields and reconstructs this evidence there.
+pub(crate) fn mark_index_definition<T>(
+    request: &mut Request<T>,
+    operation_index: usize,
+    intent: DefinitionMutationIntent,
+) {
+    request.extensions_mut().insert(InternalObjectRequest);
+    let mut intents = BTreeMap::new();
+    intents.insert(operation_index, intent);
+    request
+        .extensions_mut()
+        .insert(DefinitionMutationIntents(intents));
 }
 
 /// Marks one request created by the in-process PersonalDB adapter. The marker
@@ -58,12 +87,30 @@ pub(crate) fn mark_internal_peer_route<T>(request: &mut Request<T>) {
     request.extensions_mut().insert(InternalObjectRequest);
 }
 
+/// Restores typed definition evidence only after the private route has passed
+/// mandatory peer authentication and bounded protobuf validation.
+pub(crate) fn mark_internal_peer_definition_route<T>(
+    request: &mut Request<T>,
+    intents: impl IntoIterator<Item = (usize, DefinitionMutationIntent)>,
+) {
+    request.extensions_mut().insert(InternalObjectRequest);
+    request
+        .extensions_mut()
+        .insert(DefinitionMutationIntents(intents.into_iter().collect()));
+}
+
 pub(crate) fn require_key(access: &ObjectPathAccess, key: &ObjectKey) -> Result<(), Status> {
     require_path(access, key.path())
 }
 
 pub(crate) fn require_public_key(key: &ObjectKey) -> Result<(), Status> {
-    require_path(&ObjectPathAccess { internal: false }, key.path())
+    require_path(
+        &ObjectPathAccess {
+            internal: false,
+            definition_intents: BTreeMap::new(),
+        },
+        key.path(),
+    )
 }
 
 pub(crate) fn require_path(access: &ObjectPathAccess, path: &str) -> Result<(), Status> {
@@ -78,6 +125,34 @@ pub(crate) fn require_path(access: &ObjectPathAccess, path: &str) -> Result<(), 
 
 pub(crate) fn is_internal(access: &ObjectPathAccess) -> bool {
     access.internal
+}
+
+pub(crate) fn definition_intent(
+    access: &ObjectPathAccess,
+    operation_index: usize,
+) -> Option<DefinitionMutationIntent> {
+    access.definition_intents.get(&operation_index).copied()
+}
+
+pub(crate) fn validate_definition_intents(
+    access: &ObjectPathAccess,
+    operation_count: usize,
+) -> Result<(), Status> {
+    if !access.internal && !access.definition_intents.is_empty() {
+        return Err(Status::permission_denied(
+            "definition mutation evidence requires internal object access",
+        ));
+    }
+    if access
+        .definition_intents
+        .keys()
+        .any(|index| *index >= operation_count)
+    {
+        return Err(Status::invalid_argument(
+            "definition mutation evidence names an invalid bulk operation",
+        ));
+    }
+    Ok(())
 }
 
 fn classify(path: &str) -> ObjectPathClass {

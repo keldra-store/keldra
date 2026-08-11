@@ -42,6 +42,7 @@ fn snapshot(version: u64, predecessor: Option<u64>, branch: u8) -> ObjectPathSna
             deleted: false,
             committed_at_unix_millis: version,
         }],
+        definition_locator: None,
     }
 }
 
@@ -49,6 +50,17 @@ fn baseline() -> ObjectPathSnapshot {
     let mut baseline = snapshot(1, None, 1);
     baseline.head.mutation_stamp = None;
     baseline
+}
+
+fn current_snapshot(version: u64, predecessor: Option<u64>, branch: u8) -> CurrentObjectSnapshot {
+    let snapshot = snapshot(version, predecessor, branch);
+    CurrentObjectSnapshot {
+        tenant_id: snapshot.tenant_id,
+        bucket_id: snapshot.bucket_id,
+        exact_path: snapshot.exact_path,
+        head: snapshot.head,
+        version: snapshot.versions.into_iter().next().unwrap(),
+    }
 }
 
 async fn stores(count: usize) -> (tempfile::TempDir, Vec<Store>) {
@@ -109,6 +121,103 @@ async fn one_of_one_selects_the_complete_local_state() {
     install(&stores[0], Some(&expected)).await;
 
     assert_eq!(reconcile_stores(&stores, 1).await.unwrap(), Some(expected));
+}
+
+#[test]
+fn current_only_selector_requires_the_same_quorum_without_history() {
+    let selected = current_snapshot(9, Some(8), 9);
+    let stale = current_snapshot(8, Some(7), 8);
+    assert_eq!(
+        select_current_object_snapshot_quorum(
+            &[Some(selected.clone()), Some(stale), Some(selected.clone())],
+            2,
+            3,
+        )
+        .unwrap(),
+        Some(selected)
+    );
+}
+
+#[test]
+fn current_only_two_of_two_accepts_one_direct_successor() {
+    let predecessor = current_snapshot(8, Some(7), 8);
+    let successor = current_snapshot(9, Some(8), 9);
+    assert_eq!(
+        select_current_object_snapshot_quorum(&[Some(predecessor), Some(successor.clone())], 2, 2,)
+            .unwrap(),
+        Some(successor)
+    );
+}
+
+#[test]
+fn guarded_read_rejects_an_unreplicated_coordinator_successor() {
+    let expected = current_snapshot(1, None, 1);
+    let coordinator_successor = current_snapshot(2, Some(1), 2);
+
+    let error = select_guarded_current_object_snapshot_quorum(
+        &[
+            Some(coordinator_successor),
+            Some(expected.clone()),
+            Some(expected),
+        ],
+        VersionId(1),
+        2,
+        3,
+    )
+    .unwrap_err();
+
+    assert_eq!(error.code(), Code::Unavailable);
+}
+
+#[test]
+fn guarded_read_rejects_an_unreplicated_coordinator_delete() {
+    let expected = current_snapshot(1, None, 1);
+    let mut coordinator_delete = current_snapshot(2, Some(1), 2);
+    coordinator_delete.head.deleted = true;
+    coordinator_delete.version.deleted = true;
+    coordinator_delete.version.blob = None;
+
+    let error = select_guarded_current_object_snapshot_quorum(
+        &[
+            Some(coordinator_delete),
+            Some(expected.clone()),
+            Some(expected),
+        ],
+        VersionId(1),
+        2,
+        3,
+    )
+    .unwrap_err();
+
+    assert_eq!(error.code(), Code::Unavailable);
+}
+
+#[test]
+fn guarded_read_accepts_only_an_exact_expected_quorum_without_a_conflicting_candidate() {
+    let expected = current_snapshot(1, None, 1);
+    assert_eq!(
+        select_guarded_current_object_snapshot_quorum(
+            &[Some(expected.clone()), Some(expected.clone()), None],
+            VersionId(1),
+            2,
+            3,
+        )
+        .unwrap(),
+        expected
+    );
+
+    let successor = current_snapshot(2, Some(1), 2);
+    assert_eq!(
+        select_guarded_current_object_snapshot_quorum(
+            &[Some(current_snapshot(1, None, 1)), Some(successor)],
+            VersionId(2),
+            2,
+            2,
+        )
+        .unwrap_err()
+        .code(),
+        Code::Unavailable
+    );
 }
 
 #[tokio::test]

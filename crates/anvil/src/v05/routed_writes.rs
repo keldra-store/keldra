@@ -41,6 +41,7 @@ impl RoutedObjectWrites {
         call: RoutedCall<T>,
         internal: bool,
     ) -> Result<Request<T>, Status> {
+        let definition_intents = call.definition_intents().to_vec();
         let bearer = call.bearer().to_owned();
         let caller = self
             .service
@@ -57,7 +58,14 @@ impl RoutedObjectWrites {
         request.extensions_mut().insert(caller);
         request.extensions_mut().insert(RoutedDestination);
         if internal {
-            object_path_access::mark_internal_peer_route(&mut request);
+            if definition_intents.is_empty() {
+                object_path_access::mark_internal_peer_route(&mut request);
+            } else {
+                object_path_access::mark_internal_peer_definition_route(
+                    &mut request,
+                    definition_intents,
+                );
+            }
         }
         Ok(request)
     }

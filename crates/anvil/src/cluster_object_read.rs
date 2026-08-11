@@ -9,8 +9,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use anvil_store::{
-    BlobRef, ErasureError, ErasureProfile, ObjectKey, ObjectPathSnapshot, PlacementLogId, Version,
-    VersionId,
+    BlobRef, CurrentObjectSnapshot, ErasureError, ErasureProfile, ObjectKey, ObjectPathSnapshot,
+    PlacementLogId, Version, VersionId,
 };
 use tonic::Status;
 
@@ -37,6 +37,13 @@ trait ObjectReadMetadata: Send + Sync {
         self.reconciled_snapshot(key).await
     }
 
+    async fn reconciled_current_snapshot_stable(
+        &self,
+        key: &ObjectKey,
+        tenant_id: u64,
+        bucket_id: u64,
+    ) -> Result<Option<CurrentObjectSnapshot>, Status>;
+
     fn current_placement(&self) -> Result<Arc<dyn PayloadReadPlacementView>, Status>;
 
     fn require_current_fence(&self, expected: PlacementLogId) -> Result<(), Status>;
@@ -58,6 +65,16 @@ impl ObjectReadMetadata for ObjectDistribution {
         bucket_id: u64,
     ) -> Result<Option<ObjectPathSnapshot>, Status> {
         self.reconciled_object_snapshot_stable(key, tenant_id, bucket_id)
+            .await
+    }
+
+    async fn reconciled_current_snapshot_stable(
+        &self,
+        key: &ObjectKey,
+        tenant_id: u64,
+        bucket_id: u64,
+    ) -> Result<Option<CurrentObjectSnapshot>, Status> {
+        self.reconciled_current_object_snapshot_stable(key, tenant_id, bucket_id)
             .await
     }
 
@@ -173,6 +190,93 @@ impl ClusterObjectReader {
         }
         self.metadata.require_current_fence(placement.fence())?;
         Ok(snapshot)
+    }
+
+    /// Returns only the authoritative current head and the immutable version
+    /// descriptor it names. Retained historical descriptors are deliberately
+    /// outside this bounded read.
+    pub(crate) async fn current_head_snapshot_stable(
+        &self,
+        key: &ObjectKey,
+        tenant_id: u64,
+        bucket_id: u64,
+    ) -> Result<Option<CurrentObjectSnapshot>, Status> {
+        let placement = self.metadata.current_placement()?;
+        let snapshot = self
+            .metadata
+            .reconciled_current_snapshot_stable(key, tenant_id, bucket_id)
+            .await?;
+        if let Some(snapshot) = &snapshot {
+            snapshot
+                .validate()
+                .map_err(|error| Status::data_loss(error.to_string()))?;
+            if snapshot.exact_path != key.path() {
+                return Err(Status::data_loss(
+                    "current object quorum returned another exact path",
+                ));
+            }
+        }
+        self.metadata.require_current_fence(placement.fence())?;
+        Ok(snapshot)
+    }
+
+    /// Opens only the authoritative current descriptor through the bounded
+    /// current-head quorum path. Retained historical descriptors are neither
+    /// transferred nor decoded.
+    pub(crate) async fn open_current_stable(
+        &self,
+        key: &ObjectKey,
+        tenant_id: u64,
+        bucket_id: u64,
+    ) -> Result<Option<ClusterOpenedObject>, Status> {
+        let placement = self.metadata.current_placement()?;
+        let snapshot = self
+            .metadata
+            .reconciled_current_snapshot_stable(key, tenant_id, bucket_id)
+            .await?;
+        let Some(snapshot) = snapshot else {
+            self.metadata.require_current_fence(placement.fence())?;
+            return Ok(None);
+        };
+        snapshot
+            .validate()
+            .map_err(|error| Status::data_loss(error.to_string()))?;
+        if snapshot.tenant_id != tenant_id
+            || snapshot.bucket_id != bucket_id
+            || snapshot.exact_path != key.path()
+        {
+            return Err(Status::data_loss(
+                "current object quorum returned another object identity",
+            ));
+        }
+        self.metadata.require_current_fence(placement.fence())?;
+
+        let program_commit_cursor = snapshot
+            .head
+            .mutation_stamp
+            .and_then(|stamp| stamp.program_commit_cursor);
+        let version = snapshot.version;
+        let payload = match (&version.blob, version.deleted) {
+            (None, true) => None,
+            (Some(reference), false) => {
+                let shared =
+                    SharedOutputSpool::new(self.spools.create().map_err(|error| {
+                        Status::internal(format!("create read spool: {error}"))
+                    })?);
+                self.payload
+                    .read(placement.as_ref(), reference, shared.clone())
+                    .await
+                    .map_err(payload_status)?;
+                Some(shared.into_payload()?)
+            }
+            _ => return Err(Status::data_loss("version has an invalid payload shape")),
+        };
+        self.metadata.require_current_fence(placement.fence())?;
+        Ok(Some(ClusterOpenedObject {
+            version,
+            payload,
+            program_commit_cursor,
+        }))
     }
 
     /// Selects current or exact-version metadata and reconstructs live bytes

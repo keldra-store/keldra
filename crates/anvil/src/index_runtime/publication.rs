@@ -4,8 +4,9 @@ use std::sync::{Arc, OnceLock};
 
 use anvil_consensus::NodeId;
 use anvil_store::{
-    BatchOperation, BlobRef, DeleteRequest, DeleteRetainedVersionOutcome, Durability, ObjectKey,
-    ObjectVersioning, Precondition, PublishRequest, PutMode, VersionId,
+    BatchOperation, BlobRef, DefinitionKind, DefinitionMutationIntent, DeleteRequest,
+    DeleteRetainedVersionOutcome, Durability, ObjectKey, ObjectVersioning, Precondition,
+    PublishRequest, PutMode, Store, VersionId,
 };
 use tonic::Status;
 
@@ -18,6 +19,51 @@ use super::placement::{IndexIdentity, IndexPlacement};
 
 const INDEX_ARTIFACT_CONTENT_TYPE: &str = "application/vnd.anvil.index-artifact";
 const ACCOUNTING_ARTIFACT_CONTENT_TYPE: &str = "application/vnd.anvil.accounting+json";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DefinitionVersionGuard {
+    pub kind: DefinitionKind,
+    pub exact_path: String,
+    pub expected_version: VersionId,
+}
+
+impl DefinitionVersionGuard {
+    fn key(&self, storage_tenant: &str, bucket: &str) -> Result<ObjectKey, Status> {
+        ObjectKey::new(storage_tenant, bucket, &self.exact_path)
+            .map_err(|error| Status::invalid_argument(error.to_string()))
+    }
+
+    fn validate(
+        &self,
+        request: &IndexArtifactPublish,
+        artifact_kind: ArtifactPathKind,
+    ) -> Result<(), Status> {
+        if self.expected_version.0 == 0 {
+            return Err(Status::invalid_argument(
+                "guarded definition version must be non-zero",
+            ));
+        }
+        let valid_path = match (artifact_kind, self.kind) {
+            (ArtifactPathKind::Current, DefinitionKind::Index) => {
+                index_definition_name(&self.exact_path).is_some()
+            }
+            (ArtifactPathKind::AccountingMutable, DefinitionKind::Accounting) => {
+                crate::accounting::definition_path(request.index_id)
+                    .ok()
+                    .as_deref()
+                    == Some(self.exact_path.as_str())
+            }
+            _ => false,
+        };
+        if !valid_path {
+            return Err(Status::invalid_argument(
+                "guarded publication does not name its exact definition path",
+            ));
+        }
+        self.key(&request.storage_tenant, &request.bucket)?;
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct IndexArtifactPublish {
@@ -32,6 +78,13 @@ pub(crate) struct IndexArtifactPublish {
     /// Presence replaces only the current pointer at this exact version.
     pub expected_version: Option<VersionId>,
     pub command_id: String,
+    /// Exact authoritative definition revision which must remain live while
+    /// the mutable current pointer or accounting rollup is committed.
+    pub definition_guard: Option<DefinitionVersionGuard>,
+    /// Trusted typed evidence for an ordinary definition mutation. Generic
+    /// generation, current, rollup, and traffic-source artifacts leave this
+    /// absent.
+    pub definition_intent: Option<DefinitionMutationIntent>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,6 +103,7 @@ pub(crate) struct IndexArtifactDelete {
     pub exact_path: String,
     pub expected_version: VersionId,
     pub command_id: String,
+    pub definition_intent: Option<DefinitionMutationIntent>,
 }
 
 impl IndexArtifactDelete {
@@ -69,7 +123,14 @@ impl IndexArtifactDelete {
                 "index artifact identity, expected version, and command ID must be non-empty",
             ));
         }
-        parse_artifact_path(&self.exact_path, self.index_id)
+        let kind = parse_artifact_path(&self.exact_path, self.index_id)?;
+        validate_definition_intent(
+            kind,
+            &self.exact_path,
+            self.index_id,
+            self.definition_intent,
+        )?;
+        Ok(kind)
     }
 }
 
@@ -91,6 +152,12 @@ impl IndexArtifactPublish {
             ));
         }
         let kind = parse_artifact_path(&self.exact_path, self.index_id)?;
+        validate_definition_intent(
+            kind,
+            &self.exact_path,
+            self.index_id,
+            self.definition_intent,
+        )?;
         match (kind, self.expected_version) {
             (ArtifactPathKind::Current, Some(VersionId(0))) => Err(Status::invalid_argument(
                 "index current-pointer expected version must be non-zero",
@@ -103,7 +170,28 @@ impl IndexArtifactPublish {
             (ArtifactPathKind::Immutable, Some(_)) => Err(Status::invalid_argument(
                 "immutable index generation artifacts cannot be replaced",
             )),
+        }?;
+        let guard_required = kind == ArtifactPathKind::Current
+            || (kind == ArtifactPathKind::AccountingMutable
+                && crate::accounting::current_path(self.index_id)
+                    .ok()
+                    .as_deref()
+                    == Some(self.exact_path.as_str()));
+        match (guard_required, self.definition_guard.as_ref()) {
+            (true, Some(guard)) => guard.validate(self, kind)?,
+            (false, None) => {}
+            (true, None) => {
+                return Err(Status::invalid_argument(
+                    "mutable index/accounting publication requires an exact definition guard",
+                ));
+            }
+            (false, Some(_)) => {
+                return Err(Status::invalid_argument(
+                    "definition guards are valid only for current index/accounting publication",
+                ));
+            }
         }
+        Ok(kind)
     }
 }
 
@@ -119,6 +207,14 @@ enum ArtifactPathKind {
 pub(crate) trait IndexArtifactPublication: Send + Sync + 'static {
     async fn publish(
         &self,
+        authenticated_builder: NodeId,
+        placement: ClusterPlacement,
+        request: IndexArtifactPublish,
+    ) -> Result<IndexArtifactOutcome, Status>;
+
+    async fn commit_guarded(
+        &self,
+        authenticated_definition_coordinator: NodeId,
         authenticated_builder: NodeId,
         placement: ClusterPlacement,
         request: IndexArtifactPublish,
@@ -179,22 +275,69 @@ impl IndexArtifactPublication for LateBoundIndexArtifactPublication {
             .delete(authenticated_builder, placement, request)
             .await
     }
+
+    async fn commit_guarded(
+        &self,
+        authenticated_definition_coordinator: NodeId,
+        authenticated_builder: NodeId,
+        placement: ClusterPlacement,
+        request: IndexArtifactPublish,
+    ) -> Result<IndexArtifactOutcome, Status> {
+        let handler = self
+            .inner
+            .get()
+            .cloned()
+            .ok_or_else(|| Status::unavailable("index artifact publisher is not ready"))?;
+        handler
+            .commit_guarded(
+                authenticated_definition_coordinator,
+                authenticated_builder,
+                placement,
+                request,
+            )
+            .await
+    }
 }
 
 /// Validates the builder/fence/path and enters the existing ordinary object
 /// coordinator. It owns no bytes or metadata persistence of its own.
 #[derive(Clone)]
 pub(crate) struct IndexArtifactCoordinator {
+    store: Store,
     objects: ObjectDistribution,
     governance: BucketGovernance,
+    peers: ClusterPeerTransport,
 }
 
 impl IndexArtifactCoordinator {
-    pub(crate) fn new(objects: ObjectDistribution, governance: BucketGovernance) -> Self {
+    pub(crate) fn new(
+        store: Store,
+        objects: ObjectDistribution,
+        governance: BucketGovernance,
+        peers: ClusterPeerTransport,
+    ) -> Self {
         Self {
+            store,
             objects,
             governance,
+            peers,
         }
+    }
+
+    fn validate_index_builder(
+        &self,
+        authenticated_builder: NodeId,
+        placement: &ClusterPlacement,
+        identity: IndexIdentity,
+    ) -> Result<(), Status> {
+        let assignment = IndexPlacement::derive(identity, placement)
+            .map_err(|error| Status::unavailable(error.to_string()))?;
+        if assignment.builder() != authenticated_builder {
+            return Err(Status::permission_denied(
+                "index artifact caller is not the current weighted-HRW builder",
+            ));
+        }
+        Ok(())
     }
 
     fn validate_builder(
@@ -204,13 +347,7 @@ impl IndexArtifactCoordinator {
         identity: IndexIdentity,
         key: &ObjectKey,
     ) -> Result<(), Status> {
-        let assignment = IndexPlacement::derive(identity, placement)
-            .map_err(|error| Status::unavailable(error.to_string()))?;
-        if assignment.builder() != authenticated_builder {
-            return Err(Status::permission_denied(
-                "index artifact caller is not the current weighted-HRW builder",
-            ));
-        }
+        self.validate_index_builder(authenticated_builder, placement, identity)?;
         if self
             .objects
             .routing_target_stable(key, identity.tenant_id(), identity.bucket_id())?
@@ -218,6 +355,170 @@ impl IndexArtifactCoordinator {
         {
             return Err(Status::failed_precondition(
                 "index artifact request reached a node that is not its object coordinator",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn publish_guarded(
+        &self,
+        authenticated_builder: NodeId,
+        placement: ClusterPlacement,
+        request: IndexArtifactPublish,
+    ) -> Result<IndexArtifactOutcome, Status> {
+        request.validate()?;
+        // The public/peer middleware already admits routed calls. Builders can
+        // also publish locally, so explicitly retain the same existing
+        // membership-cutover permit across the definition lock and artifact
+        // mutation in that case.
+        let _permit = self.objects.enter_mutation()?;
+        self.require_fence(placement.fence())?;
+        let identity = IndexIdentity::new(request.tenant_id, request.bucket_id, request.index_id)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        self.validate_index_builder(authenticated_builder, &placement, identity)?;
+        let guard = request
+            .definition_guard
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("guarded publication has no guard"))?;
+        let definition_key = guard.key(&request.storage_tenant, &request.bucket)?;
+        let definition_coordinator = self.objects.object_coordinator_stable(
+            &placement,
+            &definition_key,
+            request.tenant_id,
+            request.bucket_id,
+        )?;
+        if definition_coordinator != self.objects.local_node() {
+            return Err(Status::failed_precondition(
+                "guarded publication did not reach the definition-path coordinator",
+            ));
+        }
+
+        let guarded_definition_key = definition_key.clone();
+        self.store
+            .with_ordinary_object_path_lock(&definition_key, move || async move {
+                self.require_current_definition(&placement, &guarded_definition_key, &request)
+                    .await?;
+                let artifact_key = request.key()?;
+                let artifact_coordinator = self.objects.object_coordinator_stable(
+                    &placement,
+                    &artifact_key,
+                    request.tenant_id,
+                    request.bucket_id,
+                )?;
+                let outcome = if artifact_coordinator == self.objects.local_node() {
+                    self.publish_unguarded(authenticated_builder, placement.clone(), request)
+                        .await?
+                } else {
+                    let address = placement.address(artifact_coordinator).ok_or_else(|| {
+                        Status::unavailable(format!(
+                            "ACTIVE artifact coordinator {} has no peer address",
+                            artifact_coordinator.0
+                        ))
+                    })?;
+                    self.peers
+                        .commit_guarded_index_artifact(
+                            artifact_coordinator,
+                            &address.0,
+                            placement.fence(),
+                            authenticated_builder,
+                            &request,
+                        )
+                        .await?
+                };
+                self.require_fence(placement.fence())?;
+                Ok(outcome)
+            })
+            .await
+    }
+
+    async fn publish_unguarded(
+        &self,
+        authenticated_builder: NodeId,
+        placement: ClusterPlacement,
+        request: IndexArtifactPublish,
+    ) -> Result<IndexArtifactOutcome, Status> {
+        let kind = request.validate()?;
+        let identity = IndexIdentity::new(request.tenant_id, request.bucket_id, request.index_id)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let key = request.key()?;
+        let governance = self
+            .governance
+            .resolve(&request.storage_tenant, &request.bucket)
+            .await?;
+        if (governance.tenant_id, governance.bucket_id)
+            != (identity.tenant_id(), identity.bucket_id())
+        {
+            return Err(Status::failed_precondition(
+                "index artifact mutable names no longer bind the supplied stable IDs",
+            ));
+        }
+        self.validate_builder(authenticated_builder, &placement, identity, &key)?;
+        let mode = match (kind, request.expected_version) {
+            (ArtifactPathKind::Current | ArtifactPathKind::AccountingMutable, Some(version)) => {
+                PutMode::PutIfVersion(version)
+            }
+            (
+                ArtifactPathKind::Current
+                | ArtifactPathKind::Immutable
+                | ArtifactPathKind::AccountingMutable,
+                None,
+            ) => PutMode::PutIfAbsent,
+            (ArtifactPathKind::Immutable, Some(_)) => unreachable!("validated above"),
+        };
+        let content_type = match kind {
+            ArtifactPathKind::AccountingMutable => ACCOUNTING_ARTIFACT_CONTENT_TYPE,
+            ArtifactPathKind::Current | ArtifactPathKind::Immutable => INDEX_ARTIFACT_CONTENT_TYPE,
+        };
+        let durability = artifact_durability(kind, placement.placement_nodes().len());
+        let receipt = self
+            .objects
+            .publish_from_source_with_governance_and_definition_intent(
+                PublishRequest {
+                    key,
+                    blob: request.blob,
+                    content_type: Some(content_type.into()),
+                    mode,
+                    command_id: Some(request.command_id),
+                    durability,
+                },
+                authenticated_builder,
+                governance,
+                request.definition_intent,
+            )
+            .await?;
+        Ok(IndexArtifactOutcome {
+            version: receipt.version,
+            replayed: receipt.replayed,
+        })
+    }
+
+    async fn require_current_definition(
+        &self,
+        placement: &ClusterPlacement,
+        key: &ObjectKey,
+        request: &IndexArtifactPublish,
+    ) -> Result<(), Status> {
+        let expected = request
+            .definition_guard
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("guarded publication has no guard"))?;
+        let current = self
+            .objects
+            .guarded_current_object_snapshot_stable(
+                key,
+                request.tenant_id,
+                request.bucket_id,
+                expected.expected_version,
+            )
+            .await?;
+        self.require_fence(placement.fence())?;
+        require_guarded_definition(current.as_ref(), expected.expected_version)
+    }
+
+    fn require_fence(&self, expected: anvil_store::PlacementLogId) -> Result<(), Status> {
+        if self.objects.current_program_placement()?.fence() != expected {
+            return Err(Status::unavailable(
+                "index placement changed during guarded publication",
             ));
         }
         Ok(())
@@ -257,7 +558,10 @@ impl IndexArtifactRouter {
         let placement =
             self.require_local_builder(request.tenant_id, request.bucket_id, request.index_id)?;
         let fence = placement.fence();
-        let key = request.key()?;
+        let key = match request.definition_guard.as_ref() {
+            Some(guard) => guard.key(&request.storage_tenant, &request.bucket)?,
+            None => request.key()?,
+        };
         let outcome =
             match self
                 .objects
@@ -265,7 +569,7 @@ impl IndexArtifactRouter {
             {
                 Some((target, address)) => {
                     self.peers
-                        .publish_index_artifact(target, &address, &request)
+                        .publish_index_artifact(target, &address, fence, &request)
                         .await?
                 }
                 None => {
@@ -354,58 +658,44 @@ impl IndexArtifactPublication for IndexArtifactCoordinator {
         placement: ClusterPlacement,
         request: IndexArtifactPublish,
     ) -> Result<IndexArtifactOutcome, Status> {
-        let kind = request.validate()?;
+        if request.definition_guard.is_some() {
+            self.publish_guarded(authenticated_builder, placement, request)
+                .await
+        } else {
+            self.publish_unguarded(authenticated_builder, placement, request)
+                .await
+        }
+    }
+
+    async fn commit_guarded(
+        &self,
+        authenticated_definition_coordinator: NodeId,
+        authenticated_builder: NodeId,
+        placement: ClusterPlacement,
+        request: IndexArtifactPublish,
+    ) -> Result<IndexArtifactOutcome, Status> {
+        request.validate()?;
+        let guard = request
+            .definition_guard
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("guarded commit has no definition guard"))?;
         let identity = IndexIdentity::new(request.tenant_id, request.bucket_id, request.index_id)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        let key = request.key()?;
-        let governance = self
-            .governance
-            .resolve(&request.storage_tenant, &request.bucket)
-            .await?;
-        if (governance.tenant_id, governance.bucket_id)
-            != (identity.tenant_id(), identity.bucket_id())
+        self.validate_index_builder(authenticated_builder, &placement, identity)?;
+        let definition_key = guard.key(&request.storage_tenant, &request.bucket)?;
+        if self.objects.object_coordinator_stable(
+            &placement,
+            &definition_key,
+            request.tenant_id,
+            request.bucket_id,
+        )? != authenticated_definition_coordinator
         {
-            return Err(Status::failed_precondition(
-                "index artifact mutable names no longer bind the supplied stable IDs",
+            return Err(Status::permission_denied(
+                "guarded artifact commit caller is not the definition-path coordinator",
             ));
         }
-        self.validate_builder(authenticated_builder, &placement, identity, &key)?;
-        let mode = match (kind, request.expected_version) {
-            (ArtifactPathKind::Current | ArtifactPathKind::AccountingMutable, Some(version)) => {
-                PutMode::PutIfVersion(version)
-            }
-            (
-                ArtifactPathKind::Current
-                | ArtifactPathKind::Immutable
-                | ArtifactPathKind::AccountingMutable,
-                None,
-            ) => PutMode::PutIfAbsent,
-            (ArtifactPathKind::Immutable, Some(_)) => unreachable!("validated above"),
-        };
-        let content_type = match kind {
-            ArtifactPathKind::AccountingMutable => ACCOUNTING_ARTIFACT_CONTENT_TYPE,
-            ArtifactPathKind::Current | ArtifactPathKind::Immutable => INDEX_ARTIFACT_CONTENT_TYPE,
-        };
-        let durability = artifact_durability(kind, placement.placement_nodes().len());
-        let receipt = self
-            .objects
-            .publish_from_source_with_governance(
-                PublishRequest {
-                    key,
-                    blob: request.blob,
-                    content_type: Some(content_type.into()),
-                    mode,
-                    command_id: Some(request.command_id),
-                    durability,
-                },
-                authenticated_builder,
-                governance,
-            )
-            .await?;
-        Ok(IndexArtifactOutcome {
-            version: receipt.version,
-            replayed: receipt.replayed,
-        })
+        self.publish_unguarded(authenticated_builder, placement, request)
+            .await
     }
 
     async fn delete(
@@ -430,7 +720,8 @@ impl IndexArtifactPublication for IndexArtifactCoordinator {
             ));
         }
         self.validate_builder(authenticated_builder, &placement, identity, &key)?;
-        if governance.versioning == ObjectVersioning::Enabled {
+        if request.definition_intent.is_none() && governance.versioning == ObjectVersioning::Enabled
+        {
             let outcome = self
                 .objects
                 .delete_retained_version_with_governance(&key, request.expected_version, governance)
@@ -447,7 +738,7 @@ impl IndexArtifactPublication for IndexArtifactCoordinator {
         let durability = artifact_durability(kind, placement.placement_nodes().len());
         let receipt = self
             .objects
-            .mutate_with_governance(
+            .mutate_with_governance_and_definition_intent(
                 BatchOperation::Delete(DeleteRequest {
                     key,
                     precondition: Precondition::Version(request.expected_version),
@@ -455,6 +746,7 @@ impl IndexArtifactPublication for IndexArtifactCoordinator {
                     durability,
                 }),
                 governance,
+                request.definition_intent,
             )
             .await?;
         Ok(IndexArtifactOutcome {
@@ -483,6 +775,28 @@ fn retained_delete_outcome(
                 replayed: false,
             }
         }
+    }
+}
+
+fn require_guarded_definition(
+    current: Option<&anvil_store::CurrentObjectSnapshot>,
+    expected: VersionId,
+) -> Result<(), Status> {
+    match current {
+        Some(current)
+            if !current.head.deleted
+                && current.head.version == expected
+                && current.version.id == expected
+                && !current.version.deleted =>
+        {
+            Ok(())
+        }
+        Some(_) => Err(Status::failed_precondition(
+            "definition changed before guarded artifact publication",
+        )),
+        None => Err(Status::failed_precondition(
+            "definition was deleted before guarded artifact publication",
+        )),
     }
 }
 
@@ -528,6 +842,33 @@ fn parse_artifact_path(path: &str, expected_index: u64) -> Result<ArtifactPathKi
         }
         _ => Err(Status::invalid_argument(
             "index artifact path does not name a v2 current pointer, manifest, run, or component",
+        )),
+    }
+}
+
+fn validate_definition_intent(
+    kind: ArtifactPathKind,
+    path: &str,
+    expected_id: u64,
+    intent: Option<DefinitionMutationIntent>,
+) -> Result<(), Status> {
+    let is_definition = kind == ArtifactPathKind::AccountingMutable
+        && crate::accounting::definition_path(expected_id)
+            .ok()
+            .as_deref()
+            == Some(path);
+    match (is_definition, intent) {
+        (true, Some(intent))
+            if intent.kind == DefinitionKind::Accounting && intent.definition_id == expected_id =>
+        {
+            Ok(())
+        }
+        (false, None) => Ok(()),
+        (true, None) => Err(Status::invalid_argument(
+            "accounting definition mutation requires trusted typed intent",
+        )),
+        _ => Err(Status::invalid_argument(
+            "definition intent does not match the accounting definition path",
         )),
     }
 }
@@ -647,6 +988,28 @@ pub(crate) fn is_index_recovery_path(path: &str, index_id: u64) -> bool {
 mod tests {
     use super::*;
 
+    fn artifact_publish(
+        exact_path: String,
+        definition_guard: Option<DefinitionVersionGuard>,
+    ) -> IndexArtifactPublish {
+        IndexArtifactPublish {
+            storage_tenant: "tenant".into(),
+            bucket: "bucket".into(),
+            tenant_id: 1,
+            bucket_id: 2,
+            index_id: 7,
+            exact_path,
+            blob: BlobRef {
+                hash: [3; 32],
+                length: 1,
+            },
+            expected_version: None,
+            command_id: "publish-guard-test".into(),
+            definition_guard,
+            definition_intent: None,
+        }
+    }
+
     #[test]
     fn only_exact_reserved_artifact_shapes_are_accepted() {
         assert_eq!(
@@ -690,6 +1053,94 @@ mod tests {
             index_definition_name("_anvil/indexes/v2/definitions/a/b"),
             None
         );
+    }
+
+    #[test]
+    fn current_publication_requires_its_exact_typed_definition_guard() {
+        let current = current_path(7);
+        assert!(artifact_publish(current.clone(), None).validate().is_err());
+
+        let valid = DefinitionVersionGuard {
+            kind: DefinitionKind::Index,
+            exact_path: "_anvil/indexes/v2/definitions/search".into(),
+            expected_version: VersionId(9),
+        };
+        assert_eq!(
+            artifact_publish(current.clone(), Some(valid.clone()))
+                .validate()
+                .unwrap(),
+            ArtifactPathKind::Current
+        );
+
+        let mut wrong_kind = valid.clone();
+        wrong_kind.kind = DefinitionKind::Accounting;
+        assert!(
+            artifact_publish(current.clone(), Some(wrong_kind))
+                .validate()
+                .is_err()
+        );
+
+        let mut zero_version = valid;
+        zero_version.expected_version = VersionId(0);
+        assert!(
+            artifact_publish(current, Some(zero_version))
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn guards_are_rejected_on_immutable_or_wrong_accounting_paths() {
+        let index_guard = DefinitionVersionGuard {
+            kind: DefinitionKind::Index,
+            exact_path: "_anvil/indexes/v2/definitions/search".into(),
+            expected_version: VersionId(9),
+        };
+        assert!(
+            artifact_publish(manifest_path(7, [4; 32]), Some(index_guard))
+                .validate()
+                .is_err()
+        );
+
+        let accounting_guard = DefinitionVersionGuard {
+            kind: DefinitionKind::Accounting,
+            exact_path: crate::accounting::definition_path(7).unwrap(),
+            expected_version: VersionId(9),
+        };
+        assert_eq!(
+            artifact_publish(
+                crate::accounting::current_path(7).unwrap(),
+                Some(accounting_guard.clone()),
+            )
+            .validate()
+            .unwrap(),
+            ArtifactPathKind::AccountingMutable
+        );
+        let mut wrong_path = accounting_guard;
+        wrong_path.exact_path = crate::accounting::definition_path(8).unwrap();
+        assert!(
+            artifact_publish(
+                crate::accounting::current_path(7).unwrap(),
+                Some(wrong_path),
+            )
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn accounting_definition_create_and_delete_require_typed_intent() {
+        let path = crate::accounting::definition_path(7).unwrap();
+        let intent = DefinitionMutationIntent::new(DefinitionKind::Accounting, 7).unwrap();
+        let kind = parse_artifact_path(&path, 7).unwrap();
+        assert_eq!(kind, ArtifactPathKind::AccountingMutable);
+        assert!(validate_definition_intent(kind, &path, 7, Some(intent)).is_ok());
+        assert!(validate_definition_intent(kind, &path, 7, None).is_err());
+
+        let current = crate::accounting::current_path(7).unwrap();
+        let kind = parse_artifact_path(&current, 7).unwrap();
+        assert!(validate_definition_intent(kind, &current, 7, Some(intent)).is_err());
+        assert!(validate_definition_intent(kind, &current, 7, None).is_ok());
     }
 
     #[test]

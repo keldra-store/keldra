@@ -50,6 +50,10 @@ impl IndexRequestContext {
         self.bearer.signed_token()
     }
 
+    pub(crate) fn bearer(&self) -> OriginalBearer {
+        self.bearer.clone()
+    }
+
     pub(crate) fn metadata(&self) -> &MetadataMap {
         &self.metadata
     }
@@ -59,18 +63,17 @@ impl IndexRequestContext {
     }
 }
 
-/// One ordinary definition object returned by clustered reserved-path
-/// discovery. `bytes` are the exact object payload; the service decodes them
-/// only after it has authorized the corresponding definition path.
+/// One definition name returned by a scoped ordinary-object prefix listing.
+/// The public service exact-reads and authorizes the ordinary object before
+/// returning any definition content.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ListedIndexDefinition {
     pub(crate) name: String,
-    pub(crate) version: u64,
-    pub(crate) bytes: Vec<u8>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub(crate) struct IndexDefinitionScan {
+    pub(crate) bearer: OriginalBearer,
     pub(crate) tenant: String,
     pub(crate) bucket: String,
     pub(crate) tenant_id: u64,
@@ -105,6 +108,29 @@ pub(crate) trait IndexAuthorization: Send + Sync + 'static {
         caller: &Caller,
         requests: &[(ObjectKey, ObjectPermission)],
     ) -> Result<IndexAuthorizationEvidence, Status>;
+}
+
+#[tonic::async_trait]
+pub(crate) trait IndexDefinitionReader: Send + Sync + 'static {
+    async fn current_snapshot(
+        &self,
+        key: &ObjectKey,
+        tenant_id: u64,
+        bucket_id: u64,
+    ) -> Result<Option<anvil_store::ObjectPathSnapshot>, Status>;
+}
+
+#[tonic::async_trait]
+impl IndexDefinitionReader for crate::cluster_object_read::ClusterObjectReader {
+    async fn current_snapshot(
+        &self,
+        key: &ObjectKey,
+        tenant_id: u64,
+        bucket_id: u64,
+    ) -> Result<Option<anvil_store::ObjectPathSnapshot>, Status> {
+        self.current_snapshot_stable(key, tenant_id, bucket_id)
+            .await
+    }
 }
 
 /// Immutable values to which every opaque query page token is bound.
@@ -176,4 +202,5 @@ pub(crate) struct IndexServiceDependencies {
     pub(crate) queries: Arc<dyn IndexQueryExecutor>,
     pub(crate) authorization: Arc<dyn IndexAuthorization>,
     pub(crate) page_tokens: Arc<dyn IndexPageTokenCodec>,
+    pub(crate) definition_reader: Arc<dyn IndexDefinitionReader>,
 }

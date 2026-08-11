@@ -1,5 +1,6 @@
 //! Streaming v2 run and generation publication through ordinary objects.
 
+use std::io::Read;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -7,18 +8,18 @@ use anvil_index::{
     BlockDescriptor, GeneratedBlock, IndexBlockSink, IndexDirectoryRead, IndexError, IndexFileRead,
     IndexKind, RunBlockWalker, SealedRun,
 };
-use anvil_store::{BlobRef, ObjectKey, Store, VersionId};
+use anvil_store::{BlobRef, DefinitionKind, ObjectKey, Store, VersionId};
 use tonic::Status;
 
 use crate::cluster_object_read::ClusterObjectReader;
-use crate::index_service::StoredIndexDefinition;
+use crate::index_service::{StoredIndexDefinition, definition_path};
 
 use super::engine::IndexBuildDiagnostics;
 use super::events::IndexBarrier;
 use super::generation::{IndexCurrentPointer, IndexGenerationManifest, ManifestRun};
 use super::publication::{
-    IndexArtifactPublish, IndexArtifactRouter, current_path, manifest_path, run_block_path,
-    run_root_path,
+    DefinitionVersionGuard, IndexArtifactPublish, IndexArtifactRouter, current_path, manifest_path,
+    run_block_path, run_root_path,
 };
 
 const STAGED_READ_BUFFER_BYTES: usize = 64 * 1024;
@@ -203,6 +204,12 @@ impl IndexGenerationPublisher {
                 blob: pointer_blob.clone(),
                 expected_version: current.map(|value| value.current_object_version),
                 command_id: content_command(definition.index_id, &current_path, &pointer_blob),
+                definition_guard: Some(DefinitionVersionGuard {
+                    kind: DefinitionKind::Index,
+                    exact_path: definition_path(&definition.name)?,
+                    expected_version: VersionId(definition_version),
+                }),
+                definition_intent: None,
             })
             .await?;
         Ok(PublishedGeneration {
@@ -292,6 +299,8 @@ impl IndexGenerationPublisher {
                 command_id: content_command(definition.index_id, path, &blob),
                 blob,
                 expected_version: None,
+                definition_guard: None,
+                definition_intent: None,
             })
             .await?;
         Ok(outcome.version)

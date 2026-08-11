@@ -19,12 +19,12 @@ use anvil_api::v1::{
     BatchGetRequest, BucketPolicy, BulkOperation, BulkPutRequest, BulkWriteRequest,
     CreateIndexRequest, DeleteIfVersionRequest, DeleteRequest, DeleteVersionRequest,
     DisableAccountingRequest, Durability, EnableAccountingRequest, GetAccountingRequest,
-    GetObjectRequest, HeadObjectRequest, IndexSpecification, InvokeProgramRequest,
-    ListObjectVersionsRequest, ListObjectsRequest, MutationFailureCode, ObjectAddress,
-    ObjectVersioning as ApiObjectVersioning, PathIndexSpec, PutHeader, PutIfAbsentOperation,
-    PutIfVersionOperation, PutImmutableOperation, PutOperation, PutRequest, PutToken,
-    ReadFailureCode, SetBucketPolicyRequest, SetBucketVersioningRequest, WatchNow,
-    WatchPrefixRequest, WatchStateHint,
+    GetIndexRequest, GetObjectRequest, HeadObjectRequest, IndexQuery, IndexSpecification,
+    InvokeProgramRequest, ListObjectVersionsRequest, ListObjectsRequest, MutationFailureCode,
+    ObjectAddress, ObjectVersioning as ApiObjectVersioning, PathIndexQuery, PathIndexSpec,
+    PutHeader, PutIfAbsentOperation, PutIfVersionOperation, PutImmutableOperation, PutOperation,
+    PutRequest, PutToken, QueryIndexRequest, ReadFailureCode, SetBucketPolicyRequest,
+    SetBucketVersioningRequest, UpdateIndexRequest, WatchNow, WatchPrefixRequest, WatchStateHint,
 };
 use anvil_authz::ObjectRef;
 use anvil_store::{
@@ -169,7 +169,10 @@ async fn public_accounting_lifecycle_materializes_scalar_usage() {
     .await
     .unwrap();
 
-    let deadline = Instant::now() + Duration::from_secs(20);
+    // Idle accounting workers yield their bounded lease. The durable
+    // assignment walk revisits them every 30 seconds, so allow one revisit
+    // plus ordinary scheduling margin.
+    let deadline = Instant::now() + Duration::from_secs(45);
     loop {
         let snapshot = accounting
             .get_accounting(authorized(
@@ -363,6 +366,90 @@ async fn raw_reserved_objects_are_denied_but_trusted_adapters_still_work() {
         head(&mut objects, &program, token).await.state,
         Some(HeadState::Present(_))
     ));
+
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn index_lifecycle_requires_zanzibar_access_to_the_definition_object() {
+    let fixture = Fixture::start().await;
+    let owner_token = fixture.access_token.as_str();
+    let denied_token = JwtManager::new(SIGNING_KEY)
+        .unwrap()
+        .mint(StorageTenantId::parse("acme").unwrap(), "unprivileged-app")
+        .unwrap();
+    let mut indexes = IndexServiceClient::new(fixture.channel.clone());
+
+    let create = CreateIndexRequest {
+        bucket: "objects".into(),
+        name: "authorization-boundary".into(),
+        path_prefix: "docs/".into(),
+        content_type: String::new(),
+        specification: Some(IndexSpecification {
+            specification: Some(IndexSpecificationValue::Path(PathIndexSpec {})),
+        }),
+        command_id: "create-authorization-boundary".into(),
+    };
+    assert_permission_denied(
+        indexes
+            .create_index(authorized(create.clone(), &denied_token))
+            .await,
+    );
+
+    let created = indexes
+        .create_index(authorized(create, owner_token))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_permission_denied(
+        indexes
+            .get_index(authorized(
+                GetIndexRequest {
+                    bucket: "objects".into(),
+                    name: "authorization-boundary".into(),
+                },
+                &denied_token,
+            ))
+            .await,
+    );
+    assert_permission_denied(
+        indexes
+            .update_index(authorized(
+                UpdateIndexRequest {
+                    bucket: "objects".into(),
+                    name: "authorization-boundary".into(),
+                    expected_version: created.version,
+                    path_prefix: "docs/updated".into(),
+                    content_type: String::new(),
+                    specification: Some(IndexSpecification {
+                        specification: Some(IndexSpecificationValue::Path(PathIndexSpec {})),
+                    }),
+                    command_id: "update-authorization-boundary".into(),
+                },
+                &denied_token,
+            ))
+            .await,
+    );
+    assert_permission_denied(
+        indexes
+            .query_index(authorized(
+                QueryIndexRequest {
+                    bucket: "objects".into(),
+                    index_name: "authorization-boundary".into(),
+                    query: Some(IndexQuery {
+                        query: Some(anvil_api::v1::index_query::Query::Path(PathIndexQuery {
+                            prefix: String::new(),
+                            start_after: None,
+                        })),
+                    }),
+                    limit: 10,
+                    page_token: Vec::new(),
+                    tenant: String::new(),
+                },
+                &denied_token,
+            ))
+            .await,
+    );
 
     fixture.stop().await;
 }

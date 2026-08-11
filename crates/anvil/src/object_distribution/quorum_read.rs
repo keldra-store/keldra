@@ -2,7 +2,8 @@
 
 use anvil_consensus::NodeId;
 use anvil_store::{
-    ObjectKey, ObjectMutationContext, ObjectPathSnapshot, ObjectSnapshotError, PlacementLogId,
+    CurrentObjectSnapshot, ObjectKey, ObjectMutationContext, ObjectPathSnapshot,
+    ObjectSnapshotError, PlacementLogId, VersionId,
 };
 use tonic::Status;
 
@@ -151,6 +152,127 @@ impl ObjectDistribution {
         Ok(selected)
     }
 
+    /// Selects the authoritative current head and only the descriptor it
+    /// names. This is the bounded metadata read used by incremental derived
+    /// views: retained history is neither transferred nor decoded.
+    pub(crate) async fn reconciled_current_object_snapshot_stable(
+        &self,
+        key: &ObjectKey,
+        tenant_id: u64,
+        bucket_id: u64,
+    ) -> Result<Option<CurrentObjectSnapshot>, Status> {
+        let (initial_fence, observations, required, replica_count) = self
+            .current_object_observations_stable(key, tenant_id, bucket_id)
+            .await?;
+        let selected =
+            select_current_object_snapshot_quorum(&observations, required, replica_count)?;
+        self.require_unchanged_read_fence(initial_fence)?;
+        Ok(selected)
+    }
+
+    /// Guarded derived-view publication is stricter than an ordinary read. The
+    /// expected live definition must itself have an exact quorum, and no
+    /// successfully read replica may expose a different current candidate.
+    /// This prevents a lower quorum from authorizing publication while the
+    /// definition coordinator has already durably written a successor and is
+    /// still replicating it.
+    pub(crate) async fn guarded_current_object_snapshot_stable(
+        &self,
+        key: &ObjectKey,
+        tenant_id: u64,
+        bucket_id: u64,
+        expected_version: VersionId,
+    ) -> Result<Option<CurrentObjectSnapshot>, Status> {
+        let (initial_fence, observations, required, replica_count) = self
+            .current_object_observations_stable(key, tenant_id, bucket_id)
+            .await?;
+        let selected = select_guarded_current_object_snapshot_quorum(
+            &observations,
+            expected_version,
+            required,
+            replica_count,
+        )?;
+        self.require_unchanged_read_fence(initial_fence)?;
+        Ok(Some(selected))
+    }
+
+    async fn current_object_observations_stable(
+        &self,
+        key: &ObjectKey,
+        tenant_id: u64,
+        bucket_id: u64,
+    ) -> Result<
+        (
+            PlacementLogId,
+            Vec<Option<CurrentObjectSnapshot>>,
+            usize,
+            usize,
+        ),
+        Status,
+    > {
+        let initial_fence = self.serving.mutation_context()?.active_placement_log_id;
+        let placement = self.placement()?;
+        if placement.fence() != initial_fence {
+            return Err(changed_fence());
+        }
+        let group = self.replica_group_stable(&placement, tenant_id, bucket_id, key)?;
+
+        let mut observations = Vec::with_capacity(group.replicas().len());
+        let mut reads = tokio::task::JoinSet::new();
+        for node in group.replicas().iter().copied() {
+            if node == self.local_node {
+                match self
+                    .store
+                    .export_current_object_snapshot(tenant_id, bucket_id, key.path())
+                {
+                    Ok(snapshot) => observations.push(snapshot),
+                    Err(error) => tracing::warn!(
+                        node_id = node.0,
+                        %error,
+                        "local current-object replica read failed"
+                    ),
+                }
+                continue;
+            }
+            let Some(address) = placement.address(node).cloned() else {
+                tracing::warn!(node_id = node.0, "object replica has no peer address");
+                continue;
+            };
+            let peers = self.peers.clone();
+            let exact_path = key.path().to_owned();
+            reads.spawn(async move {
+                let result = peers
+                    .read_current_object_snapshot(
+                        node,
+                        &address.0,
+                        tenant_id,
+                        bucket_id,
+                        &exact_path,
+                    )
+                    .await;
+                (node, result)
+            });
+        }
+        while let Some(result) = reads.join_next().await {
+            match result {
+                Ok((_node, Ok(snapshot))) => observations.push(snapshot),
+                Ok((node, Err(error))) => tracing::warn!(
+                    node_id = node.0,
+                    %error,
+                    "remote current-object replica read failed"
+                ),
+                Err(error) => tracing::warn!(%error, "current-object replica read task failed"),
+            }
+        }
+
+        Ok((
+            initial_fence,
+            observations,
+            group.required_acknowledgements(),
+            group.replicas().len(),
+        ))
+    }
+
     async fn repair_observation(
         &self,
         placement: &crate::cluster_placement::ClusterPlacement,
@@ -211,6 +333,108 @@ fn select_quorum_snapshot(
     select_object_snapshot_quorum(&snapshots, required, replica_count)
 }
 
+fn select_current_object_snapshot_quorum(
+    observations: &[Option<CurrentObjectSnapshot>],
+    required: usize,
+    replica_count: usize,
+) -> Result<Option<CurrentObjectSnapshot>, Status> {
+    if required == 0 || required > replica_count || observations.len() < required {
+        return Err(Status::unavailable(format!(
+            "current object metadata read reached {} of {} required replicas",
+            observations.len(),
+            required
+        )));
+    }
+    for observation in observations {
+        if let Some(snapshot) = observation {
+            snapshot.validate().map_err(snapshot_status)?;
+        }
+        let agreeing = observations
+            .iter()
+            .filter(|candidate| *candidate == observation)
+            .count();
+        if agreeing >= required {
+            return Ok(observation.clone());
+        }
+    }
+
+    if required == 2 && replica_count == 2 && observations.len() == 2 {
+        if is_current_direct_successor(&observations[0], &observations[1]) {
+            return Ok(observations[1].clone());
+        }
+        if is_current_direct_successor(&observations[1], &observations[0]) {
+            return Ok(observations[0].clone());
+        }
+    }
+
+    Err(Status::unavailable(
+        "current object replicas have neither an exact quorum nor one direct predecessor-linked successor",
+    ))
+}
+
+fn select_guarded_current_object_snapshot_quorum(
+    observations: &[Option<CurrentObjectSnapshot>],
+    expected_version: VersionId,
+    required: usize,
+    replica_count: usize,
+) -> Result<CurrentObjectSnapshot, Status> {
+    if expected_version.0 == 0 {
+        return Err(Status::invalid_argument(
+            "guarded definition version must be non-zero",
+        ));
+    }
+    if required == 0 || required > replica_count || observations.len() < required {
+        return Err(Status::unavailable(format!(
+            "guarded definition read reached {} of {} required replicas",
+            observations.len(),
+            required
+        )));
+    }
+    for observation in observations.iter().flatten() {
+        observation.validate().map_err(snapshot_status)?;
+    }
+    let Some(expected) = observations
+        .iter()
+        .flatten()
+        .find(|snapshot| {
+            !snapshot.head.deleted
+                && snapshot.head.version == expected_version
+                && snapshot.version.id == expected_version
+                && !snapshot.version.deleted
+        })
+        .cloned()
+    else {
+        return if observations.iter().any(Option::is_some) {
+            Err(Status::failed_precondition(
+                "definition changed before guarded artifact publication",
+            ))
+        } else {
+            Err(Status::failed_precondition(
+                "definition was deleted before guarded artifact publication",
+            ))
+        };
+    };
+    let agreeing = observations
+        .iter()
+        .filter(|candidate| candidate.as_ref() == Some(&expected))
+        .count();
+    if agreeing < required {
+        return Err(Status::unavailable(
+            "guarded definition version has not reached an exact metadata quorum",
+        ));
+    }
+    if observations
+        .iter()
+        .flatten()
+        .any(|candidate| candidate != &expected)
+    {
+        return Err(Status::unavailable(
+            "a conflicting definition candidate is still visible during guarded publication",
+        ));
+    }
+    Ok(expected)
+}
+
 /// Pure complete-record selector shared by serving reads and typed ADD
 /// handoff. Missing objects are explicit `None` observations.
 ///
@@ -261,6 +485,27 @@ pub(crate) fn select_object_snapshot_quorum(
 fn is_direct_successor(
     predecessor: &Option<ObjectPathSnapshot>,
     candidate: &Option<ObjectPathSnapshot>,
+) -> bool {
+    let Some(candidate) = candidate else {
+        return false;
+    };
+    let Some(stamp) = candidate.head.mutation_stamp else {
+        return false;
+    };
+    match predecessor {
+        None => stamp.predecessor_version.is_none(),
+        Some(predecessor) => {
+            predecessor.tenant_id == candidate.tenant_id
+                && predecessor.bucket_id == candidate.bucket_id
+                && predecessor.exact_path == candidate.exact_path
+                && stamp.predecessor_version == Some(predecessor.head.version)
+        }
+    }
+}
+
+fn is_current_direct_successor(
+    predecessor: &Option<CurrentObjectSnapshot>,
+    candidate: &Option<CurrentObjectSnapshot>,
 ) -> bool {
     let Some(candidate) = candidate else {
         return false;

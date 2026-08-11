@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use anvil_api::v1::bulk_outcome::Outcome;
 use anvil_api::v1::{BulkOperation, BulkOutcome, BulkWriteRequest};
 use anvil_consensus::NodeId;
-use anvil_store::BatchOperation;
+use anvil_store::{BatchOperation, DefinitionMutationIntent};
 use tonic::Status;
 
 use super::{api_receipt, api_request_failure};
@@ -17,8 +17,14 @@ pub(super) async fn execute_coordinator_groups(
     distribution: ObjectDistribution,
     peers: ClusterPeerTransport,
     local_indices: Vec<usize>,
-    local_operations: Vec<BatchOperation>,
-    remote: BTreeMap<NodeId, (String, Vec<(usize, BulkOperation)>)>,
+    local_operations: Vec<(BatchOperation, Option<DefinitionMutationIntent>)>,
+    remote: BTreeMap<
+        NodeId,
+        (
+            String,
+            Vec<(usize, BulkOperation, Option<DefinitionMutationIntent>)>,
+        ),
+    >,
     bearer: String,
     internal: bool,
     started: Instant,
@@ -28,7 +34,7 @@ pub(super) async fn execute_coordinator_groups(
     if !local_operations.is_empty() {
         tasks.spawn(async move {
             let outcomes = distribution
-                .mutate_many(local_operations)
+                .mutate_many_with_definition_intents(local_operations)
                 .await
                 .into_iter()
                 .enumerate()
@@ -49,12 +55,19 @@ pub(super) async fn execute_coordinator_groups(
         let bearer = bearer.clone();
         let original_indices = operations
             .iter()
-            .map(|(index, _)| *index)
+            .map(|(index, _, _)| *index)
             .collect::<Vec<_>>();
+        let definition_intents = operations
+            .iter()
+            .enumerate()
+            .filter_map(|(routed_index, (_, _, intent))| {
+                intent.map(|intent| (routed_index, intent))
+            })
+            .collect();
         let request = BulkWriteRequest {
             operations: operations
                 .into_iter()
-                .map(|(_, operation)| operation)
+                .map(|(_, operation, _)| operation)
                 .collect(),
         };
         let remaining = route_budget
@@ -63,7 +76,14 @@ pub(super) async fn execute_coordinator_groups(
         tasks.spawn(async move {
             let routed = if internal {
                 peers
-                    .route_internal_bulk_write(target, &address, &bearer, request, remaining)
+                    .route_internal_bulk_write(
+                        target,
+                        &address,
+                        &bearer,
+                        request,
+                        definition_intents,
+                        remaining,
+                    )
                     .await
             } else {
                 peers

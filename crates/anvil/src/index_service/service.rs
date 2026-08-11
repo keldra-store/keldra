@@ -10,13 +10,14 @@ use anvil_api::v1::object_chunk::Value as ObjectChunkValue;
 use anvil_api::v1::object_head::State as ObjectState;
 use anvil_api::v1::object_service_server::ObjectService;
 use anvil_api::v1::{
-    BulkOperation, BulkPutIfVersionRequest, BulkPutRequest, BulkWriteRequest, BulkWriteResponse,
-    CreateIndexRequest, DeleteIfVersionRequest, DeleteIndexRequest, DeleteIndexResponse,
-    Durability, GetIndexRequest, GetObjectRequest, IndexDefinition, IndexKind, IndexQuery,
-    IndexQueryHit, ListIndexesRequest, ListIndexesResponse, MutationFailure, MutationFailureCode,
-    MutationReceipt, ObjectAddress, QueryIndexRequest, QueryIndexResponse, UpdateIndexRequest,
+    BatchGetRequest, BulkOperation, BulkPutIfVersionRequest, BulkPutRequest, BulkWriteRequest,
+    BulkWriteResponse, CreateIndexRequest, DeleteIfVersionRequest, DeleteIndexRequest,
+    DeleteIndexResponse, Durability, GetIndexRequest, GetObjectRequest, IndexDefinition, IndexKind,
+    IndexQuery, IndexQueryHit, ListIndexesRequest, ListIndexesResponse, MutationFailure,
+    MutationFailureCode, MutationReceipt, ObjectAddress, QueryIndexRequest, QueryIndexResponse,
+    ReadFailureCode, UpdateIndexRequest,
 };
-use anvil_store::{ObjectKey, StorageTenantId};
+use anvil_store::{DefinitionKind, DefinitionMutationIntent, ObjectKey, StorageTenantId};
 use prost::Message;
 use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status};
@@ -135,24 +136,24 @@ impl IndexServiceImpl {
         &self,
         context: &IndexRequestContext,
         operation: BulkOperationValue,
+        intent: DefinitionMutationIntent,
     ) -> Result<MutationReceipt, Status> {
-        let response = ObjectService::bulk_write(
-            &self.objects,
-            forwarded_request(
-                context,
-                BulkWriteRequest {
-                    operations: vec![BulkOperation {
-                        operation: Some(operation),
-                    }],
-                },
-            )?,
-        )
-        .await?
-        .into_inner();
+        let mut request = forwarded_request(
+            context,
+            BulkWriteRequest {
+                operations: vec![BulkOperation {
+                    operation: Some(operation),
+                }],
+            },
+        )?;
+        object_path_access::mark_index_definition(&mut request, 0, intent);
+        let response = ObjectService::bulk_write(&self.objects, request)
+            .await?
+            .into_inner();
         single_bulk_receipt(response)
     }
 
-    async fn authorize_listed_definitions(
+    async fn load_listed_definitions(
         &self,
         context: &IndexRequestContext,
         bucket: &str,
@@ -163,41 +164,71 @@ impl IndexServiceImpl {
         if page.definitions.is_empty() {
             return Ok(Vec::new());
         }
-        let mut keys = Vec::with_capacity(page.definitions.len());
-        for definition in &page.definitions {
-            keys.push(definition_key(context.caller(), bucket, &definition.name)?);
-        }
-        let requests = keys
+        let requests = page
+            .definitions
             .iter()
-            .cloned()
-            .map(|key| (key, ObjectPermission::Get))
-            .collect::<Vec<_>>();
-        let evidence = self
-            .dependencies
-            .authorization
-            .allows_objects_with_evidence(context.caller(), &requests)
-            .await?;
-        validate_authorization_evidence(&evidence, page.definitions.len())?;
-
+            .map(|definition| {
+                let key = definition_key(context.caller(), bucket, &definition.name)?;
+                Ok(GetObjectRequest {
+                    address: Some(api_address(&key)),
+                    version: None,
+                })
+            })
+            .collect::<Result<Vec<_>, Status>>()?;
+        let outcomes = ObjectService::batch_get(
+            &self.objects,
+            forwarded_request(context, BatchGetRequest { objects: requests })?,
+        )
+        .await?
+        .into_inner()
+        .outcomes;
+        if outcomes.len() != page.definitions.len() {
+            return Err(Status::data_loss(
+                "definition batch read returned an invalid outcome count",
+            ));
+        }
         let mut visible = Vec::new();
-        for ((entry, allowed), key) in page.definitions.into_iter().zip(evidence.allowed).zip(keys)
+        for (expected_index, (entry, outcome)) in
+            page.definitions.into_iter().zip(outcomes).enumerate()
         {
-            if !allowed {
-                continue;
-            }
-            if entry.version == 0 {
+            if outcome.index as usize != expected_index {
                 return Err(Status::data_loss(
-                    "listed index definition has a zero version",
+                    "definition batch read returned an invalid outcome index",
                 ));
             }
-            let stored = StoredIndexDefinition::decode(&entry.bytes)?;
+            let Some(outcome) = outcome.outcome else {
+                return Err(Status::data_loss(
+                    "definition batch read returned no outcome",
+                ));
+            };
+            let object = match outcome {
+                anvil_api::v1::batch_get_outcome::Outcome::Object(object) => object,
+                anvil_api::v1::batch_get_outcome::Outcome::Failure(failure)
+                    if ReadFailureCode::try_from(failure.code)
+                        == Ok(ReadFailureCode::AuthorizationDenied) =>
+                {
+                    continue;
+                }
+                anvil_api::v1::batch_get_outcome::Outcome::Failure(failure) => {
+                    return Err(batch_read_failure_status(failure.code, failure.message));
+                }
+            };
+            let Some(head) = object.head else {
+                return Err(Status::data_loss("definition batch object has no head"));
+            };
+            let present = match head.state {
+                Some(ObjectState::Present(present)) => present,
+                Some(ObjectState::Deleted(_)) | Some(ObjectState::NeverExisted(_)) => continue,
+                None => return Err(Status::data_loss("definition batch head has no state")),
+            };
+            if present.version == 0 || present.content_length != object.bytes.len() as u64 {
+                return Err(Status::data_loss(
+                    "definition batch object has invalid version or length evidence",
+                ));
+            }
+            let stored = StoredIndexDefinition::decode(&object.bytes)?;
             require_definition_identity(&stored, context.caller(), bucket, &entry.name)?;
-            if key.path() != definition_path(&entry.name)?.as_str() {
-                return Err(Status::data_loss(
-                    "listed index definition has the wrong object path",
-                ));
-            }
-            visible.push(stored.to_api(entry.version)?);
+            visible.push(stored.to_api(present.version)?);
         }
         Ok(visible)
     }
@@ -216,6 +247,16 @@ impl IndexServiceRpc for IndexServiceImpl {
                 let context = request_context(&request, deadline)?;
                 let request = request.into_inner();
                 validate_create_definition(&request)?;
+                let definition_key =
+                    definition_key(context.caller(), &request.bucket, &request.name)?;
+                authorize_definition_access(
+                    self.dependencies.authorization.as_ref(),
+                    context.caller(),
+                    &definition_key,
+                    ObjectPermission::Put,
+                    "index definition create is not authorized",
+                )
+                .await?;
                 let tenant = context.caller().storage_tenant().as_str().to_owned();
                 let (tenant_id, bucket_id) = self
                     .names
@@ -239,6 +280,8 @@ impl IndexServiceRpc for IndexServiceImpl {
                             command_id: request.command_id,
                             durability: Durability::Local as i32,
                         }),
+                        DefinitionMutationIntent::new(DefinitionKind::Index, index_id)
+                            .map_err(|error| Status::internal(error.to_string()))?,
                     )
                     .await?;
                 stored.to_api(receipt.version).map(Response::new)
@@ -259,6 +302,16 @@ impl IndexServiceRpc for IndexServiceImpl {
                 let context = request_context(&request, deadline)?;
                 let request = request.into_inner();
                 validate_update_definition(&request)?;
+                let definition_key =
+                    definition_key(context.caller(), &request.bucket, &request.name)?;
+                authorize_definition_access(
+                    self.dependencies.authorization.as_ref(),
+                    context.caller(),
+                    &definition_key,
+                    ObjectPermission::Put,
+                    "index definition update is not authorized",
+                )
+                .await?;
                 let current = self
                     .load_definition(&context, &request.bucket, &request.name)
                     .await?;
@@ -274,6 +327,11 @@ impl IndexServiceRpc for IndexServiceImpl {
                             durability: Durability::Local as i32,
                             expected_version: request.expected_version,
                         }),
+                        DefinitionMutationIntent::new(
+                            DefinitionKind::Index,
+                            current.stored.index_id,
+                        )
+                        .map_err(|error| Status::data_loss(error.to_string()))?,
                     )
                     .await?;
                 updated.to_api(receipt.version).map(Response::new)
@@ -293,6 +351,16 @@ impl IndexServiceRpc for IndexServiceImpl {
             async {
                 let context = request_context(&request, deadline)?;
                 let request = request.into_inner();
+                let definition_key =
+                    definition_key(context.caller(), &request.bucket, &request.name)?;
+                authorize_definition_access(
+                    self.dependencies.authorization.as_ref(),
+                    context.caller(),
+                    &definition_key,
+                    ObjectPermission::Get,
+                    "index definition read is not authorized",
+                )
+                .await?;
                 self.load_definition(&context, &request.bucket, &request.name)
                     .await
                     .map(|loaded| Response::new(loaded.api))
@@ -328,6 +396,7 @@ impl IndexServiceRpc for IndexServiceImpl {
                         .dependencies
                         .definitions
                         .scan(IndexDefinitionScan {
+                            bearer: context.bearer(),
                             tenant: tenant.clone(),
                             bucket: request.bucket.clone(),
                             tenant_id,
@@ -351,7 +420,7 @@ impl IndexServiceRpc for IndexServiceImpl {
                         .ok_or_else(|| Status::data_loss("index definition scan page is empty"))?;
                     let has_more = page.has_more;
                     visible.extend(
-                        self.authorize_listed_definitions(
+                        self.load_listed_definitions(
                             &context,
                             &request.bucket,
                             page,
@@ -393,20 +462,50 @@ impl IndexServiceRpc for IndexServiceImpl {
                 }
                 validate_command_id(&request.command_id)?;
                 let key = definition_key(context.caller(), &request.bucket, &request.name)?;
-                let receipt = ObjectService::delete_if_version(
-                    &self.objects,
-                    forwarded_request(
+                let tenant = context.caller().storage_tenant().as_str();
+                let (tenant_id, bucket_id) = self
+                    .names
+                    .resolve_bucket_ids(tenant, &request.bucket)
+                    .await?;
+                let snapshot = authorized_definition_snapshot(
+                    self.dependencies.authorization.as_ref(),
+                    self.dependencies.definition_reader.as_ref(),
+                    context.caller(),
+                    &key,
+                    tenant_id,
+                    bucket_id,
+                )
+                .await?
+                .ok_or_else(|| Status::not_found("index definition does not exist"))?;
+                if snapshot.head.deleted {
+                    return Err(Status::not_found("index definition does not exist"));
+                }
+                let locator = snapshot
+                    .definition_locator
+                    .ok_or_else(|| Status::data_loss("index definition has no typed locator"))?;
+                if locator.kind != DefinitionKind::Index
+                    || locator.tenant_id != tenant_id
+                    || locator.bucket_id != bucket_id
+                    || locator.path != key.path()
+                    || locator.object_version != snapshot.head.version
+                {
+                    return Err(Status::data_loss(
+                        "index definition locator disagrees with its object head",
+                    ));
+                }
+                let receipt = self
+                    .write_definition(
                         &context,
-                        DeleteIfVersionRequest {
+                        BulkOperationValue::DeleteIfVersion(DeleteIfVersionRequest {
                             address: Some(api_address(&key)),
                             command_id: request.command_id,
                             durability: Durability::Local as i32,
                             expected_version: request.expected_version,
-                        },
-                    )?,
-                )
-                .await?
-                .into_inner();
+                        }),
+                        DefinitionMutationIntent::new(DefinitionKind::Index, locator.definition_id)
+                            .map_err(|error| Status::data_loss(error.to_string()))?,
+                    )
+                    .await?;
                 if !receipt.deleted {
                     return Err(Status::data_loss(
                         "index definition delete returned a non-delete receipt",
@@ -434,6 +533,16 @@ impl IndexServiceRpc for IndexServiceImpl {
                     .query
                     .ok_or_else(|| Status::invalid_argument("index query is required"))?;
                 let limit = page_limit(request.limit)?;
+                let definition_key =
+                    definition_key(context.caller(), &request.bucket, &request.index_name)?;
+                authorize_definition_access(
+                    self.dependencies.authorization.as_ref(),
+                    context.caller(),
+                    &definition_key,
+                    ObjectPermission::Get,
+                    "index definition query is not authorized",
+                )
+                .await?;
                 let loaded = self
                     .load_definition(&context, &request.bucket, &request.index_name)
                     .await?;
@@ -698,6 +807,20 @@ fn bulk_failure_status(failure: MutationFailure) -> Status {
     }
 }
 
+fn batch_read_failure_status(code: i32, message: String) -> Status {
+    match ReadFailureCode::try_from(code) {
+        Ok(ReadFailureCode::Invalid) => Status::invalid_argument(message),
+        Ok(ReadFailureCode::AuthorizationDenied) => Status::permission_denied(message),
+        Ok(ReadFailureCode::VersionNotFound) => Status::not_found(message),
+        Ok(ReadFailureCode::ResourceLimit) => Status::resource_exhausted(message),
+        Ok(ReadFailureCode::DataLoss) => Status::data_loss(message),
+        Ok(ReadFailureCode::VersioningDisabled) => Status::failed_precondition(message),
+        Ok(ReadFailureCode::Internal) | Ok(ReadFailureCode::Unspecified) | Err(_) => {
+            Status::internal(message)
+        }
+    }
+}
+
 fn page_limit(value: u32) -> Result<usize, Status> {
     match value {
         0 => Ok(DEFAULT_PAGE_LIMIT),
@@ -817,6 +940,43 @@ fn validate_execution(
     Ok(())
 }
 
+async fn authorized_definition_snapshot(
+    authorization: &dyn super::boundary::IndexAuthorization,
+    reader: &dyn super::boundary::IndexDefinitionReader,
+    caller: &Caller,
+    key: &ObjectKey,
+    tenant_id: u64,
+    bucket_id: u64,
+) -> Result<Option<anvil_store::ObjectPathSnapshot>, Status> {
+    authorize_definition_access(
+        authorization,
+        caller,
+        key,
+        ObjectPermission::Delete,
+        "index definition delete is not authorized",
+    )
+    .await?;
+    reader.current_snapshot(key, tenant_id, bucket_id).await
+}
+
+async fn authorize_definition_access(
+    authorization: &dyn super::boundary::IndexAuthorization,
+    caller: &Caller,
+    key: &ObjectKey,
+    permission: ObjectPermission,
+    denied_message: &'static str,
+) -> Result<(), Status> {
+    let evidence = authorization
+        .allows_objects_with_evidence(caller, &[(key.clone(), permission)])
+        .await?;
+    validate_authorization_evidence(&evidence, 1)?;
+    if evidence.allowed[0] {
+        Ok(())
+    } else {
+        Err(Status::permission_denied(denied_message))
+    }
+}
+
 fn validate_query_hit(
     caller: &Caller,
     definition: &StoredIndexDefinition,
@@ -881,6 +1041,7 @@ fn contains_reserved_segment(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use anvil_api::v1::{
         CreateIndexRequest, IndexFreshness, IndexSourceFreshness, IndexSpecification,
@@ -951,6 +1112,23 @@ mod tests {
         seen: Mutex<Vec<(ObjectKey, ObjectPermission)>>,
     }
 
+    struct CountingDefinitionReader {
+        reads: AtomicUsize,
+    }
+
+    #[tonic::async_trait]
+    impl super::super::boundary::IndexDefinitionReader for CountingDefinitionReader {
+        async fn current_snapshot(
+            &self,
+            _key: &ObjectKey,
+            _tenant_id: u64,
+            _bucket_id: u64,
+        ) -> Result<Option<anvil_store::ObjectPathSnapshot>, Status> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            Ok(None)
+        }
+    }
+
     #[tonic::async_trait]
     impl super::super::boundary::IndexAuthorization for FakeAuthorization {
         async fn allows_objects_with_evidence(
@@ -964,6 +1142,29 @@ mod tests {
                 revision: self.revision,
             })
         }
+    }
+
+    #[tokio::test]
+    async fn denied_definition_delete_does_not_read_internal_definition_state() {
+        let authorization = FakeAuthorization {
+            allowed: vec![false],
+            revision: 3,
+            seen: Mutex::new(Vec::new()),
+        };
+        let reader = CountingDefinitionReader {
+            reads: AtomicUsize::new(0),
+        };
+        let key = ObjectKey::new("tenant", "objects", definition_path("by-path").unwrap()).unwrap();
+        let error =
+            authorized_definition_snapshot(&authorization, &reader, &caller(), &key, 11, 12)
+                .await
+                .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        assert_eq!(reader.reads.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            authorization.seen.lock().unwrap().as_slice(),
+            &[(key, ObjectPermission::Delete)]
+        );
     }
 
     #[test]

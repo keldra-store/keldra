@@ -71,6 +71,8 @@ struct FakeMetadata {
     topology: TestTopology,
     fence_index: Arc<AtomicU64>,
     snapshot: Option<ObjectPathSnapshot>,
+    current_snapshot: Option<CurrentObjectSnapshot>,
+    full_snapshot_reads: Arc<AtomicU64>,
 }
 
 #[tonic::async_trait]
@@ -79,7 +81,17 @@ impl ObjectReadMetadata for FakeMetadata {
         &self,
         _key: &ObjectKey,
     ) -> Result<Option<ObjectPathSnapshot>, Status> {
+        self.full_snapshot_reads.fetch_add(1, Ordering::SeqCst);
         Ok(self.snapshot.clone())
+    }
+
+    async fn reconciled_current_snapshot_stable(
+        &self,
+        _key: &ObjectKey,
+        _tenant_id: u64,
+        _bucket_id: u64,
+    ) -> Result<Option<CurrentObjectSnapshot>, Status> {
+        Ok(self.current_snapshot.clone())
     }
 
     fn current_placement(&self) -> Result<Arc<dyn PayloadReadPlacementView>, Status> {
@@ -241,6 +253,15 @@ fn key() -> ObjectKey {
     ObjectKey::new("tenant", "bucket", "docs/a").unwrap()
 }
 
+fn definition_key() -> ObjectKey {
+    ObjectKey::new(
+        "system",
+        "definitions",
+        "_anvil/indexes/v2/definitions/example",
+    )
+    .unwrap()
+}
+
 fn blob(bytes: &[u8]) -> BlobRef {
     BlobRef {
         hash: *blake3::hash(bytes).as_bytes(),
@@ -269,16 +290,21 @@ fn tombstone(id: u64) -> Version {
 }
 
 fn snapshot(head: &Version, versions: Vec<Version>) -> ObjectPathSnapshot {
+    snapshot_at(key().path(), head, versions)
+}
+
+fn snapshot_at(exact_path: &str, head: &Version, versions: Vec<Version>) -> ObjectPathSnapshot {
     ObjectPathSnapshot {
         tenant_id: 11,
         bucket_id: 12,
-        exact_path: key().path().to_owned(),
+        exact_path: exact_path.to_owned(),
         head: Head {
             version: head.id,
             deleted: head.deleted,
             mutation_stamp: None,
         },
         versions,
+        definition_locator: None,
     }
 }
 
@@ -288,17 +314,97 @@ fn reader(
     fence_index: Arc<AtomicU64>,
     transport: Arc<FakePayloadTransport>,
 ) -> ClusterObjectReader {
+    reader_with_full_snapshot_counter(snapshot, topology, fence_index, transport).0
+}
+
+fn reader_with_full_snapshot_counter(
+    snapshot: ObjectPathSnapshot,
+    topology: TestTopology,
+    fence_index: Arc<AtomicU64>,
+    transport: Arc<FakePayloadTransport>,
+) -> (ClusterObjectReader, Arc<AtomicU64>) {
+    let version = snapshot
+        .versions
+        .iter()
+        .find(|version| version.id == snapshot.head.version)
+        .unwrap()
+        .clone();
+    let current_snapshot = CurrentObjectSnapshot {
+        tenant_id: snapshot.tenant_id,
+        bucket_id: snapshot.bucket_id,
+        exact_path: snapshot.exact_path.clone(),
+        head: snapshot.head.clone(),
+        version,
+    };
+    let full_snapshot_reads = Arc::new(AtomicU64::new(0));
     ClusterObjectReader::with_components(
         Arc::new(FakeMetadata {
             topology,
             fence_index,
             snapshot: Some(snapshot),
+            current_snapshot: Some(current_snapshot),
+            full_snapshot_reads: full_snapshot_reads.clone(),
         }),
         ErasureProfile::default(),
         transport,
         Arc::new(MemorySpools),
     )
+    .map(|reader| (reader, full_snapshot_reads))
     .unwrap()
+}
+
+#[tokio::test]
+async fn current_only_definition_open_never_requests_retained_history() {
+    let topology = TestTopology::three_nodes();
+    let fence_index = Arc::new(AtomicU64::new(8));
+    let bytes = b"bounded definition";
+    let reference = blob(bytes);
+    let current = live_version(10_001, reference.clone());
+    let mut versions = (1..=10_000)
+        .map(|version| tombstone(version))
+        .collect::<Vec<_>>();
+    versions.push(current.clone());
+    let transport = Arc::new(FakePayloadTransport::default());
+    let placement = topology.placement(8);
+    let PayloadPlacement::Small(owners) = select_payload_placement(
+        placement.cluster_id(),
+        &reference,
+        ErasureProfile::default(),
+        placement.placement_nodes(),
+    ) else {
+        panic!("test payload must use complete-copy placement");
+    };
+    for owner in owners.owners() {
+        transport.insert_small(*owner, &reference, bytes);
+    }
+    let (reader, full_snapshot_reads) = reader_with_full_snapshot_counter(
+        snapshot_at(definition_key().path(), &current, versions),
+        topology,
+        fence_index,
+        transport,
+    );
+
+    let head = reader
+        .current_head_snapshot_stable(&definition_key(), 11, 12)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(head.version, current);
+    let mut opened = reader
+        .open_current_stable(&definition_key(), 11, 12)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut recovered = Vec::new();
+    opened
+        .payload
+        .as_mut()
+        .unwrap()
+        .read_to_end(&mut recovered)
+        .unwrap();
+    assert_eq!(recovered, bytes);
+    assert_eq!(opened.version, current);
+    assert_eq!(full_snapshot_reads.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
