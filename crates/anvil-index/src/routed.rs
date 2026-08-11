@@ -269,6 +269,7 @@ where
     E: crate::compaction::CompactionExecutor,
 {
     let block = read_leaf(directory, descriptor).await?;
+    let encoded_bytes = descriptor.encoded_bytes;
     let descriptor = descriptor.clone();
     let rows = executor
         .run_cpu(move || {
@@ -276,7 +277,11 @@ where
             validate_block(rows, &descriptor)
         })
         .await?;
-    progress.record_input(rows.len() as u64, 0, 0);
+    // Parallel routed cursors read ordinary staged spill trees, whose directory
+    // has no runtime observation wrapper. Authoritative input directories are
+    // observed by Anvil's file wrapper and do not use this cursor path, so
+    // accounting the encoded staged leaf here does not count those bytes twice.
+    progress.record_input(rows.len() as u64, encoded_bytes, 1);
     Ok(rows)
 }
 

@@ -23,10 +23,14 @@ use crate::{
 };
 
 pub(crate) const MAX_COMPACTION_INPUT_RUNS: usize = 4;
+/// One external-sort chunk retained by a compaction lane before it is sealed
+/// as an ordinary staged component.
+pub(crate) const MAX_EXTERNAL_SORT_CHUNK_RESIDENT_BYTES: usize = 4 * 1024 * 1024;
 const ORDINAL_ROUTING_KEY_BYTES: usize = 8;
 const COMPACTION_CODEC_AND_OUTPUT_BUFFERS: usize = 5;
 const SOURCE_PHASE_RETAINED_DECODED_LEAVES: usize = 12;
 const TEXT_PHASE_RETAINED_DECODED_LEAVES: usize = 13;
+const TEXT_SELECTION_RETAINED_DECODED_LEAVES: usize = 2 * MAX_COMPACTION_INPUT_RUNS + 2;
 const CACHED_LEAF_METADATA_OVERHEAD_BYTES: usize = 128;
 const KEY_RANGE_METADATA_OVERHEAD_BYTES: usize = 128;
 const MAX_LANE_KEY_RANGE_COPIES: usize = MAX_COMPACTION_INPUT_RUNS * 2 + 4;
@@ -87,7 +91,29 @@ const TEXT_PHASE_WORKSPACE_BYTES: usize = COMPLETE_COMMON_COMPACTION_WORKSPACE_B
         * routing_traversal_workspace_bytes(MAX_TEXT_POSTING_KEY_BYTES)
     + routing_page_workspace_bytes(MAX_INDEX_ROUTING_KEY_BYTES);
 
-const MAX_COMPACTION_PHASE_WORKSPACE_BYTES: usize =
+// Range-striped text selection retains four input path leaves, one staged
+// final-path leaf, four source-ordinal posting leaves, and one selected-row
+// writer. It precedes the final external sort, so no sort chunk overlaps it.
+const TEXT_SELECTION_PHASE_WORKSPACE_BYTES: usize = COMPLETE_COMMON_COMPACTION_WORKSPACE_BYTES
+    + retained_leaf_workspace_bytes(TEXT_SELECTION_RETAINED_DECODED_LEAVES)
+    + (MAX_COMPACTION_INPUT_RUNS + 1)
+        * routing_traversal_workspace_bytes(MAX_INDEX_ROUTING_KEY_BYTES)
+    + MAX_COMPACTION_INPUT_RUNS * routing_traversal_workspace_bytes(MAX_TEXT_POSTING_KEY_BYTES)
+    + routing_page_workspace_bytes(MAX_TEXT_POSTING_KEY_BYTES);
+
+// The external-sort phase is deliberately disjoint from source selection. It
+// retains one byte-bounded row chunk while scanning one staged payload leaf,
+// or up to four routed input leaves while merging spills. An online spill merge
+// still overlaps that caller leaf, so six leaves cover caller, merge inputs,
+// and output; the row chunk has already been consumed when a merge begins.
+const EXTERNAL_SORT_PHASE_WORKSPACE_BYTES: usize = COMPLETE_COMMON_COMPACTION_WORKSPACE_BYTES
+    + MAX_EXTERNAL_SORT_CHUNK_RESIDENT_BYTES
+    + retained_leaf_workspace_bytes(MAX_COMPACTION_INPUT_RUNS + 2)
+    + (MAX_COMPACTION_INPUT_RUNS + 1)
+        * routing_traversal_workspace_bytes(MAX_INDEX_ROUTING_KEY_BYTES)
+    + routing_page_workspace_bytes(MAX_INDEX_ROUTING_KEY_BYTES);
+
+const MAX_LEGACY_COMPACTION_PHASE_WORKSPACE_BYTES: usize =
     if SOURCE_PHASE_WORKSPACE_BYTES > ROUTED_PHASE_WORKSPACE_BYTES {
         if SOURCE_PHASE_WORKSPACE_BYTES > TEXT_PHASE_WORKSPACE_BYTES {
             SOURCE_PHASE_WORKSPACE_BYTES
@@ -98,6 +124,18 @@ const MAX_COMPACTION_PHASE_WORKSPACE_BYTES: usize =
         ROUTED_PHASE_WORKSPACE_BYTES
     } else {
         TEXT_PHASE_WORKSPACE_BYTES
+    };
+const MAX_COMPACTION_PHASE_WORKSPACE_BYTES: usize =
+    if MAX_LEGACY_COMPACTION_PHASE_WORKSPACE_BYTES > EXTERNAL_SORT_PHASE_WORKSPACE_BYTES {
+        if MAX_LEGACY_COMPACTION_PHASE_WORKSPACE_BYTES > TEXT_SELECTION_PHASE_WORKSPACE_BYTES {
+            MAX_LEGACY_COMPACTION_PHASE_WORKSPACE_BYTES
+        } else {
+            TEXT_SELECTION_PHASE_WORKSPACE_BYTES
+        }
+    } else if EXTERNAL_SORT_PHASE_WORKSPACE_BYTES > TEXT_SELECTION_PHASE_WORKSPACE_BYTES {
+        EXTERNAL_SORT_PHASE_WORKSPACE_BYTES
+    } else {
+        TEXT_SELECTION_PHASE_WORKSPACE_BYTES
     };
 
 /// One complete lane is hard-capped at 64 MiB. Four lanes therefore fit
@@ -1142,6 +1180,8 @@ mod tests {
         assert!(SOURCE_PHASE_WORKSPACE_BYTES <= COMPLETE_COMPACTION_LANE_WORKSPACE_BYTES);
         assert!(ROUTED_PHASE_WORKSPACE_BYTES <= COMPLETE_COMPACTION_LANE_WORKSPACE_BYTES);
         assert!(TEXT_PHASE_WORKSPACE_BYTES <= COMPLETE_COMPACTION_LANE_WORKSPACE_BYTES);
+        assert!(TEXT_SELECTION_PHASE_WORKSPACE_BYTES <= COMPLETE_COMPACTION_LANE_WORKSPACE_BYTES);
+        assert!(EXTERNAL_SORT_PHASE_WORKSPACE_BYTES <= COMPLETE_COMPACTION_LANE_WORKSPACE_BYTES);
         assert_eq!(
             MAX_COMPACTION_PHASE_WORKSPACE_BYTES,
             SOURCE_PHASE_WORKSPACE_BYTES

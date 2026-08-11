@@ -5,9 +5,7 @@ use std::sync::Arc;
 use crate::compaction::{
     CompactionExecutor, CompactionParallelism, CompactionProgress, KeyRange, LaneResultProducer,
     PathWinnerCursor, collect_ordered_lanes, dense_ordinal_bases, deterministic_key_range_plan,
-    deterministic_suffix_key_range_plan,
 };
-use crate::routed::{RoutedComponentWriter, RoutedCursor};
 use crate::run::{ComponentTree, RunStatistics, RunView, assemble_component_ranges, seal_run_root};
 use crate::segment::{
     DOCUMENTS_TAG, DocumentComponentWriter, DocumentRecord, DocumentState, PATH_CHANGES_TAG,
@@ -16,8 +14,8 @@ use crate::segment::{
 use crate::{IndexBlockSink, IndexDirectoryRead, IndexError, IndexKind, SealedRun};
 
 use super::{
-    CompactionPointCache, KEYS_TAG, TypedComponentWriter, TypedRow, decode_typed_rows, open_views,
-    ordinal_key,
+    CompactionPointCache, TypedComponentWriter, TypedRow, decode_typed_rows, key_rebuild,
+    open_views, ordinal_key,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -156,27 +154,30 @@ where
             .await?,
         )
     };
-    let output_path_root = path_tree.root.clone();
+    let keys = if statistics.live_document_count == 0 {
+        None
+    } else {
+        key_rebuild::rebuild_keys_parallel(
+            kind,
+            output_level,
+            target_block_bytes,
+            outputs
+                .iter()
+                .filter_map(|output| output.typed.clone())
+                .collect(),
+            sink,
+            executor,
+            progress,
+        )
+        .await?
+    };
     let mut components = vec![path_tree];
     if statistics.live_document_count > 0 {
         components.push(documents.ok_or(IndexError::InvalidFormat(
             "missing compacted typed documents",
         ))?);
         components.push(typed.ok_or(IndexError::InvalidFormat("missing compacted typed rows"))?);
-        if let Some(keys) = merge_typed_keys_parallel(
-            runs.as_slice(),
-            views.as_slice(),
-            kind,
-            output_level,
-            target_block_bytes,
-            &output_path_root,
-            sink,
-            parallelism,
-            progress,
-            executor,
-        )
-        .await?
-        {
+        if let Some(keys) = keys {
             components.push(keys);
         }
     }
@@ -365,212 +366,6 @@ fn aggregate_typed_statistics(outputs: &[TypedRangeOutput]) -> Result<RunStatist
             .max(output.statistics.maximum_version);
     }
     Ok(statistics)
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn merge_typed_keys_parallel<D, S, E>(
-    runs: &[D],
-    views: &[RunView],
-    kind: IndexKind,
-    output_level: u8,
-    target_block_bytes: usize,
-    output_path_root: &crate::BlockDescriptor,
-    sink: &mut S,
-    parallelism: CompactionParallelism,
-    progress: CompactionProgress,
-    executor: E,
-) -> Result<Option<ComponentTree>, IndexError>
-where
-    D: IndexDirectoryRead + Clone + 'static,
-    S: IndexBlockSink + IndexDirectoryRead + Clone + 'static,
-    E: CompactionExecutor,
-{
-    let roots = views
-        .iter()
-        .map(|view| view.component_optional(KEYS_TAG).cloned())
-        .collect::<Vec<_>>();
-    let present_roots = roots.iter().flatten().cloned().collect::<Vec<_>>();
-    if present_roots.is_empty() {
-        return Ok(None);
-    }
-    // The shared helper strips each routed row's ordinal/position suffix before
-    // deriving boundaries, so every equal primary stays in exactly one lane.
-    let plan = deterministic_suffix_key_range_plan(
-        present_roots.iter().cloned(),
-        12,
-        parallelism.max_lanes(),
-    )?;
-    progress.record_range_limit(plan.range_limit)?;
-    let ranges = plan.ranges;
-    let runs = Arc::new(runs.to_vec());
-    let views = Arc::new(views.to_vec());
-    let roots = Arc::new(roots);
-    let mut producers =
-        Vec::<LaneResultProducer<Option<ComponentTree>>>::with_capacity(ranges.len());
-    for range in ranges {
-        let runs = runs.clone();
-        let views = views.clone();
-        let roots = roots.clone();
-        let output_path_root = output_path_root.clone();
-        let lane_sink = sink.clone();
-        let lane_executor = executor.clone();
-        let lane_progress = progress.clone();
-        producers.push(Box::new(move || {
-            Box::pin(build_typed_keys_range(
-                runs,
-                views,
-                roots,
-                kind,
-                output_level,
-                target_block_bytes,
-                output_path_root,
-                range,
-                lane_sink,
-                lane_executor,
-                lane_progress,
-            ))
-        }));
-    }
-    let trees = collect_ordered_lanes(&executor, producers, &progress)
-        .await?
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
-    if trees.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(
-            assemble_component_ranges(kind, KEYS_TAG, trees.iter(), sink).await?,
-        ))
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn build_typed_keys_range<D, S, E>(
-    runs: Arc<Vec<D>>,
-    views: Arc<Vec<RunView>>,
-    roots: Arc<Vec<Option<crate::BlockDescriptor>>>,
-    kind: IndexKind,
-    output_level: u8,
-    target_block_bytes: usize,
-    output_path_root: crate::BlockDescriptor,
-    range: KeyRange,
-    mut sink: S,
-    executor: E,
-    progress: CompactionProgress,
-) -> Result<Option<ComponentTree>, IndexError>
-where
-    D: IndexDirectoryRead,
-    S: IndexBlockSink + IndexDirectoryRead,
-    E: CompactionExecutor,
-{
-    let mut cursors = runs
-        .iter()
-        .zip(roots.iter())
-        .map(|(run, root)| {
-            root.clone()
-                .map(|root| RoutedCursor::in_range(run, root, range.clone()))
-        })
-        .collect::<Vec<_>>();
-    let mut current = Vec::with_capacity(cursors.len());
-    for cursor in &mut cursors {
-        current.push(match cursor {
-            Some(cursor) => cursor.next_parallel(&executor, &progress).await?,
-            None => None,
-        });
-    }
-    let mut point_cache = CompactionPointCache::input_documents();
-    let mut output_paths = CompactionPointCache::staged_output_paths();
-    let mut writer = RoutedComponentWriter::new(kind, KEYS_TAG, output_level, target_block_bytes);
-    loop {
-        let Some(primary) = current
-            .iter()
-            .flatten()
-            .map(|row| row.primary.as_slice())
-            .min()
-            .map(<[u8]>::to_vec)
-        else {
-            return writer.finish(&mut sink).await;
-        };
-        while current.iter().flatten().any(|row| row.primary == primary) {
-            let mut documents = vec![None; current.len()];
-            for run_index in 0..current.len() {
-                let Some(row) = current[run_index]
-                    .as_ref()
-                    .filter(|row| row.primary == primary)
-                else {
-                    continue;
-                };
-                documents[run_index] = Some(
-                    point_cache
-                        .document_parallel(
-                            &runs[run_index],
-                            &views[run_index],
-                            row.ordinal,
-                            &executor,
-                            &progress,
-                        )
-                        .await?,
-                );
-            }
-            let path = documents
-                .iter()
-                .flatten()
-                .map(|document| document.path.as_str())
-                .min()
-                .ok_or(IndexError::InvalidFormat("typed key without document"))?
-                .to_owned();
-            let mut winner = None::<usize>;
-            for (run_index, document) in documents.iter().enumerate() {
-                let Some(document) = document.as_ref().filter(|document| document.path == path)
-                else {
-                    continue;
-                };
-                if winner.is_none_or(|current_index| {
-                    let current = documents[current_index].as_ref().unwrap();
-                    document.version > current.version
-                        || (document.version == current.version && run_index < current_index)
-                }) {
-                    winner = Some(run_index);
-                }
-            }
-            let winner_index = winner.expect("one current typed row supplied the path");
-            let document = documents[winner_index].as_ref().unwrap().clone();
-            let row = current[winner_index].as_ref().unwrap().clone();
-            for run_index in 0..current.len() {
-                if documents[run_index]
-                    .as_ref()
-                    .is_some_and(|document| document.path == path)
-                {
-                    current[run_index] = cursors[run_index]
-                        .as_mut()
-                        .expect("a current row always has a cursor")
-                        .next_parallel(&executor, &progress)
-                        .await?;
-                }
-            }
-            let Some(output) = output_paths
-                .path_parallel(
-                    &sink,
-                    &output_path_root,
-                    &document.path,
-                    &executor,
-                    &progress,
-                )
-                .await?
-            else {
-                return Err(IndexError::InvalidFormat(
-                    "compacted path missing from staged output",
-                ));
-            };
-            if output.state == DocumentState::Live && output.document.version == document.version {
-                let ordinal = output.document_ordinal.ok_or(IndexError::InvalidFormat(
-                    "compacted live path has no ordinal",
-                ))?;
-                writer.push(row.with_ordinal(ordinal), &mut sink).await?;
-            }
-        }
-    }
 }
 
 pub(super) async fn read_typed_block_parallel<D, E>(

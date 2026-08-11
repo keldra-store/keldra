@@ -3,10 +3,7 @@
 use std::collections::VecDeque;
 
 use crate::run::{RunView, find_leaf};
-use crate::segment::{
-    DOCUMENTS_TAG, DocumentRecord, PathChange, read_document_block_parallel,
-    read_path_block_parallel,
-};
+use crate::segment::{DOCUMENTS_TAG, DocumentRecord, read_document_block_parallel};
 use crate::{BlockDescriptor, DocumentRef, IndexDirectoryRead, IndexError};
 
 use super::parallel_compaction::read_projection_block_parallel;
@@ -16,14 +13,9 @@ use super::{OrdinalRow, ProjectionPayload, RECORDS_TAG, ordinal_key};
 // for the writer's retained output batch and an incoming moved row during a
 // flush.
 const MAX_SOURCE_PAYLOAD_LEAVES: usize = 6;
-const MAX_INPUT_DOCUMENT_LEAVES: usize = 4;
-// Routed keys are not globally ordered by path. Four staged-output leaves are
-// a bounded locality window for paths revisited across successive key groups.
-const MAX_STAGED_OUTPUT_PATH_LEAVES: usize = 4;
 
 enum CachedRows<T> {
     Documents(Vec<DocumentRecord>),
-    Paths(Vec<PathChange>),
     Projections(Vec<CachedProjectionRow<T>>),
 }
 
@@ -56,21 +48,6 @@ impl<T> ProjectionPointCache<T>
 where
     T: ProjectionPayload + Send + 'static,
 {
-    pub(super) fn input_documents() -> Self {
-        Self::with_limit(MAX_INPUT_DOCUMENT_LEAVES)
-    }
-
-    pub(super) fn staged_output_paths() -> Self {
-        Self::with_limit(MAX_STAGED_OUTPUT_PATH_LEAVES)
-    }
-
-    fn with_limit(max_leaves: usize) -> Self {
-        Self {
-            max_leaves,
-            leaves: VecDeque::with_capacity(max_leaves),
-        }
-    }
-
     pub(super) async fn document<D, E>(
         &mut self,
         directory: &D,
@@ -147,41 +124,6 @@ where
         Ok(projection)
     }
 
-    pub(super) async fn path<D, E>(
-        &mut self,
-        directory: &D,
-        root: &BlockDescriptor,
-        path: &str,
-        executor: &E,
-        progress: &crate::compaction::CompactionProgress,
-    ) -> Result<Option<PathChange>, IndexError>
-    where
-        D: IndexDirectoryRead,
-        E: crate::compaction::CompactionExecutor,
-    {
-        let key = path.as_bytes();
-        if let Some(index) =
-            self.cached_leaf(root, key, |rows| matches!(rows, CachedRows::Paths(_)))
-        {
-            let CachedRows::Paths(rows) = &self.touch(index).rows else {
-                unreachable!("cache variant was checked")
-            };
-            return Ok(path_in_rows(rows, path));
-        }
-        self.reserve_miss_slot();
-        let Some(descriptor) = find_leaf(directory, root, key).await? else {
-            return Ok(None);
-        };
-        let rows = read_path_block_parallel(directory, &descriptor, executor, progress).await?;
-        let change = path_in_rows(&rows, path);
-        self.insert(CachedLeaf {
-            root_hash: root.hash,
-            descriptor,
-            rows: CachedRows::Paths(rows),
-        });
-        Ok(change)
-    }
-
     fn cached_leaf(
         &self,
         root: &BlockDescriptor,
@@ -245,26 +187,15 @@ fn take_projection_in_rows<T>(
     ))
 }
 
-fn path_in_rows(rows: &[PathChange], path: &str) -> Option<PathChange> {
-    let index = rows
-        .binary_search_by(|row| row.document.path.as_str().cmp(path))
-        .ok()?;
-    Some(rows[index].clone())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn projection_caches_cover_the_four_input_phase_working_sets() {
+    fn projection_cache_covers_the_selected_source_payload_working_set() {
         let source = ProjectionPointCache::<super::super::GitPayload>::default();
-        let input = ProjectionPointCache::<super::super::GitPayload>::input_documents();
-        let output = ProjectionPointCache::<super::super::GitPayload>::staged_output_paths();
 
         assert_eq!(source.max_leaves, 6);
-        assert_eq!(input.max_leaves, 4);
-        assert_eq!(output.max_leaves, 4);
     }
 
     #[test]

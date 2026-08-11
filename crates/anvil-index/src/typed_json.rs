@@ -38,6 +38,8 @@ use query::query_typed;
 mod compaction_cache;
 use compaction_cache::CompactionPointCache;
 
+#[path = "typed_json/key_rebuild.rs"]
+mod key_rebuild;
 #[path = "typed_json/parallel_compaction.rs"]
 mod parallel_compaction;
 

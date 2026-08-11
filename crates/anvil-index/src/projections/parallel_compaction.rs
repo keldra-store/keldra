@@ -1,14 +1,18 @@
 //! Bounded deterministic range compaction for Git-source and tensor runs.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::compaction::{
     CompactionExecutor, CompactionParallelism, CompactionProgress, KeyRange, LaneResultProducer,
     PathWinnerCursor, collect_ordered_lanes, dense_ordinal_bases, deterministic_key_range_plan,
-    deterministic_suffix_key_range_plan,
 };
-use crate::routed::{RoutedComponentWriter, RoutedCursor};
-use crate::run::{ComponentTree, RunStatistics, RunView, assemble_component_ranges, seal_run_root};
+use crate::routed_sort::{
+    MAX_EXTERNAL_SORT_CHUNK_RESIDENT_BYTES, RoutedExternalSorter, merge_routed_component_trees,
+};
+use crate::run::{
+    ComponentTree, LeafCursor, RunStatistics, RunView, assemble_component_ranges, seal_run_root,
+};
 use crate::segment::{
     DOCUMENTS_TAG, DocumentComponentWriter, DocumentRecord, DocumentState, PATH_CHANGES_TAG,
     PathComponentWriter,
@@ -20,8 +24,6 @@ use super::{
     OrdinalComponentWriter, OrdinalRow, ProjectionPayload, decode_ordinal_rows, open_views,
     ordinal_key,
 };
-
-const ROUTED_SUFFIX_BYTES: usize = 12;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn merge_projection_parallel<D, S, T, E>(
@@ -167,7 +169,26 @@ where
             .await?,
         )
     };
-    let output_path_root = path_tree.root.clone();
+    // Rebuild routed query components only after every source range has
+    // finished. This keeps source path/payload caches and routed external-sort
+    // merges in disjoint resident-memory phases.
+    let routed = if statistics.live_document_count == 0 {
+        Vec::new()
+    } else {
+        rebuild_projection_routes::<S, T, E>(
+            kind,
+            output_level,
+            target_block_bytes,
+            outputs
+                .iter()
+                .filter_map(|output| output.projections.clone())
+                .collect(),
+            sink,
+            executor.clone(),
+            progress.clone(),
+        )
+        .await?
+    };
     let mut components = vec![path_tree];
     if statistics.live_document_count > 0 {
         components.push(documents.ok_or(IndexError::InvalidFormat(
@@ -176,24 +197,8 @@ where
         components.push(projections.ok_or(IndexError::InvalidFormat(
             "missing compacted projection records",
         ))?);
-        for tag in T::key_tags() {
-            if let Some(tree) = merge_routed_component_parallel::<D, S, T, E>(
-                runs.as_slice(),
-                views.as_slice(),
-                kind,
-                *tag,
-                output_level,
-                target_block_bytes,
-                &output_path_root,
-                sink,
-                parallelism,
-                progress.clone(),
-                executor.clone(),
-            )
-            .await?
-            {
-                components.push(tree);
-            }
+        for (_, tree) in routed {
+            components.push(tree);
         }
     }
     seal_run_root(kind, output_level, statistics, components)
@@ -354,6 +359,172 @@ where
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn rebuild_projection_routes<S, T, E>(
+    kind: IndexKind,
+    output_level: u8,
+    target_block_bytes: usize,
+    projection_ranges: Vec<ComponentTree>,
+    sink: &mut S,
+    executor: E,
+    progress: CompactionProgress,
+) -> Result<Vec<(u8, ComponentTree)>, IndexError>
+where
+    S: IndexBlockSink + IndexDirectoryRead + Clone + 'static,
+    T: ProjectionPayload + Send + 'static,
+    E: CompactionExecutor,
+{
+    if T::key_tags().is_empty() {
+        return Err(IndexError::InvalidFormat(
+            "projection payload has no routed components",
+        ));
+    }
+    let mut producers =
+        Vec::<LaneResultProducer<Vec<(u8, ComponentTree)>>>::with_capacity(projection_ranges.len());
+    for projection in projection_ranges {
+        let lane_sink = sink.clone();
+        let lane_executor = executor.clone();
+        let lane_progress = progress.clone();
+        producers.push(Box::new(move || {
+            Box::pin(rebuild_projection_route_range::<S, T, E>(
+                kind,
+                output_level,
+                target_block_bytes,
+                projection,
+                lane_sink,
+                lane_executor,
+                lane_progress,
+            ))
+        }));
+    }
+    let ranges = collect_ordered_lanes(&executor, producers, &progress).await?;
+    let mut routed = Vec::with_capacity(T::key_tags().len());
+    for tag in T::key_tags() {
+        let trees = ranges
+            .iter()
+            .filter_map(|range| {
+                range
+                    .iter()
+                    .find_map(|(candidate, tree)| (candidate == tag).then_some(tree))
+            })
+            .cloned()
+            .collect();
+        if let Some(tree) = merge_routed_component_trees(
+            kind,
+            *tag,
+            output_level,
+            target_block_bytes,
+            trees,
+            sink,
+            &executor,
+            &progress,
+        )
+        .await?
+        {
+            routed.push((*tag, tree));
+        }
+    }
+    Ok(routed)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn rebuild_projection_route_range<S, T, E>(
+    kind: IndexKind,
+    output_level: u8,
+    target_block_bytes: usize,
+    projection: ComponentTree,
+    sink: S,
+    executor: E,
+    progress: CompactionProgress,
+) -> Result<Vec<(u8, ComponentTree)>, IndexError>
+where
+    S: IndexBlockSink + IndexDirectoryRead + Clone,
+    T: ProjectionPayload + Send + 'static,
+    E: CompactionExecutor,
+{
+    let sorter_count = T::key_tags().len();
+    let sorter_chunk_bytes = MAX_EXTERNAL_SORT_CHUNK_RESIDENT_BYTES
+        .checked_div(sorter_count)
+        .filter(|bytes| *bytes > 0)
+        .ok_or(IndexError::OffsetOverflow)?;
+    let directory = sink.clone();
+    let mut cursor = StagedProjectionCursor::<_, T>::new(&directory, projection.root);
+    let mut sorters = Vec::with_capacity(sorter_count);
+    for tag in T::key_tags() {
+        sorters.push((
+            *tag,
+            RoutedExternalSorter::new(
+                kind,
+                *tag,
+                output_level,
+                target_block_bytes,
+                sorter_chunk_bytes,
+                sink.clone(),
+                executor.clone(),
+                progress.clone(),
+            )?,
+        ));
+    }
+    while let Some(OrdinalRow { ordinal, payload }) = cursor.next(&executor, &progress).await? {
+        for (tag, row) in payload.key_rows(ordinal)? {
+            let sorter = sorters
+                .iter_mut()
+                .find_map(|(candidate, sorter)| (candidate == &tag).then_some(sorter))
+                .ok_or(IndexError::InvalidFormat(
+                    "projection payload emitted an unknown routed component",
+                ))?;
+            sorter.push(row).await?;
+        }
+    }
+    let mut routed = Vec::with_capacity(sorters.len());
+    for (tag, sorter) in sorters {
+        if let Some(tree) = sorter.finish().await? {
+            routed.push((tag, tree));
+        }
+    }
+    Ok(routed)
+}
+
+struct StagedProjectionCursor<'a, D, T> {
+    directory: &'a D,
+    leaves: LeafCursor<'a, D>,
+    rows: VecDeque<OrdinalRow<T>>,
+}
+
+impl<'a, D, T> StagedProjectionCursor<'a, D, T>
+where
+    D: IndexDirectoryRead,
+    T: ProjectionPayload + Send + 'static,
+{
+    fn new(directory: &'a D, root: crate::BlockDescriptor) -> Self {
+        Self {
+            directory,
+            leaves: LeafCursor::new(directory, root),
+            rows: VecDeque::new(),
+        }
+    }
+
+    async fn next<E: CompactionExecutor>(
+        &mut self,
+        executor: &E,
+        progress: &CompactionProgress,
+    ) -> Result<Option<OrdinalRow<T>>, IndexError> {
+        loop {
+            if let Some(row) = self.rows.pop_front() {
+                return Ok(Some(row));
+            }
+            let Some(descriptor) = self.leaves.next().await? else {
+                return Ok(None);
+            };
+            progress.record_input(0, descriptor.encoded_bytes, 1);
+            self.rows =
+                read_projection_block_parallel(self.directory, &descriptor, executor, progress)
+                    .await?
+                    .into();
+        }
+    }
+}
+
 fn aggregate_projection_statistics(
     outputs: &[ProjectionRangeOutput],
 ) -> Result<RunStatistics, IndexError> {
@@ -385,214 +556,6 @@ fn aggregate_projection_statistics(
             .max(output.statistics.maximum_version);
     }
     Ok(statistics)
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn merge_routed_component_parallel<D, S, T, E>(
-    runs: &[D],
-    views: &[RunView],
-    kind: IndexKind,
-    tag: u8,
-    output_level: u8,
-    target_block_bytes: usize,
-    output_path_root: &crate::BlockDescriptor,
-    sink: &mut S,
-    parallelism: CompactionParallelism,
-    progress: CompactionProgress,
-    executor: E,
-) -> Result<Option<ComponentTree>, IndexError>
-where
-    D: IndexDirectoryRead + Clone + 'static,
-    S: IndexBlockSink + IndexDirectoryRead + Clone + 'static,
-    T: ProjectionPayload + Clone + Send + 'static,
-    E: CompactionExecutor,
-{
-    let roots = views
-        .iter()
-        .map(|view| view.component_optional(tag).cloned())
-        .collect::<Vec<_>>();
-    let present_roots = roots.iter().flatten().cloned().collect::<Vec<_>>();
-    if present_roots.is_empty() {
-        return Ok(None);
-    }
-    let plan = deterministic_suffix_key_range_plan(
-        present_roots.iter().cloned(),
-        ROUTED_SUFFIX_BYTES,
-        parallelism.max_lanes(),
-    )?;
-    progress.record_range_limit(plan.range_limit)?;
-    let runs = Arc::new(runs.to_vec());
-    let views = Arc::new(views.to_vec());
-    let roots = Arc::new(roots);
-    let mut producers =
-        Vec::<LaneResultProducer<Option<ComponentTree>>>::with_capacity(plan.ranges.len());
-    for range in plan.ranges {
-        let runs = runs.clone();
-        let views = views.clone();
-        let roots = roots.clone();
-        let output_path_root = output_path_root.clone();
-        let lane_sink = sink.clone();
-        let lane_executor = executor.clone();
-        let lane_progress = progress.clone();
-        producers.push(Box::new(move || {
-            Box::pin(build_projection_keys_range::<D, S, T, E>(
-                runs,
-                views,
-                roots,
-                kind,
-                tag,
-                output_level,
-                target_block_bytes,
-                output_path_root,
-                range,
-                lane_sink,
-                lane_executor,
-                lane_progress,
-            ))
-        }));
-    }
-    let trees = collect_ordered_lanes(&executor, producers, &progress)
-        .await?
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
-    if trees.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(
-            assemble_component_ranges(kind, tag, trees.iter(), sink).await?,
-        ))
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn build_projection_keys_range<D, S, T, E>(
-    runs: Arc<Vec<D>>,
-    views: Arc<Vec<RunView>>,
-    roots: Arc<Vec<Option<crate::BlockDescriptor>>>,
-    kind: IndexKind,
-    tag: u8,
-    output_level: u8,
-    target_block_bytes: usize,
-    output_path_root: crate::BlockDescriptor,
-    range: KeyRange,
-    mut sink: S,
-    executor: E,
-    progress: CompactionProgress,
-) -> Result<Option<ComponentTree>, IndexError>
-where
-    D: IndexDirectoryRead,
-    S: IndexBlockSink + IndexDirectoryRead,
-    T: ProjectionPayload + Clone + Send + 'static,
-    E: CompactionExecutor,
-{
-    let mut cursors = runs
-        .iter()
-        .zip(roots.iter())
-        .map(|(run, root)| {
-            root.clone()
-                .map(|root| RoutedCursor::in_range(run, root, range.clone()))
-        })
-        .collect::<Vec<_>>();
-    let mut current = Vec::with_capacity(cursors.len());
-    for cursor in &mut cursors {
-        current.push(match cursor {
-            Some(cursor) => cursor.next_parallel(&executor, &progress).await?,
-            None => None,
-        });
-    }
-    let mut point_cache = ProjectionPointCache::<T>::input_documents();
-    let mut output_paths = ProjectionPointCache::<T>::staged_output_paths();
-    let mut writer = RoutedComponentWriter::new(kind, tag, output_level, target_block_bytes);
-    loop {
-        let Some(primary) = current
-            .iter()
-            .flatten()
-            .map(|row| row.primary.as_slice())
-            .min()
-            .map(<[u8]>::to_vec)
-        else {
-            return writer.finish(&mut sink).await;
-        };
-        while current.iter().flatten().any(|row| row.primary == primary) {
-            let mut documents = vec![None; current.len()];
-            for run_index in 0..current.len() {
-                let Some(row) = current[run_index]
-                    .as_ref()
-                    .filter(|row| row.primary == primary)
-                else {
-                    continue;
-                };
-                documents[run_index] = Some(
-                    point_cache
-                        .document(
-                            &runs[run_index],
-                            &views[run_index],
-                            row.ordinal,
-                            &executor,
-                            &progress,
-                        )
-                        .await?,
-                );
-            }
-            let path = documents
-                .iter()
-                .flatten()
-                .map(|document| document.path.as_str())
-                .min()
-                .ok_or(IndexError::InvalidFormat("projection key without document"))?
-                .to_owned();
-            let mut winner = None::<usize>;
-            for (run_index, document) in documents.iter().enumerate() {
-                let Some(document) = document.as_ref().filter(|document| document.path == path)
-                else {
-                    continue;
-                };
-                if winner.is_none_or(|current_index| {
-                    let current = documents[current_index].as_ref().unwrap();
-                    document.version > current.version
-                        || (document.version == current.version && run_index < current_index)
-                }) {
-                    winner = Some(run_index);
-                }
-            }
-            let winner_index = winner.expect("one current projection row supplied the path");
-            let document = documents[winner_index].as_ref().unwrap().clone();
-            let row = current[winner_index].as_ref().unwrap().clone();
-            for run_index in 0..current.len() {
-                if documents[run_index]
-                    .as_ref()
-                    .is_some_and(|document| document.path == path)
-                {
-                    current[run_index] = cursors[run_index]
-                        .as_mut()
-                        .expect("a current row always has a cursor")
-                        .next_parallel(&executor, &progress)
-                        .await?;
-                }
-            }
-            let Some(output) = output_paths
-                .path(
-                    &sink,
-                    &output_path_root,
-                    &document.path,
-                    &executor,
-                    &progress,
-                )
-                .await?
-            else {
-                return Err(IndexError::InvalidFormat(
-                    "compacted path missing from staged output",
-                ));
-            };
-            if output.state == DocumentState::Live && output.document.version == document.version {
-                let ordinal = output.document_ordinal.ok_or(IndexError::InvalidFormat(
-                    "compacted live path has no ordinal",
-                ))?;
-                writer.push(row.with_ordinal(ordinal), &mut sink).await?;
-            }
-        }
-    }
 }
 
 pub(super) async fn read_projection_block_parallel<D, T, E>(

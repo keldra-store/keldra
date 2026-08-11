@@ -13,6 +13,7 @@ mod io;
 mod model;
 mod query_bounds;
 mod routed;
+mod routed_sort;
 mod run;
 mod segment;
 mod succinct;

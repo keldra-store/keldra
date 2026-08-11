@@ -1,6 +1,65 @@
 use crate::compaction::COMPACTION_INCREMENTAL_LANE_WORKSPACE_BYTES;
 use crate::compaction::test_support::TokioExecutor;
 
+#[derive(Clone)]
+struct RejectInputRoutedReads {
+    inner: MemoryDirectory,
+}
+
+impl IndexDirectoryRead for RejectInputRoutedReads {
+    type File = crate::io::tests::MemoryFile;
+
+    async fn open_root(&self) -> Result<Self::File, IndexError> {
+        self.inner.open_root().await
+    }
+
+    async fn open_block(
+        &self,
+        descriptor: &crate::BlockDescriptor,
+    ) -> Result<Self::File, IndexError> {
+        if matches!(
+            descriptor.component_tag,
+            PRIMARY_KEY_TAG | SECONDARY_KEY_TAG
+        ) {
+            return Err(IndexError::Io(
+                "compaction reread an input routed projection component".into(),
+            ));
+        }
+        self.inner.open_block(descriptor).await
+    }
+}
+
+#[derive(Clone, Default)]
+struct RejectStagedPathReads {
+    inner: MemoryBlockSink,
+}
+
+impl IndexBlockSink for RejectStagedPathReads {
+    async fn emit(&mut self, block: crate::GeneratedBlock) -> Result<(), IndexError> {
+        self.inner.emit(block).await
+    }
+}
+
+impl IndexDirectoryRead for RejectStagedPathReads {
+    type File = crate::io::tests::MemoryFile;
+
+    async fn open_root(&self) -> Result<Self::File, IndexError> {
+        self.inner.open_root().await
+    }
+
+    async fn open_block(
+        &self,
+        descriptor: &crate::BlockDescriptor,
+    ) -> Result<Self::File, IndexError> {
+        if descriptor.component_tag == PATH_CHANGES_TAG {
+            return Err(IndexError::Io(
+                "compaction point-read its staged output path component".into(),
+            ));
+        }
+        self.inner.open_block(descriptor).await
+    }
+}
+
 fn tensor_document(path: &str, version: u64, index: usize) -> IndexMutation<TensorDocument> {
     IndexMutation::Upsert(TensorDocument {
         document: DocumentRef {
@@ -270,6 +329,135 @@ async fn tensor_parallel_ranges_are_semantically_equivalent_and_deterministic() 
     assert_eq!(snapshot.active_lanes, 0);
     assert_eq!(snapshot.waiting_lanes, 0);
     assert_eq!(snapshot.output_records, mutation_count);
+}
+
+#[tokio::test]
+async fn git_routed_rebuild_uses_selected_payloads_without_rereading_old_routes_or_new_paths() {
+    let (old_sink, old_run) = git_run(
+        [
+            git_document("/a", 1, "src/a.rs", "old-a"),
+            git_document("/b", 1, "src/b.rs", "old-b"),
+        ],
+        0,
+        64,
+    )
+    .await;
+    let (new_sink, new_run) = git_run(
+        [
+            git_document("/a", 2, "src/a.rs", "new-a"),
+            IndexMutation::Remove(DocumentRef {
+                path: "/b".into(),
+                version: 2,
+            }),
+        ],
+        0,
+        64,
+    )
+    .await;
+    let runs = [
+        RejectInputRoutedReads {
+            inner: directory(&new_sink, new_run),
+        },
+        RejectInputRoutedReads {
+            inner: directory(&old_sink, old_run),
+        },
+    ];
+    let mut output = RejectStagedPathReads::default();
+    let merged = parallel_compaction::merge_projection_parallel::<_, _, GitPayload, _>(
+        &runs,
+        IndexKind::GitSource,
+        1,
+        64,
+        &mut output,
+        crate::compaction::CompactionParallelism::new(
+            4,
+            COMPACTION_INCREMENTAL_LANE_WORKSPACE_BYTES,
+        )
+        .unwrap(),
+        crate::compaction::CompactionProgress::default(),
+        TokioExecutor::default(),
+    )
+    .await
+    .unwrap();
+    let compacted = [output.inner.directory_with_root(merged.into_root())];
+
+    assert_eq!(
+        GitSourceEngine::get_by_path(&compacted, "repo", "abc", "src/a.rs")
+            .await
+            .unwrap()
+            .unwrap()
+            .object_id,
+        "new-a"
+    );
+    assert!(
+        GitSourceEngine::get_by_path(&compacted, "repo", "abc", "src/b.rs")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn tensor_routed_rebuild_uses_selected_payloads_without_rereading_old_routes_or_new_paths() {
+    let (old_sink, old_run) = tensor_run(
+        [tensor_document("/a", 1, 1), tensor_document("/b", 1, 2)],
+        0,
+        64,
+    )
+    .await;
+    let (new_sink, new_run) = tensor_run(
+        [
+            tensor_document("/a", 2, 1),
+            IndexMutation::Remove(DocumentRef {
+                path: "/b".into(),
+                version: 2,
+            }),
+        ],
+        0,
+        64,
+    )
+    .await;
+    let runs = [
+        RejectInputRoutedReads {
+            inner: directory(&new_sink, new_run),
+        },
+        RejectInputRoutedReads {
+            inner: directory(&old_sink, old_run),
+        },
+    ];
+    let mut output = RejectStagedPathReads::default();
+    let merged = parallel_compaction::merge_projection_parallel::<_, _, TensorPayload, _>(
+        &runs,
+        IndexKind::Tensor,
+        1,
+        64,
+        &mut output,
+        crate::compaction::CompactionParallelism::new(
+            4,
+            COMPACTION_INCREMENTAL_LANE_WORKSPACE_BYTES,
+        )
+        .unwrap(),
+        crate::compaction::CompactionProgress::default(),
+        TokioExecutor::default(),
+    )
+    .await
+    .unwrap();
+    let compacted = [output.inner.directory_with_root(merged.into_root())];
+
+    assert_eq!(
+        TensorProjectionEngine::get(&compacted, "model-01", "weight-0001")
+            .await
+            .unwrap()
+            .unwrap()
+            .source_version,
+        2
+    );
+    assert!(
+        TensorProjectionEngine::get(&compacted, "model-02", "weight-0002")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]

@@ -1,6 +1,62 @@
 use crate::compaction::COMPACTION_INCREMENTAL_LANE_WORKSPACE_BYTES;
 use crate::compaction::test_support::TokioExecutor;
 
+#[derive(Clone)]
+struct RejectInputKeyReads {
+    inner: MemoryDirectory,
+}
+
+impl IndexDirectoryRead for RejectInputKeyReads {
+    type File = crate::io::tests::MemoryFile;
+
+    async fn open_root(&self) -> Result<Self::File, IndexError> {
+        self.inner.open_root().await
+    }
+
+    async fn open_block(
+        &self,
+        descriptor: &crate::BlockDescriptor,
+    ) -> Result<Self::File, IndexError> {
+        if descriptor.component_tag == KEYS_TAG {
+            return Err(IndexError::Io(
+                "compaction reread an input typed-key component".into(),
+            ));
+        }
+        self.inner.open_block(descriptor).await
+    }
+}
+
+#[derive(Clone, Default)]
+struct RejectStagedPathReads {
+    inner: MemoryBlockSink,
+}
+
+impl IndexBlockSink for RejectStagedPathReads {
+    async fn emit(&mut self, block: crate::GeneratedBlock) -> Result<(), IndexError> {
+        self.inner.emit(block).await
+    }
+}
+
+impl IndexDirectoryRead for RejectStagedPathReads {
+    type File = crate::io::tests::MemoryFile;
+
+    async fn open_root(&self) -> Result<Self::File, IndexError> {
+        self.inner.open_root().await
+    }
+
+    async fn open_block(
+        &self,
+        descriptor: &crate::BlockDescriptor,
+    ) -> Result<Self::File, IndexError> {
+        if descriptor.component_tag == PATH_CHANGES_TAG {
+            return Err(IndexError::Io(
+                "compaction point-read its staged typed path component".into(),
+            ));
+        }
+        self.inner.open_block(descriptor).await
+    }
+}
+
 fn metadata_upsert(
     path: &str,
     version: u64,
@@ -249,6 +305,125 @@ async fn metadata_parallel_ranges_are_semantically_equivalent_and_deterministic(
     assert_eq!(snapshot.active_lanes, 0);
     assert_eq!(snapshot.waiting_lanes, 0);
     assert_eq!(snapshot.output_records, mutation_count);
+}
+
+#[tokio::test]
+async fn typed_routed_rebuild_uses_selected_rows_without_rereading_old_keys_or_new_paths() {
+    let (old_sink, old_run) = build_run(
+        [upsert("/a", 1, "old-a", 1.0), upsert("/b", 1, "old-b", 2.0)],
+        0,
+        64,
+    )
+    .await;
+    let (new_sink, new_run) = build_run(
+        [
+            upsert("/a", 2, "new-a", 3.0),
+            IndexMutation::Remove(DocumentRef {
+                path: "/b".into(),
+                version: 2,
+            }),
+        ],
+        0,
+        64,
+    )
+    .await;
+    let runs = [
+        RejectInputKeyReads {
+            inner: directory(&new_sink, new_run),
+        },
+        RejectInputKeyReads {
+            inner: directory(&old_sink, old_run),
+        },
+    ];
+    let mut output = RejectStagedPathReads::default();
+    let merged = parallel_compaction::merge_typed_parallel(
+        &runs,
+        IndexKind::TypedJson,
+        1,
+        64,
+        &mut output,
+        crate::compaction::CompactionParallelism::new(
+            4,
+            COMPACTION_INCREMENTAL_LANE_WORKSPACE_BYTES,
+        )
+        .unwrap(),
+        crate::compaction::CompactionProgress::default(),
+        TokioExecutor::default(),
+    )
+    .await
+    .unwrap();
+    let compacted = [output.inner.directory_with_root(merged.into_root())];
+    let hits = TypedJsonEngine::query(&compacted, &definition(), &exists_query())
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].document.path, "/a");
+    assert_eq!(hits[0].document.version, 2);
+    assert_eq!(
+        hits[0].fields["status"],
+        [ScalarValue::String("new-a".into())]
+    );
+}
+
+#[tokio::test]
+async fn metadata_routed_rebuild_uses_selected_rows_without_rereading_old_keys_or_new_paths() {
+    let (old_sink, old_run) = build_metadata_run(
+        [
+            metadata_upsert("/a", 1, "old-a", 1.0),
+            metadata_upsert("/b", 1, "old-b", 2.0),
+        ],
+        0,
+        64,
+    )
+    .await;
+    let (new_sink, new_run) = build_metadata_run(
+        [
+            metadata_upsert("/a", 2, "new-a", 3.0),
+            IndexMutation::Remove(DocumentRef {
+                path: "/b".into(),
+                version: 2,
+            }),
+        ],
+        0,
+        64,
+    )
+    .await;
+    let runs = [
+        RejectInputKeyReads {
+            inner: directory(&new_sink, new_run),
+        },
+        RejectInputKeyReads {
+            inner: directory(&old_sink, old_run),
+        },
+    ];
+    let mut output = RejectStagedPathReads::default();
+    let merged = parallel_compaction::merge_typed_parallel(
+        &runs,
+        IndexKind::MetadataFilter,
+        1,
+        64,
+        &mut output,
+        crate::compaction::CompactionParallelism::new(
+            4,
+            COMPACTION_INCREMENTAL_LANE_WORKSPACE_BYTES,
+        )
+        .unwrap(),
+        crate::compaction::CompactionProgress::default(),
+        TokioExecutor::default(),
+    )
+    .await
+    .unwrap();
+    let compacted = [output.inner.directory_with_root(merged.into_root())];
+    let hits = MetadataFilterEngine::query(&compacted, &definition(), &exists_query())
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].document.path, "/a");
+    assert_eq!(hits[0].document.version, 2);
+    assert_eq!(
+        hits[0].fields["status"],
+        [ScalarValue::String("new-a".into())]
+    );
 }
 
 #[tokio::test]
