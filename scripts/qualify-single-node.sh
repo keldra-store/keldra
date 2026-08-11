@@ -273,6 +273,30 @@ log_unsigned_field() {
   return 1
 }
 
+normalize_unsigned_decimal() {
+  local value="$1"
+  while ((${#value} > 1)) && [[ "${value}" == 0* ]]; do
+    value="${value#0}"
+  done
+  printf '%s\n' "${value}"
+}
+
+unsigned_decimal_less_than() {
+  local left
+  local right
+  left="$(normalize_unsigned_decimal "$1")"
+  right="$(normalize_unsigned_decimal "$2")"
+  if ((${#left} != ${#right})); then
+    ((${#left} < ${#right}))
+    return
+  fi
+  [[ "${left}" < "${right}" ]]
+}
+
+unsigned_decimal_is_positive() {
+  [[ "$1" =~ [1-9] ]]
+}
+
 log_number_field() {
   local field="$1"
   local line="$2"
@@ -350,14 +374,16 @@ assert_index_compaction_observability() {
     expected="${index_compaction_max_lanes}"
     ((worker_limit < expected)) && expected="${worker_limit}"
     ((budget_limit < expected)) && expected="${budget_limit}"
-    ((range_limit < expected)) && expected="${range_limit}"
+    if unsigned_decimal_less_than "${range_limit}" "${expected}"; then
+      expected="${range_limit}"
+    fi
     if ((configured != index_compaction_max_lanes \
       || worker_limit != index_rayon_workers \
       || budget_limit < 1 \
-      || range_limit < 1 \
       || ranges < 1 \
       || effective != expected \
       || completed != ranges)) \
+      || ! unsigned_decimal_is_positive "${range_limit}" \
       || [[ "${line}" != *"anvil.index.compaction"* ]]
     then
       echo "${kind} emitted inconsistent bounded compaction telemetry" >&2
@@ -573,18 +599,20 @@ assert_production_typed_json_compaction_observability() {
       || worker_limit != index_rayon_workers \
       || budget_limit < index_compaction_max_lanes \
       || effective > index_compaction_max_lanes \
-      || range_limit < effective \
       || ranges < 1 \
       || completed != ranges \
-      || failures != 0))
+      || failures != 0)) \
+      || unsigned_decimal_less_than "${range_limit}" "${effective}"
     then
       echo "production-shaped TypedJson emitted inconsistent terminal compaction telemetry" >&2
       printf '%s\n' "${line}" >&2
       return 1
     fi
     if ((effective == index_compaction_max_lanes \
-      && range_limit >= index_compaction_max_lanes \
-      && ranges >= index_compaction_max_lanes)); then
+      && ranges >= index_compaction_max_lanes)) \
+      && ! unsigned_decimal_less_than \
+        "${range_limit}" "${index_compaction_max_lanes}"
+    then
       production_compaction_configured_lanes="${configured}"
       production_compaction_worker_limit="${worker_limit}"
       production_compaction_budget_limit="${budget_limit}"

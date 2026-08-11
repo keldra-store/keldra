@@ -353,6 +353,30 @@ log_unsigned_field() {
   return 1
 }
 
+normalize_unsigned_decimal() {
+  local value="$1"
+  while ((${#value} > 1)) && [[ "${value}" == 0* ]]; do
+    value="${value#0}"
+  done
+  printf '%s\n' "${value}"
+}
+
+unsigned_decimal_less_than() {
+  local left
+  local right
+  left="$(normalize_unsigned_decimal "$1")"
+  right="$(normalize_unsigned_decimal "$2")"
+  if ((${#left} != ${#right})); then
+    ((${#left} < ${#right}))
+    return
+  fi
+  [[ "${left}" < "${right}" ]]
+}
+
+unsigned_decimal_is_positive() {
+  [[ "$1" =~ [1-9] ]]
+}
+
 log_has_index_event() {
   local log="$1"
   local index_id="$2"
@@ -747,14 +771,16 @@ assert_compaction_telemetry_for_kind() {
     expected="${index_compaction_max_lanes}"
     ((worker_limit < expected)) && expected="${worker_limit}"
     ((budget_limit < expected)) && expected="${budget_limit}"
-    ((range_limit < expected)) && expected="${range_limit}"
+    if unsigned_decimal_less_than "${range_limit}" "${expected}"; then
+      expected="${range_limit}"
+    fi
     if ((configured != index_compaction_max_lanes \
       || worker_limit != index_rayon_workers \
       || budget_limit < 1 \
-      || range_limit < 1 \
       || ranges < 1 \
       || effective != expected \
       || completed != ranges)) \
+      || ! unsigned_decimal_is_positive "${range_limit}" \
       || [[ "${line}" != *"anvil.index.compaction"* ]]
     then
       echo "${kind} emitted inconsistent bounded distributed compaction telemetry" >&2
