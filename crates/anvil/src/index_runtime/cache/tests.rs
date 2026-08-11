@@ -233,6 +233,154 @@ async fn pinned_slices_may_temporarily_exceed_the_disk_budget() {
 }
 
 #[tokio::test]
+async fn tiny_segments_cannot_leave_retained_mappings_above_the_memory_budget() {
+    let root = tempfile::tempdir().unwrap();
+    let values = (0_u8..32)
+        .map(|byte| {
+            let bytes = vec![byte];
+            (id(&bytes), bytes)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let fetcher = Arc::new(MemoryFetcher {
+        values: values.clone(),
+        reads: AtomicUsize::new(0),
+    });
+    let memory_bytes = CACHE_MAPPING_MINIMUM_BYTES * 3;
+    let cache = IndexCache::new(
+        root.path(),
+        IndexCacheConfig::new(1024, memory_bytes).unwrap(),
+        fetcher.clone(),
+    )
+    .unwrap();
+
+    for (segment, bytes) in &values {
+        let slice = cache.open(*segment).read_at(0, 1).await.unwrap();
+        assert_eq!(slice.data(), bytes);
+        drop(slice);
+        let state = cache.inner.state.lock().unwrap();
+        assert!(state.memory_bytes <= memory_bytes);
+        assert!(
+            state
+                .entries
+                .values()
+                .filter(|entry| entry.mapped.is_some())
+                .count()
+                <= 3
+        );
+    }
+
+    assert_eq!(fetcher.reads.load(Ordering::Relaxed), values.len());
+    assert_eq!(
+        std::fs::read_dir(&cache.inner.directory).unwrap().count(),
+        values.len(),
+        "memory eviction must retain independently budgeted disk files"
+    );
+}
+
+#[tokio::test]
+async fn memory_eviction_keeps_disk_entries_until_the_independent_disk_limit() {
+    let root = tempfile::tempdir().unwrap();
+    let values = (0_u8..4)
+        .map(|byte| {
+            let bytes = vec![byte];
+            (id(&bytes), bytes)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let fetcher = Arc::new(MemoryFetcher {
+        values: values.clone(),
+        reads: AtomicUsize::new(0),
+    });
+    let cache = IndexCache::new(
+        root.path(),
+        IndexCacheConfig::new(3, CACHE_MAPPING_MINIMUM_BYTES).unwrap(),
+        fetcher.clone(),
+    )
+    .unwrap();
+
+    for (segment, bytes) in &values {
+        let slice = cache.open(*segment).read_at(0, 1).await.unwrap();
+        assert_eq!(slice.data(), bytes);
+        drop(slice);
+    }
+
+    let state = cache.inner.state.lock().unwrap();
+    assert_eq!(state.disk_bytes, 3);
+    assert_eq!(state.memory_bytes, CACHE_MAPPING_MINIMUM_BYTES);
+    assert_eq!(state.entries.len(), 3);
+    assert_eq!(
+        state
+            .entries
+            .values()
+            .filter(|entry| entry.mapped.is_some())
+            .count(),
+        1
+    );
+    drop(state);
+    assert_eq!(
+        std::fs::read_dir(&cache.inner.directory).unwrap().count(),
+        3
+    );
+
+    let disk_only = cache
+        .inner
+        .state
+        .lock()
+        .unwrap()
+        .entries
+        .iter()
+        .find_map(|(id, entry)| entry.mapped.is_none().then_some(*id))
+        .unwrap();
+    let remapped = cache.open(disk_only).read_at(0, 1).await.unwrap();
+    assert_eq!(remapped.data(), values.get(&disk_only).unwrap());
+    assert_eq!(fetcher.reads.load(Ordering::Relaxed), 4);
+    let state = cache.inner.state.lock().unwrap();
+    assert_eq!(state.disk_bytes, 3, "a remap must not charge disk twice");
+    assert_eq!(state.memory_bytes, CACHE_MAPPING_MINIMUM_BYTES);
+}
+
+#[tokio::test]
+async fn live_slices_pin_mappings_until_the_last_over_budget_pin_drops() {
+    let root = tempfile::tempdir().unwrap();
+    let (cache, _fetcher, left, right) = fixture(&root, 1024, CACHE_MAPPING_MINIMUM_BYTES);
+
+    let held = cache.open(left).read_at(0, 8).await.unwrap();
+    let held_clone = held.clone();
+    let temporary = cache.open(right).read_at(0, 8).await.unwrap();
+    assert_eq!(cache.inner.state.lock().unwrap().memory_bytes, 8 * 1024);
+    assert_eq!(held.data(), b"abcdefgh");
+    assert_eq!(temporary.data(), b"ijklmnop");
+
+    drop(temporary);
+    assert_eq!(cache.inner.state.lock().unwrap().memory_bytes, 4 * 1024);
+    assert_eq!(held.data(), b"abcdefgh");
+    drop(held);
+    assert_eq!(held_clone.data(), b"abcdefgh");
+}
+
+#[tokio::test]
+async fn reconciliation_reclaims_a_temporary_pin_overrun_after_the_slice_drops() {
+    let root = tempfile::tempdir().unwrap();
+    let (cache, _fetcher, left, _right) = fixture(&root, 4, 8);
+    let path = cache_path(&cache.inner.directory, left);
+
+    let held = cache.open(left).read_at(0, 8).await.unwrap();
+    assert!(path.exists());
+    assert_eq!(cache.inner.state.lock().unwrap().disk_bytes, 8);
+
+    let pinned =
+        reconcile_cache_step(&cache.inner, 8, u64::MAX, std::time::Duration::from_secs(1)).unwrap();
+    assert_eq!(pinned.removed_bytes, 0);
+    assert!(path.exists());
+
+    drop(held);
+    let unpinned =
+        reconcile_cache_step(&cache.inner, 8, u64::MAX, std::time::Duration::from_secs(1)).unwrap();
+    assert_eq!(unpinned.removed_bytes, 8);
+    assert!(!path.exists());
+    assert_eq!(cache.inner.state.lock().unwrap().disk_bytes, 0);
+}
+
+#[tokio::test]
 async fn corrupt_fetched_bytes_are_never_materialized() {
     let root = tempfile::tempdir().unwrap();
     let expected = id(b"expected");
@@ -269,7 +417,7 @@ async fn corrupt_existing_cache_file_is_atomically_replaced() {
 }
 
 #[test]
-fn startup_clears_only_the_disposable_v2_cache_directory() {
+fn startup_preserves_the_disposable_v2_cache_directory_without_inventory() {
     let root = tempfile::tempdir().unwrap();
     let cache_directory = root.path().join(CACHE_FORMAT_DIRECTORY);
     let sibling = root.path().join("must-remain");
@@ -289,8 +437,118 @@ fn startup_clears_only_the_disposable_v2_cache_directory() {
     .unwrap();
 
     assert!(cache_directory.is_dir());
-    assert_eq!(std::fs::read_dir(cache_directory).unwrap().count(), 0);
+    assert_eq!(
+        std::fs::read(cache_directory.join("stale-cache-file")).unwrap(),
+        b"stale"
+    );
     assert_eq!(std::fs::read(sibling).unwrap(), b"ordinary-data");
+}
+
+#[tokio::test]
+async fn valid_warm_file_is_verified_and_reused_without_a_fetch() {
+    let root = tempfile::tempdir().unwrap();
+    let bytes = b"warm-cache".to_vec();
+    let segment = id(&bytes);
+    let directory = root.path().join(CACHE_FORMAT_DIRECTORY);
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(cache_path(&directory, segment), &bytes).unwrap();
+    let fetcher = Arc::new(MemoryFetcher {
+        values: BTreeMap::from([(segment, bytes.clone())]),
+        reads: AtomicUsize::new(0),
+    });
+
+    let cache = IndexCache::new(
+        root.path(),
+        IndexCacheConfig::new(1024, 1024).unwrap(),
+        fetcher.clone(),
+    )
+    .unwrap();
+    let slice = cache.open(segment).read_at(0, bytes.len()).await.unwrap();
+
+    assert_eq!(slice.data(), bytes);
+    assert_eq!(fetcher.reads.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn reconciliation_advances_in_bounded_steps_and_evicts_only_after_budget() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join(CACHE_FORMAT_DIRECTORY);
+    std::fs::create_dir_all(&directory).unwrap();
+    for value in [b"first".as_slice(), b"second", b"third"] {
+        let segment = id(value);
+        std::fs::write(cache_path(&directory, segment), value).unwrap();
+    }
+    let cache = IndexCache::new(
+        root.path(),
+        IndexCacheConfig::new(6, 1024).unwrap(),
+        Arc::new(MemoryFetcher {
+            values: BTreeMap::new(),
+            reads: AtomicUsize::new(0),
+        }),
+    )
+    .unwrap();
+
+    let mut completed = false;
+    for _ in 0..8 {
+        let progress =
+            reconcile_cache_step(&cache.inner, 1, u64::MAX, std::time::Duration::from_secs(1))
+                .unwrap();
+        assert!(progress.records <= 1);
+        completed |= progress.completed_cycle;
+        if completed {
+            break;
+        }
+    }
+
+    assert!(completed);
+    let retained = std::fs::read_dir(directory).unwrap().count();
+    assert_eq!(retained, 1);
+}
+
+#[test]
+fn reconciliation_removes_unknown_regular_files_but_not_directories() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join(CACHE_FORMAT_DIRECTORY);
+    std::fs::create_dir_all(directory.join("operator-directory")).unwrap();
+    std::fs::write(directory.join("interrupted-junk"), b"junk").unwrap();
+    let cache = IndexCache::new(
+        root.path(),
+        IndexCacheConfig::new(1024, 1024).unwrap(),
+        Arc::new(MemoryFetcher {
+            values: BTreeMap::new(),
+            reads: AtomicUsize::new(0),
+        }),
+    )
+    .unwrap();
+
+    let mut completed = false;
+    for _ in 0..8 {
+        completed |=
+            reconcile_cache_step(&cache.inner, 1, u64::MAX, std::time::Duration::from_secs(1))
+                .unwrap()
+                .completed_cycle;
+        if completed {
+            break;
+        }
+    }
+
+    assert!(completed);
+    assert!(!directory.join("interrupted-junk").exists());
+    assert!(directory.join("operator-directory").is_dir());
+}
+
+#[test]
+fn configurable_reconciliation_rejects_zero_budgets() {
+    let invalid = CacheReconcileConfig::new(
+        std::time::Duration::from_secs(1),
+        0,
+        1,
+        std::time::Duration::from_millis(1),
+    );
+    assert!(matches!(
+        invalid,
+        Err(IndexCacheError::InvalidConfiguration(_))
+    ));
 }
 
 #[tokio::test]
@@ -315,4 +573,12 @@ async fn oversized_segments_remain_mmap_backed() {
     let slice = file.read_at(0, 8).await.unwrap();
     assert!(slice.is_mmap_backed());
     assert_eq!(slice.data(), b"abcdefgh");
+    assert_eq!(
+        cache.inner.state.lock().unwrap().memory_bytes,
+        CACHE_MAPPING_MINIMUM_BYTES
+    );
+    drop(slice);
+    let state = cache.inner.state.lock().unwrap();
+    assert_eq!(state.memory_bytes, 0);
+    assert!(state.entries.get(&left).unwrap().mapped.is_none());
 }
