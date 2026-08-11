@@ -45,6 +45,9 @@ mod recovery;
 use recovery::{BuilderFailurePhase, recover_builder_failure};
 #[cfg(test)]
 use recovery::{BuilderFailureRecovery, failure_recovery};
+#[path = "manager/quantum.rs"]
+mod quantum;
+use quantum::{SourceWorkBoundary, SourceWorkQuantum};
 
 const BUILDER_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_SOURCE_WIRE_BYTES: u64 = 4 * 1024 * 1024;
@@ -887,31 +890,23 @@ async fn advance_rebuild(
     let permit = await_with_builder_heartbeats(&work.progress, budget.acquire(budget.limit()))
         .await
         .map_err(budget_status)?;
-    let frame = await_with_builder_heartbeats(&work.progress, work.snapshot.next_frame()).await?;
-    match frame {
-        Some(frame) => {
-            let records = frame.len() as u64;
-            let encoded_bytes = measure_snapshot_frame(&frame)?;
-            let plan = work_plan(budget, encoded_bytes)?;
-            await_with_builder_heartbeats(
-                &work.progress,
-                process_snapshot_frame(
-                    &job.definition,
-                    &job.specification,
-                    job.kind,
-                    &work.through,
-                    frame,
-                    plan,
-                    &mut work.candidate,
-                    dependencies,
-                ),
+    let mut quantum = SourceWorkQuantum::new(budget.limit());
+    let plan = work_plan(budget, quantum.limit)?;
+    // Retain one mutable builder across every snapshot frame in this fair
+    // work quantum; only the immutable run crosses the scheduler yield.
+    let mut builder = EngineSegmentBuilder::new(&job.specification, plan).map_err(index_status)?;
+    loop {
+        let frame =
+            await_with_builder_heartbeats(&work.progress, work.snapshot.next_frame()).await?;
+        let Some(frame) = frame else {
+            flush_builder(
+                &job.definition,
+                job.kind,
+                builder,
+                &mut work.candidate,
+                dependencies,
             )
             .await?;
-            work.progress.advance(records, encoded_bytes);
-            drop(permit);
-            Ok((BuilderPhase::Rebuild(work), BuilderDisposition::Ready, None))
-        }
-        None => {
             drop(permit);
             let target = dependencies
                 .journal
@@ -920,7 +915,7 @@ async fn advance_rebuild(
                 .map_err(event_status)?;
             work.progress.complete();
             emit_source_lag(job.kind, &work.through, &target);
-            Ok((
+            return Ok((
                 BuilderPhase::CatchUp(CatchUpWork {
                     current: work.current,
                     through: work.through,
@@ -935,7 +930,38 @@ async fn advance_rebuild(
                 }),
                 BuilderDisposition::Ready,
                 None,
-            ))
+            ));
+        };
+
+        let records = frame.len() as u64;
+        let encoded_bytes = measure_snapshot_frame(&frame)?;
+        await_with_builder_heartbeats(
+            &work.progress,
+            process_snapshot_frame(
+                &job.definition,
+                &job.specification,
+                job.kind,
+                &work.through,
+                frame,
+                plan,
+                &mut builder,
+                &mut work.candidate,
+                dependencies,
+            ),
+        )
+        .await?;
+        work.progress.advance(records, encoded_bytes);
+        if quantum.advance_frame(encoded_bytes)? == SourceWorkBoundary::SealAndYield {
+            flush_builder(
+                &job.definition,
+                job.kind,
+                builder,
+                &mut work.candidate,
+                dependencies,
+            )
+            .await?;
+            drop(permit);
+            return Ok((BuilderPhase::Rebuild(work), BuilderDisposition::Ready, None));
         }
     }
 }
@@ -959,48 +985,73 @@ async fn advance_catch_up(
     let permit = await_with_builder_heartbeats(&work.progress, budget.acquire(budget.limit()))
         .await
         .map_err(budget_status)?;
-    let page = await_with_builder_heartbeats(
-        &work.progress,
-        dependencies.journal.next_page(
-            job.definition.tenant_id,
-            job.definition.bucket_id,
-            &work.through,
-            &work.target,
-            source_wire_limit(budget.limit()),
-        ),
-    )
-    .await
-    .map_err(event_status)?;
-    match page {
-        Some(page) => {
-            let records = page.changes.len() as u64;
-            let encoded_bytes = page.encoded_bytes;
-            let plan = work_plan(budget, page.encoded_bytes)?;
-            work.changed |= await_with_builder_heartbeats(
-                &work.progress,
-                process_journal_page(
-                    &job.definition,
-                    &job.specification,
-                    job.kind,
-                    &work.target,
-                    &page,
-                    plan,
-                    &mut work.candidate,
-                    dependencies,
-                ),
+    let mut quantum = SourceWorkQuantum::new(budget.limit());
+    let plan = work_plan(budget, quantum.limit)?;
+    // Sequential journal pages coalesce into one mutable run until this work
+    // quantum ends; the source cursor advances only after each page succeeds.
+    let mut builder = EngineSegmentBuilder::new(&job.specification, plan).map_err(index_status)?;
+    loop {
+        let Some(page_limit) = quantum.remaining() else {
+            flush_builder(
+                &job.definition,
+                job.kind,
+                builder,
+                &mut work.candidate,
+                dependencies,
             )
             .await?;
-            work.through = page.through;
-            work.progress.advance(records, encoded_bytes);
             drop(permit);
-            Ok((BuilderPhase::CatchUp(work), BuilderDisposition::Ready, None))
-        }
-        None => {
+            return Ok((BuilderPhase::CatchUp(work), BuilderDisposition::Ready, None));
+        };
+        let page = await_with_builder_heartbeats(
+            &work.progress,
+            dependencies.journal.next_page(
+                job.definition.tenant_id,
+                job.definition.bucket_id,
+                &work.through,
+                &work.target,
+                page_limit,
+            ),
+        )
+        .await;
+        let page = match page {
+            Ok(page) => page,
+            Err(IndexEventError::PageBytesExceeded { bytes, .. })
+                if quantum.defer_page_to_next_quantum(bytes) =>
+            {
+                flush_builder(
+                    &job.definition,
+                    job.kind,
+                    builder,
+                    &mut work.candidate,
+                    dependencies,
+                )
+                .await?;
+                drop(permit);
+                return Ok((BuilderPhase::CatchUp(work), BuilderDisposition::Ready, None));
+            }
+            Err(error) => return Err(event_status(error)),
+        };
+        let Some(page) = page else {
+            flush_builder(
+                &job.definition,
+                job.kind,
+                builder,
+                &mut work.candidate,
+                dependencies,
+            )
+            .await?;
             drop(permit);
             if work.through != work.target {
                 return Err(Status::unavailable(
                     "index catch-up did not reach its complete source barrier",
                 ));
+            }
+            // The final builder flush may have made a level overfull. Re-enter
+            // catch-up so its existing compaction gate reduces the candidate
+            // before manifest validation/publication.
+            if overfull_level(&work.candidate.runs).is_some() {
+                return Ok((BuilderPhase::CatchUp(work), BuilderDisposition::Ready, None));
             }
             if work.must_publish || work.changed {
                 work.progress.complete();
@@ -1022,11 +1073,43 @@ async fn advance_catch_up(
                 current_object_version: current.current_object_version,
                 barrier: work.through,
             });
-            Ok((
+            return Ok((
                 BuilderPhase::Inspect,
                 BuilderDisposition::Idle,
                 Some(current),
-            ))
+            ));
+        };
+
+        let records = page.changes.len() as u64;
+        let encoded_bytes = page.encoded_bytes;
+        work.changed |= await_with_builder_heartbeats(
+            &work.progress,
+            process_journal_page(
+                &job.definition,
+                &job.specification,
+                job.kind,
+                &work.target,
+                &page,
+                plan,
+                &mut builder,
+                &mut work.candidate,
+                dependencies,
+            ),
+        )
+        .await?;
+        work.through = page.through;
+        work.progress.advance(records, encoded_bytes);
+        if quantum.advance_page(encoded_bytes)? == SourceWorkBoundary::SealAndYield {
+            flush_builder(
+                &job.definition,
+                job.kind,
+                builder,
+                &mut work.candidate,
+                dependencies,
+            )
+            .await?;
+            drop(permit);
+            return Ok((BuilderPhase::CatchUp(work), BuilderDisposition::Ready, None));
         }
     }
 }
@@ -1181,10 +1264,10 @@ async fn process_snapshot_frame(
     barrier: &IndexBarrier,
     frame: Vec<IndexSourceSnapshotHead>,
     plan: SegmentMemoryPlan,
+    builder: &mut EngineSegmentBuilder,
     candidate: &mut CandidateGeneration,
     dependencies: &IndexBuilderDependencies,
 ) -> Result<(), Status> {
-    let mut builder = EngineSegmentBuilder::new(specification, plan).map_err(index_status)?;
     for head in frame {
         if head.tenant_id != definition.tenant_id
             || head.bucket_id != definition.bucket_id
@@ -1219,14 +1302,14 @@ async fn process_snapshot_frame(
             specification,
             kind,
             plan,
-            &mut builder,
+            builder,
             mutation,
             candidate,
             dependencies,
         )
         .await?;
     }
-    flush_builder(definition, kind, builder, candidate, dependencies).await
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1237,6 +1320,7 @@ async fn process_journal_page(
     target: &IndexBarrier,
     page: &IndexJournalPage,
     plan: SegmentMemoryPlan,
+    builder: &mut EngineSegmentBuilder,
     candidate: &mut CandidateGeneration,
     dependencies: &IndexBuilderDependencies,
 ) -> Result<bool, Status> {
@@ -1248,7 +1332,6 @@ async fn process_journal_page(
     );
     let changed = !paths.is_empty();
 
-    let mut builder = EngineSegmentBuilder::new(specification, plan).map_err(index_status)?;
     for (path, fallback_version) in paths {
         let source = load_target_source(
             definition,
@@ -1272,14 +1355,13 @@ async fn process_journal_page(
             specification,
             kind,
             plan,
-            &mut builder,
+            builder,
             mutation,
             candidate,
             dependencies,
         )
         .await?;
     }
-    flush_builder(definition, kind, builder, candidate, dependencies).await?;
     Ok(changed)
 }
 
@@ -1748,7 +1830,16 @@ fn source_needs_payload(specification: &IndexSpecification) -> bool {
 
 fn source_wire_limit(limit: u64) -> u64 {
     let fixed = FIXED_INDEX_SEAL_WORKSPACE_BYTES as u64;
-    let safe = limit.saturating_sub(fixed).saturating_sub(256) / DECODED_SOURCE_MULTIPLIER;
+    let remaining = limit.saturating_sub(fixed);
+    // SegmentMemoryPlan reserves half of the non-fixed budget for the mutable
+    // builder. Source framing may use only the other half, so the minimum
+    // accepted kind budget remains useful instead of consuming all of its
+    // builder capacity in the decoded-source reserve.
+    let builder_reserve = remaining / 2;
+    let safe = remaining
+        .saturating_sub(builder_reserve)
+        .saturating_sub(256)
+        / DECODED_SOURCE_MULTIPLIER;
     MAX_SOURCE_WIRE_BYTES.min(safe.max(64 * 1024))
 }
 
@@ -1785,8 +1876,10 @@ fn work_plan(
 
 fn measure_snapshot_frame(frame: &[IndexSourceSnapshotHead]) -> Result<u64, Status> {
     let mut counter = ByteCounter(0);
-    serde_json::to_writer(&mut counter, frame)
-        .map_err(|error| Status::internal(format!("measure index snapshot frame: {error}")))?;
+    for head in frame {
+        serde_json::to_writer(&mut counter, head)
+            .map_err(|error| Status::internal(format!("measure index snapshot frame: {error}")))?;
+    }
     Ok(counter.0)
 }
 

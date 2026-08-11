@@ -1,7 +1,7 @@
 use anvil_api::v1::{CreateIndexRequest, IndexSpecification, PathIndexSpec};
 use anvil_store::{
-    Head, MUTATION_STAMP_FORMAT, MutationStamp, ObjectHeadChange, ObjectHeadChangeKind,
-    PlacementLogId, SourceId, VersionId,
+    BlobRef, Head, MUTATION_STAMP_FORMAT, MutationStamp, ObjectHeadChange, ObjectHeadChangeKind,
+    PlacementLogId, SourceId, Version, VersionId,
 };
 
 use super::*;
@@ -67,6 +67,41 @@ fn journal_page(changes: Vec<IndexJournalChange>, next_offset: u64) -> IndexJour
         through: barrier(next_offset),
         encoded_bytes: 1,
     }
+}
+
+fn snapshot_head(path: &str, version: u64) -> IndexSourceSnapshotHead {
+    IndexSourceSnapshotHead {
+        tenant_id: 1,
+        bucket_id: 2,
+        exact_path: path.to_owned(),
+        head: Head {
+            version: VersionId(version),
+            deleted: false,
+            mutation_stamp: None,
+        },
+        version: Version {
+            id: VersionId(version),
+            blob: Some(BlobRef {
+                hash: [version as u8; 32],
+                length: 10,
+            }),
+            content_type: Some("application/json".to_owned()),
+            deleted: false,
+            committed_at_unix_millis: version,
+        },
+    }
+}
+
+#[test]
+fn snapshot_frame_measurement_matches_the_streams_per_record_credit() {
+    let frame = vec![snapshot_head("a.json", 1), snapshot_head("b.json", 2)];
+    let expected = frame
+        .iter()
+        .map(|head| serde_json::to_vec(head).unwrap().len() as u64)
+        .sum::<u64>();
+
+    assert_eq!(measure_snapshot_frame(&frame).unwrap(), expected);
+    assert!(serde_json::to_vec(&frame).unwrap().len() as u64 > expected);
 }
 
 fn definition(tenant_id: u64, bucket_id: u64, index_id: u64) -> CatalogDefinition {
@@ -520,4 +555,19 @@ fn deterministic_failure_stays_quiet_until_a_new_definition_revision() {
         scheduler.pop_runnable().unwrap().definition.object_version,
         2
     );
+}
+
+#[test]
+fn minimum_kind_budget_preserves_its_mutable_builder_reserve() {
+    let total = anvil_index::MIN_INDEX_KIND_MEMORY_BYTES as u64;
+    let configured = SegmentMemoryPlan::new(total as usize).unwrap();
+    let encoded_source = source_wire_limit(total);
+    let decoded_source = encoded_source * DECODED_SOURCE_MULTIPLIER;
+    let available = total - decoded_source;
+
+    assert!(encoded_source >= 64 * 1024);
+    assert!(
+        available - FIXED_INDEX_SEAL_WORKSPACE_BYTES as u64 >= configured.max_resident_bytes as u64
+    );
+    assert!(configured.max_resident_bytes > 1024 * 1024);
 }
