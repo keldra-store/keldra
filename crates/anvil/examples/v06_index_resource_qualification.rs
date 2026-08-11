@@ -46,9 +46,11 @@ const DEFAULT_RECORDS: u64 = 839_980;
 const DEFAULT_MUTATIONS: u64 = 2_048;
 const DEFAULT_BATCH_SIZE: usize = 256;
 const DEFAULT_WORKERS: usize = 4;
+const DEFAULT_VERIFICATION_WORKERS: usize = 8;
 const DEFAULT_SEED: u64 = 0x625d_54af_f989_97f3;
 const QUERY_LIMIT: u32 = 1_000;
 const BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const EXACT_VERIFICATION_TIMEOUT: Duration = Duration::from_secs(45 * 60);
 
 #[derive(Clone, Debug)]
 struct Config {
@@ -61,6 +63,7 @@ struct Config {
     mutation_count: u64,
     batch_size: usize,
     workers: usize,
+    verification_workers: usize,
     seed: u64,
     resource_pids: Vec<u32>,
     resource_containers: Vec<String>,
@@ -90,6 +93,7 @@ struct QualificationReport {
     indexed_fields: usize,
     partitions: u64,
     ingest_workers: usize,
+    verification_workers: usize,
     batch_size: usize,
     updated_objects: u64,
     deleted_objects: u64,
@@ -233,12 +237,13 @@ async fn main() -> Result<()> {
     index = index_client(channels[0].clone(), &token)?;
     let started = Instant::now();
     let (initial_count, initial_generation) = verify_every_partition(
-        &mut index,
+        &index,
         &config.bucket,
         config.records,
         &initial_versions,
         None,
         None,
+        config.verification_workers,
     )
     .await?;
     timings.exact_verification_seconds = started.elapsed().as_secs_f64();
@@ -292,12 +297,13 @@ async fn main() -> Result<()> {
     token = qualification_token(&config, channels[0].clone()).await?;
     index = index_client(channels[0].clone(), &token)?;
     let (final_count, final_generation) = verify_every_partition(
-        &mut index,
+        &index,
         &config.bucket,
         config.records,
         &initial_versions,
         Some(&expected_updates),
         Some(&deleted),
+        config.verification_workers,
     )
     .await?;
     timings.incremental_build_seconds = started.elapsed().as_secs_f64();
@@ -341,6 +347,7 @@ async fn main() -> Result<()> {
         indexed_fields: data::FIELD_COUNT,
         partitions: PARTITION_COUNT,
         ingest_workers: config.workers,
+        verification_workers: config.verification_workers,
         batch_size: config.batch_size,
         updated_objects: expected_updates.len() as u64,
         deleted_objects: deleted.len() as u64,
@@ -371,9 +378,17 @@ impl Config {
         let mutation_count = number("ANVIL_V06_RESOURCE_MUTATIONS", DEFAULT_MUTATIONS)?;
         let batch_size = number("ANVIL_V06_RESOURCE_BATCH_SIZE", DEFAULT_BATCH_SIZE)?;
         let workers = number("ANVIL_V06_RESOURCE_WORKERS", DEFAULT_WORKERS)?;
+        let verification_workers = number(
+            "ANVIL_V06_RESOURCE_VERIFICATION_WORKERS",
+            DEFAULT_VERIFICATION_WORKERS,
+        )?;
         ensure!(records > 0, "record count must be non-zero");
         ensure!(batch_size > 0, "batch size must be non-zero");
         ensure!(workers > 0, "worker count must be non-zero");
+        ensure!(
+            verification_workers > 0,
+            "verification worker count must be non-zero"
+        );
         let endpoints = required("ANVIL_V06_RESOURCE_ENDPOINTS")?
             .split(',')
             .filter(|value| !value.is_empty())
@@ -423,6 +438,7 @@ impl Config {
             mutation_count,
             batch_size,
             workers,
+            verification_workers,
             seed: number("ANVIL_V06_RESOURCE_SEED", DEFAULT_SEED)?,
             resource_pids,
             resource_containers,
@@ -664,20 +680,35 @@ async fn wait_for_generation(
 }
 
 async fn verify_every_partition(
-    client: &mut IndexClient,
+    client: &IndexClient,
     bucket: &str,
     records: u64,
     initial_versions: &[u64],
     expected_updates: Option<&BTreeMap<u64, u64>>,
     deleted: Option<&BTreeSet<u64>>,
+    workers: usize,
 ) -> Result<(u64, u64)> {
-    let deadline = Instant::now() + BUILD_TIMEOUT;
+    let deadline = Instant::now() + EXACT_VERIFICATION_TIMEOUT;
     loop {
         let mut count = 0u64;
         let mut generation = None;
         let mut complete = true;
-        for partition in 0..PARTITION_COUNT {
-            let response = match query_partition(client, bucket, partition).await {
+        let mut next_partition = 0;
+        let mut queries = JoinSet::new();
+        while next_partition < PARTITION_COUNT && queries.len() < workers {
+            spawn_partition_query(&mut queries, client, bucket, next_partition);
+            next_partition += 1;
+        }
+        while let Some(joined) = queries.join_next().await {
+            if Instant::now() >= deadline {
+                queries.abort_all();
+                while queries.join_next().await.is_some() {}
+                bail!(
+                    "exact partition verification did not converge before {EXACT_VERIFICATION_TIMEOUT:?}"
+                );
+            }
+            let (partition, response) = joined.context("exact partition query task failed")?;
+            let response = match response {
                 Ok(response) => response,
                 Err(error) if retryable_error(&error) => {
                     complete = false;
@@ -705,6 +736,14 @@ async fn verify_every_partition(
                     break;
                 }
             }
+            if next_partition < PARTITION_COUNT {
+                spawn_partition_query(&mut queries, client, bucket, next_partition);
+                next_partition += 1;
+            }
+        }
+        if !complete {
+            queries.abort_all();
+            while queries.join_next().await.is_some() {}
         }
         let expected = records - deleted.map_or(0, |values| values.len() as u64);
         if complete && count == expected {
@@ -714,10 +753,26 @@ async fn verify_every_partition(
             ));
         }
         if Instant::now() >= deadline {
-            bail!("exact partition verification did not converge before timeout");
+            bail!(
+                "exact partition verification did not converge before {EXACT_VERIFICATION_TIMEOUT:?}"
+            );
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+}
+
+fn spawn_partition_query(
+    queries: &mut JoinSet<(u64, Result<QueryIndexResponse>)>,
+    client: &IndexClient,
+    bucket: &str,
+    partition: u64,
+) {
+    let mut client = client.clone();
+    let bucket = bucket.to_owned();
+    queries.spawn(async move {
+        let response = query_partition(&mut client, &bucket, partition).await;
+        (partition, response)
+    });
 }
 
 fn validate_partition_response(

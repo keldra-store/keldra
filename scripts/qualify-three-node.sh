@@ -548,6 +548,7 @@ run_index_resource_qualification() {
   ANVIL_V06_RESOURCE_MUTATIONS="${index_resource_mutations}" \
   ANVIL_V06_RESOURCE_BATCH_SIZE=256 \
   ANVIL_V06_RESOURCE_WORKERS=6 \
+  ANVIL_V06_RESOURCE_VERIFICATION_WORKERS=8 \
   ANVIL_V06_RESOURCE_CONTAINERS="$(IFS=,; echo "${containers[*]}")" \
   ANVIL_V06_REQUIRE_RESOURCE_TARGETS=1 \
   ANVIL_V06_KIND_BUDGET_BYTES="${index_kind_budget_bytes}" \
