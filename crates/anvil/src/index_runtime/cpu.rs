@@ -1,12 +1,81 @@
 //! The one process-owned CPU pool for non-async index projection work.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
+use anvil_index::IndexError;
+use anvil_index::compaction::{CompactionExecutor, CompactionTaskFuture, CompactionTaskHandle};
 use thiserror::Error;
 
 #[derive(Clone)]
 pub(crate) struct IndexCpuPool {
     inner: Arc<rayon::ThreadPool>,
+    workers: usize,
+}
+
+/// Runtime bridge used by storage-neutral parallel index compaction.
+#[derive(Clone)]
+pub(crate) struct IndexCompactionExecutor {
+    cpu: IndexCpuPool,
+}
+
+impl IndexCompactionExecutor {
+    pub(crate) fn new(cpu: IndexCpuPool) -> Self {
+        Self { cpu }
+    }
+}
+
+pub(crate) struct IndexCompactionTask {
+    inner: tokio::task::JoinHandle<Result<(), IndexError>>,
+}
+
+impl Drop for IndexCompactionTask {
+    fn drop(&mut self) {
+        self.inner.abort();
+    }
+}
+
+impl Future for IndexCompactionTask {
+    type Output = Result<(), IndexError>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        match Pin::new(&mut self.inner).poll(context) {
+            Poll::Ready(Ok(result)) => Poll::Ready(result),
+            Poll::Ready(Err(error)) => Poll::Ready(Err(IndexError::Io(format!(
+                "parallel compaction task failed: {error}"
+            )))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl CompactionTaskHandle for IndexCompactionTask {
+    fn abort(&self) {
+        self.inner.abort();
+    }
+}
+
+impl CompactionExecutor for IndexCompactionExecutor {
+    type Task = IndexCompactionTask;
+
+    fn spawn_io(&self, task: CompactionTaskFuture) -> Self::Task {
+        IndexCompactionTask {
+            inner: tokio::spawn(task),
+        }
+    }
+
+    async fn run_cpu<T, F>(&self, work: F) -> Result<T, IndexError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, IndexError> + Send + 'static,
+    {
+        self.cpu
+            .install(work)
+            .await
+            .map_err(|error| IndexError::Io(error.to_string()))?
+    }
 }
 
 impl IndexCpuPool {
@@ -22,7 +91,12 @@ impl IndexCpuPool {
             .map_err(|error| IndexCpuPoolError::Build(error.to_string()))?;
         Ok(Self {
             inner: Arc::new(pool),
+            workers,
         })
+    }
+
+    pub(crate) fn workers(&self) -> usize {
+        self.workers
     }
 
     /// Run CPU work inside Anvil's pool, never Rayon's global registry.
@@ -57,6 +131,7 @@ mod tests {
     #[tokio::test]
     async fn work_runs_inside_the_owned_pool() {
         let pool = IndexCpuPool::new(1).unwrap();
+        assert_eq!(pool.workers(), 1);
         let name = pool
             .install(|| std::thread::current().name().unwrap_or_default().to_owned())
             .await

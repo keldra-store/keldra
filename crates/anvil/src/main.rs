@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use anvil::authentication::{JwtManager, RateLimitConfig, load_token_signing_key};
 use anvil::observability::{Observability, ObservabilityConfig};
 use anvil::{IndexRuntimeConfig, ServerConfig, serve};
+use anvil_index::IndexKind;
 use anyhow::{Context, Result};
 use clap::Parser;
 
@@ -138,13 +139,109 @@ struct Arguments {
     )]
     index_memory_percent: u8,
 
-    /// Hard aggregate build/compaction heap budget for each index kind (default: 64 MiB).
+    /// Hard aggregate build/compaction heap budget for each index kind (default: 256 MiB).
     #[arg(
         long,
         env = "ANVIL_INDEX_BUILDER_MEMORY_BYTES_PER_KIND",
         default_value_t = IndexRuntimeConfig::DEFAULT_BUILDER_MEMORY_BYTES_PER_KIND
     )]
     index_builder_memory_bytes_per_kind: u64,
+
+    /// Path builder-memory override; absent uses the common per-kind fallback.
+    #[arg(long, env = "ANVIL_INDEX_PATH_BUILDER_MEMORY_BYTES")]
+    index_path_builder_memory_bytes: Option<u64>,
+
+    /// Maximum parallel Path compaction lanes (default: 4).
+    #[arg(
+        long,
+        env = "ANVIL_INDEX_PATH_COMPACTION_MAX_LANES",
+        default_value_t = IndexRuntimeConfig::DEFAULT_COMPACTION_MAX_LANES
+    )]
+    index_path_compaction_max_lanes: u32,
+
+    /// Metadata-filter builder-memory override; absent uses the common fallback.
+    #[arg(long, env = "ANVIL_INDEX_METADATA_FILTER_BUILDER_MEMORY_BYTES")]
+    index_metadata_filter_builder_memory_bytes: Option<u64>,
+
+    /// Maximum parallel Metadata-filter compaction lanes (default: 4).
+    #[arg(
+        long,
+        env = "ANVIL_INDEX_METADATA_FILTER_COMPACTION_MAX_LANES",
+        default_value_t = IndexRuntimeConfig::DEFAULT_COMPACTION_MAX_LANES
+    )]
+    index_metadata_filter_compaction_max_lanes: u32,
+
+    /// Typed-JSON builder-memory override; absent uses the common fallback.
+    #[arg(long, env = "ANVIL_INDEX_TYPED_JSON_BUILDER_MEMORY_BYTES")]
+    index_typed_json_builder_memory_bytes: Option<u64>,
+
+    /// Maximum parallel Typed-JSON compaction lanes (default: 4).
+    #[arg(
+        long,
+        env = "ANVIL_INDEX_TYPED_JSON_COMPACTION_MAX_LANES",
+        default_value_t = IndexRuntimeConfig::DEFAULT_COMPACTION_MAX_LANES
+    )]
+    index_typed_json_compaction_max_lanes: u32,
+
+    /// Full-text builder-memory override; absent uses the common fallback.
+    #[arg(long, env = "ANVIL_INDEX_FULL_TEXT_BUILDER_MEMORY_BYTES")]
+    index_full_text_builder_memory_bytes: Option<u64>,
+
+    /// Maximum parallel Full-text compaction lanes (default: 4).
+    #[arg(
+        long,
+        env = "ANVIL_INDEX_FULL_TEXT_COMPACTION_MAX_LANES",
+        default_value_t = IndexRuntimeConfig::DEFAULT_COMPACTION_MAX_LANES
+    )]
+    index_full_text_compaction_max_lanes: u32,
+
+    /// Vector builder-memory override; absent uses the common fallback.
+    #[arg(long, env = "ANVIL_INDEX_VECTOR_BUILDER_MEMORY_BYTES")]
+    index_vector_builder_memory_bytes: Option<u64>,
+
+    /// Maximum parallel Vector compaction lanes (default: 4).
+    #[arg(
+        long,
+        env = "ANVIL_INDEX_VECTOR_COMPACTION_MAX_LANES",
+        default_value_t = IndexRuntimeConfig::DEFAULT_COMPACTION_MAX_LANES
+    )]
+    index_vector_compaction_max_lanes: u32,
+
+    /// Hybrid builder-memory override; absent uses the common fallback.
+    #[arg(long, env = "ANVIL_INDEX_HYBRID_BUILDER_MEMORY_BYTES")]
+    index_hybrid_builder_memory_bytes: Option<u64>,
+
+    /// Maximum parallel Hybrid compaction lanes (default: 4).
+    #[arg(
+        long,
+        env = "ANVIL_INDEX_HYBRID_COMPACTION_MAX_LANES",
+        default_value_t = IndexRuntimeConfig::DEFAULT_COMPACTION_MAX_LANES
+    )]
+    index_hybrid_compaction_max_lanes: u32,
+
+    /// Git-source builder-memory override; absent uses the common fallback.
+    #[arg(long, env = "ANVIL_INDEX_GIT_SOURCE_BUILDER_MEMORY_BYTES")]
+    index_git_source_builder_memory_bytes: Option<u64>,
+
+    /// Maximum parallel Git-source compaction lanes (default: 4).
+    #[arg(
+        long,
+        env = "ANVIL_INDEX_GIT_SOURCE_COMPACTION_MAX_LANES",
+        default_value_t = IndexRuntimeConfig::DEFAULT_COMPACTION_MAX_LANES
+    )]
+    index_git_source_compaction_max_lanes: u32,
+
+    /// Tensor builder-memory override; absent uses the common fallback.
+    #[arg(long, env = "ANVIL_INDEX_TENSOR_BUILDER_MEMORY_BYTES")]
+    index_tensor_builder_memory_bytes: Option<u64>,
+
+    /// Maximum parallel Tensor compaction lanes (default: 4).
+    #[arg(
+        long,
+        env = "ANVIL_INDEX_TENSOR_COMPACTION_MAX_LANES",
+        default_value_t = IndexRuntimeConfig::DEFAULT_COMPACTION_MAX_LANES
+    )]
+    index_tensor_compaction_max_lanes: u32,
 
     /// Threads in Anvil's process-owned index CPU pool (default: 4).
     #[arg(
@@ -256,7 +353,7 @@ impl Arguments {
     }
 
     fn index_runtime_config(&self) -> Result<IndexRuntimeConfig> {
-        IndexRuntimeConfig::new(
+        let mut config = IndexRuntimeConfig::new(
             self.index_disk_cache_bytes,
             self.index_memory_percent,
             self.index_builder_memory_bytes_per_kind,
@@ -265,7 +362,58 @@ impl Arguments {
             self.index_max_generation_age_hours,
             self.index_max_retained_generation_bytes,
         )
-        .context("validate index runtime configuration")
+        .context("validate index runtime configuration")?;
+        for (kind, memory, lanes) in [
+            (
+                IndexKind::Path,
+                self.index_path_builder_memory_bytes,
+                self.index_path_compaction_max_lanes,
+            ),
+            (
+                IndexKind::MetadataFilter,
+                self.index_metadata_filter_builder_memory_bytes,
+                self.index_metadata_filter_compaction_max_lanes,
+            ),
+            (
+                IndexKind::TypedJson,
+                self.index_typed_json_builder_memory_bytes,
+                self.index_typed_json_compaction_max_lanes,
+            ),
+            (
+                IndexKind::FullText,
+                self.index_full_text_builder_memory_bytes,
+                self.index_full_text_compaction_max_lanes,
+            ),
+            (
+                IndexKind::Vector,
+                self.index_vector_builder_memory_bytes,
+                self.index_vector_compaction_max_lanes,
+            ),
+            (
+                IndexKind::Hybrid,
+                self.index_hybrid_builder_memory_bytes,
+                self.index_hybrid_compaction_max_lanes,
+            ),
+            (
+                IndexKind::GitSource,
+                self.index_git_source_builder_memory_bytes,
+                self.index_git_source_compaction_max_lanes,
+            ),
+            (
+                IndexKind::Tensor,
+                self.index_tensor_builder_memory_bytes,
+                self.index_tensor_compaction_max_lanes,
+            ),
+        ] {
+            config = config
+                .with_kind_limits(
+                    kind,
+                    memory.unwrap_or(self.index_builder_memory_bytes_per_kind),
+                    lanes,
+                )
+                .context("validate index runtime configuration")?;
+        }
+        Ok(config)
     }
 }
 
@@ -435,6 +583,10 @@ mod tests {
             "25",
             "--index-builder-memory-bytes-per-kind",
             "33554432",
+            "--index-path-builder-memory-bytes",
+            "67108864",
+            "--index-path-compaction-max-lanes",
+            "3",
             "--index-rayon-workers",
             "6",
             "--index-max-retained-generations",
@@ -449,6 +601,13 @@ mod tests {
         assert_eq!(config.disk_cache_bytes(), 1_048_576);
         assert_eq!(config.memory_percent(), 25);
         assert_eq!(config.builder_memory_bytes_per_kind(), 33_554_432);
+        assert_eq!(config.builder_memory_bytes(IndexKind::Path), 67_108_864);
+        assert_eq!(config.compaction_max_lanes(IndexKind::Path), 3);
+        assert_eq!(
+            config.builder_memory_bytes(IndexKind::TypedJson),
+            33_554_432
+        );
+        assert_eq!(config.compaction_max_lanes(IndexKind::TypedJson), 4);
         assert_eq!(config.rayon_workers(), 6);
         assert_eq!(config.max_retained_generations(), 7);
         assert_eq!(config.max_generation_age_hours(), 48);
@@ -462,6 +621,8 @@ mod tests {
             vec!["--index-memory-percent", "0"],
             vec!["--index-memory-percent", "101"],
             vec!["--index-builder-memory-bytes-per-kind", "0"],
+            vec!["--index-vector-builder-memory-bytes", "0"],
+            vec!["--index-vector-compaction-max-lanes", "0"],
             vec!["--index-rayon-workers", "0"],
             vec!["--index-max-retained-generations", "0"],
             vec!["--index-max-generation-age-hours", "0"],
@@ -485,7 +646,11 @@ mod tests {
             "--index-memory-percent",
             "default: 10",
             "--index-builder-memory-bytes-per-kind",
-            "default: 64 MiB",
+            "default: 256 MiB",
+            "--index-path-builder-memory-bytes",
+            "--index-path-compaction-max-lanes",
+            "--index-tensor-builder-memory-bytes",
+            "--index-tensor-compaction-max-lanes",
             "--index-rayon-workers",
             "default: 4",
             "--index-max-retained-generations",

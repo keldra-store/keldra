@@ -112,6 +112,7 @@ fn queue_definition(scheduler: &mut BuilderScheduler, definition: CatalogDefinit
 fn queue_dirty_definition(scheduler: &mut BuilderScheduler, definition: CatalogDefinition) {
     let identity = definition.identity();
     let mut job = BuilderJob::new(definition.clone()).unwrap();
+    let progress = BuilderProgress::start(job.telemetry_identity(), BuilderProgressPhase::CatchUp);
     job.phase = BuilderPhase::CatchUp(CatchUpWork {
         current: None,
         through: barrier(10),
@@ -119,6 +120,7 @@ fn queue_dirty_definition(scheduler: &mut BuilderScheduler, definition: CatalogD
         candidate: CandidateGeneration::rebuild(),
         changed: true,
         must_publish: true,
+        progress,
     });
     scheduler.entries.insert(
         identity,
@@ -382,6 +384,7 @@ fn malformed_source_evidence_fails_the_definition_closed() {
 
 #[test]
 fn transient_catch_up_and_publish_failures_preserve_exact_work() {
+    let job = BuilderJob::new(definition(1, 2, 9)).unwrap();
     let catch_up = CatchUpWork {
         current: None,
         through: barrier(10),
@@ -389,9 +392,10 @@ fn transient_catch_up_and_publish_failures_preserve_exact_work() {
         candidate: CandidateGeneration::rebuild(),
         changed: true,
         must_publish: true,
+        progress: BuilderProgress::start(job.telemetry_identity(), BuilderProgressPhase::CatchUp),
     };
     let catch_up_step = recover_builder_failure(
-        BuilderJob::new(definition(1, 2, 9)).unwrap(),
+        job,
         BuilderFailurePhase::CatchUp,
         Some(BuilderPhase::CatchUp(catch_up)),
         Status::unavailable("temporary peer failure"),
@@ -454,6 +458,7 @@ fn head_advanced_past_a_fixed_target_reinspects_instead_of_retrying_forever() {
 
 #[test]
 fn incompatible_history_forces_the_next_inspect_to_open_a_scoped_snapshot() {
+    let job = BuilderJob::new(definition(1, 2, 9)).unwrap();
     let work = CatchUpWork {
         current: None,
         through: barrier(10),
@@ -461,9 +466,10 @@ fn incompatible_history_forces_the_next_inspect_to_open_a_scoped_snapshot() {
         candidate: CandidateGeneration::rebuild(),
         changed: false,
         must_publish: false,
+        progress: BuilderProgress::start(job.telemetry_identity(), BuilderProgressPhase::CatchUp),
     };
     let step = recover_builder_failure(
-        BuilderJob::new(definition(1, 2, 9)).unwrap(),
+        job,
         BuilderFailurePhase::CatchUp,
         Some(BuilderPhase::CatchUp(work)),
         Status::failed_precondition("source history gap"),

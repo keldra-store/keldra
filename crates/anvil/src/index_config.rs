@@ -1,5 +1,6 @@
 use std::num::{NonZeroU8, NonZeroU32, NonZeroU64};
 
+use anvil_index::IndexKind;
 use thiserror::Error;
 
 /// Startup-only budgets and retention bounds shared by every index on a node.
@@ -12,6 +13,8 @@ pub struct IndexRuntimeConfig {
     disk_cache_bytes: NonZeroU64,
     memory_percent: NonZeroU8,
     builder_memory_bytes_per_kind: NonZeroU64,
+    builder_memory_bytes: [NonZeroU64; 8],
+    compaction_max_lanes: [NonZeroU32; 8],
     rayon_workers: NonZeroU32,
     max_retained_generations: NonZeroU32,
     max_generation_age_hours: NonZeroU64,
@@ -21,7 +24,10 @@ pub struct IndexRuntimeConfig {
 impl IndexRuntimeConfig {
     pub const DEFAULT_DISK_CACHE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
     pub const DEFAULT_MEMORY_PERCENT: u8 = 10;
-    pub const DEFAULT_BUILDER_MEMORY_BYTES_PER_KIND: u64 = 64 * 1024 * 1024;
+    pub const DEFAULT_BUILDER_MEMORY_BYTES_PER_KIND: u64 = 256 * 1024 * 1024;
+    /// Four lanes fit the default per-kind construction budget. Setting one
+    /// explicitly preserves the byte-for-byte sequential compaction path.
+    pub const DEFAULT_COMPACTION_MAX_LANES: u32 = 4;
     pub const DEFAULT_RAYON_WORKERS: u32 = 4;
     pub const DEFAULT_MAX_RETAINED_GENERATIONS: u32 = 3;
     pub const DEFAULT_MAX_GENERATION_AGE_HOURS: u64 = 24;
@@ -61,6 +67,10 @@ impl IndexRuntimeConfig {
             disk_cache_bytes,
             memory_percent,
             builder_memory_bytes_per_kind,
+            builder_memory_bytes: [builder_memory_bytes_per_kind; 8],
+            compaction_max_lanes: [NonZeroU32::new(Self::DEFAULT_COMPACTION_MAX_LANES)
+                .expect("the default compaction lane limit is positive");
+                8],
             rayon_workers,
             max_retained_generations,
             max_generation_age_hours,
@@ -83,6 +93,51 @@ impl IndexRuntimeConfig {
         self.builder_memory_bytes_per_kind.get()
     }
 
+    /// Override construction memory for one kind.
+    pub fn with_kind_builder_memory_bytes(
+        mut self,
+        kind: IndexKind,
+        builder_memory_bytes: u64,
+    ) -> Result<Self, IndexRuntimeConfigError> {
+        self.builder_memory_bytes[kind_slot(kind)] = NonZeroU64::new(builder_memory_bytes)
+            .ok_or(IndexRuntimeConfigError::ZeroBuilderMemoryBytesForKind(kind))?;
+        Ok(self)
+    }
+
+    /// Override compaction parallelism for one kind.
+    ///
+    /// A lane limit of one selects the original sequential merge.
+    pub fn with_kind_compaction_max_lanes(
+        mut self,
+        kind: IndexKind,
+        compaction_max_lanes: u32,
+    ) -> Result<Self, IndexRuntimeConfigError> {
+        self.compaction_max_lanes[kind_slot(kind)] = NonZeroU32::new(compaction_max_lanes)
+            .ok_or(IndexRuntimeConfigError::ZeroCompactionLanesForKind(kind))?;
+        Ok(self)
+    }
+
+    /// Override both construction limits for one kind.
+    pub fn with_kind_limits(
+        self,
+        kind: IndexKind,
+        builder_memory_bytes: u64,
+        compaction_max_lanes: u32,
+    ) -> Result<Self, IndexRuntimeConfigError> {
+        self.with_kind_builder_memory_bytes(kind, builder_memory_bytes)?
+            .with_kind_compaction_max_lanes(kind, compaction_max_lanes)
+    }
+
+    /// Hard aggregate build-and-compaction heap budget for `kind`.
+    pub fn builder_memory_bytes(self, kind: IndexKind) -> u64 {
+        self.builder_memory_bytes[kind_slot(kind)].get()
+    }
+
+    /// Operator ceiling for parallel compaction lanes of `kind`.
+    pub fn compaction_max_lanes(self, kind: IndexKind) -> u32 {
+        self.compaction_max_lanes[kind_slot(kind)].get()
+    }
+
     pub fn rayon_workers(self) -> u32 {
         self.rayon_workers.get()
     }
@@ -98,6 +153,10 @@ impl IndexRuntimeConfig {
     pub fn max_retained_generation_bytes(self) -> u64 {
         self.max_retained_generation_bytes.get()
     }
+}
+
+const fn kind_slot(kind: IndexKind) -> usize {
+    kind as u8 as usize - 1
 }
 
 impl Default for IndexRuntimeConfig {
@@ -123,6 +182,10 @@ pub enum IndexRuntimeConfigError {
     InvalidMemoryPercent(u8),
     #[error("index builder memory byte budget per kind must be greater than zero")]
     ZeroBuilderMemoryBytesPerKind,
+    #[error("index builder memory byte budget for {0:?} must be greater than zero")]
+    ZeroBuilderMemoryBytesForKind(IndexKind),
+    #[error("index compaction lane limit for {0:?} must be greater than zero")]
+    ZeroCompactionLanesForKind(IndexKind),
     #[error("index Rayon worker count must be greater than zero")]
     ZeroRayonWorkers,
     #[error("maximum retained index generations must be greater than zero")]
@@ -137,13 +200,28 @@ pub enum IndexRuntimeConfigError {
 mod tests {
     use super::*;
 
+    const KINDS: [IndexKind; 8] = [
+        IndexKind::Path,
+        IndexKind::MetadataFilter,
+        IndexKind::TypedJson,
+        IndexKind::FullText,
+        IndexKind::Vector,
+        IndexKind::Hybrid,
+        IndexKind::GitSource,
+        IndexKind::Tensor,
+    ];
+
     #[test]
     fn defaults_are_conservative_and_valid() {
         let config = IndexRuntimeConfig::default();
         assert_eq!(config.disk_cache_bytes(), 10 * 1024 * 1024 * 1024);
         assert_eq!(config.memory_percent(), 10);
-        assert_eq!(config.builder_memory_bytes_per_kind(), 64 * 1024 * 1024);
+        assert_eq!(config.builder_memory_bytes_per_kind(), 256 * 1024 * 1024);
         assert_eq!(config.rayon_workers(), 4);
+        for kind in KINDS {
+            assert_eq!(config.builder_memory_bytes(kind), 256 * 1024 * 1024);
+            assert_eq!(config.compaction_max_lanes(kind), 4);
+        }
         assert_eq!(config.max_retained_generations(), 3);
         assert_eq!(config.max_generation_age_hours(), 24);
         assert_eq!(
@@ -248,5 +326,49 @@ mod tests {
             Err(IndexRuntimeConfigError::InvalidMemoryPercent(101))
         );
         assert!(IndexRuntimeConfig::new(1, 100, 1, 1, 1, 1, 1).is_ok());
+    }
+
+    #[test]
+    fn kind_limits_are_independent_and_keep_the_common_fallback() {
+        let configured = IndexRuntimeConfig::default()
+            .with_kind_builder_memory_bytes(IndexKind::Path, 96 * 1024 * 1024)
+            .unwrap()
+            .with_kind_compaction_max_lanes(IndexKind::Path, 2)
+            .unwrap()
+            .with_kind_limits(IndexKind::Tensor, 192 * 1024 * 1024, 7)
+            .unwrap();
+
+        assert_eq!(
+            configured.builder_memory_bytes(IndexKind::Path),
+            96 * 1024 * 1024
+        );
+        assert_eq!(configured.compaction_max_lanes(IndexKind::Path), 2);
+        assert_eq!(
+            configured.builder_memory_bytes(IndexKind::Tensor),
+            192 * 1024 * 1024
+        );
+        assert_eq!(configured.compaction_max_lanes(IndexKind::Tensor), 7);
+        assert_eq!(
+            configured.builder_memory_bytes(IndexKind::TypedJson),
+            configured.builder_memory_bytes_per_kind()
+        );
+        assert_eq!(configured.compaction_max_lanes(IndexKind::TypedJson), 4);
+    }
+
+    #[test]
+    fn zero_kind_limits_are_rejected_without_changing_other_kinds() {
+        let defaults = IndexRuntimeConfig::default();
+        assert_eq!(
+            defaults.with_kind_limits(IndexKind::Vector, 0, 1),
+            Err(IndexRuntimeConfigError::ZeroBuilderMemoryBytesForKind(
+                IndexKind::Vector
+            ))
+        );
+        assert_eq!(
+            defaults.with_kind_limits(IndexKind::Vector, 1, 0),
+            Err(IndexRuntimeConfigError::ZeroCompactionLanesForKind(
+                IndexKind::Vector
+            ))
+        );
     }
 }

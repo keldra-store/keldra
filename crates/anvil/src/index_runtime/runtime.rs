@@ -111,7 +111,7 @@ pub(crate) async fn start(
         artifact_router.clone(),
         config,
     );
-    let budgets = IndexMemoryBudgets::new(config.builder_memory_bytes_per_kind())
+    let budgets = IndexMemoryBudgets::from_config(config)
         .context("validate per-kind index construction budgets")?;
     let cpu = IndexCpuPool::new(config.rayon_workers())
         .context("initialize the fixed index Rayon pool")?;
@@ -129,6 +129,7 @@ pub(crate) async fn start(
             cache,
             budgets,
             cpu,
+            config,
         },
     );
 

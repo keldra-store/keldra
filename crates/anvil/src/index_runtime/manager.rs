@@ -2,10 +2,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anvil_api::v1::IndexSpecification;
 use anvil_consensus::{DecisionRaft, NodeId};
+use anvil_index::compaction::{CompactionParallelism, CompactionProgress};
 use anvil_index::{
     DocumentRef, FIXED_INDEX_SEAL_WORKSPACE_BYTES, IndexError, IndexKind, SegmentMemoryPlan,
 };
@@ -15,17 +16,18 @@ use tonic::Status;
 use crate::cluster_object_read::ClusterObjectReader;
 use crate::cluster_peer::IndexSourceSnapshotHead;
 use crate::cluster_placement::ClusterPlacement;
+use crate::index_config::IndexRuntimeConfig;
 use crate::index_service::{StoredIndexDefinition, definition_path, path_matches_prefix};
 
 use super::budget::{IndexBudgetError, IndexMemoryBudget, IndexMemoryBudgets};
 use super::cache::IndexCache;
 use super::catalog::{CatalogChange, CatalogDefinition, CatalogIdentity, IndexCatalog};
-use super::cpu::{IndexCpuPool, IndexCpuPoolError};
+use super::cpu::{IndexCompactionExecutor, IndexCpuPool, IndexCpuPoolError};
 use super::directory::ManifestIndexDirectory;
 use super::engine::{
     EngineMutation, EngineSegmentBuilder, EngineSegmentPush, IndexBuildDiagnostics,
-    IndexBuildObject, IndexSourceMutation, kind_for_specification, merge_runs, project_mutation,
-    projection_admission_bytes,
+    IndexBuildObject, IndexSourceMutation, kind_for_specification, merge_runs_parallel,
+    project_mutation, projection_admission_bytes,
 };
 use super::events::{IndexBarrier, IndexEventError, IndexEventJournal, IndexJournalPage};
 use super::generation::{MAX_RUNS_PER_LEVEL, ManifestRun};
@@ -33,6 +35,10 @@ use super::placement::{IndexIdentity, IndexPlacement};
 use super::publisher::{IndexGenerationPublisher, PublishedGeneration};
 use super::retention::{IndexGenerationRetention, IndexRetentionTask};
 use super::scanner::{ClusterIndexScanner, ClusterIndexSourceSnapshot};
+use super::telemetry::{
+    BuilderProgress, BuilderProgressPhase, CompactionInputTotals, CompactionTelemetry,
+    IndexTelemetryIdentity, await_with_builder_heartbeats, await_with_compaction_heartbeats,
+};
 
 #[path = "manager/recovery.rs"]
 mod recovery;
@@ -95,6 +101,7 @@ pub(crate) struct IndexBuilderDependencies {
     pub(crate) cache: IndexCache,
     pub(crate) budgets: IndexMemoryBudgets,
     pub(crate) cpu: IndexCpuPool,
+    pub(crate) config: IndexRuntimeConfig,
 }
 
 async fn run_manager(
@@ -627,6 +634,15 @@ impl BuilderJob {
     fn holds_snapshot(&self) -> bool {
         matches!(self.phase, BuilderPhase::Rebuild(_))
     }
+
+    fn telemetry_identity(&self) -> IndexTelemetryIdentity {
+        IndexTelemetryIdentity {
+            index_id: self.definition.stored.index_id,
+            tenant_id: self.definition.tenant_id,
+            bucket_id: self.definition.bucket_id,
+            kind: self.kind,
+        }
+    }
 }
 
 enum BuilderPhase {
@@ -642,6 +658,7 @@ struct RebuildWork {
     snapshot: ClusterIndexSourceSnapshot,
     through: IndexBarrier,
     candidate: CandidateGeneration,
+    progress: BuilderProgress,
 }
 
 #[derive(Clone)]
@@ -652,6 +669,7 @@ struct CatchUpWork {
     candidate: CandidateGeneration,
     changed: bool,
     must_publish: bool,
+    progress: BuilderProgress,
 }
 
 #[derive(Clone)]
@@ -731,6 +749,7 @@ async fn inspect_builder(
     ),
     Status,
 > {
+    let telemetry_identity = job.telemetry_identity();
     let definition = &job.definition;
     let current = dependencies
         .publisher
@@ -740,6 +759,7 @@ async fn inspect_builder(
             definition.bucket_id,
         )
         .await?;
+    emit_publication_age(job.kind, current.as_ref());
     if !job.force_snapshot_rebuild
         && let Some(current) = current.as_ref()
         && current.manifest.definition_version == definition.object_version
@@ -759,6 +779,7 @@ async fn inspect_builder(
         .clone();
         let retention_current = Some(current.clone());
         if barriers_can_advance(&from, &target) {
+            emit_source_lag(job.kind, &from, &target);
             if from == target {
                 job.observed = Some(ObservedGenerationProgress {
                     current_object_version: current.current_object_version,
@@ -771,7 +792,6 @@ async fn inspect_builder(
                 ));
             }
             let candidate = CandidateGeneration::incremental(current);
-            emit_source_lag(job.kind, &from, &target);
             return Ok((
                 BuilderPhase::CatchUp(CatchUpWork {
                     current: Some(current.clone()),
@@ -780,6 +800,10 @@ async fn inspect_builder(
                     candidate,
                     changed: false,
                     must_publish: false,
+                    progress: BuilderProgress::start(
+                        telemetry_identity,
+                        BuilderProgressPhase::CatchUp,
+                    ),
                 }),
                 BuilderDisposition::Ready,
                 retention_current,
@@ -792,7 +816,6 @@ async fn inspect_builder(
         index.kind = ?job.kind,
         tenant_id = job.definition.tenant_id,
         bucket_id = job.definition.bucket_id,
-        monotonic_counter.anvil_index_rebuilds_total = 1_u64,
         "index snapshot rebuild started"
     );
     job.observed = None;
@@ -830,6 +853,7 @@ async fn inspect_builder(
         .barrier_from_snapshot_tails(snapshot.placement_fence(), expected_atomic, &tails)
         .map_err(event_status)?;
     job.force_snapshot_rebuild = false;
+    let progress = BuilderProgress::start(telemetry_identity, BuilderProgressPhase::Rebuild);
     Ok((
         BuilderPhase::Rebuild(RebuildWork {
             current,
@@ -837,6 +861,7 @@ async fn inspect_builder(
             snapshot,
             through,
             candidate: CandidateGeneration::rebuild(),
+            progress,
         }),
         BuilderDisposition::Ready,
         None,
@@ -859,26 +884,30 @@ async fn advance_rebuild(
         return Ok((BuilderPhase::Rebuild(work), BuilderDisposition::Ready, None));
     }
     let budget = dependencies.budgets.for_kind(job.kind);
-    let permit = budget
-        .acquire(budget.limit())
+    let permit = await_with_builder_heartbeats(&work.progress, budget.acquire(budget.limit()))
         .await
         .map_err(budget_status)?;
-    let frame = work.snapshot.next_frame().await?;
+    let frame = await_with_builder_heartbeats(&work.progress, work.snapshot.next_frame()).await?;
     match frame {
         Some(frame) => {
+            let records = frame.len() as u64;
             let encoded_bytes = measure_snapshot_frame(&frame)?;
             let plan = work_plan(budget, encoded_bytes)?;
-            process_snapshot_frame(
-                &job.definition,
-                &job.specification,
-                job.kind,
-                &work.through,
-                frame,
-                plan,
-                &mut work.candidate,
-                dependencies,
+            await_with_builder_heartbeats(
+                &work.progress,
+                process_snapshot_frame(
+                    &job.definition,
+                    &job.specification,
+                    job.kind,
+                    &work.through,
+                    frame,
+                    plan,
+                    &mut work.candidate,
+                    dependencies,
+                ),
             )
             .await?;
+            work.progress.advance(records, encoded_bytes);
             drop(permit);
             Ok((BuilderPhase::Rebuild(work), BuilderDisposition::Ready, None))
         }
@@ -889,6 +918,7 @@ async fn advance_rebuild(
                 .capture_barrier()
                 .await
                 .map_err(event_status)?;
+            work.progress.complete();
             emit_source_lag(job.kind, &work.through, &target);
             Ok((
                 BuilderPhase::CatchUp(CatchUpWork {
@@ -898,6 +928,10 @@ async fn advance_rebuild(
                     candidate: work.candidate,
                     changed: false,
                     must_publish: true,
+                    progress: BuilderProgress::start(
+                        job.telemetry_identity(),
+                        BuilderProgressPhase::CatchUp,
+                    ),
                 }),
                 BuilderDisposition::Ready,
                 None,
@@ -922,36 +956,42 @@ async fn advance_catch_up(
         return Ok((BuilderPhase::CatchUp(work), BuilderDisposition::Ready, None));
     }
     let budget = dependencies.budgets.for_kind(job.kind);
-    let permit = budget
-        .acquire(budget.limit())
+    let permit = await_with_builder_heartbeats(&work.progress, budget.acquire(budget.limit()))
         .await
         .map_err(budget_status)?;
-    let page = dependencies
-        .journal
-        .next_page(
+    let page = await_with_builder_heartbeats(
+        &work.progress,
+        dependencies.journal.next_page(
             job.definition.tenant_id,
             job.definition.bucket_id,
             &work.through,
             &work.target,
             source_wire_limit(budget.limit()),
-        )
-        .await
-        .map_err(event_status)?;
+        ),
+    )
+    .await
+    .map_err(event_status)?;
     match page {
         Some(page) => {
+            let records = page.changes.len() as u64;
+            let encoded_bytes = page.encoded_bytes;
             let plan = work_plan(budget, page.encoded_bytes)?;
-            work.changed |= process_journal_page(
-                &job.definition,
-                &job.specification,
-                job.kind,
-                &work.target,
-                &page,
-                plan,
-                &mut work.candidate,
-                dependencies,
+            work.changed |= await_with_builder_heartbeats(
+                &work.progress,
+                process_journal_page(
+                    &job.definition,
+                    &job.specification,
+                    job.kind,
+                    &work.target,
+                    &page,
+                    plan,
+                    &mut work.candidate,
+                    dependencies,
+                ),
             )
             .await?;
             work.through = page.through;
+            work.progress.advance(records, encoded_bytes);
             drop(permit);
             Ok((BuilderPhase::CatchUp(work), BuilderDisposition::Ready, None))
         }
@@ -963,6 +1003,7 @@ async fn advance_catch_up(
                 ));
             }
             if work.must_publish || work.changed {
+                work.progress.complete();
                 return Ok((
                     BuilderPhase::Publish(PublishWork {
                         current: work.current,
@@ -976,6 +1017,7 @@ async fn advance_catch_up(
             let current = work.current.ok_or_else(|| {
                 Status::internal("incremental builder lost its current generation")
             })?;
+            work.progress.complete();
             job.observed = Some(ObservedGenerationProgress {
                 current_object_version: current.current_object_version,
                 barrier: work.through,
@@ -1028,7 +1070,7 @@ async fn compact_one_if_needed(
         return Ok(false);
     };
     let budget = dependencies.budgets.for_kind(job.kind);
-    let _permit = budget
+    let permit = budget
         .acquire(budget.limit())
         .await
         .map_err(budget_status)?;
@@ -1037,6 +1079,7 @@ async fn compact_one_if_needed(
         &job.specification,
         job.kind,
         level,
+        permit.bytes(),
         candidate,
         dependencies,
     )
@@ -1415,8 +1458,8 @@ async fn flush_builder(
     candidate.runs.sort_by_key(|run| run.sequence);
     tracing::info!(
         index.kind = ?kind,
-        gauge.anvil_index_construction_used_bytes = resident,
-        gauge.anvil_index_construction_peak_bytes = workspace,
+        gauge.anvil_index_construction_resident_bytes = resident,
+        gauge.anvil_index_construction_workspace_bytes = workspace,
         monotonic_counter.anvil_index_flushes_total = 1_u64,
         monotonic_counter.anvil_index_runs_created_total = 1_u64,
         "index L0 run flushed"
@@ -1441,6 +1484,7 @@ async fn compact_level(
     specification: &IndexSpecification,
     kind: IndexKind,
     level: u8,
+    leased_bytes: u64,
     candidate: &mut CandidateGeneration,
     dependencies: &IndexBuilderDependencies,
 ) -> Result<(), Status> {
@@ -1460,25 +1504,80 @@ async fn compact_level(
     // Engines resolve equal versions by input order, newest first.
     selected.sort_by_key(|run| std::cmp::Reverse(run.sequence));
     let replacement_sequence = compaction_replacement_sequence(&selected)?;
-    let directories = selected
-        .iter()
-        .map(|run| ManifestIndexDirectory::open(dependencies.cache.clone(), run))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(index_status)?;
-    let mut sink = dependencies.publisher.staging_sink();
-    let sealed = merge_runs(specification, &directories, output_level, &mut sink)
+    let input = CompactionInputTotals::from_runs(&selected).map_err(index_status)?;
+    let configured_lanes = usize::try_from(dependencies.config.compaction_max_lanes(kind))
+        .map_err(|_| Status::resource_exhausted("index compaction lane limit exceeds platform"))?;
+    let parallelism = CompactionParallelism::for_budget(
+        configured_lanes,
+        dependencies.cpu.workers(),
+        leased_bytes,
+    )
+    .map_err(index_status)?;
+    let progress = CompactionProgress::default();
+    let telemetry = CompactionTelemetry::start(
+        IndexTelemetryIdentity {
+            index_id: definition.stored.index_id,
+            tenant_id: definition.tenant_id,
+            bucket_id: definition.bucket_id,
+            kind,
+        },
+        level,
+        output_level,
+        input,
+        parallelism,
+        leased_bytes,
+        progress.clone(),
+    )
+    .map_err(index_status)?;
+    let result = await_with_compaction_heartbeats(&telemetry, async {
+        let directories = selected
+            .iter()
+            .map(|run| {
+                ManifestIndexDirectory::open_observed(
+                    dependencies.cache.clone(),
+                    run,
+                    progress.clone(),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(index_status)?;
+        let mut sink = dependencies
+            .publisher
+            .observed_staging_sink(progress.clone());
+        let sealed = merge_runs_parallel(
+            specification,
+            &directories,
+            output_level,
+            &mut sink,
+            parallelism,
+            progress.clone(),
+            IndexCompactionExecutor::new(dependencies.cpu.clone()),
+        )
         .await
         .map_err(index_status)?;
-    let published = dependencies
-        .publisher
-        .publish_run(
-            &definition.stored,
-            definition.tenant_id,
-            definition.bucket_id,
-            replacement_sequence,
-            sealed,
-        )
-        .await?;
+        dependencies
+            .publisher
+            .publish_run_observed(
+                &definition.stored,
+                definition.tenant_id,
+                definition.bucket_id,
+                replacement_sequence,
+                sealed,
+                progress.clone(),
+            )
+            .await
+    })
+    .await;
+    let published = match result {
+        Ok(published) => {
+            telemetry.complete();
+            published
+        }
+        Err(error) => {
+            telemetry.failed();
+            return Err(error);
+        }
+    };
     let selected_sequences = selected
         .iter()
         .map(|run| run.sequence)
@@ -1514,6 +1613,7 @@ async fn publish_candidate(
     current: Option<&PublishedGeneration>,
     dependencies: &IndexBuilderDependencies,
 ) -> Result<PublishedGeneration, Status> {
+    let started = Instant::now();
     dependencies
         .journal
         .validate_publication_barrier(&barrier)
@@ -1539,8 +1639,14 @@ async fn publish_candidate(
             tracing::info!(
                 index.id = definition.stored.index_id,
                 index.kind = ?kind,
-                monotonic_counter.anvil_index_publication_cas_failures_total = 1_u64,
                 "index generation publication CAS failed"
+            );
+            tracing::info!(
+                index.kind = ?kind,
+                monotonic_counter.anvil_index_publication_cas_failures_total = 1_u64,
+                histogram.anvil_index_publication_duration_seconds =
+                    started.elapsed().as_secs_f64(),
+                "index generation publication failed"
             );
             return Err(error);
         }
@@ -1548,9 +1654,19 @@ async fn publish_candidate(
     tracing::info!(
         index.id = definition.stored.index_id,
         index.kind = ?kind,
-        gauge.anvil_index_generation = published.pointer.generation,
-        monotonic_counter.anvil_index_publication_cas_total = 1_u64,
+        generation = published.pointer.generation,
         "index generation published"
+    );
+    tracing::info!(
+        index.kind = ?kind,
+        gauge.anvil_index_generation = published.pointer.generation,
+        gauge.anvil_index_publication_present = 1_u64,
+        gauge.anvil_index_publication_age_seconds = 0_f64,
+        gauge.anvil_index_publication_fresh = 1_u64,
+        gauge.anvil_index_source_lag = 0_u64,
+        monotonic_counter.anvil_index_publication_cas_total = 1_u64,
+        histogram.anvil_index_publication_duration_seconds = started.elapsed().as_secs_f64(),
+        "index generation publication metrics"
     );
     Ok(published)
 }
@@ -1699,7 +1815,34 @@ fn emit_source_lag(kind: IndexKind, from: &IndexBarrier, target: &IndexBarrier) 
     tracing::info!(
         index.kind = ?kind,
         gauge.anvil_index_source_lag = lag,
+        gauge.anvil_index_publication_fresh = u64::from(lag == 0),
         "index source lag observed"
+    );
+}
+
+fn emit_publication_age(kind: IndexKind, current: Option<&PublishedGeneration>) {
+    let Some(current) = current else {
+        tracing::info!(
+            index.kind = ?kind,
+            gauge.anvil_index_publication_present = 0_u64,
+            gauge.anvil_index_publication_age_seconds = 0_f64,
+            gauge.anvil_index_publication_fresh = 0_u64,
+            "index has no published generation"
+        );
+        return;
+    };
+    let now_millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0_u64, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        });
+    let age_seconds =
+        now_millis.saturating_sub(current.pointer.published_at_unix_millis) as f64 / 1_000.0;
+    tracing::info!(
+        index.kind = ?kind,
+        gauge.anvil_index_publication_present = 1_u64,
+        gauge.anvil_index_publication_age_seconds = age_seconds,
+        "index publication age observed"
     );
 }
 

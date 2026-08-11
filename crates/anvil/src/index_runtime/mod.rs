@@ -24,3 +24,4 @@ pub(crate) mod query;
 pub(crate) mod retention;
 pub(crate) mod runtime;
 pub(crate) mod scanner;
+pub(crate) mod telemetry;

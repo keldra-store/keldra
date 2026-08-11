@@ -4,6 +4,7 @@ use std::io::Read;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use anvil_index::compaction::CompactionProgress;
 use anvil_index::{
     BlockDescriptor, GeneratedBlock, IndexBlockSink, IndexDirectoryRead, IndexError, IndexFileRead,
     IndexKind, RunBlockWalker, SealedRun,
@@ -59,6 +60,17 @@ impl IndexGenerationPublisher {
     pub(crate) fn staging_sink(&self) -> IndexBlockStagingSink {
         IndexBlockStagingSink {
             store: self.store.clone(),
+            progress: None,
+        }
+    }
+
+    pub(crate) fn observed_staging_sink(
+        &self,
+        progress: CompactionProgress,
+    ) -> IndexBlockStagingSink {
+        IndexBlockStagingSink {
+            store: self.store.clone(),
+            progress: Some(progress),
         }
     }
 
@@ -72,6 +84,41 @@ impl IndexGenerationPublisher {
         bucket_id: u64,
         sequence: u64,
         sealed: SealedRun,
+    ) -> Result<PublishedRun, Status> {
+        self.publish_run_with_progress(definition, tenant_id, bucket_id, sequence, sealed, None)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn publish_run_observed(
+        &self,
+        definition: &StoredIndexDefinition,
+        tenant_id: u64,
+        bucket_id: u64,
+        sequence: u64,
+        sealed: SealedRun,
+        progress: CompactionProgress,
+    ) -> Result<PublishedRun, Status> {
+        self.publish_run_with_progress(
+            definition,
+            tenant_id,
+            bucket_id,
+            sequence,
+            sealed,
+            Some(progress),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn publish_run_with_progress(
+        &self,
+        definition: &StoredIndexDefinition,
+        tenant_id: u64,
+        bucket_id: u64,
+        sequence: u64,
+        sealed: SealedRun,
+        progress: Option<CompactionProgress>,
     ) -> Result<PublishedRun, Status> {
         if sequence == 0 {
             return Err(Status::internal("index run sequence is zero"));
@@ -90,6 +137,9 @@ impl IndexGenerationPublisher {
         let root_blob = stage_generated_block(&self.store, root)
             .await
             .map_err(index_status)?;
+        if let Some(progress) = &progress {
+            progress.record_output(0, root_descriptor.encoded_bytes, 1);
+        }
         let directory = StagedRunDirectory {
             store: self.store.clone(),
             root: root_blob.clone(),
@@ -309,13 +359,19 @@ impl IndexGenerationPublisher {
 
 /// Move-only block sink used during build/merge. It stages ordinary bytes and
 /// retains no block list; the sealed root later drives bounded publication.
+#[derive(Clone)]
 pub(crate) struct IndexBlockStagingSink {
     store: Store,
+    progress: Option<CompactionProgress>,
 }
 
 impl IndexBlockSink for IndexBlockStagingSink {
     async fn emit(&mut self, block: GeneratedBlock) -> Result<(), IndexError> {
+        let encoded_bytes = block.descriptor().encoded_bytes;
         stage_generated_block(&self.store, block).await?;
+        if let Some(progress) = &self.progress {
+            progress.record_output(0, encoded_bytes, 1);
+        }
         Ok(())
     }
 }

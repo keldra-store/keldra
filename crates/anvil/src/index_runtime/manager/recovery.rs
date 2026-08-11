@@ -73,23 +73,43 @@ pub(super) fn recover_builder_failure(
         %error,
         "bounded index build quantum failed; prior generation remains current"
     );
+    tracing::info!(
+        index.kind = ?job.kind,
+        builder.phase = ?phase,
+        monotonic_counter.anvil_index_builder_failures_total = 1_u64,
+        "index builder failure observed"
+    );
+    tracing::info!(
+        index.kind = ?job.kind,
+        recovery.action = ?recovery,
+        monotonic_counter.anvil_index_builder_recoveries_total = 1_u64,
+        "index builder recovery selected"
+    );
     let disposition = match recovery {
         BuilderFailureRecovery::Preserve => {
+            emit_retry(job.kind, recovery);
             job.phase = retry_phase.expect("preservable builder phase has retry state");
             BuilderDisposition::Retry(BUILDER_RETRY_INTERVAL)
         }
         BuilderFailureRecovery::Reinspect => {
+            emit_retry(job.kind, recovery);
             job.phase = BuilderPhase::Inspect;
             job.observed = None;
             BuilderDisposition::Retry(BUILDER_RETRY_INTERVAL)
         }
         BuilderFailureRecovery::ScopedRebuild => {
+            emit_retry(job.kind, recovery);
             job.phase = BuilderPhase::Inspect;
             job.observed = None;
             job.force_snapshot_rebuild = true;
             BuilderDisposition::Retry(BUILDER_RETRY_INTERVAL)
         }
         BuilderFailureRecovery::FailClosed => {
+            tracing::info!(
+                index.kind = ?job.kind,
+                monotonic_counter.anvil_index_builder_failed_closed_total = 1_u64,
+                "index builder failed closed"
+            );
             job.phase = BuilderPhase::Inspect;
             job.observed = None;
             BuilderDisposition::Failed
@@ -100,4 +120,13 @@ pub(super) fn recover_builder_failure(
         disposition,
         retention_current: None,
     }
+}
+
+fn emit_retry(kind: anvil_index::IndexKind, recovery: BuilderFailureRecovery) {
+    tracing::info!(
+        index.kind = ?kind,
+        recovery.action = ?recovery,
+        monotonic_counter.anvil_index_builder_retries_total = 1_u64,
+        "index builder retry scheduled"
+    );
 }

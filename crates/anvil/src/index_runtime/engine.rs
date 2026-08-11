@@ -4,6 +4,7 @@ use std::io::Read;
 
 use anvil_api::v1::index_specification::Specification;
 use anvil_api::v1::{IndexSpecification, VectorMetric as ApiVectorMetric};
+use anvil_index::compaction::{CompactionExecutor, CompactionParallelism, CompactionProgress};
 use anvil_index::full_text::{FullTextDocument, FullTextEngine, FullTextSegmentBuilder};
 use anvil_index::hybrid::{HybridDefinition, HybridDocument, HybridEngine, HybridSegmentBuilder};
 use anvil_index::ordered::{PathDocument, PathEngine, PathSegmentBuilder};
@@ -547,6 +548,110 @@ pub(crate) async fn merge_runs(
         }
         Some(Specification::Tensor(_)) => {
             TensorProjectionEngine::merge_runs(runs, output_level, sink).await
+        }
+        None => Err(missing_specification()),
+    }
+}
+
+pub(crate) async fn merge_runs_parallel<E: CompactionExecutor>(
+    specification: &IndexSpecification,
+    runs: &[ManifestIndexDirectory],
+    output_level: u8,
+    sink: &mut IndexBlockStagingSink,
+    parallelism: CompactionParallelism,
+    progress: CompactionProgress,
+    executor: E,
+) -> Result<SealedRun, IndexError> {
+    match specification.specification.as_ref() {
+        Some(Specification::Path(_)) => {
+            PathEngine::merge_runs_parallel(
+                runs,
+                output_level,
+                sink,
+                parallelism,
+                progress,
+                executor,
+            )
+            .await
+        }
+        Some(Specification::MetadataFilter(_)) => {
+            MetadataFilterEngine::merge_runs_parallel(
+                runs,
+                output_level,
+                sink,
+                parallelism,
+                progress,
+                executor,
+            )
+            .await
+        }
+        Some(Specification::TypedJson(_)) => {
+            TypedJsonEngine::merge_runs_parallel(
+                runs,
+                output_level,
+                sink,
+                parallelism,
+                progress,
+                executor,
+            )
+            .await
+        }
+        Some(Specification::FullText(_)) => {
+            FullTextEngine::merge_runs_parallel(
+                runs,
+                output_level,
+                sink,
+                parallelism,
+                progress,
+                executor,
+            )
+            .await
+        }
+        Some(Specification::Vector(value)) => {
+            VectorEngine::merge_runs_parallel(
+                runs,
+                &vector_definition(value)?,
+                output_level,
+                sink,
+                parallelism,
+                progress,
+                executor,
+            )
+            .await
+        }
+        Some(Specification::Hybrid(value)) => {
+            HybridEngine::merge_runs_parallel(
+                runs,
+                &hybrid_definition(value)?,
+                output_level,
+                sink,
+                parallelism,
+                progress,
+                executor,
+            )
+            .await
+        }
+        Some(Specification::GitSource(_)) => {
+            GitSourceEngine::merge_runs_parallel(
+                runs,
+                output_level,
+                sink,
+                parallelism,
+                progress,
+                executor,
+            )
+            .await
+        }
+        Some(Specification::Tensor(_)) => {
+            TensorProjectionEngine::merge_runs_parallel(
+                runs,
+                output_level,
+                sink,
+                parallelism,
+                progress,
+                executor,
+            )
+            .await
         }
         None => Err(missing_specification()),
     }

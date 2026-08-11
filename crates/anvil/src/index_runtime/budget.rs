@@ -11,6 +11,8 @@ use anvil_index::{IndexKind, MIN_INDEX_KIND_MEMORY_BYTES, SegmentMemoryPlan};
 use thiserror::Error;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
+use crate::index_config::IndexRuntimeConfig;
+
 /// A small fixed number of pull-driven rebuild streams may remain open per
 /// kind. Each can retain only transport backpressure state; every source frame
 /// still waits in the shared FIFO byte queue before it is pulled. Three lets
@@ -32,21 +34,43 @@ pub(crate) struct IndexMemoryBudgets {
 
 impl IndexMemoryBudgets {
     pub(crate) fn new(bytes_per_kind: u64) -> Result<Self, IndexBudgetError> {
-        let plan_bytes = usize::try_from(bytes_per_kind)
-            .map_err(|_| IndexBudgetError::LimitExceedsPlatform(bytes_per_kind))?;
-        SegmentMemoryPlan::new(plan_bytes).map_err(|_| IndexBudgetError::BelowMinimum {
-            configured: bytes_per_kind,
-            minimum: MIN_INDEX_KIND_MEMORY_BYTES as u64,
-        })?;
+        Self::from_limits(|_| bytes_per_kind)
+    }
+
+    pub(crate) fn from_config(config: IndexRuntimeConfig) -> Result<Self, IndexBudgetError> {
+        Self::from_limits(|kind| config.builder_memory_bytes(kind))
+    }
+
+    fn from_limits(mut limit: impl FnMut(IndexKind) -> u64) -> Result<Self, IndexBudgetError> {
+        let path = limit(IndexKind::Path);
+        let metadata_filter = limit(IndexKind::MetadataFilter);
+        let typed_json = limit(IndexKind::TypedJson);
+        let full_text = limit(IndexKind::FullText);
+        let vector = limit(IndexKind::Vector);
+        let hybrid = limit(IndexKind::Hybrid);
+        let git_source = limit(IndexKind::GitSource);
+        let tensor = limit(IndexKind::Tensor);
+        for bytes in [
+            path,
+            metadata_filter,
+            typed_json,
+            full_text,
+            vector,
+            hybrid,
+            git_source,
+            tensor,
+        ] {
+            validate_limit(bytes)?;
+        }
         Ok(Self {
-            path: IndexMemoryBudget::new(IndexKind::Path, bytes_per_kind)?,
-            metadata_filter: IndexMemoryBudget::new(IndexKind::MetadataFilter, bytes_per_kind)?,
-            typed_json: IndexMemoryBudget::new(IndexKind::TypedJson, bytes_per_kind)?,
-            full_text: IndexMemoryBudget::new(IndexKind::FullText, bytes_per_kind)?,
-            vector: IndexMemoryBudget::new(IndexKind::Vector, bytes_per_kind)?,
-            hybrid: IndexMemoryBudget::new(IndexKind::Hybrid, bytes_per_kind)?,
-            git_source: IndexMemoryBudget::new(IndexKind::GitSource, bytes_per_kind)?,
-            tensor: IndexMemoryBudget::new(IndexKind::Tensor, bytes_per_kind)?,
+            path: IndexMemoryBudget::new(IndexKind::Path, path)?,
+            metadata_filter: IndexMemoryBudget::new(IndexKind::MetadataFilter, metadata_filter)?,
+            typed_json: IndexMemoryBudget::new(IndexKind::TypedJson, typed_json)?,
+            full_text: IndexMemoryBudget::new(IndexKind::FullText, full_text)?,
+            vector: IndexMemoryBudget::new(IndexKind::Vector, vector)?,
+            hybrid: IndexMemoryBudget::new(IndexKind::Hybrid, hybrid)?,
+            git_source: IndexMemoryBudget::new(IndexKind::GitSource, git_source)?,
+            tensor: IndexMemoryBudget::new(IndexKind::Tensor, tensor)?,
         })
     }
 
@@ -62,6 +86,16 @@ impl IndexMemoryBudgets {
             IndexKind::Tensor => &self.tensor,
         }
     }
+}
+
+fn validate_limit(bytes: u64) -> Result<(), IndexBudgetError> {
+    let plan_bytes =
+        usize::try_from(bytes).map_err(|_| IndexBudgetError::LimitExceedsPlatform(bytes))?;
+    SegmentMemoryPlan::new(plan_bytes).map_err(|_| IndexBudgetError::BelowMinimum {
+        configured: bytes,
+        minimum: MIN_INDEX_KIND_MEMORY_BYTES as u64,
+    })?;
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -257,8 +291,8 @@ fn emit_budget_state(inner: &BudgetInner, state: &BudgetState) {
     tracing::info!(
         index.kind = ?inner.kind,
         gauge.anvil_index_construction_configured_bytes = inner.limit,
-        gauge.anvil_index_construction_used_bytes = state.used,
-        gauge.anvil_index_construction_peak_bytes = state.peak,
+        gauge.anvil_index_construction_leased_bytes = state.used,
+        gauge.anvil_index_construction_peak_leased_bytes = state.peak,
         gauge.anvil_index_construction_waiting = state.waiters.len() as u64,
         "index construction budget state"
     );
@@ -331,6 +365,18 @@ mod tests {
             &budgets.for_kind(IndexKind::Path).snapshot_slot,
             &budgets.for_kind(IndexKind::Vector).snapshot_slot,
         ));
+    }
+
+    #[test]
+    fn configured_kind_overrides_create_distinct_pool_limits() {
+        let baseline = MIN_INDEX_KIND_MEMORY_BYTES as u64;
+        let config = IndexRuntimeConfig::new(1, 1, baseline, 1, 1, 1, 1)
+            .unwrap()
+            .with_kind_limits(IndexKind::Vector, baseline * 2, 2)
+            .unwrap();
+        let budgets = IndexMemoryBudgets::from_config(config).unwrap();
+        assert_eq!(budgets.for_kind(IndexKind::Path).limit(), baseline);
+        assert_eq!(budgets.for_kind(IndexKind::Vector).limit(), baseline * 2);
     }
 
     #[test]
