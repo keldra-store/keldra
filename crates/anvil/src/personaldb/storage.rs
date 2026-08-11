@@ -38,6 +38,28 @@ impl PersonalDbObjects {
         Self { service }
     }
 
+    pub(super) fn record_gateway_ingress(
+        &self,
+        tenant_id: u64,
+        bucket_id: u64,
+        path: &str,
+        bytes: u64,
+    ) {
+        self.service
+            .record_gateway_ingress_stable(tenant_id, bucket_id, path, bytes);
+    }
+
+    pub(super) fn record_gateway_egress(
+        &self,
+        tenant_id: u64,
+        bucket_id: u64,
+        path: &str,
+        bytes: u64,
+    ) {
+        self.service
+            .record_gateway_egress_stable(tenant_id, bucket_id, path, bytes);
+    }
+
     pub(super) async fn read(
         &self,
         scope: &GroupScope,

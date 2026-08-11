@@ -19,6 +19,7 @@ use super::model::{
 };
 use super::service::{PersonalDbServiceImpl, authenticated_caller};
 use super::storage::ConditionalWrite;
+use super::traffic::{CompletedPayload, record_payload_after_success};
 
 pub(super) async fn append(
     service: &PersonalDbServiceImpl,
@@ -32,7 +33,23 @@ pub(super) async fn append(
     service
         .require_permission(&scope, GroupPermission::Write, "append")
         .await?;
-    route_or_execute(service, scope, request, deadline_remaining(deadline)?).await
+    let payload = CompletedPayload {
+        path: scope
+            .storage_key(&entry_payload_path(
+                request.expected_log_index.saturating_add(1),
+            ))?
+            .path()
+            .to_owned(),
+        bytes: request.changeset.len() as u64,
+    };
+    let tenant_id = scope.tenant_id;
+    let bucket_id = scope.bucket_id;
+    let result = route_or_execute(service, scope, request, deadline_remaining(deadline)?).await;
+    record_payload_after_success(result, payload, |payload| {
+        service
+            .objects
+            .record_gateway_ingress(tenant_id, bucket_id, &payload.path, payload.bytes);
+    })
 }
 
 pub(super) async fn execute_routed_append(

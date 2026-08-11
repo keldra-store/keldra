@@ -8,6 +8,7 @@ use axum::extract::{Path, Request, State};
 use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
+use tokio_stream::StreamExt as _;
 
 use crate::authentication::{JwtManager, RequestRateLimits};
 use crate::distributed_control_plane::DistributedControlPlane;
@@ -106,6 +107,7 @@ async fn handle(
         Ok(body) => body,
         Err(error) => return error.into_response(),
     };
+    let inbound_bytes = u64::try_from(body.len()).unwrap_or(u64::MAX);
     let response = match backend::execute(
         &target,
         &identity,
@@ -131,7 +133,51 @@ async fn handle(
             return error.into_response();
         }
     }
-    response
+    let ingress = state.objects.clone();
+    let ingress_key = key.clone();
+    let egress = state.objects.clone();
+    let egress_key = key;
+    meter_successful_response(
+        response,
+        inbound_bytes,
+        move |bytes| ingress.record_gateway_ingress(&ingress_key, bytes),
+        move |bytes| egress.record_gateway_egress(&egress_key, bytes),
+    )
+}
+
+fn meter_successful_response<Ingress, Egress>(
+    response: Response,
+    inbound_bytes: u64,
+    record_ingress: Ingress,
+    record_egress: Egress,
+) -> Response
+where
+    Ingress: FnOnce(u64),
+    Egress: FnOnce(u64) + Send + 'static,
+{
+    if !response.status().is_success() {
+        return response;
+    }
+    record_ingress(inbound_bytes);
+    let (parts, body) = response.into_parts();
+    let stream = async_stream::stream! {
+        let mut body = body.into_data_stream();
+        let mut completed_bytes = 0_u64;
+        while let Some(next) = body.next().await {
+            match next {
+                Ok(bytes) => {
+                    completed_bytes = completed_bytes.saturating_add(bytes.len() as u64);
+                    yield Ok::<_, axum::Error>(bytes);
+                }
+                Err(error) => {
+                    yield Err(error);
+                    return;
+                }
+            }
+        }
+        record_egress(completed_bytes);
+    };
+    Response::from_parts(parts, axum::body::Body::from_stream(stream))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -280,5 +326,88 @@ impl IntoResponse for GitError {
             );
         }
         response
+    }
+}
+
+#[cfg(test)]
+mod traffic_tests {
+    use std::io;
+    use std::sync::{Arc, Mutex};
+
+    use axum::body::Body;
+    use bytes::Bytes;
+    use http_body_util::BodyExt as _;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn successful_git_transfer_records_exact_public_body_bytes_once() {
+        let inbound = Arc::new(Mutex::new(Vec::new()));
+        let outbound = Arc::new(Mutex::new(Vec::new()));
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::from("git response"))
+            .unwrap();
+        let metered = meter_successful_response(
+            response,
+            17,
+            {
+                let inbound = inbound.clone();
+                move |bytes| inbound.lock().unwrap().push(bytes)
+            },
+            {
+                let outbound = outbound.clone();
+                move |bytes| outbound.lock().unwrap().push(bytes)
+            },
+        );
+
+        assert_eq!(*inbound.lock().unwrap(), [17]);
+        assert!(outbound.lock().unwrap().is_empty());
+        let body = metered.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), b"git response");
+        assert_eq!(*outbound.lock().unwrap(), [12]);
+    }
+
+    #[tokio::test]
+    async fn failed_or_unfinished_git_transfers_do_not_record_egress() {
+        let failed = Arc::new(Mutex::new(Vec::new()));
+        let response = meter_successful_response(
+            Response::builder()
+                .status(StatusCode::CONFLICT)
+                .body(Body::from("failed"))
+                .unwrap(),
+            9,
+            {
+                let failed = failed.clone();
+                move |bytes| failed.lock().unwrap().push(("in", bytes))
+            },
+            {
+                let failed = failed.clone();
+                move |bytes| failed.lock().unwrap().push(("out", bytes))
+            },
+        );
+        let _ = response.into_body().collect().await.unwrap();
+        assert!(failed.lock().unwrap().is_empty());
+
+        let incomplete_egress = Arc::new(Mutex::new(Vec::new()));
+        let response =
+            meter_successful_response(Response::new(Body::from("not consumed")), 11, |_| {}, {
+                let incomplete_egress = incomplete_egress.clone();
+                move |bytes| incomplete_egress.lock().unwrap().push(bytes)
+            });
+        drop(response);
+        assert!(incomplete_egress.lock().unwrap().is_empty());
+
+        let errored_egress = Arc::new(Mutex::new(Vec::new()));
+        let body = Body::from_stream(tokio_stream::iter([
+            Ok::<_, io::Error>(Bytes::from_static(b"partial")),
+            Err(io::Error::other("broken response")),
+        ]));
+        let response = meter_successful_response(Response::new(body), 7, |_| {}, {
+            let errored_egress = errored_egress.clone();
+            move |bytes| errored_egress.lock().unwrap().push(bytes)
+        });
+        assert!(response.into_body().collect().await.is_err());
+        assert!(errored_egress.lock().unwrap().is_empty());
     }
 }

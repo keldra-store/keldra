@@ -9,6 +9,7 @@ mod signing;
 mod snapshot;
 mod storage;
 mod sync;
+mod traffic;
 
 pub(crate) use model::{MANIFEST_ROOT_PREFIX, parse_manifest_object_path};
 pub(crate) use routing::{

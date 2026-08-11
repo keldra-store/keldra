@@ -103,6 +103,14 @@ impl GatewayObjectAdapter {
         Self { service }
     }
 
+    pub(crate) fn record_gateway_ingress(&self, key: &ObjectKey, bytes: u64) {
+        self.service.record_gateway_ingress(key, bytes);
+    }
+
+    pub(crate) fn record_gateway_egress(&self, key: &ObjectKey, bytes: u64) {
+        self.service.record_gateway_egress(key, bytes);
+    }
+
     pub(crate) async fn head(
         &self,
         identity: &GatewayIdentity,

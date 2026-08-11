@@ -14,6 +14,7 @@ use super::model::{
     digest, entry_certificate_path, entry_payload_path, protocol_status, validate_id,
 };
 use super::service::{PersonalDbFrameStream, PersonalDbServiceImpl, authenticated_caller};
+use super::traffic::{CompletedPayload, record_payloads_when_stream_completes};
 
 pub(super) async fn catch_up(
     service: &PersonalDbServiceImpl,
@@ -94,6 +95,7 @@ pub(super) async fn catch_up(
     };
     let mut delivered_entries = 0_u32;
     let mut delivered_bytes = 0_u64;
+    let mut completed_payloads = Vec::new();
     let mut index = request.from_log_index;
     while index < advertised_head.state().log_index
         && usize::try_from(delivered_entries).unwrap_or(usize::MAX) < max_entries
@@ -156,6 +158,13 @@ pub(super) async fn catch_up(
                 committed_head: resulting_head.clone(),
             },
         )))?);
+        completed_payloads.push(CompletedPayload {
+            path: scope
+                .storage_key(&entry_payload_path(next))?
+                .path()
+                .to_owned(),
+            bytes: payload_length,
+        });
         delivered_entries += 1;
         delivered_bytes += payload_length;
         index = next;
@@ -165,7 +174,16 @@ pub(super) async fn catch_up(
         delivered_byte_count: delivered_bytes,
         resulting_head,
     })))?);
-    Ok(Box::pin(tokio_stream::iter(frames).map(Ok)))
+    let objects = service.objects.clone();
+    let tenant_id = scope.tenant_id;
+    let bucket_id = scope.bucket_id;
+    Ok(record_payloads_when_stream_completes(
+        Box::pin(tokio_stream::iter(frames).map(Ok)),
+        completed_payloads,
+        move |payload| {
+            objects.record_gateway_egress(tenant_id, bucket_id, &payload.path, payload.bytes);
+        },
+    ))
 }
 
 async fn head_at(

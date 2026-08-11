@@ -23,6 +23,9 @@ use super::model::{
     validate_command_id, validate_id,
 };
 use super::service::{PersonalDbFrameStream, PersonalDbServiceImpl, authenticated_caller};
+use super::traffic::{
+    CompletedPayload, record_payload_after_success, record_payloads_when_stream_completes,
+};
 
 pub(super) async fn register(
     service: &PersonalDbServiceImpl,
@@ -36,7 +39,24 @@ pub(super) async fn register(
     service
         .require_permission(&scope, GroupPermission::Write, "snapshot registration")
         .await?;
-    route_or_execute(service, scope, request, deadline_remaining(deadline)?).await
+    let manifest =
+        SnapshotTargetManifestV1::decode_canonical(&request.manifest).map_err(protocol_status)?;
+    validate_id("snapshot_id", &manifest.snapshot_id)?;
+    let payload = CompletedPayload {
+        path: scope
+            .storage_key(&snapshot_bytes_path(&manifest.snapshot_id))?
+            .path()
+            .to_owned(),
+        bytes: request.snapshot.len() as u64,
+    };
+    let tenant_id = scope.tenant_id;
+    let bucket_id = scope.bucket_id;
+    let result = route_or_execute(service, scope, request, deadline_remaining(deadline)?).await;
+    record_payload_after_success(result, payload, |payload| {
+        service
+            .objects
+            .record_gateway_ingress(tenant_id, bucket_id, &payload.path, payload.bytes);
+    })
 }
 
 pub(super) async fn execute_routed_registration(
@@ -218,6 +238,10 @@ pub(super) async fn get(
         .require_permission(&scope, GroupPermission::Read, "snapshot read")
         .await?;
     service.require_manifest(&scope).await?;
+    let traffic_path = scope
+        .storage_key(&snapshot_bytes_path(&request.snapshot_id))?
+        .path()
+        .to_owned();
     let signed_bytes = service
         .objects
         .read(&scope, &snapshot_manifest_path(&request.snapshot_id))
@@ -282,7 +306,24 @@ pub(super) async fn get(
         next_offset: u64::try_from(end).unwrap_or(u64::MAX),
         complete: end == snapshot.len(),
     }))?);
-    Ok(Box::pin(tokio_stream::iter(frames).map(Ok)))
+    let delivered_bytes = u64::try_from(delivered.len()).unwrap_or(u64::MAX);
+    let payloads = (delivered_bytes != 0)
+        .then_some(CompletedPayload {
+            path: traffic_path,
+            bytes: delivered_bytes,
+        })
+        .into_iter()
+        .collect();
+    let objects = service.objects.clone();
+    let tenant_id = scope.tenant_id;
+    let bucket_id = scope.bucket_id;
+    Ok(record_payloads_when_stream_completes(
+        Box::pin(tokio_stream::iter(frames).map(Ok)),
+        payloads,
+        move |payload| {
+            objects.record_gateway_egress(tenant_id, bucket_id, &payload.path, payload.bytes);
+        },
+    ))
 }
 
 fn frame(value: PersonalDbSnapshotFrameV1) -> Result<PersonalDbCanonicalFrame, Status> {
