@@ -1,6 +1,6 @@
 //! Weighted-HRW assignment and bounded v2 index generation construction.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io;
 use std::time::Duration;
 
@@ -9,17 +9,17 @@ use anvil_consensus::{DecisionRaft, NodeId};
 use anvil_index::{
     DocumentRef, FIXED_INDEX_SEAL_WORKSPACE_BYTES, IndexError, IndexKind, SegmentMemoryPlan,
 };
-use anvil_store::{Head, LocalChange, ObjectKey, VersionId};
+use anvil_store::{DefinitionKind, Head, LocalChange, ObjectKey, Store, VersionId};
 use tonic::Status;
 
 use crate::cluster_object_read::ClusterObjectReader;
 use crate::cluster_peer::IndexSourceSnapshotHead;
 use crate::cluster_placement::ClusterPlacement;
-use crate::index_service::{StoredIndexDefinition, path_matches_prefix};
+use crate::index_service::{StoredIndexDefinition, definition_path, path_matches_prefix};
 
 use super::budget::{IndexBudgetError, IndexMemoryBudget, IndexMemoryBudgets};
 use super::cache::IndexCache;
-use super::catalog::{CatalogDefinition, IndexCatalog};
+use super::catalog::{CatalogChange, CatalogDefinition, CatalogIdentity, IndexCatalog};
 use super::cpu::{IndexCpuPool, IndexCpuPoolError};
 use super::directory::ManifestIndexDirectory;
 use super::engine::{
@@ -31,18 +31,26 @@ use super::events::{IndexBarrier, IndexEventError, IndexEventJournal, IndexJourn
 use super::generation::{MAX_RUNS_PER_LEVEL, ManifestRun};
 use super::placement::{IndexIdentity, IndexPlacement};
 use super::publisher::{IndexGenerationPublisher, PublishedGeneration};
-use super::retention::IndexGenerationRetention;
-use super::scanner::ClusterIndexScanner;
+use super::retention::{IndexGenerationRetention, IndexRetentionTask};
+use super::scanner::{ClusterIndexScanner, ClusterIndexSourceSnapshot};
 
-const ASSIGNMENT_INTERVAL: Duration = Duration::from_secs(2);
-const BUILDER_IDLE_INTERVAL: Duration = Duration::from_millis(100);
+#[path = "manager/recovery.rs"]
+mod recovery;
+use recovery::{BuilderFailurePhase, recover_builder_failure};
+#[cfg(test)]
+use recovery::{BuilderFailureRecovery, failure_recovery};
+
 const BUILDER_RETRY_INTERVAL: Duration = Duration::from_secs(1);
-const RETENTION_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_SOURCE_WIRE_BYTES: u64 = 4 * 1024 * 1024;
 const DECODED_SOURCE_MULTIPLIER: u64 = 4;
+const INDEX_KIND_COUNT: usize = 8;
+const BUILDER_CATALOG_PAGE: usize = 256;
+const MAX_OPEN_REBUILDS_PER_KIND: usize = 3;
+const MAX_ACTIVE_BUILDERS: usize = 64;
 
 pub(crate) struct IndexBuilderManagerTask {
     task: tokio::task::JoinHandle<()>,
+    _retention: IndexRetentionTask,
 }
 
 impl IndexBuilderManagerTask {
@@ -52,83 +60,21 @@ impl IndexBuilderManagerTask {
         catalog: IndexCatalog,
         dependencies: IndexBuilderDependencies,
     ) -> Self {
-        let task = tokio::spawn(async move {
-            let mut builders = BTreeMap::<u64, RunningBuilder>::new();
-            let mut interval = tokio::time::interval(ASSIGNMENT_INTERVAL);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                interval.tick().await;
-                let definitions = match catalog.all() {
-                    Ok(definitions) => definitions,
-                    Err(error) => {
-                        tracing::warn!(%error, "index builder catalog is unavailable");
-                        continue;
-                    }
-                };
-                let placement = match current_placement(&decisions) {
-                    Ok(placement) => placement,
-                    Err(error) => {
-                        tracing::warn!(%error, "index builder placement is unavailable");
-                        continue;
-                    }
-                };
-                let mut desired = BTreeMap::new();
-                for definition in definitions {
-                    let identity = match IndexIdentity::new(
-                        definition.tenant_id,
-                        definition.bucket_id,
-                        definition.stored.index_id,
-                    ) {
-                        Ok(identity) => identity,
-                        Err(error) => {
-                            tracing::warn!(%error, "invalid stable index identity in catalog");
-                            continue;
-                        }
-                    };
-                    let assignment = match IndexPlacement::derive(identity, &placement) {
-                        Ok(assignment) => assignment,
-                        Err(error) => {
-                            tracing::warn!(%error, "cannot derive index builder assignment");
-                            continue;
-                        }
-                    };
-                    if assignment.builder() == local_node {
-                        desired.insert(definition.stored.index_id, definition);
-                    }
-                }
-
-                let desired_ids = desired.keys().copied().collect::<BTreeSet<_>>();
-                builders.retain(|index_id, running| {
-                    let keep = desired_ids.contains(index_id)
-                        && desired.get(index_id).is_some_and(|definition| {
-                            definition.object_version == running.definition_version
-                        })
-                        && !running.task.is_finished();
-                    if !keep {
-                        running.task.abort();
-                    }
-                    keep
-                });
-                for (index_id, definition) in desired {
-                    if builders.contains_key(&index_id) {
-                        continue;
-                    }
-                    let definition_version = definition.object_version;
-                    let dependencies = dependencies.clone();
-                    let task = tokio::spawn(async move {
-                        run_builder(definition, dependencies).await;
-                    });
-                    builders.insert(
-                        index_id,
-                        RunningBuilder {
-                            definition_version,
-                            task,
-                        },
-                    );
-                }
-            }
-        });
-        Self { task }
+        // Subscribe before draining the bounded handoff so a concurrent
+        // assignment mutation cannot fall between pending work and its wakeup.
+        let changes = catalog.subscribe();
+        let retention = dependencies.retention.start_scheduler();
+        let task = tokio::spawn(run_manager(
+            local_node,
+            decisions,
+            catalog,
+            changes,
+            dependencies,
+        ));
+        Self {
+            task,
+            _retention: retention,
+        }
     }
 }
 
@@ -138,14 +84,9 @@ impl Drop for IndexBuilderManagerTask {
     }
 }
 
-struct RunningBuilder {
-    definition_version: u64,
-    task: tokio::task::JoinHandle<()>,
-}
-
 #[derive(Clone)]
 pub(crate) struct IndexBuilderDependencies {
-    pub(crate) catalog: IndexCatalog,
+    pub(crate) store: Store,
     pub(crate) journal: std::sync::Arc<IndexEventJournal>,
     pub(crate) scanner: ClusterIndexScanner,
     pub(crate) reader: ClusterObjectReader,
@@ -156,124 +97,496 @@ pub(crate) struct IndexBuilderDependencies {
     pub(crate) cpu: IndexCpuPool,
 }
 
-async fn run_builder(definition: CatalogDefinition, dependencies: IndexBuilderDependencies) {
-    let mut observed = None;
-    let mut retention_retry_deadline = next_retention_retry(tokio::time::Instant::now());
+async fn run_manager(
+    local_node: NodeId,
+    decisions: DecisionRaft,
+    catalog: IndexCatalog,
+    mut changes: tokio::sync::broadcast::Receiver<CatalogIdentity>,
+    dependencies: IndexBuilderDependencies,
+) {
+    let mut scheduler = BuilderScheduler::default();
+    let mut workers = tokio::task::JoinSet::new();
+    let mut inflight = HashMap::new();
+
     loop {
-        let specification = match definition.stored.specification() {
-            Ok(value) => value,
-            Err(error) => {
-                tracing::warn!(index.id = definition.stored.index_id, %error, "index definition is invalid");
-                return;
+        let mut available = scheduler.remaining_capacity();
+        match catalog.take_page(BUILDER_CATALOG_PAGE, |identity| {
+            if scheduler.entries.contains_key(&identity) {
+                true
+            } else if available > 0 {
+                available -= 1;
+                true
+            } else {
+                false
             }
-        };
-        let kind = match kind_for_specification(&specification) {
-            Ok(value) => value,
-            Err(error) => {
-                tracing::warn!(index.id = definition.stored.index_id, %error, "index kind is invalid");
-                return;
+        }) {
+            Ok(page) => {
+                for change in page {
+                    if let Err(error) = scheduler.apply_change(
+                        change,
+                        local_node,
+                        &decisions,
+                        &dependencies.retention,
+                    ) {
+                        tracing::debug!(%error, "bounded index builder admission deferred to assignment rediscovery");
+                    }
+                }
             }
-        };
-        match build_once(
-            &definition,
-            &specification,
-            kind,
-            observed.as_ref(),
-            &dependencies,
-        )
-        .await
-        {
-            Ok(BuildProgress::Idle(progress)) => {
-                observed = Some(progress);
-                retry_retention_if_due(
-                    &definition,
-                    kind,
-                    &dependencies,
-                    &mut retention_retry_deadline,
-                )
-                .await;
-                tokio::time::sleep(BUILDER_IDLE_INTERVAL).await;
+            Err(error) => tracing::warn!(%error, "assigned index handoff drain will retry"),
+        }
+        scheduler.promote_due(tokio::time::Instant::now());
+        while let Some(work) = scheduler.pop_runnable() {
+            let metadata = WorkMetadata::from_job(&work);
+            match builder_lease_is_current(
+                &work.definition,
+                local_node,
+                &decisions,
+                &dependencies.store,
+            ) {
+                Ok(true) => {}
+                Ok(false) => {
+                    scheduler.release(metadata, &dependencies.retention);
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(index.id = metadata.identity.index_id, %error, "active index assignment point-read will retry");
+                    scheduler.release(metadata, &dependencies.retention);
+                    continue;
+                }
             }
-            Ok(BuildProgress::Published) => {
-                observed = None;
-                retention_retry_deadline = next_retention_retry(tokio::time::Instant::now());
-                tokio::task::yield_now().await;
-            }
-            Err(error) => {
-                tracing::warn!(
-                    index.id = definition.stored.index_id,
-                    index.kind = ?kind,
-                    %error,
-                    "index build attempt failed; prior generation remains current"
-                );
-                retry_retention_if_due(
-                    &definition,
-                    kind,
-                    &dependencies,
-                    &mut retention_retry_deadline,
-                )
-                .await;
-                tokio::time::sleep(BUILDER_RETRY_INTERVAL).await;
-            }
+            let task_dependencies = dependencies.clone();
+            let handle = workers.spawn(async move {
+                let step = advance_builder(work, &task_dependencies).await;
+                (metadata, step)
+            });
+            inflight.insert(handle.id(), metadata);
+        }
+
+        let next_wake = scheduler
+            .next_due()
+            .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(60 * 60));
+
+        tokio::select! {
+            received = changes.recv() => match received {
+                Ok(identity) => {
+                    if let Ok(Some(change)) = catalog.take(identity, scheduler.can_admit(identity))
+                        && let Err(error) = scheduler.apply_change(
+                            change,
+                            local_node,
+                            &decisions,
+                            &dependencies.retention,
+                        )
+                    {
+                        tracing::debug!(%error, "bounded index builder admission deferred to assignment rediscovery");
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            },
+            completed = workers.join_next_with_id(), if !workers.is_empty() => {
+                match completed {
+                    Some(Ok((task_id, (metadata, step)))) => {
+                        inflight.remove(&task_id);
+                        scheduler.complete(metadata, step, &dependencies.retention);
+                    }
+                    Some(Err(error)) => {
+                        let metadata = inflight.remove(&error.id());
+                        tracing::warn!(%error, "bounded index builder work task failed");
+                        if let Some(metadata) = metadata {
+                            scheduler.lost(metadata, &dependencies.retention);
+                        }
+                    }
+                    None => {}
+                }
+            },
+            _ = tokio::time::sleep_until(next_wake) => {}
         }
     }
 }
 
-fn next_retention_retry(now: tokio::time::Instant) -> tokio::time::Instant {
-    now + RETENTION_RETRY_INTERVAL
-}
-
-fn retention_retry_due(now: tokio::time::Instant, next_retry: tokio::time::Instant) -> bool {
-    now >= next_retry
-}
-
-async fn retry_retention_if_due(
-    definition: &CatalogDefinition,
+#[derive(Clone, Copy)]
+struct WorkMetadata {
+    identity: CatalogIdentity,
+    definition_version: u64,
     kind: IndexKind,
-    dependencies: &IndexBuilderDependencies,
-    next_retry: &mut tokio::time::Instant,
-) {
-    if !retention_retry_due(tokio::time::Instant::now(), *next_retry) {
-        return;
+    held_snapshot: bool,
+}
+
+impl WorkMetadata {
+    fn from_job(job: &BuilderJob) -> Self {
+        Self {
+            identity: job.definition.identity(),
+            definition_version: job.definition.object_version,
+            kind: job.kind,
+            held_snapshot: job.holds_snapshot(),
+        }
     }
-    retry_retention(definition, kind, dependencies).await;
-    *next_retry = next_retention_retry(tokio::time::Instant::now());
 }
 
-async fn retry_retention(
+struct BuilderScheduler {
+    entries: BTreeMap<CatalogIdentity, ScheduledBuilder>,
+    ready_active: [VecDeque<CatalogIdentity>; INDEX_KIND_COUNT],
+    ready_inspect: [VecDeque<CatalogIdentity>; INDEX_KIND_COUNT],
+    delayed: BTreeMap<CatalogIdentity, (tokio::time::Instant, u64)>,
+    running_kinds: [bool; INDEX_KIND_COUNT],
+    open_rebuilds: [usize; INDEX_KIND_COUNT],
+    prefer_active: [bool; INDEX_KIND_COUNT],
+    next_kind: usize,
+}
+
+impl Default for BuilderScheduler {
+    fn default() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            ready_active: std::array::from_fn(|_| VecDeque::new()),
+            ready_inspect: std::array::from_fn(|_| VecDeque::new()),
+            delayed: BTreeMap::new(),
+            running_kinds: [false; INDEX_KIND_COUNT],
+            open_rebuilds: [0; INDEX_KIND_COUNT],
+            prefer_active: [false; INDEX_KIND_COUNT],
+            next_kind: 0,
+        }
+    }
+}
+
+struct ScheduledBuilder {
+    definition: CatalogDefinition,
+    job: Option<BuilderJob>,
+    queued: bool,
+}
+
+impl BuilderScheduler {
+    fn remaining_capacity(&self) -> usize {
+        MAX_ACTIVE_BUILDERS.saturating_sub(self.entries.len())
+    }
+
+    fn can_admit(&self, identity: CatalogIdentity) -> bool {
+        self.entries.contains_key(&identity) || self.remaining_capacity() > 0
+    }
+
+    fn apply_change(
+        &mut self,
+        change: CatalogChange,
+        local_node: NodeId,
+        decisions: &DecisionRaft,
+        retention: &IndexGenerationRetention,
+    ) -> Result<(), Status> {
+        match change {
+            CatalogChange::Upsert(definition) => {
+                self.upsert(definition, local_node, decisions, retention)
+            }
+            CatalogChange::Remove(identity) => {
+                self.remove(identity, retention);
+                Ok(())
+            }
+        }
+    }
+
+    fn upsert(
+        &mut self,
+        definition: CatalogDefinition,
+        local_node: NodeId,
+        decisions: &DecisionRaft,
+        retention: &IndexGenerationRetention,
+    ) -> Result<(), Status> {
+        let identity = definition.identity();
+        if is_local_builder(&definition, local_node, &current_placement(decisions)?)? {
+            self.insert(definition, retention)
+        } else {
+            self.remove(identity, retention);
+            Ok(())
+        }
+    }
+
+    fn insert(
+        &mut self,
+        definition: CatalogDefinition,
+        retention: &IndexGenerationRetention,
+    ) -> Result<(), Status> {
+        let identity = definition.identity();
+        if self.entries.get(&identity).is_some_and(|entry| {
+            entry.definition.object_version == definition.object_version
+                && entry.definition.stored == definition.stored
+        }) {
+            return Ok(());
+        }
+        if !self.entries.contains_key(&identity) && self.entries.len() >= MAX_ACTIVE_BUILDERS {
+            return Err(Status::resource_exhausted(
+                "node-wide active index builder lease limit reached",
+            ));
+        }
+        let job = BuilderJob::new(definition.clone())?;
+        if let Some(previous) = self.entries.remove(&identity) {
+            self.release_queued_snapshot(&previous);
+            retention.unschedule(identity.tenant_id, identity.bucket_id, identity.index_id)?;
+        }
+        self.entries.insert(
+            identity,
+            ScheduledBuilder {
+                definition,
+                job: Some(job),
+                queued: false,
+            },
+        );
+        self.enqueue(identity);
+        Ok(())
+    }
+
+    fn remove(&mut self, identity: CatalogIdentity, retention: &IndexGenerationRetention) {
+        let removed = self.evict_builder(identity);
+        if removed
+            && let Err(error) =
+                retention.unschedule(identity.tenant_id, identity.bucket_id, identity.index_id)
+        {
+            tracing::warn!(index.id = identity.index_id, %error, "index retention unschedule failed");
+        }
+    }
+
+    fn evict_builder(&mut self, identity: CatalogIdentity) -> bool {
+        self.delayed.remove(&identity);
+        for queue in self
+            .ready_active
+            .iter_mut()
+            .chain(self.ready_inspect.iter_mut())
+        {
+            queue.retain(|queued| *queued != identity);
+        }
+        let removed = self.entries.remove(&identity);
+        if let Some(entry) = removed.as_ref() {
+            self.release_queued_snapshot(entry);
+        }
+        removed.is_some()
+    }
+
+    fn enqueue(&mut self, identity: CatalogIdentity) {
+        let Some(entry) = self.entries.get_mut(&identity) else {
+            return;
+        };
+        if !entry.queued && entry.job.is_some() {
+            entry.queued = true;
+            let job = entry.job.as_ref().expect("queued builder has work");
+            let queue = if job.is_active() {
+                &mut self.ready_active[kind_slot(job.kind)]
+            } else {
+                &mut self.ready_inspect[kind_slot(job.kind)]
+            };
+            queue.push_back(identity);
+        }
+    }
+
+    fn promote_due(&mut self, now: tokio::time::Instant) {
+        let due = self
+            .delayed
+            .iter()
+            .filter_map(|(identity, (due, version))| (*due <= now).then_some((*identity, *version)))
+            .collect::<Vec<_>>();
+        for (identity, version) in due {
+            self.delayed.remove(&identity);
+            if self
+                .entries
+                .get(&identity)
+                .is_some_and(|entry| entry.definition.object_version == version)
+            {
+                self.enqueue(identity);
+            }
+        }
+    }
+
+    fn next_due(&self) -> Option<tokio::time::Instant> {
+        self.delayed.values().map(|(due, _)| *due).min()
+    }
+
+    fn pop_runnable(&mut self) -> Option<BuilderJob> {
+        for offset in 0..INDEX_KIND_COUNT {
+            let slot = (self.next_kind + offset) % INDEX_KIND_COUNT;
+            if self.running_kinds[slot] {
+                continue;
+            }
+            let can_inspect = self.open_rebuilds[slot] < MAX_OPEN_REBUILDS_PER_KIND;
+            let active_first = self.prefer_active[slot] || !can_inspect;
+            let identity = if active_first {
+                take_ready(&mut self.ready_active[slot], &mut self.entries, true).or_else(|| {
+                    can_inspect
+                        .then(|| {
+                            take_ready(&mut self.ready_inspect[slot], &mut self.entries, false)
+                        })
+                        .flatten()
+                })
+            } else {
+                take_ready(&mut self.ready_inspect[slot], &mut self.entries, false)
+                    .or_else(|| take_ready(&mut self.ready_active[slot], &mut self.entries, true))
+            };
+            let Some(identity) = identity else {
+                continue;
+            };
+            let entry = self.entries.get_mut(&identity).expect("ready entry exists");
+            entry.queued = false;
+            self.running_kinds[slot] = true;
+            self.prefer_active[slot] = !active_first;
+            self.next_kind = (slot + 1) % INDEX_KIND_COUNT;
+            return entry.job.take();
+        }
+        None
+    }
+
+    fn complete(
+        &mut self,
+        metadata: WorkMetadata,
+        step: BuilderStep,
+        retention: &IndexGenerationRetention,
+    ) {
+        self.complete_with(metadata, step, |definition, identity, current| {
+            match retention.schedule(
+                definition,
+                identity.tenant_id,
+                identity.bucket_id,
+                current,
+            ) {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!(index.id = identity.index_id, %error, "index retention lease admission will retry");
+                    false
+                }
+            }
+        });
+    }
+
+    fn complete_with(
+        &mut self,
+        metadata: WorkMetadata,
+        step: BuilderStep,
+        mut schedule_retention: impl FnMut(
+            &StoredIndexDefinition,
+            CatalogIdentity,
+            &PublishedGeneration,
+        ) -> bool,
+    ) {
+        let slot = kind_slot(metadata.kind);
+        self.running_kinds[slot] = false;
+        if metadata.held_snapshot {
+            self.open_rebuilds[slot] = self.open_rebuilds[slot].saturating_sub(1);
+        }
+        let Some(entry) = self.entries.get_mut(&metadata.identity) else {
+            return;
+        };
+        if entry.definition.object_version != metadata.definition_version {
+            return;
+        }
+        if step.job.holds_snapshot() {
+            self.open_rebuilds[slot] = self.open_rebuilds[slot].saturating_add(1);
+        }
+        let retention_admitted = step.retention_current.as_ref().is_none_or(|current| {
+            schedule_retention(&entry.definition.stored, metadata.identity, current)
+        });
+        entry.job = Some(step.job);
+        if !retention_admitted {
+            // Retention has its own bounded scheduler. Durable assignment
+            // rediscovery retries admission without pinning a builder lease.
+            self.evict_builder(metadata.identity);
+            return;
+        }
+        match step.disposition {
+            BuilderDisposition::Ready => self.enqueue(metadata.identity),
+            BuilderDisposition::Retry(_delay) => {
+                // The durable assignment is the retry queue. Yield this scarce
+                // process-local lease so one failing definition cannot block a
+                // later healthy definition from being discovered.
+                self.evict_builder(metadata.identity);
+            }
+            BuilderDisposition::Idle => {
+                // The published generation and durable assignment are the
+                // resume point. Idle definitions consume no scheduler state;
+                // the fair assignment walk will lease them again.
+                self.evict_builder(metadata.identity);
+            }
+            BuilderDisposition::Failed => {
+                tracing::error!(
+                    index.id = metadata.identity.index_id,
+                    definition.version = metadata.definition_version,
+                    "index definition failed closed for this lease; assignment rediscovery will retry it"
+                );
+                self.evict_builder(metadata.identity);
+            }
+        }
+    }
+
+    fn lost(&mut self, metadata: WorkMetadata, retention: &IndexGenerationRetention) {
+        self.release(metadata, retention);
+    }
+
+    fn release(&mut self, metadata: WorkMetadata, retention: &IndexGenerationRetention) {
+        let slot = kind_slot(metadata.kind);
+        self.running_kinds[slot] = false;
+        if metadata.held_snapshot {
+            self.open_rebuilds[slot] = self.open_rebuilds[slot].saturating_sub(1);
+        }
+        self.remove(metadata.identity, retention);
+    }
+
+    fn release_queued_snapshot(&mut self, entry: &ScheduledBuilder) {
+        let Some(job) = entry.job.as_ref() else {
+            return;
+        };
+        if job.holds_snapshot() {
+            let slot = kind_slot(job.kind);
+            self.open_rebuilds[slot] = self.open_rebuilds[slot].saturating_sub(1);
+        }
+    }
+}
+
+fn builder_lease_is_current(
     definition: &CatalogDefinition,
-    kind: IndexKind,
-    dependencies: &IndexBuilderDependencies,
-) {
-    let current = dependencies
-        .publisher
-        .load_current(
-            &definition.stored,
+    local_node: NodeId,
+    decisions: &DecisionRaft,
+    store: &Store,
+) -> Result<bool, Status> {
+    let assignment = store
+        .definition_assignment(
+            DefinitionKind::Index,
             definition.tenant_id,
             definition.bucket_id,
+            definition.stored.index_id,
         )
-        .await;
-    match current {
-        Ok(Some(current)) => {
-            collect_obsolete_generation_artifacts(
-                definition,
-                kind,
-                &current,
-                dependencies,
-                "periodic",
-            )
-            .await;
-        }
-        Ok(None) => {}
-        Err(error) => {
-            tracing::warn!(
-                index.id = definition.stored.index_id,
-                index.kind = ?kind,
-                %error,
-                "periodic obsolete index cleanup reload deferred"
-            );
+        .map_err(|error| Status::internal(format!("read active index assignment: {error}")))?;
+    let Some(assignment) = assignment else {
+        return Ok(false);
+    };
+    let placement = current_placement(decisions)?;
+    let identity = IndexIdentity::new(
+        definition.tenant_id,
+        definition.bucket_id,
+        definition.stored.index_id,
+    )
+    .map_err(|error| Status::data_loss(error.to_string()))?;
+    let owners = IndexPlacement::derive(identity, &placement)
+        .map_err(|error| Status::unavailable(error.to_string()))?;
+    Ok(assignment.kind == DefinitionKind::Index
+        && assignment.object_version == VersionId(definition.object_version)
+        && assignment.definition_path == definition_path(&definition.stored.name)?
+        && assignment.observed_fence == placement.fence()
+        && assignment.rank == 0
+        && owners.builder() == local_node)
+}
+
+fn take_ready(
+    queue: &mut VecDeque<CatalogIdentity>,
+    entries: &mut BTreeMap<CatalogIdentity, ScheduledBuilder>,
+    active: bool,
+) -> Option<CatalogIdentity> {
+    while let Some(identity) = queue.pop_front() {
+        let Some(entry) = entries.get(&identity) else {
+            continue;
+        };
+        if entry.queued
+            && entry
+                .job
+                .as_ref()
+                .is_some_and(|job| job.is_active() == active)
+        {
+            return Some(identity);
         }
     }
+    None
 }
 
 // This progress is deliberately task-local: a restart may safely rescan ignored
@@ -284,18 +597,141 @@ struct ObservedGenerationProgress {
     barrier: IndexBarrier,
 }
 
-enum BuildProgress {
-    Idle(ObservedGenerationProgress),
-    Published,
+struct BuilderJob {
+    definition: CatalogDefinition,
+    specification: IndexSpecification,
+    kind: IndexKind,
+    observed: Option<ObservedGenerationProgress>,
+    force_snapshot_rebuild: bool,
+    phase: BuilderPhase,
 }
 
-async fn build_once(
-    definition: &CatalogDefinition,
-    specification: &IndexSpecification,
-    kind: IndexKind,
-    observed: Option<&ObservedGenerationProgress>,
+impl BuilderJob {
+    fn new(definition: CatalogDefinition) -> Result<Self, Status> {
+        let specification = definition.stored.specification()?;
+        let kind = kind_for_specification(&specification).map_err(index_status)?;
+        Ok(Self {
+            definition,
+            specification,
+            kind,
+            observed: None,
+            force_snapshot_rebuild: false,
+            phase: BuilderPhase::Inspect,
+        })
+    }
+
+    fn is_active(&self) -> bool {
+        !matches!(self.phase, BuilderPhase::Inspect)
+    }
+
+    fn holds_snapshot(&self) -> bool {
+        matches!(self.phase, BuilderPhase::Rebuild(_))
+    }
+}
+
+enum BuilderPhase {
+    Inspect,
+    Rebuild(RebuildWork),
+    CatchUp(CatchUpWork),
+    Publish(PublishWork),
+}
+
+struct RebuildWork {
+    current: Option<PublishedGeneration>,
+    _snapshot_slot: tokio::sync::OwnedSemaphorePermit,
+    snapshot: ClusterIndexSourceSnapshot,
+    through: IndexBarrier,
+    candidate: CandidateGeneration,
+}
+
+#[derive(Clone)]
+struct CatchUpWork {
+    current: Option<PublishedGeneration>,
+    through: IndexBarrier,
+    target: IndexBarrier,
+    candidate: CandidateGeneration,
+    changed: bool,
+    must_publish: bool,
+}
+
+#[derive(Clone)]
+struct PublishWork {
+    current: Option<PublishedGeneration>,
+    barrier: IndexBarrier,
+    candidate: CandidateGeneration,
+}
+
+struct BuilderStep {
+    job: BuilderJob,
+    disposition: BuilderDisposition,
+    retention_current: Option<PublishedGeneration>,
+}
+
+enum BuilderDisposition {
+    Ready,
+    Idle,
+    Retry(Duration),
+    Failed,
+}
+
+async fn advance_builder(
+    mut job: BuilderJob,
     dependencies: &IndexBuilderDependencies,
-) -> Result<BuildProgress, Status> {
+) -> BuilderStep {
+    let phase = std::mem::replace(&mut job.phase, BuilderPhase::Inspect);
+    let (failure_phase, retry_phase, result) = match phase {
+        BuilderPhase::Inspect => (
+            BuilderFailurePhase::Inspect,
+            Some(BuilderPhase::Inspect),
+            inspect_builder(&mut job, dependencies).await,
+        ),
+        BuilderPhase::Rebuild(work) => (
+            BuilderFailurePhase::Rebuild,
+            None,
+            advance_rebuild(&job, work, dependencies).await,
+        ),
+        BuilderPhase::CatchUp(work) => {
+            let retry = work.clone();
+            (
+                BuilderFailurePhase::CatchUp,
+                Some(BuilderPhase::CatchUp(retry)),
+                advance_catch_up(&mut job, work, dependencies).await,
+            )
+        }
+        BuilderPhase::Publish(work) => {
+            let retry = work.clone();
+            (
+                BuilderFailurePhase::Publish,
+                Some(BuilderPhase::Publish(retry)),
+                publish_builder(&mut job, work, dependencies).await,
+            )
+        }
+    };
+    match result {
+        Ok((next, disposition, retention_current)) => {
+            job.phase = next;
+            BuilderStep {
+                job,
+                disposition,
+                retention_current,
+            }
+        }
+        Err(error) => recover_builder_failure(job, failure_phase, retry_phase, error),
+    }
+}
+
+async fn inspect_builder(
+    job: &mut BuilderJob,
+    dependencies: &IndexBuilderDependencies,
+) -> Result<
+    (
+        BuilderPhase,
+        BuilderDisposition,
+        Option<PublishedGeneration>,
+    ),
+    Status,
+> {
+    let definition = &job.definition;
     let current = dependencies
         .publisher
         .load_current(
@@ -304,9 +740,10 @@ async fn build_once(
             definition.bucket_id,
         )
         .await?;
-    if let Some(current) = current.as_ref()
+    if !job.force_snapshot_rebuild
+        && let Some(current) = current.as_ref()
         && current.manifest.definition_version == definition.object_version
-        && current.manifest.kind == kind
+        && current.manifest.kind == job.kind
     {
         let target = dependencies
             .journal
@@ -314,48 +751,318 @@ async fn build_once(
             .await
             .map_err(event_status)?;
         let published = current.manifest.barrier().map_err(generation_status)?;
-        let from = incremental_start(current.current_object_version, &published, observed).clone();
+        let from = incremental_start(
+            current.current_object_version,
+            &published,
+            job.observed.as_ref(),
+        )
+        .clone();
+        let retention_current = Some(current.clone());
         if barriers_can_advance(&from, &target) {
             if from == target {
-                return Ok(BuildProgress::Idle(ObservedGenerationProgress {
+                job.observed = Some(ObservedGenerationProgress {
                     current_object_version: current.current_object_version,
                     barrier: target,
-                }));
+                });
+                return Ok((
+                    BuilderPhase::Inspect,
+                    BuilderDisposition::Idle,
+                    retention_current,
+                ));
             }
-            let advanced = advance_generation(
-                definition,
-                specification,
-                kind,
-                current,
-                from,
-                target,
-                dependencies,
-            )
-            .await;
-            if advanced
-                .as_ref()
-                .is_err_and(|status| status.code() == tonic::Code::FailedPrecondition)
-            {
-                return rebuild_generation(
-                    definition,
-                    specification,
-                    kind,
-                    Some(current),
-                    dependencies,
-                )
-                .await;
-            }
-            return advanced;
+            let candidate = CandidateGeneration::incremental(current);
+            emit_source_lag(job.kind, &from, &target);
+            return Ok((
+                BuilderPhase::CatchUp(CatchUpWork {
+                    current: Some(current.clone()),
+                    through: from,
+                    target,
+                    candidate,
+                    changed: false,
+                    must_publish: false,
+                }),
+                BuilderDisposition::Ready,
+                retention_current,
+            ));
         }
     }
-    rebuild_generation(
-        definition,
-        specification,
-        kind,
-        current.as_ref(),
+
+    tracing::info!(
+        index.id = job.definition.stored.index_id,
+        index.kind = ?job.kind,
+        tenant_id = job.definition.tenant_id,
+        bucket_id = job.definition.bucket_id,
+        monotonic_counter.anvil_index_rebuilds_total = 1_u64,
+        "index snapshot rebuild started"
+    );
+    job.observed = None;
+    let budget = dependencies.budgets.for_kind(job.kind);
+    let snapshot_slot = budget
+        .acquire_snapshot_slot()
+        .await
+        .map_err(budget_status)?;
+    let max_frame_bytes = source_wire_limit(budget.limit());
+    let (expected_fence, expected_atomic) = dependencies
+        .journal
+        .snapshot_authority()
+        .map_err(event_status)?;
+    let snapshot = dependencies
+        .scanner
+        .begin_source_snapshot(
+            definition.tenant_id,
+            definition.bucket_id,
+            definition.stored.path_prefix.clone(),
+            max_frame_bytes,
+        )
+        .await?;
+    if snapshot.placement_fence() != expected_fence {
+        return Err(Status::unavailable(
+            "cluster placement changed while opening index source snapshots",
+        ));
+    }
+    let tails = snapshot
+        .checkpoints()
+        .iter()
+        .map(|checkpoint| (checkpoint.node, checkpoint.source, checkpoint.captured_tail))
+        .collect::<Vec<_>>();
+    let through = dependencies
+        .journal
+        .barrier_from_snapshot_tails(snapshot.placement_fence(), expected_atomic, &tails)
+        .map_err(event_status)?;
+    job.force_snapshot_rebuild = false;
+    Ok((
+        BuilderPhase::Rebuild(RebuildWork {
+            current,
+            _snapshot_slot: snapshot_slot,
+            snapshot,
+            through,
+            candidate: CandidateGeneration::rebuild(),
+        }),
+        BuilderDisposition::Ready,
+        None,
+    ))
+}
+
+async fn advance_rebuild(
+    job: &BuilderJob,
+    mut work: RebuildWork,
+    dependencies: &IndexBuilderDependencies,
+) -> Result<
+    (
+        BuilderPhase,
+        BuilderDisposition,
+        Option<PublishedGeneration>,
+    ),
+    Status,
+> {
+    if compact_one_if_needed(job, &mut work.candidate, dependencies).await? {
+        return Ok((BuilderPhase::Rebuild(work), BuilderDisposition::Ready, None));
+    }
+    let budget = dependencies.budgets.for_kind(job.kind);
+    let permit = budget
+        .acquire(budget.limit())
+        .await
+        .map_err(budget_status)?;
+    let frame = work.snapshot.next_frame().await?;
+    match frame {
+        Some(frame) => {
+            let encoded_bytes = measure_snapshot_frame(&frame)?;
+            let plan = work_plan(budget, encoded_bytes)?;
+            process_snapshot_frame(
+                &job.definition,
+                &job.specification,
+                job.kind,
+                &work.through,
+                frame,
+                plan,
+                &mut work.candidate,
+                dependencies,
+            )
+            .await?;
+            drop(permit);
+            Ok((BuilderPhase::Rebuild(work), BuilderDisposition::Ready, None))
+        }
+        None => {
+            drop(permit);
+            let target = dependencies
+                .journal
+                .capture_barrier()
+                .await
+                .map_err(event_status)?;
+            emit_source_lag(job.kind, &work.through, &target);
+            Ok((
+                BuilderPhase::CatchUp(CatchUpWork {
+                    current: work.current,
+                    through: work.through,
+                    target,
+                    candidate: work.candidate,
+                    changed: false,
+                    must_publish: true,
+                }),
+                BuilderDisposition::Ready,
+                None,
+            ))
+        }
+    }
+}
+
+async fn advance_catch_up(
+    job: &mut BuilderJob,
+    mut work: CatchUpWork,
+    dependencies: &IndexBuilderDependencies,
+) -> Result<
+    (
+        BuilderPhase,
+        BuilderDisposition,
+        Option<PublishedGeneration>,
+    ),
+    Status,
+> {
+    if compact_one_if_needed(job, &mut work.candidate, dependencies).await? {
+        return Ok((BuilderPhase::CatchUp(work), BuilderDisposition::Ready, None));
+    }
+    let budget = dependencies.budgets.for_kind(job.kind);
+    let permit = budget
+        .acquire(budget.limit())
+        .await
+        .map_err(budget_status)?;
+    let page = dependencies
+        .journal
+        .next_page(
+            job.definition.tenant_id,
+            job.definition.bucket_id,
+            &work.through,
+            &work.target,
+            source_wire_limit(budget.limit()),
+        )
+        .await
+        .map_err(event_status)?;
+    match page {
+        Some(page) => {
+            let plan = work_plan(budget, page.encoded_bytes)?;
+            work.changed |= process_journal_page(
+                &job.definition,
+                &job.specification,
+                job.kind,
+                &work.target,
+                &page,
+                plan,
+                &mut work.candidate,
+                dependencies,
+            )
+            .await?;
+            work.through = page.through;
+            drop(permit);
+            Ok((BuilderPhase::CatchUp(work), BuilderDisposition::Ready, None))
+        }
+        None => {
+            drop(permit);
+            if work.through != work.target {
+                return Err(Status::unavailable(
+                    "index catch-up did not reach its complete source barrier",
+                ));
+            }
+            if work.must_publish || work.changed {
+                return Ok((
+                    BuilderPhase::Publish(PublishWork {
+                        current: work.current,
+                        barrier: work.through,
+                        candidate: work.candidate,
+                    }),
+                    BuilderDisposition::Ready,
+                    None,
+                ));
+            }
+            let current = work.current.ok_or_else(|| {
+                Status::internal("incremental builder lost its current generation")
+            })?;
+            job.observed = Some(ObservedGenerationProgress {
+                current_object_version: current.current_object_version,
+                barrier: work.through,
+            });
+            Ok((
+                BuilderPhase::Inspect,
+                BuilderDisposition::Idle,
+                Some(current),
+            ))
+        }
+    }
+}
+
+async fn publish_builder(
+    job: &mut BuilderJob,
+    work: PublishWork,
+    dependencies: &IndexBuilderDependencies,
+) -> Result<
+    (
+        BuilderPhase,
+        BuilderDisposition,
+        Option<PublishedGeneration>,
+    ),
+    Status,
+> {
+    let published = publish_candidate(
+        &job.definition,
+        job.kind,
+        work.barrier,
+        work.candidate,
+        work.current.as_ref(),
         dependencies,
     )
-    .await
+    .await?;
+    let (next, disposition) = complete_publication(job);
+    Ok((next, disposition, Some(published)))
+}
+
+fn complete_publication(job: &mut BuilderJob) -> (BuilderPhase, BuilderDisposition) {
+    job.observed = None;
+    (BuilderPhase::Inspect, BuilderDisposition::Idle)
+}
+
+async fn compact_one_if_needed(
+    job: &BuilderJob,
+    candidate: &mut CandidateGeneration,
+    dependencies: &IndexBuilderDependencies,
+) -> Result<bool, Status> {
+    let Some(level) = overfull_level(&candidate.runs) else {
+        return Ok(false);
+    };
+    let budget = dependencies.budgets.for_kind(job.kind);
+    let _permit = budget
+        .acquire(budget.limit())
+        .await
+        .map_err(budget_status)?;
+    compact_level(
+        &job.definition,
+        &job.specification,
+        job.kind,
+        level,
+        candidate,
+        dependencies,
+    )
+    .await?;
+    Ok(true)
+}
+
+fn is_local_builder(
+    definition: &CatalogDefinition,
+    local_node: NodeId,
+    placement: &ClusterPlacement,
+) -> Result<bool, Status> {
+    let identity = IndexIdentity::new(
+        definition.tenant_id,
+        definition.bucket_id,
+        definition.stored.index_id,
+    )
+    .map_err(|error| Status::data_loss(error.to_string()))?;
+    Ok(IndexPlacement::derive(identity, placement)
+        .map_err(|error| Status::unavailable(error.to_string()))?
+        .builder()
+        == local_node)
+}
+
+fn kind_slot(kind: IndexKind) -> usize {
+    kind as u8 as usize - 1
 }
 
 fn incremental_start<'a>(
@@ -381,198 +1088,7 @@ fn barriers_can_advance(from: &IndexBarrier, target: &IndexBarrier) -> bool {
         })
 }
 
-async fn rebuild_generation(
-    definition: &CatalogDefinition,
-    specification: &IndexSpecification,
-    kind: IndexKind,
-    current: Option<&PublishedGeneration>,
-    dependencies: &IndexBuilderDependencies,
-) -> Result<BuildProgress, Status> {
-    tracing::info!(
-        index.kind = ?kind,
-        monotonic_counter.anvil_index_rebuilds_total = 1_u64,
-        "index snapshot rebuild started"
-    );
-    let budget = dependencies.budgets.for_kind(kind);
-    let _snapshot_slot = budget
-        .acquire_snapshot_slot()
-        .await
-        .map_err(budget_status)?;
-    let max_frame_bytes = source_wire_limit(budget.limit());
-    let mut snapshot = dependencies
-        .scanner
-        .begin_source_snapshot(
-            definition.tenant_id,
-            definition.bucket_id,
-            definition.stored.path_prefix.clone(),
-            max_frame_bytes,
-        )
-        .await?;
-    let tails = snapshot
-        .checkpoints()
-        .iter()
-        .map(|checkpoint| (checkpoint.node, checkpoint.source, checkpoint.captured_tail))
-        .collect::<Vec<_>>();
-    let mut through = dependencies
-        .journal
-        .barrier_from_snapshot_tails(snapshot.placement_fence(), &tails)
-        .map_err(event_status)?;
-    let mut candidate = CandidateGeneration::rebuild();
-
-    loop {
-        let permit = budget
-            .acquire(budget.limit())
-            .await
-            .map_err(budget_status)?;
-        let Some(frame) = snapshot.next_frame().await? else {
-            drop(permit);
-            break;
-        };
-        let encoded_bytes = measure_snapshot_frame(&frame)?;
-        let plan = work_plan(budget, encoded_bytes)?;
-        process_snapshot_frame(
-            definition,
-            specification,
-            kind,
-            &through,
-            frame,
-            plan,
-            &mut candidate,
-            dependencies,
-        )
-        .await?;
-        drop(permit);
-        compact_until_bounded(
-            definition,
-            specification,
-            kind,
-            &mut candidate,
-            budget,
-            dependencies,
-        )
-        .await?;
-        tokio::task::yield_now().await;
-    }
-
-    let target = dependencies
-        .journal
-        .capture_barrier()
-        .await
-        .map_err(event_status)?;
-    emit_source_lag(kind, &through, &target);
-    let _ = catch_up(
-        definition,
-        specification,
-        kind,
-        &mut through,
-        &target,
-        &mut candidate,
-        budget,
-        dependencies,
-    )
-    .await?;
-    publish_candidate(definition, kind, through, candidate, current, dependencies).await
-}
-
-async fn advance_generation(
-    definition: &CatalogDefinition,
-    specification: &IndexSpecification,
-    kind: IndexKind,
-    current: &PublishedGeneration,
-    mut through: IndexBarrier,
-    target: IndexBarrier,
-    dependencies: &IndexBuilderDependencies,
-) -> Result<BuildProgress, Status> {
-    let budget = dependencies.budgets.for_kind(kind);
-    let mut candidate = CandidateGeneration::incremental(current);
-    emit_source_lag(kind, &through, &target);
-    let changed = catch_up(
-        definition,
-        specification,
-        kind,
-        &mut through,
-        &target,
-        &mut candidate,
-        budget,
-        dependencies,
-    )
-    .await?;
-    if !changed {
-        return Ok(BuildProgress::Idle(ObservedGenerationProgress {
-            current_object_version: current.current_object_version,
-            barrier: through,
-        }));
-    }
-    publish_candidate(
-        definition,
-        kind,
-        through,
-        candidate,
-        Some(current),
-        dependencies,
-    )
-    .await
-}
-
-async fn catch_up(
-    definition: &CatalogDefinition,
-    specification: &IndexSpecification,
-    kind: IndexKind,
-    through: &mut IndexBarrier,
-    target: &IndexBarrier,
-    candidate: &mut CandidateGeneration,
-    budget: &IndexMemoryBudget,
-    dependencies: &IndexBuilderDependencies,
-) -> Result<bool, Status> {
-    let page_bytes = source_wire_limit(budget.limit());
-    let mut changed = false;
-    loop {
-        let permit = budget
-            .acquire(budget.limit())
-            .await
-            .map_err(budget_status)?;
-        let page = dependencies
-            .journal
-            .next_page(through, target, page_bytes)
-            .await
-            .map_err(event_status)?;
-        let Some(page) = page else {
-            drop(permit);
-            break;
-        };
-        let plan = work_plan(budget, page.encoded_bytes)?;
-        changed |= process_journal_page(
-            definition,
-            specification,
-            kind,
-            target,
-            &page,
-            plan,
-            candidate,
-            dependencies,
-        )
-        .await?;
-        *through = page.through;
-        drop(permit);
-        compact_until_bounded(
-            definition,
-            specification,
-            kind,
-            candidate,
-            budget,
-            dependencies,
-        )
-        .await?;
-        tokio::task::yield_now().await;
-    }
-    if through != target {
-        return Err(Status::unavailable(
-            "index catch-up did not reach its complete source barrier",
-        ));
-    }
-    Ok(changed)
-}
-
+#[derive(Clone)]
 struct CandidateGeneration {
     runs: Vec<ManifestRun>,
     next_sequence: u64,
@@ -777,7 +1293,7 @@ async fn load_target_source(
         .map_err(|error| Status::internal(error.to_string()))?;
     let Some(snapshot) = dependencies
         .reader
-        .current_snapshot_stable(&key, definition.tenant_id, definition.bucket_id)
+        .current_head_snapshot_stable(&key, definition.tenant_id, definition.bucket_id)
         .await?
     else {
         return Ok(IndexSourceMutation::Remove(DocumentRef {
@@ -791,11 +1307,7 @@ async fn load_target_source(
         ));
     }
     require_visible_head(&snapshot.head, target)?;
-    let version = snapshot
-        .versions
-        .iter()
-        .find(|version| version.id == snapshot.head.version)
-        .ok_or_else(|| Status::data_loss("index current head has no matching version"))?;
+    let version = &snapshot.version;
     if version.deleted
         || !source_matches_definition(&definition.stored, path, version.content_type.as_deref())
     {
@@ -912,41 +1424,6 @@ async fn flush_builder(
     Ok(())
 }
 
-async fn compact_until_bounded(
-    definition: &CatalogDefinition,
-    specification: &IndexSpecification,
-    kind: IndexKind,
-    candidate: &mut CandidateGeneration,
-    budget: &IndexMemoryBudget,
-    dependencies: &IndexBuilderDependencies,
-) -> Result<(), Status> {
-    while let Some(level) = overfull_level(&candidate.runs) {
-        let _permit = budget
-            .acquire(budget.limit())
-            .await
-            .map_err(budget_status)?;
-        if let Err(error) = compact_level(
-            definition,
-            specification,
-            kind,
-            level,
-            candidate,
-            dependencies,
-        )
-        .await
-        {
-            tracing::info!(
-                index.kind = ?kind,
-                monotonic_counter.anvil_index_compaction_failures_total = 1_u64,
-                "index compaction failed"
-            );
-            return Err(error);
-        }
-        tokio::task::yield_now().await;
-    }
-    Ok(())
-}
-
 fn overfull_level(runs: &[ManifestRun]) -> Option<u8> {
     let mut counts = BTreeMap::<u8, usize>::new();
     for run in runs {
@@ -1036,18 +1513,7 @@ async fn publish_candidate(
     candidate: CandidateGeneration,
     current: Option<&PublishedGeneration>,
     dependencies: &IndexBuilderDependencies,
-) -> Result<BuildProgress, Status> {
-    if !dependencies.catalog.is_current(
-        definition.tenant_id,
-        definition.bucket_id,
-        &definition.stored.name,
-        definition.stored.index_id,
-        definition.object_version,
-    )? {
-        return Err(Status::aborted(
-            "index definition changed before generation publication",
-        ));
-    }
+) -> Result<PublishedGeneration, Status> {
     dependencies
         .journal
         .validate_publication_barrier(&barrier)
@@ -1071,6 +1537,7 @@ async fn publish_candidate(
         Ok(value) => value,
         Err(error) => {
             tracing::info!(
+                index.id = definition.stored.index_id,
                 index.kind = ?kind,
                 monotonic_counter.anvil_index_publication_cas_failures_total = 1_u64,
                 "index generation publication CAS failed"
@@ -1079,68 +1546,13 @@ async fn publish_candidate(
         }
     };
     tracing::info!(
+        index.id = definition.stored.index_id,
         index.kind = ?kind,
         gauge.anvil_index_generation = published.pointer.generation,
         monotonic_counter.anvil_index_publication_cas_total = 1_u64,
         "index generation published"
     );
-    collect_obsolete_generation_artifacts(
-        definition,
-        kind,
-        &published,
-        dependencies,
-        "publication",
-    )
-    .await;
-    Ok(BuildProgress::Published)
-}
-
-async fn collect_obsolete_generation_artifacts(
-    definition: &CatalogDefinition,
-    kind: IndexKind,
-    current: &PublishedGeneration,
-    dependencies: &IndexBuilderDependencies,
-    trigger: &'static str,
-) {
-    match dependencies
-        .retention
-        .collect(
-            &definition.stored,
-            definition.tenant_id,
-            definition.bucket_id,
-            current,
-        )
-        .await
-    {
-        Ok(deleted) if deleted > 0 && trigger == "periodic" => {
-            tracing::info!(
-                index.id = definition.stored.index_id,
-                index.kind = ?kind,
-                index.cleanup.trigger = trigger,
-                monotonic_counter.anvil_index_retention_artifacts_deleted_total = deleted,
-                "idle obsolete index cleanup completed"
-            );
-        }
-        Ok(deleted) if deleted > 0 => {
-            tracing::info!(
-                index.id = definition.stored.index_id,
-                index.kind = ?kind,
-                index.cleanup.trigger = trigger,
-                monotonic_counter.anvil_index_retention_artifacts_deleted_total = deleted,
-                "obsolete index cleanup completed"
-            );
-        }
-        Ok(_) => {}
-        Err(error) => {
-            tracing::warn!(
-                index.id = definition.stored.index_id,
-                index.kind = ?kind,
-                index.cleanup.trigger = trigger,
-                %error,
-                "obsolete index cleanup deferred"
-            );
-        }
-    }
+    Ok(published)
 }
 
 fn source_matches_definition(
@@ -1190,19 +1602,19 @@ fn require_visible_head(head: &Head, barrier: &IndexBarrier) -> Result<(), Statu
     );
     let barrier_fence = (barrier.fence.term, barrier.fence.index);
     if stamp_fence > barrier_fence {
-        return Err(Status::unavailable(
+        return Err(Status::aborted(
             "index source advanced beyond its captured placement fence",
         ));
     }
     if stamp_fence == barrier_fence {
         let node = NodeId(u64::from(stamp.source_id.node_id));
         let Some(cursor) = barrier.sources.get(&node) else {
-            return Err(Status::unavailable(
+            return Err(Status::aborted(
                 "index source mutation is absent from the captured source vector",
             ));
         };
         if cursor.source != stamp.source_id || stamp.source_journal_position >= cursor.next_offset {
-            return Err(Status::unavailable(
+            return Err(Status::aborted(
                 "index source mutation advanced beyond its captured journal target",
             ));
         }
@@ -1316,11 +1728,23 @@ fn index_status(error: IndexError) -> Status {
 
 fn event_status(error: IndexEventError) -> Status {
     match error {
-        IndexEventError::PageBytesExceeded { .. } => Status::resource_exhausted(error.to_string()),
-        IndexEventError::CheckpointMismatch(_)
+        IndexEventError::Placement(_)
+        | IndexEventError::AtomicProgramInProgress
+        | IndexEventError::Source { .. }
+        | IndexEventError::Task(_) => Status::unavailable(error.to_string()),
+        IndexEventError::BarrierChanged
+        | IndexEventError::CheckpointMismatch(_)
         | IndexEventError::SourceEpochChanged(_)
+        | IndexEventError::SourceHistoryGap(_)
         | IndexEventError::IncompleteSources => Status::failed_precondition(error.to_string()),
-        _ => Status::unavailable(error.to_string()),
+        IndexEventError::PageBytesExceeded { .. } => Status::resource_exhausted(error.to_string()),
+        IndexEventError::ZeroPageByteLimit => Status::invalid_argument(error.to_string()),
+        IndexEventError::InvalidSourceStatus(_)
+        | IndexEventError::NonContiguousSource(_)
+        | IndexEventError::OffsetOverflow(_)
+        | IndexEventError::PageLengthOverflow
+        | IndexEventError::PageLengthMismatch { .. }
+        | IndexEventError::Encode(_) => Status::data_loss(error.to_string()),
     }
 }
 
@@ -1329,184 +1753,5 @@ fn generation_status(error: super::generation::GenerationError) -> Status {
 }
 
 #[cfg(test)]
-mod tests {
-    use anvil_store::{
-        ObjectHeadChange, ObjectHeadChangeKind, PlacementLogId, SourceId, VersionId,
-    };
-
-    use super::*;
-    use crate::index_runtime::events::{
-        AtomicProgramWatermark, IndexJournalChange, IndexSourceCursor,
-    };
-
-    fn run(sequence: u64, level: u8) -> ManifestRun {
-        ManifestRun {
-            sequence,
-            level,
-            root_path: format!("_anvil/indexes/v2/9/runs/{:064x}/root", sequence),
-            root_blob: anvil_store::BlobRef {
-                hash: [sequence as u8; 32],
-                length: 10,
-            },
-            root_object_version: anvil_store::VersionId(sequence),
-            mutation_count: 1,
-            live_document_count: 1,
-            minimum_version: 1,
-            maximum_version: 1,
-            authoritative_bytes: 10,
-        }
-    }
-
-    fn barrier(next_offset: u64) -> IndexBarrier {
-        IndexBarrier {
-            fence: PlacementLogId { term: 3, index: 7 },
-            atomic: AtomicProgramWatermark::new(None, None, 0),
-            sources: [(
-                NodeId(1),
-                IndexSourceCursor {
-                    source: SourceId {
-                        node_id: 1,
-                        source_epoch: [1; 32],
-                    },
-                    next_offset,
-                },
-            )]
-            .into_iter()
-            .collect(),
-        }
-    }
-
-    fn journal_change(
-        tenant_id: u64,
-        bucket_id: u64,
-        path: &str,
-        offset: u64,
-    ) -> IndexJournalChange {
-        IndexJournalChange {
-            node: NodeId(1),
-            change: LocalChange::ObjectHead(ObjectHeadChange {
-                offset,
-                tenant_id,
-                bucket_id,
-                exact_path: path.to_owned(),
-                path_version: VersionId(offset),
-                kind: ObjectHeadChangeKind::Put,
-                reference_deltas: Vec::new(),
-                accounting_transition: None,
-            }),
-        }
-    }
-
-    fn journal_page(changes: Vec<IndexJournalChange>, next_offset: u64) -> IndexJournalPage {
-        IndexJournalPage {
-            changes,
-            through: barrier(next_offset),
-            encoded_bytes: 1,
-        }
-    }
-
-    #[test]
-    fn compaction_replacement_uses_newest_input_sequence() {
-        let inputs = (1..=4).map(|sequence| run(sequence, 0)).collect::<Vec<_>>();
-        let replacement = compaction_replacement_sequence(&inputs).unwrap();
-        assert_eq!(replacement, 4);
-        let newer_uncompacted = run(5, 0);
-        assert!(replacement < newer_uncompacted.sequence);
-    }
-
-    #[test]
-    fn reserved_segment_matching_is_not_a_string_prefix_guess() {
-        assert!(contains_reserved_segment("a/_anvil/meta.json"));
-        assert!(!contains_reserved_segment("a/_anvilish/meta.json"));
-    }
-
-    #[test]
-    fn reserved_artifact_pages_have_no_generation_source_changes() {
-        let page = journal_page(
-            vec![
-                journal_change(1, 2, "_anvil/indexes/v2/9/current", 11),
-                journal_change(
-                    1,
-                    2,
-                    "_anvil/indexes/v2/9/manifests/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                    12,
-                ),
-            ],
-            13,
-        );
-
-        assert!(journal_source_paths(1, 2, "", &page).is_empty());
-    }
-
-    #[test]
-    fn observed_artifact_progress_is_reused_for_the_next_real_mutation() {
-        let published = barrier(10);
-        let observed = ObservedGenerationProgress {
-            current_object_version: VersionId(7),
-            barrier: barrier(13),
-        };
-        let next_target = barrier(14);
-
-        let start = incremental_start(VersionId(7), &published, Some(&observed));
-        assert_eq!(start, &observed.barrier);
-        assert!(barriers_can_advance(start, &next_target));
-        assert_eq!(start.sources[&NodeId(1)].next_offset, 13);
-        assert_eq!(next_target.sources[&NodeId(1)].next_offset, 14);
-
-        let page = journal_page(vec![journal_change(1, 2, "records/real.json", 13)], 14);
-        assert_eq!(
-            journal_source_paths(1, 2, "records/", &page),
-            BTreeMap::from([("records/real.json".to_owned(), 13)])
-        );
-    }
-
-    #[test]
-    fn observed_progress_does_not_cross_a_current_pointer_change() {
-        let published = barrier(20);
-        let observed = ObservedGenerationProgress {
-            current_object_version: VersionId(7),
-            barrier: barrier(24),
-        };
-
-        assert_eq!(
-            incremental_start(VersionId(8), &published, Some(&observed)),
-            &published
-        );
-    }
-
-    #[test]
-    fn retention_retry_rearms_at_the_bounded_interval() {
-        let started = tokio::time::Instant::now();
-        let first_retry = next_retention_retry(started);
-        assert_eq!(
-            first_retry.saturating_duration_since(started),
-            RETENTION_RETRY_INTERVAL
-        );
-        assert!(!retention_retry_due(started, first_retry));
-        assert!(retention_retry_due(first_retry, first_retry));
-
-        let second_retry = next_retention_retry(first_retry);
-        assert_eq!(
-            second_retry.saturating_duration_since(first_retry),
-            RETENTION_RETRY_INTERVAL
-        );
-    }
-
-    #[test]
-    fn first_overfull_level_is_selected_deterministically() {
-        let mut runs = (1..=5).map(|sequence| run(sequence, 0)).collect::<Vec<_>>();
-        runs.extend((6..=10).map(|sequence| run(sequence, 1)));
-        assert_eq!(overfull_level(&runs), Some(0));
-    }
-
-    #[test]
-    fn lost_incremental_history_requests_a_snapshot_rebuild() {
-        for error in [
-            IndexEventError::CheckpointMismatch(NodeId(1)),
-            IndexEventError::SourceEpochChanged(NodeId(1)),
-            IndexEventError::IncompleteSources,
-        ] {
-            assert_eq!(event_status(error).code(), tonic::Code::FailedPrecondition);
-        }
-    }
-}
+#[path = "manager/tests.rs"]
+mod tests;

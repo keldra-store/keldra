@@ -2,7 +2,6 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anvil_consensus::{DecisionRaft, NodeId};
 use anyhow::{Context, Result};
@@ -11,16 +10,19 @@ use crate::bucket_governance::BucketGovernance;
 use crate::cluster_object_read::ClusterObjectReader;
 use crate::cluster_peer::{ClusterPeerTransport, LocalIndexQueryExecutor};
 use crate::data_peer::DataPeerTransport;
+use crate::distributed_list::DistributedObjectLister;
 use crate::index_config::IndexRuntimeConfig;
-use crate::index_service::{IndexDefinitionLister, IndexQueryExecutor};
+use crate::index_service::{
+    DistributedIndexDefinitionLister, IndexDefinitionLister, IndexQueryExecutor,
+};
 use crate::object_distribution::ObjectDistribution;
 use anvil_store::Store;
 
 use super::budget::IndexMemoryBudgets;
 use super::cache::{IndexCache, IndexCacheConfig};
 use super::catalog::IndexCatalog;
+use super::coordination::DefinitionCoordinationTask;
 use super::cpu::IndexCpuPool;
-use super::discovery::{IndexDefinitionDiscovery, capture_then_refresh};
 use super::distributed_query::DistributedIndexQueryExecutor;
 use super::events::{ClusterIndexEventSources, DecisionIndexEventAuthority, IndexEventJournal};
 use super::local_query::{ClusterIndexSegmentFetcher, LocalGenerationQueryExecutor};
@@ -30,9 +32,6 @@ use super::publisher::IndexGenerationPublisher;
 use super::retention::IndexGenerationRetention;
 use super::scanner::ClusterIndexScanner;
 
-const JOURNAL_START_RETRY_INTERVAL: Duration = Duration::from_millis(100);
-const JOURNAL_START_TIMEOUT: Duration = Duration::from_secs(30);
-
 pub(crate) struct RunningIndexRuntime {
     pub(crate) definitions: Arc<dyn IndexDefinitionLister>,
     pub(crate) queries: Arc<dyn IndexQueryExecutor>,
@@ -40,14 +39,8 @@ pub(crate) struct RunningIndexRuntime {
     pub(crate) event_journal: Arc<IndexEventJournal>,
     pub(crate) scanner: ClusterIndexScanner,
     pub(crate) artifact_router: IndexArtifactRouter,
-    _definition_discovery: tokio::task::JoinHandle<()>,
+    _definition_coordination: DefinitionCoordinationTask,
     _builders: IndexBuilderManagerTask,
-}
-
-impl Drop for RunningIndexRuntime {
-    fn drop(&mut self) {
-        self._definition_discovery.abort();
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -60,27 +53,30 @@ pub(crate) async fn start(
     objects: ObjectDistribution,
     governance: BucketGovernance,
     reader: ClusterObjectReader,
+    object_lister: DistributedObjectLister,
     data_directory: &Path,
     config: IndexRuntimeConfig,
 ) -> Result<RunningIndexRuntime> {
+    tracing::info!("index runtime starts from sparse assigned-definition state");
     let scanner = ClusterIndexScanner::new(decisions.clone(), cluster_peers.clone());
     let journal = Arc::new(IndexEventJournal::new(
         Arc::new(DecisionIndexEventAuthority::new(decisions.clone())),
         Arc::new(ClusterIndexEventSources::new(
             local_node,
             store.clone(),
-            data_peers,
+            data_peers.clone(),
         )),
     ));
     let catalog = IndexCatalog::default();
-    let discovery = IndexDefinitionDiscovery::new(scanner.clone(), reader.clone(), catalog.clone());
-    let initial_definition_barrier = tokio::time::timeout(
-        JOURNAL_START_TIMEOUT,
-        capture_initial_definitions(&discovery, &journal),
-    )
-    .await
-    .context("index journals did not reach a clear initial definition barrier")??;
-    let definition_discovery = discovery.spawn(journal.clone(), initial_definition_barrier);
+    let definition_coordination = DefinitionCoordinationTask::start(
+        local_node,
+        decisions.clone(),
+        store.clone(),
+        data_peers,
+        cluster_peers.clone(),
+        reader.clone(),
+        catalog.clone(),
+    );
 
     let memory_bytes = index_memory_budget(config.memory_percent())?;
     let cache = IndexCache::new(
@@ -100,9 +96,15 @@ pub(crate) async fn start(
         local_queries.clone(),
     ));
 
-    let coordinator = IndexArtifactCoordinator::new(objects.clone(), governance);
+    let coordinator = IndexArtifactCoordinator::new(
+        store.clone(),
+        objects.clone(),
+        governance,
+        cluster_peers.clone(),
+    );
     let artifact_router = IndexArtifactRouter::new(local_node, coordinator, objects, cluster_peers);
-    let publisher = IndexGenerationPublisher::new(store, reader.clone(), artifact_router.clone());
+    let publisher =
+        IndexGenerationPublisher::new(store.clone(), reader.clone(), artifact_router.clone());
     let generation_retention = IndexGenerationRetention::new(
         scanner.clone(),
         reader.clone(),
@@ -118,7 +120,7 @@ pub(crate) async fn start(
         decisions,
         catalog.clone(),
         IndexBuilderDependencies {
-            catalog: catalog.clone(),
+            store,
             journal: journal.clone(),
             scanner: scanner.clone(),
             reader,
@@ -130,31 +132,29 @@ pub(crate) async fn start(
         },
     );
 
+    // Give the newly started coordination tasks one scheduling turn, then
+    // report the scans actually admitted while the runtime was starting.
+    tokio::task::yield_now().await;
+    let (scoped_head_scans_total, global_head_scans_total) = scanner.scan_evidence();
+    let head_scans_total = scoped_head_scans_total.saturating_add(global_head_scans_total);
+    tracing::info!(
+        node_id = local_node.0,
+        head_scans_total,
+        global_head_scans_total,
+        scoped_head_scans_total,
+        "anvil_index_startup_scan_evidence"
+    );
+
     Ok(RunningIndexRuntime {
-        definitions: Arc::new(catalog),
+        definitions: Arc::new(DistributedIndexDefinitionLister::new(object_lister)),
         queries,
         local_queries,
         event_journal: journal,
         scanner,
         artifact_router,
-        _definition_discovery: definition_discovery,
+        _definition_coordination: definition_coordination,
         _builders: builders,
     })
-}
-
-async fn capture_initial_definitions(
-    discovery: &IndexDefinitionDiscovery,
-    journal: &IndexEventJournal,
-) -> Result<super::events::IndexBarrier, tonic::Status> {
-    loop {
-        match capture_then_refresh(discovery, journal).await {
-            Ok(barrier) => return Ok(barrier),
-            Err(error) if error.code() == tonic::Code::Unavailable => {
-                tokio::time::sleep(JOURNAL_START_RETRY_INTERVAL).await;
-            }
-            Err(error) => return Err(error),
-        }
-    }
 }
 
 fn index_memory_budget(percent: u8) -> Result<u64> {

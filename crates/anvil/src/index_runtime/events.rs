@@ -4,14 +4,14 @@
 //! permit. There is no node-local fan-out inbox: a complete source vector is
 //! authoritative only when a manifest CAS publishes every prepared run.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 
 use anvil_consensus::{DecisionRaft, NodeId};
 use anvil_store::{
-    LocalChange, MAX_LOCAL_INVALIDATION_SCAN_RECORDS, OversizeLocalChange, PlacementLogId,
-    SourceId, Store, WatchJournalStatus,
+    JournalRoute, LocalChange, MAX_LOCAL_INVALIDATION_SCAN_RECORDS, OversizeLocalChange,
+    PlacementLogId, SourceId, Store, WatchJournalStatus,
 };
 use thiserror::Error;
 
@@ -21,6 +21,9 @@ use crate::data_peer::DataPeerTransport;
 /// The private peer journal codec already rejects pages larger than this.
 /// Applying the same bound to local pages keeps both paths equivalent.
 pub(crate) const MAX_INDEX_EVENT_PAGE_BYTES: u64 = 16 * 1024 * 1024;
+const BUCKET_PAGE_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+const BUCKET_PAGE_DECODED_MULTIPLIER: u64 = 4;
+const BUCKET_PAGE_ENTRY_OVERHEAD: u64 = 256;
 
 /// The globally replicated atomic-program publication watermark.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -124,6 +127,7 @@ pub(crate) struct IndexSourcePage {
     pub source_id: SourceId,
     pub changes: Vec<LocalChange>,
     pub encoded_bytes: u64,
+    pub through_offset: u64,
     pub oversize: Option<OversizeLocalChange>,
 }
 
@@ -136,6 +140,9 @@ pub(crate) trait IndexEventSources: Send + Sync + 'static {
         source: &IndexSource,
         expected_source: SourceId,
         after_offset: u64,
+        target_offset: u64,
+        tenant_id: u64,
+        bucket_id: u64,
         limit: usize,
         max_bytes: u64,
     ) -> Result<IndexSourcePage, IndexEventError>;
@@ -146,6 +153,8 @@ pub(crate) struct ClusterIndexEventSources {
     local_node: NodeId,
     store: Store,
     peers: DataPeerTransport,
+    bucket_pages: Arc<Mutex<BucketPageCache>>,
+    page_locks: Arc<Mutex<BTreeMap<BucketPageKey, Weak<tokio::sync::Mutex<()>>>>>,
 }
 
 impl ClusterIndexEventSources {
@@ -154,8 +163,176 @@ impl ClusterIndexEventSources {
             local_node,
             store,
             peers,
+            bucket_pages: Arc::new(Mutex::new(BucketPageCache::default())),
+            page_locks: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
+
+    fn page_lock(&self, key: &BucketPageKey) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self
+            .page_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(lock) = locks.get(key).and_then(Weak::upgrade) {
+            return lock;
+        }
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(key.clone(), Arc::downgrade(&lock));
+        lock
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct BucketPageKey {
+    node: NodeId,
+    source: SourceId,
+    tenant_id: u64,
+    bucket_id: u64,
+    after_offset: u64,
+}
+
+#[derive(Clone)]
+struct CachedBucketPage {
+    requested_target: u64,
+    requested_max_bytes: u64,
+    page: IndexSourcePage,
+    charge: u64,
+}
+
+#[derive(Default)]
+struct BucketPageCache {
+    pages: BTreeMap<BucketPageKey, CachedBucketPage>,
+    insertion_order: VecDeque<BucketPageKey>,
+    charged_bytes: u64,
+}
+
+impl BucketPageCache {
+    fn get(
+        &self,
+        key: &BucketPageKey,
+        target_offset: u64,
+        max_bytes: u64,
+    ) -> Result<Option<IndexSourcePage>, IndexEventError> {
+        let Some(cached) = self.pages.get(key) else {
+            return Ok(None);
+        };
+        if cached.page.oversize.is_some_and(|oversize| {
+            max_bytes >= oversize.encoded_bytes && max_bytes > cached.requested_max_bytes
+        }) {
+            return Ok(None);
+        }
+        if target_offset > cached.requested_target
+            && cached.page.through_offset >= cached.requested_target
+        {
+            return Ok(None);
+        }
+        trim_cached_page(&cached.page, key.after_offset, target_offset, max_bytes).map(Some)
+    }
+
+    fn insert(
+        &mut self,
+        key: BucketPageKey,
+        requested_target: u64,
+        requested_max_bytes: u64,
+        page: IndexSourcePage,
+    ) {
+        let charge = page
+            .encoded_bytes
+            .saturating_mul(BUCKET_PAGE_DECODED_MULTIPLIER)
+            .saturating_add((page.changes.len() as u64).saturating_mul(256))
+            .saturating_add(BUCKET_PAGE_ENTRY_OVERHEAD);
+        if let Some(previous) = self.pages.remove(&key) {
+            self.charged_bytes = self.charged_bytes.saturating_sub(previous.charge);
+            self.insertion_order.retain(|candidate| candidate != &key);
+        }
+        if charge <= BUCKET_PAGE_CACHE_BYTES {
+            self.charged_bytes = self.charged_bytes.saturating_add(charge);
+            self.insertion_order.push_back(key.clone());
+            self.pages.insert(
+                key,
+                CachedBucketPage {
+                    requested_target,
+                    requested_max_bytes,
+                    page,
+                    charge,
+                },
+            );
+        }
+        while self.charged_bytes > BUCKET_PAGE_CACHE_BYTES {
+            let Some(oldest) = self.insertion_order.pop_front() else {
+                self.pages.clear();
+                self.charged_bytes = 0;
+                break;
+            };
+            if let Some(removed) = self.pages.remove(&oldest) {
+                self.charged_bytes = self.charged_bytes.saturating_sub(removed.charge);
+            }
+        }
+    }
+}
+
+fn trim_cached_page(
+    page: &IndexSourcePage,
+    after_offset: u64,
+    target_offset: u64,
+    max_bytes: u64,
+) -> Result<IndexSourcePage, IndexEventError> {
+    if let Some(oversize) = page.oversize {
+        if oversize.offset > target_offset {
+            return Ok(IndexSourcePage {
+                source_id: page.source_id,
+                changes: Vec::new(),
+                encoded_bytes: 0,
+                through_offset: target_offset,
+                oversize: None,
+            });
+        }
+        return Ok(IndexSourcePage {
+            source_id: page.source_id,
+            changes: Vec::new(),
+            encoded_bytes: 0,
+            through_offset: after_offset,
+            oversize: Some(oversize),
+        });
+    }
+    let mut changes = Vec::new();
+    let mut encoded_bytes = 0_u64;
+    let mut through_offset = page.through_offset.min(target_offset);
+    for change in &page.changes {
+        if change.offset() > target_offset {
+            break;
+        }
+        let encoded = encoded_len(change)?;
+        if encoded_bytes.saturating_add(encoded) > max_bytes {
+            if changes.is_empty() {
+                return Ok(IndexSourcePage {
+                    source_id: page.source_id,
+                    changes,
+                    encoded_bytes: 0,
+                    through_offset: after_offset,
+                    oversize: Some(OversizeLocalChange {
+                        offset: change.offset(),
+                        encoded_bytes: encoded,
+                    }),
+                });
+            }
+            through_offset = changes
+                .last()
+                .expect("a cached change was retained")
+                .offset();
+            break;
+        }
+        encoded_bytes += encoded;
+        changes.push(change.clone());
+    }
+    Ok(IndexSourcePage {
+        source_id: page.source_id,
+        changes,
+        encoded_bytes,
+        through_offset,
+        oversize: None,
+    })
 }
 
 #[tonic::async_trait]
@@ -179,36 +356,85 @@ impl IndexEventSources for ClusterIndexEventSources {
         source: &IndexSource,
         expected_source: SourceId,
         after_offset: u64,
+        target_offset: u64,
+        tenant_id: u64,
+        bucket_id: u64,
         limit: usize,
         max_bytes: u64,
     ) -> Result<IndexSourcePage, IndexEventError> {
+        let key = BucketPageKey {
+            node: source.node,
+            source: expected_source,
+            tenant_id,
+            bucket_id,
+            after_offset,
+        };
+        if let Some(page) = self
+            .bucket_pages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key, target_offset, max_bytes)?
+        {
+            return Ok(page);
+        }
+        let page_lock = self.page_lock(&key);
+        let _guard = page_lock.lock().await;
+        if let Some(page) = self
+            .bucket_pages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key, target_offset, max_bytes)?
+        {
+            return Ok(page);
+        }
         let page = if source.node == self.local_node {
             let store = self.store.clone();
             tokio::task::spawn_blocking(move || {
-                store.scan_local_changes_bounded(after_offset, limit, max_bytes)
+                store.scan_routed_local_changes(
+                    JournalRoute::Bucket {
+                        tenant_id,
+                        bucket_id,
+                    },
+                    expected_source,
+                    after_offset,
+                    target_offset,
+                    limit,
+                    max_bytes,
+                )
             })
             .await
             .map_err(|error| source_error(source.node, error))?
-            .map_err(|error| source_error(source.node, error))?
+            .map_err(|error| local_routed_source_error(source.node, error))?
         } else {
             self.peers
-                .read_source_journal(
+                .read_routed_source_journal(
                     source.node,
                     &source.address,
+                    JournalRoute::Bucket {
+                        tenant_id,
+                        bucket_id,
+                    },
                     expected_source,
                     after_offset,
+                    target_offset,
                     limit,
                     max_bytes,
                 )
                 .await
-                .map_err(|error| source_error(source.node, error))?
+                .map_err(|error| remote_routed_source_error(source.node, error))?
         };
-        Ok(IndexSourcePage {
+        let page = IndexSourcePage {
             source_id: page.source_id,
             changes: page.changes,
             encoded_bytes: page.encoded_bytes,
+            through_offset: page.through_offset,
             oversize: page.oversize,
-        })
+        };
+        self.bucket_pages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key, target_offset, max_bytes, page.clone());
+        trim_cached_page(&page, after_offset, target_offset, max_bytes)
     }
 }
 
@@ -216,6 +442,33 @@ fn source_error(node: NodeId, error: impl std::fmt::Display) -> IndexEventError 
     IndexEventError::Source {
         node,
         message: error.to_string(),
+    }
+}
+
+fn local_routed_source_error(
+    node: NodeId,
+    error: anvil_store::RoutedJournalError,
+) -> IndexEventError {
+    match error {
+        anvil_store::RoutedJournalError::SourceNodeMismatch
+        | anvil_store::RoutedJournalError::SourceEpochMismatch => {
+            IndexEventError::SourceEpochChanged(node)
+        }
+        anvil_store::RoutedJournalError::CursorExpired { .. }
+        | anvil_store::RoutedJournalError::CursorFuture { .. }
+        | anvil_store::RoutedJournalError::MissingPrimary { .. }
+        | anvil_store::RoutedJournalError::RouteMismatch { .. } => {
+            IndexEventError::SourceHistoryGap(node)
+        }
+        error => source_error(node, error),
+    }
+}
+
+fn remote_routed_source_error(node: NodeId, error: tonic::Status) -> IndexEventError {
+    match error.code() {
+        tonic::Code::FailedPrecondition => IndexEventError::SourceEpochChanged(node),
+        tonic::Code::OutOfRange => IndexEventError::SourceHistoryGap(node),
+        _ => source_error(node, error),
     }
 }
 
@@ -301,7 +554,7 @@ impl IndexEventJournal {
                 IndexSourceCursor {
                     source: status.source_id,
                     next_offset: status
-                        .tail
+                        .settled_through
                         .checked_add(1)
                         .ok_or(IndexEventError::OffsetOverflow(source.node))?,
                 },
@@ -335,6 +588,23 @@ impl IndexEventJournal {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    /// Capture the membership and atomic-program fence before any source
+    /// snapshot is opened. The caller must pass this exact watermark back
+    /// after every source is open; a commit finalized during snapshot opening
+    /// therefore forces one bounded retry instead of admitting a mixed cut.
+    pub(crate) fn snapshot_authority(
+        &self,
+    ) -> Result<(PlacementLogId, AtomicProgramWatermark), IndexEventError> {
+        let authority = self
+            .authority
+            .current()
+            .map_err(IndexEventError::Placement)?;
+        if !authority.atomic.is_clear() {
+            return Err(IndexEventError::AtomicProgramInProgress);
+        }
+        Ok((authority.fence, authority.atomic))
     }
 
     /// Revalidate the authority named by a completed candidate immediately
@@ -371,13 +641,17 @@ impl IndexEventJournal {
     pub(crate) fn barrier_from_snapshot_tails(
         &self,
         fence: PlacementLogId,
+        expected_atomic: AtomicProgramWatermark,
         tails: &[(NodeId, SourceId, u64)],
     ) -> Result<IndexBarrier, IndexEventError> {
         let placement = self
             .authority
             .current()
             .map_err(IndexEventError::Placement)?;
-        if placement.fence != fence || !placement.atomic.is_clear() {
+        if placement.fence != fence
+            || !placement.atomic.is_clear()
+            || placement.atomic != expected_atomic
+        {
             return Err(IndexEventError::BarrierChanged);
         }
         let expected = placement
@@ -405,7 +679,7 @@ impl IndexEventJournal {
         }
         let barrier = IndexBarrier {
             fence,
-            atomic: placement.atomic,
+            atomic: expected_atomic,
             sources: cursors,
         };
         *self
@@ -422,6 +696,8 @@ impl IndexEventJournal {
     /// vector under the same placement and atomic watermark.
     pub(crate) async fn next_page(
         &self,
+        tenant_id: u64,
+        bucket_id: u64,
         from: &IndexBarrier,
         target: &IndexBarrier,
         max_bytes: u64,
@@ -452,16 +728,26 @@ impl IndexEventJournal {
         {
             return Err(IndexEventError::SourceEpochChanged(source.node));
         }
-        let remaining = usize::try_from(through.next_offset - start.next_offset)
-            .unwrap_or(usize::MAX)
-            .min(self.page_size);
         let after = start
+            .next_offset
+            .checked_sub(1)
+            .ok_or(IndexEventError::CheckpointMismatch(source.node))?;
+        let target_offset = through
             .next_offset
             .checked_sub(1)
             .ok_or(IndexEventError::CheckpointMismatch(source.node))?;
         let page = self
             .sources
-            .read_page(source, start.source, after, remaining, max_bytes)
+            .read_page(
+                source,
+                start.source,
+                after,
+                target_offset,
+                tenant_id,
+                bucket_id,
+                self.page_size,
+                max_bytes,
+            )
             .await?;
         if page.source_id != start.source {
             return Err(IndexEventError::SourceEpochChanged(source.node));
@@ -469,7 +755,8 @@ impl IndexEventJournal {
         if let Some(oversize) = page.oversize {
             if !page.changes.is_empty()
                 || page.encoded_bytes != 0
-                || oversize.offset != start.next_offset
+                || oversize.offset < start.next_offset
+                || oversize.offset > target_offset
             {
                 return Err(IndexEventError::NonContiguousSource(source.node));
             }
@@ -478,15 +765,18 @@ impl IndexEventJournal {
                 limit: max_bytes,
             });
         }
-        if page.changes.is_empty() {
-            return Err(IndexEventError::SourceEpochChanged(source.node));
+        if page.through_offset < after
+            || page.through_offset > target_offset
+            || (page.through_offset == after && target_offset > after)
+        {
+            return Err(IndexEventError::NonContiguousSource(source.node));
         }
 
-        let mut next = start.next_offset;
+        let mut previous = after;
         let mut encoded_bytes = 0_u64;
         let mut changes = Vec::with_capacity(page.changes.len());
         for change in page.changes {
-            if change.offset() != next || next >= through.next_offset {
+            if change.offset() <= previous || change.offset() > page.through_offset {
                 return Err(IndexEventError::NonContiguousSource(source.node));
             }
             let bytes = encoded_len(&change)?;
@@ -507,9 +797,7 @@ impl IndexEventJournal {
                 node: source.node,
                 change,
             });
-            next = next
-                .checked_add(1)
-                .ok_or(IndexEventError::OffsetOverflow(source.node))?;
+            previous = changes.last().expect("just pushed").change.offset();
         }
         if encoded_bytes != page.encoded_bytes {
             return Err(IndexEventError::PageLengthMismatch {
@@ -521,7 +809,7 @@ impl IndexEventJournal {
         let status_after = self.sources.status(source).await?;
         validate_status(source.node, &status_after)?;
         if status_after.source_id != start.source
-            || status_after.tail.saturating_add(1) < through.next_offset
+            || status_after.settled_through.saturating_add(1) < through.next_offset
         {
             return Err(IndexEventError::SourceEpochChanged(source.node));
         }
@@ -534,7 +822,10 @@ impl IndexEventJournal {
             return Err(IndexEventError::BarrierChanged);
         }
         let mut advanced = from.clone();
-        advanced.sources.get_mut(&source.node).unwrap().next_offset = next;
+        advanced.sources.get_mut(&source.node).unwrap().next_offset = page
+            .through_offset
+            .checked_add(1)
+            .ok_or(IndexEventError::OffsetOverflow(source.node))?;
         if advanced
             .sources
             .iter()
@@ -607,6 +898,8 @@ fn require_compatible(
 fn validate_status(node: NodeId, status: &WatchJournalStatus) -> Result<(), IndexEventError> {
     if u64::from(status.source_id.node_id) != node.0
         || status.retention_floor > status.tail
+        || status.settled_through < status.retention_floor
+        || status.settled_through > status.tail
         || status.retained_entries != status.tail - status.retention_floor
     {
         return Err(IndexEventError::InvalidSourceStatus(node));
@@ -634,6 +927,8 @@ pub(crate) enum IndexEventError {
     CheckpointMismatch(NodeId),
     #[error("index source {0:?} changed epoch or lost retained history")]
     SourceEpochChanged(NodeId),
+    #[error("index source {0:?} has a routed journal history gap")]
+    SourceHistoryGap(NodeId),
     #[error("index source {0:?} returned non-contiguous offsets")]
     NonContiguousSource(NodeId),
     #[error("index source {0:?} exhausted its offset space")]

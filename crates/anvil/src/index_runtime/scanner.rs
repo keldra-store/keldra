@@ -1,14 +1,15 @@
 //! Fenced, pull-based cluster scans for cold discovery and rebuilds.
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use anvil_consensus::{DecisionRaft, NodeId};
-use anvil_store::{ObjectRecordCursor, PlacementLogId, SourceId};
+use anvil_store::{ObjectRecordCursor, PlacementLogId, RetainedObjectSnapshot, SourceId};
 use tonic::Status;
 
 use crate::cluster_peer::{
     ClusterPeerTransport, IndexCurrentHead, IndexHeadScanPage, IndexHeadScanScope,
-    IndexSourceSnapshot, IndexSourceSnapshotHead,
+    IndexSourceSnapshot, IndexSourceSnapshotHead, RetainedSourceSnapshot,
 };
 use crate::cluster_placement::ClusterPlacement;
 
@@ -16,16 +17,52 @@ use crate::cluster_placement::ClusterPlacement;
 pub(crate) struct ClusterIndexScanner {
     decisions: DecisionRaft,
     peers: ClusterPeerTransport,
+    evidence: Arc<HeadScanEvidence>,
+}
+
+#[derive(Default)]
+struct HeadScanEvidence {
+    counts: Mutex<HeadScanCounts>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct HeadScanCounts {
+    total: u64,
+    scoped: u64,
 }
 
 impl ClusterIndexScanner {
     pub(crate) fn new(decisions: DecisionRaft, peers: ClusterPeerTransport) -> Self {
-        Self { decisions, peers }
+        Self {
+            decisions,
+            peers,
+            evidence: Arc::new(HeadScanEvidence::default()),
+        }
+    }
+
+    pub(crate) fn scan_evidence(&self) -> (u64, u64) {
+        let counts = *self
+            .evidence
+            .counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (counts.scoped, counts.total.saturating_sub(counts.scoped))
+    }
+
+    fn record_scoped_scan(&self) {
+        let mut counts = self
+            .evidence
+            .counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        counts.total = counts.total.saturating_add(1);
+        counts.scoped = counts.scoped.saturating_add(1);
     }
 
     /// Begin a scan without fetching a page. The caller can therefore obtain
     /// its memory permit before every `next_page` call.
     pub(crate) fn begin(&self, scope: IndexHeadScanScope) -> Result<ClusterIndexScan, Status> {
+        self.record_scoped_scan();
         let placement = self.placement()?;
         let fence = placement.fence();
         let nodes = placement
@@ -51,30 +88,6 @@ impl ClusterIndexScanner {
         })
     }
 
-    /// Compatibility helper for the few cold/control-plane scans whose result
-    /// is deliberately small. Index source rebuilds use `begin` directly.
-    pub(crate) async fn scan(
-        &self,
-        scope: IndexHeadScanScope,
-    ) -> Result<Vec<IndexCurrentHead>, Status> {
-        let mut scan = self.begin(scope)?;
-        let mut selected = BTreeMap::<(u64, u64, String), IndexCurrentHead>::new();
-        while let Some(page) = scan.next_page().await? {
-            for head in page {
-                let key = (head.tenant_id, head.bucket_id, head.exact_path.clone());
-                match selected.get(&key) {
-                    Some(existing)
-                        if existing.head == head.head && existing.version == head.version => {}
-                    Some(existing) if existing.head.version >= head.head.version => {}
-                    _ => {
-                        selected.insert(key, head);
-                    }
-                }
-            }
-        }
-        Ok(selected.into_values().collect())
-    }
-
     /// Open one snapshot-bound current-head stream for every ACTIVE source.
     ///
     /// Every stream is opened before the first frame is consumed so its source
@@ -88,6 +101,7 @@ impl ClusterIndexScanner {
         path_prefix: String,
         max_frame_bytes: u64,
     ) -> Result<ClusterIndexSourceSnapshot, Status> {
+        self.record_scoped_scan();
         let placement = self.placement()?;
         let fence = placement.fence();
         let sources = placement
@@ -167,6 +181,95 @@ impl ClusterIndexScanner {
         })
     }
 
+    /// Open one retained `(path, version)` snapshot stream for every ACTIVE
+    /// source. Frames remain credit-driven and are consumed sequentially so a
+    /// bucket with deep version history never materializes all descriptors.
+    pub(crate) async fn begin_retained_source_snapshot(
+        &self,
+        tenant_id: u64,
+        bucket_id: u64,
+        path_prefix: String,
+        max_frame_bytes: u64,
+    ) -> Result<ClusterRetainedSourceSnapshot, Status> {
+        self.record_scoped_scan();
+        let placement = self.placement()?;
+        let fence = placement.fence();
+        let sources = placement
+            .active_node_ids()
+            .into_iter()
+            .map(|node| {
+                let address = placement
+                    .address(node)
+                    .ok_or_else(|| {
+                        Status::unavailable("ACTIVE retained snapshot source has no address")
+                    })?
+                    .0
+                    .clone();
+                Ok((node, address))
+            })
+            .collect::<Result<Vec<_>, Status>>()?;
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for (node, address) in sources {
+            let peers = self.peers.clone();
+            let path_prefix = path_prefix.clone();
+            tasks.spawn(async move {
+                let snapshot = peers
+                    .scan_retained_source_snapshot(
+                        node,
+                        &address,
+                        tenant_id,
+                        bucket_id,
+                        path_prefix,
+                        max_frame_bytes,
+                    )
+                    .await;
+                (node, snapshot)
+            });
+        }
+
+        let mut opened = BTreeMap::new();
+        while let Some(joined) = tasks.join_next().await {
+            let (node, snapshot) = joined.map_err(|error| {
+                Status::internal(format!("retained snapshot task failed: {error}"))
+            })?;
+            let snapshot = snapshot?;
+            if snapshot.placement_fence() != fence || u64::from(snapshot.source().node_id) != node.0
+            {
+                return Err(Status::data_loss(
+                    "retained snapshot identity or placement fence is inconsistent",
+                ));
+            }
+            if opened.insert(node, snapshot).is_some() {
+                return Err(Status::data_loss(
+                    "retained snapshot returned a duplicate ACTIVE source",
+                ));
+            }
+        }
+        if opened.len() != placement.active_node_ids().len() {
+            return Err(Status::unavailable(
+                "not every ACTIVE source opened a retained snapshot",
+            ));
+        }
+        self.require_fence(fence)?;
+        let checkpoints = opened
+            .iter()
+            .map(|(&node, snapshot)| IndexSnapshotSourceCheckpoint {
+                node,
+                source: snapshot.source(),
+                captured_tail: snapshot.captured_tail(),
+            })
+            .collect();
+        Ok(ClusterRetainedSourceSnapshot {
+            scanner: self.clone(),
+            fence,
+            checkpoints,
+            snapshots: opened.into_values().collect(),
+            source_index: 0,
+            finished: false,
+        })
+    }
+
     fn placement(&self) -> Result<ClusterPlacement, Status> {
         let state = self
             .decisions
@@ -201,6 +304,47 @@ pub(crate) struct ClusterIndexSourceSnapshot {
     snapshots: Vec<IndexSourceSnapshot>,
     source_index: usize,
     finished: bool,
+}
+
+pub(crate) struct ClusterRetainedSourceSnapshot {
+    scanner: ClusterIndexScanner,
+    fence: PlacementLogId,
+    checkpoints: Vec<IndexSnapshotSourceCheckpoint>,
+    snapshots: Vec<RetainedSourceSnapshot>,
+    source_index: usize,
+    finished: bool,
+}
+
+impl ClusterRetainedSourceSnapshot {
+    pub(crate) fn placement_fence(&self) -> PlacementLogId {
+        self.fence
+    }
+
+    pub(crate) fn checkpoints(&self) -> &[IndexSnapshotSourceCheckpoint] {
+        &self.checkpoints
+    }
+
+    pub(crate) async fn next_frame(
+        &mut self,
+    ) -> Result<Option<Vec<RetainedObjectSnapshot>>, Status> {
+        if self.finished {
+            return Ok(None);
+        }
+        loop {
+            let Some(snapshot) = self.snapshots.get_mut(self.source_index) else {
+                self.scanner.require_fence(self.fence)?;
+                self.finished = true;
+                return Ok(None);
+            };
+            match snapshot.next_frame().await? {
+                Some(frame) => {
+                    self.scanner.require_fence(self.fence)?;
+                    return Ok(Some(frame));
+                }
+                None => self.source_index += 1,
+            }
+        }
+    }
 }
 
 impl ClusterIndexSourceSnapshot {

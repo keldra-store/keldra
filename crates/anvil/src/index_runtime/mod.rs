@@ -7,9 +7,9 @@
 pub(crate) mod budget;
 pub(crate) mod cache;
 pub(crate) mod catalog;
+pub(crate) mod coordination;
 pub(crate) mod cpu;
 pub(crate) mod directory;
-pub(crate) mod discovery;
 pub(crate) mod distributed_query;
 pub(crate) mod engine;
 pub(crate) mod events;

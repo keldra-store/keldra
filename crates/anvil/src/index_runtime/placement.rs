@@ -45,6 +45,10 @@ impl IndexIdentity {
     pub(crate) const fn bucket_id(self) -> u64 {
         self.bucket_id
     }
+
+    pub(crate) const fn index_id(self) -> u64 {
+        self.index_id
+    }
 }
 
 /// Derived ownership for one index under one applied membership.
@@ -64,7 +68,7 @@ impl IndexPlacement {
         Self::from_ranked(ranked, placement.fence())
     }
 
-    fn from_ranked(
+    pub(super) fn from_ranked(
         ranked: Vec<NodeId>,
         fence: anvil_store::PlacementLogId,
     ) -> Result<Self, IndexPlacementError> {
@@ -89,6 +93,13 @@ impl IndexPlacement {
 
     pub(crate) const fn fence(&self) -> anvil_store::PlacementLogId {
         self.fence
+    }
+
+    pub(crate) fn rank_of(&self, node: NodeId) -> Option<u8> {
+        self.query_replicas
+            .iter()
+            .position(|candidate| *candidate == node)
+            .and_then(|rank| u8::try_from(rank).ok())
     }
 }
 

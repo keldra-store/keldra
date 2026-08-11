@@ -44,6 +44,9 @@ impl IndexEventSources for MemorySources {
         source: &IndexSource,
         expected_source: SourceId,
         after_offset: u64,
+        target_offset: u64,
+        _tenant_id: u64,
+        _bucket_id: u64,
         limit: usize,
         max_bytes: u64,
     ) -> Result<IndexSourcePage, IndexEventError> {
@@ -52,11 +55,11 @@ impl IndexEventSources for MemorySources {
         let mut selected = Vec::new();
         let mut encoded_bytes = 0_u64;
         let mut oversize = None;
-        for change in changes
+        let matching = changes
             .iter()
-            .filter(|change| change.offset() > after_offset)
-            .take(limit)
-        {
+            .filter(|change| change.offset() > after_offset && change.offset() <= target_offset)
+            .collect::<Vec<_>>();
+        for change in matching.iter().copied().take(limit) {
             let bytes = encoded_len(change)?;
             let projected = encoded_bytes + bytes;
             if projected > max_bytes && selected.is_empty() {
@@ -72,6 +75,13 @@ impl IndexEventSources for MemorySources {
             encoded_bytes = projected;
             selected.push(change.clone());
         }
+        let through_offset = if oversize.is_some() {
+            after_offset
+        } else if selected.len() < matching.len() {
+            selected.last().map_or(after_offset, LocalChange::offset)
+        } else {
+            target_offset
+        };
         Ok(IndexSourcePage {
             source_id: if status.source_id == expected_source {
                 status.source_id
@@ -80,6 +90,7 @@ impl IndexEventSources for MemorySources {
             },
             changes: selected,
             encoded_bytes,
+            through_offset,
             oversize,
         })
     }
@@ -102,6 +113,7 @@ fn change(node: u16, offset: u64) -> LocalChange {
         kind: ObjectHeadChangeKind::Put,
         reference_deltas: Vec::<ReferenceDelta>::new(),
         accounting_transition: None,
+        definition_transition: None,
     })
 }
 
@@ -109,6 +121,7 @@ fn status(node: u16, tail: u64) -> WatchJournalStatus {
     WatchJournalStatus {
         source_id: source_id(node),
         tail,
+        settled_through: tail,
         retention_floor: 0,
         retained_entries: tail,
         retained_bytes: tail * 10,
@@ -152,6 +165,7 @@ fn snapshot_tails_form_the_exact_active_source_vector() {
     let barrier = journal
         .barrier_from_snapshot_tails(
             PlacementLogId { term: 3, index: 7 },
+            clear,
             &[(NodeId(1), source_id(1), 8), (NodeId(2), source_id(2), 13)],
         )
         .unwrap();
@@ -168,6 +182,7 @@ fn snapshot_tails_reject_an_incomplete_or_pending_boundary() {
     let incomplete = journal(vec![placement(clear)], &MemorySources::default())
         .barrier_from_snapshot_tails(
             PlacementLogId { term: 3, index: 7 },
+            clear,
             &[(NodeId(1), source_id(1), 8)],
         )
         .unwrap_err();
@@ -177,6 +192,7 @@ fn snapshot_tails_reject_an_incomplete_or_pending_boundary() {
     let pending = journal(vec![placement(pending)], &MemorySources::default())
         .barrier_from_snapshot_tails(
             PlacementLogId { term: 3, index: 7 },
+            pending,
             &[(NodeId(1), source_id(1), 8), (NodeId(2), source_id(2), 13)],
         )
         .unwrap_err();
@@ -206,6 +222,32 @@ async fn barrier_captures_every_active_source_tail() {
     assert_eq!(barrier.atomic.finalized_through(), Some(40));
     assert_eq!(barrier.sources[&NodeId(1)].next_offset, 3);
     assert_eq!(barrier.sources[&NodeId(2)].next_offset, 2);
+}
+
+#[tokio::test]
+async fn barrier_stops_at_each_sources_proof_backed_settled_boundary() {
+    let clear = AtomicProgramWatermark::new(Some(40), Some(40), 0);
+    let sources = MemorySources::default();
+    let mut pending = status(1, 2);
+    pending.settled_through = 1;
+    sources
+        .journals
+        .lock()
+        .unwrap()
+        .insert(NodeId(1), (pending, vec![change(1, 1), change(1, 2)]));
+    sources
+        .journals
+        .lock()
+        .unwrap()
+        .insert(NodeId(2), (status(2, 0), Vec::new()));
+
+    let barrier = journal(vec![placement(clear)], &sources)
+        .capture_barrier()
+        .await
+        .unwrap();
+
+    assert_eq!(barrier.sources[&NodeId(1)].next_offset, 2);
+    assert_eq!(barrier.sources[&NodeId(2)].next_offset, 1);
 }
 
 #[tokio::test]
@@ -283,7 +325,7 @@ async fn bounded_pages_advance_every_source_through_the_exact_vector() {
     let mut cursor = from;
     let mut offsets = Vec::new();
     while let Some(page) = journal
-        .next_page(&cursor, &target, MAX_INDEX_EVENT_PAGE_BYTES)
+        .next_page(1, 2, &cursor, &target, MAX_INDEX_EVENT_PAGE_BYTES)
         .await
         .unwrap()
     {
@@ -355,7 +397,7 @@ async fn page_is_rejected_before_it_can_be_retained_over_the_byte_cap() {
         ..from.clone()
     };
     let error = journal(vec![placement(clear)], &sources)
-        .next_page(&from, &target, 1)
+        .next_page(1, 2, &from, &target, 1)
         .await
         .unwrap_err();
     assert!(matches!(error, IndexEventError::PageBytesExceeded { .. }));
@@ -424,7 +466,7 @@ async fn byte_cap_returns_a_nonempty_prefix_without_advancing_past_it() {
     let first_size = encoded_len(&change(1, 1)).unwrap();
 
     let first = journal
-        .next_page(&from, &target, first_size)
+        .next_page(1, 2, &from, &target, first_size)
         .await
         .unwrap()
         .unwrap();
@@ -433,7 +475,7 @@ async fn byte_cap_returns_a_nonempty_prefix_without_advancing_past_it() {
     assert_eq!(first.through.sources[&NodeId(1)].next_offset, 2);
 
     let second = journal
-        .next_page(&first.through, &target, first_size)
+        .next_page(1, 2, &first.through, &target, first_size)
         .await
         .unwrap()
         .unwrap();
@@ -449,4 +491,155 @@ fn publication_watermark_defers_later_atomic_heads() {
     assert!(barrier.permits(Some(40)));
     assert!(!barrier.permits(Some(41)));
     assert!(!barrier.permits(Some(0)));
+}
+
+#[test]
+fn shared_bucket_page_is_trimmed_without_changing_its_cached_source() {
+    let key = BucketPageKey {
+        node: NodeId(1),
+        source: source_id(1),
+        tenant_id: 1,
+        bucket_id: 2,
+        after_offset: 0,
+    };
+    let first = change(1, 1);
+    let second = change(1, 2);
+    let first_bytes = encoded_len(&first).unwrap();
+    let second_bytes = encoded_len(&second).unwrap();
+    let page = IndexSourcePage {
+        source_id: source_id(1),
+        changes: vec![first, second],
+        encoded_bytes: first_bytes + second_bytes,
+        through_offset: 2,
+        oversize: None,
+    };
+    let mut cache = BucketPageCache::default();
+    cache.insert(key.clone(), 2, first_bytes + second_bytes, page.clone());
+
+    let trimmed = cache.get(&key, 1, first_bytes).unwrap().unwrap();
+    assert_eq!(trimmed.changes.len(), 1);
+    assert_eq!(trimmed.changes[0].offset(), 1);
+    assert_eq!(trimmed.through_offset, 1);
+    assert_eq!(trimmed.encoded_bytes, first_bytes);
+
+    let complete = cache
+        .get(&key, 2, first_bytes + second_bytes)
+        .unwrap()
+        .unwrap();
+    assert_eq!(complete.changes, page.changes);
+    assert_eq!(complete.through_offset, 2);
+}
+
+#[test]
+fn shared_bucket_cache_evicts_old_pages_at_its_process_bound() {
+    let mut cache = BucketPageCache::default();
+    for after_offset in [0, 1] {
+        let key = BucketPageKey {
+            node: NodeId(1),
+            source: source_id(1),
+            tenant_id: 1,
+            bucket_id: 2,
+            after_offset,
+        };
+        cache.insert(
+            key,
+            after_offset + 1,
+            10 * 1024 * 1024,
+            IndexSourcePage {
+                source_id: source_id(1),
+                changes: Vec::new(),
+                encoded_bytes: 10 * 1024 * 1024,
+                through_offset: after_offset + 1,
+                oversize: None,
+            },
+        );
+    }
+
+    assert!(cache.charged_bytes <= BUCKET_PAGE_CACHE_BYTES);
+    assert_eq!(cache.pages.len(), 1);
+    assert!(!cache.pages.keys().any(|key| key.after_offset == 0));
+    assert!(cache.pages.keys().any(|key| key.after_offset == 1));
+}
+
+#[test]
+fn cached_terminal_page_is_not_used_for_a_later_target() {
+    let key = BucketPageKey {
+        node: NodeId(1),
+        source: source_id(1),
+        tenant_id: 1,
+        bucket_id: 2,
+        after_offset: 0,
+    };
+    let mut cache = BucketPageCache::default();
+    cache.insert(
+        key.clone(),
+        1,
+        4096,
+        IndexSourcePage {
+            source_id: source_id(1),
+            changes: vec![change(1, 1)],
+            encoded_bytes: encoded_len(&change(1, 1)).unwrap(),
+            through_offset: 1,
+            oversize: None,
+        },
+    );
+
+    assert!(cache.get(&key, 2, 4096).unwrap().is_none());
+}
+
+#[test]
+fn local_routed_history_failures_keep_their_recovery_classification() {
+    for error in [
+        anvil_store::RoutedJournalError::CursorExpired {
+            cursor: 4,
+            retention_floor: 5,
+        },
+        anvil_store::RoutedJournalError::CursorFuture { cursor: 8, tail: 7 },
+        anvil_store::RoutedJournalError::MissingPrimary { offset: 6 },
+        anvil_store::RoutedJournalError::RouteMismatch { offset: 6 },
+    ] {
+        assert_eq!(
+            local_routed_source_error(NodeId(2), error),
+            IndexEventError::SourceHistoryGap(NodeId(2))
+        );
+    }
+    assert_eq!(
+        local_routed_source_error(
+            NodeId(2),
+            anvil_store::RoutedJournalError::SourceEpochMismatch,
+        ),
+        IndexEventError::SourceEpochChanged(NodeId(2))
+    );
+    assert!(matches!(
+        local_routed_source_error(
+            NodeId(2),
+            anvil_store::RoutedJournalError::Storage("temporarily unavailable".into()),
+        ),
+        IndexEventError::Source {
+            node: NodeId(2),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn peer_status_codes_preserve_gap_but_leave_unavailability_transient() {
+    assert_eq!(
+        remote_routed_source_error(NodeId(3), tonic::Status::out_of_range("history gap")),
+        IndexEventError::SourceHistoryGap(NodeId(3))
+    );
+    assert_eq!(
+        remote_routed_source_error(
+            NodeId(3),
+            tonic::Status::failed_precondition("source epoch changed"),
+        ),
+        IndexEventError::SourceEpochChanged(NodeId(3))
+    );
+    assert!(matches!(
+        remote_routed_source_error(NodeId(3), tonic::Status::unavailable("retry")),
+        IndexEventError::Source {
+            node: NodeId(3),
+            ..
+        }
+    ));
 }

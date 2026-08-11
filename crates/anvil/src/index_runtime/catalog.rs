@@ -1,18 +1,18 @@
-//! Disposable discovery cache for ordinary index-definition objects.
+//! Bounded process-local handoff for index definitions assigned to this node.
 //!
-//! The cache is never authoritative. Its complete contents are replaced after
-//! a successful fenced cluster scan; a restart or failed refresh merely makes
-//! index discovery temporarily stale until the next scan succeeds.
+//! Durable `ASSIGNED` records and ordinary definition objects remain the
+//! authorities. This queue only coalesces work between the paged assignment
+//! walker and the bounded builder scheduler. Losing it merely causes the next
+//! assignment walk to offer the definition again.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex};
 
 use tonic::Status;
 
-use crate::index_service::{
-    IndexDefinitionLister, IndexDefinitionScan, IndexDefinitionScanPage, ListedIndexDefinition,
-    StoredIndexDefinition, definition_path,
-};
+use crate::index_service::{StoredIndexDefinition, definition_path};
+
+const MAX_PENDING_CATALOG_CHANGES: usize = 1_024;
 
 #[derive(Clone, Debug)]
 pub(crate) struct CatalogDefinition {
@@ -20,175 +20,196 @@ pub(crate) struct CatalogDefinition {
     pub(crate) bucket_id: u64,
     pub(crate) object_version: u64,
     pub(crate) stored: StoredIndexDefinition,
-    pub(crate) encoded: Vec<u8>,
 }
 
 impl CatalogDefinition {
+    pub(crate) fn identity(&self) -> CatalogIdentity {
+        CatalogIdentity {
+            tenant_id: self.tenant_id,
+            bucket_id: self.bucket_id,
+            index_id: self.stored.index_id,
+        }
+    }
+
     pub(crate) fn validate(&self) -> Result<(), Status> {
         if self.tenant_id == 0 || self.bucket_id == 0 || self.object_version == 0 {
             return Err(Status::data_loss(
-                "index definition cache entry has a zero stable identity",
+                "assigned index definition has a zero stable identity",
             ));
         }
-        let decoded = StoredIndexDefinition::decode(&self.encoded)?;
-        if decoded != self.stored {
+        if definition_path(&self.stored.name)?
+            != format!("_anvil/indexes/v2/definitions/{}", self.stored.name)
+        {
             return Err(Status::data_loss(
-                "index definition cache bytes differ from their decoded value",
-            ));
-        }
-        let expected = definition_path(&self.stored.name)?;
-        if expected != format!("_anvil/indexes/v2/definitions/{}", self.stored.name) {
-            return Err(Status::data_loss(
-                "index definition cache path is not canonical",
+                "assigned index definition path is not canonical",
             ));
         }
         Ok(())
     }
 }
 
-#[derive(Clone, Default)]
-pub(crate) struct IndexCatalog {
-    inner: Arc<RwLock<BTreeMap<CatalogKey, CatalogDefinition>>>,
+#[derive(Clone, Debug)]
+pub(crate) enum CatalogChange {
+    Upsert(CatalogDefinition),
+    Remove(CatalogIdentity),
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct CatalogKey {
-    tenant_id: u64,
-    bucket_id: u64,
-    name: String,
+impl CatalogChange {
+    pub(crate) fn identity(&self) -> CatalogIdentity {
+        match self {
+            Self::Upsert(definition) => definition.identity(),
+            Self::Remove(identity) => *identity,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct CatalogIdentity {
+    pub(crate) tenant_id: u64,
+    pub(crate) bucket_id: u64,
+    pub(crate) index_id: u64,
+}
+
+#[derive(Clone)]
+pub(crate) struct IndexCatalog {
+    inner: Arc<Mutex<CatalogState>>,
+    changes: tokio::sync::broadcast::Sender<CatalogIdentity>,
+}
+
+struct CatalogState {
+    pending: BTreeMap<CatalogIdentity, CatalogChange>,
+    capacity: usize,
+}
+
+impl Default for IndexCatalog {
+    fn default() -> Self {
+        Self::with_capacity(MAX_PENDING_CATALOG_CHANGES)
+    }
 }
 
 impl IndexCatalog {
-    pub(crate) fn replace(&self, definitions: Vec<CatalogDefinition>) -> Result<(), Status> {
-        let mut replacement = BTreeMap::new();
-        for definition in definitions {
-            definition.validate()?;
-            let key = CatalogKey {
-                tenant_id: definition.tenant_id,
-                bucket_id: definition.bucket_id,
-                name: definition.stored.name.clone(),
-            };
-            if replacement.insert(key, definition).is_some() {
-                return Err(Status::data_loss(
-                    "cluster scan returned a duplicate index definition",
-                ));
-            }
+    fn with_capacity(capacity: usize) -> Self {
+        assert!(capacity > 0, "index catalog capacity must be positive");
+        let (changes, _) = tokio::sync::broadcast::channel(capacity);
+        Self {
+            inner: Arc::new(Mutex::new(CatalogState {
+                pending: BTreeMap::new(),
+                capacity,
+            })),
+            changes,
         }
-        *self
-            .inner
-            .write()
-            .map_err(|_| Status::internal("index definition cache lock is poisoned"))? =
-            replacement;
-        Ok(())
-    }
-
-    pub(crate) fn all(&self) -> Result<Vec<CatalogDefinition>, Status> {
-        Ok(self
-            .inner
-            .read()
-            .map_err(|_| Status::internal("index definition cache lock is poisoned"))?
-            .values()
-            .cloned()
-            .collect())
     }
 
     pub(crate) fn upsert(&self, definition: CatalogDefinition) -> Result<(), Status> {
         definition.validate()?;
-        let key = CatalogKey {
-            tenant_id: definition.tenant_id,
-            bucket_id: definition.bucket_id,
-            name: definition.stored.name.clone(),
-        };
-        self.inner
-            .write()
-            .map_err(|_| Status::internal("index definition cache lock is poisoned"))?
-            .insert(key, definition);
-        Ok(())
+        self.enqueue(CatalogChange::Upsert(definition))
     }
 
-    pub(crate) fn remove(&self, tenant_id: u64, bucket_id: u64, name: &str) -> Result<(), Status> {
-        self.inner
-            .write()
-            .map_err(|_| Status::internal("index definition cache lock is poisoned"))?
-            .remove(&CatalogKey {
-                tenant_id,
-                bucket_id,
-                name: name.to_owned(),
-            });
-        Ok(())
-    }
-
-    /// Revalidate the disposable catalog immediately before publication.
-    /// A replaced or removed definition must never acquire a new current
-    /// generation merely because its former builder task has not yet stopped.
-    pub(crate) fn is_current(
+    pub(crate) fn remove(
         &self,
         tenant_id: u64,
         bucket_id: u64,
-        name: &str,
         index_id: u64,
-        object_version: u64,
-    ) -> Result<bool, Status> {
-        Ok(self
-            .inner
-            .read()
-            .map_err(|_| Status::internal("index definition cache lock is poisoned"))?
-            .get(&CatalogKey {
-                tenant_id,
-                bucket_id,
-                name: name.to_owned(),
-            })
-            .is_some_and(|definition| {
-                definition.stored.index_id == index_id
-                    && definition.object_version == object_version
-            }))
+    ) -> Result<(), Status> {
+        self.enqueue(CatalogChange::Remove(CatalogIdentity {
+            tenant_id,
+            bucket_id,
+            index_id,
+        }))
     }
-}
 
-#[tonic::async_trait]
-impl IndexDefinitionLister for IndexCatalog {
-    async fn scan(&self, request: IndexDefinitionScan) -> Result<IndexDefinitionScanPage, Status> {
-        if request.tenant_id == 0 || request.bucket_id == 0 || request.limit == 0 {
+    fn enqueue(&self, change: CatalogChange) -> Result<(), Status> {
+        let identity = change.identity();
+        let is_remove = matches!(change, CatalogChange::Remove(_));
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| Status::internal("assigned index handoff lock is poisoned"))?;
+        if !state.pending.contains_key(&identity) && state.pending.len() >= state.capacity {
+            if is_remove {
+                // Removal is correctness-sensitive for a running local worker.
+                // Discarding one pending upsert is safe because durable
+                // assignment rediscovery will offer it again.
+                let evicted = state.pending.iter().find_map(|(key, value)| {
+                    matches!(value, CatalogChange::Upsert(_)).then_some(*key)
+                });
+                if let Some(evicted) = evicted {
+                    state.pending.remove(&evicted);
+                }
+            }
+            if state.pending.len() >= state.capacity {
+                return Err(Status::resource_exhausted(
+                    "assigned index handoff is at its bounded capacity",
+                ));
+            }
+        }
+        state.pending.insert(identity, change);
+        drop(state);
+        let _ = self.changes.send(identity);
+        Ok(())
+    }
+
+    pub(crate) fn take(
+        &self,
+        identity: CatalogIdentity,
+        admit_upsert: bool,
+    ) -> Result<Option<CatalogChange>, Status> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| Status::internal("assigned index handoff lock is poisoned"))?;
+        if state
+            .pending
+            .get(&identity)
+            .is_some_and(|change| matches!(change, CatalogChange::Upsert(_)) && !admit_upsert)
+        {
+            return Ok(None);
+        }
+        Ok(state.pending.remove(&identity))
+    }
+
+    pub(crate) fn take_page(
+        &self,
+        limit: usize,
+        mut admit_upsert: impl FnMut(CatalogIdentity) -> bool,
+    ) -> Result<Vec<CatalogChange>, Status> {
+        if limit == 0 {
             return Err(Status::invalid_argument(
-                "index definition scan identity and limit must be non-zero",
+                "assigned index handoff page must be positive",
             ));
         }
-        let catalog = self
+        let mut state = self
             .inner
-            .read()
-            .map_err(|_| Status::internal("index definition cache lock is poisoned"))?;
-        let mut selected = catalog
-            .range(
-                CatalogKey {
-                    tenant_id: request.tenant_id,
-                    bucket_id: request.bucket_id,
-                    name: String::new(),
-                }..,
-            )
-            .take_while(|(key, _)| {
-                key.tenant_id == request.tenant_id && key.bucket_id == request.bucket_id
+            .lock()
+            .map_err(|_| Status::internal("assigned index handoff lock is poisoned"))?;
+        let identities = state
+            .pending
+            .iter()
+            .filter_map(|(identity, change)| match change {
+                CatalogChange::Remove(_) => Some(*identity),
+                CatalogChange::Upsert(_) if admit_upsert(*identity) => Some(*identity),
+                CatalogChange::Upsert(_) => None,
             })
-            .filter(|(key, value)| {
-                value.stored.tenant == request.tenant
-                    && value.stored.bucket == request.bucket
-                    && request
-                        .start_after_name
-                        .as_ref()
-                        .is_none_or(|after| key.name > *after)
-            })
-            .take(request.limit.saturating_add(1))
-            .map(|(key, value)| ListedIndexDefinition {
-                name: key.name.clone(),
-                version: value.object_version,
-                bytes: value.encoded.clone(),
-            })
+            .take(limit)
             .collect::<Vec<_>>();
-        let has_more = selected.len() > request.limit;
-        selected.truncate(request.limit);
-        Ok(IndexDefinitionScanPage {
-            definitions: selected,
-            has_more,
-        })
+        Ok(identities
+            .into_iter()
+            .filter_map(|identity| state.pending.remove(&identity))
+            .collect())
+    }
+
+    pub(crate) fn subscribe(&self) -> tokio::sync::broadcast::Receiver<CatalogIdentity> {
+        self.changes.subscribe()
+    }
+
+    #[cfg(test)]
+    fn pending_len(&self) -> Result<usize, Status> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| Status::internal("assigned index handoff lock is poisoned"))?
+            .pending
+            .len())
     }
 }
 
@@ -198,100 +219,72 @@ mod tests {
 
     use super::*;
 
-    fn definition(name: &str, version: u64) -> CatalogDefinition {
-        let stored = StoredIndexDefinition::create(
-            "tenant".into(),
-            CreateIndexRequest {
-                bucket: "bucket".into(),
-                name: name.into(),
-                path_prefix: String::new(),
-                content_type: String::new(),
-                specification: Some(IndexSpecification {
-                    specification: Some(anvil_api::v1::index_specification::Specification::Path(
-                        PathIndexSpec {},
-                    )),
-                }),
-                command_id: format!("create-{name}"),
-            },
-            version + 100,
-        )
-        .unwrap();
+    fn definition(tenant_id: u64, bucket_id: u64, index_id: u64) -> CatalogDefinition {
         CatalogDefinition {
-            tenant_id: 1,
-            bucket_id: 2,
-            object_version: version,
-            encoded: stored.encode().unwrap(),
-            stored,
-        }
-    }
-
-    #[tokio::test]
-    async fn listing_is_sorted_unbounded_across_pages() {
-        let catalog = IndexCatalog::default();
-        catalog
-            .replace(vec![
-                definition("c", 3),
-                definition("a", 1),
-                definition("b", 2),
-            ])
-            .unwrap();
-        let page = catalog
-            .scan(IndexDefinitionScan {
-                tenant: "tenant".into(),
-                bucket: "bucket".into(),
-                tenant_id: 1,
-                bucket_id: 2,
-                start_after_name: Some("a".into()),
-                limit: 1,
-            })
-            .await
-            .unwrap();
-        assert_eq!(page.definitions[0].name, "b");
-        assert!(page.has_more);
-    }
-
-    #[tokio::test]
-    async fn listing_has_a_page_limit_but_no_total_result_ceiling() {
-        const TOTAL: usize = 1_205;
-        let catalog = IndexCatalog::default();
-        catalog
-            .replace(
-                (0..TOTAL)
-                    .map(|index| definition(&format!("index-{index:04}"), index as u64 + 1))
-                    .collect(),
-            )
-            .unwrap();
-
-        let mut after = None;
-        let mut names = Vec::new();
-        loop {
-            let page = catalog
-                .scan(IndexDefinitionScan {
-                    tenant: "tenant".into(),
+            tenant_id,
+            bucket_id,
+            object_version: 1,
+            stored: StoredIndexDefinition::create(
+                "tenant".into(),
+                CreateIndexRequest {
                     bucket: "bucket".into(),
-                    tenant_id: 1,
-                    bucket_id: 2,
-                    start_after_name: after.clone(),
-                    limit: 137,
-                })
-                .await
-                .unwrap();
-            names.extend(
-                page.definitions
-                    .iter()
-                    .map(|definition| definition.name.clone()),
-            );
-            if !page.has_more {
-                break;
-            }
-            after = page
-                .definitions
-                .last()
-                .map(|definition| definition.name.clone());
+                    name: format!("index-{index_id}"),
+                    path_prefix: String::new(),
+                    content_type: String::new(),
+                    specification: Some(IndexSpecification {
+                        specification: Some(
+                            anvil_api::v1::index_specification::Specification::Path(
+                                PathIndexSpec {},
+                            ),
+                        ),
+                    }),
+                    command_id: format!("create-{index_id}"),
+                },
+                index_id,
+            )
+            .unwrap(),
         }
+    }
 
-        assert_eq!(names.len(), TOTAL);
-        assert_eq!(names.first().unwrap(), "index-0000");
-        assert_eq!(names.last().unwrap(), "index-1204");
+    #[test]
+    fn changes_are_coalesced_and_consumed() {
+        let catalog = IndexCatalog::with_capacity(2);
+        let first = definition(1, 2, 9);
+        let mut replacement = first.clone();
+        replacement.object_version = 2;
+        catalog.upsert(first).unwrap();
+        catalog.upsert(replacement.clone()).unwrap();
+        assert_eq!(catalog.pending_len().unwrap(), 1);
+        let change = catalog.take(replacement.identity(), true).unwrap().unwrap();
+        assert!(matches!(change, CatalogChange::Upsert(value) if value.object_version == 2));
+        assert_eq!(catalog.pending_len().unwrap(), 0);
+    }
+
+    #[test]
+    fn bounded_queue_rejects_extra_upserts_but_prioritizes_removal() {
+        let catalog = IndexCatalog::with_capacity(1);
+        let first = definition(1, 2, 9);
+        let second = definition(3, 4, 10);
+        catalog.upsert(first.clone()).unwrap();
+        assert_eq!(
+            catalog.upsert(second).unwrap_err().code(),
+            tonic::Code::ResourceExhausted
+        );
+        catalog
+            .remove(first.tenant_id, first.bucket_id, first.stored.index_id)
+            .unwrap();
+        assert!(matches!(
+            catalog.take(first.identity(), true).unwrap(),
+            Some(CatalogChange::Remove(_))
+        ));
+    }
+
+    #[test]
+    fn upserts_remain_pending_while_builder_leases_are_full() {
+        let catalog = IndexCatalog::with_capacity(1);
+        catalog.upsert(definition(1, 2, 9)).unwrap();
+        assert!(catalog.take_page(1, |_| false).unwrap().is_empty());
+        assert_eq!(catalog.pending_len().unwrap(), 1);
+        assert_eq!(catalog.take_page(1, |_| true).unwrap().len(), 1);
     }
 }
