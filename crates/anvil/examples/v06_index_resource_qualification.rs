@@ -66,6 +66,7 @@ struct Config {
     resource_containers: Vec<String>,
     require_resource_targets: bool,
     configured_kind_budget_bytes: Option<u64>,
+    configured_compaction_max_lanes: Option<usize>,
     configured_rayon_workers: Option<usize>,
     max_anonymous_growth_bytes: Option<u64>,
     output: Option<PathBuf>,
@@ -94,6 +95,7 @@ struct QualificationReport {
     deleted_objects: u64,
     final_live_objects: u64,
     configured_kind_budget_bytes: Option<u64>,
+    configured_compaction_max_lanes: Option<usize>,
     configured_rayon_workers: Option<usize>,
     max_anonymous_growth_bytes: Option<u64>,
     observed_peak_rss_growth_bytes: Option<u64>,
@@ -121,14 +123,7 @@ enum MutationMode {
 async fn main() -> Result<()> {
     let config = Config::from_env()?;
     let channels = connect_all(&config.endpoints).await?;
-    let token = exchange_client_credentials(
-        channels[0].clone(),
-        config.client_id.clone(),
-        config.client_secret.clone(),
-    )
-    .await
-    .context("credential exchange failed")?
-    .access_token;
+    let mut token = qualification_token(&config, channels[0].clone()).await?;
 
     let mut admin = administration_client(channels[0].clone(), &token)?;
     admin
@@ -164,7 +159,14 @@ async fn main() -> Result<()> {
         .into_inner();
     ensure!(definition.index_id != 0 && definition.version != 0);
 
+    // Every independently bounded polling loop gets a fresh one-hour token.
+    // A slow-but-valid loop can consume its full 30-minute allowance, so
+    // sharing one token between two loops would recreate an accidental
+    // one-hour qualification deadline.
+    token = qualification_token(&config, channels[0].clone()).await?;
+    index = index_client(channels[0].clone(), &token)?;
     let baseline = wait_for_generation(&mut index, &config.bucket, 0, None).await?;
+    token = qualification_token(&config, channels[0].clone()).await?;
     let monitor = ResourceMonitor::start(
         &config.resource_pids,
         &config.resource_containers,
@@ -197,6 +199,12 @@ async fn main() -> Result<()> {
     }
     ensure!(initial_versions.iter().all(|version| *version != 0));
 
+    // A production-sized ingest can consume a substantial part of the
+    // one-hour access-token lifetime. Start the independently bounded build
+    // qualification with fresh credentials so authentication cannot become
+    // its accidental wall-clock limit.
+    token = qualification_token(&config, channels[0].clone()).await?;
+    index = index_client(channels[0].clone(), &token)?;
     set_phase(&monitor, Phase::InitialBuild);
     let started = Instant::now();
     let initial_response = wait_for_generation(
@@ -221,6 +229,8 @@ async fn main() -> Result<()> {
     timings.warm_query_milliseconds = started.elapsed().as_secs_f64() * 1_000.0;
     ensure!(hits_by_path(&cold)? == hits_by_path(&warm)?);
 
+    token = qualification_token(&config, channels[0].clone()).await?;
+    index = index_client(channels[0].clone(), &token)?;
     let started = Instant::now();
     let (initial_count, initial_generation) = verify_every_partition(
         &mut index,
@@ -234,6 +244,10 @@ async fn main() -> Result<()> {
     timings.exact_verification_seconds = started.elapsed().as_secs_f64();
     ensure!(initial_count == config.records);
     ensure!(initial_generation >= initial_ready_generation);
+
+    // Mutation receives its own fresh access token. The independently bounded
+    // incremental polling and verification loops renew again below.
+    token = qualification_token(&config, channels[0].clone()).await?;
 
     let mutation_count = config.mutation_count.min(config.records / 2);
     let update_start = config.records.saturating_sub(mutation_count);
@@ -268,11 +282,15 @@ async fn main() -> Result<()> {
     let expected_updates = updates.receipts.into_iter().collect::<BTreeMap<_, _>>();
     let deleted = (delete_start..delete_end).collect::<BTreeSet<_>>();
 
+    token = qualification_token(&config, channels[0].clone()).await?;
+    index = index_client(channels[0].clone(), &token)?;
     set_phase(&monitor, Phase::IncrementalBuild);
     let started = Instant::now();
     let final_live = config.records - deleted.len() as u64;
     let _final_ready =
         wait_for_generation(&mut index, &config.bucket, initial_generation, None).await?;
+    token = qualification_token(&config, channels[0].clone()).await?;
+    index = index_client(channels[0].clone(), &token)?;
     let (final_count, final_generation) = verify_every_partition(
         &mut index,
         &config.bucket,
@@ -328,6 +346,7 @@ async fn main() -> Result<()> {
         deleted_objects: deleted.len() as u64,
         final_live_objects: final_live,
         configured_kind_budget_bytes: config.configured_kind_budget_bytes,
+        configured_compaction_max_lanes: config.configured_compaction_max_lanes,
         configured_rayon_workers: config.configured_rayon_workers,
         max_anonymous_growth_bytes: config.max_anonymous_growth_bytes,
         observed_peak_rss_growth_bytes,
@@ -368,8 +387,14 @@ impl Config {
         let resource_containers = optional_list("ANVIL_V06_RESOURCE_CONTAINERS");
         let require_resource_targets = boolean("ANVIL_V06_REQUIRE_RESOURCE_TARGETS", true)?;
         let configured_kind_budget_bytes = optional_number("ANVIL_V06_KIND_BUDGET_BYTES")?;
+        let configured_compaction_max_lanes =
+            optional_number("ANVIL_V06_INDEX_COMPACTION_MAX_LANES")?;
         let configured_rayon_workers = optional_number("ANVIL_V06_INDEX_RAYON_WORKERS")?;
         let max_anonymous_growth_bytes = optional_number("ANVIL_V06_MAX_ANONYMOUS_GROWTH_BYTES")?;
+        ensure!(
+            configured_compaction_max_lanes.is_none_or(|lanes| lanes > 0),
+            "ANVIL_V06_INDEX_COMPACTION_MAX_LANES must be non-zero when configured"
+        );
         if require_resource_targets {
             ensure!(
                 !resource_pids.is_empty() || !resource_containers.is_empty(),
@@ -403,6 +428,7 @@ impl Config {
             resource_containers,
             require_resource_targets,
             configured_kind_budget_bytes,
+            configured_compaction_max_lanes,
             configured_rayon_workers,
             max_anonymous_growth_bytes,
             output: env::var_os("ANVIL_V06_RESOURCE_OUTPUT").map(PathBuf::from),
@@ -420,6 +446,17 @@ async fn connect_all(endpoints: &[String]) -> Result<Vec<Channel>> {
         );
     }
     Ok(channels)
+}
+
+async fn qualification_token(config: &Config, channel: Channel) -> Result<String> {
+    exchange_client_credentials(
+        channel,
+        config.client_id.clone(),
+        config.client_secret.clone(),
+    )
+    .await
+    .context("credential exchange failed")
+    .map(|response| response.access_token)
 }
 
 fn index_client(channel: Channel, token: &str) -> Result<IndexClient> {

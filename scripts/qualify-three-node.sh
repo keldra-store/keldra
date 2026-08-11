@@ -6,10 +6,11 @@ compose_file="${repo_root}/tests/cluster/docker-compose.yml"
 start_node="${repo_root}/tests/cluster/start-node.sh"
 requested_image="${ANVIL_IMAGE:-anvil:0.7.0}"
 qualification_mode="${ANVIL_QUALIFICATION_MODE:-smoke}"
-index_disk_cache_bytes="${ANVIL_QUALIFICATION_INDEX_DISK_CACHE_BYTES:-268435456}"
-index_memory_percent="${ANVIL_QUALIFICATION_INDEX_MEMORY_PERCENT:-5}"
-index_kind_budget_bytes="${ANVIL_QUALIFICATION_INDEX_KIND_BUDGET_BYTES:-67108864}"
-index_rayon_workers="${ANVIL_QUALIFICATION_INDEX_RAYON_WORKERS:-2}"
+index_disk_cache_bytes="${ANVIL_QUALIFICATION_INDEX_DISK_CACHE_BYTES:-1073741824}"
+index_memory_percent="${ANVIL_QUALIFICATION_INDEX_MEMORY_PERCENT:-20}"
+index_kind_budget_bytes="${ANVIL_QUALIFICATION_INDEX_KIND_BUDGET_BYTES:-268435456}"
+index_compaction_max_lanes="${ANVIL_QUALIFICATION_INDEX_COMPACTION_MAX_LANES:-4}"
+index_rayon_workers="${ANVIL_QUALIFICATION_INDEX_RAYON_WORKERS:-4}"
 # The default is a fast smoke. Set this to 839980 for the full
 # production-shaped, twelve-field corpus used by the resource qualification.
 case "${qualification_mode}" in
@@ -21,13 +22,14 @@ case "${qualification_mode}" in
     ;;
 esac
 index_resource_mutations="${ANVIL_QUALIFICATION_INDEX_MUTATIONS:-512}"
-index_resource_max_anonymous_growth_bytes="${ANVIL_QUALIFICATION_INDEX_MAX_ANONYMOUS_GROWTH_BYTES:-1073741824}"
+index_resource_max_anonymous_growth_bytes="${ANVIL_QUALIFICATION_INDEX_MAX_ANONYMOUS_GROWTH_BYTES:-2147483648}"
 index_kinds=(Path MetadataFilter TypedJson FullText Vector Hybrid GitSource Tensor)
 
 for configured_limit in \
   "${index_disk_cache_bytes}" \
   "${index_memory_percent}" \
   "${index_kind_budget_bytes}" \
+  "${index_compaction_max_lanes}" \
   "${index_rayon_workers}" \
   "${index_resource_records}" \
   "${index_resource_mutations}" \
@@ -55,8 +57,9 @@ fi
 export ANVIL_QUALIFICATION_INDEX_DISK_CACHE_BYTES="${index_disk_cache_bytes}"
 export ANVIL_QUALIFICATION_INDEX_MEMORY_PERCENT="${index_memory_percent}"
 export ANVIL_QUALIFICATION_INDEX_KIND_BUDGET_BYTES="${index_kind_budget_bytes}"
+export ANVIL_QUALIFICATION_INDEX_COMPACTION_MAX_LANES="${index_compaction_max_lanes}"
 export ANVIL_QUALIFICATION_INDEX_RAYON_WORKERS="${index_rayon_workers}"
-export ANVIL_QUALIFICATION_RUST_LOG=info,anvil::index_runtime::retention=debug
+export ANVIL_QUALIFICATION_RUST_LOG=info,anvil::index_runtime::retention=debug,anvil::observability::runtime=debug
 
 case "${ANVIL_DOCKER_PLATFORM:-}" in
   "")
@@ -550,29 +553,30 @@ assert_index_resource_bounds() {
   local kind
   local line
   local observed=0
-  local peak
+  local leased
+  local peak_leased
   local resource_node
-  local used
   while IFS= read -r line; do
     if [[ "${line}" =~ index\.kind=(Path|MetadataFilter|TypedJson|FullText|Vector|Hybrid|GitSource|Tensor) ]]; then
       kind="${BASH_REMATCH[1]}"
     else
       continue
     fi
-    if [[ "${line}" =~ gauge\.anvil_index_construction_configured_bytes=([0-9]+).*gauge\.anvil_index_construction_used_bytes=([0-9]+).*gauge\.anvil_index_construction_peak_bytes=([0-9]+) ]]; then
-      configured="${BASH_REMATCH[1]}"
-      used="${BASH_REMATCH[2]}"
-      peak="${BASH_REMATCH[3]}"
-      if ((configured != index_kind_budget_bytes \
-        || used > configured \
-        || peak > configured)); then
-        echo "distributed index construction exceeded or misstated its configured kind budget" >&2
-        printf '%s\n' "${line}" >&2
-        return 1
-      fi
-      observed_kinds["${kind}"]=1
-      observed=$((observed + 1))
+    configured="$(log_unsigned_field gauge.anvil_index_construction_configured_bytes "${line}")" \
+      || continue
+    leased="$(log_unsigned_field gauge.anvil_index_construction_leased_bytes "${line}")" \
+      || return 1
+    peak_leased="$(log_unsigned_field gauge.anvil_index_construction_peak_leased_bytes "${line}")" \
+      || return 1
+    if ((configured != index_kind_budget_bytes \
+      || leased > configured \
+      || peak_leased > configured)); then
+      echo "distributed index construction exceeded or misstated its configured kind budget" >&2
+      printf '%s\n' "${line}" >&2
+      return 1
     fi
+    observed_kinds["${kind}"]=1
+    observed=$((observed + 1))
   done < <(
     for resource_node in anvil-1 anvil-2 anvil-3; do
       grep -F 'index construction budget state' \
@@ -590,24 +594,56 @@ assert_index_resource_bounds() {
     fi
   done
 
+  local -A resident_kinds=()
+  local resident
+  local workspace
+  while IFS= read -r line; do
+    [[ "${line}" =~ index\.kind=(Path|MetadataFilter|TypedJson|FullText|Vector|Hybrid|GitSource|Tensor) ]] \
+      || continue
+    kind="${BASH_REMATCH[1]}"
+    resident="$(log_unsigned_field gauge.anvil_index_construction_resident_bytes "${line}")" \
+      || return 1
+    workspace="$(log_unsigned_field gauge.anvil_index_construction_workspace_bytes "${line}")" \
+      || return 1
+    if ((resident == 0 || resident + workspace > index_kind_budget_bytes)); then
+      echo "${kind} emitted out-of-budget distributed construction residency/workspace evidence" >&2
+      printf '%s\n' "${line}" >&2
+      return 1
+    fi
+    resident_kinds["${kind}"]=1
+  done < <(
+    for resource_node in anvil-1 anvil-2 anvil-3; do
+      grep -F 'index L0 run flushed' \
+        "${ANVIL_QUALIFICATION_DIR}/artifacts/index-${resource_node}.log" || true
+    done
+  )
+  for kind in "${index_kinds[@]}"; do
+    if [[ -z "${resident_kinds[${kind}]:-}" ]]; then
+      echo "distributed qualification emitted no ${kind} construction residency/workspace evidence" >&2
+      return 1
+    fi
+  done
+
   local resource_budget_evidence=0
   while IFS= read -r line; do
     if [[ "${line}" != *"index.kind=TypedJson"* \
       || "${line}" != *"index construction budget state"* ]]; then
       continue
     fi
-    if [[ ! "${line}" =~ gauge\.anvil_index_construction_configured_bytes=([0-9]+).*gauge\.anvil_index_construction_used_bytes=([0-9]+).*gauge\.anvil_index_construction_peak_bytes=([0-9]+) ]]; then
+    configured="$(log_unsigned_field gauge.anvil_index_construction_configured_bytes "${line}")" \
+      || {
       echo "distributed production-shaped TypedJson build emitted malformed budget evidence" >&2
       printf '%s\n' "${line}" >&2
       return 1
-    fi
-    configured="${BASH_REMATCH[1]}"
-    used="${BASH_REMATCH[2]}"
-    peak="${BASH_REMATCH[3]}"
+    }
+    leased="$(log_unsigned_field gauge.anvil_index_construction_leased_bytes "${line}")" \
+      || return 1
+    peak_leased="$(log_unsigned_field gauge.anvil_index_construction_peak_leased_bytes "${line}")" \
+      || return 1
     if ((configured != index_kind_budget_bytes \
-      || used > configured \
-      || peak == 0 \
-      || peak > configured)); then
+      || leased > configured \
+      || peak_leased == 0 \
+      || peak_leased > configured)); then
       echo "distributed production-shaped TypedJson build exceeded or misstated its configured kind budget" >&2
       printf '%s\n' "${line}" >&2
       return 1
@@ -620,6 +656,30 @@ assert_index_resource_bounds() {
   )
   if ((resource_budget_evidence == 0)); then
     echo "distributed production-shaped TypedJson build emitted no fresh construction-budget evidence" >&2
+    return 1
+  fi
+
+  local resource_residency_evidence=0
+  while IFS= read -r line; do
+    [[ "${line}" == *"index.kind=TypedJson"* ]] || continue
+    resident="$(log_unsigned_field gauge.anvil_index_construction_resident_bytes "${line}")" \
+      || return 1
+    workspace="$(log_unsigned_field gauge.anvil_index_construction_workspace_bytes "${line}")" \
+      || return 1
+    if ((resident == 0 || resident + workspace > index_kind_budget_bytes)); then
+      echo "distributed production-shaped TypedJson build exceeded its residency/workspace budget" >&2
+      printf '%s\n' "${line}" >&2
+      return 1
+    fi
+    resource_residency_evidence=$((resource_residency_evidence + 1))
+  done < <(
+    for resource_node in anvil-1 anvil-2 anvil-3; do
+      grep -F 'index L0 run flushed' \
+        "${ANVIL_QUALIFICATION_DIR}/artifacts/index-resource-${resource_node}.log" || true
+    done
+  )
+  if ((resource_residency_evidence == 0)); then
+    echo "distributed production-shaped TypedJson build emitted no fresh residency/workspace evidence" >&2
     return 1
   fi
 
@@ -654,6 +714,72 @@ save_index_qualification_logs() {
     service_logs "${node}" | tail -n "+${start_line}" \
       >"${ANVIL_QUALIFICATION_DIR}/artifacts/index-${node}.log"
   done
+}
+
+assert_compaction_telemetry_for_kind() {
+  local kind="$1"
+  local log="$2"
+  local budget_limit
+  local completed
+  local configured
+  local effective
+  local expected
+  local line
+  local observed=0
+  local range_limit
+  local ranges
+  local worker_limit
+  while IFS= read -r line; do
+    configured="$(log_unsigned_field gauge.anvil_index_compaction_configured_lanes "${line}")" \
+      || continue
+    worker_limit="$(log_unsigned_field gauge.anvil_index_compaction_worker_limit "${line}")" \
+      || return 1
+    budget_limit="$(log_unsigned_field gauge.anvil_index_compaction_budget_limit "${line}")" \
+      || return 1
+    effective="$(log_unsigned_field gauge.anvil_index_compaction_effective_lanes "${line}")" \
+      || return 1
+    range_limit="$(log_unsigned_field gauge.anvil_index_compaction_range_limit "${line}")" \
+      || return 1
+    ranges="$(log_unsigned_field gauge.anvil_index_compaction_ranges_total "${line}")" \
+      || return 1
+    completed="$(log_unsigned_field gauge.anvil_index_compaction_ranges_completed "${line}")" \
+      || return 1
+    expected="${index_compaction_max_lanes}"
+    ((worker_limit < expected)) && expected="${worker_limit}"
+    ((budget_limit < expected)) && expected="${budget_limit}"
+    ((range_limit < expected)) && expected="${range_limit}"
+    if ((configured != index_compaction_max_lanes \
+      || worker_limit != index_rayon_workers \
+      || budget_limit < 1 \
+      || range_limit < 1 \
+      || ranges < 1 \
+      || effective != expected \
+      || completed != ranges)) \
+      || [[ "${line}" != *"anvil.index.compaction"* ]]
+    then
+      echo "${kind} emitted inconsistent bounded distributed compaction telemetry" >&2
+      printf '%s\n' "${line}" >&2
+      return 1
+    fi
+    observed=$((observed + 1))
+  done < <(
+    awk -v kind="index.kind=${kind}" '
+      index($0, kind) && index($0, "index compaction terminal metrics")
+    ' "${log}"
+  )
+  if ((observed == 0)); then
+    echo "${kind} emitted no terminal range-compaction metrics and trace context" >&2
+    return 1
+  fi
+  if ! awk -v kind="index.kind=${kind}" '
+      index($0, kind) && index($0, "anvil.index.builder") &&
+      index($0, "index builder phase finished") { found = 1 }
+      END { exit !found }
+    ' "${log}"
+  then
+    echo "${kind} emitted no distributed builder trace and completion log" >&2
+    return 1
+  fi
 }
 
 assert_one_builder_published_and_compacted_each_index_kind() {
@@ -698,8 +824,10 @@ assert_one_builder_published_and_compacted_each_index_kind() {
       echo "${kind} publication and compaction ran on different builders" >&2
       return 1
     fi
+    assert_compaction_telemetry_for_kind \
+      "${kind}" "${ANVIL_QUALIFICATION_DIR}/artifacts/index-${compactor_node}.log"
   done
-  echo "[anvil-qualification] all eight kinds consumed all three ingress journals and compacted on their sole builder"
+  echo "[anvil-qualification] all eight kinds consumed all three ingress journals and emitted bounded range-compaction metrics with trace-backed completion logs on their sole builder"
 }
 
 verify_existing_indexes() {
