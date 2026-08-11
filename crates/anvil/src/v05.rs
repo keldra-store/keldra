@@ -66,6 +66,7 @@ mod gateway;
 mod mutation_failures;
 mod read_identity;
 mod routed_writes;
+mod upload;
 
 #[cfg(test)]
 use mutation_failures::api_failure;
@@ -235,132 +236,21 @@ type WatchPrefixStream = distributed_watch_stream::ClusterWatchStream;
 #[tonic::async_trait]
 impl ObjectService for ObjectServiceImpl {
     async fn start_put(&self, request: Request<PutHeader>) -> Result<Response<PutToken>, Status> {
-        let caller = authenticated_caller(&request)?;
-        let path_access = object_path_access::access_for(&request);
-        let metadata = put_metadata(request.into_inner())?;
-        object_path_access::require_key(&path_access, &metadata.key)?;
-        self.authorize_object(&caller, &metadata.key, ObjectPermission::Put)
-            .await?;
-        self.issue_upload_token(&caller, &metadata)
-            .map(Response::new)
+        upload::start_put(self, request).await
     }
 
     async fn put(
         &self,
         request: Request<Streaming<ApiPutRequest>>,
     ) -> Result<Response<PutToken>, Status> {
-        let caller = authenticated_caller(&request)?;
-        let path_access = object_path_access::access_for(&request);
-        let mut stream = request.into_inner();
-        let first = tokio::time::timeout(PUT_TOKEN_LIFETIME, stream.message())
-            .await
-            .map_err(|_| Status::deadline_exceeded("put stream inactivity lease expired"))??
-            .ok_or_else(|| Status::invalid_argument("put stream is empty"))?;
-        let token = required_put_token(first.token)?;
-        let capability = self.verify_put_token(&caller, &token)?;
-        let header = require_upload_phase(capability)?;
-        let metadata = header.to_metadata()?;
-        object_path_access::require_key(&path_access, &metadata.key)?;
-        self.authorize_object(&caller, &metadata.key, ObjectPermission::Put)
-            .await?;
-
-        let mut upload = self.store.begin_blob_upload().await.map_err(status)?;
-        let mut length = 0_u64;
-        write_upload_chunk(&mut upload, &mut length, &first.chunk, self.max_blob_bytes).await?;
-        loop {
-            let frame = tokio::time::timeout(PUT_TOKEN_LIFETIME, stream.message())
-                .await
-                .map_err(|_| Status::deadline_exceeded("put stream inactivity lease expired"))??;
-            let Some(frame) = frame else {
-                break;
-            };
-            let frame_token = required_put_token(frame.token)?;
-            if frame_token != token {
-                return Err(Status::invalid_argument(
-                    "put stream contains a missing or different upload token",
-                ));
-            }
-            write_upload_chunk(&mut upload, &mut length, &frame.chunk, self.max_blob_bytes).await?;
-        }
-        let blob = self.store.seal_blob_upload(upload).await.map_err(status)?;
-        if !object_path_access::is_internal(&path_access) {
-            self.record_accounting_inbound(&metadata.key, length);
-        }
-        self.issue_ready_token(&caller, header, &blob)
-            .map(Response::new)
+        upload::put(self, request).await
     }
 
     async fn put_end(
         &self,
         request: Request<PutToken>,
     ) -> Result<Response<ApiMutationReceipt>, Status> {
-        let peer_routed = request
-            .extensions()
-            .get::<routed_writes::RoutedDestination>()
-            .is_some();
-        let caller = authenticated_caller(&request)?;
-        let path_access = object_path_access::access_for(&request);
-        let bearer = OriginalBearer::from_metadata(request.metadata())?;
-        let remaining =
-            effective_atomic_program_timeout(request.metadata(), self.atomic_program_timeout);
-        let token = required_put_token(Some(request.into_inner()))?;
-        let capability = self.verify_put_token(&caller, &token)?;
-        let ready = require_ready_phase(capability)?;
-        let metadata = ready.header.to_metadata()?;
-        object_path_access::require_key(&path_access, &metadata.key)?;
-        self.authorize_object(&caller, &metadata.key, ObjectPermission::Put)
-            .await?;
-        let publish = PublishRequest {
-            key: metadata.key,
-            blob: BlobRef {
-                hash: ready.blob_hash,
-                length: ready.blob_length,
-            },
-            content_type: metadata.content_type,
-            mode: metadata.mode,
-            command_id: Some(metadata.command_id),
-            durability: metadata.durability,
-        };
-        let receipt = match self.distribution.routing_target(&publish.key)? {
-            Some(_) if peer_routed => {
-                return Err(Status::failed_precondition(
-                    "a routed PutEnd reached a node that is not its coordinator",
-                ));
-            }
-            Some((target, address)) => {
-                if object_path_access::is_internal(&path_access) {
-                    self.cluster_peers
-                        .route_internal_put_end(
-                            target,
-                            &address,
-                            bearer.signed_token(),
-                            token,
-                            remaining,
-                        )
-                        .await?
-                } else {
-                    self.cluster_peers
-                        .route_put_end(target, &address, bearer.signed_token(), token, remaining)
-                        .await?
-                }
-            }
-            None => {
-                let governance = self
-                    .bucket_governance
-                    .resolve(publish.key.tenant(), publish.key.bucket())
-                    .await?;
-                api_receipt(
-                    self.distribution
-                        .publish_from_source_with_governance(
-                            publish,
-                            anvil_consensus::NodeId(ready.upload_source_node_id),
-                            governance,
-                        )
-                        .await?,
-                )
-            }
-        };
-        Ok(Response::new(receipt))
+        upload::put_end(self, request).await
     }
 
     async fn delete(

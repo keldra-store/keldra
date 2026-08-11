@@ -7,7 +7,7 @@ use anvil_atomic_program::{LocalLockManager, ObjectPath};
 use anyhow::{Context, Result};
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamilyDescriptor, DB, DEFAULT_COLUMN_FAMILY_NAME, Direction,
-    IteratorMode, Options, WriteBatch, WriteBufferManager, WriteOptions,
+    IteratorMode, Options, WriteBatch, WriteBufferManager, WriteOptions, properties,
 };
 use serde::{Deserialize, Serialize};
 
@@ -110,6 +110,35 @@ pub(crate) const COLUMN_FAMILIES: &[&str] = &[
 struct MetadataMemoryResources {
     block_cache: Cache,
     write_buffer_manager: WriteBufferManager,
+}
+
+/// Point-in-time resource and backpressure signals from the metadata database.
+///
+/// These values are process-local and observational. They are never persisted
+/// or used to make storage decisions.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MetadataRuntimeMetrics {
+    pub block_cache_capacity_bytes: u64,
+    pub block_cache_usage_bytes: u64,
+    pub block_cache_pinned_bytes: u64,
+    pub write_buffer_capacity_bytes: u64,
+    pub write_buffer_usage_bytes: u64,
+    pub active_memtable_bytes: Option<u64>,
+    pub all_memtable_bytes: Option<u64>,
+    pub table_reader_bytes: Option<u64>,
+    pub pending_compaction_bytes: Option<u64>,
+    pub immutable_memtables: Option<u64>,
+    pub running_compactions: Option<u64>,
+    pub running_flushes: Option<u64>,
+    pub compaction_pending_column_families: Option<u64>,
+    pub flush_pending_column_families: Option<u64>,
+    pub actual_delayed_write_rate_bytes_per_second: Option<u64>,
+    pub write_stopped: Option<u64>,
+    pub background_errors: Option<u64>,
+    pub unavailable_properties: u64,
+    pub property_collection_failures: u64,
+    pub first_unavailable_property: Option<&'static str>,
+    pub first_collection_error: Option<String>,
 }
 
 impl MetadataMemoryResources {
@@ -504,6 +533,147 @@ impl Store {
     /// work files. Callers must not create durable records in this directory.
     pub fn payload_spool_directory(&self) -> &std::path::Path {
         self.blobs.root()
+    }
+
+    /// Read bounded operational signals from RocksDB and its shared metadata
+    /// memory resources.
+    pub fn metadata_runtime_metrics(&self) -> MetadataRuntimeMetrics {
+        let mut metrics = MetadataRuntimeMetrics {
+            block_cache_capacity_bytes: METADATA_BLOCK_CACHE_BYTES as u64,
+            block_cache_usage_bytes: self._metadata_memory.block_cache.get_usage() as u64,
+            block_cache_pinned_bytes: self._metadata_memory.block_cache.get_pinned_usage() as u64,
+            write_buffer_capacity_bytes: self
+                ._metadata_memory
+                .write_buffer_manager
+                .get_buffer_size() as u64,
+            write_buffer_usage_bytes: self._metadata_memory.write_buffer_manager.get_usage() as u64,
+            ..MetadataRuntimeMetrics::default()
+        };
+
+        let value = self.db_property(
+            properties::NUM_RUNNING_COMPACTIONS,
+            "running_compactions",
+            &mut metrics,
+        );
+        metrics.running_compactions = value;
+        let value = self.db_property(
+            properties::NUM_RUNNING_FLUSHES,
+            "running_flushes",
+            &mut metrics,
+        );
+        metrics.running_flushes = value;
+        let value = self.db_property(
+            properties::ACTUAL_DELAYED_WRITE_RATE,
+            "actual_delayed_write_rate_bytes_per_second",
+            &mut metrics,
+        );
+        metrics.actual_delayed_write_rate_bytes_per_second = value;
+        let value = self.db_property(properties::IS_WRITE_STOPPED, "write_stopped", &mut metrics);
+        metrics.write_stopped = value;
+        let value = self.db_property(
+            properties::BACKGROUND_ERRORS,
+            "background_errors",
+            &mut metrics,
+        );
+        metrics.background_errors = value;
+        let value = self.column_family_property_sum(
+            properties::CUR_SIZE_ACTIVE_MEM_TABLE,
+            "active_memtable_bytes",
+            &mut metrics,
+        );
+        metrics.active_memtable_bytes = value;
+        let value = self.column_family_property_sum(
+            properties::CUR_SIZE_ALL_MEM_TABLES,
+            "all_memtable_bytes",
+            &mut metrics,
+        );
+        metrics.all_memtable_bytes = value;
+        let value = self.column_family_property_sum(
+            properties::ESTIMATE_TABLE_READERS_MEM,
+            "table_reader_bytes",
+            &mut metrics,
+        );
+        metrics.table_reader_bytes = value;
+        let value = self.column_family_property_sum(
+            properties::ESTIMATE_PENDING_COMPACTION_BYTES,
+            "pending_compaction_bytes",
+            &mut metrics,
+        );
+        metrics.pending_compaction_bytes = value;
+        let value = self.column_family_property_sum(
+            properties::NUM_IMMUTABLE_MEM_TABLE,
+            "immutable_memtables",
+            &mut metrics,
+        );
+        metrics.immutable_memtables = value;
+        let value = self.column_family_property_sum(
+            properties::COMPACTION_PENDING,
+            "compaction_pending_column_families",
+            &mut metrics,
+        );
+        metrics.compaction_pending_column_families = value;
+        let value = self.column_family_property_sum(
+            properties::MEM_TABLE_FLUSH_PENDING,
+            "flush_pending_column_families",
+            &mut metrics,
+        );
+        metrics.flush_pending_column_families = value;
+        metrics
+    }
+
+    fn db_property(
+        &self,
+        property: &rocksdb::properties::PropName,
+        signal: &'static str,
+        metrics: &mut MetadataRuntimeMetrics,
+    ) -> Option<u64> {
+        match self.db.property_int_value(property) {
+            Ok(Some(value)) => Some(value),
+            Ok(None) => {
+                metrics.note_unavailable(signal);
+                None
+            }
+            Err(error) => {
+                metrics.note_failure(format!("read RocksDB property {signal}: {error}"));
+                None
+            }
+        }
+    }
+
+    fn column_family_property_sum(
+        &self,
+        property: &rocksdb::properties::PropName,
+        signal: &'static str,
+        metrics: &mut MetadataRuntimeMetrics,
+    ) -> Option<u64> {
+        let mut total = 0_u64;
+        for name in
+            std::iter::once(DEFAULT_COLUMN_FAMILY_NAME).chain(COLUMN_FAMILIES.iter().copied())
+        {
+            let Some(column_family) = self.db.cf_handle(name) else {
+                metrics.note_failure(format!("missing metadata column family {name}"));
+                return None;
+            };
+            let value = match self.db.property_int_value_cf(column_family, property) {
+                Ok(Some(value)) => value,
+                Ok(None) => {
+                    metrics.note_unavailable(signal);
+                    return None;
+                }
+                Err(error) => {
+                    metrics.note_failure(format!(
+                        "read RocksDB property {signal} for {name}: {error}"
+                    ));
+                    return None;
+                }
+            };
+            let Some(next) = total.checked_add(value) else {
+                metrics.note_failure(format!("RocksDB metric {signal} overflowed u64"));
+                return None;
+            };
+            total = next;
+        }
+        Some(total)
     }
 
     pub async fn open(options: StoreOptions) -> Result<Self> {
@@ -933,6 +1103,18 @@ impl Store {
         self.db
             .cf_handle(name)
             .ok_or_else(|| MutationError::Storage(format!("missing column family {name}")))
+    }
+}
+
+impl MetadataRuntimeMetrics {
+    fn note_unavailable(&mut self, property: &'static str) {
+        self.unavailable_properties = self.unavailable_properties.saturating_add(1);
+        self.first_unavailable_property.get_or_insert(property);
+    }
+
+    fn note_failure(&mut self, error: String) {
+        self.property_collection_failures = self.property_collection_failures.saturating_add(1);
+        self.first_collection_error.get_or_insert(error);
     }
 }
 

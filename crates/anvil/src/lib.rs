@@ -142,6 +142,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     )
     .await
     .with_context(|| format!("open Anvil data at {}", config.data_dir.display()))?;
+    let _runtime_metrics = observability::RuntimeMetricsTask::start(store.clone());
     let local_node = NodeId(u64::from(config.node_id));
     let (decisions, peer_runtime) = peer_runtime::open(peer_runtime::OpenPeerConfig {
         data_dir: &config.data_dir,

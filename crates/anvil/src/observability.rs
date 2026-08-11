@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use opentelemetry::trace::TracerProvider as _;
-use opentelemetry::{KeyValue, Value};
+use opentelemetry::{Key, KeyValue, Value};
 use opentelemetry_otlp::{Protocol, WithExportConfig};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::metrics::{Instrument, PeriodicReader, SdkMeterProvider, Stream};
@@ -14,6 +14,10 @@ use tracing_subscriber::filter::EnvFilter;
 use tracing_subscriber::layer::{Layer as _, SubscriberExt as _};
 use tracing_subscriber::util::SubscriberInitExt as _;
 
+mod runtime;
+
+pub(crate) use runtime::RuntimeMetricsTask;
+
 const SERVICE_NAME: &str = "anvil";
 const TRACE_QUEUE_SIZE: usize = 2_048;
 const TRACE_EXPORT_BATCH_SIZE: usize = 512;
@@ -21,6 +25,29 @@ const METRIC_CARDINALITY_LIMIT: usize = 128;
 const OTLP_EXPORT_TIMEOUT: Duration = Duration::from_secs(5);
 const OTLP_TRACES_PATH: &str = "/v1/traces";
 const OTLP_METRICS_PATH: &str = "/v1/metrics";
+
+// `tracing-opentelemetry` turns every non-instrument event field into a metric
+// attribute. Keep the accepted set deliberately small and bounded: messages,
+// object/index identities, paths, and errors remain useful on logs and spans,
+// but must never create metric time series.
+const METRIC_ATTRIBUTE_KEYS: &[&str] = &[
+    "index.kind",
+    "index.phase",
+    "index.level",
+    "builder.phase",
+    "recovery.action",
+    "compaction.input_level",
+    "compaction.output_level",
+    "compaction.lane_limit_reason",
+    "surface",
+    "phase",
+    "result",
+    "grpc_status_code",
+    "gateway",
+    "component",
+    "reason",
+    "definition_state.domain",
+];
 
 /// Startup-only observability settings.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -126,12 +153,7 @@ impl TelemetryProviders {
         let meter_provider = SdkMeterProvider::builder()
             .with_resource(resource)
             .with_reader(metric_reader)
-            .with_view(|_: &Instrument| {
-                Stream::builder()
-                    .with_cardinality_limit(METRIC_CARDINALITY_LIMIT)
-                    .build()
-                    .ok()
-            })
+            .with_view(metric_stream)
             .build();
 
         Ok(Self {
@@ -153,6 +175,14 @@ impl TelemetryProviders {
             .context("shut down OpenTelemetry tracer provider");
         metric_result.and(trace_result)
     }
+}
+
+fn metric_stream(_: &Instrument) -> Option<Stream> {
+    Stream::builder()
+        .with_allowed_attribute_keys(METRIC_ATTRIBUTE_KEYS.iter().copied().map(Key::new))
+        .with_cardinality_limit(METRIC_CARDINALITY_LIMIT)
+        .build()
+        .ok()
 }
 
 fn configured_endpoint(endpoint: Option<&str>) -> Option<&str> {
@@ -177,14 +207,93 @@ fn telemetry_resource(node_id: u16) -> Resource {
 mod tests {
     use std::sync::{Arc, Mutex};
 
+    use anvil_index::IndexKind;
+    use anvil_index::compaction::{CompactionParallelism, CompactionProgress};
     use axum::Router;
     use axum::extract::{Request, State};
     use axum::http::StatusCode;
     use opentelemetry::Key;
-    use opentelemetry::metrics::MeterProvider as _;
     use opentelemetry::trace::{Span as _, Tracer as _};
+    use opentelemetry_sdk::error::OTelSdkResult;
+    use opentelemetry_sdk::metrics::Temporality;
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
+    use opentelemetry_sdk::metrics::exporter::PushMetricExporter;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    use crate::index_runtime::telemetry::{
+        BuilderProgress, BuilderProgressPhase, CompactionInputTotals, CompactionTelemetry,
+        IndexTelemetryIdentity,
+    };
 
     use super::*;
+
+    #[derive(Clone, Debug, Default)]
+    struct RecordingMetricExporter {
+        i64_sums: Arc<Mutex<Vec<RecordedI64Sum>>>,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct RecordedI64Sum {
+        name: String,
+        points: Vec<RecordedI64Point>,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct RecordedI64Point {
+        value: i64,
+        attribute_keys: Vec<String>,
+    }
+
+    impl PushMetricExporter for RecordingMetricExporter {
+        fn export(
+            &self,
+            metrics: &ResourceMetrics,
+        ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
+            let recorded = metrics
+                .scope_metrics()
+                .flat_map(|scope| scope.metrics())
+                .filter_map(|metric| {
+                    let AggregatedMetrics::I64(MetricData::Sum(sum)) = metric.data() else {
+                        return None;
+                    };
+                    Some(RecordedI64Sum {
+                        name: metric.name().to_owned(),
+                        points: sum
+                            .data_points()
+                            .map(|point| {
+                                let mut attribute_keys = point
+                                    .attributes()
+                                    .map(|attribute| attribute.key.as_str().to_owned())
+                                    .collect::<Vec<_>>();
+                                attribute_keys.sort();
+                                RecordedI64Point {
+                                    value: point.value(),
+                                    attribute_keys,
+                                }
+                            })
+                            .collect(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let output = self.i64_sums.clone();
+            async move {
+                output.lock().unwrap().extend(recorded);
+                Ok(())
+            }
+        }
+
+        fn force_flush(&self) -> OTelSdkResult {
+            Ok(())
+        }
+
+        fn shutdown_with_timeout(&self, _timeout: Duration) -> OTelSdkResult {
+            Ok(())
+        }
+
+        fn temporality(&self) -> Temporality {
+            Temporality::Cumulative
+        }
+    }
 
     #[test]
     fn absent_or_empty_endpoint_keeps_otlp_disabled() {
@@ -235,6 +344,87 @@ mod tests {
         assert!(OTLP_EXPORT_TIMEOUT > Duration::ZERO);
     }
 
+    #[test]
+    fn metric_attributes_are_bounded_and_compaction_active_cancels() {
+        let exporter = RecordingMetricExporter::default();
+        let metric_reader = PeriodicReader::builder(exporter.clone()).build();
+        let meter_provider = SdkMeterProvider::builder()
+            .with_reader(metric_reader)
+            .with_view(metric_stream)
+            .build();
+        let subscriber =
+            tracing_subscriber::registry().with(MetricsLayer::new(meter_provider.clone()));
+
+        tracing::subscriber::with_default(subscriber, || {
+            let identity = IndexTelemetryIdentity {
+                index_id: 99,
+                tenant_id: 101,
+                bucket_id: 102,
+                kind: IndexKind::TypedJson,
+            };
+            for phase in [BuilderProgressPhase::Rebuild, BuilderProgressPhase::CatchUp] {
+                let progress = BuilderProgress::start(identity, phase);
+                progress.complete();
+            }
+            let telemetry = CompactionTelemetry::start(
+                identity,
+                0,
+                1,
+                CompactionInputTotals {
+                    runs: 2,
+                    records: 10,
+                    bytes: 100,
+                },
+                CompactionParallelism::serial(),
+                1,
+                CompactionProgress::default(),
+            )
+            .unwrap();
+            telemetry.complete();
+
+            tracing::info!(
+                index.kind = "typed_json",
+                index.id = 4_294_967_296_u64,
+                error = "customer-specific failure",
+                counter.anvil_metric_attribute_filter_test = 1_i64,
+                "a human-readable message must not become a metric attribute"
+            );
+        });
+        meter_provider.force_flush().unwrap();
+
+        let recorded = exporter.i64_sums.lock().unwrap();
+        for name in [
+            "anvil_index_rebuild_active",
+            "anvil_index_catch_up_active",
+            "anvil_index_compaction_active",
+        ] {
+            let active = recorded
+                .iter()
+                .rev()
+                .find(|sum| sum.name == name)
+                .unwrap_or_else(|| panic!("{name} metric was exported"));
+            assert_eq!(active.points.len(), 1, "{name}");
+            assert_eq!(active.points[0].value, 0, "{name}");
+            assert_eq!(active.points[0].attribute_keys, ["index.kind"], "{name}");
+        }
+
+        let filtered = recorded
+            .iter()
+            .rev()
+            .find(|sum| sum.name == "anvil_metric_attribute_filter_test")
+            .expect("attribute-filter metric was exported");
+        assert_eq!(filtered.points.len(), 1);
+        assert_eq!(filtered.points[0].attribute_keys, ["index.kind"]);
+        assert!(
+            filtered.points[0]
+                .attribute_keys
+                .iter()
+                .all(|key| key != "message" && key != "index.id" && key != "error")
+        );
+        drop(recorded);
+        meter_provider.shutdown().unwrap();
+    }
+
     #[tokio::test]
     async fn disabled_shutdown_needs_no_provider_or_collector() {
         Observability { providers: None }.shutdown().await.unwrap();
@@ -265,12 +455,13 @@ mod tests {
         let providers = TelemetryProviders::build(&format!("http://{address}/"), 7).unwrap();
         let tracer = providers.tracer_provider.tracer("route-test");
         tracer.start("route-test-span").end();
-        providers
-            .meter_provider
-            .meter("route-test")
-            .u64_counter("route_test_counter")
-            .build()
-            .add(1, &[]);
+        let subscriber = tracing_subscriber::registry()
+            .with(MetricsLayer::new(providers.meter_provider.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            // MetricsLayer intentionally has no level filter even though the
+            // stdout layer normally hides these periodic debug events.
+            tracing::debug!(gauge.route_test_gauge = 1_u64);
+        });
 
         tokio::task::spawn_blocking(move || providers.shutdown())
             .await

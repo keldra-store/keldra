@@ -26,6 +26,20 @@ async fn metadata_column_families_share_bounded_native_memory() {
         8
     );
 
+    let runtime = store.metadata_runtime_metrics();
+    assert_eq!(
+        runtime.block_cache_capacity_bytes,
+        METADATA_BLOCK_CACHE_BYTES as u64
+    );
+    assert_eq!(
+        runtime.write_buffer_capacity_bytes,
+        METADATA_WRITE_BUFFER_MANAGER_BYTES as u64
+    );
+    assert!(runtime.all_memtable_bytes.unwrap() >= runtime.active_memtable_bytes.unwrap());
+    assert!(runtime.write_stopped.unwrap() <= 1);
+    assert_eq!(runtime.unavailable_properties, 0);
+    assert_eq!(runtime.property_collection_failures, 0);
+
     for name in std::iter::once(DEFAULT_COLUMN_FAMILY_NAME).chain(COLUMN_FAMILIES.iter().copied()) {
         let column_family = store.db.cf_handle(name).unwrap();
         let capacity = store
