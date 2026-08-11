@@ -1,27 +1,18 @@
 //! Hybrid full-text and exact-vector runs with one shared document table.
 
-#[path = "hybrid_compaction_cache.rs"]
-mod compaction_cache;
-
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::compaction::{
-    CompactionExecutor, CompactionParallelism, CompactionProgress, LaneResultProducer,
-    collect_ordered_lanes, deterministic_delimited_key_range_plan,
-};
+use crate::compaction::{CompactionExecutor, CompactionParallelism, CompactionProgress};
 use crate::full_text::{
-    Candidate, RunCandidateCursor, TermCursor, TextComponentWriter, TextPosting, TextPostingRow,
-    TextRowCursor, estimate_text_fields, merge_text_component, query_terms, tokenize,
-    validate_fields,
+    Candidate, RunCandidateCursor, TermCursor, TextComponentWriter, TextPosting,
+    estimate_text_fields, merge_text_component, query_terms,
+    rebuild_selected_text_component_parallel, tokenize, validate_fields,
 };
-use crate::run::{
-    ComponentTree, LeafCursor, RunStatistics, RunView, assemble_component_ranges, open_views,
-    seal_run_root,
-};
+use crate::run::{ComponentTree, LeafCursor, RunStatistics, RunView, open_views, seal_run_root};
 use crate::segment::{
     DEFAULT_COMPONENT_BLOCK_BYTES, DocumentComponentWriter, DocumentRecord, DocumentState,
     MutationBuffer, PATH_CHANGES_TAG, PathChange, PathComponentWriter, PathRunCursor,
@@ -35,8 +26,6 @@ use crate::{
     BlockDescriptor, DocumentRef, IndexBlockSink, IndexDirectoryRead, IndexError, IndexKind,
     IndexMutation, SealedRun, SegmentBuildOptions, SegmentPush,
 };
-
-use compaction_cache::HybridCompactionPointCache;
 
 pub(crate) const HYBRID_TEXT_TAG: u8 = 50;
 pub(crate) const HYBRID_VECTOR_TAG: u8 = 51;
@@ -511,10 +500,13 @@ impl HybridEngine {
         )
         .await?;
         let views = open_views(runs, IndexKind::Hybrid).await?;
-        let text_tree = merge_hybrid_text_component_parallel(
+        let text_tree = rebuild_selected_text_component_parallel(
             runs,
             &views,
-            &path_tree,
+            &path_tree.root,
+            IndexKind::Hybrid,
+            HYBRID_TEXT_TAG,
+            statistics.live_document_count,
             output_level,
             target_bytes,
             sink,
@@ -610,252 +602,6 @@ fn collect_postings(
         ordinal = ordinal.checked_add(1).ok_or(IndexError::OffsetOverflow)?;
     }
     Ok(terms)
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn merge_hybrid_text_component_parallel<D, S, E>(
-    runs: &[D],
-    views: &[RunView],
-    output_paths: &ComponentTree,
-    output_level: u8,
-    target_bytes: usize,
-    sink: &mut S,
-    parallelism: CompactionParallelism,
-    progress: CompactionProgress,
-    executor: E,
-) -> Result<Option<ComponentTree>, IndexError>
-where
-    D: IndexDirectoryRead + Clone + 'static,
-    S: IndexBlockSink + IndexDirectoryRead + Clone + 'static,
-    E: CompactionExecutor,
-{
-    let roots = views
-        .iter()
-        .enumerate()
-        .filter_map(|(run_index, view)| {
-            view.component_optional(HYBRID_TEXT_TAG)
-                .cloned()
-                .map(|root| (run_index, root))
-        })
-        .collect::<Vec<_>>();
-    if roots.is_empty() {
-        return Ok(None);
-    }
-    let plan = deterministic_delimited_key_range_plan(
-        roots.iter().map(|(_, root)| root.clone()),
-        0,
-        parallelism.max_lanes(),
-    )?;
-    progress.record_range_limit(plan.range_limit)?;
-    let runs = Arc::new(runs.to_vec());
-    let views = Arc::new(views.to_vec());
-    let roots = Arc::new(roots);
-    let mut producers =
-        Vec::<LaneResultProducer<Option<ComponentTree>>>::with_capacity(plan.ranges.len());
-    for range in plan.ranges {
-        let runs = runs.clone();
-        let views = views.clone();
-        let roots = roots.clone();
-        let lane_executor = executor.clone();
-        let lane_progress = progress.clone();
-        let mut lane_sink = (*sink).clone();
-        let output_path_root = output_paths.root.clone();
-        producers.push(Box::new(move || {
-            Box::pin(async move {
-                write_hybrid_text_range(
-                    runs,
-                    views,
-                    roots,
-                    range,
-                    output_path_root,
-                    output_level,
-                    target_bytes,
-                    &mut lane_sink,
-                    lane_executor,
-                    lane_progress,
-                )
-                .await
-            })
-        }));
-    }
-    let trees = collect_ordered_lanes(&executor, producers, &progress)
-        .await?
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
-    if trees.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(
-        assemble_component_ranges(IndexKind::Hybrid, HYBRID_TEXT_TAG, trees, sink).await?,
-    ))
-}
-
-struct ResolvedHybridTextRow {
-    run_index: usize,
-    document: DocumentRef,
-    row: TextPostingRow,
-}
-
-async fn next_hybrid_text_row<'a, D, E>(
-    run_index: usize,
-    cursor: &mut TextRowCursor<'a, D>,
-    run: &'a D,
-    view: &RunView,
-    cache: &mut HybridCompactionPointCache,
-    executor: &E,
-    progress: &CompactionProgress,
-) -> Result<Option<ResolvedHybridTextRow>, IndexError>
-where
-    D: IndexDirectoryRead,
-    E: CompactionExecutor,
-{
-    let Some(row) = cursor.next_parallel(executor, progress).await? else {
-        return Ok(None);
-    };
-    let document = cache
-        .document(run, view, row.ordinal, executor, progress)
-        .await?;
-    Ok(Some(ResolvedHybridTextRow {
-        run_index,
-        document,
-        row,
-    }))
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn write_hybrid_text_range<D, S, E>(
-    runs: Arc<Vec<D>>,
-    views: Arc<Vec<RunView>>,
-    roots: Arc<Vec<(usize, BlockDescriptor)>>,
-    range: crate::compaction::KeyRange,
-    output_path_root: BlockDescriptor,
-    output_level: u8,
-    target_bytes: usize,
-    sink: &mut S,
-    executor: E,
-    progress: CompactionProgress,
-) -> Result<Option<ComponentTree>, IndexError>
-where
-    D: IndexDirectoryRead,
-    S: IndexBlockSink + IndexDirectoryRead,
-    E: CompactionExecutor,
-{
-    let mut point_cache = HybridCompactionPointCache::default();
-    let mut writer = TextComponentWriter::new(
-        IndexKind::Hybrid,
-        HYBRID_TEXT_TAG,
-        output_level,
-        target_bytes,
-    );
-    let mut wrote = false;
-    let mut cursors = roots
-        .iter()
-        .map(|(run_index, root)| {
-            (
-                *run_index,
-                TextRowCursor::in_range(&runs[*run_index], root.clone(), range.clone()),
-            )
-        })
-        .collect::<Vec<_>>();
-    let mut current = Vec::with_capacity(cursors.len());
-    for (run_index, cursor) in &mut cursors {
-        current.push(
-            next_hybrid_text_row(
-                *run_index,
-                cursor,
-                &runs[*run_index],
-                &views[*run_index],
-                &mut point_cache,
-                &executor,
-                &progress,
-            )
-            .await?,
-        );
-    }
-    loop {
-        let Some(selected) = current
-            .iter()
-            .enumerate()
-            .filter_map(|(index, value)| {
-                value.as_ref().map(|value| {
-                    (
-                        index,
-                        &value.row.term,
-                        &value.document.path,
-                        &value.row.field,
-                        value.row.part,
-                    )
-                })
-            })
-            .min_by(|left, right| {
-                left.1
-                    .cmp(right.1)
-                    .then(left.2.cmp(right.2))
-                    .then(left.3.cmp(right.3))
-                    .then(left.4.cmp(&right.4))
-            })
-            .map(|value| value.0)
-        else {
-            break;
-        };
-        let candidate = current[selected].take().unwrap();
-        let (cursor_run_index, cursor) = &mut cursors[selected];
-        current[selected] = next_hybrid_text_row(
-            *cursor_run_index,
-            cursor,
-            &runs[*cursor_run_index],
-            &views[*cursor_run_index],
-            &mut point_cache,
-            &executor,
-            &progress,
-        )
-        .await?;
-        let Some((winner_index, winner)) = point_cache
-            .latest_path(
-                runs.as_slice(),
-                views.as_slice(),
-                &candidate.document.path,
-                &executor,
-                &progress,
-            )
-            .await?
-        else {
-            continue;
-        };
-        if winner_index == candidate.run_index
-            && winner.state == DocumentState::Live
-            && winner.document.version == candidate.document.version
-        {
-            let output = point_cache
-                .path(
-                    &*sink,
-                    &output_path_root,
-                    &candidate.document.path,
-                    &executor,
-                    &progress,
-                )
-                .await?
-                .ok_or(IndexError::InvalidFormat("missing compacted path"))?;
-            if output.state != DocumentState::Live
-                || output.document.version != candidate.document.version
-            {
-                return Err(IndexError::InvalidFormat("compacted text winner mismatch"));
-            }
-            let mut row = candidate.row;
-            row.ordinal = output.document_ordinal.ok_or(IndexError::InvalidFormat(
-                "missing compacted document ordinal",
-            ))?;
-            writer.push_row(row, sink).await?;
-            progress.record_output(1, 0, 0);
-            wrote = true;
-        }
-    }
-    if wrote {
-        Ok(Some(writer.finish(sink).await?))
-    } else {
-        Ok(None)
-    }
 }
 
 struct VectorRowCursor<'a, D> {

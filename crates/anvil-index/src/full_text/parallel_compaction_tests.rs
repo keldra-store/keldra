@@ -1,5 +1,88 @@
 use crate::compaction::COMPACTION_INCREMENTAL_LANE_WORKSPACE_BYTES;
 use crate::compaction::test_support::TokioExecutor;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+#[derive(Clone, Default)]
+struct CountingOutputSink {
+    inner: MemoryBlockSink,
+    path_opens: Arc<AtomicUsize>,
+}
+
+impl IndexBlockSink for CountingOutputSink {
+    async fn emit(&mut self, block: GeneratedBlock) -> Result<(), IndexError> {
+        self.inner.emit(block).await
+    }
+}
+
+impl IndexDirectoryRead for CountingOutputSink {
+    type File = <MemoryBlockSink as IndexDirectoryRead>::File;
+
+    async fn open_root(&self) -> Result<Self::File, IndexError> {
+        self.inner.open_root().await
+    }
+
+    async fn open_block(&self, descriptor: &BlockDescriptor) -> Result<Self::File, IndexError> {
+        if descriptor.component_tag == PATH_CHANGES_TAG {
+            self.path_opens.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        self.inner.open_block(descriptor).await
+    }
+}
+
+#[derive(Default)]
+struct ComponentOpenCounts {
+    documents: AtomicUsize,
+    paths: AtomicUsize,
+    postings: AtomicUsize,
+}
+
+#[derive(Clone)]
+struct CountingDirectory {
+    inner: MemoryDirectory,
+    counts: Arc<ComponentOpenCounts>,
+}
+
+impl CountingDirectory {
+    fn new(inner: MemoryDirectory) -> Self {
+        Self {
+            inner,
+            counts: Arc::default(),
+        }
+    }
+
+    fn snapshot(&self) -> (usize, usize, usize) {
+        (
+            self.counts.documents.load(AtomicOrdering::Relaxed),
+            self.counts.paths.load(AtomicOrdering::Relaxed),
+            self.counts.postings.load(AtomicOrdering::Relaxed),
+        )
+    }
+}
+
+impl IndexDirectoryRead for CountingDirectory {
+    type File = <MemoryDirectory as IndexDirectoryRead>::File;
+
+    async fn open_root(&self) -> Result<Self::File, IndexError> {
+        self.inner.open_root().await
+    }
+
+    async fn open_block(&self, descriptor: &BlockDescriptor) -> Result<Self::File, IndexError> {
+        match descriptor.component_tag {
+            crate::segment::DOCUMENTS_TAG => {
+                self.counts.documents.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            PATH_CHANGES_TAG => {
+                self.counts.paths.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            FULL_TEXT_POSTINGS_TAG => {
+                self.counts.postings.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            _ => {}
+        }
+        self.inner.open_block(descriptor).await
+    }
+}
 
 #[tokio::test]
 async fn parallel_ranges_are_deterministic_and_query_equivalent() {
@@ -109,13 +192,70 @@ async fn parallel_ranges_are_deterministic_and_query_equivalent() {
         );
     }
     let snapshot = progress.snapshot();
-    // Four count stripes, four range-local path/document writers, and four
-    // independent term/posting writers all ran through the bounded executor.
+    // Four count stripes, four common path/document writers, and four bounded
+    // posting rebuild lanes ran through the shared executor.
     assert_eq!(snapshot.ranges_total, 12);
     assert_eq!(snapshot.ranges_completed, snapshot.ranges_total);
     assert_eq!(snapshot.active_lanes, 0);
     assert_eq!(snapshot.waiting_lanes, 0);
     assert_eq!(snapshot.output_records, expected_mutations);
+}
+
+#[tokio::test]
+async fn document_and_path_reads_do_not_scale_with_posting_count() {
+    let sparse = (0..16)
+        .map(|index| upsert(&format!("/docs/{index:04}"), 1, "base"))
+        .collect::<Vec<_>>();
+    let dense_text = (0..24)
+        .map(|term| format!("term{term:02}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let dense = (0..16)
+        .map(|index| {
+            upsert(
+                &format!("/docs/{index:04}"),
+                1,
+                &format!("base {dense_text}"),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let sparse_counts = compact_counted(sparse).await;
+    let dense_counts = compact_counted(dense).await;
+    assert!(dense_counts.2 > sparse_counts.2);
+    assert_eq!(dense_counts.0, sparse_counts.0);
+    assert_eq!(dense_counts.1, sparse_counts.1);
+    assert_eq!(dense_counts.3, sparse_counts.3);
+}
+
+async fn compact_counted(
+    mutations: Vec<IndexMutation<FullTextDocument>>,
+) -> (usize, usize, usize, usize) {
+    let (sink, run) = build(mutations, 0, 96).await;
+    let input = CountingDirectory::new(directory(&sink, run));
+    let mut output = CountingOutputSink::default();
+    FullTextEngine::merge_parallel_with_target(
+        std::slice::from_ref(&input),
+        1,
+        96,
+        &mut output,
+        crate::compaction::CompactionParallelism::new(
+            4,
+            COMPACTION_INCREMENTAL_LANE_WORKSPACE_BYTES,
+        )
+        .unwrap(),
+        crate::compaction::CompactionProgress::default(),
+        TokioExecutor::default(),
+    )
+    .await
+    .unwrap();
+    let (documents, paths, postings) = input.snapshot();
+    (
+        documents,
+        paths,
+        postings,
+        output.path_opens.load(AtomicOrdering::Relaxed),
+    )
 }
 
 #[tokio::test]

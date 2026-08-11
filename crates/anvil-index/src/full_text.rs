@@ -1,7 +1,9 @@
 //! Bounded immutable positional full-text runs.
 
-mod compaction_cache;
 mod parallel_compaction;
+pub(crate) mod text_sort;
+
+pub(crate) use parallel_compaction::rebuild_selected_text_component_parallel;
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -726,7 +728,7 @@ where
     Ok(rows)
 }
 
-fn decode_text_rows_fixed(bytes: &[u8]) -> Result<Vec<TextPostingRow>, IndexError> {
+fn decode_text_rows_fixed_unvalidated(bytes: &[u8]) -> Result<Vec<TextPostingRow>, IndexError> {
     let mut decoder = Decoder::new(bytes);
     let count = decoder.u32()? as usize;
     decoder.guard_count::<TextPostingRow>(count, 28)?;
@@ -742,7 +744,11 @@ fn decode_text_rows_fixed(bytes: &[u8]) -> Result<Vec<TextPostingRow>, IndexErro
         )?);
     }
     decoder.finish()?;
-    validate_text_rows(rows)
+    Ok(rows)
+}
+
+fn decode_text_rows_fixed(bytes: &[u8]) -> Result<Vec<TextPostingRow>, IndexError> {
+    validate_text_rows(decode_text_rows_fixed_unvalidated(bytes)?)
 }
 
 fn decode_text_rows_succinct(bytes: &[u8]) -> Result<Vec<TextPostingRow>, IndexError> {
@@ -840,7 +846,6 @@ pub(crate) struct TextRowCursor<'a, D> {
     directory: &'a D,
     leaves: LeafCursor<'a, D>,
     rows: std::vec::IntoIter<TextPostingRow>,
-    range: Option<crate::compaction::KeyRange>,
 }
 
 impl<'a, D: IndexDirectoryRead> TextRowCursor<'a, D> {
@@ -849,34 +854,13 @@ impl<'a, D: IndexDirectoryRead> TextRowCursor<'a, D> {
             directory,
             leaves: LeafCursor::new(directory, root),
             rows: Vec::new().into_iter(),
-            range: None,
-        }
-    }
-
-    pub(crate) fn in_range(
-        directory: &'a D,
-        root: BlockDescriptor,
-        range: crate::compaction::KeyRange,
-    ) -> Self {
-        Self {
-            directory,
-            leaves: LeafCursor::in_range(directory, root, range.clone()),
-            rows: Vec::new().into_iter(),
-            range: Some(range),
         }
     }
 
     pub(crate) async fn next(&mut self) -> Result<Option<TextPostingRow>, IndexError> {
         loop {
             if let Some(row) = self.rows.next() {
-                if self
-                    .range
-                    .as_ref()
-                    .is_none_or(|range| range.contains(row.term.as_bytes()))
-                {
-                    return Ok(Some(row));
-                }
-                continue;
+                return Ok(Some(row));
             }
             // Drop the exhausted leaf allocation before fetching its
             // replacement. Rows already returned by this cursor own their
@@ -898,14 +882,7 @@ impl<'a, D: IndexDirectoryRead> TextRowCursor<'a, D> {
     ) -> Result<Option<TextPostingRow>, IndexError> {
         loop {
             if let Some(row) = self.rows.next() {
-                if self
-                    .range
-                    .as_ref()
-                    .is_none_or(|range| range.contains(row.term.as_bytes()))
-                {
-                    return Ok(Some(row));
-                }
-                continue;
+                return Ok(Some(row));
             }
             // Release the exhausted decoded leaf before fetching/decoding its
             // replacement so the lane never retains both at once.

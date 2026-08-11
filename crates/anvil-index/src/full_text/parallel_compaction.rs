@@ -4,23 +4,26 @@ use std::sync::Arc;
 
 use crate::compaction::{
     CompactionExecutor, CompactionParallelism, CompactionProgress, KeyRange, LaneResultProducer,
-    PathWinnerCursor, collect_ordered_lanes, dense_ordinal_bases,
-    deterministic_delimited_key_range_plan, deterministic_key_range_plan,
+    PathWinnerCursor, collect_ordered_lanes, dense_ordinal_bases, deterministic_key_range_plan,
 };
+use crate::routed_sort::MAX_EXTERNAL_SORT_CHUNK_RESIDENT_BYTES;
 use crate::run::{
     ComponentTree, RunStatistics, RunView, assemble_component_ranges, open_views, seal_run_root,
 };
 use crate::segment::{
     DocumentComponentWriter, DocumentRecord, DocumentState, PATH_CHANGES_TAG, PathComponentWriter,
+    PathRunCursor,
 };
 use crate::{
-    BlockDescriptor, DocumentRef, IndexBlockSink, IndexDirectoryRead, IndexError, IndexKind,
-    SealedRun,
+    BlockDescriptor, IndexBlockSink, IndexDirectoryRead, IndexError, IndexKind, SealedRun,
 };
 
-use super::compaction_cache::FullTextPointCache;
 use super::{
-    FULL_TEXT_POSTINGS_TAG, TextComponentWriter, TextPostingRow, TextRowCursor, posting_key,
+    FULL_TEXT_POSTINGS_TAG, TextRowCursor,
+    text_sort::{
+        SourceTextComponentWriter, SpillTextCursor, TextExternalSorter, TextSortOrder,
+        merge_text_component_trees,
+    },
 };
 
 pub(super) async fn merge_full_text_parallel<D, S, E>(
@@ -58,10 +61,13 @@ where
     let text_tree = if statistics.live_document_count == 0 {
         None
     } else {
-        merge_text_component_parallel(
+        rebuild_selected_text_component_parallel(
             runs,
             &views,
             &path_tree.root,
+            IndexKind::FullText,
+            FULL_TEXT_POSTINGS_TAG,
+            statistics.live_document_count,
             output_level,
             target_bytes,
             sink,
@@ -342,10 +348,13 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn merge_text_component_parallel<D, S, E>(
+pub(crate) async fn rebuild_selected_text_component_parallel<D, S, E>(
     runs: &[D],
     views: &[RunView],
     output_path_root: &BlockDescriptor,
+    kind: IndexKind,
+    component_tag: u8,
+    expected_live: u64,
     output_level: u8,
     target_bytes: usize,
     sink: &mut S,
@@ -358,36 +367,73 @@ where
     S: IndexBlockSink + IndexDirectoryRead + Clone + 'static,
     E: CompactionExecutor,
 {
-    let roots = views
-        .iter()
-        .map(|view| view.component_optional(FULL_TEXT_POSTINGS_TAG).cloned())
-        .collect::<Vec<_>>();
-    let present_roots = roots.iter().flatten().cloned().collect::<Vec<_>>();
-    if present_roots.is_empty() {
-        return Ok(None);
+    crate::compaction::validate_parallel_compaction_fan_in(runs.len())?;
+    if runs.len() != views.len() {
+        return Err(IndexError::InvalidDefinition(
+            "run readers and descriptors must have equal length".into(),
+        ));
     }
-    let plan = deterministic_delimited_key_range_plan(present_roots, 0, parallelism.max_lanes())?;
+    let mut source_trees = Vec::with_capacity(runs.len());
+    for (run, view) in runs.iter().zip(views) {
+        let Some(root) = view.component_optional(component_tag) else {
+            source_trees.push(None);
+            continue;
+        };
+        let document_count = view.component(crate::segment::DOCUMENTS_TAG)?.element_count;
+        let mut sorter = TextExternalSorter::new(
+            kind,
+            component_tag,
+            output_level,
+            target_bytes,
+            MAX_EXTERNAL_SORT_CHUNK_RESIDENT_BYTES,
+            TextSortOrder::SourceOrdinal,
+            sink.clone(),
+            executor.clone(),
+            progress.clone(),
+        )?;
+        let mut cursor = TextRowCursor::new(run, root.clone());
+        while let Some(row) = cursor.next_parallel(&executor, &progress).await? {
+            if row.ordinal >= document_count {
+                return Err(IndexError::InvalidFormat(
+                    "text posting ordinal outside run",
+                ));
+            }
+            sorter.push(row).await?;
+        }
+        drop(cursor);
+        source_trees.push(sorter.finish().await?);
+    }
+    let path_roots = views
+        .iter()
+        .map(|view| view.component(PATH_CHANGES_TAG).cloned())
+        .collect::<Result<Vec<_>, _>>()?;
+    let plan = deterministic_key_range_plan(path_roots.iter().cloned(), parallelism.max_lanes());
     progress.record_range_limit(plan.range_limit)?;
     let runs = Arc::new(runs.to_vec());
     let views = Arc::new(views.to_vec());
-    let roots = Arc::new(roots);
+    let path_roots = Arc::new(path_roots);
+    let source_trees = Arc::new(source_trees);
     let mut producers =
-        Vec::<LaneResultProducer<Option<ComponentTree>>>::with_capacity(plan.ranges.len());
+        Vec::<LaneResultProducer<SelectedTextRange>>::with_capacity(plan.ranges.len());
     for range in plan.ranges {
         let runs = runs.clone();
         let views = views.clone();
-        let roots = roots.clone();
+        let path_roots = path_roots.clone();
+        let source_trees = source_trees.clone();
+        let output_path_root = output_path_root.clone();
+        let lane_sink = sink.clone();
         let lane_executor = executor.clone();
         let lane_progress = progress.clone();
-        let lane_sink = sink.clone();
-        let output_path_root = output_path_root.clone();
         producers.push(Box::new(move || {
-            Box::pin(build_text_range(
+            Box::pin(rebuild_selected_text_range(
                 runs,
                 views,
-                roots,
-                range,
+                path_roots,
+                source_trees,
                 output_path_root,
+                range,
+                kind,
+                component_tag,
                 output_level,
                 target_bytes,
                 lane_sink,
@@ -396,181 +442,181 @@ where
             ))
         }));
     }
-    let trees = collect_ordered_lanes(&executor, producers, &progress)
-        .await?
+    let ranges = collect_ordered_lanes(&executor, producers, &progress).await?;
+    let live = ranges.iter().try_fold(0u64, |total, range| {
+        total
+            .checked_add(range.live)
+            .ok_or(IndexError::OffsetOverflow)
+    })?;
+    if live != expected_live {
+        return Err(IndexError::InvalidFormat(
+            "text winner replay changed live count",
+        ));
+    }
+    let trees = ranges
         .into_iter()
-        .flatten()
+        .filter_map(|range| range.tree)
         .collect::<Vec<_>>();
     if trees.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(
-            assemble_component_ranges(IndexKind::FullText, FULL_TEXT_POSTINGS_TAG, trees, sink)
-                .await?,
-        ))
-    }
-}
-
-struct ResolvedTextRow {
-    run_index: usize,
-    document: DocumentRef,
-    row: TextPostingRow,
-}
-
-async fn next_resolved_parallel<'a, D, E>(
-    run_index: usize,
-    cursor: &mut TextRowCursor<'a, D>,
-    run: &'a D,
-    view: &RunView,
-    executor: &E,
-    progress: &CompactionProgress,
-    point_cache: &mut FullTextPointCache,
-) -> Result<Option<ResolvedTextRow>, IndexError>
-where
-    D: IndexDirectoryRead,
-    E: CompactionExecutor,
-{
-    let Some(row) = cursor.next_parallel(executor, progress).await? else {
         return Ok(None);
-    };
-    let document = point_cache
-        .document(run, view, row.ordinal, executor, progress)
-        .await?;
-    Ok(Some(ResolvedTextRow {
-        run_index,
-        document,
-        row,
-    }))
+    }
+    Ok(Some(
+        merge_text_component_trees(
+            kind,
+            component_tag,
+            output_level,
+            target_bytes,
+            TextSortOrder::FinalPosting,
+            trees,
+            sink,
+            &executor,
+            &progress,
+        )
+        .await?,
+    ))
+}
+
+struct SelectedTextRange {
+    tree: Option<ComponentTree>,
+    live: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn build_text_range<D, S, E>(
+async fn rebuild_selected_text_range<D, S, E>(
     runs: Arc<Vec<D>>,
     views: Arc<Vec<RunView>>,
-    roots: Arc<Vec<Option<BlockDescriptor>>>,
-    range: KeyRange,
+    path_roots: Arc<Vec<BlockDescriptor>>,
+    source_trees: Arc<Vec<Option<ComponentTree>>>,
     output_path_root: BlockDescriptor,
+    range: KeyRange,
+    kind: IndexKind,
+    component_tag: u8,
     output_level: u8,
     target_bytes: usize,
     mut sink: S,
     executor: E,
     progress: CompactionProgress,
-) -> Result<Option<ComponentTree>, IndexError>
+) -> Result<SelectedTextRange, IndexError>
 where
     D: IndexDirectoryRead,
-    S: IndexBlockSink + IndexDirectoryRead,
+    S: IndexBlockSink + IndexDirectoryRead + Clone,
     E: CompactionExecutor,
 {
-    let mut cursors = runs
-        .iter()
-        .zip(roots.iter())
-        .map(|(run, root)| {
-            root.clone()
-                .map(|root| TextRowCursor::in_range(run, root, range.clone()))
-        })
-        .collect::<Vec<_>>();
-    let mut current = Vec::with_capacity(cursors.len());
-    let mut input_cache = FullTextPointCache::input();
-    let mut output_cache = FullTextPointCache::staged_output();
-    let mut writer = TextComponentWriter::new(
-        IndexKind::FullText,
-        FULL_TEXT_POSTINGS_TAG,
-        output_level,
-        target_bytes,
-    );
+    let mut winners = PathWinnerCursor::open(
+        runs.as_slice(),
+        path_roots.as_slice(),
+        range.clone(),
+        executor.clone(),
+        progress.clone(),
+    )
+    .await?;
+    let output_directory = sink.clone();
+    let mut output_paths = PathRunCursor::in_range(&output_directory, output_path_root, range);
+    let source_directory = sink.clone();
+    let mut source_cursors = (0..runs.len()).map(|_| None).collect::<Vec<_>>();
+    let mut current = (0..runs.len()).map(|_| None).collect::<Vec<_>>();
+    let mut selected = SourceTextComponentWriter::new(kind, component_tag, target_bytes);
     let mut wrote = false;
-    for run_index in 0..cursors.len() {
-        current.push(match &mut cursors[run_index] {
-            Some(cursor) => {
-                next_resolved_parallel(
-                    run_index,
-                    cursor,
-                    &runs[run_index],
-                    &views[run_index],
-                    &executor,
-                    &progress,
-                    &mut input_cache,
-                )
-                .await?
-            }
-            None => None,
-        });
-    }
+    let mut live = 0u64;
+
     loop {
-        let Some(selected) = current
-            .iter()
-            .enumerate()
-            .filter_map(|(index, value)| {
-                value.as_ref().map(|value| {
-                    (
-                        index,
-                        &value.row.term,
-                        &value.document.path,
-                        &value.row.field,
-                        value.row.part,
-                    )
-                })
-            })
-            .min_by(|left, right| {
-                left.1
-                    .cmp(right.1)
-                    .then(left.2.cmp(right.2))
-                    .then(left.3.cmp(right.3))
-                    .then(left.4.cmp(&right.4))
-            })
-            .map(|value| value.0)
-        else {
-            break;
+        let winner = winners.next().await?;
+        let output = output_paths.next_parallel(&executor, &progress).await?;
+        let (winner_run, winner, output) = match (winner, output) {
+            (Some((winner_run, winner)), Some(output)) => (winner_run, winner, output),
+            (None, None) => break,
+            _ => {
+                return Err(IndexError::InvalidFormat(
+                    "compacted text path range changed",
+                ));
+            }
         };
-        let candidate = current[selected].take().unwrap();
-        current[selected] = next_resolved_parallel(
-            selected,
-            cursors[selected].as_mut().unwrap(),
-            &runs[selected],
-            &views[selected],
-            &executor,
-            &progress,
-            &mut input_cache,
-        )
-        .await?;
-        let Some((winner_index, winner)) = input_cache
-            .latest_path(
-                runs.as_slice(),
-                views.as_slice(),
-                &candidate.document.path,
-                &executor,
-                &progress,
-            )
-            .await?
-        else {
+        if winner.document != output.document || winner.state != output.state {
+            return Err(IndexError::InvalidFormat("compacted text winner mismatch"));
+        }
+        if winner.state != DocumentState::Live {
+            if output.document_ordinal.is_some() {
+                return Err(IndexError::InvalidFormat(
+                    "removed compacted text path has an ordinal",
+                ));
+            }
             continue;
-        };
-        if winner_index == candidate.run_index
-            && winner.state == DocumentState::Live
-            && winner.document.version == candidate.document.version
+        }
+        let old_ordinal = winner.document_ordinal.ok_or(IndexError::InvalidFormat(
+            "live text path has no source ordinal",
+        ))?;
+        let output_ordinal = output.document_ordinal.ok_or(IndexError::InvalidFormat(
+            "live text path has no output ordinal",
+        ))?;
+        let document_count = views[winner_run]
+            .component(crate::segment::DOCUMENTS_TAG)?
+            .element_count;
+        if old_ordinal >= document_count {
+            return Err(IndexError::InvalidFormat("text path ordinal outside run"));
+        }
+        live = live.checked_add(1).ok_or(IndexError::OffsetOverflow)?;
+
+        if source_cursors[winner_run].is_none()
+            && let Some(tree) = source_trees[winner_run].clone()
         {
-            let output = output_cache
-                .path(
-                    &sink,
-                    &output_path_root,
-                    &candidate.document.path,
-                    &executor,
-                    &progress,
-                )
-                .await?
-                .ok_or(IndexError::InvalidFormat("missing compacted path"))?;
-            let mut row = candidate.row;
-            row.ordinal = output.document_ordinal.ok_or(IndexError::InvalidFormat(
-                "missing compacted document ordinal",
-            ))?;
-            let _ = posting_key(&row)?;
-            writer.push_row(row, &mut sink).await?;
-            wrote = true;
+            let mut cursor =
+                SpillTextCursor::source_from_ordinal(&source_directory, tree, old_ordinal);
+            current[winner_run] = cursor.next_parallel(&executor, &progress).await?;
+            source_cursors[winner_run] = Some(cursor);
+        }
+        if let Some(cursor) = source_cursors[winner_run].as_mut() {
+            while current[winner_run]
+                .as_ref()
+                .is_some_and(|row| row.ordinal < old_ordinal)
+            {
+                current[winner_run] = cursor.next_parallel(&executor, &progress).await?;
+            }
+            while current[winner_run]
+                .as_ref()
+                .is_some_and(|row| row.ordinal == old_ordinal)
+            {
+                let mut row = current[winner_run].take().unwrap();
+                current[winner_run] = cursor.next_parallel(&executor, &progress).await?;
+                row.ordinal = output_ordinal;
+                selected.push(row, &mut sink).await?;
+                wrote = true;
+            }
         }
     }
-    if wrote {
-        Ok(Some(writer.finish(&mut sink).await?))
-    } else {
-        Ok(None)
+
+    drop(output_paths);
+    drop(winners);
+    drop(current);
+    drop(source_cursors);
+    drop(source_directory);
+    drop(output_directory);
+    if !wrote {
+        return Ok(SelectedTextRange { tree: None, live });
     }
+    let selected_tree = selected.finish(&mut sink).await?;
+    let selected_directory = sink.clone();
+    let mut cursor = SpillTextCursor::new(
+        &selected_directory,
+        selected_tree,
+        TextSortOrder::SourceOrdinal,
+    );
+    let mut sorter = TextExternalSorter::new(
+        kind,
+        component_tag,
+        output_level,
+        target_bytes,
+        MAX_EXTERNAL_SORT_CHUNK_RESIDENT_BYTES,
+        TextSortOrder::FinalPosting,
+        sink,
+        executor.clone(),
+        progress.clone(),
+    )?;
+    while let Some(row) = cursor.next_parallel(&executor, &progress).await? {
+        sorter.push(row).await?;
+    }
+    drop(cursor);
+    Ok(SelectedTextRange {
+        tree: sorter.finish().await?,
+        live,
+    })
 }
