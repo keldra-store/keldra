@@ -641,11 +641,16 @@ async fn wait_for_generation(
             {
                 if let Some(expected_hits) = expected_partition_hits {
                     if response.hits.len() != expected_hits {
-                        tokio::time::sleep(Duration::from_millis(200)).await;
-                        continue;
+                        // Fall through to the shared deadline check. A
+                        // published-but-incomplete generation must not turn
+                        // this bounded qualification wait into an infinite
+                        // loop.
+                    } else {
+                        return Ok(response);
                     }
+                } else {
+                    return Ok(response);
                 }
-                return Ok(response);
             }
             Ok(_) => {}
             Err(error) if retryable_error(&error) => {}
