@@ -1,11 +1,9 @@
-use anvil_store::{AccountingHeadTransition, LocalChange, ReferenceDelta};
+use anvil_store::{AccountingHeadTransition, LocalChange, ReferenceDelta, RetainedObjectSnapshot};
 use tonic::Status;
 
-use crate::cluster_peer::IndexHeadScanScope;
 use crate::index_runtime::events::IndexJournalPage;
-use crate::index_runtime::scanner::ClusterIndexScanner;
 
-use super::{LoadedAccountingDefinition, includes_path};
+use super::{LoadedAccountingDefinition, StoredAccountingRollup, includes_path};
 
 /// Constant-memory aggregate state. A cold start/recovery scan reduces current
 /// metadata directly into these two scalars; ordered transition evidence then
@@ -17,44 +15,11 @@ pub(crate) struct AccountingObjectSnapshot {
 }
 
 impl AccountingObjectSnapshot {
-    pub(crate) async fn initial(
-        definition: &LoadedAccountingDefinition,
-        scanner: &ClusterIndexScanner,
-    ) -> Result<Self, Status> {
-        let mut scan = scanner.begin(IndexHeadScanScope::AccountingSourceObjects {
-            tenant_id: definition.tenant_id,
-            bucket_id: definition.bucket_id,
-            path_prefix: definition.stored.path_prefix.clone(),
-        })?;
-        let mut total = Self::default();
-        while let Some(heads) = scan.next_page().await? {
-            for head in heads {
-                if !includes_path(&definition.stored.path_prefix, &head.exact_path) {
-                    continue;
-                }
-                // Logical stored bytes include every retained live payload version,
-                // not physical EC/replica overhead. Current tombstones contribute
-                // no object and no bytes of their own.
-                for version in head.versions {
-                    if let Some(blob) = version.blob {
-                        total.logical_stored_bytes = total
-                            .logical_stored_bytes
-                            .checked_add(blob.length)
-                            .ok_or_else(|| {
-                                Status::resource_exhausted(
-                                    "accounting logical byte baseline overflow",
-                                )
-                            })?;
-                    }
-                }
-                if !head.head.deleted {
-                    total.object_count = total.object_count.checked_add(1).ok_or_else(|| {
-                        Status::resource_exhausted("accounting object baseline overflow")
-                    })?;
-                }
-            }
+    pub(crate) fn from_rollup(rollup: &StoredAccountingRollup) -> Self {
+        Self {
+            logical_stored_bytes: rollup.logical_stored_bytes,
+            object_count: rollup.object_count,
         }
-        Ok(total)
     }
 
     pub(crate) fn apply(
@@ -112,6 +77,64 @@ impl AccountingObjectSnapshot {
     }
 }
 
+/// Constant-memory reducer for the snapshot-bound retained-version stream.
+///
+/// The stream repeats current-head state for every retained version and keeps
+/// each source in `(path, version)` order. Remembering only the preceding path
+/// is therefore enough to count a live object once while still accounting for
+/// every retained payload version, including a path whose history spans many
+/// frames.
+#[derive(Debug, Default)]
+pub(crate) struct AccountingBaselineAccumulator {
+    snapshot: AccountingObjectSnapshot,
+    previous_path: Option<String>,
+}
+
+impl AccountingBaselineAccumulator {
+    pub(crate) fn apply_frame(
+        &mut self,
+        definition: &LoadedAccountingDefinition,
+        records: &[RetainedObjectSnapshot],
+    ) -> Result<(), Status> {
+        for record in records {
+            record
+                .validate()
+                .map_err(|error| Status::data_loss(error.to_string()))?;
+            if record.tenant_id != definition.tenant_id
+                || record.bucket_id != definition.bucket_id
+                || !includes_path(&definition.stored.path_prefix, &record.exact_path)
+            {
+                return Err(Status::data_loss(
+                    "retained accounting snapshot escaped its requested scope",
+                ));
+            }
+            if self.previous_path.as_deref() != Some(record.exact_path.as_str()) {
+                if !record.current_head.deleted {
+                    self.snapshot.object_count =
+                        self.snapshot.object_count.checked_add(1).ok_or_else(|| {
+                            Status::resource_exhausted("accounting object baseline overflow")
+                        })?;
+                }
+                self.previous_path = Some(record.exact_path.clone());
+            }
+            if let Some(blob) = record.version.blob.as_ref() {
+                self.snapshot.logical_stored_bytes = self
+                    .snapshot
+                    .logical_stored_bytes
+                    .checked_add(blob.length)
+                    .ok_or_else(|| {
+                        Status::resource_exhausted("accounting logical byte baseline overflow")
+                    })?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish(self) -> AccountingObjectSnapshot {
+        self.snapshot
+    }
+}
+
 fn apply_reference_deltas(
     total: &mut u64,
     deltas: &[ReferenceDelta],
@@ -164,7 +187,7 @@ pub(crate) enum AccountingAdvanceError {
 
 #[cfg(test)]
 mod tests {
-    use anvil_store::BlobRef;
+    use anvil_store::{BlobRef, RetainedHeadState, Version, VersionId};
 
     use super::*;
 
@@ -203,5 +226,49 @@ mod tests {
         )
         .unwrap();
         assert_eq!(bytes, 70);
+    }
+
+    #[test]
+    fn retained_history_spanning_frames_counts_one_live_object() {
+        let definition = LoadedAccountingDefinition {
+            tenant_id: 11,
+            bucket_id: 12,
+            version: VersionId(4),
+            stored: super::super::StoredAccountingDefinition::create(
+                "tenant".into(),
+                "bucket".into(),
+                "docs".into(),
+                11,
+                12,
+            )
+            .unwrap(),
+        };
+        let record = |version, length| RetainedObjectSnapshot {
+            tenant_id: 11,
+            bucket_id: 12,
+            exact_path: "docs/a".into(),
+            version: Version {
+                id: VersionId(version),
+                blob: Some(BlobRef {
+                    hash: [version as u8; 32],
+                    length,
+                }),
+                content_type: None,
+                deleted: false,
+                committed_at_unix_millis: version,
+            },
+            current_head: RetainedHeadState {
+                version: VersionId(3),
+                deleted: false,
+            },
+        };
+        let mut baseline = AccountingBaselineAccumulator::default();
+        baseline.apply_frame(&definition, &[record(1, 10)]).unwrap();
+        baseline
+            .apply_frame(&definition, &[record(2, 20), record(3, 30)])
+            .unwrap();
+        let snapshot = baseline.finish();
+        assert_eq!(snapshot.object_count(), 1);
+        assert_eq!(snapshot.logical_stored_bytes(), 60);
     }
 }

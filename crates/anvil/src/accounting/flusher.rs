@@ -1,15 +1,15 @@
-//! Periodic persistence of node-local public traffic counters as ordinary objects.
+//! Bounded delivery of process-local public traffic to each bucket matcher.
 
 use std::time::Duration;
 
 use anvil_consensus::{DecisionRaft, NodeId};
-use anvil_store::Store;
 
-use crate::cluster_peer::{AccountingTrafficFlush, ClusterPeerTransport, RoutedAccountingHandler};
+use crate::cluster_peer::{
+    AccountingTrafficBatch, AccountingTrafficEntry, ClusterPeerTransport, RoutedAccountingHandler,
+};
 use crate::cluster_placement::ClusterPlacement;
-use crate::index_runtime::placement::{IndexIdentity, IndexPlacement};
 
-use super::{AccountingCatalog, AccountingServiceImpl, AccountingTraffic};
+use super::{AccountingServiceImpl, AccountingTraffic, matcher_node};
 
 const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -21,86 +21,66 @@ impl AccountingTrafficTask {
     pub(crate) fn start(
         local_node: NodeId,
         decisions: DecisionRaft,
-        store: Store,
         peers: ClusterPeerTransport,
-        catalog: AccountingCatalog,
         traffic: AccountingTraffic,
         service: AccountingServiceImpl,
     ) -> Self {
         let task = tokio::spawn(async move {
-            let source = match store.local_watch_status() {
-                Ok(status) => status.source_id,
-                Err(error) => {
-                    tracing::error!(%error, "accounting traffic source identity is unavailable");
-                    return;
-                }
-            };
-            let mut sequence = 0_u64;
             let mut interval = tokio::time::interval(FLUSH_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
-                for (accounting_id, delta) in traffic.pending() {
-                    let Some(definition) = catalog.get(accounting_id).ok().flatten() else {
-                        traffic.acknowledge(accounting_id, delta);
-                        continue;
-                    };
+                for pending in traffic.pending() {
                     let placement = match placement(&decisions) {
                         Ok(value) => value,
                         Err(error) => {
-                            tracing::warn!(%error, "accounting traffic placement is unavailable");
-                            continue;
+                            emit_retry(&pending, &error);
+                            break;
                         }
                     };
-                    let identity = match IndexIdentity::new(
-                        definition.tenant_id,
-                        definition.bucket_id,
-                        accounting_id,
-                    ) {
-                        Ok(value) => value,
-                        Err(error) => {
-                            tracing::warn!(%error, "accounting traffic identity is invalid");
-                            continue;
-                        }
+                    let matcher =
+                        match matcher_node(&placement, pending.tenant_id, pending.bucket_id) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                emit_retry(&pending, &error);
+                                break;
+                            }
+                        };
+                    let value = AccountingTrafficBatch {
+                        source_node: pending.id.source_node,
+                        source_epoch: pending.id.source_epoch,
+                        sequence: pending.id.sequence,
+                        tenant_id: pending.tenant_id,
+                        bucket_id: pending.bucket_id,
+                        entries: pending
+                            .entries
+                            .iter()
+                            .map(|entry| AccountingTrafficEntry {
+                                exact_path: entry.path.clone(),
+                                accepted_inbound_bytes: entry.accepted_inbound_bytes,
+                                served_outbound_bytes: entry.served_outbound_bytes,
+                            })
+                            .collect(),
                     };
-                    let assignment = match IndexPlacement::derive(identity, &placement) {
-                        Ok(value) => value,
-                        Err(error) => {
-                            tracing::warn!(%error, "accounting traffic worker is unavailable");
-                            continue;
-                        }
-                    };
-                    sequence = sequence.wrapping_add(1).max(1);
-                    let value = AccountingTrafficFlush {
-                        accounting_id,
-                        source_node: local_node,
-                        accepted_inbound_bytes: delta.accepted_inbound_bytes,
-                        served_outbound_bytes: delta.served_outbound_bytes,
-                        flush_id: format!(
-                            "accounting-traffic-{}-{}-{}",
-                            local_node.0,
-                            hex::encode(&source.source_epoch[..8]),
-                            sequence
-                        ),
-                    };
-                    let result = if assignment.builder() == local_node {
-                        service.flush(local_node, placement.clone(), value).await
-                    } else if let Some(address) = placement.address(assignment.builder()) {
+                    let result = if matcher == local_node {
+                        service
+                            .match_traffic(local_node, placement.clone(), value)
+                            .await
+                    } else if let Some(address) = placement.address(matcher) {
                         peers
-                            .flush_accounting_traffic(assignment.builder(), &address.0, &value)
+                            .match_accounting_traffic(matcher, &address.0, &value)
                             .await
                     } else {
                         Err(tonic::Status::unavailable(
-                            "accounting traffic worker has no peer address",
+                            "accounting matcher has no peer address",
                         ))
                     };
                     match result {
-                        Ok(_) => traffic.acknowledge(accounting_id, delta),
-                        Err(error) => tracing::warn!(
-                            accounting.id = accounting_id,
-                            %error,
-                            "accounting traffic flush will retry"
-                        ),
+                        Ok(()) => traffic.acknowledge(&pending.id),
+                        Err(error) => {
+                            emit_retry(&pending, &error);
+                            break;
+                        }
                     }
                 }
             }
@@ -121,4 +101,14 @@ fn placement(decisions: &DecisionRaft) -> Result<ClusterPlacement, tonic::Status
         .map_err(|_| tonic::Status::unavailable("applied cluster membership is unavailable"))?;
     ClusterPlacement::from_applied(&state)
         .map_err(|error| tonic::Status::unavailable(error.to_string()))
+}
+
+fn emit_retry(batch: &super::traffic::TrafficBatch, error: &tonic::Status) {
+    tracing::warn!(
+        tenant.id = batch.tenant_id,
+        bucket.id = batch.bucket_id,
+        monotonic_counter.anvil_accounting_matcher_retries_total = 1_u64,
+        %error,
+        "accounting traffic batch will retry"
+    );
 }

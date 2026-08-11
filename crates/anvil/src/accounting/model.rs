@@ -12,8 +12,9 @@ use tonic::Status;
 use crate::index_runtime::events::IndexBarrier;
 
 const DEFINITION_FORMAT: u16 = 1;
-const ROLLUP_FORMAT: u16 = 1;
-const OUTBOUND_SOURCE_FORMAT: u16 = 1;
+const ROLLUP_FORMAT: u16 = 2;
+const OUTBOUND_SOURCE_FORMAT: u16 = 2;
+const MAX_TRAFFIC_FLUSH_ID_BYTES: usize = 256;
 const DEFINITION_PREFIX: &str = "_anvil/accounting/definitions/";
 const ACCOUNTING_ROOT: &str = "_anvil/accounting/";
 
@@ -97,6 +98,7 @@ pub(crate) struct StoredAccountingRollup {
     pub(crate) refreshed_at_unix_millis: u64,
     pub(crate) complete: bool,
     pub(crate) placement_fence: PlacementLogId,
+    pub(crate) atomic_finalized_through: Option<u64>,
     pub(crate) sources: Vec<StoredSourceCheckpoint>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) traffic_sources: Vec<StoredTrafficCheckpoint>,
@@ -131,6 +133,7 @@ impl StoredAccountingRollup {
             refreshed_at_unix_millis: unix_millis(SystemTime::now())?,
             complete,
             placement_fence: barrier.fence,
+            atomic_finalized_through: barrier.atomic.finalized_through(),
             sources: barrier
                 .sources
                 .iter()
@@ -141,6 +144,39 @@ impl StoredAccountingRollup {
                 })
                 .collect(),
             traffic_sources,
+        })
+    }
+
+    pub(crate) fn barrier(&self) -> Result<IndexBarrier, Status> {
+        let mut sources = std::collections::BTreeMap::new();
+        for source in &self.sources {
+            let node = anvil_consensus::NodeId(source.node_id);
+            let next_offset = source.through_offset.checked_add(1).ok_or_else(|| {
+                Status::data_loss("accounting source checkpoint offset is exhausted")
+            })?;
+            if sources
+                .insert(
+                    node,
+                    crate::index_runtime::events::IndexSourceCursor {
+                        source: source.source,
+                        next_offset,
+                    },
+                )
+                .is_some()
+            {
+                return Err(Status::data_loss(
+                    "accounting rollup repeats a source checkpoint",
+                ));
+            }
+        }
+        Ok(IndexBarrier {
+            fence: self.placement_fence,
+            atomic: crate::index_runtime::events::AtomicProgramWatermark::new(
+                self.atomic_finalized_through,
+                self.atomic_finalized_through,
+                0,
+            ),
+            sources,
         })
     }
 
@@ -249,6 +285,7 @@ pub(crate) struct StoredTrafficSource {
     pub(crate) node_id: u64,
     pub(crate) accepted_inbound_bytes: u64,
     pub(crate) served_outbound_bytes: u64,
+    pub(crate) last_flush_id: String,
     pub(crate) updated_at_unix_millis: u64,
 }
 
@@ -259,12 +296,14 @@ impl StoredTrafficSource {
         node_id: u64,
         accepted_inbound_bytes: u64,
         served_outbound_bytes: u64,
+        last_flush_id: String,
     ) -> Result<Self, Status> {
         if accounting_id == 0 || definition_version == 0 || node_id == 0 {
             return Err(Status::invalid_argument(
                 "accounting outbound source identities must be non-zero",
             ));
         }
+        validate_traffic_flush_id(&last_flush_id).map_err(Status::invalid_argument)?;
         Ok(Self {
             format: OUTBOUND_SOURCE_FORMAT,
             accounting_id,
@@ -272,6 +311,7 @@ impl StoredTrafficSource {
             node_id,
             accepted_inbound_bytes,
             served_outbound_bytes,
+            last_flush_id,
             updated_at_unix_millis: unix_millis(SystemTime::now())?,
         })
     }
@@ -290,12 +330,21 @@ impl StoredTrafficSource {
             || value.accounting_id == 0
             || value.definition_version == 0
             || value.node_id == 0
+            || validate_traffic_flush_id(&value.last_flush_id).is_err()
         {
             return Err(Status::data_loss(
                 "accounting outbound source has an invalid identity or format",
             ));
         }
         Ok(value)
+    }
+}
+
+fn validate_traffic_flush_id(value: &str) -> Result<(), &'static str> {
+    if value.is_empty() || value.len() > MAX_TRAFFIC_FLUSH_ID_BYTES || value.contains('\0') {
+        Err("accounting traffic flush ID must contain 1 to 256 bytes and no NUL")
+    } else {
+        Ok(())
     }
 }
 
@@ -402,7 +451,7 @@ fn millis_timestamp(value: u64) -> Result<Timestamp, Status> {
     })
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct LoadedAccountingDefinition {
     pub(crate) tenant_id: u64,
     pub(crate) bucket_id: u64,
@@ -451,5 +500,16 @@ mod tests {
         assert!(is_artifact_path("_anvil/accounting/7/sources/2", 7));
         assert!(!is_artifact_path("_anvil/accounting/7/sources/02", 7));
         assert!(!is_artifact_path("_anvil/accounting/8/current", 7));
+    }
+
+    #[test]
+    fn traffic_source_persists_and_validates_its_last_flush_identity() {
+        let source = StoredTrafficSource::new(7, 3, 2, 10, 20, "traffic-2-9".into()).unwrap();
+        assert_eq!(
+            StoredTrafficSource::decode(&source.encode().unwrap()).unwrap(),
+            source
+        );
+        assert!(StoredTrafficSource::new(7, 3, 2, 10, 20, String::new()).is_err());
+        assert!(StoredTrafficSource::new(7, 3, 2, 10, 20, "bad\0id".into()).is_err());
     }
 }

@@ -1,8 +1,9 @@
-use anvil_store::{Store, VersionId};
+use anvil_store::{DefinitionKind, DefinitionMutationIntent, Store, VersionId};
 use tonic::Status;
 
 use crate::index_runtime::publication::{
-    IndexArtifactDelete, IndexArtifactOutcome, IndexArtifactPublish, IndexArtifactRouter,
+    DefinitionVersionGuard, IndexArtifactDelete, IndexArtifactOutcome, IndexArtifactPublish,
+    IndexArtifactRouter,
 };
 
 use super::{
@@ -38,6 +39,11 @@ impl AccountingPublisher {
             definition.encode()?,
             expected_version,
             command_id,
+            None,
+            Some(
+                DefinitionMutationIntent::new(DefinitionKind::Accounting, definition.accounting_id)
+                    .map_err(|error| Status::internal(error.to_string()))?,
+            ),
         )
         .await
     }
@@ -48,6 +54,7 @@ impl AccountingPublisher {
         tenant_id: u64,
         bucket_id: u64,
         rollup: &StoredAccountingRollup,
+        definition_version: VersionId,
         expected_version: Option<VersionId>,
         command_id: String,
     ) -> Result<IndexArtifactOutcome, Status> {
@@ -64,6 +71,12 @@ impl AccountingPublisher {
             rollup.encode()?,
             expected_version,
             command_id,
+            Some(DefinitionVersionGuard {
+                kind: DefinitionKind::Accounting,
+                exact_path: definition_path(definition.accounting_id)?,
+                expected_version: definition_version,
+            }),
+            None,
         )
         .await
     }
@@ -91,6 +104,8 @@ impl AccountingPublisher {
             source.encode()?,
             expected_version,
             command_id,
+            None,
+            None,
         )
         .await
     }
@@ -113,6 +128,13 @@ impl AccountingPublisher {
                 exact_path: definition_path(definition.accounting_id)?,
                 expected_version,
                 command_id,
+                definition_intent: Some(
+                    DefinitionMutationIntent::new(
+                        DefinitionKind::Accounting,
+                        definition.accounting_id,
+                    )
+                    .map_err(|error| Status::internal(error.to_string()))?,
+                ),
             })
             .await
     }
@@ -127,6 +149,8 @@ impl AccountingPublisher {
         bytes: Vec<u8>,
         expected_version: Option<VersionId>,
         command_id: String,
+        definition_guard: Option<DefinitionVersionGuard>,
+        definition_intent: Option<DefinitionMutationIntent>,
     ) -> Result<IndexArtifactOutcome, Status> {
         let blob = self
             .store
@@ -144,6 +168,8 @@ impl AccountingPublisher {
                 blob,
                 expected_version,
                 command_id,
+                definition_guard,
+                definition_intent,
             })
             .await
     }

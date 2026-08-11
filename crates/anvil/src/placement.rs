@@ -27,6 +27,7 @@ pub(crate) enum PlacementKind {
     LargeFragment = 7,
     FuturePersonalDb = 8,
     FutureIndex = 9,
+    AccountingMatcher = 10,
 }
 
 impl PlacementKind {
