@@ -75,6 +75,7 @@ impl WriteBatchIteratorCf for WalOperationCounter {
         }
         if [
             LOCAL_INVALIDATION_OFFSET_KEY,
+            LOCAL_INVALIDATION_SETTLED_KEY,
             LOCAL_INVALIDATION_FLOOR_KEY,
             LOCAL_INVALIDATION_COUNT_KEY,
             LOCAL_INVALIDATION_BYTES_KEY,

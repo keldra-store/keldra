@@ -1,8 +1,8 @@
 use super::*;
 use crate::model::MAX_OBJECT_MUTATION_REFERENCE_DELTAS;
 use crate::watch::{
-    REFERENCE_PROOF_KEY_BYTES, ReferenceProof, decode_reference_proof, encode_reference_proof,
-    reference_proof_key,
+    REFERENCE_PROOF_KEY_BYTES, ReferenceProof, ReferenceProofMutation, decode_reference_proof,
+    encode_reference_proof, reference_proof_key,
 };
 use crate::{ObjectMutation, RetainedVersionDeleteMutation};
 
@@ -405,7 +405,9 @@ fn proof_for_mutation(mutation: &ObjectMutation) -> Result<ReferenceProof, Mutat
             mutation.version.deleted,
             mutation.reference_deltas.clone(),
             mutation.accounting_transition,
+            mutation.definition_transition.clone(),
         ),
+        ReferenceProofMutation::Object(mutation.clone()),
     );
     validate_stored_proof(&proof).map_err(MutationError::InvalidObjectMutation)?;
     Ok(proof)
@@ -438,6 +440,7 @@ fn proof_for_retained_delete(
                 AccountingHeadTransition::new(None, None)
             }),
         ),
+        ReferenceProofMutation::RetainedVersionDelete(mutation.clone()),
     );
     validate_stored_proof(&proof).map_err(MutationError::InvalidObjectMutation)?;
     Ok(proof)
@@ -458,6 +461,93 @@ fn validate_stored_proof(proof: &ReferenceProof) -> Result<(), String> {
         || proof.offset() == 0
     {
         return Err("reference proof source identity or offset is invalid".into());
+    }
+    let expected_change = match &proof.mutation {
+        ReferenceProofMutation::Object(mutation) => {
+            mutation
+                .validate()
+                .map_err(|error| format!("reference proof object mutation is invalid: {error}"))?;
+            if mutation.stamp.source_id != proof.source_id
+                || mutation.stamp.source_journal_position != proof.offset()
+                || mutation.stamp.mutation_fingerprint != proof.mutation_fingerprint
+            {
+                return Err("reference proof object mutation coordinates disagree".into());
+            }
+            LocalChange::object_head(
+                mutation.stamp.source_journal_position,
+                mutation.tenant_id,
+                mutation.bucket_id,
+                mutation.exact_path.clone(),
+                mutation.version.id,
+                mutation.version.deleted,
+                mutation.reference_deltas.clone(),
+                mutation.accounting_transition,
+                mutation.definition_transition.clone(),
+            )
+        }
+        ReferenceProofMutation::RetainedVersionDelete(mutation) => {
+            mutation.validate().map_err(|error| {
+                format!("reference proof retained-version mutation is invalid: {error}")
+            })?;
+            if mutation.stamp.source_id != proof.source_id
+                || mutation.stamp.source_journal_position != proof.offset()
+                || mutation.stamp.mutation_fingerprint != proof.mutation_fingerprint
+            {
+                return Err("reference proof retained-version coordinates disagree".into());
+            }
+            LocalChange::retained_version_deleted(
+                mutation.stamp.source_journal_position,
+                mutation.tenant_id,
+                mutation.bucket_id,
+                mutation.exact_path.clone(),
+                mutation.target.id,
+                mutation
+                    .replacement_tombstone
+                    .as_ref()
+                    .map(|replacement| replacement.id),
+                mutation.reference_deltas.clone(),
+                Some(if mutation.replacement_tombstone.is_some() {
+                    AccountingHeadTransition::new(
+                        mutation.target.blob.as_ref().map(|blob| blob.length),
+                        None,
+                    )
+                } else {
+                    AccountingHeadTransition::new(None, None)
+                }),
+            )
+        }
+        ReferenceProofMutation::ProgramPath(mutation) => {
+            mutation.validate().map_err(|error| {
+                format!("reference proof program-path mutation is invalid: {error}")
+            })?;
+            if mutation.stamp.source_id != proof.source_id
+                || mutation.stamp.source_journal_position != proof.offset()
+                || mutation.stamp.mutation_fingerprint != proof.mutation_fingerprint
+            {
+                return Err("reference proof program-path mutation coordinates disagree".into());
+            }
+            LocalChange::object_head(
+                mutation.stamp.source_journal_position,
+                mutation.stage.tenant_id,
+                mutation.stage.bucket_id,
+                mutation.stage.path.path.clone(),
+                mutation.stage.version.id,
+                mutation.stage.version.deleted,
+                mutation.reference_deltas.clone(),
+                Some(AccountingHeadTransition::new(
+                    mutation
+                        .stage
+                        .previous_version
+                        .as_ref()
+                        .and_then(|version| version.blob.as_ref().map(|blob| blob.length)),
+                    mutation.stage.version.blob.as_ref().map(|blob| blob.length),
+                )),
+                None,
+            )
+        }
+    };
+    if expected_change != proof.change {
+        return Err("reference proof change disagrees with its typed mutation".into());
     }
     let (tenant_id, bucket_id, exact_path, reference_deltas) = match &proof.change {
         LocalChange::ObjectHead(change) => {

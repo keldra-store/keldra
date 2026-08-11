@@ -516,6 +516,7 @@ impl Store {
                     // it for an old journal entry that lacks transition
                     // evidence and unnecessarily rebuild their baseline.
                     accounting_transition: Some(AccountingHeadTransition::new(None, None)),
+                    definition_transition: None,
                 }),
             )
         };
@@ -538,6 +539,7 @@ impl Store {
         let mut options = WriteOptions::default();
         options.set_sync(self.sync_writes);
         self.db.write_opt(batch, &options).map_err(storage_error)?;
+        self.settle_inline_source_changes()?;
         self.notify_local_invalidations();
         Ok(outcome)
     }

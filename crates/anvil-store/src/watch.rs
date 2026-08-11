@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq as _;
 use thiserror::Error;
 
-use crate::{ObjectKey, ReferenceDelta, VersionId};
+use crate::{DefinitionTransition, ObjectKey, ReferenceDelta, VersionId};
 
 /// Release defaults for the one source-local 0.5.0 invalidation journal.
 pub const DEFAULT_WATCH_MAX_ENTRIES: u64 = 1_000_000;
@@ -13,6 +13,7 @@ pub const DEFAULT_WATCH_MAX_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_LOCAL_INVALIDATION_SCAN_RECORDS: usize = 1_024;
 
 pub(crate) const LOCAL_INVALIDATION_OFFSET_KEY: &[u8] = b"local_invalidation_offset";
+pub(crate) const LOCAL_INVALIDATION_SETTLED_KEY: &[u8] = b"local_invalidation_settled_through";
 pub(crate) const LOCAL_INVALIDATION_FLOOR_KEY: &[u8] = b"local_invalidation_floor";
 pub(crate) const LOCAL_INVALIDATION_COUNT_KEY: &[u8] = b"local_invalidation_count";
 pub(crate) const LOCAL_INVALIDATION_BYTES_KEY: &[u8] = b"local_invalidation_bytes";
@@ -22,7 +23,7 @@ pub(crate) const LOCAL_INVALIDATION_TOKEN_KEY: &[u8] = b"local_invalidation_toke
 const WATCH_TOKEN_FORMAT: u16 = 1;
 const WATCH_TOKEN_MAX_ENCODED_BYTES: usize = 16 * 1024;
 const LOCAL_CHANGE_FORMAT: u16 = 1;
-const REFERENCE_PROOF_FORMAT: u16 = 1;
+const REFERENCE_PROOF_FORMAT: u16 = 2;
 const REFERENCE_PROOF_NAMESPACE: u8 = 0xff;
 pub(crate) const REFERENCE_PROOF_KEY_BYTES: usize =
     1 + 1 + size_of::<u16>() + size_of::<[u8; 32]>() + size_of::<u64>();
@@ -155,6 +156,10 @@ pub struct WatchJournalStatus {
     pub source_id: SourceId,
     /// Highest offset ever allocated, including entries already pruned.
     pub tail: u64,
+    /// Highest contiguous offset whose object metadata is known to have
+    /// reached its required authority. Derived consumers must never read
+    /// beyond this boundary; retention and handoff continue to use `tail`.
+    pub settled_through: u64,
     /// Lowest valid resume cursor. Entries through this offset were pruned.
     pub retention_floor: u64,
     pub retained_entries: u64,
@@ -267,6 +272,8 @@ pub struct ObjectHeadChange {
     pub reference_deltas: Vec<ReferenceDelta>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accounting_transition: Option<AccountingHeadTransition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition_transition: Option<DefinitionTransition>,
 }
 
 /// Deletion of one retained immutable descriptor that did not necessarily
@@ -347,15 +354,27 @@ pub struct OversizeLocalChange {
 
 /// Exact object-mutation evidence copied to every complete metadata replica.
 ///
-/// This is not a second event stream or a commit marker. It is the bounded
-/// source-journal change plus the fingerprint that already identifies the
-/// typed mutation which created it.
+/// This is not a second event stream or a commit marker. It retains the
+/// bounded source-journal change and exact typed metadata mutation needed to
+/// complete an interrupted ordinary mutation quorum. Atomic-program evidence
+/// remains exact but completion stays with the nominated executor.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReferenceProof {
     format: u16,
     pub source_id: SourceId,
     pub mutation_fingerprint: [u8; 32],
     pub change: LocalChange,
+    pub mutation: ReferenceProofMutation,
+}
+
+/// Replayable typed metadata operation retained under the existing proof key.
+/// It contains descriptors and lineage only; payload bytes remain in the
+/// ordinary inline or erasure-coded byte plane.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReferenceProofMutation {
+    Object(crate::ObjectMutation),
+    RetainedVersionDelete(crate::RetainedVersionDeleteMutation),
+    ProgramPath(crate::ProgramPathMutation),
 }
 
 impl ReferenceProof {
@@ -363,12 +382,14 @@ impl ReferenceProof {
         source_id: SourceId,
         mutation_fingerprint: [u8; 32],
         change: LocalChange,
+        mutation: ReferenceProofMutation,
     ) -> Self {
         Self {
             format: REFERENCE_PROOF_FORMAT,
             source_id,
             mutation_fingerprint,
             change,
+            mutation,
         }
     }
 
@@ -392,6 +413,7 @@ impl LocalChange {
         deleted: bool,
         reference_deltas: Vec<ReferenceDelta>,
         accounting_transition: Option<AccountingHeadTransition>,
+        definition_transition: Option<DefinitionTransition>,
     ) -> Self {
         Self::ObjectHead(ObjectHeadChange {
             offset,
@@ -406,6 +428,7 @@ impl LocalChange {
             },
             reference_deltas,
             accounting_transition,
+            definition_transition,
         })
     }
 
@@ -521,21 +544,6 @@ pub(crate) enum ReferenceProofCodecError {
     UnsupportedFormat(u16),
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum StoredLocalChange {
-    Current(LocalChange),
-    V050(LocalInvalidation),
-}
-
-impl StoredLocalChange {
-    pub(crate) fn offset(&self) -> u64 {
-        match self {
-            Self::Current(change) => change.offset(),
-            Self::V050(invalidation) => invalidation.offset,
-        }
-    }
-}
-
 pub(crate) fn encode_local_change(change: &LocalChange) -> Result<Vec<u8>, LocalChangeCodecError> {
     serde_json::to_vec(&LocalChangeEnvelopeRef {
         format: LOCAL_CHANGE_FORMAT,
@@ -544,24 +552,12 @@ pub(crate) fn encode_local_change(change: &LocalChange) -> Result<Vec<u8>, Local
     .map_err(Into::into)
 }
 
-pub(crate) fn decode_local_change(
-    encoded: &[u8],
-) -> Result<StoredLocalChange, LocalChangeCodecError> {
-    let value = serde_json::from_slice::<serde_json::Value>(encoded)?;
-    if value.get("format").is_some() {
-        let envelope = serde_json::from_value::<LocalChangeEnvelope>(value)?;
-        if envelope.format != LOCAL_CHANGE_FORMAT {
-            return Err(LocalChangeCodecError::UnsupportedFormat(envelope.format));
-        }
-        return Ok(StoredLocalChange::Current(envelope.change));
+pub(crate) fn decode_local_change(encoded: &[u8]) -> Result<LocalChange, LocalChangeCodecError> {
+    let envelope = serde_json::from_slice::<LocalChangeEnvelope>(encoded)?;
+    if envelope.format != LOCAL_CHANGE_FORMAT {
+        return Err(LocalChangeCodecError::UnsupportedFormat(envelope.format));
     }
-
-    // Anvil 0.5.0 stored the object-head invalidation directly as JSON. There
-    // are only two possible records (present or deleted), both represented by
-    // this exact released type.
-    serde_json::from_value::<LocalInvalidation>(value)
-        .map(StoredLocalChange::V050)
-        .map_err(Into::into)
+    Ok(envelope.change)
 }
 
 pub(crate) fn encode_reference_proof(
@@ -787,45 +783,17 @@ mod tests {
             false,
             Vec::new(),
             None,
+            None,
         );
         let encoded = encode_local_change(&expected).unwrap();
         let value = serde_json::from_slice::<serde_json::Value>(&encoded).unwrap();
         assert_eq!(value["format"], LOCAL_CHANGE_FORMAT);
         assert_eq!(value["change"]["kind"], "object_head");
-        assert_eq!(
-            decode_local_change(&encoded).unwrap(),
-            StoredLocalChange::Current(expected)
-        );
+        assert_eq!(decode_local_change(&encoded).unwrap(), expected);
     }
 
     #[test]
-    fn every_released_v050_invalidation_shape_decodes_as_an_object_head_change() {
-        let fixtures = [
-            (
-                br#"{"offset":7,"key":{"tenant":"tenant","bucket":"bucket","path":"documents/one"},"minimum_path_version":41,"state_hint":"present"}"#
-                    .as_slice(),
-                InvalidationStateHint::Present,
-            ),
-            (
-                br#"{"offset":8,"key":{"tenant":"tenant","bucket":"bucket","path":"documents/two"},"minimum_path_version":42,"state_hint":"deleted"}"#
-                    .as_slice(),
-                InvalidationStateHint::Deleted,
-            ),
-        ];
-
-        for (encoded, expected_hint) in fixtures {
-            let StoredLocalChange::V050(invalidation) = decode_local_change(encoded).unwrap()
-            else {
-                panic!("0.5.0 record decoded as a current envelope")
-            };
-            assert_eq!(invalidation.key.tenant(), "tenant");
-            assert_eq!(invalidation.key.bucket(), "bucket");
-            assert_eq!(invalidation.state_hint, expected_hint);
-        }
-    }
-
-    #[test]
-    fn unknown_local_change_formats_fail_instead_of_falling_back_to_v050() {
+    fn unknown_local_change_formats_fail_closed() {
         let change = LocalChange::object_head(
             9,
             11,
@@ -834,6 +802,7 @@ mod tests {
             VersionId(43),
             false,
             Vec::new(),
+            None,
             None,
         );
         let encoded = encode_local_change(&change).unwrap();

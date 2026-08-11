@@ -7,14 +7,14 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::{
-    CF_HEADS, CF_METADATA, CF_RECEIPTS, CF_VERSIONS, RECEIPT_RECORD_PREFIX,
+    CF_DEFINITION_STATE, CF_HEADS, CF_METADATA, CF_RECEIPTS, CF_VERSIONS, RECEIPT_RECORD_PREFIX,
     STORAGE_KEY_FORMAT_VERSION, StoredReceipt, VERSION_HIGH_WATERMARK_KEY, now_unix_millis,
     receipt_key, version_blob_reference,
 };
 use crate::key::{BucketId, BucketIdentity, TenantId};
 use crate::{
-    Head, MAX_CONTENT_TYPE_BYTES, MUTATION_STAMP_FORMAT, MutationError, ObjectKey, ObjectMutation,
-    Store, Version, VersionId,
+    DefinitionKind, DefinitionLocator, Head, MAX_CONTENT_TYPE_BYTES, MUTATION_STAMP_FORMAT,
+    MutationError, ObjectKey, ObjectMutation, Store, Version, VersionId,
 };
 
 pub const MAX_OBJECT_RECORD_EXPORT_RECORDS: u32 = 1_000;
@@ -81,6 +81,8 @@ pub struct ObjectPathSnapshot {
     pub exact_path: String,
     pub head: Head,
     pub versions: Vec<Version>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition_locator: Option<DefinitionLocator>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,6 +203,21 @@ impl ObjectPathSnapshot {
             return Err(invalid_snapshot(
                 "head and current version descriptor disagree",
             ));
+        }
+        if let Some(locator) = self.definition_locator.as_ref() {
+            locator
+                .validate()
+                .map_err(|error| invalid_snapshot(error.to_string()))?;
+            if self.head.deleted
+                || locator.tenant_id != self.tenant_id
+                || locator.bucket_id != self.bucket_id
+                || locator.path != self.exact_path
+                || locator.object_version != self.head.version
+            {
+                return Err(invalid_snapshot(
+                    "definition locator does not match the live snapshot head",
+                ));
+            }
         }
         Ok(())
     }
@@ -331,6 +348,11 @@ impl Store {
                 }) {
                     continue;
                 }
+                let locator = definition_locator_for_head_key(
+                    &snapshot,
+                    self.cf(CF_DEFINITION_STATE).map_err(object_storage)?,
+                    &key,
+                )?;
                 let record = ObjectRecordExport::ExactPath(decode_path_snapshot(
                     key.as_ref(),
                     encoded_head.as_ref(),
@@ -338,6 +360,7 @@ impl Store {
                         self.cf(CF_VERSIONS).map_err(object_storage)?,
                         IteratorMode::From(&version_prefix_for_head(&key), Direction::Forward),
                     ),
+                    locator,
                 )?);
                 if !append_export_record(
                     &mut records,
@@ -478,6 +501,13 @@ impl Store {
             }
             batch.delete_cf(versions, key);
         }
+        self.stage_snapshot_locator(
+            &mut batch,
+            tenant_id,
+            bucket_id,
+            exact_path,
+            selected.and_then(|snapshot| snapshot.definition_locator.as_ref()),
+        )?;
 
         if let Some(selected) = selected {
             for version in &selected.versions {
@@ -551,6 +581,13 @@ impl Store {
             &head_key,
             serde_json::to_vec(&record.head).map_err(object_storage)?,
         );
+        self.stage_snapshot_locator(
+            &mut batch,
+            record.tenant_id,
+            record.bucket_id,
+            &record.exact_path,
+            record.definition_locator.as_ref(),
+        )?;
         self.stage_object_high_watermark(&mut batch, record.head.version)?;
         self.write_object_snapshot_batch(batch)?;
         self.clock.observe(record.head.version);
@@ -625,20 +662,26 @@ impl Store {
         &self,
         head_key: &[u8],
     ) -> Result<Option<ObjectPathSnapshot>, ObjectSnapshotError> {
-        let Some(encoded_head) = self
-            .db
+        let snapshot = self.db.snapshot();
+        let Some(encoded_head) = snapshot
             .get_cf(self.cf(CF_HEADS).map_err(object_storage)?, head_key)
             .map_err(object_storage)?
         else {
             return Ok(None);
         };
+        let locator = definition_locator_for_head_key(
+            &snapshot,
+            self.cf(CF_DEFINITION_STATE).map_err(object_storage)?,
+            head_key,
+        )?;
         decode_path_snapshot(
             head_key,
             &encoded_head,
-            self.db.iterator_cf(
+            snapshot.iterator_cf(
                 self.cf(CF_VERSIONS).map_err(object_storage)?,
                 IteratorMode::From(&version_prefix_for_head(head_key), Direction::Forward),
             ),
+            locator,
         )
         .map(Some)
     }
@@ -657,6 +700,37 @@ impl Store {
             VERSION_HIGH_WATERMARK_KEY,
             serde_json::to_vec(&high_watermark).map_err(object_storage)?,
         );
+        Ok(())
+    }
+
+    fn stage_snapshot_locator(
+        &self,
+        batch: &mut WriteBatch,
+        tenant_id: u64,
+        bucket_id: u64,
+        exact_path: &str,
+        locator: Option<&DefinitionLocator>,
+    ) -> Result<(), ObjectSnapshotError> {
+        let definition_state = self.cf(CF_DEFINITION_STATE).map_err(object_storage)?;
+        for kind in DefinitionKind::ALL {
+            let key = super::definition_state::locator_key(kind, tenant_id, bucket_id, exact_path)
+                .map_err(object_storage)?;
+            batch.delete_cf(definition_state, key);
+        }
+        if let Some(locator) = locator {
+            let key = super::definition_state::locator_key(
+                locator.kind,
+                locator.tenant_id,
+                locator.bucket_id,
+                &locator.path,
+            )
+            .map_err(object_storage)?;
+            batch.put_cf(
+                definition_state,
+                key,
+                super::definition_state::encode_locator(locator),
+            );
+        }
         Ok(())
     }
 
@@ -728,6 +802,7 @@ fn decode_path_snapshot<I>(
     encoded_head_key: &[u8],
     encoded_head: &[u8],
     versions: I,
+    definition_locator: Option<DefinitionLocator>,
 ) -> Result<ObjectPathSnapshot, ObjectSnapshotError>
 where
     I: IntoIterator<Item = Result<(Box<[u8]>, Box<[u8]>), rocksdb::Error>>,
@@ -766,9 +841,42 @@ where
         exact_path,
         head,
         versions: retained,
+        definition_locator,
     };
     record.validate()?;
     Ok(record)
+}
+
+fn definition_locator_for_head_key(
+    snapshot: &rocksdb::SnapshotWithThreadMode<'_, rocksdb::DB>,
+    definition_state: &rocksdb::ColumnFamily,
+    encoded_head_key: &[u8],
+) -> Result<Option<DefinitionLocator>, ObjectSnapshotError> {
+    if encoded_head_key.len() <= BucketIdentity::ENCODED_BYTES {
+        return Err(object_storage("object head key is malformed"));
+    }
+    let tenant_id = read_u64(&encoded_head_key[1..9])?;
+    let bucket_id = read_u64(&encoded_head_key[9..17])?;
+    let path = std::str::from_utf8(&encoded_head_key[17..]).map_err(object_storage)?;
+    let mut selected = None;
+    for kind in DefinitionKind::ALL {
+        let key = super::definition_state::locator_key(kind, tenant_id, bucket_id, path)
+            .map_err(object_storage)?;
+        let Some(value) = snapshot
+            .get_cf(definition_state, &key)
+            .map_err(object_storage)?
+        else {
+            continue;
+        };
+        let locator =
+            super::definition_state::decode_locator(&key, &value).map_err(object_storage)?;
+        if selected.replace(locator).is_some() {
+            return Err(invalid_snapshot(
+                "one definition path has multiple typed locators",
+            ));
+        }
+    }
+    Ok(selected)
 }
 
 fn validate_stored_receipt(
@@ -784,6 +892,7 @@ fn validate_stored_receipt(
         || stored.deleted != mutation.version.deleted
         || stored.expires_at_unix_millis != mutation.receipt_expires_at_unix_millis
         || stored.object_mutation.as_ref() != Some(mutation)
+        || stored.definition_transition != mutation.definition_transition
         || receipt_key(
             stable_identity(mutation.tenant_id, mutation.bucket_id),
             &mutation.command_id,
@@ -803,6 +912,7 @@ fn stored_receipt(mutation: &ObjectMutation) -> StoredReceipt {
         deleted: mutation.version.deleted,
         expires_at_unix_millis: mutation.receipt_expires_at_unix_millis,
         object_mutation: Some(mutation.clone()),
+        definition_transition: mutation.definition_transition.clone(),
     }
 }
 

@@ -187,6 +187,9 @@ impl Store {
         if let Some(replacement) = mutation.replacement_tombstone.as_ref() {
             self.clock.observe(replacement.id);
         }
+        if reference_effects == LocalReferenceEffects::AppliedInline {
+            self.settle_inline_source_changes()?;
+        }
         self.notify_local_invalidations();
         Ok(CoordinatedRetainedVersionDelete {
             outcome: mutation.outcome(),

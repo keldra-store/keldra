@@ -5,7 +5,7 @@ impl Store {
     /// consumer that currently constrains reference delivery. The value is
     /// monotonic for one running process and is reconstructed from destination
     /// cursors after restart rather than becoming another durable side plane.
-    pub async fn advance_source_journal_safe_through(
+    pub async fn advance_source_journal_reference_safe_through(
         &self,
         offset: u64,
     ) -> Result<(), MutationError> {
@@ -14,7 +14,7 @@ impl Store {
             .local_watch_status()
             .map_err(|error| MutationError::Storage(error.to_string()))?;
         let current = self
-            .source_journal_safe_through
+            .source_journal_reference_safe_through
             .load(std::sync::atomic::Ordering::Acquire);
         if offset < current {
             return Err(MutationError::Storage(format!(
@@ -27,53 +27,153 @@ impl Store {
                 status.tail
             )));
         }
-        self.source_journal_safe_through
+        self.source_journal_reference_safe_through
             .store(offset, std::sync::atomic::Ordering::Release);
         self.enforce_local_watch_retention()
-            .map_err(|error| MutationError::Storage(error.to_string()))
+            .map_err(|error| MutationError::Storage(error.to_string()))?;
+        self.notify_local_invalidations();
+        Ok(())
     }
 
-    fn materialize_local_change(
+    /// Advances the highest contiguous source offset whose metadata and
+    /// atomic-program visibility are settled. This cut never controls journal
+    /// pruning; reference-delivery safety has its own independent boundary.
+    pub async fn advance_source_journal_settled_through(
         &self,
-        stored: StoredLocalChange,
-    ) -> Result<LocalChange, MutationError> {
-        match stored {
-            StoredLocalChange::Current(change) => Ok(change),
-            StoredLocalChange::V050(invalidation) => {
-                let tenant_id = self
-                    .tenant_id_by_name(invalidation.key.tenant())?
-                    .ok_or_else(|| {
-                        MutationError::Storage(format!(
-                            "0.5.0 local invalidation tenant `{}` has no stable identity mapping",
-                            invalidation.key.tenant()
-                        ))
-                    })?;
-                let bucket_id = self
-                    .bucket_id_by_name(tenant_id, invalidation.key.bucket())?
-                    .ok_or_else(|| {
-                        MutationError::Storage(format!(
-                            "0.5.0 local invalidation bucket `{}/{}` has no stable identity mapping",
-                            invalidation.key.tenant(),
-                            invalidation.key.bucket()
-                        ))
-                    })?;
-                Ok(LocalChange::object_head(
-                    invalidation.offset,
-                    tenant_id.0,
-                    bucket_id.0,
-                    invalidation.key.path().to_owned(),
-                    invalidation.minimum_path_version,
-                    invalidation.state_hint == InvalidationStateHint::Deleted,
-                    Vec::new(),
-                    None,
-                ))
+        offset: u64,
+    ) -> Result<(), MutationError> {
+        let _commit_guard = self.commit_lock.lock().await;
+        let status = self
+            .local_watch_status()
+            .map_err(|error| MutationError::Storage(error.to_string()))?;
+        let current = status.settled_through;
+        if offset < current {
+            return Err(MutationError::Storage(format!(
+                "source journal settled cursor regressed from {current} to {offset}"
+            )));
+        }
+        if offset > status.tail {
+            return Err(MutationError::Storage(format!(
+                "source journal settled cursor {offset} is beyond tail {}",
+                status.tail
+            )));
+        }
+        if offset == current {
+            return Ok(());
+        }
+        let mut options = WriteOptions::default();
+        options.set_sync(self.sync_writes);
+        self.db
+            .put_cf_opt(
+                self.cf(CF_METADATA)?,
+                LOCAL_INVALIDATION_SETTLED_KEY,
+                offset.to_be_bytes(),
+                &options,
+            )
+            .map_err(storage_error)?;
+        self.notify_local_invalidations();
+        Ok(())
+    }
+
+    /// Durably settles one quorum-proven source position when it is the next
+    /// contiguous event. An already-settled position is an idempotent no-op;
+    /// an out-of-order position is left for the recovery worker.
+    pub async fn settle_source_journal_position_if_contiguous(
+        &self,
+        source: SourceId,
+        offset: u64,
+    ) -> Result<bool, MutationError> {
+        let _commit_guard = self.commit_lock.lock().await;
+        let status = self
+            .local_watch_status()
+            .map_err(|error| MutationError::Storage(error.to_string()))?;
+        if source != status.source_id {
+            return Err(MutationError::Storage(format!(
+                "source journal identity {source:?} does not match local source {:?}",
+                status.source_id
+            )));
+        }
+        if offset > status.tail {
+            return Err(MutationError::Storage(format!(
+                "source journal settled cursor {offset} is beyond tail {}",
+                status.tail
+            )));
+        }
+        if offset <= status.settled_through {
+            return Ok(false);
+        }
+        let next = status.settled_through.checked_add(1).ok_or_else(|| {
+            MutationError::Storage("source journal settled cursor overflowed".into())
+        })?;
+        if offset != next {
+            return Ok(false);
+        }
+
+        let mut options = WriteOptions::default();
+        options.set_sync(self.sync_writes);
+        self.db
+            .put_cf_opt(
+                self.cf(CF_METADATA)?,
+                LOCAL_INVALIDATION_SETTLED_KEY,
+                offset.to_be_bytes(),
+                &options,
+            )
+            .map_err(storage_error)?;
+        self.notify_local_invalidations();
+        Ok(true)
+    }
+
+    /// Reconstructs the volatile reference-safe cut after a one-node mutation.
+    /// Its durable visibility cut was already staged in the same RocksDB batch
+    /// as the journal entry; this helper performs no second durable write.
+    pub(crate) fn settle_inline_source_changes(&self) -> Result<(), MutationError> {
+        let status = self
+            .local_watch_status()
+            .map_err(|error| MutationError::Storage(error.to_string()))?;
+        let reference_safe = self
+            .source_journal_reference_safe_through
+            .load(std::sync::atomic::Ordering::Acquire);
+        if reference_safe > status.tail {
+            return Err(MutationError::Storage(format!(
+                "source journal reference-safe cursor {reference_safe} is beyond tail {}",
+                status.tail,
+            )));
+        }
+        self.source_journal_reference_safe_through
+            .store(status.tail, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    /// Waits without holding the commit lock until the proof-backed source cut
+    /// reaches the physical tail, then acquires the lock and rechecks. The
+    /// returned guard prevents a new head/journal batch from entering before a
+    /// snapshot worker captures its RocksDB snapshot.
+    pub(crate) async fn lock_settled_source_snapshot(
+        &self,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, WatchError> {
+        loop {
+            let mut notifications = self.watch_notify.subscribe();
+            let status = self.local_watch_status()?;
+            if status.settled_through != status.tail {
+                notifications.changed().await.map_err(|_| {
+                    WatchError::Storage("local source settlement notifier closed".into())
+                })?;
+                continue;
             }
+            let guard = self.commit_lock.clone().lock_owned().await;
+            let status = self.local_watch_status()?;
+            if status.settled_through == status.tail {
+                return Ok(guard);
+            }
+            drop(guard);
         }
     }
 
-    fn decode_local_change_record(&self, encoded: &[u8]) -> Result<LocalChange, MutationError> {
-        let stored = decode_local_change(encoded).map_err(storage_error)?;
-        self.materialize_local_change(stored)
+    pub(crate) fn decode_local_change_record(
+        &self,
+        encoded: &[u8],
+    ) -> Result<LocalChange, MutationError> {
+        decode_local_change(encoded).map_err(storage_error)
     }
 
     fn watch_scope_identity(&self, scope: &WatchScope) -> Result<BucketIdentity, WatchError> {
@@ -103,10 +203,17 @@ impl Store {
     }
 
     pub fn local_watch_status(&self) -> Result<WatchJournalStatus, WatchError> {
+        let snapshot = self.db.snapshot();
+        self.local_watch_status_at(&snapshot)
+    }
+
+    pub(crate) fn local_watch_status_at(
+        &self,
+        snapshot: &rocksdb::SnapshotWithThreadMode<'_, rocksdb::DB>,
+    ) -> Result<WatchJournalStatus, WatchError> {
         let metadata = self
             .cf(CF_METADATA)
             .map_err(|error| WatchError::Storage(error.to_string()))?;
-        let snapshot = self.db.snapshot();
         let read_counter = |key: &[u8]| {
             let encoded = snapshot
                 .get_cf(metadata, key)
@@ -115,10 +222,14 @@ impl Store {
             decode_watch_u64(&encoded)
         };
         let tail = read_counter(LOCAL_INVALIDATION_OFFSET_KEY)?;
+        let settled_through = read_counter(LOCAL_INVALIDATION_SETTLED_KEY)?;
         let retention_floor = read_counter(LOCAL_INVALIDATION_FLOOR_KEY)?;
         let retained_entries = read_counter(LOCAL_INVALIDATION_COUNT_KEY)?;
         let retained_bytes = read_counter(LOCAL_INVALIDATION_BYTES_KEY)?;
-        if retention_floor > tail || retained_entries != tail - retention_floor {
+        if retention_floor > settled_through
+            || settled_through > tail
+            || retained_entries != tail - retention_floor
+        {
             return Err(WatchError::Storage(
                 "local invalidation retention metadata is inconsistent".into(),
             ));
@@ -129,6 +240,7 @@ impl Store {
                 source_epoch: self.watch_source_epoch,
             },
             tail,
+            settled_through,
             retention_floor,
             retained_entries,
             retained_bytes,
@@ -142,7 +254,7 @@ impl Store {
     ) -> Result<WatchCursor, WatchError> {
         let status = self.local_watch_status()?;
         let cursor = match start {
-            WatchStart::Now => WatchCursor::new(status.tail),
+            WatchStart::Now => WatchCursor::new(status.settled_through),
             WatchStart::RetainedBeginning => WatchCursor::new(status.retention_floor),
             WatchStart::Resume(token) => decode_resume_token(
                 &token,
@@ -152,7 +264,7 @@ impl Store {
                 self.watch_retention,
             )?,
         };
-        if cursor.offset() < status.retention_floor || cursor.offset() > status.tail {
+        if cursor.offset() < status.retention_floor || cursor.offset() > status.settled_through {
             return Err(WatchError::ResumeExpired);
         }
         Ok(cursor)
@@ -164,7 +276,7 @@ impl Store {
         cursor: WatchCursor,
     ) -> Result<Vec<u8>, WatchError> {
         let status = self.local_watch_status()?;
-        if cursor.offset() < status.retention_floor || cursor.offset() > status.tail {
+        if cursor.offset() < status.retention_floor || cursor.offset() > status.settled_through {
             return Err(WatchError::ResumeExpired);
         }
         encode_resume_token(
@@ -189,11 +301,11 @@ impl Store {
         let _commit_guard = self.commit_lock.lock().await;
         let scope_identity = self.watch_scope_identity(scope)?;
         let status = self.local_watch_status()?;
-        if cursor.offset() < status.retention_floor || cursor.offset() > status.tail {
+        if cursor.offset() < status.retention_floor || cursor.offset() > status.settled_through {
             return Err(WatchError::ResumeExpired);
         }
         let limit = limit.min(MAX_LOCAL_INVALIDATION_SCAN_RECORDS);
-        if limit == 0 || cursor.offset() == status.tail {
+        if limit == 0 || cursor.offset() == status.settled_through {
             return Ok(WatchPage {
                 invalidations: Vec::new(),
                 checkpoint: cursor,
@@ -202,7 +314,7 @@ impl Store {
         let through = cursor
             .offset()
             .saturating_add(limit as u64)
-            .min(status.tail);
+            .min(status.settled_through);
         let mut invalidations = Vec::new();
         let first_offset = cursor.offset() + 1;
         let first_key = invalidation_key(first_offset);
@@ -224,16 +336,13 @@ impl Store {
                     "retained local invalidation offset {expected} is missing"
                 )));
             }
-            let stored = decode_local_change(&encoded)
+            let change = decode_local_change(&encoded)
                 .map_err(|error| WatchError::Storage(error.to_string()))?;
-            if stored.offset() != offset {
+            if change.offset() != offset {
                 return Err(WatchError::Storage(
                     "local change key does not match its stored offset".into(),
                 ));
             }
-            let change = self
-                .materialize_local_change(stored)
-                .map_err(|error| WatchError::Storage(error.to_string()))?;
             if let Some(head) = change.into_object_head()
                 && head.tenant_id == scope_identity.tenant_id.0
                 && head.bucket_id == scope_identity.bucket_id.0
@@ -273,10 +382,11 @@ impl Store {
         let mut notifications = self.watch_notify.subscribe();
         loop {
             let status = self.local_watch_status()?;
-            if cursor.offset() < status.retention_floor || cursor.offset() > status.tail {
+            if cursor.offset() < status.retention_floor || cursor.offset() > status.settled_through
+            {
                 return Err(WatchError::ResumeExpired);
             }
-            if cursor.offset() < status.tail {
+            if cursor.offset() < status.settled_through {
                 return Ok(());
             }
             notifications
@@ -426,7 +536,7 @@ impl Store {
     }
 }
 
-fn encoded_change_len(change: &LocalChange) -> Result<u64, MutationError> {
+pub(crate) fn encoded_change_len(change: &LocalChange) -> Result<u64, MutationError> {
     let mut counter = ChangeByteCounter(0);
     serde_json::to_writer(&mut counter, change)
         .map_err(|error| MutationError::Storage(format!("encode local change: {error}")))?;
@@ -453,47 +563,26 @@ impl std::io::Write for ChangeByteCounter {
 mod tests {
     use super::*;
 
-    fn legacy_invalidation() -> LocalInvalidation {
-        LocalInvalidation::new(
-            7,
-            ObjectKey::new("tenant", "bucket", "documents/one").unwrap(),
-            VersionId(41),
-            false,
-        )
-    }
-
     #[tokio::test]
-    async fn v050_names_are_resolved_through_existing_stable_identity_mappings() {
+    async fn open_rejects_a_durable_settled_cursor_beyond_the_raw_tail() {
         let temporary = tempfile::tempdir().unwrap();
         let store = Store::open(StoreOptions::new(temporary.path(), 1))
             .await
             .unwrap();
-        let identity = store
-            .install_test_bucket_identity("tenant", "bucket")
+        store
+            .db
+            .put_cf(
+                store.cf(CF_METADATA).unwrap(),
+                LOCAL_INVALIDATION_SETTLED_KEY,
+                1_u64.to_be_bytes(),
+            )
             .unwrap();
-        let change = store
-            .materialize_local_change(StoredLocalChange::V050(legacy_invalidation()))
-            .unwrap()
-            .into_object_head()
-            .unwrap();
+        drop(store);
 
-        assert_eq!(change.tenant_id, identity.tenant_id.0);
-        assert_eq!(change.bucket_id, identity.bucket_id.0);
-        assert_eq!(change.exact_path, "documents/one");
-        assert_eq!(change.path_version, VersionId(41));
-        assert_eq!(change.kind, ObjectHeadChangeKind::Put);
-    }
-
-    #[tokio::test]
-    async fn v050_names_without_identity_mappings_fail_explicitly() {
-        let temporary = tempfile::tempdir().unwrap();
-        let store = Store::open(StoreOptions::new(temporary.path(), 1))
+        let error = Store::open(StoreOptions::new(temporary.path(), 1))
             .await
-            .unwrap();
-        let error = store
-            .materialize_local_change(StoredLocalChange::V050(legacy_invalidation()))
             .unwrap_err();
-        assert!(error.to_string().contains("has no stable identity mapping"));
+        assert!(error.to_string().contains("settled cursor 1"));
     }
 
     #[tokio::test]

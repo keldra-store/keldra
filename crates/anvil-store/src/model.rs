@@ -3,7 +3,9 @@ use thiserror::Error;
 
 use anvil_atomic_program::MAX_OBJECT_PATH_BYTES;
 
-use crate::{BlobRef, ObjectKey, ReferenceDelta, SourceId};
+use crate::{
+    BlobRef, DefinitionOperation, DefinitionTransition, ObjectKey, ReferenceDelta, SourceId,
+};
 
 /// A bucket policy is deliberately small enough to validate on every write.
 pub const MAX_BUCKET_POLICY_PREFIXES: usize = 64;
@@ -220,6 +222,8 @@ pub struct ObjectMutation {
     pub reference_deltas: Vec<ReferenceDelta>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accounting_transition: Option<crate::AccountingHeadTransition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition_transition: Option<DefinitionTransition>,
 }
 
 impl ObjectMutation {
@@ -257,6 +261,21 @@ impl ObjectMutation {
             hasher.update(b"anvil.accounting-head-transition.v1");
             hash_optional_u64(&mut hasher, transition.previous_live_length);
             hash_optional_u64(&mut hasher, transition.current_live_length);
+        }
+        match self.definition_transition.as_ref() {
+            Some(transition) => {
+                hasher.update(&[1]);
+                hasher.update(&[transition.kind as u8]);
+                hash_u64(&mut hasher, transition.tenant_id);
+                hash_u64(&mut hasher, transition.bucket_id);
+                hash_u64(&mut hasher, transition.definition_id);
+                hash_bytes(&mut hasher, transition.path.as_bytes());
+                hash_u64(&mut hasher, transition.object_version.0);
+                hasher.update(&[transition.operation as u8]);
+            }
+            None => {
+                hasher.update(&[0]);
+            }
         }
         *hasher.finalize().as_bytes()
     }
@@ -366,6 +385,26 @@ impl ObjectMutation {
             {
                 return Err(MutationError::InvalidObjectMutation(
                     "accounting head-transition does not match mutation lineage".into(),
+                ));
+            }
+        }
+        if let Some(transition) = self.definition_transition.as_ref() {
+            transition
+                .validate()
+                .map_err(|error| MutationError::InvalidObjectMutation(error.to_string()))?;
+            let expected_operation = if self.version.deleted {
+                DefinitionOperation::Delete
+            } else {
+                DefinitionOperation::Upsert
+            };
+            if transition.tenant_id != self.tenant_id
+                || transition.bucket_id != self.bucket_id
+                || transition.path != self.exact_path
+                || transition.object_version != self.version.id
+                || transition.operation != expected_operation
+            {
+                return Err(MutationError::InvalidObjectMutation(
+                    "definition transition does not match its enclosing object mutation".into(),
                 ));
             }
         }

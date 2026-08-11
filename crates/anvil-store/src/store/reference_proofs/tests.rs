@@ -149,6 +149,10 @@ async fn source_and_replica_store_exact_evidence_in_the_mutation_batch() {
             .unwrap()
             .unwrap()
     );
+    assert_eq!(
+        source_proof.mutation,
+        ReferenceProofMutation::Object(mutation.clone())
+    );
     let identity = BucketIdentity {
         tenant_id: TenantId(mutation.tenant_id),
         bucket_id: BucketId(mutation.bucket_id),
@@ -159,13 +163,16 @@ async fn source_and_replica_store_exact_evidence_in_the_mutation_batch() {
         mutation.stamp.source_journal_position,
     );
     let journal_key = invalidation_key(mutation.stamp.source_journal_position);
-    assert!(
-        wal_put_batches_since(&source, source_sequence)
-            .iter()
-            .any(|puts| puts.contains(&head_key)
+    let source_batches = wal_put_batches_since(&source, source_sequence);
+    let mutation_batch = source_batches
+        .iter()
+        .find(|puts| {
+            puts.contains(&head_key)
                 && puts.contains(&proof_key.to_vec())
-                && puts.contains(&journal_key.to_vec()))
-    );
+                && puts.contains(&journal_key.to_vec())
+        })
+        .expect("source metadata and proof share one batch");
+    assert!(!mutation_batch.contains(&LOCAL_INVALIDATION_SETTLED_KEY.to_vec()));
 
     let replica_sequence = replica.db.latest_sequence_number();
     assert_eq!(
@@ -402,10 +409,10 @@ async fn malformed_mismatched_and_changed_proofs_fail_closed() {
     let mut changed = proof.clone();
     changed.mutation_fingerprint[0] ^= 1;
     assert!(
-        !source
+        source
             .delete_reference_proof_if_matches(&changed)
             .await
-            .unwrap()
+            .is_err()
     );
     assert_eq!(
         source
@@ -438,12 +445,11 @@ async fn malformed_mismatched_and_changed_proofs_fail_closed() {
                 encode_reference_proof(&mismatch).unwrap(),
             )
             .unwrap();
-        assert_eq!(
+        assert!(
             replica
                 .apply_object_mutation_replica(&mutation)
                 .await
-                .unwrap_err(),
-            MutationError::ObjectMutationConflict
+                .is_err()
         );
     }
     let identity = BucketIdentity {

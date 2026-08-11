@@ -18,22 +18,23 @@ use crate::logical_record::decode_current_value;
 use crate::watch::{
     AggregateKind, InvalidationStateHint, LOCAL_INVALIDATION_BYTES_KEY,
     LOCAL_INVALIDATION_COUNT_KEY, LOCAL_INVALIDATION_EPOCH_KEY, LOCAL_INVALIDATION_FLOOR_KEY,
-    LOCAL_INVALIDATION_OFFSET_KEY, LOCAL_INVALIDATION_TOKEN_KEY, LocalChange, LocalChangePage,
-    LocalInvalidation, MAX_LOCAL_INVALIDATION_SCAN_RECORDS, ObjectHeadChangeKind,
-    OversizeLocalChange, SourceId, StoredLocalChange, WatchCursor, WatchError, WatchJournalStatus,
-    WatchPage, WatchRetention, WatchScope, WatchStart, decode_local_change, decode_resume_token,
-    encode_local_change, encode_resume_token, invalidation_key, invalidation_record_bytes,
-    offset_from_key,
+    LOCAL_INVALIDATION_OFFSET_KEY, LOCAL_INVALIDATION_SETTLED_KEY, LOCAL_INVALIDATION_TOKEN_KEY,
+    LocalChange, LocalChangePage, LocalInvalidation, MAX_LOCAL_INVALIDATION_SCAN_RECORDS,
+    ObjectHeadChangeKind, OversizeLocalChange, SourceId, WatchCursor, WatchError,
+    WatchJournalStatus, WatchPage, WatchRetention, WatchScope, WatchStart, decode_local_change,
+    decode_resume_token, encode_local_change, encode_resume_token, invalidation_key,
+    invalidation_record_bytes, offset_from_key,
 };
 use crate::{
     AWAITING_PUBLISH, AccountingHeadTransition, BatchOperation, BatchOutcome, BlobReader, BlobRef,
-    BlobReferenceState, BlobStore, BucketPolicy, DeleteRequest, DeleteRetainedVersionOutcome,
-    Durability, Head, MutationError, MutationReceipt, Object, ObjectKey, ObjectVersioning,
-    Precondition, PublishRequest, PutMode, PutRequest, ReferenceDelta, SMALL_BLOB_MAX_BYTES,
-    StorageTenantId, Version, VersionClock, VersionId,
+    BlobReferenceState, BlobStore, BucketPolicy, DefinitionTransition, DeleteRequest,
+    DeleteRetainedVersionOutcome, Durability, Head, MutationError, MutationReceipt, Object,
+    ObjectKey, ObjectVersioning, Precondition, PublishRequest, PutMode, PutRequest, ReferenceDelta,
+    SMALL_BLOB_MAX_BYTES, StorageTenantId, Version, VersionClock, VersionId,
 };
 
 const PROGRAM_DEFINITION_PREFIX: &str = "_anvil/programs/";
+const DEFINITION_ASSIGNMENT_NOTIFICATION_CAPACITY: usize = 64;
 
 pub(crate) const CF_HEADS: &str = "heads";
 pub(crate) const CF_VERSIONS: &str = "versions";
@@ -51,6 +52,8 @@ pub(crate) const CF_AUTHZ_BINDINGS: &str = "authz_bindings";
 pub(crate) const CF_AUTHZ_TUPLES: &str = "authz_tuples";
 pub(crate) const CF_AUTHZ_RECEIPTS: &str = "authz_receipts";
 pub(crate) const CF_CREDENTIALS: &str = "credentials";
+pub(crate) const CF_DEFINITION_STATE: &str = "definition_state";
+pub(crate) const CF_JOURNAL_ROUTES: &str = "journal_routes";
 pub(crate) const VERSION_HIGH_WATERMARK_KEY: &[u8] = b"version_high_watermark";
 const MUTATION_RECEIPT_COUNT_KEY: &[u8] = b"mutation_receipt_count";
 const MUTATION_RECEIPT_BYTES_KEY: &[u8] = b"mutation_receipt_bytes";
@@ -63,8 +66,6 @@ pub const DEFAULT_MUTATION_RECEIPT_MAX_BYTES: u64 = 512 * 1024 * 1024;
 pub const DEFAULT_AWAITING_PUBLISH_TTL_SECONDS: u64 = 24 * 60 * 60;
 pub const MAX_LIST_OBJECTS: usize = 1_000;
 pub const MAX_LIST_OBJECT_VERSIONS: usize = 1_000;
-const FORMAT_MARKER_NAME: &str = ".anvil-format";
-const FORMAT_MARKER: &[u8] = b"anvil-store-format:0.5\n";
 pub(crate) const COLUMN_FAMILIES: &[&str] = &[
     CF_HEADS,
     CF_VERSIONS,
@@ -82,6 +83,8 @@ pub(crate) const COLUMN_FAMILIES: &[&str] = &[
     CF_AUTHZ_TUPLES,
     CF_AUTHZ_RECEIPTS,
     CF_CREDENTIALS,
+    CF_DEFINITION_STATE,
+    CF_JOURNAL_ROUTES,
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -142,6 +145,7 @@ pub(crate) enum PendingLocalChange {
         deleted: bool,
         reference_deltas: Vec<ReferenceDelta>,
         accounting_transition: Option<crate::AccountingHeadTransition>,
+        definition_transition: Option<DefinitionTransition>,
     },
     RetainedVersionDeleted {
         identity: BucketIdentity,
@@ -251,6 +255,7 @@ pub struct Store {
     pub(crate) policy_gate: Arc<tokio::sync::RwLock<()>>,
     pub(crate) authz_write_lock: Arc<std::sync::Mutex<()>>,
     pub(crate) bucket_options_lock: Arc<std::sync::Mutex<()>>,
+    pub(crate) definition_state_lock: Arc<std::sync::Mutex<()>>,
     pub(crate) node_id: u16,
     pub(crate) sync_writes: bool,
     pub(crate) watch_retention: WatchRetention,
@@ -261,8 +266,10 @@ pub struct Store {
     /// Highest source-journal offset known safe for retention compaction.
     /// Restart initializes this to the durable floor and waits for current
     /// destination cursors before allowing any further compaction.
-    pub(crate) source_journal_safe_through: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) source_journal_reference_safe_through: Arc<std::sync::atomic::AtomicU64>,
     watch_notify: tokio::sync::watch::Sender<()>,
+    definition_assignment_notify:
+        tokio::sync::broadcast::Sender<Vec<crate::DefinitionAssignmentMutation>>,
     #[cfg(test)]
     policy_lookup_count: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
@@ -434,6 +441,8 @@ struct StoredReceipt {
     /// receipt's existing expiry. Released 0.5.0 receipts decode as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     object_mutation: Option<crate::model::ObjectMutation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    definition_transition: Option<DefinitionTransition>,
 }
 
 pub(crate) type PendingBlobReferences = BTreeMap<Vec<u8>, BlobReferenceState>;
@@ -462,7 +471,7 @@ impl Store {
             .awaiting_publish_ttl_seconds
             .checked_mul(1_000)
             .context("awaiting-publish blob TTL is too large")?;
-        ensure_format_marker(&options.root).await?;
+        tokio::fs::create_dir_all(&options.root).await?;
         let metadata_path = options.root.join("metadata");
         let mut db_options = Options::default();
         db_options.create_if_missing(true);
@@ -497,6 +506,7 @@ impl Store {
             policy_gate: Arc::new(tokio::sync::RwLock::new(())),
             authz_write_lock: Arc::new(std::sync::Mutex::new(())),
             bucket_options_lock: Arc::new(std::sync::Mutex::new(())),
+            definition_state_lock: Arc::new(std::sync::Mutex::new(())),
             node_id: options.node_id,
             sync_writes: options.sync_writes,
             watch_retention: options.watch_retention,
@@ -504,8 +514,12 @@ impl Store {
             awaiting_publish_ttl_millis,
             watch_source_epoch,
             watch_token_key,
-            source_journal_safe_through: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            source_journal_reference_safe_through: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             watch_notify: tokio::sync::watch::channel(()).0,
+            definition_assignment_notify: tokio::sync::broadcast::channel(
+                DEFINITION_ASSIGNMENT_NOTIFICATION_CAPACITY,
+            )
+            .0,
             #[cfg(test)]
             policy_lookup_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
@@ -513,7 +527,7 @@ impl Store {
         };
         let durable_floor = store.local_watch_status()?.retention_floor;
         store
-            .source_journal_safe_through
+            .source_journal_reference_safe_through
             .store(durable_floor, std::sync::atomic::Ordering::Release);
         store.enforce_local_watch_retention()?;
         Ok(store)
@@ -661,6 +675,23 @@ impl Store {
         Ok(self
             .resolve_bucket_identity(key.tenant(), key.bucket())?
             .head_key(key.path()))
+    }
+
+    /// Runs one internal orchestration step while holding the same exact
+    /// logical-path lock used by every ordinary Put/Delete/Publish mutation.
+    /// This does not use the atomic-program lock table and owns no additional
+    /// authority or persistent state.
+    pub async fn with_ordinary_object_path_lock<T, F, Fut>(
+        &self,
+        key: &ObjectKey,
+        operation: F,
+    ) -> T
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let _guard = self.ordinary_locks.acquire(&[object_path(key)]).await;
+        operation().await
     }
 
     /// Adds immutable namespaces. Existing immutable policy may only become
@@ -853,7 +884,9 @@ impl Store {
 
 mod authz_journal;
 mod blob_references;
+pub(crate) mod definition_state;
 mod delete_version;
+mod journal_routes;
 mod mutations;
 mod object_snapshot;
 mod object_snapshot_scan;
@@ -862,6 +895,7 @@ mod payload_handoff;
 mod reads;
 mod reference_deltas;
 mod reference_proofs;
+mod retained_snapshot_scan;
 mod shards;
 mod watch_journal;
 
@@ -887,6 +921,10 @@ pub use reference_proofs::{
     ReferenceProofExportError, ReferenceProofPage, ReferenceProofPruneError,
     ReferenceProofPruneResult,
 };
+pub use retained_snapshot_scan::{
+    RetainedHeadState, RetainedObjectCursor, RetainedObjectSnapshot, RetainedObjectSnapshotFrame,
+    RetainedObjectSnapshotPage, RetainedObjectSnapshotScan, RetainedVersionCursor,
+};
 pub use shards::{ShardIdentity, ShardReader, ShardSealOutcome, ShardStoreError};
 
 pub(crate) fn is_program_definition_path(path: &str) -> bool {
@@ -901,43 +939,6 @@ pub(crate) fn is_program_definition_path(path: &str) -> bool {
         .is_some_and(|(name, version)| !name.is_empty() && !version.is_empty())
 }
 
-async fn ensure_format_marker(root: &Path) -> Result<()> {
-    tokio::fs::create_dir_all(root).await?;
-    let marker_path = root.join(FORMAT_MARKER_NAME);
-    match tokio::fs::read(&marker_path).await {
-        Ok(marker) if marker == FORMAT_MARKER => return Ok(()),
-        Ok(_) => anyhow::bail!("Anvil data directory has an incompatible format marker"),
-        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
-        Err(_) => {}
-    }
-
-    let mut entries = tokio::fs::read_dir(root).await?;
-    if entries.next_entry().await?.is_some() {
-        anyhow::bail!("non-empty Anvil data directory has no 0.5 format marker");
-    }
-
-    match tokio::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&marker_path)
-        .await
-    {
-        Ok(mut marker) => {
-            use tokio::io::AsyncWriteExt;
-            marker.write_all(FORMAT_MARKER).await?;
-            marker.sync_all().await?;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            if tokio::fs::read(&marker_path).await? != FORMAT_MARKER {
-                anyhow::bail!("Anvil data directory has an incompatible format marker");
-            }
-        }
-        Err(error) => return Err(error.into()),
-    }
-    tokio::fs::File::open(root).await?.sync_all().await?;
-    Ok(())
-}
-
 fn initialize_local_watch_metadata(
     db: &DB,
     metadata: &rocksdb::ColumnFamily,
@@ -946,18 +947,21 @@ fn initialize_local_watch_metadata(
     let epoch = db.get_cf(metadata, LOCAL_INVALIDATION_EPOCH_KEY)?;
     let token_key = db.get_cf(metadata, LOCAL_INVALIDATION_TOKEN_KEY)?;
     let offset = db.get_cf(metadata, LOCAL_INVALIDATION_OFFSET_KEY)?;
+    let settled = db.get_cf(metadata, LOCAL_INVALIDATION_SETTLED_KEY)?;
     let floor = db.get_cf(metadata, LOCAL_INVALIDATION_FLOOR_KEY)?;
     let count = db.get_cf(metadata, LOCAL_INVALIDATION_COUNT_KEY)?;
     let bytes = db.get_cf(metadata, LOCAL_INVALIDATION_BYTES_KEY)?;
     let all_absent = epoch.is_none()
         && token_key.is_none()
         && offset.is_none()
+        && settled.is_none()
         && floor.is_none()
         && count.is_none()
         && bytes.is_none();
     let all_present = epoch.is_some()
         && token_key.is_some()
         && offset.is_some()
+        && settled.is_some()
         && floor.is_some()
         && count.is_some()
         && bytes.is_some();
@@ -976,6 +980,7 @@ fn initialize_local_watch_metadata(
         batch.put_cf(metadata, LOCAL_INVALIDATION_TOKEN_KEY, integrity_key);
         for key in [
             LOCAL_INVALIDATION_OFFSET_KEY,
+            LOCAL_INVALIDATION_SETTLED_KEY,
             LOCAL_INVALIDATION_FLOOR_KEY,
             LOCAL_INVALIDATION_COUNT_KEY,
             LOCAL_INVALIDATION_BYTES_KEY,
@@ -998,6 +1003,21 @@ fn initialize_local_watch_metadata(
         .as_slice()
         .try_into()
         .map_err(|_| anyhow::anyhow!("local watch token key is malformed"))?;
+    let decode_counter = |encoded: Vec<u8>, name: &str| -> Result<u64> {
+        let bytes: [u8; size_of::<u64>()] = encoded
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("local watch {name} is malformed"))?;
+        Ok(u64::from_be_bytes(bytes))
+    };
+    let tail = decode_counter(offset.expect("checked present"), "tail")?;
+    let floor = decode_counter(floor.expect("checked present"), "retention floor")?;
+    let settled = decode_counter(settled.expect("checked present"), "settled cursor")?;
+    if floor > settled || settled > tail {
+        anyhow::bail!(
+            "local watch settled cursor {settled} is outside retention floor {floor} through tail {tail}"
+        );
+    }
     Ok((source_epoch, integrity_key))
 }
 

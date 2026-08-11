@@ -6,10 +6,13 @@
 
 mod authz;
 mod blob;
+mod blob_gc;
 mod bootstrap;
 mod clock;
 mod credential_secret;
+mod definition_state;
 mod erasure;
+mod journal_route;
 mod key;
 mod logical_record;
 mod model;
@@ -37,6 +40,7 @@ pub use authz::{
     TupleBatchReceipt, TupleBatchRequest, TupleMutation, TupleMutationKind,
 };
 pub use blob::{AWAITING_PUBLISH, BlobReader, BlobRef, BlobReferenceState, BlobStore, BlobUpload};
+pub use blob_gc::{BlobGcBudget, BlobGcCursor, BlobGcTick};
 pub use bootstrap::{
     ApplicationCredential, ApplicationCredentialRequest, ApplicationRoleTarget,
     BucketApplicationRole, CreateBucketReceipt, CreateBucketRequest, CredentialMutationReceipt,
@@ -49,10 +53,18 @@ pub use bootstrap::{
 };
 pub use clock::VersionClock;
 pub use credential_secret::CredentialSecretEnvelope;
+pub use definition_state::{
+    DefinitionAssignment, DefinitionAssignmentCursor, DefinitionAssignmentMutation,
+    DefinitionAssignmentPage, DefinitionCheckpoint, DefinitionConsumerKind, DefinitionKind,
+    DefinitionLocator, DefinitionLocatorCursor, DefinitionLocatorPage, DefinitionMutationIntent,
+    DefinitionOperation, DefinitionStateError, DefinitionTransition,
+    MAX_DEFINITION_STATE_SCAN_RECORDS,
+};
 pub use erasure::{
     DEFAULT_ERASURE_DATA_SHARDS, DEFAULT_ERASURE_PARITY_SHARDS, DEFAULT_ERASURE_STRIPE_UNIT_BYTES,
     ErasureCodec, ErasureError, ErasureProfile, FRAGMENT_FORMAT_VERSION,
 };
+pub use journal_route::{JournalRoute, RoutedJournalError, RoutedLocalChangePage};
 pub use key::ObjectKey;
 pub use logical_record::{
     BaselineHash, LOGICAL_RECORD_FORMAT, LogicalApplicationRecord, LogicalBucketRecord,
@@ -100,14 +112,16 @@ pub use store::{
     ObjectSnapshotError, OpenedObject, PayloadArtifactCursor, PayloadArtifactIdentity,
     PayloadArtifactSnapshot, PayloadArtifactSnapshotPage, PayloadArtifactState, PayloadStoreError,
     ReferenceProofCursor, ReferenceProofExportError, ReferenceProofPage, ReferenceProofPruneError,
-    ReferenceProofPruneResult, ShardIdentity, ShardReader, ShardSealOutcome, ShardStoreError,
-    Store, StoreOptions,
+    ReferenceProofPruneResult, RetainedHeadState, RetainedObjectCursor, RetainedObjectSnapshot,
+    RetainedObjectSnapshotFrame, RetainedObjectSnapshotPage, RetainedObjectSnapshotScan,
+    RetainedVersionCursor, ShardIdentity, ShardReader, ShardSealOutcome, ShardStoreError, Store,
+    StoreOptions,
 };
 pub use watch::{
     AccountingHeadTransition, AggregateChanged, AggregateKind, ContentLifecycleChanged,
     DEFAULT_WATCH_MAX_BYTES, DEFAULT_WATCH_MAX_ENTRIES, InvalidationStateHint, LocalChange,
     LocalChangePage, LocalInvalidation, MAX_LOCAL_INVALIDATION_SCAN_RECORDS, ObjectHeadChange,
-    ObjectHeadChangeKind, OversizeLocalChange, ReferenceProof, RetainedVersionDeletedChange,
-    SourceId, WatchCursor, WatchError, WatchJournalStatus, WatchPage, WatchRetention, WatchScope,
-    WatchStart,
+    ObjectHeadChangeKind, OversizeLocalChange, ReferenceProof, ReferenceProofMutation,
+    RetainedVersionDeletedChange, SourceId, WatchCursor, WatchError, WatchJournalStatus, WatchPage,
+    WatchRetention, WatchScope, WatchStart,
 };

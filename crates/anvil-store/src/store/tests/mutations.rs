@@ -332,13 +332,13 @@ async fn bulk_wal_contains_one_high_watermark_and_replay_adds_no_write() {
     let mut counter = WalOperationCounter::default();
     updates[0].1.iterate_cf(&mut counter);
     // Three small raw values, blob lifecycle records, versions, heads, receipts,
-    // receipt-expiry indexes and invalidations, plus one version watermark,
-    // four watch counters, the locally-applied reference cursor and two
-    // receipt counters. All metadata moves in this one physical batch rather
-    // than once per mutation.
-    assert_eq!(counter.puts, 29);
+    // receipt-expiry indexes, invalidations and bucket journal routes, plus one
+    // version watermark, five watch counters, the locally-applied reference
+    // cursor and two receipt counters. All metadata moves in this one physical
+    // batch rather than once per mutation.
+    assert_eq!(counter.puts, 33);
     assert_eq!(counter.high_watermark_puts, 1);
-    assert_eq!(counter.invalidation_metadata_puts, 4);
+    assert_eq!(counter.invalidation_metadata_puts, 5);
     assert_eq!(counter.receipt_metadata_puts, 2);
     assert_eq!(counter.deletes, 0);
     assert_eq!(counter.merges, 0);
@@ -640,8 +640,17 @@ async fn typed_mutation_replicates_exactly_and_retries_after_head_and_journal_mo
         sequence_after_first_apply
     );
 
+    assert!(
+        coordinator
+            .settle_source_journal_position_if_contiguous(
+                first_mutation.stamp.source_id,
+                first_mutation.stamp.source_journal_position,
+            )
+            .await
+            .unwrap()
+    );
     coordinator
-        .advance_source_journal_safe_through(2)
+        .advance_source_journal_reference_safe_through(2)
         .await
         .unwrap();
     let second = coordinator
@@ -662,6 +671,15 @@ async fn typed_mutation_replicates_exactly_and_retries_after_head_and_journal_mo
         .apply_object_mutation_replica(&second_mutation)
         .await
         .unwrap();
+    assert!(
+        coordinator
+            .settle_source_journal_position_if_contiguous(
+                second_mutation.stamp.source_id,
+                second_mutation.stamp.source_journal_position,
+            )
+            .await
+            .unwrap()
+    );
     assert_same_mutation_metadata(&coordinator, &replica, &second_mutation);
     assert!(
         coordinator
@@ -676,7 +694,9 @@ async fn typed_mutation_replicates_exactly_and_retries_after_head_and_journal_mo
             .is_none()
     );
     coordinator
-        .advance_source_journal_safe_through(second_mutation.stamp.source_journal_position)
+        .advance_source_journal_reference_safe_through(
+            second_mutation.stamp.source_journal_position,
+        )
         .await
         .unwrap();
 
@@ -1104,9 +1124,18 @@ async fn rejected_large_inline_put_leaves_only_an_age_gated_orphan() {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64;
-    assert_eq!(store.collect_blob_garbage_at(modified + 999).unwrap(), 0);
+    assert_eq!(
+        store.collect_blob_garbage_at(modified + 999).await.unwrap(),
+        0
+    );
     assert!(store.blobs.contains(&reference).await.unwrap());
-    assert_eq!(store.collect_blob_garbage_at(modified + 1_000).unwrap(), 1);
+    assert_eq!(
+        store
+            .collect_blob_garbage_at(modified + 1_000)
+            .await
+            .unwrap(),
+        1
+    );
     assert!(!store.blobs.contains(&reference).await.unwrap());
 }
 

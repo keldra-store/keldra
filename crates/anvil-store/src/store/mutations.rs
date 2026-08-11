@@ -3,6 +3,9 @@ use crate::model::{
     CoordinatedObjectMutation, MUTATION_STAMP_FORMAT, MutationStamp, OBJECT_MUTATION_FORMAT,
     ObjectMutation, ObjectMutationContext, ObjectMutationGovernance, ReplicaObjectMutationApplied,
 };
+use crate::{
+    DefinitionMutationIntent, DefinitionOperation, DefinitionStateError, DefinitionTransition,
+};
 
 #[derive(Clone, Copy)]
 struct DistributedEvaluationContext {
@@ -16,6 +19,7 @@ struct EvaluatedOperation {
     mutation: Option<ObjectMutation>,
     reference_deltas: Vec<ReferenceDelta>,
     accounting_transition: Option<AccountingHeadTransition>,
+    definition_transition: Option<DefinitionTransition>,
 }
 
 impl Store {
@@ -51,7 +55,24 @@ impl Store {
         governance: ObjectMutationGovernance,
     ) -> Result<MutationReceipt, MutationError> {
         governance.validate()?;
-        self.bulk_write_inner(vec![operation], Some(governance))
+        self.bulk_write_inner(vec![operation], Some(governance), None)
+            .await
+            .pop()
+            .expect("one operation has one outcome")
+            .result
+    }
+
+    /// Trusted single-node definition mutation. The typed intent is converted
+    /// to a version-bound transition inside the same commit batch.
+    pub async fn mutate_definition_with_governance(
+        &self,
+        operation: BatchOperation,
+        governance: ObjectMutationGovernance,
+        intent: DefinitionMutationIntent,
+    ) -> Result<MutationReceipt, MutationError> {
+        governance.validate()?;
+        intent.validate().map_err(definition_mutation_error)?;
+        self.bulk_write_inner(vec![operation], Some(governance), Some(intent))
             .await
             .pop()
             .expect("one operation has one outcome")
@@ -62,14 +83,27 @@ impl Store {
     /// successful outcomes with one physical RocksDB write. A failed
     /// precondition is an item result, not a reason to retry the whole bulk.
     pub async fn bulk_write(&self, operations: Vec<BatchOperation>) -> Vec<BatchOutcome> {
-        self.bulk_write_inner(operations, None).await
+        self.bulk_write_inner(operations, None, None).await
     }
 
     async fn bulk_write_inner(
         &self,
         operations: Vec<BatchOperation>,
         governance: Option<ObjectMutationGovernance>,
+        definition_intent: Option<DefinitionMutationIntent>,
     ) -> Vec<BatchOutcome> {
+        if definition_intent.is_some() && operations.len() != 1 {
+            return operations
+                .into_iter()
+                .enumerate()
+                .map(|(index, _)| BatchOutcome {
+                    index,
+                    result: Err(MutationError::InvalidObjectMutation(
+                        "one typed definition intent must describe exactly one operation".into(),
+                    )),
+                })
+                .collect();
+        }
         let _policy_guard = self.policy_gate.read().await;
         let mut prepared = Vec::with_capacity(operations.len());
         let mut early = BTreeMap::new();
@@ -181,6 +215,7 @@ impl Store {
                     &mut receipt_status,
                     now,
                     None,
+                    definition_intent,
                 )
                 .await;
             if let Ok(evaluated) = &outcome
@@ -198,6 +233,7 @@ impl Store {
                     deleted: evaluated.receipt.deleted,
                     reference_deltas: evaluated.reference_deltas.clone(),
                     accounting_transition: evaluated.accounting_transition,
+                    definition_transition: evaluated.definition_transition.clone(),
                 });
             }
             results.insert(index, outcome.map(|evaluated| evaluated.receipt));
@@ -229,6 +265,18 @@ impl Store {
         match persistence {
             Ok(()) => {
                 if !pending_changes.is_empty() {
+                    if let Err(error) = self.settle_inline_source_changes() {
+                        for result in results.values_mut() {
+                            if result.is_ok() {
+                                *result = Err(error.clone());
+                            }
+                        }
+                        return results
+                            .into_iter()
+                            .chain(early.into_iter().map(|(index, error)| (index, Err(error))))
+                            .map(|(index, result)| BatchOutcome { index, result })
+                            .collect();
+                    }
                     self.notify_local_invalidations();
                 }
             }
@@ -297,7 +345,30 @@ impl Store {
             bucket_id: BucketId(governance.bucket_id),
         };
         let prepared = self.prepare(operation, identity, true).await?;
-        self.coordinate_prepared_object_mutation(prepared, context, governance)
+        self.coordinate_prepared_object_mutation(prepared, context, governance, None)
+            .await
+    }
+
+    pub async fn coordinate_definition_object_mutation_with_governance(
+        &self,
+        operation: BatchOperation,
+        governance: ObjectMutationGovernance,
+        context: ObjectMutationContext,
+        intent: DefinitionMutationIntent,
+    ) -> Result<CoordinatedObjectMutation, MutationError> {
+        if context.serving_fence_term == 0 {
+            return Err(MutationError::InvalidObjectMutation(
+                "serving-fence term must be non-zero".into(),
+            ));
+        }
+        governance.validate()?;
+        intent.validate().map_err(definition_mutation_error)?;
+        let identity = BucketIdentity {
+            tenant_id: TenantId(governance.tenant_id),
+            bucket_id: BucketId(governance.bucket_id),
+        };
+        let prepared = self.prepare(operation, identity, true).await?;
+        self.coordinate_prepared_object_mutation(prepared, context, governance, Some(intent))
             .await
     }
 
@@ -349,7 +420,30 @@ impl Store {
             bucket_id: BucketId(governance.bucket_id),
         };
         let prepared = self.prepare_verified_distributed_publish(request, identity)?;
-        self.coordinate_prepared_object_mutation(prepared, context, governance)
+        self.coordinate_prepared_object_mutation(prepared, context, governance, None)
+            .await
+    }
+
+    pub async fn coordinate_distributed_definition_publish_with_governance(
+        &self,
+        request: PublishRequest,
+        governance: ObjectMutationGovernance,
+        context: ObjectMutationContext,
+        intent: DefinitionMutationIntent,
+    ) -> Result<CoordinatedObjectMutation, MutationError> {
+        if context.serving_fence_term == 0 {
+            return Err(MutationError::InvalidObjectMutation(
+                "serving-fence term must be non-zero".into(),
+            ));
+        }
+        governance.validate()?;
+        intent.validate().map_err(definition_mutation_error)?;
+        let identity = BucketIdentity {
+            tenant_id: TenantId(governance.tenant_id),
+            bucket_id: BucketId(governance.bucket_id),
+        };
+        let prepared = self.prepare_verified_distributed_publish(request, identity)?;
+        self.coordinate_prepared_object_mutation(prepared, context, governance, Some(intent))
             .await
     }
 
@@ -372,6 +466,7 @@ impl Store {
         prepared: PreparedOperation,
         context: ObjectMutationContext,
         governance: ObjectMutationGovernance,
+        definition_intent: Option<DefinitionMutationIntent>,
     ) -> Result<CoordinatedObjectMutation, MutationError> {
         if prepared.command_id().is_none() {
             return Err(MutationError::InvalidCommandId);
@@ -422,6 +517,7 @@ impl Store {
                     source_id: source.source_id,
                     source_journal_position,
                 }),
+                definition_intent,
             )
             .await?;
 
@@ -444,6 +540,7 @@ impl Store {
                     deleted: evaluated.receipt.deleted,
                     reference_deltas: evaluated.reference_deltas.clone(),
                     accounting_transition: evaluated.accounting_transition,
+                    definition_transition: evaluated.definition_transition.clone(),
                 }],
                 LocalReferenceEffects::Deferred,
             )?;
@@ -512,6 +609,12 @@ impl Store {
         let mut batch = WriteBatch::default();
         let proof_staged = self.stage_object_mutation_reference_proof(&mut batch, mutation)?;
         let current = self.head_by_storage_key(&encoded_head_key)?;
+        let locator_applied = mutation
+            .definition_transition
+            .as_ref()
+            .map(|transition| self.definition_transition_is_applied(transition))
+            .transpose()?
+            .unwrap_or(true);
         let mut already_applied = false;
         match current.as_ref() {
             None if mutation.stamp.predecessor_version.is_some() => {
@@ -533,7 +636,7 @@ impl Store {
                     && head.mutation_stamp == Some(mutation.stamp)
                     && descriptor == mutation.version
                 {
-                    if retained_identical_receipt && !proof_staged {
+                    if retained_identical_receipt && !proof_staged && locator_applied {
                         return Ok(ReplicaObjectMutationApplied {
                             version: mutation.version.id,
                             replayed: true,
@@ -638,6 +741,7 @@ impl Store {
                     deleted: mutation.version.deleted,
                     expires_at_unix_millis: mutation.receipt_expires_at_unix_millis,
                     object_mutation: Some(mutation.clone()),
+                    definition_transition: mutation.definition_transition.clone(),
                 },
                 &mut receipt_status,
                 &mut BTreeMap::new(),
@@ -656,6 +760,14 @@ impl Store {
             VERSION_HIGH_WATERMARK_KEY,
             serde_json::to_vec(&high_watermark).map_err(storage_error)?,
         );
+        let mutation_is_current = !already_applied
+            || current
+                .as_ref()
+                .is_some_and(|head| head.version == mutation.version.id);
+        if mutation_is_current && let Some(transition) = mutation.definition_transition.as_ref() {
+            self.stage_definition_transition(&mut batch, transition)
+                .map_err(definition_mutation_error)?;
+        }
         let mut options = WriteOptions::default();
         options.set_sync(self.sync_writes);
         self.db.write_opt(batch, &options).map_err(storage_error)?;
@@ -718,7 +830,7 @@ impl Store {
             LocalReferenceEffects::Deferred => None,
         };
         let safe_through = self
-            .source_journal_safe_through
+            .source_journal_reference_safe_through
             .load(std::sync::atomic::Ordering::Acquire);
         let first_old_key = invalidation_key(status.retention_floor.saturating_add(1));
         let mut old_entries = self.db.iterator_cf(
@@ -738,6 +850,7 @@ impl Store {
                     deleted,
                     reference_deltas,
                     accounting_transition,
+                    definition_transition,
                 } => LocalChange::object_head(
                     status.tail,
                     identity.tenant_id.0,
@@ -747,6 +860,7 @@ impl Store {
                     *deleted,
                     reference_deltas.clone(),
                     *accounting_transition,
+                    definition_transition.clone(),
                 ),
                 PendingLocalChange::RetainedVersionDeleted {
                     identity,
@@ -787,6 +901,7 @@ impl Store {
                 ),
             };
             let encoded = encode_local_change(&change).map_err(storage_error)?;
+            self.stage_journal_routes(batch, status.source_id.source_epoch, &change)?;
             status.retained_entries = status.retained_entries.checked_add(1).ok_or_else(|| {
                 MutationError::Storage("local invalidation entry count is exhausted".into())
             })?;
@@ -805,7 +920,7 @@ impl Store {
             let pruned = status.retention_floor.checked_add(1).ok_or_else(|| {
                 MutationError::Storage("local invalidation retention floor is exhausted".into())
             })?;
-            if pruned > old_tail || pruned > safe_through {
+            if pruned > old_tail || pruned > safe_through || pruned > status.settled_through {
                 return Err(MutationError::SourceJournalCapacity);
             }
             let (stored_key, encoded) = old_entries
@@ -821,6 +936,13 @@ impl Store {
                     "retained local invalidation offset {pruned} is missing"
                 )));
             }
+            let pruned_change = self.decode_local_change_record(&encoded)?;
+            if pruned_change.offset() != pruned {
+                return Err(MutationError::Storage(
+                    "local change key does not match its stored offset".into(),
+                ));
+            }
+            self.stage_journal_route_removal(batch, status.source_id.source_epoch, &pruned_change)?;
             batch.delete_cf(journal, invalidation_key(pruned));
             status.retention_floor = pruned;
             status.retained_entries -= 1;
@@ -841,6 +963,15 @@ impl Store {
             LOCAL_INVALIDATION_OFFSET_KEY,
             status.tail.to_be_bytes(),
         );
+        if reference_effects != LocalReferenceEffects::Deferred
+            && status.settled_through == old_tail
+        {
+            batch.put_cf(
+                metadata,
+                LOCAL_INVALIDATION_SETTLED_KEY,
+                status.tail.to_be_bytes(),
+            );
+        }
         batch.put_cf(
             metadata,
             LOCAL_INVALIDATION_FLOOR_KEY,
@@ -881,8 +1012,9 @@ impl Store {
         }
         let mut batch = WriteBatch::default();
         let safe_through = self
-            .source_journal_safe_through
-            .load(std::sync::atomic::Ordering::Acquire);
+            .source_journal_reference_safe_through
+            .load(std::sync::atomic::Ordering::Acquire)
+            .min(status.settled_through);
         while (status.retained_entries > self.watch_retention.max_entries
             || status.retained_bytes > self.watch_retention.max_bytes)
             && status.retention_floor < safe_through
@@ -899,6 +1031,20 @@ impl Store {
                         "retained local invalidation offset {offset} is missing"
                     ))
                 })?;
+            let pruned_change = self
+                .decode_local_change_record(&encoded)
+                .map_err(|error| WatchError::Storage(error.to_string()))?;
+            if pruned_change.offset() != offset {
+                return Err(WatchError::Storage(
+                    "local change key does not match its stored offset".into(),
+                ));
+            }
+            self.stage_journal_route_removal(
+                &mut batch,
+                status.source_id.source_epoch,
+                &pruned_change,
+            )
+            .map_err(|error| WatchError::Storage(error.to_string()))?;
             batch.delete_cf(journal, invalidation_key(offset));
             status.retention_floor = offset;
             status.retained_entries -= 1;
@@ -1081,6 +1227,7 @@ impl Store {
         version: VersionId,
         deleted: bool,
         object_mutation: Option<ObjectMutation>,
+        definition_transition: Option<DefinitionTransition>,
         now_unix_millis: u64,
         status: &mut MutationReceiptStatus,
         pending_receipts: &mut BTreeMap<Vec<u8>, StoredReceipt>,
@@ -1097,6 +1244,7 @@ impl Store {
             deleted,
             expires_at_unix_millis,
             object_mutation,
+            definition_transition,
         };
         self.stage_stored_mutation_receipt(batch, primary_key, stored, status, pending_receipts)?;
         Ok(expires_at_unix_millis)
@@ -1169,6 +1317,7 @@ impl Store {
         receipt_status: &mut MutationReceiptStatus,
         now_unix_millis: u64,
         distributed: Option<DistributedEvaluationContext>,
+        definition_intent: Option<DefinitionMutationIntent>,
     ) -> Result<EvaluatedOperation, MutationError> {
         let key = operation.key();
         let encoded_key = operation.encoded_head_key();
@@ -1190,6 +1339,13 @@ impl Store {
                 if existing.fingerprint != operation.fingerprint() {
                     return Err(MutationError::IdempotencyConflict);
                 }
+                if !definition_receipt_matches_intent(
+                    existing.definition_transition.as_ref(),
+                    definition_intent,
+                    operation,
+                ) {
+                    return Err(MutationError::IdempotencyConflict);
+                }
                 return Ok(EvaluatedOperation {
                     receipt: MutationReceipt {
                         command_id: operation.command_id().map(str::to_owned),
@@ -1202,6 +1358,7 @@ impl Store {
                     mutation: existing.object_mutation,
                     reference_deltas: Vec::new(),
                     accounting_transition: None,
+                    definition_transition: existing.definition_transition,
                 });
             }
         }
@@ -1286,6 +1443,19 @@ impl Store {
                 && existing.content_type.as_ref() == requested_content_type
             {
                 let fingerprint = operation.fingerprint();
+                let definition_transition = definition_intent.map(|intent| DefinitionTransition {
+                    kind: intent.kind,
+                    tenant_id: operation.identity().tenant_id.0,
+                    bucket_id: operation.identity().bucket_id.0,
+                    definition_id: intent.definition_id,
+                    path: key.path().to_owned(),
+                    object_version: current.version,
+                    operation: DefinitionOperation::Upsert,
+                });
+                if let Some(transition) = definition_transition.as_ref() {
+                    self.stage_definition_transition(batch, transition)
+                        .map_err(definition_mutation_error)?;
+                }
                 let expires_at = self.stage_mutation_receipt(
                     batch,
                     receipt_key,
@@ -1293,6 +1463,7 @@ impl Store {
                     current.version,
                     false,
                     None,
+                    definition_transition.clone(),
                     now_unix_millis,
                     receipt_status,
                     pending_receipts,
@@ -1309,6 +1480,7 @@ impl Store {
                     mutation: None,
                     reference_deltas: Vec::new(),
                     accounting_transition: None,
+                    definition_transition,
                 });
             }
             return Err(MutationError::Immutable);
@@ -1343,6 +1515,22 @@ impl Store {
             current_version.as_ref().and_then(live_version_length),
             live_version_length(&version),
         );
+        let definition_transition = definition_intent.map(|intent| DefinitionTransition {
+            kind: intent.kind,
+            tenant_id: operation.identity().tenant_id.0,
+            bucket_id: operation.identity().bucket_id.0,
+            definition_id: intent.definition_id,
+            path: key.path().to_owned(),
+            object_version: id,
+            operation: if deleted {
+                DefinitionOperation::Delete
+            } else {
+                DefinitionOperation::Upsert
+            },
+        });
+        if let Some(transition) = definition_transition.as_ref() {
+            transition.validate().map_err(definition_mutation_error)?;
+        }
         let fingerprint = operation.fingerprint();
         let apply_content_lifecycle = distributed.is_none();
         let old_blob = current_version
@@ -1404,6 +1592,7 @@ impl Store {
                     },
                     reference_deltas: reference_deltas.clone(),
                     accounting_transition: Some(accounting_transition),
+                    definition_transition: definition_transition.clone(),
                 };
                 mutation.set_computed_fingerprint();
                 mutation.validate()?;
@@ -1473,6 +1662,7 @@ impl Store {
             id,
             deleted,
             object_mutation.clone(),
+            definition_transition.clone(),
             now_unix_millis,
             receipt_status,
             pending_receipts,
@@ -1494,6 +1684,10 @@ impl Store {
         }
         batch.put_cf(versions, encoded_version_key, encoded_version);
         batch.put_cf(heads, &encoded_key, encoded_head);
+        if let Some(transition) = definition_transition.as_ref() {
+            self.stage_definition_transition(batch, transition)
+                .map_err(definition_mutation_error)?;
+        }
         pending_heads.insert(encoded_key.clone(), head);
         pending_versions.insert(encoded_key, version);
         Ok(EvaluatedOperation {
@@ -1508,6 +1702,7 @@ impl Store {
             mutation: object_mutation,
             reference_deltas,
             accounting_transition: Some(accounting_transition),
+            definition_transition,
         })
     }
 }
@@ -1516,6 +1711,28 @@ fn live_version_length(version: &Version) -> Option<u64> {
     (!version.deleted)
         .then(|| version.blob.as_ref().map(|blob| blob.length))
         .flatten()
+}
+
+fn definition_receipt_matches_intent(
+    stored: Option<&DefinitionTransition>,
+    intent: Option<DefinitionMutationIntent>,
+    operation: &PreparedOperation,
+) -> bool {
+    match (stored, intent) {
+        (None, None) => true,
+        (Some(stored), Some(intent)) => {
+            stored.kind == intent.kind
+                && stored.definition_id == intent.definition_id
+                && stored.tenant_id == operation.identity().tenant_id.0
+                && stored.bucket_id == operation.identity().bucket_id.0
+                && stored.path == operation.key().path()
+        }
+        (Some(_), None) | (None, Some(_)) => false,
+    }
+}
+
+fn definition_mutation_error(error: DefinitionStateError) -> MutationError {
+    MutationError::InvalidObjectMutation(error.to_string())
 }
 
 fn exact_version_key(identity: BucketIdentity, exact_path: &str, version: VersionId) -> Vec<u8> {

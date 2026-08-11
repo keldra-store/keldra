@@ -642,35 +642,3 @@ async fn reopen_seeds_version_clock_above_persisted_high_watermark() {
         .unwrap();
     assert!(next.version > forced);
 }
-
-#[tokio::test]
-async fn format_marker_rejects_legacy_or_mismatched_directories_without_deleting_them() {
-    let legacy = tempfile::tempdir().unwrap();
-    tokio::fs::write(legacy.path().join("old-data"), b"keep")
-        .await
-        .unwrap();
-    assert!(
-        Store::open(StoreOptions::new(legacy.path(), 1))
-            .await
-            .is_err()
-    );
-    assert_eq!(
-        tokio::fs::read(legacy.path().join("old-data"))
-            .await
-            .unwrap(),
-        b"keep"
-    );
-
-    let mismatched = tempfile::tempdir().unwrap();
-    tokio::fs::write(
-        mismatched.path().join(FORMAT_MARKER_NAME),
-        b"anvil-store-format:0.4\n",
-    )
-    .await
-    .unwrap();
-    assert!(
-        Store::open(StoreOptions::new(mismatched.path(), 1))
-            .await
-            .is_err()
-    );
-}

@@ -315,11 +315,9 @@ async fn entry_retention_prunes_in_the_head_batch_and_expires_stale_tokens() {
             .await
             .unwrap();
     }
-    assert_eq!(
-        store.put(put("c", b"c", "c")).await.unwrap_err(),
-        anvil_store::MutationError::SourceJournalCapacity
-    );
-    store.advance_source_journal_safe_through(1).await.unwrap();
+    // A one-node mutation applies its reference effects in the same durable
+    // batch, so the reference-safe cut advances without a delivery worker and
+    // the third put can prune offset 1 atomically.
     store.put(put("c", b"c", "c")).await.unwrap();
 
     let status = store.local_watch_status().unwrap();
@@ -399,19 +397,56 @@ async fn an_event_larger_than_the_journal_bound_rejects_the_whole_mutation() {
 #[tokio::test]
 async fn safe_through_cursor_is_monotonic_bounded_and_reconstructed_fail_closed() {
     let temporary = tempfile::tempdir().unwrap();
+    let initial = Store::open(
+        StoreOptions::new(temporary.path(), 1)
+            .with_watch_retention(WatchRetention::new(2, 1024 * 1024).unwrap()),
+    )
+    .await
+    .unwrap();
+    seed_bucket_identity(&initial);
+    initial.put(put("a", b"a", "a")).await.unwrap();
+    initial.put(put("b", b"b", "b")).await.unwrap();
+    drop(initial);
+
     let store = Store::open(
         StoreOptions::new(temporary.path(), 1)
             .with_watch_retention(WatchRetention::new(2, 1024 * 1024).unwrap()),
     )
     .await
     .unwrap();
-    seed_bucket_identity(&store);
-    store.put(put("a", b"a", "a")).await.unwrap();
-    store.put(put("b", b"b", "b")).await.unwrap();
+    let reopened_status = store.local_watch_status().unwrap();
+    assert_eq!(reopened_status.tail, 2);
+    assert_eq!(reopened_status.settled_through, 2);
+    assert!(
+        store
+            .advance_source_journal_settled_through(3)
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .advance_source_journal_settled_through(1)
+            .await
+            .is_err()
+    );
 
-    assert!(store.advance_source_journal_safe_through(3).await.is_err());
-    store.advance_source_journal_safe_through(1).await.unwrap();
-    assert!(store.advance_source_journal_safe_through(0).await.is_err());
+    assert!(
+        store
+            .advance_source_journal_reference_safe_through(reopened_status.tail + 1)
+            .await
+            .is_err()
+    );
+    store
+        .advance_source_journal_reference_safe_through(1)
+        .await
+        .unwrap();
+    assert_eq!(store.local_watch_status().unwrap().settled_through, 2);
+    assert!(
+        store
+            .advance_source_journal_reference_safe_through(0)
+            .await
+            .is_err()
+    );
     store.put(put("c", b"c", "c")).await.unwrap();
     assert_eq!(store.local_watch_status().unwrap().retention_floor, 1);
 
@@ -427,7 +462,7 @@ async fn safe_through_cursor_is_monotonic_bounded_and_reconstructed_fail_closed(
         anvil_store::MutationError::SourceJournalCapacity
     );
     reopened
-        .advance_source_journal_safe_through(2)
+        .advance_source_journal_reference_safe_through(2)
         .await
         .unwrap();
     reopened.put(put("d", b"d", "d")).await.unwrap();

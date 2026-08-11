@@ -1,5 +1,6 @@
 use crate::{
-    BatchOperation, Durability, ObjectKey, ObjectMutationContext, PlacementLogId, PutMode,
+    BatchOperation, BucketPolicy, DefinitionKind, DefinitionMutationIntent, Durability, ObjectKey,
+    ObjectMutationContext, ObjectMutationGovernance, ObjectVersioning, PlacementLogId, PutMode,
     PutRequest, StoreOptions,
 };
 
@@ -221,4 +222,94 @@ async fn export_validates_cursors_limits_and_record_size() {
         source.export_object_path_record(0, 1, "a"),
         Err(ObjectSnapshotError::InvalidRecord(_))
     ));
+}
+
+#[tokio::test]
+async fn definition_locator_survives_replica_replay_handoff_and_read_repair() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = Store::open(StoreOptions::new(temporary.path().join("source"), 1))
+        .await
+        .unwrap();
+    let (tenant_id, bucket_id) = source.resolve_bucket_ids("tenant", "bucket").unwrap();
+    let governance = ObjectMutationGovernance {
+        tenant_id,
+        bucket_id,
+        versioning: ObjectVersioning::Unversioned,
+        policy: BucketPolicy::default(),
+    };
+    let path = "_anvil/indexes/v2/definitions/search";
+    let intent = DefinitionMutationIntent::new(DefinitionKind::Index, 41).unwrap();
+    let coordinated = source
+        .coordinate_definition_object_mutation_with_governance(
+            BatchOperation::Put(PutRequest {
+                mode: PutMode::PutIfAbsent,
+                ..put(path, b"definition", "create-definition")
+            }),
+            governance,
+            context(1),
+            intent,
+        )
+        .await
+        .unwrap();
+    let mutation = coordinated.mutation.as_ref().unwrap();
+    let expected = source
+        .export_object_path_record(tenant_id, bucket_id, path)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        expected.definition_locator.as_ref().unwrap().definition_id,
+        41
+    );
+
+    let replica = Store::open(StoreOptions::new(temporary.path().join("replica"), 2))
+        .await
+        .unwrap();
+    assert!(
+        !replica
+            .apply_object_mutation_replica(mutation)
+            .await
+            .unwrap()
+            .replayed
+    );
+    assert!(
+        replica
+            .apply_object_mutation_replica(mutation)
+            .await
+            .unwrap()
+            .replayed
+    );
+    assert_eq!(
+        replica
+            .definition_locator(DefinitionKind::Index, tenant_id, bucket_id, path)
+            .unwrap(),
+        expected.definition_locator.clone()
+    );
+
+    let handoff = Store::open(StoreOptions::new(temporary.path().join("handoff"), 3))
+        .await
+        .unwrap();
+    handoff
+        .install_quorum_reconciled_object_record(&ObjectRecordExport::ExactPath(expected.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        handoff
+            .definition_locator(DefinitionKind::Index, tenant_id, bucket_id, path)
+            .unwrap(),
+        expected.definition_locator.clone()
+    );
+
+    let repaired = Store::open(StoreOptions::new(temporary.path().join("repair"), 4))
+        .await
+        .unwrap();
+    repaired
+        .repair_object_path_snapshot(tenant_id, bucket_id, path, None, Some(&expected))
+        .await
+        .unwrap();
+    assert_eq!(
+        repaired
+            .definition_locator(DefinitionKind::Index, tenant_id, bucket_id, path)
+            .unwrap(),
+        expected.definition_locator.clone()
+    );
 }

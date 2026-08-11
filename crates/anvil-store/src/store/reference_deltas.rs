@@ -108,7 +108,7 @@ impl Store {
         self.stage_local_changes(
             &mut batch,
             &lifecycle_changes,
-            LocalReferenceEffects::Deferred,
+            LocalReferenceEffects::NoReferenceEffects,
         )
         .map_err(ReferenceDeltaError::from)?;
         let mut options = WriteOptions::default();
