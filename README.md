@@ -737,6 +737,12 @@ budget, and an accepted maximum anonymous-memory increase so the run fails
 rather than merely reporting an unbounded build:
 
 ```sh
+cargo build --release --locked -p anvil-server \
+  --example v06_index_resource_qualification
+anvil_target_dir="$(
+  cargo metadata --quiet --locked --no-deps --format-version 1 \
+    | jq -er '.target_directory'
+)"
 ANVIL_V06_RESOURCE_ENDPOINTS=http://127.0.0.1:50051 \
 ANVIL_V06_RESOURCE_TENANT=qualification \
 ANVIL_V06_RESOURCE_BUCKET=index-resource \
@@ -746,8 +752,7 @@ ANVIL_V06_RESOURCE_CONTAINERS=anvil \
 ANVIL_V06_KIND_BUDGET_BYTES=268435456 \
 ANVIL_V06_INDEX_RAYON_WORKERS=4 \
 ANVIL_V06_MAX_ANONYMOUS_GROWTH_BYTES=2147483648 \
-  cargo run --release --locked -p anvil-server \
-    --example v06_index_resource_qualification
+  "${anvil_target_dir}/release/examples/v06_index_resource_qualification"
 ```
 
 The pinned `sux` and Rayon features, resolved versions and license choices are
