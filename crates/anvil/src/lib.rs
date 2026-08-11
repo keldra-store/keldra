@@ -65,7 +65,10 @@ use anvil_api::v1::index_service_server::IndexServiceServer;
 use anvil_api::v1::object_service_server::ObjectServiceServer;
 use anvil_api::v1::personal_db_service_server::PersonalDbServiceServer;
 use anvil_consensus::{ATOMIC_REPLAY_RETENTION_MILLIS, NodeId};
-use anvil_store::{ErasureProfile, MutationReceiptRetention, Store, StoreOptions, WatchRetention};
+use anvil_store::{
+    BlobGcBudget, BlobGcCursor, ErasureProfile, MutationReceiptRetention, Store, StoreOptions,
+    WatchRetention,
+};
 use anyhow::{Context, Result};
 
 use authentication::{JwtManager, RateLimitConfig, RequestRateLimits};
@@ -76,6 +79,10 @@ pub use v05::ObjectServiceImpl;
 
 const MAX_GRPC_MESSAGE_BYTES: usize = 72 * 1024 * 1024;
 const BLOB_GC_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const BLOB_GC_CONTINUATION_INTERVAL: Duration = Duration::from_millis(100);
+const BLOB_GC_RECORDS_PER_TICK: u32 = 128;
+const BLOB_GC_BYTES_PER_TICK: u64 = 1024 * 1024;
+const BLOB_GC_TIME_PER_TICK: Duration = Duration::from_secs(30);
 const DECISION_LEADER_TIMEOUT: Duration = Duration::from_secs(10);
 // A maximum 1,000-item authorization batch can contain two maximum-size exact
 // paths per tuple plus identifiers and protobuf framing.
@@ -222,48 +229,9 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         config.erasure_profile,
         mutation_admission.clone(),
     );
-    // Ordered reference effects and their cursor must be recovered before any
-    // startup component can create another journal entry. In particular,
-    // program recovery must not race a cursor left behind by a 0.5.3 node.
-    enum ReferenceStartup {
-        Ready,
-        Signal(std::io::Result<()>),
-        Peer(Result<Result<()>, tokio::task::JoinError>),
-    }
-    let reference_startup = tokio::select! {
-        _ = reference_runtime_handle.wait_until_startup_ready() => ReferenceStartup::Ready,
-        signal = tokio::signal::ctrl_c() => ReferenceStartup::Signal(signal),
-        peer = peer_server.task_mut() => ReferenceStartup::Peer(peer),
-    };
-    match reference_startup {
-        ReferenceStartup::Ready => {}
-        ReferenceStartup::Signal(signal) => {
-            reference_runtime.shutdown().await;
-            let peer = peer_server.shutdown().await;
-            serving_fence.shutdown().await;
-            let raft = decisions
-                .shutdown()
-                .await
-                .context("shut down decision Raft during startup");
-            signal.context("wait for shutdown signal during startup")?;
-            peer?;
-            raft?;
-            return Ok(());
-        }
-        ReferenceStartup::Peer(peer) => {
-            peer_server.record_completed();
-            reference_runtime.shutdown().await;
-            serving_fence.shutdown().await;
-            let raft = decisions
-                .shutdown()
-                .await
-                .context("shut down decision Raft after startup peer failure");
-            peer.context("join private peer server task during startup")?
-                .context("serve private peer listener during startup")?;
-            raft?;
-            return Ok(());
-        }
-    }
+    // Reference reconstruction is bounded background recovery. Serving does
+    // not wait for it; the garbage collectors already fail closed until the
+    // reference runtime proves every current source safe.
     let payload_read_transport = payload_read_transport::StorePayloadReadTransport::new(
         local_node,
         store.clone(),
@@ -365,8 +333,10 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         name_resolver.clone(),
     );
     let index_artifact_coordinator = index_runtime::publication::IndexArtifactCoordinator::new(
+        store.clone(),
         object_distribution.clone(),
         bucket_governance.clone(),
+        cluster_transport.clone(),
     );
     index_artifacts_binding
         .install(Arc::new(index_artifact_coordinator))
@@ -400,10 +370,6 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         watch_sources,
         Arc::new(config.token_manager.clone()),
     ));
-    // No public request is accepted until ordered reference delivery proves
-    // every current source tail locally applied. Recheck immediately before
-    // the destructive scan in case placement changed after readiness.
-    collect_blob_garbage_if_safe(&store, &reference_runtime_handle, "startup").await;
     let index_runtime = index_runtime::runtime::start(
         local_node,
         decisions.clone(),
@@ -413,6 +379,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         object_distribution.clone(),
         bucket_governance.clone(),
         object_reader.clone(),
+        object_lister.clone(),
         &config.data_dir,
         config.index_runtime,
     )
@@ -437,9 +404,20 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         index_runtime.scanner.clone(),
         index_runtime.event_journal.clone(),
         index_runtime.artifact_router.clone(),
+        accounting::AccountingTrafficConfig::default(),
     )
     .await
     .context("initialize distributed accounting runtime")?;
+    let accounting_matcher = accounting::AccountingMatcher::new(
+        index_runtime::coordination::ClusterDefinitionLocatorScanner::new(
+            local_node,
+            decisions.clone(),
+            store.clone(),
+            data_transport.clone(),
+        ),
+        object_reader.clone(),
+        accounting::AccountingMatcherConfig::default(),
+    );
     let accounting_service = accounting::AccountingServiceImpl::new(
         local_node,
         decisions.clone(),
@@ -447,9 +425,10 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         name_resolver.clone(),
         authoritative_system.clone(),
         cluster_transport.clone(),
+        store.clone(),
         object_reader.clone(),
         accounting_runtime.publisher.clone(),
-        accounting_runtime.catalog.clone(),
+        accounting_matcher,
         config.atomic_program_timeout,
     );
     routed_accounting_handlers
@@ -458,7 +437,6 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     accounting_runtime.start_traffic(
         local_node,
         decisions.clone(),
-        store.clone(),
         cluster_transport.clone(),
         accounting_service.clone(),
     );
@@ -466,7 +444,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         store.clone(),
         programs.clone(),
         object_distribution,
-        object_reader,
+        object_reader.clone(),
         cluster_transport.clone(),
         object_lister.clone(),
         distributed_watch,
@@ -486,6 +464,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
             queries: index_runtime.queries.clone(),
             authorization: index_authorization,
             page_tokens: Arc::new(config.token_manager.clone()),
+            definition_reader: Arc::new(object_reader.clone()),
         },
         config.atomic_program_timeout,
     );
@@ -750,54 +729,81 @@ fn spawn_blob_gc(
     payloads: payload_gc::PayloadGarbageCollector,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let first_run = tokio::time::Instant::now() + BLOB_GC_INTERVAL;
-        let mut interval = tokio::time::interval_at(first_run, BLOB_GC_INTERVAL);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            interval.tick().await;
-            match payloads.run_once().await {
-                Ok(retired) if retired > 0 => {
+        tokio::join!(
+            run_blob_gc(store, references),
+            run_payload_retirement(payloads)
+        );
+    })
+}
+
+async fn run_blob_gc(store: Store, references: reference_delivery::ReferenceRuntimeHandle) {
+    let mut cursor = BlobGcCursor::default();
+    let budget = BlobGcBudget::new(
+        BLOB_GC_RECORDS_PER_TICK,
+        BLOB_GC_BYTES_PER_TICK,
+        BLOB_GC_TIME_PER_TICK,
+    )
+    .expect("fixed blob GC budget is valid");
+    let mut delay = BLOB_GC_INTERVAL;
+    loop {
+        tokio::time::sleep(delay).await;
+        let outcome =
+            collect_blob_garbage_if_safe(&store, &references, &mut cursor, budget, "scheduled")
+                .await;
+        delay = blob_gc_next_delay(outcome);
+    }
+}
+
+async fn run_payload_retirement(payloads: payload_gc::PayloadGarbageCollector) {
+    let mut delay = BLOB_GC_INTERVAL;
+    loop {
+        tokio::time::sleep(delay).await;
+        match payloads.run_once().await {
+            Ok(tick) => {
+                if tick.retired > 0 {
                     tracing::info!(
-                        retired,
+                        retired = tick.retired,
                         "former payload artifacts entered the ordinary GC grace window"
                     );
                 }
-                Ok(_) => {}
-                Err(error) => {
-                    tracing::warn!(%error, "former payload-artifact retirement paused");
-                }
+                delay = payload_gc_next_delay(tick.cycle_complete);
             }
-            collect_blob_garbage_if_safe(&store, &references, "scheduled").await;
+            Err(error) => {
+                tracing::warn!(%error, "former payload-artifact retirement paused");
+                delay = BLOB_GC_INTERVAL;
+            }
         }
-    })
+    }
 }
 
 async fn collect_blob_garbage_if_safe(
     store: &Store,
     references: &reference_delivery::ReferenceRuntimeHandle,
+    cursor: &mut BlobGcCursor,
+    budget: BlobGcBudget,
     trigger: &'static str,
-) {
+) -> Option<bool> {
     if !references.gc_safe().await {
         tracing::warn!(
             monotonic_counter.anvil_blob_gc_paused_total = 1_u64,
             trigger,
             "blob garbage collection paused until every ACTIVE source tail is current"
         );
-        return;
+        return None;
     }
-    collect_blob_garbage(store, trigger).await;
-}
-
-async fn collect_blob_garbage(store: &Store, trigger: &'static str) {
-    match store.collect_blob_garbage().await {
-        Ok(removed) => {
-            tracing::info!(
+    match store.collect_blob_garbage_tick(cursor, budget).await {
+        Ok(tick) => {
+            tracing::debug!(
                 monotonic_counter.anvil_blob_gc_runs_total = 1_u64,
-                monotonic_counter.anvil_blob_gc_removed_total = removed,
+                monotonic_counter.anvil_blob_gc_removed_total = tick.removed,
+                gauge.anvil_blob_gc_tick_records = tick.inspected_records as u64,
+                gauge.anvil_blob_gc_tick_bytes = tick.inspected_bytes,
+                cycle_complete = tick.cycle_complete,
                 trigger,
-                removed,
-                "blob garbage-collection pass completed"
+                removed = tick.removed,
+                "bounded blob garbage-collection tick completed"
             );
+            Some(tick.cycle_complete)
         }
         Err(error) => {
             tracing::error!(
@@ -806,7 +812,24 @@ async fn collect_blob_garbage(store: &Store, trigger: &'static str) {
                 %error,
                 "blob garbage-collection pass failed"
             );
+            None
         }
+    }
+}
+
+fn blob_gc_next_delay(cycle_complete: Option<bool>) -> Duration {
+    if cycle_complete == Some(false) {
+        BLOB_GC_CONTINUATION_INTERVAL
+    } else {
+        BLOB_GC_INTERVAL
+    }
+}
+
+fn payload_gc_next_delay(cycle_complete: bool) -> Duration {
+    if cycle_complete {
+        BLOB_GC_INTERVAL
+    } else {
+        BLOB_GC_CONTINUATION_INTERVAL
     }
 }
 
@@ -819,5 +842,21 @@ mod tests {
         let replay_seconds = ATOMIC_REPLAY_RETENTION_MILLIS / 1_000;
         assert!(validate_atomic_replay_gc(replay_seconds).is_ok());
         assert!(validate_atomic_replay_gc(replay_seconds - 1).is_err());
+    }
+
+    #[test]
+    fn incomplete_blob_gc_ticks_continue_but_complete_cycles_wait_an_hour() {
+        assert_eq!(
+            blob_gc_next_delay(Some(false)),
+            BLOB_GC_CONTINUATION_INTERVAL
+        );
+        assert_eq!(blob_gc_next_delay(Some(true)), BLOB_GC_INTERVAL);
+        assert_eq!(blob_gc_next_delay(None), BLOB_GC_INTERVAL);
+    }
+
+    #[test]
+    fn incomplete_payload_retirement_ticks_continue_but_complete_cycles_wait_an_hour() {
+        assert_eq!(payload_gc_next_delay(false), BLOB_GC_CONTINUATION_INTERVAL);
+        assert_eq!(payload_gc_next_delay(true), BLOB_GC_INTERVAL);
     }
 }

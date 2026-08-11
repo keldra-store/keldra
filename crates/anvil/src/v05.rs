@@ -56,6 +56,7 @@ use crate::programs::ProgramCoordinator;
 #[cfg(test)]
 use anvil_store::WatchJournalStatus;
 
+mod accounting_traffic;
 mod atomic_program;
 mod batch_get;
 mod bulk;
@@ -135,11 +136,6 @@ impl ObjectServiceImpl {
             max_blob_bytes,
             atomic_program_timeout,
         }
-    }
-
-    pub(crate) fn record_gateway_ingress(&self, key: &ObjectKey, bytes: u64) {
-        self.accounting_traffic
-            .record_inbound(key.tenant(), key.bucket(), key.path(), bytes);
     }
 
     pub(crate) fn is_single_node(&self) -> Result<bool, Status> {
@@ -288,12 +284,7 @@ impl ObjectService for ObjectServiceImpl {
         }
         let blob = self.store.seal_blob_upload(upload).await.map_err(status)?;
         if !object_path_access::is_internal(&path_access) {
-            self.accounting_traffic.record_inbound(
-                metadata.key.tenant(),
-                metadata.key.bucket(),
-                metadata.key.path(),
-                length,
-            );
+            self.record_accounting_inbound(&metadata.key, length);
         }
         self.issue_ready_token(&caller, header, &blob)
             .map(Response::new)
@@ -640,12 +631,7 @@ impl ObjectService for ObjectServiceImpl {
                             .and_then(|object| object.version.blob.as_ref())
                             .map(|blob| blob.length)
                     {
-                        self.accounting_traffic.record_outbound(
-                            key.tenant(),
-                            key.bucket(),
-                            key.path(),
-                            bytes,
-                        );
+                        self.record_accounting_outbound(&key, bytes);
                     }
                     return distributed_reads::get_object_response(
                         selected,
@@ -715,10 +701,20 @@ impl ObjectService for ObjectServiceImpl {
                 effective_atomic_program_timeout(request.metadata(), self.atomic_program_timeout);
             let operations = request.into_inner().operations;
             validate_bulk_limits(&operations)?;
+            object_path_access::validate_definition_intents(&path_access, operations.len())?;
 
             let mut local = Vec::with_capacity(operations.len());
-            let mut remote =
-                BTreeMap::<anvil_consensus::NodeId, (String, Vec<(usize, BulkOperation)>)>::new();
+            let mut remote = BTreeMap::<
+                anvil_consensus::NodeId,
+                (
+                    String,
+                    Vec<(
+                        usize,
+                        BulkOperation,
+                        Option<anvil_store::DefinitionMutationIntent>,
+                    )>,
+                ),
+            >::new();
             let mut outcomes = Vec::new();
             let mut pending = Vec::with_capacity(operations.len());
             for (index, operation) in operations.into_iter().enumerate() {
@@ -729,7 +725,12 @@ impl ObjectService for ObjectServiceImpl {
                         match object_path_access::require_key(&path_access, key)
                             .and_then(|()| require_caller_tenant(&caller, key))
                         {
-                            Ok(()) => pending.push((index, forwarded, mutation)),
+                            Ok(()) => pending.push((
+                                index,
+                                forwarded,
+                                mutation,
+                                object_path_access::definition_intent(&path_access, index),
+                            )),
                             Err(error) => outcomes.push(bulk_authorization_failure(index, &error)),
                         }
                     }
@@ -743,7 +744,7 @@ impl ObjectService for ObjectServiceImpl {
             }
             let authorization_requests = pending
                 .iter()
-                .map(|(_, _, mutation)| {
+                .map(|(_, _, mutation, _)| {
                     (
                         batch_operation_key(mutation).clone(),
                         batch_operation_permission(mutation),
@@ -759,7 +760,9 @@ impl ObjectService for ObjectServiceImpl {
                     .allows_objects(&caller, &authorization_requests)
                     .await?
             };
-            for ((index, forwarded, mutation), allowed) in pending.into_iter().zip(allowed) {
+            for ((index, forwarded, mutation, definition_intent), allowed) in
+                pending.into_iter().zip(allowed)
+            {
                 if !allowed {
                     outcomes.push(bulk_authorization_failure(
                         index,
@@ -768,12 +771,7 @@ impl ObjectService for ObjectServiceImpl {
                     continue;
                 }
                 if meter_public && let BatchOperation::Put(put) = &mutation {
-                    self.accounting_traffic.record_inbound(
-                        put.key.tenant(),
-                        put.key.bucket(),
-                        put.key.path(),
-                        put.bytes.len() as u64,
-                    );
+                    self.record_accounting_inbound(&put.key, put.bytes.len() as u64);
                 }
                 match self
                     .distribution
@@ -783,12 +781,15 @@ impl ObjectService for ObjectServiceImpl {
                         .entry(target)
                         .or_insert_with(|| (address, Vec::new()))
                         .1
-                        .push((index, forwarded)),
-                    None => local.push((index, mutation)),
+                        .push((index, forwarded, definition_intent)),
+                    None => local.push((index, mutation, definition_intent)),
                 }
             }
-            let local_indices = local.iter().map(|(index, _)| *index).collect::<Vec<_>>();
-            let local_operations = local.into_iter().map(|(_, operation)| operation).collect();
+            let local_indices = local.iter().map(|(index, _, _)| *index).collect::<Vec<_>>();
+            let local_operations = local
+                .into_iter()
+                .map(|(_, operation, definition_intent)| (operation, definition_intent))
+                .collect();
             if peer_routed && !remote.is_empty() {
                 return Err(Status::failed_precondition(
                     "a routed bulk reached a node that is not every item's coordinator",
@@ -978,10 +979,11 @@ impl ObjectService for ObjectServiceImpl {
                     else {
                         continue;
                     };
-                    self.accounting_traffic.record_outbound(
+                    self.record_accounting_traffic(
                         &address.tenant,
                         &address.bucket,
                         &address.path,
+                        0,
                         object.bytes.len() as u64,
                     );
                 }
@@ -1553,7 +1555,7 @@ fn record_bulk_write_metrics(
 
 #[cfg(test)]
 fn watch_consumer_lag(status: &WatchJournalStatus, cursor_offset: u64) -> Option<u64> {
-    status.tail.checked_sub(cursor_offset)
+    status.settled_through.checked_sub(cursor_offset)
 }
 
 fn bulk_encoded_len(operations: &[BulkOperation]) -> Result<usize, Status> {
