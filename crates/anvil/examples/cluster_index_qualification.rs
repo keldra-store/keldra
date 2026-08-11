@@ -1,9 +1,10 @@
 //! Public-API index qualification for one- and three-node Docker harnesses.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::error::Error;
 use std::io;
+use std::path::Path;
 use std::time::Duration;
 
 use anvil_storage::v1::index_query::Query as QueryValue;
@@ -24,6 +25,7 @@ use anvil_storage::{
     BearerToken, RawAdministrationClient, RawClient, administration_client, connect_channel,
     exchange_client_credentials, object_client, put_chunks,
 };
+use serde::{Deserialize, Serialize};
 use tokio::time::{Instant, sleep};
 use tonic::metadata::MetadataValue;
 use tonic::service::interceptor::InterceptedService;
@@ -38,6 +40,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(200);
 const GENERATION_QUIET_WINDOW: Duration = Duration::from_secs(3);
 const GENERATION_QUIET_LIMIT: Duration = Duration::from_secs(12);
 const CONTENT_TYPE: &str = "application/json";
+const COMPACTION_WAVES: usize = 5;
+const VERIFICATION_STATE_SCHEMA: &str = "anvil.index-qualification-state.v1";
 
 #[derive(Clone)]
 struct EngineCase {
@@ -50,7 +54,42 @@ struct EngineCase {
     replacement: (&'static str, &'static [u8]),
     delete_path: &'static str,
     expects_scores: bool,
-    min_advanced_sources: usize,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct VerificationState {
+    schema: String,
+    tenant: String,
+    source_count: usize,
+    indexes: Vec<VerificationIndex>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct VerificationIndex {
+    bucket: String,
+    name: String,
+    index_id: u64,
+    definition_version: u64,
+    generation: u64,
+    placement_term: u64,
+    placement_index: u64,
+    sources: Vec<VerificationSource>,
+    hits: Vec<VerificationHit>,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct VerificationSource {
+    node_id: u64,
+    source_epoch: Vec<u8>,
+    indexed_next_offset: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+struct VerificationHit {
+    path: String,
+    object_version: u64,
+    score_bits: Option<u32>,
+    fields_json: Vec<u8>,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -75,6 +114,22 @@ async fn main() -> TestResult<()> {
     let token = exchange_client_credentials(channels[0].clone(), client_id, client_secret)
         .await?
         .access_token;
+    let mut indexes = channels
+        .iter()
+        .cloned()
+        .map(|channel| index_client(channel, &token))
+        .collect::<Result<Vec<_>, _>>()?;
+    let cases = engine_cases();
+    if let Some(path) = env::var_os("ANVIL_INDEX_QUALIFICATION_STATE_INPUT") {
+        verify_existing_state(Path::new(&path), &tenant, &cases, &mut indexes).await?;
+        println!(
+            "verified {} final index generations through {} endpoint(s)",
+            cases.len(),
+            endpoints.len()
+        );
+        return Ok(());
+    }
+
     let mut objects = channels
         .iter()
         .cloned()
@@ -85,13 +140,6 @@ async fn main() -> TestResult<()> {
         .cloned()
         .map(|channel| administration_client(channel, &token))
         .collect::<Result<Vec<_>, _>>()?;
-    let mut indexes = channels
-        .iter()
-        .cloned()
-        .map(|channel| index_client(channel, &token))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let cases = engine_cases();
     let mut definitions = Vec::new();
     let endpoint_count = endpoints.len();
     for (position, case) in cases.iter().enumerate() {
@@ -116,6 +164,7 @@ async fn main() -> TestResult<()> {
     let mut baseline = Vec::new();
     for (case, definition) in cases.iter().zip(&definitions) {
         let expected_paths = BTreeSet::new();
+        let expected_versions = BTreeMap::new();
         let responses = wait_for_queries(
             &mut indexes,
             request(case),
@@ -124,6 +173,7 @@ async fn main() -> TestResult<()> {
             0,
             0,
             &expected_paths,
+            &expected_versions,
             false,
             endpoints.len(),
         )
@@ -135,8 +185,14 @@ async fn main() -> TestResult<()> {
     let object_client_count = objects.len();
     let source_durability = qualification_durability(endpoint_count);
     for case in &cases {
-        for (path, bytes) in &case.documents {
-            let client = &mut objects[(write_number as usize) % object_client_count];
+        if endpoint_count == 3 && case.documents.len() < endpoint_count {
+            return Err(invalid(format!(
+                "{} does not provide one source document per ingress node",
+                case.name
+            )));
+        }
+        for (document_number, (path, bytes)) in case.documents.iter().enumerate() {
+            let client = &mut objects[document_number % object_client_count];
             put_json(
                 client,
                 &tenant,
@@ -154,6 +210,7 @@ async fn main() -> TestResult<()> {
     let mut first_generations = Vec::new();
     for ((case, definition), before) in cases.iter().zip(&definitions).zip(&baseline) {
         let expected = case.expected_paths.iter().copied().collect::<BTreeSet<_>>();
+        let expected_versions = BTreeMap::new();
         let responses = wait_for_queries(
             &mut indexes,
             request(case),
@@ -162,15 +219,12 @@ async fn main() -> TestResult<()> {
             before.generation,
             case.documents.len() as u64,
             &expected,
+            &expected_versions,
             case.expects_scores,
             endpoints.len(),
         )
         .await?;
-        require_checkpoint_advance(
-            before,
-            require_freshness(&responses[0])?,
-            case.min_advanced_sources.min(endpoints.len()),
-        )?;
+        require_checkpoint_advance(before, require_freshness(&responses[0])?, endpoints.len())?;
         first_generations.push(responses[0].clone());
     }
 
@@ -243,12 +297,8 @@ async fn main() -> TestResult<()> {
 
     let mut mutation_generations = Vec::with_capacity(cases.len());
     for ((case, definition), before) in cases.iter().zip(&definitions).zip(&first_generations) {
-        let expected = case
-            .expected_paths
-            .iter()
-            .copied()
-            .filter(|path| *path != case.delete_path)
-            .collect::<BTreeSet<_>>();
+        let expected = expected_after_primary_mutations(case);
+        let expected_versions = BTreeMap::new();
         let before_freshness = require_freshness(before)?;
         let before_replacement_version = hit_version(before, case.replacement.0)?;
         let responses = wait_for_queries(
@@ -259,6 +309,7 @@ async fn main() -> TestResult<()> {
             before_freshness.generation,
             case.documents.len() as u64 + 2,
             &expected,
+            &expected_versions,
             case.expects_scores,
             endpoints.len(),
         )
@@ -272,6 +323,52 @@ async fn main() -> TestResult<()> {
         }
         require_checkpoint_advance(before_freshness, require_freshness(&responses[0])?, 1)?;
         mutation_generations.push(responses[0].clone());
+    }
+
+    let mut final_replacement_versions = vec![0_u64; cases.len()];
+    for wave in 0..COMPACTION_WAVES {
+        for (case_number, case) in cases.iter().enumerate() {
+            let put_client = &mut objects[(case_number + wave) % object_client_count];
+            final_replacement_versions[case_number] = put_json(
+                put_client,
+                &tenant,
+                case.bucket,
+                case.replacement.0,
+                case.replacement.1,
+                &format!("qualification-compaction-{case_number}-{wave}"),
+                source_durability,
+            )
+            .await?;
+            write_number += 1;
+        }
+
+        let previous_generations = mutation_generations.clone();
+        for (case_number, ((case, definition), before)) in cases
+            .iter()
+            .zip(&definitions)
+            .zip(&previous_generations)
+            .enumerate()
+        {
+            let expected = expected_after_primary_mutations(case);
+            let expected_versions =
+                BTreeMap::from([(case.replacement.0, final_replacement_versions[case_number])]);
+            let before_freshness = require_freshness(before)?;
+            let responses = wait_for_queries(
+                &mut indexes,
+                request(case),
+                definition.index_id,
+                definition.version,
+                before_freshness.generation,
+                case.documents.len() as u64 + 3 + wave as u64,
+                &expected,
+                &expected_versions,
+                case.expects_scores,
+                endpoints.len(),
+            )
+            .await?;
+            require_checkpoint_advance(before_freshness, require_freshness(&responses[0])?, 1)?;
+            mutation_generations[case_number] = responses[0].clone();
+        }
     }
 
     let tensor_position = cases
@@ -302,6 +399,7 @@ async fn main() -> TestResult<()> {
     .await?;
     write_number += 1;
     let expected = BTreeSet::new();
+    let expected_versions = BTreeMap::new();
     let responses = wait_for_queries(
         &mut indexes,
         request(tensor_case),
@@ -310,71 +408,314 @@ async fn main() -> TestResult<()> {
         before_tensor_delete.generation,
         tensor_case.documents.len() as u64 + 3,
         &expected,
+        &expected_versions,
         tensor_case.expects_scores,
         endpoints.len(),
     )
     .await?;
     require_checkpoint_advance(&before_tensor_delete, require_freshness(&responses[0])?, 1)?;
+    mutation_generations[tensor_position] = responses[0].clone();
+    final_replacement_versions[tensor_position] = 0;
 
-    if env::var("ANVIL_INDEX_QUALIFICATION_REQUIRE_QUIESCENCE").is_ok_and(|value| value == "1") {
-        require_generation_quiescence(&mut indexes[0], &cases[0]).await?;
+    let state_output = env::var_os("ANVIL_INDEX_QUALIFICATION_STATE_OUTPUT");
+    if state_output.is_some()
+        || env::var("ANVIL_INDEX_QUALIFICATION_REQUIRE_QUIESCENCE").is_ok_and(|value| value == "1")
+    {
+        require_generation_quiescence(&mut indexes[0], &cases).await?;
+    }
+    if let Some(path) = state_output {
+        let final_responses = collect_final_responses(
+            &mut indexes,
+            &cases,
+            &definitions,
+            &final_replacement_versions,
+            tensor_position,
+            endpoints.len(),
+        )
+        .await?;
+        write_verification_state(
+            Path::new(&path),
+            &tenant,
+            endpoints.len(),
+            &cases,
+            &definitions,
+            &final_responses,
+        )?;
     }
 
     println!(
-        "index qualification passed on {} node(s): {} engines, {} put/delete mutations",
+        "index qualification passed on {} node(s): {} engines, {} public mutations, {} compaction waves",
         endpoints.len(),
         cases.len(),
-        write_number
+        write_number,
+        COMPACTION_WAVES,
     );
     Ok(())
 }
 
 async fn require_generation_quiescence(
     client: &mut IndexClient,
-    case: &EngineCase,
+    cases: &[EngineCase],
 ) -> TestResult<()> {
     let deadline = Instant::now() + GENERATION_QUIET_LIMIT;
-    let mut observed_generation = None;
+    let mut observed_generations = None;
     let mut stable_since = Instant::now();
     let mut advances = 0_u64;
 
     loop {
-        let response = client.query_index(request(case)).await?.into_inner();
-        let generation = require_freshness(&response)?.generation;
-        if generation == 0 {
-            return Err(invalid(
-                "index generation disappeared while checking quiescence",
-            ));
+        let mut generations = Vec::with_capacity(cases.len());
+        for case in cases {
+            let response = client.query_index(request(case)).await?.into_inner();
+            let generation = require_freshness(&response)?.generation;
+            if generation == 0 {
+                return Err(invalid(format!(
+                    "{} generation disappeared while checking quiescence",
+                    case.name
+                )));
+            }
+            generations.push(generation);
         }
-        match observed_generation {
-            Some(previous) if previous == generation => {}
+        match observed_generations.as_ref() {
+            Some(previous) if previous == &generations => {}
             Some(_) => {
-                observed_generation = Some(generation);
+                observed_generations = Some(generations.clone());
                 stable_since = Instant::now();
                 advances = advances.saturating_add(1);
             }
             None => {
-                observed_generation = Some(generation);
+                observed_generations = Some(generations.clone());
                 stable_since = Instant::now();
             }
         }
 
         if stable_since.elapsed() >= GENERATION_QUIET_WINDOW {
             println!(
-                "index generation {generation} remained stable for {} seconds",
+                "all {} index generations remained stable for {} seconds",
+                generations.len(),
                 GENERATION_QUIET_WINDOW.as_secs()
             );
             return Ok(());
         }
         if Instant::now() >= deadline {
             return Err(invalid(format!(
-                "index generation did not quiesce without source mutations: \
-                 observed {advances} advances in {} seconds (latest generation {generation})",
+                "index generations did not quiesce without source mutations: \
+                 observed {advances} vector advances in {} seconds (latest {generations:?})",
                 GENERATION_QUIET_LIMIT.as_secs()
             )));
         }
         sleep(POLL_INTERVAL).await;
     }
+}
+
+async fn collect_final_responses(
+    indexes: &mut [IndexClient],
+    cases: &[EngineCase],
+    definitions: &[anvil_storage::v1::IndexDefinition],
+    replacement_versions: &[u64],
+    tensor_position: usize,
+    source_count: usize,
+) -> TestResult<Vec<QueryIndexResponse>> {
+    let mut final_responses = Vec::with_capacity(cases.len());
+    for (position, ((case, definition), replacement_version)) in cases
+        .iter()
+        .zip(definitions)
+        .zip(replacement_versions)
+        .enumerate()
+    {
+        let expected = if position == tensor_position {
+            BTreeSet::new()
+        } else {
+            expected_after_primary_mutations(case)
+        };
+        let expected_versions = if *replacement_version == 0 {
+            BTreeMap::new()
+        } else {
+            BTreeMap::from([(case.replacement.0, *replacement_version)])
+        };
+        let responses = wait_for_queries(
+            indexes,
+            request(case),
+            definition.index_id,
+            definition.version,
+            0,
+            u64::MAX,
+            &expected,
+            &expected_versions,
+            case.expects_scores,
+            source_count,
+        )
+        .await?;
+        final_responses.push(responses[0].clone());
+    }
+    Ok(final_responses)
+}
+
+fn expected_after_primary_mutations<'a>(case: &'a EngineCase) -> BTreeSet<&'a str> {
+    case.expected_paths
+        .iter()
+        .copied()
+        .filter(|path| *path != case.delete_path)
+        .collect()
+}
+
+fn write_verification_state(
+    path: &Path,
+    tenant: &str,
+    source_count: usize,
+    cases: &[EngineCase],
+    definitions: &[anvil_storage::v1::IndexDefinition],
+    responses: &[QueryIndexResponse],
+) -> TestResult<()> {
+    if cases.len() != definitions.len() || cases.len() != responses.len() {
+        return Err(invalid(
+            "index verification state inputs have different lengths",
+        ));
+    }
+    let indexes = cases
+        .iter()
+        .zip(definitions)
+        .zip(responses)
+        .map(|((case, definition), response)| {
+            let freshness = require_freshness(response)?;
+            let mut sources = freshness
+                .sources
+                .iter()
+                .map(|source| VerificationSource {
+                    node_id: source.node_id,
+                    source_epoch: source.source_epoch.clone(),
+                    indexed_next_offset: source.indexed_next_offset,
+                })
+                .collect::<Vec<_>>();
+            sources.sort_by_key(|source| source.node_id);
+            let hits = verification_hits(response)?;
+            Ok(VerificationIndex {
+                bucket: case.bucket.into(),
+                name: case.name.into(),
+                index_id: definition.index_id,
+                definition_version: definition.version,
+                generation: freshness.generation,
+                placement_term: freshness.placement_term,
+                placement_index: freshness.placement_index,
+                sources,
+                hits,
+            })
+        })
+        .collect::<TestResult<Vec<_>>>()?;
+    let encoded = serde_json::to_vec_pretty(&VerificationState {
+        schema: VERIFICATION_STATE_SCHEMA.into(),
+        tenant: tenant.into(),
+        source_count,
+        indexes,
+    })?;
+    std::fs::write(path, encoded)?;
+    Ok(())
+}
+
+async fn verify_existing_state(
+    path: &Path,
+    tenant: &str,
+    cases: &[EngineCase],
+    indexes: &mut [IndexClient],
+) -> TestResult<()> {
+    let state: VerificationState = serde_json::from_slice(&std::fs::read(path)?)?;
+    if state.schema != VERIFICATION_STATE_SCHEMA
+        || state.tenant != tenant
+        || state.source_count != indexes.len()
+        || state.indexes.len() != cases.len()
+    {
+        return Err(invalid(
+            "index verification state does not match this cluster",
+        ));
+    }
+    for (case, expected) in cases.iter().zip(&state.indexes) {
+        if expected.bucket != case.bucket || expected.name != case.name {
+            return Err(invalid(
+                "index verification state order or identity changed",
+            ));
+        }
+        let expected_paths = expected
+            .hits
+            .iter()
+            .map(|hit| hit.path.as_str())
+            .collect::<BTreeSet<_>>();
+        let expected_versions = expected
+            .hits
+            .iter()
+            .map(|hit| (hit.path.as_str(), hit.object_version))
+            .collect::<BTreeMap<_, _>>();
+        let responses = wait_for_queries(
+            indexes,
+            request(case),
+            expected.index_id,
+            expected.definition_version,
+            expected.generation.saturating_sub(1),
+            u64::MAX,
+            &expected_paths,
+            &expected_versions,
+            case.expects_scores,
+            state.source_count,
+        )
+        .await?;
+        for response in &responses {
+            verify_response_state(response, expected)?;
+        }
+    }
+    Ok(())
+}
+
+fn verify_response_state(
+    response: &QueryIndexResponse,
+    expected: &VerificationIndex,
+) -> TestResult<()> {
+    let freshness = require_freshness(response)?;
+    let mut sources = freshness
+        .sources
+        .iter()
+        .map(|source| VerificationSource {
+            node_id: source.node_id,
+            source_epoch: source.source_epoch.clone(),
+            indexed_next_offset: source.indexed_next_offset,
+        })
+        .collect::<Vec<_>>();
+    sources.sort_by_key(|source| source.node_id);
+    if freshness.generation != expected.generation
+        || freshness.index_id != expected.index_id
+        || freshness.definition_version != expected.definition_version
+        || freshness.placement_term != expected.placement_term
+        || freshness.placement_index != expected.placement_index
+        || !freshness.initial_build_complete
+        || freshness.rebuilding
+        || sources != expected.sources
+        || verification_hits(response)? != expected.hits
+    {
+        return Err(invalid(format!(
+            "{}:{} did not preserve its final complete generation {}",
+            expected.bucket, expected.name, expected.generation
+        )));
+    }
+    Ok(())
+}
+
+fn verification_hits(response: &QueryIndexResponse) -> TestResult<Vec<VerificationHit>> {
+    let mut hits = response
+        .hits
+        .iter()
+        .map(|hit| {
+            Ok(VerificationHit {
+                path: hit
+                    .address
+                    .as_ref()
+                    .ok_or_else(|| invalid("index verification hit omitted its address"))?
+                    .path
+                    .clone(),
+                object_version: hit.object_version,
+                score_bits: hit.score.map(f32::to_bits),
+                fields_json: hit.fields_json.clone(),
+            })
+        })
+        .collect::<TestResult<Vec<_>>>()?;
+    hits.sort();
+    Ok(hits)
 }
 
 fn index_client(
@@ -578,7 +919,7 @@ async fn put_json(
     bytes: &[u8],
     command_id: &str,
     durability: Durability,
-) -> TestResult<()> {
+) -> TestResult<u64> {
     let receipt = put_chunks(
         client,
         PutHeader {
@@ -598,7 +939,7 @@ async fn put_json(
     if receipt.version == 0 || receipt.deleted {
         return Err(invalid("index source write returned an invalid receipt"));
     }
-    Ok(())
+    Ok(receipt.version)
 }
 
 async fn delete_object(
@@ -641,6 +982,7 @@ async fn wait_for_queries(
     after_generation: u64,
     indexed_objects: u64,
     expected_paths: &BTreeSet<&str>,
+    expected_versions: &BTreeMap<&str, u64>,
     expects_scores: bool,
     expected_sources: usize,
 ) -> TestResult<Vec<QueryIndexResponse>> {
@@ -668,6 +1010,7 @@ async fn wait_for_queries(
                     after_generation,
                     indexed_objects,
                     expected_paths,
+                    expected_versions,
                     expects_scores,
                     expected_sources,
                 )
@@ -731,6 +1074,7 @@ fn response_matches(
     after_generation: u64,
     indexed_objects: u64,
     expected_paths: &BTreeSet<&str>,
+    expected_versions: &BTreeMap<&str, u64>,
     expects_scores: bool,
     expected_sources: usize,
 ) -> bool {
@@ -771,6 +1115,12 @@ fn response_matches(
     actual == *expected_paths
         && indexed_objects >= response.hits.len() as u64
         && response.hits.len() == expected_paths.len()
+        && expected_versions.iter().all(|(path, version)| {
+            response
+                .hits
+                .iter()
+                .any(|hit| hit_path(hit) == Some(*path) && hit.object_version == *version)
+        })
         && response.hits.iter().all(|hit| {
             hit.object_version != 0
                 && hit.score.is_some() == expects_scores
@@ -954,7 +1304,6 @@ fn engine_cases() -> Vec<EngineCase> {
             replacement: ("docs/a.json", br#"{"value":"a-replaced"}"#),
             delete_path: "docs/b.json",
             expects_scores: false,
-            min_advanced_sources: 3,
         },
         EngineCase {
             bucket: "index-typed-json",
@@ -985,7 +1334,6 @@ fn engine_cases() -> Vec<EngineCase> {
             ),
             delete_path: "docs/active-b.json",
             expects_scores: false,
-            min_advanced_sources: 1,
         },
         EngineCase {
             bucket: "index-object-metadata",
@@ -1011,7 +1359,6 @@ fn engine_cases() -> Vec<EngineCase> {
             replacement: ("docs/keep-a.json", br#"{"value":"a-replaced"}"#),
             delete_path: "docs/keep-b.json",
             expects_scores: false,
-            min_advanced_sources: 1,
         },
         EngineCase {
             bucket: "index-full-text",
@@ -1041,7 +1388,6 @@ fn engine_cases() -> Vec<EngineCase> {
             ),
             delete_path: "docs/journal-b.json",
             expects_scores: true,
-            min_advanced_sources: 1,
         },
         EngineCase {
             bucket: "index-vector",
@@ -1058,7 +1404,6 @@ fn engine_cases() -> Vec<EngineCase> {
             ),
             delete_path: "docs/storage.json",
             expects_scores: true,
-            min_advanced_sources: 1,
         },
         EngineCase {
             bucket: "index-hybrid",
@@ -1086,7 +1431,6 @@ fn engine_cases() -> Vec<EngineCase> {
             ),
             delete_path: "docs/storage.json",
             expects_scores: true,
-            min_advanced_sources: 1,
         },
         EngineCase {
             bucket: "index-git-source",
@@ -1108,6 +1452,10 @@ fn engine_cases() -> Vec<EngineCase> {
                     "docs/git-main.json",
                     br#"{"repository_id":"qualification-repository","commit_id":"qualification-commit","tree_path":"src/main.rs","object_id":"2222222222222222222222222222222222222222","pack_path":"docs/git-main.json","pack_version":1,"offset":128,"length":256}"#,
                 ),
+                (
+                    "docs/git-readme.json",
+                    br#"{"repository_id":"qualification-repository","commit_id":"qualification-commit","tree_path":"README.md","object_id":"4444444444444444444444444444444444444444","pack_path":"docs/git-readme.json","pack_version":1,"offset":384,"length":64}"#,
+                ),
             ],
             expected_paths: vec!["docs/git-lib.json", "docs/git-main.json"],
             replacement: (
@@ -1116,7 +1464,6 @@ fn engine_cases() -> Vec<EngineCase> {
             ),
             delete_path: "docs/git-main.json",
             expects_scores: false,
-            min_advanced_sources: 1,
         },
         EngineCase {
             bucket: "index-tensor",
@@ -1148,7 +1495,6 @@ fn engine_cases() -> Vec<EngineCase> {
             ),
             delete_path: "docs/tensor-decoder.json",
             expects_scores: false,
-            min_advanced_sources: 1,
         },
     ]
 }
@@ -1251,6 +1597,11 @@ mod tests {
         );
         assert_eq!(cases.len(), kinds.len());
         for case in cases {
+            assert!(
+                case.documents.len() >= 3,
+                "{} must exercise every three-node ingress source",
+                case.name
+            );
             assert!(!case.expected_paths.is_empty());
             assert!(case.expected_paths.contains(&case.replacement.0));
             assert_ne!(case.replacement.0, case.delete_path);
