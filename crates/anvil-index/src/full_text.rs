@@ -1,5 +1,8 @@
 //! Bounded immutable positional full-text runs.
 
+mod compaction_cache;
+mod parallel_compaction;
+
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -282,6 +285,59 @@ impl FullTextEngine {
         Self::merge_with_target(runs, output_level, DEFAULT_COMPONENT_BLOCK_BYTES, sink).await
     }
 
+    /// Compact deterministic path and term stripes concurrently into the
+    /// ordinary immutable full-text component format.
+    pub async fn merge_runs_parallel<D, S, E>(
+        runs: &[D],
+        output_level: u8,
+        sink: &mut S,
+        parallelism: crate::compaction::CompactionParallelism,
+        progress: crate::compaction::CompactionProgress,
+        executor: E,
+    ) -> Result<SealedRun, IndexError>
+    where
+        D: IndexDirectoryRead + Clone + 'static,
+        S: IndexBlockSink + IndexDirectoryRead + Clone + 'static,
+        E: crate::compaction::CompactionExecutor,
+    {
+        Self::merge_parallel_with_target(
+            runs,
+            output_level,
+            DEFAULT_COMPONENT_BLOCK_BYTES,
+            sink,
+            parallelism,
+            progress,
+            executor,
+        )
+        .await
+    }
+
+    async fn merge_parallel_with_target<D, S, E>(
+        runs: &[D],
+        output_level: u8,
+        target_bytes: usize,
+        sink: &mut S,
+        parallelism: crate::compaction::CompactionParallelism,
+        progress: crate::compaction::CompactionProgress,
+        executor: E,
+    ) -> Result<SealedRun, IndexError>
+    where
+        D: IndexDirectoryRead + Clone + 'static,
+        S: IndexBlockSink + IndexDirectoryRead + Clone + 'static,
+        E: crate::compaction::CompactionExecutor,
+    {
+        parallel_compaction::merge_full_text_parallel(
+            runs,
+            output_level,
+            target_bytes,
+            sink,
+            parallelism,
+            progress,
+            executor,
+        )
+        .await
+    }
+
     async fn merge_with_target<D, S>(
         runs: &[D],
         output_level: u8,
@@ -521,7 +577,7 @@ fn posting_estimate(row: &TextPostingRow) -> usize {
         .saturating_add(128)
 }
 
-fn posting_key(row: &TextPostingRow) -> Result<Vec<u8>, IndexError> {
+pub(crate) fn posting_key(row: &TextPostingRow) -> Result<Vec<u8>, IndexError> {
     validate_term(&row.term)?;
     validate_field(&row.field)?;
     let mut key = Vec::with_capacity(row.term.len() + row.field.len() + 14);
@@ -633,6 +689,38 @@ pub(crate) async fn read_text_block<D: IndexDirectoryRead>(
     {
         return Err(IndexError::InvalidFormat("full-text block descriptor"));
     }
+    Ok(rows)
+}
+
+async fn read_text_block_parallel<D, E>(
+    directory: &D,
+    descriptor: &BlockDescriptor,
+    executor: &E,
+    progress: &crate::compaction::CompactionProgress,
+) -> Result<Vec<TextPostingRow>, IndexError>
+where
+    D: IndexDirectoryRead,
+    E: crate::compaction::CompactionExecutor,
+{
+    let block = crate::run::read_leaf(directory, descriptor).await?;
+    let descriptor = descriptor.clone();
+    let rows = executor
+        .run_cpu(move || {
+            let rows = match descriptor.codec {
+                ComponentCodec::GapPostings => decode_text_rows_fixed(block.body())?,
+                ComponentCodec::QuasiSuccinctPostings => decode_text_rows_succinct(block.body())?,
+                _ => return Err(IndexError::InvalidFormat("full-text block codec")),
+            };
+            if rows.first().map(posting_key).transpose()? != Some(descriptor.minimum_key.clone())
+                || rows.last().map(posting_key).transpose()? != Some(descriptor.maximum_key.clone())
+                || rows.len() as u64 != descriptor.element_count
+            {
+                return Err(IndexError::InvalidFormat("full-text block descriptor"));
+            }
+            Ok(rows)
+        })
+        .await?;
+    progress.record_input(rows.len() as u64, 0, 0);
     Ok(rows)
 }
 
@@ -751,6 +839,7 @@ pub(crate) struct TextRowCursor<'a, D> {
     leaves: LeafCursor<'a, D>,
     rows: Vec<TextPostingRow>,
     next_row: usize,
+    range: Option<crate::compaction::KeyRange>,
 }
 
 impl<'a, D: IndexDirectoryRead> TextRowCursor<'a, D> {
@@ -760,6 +849,21 @@ impl<'a, D: IndexDirectoryRead> TextRowCursor<'a, D> {
             leaves: LeafCursor::new(directory, root),
             rows: Vec::new(),
             next_row: 0,
+            range: None,
+        }
+    }
+
+    pub(crate) fn in_range(
+        directory: &'a D,
+        root: BlockDescriptor,
+        range: crate::compaction::KeyRange,
+    ) -> Self {
+        Self {
+            directory,
+            leaves: LeafCursor::in_range(directory, root, range.clone()),
+            rows: Vec::new(),
+            next_row: 0,
+            range: Some(range),
         }
     }
 
@@ -767,12 +871,48 @@ impl<'a, D: IndexDirectoryRead> TextRowCursor<'a, D> {
         loop {
             if let Some(row) = self.rows.get(self.next_row).cloned() {
                 self.next_row += 1;
-                return Ok(Some(row));
+                if self
+                    .range
+                    .as_ref()
+                    .is_none_or(|range| range.contains(row.term.as_bytes()))
+                {
+                    return Ok(Some(row));
+                }
+                continue;
             }
             let Some(descriptor) = self.leaves.next().await? else {
                 return Ok(None);
             };
             self.rows = read_text_block(self.directory, &descriptor).await?;
+            self.next_row = 0;
+        }
+    }
+
+    pub(crate) async fn next_parallel<E: crate::compaction::CompactionExecutor>(
+        &mut self,
+        executor: &E,
+        progress: &crate::compaction::CompactionProgress,
+    ) -> Result<Option<TextPostingRow>, IndexError> {
+        loop {
+            if let Some(row) = self.rows.get(self.next_row).cloned() {
+                self.next_row += 1;
+                if self
+                    .range
+                    .as_ref()
+                    .is_none_or(|range| range.contains(row.term.as_bytes()))
+                {
+                    return Ok(Some(row));
+                }
+                continue;
+            }
+            // Release the exhausted decoded leaf before fetching/decoding its
+            // replacement so the lane never retains both at once.
+            self.rows = Vec::new();
+            let Some(descriptor) = self.leaves.next().await? else {
+                return Ok(None);
+            };
+            self.rows =
+                read_text_block_parallel(self.directory, &descriptor, executor, progress).await?;
             self.next_row = 0;
         }
     }
@@ -1692,4 +1832,5 @@ mod tests {
     }
 
     include!("full_text/query_bounds_tests.rs");
+    include!("full_text/parallel_compaction_tests.rs");
 }

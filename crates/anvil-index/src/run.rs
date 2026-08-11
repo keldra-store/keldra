@@ -1,3 +1,4 @@
+use std::borrow::Borrow;
 use std::collections::BTreeMap;
 
 use crate::codec::{
@@ -23,7 +24,7 @@ pub(crate) struct RunStatistics {
     pub(crate) maximum_version: u64,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct ComponentTree {
     pub(crate) root: BlockDescriptor,
     pub(crate) encoded_bytes: u64,
@@ -87,7 +88,8 @@ impl RoutingTreeBuilder {
     ) -> Result<(), IndexError> {
         loop {
             if self.levels.len() <= level {
-                self.levels.push(Vec::with_capacity(ROUTING_FANOUT));
+                self.levels
+                    .resize_with(level + 1, || Vec::with_capacity(ROUTING_FANOUT));
             }
             self.levels[level].push(descriptor);
             if self.levels[level].len() < ROUTING_FANOUT {
@@ -140,6 +142,92 @@ impl RoutingTreeBuilder {
             self.add_descriptor(level + 1, descriptor, sink).await?;
         }
     }
+
+    async fn emit_subtree<S: IndexBlockSink>(
+        &mut self,
+        tree: ComponentTree,
+        target_height: u8,
+        sink: &mut S,
+    ) -> Result<(), IndexError> {
+        if tree.root.kind != self.kind
+            || tree.root.component_tag != self.component_tag
+            || tree.root.routing_height > target_height
+        {
+            return Err(IndexError::InvalidDefinition(
+                "component range has the wrong kind, tag, or height".into(),
+            ));
+        }
+        if self
+            .last_maximum
+            .as_ref()
+            .is_some_and(|maximum| maximum >= &tree.root.minimum_key)
+        {
+            return Err(IndexError::InvalidDefinition(
+                "component ranges must be strictly ordered".into(),
+            ));
+        }
+        self.last_maximum = Some(tree.root.maximum_key.clone());
+        self.encoded_bytes = self
+            .encoded_bytes
+            .checked_add(tree.encoded_bytes)
+            .ok_or(IndexError::OffsetOverflow)?;
+
+        let mut descriptor = tree.root;
+        while descriptor.routing_height < target_height {
+            let next_height = descriptor
+                .routing_height
+                .checked_add(1)
+                .ok_or(IndexError::OffsetOverflow)?;
+            let page = encode_routing_page(
+                self.kind,
+                self.component_tag,
+                usize::from(next_height),
+                std::slice::from_ref(&descriptor),
+            )?;
+            descriptor = page.descriptor().clone();
+            self.encoded_bytes = self
+                .encoded_bytes
+                .checked_add(descriptor.encoded_bytes)
+                .ok_or(IndexError::OffsetOverflow)?;
+            sink.emit(page).await?;
+        }
+        self.add_descriptor(usize::from(target_height), descriptor, sink)
+            .await
+    }
+}
+
+/// Stitch independently written, strictly ordered component subtrees into one
+/// Merkle tree. Shorter subtrees are promoted with single-child routing pages;
+/// lane blocks remain ordinary immutable component blocks.
+pub(crate) async fn assemble_component_ranges<S, I, T>(
+    kind: IndexKind,
+    component_tag: u8,
+    trees: I,
+    sink: &mut S,
+) -> Result<ComponentTree, IndexError>
+where
+    S: IndexBlockSink,
+    I: IntoIterator<Item = T>,
+    T: Borrow<ComponentTree>,
+{
+    let trees = trees
+        .into_iter()
+        .map(|tree| tree.borrow().clone())
+        .collect::<Vec<_>>();
+    let target_height = trees
+        .iter()
+        .map(|tree| tree.root.routing_height)
+        .max()
+        .ok_or_else(|| {
+            IndexError::InvalidDefinition(
+                "component assembly requires at least one non-empty range".into(),
+            )
+        })?;
+    let mut builder = RoutingTreeBuilder::new(kind, component_tag);
+    for tree in trees {
+        builder.emit_subtree(tree, target_height, sink).await?;
+    }
+    builder.finish(sink).await
 }
 
 fn encode_routing_page(
@@ -268,7 +356,7 @@ pub(crate) fn seal_run_root(
     ))
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct RunView {
     components: BTreeMap<u8, (u64, BlockDescriptor)>,
 }
@@ -446,6 +534,7 @@ pub(crate) struct LeafCursor<'a, D> {
     directory: &'a D,
     pending: Option<BlockDescriptor>,
     stack: Vec<(Vec<BlockDescriptor>, usize)>,
+    range: Option<crate::compaction::KeyRange>,
 }
 
 /// One validated leaf retaining the original encoded allocation. Consumers
@@ -527,20 +616,43 @@ impl<'a, D: IndexDirectoryRead> LeafCursor<'a, D> {
             directory,
             pending: Some(root),
             stack: Vec::new(),
+            range: None,
+        }
+    }
+
+    pub(crate) fn in_range(
+        directory: &'a D,
+        root: BlockDescriptor,
+        range: crate::compaction::KeyRange,
+    ) -> Self {
+        Self {
+            directory,
+            pending: Some(root),
+            stack: Vec::new(),
+            range: Some(range),
         }
     }
 
     pub(crate) async fn next(&mut self) -> Result<Option<BlockDescriptor>, IndexError> {
         loop {
             if let Some(current) = self.pending.take() {
+                if self
+                    .range
+                    .as_ref()
+                    .is_some_and(|range| !range.intersects(&current))
+                {
+                    continue;
+                }
                 if current.routing_height == 0 {
                     return Ok(Some(current));
                 }
-                let children = read_routing_page(self.directory, &current).await?;
-                let first = children
-                    .first()
-                    .cloned()
-                    .ok_or(IndexError::InvalidFormat("empty routing page"))?;
+                let mut children = read_routing_page(self.directory, &current).await?;
+                if let Some(range) = &self.range {
+                    children.retain(|child| range.intersects(child));
+                }
+                let Some(first) = children.first().cloned() else {
+                    continue;
+                };
                 self.stack.push((children, 1));
                 self.pending = Some(first);
                 continue;
@@ -793,6 +905,110 @@ mod tests {
         }
         assert_eq!(keys.len(), ROUTING_FANOUT * ROUTING_FANOUT + 3);
         assert!(keys.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[tokio::test]
+    async fn independently_written_ranges_assemble_across_tree_heights() {
+        let mut sink = MemoryBlockSink::default();
+        let mut first = RoutingTreeBuilder::new(IndexKind::Path, 1);
+        for index in 0..=ROUTING_FANOUT {
+            let key = format!("a{index:08}").into_bytes();
+            let bytes =
+                encode_component(IndexKind::Path, 1, ComponentCodec::FixedRows, key.clone())
+                    .unwrap();
+            first
+                .emit_leaf(
+                    GeneratedBlock::new(
+                        IndexKind::Path,
+                        1,
+                        ComponentCodec::FixedRows,
+                        0,
+                        key.clone(),
+                        key,
+                        1,
+                        bytes,
+                    )
+                    .unwrap(),
+                    &mut sink,
+                )
+                .await
+                .unwrap();
+        }
+        let first = first.finish(&mut sink).await.unwrap();
+        assert_eq!(first.root.routing_height, 2);
+
+        let mut second_sink = sink.clone();
+        let mut second = RoutingTreeBuilder::new(IndexKind::Path, 1);
+        let key = b"z00000000".to_vec();
+        let bytes =
+            encode_component(IndexKind::Path, 1, ComponentCodec::FixedRows, key.clone()).unwrap();
+        second
+            .emit_leaf(
+                GeneratedBlock::new(
+                    IndexKind::Path,
+                    1,
+                    ComponentCodec::FixedRows,
+                    0,
+                    key.clone(),
+                    key,
+                    1,
+                    bytes,
+                )
+                .unwrap(),
+                &mut second_sink,
+            )
+            .await
+            .unwrap();
+        let second = second.finish(&mut second_sink).await.unwrap();
+        assert_eq!(second.root.routing_height, 0);
+
+        let assembled = assemble_component_ranges(IndexKind::Path, 1, [&first, &second], &mut sink)
+            .await
+            .unwrap();
+        let directory = sink.directory();
+        let mut cursor = LeafCursor::new(&directory, assembled.root);
+        let mut keys = Vec::new();
+        while let Some(descriptor) = cursor.next().await.unwrap() {
+            keys.push(descriptor.minimum_key);
+        }
+        assert_eq!(keys.len(), ROUTING_FANOUT + 2);
+        assert!(keys.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[tokio::test]
+    async fn component_range_assembly_rejects_out_of_order_subtrees() {
+        let mut sink = MemoryBlockSink::default();
+        let mut trees = Vec::new();
+        for key in [b"a".as_slice(), b"b".as_slice()] {
+            let mut builder = RoutingTreeBuilder::new(IndexKind::Path, 1);
+            let bytes =
+                encode_component(IndexKind::Path, 1, ComponentCodec::FixedRows, key.to_vec())
+                    .unwrap();
+            builder
+                .emit_leaf(
+                    GeneratedBlock::new(
+                        IndexKind::Path,
+                        1,
+                        ComponentCodec::FixedRows,
+                        0,
+                        key.to_vec(),
+                        key.to_vec(),
+                        1,
+                        bytes,
+                    )
+                    .unwrap(),
+                    &mut sink,
+                )
+                .await
+                .unwrap();
+            trees.push(builder.finish(&mut sink).await.unwrap());
+        }
+        trees.reverse();
+        assert!(
+            assemble_component_ranges(IndexKind::Path, 1, trees, &mut sink)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

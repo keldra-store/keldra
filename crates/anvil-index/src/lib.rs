@@ -7,6 +7,7 @@
 
 mod artifact;
 mod codec;
+pub mod compaction;
 mod error;
 mod io;
 mod model;

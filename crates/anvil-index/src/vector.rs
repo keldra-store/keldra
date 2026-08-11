@@ -1,24 +1,34 @@
 //! Exact vector search over bounded immutable runs.
 
+#[path = "vector_compaction_cache.rs"]
+mod compaction_cache;
+
 use std::cmp::Ordering;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
 use crate::codec::{Decoder, Encoder, encode_component};
+use crate::compaction::{
+    CompactionExecutor, CompactionParallelism, CompactionProgress, LaneResultProducer,
+    PathWinnerCursor, collect_ordered_lanes, dense_ordinal_bases, deterministic_key_range_plan,
+};
 use crate::run::{
-    ComponentTree, LeafCursor, RoutingTreeBuilder, RunStatistics, RunView, find_leaf, open_views,
-    seal_run_root,
+    ComponentTree, LeafCursor, RoutingTreeBuilder, RunStatistics, RunView,
+    assemble_component_ranges, find_leaf, open_views, seal_run_root,
 };
 use crate::segment::{
     DEFAULT_COMPONENT_BLOCK_BYTES, DocumentComponentWriter, DocumentRecord, DocumentState,
-    MutationBuffer, PATH_CHANGES_TAG, PathChange, PathComponentWriter, document_by_ordinal,
-    is_latest_live, read_path_block,
+    MutationBuffer, PATH_CHANGES_TAG, PathChange, PathComponentWriter, PathRunCursor,
+    document_by_ordinal, is_latest_live,
 };
 use crate::succinct::{decode_elias_fano_with_budget, encode_elias_fano};
 use crate::{
     ComponentCodec, DocumentRef, GeneratedBlock, IndexBlockSink, IndexDirectoryRead, IndexError,
     IndexKind, IndexMutation, SealedRun, SegmentBuildOptions, SegmentPush,
 };
+
+use compaction_cache::VectorCompactionPointCache;
 
 pub(crate) const VECTORS_TAG: u8 = 40;
 const VECTOR_ROW_OVERHEAD: usize = 24;
@@ -313,6 +323,77 @@ impl VectorEngine {
         .await
     }
 
+    pub async fn merge_runs_parallel<D, S, E>(
+        runs: &[D],
+        definition: &VectorDefinition,
+        output_level: u8,
+        sink: &mut S,
+        parallelism: CompactionParallelism,
+        progress: CompactionProgress,
+        executor: E,
+    ) -> Result<SealedRun, IndexError>
+    where
+        D: IndexDirectoryRead + Clone + 'static,
+        S: IndexBlockSink + Clone + 'static,
+        E: CompactionExecutor,
+    {
+        definition.validate()?;
+        Self::merge_parallel_with_target(
+            runs,
+            definition,
+            output_level,
+            DEFAULT_COMPONENT_BLOCK_BYTES,
+            sink,
+            parallelism,
+            progress,
+            executor,
+        )
+        .await
+    }
+
+    async fn merge_parallel_with_target<D, S, E>(
+        runs: &[D],
+        definition: &VectorDefinition,
+        output_level: u8,
+        target_block_bytes: usize,
+        sink: &mut S,
+        parallelism: CompactionParallelism,
+        progress: CompactionProgress,
+        executor: E,
+    ) -> Result<SealedRun, IndexError>
+    where
+        D: IndexDirectoryRead + Clone + 'static,
+        S: IndexBlockSink + Clone + 'static,
+        E: CompactionExecutor,
+    {
+        if runs.is_empty() || output_level == 0 {
+            return Err(IndexError::InvalidDefinition(
+                "vector compaction requires input runs and an L1+ output level".into(),
+            ));
+        }
+        let (path_tree, document_tree, vector_tree, statistics) = merge_vector_components_parallel(
+            runs,
+            IndexKind::Vector,
+            definition,
+            VECTORS_TAG,
+            output_level,
+            target_block_bytes,
+            sink,
+            parallelism,
+            progress,
+            executor,
+        )
+        .await?;
+        let mut components = vec![path_tree];
+        if let Some(tree) = document_tree {
+            components.push(tree);
+        }
+        if let Some(tree) = vector_tree {
+            components.push(tree);
+        }
+        seal_run_root(IndexKind::Vector, output_level, statistics, components)
+    }
+
     async fn merge_with_target<D, S>(
         runs: &[D],
         definition: &VectorDefinition,
@@ -446,6 +527,307 @@ impl VectorEngine {
             components,
         )
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn merge_vector_components_parallel<D, S, E>(
+    runs: &[D],
+    kind: IndexKind,
+    definition: &VectorDefinition,
+    vector_tag: u8,
+    output_level: u8,
+    target_block_bytes: usize,
+    sink: &mut S,
+    parallelism: CompactionParallelism,
+    progress: CompactionProgress,
+    executor: E,
+) -> Result<
+    (
+        ComponentTree,
+        Option<ComponentTree>,
+        Option<ComponentTree>,
+        RunStatistics,
+    ),
+    IndexError,
+>
+where
+    D: IndexDirectoryRead + Clone + 'static,
+    S: IndexBlockSink + Clone + 'static,
+    E: CompactionExecutor,
+{
+    let views = open_views(runs, kind).await?;
+    let roots = views
+        .iter()
+        .map(|view| view.component(PATH_CHANGES_TAG).cloned())
+        .collect::<Result<Vec<_>, _>>()?;
+    let plan = deterministic_key_range_plan(roots.iter().cloned(), parallelism.max_lanes());
+    progress.record_range_limit(plan.range_limit)?;
+    let ranges = plan.ranges;
+    let runs = Arc::new(runs.to_vec());
+    let views = Arc::new(views);
+    let roots = Arc::new(roots);
+    let definition = Arc::new(definition.clone());
+
+    let mut count_producers =
+        Vec::<LaneResultProducer<VectorLaneSummary>>::with_capacity(ranges.len());
+    for range in &ranges {
+        let runs = runs.clone();
+        let roots = roots.clone();
+        let lane_executor = executor.clone();
+        let lane_progress = progress.clone();
+        let range = range.clone();
+        count_producers.push(Box::new(move || {
+            Box::pin(async move {
+                let mut cursor = PathWinnerCursor::open(
+                    runs.as_slice(),
+                    roots.as_slice(),
+                    range,
+                    lane_executor,
+                    lane_progress,
+                )
+                .await?;
+                let mut summary = VectorLaneSummary::default();
+                while let Some((_, winner)) = cursor.next().await? {
+                    summary.observe(&winner)?;
+                }
+                Ok(summary)
+            })
+        }));
+    }
+    let summaries = collect_ordered_lanes(&executor, count_producers, &progress).await?;
+    let mutation_count = summaries.iter().try_fold(0u64, |total, summary| {
+        total
+            .checked_add(summary.mutation_count)
+            .ok_or(IndexError::OffsetOverflow)
+    })?;
+    if mutation_count == 0 {
+        return Err(IndexError::InvalidDefinition(
+            "vector compaction produced no changes".into(),
+        ));
+    }
+    let live_counts = summaries
+        .iter()
+        .map(|summary| summary.live_count)
+        .collect::<Vec<_>>();
+    let (ordinal_bases, live_document_count) = dense_ordinal_bases(&live_counts)?;
+    let minimum_version = summaries
+        .iter()
+        .filter(|summary| summary.mutation_count != 0)
+        .map(|summary| summary.minimum_version)
+        .min()
+        .unwrap();
+    let maximum_version = summaries
+        .iter()
+        .map(|summary| summary.maximum_version)
+        .max()
+        .unwrap();
+
+    let mut write_producers = Vec::<LaneResultProducer<VectorLaneComponents>>::new();
+    for ((range, summary), ordinal_base) in ranges.into_iter().zip(summaries).zip(ordinal_bases) {
+        if summary.mutation_count == 0 {
+            continue;
+        }
+        let runs = runs.clone();
+        let views = views.clone();
+        let roots = roots.clone();
+        let definition = definition.clone();
+        let lane_executor = executor.clone();
+        let lane_progress = progress.clone();
+        let mut lane_sink = (*sink).clone();
+        write_producers.push(Box::new(move || {
+            Box::pin(async move {
+                let mut paths = PathComponentWriter::new(kind, output_level, target_block_bytes);
+                let mut documents = DocumentComponentWriter::with_ordinal_base(
+                    kind,
+                    output_level,
+                    target_block_bytes,
+                    ordinal_base,
+                );
+                let mut vectors = VectorComponentWriter::new(
+                    kind,
+                    vector_tag,
+                    output_level,
+                    definition.dimension,
+                    target_block_bytes,
+                );
+                let mut point_cache = VectorCompactionPointCache::default();
+                let mut local_live = 0u64;
+                let mut local_mutations = 0u64;
+                let mut cursor = PathWinnerCursor::open(
+                    runs.as_slice(),
+                    roots.as_slice(),
+                    range,
+                    lane_executor.clone(),
+                    lane_progress.clone(),
+                )
+                .await?;
+                while let Some((winner_run, mut winner)) = cursor.next().await? {
+                    if winner.state == DocumentState::Live {
+                        let input_ordinal = winner
+                            .document_ordinal
+                            .ok_or(IndexError::InvalidFormat("live vector has no ordinal"))?;
+                        let source_document = point_cache
+                            .document(
+                                &runs[winner_run],
+                                &views[winner_run],
+                                input_ordinal,
+                                &lane_executor,
+                                &lane_progress,
+                            )
+                            .await?;
+                        if source_document != winner.document {
+                            return Err(IndexError::InvalidFormat("vector document mismatch"));
+                        }
+                        let values = point_cache
+                            .vector(
+                                &runs[winner_run],
+                                &views[winner_run],
+                                &definition,
+                                vector_tag,
+                                input_ordinal,
+                                &lane_executor,
+                                &lane_progress,
+                            )
+                            .await?;
+                        let ordinal = ordinal_base
+                            .checked_add(local_live)
+                            .ok_or(IndexError::OffsetOverflow)?;
+                        local_live = local_live
+                            .checked_add(1)
+                            .ok_or(IndexError::OffsetOverflow)?;
+                        winner.document_ordinal = Some(ordinal);
+                        documents
+                            .push(
+                                DocumentRecord {
+                                    ordinal,
+                                    document: winner.document.clone(),
+                                },
+                                &mut lane_sink,
+                            )
+                            .await?;
+                        vectors
+                            .push(VectorRow { ordinal, values }, &mut lane_sink)
+                            .await?;
+                    } else {
+                        winner.document_ordinal = None;
+                    }
+                    local_mutations = local_mutations
+                        .checked_add(1)
+                        .ok_or(IndexError::OffsetOverflow)?;
+                    paths.push(winner, &mut lane_sink).await?;
+                    lane_progress.record_output(1, 0, 0);
+                }
+                if local_mutations != summary.mutation_count || local_live != summary.live_count {
+                    return Err(IndexError::InvalidFormat(
+                        "vector range changed between count and write passes",
+                    ));
+                }
+                Ok(VectorLaneComponents {
+                    paths: paths.finish(&mut lane_sink).await?,
+                    documents: if local_live == 0 {
+                        None
+                    } else {
+                        Some(documents.finish(&mut lane_sink).await?)
+                    },
+                    vectors: if local_live == 0 {
+                        None
+                    } else {
+                        Some(vectors.finish(&mut lane_sink).await?)
+                    },
+                })
+            })
+        }));
+    }
+    let lane_components = collect_ordered_lanes(&executor, write_producers, &progress).await?;
+    let path_tree = assemble_component_ranges(
+        kind,
+        PATH_CHANGES_TAG,
+        lane_components.iter().map(|lane| lane.paths.clone()),
+        sink,
+    )
+    .await?;
+    let (document_tree, vector_tree) = if live_document_count == 0 {
+        (None, None)
+    } else {
+        (
+            Some(
+                assemble_component_ranges(
+                    kind,
+                    crate::segment::DOCUMENTS_TAG,
+                    lane_components
+                        .iter()
+                        .filter_map(|lane| lane.documents.clone()),
+                    sink,
+                )
+                .await?,
+            ),
+            Some(
+                assemble_component_ranges(
+                    kind,
+                    vector_tag,
+                    lane_components
+                        .iter()
+                        .filter_map(|lane| lane.vectors.clone()),
+                    sink,
+                )
+                .await?,
+            ),
+        )
+    };
+    Ok((
+        path_tree,
+        document_tree,
+        vector_tree,
+        RunStatistics {
+            mutation_count,
+            live_document_count,
+            minimum_version,
+            maximum_version,
+        },
+    ))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct VectorLaneSummary {
+    mutation_count: u64,
+    live_count: u64,
+    minimum_version: u64,
+    maximum_version: u64,
+}
+
+impl Default for VectorLaneSummary {
+    fn default() -> Self {
+        Self {
+            mutation_count: 0,
+            live_count: 0,
+            minimum_version: u64::MAX,
+            maximum_version: 0,
+        }
+    }
+}
+
+impl VectorLaneSummary {
+    fn observe(&mut self, winner: &PathChange) -> Result<(), IndexError> {
+        self.mutation_count = self
+            .mutation_count
+            .checked_add(1)
+            .ok_or(IndexError::OffsetOverflow)?;
+        if winner.state == DocumentState::Live {
+            self.live_count = self
+                .live_count
+                .checked_add(1)
+                .ok_or(IndexError::OffsetOverflow)?;
+        }
+        self.minimum_version = self.minimum_version.min(winner.document.version);
+        self.maximum_version = self.maximum_version.max(winner.document.version);
+        Ok(())
+    }
+}
+
+struct VectorLaneComponents {
+    paths: ComponentTree,
+    documents: Option<ComponentTree>,
+    vectors: Option<ComponentTree>,
 }
 
 #[derive(Clone, Debug)]
@@ -585,6 +967,40 @@ pub(crate) async fn read_vector_block<D: IndexDirectoryRead>(
     }
     let block = crate::run::read_leaf(directory, descriptor).await?;
     let rows = decode_vector_rows(block.body(), definition)?;
+    validate_vector_block(rows, descriptor)
+}
+
+async fn read_vector_block_parallel<D, E>(
+    directory: &D,
+    descriptor: &crate::BlockDescriptor,
+    definition: &VectorDefinition,
+    executor: &E,
+    progress: &CompactionProgress,
+) -> Result<Vec<VectorRow>, IndexError>
+where
+    D: IndexDirectoryRead,
+    E: CompactionExecutor,
+{
+    if descriptor.codec != ComponentCodec::FixedVectors {
+        return Err(IndexError::InvalidFormat("vector block codec"));
+    }
+    let block = crate::run::read_leaf(directory, descriptor).await?;
+    let descriptor = descriptor.clone();
+    let definition = definition.clone();
+    let rows = executor
+        .run_cpu(move || {
+            let rows = decode_vector_rows(block.body(), &definition)?;
+            validate_vector_block(rows, &descriptor)
+        })
+        .await?;
+    progress.record_input(rows.len() as u64, 0, 0);
+    Ok(rows)
+}
+
+fn validate_vector_block(
+    rows: Vec<VectorRow>,
+    descriptor: &crate::BlockDescriptor,
+) -> Result<Vec<VectorRow>, IndexError> {
     if rows.first().map(|row| ordinal_key(row.ordinal)) != Some(descriptor.minimum_key.clone())
         || rows.last().map(|row| ordinal_key(row.ordinal)) != Some(descriptor.maximum_key.clone())
         || rows.len() as u64 != descriptor.element_count
@@ -661,38 +1077,6 @@ pub(crate) async fn vector_by_ordinal<D: IndexDirectoryRead>(
         .binary_search_by_key(&ordinal, |row| row.ordinal)
         .map_err(|_| IndexError::InvalidFormat("missing vector ordinal"))?;
     Ok(rows.into_iter().nth(index).unwrap().values)
-}
-
-struct PathRunCursor<'a, D> {
-    directory: &'a D,
-    leaves: LeafCursor<'a, D>,
-    rows: Vec<PathChange>,
-    next: usize,
-}
-
-impl<'a, D: IndexDirectoryRead> PathRunCursor<'a, D> {
-    fn new(directory: &'a D, root: crate::BlockDescriptor) -> Self {
-        Self {
-            directory,
-            leaves: LeafCursor::new(directory, root),
-            rows: Vec::new(),
-            next: 0,
-        }
-    }
-
-    async fn next(&mut self) -> Result<Option<PathChange>, IndexError> {
-        loop {
-            if let Some(row) = self.rows.get(self.next).cloned() {
-                self.next += 1;
-                return Ok(Some(row));
-            }
-            let Some(descriptor) = self.leaves.next().await? else {
-                return Ok(None);
-            };
-            self.rows = read_path_block(self.directory, &descriptor).await?;
-            self.next = 0;
-        }
-    }
 }
 
 pub(crate) fn validate_vector(values: &[f32], dimension: usize) -> Result<(), IndexError> {
@@ -795,6 +1179,8 @@ fn sort_hits(hits: &mut [VectorHit]) {
 
 #[cfg(test)]
 mod tests {
+    use crate::compaction::COMPACTION_INCREMENTAL_LANE_WORKSPACE_BYTES;
+    use crate::compaction::test_support::TokioExecutor;
     use crate::io::tests::{MemoryBlockSink, MemoryDirectory};
 
     use super::*;
@@ -918,6 +1304,146 @@ mod tests {
         assert_eq!(first.descriptor().hash, second.descriptor().hash);
         assert_eq!(first_sink.len(), second_sink.len());
         assert!(first_sink.len() > 4);
+    }
+
+    #[tokio::test]
+    async fn parallel_ranges_are_deterministic_and_query_equivalent() {
+        let definition = VectorDefinition {
+            dimension: 3,
+            metric: VectorMetric::DotProduct,
+        };
+        let old_mutations = (0..72)
+            .map(|index| {
+                upsert(
+                    &format!("/{:02x}/vector/{index:04}", index % 24),
+                    1,
+                    &[index as f32, 1.0, 2.0],
+                )
+            })
+            .collect::<Vec<_>>();
+        let (old_sink, old_run) = build(&definition, old_mutations, 0, 96).await;
+        let old = directory(&old_sink, old_run);
+        let new_mutations = (0..36)
+            .map(|index| {
+                let path = format!("/{:02x}/vector/{index:04}", index % 24);
+                if index % 7 == 0 {
+                    IndexMutation::Remove(DocumentRef { path, version: 2 })
+                } else {
+                    upsert(&path, 2, &[2.0, index as f32, 3.0])
+                }
+            })
+            .collect::<Vec<_>>();
+        let (new_sink, new_run) = build(&definition, new_mutations, 0, 96).await;
+        let runs = [directory(&new_sink, new_run), old];
+
+        let mut serial_sink = MemoryBlockSink::default();
+        let serial = VectorEngine::merge_with_target(&runs, &definition, 1, 96, &mut serial_sink)
+            .await
+            .unwrap();
+        let progress = CompactionProgress::default();
+        let mut parallel_sink = MemoryBlockSink::default();
+        let parallel = VectorEngine::merge_parallel_with_target(
+            &runs,
+            &definition,
+            1,
+            96,
+            &mut parallel_sink,
+            CompactionParallelism::new(4, COMPACTION_INCREMENTAL_LANE_WORKSPACE_BYTES).unwrap(),
+            progress.clone(),
+            TokioExecutor::default(),
+        )
+        .await
+        .unwrap();
+
+        let mut repeated_sink = MemoryBlockSink::default();
+        let repeated = VectorEngine::merge_parallel_with_target(
+            &runs,
+            &definition,
+            1,
+            96,
+            &mut repeated_sink,
+            CompactionParallelism::new(4, COMPACTION_INCREMENTAL_LANE_WORKSPACE_BYTES).unwrap(),
+            CompactionProgress::default(),
+            TokioExecutor::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(parallel, repeated);
+        assert_eq!(parallel_sink.len(), repeated_sink.len());
+        assert_eq!(
+            parallel.descriptor().mutation_count,
+            serial.descriptor().mutation_count
+        );
+        assert_eq!(
+            parallel.descriptor().live_document_count,
+            serial.descriptor().live_document_count
+        );
+        assert_eq!(
+            parallel.descriptor().minimum_version,
+            serial.descriptor().minimum_version
+        );
+        assert_eq!(
+            parallel.descriptor().maximum_version,
+            serial.descriptor().maximum_version
+        );
+        let parallel_mutation_count = parallel.descriptor().mutation_count;
+        let serial = [directory(&serial_sink, serial)];
+        let parallel_directory = [directory(&parallel_sink, parallel)];
+        for query in [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [2.0, 3.0, 1.0]] {
+            assert_eq!(
+                VectorEngine::query(&parallel_directory, &definition, &query, 128)
+                    .await
+                    .unwrap(),
+                VectorEngine::query(&serial, &definition, &query, 128)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let snapshot = progress.snapshot();
+        assert!(snapshot.effective_lanes > 1 && snapshot.effective_lanes <= 4);
+        assert_eq!(snapshot.ranges_completed, snapshot.ranges_total);
+        assert_eq!(snapshot.output_records, parallel_mutation_count);
+        assert!(snapshot.input_records >= parallel_mutation_count);
+    }
+
+    #[tokio::test]
+    async fn parallel_cpu_failure_joins_all_vector_ranges() {
+        let definition = VectorDefinition {
+            dimension: 2,
+            metric: VectorMetric::Cosine,
+        };
+        let (sink, run) = build(
+            &definition,
+            [upsert("/a", 1, &[1.0, 0.0]), upsert("/z", 1, &[0.0, 1.0])],
+            0,
+            64,
+        )
+        .await;
+        let runs = [directory(&sink, run)];
+        let progress = CompactionProgress::default();
+        let mut output = MemoryBlockSink::default();
+        let error = VectorEngine::merge_parallel_with_target(
+            &runs,
+            &definition,
+            1,
+            64,
+            &mut output,
+            CompactionParallelism::new(4, COMPACTION_INCREMENTAL_LANE_WORKSPACE_BYTES).unwrap(),
+            progress.clone(),
+            TokioExecutor::failing_cpu(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("injected compaction CPU failure")
+        );
+        let snapshot = progress.snapshot();
+        assert_eq!(snapshot.active_lanes, 0);
+        assert_eq!(snapshot.waiting_lanes, 0);
     }
 
     #[test]

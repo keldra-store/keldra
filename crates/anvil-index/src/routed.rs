@@ -255,6 +255,35 @@ async fn read_block<D: IndexDirectoryRead>(
 ) -> Result<Vec<RoutedRow>, IndexError> {
     let block = read_leaf(directory, descriptor).await?;
     let rows = decode_rows(block.body(), descriptor.codec)?;
+    validate_block(rows, descriptor)
+}
+
+async fn read_block_parallel<D, E>(
+    directory: &D,
+    descriptor: &crate::BlockDescriptor,
+    executor: &E,
+    progress: &crate::compaction::CompactionProgress,
+) -> Result<Vec<RoutedRow>, IndexError>
+where
+    D: IndexDirectoryRead,
+    E: crate::compaction::CompactionExecutor,
+{
+    let block = read_leaf(directory, descriptor).await?;
+    let descriptor = descriptor.clone();
+    let rows = executor
+        .run_cpu(move || {
+            let rows = decode_rows(block.body(), descriptor.codec)?;
+            validate_block(rows, &descriptor)
+        })
+        .await?;
+    progress.record_input(rows.len() as u64, 0, 0);
+    Ok(rows)
+}
+
+fn validate_block(
+    rows: Vec<RoutedRow>,
+    descriptor: &crate::BlockDescriptor,
+) -> Result<Vec<RoutedRow>, IndexError> {
     if rows.first().map(RoutedRow::key) != Some(descriptor.minimum_key.clone())
         || rows.last().map(RoutedRow::key) != Some(descriptor.maximum_key.clone())
         || rows.len() as u64 != descriptor.element_count
@@ -270,6 +299,7 @@ pub(crate) struct RoutedCursor<'a, D> {
     rows: VecDeque<RoutedRow>,
     prefix: Option<Vec<u8>>,
     upper: Option<Vec<u8>>,
+    range: Option<crate::compaction::KeyRange>,
 }
 
 impl<'a, D: IndexDirectoryRead> RoutedCursor<'a, D> {
@@ -285,6 +315,22 @@ impl<'a, D: IndexDirectoryRead> RoutedCursor<'a, D> {
             rows: VecDeque::new(),
             prefix,
             upper,
+            range: None,
+        }
+    }
+
+    pub(crate) fn in_range(
+        directory: &'a D,
+        root: crate::BlockDescriptor,
+        range: crate::compaction::KeyRange,
+    ) -> Self {
+        Self {
+            directory,
+            leaves: LeafCursor::in_range(directory, root, range.clone()),
+            rows: VecDeque::new(),
+            prefix: None,
+            upper: None,
+            range: Some(range),
         }
     }
 
@@ -295,6 +341,10 @@ impl<'a, D: IndexDirectoryRead> RoutedCursor<'a, D> {
                     .prefix
                     .as_ref()
                     .is_none_or(|prefix| row.primary.starts_with(prefix))
+                    && self
+                        .range
+                        .as_ref()
+                        .is_none_or(|range| range.contains(&row.primary))
                 {
                     return Ok(Some(row));
                 }
@@ -313,6 +363,47 @@ impl<'a, D: IndexDirectoryRead> RoutedCursor<'a, D> {
                 }
             }
             self.rows = read_block(self.directory, &descriptor).await?.into();
+        }
+    }
+
+    pub(crate) async fn next_parallel<E: crate::compaction::CompactionExecutor>(
+        &mut self,
+        executor: &E,
+        progress: &crate::compaction::CompactionProgress,
+    ) -> Result<Option<RoutedRow>, IndexError> {
+        loop {
+            while let Some(row) = self.rows.pop_front() {
+                if self
+                    .prefix
+                    .as_ref()
+                    .is_none_or(|prefix| row.primary.starts_with(prefix))
+                    && self
+                        .range
+                        .as_ref()
+                        .is_none_or(|range| range.contains(&row.primary))
+                {
+                    return Ok(Some(row));
+                }
+            }
+            // `pop_front` leaves the old allocation behind; release it before
+            // a replacement leaf is fetched and decoded.
+            self.rows = VecDeque::new();
+            let Some(descriptor) = self.leaves.next().await? else {
+                return Ok(None);
+            };
+            if let Some(prefix) = &self.prefix {
+                if descriptor.maximum_key.as_slice() < prefix.as_slice()
+                    || self
+                        .upper
+                        .as_ref()
+                        .is_some_and(|upper| descriptor.minimum_key.as_slice() >= upper.as_slice())
+                {
+                    continue;
+                }
+            }
+            self.rows = read_block_parallel(self.directory, &descriptor, executor, progress)
+                .await?
+                .into();
         }
     }
 }

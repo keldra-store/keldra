@@ -1,29 +1,42 @@
 //! Hybrid full-text and exact-vector runs with one shared document table.
 
+#[path = "hybrid_compaction_cache.rs"]
+mod compaction_cache;
+
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::full_text::{
-    Candidate, RunCandidateCursor, TermCursor, TextComponentWriter, TextPosting,
-    estimate_text_fields, merge_text_component, query_terms, tokenize, validate_fields,
+use crate::compaction::{
+    CompactionExecutor, CompactionParallelism, CompactionProgress, LaneResultProducer,
+    collect_ordered_lanes, deterministic_delimited_key_range_plan,
 };
-use crate::run::{ComponentTree, LeafCursor, RunStatistics, RunView, open_views, seal_run_root};
+use crate::full_text::{
+    Candidate, RunCandidateCursor, TermCursor, TextComponentWriter, TextPosting, TextPostingRow,
+    TextRowCursor, estimate_text_fields, merge_text_component, query_terms, tokenize,
+    validate_fields,
+};
+use crate::run::{
+    ComponentTree, LeafCursor, RunStatistics, RunView, assemble_component_ranges, open_views,
+    seal_run_root,
+};
 use crate::segment::{
     DEFAULT_COMPONENT_BLOCK_BYTES, DocumentComponentWriter, DocumentRecord, DocumentState,
     MutationBuffer, PATH_CHANGES_TAG, PathChange, PathComponentWriter, PathRunCursor,
     document_by_ordinal, is_latest_live,
 };
 use crate::vector::{
-    VectorComponentWriter, VectorDefinition, VectorRow, read_vector_block, similarity,
-    validate_vector, vector_by_ordinal,
+    VectorComponentWriter, VectorDefinition, VectorRow, merge_vector_components_parallel,
+    read_vector_block, similarity, validate_vector, vector_by_ordinal,
 };
 use crate::{
     BlockDescriptor, DocumentRef, IndexBlockSink, IndexDirectoryRead, IndexError, IndexKind,
     IndexMutation, SealedRun, SegmentBuildOptions, SegmentPush,
 };
+
+use compaction_cache::HybridCompactionPointCache;
 
 const HYBRID_TEXT_TAG: u8 = 50;
 pub(crate) const HYBRID_VECTOR_TAG: u8 = 51;
@@ -434,6 +447,94 @@ impl HybridEngine {
         .await
     }
 
+    pub async fn merge_runs_parallel<D, S, E>(
+        runs: &[D],
+        definition: &HybridDefinition,
+        output_level: u8,
+        sink: &mut S,
+        parallelism: CompactionParallelism,
+        progress: CompactionProgress,
+        executor: E,
+    ) -> Result<SealedRun, IndexError>
+    where
+        D: IndexDirectoryRead + Clone + 'static,
+        S: IndexBlockSink + IndexDirectoryRead + Clone + 'static,
+        E: CompactionExecutor,
+    {
+        definition.validate()?;
+        Self::merge_parallel_with_target(
+            runs,
+            definition,
+            output_level,
+            DEFAULT_COMPONENT_BLOCK_BYTES,
+            sink,
+            parallelism,
+            progress,
+            executor,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn merge_parallel_with_target<D, S, E>(
+        runs: &[D],
+        definition: &HybridDefinition,
+        output_level: u8,
+        target_bytes: usize,
+        sink: &mut S,
+        parallelism: CompactionParallelism,
+        progress: CompactionProgress,
+        executor: E,
+    ) -> Result<SealedRun, IndexError>
+    where
+        D: IndexDirectoryRead + Clone + 'static,
+        S: IndexBlockSink + IndexDirectoryRead + Clone + 'static,
+        E: CompactionExecutor,
+    {
+        if runs.is_empty() || output_level == 0 {
+            return Err(IndexError::InvalidDefinition(
+                "hybrid compaction requires input runs and an L1+ output level".into(),
+            ));
+        }
+        let (path_tree, document_tree, vector_tree, statistics) = merge_vector_components_parallel(
+            runs,
+            IndexKind::Hybrid,
+            &definition.vector,
+            HYBRID_VECTOR_TAG,
+            output_level,
+            target_bytes,
+            sink,
+            parallelism,
+            progress.clone(),
+            executor.clone(),
+        )
+        .await?;
+        let views = open_views(runs, IndexKind::Hybrid).await?;
+        let text_tree = merge_hybrid_text_component_parallel(
+            runs,
+            &views,
+            &path_tree,
+            output_level,
+            target_bytes,
+            sink,
+            parallelism,
+            progress,
+            executor,
+        )
+        .await?;
+        let mut components = vec![path_tree];
+        if let Some(tree) = document_tree {
+            components.push(tree);
+        }
+        if let Some(tree) = vector_tree {
+            components.push(tree);
+        }
+        if let Some(tree) = text_tree {
+            components.push(tree);
+        }
+        seal_run_root(IndexKind::Hybrid, output_level, statistics, components)
+    }
+
     async fn merge_with_target<D, S>(
         runs: &[D],
         definition: &HybridDefinition,
@@ -508,6 +609,252 @@ fn collect_postings(
         ordinal = ordinal.checked_add(1).ok_or(IndexError::OffsetOverflow)?;
     }
     Ok(terms)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn merge_hybrid_text_component_parallel<D, S, E>(
+    runs: &[D],
+    views: &[RunView],
+    output_paths: &ComponentTree,
+    output_level: u8,
+    target_bytes: usize,
+    sink: &mut S,
+    parallelism: CompactionParallelism,
+    progress: CompactionProgress,
+    executor: E,
+) -> Result<Option<ComponentTree>, IndexError>
+where
+    D: IndexDirectoryRead + Clone + 'static,
+    S: IndexBlockSink + IndexDirectoryRead + Clone + 'static,
+    E: CompactionExecutor,
+{
+    let roots = views
+        .iter()
+        .enumerate()
+        .filter_map(|(run_index, view)| {
+            view.component_optional(HYBRID_TEXT_TAG)
+                .cloned()
+                .map(|root| (run_index, root))
+        })
+        .collect::<Vec<_>>();
+    if roots.is_empty() {
+        return Ok(None);
+    }
+    let plan = deterministic_delimited_key_range_plan(
+        roots.iter().map(|(_, root)| root.clone()),
+        0,
+        parallelism.max_lanes(),
+    )?;
+    progress.record_range_limit(plan.range_limit)?;
+    let runs = Arc::new(runs.to_vec());
+    let views = Arc::new(views.to_vec());
+    let roots = Arc::new(roots);
+    let mut producers =
+        Vec::<LaneResultProducer<Option<ComponentTree>>>::with_capacity(plan.ranges.len());
+    for range in plan.ranges {
+        let runs = runs.clone();
+        let views = views.clone();
+        let roots = roots.clone();
+        let lane_executor = executor.clone();
+        let lane_progress = progress.clone();
+        let mut lane_sink = (*sink).clone();
+        let output_path_root = output_paths.root.clone();
+        producers.push(Box::new(move || {
+            Box::pin(async move {
+                write_hybrid_text_range(
+                    runs,
+                    views,
+                    roots,
+                    range,
+                    output_path_root,
+                    output_level,
+                    target_bytes,
+                    &mut lane_sink,
+                    lane_executor,
+                    lane_progress,
+                )
+                .await
+            })
+        }));
+    }
+    let trees = collect_ordered_lanes(&executor, producers, &progress)
+        .await?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    if trees.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(
+        assemble_component_ranges(IndexKind::Hybrid, HYBRID_TEXT_TAG, trees, sink).await?,
+    ))
+}
+
+struct ResolvedHybridTextRow {
+    run_index: usize,
+    document: DocumentRef,
+    row: TextPostingRow,
+}
+
+async fn next_hybrid_text_row<'a, D, E>(
+    run_index: usize,
+    cursor: &mut TextRowCursor<'a, D>,
+    run: &'a D,
+    view: &RunView,
+    cache: &mut HybridCompactionPointCache,
+    executor: &E,
+    progress: &CompactionProgress,
+) -> Result<Option<ResolvedHybridTextRow>, IndexError>
+where
+    D: IndexDirectoryRead,
+    E: CompactionExecutor,
+{
+    let Some(row) = cursor.next_parallel(executor, progress).await? else {
+        return Ok(None);
+    };
+    let document = cache
+        .document(run, view, row.ordinal, executor, progress)
+        .await?;
+    Ok(Some(ResolvedHybridTextRow {
+        run_index,
+        document,
+        row,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn write_hybrid_text_range<D, S, E>(
+    runs: Arc<Vec<D>>,
+    views: Arc<Vec<RunView>>,
+    roots: Arc<Vec<(usize, BlockDescriptor)>>,
+    range: crate::compaction::KeyRange,
+    output_path_root: BlockDescriptor,
+    output_level: u8,
+    target_bytes: usize,
+    sink: &mut S,
+    executor: E,
+    progress: CompactionProgress,
+) -> Result<Option<ComponentTree>, IndexError>
+where
+    D: IndexDirectoryRead,
+    S: IndexBlockSink + IndexDirectoryRead,
+    E: CompactionExecutor,
+{
+    let mut point_cache = HybridCompactionPointCache::default();
+    let mut writer = TextComponentWriter::new(
+        IndexKind::Hybrid,
+        HYBRID_TEXT_TAG,
+        output_level,
+        target_bytes,
+    );
+    let mut wrote = false;
+    let mut cursors = roots
+        .iter()
+        .map(|(run_index, root)| {
+            (
+                *run_index,
+                TextRowCursor::in_range(&runs[*run_index], root.clone(), range.clone()),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut current = Vec::with_capacity(cursors.len());
+    for (run_index, cursor) in &mut cursors {
+        current.push(
+            next_hybrid_text_row(
+                *run_index,
+                cursor,
+                &runs[*run_index],
+                &views[*run_index],
+                &mut point_cache,
+                &executor,
+                &progress,
+            )
+            .await?,
+        );
+    }
+    loop {
+        let Some(selected) = current
+            .iter()
+            .enumerate()
+            .filter_map(|(index, value)| {
+                value.as_ref().map(|value| {
+                    (
+                        index,
+                        &value.row.term,
+                        &value.document.path,
+                        &value.row.field,
+                        value.row.part,
+                    )
+                })
+            })
+            .min_by(|left, right| {
+                left.1
+                    .cmp(right.1)
+                    .then(left.2.cmp(right.2))
+                    .then(left.3.cmp(right.3))
+                    .then(left.4.cmp(&right.4))
+            })
+            .map(|value| value.0)
+        else {
+            break;
+        };
+        let candidate = current[selected].take().unwrap();
+        let (cursor_run_index, cursor) = &mut cursors[selected];
+        current[selected] = next_hybrid_text_row(
+            *cursor_run_index,
+            cursor,
+            &runs[*cursor_run_index],
+            &views[*cursor_run_index],
+            &mut point_cache,
+            &executor,
+            &progress,
+        )
+        .await?;
+        let Some((winner_index, winner)) = point_cache
+            .latest_path(
+                runs.as_slice(),
+                views.as_slice(),
+                &candidate.document.path,
+                &executor,
+                &progress,
+            )
+            .await?
+        else {
+            continue;
+        };
+        if winner_index == candidate.run_index
+            && winner.state == DocumentState::Live
+            && winner.document.version == candidate.document.version
+        {
+            let output = point_cache
+                .path(
+                    &*sink,
+                    &output_path_root,
+                    &candidate.document.path,
+                    &executor,
+                    &progress,
+                )
+                .await?
+                .ok_or(IndexError::InvalidFormat("missing compacted path"))?;
+            if output.state != DocumentState::Live
+                || output.document.version != candidate.document.version
+            {
+                return Err(IndexError::InvalidFormat("compacted text winner mismatch"));
+            }
+            let mut row = candidate.row;
+            row.ordinal = output.document_ordinal.ok_or(IndexError::InvalidFormat(
+                "missing compacted document ordinal",
+            ))?;
+            writer.push_row(row, sink).await?;
+            progress.record_output(1, 0, 0);
+            wrote = true;
+        }
+    }
+    if wrote {
+        Ok(Some(writer.finish(sink).await?))
+    } else {
+        Ok(None)
+    }
 }
 
 struct VectorRowCursor<'a, D> {
@@ -870,6 +1217,8 @@ fn sort_hits(hits: &mut [HybridHit]) {
 
 #[cfg(test)]
 mod tests {
+    use crate::compaction::COMPACTION_INCREMENTAL_LANE_WORKSPACE_BYTES;
+    use crate::compaction::test_support::TokioExecutor;
     use crate::io::tests::{MemoryBlockSink, MemoryDirectory};
     use crate::vector::VectorMetric;
 
@@ -1075,6 +1424,161 @@ mod tests {
         assert_eq!(first.descriptor().hash, second.descriptor().hash);
         assert_eq!(first_sink.len(), second_sink.len());
         assert!(first_sink.len() > 10);
+    }
+
+    #[tokio::test]
+    async fn parallel_ranges_are_deterministic_and_query_equivalent() {
+        let definition = definition();
+        let old_mutations = (0..64)
+            .map(|index| {
+                upsert(
+                    &format!("/{:02x}/hybrid/{index:04}", index % 24),
+                    1,
+                    &format!("term{:02} shared old", index % 20),
+                    &[index as f32, 1.0],
+                )
+            })
+            .collect::<Vec<_>>();
+        let (old_sink, old_run) = build(&definition, old_mutations, 0, 128, 1024 * 1024).await;
+        let old = directory(&old_sink, old_run);
+        let new_mutations = (0..32)
+            .map(|index| {
+                let path = format!("/{:02x}/hybrid/{index:04}", index % 24);
+                if index % 6 == 0 {
+                    IndexMutation::Remove(DocumentRef { path, version: 2 })
+                } else {
+                    upsert(
+                        &path,
+                        2,
+                        &format!("term{:02} shared new", (index + 7) % 20),
+                        &[2.0, index as f32],
+                    )
+                }
+            })
+            .collect::<Vec<_>>();
+        let (new_sink, new_run) = build(&definition, new_mutations, 0, 128, 1024 * 1024).await;
+        let runs = [directory(&new_sink, new_run), old];
+
+        let mut serial_sink = MemoryBlockSink::default();
+        let serial = HybridEngine::merge_with_target(&runs, &definition, 1, 128, &mut serial_sink)
+            .await
+            .unwrap();
+        let progress = CompactionProgress::default();
+        let mut parallel_sink = MemoryBlockSink::default();
+        let parallel = HybridEngine::merge_parallel_with_target(
+            &runs,
+            &definition,
+            1,
+            128,
+            &mut parallel_sink,
+            CompactionParallelism::new(4, COMPACTION_INCREMENTAL_LANE_WORKSPACE_BYTES).unwrap(),
+            progress.clone(),
+            TokioExecutor::default(),
+        )
+        .await
+        .unwrap();
+
+        let mut repeated_sink = MemoryBlockSink::default();
+        let repeated = HybridEngine::merge_parallel_with_target(
+            &runs,
+            &definition,
+            1,
+            128,
+            &mut repeated_sink,
+            CompactionParallelism::new(4, COMPACTION_INCREMENTAL_LANE_WORKSPACE_BYTES).unwrap(),
+            CompactionProgress::default(),
+            TokioExecutor::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(parallel, repeated);
+        assert_eq!(parallel_sink.len(), repeated_sink.len());
+        assert_eq!(
+            parallel.descriptor().mutation_count,
+            serial.descriptor().mutation_count
+        );
+        assert_eq!(
+            parallel.descriptor().live_document_count,
+            serial.descriptor().live_document_count
+        );
+        assert_eq!(
+            parallel.descriptor().minimum_version,
+            serial.descriptor().minimum_version
+        );
+        assert_eq!(
+            parallel.descriptor().maximum_version,
+            serial.descriptor().maximum_version
+        );
+        let parallel_mutation_count = parallel.descriptor().mutation_count;
+        let serial = [directory(&serial_sink, serial)];
+        let parallel_directory = [directory(&parallel_sink, parallel)];
+        let fields = Vec::new();
+        for (text, vector) in [
+            ("shared", [1.0, 0.0]),
+            ("term07", [0.0, 1.0]),
+            ("new", [2.0, 3.0]),
+        ] {
+            let query = HybridQuery {
+                text,
+                vector: &vector,
+                fields: &fields,
+                phrase: false,
+                limit: 128,
+            };
+            assert_eq!(
+                HybridEngine::query(&parallel_directory, &definition, query.clone())
+                    .await
+                    .unwrap(),
+                HybridEngine::query(&serial, &definition, query)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let snapshot = progress.snapshot();
+        assert!(snapshot.effective_lanes > 1 && snapshot.effective_lanes <= 4);
+        assert_eq!(snapshot.ranges_completed, snapshot.ranges_total);
+        assert!(snapshot.output_records >= parallel_mutation_count);
+    }
+
+    #[tokio::test]
+    async fn parallel_cpu_failure_joins_all_hybrid_ranges() {
+        let definition = definition();
+        let (sink, run) = build(
+            &definition,
+            [
+                upsert("/a", 1, "alpha", &[1.0, 0.0]),
+                upsert("/z", 1, "omega", &[0.0, 1.0]),
+            ],
+            0,
+            64,
+            64 * 1024,
+        )
+        .await;
+        let runs = [directory(&sink, run)];
+        let progress = CompactionProgress::default();
+        let mut output = MemoryBlockSink::default();
+        let error = HybridEngine::merge_parallel_with_target(
+            &runs,
+            &definition,
+            1,
+            64,
+            &mut output,
+            CompactionParallelism::new(4, COMPACTION_INCREMENTAL_LANE_WORKSPACE_BYTES).unwrap(),
+            progress.clone(),
+            TokioExecutor::failing_cpu(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("injected compaction CPU failure")
+        );
+        let snapshot = progress.snapshot();
+        assert_eq!(snapshot.active_lanes, 0);
+        assert_eq!(snapshot.waiting_lanes, 0);
     }
 
     include!("hybrid/query_bounds_tests.rs");

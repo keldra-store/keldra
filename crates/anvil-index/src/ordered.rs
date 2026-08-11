@@ -1,10 +1,17 @@
 //! Ordered path runs.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::run::{LeafCursor, RunStatistics, open_views, seal_run_root};
+use crate::compaction::{
+    CompactionExecutor, CompactionParallelism, CompactionProgress, LaneResultProducer,
+    PathWinnerCursor, collect_ordered_lanes, dense_ordinal_bases, deterministic_key_range_plan,
+};
+use crate::run::{
+    ComponentTree, LeafCursor, RunStatistics, assemble_component_ranges, open_views, seal_run_root,
+};
 use crate::segment::{
     DEFAULT_COMPONENT_BLOCK_BYTES, DocumentState, MutationBuffer, PATH_CHANGES_TAG, PathChange,
     PathComponentWriter, PathRunCursor, latest_path_change, read_path_block,
@@ -190,6 +197,205 @@ impl PathEngine {
         Self::merge_with_target(runs, output_level, DEFAULT_COMPONENT_BLOCK_BYTES, sink).await
     }
 
+    /// Compact deterministic path-key stripes with lane-local immutable output
+    /// staging and one ordered root assembly.
+    pub async fn merge_runs_parallel<D, S, E>(
+        runs: &[D],
+        output_level: u8,
+        sink: &mut S,
+        parallelism: CompactionParallelism,
+        progress: CompactionProgress,
+        executor: E,
+    ) -> Result<SealedRun, IndexError>
+    where
+        D: IndexDirectoryRead + Clone + 'static,
+        S: IndexBlockSink + Clone + 'static,
+        E: CompactionExecutor,
+    {
+        Self::merge_parallel_with_target(
+            runs,
+            output_level,
+            DEFAULT_COMPONENT_BLOCK_BYTES,
+            sink,
+            parallelism,
+            progress,
+            executor,
+        )
+        .await
+    }
+
+    async fn merge_parallel_with_target<D, S, E>(
+        runs: &[D],
+        output_level: u8,
+        target_block_bytes: usize,
+        sink: &mut S,
+        parallelism: CompactionParallelism,
+        progress: CompactionProgress,
+        executor: E,
+    ) -> Result<SealedRun, IndexError>
+    where
+        D: IndexDirectoryRead + Clone + 'static,
+        S: IndexBlockSink + Clone + 'static,
+        E: CompactionExecutor,
+    {
+        if runs.is_empty() || output_level == 0 {
+            return Err(IndexError::InvalidDefinition(
+                "path compaction requires input runs and an L1+ output level".into(),
+            ));
+        }
+        let views = open_views(runs, IndexKind::Path).await?;
+        let roots = views
+            .iter()
+            .map(|view| view.component(PATH_CHANGES_TAG).cloned())
+            .collect::<Result<Vec<_>, _>>()?;
+        let plan = deterministic_key_range_plan(roots.iter().cloned(), parallelism.max_lanes());
+        progress.record_range_limit(plan.range_limit)?;
+        let ranges = plan.ranges;
+        let runs = Arc::new(runs.to_vec());
+        let roots = Arc::new(roots);
+        let planned_summaries = if ranges.len() == 1 {
+            None
+        } else {
+            let mut count_producers =
+                Vec::<LaneResultProducer<PathRangeSummary>>::with_capacity(ranges.len());
+            for range in ranges.iter().cloned() {
+                let runs = runs.clone();
+                let roots = roots.clone();
+                let lane_executor = executor.clone();
+                let lane_progress = progress.clone();
+                count_producers.push(Box::new(move || {
+                    Box::pin(async move {
+                        let mut cursor = PathWinnerCursor::open(
+                            runs.as_slice(),
+                            roots.as_slice(),
+                            range,
+                            lane_executor,
+                            lane_progress,
+                        )
+                        .await?;
+                        let mut summary = PathRangeSummary::default();
+                        while let Some(winner) = cursor.next().await? {
+                            summary.record(&winner.1)?;
+                        }
+                        Ok(summary)
+                    })
+                }));
+            }
+            Some(collect_ordered_lanes(&executor, count_producers, &progress).await?)
+        };
+        let (ordinal_bases, expected_live_document_count) = match &planned_summaries {
+            Some(summaries) => {
+                let (bases, total) = dense_ordinal_bases(
+                    &summaries
+                        .iter()
+                        .map(|summary| summary.live_count)
+                        .collect::<Vec<_>>(),
+                )?;
+                (bases, Some(total))
+            }
+            None => (vec![0], None),
+        };
+
+        let mut write_producers =
+            Vec::<LaneResultProducer<PathRangeOutput>>::with_capacity(ranges.len());
+        for (range, ordinal_base) in ranges.into_iter().zip(ordinal_bases) {
+            let runs = runs.clone();
+            let roots = roots.clone();
+            let lane_executor = executor.clone();
+            let lane_progress = progress.clone();
+            let mut lane_sink = (*sink).clone();
+            write_producers.push(Box::new(move || {
+                Box::pin(async move {
+                    let mut cursor = PathWinnerCursor::open(
+                        runs.as_slice(),
+                        roots.as_slice(),
+                        range,
+                        lane_executor,
+                        lane_progress.clone(),
+                    )
+                    .await?;
+                    let mut writer = None::<PathComponentWriter>;
+                    let mut summary = PathRangeSummary::default();
+                    let mut local_live_count = 0u64;
+                    while let Some((_, mut winner)) = cursor.next().await? {
+                        summary.record(&winner)?;
+                        winner.document_ordinal = if winner.state == DocumentState::Live {
+                            let ordinal = ordinal_base
+                                .checked_add(local_live_count)
+                                .ok_or(IndexError::OffsetOverflow)?;
+                            local_live_count = local_live_count
+                                .checked_add(1)
+                                .ok_or(IndexError::OffsetOverflow)?;
+                            Some(ordinal)
+                        } else {
+                            None
+                        };
+                        let writer = writer.get_or_insert_with(|| {
+                            PathComponentWriter::new(
+                                IndexKind::Path,
+                                output_level,
+                                target_block_bytes,
+                            )
+                        });
+                        writer.push(winner, &mut lane_sink).await?;
+                        lane_progress.record_output(1, 0, 0);
+                    }
+                    let tree = match writer {
+                        Some(writer) => Some(writer.finish(&mut lane_sink).await?),
+                        None => None,
+                    };
+                    Ok(PathRangeOutput { tree, summary })
+                })
+            }));
+        }
+        let outputs = collect_ordered_lanes(&executor, write_producers, &progress).await?;
+        if let Some(summaries) = &planned_summaries {
+            if summaries
+                .iter()
+                .zip(&outputs)
+                .any(|(planned, output)| planned != &output.summary)
+            {
+                return Err(IndexError::InvalidDefinition(
+                    "path compaction range changed between passes".into(),
+                ));
+            }
+        }
+        let statistics = PathRangeSummary::combine(
+            &outputs
+                .iter()
+                .map(|output| output.summary)
+                .collect::<Vec<_>>(),
+        )?;
+        if statistics.mutation_count == 0 {
+            return Err(IndexError::InvalidDefinition(
+                "path compaction produced no changes".into(),
+            ));
+        }
+        if expected_live_document_count.is_some_and(|expected| expected != statistics.live_count) {
+            return Err(IndexError::InvalidDefinition(
+                "path compaction live count changed during planning".into(),
+            ));
+        }
+        let tree = assemble_component_ranges(
+            IndexKind::Path,
+            PATH_CHANGES_TAG,
+            outputs.into_iter().filter_map(|output| output.tree),
+            sink,
+        )
+        .await?;
+        seal_run_root(
+            IndexKind::Path,
+            output_level,
+            RunStatistics {
+                mutation_count: statistics.mutation_count,
+                live_document_count: statistics.live_count,
+                minimum_version: statistics.minimum_version,
+                maximum_version: statistics.maximum_version,
+            },
+            [tree],
+        )
+    }
+
     async fn merge_with_target<D, S>(
         runs: &[D],
         output_level: u8,
@@ -284,6 +490,67 @@ impl PathEngine {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PathRangeSummary {
+    mutation_count: u64,
+    live_count: u64,
+    minimum_version: u64,
+    maximum_version: u64,
+}
+
+impl Default for PathRangeSummary {
+    fn default() -> Self {
+        Self {
+            mutation_count: 0,
+            live_count: 0,
+            minimum_version: u64::MAX,
+            maximum_version: 0,
+        }
+    }
+}
+
+impl PathRangeSummary {
+    fn record(&mut self, winner: &PathChange) -> Result<(), IndexError> {
+        self.mutation_count = self
+            .mutation_count
+            .checked_add(1)
+            .ok_or(IndexError::OffsetOverflow)?;
+        if winner.state == DocumentState::Live {
+            self.live_count = self
+                .live_count
+                .checked_add(1)
+                .ok_or(IndexError::OffsetOverflow)?;
+        }
+        self.minimum_version = self.minimum_version.min(winner.document.version);
+        self.maximum_version = self.maximum_version.max(winner.document.version);
+        Ok(())
+    }
+
+    fn combine(ranges: &[Self]) -> Result<Self, IndexError> {
+        let mut combined = Self::default();
+        for range in ranges {
+            combined.mutation_count = combined
+                .mutation_count
+                .checked_add(range.mutation_count)
+                .ok_or(IndexError::OffsetOverflow)?;
+            combined.live_count = combined
+                .live_count
+                .checked_add(range.live_count)
+                .ok_or(IndexError::OffsetOverflow)?;
+            if range.mutation_count != 0 {
+                combined.minimum_version = combined.minimum_version.min(range.minimum_version);
+                combined.maximum_version = combined.maximum_version.max(range.maximum_version);
+            }
+        }
+        Ok(combined)
+    }
+}
+
+struct PathRangeOutput {
+    tree: Option<ComponentTree>,
+    summary: PathRangeSummary,
+}
+
 fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
     let mut successor = prefix.to_vec();
     for index in (0..successor.len()).rev() {
@@ -316,6 +583,8 @@ fn validate_prefix(prefix: &str) -> Result<(), IndexError> {
 
 #[cfg(test)]
 mod tests {
+    use crate::compaction::COMPACTION_INCREMENTAL_LANE_WORKSPACE_BYTES;
+    use crate::compaction::test_support::TokioExecutor;
     use crate::io::tests::{MemoryBlockSink, MemoryDirectory};
 
     use super::*;
@@ -443,6 +712,108 @@ mod tests {
         );
         assert!(first_sink.len() > 2);
         assert_eq!(first_sink.len(), second_sink.len());
+    }
+
+    #[tokio::test]
+    async fn parallel_ranges_are_deterministic_and_query_equivalent_to_serial() {
+        let old_mutations = (0..80)
+            .map(|index| upsert(&format!("/{:02x}/object/{index:04}", index % 32), 1))
+            .collect::<Vec<_>>();
+        let (old_sink, old_run) = build_run(old_mutations, 0, 96).await;
+        let old = directory(&old_sink, old_run);
+        let new_mutations = (0..40)
+            .map(|index| {
+                if index % 5 == 0 {
+                    IndexMutation::Remove(DocumentRef {
+                        path: format!("/{:02x}/object/{index:04}", index % 32),
+                        version: 2,
+                    })
+                } else {
+                    upsert(&format!("/{:02x}/object/{index:04}", index % 32), 2)
+                }
+            })
+            .collect::<Vec<_>>();
+        let (new_sink, new_run) = build_run(new_mutations, 0, 96).await;
+        let new = directory(&new_sink, new_run);
+        let runs = [new, old];
+
+        let mut serial_sink = MemoryBlockSink::default();
+        let serial = PathEngine::merge_with_target(&runs, 1, 96, &mut serial_sink)
+            .await
+            .unwrap();
+        let progress = CompactionProgress::default();
+        let mut first_parallel_sink = MemoryBlockSink::default();
+        let first_parallel = PathEngine::merge_parallel_with_target(
+            &runs,
+            1,
+            96,
+            &mut first_parallel_sink,
+            CompactionParallelism::new(4, COMPACTION_INCREMENTAL_LANE_WORKSPACE_BYTES).unwrap(),
+            progress.clone(),
+            TokioExecutor::default(),
+        )
+        .await
+        .unwrap();
+        let mut second_parallel_sink = MemoryBlockSink::default();
+        let second_parallel = PathEngine::merge_parallel_with_target(
+            &runs,
+            1,
+            96,
+            &mut second_parallel_sink,
+            CompactionParallelism::new(4, COMPACTION_INCREMENTAL_LANE_WORKSPACE_BYTES).unwrap(),
+            CompactionProgress::default(),
+            TokioExecutor::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(first_parallel, second_parallel);
+        assert_eq!(first_parallel_sink.len(), second_parallel_sink.len());
+        let parallel_mutation_count = first_parallel.descriptor().mutation_count;
+        let query = PathQuery {
+            prefix: "/",
+            after_path: None,
+            limit: 200,
+        };
+        let serial = [directory(&serial_sink, serial)];
+        let parallel = [directory(&first_parallel_sink, first_parallel)];
+        assert_eq!(
+            PathEngine::query(&parallel, query.clone()).await.unwrap(),
+            PathEngine::query(&serial, query).await.unwrap()
+        );
+        let snapshot = progress.snapshot();
+        assert_eq!(snapshot.ranges_total, snapshot.effective_lanes * 2);
+        assert!(snapshot.effective_lanes > 1 && snapshot.effective_lanes <= 4);
+        assert_eq!(snapshot.ranges_completed, snapshot.ranges_total);
+        assert_eq!(snapshot.output_records, parallel_mutation_count);
+        assert!(snapshot.input_records >= parallel_mutation_count * 2);
+    }
+
+    #[tokio::test]
+    async fn parallel_cpu_failure_joins_all_ranges() {
+        let (sink, run) = build_run([upsert("/a", 1), upsert("/z", 1)], 0, 64).await;
+        let runs = [directory(&sink, run)];
+        let progress = CompactionProgress::default();
+        let mut output = MemoryBlockSink::default();
+        let error = PathEngine::merge_parallel_with_target(
+            &runs,
+            1,
+            64,
+            &mut output,
+            CompactionParallelism::new(4, COMPACTION_INCREMENTAL_LANE_WORKSPACE_BYTES).unwrap(),
+            progress.clone(),
+            TokioExecutor::failing_cpu(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("injected compaction CPU failure")
+        );
+        assert_eq!(progress.snapshot().active_lanes, 0);
+        assert_eq!(progress.snapshot().waiting_lanes, 0);
     }
 
     #[test]

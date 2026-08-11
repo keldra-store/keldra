@@ -288,6 +288,39 @@ pub(crate) async fn read_path_block<D: IndexDirectoryRead>(
         ComponentCodec::PrefixEliasFano => decode_path_rows_succinct(block.body())?,
         _ => return Err(IndexError::InvalidFormat("path block codec")),
     };
+    validate_path_block(rows, descriptor)
+}
+
+pub(crate) async fn read_path_block_parallel<D, E>(
+    directory: &D,
+    descriptor: &crate::BlockDescriptor,
+    executor: &E,
+    progress: &crate::compaction::CompactionProgress,
+) -> Result<Vec<PathChange>, IndexError>
+where
+    D: IndexDirectoryRead,
+    E: crate::compaction::CompactionExecutor,
+{
+    let block = crate::run::read_leaf(directory, descriptor).await?;
+    let descriptor = descriptor.clone();
+    let rows = executor
+        .run_cpu(move || {
+            let rows = match descriptor.codec {
+                ComponentCodec::FixedRows => decode_path_rows_fixed(block.body())?,
+                ComponentCodec::PrefixEliasFano => decode_path_rows_succinct(block.body())?,
+                _ => return Err(IndexError::InvalidFormat("path block codec")),
+            };
+            validate_path_block(rows, &descriptor)
+        })
+        .await?;
+    progress.record_input(rows.len() as u64, 0, 0);
+    Ok(rows)
+}
+
+fn validate_path_block(
+    rows: Vec<PathChange>,
+    descriptor: &crate::BlockDescriptor,
+) -> Result<Vec<PathChange>, IndexError> {
     if rows.first().map(|row| row.document.path.as_bytes())
         != Some(descriptor.minimum_key.as_slice())
         || rows.last().map(|row| row.document.path.as_bytes())
@@ -319,13 +352,22 @@ pub(crate) struct DocumentComponentWriter {
 
 impl DocumentComponentWriter {
     pub(crate) fn new(kind: IndexKind, level: u8, target_bytes: usize) -> Self {
+        Self::with_ordinal_base(kind, level, target_bytes, 0)
+    }
+
+    pub(crate) fn with_ordinal_base(
+        kind: IndexKind,
+        level: u8,
+        target_bytes: usize,
+        ordinal_base: u64,
+    ) -> Self {
         Self {
             kind,
             level,
             target_bytes: target_bytes.max(256),
             rows: Vec::new(),
             estimated_bytes: 0,
-            next_ordinal: 0,
+            next_ordinal: ordinal_base,
             tree: RoutingTreeBuilder::new(kind, DOCUMENTS_TAG),
         }
     }
@@ -338,7 +380,7 @@ impl DocumentComponentWriter {
         row.document.validate()?;
         if row.ordinal != self.next_ordinal {
             return Err(IndexError::InvalidDefinition(
-                "document ordinals must be contiguous from zero".into(),
+                "document ordinals must be contiguous from the writer base".into(),
             ));
         }
         let row_bytes = row.document.path.len().saturating_add(24);
@@ -442,6 +484,39 @@ pub(crate) async fn read_document_block<D: IndexDirectoryRead>(
         ComponentCodec::PrefixEliasFano => decode_document_rows_succinct(block.body())?,
         _ => return Err(IndexError::InvalidFormat("document block codec")),
     };
+    validate_document_block(rows, descriptor)
+}
+
+pub(crate) async fn read_document_block_parallel<D, E>(
+    directory: &D,
+    descriptor: &crate::BlockDescriptor,
+    executor: &E,
+    progress: &crate::compaction::CompactionProgress,
+) -> Result<Vec<DocumentRecord>, IndexError>
+where
+    D: IndexDirectoryRead,
+    E: crate::compaction::CompactionExecutor,
+{
+    let block = crate::run::read_leaf(directory, descriptor).await?;
+    let descriptor = descriptor.clone();
+    let rows = executor
+        .run_cpu(move || {
+            let rows = match descriptor.codec {
+                ComponentCodec::FixedRows => decode_document_rows_fixed(block.body())?,
+                ComponentCodec::PrefixEliasFano => decode_document_rows_succinct(block.body())?,
+                _ => return Err(IndexError::InvalidFormat("document block codec")),
+            };
+            validate_document_block(rows, &descriptor)
+        })
+        .await?;
+    progress.record_input(rows.len() as u64, 0, 0);
+    Ok(rows)
+}
+
+fn validate_document_block(
+    rows: Vec<DocumentRecord>,
+    descriptor: &crate::BlockDescriptor,
+) -> Result<Vec<DocumentRecord>, IndexError> {
     if rows.first().map(|row| ordinal_key(row.ordinal)) != Some(descriptor.minimum_key.clone())
         || rows.last().map(|row| ordinal_key(row.ordinal)) != Some(descriptor.maximum_key.clone())
         || rows.len() as u64 != descriptor.element_count
@@ -588,6 +663,7 @@ pub(crate) struct PathRunCursor<'a, D> {
     leaves: crate::run::LeafCursor<'a, D>,
     rows: Vec<PathChange>,
     next_row: usize,
+    range: Option<crate::compaction::KeyRange>,
 }
 
 impl<'a, D: IndexDirectoryRead> PathRunCursor<'a, D> {
@@ -597,6 +673,21 @@ impl<'a, D: IndexDirectoryRead> PathRunCursor<'a, D> {
             leaves: crate::run::LeafCursor::new(directory, root),
             rows: Vec::new(),
             next_row: 0,
+            range: None,
+        }
+    }
+
+    pub(crate) fn in_range(
+        directory: &'a D,
+        root: crate::BlockDescriptor,
+        range: crate::compaction::KeyRange,
+    ) -> Self {
+        Self {
+            directory,
+            leaves: crate::run::LeafCursor::in_range(directory, root, range.clone()),
+            rows: Vec::new(),
+            next_row: 0,
+            range: Some(range),
         }
     }
 
@@ -604,12 +695,48 @@ impl<'a, D: IndexDirectoryRead> PathRunCursor<'a, D> {
         loop {
             if let Some(row) = self.rows.get(self.next_row).cloned() {
                 self.next_row += 1;
-                return Ok(Some(row));
+                if self
+                    .range
+                    .as_ref()
+                    .is_none_or(|range| range.contains(row.document.path.as_bytes()))
+                {
+                    return Ok(Some(row));
+                }
+                continue;
             }
             let Some(descriptor) = self.leaves.next().await? else {
                 return Ok(None);
             };
             self.rows = read_path_block(self.directory, &descriptor).await?;
+            self.next_row = 0;
+        }
+    }
+
+    pub(crate) async fn next_parallel<E: crate::compaction::CompactionExecutor>(
+        &mut self,
+        executor: &E,
+        progress: &crate::compaction::CompactionProgress,
+    ) -> Result<Option<PathChange>, IndexError> {
+        loop {
+            if let Some(row) = self.rows.get(self.next_row).cloned() {
+                self.next_row += 1;
+                if self
+                    .range
+                    .as_ref()
+                    .is_none_or(|range| range.contains(row.document.path.as_bytes()))
+                {
+                    return Ok(Some(row));
+                }
+                continue;
+            }
+            // Release the exhausted decoded leaf before fetching/decoding its
+            // replacement so the lane never retains both at once.
+            self.rows = Vec::new();
+            let Some(descriptor) = self.leaves.next().await? else {
+                return Ok(None);
+            };
+            self.rows =
+                read_path_block_parallel(self.directory, &descriptor, executor, progress).await?;
             self.next_row = 0;
         }
     }

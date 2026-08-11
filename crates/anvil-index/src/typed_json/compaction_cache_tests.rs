@@ -156,7 +156,7 @@ async fn repeated_point_reads_reuse_resolved_decoded_leaves() {
 }
 
 #[tokio::test]
-async fn four_input_documents_and_output_path_remain_hot_together() {
+async fn routed_input_and_output_caches_match_the_charged_working_set() {
     let block_opens = Arc::new(AtomicUsize::new(0));
     let mut directories = Vec::new();
     let mut views = Vec::new();
@@ -165,14 +165,15 @@ async fn four_input_documents_and_output_path_remain_hot_together() {
         directories.push(directory);
         views.push(view);
     }
-    let (sixth_directory, sixth_view) = counted_run("/e", 4, block_opens.clone()).await;
+    let (fifth_directory, fifth_view) = counted_run("/e", 4, block_opens.clone()).await;
     let output_path_root = views[0].component(PATH_CHANGES_TAG).unwrap();
-    let mut cache = CompactionPointCache::default();
+    let mut input = CompactionPointCache::input_documents();
+    let mut output = CompactionPointCache::staged_output_paths();
 
     for (directory, view) in directories.iter().zip(&views) {
-        cache.document(directory, view, 0).await.unwrap();
+        input.document(directory, view, 0).await.unwrap();
     }
-    cache
+    output
         .path(&directories[0], output_path_root, "/a")
         .await
         .unwrap()
@@ -180,9 +181,9 @@ async fn four_input_documents_and_output_path_remain_hot_together() {
     let first_sequence_opens = block_opens.load(Ordering::Relaxed);
 
     for (directory, view) in directories.iter().zip(&views) {
-        cache.document(directory, view, 0).await.unwrap();
+        input.document(directory, view, 0).await.unwrap();
     }
-    cache
+    output
         .path(&directories[0], output_path_root, "/a")
         .await
         .unwrap()
@@ -190,12 +191,13 @@ async fn four_input_documents_and_output_path_remain_hot_together() {
     assert_eq!(
         block_opens.load(Ordering::Relaxed),
         first_sequence_opens,
-        "d0,d1,d2,d3,p must remain in the five-leaf point cache"
+        "four input leaves and one independent staged-output leaf remain hot"
     );
 
-    cache
-        .document(&sixth_directory, &sixth_view, 0)
+    input
+        .document(&fifth_directory, &fifth_view, 0)
         .await
         .unwrap();
-    assert_eq!(cache.cached_leaf_count(), 5);
+    assert_eq!(input.cached_leaf_count(), 4);
+    assert_eq!(output.cached_leaf_count(), 1);
 }

@@ -25,6 +25,12 @@ pub(crate) const RECORDS_TAG: u8 = 60;
 const PRIMARY_KEY_TAG: u8 = 61;
 const SECONDARY_KEY_TAG: u8 = 62;
 
+#[path = "projections/compaction_cache.rs"]
+mod compaction_cache;
+
+#[path = "projections/parallel_compaction.rs"]
+mod parallel_compaction;
+
 macro_rules! builder_state {
     () => {
         pub fn resident_bytes(&self) -> usize {
@@ -310,6 +316,34 @@ impl GitSourceEngine {
         )
         .await
     }
+
+    /// Compact path, record, and both Git routing components through bounded
+    /// deterministic lanes into one format-valid immutable run.
+    pub async fn merge_runs_parallel<D, S, E>(
+        runs: &[D],
+        output_level: u8,
+        sink: &mut S,
+        parallelism: crate::compaction::CompactionParallelism,
+        progress: crate::compaction::CompactionProgress,
+        executor: E,
+    ) -> Result<SealedRun, IndexError>
+    where
+        D: IndexDirectoryRead + Clone + 'static,
+        S: IndexBlockSink + IndexDirectoryRead + Clone + 'static,
+        E: crate::compaction::CompactionExecutor,
+    {
+        parallel_compaction::merge_projection_parallel::<D, S, GitPayload, E>(
+            runs,
+            IndexKind::GitSource,
+            output_level,
+            DEFAULT_COMPONENT_BLOCK_BYTES,
+            sink,
+            parallelism,
+            progress,
+            executor,
+        )
+        .await
+    }
 }
 
 struct RetainedGitRecord {
@@ -489,6 +523,34 @@ impl TensorProjectionEngine {
             output_level,
             DEFAULT_COMPONENT_BLOCK_BYTES,
             sink,
+        )
+        .await
+    }
+
+    /// Compact path, record, and tensor routing components through bounded
+    /// deterministic lanes into one format-valid immutable run.
+    pub async fn merge_runs_parallel<D, S, E>(
+        runs: &[D],
+        output_level: u8,
+        sink: &mut S,
+        parallelism: crate::compaction::CompactionParallelism,
+        progress: crate::compaction::CompactionProgress,
+        executor: E,
+    ) -> Result<SealedRun, IndexError>
+    where
+        D: IndexDirectoryRead + Clone + 'static,
+        S: IndexBlockSink + IndexDirectoryRead + Clone + 'static,
+        E: crate::compaction::CompactionExecutor,
+    {
+        parallel_compaction::merge_projection_parallel::<D, S, TensorPayload, E>(
+            runs,
+            IndexKind::Tensor,
+            output_level,
+            DEFAULT_COMPONENT_BLOCK_BYTES,
+            sink,
+            parallelism,
+            progress,
+            executor,
         )
         .await
     }
@@ -1719,4 +1781,5 @@ mod tests {
     }
 
     include!("projections/query_bounds_tests.rs");
+    include!("projections/parallel_compaction_tests.rs");
 }

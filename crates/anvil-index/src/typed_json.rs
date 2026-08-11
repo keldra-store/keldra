@@ -34,6 +34,9 @@ use query::query_typed;
 mod compaction_cache;
 use compaction_cache::CompactionPointCache;
 
+#[path = "typed_json/parallel_compaction.rs"]
+mod parallel_compaction;
+
 #[cfg(test)]
 #[path = "typed_json/compaction_cache_tests.rs"]
 mod compaction_cache_tests;
@@ -410,6 +413,34 @@ impl TypedJsonEngine {
         )
         .await
     }
+
+    /// Compact deterministic path and typed-key ranges concurrently into one
+    /// format-valid immutable run.
+    pub async fn merge_runs_parallel<D, S, E>(
+        runs: &[D],
+        output_level: u8,
+        sink: &mut S,
+        parallelism: crate::compaction::CompactionParallelism,
+        progress: crate::compaction::CompactionProgress,
+        executor: E,
+    ) -> Result<SealedRun, IndexError>
+    where
+        D: IndexDirectoryRead + Clone + 'static,
+        S: IndexBlockSink + IndexDirectoryRead + Clone + 'static,
+        E: crate::compaction::CompactionExecutor,
+    {
+        parallel_compaction::merge_typed_parallel(
+            runs,
+            IndexKind::TypedJson,
+            output_level,
+            DEFAULT_COMPONENT_BLOCK_BYTES,
+            sink,
+            parallelism,
+            progress,
+            executor,
+        )
+        .await
+    }
 }
 
 pub struct MetadataFilterEngine;
@@ -470,6 +501,34 @@ impl MetadataFilterEngine {
             output_level,
             DEFAULT_COMPONENT_BLOCK_BYTES,
             sink,
+        )
+        .await
+    }
+
+    /// Compact deterministic path and metadata-key ranges concurrently into
+    /// one format-valid immutable run.
+    pub async fn merge_runs_parallel<D, S, E>(
+        runs: &[D],
+        output_level: u8,
+        sink: &mut S,
+        parallelism: crate::compaction::CompactionParallelism,
+        progress: crate::compaction::CompactionProgress,
+        executor: E,
+    ) -> Result<SealedRun, IndexError>
+    where
+        D: IndexDirectoryRead + Clone + 'static,
+        S: IndexBlockSink + IndexDirectoryRead + Clone + 'static,
+        E: crate::compaction::CompactionExecutor,
+    {
+        parallel_compaction::merge_typed_parallel(
+            runs,
+            IndexKind::MetadataFilter,
+            output_level,
+            DEFAULT_COMPONENT_BLOCK_BYTES,
+            sink,
+            parallelism,
+            progress,
+            executor,
         )
         .await
     }
@@ -1902,4 +1961,5 @@ mod tests {
     }
 
     include!("typed_json/query_bounds_tests.rs");
+    include!("typed_json/parallel_compaction_tests.rs");
 }
