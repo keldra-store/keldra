@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anvil_consensus::{DecisionRaft, NodeId};
-use anvil_store::{PlacementLogId, SourceId, Store};
+use anvil_store::{JournalRoute, PlacementLogId, RoutedJournalError, SourceId, Store};
 use tonic::{Code, Status};
 
 use crate::cluster_peer::ClusterPeerTransport;
@@ -179,6 +179,8 @@ impl ClusterWatchSources for ClusterWatchSourcesAdapter {
             let expected_source = query.expected_source;
             let next_offset = query.next_offset;
             let max_records = query.max_records;
+            let tenant_id = query.scope.tenant_id();
+            let bucket_id = query.scope.bucket_id();
             let (status, changes, returned_next) = tokio::task::spawn_blocking(move || {
                 let status = store.local_watch_status()?;
                 if status.source_id != expected_source {
@@ -187,19 +189,35 @@ impl ClusterWatchSources for ClusterWatchSourcesAdapter {
                 let floor_next = status.retention_floor.checked_add(1).ok_or_else(|| {
                     anvil_store::WatchError::Storage("watch retention floor cannot advance".into())
                 })?;
-                let tail_next = status.tail.checked_add(1).ok_or_else(|| {
-                    anvil_store::WatchError::Storage("watch tail cannot advance".into())
+                let settled_next = status.settled_through.checked_add(1).ok_or_else(|| {
+                    anvil_store::WatchError::Storage("watch settled boundary cannot advance".into())
                 })?;
-                if next_offset < floor_next || next_offset > tail_next {
+                if next_offset < floor_next || next_offset > settled_next {
                     return Err(anvil_store::WatchError::ResumeExpired);
                 }
-                let changes = store
-                    .scan_local_changes(next_offset - 1, max_records)
-                    .map_err(|error| anvil_store::WatchError::Storage(error.to_string()))?;
-                let returned_next = changes
-                    .last()
-                    .map_or(next_offset, |change| change.offset().saturating_add(1));
-                Ok((status, changes, returned_next))
+                let page = store
+                    .scan_routed_local_changes(
+                        JournalRoute::Bucket {
+                            tenant_id,
+                            bucket_id,
+                        },
+                        expected_source,
+                        next_offset - 1,
+                        status.settled_through,
+                        max_records,
+                        crate::distributed_watch::MAX_WATCH_SOURCE_PAGE_BYTES,
+                    )
+                    .map_err(routed_watch_error)?;
+                if let Some(oversize) = page.oversize {
+                    return Err(anvil_store::WatchError::Storage(format!(
+                        "watch source event at offset {} needs {} bytes",
+                        oversize.offset, oversize.encoded_bytes
+                    )));
+                }
+                let returned_next = page.through_offset.checked_add(1).ok_or_else(|| {
+                    anvil_store::WatchError::Storage("watch cursor cannot advance".into())
+                })?;
+                Ok((status, page.changes, returned_next))
             })
             .await
             .map_err(|error| WatchSourceError::Unavailable(error.to_string()))?
@@ -223,6 +241,15 @@ impl ClusterWatchSources for ClusterWatchSourcesAdapter {
                 .await
                 .map_err(status_to_watch_error)?;
         }
+    }
+}
+
+fn routed_watch_error(error: RoutedJournalError) -> anvil_store::WatchError {
+    match error {
+        RoutedJournalError::CursorExpired { .. }
+        | RoutedJournalError::SourceEpochMismatch
+        | RoutedJournalError::SourceNodeMismatch => anvil_store::WatchError::ResumeExpired,
+        other => anvil_store::WatchError::Storage(other.to_string()),
     }
 }
 

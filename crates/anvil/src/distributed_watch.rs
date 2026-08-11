@@ -1,10 +1,10 @@
 //! Transport-neutral cluster-wide public watch aggregation.
 //!
 //! The existing source-local journal remains the only event authority. This
-//! module fans one bounded read out to every ACTIVE source, validates the full
-//! response set, filters public output to object-head invalidations, and then
-//! advances an opaque vector checkpoint. It persists no cursor, acknowledgement,
-//! emission, or second log.
+//! module fans one bounded bucket-routed read out to every ACTIVE source,
+//! validates the full response set, filters public output to object-head
+//! invalidations, and then advances an opaque vector checkpoint. It persists
+//! no cursor, acknowledgement, emission, or second log.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -23,6 +23,7 @@ use crate::distributed_list::OriginalBearer;
 const CHECKPOINT_FORMAT: u16 = 1;
 pub(crate) const CHECKPOINT_AUDIENCE: &str = "anvil-watch-checkpoint";
 pub(crate) const CHECKPOINT_PURPOSE: &str = "anvil-watch-vector";
+pub(crate) const MAX_WATCH_SOURCE_PAGE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// The canonical public scope plus the stable IDs used in source journals.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -327,7 +328,7 @@ impl DistributedWatch {
             }
             validate_status(node, &response.status)?;
             let cursor = match position {
-                WatchInitialPosition::Now => response.status.tail,
+                WatchInitialPosition::Now => response.status.settled_through,
                 WatchInitialPosition::RetainedBeginning => response.status.retention_floor,
             };
             let next_offset =
@@ -543,6 +544,8 @@ fn validate_status(node: NodeId, status: &WatchJournalStatus) -> Result<(), Dist
         });
     }
     if status.retention_floor > status.tail
+        || status.settled_through < status.retention_floor
+        || status.settled_through > status.tail
         || status.retained_entries != status.tail - status.retention_floor
     {
         return Err(DistributedWatchError::InvalidSource {
@@ -568,14 +571,12 @@ fn validate_page(
     if page.status.source_id != query.expected_source {
         return Err(DistributedWatchError::ResumeExpired);
     }
-    let after_tail =
-        page.status
-            .tail
-            .checked_add(1)
-            .ok_or_else(|| DistributedWatchError::InvalidSource {
-                node_id: node,
-                message: "source journal tail cannot advance".into(),
-            })?;
+    let after_tail = page.status.settled_through.checked_add(1).ok_or_else(|| {
+        DistributedWatchError::InvalidSource {
+            node_id: node,
+            message: "source journal tail cannot advance".into(),
+        }
+    })?;
     let floor_next = page.status.retention_floor.checked_add(1).ok_or_else(|| {
         DistributedWatchError::InvalidSource {
             node_id: node,
@@ -591,11 +592,10 @@ fn validate_page(
             message: "source returned an invalid next offset".into(),
         });
     }
-    let advanced = page.next_offset - query.next_offset;
-    if advanced > query.max_records as u64 {
+    if page.object_heads.len() > query.max_records {
         return Err(DistributedWatchError::InvalidSource {
             node_id: node,
-            message: "source advanced beyond the bounded journal page".into(),
+            message: "source returned more events than the bounded journal page".into(),
         });
     }
     if query.next_offset < after_tail && page.next_offset == query.next_offset {
@@ -662,8 +662,9 @@ fn contains_reserved_segment(path: &str) -> bool {
     path.split('/').any(|segment| segment == "_anvil")
 }
 
-/// Source adapters use this helper after scanning every represented raw record.
-/// It prevents later journal variants from leaking through public WatchPrefix.
+/// Source adapters use this helper after resolving bucket-routed source
+/// records. It prevents internal paths and later journal variants from leaking
+/// through public WatchPrefix.
 pub(crate) fn filter_public_changes(
     scope: &DistributedWatchScope,
     changes: Vec<LocalChange>,

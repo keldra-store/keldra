@@ -476,18 +476,19 @@ fn bulk_metrics_partition_success_failure_and_replay_outcomes() {
 }
 
 #[test]
-fn watch_lag_is_an_observation_against_the_current_journal_tail() {
+fn watch_lag_is_an_observation_against_the_settled_journal_cut() {
     let status = WatchJournalStatus {
         source_id: anvil_store::SourceId {
             node_id: 1,
             source_epoch: [0; 32],
         },
         tail: 19,
+        settled_through: 17,
         retention_floor: 4,
         retained_entries: 15,
         retained_bytes: 900,
     };
-    assert_eq!(watch_consumer_lag(&status, 7), Some(12));
+    assert_eq!(watch_consumer_lag(&status, 7), Some(10));
     assert_eq!(watch_consumer_lag(&status, 20), None);
 }
 
@@ -651,6 +652,7 @@ fn distributed_batch_preflight_selects_current_and_exact_descriptors() {
             mutation_stamp: None,
         },
         versions: vec![live, deleted],
+        definition_locator: None,
     };
 
     assert_eq!(
@@ -689,6 +691,7 @@ fn distributed_read_preflight_rejects_another_exact_path() {
             mutation_stamp: None,
         },
         versions: vec![version],
+        definition_locator: None,
     };
 
     let error =

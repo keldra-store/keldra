@@ -73,6 +73,7 @@ impl Journal {
                 source_epoch: self.epoch,
             },
             tail,
+            settled_through: tail,
             retention_floor: self.floor,
             retained_entries: tail - self.floor,
             retained_bytes: 0,
@@ -119,6 +120,7 @@ impl MemorySources {
                 kind,
                 reference_deltas: Vec::new(),
                 accounting_transition: None,
+                definition_transition: None,
             }));
     }
 
@@ -534,6 +536,7 @@ fn public_filter_keeps_only_matching_object_heads() {
             kind: ObjectHeadChangeKind::Put,
             reference_deltas: Vec::new(),
             accounting_transition: None,
+            definition_transition: None,
         }),
         LocalChange::RetainedVersionDeleted(RetainedVersionDeletedChange {
             offset: 2,
@@ -554,6 +557,7 @@ fn public_filter_keeps_only_matching_object_heads() {
             kind: ObjectHeadChangeKind::Put,
             reference_deltas: Vec::new(),
             accounting_transition: None,
+            definition_transition: None,
         }),
         LocalChange::ObjectHead(ObjectHeadChange {
             offset: 4,
@@ -564,6 +568,7 @@ fn public_filter_keeps_only_matching_object_heads() {
             kind: ObjectHeadChangeKind::Put,
             reference_deltas: Vec::new(),
             accounting_transition: None,
+            definition_transition: None,
         }),
     ];
 
@@ -597,6 +602,7 @@ async fn malformed_filtered_page_fails_closed() {
                         source_epoch: [1; 32],
                     },
                     tail: 0,
+                    settled_through: 0,
                     retention_floor: 0,
                     retained_entries: 0,
                     retained_bytes: 0,
@@ -617,6 +623,7 @@ async fn malformed_filtered_page_fails_closed() {
                 status: WatchJournalStatus {
                     source_id: query.expected_source,
                     tail: 1,
+                    settled_through: 1,
                     retention_floor: 0,
                     retained_entries: 1,
                     retained_bytes: 0,
@@ -631,6 +638,7 @@ async fn malformed_filtered_page_fails_closed() {
                     kind: ObjectHeadChangeKind::Put,
                     reference_deltas: Vec::new(),
                     accounting_transition: None,
+                    definition_transition: None,
                 }],
             })
         }
@@ -651,5 +659,72 @@ async fn malformed_filtered_page_fails_closed() {
             node_id: NodeId(1),
             ..
         })
+    ));
+}
+
+#[test]
+fn sparse_page_can_prove_a_large_irrelevant_offset_range() {
+    let source = SourceId {
+        node_id: 1,
+        source_epoch: [1; 32],
+    };
+    let query = WatchSourceQuery {
+        membership_revision: revision(10),
+        expected_source: source,
+        scope: scope("docs"),
+        next_offset: 1,
+        max_records: 1,
+    };
+    let page = WatchSourcePage {
+        source_node: NodeId(1),
+        membership_revision: revision(10),
+        status: WatchJournalStatus {
+            source_id: source,
+            tail: 1_000_000,
+            settled_through: 1_000_000,
+            retention_floor: 0,
+            retained_entries: 1_000_000,
+            retained_bytes: 0,
+        },
+        next_offset: 1_000_001,
+        object_heads: Vec::new(),
+    };
+
+    let validated = validate_page(NodeId(1), &query, page).unwrap();
+    assert_eq!(validated.next_offset, 1_000_001);
+    assert!(validated.invalidations.is_empty());
+}
+
+#[test]
+fn public_page_cannot_advance_into_an_unsettled_source_suffix() {
+    let source = SourceId {
+        node_id: 1,
+        source_epoch: [1; 32],
+    };
+    let query = WatchSourceQuery {
+        membership_revision: revision(10),
+        expected_source: source,
+        scope: scope("docs"),
+        next_offset: 2,
+        max_records: 1,
+    };
+    let page = WatchSourcePage {
+        source_node: NodeId(1),
+        membership_revision: revision(10),
+        status: WatchJournalStatus {
+            source_id: source,
+            tail: 2,
+            settled_through: 1,
+            retention_floor: 0,
+            retained_entries: 2,
+            retained_bytes: 0,
+        },
+        next_offset: 3,
+        object_heads: Vec::new(),
+    };
+
+    assert!(matches!(
+        validate_page(NodeId(1), &query, page),
+        Err(DistributedWatchError::InvalidSource { .. })
     ));
 }
