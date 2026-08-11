@@ -9,8 +9,10 @@ use tempfile::TempDir;
 
 use super::*;
 use crate::{
-    BucketPolicy, Durability, LogicalRecordCandidate, LogicalRecordMutationContext,
-    LogicalRecordValue, ObjectVersioning, PlacementLogId, PutMode, PutRequest, StoreOptions,
+    BucketPolicy, DeleteRetainedVersionOutcome, DestinationReferenceArtifact,
+    DestinationReferenceDelta, Durability, LogicalRecordCandidate, LogicalRecordMutationContext,
+    LogicalRecordValue, ObjectMutationContext, ObjectMutationGovernance, ObjectVersioning,
+    PlacementLogId, PutMode, PutRequest, ReferenceDeltaBatch, StoreOptions,
 };
 
 fn counter_path() -> ObjectPath {
@@ -358,6 +360,7 @@ async fn ordinary_blob_plane_attests_executor_local_durability() {
     assert_eq!(
         store
             .collect_blob_garbage_at(released_bundle.updated_at + replay_grace_millis - 1)
+            .await
             .unwrap(),
         0
     );
@@ -365,6 +368,7 @@ async fn ordinary_blob_plane_attests_executor_local_durability() {
     assert_eq!(
         store
             .collect_blob_garbage_at(released_bundle.updated_at + replay_grace_millis)
+            .await
             .unwrap(),
         1
     );
@@ -988,6 +992,17 @@ async fn distributed_path_stage_is_invisible_until_commit_bound_finalization() {
         .unwrap();
     assert_eq!(head.version, stage.version.id);
     assert_eq!(head.mutation_stamp.unwrap().program_commit_cursor, Some(42));
+    let proof = store
+        .read_reference_proof(
+            finalized.mutation.stamp.source_id,
+            finalized.mutation.stamp.source_journal_position,
+        )
+        .unwrap()
+        .expect("program path proof");
+    assert_eq!(
+        proof.mutation,
+        crate::ReferenceProofMutation::ProgramPath(finalized.mutation.clone())
+    );
 
     let replay = store
         .apply_program_path_finalization_replica(&finalized.mutation)
@@ -995,4 +1010,222 @@ async fn distributed_path_stage_is_invisible_until_commit_bound_finalization() {
         .unwrap();
     assert!(replay.replayed);
     assert_eq!(replay.version, stage.version.id);
+}
+
+#[tokio::test]
+async fn distributed_versioned_program_counts_each_same_blob_retained_version() {
+    let (_temporary, store, _program) = configured_store().await;
+    assert!(
+        store
+            .enable_bucket_versioning("tenant", "bucket")
+            .await
+            .unwrap()
+    );
+    let payload = store.stage_blob(br#"{"value":1}"#).await.unwrap();
+    let (tenant_id, bucket_id) = store.resolve_bucket_ids("tenant", "bucket").unwrap();
+    let first_version = Version {
+        id: store.clock.next().unwrap(),
+        blob: Some(payload.clone()),
+        content_type: Some("application/json".into()),
+        deleted: false,
+        committed_at_unix_millis: now_unix_millis().unwrap(),
+    };
+    let first = store
+        .coordinate_program_path_finalization(
+            ProgramPathStage {
+                format: 1,
+                bundle_hash: PreparedBundleHash([0x11; 32]),
+                program_hash: ProgramHash([0x22; 32]),
+                tenant_id,
+                bucket_id,
+                path: counter_path(),
+                expected: ObservedHead::NeverExisted,
+                previous_version: None,
+                version: first_version.clone(),
+            },
+            41,
+            ObjectMutationContext {
+                active_placement_log_id: PlacementLogId { term: 3, index: 7 },
+                serving_fence_term: 3,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!first.mutation.retire_predecessor);
+    assert_eq!(
+        first.mutation.reference_deltas,
+        [ReferenceDelta {
+            blob: payload.clone(),
+            change: 1,
+        }]
+    );
+    let source = first.mutation.stamp.source_id;
+    let before_first = store.reference_delta_cursor(source).unwrap();
+    store
+        .apply_reference_deltas(ReferenceDeltaBatch {
+            source,
+            after: before_first,
+            through: first.mutation.stamp.source_journal_position,
+            deltas: vec![DestinationReferenceDelta {
+                artifact: DestinationReferenceArtifact::CompleteBlob(payload.clone()),
+                change: 1,
+            }],
+        })
+        .await
+        .unwrap();
+
+    let second_version = Version {
+        id: store.clock.next().unwrap(),
+        blob: Some(payload.clone()),
+        content_type: Some("application/json".into()),
+        deleted: false,
+        committed_at_unix_millis: now_unix_millis().unwrap(),
+    };
+    let second = store
+        .coordinate_program_path_finalization(
+            ProgramPathStage {
+                format: 1,
+                bundle_hash: PreparedBundleHash([0x33; 32]),
+                program_hash: ProgramHash([0x22; 32]),
+                tenant_id,
+                bucket_id,
+                path: counter_path(),
+                expected: ObservedHead::Version {
+                    version: first_version.id.0.to_string(),
+                },
+                previous_version: Some(first_version.clone()),
+                version: second_version.clone(),
+            },
+            42,
+            ObjectMutationContext {
+                active_placement_log_id: PlacementLogId { term: 3, index: 7 },
+                serving_fence_term: 3,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!second.mutation.retire_predecessor);
+    assert_eq!(
+        second.mutation.reference_deltas,
+        [ReferenceDelta {
+            blob: payload.clone(),
+            change: 1,
+        }]
+    );
+    store
+        .apply_reference_deltas(ReferenceDeltaBatch {
+            source,
+            after: first.mutation.stamp.source_journal_position,
+            through: second.mutation.stamp.source_journal_position,
+            deltas: vec![DestinationReferenceDelta {
+                artifact: DestinationReferenceArtifact::CompleteBlob(payload.clone()),
+                change: 1,
+            }],
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .blob_reference_state(&payload)
+            .unwrap()
+            .unwrap()
+            .ref_count,
+        2
+    );
+
+    let (_replica_temporary, replica, _program) = configured_store().await;
+    let policy = LogicalRecordValue::BucketPolicy {
+        tenant_id,
+        bucket_id,
+        policy: BucketPolicy {
+            program_only_prefixes: vec!["managed".into()],
+            ..Default::default()
+        },
+    };
+    let policy_mutation = replica
+        .construct_logical_record_mutation(
+            policy,
+            LogicalRecordMutationContext {
+                record_version: replica.allocate_logical_record_version().unwrap(),
+                active_placement_log_id: PlacementLogId { term: 3, index: 7 },
+                serving_fence_term: 3,
+            },
+        )
+        .unwrap();
+    replica
+        .commit_logical_record_mutation(&policy_mutation)
+        .unwrap();
+    replica
+        .apply_program_path_finalization_replica(&first.mutation)
+        .await
+        .unwrap();
+    assert_eq!(
+        replica
+            .apply_program_path_finalization_replica(&second.mutation)
+            .await
+            .unwrap_err(),
+        ProgramStoreError::InvalidBundle(
+            "distributed program path mutation disagrees with local bucket versioning".into()
+        )
+    );
+
+    let deletion = store
+        .coordinate_retained_version_delete(
+            &object_key(&counter_path()).unwrap(),
+            first_version.id,
+            ObjectMutationGovernance {
+                tenant_id,
+                bucket_id,
+                versioning: ObjectVersioning::Enabled,
+                policy: BucketPolicy::default(),
+            },
+            ObjectMutationContext {
+                active_placement_log_id: PlacementLogId { term: 3, index: 7 },
+                serving_fence_term: 3,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        deletion.outcome,
+        DeleteRetainedVersionOutcome::DeletedNonCurrent
+    );
+    let deletion = deletion.mutation.unwrap();
+    assert_eq!(
+        deletion.reference_deltas,
+        [ReferenceDelta {
+            blob: payload.clone(),
+            change: -1,
+        }]
+    );
+    store
+        .apply_reference_deltas(ReferenceDeltaBatch {
+            source,
+            after: second.mutation.stamp.source_journal_position,
+            through: deletion.stamp.source_journal_position,
+            deltas: vec![DestinationReferenceDelta {
+                artifact: DestinationReferenceArtifact::CompleteBlob(payload.clone()),
+                change: -1,
+            }],
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .blob_reference_state(&payload)
+            .unwrap()
+            .unwrap()
+            .ref_count,
+        1
+    );
+    assert_eq!(
+        store
+            .version_metadata(&object_key(&counter_path()).unwrap(), second_version.id)
+            .unwrap(),
+        Some(second_version)
+    );
+    assert_eq!(
+        store.read_blob_bytes(&payload).await.unwrap(),
+        br#"{"value":1}"#
+    );
 }

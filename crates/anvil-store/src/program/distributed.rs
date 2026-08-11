@@ -8,7 +8,8 @@ use crate::store::{
     CF_HEADS, CF_METADATA, CF_VERSIONS, PendingLocalChange, VERSION_HIGH_WATERMARK_KEY, version_key,
 };
 use crate::{
-    MUTATION_STAMP_FORMAT, MutationStamp, ObjectMutationContext, ReferenceProof, SourceId,
+    MUTATION_STAMP_FORMAT, MutationStamp, ObjectMutationContext, ReferenceProof,
+    ReferenceProofMutation, SourceId,
 };
 
 pub const PROGRAM_PATH_STAGE_FORMAT: u16 = 1;
@@ -316,12 +317,12 @@ impl Store {
         source_journal_position: u64,
     ) -> Result<ProgramPathMutation, ProgramStoreError> {
         let identity = stage_identity(&stage);
-        let retire_predecessor = self
+        let versioning = self
             .bucket_versioning_by_key(&identity.encode())
-            .map_err(program_mutation_error)?
-            == ObjectVersioning::Unversioned
-            && stage.previous_version.is_some();
-        let reference_deltas = reference_deltas(&stage, retire_predecessor)?;
+            .map_err(program_mutation_error)?;
+        let retire_predecessor =
+            versioning == ObjectVersioning::Unversioned && stage.previous_version.is_some();
+        let reference_deltas = reference_deltas(&stage, versioning)?;
         let mut mutation = ProgramPathMutation {
             format: PROGRAM_PATH_MUTATION_FORMAT,
             commit_cursor,
@@ -352,6 +353,19 @@ impl Store {
         mutation.validate()?;
         let stage = &mutation.stage;
         let identity = stage_identity(stage);
+        let versioning = self
+            .bucket_versioning_by_key(&identity.encode())
+            .map_err(program_mutation_error)?;
+        let expected_retire_predecessor =
+            versioning == ObjectVersioning::Unversioned && stage.previous_version.is_some();
+        let expected_reference_deltas = reference_deltas(stage, versioning)?;
+        if mutation.retire_predecessor != expected_retire_predecessor
+            || mutation.reference_deltas != expected_reference_deltas
+        {
+            return Err(ProgramStoreError::InvalidBundle(
+                "distributed program path mutation disagrees with local bucket versioning".into(),
+            ));
+        }
         let key = stage_key(stage)?;
         let encoded_head_key = identity.head_key(key.path());
         let current = self
@@ -419,7 +433,7 @@ impl Store {
             VERSION_HIGH_WATERMARK_KEY,
             serde_json::to_vec(&high).map_err(program_storage_error)?,
         );
-        let proof = program_reference_proof(mutation);
+        let proof = program_reference_proof(mutation)?;
         self.stage_reference_proof_if_absent(&mut batch, &proof)
             .map_err(program_mutation_error)?;
         if emit_source_change {
@@ -432,6 +446,7 @@ impl Store {
                     deleted: stage.version.deleted,
                     reference_deltas: mutation.reference_deltas.clone(),
                     accounting_transition: Some(stage_accounting_transition(stage)),
+                    definition_transition: None,
                 }],
                 LocalReferenceEffects::Deferred,
             )
@@ -518,7 +533,7 @@ fn require_stage_head(
 
 fn reference_deltas(
     stage: &ProgramPathStage,
-    retire_predecessor: bool,
+    versioning: ObjectVersioning,
 ) -> Result<Vec<ReferenceDelta>, ProgramStoreError> {
     let old = stage
         .previous_version
@@ -528,9 +543,10 @@ fn reference_deltas(
         .map_err(program_mutation_error)?
         .flatten();
     let new = version_blob_reference(&stage.version).map_err(program_mutation_error)?;
+    let references_changed = old.as_ref() != new.as_ref();
     let mut deltas = Vec::with_capacity(2);
-    if retire_predecessor
-        && old != new
+    if versioning == ObjectVersioning::Unversioned
+        && references_changed
         && let Some(old) = old.as_ref()
     {
         deltas.push(ReferenceDelta {
@@ -538,8 +554,8 @@ fn reference_deltas(
             change: -1,
         });
     }
-    if old != new
-        && let Some(new) = new
+    if let Some(new) = new
+        && (versioning == ObjectVersioning::Enabled || references_changed)
     {
         deltas.push(ReferenceDelta {
             blob: new,
@@ -549,8 +565,11 @@ fn reference_deltas(
     Ok(deltas)
 }
 
-fn program_reference_proof(mutation: &ProgramPathMutation) -> ReferenceProof {
-    ReferenceProof::new(
+fn program_reference_proof(
+    mutation: &ProgramPathMutation,
+) -> Result<ReferenceProof, ProgramStoreError> {
+    mutation.validate()?;
+    Ok(ReferenceProof::new(
         mutation.stamp.source_id,
         mutation.stamp.mutation_fingerprint,
         crate::LocalChange::object_head(
@@ -562,8 +581,10 @@ fn program_reference_proof(mutation: &ProgramPathMutation) -> ReferenceProof {
             mutation.stage.version.deleted,
             mutation.reference_deltas.clone(),
             Some(stage_accounting_transition(&mutation.stage)),
+            None,
         ),
-    )
+        ReferenceProofMutation::ProgramPath(mutation.clone()),
+    ))
 }
 
 fn stage_accounting_transition(stage: &ProgramPathStage) -> AccountingHeadTransition {

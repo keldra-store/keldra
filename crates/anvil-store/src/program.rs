@@ -1260,6 +1260,7 @@ impl Store {
                 deleted: write.version.deleted,
                 reference_deltas,
                 accounting_transition: Some(accounting_transition),
+                definition_transition: None,
             });
         }
         let bundle_reference = BlobRef::from(loaded.bundle);
@@ -1298,6 +1299,8 @@ impl Store {
         );
         self.write_program_batch(batch)?;
         if !changes.is_empty() {
+            self.settle_inline_source_changes()
+                .map_err(program_mutation_error)?;
             self.notify_local_invalidations();
         }
         if let Some(allocated) = allocated_high {
