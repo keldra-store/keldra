@@ -10,13 +10,15 @@ mod serving_read;
 
 pub(crate) use quorum_read::select_object_snapshot_quorum;
 
+use std::future::Future;
 use std::time::Duration;
 
 use anvil_consensus::{DecisionRaft, NodeId};
 use anvil_store::{
     BatchOperation, BlobRef, CoordinatedObjectMutation, CoordinatedRetainedVersionDelete,
-    DeleteRetainedVersionOutcome, Durability, ErasureProfile, MutationError, MutationReceipt,
-    ObjectKey, ObjectMutationGovernance, PublishRequest, PutRequest, Store, VersionId,
+    DefinitionMutationIntent, DeleteRetainedVersionOutcome, Durability, ErasureProfile,
+    MutationError, MutationReceipt, ObjectKey, ObjectMutationGovernance, PublishRequest,
+    PutRequest, Store, VersionId,
 };
 use tonic::Status;
 
@@ -84,6 +86,14 @@ impl ObjectDistribution {
         self.local_node
     }
 
+    /// Retains the existing membership-cutover gate across an internal
+    /// orchestration step that must not straddle two object placements.
+    pub(crate) fn enter_mutation(
+        &self,
+    ) -> Result<crate::mutation_admission::MutationPermit, Status> {
+        self.mutation_admission.enter()
+    }
+
     /// Publish content sealed by the upload-source node named in the ready
     /// capability. Payload evidence and the exact-path metadata quorum remain
     /// separate, explicit response boundaries.
@@ -118,6 +128,22 @@ impl ObjectDistribution {
         upload_source: NodeId,
         governance: ObjectMutationGovernance,
     ) -> Result<MutationReceipt, Status> {
+        self.publish_from_source_with_governance_and_definition_intent(
+            request,
+            upload_source,
+            governance,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn publish_from_source_with_governance_and_definition_intent(
+        &self,
+        request: PublishRequest,
+        upload_source: NodeId,
+        governance: ObjectMutationGovernance,
+        definition_intent: Option<DefinitionMutationIntent>,
+    ) -> Result<MutationReceipt, Status> {
         governance.validate().map_err(mutation_status)?;
         let placement = self.placement()?;
         if placement.active_node_ids().len() == 1 {
@@ -127,11 +153,23 @@ impl ObjectDistribution {
                 ));
             }
             let _permit = self.mutation_admission.enter()?;
-            return self
-                .store
-                .mutate_with_governance(BatchOperation::Publish(request), governance)
-                .await
-                .map_err(mutation_status);
+            return match definition_intent {
+                Some(intent) => {
+                    self.store
+                        .mutate_definition_with_governance(
+                            BatchOperation::Publish(request),
+                            governance,
+                            intent,
+                        )
+                        .await
+                }
+                None => {
+                    self.store
+                        .mutate_with_governance(BatchOperation::Publish(request), governance)
+                        .await
+                }
+            }
+            .map_err(mutation_status);
         }
 
         let group = self.replica_group_stable(
@@ -167,7 +205,7 @@ impl ObjectDistribution {
             .await
             .map_err(payload_status)?;
 
-        let _permit = self.mutation_admission.enter()?;
+        let permit = self.mutation_admission.enter()?;
         let context = self
             .reconcile_before_mutation_stable(
                 &request.key,
@@ -177,12 +215,35 @@ impl ObjectDistribution {
             )
             .await?;
         let durability = request.durability;
-        let coordinated = self
-            .store
-            .coordinate_distributed_publish_with_governance(request, governance, context)
-            .await
+        let completion = self.clone();
+        let completion_placement = placement.clone();
+        let coordinated = complete_metadata(async move {
+            let _permit = permit;
+            let coordinated = match definition_intent {
+                Some(intent) => {
+                    completion
+                        .store
+                        .coordinate_distributed_definition_publish_with_governance(
+                            request, governance, context, intent,
+                        )
+                        .await
+                }
+                None => {
+                    completion
+                        .store
+                        .coordinate_distributed_publish_with_governance(
+                            request, governance, context,
+                        )
+                        .await
+                }
+            }
             .map_err(mutation_status)?;
-        self.replicate(&placement, &group, &coordinated).await?;
+            completion
+                .replicate(&completion_placement, &group, &coordinated)
+                .await?;
+            Ok::<_, Status>(coordinated)
+        })
+        .await?;
 
         match durability {
             Durability::Local => self.continue_payload_placement(upload_source, reference),
@@ -218,7 +279,34 @@ impl ObjectDistribution {
                 .bucket_policy(key.tenant(), key.bucket())
                 .map_err(mutation_status)?,
         };
-        self.mutate_with_governance(operation, governance).await
+        self.mutate_with_governance_and_definition_intent(operation, governance, None)
+            .await
+    }
+
+    pub(crate) async fn mutate_with_definition_intent(
+        &self,
+        operation: BatchOperation,
+        intent: DefinitionMutationIntent,
+    ) -> Result<MutationReceipt, Status> {
+        let key = operation_key(&operation);
+        let (tenant_id, bucket_id) = self
+            .store
+            .resolve_bucket_ids(key.tenant(), key.bucket())
+            .map_err(mutation_status)?;
+        let governance = ObjectMutationGovernance {
+            tenant_id,
+            bucket_id,
+            versioning: self
+                .store
+                .bucket_versioning(key.tenant(), key.bucket())
+                .map_err(mutation_status)?,
+            policy: self
+                .store
+                .bucket_policy(key.tenant(), key.bucket())
+                .map_err(mutation_status)?,
+        };
+        self.mutate_with_governance_and_definition_intent(operation, governance, Some(intent))
+            .await
     }
 
     pub(crate) async fn mutate_with_governance(
@@ -226,15 +314,33 @@ impl ObjectDistribution {
         operation: BatchOperation,
         governance: ObjectMutationGovernance,
     ) -> Result<MutationReceipt, Status> {
+        self.mutate_with_governance_and_definition_intent(operation, governance, None)
+            .await
+    }
+
+    pub(crate) async fn mutate_with_governance_and_definition_intent(
+        &self,
+        operation: BatchOperation,
+        governance: ObjectMutationGovernance,
+        definition_intent: Option<DefinitionMutationIntent>,
+    ) -> Result<MutationReceipt, Status> {
         governance.validate().map_err(mutation_status)?;
         let placement = self.placement()?;
         if placement.active_node_ids().len() == 1 {
             let _permit = self.mutation_admission.enter()?;
-            return self
-                .store
-                .mutate_with_governance(operation, governance)
-                .await
-                .map_err(mutation_status);
+            return match definition_intent {
+                Some(intent) => {
+                    self.store
+                        .mutate_definition_with_governance(operation, governance, intent)
+                        .await
+                }
+                None => {
+                    self.store
+                        .mutate_with_governance(operation, governance)
+                        .await
+                }
+            }
+            .map_err(mutation_status);
         }
 
         // A unary bulk put arrives with inline bytes rather than a previously
@@ -246,7 +352,12 @@ impl ObjectDistribution {
             BatchOperation::Put(request) => {
                 let publish = stage_distributed_put(&self.store, request).await?;
                 return self
-                    .publish_from_source_with_governance(publish, self.local_node, governance)
+                    .publish_from_source_with_governance_and_definition_intent(
+                        publish,
+                        self.local_node,
+                        governance,
+                        definition_intent,
+                    )
                     .await;
             }
             operation => operation,
@@ -262,7 +373,7 @@ impl ObjectDistribution {
             )));
         }
 
-        let _permit = self.mutation_admission.enter()?;
+        let permit = self.mutation_admission.enter()?;
         let context = self
             .reconcile_before_mutation_stable(
                 key,
@@ -271,12 +382,33 @@ impl ObjectDistribution {
                 placement.fence(),
             )
             .await?;
-        let coordinated = self
-            .store
-            .coordinate_object_mutation_with_governance(operation, governance, context)
-            .await
+        let completion = self.clone();
+        let completion_placement = placement.clone();
+        let coordinated = complete_metadata(async move {
+            let _permit = permit;
+            let coordinated = match definition_intent {
+                Some(intent) => {
+                    completion
+                        .store
+                        .coordinate_definition_object_mutation_with_governance(
+                            operation, governance, context, intent,
+                        )
+                        .await
+                }
+                None => {
+                    completion
+                        .store
+                        .coordinate_object_mutation_with_governance(operation, governance, context)
+                        .await
+                }
+            }
             .map_err(mutation_status)?;
-        self.replicate(&placement, &group, &coordinated).await?;
+            completion
+                .replicate(&completion_placement, &group, &coordinated)
+                .await?;
+            Ok::<_, Status>(coordinated)
+        })
+        .await?;
         Ok(coordinated.receipt)
     }
 
@@ -310,7 +442,7 @@ impl ObjectDistribution {
                 group.coordinator().0
             )));
         }
-        let _permit = self.mutation_admission.enter()?;
+        let permit = self.mutation_admission.enter()?;
         let context = self
             .reconcile_before_mutation_stable(
                 key,
@@ -319,13 +451,22 @@ impl ObjectDistribution {
                 placement.fence(),
             )
             .await?;
-        let coordinated = self
-            .store
-            .coordinate_retained_version_delete(key, version, governance, context)
-            .await
-            .map_err(mutation_status)?;
-        self.replicate_retained_version_delete(&placement, &group, &coordinated)
-            .await?;
+        let completion = self.clone();
+        let completion_placement = placement.clone();
+        let key = key.clone();
+        let coordinated = complete_metadata(async move {
+            let _permit = permit;
+            let coordinated = completion
+                .store
+                .coordinate_retained_version_delete(&key, version, governance, context)
+                .await
+                .map_err(mutation_status)?;
+            completion
+                .replicate_retained_version_delete(&completion_placement, &group, &coordinated)
+                .await?;
+            Ok::<_, Status>(coordinated)
+        })
+        .await?;
         Ok(coordinated.outcome)
     }
 
@@ -356,6 +497,30 @@ impl ObjectDistribution {
             }
             Err(error) => (0..operations.len()).map(|_| Err(error.clone())).collect(),
         }
+    }
+
+    pub(crate) async fn mutate_many_with_definition_intents(
+        &self,
+        operations: Vec<(BatchOperation, Option<DefinitionMutationIntent>)>,
+    ) -> Vec<Result<MutationReceipt, Status>> {
+        if operations.iter().all(|(_, intent)| intent.is_none()) {
+            return self
+                .mutate_many(
+                    operations
+                        .into_iter()
+                        .map(|(operation, _)| operation)
+                        .collect(),
+                )
+                .await;
+        }
+        let mut outcomes = Vec::with_capacity(operations.len());
+        for (operation, intent) in operations {
+            outcomes.push(match intent {
+                Some(intent) => self.mutate_with_definition_intent(operation, intent).await,
+                None => self.mutate(operation).await,
+            });
+        }
+        outcomes
     }
 
     pub(crate) async fn mutate_many_with_governance(
@@ -414,6 +579,18 @@ impl ObjectDistribution {
             ))
         })?;
         Ok(Some((coordinator, address.0.clone())))
+    }
+
+    pub(crate) fn object_coordinator_stable(
+        &self,
+        placement: &ClusterPlacement,
+        key: &ObjectKey,
+        tenant_id: u64,
+        bucket_id: u64,
+    ) -> Result<NodeId, Status> {
+        Ok(self
+            .replica_group_stable(placement, tenant_id, bucket_id, key)?
+            .coordinator())
     }
 
     pub(crate) fn is_single_node(&self) -> Result<bool, Status> {
@@ -645,6 +822,21 @@ impl ObjectDistribution {
             }
         }
         if group.is_acknowledged_by(&durable) {
+            if let Err(error) = self
+                .store
+                .settle_source_journal_position_if_contiguous(
+                    mutation.stamp.source_id,
+                    mutation.stamp.source_journal_position,
+                )
+                .await
+            {
+                tracing::warn!(
+                    source = ?mutation.stamp.source_id,
+                    offset = mutation.stamp.source_journal_position,
+                    %error,
+                    "metadata quorum succeeded but direct source settlement failed"
+                );
+            }
             return Ok(());
         }
         tracing::warn!(
@@ -702,6 +894,21 @@ impl ObjectDistribution {
             }
         }
         if group.is_acknowledged_by(&durable) {
+            if let Err(error) = self
+                .store
+                .settle_source_journal_position_if_contiguous(
+                    mutation.stamp.source_id,
+                    mutation.stamp.source_journal_position,
+                )
+                .await
+            {
+                tracing::warn!(
+                    source = ?mutation.stamp.source_id,
+                    offset = mutation.stamp.source_journal_position,
+                    %error,
+                    "retained-version metadata quorum succeeded but direct source settlement failed"
+                );
+            }
             return Ok(());
         }
         tracing::warn!(
@@ -779,6 +986,20 @@ fn mutation_status(error: MutationError) -> Status {
         | MutationError::ReceiptCapacity => Status::unavailable(error.to_string()),
         _ => Status::internal(error.to_string()),
     }
+}
+
+fn metadata_completion_join(error: tokio::task::JoinError) -> Status {
+    Status::internal(format!("object metadata completion task failed: {error}"))
+}
+
+async fn complete_metadata<T, F>(completion: F) -> Result<T, Status>
+where
+    T: Send + 'static,
+    F: Future<Output = Result<T, Status>> + Send + 'static,
+{
+    tokio::spawn(completion)
+        .await
+        .map_err(metadata_completion_join)?
 }
 
 fn payload_status(error: PayloadDistributionError) -> Status {
@@ -872,6 +1093,28 @@ mod tests {
             MutationError::DurabilityUnavailable
         );
         assert!(store.get(&key).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn metadata_completion_outlives_cancelled_request_future() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+        let request = tokio::spawn(complete_metadata(async move {
+            let _ = started_tx.send(());
+            let _ = release_rx.await;
+            let _ = completed_tx.send(());
+            Ok::<_, Status>(())
+        }));
+        started_rx.await.unwrap();
+
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), completed_rx)
+            .await
+            .expect("detached metadata completion timed out")
+            .expect("detached metadata completion stopped");
     }
 
     async fn store() -> (TempDir, Store) {

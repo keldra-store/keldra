@@ -7,8 +7,9 @@ use std::time::Duration;
 
 use anvil_consensus::{DecisionRaft, NodeId};
 use anvil_store::{
-    BlobRef, Durability, ErasureProfile, PayloadArtifactState, ReferenceDeltaApplied,
-    ReferenceDeltaBatch, SourceId, Store, WatchJournalStatus,
+    BlobRef, Durability, ErasureProfile, ObjectMutation, PayloadArtifactState,
+    ReferenceDeltaApplied, ReferenceDeltaBatch, RetainedVersionDeleteMutation, SourceId, Store,
+    WatchJournalStatus,
 };
 use tonic::{Code, Status};
 
@@ -18,7 +19,7 @@ use super::cleanup::{
 };
 use super::{
     PositiveReferencePreparation, QuorumReferenceCommitAuthority, ReferenceDelivery,
-    ReferenceDestinations, ReferencePlacement, ReferencePlacementAuthority,
+    ReferenceDestinations, ReferenceMutationPeers, ReferencePlacement, ReferencePlacementAuthority,
 };
 use crate::cluster_peer::ClusterPeerTransport;
 use crate::cluster_placement::ClusterPlacement;
@@ -154,6 +155,33 @@ impl ReferenceProofSourceStatuses for StoreReferenceDestinations {
         self.peers
             .source_journal_status(node, address)
             .await
+            .map_err(|error| error.to_string())
+    }
+}
+
+#[tonic::async_trait]
+impl ReferenceMutationPeers for DataPeerTransport {
+    async fn apply_object_mutation(
+        &self,
+        node: NodeId,
+        address: &str,
+        mutation: &ObjectMutation,
+    ) -> Result<(), String> {
+        DataPeerTransport::apply_object_mutation(self, node, address, mutation)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    async fn apply_retained_version_delete(
+        &self,
+        node: NodeId,
+        address: &str,
+        mutation: &RetainedVersionDeleteMutation,
+    ) -> Result<(), String> {
+        DataPeerTransport::apply_retained_version_delete(self, node, address, mutation)
+            .await
+            .map(|_| ())
             .map_err(|error| error.to_string())
     }
 }
@@ -343,7 +371,7 @@ impl ReferenceRuntime {
             local_node,
             store: store.clone(),
             peers: data_peers.clone(),
-            mutation_admission,
+            mutation_admission: mutation_admission.clone(),
         };
         let payloads = Arc::new(StorePositiveReferencePreparation {
             local_node,
@@ -356,11 +384,14 @@ impl ReferenceRuntime {
                 profile,
             ),
         });
-        let commits = Arc::new(QuorumReferenceCommitAuthority::new(
-            store.clone(),
-            placement.clone(),
-            Arc::new(cluster_peers),
-        ));
+        let commits = Arc::new(
+            QuorumReferenceCommitAuthority::new(
+                store.clone(),
+                placement.clone(),
+                Arc::new(cluster_peers),
+            )
+            .with_redrive(Arc::new(data_peers.clone()), mutation_admission),
+        );
         let delivery = ReferenceDelivery::new(
             store.clone(),
             placement.clone(),
@@ -388,7 +419,9 @@ impl ReferenceRuntime {
                 let delay = match result {
                     Ok(progress) => {
                         delivery_safety.store(true, Ordering::Release);
-                        if progress.safe_through == progress.tail {
+                        if progress.reference_safe_through == progress.tail
+                            && progress.settled_through == progress.tail
+                        {
                             DELIVERY_IDLE_INTERVAL
                         } else {
                             Duration::ZERO
@@ -587,19 +620,6 @@ impl ReferenceRuntimeHandle {
                 Ok((node, current_address.0.clone()))
             })
             .collect()
-    }
-
-    /// Waits without a data-size timeout for exact reference safety. Complete
-    /// replicas let an undersized membership converge normally, so startup no
-    /// longer bypasses reconciliation merely because it cannot place K+M
-    /// distinct erasure ordinals.
-    pub(crate) async fn wait_until_startup_ready(&self) -> bool {
-        loop {
-            if self.gc_safe().await {
-                return true;
-            }
-            tokio::time::sleep(READINESS_POLL_INTERVAL).await;
-        }
     }
 
     /// GC is safe only after this destination has consumed the complete tail

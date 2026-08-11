@@ -61,6 +61,7 @@ pub(super) struct HandoffTopology {
 struct SourceTail {
     source_id: SourceId,
     tail: u64,
+    settled_through: u64,
     retention_floor: u64,
 }
 
@@ -193,6 +194,8 @@ impl TypedAddHandoff {
                 .handoff_source_journal_status(endpoint.node_id, &endpoint.address)
                 .await?;
             if u64::from(status.source_id.node_id) != endpoint.node_id.0
+                || status.retention_floor > status.settled_through
+                || status.settled_through > status.tail
                 || tails
                     .insert(endpoint.node_id, source_tail(status))
                     .is_some()
@@ -203,6 +206,26 @@ impl TypedAddHandoff {
             }
         }
         Ok(tails)
+    }
+
+    async fn settled_journal_tails(
+        &self,
+        descriptor: &NodeDescriptor,
+        transition: &MembershipTransition,
+        topology: &HandoffTopology,
+        peers: &DataPeerTransport,
+    ) -> Result<BTreeMap<NodeId, SourceTail>, Status> {
+        loop {
+            let tails = self.journal_tails(topology, peers).await?;
+            if tails
+                .values()
+                .all(|source| source.settled_through == source.tail)
+            {
+                return Ok(tails);
+            }
+            self.require_current(descriptor, transition).await?;
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
     }
 
     async fn changes_between(
@@ -446,7 +469,9 @@ impl JoinActivationGate for TypedAddHandoff {
         tokio::time::sleep(SERVING_LEASE_CUTOVER_WAIT).await;
         self.require_current(descriptor, transition).await?;
 
-        let final_tail = self.journal_tails(&topology, &peers).await?;
+        let final_tail = self
+            .settled_journal_tails(descriptor, transition, &topology, &peers)
+            .await?;
         self.require_reference_cursors(&topology, &peers, &final_tail)
             .await?;
         records::transfer_all(&topology, &peers).await?;
@@ -455,7 +480,9 @@ impl JoinActivationGate for TypedAddHandoff {
             .await?;
         records::replay_object_paths(&topology, &peers, &final_changes).await?;
         payload::transfer_all(&topology, &peers, self.profile, payload_spools).await?;
-        let post_payload_tail = self.journal_tails(&topology, &peers).await?;
+        let post_payload_tail = self
+            .settled_journal_tails(descriptor, transition, &topology, &peers)
+            .await?;
         let payload_suffix = self
             .changes_between(&topology, &peers, &final_tail, &post_payload_tail)
             .await?;
@@ -572,6 +599,7 @@ fn source_tail(status: WatchJournalStatus) -> SourceTail {
     SourceTail {
         source_id: status.source_id,
         tail: status.tail,
+        settled_through: status.settled_through,
         retention_floor: status.retention_floor,
     }
 }
@@ -642,6 +670,7 @@ mod tests {
             kind: ObjectHeadChangeKind::Put,
             reference_deltas: Vec::new(),
             accounting_transition: None,
+            definition_transition: None,
         });
         let aggregate = LocalChange::AggregateChanged(AggregateChanged {
             offset: 2,

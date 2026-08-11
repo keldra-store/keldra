@@ -90,6 +90,7 @@ fn status(source_id: SourceId, tail: u64, retention_floor: u64) -> WatchJournalS
     WatchJournalStatus {
         source_id,
         tail,
+        settled_through: tail,
         retention_floor,
         retained_entries: tail - retention_floor,
         retained_bytes: 0,

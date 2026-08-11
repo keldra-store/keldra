@@ -7,6 +7,7 @@ fn status(node_id: u16, tail: u64, retention_floor: u64) -> WatchJournalStatus {
             source_epoch: [7; 32],
         },
         tail,
+        settled_through: tail,
         retention_floor,
         retained_entries: tail - retention_floor,
         retained_bytes: 0,

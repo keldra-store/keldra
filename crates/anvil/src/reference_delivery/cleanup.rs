@@ -224,7 +224,8 @@ fn validate_status(
 ) -> Result<(), ReferenceProofCleanupError> {
     if u64::from(status.source_id.node_id) != expected_node.0
         || status.source_id.source_epoch == [0; 32]
-        || status.retention_floor > status.tail
+        || status.retention_floor > status.settled_through
+        || status.settled_through > status.tail
         || status.retained_entries != status.tail - status.retention_floor
     {
         return Err(ReferenceProofCleanupError::InvalidSourceStatus(format!(

@@ -16,8 +16,9 @@ use std::sync::Arc;
 use anvil_consensus::{ClusterId, NodeId};
 use anvil_store::{
     BlobRef, DestinationReferenceArtifact, DestinationReferenceDelta, ErasureProfile, LocalChange,
-    MAX_LOCAL_INVALIDATION_SCAN_RECORDS, PlacementLogId, ReferenceDeltaApplied,
-    ReferenceDeltaBatch, ReferenceProof, ShardIdentity, SourceId, Store,
+    MAX_LOCAL_INVALIDATION_SCAN_RECORDS, ObjectMutation, PlacementLogId, ReferenceDeltaApplied,
+    ReferenceDeltaBatch, ReferenceProof, ReferenceProofMutation, RetainedVersionDeleteMutation,
+    ShardIdentity, SourceId, Store,
 };
 use thiserror::Error;
 
@@ -70,6 +71,23 @@ pub(crate) trait ReferenceProofPeers: Send + Sync {
         address: &str,
         request: ReferenceProofRead,
     ) -> Result<Option<ReferenceProof>, String>;
+}
+
+#[tonic::async_trait]
+pub(crate) trait ReferenceMutationPeers: Send + Sync {
+    async fn apply_object_mutation(
+        &self,
+        node: NodeId,
+        address: &str,
+        mutation: &ObjectMutation,
+    ) -> Result<(), String>;
+
+    async fn apply_retained_version_delete(
+        &self,
+        node: NodeId,
+        address: &str,
+        mutation: &RetainedVersionDeleteMutation,
+    ) -> Result<(), String>;
 }
 
 pub(crate) trait ReferencePlacementAuthority: Send + Sync {
@@ -139,6 +157,12 @@ pub(crate) struct QuorumReferenceCommitAuthority {
     source: Store,
     placement: Arc<dyn ReferencePlacementAuthority>,
     peers: Arc<dyn ReferenceProofPeers>,
+    redrive: Option<ReferenceRedrive>,
+}
+
+struct ReferenceRedrive {
+    peers: Arc<dyn ReferenceMutationPeers>,
+    admission: crate::mutation_admission::MutationAdmission,
 }
 
 impl QuorumReferenceCommitAuthority {
@@ -151,7 +175,95 @@ impl QuorumReferenceCommitAuthority {
             source,
             placement,
             peers,
+            redrive: None,
         }
+    }
+
+    pub(crate) fn with_redrive(
+        mut self,
+        peers: Arc<dyn ReferenceMutationPeers>,
+        admission: crate::mutation_admission::MutationAdmission,
+    ) -> Self {
+        self.redrive = Some(ReferenceRedrive { peers, admission });
+        self
+    }
+
+    async fn redrive(
+        &self,
+        started: &ReferencePlacement,
+        group: &MutableRecordReplicaGroup,
+        proof: &ReferenceProof,
+    ) -> Result<(), String> {
+        let Some(redrive) = self.redrive.as_ref() else {
+            return Ok(());
+        };
+        if matches!(&proof.mutation, ReferenceProofMutation::ProgramPath(_)) {
+            return Ok(());
+        }
+        let _permit = redrive
+            .admission
+            .enter_continuation()
+            .map_err(|error| format!("metadata redrive admission failed: {error}"))?;
+        if self
+            .placement
+            .current()
+            .map_err(|error| format!("metadata redrive placement is unavailable: {error}"))?
+            != *started
+        {
+            return Err("object placement changed before metadata redrive".into());
+        }
+        let mutation_fence = match &proof.mutation {
+            ReferenceProofMutation::Object(mutation) => mutation.stamp.active_placement_log_id,
+            ReferenceProofMutation::RetainedVersionDelete(mutation) => {
+                mutation.stamp.active_placement_log_id
+            }
+            ReferenceProofMutation::ProgramPath(mutation) => mutation.stamp.active_placement_log_id,
+        };
+        if mutation_fence != started.fence() {
+            return Err("typed metadata proof belongs to an earlier placement fence".into());
+        }
+        let local = NodeId(u64::from(proof.source_id.node_id));
+        for replica in group.replicas() {
+            let result = match (&proof.mutation, *replica == local) {
+                (ReferenceProofMutation::Object(mutation), true) => self
+                    .source
+                    .apply_object_mutation_replica(mutation)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string()),
+                (ReferenceProofMutation::RetainedVersionDelete(mutation), true) => self
+                    .source
+                    .apply_retained_version_delete_replica(mutation)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string()),
+                (ReferenceProofMutation::Object(mutation), false) => {
+                    let address = started
+                        .address(*replica)
+                        .ok_or_else(|| "current metadata replica has no peer address".to_owned())?;
+                    redrive
+                        .peers
+                        .apply_object_mutation(*replica, address, mutation)
+                        .await
+                }
+                (ReferenceProofMutation::RetainedVersionDelete(mutation), false) => {
+                    let address = started
+                        .address(*replica)
+                        .ok_or_else(|| "current metadata replica has no peer address".to_owned())?;
+                    redrive
+                        .peers
+                        .apply_retained_version_delete(*replica, address, mutation)
+                        .await
+                }
+                (ReferenceProofMutation::ProgramPath(_), _) => {
+                    unreachable!("program-path mutations are completed by the nominated executor")
+                }
+            };
+            if let Err(error) = result {
+                tracing::warn!(node_id = replica.0, %error, "typed metadata redrive did not complete");
+            }
+        }
+        Ok(())
     }
 }
 
@@ -166,6 +278,23 @@ impl ReferenceCommitAuthority for QuorumReferenceCommitAuthority {
             .placement
             .current()
             .map_err(|error| format!("current placement is unavailable: {error}"))?;
+        let path = reference_object_path(change)?;
+        let placement_key = object_placement_key(path.tenant_id, path.bucket_id, path.exact_path);
+        let group = MutableRecordReplicaGroup::select(
+            PlacementKind::Object,
+            started.cluster_id(),
+            &placement_key,
+            started.placement_nodes(),
+        )
+        .ok_or_else(|| "current placement has no object metadata replica group".to_owned())?;
+        let local_node = NodeId(u64::from(source.node_id));
+        if group.coordinator() != local_node {
+            return Err(format!(
+                "source node {} is not the current coordinator {} for its object metadata proof",
+                local_node.0,
+                group.coordinator().0
+            ));
+        }
         let expected = self
             .source
             .read_reference_proof(source, change.offset())
@@ -179,7 +308,12 @@ impl ReferenceCommitAuthority for QuorumReferenceCommitAuthority {
             let only_active_source = started.active_node_ids().as_slice()
                 == [NodeId(u64::from(source.node_id))]
                 && local_source == source;
-            if only_active_source && matches!(change, LocalChange::ObjectHead(_)) {
+            if only_active_source
+                && matches!(
+                    change,
+                    LocalChange::ObjectHead(_) | LocalChange::RetainedVersionDeleted(_)
+                )
+            {
                 return Ok(ReferenceCommitDisposition::AlreadyAppliedLocally);
             }
             return Err("source reference proof is missing".to_owned());
@@ -191,15 +325,6 @@ impl ReferenceCommitAuthority for QuorumReferenceCommitAuthority {
             return Err("source reference proof does not match its journal event".into());
         }
 
-        let path = reference_object_path(change)?;
-        let placement_key = object_placement_key(path.tenant_id, path.bucket_id, path.exact_path);
-        let group = MutableRecordReplicaGroup::select(
-            PlacementKind::Object,
-            started.cluster_id(),
-            &placement_key,
-            started.placement_nodes(),
-        )
-        .ok_or_else(|| "current placement has no object metadata replica group".to_owned())?;
         let request = ReferenceProofRead {
             placement_fence: started.fence(),
             source,
@@ -208,7 +333,6 @@ impl ReferenceCommitAuthority for QuorumReferenceCommitAuthority {
             bucket_id: path.bucket_id,
             exact_path: path.exact_path.to_owned(),
         };
-        let local_node = NodeId(u64::from(source.node_id));
         let mut exact = 0_usize;
         let mut absent = 0_usize;
         let mut unavailable = Vec::new();
@@ -251,6 +375,49 @@ impl ReferenceCommitAuthority for QuorumReferenceCommitAuthority {
         }
 
         let quorum = group.required_acknowledgements();
+        if exact < quorum
+            && self.redrive.is_some()
+            && !matches!(&expected.mutation, ReferenceProofMutation::ProgramPath(_))
+        {
+            self.redrive(&started, &group, &expected).await?;
+            exact = 0;
+            absent = 0;
+            unavailable.clear();
+            conflict = None;
+            for replica in group.replicas() {
+                let observed = if *replica == local_node {
+                    self.source
+                        .read_reference_proof(source, change.offset())
+                        .map_err(|error| error.to_string())
+                } else if let Some(address) = started.address(*replica) {
+                    self.peers
+                        .read_reference_proof(*replica, address, request.clone())
+                        .await
+                } else {
+                    Err("current replica has no peer address".into())
+                };
+                match observed {
+                    Ok(Some(proof)) if proof == expected => exact += 1,
+                    Ok(Some(_)) => conflict = Some(*replica),
+                    Ok(None) => absent += 1,
+                    Err(error) => unavailable.push(format!("node {}: {error}", replica.0)),
+                }
+            }
+            if self
+                .placement
+                .current()
+                .map_err(|error| format!("metadata redrive placement recheck failed: {error}"))?
+                != started
+            {
+                return Err("object placement changed during metadata redrive".into());
+            }
+            if let Some(node) = conflict {
+                return Err(format!(
+                    "node {} returned a conflicting proof after metadata redrive",
+                    node.0
+                ));
+            }
+        }
         if exact >= quorum {
             return Ok(ReferenceCommitDisposition::CommittedOrAncestor);
         }
@@ -322,7 +489,8 @@ pub(crate) trait PositiveReferencePreparation: Send + Sync {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ReferenceDeliveryProgress {
     pub source_id: SourceId,
-    pub safe_through: u64,
+    pub reference_safe_through: u64,
+    pub settled_through: u64,
     pub tail: u64,
 }
 
@@ -384,6 +552,11 @@ impl ReferenceDelivery {
             });
         }
 
+        // Visibility settlement and reference-delivery progress are
+        // independent cuts. Settle the captured source prefix before any
+        // destination cursor RPC can fail or stall this pass.
+        let visibility_blocked = self.settle_visibility_prefix(&initial_status).await.err();
+
         let mut cursors = BTreeMap::new();
         for destination in &active {
             let cursor = self
@@ -416,14 +589,28 @@ impl ReferenceDelivery {
         for (node, cursor) in &cursors {
             validate_cursor(*node, *cursor, status.retention_floor, status.tail)?;
         }
+        let visibility_through = self
+            .source
+            .local_watch_status()
+            .map_err(|error| ReferenceDeliveryError::Source(error.to_string()))?
+            .settled_through;
         let slowest = cursors.values().copied().min().unwrap_or(status.tail);
         if slowest == status.tail {
             let final_tail = self
                 .finish_compaction(&placement, status.source_id, &cursors)
                 .await?;
+            if let Some(error) = visibility_blocked {
+                return Err(error);
+            }
+            let settled_through = self
+                .source
+                .local_watch_status()
+                .map_err(|error| ReferenceDeliveryError::Source(error.to_string()))?
+                .settled_through;
             return Ok(ReferenceDeliveryProgress {
                 source_id: status.source_id,
-                safe_through: status.tail,
+                reference_safe_through: status.tail,
+                settled_through,
                 tail: final_tail,
             });
         }
@@ -438,21 +625,33 @@ impl ReferenceDelivery {
         let mut prepared = Vec::new();
         let mut blocked = None;
         for change in changes {
-            if change.reference_deltas().is_empty() {
+            let object_metadata = matches!(
+                change,
+                LocalChange::ObjectHead(_) | LocalChange::RetainedVersionDeleted(_)
+            );
+            if !object_metadata && change.reference_deltas().is_empty() {
                 routed.push((change.offset(), BTreeMap::new()));
                 continue;
             }
-            let disposition = match self.commits.classify(status.source_id, &change).await {
-                Ok(disposition) => disposition,
-                Err(message) => {
-                    blocked = Some(ReferenceDeliveryError::CommitProof {
-                        offset: change.offset(),
-                        message,
-                    });
-                    break;
+            let disposition = if !object_metadata || change.offset() <= visibility_through {
+                ReferenceCommitDisposition::CommittedOrAncestor
+            } else {
+                match self.commits.classify(status.source_id, &change).await {
+                    Ok(disposition) => disposition,
+                    Err(message) => {
+                        blocked = Some(ReferenceDeliveryError::CommitProof {
+                            offset: change.offset(),
+                            message,
+                        });
+                        break;
+                    }
                 }
             };
             if disposition == ReferenceCommitDisposition::AlreadyAppliedLocally {
+                routed.push((change.offset(), BTreeMap::new()));
+                continue;
+            }
+            if change.reference_deltas().is_empty() {
                 routed.push((change.offset(), BTreeMap::new()));
                 continue;
             }
@@ -542,6 +741,9 @@ impl ReferenceDelivery {
         if let Some(error) = blocked {
             return Err(error);
         }
+        if let Some(error) = visibility_blocked {
+            return Err(error);
+        }
         let final_tail = self
             .source
             .local_watch_status()
@@ -553,9 +755,73 @@ impl ReferenceDelivery {
         }
         Ok(ReferenceDeliveryProgress {
             source_id: status.source_id,
-            safe_through: cursors.values().copied().min().unwrap_or(through),
+            reference_safe_through: cursors.values().copied().min().unwrap_or(through),
+            settled_through: final_tail.settled_through,
             tail: final_tail.tail,
         })
+    }
+
+    /// Advances only the contiguous metadata/atomic visibility cut. Physical
+    /// reference-delivery cursors are independent and may neither prove nor
+    /// manufacture this settlement.
+    async fn settle_visibility_prefix(
+        &self,
+        status: &anvil_store::WatchJournalStatus,
+    ) -> Result<u64, ReferenceDeliveryError> {
+        if status.settled_through == status.tail {
+            return Ok(status.tail);
+        }
+        let changes = self
+            .source
+            .scan_local_changes_bounded(status.settled_through, self.page_size, u64::MAX)
+            .map_err(|error| ReferenceDeliveryError::Source(error.to_string()))?;
+        if let Some(oversize) = changes.oversize {
+            return Err(ReferenceDeliveryError::Source(format!(
+                "source event {} requires {} bytes during settlement",
+                oversize.offset, oversize.encoded_bytes
+            )));
+        }
+        let mut through = status.settled_through;
+        let mut blocked = None;
+        for change in changes.changes {
+            if change.offset() > status.tail {
+                break;
+            }
+            let classification = match change {
+                LocalChange::ObjectHead(_) | LocalChange::RetainedVersionDeleted(_) => {
+                    self.commits.classify(status.source_id, &change).await
+                }
+                // Aggregate and lifecycle changes describe effects committed
+                // in the same local RocksDB batch as the journal event. They
+                // do not feed object/index/accounting/Watch visibility; any
+                // carried reference deltas remain governed independently by
+                // destination reference cursors.
+                LocalChange::AggregateChanged(_) | LocalChange::ContentLifecycleChanged(_) => {
+                    Ok(ReferenceCommitDisposition::CommittedOrAncestor)
+                }
+                _ => Err("source journal change type is not supported for settlement".into()),
+            };
+            match classification {
+                Ok(_) => through = change.offset(),
+                Err(message) => {
+                    blocked = Some(ReferenceDeliveryError::CommitProof {
+                        offset: change.offset(),
+                        message,
+                    });
+                    break;
+                }
+            }
+        }
+        if through > status.settled_through {
+            self.source
+                .advance_source_journal_settled_through(through)
+                .await
+                .map_err(|error| ReferenceDeliveryError::Source(error.to_string()))?;
+        }
+        if let Some(error) = blocked {
+            return Err(error);
+        }
+        Ok(through)
     }
 
     async fn finish_compaction(
@@ -591,7 +857,7 @@ impl ReferenceDelivery {
             });
         }
         self.source
-            .advance_source_journal_safe_through(safe)
+            .advance_source_journal_reference_safe_through(safe)
             .await
             .map_err(|error| ReferenceDeliveryError::Source(error.to_string()))?;
         Ok(status.tail)
