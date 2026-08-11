@@ -94,6 +94,7 @@ pub(super) async fn source_journal_status(
         schema_version: DATA_PEER_SCHEMA_VERSION,
         source_id_json: encode_typed(&status.source_id)?,
         tail: status.tail,
+        settled_through: status.settled_through,
         retention_floor: status.retention_floor,
         retained_entries: status.retained_entries,
         retained_bytes: status.retained_bytes,

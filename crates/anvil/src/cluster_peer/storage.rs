@@ -28,12 +28,20 @@ struct SchemaReplicaQueryWire {
 impl wire::cluster_peer_server::ClusterPeer for ClusterPeerService {
     type ReadRealmAggregateStream = super::authz::RealmAggregateStream;
     type ScanIndexSourceSnapshotStream = super::index_snapshot::IndexSourceSnapshotRpcStream;
+    type ScanRetainedSourceSnapshotStream = super::index_snapshot::RetainedSourceSnapshotRpcStream;
 
     async fn publish_index_artifact(
         &self,
         request: Request<wire::PublishIndexArtifactRequest>,
     ) -> Result<Response<wire::IndexArtifactPublished>, Status> {
         self.publish_index_artifact_call(request).await
+    }
+
+    async fn commit_guarded_index_artifact(
+        &self,
+        request: Request<wire::CommitGuardedIndexArtifactRequest>,
+    ) -> Result<Response<wire::IndexArtifactPublished>, Status> {
+        self.commit_guarded_index_artifact_call(request).await
     }
 
     async fn delete_index_artifact(
@@ -55,6 +63,13 @@ impl wire::cluster_peer_server::ClusterPeer for ClusterPeerService {
         request: Request<tonic::Streaming<wire::IndexSourceSnapshotRequest>>,
     ) -> Result<Response<Self::ScanIndexSourceSnapshotStream>, Status> {
         self.scan_index_source_snapshot_call(request).await
+    }
+
+    async fn scan_retained_source_snapshot(
+        &self,
+        request: Request<tonic::Streaming<wire::RetainedSourceSnapshotRequest>>,
+    ) -> Result<Response<Self::ScanRetainedSourceSnapshotStream>, Status> {
+        self.scan_retained_source_snapshot_call(request).await
     }
 
     async fn route_index_query(
@@ -133,6 +148,28 @@ impl wire::cluster_peer_server::ClusterPeer for ClusterPeerService {
         request: Request<wire::FlushAccountingTrafficRequest>,
     ) -> Result<Response<wire::FlushAccountingTrafficResponse>, Status> {
         self.flush_accounting_traffic_call(request).await
+    }
+
+    async fn match_accounting_traffic(
+        &self,
+        request: Request<wire::MatchAccountingTrafficRequest>,
+    ) -> Result<Response<wire::MatchAccountingTrafficResponse>, Status> {
+        self.match_accounting_traffic_call(request).await
+    }
+
+    async fn invalidate_accounting_matcher_bucket(
+        &self,
+        request: Request<wire::InvalidateAccountingMatcherBucketRequest>,
+    ) -> Result<Response<wire::AccountingMatcherCacheInvalidated>, Status> {
+        self.invalidate_accounting_matcher_bucket_call(request)
+            .await
+    }
+
+    async fn clear_accounting_matcher_cache(
+        &self,
+        request: Request<wire::ClearAccountingMatcherCacheRequest>,
+    ) -> Result<Response<wire::AccountingMatcherCacheInvalidated>, Status> {
+        self.clear_accounting_matcher_cache_call(request).await
     }
 
     async fn resolve_tenant_name(
@@ -564,6 +601,8 @@ impl wire::cluster_peer_server::ClusterPeer for ClusterPeerService {
             )
             .await?;
         let next_offset = request.get_ref().next_offset;
+        let tenant_id = scope.tenant_id();
+        let bucket_id = scope.bucket_id();
         let max_records = usize::try_from(request.get_ref().max_records)
             .map_err(|_| Status::invalid_argument("watch page limit does not fit this node"))?
             .min(anvil_store::MAX_LOCAL_INVALIDATION_SCAN_RECORDS);
@@ -589,20 +628,36 @@ impl wire::cluster_peer_server::ClusterPeer for ClusterPeerService {
                         .retention_floor
                         .checked_add(1)
                         .ok_or_else(|| Status::data_loss("watch retention floor cannot advance"))?;
-                    let tail_next = status
-                        .tail
-                        .checked_add(1)
-                        .ok_or_else(|| Status::data_loss("watch tail cannot advance"))?;
-                    if next_offset < floor_next || next_offset > tail_next {
+                    let settled_next = status.settled_through.checked_add(1).ok_or_else(|| {
+                        Status::data_loss("watch settled boundary cannot advance")
+                    })?;
+                    if next_offset < floor_next || next_offset > settled_next {
                         return Err(Status::out_of_range("RESUME_EXPIRED"));
                     }
-                    let changes = store
-                        .scan_local_changes(next_offset - 1, max_records)
-                        .map_err(|error| Status::internal(error.to_string()))?;
-                    let returned_next = changes
-                        .last()
-                        .map_or(next_offset, |change| change.offset().saturating_add(1));
-                    Ok((status, changes, returned_next))
+                    let page = store
+                        .scan_routed_local_changes(
+                            anvil_store::JournalRoute::Bucket {
+                                tenant_id,
+                                bucket_id,
+                            },
+                            expected_source,
+                            next_offset - 1,
+                            status.settled_through,
+                            max_records,
+                            crate::distributed_watch::MAX_WATCH_SOURCE_PAGE_BYTES,
+                        )
+                        .map_err(routed_watch_status)?;
+                    if let Some(oversize) = page.oversize {
+                        return Err(Status::resource_exhausted(format!(
+                            "watch source event at offset {} needs {} bytes",
+                            oversize.offset, oversize.encoded_bytes
+                        )));
+                    }
+                    let returned_next = page
+                        .through_offset
+                        .checked_add(1)
+                        .ok_or_else(|| Status::data_loss("watch cursor cannot advance"))?;
+                    Ok((status, page.changes, returned_next))
                 })
                 .await?;
             require_local_source(self.local_node, &status)?;
@@ -615,6 +670,7 @@ impl wire::cluster_peer_server::ClusterPeer for ClusterPeerService {
                     placement_index: admitted.placement.fence().index,
                     source_id_json: encode_json(&status.source_id)?,
                     tail: status.tail,
+                    settled_through: status.settled_through,
                     retention_floor: status.retention_floor,
                     retained_entries: status.retained_entries,
                     retained_bytes: status.retained_bytes,
@@ -1062,6 +1118,8 @@ fn require_local_source(
         .map_err(|_| Status::data_loss("local node ID cannot identify a source journal"))?;
     if status.source_id.node_id != expected
         || status.retention_floor > status.tail
+        || status.settled_through < status.retention_floor
+        || status.settled_through > status.tail
         || status.retained_entries != status.tail - status.retention_floor
     {
         return Err(Status::data_loss(
@@ -1069,6 +1127,25 @@ fn require_local_source(
         ));
     }
     Ok(())
+}
+
+fn routed_watch_status(error: anvil_store::RoutedJournalError) -> Status {
+    match error {
+        anvil_store::RoutedJournalError::CursorExpired { .. }
+        | anvil_store::RoutedJournalError::SourceEpochMismatch
+        | anvil_store::RoutedJournalError::SourceNodeMismatch => {
+            Status::out_of_range("RESUME_EXPIRED")
+        }
+        anvil_store::RoutedJournalError::InvalidLimits
+        | anvil_store::RoutedJournalError::TargetBeforeCursor { .. }
+        | anvil_store::RoutedJournalError::TargetFuture { .. } => {
+            Status::invalid_argument(error.to_string())
+        }
+        anvil_store::RoutedJournalError::CursorFuture { .. }
+        | anvil_store::RoutedJournalError::MissingPrimary { .. }
+        | anvil_store::RoutedJournalError::RouteMismatch { .. }
+        | anvil_store::RoutedJournalError::Storage(_) => Status::data_loss(error.to_string()),
+    }
 }
 
 fn wire_watch_status(
@@ -1083,6 +1160,7 @@ fn wire_watch_status(
         placement_index: fence.index,
         source_id_json: encode_json(&status.source_id)?,
         tail: status.tail,
+        settled_through: status.settled_through,
         retention_floor: status.retention_floor,
         retained_entries: status.retained_entries,
         retained_bytes: status.retained_bytes,

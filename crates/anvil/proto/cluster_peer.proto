@@ -257,6 +257,7 @@ message WatchStatus {
   uint64 retention_floor = 7;
   uint64 retained_entries = 8;
   uint64 retained_bytes = 9;
+  uint64 settled_through = 10;
 }
 
 message WatchPageRequest {
@@ -279,6 +280,7 @@ message WatchPage {
   uint64 retained_bytes = 9;
   uint64 next_offset = 10;
   repeated bytes object_heads_json = 11;
+  uint64 settled_through = 12;
 }
 
 message RoutePutEndRequest {
@@ -299,6 +301,22 @@ message RouteDeleteIfVersionRequest {
 message RouteBulkWriteRequest {
   PeerContext peer = 1;
   anvil.v1.BulkWriteRequest request = 2;
+  repeated RoutedDefinitionMutationIntent definition_intents = 3;
+}
+
+enum RoutedDefinitionKind {
+  ROUTED_DEFINITION_KIND_UNSPECIFIED = 0;
+  ROUTED_DEFINITION_KIND_INDEX = 1;
+  ROUTED_DEFINITION_KIND_ACCOUNTING = 2;
+}
+
+// Typed evidence produced by a trusted definition lifecycle service. This is
+// accepted only on the mandatory-mTLS internal bulk route; public clients have
+// no corresponding field.
+message RoutedDefinitionMutationIntent {
+  uint32 operation_index = 1;
+  RoutedDefinitionKind kind = 2;
+  uint64 definition_id = 3;
 }
 
 message RouteProvisionTenantRequest {
@@ -485,6 +503,23 @@ message PublishIndexArtifactRequest {
   uint64 blob_length = 9;
   optional uint64 expected_version = 10;
   string command_id = 11;
+  // Non-zero only for a trusted ordinary definition mutation. Generic index
+  // and accounting artifacts leave this unspecified.
+  RoutedDefinitionKind definition_kind = 12;
+  // Present together only for current-pointer/accounting-rollup publication.
+  // The first hop is routed to this definition path's coordinator, which
+  // holds its ordinary exact-path lock through the artifact CAS.
+  RoutedDefinitionKind guarded_definition_kind = 13;
+  string guarded_definition_path = 14;
+  uint64 guarded_definition_version = 15;
+}
+
+// Second hop emitted only by the authenticated definition-path coordinator
+// while it still holds the ordinary definition lock.
+message CommitGuardedIndexArtifactRequest {
+  PeerContext peer = 1;
+  uint64 builder_node_id = 2;
+  PublishIndexArtifactRequest publication = 3;
 }
 
 message IndexArtifactPublished {
@@ -505,6 +540,7 @@ message DeleteIndexArtifactRequest {
   string exact_path = 7;
   uint64 expected_version = 8;
   string command_id = 9;
+  RoutedDefinitionKind definition_kind = 10;
 }
 
 message IndexArtifactDeleted {
@@ -513,10 +549,9 @@ message IndexArtifactDeleted {
   bool replayed = 3;
 }
 
-message AllIndexDefinitionHeads {}
-message AllAccountingDefinitionHeads {}
-
-message IndexGenerationHeads {
+// Every retained descriptor beneath one exact Anvil-owned index artifact
+// prefix. The server derives the prefix from index_id; peers cannot widen it.
+message IndexArtifactHeads {
   uint64 tenant_id = 1;
   uint64 bucket_id = 2;
   uint64 index_id = 3;
@@ -531,29 +566,13 @@ message IndexRunHeads {
   bytes run_blake3 = 4;
 }
 
-message IndexSourceObjectHeads {
-  uint64 tenant_id = 1;
-  uint64 bucket_id = 2;
-  string path_prefix = 3;
-}
-
-message AccountingSourceObjectHeads {
-  uint64 tenant_id = 1;
-  uint64 bucket_id = 2;
-  string path_prefix = 3;
-}
-
-// A bounded current-head scan with explicit derived-view scopes. Reserved
-// discovery remains limited to exact Anvil-owned definition namespaces.
+// A bounded index-maintenance scan with explicit derived-view scopes. Artifact
+// pages are retained `(path, version)` records; run pages are current heads.
 message ScanIndexHeadsRequest {
   PeerContext peer = 1;
   optional string cursor = 2;
   oneof scope {
-    AllIndexDefinitionHeads definitions = 3;
-    IndexGenerationHeads generation = 4;
-    IndexSourceObjectHeads source_objects = 5;
-    AllAccountingDefinitionHeads accounting_definitions = 6;
-    AccountingSourceObjectHeads accounting_source_objects = 7;
+    IndexArtifactHeads artifacts = 4;
     IndexRunHeads run = 8;
   }
 }
@@ -617,6 +636,43 @@ message IndexSourceSnapshotResponse {
   oneof event {
     IndexSourceSnapshotBegun begun = 1;
     IndexSourceSnapshotFrame frame = 2;
+  }
+}
+
+// Credit-driven retained `(path, version)` snapshot used by accounting
+// baselines. It is deliberately separate from the current-head rebuild stream
+// so neither consumer can accidentally decode the other record shape.
+message RetainedSourceSnapshotBegin {
+  PeerContext peer = 1;
+  uint64 tenant_id = 2;
+  uint64 bucket_id = 3;
+  string path_prefix = 4;
+  uint64 max_frame_bytes = 5;
+}
+
+message RetainedSourceSnapshotRequest {
+  oneof command {
+    RetainedSourceSnapshotBegin begin = 1;
+    IndexSourceSnapshotPull pull = 2;
+  }
+}
+
+message RetainedSourceSnapshotFrame {
+  uint32 schema_version = 1;
+  uint64 source_node_id = 2;
+  bytes source_epoch = 3;
+  uint64 captured_source_tail = 4;
+  uint64 placement_term = 5;
+  uint64 placement_index = 6;
+  uint64 sequence = 7;
+  repeated bytes records_json = 8;
+  bool end = 9;
+}
+
+message RetainedSourceSnapshotResponse {
+  oneof event {
+    IndexSourceSnapshotBegun begun = 1;
+    RetainedSourceSnapshotFrame frame = 2;
   }
 }
 
@@ -714,11 +770,50 @@ message FlushAccountingTrafficRequest {
   uint64 accepted_inbound_bytes = 4;
   uint64 served_outbound_bytes = 5;
   string flush_id = 6;
+  uint64 tenant_id = 7;
+  uint64 bucket_id = 8;
 }
 
 message FlushAccountingTrafficResponse {
   uint32 schema_version = 1;
   bool replayed = 2;
+}
+
+message AccountingTrafficEntry {
+  string exact_path = 1;
+  uint64 accepted_inbound_bytes = 2;
+  uint64 served_outbound_bytes = 3;
+}
+
+// One bounded source batch sent to the current weighted-HRW bucket matcher.
+// The matcher resolves the bucket's sparse accounting definitions and forwards
+// idempotent per-definition totals to each rank-zero accounting builder.
+message MatchAccountingTrafficRequest {
+  PeerContext peer = 1;
+  uint64 source_node_id = 2;
+  bytes source_epoch = 3;
+  uint64 sequence = 4;
+  uint64 tenant_id = 5;
+  uint64 bucket_id = 6;
+  repeated AccountingTrafficEntry entries = 7;
+}
+
+message MatchAccountingTrafficResponse {
+  uint32 schema_version = 1;
+}
+
+message InvalidateAccountingMatcherBucketRequest {
+  PeerContext peer = 1;
+  uint64 tenant_id = 2;
+  uint64 bucket_id = 3;
+}
+
+message ClearAccountingMatcherCacheRequest {
+  PeerContext peer = 1;
+}
+
+message AccountingMatcherCacheInvalidated {
+  uint32 schema_version = 1;
 }
 
 // This service is installed only on Anvil's mandatory-mTLS peer listener.
@@ -781,9 +876,11 @@ service ClusterPeer {
   rpc ApplyProgramPathFinalization(ProgramApplyPathFinalizationRequest) returns (ProgramPathFinalizationApplied);
 
   rpc PublishIndexArtifact(PublishIndexArtifactRequest) returns (IndexArtifactPublished);
+  rpc CommitGuardedIndexArtifact(CommitGuardedIndexArtifactRequest) returns (IndexArtifactPublished);
   rpc DeleteIndexArtifact(DeleteIndexArtifactRequest) returns (IndexArtifactDeleted);
   rpc ScanIndexHeads(ScanIndexHeadsRequest) returns (IndexHeadScanPage);
   rpc ScanIndexSourceSnapshot(stream IndexSourceSnapshotRequest) returns (stream IndexSourceSnapshotResponse);
+  rpc ScanRetainedSourceSnapshot(stream RetainedSourceSnapshotRequest) returns (stream RetainedSourceSnapshotResponse);
   rpc RouteIndexQuery(RouteIndexQueryRequest) returns (RoutedIndexQueryResponse);
   rpc RouteCreatePersonalDbGroup(RouteCreatePersonalDbGroupRequest) returns (anvil.v1.PersonalDbGroup);
   rpc RouteChangePersonalDbGroupRole(RouteChangePersonalDbGroupRoleRequest) returns (anvil.v1.PersonalDbGroupRoleChange);
@@ -794,7 +891,10 @@ service ClusterPeer {
   rpc RouteEnableAccounting(RouteEnableAccountingRequest) returns (anvil.v1.AccountingDefinition);
   rpc RouteDisableAccounting(RouteDisableAccountingRequest) returns (anvil.v1.DisableAccountingResponse);
   rpc RouteGetAccounting(RouteGetAccountingRequest) returns (anvil.v1.AccountingSnapshot);
+  rpc MatchAccountingTraffic(MatchAccountingTrafficRequest) returns (MatchAccountingTrafficResponse);
   rpc FlushAccountingTraffic(FlushAccountingTrafficRequest) returns (FlushAccountingTrafficResponse);
+  rpc InvalidateAccountingMatcherBucket(InvalidateAccountingMatcherBucketRequest) returns (AccountingMatcherCacheInvalidated);
+  rpc ClearAccountingMatcherCache(ClearAccountingMatcherCacheRequest) returns (AccountingMatcherCacheInvalidated);
 
   rpc CoordinateLogicalRecord(CoordinateLogicalRecordRequest) returns (CoordinateLogicalRecordResponse);
   rpc ReadCoordinatedLogicalRecord(CoordinatedLogicalReadRequest) returns (CoordinatedLogicalReadResponse);

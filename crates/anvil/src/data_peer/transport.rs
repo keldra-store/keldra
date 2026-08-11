@@ -3,12 +3,20 @@
 use super::*;
 use anvil_store::{
     AuthzRealmCursor, AuthzRealmKeyPage, AuthzRealmTransferManifest, AuthzSchemaCatalogue,
-    AuthzScope, LocalChangePage, LogicalRecordCandidate, LogicalRecordCursor, LogicalRecordExport,
-    LogicalRecordExportPage, LogicalRecordId, ObjectRecordCursor, ObjectRecordExport,
+    AuthzScope, BlobReader, DefinitionAssignmentCursor, DefinitionAssignmentMutation,
+    DefinitionAssignmentPage, DefinitionCheckpoint, DefinitionConsumerKind, DefinitionKind,
+    DefinitionLocatorCursor, DefinitionLocatorPage, JournalRoute, LocalChangePage,
+    LogicalRecordCandidate, LogicalRecordCursor, LogicalRecordExport, LogicalRecordExportPage,
+    LogicalRecordId, MAX_DEFINITION_STATE_SCAN_RECORDS, ObjectRecordCursor, ObjectRecordExport,
     ObjectRecordExportPage, OversizeLocalChange, PayloadArtifactCursor, PayloadArtifactSnapshot,
-    PayloadArtifactSnapshotPage, StorageTenantId,
+    PayloadArtifactSnapshotPage, RoutedLocalChangePage, StorageTenantId,
 };
+use std::io::{self, Read};
 use std::task::{Context, Poll};
+
+mod definition_coordination;
+
+use definition_coordination::*;
 
 #[derive(Clone)]
 #[allow(
@@ -290,6 +298,7 @@ impl DataPeerTransport {
         Ok(WatchJournalStatus {
             source_id: decode_typed(&response.source_id_json)?,
             tail: response.tail,
+            settled_through: response.settled_through,
             retention_floor: response.retention_floor,
             retained_entries: response.retained_entries,
             retained_bytes: response.retained_bytes,
@@ -319,6 +328,271 @@ impl DataPeerTransport {
             .await?
             .into_inner();
         decode_source_journal_page(response, Some(expected_source), after_offset, max_bytes)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn read_routed_source_journal(
+        &self,
+        target: NodeId,
+        address: &str,
+        route: JournalRoute,
+        expected_source: SourceId,
+        after_offset: u64,
+        target_offset: u64,
+        limit: usize,
+        max_bytes: u64,
+    ) -> Result<RoutedLocalChangePage, Status> {
+        require_source_page_limit(max_bytes)?;
+        let limit = u32::try_from(limit.min(MAX_LOCAL_INVALIDATION_SCAN_RECORDS))
+            .expect("source journal limit fits u32");
+        let (route, tenant_id, bucket_id) = match route {
+            JournalRoute::Definition(DefinitionKind::Index) => {
+                (wire::RoutedJournalKind::IndexDefinitions, 0, 0)
+            }
+            JournalRoute::Definition(DefinitionKind::Accounting) => {
+                (wire::RoutedJournalKind::AccountingDefinitions, 0, 0)
+            }
+            JournalRoute::Bucket {
+                tenant_id,
+                bucket_id,
+            } => (wire::RoutedJournalKind::Bucket, tenant_id, bucket_id),
+        };
+        let response = self
+            .client(target, address)?
+            .read_routed_source_journal(wire::RoutedSourceJournalReadRequest {
+                peer: Some(self.context()),
+                route: route as i32,
+                tenant_id,
+                bucket_id,
+                source_id_json: encode_typed(&expected_source)?,
+                after_offset,
+                target_offset,
+                limit,
+                max_bytes,
+            })
+            .await?
+            .into_inner();
+        decode_routed_source_journal_page(
+            response,
+            expected_source,
+            after_offset,
+            target_offset,
+            max_bytes,
+        )
+    }
+
+    pub(crate) async fn apply_definition_assignment_page(
+        &self,
+        target: NodeId,
+        address: &str,
+        mutations: &[DefinitionAssignmentMutation],
+        checkpoint: DefinitionCheckpoint,
+    ) -> Result<(), Status> {
+        if mutations.len() > MAX_DEFINITION_STATE_SCAN_RECORDS as usize {
+            return Err(Status::invalid_argument(
+                "definition assignment page exceeds the private peer item limit",
+            ));
+        }
+        let encoded = mutations
+            .iter()
+            .map(encode_assignment_mutation)
+            .collect::<Result<Vec<_>, Status>>()?;
+        let consumer_kind = wire_consumer_kind(checkpoint.consumer_kind)?;
+        let response = self
+            .client(target, address)?
+            .apply_definition_assignment_page(wire::ApplyDefinitionAssignmentPageRequest {
+                peer: Some(self.context()),
+                mutations: encoded,
+                consumer_kind: consumer_kind as i32,
+                source_node_id: u64::from(checkpoint.source_id.node_id),
+                source_epoch: checkpoint.source_id.source_epoch.to_vec(),
+                next_offset: checkpoint.next_offset,
+                observed_fence_term: checkpoint.observed_fence.term,
+                observed_fence_index: checkpoint.observed_fence.index,
+            })
+            .await?
+            .into_inner();
+        require_response_schema(response.schema_version)?;
+        if response.mutation_count as usize != mutations.len() {
+            return Err(Status::data_loss(
+                "definition assignment response count is inconsistent",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn definition_checkpoint(
+        &self,
+        target: NodeId,
+        address: &str,
+        consumer_kind: DefinitionConsumerKind,
+        source_node_id: u16,
+    ) -> Result<Option<DefinitionCheckpoint>, Status> {
+        let consumer_kind_wire = wire_consumer_kind(consumer_kind)?;
+        let response = self
+            .client(target, address)?
+            .get_definition_checkpoint(wire::DefinitionCheckpointRequest {
+                peer: Some(self.context()),
+                consumer_kind: consumer_kind_wire as i32,
+                source_node_id: u64::from(source_node_id),
+            })
+            .await?
+            .into_inner();
+        require_response_schema(response.schema_version)?;
+        if response.consumer_kind != consumer_kind_wire as i32
+            || response.source_node_id != u64::from(source_node_id)
+        {
+            return Err(Status::data_loss(
+                "definition checkpoint response identity changed",
+            ));
+        }
+        if !response.present {
+            if !response.source_epoch.is_empty()
+                || response.next_offset != 0
+                || response.observed_fence_term != 0
+                || response.observed_fence_index != 0
+            {
+                return Err(Status::data_loss(
+                    "absent definition checkpoint carries state",
+                ));
+            }
+            return Ok(None);
+        }
+        let checkpoint = DefinitionCheckpoint {
+            consumer_kind,
+            source_id: SourceId {
+                node_id: source_node_id,
+                source_epoch: response
+                    .source_epoch
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| Status::data_loss("definition checkpoint epoch is invalid"))?,
+            },
+            next_offset: response.next_offset,
+            observed_fence: anvil_store::PlacementLogId {
+                term: response.observed_fence_term,
+                index: response.observed_fence_index,
+            },
+        };
+        checkpoint
+            .validate()
+            .map_err(|error| Status::data_loss(error.to_string()))?;
+        Ok(Some(checkpoint))
+    }
+
+    pub(crate) async fn apply_definition_assignments(
+        &self,
+        target: NodeId,
+        address: &str,
+        mutations: &[DefinitionAssignmentMutation],
+    ) -> Result<(), Status> {
+        if mutations.is_empty() || mutations.len() > MAX_DEFINITION_STATE_SCAN_RECORDS as usize {
+            return Err(Status::invalid_argument(
+                "definition assignment transfer must contain a bounded non-empty page",
+            ));
+        }
+        let encoded = mutations
+            .iter()
+            .map(encode_assignment_mutation)
+            .collect::<Result<Vec<_>, Status>>()?;
+        let response = self
+            .client(target, address)?
+            .apply_definition_assignments(wire::ApplyDefinitionAssignmentsRequest {
+                peer: Some(self.context()),
+                mutations: encoded,
+            })
+            .await?
+            .into_inner();
+        require_response_schema(response.schema_version)?;
+        if response.mutation_count as usize != mutations.len() {
+            return Err(Status::data_loss(
+                "definition assignment transfer response count is inconsistent",
+            ));
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn scan_definition_locators_by_bucket(
+        &self,
+        target: NodeId,
+        address: &str,
+        kind: DefinitionKind,
+        tenant_id: u64,
+        bucket_id: u64,
+        cursor: Option<&DefinitionLocatorCursor>,
+        limit: u32,
+    ) -> Result<DefinitionLocatorPage, Status> {
+        let response = self
+            .client(target, address)?
+            .scan_definition_locators_by_bucket(wire::DefinitionLocatorScanRequest {
+                peer: Some(self.context()),
+                kind: encode_wire_definition_kind(kind) as i32,
+                tenant_id,
+                bucket_id,
+                cursor: cursor.map_or_else(Vec::new, |cursor| cursor.as_bytes().to_vec()),
+                limit,
+            })
+            .await?
+            .into_inner();
+        decode_locator_page(response, kind, Some((tenant_id, bucket_id)))
+    }
+
+    pub(crate) async fn scan_definition_locators_by_kind(
+        &self,
+        target: NodeId,
+        address: &str,
+        kind: DefinitionKind,
+        cursor: Option<&DefinitionLocatorCursor>,
+        limit: u32,
+    ) -> Result<DefinitionLocatorPage, Status> {
+        let response = self
+            .client(target, address)?
+            .scan_definition_locators_by_kind(wire::DefinitionLocatorKindScanRequest {
+                peer: Some(self.context()),
+                kind: encode_wire_definition_kind(kind) as i32,
+                cursor: cursor.map_or_else(Vec::new, |cursor| cursor.as_bytes().to_vec()),
+                limit,
+            })
+            .await?
+            .into_inner();
+        decode_locator_page(response, kind, None)
+    }
+
+    pub(crate) async fn scan_definition_assignments_by_kind(
+        &self,
+        target: NodeId,
+        address: &str,
+        kind: DefinitionKind,
+        cursor: Option<&DefinitionAssignmentCursor>,
+        limit: u32,
+    ) -> Result<DefinitionAssignmentPage, Status> {
+        let response = self
+            .client(target, address)?
+            .scan_definition_assignments_by_kind(wire::DefinitionAssignmentScanRequest {
+                peer: Some(self.context()),
+                kind: encode_wire_definition_kind(kind) as i32,
+                cursor: cursor.map_or_else(Vec::new, |cursor| cursor.as_bytes().to_vec()),
+                limit,
+            })
+            .await?
+            .into_inner();
+        require_response_schema(response.schema_version)?;
+        let assignments = response
+            .assignments
+            .iter()
+            .map(decode_assignment_upsert)
+            .collect::<Result<Vec<_>, Status>>()?;
+        if assignments.iter().any(|assignment| assignment.kind != kind) {
+            return Err(Status::data_loss(
+                "definition assignment scan escaped its requested kind",
+            ));
+        }
+        let next_cursor = decode_assignment_cursor(response.has_more, response.next_cursor)?;
+        Ok(DefinitionAssignmentPage {
+            assignments,
+            next_cursor,
+        })
     }
 
     pub(crate) async fn small_content_exists(
@@ -782,6 +1056,7 @@ impl DataPeerTransport {
         Ok(WatchJournalStatus {
             source_id: decode_typed(&response.source_id_json)?,
             tail: response.tail,
+            settled_through: response.settled_through,
             retention_floor: response.retention_floor,
             retained_entries: response.retained_entries,
             retained_bytes: response.retained_bytes,
@@ -1454,6 +1729,7 @@ mod tests {
             kind: ObjectHeadChangeKind::Put,
             reference_deltas: Vec::new(),
             accounting_transition: None,
+            definition_transition: None,
         })
     }
 

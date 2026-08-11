@@ -40,6 +40,31 @@ fn validate_snapshot_identity(
     Ok(())
 }
 
+fn validate_current_snapshot_identity(
+    snapshot: Option<&CurrentObjectSnapshot>,
+    tenant_id: u64,
+    bucket_id: u64,
+    exact_path: &str,
+) -> Result<(), Status> {
+    if tenant_id == 0 || bucket_id == 0 || ObjectKey::new("t", "b", exact_path).is_err() {
+        return Err(Status::invalid_argument(
+            "current object snapshot exact-path identity is invalid",
+        ));
+    }
+    if let Some(snapshot) = snapshot {
+        snapshot.validate().map_err(map_object_snapshot_error)?;
+        if snapshot.tenant_id != tenant_id
+            || snapshot.bucket_id != bucket_id
+            || snapshot.exact_path != exact_path
+        {
+            return Err(Status::invalid_argument(
+                "current object snapshot does not match its requested exact path",
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn map_object_snapshot_error(error: ObjectSnapshotError) -> Status {
     match error {
         ObjectSnapshotError::InvalidCursor
@@ -80,6 +105,38 @@ impl DataPeerService {
             .await?;
         let snapshot_json = encode_object_snapshot(&snapshot)?;
         Ok(Response::new(wire::ObjectPathSnapshotResponse {
+            schema_version: DATA_PEER_SCHEMA_VERSION,
+            snapshot_json,
+        }))
+    }
+
+    pub(super) async fn read_current_object_snapshot_call(
+        &self,
+        mut request: Request<wire::ObjectPathSnapshotRequest>,
+    ) -> Result<Response<wire::CurrentObjectSnapshotResponse>, Status> {
+        let peer = request.get_ref().peer.clone();
+        self.authorize(&mut request, peer.as_ref(), PeerRpcKind::DataPlane)?;
+        let metadata = request.metadata().clone();
+        let request = request.into_inner();
+        let store = self.store.clone();
+        let snapshot = self
+            .bounded(&metadata, async move {
+                tokio::task::spawn_blocking(move || {
+                    store.export_current_object_snapshot(
+                        request.tenant_id,
+                        request.bucket_id,
+                        &request.exact_path,
+                    )
+                })
+                .await
+                .map_err(|error| {
+                    Status::internal(format!("current object snapshot read: {error}"))
+                })?
+                .map_err(map_object_snapshot_error)
+            })
+            .await?;
+        let snapshot_json = encode_object_snapshot(&snapshot)?;
+        Ok(Response::new(wire::CurrentObjectSnapshotResponse {
             schema_version: DATA_PEER_SCHEMA_VERSION,
             snapshot_json,
         }))
@@ -161,6 +218,31 @@ impl DataPeerTransport {
         require_object_snapshot_bound(&response.snapshot_json)?;
         let snapshot: Option<ObjectPathSnapshot> = decode_typed(&response.snapshot_json)?;
         validate_snapshot_identity(snapshot.as_ref(), tenant_id, bucket_id, exact_path)?;
+        Ok(snapshot)
+    }
+
+    pub(crate) async fn read_current_object_snapshot(
+        &self,
+        target: NodeId,
+        address: &str,
+        tenant_id: u64,
+        bucket_id: u64,
+        exact_path: &str,
+    ) -> Result<Option<CurrentObjectSnapshot>, Status> {
+        let response = self
+            .client(target, address)?
+            .read_current_object_snapshot(wire::ObjectPathSnapshotRequest {
+                peer: Some(self.context()),
+                tenant_id,
+                bucket_id,
+                exact_path: exact_path.to_owned(),
+            })
+            .await?
+            .into_inner();
+        require_response_schema(response.schema_version)?;
+        require_object_snapshot_bound(&response.snapshot_json)?;
+        let snapshot: Option<CurrentObjectSnapshot> = decode_typed(&response.snapshot_json)?;
+        validate_current_snapshot_identity(snapshot.as_ref(), tenant_id, bucket_id, exact_path)?;
         Ok(snapshot)
     }
 

@@ -9,11 +9,11 @@ use anvil_api::v1::{
 };
 use anvil_consensus::{DecisionRaft, NodeId};
 use anvil_store::{
-    AuthzSchemaPublicationMutation, LogicalRecordApplied, LogicalRecordCandidate, LogicalRecordId,
-    LogicalRecordMutation, LogicalRecordSnapshotApplied, LogicalRecordValue, ObjectHeadChange,
-    PlacementLogId, ProgramPathMutation, ProgramPathStage, ReferenceProof,
-    ReplicaAuthzSchemaPublicationApplied, SourceId, TupleBatchReceipt, TupleBatchRequest,
-    VersionId, WatchJournalStatus,
+    AuthzSchemaPublicationMutation, DefinitionKind, DefinitionMutationIntent, LogicalRecordApplied,
+    LogicalRecordCandidate, LogicalRecordId, LogicalRecordMutation, LogicalRecordSnapshotApplied,
+    LogicalRecordValue, ObjectHeadChange, PlacementLogId, ProgramPathMutation, ProgramPathStage,
+    ReferenceProof, ReplicaAuthzSchemaPublicationApplied, SourceId, TupleBatchReceipt,
+    TupleBatchRequest, VersionId, WatchJournalStatus,
 };
 use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
@@ -120,6 +120,8 @@ impl ClusterPeerTransport {
             .client(target, address)?
             .flush_accounting_traffic(wire::FlushAccountingTrafficRequest {
                 peer: Some(self.context(placement.fence(), 0, MAX_CLUSTER_OPERATION_TIME)?),
+                tenant_id: value.tenant_id,
+                bucket_id: value.bucket_id,
                 accounting_id: value.accounting_id,
                 source_node_id: value.source_node.0,
                 accepted_inbound_bytes: value.accepted_inbound_bytes,
@@ -132,6 +134,90 @@ impl ClusterPeerTransport {
         Ok(response.replayed)
     }
 
+    pub(crate) async fn match_accounting_traffic(
+        &self,
+        target: NodeId,
+        address: &str,
+        value: &super::AccountingTrafficBatch,
+    ) -> Result<(), Status> {
+        if value.source_node != self.data.peer_identity().1 {
+            return Err(Status::invalid_argument(
+                "accounting traffic batch source is not the local node",
+            ));
+        }
+        let placement = self.placement()?;
+        let response = self
+            .client(target, address)?
+            .match_accounting_traffic(wire::MatchAccountingTrafficRequest {
+                peer: Some(self.context(placement.fence(), 0, MAX_CLUSTER_OPERATION_TIME)?),
+                source_node_id: value.source_node.0,
+                source_epoch: value.source_epoch.to_vec(),
+                sequence: value.sequence,
+                tenant_id: value.tenant_id,
+                bucket_id: value.bucket_id,
+                entries: value
+                    .entries
+                    .iter()
+                    .map(|entry| wire::AccountingTrafficEntry {
+                        exact_path: entry.exact_path.clone(),
+                        accepted_inbound_bytes: entry.accepted_inbound_bytes,
+                        served_outbound_bytes: entry.served_outbound_bytes,
+                    })
+                    .collect(),
+            })
+            .await?
+            .into_inner();
+        require_response_schema(response.schema_version)
+    }
+
+    pub(crate) async fn invalidate_accounting_matcher_bucket(
+        &self,
+        target: NodeId,
+        address: &str,
+        tenant_id: u64,
+        bucket_id: u64,
+        expected_fence: PlacementLogId,
+    ) -> Result<(), Status> {
+        let placement = self.placement()?;
+        if placement.fence() != expected_fence {
+            return Err(Status::unavailable(
+                "accounting matcher invalidation placement changed",
+            ));
+        }
+        let response = self
+            .client(target, address)?
+            .invalidate_accounting_matcher_bucket(wire::InvalidateAccountingMatcherBucketRequest {
+                peer: Some(self.context(expected_fence, 0, MAX_CLUSTER_OPERATION_TIME)?),
+                tenant_id,
+                bucket_id,
+            })
+            .await?
+            .into_inner();
+        require_response_schema(response.schema_version)
+    }
+
+    pub(crate) async fn clear_accounting_matcher_cache(
+        &self,
+        target: NodeId,
+        address: &str,
+        expected_fence: PlacementLogId,
+    ) -> Result<(), Status> {
+        let placement = self.placement()?;
+        if placement.fence() != expected_fence {
+            return Err(Status::unavailable(
+                "accounting matcher cache-clear placement changed",
+            ));
+        }
+        let response = self
+            .client(target, address)?
+            .clear_accounting_matcher_cache(wire::ClearAccountingMatcherCacheRequest {
+                peer: Some(self.context(expected_fence, 0, MAX_CLUSTER_OPERATION_TIME)?),
+            })
+            .await?
+            .into_inner();
+        require_response_schema(response.schema_version)
+    }
+
     pub(crate) fn new(data: DataPeerTransport, decisions: DecisionRaft) -> Self {
         Self { data, decisions }
     }
@@ -140,23 +226,35 @@ impl ClusterPeerTransport {
         &self,
         target: NodeId,
         address: &str,
+        expected_fence: PlacementLogId,
         request: &IndexArtifactPublish,
     ) -> Result<IndexArtifactOutcome, Status> {
-        let placement = self.placement()?;
         let response = self
             .client(target, address)?
-            .publish_index_artifact(wire::PublishIndexArtifactRequest {
-                peer: Some(self.context(placement.fence(), 0, MAX_CLUSTER_OPERATION_TIME)?),
-                storage_tenant: request.storage_tenant.clone(),
-                bucket: request.bucket.clone(),
-                tenant_id: request.tenant_id,
-                bucket_id: request.bucket_id,
-                index_id: request.index_id,
-                exact_path: request.exact_path.clone(),
-                blob_blake3: request.blob.hash.to_vec(),
-                blob_length: request.blob.length,
-                expected_version: request.expected_version.map(|version| version.0),
-                command_id: request.command_id.clone(),
+            .publish_index_artifact(wire_index_artifact_publish(
+                request,
+                Some(self.context(expected_fence, 0, MAX_CLUSTER_OPERATION_TIME)?),
+            ))
+            .await?
+            .into_inner();
+        require_response_schema(response.schema_version)?;
+        nonzero_artifact_outcome(response.version, response.replayed)
+    }
+
+    pub(crate) async fn commit_guarded_index_artifact(
+        &self,
+        target: NodeId,
+        address: &str,
+        expected_fence: PlacementLogId,
+        builder: NodeId,
+        request: &IndexArtifactPublish,
+    ) -> Result<IndexArtifactOutcome, Status> {
+        let response = self
+            .client(target, address)?
+            .commit_guarded_index_artifact(wire::CommitGuardedIndexArtifactRequest {
+                peer: Some(self.context(expected_fence, 0, MAX_CLUSTER_OPERATION_TIME)?),
+                builder_node_id: builder.0,
+                publication: Some(wire_index_artifact_publish(request, None)),
             })
             .await?
             .into_inner();
@@ -183,6 +281,7 @@ impl ClusterPeerTransport {
                 exact_path: request.exact_path.clone(),
                 expected_version: request.expected_version.0,
                 command_id: request.command_id.clone(),
+                definition_kind: routed_definition_kind(request.definition_intent),
             })
             .await?
             .into_inner();
@@ -200,19 +299,11 @@ impl ClusterPeerTransport {
         let placement = self.placement()?;
         let fence = placement.fence();
         let scope = match scope {
-            super::IndexHeadScanScope::Definitions => {
-                wire::scan_index_heads_request::Scope::Definitions(wire::AllIndexDefinitionHeads {})
-            }
-            super::IndexHeadScanScope::AccountingDefinitions => {
-                wire::scan_index_heads_request::Scope::AccountingDefinitions(
-                    wire::AllAccountingDefinitionHeads {},
-                )
-            }
-            super::IndexHeadScanScope::Generation {
+            super::IndexHeadScanScope::Artifacts {
                 tenant_id,
                 bucket_id,
                 index_id,
-            } => wire::scan_index_heads_request::Scope::Generation(wire::IndexGenerationHeads {
+            } => wire::scan_index_heads_request::Scope::Artifacts(wire::IndexArtifactHeads {
                 tenant_id,
                 bucket_id,
                 index_id,
@@ -228,28 +319,6 @@ impl ClusterPeerTransport {
                 index_id,
                 run_blake3: run_hash.to_vec(),
             }),
-            super::IndexHeadScanScope::SourceObjects {
-                tenant_id,
-                bucket_id,
-                path_prefix,
-            } => {
-                wire::scan_index_heads_request::Scope::SourceObjects(wire::IndexSourceObjectHeads {
-                    tenant_id,
-                    bucket_id,
-                    path_prefix,
-                })
-            }
-            super::IndexHeadScanScope::AccountingSourceObjects {
-                tenant_id,
-                bucket_id,
-                path_prefix,
-            } => wire::scan_index_heads_request::Scope::AccountingSourceObjects(
-                wire::AccountingSourceObjectHeads {
-                    tenant_id,
-                    bucket_id,
-                    path_prefix,
-                },
-            ),
         };
         let response = self
             .client(target, address)?
@@ -311,7 +380,6 @@ impl ClusterPeerTransport {
         super::index_snapshot::require_snapshot_frame_bound(max_frame_bytes)?;
         let placement = self.placement()?;
         let fence = placement.fence();
-        let deadline = tokio::time::Instant::now() + MAX_INDEX_SOURCE_SNAPSHOT_TIME;
         let (requests, receiver) = tokio::sync::mpsc::channel(1);
         requests
             .send(wire::IndexSourceSnapshotRequest {
@@ -333,13 +401,12 @@ impl ClusterPeerTransport {
             .await
             .map_err(|_| Status::unavailable("index snapshot request stream closed"))?;
         let mut request = Request::new(tokio_stream::wrappers::ReceiverStream::new(receiver));
-        request.set_timeout(MAX_INDEX_SOURCE_SNAPSHOT_TIME);
         let mut stream = self
             .client(target, address)?
             .scan_index_source_snapshot(request)
             .await?
             .into_inner();
-        let response = tokio::time::timeout_at(deadline, stream.message())
+        let response = tokio::time::timeout(MAX_INDEX_SOURCE_SNAPSHOT_TIME, stream.message())
             .await
             .map_err(|_| Status::deadline_exceeded("index source snapshot deadline exceeded"))??
             .ok_or_else(|| {
@@ -360,7 +427,70 @@ impl ClusterPeerTransport {
             requests,
             stream,
             begun,
-            deadline,
+            MAX_INDEX_SOURCE_SNAPSHOT_TIME,
+        )
+    }
+
+    pub(crate) async fn scan_retained_source_snapshot(
+        &self,
+        target: NodeId,
+        address: &str,
+        tenant_id: u64,
+        bucket_id: u64,
+        path_prefix: String,
+        max_frame_bytes: u64,
+    ) -> Result<super::RetainedSourceSnapshot, Status> {
+        super::index_snapshot::require_snapshot_frame_bound(max_frame_bytes)?;
+        let placement = self.placement()?;
+        let fence = placement.fence();
+        let (requests, receiver) = tokio::sync::mpsc::channel(1);
+        requests
+            .send(wire::RetainedSourceSnapshotRequest {
+                command: Some(wire::retained_source_snapshot_request::Command::Begin(
+                    wire::RetainedSourceSnapshotBegin {
+                        peer: Some(self.context_with_timeout_limit(
+                            fence,
+                            0,
+                            MAX_INDEX_SOURCE_SNAPSHOT_TIME,
+                            MAX_INDEX_SOURCE_SNAPSHOT_TIME,
+                        )?),
+                        tenant_id,
+                        bucket_id,
+                        path_prefix,
+                        max_frame_bytes,
+                    },
+                )),
+            })
+            .await
+            .map_err(|_| Status::unavailable("retained snapshot request stream closed"))?;
+        let request = Request::new(tokio_stream::wrappers::ReceiverStream::new(receiver));
+        let mut stream = self
+            .client(target, address)?
+            .scan_retained_source_snapshot(request)
+            .await?
+            .into_inner();
+        let response = tokio::time::timeout(MAX_INDEX_SOURCE_SNAPSHOT_TIME, stream.message())
+            .await
+            .map_err(|_| Status::deadline_exceeded("retained source snapshot deadline exceeded"))??
+            .ok_or_else(|| {
+                Status::data_loss("retained source snapshot returned no acknowledgement")
+            })?;
+        let begun = match response.event {
+            Some(wire::retained_source_snapshot_response::Event::Begun(begun)) => begun,
+            Some(wire::retained_source_snapshot_response::Event::Frame(_)) | None => {
+                return Err(Status::data_loss(
+                    "retained source snapshot did not begin with an acknowledgement",
+                ));
+            }
+        };
+        super::index_snapshot::open_client_retained_snapshot(
+            target,
+            self.decisions.clone(),
+            fence,
+            requests,
+            stream,
+            begun,
+            MAX_INDEX_SOURCE_SNAPSHOT_TIME,
         )
     }
 
@@ -505,6 +635,7 @@ impl ClusterPeerTransport {
         let mut request = Request::new(wire::RouteBulkWriteRequest {
             peer: Some(self.context(fence, 1, remaining)?),
             request: Some(value),
+            definition_intents: Vec::new(),
         });
         add_bearer_and_timeout(&mut request, bearer, remaining)?;
         Ok(self
@@ -541,12 +672,31 @@ impl ClusterPeerTransport {
         address: &str,
         bearer: &str,
         value: BulkWriteRequest,
+        definition_intents: Vec<(usize, DefinitionMutationIntent)>,
         remaining: Duration,
     ) -> Result<BulkWriteResponse, Status> {
         let fence = self.placement()?.fence();
+        let definition_intents = definition_intents
+            .into_iter()
+            .map(|(operation_index, intent)| {
+                let operation_index = u32::try_from(operation_index).map_err(|_| {
+                    Status::invalid_argument("definition intent operation index is too large")
+                })?;
+                let kind = match intent.kind {
+                    DefinitionKind::Index => wire::RoutedDefinitionKind::Index,
+                    DefinitionKind::Accounting => wire::RoutedDefinitionKind::Accounting,
+                };
+                Ok(wire::RoutedDefinitionMutationIntent {
+                    operation_index,
+                    kind: kind as i32,
+                    definition_id: intent.definition_id,
+                })
+            })
+            .collect::<Result<Vec<_>, Status>>()?;
         let mut request = Request::new(wire::RouteBulkWriteRequest {
             peer: Some(self.context(fence, 1, remaining)?),
             request: Some(value),
+            definition_intents,
         });
         add_bearer_and_timeout(&mut request, bearer, remaining)?;
         Ok(self
@@ -882,6 +1032,49 @@ impl ClusterPeerTransport {
     }
 }
 
+fn wire_index_artifact_publish(
+    request: &IndexArtifactPublish,
+    peer: Option<wire::PeerContext>,
+) -> wire::PublishIndexArtifactRequest {
+    wire::PublishIndexArtifactRequest {
+        peer,
+        storage_tenant: request.storage_tenant.clone(),
+        bucket: request.bucket.clone(),
+        tenant_id: request.tenant_id,
+        bucket_id: request.bucket_id,
+        index_id: request.index_id,
+        exact_path: request.exact_path.clone(),
+        blob_blake3: request.blob.hash.to_vec(),
+        blob_length: request.blob.length,
+        expected_version: request.expected_version.map(|version| version.0),
+        command_id: request.command_id.clone(),
+        definition_kind: routed_definition_kind(request.definition_intent),
+        guarded_definition_kind: routed_kind(
+            request.definition_guard.as_ref().map(|guard| guard.kind),
+        ),
+        guarded_definition_path: request
+            .definition_guard
+            .as_ref()
+            .map_or_else(String::new, |guard| guard.exact_path.clone()),
+        guarded_definition_version: request
+            .definition_guard
+            .as_ref()
+            .map_or(0, |guard| guard.expected_version.0),
+    }
+}
+
+fn routed_definition_kind(intent: Option<DefinitionMutationIntent>) -> i32 {
+    routed_kind(intent.map(|intent| intent.kind))
+}
+
+fn routed_kind(kind: Option<DefinitionKind>) -> i32 {
+    match kind {
+        Some(DefinitionKind::Index) => wire::RoutedDefinitionKind::Index as i32,
+        Some(DefinitionKind::Accounting) => wire::RoutedDefinitionKind::Accounting as i32,
+        None => wire::RoutedDefinitionKind::Unspecified as i32,
+    }
+}
+
 #[tonic::async_trait]
 impl LogicalRecordReplicaTransport for ClusterPeerTransport {
     async fn read_candidate(
@@ -1065,6 +1258,7 @@ impl ClusterWatchSources for ClusterPeerTransport {
                 status: parse_watch_status(
                     &response.source_id_json,
                     response.tail,
+                    response.settled_through,
                     response.retention_floor,
                     response.retained_entries,
                     response.retained_bytes,
@@ -1109,6 +1303,7 @@ impl ClusterWatchSources for ClusterPeerTransport {
             let status = parse_watch_status(
                 &response.source_id_json,
                 response.tail,
+                response.settled_through,
                 response.retention_floor,
                 response.retained_entries,
                 response.retained_bytes,
@@ -1137,6 +1332,7 @@ impl ClusterWatchSources for ClusterPeerTransport {
 fn parse_watch_status(
     encoded_source: &[u8],
     tail: u64,
+    settled_through: u64,
     retention_floor: u64,
     retained_entries: u64,
     retained_bytes: u64,
@@ -1144,6 +1340,7 @@ fn parse_watch_status(
     Ok(WatchJournalStatus {
         source_id: decode_json::<SourceId>(encoded_source)?,
         tail,
+        settled_through,
         retention_floor,
         retained_entries,
         retained_bytes,
@@ -1180,11 +1377,15 @@ fn validate_index_head(head: &super::IndexCurrentHead) -> Result<(), Status> {
         || head.bucket_id == 0
         || head.exact_path.is_empty()
         || head.head.version.0 == 0
-        || head.head.version != head.version.id
-        || head.head.deleted != head.version.deleted
+        || head.version.id.0 == 0
+        || head.version.id > head.head.version
+        || head.versions.len() != 1
+        || head.versions.first() != Some(&head.version)
+        || (head.head.version == head.version.id && head.head.deleted != head.version.deleted)
+        || head.version.deleted != head.version.blob.is_none()
     {
         return Err(Status::data_loss(
-            "index head scan returned an invalid current-head snapshot",
+            "index head scan returned an invalid retained descriptor",
         ));
     }
     Ok(())

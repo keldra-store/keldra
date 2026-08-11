@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::io::{self, Read};
+use std::io::Read;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -15,12 +15,13 @@ use anvil_consensus::{
     PeerTlsConnector, PeerTlsError, authorize_peer_rpc,
 };
 use anvil_store::{
-    AuthzRealmMutation, BlobReader, BlobRef, CompleteCopySealOutcome, ErasureCodec, ErasureProfile,
-    LocalChange, MAX_LOCAL_INVALIDATION_SCAN_RECORDS, MAX_OBJECT_RECORD_EXPORT_BYTES,
-    MutationError, ObjectKey, ObjectMutation, ObjectPathSnapshot, ObjectSnapshotApplied,
-    ObjectSnapshotError, PayloadStoreError, ReferenceDeltaApplied, ReferenceDeltaBatch,
-    ReplicaAuthzRealmMutationApplied, ReplicaObjectMutationApplied, RetainedVersionDeleteMutation,
-    ShardIdentity, ShardSealOutcome, ShardStoreError, SourceId, Store, WatchJournalStatus,
+    AuthzRealmMutation, BlobRef, CompleteCopySealOutcome, CurrentObjectSnapshot, ErasureCodec,
+    ErasureProfile, LocalChange, MAX_LOCAL_INVALIDATION_SCAN_RECORDS,
+    MAX_OBJECT_RECORD_EXPORT_BYTES, MutationError, ObjectKey, ObjectMutation, ObjectPathSnapshot,
+    ObjectSnapshotApplied, ObjectSnapshotError, PayloadStoreError, ReferenceDeltaApplied,
+    ReferenceDeltaBatch, ReplicaAuthzRealmMutationApplied, ReplicaObjectMutationApplied,
+    RetainedVersionDeleteMutation, ShardIdentity, ShardSealOutcome, ShardStoreError, SourceId,
+    Store, WatchJournalStatus,
 };
 use hyper_util::rt::TokioIo;
 use tokio::io::AsyncWriteExt;
@@ -31,6 +32,7 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status, Streaming};
 
 mod cutover;
+mod definition_coordination;
 mod errors;
 mod handoff;
 mod handoff_scope;
@@ -39,6 +41,7 @@ mod object_mutation;
 mod object_snapshot;
 mod retained_version_delete;
 mod source_journal;
+mod stream;
 mod timeout;
 mod transport;
 mod typed_json;
@@ -50,6 +53,7 @@ use mutation_admission::MutationAdmission;
 use object_snapshot::{
     encode_object_snapshot, map_object_snapshot_error, require_object_snapshot_bound,
 };
+use stream::{next_stream_message, require_large_blob, stream_blob, validate_stream_frame};
 use timeout::effective_timeout;
 pub(crate) use transport::{DataPeerTransport, RemoteMutationDrain};
 use typed_json::{decode_typed, encode_page, encode_typed, require_typed_bound};
@@ -276,6 +280,13 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
         self.read_object_path_snapshot_call(request).await
     }
 
+    async fn read_current_object_snapshot(
+        &self,
+        request: Request<wire::ObjectPathSnapshotRequest>,
+    ) -> Result<Response<wire::CurrentObjectSnapshotResponse>, Status> {
+        self.read_current_object_snapshot_call(request).await
+    }
+
     async fn repair_object_path_snapshot(
         &self,
         request: Request<wire::RepairObjectPathSnapshotRequest>,
@@ -379,6 +390,55 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
         request: Request<wire::SourceJournalReadRequest>,
     ) -> Result<Response<wire::SourceJournalPage>, Status> {
         source_journal::read(self, request).await
+    }
+
+    async fn read_routed_source_journal(
+        &self,
+        request: Request<wire::RoutedSourceJournalReadRequest>,
+    ) -> Result<Response<wire::RoutedSourceJournalPage>, Status> {
+        definition_coordination::read_routed_source_journal(self, request).await
+    }
+
+    async fn apply_definition_assignment_page(
+        &self,
+        request: Request<wire::ApplyDefinitionAssignmentPageRequest>,
+    ) -> Result<Response<wire::DefinitionAssignmentPageApplied>, Status> {
+        definition_coordination::apply_definition_assignment_page(self, request).await
+    }
+
+    async fn get_definition_checkpoint(
+        &self,
+        request: Request<wire::DefinitionCheckpointRequest>,
+    ) -> Result<Response<wire::DefinitionCheckpointState>, Status> {
+        definition_coordination::get_definition_checkpoint(self, request).await
+    }
+
+    async fn apply_definition_assignments(
+        &self,
+        request: Request<wire::ApplyDefinitionAssignmentsRequest>,
+    ) -> Result<Response<wire::DefinitionAssignmentPageApplied>, Status> {
+        definition_coordination::apply_definition_assignments(self, request).await
+    }
+
+    async fn scan_definition_locators_by_bucket(
+        &self,
+        request: Request<wire::DefinitionLocatorScanRequest>,
+    ) -> Result<Response<wire::DefinitionLocatorScanPage>, Status> {
+        definition_coordination::scan_definition_locators_by_bucket(self, request).await
+    }
+
+    async fn scan_definition_locators_by_kind(
+        &self,
+        request: Request<wire::DefinitionLocatorKindScanRequest>,
+    ) -> Result<Response<wire::DefinitionLocatorScanPage>, Status> {
+        definition_coordination::scan_definition_locators_by_kind(self, request).await
+    }
+
+    async fn scan_definition_assignments_by_kind(
+        &self,
+        request: Request<wire::DefinitionAssignmentScanRequest>,
+    ) -> Result<Response<wire::DefinitionAssignmentScanPage>, Status> {
+        definition_coordination::scan_definition_assignments_by_kind(self, request).await
     }
 
     async fn small_content_exists(
@@ -942,88 +1002,10 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
     }
 }
 
-fn stream_blob(mut reader: BlobReader) -> ContentStream {
-    let (sender, receiver) = tokio::sync::mpsc::channel(2);
-    tokio::spawn(async move {
-        let mut offset = 0_u64;
-        let mut buffer = vec![0_u8; DATA_PEER_FRAME_BYTES];
-        loop {
-            match reader.read(&mut buffer).await {
-                Ok(0) => {
-                    let _ = sender.send(Ok(content_end(offset))).await;
-                    break;
-                }
-                Ok(read) => {
-                    let frame = content_frame(offset, buffer[..read].to_vec());
-                    offset += read as u64;
-                    if sender.send(Ok(frame)).await.is_err() {
-                        break;
-                    }
-                }
-                Err(error) => {
-                    let _ = sender.send(Err(Status::data_loss(error.to_string()))).await;
-                    break;
-                }
-            }
-        }
-    });
-    Box::pin(tokio_stream::wrappers::ReceiverStream::new(receiver))
-}
-
-async fn next_stream_message<T>(
-    stream: &mut Streaming<T>,
-    idle: Duration,
-    operation: &'static str,
-) -> Result<T, Status>
-where
-    T: prost::Message + Default,
-{
-    tokio::time::timeout(idle, stream.message())
-        .await
-        .map_err(|_| Status::deadline_exceeded(format!("{operation} made no progress")))??
-        .ok_or_else(|| Status::invalid_argument(format!("{operation} ended without end frame")))
-}
-
-fn validate_stream_frame(
-    expected_offset: u64,
-    content: &[u8],
-    actual_offset: u64,
-    end: bool,
-) -> Result<(), Status> {
-    if content.len() > DATA_PEER_FRAME_BYTES {
-        return Err(Status::resource_exhausted("peer frame exceeds 64 KiB"));
-    }
-    if actual_offset != expected_offset {
-        return Err(Status::invalid_argument(
-            "peer frame offset is not contiguous",
-        ));
-    }
-    if content.is_empty() && !end {
-        return Err(Status::invalid_argument(
-            "an empty peer frame must terminate its stream",
-        ));
-    }
-    Ok(())
-}
-
-fn require_large_blob(reference: &BlobRef, max_blob_bytes: u64) -> Result<(), Status> {
-    if reference.length <= anvil_store::SMALL_BLOB_MAX_BYTES as u64 {
-        return Err(Status::invalid_argument(
-            "operation requires content larger than 64 KiB",
-        ));
-    }
-    if reference.length > max_blob_bytes {
-        return Err(Status::resource_exhausted(
-            "content identity exceeds the configured maximum blob size",
-        ));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::io::Cursor;
+    use std::io::{Cursor, Read};
     use std::sync::{Arc, RwLock};
 
     use anvil_consensus::{
@@ -1282,6 +1264,15 @@ mod tests {
             "ReadObjectPathSnapshot"
         );
         require_denied!(
+            client.read_current_object_snapshot(wire::ObjectPathSnapshotRequest {
+                peer: Some(peer.clone()),
+                tenant_id: 0,
+                bucket_id: 0,
+                exact_path: String::new(),
+            }),
+            "ReadCurrentObjectSnapshot"
+        );
+        require_denied!(
             client.repair_object_path_snapshot(wire::RepairObjectPathSnapshotRequest {
                 peer: Some(peer.clone()),
                 tenant_id: 0,
@@ -1324,6 +1315,7 @@ mod tests {
             }),
             "ReadSourceJournal"
         );
+        definition_coordination::denied_test_calls!(client, peer, require_denied);
         require_denied!(client.small_content_exists(content()), "SmallContentExists");
         require_denied!(client.get_small_content(content()), "GetSmallContent");
         require_denied!(
@@ -1501,7 +1493,7 @@ mod tests {
             "InstallPayloadLifecycle"
         );
         assert_eq!(
-            denied, 40,
+            denied, 48,
             "the DataPeer RPC list changed without updating this test"
         );
     }
@@ -1634,6 +1626,7 @@ mod tests {
                 deleted: true,
                 committed_at_unix_millis: 1,
             }],
+            definition_locator: None,
         });
         store
             .repair_object_path_snapshot(tenant_id, bucket_id, exact_path, None, snapshot.as_ref())
@@ -1646,6 +1639,14 @@ mod tests {
                 .unwrap(),
             snapshot
         );
+        let current = joining
+            .read_current_object_snapshot(NodeId(1), &address, tenant_id, bucket_id, exact_path)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.exact_path, exact_path);
+        assert_eq!(current.head, snapshot.as_ref().unwrap().head);
+        assert_eq!(current.version, snapshot.as_ref().unwrap().versions[0]);
         let stale = joining
             .repair_object_path_snapshot(
                 NodeId(1),

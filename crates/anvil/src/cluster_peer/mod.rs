@@ -38,7 +38,9 @@ pub(crate) mod wire {
 }
 
 pub(crate) use accounting::{
-    AccountingTrafficFlush, RoutedAccountingHandler, RoutedAccountingHandlers,
+    AccountingTrafficBatch, AccountingTrafficEntry, AccountingTrafficFlush,
+    MAX_ACCOUNTING_TRAFFIC_ENTRIES, MAX_ACCOUNTING_TRAFFIC_LOGICAL_BYTES, RoutedAccountingHandler,
+    RoutedAccountingHandlers, accounting_traffic_entry_logical_bytes,
 };
 pub(crate) use authz::LateBoundFreshAuthorization;
 pub(crate) use control::LateBoundDistributedControl;
@@ -47,7 +49,9 @@ pub(crate) use index_queries::{
     AuthorizedIndexQueryHandler, LocalIndexQueryExecutor, LocalIndexQueryRequest,
     RoutedIndexQueryHandlers, RoutedIndexQueryRequest,
 };
-pub(crate) use index_snapshot::{IndexSourceSnapshot, IndexSourceSnapshotHead};
+pub(crate) use index_snapshot::{
+    IndexSourceSnapshot, IndexSourceSnapshotHead, RetainedSourceSnapshot,
+};
 pub(crate) use public_authz::{RoutedAuthzHandler, RoutedAuthzHandlers};
 pub(crate) use routing::{RoutedCall, RoutedPublicHandler, RoutedPublicHandlers};
 pub(crate) use transport::ClusterPeerTransport;

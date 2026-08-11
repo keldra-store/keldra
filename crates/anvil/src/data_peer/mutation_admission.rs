@@ -136,6 +136,52 @@ impl MutationAdmission {
         Ok(placement.fence)
     }
 
+    pub(super) fn definition_checkpoint(
+        &self,
+        peer: AuthenticatedPeer,
+        source_node_id: u16,
+    ) -> Result<PlacementLogId, Status> {
+        let placement = self.current()?;
+        self.require_active_peer(peer, &placement)?;
+        if peer.node_id.0 != u64::from(source_node_id) {
+            return Err(Status::permission_denied(
+                "definition checkpoint source does not match the authenticated peer",
+            ));
+        }
+        self.require_local_active(&placement)?;
+        Ok(placement.fence)
+    }
+
+    pub(super) fn definition_assignments(
+        &self,
+        peer: AuthenticatedPeer,
+        expected_fence: PlacementLogId,
+    ) -> Result<PlacementLogId, Status> {
+        let placement = self.current()?;
+        self.require_active_peer(peer, &placement)?;
+        self.require_local_active(&placement)?;
+        if placement.fence != expected_fence {
+            return Err(Status::unavailable(
+                "definition assignment carries a stale placement fence",
+            ));
+        }
+        Ok(placement.fence)
+    }
+
+    pub(super) fn definition_assignment_page(
+        &self,
+        peer: AuthenticatedPeer,
+        source_node_id: u16,
+        expected_fence: PlacementLogId,
+    ) -> Result<PlacementLogId, Status> {
+        if peer.node_id.0 != u64::from(source_node_id) {
+            return Err(Status::permission_denied(
+                "definition assignment source does not match the authenticated peer",
+            ));
+        }
+        self.definition_assignments(peer, expected_fence)
+    }
+
     pub(super) fn require_fence(&self, expected: PlacementLogId) -> Result<(), Status> {
         if self.current()?.fence != expected {
             return Err(Status::unavailable(
@@ -205,6 +251,20 @@ impl MutationAdmission {
             ));
         }
         Ok(())
+    }
+
+    fn require_local_active(&self, placement: &AdmissionPlacement) -> Result<(), Status> {
+        if placement
+            .nodes
+            .iter()
+            .any(|node| node.node_id() == self.local_node)
+        {
+            Ok(())
+        } else {
+            Err(Status::failed_precondition(
+                "definition assignment was sent to a node outside current ACTIVE placement",
+            ))
+        }
     }
 
     fn current(&self) -> Result<AdmissionPlacement, Status> {
@@ -407,6 +467,25 @@ mod tests {
                 .unwrap_err()
                 .code(),
             Code::FailedPrecondition
+        );
+    }
+
+    #[test]
+    fn definition_assignment_page_cannot_advance_another_sources_checkpoint() {
+        let authority =
+            MutationAdmission::fixed(cluster_id(), NodeId(1), [NodeId(1), NodeId(2), NodeId(3)]);
+        let fence = authority.current().unwrap().fence;
+        assert_eq!(
+            authority
+                .definition_assignment_page(peer(2), 3, fence)
+                .unwrap_err()
+                .code(),
+            Code::PermissionDenied
+        );
+        assert!(
+            authority
+                .definition_assignment_page(peer(2), 2, fence)
+                .is_ok()
         );
     }
 }

@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 
 use anvil_api::v1::{
@@ -6,7 +7,7 @@ use anvil_api::v1::{
     InvokeProgramResponse, MutationReceipt, PutToken, SetBucketPolicyRequest,
 };
 use anvil_consensus::NodeId;
-use anvil_store::PlacementLogId;
+use anvil_store::{DefinitionKind, DefinitionMutationIntent, PlacementLogId};
 use prost::Message;
 use tonic::metadata::MetadataMap;
 use tonic::{Request, Response, Status};
@@ -24,6 +25,7 @@ pub(crate) struct RoutedCall<T> {
     source_node: NodeId,
     placement_fence: PlacementLogId,
     request: T,
+    definition_intents: Vec<(usize, DefinitionMutationIntent)>,
 }
 
 impl<T> RoutedCall<T> {
@@ -41,6 +43,10 @@ impl<T> RoutedCall<T> {
 
     pub(crate) fn request(&self) -> &T {
         &self.request
+    }
+
+    pub(crate) fn definition_intents(&self) -> &[(usize, DefinitionMutationIntent)] {
+        &self.definition_intents
     }
 
     pub(crate) fn into_request(self) -> T {
@@ -190,6 +196,11 @@ impl ClusterPeerService {
                 "routed bulk must contain 1..=1000 items within 64 MiB",
             ));
         }
+        if !request.get_ref().definition_intents.is_empty() {
+            return Err(Status::permission_denied(
+                "definition mutation evidence is valid only on the internal bulk route",
+            ));
+        }
         let (call, timeout) = self.routed_call(&request, request.get_ref().peer.as_ref(), bulk)?;
         let fence = call.placement_fence;
         let response = tokio::time::timeout(timeout, self.routed.get()?.bulk_write(call))
@@ -257,7 +268,13 @@ impl ClusterPeerService {
                 "routed internal bulk must contain 1..=1000 items within 64 MiB",
             ));
         }
-        let (call, timeout) = self.routed_call(&request, request.get_ref().peer.as_ref(), bulk)?;
+        let definition_intents = decode_definition_intents(
+            &request.get_ref().definition_intents,
+            bulk.operations.len(),
+        )?;
+        let (mut call, timeout) =
+            self.routed_call(&request, request.get_ref().peer.as_ref(), bulk)?;
+        call.definition_intents = definition_intents;
         let fence = call.placement_fence;
         let response = tokio::time::timeout(timeout, self.routed.get()?.internal_bulk_write(call))
             .await
@@ -336,6 +353,7 @@ impl ClusterPeerService {
                 source_node: admitted.authenticated.node_id,
                 placement_fence: admitted.placement.fence(),
                 request: value,
+                definition_intents: Vec::new(),
             },
             admitted.timeout,
         ))
@@ -356,6 +374,40 @@ impl ClusterPeerService {
             ))
         }
     }
+}
+
+fn decode_definition_intents(
+    values: &[wire::RoutedDefinitionMutationIntent],
+    operation_count: usize,
+) -> Result<Vec<(usize, DefinitionMutationIntent)>, Status> {
+    if values.len() > operation_count {
+        return Err(Status::invalid_argument(
+            "too many routed definition mutation intents",
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    let mut intents = Vec::with_capacity(values.len());
+    for value in values {
+        let operation_index = value.operation_index as usize;
+        if operation_index >= operation_count || !seen.insert(operation_index) {
+            return Err(Status::invalid_argument(
+                "routed definition mutation intent has an invalid operation index",
+            ));
+        }
+        let kind = match wire::RoutedDefinitionKind::try_from(value.kind) {
+            Ok(wire::RoutedDefinitionKind::Index) => DefinitionKind::Index,
+            Ok(wire::RoutedDefinitionKind::Accounting) => DefinitionKind::Accounting,
+            Ok(wire::RoutedDefinitionKind::Unspecified) | Err(_) => {
+                return Err(Status::invalid_argument(
+                    "routed definition mutation intent has an invalid kind",
+                ));
+            }
+        };
+        let intent = DefinitionMutationIntent::new(kind, value.definition_id)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        intents.push((operation_index, intent));
+    }
+    Ok(intents)
 }
 
 fn bearer_from_metadata(metadata: &MetadataMap) -> Result<Arc<str>, Status> {

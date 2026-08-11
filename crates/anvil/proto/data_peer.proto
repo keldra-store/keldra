@@ -60,6 +60,14 @@ message ObjectPathSnapshotResponse {
   bytes snapshot_json = 2;
 }
 
+// `snapshot_json` is the typed JSON encoding of
+// `Option<anvil_store::CurrentObjectSnapshot>`; it contains exactly the
+// current head and the immutable descriptor named by that head.
+message CurrentObjectSnapshotResponse {
+  uint32 schema_version = 1;
+  bytes snapshot_json = 2;
+}
+
 message RepairObjectPathSnapshotRequest {
   PeerContext peer = 1;
   uint64 tenant_id = 2;
@@ -111,6 +119,7 @@ message SourceJournalStatus {
   uint64 retention_floor = 4;
   uint64 retained_entries = 5;
   uint64 retained_bytes = 6;
+  uint64 settled_through = 7;
 }
 
 message SourceJournalReadRequest {
@@ -127,6 +136,157 @@ message SourceJournalPage {
   uint64 oversize_offset = 4;
   uint64 oversize_encoded_bytes = 5;
   bytes source_id_json = 6;
+}
+
+enum RoutedJournalKind {
+  ROUTED_JOURNAL_KIND_UNSPECIFIED = 0;
+  ROUTED_JOURNAL_KIND_INDEX_DEFINITIONS = 1;
+  ROUTED_JOURNAL_KIND_ACCOUNTING_DEFINITIONS = 2;
+  ROUTED_JOURNAL_KIND_BUCKET = 3;
+}
+
+message RoutedSourceJournalReadRequest {
+  PeerContext peer = 1;
+  RoutedJournalKind route = 2;
+  uint64 tenant_id = 3;
+  uint64 bucket_id = 4;
+  bytes source_id_json = 5;
+  uint64 after_offset = 6;
+  uint64 target_offset = 7;
+  uint32 limit = 8;
+  uint64 max_bytes = 9;
+}
+
+message RoutedSourceJournalPage {
+  uint32 schema_version = 1;
+  repeated bytes changes_json = 2;
+  uint64 encoded_bytes = 3;
+  uint64 source_node_id = 4;
+  bytes source_epoch = 5;
+  uint64 through_offset = 6;
+  uint64 oversize_offset = 7;
+  uint64 oversize_encoded_bytes = 8;
+}
+
+enum PrivateDefinitionKind {
+  PRIVATE_DEFINITION_KIND_UNSPECIFIED = 0;
+  PRIVATE_DEFINITION_KIND_INDEX = 1;
+  PRIVATE_DEFINITION_KIND_ACCOUNTING = 2;
+}
+
+enum PrivateDefinitionConsumerKind {
+  PRIVATE_DEFINITION_CONSUMER_KIND_UNSPECIFIED = 0;
+  PRIVATE_DEFINITION_CONSUMER_KIND_INDEX_ASSIGNMENTS = 1;
+  PRIVATE_DEFINITION_CONSUMER_KIND_ACCOUNTING_ASSIGNMENTS = 2;
+}
+
+enum DefinitionAssignmentOperation {
+  DEFINITION_ASSIGNMENT_OPERATION_UNSPECIFIED = 0;
+  DEFINITION_ASSIGNMENT_OPERATION_UPSERT = 1;
+  DEFINITION_ASSIGNMENT_OPERATION_REMOVE = 2;
+}
+
+message DefinitionAssignmentMutation {
+  DefinitionAssignmentOperation operation = 1;
+  PrivateDefinitionKind kind = 2;
+  uint64 tenant_id = 3;
+  uint64 bucket_id = 4;
+  uint64 definition_id = 5;
+  string definition_path = 6;
+  uint64 object_version = 7;
+  uint64 observed_fence_term = 8;
+  uint64 observed_fence_index = 9;
+  uint32 rank = 10;
+}
+
+message ApplyDefinitionAssignmentPageRequest {
+  PeerContext peer = 1;
+  repeated DefinitionAssignmentMutation mutations = 2;
+  PrivateDefinitionConsumerKind consumer_kind = 3;
+  uint64 source_node_id = 4;
+  bytes source_epoch = 5;
+  uint64 next_offset = 6;
+  uint64 observed_fence_term = 7;
+  uint64 observed_fence_index = 8;
+}
+
+message DefinitionAssignmentPageApplied {
+  uint32 schema_version = 1;
+  uint32 mutation_count = 2;
+}
+
+// Exact destination-side progress for one sparse definition source. The
+// source lazily reads this after restart and then caches successful advances;
+// it is not a sender-side journal or another authority.
+message DefinitionCheckpointRequest {
+  PeerContext peer = 1;
+  PrivateDefinitionConsumerKind consumer_kind = 2;
+  uint64 source_node_id = 3;
+}
+
+message DefinitionCheckpointState {
+  uint32 schema_version = 1;
+  bool present = 2;
+  PrivateDefinitionConsumerKind consumer_kind = 3;
+  uint64 source_node_id = 4;
+  bytes source_epoch = 5;
+  uint64 next_offset = 6;
+  uint64 observed_fence_term = 7;
+  uint64 observed_fence_index = 8;
+}
+
+// Membership cutover transfers only already-derived assignment records. It
+// does not advance a source checkpoint because an assignment does not retain
+// a second copy of its source-journal identity.
+message ApplyDefinitionAssignmentsRequest {
+  PeerContext peer = 1;
+  repeated DefinitionAssignmentMutation mutations = 2;
+}
+
+message DefinitionLocatorScanRequest {
+  PeerContext peer = 1;
+  PrivateDefinitionKind kind = 2;
+  uint64 tenant_id = 3;
+  uint64 bucket_id = 4;
+  bytes cursor = 5;
+  uint32 limit = 6;
+}
+
+message DefinitionLocatorRecord {
+  PrivateDefinitionKind kind = 1;
+  uint64 tenant_id = 2;
+  uint64 bucket_id = 3;
+  uint64 definition_id = 4;
+  string definition_path = 5;
+  uint64 object_version = 6;
+}
+
+message DefinitionLocatorScanPage {
+  uint32 schema_version = 1;
+  repeated DefinitionLocatorRecord locators = 2;
+  bytes next_cursor = 3;
+  bool has_more = 4;
+}
+
+message DefinitionLocatorKindScanRequest {
+  PeerContext peer = 1;
+  PrivateDefinitionKind kind = 2;
+  bytes cursor = 3;
+  uint32 limit = 4;
+}
+
+message DefinitionAssignmentScanRequest {
+  PeerContext peer = 1;
+  PrivateDefinitionKind kind = 2;
+  bytes cursor = 3;
+  uint32 limit = 4;
+}
+
+message DefinitionAssignmentScanPage {
+  uint32 schema_version = 1;
+  repeated DefinitionAssignmentMutation assignments = 2;
+  bytes next_cursor = 3;
+  bool has_more = 4;
 }
 
 message BlobIdentity {
@@ -347,6 +507,7 @@ service DataPeer {
   rpc ApplyObjectMutation(TypedMutationRequest) returns (ObjectMutationApplied);
   rpc ApplyRetainedVersionDelete(TypedMutationRequest) returns (RetainedVersionDeleteApplied);
   rpc ReadObjectPathSnapshot(ObjectPathSnapshotRequest) returns (ObjectPathSnapshotResponse);
+  rpc ReadCurrentObjectSnapshot(ObjectPathSnapshotRequest) returns (CurrentObjectSnapshotResponse);
   rpc RepairObjectPathSnapshot(RepairObjectPathSnapshotRequest) returns (ObjectPathSnapshotApplied);
   rpc ApplyAuthzRealmMutation(TypedMutationRequest) returns (AuthzRealmMutationApplied);
   rpc ApplyReferenceDeltas(TypedMutationRequest) returns (ReferenceDeltaApplied);
@@ -354,6 +515,13 @@ service DataPeer {
 
   rpc GetSourceJournalStatus(SourceJournalStatusRequest) returns (SourceJournalStatus);
   rpc ReadSourceJournal(SourceJournalReadRequest) returns (SourceJournalPage);
+  rpc ReadRoutedSourceJournal(RoutedSourceJournalReadRequest) returns (RoutedSourceJournalPage);
+  rpc GetDefinitionCheckpoint(DefinitionCheckpointRequest) returns (DefinitionCheckpointState);
+  rpc ApplyDefinitionAssignmentPage(ApplyDefinitionAssignmentPageRequest) returns (DefinitionAssignmentPageApplied);
+  rpc ApplyDefinitionAssignments(ApplyDefinitionAssignmentsRequest) returns (DefinitionAssignmentPageApplied);
+  rpc ScanDefinitionLocatorsByBucket(DefinitionLocatorScanRequest) returns (DefinitionLocatorScanPage);
+  rpc ScanDefinitionLocatorsByKind(DefinitionLocatorKindScanRequest) returns (DefinitionLocatorScanPage);
+  rpc ScanDefinitionAssignmentsByKind(DefinitionAssignmentScanRequest) returns (DefinitionAssignmentScanPage);
 
   rpc SmallContentExists(ContentRequest) returns (ExistsResponse);
   rpc GetSmallContent(ContentRequest) returns (stream ContentFrame);

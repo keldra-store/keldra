@@ -3,7 +3,9 @@
 use std::pin::Pin;
 
 use anvil_consensus::{DecisionRaft, NodeId, PeerSpkiSha256};
-use anvil_store::{CurrentObjectSnapshot, Head, PlacementLogId, SourceId, Version};
+use anvil_store::{
+    CurrentObjectSnapshot, Head, PlacementLogId, RetainedObjectSnapshot, SourceId, Version,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
@@ -22,6 +24,13 @@ pub(super) const INDEX_SOURCE_FRAME_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 pub(super) type IndexSourceSnapshotRpcStream = Pin<
     Box<dyn tokio_stream::Stream<Item = Result<wire::IndexSourceSnapshotResponse, Status>> + Send>,
+>;
+
+pub(super) type RetainedSourceSnapshotRpcStream = Pin<
+    Box<
+        dyn tokio_stream::Stream<Item = Result<wire::RetainedSourceSnapshotResponse, Status>>
+            + Send,
+    >,
 >;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -56,7 +65,7 @@ pub(crate) struct IndexSourceSnapshot {
     requests: mpsc::Sender<wire::IndexSourceSnapshotRequest>,
     stream: tonic::Streaming<wire::IndexSourceSnapshotResponse>,
     next_sequence: u64,
-    deadline: tokio::time::Instant,
+    inactivity_timeout: std::time::Duration,
     ended: bool,
 }
 
@@ -89,11 +98,11 @@ impl IndexSourceSnapshot {
                 },
             )),
         };
-        tokio::time::timeout_at(self.deadline, self.requests.send(pull))
+        tokio::time::timeout(self.inactivity_timeout, self.requests.send(pull))
             .await
             .map_err(|_| Status::deadline_exceeded("index snapshot pull deadline exceeded"))?
             .map_err(|_| Status::unavailable("index snapshot request stream closed"))?;
-        let response = tokio::time::timeout_at(self.deadline, self.stream.message())
+        let response = tokio::time::timeout(self.inactivity_timeout, self.stream.message())
             .await
             .map_err(|_| Status::deadline_exceeded("index source snapshot deadline exceeded"))??
             .ok_or_else(|| {
@@ -146,12 +155,113 @@ impl IndexSourceSnapshot {
     }
 }
 
+/// Client side of one retained `(path, version)` snapshot. Like the current
+/// head stream, each pull is issued only while its consumer holds a bounded
+/// construction permit.
+pub(crate) struct RetainedSourceSnapshot {
+    source: SourceId,
+    captured_tail: u64,
+    placement_fence: PlacementLogId,
+    target: NodeId,
+    decisions: DecisionRaft,
+    requests: mpsc::Sender<wire::RetainedSourceSnapshotRequest>,
+    stream: tonic::Streaming<wire::RetainedSourceSnapshotResponse>,
+    next_sequence: u64,
+    inactivity_timeout: std::time::Duration,
+    ended: bool,
+}
+
+impl RetainedSourceSnapshot {
+    pub(crate) fn source(&self) -> SourceId {
+        self.source
+    }
+
+    pub(crate) fn captured_tail(&self) -> u64 {
+        self.captured_tail
+    }
+
+    pub(crate) fn placement_fence(&self) -> PlacementLogId {
+        self.placement_fence
+    }
+
+    pub(crate) async fn next_frame(
+        &mut self,
+    ) -> Result<Option<Vec<RetainedObjectSnapshot>>, Status> {
+        if self.ended {
+            return Ok(None);
+        }
+        require_client_fence(&self.decisions, self.placement_fence, self.target)?;
+        let pull = wire::RetainedSourceSnapshotRequest {
+            command: Some(wire::retained_source_snapshot_request::Command::Pull(
+                wire::IndexSourceSnapshotPull {
+                    sequence: self.next_sequence,
+                },
+            )),
+        };
+        tokio::time::timeout(self.inactivity_timeout, self.requests.send(pull))
+            .await
+            .map_err(|_| Status::deadline_exceeded("retained snapshot pull deadline exceeded"))?
+            .map_err(|_| Status::unavailable("retained snapshot request stream closed"))?;
+        let response = tokio::time::timeout(self.inactivity_timeout, self.stream.message())
+            .await
+            .map_err(|_| Status::deadline_exceeded("retained source snapshot deadline exceeded"))??
+            .ok_or_else(|| {
+                Status::data_loss("retained source snapshot ended without a terminal frame")
+            })?;
+        let frame = match response.event {
+            Some(wire::retained_source_snapshot_response::Event::Frame(frame)) => frame,
+            Some(wire::retained_source_snapshot_response::Event::Begun(_)) | None => {
+                return Err(Status::data_loss(
+                    "retained source snapshot returned an unexpected event",
+                ));
+            }
+        };
+        validate_retained_frame_identity(
+            &frame,
+            self.target,
+            self.source,
+            self.captured_tail,
+            self.placement_fence,
+            self.next_sequence,
+        )?;
+        self.next_sequence = self
+            .next_sequence
+            .checked_add(1)
+            .ok_or_else(|| Status::data_loss("retained source snapshot sequence overflow"))?;
+        if frame.end {
+            if !frame.records_json.is_empty() {
+                return Err(Status::data_loss(
+                    "terminal retained source snapshot frame contains records",
+                ));
+            }
+            self.ended = true;
+            return Ok(None);
+        }
+        if frame.records_json.is_empty() {
+            return Err(Status::data_loss(
+                "non-terminal retained source snapshot frame is empty",
+            ));
+        }
+        let records = frame
+            .records_json
+            .iter()
+            .map(|encoded| decode_json::<RetainedObjectSnapshot>(encoded))
+            .collect::<Result<Vec<_>, _>>()?;
+        for record in &records {
+            record
+                .validate()
+                .map_err(|error| Status::data_loss(error.to_string()))?;
+        }
+        require_client_fence(&self.decisions, self.placement_fence, self.target)?;
+        Ok(Some(records))
+    }
+}
+
 impl ClusterPeerService {
     pub(super) async fn scan_index_source_snapshot_call(
         &self,
         request: Request<tonic::Streaming<wire::IndexSourceSnapshotRequest>>,
     ) -> Result<Response<IndexSourceSnapshotRpcStream>, Status> {
-        let started = tokio::time::Instant::now();
         let pin = request
             .extensions()
             .get::<PeerSpkiSha256>()
@@ -205,9 +315,9 @@ impl ClusterPeerService {
                     &snapshot.exact_path,
                 ) == Some(local_node)
         };
-        let deadline = started + admitted.timeout;
-        let mut scan = tokio::time::timeout_at(
-            deadline,
+        let inactivity_timeout = admitted.timeout;
+        let mut scan = tokio::time::timeout(
+            inactivity_timeout,
             self.store.start_current_head_snapshot_scan(
                 tenant_id,
                 bucket_id,
@@ -224,12 +334,14 @@ impl ClusterPeerService {
         let source = scan.source();
         let captured_tail = scan.captured_tail();
         let service = self.clone();
+        let path_prefix_hash = hex::encode(&blake3::hash(path_prefix.as_bytes()).as_bytes()[..8]);
 
         let output = async_stream::try_stream! {
             yield begun_response(source, captured_tail, fence);
             let mut sequence = 0_u64;
+            let mut heads_emitted_total = 0_u64;
             loop {
-                let request = match tokio::time::timeout_at(deadline, inbound.message()).await {
+                let request = match tokio::time::timeout(inactivity_timeout, inbound.message()).await {
                     Ok(Ok(Some(request))) => request,
                     Ok(Ok(None)) => break,
                     Ok(Err(error)) => Err(error)?,
@@ -253,7 +365,7 @@ impl ClusterPeerService {
                 };
                 let _ = pull;
                 service.require_unchanged(fence)?;
-                let next = tokio::time::timeout_at(deadline, scan.next_frame())
+                let next = tokio::time::timeout(inactivity_timeout, scan.next_frame())
                     .await
                     .map_err(|_| Status::deadline_exceeded(
                         "index source snapshot deadline exceeded",
@@ -261,16 +373,31 @@ impl ClusterPeerService {
                     .map_err(|error| Status::internal(error.to_string()))?;
                 service.require_unchanged(fence)?;
                 let (heads_json, end) = match next {
-                    Some(frame) => (
-                        frame
-                            .heads
-                            .into_iter()
-                            .map(IndexSourceSnapshotHead::from)
-                            .map(|head| encode_json(&head))
-                            .collect::<Result<Vec<_>, _>>()?,
-                        false,
-                    ),
-                    None => (Vec::new(), true),
+                    Some(frame) => {
+                        heads_emitted_total = heads_emitted_total
+                            .saturating_add(frame.heads.len() as u64);
+                        (
+                            frame
+                                .heads
+                                .into_iter()
+                                .map(IndexSourceSnapshotHead::from)
+                                .map(|head| encode_json(&head))
+                                .collect::<Result<Vec<_>, _>>()?,
+                            false,
+                        )
+                    }
+                    None => {
+                        tracing::info!(
+                            node_id = local_node.0,
+                            tenant_id,
+                            bucket_id,
+                            path_prefix_hash,
+                            head_reads_total = scan.heads_visited(),
+                            heads_emitted_total,
+                            "anvil_index_scoped_snapshot_evidence"
+                        );
+                        (Vec::new(), true)
+                    }
                 };
                 yield frame_response(snapshot_frame(
                     source,
@@ -282,6 +409,145 @@ impl ClusterPeerService {
                 ));
                 sequence = sequence.checked_add(1).ok_or_else(|| {
                     Status::internal("index source snapshot sequence overflow")
+                })?;
+                if end {
+                    break;
+                }
+            }
+        };
+        Ok(Response::new(Box::pin(output)))
+    }
+
+    pub(super) async fn scan_retained_source_snapshot_call(
+        &self,
+        request: Request<tonic::Streaming<wire::RetainedSourceSnapshotRequest>>,
+    ) -> Result<Response<RetainedSourceSnapshotRpcStream>, Status> {
+        let pin = request
+            .extensions()
+            .get::<PeerSpkiSha256>()
+            .copied()
+            .ok_or_else(|| Status::unauthenticated("peer mTLS identity is missing"))?;
+        let mut inbound = request.into_inner();
+        let first = tokio::time::timeout(MAX_INDEX_SOURCE_SNAPSHOT_TIME, inbound.message())
+            .await
+            .map_err(|_| Status::deadline_exceeded("retained snapshot begin deadline exceeded"))??
+            .ok_or_else(|| Status::invalid_argument("retained snapshot begin is required"))?;
+        let begin = match first.command {
+            Some(wire::retained_source_snapshot_request::Command::Begin(begin)) => begin,
+            Some(wire::retained_source_snapshot_request::Command::Pull(_)) | None => {
+                return Err(Status::invalid_argument(
+                    "the first retained snapshot command must be begin",
+                ));
+            }
+        };
+        let admitted = self.admit_pin_with_timeout_limit(
+            pin,
+            begin
+                .peer
+                .as_ref()
+                .ok_or_else(|| Status::invalid_argument("peer context is required"))?,
+            0,
+            MAX_INDEX_SOURCE_SNAPSHOT_TIME,
+        )?;
+        if begin.tenant_id == 0 || begin.bucket_id == 0 || !valid_source_prefix(&begin.path_prefix)
+        {
+            return Err(Status::invalid_argument(
+                "retained source snapshot stable IDs or path prefix are invalid",
+            ));
+        }
+        require_snapshot_frame_bound(begin.max_frame_bytes)?;
+        let tenant_id = begin.tenant_id;
+        let bucket_id = begin.bucket_id;
+        let path_prefix = begin.path_prefix;
+        let max_frame_bytes = begin.max_frame_bytes;
+        let fence = admitted.placement.fence();
+        let placement = admitted.placement;
+        let local_node = self.local_node;
+        let include_prefix = path_prefix.clone();
+        let include = move |record: &RetainedObjectSnapshot| {
+            crate::accounting::includes_path(&include_prefix, &record.exact_path)
+                && object_coordinator(
+                    &placement,
+                    record.tenant_id,
+                    record.bucket_id,
+                    &record.exact_path,
+                ) == Some(local_node)
+        };
+        let inactivity_timeout = admitted.timeout;
+        let mut scan = tokio::time::timeout(
+            inactivity_timeout,
+            self.store.start_retained_object_snapshot_scan(
+                tenant_id,
+                bucket_id,
+                &path_prefix,
+                INDEX_SOURCE_FRAME_MAX_RECORDS,
+                max_frame_bytes,
+                include,
+            ),
+        )
+        .await
+        .map_err(|_| Status::deadline_exceeded("retained snapshot capture deadline exceeded"))?
+        .map_err(|error| Status::internal(error.to_string()))?;
+        self.require_unchanged(fence)?;
+        let source = scan.source();
+        let captured_tail = scan.captured_tail();
+        let service = self.clone();
+
+        let output = async_stream::try_stream! {
+            yield retained_begun_response(source, captured_tail, fence);
+            let mut sequence = 0_u64;
+            loop {
+                let request = match tokio::time::timeout(inactivity_timeout, inbound.message()).await {
+                    Ok(Ok(Some(request))) => request,
+                    Ok(Ok(None)) => break,
+                    Ok(Err(error)) => Err(error)?,
+                    Err(_) => Err(Status::deadline_exceeded(
+                        "retained source snapshot deadline exceeded",
+                    ))?,
+                };
+                match request.command {
+                    Some(wire::retained_source_snapshot_request::Command::Pull(pull))
+                        if pull.sequence == sequence => {}
+                    Some(wire::retained_source_snapshot_request::Command::Pull(_)) => {
+                        Err(Status::data_loss(
+                            "retained source snapshot pull sequence is not contiguous",
+                        ))?
+                    }
+                    Some(wire::retained_source_snapshot_request::Command::Begin(_)) | None => {
+                        Err(Status::invalid_argument(
+                            "retained source snapshot accepts exactly one begin command",
+                        ))?
+                    }
+                }
+                service.require_unchanged(fence)?;
+                let next = tokio::time::timeout(inactivity_timeout, scan.next_frame())
+                    .await
+                    .map_err(|_| Status::deadline_exceeded(
+                        "retained source snapshot deadline exceeded",
+                    ))?
+                    .map_err(|error| Status::internal(error.to_string()))?;
+                service.require_unchanged(fence)?;
+                let (records_json, end) = match next {
+                    Some(frame) => (
+                        frame
+                            .records
+                            .into_iter()
+                            .map(|record| encode_json(&record))
+                            .collect::<Result<Vec<_>, _>>()?,
+                        false,
+                    ),
+                    None => (Vec::new(), true),
+                };
+                yield retained_frame_response(retained_snapshot_frame(
+                    source,
+                    captured_tail,
+                    fence,
+                    sequence,
+                    records_json,
+                    end,
+                ));
+                sequence = sequence.checked_add(1).ok_or_else(|| {
+                    Status::internal("retained source snapshot sequence overflow")
                 })?;
                 if end {
                     break;
@@ -320,9 +586,36 @@ fn begun_response(
     }
 }
 
+fn retained_begun_response(
+    source: SourceId,
+    captured_tail: u64,
+    fence: PlacementLogId,
+) -> wire::RetainedSourceSnapshotResponse {
+    wire::RetainedSourceSnapshotResponse {
+        event: Some(wire::retained_source_snapshot_response::Event::Begun(
+            wire::IndexSourceSnapshotBegun {
+                schema_version: CLUSTER_PEER_SCHEMA_VERSION,
+                source_node_id: u64::from(source.node_id),
+                source_epoch: source.source_epoch.to_vec(),
+                captured_source_tail: captured_tail,
+                placement_term: fence.term,
+                placement_index: fence.index,
+            },
+        )),
+    }
+}
+
 fn frame_response(frame: wire::IndexSourceSnapshotFrame) -> wire::IndexSourceSnapshotResponse {
     wire::IndexSourceSnapshotResponse {
         event: Some(wire::index_source_snapshot_response::Event::Frame(frame)),
+    }
+}
+
+fn retained_frame_response(
+    frame: wire::RetainedSourceSnapshotFrame,
+) -> wire::RetainedSourceSnapshotResponse {
+    wire::RetainedSourceSnapshotResponse {
+        event: Some(wire::retained_source_snapshot_response::Event::Frame(frame)),
     }
 }
 
@@ -347,6 +640,27 @@ fn snapshot_frame(
     }
 }
 
+fn retained_snapshot_frame(
+    source: SourceId,
+    captured_tail: u64,
+    fence: PlacementLogId,
+    sequence: u64,
+    records_json: Vec<Vec<u8>>,
+    end: bool,
+) -> wire::RetainedSourceSnapshotFrame {
+    wire::RetainedSourceSnapshotFrame {
+        schema_version: CLUSTER_PEER_SCHEMA_VERSION,
+        source_node_id: u64::from(source.node_id),
+        source_epoch: source.source_epoch.to_vec(),
+        captured_source_tail: captured_tail,
+        placement_term: fence.term,
+        placement_index: fence.index,
+        sequence,
+        records_json,
+        end,
+    }
+}
+
 fn validate_frame_identity(
     frame: &wire::IndexSourceSnapshotFrame,
     target: NodeId,
@@ -366,6 +680,30 @@ fn validate_frame_identity(
     {
         return Err(Status::data_loss(
             "index source snapshot identity, checkpoint, fence, or sequence changed",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_retained_frame_identity(
+    frame: &wire::RetainedSourceSnapshotFrame,
+    target: NodeId,
+    source: SourceId,
+    captured_tail: u64,
+    fence: PlacementLogId,
+    expected_sequence: u64,
+) -> Result<(), Status> {
+    require_response_schema(frame.schema_version)?;
+    if frame.source_node_id != target.0
+        || frame.source_node_id != u64::from(source.node_id)
+        || frame.source_epoch != source.source_epoch
+        || frame.captured_source_tail != captured_tail
+        || frame.placement_term != fence.term
+        || frame.placement_index != fence.index
+        || frame.sequence != expected_sequence
+    {
+        return Err(Status::data_loss(
+            "retained source snapshot identity, checkpoint, fence, or sequence changed",
         ));
     }
     Ok(())
@@ -408,7 +746,7 @@ pub(super) fn open_client_snapshot(
     requests: mpsc::Sender<wire::IndexSourceSnapshotRequest>,
     stream: tonic::Streaming<wire::IndexSourceSnapshotResponse>,
     begun: wire::IndexSourceSnapshotBegun,
-    deadline: tokio::time::Instant,
+    inactivity_timeout: std::time::Duration,
 ) -> Result<IndexSourceSnapshot, Status> {
     require_response_schema(begun.schema_version)?;
     if begun.source_node_id != target.0
@@ -443,7 +781,54 @@ pub(super) fn open_client_snapshot(
         requests,
         stream,
         next_sequence: 0,
-        deadline,
+        inactivity_timeout,
+        ended: false,
+    })
+}
+
+pub(super) fn open_client_retained_snapshot(
+    target: NodeId,
+    decisions: DecisionRaft,
+    fence: PlacementLogId,
+    requests: mpsc::Sender<wire::RetainedSourceSnapshotRequest>,
+    stream: tonic::Streaming<wire::RetainedSourceSnapshotResponse>,
+    begun: wire::IndexSourceSnapshotBegun,
+    inactivity_timeout: std::time::Duration,
+) -> Result<RetainedSourceSnapshot, Status> {
+    require_response_schema(begun.schema_version)?;
+    if begun.source_node_id != target.0
+        || begun.placement_term != fence.term
+        || begun.placement_index != fence.index
+    {
+        return Err(Status::data_loss(
+            "retained source snapshot acknowledgement has the wrong source or fence",
+        ));
+    }
+    let source_epoch: [u8; 32] = begun
+        .source_epoch
+        .as_slice()
+        .try_into()
+        .map_err(|_| Status::data_loss("retained source epoch has the wrong length"))?;
+    if source_epoch == [0; 32] {
+        return Err(Status::data_loss("retained source epoch is all zero"));
+    }
+    let source_node = u16::try_from(begun.source_node_id)
+        .map_err(|_| Status::data_loss("retained source node exceeds u16"))?;
+    let source = SourceId {
+        node_id: source_node,
+        source_epoch,
+    };
+    require_client_fence(&decisions, fence, target)?;
+    Ok(RetainedSourceSnapshot {
+        source,
+        captured_tail: begun.captured_source_tail,
+        placement_fence: fence,
+        target,
+        decisions,
+        requests,
+        stream,
+        next_sequence: 0,
+        inactivity_timeout,
         ended: false,
     })
 }
