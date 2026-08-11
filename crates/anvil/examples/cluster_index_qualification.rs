@@ -52,6 +52,7 @@ struct EngineCase {
     documents: Vec<(&'static str, &'static [u8])>,
     expected_paths: Vec<&'static str>,
     replacement: (&'static str, &'static [u8]),
+    replacement_hit_version: Option<u64>,
     delete_path: &'static str,
     expects_scores: bool,
 }
@@ -325,11 +326,11 @@ async fn main() -> TestResult<()> {
         mutation_generations.push(responses[0].clone());
     }
 
-    let mut final_replacement_versions = vec![0_u64; cases.len()];
+    let mut final_hit_versions = vec![0_u64; cases.len()];
     for wave in 0..COMPACTION_WAVES {
         for (case_number, case) in cases.iter().enumerate() {
             let put_client = &mut objects[(case_number + wave) % object_client_count];
-            final_replacement_versions[case_number] = put_json(
+            let source_object_version = put_json(
                 put_client,
                 &tenant,
                 case.bucket,
@@ -339,6 +340,9 @@ async fn main() -> TestResult<()> {
                 source_durability,
             )
             .await?;
+            final_hit_versions[case_number] = case
+                .replacement_hit_version
+                .unwrap_or(source_object_version);
             write_number += 1;
         }
 
@@ -351,7 +355,7 @@ async fn main() -> TestResult<()> {
         {
             let expected = expected_after_primary_mutations(case);
             let expected_versions =
-                BTreeMap::from([(case.replacement.0, final_replacement_versions[case_number])]);
+                BTreeMap::from([(case.replacement.0, final_hit_versions[case_number])]);
             let before_freshness = require_freshness(before)?;
             let responses = wait_for_queries(
                 &mut indexes,
@@ -415,7 +419,7 @@ async fn main() -> TestResult<()> {
     .await?;
     require_checkpoint_advance(&before_tensor_delete, require_freshness(&responses[0])?, 1)?;
     mutation_generations[tensor_position] = responses[0].clone();
-    final_replacement_versions[tensor_position] = 0;
+    final_hit_versions[tensor_position] = 0;
 
     let state_output = env::var_os("ANVIL_INDEX_QUALIFICATION_STATE_OUTPUT");
     if state_output.is_some()
@@ -428,7 +432,7 @@ async fn main() -> TestResult<()> {
             &mut indexes,
             &cases,
             &definitions,
-            &final_replacement_versions,
+            &final_hit_versions,
             tensor_position,
             endpoints.len(),
         )
@@ -511,15 +515,15 @@ async fn collect_final_responses(
     indexes: &mut [IndexClient],
     cases: &[EngineCase],
     definitions: &[anvil_storage::v1::IndexDefinition],
-    replacement_versions: &[u64],
+    replacement_hit_versions: &[u64],
     tensor_position: usize,
     source_count: usize,
 ) -> TestResult<Vec<QueryIndexResponse>> {
     let mut final_responses = Vec::with_capacity(cases.len());
-    for (position, ((case, definition), replacement_version)) in cases
+    for (position, ((case, definition), replacement_hit_version)) in cases
         .iter()
         .zip(definitions)
-        .zip(replacement_versions)
+        .zip(replacement_hit_versions)
         .enumerate()
     {
         let expected = if position == tensor_position {
@@ -527,10 +531,10 @@ async fn collect_final_responses(
         } else {
             expected_after_primary_mutations(case)
         };
-        let expected_versions = if *replacement_version == 0 {
+        let expected_versions = if *replacement_hit_version == 0 {
             BTreeMap::new()
         } else {
-            BTreeMap::from([(case.replacement.0, *replacement_version)])
+            BTreeMap::from([(case.replacement.0, *replacement_hit_version)])
         };
         let responses = wait_for_queries(
             indexes,
@@ -1302,6 +1306,7 @@ fn engine_cases() -> Vec<EngineCase> {
                 "docs/l.json",
             ],
             replacement: ("docs/a.json", br#"{"value":"a-replaced"}"#),
+            replacement_hit_version: None,
             delete_path: "docs/b.json",
             expects_scores: false,
         },
@@ -1332,6 +1337,7 @@ fn engine_cases() -> Vec<EngineCase> {
                 "docs/active-a.json",
                 br#"{"status":"active","revision":2}"#,
             ),
+            replacement_hit_version: None,
             delete_path: "docs/active-b.json",
             expects_scores: false,
         },
@@ -1357,6 +1363,7 @@ fn engine_cases() -> Vec<EngineCase> {
             ],
             expected_paths: vec!["docs/keep-a.json", "docs/keep-b.json"],
             replacement: ("docs/keep-a.json", br#"{"value":"a-replaced"}"#),
+            replacement_hit_version: None,
             delete_path: "docs/keep-b.json",
             expects_scores: false,
         },
@@ -1386,6 +1393,7 @@ fn engine_cases() -> Vec<EngineCase> {
                 "docs/journal-a.json",
                 br#"{"body":"durable journal replacement"}"#,
             ),
+            replacement_hit_version: None,
             delete_path: "docs/journal-b.json",
             expects_scores: true,
         },
@@ -1402,6 +1410,7 @@ fn engine_cases() -> Vec<EngineCase> {
                 "docs/rust.json",
                 br#"{"title":"rust search replacement","embedding":[0.9,0.1,0.0]}"#,
             ),
+            replacement_hit_version: None,
             delete_path: "docs/storage.json",
             expects_scores: true,
         },
@@ -1429,6 +1438,7 @@ fn engine_cases() -> Vec<EngineCase> {
                 "docs/rust.json",
                 br#"{"title":"rust search replacement","embedding":[0.9,0.1,0.0]}"#,
             ),
+            replacement_hit_version: None,
             delete_path: "docs/storage.json",
             expects_scores: true,
         },
@@ -1462,6 +1472,7 @@ fn engine_cases() -> Vec<EngineCase> {
                 "docs/git-lib.json",
                 br#"{"repository_id":"qualification-repository","commit_id":"qualification-commit","tree_path":"src/lib.rs","object_id":"3333333333333333333333333333333333333333","pack_path":"docs/git-lib.json","pack_version":2,"offset":256,"length":192}"#,
             ),
+            replacement_hit_version: Some(2),
             delete_path: "docs/git-main.json",
             expects_scores: false,
         },
@@ -1493,6 +1504,7 @@ fn engine_cases() -> Vec<EngineCase> {
                 "docs/tensor-encoder-copy.json",
                 br#"{"model_id":"qualification-model","tensor_name":"encoder.weight","source_path":"docs/tensor-encoder-copy.json","source_version":2,"offset":288,"length":128,"dtype":"f32","shape":[8,4]}"#,
             ),
+            replacement_hit_version: Some(2),
             delete_path: "docs/tensor-decoder.json",
             expects_scores: false,
         },
@@ -1605,6 +1617,16 @@ mod tests {
             assert!(!case.expected_paths.is_empty());
             assert!(case.expected_paths.contains(&case.replacement.0));
             assert_ne!(case.replacement.0, case.delete_path);
+            let references_another_object = matches!(
+                case.specification.specification.as_ref(),
+                Some(SpecificationValue::GitSource(_) | SpecificationValue::Tensor(_))
+            );
+            assert_eq!(
+                case.replacement_hit_version.is_some(),
+                references_another_object,
+                "{} must declare whether result versions come from a referenced object",
+                case.name
+            );
             if !matches!(
                 case.specification.specification,
                 Some(SpecificationValue::Tensor(_))
