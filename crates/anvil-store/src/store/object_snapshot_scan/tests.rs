@@ -40,6 +40,15 @@ async fn put_at(store: &Store, path: &str, value: &[u8], command: &str, index: u
         )
         .await
         .unwrap();
+    let tail = store.local_watch_status().unwrap().tail;
+    store
+        .advance_source_journal_reference_safe_through(tail)
+        .await
+        .unwrap();
+    store
+        .advance_source_journal_settled_through(tail)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -105,6 +114,133 @@ async fn stable_prefix_pages_are_sorted_bounded_and_scope_the_cursor() {
 }
 
 #[tokio::test]
+async fn exact_current_snapshot_never_decodes_retained_history() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = Store::open(StoreOptions::new(temporary.path(), 1))
+        .await
+        .unwrap();
+    assert!(
+        store
+            .enable_bucket_versioning("tenant", "bucket")
+            .await
+            .unwrap()
+    );
+    for version in 1..=256 {
+        put_at(
+            &store,
+            "deep/history",
+            format!("value-{version}").as_bytes(),
+            &format!("put-{version}"),
+            version,
+        )
+        .await;
+    }
+    let (tenant_id, bucket_id) = store.resolve_bucket_ids("tenant", "bucket").unwrap();
+    let complete = store
+        .export_object_path_record(tenant_id, bucket_id, "deep/history")
+        .unwrap()
+        .unwrap();
+    assert_eq!(complete.versions.len(), 256);
+    let expected = complete.versions.last().unwrap().clone();
+
+    // A malformed historical descriptor makes the complete-record export
+    // fail. The exact-current read still succeeds because it performs only a
+    // head lookup followed by the one descriptor named by that head.
+    let identity = stable_identity(tenant_id, bucket_id);
+    let head_key = identity.head_key("deep/history");
+    store
+        .db
+        .put_cf(
+            store.cf(CF_VERSIONS).unwrap(),
+            exact_version_key(&head_key, complete.versions[0].id),
+            b"not-json",
+        )
+        .unwrap();
+    assert!(
+        store
+            .export_object_path_record(tenant_id, bucket_id, "deep/history")
+            .is_err()
+    );
+    let current = store
+        .export_current_object_snapshot(tenant_id, bucket_id, "deep/history")
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.exact_path, "deep/history");
+    assert_eq!(current.version, expected);
+    assert_eq!(current.head.version, expected.id);
+}
+
+#[tokio::test]
+async fn ordinary_definition_guard_blocks_only_its_exact_path() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = Store::open(StoreOptions::new(temporary.path(), 1))
+        .await
+        .unwrap();
+    put_at(&store, "definitions/one", b"v1", "one-v1", 1).await;
+    put_at(&store, "definitions/two", b"v1", "two-v1", 2).await;
+
+    let guarded_key = ObjectKey::new("tenant", "bucket", "definitions/one").unwrap();
+    let guarded_store = store.clone();
+    let (entered_sender, entered_receiver) = tokio::sync::oneshot::channel();
+    let (release_sender, release_receiver) = tokio::sync::oneshot::channel();
+    let guard = tokio::spawn(async move {
+        guarded_store
+            .with_ordinary_object_path_lock(&guarded_key, || async move {
+                entered_sender.send(()).unwrap();
+                release_receiver.await.unwrap();
+            })
+            .await;
+    });
+    entered_receiver.await.unwrap();
+
+    let same_store = store.clone();
+    let mut same_path = tokio::spawn(async move {
+        put_at(&same_store, "definitions/one", b"v2", "one-v2", 3).await;
+    });
+    let other_store = store.clone();
+    let other_path = tokio::spawn(async move {
+        put_at(&other_store, "definitions/two", b"v2", "two-v2", 4).await;
+    });
+    let delete_store = store.clone();
+    let mut same_delete = tokio::spawn(async move {
+        delete_store
+            .coordinate_object_mutation(
+                BatchOperation::Delete(delete("definitions/one", "one-delete")),
+                context(5),
+            )
+            .await
+            .unwrap();
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), other_path)
+        .await
+        .expect("an unrelated definition must not share the guard")
+        .unwrap();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(25), &mut same_path)
+            .await
+            .is_err(),
+        "the ordinary update must use the exact same path lock as the guard"
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(25), &mut same_delete)
+            .await
+            .is_err(),
+        "the ordinary delete must use the exact same path lock as the guard"
+    );
+    release_sender.send(()).unwrap();
+    guard.await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), same_path)
+        .await
+        .expect("the same-path update must resume after guard release")
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), same_delete)
+        .await
+        .expect("the same-path delete must resume after guard release")
+        .unwrap();
+}
+
+#[tokio::test]
 async fn one_snapshot_binds_heads_and_tail_across_concurrent_put_delete_and_epoch_change() {
     let temporary = tempfile::tempdir().unwrap();
     let store = Store::open(StoreOptions::new(temporary.path(), 1))
@@ -156,6 +292,7 @@ async fn one_snapshot_binds_heads_and_tail_across_concurrent_put_delete_and_epoc
     while let Some(frame) = scan.next_frame().await.unwrap() {
         captured.extend(frame.heads);
     }
+    assert_eq!(scan.heads_visited(), 3);
     assert_eq!(
         captured
             .iter()
@@ -177,6 +314,50 @@ async fn one_snapshot_binds_heads_and_tail_across_concurrent_put_delete_and_epoc
 }
 
 #[tokio::test]
+async fn snapshot_waits_for_the_proof_backed_tail_without_holding_the_commit_lock() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = Store::open(StoreOptions::new(temporary.path(), 1))
+        .await
+        .unwrap();
+    store
+        .coordinate_object_mutation(
+            BatchOperation::Put(put("docs/pending", b"pending", "pending")),
+            context(1),
+        )
+        .await
+        .unwrap();
+    let (tenant_id, bucket_id) = store.resolve_bucket_ids("tenant", "bucket").unwrap();
+    let status = store.local_watch_status().unwrap();
+    assert!(status.settled_through < status.tail);
+
+    let scanning = store.clone();
+    let mut scan = tokio::spawn(async move {
+        scanning
+            .start_current_head_snapshot_scan(tenant_id, bucket_id, "docs/", 1, 1024 * 1024, |_| {
+                true
+            })
+            .await
+    });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(25), &mut scan)
+            .await
+            .is_err()
+    );
+
+    store
+        .advance_source_journal_settled_through(status.tail)
+        .await
+        .unwrap();
+    let mut scan = tokio::time::timeout(std::time::Duration::from_secs(1), scan)
+        .await
+        .expect("snapshot resumes after settlement")
+        .unwrap()
+        .unwrap();
+    assert_eq!(scan.captured_tail(), status.tail);
+    assert_eq!(scan.next_frame().await.unwrap().unwrap().heads.len(), 1);
+}
+
+#[tokio::test]
 async fn snapshot_filter_runs_before_bounded_frames_are_emitted() {
     let temporary = tempfile::tempdir().unwrap();
     let store = Store::open(StoreOptions::new(temporary.path(), 1))
@@ -195,6 +376,7 @@ async fn snapshot_filter_runs_before_bounded_frames_are_emitted() {
     assert_eq!(frame.heads.len(), 1);
     assert_eq!(frame.heads[0].exact_path, "docs/b");
     assert!(scan.next_frame().await.unwrap().is_none());
+    assert_eq!(scan.heads_visited(), 2);
 }
 
 #[tokio::test]

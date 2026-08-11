@@ -1,4 +1,6 @@
 use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anvil_atomic_program::MAX_OBJECT_PATH_BYTES;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -149,6 +151,7 @@ enum SnapshotCommand {
 pub struct CurrentObjectSnapshotScan {
     source: SourceId,
     captured_tail: u64,
+    heads_visited: Arc<AtomicU64>,
     commands: mpsc::Sender<SnapshotCommand>,
     complete: bool,
 }
@@ -160,6 +163,12 @@ impl CurrentObjectSnapshotScan {
 
     pub fn captured_tail(&self) -> u64 {
         self.captured_tail
+    }
+
+    /// Number of current-head records physically visited by this scoped
+    /// RocksDB iterator. This includes records rejected by the caller's filter.
+    pub fn heads_visited(&self) -> u64 {
+        self.heads_visited.load(Ordering::Relaxed)
     }
 
     pub async fn next_frame(
@@ -194,6 +203,37 @@ impl CurrentObjectSnapshotScan {
 }
 
 impl Store {
+    /// Reads one exact current head and its immutable descriptor by stable
+    /// storage identity. Historical descriptors are not iterated or decoded.
+    pub fn export_current_object_snapshot(
+        &self,
+        tenant_id: u64,
+        bucket_id: u64,
+        exact_path: &str,
+    ) -> Result<Option<CurrentObjectSnapshot>, ObjectSnapshotError> {
+        require_nonzero(tenant_id, "tenant ID")?;
+        require_nonzero(bucket_id, "bucket ID")?;
+        validate_exact_path(exact_path)?;
+        let identity = stable_identity(tenant_id, bucket_id);
+        let head_key = identity.head_key(exact_path);
+        let snapshot = self.db.snapshot();
+        let heads_cf = self.cf(CF_HEADS).map_err(object_storage)?;
+        let Some(encoded_head) = snapshot
+            .get_cf(heads_cf, &head_key)
+            .map_err(object_storage)?
+        else {
+            return Ok(None);
+        };
+        decode_current_head(
+            identity,
+            &head_key,
+            &encoded_head,
+            &snapshot,
+            self.cf(CF_VERSIONS).map_err(object_storage)?,
+        )
+        .map(Some)
+    }
+
     /// Reads one bounded, sorted page across all local current heads. This is
     /// reserved for accepted cold discovery when stable bucket IDs are not yet
     /// known; scoped consumers should always use the prefix form below.
@@ -352,13 +392,19 @@ impl Store {
         let prefix = identity.head_key(path_prefix);
         let path_prefix = path_prefix.to_owned();
         let store = self.clone();
+        let heads_visited = Arc::new(AtomicU64::new(0));
+        let worker_heads_visited = heads_visited.clone();
         let (command_sender, command_receiver) = mpsc::channel(1);
         let (ready_sender, ready_receiver) = oneshot::channel();
 
-        // Every ordinary mutation stages its head and source-journal append in
-        // one batch under this fence. Hold it only until the worker confirms
-        // that its RocksDB snapshot and checkpoint have both been captured.
-        let commit_guard = self.commit_lock.lock().await;
+        // Do not capture a locally visible metadata candidate whose quorum
+        // proof is still pending. Waiting happens without the commit lock;
+        // after the cut drains, the helper locks and rechecks before the
+        // worker captures both the RocksDB snapshot and journal checkpoint.
+        let commit_guard = self
+            .lock_settled_source_snapshot()
+            .await
+            .map_err(object_storage)?;
         std::thread::Builder::new()
             .name(format!("anvil-head-snapshot-{}", self.node_id))
             .spawn(move || {
@@ -370,6 +416,7 @@ impl Store {
                     max_records,
                     max_bytes,
                     include,
+                    worker_heads_visited,
                     ready_sender,
                     command_receiver,
                 );
@@ -383,6 +430,7 @@ impl Store {
         Ok(CurrentObjectSnapshotScan {
             source,
             captured_tail,
+            heads_visited,
             commands: command_sender,
             complete: false,
         })
@@ -398,6 +446,7 @@ fn run_snapshot_worker<F>(
     max_records: u32,
     max_bytes: u64,
     include: F,
+    heads_visited: Arc<AtomicU64>,
     ready: oneshot::Sender<Result<(SourceId, u64), ObjectSnapshotError>>,
     mut commands: mpsc::Receiver<SnapshotCommand>,
 ) where
@@ -456,6 +505,7 @@ fn run_snapshot_worker<F>(
                 max_records,
                 max_bytes,
                 &include,
+                &heads_visited,
                 &snapshot,
                 versions_cf,
                 &mut pending,
@@ -483,6 +533,7 @@ fn pull_snapshot_frame<F, I>(
     max_records: u32,
     max_bytes: u64,
     include: &F,
+    heads_visited: &AtomicU64,
     snapshot: &rocksdb::SnapshotWithThreadMode<'_, rocksdb::DB>,
     versions_cf: &rocksdb::ColumnFamily,
     pending: &mut Option<CurrentObjectSnapshot>,
@@ -510,6 +561,7 @@ where
                     *exhausted = true;
                     break None;
                 }
+                heads_visited.fetch_add(1, Ordering::Relaxed);
                 let record =
                     decode_current_head(identity, &key, &encoded_head, snapshot, versions_cf)?;
                 if path_is_within_prefix(&record.exact_path, path_prefix) && include(&record) {
