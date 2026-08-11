@@ -198,6 +198,32 @@ and commits the head, version, receipt, reference evidence, journal event, and
 journal counters in one synchronous `WriteBatch`. Metadata replicas do not
 append duplicate source events.
 
+The physical journal tail is not by itself a visibility guarantee. A
+distributed coordinator can durably append its candidate before the complete
+metadata quorum has acknowledged it. The journal therefore stores one durable
+`settled_through` watermark alongside its existing counters. It advances only
+over a contiguous prefix for which the selected mutation is proven at the
+fixed metadata quorum. Public watches, index builders, accounting workers, and
+scoped snapshot boundaries consume only through that watermark.
+
+The coordinator retains one bounded proof value at each unsettled object
+position. The proof contains the exact typed object, retained-version-delete,
+or program-path metadata mutation and no payload bytes. Recovery can replay an
+ordinary object or retained-version mutation to its current fixed replica
+group and then re-read the quorum. Atomic-program mutations remain owned by the
+nominated executor's existing committed-tail recovery; journal settlement only
+verifies their resulting exact proofs. Missing or split proof evidence stops at
+that position rather than stepping over an unknown outcome.
+
+Single-node mutations whose metadata and reference effects share the original
+RocksDB batch stage the new settled watermark in that same batch. Distributed
+recovery writes it once per bounded proven page. A crash before the watermark
+write safely repeats proof work; a crash after it trusts the already proven
+prefix. Membership cutover requires every old source's settled watermark to
+equal its physical tail before activating the new placement. Because the
+watermark is durable source-journal state, restart and later node additions do
+not require an inventory or transfer of historical proof records.
+
 The journal carries invalidations and exact transition evidence, not object
 payload bytes. It supports:
 
@@ -210,6 +236,12 @@ Reference-delivery cursors constrain journal compaction because losing those
 deltas can make object garbage collection unsafe. Public watches, indexes, and
 accounting do not constrain it. They report an expired cursor or rebuild their
 own derived view after a gap.
+
+Reference-delivery safety and public visibility are separate cuts. The former
+is reconstructed from durable destination cursors after restart and alone
+controls journal pruning. The durable settled watermark controls visibility
+and never claims that physical reference effects have reached every shard
+owner.
 
 The journal remains bounded by configured entry and byte limits. This is
 correct: retained change history scales with a configured window, not stored
@@ -248,7 +280,7 @@ trusted transition.
 
 ### 7.2 `definition_state` column family
 
-The new column family contains three key domains. Keys begin with a storage
+The new column family contains four key domains. Keys begin with a storage
 format byte and a domain byte; ordered numeric components are big-endian.
 Values use an explicit versioned encoding and reject unknown required versions.
 
@@ -264,6 +296,10 @@ ASSIGNED
 CHECKPOINT
   [format][C][consumer_kind][source_node_id]
     -> { source_epoch, next_offset, observed_fence }
+
+RECONCILED
+  [format][R]
+    -> { membership_fence }
 ```
 
 An UPSERT transaction writes or replaces the locator. A DELETE removes it. The
@@ -277,6 +313,11 @@ idempotent assignment delivery and advancing its source checkpoint is one local
 RocksDB batch. A crash observes either both or neither. An assignment is used
 only after exact-reading the ordinary definition at the recorded version and
 rechecking current weighted-HRW placement.
+
+The single local `RECONCILED` record is only crash-recovery progress for the
+rare membership-triggered locator inventory. It is sync-written after both
+definition kinds finish and the membership fence is rechecked. It contains no
+definition identity, cursor, payload, ownership decision, or authority.
 
 The column family never contains definition payloads. Deleting it can delay or
 rebuild derived capabilities but cannot lose ordinary data or grant access.
@@ -296,11 +337,48 @@ Failure to deliver does not block the original object mutation or source-journal
 retention. If the route falls behind retention, the affected projection enters
 `RECONCILING` and inventories definition locators rather than ordinary heads.
 
+Because a deleted definition has no live locator and assignment records do not
+carry a source identity, a true gap reconciles the affected definition kind as
+a whole; it does not guess which stale assignment came from the gapped source.
+Under one committed membership fence, the reconciler streams each ACTIVE
+node's assignments and locators in bounded pages. Every assignment and locator
+candidate is exact-read from the authoritative ordinary object. Stale,
+deleted, or misplaced assignments receive an idempotent versioned removal;
+live locators recompute the top-three owners and receive idempotent upserts with
+the current rank and fence. Replica locators therefore cannot resurrect a
+deleted definition. Source tails captured before the inventory are replayed
+through the sparse definition routes before the destination checkpoints become
+current. A membership or source-epoch change, or another expired suffix,
+restarts reconciliation. Version and fence ordering lets a concurrent newer
+delivery win. The process uses no atomic registry swap, assignment generation,
+tombstone catalogue, new column family, or corpus-sized in-memory set; an
+interrupted rebuild is safe to repeat and every assignment remains subject to
+exact authoritative-object revalidation.
+
 On membership change, current owners stream their local assignments, recompute
 the top three, and transfer only assignments whose owner set changes. A new
 rank-zero owner exact-reads the definition and the published current pointer
 before it builds. The existing placement fence prevents an old builder from
 publishing after cutover.
+
+Assignment transfer alone cannot discover a definition committed immediately
+before its source disappeared but before its first asynchronous assignment was
+delivered. Every committed membership/source-set change therefore also queues
+the existing bounded whole-kind locator reconciliation for both index and
+accounting definitions. It exact-validates ordinary definition objects and
+repairs only missing, stale, or misplaced assignments. This rare recovery work
+is `O(definitions)`, proceeds in bounded pages after serving is available, and
+never scans ordinary object heads or blocks normal startup.
+
+The lowest ACTIVE node performs that inventory. On its first observation of a
+fence, it skips the inventory only when its durable local `RECONCILED` record
+equals that exact fence. A missing or older record starts the inventory; a
+future or malformed record fails closed. The marker advances only after both
+kinds finish and the fence is rechecked. A crash before or during the inventory
+therefore leaves the old marker and repeats bounded work after restart instead
+of permanently losing an unassigned locator. Other nodes continue their local
+assignment transfer but never write this completion record. A fresh 0.7 volume
+may perform one empty locator inventory on first start.
 
 At one billion live definitions, rebuilding all ownership has an unavoidable
 `O(definitions)` lower bound. The design distributes normal ownership across
@@ -389,8 +467,10 @@ boundary without a cluster-wide frozen snapshot:
 
 1. bind to one committed ACTIVE membership fence and a clear atomic-program
    finalized watermark;
-2. on every required source, take one RocksDB snapshot which includes current
-   heads and that same snapshot's source epoch and tail;
+2. on every required source, wait until its durable settled watermark reaches
+   its physical tail, acquire the source commit fence, and take one RocksDB
+   snapshot which includes current heads and that same snapshot's source epoch
+   and settled tail;
 3. seek and stream only retained current heads matching the stable tenant,
    bucket, and path-prefix scope;
 4. feed frames directly into the bounded builder or accounting accumulator;
@@ -469,13 +549,24 @@ Each ingress:
    process loses its disposable queue.
 
 The matcher lazily prefix-loads only that bucket's ordinary accounting
-definitions, follows sparse accounting-definition changes for the bucket, and
-evicts idle bucket match state under a shared bound. It applies segment-aware
-path-prefix matching once, aggregates by definition, and uses the existing
-idempotent per-definition traffic-source publication path to the definition's
-rank-zero worker. A membership change causes the ingress to rederive and retry
-against the new matcher. Duplicate batch delivery cannot double count because
-the stable batch identity derives stable per-definition flush identities.
+definitions and evicts idle bucket match state under a shared bound. Cached
+definitions have no time-to-live and therefore never create periodic bucket or
+corpus scans. After assignment delivery for an accounting-definition
+transition, the source synchronously sends an idempotent bucket invalidation to
+the current weighted-HRW matcher before advancing its delivery checkpoint. The
+authenticated peer handler verifies the committed fence, ACTIVE caller, and
+current matcher target, takes the existing traffic-delivery gate, and then
+evicts exactly that bucket. A true route gap clears the disposable matcher
+caches on every ACTIVE node before the reconciled delivery checkpoint or
+membership completion marker advances. Duplicate invalidation and clear
+delivery are harmless.
+
+The matcher applies segment-aware path-prefix matching once, aggregates by
+definition, and uses the existing idempotent per-definition traffic-source
+publication path to the definition's rank-zero worker. A membership change
+causes the ingress to rederive and retry against the new matcher. Duplicate
+batch delivery cannot double count because the stable batch identity derives
+stable per-definition flush identities.
 
 This adds no authoritative traffic log, per-bucket Raft record, global
 definition catalogue, or durable matcher assignment. The accepted consequence
@@ -542,7 +633,10 @@ age exceeds the request deadline.
 
 Retention never performs one full scan per index on a timer. One node-wide
 bounded scheduler seeks only the reserved artifact prefixes for due definitions,
-persists cursors, staggers work, and enforces record, byte, and time budgets.
+keeps cursors across scheduler ticks, staggers work, and enforces record, byte,
+and time budgets. In 0.7.0 a process restart begins that disposable traversal
+again at the exact definition's artifact prefix; it never widens to unrelated
+objects and every tick remains bounded.
 
 ## 14. Query execution and authorization
 
@@ -635,7 +729,7 @@ Recovery classifies failures instead of mapping every error to a rebuild:
 
 | Failure | Behavior |
 | --- | --- |
-| Peer timeout, temporary unavailability, atomic program in progress | Retain state and retry with bounded backoff. |
+| Peer timeout, temporary unavailability, atomic program in progress | Retain the durable checkpoint, yield the process-local worker lease, and retry through bounded assignment rediscovery. |
 | Membership fence changed before publication | Discard candidate, recompute placement, and resume from a compatible checkpoint when possible. |
 | Source epoch changed or cursor fell below retention floor | Mark the exact definition `RECONCILING` and run one scoped baseline. |
 | Corrupt definition, manifest, component, or unsupported version | Fail that definition closed and alert; do not loop a broad scan. |
@@ -645,7 +739,10 @@ Recovery classifies failures instead of mapping every error to a rebuild:
 | Accounting worker crash | Resume from the last published rollup barrier. |
 
 Shared bounded queues coalesce retries and prevent many definitions from
-starting simultaneous rebuilds after one peer or membership failure.
+starting simultaneous rebuilds after one peer or membership failure. A failed
+definition never retains one of the bounded process-local worker leases while
+waiting: the durable assignment and last published checkpoint are its resume
+point, while incomplete mutable scratch is disposable.
 
 ## 17. Bounded garbage collection and cache recovery
 
@@ -748,6 +845,11 @@ credentials, tokens, or proprietary path names.
 - Route prefixes return exact source-order offsets and are pruned with primary
   journal entries.
 - Old, missing-middle, future, and wrong-epoch routed cursors fail distinctly.
+- Raw tail, durable settled visibility, and reference-safe cuts advance
+  independently; restart preserves only the proven settled prefix.
+- A cancelled or restarted distributed mutation is replayed from its exact
+  typed proof and cannot expose a split or absent quorum through Watch or a
+  derived capability.
 - A new 0.7 volume creates and reopens all required column families without
   scanning heads.
 
@@ -761,6 +863,9 @@ credentials, tokens, or proprietary path names.
   runtime.
 - Upsert, delete, duplicate replay, stale replay, membership change, and rank-zero
   failover preserve exactly one publisher and at most three owners.
+- A crash before or during the lowest-ACTIVE membership locator inventory leaves
+  its durable completion fence old; restart repeats it, while an exact completed
+  fence skips it and a future or malformed fence fails closed.
 - Public exact/list APIs read ordinary definitions and enforce Zanzibar even if
   local assignment state is absent or corrupt.
 

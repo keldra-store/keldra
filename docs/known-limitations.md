@@ -2,6 +2,14 @@
 
 ## Sparse index coordination in 0.7.0
 
+Anvil 0.7.0 supersedes the 0.5.2 and 0.6.x cold definition-discovery
+limitation. Startup and recovery read bounded pages from the transactional
+definition locator and this node's sparse assignment state; they do not scan
+ordinary object heads, the stored corpus, or every bucket. Normal serving
+startup is therefore independent of tenant, bucket, object, and dormant-index
+population. The ordinary definition object remains authoritative and each
+selected locator is exact-read and revalidated before work starts.
+
 Stored-byte and object-count accounting is derived from authoritative object
 state and remains exact at each reported complete checkpoint. Inbound and
 outbound byte totals are bounded usage telemetry rather than a financial
@@ -12,6 +20,23 @@ after an accounting definition or matcher changes can omit traffic bytes.
 Anvil reports dropped batches and bytes; supported-load qualification requires
 both to remain zero. These windows do not affect stored objects, stored-byte
 totals, object counts, authorization, references, or index correctness.
+
+Index-retention traversal cursors are resumable across bounded scheduler ticks
+but are not persisted across a process restart in 0.7.0. After restart, each
+scheduled definition begins retention again from its current published
+generation and the start of its reserved artifact prefix. Serving and startup
+remain O(1), each maintenance tick remains bounded by its configured record,
+byte, and time budget, and exact-version deletion is idempotent. Repeating
+already-inspected maintenance work can delay reclamation; it cannot remove a
+live object or change index results.
+
+The credit-driven source snapshot used for a scoped index baseline is an
+ephemeral peer stream, not a durable server-side lease. A terminal transport
+error therefore restarts that one definition's tenant/bucket/path-prefix
+baseline from its beginning. It never widens into an unrelated-object scan or
+delays core serving, and the preceding complete generation remains current.
+Catch-up and publication state use retryable cursors and are retained across
+transient failures; only the in-progress scoped baseline work is repeated.
 
 ## Streaming indexes in 0.6.0
 
@@ -29,12 +54,12 @@ Tensor remain manifest projections rather than general Git or model-serving
 engines. These are query-feature and performance limits, not weaker
 authorization or visibility semantics.
 
-Index definitions remain ordinary objects rather than a second authoritative
-catalogue. Rebuilding a node's disposable assignment cache therefore scans the
-reserved definition prefix. Query materialization remains disposable and cold
-queries may fetch index blocks before executing. A query always includes
-freshness evidence and continues to serve the preceding complete generation
-while its writer builds the next one.
+In the historical 0.6 implementation, rebuilding a node's disposable
+assignment cache scanned the reserved definition prefix. Anvil 0.7 replaces
+that cold path with the sparse locator described above. Query materialization
+remains disposable and cold queries may fetch index blocks before executing. A
+query always includes freshness evidence and continues to serve the preceding
+complete generation while its writer builds the next one.
 
 One source mutation whose selected payload and required seal workspace cannot
 fit the configured per-kind construction budget cannot be indexed. The writer
@@ -66,11 +91,18 @@ index size, ranking quality and query throughput, not path/version visibility,
 freshness, durability or Zanzibar filtering.
 
 Format-2 cache reads remain mmap-backed and do not copy immutable blocks into a
-second managed heap cache. `ANVIL_INDEX_MEMORY_PERCENT` bounds aggregate
-in-flight block materialization; clean mapped pages are retained or reclaimed
-by the operating system. The first engines use bounded demand reads and only
-explicit prefetch, without format-specific cache-retention priorities. This can
-increase cold-query I/O but cannot change authoritative index bytes or results.
+second managed heap cache. `ANVIL_INDEX_MEMORY_PERCENT` independently bounds
+concurrent block-fetch buffers and retained mappings; each mapping is charged at
+least one 4 KiB page so a large disk cache cannot retain an unbounded number of
+tiny mappings. Live query slices pin their mappings and may temporarily exceed
+the retained-mapping budget until the last slice is dropped. The first engines
+use bounded demand reads and only explicit prefetch, without format-specific
+cache-retention priorities. Full-text and hybrid queries accept at most 32 term
+cursors, while typed-JSON and Git pages retain at most 4 MiB of projected
+records. Concurrent query working sets are bounded per request but do not yet
+share one aggregate byte-admission pool. These limits can reject a pathological
+query or increase cold-query I/O, but cannot change authoritative index bytes or
+results.
 
 Stable index identity, definition version, source checkpoint, atomic watermark
 and build diagnostics are bound once by the immutable generation manifest. A
@@ -272,6 +304,9 @@ release; normal blob reference accounting remains correct, and a later
 maintenance capability will collect those unreachable index generations.
 
 ## Cold index-definition discovery in 0.5.2
+
+This historical limitation is superseded by the sparse, bounded 0.7.0 locator
+recovery described at the start of this document.
 
 Index definitions are ordinary authoritative Anvil objects and there is no
 separate registry or index-specific persistence plane. A node without its
@@ -502,3 +537,46 @@ Path policy correctly prohibits the ordinary `DeleteVersion` API from mutating
 that path, and the 0.5.0 atomic-program DSL has no operation for deleting one
 exact retained version. Operators therefore cannot permanently prune that
 history in Anvil 0.5.0.
+
+## Fixed accounting traffic bounds in 0.7.0
+
+The process-local accounting traffic queue, per-bucket matcher cache, and
+traffic-batch limits use fixed bounded defaults in 0.7.0. A
+sustained ingress rate above those bounds can drop bandwidth-accounting entries;
+Anvil reports the dropped batches and bytes, and stored-byte and object-count
+accounting remains exact. Operators can reduce the risk by sizing or scaling
+ingress nodes so the supported workload records zero drops. Runtime and startup
+configuration for these bounds is deferred to a later release.
+
+The 0.7.0 bandwidth matcher loads one bucket's sparse accounting-definition
+locators only on a cache miss. Definition delivery invalidates that exact
+bucket synchronously, while true-gap reconciliation clears disposable matcher
+caches before its checkpoint advances; there is no periodic matcher rescan. A
+bucket with more than 65,536 accounting definitions or more than 64 MiB of
+decoded matcher state cannot be loaded, so bandwidth entries for that bucket
+are dropped and reported rather than consuming unbounded memory. Very large
+definition sets within the bound can still make a cold load expensive. Stored-
+byte and object-count rollups remain exact, and all ordinary object and
+authorization behavior is unaffected. Operators should use coarse path
+accounting boundaries and monitor the accounting drop metrics.
+
+## Fixed maintenance budgets in 0.7.0
+
+Blob collection and former-placement retirement use fixed bounded work budgets
+in 0.7.0. Each hourly cycle advances through 100 ms-spaced bounded ticks until
+it completes. If sustained churn or slow health probes outpace that bounded
+progress, disk reclamation can lag and local storage can temporarily grow.
+Object availability, reference safety, and acknowledged durability are
+unaffected because maintenance fails closed. Operators should monitor and
+provision disk headroom for high-churn deployments; startup configuration for
+the maintenance budgets and cadence is deferred.
+
+## Accounting baseline restart after a terminal stream failure in 0.7.0
+
+A first accounting build or genuine retained-journal gap consumes a scoped,
+snapshot-bound baseline stream. If that stream ends with a terminal peer error,
+its held RocksDB snapshots cannot be resumed, so Anvil restarts the baseline for
+that same accounting path scope. The last complete rollup remains readable;
+ordinary restarts resume valid rollups, and no unrelated object heads or startup
+inventory are scanned. Operators can retry after peer health returns. A
+resumable cross-node snapshot protocol is deferred.
