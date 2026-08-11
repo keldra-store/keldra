@@ -87,11 +87,47 @@ command -v cargo >/dev/null 2>&1 || {
   echo "cargo is required for the test-only index qualification client" >&2
   exit 2
 }
+command -v jq >/dev/null 2>&1 || {
+  echo "jq is required to resolve Cargo's configured target directory" >&2
+  exit 2
+}
 command -v git >/dev/null 2>&1 || {
   echo "git is required for the smart HTTP gateway qualification" >&2
   exit 2
 }
 docker compose version >/dev/null
+
+qualification_examples=(
+  accounting_qualification
+  atomic_index_qualification
+  cluster_index_qualification
+  index_recovery_qualification
+  personaldb_qualification
+  s3_qualification
+  v06_index_resource_qualification
+)
+qualification_example_flags=()
+for qualification_example in "${qualification_examples[@]}"; do
+  qualification_example_flags+=(--example "${qualification_example}")
+done
+cargo_target_dir="$(
+  cargo metadata --quiet --locked --no-deps --format-version 1 \
+    --manifest-path "${repo_root}/Cargo.toml" \
+    | jq --exit-status --raw-output \
+      '.target_directory | select(type == "string" and length > 0)'
+)"
+cargo build --quiet --locked --package anvil-server \
+  --manifest-path "${repo_root}/Cargo.toml" \
+  "${qualification_example_flags[@]}"
+
+declare -A qualification_binaries=()
+for qualification_example in "${qualification_examples[@]}"; do
+  qualification_binaries["${qualification_example}"]="${cargo_target_dir}/debug/examples/${qualification_example}"
+  if [[ ! -x "${qualification_binaries[${qualification_example}]}" ]]; then
+    echo "Cargo did not produce executable ${qualification_binaries[${qualification_example}]}" >&2
+    exit 1
+  fi
+done
 
 image_id="$("${repo_root}/scripts/resolve-docker-image-id.sh" "${requested_image}")"
 server_version="$(
@@ -316,9 +352,7 @@ run_index_recovery_qualification() {
   ANVIL_INDEX_RECOVERY_QUALIFICATION_CLIENT_SECRET="${client_secret}" \
   ANVIL_INDEX_RECOVERY_QUALIFICATION_STATE="${state_path}" \
   ANVIL_INDEX_RECOVERY_QUALIFICATION_BUCKET="${bucket}" \
-    cargo run --quiet --locked --package anvil-server \
-      --manifest-path "${repo_root}/Cargo.toml" \
-      --example index_recovery_qualification
+    "${qualification_binaries[index_recovery_qualification]}"
 }
 
 log_line_count() {
@@ -555,9 +589,7 @@ run_index_resource_qualification() {
   ANVIL_V06_INDEX_RAYON_WORKERS="${index_rayon_workers}" \
   ANVIL_V06_MAX_ANONYMOUS_GROWTH_BYTES="${index_resource_max_anonymous_growth_bytes}" \
   ANVIL_V06_RESOURCE_OUTPUT="${index_resource_report}" \
-    cargo run --quiet --locked --package anvil-server \
-      --manifest-path "${repo_root}/Cargo.toml" \
-      --example v06_index_resource_qualification >/dev/null
+    "${qualification_binaries[v06_index_resource_qualification]}" >/dev/null
   for resource_node in anvil-1 anvil-2 anvil-3; do
     save_log_suffix \
       "${resource_node}" "${resource_log_starts[${resource_node}]}" \
@@ -863,9 +895,7 @@ verify_existing_indexes() {
   ANVIL_INDEX_QUALIFICATION_CLIENT_ID=qindex-client \
   ANVIL_INDEX_QUALIFICATION_CLIENT_SECRET="${index_secret}" \
   ANVIL_INDEX_QUALIFICATION_STATE_INPUT="${index_verification_state}" \
-    cargo run --quiet --locked --package anvil-server \
-      --manifest-path "${repo_root}/Cargo.toml" \
-      --example cluster_index_qualification
+    "${qualification_binaries[cluster_index_qualification]}"
 }
 
 assert_index_retention_converged() {
@@ -998,9 +1028,7 @@ run_atomic_index_qualification() {
   ANVIL_ATOMIC_INDEX_QUALIFICATION_BUCKET="atomic-index-three-${$}" \
   ANVIL_ATOMIC_INDEX_QUALIFICATION_CLIENT_ID=qatomic-client \
   ANVIL_ATOMIC_INDEX_QUALIFICATION_CLIENT_SECRET="${atomic_secret}" \
-    cargo run --quiet --locked --package anvil-server \
-      --manifest-path "${repo_root}/Cargo.toml" \
-      --example atomic_index_qualification
+    "${qualification_binaries[atomic_index_qualification]}"
   echo "[anvil-qualification] distributed atomic-program index visibility passed"
 }
 
@@ -1552,9 +1580,7 @@ ANVIL_INDEX_QUALIFICATION_CLIENT_ID=qindex-client \
 ANVIL_INDEX_QUALIFICATION_CLIENT_SECRET="${index_secret}" \
 ANVIL_INDEX_QUALIFICATION_REQUIRE_QUIESCENCE=1 \
 ANVIL_INDEX_QUALIFICATION_STATE_OUTPUT="${index_verification_state}" \
-  cargo run --quiet --locked --package anvil-server \
-    --manifest-path "${repo_root}/Cargo.toml" \
-    --example cluster_index_qualification
+  "${qualification_binaries[cluster_index_qualification]}"
 test -s "${index_verification_state}"
 save_index_qualification_logs
 echo "[anvil-qualification] distributed index qualification passed"
@@ -1572,9 +1598,7 @@ ANVIL_ACCOUNTING_QUALIFICATION_TENANT=qaccounting \
 ANVIL_ACCOUNTING_QUALIFICATION_BUCKET="accounting-three-${$}" \
 ANVIL_ACCOUNTING_QUALIFICATION_CLIENT_ID=qaccounting-client \
 ANVIL_ACCOUNTING_QUALIFICATION_CLIENT_SECRET="${accounting_secret}" \
-  cargo run --quiet --locked --package anvil-server \
-    --manifest-path "${repo_root}/Cargo.toml" \
-    --example accounting_qualification
+  "${qualification_binaries[accounting_qualification]}"
 echo "[anvil-qualification] distributed accounting qualification passed"
 
 personaldb_secret=qualification-personaldb-secret-0000000000000000000
@@ -1583,9 +1607,7 @@ ANVIL_PERSONALDB_QUALIFICATION_ENDPOINTS="$(IFS=,; echo "${public_endpoints[*]}"
 ANVIL_PERSONALDB_QUALIFICATION_TENANT=qpersonaldb \
 ANVIL_PERSONALDB_QUALIFICATION_CLIENT_ID=qpersonaldb-client \
 ANVIL_PERSONALDB_QUALIFICATION_CLIENT_SECRET="${personaldb_secret}" \
-  cargo run --quiet --locked --package anvil-server \
-    --manifest-path "${repo_root}/Cargo.toml" \
-    --example personaldb_qualification
+  "${qualification_binaries[personaldb_qualification]}"
 echo "[anvil-qualification] distributed PersonalDB qualification passed"
 
 s3_secret=qualification-s3-secret-00000000000000000000000000
@@ -1594,9 +1616,7 @@ ANVIL_S3_QUALIFICATION_ENDPOINTS="$(IFS=,; echo "${public_endpoints[*]}")" \
 ANVIL_S3_QUALIFICATION_CLIENT_ID=qs3-client \
 ANVIL_S3_QUALIFICATION_CLIENT_SECRET="${s3_secret}" \
 ANVIL_S3_QUALIFICATION_BUCKET="s3-three-${$}" \
-  cargo run --quiet --locked --package anvil-server \
-    --manifest-path "${repo_root}/Cargo.toml" \
-    --example s3_qualification
+  "${qualification_binaries[s3_qualification]}"
 echo "[anvil-qualification] distributed official AWS SDK S3 qualification passed"
 run_git_qualification
 
