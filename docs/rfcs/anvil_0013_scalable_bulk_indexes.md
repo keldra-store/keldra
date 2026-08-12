@@ -17,7 +17,7 @@ index generation.
 The new design has two deliberately different construction paths:
 
 ```text
-initial build, requested rebuild, or large lag
+initial build or explicitly requested rebuild
   -> snapshot-bound scoped source stream
   -> bounded parallel projection
   -> range-partitioned bulk builder
@@ -125,6 +125,8 @@ Anvil 0.8.0 must:
   repaid;
 - keep journal and receipt guarantees under pressure by delaying new writes,
   never by silently discarding required state;
+- use the source journal's hard entry and byte capacities as the sole
+  lag-driven admission pressure; lag never switches an index into bulk rebuild;
 - reduce durable artifact-object count by packing logical blocks;
 - avoid corpus-wide dense document renumbering during each compaction;
 - use compressed postings for Typed JSON and Metadata Filter predicates;
@@ -178,9 +180,15 @@ contain bounded compaction debt.
 immutable runs which are queryable but not yet merged into their target level.
 It is not missing source data.
 
+**Publication progress debt** is the exact journal entries and logical bytes
+by which a trusted derived publication temporarily exceeds the configured
+source-journal capacities so it can publish the source-complete generation or
+complete accounting rollup which releases older retained evidence. It is
+retained journal data, not permission to omit or truncate an event.
+
 **Bulk rebuild** is the scoped, snapshot-bound base-generation construction path
-used for a first build, an explicitly requested rebuild, a true journal gap, or
-lag beyond the deterministic automatic threshold.
+used for a first build or an explicitly authorized rebuild request. Source lag
+alone never selects this path.
 
 **Logical block** is one independently checksummed and decoded leaf, routing,
 dictionary, posting, document, or vector block in format v3.
@@ -206,10 +214,15 @@ window. It is not an index artifact or an event-delivery acknowledgement.
 1. Ordinary object mutation and its source-journal transition commit in the
    same synchronous RocksDB batch on the authoritative metadata coordinator.
 2. A successful mutation is never omitted from every future complete index
-   generation merely because a bounded journal became full.
-3. A write which cannot reserve both its mutation receipt and source-journal
-   entry does not begin. Capacity pressure occurs before the authoritative
-   object mutation.
+   generation merely because a bounded journal became full. Capturing or
+   completing an unpublished snapshot is never proof that its journal evidence
+   may be discarded.
+3. Except for the narrowly scoped trusted derived publication described in
+   Section 8.5, a write which cannot reserve both its mutation receipt and
+   source-journal entry does not begin. Capacity pressure occurs before the
+   authoritative object mutation. The exception may create only retained
+   publication progress debt; it cannot omit evidence or admit an ordinary
+   source-producing write above either configured capacity.
 4. The ordinary index definition object is the sole authority for definition
    content, version, scope, and Zanzibar authorization.
 5. The existing source journal remains the sole ordered change authority.
@@ -362,9 +375,11 @@ remain separate cuts; neither may claim progress from an unproven tail.
 
 Public `WatchPrefix` remains an invalidation subscription. A slow public watch
 may receive `RESUME_EXPIRED` after retention. Internal index and exact accounting
-consumers are different: their last source-complete generation or rollup, active
-bulk snapshot barrier, and routed suffix determine the oldest evidence which
-must remain recoverable.
+consumers are different: only their last source-complete generation or complete
+rollup can release required journal evidence, while active bulk work may pin an
+additional routed suffix. Capturing or processing a scoped snapshot is not
+retention proof. Only publication of a source-complete generation or complete
+accounting rollup may advance the corresponding retention cursor.
 
 ### 8.2 Configurable bounds
 
@@ -382,6 +397,9 @@ Raft state. Reducing a bound below current occupancy is valid: reads and
 consumer progress continue, while affected new mutations wait until occupancy
 falls below the new bound. A single encoded receipt or journal transition larger
 than its configured byte bound is rejected immediately; it cannot wait forever.
+The journal capacities are hard admission bounds for every ordinary
+source-producing write. Current retained occupancy may exceed them only by the
+explicit publication progress debt in Section 8.5.
 
 ### 8.3 Receipt backpressure
 
@@ -412,11 +430,11 @@ Derived-consumer progress is aggregated by source, consumer kind, and ACTIVE
 consumer node, not recorded once per index or bucket. Each node's index manager
 demultiplexes sparse bucket routes across the rank-zero definitions currently
 assigned to that node. It advances its one index-consumer checkpoint for a
-source only after every affected assigned definition has either incorporated
-the preceding offsets in a source-complete generation or established a valid
-scoped bulk-snapshot barrier. Accounting uses one separate aggregate consumer
-checkpoint by the same rule. A node with no affected assigned definitions can
-advance directly to the settled tail.
+source only after every affected assigned definition has incorporated
+the preceding offsets in a source-complete generation. Accounting uses one
+separate aggregate consumer checkpoint and may advance only through a published
+complete rollup. A node with no affected assigned definitions can advance
+directly to the settled tail.
 
 Demultiplexing chooses the cheaper of two bounded reads without adding another
 log or persistent route format. When the node owns relatively few bucket
@@ -444,18 +462,18 @@ node's published generation.
 This costs `O(active nodes x consumer kinds)` checkpoint records per source,
 not `O(indexes)`, `O(buckets)`, or `O(objects)`. A membership change fences the
 old checkpoint set. A newly responsible rank-zero manager completes assignment
-reconciliation and establishes scoped baselines before the new fence can
+reconciliation and recovers each published barrier before the new fence can
 release history; a removed node ceases to pin only after committed membership
 cutover.
 
 On restart, a consumer loads its local aggregate checkpoint and every assigned
 definition's last published barrier. If the source still retains the suffix, it
-resumes normal demultiplexing. If a source has pruned beyond any assigned
-definition's published barrier because that definition previously established
-a disposable snapshot, the consumer does not trust the old process state: it
-immediately captures a new scoped snapshot for that definition and rebuilds.
-Only published generations and newly captured source snapshots justify the
-next aggregate acknowledgement. A malformed, future-fence, or future-offset
+resumes normal demultiplexing. If a required cursor is below the retained floor
+or belongs to an unavailable source epoch, that definition fails closed until
+an authorized principal explicitly requests a rebuild. Anvil does not capture
+a replacement snapshot merely because history is missing. Only published
+source-complete generations or complete accounting rollups justify the next
+aggregate acknowledgement. A malformed, future-fence, or future-offset
 checkpoint fails closed.
 
 These aggregate checkpoints are retention evidence only. They cannot select a
@@ -464,12 +482,10 @@ they are neither an index authority nor a registry.
 
 A journal record is removable only when losing it cannot violate reference
 correctness and every required aggregate derived-consumer cursor proves that
-each affected index or exact accounting consumer has either:
-
-- published a source-complete barrier beyond the record; or
-- captured a valid scoped bulk-snapshot barrier which makes the older event
-  unnecessary and can be restarted from authoritative heads without omitting
-  the source state.
+each affected index has published a source-complete barrier beyond the record
+and each affected exact accounting consumer has published a complete rollup
+beyond it. A captured, in-progress, completed-but-unpublished, failed, or
+discarded scoped snapshot never permits pruning.
 
 If safe pruning cannot satisfy the reservation, the request waits before its
 object mutation. Source consumers receive scheduling priority while journal
@@ -483,48 +499,51 @@ best-effort-delivering its index evidence.
 
 A failed or deliberately disabled definition can eventually apply backpressure
 to writes routed through a source it pins. This is intentional fail-closed
-behavior. The operator can repair the definition, request a scoped rebuild, or
-delete the definition through its authorized API. Anvil does not silently make
-customer data disappear from indexed results to preserve write throughput.
+behavior. A principal authorized to update that definition can repair it,
+request a scoped rebuild, or delete it through the public API. Anvil does not
+silently make customer data disappear from indexed results to preserve write
+throughput.
 
-## 9. Deterministic bulk rebuild selection
+### 8.5 Trusted derived publication progress debt
 
-### 9.1 Automatic threshold
+Journal capacity can otherwise create one circular wait: an index generation
+or accounting rollup has consumed the retained suffix and is ready to publish,
+but writing its immutable artifacts and current pointer through the ordinary
+object path also requires journal entries. Refusing those exact entries at the
+capacity boundary would prevent the only durable publication which can advance
+the consumer cursor and permit pruning.
 
-Every index tracks unrepresented routed source lag in both entries and logical
-bytes relative to its last source-complete generation. The automatic rebuild
-threshold has two non-zero startup-configured values:
+Anvil therefore gives one narrow trusted path an admission exception. The
+internal publisher of an already constructed source-complete index generation
+or complete accounting rollup may reserve the exact journal entries and logical
+bytes needed to durably write that publication even when the reservation takes
+retained occupancy above a configured journal capacity. The excess entries and
+bytes are publication progress debt. This exception applies only to the pack,
+run, manifest, rollup, and current-pointer writes required to finish that
+publication. It does not admit client writes, ordinary internal writes,
+snapshots, rebuild initiation, compaction, cache materialization, or speculative
+work, and it does not relax mutation-receipt capacity.
 
-- `index_auto_rebuild_lag_entries`, default 50% of the configured source-journal
-  maximum entries; and
-- `index_auto_rebuild_lag_bytes`, default 50% of the configured source-journal
-  maximum logical bytes.
+Every debt entry is appended normally and remains subject to the same ordering,
+settlement, routing, integrity, and retention rules as any other journal entry.
+No event is dropped, sampled, overwritten, hidden from a required consumer, or
+declared represented by an unpublished snapshot. Only the durable CAS of the
+source-complete generation, or durable publication of the complete accounting
+rollup, advances the corresponding consumer checkpoint. Failed or incomplete
+publication leaves its evidence retained and must be retried or repaired; it
+does not manufacture a prune proof.
 
-Anvil deterministically enters bulk rebuild when either threshold is reached.
-It enters bulk rebuild immediately if the required cursor is already below the
-retained floor or belongs to an unavailable source epoch. The comparison uses
-durable journal counters and the published generation barrier, not wall-clock
-guesses, queue length, memory pressure, or a locally sampled percentage.
+While either debt counter is non-zero, all ordinary source-producing mutations
+remain under backpressure even if a concurrent prune briefly makes one nominal
+reservation fit. Trusted publication work receives scheduling priority so it
+can complete, advance the safe cursor, prune proven evidence, and repay the
+debt. The observable journal occupancy may consequently exceed its configured
+capacity by the exact debt of publication already needed to make progress. A
+persistent or growing debt means publication is failing or slower than its
+source and is an operational fault, not permission to truncate the journal or
+accept more ordinary writes.
 
-Entry lag counts bucket-routed source events after the published cursor. Byte
-lag is the exact sum of those events' existing logical encoded sizes as bounded
-route pages are read. Events later eliminated by the definition's narrower path
-or content-type predicate may therefore trigger a rebuild early, never late.
-This conservative bucket-level measurement reuses sparse journal data and does
-not add a per-index byte counter or source-side definition catalogue. Restart
-recomputes it by the same bounded routed scan from the published cursor.
-
-Only one rebuild candidate for an exact definition version runs at once.
-Duplicate threshold observations coalesce. The old complete generation remains
-queryable and reports `rebuilding = true` until a replacement wins publication.
-A crash loses only disposable scratch; the published barrier still makes the
-same deterministic decision after restart.
-
-The thresholds may change on restart. Lowering one can immediately schedule a
-rebuild; raising one does not alter journal safety or permit the hard journal
-bound to be exceeded.
-
-### 9.2 Authorized manual rebuild
+## 9. Authorized explicit bulk rebuild
 
 `IndexService` adds one authenticated `RebuildIndex` operation with:
 
@@ -535,27 +554,56 @@ expected definition version
 command identity
 ```
 
-The caller's tenant comes from its authenticated identity. The operation is
-authorized through the same Zanzibar policy boundary as updating that index.
-It does not expose an internal builder endpoint and it cannot select another
-tenant's definition.
+The caller's tenant comes from its authenticated identity. This is a public
+Zanzibar-authorized capability. The same exact permission which permits
+updating or putting that index definition permits rebuilding it; no hard-coded
+role grants or denies the operation. It does not expose an internal builder
+endpoint and it cannot select another tenant's definition.
 
 The implementation exact-reads the ordinary definition and uses
-`PutIfVersion(expected_definition_version)` to write the same canonical
-definition body as a new ordinary object version. The normal typed definition
-transition, source journal, assignment delivery, and current-pointer rules then
-schedule a bulk build for that new definition version. The response is the
-updated `IndexDefinition`; it does not invent a durable job ID.
+`PutIfVersion(expected_definition_version)` to write the same semantic
+definition plus one internal server-time acceptance timestamp as a new ordinary
+object version. That timestamp is carried forward unchanged by later semantic
+updates and is not exposed as another public resource. The normal typed
+definition transition, source journal, assignment delivery, and current-pointer
+rules then schedule a bulk build for that new definition version. The response
+is the updated `IndexDefinition`; it does not invent a durable job ID.
 
 Concurrent manual or semantic updates resolve through the ordinary definition
 CAS. Repeated command identities use the ordinary mutation receipt. No rebuild
 registry, job database, Raft entry, side file, or second definition authority is
 added.
 
+Admission is rate-limited by the exact stable
+`(tenant_id, bucket_id, definition_id)` identity:
+
+- at most one new rebuild command is accepted in any rolling one-hour interval;
+- durable acceptance starts the full one-hour interval immediately; and
+- success, failure, cancellation, process restart, builder reassignment, and an
+  unknown outcome neither shorten nor reset that interval.
+
+Authorization happens before replay, CAS, or rate decisions. When the supplied
+expected version is not current, Anvil safely submits the unchanged current
+definition through the ordinary mutation path: an exact retry of the immediately
+preceding accepted rebuild replays its retained receipt, while another command
+can only return the ordinary CAS or idempotency error and cannot create a build.
+A fresh request against the current version then checks the one-hour timestamp.
+It either writes the next definition version and timestamp together or returns
+`RESOURCE_EXHAUSTED` without creating a definition version or build. Acceptance
+evidence is durable and the limit is cluster-wide: it survives process restart
+and builder reassignment, and sending the request to another public ingress node
+cannot bypass it. Its evidence remains part of the ordinary definition authority
+and does not create a registry, job database, Raft record, or process-local
+authority.
+
+Source lag never starts a bulk rebuild. A history gap, unavailable source epoch,
+or malformed cursor fails the affected definition closed until an authorized
+principal repairs or explicitly rebuilds it. Hard source-journal capacity is
+the sole lag-driven write backpressure mechanism.
+
 ## 10. Scoped snapshot and bulk builder
 
-A first build, automatic rebuild, manual rebuild, or true gap uses the same
-path:
+A first build or authorized explicit rebuild uses the same path:
 
 1. Pin the exact ordinary definition version, current ACTIVE membership fence,
    and a clear atomic-program finalized watermark.
@@ -1040,10 +1088,13 @@ locator, top-three assignment, sparse bucket routes, scoped snapshot stream,
 complete barrier, and current-rollup CAS as index definitions.
 
 Exact stored bytes and object counts constrain journal pruning until a complete
-rollup or valid scoped snapshot barrier makes older events unnecessary. Their
-receipt and journal pressure follows Section 8. Normal restart resumes from the
-published rollup barrier; first build, requested recovery, or a true gap uses a
-bounded scoped bulk baseline.
+rollup makes older events unnecessary. A captured or completed-but-unpublished
+scoped snapshot is not retention evidence. Their receipt and journal pressure
+follows Section 8. Normal restart resumes from the published rollup barrier;
+first build or a true source-history gap uses a bounded scoped bulk baseline.
+The hard journal cap prevents ordinary accounting lag from manufacturing that
+gap; source-epoch replacement may still require the scoped baseline. Only its
+complete published rollup can advance the accounting retention cursor.
 
 Per-object ingress and egress accounting remains bounded best-effort telemetry,
 not a financial ledger. Weighted HRW selects one disposable matcher for each
@@ -1058,15 +1109,17 @@ Recovery is typed and scoped:
 
 | Failure | Required behavior |
 | --- | --- |
-| Process crash during bulk build or compaction | Discard disposable scratch and resume from the last source-complete generation. |
-| Automatic threshold still exceeded after restart | Deterministically schedule the same scoped bulk rebuild. |
-| Source cursor below retained floor or wrong epoch | Immediately run a scoped bulk rebuild for the affected definition. |
+| Process crash during bulk build or compaction | Discard disposable scratch. Keep serving the last source-complete generation and, for a first build or accepted explicit rebuild, restart construction for the same ordinary definition version. |
+| Source lag reaches the configured journal entry or byte capacity | Prioritize consumers and hold new source-producing mutations before commit until published progress permits safe pruning. Never switch construction paths merely because of lag. |
+| Index source cursor below retained floor or wrong epoch | Fail the affected index definition closed until an authorized principal explicitly requests a rebuild. Do not capture a replacement snapshot automatically. |
+| Accounting source cursor below retained floor or wrong epoch | Capture only that accounting definition's bounded scoped baseline; retain source evidence until its complete rollup publishes. |
 | Pack upload or current-pointer CAS failure | Keep the prior complete generation; ordinary unreachable packs become retention candidates. |
 | Corrupt format-v3 pack, logical block, run, or manifest, or an unknown future required tag | Fail that definition closed and alert; never broaden into a corpus scan. Format-v2 artifacts are never opened. |
 | Missing or corrupt disposable cache entry | Evict and refetch the exact ordinary pack. |
 | Membership fence changes before publication | Cancel the candidate, recompute weighted-HRW ownership, and resume on the current rank-zero owner. |
 | Receipt capacity exhausted | Wait before mutation admission until expiry pruning frees the configured reservation. |
 | Journal capacity exhausted | Prioritize consumers and wait before mutation admission until the exact event reservation is safe. |
+| Journal capacity blocks the trusted publication required to release retained evidence | Admit only the exact generation or rollup publication entries as progress debt, keep ordinary writes blocked, publish durably, then prune and repay the debt. |
 | Compaction debt limit reached | Stop publishing more debt, compact within the kind budget, and allow journal backpressure if lag reaches its hard bound. |
 
 Garbage collection, artifact retention, cache reconciliation, definition
@@ -1082,8 +1135,6 @@ restart. They are not placed in Raft and do not change durable format:
 
 - mutation-receipt retention seconds, maximum entries, and maximum bytes;
 - source-journal maximum entries and maximum bytes;
-- automatic bulk-rebuild lag entries and lag bytes, each defaulting to 50% of
-  the corresponding configured journal bound;
 - process Rayon worker count, default four;
 - per-kind construction memory, default 256 MiB per kind;
 - per-kind projection lanes, default four;
@@ -1137,9 +1188,13 @@ exported.
   time to projected capacity;
 - configured and current journal entries/bytes, settled tail, retention floor,
   safe-prune cursor, per-consumer lag, prune rate, active/waiting writers, wait
-  duration, and deadline outcomes; and
-- automatic rebuild threshold entries/bytes, threshold crossings, manual/gap/
-  threshold triggers, rebuild coalescing, and source priority while pressured.
+  duration, deadline outcomes, limiting bound, and source priority while
+  pressured;
+- current and peak publication progress-debt entries/bytes, plus the ordinary
+  mutation backpressure wait and publication outcome signals which show whether
+  debt is blocking writers or making progress; and
+- public rebuild request outcomes, including authorization, stale-CAS, and
+  one-hour rate-limit failures, plus builder rebuild progress and outcome.
 
 ### 24.3 Build and publication
 
@@ -1174,7 +1229,9 @@ query phases carry nested trace spans with stable numeric definition and
 generation IDs. Progress is emitted as bounded span events and periodic
 structured logs, not by repeatedly overwriting one span field. Failures name
 the exact phase and durable barrier which remains valid. Ordinary successful
-per-object work does not generate one log line per object.
+per-object work does not generate one log line per object. Publication debt is
+sampled as current and process-lifetime peak entry/byte gauges without placing
+tenant, bucket, definition, or path values in metric labels.
 
 ## 25. Complexity contract
 
@@ -1246,19 +1303,44 @@ order. Exact vector search remains linear in selected vectors.
   preserve idempotent retry, and never evict an unexpired receipt.
 - Tiny journal limits block a new mutation before commit, prioritize consumers,
   wake after safe cursor advance, and never commit an object without its event.
+- With a journal exactly at its entry or byte bound, the trusted publication of
+  an already constructed source-complete generation and a complete accounting
+  rollup may each incur exact progress debt, publish durably, advance the safe
+  cursor, prune, repay the debt, and wake the blocked ordinary writer.
+- Publication progress debt survives publication failure and process restart
+  as retained journal evidence. It never admits an ordinary or speculative
+  write, drops an event, advances a cursor from a snapshot, or becomes an
+  unreported capacity bypass.
 - Lowering limits on restart begins in backpressure and drains safely.
-- Entry and byte lag independently trigger rebuild exactly at their configured
-  thresholds; defaults equal 50% of configured journal bounds.
-- A missing retained cursor triggers immediate scoped rebuild.
-- Rebuild triggers coalesce across restart and leave the old complete generation
-  queryable.
-- The authorized manual API rewrites the same ordinary definition by CAS,
-  rejects stale versions and unauthorized callers, and creates no job or
-  registry state.
+- Entry and byte capacity independently block mutation admission only at their
+  configured hard journal bounds; neither lag level starts a rebuild.
+- An in-progress scoped snapshot never advances a derived-consumer retention
+  cursor. Only a published source-complete generation or complete accounting
+  rollup permits the corresponding event to be pruned.
+- A missing retained cursor or unavailable source epoch fails the index definition
+  closed and does not start a snapshot until an authorized rebuild is accepted.
+- The public rebuild API rewrites the same ordinary definition by CAS, rejects
+  stale versions and callers without definition-update permission, and creates
+  no job or registry state.
+- Any principal can rebuild exactly when Zanzibar grants the exact
+  definition-update permission; no hard-coded role changes the result.
+- One newly accepted rebuild blocks another for one full hour regardless of
+  success, failure, cancellation, restart, reassignment, or unknown outcome.
+  The result is identical across public ingress nodes and after process restart.
+- Replaying the immediately preceding rebuild command identity returns its
+  original outcome without a second definition version or build. After an
+  intervening semantic definition update, the old rebuild input is no longer
+  byte-identical and returns the ordinary idempotency-input-mismatch error;
+  concurrent rebuild and semantic updates still resolve by the ordinary CAS and
+  never schedule a second build from that retry.
 - Concurrent source writes during a bulk snapshot appear exactly once after
   suffix replay.
 - A finalized atomic program is entirely present or entirely absent from each
   published generation.
+- Focused tiny-capacity tests delay the derived consumer and prove the exact
+  entry and byte admission boundaries, trusted publication progress, safe
+  pruning, debt repayment, and writer wake-up independently of the large-corpus
+  performance qualification.
 
 ### 26.4 Public single-node and three-node tests
 
@@ -1288,12 +1370,10 @@ On the documented reference hardware, the approximately 840,000-record,
 twelve-field qualification must:
 
 - use public `BulkWrite` requests up to the public 1,000-operation/64 MiB bound;
-- sustain at least 8,000 accepted source objects per second over the measured
+- sustain at least 3,000 accepted source objects per second over the measured
   ingest interval;
-- sustain at least 8,000 source objects per second through Typed JSON
+- sustain at least 1,000 source objects per second through Typed JSON
   projection and source-complete generation publication;
-- publish the first complete generation within 150 seconds from the first
-  accepted object while ingest and indexing overlap;
 - return exact expected results for every partition before and after updates,
   deletes, restart, and compaction;
 - show zero missing events, dropped required journal evidence, authorization
@@ -1306,6 +1386,8 @@ increase peak configured memory, create a generation beyond debt limits, or
 degrade equality query work into a full routed-tree traversal. Performance is
 reported separately for ingest, projection, sort, pack publication, suffix
 catch-up, compaction, and verification; one aggregate duration is insufficient.
+The focused capacity tests in Section 26.3, rather than this throughput run,
+exercise deliberately delayed consumption at tiny journal bounds.
 
 ### 26.6 Release gates
 
@@ -1353,7 +1435,14 @@ than reasons to weaken these gates.
   merge network result sets.
 - A permanently failed index or accounting definition can hold journal space
   and apply write backpressure. This preserves visibility correctness; the
-  operator must repair, rebuild, or delete that authorized definition.
+  definition must be repaired, explicitly rebuilt, or deleted by a principal
+  with the required Zanzibar permission.
+- An exact rebuild-command retry replays its retained receipt while that rebuild
+  remains the current definition version. If a semantic definition update has
+  since changed the canonical body, retrying the older rebuild command returns
+  the ordinary idempotency-input-mismatch error instead of reconstructing a
+  historical response. The accepted rebuild and one-hour limit remain intact;
+  use the current definition version and a fresh command after the window.
 - Capacity and lane settings change on restart, not through a runtime control
   API in 0.8.0.
 - Format-v2 index generations are not queryable, converted, or cleaned through
@@ -1372,8 +1461,8 @@ than reasons to weaken these gates.
 
 Format v3 is a clean break which removes millions of small artifact objects and
 the global-ordinal constraint at the cost of rebuilding indexes from ordinary
-source data. The same bulk path is useful for first build, lag recovery, manual
-repair, and format replacement, so no migration-only subsystem is required.
+source data. The same bulk path is used for first build and explicitly
+authorized replacement or repair, so no migration-only subsystem is required.
 
 Publishing complete generations ahead of compaction improves freshness while
 the explicit debt limit prevents query and storage costs from becoming

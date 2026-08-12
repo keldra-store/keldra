@@ -14,6 +14,7 @@ This clean boundary keeps the serving and recovery paths small and predictable.
 | Query placement | One weighted-HRW owner executes a query. Large indexes may fetch ordinary pack objects, but there is no scatter/gather query engine. |
 | Oversized source values | One selected payload and its fixed projection workspace must fit that index kind's configured construction budget. Other definitions and object operations remain available. |
 | Failed definitions | A definition which cannot advance can eventually apply write backpressure rather than allow accepted objects to disappear from future indexed results. Repair, rebuild, or delete the authorized definition. |
+| Rebuild retry after semantic update | Retrying an accepted rebuild command replays normally while that rebuild remains the current definition version. If a later semantic update changes the canonical definition body, the older command returns the ordinary idempotency-input-mismatch error; it never starts another build or resets the durable one-hour window. Retry later with the current definition version and a fresh command. |
 | Runtime tuning | Journal, receipt, builder, compaction, query, cache, and retention limits are startup settings and change on restart. |
 | Pack range reads | A cold logical-block read may fetch its complete ordinary pack where the underlying object path cannot provide an efficient range; packs have a fixed 16 MiB target. |
 | Build scratch | Secondary-key external sort uses disposable bounded local scratch. A crash repeats the affected scoped build. |
@@ -181,9 +182,9 @@ Unsupported or corrupt format-2 derived objects are rejected when discovery or
 generation loading encounters them. Startup does not scan every dormant object
 under the reserved index prefix. An invalid candidate cannot replace the
 current generation. If an already-published current pointer or manifest is
-later found corrupt, that definition is unavailable, reports the failure and
-retries rather than preventing unrelated object storage from starting. Delete
-and recreate that definition to rebuild it from authoritative source objects.
+later found corrupt, that definition is unavailable rather than preventing
+unrelated object storage from starting. An authorized principal can use the
+public `RebuildIndex` operation to rebuild it from authoritative source objects.
 
 The implementation dependencies and their selected license options are
 recorded in [the Anvil 0.6 index dependency record](dependency-licenses.md).

@@ -26,7 +26,7 @@ rendezvous hashing.
 | Shared public listener | 0.5.5 | Native gRPC, S3, Git, and administrative APIs share one authorized public endpoint; peer mTLS remains isolated |
 | Streaming succinct indexes | 0.6.0 | Bounded per-kind construction memory, incremental immutable runs, streaming compaction, `sux`-based merged structures, and lazy block materialization |
 | Sparse index coordination | 0.7.0 | Non-blocking startup, transactional definition locators, routed change journals, scoped recovery, resumable accounting, and budgeted maintenance |
-| Scalable bulk indexes | 0.8.0 | Direct bounded bulk builds, packed format-v3 artifacts, stable compressed postings, deterministic rebuilds, and lossless journal backpressure |
+| Scalable bulk indexes | 0.8.0 | Direct bounded bulk builds, packed format-v3 artifacts, stable compressed postings, authorized rebuilds, and lossless journal backpressure |
 | Java client | — | TODO |
 | Python client | — | TODO |
 | Node.js client | — | TODO |
