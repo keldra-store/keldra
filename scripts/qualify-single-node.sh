@@ -302,50 +302,67 @@ docker run --rm --user 0 \
     /qualification/data \
     /qualification/token-signing-key
 
-# The public all-kind workload publishes independently observed generations;
-# use the engine's four-run maintenance bound so it exercises real compaction
-# without manufacturing more than 64 serial generations per kind.
-docker run --detach \
-  --name "${container_name}" \
-  --platform "${platform}" \
-  --publish 127.0.0.1::50051 \
-  --env RUST_LOG=info,anvil::index_runtime::cpu=warn,anvil::index_runtime::retention=debug,anvil::observability::runtime=debug \
-  --env ANVIL_LISTEN=0.0.0.0:50051 \
-  --env ANVIL_PEER_LISTEN=127.0.0.1:50052 \
-  --env ANVIL_DATA_DIR=/var/lib/anvil \
-  --env ANVIL_NODE_ID=1 \
-  --env ANVIL_TOKEN_SIGNING_KEY_FILE=/run/secrets/anvil-token-signing-key \
-  --env ANVIL_RATE_LIMIT_CREDENTIAL_GLOBAL_PER_MINUTE=6000 \
-  --env ANVIL_RATE_LIMIT_CREDENTIAL_GLOBAL_BURST=1000 \
-  --env ANVIL_RATE_LIMIT_CREDENTIAL_CLIENT_PER_MINUTE=600 \
-  --env ANVIL_RATE_LIMIT_CREDENTIAL_CLIENT_BURST=100 \
-  --env "ANVIL_INDEX_DISK_CACHE_BYTES=${index_disk_cache_bytes}" \
-  --env "ANVIL_INDEX_MEMORY_PERCENT=${index_memory_percent}" \
-  --env "ANVIL_INDEX_BUILDER_MEMORY_BYTES_PER_KIND=${index_kind_budget_bytes}" \
-  --env "ANVIL_INDEX_PATH_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
-  --env "ANVIL_INDEX_PATH_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
-  --env "ANVIL_INDEX_METADATA_FILTER_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
-  --env "ANVIL_INDEX_METADATA_FILTER_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
-  --env "ANVIL_INDEX_TYPED_JSON_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
-  --env "ANVIL_INDEX_TYPED_JSON_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
-  --env "ANVIL_INDEX_FULL_TEXT_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
-  --env "ANVIL_INDEX_FULL_TEXT_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
-  --env "ANVIL_INDEX_VECTOR_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
-  --env "ANVIL_INDEX_VECTOR_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
-  --env "ANVIL_INDEX_HYBRID_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
-  --env "ANVIL_INDEX_HYBRID_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
-  --env "ANVIL_INDEX_GIT_SOURCE_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
-  --env "ANVIL_INDEX_GIT_SOURCE_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
-  --env "ANVIL_INDEX_TENSOR_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
-  --env "ANVIL_INDEX_TENSOR_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
-  --env "ANVIL_INDEX_RAYON_WORKERS=${index_rayon_workers}" \
-  --env ANVIL_INDEX_MAX_RUNS_PER_LEVEL=4 \
-  --env ANVIL_INDEX_MAX_RETAINED_GENERATIONS=1 \
-  --env ANVIL_RUN_SYSTEM_BOOTSTRAP=true \
-  --volume "${data_dir}:/var/lib/anvil" \
-  --volume "${signing_key}:/run/secrets/anvil-token-signing-key:ro" \
-  "${image_id}" >/dev/null
-container_started=1
+start_single_node() {
+  local profile="$1"
+  local -a profile_environment=()
+  case "${profile}" in
+    production-debt-default) ;;
+    four-run-compaction)
+      profile_environment=(--env ANVIL_INDEX_MAX_RUNS_PER_LEVEL=4)
+      ;;
+    *)
+      echo "unsupported single-node qualification profile ${profile}" >&2
+      return 1
+      ;;
+  esac
+
+  docker run --detach \
+    --name "${container_name}" \
+    --platform "${platform}" \
+    --publish 127.0.0.1::50051 \
+    --env RUST_LOG=info,anvil::index_runtime::cpu=warn,anvil::index_runtime::retention=debug,anvil::observability::runtime=debug \
+    --env ANVIL_LISTEN=0.0.0.0:50051 \
+    --env ANVIL_PEER_LISTEN=127.0.0.1:50052 \
+    --env ANVIL_DATA_DIR=/var/lib/anvil \
+    --env ANVIL_NODE_ID=1 \
+    --env ANVIL_TOKEN_SIGNING_KEY_FILE=/run/secrets/anvil-token-signing-key \
+    --env ANVIL_RATE_LIMIT_CREDENTIAL_GLOBAL_PER_MINUTE=6000 \
+    --env ANVIL_RATE_LIMIT_CREDENTIAL_GLOBAL_BURST=1000 \
+    --env ANVIL_RATE_LIMIT_CREDENTIAL_CLIENT_PER_MINUTE=600 \
+    --env ANVIL_RATE_LIMIT_CREDENTIAL_CLIENT_BURST=100 \
+    --env "ANVIL_INDEX_DISK_CACHE_BYTES=${index_disk_cache_bytes}" \
+    --env "ANVIL_INDEX_MEMORY_PERCENT=${index_memory_percent}" \
+    --env "ANVIL_INDEX_BUILDER_MEMORY_BYTES_PER_KIND=${index_kind_budget_bytes}" \
+    --env "ANVIL_INDEX_PATH_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
+    --env "ANVIL_INDEX_PATH_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
+    --env "ANVIL_INDEX_METADATA_FILTER_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
+    --env "ANVIL_INDEX_METADATA_FILTER_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
+    --env "ANVIL_INDEX_TYPED_JSON_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
+    --env "ANVIL_INDEX_TYPED_JSON_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
+    --env "ANVIL_INDEX_FULL_TEXT_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
+    --env "ANVIL_INDEX_FULL_TEXT_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
+    --env "ANVIL_INDEX_VECTOR_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
+    --env "ANVIL_INDEX_VECTOR_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
+    --env "ANVIL_INDEX_HYBRID_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
+    --env "ANVIL_INDEX_HYBRID_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
+    --env "ANVIL_INDEX_GIT_SOURCE_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
+    --env "ANVIL_INDEX_GIT_SOURCE_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
+    --env "ANVIL_INDEX_TENSOR_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
+    --env "ANVIL_INDEX_TENSOR_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
+    --env "ANVIL_INDEX_RAYON_WORKERS=${index_rayon_workers}" \
+    "${profile_environment[@]}" \
+    --env ANVIL_INDEX_MAX_RETAINED_GENERATIONS=1 \
+    --env ANVIL_RUN_SYSTEM_BOOTSTRAP=true \
+    --volume "${data_dir}:/var/lib/anvil" \
+    --volume "${signing_key}:/run/secrets/anvil-token-signing-key:ro" \
+    "${image_id}" >/dev/null
+  container_started=1
+}
+
+# Scale and release-performance evidence is captured with the RFC's default
+# compaction-debt limits. The four-run bound is installed only for the later
+# workload whose purpose is to force compaction for every public index kind.
+start_single_node production-debt-default
 
 wait_for_bootstrap() {
   local attempt
@@ -654,6 +671,22 @@ assert_sparse_index_startup() {
   assert_zero_global_startup_scan_evidence "${minimum_count}"
 }
 
+recreate_single_node() {
+  local next_profile="$1"
+  local completed_profile="$2"
+  local startup_evidence="/var/tmp/anvil-v080-single-startup-scans-${qualification_suffix}-${completed_profile}.log"
+
+  container_logs | preserve_startup_scan_evidence "${startup_evidence}"
+  docker stop --timeout 30 "${container_name}" >/dev/null
+  docker rm "${container_name}" >/dev/null
+  container_started=0
+  start_single_node "${next_profile}"
+  wait_for_bootstrap
+  assert_sparse_index_startup 1
+  public_endpoint="$(published_endpoint 50051 public)"
+  echo "[anvil-single-qualification] recreated persisted node profile=${next_profile} public=${public_endpoint}"
+}
+
 run_index_resource_qualification() {
   local capture_cursor
   local next_cursor
@@ -805,7 +838,8 @@ verify_index_resource_state() {
     "${qualification_example_binaries[v06_index_resource_qualification]}"
 }
 
-assert_production_typed_json_compaction_observability() {
+assert_four_run_typed_json_compaction_observability() {
+  local telemetry_log="$1"
   local active
   local budget_limit
   local completed
@@ -860,7 +894,7 @@ assert_production_typed_json_compaction_observability() {
       || failures != 0)) \
       || unsigned_decimal_less_than "${range_limit}" "${effective}"
     then
-      echo "production-shaped TypedJson emitted inconsistent terminal compaction telemetry" >&2
+      echo "four-run TypedJson compaction proof emitted inconsistent terminal telemetry" >&2
       printf '%s\n' "${line}" >&2
       return 1
     fi
@@ -885,10 +919,10 @@ assert_production_typed_json_compaction_observability() {
     fi
   done < <(
     grep -F 'index compaction terminal metrics' \
-      "${index_resource_qualification_log}" || true
+      "${telemetry_log}" || true
   )
   if ((terminal_found == 0)); then
-    echo "production-shaped TypedJson emitted no completed ${index_compaction_max_lanes}-lane compaction" >&2
+    echo "four-run TypedJson compaction proof emitted no completed ${index_compaction_max_lanes}-lane compaction" >&2
     return 1
   fi
 
@@ -912,13 +946,13 @@ assert_production_typed_json_compaction_observability() {
       fi
     fi
   done < <(
-    grep -F 'index compaction progress' "${index_resource_qualification_log}" || true
+    grep -F 'index compaction progress' "${telemetry_log}" || true
   )
   if ((production_compaction_peak_active_lanes < 2)); then
-    echo "production-shaped TypedJson terminal telemetry proved no concurrent compaction" >&2
+    echo "four-run TypedJson compaction proof showed no concurrent compaction" >&2
     return 1
   fi
-  echo "[anvil-single-qualification] production TypedJson used ${production_compaction_effective_lanes} effective lanes with ${production_compaction_peak_active_lanes} concurrently active"
+  echo "[anvil-single-qualification] four-run TypedJson compaction used ${production_compaction_effective_lanes} effective lanes with ${production_compaction_peak_active_lanes} concurrently active"
 }
 
 assert_production_runtime_observability() {
@@ -980,6 +1014,8 @@ write_index_resource_observability_report() {
     '{' \
     '  "schema": "anvil.index-resource-observability.v1",' \
     '  "index_kind": "TypedJson",' \
+    '  "resource_profile": "production-compaction-debt-defaults",' \
+    '  "compaction_profile": "four-run-compaction",' \
     "  \"configured_lanes\": ${production_compaction_configured_lanes}," \
     "  \"worker_limit\": ${production_compaction_worker_limit}," \
     "  \"budget_limit\": ${production_compaction_budget_limit}," \
@@ -1123,10 +1159,6 @@ assert_index_resource_bounds() {
     return 1
   fi
   assert_production_runtime_observability
-  if [[ "${index_resource_scope}" == "release-corpus" ]]; then
-    assert_production_typed_json_compaction_observability
-    write_index_resource_observability_report
-  fi
   echo "[anvil-single-qualification] preserved full production telemetry ${index_resource_telemetry_prefix}.log"
   echo "[anvil-single-qualification] index construction and disk cache remained within configured bounds"
 }
@@ -1451,15 +1483,35 @@ case "${index_resource_scope}" in
     echo "[anvil-single-qualification] index resource scope=custom records=${index_resource_records}; this does not satisfy the required 839980-record release-resource gate"
     ;;
 esac
-run_large_object_qualification
-run_public_read_qualification
-run_index_qualification
-run_atomic_index_qualification
+
+# Keep the bounded baseline and exact release corpus ahead of every unrelated
+# workload so their resource and performance evidence comes from a clean node
+# running the RFC default compaction-debt limits.
 if [[ "${qualification_mode}" == "release" ]]; then
   run_scale_baseline_resource_qualification single
 fi
 run_exact_resource_scale_qualification single
 verify_index_resource_state
+
+# Four runs per level is deliberately more aggressive than the production
+# default. Recreate the same persisted node with it only to force compaction in
+# the public all-eight-kind workload, then return to production defaults.
+recreate_single_node four-run-compaction production-debt-default
+verify_index_resource_state
+run_index_qualification
+verify_index_resource_state
+if [[ "${qualification_mode}" == "release" ]]; then
+  assert_four_run_typed_json_compaction_observability \
+    "${index_qualification_log}"
+  write_index_resource_observability_report
+fi
+recreate_single_node production-debt-default four-run-compaction
+verify_index_resource_state
+verify_existing_indexes
+
+run_large_object_qualification
+run_public_read_qualification
+run_atomic_index_qualification
 restart_populated_node
 run_accounting_qualification
 run_personaldb_qualification
