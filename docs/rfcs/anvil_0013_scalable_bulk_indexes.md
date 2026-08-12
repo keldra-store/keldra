@@ -222,6 +222,9 @@ window. It is not an index artifact or an event-delivery acknowledgement.
    met artifact durability.
 9. A published generation is source-complete. Compaction debt may affect query
    cost but never source visibility through its advertised barrier.
+   Advancing that barrier is itself publication work even when none of the
+   intervening source objects changes the index contents. Checkpoint-only
+   progress is never left solely in disposable builder memory.
 10. Atomic-program paths which are atomically visible through ordinary APIs
     become visible together in an index generation.
 11. One `IndexKind` memory budget is shared fairly by every local definition of
@@ -774,6 +777,14 @@ This separates two facts which 0.7 conflated:
 Only the first gates freshness publication. The second is bounded operational
 debt.
 
+If a source quantum contains no mutation matching the definition, the builder
+publishes a new manifest and current pointer with the unchanged immutable run
+set and the advanced complete source barrier. This checkpoint-only generation
+uses the same artifact validation and current-pointer CAS as every other
+generation. An idle eviction, process restart, or builder reassignment can
+therefore recover zero-lag evidence from ordinary authoritative objects rather
+than an in-memory pseudo-checkpoint.
+
 ## 15. All-kind parallel compaction
 
 Path, Metadata Filter, Typed JSON, Full Text, Vector, Hybrid, Git Source, and
@@ -883,6 +894,13 @@ An index never grants access. Results include the complete freshness structure,
 including source barriers, observed lag, generation, definition version,
 placement fence, initial-build completion, and rebuild state. Lag returns valid
 results plus evidence; it is not by itself an `INDEX_LAGGING` failure.
+
+`QueryIndex` has a separate startup-configured server execution maximum,
+defaulting to 300 seconds. A valid shorter client `grpc-timeout` still wins and
+is propagated through downstream work. Other bounded unary APIs retain the
+30-second server maximum. This separation allows cold pack materialization and
+authorized first-page filtering to make bounded progress without weakening
+deadlines for inexpensive control-plane operations.
 
 ## 18. Ingest, authorization, and routing path
 
@@ -1076,7 +1094,9 @@ restart. They are not placed in Raft and do not change durable format:
   1 GiB per level;
 - global index-cache disk bytes and memory percentage;
 - query concurrency, default 64, and a cache-read CPU-work quantum, default
-  4 MiB between cooperative yields; and
+  4 MiB between cooperative yields;
+- index-query maximum execution time, default 300 seconds, independently
+  clamped by a shorter client deadline; and
 - generation count, age, and authoritative-byte retention limits.
 
 The 16 MiB format-v3 pack target is part of format v3 rather than an operator
@@ -1323,6 +1343,11 @@ than reasons to weaken these gates.
 
 - Vector search is exact and therefore linear in the selected vector scope. An
   ANN format requires a later explicit design.
+- Typed JSON and Metadata Filter conjunctions choose one bounded posting range
+  as the driver and evaluate the remaining predicates against those projected
+  candidates. Every predicate remains exact and bounded, but 0.8.0 does not
+  intersect multiple compressed posting streams; an unselective driver may
+  therefore read more candidate rows than a range-local intersection.
 - One index query executes on one owner. Very large indexes may fetch packs over
   the ordinary distributed object path, but Anvil does not scatter the query or
   merge network result sets.

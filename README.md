@@ -26,6 +26,7 @@ rendezvous hashing.
 | Shared public listener | 0.5.5 | Native gRPC, S3, Git, and administrative APIs share one authorized public endpoint; peer mTLS remains isolated |
 | Streaming succinct indexes | 0.6.0 | Bounded per-kind construction memory, incremental immutable runs, streaming compaction, `sux`-based merged structures, and lazy block materialization |
 | Sparse index coordination | 0.7.0 | Non-blocking startup, transactional definition locators, routed change journals, scoped recovery, resumable accounting, and budgeted maintenance |
+| Scalable bulk indexes | 0.8.0 | Direct bounded bulk builds, packed format-v3 artifacts, stable compressed postings, deterministic rebuilds, and lossless journal backpressure |
 | Java client | — | TODO |
 | Python client | — | TODO |
 | Node.js client | — | TODO |
@@ -45,7 +46,7 @@ repository are required.
 ### 1. Start a development node
 
 ```sh
-export ANVIL_IMAGE=ghcr.io/worka-ai/anvil:0.7.0
+export ANVIL_IMAGE=ghcr.io/worka-ai/anvil:0.8.0
 export ANVIL_TOKEN_SIGNING_KEY_FILE="$PWD/anvil-data/token-signing-key"
 
 mkdir -p anvil-data
@@ -157,7 +158,7 @@ Zanzibar-authorized object addressed by `(tenant, bucket, path)`.
 ## Use the Rust client
 
 ```sh
-cargo add anvil-storage@0.7.0
+cargo add anvil-storage@0.8.0
 cargo add tokio --features macros,rt-multi-thread
 ```
 
@@ -232,7 +233,7 @@ Zanzibar-authorized independently of ordinary object traffic.
 Add the public client and canonical protocol types:
 
 ```sh
-cargo add anvil-storage@0.7.0 personaldb-protocol@0.2.2 serde_json
+cargo add anvil-storage@0.8.0 personaldb-protocol@0.2.2 serde_json
 ```
 
 Use the same application credential created above to create a source group and
@@ -547,6 +548,10 @@ limits remain separate: `ANVIL_INDEX_DISK_CACHE_BYTES` controls the shared
 disposable disk cache and `ANVIL_INDEX_MEMORY_PERCENT` caps aggregate in-flight
 block materialization. Immutable cache files are read through mmap, allowing
 the operating system to retain clean hot pages and reclaim them under pressure.
+`QueryIndex` has a separate five-minute server maximum so a cold first page can
+materialize the required blocks without inheriting the ordinary 30-second RPC
+limit. Set `ANVIL_INDEX_QUERY_TIMEOUT_SECONDS` at startup to tune it; a shorter
+client `grpc-timeout` always wins.
 
 Construct an authenticated index client from the same token used for objects:
 
@@ -648,7 +653,7 @@ bundles, establishes peer mTLS, exercises replicated and erasure-coded storage,
 queries every index type, and performs a rolling restart:
 
 ```sh
-ANVIL_IMAGE=ghcr.io/worka-ai/anvil:0.7.0 \
+ANVIL_IMAGE=ghcr.io/worka-ai/anvil:0.8.0 \
   ./scripts/qualify-three-node.sh
 ```
 
@@ -701,9 +706,9 @@ acceleration, not another authoritative storage plane.
 
 The architecture contracts live in
 [ANVIL-0009](docs/rfcs/anvil_0009_atomic_programs.md) and
-[ANVIL-0010](docs/rfcs/anvil_0010_cluster_distribution.md). The clean-break,
-bounded index architecture is specified by
-[ANVIL-0011](docs/rfcs/anvil_0011_streaming_succinct_indexes.md).
+[ANVIL-0010](docs/rfcs/anvil_0010_cluster_distribution.md). The current
+clean-break, bounded bulk and incremental index architecture is specified by
+[ANVIL-0013](docs/rfcs/anvil_0013_scalable_bulk_indexes.md).
 
 ## Build and qualify
 
@@ -732,33 +737,14 @@ ANVIL_QUALIFICATION_MODE=release \
 The production-shaped index qualification generates 839,980 private-data-free
 JSON objects with 12 indexed fields, verifies every live path and version after
 updates and deletes, and records phase-by-phase RSS and anonymous-memory peaks.
-It requires an explicit process target, the server's configured per-kind
-budget, and an accepted maximum anonymous-memory increase so the run fails
-rather than merely reporting an unbounded build:
-
-```sh
-cargo build --release --locked -p anvil-server \
-  --example v06_index_resource_qualification
-anvil_target_dir="$(
-  cargo metadata --quiet --locked --no-deps --format-version 1 \
-    | jq -er '.target_directory'
-)"
-ANVIL_V06_RESOURCE_ENDPOINTS=http://127.0.0.1:50051 \
-ANVIL_V06_RESOURCE_TENANT=qualification \
-ANVIL_V06_RESOURCE_BUCKET=index-resource \
-ANVIL_V06_RESOURCE_CLIENT_ID=qualification-client \
-ANVIL_V06_RESOURCE_CLIENT_SECRET="$ANVIL_QUALIFICATION_SECRET" \
-ANVIL_V06_RESOURCE_CONTAINERS=anvil \
-ANVIL_V06_KIND_BUDGET_BYTES=268435456 \
-ANVIL_V06_INDEX_RAYON_WORKERS=4 \
-ANVIL_V06_MAX_ANONYMOUS_GROWTH_BYTES=2147483648 \
-  "${anvil_target_dir}/release/examples/v06_index_resource_qualification"
-```
+The wrapper scripts above build the release-mode qualification client, bind the
+evidence to the exact image revision, and run the client directly so Cargo does
+not hold the shared build lock during the long qualification.
 
 The pinned `sux` and Rayon features, resolved versions and license choices are
 recorded in [the index dependency record](docs/dependency-licenses.md).
 
-Anvil 0.7 deployments start with new volumes. Index definitions and generated
+Anvil 0.8 deployments start with new volumes. Index definitions and generated
 artifacts are rebuilt from authoritative source objects rather than migrated
 from earlier releases. Current operational boundaries are collected in the
 [known limitations](docs/known-limitations.md).

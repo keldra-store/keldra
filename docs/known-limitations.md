@@ -1,5 +1,30 @@
 # Anvil known limitations
 
+## Anvil 0.8 operational boundaries
+
+Anvil 0.8 uses index format 3 exclusively and starts with new volumes. Index
+definitions build fresh packed generations from authoritative ordinary source
+objects; there is no format-2 decoder, converter, dual writer, or fallback.
+This clean boundary keeps the serving and recovery paths small and predictable.
+
+| Area | Current boundary |
+| --- | --- |
+| Vector search | Exact search is linear in the selected vector scope; an ANN format is deferred. |
+| Typed/Metadata conjunctions | Every predicate is enforced and each individual equality, `IN`, prefix, range, or `EXISTS` lookup uses bounded posting ranges. A conjunction currently chooses one bounded posting lookup as its driver and checks the remaining predicates against those projected candidates instead of intersecting several compressed posting streams. Results and memory bounds are unchanged, but a poorly selective driver can read more candidates. Adding a selective equality or prefix predicate narrows that work; range-local multi-stream intersection is deferred to a later index format. |
+| Query placement | One weighted-HRW owner executes a query. Large indexes may fetch ordinary pack objects, but there is no scatter/gather query engine. |
+| Oversized source values | One selected payload and its fixed projection workspace must fit that index kind's configured construction budget. Other definitions and object operations remain available. |
+| Failed definitions | A definition which cannot advance can eventually apply write backpressure rather than allow accepted objects to disappear from future indexed results. Repair, rebuild, or delete the authorized definition. |
+| Runtime tuning | Journal, receipt, builder, compaction, query, cache, and retention limits are startup settings and change on restart. |
+| Pack range reads | A cold logical-block read may fetch its complete ordinary pack where the underlying object path cannot provide an efficient range; packs have a fixed 16 MiB target. |
+| Build scratch | Secondary-key external sort uses disposable bounded local scratch. A crash repeats the affected scoped build. |
+| Traffic accounting | Inbound and outbound byte accounting is bounded best-effort telemetry. Stored bytes and object counts remain exact at their reported complete checkpoint. |
+| Distribution | 0.8 is a single-cluster release; mesh and region coordination remain future capabilities. |
+
+These limits do not weaken object durability, Zanzibar authorization, CAS,
+atomic-program visibility, source-complete index publication, or journal
+evidence retention. Operational pressure is surfaced through metrics, traces,
+logs, and pre-mutation backpressure.
+
 ## Sparse index coordination in 0.7.0
 
 Anvil 0.7.0 supersedes the 0.5.2 and 0.6.x cold definition-discovery
@@ -194,22 +219,24 @@ cold multi-page baseline can therefore require a later operator restart during
 a quiet interval to establish an exact base. The steady-state path is ordered,
 incremental, and does not retain one in-memory entry per object.
 
-## Request deadline coverage in 0.5.2
+## Request deadline coverage
 
-Index unary requests use one absolute deadline: the shorter of the client
-`grpc-timeout` and the startup-configured 30-second maximum. That same
-remaining budget is propagated across object and peer calls. The maximum is
-deliberately not a transport-wide timeout because `Put` and `WatchPrefix` are
-long-lived streams. Local authorization, administration, and credential unary
-requests still rely on their client or external TLS terminator to supply a
-deadline in 0.5.2; extending the shared deadline wrapper to those existing
-services is deferred.
+Index definition create, update, inspect, list, delete, and rebuild requests use
+one absolute deadline: the shorter of the client `grpc-timeout` and the
+startup-configured 30-second maximum. `QueryIndex` instead uses the shorter of
+the client deadline and `ANVIL_INDEX_QUERY_TIMEOUT_SECONDS`, whose default is
+five minutes. The same remaining budget is propagated across object and peer
+calls. These maxima are deliberately not transport-wide timeouts because `Put`
+and `WatchPrefix` are long-lived streams. Local authorization, administration,
+and credential unary requests still rely on their client or external TLS
+terminator to supply a deadline; extending the shared deadline wrapper to those
+existing services is deferred.
 
 Authorization-aware index pagination batches the common case where every
 candidate is visible. If Zanzibar filters or reorders a candidate, Anvil falls
 back to a one-candidate scan so a continuation never exposes an unauthorized
-position. A large, heavily filtered cold query can therefore exhaust the
-30-second request budget; the transport timeout is safely retryable.
+position. A large, heavily filtered cold query can therefore exhaust its
+configured query request budget; the transport timeout is safely retryable.
 
 ## Minimum PersonalDB surface in 0.5.3
 

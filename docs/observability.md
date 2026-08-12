@@ -1,4 +1,4 @@
-# Anvil 0.7 observability
+# Anvil 0.8 observability
 
 Anvil always writes its structured `tracing` logs to stdout. OTLP export is an
 optional startup setting and carries metrics and traces only; logs remain on
@@ -28,7 +28,7 @@ API.
 Metrics and traces share these resource attributes:
 
 - `service.name=anvil`
-- `service.version=0.7.0`
+- `service.version=0.8.0`
 - `node.id=<ANVIL_NODE_ID>`
 
 Trace export uses a dedicated worker with a 2,048-span queue and batches of at
@@ -55,7 +55,7 @@ needed to join a single invocation's work; caller-selected invocation IDs,
 opaque program input, paths, and object payload bytes are never span fields or
 events.
 
-The Anvil 0.7 process metric vocabulary covers:
+The Anvil 0.8 process metric vocabulary covers:
 
 - executor nomination count;
 - atomic-program invocation counts, total and combined preparation latency,
@@ -112,6 +112,34 @@ failures, selected recovery actions, retries, and fail-closed outcomes use the
 age, freshness, source lag, CAS success/failure, and publication duration; a
 successful publication resets age and source lag to zero and marks the
 generation fresh.
+
+Query execution exposes the complete request and local-work path. Public RPCs
+report `anvil_index_query_requests_total`, failures, deadline expirations, and
+request duration. Local execution reports admission waiting/active counts,
+wait duration, runs, cancellation and failure counts, returned hits, artifact
+read operations and bytes, cooperative yields, and query duration. CPU chunks
+report waiting/active counts, queue time, execution time, chunk count, and
+failures. These metrics are split only by bounded index kind and closed outcome
+or status values. The `anvil.index.query` and `anvil.index.query.cpu` spans may
+carry stable numeric identifiers and detailed terminal snapshots; identifiers
+never become metric attributes. Artifact reads remain asynchronous, while
+decoded-page construction, filtering, ranking, bounded top-k maintenance, and
+response-page serialization execute on the process-owned index CPU pool.
+
+The serving fence reports renewal attempts and failures, renewal duration and
+Tokio scheduling lateness, remaining lease margin, current validity, missed
+deadlines, placement progress, and the overlap-safe
+`anvil_control_plane_tasks_active` count. `anvil.serving_fence.renewal` spans
+carry the placement term/index and leader node for diagnosis; the metric series
+uses only closed operation and outcome labels.
+
+A ten-second runtime sampler exports process RSS/virtual memory/thread count,
+cgroup current/limit/peak memory and pressure/OOM events, and RocksDB block
+cache, table-reader, memtable, flush, compaction, pending-byte, delayed-write,
+and stall state. It also reports source-journal occupancy and per-consumer lag,
+plus mutation-receipt occupancy and projected capacity. Collection runs on a
+blocking worker and optional kernel or RocksDB properties fail independently,
+so telemetry sampling cannot stall or fail the storage path.
 
 `anvil.index.builder` and `anvil.index.compaction` are phase-lifetime spans.
 They contain stable numeric index, tenant, and bucket IDs for investigation,
