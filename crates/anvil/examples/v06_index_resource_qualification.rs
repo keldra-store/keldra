@@ -52,6 +52,8 @@ const DEFAULT_WORKERS: usize = 4;
 const DEFAULT_VERIFICATION_WORKERS: usize = 8;
 const DEFAULT_SEED: u64 = 0x625d_54af_f989_97f3;
 const QUERY_LIMIT: u32 = 1_000;
+// Generated records use `record_id % PARTITION_COUNT`, so this partition is
+// guaranteed empty and can carry freshness without scanning a real result set.
 const FRESHNESS_PROBE_PARTITION: u64 = PARTITION_COUNT;
 const BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const EXACT_VERIFICATION_TIMEOUT: Duration = Duration::from_secs(45 * 60);
