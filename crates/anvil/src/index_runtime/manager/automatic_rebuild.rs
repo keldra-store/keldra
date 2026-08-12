@@ -9,9 +9,9 @@ use crate::index_runtime::events::{
     IndexBarrier, IndexEventError, IndexEventJournal, IndexRoutedLag,
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum RebuildSelection {
-    Incremental,
+    Incremental(IndexRoutedLag),
     ScopedSnapshot,
 }
 
@@ -94,10 +94,110 @@ pub(super) async fn select(
         byte_threshold,
     );
     let Some(trigger) = classify_lag(&lag, entry_threshold, byte_threshold) else {
-        return Ok(RebuildSelection::Incremental);
+        return Ok(RebuildSelection::Incremental(lag));
     };
     emit_trigger(index_id, tenant_id, bucket_id, kind, trigger);
     Ok(RebuildSelection::ScopedSnapshot)
+}
+
+/// Extend one below-threshold measurement from its exact observed cursor to a
+/// newer source barrier. This keeps catch-up threshold checks linear in new
+/// journal traffic rather than rescanning the complete unpublished suffix at
+/// every bounded work quantum.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn recheck(
+    index_id: u64,
+    tenant_id: u64,
+    bucket_id: u64,
+    kind: IndexKind,
+    journal: &IndexEventJournal,
+    observed: &IndexRoutedLag,
+    target: &IndexBarrier,
+    config: IndexRuntimeConfig,
+) -> Result<RebuildSelection, IndexEventError> {
+    let entry_threshold = NonZeroU64::new(config.auto_rebuild_lag_entries())
+        .expect("validated automatic rebuild entry threshold is non-zero");
+    let byte_threshold = NonZeroU64::new(config.auto_rebuild_lag_bytes())
+        .expect("validated automatic rebuild byte threshold is non-zero");
+    if let Some(trigger) = classify_lag(observed, entry_threshold, byte_threshold) {
+        emit_trigger(index_id, tenant_id, bucket_id, kind, trigger);
+        return Ok(RebuildSelection::ScopedSnapshot);
+    }
+    if !barriers_can_advance(&observed.through, target) {
+        emit_trigger(
+            index_id,
+            tenant_id,
+            bucket_id,
+            kind,
+            RebuildTrigger::HistoryUnavailable,
+        );
+        return Ok(RebuildSelection::ScopedSnapshot);
+    }
+    if observed.through == *target {
+        return Ok(RebuildSelection::Incremental(observed.clone()));
+    }
+
+    let remaining_entries = NonZeroU64::new(entry_threshold.get() - observed.entries)
+        .expect("below-threshold entry lag leaves non-zero measurement capacity");
+    let remaining_bytes = NonZeroU64::new(byte_threshold.get() - observed.encoded_bytes)
+        .expect("below-threshold byte lag leaves non-zero measurement capacity");
+    let suffix = match journal
+        .measure_routed_lag(
+            tenant_id,
+            bucket_id,
+            &observed.through,
+            target,
+            remaining_entries,
+            remaining_bytes,
+        )
+        .await
+    {
+        Ok(lag) => lag,
+        Err(error) if history_is_unavailable(&error) => {
+            emit_trigger(
+                index_id,
+                tenant_id,
+                bucket_id,
+                kind,
+                RebuildTrigger::HistoryUnavailable,
+            );
+            return Ok(RebuildSelection::ScopedSnapshot);
+        }
+        Err(error) => return Err(error),
+    };
+    let lag = extend_lag(observed, suffix)?;
+    emit_lag(
+        index_id,
+        tenant_id,
+        bucket_id,
+        kind,
+        &lag,
+        target,
+        entry_threshold,
+        byte_threshold,
+    );
+    let Some(trigger) = classify_lag(&lag, entry_threshold, byte_threshold) else {
+        return Ok(RebuildSelection::Incremental(lag));
+    };
+    emit_trigger(index_id, tenant_id, bucket_id, kind, trigger);
+    Ok(RebuildSelection::ScopedSnapshot)
+}
+
+fn extend_lag(
+    observed: &IndexRoutedLag,
+    suffix: IndexRoutedLag,
+) -> Result<IndexRoutedLag, IndexEventError> {
+    Ok(IndexRoutedLag {
+        entries: observed
+            .entries
+            .checked_add(suffix.entries)
+            .ok_or(IndexEventError::PageLengthOverflow)?,
+        encoded_bytes: observed
+            .encoded_bytes
+            .checked_add(suffix.encoded_bytes)
+            .ok_or(IndexEventError::PageLengthOverflow)?,
+        through: suffix.through,
+    })
 }
 
 pub(super) fn barriers_can_advance(from: &IndexBarrier, target: &IndexBarrier) -> bool {
@@ -266,6 +366,62 @@ mod tests {
         assert_eq!(
             classify_lag(&lag(5, 10), entries, bytes),
             Some(RebuildTrigger::EntriesAndBytes)
+        );
+    }
+
+    #[test]
+    fn recheck_accumulates_only_the_new_suffix() {
+        let observed = IndexRoutedLag {
+            entries: 4,
+            encoded_bytes: 8,
+            through: barrier(10),
+        };
+        let suffix = IndexRoutedLag {
+            entries: 1,
+            encoded_bytes: 2,
+            through: barrier(11),
+        };
+
+        let combined = extend_lag(&observed, suffix).unwrap();
+
+        assert_eq!(combined.entries, 5);
+        assert_eq!(combined.encoded_bytes, 10);
+        assert_eq!(combined.through, barrier(11));
+        assert_eq!(
+            classify_lag(
+                &combined,
+                NonZeroU64::new(5).unwrap(),
+                NonZeroU64::new(10).unwrap(),
+            ),
+            Some(RebuildTrigger::EntriesAndBytes)
+        );
+    }
+
+    #[test]
+    fn below_threshold_recheck_advances_its_exact_resume_cursor() {
+        let observed = IndexRoutedLag {
+            entries: 2,
+            encoded_bytes: 3,
+            through: barrier(10),
+        };
+        let suffix = IndexRoutedLag {
+            entries: 1,
+            encoded_bytes: 2,
+            through: barrier(11),
+        };
+
+        let combined = extend_lag(&observed, suffix).unwrap();
+
+        assert_eq!(combined.entries, 3);
+        assert_eq!(combined.encoded_bytes, 5);
+        assert_eq!(combined.through, barrier(11));
+        assert_eq!(
+            classify_lag(
+                &combined,
+                NonZeroU64::new(5).unwrap(),
+                NonZeroU64::new(10).unwrap(),
+            ),
+            None
         );
     }
 

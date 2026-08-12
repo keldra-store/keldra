@@ -199,6 +199,7 @@ pub(super) async fn advance_rebuild(
                     current: work.current,
                     through: work.through,
                     target,
+                    automatic_rebuild_lag: None,
                     candidate: work.candidate,
                     changed: false,
                     must_publish: true,

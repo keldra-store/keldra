@@ -32,7 +32,9 @@ use super::engine::{
     IndexBuildObject, IndexSourceMutation, kind_for_specification, merge_runs_parallel,
     project_mutation, projection_admission_bytes,
 };
-use super::events::{IndexBarrier, IndexEventError, IndexEventJournal, IndexJournalPage};
+use super::events::{
+    IndexBarrier, IndexEventError, IndexEventJournal, IndexJournalPage, IndexRoutedLag,
+};
 use super::generation::ManifestRun;
 use super::placement::{IndexIdentity, IndexPlacement};
 use super::publisher::{IndexGenerationPublisher, PublishedGeneration};
@@ -685,6 +687,11 @@ struct CatchUpWork {
     current: Option<PublishedGeneration>,
     through: IndexBarrier,
     target: IndexBarrier,
+    // Present only for an incremental candidate. The cursor advances over new
+    // routed suffixes at quantum boundaries, so threshold checks never rescan
+    // the already measured unpublished lag. A bulk snapshot's own suffix must
+    // complete that snapshot candidate and therefore leaves this unset.
+    automatic_rebuild_lag: Option<IndexRoutedLag>,
     candidate: CandidateGeneration,
     changed: bool,
     must_publish: bool,
@@ -810,7 +817,7 @@ async fn inspect_builder(
         )
         .await
         .map_err(event_status)?;
-        if selection == RebuildSelection::Incremental {
+        if let RebuildSelection::Incremental(automatic_rebuild_lag) = selection {
             let from = published.clone();
             let retention_current = Some(current.clone());
             emit_source_lag(job.kind, &from, &target);
@@ -821,6 +828,7 @@ async fn inspect_builder(
                             current: Some(current.clone()),
                             through: target.clone(),
                             target,
+                            automatic_rebuild_lag: Some(automatic_rebuild_lag),
                             candidate: CandidateGeneration::incremental(current),
                             changed: false,
                             must_publish: true,
@@ -846,6 +854,7 @@ async fn inspect_builder(
                     current: Some(current.clone()),
                     through: from,
                     target,
+                    automatic_rebuild_lag: Some(automatic_rebuild_lag),
                     candidate,
                     changed: false,
                     must_publish: false,
@@ -952,6 +961,47 @@ async fn advance_catch_up(
     ),
     Status,
 > {
+    if let Some(observed) = work.automatic_rebuild_lag.as_ref() {
+        let target = dependencies
+            .journal
+            .capture_barrier()
+            .await
+            .map_err(event_status)?;
+        match automatic_rebuild::recheck(
+            job.definition.stored.index_id,
+            job.definition.tenant_id,
+            job.definition.bucket_id,
+            job.kind,
+            &dependencies.journal,
+            observed,
+            &target,
+            dependencies.config,
+        )
+        .await
+        .map_err(event_status)?
+        {
+            RebuildSelection::Incremental(lag) => {
+                work.automatic_rebuild_lag = Some(lag);
+            }
+            RebuildSelection::ScopedSnapshot => {
+                tracing::info!(
+                    index.id = job.definition.stored.index_id,
+                    tenant.id = job.definition.tenant_id,
+                    bucket.id = job.definition.bucket_id,
+                    index.kind = ?job.kind,
+                    monotonic_counter.anvil_index_incremental_candidates_preempted_total = 1_u64,
+                    "index incremental candidate yielded to a scoped rebuild"
+                );
+                work.progress.complete();
+                job.force_snapshot_rebuild = true;
+                return Ok((
+                    BuilderPhase::Inspect,
+                    BuilderDisposition::Ready,
+                    work.current,
+                ));
+            }
+        }
+    }
     let debt_limits = if work.maintenance {
         DebtLimits::maintenance()
     } else {
