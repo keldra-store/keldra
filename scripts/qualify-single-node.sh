@@ -302,6 +302,9 @@ docker run --rm --user 0 \
     /qualification/data \
     /qualification/token-signing-key
 
+# The public all-kind workload publishes independently observed generations;
+# use the engine's four-run maintenance bound so it exercises real compaction
+# without manufacturing more than 64 serial generations per kind.
 docker run --detach \
   --name "${container_name}" \
   --platform "${platform}" \
@@ -336,6 +339,7 @@ docker run --detach \
   --env "ANVIL_INDEX_TENSOR_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
   --env "ANVIL_INDEX_TENSOR_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
   --env "ANVIL_INDEX_RAYON_WORKERS=${index_rayon_workers}" \
+  --env ANVIL_INDEX_MAX_RUNS_PER_LEVEL=4 \
   --env ANVIL_INDEX_MAX_RETAINED_GENERATIONS=1 \
   --env ANVIL_RUN_SYSTEM_BOOTSTRAP=true \
   --volume "${data_dir}:/var/lib/anvil" \

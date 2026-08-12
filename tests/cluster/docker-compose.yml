@@ -29,6 +29,9 @@ x-anvil-environment: &anvil-environment
   ANVIL_INDEX_GIT_SOURCE_COMPACTION_MAX_LANES: "${ANVIL_QUALIFICATION_INDEX_COMPACTION_MAX_LANES:-4}"
   ANVIL_INDEX_TENSOR_COMPACTION_MAX_LANES: "${ANVIL_QUALIFICATION_INDEX_COMPACTION_MAX_LANES:-4}"
   ANVIL_INDEX_RAYON_WORKERS: "${ANVIL_QUALIFICATION_INDEX_RAYON_WORKERS:-4}"
+  # Force the public all-kind workload through genuine four-input compaction;
+  # this is qualification configuration, not Anvil's production default.
+  ANVIL_INDEX_MAX_RUNS_PER_LEVEL: "4"
   ANVIL_INDEX_MAX_RETAINED_GENERATIONS: "1"
   # The qualification wrapper temporarily selects a tiny bound only for its
   # isolated pressure phase, then restarts onto this production default before
