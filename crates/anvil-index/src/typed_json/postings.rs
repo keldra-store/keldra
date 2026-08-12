@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use crate::codec::{Decoder, Encoder, encode_component};
 use crate::routed::{RoutedRow, prefix_successor};
 use crate::run::{ComponentTree, LeafCursor, RoutingTreeBuilder};
-use crate::succinct::{decode_elias_fano_with_budget, encode_elias_fano};
+use crate::succinct::{decode_elias_fano_with_budget, elias_fano_encoded_len, encode_elias_fano};
 use crate::{
     ComponentCodec, GeneratedBlock, IndexBlockSink, IndexDirectoryRead, IndexError, IndexKind,
 };
@@ -52,7 +52,18 @@ impl PostingComponentWriter {
         {
             return Err(IndexError::UnsortedRecords);
         }
-        let row_bytes = row.primary.len().saturating_add(24);
+        // Charge every row as if it were its own primary and range group. The
+        // actual codec groups both and therefore cannot exceed this bound.
+        // This matters for high-cardinality fields: every singleton posting
+        // carries Elias-Fano support metadata that the old 24-byte estimate
+        // omitted, allowing an L0 leaf to cross the fixed block ceiling.
+        let sequence_bytes = elias_fano_encoded_len(1, ordinal_local(row.ordinal))?;
+        let row_bytes = row
+            .primary
+            .len()
+            .checked_add(28)
+            .and_then(|bytes| bytes.checked_add(sequence_bytes))
+            .ok_or(IndexError::OffsetOverflow)?;
         if !self.rows.is_empty()
             && self.estimated_bytes.saturating_add(row_bytes) > self.target_bytes
         {

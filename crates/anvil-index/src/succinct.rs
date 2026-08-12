@@ -96,6 +96,36 @@ pub(crate) fn encode_elias_fano(values: &[u64]) -> Result<Vec<u8>, IndexError> {
     Ok(output.finish())
 }
 
+/// Exact encoded length for one Elias-Fano sequence. Component writers use
+/// this to reserve a conservative singleton sequence for each pending row;
+/// grouping rows can only remove fixed sequence and support overhead.
+pub(crate) fn elias_fano_encoded_len(count: usize, upper: u64) -> Result<usize, IndexError> {
+    let low_width = low_width(count, upper);
+    let low_words = count
+        .checked_mul(low_width as usize)
+        .ok_or(IndexError::OffsetOverflow)?
+        .div_ceil(64);
+    let high_length = if count == 0 {
+        0
+    } else {
+        count
+            .checked_add(1)
+            .and_then(|value| value.checked_add((upper >> low_width) as usize))
+            .ok_or(IndexError::OffsetOverflow)?
+    };
+    let high_words = high_length.div_ceil(64);
+    let samples = count.div_ceil(SELECT_SAMPLE_RATE);
+    54usize
+        .checked_add(
+            low_words
+                .checked_add(high_words)
+                .and_then(|words| words.checked_add(samples))
+                .and_then(|words| words.checked_mul(8))
+                .ok_or(IndexError::OffsetOverflow)?,
+        )
+        .ok_or(IndexError::OffsetOverflow)
+}
+
 #[cfg(test)]
 pub(crate) fn decode_elias_fano(bytes: &[u8]) -> Result<EliasFanoSequence, IndexError> {
     decode_elias_fano_with_budget(bytes, DecodeBudget::new())

@@ -1894,4 +1894,5 @@ mod tests {
     include!("typed_json/semantics_tests.rs");
     include!("typed_json/unsigned_metadata_tests.rs");
     include!("typed_json/parallel_compaction_tests.rs");
+    include!("typed_json/scale_seal_tests.rs");
 }
