@@ -1,4 +1,3 @@
-use std::num::NonZeroU64;
 use std::sync::Mutex;
 
 use anvil_store::{ObjectHeadChange, ObjectHeadChangeKind, ReferenceDelta, VersionId};
@@ -534,6 +533,37 @@ async fn routed_effects_report_only_the_relevant_sources_newest_offset() {
 }
 
 #[tokio::test]
+async fn routed_accounting_effects_ignore_rollup_publication() {
+    let clear = AtomicProgramWatermark::new(None, None, 0);
+    let sources = MemorySources::default();
+    sources.journals.lock().unwrap().insert(
+        NodeId(1),
+        (
+            status(1, 1),
+            vec![change_at_path(1, 1, 1, 2, "_anvil/accounting/7/current")],
+        ),
+    );
+    sources
+        .journals
+        .lock()
+        .unwrap()
+        .insert(NodeId(2), (status(2, 0), Vec::new()));
+    let target = journal(vec![placement(clear)], &sources)
+        .capture_barrier()
+        .await
+        .unwrap();
+    let mut from = target.clone();
+    from.sources.get_mut(&NodeId(1)).unwrap().next_offset = 1;
+
+    let effects = journal(vec![placement(clear)], &sources)
+        .routed_accounting_effects(1, 2, &from, &target)
+        .await
+        .unwrap();
+
+    assert!(effects.is_empty());
+}
+
+#[tokio::test]
 async fn query_bucket_barrier_ignores_an_unrelated_bucket() {
     let clear = AtomicProgramWatermark::new(None, None, 0);
     let sources = MemorySources::default();
@@ -635,221 +665,6 @@ async fn raw_interval_reads_one_bounded_page_without_bucket_probes() {
     assert_eq!(change_bucket(&page.changes[0].change), Some((9, 9)));
     assert_eq!(*sources.raw_reads.lock().unwrap(), [NodeId(1)]);
     assert!(sources.reads.lock().unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn routed_lag_measurement_stops_exactly_at_the_entry_threshold() {
-    let clear = AtomicProgramWatermark::new(None, None, 0);
-    let sources = MemorySources::default();
-    sources.journals.lock().unwrap().insert(
-        NodeId(1),
-        (
-            status(1, 4),
-            vec![change(1, 1), change(1, 2), change(1, 3), change(1, 4)],
-        ),
-    );
-    sources
-        .journals
-        .lock()
-        .unwrap()
-        .insert(NodeId(2), (status(2, 0), Vec::new()));
-    let from = IndexBarrier {
-        fence: PlacementLogId { term: 3, index: 7 },
-        atomic: clear,
-        sources: BTreeMap::from([
-            (
-                NodeId(1),
-                IndexSourceCursor {
-                    source: source_id(1),
-                    next_offset: 1,
-                },
-            ),
-            (
-                NodeId(2),
-                IndexSourceCursor {
-                    source: source_id(2),
-                    next_offset: 1,
-                },
-            ),
-        ]),
-    };
-    let target = IndexBarrier {
-        sources: BTreeMap::from([
-            (
-                NodeId(1),
-                IndexSourceCursor {
-                    source: source_id(1),
-                    next_offset: 5,
-                },
-            ),
-            (
-                NodeId(2),
-                IndexSourceCursor {
-                    source: source_id(2),
-                    next_offset: 1,
-                },
-            ),
-        ]),
-        ..from.clone()
-    };
-    let measured = journal(vec![placement(clear)], &sources)
-        .measure_routed_lag(
-            1,
-            2,
-            &from,
-            &target,
-            NonZeroU64::new(2).unwrap(),
-            NonZeroU64::new(u64::MAX).unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(measured.entries, 2);
-    assert!(measured.entry_threshold_reached(NonZeroU64::new(2).unwrap()));
-    assert_eq!(measured.through.sources[&NodeId(1)].next_offset, 3);
-    assert_ne!(measured.through, target);
-}
-
-#[tokio::test]
-async fn routed_lag_measurement_stops_when_the_next_entry_crosses_the_byte_threshold() {
-    let clear = AtomicProgramWatermark::new(None, None, 0);
-    let sources = MemorySources::default();
-    sources
-        .journals
-        .lock()
-        .unwrap()
-        .insert(NodeId(1), (status(1, 2), vec![change(1, 1), change(1, 2)]));
-    sources
-        .journals
-        .lock()
-        .unwrap()
-        .insert(NodeId(2), (status(2, 0), Vec::new()));
-    let from = IndexBarrier {
-        fence: PlacementLogId { term: 3, index: 7 },
-        atomic: clear,
-        sources: BTreeMap::from([
-            (
-                NodeId(1),
-                IndexSourceCursor {
-                    source: source_id(1),
-                    next_offset: 1,
-                },
-            ),
-            (
-                NodeId(2),
-                IndexSourceCursor {
-                    source: source_id(2),
-                    next_offset: 1,
-                },
-            ),
-        ]),
-    };
-    let target = IndexBarrier {
-        sources: BTreeMap::from([
-            (
-                NodeId(1),
-                IndexSourceCursor {
-                    source: source_id(1),
-                    next_offset: 3,
-                },
-            ),
-            (
-                NodeId(2),
-                IndexSourceCursor {
-                    source: source_id(2),
-                    next_offset: 1,
-                },
-            ),
-        ]),
-        ..from.clone()
-    };
-    let one_entry_bytes = encoded_len(&change(1, 1)).unwrap();
-    let byte_threshold = NonZeroU64::new(one_entry_bytes + 1).unwrap();
-    let measured = journal(vec![placement(clear)], &sources)
-        .measure_routed_lag(
-            1,
-            2,
-            &from,
-            &target,
-            NonZeroU64::new(10).unwrap(),
-            byte_threshold,
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(measured.entries, 2);
-    assert_eq!(measured.encoded_bytes, one_entry_bytes * 2);
-    assert!(measured.byte_threshold_reached(byte_threshold));
-    assert_eq!(measured.through.sources[&NodeId(1)].next_offset, 2);
-}
-
-#[tokio::test]
-async fn routed_lag_measurement_completes_a_suffix_below_both_thresholds() {
-    let clear = AtomicProgramWatermark::new(None, None, 0);
-    let sources = MemorySources::default();
-    sources
-        .journals
-        .lock()
-        .unwrap()
-        .insert(NodeId(1), (status(1, 2), vec![change(1, 1), change(1, 2)]));
-    sources
-        .journals
-        .lock()
-        .unwrap()
-        .insert(NodeId(2), (status(2, 0), Vec::new()));
-    let from = IndexBarrier {
-        fence: PlacementLogId { term: 3, index: 7 },
-        atomic: clear,
-        sources: BTreeMap::from([
-            (
-                NodeId(1),
-                IndexSourceCursor {
-                    source: source_id(1),
-                    next_offset: 1,
-                },
-            ),
-            (
-                NodeId(2),
-                IndexSourceCursor {
-                    source: source_id(2),
-                    next_offset: 1,
-                },
-            ),
-        ]),
-    };
-    let target = IndexBarrier {
-        sources: BTreeMap::from([
-            (
-                NodeId(1),
-                IndexSourceCursor {
-                    source: source_id(1),
-                    next_offset: 3,
-                },
-            ),
-            (
-                NodeId(2),
-                IndexSourceCursor {
-                    source: source_id(2),
-                    next_offset: 1,
-                },
-            ),
-        ]),
-        ..from.clone()
-    };
-    let measured = journal(vec![placement(clear)], &sources)
-        .measure_routed_lag(
-            1,
-            2,
-            &from,
-            &target,
-            NonZeroU64::new(3).unwrap(),
-            NonZeroU64::new(u64::MAX).unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(measured.entries, 2);
-    assert_eq!(measured.through, target);
 }
 
 #[tokio::test]

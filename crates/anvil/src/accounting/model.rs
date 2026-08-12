@@ -4,7 +4,7 @@ use anvil_api::v1::{
     AccountingDefinition as ApiDefinition, AccountingFreshness as ApiFreshness,
     AccountingSnapshot as ApiSnapshot, AccountingSourceCheckpoint as ApiSourceCheckpoint,
 };
-use anvil_store::{ObjectKey, PlacementLogId, SourceId, VersionId};
+use anvil_store::{LocalChange, ObjectKey, PlacementLogId, SourceId, VersionId};
 use prost_types::Timestamp;
 use serde::{Deserialize, Serialize};
 use tonic::Status;
@@ -402,6 +402,29 @@ pub(crate) fn includes_path(prefix: &str, path: &str) -> bool {
 
 pub(crate) fn is_accounting_path(path: &str) -> bool {
     path == "_anvil/accounting" || path.starts_with("_anvil/accounting/")
+}
+
+/// Select object changes which can alter an accounting rollup. Ordinary source
+/// objects and per-node traffic sources are inputs; definitions and published
+/// rollups are not, so publishing a rollup cannot recursively wake itself.
+pub(crate) fn is_accounting_source_change(change: &LocalChange) -> bool {
+    let path = match change {
+        LocalChange::ObjectHead(change) => &change.exact_path,
+        LocalChange::RetainedVersionDeleted(change) => &change.exact_path,
+        _ => return false,
+    };
+    !is_accounting_path(path) || is_outbound_source_path(path)
+}
+
+fn is_outbound_source_path(path: &str) -> bool {
+    let Some(remainder) = path.strip_prefix(ACCOUNTING_ROOT) else {
+        return false;
+    };
+    let mut segments = remainder.split('/');
+    canonical_id(segments.next().unwrap_or_default()).is_some()
+        && segments.next() == Some("sources")
+        && segments.next().and_then(canonical_id).is_some()
+        && segments.next().is_none()
 }
 
 pub(crate) fn validate_prefix(prefix: &str) -> Result<(), Status> {

@@ -554,6 +554,10 @@ fn emit_source_journal_metrics(source: SourceJournalRuntimeMetrics) {
         gauge.anvil_source_journal_retained_bytes = source.retained_bytes,
         gauge.anvil_source_journal_max_entries = source.max_entries,
         gauge.anvil_source_journal_max_bytes = source.max_bytes,
+        gauge.anvil_source_journal_progress_debt_entries = source.progress_debt_entries(),
+        gauge.anvil_source_journal_progress_debt_bytes = source.progress_debt_bytes(),
+        gauge.anvil_source_journal_progress_debt_peak_entries = source.progress_debt_peak_entries,
+        gauge.anvil_source_journal_progress_debt_peak_bytes = source.progress_debt_peak_bytes,
         gauge.anvil_source_journal_entry_occupancy_ratio =
             source.retained_entries as f64 / source.max_entries as f64,
         gauge.anvil_source_journal_byte_occupancy_ratio =

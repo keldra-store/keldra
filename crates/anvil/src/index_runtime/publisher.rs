@@ -23,8 +23,8 @@ use super::engine::IndexBuildDiagnostics;
 use super::events::IndexBarrier;
 use super::generation::{IndexCurrentPointer, IndexGenerationManifest, ManifestPack, ManifestRun};
 use super::publication::{
-    DefinitionVersionGuard, IndexArtifactPublish, IndexArtifactRouter, current_path, manifest_path,
-    run_pack_path, run_root_path,
+    DefinitionVersionGuard, DerivedArtifactAdmission, IndexArtifactPublish, IndexArtifactRouter,
+    current_path, manifest_path, run_pack_path, run_root_path,
 };
 
 const STAGED_READ_BUFFER_BYTES: usize = 64 * 1024;
@@ -72,16 +72,30 @@ impl IndexGenerationPublisher {
     }
 
     pub(crate) fn staging_sink(&self) -> IndexBlockStagingSink {
-        IndexBlockStagingSink::new(self.store.clone(), None, self.scratch_root.as_ref())
+        self.staging_sink_with_admission(DerivedArtifactAdmission::PublicationProgress)
+    }
+
+    fn staging_sink_with_admission(
+        &self,
+        admission: DerivedArtifactAdmission,
+    ) -> IndexBlockStagingSink {
+        IndexBlockStagingSink::new(
+            self.store.clone(),
+            None,
+            admission,
+            self.scratch_root.as_ref(),
+        )
     }
 
     pub(crate) fn observed_staging_sink(
         &self,
         progress: CompactionProgress,
+        admission: DerivedArtifactAdmission,
     ) -> IndexBlockStagingSink {
         IndexBlockStagingSink::new(
             self.store.clone(),
             Some(progress),
+            admission,
             self.scratch_root.as_ref(),
         )
     }
@@ -204,8 +218,14 @@ impl IndexGenerationPublisher {
                 "index artifact packs sealed"
             );
         });
-        let pack_requests =
-            pack_publication_requests(definition, tenant_id, bucket_id, descriptor.hash, &packs);
+        let pack_requests = pack_publication_requests(
+            definition,
+            tenant_id,
+            bucket_id,
+            descriptor.hash,
+            &packs,
+            sink.admission,
+        );
         let publish_span = tracing::info_span!(
             "anvil.index.pack_publish",
             index.id = definition.index_id,
@@ -248,7 +268,7 @@ impl IndexGenerationPublisher {
             index.kind = ?descriptor.kind,
             run.sequence = sequence,
         );
-        let root_blob = stage_generated_block(&self.store, root)
+        let root_blob = stage_generated_block(&self.store, root, sink.admission)
             .instrument(root_span.clone())
             .await;
         let root_blob = match root_blob {
@@ -279,6 +299,7 @@ impl IndexGenerationPublisher {
                 bucket_id,
                 &root_path,
                 root_blob.clone(),
+                sink.admission,
             )
             .instrument(root_span.clone())
             .await;
@@ -323,6 +344,7 @@ impl IndexGenerationPublisher {
         mut runs: Vec<ManifestRun>,
         diagnostics: IndexBuildDiagnostics,
         current: Option<&PublishedGeneration>,
+        admission: DerivedArtifactAdmission,
     ) -> Result<PublishedGeneration, Status> {
         runs.sort_by_key(|run| run.sequence);
         let generation =
@@ -358,11 +380,8 @@ impl IndexGenerationPublisher {
             manifest.bytes = manifest_length,
         );
         let manifest_result = async {
-            let manifest_blob = self
-                .store
-                .stage_blob(&manifest_bytes)
-                .await
-                .map_err(store_status)?;
+            let manifest_blob =
+                stage_artifact_bytes(&self.store, &manifest_bytes, admission).await?;
             let path = manifest_path(definition.index_id, manifest_blob.hash);
             let manifest_object_version = self
                 .publish_immutable(
@@ -371,6 +390,7 @@ impl IndexGenerationPublisher {
                     bucket_id,
                     &path,
                     manifest_blob.clone(),
+                    admission,
                 )
                 .await?;
             Ok::<_, Status>((manifest_blob, manifest_object_version))
@@ -416,11 +436,7 @@ impl IndexGenerationPublisher {
             current.bytes = pointer_length,
         );
         let current_result = async {
-            let pointer_blob = self
-                .store
-                .stage_blob(&pointer_bytes)
-                .await
-                .map_err(store_status)?;
+            let pointer_blob = stage_artifact_bytes(&self.store, &pointer_bytes, admission).await?;
             self.artifacts
                 .publish(IndexArtifactPublish {
                     storage_tenant: definition.tenant.clone(),
@@ -438,6 +454,7 @@ impl IndexGenerationPublisher {
                         expected_version: VersionId(definition_version),
                     }),
                     definition_intent: None,
+                    admission,
                 })
                 .await
         }
@@ -535,6 +552,7 @@ impl IndexGenerationPublisher {
         bucket_id: u64,
         path: &str,
         blob: BlobRef,
+        admission: DerivedArtifactAdmission,
     ) -> Result<VersionId, Status> {
         let outcome = self
             .artifacts
@@ -550,6 +568,7 @@ impl IndexGenerationPublisher {
                 expected_version: None,
                 definition_guard: None,
                 definition_intent: None,
+                admission,
             })
             .await?;
         Ok(outcome.version)
@@ -562,6 +581,7 @@ impl IndexGenerationPublisher {
 pub(crate) struct IndexBlockStagingSink {
     store: Store,
     progress: Option<CompactionProgress>,
+    admission: DerivedArtifactAdmission,
     registry: Arc<Mutex<IndexPackRegistry>>,
     lane: Arc<tokio::sync::Mutex<IndexPackLane>>,
     seal_permits: Arc<tokio::sync::Semaphore>,
@@ -642,6 +662,7 @@ impl Clone for IndexBlockStagingSink {
         Self {
             store: self.store.clone(),
             progress: self.progress.clone(),
+            admission: self.admission,
             registry: self.registry.clone(),
             lane: self.lane.clone(),
             seal_permits: self.seal_permits.clone(),
@@ -654,6 +675,7 @@ impl IndexBlockStagingSink {
     fn new(
         store: Store,
         progress: Option<CompactionProgress>,
+        admission: DerivedArtifactAdmission,
         scratch_root: &std::path::Path,
     ) -> Self {
         let scratch_id = NEXT_INDEX_SCRATCH_ID.fetch_add(1, Ordering::Relaxed);
@@ -665,6 +687,7 @@ impl IndexBlockStagingSink {
         Self {
             store,
             progress,
+            admission,
             registry: Arc::new(Mutex::new(IndexPackRegistry {
                 next_lane_id: 1,
                 lanes,
@@ -693,10 +716,10 @@ impl IndexBlockStagingSink {
             .await
             .map_err(|_| IndexError::Io("index pack seal admission closed".into()))?;
         let store = self.store.clone();
+        let admission = self.admission;
         let task = tokio::spawn(async move {
             let _permit = permit;
-            let blob = store
-                .seal_blob_upload(upload)
+            let blob = seal_artifact_upload(&store, upload, admission)
                 .await
                 .map_err(|error| PackSealFailure::Io(error.to_string()))?;
             if blob.length != expected_length || blob.length > MAX_INDEX_ARTIFACT_PACK_BYTES as u64
@@ -825,6 +848,7 @@ fn pack_publication_requests(
     bucket_id: u64,
     run_hash: [u8; 32],
     packs: &[StagedPack],
+    admission: DerivedArtifactAdmission,
 ) -> Vec<IndexArtifactPublish> {
     packs
         .iter()
@@ -842,6 +866,7 @@ fn pack_publication_requests(
                 expected_version: None,
                 definition_guard: None,
                 definition_intent: None,
+                admission,
             }
         })
         .collect()
@@ -1016,6 +1041,7 @@ impl IndexBlockStagingSink {
         Ok(Self {
             store: self.store.clone(),
             progress: self.progress.clone(),
+            admission: self.admission,
             registry: self.registry.clone(),
             lane,
             seal_permits: self.seal_permits.clone(),
@@ -1132,6 +1158,7 @@ fn unpack_id(id: u32) -> Result<(u32, usize), IndexError> {
 async fn stage_generated_block(
     store: &Store,
     block: GeneratedBlock,
+    admission: DerivedArtifactAdmission,
 ) -> Result<BlobRef, IndexError> {
     let descriptor = block.descriptor().clone();
     let (_, bytes) = block.into_parts();
@@ -1140,14 +1167,44 @@ async fn stage_generated_block(
     {
         return Err(IndexError::Integrity);
     }
-    let blob = store
-        .stage_blob(&bytes)
-        .await
-        .map_err(|error| IndexError::Io(error.to_string()))?;
+    let blob = match admission {
+        DerivedArtifactAdmission::Bounded => store.stage_blob(&bytes).await,
+        DerivedArtifactAdmission::PublicationProgress => {
+            store.stage_derived_progress_blob(&bytes).await
+        }
+    }
+    .map_err(|error| IndexError::Io(error.to_string()))?;
     if blob.hash != descriptor.hash || blob.length != descriptor.encoded_bytes {
         return Err(IndexError::Integrity);
     }
     Ok(blob)
+}
+
+async fn stage_artifact_bytes(
+    store: &Store,
+    bytes: &[u8],
+    admission: DerivedArtifactAdmission,
+) -> Result<BlobRef, Status> {
+    match admission {
+        DerivedArtifactAdmission::Bounded => store.stage_blob(bytes).await,
+        DerivedArtifactAdmission::PublicationProgress => {
+            store.stage_derived_progress_blob(bytes).await
+        }
+    }
+    .map_err(store_status)
+}
+
+async fn seal_artifact_upload(
+    store: &Store,
+    upload: BlobUpload,
+    admission: DerivedArtifactAdmission,
+) -> Result<BlobRef, anvil_store::MutationError> {
+    match admission {
+        DerivedArtifactAdmission::Bounded => store.seal_blob_upload(upload).await,
+        DerivedArtifactAdmission::PublicationProgress => {
+            store.seal_derived_progress_blob_upload(upload).await
+        }
+    }
 }
 
 pub(crate) struct StagedIndexFile {
@@ -1346,7 +1403,12 @@ mod tests {
             .await
             .unwrap();
         let scratch_root = temporary.path().join("index-scratch");
-        let mut sink = IndexBlockStagingSink::new(store.clone(), None, &scratch_root);
+        let mut sink = IndexBlockStagingSink::new(
+            store.clone(),
+            None,
+            DerivedArtifactAdmission::Bounded,
+            &scratch_root,
+        );
         let fork = sink.fork().unwrap();
         assert!(Arc::ptr_eq(&sink.seal_permits, &fork.seal_permits));
         assert_eq!(
@@ -1406,7 +1468,12 @@ mod tests {
             .await
             .unwrap();
         let scratch_root = temporary.path().join("index-scratch");
-        let mut sink = IndexBlockStagingSink::new(store.clone(), None, &scratch_root);
+        let mut sink = IndexBlockStagingSink::new(
+            store.clone(),
+            None,
+            DerivedArtifactAdmission::Bounded,
+            &scratch_root,
+        );
         let bytes = b"block read while its containing pack is sealing";
         let mut upload = store.begin_blob_upload().await.unwrap();
         upload.write(bytes).await.unwrap();
@@ -1434,7 +1501,12 @@ mod tests {
             .unwrap();
         let published_blob = store.stage_blob(b"authoritative pack").await.unwrap();
         let scratch_root = temporary.path().join("index-scratch");
-        let mut sink = IndexBlockStagingSink::new(store, None, &scratch_root);
+        let mut sink = IndexBlockStagingSink::new(
+            store,
+            None,
+            DerivedArtifactAdmission::Bounded,
+            &scratch_root,
+        );
         sink.lane
             .lock()
             .await
@@ -1456,7 +1528,14 @@ mod tests {
         assert_eq!(finished.summary.authoritative_bytes, 0);
         let staged = finished.packs;
         let definition = test_definition();
-        let requests = pack_publication_requests(&definition, 1, 2, [9; 32], &staged);
+        let requests = pack_publication_requests(
+            &definition,
+            1,
+            2,
+            [9; 32],
+            &staged,
+            DerivedArtifactAdmission::Bounded,
+        );
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].blob, published_blob);
         assert_ne!(requests[0].blob.hash, *blake3::hash(bytes).as_bytes());
@@ -1480,7 +1559,12 @@ mod tests {
         let store = Store::open(anvil_store::StoreOptions::new(temporary.path(), 1))
             .await
             .unwrap();
-        let sink = IndexBlockStagingSink::new(store, None, &temporary.path().join("index-scratch"));
+        let sink = IndexBlockStagingSink::new(
+            store,
+            None,
+            DerivedArtifactAdmission::Bounded,
+            &temporary.path().join("index-scratch"),
+        );
         let mut scratch = sink.fork_scratch().unwrap();
         let lane_id = scratch.lane.lock().await.id;
         let represented_blocks = 50_000_u32;

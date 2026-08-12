@@ -113,7 +113,7 @@ fn inventory_retains_only_sparse_affected_definitions_and_uses_the_minimum_proof
 }
 
 #[test]
-fn published_or_snapshot_proof_releases_only_the_effects_it_covers() {
+fn published_proof_releases_only_the_effects_it_covers() {
     let status = source(1, 20);
     let assignment = assignment(DefinitionKind::Index, 1);
     let initial = barrier(&[(status, 6)]);
@@ -129,16 +129,30 @@ fn published_or_snapshot_proof_releases_only_the_effects_it_covers() {
         .unwrap();
     let mut tracker = inventory.finish();
     tracker
-        .observe_proof(
-            &assignment,
-            &DerivedBarrierEvidence::ScopedSnapshot(match barrier(&[(status, 14)]) {
-                DerivedBarrierEvidence::Published(barrier) => barrier,
-                DerivedBarrierEvidence::ScopedSnapshot(_) => unreachable!(),
-            }),
-        )
+        .observe_proof(&assignment, &barrier(&[(status, 14)]))
         .unwrap();
     assert_eq!(tracker.affected_len(status.source_id), 0);
     assert_eq!(tracker.checkpoints().unwrap()[0].next_offset, 21);
+}
+
+#[test]
+fn unpublished_construction_state_cannot_release_a_routed_effect() {
+    let status = source(1, 20);
+    let assignment = assignment(DefinitionKind::Index, 1);
+    let mut inventory = SparseDerivedInventory::begin(
+        DerivedConsumerKind::Index,
+        NodeId(3),
+        fence(),
+        [(status, None)],
+    )
+    .unwrap();
+    inventory
+        .record_affected(&assignment, status.source_id, 14, None)
+        .unwrap();
+
+    let tracker = inventory.finish();
+    assert_eq!(tracker.affected_len(status.source_id), 1);
+    assert_eq!(tracker.checkpoints().unwrap()[0].next_offset, 1);
 }
 
 #[test]

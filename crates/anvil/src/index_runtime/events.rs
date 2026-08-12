@@ -562,28 +562,6 @@ pub(crate) struct IndexJournalPage {
     pub encoded_bytes: u64,
 }
 
-/// Exact bucket-routed lag measured from a source-complete generation barrier.
-///
-/// Measurement stops as soon as either configured threshold is reached, so a
-/// builder never scans an arbitrarily large suffix merely to decide that a
-/// scoped snapshot is cheaper.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct IndexRoutedLag {
-    pub(crate) entries: u64,
-    pub(crate) encoded_bytes: u64,
-    pub(crate) through: IndexBarrier,
-}
-
-impl IndexRoutedLag {
-    pub(crate) fn entry_threshold_reached(&self, threshold: NonZeroU64) -> bool {
-        self.entries >= threshold.get()
-    }
-
-    pub(crate) fn byte_threshold_reached(&self, threshold: NonZeroU64) -> bool {
-        self.encoded_bytes >= threshold.get()
-    }
-}
-
 pub(crate) struct IndexEventJournal {
     authority: Arc<dyn IndexEventAuthority>,
     sources: Arc<dyn IndexEventSources>,
@@ -797,84 +775,6 @@ impl IndexEventJournal {
         .await
     }
 
-    /// Measure only the existing bucket route, stopping at the first rebuild
-    /// threshold. Pages remain bounded by the same record and wire-byte limits
-    /// used by incremental catch-up.
-    pub(crate) async fn measure_routed_lag(
-        &self,
-        tenant_id: u64,
-        bucket_id: u64,
-        from: &IndexBarrier,
-        target: &IndexBarrier,
-        entry_threshold: NonZeroU64,
-        byte_threshold: NonZeroU64,
-    ) -> Result<IndexRoutedLag, IndexEventError> {
-        let mut lag = IndexRoutedLag {
-            entries: 0,
-            encoded_bytes: 0,
-            through: from.clone(),
-        };
-        loop {
-            if lag.entry_threshold_reached(entry_threshold)
-                || lag.byte_threshold_reached(byte_threshold)
-            {
-                return Ok(lag);
-            }
-            let remaining_entries = entry_threshold.get() - lag.entries;
-            let page_entries = usize::try_from(remaining_entries)
-                .unwrap_or(usize::MAX)
-                .min(self.page_size)
-                .max(1);
-            let page_bytes = (byte_threshold.get() - lag.encoded_bytes)
-                .min(MAX_INDEX_EVENT_PAGE_BYTES)
-                .max(1);
-            let page = match self
-                .next_page_limited(
-                    tenant_id,
-                    bucket_id,
-                    &lag.through,
-                    target,
-                    page_entries,
-                    page_bytes,
-                )
-                .await
-            {
-                Ok(page) => page,
-                Err(IndexEventError::PageBytesExceeded { bytes, limit }) => {
-                    let projected = lag
-                        .encoded_bytes
-                        .checked_add(bytes)
-                        .ok_or(IndexEventError::PageLengthOverflow)?;
-                    if projected < byte_threshold.get() {
-                        return Err(IndexEventError::PageBytesExceeded { bytes, limit });
-                    }
-                    lag.entries = lag
-                        .entries
-                        .checked_add(1)
-                        .ok_or(IndexEventError::PageLengthOverflow)?;
-                    lag.encoded_bytes = projected;
-                    return Ok(lag);
-                }
-                Err(error) => return Err(error),
-            };
-            let Some(page) = page else {
-                return Ok(lag);
-            };
-            lag.entries = lag
-                .entries
-                .checked_add(
-                    u64::try_from(page.changes.len())
-                        .map_err(|_| IndexEventError::PageLengthOverflow)?,
-                )
-                .ok_or(IndexEventError::PageLengthOverflow)?;
-            lag.encoded_bytes = lag
-                .encoded_bytes
-                .checked_add(page.encoded_bytes)
-                .ok_or(IndexEventError::PageLengthOverflow)?;
-            lag.through = page.through;
-        }
-    }
-
     /// Return the newest routed offset per source for one bucket interval.
     /// Empty source ranges consume no caller memory and still advance the
     /// disposable scan cursor to the complete target vector.
@@ -901,6 +801,26 @@ impl IndexEventJournal {
     ) -> Result<BTreeMap<SourceId, u64>, IndexEventError> {
         self.routed_effects_filtered(tenant_id, bucket_id, from, target, is_index_source_change)
             .await
+    }
+
+    /// Return only bucket effects which can alter an accounting rollup.
+    /// Accounting artifacts are ordinary objects for durability, but they are
+    /// excluded from accounting projection input and must not self-trigger.
+    pub(crate) async fn routed_accounting_effects(
+        &self,
+        tenant_id: u64,
+        bucket_id: u64,
+        from: &IndexBarrier,
+        target: &IndexBarrier,
+    ) -> Result<BTreeMap<SourceId, u64>, IndexEventError> {
+        self.routed_effects_filtered(
+            tenant_id,
+            bucket_id,
+            from,
+            target,
+            crate::accounting::is_accounting_source_change,
+        )
+        .await
     }
 
     /// Capture a query freshness cut scoped to one bucket. An unrelated

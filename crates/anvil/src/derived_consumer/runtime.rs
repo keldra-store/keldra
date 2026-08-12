@@ -649,7 +649,7 @@ async fn routed_effects(
         }
         DerivedConsumerKind::Accounting => {
             journal
-                .routed_effects(tenant_id, bucket_id, from, target)
+                .routed_accounting_effects(tenant_id, bucket_id, from, target)
                 .await
         }
     }
@@ -681,8 +681,7 @@ fn evidence_covers_effects(
         return false;
     };
     let barrier = match evidence {
-        DerivedBarrierEvidence::Published(barrier)
-        | DerivedBarrierEvidence::ScopedSnapshot(barrier) => barrier,
+        DerivedBarrierEvidence::Published(barrier) => barrier,
     };
     effects.iter().all(|(source, required_next)| {
         let node = NodeId(u64::from(source.node_id));
@@ -734,9 +733,11 @@ fn demux_strategy(
 }
 
 fn change_bucket(kind: DerivedConsumerKind, change: &LocalChange) -> Option<(u64, u64)> {
-    if kind == DerivedConsumerKind::Index
-        && !crate::index_runtime::events::is_index_source_change(change)
-    {
+    let included = match kind {
+        DerivedConsumerKind::Index => crate::index_runtime::events::is_index_source_change(change),
+        DerivedConsumerKind::Accounting => crate::accounting::is_accounting_source_change(change),
+    };
+    if !included {
         return None;
     }
     match change {
@@ -964,7 +965,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_durable_generation_covering_every_effect_suppresses_a_builder_wake() {
+    fn only_published_source_complete_evidence_suppresses_a_builder_wake() {
         let source = SourceId {
             node_id: 1,
             source_epoch: [4; 32],
@@ -991,22 +992,47 @@ mod tests {
     }
 
     #[test]
-    fn raw_demux_excludes_reserved_objects_only_from_index_consumers() {
-        let change = LocalChange::ObjectHead(anvil_store::ObjectHeadChange {
-            offset: 8,
-            tenant_id: 1,
-            bucket_id: 2,
-            exact_path: "objects/_anvil/index-pack".into(),
-            path_version: anvil_store::VersionId(9),
-            kind: anvil_store::ObjectHeadChangeKind::Put,
-            reference_deltas: Vec::new(),
-            definition_transition: None,
-            accounting_transition: None,
-        });
+    fn raw_demux_uses_each_projection_source_predicate() {
+        let change = |path: &str| {
+            LocalChange::ObjectHead(anvil_store::ObjectHeadChange {
+                offset: 8,
+                tenant_id: 1,
+                bucket_id: 2,
+                exact_path: path.into(),
+                path_version: anvil_store::VersionId(9),
+                kind: anvil_store::ObjectHeadChangeKind::Put,
+                reference_deltas: Vec::new(),
+                definition_transition: None,
+                accounting_transition: None,
+            })
+        };
 
-        assert_eq!(change_bucket(DerivedConsumerKind::Index, &change), None);
         assert_eq!(
-            change_bucket(DerivedConsumerKind::Accounting, &change),
+            change_bucket(
+                DerivedConsumerKind::Index,
+                &change("objects/_anvil/index-pack")
+            ),
+            None
+        );
+        assert_eq!(
+            change_bucket(
+                DerivedConsumerKind::Accounting,
+                &change("_anvil/accounting/7/current")
+            ),
+            None
+        );
+        assert_eq!(
+            change_bucket(
+                DerivedConsumerKind::Accounting,
+                &change("_anvil/accounting/7/sources/3")
+            ),
+            Some((1, 2))
+        );
+        assert_eq!(
+            change_bucket(
+                DerivedConsumerKind::Accounting,
+                &change("customer/ordinary.json")
+            ),
             Some((1, 2))
         );
     }

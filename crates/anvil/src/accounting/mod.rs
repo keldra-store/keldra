@@ -17,8 +17,8 @@ pub(crate) use matcher::{AccountingMatcher, AccountingMatcherConfig, matcher_nod
 pub(crate) use model::{
     LoadedAccountingDefinition, StoredAccountingDefinition, StoredAccountingRollup,
     StoredTrafficCheckpoint, StoredTrafficSource, current_path, definition_id_from_path,
-    definition_path, derive_accounting_id, includes_path, is_accounting_path, is_artifact_path,
-    outbound_source_path, validate_prefix,
+    definition_path, derive_accounting_id, includes_path, is_accounting_path,
+    is_accounting_source_change, is_artifact_path, outbound_source_path, validate_prefix,
 };
 pub(crate) use publication::AccountingPublisher;
 pub(crate) use service::AccountingServiceImpl;

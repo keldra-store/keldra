@@ -1,8 +1,10 @@
 //! Disposable sparse-route aggregation for derived-consumer retention.
 //!
 //! The tracker contains only definitions with a routed effect not yet covered
-//! by a published generation or a scoped snapshot. It cannot emit a checkpoint
-//! until the caller has completed one explicit assigned-definition inventory.
+//! by a published source-complete generation or rollup. Construction snapshots
+//! are not durable publication evidence and therefore cannot release retained
+//! source history. The tracker cannot emit a checkpoint until the caller has
+//! completed one explicit assigned-definition inventory.
 
 use std::collections::BTreeMap;
 
@@ -40,13 +42,12 @@ impl DerivedDefinitionIdentity {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum DerivedBarrierEvidence {
     Published(IndexBarrier),
-    ScopedSnapshot(IndexBarrier),
 }
 
 impl DerivedBarrierEvidence {
     fn barrier(&self) -> &IndexBarrier {
         match self {
-            Self::Published(barrier) | Self::ScopedSnapshot(barrier) => barrier,
+            Self::Published(barrier) => barrier,
         }
     }
 }

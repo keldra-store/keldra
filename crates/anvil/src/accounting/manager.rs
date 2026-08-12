@@ -647,13 +647,6 @@ async fn open_baseline(
         .journal
         .barrier_from_snapshot_tails(stream.placement_fence(), expected_atomic, &tails)
         .map_err(event_status)?;
-    dependencies
-        .derived_progress
-        .report(
-            derived_identity(definition),
-            DerivedBarrierEvidence::ScopedSnapshot(through.clone()),
-        )
-        .await;
     Ok((stream, through))
 }
 
@@ -974,6 +967,29 @@ mod tests {
         assert_eq!(snapshot.logical_stored_bytes(), 90);
         assert_eq!(snapshot.object_count(), 3);
         assert_eq!(through.sources[&NodeId(4)].next_offset, 9);
+    }
+
+    #[test]
+    fn incomplete_rollup_never_becomes_retention_proof() {
+        let definition = definition();
+        let rollup = StoredAccountingRollup::new(
+            definition.stored.accounting_id,
+            definition.version.0,
+            90,
+            3,
+            4,
+            5,
+            false,
+            &barrier(9),
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert!(
+            resume_rollup(&definition, &rollup, &barrier(12))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

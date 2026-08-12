@@ -2,8 +2,8 @@ use anvil_store::{DefinitionKind, DefinitionMutationIntent, Store, VersionId};
 use tonic::Status;
 
 use crate::index_runtime::publication::{
-    DefinitionVersionGuard, IndexArtifactDelete, IndexArtifactOutcome, IndexArtifactPublish,
-    IndexArtifactRouter,
+    DefinitionVersionGuard, DerivedArtifactAdmission, IndexArtifactDelete, IndexArtifactOutcome,
+    IndexArtifactPublish, IndexArtifactRouter,
 };
 
 use super::{
@@ -44,6 +44,7 @@ impl AccountingPublisher {
                 DefinitionMutationIntent::new(DefinitionKind::Accounting, definition.accounting_id)
                     .map_err(|error| Status::internal(error.to_string()))?,
             ),
+            false,
         )
         .await
     }
@@ -77,6 +78,7 @@ impl AccountingPublisher {
                 expected_version: definition_version,
             }),
             None,
+            true,
         )
         .await
     }
@@ -106,6 +108,7 @@ impl AccountingPublisher {
             command_id,
             None,
             None,
+            false,
         )
         .await
     }
@@ -151,12 +154,14 @@ impl AccountingPublisher {
         command_id: String,
         definition_guard: Option<DefinitionVersionGuard>,
         definition_intent: Option<DefinitionMutationIntent>,
+        derived_progress: bool,
     ) -> Result<IndexArtifactOutcome, Status> {
-        let blob = self
-            .store
-            .stage_blob(&bytes)
-            .await
-            .map_err(|error| Status::internal(format!("stage accounting artifact: {error}")))?;
+        let blob = if derived_progress {
+            self.store.stage_derived_progress_blob(&bytes).await
+        } else {
+            self.store.stage_blob(&bytes).await
+        }
+        .map_err(|error| Status::internal(format!("stage accounting artifact: {error}")))?;
         self.artifacts
             .publish(IndexArtifactPublish {
                 storage_tenant: definition.storage_tenant.clone(),
@@ -170,6 +175,11 @@ impl AccountingPublisher {
                 command_id,
                 definition_guard,
                 definition_intent,
+                admission: if derived_progress {
+                    DerivedArtifactAdmission::PublicationProgress
+                } else {
+                    DerivedArtifactAdmission::Bounded
+                },
             })
             .await
     }

@@ -11,8 +11,8 @@ use anvil_consensus::NodeId;
 use super::storage::{bounded_blocking, object_coordinator};
 use super::{CLUSTER_PEER_SCHEMA_VERSION, ClusterPeerService, wire};
 use crate::index_runtime::publication::{
-    DefinitionVersionGuard, IndexArtifactDelete, IndexArtifactPublication, IndexArtifactPublish,
-    is_index_recovery_path,
+    DefinitionVersionGuard, DerivedArtifactAdmission, IndexArtifactDelete,
+    IndexArtifactPublication, IndexArtifactPublish, is_index_recovery_path,
 };
 
 const INDEX_HEAD_SCAN_MAX_RECORDS: u32 = 128;
@@ -449,6 +449,11 @@ pub(super) fn decode_request(
         command_id: request.command_id.clone(),
         definition_guard: decode_definition_guard(request)?,
         definition_intent: decode_definition_intent(request.definition_kind, request.index_id)?,
+        admission: if request.publication_progress {
+            DerivedArtifactAdmission::PublicationProgress
+        } else {
+            DerivedArtifactAdmission::Bounded
+        },
     })
 }
 
@@ -522,6 +527,34 @@ mod tests {
     use anvil_store::{RetainedHeadState, Version};
 
     use super::*;
+
+    #[test]
+    fn private_artifact_admission_round_trips_over_the_peer_protocol() {
+        for admission in [
+            DerivedArtifactAdmission::Bounded,
+            DerivedArtifactAdmission::PublicationProgress,
+        ] {
+            let request = IndexArtifactPublish {
+                storage_tenant: "tenant".into(),
+                bucket: "bucket".into(),
+                tenant_id: 4,
+                bucket_id: 5,
+                index_id: 9,
+                exact_path: crate::index_runtime::publication::manifest_path(9, [3; 32]),
+                blob: BlobRef {
+                    hash: [7; 32],
+                    length: 11,
+                },
+                expected_version: None,
+                command_id: "peer-admission-round-trip".into(),
+                definition_guard: None,
+                definition_intent: None,
+                admission,
+            };
+            let encoded = super::super::transport::wire_index_artifact_publish(&request, None);
+            assert_eq!(decode_request(&encoded).unwrap().admission, admission);
+        }
+    }
 
     #[test]
     fn scan_scopes_cannot_become_arbitrary_prefix_scans() {

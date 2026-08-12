@@ -512,6 +512,9 @@ message PublishIndexArtifactRequest {
   RoutedDefinitionKind guarded_definition_kind = 13;
   string guarded_definition_path = 14;
   uint64 guarded_definition_version = 15;
+  // Private builder-selected admission. Only an authenticated current HRW
+  // builder may send this peer request; public APIs cannot set it.
+  bool publication_progress = 16;
 }
 
 // Second hop emitted only by the authenticated definition-path coordinator

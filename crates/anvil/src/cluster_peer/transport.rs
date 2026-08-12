@@ -1066,7 +1066,7 @@ impl ClusterPeerTransport {
     }
 }
 
-fn wire_index_artifact_publish(
+pub(super) fn wire_index_artifact_publish(
     request: &IndexArtifactPublish,
     peer: Option<wire::PeerContext>,
 ) -> wire::PublishIndexArtifactRequest {
@@ -1094,6 +1094,7 @@ fn wire_index_artifact_publish(
             .definition_guard
             .as_ref()
             .map_or(0, |guard| guard.expected_version.0),
+        publication_progress: request.admission.is_publication_progress(),
     }
 }
 

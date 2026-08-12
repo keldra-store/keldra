@@ -88,6 +88,22 @@ pub(crate) struct IndexArtifactPublish {
     /// generation, current, rollup, and traffic-source artifacts leave this
     /// absent.
     pub definition_intent: Option<DefinitionMutationIntent>,
+    /// Private admission selected by the current authenticated HRW builder.
+    /// It is never inferred from a reserved path or exposed to public clients.
+    pub admission: DerivedArtifactAdmission,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum DerivedArtifactAdmission {
+    #[default]
+    Bounded,
+    PublicationProgress,
+}
+
+impl DerivedArtifactAdmission {
+    pub(crate) const fn is_publication_progress(self) -> bool {
+        matches!(self, Self::PublicationProgress)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -161,6 +177,21 @@ impl IndexArtifactPublish {
             self.index_id,
             self.definition_intent,
         )?;
+        if self.admission.is_publication_progress() {
+            let eligible = matches!(
+                kind,
+                ArtifactPathKind::Current | ArtifactPathKind::Immutable
+            ) || (kind == ArtifactPathKind::AccountingMutable
+                && crate::accounting::current_path(self.index_id)
+                    .ok()
+                    .as_deref()
+                    == Some(self.exact_path.as_str()));
+            if !eligible || self.definition_intent.is_some() {
+                return Err(Status::invalid_argument(
+                    "publication-progress admission is valid only for index generation or complete accounting-rollup publication",
+                ));
+            }
+        }
         match (kind, self.expected_version) {
             (ArtifactPathKind::Current, Some(VersionId(0))) => Err(Status::invalid_argument(
                 "index current-pointer expected version must be non-zero",
@@ -495,23 +526,38 @@ impl IndexArtifactCoordinator {
             ArtifactPathKind::AccountingMutable => ACCOUNTING_ARTIFACT_CONTENT_TYPE,
             ArtifactPathKind::Current | ArtifactPathKind::Immutable => INDEX_ARTIFACT_CONTENT_TYPE,
         };
+        let derived_progress = request.admission.is_publication_progress();
         let durability = artifact_durability(kind, placement.placement_nodes().len());
-        let receipt = self
-            .objects
-            .publish_from_source_with_governance_and_definition_intent(
-                PublishRequest {
-                    key,
-                    blob: request.blob,
-                    content_type: Some(content_type.into()),
-                    mode,
-                    command_id: Some(request.command_id),
-                    durability,
-                },
-                authenticated_builder,
-                governance,
-                request.definition_intent,
-            )
-            .await?;
+        let publish = PublishRequest {
+            key,
+            blob: request.blob,
+            content_type: Some(content_type.into()),
+            mode,
+            command_id: Some(request.command_id),
+            durability,
+        };
+        let receipt = if derived_progress && request.definition_intent.is_none() {
+            self.objects
+                .publish_derived_progress_from_source_with_governance(
+                    publish,
+                    authenticated_builder,
+                    governance,
+                )
+                .await?
+        } else if !derived_progress {
+            self.objects
+                .publish_from_source_with_governance_and_definition_intent(
+                    publish,
+                    authenticated_builder,
+                    governance,
+                    request.definition_intent,
+                )
+                .await?
+        } else {
+            return Err(Status::invalid_argument(
+                "derived progress publication cannot mutate a definition",
+            ));
+        };
         Ok(IndexArtifactOutcome {
             version: receipt.version,
             replayed: receipt.replayed,
@@ -526,6 +572,7 @@ impl IndexArtifactCoordinator {
     ) -> Result<Vec<IndexArtifactOutcome>, Status> {
         validate_immutable_batch(&requests)?;
         let first = &requests[0];
+        let admission = first.admission;
         let identity = IndexIdentity::new(first.tenant_id, first.bucket_id, first.index_id)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         self.validate_index_builder(authenticated_builder, &placement, identity)?;
@@ -583,14 +630,26 @@ impl IndexArtifactCoordinator {
                 })
             })
             .collect::<Result<Vec<_>, Status>>()?;
-        self.objects
-            .publish_many_from_source_with_governance(
-                publishes,
-                authenticated_builder,
-                governance,
-                placement,
-            )
-            .await?
+        let results = if admission.is_publication_progress() {
+            self.objects
+                .publish_many_derived_progress_from_source_with_governance(
+                    publishes,
+                    authenticated_builder,
+                    governance,
+                    placement,
+                )
+                .await?
+        } else {
+            self.objects
+                .publish_many_from_source_with_governance(
+                    publishes,
+                    authenticated_builder,
+                    governance,
+                    placement,
+                )
+                .await?
+        };
+        results
             .into_iter()
             .map(|outcome| {
                 outcome.map(|receipt| IndexArtifactOutcome {
@@ -1228,9 +1287,10 @@ fn validate_immutable_batch(requests: &[IndexArtifactPublish]) -> Result<(), Sta
             || request.tenant_id != first.tenant_id
             || request.bucket_id != first.bucket_id
             || request.index_id != first.index_id
+            || request.admission != first.admission
         {
             return Err(Status::invalid_argument(
-                "grouped index artifacts must share one exact index identity",
+                "grouped index artifacts must share one exact index identity and admission",
             ));
         }
         bytes = bytes.checked_add(request.blob.length).ok_or_else(|| {
@@ -1451,6 +1511,7 @@ mod tests {
             command_id: "publish-guard-test".into(),
             definition_guard,
             definition_intent: None,
+            admission: DerivedArtifactAdmission::Bounded,
         }
     }
 
@@ -1477,6 +1538,18 @@ mod tests {
         ] {
             assert!(parse_artifact_path(invalid, 7).is_err(), "{invalid}");
         }
+    }
+
+    #[test]
+    fn progress_admission_is_explicit_and_limited_to_complete_derived_artifacts() {
+        let mut manifest = artifact_publish(manifest_path(7, [4; 32]), None);
+        manifest.admission = DerivedArtifactAdmission::PublicationProgress;
+        assert_eq!(manifest.validate().unwrap(), ArtifactPathKind::Immutable);
+
+        let mut outbound =
+            artifact_publish(crate::accounting::outbound_source_path(7, 1).unwrap(), None);
+        outbound.admission = DerivedArtifactAdmission::PublicationProgress;
+        assert!(outbound.validate().is_err());
     }
 
     #[test]
