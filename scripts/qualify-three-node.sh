@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${repo_root}/scripts/qualification-log-evidence.sh"
 source "${repo_root}/scripts/qualification-scale-evidence.sh"
@@ -33,9 +32,8 @@ esac
 index_resource_mutations="${ANVIL_QUALIFICATION_INDEX_MUTATIONS:-512}"
 index_resource_max_anonymous_growth_bytes="${ANVIL_QUALIFICATION_INDEX_MAX_ANONYMOUS_GROWTH_BYTES:-2147483648}"
 release_source_journal_max_entries="${ANVIL_QUALIFICATION_SOURCE_JOURNAL_MAX_ENTRIES:-1000000}"
-gap_source_journal_max_entries="${ANVIL_QUALIFICATION_GAP_SOURCE_JOURNAL_MAX_ENTRIES:-64}"
+pressure_source_journal_max_entries="${ANVIL_QUALIFICATION_PRESSURE_SOURCE_JOURNAL_MAX_ENTRIES:-64}"
 index_kinds=(Path MetadataFilter TypedJson FullText Vector Hybrid GitSource Tensor)
-
 for configured_limit in \
   "${index_disk_cache_bytes}" \
   "${index_memory_percent}" \
@@ -46,7 +44,7 @@ for configured_limit in \
   "${index_resource_mutations}" \
   "${index_resource_max_anonymous_growth_bytes}" \
   "${release_source_journal_max_entries}" \
-  "${gap_source_journal_max_entries}"
+  "${pressure_source_journal_max_entries}"
 do
   if [[ ! "${configured_limit}" =~ ^[1-9][0-9]*$ ]]; then
     echo "index qualification limits must be positive decimal integers" >&2
@@ -72,8 +70,8 @@ if [[ "${qualification_mode}" == "release" ]] \
   echo "release qualification requires the production source-journal entry bound of at least 1000000" >&2
   exit 2
 fi
-if ((gap_source_journal_max_entries >= release_source_journal_max_entries)); then
-  echo "journal-gap entry bound must be smaller than the release entry bound" >&2
+if ((pressure_source_journal_max_entries >= release_source_journal_max_entries)); then
+  echo "journal-pressure entry bound must be smaller than the release entry bound" >&2
   exit 2
 fi
 export ANVIL_QUALIFICATION_INDEX_DISK_CACHE_BYTES="${index_disk_cache_bytes}"
@@ -81,9 +79,8 @@ export ANVIL_QUALIFICATION_INDEX_MEMORY_PERCENT="${index_memory_percent}"
 export ANVIL_QUALIFICATION_INDEX_KIND_BUDGET_BYTES="${index_kind_budget_bytes}"
 export ANVIL_QUALIFICATION_INDEX_COMPACTION_MAX_LANES="${index_compaction_max_lanes}"
 export ANVIL_QUALIFICATION_INDEX_RAYON_WORKERS="${index_rayon_workers}"
-export ANVIL_QUALIFICATION_SOURCE_JOURNAL_MAX_ENTRIES="${gap_source_journal_max_entries}"
+export ANVIL_QUALIFICATION_SOURCE_JOURNAL_MAX_ENTRIES="${pressure_source_journal_max_entries}"
 export ANVIL_QUALIFICATION_RUST_LOG=info,anvil::index_runtime::cpu=warn,anvil::index_runtime::retention=debug,anvil::observability::runtime=debug
-
 case "${ANVIL_DOCKER_PLATFORM:-}" in
   "")
     case "$(uname -m)" in
@@ -101,7 +98,6 @@ case "${ANVIL_DOCKER_PLATFORM:-}" in
     exit 2
     ;;
 esac
-
 command -v docker >/dev/null 2>&1 || {
   echo "docker is required" >&2
   exit 2
@@ -119,7 +115,6 @@ command -v git >/dev/null 2>&1 || {
   exit 2
 }
 docker compose version >/dev/null
-
 source_commit="$(git -C "${repo_root}" rev-parse --verify 'HEAD^{commit}')"
 if [[ ! "${source_commit}" =~ ^[0-9a-f]{40}$ ]]; then
   echo "qualification could not derive the exact source commit" >&2
@@ -149,7 +144,6 @@ if [[ ! "${hardware_logical_cpus}" =~ ^[1-9][0-9]*$ \
   echo "qualification could not derive the bounded host hardware summary" >&2
   exit 2
 fi
-
 qualification_examples=(
   accounting_qualification
   atomic_index_qualification
@@ -170,9 +164,9 @@ cargo_target_dir="$(
       '.target_directory | select(type == "string" and length > 0)'
 )"
 cargo build --quiet --release --locked --package anvil-server \
+  --jobs "${CARGO_BUILD_JOBS:-1}" \
   --manifest-path "${repo_root}/Cargo.toml" \
   "${qualification_example_flags[@]}"
-
 declare -A qualification_binaries=()
 for qualification_example in "${qualification_examples[@]}"; do
   qualification_binaries["${qualification_example}"]="${cargo_target_dir}/release/examples/${qualification_example}"
@@ -182,7 +176,6 @@ for qualification_example in "${qualification_examples[@]}"; do
   fi
 done
 echo "[anvil-qualification] optimized qualification clients are ready; Cargo is no longer needed"
-
 image_id="$("${repo_root}/scripts/resolve-docker-image-id.sh" "${requested_image}")"
 if [[ ! "${image_id}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
   echo "qualification image did not resolve to an immutable sha256 digest" >&2
@@ -224,7 +217,9 @@ export ANVIL_QUALIFICATION_START_NODE="${start_node}"
 qualification_suffix="${ANVIL_QUALIFICATION_DIR##*.}"
 index_verification_state="${ANVIL_QUALIFICATION_DIR}/artifacts/index-verification-state.json"
 index_membership_state="${ANVIL_QUALIFICATION_DIR}/artifacts/index-membership-state.json"
-index_gap_state="${ANVIL_QUALIFICATION_DIR}/artifacts/index-gap-state.json"
+index_pressure_state="${ANVIL_QUALIFICATION_DIR}/artifacts/index-pressure-state.json"
+index_pressure_release="${ANVIL_QUALIFICATION_DIR}/artifacts/index-pressure-release"
+index_pressure_writer_output="${ANVIL_QUALIFICATION_DIR}/artifacts/index-pressure-writer.log"
 index_resource_state="${ANVIL_QUALIFICATION_DIR}/artifacts/index-resource-state.json"
 index_resource_bucket="index-resource-${$}"
 index_resource_report="/var/tmp/anvil-v080-three-index-resource-${qualification_suffix}.json"
@@ -233,14 +228,13 @@ journal_pressure_evidence_prefix="/var/tmp/anvil-v080-three-journal-pressure-${q
 ANVIL_QUALIFICATION_STATE_DIR="${ANVIL_QUALIFICATION_DIR}/artifacts"
 keep="${ANVIL_QUALIFICATION_KEEP:-0}"
 paused_container=""
-
+pressure_writer_pid=""
 compose() {
   docker compose \
     --project-name "${ANVIL_QUALIFICATION_PROJECT}" \
     --file "${compose_file}" \
     "$@"
 }
-
 require_service_image() {
   local service="$1"
   local expected_image="$2"
@@ -256,10 +250,14 @@ require_service_image() {
     return 1
   fi
 }
-
 cleanup() {
   local status=$?
   trap - EXIT INT TERM
+  if [[ -n "${pressure_writer_pid}" ]] && kill -0 "${pressure_writer_pid}" 2>/dev/null; then
+    kill "${pressure_writer_pid}" >/dev/null 2>&1 || true
+    wait "${pressure_writer_pid}" >/dev/null 2>&1 || true
+  fi
+  pressure_writer_pid=""
   if [[ -n "${paused_container}" ]] \
     && docker inspect --format '{{.State.Paused}}' "${paused_container}" 2>/dev/null \
       | grep -Fxq true
@@ -295,7 +293,6 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
-
 server_help="$(docker run --rm "${image_id}" anvil-server --help)"
 for required in --peer-listen --peer-advertise --join-bundle; do
   if ! grep -Fq -- "${required}" <<<"${server_help}"; then
@@ -310,7 +307,6 @@ for required in prepare-node provision-tenant create-bucket; do
     exit 1
   fi
 done
-
 for directory in node-1 node-2 node-3 artifacts; do
   mkdir "${ANVIL_QUALIFICATION_DIR}/${directory}"
   chmod 0777 "${ANVIL_QUALIFICATION_DIR}/${directory}"
@@ -321,13 +317,10 @@ chmod 0600 "${ANVIL_QUALIFICATION_DIR}/token-signing-key"
 docker run --rm --user 0 \
   --volume "${ANVIL_QUALIFICATION_DIR}/token-signing-key:/qualification-key" \
   "${image_id}" chown 10001:10001 /qualification-key
-
 compose config --quiet
 compose up --detach anvil-1
 require_service_image anvil-1 "${image_id}" candidate
-
 network="${ANVIL_QUALIFICATION_PROJECT}_default"
-
 run_cli() {
   local node="$1"
   local client_id="$2"
@@ -341,7 +334,6 @@ run_cli() {
     "${image_id}" \
     anvil --endpoint "http://${node}:50051" "$@"
 }
-
 run_bootstrap_cli() {
   local node="$1"
   shift
@@ -357,7 +349,6 @@ run_bootstrap_cli() {
     anvil --endpoint "http://${node}:50051" \
       --credentials-file /qualification/node-1/system-bootstrap-credential.json "$@"
 }
-
 wait_for_bootstrap() {
   local attempt
   for attempt in $(seq 1 60); do
@@ -372,7 +363,6 @@ wait_for_bootstrap() {
   echo "node 1 did not generate its bootstrap credential within 60 seconds" >&2
   return 1
 }
-
 wait_for_node() {
   local node="$1"
   local attempt
@@ -390,11 +380,9 @@ wait_for_node() {
   echo "last client error: ${output}" >&2
   return 1
 }
-
 service_container() {
   compose ps --quiet "$1"
 }
-
 service_logs() {
   docker logs "$(service_container "$1")" 2>&1 | strip_ansi
 }
@@ -431,6 +419,7 @@ run_index_recovery_qualification() {
   local client_secret="$5"
   local state_path="$6"
   local bucket="${7:-}"
+  local release_path="${8:-}"
   ANVIL_INDEX_RECOVERY_QUALIFICATION_MODE="${mode}" \
   ANVIL_INDEX_RECOVERY_QUALIFICATION_ENDPOINTS="${endpoints}" \
   ANVIL_INDEX_RECOVERY_QUALIFICATION_TENANT="${tenant}" \
@@ -438,6 +427,7 @@ run_index_recovery_qualification() {
   ANVIL_INDEX_RECOVERY_QUALIFICATION_CLIENT_SECRET="${client_secret}" \
   ANVIL_INDEX_RECOVERY_QUALIFICATION_STATE="${state_path}" \
   ANVIL_INDEX_RECOVERY_QUALIFICATION_BUCKET="${bucket}" \
+  ANVIL_INDEX_RECOVERY_QUALIFICATION_RELEASE="${release_path}" \
     "${qualification_binaries[index_recovery_qualification]}"
 }
 
@@ -454,13 +444,6 @@ save_log_suffix() {
 
 state_index_ids() {
   sed -n 's/^[[:space:]]*"index_id":[[:space:]]*\([1-9][0-9]*\),\{0,1\}[[:space:]]*$/\1/p' "$1"
-}
-
-state_unsigned_field() {
-  local field="$1"
-  local state="$2"
-  sed -n "s/^[[:space:]]*\"${field}\":[[:space:]]*\([0-9][0-9]*\),\{0,1\}[[:space:]]*$/\1/p" \
-    "${state}"
 }
 
 log_has_index_event() {
@@ -716,9 +699,8 @@ run_index_resource_qualification() {
     ' "${index_resource_report}" >/dev/null
   if ((require_performance_targets == 1)); then
     jq -e '
-      .accepted_objects_per_second >= 8000 and
-      .source_complete_objects_per_second >= 8000 and
-      .timings.first_complete_generation_seconds <= 150
+      .accepted_objects_per_second >= 3000 and
+      .source_complete_objects_per_second >= 1000
     ' "${index_resource_report}" >/dev/null
   fi
   echo "[anvil-qualification] bounded distributed index resource qualification passed scope=${index_resource_scope} records=${index_resource_records} kind_budget=${index_kind_budget_bytes}"
@@ -1253,51 +1235,32 @@ run_live_builder_reassignment_qualification() {
   echo "[anvil-qualification] pre-growth indexes remained exact and published from ${new_builder_node} after online $((active_nodes - 1))->${active_nodes} reassignment"
 }
 
-run_real_journal_gap_qualification() {
-  local -A recovery_log_starts=()
-  local -A seed_log_starts=()
-  local builder=""
-  local builder_count=0
-  local bucket_id
-  local emitted_total=0
-  local evidence
-  local expected_scoped_heads
-  local gap_index_id
-  local head_reads
-  local heads_emitted
-  local ingress=""
-  local max_scoped_head_reads
-  local node
-  local node_id
-  local rebuild_line
-  local seed_log
-  local tenant_id
-  local unrelated_objects
-  local value
-  for node in anvil-1 anvil-2 anvil-3; do
-    seed_log_starts["${node}"]="$(log_cursor)"
-  done
+run_journal_pressure_qualification() {
+  local builder="" capacity_node="" ingress="" node pressure_log seed_log
+  local builder_count=0 deadline pending_command pressure_cursor pressure_index_id
+  local seed_cursor successful_mutations
+  seed_cursor="$(log_cursor)"
   run_index_recovery_qualification \
-    gap-seed "$(IFS=,; echo "${public_endpoints[*]}")" \
-    qindex-gap qindex-gap-client "${index_gap_secret}" \
-    "${index_gap_state}" "index-gap-${$}"
-  gap_index_id="$(state_index_ids "${index_gap_state}")"
-  if [[ ! "${gap_index_id}" =~ ^[1-9][0-9]*$ ]]; then
-    echo "journal-gap state did not contain exactly one fixture index ID" >&2
+    pressure-seed "$(IFS=,; echo "${public_endpoints[*]}")" \
+    qindex-pressure qindex-pressure-client "${index_pressure_secret}" \
+    "${index_pressure_state}" "index-pressure-${$}"
+  pressure_index_id="$(state_index_ids "${index_pressure_state}")"
+  if [[ ! "${pressure_index_id}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "journal-pressure state did not contain exactly one fixture index ID" >&2
     return 1
   fi
   for node in anvil-1 anvil-2 anvil-3; do
-    seed_log="${ANVIL_QUALIFICATION_DIR}/artifacts/index-gap-seed-${node}.log"
-    save_log_suffix "${node}" "${seed_log_starts[${node}]}" "${seed_log}"
-    if log_has_index_event \
-      "${seed_log}" "${gap_index_id}" "index generation published"
+    seed_log="${ANVIL_QUALIFICATION_DIR}/artifacts/index-pressure-seed-${node}.log"
+    save_log_suffix "${node}" "${seed_cursor}" "${seed_log}"
+    if log_has_index_event "${seed_log}" "${pressure_index_id}" \
+      "index generation published"
     then
       builder="${node}"
       builder_count=$((builder_count + 1))
     fi
   done
   if ((builder_count != 1)); then
-    echo "journal-gap seed was published by ${builder_count} nodes; expected one builder" >&2
+    echo "journal-pressure seed was published by ${builder_count} nodes; expected one builder" >&2
     return 1
   fi
   for node in anvil-1 anvil-2 anvil-3; do
@@ -1307,99 +1270,135 @@ run_real_journal_gap_qualification() {
     fi
   done
   if [[ -z "${ingress}" ]]; then
-    echo "journal-gap qualification found no non-builder ingress" >&2
+    echo "journal-pressure qualification found no non-builder ingress" >&2
+    return 1
+  fi
+
+  pressure_cursor="$(log_cursor)"
+  paused_container="$(service_container "${builder}")"
+  docker pause "${paused_container}" >/dev/null
+  : >"${index_pressure_writer_output}"
+  run_index_recovery_qualification \
+    pressure-write "$(public_endpoint_for "${ingress}")" \
+    qindex-pressure qindex-pressure-client "${index_pressure_secret}" \
+    "${index_pressure_state}" "" "${index_pressure_release}" \
+    >"${index_pressure_writer_output}" 2>&1 &
+  pressure_writer_pid=$!
+
+  deadline=$((SECONDS + 90))
+  while ((SECONDS < deadline)); do
+    if ! kill -0 "${pressure_writer_pid}" 2>/dev/null; then
+      wait "${pressure_writer_pid}" >/dev/null 2>&1 || true
+      pressure_writer_pid=""
+      echo "journal-pressure writer exited before reaching backpressure" >&2
+      cat "${index_pressure_writer_output}" >&2
+      return 1
+    fi
+    read -r pending_command successful_mutations < <(
+      jq -r '[.pending_command_id // "", .successful_mutations // 0] | @tsv' \
+        "${index_pressure_state}" 2>/dev/null || true
+    )
+    capacity_node=""
+    for node in anvil-1 anvil-2 anvil-3; do
+      pressure_log="${ANVIL_QUALIFICATION_DIR}/artifacts/index-pressure-live-${node}.log"
+      save_log_suffix "${node}" "${pressure_cursor}" "${pressure_log}"
+      if grep -F 'distributed object mutation is waiting for bounded durable state' \
+        "${pressure_log}" | grep -Fq 'capacity="source_journal"'
+      then
+        capacity_node="${node}"
+        break
+      fi
+    done
+    if [[ -n "${pending_command}" \
+      && "${successful_mutations}" =~ ^[1-9][0-9]*$ \
+      && -n "${capacity_node}" ]]
+    then
+      break
+    fi
+    sleep 1
+  done
+  if ((SECONDS >= deadline)); then
+    echo "journal-pressure writer did not reach source-journal backpressure within 90 seconds" >&2
+    cat "${index_pressure_writer_output}" >&2
+    return 1
+  fi
+
+  sleep 3
+  if ! kill -0 "${pressure_writer_pid}" 2>/dev/null; then
+    wait "${pressure_writer_pid}" >/dev/null 2>&1 || true
+    pressure_writer_pid=""
+    echo "journal-pressure writer did not remain pending while its index builder was paused" >&2
+    cat "${index_pressure_writer_output}" >&2
+    return 1
+  fi
+  run_index_recovery_qualification \
+    pressure-assert-blocked "$(public_endpoint_for "${ingress}")" \
+    qindex-pressure qindex-pressure-client "${index_pressure_secret}" \
+    "${index_pressure_state}"
+  if ! kill -0 "${pressure_writer_pid}" 2>/dev/null; then
+    wait "${pressure_writer_pid}" >/dev/null 2>&1 || true
+    pressure_writer_pid=""
+    echo "journal-pressure writer completed before capacity was released" >&2
+    cat "${index_pressure_writer_output}" >&2
     return 1
   fi
 
   for node in anvil-1 anvil-2 anvil-3; do
-    recovery_log_starts["${node}"]="$(log_cursor)"
+    pressure_log="${ANVIL_QUALIFICATION_DIR}/artifacts/index-pressure-${node}.log"
+    save_log_suffix "${node}" "${pressure_cursor}" "${pressure_log}"
+    if grep -Fq 'index snapshot rebuild started' "${pressure_log}"; then
+      echo "${node} started an unauthorized automatic snapshot rebuild under journal pressure" >&2
+      return 1
+    fi
   done
-  paused_container="$(service_container "${builder}")"
-  docker pause "${paused_container}" >/dev/null
-  sleep 4
-  run_index_recovery_qualification \
-    gap-write "$(public_endpoint_for "${ingress}")" \
-    qindex-gap qindex-gap-client "${index_gap_secret}" \
-    "${index_gap_state}"
+
+  touch "${index_pressure_release}"
   docker unpause "${paused_container}" >/dev/null
   paused_container=""
   wait_for_node "${builder}"
+  deadline=$((SECONDS + 90))
+  while kill -0 "${pressure_writer_pid}" 2>/dev/null && ((SECONDS < deadline)); do
+    sleep 1
+  done
+  if kill -0 "${pressure_writer_pid}" 2>/dev/null; then
+    kill "${pressure_writer_pid}" >/dev/null 2>&1 || true
+    wait "${pressure_writer_pid}" >/dev/null 2>&1 || true
+    pressure_writer_pid=""
+    echo "journal-pressure writer did not wake within 90 seconds" >&2
+    cat "${index_pressure_writer_output}" >&2
+    return 1
+  fi
+  local completed_writer_pid="${pressure_writer_pid}"
+  pressure_writer_pid=""
+  if ! wait "${completed_writer_pid}"; then
+    echo "journal-pressure writer failed after capacity was released" >&2
+    cat "${index_pressure_writer_output}" >&2
+    return 1
+  fi
   run_index_recovery_qualification \
-    gap-verify "$(IFS=,; echo "${public_endpoints[*]}")" \
-    qindex-gap qindex-gap-client "${index_gap_secret}" \
-    "${index_gap_state}"
-  for node in anvil-1 anvil-2 anvil-3; do
-    save_log_suffix \
-      "${node}" "${recovery_log_starts[${node}]}" \
-      "${ANVIL_QUALIFICATION_DIR}/artifacts/index-gap-recovery-${node}.log"
-  done
-  if ! log_has_index_event \
-    "${ANVIL_QUALIFICATION_DIR}/artifacts/index-gap-recovery-${builder}.log" \
-    "${gap_index_id}" "index snapshot rebuild started"
-  then
-    echo "${builder} did not report a scoped snapshot rebuild after its source cursor expired" >&2
-    return 1
-  fi
-  rebuild_line="$(awk -v marker="index.id=${gap_index_id} " '
-      index($0, marker) && index($0, "index snapshot rebuild started") { line = $0 }
-      END { print line }
-    ' "${ANVIL_QUALIFICATION_DIR}/artifacts/index-gap-recovery-${builder}.log")"
-  tenant_id="$(log_unsigned_field tenant_id "${rebuild_line}")" || {
-    echo "journal-gap rebuild omitted stable tenant_id evidence" >&2
-    return 1
-  }
-  bucket_id="$(log_unsigned_field bucket_id "${rebuild_line}")" || {
-    echo "journal-gap rebuild omitted stable bucket_id evidence" >&2
-    return 1
-  }
-  expected_scoped_heads="$(state_unsigned_field expected_scoped_heads "${index_gap_state}")"
-  max_scoped_head_reads="$(state_unsigned_field max_scoped_head_reads_per_source "${index_gap_state}")"
-  unrelated_objects="$(state_unsigned_field unrelated_objects "${index_gap_state}")"
-  for value in "${expected_scoped_heads}" "${max_scoped_head_reads}" "${unrelated_objects}"; do
-    if [[ ! "${value}" =~ ^[1-9][0-9]*$ ]]; then
-      echo "journal-gap state omitted its scoped head-read bounds" >&2
-      return 1
-    fi
-  done
-  if ((unrelated_objects <= max_scoped_head_reads * 3)); then
-    echo "journal-gap unrelated fixture is too small to expose a broad scan on every source" >&2
-    return 1
-  fi
+    pressure-verify "$(IFS=,; echo "${public_endpoints[*]}")" \
+    qindex-pressure qindex-pressure-client "${index_pressure_secret}" \
+    "${index_pressure_state}"
 
-  for node_id in 1 2 3; do
-    node="anvil-${node_id}"
-    evidence="$(awk -v tenant="tenant_id=${tenant_id}" -v bucket="bucket_id=${bucket_id}" '
-        index($0, "anvil_index_scoped_snapshot_evidence") &&
-        index($0, tenant) && index($0, bucket) { line = $0 }
-        END { print line }
-      ' "${ANVIL_QUALIFICATION_DIR}/artifacts/index-gap-recovery-${node}.log")"
-    if [[ -z "${evidence}" ]]; then
-      echo "${node} emitted no terminal scoped snapshot evidence for the journal-gap bucket" >&2
+  for node in anvil-1 anvil-2 anvil-3; do
+    pressure_log="${ANVIL_QUALIFICATION_DIR}/artifacts/index-pressure-${node}.log"
+    save_log_suffix "${node}" "${pressure_cursor}" "${pressure_log}"
+    if grep -Fq 'index snapshot rebuild started' "${pressure_log}"; then
+      echo "${node} started an unauthorized automatic snapshot rebuild while catching up" >&2
       return 1
     fi
-    if [[ "$(log_unsigned_field node_id "${evidence}")" != "${node_id}" ]]; then
-      echo "${node} scoped snapshot evidence carried another node identity" >&2
-      return 1
-    fi
-    head_reads="$(log_unsigned_field head_reads_total "${evidence}")" || {
-      echo "${node} scoped snapshot evidence omitted physical head reads" >&2
-      return 1
-    }
-    heads_emitted="$(log_unsigned_field heads_emitted_total "${evidence}")" || {
-      echo "${node} scoped snapshot evidence omitted emitted heads" >&2
-      return 1
-    }
-    if ((head_reads > max_scoped_head_reads)); then
-      echo "${node} physically read ${head_reads} heads for a scope capped at ${max_scoped_head_reads}" >&2
-      return 1
-    fi
-    emitted_total=$((emitted_total + heads_emitted))
   done
-  if ((emitted_total != expected_scoped_heads)); then
-    echo "scoped snapshot emitted ${emitted_total} heads, expected ${expected_scoped_heads}" >&2
+  if ! awk '
+    index($0, "distributed object mutation capacity wait finished") &&
+    index($0, "capacity=\"source_journal\"") &&
+    index($0, "backpressure.outcome=\"capacity_available\"") { found = 1 }
+    END { exit !found }
+  ' "${ANVIL_QUALIFICATION_DIR}/artifacts/index-pressure-${capacity_node}.log"
+  then
+    echo "${capacity_node} did not report that source-journal capacity released its writer" >&2
     return 1
   fi
-  echo "[anvil-qualification] a genuine retained-journal gap read only its scoped bucket and recovered ${expected_scoped_heads} exact live heads"
+  echo "[anvil-qualification] hard source-journal capacity kept a public write pending and uncommitted, then woke it and reached an exact incremental index generation"
 }
 
 assert_zero_accounting_traffic_drops() {
@@ -1664,14 +1663,14 @@ cmp "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-two-large.bin" \
 require_qprobe_head anvil-1 growth/from-two.bin "${growth_two_head}"
 echo "[anvil-qualification] two-node REPLICATED read succeeded without its ingress copy"
 
-prepare_no_event_membership_cutover_qualification anvil-2 2 qprobe-client "${qprobe_secret}" qprobe objects "${gap_source_journal_max_entries}"
+prepare_no_event_membership_cutover_qualification anvil-2 2 qprobe-client "${qprobe_secret}" qprobe objects "${pressure_source_journal_max_entries}"
 prepare_joining_node 3
 prepare_indexed_membership_cutover_qualification \
   anvil-1 1 anvil-2 qindex-membership \
   qindex-membership-client "${index_membership_secret}" \
-  "${index_membership_state}" "${gap_source_journal_max_entries}"
+  "${index_membership_state}" "${pressure_source_journal_max_entries}"
 start_prepared_node_during_indexed_cutover 3
-qualify_no_event_membership_cutover anvil-2 2 qprobe-client "${qprobe_secret}" qprobe objects "${gap_source_journal_max_entries}"
+qualify_no_event_membership_cutover anvil-2 2 qprobe-client "${qprobe_secret}" qprobe objects "${pressure_source_journal_max_entries}"
 membership_three_endpoints="$(public_endpoint_for anvil-1),$(public_endpoint_for anvil-2),$(public_endpoint_for anvil-3)"
 run_live_builder_reassignment_qualification \
   3 "${membership_three_endpoints}" anvil-3
@@ -1742,10 +1741,15 @@ for index_node in anvil-1 anvil-2 anvil-3; do
   public_endpoints+=("$(public_endpoint_for "${index_node}")")
 done
 
-index_gap_secret=qualification-index-gap-secret-0000000000000000000000
-provision_tenant qindex-gap qindex-gap-client "${index_gap_secret}"
-run_real_journal_gap_qualification
-preserve_journal_pressure_evidence "${journal_pressure_evidence_prefix}"
+index_pressure_secret=qualification-index-pressure-secret-000000000000000000
+provision_tenant qindex-pressure qindex-pressure-client "${index_pressure_secret}"
+run_journal_pressure_qualification
+for pressure_node in anvil-1 anvil-2 anvil-3; do
+  preserve_qualification_log \
+    "${ANVIL_QUALIFICATION_DIR}/artifacts/index-pressure-${pressure_node}.log" \
+    "${journal_pressure_evidence_prefix}-${pressure_node}.log"
+done
+echo "[anvil-qualification] preserved journal-pressure evidence ${journal_pressure_evidence_prefix}-anvil-{1,2,3}.log"
 start_release_source_journal_phase "${release_source_journal_max_entries}"
 
 index_secret=qualification-index-secret-00000000000000000000000

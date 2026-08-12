@@ -436,7 +436,9 @@ run_exact_resource_scale_qualification() {
     "${index_resource_probe_report}" \
     "${index_resource_probe_telemetry_prefix}" \
     "${index_resource_probe_proof}"
-  write_scale_comparison_report
+  if [[ -n "${scale_baseline_resource_report:-}" ]]; then
+    write_scale_comparison_report
+  fi
 }
 
 write_scale_comparison_report() {

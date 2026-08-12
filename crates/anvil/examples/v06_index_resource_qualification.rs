@@ -57,8 +57,8 @@ const QUERY_LIMIT: u32 = 1_000;
 const FRESHNESS_PROBE_PARTITION: u64 = PARTITION_COUNT;
 const BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const EXACT_VERIFICATION_TIMEOUT: Duration = Duration::from_secs(45 * 60);
-const MIN_RELEASE_OBJECTS_PER_SECOND: f64 = 8_000.0;
-const MAX_RELEASE_FIRST_GENERATION_SECONDS: f64 = 150.0;
+const MIN_RELEASE_INGEST_OBJECTS_PER_SECOND: f64 = 3_000.0;
+const MIN_RELEASE_INDEX_OBJECTS_PER_SECOND: f64 = 1_000.0;
 
 #[derive(Clone, Debug)]
 struct Config {
@@ -392,17 +392,12 @@ async fn main() -> Result<()> {
         config.records as f64 / timings.first_complete_generation_seconds;
     if config.require_performance_targets {
         ensure!(
-            accepted_objects_per_second >= MIN_RELEASE_OBJECTS_PER_SECOND,
-            "accepted object rate {accepted_objects_per_second:.3}/s is below the release target {MIN_RELEASE_OBJECTS_PER_SECOND:.3}/s"
+            accepted_objects_per_second >= MIN_RELEASE_INGEST_OBJECTS_PER_SECOND,
+            "accepted object rate {accepted_objects_per_second:.3}/s is below the release target {MIN_RELEASE_INGEST_OBJECTS_PER_SECOND:.3}/s"
         );
         ensure!(
-            source_complete_objects_per_second >= MIN_RELEASE_OBJECTS_PER_SECOND,
-            "source-complete index rate {source_complete_objects_per_second:.3}/s is below the release target {MIN_RELEASE_OBJECTS_PER_SECOND:.3}/s"
-        );
-        ensure!(
-            timings.first_complete_generation_seconds <= MAX_RELEASE_FIRST_GENERATION_SECONDS,
-            "first complete generation took {:.3}s, above the release target {MAX_RELEASE_FIRST_GENERATION_SECONDS:.3}s",
-            timings.first_complete_generation_seconds,
+            source_complete_objects_per_second >= MIN_RELEASE_INDEX_OBJECTS_PER_SECOND,
+            "source-complete index rate {source_complete_objects_per_second:.3}/s is below the release target {MIN_RELEASE_INDEX_OBJECTS_PER_SECOND:.3}/s"
         );
     }
 

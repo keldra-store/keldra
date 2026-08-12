@@ -1,4 +1,4 @@
-//! Public-API fixtures for online index reassignment and retained-journal gaps.
+//! Public-API fixtures for online index reassignment and journal backpressure.
 
 use std::collections::BTreeSet;
 use std::env;
@@ -12,14 +12,13 @@ use anvil_storage::v1::bulk_outcome::Outcome as BulkOutcomeValue;
 use anvil_storage::v1::index_query::Query as QueryValue;
 use anvil_storage::v1::index_service_client::IndexServiceClient;
 use anvil_storage::v1::index_specification::Specification as SpecificationValue;
+use anvil_storage::v1::object_head::State as ObjectHeadState;
 use anvil_storage::v1::put_header::Operation as PutOperationValue;
-use anvil_storage::v1::watch_message::Message as WatchMessageValue;
-use anvil_storage::v1::watch_prefix_request::Start as WatchStart;
 use anvil_storage::v1::{
     BulkOperation, BulkPutRequest, BulkWriteRequest, CreateBucketRequest, CreateIndexRequest,
-    Durability, IndexQuery, IndexSpecification, MutationFailureCode, ObjectAddress,
-    ObjectVersioning, PathIndexQuery, PathIndexSpec, PutHeader, PutOperation, QueryIndexRequest,
-    WatchNow, WatchPrefixRequest,
+    DeleteRequest, Durability, HeadObjectRequest, IndexQuery, IndexSpecification,
+    MutationFailureCode, MutationReceipt, ObjectAddress, ObjectVersioning, PathIndexQuery,
+    PathIndexSpec, PutHeader, PutOperation, QueryIndexRequest,
 };
 use anvil_storage::{
     BearerToken, RawClient, administration_client, connect_channel, exchange_client_credentials,
@@ -37,12 +36,10 @@ type IndexClient = IndexServiceClient<InterceptedService<Channel, BearerToken>>;
 const WAIT_LIMIT: Duration = Duration::from_secs(90);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MEMBERSHIP_FIXTURES: usize = 16;
-const GAP_BATCH: usize = 128;
-const GAP_MAX_CANDIDATES: usize = 768;
-const GAP_UNRELATED_RECORDS: usize = 4_096;
-const GAP_SCOPED_HEAD_READ_LIMIT_PER_SOURCE: u64 = GAP_MAX_CANDIDATES as u64 + 8;
+const PRESSURE_PATH_SELECTION_ATTEMPTS: usize = 32;
+const PRESSURE_PATH_SELECTION_TIMEOUT: Duration = Duration::from_secs(2);
 const INDEX_NAME: &str = "paths";
-const STATE_SCHEMA: &str = "anvil.index-recovery-qualification.v1";
+const STATE_SCHEMA: &str = "anvil.index-recovery-qualification.v2";
 
 #[derive(Debug, Deserialize, Serialize)]
 struct FixtureState {
@@ -59,16 +56,15 @@ struct MembershipState {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-struct GapState {
+struct PressureState {
     schema: String,
     fixture: FixtureState,
-    unrelated_bucket: String,
-    unrelated_objects: usize,
-    max_scoped_head_reads_per_source: u64,
-    expected_scoped_heads: usize,
-    resume_token: Vec<u8>,
     next_candidate: usize,
-    successful_paths: Vec<String>,
+    pressure_path: Option<String>,
+    skipped_paths: Vec<String>,
+    successful_mutations: u64,
+    last_version: u64,
+    pending_command_id: Option<String>,
 }
 
 struct Context {
@@ -86,9 +82,10 @@ async fn main() -> TestResult<()> {
         "membership-seed" => membership_seed(&context, state_path).await?,
         "membership-verify-two" => membership_verify(&context, state_path, 2).await?,
         "membership-verify-three" => membership_verify(&context, state_path, 3).await?,
-        "gap-seed" => gap_seed(&context, state_path).await?,
-        "gap-write" => gap_write(&context, state_path).await?,
-        "gap-verify" => gap_verify(&context, state_path).await?,
+        "pressure-seed" => pressure_seed(&context, state_path).await?,
+        "pressure-write" => pressure_write(&context, state_path).await?,
+        "pressure-assert-blocked" => pressure_assert_blocked(&context, state_path).await?,
+        "pressure-verify" => pressure_verify(&context, state_path).await?,
         _ => return Err(invalid("unknown index recovery qualification mode")),
     }
     Ok(())
@@ -260,35 +257,12 @@ async fn membership_verify(
     Ok(())
 }
 
-async fn gap_seed(context: &Context, state_path: PathBuf) -> TestResult<()> {
+async fn pressure_seed(context: &Context, state_path: PathBuf) -> TestResult<()> {
     if context.channels.len() != 3 {
-        return Err(invalid("journal-gap seed requires three endpoints"));
+        return Err(invalid("journal-pressure seed requires three endpoints"));
     }
     let bucket = required("ANVIL_INDEX_RECOVERY_QUALIFICATION_BUCKET")?;
     let mut administrator = administration_client(context.channels[0].clone(), &context.token)?;
-    let unrelated_bucket = format!("{bucket}-unrelated");
-    create_bucket(&mut administrator, &unrelated_bucket).await?;
-    let mut unrelated_objects = context.object_clients()?.remove(0);
-    let mut unrelated_accepted = 0_usize;
-    for start in (0..GAP_UNRELATED_RECORDS).step_by(GAP_BATCH) {
-        let end = (start + GAP_BATCH).min(GAP_UNRELATED_RECORDS);
-        unrelated_accepted += bulk_put_paths(
-            &mut unrelated_objects,
-            &context.tenant,
-            &unrelated_bucket,
-            start,
-            end,
-            "unrelated",
-            "index-gap-unrelated",
-        )
-        .await?
-        .len();
-    }
-    if unrelated_accepted != GAP_UNRELATED_RECORDS {
-        return Err(invalid(format!(
-            "unrelated gap fixture accepted {unrelated_accepted} of {GAP_UNRELATED_RECORDS} objects"
-        )));
-    }
     create_bucket(&mut administrator, &bucket).await?;
     let mut indexes = context.index_clients()?;
     let mut objects = context.object_clients()?;
@@ -298,111 +272,242 @@ async fn gap_seed(context: &Context, state_path: PathBuf) -> TestResult<()> {
         &mut objects[0],
         &context.tenant,
         &bucket,
-        "gap/seed.json",
-        "index-gap-seed",
+        "pressure/seed.json",
+        "index-pressure-seed",
     )
     .await?;
-    let generation =
-        wait_for_paths(&mut indexes, &bucket, &paths(["gap/seed.json"]), baseline).await?;
-    let resume_token =
-        current_watch_checkpoint(&mut objects[0], address(&context.tenant, &bucket, "gap/"))
-            .await?;
+    let generation = wait_for_paths(
+        &mut indexes,
+        &bucket,
+        &paths(["pressure/seed.json"]),
+        baseline,
+    )
+    .await?;
     write_state(
         state_path,
-        &GapState {
+        &PressureState {
             schema: STATE_SCHEMA.into(),
             fixture: FixtureState {
                 bucket,
                 index_id: definition.index_id,
                 generation,
             },
-            unrelated_bucket,
-            unrelated_objects: GAP_UNRELATED_RECORDS,
-            max_scoped_head_reads_per_source: GAP_SCOPED_HEAD_READ_LIMIT_PER_SOURCE,
-            expected_scoped_heads: 1,
-            resume_token,
             next_candidate: 0,
-            successful_paths: Vec::new(),
+            pressure_path: None,
+            skipped_paths: Vec::new(),
+            successful_mutations: 0,
+            last_version: 0,
+            pending_command_id: None,
         },
     )?;
-    println!("seeded journal-gap index and captured its pre-gap cursor");
+    println!("seeded the journal-pressure Path index");
     Ok(())
 }
 
-async fn gap_write(context: &Context, state_path: PathBuf) -> TestResult<()> {
+async fn pressure_write(context: &Context, state_path: PathBuf) -> TestResult<()> {
     if context.channels.len() != 1 {
         return Err(invalid(
-            "journal-gap writer requires one selected ingress endpoint",
+            "journal-pressure writer requires one selected ingress endpoint",
         ));
     }
-    let mut state: GapState = read_state(&state_path)?;
+    let release_path = PathBuf::from(required("ANVIL_INDEX_RECOVERY_QUALIFICATION_RELEASE")?);
+    if release_path.exists() {
+        return Err(invalid(
+            "journal-pressure release marker already exists before the writer starts",
+        ));
+    }
+    let mut state: PressureState = read_state(&state_path)?;
     require_schema(&state.schema)?;
+    if state.pressure_path.is_some()
+        || state.successful_mutations != 0
+        || state.last_version != 0
+        || state.pending_command_id.is_some()
+    {
+        return Err(invalid("journal-pressure state is not fresh"));
+    }
     let mut objects = context.object_clients()?.remove(0);
-    while state.next_candidate < GAP_MAX_CANDIDATES {
-        let end = (state.next_candidate + GAP_BATCH).min(GAP_MAX_CANDIDATES);
-        let accepted = bulk_put_paths(
+    while state.next_candidate < PRESSURE_PATH_SELECTION_ATTEMPTS {
+        let candidate = state.next_candidate;
+        let path = format!("pressure/live-{candidate:02}.json");
+        let command_id = format!("index-pressure-select-{candidate}");
+        state.next_candidate += 1;
+        match bulk_put_attempt(
             &mut objects,
             &context.tenant,
             &state.fixture.bucket,
-            state.next_candidate,
-            end,
-            "gap",
-            "index-gap-write",
-        )
-        .await?;
-        state.next_candidate = end;
-        state.successful_paths.extend(accepted);
-        state.expected_scoped_heads = state.successful_paths.len() + 1;
-        write_state(&state_path, &state)?;
-        if watch_cursor_expired(
-            &mut objects,
-            address(&context.tenant, &state.fixture.bucket, "gap/"),
-            &state.resume_token,
+            &path,
+            &command_id,
+            format!(r#"{{"mutation":0,"candidate":{candidate}}}"#).into_bytes(),
+            Some(PRESSURE_PATH_SELECTION_TIMEOUT),
         )
         .await?
         {
-            println!(
-                "proved a retained source-journal gap after {} accepted writes from {} candidates",
-                state.successful_paths.len(),
-                state.next_candidate
-            );
-            return Ok(());
+            Some(receipt) => {
+                state.pressure_path = Some(path);
+                state.successful_mutations = 1;
+                state.last_version = receipt.version;
+                write_state(&state_path, &state)?;
+                break;
+            }
+            None => {
+                state.skipped_paths.push(path);
+                write_state(&state_path, &state)?;
+            }
         }
     }
-    Err(invalid(
-        "the pre-gap public cursor did not expire within the bounded write budget",
-    ))
+    let pressure_path = state.pressure_path.clone().ok_or_else(|| {
+        invalid(format!(
+            "no live-coordinator path completed within {PRESSURE_PATH_SELECTION_ATTEMPTS} attempts"
+        ))
+    })?;
+    loop {
+        let mutation = state
+            .successful_mutations
+            .checked_add(1)
+            .ok_or_else(|| invalid("journal-pressure mutation count is exhausted"))?;
+        let command_id = format!("index-pressure-write-{mutation}");
+        state.pending_command_id = Some(command_id.clone());
+        write_state(&state_path, &state)?;
+        let receipt = loop {
+            if let Some(receipt) = bulk_put_attempt(
+                &mut objects,
+                &context.tenant,
+                &state.fixture.bucket,
+                &pressure_path,
+                &command_id,
+                format!(r#"{{"mutation":{mutation}}}"#).into_bytes(),
+                None,
+            )
+            .await?
+            {
+                break receipt;
+            }
+            sleep(POLL_INTERVAL).await;
+        };
+        if receipt.version <= state.last_version {
+            return Err(invalid(
+                "journal-pressure mutation did not advance the object version",
+            ));
+        }
+        state.successful_mutations = mutation;
+        state.last_version = receipt.version;
+        state.pending_command_id = None;
+        write_state(&state_path, &state)?;
+        if release_path.exists() {
+            break;
+        }
+    }
+    for (position, path) in state.skipped_paths.iter().enumerate() {
+        bulk_delete_retry(
+            &mut objects,
+            &context.tenant,
+            &state.fixture.bucket,
+            path,
+            &format!("index-pressure-cleanup-{position}"),
+        )
+        .await?;
+    }
+    println!(
+        "journal-pressure writer resumed and committed version {} after {} mutations",
+        state.last_version, state.successful_mutations
+    );
+    Ok(())
 }
 
-async fn gap_verify(context: &Context, state_path: PathBuf) -> TestResult<()> {
-    if context.channels.len() != 3 {
-        return Err(invalid("journal-gap verification requires three endpoints"));
+async fn pressure_assert_blocked(context: &Context, state_path: PathBuf) -> TestResult<()> {
+    if context.channels.len() != 1 {
+        return Err(invalid(
+            "journal-pressure blocked assertion requires one live endpoint",
+        ));
     }
-    let state: GapState = read_state(state_path)?;
+    let state: PressureState = read_state(state_path)?;
     require_schema(&state.schema)?;
-    if state.successful_paths.is_empty() {
-        return Err(invalid("journal-gap state contains no post-cursor writes"));
-    }
-    if state.unrelated_bucket.is_empty()
-        || state.unrelated_objects != GAP_UNRELATED_RECORDS
-        || state.max_scoped_head_reads_per_source != GAP_SCOPED_HEAD_READ_LIMIT_PER_SOURCE
-        || state.expected_scoped_heads != state.successful_paths.len() + 1
+    let pressure_path = state
+        .pressure_path
+        .as_deref()
+        .ok_or_else(|| invalid("journal-pressure state has no selected path"))?;
+    if state.successful_mutations == 0
+        || state.last_version == 0
+        || state.pending_command_id.is_none()
     {
-        return Err(invalid("journal-gap unrelated-scope fixture is incomplete"));
+        return Err(invalid(
+            "journal-pressure writer has no in-flight mutation to assert",
+        ));
+    }
+    let mut objects = context.object_clients()?.remove(0);
+    let head = objects
+        .head_object(HeadObjectRequest {
+            address: Some(address(
+                &context.tenant,
+                &state.fixture.bucket,
+                pressure_path,
+            )),
+        })
+        .await?
+        .into_inner();
+    match head.state {
+        Some(ObjectHeadState::Present(present)) if present.version == state.last_version => {}
+        Some(ObjectHeadState::Present(present)) => {
+            return Err(invalid(format!(
+                "pending journal-pressure mutation became visible as version {}, expected {}",
+                present.version, state.last_version
+            )));
+        }
+        _ => {
+            return Err(invalid(
+                "journal-pressure path was not present at its last committed version",
+            ));
+        }
+    }
+    println!(
+        "proved pending mutation {} is absent while version {} remains current",
+        state
+            .pending_command_id
+            .as_deref()
+            .expect("validated above"),
+        state.last_version
+    );
+    Ok(())
+}
+
+async fn pressure_verify(context: &Context, state_path: PathBuf) -> TestResult<()> {
+    if context.channels.len() != 3 {
+        return Err(invalid(
+            "journal-pressure verification requires three endpoints",
+        ));
+    }
+    let state: PressureState = read_state(state_path)?;
+    require_schema(&state.schema)?;
+    let pressure_path = state
+        .pressure_path
+        .as_deref()
+        .ok_or_else(|| invalid("journal-pressure state has no selected path"))?;
+    if state.successful_mutations < 2 || state.last_version == 0 {
+        return Err(invalid(
+            "journal-pressure writer did not commit its released mutation",
+        ));
+    }
+    if state.pending_command_id.is_some() {
+        return Err(invalid(
+            "journal-pressure state still contains an in-flight mutation",
+        ));
     }
     let mut indexes = context.index_clients()?;
-    let mut expected = paths(["gap/seed.json"]);
-    expected.extend(state.successful_paths.iter().cloned());
-    wait_for_paths(
+    let expected = ["pressure/seed.json".to_owned(), pressure_path.to_owned()]
+        .into_iter()
+        .collect();
+    wait_for_pressure_index(
         &mut indexes,
         &state.fixture.bucket,
         &expected,
         state.fixture.generation,
+        pressure_path,
+        state.last_version,
     )
     .await?;
     println!(
-        "scoped rebuild recovered all {} live paths after a genuine journal gap",
-        state.successful_paths.len() + 1
+        "journal-pressure release reached an exact zero-lag generation at version {}",
+        state.last_version
     );
     Ok(())
 }
@@ -466,79 +571,126 @@ async fn put_path(
     Ok(())
 }
 
-async fn bulk_put_paths(
+async fn bulk_put_attempt(
     client: &mut RawClient,
     tenant: &str,
     bucket: &str,
-    start: usize,
-    end: usize,
-    path_prefix: &str,
-    command_prefix: &str,
-) -> TestResult<Vec<String>> {
+    path: &str,
+    command_id: &str,
+    bytes: Vec<u8>,
+    timeout: Option<Duration>,
+) -> TestResult<Option<MutationReceipt>> {
+    let mut request = tonic::Request::new(BulkWriteRequest {
+        operations: vec![BulkOperation {
+            operation: Some(BulkOperationValue::Put(BulkPutRequest {
+                address: Some(address(tenant, bucket, path)),
+                bytes,
+                content_type: "application/json".into(),
+                command_id: command_id.into(),
+                durability: Durability::Local as i32,
+            })),
+        }],
+    });
+    if let Some(timeout) = timeout {
+        request.set_timeout(timeout);
+    }
+    let response = match client.bulk_write(request).await {
+        Ok(response) => response.into_inner(),
+        Err(status) if retryable(&status) => return Ok(None),
+        Err(status) => return Err(status.into()),
+    };
+    let mut outcomes = response.outcomes.into_iter();
+    let Some(outcome) = outcomes.next() else {
+        return Err(invalid("journal-pressure BulkWrite omitted its outcome"));
+    };
+    if outcome.index != 0 || outcomes.next().is_some() {
+        return Err(invalid(
+            "journal-pressure BulkWrite returned invalid outcomes",
+        ));
+    }
+    match outcome.outcome {
+        Some(BulkOutcomeValue::Receipt(receipt)) => {
+            if receipt.command_id != command_id || receipt.version == 0 || receipt.deleted {
+                return Err(invalid(
+                    "journal-pressure BulkWrite returned an invalid put receipt",
+                ));
+            }
+            Ok(Some(receipt))
+        }
+        Some(BulkOutcomeValue::Failure(failure))
+            if failure.code == MutationFailureCode::DurabilityUnavailable as i32 =>
+        {
+            Ok(None)
+        }
+        Some(BulkOutcomeValue::Failure(failure)) => Err(invalid(format!(
+            "journal-pressure put failed non-retryably with code {}: {}",
+            failure.code, failure.message
+        ))),
+        None => Err(invalid(
+            "journal-pressure BulkWrite outcome omitted its result",
+        )),
+    }
+}
+
+async fn bulk_delete_retry(
+    client: &mut RawClient,
+    tenant: &str,
+    bucket: &str,
+    path: &str,
+    command_id: &str,
+) -> TestResult<()> {
     let request = BulkWriteRequest {
-        operations: (start..end)
-            .map(|position| BulkOperation {
-                operation: Some(BulkOperationValue::Put(BulkPutRequest {
-                    address: Some(address(
-                        tenant,
-                        bucket,
-                        &format!("{path_prefix}/{position:06}.json"),
-                    )),
-                    bytes: br#"{"qualified":true}"#.to_vec(),
-                    content_type: "application/json".into(),
-                    command_id: format!("{command_prefix}-{position}"),
-                    durability: Durability::Local as i32,
-                })),
-            })
-            .collect(),
+        operations: vec![BulkOperation {
+            operation: Some(BulkOperationValue::Delete(DeleteRequest {
+                address: Some(address(tenant, bucket, path)),
+                command_id: command_id.into(),
+                durability: Durability::Local as i32,
+            })),
+        }],
     };
     let deadline = Instant::now() + WAIT_LIMIT;
     loop {
         match client.bulk_write(request.clone()).await {
             Ok(response) => {
-                let outcomes = response.into_inner().outcomes;
-                if outcomes.len() != end - start {
-                    return Err(invalid("journal-gap BulkWrite omitted an outcome"));
+                let mut outcomes = response.into_inner().outcomes.into_iter();
+                let Some(outcome) = outcomes.next() else {
+                    return Err(invalid(
+                        "journal-pressure cleanup BulkWrite omitted its outcome",
+                    ));
+                };
+                if outcome.index != 0 || outcomes.next().is_some() {
+                    return Err(invalid(
+                        "journal-pressure cleanup BulkWrite returned invalid outcomes",
+                    ));
                 }
-                let mut seen = BTreeSet::new();
-                let mut accepted = Vec::new();
-                for outcome in outcomes {
-                    let index = usize::try_from(outcome.index)?;
-                    if index >= end - start || !seen.insert(index) {
+                match outcome.outcome {
+                    Some(BulkOutcomeValue::Receipt(receipt))
+                        if receipt.command_id == command_id
+                            && receipt.version != 0
+                            && receipt.deleted =>
+                    {
+                        return Ok(());
+                    }
+                    Some(BulkOutcomeValue::Failure(failure))
+                        if failure.code == MutationFailureCode::DurabilityUnavailable as i32 => {}
+                    Some(BulkOutcomeValue::Failure(failure)) => {
+                        return Err(invalid(format!(
+                            "journal-pressure cleanup failed with code {}: {}",
+                            failure.code, failure.message
+                        )));
+                    }
+                    _ => {
                         return Err(invalid(
-                            "journal-gap BulkWrite returned an invalid outcome index",
+                            "journal-pressure cleanup returned an invalid receipt",
                         ));
                     }
-                    let candidate = start + index;
-                    match outcome.outcome {
-                        Some(BulkOutcomeValue::Receipt(receipt)) => {
-                            if receipt.command_id != format!("{command_prefix}-{candidate}")
-                                || receipt.version == 0
-                                || receipt.deleted
-                            {
-                                return Err(invalid(
-                                    "journal-gap BulkWrite returned an invalid receipt",
-                                ));
-                            }
-                            accepted.push(format!("{path_prefix}/{candidate:06}.json"));
-                        }
-                        Some(BulkOutcomeValue::Failure(failure))
-                            if failure.code
-                                == MutationFailureCode::DurabilityUnavailable as i32 => {}
-                        Some(BulkOutcomeValue::Failure(failure)) => {
-                            return Err(invalid(format!(
-                                "journal-gap candidate {candidate} failed non-retryably with code {}: {}",
-                                failure.code, failure.message
-                            )));
-                        }
-                        None => {
-                            return Err(invalid(
-                                "journal-gap BulkWrite outcome omitted its result",
-                            ));
-                        }
-                    }
                 }
-                return Ok(accepted);
+                if Instant::now() >= deadline {
+                    return Err(invalid(
+                        "journal-pressure cleanup did not complete before its deadline",
+                    ));
+                }
+                sleep(POLL_INTERVAL).await;
             }
             Err(status) if retryable(&status) && Instant::now() < deadline => {
                 sleep(POLL_INTERVAL).await;
@@ -601,56 +753,81 @@ async fn wait_for_paths(
     }
 }
 
-async fn current_watch_checkpoint(
-    client: &mut RawClient,
-    prefix: ObjectAddress,
-) -> TestResult<Vec<u8>> {
-    let mut stream = client
-        .watch_prefix(WatchPrefixRequest {
-            prefix: Some(prefix),
-            start: Some(WatchStart::Now(WatchNow {})),
-        })
-        .await?
-        .into_inner();
-    let message = tokio::time::timeout(WAIT_LIMIT, stream.message())
-        .await??
-        .ok_or_else(|| invalid("watch ended before its initial checkpoint"))?;
-    match message.message {
-        Some(WatchMessageValue::Checkpoint(checkpoint)) if !checkpoint.resume_token.is_empty() => {
-            Ok(checkpoint.resume_token)
+async fn wait_for_pressure_index(
+    clients: &mut [IndexClient],
+    bucket: &str,
+    expected: &BTreeSet<String>,
+    after_generation: u64,
+    pressure_path: &str,
+    expected_version: u64,
+) -> TestResult<()> {
+    let expected_sources = clients.len();
+    let deadline = Instant::now() + WAIT_LIMIT;
+    loop {
+        let mut ready = true;
+        for client in clients.iter_mut() {
+            match client.query_index(query(bucket)).await {
+                Ok(response) => {
+                    let response = response.into_inner();
+                    let freshness = response
+                        .freshness
+                        .ok_or_else(|| invalid("journal-pressure index omitted freshness"))?;
+                    let paths = response
+                        .hits
+                        .iter()
+                        .filter_map(|hit| hit.address.as_ref().map(|value| value.path.clone()))
+                        .collect::<BTreeSet<_>>();
+                    let expected_version_present = response.hits.iter().any(|hit| {
+                        hit.address
+                            .as_ref()
+                            .is_some_and(|address| address.path == pressure_path)
+                            && hit.object_version == expected_version
+                    });
+                    let source_ids = freshness
+                        .sources
+                        .iter()
+                        .map(|source| source.node_id)
+                        .collect::<BTreeSet<_>>();
+                    let zero_lag = expected_sources != 0
+                        && freshness.sources.len() == expected_sources
+                        && source_ids.len() == expected_sources
+                        && freshness.sources.iter().all(|source| {
+                            source.node_id != 0
+                                && source.source_epoch.len() == 32
+                                && source.lag_hint == 0
+                                && source.observed_tail.and_then(|tail| tail.checked_add(1))
+                                    == Some(source.indexed_next_offset)
+                        });
+                    if paths != *expected
+                        || response.hits.len() != expected.len()
+                        || !expected_version_present
+                        || freshness.generation <= after_generation
+                        || !freshness.initial_build_complete
+                        || freshness.rebuilding
+                        || !zero_lag
+                    {
+                        ready = false;
+                        break;
+                    }
+                }
+                Err(status) if retryable(&status) => {
+                    ready = false;
+                    break;
+                }
+                Err(status) => return Err(status.into()),
+            }
         }
-        _ => Err(invalid("watch omitted its initial checkpoint")),
+        if ready {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(invalid(format!(
+                "journal-pressure index did not converge to {} exact zero-lag paths",
+                expected.len()
+            )));
+        }
+        sleep(POLL_INTERVAL).await;
     }
-}
-
-async fn watch_cursor_expired(
-    client: &mut RawClient,
-    prefix: ObjectAddress,
-    resume_token: &[u8],
-) -> TestResult<bool> {
-    let response = client
-        .watch_prefix(WatchPrefixRequest {
-            prefix: Some(prefix),
-            start: Some(WatchStart::ResumeToken(resume_token.to_vec())),
-        })
-        .await;
-    let mut stream = match response {
-        Err(status) if resume_expired(&status) => return Ok(true),
-        Err(status) if retryable(&status) => return Ok(false),
-        Err(status) => return Err(status.into()),
-        Ok(response) => response.into_inner(),
-    };
-    match tokio::time::timeout(Duration::from_secs(2), stream.message()).await {
-        Ok(Err(status)) if resume_expired(&status) => Ok(true),
-        Ok(Err(status)) if retryable(&status) => Ok(false),
-        Ok(Err(status)) => Err(status.into()),
-        Ok(Ok(_)) | Err(_) => Ok(false),
-    }
-}
-
-fn resume_expired(status: &Status) -> bool {
-    matches!(status.code(), Code::FailedPrecondition | Code::OutOfRange)
-        && status.message() == "RESUME_EXPIRED"
 }
 
 fn query(bucket: &str) -> QueryIndexRequest {
@@ -689,7 +866,10 @@ fn retryable(status: &Status) -> bool {
 }
 
 fn write_state(path: impl AsRef<std::path::Path>, state: &impl Serialize) -> TestResult<()> {
-    std::fs::write(path, serde_json::to_vec_pretty(state)?)?;
+    let path = path.as_ref();
+    let temporary = path.with_extension("tmp");
+    std::fs::write(&temporary, serde_json::to_vec_pretty(state)?)?;
+    std::fs::rename(temporary, path)?;
     Ok(())
 }
 

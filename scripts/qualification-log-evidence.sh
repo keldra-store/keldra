@@ -136,7 +136,11 @@ assert_capacity_samples() {
     gauge.anvil_source_journal_retained_bytes \
     gauge.anvil_source_journal_max_entries \
     gauge.anvil_source_journal_max_bytes \
-    gauge.anvil_source_journal_index_lag_entries
+    gauge.anvil_source_journal_index_lag_entries \
+    gauge.anvil_source_journal_progress_debt_entries \
+    gauge.anvil_source_journal_progress_debt_bytes \
+    gauge.anvil_source_journal_progress_debt_peak_entries \
+    gauge.anvil_source_journal_progress_debt_peak_bytes
   do
     log_unsigned_field "${field}" "${line}" >/dev/null || {
       echo "${label} source-journal sample omitted ${field}" >&2
@@ -166,6 +170,32 @@ assert_capacity_samples() {
       echo "${label} mutation-receipt sample omitted ${field}" >&2
       return 1
     }
+  done
+}
+
+assert_zero_current_source_journal_progress_debt() {
+  local log="$1"
+  local label="$2"
+  local field
+  local line
+  local value
+  line="$(grep -F 'sampled source-journal safety and capacity' "${log}" | tail -n 1 || true)"
+  if [[ -z "${line}" ]]; then
+    echo "${label} emitted no terminal source-journal capacity sample" >&2
+    return 1
+  fi
+  for field in \
+    gauge.anvil_source_journal_progress_debt_entries \
+    gauge.anvil_source_journal_progress_debt_bytes
+  do
+    value="$(log_unsigned_field "${field}" "${line}")" || {
+      echo "${label} terminal source-journal sample omitted ${field}" >&2
+      return 1
+    }
+    if [[ "${value}" != "0" ]]; then
+      echo "${label} ended with ${field}=${value}; publication progress debt must be repaid" >&2
+      return 1
+    fi
   done
 }
 
