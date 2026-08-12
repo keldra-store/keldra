@@ -9,7 +9,7 @@ use crate::index_runtime::events::{AtomicProgramWatermark, IndexJournalChange, I
 use super::*;
 
 #[test]
-fn only_idle_maintenance_uses_bounded_artifact_admission() {
+fn publication_progress_is_narrow_and_compaction_stays_bounded() {
     assert_eq!(
         publication_admission(false),
         DerivedArtifactAdmission::PublicationProgress
@@ -18,6 +18,7 @@ fn only_idle_maintenance_uses_bounded_artifact_admission() {
         publication_admission(true),
         DerivedArtifactAdmission::Bounded
     );
+    assert_eq!(compaction_admission(), DerivedArtifactAdmission::Bounded);
 }
 
 fn run(sequence: u64, level: u8) -> ManifestRun {

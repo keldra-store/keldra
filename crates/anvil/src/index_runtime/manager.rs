@@ -930,15 +930,7 @@ async fn advance_catch_up(
         )
     };
     let admission = publication_admission(work.maintenance);
-    if compact_one_if_needed(
-        job,
-        &mut work.candidate,
-        debt_limits,
-        admission,
-        dependencies,
-    )
-    .await?
-    {
+    if compact_one_if_needed(job, &mut work.candidate, debt_limits, dependencies).await? {
         return Ok((BuilderPhase::CatchUp(work), BuilderDisposition::Ready, None));
     }
     let budget = dependencies.budgets.for_kind(job.kind);
@@ -1114,7 +1106,6 @@ async fn compact_one_if_needed(
     job: &BuilderJob,
     candidate: &mut CandidateGeneration,
     limits: DebtLimits,
-    admission: DerivedArtifactAdmission,
     dependencies: &IndexBuilderDependencies,
 ) -> Result<bool, Status> {
     emit_compaction_debt(
@@ -1144,7 +1135,7 @@ async fn compact_one_if_needed(
         job.kind,
         selection,
         permit.bytes(),
-        admission,
+        compaction_admission(),
         candidate,
         dependencies,
     )
@@ -1558,6 +1549,10 @@ const fn publication_admission(maintenance: bool) -> DerivedArtifactAdmission {
     } else {
         DerivedArtifactAdmission::PublicationProgress
     }
+}
+
+const fn compaction_admission() -> DerivedArtifactAdmission {
+    DerivedArtifactAdmission::Bounded
 }
 
 fn derived_identity(definition: &CatalogDefinition) -> DerivedDefinitionIdentity {
