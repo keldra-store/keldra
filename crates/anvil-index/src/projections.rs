@@ -5,15 +5,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::codec::{Decoder, Encoder, encode_component};
-use crate::query_bounds::replace_retained_bytes;
 use crate::routed::{
     ROUTED_ROW_RESIDENT_OVERHEAD_BYTES, RoutedComponentWriter, RoutedCursor, RoutedRow,
 };
 use crate::run::{ComponentTree, RunStatistics, RunView, find_leaf, open_run, seal_run_root};
 use crate::segment::{
     DEFAULT_COMPONENT_BLOCK_BYTES, DocumentComponentWriter, DocumentRecord, DocumentState,
-    MutationBuffer, PATH_CHANGES_TAG, PathChange, PathComponentWriter, PathRunCursor,
-    document_by_ordinal, is_latest_live, path_change_in_tree,
+    LatestLiveProbe, MutationBuffer, PATH_CHANGES_TAG, PathChange, PathComponentWriter,
+    PathRunCursor, document_by_ordinal, path_change_in_tree,
 };
 use crate::succinct::{decode_elias_fano_with_budget, encode_elias_fano};
 use crate::{
@@ -22,14 +21,24 @@ use crate::{
 };
 
 pub(crate) const RECORDS_TAG: u8 = 60;
-const PRIMARY_KEY_TAG: u8 = 61;
-const SECONDARY_KEY_TAG: u8 = 62;
+pub(crate) const PRIMARY_KEY_TAG: u8 = 61;
+pub(crate) const SECONDARY_KEY_TAG: u8 = 62;
+const QUERY_PROJECTION_CHUNK_ROWS: usize = 128;
+
+struct ProjectionQueryCandidate<T> {
+    document: DocumentRef,
+    payload: OrdinalRow<T>,
+    key: RoutedRow,
+}
 
 #[path = "projections/compaction_cache.rs"]
 mod compaction_cache;
 
 #[path = "projections/parallel_compaction.rs"]
 mod parallel_compaction;
+
+#[path = "projections/query_cpu.rs"]
+mod query_cpu;
 
 macro_rules! builder_state {
     () => {
@@ -147,6 +156,7 @@ impl GitSourceEngine {
         validate_query_text("commit ID", commit_id, false)?;
         validate_query_text("Git tree path", tree_path, false)?;
         let views = open_views(runs, IndexKind::GitSource).await?;
+        let mut live_probe = LatestLiveProbe::new();
         let prefix = composite_prefix(&[repository_id, commit_id, tree_path], true)?;
         let mut selected = None::<(DocumentRef, GitSourceRecord)>;
         for (run, view) in runs.iter().zip(&views) {
@@ -154,22 +164,37 @@ impl GitSourceEngine {
                 continue;
             };
             let mut cursor = RoutedCursor::new(run, root.clone(), Some(prefix.clone()));
+            let mut candidates = Vec::with_capacity(QUERY_PROJECTION_CHUNK_ROWS);
             while let Some(row) = cursor.next().await? {
-                let document = document_by_ordinal(run, view, row.ordinal).await?;
-                if !is_latest_live(runs, &views, &document).await? {
-                    continue;
-                }
-                let payload = ordinal_row::<D, GitPayload>(run, view, row.ordinal).await?;
-                let record = take_git_record(payload, row.position)?;
-                if git_path_primary(&record)? != row.primary {
-                    return Err(IndexError::InvalidFormat("Git path key mismatch"));
-                }
-                if selected
-                    .as_ref()
-                    .is_none_or(|(current, _)| newer_projection_document(&document, current))
+                if let Some(candidate) = live_projection_candidate::<D, GitPayload>(
+                    runs,
+                    &views,
+                    run,
+                    view,
+                    row,
+                    &mut live_probe,
+                )
+                .await?
                 {
-                    selected = Some((document, record));
+                    candidates.push(candidate);
                 }
+                if candidates.len() == QUERY_PROJECTION_CHUNK_ROWS {
+                    selected = run
+                        .run_query_cpu({
+                            let retained = selected.take();
+                            let chunk = std::mem::take(&mut candidates);
+                            move || query_cpu::merge_git_path_candidates(retained, chunk)
+                        })
+                        .await?;
+                }
+            }
+            if !candidates.is_empty() {
+                selected = run
+                    .run_query_cpu({
+                        let retained = selected.take();
+                        move || query_cpu::merge_git_path_candidates(retained, candidates)
+                    })
+                    .await?;
             }
         }
         Ok(selected.map(|(_, record)| record))
@@ -193,6 +218,7 @@ impl GitSourceEngine {
             return Ok(Vec::new());
         }
         let views = open_views(runs, IndexKind::GitSource).await?;
+        let mut live_probe = LatestLiveProbe::new();
         let prefix = composite_prefix(&[repository_id, commit_id, tree_prefix], false)?;
         let mut selected = BTreeMap::<String, RetainedGitRecord>::new();
         let mut retained_bytes = 0usize;
@@ -201,39 +227,56 @@ impl GitSourceEngine {
                 continue;
             };
             let mut cursor = RoutedCursor::new(run, root.clone(), Some(prefix.clone()));
+            let mut candidates = Vec::with_capacity(QUERY_PROJECTION_CHUNK_ROWS);
             while let Some(row) = cursor.next().await? {
-                let document = document_by_ordinal(run, view, row.ordinal).await?;
-                if !is_latest_live(runs, &views, &document).await? {
-                    continue;
-                }
-                let payload = ordinal_row::<D, GitPayload>(run, view, row.ordinal).await?;
-                let record = take_git_record(payload, row.position)?;
-                if git_path_primary(&record)? != row.primary {
-                    return Err(IndexError::InvalidFormat("Git path key mismatch"));
-                }
-                if after_path.is_some_and(|after| record.tree_path.as_str() <= after) {
-                    continue;
-                }
-                let path = record.tree_path.clone();
-                if selected
-                    .get(&path)
-                    .is_none_or(|current| newer_projection_document(&document, &current.document))
+                if let Some(candidate) = live_projection_candidate::<D, GitPayload>(
+                    runs,
+                    &views,
+                    run,
+                    view,
+                    row,
+                    &mut live_probe,
+                )
+                .await?
                 {
-                    let value = RetainedGitRecord::new(document, record, path.len());
-                    let added = value.resident_bytes;
-                    let replaced = selected.insert(path, value);
-                    let mut removed = replaced.as_ref().map_or(0, |value| value.resident_bytes);
-                    removed = removed.saturating_add(
-                        (selected.len() > limit)
-                            .then(|| {
-                                selected
-                                    .pop_last()
-                                    .map_or(0, |(_, value)| value.resident_bytes)
-                            })
-                            .unwrap_or(0),
-                    );
-                    retained_bytes = replace_retained_bytes(retained_bytes, added, removed)?;
+                    candidates.push(candidate);
                 }
+                if candidates.len() == QUERY_PROJECTION_CHUNK_ROWS {
+                    (selected, retained_bytes) = run
+                        .run_query_cpu({
+                            let retained = std::mem::take(&mut selected);
+                            let retained_bytes = retained_bytes;
+                            let chunk = std::mem::take(&mut candidates);
+                            let after_path = after_path.map(str::to_owned);
+                            move || {
+                                query_cpu::merge_git_tree_candidates(
+                                    retained,
+                                    retained_bytes,
+                                    chunk,
+                                    after_path.as_deref(),
+                                    limit,
+                                )
+                            }
+                        })
+                        .await?;
+                }
+            }
+            if !candidates.is_empty() {
+                (selected, retained_bytes) = run
+                    .run_query_cpu({
+                        let retained = std::mem::take(&mut selected);
+                        let after_path = after_path.map(str::to_owned);
+                        move || {
+                            query_cpu::merge_git_tree_candidates(
+                                retained,
+                                retained_bytes,
+                                candidates,
+                                after_path.as_deref(),
+                                limit,
+                            )
+                        }
+                    })
+                    .await?;
             }
         }
         Ok(selected.into_values().map(|value| value.record).collect())
@@ -251,6 +294,7 @@ impl GitSourceEngine {
             return Ok(Vec::new());
         }
         let views = open_views(runs, IndexKind::GitSource).await?;
+        let mut live_probe = LatestLiveProbe::new();
         let prefix = composite_prefix(&[repository_id, object_id], true)?;
         let mut selected = BTreeMap::<(String, String), RetainedGitRecord>::new();
         let mut retained_bytes = 0usize;
@@ -259,40 +303,52 @@ impl GitSourceEngine {
                 continue;
             };
             let mut cursor = RoutedCursor::new(run, root.clone(), Some(prefix.clone()));
+            let mut candidates = Vec::with_capacity(QUERY_PROJECTION_CHUNK_ROWS);
             while let Some(row) = cursor.next().await? {
-                let document = document_by_ordinal(run, view, row.ordinal).await?;
-                if !is_latest_live(runs, &views, &document).await? {
-                    continue;
-                }
-                let payload = ordinal_row::<D, GitPayload>(run, view, row.ordinal).await?;
-                let record = take_git_record(payload, row.position)?;
-                if git_object_primary(&record)? != row.primary {
-                    return Err(IndexError::InvalidFormat("Git object key mismatch"));
-                }
-                let key = (record.commit_id.clone(), record.tree_path.clone());
-                if selected
-                    .get(&key)
-                    .is_none_or(|current| newer_projection_document(&document, &current.document))
+                if let Some(candidate) = live_projection_candidate::<D, GitPayload>(
+                    runs,
+                    &views,
+                    run,
+                    view,
+                    row,
+                    &mut live_probe,
+                )
+                .await?
                 {
-                    let value = RetainedGitRecord::new(
-                        document,
-                        record,
-                        key.0.len().saturating_add(key.1.len()),
-                    );
-                    let added = value.resident_bytes;
-                    let replaced = selected.insert(key, value);
-                    let mut removed = replaced.map_or(0, |value| value.resident_bytes);
-                    removed = removed.saturating_add(
-                        (selected.len() > limit)
-                            .then(|| {
-                                selected
-                                    .pop_last()
-                                    .map_or(0, |(_, value)| value.resident_bytes)
-                            })
-                            .unwrap_or(0),
-                    );
-                    retained_bytes = replace_retained_bytes(retained_bytes, added, removed)?;
+                    candidates.push(candidate);
                 }
+                if candidates.len() == QUERY_PROJECTION_CHUNK_ROWS {
+                    (selected, retained_bytes) = run
+                        .run_query_cpu({
+                            let retained = std::mem::take(&mut selected);
+                            let retained_bytes = retained_bytes;
+                            let chunk = std::mem::take(&mut candidates);
+                            move || {
+                                query_cpu::merge_git_object_candidates(
+                                    retained,
+                                    retained_bytes,
+                                    chunk,
+                                    limit,
+                                )
+                            }
+                        })
+                        .await?;
+                }
+            }
+            if !candidates.is_empty() {
+                (selected, retained_bytes) = run
+                    .run_query_cpu({
+                        let retained = std::mem::take(&mut selected);
+                        move || {
+                            query_cpu::merge_git_object_candidates(
+                                retained,
+                                retained_bytes,
+                                candidates,
+                                limit,
+                            )
+                        }
+                    })
+                    .await?;
             }
         }
         Ok(selected.into_values().map(|value| value.record).collect())
@@ -364,6 +420,30 @@ impl RetainedGitRecord {
             resident_bytes,
         }
     }
+}
+
+async fn live_projection_candidate<D, T>(
+    runs: &[D],
+    views: &[RunView],
+    run: &D,
+    view: &RunView,
+    key: RoutedRow,
+    live_probe: &mut LatestLiveProbe,
+) -> Result<Option<ProjectionQueryCandidate<T>>, IndexError>
+where
+    D: IndexDirectoryRead,
+    T: ProjectionPayload,
+{
+    let document = document_by_ordinal(run, view, key.ordinal).await?;
+    if !live_probe.is_latest_live(runs, views, &document).await? {
+        return Ok(None);
+    }
+    let payload = ordinal_row::<D, T>(run, view, key.ordinal).await?;
+    Ok(Some(ProjectionQueryCandidate {
+        document,
+        payload,
+        key,
+    }))
 }
 
 fn take_git_record(
@@ -475,6 +555,7 @@ impl TensorProjectionEngine {
         validate_query_text("model ID", model_id, false)?;
         validate_query_text("tensor name", tensor_name, false)?;
         let views = open_views(runs, IndexKind::Tensor).await?;
+        let mut live_probe = LatestLiveProbe::new();
         let prefix = composite_prefix(&[model_id, tensor_name], true)?;
         let mut selected = None::<(DocumentRef, TensorRecord)>;
         for (run, view) in runs.iter().zip(&views) {
@@ -482,27 +563,37 @@ impl TensorProjectionEngine {
                 continue;
             };
             let mut cursor = RoutedCursor::new(run, root.clone(), Some(prefix.clone()));
+            let mut candidates = Vec::with_capacity(QUERY_PROJECTION_CHUNK_ROWS);
             while let Some(row) = cursor.next().await? {
-                let document = document_by_ordinal(run, view, row.ordinal).await?;
-                if !is_latest_live(runs, &views, &document).await? {
-                    continue;
-                }
-                let payload = ordinal_row::<D, TensorPayload>(run, view, row.ordinal).await?;
-                let record = payload
-                    .payload
-                    .0
-                    .get(row.position as usize)
-                    .cloned()
-                    .ok_or(IndexError::InvalidFormat("tensor key record slot"))?;
-                if tensor_primary(&record)? != row.primary {
-                    return Err(IndexError::InvalidFormat("tensor key mismatch"));
-                }
-                if selected
-                    .as_ref()
-                    .is_none_or(|(current, _)| newer_projection_document(&document, current))
+                if let Some(candidate) = live_projection_candidate::<D, TensorPayload>(
+                    runs,
+                    &views,
+                    run,
+                    view,
+                    row,
+                    &mut live_probe,
+                )
+                .await?
                 {
-                    selected = Some((document, record));
+                    candidates.push(candidate);
                 }
+                if candidates.len() == QUERY_PROJECTION_CHUNK_ROWS {
+                    selected = run
+                        .run_query_cpu({
+                            let retained = selected.take();
+                            let chunk = std::mem::take(&mut candidates);
+                            move || query_cpu::merge_tensor_candidates(retained, chunk)
+                        })
+                        .await?;
+                }
+            }
+            if !candidates.is_empty() {
+                selected = run
+                    .run_query_cpu({
+                        let retained = selected.take();
+                        move || query_cpu::merge_tensor_candidates(retained, candidates)
+                    })
+                    .await?;
             }
         }
         Ok(selected.map(|(_, record)| record))
@@ -556,7 +647,7 @@ impl TensorProjectionEngine {
     }
 }
 
-trait ProjectionPayload: Sized {
+pub(crate) trait ProjectionPayload: Sized + Send + 'static {
     fn encoded_bytes(&self) -> usize;
     fn resident_bytes(&self) -> usize;
     fn encode(&self, output: &mut Encoder) -> Result<(), IndexError>;
@@ -565,7 +656,7 @@ trait ProjectionPayload: Sized {
     fn key_rows(&self, ordinal: u64) -> Result<Vec<(u8, RoutedRow)>, IndexError>;
 }
 
-fn preflight_projection_row(encoded_payload_bytes: usize) -> Result<(), IndexError> {
+pub(crate) fn preflight_projection_row(encoded_payload_bytes: usize) -> Result<(), IndexError> {
     let needed = encoded_payload_bytes.saturating_add(16);
     if needed > DEFAULT_COMPONENT_BLOCK_BYTES {
         return Err(IndexError::ResourceLimit {
@@ -576,7 +667,7 @@ fn preflight_projection_row(encoded_payload_bytes: usize) -> Result<(), IndexErr
     Ok(())
 }
 
-fn git_encoded_bytes(records: &[GitSourceRecord]) -> usize {
+pub(crate) fn git_encoded_bytes(records: &[GitSourceRecord]) -> usize {
     records.iter().fold(4usize, |size, record| {
         size.saturating_add(44)
             .saturating_add(record.repository_id.len())
@@ -587,7 +678,7 @@ fn git_encoded_bytes(records: &[GitSourceRecord]) -> usize {
     })
 }
 
-fn tensor_encoded_bytes(records: &[TensorRecord]) -> usize {
+pub(crate) fn tensor_encoded_bytes(records: &[TensorRecord]) -> usize {
     records.iter().fold(4usize, |size, record| {
         size.saturating_add(44)
             .saturating_add(record.model_id.len())
@@ -599,7 +690,7 @@ fn tensor_encoded_bytes(records: &[TensorRecord]) -> usize {
 }
 
 #[derive(Clone, Debug)]
-struct GitPayload(Vec<GitSourceRecord>);
+pub(crate) struct GitPayload(pub(crate) Vec<GitSourceRecord>);
 
 impl GitPayload {
     fn record_bytes(record: &GitSourceRecord) -> usize {
@@ -696,7 +787,7 @@ impl ProjectionPayload for GitPayload {
 }
 
 #[derive(Clone, Debug)]
-struct TensorPayload(Vec<TensorRecord>);
+pub(crate) struct TensorPayload(pub(crate) Vec<TensorRecord>);
 
 impl TensorPayload {
     fn record_bytes(record: &TensorRecord) -> usize {
@@ -815,12 +906,12 @@ impl ProjectionPayload for TensorPayload {
 }
 
 #[derive(Debug)]
-struct OrdinalRow<T> {
-    ordinal: u64,
-    payload: T,
+pub(crate) struct OrdinalRow<T> {
+    pub(crate) ordinal: u64,
+    pub(crate) payload: T,
 }
 
-struct OrdinalComponentWriter<T> {
+pub(crate) struct OrdinalComponentWriter<T> {
     kind: IndexKind,
     level: u8,
     target_bytes: usize,
@@ -831,7 +922,7 @@ struct OrdinalComponentWriter<T> {
 }
 
 impl<T: ProjectionPayload> OrdinalComponentWriter<T> {
-    fn new(kind: IndexKind, level: u8, target_bytes: usize) -> Self {
+    pub(crate) fn new(kind: IndexKind, level: u8, target_bytes: usize) -> Self {
         Self {
             kind,
             level,
@@ -843,7 +934,7 @@ impl<T: ProjectionPayload> OrdinalComponentWriter<T> {
         }
     }
 
-    async fn push<S: IndexBlockSink>(
+    pub(crate) async fn push<S: IndexBlockSink>(
         &mut self,
         row: OrdinalRow<T>,
         sink: &mut S,
@@ -912,7 +1003,7 @@ impl<T: ProjectionPayload> OrdinalComponentWriter<T> {
             .await
     }
 
-    async fn finish<S: IndexBlockSink>(
+    pub(crate) async fn finish<S: IndexBlockSink>(
         mut self,
         sink: &mut S,
     ) -> Result<ComponentTree, IndexError> {
@@ -986,14 +1077,21 @@ async fn read_ordinal_block<D: IndexDirectoryRead, T: ProjectionPayload>(
     descriptor: &crate::BlockDescriptor,
 ) -> Result<Vec<OrdinalRow<T>>, IndexError> {
     let block = crate::run::read_leaf(directory, descriptor).await?;
-    let rows = decode_ordinal_rows(block.body(), descriptor.codec)?;
-    if rows.first().map(|row| ordinal_key(row.ordinal)) != Some(descriptor.minimum_key.clone())
-        || rows.last().map(|row| ordinal_key(row.ordinal)) != Some(descriptor.maximum_key.clone())
-        || rows.len() as u64 != descriptor.element_count
-    {
-        return Err(IndexError::InvalidFormat("projection block descriptor"));
-    }
-    Ok(rows)
+    let descriptor = descriptor.clone();
+    directory
+        .run_query_cpu(move || {
+            let rows = decode_ordinal_rows(block.body(), descriptor.codec)?;
+            if rows.first().map(|row| ordinal_key(row.ordinal))
+                != Some(descriptor.minimum_key.clone())
+                || rows.last().map(|row| ordinal_key(row.ordinal))
+                    != Some(descriptor.maximum_key.clone())
+                || rows.len() as u64 != descriptor.element_count
+            {
+                return Err(IndexError::InvalidFormat("projection block descriptor"));
+            }
+            Ok(rows)
+        })
+        .await
 }
 
 async fn ordinal_row<D: IndexDirectoryRead, T: ProjectionPayload>(
@@ -1485,7 +1583,7 @@ fn validate_query_text(label: &str, value: &str, empty_allowed: bool) -> Result<
     Ok(())
 }
 
-fn validate_git_records(records: &[GitSourceRecord]) -> Result<(), IndexError> {
+pub(crate) fn validate_git_records(records: &[GitSourceRecord]) -> Result<(), IndexError> {
     let mut keys = BTreeSet::new();
     for record in records {
         validate_text("repository ID", &record.repository_id)?;
@@ -1502,7 +1600,7 @@ fn validate_git_records(records: &[GitSourceRecord]) -> Result<(), IndexError> {
     Ok(())
 }
 
-fn validate_tensor_records(records: &[TensorRecord]) -> Result<(), IndexError> {
+pub(crate) fn validate_tensor_records(records: &[TensorRecord]) -> Result<(), IndexError> {
     let mut keys = BTreeSet::new();
     for record in records {
         validate_text("model ID", &record.model_id)?;

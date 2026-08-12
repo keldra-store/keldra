@@ -374,7 +374,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn v2_envelope_is_portable_and_integrity_checked() {
+    async fn v3_envelope_is_portable_and_integrity_checked() {
         let encoded = encode_component(
             IndexKind::Path,
             9,

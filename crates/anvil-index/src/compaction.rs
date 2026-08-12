@@ -340,7 +340,11 @@ struct ProgressCounters {
     effective_lanes: AtomicU64,
     range_limit: AtomicU64,
     active_lanes: AtomicU64,
+    peak_active_lanes: AtomicU64,
     waiting_lanes: AtomicU64,
+    sort_chunks: AtomicU64,
+    sort_merge_passes: AtomicU64,
+    sort_peak_workspace_bytes: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -361,7 +365,11 @@ pub struct CompactionProgressSnapshot {
     /// worker or budget cap without planning an unbounded number of stripes.
     pub range_limit: u64,
     pub active_lanes: u64,
+    pub peak_active_lanes: u64,
     pub waiting_lanes: u64,
+    pub sort_chunks: u64,
+    pub sort_merge_passes: u64,
+    pub sort_peak_workspace_bytes: u64,
 }
 
 impl CompactionProgress {
@@ -396,6 +404,20 @@ impl CompactionProgress {
         Ok(())
     }
 
+    pub(crate) fn record_sort_chunk(&self, workspace_bytes: usize) -> Result<(), IndexError> {
+        let workspace_bytes =
+            u64::try_from(workspace_bytes).map_err(|_| IndexError::OffsetOverflow)?;
+        self.inner.sort_chunks.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .sort_peak_workspace_bytes
+            .fetch_max(workspace_bytes, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub(crate) fn record_sort_merge_pass(&self) {
+        self.inner.sort_merge_passes.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> CompactionProgressSnapshot {
         CompactionProgressSnapshot {
             ranges_total: self.inner.ranges_total.load(Ordering::Relaxed),
@@ -409,7 +431,11 @@ impl CompactionProgress {
             effective_lanes: self.inner.effective_lanes.load(Ordering::Relaxed),
             range_limit: self.inner.range_limit.load(Ordering::Relaxed),
             active_lanes: self.inner.active_lanes.load(Ordering::Relaxed),
+            peak_active_lanes: self.inner.peak_active_lanes.load(Ordering::Relaxed),
             waiting_lanes: self.inner.waiting_lanes.load(Ordering::Relaxed),
+            sort_chunks: self.inner.sort_chunks.load(Ordering::Relaxed),
+            sort_merge_passes: self.inner.sort_merge_passes.load(Ordering::Relaxed),
+            sort_peak_workspace_bytes: self.inner.sort_peak_workspace_bytes.load(Ordering::Relaxed),
         }
     }
 
@@ -426,7 +452,14 @@ impl CompactionProgress {
 
     pub(crate) fn start_range(&self) -> ActiveCompactionRange {
         self.inner.waiting_lanes.fetch_sub(1, Ordering::Relaxed);
-        self.inner.active_lanes.fetch_add(1, Ordering::Relaxed);
+        let active_lanes = self
+            .inner
+            .active_lanes
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        self.inner
+            .peak_active_lanes
+            .fetch_max(active_lanes, Ordering::Relaxed);
         ActiveCompactionRange {
             progress: self.clone(),
         }
@@ -763,17 +796,6 @@ where
     )
     .await?;
     Ok(results)
-}
-
-/// Dense ordinal bases for ordered range-local writers and the final count.
-pub(crate) fn dense_ordinal_bases(live_counts: &[u64]) -> Result<(Vec<u64>, u64), IndexError> {
-    let mut bases = Vec::with_capacity(live_counts.len());
-    let mut next = 0u64;
-    for count in live_counts {
-        bases.push(next);
-        next = next.checked_add(*count).ok_or(IndexError::OffsetOverflow)?;
-    }
-    Ok((bases, next))
 }
 
 /// Run bounded producers concurrently and drain their rows strictly by range.
@@ -1143,6 +1165,8 @@ mod tests {
             element_count: 100,
             encoded_bytes: 100,
             hash: [7; 32],
+            pack_id: 0,
+            pack_offset: 0,
         }
     }
 
@@ -1281,6 +1305,9 @@ mod tests {
         let first = progress.start_range();
         progress.record_input(7, 101, 2);
         progress.record_output(5, 89, 1);
+        progress.record_sort_chunk(64).unwrap();
+        progress.record_sort_chunk(32).unwrap();
+        progress.record_sort_merge_pass();
         assert_eq!(
             progress.snapshot(),
             CompactionProgressSnapshot {
@@ -1295,12 +1322,23 @@ mod tests {
                 effective_lanes: 2,
                 range_limit: 9,
                 active_lanes: 1,
+                peak_active_lanes: 1,
                 waiting_lanes: 1,
+                sort_chunks: 2,
+                sort_merge_passes: 1,
+                sort_peak_workspace_bytes: 64,
             }
         );
+        let second = progress.start_range();
+        assert_eq!(progress.snapshot().active_lanes, 2);
+        assert_eq!(progress.snapshot().peak_active_lanes, 2);
         first.complete();
         assert_eq!(progress.snapshot().ranges_completed, 1);
+        assert_eq!(progress.snapshot().active_lanes, 1);
+        second.complete();
+        assert_eq!(progress.snapshot().ranges_completed, 2);
         assert_eq!(progress.snapshot().active_lanes, 0);
+        assert_eq!(progress.snapshot().peak_active_lanes, 2);
     }
 
     #[tokio::test]
@@ -1392,15 +1430,6 @@ mod tests {
 
         assert_eq!(results, [0, 1, 2]);
         assert_eq!(progress.snapshot().ranges_completed, 3);
-    }
-
-    #[test]
-    fn dense_bases_prefix_sum_and_reject_overflow() {
-        assert_eq!(dense_ordinal_bases(&[3, 0, 4]).unwrap(), (vec![0, 3, 3], 7));
-        assert_eq!(
-            dense_ordinal_bases(&[u64::MAX, 1]).unwrap_err(),
-            IndexError::OffsetOverflow
-        );
     }
 
     #[tokio::test]

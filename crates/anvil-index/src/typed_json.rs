@@ -1,34 +1,28 @@
 //! Bounded typed-JSON and fixed object-metadata runs.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::codec::{Decoder, Encoder, encode_component};
-use crate::routed::{
-    ROUTED_ROW_RESIDENT_OVERHEAD_BYTES, RoutedComponentWriter, RoutedCursor, RoutedRow,
-};
-use crate::run::{
-    ComponentTree, LeafCursor, RunStatistics, RunView, find_leaf, open_run, seal_run_root,
-};
+use crate::codec::{Decoder, Encoder};
+use crate::routed::{ROUTED_ROW_RESIDENT_OVERHEAD_BYTES, RoutedRow};
+use crate::run::{ComponentTree, RunStatistics, RunView, open_run, seal_run_root};
 use crate::segment::{
     DEFAULT_COMPONENT_BLOCK_BYTES, DocumentComponentWriter, DocumentRecord, DocumentState,
-    MutationBuffer, PATH_CHANGES_TAG, PathChange, PathComponentWriter, PathRunCursor,
-    document_by_ordinal, is_latest_live,
+    LatestLiveProbe, MutationBuffer, PATH_CHANGES_TAG, PathChange, PathComponentWriter,
+    PathRunCursor, document_by_ordinal,
 };
-use crate::succinct::{decode_elias_fano_with_budget, encode_elias_fano};
 use crate::{
-    ComponentCodec, DocumentRef, IndexBlockSink, IndexDirectoryRead, IndexError, IndexKind,
-    IndexMutation, MAX_INDEX_DECODED_BLOCK_BYTES, SealedRun, SegmentBuildOptions, SegmentPush,
+    DocumentRef, IndexBlockSink, IndexDirectoryRead, IndexError, IndexKind, IndexMutation,
+    SealedRun, SegmentBuildOptions, SegmentPush,
 };
 
 pub(crate) const ROWS_TAG: u8 = 20;
-const KEYS_TAG: u8 = 21;
-const ELIAS_FANO_DECODED_FIXED_BYTES: usize = 256;
-// Two words remain in the decoded sequence; one more conservatively covers
-// low/high-word and sample construction while that sequence is built.
-const ELIAS_FANO_DECODED_BYTES_PER_VALUE: usize = 3 * std::mem::size_of::<u64>();
+pub(crate) const KEYS_TAG: u8 = 21;
+const EXISTS_VALUE_TAG: u8 = 4;
+const UNSIGNED_VALUE_TAG: u8 = 5;
+const EXISTS_POSITION: u32 = u32::MAX;
 
 #[path = "typed_json/query.rs"]
 mod query;
@@ -37,6 +31,25 @@ use query::query_typed;
 #[path = "typed_json/compaction_cache.rs"]
 mod compaction_cache;
 use compaction_cache::CompactionPointCache;
+
+#[path = "typed_json/identity.rs"]
+mod identity;
+#[cfg(test)]
+use crate::run::LeafCursor;
+#[cfg(test)]
+use crate::{ComponentCodec, MAX_INDEX_DECODED_BLOCK_BYTES};
+#[cfg(test)]
+use identity::{
+    ELIAS_FANO_DECODED_BYTES_PER_VALUE, ELIAS_FANO_DECODED_FIXED_BYTES, decode_typed_rows,
+    read_typed_block,
+};
+pub(crate) use identity::{TypedComponentWriter, TypedRow};
+use identity::{TypedCursor, range_local_ordinal, typed_row};
+
+#[path = "typed_json/postings.rs"]
+mod postings;
+pub(crate) use postings::PostingComponentWriter;
+use postings::PostingCursor;
 
 #[path = "typed_json/key_rebuild.rs"]
 mod key_rebuild;
@@ -69,6 +82,10 @@ pub enum ScalarValue {
     Null,
     Boolean(bool),
     Number(f64),
+    /// Exact unsigned value used by Anvil's fixed object-head metadata fields.
+    /// Typed JSON numbers remain `Number`; this variant prevents u64 metadata
+    /// identities and counters from losing precision through f64 conversion.
+    Unsigned(u64),
     String(String),
 }
 
@@ -88,6 +105,7 @@ impl ScalarValue {
             (Self::Null, Self::Null) => Some(Ordering::Equal),
             (Self::Boolean(left), Self::Boolean(right)) => Some(left.cmp(right)),
             (Self::Number(left), Self::Number(right)) => left.partial_cmp(right),
+            (Self::Unsigned(left), Self::Unsigned(right)) => Some(left.cmp(right)),
             (Self::String(left), Self::String(right)) => Some(left.cmp(right)),
             _ => None,
         }
@@ -541,12 +559,12 @@ impl MetadataFilterEngine {
 }
 
 #[derive(Clone, Debug)]
-struct TypedPayload {
-    fields: BTreeMap<String, Vec<ScalarValue>>,
+pub(crate) struct TypedPayload {
+    pub(crate) fields: BTreeMap<String, Vec<ScalarValue>>,
 }
 
 impl TypedPayload {
-    fn canonical(fields: SelectedScalarFields) -> Self {
+    pub(crate) fn canonical(fields: SelectedScalarFields) -> Self {
         Self {
             fields: fields
                 .into_iter()
@@ -576,7 +594,10 @@ impl TypedPayload {
                 |size, value| {
                     size.saturating_add(match value {
                         ScalarValue::String(value) => value.len(),
-                        ScalarValue::Null | ScalarValue::Boolean(_) | ScalarValue::Number(_) => 0,
+                        ScalarValue::Null
+                        | ScalarValue::Boolean(_)
+                        | ScalarValue::Number(_)
+                        | ScalarValue::Unsigned(_) => 0,
                     })
                 },
             );
@@ -628,22 +649,32 @@ impl TypedPayload {
         Ok(Self { fields })
     }
 
-    fn key_rows(&self, ordinal: u64) -> Result<Vec<RoutedRow>, IndexError> {
+    pub(crate) fn key_rows(&self, ordinal: u64) -> Result<Vec<RoutedRow>, IndexError> {
         let mut rows = Vec::new();
+        let mut position = 0u32;
         for (field, values) in &self.fields {
+            rows.push(typed_exists_row(field, ordinal)?);
             for value in values {
-                let position = u32::try_from(rows.len()).map_err(|_| IndexError::OffsetOverflow)?;
                 rows.push(RoutedRow::new(
                     typed_primary(field, value)?,
                     ordinal,
                     position,
                 )?);
+                position = position.checked_add(1).ok_or(IndexError::OffsetOverflow)?;
             }
         }
         Ok(rows)
     }
 
     fn matches_key(&self, primary: &[u8], position: u32) -> Result<bool, IndexError> {
+        if position == EXISTS_POSITION {
+            for field in self.fields.keys() {
+                if typed_exists_primary(field)? == primary {
+                    return Ok(true);
+                }
+            }
+            return Ok(false);
+        }
         let target = usize::try_from(position).map_err(|_| IndexError::OffsetOverflow)?;
         let mut current = 0usize;
         for (field, values) in &self.fields {
@@ -656,240 +687,6 @@ impl TypedPayload {
         }
         Ok(false)
     }
-}
-
-#[derive(Clone, Debug)]
-struct TypedRow {
-    ordinal: u64,
-    payload: TypedPayload,
-}
-
-struct TypedComponentWriter {
-    kind: IndexKind,
-    level: u8,
-    target_bytes: usize,
-    estimated_bytes: usize,
-    decoded_resident_bytes: usize,
-    rows: Vec<TypedRow>,
-    tree: crate::run::RoutingTreeBuilder,
-}
-
-impl TypedComponentWriter {
-    fn new(kind: IndexKind, level: u8, target_bytes: usize) -> Self {
-        Self {
-            kind,
-            level,
-            target_bytes: target_bytes.max(256),
-            estimated_bytes: 0,
-            decoded_resident_bytes: 0,
-            rows: Vec::new(),
-            tree: crate::run::RoutingTreeBuilder::new(kind, ROWS_TAG),
-        }
-    }
-
-    async fn push<S: IndexBlockSink>(
-        &mut self,
-        row: TypedRow,
-        sink: &mut S,
-    ) -> Result<(), IndexError> {
-        let row_bytes = row.payload.encoded_bytes().saturating_add(16);
-        let row_decoded_resident_bytes =
-            std::mem::size_of::<TypedRow>().saturating_add(row.payload.decoded_resident_bytes());
-        let single_row_decoded_bytes =
-            row_decoded_resident_bytes.saturating_add(self.ordinal_decode_resident_bytes(1));
-        if single_row_decoded_bytes > MAX_INDEX_DECODED_BLOCK_BYTES {
-            return Err(IndexError::ResourceLimit {
-                needed: single_row_decoded_bytes,
-                limit: MAX_INDEX_DECODED_BLOCK_BYTES,
-            });
-        }
-        let next_decoded_resident_bytes = self
-            .decoded_resident_bytes
-            .saturating_add(row_decoded_resident_bytes)
-            .saturating_add(self.ordinal_decode_resident_bytes(self.rows.len().saturating_add(1)));
-        if !self.rows.is_empty()
-            && (self.estimated_bytes.saturating_add(row_bytes) > self.target_bytes
-                || next_decoded_resident_bytes > MAX_INDEX_DECODED_BLOCK_BYTES)
-        {
-            self.flush(sink).await?;
-        }
-        if self
-            .rows
-            .last()
-            .is_some_and(|previous| previous.ordinal >= row.ordinal)
-        {
-            return Err(IndexError::UnsortedRecords);
-        }
-        self.estimated_bytes = self.estimated_bytes.saturating_add(row_bytes);
-        self.decoded_resident_bytes = self
-            .decoded_resident_bytes
-            .saturating_add(row_decoded_resident_bytes);
-        self.rows.push(row);
-        Ok(())
-    }
-
-    fn ordinal_decode_resident_bytes(&self, row_count: usize) -> usize {
-        if self.level == 0 || row_count == 0 {
-            0
-        } else {
-            ELIAS_FANO_DECODED_FIXED_BYTES
-                .saturating_add(row_count.saturating_mul(ELIAS_FANO_DECODED_BYTES_PER_VALUE))
-        }
-    }
-
-    async fn flush<S: IndexBlockSink>(&mut self, sink: &mut S) -> Result<(), IndexError> {
-        if self.rows.is_empty() {
-            return Ok(());
-        }
-        let rows = std::mem::take(&mut self.rows);
-        self.estimated_bytes = 0;
-        self.decoded_resident_bytes = 0;
-        let codec = if self.level == 0 {
-            ComponentCodec::FixedRows
-        } else {
-            ComponentCodec::PrefixEliasFano
-        };
-        let body = encode_typed_rows(&rows, codec)?;
-        let bytes = encode_component(self.kind, ROWS_TAG, codec, body)?;
-        self.tree
-            .emit_leaf(
-                crate::GeneratedBlock::new(
-                    self.kind,
-                    ROWS_TAG,
-                    codec,
-                    0,
-                    ordinal_key(rows.first().unwrap().ordinal),
-                    ordinal_key(rows.last().unwrap().ordinal),
-                    rows.len() as u64,
-                    bytes,
-                )?,
-                sink,
-            )
-            .await
-    }
-
-    async fn finish<S: IndexBlockSink>(
-        mut self,
-        sink: &mut S,
-    ) -> Result<ComponentTree, IndexError> {
-        self.flush(sink).await?;
-        self.tree.finish(sink).await
-    }
-}
-
-fn encode_typed_rows(rows: &[TypedRow], codec: ComponentCodec) -> Result<Vec<u8>, IndexError> {
-    let mut output = Encoder::default();
-    output.u32(rows.len())?;
-    if codec == ComponentCodec::PrefixEliasFano {
-        output.bytes(&encode_elias_fano(
-            &rows.iter().map(|row| row.ordinal).collect::<Vec<_>>(),
-        )?)?;
-    }
-    for row in rows {
-        if codec == ComponentCodec::FixedRows {
-            output.u64(row.ordinal);
-        }
-        row.payload.encode(&mut output)?;
-    }
-    Ok(output.finish())
-}
-
-fn decode_typed_rows(bytes: &[u8], codec: ComponentCodec) -> Result<Vec<TypedRow>, IndexError> {
-    let mut decoder = Decoder::new(bytes);
-    let count = decoder.u32()? as usize;
-    decoder.guard_count::<TypedRow>(count, 4)?;
-    let ordinals = if codec == ComponentCodec::PrefixEliasFano {
-        let budget = decoder.budget();
-        let sequence = decode_elias_fano_with_budget(decoder.bytes()?, budget)?;
-        if sequence.len() != count {
-            return Err(IndexError::InvalidFormat("typed ordinal count"));
-        }
-        Some(sequence)
-    } else if codec == ComponentCodec::FixedRows {
-        None
-    } else {
-        return Err(IndexError::InvalidFormat("typed block codec"));
-    };
-    let mut rows = Vec::with_capacity(count);
-    for index in 0..count {
-        rows.push(TypedRow {
-            ordinal: match &ordinals {
-                Some(values) => values.get(index)?,
-                None => decoder.u64()?,
-            },
-            payload: TypedPayload::decode(&mut decoder)?,
-        });
-    }
-    decoder.finish()?;
-    if rows.is_empty()
-        || rows
-            .windows(2)
-            .any(|pair| pair[0].ordinal >= pair[1].ordinal)
-    {
-        return Err(IndexError::InvalidFormat("typed ordinal order"));
-    }
-    Ok(rows)
-}
-
-async fn read_typed_block<D: IndexDirectoryRead>(
-    directory: &D,
-    descriptor: &crate::BlockDescriptor,
-) -> Result<Vec<TypedRow>, IndexError> {
-    let block = crate::run::read_leaf(directory, descriptor).await?;
-    let rows = decode_typed_rows(block.body(), descriptor.codec)?;
-    if rows.first().map(|row| ordinal_key(row.ordinal)) != Some(descriptor.minimum_key.clone())
-        || rows.last().map(|row| ordinal_key(row.ordinal)) != Some(descriptor.maximum_key.clone())
-        || rows.len() as u64 != descriptor.element_count
-    {
-        return Err(IndexError::InvalidFormat("typed block descriptor"));
-    }
-    Ok(rows)
-}
-
-struct TypedCursor<'a, D> {
-    directory: &'a D,
-    leaves: LeafCursor<'a, D>,
-    rows: VecDeque<TypedRow>,
-}
-
-impl<'a, D: IndexDirectoryRead> TypedCursor<'a, D> {
-    fn new(directory: &'a D, root: crate::BlockDescriptor) -> Self {
-        Self {
-            directory,
-            leaves: LeafCursor::new(directory, root),
-            rows: VecDeque::new(),
-        }
-    }
-
-    async fn next(&mut self) -> Result<Option<TypedRow>, IndexError> {
-        loop {
-            if let Some(row) = self.rows.pop_front() {
-                return Ok(Some(row));
-            }
-            let Some(descriptor) = self.leaves.next().await? else {
-                return Ok(None);
-            };
-            self.rows = read_typed_block(self.directory, &descriptor).await?.into();
-        }
-    }
-}
-
-async fn typed_row<D: IndexDirectoryRead>(
-    directory: &D,
-    view: &RunView,
-    ordinal: u64,
-) -> Result<TypedRow, IndexError> {
-    let root = view
-        .component_optional(ROWS_TAG)
-        .ok_or(IndexError::InvalidFormat("missing typed component"))?;
-    let descriptor = find_leaf(directory, root, &ordinal_key(ordinal))
-        .await?
-        .ok_or(IndexError::InvalidFormat("missing typed ordinal"))?;
-    let rows = read_typed_block(directory, &descriptor).await?;
-    let index = rows
-        .binary_search_by_key(&ordinal, |row| row.ordinal)
-        .map_err(|_| IndexError::InvalidFormat("missing typed ordinal"))?;
-    Ok(rows.into_iter().nth(index).unwrap())
 }
 
 async fn seal_typed<T, S>(
@@ -919,7 +716,7 @@ where
         match entry.mutation {
             IndexMutation::Upsert(value) => {
                 let (document, payload) = project(value);
-                let ordinal = live;
+                let ordinal = range_local_ordinal(0, live)?;
                 let key_rows = payload.key_rows(ordinal)?;
                 live += 1;
                 minimum_version = minimum_version.min(document.version);
@@ -969,7 +766,7 @@ where
                 "typed query keys must be unique within one source run".into(),
             ));
         }
-        let mut writer = RoutedComponentWriter::new(kind, KEYS_TAG, level, target_block_bytes);
+        let mut writer = PostingComponentWriter::new(kind, target_block_bytes);
         for row in keys {
             writer.push(row, sink).await?;
         }
@@ -1069,7 +866,7 @@ where
                 .typed(&runs[winner_run], &views[winner_run], old_ordinal)
                 .await?
                 .payload;
-            let ordinal = live;
+            let ordinal = range_local_ordinal(0, live)?;
             live += 1;
             winner.document_ordinal = Some(ordinal);
             documents
@@ -1104,16 +901,8 @@ where
         components.push(documents.finish(sink).await?);
         components.push(typed.finish(sink).await?);
         drop(point_cache);
-        if let Some(tree) = merge_typed_keys(
-            runs,
-            &views,
-            kind,
-            output_level,
-            target_block_bytes,
-            &path_root,
-            sink,
-        )
-        .await?
+        if let Some(tree) =
+            merge_typed_keys(runs, &views, kind, target_block_bytes, &path_root, sink).await?
         {
             components.push(tree);
         }
@@ -1135,7 +924,6 @@ async fn merge_typed_keys<D, S>(
     runs: &[D],
     views: &[RunView],
     kind: IndexKind,
-    output_level: u8,
     target_block_bytes: usize,
     output_path_root: &crate::BlockDescriptor,
     sink: &mut S,
@@ -1151,7 +939,7 @@ where
         .map(|(run, view)| {
             view.component_optional(KEYS_TAG)
                 .cloned()
-                .map(|root| RoutedCursor::new(run, root, None))
+                .map(|root| PostingCursor::new(run, root, None))
         })
         .collect::<Vec<_>>();
     let mut current = Vec::with_capacity(cursors.len());
@@ -1161,7 +949,7 @@ where
             None => None,
         });
     }
-    let mut writer = RoutedComponentWriter::new(kind, KEYS_TAG, output_level, target_block_bytes);
+    let mut writer = PostingComponentWriter::new(kind, target_block_bytes);
     loop {
         let Some(primary) = current
             .iter()
@@ -1300,7 +1088,9 @@ fn predicate_values(predicate: &TypedPredicate) -> &[ScalarValue] {
     }
 }
 
-fn query_driver_prefix(predicates: &[TypedPredicate]) -> Result<Option<Vec<u8>>, IndexError> {
+fn query_driver_ranges(
+    predicates: &[TypedPredicate],
+) -> Result<Option<Vec<crate::compaction::KeyRange>>, IndexError> {
     let Some(predicate) = predicates.iter().min_by_key(|predicate| match predicate {
         TypedPredicate::Equal { .. } => 0,
         TypedPredicate::Prefix { .. } => 1,
@@ -1313,14 +1103,119 @@ fn query_driver_prefix(predicates: &[TypedPredicate]) -> Result<Option<Vec<u8>>,
     }) else {
         return Ok(None);
     };
-    let prefix = match predicate {
-        TypedPredicate::Equal { field, value } => typed_primary(field, value).map_err(|_| {
-            IndexError::InvalidQuery("typed equality key exceeds the format limit".into())
-        })?,
-        TypedPredicate::Prefix { field, prefix } => typed_string_prefix(field, prefix)?,
-        predicate => typed_field_prefix(predicate.field())?,
+    let ranges = match predicate {
+        TypedPredicate::Exists { field } => {
+            vec![query_prefix_range(typed_exists_primary(field).map_err(
+                |_| IndexError::InvalidQuery("typed query key exceeds the format limit".into()),
+            )?)]
+        }
+        TypedPredicate::Equal { field, value } => {
+            vec![query_prefix_range(typed_query_primary(field, value)?)]
+        }
+        TypedPredicate::In { field, values } => {
+            let mut keys = values
+                .iter()
+                .map(|value| typed_query_primary(field, value))
+                .collect::<Result<Vec<_>, _>>()?;
+            keys.sort();
+            keys.dedup();
+            keys.into_iter().map(query_prefix_range).collect()
+        }
+        TypedPredicate::Prefix { field, prefix } => {
+            vec![query_prefix_range(typed_string_prefix(field, prefix)?)]
+        }
+        TypedPredicate::LessThan { field, value } => query_nonempty_range(
+            typed_scalar_prefix(field, value)?,
+            Some(typed_query_primary(field, value)?),
+        )
+        .into_iter()
+        .collect(),
+        TypedPredicate::LessThanOrEqual { field, value } => {
+            let scalar_prefix = typed_scalar_prefix(field, value)?;
+            let value = typed_query_primary(field, value)?;
+            query_nonempty_range(scalar_prefix, crate::routed::prefix_successor(&value))
+                .into_iter()
+                .collect()
+        }
+        TypedPredicate::GreaterThan { field, value } => {
+            let scalar_prefix = typed_scalar_prefix(field, value)?;
+            query_nonempty_range(
+                crate::routed::prefix_successor(&typed_query_primary(field, value)?)
+                    .unwrap_or_else(|| scalar_prefix.clone()),
+                crate::routed::prefix_successor(&scalar_prefix),
+            )
+            .into_iter()
+            .collect()
+        }
+        TypedPredicate::GreaterThanOrEqual { field, value } => {
+            let scalar_prefix = typed_scalar_prefix(field, value)?;
+            query_nonempty_range(
+                typed_query_primary(field, value)?,
+                crate::routed::prefix_successor(&scalar_prefix),
+            )
+            .into_iter()
+            .collect()
+        }
     };
-    Ok(Some(prefix))
+    Ok(Some(ranges))
+}
+
+fn typed_query_primary(field: &str, value: &ScalarValue) -> Result<Vec<u8>, IndexError> {
+    typed_primary(field, value)
+        .map_err(|_| IndexError::InvalidQuery("typed query key exceeds the format limit".into()))
+}
+
+fn typed_scalar_prefix(field: &str, value: &ScalarValue) -> Result<Vec<u8>, IndexError> {
+    let mut key = typed_field_prefix(field)?;
+    key.push(match value {
+        ScalarValue::Null => 0,
+        ScalarValue::Boolean(_) => 1,
+        ScalarValue::Number(_) => 2,
+        ScalarValue::String(_) => 3,
+        ScalarValue::Unsigned(_) => UNSIGNED_VALUE_TAG,
+    });
+    validate_query_key(key)
+}
+
+fn typed_exists_primary(field: &str) -> Result<Vec<u8>, IndexError> {
+    let mut key = Vec::with_capacity(field.len().saturating_add(2));
+    key.extend_from_slice(field.as_bytes());
+    key.push(0);
+    key.push(EXISTS_VALUE_TAG);
+    if key.len() > crate::MAX_INDEX_ROUTING_KEY_BYTES.saturating_sub(12) {
+        return Err(IndexError::InvalidDefinition(
+            "typed query key exceeds the format limit".into(),
+        ));
+    }
+    Ok(key)
+}
+
+pub(crate) fn typed_exists_row(field: &str, ordinal: u64) -> Result<RoutedRow, IndexError> {
+    RoutedRow::new(typed_exists_primary(field)?, ordinal, EXISTS_POSITION)
+}
+
+fn query_prefix_range(prefix: Vec<u8>) -> crate::compaction::KeyRange {
+    crate::compaction::KeyRange {
+        upper: crate::routed::prefix_successor(&prefix),
+        lower: Some(prefix),
+    }
+}
+
+fn query_nonempty_range(
+    lower: Vec<u8>,
+    upper: Option<Vec<u8>>,
+) -> Option<crate::compaction::KeyRange> {
+    if upper
+        .as_ref()
+        .is_some_and(|upper| lower.as_slice() >= upper.as_slice())
+    {
+        None
+    } else {
+        Some(crate::compaction::KeyRange {
+            lower: Some(lower),
+            upper,
+        })
+    }
 }
 
 fn typed_field_prefix(field: &str) -> Result<Vec<u8>, IndexError> {
@@ -1346,7 +1241,7 @@ fn validate_query_key(key: Vec<u8>) -> Result<Vec<u8>, IndexError> {
     Ok(key)
 }
 
-fn validate_selected_fields(
+pub(crate) fn validate_selected_fields(
     definition: &TypedJsonDefinition,
     fields: &SelectedScalarFields,
 ) -> Result<(), IndexError> {
@@ -1522,6 +1417,10 @@ fn encode_scalar(output: &mut Encoder, value: &ScalarValue) -> Result<(), IndexE
             output.u8(2);
             output.f64(if *value == 0.0 { 0.0 } else { *value });
         }
+        ScalarValue::Unsigned(value) => {
+            output.u8(UNSIGNED_VALUE_TAG);
+            output.u64(*value);
+        }
         ScalarValue::String(value) => {
             output.u8(3);
             output.string(value)?;
@@ -1543,6 +1442,7 @@ fn decode_scalar(decoder: &mut Decoder<'_>) -> Result<ScalarValue, IndexError> {
             }
         }
         3 => Ok(ScalarValue::String(decoder.string()?)),
+        UNSIGNED_VALUE_TAG => Ok(ScalarValue::Unsigned(decoder.u64()?)),
         _ => Err(IndexError::InvalidFormat("typed scalar tag")),
     }
 }
@@ -1584,6 +1484,10 @@ fn sortable_scalar_key(value: &ScalarValue) -> Result<Vec<u8>, IndexError> {
             };
             key.extend_from_slice(&ordered.to_be_bytes());
         }
+        ScalarValue::Unsigned(value) => {
+            key.push(UNSIGNED_VALUE_TAG);
+            key.extend_from_slice(&value.to_be_bytes());
+        }
         ScalarValue::String(value) => {
             key.push(3);
             append_escaped_string(&mut key, value, true);
@@ -1609,7 +1513,7 @@ fn scalar_bytes(value: &ScalarValue) -> usize {
     match value {
         ScalarValue::Null => 1,
         ScalarValue::Boolean(_) => 2,
-        ScalarValue::Number(_) => 9,
+        ScalarValue::Number(_) | ScalarValue::Unsigned(_) => 9,
         ScalarValue::String(value) => value.len().saturating_add(5),
     }
 }
@@ -1619,6 +1523,10 @@ fn estimate_selected_fields(fields: &SelectedScalarFields) -> usize {
     let mut derived = 0usize;
     for (field, values) in fields {
         source = source.saturating_add(field.len()).saturating_add(64);
+        derived = derived
+            .saturating_add(field.len())
+            .saturating_add(2)
+            .saturating_add(ROUTED_ROW_RESIDENT_OVERHEAD_BYTES);
         for value in values {
             source = source.saturating_add(scalar_resident_bytes(value));
             derived = derived
@@ -1631,7 +1539,7 @@ fn estimate_selected_fields(fields: &SelectedScalarFields) -> usize {
     source.max(derived)
 }
 
-fn preflight_typed_row(fields: &SelectedScalarFields) -> Result<(), IndexError> {
+pub(crate) fn preflight_typed_row(fields: &SelectedScalarFields) -> Result<(), IndexError> {
     let encoded = fields.iter().fold(4usize, |size, (field, values)| {
         values.iter().fold(
             size.saturating_add(field.len()).saturating_add(8),
@@ -1651,7 +1559,10 @@ fn preflight_typed_row(fields: &SelectedScalarFields) -> Result<(), IndexError> 
 fn scalar_resident_bytes(value: &ScalarValue) -> usize {
     match value {
         ScalarValue::String(value) => value.len().saturating_add(48),
-        ScalarValue::Null | ScalarValue::Boolean(_) | ScalarValue::Number(_) => 32,
+        ScalarValue::Null
+        | ScalarValue::Boolean(_)
+        | ScalarValue::Number(_)
+        | ScalarValue::Unsigned(_) => 32,
     }
 }
 
@@ -1659,7 +1570,7 @@ fn sortable_scalar_bytes(value: &ScalarValue) -> usize {
     match value {
         ScalarValue::Null => 1,
         ScalarValue::Boolean(_) => 2,
-        ScalarValue::Number(_) => 9,
+        ScalarValue::Number(_) | ScalarValue::Unsigned(_) => 9,
         ScalarValue::String(value) => value
             .len()
             .saturating_add(value.as_bytes().iter().filter(|byte| **byte == 0).count())
@@ -1739,7 +1650,7 @@ mod tests {
     ) -> (MemoryBlockSink, SealedRun) {
         let mut builder = TypedJsonSegmentBuilder::new(
             definition(),
-            SegmentBuildOptions::for_level(64 * 1024, level).unwrap(),
+            SegmentBuildOptions::for_level(128 * 1024, level).unwrap(),
         )
         .unwrap();
         for mutation in mutations {
@@ -1965,7 +1876,7 @@ mod tests {
 
     #[test]
     fn builder_returns_unadmitted_mutation_without_crossing_cap() {
-        let options = SegmentBuildOptions::new(500).unwrap();
+        let options = SegmentBuildOptions::new(1_024).unwrap();
         let mut builder = TypedJsonSegmentBuilder::new(definition(), options).unwrap();
         assert!(matches!(
             builder.try_push(upsert("/a", 1, "active", 1.0)).unwrap(),
@@ -1980,5 +1891,7 @@ mod tests {
 
     include!("typed_json/writer_resident_tests.rs");
     include!("typed_json/query_bounds_tests.rs");
+    include!("typed_json/semantics_tests.rs");
+    include!("typed_json/unsigned_metadata_tests.rs");
     include!("typed_json/parallel_compaction_tests.rs");
 }

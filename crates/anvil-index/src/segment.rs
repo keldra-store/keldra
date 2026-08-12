@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use crate::codec::{Decoder, Encoder, encode_component};
 use crate::run::{ComponentTree, RoutingTreeBuilder};
@@ -12,6 +12,7 @@ pub(crate) const PATH_CHANGES_TAG: u8 = 1;
 pub(crate) const DOCUMENTS_TAG: u8 = 2;
 pub(crate) const DEFAULT_COMPONENT_BLOCK_BYTES: usize = crate::MAX_INDEX_BLOCK_BYTES - 64 * 1024;
 const ENTRY_OVERHEAD: usize = 128;
+const LATEST_LIVE_PROBE_CACHE_ENTRIES: usize = 256;
 
 #[derive(Debug)]
 pub(crate) struct PendingMutation<T> {
@@ -289,12 +290,17 @@ pub(crate) async fn read_path_block<D: IndexDirectoryRead>(
     descriptor: &crate::BlockDescriptor,
 ) -> Result<Vec<PathChange>, IndexError> {
     let block = crate::run::read_leaf(directory, descriptor).await?;
-    let rows = match descriptor.codec {
-        ComponentCodec::FixedRows => decode_path_rows_fixed(block.body())?,
-        ComponentCodec::PrefixEliasFano => decode_path_rows_succinct(block.body())?,
-        _ => return Err(IndexError::InvalidFormat("path block codec")),
-    };
-    validate_path_block(rows, descriptor)
+    let descriptor = descriptor.clone();
+    directory
+        .run_query_cpu(move || {
+            let rows = match descriptor.codec {
+                ComponentCodec::FixedRows => decode_path_rows_fixed(block.body())?,
+                ComponentCodec::PrefixEliasFano => decode_path_rows_succinct(block.body())?,
+                _ => return Err(IndexError::InvalidFormat("path block codec")),
+            };
+            validate_path_block(rows, &descriptor)
+        })
+        .await
 }
 
 pub(crate) async fn read_path_block_parallel<D, E>(
@@ -491,12 +497,17 @@ pub(crate) async fn read_document_block<D: IndexDirectoryRead>(
     descriptor: &crate::BlockDescriptor,
 ) -> Result<Vec<DocumentRecord>, IndexError> {
     let block = crate::run::read_leaf(directory, descriptor).await?;
-    let rows = match descriptor.codec {
-        ComponentCodec::FixedRows => decode_document_rows_fixed(block.body())?,
-        ComponentCodec::PrefixEliasFano => decode_document_rows_succinct(block.body())?,
-        _ => return Err(IndexError::InvalidFormat("document block codec")),
-    };
-    validate_document_block(rows, descriptor)
+    let descriptor = descriptor.clone();
+    directory
+        .run_query_cpu(move || {
+            let rows = match descriptor.codec {
+                ComponentCodec::FixedRows => decode_document_rows_fixed(block.body())?,
+                ComponentCodec::PrefixEliasFano => decode_document_rows_succinct(block.body())?,
+                _ => return Err(IndexError::InvalidFormat("document block codec")),
+            };
+            validate_document_block(rows, &descriptor)
+        })
+        .await
 }
 
 pub(crate) async fn read_document_block_parallel<D, E>(
@@ -656,18 +667,92 @@ pub(crate) async fn path_change_in_tree<D: IndexDirectoryRead>(
     Ok(Some(rows[index].clone()))
 }
 
-/// `runs` are ordered newest first. Exact path/version evidence, rather than a
-/// probabilistic filter, decides visibility.
-pub(crate) async fn is_latest_live<D: IndexDirectoryRead>(
-    runs: &[D],
-    views: &[crate::run::RunView],
-    candidate: &DocumentRef,
-) -> Result<bool, IndexError> {
-    Ok(latest_path_change(runs, views, &candidate.path)
-        .await?
-        .is_some_and(|(_, change)| {
-            change.state == DocumentState::Live && change.document.version == candidate.version
-        }))
+/// Small per-query reuse of exact latest-version decisions. Immutable runs
+/// make a cached answer authoritative for the lifetime of one query, while a
+/// fixed FIFO bound prevents broad scans from retaining one entry per object.
+pub(crate) struct LatestLiveProbe {
+    entries: HashMap<String, Option<CachedPathChange>>,
+    insertion_order: VecDeque<String>,
+}
+
+#[derive(Clone, Copy)]
+struct CachedPathChange {
+    run_index: usize,
+    version: u64,
+    state: DocumentState,
+    document_ordinal: Option<u64>,
+}
+
+impl LatestLiveProbe {
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: HashMap::with_capacity(LATEST_LIVE_PROBE_CACHE_ENTRIES),
+            insertion_order: VecDeque::with_capacity(LATEST_LIVE_PROBE_CACHE_ENTRIES),
+        }
+    }
+
+    pub(crate) async fn latest_change<D: IndexDirectoryRead>(
+        &mut self,
+        runs: &[D],
+        views: &[crate::run::RunView],
+        path: &str,
+    ) -> Result<Option<(usize, PathChange)>, IndexError> {
+        if let Some(cached) = self.entries.get(path) {
+            return Ok(cached.map(|change| change.materialize(path)));
+        }
+        let latest = latest_path_change(runs, views, path).await?;
+        let cached = latest.as_ref().map(|(run_index, change)| CachedPathChange {
+            run_index: *run_index,
+            version: change.document.version,
+            state: change.state,
+            document_ordinal: change.document_ordinal,
+        });
+        self.remember(path.to_owned(), cached);
+        Ok(latest)
+    }
+
+    pub(crate) async fn is_latest_live<D: IndexDirectoryRead>(
+        &mut self,
+        runs: &[D],
+        views: &[crate::run::RunView],
+        candidate: &DocumentRef,
+    ) -> Result<bool, IndexError> {
+        Ok(self
+            .latest_change(runs, views, &candidate.path)
+            .await?
+            .is_some_and(|(_, change)| {
+                change.state == DocumentState::Live && change.document.version == candidate.version
+            }))
+    }
+
+    fn remember(&mut self, path: String, change: Option<CachedPathChange>) {
+        if self.entries.contains_key(&path) {
+            return;
+        }
+        if self.entries.len() == LATEST_LIVE_PROBE_CACHE_ENTRIES
+            && let Some(oldest) = self.insertion_order.pop_front()
+        {
+            self.entries.remove(&oldest);
+        }
+        self.insertion_order.push_back(path.clone());
+        self.entries.insert(path, change);
+    }
+}
+
+impl CachedPathChange {
+    fn materialize(self, path: &str) -> (usize, PathChange) {
+        (
+            self.run_index,
+            PathChange {
+                document: DocumentRef {
+                    path: path.to_owned(),
+                    version: self.version,
+                },
+                state: self.state,
+                document_ordinal: self.document_ordinal,
+            },
+        )
+    }
 }
 
 pub(crate) struct PathRunCursor<'a, D> {
@@ -977,41 +1062,61 @@ mod tests {
         let new = directory(&new_sink, new);
         let runs = [new, old];
         let views = open_views(&runs, IndexKind::FullText).await.unwrap();
+        let mut probe = LatestLiveProbe::new();
         assert!(
-            is_latest_live(
-                &runs,
-                &views,
-                &DocumentRef {
-                    path: "/a".into(),
-                    version: 2,
-                },
-            )
-            .await
-            .unwrap()
+            probe
+                .is_latest_live(
+                    &runs,
+                    &views,
+                    &DocumentRef {
+                        path: "/a".into(),
+                        version: 2,
+                    },
+                )
+                .await
+                .unwrap()
         );
         assert!(
-            !is_latest_live(
-                &runs,
-                &views,
-                &DocumentRef {
-                    path: "/a".into(),
-                    version: 1,
-                },
-            )
-            .await
-            .unwrap()
+            !probe
+                .is_latest_live(
+                    &runs,
+                    &views,
+                    &DocumentRef {
+                        path: "/a".into(),
+                        version: 1,
+                    },
+                )
+                .await
+                .unwrap()
         );
         assert!(
-            !is_latest_live(
-                &runs,
-                &views,
-                &DocumentRef {
-                    path: "/b".into(),
-                    version: 1,
-                },
-            )
-            .await
-            .unwrap()
+            !probe
+                .is_latest_live(
+                    &runs,
+                    &views,
+                    &DocumentRef {
+                        path: "/b".into(),
+                        version: 1,
+                    },
+                )
+                .await
+                .unwrap()
+        );
+        assert_eq!(probe.entries.len(), 2);
+    }
+
+    #[test]
+    fn latest_live_probe_cache_has_a_fixed_fifo_bound() {
+        let mut probe = LatestLiveProbe::new();
+        for index in 0..LATEST_LIVE_PROBE_CACHE_ENTRIES + 8 {
+            probe.remember(format!("/objects/{index}"), None);
+        }
+        assert_eq!(probe.entries.len(), LATEST_LIVE_PROBE_CACHE_ENTRIES);
+        assert!(!probe.entries.contains_key("/objects/0"));
+        assert!(
+            probe
+                .entries
+                .contains_key(&format!("/objects/{}", LATEST_LIVE_PROBE_CACHE_ENTRIES + 7))
         );
     }
 }

@@ -254,8 +254,13 @@ async fn read_block<D: IndexDirectoryRead>(
     descriptor: &crate::BlockDescriptor,
 ) -> Result<Vec<RoutedRow>, IndexError> {
     let block = read_leaf(directory, descriptor).await?;
-    let rows = decode_rows(block.body(), descriptor.codec)?;
-    validate_block(rows, descriptor)
+    let descriptor = descriptor.clone();
+    directory
+        .run_query_cpu(move || {
+            let rows = decode_rows(block.body(), descriptor.codec)?;
+            validate_block(rows, &descriptor)
+        })
+        .await
 }
 
 async fn read_block_parallel<D, E>(
@@ -314,13 +319,21 @@ impl<'a, D: IndexDirectoryRead> RoutedCursor<'a, D> {
         prefix: Option<Vec<u8>>,
     ) -> Self {
         let upper = prefix.as_deref().and_then(prefix_successor);
+        let range = prefix.as_ref().map(|lower| crate::compaction::KeyRange {
+            lower: Some(lower.clone()),
+            upper: upper.clone(),
+        });
+        let leaves = match &range {
+            Some(range) => LeafCursor::in_range(directory, root, range.clone()),
+            None => LeafCursor::new(directory, root),
+        };
         Self {
             directory,
-            leaves: LeafCursor::new(directory, root),
+            leaves,
             rows: VecDeque::new(),
             prefix,
             upper,
-            range: None,
+            range,
         }
     }
 
@@ -429,4 +442,83 @@ fn common_prefix(left: &[u8], right: &[u8]) -> usize {
         .zip(right)
         .take_while(|(left, right)| left == right)
         .count()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::compaction::KeyRange;
+    use crate::io::tests::{MemoryBlockSink, MemoryFile};
+    use crate::{BlockDescriptor, IndexDirectoryRead};
+
+    use super::*;
+
+    struct RangeObservedDirectory {
+        inner: MemoryBlockSink,
+        range: KeyRange,
+        outside_range_opens: Arc<AtomicUsize>,
+    }
+
+    impl IndexDirectoryRead for RangeObservedDirectory {
+        type File = MemoryFile;
+
+        async fn open_root(&self) -> Result<Self::File, IndexError> {
+            self.inner.open_root().await
+        }
+
+        async fn open_block(&self, descriptor: &BlockDescriptor) -> Result<Self::File, IndexError> {
+            if !self.range.intersects(descriptor) {
+                self.outside_range_opens.fetch_add(1, Ordering::Relaxed);
+            }
+            self.inner.open_block(descriptor).await
+        }
+    }
+
+    #[tokio::test]
+    async fn prefix_cursor_prunes_unrelated_routing_subtrees() {
+        let mut sink = MemoryBlockSink::default();
+        let mut writer = RoutedComponentWriter::new(IndexKind::TypedJson, 9, 0, 256);
+        for index in 0..4_000u64 {
+            writer
+                .push(
+                    RoutedRow::new(format!("key/{index:05}").into_bytes(), index, 0).unwrap(),
+                    &mut sink,
+                )
+                .await
+                .unwrap();
+        }
+        let tree = writer.finish(&mut sink).await.unwrap().unwrap();
+        assert!(tree.root.routing_height >= 2);
+
+        let prefix = b"key/012".to_vec();
+        let range = KeyRange {
+            lower: Some(prefix.clone()),
+            upper: prefix_successor(&prefix),
+        };
+        let outside_range_opens = Arc::new(AtomicUsize::new(0));
+        let directory = RangeObservedDirectory {
+            inner: sink,
+            range,
+            outside_range_opens: Arc::clone(&outside_range_opens),
+        };
+        let mut cursor = RoutedCursor::new(&directory, tree.root, Some(prefix.clone()));
+        let mut rows = Vec::new();
+        while let Some(row) = cursor.next().await.unwrap() {
+            rows.push(row);
+        }
+
+        assert_eq!(rows.len(), 100);
+        assert!(rows.iter().all(|row| row.primary.starts_with(&prefix)));
+        assert_eq!(rows.first().unwrap().ordinal, 1_200);
+        assert_eq!(rows.last().unwrap().ordinal, 1_299);
+        assert_eq!(outside_range_opens.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn prefix_successor_carries_and_preserves_unbounded_maximum() {
+        assert_eq!(prefix_successor(&[1, 2, 255]), Some(vec![1, 3]));
+        assert_eq!(prefix_successor(&[255, 255]), None);
+    }
 }

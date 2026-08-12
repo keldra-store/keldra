@@ -29,15 +29,68 @@ pub trait IndexDirectoryRead: Send + Sync {
         &self,
         descriptor: &BlockDescriptor,
     ) -> impl Future<Output = Result<Self::File, IndexError>> + Send;
+
+    /// Execute one bounded, storage-independent query CPU chunk.
+    ///
+    /// Storage-neutral callers run inline by default. Anvil's production
+    /// query directory overrides this boundary to use the one process-owned
+    /// index CPU pool after asynchronous artifact reads have completed.
+    fn run_query_cpu<T, F>(&self, work: F) -> impl Future<Output = Result<T, IndexError>> + Send
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, IndexError> + Send + 'static,
+    {
+        async move { work() }
+    }
 }
 
 /// Storage-neutral publication boundary. Anvil durably writes and releases
 /// each move-only block before this future resolves.
 pub trait IndexBlockSink: Send {
+    /// Create an independently packed writer lane.
+    ///
+    /// A plain `Clone` may be used as a read directory and therefore retains
+    /// the same lane. Parallel writers call this method so physical pack
+    /// assignment is deterministic from lane creation order rather than task
+    /// completion order.
+    fn fork(&self) -> Result<Self, IndexError>
+    where
+        Self: Sized + Clone,
+    {
+        Ok(self.clone())
+    }
+
+    /// Create one disposable local scratch lane.
+    ///
+    /// External sorters use this lane for spill blocks which are readable
+    /// while a candidate is being built but must never become authoritative
+    /// generation artifacts. In-memory test sinks may use the ordinary clone;
+    /// Anvil's production sink places these blocks in its restart-disposable
+    /// scratch directory instead of the object byte plane.
+    fn fork_scratch(&self) -> Result<Self, IndexError>
+    where
+        Self: Sized + Clone,
+    {
+        self.fork()
+    }
+
+    /// Remove one disposable scratch block after a successful merge has made
+    /// it unreachable. Ordinary sinks may keep the default no-op; Anvil's
+    /// scratch sink deletes only descriptors belonging to a scratch lane.
+    fn discard_scratch_block(
+        &mut self,
+        _descriptor: &BlockDescriptor,
+    ) -> impl Future<Output = Result<(), IndexError>> + Send {
+        std::future::ready(Ok(()))
+    }
+
+    /// Persist or stage one logical block and return its physical pack
+    /// location. Callers must embed this returned descriptor, not the
+    /// unplaced descriptor carried by `block`.
     fn emit(
         &mut self,
         block: GeneratedBlock,
-    ) -> impl Future<Output = Result<(), IndexError>> + Send;
+    ) -> impl Future<Output = Result<BlockDescriptor, IndexError>> + Send;
 }
 
 pub(crate) enum ReadBuffer<S> {
@@ -228,18 +281,20 @@ pub(crate) mod tests {
     }
 
     impl IndexBlockSink for MemoryBlockSink {
-        async fn emit(&mut self, block: GeneratedBlock) -> Result<(), IndexError> {
+        async fn emit(&mut self, block: GeneratedBlock) -> Result<BlockDescriptor, IndexError> {
+            let mut descriptor = block.descriptor().clone();
+            descriptor.place(0, 0);
             let name = block.logical_name();
             let (_, bytes) = block.into_parts();
             let mut files = self.files.lock().unwrap();
             if let Some(existing) = files.get(&name) {
                 if existing == &bytes {
-                    return Ok(());
+                    return Ok(descriptor);
                 }
                 return Err(IndexError::Integrity);
             }
             files.insert(name, bytes);
-            Ok(())
+            Ok(descriptor)
         }
     }
 

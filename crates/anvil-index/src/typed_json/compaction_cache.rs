@@ -10,8 +10,10 @@ use crate::segment::{
 use crate::{BlockDescriptor, DocumentRef, IndexDirectoryRead, IndexError};
 
 use super::{
-    ROWS_TAG, TypedPayload, TypedRow, ordinal_key, parallel_compaction::read_typed_block_parallel,
-    read_typed_block,
+    ROWS_TAG, TypedPayload,
+    identity::{TypedRow, read_typed_block},
+    ordinal_key,
+    parallel_compaction::read_typed_block_parallel,
 };
 
 /// Six source leaves plus four path cursors leave two decoded-allocation slots

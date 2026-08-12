@@ -14,11 +14,24 @@ pub struct BlockDescriptor {
     pub element_count: u64,
     pub encoded_bytes: u64,
     pub hash: [u8; 32],
+    /// Deterministic writer-lane/local-pack ID containing this logical block.
+    ///
+    /// Builders create blocks before a storage sink assigns their physical
+    /// location. Only descriptors returned by [`crate::IndexBlockSink`] may be
+    /// embedded in another block.
+    pub pack_id: u32,
+    /// Byte offset of this logical block within `pack_id`.
+    pub pack_offset: u64,
 }
 
 impl BlockDescriptor {
     pub fn logical_name(&self) -> String {
         hex_hash(&self.hash)
+    }
+
+    pub(crate) fn place(&mut self, pack_id: u32, pack_offset: u64) {
+        self.pack_id = pack_id;
+        self.pack_offset = pack_offset;
     }
 }
 
@@ -71,6 +84,8 @@ impl GeneratedBlock {
                 encoded_bytes: u64::try_from(bytes.len())
                     .map_err(|_| IndexError::OffsetOverflow)?,
                 hash,
+                pack_id: u32::MAX,
+                pack_offset: 0,
             },
             bytes,
         })
@@ -121,7 +136,7 @@ impl SealedRun {
     ) -> Self {
         Self {
             descriptor: RunDescriptor {
-                format_version: 2,
+                format_version: crate::INDEX_FORMAT_VERSION,
                 kind,
                 level,
                 mutation_count,

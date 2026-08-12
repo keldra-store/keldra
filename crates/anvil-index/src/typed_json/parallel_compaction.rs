@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::compaction::{
     CompactionExecutor, CompactionParallelism, CompactionProgress, KeyRange, LaneResultProducer,
-    PathWinnerCursor, collect_ordered_lanes, dense_ordinal_bases, deterministic_key_range_plan,
+    PathWinnerCursor, collect_ordered_lanes, deterministic_key_range_plan,
 };
 use crate::run::{ComponentTree, RunStatistics, RunView, assemble_component_ranges, seal_run_root};
 use crate::segment::{
@@ -14,8 +14,12 @@ use crate::segment::{
 use crate::{IndexBlockSink, IndexDirectoryRead, IndexError, IndexKind, SealedRun};
 
 use super::{
-    CompactionPointCache, TypedComponentWriter, TypedRow, decode_typed_rows, key_rebuild,
-    open_views, ordinal_key,
+    CompactionPointCache,
+    identity::{
+        TypedComponentWriter, TypedRow, decode_typed_rows, range_local_ordinal, range_ordinal_base,
+        validate_typed_rows,
+    },
+    key_rebuild, open_views,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -51,40 +55,14 @@ where
     let runs = Arc::new(runs.to_vec());
     let views = Arc::new(views);
     let roots = Arc::new(roots);
-    let expected_live = if ranges.len() == 1 {
-        None
-    } else {
-        let mut producers = Vec::<LaneResultProducer<TypedRangeCount>>::with_capacity(ranges.len());
-        for range in ranges.iter().cloned() {
-            let runs = runs.clone();
-            let roots = roots.clone();
-            let lane_executor = executor.clone();
-            let lane_progress = progress.clone();
-            producers.push(Box::new(move || {
-                Box::pin(count_typed_range(
-                    runs,
-                    roots,
-                    range,
-                    lane_executor,
-                    lane_progress,
-                ))
-            }));
-        }
-        Some(collect_ordered_lanes(&executor, producers, &progress).await?)
-    };
-    let (ordinal_bases, expected_total_live) = match &expected_live {
-        Some(counts) => {
-            dense_ordinal_bases(&counts.iter().map(|count| count.live).collect::<Vec<_>>())?
-        }
-        None => (vec![0], 0),
-    };
     let mut producers =
         Vec::<LaneResultProducer<Option<TypedRangeOutput>>>::with_capacity(ranges.len());
-    for (range, ordinal_base) in ranges.into_iter().zip(ordinal_bases) {
+    for (range_id, range) in ranges.into_iter().enumerate() {
+        let ordinal_base = range_ordinal_base(range_id)?;
         let runs = runs.clone();
         let views = views.clone();
         let roots = roots.clone();
-        let lane_sink = sink.clone();
+        let lane_sink = sink.fork()?;
         let lane_executor = executor.clone();
         let lane_progress = progress.clone();
         producers.push(Box::new(move || {
@@ -104,21 +82,8 @@ where
         }));
     }
     let outputs = collect_ordered_lanes(&executor, producers, &progress).await?;
-    if let Some(expected) = &expected_live {
-        for (expected, output) in expected.iter().zip(&outputs) {
-            let actual = output
-                .as_ref()
-                .map_or(0, |output| output.statistics.live_document_count);
-            if actual != expected.live {
-                return Err(IndexError::InvalidFormat("typed range live count changed"));
-            }
-        }
-    }
     let outputs = outputs.into_iter().flatten().collect::<Vec<_>>();
     let statistics = aggregate_typed_statistics(&outputs)?;
-    if expected_live.is_some() && statistics.live_document_count != expected_total_live {
-        return Err(IndexError::InvalidFormat("typed range live count changed"));
-    }
     let path_tree = assemble_component_ranges(
         kind,
         PATH_CHANGES_TAG,
@@ -166,6 +131,7 @@ where
                 .filter_map(|output| output.typed.clone())
                 .collect(),
             sink,
+            parallelism.max_lanes(),
             executor,
             progress,
         )
@@ -184,39 +150,11 @@ where
     seal_run_root(kind, output_level, statistics, components)
 }
 
-#[derive(Clone, Copy)]
-struct TypedRangeCount {
-    live: u64,
-}
-
 struct TypedRangeOutput {
     paths: ComponentTree,
     documents: Option<ComponentTree>,
     typed: Option<ComponentTree>,
     statistics: RunStatistics,
-}
-
-async fn count_typed_range<D, E>(
-    runs: Arc<Vec<D>>,
-    roots: Arc<Vec<crate::BlockDescriptor>>,
-    range: KeyRange,
-    executor: E,
-    progress: CompactionProgress,
-) -> Result<TypedRangeCount, IndexError>
-where
-    D: IndexDirectoryRead,
-    E: CompactionExecutor,
-{
-    let mut winners =
-        PathWinnerCursor::open(runs.as_slice(), roots.as_slice(), range, executor, progress)
-            .await?;
-    let mut live = 0u64;
-    while let Some((_, winner)) = winners.next().await? {
-        if winner.state == DocumentState::Live {
-            live = live.checked_add(1).ok_or(IndexError::OffsetOverflow)?;
-        }
-    }
-    Ok(TypedRangeCount { live })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -286,9 +224,7 @@ where
                 )
                 .await?
                 .payload;
-            let ordinal = ordinal_base
-                .checked_add(live)
-                .ok_or(IndexError::OffsetOverflow)?;
+            let ordinal = range_local_ordinal(ordinal_base, live)?;
             live = live.checked_add(1).ok_or(IndexError::OffsetOverflow)?;
             winner.document_ordinal = Some(ordinal);
             documents
@@ -382,16 +318,10 @@ where
     let descriptor = descriptor.clone();
     let rows = executor
         .run_cpu(move || {
-            let rows = decode_typed_rows(block.body(), descriptor.codec)?;
-            if rows.first().map(|row| ordinal_key(row.ordinal))
-                != Some(descriptor.minimum_key.clone())
-                || rows.last().map(|row| ordinal_key(row.ordinal))
-                    != Some(descriptor.maximum_key.clone())
-                || rows.len() as u64 != descriptor.element_count
-            {
-                return Err(IndexError::InvalidFormat("typed block descriptor"));
-            }
-            Ok(rows)
+            validate_typed_rows(
+                decode_typed_rows(block.body(), descriptor.codec)?,
+                &descriptor,
+            )
         })
         .await?;
     progress.record_input(rows.len() as u64, 0, 0);

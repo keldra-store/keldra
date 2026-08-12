@@ -5,10 +5,11 @@ use std::sync::Arc;
 
 use crate::compaction::{
     CompactionExecutor, CompactionParallelism, CompactionProgress, KeyRange, LaneResultProducer,
-    PathWinnerCursor, collect_ordered_lanes, dense_ordinal_bases, deterministic_key_range_plan,
+    PathWinnerCursor, collect_ordered_lanes, deterministic_key_range_plan,
 };
 use crate::routed_sort::{
-    MAX_EXTERNAL_SORT_CHUNK_RESIDENT_BYTES, RoutedExternalSorter, merge_routed_component_trees,
+    MAX_EXTERNAL_SORT_CHUNK_RESIDENT_BYTES, RoutedExternalSorter,
+    merge_routed_component_trees_parallel,
 };
 use crate::run::{
     ComponentTree, LeafCursor, RunStatistics, RunView, assemble_component_ranges, seal_run_root,
@@ -59,41 +60,15 @@ where
     let runs = Arc::new(runs.to_vec());
     let views = Arc::new(views);
     let roots = Arc::new(roots);
-    let expected_live = if ranges.len() == 1 {
-        None
-    } else {
-        let mut producers =
-            Vec::<LaneResultProducer<ProjectionRangeCount>>::with_capacity(ranges.len());
-        for range in ranges.iter().cloned() {
-            let runs = runs.clone();
-            let roots = roots.clone();
-            let lane_executor = executor.clone();
-            let lane_progress = progress.clone();
-            producers.push(Box::new(move || {
-                Box::pin(count_projection_range(
-                    runs,
-                    roots,
-                    range,
-                    lane_executor,
-                    lane_progress,
-                ))
-            }));
-        }
-        Some(collect_ordered_lanes(&executor, producers, &progress).await?)
-    };
-    let (ordinal_bases, expected_total_live) = match &expected_live {
-        Some(counts) => {
-            dense_ordinal_bases(&counts.iter().map(|count| count.live).collect::<Vec<_>>())?
-        }
-        None => (vec![0], 0),
-    };
     let mut producers =
         Vec::<LaneResultProducer<Option<ProjectionRangeOutput>>>::with_capacity(ranges.len());
-    for (range, ordinal_base) in ranges.into_iter().zip(ordinal_bases) {
+    for (range_id, range) in ranges.into_iter().enumerate() {
+        let range_id = u64::try_from(range_id).map_err(|_| IndexError::OffsetOverflow)?;
+        let ordinal_base = crate::bulk::range_ordinal_base(range_id)?;
         let runs = runs.clone();
         let views = views.clone();
         let roots = roots.clone();
-        let lane_sink = sink.clone();
+        let lane_sink = sink.fork()?;
         let lane_executor = executor.clone();
         let lane_progress = progress.clone();
         producers.push(Box::new(move || {
@@ -113,25 +88,8 @@ where
         }));
     }
     let outputs = collect_ordered_lanes(&executor, producers, &progress).await?;
-    if let Some(expected) = &expected_live {
-        for (expected, output) in expected.iter().zip(&outputs) {
-            let actual = output
-                .as_ref()
-                .map_or(0, |output| output.statistics.live_document_count);
-            if actual != expected.live {
-                return Err(IndexError::InvalidFormat(
-                    "projection range live count changed",
-                ));
-            }
-        }
-    }
     let outputs = outputs.into_iter().flatten().collect::<Vec<_>>();
     let statistics = aggregate_projection_statistics(&outputs)?;
-    if expected_live.is_some() && statistics.live_document_count != expected_total_live {
-        return Err(IndexError::InvalidFormat(
-            "projection range live count changed",
-        ));
-    }
     let path_tree = assemble_component_ranges(
         kind,
         PATH_CHANGES_TAG,
@@ -184,6 +142,7 @@ where
                 .filter_map(|output| output.projections.clone())
                 .collect(),
             sink,
+            parallelism.max_lanes(),
             executor.clone(),
             progress.clone(),
         )
@@ -204,39 +163,11 @@ where
     seal_run_root(kind, output_level, statistics, components)
 }
 
-#[derive(Clone, Copy)]
-struct ProjectionRangeCount {
-    live: u64,
-}
-
 struct ProjectionRangeOutput {
     paths: ComponentTree,
     documents: Option<ComponentTree>,
     projections: Option<ComponentTree>,
     statistics: RunStatistics,
-}
-
-async fn count_projection_range<D, E>(
-    runs: Arc<Vec<D>>,
-    roots: Arc<Vec<crate::BlockDescriptor>>,
-    range: KeyRange,
-    executor: E,
-    progress: CompactionProgress,
-) -> Result<ProjectionRangeCount, IndexError>
-where
-    D: IndexDirectoryRead,
-    E: CompactionExecutor,
-{
-    let mut winners =
-        PathWinnerCursor::open(runs.as_slice(), roots.as_slice(), range, executor, progress)
-            .await?;
-    let mut live = 0u64;
-    while let Some((_, winner)) = winners.next().await? {
-        if winner.state == DocumentState::Live {
-            live = live.checked_add(1).ok_or(IndexError::OffsetOverflow)?;
-        }
-    }
-    Ok(ProjectionRangeCount { live })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -306,9 +237,7 @@ where
                     &progress,
                 )
                 .await?;
-            let ordinal = ordinal_base
-                .checked_add(live)
-                .ok_or(IndexError::OffsetOverflow)?;
+            let ordinal = crate::bulk::range_local_ordinal(ordinal_base, live)?;
             live = live.checked_add(1).ok_or(IndexError::OffsetOverflow)?;
             winner.document_ordinal = Some(ordinal);
             documents
@@ -366,6 +295,7 @@ async fn rebuild_projection_routes<S, T, E>(
     target_block_bytes: usize,
     projection_ranges: Vec<ComponentTree>,
     sink: &mut S,
+    max_lanes: usize,
     executor: E,
     progress: CompactionProgress,
 ) -> Result<Vec<(u8, ComponentTree)>, IndexError>
@@ -382,7 +312,7 @@ where
     let mut producers =
         Vec::<LaneResultProducer<Vec<(u8, ComponentTree)>>>::with_capacity(projection_ranges.len());
     for projection in projection_ranges {
-        let lane_sink = sink.clone();
+        let lane_sink = sink.fork()?;
         let lane_executor = executor.clone();
         let lane_progress = progress.clone();
         producers.push(Box::new(move || {
@@ -409,15 +339,16 @@ where
             })
             .cloned()
             .collect();
-        if let Some(tree) = merge_routed_component_trees(
+        if let Some(tree) = merge_routed_component_trees_parallel(
             kind,
             *tag,
             output_level,
             target_block_bytes,
             trees,
             sink,
-            &executor,
-            &progress,
+            max_lanes,
+            executor.clone(),
+            progress.clone(),
         )
         .await?
         {
@@ -451,6 +382,7 @@ where
     let mut cursor = StagedProjectionCursor::<_, T>::new(&directory, projection.root);
     let mut sorters = Vec::with_capacity(sorter_count);
     for tag in T::key_tags() {
+        let scratch = sink.fork_scratch()?;
         sorters.push((
             *tag,
             RoutedExternalSorter::new(
@@ -459,7 +391,7 @@ where
                 output_level,
                 target_block_bytes,
                 sorter_chunk_bytes,
-                sink.clone(),
+                scratch,
                 executor.clone(),
                 progress.clone(),
             )?,

@@ -2,20 +2,24 @@ use serde::{Deserialize, Serialize};
 
 use crate::IndexError;
 
-/// Fixed format-2 leaf/routing object ceiling, including its component
+/// Fixed format-3 logical leaf/routing block ceiling, including its component
 /// envelope. Writers split before crossing this boundary.
 pub const MAX_INDEX_BLOCK_BYTES: usize = 512 * 1024;
+/// Logical blocks are concatenated into ordinary immutable objects up to this
+/// ceiling. The location embedded in every parent descriptor lets readers
+/// fetch one pack and expose only the requested logical block.
+pub const MAX_INDEX_ARTIFACT_PACK_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum decoded allocation charged while reconstructing one encoded block.
 /// Four-way compaction therefore retains at most 16 MiB of decoded input blocks.
 pub const MAX_INDEX_DECODED_BLOCK_BYTES: usize = 4 * 1024 * 1024;
-/// Object paths are the largest routing keys in format 2.
+/// Object paths are the largest routing keys in format 3.
 pub const MAX_INDEX_ROUTING_KEY_BYTES: usize = 4096;
 pub const INDEX_ROUTING_FANOUT: usize = 32;
 pub const MAX_INDEX_ROUTING_HEIGHT: usize = 8;
 pub const MAX_RUN_COMPONENTS: usize = 16;
 
 const COMPONENT_HEADER_BYTES: usize = 54;
-const DESCRIPTOR_FIXED_BYTES: usize = 4 + 8 + 16 + 32;
+const DESCRIPTOR_FIXED_BYTES: usize = 4 + 8 + 16 + 32 + 4 + 8;
 const MAX_DESCRIPTOR_ENCODED_BYTES: usize =
     DESCRIPTOR_FIXED_BYTES + 2 * MAX_INDEX_ROUTING_KEY_BYTES;
 const DESCRIPTOR_RESIDENT_FIXED_BYTES: usize = 256;
@@ -34,7 +38,7 @@ pub(crate) const fn routing_traversal_workspace_bytes(maximum_key_bytes: usize) 
     MAX_INDEX_ROUTING_HEIGHT * routing_page_workspace_bytes(maximum_key_bytes)
 }
 
-/// Largest canonical routing object at the fixed format-2 fanout.
+/// Largest canonical routing object at the fixed format-3 fanout.
 pub const MAX_INDEX_ROUTING_BLOCK_BYTES: usize =
     COMPONENT_HEADER_BYTES + 1 + 4 + INDEX_ROUTING_FANOUT * MAX_DESCRIPTOR_ENCODED_BYTES;
 pub(crate) const MAX_RUN_ROOT_WORKSPACE_BYTES: usize = COMPONENT_HEADER_BYTES
@@ -116,7 +120,7 @@ impl SegmentMemoryPlan {
     }
 }
 
-/// The eight index capabilities supported by Anvil 0.7.
+/// The eight index capabilities supported by Anvil 0.8.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 #[serde(rename_all = "snake_case")]

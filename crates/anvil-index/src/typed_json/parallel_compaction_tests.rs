@@ -32,7 +32,10 @@ struct RejectStagedPathReads {
 }
 
 impl IndexBlockSink for RejectStagedPathReads {
-    async fn emit(&mut self, block: crate::GeneratedBlock) -> Result<(), IndexError> {
+    async fn emit(
+        &mut self,
+        block: crate::GeneratedBlock,
+    ) -> Result<crate::BlockDescriptor, IndexError> {
         self.inner.emit(block).await
     }
 }
@@ -124,10 +127,20 @@ async fn typed_parallel_ranges_are_semantically_equivalent_and_deterministic() {
     let (new_sink, new_run) = build_run(new_mutations, 0, 96).await;
     let runs = [directory(&new_sink, new_run), old];
 
-    let mut serial_sink = MemoryBlockSink::default();
-    let serial = merge_typed(&runs, IndexKind::TypedJson, 1, 96, &mut serial_sink)
-        .await
-        .unwrap();
+    let one_lane_progress = crate::compaction::CompactionProgress::default();
+    let mut one_lane_sink = MemoryBlockSink::default();
+    let one_lane = parallel_compaction::merge_typed_parallel(
+        &runs,
+        IndexKind::TypedJson,
+        1,
+        96,
+        &mut one_lane_sink,
+        crate::compaction::CompactionParallelism::serial(),
+        one_lane_progress.clone(),
+        TokioExecutor::default(),
+    )
+    .await
+    .unwrap();
     let progress = crate::compaction::CompactionProgress::default();
     let mut parallel_sink = MemoryBlockSink::default();
     let parallel = parallel_compaction::merge_typed_parallel(
@@ -176,26 +189,49 @@ async fn typed_parallel_ranges_are_semantically_equivalent_and_deterministic() {
             parallel.descriptor().maximum_version,
         ),
         (
-            serial.descriptor().mutation_count,
-            serial.descriptor().live_document_count,
-            serial.descriptor().minimum_version,
-            serial.descriptor().maximum_version,
+            one_lane.descriptor().mutation_count,
+            one_lane.descriptor().live_document_count,
+            one_lane.descriptor().minimum_version,
+            one_lane.descriptor().maximum_version,
         )
     );
-    let serial = directory(&serial_sink, serial);
+    let one_lane = directory(&one_lane_sink, one_lane);
     let parallel = directory(&parallel_sink, parallel);
+    let parallel_view = open_run(&parallel, IndexKind::TypedJson).await.unwrap();
+    let mut paths = PathRunCursor::new(
+        &parallel,
+        parallel_view.component(PATH_CHANGES_TAG).unwrap().clone(),
+    );
+    let mut local_by_range = BTreeMap::<u32, Vec<u64>>::new();
+    while let Some(change) = paths.next().await.unwrap() {
+        if let Some(ordinal) = change.document_ordinal {
+            local_by_range
+                .entry(identity::ordinal_range_id(ordinal))
+                .or_default()
+                .push(identity::ordinal_local(ordinal));
+        }
+    }
+    assert!(local_by_range.len() > 1);
+    assert!(local_by_range.values().all(|locals| {
+        locals
+            .iter()
+            .copied()
+            .eq(0..u64::try_from(locals.len()).unwrap())
+    }));
     let mut query = exists_query();
     query.limit = 200;
     assert_eq!(
         TypedJsonEngine::query(&[parallel], &definition(), &query)
             .await
             .unwrap(),
-        TypedJsonEngine::query(&[serial], &definition(), &query)
+        TypedJsonEngine::query(&[one_lane], &definition(), &query)
             .await
             .unwrap()
     );
+    assert_eq!(one_lane_progress.snapshot().effective_lanes, 1);
     let snapshot = progress.snapshot();
     assert!(snapshot.ranges_total > 3);
+    assert!(snapshot.effective_lanes > 1);
     assert_eq!(snapshot.ranges_completed, snapshot.ranges_total);
     assert_eq!(snapshot.active_lanes, 0);
     assert_eq!(snapshot.waiting_lanes, 0);
@@ -229,10 +265,20 @@ async fn metadata_parallel_ranges_are_semantically_equivalent_and_deterministic(
     let (new_sink, new_run) = build_metadata_run(new_mutations, 0, 96).await;
     let runs = [directory(&new_sink, new_run), old];
 
-    let mut serial_sink = MemoryBlockSink::default();
-    let serial = merge_typed(&runs, IndexKind::MetadataFilter, 1, 96, &mut serial_sink)
-        .await
-        .unwrap();
+    let one_lane_progress = crate::compaction::CompactionProgress::default();
+    let mut one_lane_sink = MemoryBlockSink::default();
+    let one_lane = parallel_compaction::merge_typed_parallel(
+        &runs,
+        IndexKind::MetadataFilter,
+        1,
+        96,
+        &mut one_lane_sink,
+        crate::compaction::CompactionParallelism::serial(),
+        one_lane_progress.clone(),
+        TokioExecutor::default(),
+    )
+    .await
+    .unwrap();
     let progress = crate::compaction::CompactionProgress::default();
     let mut parallel_sink = MemoryBlockSink::default();
     let parallel = parallel_compaction::merge_typed_parallel(
@@ -281,13 +327,13 @@ async fn metadata_parallel_ranges_are_semantically_equivalent_and_deterministic(
             parallel.descriptor().maximum_version,
         ),
         (
-            serial.descriptor().mutation_count,
-            serial.descriptor().live_document_count,
-            serial.descriptor().minimum_version,
-            serial.descriptor().maximum_version,
+            one_lane.descriptor().mutation_count,
+            one_lane.descriptor().live_document_count,
+            one_lane.descriptor().minimum_version,
+            one_lane.descriptor().maximum_version,
         )
     );
-    let serial = directory(&serial_sink, serial);
+    let one_lane = directory(&one_lane_sink, one_lane);
     let parallel = directory(&parallel_sink, parallel);
     let mut query = exists_query();
     query.limit = 200;
@@ -295,12 +341,14 @@ async fn metadata_parallel_ranges_are_semantically_equivalent_and_deterministic(
         MetadataFilterEngine::query(&[parallel], &definition(), &query)
             .await
             .unwrap(),
-        MetadataFilterEngine::query(&[serial], &definition(), &query)
+        MetadataFilterEngine::query(&[one_lane], &definition(), &query)
             .await
             .unwrap()
     );
+    assert_eq!(one_lane_progress.snapshot().effective_lanes, 1);
     let snapshot = progress.snapshot();
     assert!(snapshot.ranges_total > 3);
+    assert!(snapshot.effective_lanes > 1);
     assert_eq!(snapshot.ranges_completed, snapshot.ranges_total);
     assert_eq!(snapshot.active_lanes, 0);
     assert_eq!(snapshot.waiting_lanes, 0);

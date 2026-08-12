@@ -1,12 +1,13 @@
 //! Bounded immutable positional full-text runs.
 
 mod parallel_compaction;
+mod query_cpu;
 pub(crate) mod text_sort;
 
 pub(crate) use parallel_compaction::rebuild_selected_text_component_parallel;
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -18,8 +19,8 @@ use crate::run::{
 };
 use crate::segment::{
     DEFAULT_COMPONENT_BLOCK_BYTES, DocumentComponentWriter, DocumentRecord, DocumentState,
-    MutationBuffer, PATH_CHANGES_TAG, PathChange, PathComponentWriter, PathRunCursor,
-    document_by_ordinal, is_latest_live, latest_path_change, path_change_in_tree,
+    LatestLiveProbe, MutationBuffer, PATH_CHANGES_TAG, PathChange, PathComponentWriter,
+    PathRunCursor, document_by_ordinal, latest_path_change, path_change_in_tree,
 };
 use crate::succinct::{
     decode_elias_fano_with_budget, decode_prefix_dictionary_with_budget, encode_elias_fano,
@@ -232,7 +233,9 @@ impl FullTextEngine {
         }
         let selected_fields = Arc::new(query.fields.iter().cloned().collect::<BTreeSet<_>>());
         let views = open_views(runs, IndexKind::FullText).await?;
+        let mut live_probe = LatestLiveProbe::new();
         let mut hits = Vec::with_capacity(query.limit.min(128));
+        let mut hit_chunk = Vec::with_capacity(query_cpu::RANK_CHUNK_DOCUMENTS);
         for (run, view) in runs.iter().zip(&views) {
             let Some(root) = view.component_optional(FULL_TEXT_POSTINGS_TAG) else {
                 continue;
@@ -257,7 +260,7 @@ impl FullTextEngine {
             .await?;
             while let Some(candidate) = candidates.next().await? {
                 let document = document_by_ordinal(run, view, candidate.ordinal).await?;
-                if !is_latest_live(runs, &views, &document).await? {
+                if !live_probe.is_latest_live(runs, &views, &document).await? {
                     continue;
                 }
                 let hit = FullTextHit {
@@ -270,10 +273,29 @@ impl FullTextEngine {
                 {
                     continue;
                 }
-                insert_bounded(&mut hits, hit, query.limit);
+                hit_chunk.push(hit);
+                if hit_chunk.len() == query_cpu::RANK_CHUNK_DOCUMENTS {
+                    hits = run
+                        .run_query_cpu({
+                            let retained = std::mem::take(&mut hits);
+                            let candidates = std::mem::take(&mut hit_chunk);
+                            let limit = query.limit;
+                            move || Ok(query_cpu::merge_full_text_hits(retained, candidates, limit))
+                        })
+                        .await?;
+                }
             }
         }
-        sort_hits(&mut hits);
+        if !hit_chunk.is_empty() {
+            hits = runs[0]
+                .run_query_cpu({
+                    let retained = hits;
+                    let candidates = hit_chunk;
+                    let limit = query.limit;
+                    move || Ok(query_cpu::merge_full_text_hits(retained, candidates, limit))
+                })
+                .await?;
+        }
         Ok(hits)
     }
 
@@ -462,40 +484,8 @@ impl TextComponentWriter {
         posting: TextPosting,
         sink: &mut S,
     ) -> Result<(), IndexError> {
-        validate_term(term)?;
-        validate_field(&posting.field)?;
-        if posting.positions.is_empty()
-            || posting.positions.windows(2).any(|pair| pair[0] >= pair[1])
-        {
-            return Err(IndexError::InvalidDefinition(
-                "full-text positions must be non-empty and strictly ordered".into(),
-            ));
-        }
-        let row_overhead = term
-            .len()
-            .saturating_mul(2)
-            .saturating_add(posting.field.len().saturating_mul(2))
-            .saturating_add(128);
-        if row_overhead.saturating_add(5) > self.target_bytes {
-            return Err(IndexError::ResourceLimit {
-                needed: row_overhead.saturating_add(5),
-                limit: self.target_bytes,
-            });
-        }
-        let maximum_positions = (self.target_bytes - row_overhead) / 5;
-        for (part, positions) in posting.positions.chunks(maximum_positions).enumerate() {
-            self.push_row(
-                TextPostingRow {
-                    term: term.to_owned(),
-                    ordinal: posting.ordinal,
-                    field: posting.field.clone(),
-                    field_length: posting.field_length,
-                    part: u32::try_from(part).map_err(|_| IndexError::OffsetOverflow)?,
-                    positions: positions.to_vec(),
-                },
-                sink,
-            )
-            .await?;
+        for row in split_posting_rows(term, posting, self.target_bytes)? {
+            self.push_row(row, sink).await?;
         }
         Ok(())
     }
@@ -570,6 +560,52 @@ impl TextComponentWriter {
         self.flush(sink).await?;
         self.tree.finish(sink).await
     }
+}
+
+pub(crate) fn split_posting_rows(
+    term: &str,
+    posting: TextPosting,
+    target_bytes: usize,
+) -> Result<Vec<TextPostingRow>, IndexError> {
+    if posting.positions.is_empty() || posting.positions.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(IndexError::InvalidDefinition(
+            "full-text positions must be non-empty and strictly ordered".into(),
+        ));
+    }
+    let maximum_positions = posting_positions_per_row(term, &posting.field, target_bytes)?;
+    let mut rows = Vec::with_capacity(posting.positions.len().div_ceil(maximum_positions));
+    for (part, positions) in posting.positions.chunks(maximum_positions).enumerate() {
+        rows.push(TextPostingRow {
+            term: term.to_owned(),
+            ordinal: posting.ordinal,
+            field: posting.field.clone(),
+            field_length: posting.field_length,
+            part: u32::try_from(part).map_err(|_| IndexError::OffsetOverflow)?,
+            positions: positions.to_vec(),
+        });
+    }
+    Ok(rows)
+}
+
+pub(crate) fn posting_positions_per_row(
+    term: &str,
+    field: &str,
+    target_bytes: usize,
+) -> Result<usize, IndexError> {
+    validate_term(term)?;
+    validate_field(field)?;
+    let row_overhead = term
+        .len()
+        .saturating_mul(2)
+        .saturating_add(field.len().saturating_mul(2))
+        .saturating_add(128);
+    if row_overhead.saturating_add(5) > target_bytes {
+        return Err(IndexError::ResourceLimit {
+            needed: row_overhead.saturating_add(5),
+            limit: target_bytes,
+        });
+    }
+    Ok((target_bytes - row_overhead) / 5)
 }
 
 fn posting_estimate(row: &TextPostingRow) -> usize {
@@ -682,18 +718,23 @@ pub(crate) async fn read_text_block<D: IndexDirectoryRead>(
     descriptor: &BlockDescriptor,
 ) -> Result<Vec<TextPostingRow>, IndexError> {
     let block = crate::run::read_leaf(directory, descriptor).await?;
-    let rows = match descriptor.codec {
-        ComponentCodec::GapPostings => decode_text_rows_fixed(block.body())?,
-        ComponentCodec::QuasiSuccinctPostings => decode_text_rows_succinct(block.body())?,
-        _ => return Err(IndexError::InvalidFormat("full-text block codec")),
-    };
-    if rows.first().map(posting_key).transpose()? != Some(descriptor.minimum_key.clone())
-        || rows.last().map(posting_key).transpose()? != Some(descriptor.maximum_key.clone())
-        || rows.len() as u64 != descriptor.element_count
-    {
-        return Err(IndexError::InvalidFormat("full-text block descriptor"));
-    }
-    Ok(rows)
+    let descriptor = descriptor.clone();
+    directory
+        .run_query_cpu(move || {
+            let rows = match descriptor.codec {
+                ComponentCodec::GapPostings => decode_text_rows_fixed(block.body())?,
+                ComponentCodec::QuasiSuccinctPostings => decode_text_rows_succinct(block.body())?,
+                _ => return Err(IndexError::InvalidFormat("full-text block codec")),
+            };
+            if rows.first().map(posting_key).transpose()? != Some(descriptor.minimum_key.clone())
+                || rows.last().map(posting_key).transpose()? != Some(descriptor.maximum_key.clone())
+                || rows.len() as u64 != descriptor.element_count
+            {
+                return Err(IndexError::InvalidFormat("full-text block descriptor"));
+            }
+            Ok(rows)
+        })
+        .await
 }
 
 async fn read_text_block_parallel<D, E>(
@@ -1060,12 +1101,14 @@ pub(crate) struct Candidate {
 }
 
 pub(crate) struct RunCandidateCursor<'a, D> {
+    directory: &'a D,
     cursors: Vec<TermCursor<'a, D>>,
     current: Vec<Option<TermDocumentMatch>>,
     phrase_terms: Vec<String>,
     unique_terms: Vec<String>,
     phrase: bool,
     match_all_terms: bool,
+    ranked: VecDeque<Candidate>,
 }
 
 impl<'a, D: IndexDirectoryRead> RunCandidateCursor<'a, D> {
@@ -1076,62 +1119,75 @@ impl<'a, D: IndexDirectoryRead> RunCandidateCursor<'a, D> {
         phrase: bool,
         match_all_terms: bool,
     ) -> Result<Self, IndexError> {
+        let directory = cursors
+            .first()
+            .map(|cursor| cursor.directory)
+            .ok_or_else(|| IndexError::InvalidQuery("full-text query has no term cursor".into()))?;
         let mut current = Vec::with_capacity(cursors.len());
         for cursor in &mut cursors {
             current.push(cursor.next_document().await?);
         }
         Ok(Self {
+            directory,
             cursors,
             current,
             phrase_terms,
             unique_terms,
             phrase,
             match_all_terms,
+            ranked: VecDeque::new(),
         })
     }
 
     pub(crate) async fn next(&mut self) -> Result<Option<Candidate>, IndexError> {
         loop {
-            let Some(ordinal) = self
-                .current
-                .iter()
-                .flatten()
-                .map(|entry| entry.ordinal)
-                .min()
-            else {
-                return Ok(None);
-            };
-            let mut matched = BTreeMap::<String, TermDocumentMatch>::new();
-            for (index, entry) in self.current.iter_mut().enumerate() {
-                if entry.as_ref().is_some_and(|entry| entry.ordinal == ordinal) {
-                    matched.insert(self.unique_terms[index].clone(), entry.take().unwrap());
-                    *entry = self.cursors[index].next_document().await?;
+            if let Some(candidate) = self.ranked.pop_front() {
+                return Ok(Some(candidate));
+            }
+            let mut raw = Vec::with_capacity(query_cpu::RANK_CHUNK_DOCUMENTS);
+            let mut exhausted = false;
+            while raw.len() < query_cpu::RANK_CHUNK_DOCUMENTS {
+                let Some(ordinal) = self
+                    .current
+                    .iter()
+                    .flatten()
+                    .map(|entry| entry.ordinal)
+                    .min()
+                else {
+                    exhausted = true;
+                    break;
+                };
+                let mut matched = BTreeMap::<String, TermDocumentMatch>::new();
+                for (index, entry) in self.current.iter_mut().enumerate() {
+                    if entry.as_ref().is_some_and(|entry| entry.ordinal == ordinal) {
+                        matched.insert(self.unique_terms[index].clone(), entry.take().unwrap());
+                        *entry = self.cursors[index].next_document().await?;
+                    }
                 }
+                raw.push(query_cpu::RawCandidate { ordinal, matched });
             }
-            let accepted = if self.phrase {
-                phrase_matches(&self.phrase_terms, &matched)
-            } else if self.match_all_terms {
-                matched.len() == self.unique_terms.len()
-            } else {
-                !matched.is_empty()
-            };
-            if !accepted {
-                continue;
+            if raw.is_empty() {
+                return Ok(None);
             }
-            let score = matched
-                .values()
-                .flat_map(|entry| entry.fields.values())
-                .map(|field| {
-                    let frequency = field.frequency as f32;
-                    frequency * 2.2
-                        / (frequency + 1.2 * (0.25 + 0.75 * field.length as f32 / 100.0))
+            let phrase_terms = self.phrase_terms.clone();
+            let unique_term_count = self.unique_terms.len();
+            let phrase = self.phrase;
+            let match_all_terms = self.match_all_terms;
+            self.ranked = self
+                .directory
+                .run_query_cpu(move || {
+                    Ok(query_cpu::rank_candidates(
+                        raw,
+                        &phrase_terms,
+                        unique_term_count,
+                        phrase,
+                        match_all_terms,
+                    ))
                 })
-                .sum();
-            return Ok(Some(Candidate {
-                ordinal,
-                score,
-                matched_terms: u32::try_from(matched.len()).unwrap_or(u32::MAX),
-            }));
+                .await?;
+            if self.ranked.is_empty() && exhausted {
+                return Ok(None);
+            }
         }
     }
 }
@@ -1373,21 +1429,53 @@ where
     }
 }
 
-pub(crate) fn tokenize(text: &str) -> Vec<(String, u32)> {
-    let mut output = Vec::new();
-    let mut token = String::new();
-    let mut position = 0u32;
-    for character in text.chars().chain(std::iter::once(' ')) {
-        if character.is_alphanumeric() && token.chars().count() < MAX_TOKEN_CHARS {
-            for lower in character.to_lowercase() {
-                token.push(lower);
+pub(crate) struct Tokenizer<'a> {
+    characters: std::iter::Chain<std::str::Chars<'a>, std::iter::Once<char>>,
+    token: String,
+    token_chars: usize,
+    position: u32,
+    #[cfg(test)]
+    peak_token_bytes: usize,
+}
+
+impl Iterator for Tokenizer<'_> {
+    type Item = (String, u32);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        for character in self.characters.by_ref() {
+            if character.is_alphanumeric() && self.token_chars < MAX_TOKEN_CHARS {
+                for lower in character.to_lowercase() {
+                    self.token.push(lower);
+                    self.token_chars = self.token_chars.saturating_add(1);
+                    #[cfg(test)]
+                    {
+                        self.peak_token_bytes = self.peak_token_bytes.max(self.token.len());
+                    }
+                }
+            } else if !self.token.is_empty() {
+                self.token_chars = 0;
+                let position = self.position;
+                self.position = self.position.saturating_add(1);
+                return Some((std::mem::take(&mut self.token), position));
             }
-        } else if !token.is_empty() {
-            output.push((std::mem::take(&mut token), position));
-            position = position.saturating_add(1);
         }
+        None
     }
-    output
+}
+
+pub(crate) fn tokenize_iter(text: &str) -> Tokenizer<'_> {
+    Tokenizer {
+        characters: text.chars().chain(std::iter::once(' ')),
+        token: String::new(),
+        token_chars: 0,
+        position: 0,
+        #[cfg(test)]
+        peak_token_bytes: 0,
+    }
+}
+
+pub(crate) fn tokenize(text: &str) -> Vec<(String, u32)> {
+    tokenize_iter(text).collect()
 }
 
 /// Tokenizes query text while bounding both phrase state and the number of
@@ -1561,6 +1649,18 @@ mod tests {
     use crate::io::tests::{MemoryBlockSink, MemoryDirectory};
 
     use super::*;
+
+    #[test]
+    fn tokenizer_keeps_only_one_bounded_token_for_a_large_field() {
+        let text = "one-token ".repeat(100_000);
+        let mut tokenizer = tokenize_iter(&text);
+        let mut count = 0;
+        while tokenizer.next().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 200_000);
+        assert!(tokenizer.peak_token_bytes <= MAX_TOKEN_CHARS * 4);
+    }
 
     fn upsert(path: &str, version: u64, text: &str) -> IndexMutation<FullTextDocument> {
         IndexMutation::Upsert(FullTextDocument {
@@ -1824,6 +1924,8 @@ mod tests {
             element_count: 1,
             encoded_bytes: 1,
             hash: [0; 32],
+            pack_id: 0,
+            pack_offset: 0,
         };
         let positions = vec![1, 3, 5];
         let positions_allocation = positions.as_ptr();

@@ -11,7 +11,7 @@ use crate::{
 };
 
 #[cfg(test)]
-pub(crate) const RUN_ROOT_FILE: &str = "run/root.v2";
+pub(crate) const RUN_ROOT_FILE: &str = "run/root.v3";
 pub(crate) const RUN_ROOT_TAG: u8 = 254;
 const ROUTING_TAG: u8 = 253;
 const ROUTING_FANOUT: usize = INDEX_ROUTING_FANOUT;
@@ -28,6 +28,52 @@ pub(crate) struct RunStatistics {
 pub(crate) struct ComponentTree {
     pub(crate) root: BlockDescriptor,
     pub(crate) encoded_bytes: u64,
+}
+
+/// Incrementally joins independently written, path-ordered bulk ranges while
+/// retaining only the routing fanout at each level. A fixed range-root height
+/// avoids collecting every range descriptor merely to discover the tallest
+/// subtree after a corpus-sized stream has finished.
+pub(crate) struct ComponentRangeAssembler {
+    builder: RoutingTreeBuilder,
+    range_root_height: u8,
+    range_count: u64,
+}
+
+impl ComponentRangeAssembler {
+    pub(crate) fn new(kind: IndexKind, component_tag: u8, range_root_height: u8) -> Self {
+        Self {
+            builder: RoutingTreeBuilder::new(kind, component_tag),
+            range_root_height,
+            range_count: 0,
+        }
+    }
+
+    pub(crate) async fn push<S: IndexBlockSink>(
+        &mut self,
+        tree: ComponentTree,
+        sink: &mut S,
+    ) -> Result<(), IndexError> {
+        self.builder
+            .emit_subtree(tree, self.range_root_height, sink)
+            .await?;
+        self.range_count = self
+            .range_count
+            .checked_add(1)
+            .ok_or(IndexError::OffsetOverflow)?;
+        Ok(())
+    }
+
+    pub(crate) async fn finish<S: IndexBlockSink>(
+        self,
+        sink: &mut S,
+    ) -> Result<Option<ComponentTree>, IndexError> {
+        if self.range_count == 0 {
+            Ok(None)
+        } else {
+            self.builder.finish(sink).await.map(Some)
+        }
+    }
 }
 
 /// Rolls ordered leaf descriptors into fixed-fanout recursive Merkle routing
@@ -76,7 +122,7 @@ impl RoutingTreeBuilder {
             .encoded_bytes
             .checked_add(descriptor.encoded_bytes)
             .ok_or(IndexError::OffsetOverflow)?;
-        sink.emit(block).await?;
+        let descriptor = sink.emit(block).await?;
         self.add_descriptor(0, descriptor, sink).await
     }
 
@@ -103,7 +149,7 @@ impl RoutingTreeBuilder {
                 .encoded_bytes
                 .checked_add(descriptor.encoded_bytes)
                 .ok_or(IndexError::OffsetOverflow)?;
-            sink.emit(page).await?;
+            descriptor = sink.emit(page).await?;
             level += 1;
         }
     }
@@ -138,7 +184,7 @@ impl RoutingTreeBuilder {
                 .encoded_bytes
                 .checked_add(descriptor.encoded_bytes)
                 .ok_or(IndexError::OffsetOverflow)?;
-            sink.emit(page).await?;
+            let descriptor = sink.emit(page).await?;
             self.add_descriptor(level + 1, descriptor, sink).await?;
         }
     }
@@ -189,7 +235,7 @@ impl RoutingTreeBuilder {
                 .encoded_bytes
                 .checked_add(descriptor.encoded_bytes)
                 .ok_or(IndexError::OffsetOverflow)?;
-            sink.emit(page).await?;
+            descriptor = sink.emit(page).await?;
         }
         self.add_descriptor(usize::from(target_height), descriptor, sink)
             .await
@@ -228,6 +274,29 @@ where
         builder.emit_subtree(tree, target_height, sink).await?;
     }
     builder.finish(sink).await
+}
+
+/// Discard every block reachable from one successfully consumed disposable
+/// component root. Only routing pages are reread to discover their children;
+/// already-consumed data leaves are removed without a second payload read.
+pub(crate) async fn discard_component_tree<D, S>(
+    directory: &D,
+    tree: &ComponentTree,
+    sink: &mut S,
+) -> Result<(), IndexError>
+where
+    D: IndexDirectoryRead,
+    S: IndexBlockSink,
+{
+    let mut pending = vec![tree.root.clone()];
+    while let Some(descriptor) = pending.pop() {
+        if descriptor.routing_height > 0 {
+            let children = read_routing_page(directory, &descriptor).await?;
+            pending.extend(children.into_iter().rev());
+        }
+        sink.discard_scratch_block(&descriptor).await?;
+    }
+    Ok(())
 }
 
 fn encode_routing_page(
@@ -386,12 +455,16 @@ pub(crate) async fn open_run<D: IndexDirectoryRead>(
         &[ComponentCodec::FixedRows],
     )
     .await?;
-    decode_run_root(
-        component.body.as_slice(),
-        expected_kind,
-        component.encoded_bytes,
-        None,
-    )
+    directory
+        .run_query_cpu(move || {
+            decode_run_root(
+                component.body.as_slice(),
+                expected_kind,
+                component.encoded_bytes,
+                None,
+            )
+        })
+        .await
 }
 
 fn decode_run_root(
@@ -567,18 +640,23 @@ pub struct RunBlockWalker<'a, D> {
 impl<'a, D: IndexDirectoryRead> RunBlockWalker<'a, D> {
     pub async fn open(directory: &'a D, root: BlockDescriptor) -> Result<Self, IndexError> {
         let bytes = read_descriptor_bytes(directory, &root).await?;
-        let component = decode_component_bytes(
-            bytes.as_ref(),
-            root.kind,
-            RUN_ROOT_TAG,
-            &[ComponentCodec::FixedRows],
-        )?;
-        let view = decode_run_root(
-            component.body,
-            root.kind,
-            component.encoded_bytes,
-            Some(&root),
-        )?;
+        let decode_root = root.clone();
+        let view = directory
+            .run_query_cpu(move || {
+                let component = decode_component_bytes(
+                    bytes.as_ref(),
+                    decode_root.kind,
+                    RUN_ROOT_TAG,
+                    &[ComponentCodec::FixedRows],
+                )?;
+                decode_run_root(
+                    component.body,
+                    decode_root.kind,
+                    component.encoded_bytes,
+                    Some(&decode_root),
+                )
+            })
+            .await?;
         let mut pending = view
             .components
             .into_values()
@@ -678,21 +756,26 @@ pub(crate) async fn read_leaf<D: IndexDirectoryRead>(
         return Err(IndexError::InvalidFormat("expected data leaf"));
     }
     let bytes = read_descriptor_bytes(directory, descriptor).await?;
-    let component = decode_component_bytes(
-        bytes.as_ref(),
-        descriptor.kind,
-        descriptor.component_tag,
-        &[descriptor.codec],
-    )?;
-    let body_start = bytes
-        .as_ref()
-        .len()
-        .checked_sub(component.body.len())
-        .ok_or(IndexError::OffsetOverflow)?;
-    Ok(LeafBlock {
-        encoded: bytes,
-        body_start,
-    })
+    let descriptor = descriptor.clone();
+    directory
+        .run_query_cpu(move || {
+            let component = decode_component_bytes(
+                bytes.as_ref(),
+                descriptor.kind,
+                descriptor.component_tag,
+                &[descriptor.codec],
+            )?;
+            let body_start = bytes
+                .as_ref()
+                .len()
+                .checked_sub(component.body.len())
+                .ok_or(IndexError::OffsetOverflow)?;
+            Ok(LeafBlock {
+                encoded: bytes,
+                body_start,
+            })
+        })
+        .await
 }
 
 async fn read_routing_page<D: IndexDirectoryRead>(
@@ -703,8 +786,18 @@ async fn read_routing_page<D: IndexDirectoryRead>(
         return Err(IndexError::InvalidFormat("routing descriptor"));
     }
     let bytes = read_descriptor_bytes(directory, descriptor).await?;
+    let descriptor = descriptor.clone();
+    directory
+        .run_query_cpu(move || decode_routing_page(bytes.as_ref(), &descriptor))
+        .await
+}
+
+fn decode_routing_page(
+    bytes: &[u8],
+    descriptor: &BlockDescriptor,
+) -> Result<Vec<BlockDescriptor>, IndexError> {
     let component = decode_component_bytes(
-        bytes.as_ref(),
+        bytes,
         descriptor.kind,
         ROUTING_TAG,
         &[ComponentCodec::FixedRows],
@@ -766,16 +859,26 @@ async fn read_descriptor_bytes<D: IndexDirectoryRead>(
     {
         return Err(IndexError::InvalidFormat("trailing block bytes"));
     }
-    if blake3::hash(bytes.as_ref()).as_bytes() != &descriptor.hash {
-        return Err(IndexError::Integrity);
-    }
-    Ok(bytes)
+    let expected_hash = descriptor.hash;
+    directory
+        .run_query_cpu(move || {
+            if blake3::hash(bytes.as_ref()).as_bytes() != &expected_hash {
+                return Err(IndexError::Integrity);
+            }
+            Ok(bytes)
+        })
+        .await
 }
 
 pub(crate) fn encode_descriptor(
     output: &mut Encoder,
     descriptor: &BlockDescriptor,
 ) -> Result<(), IndexError> {
+    if descriptor.pack_id == u32::MAX {
+        return Err(IndexError::InvalidDefinition(
+            "index block descriptor has not been placed in an artifact pack".into(),
+        ));
+    }
     output.u8(descriptor.component_tag);
     output.u8(descriptor.kind as u8);
     output.u8(descriptor.codec as u8);
@@ -785,6 +888,8 @@ pub(crate) fn encode_descriptor(
     output.u64(descriptor.element_count);
     output.u64(descriptor.encoded_bytes);
     output.raw_bytes(&descriptor.hash);
+    output.u32(usize::try_from(descriptor.pack_id).map_err(|_| IndexError::OffsetOverflow)?)?;
+    output.u64(descriptor.pack_offset);
     Ok(())
 }
 
@@ -813,9 +918,12 @@ pub(crate) fn decode_descriptor(decoder: &mut Decoder<'_>) -> Result<BlockDescri
     let element_count = decoder.u64()?;
     let encoded_bytes = decoder.u64()?;
     let hash = decoder.fixed(32)?.try_into().unwrap();
+    let pack_id = decoder.u32()?;
+    let pack_offset = decoder.u64()?;
     if element_count == 0
         || encoded_bytes == 0
         || encoded_bytes > MAX_INDEX_BLOCK_BYTES as u64
+        || pack_id == u32::MAX
         || usize::from(routing_height) > MAX_INDEX_ROUTING_HEIGHT
         || minimum_key > maximum_key
     {
@@ -831,14 +939,125 @@ pub(crate) fn decode_descriptor(decoder: &mut Decoder<'_>) -> Result<BlockDescri
         element_count,
         encoded_bytes,
         hash,
+        pack_id,
+        pack_offset,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::io::tests::MemoryBlockSink;
+    use std::sync::{Arc, Mutex};
+
+    use crate::IndexFileRead;
+    use crate::io::tests::{MemoryBlockSink, MemoryDirectory, MemoryFile};
 
     use super::*;
+
+    #[derive(Clone)]
+    struct SequencedFile {
+        inner: MemoryFile,
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl IndexFileRead for SequencedFile {
+        type Slice = Arc<[u8]>;
+
+        async fn read_at(&self, offset: u64, max_length: usize) -> Result<Self::Slice, IndexError> {
+            self.events.lock().unwrap().push("io");
+            self.inner.read_at(offset, max_length).await
+        }
+    }
+
+    #[derive(Clone)]
+    struct SequencedDirectory {
+        inner: MemoryDirectory,
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl IndexDirectoryRead for SequencedDirectory {
+        type File = SequencedFile;
+
+        async fn open_root(&self) -> Result<Self::File, IndexError> {
+            Ok(SequencedFile {
+                inner: self.inner.open_root().await?,
+                events: Arc::clone(&self.events),
+            })
+        }
+
+        async fn open_block(&self, descriptor: &BlockDescriptor) -> Result<Self::File, IndexError> {
+            Ok(SequencedFile {
+                inner: self.inner.open_block(descriptor).await?,
+                events: Arc::clone(&self.events),
+            })
+        }
+
+        async fn run_query_cpu<T, F>(&self, work: F) -> Result<T, IndexError>
+        where
+            T: Send + 'static,
+            F: FnOnce() -> Result<T, IndexError> + Send + 'static,
+        {
+            self.events.lock().unwrap().push("cpu");
+            work()
+        }
+    }
+
+    #[tokio::test]
+    async fn run_root_io_completes_before_cpu_decode() {
+        let mut sink = MemoryBlockSink::default();
+        let key = b"a".to_vec();
+        let bytes = encode_component(
+            IndexKind::Path,
+            crate::segment::PATH_CHANGES_TAG,
+            ComponentCodec::FixedRows,
+            key.clone(),
+        )
+        .unwrap();
+        let mut tree = RoutingTreeBuilder::new(IndexKind::Path, crate::segment::PATH_CHANGES_TAG);
+        tree.emit_leaf(
+            GeneratedBlock::new(
+                IndexKind::Path,
+                crate::segment::PATH_CHANGES_TAG,
+                ComponentCodec::FixedRows,
+                0,
+                key.clone(),
+                key,
+                1,
+                bytes,
+            )
+            .unwrap(),
+            &mut sink,
+        )
+        .await
+        .unwrap();
+        let tree = tree.finish(&mut sink).await.unwrap();
+        let run = seal_run_root(
+            IndexKind::Path,
+            0,
+            RunStatistics {
+                mutation_count: 1,
+                live_document_count: 1,
+                minimum_version: 1,
+                maximum_version: 1,
+            },
+            [tree],
+        )
+        .unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let directory = SequencedDirectory {
+            inner: sink.directory_with_root(run.into_root()),
+            events: Arc::clone(&events),
+        };
+
+        open_run(&directory, IndexKind::Path).await.unwrap();
+
+        let events = events.lock().unwrap();
+        assert_eq!(events.last(), Some(&"cpu"));
+        assert!(
+            events[..events.len() - 1]
+                .iter()
+                .all(|event| *event == "io")
+        );
+    }
 
     #[test]
     fn live_runs_require_their_payload_component() {
@@ -853,6 +1072,8 @@ mod tests {
             element_count: 1,
             encoded_bytes: 1,
             hash: [0; 32],
+            pack_id: 0,
+            pack_offset: 0,
         };
         components.insert(crate::segment::PATH_CHANGES_TAG, (1, descriptor));
         assert_eq!(
@@ -873,6 +1094,8 @@ mod tests {
         encoded.u64(1);
         encoded.u64((MAX_INDEX_BLOCK_BYTES + 1) as u64);
         encoded.raw_bytes(&[0; 32]);
+        encoded.u32(0).unwrap();
+        encoded.u64(0);
         let bytes = encoded.finish();
         assert_eq!(
             decode_descriptor(&mut Decoder::new(&bytes)).unwrap_err(),
@@ -916,6 +1139,8 @@ mod tests {
                         element_count: 1,
                         encoded_bytes: 1,
                         hash: [0; 32],
+                        pack_id: 0,
+                        pack_offset: 0,
                     },
                 )
                 .unwrap();
@@ -932,6 +1157,8 @@ mod tests {
                         element_count: 1,
                         encoded_bytes: 1,
                         hash: [0; 32],
+                        pack_id: 0,
+                        pack_offset: 0,
                     },
                 )
                 .unwrap();
@@ -957,6 +1184,8 @@ mod tests {
             element_count: 1,
             encoded_bytes: 1,
             hash: [0; 32],
+            pack_id: 0,
+            pack_offset: 0,
         };
         let mut body = Encoder::default();
         body.u8(crate::full_text::FULL_TEXT_POSTINGS_TAG);
@@ -1271,6 +1500,8 @@ mod tests {
             element_count: 1,
             encoded_bytes: 1,
             hash: [1; 32],
+            pack_id: 0,
+            pack_offset: 0,
         };
         assert!(encode_routing_page(IndexKind::Path, 1, 1, &[child.clone(), child]).is_err());
     }

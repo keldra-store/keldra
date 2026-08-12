@@ -6,15 +6,15 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::compaction::{
-    CompactionExecutor, CompactionParallelism, CompactionProgress, LaneResultProducer,
-    PathWinnerCursor, collect_ordered_lanes, dense_ordinal_bases, deterministic_key_range_plan,
+    CompactionExecutor, CompactionParallelism, CompactionProgress, KeyRange, LaneResultProducer,
+    PathWinnerCursor, collect_ordered_lanes, deterministic_key_range_plan,
 };
 use crate::run::{
     ComponentTree, LeafCursor, RunStatistics, assemble_component_ranges, open_views, seal_run_root,
 };
 use crate::segment::{
-    DEFAULT_COMPONENT_BLOCK_BYTES, DocumentState, MutationBuffer, PATH_CHANGES_TAG, PathChange,
-    PathComponentWriter, PathRunCursor, latest_path_change, read_path_block,
+    DEFAULT_COMPONENT_BLOCK_BYTES, DocumentState, LatestLiveProbe, MutationBuffer,
+    PATH_CHANGES_TAG, PathChange, PathComponentWriter, PathRunCursor, read_path_block,
 };
 use crate::{
     DocumentRef, IndexBlockSink, IndexDirectoryRead, IndexError, IndexKind, IndexMutation,
@@ -144,10 +144,15 @@ impl PathEngine {
         }
         let views = open_views(runs, IndexKind::Path).await?;
         let upper = prefix_successor(query.prefix.as_bytes());
+        let range = KeyRange {
+            lower: Some(query.prefix.as_bytes().to_vec()),
+            upper: upper.clone(),
+        };
+        let mut live_probe = LatestLiveProbe::new();
         let mut selected = BTreeMap::<String, DocumentRef>::new();
         for (run_index, run) in runs.iter().enumerate() {
             let root = views[run_index].component(PATH_CHANGES_TAG)?.clone();
-            let mut cursor = LeafCursor::new(run, root);
+            let mut cursor = LeafCursor::in_range(run, root, range.clone());
             while let Some(descriptor) = cursor.next().await? {
                 if descriptor.maximum_key.as_slice() < query.prefix.as_bytes()
                     || upper
@@ -156,29 +161,49 @@ impl PathEngine {
                 {
                     continue;
                 }
-                for candidate in read_path_block(run, &descriptor).await? {
-                    if !candidate.document.path.starts_with(query.prefix)
-                        || query
-                            .after_path
-                            .is_some_and(|after| candidate.document.path.as_str() <= after)
-                    {
-                        continue;
-                    }
-                    let Some((_, latest)) =
-                        latest_path_change(runs, &views, &candidate.document.path).await?
+                let rows = read_path_block(run, &descriptor).await?;
+                let prefix = query.prefix.to_owned();
+                let after = query.after_path.map(str::to_owned);
+                let candidates = run
+                    .run_query_cpu(move || {
+                        Ok(rows
+                            .into_iter()
+                            .filter(|candidate| {
+                                candidate.document.path.starts_with(&prefix)
+                                    && after.as_ref().is_none_or(|after| {
+                                        candidate.document.path.as_str() > after.as_str()
+                                    })
+                            })
+                            .collect::<Vec<_>>())
+                    })
+                    .await?;
+                let mut live = Vec::with_capacity(candidates.len());
+                for candidate in candidates {
+                    let Some((_, latest)) = live_probe
+                        .latest_change(runs, &views, &candidate.document.path)
+                        .await?
                     else {
                         continue;
                     };
                     if latest.state == DocumentState::Live
                         && latest.document.version == candidate.document.version
                     {
-                        selected
-                            .entry(latest.document.path.clone())
-                            .or_insert(latest.document);
-                        if selected.len() > query.limit {
-                            selected.pop_last();
-                        }
+                        live.push(latest.document);
                     }
+                }
+                if !live.is_empty() {
+                    let limit = query.limit;
+                    selected = run
+                        .run_query_cpu(move || {
+                            for document in live {
+                                selected.entry(document.path.clone()).or_insert(document);
+                                if selected.len() > limit {
+                                    selected.pop_last();
+                                }
+                            }
+                            Ok(selected)
+                        })
+                        .await?;
                 }
             }
         }
@@ -254,57 +279,16 @@ impl PathEngine {
         let ranges = plan.ranges;
         let runs = Arc::new(runs.to_vec());
         let roots = Arc::new(roots);
-        let planned_summaries = if ranges.len() == 1 {
-            None
-        } else {
-            let mut count_producers =
-                Vec::<LaneResultProducer<PathRangeSummary>>::with_capacity(ranges.len());
-            for range in ranges.iter().cloned() {
-                let runs = runs.clone();
-                let roots = roots.clone();
-                let lane_executor = executor.clone();
-                let lane_progress = progress.clone();
-                count_producers.push(Box::new(move || {
-                    Box::pin(async move {
-                        let mut cursor = PathWinnerCursor::open(
-                            runs.as_slice(),
-                            roots.as_slice(),
-                            range,
-                            lane_executor,
-                            lane_progress,
-                        )
-                        .await?;
-                        let mut summary = PathRangeSummary::default();
-                        while let Some(winner) = cursor.next().await? {
-                            summary.record(&winner.1)?;
-                        }
-                        Ok(summary)
-                    })
-                }));
-            }
-            Some(collect_ordered_lanes(&executor, count_producers, &progress).await?)
-        };
-        let (ordinal_bases, expected_live_document_count) = match &planned_summaries {
-            Some(summaries) => {
-                let (bases, total) = dense_ordinal_bases(
-                    &summaries
-                        .iter()
-                        .map(|summary| summary.live_count)
-                        .collect::<Vec<_>>(),
-                )?;
-                (bases, Some(total))
-            }
-            None => (vec![0], None),
-        };
-
         let mut write_producers =
             Vec::<LaneResultProducer<PathRangeOutput>>::with_capacity(ranges.len());
-        for (range, ordinal_base) in ranges.into_iter().zip(ordinal_bases) {
+        for (range_id, range) in ranges.into_iter().enumerate() {
+            let range_id = u64::try_from(range_id).map_err(|_| IndexError::OffsetOverflow)?;
+            let ordinal_base = crate::bulk::range_ordinal_base(range_id)?;
             let runs = runs.clone();
             let roots = roots.clone();
             let lane_executor = executor.clone();
             let lane_progress = progress.clone();
-            let mut lane_sink = (*sink).clone();
+            let mut lane_sink = sink.fork()?;
             write_producers.push(Box::new(move || {
                 Box::pin(async move {
                     let mut cursor = PathWinnerCursor::open(
@@ -321,9 +305,8 @@ impl PathEngine {
                     while let Some((_, mut winner)) = cursor.next().await? {
                         summary.record(&winner)?;
                         winner.document_ordinal = if winner.state == DocumentState::Live {
-                            let ordinal = ordinal_base
-                                .checked_add(local_live_count)
-                                .ok_or(IndexError::OffsetOverflow)?;
+                            let ordinal =
+                                crate::bulk::range_local_ordinal(ordinal_base, local_live_count)?;
                             local_live_count = local_live_count
                                 .checked_add(1)
                                 .ok_or(IndexError::OffsetOverflow)?;
@@ -350,17 +333,6 @@ impl PathEngine {
             }));
         }
         let outputs = collect_ordered_lanes(&executor, write_producers, &progress).await?;
-        if let Some(summaries) = &planned_summaries {
-            if summaries
-                .iter()
-                .zip(&outputs)
-                .any(|(planned, output)| planned != &output.summary)
-            {
-                return Err(IndexError::InvalidDefinition(
-                    "path compaction range changed between passes".into(),
-                ));
-            }
-        }
         let statistics = PathRangeSummary::combine(
             &outputs
                 .iter()
@@ -370,11 +342,6 @@ impl PathEngine {
         if statistics.mutation_count == 0 {
             return Err(IndexError::InvalidDefinition(
                 "path compaction produced no changes".into(),
-            ));
-        }
-        if expected_live_document_count.is_some_and(|expected| expected != statistics.live_count) {
-            return Err(IndexError::InvalidDefinition(
-                "path compaction live count changed during planning".into(),
             ));
         }
         let tree = assemble_component_ranges(
@@ -716,7 +683,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parallel_ranges_are_deterministic_and_query_equivalent_to_serial() {
+    async fn one_and_four_lane_compaction_are_query_equivalent() {
         let old_mutations = (0..80)
             .map(|index| upsert(&format!("/{:02x}/object/{index:04}", index % 32), 1))
             .collect::<Vec<_>>();
@@ -738,10 +705,19 @@ mod tests {
         let new = directory(&new_sink, new_run);
         let runs = [new, old];
 
-        let mut serial_sink = MemoryBlockSink::default();
-        let serial = PathEngine::merge_with_target(&runs, 1, 96, &mut serial_sink)
-            .await
-            .unwrap();
+        let one_lane_progress = CompactionProgress::default();
+        let mut one_lane_sink = MemoryBlockSink::default();
+        let one_lane = PathEngine::merge_parallel_with_target(
+            &runs,
+            1,
+            96,
+            &mut one_lane_sink,
+            CompactionParallelism::serial(),
+            one_lane_progress.clone(),
+            TokioExecutor::default(),
+        )
+        .await
+        .unwrap();
         let progress = CompactionProgress::default();
         let mut first_parallel_sink = MemoryBlockSink::default();
         let first_parallel = PathEngine::merge_parallel_with_target(
@@ -776,18 +752,19 @@ mod tests {
             after_path: None,
             limit: 200,
         };
-        let serial = [directory(&serial_sink, serial)];
+        let one_lane = [directory(&one_lane_sink, one_lane)];
         let parallel = [directory(&first_parallel_sink, first_parallel)];
         assert_eq!(
             PathEngine::query(&parallel, query.clone()).await.unwrap(),
-            PathEngine::query(&serial, query).await.unwrap()
+            PathEngine::query(&one_lane, query).await.unwrap()
         );
+        assert_eq!(one_lane_progress.snapshot().effective_lanes, 1);
         let snapshot = progress.snapshot();
-        assert_eq!(snapshot.ranges_total, snapshot.effective_lanes * 2);
+        assert_eq!(snapshot.ranges_total, snapshot.effective_lanes);
         assert!(snapshot.effective_lanes > 1 && snapshot.effective_lanes <= 4);
         assert_eq!(snapshot.ranges_completed, snapshot.ranges_total);
         assert_eq!(snapshot.output_records, parallel_mutation_count);
-        assert!(snapshot.input_records >= parallel_mutation_count * 2);
+        assert!(snapshot.input_records >= parallel_mutation_count);
     }
 
     #[tokio::test]

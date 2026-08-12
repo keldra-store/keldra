@@ -3,17 +3,21 @@
 use std::cmp::Ordering;
 
 use crate::compaction::{
-    CompactionExecutor, CompactionProgress, MAX_COMPACTION_INPUT_RUNS,
+    CompactionExecutor, CompactionProgress, KeyRange, LaneResultProducer,
+    MAX_COMPACTION_INPUT_RUNS, collect_ordered_lanes, deterministic_delimited_key_range_plan,
     validate_parallel_compaction_fan_in,
 };
-use crate::run::{ComponentTree, LeafCursor, RoutingTreeBuilder};
+use crate::run::{
+    ComponentTree, LeafCursor, RoutingTreeBuilder, assemble_component_ranges,
+    discard_component_tree,
+};
 use crate::{
     ComponentCodec, GeneratedBlock, IndexBlockSink, IndexDirectoryRead, IndexError, IndexKind,
 };
 
 use super::{
     TextComponentWriter, TextPostingRow, decode_text_rows_fixed_unvalidated,
-    encode_text_rows_fixed, posting_estimate, posting_key,
+    encode_text_rows_fixed, posting_estimate, posting_key, posting_positions_per_row,
 };
 
 // Four-way leveling needs at most 32 slots before it exceeds every addressable
@@ -116,8 +120,9 @@ where
             carry = match trees.len() {
                 0 => None,
                 1 => trees.pop(),
-                _ => Some(
-                    merge_text_component_trees(
+                _ => {
+                    let consumed = trees.clone();
+                    let merged = merge_text_component_trees(
                         self.kind,
                         self.component_tag,
                         self.output_level,
@@ -128,17 +133,26 @@ where
                         &self.executor,
                         &self.progress,
                     )
-                    .await?,
-                ),
+                    .await?;
+                    self.discard_trees(&consumed).await?;
+                    Some(merged)
+                }
             };
         }
         Ok(carry)
+    }
+
+    /// Spill the current byte-bounded source quantum before its owner yields.
+    /// Only routing descriptors remain resident between scheduler turns.
+    pub(crate) async fn checkpoint(&mut self) -> Result<(), IndexError> {
+        self.spill_chunk().await
     }
 
     async fn spill_chunk(&mut self) -> Result<(), IndexError> {
         if self.rows.is_empty() {
             return Ok(());
         }
+        let chunk_workspace_bytes = self.chunk_resident_bytes;
         let mut rows = std::mem::take(&mut self.rows);
         self.chunk_resident_bytes = 0;
         let order = self.order;
@@ -167,7 +181,8 @@ where
             &mut self.sink,
         )
         .await?;
-        self.add_run(0, tree).await
+        self.add_run(0, tree).await?;
+        self.progress.record_sort_chunk(chunk_workspace_bytes)
     }
 
     async fn add_run(
@@ -184,6 +199,7 @@ where
                 return Ok(());
             }
             let trees = std::mem::take(runs);
+            let consumed = trees.clone();
             tree = merge_text_component_trees(
                 self.kind,
                 self.component_tag,
@@ -196,8 +212,17 @@ where
                 &self.progress,
             )
             .await?;
+            self.discard_trees(&consumed).await?;
             level = level.checked_add(1).ok_or(IndexError::OffsetOverflow)?;
         }
+    }
+
+    async fn discard_trees(&mut self, trees: &[ComponentTree]) -> Result<(), IndexError> {
+        let directory = self.sink.clone();
+        for tree in trees {
+            discard_component_tree(&directory, tree, &mut self.sink).await?;
+        }
+        Ok(())
     }
 }
 
@@ -283,6 +308,523 @@ where
     .await
 }
 
+/// Merge final-posting scratch trees directly through deterministic term
+/// stripes. Every stripe performs bounded fan-in reduction locally, then
+/// canonicalizes occurrences once into its authoritative output lane.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn merge_final_text_component_trees_parallel<S, E>(
+    kind: IndexKind,
+    component_tag: u8,
+    output_level: u8,
+    target_block_bytes: usize,
+    trees: Vec<ComponentTree>,
+    sink: &mut S,
+    max_lanes: usize,
+    executor: E,
+    progress: CompactionProgress,
+) -> Result<Option<ComponentTree>, IndexError>
+where
+    S: IndexBlockSink + IndexDirectoryRead + Clone + 'static,
+    E: CompactionExecutor,
+{
+    if trees.is_empty() {
+        return Ok(None);
+    }
+    let plan = deterministic_delimited_key_range_plan(
+        trees.iter().map(|tree| tree.root.clone()),
+        0,
+        max_lanes,
+    )?;
+    progress.record_range_limit(plan.range_limit)?;
+    let directory = sink.clone();
+    let trees = std::sync::Arc::new(trees);
+    let mut producers = Vec::<LaneResultProducer<Option<ComponentTree>>>::new();
+    for range in plan.ranges {
+        let trees = trees.clone();
+        let lane_directory = directory.clone();
+        let lane_sink = sink.fork()?;
+        let lane_scratch = sink.fork_scratch()?;
+        let lane_executor = executor.clone();
+        let lane_progress = progress.clone();
+        producers.push(Box::new(move || {
+            Box::pin(merge_final_text_range_bounded(
+                kind,
+                component_tag,
+                output_level,
+                target_block_bytes,
+                trees,
+                range,
+                lane_directory,
+                lane_sink,
+                lane_scratch,
+                lane_executor,
+                lane_progress,
+            ))
+        }));
+    }
+    let ranges = collect_ordered_lanes(&executor, producers, &progress)
+        .await?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    for tree in trees.iter() {
+        discard_component_tree(&directory, tree, sink).await?;
+    }
+    if ranges.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(
+        assemble_component_ranges(kind, component_tag, ranges, sink).await?,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn merge_final_text_range_bounded<S, E>(
+    kind: IndexKind,
+    component_tag: u8,
+    output_level: u8,
+    target_block_bytes: usize,
+    source_trees: std::sync::Arc<Vec<ComponentTree>>,
+    range: KeyRange,
+    directory: S,
+    mut sink: S,
+    mut scratch: S,
+    executor: E,
+    progress: CompactionProgress,
+) -> Result<Option<ComponentTree>, IndexError>
+where
+    S: IndexBlockSink + IndexDirectoryRead + Clone,
+    E: CompactionExecutor,
+{
+    let mut trees = source_trees.as_ref().clone();
+    let mut trees_are_scratch = false;
+    while trees.len() > MAX_COMPACTION_INPUT_RUNS {
+        let mut reduced = Vec::with_capacity(trees.len().div_ceil(MAX_COMPACTION_INPUT_RUNS));
+        for group in trees.chunks(MAX_COMPACTION_INPUT_RUNS) {
+            if let Some(tree) = merge_final_text_range_once(
+                kind,
+                component_tag,
+                output_level,
+                target_block_bytes,
+                group.to_vec(),
+                range.clone(),
+                &directory,
+                &mut scratch,
+                &executor,
+                &progress,
+            )
+            .await?
+            {
+                reduced.push(tree);
+            }
+        }
+        if trees_are_scratch {
+            for tree in &trees {
+                discard_component_tree(&directory, tree, &mut scratch).await?;
+            }
+        }
+        trees = reduced;
+        trees_are_scratch = true;
+        if trees.is_empty() {
+            return Ok(None);
+        }
+    }
+    let output = write_canonical_text_range(
+        kind,
+        component_tag,
+        output_level,
+        target_block_bytes,
+        trees.clone(),
+        range,
+        &directory,
+        &mut sink,
+        &executor,
+        &progress,
+    )
+    .await?;
+    if trees_are_scratch {
+        for tree in &trees {
+            discard_component_tree(&directory, tree, &mut scratch).await?;
+        }
+    }
+    Ok(output)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn merge_final_text_range_once<D, S, E>(
+    kind: IndexKind,
+    component_tag: u8,
+    output_level: u8,
+    target_block_bytes: usize,
+    trees: Vec<ComponentTree>,
+    range: KeyRange,
+    directory: &D,
+    sink: &mut S,
+    executor: &E,
+    progress: &CompactionProgress,
+) -> Result<Option<ComponentTree>, IndexError>
+where
+    D: IndexDirectoryRead,
+    S: IndexBlockSink,
+    E: CompactionExecutor,
+{
+    validate_parallel_compaction_fan_in(trees.len())?;
+    let merged_multiple_inputs = trees.len() > 1;
+    let mut cursors = trees
+        .into_iter()
+        .map(|tree| SpillTextCursor::final_in_range(directory, tree, range.clone()))
+        .collect::<Vec<_>>();
+    let mut current = Vec::with_capacity(cursors.len());
+    for cursor in &mut cursors {
+        current.push(cursor.next_parallel(executor, progress).await?);
+    }
+    let mut writer = SpillTextWriter::new(
+        kind,
+        component_tag,
+        output_level,
+        target_block_bytes,
+        TextSortOrder::FinalPosting,
+    );
+    let mut wrote = false;
+    loop {
+        let Some(selected) = current
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| row.as_ref().map(|row| (index, row)))
+            .min_by(|left, right| compare_rows(TextSortOrder::FinalPosting, left.1, right.1))
+            .map(|(index, _)| index)
+        else {
+            break;
+        };
+        let row = current[selected]
+            .take()
+            .expect("the selected text cursor has one row");
+        writer.push(row, sink).await?;
+        wrote = true;
+        current[selected] = cursors[selected].next_parallel(executor, progress).await?;
+    }
+    if merged_multiple_inputs {
+        progress.record_sort_merge_pass();
+    }
+    if wrote {
+        Ok(Some(writer.finish(sink).await?))
+    } else {
+        Ok(None)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn write_canonical_text_range<D, S, E>(
+    kind: IndexKind,
+    component_tag: u8,
+    output_level: u8,
+    target_block_bytes: usize,
+    trees: Vec<ComponentTree>,
+    range: KeyRange,
+    directory: &D,
+    sink: &mut S,
+    executor: &E,
+    progress: &CompactionProgress,
+) -> Result<Option<ComponentTree>, IndexError>
+where
+    D: IndexDirectoryRead,
+    S: IndexBlockSink,
+    E: CompactionExecutor,
+{
+    validate_parallel_compaction_fan_in(trees.len())?;
+    let merged_multiple_inputs = trees.len() > 1;
+    let mut cursors = trees
+        .into_iter()
+        .map(|tree| SpillTextCursor::final_in_range(directory, tree, range.clone()))
+        .collect::<Vec<_>>();
+    let mut current = Vec::with_capacity(cursors.len());
+    for cursor in &mut cursors {
+        current.push(cursor.next_parallel(executor, progress).await?);
+    }
+    let mut writer =
+        CanonicalPostingWriter::new(kind, component_tag, output_level, target_block_bytes);
+    let mut wrote = false;
+    loop {
+        let Some(selected) = current
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| row.as_ref().map(|row| (index, row)))
+            .min_by(|left, right| compare_rows(TextSortOrder::FinalPosting, left.1, right.1))
+            .map(|(index, _)| index)
+        else {
+            break;
+        };
+        let row = current[selected]
+            .take()
+            .expect("the selected canonical text cursor has one row");
+        writer.push_occurrence(row, sink).await?;
+        wrote = true;
+        current[selected] = cursors[selected].next_parallel(executor, progress).await?;
+    }
+    if merged_multiple_inputs {
+        progress.record_sort_merge_pass();
+    }
+    if wrote {
+        Ok(Some(writer.finish(sink).await?))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Rewrite one sorted disposable text tree into an authoritative output lane.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn rewrite_text_component_tree<D, S, E>(
+    kind: IndexKind,
+    component_tag: u8,
+    output_level: u8,
+    target_block_bytes: usize,
+    order: TextSortOrder,
+    tree: ComponentTree,
+    directory: &D,
+    sink: &mut S,
+    executor: &E,
+    progress: &CompactionProgress,
+) -> Result<ComponentTree, IndexError>
+where
+    D: IndexDirectoryRead,
+    S: IndexBlockSink,
+    E: CompactionExecutor,
+{
+    let mut cursor = SpillTextCursor::new(directory, tree, order);
+    let mut writer =
+        SpillTextWriter::new(kind, component_tag, output_level, target_block_bytes, order);
+    while let Some(row) = cursor.next_parallel(executor, progress).await? {
+        writer.push(row, sink).await?;
+    }
+    writer.finish(sink).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn rewrite_text_component_tree_parallel<D, S, E>(
+    kind: IndexKind,
+    component_tag: u8,
+    output_level: u8,
+    target_block_bytes: usize,
+    tree: ComponentTree,
+    directory: D,
+    sink: &mut S,
+    max_lanes: usize,
+    executor: E,
+    progress: CompactionProgress,
+) -> Result<ComponentTree, IndexError>
+where
+    D: IndexDirectoryRead + Clone + Send + Sync + 'static,
+    S: IndexBlockSink + IndexDirectoryRead + Clone + 'static,
+    E: CompactionExecutor,
+{
+    let plan = deterministic_delimited_key_range_plan([tree.root.clone()], 0, max_lanes)?;
+    progress.record_range_limit(plan.range_limit)?;
+    let mut producers = Vec::<LaneResultProducer<Option<ComponentTree>>>::new();
+    for range in plan.ranges {
+        let tree = tree.clone();
+        let directory = directory.clone();
+        let lane_sink = sink.fork()?;
+        let lane_executor = executor.clone();
+        let lane_progress = progress.clone();
+        producers.push(Box::new(move || {
+            Box::pin(rewrite_text_range(
+                kind,
+                component_tag,
+                output_level,
+                target_block_bytes,
+                tree,
+                range,
+                directory,
+                lane_sink,
+                lane_executor,
+                lane_progress,
+            ))
+        }));
+    }
+    let trees = collect_ordered_lanes(&executor, producers, &progress)
+        .await?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let output = assemble_component_ranges(kind, component_tag, &trees, sink).await?;
+    discard_component_tree(&directory, &tree, sink).await?;
+    Ok(output)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn rewrite_text_range<D, S, E>(
+    kind: IndexKind,
+    component_tag: u8,
+    output_level: u8,
+    target_block_bytes: usize,
+    tree: ComponentTree,
+    range: KeyRange,
+    directory: D,
+    mut sink: S,
+    executor: E,
+    progress: CompactionProgress,
+) -> Result<Option<ComponentTree>, IndexError>
+where
+    D: IndexDirectoryRead,
+    S: IndexBlockSink,
+    E: CompactionExecutor,
+{
+    let mut cursor = SpillTextCursor::final_in_range(&directory, tree, range);
+    let mut writer =
+        CanonicalPostingWriter::new(kind, component_tag, output_level, target_block_bytes);
+    let mut wrote = false;
+    while let Some(row) = cursor.next_parallel(&executor, &progress).await? {
+        writer.push_occurrence(row, &mut sink).await?;
+        wrote = true;
+    }
+    if wrote {
+        Ok(Some(writer.finish(&mut sink).await?))
+    } else {
+        Ok(None)
+    }
+}
+
+struct PendingPosting {
+    term: String,
+    ordinal: u64,
+    field: String,
+    field_length: u32,
+    next_part: u32,
+    maximum_positions: usize,
+    last_position: Option<u32>,
+    positions: Vec<u32>,
+}
+
+impl PendingPosting {
+    fn matches(&self, row: &TextPostingRow) -> bool {
+        self.term == row.term && self.ordinal == row.ordinal && self.field == row.field
+    }
+}
+
+/// Coalesces occurrence-sort rows into the canonical bounded posting parts
+/// used by authoritative components. At most one output part is resident.
+struct CanonicalPostingWriter {
+    target_block_bytes: usize,
+    writer: TextComponentWriter,
+    pending: Option<PendingPosting>,
+}
+
+impl CanonicalPostingWriter {
+    fn new(
+        kind: IndexKind,
+        component_tag: u8,
+        output_level: u8,
+        target_block_bytes: usize,
+    ) -> Self {
+        // `TextComponentWriter` applies the same floor. Canonical part sizing
+        // must use the writer's effective block size rather than rejecting a
+        // deliberately tiny test/configured target that the writer can safely
+        // raise to its format minimum.
+        let target_block_bytes = target_block_bytes.max(1024);
+        Self {
+            target_block_bytes,
+            writer: TextComponentWriter::new(kind, component_tag, output_level, target_block_bytes),
+            pending: None,
+        }
+    }
+
+    async fn push_occurrence<S: IndexBlockSink>(
+        &mut self,
+        row: TextPostingRow,
+        sink: &mut S,
+    ) -> Result<(), IndexError> {
+        if row.positions.is_empty() || row.positions.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(IndexError::InvalidFormat("external text posting positions"));
+        }
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| !pending.matches(&row))
+        {
+            self.finish_pending(sink).await?;
+        }
+        if self.pending.is_none() {
+            self.pending = Some(PendingPosting {
+                maximum_positions: posting_positions_per_row(
+                    &row.term,
+                    &row.field,
+                    self.target_block_bytes,
+                )?,
+                term: row.term.clone(),
+                ordinal: row.ordinal,
+                field: row.field.clone(),
+                field_length: row.field_length,
+                next_part: 0,
+                last_position: None,
+                positions: Vec::new(),
+            });
+        }
+        let field_length = row.field_length;
+        for position in row.positions {
+            let flush = {
+                let pending = self.pending.as_mut().expect("posting group was opened");
+                if pending.field_length != field_length
+                    || pending
+                        .last_position
+                        .is_some_and(|previous| previous >= position)
+                {
+                    return Err(IndexError::InvalidFormat("external text posting order"));
+                }
+                pending.last_position = Some(position);
+                pending.positions.push(position);
+                pending.positions.len() == pending.maximum_positions
+            };
+            if flush {
+                self.flush_part(sink).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn flush_part<S: IndexBlockSink>(&mut self, sink: &mut S) -> Result<(), IndexError> {
+        let mut pending = self.pending.take().expect("posting group is present");
+        if pending.positions.is_empty() {
+            self.pending = Some(pending);
+            return Ok(());
+        }
+        let row = TextPostingRow {
+            term: pending.term.clone(),
+            ordinal: pending.ordinal,
+            field: pending.field.clone(),
+            field_length: pending.field_length,
+            part: pending.next_part,
+            positions: std::mem::take(&mut pending.positions),
+        };
+        pending.next_part = pending
+            .next_part
+            .checked_add(1)
+            .ok_or(IndexError::OffsetOverflow)?;
+        self.writer.push_row(row, sink).await?;
+        self.pending = Some(pending);
+        Ok(())
+    }
+
+    async fn finish_pending<S: IndexBlockSink>(&mut self, sink: &mut S) -> Result<(), IndexError> {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| !pending.positions.is_empty())
+        {
+            self.flush_part(sink).await?;
+        }
+        self.pending = None;
+        Ok(())
+    }
+
+    async fn finish<S: IndexBlockSink>(
+        mut self,
+        sink: &mut S,
+    ) -> Result<ComponentTree, IndexError> {
+        self.finish_pending(sink).await?;
+        self.writer.finish(sink).await
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn merge_text_component_trees_once<S, E>(
     kind: IndexKind,
@@ -300,6 +842,7 @@ where
     E: CompactionExecutor,
 {
     validate_parallel_compaction_fan_in(trees.len())?;
+    let merged_multiple_inputs = trees.len() > 1;
     let directory = sink.clone();
     let mut cursors = trees
         .into_iter()
@@ -325,7 +868,11 @@ where
         current[selected] = cursors[selected].next_parallel(executor, progress).await?;
         writer.push(row, sink).await?;
     }
-    writer.finish(sink).await
+    let output = writer.finish(sink).await?;
+    if merged_multiple_inputs {
+        progress.record_sort_merge_pass();
+    }
+    Ok(output)
 }
 
 enum SpillTextWriter {
@@ -472,6 +1019,7 @@ pub(crate) struct SpillTextCursor<'a, D> {
     rows: std::vec::IntoIter<TextPostingRow>,
     order: TextSortOrder,
     minimum_source_ordinal: Option<u64>,
+    range: Option<KeyRange>,
 }
 
 impl<'a, D: IndexDirectoryRead> SpillTextCursor<'a, D> {
@@ -482,6 +1030,7 @@ impl<'a, D: IndexDirectoryRead> SpillTextCursor<'a, D> {
             rows: Vec::new().into_iter(),
             order,
             minimum_source_ordinal: None,
+            range: None,
         }
     }
 
@@ -499,6 +1048,18 @@ impl<'a, D: IndexDirectoryRead> SpillTextCursor<'a, D> {
             rows: Vec::new().into_iter(),
             order: TextSortOrder::SourceOrdinal,
             minimum_source_ordinal: Some(ordinal),
+            range: None,
+        }
+    }
+
+    pub(crate) fn final_in_range(directory: &'a D, tree: ComponentTree, range: KeyRange) -> Self {
+        Self {
+            directory,
+            leaves: LeafCursor::in_range(directory, tree.root, range.clone()),
+            rows: Vec::new().into_iter(),
+            order: TextSortOrder::FinalPosting,
+            minimum_source_ordinal: None,
+            range: Some(range),
         }
     }
 
@@ -508,6 +1069,10 @@ impl<'a, D: IndexDirectoryRead> SpillTextCursor<'a, D> {
                 if self
                     .minimum_source_ordinal
                     .is_none_or(|minimum| row.ordinal >= minimum)
+                    && self
+                        .range
+                        .as_ref()
+                        .is_none_or(|range| range.contains(row.term.as_bytes()))
                 {
                     return Ok(Some(row));
                 }
@@ -539,6 +1104,10 @@ impl<'a, D: IndexDirectoryRead> SpillTextCursor<'a, D> {
                 if self
                     .minimum_source_ordinal
                     .is_none_or(|minimum| row.ordinal >= minimum)
+                    && self
+                        .range
+                        .as_ref()
+                        .is_none_or(|range| range.contains(row.term.as_bytes()))
                 {
                     return Ok(Some(row));
                 }
@@ -684,6 +1253,7 @@ mod tests {
 
         for order in [TextSortOrder::SourceOrdinal, TextSortOrder::FinalPosting] {
             let sink = MemoryBlockSink::default();
+            let progress = CompactionProgress::default();
             let mut sorter = TextExternalSorter::new(
                 IndexKind::FullText,
                 super::super::FULL_TEXT_POSTINGS_TAG,
@@ -693,7 +1263,7 @@ mod tests {
                 order,
                 sink.clone(),
                 TokioExecutor::default(),
-                CompactionProgress::default(),
+                progress.clone(),
             )
             .unwrap();
             for row in rows.iter().cloned() {
@@ -712,6 +1282,10 @@ mod tests {
                     .windows(2)
                     .all(|pair| compare_rows(order, &pair[0], &pair[1]).is_lt())
             );
+            let progress = progress.snapshot();
+            assert!(progress.sort_chunks > 1);
+            assert!(progress.sort_merge_passes > 0);
+            assert!(progress.sort_peak_workspace_bytes > 0);
             let mut expected = rows.clone();
             expected.sort_unstable_by(|left, right| compare_rows(order, left, right));
             assert_eq!(sorted, expected);
@@ -771,5 +1345,67 @@ mod tests {
         expected
             .sort_unstable_by(|left, right| compare_rows(TextSortOrder::FinalPosting, left, right));
         assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn final_multi_tree_merge_is_term_striped() {
+        let mut sink = MemoryBlockSink::default();
+        let mut trees = Vec::new();
+        for tree_index in 0..4_u64 {
+            let rows = (0..64_u64)
+                .map(|index| TextPostingRow {
+                    term: format!("term-{index:03}"),
+                    ordinal: tree_index * 64 + index,
+                    field: "body".into(),
+                    field_length: 1,
+                    part: 0,
+                    positions: vec![0],
+                })
+                .collect::<Vec<_>>();
+            trees.push(
+                write_sorted_rows(
+                    IndexKind::FullText,
+                    super::super::FULL_TEXT_POSTINGS_TAG,
+                    1,
+                    1024,
+                    TextSortOrder::FinalPosting,
+                    rows,
+                    &mut sink,
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        let progress = CompactionProgress::default();
+        let tree = merge_final_text_component_trees_parallel(
+            IndexKind::FullText,
+            super::super::FULL_TEXT_POSTINGS_TAG,
+            1,
+            1024,
+            trees,
+            &mut sink,
+            4,
+            TokioExecutor::default(),
+            progress.clone(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut cursor = SpillTextCursor::new(&sink, tree, TextSortOrder::FinalPosting);
+        let mut previous = None;
+        let mut count = 0;
+        while let Some(row) = cursor.next().await.unwrap() {
+            assert!(
+                previous
+                    .as_ref()
+                    .is_none_or(|previous: &TextPostingRow| { final_cmp(previous, &row).is_lt() })
+            );
+            previous = Some(row);
+            count += 1;
+        }
+        assert_eq!(count, 256);
+        let snapshot = progress.snapshot();
+        assert!(snapshot.effective_lanes > 1);
+        assert_eq!(snapshot.ranges_completed, snapshot.ranges_total);
     }
 }

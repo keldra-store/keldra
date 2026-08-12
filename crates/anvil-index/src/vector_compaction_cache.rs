@@ -232,6 +232,8 @@ mod tests {
             element_count: 1,
             encoded_bytes: 1,
             hash: [value; 32],
+            pack_id: 0,
+            pack_offset: 0,
         }
     }
 }

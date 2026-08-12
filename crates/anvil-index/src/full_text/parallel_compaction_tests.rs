@@ -10,7 +10,7 @@ struct CountingOutputSink {
 }
 
 impl IndexBlockSink for CountingOutputSink {
-    async fn emit(&mut self, block: GeneratedBlock) -> Result<(), IndexError> {
+    async fn emit(&mut self, block: GeneratedBlock) -> Result<BlockDescriptor, IndexError> {
         self.inner.emit(block).await
     }
 }
@@ -114,11 +114,20 @@ async fn parallel_ranges_are_deterministic_and_query_equivalent() {
     let (new_sink, new_run) = build(new_mutations, 0, 96).await;
     let runs = [directory(&new_sink, new_run), old];
 
-    let mut serial_sink = MemoryBlockSink::default();
-    let serial = FullTextEngine::merge_with_target(&runs, 1, 96, &mut serial_sink)
-        .await
-        .unwrap();
-    let expected_mutations = serial.descriptor().mutation_count;
+    let one_lane_progress = crate::compaction::CompactionProgress::default();
+    let mut one_lane_sink = MemoryBlockSink::default();
+    let one_lane = FullTextEngine::merge_parallel_with_target(
+        &runs,
+        1,
+        96,
+        &mut one_lane_sink,
+        crate::compaction::CompactionParallelism::serial(),
+        one_lane_progress.clone(),
+        TokioExecutor::default(),
+    )
+    .await
+    .unwrap();
+    let expected_mutations = one_lane.descriptor().mutation_count;
     let progress = crate::compaction::CompactionProgress::default();
     let mut parallel_sink = MemoryBlockSink::default();
     let parallel = FullTextEngine::merge_parallel_with_target(
@@ -158,22 +167,22 @@ async fn parallel_ranges_are_deterministic_and_query_equivalent() {
     assert_eq!(parallel_sink.len(), repeated_sink.len());
     assert_eq!(
         parallel.descriptor().mutation_count,
-        serial.descriptor().mutation_count
+        one_lane.descriptor().mutation_count
     );
     assert_eq!(
         parallel.descriptor().live_document_count,
-        serial.descriptor().live_document_count
+        one_lane.descriptor().live_document_count
     );
     assert_eq!(
         parallel.descriptor().minimum_version,
-        serial.descriptor().minimum_version
+        one_lane.descriptor().minimum_version
     );
     assert_eq!(
         parallel.descriptor().maximum_version,
-        serial.descriptor().maximum_version
+        one_lane.descriptor().maximum_version
     );
 
-    let serial = [directory(&serial_sink, serial)];
+    let one_lane = [directory(&one_lane_sink, one_lane)];
     let parallel = [directory(&parallel_sink, parallel)];
     let fields = Vec::new();
     for text in ["shared", "alpha", "zulu", "updated0047"] {
@@ -188,13 +197,15 @@ async fn parallel_ranges_are_deterministic_and_query_equivalent() {
             FullTextEngine::query(&parallel, query.clone())
                 .await
                 .unwrap(),
-            FullTextEngine::query(&serial, query).await.unwrap(),
+            FullTextEngine::query(&one_lane, query).await.unwrap(),
         );
     }
+    assert_eq!(one_lane_progress.snapshot().effective_lanes, 1);
     let snapshot = progress.snapshot();
-    // Four count stripes, four common path/document writers, and four bounded
-    // posting rebuild lanes ran through the shared executor.
+    // Four common path/document writers, four bounded posting-selection
+    // lanes, and four final posting-key merge lanes shared the executor.
     assert_eq!(snapshot.ranges_total, 12);
+    assert!(snapshot.effective_lanes > 1);
     assert_eq!(snapshot.ranges_completed, snapshot.ranges_total);
     assert_eq!(snapshot.active_lanes, 0);
     assert_eq!(snapshot.waiting_lanes, 0);

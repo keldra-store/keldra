@@ -1,7 +1,7 @@
 //! Hybrid full-text and exact-vector runs with one shared document table.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -15,8 +15,8 @@ use crate::full_text::{
 use crate::run::{ComponentTree, LeafCursor, RunStatistics, RunView, open_views, seal_run_root};
 use crate::segment::{
     DEFAULT_COMPONENT_BLOCK_BYTES, DocumentComponentWriter, DocumentRecord, DocumentState,
-    MutationBuffer, PATH_CHANGES_TAG, PathChange, PathComponentWriter, PathRunCursor,
-    document_by_ordinal, is_latest_live,
+    LatestLiveProbe, MutationBuffer, PATH_CHANGES_TAG, PathChange, PathComponentWriter,
+    PathRunCursor, document_by_ordinal,
 };
 use crate::vector::{
     VectorComponentWriter, VectorDefinition, VectorRow, merge_vector_components_parallel,
@@ -308,6 +308,7 @@ impl HybridEngine {
         }
         let selected_fields = Arc::new(query.fields.iter().cloned().collect::<BTreeSet<_>>());
         let views = open_views(runs, IndexKind::Hybrid).await?;
+        let mut live_probe = LatestLiveProbe::new();
         let mut maximum_text = 0.0f32;
         let mut vector_range = None::<(f32, f32)>;
         for (run, view) in runs.iter().zip(&views) {
@@ -327,7 +328,7 @@ impl HybridEngine {
             .await?;
             while let Some(raw) = cursor.next().await? {
                 let document = document_by_ordinal(run, view, raw.ordinal).await?;
-                if !is_latest_live(runs, &views, &document).await? {
+                if !live_probe.is_latest_live(runs, &views, &document).await? {
                     continue;
                 }
                 if let Some(score) = raw.text {
@@ -359,6 +360,7 @@ impl HybridEngine {
             ));
         }
         let mut hits = Vec::with_capacity(query.limit.min(128));
+        let mut hit_chunk = Vec::with_capacity(128);
         for (run, view) in runs.iter().zip(&views) {
             if !query.vector.is_empty() && view.component_optional(HYBRID_VECTOR_TAG).is_none() {
                 continue;
@@ -381,7 +383,7 @@ impl HybridEngine {
                     continue;
                 }
                 let document = document_by_ordinal(run, view, raw.ordinal).await?;
-                if !is_latest_live(runs, &views, &document).await? {
+                if !live_probe.is_latest_live(runs, &views, &document).await? {
                     continue;
                 }
                 let text_score = raw.text.map(|score| {
@@ -408,10 +410,27 @@ impl HybridEngine {
                 {
                     continue;
                 }
-                insert_bounded(&mut hits, hit, query.limit);
+                hit_chunk.push(hit);
+                if hit_chunk.len() == 128 {
+                    hits = run
+                        .run_query_cpu({
+                            let retained = std::mem::take(&mut hits);
+                            let candidates = std::mem::take(&mut hit_chunk);
+                            let limit = query.limit;
+                            move || Ok(merge_hybrid_hits(retained, candidates, limit))
+                        })
+                        .await?;
+                }
             }
         }
-        sort_hits(&mut hits);
+        if !hit_chunk.is_empty() {
+            hits = runs[0]
+                .run_query_cpu({
+                    let limit = query.limit;
+                    move || Ok(merge_hybrid_hits(hits, hit_chunk, limit))
+                })
+                .await?;
+        }
         Ok(hits)
     }
 
@@ -607,33 +626,55 @@ fn collect_postings(
 struct VectorRowCursor<'a, D> {
     directory: &'a D,
     definition: &'a VectorDefinition,
+    query_vector: &'a [f32],
     leaves: LeafCursor<'a, D>,
-    rows: Vec<VectorRow>,
-    next_row: usize,
+    rows: VecDeque<ScoredVectorRow>,
+}
+
+struct ScoredVectorRow {
+    row: VectorRow,
+    score: f32,
 }
 
 impl<'a, D: IndexDirectoryRead> VectorRowCursor<'a, D> {
-    fn new(directory: &'a D, definition: &'a VectorDefinition, root: BlockDescriptor) -> Self {
+    fn new(
+        directory: &'a D,
+        definition: &'a VectorDefinition,
+        query_vector: &'a [f32],
+        root: BlockDescriptor,
+    ) -> Self {
         Self {
             directory,
             definition,
+            query_vector,
             leaves: LeafCursor::new(directory, root),
-            rows: Vec::new(),
-            next_row: 0,
+            rows: VecDeque::new(),
         }
     }
 
-    async fn next(&mut self) -> Result<Option<VectorRow>, IndexError> {
+    async fn next(&mut self) -> Result<Option<ScoredVectorRow>, IndexError> {
         loop {
-            if let Some(row) = self.rows.get(self.next_row).cloned() {
-                self.next_row += 1;
+            if let Some(row) = self.rows.pop_front() {
                 return Ok(Some(row));
             }
             let Some(descriptor) = self.leaves.next().await? else {
                 return Ok(None);
             };
-            self.rows = read_vector_block(self.directory, &descriptor, self.definition).await?;
-            self.next_row = 0;
+            let rows = read_vector_block(self.directory, &descriptor, self.definition).await?;
+            let query_vector = self.query_vector.to_vec();
+            let metric = self.definition.metric;
+            self.rows = self
+                .directory
+                .run_query_cpu(move || {
+                    Ok(rows
+                        .into_iter()
+                        .map(|row| ScoredVectorRow {
+                            score: similarity(&query_vector, &row.values, metric),
+                            row,
+                        })
+                        .collect())
+                })
+                .await?;
         }
     }
 }
@@ -648,8 +689,6 @@ struct HybridScoreCursor<'a, D> {
     vectors: Option<VectorRowCursor<'a, D>>,
     text: Option<RunCandidateCursor<'a, D>>,
     current_text: Option<Candidate>,
-    query_vector: &'a [f32],
-    definition: &'a HybridDefinition,
 }
 
 impl<'a, D: IndexDirectoryRead> HybridScoreCursor<'a, D> {
@@ -670,6 +709,7 @@ impl<'a, D: IndexDirectoryRead> HybridScoreCursor<'a, D> {
             Some(VectorRowCursor::new(
                 run,
                 &definition.vector,
+                query_vector,
                 view.component(HYBRID_VECTOR_TAG)?.clone(),
             ))
         };
@@ -709,8 +749,6 @@ impl<'a, D: IndexDirectoryRead> HybridScoreCursor<'a, D> {
             vectors,
             text,
             current_text,
-            query_vector,
-            definition,
         })
     }
 
@@ -736,7 +774,7 @@ impl<'a, D: IndexDirectoryRead> HybridScoreCursor<'a, D> {
         while self
             .current_text
             .as_ref()
-            .is_some_and(|text| text.ordinal < vector.ordinal)
+            .is_some_and(|text| text.ordinal < vector.row.ordinal)
         {
             self.current_text = match self.text.as_mut() {
                 Some(cursor) => cursor.next().await?,
@@ -746,7 +784,7 @@ impl<'a, D: IndexDirectoryRead> HybridScoreCursor<'a, D> {
         let text = if self
             .current_text
             .as_ref()
-            .is_some_and(|text| text.ordinal == vector.ordinal)
+            .is_some_and(|text| text.ordinal == vector.row.ordinal)
         {
             let score = self.current_text.take().unwrap().score;
             self.current_text = match self.text.as_mut() {
@@ -757,17 +795,10 @@ impl<'a, D: IndexDirectoryRead> HybridScoreCursor<'a, D> {
         } else {
             None
         };
-        let vector_score = (!self.query_vector.is_empty()).then(|| {
-            similarity(
-                self.query_vector,
-                &vector.values,
-                self.definition.vector.metric,
-            )
-        });
         Ok(Some(RawHybridScore {
-            ordinal: vector.ordinal,
+            ordinal: vector.row.ordinal,
             text,
-            vector: vector_score,
+            vector: Some(vector.score),
         }))
     }
 }
@@ -932,6 +963,18 @@ fn insert_bounded(hits: &mut Vec<HybridHit>, hit: HybridHit, limit: usize) {
     hits.push(hit);
     sort_hits(hits);
     hits.truncate(limit);
+}
+
+fn merge_hybrid_hits(
+    mut retained: Vec<HybridHit>,
+    candidates: Vec<HybridHit>,
+    limit: usize,
+) -> Vec<HybridHit> {
+    for hit in candidates {
+        insert_bounded(&mut retained, hit, limit);
+    }
+    sort_hits(&mut retained);
+    retained
 }
 
 fn compare_hit_to_cursor(hit: &HybridHit, cursor: &HybridQueryCursor) -> Ordering {
@@ -1206,10 +1249,20 @@ mod tests {
         let (new_sink, new_run) = build(&definition, new_mutations, 0, 128, 1024 * 1024).await;
         let runs = [directory(&new_sink, new_run), old];
 
-        let mut serial_sink = MemoryBlockSink::default();
-        let serial = HybridEngine::merge_with_target(&runs, &definition, 1, 128, &mut serial_sink)
-            .await
-            .unwrap();
+        let one_lane_progress = CompactionProgress::default();
+        let mut one_lane_sink = MemoryBlockSink::default();
+        let one_lane = HybridEngine::merge_parallel_with_target(
+            &runs,
+            &definition,
+            1,
+            128,
+            &mut one_lane_sink,
+            CompactionParallelism::serial(),
+            one_lane_progress.clone(),
+            TokioExecutor::default(),
+        )
+        .await
+        .unwrap();
         let progress = CompactionProgress::default();
         let mut parallel_sink = MemoryBlockSink::default();
         let parallel = HybridEngine::merge_parallel_with_target(
@@ -1243,22 +1296,22 @@ mod tests {
         assert_eq!(parallel_sink.len(), repeated_sink.len());
         assert_eq!(
             parallel.descriptor().mutation_count,
-            serial.descriptor().mutation_count
+            one_lane.descriptor().mutation_count
         );
         assert_eq!(
             parallel.descriptor().live_document_count,
-            serial.descriptor().live_document_count
+            one_lane.descriptor().live_document_count
         );
         assert_eq!(
             parallel.descriptor().minimum_version,
-            serial.descriptor().minimum_version
+            one_lane.descriptor().minimum_version
         );
         assert_eq!(
             parallel.descriptor().maximum_version,
-            serial.descriptor().maximum_version
+            one_lane.descriptor().maximum_version
         );
         let parallel_mutation_count = parallel.descriptor().mutation_count;
-        let serial = [directory(&serial_sink, serial)];
+        let one_lane = [directory(&one_lane_sink, one_lane)];
         let parallel_directory = [directory(&parallel_sink, parallel)];
         let fields = Vec::new();
         for (text, vector) in [
@@ -1277,11 +1330,12 @@ mod tests {
                 HybridEngine::query(&parallel_directory, &definition, query.clone())
                     .await
                     .unwrap(),
-                HybridEngine::query(&serial, &definition, query)
+                HybridEngine::query(&one_lane, &definition, query)
                     .await
                     .unwrap(),
             );
         }
+        assert_eq!(one_lane_progress.snapshot().effective_lanes, 1);
         let snapshot = progress.snapshot();
         assert!(snapshot.effective_lanes > 1 && snapshot.effective_lanes <= 4);
         assert_eq!(snapshot.ranges_completed, snapshot.ranges_total);
