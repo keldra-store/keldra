@@ -279,8 +279,17 @@ async fn process_snapshot_frame(
     )
     .map_err(|_| Status::resource_exhausted("projection lane limit exceeds platform"))?;
     let max_parallel = dependencies.cpu.workers().min(configured_lanes).max(1);
-    let projection_budget = plan.max_source_projection_bytes as u64;
-    let mut batch = ProjectionBatch::new(projection_budget, max_parallel);
+    // A bulk push may synchronously start an external-sort/pack CPU phase. Its
+    // fixed workspace must coexist with the bulk builder's retained rows and
+    // every projected result that has not been pushed yet.
+    let projection_budget = plan
+        .max_source_projection_bytes
+        .checked_sub(FIXED_INDEX_SEAL_WORKSPACE_BYTES)
+        .filter(|budget| *budget > 0)
+        .ok_or_else(|| {
+            Status::resource_exhausted("index kind budget leaves no snapshot projection workspace")
+        })? as u64;
+    let mut batch = ProjectionBatch::new(projection_budget, projection_budget, max_parallel);
     for head in frame {
         if head.tenant_id != definition.tenant_id
             || head.bucket_id != definition.bucket_id
@@ -305,10 +314,9 @@ async fn process_snapshot_frame(
         if let Some(pending) = batch.try_push(prepared)? {
             let full = std::mem::replace(
                 &mut batch,
-                ProjectionBatch::new(projection_budget, max_parallel),
+                ProjectionBatch::new(projection_budget, projection_budget, max_parallel),
             );
-            project_snapshot_batch(specification, plan, full, builder, candidate, dependencies)
-                .await?;
+            project_snapshot_batch(specification, full, builder, candidate, dependencies).await?;
             if batch.try_push(pending)?.is_some() {
                 return Err(Status::internal(
                     "projection source was rejected by an empty batch after admission",
@@ -317,15 +325,13 @@ async fn process_snapshot_frame(
         }
     }
     if !batch.is_empty() {
-        project_snapshot_batch(specification, plan, batch, builder, candidate, dependencies)
-            .await?;
+        project_snapshot_batch(specification, batch, builder, candidate, dependencies).await?;
     }
     Ok(())
 }
 
 async fn project_snapshot_batch(
     specification: &IndexSpecification,
-    plan: SegmentMemoryPlan,
     batch: ProjectionBatch,
     builder: &mut EngineBulkBuilder<IndexBlockStagingSink, IndexCompactionExecutor>,
     candidate: &mut CandidateGeneration,
@@ -377,8 +383,7 @@ async fn project_snapshot_batch(
             gauge.anvil_index_projection_configured_lanes = configured_lanes,
             gauge.anvil_index_projection_effective_lanes = effective_lanes as u64,
             gauge.anvil_index_projection_lane_budget_bytes = lane_limit as u64,
-            gauge.anvil_index_projection_wave_budget_bytes =
-                plan.max_source_projection_bytes as u64,
+            gauge.anvil_index_projection_wave_budget_bytes = batch.budget,
             monotonic_counter.anvil_index_projection_waves_total = 1_u64,
             monotonic_counter.anvil_index_projection_inputs_total = source_count,
             monotonic_counter.anvil_index_projection_admitted_bytes_total = admitted_bytes,
@@ -502,16 +507,18 @@ pub(super) struct ProjectionBatch {
     pub(super) resident_bytes: u64,
     max_projection_bytes: u64,
     budget: u64,
+    output_budget: u64,
     max_lanes: usize,
 }
 
 impl ProjectionBatch {
-    pub(super) fn new(budget: u64, max_lanes: usize) -> Self {
+    pub(super) fn new(budget: u64, output_budget: u64, max_lanes: usize) -> Self {
         Self {
             sources: Vec::new(),
             resident_bytes: 0,
             max_projection_bytes: 0,
             budget,
+            output_budget,
             max_lanes: max_lanes.max(1),
         }
     }
@@ -538,17 +545,26 @@ impl ProjectionBatch {
             .map_err(|_| Status::resource_exhausted("projection lane budget exceeds platform"))
     }
 
-    pub(super) fn try_push(
-        &mut self,
-        source: PreparedProjection,
-    ) -> Result<Option<PreparedProjection>, Status> {
+    pub(super) fn can_accept(&self, source: &PreparedProjection) -> Result<bool, Status> {
         let count = self.sources.len().saturating_add(1);
         let resident = self
             .resident_bytes
             .checked_add(source.resident_bytes)
             .ok_or_else(|| Status::resource_exhausted("projection batch reserve overflow"))?;
         let maximum = self.max_projection_bytes.max(source.projection_bytes);
-        if self.layout(count, resident, maximum).is_none() {
+        Ok(self.layout(count, resident, maximum).is_some())
+    }
+
+    pub(super) fn try_push(
+        &mut self,
+        source: PreparedProjection,
+    ) -> Result<Option<PreparedProjection>, Status> {
+        let resident = self
+            .resident_bytes
+            .checked_add(source.resident_bytes)
+            .ok_or_else(|| Status::resource_exhausted("projection batch reserve overflow"))?;
+        let maximum = self.max_projection_bytes.max(source.projection_bytes);
+        if !self.can_accept(&source)? {
             if self.sources.is_empty() {
                 return Err(Status::resource_exhausted(format!(
                     "one index source projection cannot fit the {} byte batch budget",
@@ -568,15 +584,12 @@ impl ProjectionBatch {
             return None;
         }
         let lanes = count.min(self.max_lanes).max(1);
-        // A lane can have one result buffered while it computes its next one.
-        // When every lane owns one source only, no second result can coexist.
-        let output_slots = if count <= lanes {
-            count
-        } else {
-            lanes.checked_mul(2)?
-        };
-        let output_slots = u64::try_from(output_slots).ok()?;
-        let lane_limit = self.budget.checked_sub(resident)? / output_slots;
+        // Projection completes before any async builder push. All results can
+        // therefore coexist, so charge one bounded output for every source.
+        let output_slots = u64::try_from(count).ok()?;
+        let memory_limit = self.budget.checked_sub(resident)? / output_slots;
+        let output_limit = self.output_budget / output_slots;
+        let lane_limit = memory_limit.min(output_limit);
         (lane_limit >= maximum && lane_limit > 0).then_some((lanes, lane_limit))
     }
 }
@@ -586,7 +599,63 @@ pub(super) struct FetchedProjection {
     pub(super) payload: Option<ClusterReadPayload>,
 }
 
-type ProjectedSource = Result<(EngineMutation, IndexBuildDiagnostics), IndexError>;
+pub(super) type ProjectedSource = Result<(EngineMutation, IndexBuildDiagnostics), IndexError>;
+
+pub(super) async fn execute_projection_batch(
+    specification: &IndexSpecification,
+    sources: Vec<PreparedProjection>,
+    effective_lanes: usize,
+    lane_limit: usize,
+    dependencies: &IndexBuilderDependencies,
+) -> Result<(Vec<ProjectedSource>, ProjectionExecution), Status> {
+    let fetched = fetch_projection_sources(sources, effective_lanes, dependencies).await?;
+    let lanes = partition_projection_lanes(fetched, effective_lanes);
+    let cpu = dependencies.cpu.clone();
+    let specification = specification.clone();
+    let queued = Instant::now();
+    cpu.install(move || {
+        let cpu_started = Instant::now();
+        let queue_seconds = cpu_started.saturating_duration_since(queued).as_secs_f64();
+        let mut projected = lanes
+            .into_par_iter()
+            .map(|lane| {
+                lane.into_iter()
+                    .map(|(position, mut fetched)| {
+                        let started = Instant::now();
+                        let reader = fetched
+                            .payload
+                            .as_mut()
+                            .map(|payload| payload as &mut dyn std::io::Read);
+                        let projected =
+                            project_mutation(&specification, fetched.source, reader, lane_limit);
+                        (position, projected, started.elapsed().as_secs_f64())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        projected.sort_unstable_by_key(|(position, _, _)| *position);
+        let cpu_seconds = projected
+            .iter()
+            .map(|(_, _, elapsed)| *elapsed)
+            .sum::<f64>();
+        let projected = projected
+            .into_iter()
+            .map(|(_, projected, _)| projected)
+            .collect();
+        (
+            projected,
+            ProjectionExecution {
+                queue_seconds,
+                cpu_seconds,
+            },
+        )
+    })
+    .await
+    .map_err(cpu_status)
+}
 
 async fn project_snapshot_batch_inner(
     specification: &IndexSpecification,
@@ -597,103 +666,30 @@ async fn project_snapshot_batch_inner(
     candidate: &mut CandidateGeneration,
     dependencies: &IndexBuilderDependencies,
 ) -> Result<ProjectionWaveTotals, Status> {
-    let fetched = fetch_projection_sources(sources, effective_lanes, dependencies).await?;
-    let source_count = fetched.len();
-    let lanes = partition_projection_lanes(fetched, effective_lanes);
-    let mut senders = Vec::with_capacity(lanes.len());
-    let mut receivers = Vec::with_capacity(lanes.len());
-    for _ in 0..lanes.len() {
-        let (sender, receiver) = tokio::sync::mpsc::channel::<ProjectedSource>(1);
-        senders.push(sender);
-        receivers.push(receiver);
-    }
-    let cpu = dependencies.cpu.clone();
-    let specification = specification.clone();
-    let queued = Instant::now();
-    let cpu_task = tokio::spawn(async move {
-        cpu.install(move || {
-            let cpu_started = Instant::now();
-            let queue_seconds = cpu_started.saturating_duration_since(queued).as_secs_f64();
-            let lane_cpu_seconds = lanes
-                .into_par_iter()
-                .zip(senders.into_par_iter())
-                .map(|(lane, sender)| {
-                    lane.into_iter().fold(0.0, |cpu_seconds, mut fetched| {
-                        let started = Instant::now();
-                        let reader = fetched
-                            .payload
-                            .as_mut()
-                            .map(|payload| payload as &mut dyn std::io::Read);
-                        let projected =
-                            project_mutation(&specification, fetched.source, reader, lane_limit);
-                        let cpu_seconds = cpu_seconds + started.elapsed().as_secs_f64();
-                        let failed = projected.is_err();
-                        if sender.blocking_send(projected).is_err() || failed {
-                            return cpu_seconds;
-                        }
-                        cpu_seconds
-                    })
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .sum();
-            ProjectionExecution {
-                queue_seconds,
-                cpu_seconds: lane_cpu_seconds,
-            }
-        })
-        .await
-        .map_err(cpu_status)
-    });
+    let (projected, timing) = execute_projection_batch(
+        specification,
+        sources,
+        effective_lanes,
+        lane_limit,
+        dependencies,
+    )
+    .await?;
 
     let mut totals = ProjectionWaveTotals::default();
-    let mut failure = None;
-    for position in 0..source_count {
-        let projected = match receive_ordered_lane_item(&mut receivers, position).await {
-            Some(projected) => projected,
-            None => {
-                failure = Some(Status::internal("projection lane omitted a source"));
-                break;
-            }
-        };
+    for projected in projected {
         match projected {
             Ok((mutation, diagnostics)) => {
                 totals.accepted = totals.accepted.saturating_add(diagnostics.accepted_objects);
                 totals.skipped = totals.skipped.saturating_add(diagnostics.skipped_objects);
                 candidate.diagnostics.add(diagnostics);
-                if let Err(error) = builder.push(mutation).await {
-                    failure = Some(index_status(error));
-                    break;
-                }
+                builder.push(mutation).await.map_err(index_status)?;
             }
-            Err(error) => {
-                failure = Some(index_status(error));
-                break;
-            }
+            Err(error) => return Err(index_status(error)),
         }
-    }
-    drop(receivers);
-    let timing = cpu_task
-        .await
-        .map_err(|error| Status::internal(format!("projection batch task failed: {error}")))??;
-    if let Some(error) = failure {
-        return Err(error);
     }
     totals.queue_seconds = timing.queue_seconds;
     totals.cpu_seconds = timing.cpu_seconds;
     Ok(totals)
-}
-
-pub(super) async fn receive_ordered_lane_item<T>(
-    receivers: &mut [tokio::sync::mpsc::Receiver<T>],
-    position: usize,
-) -> Option<T> {
-    let lane_count = receivers.len();
-    if lane_count == 0 {
-        return None;
-    }
-    let lane = position % lane_count;
-    receivers[lane].recv().await
 }
 
 pub(super) async fn fetch_projection_sources(
@@ -787,11 +783,14 @@ fn fill_projection_fetches(
     Ok(())
 }
 
-pub(super) fn partition_projection_lanes<T>(values: Vec<T>, lane_count: usize) -> Vec<Vec<T>> {
+pub(super) fn partition_projection_lanes<T>(
+    values: Vec<T>,
+    lane_count: usize,
+) -> Vec<Vec<(usize, T)>> {
     let lane_count = lane_count.min(values.len()).max(1);
     let mut lanes = (0..lane_count).map(|_| Vec::new()).collect::<Vec<_>>();
     for (position, value) in values.into_iter().enumerate() {
-        lanes[position % lane_count].push(value);
+        lanes[position % lane_count].push((position, value));
     }
     lanes
 }
@@ -839,14 +838,14 @@ mod tests {
 
     #[test]
     fn projection_batch_is_bounded_by_bytes_not_lane_count() {
-        let mut batch = ProjectionBatch::new(64, 4);
+        let mut batch = ProjectionBatch::new(64, 64, 4);
         for index in 0..12 {
             assert!(batch.try_push(prepared(index, 1, 1)).unwrap().is_none());
         }
 
         assert_eq!(batch.sources.len(), 12);
         assert_eq!(batch.effective_lanes(), 4);
-        assert_eq!(batch.lane_limit().unwrap(), 6);
+        assert_eq!(batch.lane_limit().unwrap(), 4);
 
         let mut rejected = None;
         for index in 12..64 {
@@ -856,8 +855,12 @@ mod tests {
             }
         }
         assert!(rejected.is_some());
-        assert_eq!(batch.sources.len(), 56);
+        assert_eq!(batch.sources.len(), 32);
         assert_eq!(batch.lane_limit().unwrap(), 1);
+        assert!(
+            batch.resident_bytes + batch.sources.len() as u64 * batch.lane_limit().unwrap() as u64
+                <= 64
+        );
     }
 
     #[test]
@@ -867,63 +870,22 @@ mod tests {
         assert_eq!(
             (0..11)
                 .map(|position| lanes[position % lanes.len()][position / lanes.len()])
+                .map(|(position, value)| (position, value))
                 .collect::<Vec<_>>(),
-            (0_u64..11).collect::<Vec<_>>()
+            (0_u64..11)
+                .enumerate()
+                .map(|(position, value)| (position, value))
+                .collect::<Vec<_>>()
         );
     }
 
-    #[tokio::test]
-    async fn projection_lanes_all_progress_while_results_remain_ordered() {
-        let lanes = partition_projection_lanes((0_u64..6).collect(), 3);
-        let (progress_sender, mut progress_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let mut receivers = Vec::new();
-        let mut tasks = Vec::new();
-        for lane in lanes {
-            let (sender, receiver) = tokio::sync::mpsc::channel(1);
-            receivers.push(receiver);
-            let progress_sender = progress_sender.clone();
-            tasks.push(tokio::task::spawn_blocking(move || {
-                for value in lane {
-                    sender.blocking_send(value).unwrap();
-                    progress_sender.send(value).unwrap();
-                }
-            }));
-        }
-        drop(progress_sender);
-
-        let mut first_round = Vec::new();
-        for _ in 0..3 {
-            first_round.push(progress_receiver.recv().await.unwrap());
-        }
-        first_round.sort_unstable();
-        assert_eq!(first_round, [0, 1, 2]);
-
-        let mut delivered = Vec::new();
-        for position in 0..3 {
-            delivered.push(
-                receive_ordered_lane_item(&mut receivers, position)
-                    .await
-                    .unwrap(),
-            );
-        }
-
-        let mut second_round = Vec::new();
-        for _ in 0..3 {
-            second_round.push(progress_receiver.recv().await.unwrap());
-        }
-        second_round.sort_unstable();
-        assert_eq!(second_round, [3, 4, 5]);
-
-        for position in 3..6 {
-            delivered.push(
-                receive_ordered_lane_item(&mut receivers, position)
-                    .await
-                    .unwrap(),
-            );
-        }
-        assert_eq!(delivered, (0_u64..6).collect::<Vec<_>>());
-        for task in tasks {
-            task.await.unwrap();
-        }
+    #[test]
+    fn collected_projection_outputs_have_a_separate_capacity_bound() {
+        let mut batch = ProjectionBatch::new(100, 25, 4);
+        assert!(batch.try_push(prepared(0, 10, 5)).unwrap().is_none());
+        assert!(batch.try_push(prepared(1, 10, 5)).unwrap().is_none());
+        assert!(batch.try_push(prepared(2, 10, 5)).unwrap().is_some());
+        assert_eq!(batch.sources.len(), 2);
+        assert!(batch.sources.len() as u64 * batch.lane_limit().unwrap() as u64 <= 25);
     }
 }
