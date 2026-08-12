@@ -1,4 +1,4 @@
-name: ${ANVIL_QUALIFICATION_PROJECT:-anvil-v070-qualification}
+name: ${ANVIL_QUALIFICATION_PROJECT:-anvil-v080-qualification}
 
 x-anvil-environment: &anvil-environment
   RUST_LOG: ${ANVIL_QUALIFICATION_RUST_LOG:-info,anvil::index_runtime::retention=debug}
@@ -30,9 +30,10 @@ x-anvil-environment: &anvil-environment
   ANVIL_INDEX_TENSOR_COMPACTION_MAX_LANES: "${ANVIL_QUALIFICATION_INDEX_COMPACTION_MAX_LANES:-4}"
   ANVIL_INDEX_RAYON_WORKERS: "${ANVIL_QUALIFICATION_INDEX_RAYON_WORKERS:-4}"
   ANVIL_INDEX_MAX_RETAINED_GENERATIONS: "1"
-  # A bounded qualification-only retention window makes the journal-gap
-  # recovery gate deterministic without changing production defaults.
-  ANVIL_WATCH_MAX_ENTRIES: "${ANVIL_QUALIFICATION_WATCH_MAX_ENTRIES:-64}"
+  # The qualification wrapper temporarily selects a tiny bound only for its
+  # isolated pressure phase, then restarts onto this production default before
+  # the release corpus.
+  ANVIL_SOURCE_JOURNAL_MAX_ENTRIES: "${ANVIL_QUALIFICATION_SOURCE_JOURNAL_MAX_ENTRIES:-1000000}"
 
 x-anvil-service: &anvil-service
   image: ${ANVIL_IMAGE:?ANVIL_IMAGE must name the already-built qualification image}

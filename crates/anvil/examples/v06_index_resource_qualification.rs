@@ -7,11 +7,13 @@
 mod data;
 #[path = "v06_index_resource_qualification/resource.rs"]
 mod resource;
+#[path = "v06_index_resource_qualification/singleton_probe.rs"]
+mod singleton_probe;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::error::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,9 +24,9 @@ use anvil_storage::v1::index_service_client::IndexServiceClient;
 use anvil_storage::v1::index_specification::Specification as SpecificationValue;
 use anvil_storage::v1::{
     BulkOperation, BulkPutRequest, BulkWriteRequest, CreateBucketRequest, CreateIndexRequest,
-    DeleteRequest, Durability, IndexField, IndexPredicate, IndexPredicateOperator, IndexQuery,
-    IndexSpecification, ObjectAddress, ObjectVersioning, QueryIndexRequest, QueryIndexResponse,
-    TypedJsonIndexQuery, TypedJsonIndexSpec,
+    DeleteRequest, Durability, IndexField, IndexFreshness, IndexPredicate, IndexPredicateOperator,
+    IndexQuery, IndexSourceFreshness, IndexSpecification, ObjectAddress, ObjectVersioning,
+    QueryIndexRequest, QueryIndexResponse, TypedJsonIndexQuery, TypedJsonIndexSpec,
 };
 use anvil_storage::{
     BearerToken, RawClient, administration_client, connect_channel, exchange_client_credentials,
@@ -33,7 +35,8 @@ use anvil_storage::{
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use data::{PARTITION_COUNT, RecordFlavor};
 use resource::{Phase, ResourceMonitor, ResourceReport};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tonic::service::interceptor::InterceptedService;
@@ -44,13 +47,15 @@ type IndexClient = IndexServiceClient<InterceptedService<Channel, BearerToken>>;
 const CONTENT_TYPE: &str = "application/json";
 const DEFAULT_RECORDS: u64 = 839_980;
 const DEFAULT_MUTATIONS: u64 = 2_048;
-const DEFAULT_BATCH_SIZE: usize = 256;
+const DEFAULT_BATCH_SIZE: usize = 1_000;
 const DEFAULT_WORKERS: usize = 4;
 const DEFAULT_VERIFICATION_WORKERS: usize = 8;
 const DEFAULT_SEED: u64 = 0x625d_54af_f989_97f3;
 const QUERY_LIMIT: u32 = 1_000;
 const BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const EXACT_VERIFICATION_TIMEOUT: Duration = Duration::from_secs(45 * 60);
+const MIN_RELEASE_OBJECTS_PER_SECOND: f64 = 10_000.0;
+const MAX_RELEASE_FIRST_GENERATION_SECONDS: f64 = 150.0;
 
 #[derive(Clone, Debug)]
 struct Config {
@@ -72,13 +77,33 @@ struct Config {
     configured_compaction_max_lanes: Option<usize>,
     configured_rayon_workers: Option<usize>,
     max_anonymous_growth_bytes: Option<u64>,
+    require_performance_targets: bool,
+    evidence: EvidenceConfig,
     output: Option<PathBuf>,
+    state_output: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+struct EvidenceConfig {
+    source_commit: String,
+    resolved_container_digest: String,
+    native_architecture: String,
+    container_platform: String,
+    topology: String,
+    node_count: usize,
+    hardware_logical_cpus: usize,
+    hardware_memory_bytes: u64,
+    qualification_filesystem_total_bytes: u64,
+    qualification_filesystem_available_bytes_at_start: u64,
+    index_disk_cache_bytes_per_node: u64,
+    index_memory_percent_per_node: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
 struct Timings {
     ingest_seconds: f64,
     initial_build_seconds: f64,
+    first_complete_generation_seconds: f64,
     exact_verification_seconds: f64,
     cold_query_milliseconds: f64,
     warm_query_milliseconds: f64,
@@ -104,10 +129,127 @@ struct QualificationReport {
     max_anonymous_growth_bytes: Option<u64>,
     observed_peak_rss_growth_bytes: Option<u64>,
     observed_peak_anonymous_growth_bytes: Option<u64>,
+    accepted_objects_per_second: f64,
+    source_complete_objects_per_second: f64,
     initial_generation: u64,
     final_generation: u64,
     timings: Timings,
     resources: Option<ResourceReport>,
+    evidence: QualificationEvidence,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct QualificationEvidence {
+    source_commit: String,
+    resolved_container_digest: String,
+    native_architecture: String,
+    container_platform: String,
+    hardware: HardwareEvidence,
+    corpus: CorpusEvidence,
+    topology: TopologyEvidence,
+    durability: DurabilityEvidence,
+    execution: ExecutionEvidence,
+    resource_configuration: ResourceConfigurationEvidence,
+    timer_boundaries: TimerBoundaryEvidence,
+    correctness: CorrectnessEvidence,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HardwareEvidence {
+    logical_cpus: usize,
+    memory_bytes: u64,
+    qualification_filesystem_total_bytes: u64,
+    qualification_filesystem_available_bytes_at_start: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CorpusEvidence {
+    identity: &'static str,
+    initial_corpus_sha256: String,
+    generator_seed_hex: String,
+    records: u64,
+    indexed_fields: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TopologyEvidence {
+    kind: String,
+    node_count: usize,
+    ingress_endpoint_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DurabilityEvidence {
+    initial_writes: &'static str,
+    updates: &'static str,
+    deletes: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ExecutionEvidence {
+    bulk_write_max_operations: usize,
+    ingest_workers: usize,
+    verification_workers: usize,
+    partition_count: u64,
+    query_limit: u32,
+    configured_mutations: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ResourceConfigurationEvidence {
+    index_disk_cache_bytes_per_node: u64,
+    index_memory_percent_per_node: u64,
+    builder_memory_bytes_per_kind_per_node: u64,
+    compaction_max_lanes_per_kind: usize,
+    rayon_workers_per_node: usize,
+    maximum_anonymous_growth_bytes: u64,
+    resource_sample_interval_milliseconds: u64,
+    monitored_target_count: usize,
+    resource_targets_required: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TimerBoundary {
+    starts: &'static str,
+    stops: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TimerBoundaryEvidence {
+    clock: &'static str,
+    ingest_seconds: TimerBoundary,
+    initial_build_seconds: TimerBoundary,
+    first_complete_generation_seconds: TimerBoundary,
+    exact_verification_seconds: TimerBoundary,
+    cold_query_milliseconds: TimerBoundary,
+    warm_query_milliseconds: TimerBoundary,
+    mutation_seconds: TimerBoundary,
+    incremental_build_seconds: TimerBoundary,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CorrectnessEvidence {
+    result: &'static str,
+    source_complete_generation_observed: bool,
+    source_complete_sources_observed: usize,
+    initial_exact_partition_verification: bool,
+    final_exact_partition_verification: bool,
+    update_and_delete_verification: bool,
+    resource_limits_passed: bool,
+    performance_targets_required: bool,
+    performance_targets_passed: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct VerificationState {
+    schema: String,
+    tenant: String,
+    bucket: String,
+    records: u64,
+    final_live_objects: u64,
+    final_generation: u64,
+    final_result_sha256: String,
+    source_count: usize,
 }
 
 #[derive(Debug)]
@@ -125,7 +267,17 @@ enum MutationMode {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
+    if let Some(path) = env::var_os("ANVIL_V08_RESOURCE_SINGLETON_PROBE_STATE_INPUT") {
+        return singleton_probe::run(Path::new(&path)).await;
+    }
+    if let Some(path) = env::var_os("ANVIL_V06_RESOURCE_STATE_INPUT") {
+        return verify_existing_state(Path::new(&path)).await;
+    }
     let config = Config::from_env()?;
+    // Hashing is intentionally outside every measured timer and resource
+    // phase. It identifies the exact deterministic input without changing the
+    // workload whose performance and memory use are under qualification.
+    let initial_corpus_sha256 = initial_corpus_sha256(config.seed, config.records);
     let channels = connect_all(&config.endpoints).await?;
     let mut token = qualification_token(&config, channels[0].clone()).await?;
 
@@ -169,7 +321,7 @@ async fn main() -> Result<()> {
     // one-hour qualification deadline.
     token = qualification_token(&config, channels[0].clone()).await?;
     index = index_client(channels[0].clone(), &token)?;
-    let baseline = wait_for_generation(&mut index, &config.bucket, 0, None).await?;
+    let baseline = wait_for_generation(&mut index, &config.bucket, 0, None, None).await?;
     token = qualification_token(&config, channels[0].clone()).await?;
     let monitor = ResourceMonitor::start(
         &config.resource_pids,
@@ -180,7 +332,11 @@ async fn main() -> Result<()> {
 
     let mut timings = Timings::default();
     set_phase(&monitor, Phase::Ingest);
-    let started = Instant::now();
+    // This starts before the first request, so the measured time to a complete
+    // generation is conservatively no shorter than the RFC's first-accepted
+    // object boundary.
+    let first_object_started = Instant::now();
+    let started = first_object_started;
     let initial = write_ranges(
         &config,
         &channels,
@@ -216,10 +372,36 @@ async fn main() -> Result<()> {
         &config.bucket,
         baseline.generation(),
         Some(data::partition_paths(config.records, 7).len()),
+        Some(config.endpoints.len()),
     )
     .await?;
     timings.initial_build_seconds = started.elapsed().as_secs_f64();
+    timings.first_complete_generation_seconds = first_object_started.elapsed().as_secs_f64();
     let initial_ready_generation = freshness(&initial_response)?.generation;
+    let source_complete_generation_observed =
+        source_complete_freshness(freshness(&initial_response)?, config.endpoints.len());
+    ensure!(
+        source_complete_generation_observed,
+        "first complete generation did not prove zero lag for every source"
+    );
+    let accepted_objects_per_second = config.records as f64 / timings.ingest_seconds;
+    let source_complete_objects_per_second =
+        config.records as f64 / timings.first_complete_generation_seconds;
+    if config.require_performance_targets {
+        ensure!(
+            accepted_objects_per_second >= MIN_RELEASE_OBJECTS_PER_SECOND,
+            "accepted object rate {accepted_objects_per_second:.3}/s is below the release target {MIN_RELEASE_OBJECTS_PER_SECOND:.3}/s"
+        );
+        ensure!(
+            source_complete_objects_per_second >= MIN_RELEASE_OBJECTS_PER_SECOND,
+            "source-complete index rate {source_complete_objects_per_second:.3}/s is below the release target {MIN_RELEASE_OBJECTS_PER_SECOND:.3}/s"
+        );
+        ensure!(
+            timings.first_complete_generation_seconds <= MAX_RELEASE_FIRST_GENERATION_SECONDS,
+            "first complete generation took {:.3}s, above the release target {MAX_RELEASE_FIRST_GENERATION_SECONDS:.3}s",
+            timings.first_complete_generation_seconds,
+        );
+    }
 
     set_phase(&monitor, Phase::ColdQuery);
     let started = Instant::now();
@@ -236,7 +418,7 @@ async fn main() -> Result<()> {
     token = qualification_token(&config, channels[0].clone()).await?;
     index = index_client(channels[0].clone(), &token)?;
     let started = Instant::now();
-    let (initial_count, initial_generation) = verify_every_partition(
+    let (initial_count, initial_generation, _) = verify_every_partition(
         &index,
         &config.bucket,
         config.records,
@@ -292,11 +474,17 @@ async fn main() -> Result<()> {
     set_phase(&monitor, Phase::IncrementalBuild);
     let started = Instant::now();
     let final_live = config.records - deleted.len() as u64;
-    let _final_ready =
-        wait_for_generation(&mut index, &config.bucket, initial_generation, None).await?;
+    let _final_ready = wait_for_generation(
+        &mut index,
+        &config.bucket,
+        initial_generation,
+        None,
+        Some(config.endpoints.len()),
+    )
+    .await?;
     token = qualification_token(&config, channels[0].clone()).await?;
     index = index_client(channels[0].clone(), &token)?;
-    let (final_count, final_generation) = verify_every_partition(
+    let (final_count, final_generation, final_result_sha256) = verify_every_partition(
         &index,
         &config.bucket,
         config.records,
@@ -341,6 +529,11 @@ async fn main() -> Result<()> {
     let observed_peak_anonymous_growth_bytes = resources
         .as_ref()
         .map(ResourceReport::peak_anonymous_growth_bytes);
+    let evidence = qualification_evidence(
+        &config,
+        initial_corpus_sha256,
+        source_complete_generation_observed,
+    )?;
     let report = QualificationReport {
         schema: "anvil.index-resource-qualification.v1",
         records: config.records,
@@ -358,14 +551,31 @@ async fn main() -> Result<()> {
         max_anonymous_growth_bytes: config.max_anonymous_growth_bytes,
         observed_peak_rss_growth_bytes,
         observed_peak_anonymous_growth_bytes,
+        accepted_objects_per_second,
+        source_complete_objects_per_second,
         initial_generation,
         final_generation,
         timings,
         resources,
+        evidence,
     };
+    if let Some(path) = &config.state_output {
+        let state = VerificationState {
+            schema: "anvil.index-resource-verification.v1".into(),
+            tenant: config.tenant.to_string(),
+            bucket: config.bucket.to_string(),
+            records: config.records,
+            final_live_objects: final_live,
+            final_generation,
+            final_result_sha256,
+            source_count: config.endpoints.len(),
+        };
+        std::fs::write(path, serde_json::to_vec_pretty(&state)?)
+            .with_context(|| format!("write qualification state {}", path.display()))?;
+    }
     let encoded = serde_json::to_vec_pretty(&report)?;
-    if let Some(path) = config.output {
-        std::fs::write(&path, &encoded)
+    if let Some(path) = &config.output {
+        std::fs::write(path, &encoded)
             .with_context(|| format!("write qualification report {}", path.display()))?;
     }
     println!("{}", String::from_utf8(encoded).expect("JSON is UTF-8"));
@@ -406,6 +616,8 @@ impl Config {
             optional_number("ANVIL_V06_INDEX_COMPACTION_MAX_LANES")?;
         let configured_rayon_workers = optional_number("ANVIL_V06_INDEX_RAYON_WORKERS")?;
         let max_anonymous_growth_bytes = optional_number("ANVIL_V06_MAX_ANONYMOUS_GROWTH_BYTES")?;
+        let require_performance_targets = boolean("ANVIL_V08_REQUIRE_PERFORMANCE_TARGETS", false)?;
+        let evidence = EvidenceConfig::from_env(endpoints.len())?;
         ensure!(
             configured_compaction_max_lanes.is_none_or(|lanes| lanes > 0),
             "ANVIL_V06_INDEX_COMPACTION_MAX_LANES must be non-zero when configured"
@@ -447,9 +659,229 @@ impl Config {
             configured_compaction_max_lanes,
             configured_rayon_workers,
             max_anonymous_growth_bytes,
+            require_performance_targets,
+            evidence,
             output: env::var_os("ANVIL_V06_RESOURCE_OUTPUT").map(PathBuf::from),
+            state_output: env::var_os("ANVIL_V06_RESOURCE_STATE_OUTPUT").map(PathBuf::from),
         })
     }
+}
+
+impl EvidenceConfig {
+    fn from_env(ingress_endpoint_count: usize) -> Result<Self> {
+        let source_commit = required("ANVIL_V08_EVIDENCE_SOURCE_COMMIT")?;
+        ensure!(
+            source_commit.len() == 40 && source_commit.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "ANVIL_V08_EVIDENCE_SOURCE_COMMIT must be a full Git commit ID"
+        );
+        let resolved_container_digest = required("ANVIL_V08_EVIDENCE_CONTAINER_DIGEST")?;
+        let digest_hex = resolved_container_digest
+            .strip_prefix("sha256:")
+            .context("ANVIL_V08_EVIDENCE_CONTAINER_DIGEST must use sha256")?;
+        ensure!(
+            digest_hex.len() == 64 && digest_hex.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "ANVIL_V08_EVIDENCE_CONTAINER_DIGEST must be a complete sha256 digest"
+        );
+        let native_architecture = required("ANVIL_V08_EVIDENCE_NATIVE_ARCHITECTURE")?;
+        ensure!(
+            !native_architecture.trim().is_empty(),
+            "native architecture evidence must not be empty"
+        );
+        let container_platform = required("ANVIL_V08_EVIDENCE_CONTAINER_PLATFORM")?;
+        ensure!(
+            matches!(container_platform.as_str(), "linux/amd64" | "linux/arm64"),
+            "container platform evidence must be linux/amd64 or linux/arm64"
+        );
+        let topology = required("ANVIL_V08_EVIDENCE_TOPOLOGY")?;
+        let node_count = required_number("ANVIL_V08_EVIDENCE_NODE_COUNT")?;
+        ensure!(
+            matches!(
+                (topology.as_str(), node_count),
+                ("single-node", 1) | ("three-node", 3)
+            ),
+            "topology evidence must describe the supported one- or three-node qualification"
+        );
+        ensure!(
+            ingress_endpoint_count == node_count,
+            "topology node count must equal the number of qualification ingress endpoints"
+        );
+        let hardware_logical_cpus = required_number("ANVIL_V08_EVIDENCE_HARDWARE_LOGICAL_CPUS")?;
+        let hardware_memory_bytes = required_number("ANVIL_V08_EVIDENCE_HARDWARE_MEMORY_BYTES")?;
+        let qualification_filesystem_total_bytes =
+            required_number("ANVIL_V08_EVIDENCE_FILESYSTEM_TOTAL_BYTES")?;
+        let qualification_filesystem_available_bytes_at_start =
+            required_number("ANVIL_V08_EVIDENCE_FILESYSTEM_AVAILABLE_BYTES")?;
+        let index_disk_cache_bytes_per_node =
+            required_number("ANVIL_V08_EVIDENCE_INDEX_DISK_CACHE_BYTES_PER_NODE")?;
+        let index_memory_percent_per_node =
+            required_number("ANVIL_V08_EVIDENCE_INDEX_MEMORY_PERCENT_PER_NODE")?;
+        ensure!(
+            hardware_logical_cpus > 0
+                && hardware_memory_bytes > 0
+                && qualification_filesystem_total_bytes > 0
+                && qualification_filesystem_available_bytes_at_start > 0
+                && qualification_filesystem_available_bytes_at_start
+                    <= qualification_filesystem_total_bytes
+                && index_disk_cache_bytes_per_node > 0
+                && (1..=100).contains(&index_memory_percent_per_node),
+            "qualification hardware and resource evidence must be positive and bounded"
+        );
+        Ok(Self {
+            source_commit,
+            resolved_container_digest,
+            native_architecture,
+            container_platform,
+            topology,
+            node_count,
+            hardware_logical_cpus,
+            hardware_memory_bytes,
+            qualification_filesystem_total_bytes,
+            qualification_filesystem_available_bytes_at_start,
+            index_disk_cache_bytes_per_node,
+            index_memory_percent_per_node,
+        })
+    }
+}
+
+fn qualification_evidence(
+    config: &Config,
+    initial_corpus_sha256: String,
+    source_complete_generation_observed: bool,
+) -> Result<QualificationEvidence> {
+    let builder_memory_bytes_per_kind_per_node = config
+        .configured_kind_budget_bytes
+        .context("qualification evidence requires the configured per-kind memory budget")?;
+    let compaction_max_lanes_per_kind = config
+        .configured_compaction_max_lanes
+        .context("qualification evidence requires the configured compaction lane limit")?;
+    let rayon_workers_per_node = config
+        .configured_rayon_workers
+        .context("qualification evidence requires the configured Rayon worker count")?;
+    let maximum_anonymous_growth_bytes = config
+        .max_anonymous_growth_bytes
+        .context("qualification evidence requires the anonymous-memory growth limit")?;
+    let evidence = &config.evidence;
+    Ok(QualificationEvidence {
+        source_commit: evidence.source_commit.clone(),
+        resolved_container_digest: evidence.resolved_container_digest.clone(),
+        native_architecture: evidence.native_architecture.clone(),
+        container_platform: evidence.container_platform.clone(),
+        hardware: HardwareEvidence {
+            logical_cpus: evidence.hardware_logical_cpus,
+            memory_bytes: evidence.hardware_memory_bytes,
+            qualification_filesystem_total_bytes: evidence.qualification_filesystem_total_bytes,
+            qualification_filesystem_available_bytes_at_start: evidence
+                .qualification_filesystem_available_bytes_at_start,
+        },
+        corpus: CorpusEvidence {
+            identity: "anvil.synthetic-index-resource.initial.v1",
+            initial_corpus_sha256,
+            generator_seed_hex: format!("0x{:016x}", config.seed),
+            records: config.records,
+            indexed_fields: data::FIELD_COUNT,
+        },
+        topology: TopologyEvidence {
+            kind: evidence.topology.clone(),
+            node_count: evidence.node_count,
+            ingress_endpoint_count: config.endpoints.len(),
+        },
+        durability: DurabilityEvidence {
+            initial_writes: "LOCAL",
+            updates: "LOCAL",
+            deletes: "LOCAL",
+        },
+        execution: ExecutionEvidence {
+            bulk_write_max_operations: config.batch_size,
+            ingest_workers: config.workers,
+            verification_workers: config.verification_workers,
+            partition_count: PARTITION_COUNT,
+            query_limit: QUERY_LIMIT,
+            configured_mutations: config.mutation_count,
+        },
+        resource_configuration: ResourceConfigurationEvidence {
+            index_disk_cache_bytes_per_node: evidence.index_disk_cache_bytes_per_node,
+            index_memory_percent_per_node: evidence.index_memory_percent_per_node,
+            builder_memory_bytes_per_kind_per_node,
+            compaction_max_lanes_per_kind,
+            rayon_workers_per_node,
+            maximum_anonymous_growth_bytes,
+            resource_sample_interval_milliseconds: 100,
+            monitored_target_count: config.resource_pids.len() + config.resource_containers.len(),
+            resource_targets_required: config.require_resource_targets,
+        },
+        timer_boundaries: TimerBoundaryEvidence {
+            clock: "tokio::time::Instant monotonic elapsed time",
+            ingest_seconds: TimerBoundary {
+                starts: "immediately before the first initial BulkWrite request",
+                stops: "after every initial BulkWrite receipt is accepted",
+            },
+            initial_build_seconds: TimerBoundary {
+                starts: "immediately before polling after every initial BulkWrite receipt is accepted",
+                stops: "when one generation proves zero lag through the observed tail of every topology source",
+            },
+            first_complete_generation_seconds: TimerBoundary {
+                starts: "immediately before the first initial BulkWrite request",
+                stops: "when one generation proves zero lag through the observed tail of every topology source",
+            },
+            exact_verification_seconds: TimerBoundary {
+                starts: "before initial exact partition verification",
+                stops: "after one complete generation exactly matches every initial object",
+            },
+            cold_query_milliseconds: TimerBoundary {
+                starts: "immediately before the first representative query request",
+                stops: "when that query response is received",
+            },
+            warm_query_milliseconds: TimerBoundary {
+                starts: "immediately before the repeated representative query request",
+                stops: "when that query response is received",
+            },
+            mutation_seconds: TimerBoundary {
+                starts: "immediately before the first update BulkWrite request",
+                stops: "after every update and delete BulkWrite receipt is accepted",
+            },
+            incremental_build_seconds: TimerBoundary {
+                starts: "immediately before polling after every update and delete receipt is accepted",
+                stops: "after a newer complete generation passes exact final verification",
+            },
+        },
+        correctness: CorrectnessEvidence {
+            result: "pass",
+            source_complete_generation_observed,
+            source_complete_sources_observed: config.endpoints.len(),
+            initial_exact_partition_verification: true,
+            final_exact_partition_verification: true,
+            update_and_delete_verification: true,
+            resource_limits_passed: true,
+            performance_targets_required: config.require_performance_targets,
+            performance_targets_passed: config.require_performance_targets.then_some(true),
+        },
+    })
+}
+
+fn initial_corpus_sha256(seed: u64, records: u64) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"anvil.synthetic-index-resource.initial.v1\0");
+    hash.update(seed.to_be_bytes());
+    hash.update(records.to_be_bytes());
+    hash.update(CONTENT_TYPE.as_bytes());
+    for record_id in 0..records {
+        let path = data::object_path(record_id);
+        let payload = data::payload(seed, record_id, RecordFlavor::Initial);
+        hash.update(record_id.to_be_bytes());
+        hash.update(
+            u64::try_from(path.len())
+                .expect("generated path length fits u64")
+                .to_be_bytes(),
+        );
+        hash.update(path.as_bytes());
+        hash.update(
+            u64::try_from(payload.len())
+                .expect("generated payload length fits u64")
+                .to_be_bytes(),
+        );
+        hash.update(payload);
+    }
+    format!("sha256:{}", hex::encode(hash.finalize()))
 }
 
 async fn connect_all(endpoints: &[String]) -> Result<Vec<Channel>> {
@@ -643,6 +1075,7 @@ async fn wait_for_generation(
     bucket: &str,
     after_generation: u64,
     expected_partition_hits: Option<usize>,
+    expected_complete_sources: Option<usize>,
 ) -> Result<QueryIndexResponse> {
     let deadline = Instant::now() + BUILD_TIMEOUT;
     let partition = 7;
@@ -653,6 +1086,8 @@ async fn wait_for_generation(
                     value.generation > after_generation
                         && value.initial_build_complete
                         && !value.rebuilding
+                        && expected_complete_sources
+                            .is_none_or(|expected| source_complete_freshness(value, expected))
                 }) =>
             {
                 if let Some(expected_hits) = expected_partition_hits {
@@ -687,11 +1122,12 @@ async fn verify_every_partition(
     expected_updates: Option<&BTreeMap<u64, u64>>,
     deleted: Option<&BTreeSet<u64>>,
     workers: usize,
-) -> Result<(u64, u64)> {
+) -> Result<(u64, u64, String)> {
     let deadline = Instant::now() + EXACT_VERIFICATION_TIMEOUT;
     loop {
         let mut count = 0u64;
         let mut generation = None;
+        let mut partition_digests = BTreeMap::new();
         let mut complete = true;
         let mut next_partition = 0;
         let mut queries = JoinSet::new();
@@ -730,7 +1166,15 @@ async fn verify_every_partition(
                 expected_updates,
                 deleted,
             ) {
-                Ok(partition_count) => count += partition_count,
+                Ok(partition_count) => {
+                    count += partition_count;
+                    ensure!(
+                        partition_digests
+                            .insert(partition, partition_result_digest(partition, &response)?)
+                            .is_none(),
+                        "duplicate partition response"
+                    );
+                }
                 Err(_) => {
                     complete = false;
                     break;
@@ -750,11 +1194,186 @@ async fn verify_every_partition(
             return Ok((
                 count,
                 generation.context("verification returned no generation")?,
+                qualification_result_digest(&partition_digests)?,
             ));
         }
         if Instant::now() >= deadline {
             bail!(
                 "exact partition verification did not converge before {EXACT_VERIFICATION_TIMEOUT:?}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn verify_existing_state(path: &Path) -> Result<()> {
+    let state: VerificationState = serde_json::from_slice(
+        &std::fs::read(path)
+            .with_context(|| format!("read qualification state {}", path.display()))?,
+    )
+    .with_context(|| format!("parse qualification state {}", path.display()))?;
+    ensure!(
+        state.schema == "anvil.index-resource-verification.v1",
+        "unsupported qualification state schema"
+    );
+    ensure!(state.records > 0, "qualification state has no records");
+    ensure!(
+        state.final_live_objects <= state.records,
+        "qualification state has more live objects than records"
+    );
+    ensure!(
+        state.final_generation > 0,
+        "qualification state has no final generation"
+    );
+    ensure!(state.source_count > 0, "qualification state has no sources");
+    validate_sha256(&state.final_result_sha256)?;
+
+    let tenant = required("ANVIL_V06_RESOURCE_TENANT")?;
+    let bucket = required("ANVIL_V06_RESOURCE_BUCKET")?;
+    ensure!(
+        tenant == state.tenant,
+        "qualification state tenant mismatch"
+    );
+    ensure!(
+        bucket == state.bucket,
+        "qualification state bucket mismatch"
+    );
+    let client_id = required("ANVIL_V06_RESOURCE_CLIENT_ID")?;
+    let client_secret = required("ANVIL_V06_RESOURCE_CLIENT_SECRET")?;
+    let verification_workers = number(
+        "ANVIL_V06_RESOURCE_VERIFICATION_WORKERS",
+        DEFAULT_VERIFICATION_WORKERS,
+    )?;
+    ensure!(
+        verification_workers > 0,
+        "verification worker count must be non-zero"
+    );
+    let endpoints = required("ANVIL_V06_RESOURCE_ENDPOINTS")?
+        .split(',')
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    ensure!(!endpoints.is_empty(), "at least one endpoint is required");
+    let channels = connect_all(&endpoints).await?;
+
+    for (endpoint, channel) in endpoints.iter().zip(channels) {
+        let token =
+            exchange_client_credentials(channel.clone(), client_id.clone(), client_secret.clone())
+                .await
+                .with_context(|| format!("credential exchange through {endpoint} failed"))?
+                .access_token;
+        let index = index_client(channel, &token)?;
+        let (count, generation, digest) = digest_every_partition(
+            &index,
+            &state.bucket,
+            state.records,
+            state.final_live_objects,
+            state.source_count,
+            verification_workers,
+        )
+        .await
+        .with_context(|| format!("verify resource index through {endpoint}"))?;
+        ensure!(
+            count == state.final_live_objects,
+            "resource index live-object count changed through {endpoint}"
+        );
+        ensure!(
+            generation >= state.final_generation,
+            "resource index generation regressed through {endpoint}"
+        );
+        ensure!(
+            digest == state.final_result_sha256,
+            "resource index result digest changed through {endpoint}"
+        );
+        println!(
+            "verified resource index through {endpoint}: generation={generation} objects={count} digest={digest}"
+        );
+    }
+    Ok(())
+}
+
+async fn digest_every_partition(
+    client: &IndexClient,
+    bucket: &str,
+    records: u64,
+    expected_objects: u64,
+    expected_sources: usize,
+    workers: usize,
+) -> Result<(u64, u64, String)> {
+    let deadline = Instant::now() + EXACT_VERIFICATION_TIMEOUT;
+    loop {
+        let mut count = 0u64;
+        let mut generation = None;
+        let mut partition_digests = BTreeMap::new();
+        let mut complete = true;
+        let mut next_partition = 0;
+        let mut queries = JoinSet::new();
+        while next_partition < PARTITION_COUNT && queries.len() < workers {
+            spawn_partition_query(&mut queries, client, bucket, next_partition);
+            next_partition += 1;
+        }
+        while let Some(joined) = queries.join_next().await {
+            if Instant::now() >= deadline {
+                queries.abort_all();
+                while queries.join_next().await.is_some() {}
+                bail!(
+                    "persisted resource verification did not converge before {EXACT_VERIFICATION_TIMEOUT:?}"
+                );
+            }
+            let (partition, response) =
+                joined.context("resource verification query task failed")?;
+            let response = match response {
+                Ok(response) => response,
+                Err(error) if retryable_error(&error) => {
+                    complete = false;
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
+            let response_freshness = freshness(&response)?;
+            if !response_freshness.initial_build_complete
+                || response_freshness.rebuilding
+                || !source_complete_freshness(response_freshness, expected_sources)
+                || generation.is_some_and(|value| value != response_freshness.generation)
+            {
+                complete = false;
+                break;
+            }
+            generation = Some(response_freshness.generation);
+            match validate_digest_partition_response(&response, records, partition) {
+                Ok((partition_count, partition_digest)) => {
+                    count += partition_count;
+                    ensure!(
+                        partition_digests
+                            .insert(partition, partition_digest)
+                            .is_none(),
+                        "duplicate partition response"
+                    );
+                }
+                Err(_) => {
+                    complete = false;
+                    break;
+                }
+            }
+            if next_partition < PARTITION_COUNT {
+                spawn_partition_query(&mut queries, client, bucket, next_partition);
+                next_partition += 1;
+            }
+        }
+        if !complete {
+            queries.abort_all();
+            while queries.join_next().await.is_some() {}
+        }
+        if complete && count == expected_objects {
+            return Ok((
+                count,
+                generation.context("verification returned no generation")?,
+                qualification_result_digest(&partition_digests)?,
+            ));
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "persisted resource verification did not converge before {EXACT_VERIFICATION_TIMEOUT:?}"
             );
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -814,6 +1433,83 @@ fn validate_partition_response(
     Ok(expected)
 }
 
+fn validate_digest_partition_response(
+    response: &QueryIndexResponse,
+    records: u64,
+    partition: u64,
+) -> Result<(u64, [u8; 32])> {
+    ensure!(response.next_page_token.is_empty());
+    let mut records_and_versions = Vec::with_capacity(response.hits.len());
+    let mut seen = BTreeSet::new();
+    for hit in &response.hits {
+        let address = hit.address.as_ref().context("index hit omitted address")?;
+        let record_id = parse_record_id(&address.path)?;
+        ensure!(record_id < records && record_id % PARTITION_COUNT == partition);
+        ensure!(hit.object_version != 0, "index hit omitted object version");
+        ensure!(seen.insert(record_id), "duplicate index hit");
+        records_and_versions.push((record_id, hit.object_version));
+    }
+    Ok((
+        records_and_versions.len() as u64,
+        digest_partition_records(partition, &records_and_versions),
+    ))
+}
+
+fn partition_result_digest(partition: u64, response: &QueryIndexResponse) -> Result<[u8; 32]> {
+    let records_and_versions = response
+        .hits
+        .iter()
+        .map(|hit| {
+            let address = hit.address.as_ref().context("index hit omitted address")?;
+            Ok((parse_record_id(&address.path)?, hit.object_version))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(digest_partition_records(partition, &records_and_versions))
+}
+
+fn digest_partition_records(partition: u64, records_and_versions: &[(u64, u64)]) -> [u8; 32] {
+    let mut canonical = records_and_versions.to_vec();
+    canonical.sort_unstable();
+    let mut hash = Sha256::new();
+    hash.update(b"anvil.index-resource.partition-result.v1\0");
+    hash.update(partition.to_be_bytes());
+    hash.update((canonical.len() as u64).to_be_bytes());
+    for (record_id, version) in canonical {
+        hash.update(record_id.to_be_bytes());
+        hash.update(version.to_be_bytes());
+    }
+    hash.finalize().into()
+}
+
+fn qualification_result_digest(partition_digests: &BTreeMap<u64, [u8; 32]>) -> Result<String> {
+    ensure!(
+        partition_digests.len() as u64 == PARTITION_COUNT,
+        "qualification result omitted one or more partitions"
+    );
+    let mut hash = Sha256::new();
+    hash.update(b"anvil.index-resource.complete-result.v1\0");
+    hash.update(PARTITION_COUNT.to_be_bytes());
+    for partition in 0..PARTITION_COUNT {
+        let digest = partition_digests
+            .get(&partition)
+            .context("qualification result omitted a partition")?;
+        hash.update(partition.to_be_bytes());
+        hash.update(digest);
+    }
+    Ok(format!("sha256:{}", hex::encode(hash.finalize())))
+}
+
+fn validate_sha256(value: &str) -> Result<()> {
+    let digest = value
+        .strip_prefix("sha256:")
+        .context("qualification result digest must use sha256")?;
+    ensure!(
+        digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "qualification result digest must be a complete sha256 digest"
+    );
+    Ok(())
+}
+
 async fn query_partition(
     client: &mut IndexClient,
     bucket: &str,
@@ -847,6 +1543,26 @@ fn freshness(response: &QueryIndexResponse) -> Result<&anvil_storage::v1::IndexF
         .freshness
         .as_ref()
         .context("index response omitted freshness")
+}
+
+fn source_complete_freshness(freshness: &IndexFreshness, expected_sources: usize) -> bool {
+    let source_ids = freshness
+        .sources
+        .iter()
+        .map(|source| source.node_id)
+        .collect::<BTreeSet<_>>();
+    expected_sources != 0
+        && freshness.sources.len() == expected_sources
+        && source_ids.len() == expected_sources
+        && freshness.sources.iter().all(source_is_proven_current)
+}
+
+fn source_is_proven_current(source: &IndexSourceFreshness) -> bool {
+    source.node_id != 0
+        && source.source_epoch.len() == 32
+        && source.lag_hint == 0
+        && source.observed_tail.and_then(|tail| tail.checked_add(1))
+            == Some(source.indexed_next_offset)
 }
 
 fn hits_by_path(response: &QueryIndexResponse) -> Result<BTreeMap<&str, u64>> {
@@ -888,6 +1604,16 @@ fn set_phase(monitor: &Option<ResourceMonitor>, phase: Phase) {
 
 fn required(name: &str) -> Result<String> {
     env::var(name).map_err(|_| anyhow!("{name} is required"))
+}
+
+fn required_number<T>(name: &str) -> Result<T>
+where
+    T: std::str::FromStr,
+    T::Err: Error + Send + Sync + 'static,
+{
+    required(name)?
+        .parse()
+        .with_context(|| format!("invalid {name}"))
 }
 
 fn optional_list(name: &str) -> Vec<String> {
@@ -962,5 +1688,58 @@ mod tests {
     fn default_partitions_fit_one_exact_public_query_page() {
         let largest_partition = DEFAULT_RECORDS.div_ceil(PARTITION_COUNT);
         assert!(largest_partition <= u64::from(QUERY_LIMIT));
+    }
+
+    #[test]
+    fn corpus_identity_hash_is_deterministic_and_input_sensitive() {
+        assert_eq!(initial_corpus_sha256(42, 8), initial_corpus_sha256(42, 8));
+        assert_ne!(initial_corpus_sha256(42, 8), initial_corpus_sha256(43, 8));
+        assert_ne!(initial_corpus_sha256(42, 8), initial_corpus_sha256(42, 9));
+    }
+
+    #[test]
+    fn source_complete_freshness_requires_every_unique_source_at_observed_tail() {
+        let current = |node_id, indexed_next_offset| IndexSourceFreshness {
+            node_id,
+            source_epoch: vec![u8::try_from(node_id).unwrap(); 32],
+            indexed_next_offset,
+            observed_tail: Some(indexed_next_offset - 1),
+            lag_hint: 0,
+        };
+        let mut freshness = IndexFreshness {
+            sources: vec![current(1, 11), current(2, 21), current(3, 31)],
+            ..Default::default()
+        };
+        assert!(source_complete_freshness(&freshness, 3));
+
+        freshness.sources[2].lag_hint = 1;
+        assert!(!source_complete_freshness(&freshness, 3));
+        freshness.sources[2] = current(3, 31);
+        freshness.sources[2].observed_tail = None;
+        assert!(!source_complete_freshness(&freshness, 3));
+        freshness.sources[2] = current(2, 31);
+        assert!(!source_complete_freshness(&freshness, 3));
+        assert!(!source_complete_freshness(&freshness, 2));
+    }
+
+    #[test]
+    fn qualification_result_digest_is_order_independent_and_input_sensitive() {
+        let ordered = digest_partition_records(7, &[(7, 11), (1_031, 12), (2_055, 13)]);
+        let reordered = digest_partition_records(7, &[(2_055, 13), (7, 11), (1_031, 12)]);
+        let changed_version = digest_partition_records(7, &[(7, 11), (1_031, 12), (2_055, 14)]);
+        let changed_partition = digest_partition_records(8, &[(7, 11), (1_031, 12), (2_055, 13)]);
+        assert_eq!(ordered, reordered);
+        assert_ne!(ordered, changed_version);
+        assert_ne!(ordered, changed_partition);
+
+        let partitions = (0..PARTITION_COUNT)
+            .map(|partition| (partition, digest_partition_records(partition, &[])))
+            .collect::<BTreeMap<_, _>>();
+        let complete = qualification_result_digest(&partitions).unwrap();
+        validate_sha256(&complete).unwrap();
+
+        let mut incomplete = partitions;
+        incomplete.remove(&0);
+        assert!(qualification_result_digest(&incomplete).is_err());
     }
 }

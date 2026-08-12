@@ -2,9 +2,12 @@
 set -Eeuo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "${repo_root}/scripts/qualification-log-evidence.sh"
+source "${repo_root}/scripts/qualification-scale-evidence.sh"
+source "${repo_root}/scripts/qualification-three-node-phases.sh"
 compose_file="${repo_root}/tests/cluster/docker-compose.yml"
 start_node="${repo_root}/tests/cluster/start-node.sh"
-requested_image="${ANVIL_IMAGE:-anvil:0.7.0}"
+requested_image="${ANVIL_IMAGE:-anvil:0.8.0}"
 qualification_mode="${ANVIL_QUALIFICATION_MODE:-smoke}"
 index_disk_cache_bytes="${ANVIL_QUALIFICATION_INDEX_DISK_CACHE_BYTES:-1073741824}"
 index_memory_percent="${ANVIL_QUALIFICATION_INDEX_MEMORY_PERCENT:-20}"
@@ -14,8 +17,14 @@ index_rayon_workers="${ANVIL_QUALIFICATION_INDEX_RAYON_WORKERS:-4}"
 # The default is a fast smoke. Set this to 839980 for the full
 # production-shaped, twelve-field corpus used by the resource qualification.
 case "${qualification_mode}" in
-  release) index_resource_records="${ANVIL_QUALIFICATION_INDEX_RECORDS:-839980}" ;;
-  smoke) index_resource_records="${ANVIL_QUALIFICATION_INDEX_RECORDS:-16384}" ;;
+  release)
+    index_resource_records="${ANVIL_QUALIFICATION_INDEX_RECORDS:-839980}"
+    require_performance_targets=1
+    ;;
+  smoke)
+    index_resource_records="${ANVIL_QUALIFICATION_INDEX_RECORDS:-16384}"
+    require_performance_targets=0
+    ;;
   *)
     echo "ANVIL_QUALIFICATION_MODE must be release or smoke" >&2
     exit 2
@@ -23,6 +32,8 @@ case "${qualification_mode}" in
 esac
 index_resource_mutations="${ANVIL_QUALIFICATION_INDEX_MUTATIONS:-512}"
 index_resource_max_anonymous_growth_bytes="${ANVIL_QUALIFICATION_INDEX_MAX_ANONYMOUS_GROWTH_BYTES:-2147483648}"
+release_source_journal_max_entries="${ANVIL_QUALIFICATION_SOURCE_JOURNAL_MAX_ENTRIES:-1000000}"
+gap_source_journal_max_entries="${ANVIL_QUALIFICATION_GAP_SOURCE_JOURNAL_MAX_ENTRIES:-64}"
 index_kinds=(Path MetadataFilter TypedJson FullText Vector Hybrid GitSource Tensor)
 
 for configured_limit in \
@@ -33,7 +44,9 @@ for configured_limit in \
   "${index_rayon_workers}" \
   "${index_resource_records}" \
   "${index_resource_mutations}" \
-  "${index_resource_max_anonymous_growth_bytes}"
+  "${index_resource_max_anonymous_growth_bytes}" \
+  "${release_source_journal_max_entries}" \
+  "${gap_source_journal_max_entries}"
 do
   if [[ ! "${configured_limit}" =~ ^[1-9][0-9]*$ ]]; then
     echo "index qualification limits must be positive decimal integers" >&2
@@ -54,11 +67,21 @@ if [[ "${qualification_mode}" == "release" \
   echo "release qualification requires exactly 839980 resource records" >&2
   exit 2
 fi
+if [[ "${qualification_mode}" == "release" ]] \
+  && ((release_source_journal_max_entries < 1000000)); then
+  echo "release qualification requires the production source-journal entry bound of at least 1000000" >&2
+  exit 2
+fi
+if ((gap_source_journal_max_entries >= release_source_journal_max_entries)); then
+  echo "journal-gap entry bound must be smaller than the release entry bound" >&2
+  exit 2
+fi
 export ANVIL_QUALIFICATION_INDEX_DISK_CACHE_BYTES="${index_disk_cache_bytes}"
 export ANVIL_QUALIFICATION_INDEX_MEMORY_PERCENT="${index_memory_percent}"
 export ANVIL_QUALIFICATION_INDEX_KIND_BUDGET_BYTES="${index_kind_budget_bytes}"
 export ANVIL_QUALIFICATION_INDEX_COMPACTION_MAX_LANES="${index_compaction_max_lanes}"
 export ANVIL_QUALIFICATION_INDEX_RAYON_WORKERS="${index_rayon_workers}"
+export ANVIL_QUALIFICATION_SOURCE_JOURNAL_MAX_ENTRIES="${gap_source_journal_max_entries}"
 export ANVIL_QUALIFICATION_RUST_LOG=info,anvil::index_runtime::retention=debug,anvil::observability::runtime=debug
 
 case "${ANVIL_DOCKER_PLATFORM:-}" in
@@ -97,6 +120,36 @@ command -v git >/dev/null 2>&1 || {
 }
 docker compose version >/dev/null
 
+source_commit="$(git -C "${repo_root}" rev-parse --verify 'HEAD^{commit}')"
+if [[ ! "${source_commit}" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "qualification could not derive the exact source commit" >&2
+  exit 2
+fi
+assert_source_tree_exact() {
+  if [[ "$(git -C "${repo_root}" rev-parse --verify 'HEAD^{commit}')" != "${source_commit}" \
+    || -n "$(git -C "${repo_root}" status --porcelain=v1 --untracked-files=normal)" ]]
+  then
+    echo "qualification requires an unchanged clean source tree so the source commit is exact" >&2
+    return 1
+  fi
+}
+assert_source_tree_exact
+native_architecture="$(uname -m)"
+hardware_logical_cpus="$(getconf _NPROCESSORS_ONLN)"
+hardware_memory_bytes="$({
+  awk '$1 == "MemTotal:" { printf "%.0f\n", $2 * 1024; found = 1 }
+       END { if (!found) exit 1 }' /proc/meminfo
+})"
+read -r qualification_filesystem_total_bytes qualification_filesystem_available_bytes \
+  < <(df -B1 --output=size,avail /var/tmp | awk 'NR == 2 { print $1, $2 }')
+if [[ ! "${hardware_logical_cpus}" =~ ^[1-9][0-9]*$ \
+  || ! "${hardware_memory_bytes}" =~ ^[1-9][0-9]*$ \
+  || ! "${qualification_filesystem_total_bytes}" =~ ^[1-9][0-9]*$ \
+  || ! "${qualification_filesystem_available_bytes}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "qualification could not derive the bounded host hardware summary" >&2
+  exit 2
+fi
+
 qualification_examples=(
   accounting_qualification
   atomic_index_qualification
@@ -116,20 +169,39 @@ cargo_target_dir="$(
     | jq --exit-status --raw-output \
       '.target_directory | select(type == "string" and length > 0)'
 )"
-cargo build --quiet --locked --package anvil-server \
+cargo build --quiet --release --locked --package anvil-server \
   --manifest-path "${repo_root}/Cargo.toml" \
   "${qualification_example_flags[@]}"
 
 declare -A qualification_binaries=()
 for qualification_example in "${qualification_examples[@]}"; do
-  qualification_binaries["${qualification_example}"]="${cargo_target_dir}/debug/examples/${qualification_example}"
+  qualification_binaries["${qualification_example}"]="${cargo_target_dir}/release/examples/${qualification_example}"
   if [[ ! -x "${qualification_binaries[${qualification_example}]}" ]]; then
     echo "Cargo did not produce executable ${qualification_binaries[${qualification_example}]}" >&2
     exit 1
   fi
 done
+echo "[anvil-qualification] optimized qualification clients are ready; Cargo is no longer needed"
 
 image_id="$("${repo_root}/scripts/resolve-docker-image-id.sh" "${requested_image}")"
+if [[ ! "${image_id}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+  echo "qualification image did not resolve to an immutable sha256 digest" >&2
+  exit 2
+fi
+container_platform="$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "${image_id}")"
+if [[ "${container_platform}" != "${ANVIL_DOCKER_PLATFORM}" ]]; then
+  echo "qualification image platform ${container_platform} does not match ${ANVIL_DOCKER_PLATFORM}" >&2
+  exit 2
+fi
+image_revision="$(
+  docker image inspect \
+    --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
+    "${image_id}"
+)"
+if [[ "${image_revision}" != "${source_commit}" ]]; then
+  echo "qualification image revision ${image_revision} does not match source commit ${source_commit}" >&2
+  exit 2
+fi
 server_version="$(
   docker run --rm --platform "${ANVIL_DOCKER_PLATFORM}" \
     "${image_id}" anvil-server --version
@@ -138,22 +210,27 @@ client_version="$(
   docker run --rm --platform "${ANVIL_DOCKER_PLATFORM}" \
     "${image_id}" anvil --version
 )"
-if [[ "${server_version}" != "anvil-server 0.7.0" \
-  || "${client_version}" != "anvil 0.7.0" ]]; then
-  echo "qualification requires the exact Anvil 0.7.0 image" >&2
+if [[ "${server_version}" != "anvil-server 0.8.0" \
+  || "${client_version}" != "anvil 0.8.0" ]]; then
+  echo "qualification requires the exact Anvil 0.8.0 image" >&2
   echo "server: ${server_version}" >&2
   echo "client: ${client_version}" >&2
   exit 2
 fi
 export ANVIL_IMAGE="${image_id}"
-export ANVIL_QUALIFICATION_PROJECT="${ANVIL_QUALIFICATION_PROJECT:-anvil-v070-${$}}"
-export ANVIL_QUALIFICATION_DIR="$(mktemp -d /var/tmp/anvil-v070-qualification.XXXXXX)"
+export ANVIL_QUALIFICATION_PROJECT="${ANVIL_QUALIFICATION_PROJECT:-anvil-v080-${$}}"
+export ANVIL_QUALIFICATION_DIR="$(mktemp -d /var/tmp/anvil-v080-qualification.XXXXXX)"
 export ANVIL_QUALIFICATION_START_NODE="${start_node}"
 qualification_suffix="${ANVIL_QUALIFICATION_DIR##*.}"
 index_verification_state="${ANVIL_QUALIFICATION_DIR}/artifacts/index-verification-state.json"
 index_membership_state="${ANVIL_QUALIFICATION_DIR}/artifacts/index-membership-state.json"
 index_gap_state="${ANVIL_QUALIFICATION_DIR}/artifacts/index-gap-state.json"
-index_resource_report="/var/tmp/anvil-v070-three-index-resource-${qualification_suffix}.json"
+index_resource_state="${ANVIL_QUALIFICATION_DIR}/artifacts/index-resource-state.json"
+index_resource_bucket="index-resource-${$}"
+index_resource_report="/var/tmp/anvil-v080-three-index-resource-${qualification_suffix}.json"
+index_resource_telemetry_prefix="/var/tmp/anvil-v080-three-index-telemetry-${qualification_suffix}"
+journal_pressure_evidence_prefix="/var/tmp/anvil-v080-three-journal-pressure-${qualification_suffix}"
+ANVIL_QUALIFICATION_STATE_DIR="${ANVIL_QUALIFICATION_DIR}/artifacts"
 keep="${ANVIL_QUALIFICATION_KEEP:-0}"
 paused_container=""
 
@@ -199,7 +276,7 @@ cleanup() {
     echo "[anvil-qualification] retained files ${ANVIL_QUALIFICATION_DIR}" >&2
   else
     compose down --volumes --remove-orphans >/dev/null 2>&1 || true
-    if [[ "${ANVIL_QUALIFICATION_DIR}" == /var/tmp/anvil-v070-qualification.* ]]; then
+    if [[ "${ANVIL_QUALIFICATION_DIR}" == /var/tmp/anvil-v080-qualification.* ]]; then
       docker run --rm --user 0 \
         --volume "${ANVIL_QUALIFICATION_DIR}:/qualification" \
         "${image_id}" rm -rf \
@@ -318,10 +395,6 @@ service_container() {
   compose ps --quiet "$1"
 }
 
-strip_ansi() {
-  LC_ALL=C sed $'s/\033\\[[0-9;?]*[ -\\/]*[@-~]//g'
-}
-
 service_logs() {
   docker logs "$(service_container "$1")" 2>&1 | strip_ansi
 }
@@ -377,40 +450,6 @@ state_unsigned_field() {
     "${state}"
 }
 
-log_unsigned_field() {
-  local field="$1"
-  local line="$2"
-  if [[ "${line}" =~ (^|[[:space:]])${field}=([0-9]+)($|[[:space:]]) ]]; then
-    printf '%s\n' "${BASH_REMATCH[2]}"
-    return 0
-  fi
-  return 1
-}
-
-normalize_unsigned_decimal() {
-  local value="$1"
-  while ((${#value} > 1)) && [[ "${value}" == 0* ]]; do
-    value="${value#0}"
-  done
-  printf '%s\n' "${value}"
-}
-
-unsigned_decimal_less_than() {
-  local left
-  local right
-  left="$(normalize_unsigned_decimal "$1")"
-  right="$(normalize_unsigned_decimal "$2")"
-  if ((${#left} != ${#right})); then
-    ((${#left} < ${#right}))
-    return
-  fi
-  [[ "${left}" < "${right}" ]]
-}
-
-unsigned_decimal_is_positive() {
-  [[ "$1" =~ [1-9] ]]
-}
-
 log_has_index_event() {
   local log="$1"
   local index_id="$2"
@@ -428,40 +467,43 @@ index_sparse_start_count() {
     || true
 }
 
-startup_scan_evidence_count() {
-  service_logs "$1" | grep -Fc 'anvil_index_startup_scan_evidence' || true
-}
-
 assert_zero_global_startup_scan_evidence() {
   local node="$1"
   local minimum_count="$2"
   local count=0
   local expected_node_id="${node#anvil-}"
-  local global_scans
+  local field
   local line
   local node_id
-  local scoped_scans
+  local value
   while IFS= read -r line; do
     node_id="$(log_unsigned_field node_id "${line}")" || {
       echo "${node} startup scan evidence omitted node_id" >&2
       return 1
     }
-    global_scans="$(log_unsigned_field global_head_scans_total "${line}")" || {
-      echo "${node} startup scan evidence omitted its measured global scan count" >&2
-      return 1
-    }
-    scoped_scans="$(log_unsigned_field scoped_head_scans_total "${line}")" || {
-      echo "${node} startup scan evidence omitted its measured scoped scan count" >&2
-      return 1
-    }
-    if [[ "${node_id}" != "${expected_node_id}" ]] || ((global_scans != 0)); then
-      echo "${node} startup reported node=${node_id} global_head_scans_total=${global_scans} scoped_head_scans_total=${scoped_scans}" >&2
+    if [[ "${node_id}" != "${expected_node_id}" ]]; then
+      echo "${node} startup scan evidence reported node=${node_id}" >&2
       return 1
     fi
+    for field in \
+      global_object_head_scans_total \
+      global_index_artifact_scans_total \
+      global_blob_scans_total \
+      global_cache_scans_total
+    do
+      value="$(log_unsigned_field "${field}" "${line}")" || {
+        echo "${node} startup scan evidence omitted ${field}" >&2
+        return 1
+      }
+      if [[ "${value}" != "0" ]]; then
+        echo "${node} startup reported ${field}=${value}" >&2
+        return 1
+      fi
+    done
     count=$((count + 1))
   done < <(
     service_logs "${node}" \
-      | grep -F 'anvil_index_startup_scan_evidence' || true
+      | grep -F 'anvil_startup_scan_evidence' || true
   )
   if ((count < minimum_count)); then
     echo "${node} startup emitted ${count} measured scan samples; expected at least ${minimum_count}" >&2
@@ -523,87 +565,140 @@ create_bucket() {
     | grep -Fq "bucket=${bucket}"
 }
 
-prepare_and_start_node() {
-  local node_id="$1"
-  local service="anvil-${node_id}"
-  local peer_address="${service}:50052"
-  local leader
-  local output=""
-  local bundle_path=""
-  local source_service=""
-  for leader in anvil-1 anvil-2 anvil-3; do
-    if ! compose ps --status running --services | grep -Fxq "${leader}"; then
-      continue
-    fi
-    if output="$(run_bootstrap_cli "${leader}" prepare-node \
-      "${node_id}" "${peer_address}" 2>&1)"
-    then
-      bundle_path="$(sed -n 's/^bundle=\([^ ]*\) .*/\1/p' <<<"${output}")"
-      source_service="${leader}"
-      break
-    fi
-  done
-  if [[ "${bundle_path}" != "/var/lib/anvil/anvil-node-${node_id}.join.json" ]]; then
-    echo "node ${node_id} preparation did not return its expected private bundle" >&2
-    echo "last administration output: ${output}" >&2
-    return 1
-  fi
-
-  local copied="${ANVIL_QUALIFICATION_DIR}/artifacts/anvil-node-${node_id}.join.json"
-  compose cp "${source_service}:${bundle_path}" "${copied}"
-  chmod 0600 "${copied}"
-  docker run --rm --user 0 \
-    --volume "${copied}:/join-bundle" \
-    "${image_id}" chown 10001:10001 /join-bundle
-
-  compose up --detach "${service}"
-  wait_for_node "${service}"
-  assert_sparse_index_startup "${service}" 1
-  if [[ -e "${copied}" ]]; then
-    echo "${service} became ready without consuming and deleting its join bundle" >&2
-    return 1
-  fi
-}
-
 run_index_resource_qualification() {
   local -A resource_log_starts=()
   local containers=()
   local resource_node
+  assert_source_tree_exact
   for resource_node in anvil-1 anvil-2 anvil-3; do
     containers+=("$(service_container "${resource_node}")")
     resource_log_starts["${resource_node}"]="$(log_line_count "${resource_node}")"
   done
   ANVIL_V06_RESOURCE_ENDPOINTS="$(IFS=,; echo "${public_endpoints[*]}")" \
-  ANVIL_V06_RESOURCE_TENANT=qindex-resource \
-  ANVIL_V06_RESOURCE_BUCKET="index-resource-${$}" \
-  ANVIL_V06_RESOURCE_CLIENT_ID=qindex-resource-client \
+  ANVIL_V06_RESOURCE_TENANT="${index_resource_tenant}" \
+  ANVIL_V06_RESOURCE_BUCKET="${index_resource_bucket}" \
+  ANVIL_V06_RESOURCE_CLIENT_ID="${index_resource_client}" \
   ANVIL_V06_RESOURCE_CLIENT_SECRET="${index_resource_secret}" \
   ANVIL_V06_RESOURCE_RECORDS="${index_resource_records}" \
   ANVIL_V06_RESOURCE_MUTATIONS="${index_resource_mutations}" \
-  ANVIL_V06_RESOURCE_BATCH_SIZE=256 \
+  ANVIL_V06_RESOURCE_BATCH_SIZE=1000 \
   ANVIL_V06_RESOURCE_WORKERS=6 \
   ANVIL_V06_RESOURCE_VERIFICATION_WORKERS=8 \
   ANVIL_V06_RESOURCE_CONTAINERS="$(IFS=,; echo "${containers[*]}")" \
   ANVIL_V06_REQUIRE_RESOURCE_TARGETS=1 \
   ANVIL_V06_KIND_BUDGET_BYTES="${index_kind_budget_bytes}" \
+  ANVIL_V06_INDEX_COMPACTION_MAX_LANES="${index_compaction_max_lanes}" \
   ANVIL_V06_INDEX_RAYON_WORKERS="${index_rayon_workers}" \
   ANVIL_V06_MAX_ANONYMOUS_GROWTH_BYTES="${index_resource_max_anonymous_growth_bytes}" \
+  ANVIL_V08_REQUIRE_PERFORMANCE_TARGETS="${require_performance_targets}" \
+  ANVIL_V08_EVIDENCE_SOURCE_COMMIT="${source_commit}" \
+  ANVIL_V08_EVIDENCE_CONTAINER_DIGEST="${image_id}" \
+  ANVIL_V08_EVIDENCE_NATIVE_ARCHITECTURE="${native_architecture}" \
+  ANVIL_V08_EVIDENCE_CONTAINER_PLATFORM="${container_platform}" \
+  ANVIL_V08_EVIDENCE_TOPOLOGY=three-node \
+  ANVIL_V08_EVIDENCE_NODE_COUNT=3 \
+  ANVIL_V08_EVIDENCE_HARDWARE_LOGICAL_CPUS="${hardware_logical_cpus}" \
+  ANVIL_V08_EVIDENCE_HARDWARE_MEMORY_BYTES="${hardware_memory_bytes}" \
+  ANVIL_V08_EVIDENCE_FILESYSTEM_TOTAL_BYTES="${qualification_filesystem_total_bytes}" \
+  ANVIL_V08_EVIDENCE_FILESYSTEM_AVAILABLE_BYTES="${qualification_filesystem_available_bytes}" \
+  ANVIL_V08_EVIDENCE_INDEX_DISK_CACHE_BYTES_PER_NODE="${index_disk_cache_bytes}" \
+  ANVIL_V08_EVIDENCE_INDEX_MEMORY_PERCENT_PER_NODE="${index_memory_percent}" \
   ANVIL_V06_RESOURCE_OUTPUT="${index_resource_report}" \
+  ANVIL_V06_RESOURCE_STATE_OUTPUT="${index_resource_state}" \
     "${qualification_binaries[v06_index_resource_qualification]}" >/dev/null
   for resource_node in anvil-1 anvil-2 anvil-3; do
-    save_log_suffix \
-      "${resource_node}" "${resource_log_starts[${resource_node}]}" \
-      "${ANVIL_QUALIFICATION_DIR}/artifacts/index-resource-${resource_node}.log"
+    capture_three_node_resource_evidence \
+      "${resource_node}" "${resource_log_starts[${resource_node}]}"
   done
   test -s "${index_resource_report}"
+  test -s "${index_resource_state}"
   grep -Eq "^[[:space:]]*\"records\":[[:space:]]*${index_resource_records},?[[:space:]]*$" \
     "${index_resource_report}"
   grep -Eq '^[[:space:]]*"indexed_fields":[[:space:]]*12,?[[:space:]]*$' \
     "${index_resource_report}"
+  jq -e \
+    --arg source_commit "${source_commit}" \
+    --arg container_digest "${image_id}" \
+    --arg native_architecture "${native_architecture}" \
+    --arg container_platform "${container_platform}" \
+    --argjson hardware_logical_cpus "${hardware_logical_cpus}" \
+    --argjson hardware_memory_bytes "${hardware_memory_bytes}" \
+    --argjson filesystem_total_bytes "${qualification_filesystem_total_bytes}" \
+    --argjson filesystem_available_bytes "${qualification_filesystem_available_bytes}" \
+    --argjson disk_cache_bytes "${index_disk_cache_bytes}" \
+    --argjson memory_percent "${index_memory_percent}" \
+    --argjson kind_budget_bytes "${index_kind_budget_bytes}" \
+    --argjson compaction_lanes "${index_compaction_max_lanes}" \
+    --argjson rayon_workers "${index_rayon_workers}" \
+    --argjson maximum_growth "${index_resource_max_anonymous_growth_bytes}" \
+    --argjson performance_targets_required "${require_performance_targets}" \
+    '
+      .evidence.source_commit == $source_commit and
+      .evidence.resolved_container_digest == $container_digest and
+      .evidence.native_architecture == $native_architecture and
+      .evidence.container_platform == $container_platform and
+      .evidence.hardware.logical_cpus == $hardware_logical_cpus and
+      .evidence.hardware.memory_bytes == $hardware_memory_bytes and
+      .evidence.hardware.qualification_filesystem_total_bytes == $filesystem_total_bytes and
+      .evidence.hardware.qualification_filesystem_available_bytes_at_start == $filesystem_available_bytes and
+      .evidence.corpus.identity == "anvil.synthetic-index-resource.initial.v1" and
+      (.evidence.corpus.initial_corpus_sha256 | test("^sha256:[0-9a-f]{64}$")) and
+      .evidence.corpus.records == .records and
+      .evidence.corpus.indexed_fields == .indexed_fields and
+      .evidence.topology.kind == "three-node" and
+      .evidence.topology.node_count == 3 and
+      .evidence.topology.ingress_endpoint_count == 3 and
+      .evidence.durability.initial_writes == "LOCAL" and
+      .evidence.durability.updates == "LOCAL" and
+      .evidence.durability.deletes == "LOCAL" and
+      .evidence.execution.bulk_write_max_operations == .batch_size and
+      .evidence.execution.ingest_workers == .ingest_workers and
+      .evidence.execution.verification_workers == .verification_workers and
+      .evidence.resource_configuration.index_disk_cache_bytes_per_node == $disk_cache_bytes and
+      .evidence.resource_configuration.index_memory_percent_per_node == $memory_percent and
+      .evidence.resource_configuration.builder_memory_bytes_per_kind_per_node == $kind_budget_bytes and
+      .evidence.resource_configuration.compaction_max_lanes_per_kind == $compaction_lanes and
+      .evidence.resource_configuration.rayon_workers_per_node == $rayon_workers and
+      .evidence.resource_configuration.maximum_anonymous_growth_bytes == $maximum_growth and
+      .evidence.resource_configuration.monitored_target_count == 3 and
+      .evidence.resource_configuration.resource_targets_required == true and
+      (.evidence.timer_boundaries | to_entries | all(.value | if type == "object" then (.starts | length > 0) and (.stops | length > 0) else length > 0 end)) and
+      .evidence.correctness.result == "pass" and
+      .evidence.correctness.source_complete_generation_observed == true and
+      .evidence.correctness.source_complete_sources_observed == 3 and
+      .evidence.correctness.initial_exact_partition_verification == true and
+      .evidence.correctness.final_exact_partition_verification == true and
+      .evidence.correctness.update_and_delete_verification == true and
+      .evidence.correctness.resource_limits_passed == true and
+      .evidence.correctness.performance_targets_required == ($performance_targets_required == 1) and
+      (if $performance_targets_required == 1
+       then .evidence.correctness.performance_targets_passed == true
+       else .evidence.correctness.performance_targets_passed == null
+       end)
+    ' "${index_resource_report}" >/dev/null
+  if ((require_performance_targets == 1)); then
+    jq -e '
+      .accepted_objects_per_second >= 10000 and
+      .source_complete_objects_per_second >= 10000 and
+      .timings.first_complete_generation_seconds <= 150
+    ' "${index_resource_report}" >/dev/null
+  fi
   echo "[anvil-qualification] bounded distributed index resource qualification passed scope=${index_resource_scope} records=${index_resource_records} kind_budget=${index_kind_budget_bytes}"
   echo "[anvil-qualification] preserved resource report ${index_resource_report}"
+  echo "[anvil-qualification] preserved full production telemetry ${index_resource_telemetry_prefix}-anvil-{1,2,3}.log"
 }
 
+verify_index_resource_state() {
+  local endpoint="$1"
+  ANVIL_V06_RESOURCE_ENDPOINTS="${endpoint}" \
+  ANVIL_V06_RESOURCE_TENANT="${index_resource_tenant}" \
+  ANVIL_V06_RESOURCE_BUCKET="${index_resource_bucket}" \
+  ANVIL_V06_RESOURCE_CLIENT_ID="${index_resource_client}" \
+  ANVIL_V06_RESOURCE_CLIENT_SECRET="${index_resource_secret}" \
+  ANVIL_V06_RESOURCE_VERIFICATION_WORKERS=8 \
+  ANVIL_V06_RESOURCE_STATE_INPUT="${index_resource_state}" \
+    "${qualification_binaries[v06_index_resource_qualification]}"
+}
 assert_index_resource_bounds() {
   local -A observed_kinds=()
   local configured
@@ -740,6 +835,9 @@ assert_index_resource_bounds() {
     return 1
   fi
 
+  if [[ "${index_resource_scope}" == "release-corpus" ]]; then
+    assert_production_resource_compaction
+  fi
   local cache_bytes
   for resource_node in 1 2 3; do
     cache_bytes="$(find \
@@ -770,6 +868,7 @@ save_index_qualification_logs() {
     start_line=$((index_qualification_log_start["${node}"] + 1))
     service_logs "${node}" | tail -n "+${start_line}" \
       >"${ANVIL_QUALIFICATION_DIR}/artifacts/index-${node}.log"
+    preserve_all_kind_telemetry "${ANVIL_QUALIFICATION_DIR}/artifacts/index-${node}.log" three "${qualification_suffix}" "${node}"
   done
 }
 
@@ -783,6 +882,7 @@ assert_compaction_telemetry_for_kind() {
   local expected
   local line
   local observed=0
+  local peak_active
   local range_limit
   local ranges
   local worker_limit
@@ -793,13 +893,15 @@ assert_compaction_telemetry_for_kind() {
       || return 1
     budget_limit="$(log_unsigned_field gauge.anvil_index_compaction_budget_limit "${line}")" \
       || return 1
-    effective="$(log_unsigned_field gauge.anvil_index_compaction_effective_lanes "${line}")" \
+    effective="$(log_unsigned_field compaction.effective_lanes "${line}")" \
       || return 1
     range_limit="$(log_unsigned_field gauge.anvil_index_compaction_range_limit "${line}")" \
       || return 1
     ranges="$(log_unsigned_field gauge.anvil_index_compaction_ranges_total "${line}")" \
       || return 1
     completed="$(log_unsigned_field gauge.anvil_index_compaction_ranges_completed "${line}")" \
+      || return 1
+    peak_active="$(log_unsigned_field gauge.anvil_index_compaction_peak_active_lanes "${line}")" \
       || return 1
     expected="${index_compaction_max_lanes}"
     ((worker_limit < expected)) && expected="${worker_limit}"
@@ -812,6 +914,8 @@ assert_compaction_telemetry_for_kind() {
       || budget_limit < 1 \
       || ranges < 1 \
       || effective != expected \
+      || peak_active < 1 \
+      || peak_active > effective \
       || completed != ranges)) \
       || ! unsigned_decimal_is_positive "${range_limit}" \
       || [[ "${line}" != *"anvil.index.compaction"* ]]
@@ -820,14 +924,14 @@ assert_compaction_telemetry_for_kind() {
       printf '%s\n' "${line}" >&2
       return 1
     fi
-    observed=$((observed + 1))
+    observed=$((observed + (effective >= 2 && peak_active >= 2)))
   done < <(
     awk -v kind="index.kind=${kind}" '
       index($0, kind) && index($0, "index compaction terminal metrics")
     ' "${log}"
   )
   if ((observed == 0)); then
-    echo "${kind} emitted no terminal range-compaction metrics and trace context" >&2
+    echo "${kind} emitted no terminal compaction with at least two effective and concurrently active lanes" >&2
     return 1
   fi
   if ! awk -v kind="index.kind=${kind}" '
@@ -839,6 +943,32 @@ assert_compaction_telemetry_for_kind() {
     echo "${kind} emitted no distributed builder trace and completion log" >&2
     return 1
   fi
+}
+
+assert_production_resource_compaction() {
+  local builder=
+  local builders=0
+  local node
+  local log
+  for node in anvil-1 anvil-2 anvil-3; do
+    log="${ANVIL_QUALIFICATION_DIR}/artifacts/index-resource-${node}.log"
+    if awk '
+          index($0, "index.kind=TypedJson") &&
+          index($0, "index compaction terminal metrics") { found = 1 }
+          END { exit !found }
+        ' "${log}"
+    then
+      builder="${node}"
+      builders=$((builders + 1))
+    fi
+  done
+  if ((builders != 1)); then
+    echo "production-shaped TypedJson compaction completed on ${builders} nodes; expected exactly one builder" >&2
+    return 1
+  fi
+  assert_compaction_telemetry_for_kind \
+    TypedJson "${ANVIL_QUALIFICATION_DIR}/artifacts/index-resource-${builder}.log"
+  echo "[anvil-qualification] production-shaped TypedJson compaction completed on its sole builder"
 }
 
 assert_one_builder_published_and_compacted_each_index_kind() {
@@ -863,7 +993,7 @@ assert_one_builder_published_and_compacted_each_index_kind() {
         publisher_node="${node}"
       fi
       if awk -v kind="index.kind=${kind}" '
-            index($0, kind) && index($0, "index runs compacted") { found = 1 }
+            index($0, kind) && index($0, "index runs compacted") && $0 ~ /histogram\.anvil_index_compaction_input_runs=([2-9]|[1-9][0-9]+)([[:space:]]|$)/ { found = 1 }
             END { exit !found }
           ' "${ANVIL_QUALIFICATION_DIR}/artifacts/index-${node}.log"
       then
@@ -1496,7 +1626,14 @@ cmp "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-two-large.bin" \
 require_qprobe_head anvil-1 growth/from-two.bin "${growth_two_head}"
 echo "[anvil-qualification] two-node REPLICATED read succeeded without its ingress copy"
 
-prepare_and_start_node 3
+prepare_no_event_membership_cutover_qualification anvil-2 2 qprobe-client "${qprobe_secret}" qprobe objects "${gap_source_journal_max_entries}"
+prepare_joining_node 3
+prepare_indexed_membership_cutover_qualification \
+  anvil-1 1 anvil-2 qindex-membership \
+  qindex-membership-client "${index_membership_secret}" \
+  "${index_membership_state}" "${gap_source_journal_max_entries}"
+start_prepared_node_during_indexed_cutover 3
+qualify_no_event_membership_cutover anvil-2 2 qprobe-client "${qprobe_secret}" qprobe objects "${gap_source_journal_max_entries}"
 membership_three_endpoints="$(public_endpoint_for anvil-1),$(public_endpoint_for anvil-2),$(public_endpoint_for anvil-3)"
 run_live_builder_reassignment_qualification \
   3 "${membership_three_endpoints}" anvil-3
@@ -1570,6 +1707,8 @@ done
 index_gap_secret=qualification-index-gap-secret-0000000000000000000000
 provision_tenant qindex-gap qindex-gap-client "${index_gap_secret}"
 run_real_journal_gap_qualification
+preserve_journal_pressure_evidence "${journal_pressure_evidence_prefix}"
+start_release_source_journal_phase "${release_source_journal_max_entries}"
 
 index_secret=qualification-index-secret-00000000000000000000000
 provision_tenant qindex qindex-client "${index_secret}"
@@ -1586,10 +1725,12 @@ save_index_qualification_logs
 echo "[anvil-qualification] distributed index qualification passed"
 assert_one_builder_published_and_compacted_each_index_kind
 
-index_resource_secret=qualification-index-resource-secret-000000000000000000
-provision_tenant qindex-resource qindex-resource-client "${index_resource_secret}"
-run_index_resource_qualification
-assert_index_resource_bounds
+configure_three_node_resource_qualification
+if [[ "${qualification_mode}" == "release" ]]; then
+  run_scale_baseline_resource_qualification three
+fi
+run_exact_resource_scale_qualification three
+verify_index_resource_state "${public_endpoints[0]}"
 
 accounting_secret=qualification-accounting-secret-000000000000000000000
 provision_tenant qaccounting qaccounting-client "${accounting_secret}"
@@ -1772,6 +1913,8 @@ for node in anvil-1 anvil-2 anvil-3; do
     echo "${node} populated restart exceeded 30 seconds" >&2
     exit 1
   fi
+  service_logs "${node}" | preserve_startup_scan_evidence \
+    "/var/tmp/anvil-v080-three-startup-scans-${qualification_suffix}-${node}.log"
   assert_sparse_index_startup "${node}" "$((sparse_starts_before + 1))"
   rm -f "${ANVIL_QUALIFICATION_DIR}/artifacts/restart-read.txt"
   run_cli "${node}" qrestart-client "${restart_secret}" \
@@ -1780,6 +1923,7 @@ for node in anvil-1 anvil-2 anvil-3; do
   cmp "${ANVIL_QUALIFICATION_DIR}/artifacts/restart.txt" \
     "${ANVIL_QUALIFICATION_DIR}/artifacts/restart-read.txt"
   verify_existing_indexes
+  verify_index_resource_state "$(public_endpoint_for "${node}")"
   echo "[anvil-qualification] ${node} restart preserved every final complete index generation through all public endpoints"
   for growth_object in from-one from-two; do
     case "${growth_object}" in
