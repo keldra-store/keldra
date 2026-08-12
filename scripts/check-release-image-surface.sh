@@ -86,6 +86,7 @@ fi
 
 grep -Fq 'FROM --platform=$TARGETPLATFORM rust:1.96-trixie AS builder' crates/anvil/Dockerfile
 grep -Fq 'FROM --platform=$TARGETPLATFORM debian:trixie-slim' crates/anvil/Dockerfile
+grep -Fq 'org.opencontainers.image.revision=' crates/anvil/Dockerfile
 grep -Fxq 'EXPOSE 50051 50052' crates/anvil/Dockerfile
 if grep -REn 'ANVIL_GATEWAY_LISTEN|50053' \
   crates/anvil/src \
@@ -101,3 +102,5 @@ then
 fi
 grep -Fq -- '--file crates/anvil/Dockerfile' scripts/build-image.sh
 grep -Fq -- '--file crates/anvil/Dockerfile' "${release_workflow}"
+grep -Fq -- '--build-arg "ANVIL_SOURCE_REVISION=${source_revision}"' scripts/build-image.sh
+grep -Fq -- '--build-arg "ANVIL_SOURCE_REVISION=${SOURCE_COMMIT}"' "${release_workflow}"

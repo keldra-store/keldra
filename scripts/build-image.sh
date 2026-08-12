@@ -2,6 +2,12 @@
 set -euo pipefail
 
 image="${ANVIL_IMAGE:-anvil:test}"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source_commit="$(git -C "${repo_root}" rev-parse --verify 'HEAD^{commit}')"
+source_revision="${source_commit}"
+if [[ -n "$(git -C "${repo_root}" status --porcelain=v1 --untracked-files=normal)" ]]; then
+  source_revision="${source_commit}-dirty"
+fi
 
 case "${ANVIL_DOCKER_PLATFORM:-}" in
   "")
@@ -35,6 +41,7 @@ iid_file="$(mktemp -t anvil-image.XXXXXX)"
 trap 'rm -f "${iid_file}"' EXIT
 docker buildx build \
   --platform "${platform}" \
+  --build-arg "ANVIL_SOURCE_REVISION=${source_revision}" \
   --load \
   --iidfile "${iid_file}" \
   --file crates/anvil/Dockerfile \

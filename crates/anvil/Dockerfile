@@ -21,7 +21,7 @@ WORKDIR /usr/src/anvil
 
 COPY . .
 
-# Build the 0.7 server and CLI in release mode. BuildKit cache mounts keep
+# Build the 0.8 server and CLI in release mode. BuildKit cache mounts keep
 # Cargo's registry, git checkout cache, and target directory outside the image
 # layer so repeat local/CI Docker builds reuse compiled dependencies.
 RUN --mount=type=cache,id=anvil-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
@@ -39,6 +39,9 @@ RUN --mount=type=cache,id=anvil-cargo-registry,target=/usr/local/cargo/registry,
 # Rust tooling is deliberately absent from the matching target-platform
 # runtime image.
 FROM --platform=$TARGETPLATFORM debian:trixie-slim
+ARG ANVIL_SOURCE_REVISION=unknown
+
+LABEL org.opencontainers.image.revision="${ANVIL_SOURCE_REVISION}"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
@@ -66,8 +69,8 @@ ENV ANVIL_LISTEN=0.0.0.0:50051 \
     ANVIL_MUTATION_RECEIPT_RETENTION_SECONDS=86400 \
     ANVIL_MAX_MUTATION_RECEIPT_ENTRIES=2000000 \
     ANVIL_MAX_MUTATION_RECEIPT_BYTES=536870912 \
-    ANVIL_WATCH_MAX_ENTRIES=1000000 \
-    ANVIL_WATCH_MAX_BYTES=536870912
+    ANVIL_SOURCE_JOURNAL_MAX_ENTRIES=1000000 \
+    ANVIL_SOURCE_JOURNAL_MAX_BYTES=536870912
 USER anvil
 WORKDIR /var/lib/anvil
 
