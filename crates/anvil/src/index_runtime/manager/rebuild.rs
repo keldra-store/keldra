@@ -597,6 +597,7 @@ async fn project_snapshot_batch_inner(
     dependencies: &IndexBuilderDependencies,
 ) -> Result<ProjectionWaveTotals, Status> {
     let fetched = fetch_projection_sources(sources, effective_lanes, dependencies).await?;
+    let source_count = fetched.len();
     let lanes = partition_projection_lanes(fetched, effective_lanes);
     let mut senders = Vec::with_capacity(lanes.len());
     let mut receivers = Vec::with_capacity(lanes.len());
@@ -646,22 +647,27 @@ async fn project_snapshot_batch_inner(
 
     let mut totals = ProjectionWaveTotals::default();
     let mut failure = None;
-    'ordered: for receiver in &mut receivers {
-        while let Some(projected) = receiver.recv().await {
-            match projected {
-                Ok((mutation, diagnostics)) => {
-                    totals.accepted = totals.accepted.saturating_add(diagnostics.accepted_objects);
-                    totals.skipped = totals.skipped.saturating_add(diagnostics.skipped_objects);
-                    candidate.diagnostics.add(diagnostics);
-                    if let Err(error) = builder.push(mutation).await {
-                        failure = Some(index_status(error));
-                        break 'ordered;
-                    }
-                }
-                Err(error) => {
+    for position in 0..source_count {
+        let projected = match receive_ordered_lane_item(&mut receivers, position).await {
+            Some(projected) => projected,
+            None => {
+                failure = Some(Status::internal("projection lane omitted a source"));
+                break;
+            }
+        };
+        match projected {
+            Ok((mutation, diagnostics)) => {
+                totals.accepted = totals.accepted.saturating_add(diagnostics.accepted_objects);
+                totals.skipped = totals.skipped.saturating_add(diagnostics.skipped_objects);
+                candidate.diagnostics.add(diagnostics);
+                if let Err(error) = builder.push(mutation).await {
                     failure = Some(index_status(error));
-                    break 'ordered;
+                    break;
                 }
+            }
+            Err(error) => {
+                failure = Some(index_status(error));
+                break;
             }
         }
     }
@@ -675,6 +681,18 @@ async fn project_snapshot_batch_inner(
     totals.queue_seconds = timing.queue_seconds;
     totals.cpu_seconds = timing.cpu_seconds;
     Ok(totals)
+}
+
+async fn receive_ordered_lane_item<T>(
+    receivers: &mut [tokio::sync::mpsc::Receiver<T>],
+    position: usize,
+) -> Option<T> {
+    let lane_count = receivers.len();
+    if lane_count == 0 {
+        return None;
+    }
+    let lane = position % lane_count;
+    receivers[lane].recv().await
 }
 
 async fn fetch_projection_sources(
@@ -770,15 +788,11 @@ fn fill_projection_fetches(
 
 fn partition_projection_lanes<T>(values: Vec<T>, lane_count: usize) -> Vec<Vec<T>> {
     let lane_count = lane_count.min(values.len()).max(1);
-    let base = values.len() / lane_count;
-    let remainder = values.len() % lane_count;
-    let mut values = values.into_iter();
-    (0..lane_count)
-        .map(|lane| {
-            let length = base + usize::from(lane < remainder);
-            values.by_ref().take(length).collect()
-        })
-        .collect()
+    let mut lanes = (0..lane_count).map(|_| Vec::new()).collect::<Vec<_>>();
+    for (position, value) in values.into_iter().enumerate() {
+        lanes[position % lane_count].push(value);
+    }
+    lanes
 }
 
 pub(super) fn measure_snapshot_frame(frame: &[IndexSourceSnapshotHead]) -> Result<u64, Status> {
@@ -850,8 +864,65 @@ mod tests {
         let lanes = partition_projection_lanes((0_u64..11).collect(), 4);
         assert_eq!(lanes.iter().map(Vec::len).collect::<Vec<_>>(), [3, 3, 3, 2]);
         assert_eq!(
-            lanes.into_iter().flatten().collect::<Vec<_>>(),
+            (0..11)
+                .map(|position| lanes[position % lanes.len()][position / lanes.len()])
+                .collect::<Vec<_>>(),
             (0_u64..11).collect::<Vec<_>>()
         );
+    }
+
+    #[tokio::test]
+    async fn projection_lanes_all_progress_while_results_remain_ordered() {
+        let lanes = partition_projection_lanes((0_u64..6).collect(), 3);
+        let (progress_sender, mut progress_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut receivers = Vec::new();
+        let mut tasks = Vec::new();
+        for lane in lanes {
+            let (sender, receiver) = tokio::sync::mpsc::channel(1);
+            receivers.push(receiver);
+            let progress_sender = progress_sender.clone();
+            tasks.push(tokio::task::spawn_blocking(move || {
+                for value in lane {
+                    sender.blocking_send(value).unwrap();
+                    progress_sender.send(value).unwrap();
+                }
+            }));
+        }
+        drop(progress_sender);
+
+        let mut first_round = Vec::new();
+        for _ in 0..3 {
+            first_round.push(progress_receiver.recv().await.unwrap());
+        }
+        first_round.sort_unstable();
+        assert_eq!(first_round, [0, 1, 2]);
+
+        let mut delivered = Vec::new();
+        for position in 0..3 {
+            delivered.push(
+                receive_ordered_lane_item(&mut receivers, position)
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        let mut second_round = Vec::new();
+        for _ in 0..3 {
+            second_round.push(progress_receiver.recv().await.unwrap());
+        }
+        second_round.sort_unstable();
+        assert_eq!(second_round, [3, 4, 5]);
+
+        for position in 3..6 {
+            delivered.push(
+                receive_ordered_lane_item(&mut receivers, position)
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert_eq!(delivered, (0_u64..6).collect::<Vec<_>>());
+        for task in tasks {
+            task.await.unwrap();
+        }
     }
 }
