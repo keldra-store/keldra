@@ -32,11 +32,10 @@ use super::engine::{
     IndexBuildObject, IndexSourceMutation, kind_for_specification, merge_runs_parallel,
     project_mutation, projection_admission_bytes,
 };
-use super::events::{
-    IndexBarrier, IndexEventError, IndexEventJournal, IndexJournalPage, IndexRoutedLag,
-};
+use super::events::{IndexBarrier, IndexEventError, IndexEventJournal, IndexJournalPage};
 use super::generation::ManifestRun;
 use super::placement::{IndexIdentity, IndexPlacement};
+use super::publication::DerivedArtifactAdmission;
 use super::publisher::{IndexGenerationPublisher, PublishedGeneration};
 use super::retention::{IndexGenerationRetention, IndexRetentionTask};
 use super::scanner::{ClusterIndexScanner, ClusterIndexSourceSnapshot};
@@ -46,9 +45,6 @@ use super::telemetry::{
     emit_compaction_debt,
 };
 
-#[path = "manager/automatic_rebuild.rs"]
-mod automatic_rebuild;
-use automatic_rebuild::RebuildSelection;
 #[path = "manager/catch_up.rs"]
 mod catch_up;
 use catch_up::{journal_source_paths, process_journal_page};
@@ -640,7 +636,6 @@ struct BuilderJob {
     definition: CatalogDefinition,
     specification: IndexSpecification,
     kind: IndexKind,
-    force_snapshot_rebuild: bool,
     phase: BuilderPhase,
 }
 
@@ -652,7 +647,6 @@ impl BuilderJob {
             definition,
             specification,
             kind,
-            force_snapshot_rebuild: false,
             phase: BuilderPhase::Inspect,
         })
     }
@@ -687,11 +681,6 @@ struct CatchUpWork {
     current: Option<PublishedGeneration>,
     through: IndexBarrier,
     target: IndexBarrier,
-    // Present only for an incremental candidate. The cursor advances over new
-    // routed suffixes at quantum boundaries, so threshold checks never rescan
-    // the already measured unpublished lag. A bulk snapshot's own suffix must
-    // complete that snapshot candidate and therefore leaves this unset.
-    automatic_rebuild_lag: Option<IndexRoutedLag>,
     candidate: CandidateGeneration,
     changed: bool,
     must_publish: bool,
@@ -704,6 +693,7 @@ struct PublishWork {
     current: Option<PublishedGeneration>,
     barrier: IndexBarrier,
     candidate: CandidateGeneration,
+    admission: DerivedArtifactAdmission,
 }
 
 struct BuilderStep {
@@ -766,7 +756,7 @@ async fn advance_builder(
 }
 
 async fn inspect_builder(
-    job: &mut BuilderJob,
+    job: &BuilderJob,
     dependencies: &IndexBuilderDependencies,
 ) -> Result<
     (
@@ -787,8 +777,7 @@ async fn inspect_builder(
         )
         .await?;
     emit_publication_age(job.kind, current.as_ref());
-    if !job.force_snapshot_rebuild
-        && let Some(current) = current.as_ref()
+    if let Some(current) = current.as_ref()
         && current.manifest.definition_version == definition.object_version
         && current.manifest.kind == job.kind
     {
@@ -805,73 +794,50 @@ async fn inspect_builder(
                 DerivedBarrierEvidence::Published(published.clone()),
             )
             .await;
-        let selection = automatic_rebuild::select(
-            definition.stored.index_id,
-            definition.tenant_id,
-            definition.bucket_id,
-            job.kind,
-            &dependencies.journal,
-            &published,
-            &target,
-            dependencies.config,
-        )
-        .await
-        .map_err(event_status)?;
-        if let RebuildSelection::Incremental(automatic_rebuild_lag) = selection {
-            let from = published.clone();
-            let retention_current = Some(current.clone());
-            emit_source_lag(job.kind, &from, &target);
-            if from == target {
-                if debt::select(&current.manifest.runs, DebtLimits::maintenance()).is_some() {
-                    return Ok((
-                        BuilderPhase::CatchUp(CatchUpWork {
-                            current: Some(current.clone()),
-                            through: target.clone(),
-                            target,
-                            automatic_rebuild_lag: Some(automatic_rebuild_lag),
-                            candidate: CandidateGeneration::incremental(current),
-                            changed: false,
-                            must_publish: true,
-                            maintenance: true,
-                            progress: BuilderProgress::start(
-                                telemetry_identity,
-                                BuilderProgressPhase::CatchUp,
-                            ),
-                        }),
-                        BuilderDisposition::Ready,
-                        retention_current,
-                    ));
-                }
+        let from = published.clone();
+        let retention_current = Some(current.clone());
+        emit_source_lag(job.kind, &from, &target);
+        if from == target {
+            if debt::select(&current.manifest.runs, DebtLimits::maintenance()).is_some() {
                 return Ok((
-                    BuilderPhase::Inspect,
-                    BuilderDisposition::Idle,
+                    BuilderPhase::CatchUp(CatchUpWork {
+                        current: Some(current.clone()),
+                        through: target.clone(),
+                        target,
+                        candidate: CandidateGeneration::incremental(current),
+                        changed: false,
+                        must_publish: true,
+                        maintenance: true,
+                        progress: BuilderProgress::start(
+                            telemetry_identity,
+                            BuilderProgressPhase::CatchUp,
+                        ),
+                    }),
+                    BuilderDisposition::Ready,
                     retention_current,
                 ));
             }
-            let candidate = CandidateGeneration::incremental(current);
             return Ok((
-                BuilderPhase::CatchUp(CatchUpWork {
-                    current: Some(current.clone()),
-                    through: from,
-                    target,
-                    automatic_rebuild_lag: Some(automatic_rebuild_lag),
-                    candidate,
-                    changed: false,
-                    must_publish: false,
-                    maintenance: false,
-                    progress: BuilderProgress::start(
-                        telemetry_identity,
-                        BuilderProgressPhase::CatchUp,
-                    ),
-                }),
-                BuilderDisposition::Ready,
+                BuilderPhase::Inspect,
+                BuilderDisposition::Idle,
                 retention_current,
             ));
-        } else {
-            // Preserve the deterministic decision if opening the disposable
-            // snapshot must retry before this inspect quantum completes.
-            job.force_snapshot_rebuild = true;
         }
+        let candidate = CandidateGeneration::incremental(current);
+        return Ok((
+            BuilderPhase::CatchUp(CatchUpWork {
+                current: Some(current.clone()),
+                through: from,
+                target,
+                candidate,
+                changed: false,
+                must_publish: false,
+                maintenance: false,
+                progress: BuilderProgress::start(telemetry_identity, BuilderProgressPhase::CatchUp),
+            }),
+            BuilderDisposition::Ready,
+            retention_current,
+        ));
     }
 
     tracing::info!(
@@ -923,14 +889,6 @@ async fn inspect_builder(
         .journal
         .barrier_from_snapshot_tails(snapshot.placement_fence(), expected_atomic, &tails)
         .map_err(event_status)?;
-    dependencies
-        .derived_progress
-        .report(
-            derived_identity(definition),
-            DerivedBarrierEvidence::ScopedSnapshot(through.clone()),
-        )
-        .await;
-    job.force_snapshot_rebuild = false;
     Ok((
         BuilderPhase::Rebuild(RebuildWork {
             current,
@@ -950,7 +908,7 @@ async fn inspect_builder(
 }
 
 async fn advance_catch_up(
-    job: &mut BuilderJob,
+    job: &BuilderJob,
     mut work: CatchUpWork,
     dependencies: &IndexBuilderDependencies,
 ) -> Result<
@@ -961,47 +919,6 @@ async fn advance_catch_up(
     ),
     Status,
 > {
-    if let Some(observed) = work.automatic_rebuild_lag.as_ref() {
-        let target = dependencies
-            .journal
-            .capture_barrier()
-            .await
-            .map_err(event_status)?;
-        match automatic_rebuild::recheck(
-            job.definition.stored.index_id,
-            job.definition.tenant_id,
-            job.definition.bucket_id,
-            job.kind,
-            &dependencies.journal,
-            observed,
-            &target,
-            dependencies.config,
-        )
-        .await
-        .map_err(event_status)?
-        {
-            RebuildSelection::Incremental(lag) => {
-                work.automatic_rebuild_lag = Some(lag);
-            }
-            RebuildSelection::ScopedSnapshot => {
-                tracing::info!(
-                    index.id = job.definition.stored.index_id,
-                    tenant.id = job.definition.tenant_id,
-                    bucket.id = job.definition.bucket_id,
-                    index.kind = ?job.kind,
-                    monotonic_counter.anvil_index_incremental_candidates_preempted_total = 1_u64,
-                    "index incremental candidate yielded to a scoped rebuild"
-                );
-                work.progress.complete();
-                job.force_snapshot_rebuild = true;
-                return Ok((
-                    BuilderPhase::Inspect,
-                    BuilderDisposition::Ready,
-                    work.current,
-                ));
-            }
-        }
-    }
     let debt_limits = if work.maintenance {
         DebtLimits::maintenance()
     } else {
@@ -1012,7 +929,16 @@ async fn advance_catch_up(
                 .max_uncompacted_bytes_per_level(job.kind),
         )
     };
-    if compact_one_if_needed(job, &mut work.candidate, debt_limits, dependencies).await? {
+    let admission = publication_admission(work.maintenance);
+    if compact_one_if_needed(
+        job,
+        &mut work.candidate,
+        debt_limits,
+        admission,
+        dependencies,
+    )
+    .await?
+    {
         return Ok((BuilderPhase::CatchUp(work), BuilderDisposition::Ready, None));
     }
     let budget = dependencies.budgets.for_kind(job.kind);
@@ -1094,6 +1020,7 @@ async fn advance_catch_up(
                         current: work.current,
                         barrier: work.through,
                         candidate: work.candidate,
+                        admission,
                     }),
                     BuilderDisposition::Ready,
                     None,
@@ -1171,6 +1098,7 @@ async fn publish_builder(
         work.barrier,
         work.candidate,
         work.current.as_ref(),
+        work.admission,
         dependencies,
     )
     .await?;
@@ -1186,6 +1114,7 @@ async fn compact_one_if_needed(
     job: &BuilderJob,
     candidate: &mut CandidateGeneration,
     limits: DebtLimits,
+    admission: DerivedArtifactAdmission,
     dependencies: &IndexBuilderDependencies,
 ) -> Result<bool, Status> {
     emit_compaction_debt(
@@ -1215,6 +1144,7 @@ async fn compact_one_if_needed(
         job.kind,
         selection,
         permit.bytes(),
+        admission,
         candidate,
         dependencies,
     )
@@ -1373,6 +1303,7 @@ async fn compact_level(
     kind: IndexKind,
     selection: DebtSelection,
     leased_bytes: u64,
+    admission: DerivedArtifactAdmission,
     candidate: &mut CandidateGeneration,
     dependencies: &IndexBuilderDependencies,
 ) -> Result<(), Status> {
@@ -1434,7 +1365,7 @@ async fn compact_level(
             .map_err(index_status)?;
         let mut sink = dependencies
             .publisher
-            .observed_staging_sink(progress.clone());
+            .observed_staging_sink(progress.clone(), admission);
         let sealed = merge_runs_parallel(
             specification,
             &directories,
@@ -1511,6 +1442,7 @@ async fn publish_candidate(
     barrier: IndexBarrier,
     candidate: CandidateGeneration,
     current: Option<&PublishedGeneration>,
+    admission: DerivedArtifactAdmission,
     dependencies: &IndexBuilderDependencies,
 ) -> Result<PublishedGeneration, Status> {
     let started = Instant::now();
@@ -1555,6 +1487,7 @@ async fn publish_candidate(
                 candidate.runs,
                 candidate.diagnostics,
                 current,
+                admission,
             )
             .await
     }
@@ -1617,6 +1550,14 @@ async fn publish_candidate(
         );
     });
     Ok(published)
+}
+
+const fn publication_admission(maintenance: bool) -> DerivedArtifactAdmission {
+    if maintenance {
+        DerivedArtifactAdmission::Bounded
+    } else {
+        DerivedArtifactAdmission::PublicationProgress
+    }
 }
 
 fn derived_identity(definition: &CatalogDefinition) -> DerivedDefinitionIdentity {

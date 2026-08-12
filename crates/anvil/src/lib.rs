@@ -136,13 +136,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         "index query timeout must be greater than zero and fit the server clock"
     );
     validate_atomic_replay_gc(config.awaiting_publish_ttl_seconds)?;
-    let index_runtime_config = config
-        .index_runtime
-        .with_source_journal_rebuild_defaults(
-            config.source_journal_max_entries,
-            config.source_journal_max_bytes,
-        )
-        .context("validate index automatic rebuild thresholds")?;
+    let index_runtime_config = config.index_runtime;
     let watch_retention = WatchRetention::new(
         config.source_journal_max_entries,
         config.source_journal_max_bytes,

@@ -1,6 +1,6 @@
 //! Public index lifecycle and query RPC implementation.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anvil_api::v1::bulk_operation::Operation as BulkOperationValue;
 use anvil_api::v1::bulk_outcome::Outcome as BulkOutcomeValue;
@@ -43,6 +43,7 @@ const DEFINITION_CONTENT_TYPE: &str = "application/vnd.anvil.index-definition+js
 const DEFAULT_PAGE_LIMIT: usize = 100;
 const MAX_PAGE_LIMIT: usize = 1_000;
 const QUERY_HASH_CONTEXT: &[u8] = b"anvil.index/query/v1";
+const EXPLICIT_REBUILD_INTERVAL_MILLIS: u64 = 60 * 60 * 1_000;
 
 #[derive(Clone)]
 pub(crate) struct IndexServiceImpl {
@@ -513,16 +514,40 @@ impl IndexServiceRpc for IndexServiceImpl {
                     .load_definition(&context, &request.bucket, &request.name)
                     .await?;
                 if current.api.version != request.expected_version {
-                    return Err(Status::failed_precondition(
-                        "index definition version changed before rebuild",
-                    ));
+                    let receipt = self
+                        .write_definition(
+                            &context,
+                            BulkOperationValue::PutIfVersion(BulkPutIfVersionRequest {
+                                address: Some(api_address(&current.key)),
+                                bytes: current.stored.encode()?,
+                                content_type: DEFINITION_CONTENT_TYPE.into(),
+                                command_id: request.command_id,
+                                durability: Durability::Local as i32,
+                                expected_version: request.expected_version,
+                            }),
+                            DefinitionMutationIntent::new(
+                                DefinitionKind::Index,
+                                current.stored.index_id,
+                            )
+                            .map_err(|error| Status::data_loss(error.to_string()))?,
+                        )
+                        .await?;
+                    return current.stored.to_api(receipt.version).map(Response::new);
                 }
+                let accepted_at_unix_millis = current_unix_millis()?;
+                enforce_explicit_rebuild_interval(
+                    current.stored.last_explicit_rebuild_at_unix_millis(),
+                    accepted_at_unix_millis,
+                )?;
+                let rebuilt = current
+                    .stored
+                    .with_explicit_rebuild(accepted_at_unix_millis)?;
                 let receipt = self
                     .write_definition(
                         &context,
                         BulkOperationValue::PutIfVersion(BulkPutIfVersionRequest {
                             address: Some(api_address(&current.key)),
-                            bytes: current.stored.encode()?,
+                            bytes: rebuilt.encode()?,
                             content_type: DEFINITION_CONTENT_TYPE.into(),
                             command_id: request.command_id,
                             durability: Durability::Local as i32,
@@ -535,7 +560,7 @@ impl IndexServiceRpc for IndexServiceImpl {
                         .map_err(|error| Status::data_loss(error.to_string()))?,
                     )
                     .await?;
-                current.stored.to_api(receipt.version).map(Response::new)
+                rebuilt.to_api(receipt.version).map(Response::new)
             },
             "index request deadline exceeded",
         )
@@ -795,6 +820,34 @@ fn grpc_status_code_name(code: tonic::Code) -> &'static str {
         tonic::Code::Unavailable => "unavailable",
         tonic::Code::DataLoss => "data_loss",
         tonic::Code::Unauthenticated => "unauthenticated",
+    }
+}
+
+fn current_unix_millis() -> Result<u64, Status> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| Status::internal("system clock is before the Unix epoch"))?
+        .as_millis()
+        .try_into()
+        .map_err(|_| Status::internal("system clock exceeds index timestamp range"))
+}
+
+fn enforce_explicit_rebuild_interval(
+    previous_accepted_at_unix_millis: Option<u64>,
+    now_unix_millis: u64,
+) -> Result<(), Status> {
+    let Some(previous) = previous_accepted_at_unix_millis else {
+        return Ok(());
+    };
+    let retry_at = previous
+        .checked_add(EXPLICIT_REBUILD_INTERVAL_MILLIS)
+        .ok_or_else(|| Status::data_loss("stored explicit rebuild timestamp overflows"))?;
+    if now_unix_millis < retry_at {
+        Err(Status::resource_exhausted(format!(
+            "index rebuild is rate limited; retry after Unix millisecond {retry_at}"
+        )))
+    } else {
+        Ok(())
     }
 }
 
@@ -1369,6 +1422,30 @@ mod tests {
         assert_eq!(
             authorization.seen.lock().unwrap().as_slice(),
             &[(key, ObjectPermission::Put)]
+        );
+    }
+
+    #[test]
+    fn explicit_rebuild_interval_is_one_full_hour() {
+        assert!(enforce_explicit_rebuild_interval(None, 1).is_ok());
+        let previous = 10_000;
+        let before_boundary = enforce_explicit_rebuild_interval(
+            Some(previous),
+            previous + EXPLICIT_REBUILD_INTERVAL_MILLIS - 1,
+        )
+        .unwrap_err();
+        assert_eq!(before_boundary.code(), tonic::Code::ResourceExhausted);
+        assert!(
+            before_boundary
+                .message()
+                .contains("retry after Unix millisecond 3610000")
+        );
+        assert!(
+            enforce_explicit_rebuild_interval(
+                Some(previous),
+                previous + EXPLICIT_REBUILD_INTERVAL_MILLIS,
+            )
+            .is_ok()
         );
     }
 

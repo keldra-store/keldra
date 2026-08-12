@@ -102,12 +102,9 @@ pub(crate) async fn start(
         .context("initialize the fixed index Rayon pool")?;
     let local_queries: Arc<dyn LocalIndexQueryExecutor> =
         Arc::new(LocalGenerationQueryExecutor::new(
-            local_node,
-            decisions.clone(),
             reader.clone(),
             cache.clone(),
             journal.clone(),
-            catalog.clone(),
             cpu.clone(),
             config.query_max_concurrency(),
             config.query_work_quantum_bytes(),

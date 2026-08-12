@@ -14,7 +14,6 @@ pub(super) enum BuilderFailurePhase {
 pub(super) enum BuilderFailureRecovery {
     Preserve,
     Reinspect,
-    ScopedRebuild,
     FailClosed,
 }
 
@@ -23,27 +22,27 @@ pub(super) fn failure_recovery(
     error: &Status,
 ) -> BuilderFailureRecovery {
     match error.code() {
-        Code::FailedPrecondition
-            if matches!(
-                phase,
-                BuilderFailurePhase::Rebuild | BuilderFailurePhase::CatchUp
-            ) =>
-        {
-            BuilderFailureRecovery::ScopedRebuild
+        Code::FailedPrecondition if phase == BuilderFailurePhase::Publish => {
+            BuilderFailureRecovery::Reinspect
         }
-        Code::FailedPrecondition => BuilderFailureRecovery::Reinspect,
-        Code::Aborted if phase != BuilderFailurePhase::Rebuild => BuilderFailureRecovery::Reinspect,
+        Code::FailedPrecondition if phase == BuilderFailurePhase::Rebuild => {
+            // An explicitly requested or first build has no resumable snapshot
+            // stream. Reinspection restarts that same accepted definition
+            // version; it does not turn incremental lag into a rebuild.
+            BuilderFailureRecovery::Reinspect
+        }
+        Code::FailedPrecondition => BuilderFailureRecovery::FailClosed,
+        Code::Aborted => BuilderFailureRecovery::Reinspect,
         Code::Unavailable | Code::DeadlineExceeded | Code::Cancelled | Code::Unknown => {
             if phase == BuilderFailurePhase::Rebuild {
                 // Snapshot streams are ephemeral and cannot resume after a
-                // terminal transport error. Restart only this definition's
-                // scoped baseline; never broaden the scan.
-                BuilderFailureRecovery::ScopedRebuild
+                // transport error. Reinspect restarts only the same first or
+                // explicitly requested definition version.
+                BuilderFailureRecovery::Reinspect
             } else {
                 BuilderFailureRecovery::Preserve
             }
         }
-        Code::Aborted => BuilderFailureRecovery::ScopedRebuild,
         Code::InvalidArgument
         | Code::NotFound
         | Code::AlreadyExists
@@ -94,12 +93,6 @@ pub(super) fn recover_builder_failure(
         BuilderFailureRecovery::Reinspect => {
             emit_retry(job.kind, recovery);
             job.phase = BuilderPhase::Inspect;
-            BuilderDisposition::Retry(BUILDER_RETRY_INTERVAL)
-        }
-        BuilderFailureRecovery::ScopedRebuild => {
-            emit_retry(job.kind, recovery);
-            job.phase = BuilderPhase::Inspect;
-            job.force_snapshot_rebuild = true;
             BuilderDisposition::Retry(BUILDER_RETRY_INTERVAL)
         }
         BuilderFailureRecovery::FailClosed => {

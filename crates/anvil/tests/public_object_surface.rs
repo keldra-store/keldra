@@ -602,6 +602,20 @@ async fn index_lifecycle_requires_zanzibar_access_to_the_definition_object() {
     let mut expected = created.clone();
     expected.version = rebuilt.version;
     assert_eq!(rebuilt, expected);
+    let replayed = indexes
+        .rebuild_index(authorized(
+            RebuildIndexRequest {
+                bucket: "objects".into(),
+                name: "authorization-boundary".into(),
+                expected_version: created.version,
+                command_id: "rebuild-authorization-boundary".into(),
+            },
+            owner_token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(replayed, rebuilt);
     assert_eq!(
         indexes
             .get_index(authorized(
@@ -628,7 +642,70 @@ async fn index_lifecycle_requires_zanzibar_access_to_the_definition_object() {
         ))
         .await
         .unwrap_err();
-    assert_eq!(stale.code(), Code::FailedPrecondition);
+    assert_eq!(stale.code(), Code::FailedPrecondition, "{stale:?}");
+    let rate_limited = indexes
+        .rebuild_index(authorized(
+            RebuildIndexRequest {
+                bucket: "objects".into(),
+                name: "authorization-boundary".into(),
+                expected_version: rebuilt.version,
+                command_id: "rebuild-authorization-rate-limited".into(),
+            },
+            owner_token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(rate_limited.code(), Code::ResourceExhausted);
+    assert!(
+        rate_limited
+            .message()
+            .contains("index rebuild is rate limited")
+    );
+
+    let updated = indexes
+        .update_index(authorized(
+            UpdateIndexRequest {
+                bucket: "objects".into(),
+                name: "authorization-boundary".into(),
+                expected_version: rebuilt.version,
+                path_prefix: "docs/updated".into(),
+                content_type: String::new(),
+                specification: Some(IndexSpecification {
+                    specification: Some(IndexSpecificationValue::Path(PathIndexSpec {})),
+                }),
+                command_id: "update-after-rebuild".into(),
+            },
+            owner_token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let replay_after_update = indexes
+        .rebuild_index(authorized(
+            RebuildIndexRequest {
+                bucket: "objects".into(),
+                name: "authorization-boundary".into(),
+                expected_version: created.version,
+                command_id: "rebuild-authorization-boundary".into(),
+            },
+            owner_token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(replay_after_update.code(), Code::AlreadyExists);
+    let rate_limited_after_update = indexes
+        .rebuild_index(authorized(
+            RebuildIndexRequest {
+                bucket: "objects".into(),
+                name: "authorization-boundary".into(),
+                expected_version: updated.version,
+                command_id: "rebuild-after-semantic-update".into(),
+            },
+            owner_token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(rate_limited_after_update.code(), Code::ResourceExhausted);
 
     fixture.stop().await;
 }

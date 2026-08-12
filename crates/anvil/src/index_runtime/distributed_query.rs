@@ -12,7 +12,6 @@ use crate::cluster_peer::{
 use crate::cluster_placement::ClusterPlacement;
 use crate::index_service::{ExecuteIndexQuery, ExecutedIndexQuery, IndexQueryExecutor};
 
-use super::local_query::requires_primary_history_gap_retry;
 use super::placement::{IndexIdentity, IndexPlacement};
 
 #[derive(Clone)]
@@ -107,52 +106,15 @@ impl IndexQueryExecutor for DistributedIndexQueryExecutor {
             limit: request.limit,
             resume: request.resume.clone(),
         };
-        let result = match self
+        let result = self
             .execute_on(
                 target,
                 &placement,
                 &bearer,
-                routed.clone(),
+                routed,
                 request.context.remaining()?,
             )
-            .await
-        {
-            Ok(result) => result,
-            Err(error)
-                if requires_primary_history_gap_retry(&error) && target != assignment.builder() =>
-            {
-                tracing::info!(
-                    index.id = request.definition.index_id,
-                    from.node_id = target.0,
-                    to.node_id = assignment.builder().0,
-                    monotonic_counter.anvil_index_query_primary_retries_total = 1_u64,
-                    "index query retried once on its rank-zero builder after a source-history gap"
-                );
-                self.execute_on(
-                    assignment.builder(),
-                    &placement,
-                    &bearer,
-                    routed,
-                    request.context.remaining()?,
-                )
-                .await
-                .map_err(|error| {
-                    if requires_primary_history_gap_retry(&error) {
-                        Status::unavailable(
-                            "index builder placement changed while recovering source history",
-                        )
-                    } else {
-                        error
-                    }
-                })?
-            }
-            Err(error) if requires_primary_history_gap_retry(&error) => {
-                return Err(Status::unavailable(
-                    "index builder placement changed while recovering source history",
-                ));
-            }
-            Err(error) => return Err(error),
-        };
+            .await?;
         if self.placement()?.fence() != placement.fence() {
             return Err(Status::unavailable(
                 "index query placement changed during execution",

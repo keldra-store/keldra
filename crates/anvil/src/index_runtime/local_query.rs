@@ -6,7 +6,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anvil_api::v1::{IndexFreshness, IndexQueryHit, IndexSourceFreshness, ObjectAddress};
-use anvil_consensus::{DecisionRaft, NodeId};
 use anvil_index::{BlockDescriptor, IndexDirectoryRead, IndexError, IndexFileRead};
 use anvil_store::{BlobRef, ObjectKey};
 use tonic::Status;
@@ -14,12 +13,9 @@ use tracing::Instrument;
 
 use crate::cluster_object_read::ClusterObjectReader;
 use crate::cluster_peer::{LocalIndexQueryExecutor, LocalIndexQueryRequest};
-use crate::cluster_placement::ClusterPlacement;
-use crate::index_service::{ExecutedIndexQuery, StoredIndexDefinition, definition_path};
+use crate::index_service::ExecutedIndexQuery;
 
 use super::cache::{IndexCache, IndexCacheError, IndexSegmentFetcher, IndexSegmentId, IndexSlice};
-use super::catalog::{CatalogDefinition, IndexCatalog};
-use super::coordination::load_definition_object;
 use super::cpu::IndexCpuPool;
 use super::directory::{ManifestIndexDirectory, ManifestIndexFile};
 use super::engine::kind_for_specification;
@@ -27,16 +23,8 @@ use super::events::{IndexBarrier, IndexEventError, IndexEventJournal};
 use super::generation::{
     IndexCurrentPointer, IndexGenerationManifest, ManifestReference, ManifestRun,
 };
-use super::placement::{IndexIdentity, IndexPlacement};
 use super::publication::{current_path, manifest_path};
 use super::query::{IndexQueryPosition, execute_query};
-
-const RETRY_HISTORY_GAP_ON_PRIMARY: &str =
-    "index source history gap requires retry on the rank-zero builder";
-
-pub(super) fn requires_primary_history_gap_retry(error: &Status) -> bool {
-    error.code() == tonic::Code::Aborted && error.message() == RETRY_HISTORY_GAP_ON_PRIMARY
-}
 
 #[derive(Clone)]
 struct QueryReadObserver {
@@ -343,12 +331,9 @@ impl Drop for QueryActiveGuard {
 
 #[derive(Clone)]
 pub(crate) struct LocalGenerationQueryExecutor {
-    local_node: NodeId,
-    decisions: DecisionRaft,
     reader: ClusterObjectReader,
     cache: IndexCache,
     events: Arc<IndexEventJournal>,
-    catalog: IndexCatalog,
     cpu: IndexCpuPool,
     admission: Arc<tokio::sync::Semaphore>,
     work_quantum_bytes: u64,
@@ -356,24 +341,18 @@ pub(crate) struct LocalGenerationQueryExecutor {
 
 impl LocalGenerationQueryExecutor {
     pub(crate) fn new(
-        local_node: NodeId,
-        decisions: DecisionRaft,
         reader: ClusterObjectReader,
         cache: IndexCache,
         events: Arc<IndexEventJournal>,
-        catalog: IndexCatalog,
         cpu: IndexCpuPool,
         max_concurrency: u32,
         work_quantum_bytes: u64,
     ) -> Self {
         debug_assert!(work_quantum_bytes > 0);
         Self {
-            local_node,
-            decisions,
             reader,
             cache,
             events,
-            catalog,
             cpu,
             admission: Arc::new(tokio::sync::Semaphore::new(max_concurrency as usize)),
             work_quantum_bytes,
@@ -465,20 +444,10 @@ impl LocalGenerationQueryExecutor {
             .await
         {
             Ok(observed) => Some(observed),
-            Err(error) if query_history_requires_rebuild(&error) => {
-                if !self.is_local_builder(&request)? {
-                    return Err(Status::aborted(RETRY_HISTORY_GAP_ON_PRIMARY));
-                }
-                self.schedule_scoped_rebuild(&request).await?;
-                tracing::info!(
-                    index.id = request.definition.index_id,
-                    tenant.id = request.tenant_id,
-                    bucket.id = request.bucket_id,
-                    reason = "history_unavailable",
-                    monotonic_counter.anvil_index_query_rebuild_wakes_total = 1_u64,
-                    "index query retained the prior generation and scheduled a scoped rebuild"
-                );
-                None
+            Err(error) if query_history_requires_explicit_rebuild(&error) => {
+                return Err(Status::failed_precondition(format!(
+                    "index source history is unavailable; an authorized explicit rebuild is required: {error}"
+                )));
             }
             Err(error) => return Err(Status::unavailable(error.to_string())),
         };
@@ -576,59 +545,6 @@ impl LocalGenerationQueryExecutor {
             freshness: query_freshness(&loaded, observed.as_ref(), true)?,
             next_position,
         })
-    }
-
-    fn is_local_builder(&self, request: &LocalIndexQueryRequest) -> Result<bool, Status> {
-        let state = self
-            .decisions
-            .state()
-            .map_err(|_| Status::unavailable("applied cluster membership is unavailable"))?;
-        let placement = ClusterPlacement::from_applied(&state)
-            .map_err(|error| Status::unavailable(error.to_string()))?;
-        let identity = IndexIdentity::new(
-            request.tenant_id,
-            request.bucket_id,
-            request.definition.index_id,
-        )
-        .map_err(|error| Status::data_loss(error.to_string()))?;
-        Ok(IndexPlacement::derive(identity, &placement)
-            .map_err(|error| Status::unavailable(error.to_string()))?
-            .builder()
-            == self.local_node)
-    }
-
-    async fn schedule_scoped_rebuild(
-        &self,
-        request: &LocalIndexQueryRequest,
-    ) -> Result<(), Status> {
-        let path = definition_path(&request.definition.name)?;
-        let Some(opened) = load_definition_object(
-            &self.reader,
-            request.tenant_id,
-            request.bucket_id,
-            &path,
-            anvil_store::VersionId(request.definition.version),
-        )
-        .await?
-        else {
-            return Err(Status::failed_precondition(
-                "index definition changed while scheduling its scoped rebuild",
-            ));
-        };
-        let stored = StoredIndexDefinition::decode(&opened.bytes)?;
-        if stored.to_api(opened.object_version.0)? != request.definition {
-            return Err(Status::failed_precondition(
-                "index definition changed while scheduling its scoped rebuild",
-            ));
-        }
-        self.catalog
-            .upsert_wait(CatalogDefinition {
-                tenant_id: request.tenant_id,
-                bucket_id: request.bucket_id,
-                object_version: opened.object_version.0,
-                stored,
-            })
-            .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -871,14 +787,14 @@ fn query_freshness(
     let mut value = freshness(generation, observed, initial_build_complete)?;
     if observed.is_none() {
         // The published generation remains complete and queryable, but a
-        // retained-history gap prevents a provable observed tail until the
-        // scoped rebuild (or checkpoint-only publication) completes.
+        // A missing observed tail prevents a provable freshness bound until
+        // an authorized explicit rebuild or checkpoint publication completes.
         value.rebuilding = true;
     }
     Ok(value)
 }
 
-fn query_history_requires_rebuild(error: &IndexEventError) -> bool {
+fn query_history_requires_explicit_rebuild(error: &IndexEventError) -> bool {
     matches!(
         error,
         IndexEventError::CheckpointMismatch(_)
@@ -1045,16 +961,13 @@ mod tests {
     }
 
     #[test]
-    fn only_the_private_history_gap_sentinel_requests_primary_retry() {
-        assert!(requires_primary_history_gap_retry(&Status::aborted(
-            RETRY_HISTORY_GAP_ON_PRIMARY
-        )));
-        assert!(!requires_primary_history_gap_retry(&Status::aborted(
-            "another aborted operation"
-        )));
-        assert!(!requires_primary_history_gap_retry(&Status::unavailable(
-            RETRY_HISTORY_GAP_ON_PRIMARY
-        )));
+    fn source_history_failures_require_an_explicit_rebuild() {
+        assert!(query_history_requires_explicit_rebuild(
+            &IndexEventError::IncompleteSources
+        ));
+        assert!(!query_history_requires_explicit_rebuild(
+            &IndexEventError::ZeroPageByteLimit
+        ));
     }
 
     #[test]

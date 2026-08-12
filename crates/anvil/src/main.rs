@@ -379,16 +379,6 @@ struct Arguments {
     #[arg(long, env = "ANVIL_INDEX_TENSOR_MAX_UNCOMPACTED_BYTES_PER_LEVEL")]
     index_tensor_max_uncompacted_bytes_per_level: Option<u64>,
 
-    /// Bucket-routed source events which trigger a scoped bulk rebuild.
-    /// Absent defaults to 50% of --source-journal-max-entries.
-    #[arg(long, env = "ANVIL_INDEX_AUTO_REBUILD_LAG_ENTRIES")]
-    index_auto_rebuild_lag_entries: Option<u64>,
-
-    /// Bucket-routed source bytes which trigger a scoped bulk rebuild.
-    /// Absent defaults to 50% of --source-journal-max-bytes.
-    #[arg(long, env = "ANVIL_INDEX_AUTO_REBUILD_LAG_BYTES")]
-    index_auto_rebuild_lag_bytes: Option<u64>,
-
     /// Maximum generations retained per index, including current (default: 3).
     #[arg(
         long,
@@ -508,22 +498,7 @@ impl Arguments {
             config.with_query_work_quantum_bytes(self.index_query_work_quantum_bytes)
         })
         .context("validate index runtime configuration")?;
-        let mut config = if self.index_auto_rebuild_lag_entries.is_some()
-            || self.index_auto_rebuild_lag_bytes.is_some()
-        {
-            config.with_auto_rebuild_lag_thresholds(
-                self.index_auto_rebuild_lag_entries
-                    .unwrap_or_else(|| half_nonzero_bound(self.source_journal_max_entries)),
-                self.index_auto_rebuild_lag_bytes
-                    .unwrap_or_else(|| half_nonzero_bound(self.source_journal_max_bytes)),
-            )
-        } else {
-            config.with_source_journal_rebuild_defaults(
-                self.source_journal_max_entries,
-                self.source_journal_max_bytes,
-            )
-        }
-        .context("validate index runtime configuration")?;
+        let mut config = config;
         for (
             kind,
             memory,
@@ -709,10 +684,6 @@ async fn main() -> Result<()> {
     }
 }
 
-const fn half_nonzero_bound(bound: u64) -> u64 {
-    bound / 2 + bound % 2
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -850,10 +821,6 @@ mod tests {
             "8",
             "--index-path-max-uncompacted-bytes-per-level",
             "5242880",
-            "--index-auto-rebuild-lag-entries",
-            "12345",
-            "--index-auto-rebuild-lag-bytes",
-            "67890",
             "--index-max-retained-generations",
             "7",
             "--index-max-generation-age-hours",
@@ -889,8 +856,6 @@ mod tests {
             config.max_uncompacted_bytes_per_level(IndexKind::TypedJson),
             10_485_760
         );
-        assert_eq!(config.auto_rebuild_lag_entries(), 12_345);
-        assert_eq!(config.auto_rebuild_lag_bytes(), 67_890);
         assert_eq!(config.max_retained_generations(), 7);
         assert_eq!(config.max_generation_age_hours(), 48);
         assert_eq!(config.max_retained_generation_bytes(), 2_097_152);
@@ -915,8 +880,6 @@ mod tests {
             vec!["--index-max-uncompacted-bytes-per-level", "0"],
             vec!["--index-vector-max-runs-per-level", "0"],
             vec!["--index-vector-max-uncompacted-bytes-per-level", "0"],
-            vec!["--index-auto-rebuild-lag-entries", "0"],
-            vec!["--index-auto-rebuild-lag-bytes", "0"],
             vec!["--index-max-retained-generations", "0"],
             vec!["--index-max-generation-age-hours", "0"],
             vec!["--index-max-retained-generation-bytes", "0"],
@@ -928,20 +891,6 @@ mod tests {
                     .contains("validate index runtime configuration")
             );
         }
-    }
-
-    #[test]
-    fn automatic_rebuild_defaults_follow_source_journal_bounds() {
-        let config = parse(&[
-            "--source-journal-max-entries",
-            "101",
-            "--source-journal-max-bytes",
-            "1001",
-        ])
-        .index_runtime_config()
-        .unwrap();
-        assert_eq!(config.auto_rebuild_lag_entries(), 51);
-        assert_eq!(config.auto_rebuild_lag_bytes(), 501);
     }
 
     #[test]
@@ -976,10 +925,6 @@ mod tests {
             "--index-path-max-uncompacted-bytes-per-level",
             "--index-tensor-max-runs-per-level",
             "--index-tensor-max-uncompacted-bytes-per-level",
-            "--index-auto-rebuild-lag-entries",
-            "50% of --source-journal-max-entries",
-            "--index-auto-rebuild-lag-bytes",
-            "50% of --source-journal-max-bytes",
             "--source-journal-max-entries",
             "--source-journal-max-bytes",
             "--index-max-retained-generations",

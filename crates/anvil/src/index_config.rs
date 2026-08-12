@@ -20,9 +20,6 @@ pub struct IndexRuntimeConfig {
     compaction_max_lanes: [NonZeroU32; 8],
     max_runs_per_level: [NonZeroU32; 8],
     max_uncompacted_bytes_per_level: [NonZeroU64; 8],
-    auto_rebuild_lag_entries: NonZeroU64,
-    auto_rebuild_lag_bytes: NonZeroU64,
-    auto_rebuild_lag_uses_source_journal_defaults: bool,
     rayon_workers: NonZeroU32,
     query_max_concurrency: NonZeroU32,
     query_work_quantum_bytes: NonZeroU64,
@@ -46,8 +43,6 @@ impl IndexRuntimeConfig {
     pub const DEFAULT_QUERY_WORK_QUANTUM_BYTES: u64 = 4 * 1024 * 1024;
     pub const DEFAULT_MAX_RUNS_PER_LEVEL: u32 = 64;
     pub const DEFAULT_MAX_UNCOMPACTED_BYTES_PER_LEVEL: u64 = 1024 * 1024 * 1024;
-    pub const DEFAULT_AUTO_REBUILD_LAG_ENTRIES: u64 = anvil_store::DEFAULT_WATCH_MAX_ENTRIES / 2;
-    pub const DEFAULT_AUTO_REBUILD_LAG_BYTES: u64 = anvil_store::DEFAULT_WATCH_MAX_BYTES / 2;
     pub const DEFAULT_MAX_RETAINED_GENERATIONS: u32 = 3;
     pub const DEFAULT_MAX_GENERATION_AGE_HOURS: u64 = 24;
     pub const DEFAULT_MAX_RETAINED_GENERATION_BYTES: u64 = 50 * 1024 * 1024 * 1024;
@@ -107,11 +102,6 @@ impl IndexRuntimeConfig {
             )
             .expect("the default byte-debt bound is positive");
                 8],
-            auto_rebuild_lag_entries: NonZeroU64::new(Self::DEFAULT_AUTO_REBUILD_LAG_ENTRIES)
-                .expect("the default automatic rebuild entry threshold is positive"),
-            auto_rebuild_lag_bytes: NonZeroU64::new(Self::DEFAULT_AUTO_REBUILD_LAG_BYTES)
-                .expect("the default automatic rebuild byte threshold is positive"),
-            auto_rebuild_lag_uses_source_journal_defaults: true,
             rayon_workers,
             query_max_concurrency: NonZeroU32::new(Self::DEFAULT_QUERY_MAX_CONCURRENCY)
                 .expect("the default query concurrency is positive"),
@@ -285,45 +275,6 @@ impl IndexRuntimeConfig {
         self.max_uncompacted_bytes_per_level[kind_slot(kind)].get()
     }
 
-    /// Bucket-routed lag at which an incremental builder switches to a scoped
-    /// snapshot rebuild. Either non-zero threshold is sufficient.
-    pub fn with_auto_rebuild_lag_thresholds(
-        mut self,
-        entries: u64,
-        bytes: u64,
-    ) -> Result<Self, IndexRuntimeConfigError> {
-        self.auto_rebuild_lag_entries =
-            NonZeroU64::new(entries).ok_or(IndexRuntimeConfigError::ZeroAutoRebuildLagEntries)?;
-        self.auto_rebuild_lag_bytes =
-            NonZeroU64::new(bytes).ok_or(IndexRuntimeConfigError::ZeroAutoRebuildLagBytes)?;
-        self.auto_rebuild_lag_uses_source_journal_defaults = false;
-        Ok(self)
-    }
-
-    /// Resolve default automatic-rebuild thresholds from this deployment's
-    /// source-journal bounds. Explicit threshold overrides remain unchanged.
-    pub fn with_source_journal_rebuild_defaults(
-        mut self,
-        journal_entries: u64,
-        journal_bytes: u64,
-    ) -> Result<Self, IndexRuntimeConfigError> {
-        if self.auto_rebuild_lag_uses_source_journal_defaults {
-            self.auto_rebuild_lag_entries = NonZeroU64::new(half_nonzero_bound(journal_entries))
-                .ok_or(IndexRuntimeConfigError::ZeroAutoRebuildLagEntries)?;
-            self.auto_rebuild_lag_bytes = NonZeroU64::new(half_nonzero_bound(journal_bytes))
-                .ok_or(IndexRuntimeConfigError::ZeroAutoRebuildLagBytes)?;
-        }
-        Ok(self)
-    }
-
-    pub fn auto_rebuild_lag_entries(self) -> u64 {
-        self.auto_rebuild_lag_entries.get()
-    }
-
-    pub fn auto_rebuild_lag_bytes(self) -> u64 {
-        self.auto_rebuild_lag_bytes.get()
-    }
-
     pub fn max_retained_generations(self) -> u32 {
         self.max_retained_generations.get()
     }
@@ -339,10 +290,6 @@ impl IndexRuntimeConfig {
 
 const fn kind_slot(kind: IndexKind) -> usize {
     kind as u8 as usize - 1
-}
-
-const fn half_nonzero_bound(bound: u64) -> u64 {
-    bound / 2 + bound % 2
 }
 
 impl Default for IndexRuntimeConfig {
@@ -390,10 +337,6 @@ pub enum IndexRuntimeConfigError {
     ZeroUncompactedBytesPerLevel(IndexKind),
     #[error("maximum index runs per level {configured} exceeds format bound {maximum}")]
     TooManyRunsPerLevel { configured: u32, maximum: u32 },
-    #[error("automatic index rebuild lag entry threshold must be greater than zero")]
-    ZeroAutoRebuildLagEntries,
-    #[error("automatic index rebuild lag byte threshold must be greater than zero")]
-    ZeroAutoRebuildLagBytes,
     #[error("maximum retained index generations must be greater than zero")]
     ZeroRetainedGenerations,
     #[error("maximum index generation age hours must be greater than zero")]
@@ -426,8 +369,6 @@ mod tests {
         assert_eq!(config.rayon_workers(), 4);
         assert_eq!(config.query_max_concurrency(), 64);
         assert_eq!(config.query_work_quantum_bytes(), 4 * 1024 * 1024);
-        assert_eq!(config.auto_rebuild_lag_entries(), 500_000);
-        assert_eq!(config.auto_rebuild_lag_bytes(), 256 * 1024 * 1024);
         for kind in KINDS {
             assert_eq!(config.builder_memory_bytes(kind), 256 * 1024 * 1024);
             assert_eq!(config.projection_max_lanes(kind), 4);
@@ -623,39 +564,5 @@ mod tests {
             .with_kind_compaction_debt_limits(IndexKind::TypedJson, 1, 99)
             .unwrap();
         assert_eq!(configured.max_runs_per_level(IndexKind::TypedJson), 1);
-    }
-
-    #[test]
-    fn automatic_rebuild_thresholds_are_nonzero_and_independent() {
-        let defaults = IndexRuntimeConfig::default();
-        assert_eq!(
-            defaults.with_auto_rebuild_lag_thresholds(0, 1),
-            Err(IndexRuntimeConfigError::ZeroAutoRebuildLagEntries)
-        );
-        assert_eq!(
-            defaults.with_auto_rebuild_lag_thresholds(1, 0),
-            Err(IndexRuntimeConfigError::ZeroAutoRebuildLagBytes)
-        );
-
-        let configured = defaults.with_auto_rebuild_lag_thresholds(123, 456).unwrap();
-        assert_eq!(configured.auto_rebuild_lag_entries(), 123);
-        assert_eq!(configured.auto_rebuild_lag_bytes(), 456);
-    }
-
-    #[test]
-    fn source_journal_defaults_are_dynamic_but_do_not_replace_overrides() {
-        let derived = IndexRuntimeConfig::default()
-            .with_source_journal_rebuild_defaults(101, 1001)
-            .unwrap();
-        assert_eq!(derived.auto_rebuild_lag_entries(), 51);
-        assert_eq!(derived.auto_rebuild_lag_bytes(), 501);
-
-        let explicit = IndexRuntimeConfig::default()
-            .with_auto_rebuild_lag_thresholds(7, 9)
-            .unwrap()
-            .with_source_journal_rebuild_defaults(101, 1001)
-            .unwrap();
-        assert_eq!(explicit.auto_rebuild_lag_entries(), 7);
-        assert_eq!(explicit.auto_rebuild_lag_bytes(), 9);
     }
 }

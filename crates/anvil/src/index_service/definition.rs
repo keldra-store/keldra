@@ -27,6 +27,8 @@ pub(crate) struct StoredIndexDefinition {
     pub path_prefix: String,
     pub content_type: Option<String>,
     specification_protobuf: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_explicit_rebuild_at_unix_millis: Option<u64>,
 }
 
 impl StoredIndexDefinition {
@@ -48,6 +50,7 @@ impl StoredIndexDefinition {
             path_prefix: request.path_prefix,
             content_type: optional_content_type(request.content_type)?,
             specification_protobuf: specification.encode_to_vec(),
+            last_explicit_rebuild_at_unix_millis: None,
         })
     }
 
@@ -67,7 +70,22 @@ impl StoredIndexDefinition {
             path_prefix: request.path_prefix,
             content_type: optional_content_type(request.content_type)?,
             specification_protobuf: specification.encode_to_vec(),
+            last_explicit_rebuild_at_unix_millis: self.last_explicit_rebuild_at_unix_millis,
         })
+    }
+
+    pub(crate) fn with_explicit_rebuild(
+        &self,
+        accepted_at_unix_millis: u64,
+    ) -> Result<Self, Status> {
+        validate_explicit_rebuild(accepted_at_unix_millis)?;
+        let mut updated = self.clone();
+        updated.last_explicit_rebuild_at_unix_millis = Some(accepted_at_unix_millis);
+        Ok(updated)
+    }
+
+    pub(crate) fn last_explicit_rebuild_at_unix_millis(&self) -> Option<u64> {
+        self.last_explicit_rebuild_at_unix_millis
     }
 
     pub(crate) fn encode(&self) -> Result<Vec<u8>, Status> {
@@ -100,6 +118,10 @@ impl StoredIndexDefinition {
         let specification = stored.specification()?;
         validate_specification(&specification)
             .map_err(|_| Status::data_loss("stored index specification is invalid"))?;
+        if let Some(accepted_at_unix_millis) = stored.last_explicit_rebuild_at_unix_millis {
+            validate_explicit_rebuild(accepted_at_unix_millis)
+                .map_err(|_| Status::data_loss("stored explicit index rebuild is invalid"))?;
+        }
         Ok(stored)
     }
 
@@ -422,6 +444,15 @@ pub(crate) fn validate_command_id(value: &str) -> Result<(), Status> {
     }
 }
 
+fn validate_explicit_rebuild(accepted_at_unix_millis: u64) -> Result<(), Status> {
+    if accepted_at_unix_millis == 0 {
+        return Err(Status::invalid_argument(
+            "explicit rebuild timestamp must be non-zero",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use anvil_api::v1::{PathIndexSpec, TensorIndexSpec, index_specification};
@@ -458,6 +489,41 @@ mod tests {
             derive_index_id(7, 9, "by-path", "create-index").unwrap(),
             derive_index_id(7, 9, "by-path", "create-index").unwrap()
         );
+    }
+
+    #[test]
+    fn explicit_rebuild_state_round_trips_and_survives_semantic_updates() {
+        let stored = StoredIndexDefinition::create("tenant".into(), request(), 44)
+            .unwrap()
+            .with_explicit_rebuild(1_000)
+            .unwrap();
+        let decoded = StoredIndexDefinition::decode(&stored.encode().unwrap()).unwrap();
+        assert_eq!(decoded, stored);
+        assert_eq!(decoded.last_explicit_rebuild_at_unix_millis(), Some(1_000));
+
+        let create = request();
+        let updated = decoded
+            .updated(UpdateIndexRequest {
+                bucket: create.bucket,
+                name: create.name,
+                path_prefix: "tenant/456/".into(),
+                content_type: create.content_type,
+                specification: create.specification,
+                expected_version: 8,
+                command_id: "update-index".into(),
+            })
+            .unwrap();
+        assert_eq!(updated.last_explicit_rebuild_at_unix_millis(), Some(1_000));
+    }
+
+    #[test]
+    fn invalid_stored_explicit_rebuild_state_is_rejected() {
+        let stored = StoredIndexDefinition::create("tenant".into(), request(), 44).unwrap();
+        let mut encoded = serde_json::to_value(stored).unwrap();
+        encoded["last_explicit_rebuild_at_unix_millis"] = serde_json::json!(0);
+        let error =
+            StoredIndexDefinition::decode(&serde_json::to_vec(&encoded).unwrap()).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::DataLoss);
     }
 
     #[test]

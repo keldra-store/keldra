@@ -4,8 +4,21 @@ use anvil_store::{
     PlacementLogId, SourceId, Version, VersionId,
 };
 
-use super::*;
 use crate::index_runtime::events::{AtomicProgramWatermark, IndexJournalChange, IndexSourceCursor};
+
+use super::*;
+
+#[test]
+fn only_idle_maintenance_uses_bounded_artifact_admission() {
+    assert_eq!(
+        publication_admission(false),
+        DerivedArtifactAdmission::PublicationProgress
+    );
+    assert_eq!(
+        publication_admission(true),
+        DerivedArtifactAdmission::Bounded
+    );
+}
 
 fn run(sequence: u64, level: u8) -> ManifestRun {
     ManifestRun {
@@ -155,7 +168,6 @@ fn queue_dirty_definition(scheduler: &mut BuilderScheduler, definition: CatalogD
         current: None,
         through: barrier(10),
         target: barrier(12),
-        automatic_rebuild_lag: None,
         candidate: CandidateGeneration::rebuild(),
         changed: true,
         must_publish: true,
@@ -214,7 +226,6 @@ fn irrelevant_source_progress_is_published_and_survives_reload() {
         current: None,
         through: barrier(10),
         target: barrier(13),
-        automatic_rebuild_lag: None,
         candidate: CandidateGeneration::rebuild(),
         changed: false,
         must_publish: false,
@@ -430,7 +441,7 @@ fn transient_failure_yields_a_lease_to_a_later_assignment() {
 }
 
 #[test]
-fn lost_incremental_history_requests_a_snapshot_rebuild() {
+fn lost_incremental_history_is_a_failed_precondition() {
     for error in [
         IndexEventError::CheckpointMismatch(NodeId(1)),
         IndexEventError::SourceEpochChanged(NodeId(1)),
@@ -459,7 +470,6 @@ fn transient_catch_up_and_publish_failures_preserve_exact_work() {
         current: None,
         through: barrier(10),
         target: barrier(12),
-        automatic_rebuild_lag: None,
         candidate: CandidateGeneration::rebuild(),
         changed: true,
         must_publish: true,
@@ -488,6 +498,7 @@ fn transient_catch_up_and_publish_failures_preserve_exact_work() {
         current: None,
         barrier: barrier(12),
         candidate: CandidateGeneration::rebuild(),
+        admission: DerivedArtifactAdmission::PublicationProgress,
     };
     let publish_step = recover_builder_failure(
         BuilderJob::new(definition(1, 2, 9)).unwrap(),
@@ -529,13 +540,12 @@ fn head_advanced_past_a_fixed_target_reinspects_instead_of_retrying_forever() {
 }
 
 #[test]
-fn incompatible_history_forces_the_next_inspect_to_open_a_scoped_snapshot() {
+fn incompatible_incremental_history_fails_closed_without_opening_a_snapshot() {
     let job = BuilderJob::new(definition(1, 2, 9)).unwrap();
     let work = CatchUpWork {
         current: None,
         through: barrier(10),
         target: barrier(12),
-        automatic_rebuild_lag: None,
         candidate: CandidateGeneration::rebuild(),
         changed: false,
         must_publish: false,
@@ -550,14 +560,20 @@ fn incompatible_history_forces_the_next_inspect_to_open_a_scoped_snapshot() {
     );
 
     assert!(matches!(step.job.phase, BuilderPhase::Inspect));
-    assert!(step.job.force_snapshot_rebuild);
-    assert!(matches!(step.disposition, BuilderDisposition::Retry(_)));
+    assert!(matches!(step.disposition, BuilderDisposition::Failed));
+    assert_eq!(
+        failure_recovery(
+            BuilderFailurePhase::Inspect,
+            &Status::failed_precondition("published barrier is no longer retained")
+        ),
+        BuilderFailureRecovery::FailClosed
+    );
     assert_eq!(
         failure_recovery(
             BuilderFailurePhase::Rebuild,
             &Status::unavailable("terminal snapshot stream")
         ),
-        BuilderFailureRecovery::ScopedRebuild
+        BuilderFailureRecovery::Reinspect
     );
     assert_eq!(
         failure_recovery(
