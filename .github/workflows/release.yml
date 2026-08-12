@@ -59,7 +59,7 @@ jobs:
           printf 'tag=%s\ncommit=%s\n' "$tag" "$commit" >>"$GITHUB_OUTPUT"
 
   validate:
-    name: Validate Anvil 0.7 release
+    name: Validate Anvil 0.8 release
     needs: release-context
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -99,9 +99,9 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-          key: ${{ runner.os }}-release-cargo-v07-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-release-cargo-v08-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-release-cargo-v07-
+            ${{ runner.os }}-release-cargo-v08-
 
       - name: Run static gates
         run: ./scripts/release-gates.sh static
@@ -150,6 +150,7 @@ jobs:
         id: build
         env:
           DIGEST_FILE: ${{ runner.temp }}/anvil-image-digest-${{ matrix.arch }}.txt
+          SOURCE_COMMIT: ${{ needs.release-context.outputs.commit }}
         run: |
           set -euo pipefail
           repository="ghcr.io/${GITHUB_REPOSITORY,,}"
@@ -157,6 +158,7 @@ jobs:
 
           docker buildx build \
             --platform "$ANVIL_DOCKER_PLATFORM" \
+            --build-arg "ANVIL_SOURCE_REVISION=${SOURCE_COMMIT}" \
             --provenance=false \
             --sbom=false \
             --output "type=image,name=${repository},push=true,push-by-digest=true,name-canonical=true" \
@@ -210,7 +212,7 @@ jobs:
           fi
 
   publish:
-    name: Publish Anvil 0.7 image and release
+    name: Publish Anvil 0.8 image and release
     needs: [release-context, validate, build-image]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -324,9 +326,9 @@ jobs:
           generate_release_notes: true
           make_latest: true
           body: |
-            Anvil 0.7.0 replaces corpus-wide index discovery and recovery with
-            sparse transactional definition state, routed source-journal
-            changes, bounded scoped recovery, and non-blocking service startup.
+            Anvil 0.8.0 builds source-complete indexes with bounded direct bulk
+            construction, packed format-v3 artifacts, compressed postings, and
+            lossless journal backpressure.
 
             - Image: `${{ steps.image.outputs.image }}`
             - Manifest digest: `${{ steps.image.outputs.digest }}`

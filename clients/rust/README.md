@@ -1,14 +1,14 @@
 # anvil-storage
 
 The official Rust client for Anvil. It provides authenticated object upload
-helpers and the complete generated Anvil 0.7 protocol, including object,
+helpers and the complete generated Anvil 0.8 protocol, including object,
 authorization, administration, cluster-wide index, accounting, and PersonalDB
 clients.
 
 ## Install
 
 ```sh
-cargo add anvil-storage@0.7.0
+cargo add anvil-storage@0.8.0
 cargo add tokio --features macros,rt-multi-thread
 ```
 

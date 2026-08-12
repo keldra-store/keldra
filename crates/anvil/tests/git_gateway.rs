@@ -244,6 +244,7 @@ fn test_server_config(
         max_atomic_commit_entries: 128,
         max_atomic_commit_bytes: 1024 * 1024,
         atomic_program_timeout: Duration::from_secs(30),
+        index_query_timeout: Duration::from_secs(300),
         token_manager,
         rate_limits: RateLimitConfig::default(),
         index_runtime: anvil::IndexRuntimeConfig::default(),
@@ -253,8 +254,8 @@ fn test_server_config(
         mutation_receipt_retention_seconds: 60,
         max_mutation_receipt_entries: 512,
         max_mutation_receipt_bytes: 1024 * 1024,
-        watch_max_entries: 512,
-        watch_max_bytes: 1024 * 1024,
+        source_journal_max_entries: 512,
+        source_journal_max_bytes: 1024 * 1024,
     }
 }
 
