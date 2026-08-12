@@ -281,6 +281,7 @@ fn program_status(error: ProgramStoreError) -> Status {
         | ProgramStoreError::DurabilityClassMismatch => {
             Status::failed_precondition(error.to_string())
         }
+        ProgramStoreError::SourceJournalCapacity => Status::unavailable(error.to_string()),
         ProgramStoreError::ProgramHashMismatch => {
             Status::failed_precondition(format!("PROGRAM_VERSION_MISMATCH: {error}"))
         }

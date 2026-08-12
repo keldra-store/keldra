@@ -282,6 +282,8 @@ pub enum LogicalRecordError {
     ExportRecordTooLarge { required_bytes: u64 },
     #[error("logical record snapshot conflicts with an existing local value")]
     SnapshotConflict,
+    #[error("source journal capacity is exhausted")]
+    SourceJournalCapacity,
     #[error("logical record storage failed: {0}")]
     Storage(String),
 }
@@ -736,7 +738,7 @@ impl Store {
                 std::slice::from_ref(change),
                 LocalReferenceEffects::NoReferenceEffects,
             )
-            .map_err(storage)?;
+            .map_err(logical_record_mutation_error)?;
         }
         let mut options = WriteOptions::default();
         options.set_sync(self.sync_writes);
@@ -745,6 +747,13 @@ impl Store {
             self.clock.observe(record_version);
         }
         Ok(())
+    }
+}
+
+fn logical_record_mutation_error(error: MutationError) -> LogicalRecordError {
+    match error {
+        MutationError::SourceJournalCapacity => LogicalRecordError::SourceJournalCapacity,
+        error => storage(error),
     }
 }
 

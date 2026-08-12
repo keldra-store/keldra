@@ -1039,6 +1039,9 @@ fn program_store_status(error: ProgramStoreError) -> Status {
         ProgramStoreError::ExecutorLocalDurability => {
             Status::unavailable(format!("DURABILITY_UNAVAILABLE: {error}"))
         }
+        ProgramStoreError::SourceJournalCapacity => {
+            Status::unavailable(format!("RESOURCE_LIMIT: {error}"))
+        }
         ProgramStoreError::ProgramPolicy { .. } | ProgramStoreError::PreconditionFailed { .. } => {
             Status::failed_precondition(format!("PROGRAM_CONCURRENCY_VIOLATION: {error}"))
         }

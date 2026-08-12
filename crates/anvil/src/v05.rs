@@ -70,7 +70,7 @@ mod upload;
 
 #[cfg(test)]
 use mutation_failures::api_failure;
-use mutation_failures::api_request_failure;
+use mutation_failures::{api_mutation_failure, api_request_failure};
 use read_identity::ObjectReadIdentity;
 
 pub(crate) use gateway::{GatewayIdentity, GatewayObjectAdapter, GatewayPutMode};
@@ -1446,7 +1446,9 @@ fn authorization_store_status(error: AuthzStoreError) -> Status {
         | AuthzStoreError::RevisionNotAvailable { .. }
         | AuthzStoreError::RevisionExpired { .. }
         | AuthzStoreError::OperationMismatch => Status::failed_precondition(error.to_string()),
-        AuthzStoreError::ReceiptCapacity => Status::resource_exhausted(error.to_string()),
+        AuthzStoreError::ReceiptCapacity | AuthzStoreError::SourceJournalCapacity => {
+            Status::resource_exhausted(error.to_string())
+        }
         AuthzStoreError::RealmMutationLineageGap { .. }
         | AuthzStoreError::RealmMutationStale { .. }
         | AuthzStoreError::RealmMutationSibling { .. }

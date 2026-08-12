@@ -200,7 +200,7 @@ impl Store {
             }],
             LocalReferenceEffects::NoReferenceEffects,
         )
-        .map_err(|error| AuthzStoreError::Storage(error.to_string()))?;
+        .map_err(authz_mutation_error)?;
         repository.write(batch)?;
         self.notify_local_invalidations();
         Ok(coordinated)
@@ -226,7 +226,14 @@ impl Store {
             }],
             LocalReferenceEffects::NoReferenceEffects,
         )
-        .map_err(|error| AuthzStoreError::Storage(error.to_string()))
+        .map_err(authz_mutation_error)
+    }
+}
+
+fn authz_mutation_error(error: MutationError) -> AuthzStoreError {
+    match error {
+        MutationError::SourceJournalCapacity => AuthzStoreError::SourceJournalCapacity,
+        error => AuthzStoreError::Storage(error.to_string()),
     }
 }
 

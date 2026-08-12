@@ -67,6 +67,8 @@ pub struct SourceJournalRuntimeMetrics {
     pub retained_bytes: u64,
     pub max_entries: u64,
     pub max_bytes: u64,
+    pub progress_debt_peak_entries: u64,
+    pub progress_debt_peak_bytes: u64,
 }
 
 impl SourceJournalRuntimeMetrics {
@@ -75,6 +77,17 @@ impl SourceJournalRuntimeMetrics {
             .min(self.reference_safe_through)
             .min(self.index_safe_through)
             .min(self.accounting_safe_through)
+    }
+
+    /// Temporary entries admitted only so a derived consumer can durably
+    /// publish the progress needed to release a full journal.
+    pub fn progress_debt_entries(self) -> u64 {
+        self.retained_entries.saturating_sub(self.max_entries)
+    }
+
+    /// Logical-byte counterpart to [`Self::progress_debt_entries`].
+    pub fn progress_debt_bytes(self) -> u64 {
+        self.retained_bytes.saturating_sub(self.max_bytes)
     }
 }
 

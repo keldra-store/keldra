@@ -89,39 +89,55 @@ impl LogicalRecordDistributionCore {
     where
         F: FnMut() -> Result<(), Status> + Send,
     {
-        let _serial = self.coordinator_serial.lock().await;
-        let _permit = self.mutation_admission.enter()?;
-        require_current_fence()?;
-        let id = typed_value.id();
-        let current = self.reconcile(route, &id).await?;
-        require_current_fence()?;
-        if let Some(LogicalRecordCandidate::Versioned(existing)) = current
-            && existing.typed_value == typed_value
-        {
-            return Ok(LogicalRecordApplied {
-                record_version: existing.record_version,
-                replayed: true,
-            });
-        }
+        loop {
+            let serial = self.coordinator_serial.lock().await;
+            let permit = self.mutation_admission.enter()?;
+            require_current_fence()?;
+            let id = typed_value.id();
+            let current = self.reconcile(route, &id).await?;
+            require_current_fence()?;
+            if let Some(LogicalRecordCandidate::Versioned(existing)) = current
+                && existing.typed_value == typed_value
+            {
+                return Ok(LogicalRecordApplied {
+                    record_version: existing.record_version,
+                    replayed: true,
+                });
+            }
 
-        let record_version = self
-            .store
-            .allocate_logical_record_version()
-            .map_err(logical_record_status)?;
-        let mutation = self
-            .store
-            .construct_logical_record_mutation(
-                typed_value,
-                LogicalRecordMutationContext {
-                    record_version,
-                    active_placement_log_id: route.active_placement_log_id,
-                    serving_fence_term: route.serving_fence_term,
-                },
-            )
-            .map_err(logical_record_status)?;
-        let applied = self.replicate(route, &mutation).await?;
-        require_current_fence()?;
-        Ok(applied)
+            let record_version = self
+                .store
+                .allocate_logical_record_version()
+                .map_err(logical_record_status)?;
+            let mutation = self
+                .store
+                .construct_logical_record_mutation(
+                    typed_value.clone(),
+                    LogicalRecordMutationContext {
+                        record_version,
+                        active_placement_log_id: route.active_placement_log_id,
+                        serving_fence_term: route.serving_fence_term,
+                    },
+                )
+                .map_err(logical_record_status)?;
+            let local = match self
+                .store
+                .apply_logical_record_mutation_journaled(&mutation)
+                .await
+            {
+                Ok(applied) => applied,
+                Err(LogicalRecordError::SourceJournalCapacity) => {
+                    drop(permit);
+                    drop(serial);
+                    self.store.wait_for_mutation_capacity().await;
+                    continue;
+                }
+                Err(error) => return Err(logical_record_status(error)),
+            };
+            let applied = self.replicate_after_local(route, &mutation, local).await?;
+            require_current_fence()?;
+            return Ok(applied);
+        }
     }
 
     async fn reconcile(
@@ -257,16 +273,12 @@ impl LogicalRecordDistributionCore {
         Ok(winner)
     }
 
-    async fn replicate(
+    async fn replicate_after_local(
         &self,
         route: &LogicalRecordRoute,
         mutation: &LogicalRecordMutation,
+        local: LogicalRecordApplied,
     ) -> Result<LogicalRecordApplied, Status> {
-        let local = self
-            .store
-            .apply_logical_record_mutation_journaled(mutation)
-            .await
-            .map_err(logical_record_status)?;
         if local.record_version != mutation.record_version {
             return Err(Status::data_loss(
                 "local logical-record replica returned another version",
@@ -786,6 +798,7 @@ fn logical_record_status(error: LogicalRecordError) -> Status {
     match error {
         LogicalRecordError::Storage(_) => Status::internal(error.to_string()),
         LogicalRecordError::Tampered => Status::data_loss(error.to_string()),
+        LogicalRecordError::SourceJournalCapacity => Status::resource_exhausted(error.to_string()),
         LogicalRecordError::LineageGap
         | LogicalRecordError::Sibling
         | LogicalRecordError::SnapshotConflict => Status::unavailable(error.to_string()),

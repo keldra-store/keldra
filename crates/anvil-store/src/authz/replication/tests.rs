@@ -5,7 +5,9 @@ use anvil_authz::{
 use tempfile::TempDir;
 
 use super::*;
-use crate::{AggregateKind, AuthzConsistency, LocalChange, SchemaId, Store, StoreOptions};
+use crate::{
+    AggregateKind, AuthzConsistency, LocalChange, SchemaId, Store, StoreOptions, WatchRetention,
+};
 
 fn tenant() -> StorageTenantId {
     StorageTenantId::parse("acme").unwrap()
@@ -211,6 +213,90 @@ async fn journaled_tuple_mutation_uses_the_actual_atomic_source_position() {
         CoordinatedAuthzRealmResult::Tuples(TupleBatchReceipt { replayed: true, .. })
     ));
     assert_eq!(coordinator.local_watch_status().unwrap().tail, 1);
+}
+
+#[tokio::test]
+async fn journaled_authz_capacity_is_typed_and_retry_wakes_without_partial_binding() {
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::open(
+        StoreOptions::new(root.path(), 1)
+            .with_watch_retention(WatchRetention::new(1, 1024 * 1024).unwrap()),
+    )
+    .await
+    .unwrap();
+    let placement = PlacementLogId { term: 8, index: 21 };
+    let publish_request = super::super::PublishSchemaRequest {
+        storage_tenant: tenant(),
+        schema_id: SchemaId::parse("capacity").unwrap(),
+        schema: schema(),
+        expected_revision: Some(AuthzRevision::ZERO),
+    };
+    let published = store
+        .coordinate_journaled_authz_schema_publication(41, publish_request.clone(), placement, 8)
+        .await
+        .unwrap();
+    assert_eq!(store.local_watch_status().unwrap().tail, 1);
+    let binding = bind_request(published.result.schema_ref.clone());
+
+    assert!(matches!(
+        store
+            .coordinate_journaled_authz_schema_binding(41, binding.clone(), placement, 8)
+            .await,
+        Err(AuthzStoreError::SourceJournalCapacity)
+    ));
+    assert_eq!(store.local_watch_status().unwrap().tail, 1);
+    assert!(store.authz().get_binding(&scope()).unwrap().is_none());
+
+    let retry_store = store.clone();
+    let mut waiting = tokio::spawn(async move {
+        loop {
+            match retry_store
+                .coordinate_journaled_authz_schema_binding(41, binding.clone(), placement, 8)
+                .await
+            {
+                Err(AuthzStoreError::SourceJournalCapacity) => {
+                    retry_store.wait_for_mutation_capacity().await;
+                }
+                outcome => break outcome,
+            }
+        }
+    });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut waiting)
+            .await
+            .is_err(),
+        "the exact journal bound must hold the authorization mutation"
+    );
+    assert_eq!(store.local_watch_status().unwrap().tail, 1);
+    assert!(store.authz().get_binding(&scope()).unwrap().is_none());
+
+    let replay = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        store.coordinate_journaled_authz_schema_publication(41, publish_request, placement, 8),
+    )
+    .await
+    .expect("capacity waiting must release the journal and authorization locks")
+    .unwrap();
+    assert!(replay.result.replayed);
+
+    store
+        .advance_source_journal_reference_safe_through(1)
+        .await
+        .unwrap();
+    let bound = tokio::time::timeout(std::time::Duration::from_secs(2), waiting)
+        .await
+        .expect("the capacity notification must wake the authorization retry")
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        bound.result,
+        CoordinatedAuthzRealmResult::Bound(_)
+    ));
+    assert!(store.authz().get_binding(&scope()).unwrap().is_some());
+    let status = store.local_watch_status().unwrap();
+    assert_eq!(status.tail, 2);
+    assert_eq!(status.retention_floor, 1);
+    assert_eq!(status.retained_entries, 1);
 }
 
 #[tokio::test]

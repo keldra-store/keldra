@@ -1,3 +1,4 @@
+use super::journal_capacity::SourceJournalAdmission;
 use super::*;
 use crate::model::{
     CoordinatedObjectMutation, MUTATION_STAMP_FORMAT, MutationStamp, OBJECT_MUTATION_FORMAT,
@@ -83,11 +84,17 @@ impl Store {
         governance: ObjectMutationGovernance,
     ) -> Result<MutationReceipt, MutationError> {
         governance.validate()?;
-        self.bulk_write_inner(vec![operation], Some(governance), None, false)
-            .await
-            .pop()
-            .expect("one operation has one outcome")
-            .result
+        self.bulk_write_inner(
+            vec![operation],
+            Some(governance),
+            None,
+            false,
+            SourceJournalAdmission::Bounded,
+        )
+        .await
+        .pop()
+        .expect("one operation has one outcome")
+        .result
     }
 
     pub async fn mutate_with_governance_and_backpressure(
@@ -96,11 +103,17 @@ impl Store {
         governance: ObjectMutationGovernance,
     ) -> Result<MutationReceipt, MutationError> {
         governance.validate()?;
-        self.bulk_write_inner(vec![operation], Some(governance), None, true)
-            .await
-            .pop()
-            .expect("one operation has one outcome")
-            .result
+        self.bulk_write_inner(
+            vec![operation],
+            Some(governance),
+            None,
+            true,
+            SourceJournalAdmission::Bounded,
+        )
+        .await
+        .pop()
+        .expect("one operation has one outcome")
+        .result
     }
 
     /// Trusted single-node definition mutation. The typed intent is converted
@@ -113,11 +126,17 @@ impl Store {
     ) -> Result<MutationReceipt, MutationError> {
         governance.validate()?;
         intent.validate().map_err(definition_mutation_error)?;
-        self.bulk_write_inner(vec![operation], Some(governance), Some(intent), false)
-            .await
-            .pop()
-            .expect("one operation has one outcome")
-            .result
+        self.bulk_write_inner(
+            vec![operation],
+            Some(governance),
+            Some(intent),
+            false,
+            SourceJournalAdmission::Bounded,
+        )
+        .await
+        .pop()
+        .expect("one operation has one outcome")
+        .result
     }
 
     pub async fn mutate_definition_with_governance_and_backpressure(
@@ -128,18 +147,31 @@ impl Store {
     ) -> Result<MutationReceipt, MutationError> {
         governance.validate()?;
         intent.validate().map_err(definition_mutation_error)?;
-        self.bulk_write_inner(vec![operation], Some(governance), Some(intent), true)
-            .await
-            .pop()
-            .expect("one operation has one outcome")
-            .result
+        self.bulk_write_inner(
+            vec![operation],
+            Some(governance),
+            Some(intent),
+            true,
+            SourceJournalAdmission::Bounded,
+        )
+        .await
+        .pop()
+        .expect("one operation has one outcome")
+        .result
     }
 
     /// Evaluates independent operations in request order and persists all
     /// successful outcomes with one physical RocksDB write. A failed
     /// precondition is an item result, not a reason to retry the whole bulk.
     pub async fn bulk_write(&self, operations: Vec<BatchOperation>) -> Vec<BatchOutcome> {
-        self.bulk_write_inner(operations, None, None, false).await
+        self.bulk_write_inner(
+            operations,
+            None,
+            None,
+            false,
+            SourceJournalAdmission::Bounded,
+        )
+        .await
     }
 
     /// Applies one public/internal coordinator batch with capacity
@@ -150,15 +182,23 @@ impl Store {
         &self,
         operations: Vec<BatchOperation>,
     ) -> Vec<BatchOutcome> {
-        self.bulk_write_inner(operations, None, None, true).await
+        self.bulk_write_inner(
+            operations,
+            None,
+            None,
+            true,
+            SourceJournalAdmission::Bounded,
+        )
+        .await
     }
 
-    async fn bulk_write_inner(
+    pub(super) async fn bulk_write_inner(
         &self,
         operations: Vec<BatchOperation>,
         governance: Option<ObjectMutationGovernance>,
         definition_intent: Option<DefinitionMutationIntent>,
         backpressure: bool,
+        source_journal_admission: SourceJournalAdmission,
     ) -> Vec<BatchOutcome> {
         if definition_intent.is_some() && operations.len() != 1 {
             return operations
@@ -336,10 +376,11 @@ impl Store {
                 if receipt_status != initial_receipt_status {
                     self.stage_mutation_receipt_status(&mut batch, receipt_status)?;
                 }
-                self.stage_local_changes(
+                self.stage_local_changes_with_admission(
                     &mut batch,
                     &pending_changes,
                     LocalReferenceEffects::AppliedInline,
+                    source_journal_admission,
                 )?;
                 if let Some(high_watermark) = batch_high_watermark {
                     batch.put_cf(
@@ -485,8 +526,14 @@ impl Store {
             bucket_id: BucketId(governance.bucket_id),
         };
         let prepared = self.prepare(operation, identity, true).await?;
-        self.coordinate_prepared_object_mutation(prepared, context, governance, None)
-            .await
+        self.coordinate_prepared_object_mutation(
+            prepared,
+            context,
+            governance,
+            None,
+            SourceJournalAdmission::Bounded,
+        )
+        .await
     }
 
     pub async fn coordinate_definition_object_mutation_with_governance(
@@ -508,8 +555,14 @@ impl Store {
             bucket_id: BucketId(governance.bucket_id),
         };
         let prepared = self.prepare(operation, identity, true).await?;
-        self.coordinate_prepared_object_mutation(prepared, context, governance, Some(intent))
-            .await
+        self.coordinate_prepared_object_mutation(
+            prepared,
+            context,
+            governance,
+            Some(intent),
+            SourceJournalAdmission::Bounded,
+        )
+        .await
     }
 
     /// Coordinates a distributed publish whose payload evidence was verified
@@ -560,8 +613,14 @@ impl Store {
             bucket_id: BucketId(governance.bucket_id),
         };
         let prepared = self.prepare_verified_distributed_publish(request, identity)?;
-        self.coordinate_prepared_object_mutation(prepared, context, governance, None)
-            .await
+        self.coordinate_prepared_object_mutation(
+            prepared,
+            context,
+            governance,
+            None,
+            SourceJournalAdmission::Bounded,
+        )
+        .await
     }
 
     pub async fn coordinate_distributed_definition_publish_with_governance(
@@ -583,8 +642,14 @@ impl Store {
             bucket_id: BucketId(governance.bucket_id),
         };
         let prepared = self.prepare_verified_distributed_publish(request, identity)?;
-        self.coordinate_prepared_object_mutation(prepared, context, governance, Some(intent))
-            .await
+        self.coordinate_prepared_object_mutation(
+            prepared,
+            context,
+            governance,
+            Some(intent),
+            SourceJournalAdmission::Bounded,
+        )
+        .await
     }
 
     pub(super) fn prepare_verified_distributed_publish(
@@ -601,12 +666,13 @@ impl Store {
         })
     }
 
-    async fn coordinate_prepared_object_mutation(
+    pub(super) async fn coordinate_prepared_object_mutation(
         &self,
         prepared: PreparedOperation,
         context: ObjectMutationContext,
         governance: ObjectMutationGovernance,
         definition_intent: Option<DefinitionMutationIntent>,
+        source_journal_admission: SourceJournalAdmission,
     ) -> Result<CoordinatedObjectMutation, MutationError> {
         if prepared.command_id().is_none() {
             return Err(MutationError::InvalidCommandId);
@@ -671,7 +737,7 @@ impl Store {
                     "distributed mutation source position changed during evaluation".into(),
                 ));
             }
-            self.stage_local_changes(
+            self.stage_local_changes_with_admission(
                 &mut batch,
                 &[PendingLocalChange::ObjectHead {
                     identity,
@@ -683,6 +749,7 @@ impl Store {
                     definition_transition: evaluated.definition_transition.clone(),
                 }],
                 LocalReferenceEffects::Deferred,
+                source_journal_admission,
             )?;
             batch.put_cf(
                 self.cf(CF_METADATA)?,
@@ -930,6 +997,21 @@ impl Store {
         changes: &[PendingLocalChange],
         reference_effects: LocalReferenceEffects,
     ) -> Result<(), MutationError> {
+        self.stage_local_changes_with_admission(
+            batch,
+            changes,
+            reference_effects,
+            SourceJournalAdmission::Bounded,
+        )
+    }
+
+    pub(super) fn stage_local_changes_with_admission(
+        &self,
+        batch: &mut WriteBatch,
+        changes: &[PendingLocalChange],
+        reference_effects: LocalReferenceEffects,
+        admission: SourceJournalAdmission,
+    ) -> Result<(), MutationError> {
         if changes.is_empty() {
             return Ok(());
         }
@@ -939,6 +1021,16 @@ impl Store {
         let mut status = self
             .local_watch_status()
             .map_err(|error| MutationError::Storage(error.to_string()))?;
+        if admission == SourceJournalAdmission::Bounded
+            && (status.retained_entries > self.watch_retention.max_entries
+                || status.retained_bytes > self.watch_retention.max_bytes)
+        {
+            // Publication progress debt is repaid by advancing the durable
+            // consumer cuts and pruning before an ordinary writer retries. Do
+            // not combine that repayment with a new source append: while debt
+            // exists, every bounded mutation remains under backpressure.
+            return Err(MutationError::SourceJournalCapacity);
+        }
         let old_tail = status.tail;
         let cursor = self
             .reference_delta_cursor(status.source_id)
@@ -1050,7 +1142,9 @@ impl Store {
             let encoded = encode_local_change(&change).map_err(storage_error)?;
             let logical_bytes = invalidation_record_bytes(encoded.len())
                 .saturating_add(super::journal_routes::journal_route_logical_bytes(&change));
-            if logical_bytes > self.watch_retention.max_bytes {
+            if admission == SourceJournalAdmission::Bounded
+                && logical_bytes > self.watch_retention.max_bytes
+            {
                 return Err(MutationError::SourceJournalRecordTooLarge {
                     bytes: logical_bytes,
                     maximum: self.watch_retention.max_bytes,
@@ -1085,6 +1179,9 @@ impl Store {
                 MutationError::Storage("local invalidation retention floor is exhausted".into())
             })?;
             if pruned > old_tail || pruned > safe_through || pruned > status.settled_through {
+                if admission == SourceJournalAdmission::DerivedProgress {
+                    break;
+                }
                 return Err(MutationError::SourceJournalCapacity);
             }
             let (stored_key, encoded) = old_entries
@@ -1162,95 +1259,8 @@ impl Store {
     }
 
     pub(crate) fn notify_local_invalidations(&self) {
+        self.observe_source_journal_progress_debt();
         self.watch_notify.send_replace(());
-    }
-
-    pub(super) fn enforce_local_watch_retention(&self) -> Result<(), WatchError> {
-        let journal = self
-            .cf(CF_LOCAL_INVALIDATIONS)
-            .map_err(|error| WatchError::Storage(error.to_string()))?;
-        let metadata = self
-            .cf(CF_METADATA)
-            .map_err(|error| WatchError::Storage(error.to_string()))?;
-        let mut status = self.local_watch_status()?;
-        if status.retained_entries <= self.watch_retention.max_entries
-            && status.retained_bytes <= self.watch_retention.max_bytes
-        {
-            return Ok(());
-        }
-        let mut batch = WriteBatch::default();
-        let reference_safe_through = self
-            .source_journal_reference_safe_through
-            .load(std::sync::atomic::Ordering::Acquire)
-            .min(status.settled_through);
-        let (index_safe_through, accounting_safe_through) = self
-            .derived_consumer_safe_through(status)
-            .map_err(|error| WatchError::Storage(error.to_string()))?;
-        let safe_through = reference_safe_through
-            .min(index_safe_through)
-            .min(accounting_safe_through);
-        while (status.retained_entries > self.watch_retention.max_entries
-            || status.retained_bytes > self.watch_retention.max_bytes)
-            && status.retention_floor < safe_through
-        {
-            let offset = status.retention_floor.checked_add(1).ok_or_else(|| {
-                WatchError::Storage("local invalidation retention floor is exhausted".into())
-            })?;
-            let encoded = self
-                .db
-                .get_cf(journal, invalidation_key(offset))
-                .map_err(|error| WatchError::Storage(error.to_string()))?
-                .ok_or_else(|| {
-                    WatchError::Storage(format!(
-                        "retained local invalidation offset {offset} is missing"
-                    ))
-                })?;
-            let pruned_change = self
-                .decode_local_change_record(&encoded)
-                .map_err(|error| WatchError::Storage(error.to_string()))?;
-            if pruned_change.offset() != offset {
-                return Err(WatchError::Storage(
-                    "local change key does not match its stored offset".into(),
-                ));
-            }
-            self.stage_journal_route_removal(
-                &mut batch,
-                status.source_id.source_epoch,
-                &pruned_change,
-            )
-            .map_err(|error| WatchError::Storage(error.to_string()))?;
-            batch.delete_cf(journal, invalidation_key(offset));
-            status.retention_floor = offset;
-            status.retained_entries -= 1;
-            status.retained_bytes = status
-                .retained_bytes
-                .checked_sub(invalidation_record_bytes(encoded.len()).saturating_add(
-                    super::journal_routes::journal_route_logical_bytes(&pruned_change),
-                ))
-                .ok_or_else(|| {
-                    WatchError::Storage("local invalidation byte accounting is inconsistent".into())
-                })?;
-        }
-        batch.put_cf(
-            metadata,
-            LOCAL_INVALIDATION_FLOOR_KEY,
-            status.retention_floor.to_be_bytes(),
-        );
-        batch.put_cf(
-            metadata,
-            LOCAL_INVALIDATION_COUNT_KEY,
-            status.retained_entries.to_be_bytes(),
-        );
-        batch.put_cf(
-            metadata,
-            LOCAL_INVALIDATION_BYTES_KEY,
-            status.retained_bytes.to_be_bytes(),
-        );
-        let mut options = WriteOptions::default();
-        options.set_sync(self.sync_writes);
-        self.db
-            .write_opt(batch, &options)
-            .map_err(|error| WatchError::Storage(error.to_string()))
     }
 
     pub(super) async fn prepare(

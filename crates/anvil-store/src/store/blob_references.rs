@@ -8,21 +8,37 @@ use crate::blob_gc::{
     FilesystemGcCursor,
 };
 
+use super::journal_capacity::SourceJournalAdmission;
 use super::*;
 
 static NEXT_GC_QUARANTINE_ID: AtomicU64 = AtomicU64::new(1);
 
 impl Store {
     pub async fn stage_blob(&self, bytes: &[u8]) -> Result<BlobRef, MutationError> {
+        self.stage_blob_with_admission(bytes, SourceJournalAdmission::Bounded)
+            .await
+    }
+
+    pub(super) async fn stage_blob_with_admission(
+        &self,
+        bytes: &[u8],
+        admission: SourceJournalAdmission,
+    ) -> Result<BlobRef, MutationError> {
         if bytes.len() <= SMALL_BLOB_MAX_BYTES {
             let reference = blob_reference_for_bytes(bytes);
-            let _commit_guard = self.commit_lock.lock().await;
-            self.persist_small_blob_seal(&reference, bytes, now_unix_millis()?)?;
+            self.persist_small_blob_seal_with_admission(
+                &reference,
+                bytes,
+                now_unix_millis()?,
+                admission,
+            )
+            .await?;
             return Ok(reference);
         }
         let mut upload = self.begin_blob_upload().await?;
         upload.write(bytes).await.map_err(storage_error)?;
-        self.seal_blob_upload(upload).await
+        self.seal_blob_upload_with_admission(upload, admission)
+            .await
     }
 
     pub fn lock_manager(&self) -> LocalLockManager {
@@ -39,32 +55,29 @@ impl Store {
         &self,
         upload: crate::BlobUpload,
     ) -> Result<BlobRef, MutationError> {
+        self.seal_blob_upload_with_admission(upload, SourceJournalAdmission::Bounded)
+            .await
+    }
+
+    pub(super) async fn seal_blob_upload_with_admission(
+        &self,
+        upload: crate::BlobUpload,
+        admission: SourceJournalAdmission,
+    ) -> Result<BlobRef, MutationError> {
         // Hashing, fsync, rename and parent-directory fsync are byte-plane IO,
         // so complete them before taking the short metadata commit fence.
         let reference = upload.finish().await.map_err(storage_error)?;
         let now = now_unix_millis()?;
         if is_small_blob(&reference) {
             let bytes = self.blobs.get(&reference).await.map_err(storage_error)?;
-            {
-                let _commit_guard = self.commit_lock.lock().await;
-                self.persist_small_blob_seal(&reference, &bytes, now)?;
-            }
+            self.persist_small_blob_seal_with_admission(&reference, &bytes, now, admission)
+                .await?;
             // A crash before this cleanup leaves only a normal untracked copy,
             // which the existing age-gated orphan scan removes.
             self.blobs.remove(&reference).map_err(storage_error)?;
         } else {
-            let _commit_guard = self.commit_lock.lock().await;
-            // GC may have removed a stale deduplication target while finish was
-            // outside the fence. Never recreate lifecycle state without bytes.
-            if !self
-                .blobs
-                .contains(&reference)
-                .await
-                .map_err(storage_error)?
-            {
-                return Err(MutationError::BlobNotFound);
-            }
-            self.reserve_sealed_blob(&reference, now)?;
+            self.reserve_sealed_blob_with_admission_wait(&reference, now, admission)
+                .await?;
         }
         Ok(reference)
     }
@@ -557,6 +570,19 @@ impl Store {
         key: &[u8],
         now_unix_millis: u64,
     ) -> Result<BlobReferenceState, MutationError> {
+        self.reserve_sealed_artifact_with_admission(
+            key,
+            now_unix_millis,
+            SourceJournalAdmission::Bounded,
+        )
+    }
+
+    fn reserve_sealed_artifact_with_admission(
+        &self,
+        key: &[u8],
+        now_unix_millis: u64,
+        admission: SourceJournalAdmission,
+    ) -> Result<BlobReferenceState, MutationError> {
         let next = self
             .prepare_sealed_artifact_reservation(key, now_unix_millis)?
             .ok_or_else(|| MutationError::Storage("sealed lifecycle state is missing".into()))?;
@@ -566,7 +592,7 @@ impl Store {
             key,
             encode_blob_reference_state(next),
         );
-        self.stage_local_changes(
+        self.stage_local_changes_with_admission(
             &mut batch,
             &[PendingLocalChange::ContentLifecycleChanged {
                 blob_identity: key.to_vec(),
@@ -574,6 +600,7 @@ impl Store {
                 reference_deltas: Vec::new(),
             }],
             LocalReferenceEffects::NoReferenceEffects,
+            admission,
         )?;
         let mut options = WriteOptions::default();
         options.set_sync(self.sync_writes);
@@ -587,9 +614,76 @@ impl Store {
         reference: &BlobRef,
         now_unix_millis: u64,
     ) -> Result<(), MutationError> {
+        self.reserve_sealed_blob_with_admission(
+            reference,
+            now_unix_millis,
+            SourceJournalAdmission::Bounded,
+        )
+    }
+
+    fn reserve_sealed_blob_with_admission(
+        &self,
+        reference: &BlobRef,
+        now_unix_millis: u64,
+        admission: SourceJournalAdmission,
+    ) -> Result<(), MutationError> {
         let key = blob_reference_key(reference);
-        self.reserve_sealed_artifact(&key, now_unix_millis)
+        self.reserve_sealed_artifact_with_admission(&key, now_unix_millis, admission)
             .map(|_| ())
+    }
+
+    async fn reserve_sealed_blob_with_admission_wait(
+        &self,
+        reference: &BlobRef,
+        now_unix_millis: u64,
+        admission: SourceJournalAdmission,
+    ) -> Result<(), MutationError> {
+        loop {
+            let guard = self.commit_lock.lock().await;
+            // GC may have removed a stale deduplication target while finish was
+            // outside the fence. Never recreate lifecycle state without bytes.
+            if !self
+                .blobs
+                .contains(reference)
+                .await
+                .map_err(storage_error)?
+            {
+                return Err(MutationError::BlobNotFound);
+            }
+            let result =
+                self.reserve_sealed_blob_with_admission(reference, now_unix_millis, admission);
+            drop(guard);
+            match result {
+                Err(MutationError::SourceJournalCapacity)
+                    if admission == SourceJournalAdmission::Bounded =>
+                {
+                    self.wait_for_mutation_capacity().await;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    async fn persist_small_blob_seal_with_admission(
+        &self,
+        reference: &BlobRef,
+        bytes: &[u8],
+        now_unix_millis: u64,
+        admission: SourceJournalAdmission,
+    ) -> Result<(), MutationError> {
+        loop {
+            let guard = self.commit_lock.lock().await;
+            let result = self.persist_small_blob_seal(reference, bytes, now_unix_millis, admission);
+            drop(guard);
+            match result {
+                Err(MutationError::SourceJournalCapacity)
+                    if admission == SourceJournalAdmission::Bounded =>
+                {
+                    self.wait_for_mutation_capacity().await;
+                }
+                result => return result,
+            }
+        }
     }
 
     fn persist_small_blob_seal(
@@ -597,6 +691,7 @@ impl Store {
         reference: &BlobRef,
         bytes: &[u8],
         now_unix_millis: u64,
+        admission: SourceJournalAdmission,
     ) -> Result<(), MutationError> {
         validate_small_blob(reference, bytes)?;
         let pending = BTreeSet::new();
@@ -614,7 +709,7 @@ impl Store {
             &key,
             encode_blob_reference_state(state),
         );
-        self.stage_local_changes(
+        self.stage_local_changes_with_admission(
             &mut batch,
             &[PendingLocalChange::ContentLifecycleChanged {
                 blob_identity: key,
@@ -622,6 +717,7 @@ impl Store {
                 reference_deltas: Vec::new(),
             }],
             LocalReferenceEffects::NoReferenceEffects,
+            admission,
         )?;
         let mut options = WriteOptions::default();
         options.set_sync(self.sync_writes);

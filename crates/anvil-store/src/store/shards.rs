@@ -265,12 +265,24 @@ impl Store {
             }
         }
 
-        let _commit_guard = self.commit_lock.lock().await;
-        if !final_path.is_file() {
-            return Err(ShardStoreError::NotFound);
+        loop {
+            let commit_guard = self.commit_lock.lock().await;
+            if !final_path.is_file() {
+                return Err(ShardStoreError::NotFound);
+            }
+            let reservation = self.reserve_sealed_artifact(
+                &identity.encode(),
+                now_unix_millis().map_err(shard_error)?,
+            );
+            drop(commit_guard);
+            match reservation {
+                Ok(_) => break,
+                Err(MutationError::SourceJournalCapacity) => {
+                    self.wait_for_mutation_capacity().await;
+                }
+                Err(error) => return Err(shard_error(error)),
+            }
         }
-        self.reserve_sealed_artifact(&identity.encode(), now_unix_millis().map_err(shard_error)?)
-            .map_err(shard_error)?;
         drop(temporary_guard);
         Ok(if created {
             ShardSealOutcome::Created

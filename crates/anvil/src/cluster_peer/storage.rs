@@ -268,14 +268,27 @@ impl wire::cluster_peer_server::ClusterPeer for ClusterPeerService {
                 "logical mutation does not carry the admitted placement fence",
             ));
         }
-        let applied = tokio::time::timeout(
-            admitted.timeout,
-            self.store
-                .apply_logical_record_mutation_journaled(&mutation),
-        )
-        .await
-        .map_err(|_| Status::deadline_exceeded("logical mutation deadline exceeded"))?
-        .map_err(logical_status)?;
+        let deadline = tokio::time::Instant::now() + admitted.timeout;
+        let applied = loop {
+            match tokio::time::timeout_at(
+                deadline,
+                self.store
+                    .apply_logical_record_mutation_journaled(&mutation),
+            )
+            .await
+            .map_err(|_| Status::deadline_exceeded("logical mutation deadline exceeded"))?
+            {
+                Ok(applied) => break applied,
+                Err(LogicalRecordError::SourceJournalCapacity) => {
+                    tokio::time::timeout_at(deadline, self.store.wait_for_mutation_capacity())
+                        .await
+                        .map_err(|_| {
+                            Status::deadline_exceeded("logical mutation deadline exceeded")
+                        })?;
+                }
+                Err(error) => return Err(logical_status(error)),
+            }
+        };
         Ok(Response::new(wire::LogicalRecordApplied {
             schema_version: CLUSTER_PEER_SCHEMA_VERSION,
             record_version: applied.record_version.0,
@@ -1225,6 +1238,7 @@ pub(super) async fn bounded_blocking<T: Send + 'static>(
 fn logical_status(error: LogicalRecordError) -> Status {
     match error {
         LogicalRecordError::Storage(_) => Status::internal(error.to_string()),
+        LogicalRecordError::SourceJournalCapacity => Status::resource_exhausted(error.to_string()),
         LogicalRecordError::Stale
         | LogicalRecordError::Sibling
         | LogicalRecordError::LineageGap => Status::aborted(error.to_string()),
@@ -1235,9 +1249,9 @@ fn logical_status(error: LogicalRecordError) -> Status {
 pub(super) fn authz_status(error: AuthzStoreError) -> Status {
     match error {
         AuthzStoreError::Storage(_) => Status::internal(error.to_string()),
-        AuthzStoreError::RevisionNotAvailable { .. } | AuthzStoreError::ReceiptCapacity => {
-            Status::unavailable(error.to_string())
-        }
+        AuthzStoreError::RevisionNotAvailable { .. }
+        | AuthzStoreError::ReceiptCapacity
+        | AuthzStoreError::SourceJournalCapacity => Status::unavailable(error.to_string()),
         _ => Status::failed_precondition(error.to_string()),
     }
 }

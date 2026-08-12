@@ -748,6 +748,7 @@ fn logical_status(error: LogicalRecordError) -> Status {
     match error {
         LogicalRecordError::Storage(_) => Status::internal(error.to_string()),
         LogicalRecordError::Tampered => Status::data_loss(error.to_string()),
+        LogicalRecordError::SourceJournalCapacity => Status::resource_exhausted(error.to_string()),
         _ => Status::failed_precondition(error.to_string()),
     }
 }
@@ -763,9 +764,9 @@ fn authz_status(error: AuthzRealmSnapshotError) -> Status {
 fn authz_store_status(error: AuthzStoreError) -> Status {
     match error {
         AuthzStoreError::Storage(_) => Status::internal(error.to_string()),
-        AuthzStoreError::RevisionNotAvailable { .. } | AuthzStoreError::ReceiptCapacity => {
-            Status::unavailable(error.to_string())
-        }
+        AuthzStoreError::RevisionNotAvailable { .. }
+        | AuthzStoreError::ReceiptCapacity
+        | AuthzStoreError::SourceJournalCapacity => Status::unavailable(error.to_string()),
         _ => Status::failed_precondition(error.to_string()),
     }
 }

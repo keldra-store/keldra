@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use anvil_consensus::{ClusterId, NodeId};
 use anvil_store::{
     BucketPolicy, LogicalRecordMutationContext, LogicalRecordValue, PlacementLogId, StoreOptions,
-    VersionId,
+    VersionId, WatchRetention,
 };
 use tonic::Code;
 
@@ -106,17 +106,25 @@ struct Fixture {
 }
 
 async fn fixture(active_count: usize) -> Fixture {
+    fixture_with_retention(active_count, None).await
+}
+
+async fn fixture_with_retention(
+    active_count: usize,
+    watch_retention: Option<WatchRetention>,
+) -> Fixture {
     let root = tempfile::tempdir().unwrap();
     let mut stores = BTreeMap::new();
     let mut nodes = Vec::with_capacity(active_count);
     for id in 1..=active_count as u64 {
         let node = NodeId(id);
+        let options = StoreOptions::new(root.path().join(format!("node-{id}")), id as u16);
         stores.insert(
             node,
-            Store::open(StoreOptions::new(
-                root.path().join(format!("node-{id}")),
-                id as u16,
-            ))
+            Store::open(match watch_retention {
+                Some(retention) => options.with_watch_retention(retention),
+                None => options,
+            })
             .await
             .unwrap(),
         );
@@ -236,6 +244,76 @@ async fn one_two_and_three_node_groups_apply_their_fixed_quorums() {
             .code(),
         Code::Unavailable
     );
+}
+
+#[tokio::test]
+async fn exact_journal_capacity_blocks_without_mutation_then_wakes_and_retries() {
+    let fixture =
+        fixture_with_retention(1, Some(WatchRetention::new(1, 1024 * 1024).unwrap())).await;
+    let first_value = policy_value("first");
+    let first = fixture
+        .core
+        .coordinate(&fixture.route, first_value.clone(), || Ok(()))
+        .await
+        .unwrap();
+    let coordinator = fixture.route.group.coordinator();
+    let store = fixture.stores[&coordinator].clone();
+    assert_eq!(store.local_watch_status().unwrap().tail, 1);
+
+    let core = fixture.core.clone();
+    let route = fixture.route.clone();
+    let mut waiting = tokio::spawn(async move {
+        core.coordinate(&route, policy_value("second"), || Ok(()))
+            .await
+    });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut waiting)
+            .await
+            .is_err(),
+        "the second mutation must wait at the exact journal bound"
+    );
+    assert_eq!(store.local_watch_status().unwrap().tail, 1);
+    let current = store
+        .logical_record_candidate(&first_value.id())
+        .unwrap()
+        .unwrap();
+    let LogicalRecordCandidate::Versioned(current) = current else {
+        panic!("the first logical record is not versioned")
+    };
+    assert_eq!(current.record_version, first.record_version);
+    assert_eq!(current.typed_value, first_value);
+
+    let serial = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        fixture.core.coordinator_serial.lock(),
+    )
+    .await
+    .expect("capacity waiting must release the coordinator serialization lock");
+    drop(serial);
+
+    store
+        .advance_source_journal_reference_safe_through(1)
+        .await
+        .unwrap();
+    let second = tokio::time::timeout(std::time::Duration::from_secs(2), waiting)
+        .await
+        .expect("the capacity notification must wake the coordinator")
+        .unwrap()
+        .unwrap();
+    assert_ne!(second.record_version, first.record_version);
+    let status = store.local_watch_status().unwrap();
+    assert_eq!(status.tail, 2);
+    assert_eq!(status.retention_floor, 1);
+    assert_eq!(status.retained_entries, 1);
+    let current = store
+        .logical_record_candidate(&first_value.id())
+        .unwrap()
+        .unwrap();
+    let LogicalRecordCandidate::Versioned(current) = current else {
+        panic!("the retried logical record is not versioned")
+    };
+    assert_eq!(current.record_version, second.record_version);
+    assert_eq!(current.typed_value, policy_value("second"));
 }
 
 #[tokio::test]

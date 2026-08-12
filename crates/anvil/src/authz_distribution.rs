@@ -610,30 +610,41 @@ impl ZanzibarDistribution {
         store: &Store,
         request: BindSchemaRequest,
     ) -> Result<CoordinatedAuthzRealmMutation, Status> {
-        let _serial = self.core.coordinator_serial.lock().await;
-        let _permit = self.mutation_admission.enter()?;
-        let mut replicas = self.require_coordinator(stable_tenant_id)?;
-        let serving = self.serving.mutation_context()?;
-        let scope = request.scope.clone();
-        self.core.reconcile(&replicas, &scope).await?;
-        replicas = self.require_coordinator(stable_tenant_id)?;
-        let current = self.serving.mutation_context()?;
-        if current != serving {
-            return Err(Status::unavailable(
-                "authorization serving fence changed during reconciliation",
-            ));
+        loop {
+            let serial = self.core.coordinator_serial.lock().await;
+            let permit = self.mutation_admission.enter()?;
+            let mut replicas = self.require_coordinator(stable_tenant_id)?;
+            let serving = self.serving.mutation_context()?;
+            let scope = request.scope.clone();
+            self.core.reconcile(&replicas, &scope).await?;
+            replicas = self.require_coordinator(stable_tenant_id)?;
+            let current = self.serving.mutation_context()?;
+            if current != serving {
+                return Err(Status::unavailable(
+                    "authorization serving fence changed during reconciliation",
+                ));
+            }
+            let coordinated = match store
+                .coordinate_journaled_authz_schema_binding(
+                    stable_tenant_id,
+                    request.clone(),
+                    serving.active_placement_log_id,
+                    serving.serving_fence_term,
+                )
+                .await
+            {
+                Ok(coordinated) => coordinated,
+                Err(AuthzStoreError::SourceJournalCapacity) => {
+                    drop(permit);
+                    drop(serial);
+                    store.wait_for_mutation_capacity().await;
+                    continue;
+                }
+                Err(error) => return Err(authz_status(error)),
+            };
+            self.core.replicate(&replicas, &scope, &coordinated).await?;
+            return Ok(coordinated);
         }
-        let coordinated = store
-            .coordinate_journaled_authz_schema_binding(
-                stable_tenant_id,
-                request,
-                serving.active_placement_log_id,
-                serving.serving_fence_term,
-            )
-            .await
-            .map_err(authz_status)?;
-        self.core.replicate(&replicas, &scope, &coordinated).await?;
-        Ok(coordinated)
     }
 
     pub(crate) async fn publish_schema(
@@ -666,24 +677,35 @@ impl ZanzibarDistribution {
         store: &Store,
         request: PublishSchemaRequest,
     ) -> Result<CoordinatedAuthzSchemaPublication, Status> {
-        let _serial = self.core.coordinator_serial.lock().await;
-        let _permit = self.mutation_admission.enter()?;
-        let replicas = self.require_coordinator(stable_tenant_id)?;
-        let serving = self.serving.mutation_context()?;
-        let storage_tenant = request.storage_tenant.clone();
-        let coordinated = store
-            .coordinate_journaled_authz_schema_publication(
-                stable_tenant_id,
-                request,
-                serving.active_placement_log_id,
-                serving.serving_fence_term,
-            )
-            .await
-            .map_err(authz_status)?;
-        self.core
-            .replicate_schema_publication(&replicas, &storage_tenant, &coordinated)
-            .await?;
-        Ok(coordinated)
+        loop {
+            let serial = self.core.coordinator_serial.lock().await;
+            let permit = self.mutation_admission.enter()?;
+            let replicas = self.require_coordinator(stable_tenant_id)?;
+            let serving = self.serving.mutation_context()?;
+            let storage_tenant = request.storage_tenant.clone();
+            let coordinated = match store
+                .coordinate_journaled_authz_schema_publication(
+                    stable_tenant_id,
+                    request.clone(),
+                    serving.active_placement_log_id,
+                    serving.serving_fence_term,
+                )
+                .await
+            {
+                Ok(coordinated) => coordinated,
+                Err(AuthzStoreError::SourceJournalCapacity) => {
+                    drop(permit);
+                    drop(serial);
+                    store.wait_for_mutation_capacity().await;
+                    continue;
+                }
+                Err(error) => return Err(authz_status(error)),
+            };
+            self.core
+                .replicate_schema_publication(&replicas, &storage_tenant, &coordinated)
+                .await?;
+            return Ok(coordinated);
+        }
     }
 
     pub(crate) async fn reconcile_realm(
@@ -739,30 +761,41 @@ impl ZanzibarDistribution {
         store: &Store,
         request: TupleBatchRequest,
     ) -> Result<CoordinatedAuthzRealmMutation, Status> {
-        let _serial = self.core.coordinator_serial.lock().await;
-        let _permit = self.mutation_admission.enter()?;
-        let mut replicas = self.require_coordinator(stable_tenant_id)?;
-        let serving = self.serving.mutation_context()?;
-        let scope = request.scope.clone();
-        self.core.reconcile(&replicas, &scope).await?;
-        replicas = self.require_coordinator(stable_tenant_id)?;
-        let current = self.serving.mutation_context()?;
-        if current != serving {
-            return Err(Status::unavailable(
-                "authorization serving fence changed during reconciliation",
-            ));
+        loop {
+            let serial = self.core.coordinator_serial.lock().await;
+            let permit = self.mutation_admission.enter()?;
+            let mut replicas = self.require_coordinator(stable_tenant_id)?;
+            let serving = self.serving.mutation_context()?;
+            let scope = request.scope.clone();
+            self.core.reconcile(&replicas, &scope).await?;
+            replicas = self.require_coordinator(stable_tenant_id)?;
+            let current = self.serving.mutation_context()?;
+            if current != serving {
+                return Err(Status::unavailable(
+                    "authorization serving fence changed during reconciliation",
+                ));
+            }
+            let coordinated = match store
+                .coordinate_journaled_authz_tuple_mutation(
+                    stable_tenant_id,
+                    request.clone(),
+                    serving.active_placement_log_id,
+                    serving.serving_fence_term,
+                )
+                .await
+            {
+                Ok(coordinated) => coordinated,
+                Err(AuthzStoreError::SourceJournalCapacity) => {
+                    drop(permit);
+                    drop(serial);
+                    store.wait_for_mutation_capacity().await;
+                    continue;
+                }
+                Err(error) => return Err(authz_status(error)),
+            };
+            self.core.replicate(&replicas, &scope, &coordinated).await?;
+            return Ok(coordinated);
         }
-        let coordinated = store
-            .coordinate_journaled_authz_tuple_mutation(
-                stable_tenant_id,
-                request,
-                serving.active_placement_log_id,
-                serving.serving_fence_term,
-            )
-            .await
-            .map_err(authz_status)?;
-        self.core.replicate(&replicas, &scope, &coordinated).await?;
-        Ok(coordinated)
     }
 
     pub(crate) async fn fresh_check(
@@ -888,9 +921,9 @@ pub(crate) fn exact_quorum_candidate(
 
 fn authz_status(error: AuthzStoreError) -> Status {
     match error {
-        AuthzStoreError::ReceiptCapacity | AuthzStoreError::RevisionNotAvailable { .. } => {
-            Status::unavailable(error.to_string())
-        }
+        AuthzStoreError::ReceiptCapacity
+        | AuthzStoreError::SourceJournalCapacity
+        | AuthzStoreError::RevisionNotAvailable { .. } => Status::unavailable(error.to_string()),
         AuthzStoreError::Storage(_) => Status::internal(error.to_string()),
         _ => Status::failed_precondition(error.to_string()),
     }

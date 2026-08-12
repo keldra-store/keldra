@@ -523,6 +523,18 @@ fn oversized_bulk_items_fail_and_replicated_durability_is_preserved() {
 }
 
 #[test]
+fn coordinator_mutation_failures_preserve_cas_and_idempotency_outcomes() {
+    assert_eq!(
+        api_mutation_failure(Status::failed_precondition("stale version")).code,
+        MutationFailureCode::ConditionFailed as i32
+    );
+    assert_eq!(
+        api_mutation_failure(Status::already_exists("command input changed")).code,
+        MutationFailureCode::IdempotencyInputMismatch as i32
+    );
+}
+
+#[test]
 fn put_token_helper_rejects_missing_values() {
     assert_eq!(
         required_put_token(None).unwrap_err().code(),

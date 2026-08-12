@@ -570,7 +570,9 @@ pub(super) fn authz_store_status(error: AuthzStoreError) -> Status {
             Status::failed_precondition(error.to_string())
         }
         AuthzStoreError::RevisionExpired { .. } => Status::failed_precondition(error.to_string()),
-        AuthzStoreError::ReceiptCapacity => Status::resource_exhausted(error.to_string()),
+        AuthzStoreError::ReceiptCapacity | AuthzStoreError::SourceJournalCapacity => {
+            Status::resource_exhausted(error.to_string())
+        }
         AuthzStoreError::RealmMutationLineageGap { .. }
         | AuthzStoreError::RealmMutationStale { .. }
         | AuthzStoreError::RealmMutationSibling { .. }

@@ -180,6 +180,13 @@ impl Store {
                 tracing::warn!(%error, "bounded mutation-capacity maintenance will retry");
             }
         }
+        match self.prune_source_journal_for_capacity().await {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(%error, "source-journal capacity maintenance will retry");
+            }
+        }
         let notified = self.mutation_capacity_notify.notified();
         tokio::select! {
             () = notified => {}

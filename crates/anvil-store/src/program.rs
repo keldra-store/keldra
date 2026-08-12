@@ -325,6 +325,8 @@ pub enum ProgramStoreError {
         "prepared ordinary blobs are durable only on the executor and cannot back a cluster-safe commit"
     )]
     ExecutorLocalDurability,
+    #[error("source journal capacity is exhausted before required consumers are durable")]
+    SourceJournalCapacity,
     #[error("storage error: {0}")]
     Storage(String),
 }
@@ -785,7 +787,10 @@ fn program_storage_error(error: impl std::fmt::Display) -> ProgramStoreError {
 }
 
 fn program_mutation_error(error: MutationError) -> ProgramStoreError {
-    ProgramStoreError::Storage(error.to_string())
+    match error {
+        MutationError::SourceJournalCapacity => ProgramStoreError::SourceJournalCapacity,
+        other => ProgramStoreError::Storage(other.to_string()),
+    }
 }
 
 impl Store {
@@ -810,28 +815,38 @@ impl Store {
                 return Err(ProgramStoreError::PreparedBundleMismatch);
             }
             verify_prepared_commit(prepared, &commit)?;
-            let _commit_guard = self.commit_lock.lock().await;
-            let loaded = self
-                .load_prepared_bundle(
-                    commit.bundle_ref,
-                    commit.bundle_hash,
-                    commit.durability_evidence_hash,
-                )
-                .await?;
-            if source_hash != loaded.record.source_bundle_hash
-                || prepared.bundle != loaded.bundle
-                || prepared.durability != loaded.evidence
-            {
-                return Err(ProgramStoreError::PreparedBundleMismatch);
+            loop {
+                let commit_guard = self.commit_lock.lock().await;
+                let loaded = self
+                    .load_prepared_bundle(
+                        commit.bundle_ref,
+                        commit.bundle_hash,
+                        commit.durability_evidence_hash,
+                    )
+                    .await?;
+                if source_hash != loaded.record.source_bundle_hash
+                    || prepared.bundle != loaded.bundle
+                    || prepared.durability != loaded.evidence
+                {
+                    return Err(ProgramStoreError::PreparedBundleMismatch);
+                }
+                verify_loaded_commit(&loaded, &commit)?;
+                let attempt = if let Some(existing) = self.applied_program_commit()?
+                    && existing.commit_cursor == commit.commit_cursor
+                {
+                    self.match_applied_commit(&existing, &commit)?;
+                    Ok(committed_result(&loaded.record))
+                } else {
+                    self.apply_prepared_record(&loaded, &commit)
+                };
+                drop(commit_guard);
+                match attempt {
+                    Err(ProgramStoreError::SourceJournalCapacity) => {
+                        self.wait_for_mutation_capacity().await;
+                    }
+                    outcome => break outcome,
+                }
             }
-            verify_loaded_commit(&loaded, &commit)?;
-            if let Some(existing) = self.applied_program_commit()?
-                && existing.commit_cursor == commit.commit_cursor
-            {
-                self.match_applied_commit(&existing, &commit)?;
-                return Ok(committed_result(&loaded.record));
-            }
-            self.apply_prepared_record(&loaded, &commit)
         }
         .await;
         drop(lease);
@@ -865,23 +880,33 @@ impl Store {
             .map(|precondition| precondition.path.clone())
             .collect::<Vec<_>>();
         let _guard = self.program_locks.acquire(&paths).await;
-        let _commit_guard = self.commit_lock.lock().await;
-        // Re-read and verify under the commit fence so GC cannot retire an
-        // awaiting output or bundle between verification and publication.
-        let loaded = self
-            .load_prepared_bundle(
-                commit.bundle_ref,
-                commit.bundle_hash,
-                commit.durability_evidence_hash,
-            )
-            .await?;
-        if let Some(existing) = self.applied_program_commit()?
-            && existing.commit_cursor == commit.commit_cursor
-        {
-            self.match_applied_commit(&existing, &commit)?;
-            return Ok(committed_result(&loaded.record));
+        loop {
+            let commit_guard = self.commit_lock.lock().await;
+            // Re-read and verify under the commit fence so GC cannot retire an
+            // awaiting output or bundle between verification and publication.
+            let loaded = self
+                .load_prepared_bundle(
+                    commit.bundle_ref,
+                    commit.bundle_hash,
+                    commit.durability_evidence_hash,
+                )
+                .await?;
+            let attempt = if let Some(existing) = self.applied_program_commit()?
+                && existing.commit_cursor == commit.commit_cursor
+            {
+                self.match_applied_commit(&existing, &commit)?;
+                Ok(committed_result(&loaded.record))
+            } else {
+                self.apply_prepared_record(&loaded, &commit)
+            };
+            drop(commit_guard);
+            match attempt {
+                Err(ProgramStoreError::SourceJournalCapacity) => {
+                    self.wait_for_mutation_capacity().await;
+                }
+                outcome => break outcome,
+            }
         }
-        self.apply_prepared_record(&loaded, &commit)
     }
 
     /// Reconstructs the exact public response from the ordinary prepared

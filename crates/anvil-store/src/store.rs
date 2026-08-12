@@ -405,6 +405,10 @@ pub struct Store {
     /// Restart initializes this to the durable floor and waits for current
     /// destination cursors before allowing any further compaction.
     pub(crate) source_journal_reference_safe_through: Arc<std::sync::atomic::AtomicU64>,
+    /// Process-lifetime high-water marks for trusted publication progress
+    /// debt. Current debt remains derived from durable journal occupancy.
+    pub(crate) source_journal_progress_debt_peak_entries: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) source_journal_progress_debt_peak_bytes: Arc<std::sync::atomic::AtomicU64>,
     /// Wakes object writers when receipt expiry or source-journal progress may
     /// have released capacity. A short timer fallback covers receipt expiry
     /// when no other writer is active.
@@ -850,6 +854,10 @@ impl Store {
             watch_source_epoch,
             watch_token_key,
             source_journal_reference_safe_through: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            source_journal_progress_debt_peak_entries: Arc::new(std::sync::atomic::AtomicU64::new(
+                0,
+            )),
+            source_journal_progress_debt_peak_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             mutation_capacity_notify: Arc::new(tokio::sync::Notify::new()),
             watch_notify: tokio::sync::watch::channel(()).0,
             definition_assignment_notify: tokio::sync::broadcast::channel(
@@ -1236,6 +1244,7 @@ pub(crate) mod definition_state;
 mod delete_version;
 mod derived_consumers;
 mod distributed_publish_batch;
+mod journal_capacity;
 mod journal_routes;
 mod mutations;
 mod object_mutation_replica_batch;

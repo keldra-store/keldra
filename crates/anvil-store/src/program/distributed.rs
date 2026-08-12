@@ -250,51 +250,67 @@ impl Store {
     ) -> Result<CoordinatedProgramPathFinalization, ProgramStoreError> {
         stage.validate()?;
         self.persist_program_path_stage(&stage).await?;
-        let _commit_guard = self.commit_lock.lock().await;
-        self.validate_program_path_policy(&stage)?;
-        let identity = stage_identity(&stage);
-        let key = stage_key(&stage)?;
-        let current = self
-            .head_by_storage_key(&identity.head_key(key.path()))
-            .map_err(program_mutation_error)?;
-        if current
-            .as_ref()
-            .is_some_and(|head| head.version == stage.version.id)
-        {
-            let stamp = current
+        loop {
+            let commit_guard = self.commit_lock.lock().await;
+            self.validate_program_path_policy(&stage)?;
+            let identity = stage_identity(&stage);
+            let key = stage_key(&stage)?;
+            let current = self
+                .head_by_storage_key(&identity.head_key(key.path()))
+                .map_err(program_mutation_error)?;
+            if current
                 .as_ref()
-                .and_then(|head| head.mutation_stamp)
-                .ok_or_else(|| ProgramStoreError::CommitCorruption {
-                    cursor: commit_cursor,
-                })?;
-            let mut mutation = self.program_path_mutation(
-                stage,
+                .is_some_and(|head| head.version == stage.version.id)
+            {
+                let stamp = current
+                    .as_ref()
+                    .and_then(|head| head.mutation_stamp)
+                    .ok_or_else(|| ProgramStoreError::CommitCorruption {
+                        cursor: commit_cursor,
+                    })?;
+                let mut mutation = self.program_path_mutation(
+                    stage.clone(),
+                    commit_cursor,
+                    context,
+                    stamp.source_id,
+                    stamp.source_journal_position,
+                )?;
+                mutation.stamp = stamp;
+                mutation.validate()?;
+                return Ok(CoordinatedProgramPathFinalization {
+                    mutation,
+                    replayed: true,
+                });
+            }
+            require_stage_head(&stage, current.as_ref())?;
+            let source = self
+                .local_watch_status()
+                .map_err(|error| ProgramStoreError::Storage(error.to_string()))?;
+            let offset = source.tail.checked_add(1).ok_or_else(|| {
+                ProgramStoreError::Storage("local invalidation offset is exhausted".into())
+            })?;
+            let mutation = self.program_path_mutation(
+                stage.clone(),
                 commit_cursor,
                 context,
-                stamp.source_id,
-                stamp.source_journal_position,
+                source.source_id,
+                offset,
             )?;
-            mutation.stamp = stamp;
-            mutation.validate()?;
-            return Ok(CoordinatedProgramPathFinalization {
-                mutation,
-                replayed: true,
-            });
+            let attempt = self.apply_program_path_mutation_locked(&mutation, true);
+            drop(commit_guard);
+            match attempt {
+                Ok(_) => {
+                    return Ok(CoordinatedProgramPathFinalization {
+                        mutation,
+                        replayed: false,
+                    });
+                }
+                Err(ProgramStoreError::SourceJournalCapacity) => {
+                    self.wait_for_mutation_capacity().await;
+                }
+                Err(error) => return Err(error),
+            }
         }
-        require_stage_head(&stage, current.as_ref())?;
-        let source = self
-            .local_watch_status()
-            .map_err(|error| ProgramStoreError::Storage(error.to_string()))?;
-        let offset = source.tail.checked_add(1).ok_or_else(|| {
-            ProgramStoreError::Storage("local invalidation offset is exhausted".into())
-        })?;
-        let mutation =
-            self.program_path_mutation(stage, commit_cursor, context, source.source_id, offset)?;
-        self.apply_program_path_mutation_locked(&mutation, true)?;
-        Ok(CoordinatedProgramPathFinalization {
-            mutation,
-            replayed: false,
-        })
     }
 
     pub async fn apply_program_path_finalization_replica(

@@ -86,17 +86,26 @@ impl Store {
                 "sealed complete source changed content identity".into(),
             ));
         }
-        let now = now_unix_millis()?;
-        let _commit_guard = self.commit_lock.lock().await;
-        if !self
-            .blobs
-            .contains(expected)
-            .await
-            .map_err(|error| PayloadStoreError::Storage(error.to_string()))?
-        {
-            return Err(PayloadStoreError::CompleteCopyMissing);
+        loop {
+            let commit_guard = self.commit_lock.lock().await;
+            if !self
+                .blobs
+                .contains(expected)
+                .await
+                .map_err(|error| PayloadStoreError::Storage(error.to_string()))?
+            {
+                return Err(PayloadStoreError::CompleteCopyMissing);
+            }
+            let reservation = self.reserve_sealed_blob(expected, now_unix_millis()?);
+            drop(commit_guard);
+            match reservation {
+                Ok(()) => break,
+                Err(MutationError::SourceJournalCapacity) => {
+                    self.wait_for_mutation_capacity().await;
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
-        self.reserve_sealed_blob(expected, now)?;
         Ok(if previous == PayloadArtifactState::Valid {
             CompleteCopySealOutcome::AlreadyPresent
         } else {

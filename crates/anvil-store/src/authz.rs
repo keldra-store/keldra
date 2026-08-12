@@ -376,6 +376,8 @@ pub enum AuthzStoreError {
     },
     #[error("authorization tuple receipt capacity is exhausted by unexpired guarantees")]
     ReceiptCapacity,
+    #[error("source journal capacity is exhausted")]
+    SourceJournalCapacity,
     #[error("operation id is already bound to different tuple input")]
     OperationMismatch,
     #[error("invalid replicated authorization realm mutation: {0}")]

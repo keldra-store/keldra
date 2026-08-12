@@ -10,7 +10,8 @@ use anvil_store::{BatchOperation, DefinitionMutationIntent, ObjectKey};
 use tonic::Status;
 
 use super::{
-    MAX_CONTENT_TYPE_BYTES, api_receipt, api_request_failure, durability, validate_command_id,
+    MAX_CONTENT_TYPE_BYTES, api_mutation_failure, api_receipt, api_request_failure, durability,
+    validate_command_id,
 };
 use crate::authorization::ObjectPermission;
 use crate::cluster_peer::ClusterPeerTransport;
@@ -139,7 +140,7 @@ pub(super) async fn execute_coordinator_groups(
                     index: local_indices[index] as u32,
                     outcome: Some(match result {
                         Ok(receipt) => Outcome::Receipt(api_receipt(receipt)),
-                        Err(error) => Outcome::Failure(api_request_failure(error)),
+                        Err(error) => Outcome::Failure(api_mutation_failure(error)),
                     }),
                 })
                 .collect();

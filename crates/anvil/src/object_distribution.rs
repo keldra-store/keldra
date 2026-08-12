@@ -201,6 +201,41 @@ impl ObjectDistribution {
         governance: ObjectMutationGovernance,
         placement: ClusterPlacement,
     ) -> Result<Vec<Result<MutationReceipt, Status>>, Status> {
+        self.publish_many_from_source_with_governance_and_admission(
+            requests,
+            upload_source,
+            governance,
+            placement,
+            false,
+        )
+        .await
+    }
+
+    pub(crate) async fn publish_many_derived_progress_from_source_with_governance(
+        &self,
+        requests: Vec<PublishRequest>,
+        upload_source: NodeId,
+        governance: ObjectMutationGovernance,
+        placement: ClusterPlacement,
+    ) -> Result<Vec<Result<MutationReceipt, Status>>, Status> {
+        self.publish_many_from_source_with_governance_and_admission(
+            requests,
+            upload_source,
+            governance,
+            placement,
+            true,
+        )
+        .await
+    }
+
+    async fn publish_many_from_source_with_governance_and_admission(
+        &self,
+        requests: Vec<PublishRequest>,
+        upload_source: NodeId,
+        governance: ObjectMutationGovernance,
+        placement: ClusterPlacement,
+        derived_progress: bool,
+    ) -> Result<Vec<Result<MutationReceipt, Status>>, Status> {
         if requests.is_empty() {
             return Err(Status::invalid_argument(
                 "grouped publication requires at least one object",
@@ -245,12 +280,18 @@ impl ObjectDistribution {
                 ));
             }
             let _permit = self.mutation_admission.enter()?;
-            return Ok(self
-                .store
-                .bulk_write_with_backpressure(
-                    requests.into_iter().map(BatchOperation::Publish).collect(),
-                )
-                .await
+            let outcomes = if derived_progress {
+                self.store
+                    .bulk_write_derived_progress_with_backpressure(requests)
+                    .await
+            } else {
+                self.store
+                    .bulk_write_with_backpressure(
+                        requests.into_iter().map(BatchOperation::Publish).collect(),
+                    )
+                    .await
+            };
+            return Ok(outcomes
                 .into_iter()
                 .map(|outcome| outcome.result.map_err(mutation_status))
                 .collect());
@@ -306,15 +347,26 @@ impl ObjectDistribution {
             let completion_group = group.clone();
             let completed = complete_metadata(async move {
                 let _permit = permit;
-                let coordinated = completion
-                    .store
-                    .coordinate_distributed_publish_batch_with_governance(
-                        completion_requests.clone(),
-                        completion_governance,
-                        context,
-                    )
-                    .await
-                    .map_err(mutation_status)?;
+                let coordinated = if derived_progress {
+                    completion
+                        .store
+                        .coordinate_derived_progress_publish_batch_with_governance(
+                            completion_requests.clone(),
+                            completion_governance,
+                            context,
+                        )
+                        .await
+                } else {
+                    completion
+                        .store
+                        .coordinate_distributed_publish_batch_with_governance(
+                            completion_requests.clone(),
+                            completion_governance,
+                            context,
+                        )
+                        .await
+                }
+                .map_err(mutation_status)?;
                 let mut outcomes = Vec::with_capacity(coordinated.len());
                 let mut quorum_proven_positions = Vec::new();
                 for coordinated in coordinated {
@@ -409,6 +461,40 @@ impl ObjectDistribution {
         governance: ObjectMutationGovernance,
         definition_intent: Option<DefinitionMutationIntent>,
     ) -> Result<MutationReceipt, Status> {
+        self.publish_from_source_with_governance_and_admission(
+            request,
+            upload_source,
+            governance,
+            definition_intent,
+            false,
+        )
+        .await
+    }
+
+    pub(crate) async fn publish_derived_progress_from_source_with_governance(
+        &self,
+        request: PublishRequest,
+        upload_source: NodeId,
+        governance: ObjectMutationGovernance,
+    ) -> Result<MutationReceipt, Status> {
+        self.publish_from_source_with_governance_and_admission(
+            request,
+            upload_source,
+            governance,
+            None,
+            true,
+        )
+        .await
+    }
+
+    async fn publish_from_source_with_governance_and_admission(
+        &self,
+        request: PublishRequest,
+        upload_source: NodeId,
+        governance: ObjectMutationGovernance,
+        definition_intent: Option<DefinitionMutationIntent>,
+        derived_progress: bool,
+    ) -> Result<MutationReceipt, Status> {
         if self.is_single_node()? {
             if upload_source != self.local_node {
                 return Err(Status::failed_precondition(
@@ -416,8 +502,8 @@ impl ObjectDistribution {
                 ));
             }
             let _permit = self.mutation_admission.enter()?;
-            return match definition_intent {
-                Some(intent) => {
+            return match (definition_intent, derived_progress) {
+                (Some(intent), false) => {
                     self.store
                         .mutate_definition_with_governance_and_backpressure(
                             BatchOperation::Publish(request),
@@ -426,7 +512,7 @@ impl ObjectDistribution {
                         )
                         .await
                 }
-                None => {
+                (None, false) => {
                     self.store
                         .mutate_with_governance_and_backpressure(
                             BatchOperation::Publish(request),
@@ -434,6 +520,16 @@ impl ObjectDistribution {
                         )
                         .await
                 }
+                (None, true) => {
+                    self.store
+                        .mutate_derived_progress_with_governance_and_backpressure(
+                            request, governance,
+                        )
+                        .await
+                }
+                (Some(_), true) => Err(MutationError::InvalidObjectMutation(
+                    "definition publication cannot claim derived progress admission".into(),
+                )),
             }
             .map_err(mutation_status);
         }
@@ -444,6 +540,7 @@ impl ObjectDistribution {
                     upload_source,
                     governance.clone(),
                     definition_intent,
+                    derived_progress,
                 )
                 .await;
             if let Err(error) = &result
@@ -462,6 +559,7 @@ impl ObjectDistribution {
         upload_source: NodeId,
         governance: ObjectMutationGovernance,
         definition_intent: Option<DefinitionMutationIntent>,
+        derived_progress: bool,
     ) -> Result<MutationReceipt, Status> {
         governance.validate().map_err(mutation_status)?;
         let placement = self.placement()?;
@@ -472,8 +570,8 @@ impl ObjectDistribution {
                 ));
             }
             let _permit = self.mutation_admission.enter()?;
-            return match definition_intent {
-                Some(intent) => {
+            return match (definition_intent, derived_progress) {
+                (Some(intent), false) => {
                     self.store
                         .mutate_definition_with_governance(
                             BatchOperation::Publish(request),
@@ -482,11 +580,21 @@ impl ObjectDistribution {
                         )
                         .await
                 }
-                None => {
+                (None, false) => {
                     self.store
                         .mutate_with_governance(BatchOperation::Publish(request), governance)
                         .await
                 }
+                (None, true) => {
+                    self.store
+                        .mutate_derived_progress_with_governance_and_backpressure(
+                            request, governance,
+                        )
+                        .await
+                }
+                (Some(_), true) => Err(MutationError::InvalidObjectMutation(
+                    "definition publication cannot claim derived progress admission".into(),
+                )),
             }
             .map_err(mutation_status);
         }
@@ -538,8 +646,8 @@ impl ObjectDistribution {
         let completion_placement = placement.clone();
         let coordinated = complete_metadata(async move {
             let _permit = permit;
-            let coordinated = match definition_intent {
-                Some(intent) => {
+            let coordinated = match (definition_intent, derived_progress) {
+                (Some(intent), false) => {
                     completion
                         .store
                         .coordinate_distributed_definition_publish_with_governance(
@@ -547,7 +655,7 @@ impl ObjectDistribution {
                         )
                         .await
                 }
-                None => {
+                (None, false) => {
                     completion
                         .store
                         .coordinate_distributed_publish_with_governance(
@@ -555,6 +663,17 @@ impl ObjectDistribution {
                         )
                         .await
                 }
+                (None, true) => {
+                    completion
+                        .store
+                        .coordinate_derived_progress_publish_with_governance(
+                            request, governance, context,
+                        )
+                        .await
+                }
+                (Some(_), true) => Err(MutationError::InvalidObjectMutation(
+                    "definition publication cannot claim derived progress admission".into(),
+                )),
             }
             .map_err(mutation_status)?;
             completion
@@ -1350,7 +1469,6 @@ fn mutation_status(error: MutationError) -> Status {
         | MutationError::Immutable
         | MutationError::ImmutablePolicyRequired
         | MutationError::ProgramConcurrencyViolation
-        | MutationError::IdempotencyConflict
         | MutationError::InvalidCommandId
         | MutationError::InvalidPolicy(_)
         | MutationError::InvalidObjectMutation(_)
@@ -1361,6 +1479,7 @@ fn mutation_status(error: MutationError) -> Status {
         | MutationError::CurrentTombstoneCannotBeDeleted => {
             Status::failed_precondition(error.to_string())
         }
+        MutationError::IdempotencyConflict => Status::already_exists(error.to_string()),
         MutationError::SourceJournalCapacity
         | MutationError::DurabilityUnavailable
         | MutationError::ReceiptCapacity => Status::unavailable(error.to_string()),

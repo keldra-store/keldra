@@ -1,5 +1,6 @@
 //! One physical coordinator batch for independently receipted distributed publishes.
 
+use super::journal_capacity::SourceJournalAdmission;
 use super::mutations::DistributedEvaluationContext;
 use super::*;
 use crate::model::{CoordinatedObjectMutation, ObjectMutationContext, ObjectMutationGovernance};
@@ -256,6 +257,40 @@ impl Store {
         governance: ObjectMutationGovernance,
         context: ObjectMutationContext,
     ) -> Result<Vec<Result<CoordinatedObjectMutation, MutationError>>, MutationError> {
+        self.coordinate_distributed_publish_batch_with_admission(
+            requests,
+            governance,
+            context,
+            SourceJournalAdmission::Bounded,
+        )
+        .await
+    }
+
+    /// Trusted grouped derived publication. The cluster layer validates that
+    /// every request is an immutable artifact needed to publish progress.
+    #[doc(hidden)]
+    pub async fn coordinate_derived_progress_publish_batch_with_governance(
+        &self,
+        requests: Vec<PublishRequest>,
+        governance: ObjectMutationGovernance,
+        context: ObjectMutationContext,
+    ) -> Result<Vec<Result<CoordinatedObjectMutation, MutationError>>, MutationError> {
+        self.coordinate_distributed_publish_batch_with_admission(
+            requests,
+            governance,
+            context,
+            SourceJournalAdmission::DerivedProgress,
+        )
+        .await
+    }
+
+    async fn coordinate_distributed_publish_batch_with_admission(
+        &self,
+        requests: Vec<PublishRequest>,
+        governance: ObjectMutationGovernance,
+        context: ObjectMutationContext,
+        source_journal_admission: SourceJournalAdmission,
+    ) -> Result<Vec<Result<CoordinatedObjectMutation, MutationError>>, MutationError> {
         if context.serving_fence_term == 0 {
             return Err(MutationError::InvalidObjectMutation(
                 "serving-fence term must be non-zero".into(),
@@ -398,10 +433,11 @@ impl Store {
         if receipt_status != initial_receipt_status {
             self.stage_mutation_receipt_status(&mut batch, receipt_status)?;
         }
-        self.stage_local_changes(
+        self.stage_local_changes_with_admission(
             &mut batch,
             &pending_changes,
             LocalReferenceEffects::Deferred,
+            source_journal_admission,
         )?;
         if let Some(high_watermark) = high_watermark {
             batch.put_cf(

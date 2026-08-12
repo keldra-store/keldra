@@ -1151,7 +1151,9 @@ fn authz_status(error: AuthzStoreError) -> Status {
         }
         AuthzStoreError::RevisionNotAvailable { .. } => Status::unavailable(message),
         AuthzStoreError::RevisionExpired { .. } => Status::failed_precondition(message),
-        AuthzStoreError::ReceiptCapacity => Status::resource_exhausted(message),
+        AuthzStoreError::ReceiptCapacity | AuthzStoreError::SourceJournalCapacity => {
+            Status::resource_exhausted(message)
+        }
         AuthzStoreError::OperationMismatch => Status::already_exists(message),
         AuthzStoreError::RealmMutationLineageGap { .. }
         | AuthzStoreError::RealmMutationStale { .. }

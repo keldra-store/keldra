@@ -15,6 +15,21 @@ pub(super) fn api_request_failure(error: Status) -> MutationFailure {
     }
 }
 
+/// Preserves the public outcome of a mutation after coordinator execution has
+/// converted the store error to a gRPC status.
+pub(super) fn api_mutation_failure(error: Status) -> MutationFailure {
+    let code = match error.code() {
+        tonic::Code::FailedPrecondition => MutationFailureCode::ConditionFailed,
+        tonic::Code::AlreadyExists => MutationFailureCode::IdempotencyInputMismatch,
+        _ => return api_request_failure(error),
+    };
+    MutationFailure {
+        code: code as i32,
+        message: error.message().to_owned(),
+        current_version: None,
+    }
+}
+
 pub(super) fn api_failure(error: MutationError) -> MutationFailure {
     let (code, current_version) = match &error {
         MutationError::PreconditionFailed { current } => (

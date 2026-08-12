@@ -218,6 +218,22 @@ impl Store {
             retained_bytes: status.retained_bytes,
             max_entries: self.watch_retention.max_entries,
             max_bytes: self.watch_retention.max_bytes,
+            progress_debt_peak_entries: self
+                .source_journal_progress_debt_peak_entries
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .max(
+                    status
+                        .retained_entries
+                        .saturating_sub(self.watch_retention.max_entries),
+                ),
+            progress_debt_peak_bytes: self
+                .source_journal_progress_debt_peak_bytes
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .max(
+                    status
+                        .retained_bytes
+                        .saturating_sub(self.watch_retention.max_bytes),
+                ),
         })
     }
 
