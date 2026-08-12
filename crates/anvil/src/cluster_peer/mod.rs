@@ -10,6 +10,7 @@ mod admission;
 mod authz;
 mod authz_transport;
 mod control;
+mod index_artifact_batch;
 mod index_artifacts;
 mod index_queries;
 mod index_snapshot;

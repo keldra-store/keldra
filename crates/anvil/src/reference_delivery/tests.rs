@@ -1386,6 +1386,24 @@ async fn compaction_uses_only_every_current_active_destination() {
     let caught_up = runner.deliver_once().await.unwrap();
     let before_third = source.local_watch_status().unwrap();
     assert_eq!(caught_up.reference_safe_through, before_third.tail);
+    let active_nodes = [1_u16, 2, 3];
+    for consumer_kind in anvil_store::DerivedConsumerKind::ALL {
+        for consumer_node_id in active_nodes {
+            source
+                .apply_derived_consumer_checkpoint(
+                    anvil_store::DerivedConsumerCheckpoint {
+                        consumer_kind,
+                        source_id: before_third.source_id,
+                        consumer_node_id,
+                        next_offset: before_third.tail + 1,
+                        observed_fence: PlacementLogId { term: 1, index: 2 },
+                    },
+                    &active_nodes,
+                )
+                .await
+                .unwrap();
+        }
+    }
     publish(&source, "three", b"three", "three").await;
     let status = source.local_watch_status().unwrap();
     assert_eq!(status.tail, before_third.tail + 2);

@@ -856,6 +856,22 @@ impl ReferenceDelivery {
                 tail: status.tail,
             });
         }
+        let mut active_nodes = current
+            .active_node_ids()
+            .into_iter()
+            .map(|node| {
+                u16::try_from(node.0).map_err(|_| {
+                    ReferenceDeliveryError::Placement(
+                        "ACTIVE node ID exceeds the source-journal identity range".into(),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        active_nodes.sort_unstable();
+        self.source
+            .ensure_derived_consumer_membership(current.fence(), &active_nodes)
+            .await
+            .map_err(|error| ReferenceDeliveryError::Source(error.to_string()))?;
         self.source
             .advance_source_journal_reference_safe_through(safe)
             .await

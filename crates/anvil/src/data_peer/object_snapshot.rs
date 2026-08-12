@@ -65,6 +65,56 @@ fn validate_current_snapshot_identity(
     Ok(())
 }
 
+fn validate_current_snapshot_batch_request(
+    tenant_id: u64,
+    bucket_id: u64,
+    exact_paths: &[String],
+) -> Result<(), Status> {
+    if tenant_id == 0
+        || bucket_id == 0
+        || exact_paths.is_empty()
+        || exact_paths.len() > MAX_OBJECT_MUTATION_BATCH_ITEMS
+    {
+        return Err(Status::invalid_argument(format!(
+            "current object snapshot batch must contain 1..={MAX_OBJECT_MUTATION_BATCH_ITEMS} paths under valid stable IDs"
+        )));
+    }
+    let mut request_bytes = 0_usize;
+    for exact_path in exact_paths {
+        if ObjectKey::new("t", "b", exact_path).is_err() {
+            return Err(Status::invalid_argument(
+                "current object snapshot batch contains an invalid exact path",
+            ));
+        }
+        request_bytes = request_bytes
+            .checked_add(exact_path.len())
+            .ok_or_else(|| Status::resource_exhausted("snapshot batch byte count overflow"))?;
+        if request_bytes > MAX_OBJECT_SNAPSHOT_BYTES {
+            return Err(Status::resource_exhausted(
+                "current object snapshot batch exceeds the private peer limit",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_current_snapshot_batch(
+    snapshots: &[Option<CurrentObjectSnapshot>],
+    tenant_id: u64,
+    bucket_id: u64,
+    exact_paths: &[String],
+) -> Result<(), Status> {
+    if snapshots.len() != exact_paths.len() {
+        return Err(Status::data_loss(
+            "current object snapshot batch result count disagrees with its request",
+        ));
+    }
+    for (snapshot, exact_path) in snapshots.iter().zip(exact_paths) {
+        validate_current_snapshot_identity(snapshot.as_ref(), tenant_id, bucket_id, exact_path)?;
+    }
+    Ok(())
+}
+
 pub(super) fn map_object_snapshot_error(error: ObjectSnapshotError) -> Status {
     match error {
         ObjectSnapshotError::InvalidCursor
@@ -139,6 +189,42 @@ impl DataPeerService {
         Ok(Response::new(wire::CurrentObjectSnapshotResponse {
             schema_version: DATA_PEER_SCHEMA_VERSION,
             snapshot_json,
+        }))
+    }
+
+    pub(super) async fn read_current_object_snapshots_call(
+        &self,
+        mut request: Request<wire::CurrentObjectSnapshotBatchRequest>,
+    ) -> Result<Response<wire::CurrentObjectSnapshotBatchResponse>, Status> {
+        let peer = request.get_ref().peer.clone();
+        self.authorize(&mut request, peer.as_ref(), PeerRpcKind::DataPlane)?;
+        validate_current_snapshot_batch_request(
+            request.get_ref().tenant_id,
+            request.get_ref().bucket_id,
+            &request.get_ref().exact_paths,
+        )?;
+        let metadata = request.metadata().clone();
+        let request = request.into_inner();
+        let tenant_id = request.tenant_id;
+        let bucket_id = request.bucket_id;
+        let exact_paths = request.exact_paths;
+        let store = self.store.clone();
+        let snapshots = self
+            .bounded(&metadata, async move {
+                tokio::task::spawn_blocking(move || {
+                    store.export_current_object_snapshots(tenant_id, bucket_id, &exact_paths)
+                })
+                .await
+                .map_err(|error| {
+                    Status::internal(format!("current object snapshot batch read: {error}"))
+                })?
+                .map_err(map_object_snapshot_error)
+            })
+            .await?;
+        let snapshots_json = encode_object_snapshot(&snapshots)?;
+        Ok(Response::new(wire::CurrentObjectSnapshotBatchResponse {
+            schema_version: DATA_PEER_SCHEMA_VERSION,
+            snapshots_json,
         }))
     }
 
@@ -244,6 +330,32 @@ impl DataPeerTransport {
         let snapshot: Option<CurrentObjectSnapshot> = decode_typed(&response.snapshot_json)?;
         validate_current_snapshot_identity(snapshot.as_ref(), tenant_id, bucket_id, exact_path)?;
         Ok(snapshot)
+    }
+
+    pub(crate) async fn read_current_object_snapshots(
+        &self,
+        target: NodeId,
+        address: &str,
+        tenant_id: u64,
+        bucket_id: u64,
+        exact_paths: &[String],
+    ) -> Result<Vec<Option<CurrentObjectSnapshot>>, Status> {
+        validate_current_snapshot_batch_request(tenant_id, bucket_id, exact_paths)?;
+        let response = self
+            .client(target, address)?
+            .read_current_object_snapshots(wire::CurrentObjectSnapshotBatchRequest {
+                peer: Some(self.context()),
+                tenant_id,
+                bucket_id,
+                exact_paths: exact_paths.to_vec(),
+            })
+            .await?
+            .into_inner();
+        require_response_schema(response.schema_version)?;
+        require_object_snapshot_bound(&response.snapshots_json)?;
+        let snapshots: Vec<Option<CurrentObjectSnapshot>> = decode_typed(&response.snapshots_json)?;
+        validate_current_snapshot_batch(&snapshots, tenant_id, bucket_id, exact_paths)?;
+        Ok(snapshots)
     }
 
     pub(crate) async fn repair_object_path_snapshot(

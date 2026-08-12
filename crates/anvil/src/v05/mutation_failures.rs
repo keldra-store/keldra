@@ -41,6 +41,10 @@ pub(super) fn api_failure(error: MutationError) -> MutationFailure {
         MutationError::ReceiptCapacity | MutationError::SourceJournalCapacity => {
             (MutationFailureCode::ResourceLimit, None)
         }
+        MutationError::ReceiptTooLarge { .. }
+        | MutationError::SourceJournalRecordTooLarge { .. } => {
+            (MutationFailureCode::ResourceLimit, None)
+        }
         MutationError::ObjectMutationLineageGap { .. }
         | MutationError::ObjectMutationSibling { .. }
         | MutationError::ObjectMutationConflict

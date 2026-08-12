@@ -13,7 +13,7 @@ use anvil_consensus::NodeId;
 use anvil_store::{ObjectKey, PlacementLogId, StorageTenantId};
 use tonic::{Request, Response, Status};
 
-use super::transport::add_bearer_and_timeout;
+use super::transport::add_bearer_and_timeout_with_limit;
 use super::{
     CLUSTER_PEER_SCHEMA_VERSION, ClusterPeerService, ClusterPeerTransport, require_response_schema,
     wire,
@@ -24,12 +24,16 @@ use crate::cluster_placement::ClusterPlacement;
 use crate::distributed_list::OriginalBearer;
 use crate::index_runtime::placement::{IndexIdentity, IndexPlacement};
 use crate::index_service::{
-    ExecutedIndexQuery, IndexAuthorization, IndexPageCursor, collect_authorized_page,
-    definition_path, path_matches_prefix,
+    ExecutedIndexQuery, IndexAuthorization, IndexLiveVersionReader, IndexPageCursor,
+    collect_authorized_page, definition_path, path_matches_prefix, retain_live_query_hits,
 };
 use crate::logical_name_resolution::LogicalNameResolver;
 
 const MAX_QUERY_HITS: usize = 1_000;
+/// The peer context represents remaining time as milliseconds in a `u32`.
+/// Public ingress already clamps this to the configured QueryIndex maximum;
+/// this is only the lossless ceiling of the existing one-hop wire field.
+const MAX_ROUTED_INDEX_QUERY_TIME: Duration = Duration::from_millis(u32::MAX as u64);
 
 #[derive(Clone, Debug)]
 pub(crate) struct RoutedIndexQueryRequest {
@@ -67,6 +71,7 @@ pub(crate) trait LocalIndexQueryExecutor: Send + Sync + 'static {
 pub(crate) struct RoutedIndexQueryCall {
     bearer: Arc<str>,
     placement: ClusterPlacement,
+    deadline: tokio::time::Instant,
     request: RoutedIndexQueryRequest,
 }
 
@@ -103,6 +108,7 @@ pub(crate) struct AuthorizedIndexQueryHandler {
     tokens: JwtManager,
     names: LogicalNameResolver,
     authorization: Arc<dyn IndexAuthorization>,
+    live_versions: Arc<dyn IndexLiveVersionReader>,
     executor: Arc<dyn LocalIndexQueryExecutor>,
 }
 
@@ -112,6 +118,7 @@ impl AuthorizedIndexQueryHandler {
         tokens: JwtManager,
         names: LogicalNameResolver,
         authorization: Arc<dyn IndexAuthorization>,
+        live_versions: Arc<dyn IndexLiveVersionReader>,
         executor: Arc<dyn LocalIndexQueryExecutor>,
     ) -> Self {
         Self {
@@ -119,6 +126,7 @@ impl AuthorizedIndexQueryHandler {
             tokens,
             names,
             authorization,
+            live_versions,
             executor,
         }
     }
@@ -172,6 +180,7 @@ impl RoutedIndexQueryHandler for AuthorizedIndexQueryHandler {
         }
 
         let request = call.request;
+        let deadline = call.deadline;
         let limit = request.limit;
         let tenant_id = request.tenant_id;
         let bucket_id = request.bucket_id;
@@ -181,6 +190,7 @@ impl RoutedIndexQueryHandler for AuthorizedIndexQueryHandler {
         let execute_definition = request.definition.clone();
         let execute_query = request.query.clone();
         let authorization = self.authorization.clone();
+        let live_versions = self.live_versions.clone();
         let authorization_caller = caller.clone();
         let authorization_definition = request.definition.clone();
         collect_authorized_page(
@@ -211,6 +221,7 @@ impl RoutedIndexQueryHandler for AuthorizedIndexQueryHandler {
             },
             move |hits| {
                 let authorization = authorization.clone();
+                let live_versions = live_versions.clone();
                 let caller = authorization_caller.clone();
                 let definition = authorization_definition.clone();
                 let definition_key = definition_key.clone();
@@ -233,11 +244,19 @@ impl RoutedIndexQueryHandler for AuthorizedIndexQueryHandler {
                             "index definition read is no longer authorized",
                         ));
                     }
-                    let visible = hits
+                    let authorized = hits
                         .into_iter()
                         .zip(evidence.allowed.into_iter().skip(1))
                         .filter_map(|(hit, allowed)| allowed.then_some(hit))
                         .collect();
+                    let visible = retain_live_query_hits(
+                        live_versions.as_ref(),
+                        tenant_id,
+                        bucket_id,
+                        authorized,
+                        crate::v05::deadline_remaining(deadline)?,
+                    )
+                    .await?;
                     Ok((visible, evidence.revision))
                 }
             },
@@ -251,7 +270,12 @@ impl ClusterPeerService {
         &self,
         request: Request<wire::RouteIndexQueryRequest>,
     ) -> Result<Response<wire::RoutedIndexQueryResponse>, Status> {
-        let admitted = self.admit(&request, request.get_ref().peer.as_ref(), 1)?;
+        let admitted = self.admit_with_timeout_limit(
+            &request,
+            request.get_ref().peer.as_ref(),
+            1,
+            MAX_ROUTED_INDEX_QUERY_TIME,
+        )?;
         let bearer = OriginalBearer::from_metadata(request.metadata())?;
         let value = request_from_wire(request.get_ref())?;
         require_query_replica(
@@ -262,6 +286,9 @@ impl ClusterPeerService {
             value.definition.index_id,
         )?;
         let fence = admitted.placement.fence();
+        let deadline = tokio::time::Instant::now()
+            .checked_add(admitted.timeout)
+            .ok_or_else(|| Status::invalid_argument("routed index query deadline overflowed"))?;
         let result = tokio::time::timeout(
             admitted.timeout,
             self.routed_index_queries
@@ -269,6 +296,7 @@ impl ClusterPeerService {
                 .execute(RoutedIndexQueryCall {
                     bearer: Arc::from(bearer.signed_token()),
                     placement: admitted.placement,
+                    deadline,
                     request: value,
                 }),
         )
@@ -300,8 +328,17 @@ impl ClusterPeerTransport {
         let fence = placement.fence();
         let limit = value.limit;
         let resumed = value.resume.clone();
-        let mut request = Request::new(request_to_wire(self.context(fence, 1, remaining)?, value)?);
-        add_bearer_and_timeout(&mut request, bearer, remaining)?;
+        let remaining = remaining.min(MAX_ROUTED_INDEX_QUERY_TIME);
+        let mut request = Request::new(request_to_wire(
+            self.context_with_timeout_limit(fence, 1, remaining, MAX_ROUTED_INDEX_QUERY_TIME)?,
+            value,
+        )?);
+        add_bearer_and_timeout_with_limit(
+            &mut request,
+            bearer,
+            remaining,
+            MAX_ROUTED_INDEX_QUERY_TIME,
+        )?;
         let response = self
             .client(target, address)?
             .route_index_query(request)
@@ -696,5 +733,67 @@ mod tests {
         let freshness = response.freshness.unwrap();
         assert_eq!(freshness.placement_term, 31);
         assert_eq!(freshness.placement_index, 32);
+    }
+
+    #[test]
+    fn routed_query_preserves_long_and_short_public_deadlines() {
+        for remaining in [Duration::from_secs(120), Duration::from_secs(2)] {
+            let mut request = Request::new(());
+            add_bearer_and_timeout_with_limit(
+                &mut request,
+                "signed-token",
+                remaining,
+                MAX_ROUTED_INDEX_QUERY_TIME,
+            )
+            .unwrap();
+            assert_eq!(grpc_timeout(&request), remaining);
+
+            let context = wire::PeerContext {
+                schema_version: CLUSTER_PEER_SCHEMA_VERSION,
+                cluster_id: vec![1; 16],
+                source_node_id: 2,
+                placement_term: 3,
+                placement_index: 4,
+                hop_count: 1,
+                remaining_deadline_millis: u32::try_from(remaining.as_millis()).unwrap(),
+            };
+            super::super::admission::validate_context_with_timeout_limit(
+                &context,
+                1,
+                MAX_ROUTED_INDEX_QUERY_TIME,
+            )
+            .unwrap();
+        }
+
+        let long = wire::PeerContext {
+            schema_version: CLUSTER_PEER_SCHEMA_VERSION,
+            cluster_id: vec![1; 16],
+            source_node_id: 2,
+            placement_term: 3,
+            placement_index: 4,
+            hop_count: 1,
+            remaining_deadline_millis: 120_000,
+        };
+        assert!(super::super::admission::validate_context(&long, 1).is_err());
+    }
+
+    fn grpc_timeout<T>(request: &Request<T>) -> Duration {
+        let encoded = request
+            .metadata()
+            .get("grpc-timeout")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let (value, unit) = encoded.split_at(encoded.len() - 1);
+        let value = value.parse::<u64>().unwrap();
+        match unit {
+            "H" => Duration::from_secs(value * 60 * 60),
+            "M" => Duration::from_secs(value * 60),
+            "S" => Duration::from_secs(value),
+            "m" => Duration::from_millis(value),
+            "u" => Duration::from_micros(value),
+            "n" => Duration::from_nanos(value),
+            _ => panic!("unexpected grpc-timeout unit"),
+        }
     }
 }

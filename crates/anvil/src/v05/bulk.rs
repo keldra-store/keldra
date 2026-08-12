@@ -6,12 +6,108 @@ use std::time::{Duration, Instant};
 use anvil_api::v1::bulk_outcome::Outcome;
 use anvil_api::v1::{BulkOperation, BulkOutcome, BulkWriteRequest};
 use anvil_consensus::NodeId;
-use anvil_store::{BatchOperation, DefinitionMutationIntent};
+use anvil_store::{BatchOperation, DefinitionMutationIntent, ObjectKey};
 use tonic::Status;
 
-use super::{api_receipt, api_request_failure};
+use super::{
+    MAX_CONTENT_TYPE_BYTES, api_receipt, api_request_failure, durability, validate_command_id,
+};
+use crate::authorization::ObjectPermission;
 use crate::cluster_peer::ClusterPeerTransport;
 use crate::object_distribution::ObjectDistribution;
+
+/// Validates a bulk item without cloning its payload so a locally-coordinated
+/// item can move the original bytes directly into the storage batch.
+pub(super) fn validate_operation(
+    operation: &BulkOperation,
+    max_blob_bytes: u64,
+) -> Result<(ObjectKey, ObjectPermission), Status> {
+    use anvil_api::v1::bulk_operation::Operation;
+
+    let (address, command_id, durability_value, content_type_value, payload_bytes, permission) =
+        match operation.operation.as_ref() {
+            Some(Operation::Put(request))
+            | Some(Operation::PutIfAbsent(request))
+            | Some(Operation::PutImmutable(request)) => (
+                request.address.as_ref(),
+                request.command_id.as_str(),
+                request.durability,
+                Some(request.content_type.as_str()),
+                request.bytes.len() as u64,
+                ObjectPermission::Put,
+            ),
+            Some(Operation::PutIfVersion(request)) => (
+                request.address.as_ref(),
+                request.command_id.as_str(),
+                request.durability,
+                Some(request.content_type.as_str()),
+                request.bytes.len() as u64,
+                ObjectPermission::Put,
+            ),
+            Some(Operation::Delete(request)) => (
+                request.address.as_ref(),
+                request.command_id.as_str(),
+                request.durability,
+                None,
+                0,
+                ObjectPermission::Delete,
+            ),
+            Some(Operation::DeleteIfVersion(request)) => (
+                request.address.as_ref(),
+                request.command_id.as_str(),
+                request.durability,
+                None,
+                0,
+                ObjectPermission::Delete,
+            ),
+            None => return Err(Status::invalid_argument("bulk operation is required")),
+        };
+    let address = address.ok_or_else(|| Status::invalid_argument("object address is required"))?;
+    let key = ObjectKey::new(&address.tenant, &address.bucket, &address.path)
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    validate_command_id(command_id)?;
+    durability(durability_value)?;
+    if content_type_value.is_some_and(|value| value.len() > MAX_CONTENT_TYPE_BYTES) {
+        return Err(Status::invalid_argument(format!(
+            "content_type exceeds {MAX_CONTENT_TYPE_BYTES} UTF-8 bytes"
+        )));
+    }
+    if payload_bytes > max_blob_bytes {
+        return Err(Status::resource_exhausted(
+            "bulk put item exceeds the object-size limit",
+        ));
+    }
+    Ok((key, permission))
+}
+
+pub(super) fn operation_inbound_bytes(operation: &BulkOperation) -> u64 {
+    use anvil_api::v1::bulk_operation::Operation;
+    match operation.operation.as_ref() {
+        Some(Operation::Put(request))
+        | Some(Operation::PutIfAbsent(request))
+        | Some(Operation::PutImmutable(request)) => request.bytes.len() as u64,
+        Some(Operation::PutIfVersion(request)) => request.bytes.len() as u64,
+        Some(Operation::Delete(_)) | Some(Operation::DeleteIfVersion(_)) | None => 0,
+    }
+}
+
+pub(super) fn record_phase_metrics(
+    validation: Duration,
+    authorization: Duration,
+    identity_resolution: Duration,
+    routing: Duration,
+    dispatch: Duration,
+) {
+    tracing::info!(
+        histogram.anvil_bulk_validation_duration_seconds = validation.as_secs_f64(),
+        histogram.anvil_bulk_authorization_duration_seconds = authorization.as_secs_f64(),
+        histogram.anvil_bulk_identity_resolution_duration_seconds =
+            identity_resolution.as_secs_f64(),
+        histogram.anvil_bulk_routing_duration_seconds = routing.as_secs_f64(),
+        histogram.anvil_bulk_dispatch_duration_seconds = dispatch.as_secs_f64(),
+        "bulk write phases completed"
+    );
+}
 
 pub(super) async fn execute_coordinator_groups(
     distribution: ObjectDistribution,
@@ -19,8 +115,9 @@ pub(super) async fn execute_coordinator_groups(
     local_indices: Vec<usize>,
     local_operations: Vec<(BatchOperation, Option<DefinitionMutationIntent>)>,
     remote: BTreeMap<
-        NodeId,
+        Vec<u64>,
         (
+            NodeId,
             String,
             Vec<(usize, BulkOperation, Option<DefinitionMutationIntent>)>,
         ),
@@ -50,7 +147,7 @@ pub(super) async fn execute_coordinator_groups(
         });
     }
 
-    for (target, (address, operations)) in remote {
+    for (_, (target, address, operations)) in remote {
         let peers = peers.clone();
         let bearer = bearer.clone();
         let original_indices = operations

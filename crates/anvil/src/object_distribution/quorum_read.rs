@@ -1,9 +1,12 @@
 //! Complete-record quorum reads and read repair.
 
+use std::collections::BTreeMap;
+use std::time::Duration;
+
 use anvil_consensus::NodeId;
 use anvil_store::{
-    CurrentObjectSnapshot, ObjectKey, ObjectMutationContext, ObjectPathSnapshot,
-    ObjectSnapshotError, PlacementLogId, VersionId,
+    CurrentObjectSnapshot, MAX_OBJECT_RECORD_EXPORT_RECORDS, ObjectKey, ObjectMutationContext,
+    ObjectPathSnapshot, ObjectSnapshotError, PlacementLogId, VersionId,
 };
 use tonic::Status;
 
@@ -16,6 +19,25 @@ struct ReplicaObservation {
 }
 
 impl ObjectDistribution {
+    /// Waits for the highest program cursor named by one exact-current batch.
+    /// FinalizedThrough is monotonic, so proving the maximum proves every
+    /// lower cursor in the same batch. `true` tells the caller that it waited
+    /// and must reread the complete batch before exposing any descriptor.
+    pub(crate) async fn wait_for_program_cursors(
+        &self,
+        cursors: &[u64],
+        budget: Duration,
+    ) -> Result<bool, Status> {
+        let Some(cursor) = cursors.iter().copied().max() else {
+            return Ok(false);
+        };
+        if crate::programs::program_cursor_is_visible(&self.decisions, cursor)? {
+            return Ok(false);
+        }
+        crate::programs::wait_for_program_cursor(&self.decisions, Some(cursor), budget).await?;
+        Ok(true)
+    }
+
     /// The only multi-node object-mutation admission hook. It repairs the
     /// current exact-path state first, then proves that placement, rank-zero
     /// coordination, and the serving fence still match before returning the
@@ -170,6 +192,147 @@ impl ObjectDistribution {
         Ok(selected)
     }
 
+    /// Selects a bounded set of exact current descriptors under one placement
+    /// fence. Paths are grouped by their complete ranked metadata replica
+    /// group, and every responding replica serves its group through one
+    /// RocksDB multi-get or one peer batch RPC. Results preserve caller order.
+    pub(crate) async fn reconciled_current_object_snapshots_stable(
+        &self,
+        keys: &[ObjectKey],
+        tenant_id: u64,
+        bucket_id: u64,
+    ) -> Result<Vec<Option<CurrentObjectSnapshot>>, Status> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        if keys.len() > MAX_OBJECT_RECORD_EXPORT_RECORDS as usize {
+            return Err(Status::resource_exhausted(format!(
+                "current object quorum batch must contain at most {MAX_OBJECT_RECORD_EXPORT_RECORDS} paths"
+            )));
+        }
+        let initial_fence = self.serving.mutation_context()?.active_placement_log_id;
+        let placement = self.placement()?;
+        if placement.fence() != initial_fence {
+            return Err(changed_fence());
+        }
+
+        let mut grouped = BTreeMap::<Vec<NodeId>, CurrentObjectBatchGroup>::new();
+        for (index, key) in keys.iter().enumerate() {
+            let group = self.replica_group_stable(&placement, tenant_id, bucket_id, key)?;
+            grouped
+                .entry(group.replicas().to_vec())
+                .or_insert_with(|| CurrentObjectBatchGroup {
+                    replicas: group.replicas().to_vec(),
+                    required: group.required_acknowledgements(),
+                    entries: Vec::new(),
+                })
+                .entries
+                .push((index, key.path().to_owned()));
+        }
+        let groups = grouped.into_values().collect::<Vec<_>>();
+        let mut observations = vec![Vec::new(); groups.len()];
+        let mut reads = tokio::task::JoinSet::new();
+
+        for (group_index, group) in groups.iter().enumerate() {
+            let exact_paths = group
+                .entries
+                .iter()
+                .map(|(_, path)| path.clone())
+                .collect::<Vec<_>>();
+            for node in group.replicas.iter().copied() {
+                if node == self.local_node {
+                    let store = self.store.clone();
+                    let exact_paths = exact_paths.clone();
+                    reads.spawn(async move {
+                        let result = tokio::task::spawn_blocking(move || {
+                            store.export_current_object_snapshots(
+                                tenant_id,
+                                bucket_id,
+                                &exact_paths,
+                            )
+                        })
+                        .await
+                        .map_err(|error| {
+                            Status::internal(format!(
+                                "local current-object batch read task failed: {error}"
+                            ))
+                        })?
+                        .map_err(snapshot_status);
+                        Ok::<_, Status>((group_index, node, result))
+                    });
+                    continue;
+                }
+                let Some(address) = placement.address(node).cloned() else {
+                    tracing::warn!(node_id = node.0, "object replica has no peer address");
+                    continue;
+                };
+                let peers = self.peers.clone();
+                let exact_paths = exact_paths.clone();
+                reads.spawn(async move {
+                    let result = peers
+                        .read_current_object_snapshots(
+                            node,
+                            &address.0,
+                            tenant_id,
+                            bucket_id,
+                            &exact_paths,
+                        )
+                        .await;
+                    Ok::<_, Status>((group_index, node, result))
+                });
+            }
+        }
+        while let Some(result) = reads.join_next().await {
+            match result {
+                Ok(Ok((group_index, _node, Ok(batch)))) => observations[group_index].push(batch),
+                Ok(Ok((_group_index, node, Err(error)))) => tracing::warn!(
+                    node_id = node.0,
+                    %error,
+                    "current-object batch replica read failed"
+                ),
+                Ok(Err(error)) => tracing::warn!(
+                    %error,
+                    "current-object batch replica read setup failed"
+                ),
+                Err(error) => tracing::warn!(
+                    %error,
+                    "current-object batch replica read task failed"
+                ),
+            }
+        }
+
+        let mut selected = vec![None; keys.len()];
+        for (group, observations) in groups.iter().zip(&observations) {
+            let group_selected = select_current_object_snapshot_batch_quorum(
+                observations,
+                group.required,
+                group.replicas.len(),
+                group.entries.len(),
+            )?;
+            for ((index, exact_path), snapshot) in group.entries.iter().zip(group_selected) {
+                if let Some(snapshot) = snapshot.as_ref()
+                    && (snapshot.tenant_id != tenant_id
+                        || snapshot.bucket_id != bucket_id
+                        || snapshot.exact_path != *exact_path)
+                {
+                    return Err(Status::data_loss(
+                        "current object batch quorum returned another object identity",
+                    ));
+                }
+                selected[*index] = Some(snapshot);
+            }
+        }
+        self.require_unchanged_read_fence(initial_fence)?;
+        selected
+            .into_iter()
+            .map(|snapshot| {
+                snapshot.ok_or_else(|| {
+                    Status::internal("current object batch quorum omitted a requested path")
+                })
+            })
+            .collect()
+    }
+
     /// Guarded derived-view publication is stricter than an ordinary read. The
     /// expected live definition must itself have an exact quorum, and no
     /// successfully read replica may expose a different current candidate.
@@ -321,6 +484,12 @@ impl ObjectDistribution {
     }
 }
 
+struct CurrentObjectBatchGroup {
+    replicas: Vec<NodeId>,
+    required: usize,
+    entries: Vec<(usize, String)>,
+}
+
 fn select_quorum_snapshot(
     observations: &[ReplicaObservation],
     required: usize,
@@ -370,6 +539,35 @@ fn select_current_object_snapshot_quorum(
     Err(Status::unavailable(
         "current object replicas have neither an exact quorum nor one direct predecessor-linked successor",
     ))
+}
+
+fn select_current_object_snapshot_batch_quorum(
+    observations: &[Vec<Option<CurrentObjectSnapshot>>],
+    required: usize,
+    replica_count: usize,
+    expected_records: usize,
+) -> Result<Vec<Option<CurrentObjectSnapshot>>, Status> {
+    if observations
+        .iter()
+        .any(|observation| observation.len() != expected_records)
+    {
+        return Err(Status::data_loss(
+            "current object replica batch returned the wrong result count",
+        ));
+    }
+    let mut selected = Vec::with_capacity(expected_records);
+    for index in 0..expected_records {
+        let candidates = observations
+            .iter()
+            .map(|observation| observation[index].clone())
+            .collect::<Vec<_>>();
+        selected.push(select_current_object_snapshot_quorum(
+            &candidates,
+            required,
+            replica_count,
+        )?);
+    }
+    Ok(selected)
 }
 
 fn select_guarded_current_object_snapshot_quorum(

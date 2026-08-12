@@ -1,11 +1,12 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{Cursor, Read, Write};
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anvil_consensus::{ClusterId, NodeId};
 use anvil_store::{
-    BlobRef, ErasureCodec, Head, ObjectPathSnapshot, ShardIdentity, Version, VersionId,
+    BlobRef, ErasureCodec, Head, MUTATION_STAMP_FORMAT, MutationStamp, ObjectPathSnapshot,
+    ShardIdentity, SourceId, Version, VersionId,
 };
 use tonic::Code;
 
@@ -73,6 +74,73 @@ struct FakeMetadata {
     snapshot: Option<ObjectPathSnapshot>,
     current_snapshot: Option<CurrentObjectSnapshot>,
     full_snapshot_reads: Arc<AtomicU64>,
+    change_fence_after_current_batch: AtomicBool,
+}
+
+struct ProgramVisibilityMetadata {
+    topology: TestTopology,
+    fence_index: Arc<AtomicU64>,
+    batches: Mutex<VecDeque<Vec<Option<CurrentObjectSnapshot>>>>,
+    batch_reads: AtomicU64,
+    waits: AtomicU64,
+    finalized: AtomicBool,
+}
+
+#[tonic::async_trait]
+impl ObjectReadMetadata for ProgramVisibilityMetadata {
+    async fn reconciled_snapshot(
+        &self,
+        _key: &ObjectKey,
+    ) -> Result<Option<ObjectPathSnapshot>, Status> {
+        Err(Status::internal("full snapshots are outside this test"))
+    }
+
+    async fn reconciled_current_snapshot_stable(
+        &self,
+        _key: &ObjectKey,
+        _tenant_id: u64,
+        _bucket_id: u64,
+    ) -> Result<Option<CurrentObjectSnapshot>, Status> {
+        Err(Status::internal("single snapshots are outside this test"))
+    }
+
+    async fn reconciled_current_snapshots_stable(
+        &self,
+        _keys: &[ObjectKey],
+        _tenant_id: u64,
+        _bucket_id: u64,
+    ) -> Result<Vec<Option<CurrentObjectSnapshot>>, Status> {
+        self.batch_reads.fetch_add(1, Ordering::SeqCst);
+        self.batches
+            .lock()
+            .unwrap()
+            .pop_front()
+            .ok_or_else(|| Status::internal("test batch sequence was exhausted"))
+    }
+
+    async fn wait_for_program_cursors(
+        &self,
+        cursors: &[u64],
+        _budget: Duration,
+    ) -> Result<bool, Status> {
+        assert_eq!(cursors, &[7]);
+        self.waits.fetch_add(1, Ordering::SeqCst);
+        Ok(!self.finalized.swap(true, Ordering::SeqCst))
+    }
+
+    fn current_placement(&self) -> Result<Arc<dyn PayloadReadPlacementView>, Status> {
+        Ok(Arc::new(
+            self.topology
+                .placement(self.fence_index.load(Ordering::SeqCst)),
+        ))
+    }
+
+    fn require_current_fence(&self, expected: PlacementLogId) -> Result<(), Status> {
+        if expected.index != self.fence_index.load(Ordering::SeqCst) {
+            return Err(Status::unavailable("test placement changed"));
+        }
+        Ok(())
+    }
 }
 
 #[tonic::async_trait]
@@ -92,6 +160,30 @@ impl ObjectReadMetadata for FakeMetadata {
         _bucket_id: u64,
     ) -> Result<Option<CurrentObjectSnapshot>, Status> {
         Ok(self.current_snapshot.clone())
+    }
+
+    async fn reconciled_current_snapshots_stable(
+        &self,
+        keys: &[ObjectKey],
+        _tenant_id: u64,
+        _bucket_id: u64,
+    ) -> Result<Vec<Option<CurrentObjectSnapshot>>, Status> {
+        let snapshots = keys
+            .iter()
+            .map(|key| {
+                self.current_snapshot
+                    .as_ref()
+                    .filter(|snapshot| snapshot.exact_path == key.path())
+                    .cloned()
+            })
+            .collect();
+        if self
+            .change_fence_after_current_batch
+            .swap(false, Ordering::SeqCst)
+        {
+            self.fence_index.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(snapshots)
     }
 
     fn current_placement(&self) -> Result<Arc<dyn PayloadReadPlacementView>, Status> {
@@ -249,6 +341,16 @@ impl PayloadReadSpoolFactory for MemorySpools {
     }
 }
 
+struct RejectSpools;
+
+impl PayloadReadSpoolFactory for RejectSpools {
+    fn create(&self) -> io::Result<Box<dyn PayloadReadSpool>> {
+        Err(io::Error::other(
+            "inline payload projection must not create a spool",
+        ))
+    }
+}
+
 fn key() -> ObjectKey {
     ObjectKey::new("tenant", "bucket", "docs/a").unwrap()
 }
@@ -257,7 +359,7 @@ fn definition_key() -> ObjectKey {
     ObjectKey::new(
         "system",
         "definitions",
-        "_anvil/indexes/v2/definitions/example",
+        "_anvil/indexes/v3/definitions/example",
     )
     .unwrap()
 }
@@ -308,6 +410,43 @@ fn snapshot_at(exact_path: &str, head: &Version, versions: Vec<Version>) -> Obje
     }
 }
 
+fn current_at(
+    path: &str,
+    version_id: u64,
+    program_commit_cursor: Option<u64>,
+) -> CurrentObjectSnapshot {
+    let version = live_version(
+        version_id,
+        BlobRef {
+            hash: [u8::try_from(version_id).unwrap(); 32],
+            length: 1,
+        },
+    );
+    CurrentObjectSnapshot {
+        tenant_id: 11,
+        bucket_id: 12,
+        exact_path: path.to_owned(),
+        head: Head {
+            version: version.id,
+            deleted: false,
+            mutation_stamp: program_commit_cursor.map(|cursor| MutationStamp {
+                format: MUTATION_STAMP_FORMAT,
+                predecessor_version: Some(VersionId(version_id - 1)),
+                program_commit_cursor: Some(cursor),
+                mutation_fingerprint: [u8::try_from(version_id).unwrap(); 32],
+                active_placement_log_id: PlacementLogId { term: 3, index: 41 },
+                serving_fence_term: 3,
+                source_id: SourceId {
+                    node_id: 1,
+                    source_epoch: [1; 32],
+                },
+                source_journal_position: version_id,
+            }),
+        },
+        version,
+    }
+}
+
 fn reader(
     snapshot: ObjectPathSnapshot,
     topology: TestTopology,
@@ -344,6 +483,7 @@ fn reader_with_full_snapshot_counter(
             snapshot: Some(snapshot),
             current_snapshot: Some(current_snapshot),
             full_snapshot_reads: full_snapshot_reads.clone(),
+            change_fence_after_current_batch: AtomicBool::new(false),
         }),
         ErasureProfile::default(),
         transport,
@@ -351,6 +491,46 @@ fn reader_with_full_snapshot_counter(
     )
     .map(|reader| (reader, full_snapshot_reads))
     .unwrap()
+}
+
+#[tokio::test]
+async fn verified_inline_blob_payload_stays_in_memory() {
+    let topology = TestTopology::three_nodes();
+    let fence_index = Arc::new(AtomicU64::new(7));
+    let bytes = b"inline projection payload";
+    let reference = blob(bytes);
+    let transport = Arc::new(FakePayloadTransport::default());
+    let placement = topology.placement(7);
+    let PayloadPlacement::Small(owners) = select_payload_placement(
+        placement.cluster_id(),
+        &reference,
+        ErasureProfile::default(),
+        placement.placement_nodes(),
+    ) else {
+        panic!("test payload must use inline placement");
+    };
+    for owner in owners.owners() {
+        transport.insert_small(*owner, &reference, bytes);
+    }
+    let reader = ClusterObjectReader::with_components(
+        Arc::new(FakeMetadata {
+            topology,
+            fence_index,
+            snapshot: None,
+            current_snapshot: None,
+            full_snapshot_reads: Arc::new(AtomicU64::new(0)),
+            change_fence_after_current_batch: AtomicBool::new(false),
+        }),
+        ErasureProfile::default(),
+        transport,
+        Arc::new(RejectSpools),
+    )
+    .unwrap();
+
+    let mut payload = reader.open_blob_payload(&reference).await.unwrap();
+    let mut recovered = Vec::new();
+    payload.read_to_end(&mut recovered).unwrap();
+    assert_eq!(recovered, bytes);
 }
 
 #[tokio::test]
@@ -405,6 +585,84 @@ async fn current_only_definition_open_never_requests_retained_history() {
     assert_eq!(recovered, bytes);
     assert_eq!(opened.version, current);
     assert_eq!(full_snapshot_reads.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn current_head_batch_fails_closed_when_the_placement_fence_changes() {
+    let topology = TestTopology::three_nodes();
+    let fence_index = Arc::new(AtomicU64::new(41));
+    let version = live_version(7, blob(b"current"));
+    let snapshot = snapshot(&version, vec![version.clone()]);
+    let current_snapshot = CurrentObjectSnapshot {
+        tenant_id: snapshot.tenant_id,
+        bucket_id: snapshot.bucket_id,
+        exact_path: snapshot.exact_path,
+        head: snapshot.head,
+        version,
+    };
+    let reader = ClusterObjectReader::with_components(
+        Arc::new(FakeMetadata {
+            topology,
+            fence_index,
+            snapshot: None,
+            current_snapshot: Some(current_snapshot),
+            full_snapshot_reads: Arc::new(AtomicU64::new(0)),
+            change_fence_after_current_batch: AtomicBool::new(true),
+        }),
+        ErasureProfile::default(),
+        Arc::new(FakePayloadTransport::default()),
+        Arc::new(RejectSpools),
+    )
+    .unwrap();
+
+    let error = reader
+        .current_head_snapshots_stable(&[key()], 11, 12, Duration::from_secs(1))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::Unavailable);
+}
+
+#[tokio::test]
+async fn current_head_batch_rereads_every_path_after_program_finalization() {
+    let topology = TestTopology::three_nodes();
+    let fence_index = Arc::new(AtomicU64::new(41));
+    let first = vec![
+        Some(current_at("docs/a", 2, Some(7))),
+        Some(current_at("docs/b", 1, None)),
+    ];
+    let finalized = vec![
+        Some(current_at("docs/a", 2, Some(7))),
+        Some(current_at("docs/b", 2, Some(7))),
+    ];
+    let metadata = Arc::new(ProgramVisibilityMetadata {
+        topology,
+        fence_index,
+        batches: Mutex::new(VecDeque::from([first, finalized.clone()])),
+        batch_reads: AtomicU64::new(0),
+        waits: AtomicU64::new(0),
+        finalized: AtomicBool::new(false),
+    });
+    let reader = ClusterObjectReader::with_components(
+        metadata.clone(),
+        ErasureProfile::default(),
+        Arc::new(FakePayloadTransport::default()),
+        Arc::new(RejectSpools),
+    )
+    .unwrap();
+    let keys = [
+        ObjectKey::new("tenant", "bucket", "docs/a").unwrap(),
+        ObjectKey::new("tenant", "bucket", "docs/b").unwrap(),
+    ];
+
+    assert_eq!(
+        reader
+            .current_head_snapshots_stable(&keys, 11, 12, Duration::from_secs(1))
+            .await
+            .unwrap(),
+        finalized
+    );
+    assert_eq!(metadata.batch_reads.load(Ordering::SeqCst), 2);
+    assert_eq!(metadata.waits.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]

@@ -139,6 +139,50 @@ fn current_only_selector_requires_the_same_quorum_without_history() {
 }
 
 #[test]
+fn current_only_batch_selector_preserves_input_order_and_selects_each_exact_quorum() {
+    let mut a_current = current_snapshot(9, Some(8), 9);
+    a_current.exact_path = "docs/a".into();
+    let mut a_old = current_snapshot(8, Some(7), 8);
+    a_old.exact_path = "docs/a".into();
+    let mut b_current = current_snapshot(12, Some(11), 12);
+    b_current.exact_path = "docs/b".into();
+    let mut b_old = current_snapshot(11, Some(10), 11);
+    b_old.exact_path = "docs/b".into();
+    let mut c_minority = current_snapshot(4, Some(3), 4);
+    c_minority.exact_path = "docs/c".into();
+
+    let selected = select_current_object_snapshot_batch_quorum(
+        &[
+            vec![Some(a_current.clone()), Some(b_old), None],
+            vec![Some(a_current.clone()), Some(b_current.clone()), None],
+            vec![Some(a_old), Some(b_current.clone()), Some(c_minority)],
+        ],
+        2,
+        3,
+        3,
+    )
+    .unwrap();
+
+    assert_eq!(
+        selected,
+        vec![Some(a_current), Some(b_current), None],
+        "each column must be quorum-selected without reordering the requested paths"
+    );
+}
+
+#[test]
+fn current_only_batch_selector_rejects_short_replica_batches() {
+    let error = select_current_object_snapshot_batch_quorum(
+        &[vec![Some(current_snapshot(1, None, 1))], Vec::new()],
+        2,
+        2,
+        1,
+    )
+    .unwrap_err();
+    assert_eq!(error.code(), Code::DataLoss);
+}
+
+#[test]
 fn current_only_two_of_two_accepts_one_direct_successor() {
     let predecessor = current_snapshot(8, Some(7), 8);
     let successor = current_snapshot(9, Some(8), 9);

@@ -33,11 +33,13 @@ use tonic::{Request, Response, Status, Streaming};
 
 mod cutover;
 mod definition_coordination;
+mod derived_consumer;
 mod errors;
 mod handoff;
 mod handoff_scope;
 mod mutation_admission;
 mod object_mutation;
+mod object_mutation_batch;
 mod object_snapshot;
 mod retained_version_delete;
 mod source_journal;
@@ -69,6 +71,8 @@ pub(crate) mod wire {
 pub(crate) const DATA_PEER_SCHEMA_VERSION: u32 = 1;
 pub(crate) const DATA_PEER_FRAME_BYTES: usize = 64 * 1024;
 const MAX_TYPED_MUTATION_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_OBJECT_MUTATION_BATCH_ITEMS: usize = 1_000;
+pub(crate) const MAX_OBJECT_MUTATION_BATCH_BYTES: usize = 64 * 1024 * 1024;
 const MAX_OBJECT_SNAPSHOT_BYTES: usize = MAX_OBJECT_RECORD_EXPORT_BYTES as usize;
 const MAX_DATA_PEER_MESSAGE_BYTES: usize = MAX_OBJECT_SNAPSHOT_BYTES + 1024;
 
@@ -246,54 +250,58 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
     ) -> Result<Response<wire::MutationDrained>, Status> {
         cutover::drain_mutations(self, request).await
     }
-
     async fn release_mutation_drain(
         &self,
         request: Request<wire::MutationDrainRequest>,
     ) -> Result<Response<wire::MutationDrained>, Status> {
         cutover::release_mutation_drain(self, request)
     }
-
     type GetSmallContentStream = ContentStream;
     type GetCompleteSourceStream = ContentStream;
     type GetShardStream = ContentStream;
     type GetAuthzRealmStream = AuthzRealmStream;
-
     async fn apply_object_mutation(
         &self,
         request: Request<wire::TypedMutationRequest>,
     ) -> Result<Response<wire::ObjectMutationApplied>, Status> {
         self.apply_object_mutation_call(request).await
     }
-
+    async fn apply_object_mutation_batch(
+        &self,
+        request: Request<wire::TypedMutationBatchRequest>,
+    ) -> Result<Response<wire::ObjectMutationBatchApplied>, Status> {
+        self.apply_object_mutation_batch_call(request).await
+    }
     async fn apply_retained_version_delete(
         &self,
         request: Request<wire::TypedMutationRequest>,
     ) -> Result<Response<wire::RetainedVersionDeleteApplied>, Status> {
         self.apply_retained_version_delete_call(request).await
     }
-
     async fn read_object_path_snapshot(
         &self,
         request: Request<wire::ObjectPathSnapshotRequest>,
     ) -> Result<Response<wire::ObjectPathSnapshotResponse>, Status> {
         self.read_object_path_snapshot_call(request).await
     }
-
     async fn read_current_object_snapshot(
         &self,
         request: Request<wire::ObjectPathSnapshotRequest>,
     ) -> Result<Response<wire::CurrentObjectSnapshotResponse>, Status> {
         self.read_current_object_snapshot_call(request).await
     }
-
+    async fn read_current_object_snapshots(
+        &self,
+        request: Request<wire::CurrentObjectSnapshotBatchRequest>,
+    ) -> Result<Response<wire::CurrentObjectSnapshotBatchResponse>, Status> {
+        self.read_current_object_snapshots_call(request).await
+    }
     async fn repair_object_path_snapshot(
         &self,
         request: Request<wire::RepairObjectPathSnapshotRequest>,
     ) -> Result<Response<wire::ObjectPathSnapshotApplied>, Status> {
         self.repair_object_path_snapshot_call(request).await
     }
-
     async fn apply_authz_realm_mutation(
         &self,
         mut request: Request<wire::TypedMutationRequest>,
@@ -321,7 +329,6 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
             replayed: applied.replayed,
         }))
     }
-
     async fn apply_reference_deltas(
         &self,
         mut request: Request<wire::TypedMutationRequest>,
@@ -354,7 +361,6 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
             replayed: applied.replayed,
         }))
     }
-
     async fn get_reference_delta_status(
         &self,
         mut request: Request<wire::ReferenceDeltaStatusRequest>,
@@ -377,14 +383,12 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
             through,
         }))
     }
-
     async fn get_source_journal_status(
         &self,
         request: Request<wire::SourceJournalStatusRequest>,
     ) -> Result<Response<wire::SourceJournalStatus>, Status> {
         source_journal::status(self, request).await
     }
-
     async fn read_source_journal(
         &self,
         request: Request<wire::SourceJournalReadRequest>,
@@ -397,6 +401,13 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
         request: Request<wire::RoutedSourceJournalReadRequest>,
     ) -> Result<Response<wire::RoutedSourceJournalPage>, Status> {
         definition_coordination::read_routed_source_journal(self, request).await
+    }
+
+    async fn apply_derived_consumer_checkpoint(
+        &self,
+        request: Request<wire::ApplyDerivedConsumerCheckpointRequest>,
+    ) -> Result<Response<wire::DerivedConsumerCheckpointApplied>, Status> {
+        derived_consumer::apply(self, request).await
     }
 
     async fn apply_definition_assignment_page(
@@ -1273,6 +1284,15 @@ mod tests {
             "ReadCurrentObjectSnapshot"
         );
         require_denied!(
+            client.read_current_object_snapshots(wire::CurrentObjectSnapshotBatchRequest {
+                peer: Some(peer.clone()),
+                tenant_id: 0,
+                bucket_id: 0,
+                exact_paths: Vec::new(),
+            }),
+            "ReadCurrentObjectSnapshots"
+        );
+        require_denied!(
             client.repair_object_path_snapshot(wire::RepairObjectPathSnapshotRequest {
                 peer: Some(peer.clone()),
                 tenant_id: 0,
@@ -1316,6 +1336,7 @@ mod tests {
             "ReadSourceJournal"
         );
         definition_coordination::denied_test_calls!(client, peer, require_denied);
+        derived_consumer::denied_test_call!(client, peer, require_denied);
         require_denied!(client.small_content_exists(content()), "SmallContentExists");
         require_denied!(client.get_small_content(content()), "GetSmallContent");
         require_denied!(
@@ -1493,7 +1514,7 @@ mod tests {
             "InstallPayloadLifecycle"
         );
         assert_eq!(
-            denied, 48,
+            denied, 50,
             "the DataPeer RPC list changed without updating this test"
         );
     }

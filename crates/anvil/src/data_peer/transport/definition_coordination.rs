@@ -149,11 +149,12 @@ pub(super) fn wire_consumer_kind(
         DefinitionConsumerKind::AccountingAssignments => {
             Ok(wire::PrivateDefinitionConsumerKind::AccountingAssignments)
         }
-        DefinitionConsumerKind::IndexDelivery | DefinitionConsumerKind::AccountingDelivery => {
-            Err(Status::invalid_argument(
-                "source-local delivery checkpoints cannot cross the peer assignment API",
-            ))
-        }
+        DefinitionConsumerKind::IndexDelivery
+        | DefinitionConsumerKind::AccountingDelivery
+        | DefinitionConsumerKind::IndexRetention
+        | DefinitionConsumerKind::AccountingRetention => Err(Status::invalid_argument(
+            "source-local delivery checkpoints cannot cross the peer assignment API",
+        )),
     }
 }
 

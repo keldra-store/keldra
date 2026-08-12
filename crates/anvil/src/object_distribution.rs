@@ -5,6 +5,7 @@
 //! coordinates one exact path and the first three HRW owners hold complete
 //! logical replicas. Ownership itself is never persisted here or in Raft.
 
+mod batch;
 mod quorum_read;
 mod serving_read;
 
@@ -32,6 +33,58 @@ use crate::payload_placement::select_payload_placement;
 use crate::placement::PlacementKind;
 use crate::reference_delivery::ReferenceRuntimeHandle;
 use crate::serving_fence::ServingAuthority;
+
+struct DistributedMutationBackpressureWait {
+    capacity: &'static str,
+    started: std::time::Instant,
+    finished: bool,
+}
+
+impl DistributedMutationBackpressureWait {
+    fn start(capacity: &'static str) -> Self {
+        tracing::info!(
+            capacity,
+            counter.anvil_distributed_mutation_backpressure_waiting = 1_i64,
+            monotonic_counter.anvil_distributed_mutation_backpressure_waits_total = 1_u64,
+            "distributed object mutation is waiting for bounded durable state"
+        );
+        Self {
+            capacity,
+            started: std::time::Instant::now(),
+            finished: false,
+        }
+    }
+
+    fn complete(mut self) {
+        self.emit("capacity_available", false);
+        self.finished = true;
+    }
+
+    fn emit(&self, outcome: &'static str, cancelled: bool) {
+        tracing::info!(
+            capacity = self.capacity,
+            counter.anvil_distributed_mutation_backpressure_waiting = -1_i64,
+            "distributed object mutation capacity wait released"
+        );
+        tracing::info!(
+            capacity = self.capacity,
+            backpressure.outcome = outcome,
+            monotonic_counter.anvil_distributed_mutation_backpressure_wait_cancellations_total =
+                u64::from(cancelled),
+            histogram.anvil_distributed_mutation_backpressure_wait_duration_seconds =
+                self.started.elapsed().as_secs_f64(),
+            "distributed object mutation capacity wait finished"
+        );
+    }
+}
+
+impl Drop for DistributedMutationBackpressureWait {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.emit("cancelled", true);
+        }
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct ObjectDistribution {
@@ -137,7 +190,273 @@ impl ObjectDistribution {
         .await
     }
 
+    /// Publish one bounded set of independently receipted objects whose exact
+    /// paths select the same metadata replica group under `placement`.
+    /// Payload preparation and metadata quorum rules remain identical to the
+    /// unary path; only coordinator persistence is physically grouped.
+    pub(crate) async fn publish_many_from_source_with_governance(
+        &self,
+        requests: Vec<PublishRequest>,
+        upload_source: NodeId,
+        governance: ObjectMutationGovernance,
+        placement: ClusterPlacement,
+    ) -> Result<Vec<Result<MutationReceipt, Status>>, Status> {
+        if requests.is_empty() {
+            return Err(Status::invalid_argument(
+                "grouped publication requires at least one object",
+            ));
+        }
+        governance.validate().map_err(mutation_status)?;
+        if self.placement()?.fence() != placement.fence() {
+            return Err(Status::unavailable(
+                "object placement changed before grouped publication",
+            ));
+        }
+        let group = self.replica_group_stable(
+            &placement,
+            governance.tenant_id,
+            governance.bucket_id,
+            &requests[0].key,
+        )?;
+        if group.coordinator() != self.local_node {
+            return Err(Status::failed_precondition(format!(
+                "object group is coordinated by node {}",
+                group.coordinator().0
+            )));
+        }
+        for request in &requests[1..] {
+            let candidate = self.replica_group_stable(
+                &placement,
+                governance.tenant_id,
+                governance.bucket_id,
+                &request.key,
+            )?;
+            if candidate != group {
+                return Err(Status::invalid_argument(
+                    "grouped publication spans metadata replica groups",
+                ));
+            }
+        }
+
+        if placement.active_node_ids().len() == 1 {
+            if upload_source != self.local_node {
+                return Err(Status::failed_precondition(
+                    "the ready capability names another upload source",
+                ));
+            }
+            let _permit = self.mutation_admission.enter()?;
+            return Ok(self
+                .store
+                .bulk_write_with_backpressure(
+                    requests.into_iter().map(BatchOperation::Publish).collect(),
+                )
+                .await
+                .into_iter()
+                .map(|outcome| outcome.result.map_err(mutation_status))
+                .collect());
+        }
+        if !placement.active_node_ids().contains(&upload_source) {
+            return Err(Status::failed_precondition(
+                "the upload source is not ACTIVE in the current placement",
+            ));
+        }
+
+        let mut evidence = Vec::with_capacity(requests.len());
+        for request in &requests {
+            let prepared = self
+                .prepare_payload(&placement, upload_source, &request.blob, request.durability)
+                .await?;
+            self.payload
+                .verify_on_path_coordinator(
+                    &placement,
+                    &request.blob,
+                    request.durability,
+                    upload_source,
+                    &prepared,
+                )
+                .await
+                .map_err(payload_status)?;
+            evidence.push(prepared);
+        }
+
+        loop {
+            let permit = self.mutation_admission.enter()?;
+            let mut context = None;
+            for request in &requests {
+                let candidate = self
+                    .reconcile_before_mutation_stable(
+                        &request.key,
+                        governance.tenant_id,
+                        governance.bucket_id,
+                        placement.fence(),
+                    )
+                    .await?;
+                if context.is_some_and(|current| current != candidate) {
+                    return Err(Status::unavailable(
+                        "serving authority changed during grouped publication",
+                    ));
+                }
+                context = Some(candidate);
+            }
+            let context = context.expect("non-empty publication has a mutation context");
+            let completion = self.clone();
+            let completion_requests = requests.clone();
+            let completion_governance = governance.clone();
+            let completion_placement = placement.clone();
+            let completion_group = group.clone();
+            let completed = complete_metadata(async move {
+                let _permit = permit;
+                let coordinated = completion
+                    .store
+                    .coordinate_distributed_publish_batch_with_governance(
+                        completion_requests.clone(),
+                        completion_governance,
+                        context,
+                    )
+                    .await
+                    .map_err(mutation_status)?;
+                let mut outcomes = Vec::with_capacity(coordinated.len());
+                let mut quorum_proven_positions = Vec::new();
+                for coordinated in coordinated {
+                    let outcome = match coordinated {
+                        Err(error) => Err(mutation_status(error)),
+                        Ok(coordinated) => {
+                            let replayed = coordinated.receipt.replayed;
+                            if let Some(position) = completion
+                                .replicate_without_settlement(
+                                    &completion_placement,
+                                    &completion_group,
+                                    &coordinated,
+                                )
+                                .await?
+                                && !replayed
+                            {
+                                quorum_proven_positions.push(position);
+                            }
+                            Ok(coordinated)
+                        }
+                    };
+                    outcomes.push(outcome);
+                }
+                if let Some((source, _)) = quorum_proven_positions.first().copied()
+                    && let Err(error) = completion
+                        .store
+                        .settle_source_journal_positions_if_contiguous(
+                            source,
+                            &quorum_proven_positions
+                                .iter()
+                                .map(|(_, offset)| *offset)
+                                .collect::<Vec<_>>(),
+                        )
+                        .await
+                {
+                    tracing::warn!(
+                        source = ?source,
+                        count = quorum_proven_positions.len(),
+                        %error,
+                        "grouped metadata quorum succeeded but source settlement failed"
+                    );
+                }
+                Ok::<_, Status>(outcomes)
+            })
+            .await;
+            if let Err(error) = &completed
+                && let Some(capacity) = mutation_capacity_kind(error)
+            {
+                self.wait_for_mutation_capacity(capacity).await;
+                continue;
+            }
+            let coordinated = completed?;
+            let mut outcomes = Vec::with_capacity(coordinated.len());
+            for ((request, evidence), coordinated) in
+                requests.iter().zip(&evidence).zip(coordinated)
+            {
+                let outcome = match coordinated {
+                    Err(error) => Err(error),
+                    Ok(coordinated) => {
+                        match request.durability {
+                            Durability::Local => {
+                                self.continue_payload_placement(upload_source, request.blob.clone())
+                            }
+                            Durability::Replicated => {
+                                self.wait_for_replicated_reference(
+                                    &placement,
+                                    &request.blob,
+                                    evidence,
+                                    &coordinated,
+                                )
+                                .await?;
+                            }
+                        }
+                        Ok(coordinated.receipt)
+                    }
+                };
+                outcomes.push(outcome);
+            }
+            if self.placement()?.fence() != placement.fence() {
+                return Err(Status::unavailable(
+                    "object placement changed during grouped publication",
+                ));
+            }
+            return Ok(outcomes);
+        }
+    }
+
     pub(crate) async fn publish_from_source_with_governance_and_definition_intent(
+        &self,
+        request: PublishRequest,
+        upload_source: NodeId,
+        governance: ObjectMutationGovernance,
+        definition_intent: Option<DefinitionMutationIntent>,
+    ) -> Result<MutationReceipt, Status> {
+        if self.is_single_node()? {
+            if upload_source != self.local_node {
+                return Err(Status::failed_precondition(
+                    "the ready capability names another upload source",
+                ));
+            }
+            let _permit = self.mutation_admission.enter()?;
+            return match definition_intent {
+                Some(intent) => {
+                    self.store
+                        .mutate_definition_with_governance_and_backpressure(
+                            BatchOperation::Publish(request),
+                            governance,
+                            intent,
+                        )
+                        .await
+                }
+                None => {
+                    self.store
+                        .mutate_with_governance_and_backpressure(
+                            BatchOperation::Publish(request),
+                            governance,
+                        )
+                        .await
+                }
+            }
+            .map_err(mutation_status);
+        }
+        loop {
+            let result = self
+                .publish_from_source_with_governance_and_definition_intent_once(
+                    request.clone(),
+                    upload_source,
+                    governance.clone(),
+                    definition_intent,
+                )
+                .await;
+            if let Err(error) = &result
+                && let Some(capacity) = mutation_capacity_kind(error)
+            {
+                self.wait_for_mutation_capacity(capacity).await;
+                continue;
+            }
+            return result;
+        }
+    }
+
+    async fn publish_from_source_with_governance_and_definition_intent_once(
         &self,
         request: PublishRequest,
         upload_source: NodeId,
@@ -324,6 +643,64 @@ impl ObjectDistribution {
         governance: ObjectMutationGovernance,
         definition_intent: Option<DefinitionMutationIntent>,
     ) -> Result<MutationReceipt, Status> {
+        if self.is_single_node()? {
+            let _permit = self.mutation_admission.enter()?;
+            return match definition_intent {
+                Some(intent) => {
+                    self.store
+                        .mutate_definition_with_governance_and_backpressure(
+                            operation, governance, intent,
+                        )
+                        .await
+                }
+                None => {
+                    self.store
+                        .mutate_with_governance_and_backpressure(operation, governance)
+                        .await
+                }
+            }
+            .map_err(mutation_status);
+        }
+        // Seal a distributed inline payload once before any bounded-state
+        // backpressure retries. Retries then copy only the compact descriptor.
+        let operation = match operation {
+            BatchOperation::Put(request) => {
+                let publish = stage_distributed_put(&self.store, request).await?;
+                return self
+                    .publish_from_source_with_governance_and_definition_intent(
+                        publish,
+                        self.local_node,
+                        governance,
+                        definition_intent,
+                    )
+                    .await;
+            }
+            operation => operation,
+        };
+        loop {
+            let result = self
+                .mutate_with_governance_and_definition_intent_once(
+                    operation.clone(),
+                    governance.clone(),
+                    definition_intent,
+                )
+                .await;
+            if let Err(error) = &result
+                && let Some(capacity) = mutation_capacity_kind(error)
+            {
+                self.wait_for_mutation_capacity(capacity).await;
+                continue;
+            }
+            return result;
+        }
+    }
+
+    async fn mutate_with_governance_and_definition_intent_once(
+        &self,
+        operation: BatchOperation,
+        governance: ObjectMutationGovernance,
+        definition_intent: Option<DefinitionMutationIntent>,
+    ) -> Result<MutationReceipt, Status> {
         governance.validate().map_err(mutation_status)?;
         let placement = self.placement()?;
         if placement.active_node_ids().len() == 1 {
@@ -418,6 +795,26 @@ impl ObjectDistribution {
         version: VersionId,
         governance: ObjectMutationGovernance,
     ) -> Result<DeleteRetainedVersionOutcome, Status> {
+        loop {
+            let result = self
+                .delete_retained_version_with_governance_once(key, version, governance.clone())
+                .await;
+            if let Err(error) = &result
+                && let Some(capacity) = mutation_capacity_kind(error)
+            {
+                self.wait_for_mutation_capacity(capacity).await;
+                continue;
+            }
+            return result;
+        }
+    }
+
+    async fn delete_retained_version_with_governance_once(
+        &self,
+        key: &ObjectKey,
+        version: VersionId,
+        governance: ObjectMutationGovernance,
+    ) -> Result<DeleteRetainedVersionOutcome, Status> {
         governance.validate().map_err(mutation_status)?;
         let placement = self.placement()?;
         if placement.active_node_ids().len() == 1 {
@@ -468,70 +865,6 @@ impl ObjectDistribution {
         })
         .await?;
         Ok(coordinated.outcome)
-    }
-
-    /// Preserve the released one-node physical WriteBatch fast path. A
-    /// multi-node batch remains a collection of independent exact-path
-    /// mutations and is never presented as an atomic transaction.
-    pub(crate) async fn mutate_many(
-        &self,
-        operations: Vec<BatchOperation>,
-    ) -> Vec<Result<MutationReceipt, Status>> {
-        match self.is_single_node() {
-            Ok(true) => match self.mutation_admission.enter() {
-                Ok(_permit) => self
-                    .store
-                    .bulk_write(operations)
-                    .await
-                    .into_iter()
-                    .map(|outcome| outcome.result.map_err(mutation_status))
-                    .collect(),
-                Err(error) => (0..operations.len()).map(|_| Err(error.clone())).collect(),
-            },
-            Ok(false) => {
-                let mut outcomes = Vec::with_capacity(operations.len());
-                for operation in operations {
-                    outcomes.push(self.mutate(operation).await);
-                }
-                outcomes
-            }
-            Err(error) => (0..operations.len()).map(|_| Err(error.clone())).collect(),
-        }
-    }
-
-    pub(crate) async fn mutate_many_with_definition_intents(
-        &self,
-        operations: Vec<(BatchOperation, Option<DefinitionMutationIntent>)>,
-    ) -> Vec<Result<MutationReceipt, Status>> {
-        if operations.iter().all(|(_, intent)| intent.is_none()) {
-            return self
-                .mutate_many(
-                    operations
-                        .into_iter()
-                        .map(|(operation, _)| operation)
-                        .collect(),
-                )
-                .await;
-        }
-        let mut outcomes = Vec::with_capacity(operations.len());
-        for (operation, intent) in operations {
-            outcomes.push(match intent {
-                Some(intent) => self.mutate_with_definition_intent(operation, intent).await,
-                None => self.mutate(operation).await,
-            });
-        }
-        outcomes
-    }
-
-    pub(crate) async fn mutate_many_with_governance(
-        &self,
-        operations: Vec<(BatchOperation, ObjectMutationGovernance)>,
-    ) -> Vec<Result<MutationReceipt, Status>> {
-        let mut outcomes = Vec::with_capacity(operations.len());
-        for (operation, governance) in operations {
-            outcomes.push(self.mutate_with_governance(operation, governance).await);
-        }
-        outcomes
     }
 
     pub(crate) fn coordinator(&self, key: &ObjectKey) -> Result<NodeId, Status> {
@@ -593,8 +926,43 @@ impl ObjectDistribution {
             .coordinator())
     }
 
+    pub(crate) fn object_replica_group_stable(
+        &self,
+        placement: &ClusterPlacement,
+        key: &ObjectKey,
+        tenant_id: u64,
+        bucket_id: u64,
+    ) -> Result<MutableRecordReplicaGroup, Status> {
+        self.replica_group_stable(placement, tenant_id, bucket_id, key)
+    }
+
     pub(crate) fn is_single_node(&self) -> Result<bool, Status> {
         Ok(self.placement()?.active_node_ids().len() == 1)
+    }
+
+    /// Reject a response guarantee which the committed ACTIVE membership
+    /// cannot satisfy before the caller starts expensive or mutating work.
+    ///
+    /// Ordinary Put/Delete still perform their authoritative durability check
+    /// at publication. This early check shares the same committed placement
+    /// authority and only closes the one-node case where `REPLICATED` is
+    /// impossible by definition. Membership may change afterwards, so the
+    /// publication-time check remains mandatory.
+    pub(crate) fn require_durability_available(
+        &self,
+        durability: Durability,
+    ) -> Result<(), Status> {
+        if durability == Durability::Replicated && self.is_single_node()? {
+            Err(mutation_status(MutationError::DurabilityUnavailable))
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn wait_for_mutation_capacity(&self, capacity: &'static str) {
+        let wait = DistributedMutationBackpressureWait::start(capacity);
+        self.store.wait_for_mutation_capacity().await;
+        wait.complete();
     }
 
     pub(crate) fn current_program_placement(&self) -> Result<ClusterPlacement, Status> {
@@ -787,9 +1155,33 @@ impl ObjectDistribution {
         group: &MutableRecordReplicaGroup,
         coordinated: &CoordinatedObjectMutation,
     ) -> Result<(), Status> {
+        if let Some((source, offset)) = self
+            .replicate_without_settlement(placement, group, coordinated)
+            .await?
+            && let Err(error) = self
+                .store
+                .settle_source_journal_position_if_contiguous(source, offset)
+                .await
+        {
+            tracing::warn!(
+                source = ?source,
+                offset,
+                %error,
+                "metadata quorum succeeded but direct source settlement failed"
+            );
+        }
+        Ok(())
+    }
+
+    async fn replicate_without_settlement(
+        &self,
+        placement: &ClusterPlacement,
+        group: &MutableRecordReplicaGroup,
+        coordinated: &CoordinatedObjectMutation,
+    ) -> Result<Option<(anvil_store::SourceId, u64)>, Status> {
         let Some(mutation) = coordinated.mutation.as_ref() else {
             // The local command receipt proved an exact idempotent replay.
-            return Ok(());
+            return Ok(None);
         };
         let mut durable = Vec::with_capacity(group.replicas().len());
         let mut failures = Vec::new();
@@ -822,22 +1214,10 @@ impl ObjectDistribution {
             }
         }
         if group.is_acknowledged_by(&durable) {
-            if let Err(error) = self
-                .store
-                .settle_source_journal_position_if_contiguous(
-                    mutation.stamp.source_id,
-                    mutation.stamp.source_journal_position,
-                )
-                .await
-            {
-                tracing::warn!(
-                    source = ?mutation.stamp.source_id,
-                    offset = mutation.stamp.source_journal_position,
-                    %error,
-                    "metadata quorum succeeded but direct source settlement failed"
-                );
-            }
-            return Ok(());
+            return Ok(Some((
+                mutation.stamp.source_id,
+                mutation.stamp.source_journal_position,
+            )));
         }
         tracing::warn!(
             durable = durable.len(),
@@ -984,7 +1364,21 @@ fn mutation_status(error: MutationError) -> Status {
         MutationError::SourceJournalCapacity
         | MutationError::DurabilityUnavailable
         | MutationError::ReceiptCapacity => Status::unavailable(error.to_string()),
+        MutationError::ReceiptTooLarge { .. }
+        | MutationError::SourceJournalRecordTooLarge { .. } => {
+            Status::resource_exhausted(error.to_string())
+        }
         _ => Status::internal(error.to_string()),
+    }
+}
+
+fn mutation_capacity_kind(error: &Status) -> Option<&'static str> {
+    if error.message() == MutationError::ReceiptCapacity.to_string() {
+        Some("receipt")
+    } else if error.message() == MutationError::SourceJournalCapacity.to_string() {
+        Some("source_journal")
+    } else {
+        None
     }
 }
 

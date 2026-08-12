@@ -33,10 +33,23 @@ message TypedMutationRequest {
   bytes mutation_json = 2;
 }
 
+// One bounded set of coordinator-produced mutations for the same exact
+// metadata replica group and placement fence. The receiver recomputes both
+// properties from every typed mutation before applying the batch.
+message TypedMutationBatchRequest {
+  PeerContext peer = 1;
+  repeated bytes mutation_json = 2;
+}
+
 message ObjectMutationApplied {
   uint32 schema_version = 1;
   uint64 version = 2;
   bool replayed = 3;
+}
+
+message ObjectMutationBatchApplied {
+  uint32 schema_version = 1;
+  repeated ObjectMutationApplied outcomes = 2;
 }
 
 message RetainedVersionDeleteApplied {
@@ -66,6 +79,21 @@ message ObjectPathSnapshotResponse {
 message CurrentObjectSnapshotResponse {
   uint32 schema_version = 1;
   bytes snapshot_json = 2;
+}
+
+// One bounded, ordered exact-current read for paths in the same stable
+// tenant/bucket. `snapshots_json` encodes
+// `Vec<Option<anvil_store::CurrentObjectSnapshot>>` in request order.
+message CurrentObjectSnapshotBatchRequest {
+  PeerContext peer = 1;
+  uint64 tenant_id = 2;
+  uint64 bucket_id = 3;
+  repeated string exact_paths = 4;
+}
+
+message CurrentObjectSnapshotBatchResponse {
+  uint32 schema_version = 1;
+  bytes snapshots_json = 2;
 }
 
 message RepairObjectPathSnapshotRequest {
@@ -178,6 +206,37 @@ enum PrivateDefinitionConsumerKind {
   PRIVATE_DEFINITION_CONSUMER_KIND_UNSPECIFIED = 0;
   PRIVATE_DEFINITION_CONSUMER_KIND_INDEX_ASSIGNMENTS = 1;
   PRIVATE_DEFINITION_CONSUMER_KIND_ACCOUNTING_ASSIGNMENTS = 2;
+}
+
+enum PrivateDerivedConsumerKind {
+  PRIVATE_DERIVED_CONSUMER_KIND_UNSPECIFIED = 0;
+  PRIVATE_DERIVED_CONSUMER_KIND_INDEX = 1;
+  PRIVATE_DERIVED_CONSUMER_KIND_ACCOUNTING = 2;
+}
+
+// One node-wide aggregate retention proof. The authenticated consumer may
+// advance only its own entry on the exact ACTIVE membership fence.
+message ApplyDerivedConsumerCheckpointRequest {
+  PeerContext peer = 1;
+  PrivateDerivedConsumerKind consumer_kind = 2;
+  uint64 source_node_id = 3;
+  bytes source_epoch = 4;
+  uint64 consumer_node_id = 5;
+  uint64 next_offset = 6;
+  uint64 observed_fence_term = 7;
+  uint64 observed_fence_index = 8;
+}
+
+message DerivedConsumerCheckpointApplied {
+  uint32 schema_version = 1;
+  PrivateDerivedConsumerKind consumer_kind = 2;
+  uint64 source_node_id = 3;
+  uint64 consumer_node_id = 4;
+  uint64 next_offset = 5;
+  uint64 observed_fence_term = 6;
+  uint64 observed_fence_index = 7;
+  uint64 index_safe_through = 8;
+  uint64 accounting_safe_through = 9;
 }
 
 enum DefinitionAssignmentOperation {
@@ -505,9 +564,11 @@ service DataPeer {
   rpc DrainMutations(MutationDrainRequest) returns (MutationDrained);
   rpc ReleaseMutationDrain(MutationDrainRequest) returns (MutationDrained);
   rpc ApplyObjectMutation(TypedMutationRequest) returns (ObjectMutationApplied);
+  rpc ApplyObjectMutationBatch(TypedMutationBatchRequest) returns (ObjectMutationBatchApplied);
   rpc ApplyRetainedVersionDelete(TypedMutationRequest) returns (RetainedVersionDeleteApplied);
   rpc ReadObjectPathSnapshot(ObjectPathSnapshotRequest) returns (ObjectPathSnapshotResponse);
   rpc ReadCurrentObjectSnapshot(ObjectPathSnapshotRequest) returns (CurrentObjectSnapshotResponse);
+  rpc ReadCurrentObjectSnapshots(CurrentObjectSnapshotBatchRequest) returns (CurrentObjectSnapshotBatchResponse);
   rpc RepairObjectPathSnapshot(RepairObjectPathSnapshotRequest) returns (ObjectPathSnapshotApplied);
   rpc ApplyAuthzRealmMutation(TypedMutationRequest) returns (AuthzRealmMutationApplied);
   rpc ApplyReferenceDeltas(TypedMutationRequest) returns (ReferenceDeltaApplied);
@@ -516,6 +577,7 @@ service DataPeer {
   rpc GetSourceJournalStatus(SourceJournalStatusRequest) returns (SourceJournalStatus);
   rpc ReadSourceJournal(SourceJournalReadRequest) returns (SourceJournalPage);
   rpc ReadRoutedSourceJournal(RoutedSourceJournalReadRequest) returns (RoutedSourceJournalPage);
+  rpc ApplyDerivedConsumerCheckpoint(ApplyDerivedConsumerCheckpointRequest) returns (DerivedConsumerCheckpointApplied);
   rpc GetDefinitionCheckpoint(DefinitionCheckpointRequest) returns (DefinitionCheckpointState);
   rpc ApplyDefinitionAssignmentPage(ApplyDefinitionAssignmentPageRequest) returns (DefinitionAssignmentPageApplied);
   rpc ApplyDefinitionAssignments(ApplyDefinitionAssignmentsRequest) returns (DefinitionAssignmentPageApplied);

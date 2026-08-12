@@ -18,6 +18,12 @@ pub(super) struct MutationAdmission {
     local_node: NodeId,
 }
 
+#[derive(Debug)]
+pub(super) struct DerivedConsumerAdmission {
+    pub(super) fence: PlacementLogId,
+    pub(super) active_nodes: Vec<u16>,
+}
+
 #[derive(Clone)]
 enum PlacementSource {
     Raft(DecisionRaft),
@@ -75,6 +81,42 @@ impl MutationAdmission {
             mutation.stamp.active_placement_log_id,
             mutation.stamp.source_id,
         )
+    }
+
+    pub(super) fn object_mutation_batch(
+        &self,
+        peer: AuthenticatedPeer,
+        mutations: &[ObjectMutation],
+    ) -> Result<PlacementLogId, Status> {
+        let placement = self.current()?;
+        self.require_active_peer(peer, &placement)?;
+        let mut expected_group = None;
+        for mutation in mutations {
+            let group = self.object_mutation_group(
+                peer,
+                &placement,
+                mutation.tenant_id,
+                mutation.bucket_id,
+                &mutation.exact_path,
+                mutation.stamp.active_placement_log_id,
+                mutation.stamp.source_id,
+            )?;
+            if expected_group
+                .as_ref()
+                .is_some_and(|expected| expected != &group)
+            {
+                return Err(Status::failed_precondition(
+                    "object mutation batch spans metadata replica groups",
+                ));
+            }
+            expected_group = Some(group);
+        }
+        if expected_group.is_none() {
+            return Err(Status::invalid_argument(
+                "object mutation batch must not be empty",
+            ));
+        }
+        Ok(placement.fence)
     }
 
     pub(super) fn retained_version_delete(
@@ -152,6 +194,47 @@ impl MutationAdmission {
         Ok(placement.fence)
     }
 
+    pub(super) fn derived_consumer_checkpoint(
+        &self,
+        peer: AuthenticatedPeer,
+        source_node_id: u16,
+        consumer_node_id: u16,
+        expected_fence: PlacementLogId,
+    ) -> Result<DerivedConsumerAdmission, Status> {
+        let placement = self.current()?;
+        self.require_active_peer(peer, &placement)?;
+        self.require_local_active(&placement)?;
+        if self.local_node.0 != u64::from(source_node_id) {
+            return Err(Status::failed_precondition(
+                "derived checkpoint was sent to another source node",
+            ));
+        }
+        if peer.node_id.0 != u64::from(consumer_node_id) {
+            return Err(Status::permission_denied(
+                "derived checkpoint consumer does not match the authenticated peer",
+            ));
+        }
+        if placement.fence != expected_fence {
+            return Err(Status::unavailable(
+                "derived checkpoint carries a stale membership fence",
+            ));
+        }
+        let mut active_nodes = placement
+            .nodes
+            .iter()
+            .map(|node| {
+                u16::try_from(node.node_id().0).map_err(|_| {
+                    Status::data_loss("ACTIVE node ID exceeds the source-journal identity range")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        active_nodes.sort_unstable();
+        Ok(DerivedConsumerAdmission {
+            fence: placement.fence,
+            active_nodes,
+        })
+    }
+
     pub(super) fn definition_assignments(
         &self,
         peer: AuthenticatedPeer,
@@ -202,6 +285,29 @@ impl MutationAdmission {
     ) -> Result<PlacementLogId, Status> {
         let placement = self.current()?;
         self.require_active_peer(peer, &placement)?;
+        self.object_mutation_group(
+            peer,
+            &placement,
+            tenant_id,
+            bucket_id,
+            exact_path,
+            mutation_fence,
+            source,
+        )?;
+        Ok(placement.fence)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn object_mutation_group(
+        &self,
+        peer: AuthenticatedPeer,
+        placement: &AdmissionPlacement,
+        tenant_id: u64,
+        bucket_id: u64,
+        exact_path: &str,
+        mutation_fence: PlacementLogId,
+        source: SourceId,
+    ) -> Result<MutableRecordReplicaGroup, Status> {
         if mutation_fence != placement.fence {
             return Err(Status::unavailable(
                 "object mutation carries a stale placement fence",
@@ -219,7 +325,7 @@ impl MutationAdmission {
                 "object mutation did not come from the current path coordinator",
             ));
         }
-        Ok(placement.fence)
+        Ok(group)
     }
 
     fn require_active_peer(
@@ -309,6 +415,9 @@ fn object_group(
 #[cfg(test)]
 mod tests {
     use anvil_consensus::PeerSpkiSha256;
+    use anvil_store::{
+        MUTATION_STAMP_FORMAT, MutationStamp, OBJECT_MUTATION_FORMAT, Version, VersionId,
+    };
     use tonic::Code;
 
     use super::*;
@@ -344,6 +453,39 @@ mod tests {
                 predicate(&group)
             })
             .expect("test membership has a matching HRW path")
+    }
+
+    fn mutation(path: String, fence: PlacementLogId, coordinator: NodeId) -> ObjectMutation {
+        ObjectMutation {
+            format: OBJECT_MUTATION_FORMAT,
+            tenant_id: 1,
+            bucket_id: 2,
+            exact_path: path,
+            command_id: "command".into(),
+            input_fingerprint: [1; 32],
+            version: Version {
+                id: VersionId(1),
+                blob: None,
+                content_type: None,
+                deleted: true,
+                committed_at_unix_millis: 1,
+            },
+            retire_predecessor: false,
+            receipt_expires_at_unix_millis: 1,
+            stamp: MutationStamp {
+                format: MUTATION_STAMP_FORMAT,
+                predecessor_version: None,
+                program_commit_cursor: None,
+                mutation_fingerprint: [2; 32],
+                active_placement_log_id: fence,
+                serving_fence_term: 1,
+                source_id: source(coordinator.0 as u16),
+                source_journal_position: 1,
+            },
+            reference_deltas: Vec::new(),
+            accounting_transition: None,
+            definition_transition: None,
+        }
     }
 
     #[test]
@@ -407,6 +549,57 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error.code(), Code::FailedPrecondition);
+    }
+
+    #[test]
+    fn object_mutation_batch_requires_one_exact_group_and_fence() {
+        let authority = MutationAdmission::fixed(
+            cluster_id(),
+            NodeId(2),
+            [NodeId(1), NodeId(2), NodeId(3), NodeId(4)],
+        );
+        let placement = authority.current().unwrap();
+        let first_path = path_matching(&authority, |group| {
+            group.coordinator() == NodeId(1) && group.replicas().contains(&NodeId(2))
+        });
+        let first_group = object_group(&placement, 1, 2, &first_path).unwrap();
+        let second_path = (0..100_000)
+            .map(|index| format!("/batch-{index}"))
+            .find(|path| {
+                let group = object_group(&placement, 1, 2, path).unwrap();
+                group.coordinator() == NodeId(1)
+                    && group.replicas().contains(&NodeId(2))
+                    && group != first_group
+            })
+            .unwrap();
+        let first = mutation(first_path, placement.fence, NodeId(1));
+        assert!(
+            authority
+                .object_mutation_batch(peer(1), std::slice::from_ref(&first))
+                .is_ok()
+        );
+        assert_eq!(
+            authority
+                .object_mutation_batch(
+                    peer(1),
+                    &[
+                        first.clone(),
+                        mutation(second_path, placement.fence, NodeId(1))
+                    ],
+                )
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition
+        );
+        let mut stale = first;
+        stale.stamp.active_placement_log_id.index += 1;
+        assert_eq!(
+            authority
+                .object_mutation_batch(peer(1), &[stale])
+                .unwrap_err()
+                .code(),
+            Code::Unavailable
+        );
     }
 
     #[test]
@@ -486,6 +679,47 @@ mod tests {
             authority
                 .definition_assignment_page(peer(2), 2, fence)
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn derived_checkpoint_is_bound_to_source_consumer_and_current_fence() {
+        let authority =
+            MutationAdmission::fixed(cluster_id(), NodeId(1), [NodeId(1), NodeId(2), NodeId(3)]);
+        let fence = authority.current().unwrap().fence;
+        let accepted = authority
+            .derived_consumer_checkpoint(peer(2), 1, 2, fence)
+            .unwrap();
+        assert_eq!(accepted.fence, fence);
+        assert_eq!(accepted.active_nodes, vec![1, 2, 3]);
+        assert_eq!(
+            authority
+                .derived_consumer_checkpoint(peer(2), 1, 3, fence)
+                .unwrap_err()
+                .code(),
+            Code::PermissionDenied
+        );
+        assert_eq!(
+            authority
+                .derived_consumer_checkpoint(peer(2), 2, 2, fence)
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition
+        );
+        assert_eq!(
+            authority
+                .derived_consumer_checkpoint(
+                    peer(2),
+                    1,
+                    2,
+                    PlacementLogId {
+                        term: fence.term,
+                        index: fence.index + 1,
+                    },
+                )
+                .unwrap_err()
+                .code(),
+            Code::Unavailable
         );
     }
 }

@@ -15,6 +15,7 @@ use std::io::{self, Read};
 use std::task::{Context, Poll};
 
 mod definition_coordination;
+mod derived_consumer;
 
 use definition_coordination::*;
 
@@ -199,6 +200,58 @@ impl DataPeerTransport {
             version: anvil_store::VersionId(response.version),
             replayed: response.replayed,
         })
+    }
+
+    pub(crate) async fn apply_object_mutation_batch(
+        &self,
+        target: NodeId,
+        address: &str,
+        mutations: &[ObjectMutation],
+    ) -> Result<Vec<ReplicaObjectMutationApplied>, Status> {
+        if mutations.is_empty() || mutations.len() > MAX_OBJECT_MUTATION_BATCH_ITEMS {
+            return Err(Status::resource_exhausted(format!(
+                "object mutation batch must contain 1..={MAX_OBJECT_MUTATION_BATCH_ITEMS} items"
+            )));
+        }
+        let mut logical_bytes = 0_usize;
+        let mut encoded = Vec::with_capacity(mutations.len());
+        for mutation in mutations {
+            let value = encode_typed(mutation)?;
+            logical_bytes = logical_bytes.checked_add(value.len()).ok_or_else(|| {
+                Status::resource_exhausted("object mutation batch byte count overflow")
+            })?;
+            if logical_bytes > MAX_OBJECT_MUTATION_BATCH_BYTES {
+                return Err(Status::resource_exhausted(format!(
+                    "object mutation batch exceeds {MAX_OBJECT_MUTATION_BATCH_BYTES} bytes"
+                )));
+            }
+            encoded.push(value);
+        }
+        let response = self
+            .client(target, address)?
+            .apply_object_mutation_batch(wire::TypedMutationBatchRequest {
+                peer: Some(self.context()),
+                mutation_json: encoded,
+            })
+            .await?
+            .into_inner();
+        require_response_schema(response.schema_version)?;
+        if response.outcomes.len() != mutations.len() {
+            return Err(Status::data_loss(
+                "replica mutation batch returned an unexpected outcome count",
+            ));
+        }
+        response
+            .outcomes
+            .into_iter()
+            .map(|outcome| {
+                require_response_schema(outcome.schema_version)?;
+                Ok(ReplicaObjectMutationApplied {
+                    version: anvil_store::VersionId(outcome.version),
+                    replayed: outcome.replayed,
+                })
+            })
+            .collect()
     }
 
     pub(crate) async fn apply_retained_version_delete(

@@ -16,13 +16,42 @@ impl DataPeerService {
         let admission = self.mutation_admission.clone();
         let applied = self
             .bounded(&metadata, async move {
-                admission.require_fence(placement_fence)?;
-                let applied = store
-                    .apply_object_mutation_replica(&mutation)
-                    .await
-                    .map_err(map_mutation_error)?;
-                admission.require_fence(placement_fence)?;
-                Ok(applied)
+                loop {
+                    admission.require_fence(placement_fence)?;
+                    match store.apply_object_mutation_replica(&mutation).await {
+                        Ok(applied) => {
+                            admission.require_fence(placement_fence)?;
+                            return Ok(applied);
+                        }
+                        Err(
+                            error @ (anvil_store::MutationError::ReceiptCapacity
+                            | anvil_store::MutationError::SourceJournalCapacity),
+                        ) => {
+                            let capacity = match error {
+                                anvil_store::MutationError::ReceiptCapacity => "receipt",
+                                anvil_store::MutationError::SourceJournalCapacity => {
+                                    "source_journal"
+                                }
+                                _ => unreachable!("capacity pattern was matched"),
+                            };
+                            let started = std::time::Instant::now();
+                            tracing::info!(
+                                monotonic_counter.anvil_peer_mutation_backpressure_waits_total =
+                                    1_u64,
+                                capacity,
+                                "replica mutation is waiting for bounded durable state"
+                            );
+                            store.wait_for_mutation_capacity().await;
+                            tracing::info!(
+                                histogram.anvil_peer_mutation_backpressure_wait_duration_seconds =
+                                    started.elapsed().as_secs_f64(),
+                                capacity,
+                                "replica mutation capacity wait completed"
+                            );
+                        }
+                        Err(error) => return Err(map_mutation_error(error)),
+                    }
+                }
             })
             .await?;
         Ok(Response::new(wire::ObjectMutationApplied {

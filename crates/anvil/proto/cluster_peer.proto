@@ -528,6 +528,19 @@ message IndexArtifactPublished {
   bool replayed = 3;
 }
 
+// Bounded internal publication for immutable artifacts which share one exact
+// metadata replica group. Nested items carry no PeerContext; the outer mTLS
+// request authenticates the current weighted-HRW builder once.
+message PublishIndexArtifactsRequest {
+  PeerContext peer = 1;
+  repeated PublishIndexArtifactRequest publications = 2;
+}
+
+message IndexArtifactsPublished {
+  uint32 schema_version = 1;
+  repeated IndexArtifactPublished outcomes = 2;
+}
+
 // Deletes exactly one obsolete immutable generation artifact through the
 // ordinary DeleteIfVersion path. `current` and definitions are never valid.
 message DeleteIndexArtifactRequest {
@@ -876,6 +889,7 @@ service ClusterPeer {
   rpc ApplyProgramPathFinalization(ProgramApplyPathFinalizationRequest) returns (ProgramPathFinalizationApplied);
 
   rpc PublishIndexArtifact(PublishIndexArtifactRequest) returns (IndexArtifactPublished);
+  rpc PublishIndexArtifacts(PublishIndexArtifactsRequest) returns (IndexArtifactsPublished);
   rpc CommitGuardedIndexArtifact(CommitGuardedIndexArtifactRequest) returns (IndexArtifactPublished);
   rpc DeleteIndexArtifact(DeleteIndexArtifactRequest) returns (IndexArtifactDeleted);
   rpc ScanIndexHeads(ScanIndexHeadsRequest) returns (IndexHeadScanPage);

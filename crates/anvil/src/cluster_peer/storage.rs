@@ -37,6 +37,13 @@ impl wire::cluster_peer_server::ClusterPeer for ClusterPeerService {
         self.publish_index_artifact_call(request).await
     }
 
+    async fn publish_index_artifacts(
+        &self,
+        request: Request<wire::PublishIndexArtifactsRequest>,
+    ) -> Result<Response<wire::IndexArtifactsPublished>, Status> {
+        self.publish_index_artifacts_call(request).await
+    }
+
     async fn commit_guarded_index_artifact(
         &self,
         request: Request<wire::CommitGuardedIndexArtifactRequest>,

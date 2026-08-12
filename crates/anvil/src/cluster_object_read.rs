@@ -4,13 +4,14 @@
 //! are reconstructed into an anonymous, non-authoritative file and are not
 //! exposed until the placement fence is checked again.
 
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anvil_store::{
     BlobRef, CurrentObjectSnapshot, ErasureError, ErasureProfile, ObjectKey, ObjectPathSnapshot,
-    PlacementLogId, Version, VersionId,
+    PlacementLogId, SMALL_BLOB_MAX_BYTES, Version, VersionId,
 };
 use tonic::Status;
 
@@ -44,6 +45,30 @@ trait ObjectReadMetadata: Send + Sync {
         bucket_id: u64,
     ) -> Result<Option<CurrentObjectSnapshot>, Status>;
 
+    async fn reconciled_current_snapshots_stable(
+        &self,
+        keys: &[ObjectKey],
+        tenant_id: u64,
+        bucket_id: u64,
+    ) -> Result<Vec<Option<CurrentObjectSnapshot>>, Status> {
+        let mut snapshots = Vec::with_capacity(keys.len());
+        for key in keys {
+            snapshots.push(
+                self.reconciled_current_snapshot_stable(key, tenant_id, bucket_id)
+                    .await?,
+            );
+        }
+        Ok(snapshots)
+    }
+
+    async fn wait_for_program_cursors(
+        &self,
+        _cursors: &[u64],
+        _budget: Duration,
+    ) -> Result<bool, Status> {
+        Ok(false)
+    }
+
     fn current_placement(&self) -> Result<Arc<dyn PayloadReadPlacementView>, Status>;
 
     fn require_current_fence(&self, expected: PlacementLogId) -> Result<(), Status>;
@@ -76,6 +101,24 @@ impl ObjectReadMetadata for ObjectDistribution {
     ) -> Result<Option<CurrentObjectSnapshot>, Status> {
         self.reconciled_current_object_snapshot_stable(key, tenant_id, bucket_id)
             .await
+    }
+
+    async fn reconciled_current_snapshots_stable(
+        &self,
+        keys: &[ObjectKey],
+        tenant_id: u64,
+        bucket_id: u64,
+    ) -> Result<Vec<Option<CurrentObjectSnapshot>>, Status> {
+        self.reconciled_current_object_snapshots_stable(keys, tenant_id, bucket_id)
+            .await
+    }
+
+    async fn wait_for_program_cursors(
+        &self,
+        cursors: &[u64],
+        budget: Duration,
+    ) -> Result<bool, Status> {
+        ObjectDistribution::wait_for_program_cursors(self, cursors, budget).await
     }
 
     fn current_placement(&self) -> Result<Arc<dyn PayloadReadPlacementView>, Status> {
@@ -220,6 +263,71 @@ impl ClusterObjectReader {
         Ok(snapshot)
     }
 
+    /// Returns one authoritative exact-current descriptor per key under one
+    /// placement fence. Production metadata reads are grouped into bounded
+    /// replica batches; this boundary additionally validates result ordering
+    /// and identity before exposing any descriptor to an index query.
+    pub(crate) async fn current_head_snapshots_stable(
+        &self,
+        keys: &[ObjectKey],
+        tenant_id: u64,
+        bucket_id: u64,
+        budget: Duration,
+    ) -> Result<Vec<Option<CurrentObjectSnapshot>>, Status> {
+        let placement = self.metadata.current_placement()?;
+        let deadline = tokio::time::Instant::now()
+            .checked_add(budget)
+            .ok_or_else(|| Status::invalid_argument("live-version deadline overflowed"))?;
+        loop {
+            let snapshots = self
+                .metadata
+                .reconciled_current_snapshots_stable(keys, tenant_id, bucket_id)
+                .await?;
+            if snapshots.len() != keys.len() {
+                return Err(Status::data_loss(
+                    "current object batch returned the wrong result count",
+                ));
+            }
+            let mut maximum_program_cursor = None::<u64>;
+            for (key, snapshot) in keys.iter().zip(&snapshots) {
+                let Some(snapshot) = snapshot else {
+                    continue;
+                };
+                snapshot
+                    .validate()
+                    .map_err(|error| Status::data_loss(error.to_string()))?;
+                if snapshot.tenant_id != tenant_id
+                    || snapshot.bucket_id != bucket_id
+                    || snapshot.exact_path != key.path()
+                {
+                    return Err(Status::data_loss(
+                        "current object batch returned another object identity",
+                    ));
+                }
+                if let Some(cursor) = snapshot
+                    .head
+                    .mutation_stamp
+                    .and_then(|stamp| stamp.program_commit_cursor)
+                {
+                    maximum_program_cursor =
+                        Some(maximum_program_cursor.map_or(cursor, |current| current.max(cursor)));
+                }
+            }
+            let waited = self
+                .metadata
+                .wait_for_program_cursors(
+                    maximum_program_cursor.as_slice(),
+                    deadline.saturating_duration_since(tokio::time::Instant::now()),
+                )
+                .await?;
+            self.metadata.require_current_fence(placement.fence())?;
+            if waited {
+                continue;
+            }
+            return Ok(snapshots);
+        }
+    }
+
     /// Opens only the authoritative current descriptor through the bounded
     /// current-head quorum path. Retained historical descriptors are neither
     /// transferred nor decoded.
@@ -355,13 +463,24 @@ impl ClusterObjectReader {
         Ok(bytes)
     }
 
-    /// Reconstructs one immutable blob into the existing anonymous file spool
-    /// without copying it into a corpus-sized `Vec`.
+    /// Reconstructs one immutable blob. Verified inline values remain in memory;
+    /// large values retain the anonymous spool so memory stays corpus-independent.
     pub(crate) async fn open_blob_payload(
         &self,
         reference: &BlobRef,
     ) -> Result<ClusterReadPayload, Status> {
         let placement = self.metadata.current_placement()?;
+        if reference.length <= SMALL_BLOB_MAX_BYTES as u64 {
+            let capacity = usize::try_from(reference.length)
+                .map_err(|_| Status::resource_exhausted("small payload exceeds platform"))?;
+            let shared = SharedOutputBytes::new(capacity);
+            self.payload
+                .read(placement.as_ref(), reference, shared.clone())
+                .await
+                .map_err(payload_status)?;
+            self.metadata.require_current_fence(placement.fence())?;
+            return shared.into_payload();
+        }
         let shared = SharedOutputSpool::new(
             self.spools
                 .create()
@@ -489,6 +608,45 @@ fn selected_program_cursor(
     (selected == snapshot.head.version)
         .then(|| snapshot.head.mutation_stamp?.program_commit_cursor)
         .flatten()
+}
+
+#[derive(Clone)]
+struct SharedOutputBytes(Arc<Mutex<Option<Vec<u8>>>>);
+
+impl SharedOutputBytes {
+    fn new(capacity: usize) -> Self {
+        Self(Arc::new(Mutex::new(Some(Vec::with_capacity(capacity)))))
+    }
+
+    fn into_payload(self) -> Result<ClusterReadPayload, Status> {
+        let mut guard = self
+            .0
+            .lock()
+            .map_err(|_| Status::internal("read bytes lock is poisoned"))?;
+        let bytes = guard
+            .take()
+            .ok_or_else(|| Status::internal("read bytes are unavailable"))?;
+        Ok(ClusterReadPayload {
+            spool: Box::new(Cursor::new(bytes)),
+        })
+    }
+}
+
+impl Write for SharedOutputBytes {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let mut guard = self
+            .0
+            .lock()
+            .map_err(|_| io::Error::other("read bytes lock is poisoned"))?;
+        guard
+            .as_mut()
+            .ok_or_else(|| io::Error::other("read bytes are unavailable"))?
+            .write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Clone)]

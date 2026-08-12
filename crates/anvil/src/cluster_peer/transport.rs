@@ -241,6 +241,40 @@ impl ClusterPeerTransport {
         nonzero_artifact_outcome(response.version, response.replayed)
     }
 
+    pub(crate) async fn publish_index_artifacts(
+        &self,
+        target: NodeId,
+        address: &str,
+        expected_fence: PlacementLogId,
+        requests: &[IndexArtifactPublish],
+    ) -> Result<Vec<IndexArtifactOutcome>, Status> {
+        let response = self
+            .client(target, address)?
+            .publish_index_artifacts(wire::PublishIndexArtifactsRequest {
+                peer: Some(self.context(expected_fence, 0, MAX_CLUSTER_OPERATION_TIME)?),
+                publications: requests
+                    .iter()
+                    .map(|request| wire_index_artifact_publish(request, None))
+                    .collect(),
+            })
+            .await?
+            .into_inner();
+        require_response_schema(response.schema_version)?;
+        if response.outcomes.len() != requests.len() {
+            return Err(Status::data_loss(
+                "grouped index artifact outcome count differs from its request",
+            ));
+        }
+        response
+            .outcomes
+            .into_iter()
+            .map(|outcome| {
+                require_response_schema(outcome.schema_version)?;
+                nonzero_artifact_outcome(outcome.version, outcome.replayed)
+            })
+            .collect()
+    }
+
     pub(crate) async fn commit_guarded_index_artifact(
         &self,
         target: NodeId,
@@ -986,7 +1020,7 @@ impl ClusterPeerTransport {
         self.context_with_timeout_limit(expected, hop_count, remaining, MAX_CLUSTER_OPERATION_TIME)
     }
 
-    fn context_with_timeout_limit(
+    pub(super) fn context_with_timeout_limit(
         &self,
         expected: PlacementLogId,
         hop_count: u32,
@@ -1396,10 +1430,19 @@ pub(super) fn add_bearer_and_timeout<T>(
     bearer: &str,
     timeout: Duration,
 ) -> Result<(), Status> {
+    add_bearer_and_timeout_with_limit(request, bearer, timeout, MAX_CLUSTER_OPERATION_TIME)
+}
+
+pub(super) fn add_bearer_and_timeout_with_limit<T>(
+    request: &mut Request<T>,
+    bearer: &str,
+    timeout: Duration,
+    maximum: Duration,
+) -> Result<(), Status> {
     let value = MetadataValue::try_from(format!("Bearer {bearer}"))
         .map_err(|_| Status::invalid_argument("bearer token cannot be represented as metadata"))?;
     request.metadata_mut().insert("authorization", value);
-    request.set_timeout(timeout.min(MAX_CLUSTER_OPERATION_TIME));
+    request.set_timeout(timeout.min(maximum));
     Ok(())
 }
 

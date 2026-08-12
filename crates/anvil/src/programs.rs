@@ -1013,6 +1013,10 @@ fn mutation_status(error: anvil_store::MutationError) -> Status {
         | anvil_store::MutationError::SourceJournalCapacity => {
             Status::resource_exhausted(format!("RESOURCE_LIMIT: {error}"))
         }
+        anvil_store::MutationError::ReceiptTooLarge { .. }
+        | anvil_store::MutationError::SourceJournalRecordTooLarge { .. } => {
+            Status::resource_exhausted(format!("RESOURCE_LIMIT: {error}"))
+        }
         anvil_store::MutationError::ObjectMutationLineageGap { .. }
         | anvil_store::MutationError::ObjectMutationSibling { .. }
         | anvil_store::MutationError::ObjectMutationConflict => {

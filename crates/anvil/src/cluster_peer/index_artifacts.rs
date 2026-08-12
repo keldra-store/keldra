@@ -271,7 +271,7 @@ impl IndexHeadScanScope {
                         .strip_prefix(&crate::index_runtime::publication::run_prefix(
                             *index_id, *run_hash,
                         ))
-                        .is_some_and(|suffix| suffix == "root" || suffix.starts_with("blocks/"))
+                        .is_some_and(|suffix| suffix == "root" || suffix.starts_with("packs/"))
                     && is_index_recovery_path(exact_path, *index_id)
             }
         }
@@ -286,7 +286,7 @@ impl IndexHeadScanScope {
             } => (
                 *tenant_id,
                 *bucket_id,
-                format!("_anvil/indexes/v2/{index_id}/"),
+                format!("_anvil/indexes/v3/{index_id}/"),
             ),
             Self::Run {
                 tenant_id,
@@ -426,7 +426,7 @@ fn decode_scan_scope(request: &wire::ScanIndexHeadsRequest) -> Result<IndexHeadS
     }
 }
 
-fn decode_request(
+pub(super) fn decode_request(
     request: &wire::PublishIndexArtifactRequest,
 ) -> Result<IndexArtifactPublish, Status> {
     let hash: [u8; 32] = request
@@ -526,8 +526,8 @@ mod tests {
     #[test]
     fn scan_scopes_cannot_become_arbitrary_prefix_scans() {
         let digest = "a".repeat(64);
-        let generation = format!("_anvil/indexes/v2/9/manifests/{digest}");
-        let current = "_anvil/indexes/v2/9/current";
+        let generation = format!("_anvil/indexes/v3/9/manifests/{digest}");
+        let current = "_anvil/indexes/v3/9/current";
 
         let scoped = IndexHeadScanScope::Artifacts {
             tenant_id: 4,
@@ -536,7 +536,7 @@ mod tests {
         };
         assert!(scoped.matches(4, 5, &generation));
         assert!(scoped.matches(4, 5, current));
-        assert!(!scoped.matches(4, 5, "_anvil/indexes/v2/definitions/search"));
+        assert!(!scoped.matches(4, 5, "_anvil/indexes/v3/definitions/search"));
         assert!(!scoped.matches(4, 5, "_anvil/indexes/definitions/search"));
         assert!(!scoped.matches(4, 5, "ordinary/path"));
         let run_hash = [3; 32];
@@ -569,7 +569,7 @@ mod tests {
         let source = RetainedObjectSnapshot {
             tenant_id: 4,
             bucket_id: 5,
-            exact_path: "_anvil/indexes/v2/9/current".into(),
+            exact_path: "_anvil/indexes/v3/9/current".into(),
             version: Version {
                 id: VersionId(6),
                 blob: Some(BlobRef {

@@ -321,6 +321,7 @@ fn is_public_mutation(path: &str) -> bool {
             | "MutateTuples"
             | "CreateIndex"
             | "UpdateIndex"
+            | "RebuildIndex"
             | "DeleteIndex"
             | "EnableAccounting"
             | "DisableAccounting"
@@ -386,6 +387,7 @@ fn is_cluster_peer_mutation(path: &str) -> bool {
             | "RouteEnableAccounting"
             | "RouteDisableAccounting"
             | "FlushAccountingTraffic"
+            | "ApplyDerivedConsumerCheckpoint"
             | "CoordinateLogicalRecord"
             | "CoordinateSystemGrant"
     )
@@ -541,6 +543,7 @@ mod tests {
         assert!(is_public_mutation("/anvil.v1.ObjectService/DeleteVersion"));
         assert!(is_public_mutation("/anvil.v1.ObjectService/BulkWrite"));
         assert!(is_public_mutation("/anvil.v1.AuthzService/MutateTuples"));
+        assert!(is_public_mutation("/anvil.v1.IndexService/RebuildIndex"));
         assert!(!is_public_mutation("/anvil.v1.ObjectService/GetObject"));
         assert!(is_cluster_peer_mutation(
             "/anvil.cluster_peer.v1.ClusterPeer/RoutePutEnd"

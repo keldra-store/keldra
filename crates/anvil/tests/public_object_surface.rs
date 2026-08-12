@@ -23,8 +23,9 @@ use anvil_api::v1::{
     InvokeProgramRequest, ListObjectVersionsRequest, ListObjectsRequest, MutationFailureCode,
     ObjectAddress, ObjectVersioning as ApiObjectVersioning, PathIndexQuery, PathIndexSpec,
     PutHeader, PutIfAbsentOperation, PutIfVersionOperation, PutImmutableOperation, PutOperation,
-    PutRequest, PutToken, QueryIndexRequest, ReadFailureCode, SetBucketPolicyRequest,
-    SetBucketVersioningRequest, UpdateIndexRequest, WatchNow, WatchPrefixRequest, WatchStateHint,
+    PutRequest, PutToken, QueryIndexRequest, ReadFailureCode, RebuildIndexRequest,
+    SetBucketPolicyRequest, SetBucketVersioningRequest, UpdateIndexRequest, WatchNow,
+    WatchPrefixRequest, WatchStateHint,
 };
 use anvil_authz::ObjectRef;
 use anvil_store::{
@@ -65,6 +66,9 @@ async fn object_rpc_authentication_distinguishes_anonymous_reads_from_protected_
             .await,
     );
     assert_unauthenticated(client.invoke_program(InvokeProgramRequest::default()).await);
+
+    let mut indexes = IndexServiceClient::new(fixture.channel.clone());
+    assert_unauthenticated(indexes.rebuild_index(RebuildIndexRequest::default()).await);
 
     let private_object = address("private/read.txt");
     assert_permission_denied(
@@ -128,6 +132,124 @@ async fn object_rpc_authentication_distinguishes_anonymous_reads_from_protected_
         .metadata_mut()
         .insert("authorization", "Bearer not-a-valid-jwt".parse().unwrap());
     assert_unauthenticated(client.head_object(invalid_bearer).await);
+
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn one_node_start_put_accepts_local_and_rejects_replicated_before_upload() {
+    let fixture = Fixture::start().await;
+    let token = fixture.access_token.as_str();
+    let mut client = ObjectServiceClient::new(fixture.channel.clone());
+
+    let local = client
+        .start_put(authorized(
+            PutHeader {
+                address: Some(address("durability/local-upload")),
+                content_type: "application/octet-stream".into(),
+                command_id: "local-upload-admission".into(),
+                durability: Durability::Local as i32,
+                operation: Some(PutOperationValue::Put(PutOperation {})),
+            },
+            token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!local.value.is_empty());
+
+    let replicated = client
+        .start_put(authorized(
+            PutHeader {
+                address: Some(address("durability/replicated-upload")),
+                content_type: "application/octet-stream".into(),
+                command_id: "replicated-upload-admission".into(),
+                durability: Durability::Replicated as i32,
+                operation: Some(PutOperationValue::Put(PutOperation {})),
+            },
+            token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(replicated.code(), Code::Unavailable);
+
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn one_node_delete_version_accepts_local_and_rejects_replicated_before_mutation() {
+    let fixture = Fixture::start().await;
+    let token = fixture.access_token.as_str();
+    let mut administration = AdministrationServiceClient::new(fixture.channel.clone());
+    administration
+        .set_bucket_versioning(authorized(
+            SetBucketVersioningRequest {
+                bucket: "objects".into(),
+                versioning: ApiObjectVersioning::Enabled as i32,
+            },
+            token,
+        ))
+        .await
+        .unwrap();
+
+    let mut client = ObjectServiceClient::new(fixture.channel.clone());
+    let object = address("durability/retained-version");
+    let first = put_object(
+        &mut client,
+        token,
+        object.clone(),
+        b"first",
+        "retained-version-first",
+        PutOperationValue::Put(PutOperation {}),
+    )
+    .await
+    .unwrap();
+    let second = put_object(
+        &mut client,
+        token,
+        object.clone(),
+        b"second",
+        "retained-version-second",
+        PutOperationValue::Put(PutOperation {}),
+    )
+    .await
+    .unwrap();
+
+    let replicated = client
+        .delete_version(authorized(
+            DeleteVersionRequest {
+                address: Some(object.clone()),
+                version: first.version,
+                durability: Durability::Replicated as i32,
+            },
+            token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(replicated.code(), Code::Unavailable);
+    assert_eq!(
+        list_version_ids(&mut client, &object, token).await,
+        [first.version, second.version]
+    );
+
+    let local = client
+        .delete_version(authorized(
+            DeleteVersionRequest {
+                address: Some(object.clone()),
+                version: first.version,
+                durability: Durability::Local as i32,
+            },
+            token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(local.deleted);
+    assert_eq!(local.replacement_tombstone_version, None);
+    assert_eq!(
+        list_version_ids(&mut client, &object, token).await,
+        [second.version]
+    );
 
     fixture.stop().await;
 }
@@ -432,6 +554,19 @@ async fn index_lifecycle_requires_zanzibar_access_to_the_definition_object() {
     );
     assert_permission_denied(
         indexes
+            .rebuild_index(authorized(
+                RebuildIndexRequest {
+                    bucket: "objects".into(),
+                    name: "authorization-boundary".into(),
+                    expected_version: created.version,
+                    command_id: "rebuild-authorization-denied".into(),
+                },
+                &denied_token,
+            ))
+            .await,
+    );
+    assert_permission_denied(
+        indexes
             .query_index(authorized(
                 QueryIndexRequest {
                     bucket: "objects".into(),
@@ -450,6 +585,51 @@ async fn index_lifecycle_requires_zanzibar_access_to_the_definition_object() {
             ))
             .await,
     );
+
+    let rebuilt = indexes
+        .rebuild_index(authorized(
+            RebuildIndexRequest {
+                bucket: "objects".into(),
+                name: "authorization-boundary".into(),
+                expected_version: created.version,
+                command_id: "rebuild-authorization-boundary".into(),
+            },
+            owner_token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(rebuilt.version > created.version);
+    let mut expected = created.clone();
+    expected.version = rebuilt.version;
+    assert_eq!(rebuilt, expected);
+    assert_eq!(
+        indexes
+            .get_index(authorized(
+                GetIndexRequest {
+                    bucket: "objects".into(),
+                    name: "authorization-boundary".into(),
+                },
+                owner_token,
+            ))
+            .await
+            .unwrap()
+            .into_inner(),
+        rebuilt
+    );
+    let stale = indexes
+        .rebuild_index(authorized(
+            RebuildIndexRequest {
+                bucket: "objects".into(),
+                name: "authorization-boundary".into(),
+                expected_version: created.version,
+                command_id: "rebuild-authorization-stale".into(),
+            },
+            owner_token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(stale.code(), Code::FailedPrecondition);
 
     fixture.stop().await;
 }
@@ -1193,6 +1373,7 @@ fn test_server_config(
         max_atomic_commit_entries: 128,
         max_atomic_commit_bytes: 1024 * 1024,
         atomic_program_timeout: Duration::from_secs(30),
+        index_query_timeout: Duration::from_secs(300),
         token_manager,
         rate_limits: RateLimitConfig::default(),
         index_runtime: anvil::IndexRuntimeConfig::default(),
@@ -1202,8 +1383,8 @@ fn test_server_config(
         mutation_receipt_retention_seconds: 60,
         max_mutation_receipt_entries: 512,
         max_mutation_receipt_bytes: 1024 * 1024,
-        watch_max_entries: 512,
-        watch_max_bytes: 1024 * 1024,
+        source_journal_max_entries: 512,
+        source_journal_max_bytes: 1024 * 1024,
     }
 }
 

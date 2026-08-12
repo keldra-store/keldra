@@ -15,6 +15,9 @@ pub(super) async fn start_put(
             .authorize_object(&caller, &metadata.key, ObjectPermission::Put)
             .await?;
         service
+            .distribution
+            .require_durability_available(metadata.durability)?;
+        service
             .issue_upload_token(&caller, &metadata)
             .map(Response::new)
     }
@@ -115,8 +118,7 @@ pub(super) async fn put_end(
     let result = async {
         let caller = authenticated_caller(&request)?;
         let bearer = OriginalBearer::from_metadata(request.metadata())?;
-        let remaining =
-            effective_atomic_program_timeout(request.metadata(), service.atomic_program_timeout);
+        let deadline = request_deadline(request.metadata(), service.atomic_program_timeout)?;
         let token = required_put_token(Some(request.into_inner()))?;
         let capability = service.verify_put_token(&caller, &token)?;
         let ready = require_ready_phase(capability)?;
@@ -152,13 +154,19 @@ pub(super) async fn put_end(
                             &address,
                             bearer.signed_token(),
                             token,
-                            remaining,
+                            deadline_remaining(deadline)?,
                         )
                         .await?
                 } else {
                     service
                         .cluster_peers
-                        .route_put_end(target, &address, bearer.signed_token(), token, remaining)
+                        .route_put_end(
+                            target,
+                            &address,
+                            bearer.signed_token(),
+                            token,
+                            deadline_remaining(deadline)?,
+                        )
                         .await?
                 }
             }
@@ -168,14 +176,16 @@ pub(super) async fn put_end(
                     .resolve(publish.key.tenant(), publish.key.bucket())
                     .await?;
                 api_receipt(
-                    service
-                        .distribution
-                        .publish_from_source_with_governance(
+                    run_request_until(
+                        deadline,
+                        service.distribution.publish_from_source_with_governance(
                             publish,
                             anvil_consensus::NodeId(ready.upload_source_node_id),
                             governance,
-                        )
-                        .await?,
+                        ),
+                        "put publication deadline exceeded",
+                    )
+                    .await?,
                 )
             }
         };

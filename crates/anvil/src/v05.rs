@@ -264,8 +264,7 @@ impl ObjectService for ObjectServiceImpl {
         let caller = authenticated_caller(&request)?;
         let path_access = object_path_access::access_for(&request);
         let bearer = OriginalBearer::from_metadata(request.metadata())?;
-        let remaining =
-            effective_atomic_program_timeout(request.metadata(), self.atomic_program_timeout);
+        let deadline = request_deadline(request.metadata(), self.atomic_program_timeout)?;
         let api_request = request.into_inner();
         let mutation = delete_request(api_request.clone(), Precondition::Any)?;
         object_path_access::require_key(&path_access, &mutation.key)?;
@@ -284,14 +283,17 @@ impl ObjectService for ObjectServiceImpl {
                         &address,
                         bearer.signed_token(),
                         api_request,
-                        remaining,
+                        deadline_remaining(deadline)?,
                     )
                     .await?
             }
             None => api_receipt(
-                self.distribution
-                    .mutate(BatchOperation::Delete(mutation))
-                    .await?,
+                run_request_until(
+                    deadline,
+                    self.distribution.mutate(BatchOperation::Delete(mutation)),
+                    "delete deadline exceeded",
+                )
+                .await?,
             ),
         };
         Ok(Response::new(receipt))
@@ -308,8 +310,7 @@ impl ObjectService for ObjectServiceImpl {
         let caller = authenticated_caller(&request)?;
         let path_access = object_path_access::access_for(&request);
         let bearer = OriginalBearer::from_metadata(request.metadata())?;
-        let remaining =
-            effective_atomic_program_timeout(request.metadata(), self.atomic_program_timeout);
+        let deadline = request_deadline(request.metadata(), self.atomic_program_timeout)?;
         let api_request = request.into_inner();
         let precondition = Precondition::Version(VersionId(api_request.expected_version));
         let mutation = delete_if_version_request(api_request.clone(), precondition)?;
@@ -330,7 +331,7 @@ impl ObjectService for ObjectServiceImpl {
                             &address,
                             bearer.signed_token(),
                             api_request,
-                            remaining,
+                            deadline_remaining(deadline)?,
                         )
                         .await?
                 } else {
@@ -340,15 +341,18 @@ impl ObjectService for ObjectServiceImpl {
                             &address,
                             bearer.signed_token(),
                             api_request,
-                            remaining,
+                            deadline_remaining(deadline)?,
                         )
                         .await?
                 }
             }
             None => api_receipt(
-                self.distribution
-                    .mutate(BatchOperation::Delete(mutation))
-                    .await?,
+                run_request_until(
+                    deadline,
+                    self.distribution.mutate(BatchOperation::Delete(mutation)),
+                    "conditional delete deadline exceeded",
+                )
+                .await?,
             ),
         };
         Ok(Response::new(receipt))
@@ -365,10 +369,9 @@ impl ObjectService for ObjectServiceImpl {
         let caller = authenticated_caller(&request)?;
         let path_access = object_path_access::access_for(&request);
         let bearer = OriginalBearer::from_metadata(request.metadata())?;
-        let remaining =
-            effective_atomic_program_timeout(request.metadata(), self.atomic_program_timeout);
+        let deadline = request_deadline(request.metadata(), self.atomic_program_timeout)?;
         let api_request = request.into_inner();
-        let _durability = durability(api_request.durability)?;
+        let durability = durability(api_request.durability)?;
         let key = object_key(api_request.address.clone())?;
         object_path_access::require_key(&path_access, &key)?;
         self.authorize_object(&caller, &key, ObjectPermission::Delete)
@@ -378,6 +381,7 @@ impl ObjectService for ObjectServiceImpl {
             .resolve(key.tenant(), key.bucket())
             .await?;
         require_governance_versioning_enabled(&governance)?;
+        self.distribution.require_durability_available(durability)?;
         let outcome = match self.distribution.routing_target_stable(
             &key,
             governance.tenant_id,
@@ -396,19 +400,22 @@ impl ObjectService for ObjectServiceImpl {
                         &address,
                         bearer.signed_token(),
                         api_request,
-                        remaining,
+                        deadline_remaining(deadline)?,
                     )
                     .await
                     .map(Response::new);
             }
             None => {
-                self.distribution
-                    .delete_retained_version_with_governance(
+                run_request_until(
+                    deadline,
+                    self.distribution.delete_retained_version_with_governance(
                         &key,
                         VersionId(api_request.version),
                         governance,
-                    )
-                    .await?
+                    ),
+                    "delete version deadline exceeded",
+                )
+                .await?
             }
         };
         Ok(Response::new(api_delete_version_outcome(outcome)))
@@ -587,16 +594,19 @@ impl ObjectService for ObjectServiceImpl {
             let path_access = object_path_access::access_for(&request);
             let meter_public = !peer_routed && !object_path_access::is_internal(&path_access);
             let bearer = OriginalBearer::from_metadata(request.metadata())?;
+            let deadline = request_deadline(request.metadata(), self.atomic_program_timeout)?;
             let route_budget =
                 effective_atomic_program_timeout(request.metadata(), self.atomic_program_timeout);
             let operations = request.into_inner().operations;
             validate_bulk_limits(&operations)?;
             object_path_access::validate_definition_intents(&path_access, operations.len())?;
+            let validation_started = Instant::now();
 
             let mut local = Vec::with_capacity(operations.len());
             let mut remote = BTreeMap::<
-                anvil_consensus::NodeId,
+                Vec<u64>,
                 (
+                    anvil_consensus::NodeId,
                     String,
                     Vec<(
                         usize,
@@ -608,17 +618,16 @@ impl ObjectService for ObjectServiceImpl {
             let mut outcomes = Vec::new();
             let mut pending = Vec::with_capacity(operations.len());
             for (index, operation) in operations.into_iter().enumerate() {
-                let forwarded = operation.clone();
-                match batch_operation(operation, self.max_blob_bytes) {
-                    Ok(mutation) => {
-                        let key = batch_operation_key(&mutation);
-                        match object_path_access::require_key(&path_access, key)
-                            .and_then(|()| require_caller_tenant(&caller, key))
+                match bulk::validate_operation(&operation, self.max_blob_bytes) {
+                    Ok((key, permission)) => {
+                        match object_path_access::require_key(&path_access, &key)
+                            .and_then(|()| require_caller_tenant(&caller, &key))
                         {
                             Ok(()) => pending.push((
                                 index,
-                                forwarded,
-                                mutation,
+                                operation,
+                                key.clone(),
+                                permission,
                                 object_path_access::definition_intent(&path_access, index),
                             )),
                             Err(error) => outcomes.push(bulk_authorization_failure(index, &error)),
@@ -632,15 +641,12 @@ impl ObjectService for ObjectServiceImpl {
                     }),
                 }
             }
+            let validation_duration = validation_started.elapsed();
             let authorization_requests = pending
                 .iter()
-                .map(|(_, _, mutation, _)| {
-                    (
-                        batch_operation_key(mutation).clone(),
-                        batch_operation_permission(mutation),
-                    )
-                })
+                .map(|(_, _, key, permission, _)| (key.clone(), *permission))
                 .collect::<Vec<_>>();
+            let authorization_started = Instant::now();
             let allowed = if object_path_access::is_internal(&path_access) {
                 vec![true; authorization_requests.len()]
             } else if authorization_requests.is_empty() {
@@ -650,7 +656,30 @@ impl ObjectService for ObjectServiceImpl {
                     .allows_objects(&caller, &authorization_requests)
                     .await?
             };
-            for ((index, forwarded, mutation, definition_intent), allowed) in
+            let authorization_duration = authorization_started.elapsed();
+            let identity_started = Instant::now();
+            let mut stable_buckets = BTreeMap::<String, BTreeMap<String, (u64, u64)>>::new();
+            for (_, _, key, _, _) in &pending {
+                let known = stable_buckets
+                    .get(key.tenant())
+                    .is_some_and(|tenant| tenant.contains_key(key.bucket()));
+                if !known {
+                    let resolved = self
+                        .name_resolver
+                        .resolve_bucket_ids(key.tenant(), key.bucket())
+                        .await?;
+                    stable_buckets
+                        .entry(key.tenant().to_owned())
+                        .or_default()
+                        .insert(key.bucket().to_owned(), resolved);
+                }
+            }
+            let placement = self.distribution.current_program_placement()?;
+            let single_node = placement.active_node_ids().len() == 1;
+            let identity_duration = identity_started.elapsed();
+            let routing_started = Instant::now();
+            let mut accounting_inbound = Vec::<(u64, u64, String, u64)>::new();
+            for ((index, operation, key, _permission, definition_intent), allowed) in
                 pending.into_iter().zip(allowed)
             {
                 if !allowed {
@@ -660,21 +689,85 @@ impl ObjectService for ObjectServiceImpl {
                     ));
                     continue;
                 }
-                if meter_public && let BatchOperation::Put(put) = &mutation {
-                    self.record_accounting_inbound(&put.key, put.bytes.len() as u64);
-                }
-                match self
-                    .distribution
-                    .routing_target(batch_operation_key(&mutation))?
-                {
-                    Some((target, address)) => remote
-                        .entry(target)
-                        .or_insert_with(|| (address, Vec::new()))
-                        .1
-                        .push((index, forwarded, definition_intent)),
-                    None => local.push((index, mutation, definition_intent)),
+                let (tenant_id, bucket_id) = stable_buckets
+                    .get(key.tenant())
+                    .and_then(|tenant| tenant.get(key.bucket()))
+                    .copied()
+                    .ok_or_else(|| Status::internal("bulk stable bucket identity is missing"))?;
+                let target = if single_node {
+                    None
+                } else {
+                    let group = self
+                        .distribution
+                        .object_replica_group_stable(&placement, &key, tenant_id, bucket_id)?;
+                    let coordinator = group.coordinator();
+                    (coordinator != self.distribution.local_node())
+                        .then(|| {
+                            let address = placement.address(coordinator).ok_or_else(|| {
+                                Status::unavailable(format!(
+                                    "ACTIVE object coordinator {} has no peer address",
+                                    coordinator.0
+                                ))
+                            })?;
+                            Ok::<_, Status>((
+                                group
+                                    .replicas()
+                                    .iter()
+                                    .map(|node| node.0)
+                                    .collect::<Vec<_>>(),
+                                coordinator,
+                                address.0.clone(),
+                            ))
+                        })
+                        .transpose()?
+                };
+                match target {
+                    Some((group_key, target, address)) => {
+                        if meter_public {
+                            let bytes = bulk::operation_inbound_bytes(&operation);
+                            if bytes != 0 {
+                                accounting_inbound.push((
+                                    tenant_id,
+                                    bucket_id,
+                                    key.path().to_owned(),
+                                    bytes,
+                                ));
+                            }
+                        }
+                        remote
+                            .entry(group_key)
+                            .or_insert_with(|| (target, address, Vec::new()))
+                            .2
+                            .push((index, operation, definition_intent));
+                    }
+                    None => match batch_operation(operation, self.max_blob_bytes) {
+                        Ok(mutation) => {
+                            if meter_public && let BatchOperation::Put(put) = &mutation {
+                                accounting_inbound.push((
+                                    tenant_id,
+                                    bucket_id,
+                                    put.key.path().to_owned(),
+                                    put.bytes.len() as u64,
+                                ));
+                            }
+                            local.push((index, mutation, definition_intent));
+                        }
+                        Err(error) => outcomes.push(BulkOutcome {
+                            index: index as u32,
+                            outcome: Some(anvil_api::v1::bulk_outcome::Outcome::Failure(
+                                api_request_failure(error),
+                            )),
+                        }),
+                    },
                 }
             }
+            let routing_duration = routing_started.elapsed();
+            self.accounting_traffic
+                .record_inbound_batch(accounting_inbound.iter().map(
+                    |(tenant_id, bucket_id, path, bytes)| {
+                        (*tenant_id, *bucket_id, path.as_str(), *bytes)
+                    },
+                ));
             let local_indices = local.iter().map(|(index, _, _)| *index).collect::<Vec<_>>();
             let local_operations = local
                 .into_iter()
@@ -685,19 +778,31 @@ impl ObjectService for ObjectServiceImpl {
                     "a routed bulk reached a node that is not every item's coordinator",
                 ));
             }
+            let dispatch_started = Instant::now();
             outcomes.extend(
-                bulk::execute_coordinator_groups(
-                    self.distribution.clone(),
-                    self.cluster_peers.clone(),
-                    local_indices,
-                    local_operations,
-                    remote,
-                    bearer.signed_token().to_owned(),
-                    object_path_access::is_internal(&path_access),
-                    started,
-                    route_budget,
+                run_request_until(
+                    deadline,
+                    bulk::execute_coordinator_groups(
+                        self.distribution.clone(),
+                        self.cluster_peers.clone(),
+                        local_indices,
+                        local_operations,
+                        remote,
+                        bearer.signed_token().to_owned(),
+                        object_path_access::is_internal(&path_access),
+                        started,
+                        route_budget,
+                    ),
+                    "bulk write deadline exceeded",
                 )
                 .await?,
+            );
+            bulk::record_phase_metrics(
+                validation_duration,
+                authorization_duration,
+                identity_duration,
+                routing_duration,
+                dispatch_started.elapsed(),
             );
             outcomes.sort_unstable_by_key(|outcome| outcome.index);
             Ok(Response::new(BulkWriteResponse { outcomes }))
@@ -1589,6 +1694,16 @@ fn batch_operation(
     Ok(operation)
 }
 
+fn validate_command_id(value: &str) -> Result<(), Status> {
+    if value.is_empty() || value.len() > 256 || value.contains('\0') {
+        Err(Status::invalid_argument(
+            "command_id must contain 1 to 256 bytes and no NUL",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn object_key(address: Option<ObjectAddress>) -> Result<ObjectKey, Status> {
     let address = address.ok_or_else(|| Status::invalid_argument("object address is required"))?;
     ObjectKey::new(address.tenant, address.bucket, address.path)
@@ -1756,6 +1871,10 @@ fn status(error: MutationError) -> Status {
         MutationError::ReceiptCapacity | MutationError::SourceJournalCapacity => {
             Status::resource_exhausted(error.to_string())
         }
+        MutationError::ReceiptTooLarge { .. }
+        | MutationError::SourceJournalRecordTooLarge { .. } => {
+            Status::resource_exhausted(error.to_string())
+        }
         MutationError::ObjectMutationLineageGap { .. }
         | MutationError::ObjectMutationSibling { .. }
         | MutationError::ObjectMutationConflict => {
@@ -1851,13 +1970,8 @@ fn content_type(value: String) -> Result<Option<String>, Status> {
 }
 
 fn required_command_id(value: String) -> Result<String, Status> {
-    if value.is_empty() || value.len() > 256 || value.contains('\0') {
-        Err(Status::invalid_argument(
-            "command_id must contain 1 to 256 bytes and no NUL",
-        ))
-    } else {
-        Ok(value)
-    }
+    validate_command_id(&value)?;
+    Ok(value)
 }
 
 #[cfg(test)]
