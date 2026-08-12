@@ -79,7 +79,7 @@ export ANVIL_QUALIFICATION_INDEX_MEMORY_PERCENT="${index_memory_percent}"
 export ANVIL_QUALIFICATION_INDEX_KIND_BUDGET_BYTES="${index_kind_budget_bytes}"
 export ANVIL_QUALIFICATION_INDEX_COMPACTION_MAX_LANES="${index_compaction_max_lanes}"
 export ANVIL_QUALIFICATION_INDEX_RAYON_WORKERS="${index_rayon_workers}"
-export ANVIL_QUALIFICATION_SOURCE_JOURNAL_MAX_ENTRIES="${pressure_source_journal_max_entries}"
+export ANVIL_QUALIFICATION_SOURCE_JOURNAL_MAX_ENTRIES="${release_source_journal_max_entries}"
 export ANVIL_QUALIFICATION_RUST_LOG=info,anvil::index_runtime::cpu=warn,anvil::index_runtime::retention=debug,anvil::observability::runtime=debug
 case "${ANVIL_DOCKER_PLATFORM:-}" in
   "")
@@ -1663,6 +1663,8 @@ cmp "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-two-large.bin" \
 require_qprobe_head anvil-1 growth/from-two.bin "${growth_two_head}"
 echo "[anvil-qualification] two-node REPLICATED read succeeded without its ingress copy"
 
+start_source_journal_phase "${pressure_source_journal_max_entries}" anvil-1 anvil-2
+echo "[anvil-qualification] topology handoff passed; cutover and pressure phases use source-journal max entries ${pressure_source_journal_max_entries}"
 prepare_no_event_membership_cutover_qualification anvil-2 2 qprobe-client "${qprobe_secret}" qprobe objects "${pressure_source_journal_max_entries}"
 prepare_joining_node 3
 prepare_indexed_membership_cutover_qualification \

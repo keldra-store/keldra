@@ -65,17 +65,24 @@ wait_for_source_journal_entry_bound() {
   return 1
 }
 
-start_release_source_journal_phase() {
+start_source_journal_phase() {
   local bound="$1"
+  shift
   local node
   export ANVIL_QUALIFICATION_SOURCE_JOURNAL_MAX_ENTRIES="${bound}"
-  for node in anvil-1 anvil-2 anvil-3; do
+  for node in "$@"; do
     compose up --detach --no-deps --force-recreate "${node}"
     wait_for_node "${node}"
     require_service_image "${node}" "${image_id}" qualification
     assert_sparse_index_startup "${node}" 1
     wait_for_source_journal_entry_bound "${node}" "${bound}"
   done
+}
+
+start_release_source_journal_phase() {
+  local bound="$1"
+  local node
+  start_source_journal_phase "${bound}" anvil-1 anvil-2 anvil-3
   public_endpoints=()
   for node in anvil-1 anvil-2 anvil-3; do
     public_endpoints+=("$(public_endpoint_for "${node}")")
