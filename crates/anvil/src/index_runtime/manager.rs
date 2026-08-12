@@ -1298,6 +1298,34 @@ struct ProjectionExecution {
     cpu_seconds: f64,
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn push_or_flush(
+    definition: &CatalogDefinition,
+    specification: &IndexSpecification,
+    kind: IndexKind,
+    plan: SegmentMemoryPlan,
+    builder: &mut EngineSegmentBuilder,
+    mutation: EngineMutation,
+    candidate: &mut CandidateGeneration,
+    dependencies: &IndexBuilderDependencies,
+) -> Result<(), Status> {
+    match builder.try_push(mutation).map_err(index_status)? {
+        EngineSegmentPush::Accepted => Ok(()),
+        EngineSegmentPush::Full(pending) => {
+            let replacement =
+                EngineSegmentBuilder::new(specification, plan).map_err(index_status)?;
+            let full = std::mem::replace(builder, replacement);
+            flush_builder(definition, kind, full, candidate, dependencies).await?;
+            match builder.try_push(pending).map_err(index_status)? {
+                EngineSegmentPush::Accepted => Ok(()),
+                EngineSegmentPush::Full(_) => Err(Status::resource_exhausted(
+                    "one index mutation cannot fit an empty bounded builder",
+                )),
+            }
+        }
+    }
+}
+
 async fn flush_builder(
     definition: &CatalogDefinition,
     kind: IndexKind,
