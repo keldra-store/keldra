@@ -10,7 +10,7 @@ use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::metrics::{Instrument, PeriodicReader, SdkMeterProvider, Stream};
 use opentelemetry_sdk::trace::{BatchConfigBuilder, BatchSpanProcessor, SdkTracerProvider};
 use tracing_opentelemetry::{MetricsLayer, OpenTelemetryLayer};
-use tracing_subscriber::filter::EnvFilter;
+use tracing_subscriber::filter::{EnvFilter, filter_fn};
 use tracing_subscriber::layer::{Layer as _, SubscriberExt as _};
 use tracing_subscriber::util::SubscriberInitExt as _;
 
@@ -87,7 +87,7 @@ impl Observability {
         let tracer = providers.tracer_provider.tracer("anvil-server");
         tracing_subscriber::registry()
             .with(MetricsLayer::new(providers.meter_provider.clone()))
-            .with(OpenTelemetryLayer::new(tracer))
+            .with(OpenTelemetryLayer::new(tracer).with_filter(filter_fn(otlp_trace_enabled)))
             .with(
                 tracing_subscriber::fmt::layer()
                     .with_writer(std::io::stdout)
@@ -114,6 +114,13 @@ impl Observability {
             .await
             .context("join OpenTelemetry shutdown worker")?
     }
+}
+
+fn otlp_trace_enabled(metadata: &tracing::Metadata<'_>) -> bool {
+    // Query CPU chunks retain their low-cardinality metrics, but one query can
+    // execute millions of chunks. Recording each normal lifecycle event on
+    // the enclosing span would make trace memory and payload size unbounded.
+    metadata.target() != "anvil::index_runtime::cpu" || *metadata.level() != tracing::Level::DEBUG
 }
 
 struct TelemetryProviders {
@@ -222,7 +229,7 @@ mod tests {
     use opentelemetry_sdk::metrics::Temporality;
     use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
     use opentelemetry_sdk::metrics::exporter::PushMetricExporter;
-    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::layer::{Layer as _, SubscriberExt as _};
 
     use crate::index_runtime::telemetry::{
         BuilderProgress, BuilderProgressPhase, CompactionInputTotals, CompactionTelemetry,
@@ -346,6 +353,43 @@ mod tests {
         assert!(TRACE_EXPORT_BATCH_SIZE <= TRACE_QUEUE_SIZE);
         assert!(METRIC_CARDINALITY_LIMIT > 0);
         assert!(OTLP_EXPORT_TIMEOUT > Duration::ZERO);
+    }
+
+    #[test]
+    fn cpu_chunk_debug_events_are_excluded_from_otlp_traces() {
+        #[derive(Clone)]
+        struct RecordingLayer(Arc<Mutex<Vec<(&'static str, tracing::Level)>>>);
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RecordingLayer {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _context: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let metadata = event.metadata();
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((metadata.target(), *metadata.level()));
+            }
+        }
+
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(RecordingLayer(recorded.clone()).with_filter(filter_fn(otlp_trace_enabled)));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::debug!(target: "anvil::index_runtime::cpu", "normal CPU chunk");
+            tracing::warn!(target: "anvil::index_runtime::cpu", "failed CPU chunk");
+            tracing::debug!(target: "anvil::index_runtime::manager", "builder progress");
+        });
+
+        assert_eq!(
+            *recorded.lock().unwrap(),
+            vec![
+                ("anvil::index_runtime::cpu", tracing::Level::WARN),
+                ("anvil::index_runtime::manager", tracing::Level::DEBUG),
+            ]
+        );
     }
 
     #[test]
