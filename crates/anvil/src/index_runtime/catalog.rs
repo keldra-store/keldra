@@ -38,7 +38,7 @@ impl CatalogDefinition {
             ));
         }
         if definition_path(&self.stored.name)?
-            != format!("_anvil/indexes/v2/definitions/{}", self.stored.name)
+            != format!("_anvil/indexes/v3/definitions/{}", self.stored.name)
         {
             return Err(Status::data_loss(
                 "assigned index definition path is not canonical",
@@ -74,6 +74,7 @@ pub(crate) struct CatalogIdentity {
 pub(crate) struct IndexCatalog {
     inner: Arc<Mutex<CatalogState>>,
     changes: tokio::sync::broadcast::Sender<CatalogIdentity>,
+    capacity_changed: Arc<tokio::sync::Notify>,
 }
 
 struct CatalogState {
@@ -97,12 +98,41 @@ impl IndexCatalog {
                 capacity,
             })),
             changes,
+            capacity_changed: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
     pub(crate) fn upsert(&self, definition: CatalogDefinition) -> Result<(), Status> {
         definition.validate()?;
         self.enqueue(CatalogChange::Upsert(definition))
+    }
+
+    /// Losslessly hand one affected definition to the bounded builder queue.
+    ///
+    /// The source-journal demultiplexer cannot acknowledge its aggregate
+    /// checkpoint until this disposable wake has been admitted. Capacity
+    /// pressure therefore delays journal progress instead of dropping the only
+    /// prompt wake for an idle builder. Durable assignments remain the recovery
+    /// authority if the process stops while waiting.
+    pub(crate) async fn upsert_wait(&self, definition: CatalogDefinition) -> Result<(), Status> {
+        definition.validate()?;
+        let identity = definition.identity();
+        loop {
+            let notified = self.capacity_changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match self.enqueue(CatalogChange::Upsert(definition.clone())) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.code() == tonic::Code::ResourceExhausted => {
+                    tracing::debug!(
+                        index.id = identity.index_id,
+                        "affected index wake waits for bounded catalog capacity"
+                    );
+                    notified.await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     pub(crate) fn remove(
@@ -120,28 +150,14 @@ impl IndexCatalog {
 
     fn enqueue(&self, change: CatalogChange) -> Result<(), Status> {
         let identity = change.identity();
-        let is_remove = matches!(change, CatalogChange::Remove(_));
         let mut state = self
             .inner
             .lock()
             .map_err(|_| Status::internal("assigned index handoff lock is poisoned"))?;
         if !state.pending.contains_key(&identity) && state.pending.len() >= state.capacity {
-            if is_remove {
-                // Removal is correctness-sensitive for a running local worker.
-                // Discarding one pending upsert is safe because durable
-                // assignment rediscovery will offer it again.
-                let evicted = state.pending.iter().find_map(|(key, value)| {
-                    matches!(value, CatalogChange::Upsert(_)).then_some(*key)
-                });
-                if let Some(evicted) = evicted {
-                    state.pending.remove(&evicted);
-                }
-            }
-            if state.pending.len() >= state.capacity {
-                return Err(Status::resource_exhausted(
-                    "assigned index handoff is at its bounded capacity",
-                ));
-            }
+            return Err(Status::resource_exhausted(
+                "assigned index handoff is at its bounded capacity",
+            ));
         }
         state.pending.insert(identity, change);
         drop(state);
@@ -165,7 +181,12 @@ impl IndexCatalog {
         {
             return Ok(None);
         }
-        Ok(state.pending.remove(&identity))
+        let removed = state.pending.remove(&identity);
+        drop(state);
+        if removed.is_some() {
+            self.capacity_changed.notify_waiters();
+        }
+        Ok(removed)
     }
 
     pub(crate) fn take_page(
@@ -192,10 +213,15 @@ impl IndexCatalog {
             })
             .take(limit)
             .collect::<Vec<_>>();
-        Ok(identities
+        let changes = identities
             .into_iter()
             .filter_map(|identity| state.pending.remove(&identity))
-            .collect())
+            .collect::<Vec<_>>();
+        drop(state);
+        if !changes.is_empty() {
+            self.capacity_changed.notify_waiters();
+        }
+        Ok(changes)
     }
 
     pub(crate) fn subscribe(&self) -> tokio::sync::broadcast::Receiver<CatalogIdentity> {
@@ -261,7 +287,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_queue_rejects_extra_upserts_but_prioritizes_removal() {
+    fn bounded_queue_rejects_extra_upserts_but_coalesces_same_identity_removal() {
         let catalog = IndexCatalog::with_capacity(1);
         let first = definition(1, 2, 9);
         let second = definition(3, 4, 10);
@@ -286,5 +312,27 @@ mod tests {
         assert!(catalog.take_page(1, |_| false).unwrap().is_empty());
         assert_eq!(catalog.pending_len().unwrap(), 1);
         assert_eq!(catalog.take_page(1, |_| true).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn affected_definition_waits_for_capacity_instead_of_losing_its_wake() {
+        let catalog = IndexCatalog::with_capacity(1);
+        let first = definition(1, 2, 9);
+        let second = definition(3, 4, 10);
+        let second_identity = second.identity();
+        catalog.upsert(first.clone()).unwrap();
+
+        let waiting_catalog = catalog.clone();
+        let waiting = tokio::spawn(async move { waiting_catalog.upsert_wait(second).await });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+
+        assert!(catalog.take(first.identity(), true).unwrap().is_some());
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+            .await
+            .expect("affected wake did not resume after catalog capacity was released")
+            .unwrap()
+            .unwrap();
+        assert!(catalog.take(second_identity, true).unwrap().is_some());
     }
 }

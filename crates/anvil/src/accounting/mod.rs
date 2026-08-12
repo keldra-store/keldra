@@ -12,6 +12,7 @@ mod snapshot;
 mod traffic;
 
 pub(crate) use catalog::{AccountingCatalog, AccountingCatalogChange, AccountingIdentity};
+pub(crate) use manager::read_rollup;
 pub(crate) use matcher::{AccountingMatcher, AccountingMatcherConfig, matcher_node};
 pub(crate) use model::{
     LoadedAccountingDefinition, StoredAccountingDefinition, StoredAccountingRollup,

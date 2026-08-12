@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
+use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex, Weak};
 
 use anvil_consensus::{DecisionRaft, NodeId};
@@ -134,6 +135,16 @@ pub(crate) struct IndexSourcePage {
 #[tonic::async_trait]
 pub(crate) trait IndexEventSources: Send + Sync + 'static {
     async fn status(&self, source: &IndexSource) -> Result<WatchJournalStatus, IndexEventError>;
+
+    async fn read_raw_page(
+        &self,
+        source: &IndexSource,
+        expected_source: SourceId,
+        after_offset: u64,
+        target_offset: u64,
+        limit: usize,
+        max_bytes: u64,
+    ) -> Result<IndexSourcePage, IndexEventError>;
 
     async fn read_page(
         &self,
@@ -351,6 +362,57 @@ impl IndexEventSources for ClusterIndexEventSources {
             .map_err(|error| source_error(source.node, error))
     }
 
+    async fn read_raw_page(
+        &self,
+        source: &IndexSource,
+        expected_source: SourceId,
+        after_offset: u64,
+        target_offset: u64,
+        limit: usize,
+        max_bytes: u64,
+    ) -> Result<IndexSourcePage, IndexEventError> {
+        let page = if source.node == self.local_node {
+            let store = self.store.clone();
+            tokio::task::spawn_blocking(move || {
+                store.scan_local_changes_bounded(after_offset, limit, max_bytes)
+            })
+            .await
+            .map_err(|error| source_error(source.node, error))?
+            .map_err(|error| source_error(source.node, error))?
+        } else {
+            self.peers
+                .read_source_journal(
+                    source.node,
+                    &source.address,
+                    expected_source,
+                    after_offset,
+                    limit,
+                    max_bytes,
+                )
+                .await
+                .map_err(|error| source_error(source.node, error))?
+        };
+        if page.source_id != expected_source {
+            return Err(IndexEventError::SourceEpochChanged(source.node));
+        }
+        let through_offset = page
+            .changes
+            .last()
+            .map_or(after_offset, LocalChange::offset);
+        trim_cached_page(
+            &IndexSourcePage {
+                source_id: page.source_id,
+                changes: page.changes,
+                encoded_bytes: page.encoded_bytes,
+                through_offset,
+                oversize: page.oversize,
+            },
+            after_offset,
+            target_offset,
+            max_bytes,
+        )
+    }
+
     async fn read_page(
         &self,
         source: &IndexSource,
@@ -498,6 +560,28 @@ pub(crate) struct IndexJournalPage {
     pub changes: Vec<IndexJournalChange>,
     pub through: IndexBarrier,
     pub encoded_bytes: u64,
+}
+
+/// Exact bucket-routed lag measured from a source-complete generation barrier.
+///
+/// Measurement stops as soon as either configured threshold is reached, so a
+/// builder never scans an arbitrarily large suffix merely to decide that a
+/// scoped snapshot is cheaper.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct IndexRoutedLag {
+    pub(crate) entries: u64,
+    pub(crate) encoded_bytes: u64,
+    pub(crate) through: IndexBarrier,
+}
+
+impl IndexRoutedLag {
+    pub(crate) fn entry_threshold_reached(&self, threshold: NonZeroU64) -> bool {
+        self.entries >= threshold.get()
+    }
+
+    pub(crate) fn byte_threshold_reached(&self, threshold: NonZeroU64) -> bool {
+        self.encoded_bytes >= threshold.get()
+    }
 }
 
 pub(crate) struct IndexEventJournal {
@@ -702,6 +786,344 @@ impl IndexEventJournal {
         target: &IndexBarrier,
         max_bytes: u64,
     ) -> Result<Option<IndexJournalPage>, IndexEventError> {
+        self.next_page_limited(
+            tenant_id,
+            bucket_id,
+            from,
+            target,
+            self.page_size,
+            max_bytes,
+        )
+        .await
+    }
+
+    /// Measure only the existing bucket route, stopping at the first rebuild
+    /// threshold. Pages remain bounded by the same record and wire-byte limits
+    /// used by incremental catch-up.
+    pub(crate) async fn measure_routed_lag(
+        &self,
+        tenant_id: u64,
+        bucket_id: u64,
+        from: &IndexBarrier,
+        target: &IndexBarrier,
+        entry_threshold: NonZeroU64,
+        byte_threshold: NonZeroU64,
+    ) -> Result<IndexRoutedLag, IndexEventError> {
+        let mut lag = IndexRoutedLag {
+            entries: 0,
+            encoded_bytes: 0,
+            through: from.clone(),
+        };
+        loop {
+            if lag.entry_threshold_reached(entry_threshold)
+                || lag.byte_threshold_reached(byte_threshold)
+            {
+                return Ok(lag);
+            }
+            let remaining_entries = entry_threshold.get() - lag.entries;
+            let page_entries = usize::try_from(remaining_entries)
+                .unwrap_or(usize::MAX)
+                .min(self.page_size)
+                .max(1);
+            let page_bytes = (byte_threshold.get() - lag.encoded_bytes)
+                .min(MAX_INDEX_EVENT_PAGE_BYTES)
+                .max(1);
+            let page = match self
+                .next_page_limited(
+                    tenant_id,
+                    bucket_id,
+                    &lag.through,
+                    target,
+                    page_entries,
+                    page_bytes,
+                )
+                .await
+            {
+                Ok(page) => page,
+                Err(IndexEventError::PageBytesExceeded { bytes, limit }) => {
+                    let projected = lag
+                        .encoded_bytes
+                        .checked_add(bytes)
+                        .ok_or(IndexEventError::PageLengthOverflow)?;
+                    if projected < byte_threshold.get() {
+                        return Err(IndexEventError::PageBytesExceeded { bytes, limit });
+                    }
+                    lag.entries = lag
+                        .entries
+                        .checked_add(1)
+                        .ok_or(IndexEventError::PageLengthOverflow)?;
+                    lag.encoded_bytes = projected;
+                    return Ok(lag);
+                }
+                Err(error) => return Err(error),
+            };
+            let Some(page) = page else {
+                return Ok(lag);
+            };
+            lag.entries = lag
+                .entries
+                .checked_add(
+                    u64::try_from(page.changes.len())
+                        .map_err(|_| IndexEventError::PageLengthOverflow)?,
+                )
+                .ok_or(IndexEventError::PageLengthOverflow)?;
+            lag.encoded_bytes = lag
+                .encoded_bytes
+                .checked_add(page.encoded_bytes)
+                .ok_or(IndexEventError::PageLengthOverflow)?;
+            lag.through = page.through;
+        }
+    }
+
+    /// Return the newest routed offset per source for one bucket interval.
+    /// Empty source ranges consume no caller memory and still advance the
+    /// disposable scan cursor to the complete target vector.
+    pub(crate) async fn routed_effects(
+        &self,
+        tenant_id: u64,
+        bucket_id: u64,
+        from: &IndexBarrier,
+        target: &IndexBarrier,
+    ) -> Result<BTreeMap<SourceId, u64>, IndexEventError> {
+        self.routed_effects_filtered(tenant_id, bucket_id, from, target, |_| true)
+            .await
+    }
+
+    /// Return only bucket effects which can be source data for an index.
+    /// Reserved Anvil objects still advance the authoritative journal but
+    /// cannot wake an index builder or make a query appear stale.
+    pub(crate) async fn routed_index_effects(
+        &self,
+        tenant_id: u64,
+        bucket_id: u64,
+        from: &IndexBarrier,
+        target: &IndexBarrier,
+    ) -> Result<BTreeMap<SourceId, u64>, IndexEventError> {
+        self.routed_effects_filtered(tenant_id, bucket_id, from, target, is_index_source_change)
+            .await
+    }
+
+    /// Capture a query freshness cut scoped to one bucket. An unrelated
+    /// bucket never advances this returned barrier, while an indexable change
+    /// advances only the source cursors on which that bucket changed.
+    pub(crate) async fn capture_index_bucket_barrier(
+        &self,
+        tenant_id: u64,
+        bucket_id: u64,
+        indexed: Option<&IndexBarrier>,
+    ) -> Result<IndexBarrier, IndexEventError> {
+        let target = self.capture_barrier().await?;
+        let Some(indexed) = indexed else {
+            return Ok(target);
+        };
+        if !barriers_are_routable(indexed, &target) {
+            return Ok(target);
+        }
+        let effects = self
+            .routed_index_effects(tenant_id, bucket_id, indexed, &target)
+            .await?;
+        let mut observed = indexed.clone();
+        for (source, next_offset) in effects {
+            let node = NodeId(u64::from(source.node_id));
+            let cursor = observed
+                .sources
+                .get_mut(&node)
+                .ok_or(IndexEventError::IncompleteSources)?;
+            if cursor.source != source || next_offset < cursor.next_offset {
+                return Err(IndexEventError::NonContiguousSource(node));
+            }
+            cursor.next_offset = next_offset;
+        }
+        Ok(observed)
+    }
+
+    async fn routed_effects_filtered(
+        &self,
+        tenant_id: u64,
+        bucket_id: u64,
+        from: &IndexBarrier,
+        target: &IndexBarrier,
+        include: fn(&LocalChange) -> bool,
+    ) -> Result<BTreeMap<SourceId, u64>, IndexEventError> {
+        let mut through = from.clone();
+        let mut affected = BTreeMap::<SourceId, u64>::new();
+        while let Some(page) = self
+            .next_page_limited(
+                tenant_id,
+                bucket_id,
+                &through,
+                target,
+                self.page_size,
+                MAX_INDEX_EVENT_PAGE_BYTES,
+            )
+            .await?
+        {
+            for change in &page.changes {
+                if !include(&change.change) {
+                    continue;
+                }
+                let source = page.through.sources[&change.node].source;
+                let next = change
+                    .change
+                    .offset()
+                    .checked_add(1)
+                    .ok_or(IndexEventError::OffsetOverflow(change.node))?;
+                affected
+                    .entry(source)
+                    .and_modify(|current| *current = (*current).max(next))
+                    .or_insert(next);
+            }
+            through = page.through;
+        }
+        Ok(affected)
+    }
+
+    /// Pull one bounded contiguous page from the authoritative source interval
+    /// without applying a bucket route. Aggregate derived consumers use this
+    /// only when the interval contains fewer records than probing every bucket
+    /// in their disposable assignment inventory.
+    pub(crate) async fn next_raw_page(
+        &self,
+        from: &IndexBarrier,
+        target: &IndexBarrier,
+        max_bytes: u64,
+    ) -> Result<Option<IndexJournalPage>, IndexEventError> {
+        if max_bytes == 0 {
+            return Err(IndexEventError::ZeroPageByteLimit);
+        }
+        let placement = self
+            .authority
+            .current()
+            .map_err(IndexEventError::Placement)?;
+        require_compatible(from, target, &placement)?;
+        let Some(source) = placement.sources.iter().find(|source| {
+            from.sources[&source.node].next_offset < target.sources[&source.node].next_offset
+        }) else {
+            if from != target {
+                return Err(IndexEventError::IncompleteSources);
+            }
+            return Ok(None);
+        };
+
+        let start = from.sources[&source.node];
+        let through = target.sources[&source.node];
+        let status_before = self.sources.status(source).await?;
+        validate_status(source.node, &status_before)?;
+        if status_before.source_id != start.source
+            || start.next_offset.saturating_sub(1) < status_before.retention_floor
+        {
+            return Err(IndexEventError::SourceEpochChanged(source.node));
+        }
+        let after = start
+            .next_offset
+            .checked_sub(1)
+            .ok_or(IndexEventError::CheckpointMismatch(source.node))?;
+        let target_offset = through
+            .next_offset
+            .checked_sub(1)
+            .ok_or(IndexEventError::CheckpointMismatch(source.node))?;
+        let page = self
+            .sources
+            .read_raw_page(
+                source,
+                start.source,
+                after,
+                target_offset,
+                self.page_size,
+                max_bytes,
+            )
+            .await?;
+        if page.source_id != start.source {
+            return Err(IndexEventError::SourceEpochChanged(source.node));
+        }
+        if let Some(oversize) = page.oversize {
+            if !page.changes.is_empty()
+                || page.encoded_bytes != 0
+                || oversize.offset < start.next_offset
+                || oversize.offset > target_offset
+            {
+                return Err(IndexEventError::NonContiguousSource(source.node));
+            }
+            return Err(IndexEventError::PageBytesExceeded {
+                bytes: oversize.encoded_bytes,
+                limit: max_bytes,
+            });
+        }
+        if page.through_offset < after
+            || page.through_offset > target_offset
+            || (page.through_offset == after && target_offset > after)
+        {
+            return Err(IndexEventError::NonContiguousSource(source.node));
+        }
+
+        let mut expected_offset = after;
+        let mut encoded_bytes = 0_u64;
+        let mut changes = Vec::with_capacity(page.changes.len());
+        for change in page.changes {
+            expected_offset = expected_offset
+                .checked_add(1)
+                .ok_or(IndexEventError::OffsetOverflow(source.node))?;
+            if change.offset() != expected_offset || change.offset() > page.through_offset {
+                return Err(IndexEventError::NonContiguousSource(source.node));
+            }
+            encoded_bytes = encoded_bytes
+                .checked_add(encoded_len(&change)?)
+                .ok_or(IndexEventError::PageLengthOverflow)?;
+            changes.push(IndexJournalChange {
+                node: source.node,
+                change,
+            });
+        }
+        if expected_offset != page.through_offset || encoded_bytes != page.encoded_bytes {
+            return Err(IndexEventError::PageLengthMismatch {
+                measured: encoded_bytes,
+                reported: page.encoded_bytes,
+            });
+        }
+
+        let status_after = self.sources.status(source).await?;
+        validate_status(source.node, &status_after)?;
+        if status_after.source_id != start.source
+            || status_after.settled_through.saturating_add(1) < through.next_offset
+        {
+            return Err(IndexEventError::SourceEpochChanged(source.node));
+        }
+        if self
+            .authority
+            .current()
+            .map_err(IndexEventError::Placement)?
+            != placement
+        {
+            return Err(IndexEventError::BarrierChanged);
+        }
+        let mut advanced = from.clone();
+        advanced.sources.get_mut(&source.node).unwrap().next_offset = page
+            .through_offset
+            .checked_add(1)
+            .ok_or(IndexEventError::OffsetOverflow(source.node))?;
+        if advanced
+            .sources
+            .iter()
+            .all(|(node, cursor)| cursor.next_offset == target.sources[node].next_offset)
+        {
+            advanced.atomic = target.atomic;
+        }
+        Ok(Some(IndexJournalPage {
+            changes,
+            through: advanced,
+            encoded_bytes,
+        }))
+    }
+
+    async fn next_page_limited(
+        &self,
+        tenant_id: u64,
+        bucket_id: u64,
+        from: &IndexBarrier,
+        target: &IndexBarrier,
+        page_size: usize,
+        max_bytes: u64,
+    ) -> Result<Option<IndexJournalPage>, IndexEventError> {
         if max_bytes == 0 {
             return Err(IndexEventError::ZeroPageByteLimit);
         }
@@ -745,7 +1167,7 @@ impl IndexEventJournal {
                 target_offset,
                 tenant_id,
                 bucket_id,
-                self.page_size,
+                page_size,
                 max_bytes,
             )
             .await?;
@@ -842,6 +1264,26 @@ impl IndexEventJournal {
             encoded_bytes,
         }))
     }
+}
+
+fn barriers_are_routable(from: &IndexBarrier, target: &IndexBarrier) -> bool {
+    from.fence == target.fence
+        && target.atomic.is_clear()
+        && from.sources.len() == target.sources.len()
+        && from.sources.iter().all(|(node, cursor)| {
+            target.sources.get(node).is_some_and(|target| {
+                cursor.source == target.source && cursor.next_offset <= target.next_offset
+            })
+        })
+}
+
+pub(crate) fn is_index_source_change(change: &LocalChange) -> bool {
+    let path = match change {
+        LocalChange::ObjectHead(change) => &change.exact_path,
+        LocalChange::RetainedVersionDeleted(change) => &change.exact_path,
+        _ => return false,
+    };
+    !path.split('/').any(|segment| segment == "_anvil")
 }
 
 fn encoded_len(change: &LocalChange) -> Result<u64, IndexEventError> {

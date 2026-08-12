@@ -110,81 +110,117 @@ impl AccountingTraffic {
         self.record(tenant_id, bucket_id, path, 0, bytes);
     }
 
+    /// Records one request's accepted inbound bytes while acquiring the
+    /// disposable traffic queue once. Object durability never depends on this
+    /// best-effort accounting path.
+    pub(crate) fn record_inbound_batch<'a>(
+        &self,
+        entries: impl IntoIterator<Item = (u64, u64, &'a str, u64)>,
+    ) {
+        self.record_batch(
+            entries
+                .into_iter()
+                .map(|(tenant_id, bucket_id, path, bytes)| (tenant_id, bucket_id, path, bytes, 0)),
+        );
+    }
+
     pub(crate) fn record_resolution_drop(&self, inbound: u64, outbound: u64) {
         self.emit_dropped(inbound, outbound, "stable bucket identity was unavailable");
     }
 
     fn record(&self, tenant_id: u64, bucket_id: u64, path: &str, inbound: u64, outbound: u64) {
-        if inbound == 0 && outbound == 0 {
-            return;
-        }
-        if tenant_id == 0 || bucket_id == 0 || path.is_empty() {
-            self.emit_dropped(inbound, outbound, "traffic observation identity is invalid");
-            return;
-        }
-        let entry = TrafficEntry {
-            path: path.to_owned(),
-            accepted_inbound_bytes: inbound,
-            served_outbound_bytes: outbound,
-        };
-        let encoded_bytes = entry.encoded_bytes();
-        if encoded_bytes > self.config.max_batch_bytes {
-            self.emit_dropped(
-                inbound,
-                outbound,
-                "traffic observation exceeds the batch byte bound",
-            );
-            return;
-        }
+        self.record_batch(std::iter::once((
+            tenant_id, bucket_id, path, inbound, outbound,
+        )));
+    }
+
+    fn record_batch<'a>(&self, entries: impl IntoIterator<Item = (u64, u64, &'a str, u64, u64)>) {
         let Ok(mut pending) = self.pending.lock() else {
+            let (inbound, outbound) = entries.into_iter().fold(
+                (0_u64, 0_u64),
+                |(inbound_total, outbound_total), (_, _, _, inbound, outbound)| {
+                    (
+                        inbound_total.saturating_add(inbound),
+                        outbound_total.saturating_add(outbound),
+                    )
+                },
+            );
             self.emit_dropped(inbound, outbound, "traffic queue lock is poisoned");
             return;
         };
-        if pending.total_entries >= self.config.max_pending_entries
-            || pending.total_bytes.saturating_add(encoded_bytes) > self.config.max_pending_bytes
-        {
-            self.emit_dropped(inbound, outbound, "traffic queue capacity is exhausted");
-            return;
-        }
-        let bucket = BucketIdentity {
-            tenant_id,
-            bucket_id,
-        };
-        let must_rotate = pending.open.get(&bucket).is_some_and(|batch| {
-            batch.entries.len() >= self.config.max_batch_entries
-                || batch.encoded_bytes.saturating_add(encoded_bytes) > self.config.max_batch_bytes
-        });
-        if must_rotate && !pending.seal(bucket, self.config.max_pending_batches) {
-            self.emit_dropped(
-                inbound,
-                outbound,
-                "traffic batch queue capacity is exhausted",
-            );
-            return;
-        }
-        if !pending.open.contains_key(&bucket) {
-            if pending.ready.len().saturating_add(pending.open.len())
-                >= self.config.max_pending_batches
+        let mut accepted = false;
+        for (tenant_id, bucket_id, path, inbound, outbound) in entries {
+            if inbound == 0 && outbound == 0 {
+                continue;
+            }
+            if tenant_id == 0 || bucket_id == 0 || path.is_empty() {
+                self.emit_dropped(inbound, outbound, "traffic observation identity is invalid");
+                continue;
+            }
+            let entry = TrafficEntry {
+                path: path.to_owned(),
+                accepted_inbound_bytes: inbound,
+                served_outbound_bytes: outbound,
+            };
+            let encoded_bytes = entry.encoded_bytes();
+            if encoded_bytes > self.config.max_batch_bytes {
+                self.emit_dropped(
+                    inbound,
+                    outbound,
+                    "traffic observation exceeds the batch byte bound",
+                );
+                continue;
+            }
+            if pending.total_entries >= self.config.max_pending_entries
+                || pending.total_bytes.saturating_add(encoded_bytes) > self.config.max_pending_bytes
             {
+                self.emit_dropped(inbound, outbound, "traffic queue capacity is exhausted");
+                continue;
+            }
+            let bucket = BucketIdentity {
+                tenant_id,
+                bucket_id,
+            };
+            let must_rotate = pending.open.get(&bucket).is_some_and(|batch| {
+                batch.entries.len() >= self.config.max_batch_entries
+                    || batch.encoded_bytes.saturating_add(encoded_bytes)
+                        > self.config.max_batch_bytes
+            });
+            if must_rotate && !pending.seal(bucket, self.config.max_pending_batches) {
                 self.emit_dropped(
                     inbound,
                     outbound,
                     "traffic batch queue capacity is exhausted",
                 );
-                return;
+                continue;
             }
-            pending.next_sequence = pending.next_sequence.wrapping_add(1).max(1);
-            let sequence = pending.next_sequence;
-            pending
-                .open
-                .insert(bucket, TrafficBatch::new(self.source, bucket, sequence));
+            if !pending.open.contains_key(&bucket) {
+                if pending.ready.len().saturating_add(pending.open.len())
+                    >= self.config.max_pending_batches
+                {
+                    self.emit_dropped(
+                        inbound,
+                        outbound,
+                        "traffic batch queue capacity is exhausted",
+                    );
+                    continue;
+                }
+                pending.next_sequence = pending.next_sequence.wrapping_add(1).max(1);
+                let sequence = pending.next_sequence;
+                pending
+                    .open
+                    .insert(bucket, TrafficBatch::new(self.source, bucket, sequence));
+            }
+            let batch = pending.open.get_mut(&bucket).expect("open batch exists");
+            batch.encoded_bytes = batch.encoded_bytes.saturating_add(encoded_bytes);
+            batch.entries.push(entry);
+            pending.total_entries += 1;
+            pending.total_bytes = pending.total_bytes.saturating_add(encoded_bytes);
+            accepted = true;
         }
-        let batch = pending.open.get_mut(&bucket).expect("open batch exists");
-        batch.encoded_bytes = batch.encoded_bytes.saturating_add(encoded_bytes);
-        batch.entries.push(entry);
-        pending.total_entries += 1;
-        pending.total_bytes = pending.total_bytes.saturating_add(encoded_bytes);
-        emit_pending(&pending);
+        if accepted {
+            emit_pending(&pending);
+        }
     }
 
     pub(crate) fn pending(&self) -> Vec<TrafficBatch> {
@@ -415,6 +451,27 @@ mod tests {
 
         meter.acknowledge(&first[0].id);
         assert!(meter.pending().is_empty());
+    }
+
+    #[test]
+    fn request_batch_records_all_inbound_observations() {
+        let meter = meter(AccountingTrafficConfig::default());
+        meter.record_inbound_batch([
+            (11, 12, "users/7/a", 12),
+            (11, 12, "users/7/b", 8),
+            (11, 13, "users/8/a", 5),
+        ]);
+
+        let batches = meter.pending();
+        assert_eq!(batches.len(), 2);
+        assert_eq!(
+            batches
+                .iter()
+                .flat_map(|batch| batch.entries.iter())
+                .map(|entry| entry.accepted_inbound_bytes)
+                .sum::<u64>(),
+            25
+        );
     }
 
     #[test]

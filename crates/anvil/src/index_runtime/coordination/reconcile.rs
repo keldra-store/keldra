@@ -346,7 +346,7 @@ mod tests {
             tenant_id: 11,
             bucket_id: 12,
             definition_id: 13,
-            path: "_anvil/indexes/v2/definitions/example".into(),
+            path: "_anvil/indexes/v3/definitions/example".into(),
             object_version: VersionId(14),
         };
         for store in stores.values() {
@@ -565,9 +565,7 @@ async fn advance_local_destination_barrier(
             )
             .await?;
             let same_source = existing.filter(|value| value.source_id == source.captured.source_id);
-            let next_offset =
-                same_source.map_or(target_next, |value| value.next_offset.max(target_next));
-            if same_source.is_some_and(|value| value.next_offset >= target_next) {
+            if destination_barrier_is_current(same_source, placement.fence(), target_next) {
                 continue;
             }
             apply_assignment_page(
@@ -580,7 +578,7 @@ async fn advance_local_destination_barrier(
                 DefinitionCheckpoint {
                     consumer_kind,
                     source_id: source.captured.source_id,
-                    next_offset,
+                    next_offset: target_next,
                     observed_fence: placement.fence(),
                 },
             )
@@ -588,4 +586,54 @@ async fn advance_local_destination_barrier(
         }
     }
     Ok(())
+}
+
+fn destination_barrier_is_current(
+    checkpoint: Option<DefinitionCheckpoint>,
+    fence: anvil_store::PlacementLogId,
+    target_next: u64,
+) -> bool {
+    checkpoint.is_some_and(|checkpoint| {
+        checkpoint.observed_fence == fence && checkpoint.next_offset >= target_next
+    })
+}
+
+#[cfg(test)]
+mod destination_barrier_tests {
+    use super::*;
+
+    fn checkpoint(fence: anvil_store::PlacementLogId, next_offset: u64) -> DefinitionCheckpoint {
+        DefinitionCheckpoint {
+            consumer_kind: DefinitionConsumerKind::IndexAssignments,
+            source_id: SourceId {
+                node_id: 1,
+                source_epoch: [1; 32],
+            },
+            next_offset,
+            observed_fence: fence,
+        }
+    }
+
+    #[test]
+    fn an_old_fence_offset_never_skips_current_fence_baseline_installation() {
+        let current = anvil_store::PlacementLogId { term: 3, index: 9 };
+        assert!(!destination_barrier_is_current(
+            Some(checkpoint(
+                anvil_store::PlacementLogId { term: 3, index: 8 },
+                1_000,
+            )),
+            current,
+            10,
+        ));
+        assert!(!destination_barrier_is_current(
+            Some(checkpoint(current, 9)),
+            current,
+            10,
+        ));
+        assert!(destination_barrier_is_current(
+            Some(checkpoint(current, 10)),
+            current,
+            10,
+        ));
+    }
 }

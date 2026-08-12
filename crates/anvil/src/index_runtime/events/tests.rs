@@ -1,3 +1,4 @@
+use std::num::NonZeroU64;
 use std::sync::Mutex;
 
 use anvil_store::{ObjectHeadChange, ObjectHeadChangeKind, ReferenceDelta, VersionId};
@@ -23,6 +24,8 @@ impl IndexEventAuthority for MemoryAuthority {
 #[derive(Clone, Default)]
 struct MemorySources {
     journals: Arc<Mutex<BTreeMap<NodeId, (WatchJournalStatus, Vec<LocalChange>)>>>,
+    reads: Arc<Mutex<Vec<(NodeId, u64, u64)>>>,
+    raw_reads: Arc<Mutex<Vec<NodeId>>>,
 }
 
 #[tonic::async_trait]
@@ -39,61 +42,112 @@ impl IndexEventSources for MemorySources {
             })
     }
 
+    async fn read_raw_page(
+        &self,
+        source: &IndexSource,
+        expected_source: SourceId,
+        after_offset: u64,
+        target_offset: u64,
+        limit: usize,
+        max_bytes: u64,
+    ) -> Result<IndexSourcePage, IndexEventError> {
+        self.raw_reads.lock().unwrap().push(source.node);
+        memory_page(
+            &self.journals,
+            source,
+            expected_source,
+            after_offset,
+            target_offset,
+            limit,
+            max_bytes,
+            |_| true,
+        )
+    }
+
     async fn read_page(
         &self,
         source: &IndexSource,
         expected_source: SourceId,
         after_offset: u64,
         target_offset: u64,
-        _tenant_id: u64,
-        _bucket_id: u64,
+        tenant_id: u64,
+        bucket_id: u64,
         limit: usize,
         max_bytes: u64,
     ) -> Result<IndexSourcePage, IndexEventError> {
-        let journals = self.journals.lock().unwrap();
-        let (status, changes) = journals.get(&source.node).unwrap();
-        let mut selected = Vec::new();
-        let mut encoded_bytes = 0_u64;
-        let mut oversize = None;
-        let matching = changes
-            .iter()
-            .filter(|change| change.offset() > after_offset && change.offset() <= target_offset)
-            .collect::<Vec<_>>();
-        for change in matching.iter().copied().take(limit) {
-            let bytes = encoded_len(change)?;
-            let projected = encoded_bytes + bytes;
-            if projected > max_bytes && selected.is_empty() {
-                oversize = Some(OversizeLocalChange {
-                    offset: change.offset(),
-                    encoded_bytes: bytes,
-                });
-                break;
-            }
-            if projected > max_bytes {
-                break;
-            }
-            encoded_bytes = projected;
-            selected.push(change.clone());
-        }
-        let through_offset = if oversize.is_some() {
-            after_offset
-        } else if selected.len() < matching.len() {
-            selected.last().map_or(after_offset, LocalChange::offset)
-        } else {
-            target_offset
-        };
-        Ok(IndexSourcePage {
-            source_id: if status.source_id == expected_source {
-                status.source_id
-            } else {
-                expected_source
-            },
-            changes: selected,
-            encoded_bytes,
-            through_offset,
-            oversize,
-        })
+        self.reads
+            .lock()
+            .unwrap()
+            .push((source.node, tenant_id, bucket_id));
+        memory_page(
+            &self.journals,
+            source,
+            expected_source,
+            after_offset,
+            target_offset,
+            limit,
+            max_bytes,
+            |change| change_bucket(change) == Some((tenant_id, bucket_id)),
+        )
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn memory_page(
+    journals: &Mutex<BTreeMap<NodeId, (WatchJournalStatus, Vec<LocalChange>)>>,
+    source: &IndexSource,
+    expected_source: SourceId,
+    after_offset: u64,
+    target_offset: u64,
+    limit: usize,
+    max_bytes: u64,
+    include: impl Fn(&LocalChange) -> bool,
+) -> Result<IndexSourcePage, IndexEventError> {
+    let journals = journals.lock().unwrap();
+    let (status, changes) = journals.get(&source.node).unwrap();
+    let mut selected = Vec::new();
+    let mut encoded_bytes = 0_u64;
+    let mut oversize = None;
+    let matching = changes
+        .iter()
+        .filter(|change| {
+            change.offset() > after_offset && change.offset() <= target_offset && include(change)
+        })
+        .collect::<Vec<_>>();
+    for change in matching.iter().copied().take(limit) {
+        let bytes = encoded_len(change)?;
+        let projected = encoded_bytes + bytes;
+        if projected > max_bytes && selected.is_empty() {
+            oversize = Some(OversizeLocalChange {
+                offset: change.offset(),
+                encoded_bytes: bytes,
+            });
+            break;
+        }
+        if projected > max_bytes {
+            break;
+        }
+        encoded_bytes = projected;
+        selected.push(change.clone());
+    }
+    let through_offset = if oversize.is_some() {
+        after_offset
+    } else if selected.len() < matching.len() {
+        selected.last().map_or(after_offset, LocalChange::offset)
+    } else {
+        target_offset
+    };
+    Ok(IndexSourcePage {
+        source_id: if status.source_id == expected_source {
+            status.source_id
+        } else {
+            expected_source
+        },
+        changes: selected,
+        encoded_bytes,
+        through_offset,
+        oversize,
+    })
 }
 
 fn source_id(node: u16) -> SourceId {
@@ -104,17 +158,46 @@ fn source_id(node: u16) -> SourceId {
 }
 
 fn change(node: u16, offset: u64) -> LocalChange {
+    change_in_bucket(node, offset, 1, 2)
+}
+
+fn change_in_bucket(node: u16, offset: u64, tenant_id: u64, bucket_id: u64) -> LocalChange {
+    change_at_path(
+        node,
+        offset,
+        tenant_id,
+        bucket_id,
+        &format!("source-{node}/{offset}"),
+    )
+}
+
+fn change_at_path(
+    _node: u16,
+    offset: u64,
+    tenant_id: u64,
+    bucket_id: u64,
+    path: &str,
+) -> LocalChange {
     LocalChange::ObjectHead(ObjectHeadChange {
         offset,
-        tenant_id: 1,
-        bucket_id: 2,
-        exact_path: format!("source-{node}/{offset}"),
+        tenant_id,
+        bucket_id,
+        exact_path: path.to_owned(),
         path_version: VersionId(offset),
         kind: ObjectHeadChangeKind::Put,
         reference_deltas: Vec::<ReferenceDelta>::new(),
         accounting_transition: None,
         definition_transition: None,
     })
+}
+
+fn change_bucket(change: &LocalChange) -> Option<(u64, u64)> {
+    match change {
+        LocalChange::ObjectHead(change) => Some((change.tenant_id, change.bucket_id)),
+        LocalChange::RetainedVersionDeleted(change) => Some((change.tenant_id, change.bucket_id)),
+        LocalChange::AggregateChanged(_) | LocalChange::ContentLifecycleChanged(_) => None,
+        _ => None,
+    }
 }
 
 fn status(node: u16, tail: u64) -> WatchJournalStatus {
@@ -341,6 +424,432 @@ async fn bounded_pages_advance_every_source_through_the_exact_vector() {
     offsets.sort_unstable();
     assert_eq!(offsets, [(NodeId(1), 1), (NodeId(1), 2), (NodeId(2), 1)]);
     assert_eq!(cursor, target);
+}
+
+#[tokio::test]
+async fn routed_effects_do_no_source_reads_for_an_idle_vector() {
+    let clear = AtomicProgramWatermark::new(None, None, 0);
+    let sources = MemorySources::default();
+    sources
+        .journals
+        .lock()
+        .unwrap()
+        .insert(NodeId(1), (status(1, 0), Vec::new()));
+    sources
+        .journals
+        .lock()
+        .unwrap()
+        .insert(NodeId(2), (status(2, 0), Vec::new()));
+    let barrier = journal(vec![placement(clear)], &sources)
+        .capture_barrier()
+        .await
+        .unwrap();
+
+    let effects = journal(vec![placement(clear)], &sources)
+        .routed_effects(1, 2, &barrier, &barrier)
+        .await
+        .unwrap();
+
+    assert!(effects.is_empty());
+    assert!(sources.reads.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn routed_effects_never_fetch_or_process_an_irrelevant_bucket() {
+    let clear = AtomicProgramWatermark::new(None, None, 0);
+    let sources = MemorySources::default();
+    sources.journals.lock().unwrap().insert(
+        NodeId(1),
+        (status(1, 1), vec![change_in_bucket(1, 1, 9, 9)]),
+    );
+    sources
+        .journals
+        .lock()
+        .unwrap()
+        .insert(NodeId(2), (status(2, 0), Vec::new()));
+    let target = journal(vec![placement(clear)], &sources)
+        .capture_barrier()
+        .await
+        .unwrap();
+    let mut from = target.clone();
+    from.sources.get_mut(&NodeId(1)).unwrap().next_offset = 1;
+
+    let effects = journal(vec![placement(clear)], &sources)
+        .routed_effects(1, 2, &from, &target)
+        .await
+        .unwrap();
+
+    assert!(effects.is_empty());
+    assert!(
+        sources
+            .reads
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(_, tenant, bucket)| (*tenant, *bucket) == (1, 2))
+    );
+}
+
+#[tokio::test]
+async fn routed_effects_report_only_the_relevant_sources_newest_offset() {
+    let clear = AtomicProgramWatermark::new(None, None, 0);
+    let sources = MemorySources::default();
+    sources.journals.lock().unwrap().insert(
+        NodeId(1),
+        (
+            status(1, 3),
+            vec![
+                change_in_bucket(1, 1, 1, 2),
+                change_in_bucket(1, 2, 9, 9),
+                change_in_bucket(1, 3, 1, 2),
+            ],
+        ),
+    );
+    sources
+        .journals
+        .lock()
+        .unwrap()
+        .insert(NodeId(2), (status(2, 0), Vec::new()));
+    let target = journal(vec![placement(clear)], &sources)
+        .capture_barrier()
+        .await
+        .unwrap();
+    let mut from = target.clone();
+    from.sources.get_mut(&NodeId(1)).unwrap().next_offset = 1;
+
+    let effects = journal(vec![placement(clear)], &sources)
+        .routed_effects(1, 2, &from, &target)
+        .await
+        .unwrap();
+
+    assert_eq!(effects, BTreeMap::from([(source_id(1), 4)]));
+    assert!(
+        sources
+            .reads
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(_, tenant, bucket)| (*tenant, *bucket) == (1, 2))
+    );
+}
+
+#[tokio::test]
+async fn query_bucket_barrier_ignores_an_unrelated_bucket() {
+    let clear = AtomicProgramWatermark::new(None, None, 0);
+    let sources = MemorySources::default();
+    sources.journals.lock().unwrap().insert(
+        NodeId(1),
+        (status(1, 1), vec![change_in_bucket(1, 1, 9, 9)]),
+    );
+    sources
+        .journals
+        .lock()
+        .unwrap()
+        .insert(NodeId(2), (status(2, 0), Vec::new()));
+    let events = journal(vec![placement(clear)], &sources);
+    let target = events.capture_barrier().await.unwrap();
+    let mut indexed = target.clone();
+    indexed.sources.get_mut(&NodeId(1)).unwrap().next_offset = 1;
+
+    let observed = events
+        .capture_index_bucket_barrier(1, 2, Some(&indexed))
+        .await
+        .unwrap();
+
+    assert_eq!(observed, indexed);
+    assert!(
+        sources
+            .reads
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(_, tenant, bucket)| (*tenant, *bucket) == (1, 2))
+    );
+}
+
+#[tokio::test]
+async fn reserved_index_artifacts_cannot_advance_or_rewake_their_index() {
+    let clear = AtomicProgramWatermark::new(None, None, 0);
+    let sources = MemorySources::default();
+    sources.journals.lock().unwrap().insert(
+        NodeId(1),
+        (
+            status(1, 1),
+            vec![change_at_path(1, 1, 1, 2, "_anvil/indexes/v3/9/current")],
+        ),
+    );
+    sources
+        .journals
+        .lock()
+        .unwrap()
+        .insert(NodeId(2), (status(2, 0), Vec::new()));
+    let events = journal(vec![placement(clear)], &sources);
+    let target = events.capture_barrier().await.unwrap();
+    let mut indexed = target.clone();
+    indexed.sources.get_mut(&NodeId(1)).unwrap().next_offset = 1;
+
+    assert!(
+        events
+            .routed_index_effects(1, 2, &indexed, &target)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        events
+            .capture_index_bucket_barrier(1, 2, Some(&indexed))
+            .await
+            .unwrap(),
+        indexed
+    );
+}
+
+#[tokio::test]
+async fn raw_interval_reads_one_bounded_page_without_bucket_probes() {
+    let clear = AtomicProgramWatermark::new(None, None, 0);
+    let sources = MemorySources::default();
+    sources.journals.lock().unwrap().insert(
+        NodeId(1),
+        (status(1, 1), vec![change_in_bucket(1, 1, 9, 9)]),
+    );
+    sources
+        .journals
+        .lock()
+        .unwrap()
+        .insert(NodeId(2), (status(2, 0), Vec::new()));
+    let target = journal(vec![placement(clear)], &sources)
+        .capture_barrier()
+        .await
+        .unwrap();
+    let mut from = target.clone();
+    from.sources.get_mut(&NodeId(1)).unwrap().next_offset = 1;
+
+    let page = journal(vec![placement(clear)], &sources)
+        .next_raw_page(&from, &target, MAX_INDEX_EVENT_PAGE_BYTES)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(page.through, target);
+    assert_eq!(page.changes.len(), 1);
+    assert_eq!(change_bucket(&page.changes[0].change), Some((9, 9)));
+    assert_eq!(*sources.raw_reads.lock().unwrap(), [NodeId(1)]);
+    assert!(sources.reads.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn routed_lag_measurement_stops_exactly_at_the_entry_threshold() {
+    let clear = AtomicProgramWatermark::new(None, None, 0);
+    let sources = MemorySources::default();
+    sources.journals.lock().unwrap().insert(
+        NodeId(1),
+        (
+            status(1, 4),
+            vec![change(1, 1), change(1, 2), change(1, 3), change(1, 4)],
+        ),
+    );
+    sources
+        .journals
+        .lock()
+        .unwrap()
+        .insert(NodeId(2), (status(2, 0), Vec::new()));
+    let from = IndexBarrier {
+        fence: PlacementLogId { term: 3, index: 7 },
+        atomic: clear,
+        sources: BTreeMap::from([
+            (
+                NodeId(1),
+                IndexSourceCursor {
+                    source: source_id(1),
+                    next_offset: 1,
+                },
+            ),
+            (
+                NodeId(2),
+                IndexSourceCursor {
+                    source: source_id(2),
+                    next_offset: 1,
+                },
+            ),
+        ]),
+    };
+    let target = IndexBarrier {
+        sources: BTreeMap::from([
+            (
+                NodeId(1),
+                IndexSourceCursor {
+                    source: source_id(1),
+                    next_offset: 5,
+                },
+            ),
+            (
+                NodeId(2),
+                IndexSourceCursor {
+                    source: source_id(2),
+                    next_offset: 1,
+                },
+            ),
+        ]),
+        ..from.clone()
+    };
+    let measured = journal(vec![placement(clear)], &sources)
+        .measure_routed_lag(
+            1,
+            2,
+            &from,
+            &target,
+            NonZeroU64::new(2).unwrap(),
+            NonZeroU64::new(u64::MAX).unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(measured.entries, 2);
+    assert!(measured.entry_threshold_reached(NonZeroU64::new(2).unwrap()));
+    assert_eq!(measured.through.sources[&NodeId(1)].next_offset, 3);
+    assert_ne!(measured.through, target);
+}
+
+#[tokio::test]
+async fn routed_lag_measurement_stops_when_the_next_entry_crosses_the_byte_threshold() {
+    let clear = AtomicProgramWatermark::new(None, None, 0);
+    let sources = MemorySources::default();
+    sources
+        .journals
+        .lock()
+        .unwrap()
+        .insert(NodeId(1), (status(1, 2), vec![change(1, 1), change(1, 2)]));
+    sources
+        .journals
+        .lock()
+        .unwrap()
+        .insert(NodeId(2), (status(2, 0), Vec::new()));
+    let from = IndexBarrier {
+        fence: PlacementLogId { term: 3, index: 7 },
+        atomic: clear,
+        sources: BTreeMap::from([
+            (
+                NodeId(1),
+                IndexSourceCursor {
+                    source: source_id(1),
+                    next_offset: 1,
+                },
+            ),
+            (
+                NodeId(2),
+                IndexSourceCursor {
+                    source: source_id(2),
+                    next_offset: 1,
+                },
+            ),
+        ]),
+    };
+    let target = IndexBarrier {
+        sources: BTreeMap::from([
+            (
+                NodeId(1),
+                IndexSourceCursor {
+                    source: source_id(1),
+                    next_offset: 3,
+                },
+            ),
+            (
+                NodeId(2),
+                IndexSourceCursor {
+                    source: source_id(2),
+                    next_offset: 1,
+                },
+            ),
+        ]),
+        ..from.clone()
+    };
+    let one_entry_bytes = encoded_len(&change(1, 1)).unwrap();
+    let byte_threshold = NonZeroU64::new(one_entry_bytes + 1).unwrap();
+    let measured = journal(vec![placement(clear)], &sources)
+        .measure_routed_lag(
+            1,
+            2,
+            &from,
+            &target,
+            NonZeroU64::new(10).unwrap(),
+            byte_threshold,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(measured.entries, 2);
+    assert_eq!(measured.encoded_bytes, one_entry_bytes * 2);
+    assert!(measured.byte_threshold_reached(byte_threshold));
+    assert_eq!(measured.through.sources[&NodeId(1)].next_offset, 2);
+}
+
+#[tokio::test]
+async fn routed_lag_measurement_completes_a_suffix_below_both_thresholds() {
+    let clear = AtomicProgramWatermark::new(None, None, 0);
+    let sources = MemorySources::default();
+    sources
+        .journals
+        .lock()
+        .unwrap()
+        .insert(NodeId(1), (status(1, 2), vec![change(1, 1), change(1, 2)]));
+    sources
+        .journals
+        .lock()
+        .unwrap()
+        .insert(NodeId(2), (status(2, 0), Vec::new()));
+    let from = IndexBarrier {
+        fence: PlacementLogId { term: 3, index: 7 },
+        atomic: clear,
+        sources: BTreeMap::from([
+            (
+                NodeId(1),
+                IndexSourceCursor {
+                    source: source_id(1),
+                    next_offset: 1,
+                },
+            ),
+            (
+                NodeId(2),
+                IndexSourceCursor {
+                    source: source_id(2),
+                    next_offset: 1,
+                },
+            ),
+        ]),
+    };
+    let target = IndexBarrier {
+        sources: BTreeMap::from([
+            (
+                NodeId(1),
+                IndexSourceCursor {
+                    source: source_id(1),
+                    next_offset: 3,
+                },
+            ),
+            (
+                NodeId(2),
+                IndexSourceCursor {
+                    source: source_id(2),
+                    next_offset: 1,
+                },
+            ),
+        ]),
+        ..from.clone()
+    };
+    let measured = journal(vec![placement(clear)], &sources)
+        .measure_routed_lag(
+            1,
+            2,
+            &from,
+            &target,
+            NonZeroU64::new(3).unwrap(),
+            NonZeroU64::new(u64::MAX).unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(measured.entries, 2);
+    assert_eq!(measured.through, target);
 }
 
 #[tokio::test]

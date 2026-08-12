@@ -11,6 +11,9 @@ use tonic::Status;
 
 use crate::cluster_object_read::ClusterObjectReader;
 use crate::cluster_placement::ClusterPlacement;
+use crate::derived_consumer::{
+    DerivedBarrierEvidence, DerivedDefinitionIdentity, DerivedProgressReporter,
+};
 use crate::index_runtime::events::{
     IndexBarrier, IndexEventError, IndexEventJournal, IndexJournalPage, MAX_INDEX_EVENT_PAGE_BYTES,
 };
@@ -68,6 +71,7 @@ pub(crate) struct AccountingBuilderDependencies {
     pub(crate) scanner: ClusterIndexScanner,
     pub(crate) reader: ClusterObjectReader,
     pub(crate) publisher: AccountingPublisher,
+    pub(crate) derived_progress: DerivedProgressReporter,
 }
 
 async fn run_scheduler(
@@ -599,8 +603,17 @@ async fn recover_rollup(
         .capture_barrier()
         .await
         .map_err(event_status)?;
-    Ok(resume_rollup(definition, &rollup, &target)?
-        .map(|(snapshot, through)| (snapshot, through, target)))
+    let resumed = resume_rollup(definition, &rollup, &target)?;
+    if let Some((_, through)) = resumed.as_ref() {
+        dependencies
+            .derived_progress
+            .report(
+                derived_identity(definition),
+                DerivedBarrierEvidence::Published(through.clone()),
+            )
+            .await;
+    }
+    Ok(resumed.map(|(snapshot, through)| (snapshot, through, target)))
 }
 
 async fn open_baseline(
@@ -634,6 +647,13 @@ async fn open_baseline(
         .journal
         .barrier_from_snapshot_tails(stream.placement_fence(), expected_atomic, &tails)
         .map_err(event_status)?;
+    dependencies
+        .derived_progress
+        .report(
+            derived_identity(definition),
+            DerivedBarrierEvidence::ScopedSnapshot(through.clone()),
+        )
+        .await;
     Ok((stream, through))
 }
 
@@ -724,7 +744,24 @@ async fn publish_snapshot(
             command_id,
         )
         .await?;
+    dependencies
+        .derived_progress
+        .report(
+            derived_identity(definition),
+            DerivedBarrierEvidence::Published(barrier.clone()),
+        )
+        .await;
     Ok(())
+}
+
+fn derived_identity(definition: &LoadedAccountingDefinition) -> DerivedDefinitionIdentity {
+    DerivedDefinitionIdentity {
+        kind: DefinitionKind::Accounting,
+        tenant_id: definition.tenant_id,
+        bucket_id: definition.bucket_id,
+        definition_id: definition.stored.accounting_id,
+        object_version: definition.version,
+    }
 }
 
 async fn merge_traffic(

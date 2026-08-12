@@ -14,6 +14,9 @@ use tonic::Status;
 use crate::cluster_object_read::ClusterObjectReader;
 use crate::cluster_peer::ClusterPeerTransport;
 use crate::cluster_placement::ClusterPlacement;
+use crate::derived_consumer::{
+    DerivedCheckpointPublisher, DerivedConsumerRuntimeTask, DerivedEvidenceResolver,
+};
 use crate::index_runtime::coordination::load_assigned_definition_object;
 use crate::index_runtime::events::IndexEventJournal;
 use crate::index_runtime::placement::{IndexIdentity, IndexPlacement};
@@ -36,6 +39,7 @@ pub(crate) struct RunningAccountingRuntime {
     pub(crate) publisher: AccountingPublisher,
     assignments: tokio::task::JoinHandle<()>,
     manager: AccountingManagerTask,
+    derived_retention: DerivedConsumerRuntimeTask,
     traffic_task: Option<AccountingTrafficTask>,
 }
 
@@ -61,6 +65,7 @@ impl Drop for RunningAccountingRuntime {
     fn drop(&mut self) {
         self.assignments.abort();
         let _ = &self.manager;
+        let _ = &self.derived_retention;
         let _ = &self.traffic_task;
     }
 }
@@ -75,6 +80,7 @@ pub(crate) async fn start(
     event_journal: Arc<IndexEventJournal>,
     artifacts: IndexArtifactRouter,
     traffic_config: AccountingTrafficConfig,
+    derived_checkpoints: DerivedCheckpointPublisher,
 ) -> Result<RunningAccountingRuntime> {
     let catalog = AccountingCatalog::default();
     // Subscribe before the bounded initial assigned scan so a concurrent
@@ -91,6 +97,15 @@ pub(crate) async fn start(
     let source = store.local_watch_status()?.source_id;
     let traffic = AccountingTraffic::new(source, traffic_config);
     let publisher = AccountingPublisher::new(store.clone(), artifacts);
+    let (derived_progress, derived_retention) = DerivedConsumerRuntimeTask::start(
+        anvil_store::DerivedConsumerKind::Accounting,
+        local_node,
+        decisions.clone(),
+        store.clone(),
+        event_journal.clone(),
+        derived_checkpoints,
+        DerivedEvidenceResolver::accounting(local_node, decisions.clone(), reader.clone()),
+    );
     let manager = AccountingManagerTask::start(
         local_node,
         decisions,
@@ -101,6 +116,7 @@ pub(crate) async fn start(
             scanner,
             reader,
             publisher: publisher.clone(),
+            derived_progress,
         },
     );
     Ok(RunningAccountingRuntime {
@@ -108,6 +124,7 @@ pub(crate) async fn start(
         publisher,
         assignments,
         manager,
+        derived_retention,
         traffic_task: None,
     })
 }

@@ -29,13 +29,21 @@ use super::catalog::{CatalogDefinition, IndexCatalog};
 use super::events::MAX_INDEX_EVENT_PAGE_BYTES;
 use super::placement::{IndexIdentity, IndexPlacement};
 
+#[path = "coordination/assignment_recovery.rs"]
+mod assignment_recovery;
+#[path = "coordination/delivery_checkpoint.rs"]
+mod delivery_checkpoint;
 mod reconcile;
+use assignment_recovery::AssignmentInventoryRecovery;
+use delivery_checkpoint::{
+    DeliveryProgress, advance_assignment_checkpoints, commit_delivery_progress,
+    require_membership_assignment_baseline,
+};
 
 const DELIVERY_IDLE_INTERVAL: Duration = Duration::from_millis(100);
 const DELIVERY_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 const MEMBERSHIP_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const ASSIGNMENT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
-const ASSIGNMENT_REVISIT_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_DEFINITION_BYTES: u64 = 64 * 1024 * 1024;
 const LOCATOR_MERGE_SOURCE_PAGE: u32 = 64;
 
@@ -405,7 +413,7 @@ async fn definition_reference_is_live(
         .is_some_and(|current| !current.version.deleted && current.version.id == object_version))
 }
 
-async fn load_definition_object(
+pub(crate) async fn load_definition_object(
     reader: &ClusterObjectReader,
     tenant_id: u64,
     bucket_id: u64,
@@ -491,14 +499,6 @@ impl Drop for DefinitionCoordinationTask {
     }
 }
 
-#[derive(Default)]
-struct DeliveryProgress {
-    source: Option<SourceId>,
-    after_offset: u64,
-    fence: Option<PlacementLogId>,
-    destination_next: BTreeMap<NodeId, u64>,
-}
-
 async fn run_source_delivery(
     kind: DefinitionKind,
     local_node: NodeId,
@@ -555,11 +555,14 @@ async fn deliver_source_page(
             "local definition source is not ACTIVE",
         ));
     }
-    if progress.source != Some(status.source_id) || progress.fence != Some(placement.fence()) {
-        progress.source = Some(status.source_id);
-        progress.fence = Some(placement.fence());
-        progress.destination_next.clear();
-        progress.after_offset = initialize_delivery_epoch(
+    // Normal delivery must not create a current-fence assignment checkpoint
+    // before membership reconciliation has made that assignment inventory
+    // complete. The derived-retention runtime treats these checkpoints as its
+    // inventory barrier, so advancing early could release source history for a
+    // definition which has not reached its new rank-zero owner yet.
+    require_membership_assignment_baseline(kind, &placement, store).await?;
+    if progress.reset_required(status.source_id, placement.fence(), status.retention_floor) {
+        let after_offset = initialize_delivery_epoch(
             kind,
             local_node,
             decisions,
@@ -573,20 +576,16 @@ async fn deliver_source_page(
             status.settled_through,
         )
         .await?;
-    } else if progress.after_offset < status.retention_floor {
-        progress.destination_next.clear();
-        progress.after_offset = initialize_delivery_epoch(
+        commit_delivery_progress(
             kind,
             local_node,
             decisions,
+            &placement,
             store,
             peers,
-            cluster_peers,
-            reader,
-            &placement,
             status.source_id,
-            status.retention_floor,
-            status.settled_through,
+            after_offset,
+            progress,
         )
         .await?;
     }
@@ -615,7 +614,6 @@ async fn deliver_source_page(
         match result {
             Ok(page) => page,
             Err(error) if routed_failure_requires_reconciliation(&error) => {
-                progress.destination_next.clear();
                 let through = reconcile_delivery_epoch(
                     kind,
                     local_node,
@@ -628,7 +626,11 @@ async fn deliver_source_page(
                     source,
                 )
                 .await?;
-                progress.after_offset = through;
+                commit_delivery_progress(
+                    kind, local_node, decisions, &placement, store, peers, source, through,
+                    progress,
+                )
+                .await?;
                 return Ok(true);
             }
             Err(error) => return Err(Status::out_of_range(error.to_string())),
@@ -658,6 +660,20 @@ async fn deliver_source_page(
         )
         .await?;
     }
+    // A routed page proves every skipped source position irrelevant to this
+    // definition kind. Publish that proof to every ACTIVE derived consumer
+    // only after all assignment mutations in the page are durable there.
+    advance_assignment_checkpoints(
+        kind,
+        local_node,
+        &placement,
+        store,
+        peers,
+        source,
+        page.through_offset,
+        &mut progress.destination_next,
+    )
+    .await?;
     require_placement(decisions, placement.fence())?;
     persist_delivery_checkpoint(kind, store, source, page.through_offset, placement.fence())
         .await?;
@@ -702,10 +718,6 @@ async fn initialize_delivery_epoch(
         )
         .await;
     }
-    if plan.establish_checkpoint {
-        persist_delivery_checkpoint(kind, store, source, plan.resume_after, placement.fence())
-            .await?;
-    }
     require_placement(decisions, placement.fence())?;
     Ok(plan.resume_after)
 }
@@ -737,7 +749,6 @@ async fn reconcile_delivery_epoch(
         .get(&source.node_id)
         .copied()
         .ok_or_else(|| Status::data_loss("reconciliation omitted the local source"))?;
-    persist_delivery_checkpoint(kind, store, source, through, placement.fence()).await?;
     require_placement(decisions, placement.fence())?;
     Ok(through)
 }
@@ -786,7 +797,6 @@ fn delivery_checkpoint(
 struct SourceDeliveryStart {
     requires_inventory: bool,
     resume_after: u64,
-    establish_checkpoint: bool,
 }
 
 fn source_delivery_start(
@@ -824,7 +834,6 @@ fn source_delivery_start(
         } else {
             resume_after
         },
-        establish_checkpoint: matching.is_none() || requires_inventory,
     })
 }
 
@@ -1339,9 +1348,15 @@ async fn run_index_assignments(
     catalog: IndexCatalog,
 ) {
     let mut changes = store.subscribe_definition_assignment_changes();
-    let mut cursor: Option<DefinitionAssignmentCursor> = None;
-    let mut scan_at = tokio::time::Instant::now();
+    let mut recovery = Some(AssignmentInventoryRecovery::startup());
     loop {
+        let recovery_at = recovery.as_ref().map(|recovery| recovery.due);
+        let recovery_due = async move {
+            match recovery_at {
+                Some(due) => tokio::time::sleep_until(due).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
         tokio::select! {
             received = changes.recv() => match received {
                 Ok(mutations) => {
@@ -1359,42 +1374,40 @@ async fn run_index_assignments(
                             identity,
                         ).await {
                             tracing::warn!(definition.id = identity.2, %error, "assigned index refresh will retry");
-                            // The durable assignment walk is the retry queue.
-                            // Preserve its cursor so repeated exact-update
-                            // failures cannot starve later assignment pages.
-                            if cursor.is_none() {
-                                scan_at = tokio::time::Instant::now() + ASSIGNMENT_RETRY_INTERVAL;
-                            }
+                            recovery = Some(AssignmentInventoryRecovery::retry());
                         }
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    cursor = None;
-                    scan_at = tokio::time::Instant::now();
+                    recovery = Some(AssignmentInventoryRecovery::immediate());
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
             },
-            _ = tokio::time::sleep_until(scan_at) => {
+            _ = recovery_due => {
+                let cursor = recovery.as_ref().and_then(|recovery| recovery.cursor.as_ref());
                 match scan_index_assignment_page(
                     local_node,
                     &decisions,
                     &store,
                     &reader,
                     &catalog,
-                    cursor.as_ref(),
+                    cursor,
                 ).await {
-                    Ok(Some(next)) => {
-                        cursor = Some(next);
-                        scan_at = tokio::time::Instant::now();
-                        tokio::task::yield_now().await;
-                    }
-                    Ok(None) => {
-                        cursor = None;
-                        scan_at = tokio::time::Instant::now() + ASSIGNMENT_REVISIT_INTERVAL;
+                    Ok(next) => {
+                        // Normal source changes are delivered by the sparse
+                        // derived-consumer wake path. A completed inventory is
+                        // not revisited until a notification gap, membership
+                        // recovery, or retry explicitly requires it.
+                        let continued = next.is_some();
+                        recovery = AssignmentInventoryRecovery::after_page(next);
+                        if continued {
+                            tokio::task::yield_now().await;
+                        }
                     }
                     Err(error) => {
                         tracing::warn!(%error, "paged assigned index inventory will retry");
-                        scan_at = tokio::time::Instant::now() + ASSIGNMENT_RETRY_INTERVAL;
+                        let cursor = recovery.take().and_then(|recovery| recovery.cursor);
+                        recovery = Some(AssignmentInventoryRecovery::retry_from(cursor));
                     }
                 }
             }
@@ -1493,7 +1506,7 @@ async fn remove_stale_assignment(
         .map_err(internal_status)
 }
 
-async fn load_index_assignment(
+pub(crate) async fn load_index_assignment(
     local_node: NodeId,
     decisions: &DecisionRaft,
     reader: &ClusterObjectReader,
@@ -1577,7 +1590,7 @@ fn delivery_consumer_kind(kind: DefinitionKind) -> DefinitionConsumerKind {
     }
 }
 
-fn current_placement(decisions: &DecisionRaft) -> Result<ClusterPlacement, Status> {
+pub(crate) fn current_placement(decisions: &DecisionRaft) -> Result<ClusterPlacement, Status> {
     let state = decisions
         .state()
         .map_err(|_| Status::unavailable("applied cluster membership is unavailable"))?;
@@ -1617,7 +1630,7 @@ mod tests {
             tenant_id: 1,
             bucket_id: 2,
             definition_id: 3,
-            path: "_anvil/indexes/v2/definitions/one".into(),
+            path: "_anvil/indexes/v3/definitions/one".into(),
             object_version: VersionId(4),
             operation: DefinitionOperation::Upsert,
         };
@@ -1696,7 +1709,7 @@ mod tests {
             tenant_id: 1,
             bucket_id: 2,
             definition_id: 3,
-            path: "_anvil/indexes/v2/definitions/example".into(),
+            path: "_anvil/indexes/v3/definitions/example".into(),
             object_version: VersionId(4),
         });
         let error = select_replica_locator(
@@ -1706,7 +1719,7 @@ mod tests {
                 tenant_id: 1,
                 bucket_id: 2,
                 definition_id: 9,
-                path: "_anvil/indexes/v2/definitions/example".into(),
+                path: "_anvil/indexes/v3/definitions/example".into(),
                 object_version: VersionId(4),
             },
         )
@@ -1751,7 +1764,7 @@ mod tests {
             tenant_id: 2,
             bucket_id: 3,
             definition_id: 4,
-            definition_path: "_anvil/indexes/v2/definitions/example".into(),
+            definition_path: "_anvil/indexes/v3/definitions/example".into(),
             object_version: VersionId(5),
             observed_fence: fence,
             rank: 0,
@@ -1820,7 +1833,6 @@ mod tests {
             SourceDeliveryStart {
                 requires_inventory: false,
                 resume_after: 46,
-                establish_checkpoint: false,
             }
         );
     }
@@ -1838,7 +1850,6 @@ mod tests {
             SourceDeliveryStart {
                 requires_inventory: false,
                 resume_after: 0,
-                establish_checkpoint: true,
             }
         );
     }
@@ -1871,7 +1882,6 @@ mod tests {
                 SourceDeliveryStart {
                     requires_inventory: true,
                     resume_after: 40,
-                    establish_checkpoint: true,
                 }
             );
         }
@@ -1915,6 +1925,16 @@ mod tests {
             checkpoint.consumer_kind,
             DefinitionConsumerKind::IndexDelivery
         );
+    }
+
+    #[test]
+    fn completed_assignment_inventory_has_no_periodic_revisit() {
+        assert!(AssignmentInventoryRecovery::after_page(None).is_none());
+
+        let cursor = DefinitionAssignmentCursor::from_bytes(vec![1, b'A', 1]).unwrap();
+        let continued = AssignmentInventoryRecovery::after_page(Some(cursor.clone())).unwrap();
+        assert_eq!(continued.cursor, Some(cursor));
+        assert!(continued.due <= tokio::time::Instant::now());
     }
 
     #[tokio::test]
