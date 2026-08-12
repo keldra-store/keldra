@@ -7,19 +7,47 @@ use crate::{
     DefinitionMutationIntent, DefinitionOperation, DefinitionStateError, DefinitionTransition,
 };
 
+const MAX_EXPIRED_RECEIPTS_PRUNED_PER_PASS: usize = 1_024;
+const MAX_EXPIRED_RECEIPT_BYTES_PRUNED_PER_PASS: u64 = 4 * 1024 * 1024;
+
 #[derive(Clone, Copy)]
-struct DistributedEvaluationContext {
-    mutation: ObjectMutationContext,
-    source_id: SourceId,
-    source_journal_position: u64,
+pub(super) struct DistributedEvaluationContext {
+    pub(super) mutation: ObjectMutationContext,
+    pub(super) source_id: SourceId,
+    pub(super) source_journal_position: u64,
 }
 
-struct EvaluatedOperation {
-    receipt: MutationReceipt,
-    mutation: Option<ObjectMutation>,
-    reference_deltas: Vec<ReferenceDelta>,
-    accounting_transition: Option<AccountingHeadTransition>,
-    definition_transition: Option<DefinitionTransition>,
+pub(super) struct EvaluatedOperation {
+    pub(super) receipt: MutationReceipt,
+    pub(super) mutation: Option<ObjectMutation>,
+    pub(super) reference_deltas: Vec<ReferenceDelta>,
+    pub(super) accounting_transition: Option<AccountingHeadTransition>,
+    pub(super) definition_transition: Option<DefinitionTransition>,
+}
+
+fn is_mutation_capacity(error: &MutationError) -> bool {
+    mutation_capacity_kind(error).is_some()
+}
+
+fn mutation_capacity_kind(error: &MutationError) -> Option<&'static str> {
+    match error {
+        MutationError::ReceiptCapacity => Some("receipt"),
+        MutationError::SourceJournalCapacity => Some("source_journal"),
+        _ => None,
+    }
+}
+
+fn fail_unresolved_prepared(
+    results: &mut BTreeMap<usize, Result<MutationReceipt, MutationError>>,
+    prepared: &[(usize, PreparedOperation)],
+    error: MutationError,
+) {
+    for (index, _) in prepared {
+        let result = results.entry(*index).or_insert_with(|| Err(error.clone()));
+        if result.is_ok() || result.as_ref().is_err_and(is_mutation_capacity) {
+            *result = Err(error.clone());
+        }
+    }
 }
 
 impl Store {
@@ -55,7 +83,20 @@ impl Store {
         governance: ObjectMutationGovernance,
     ) -> Result<MutationReceipt, MutationError> {
         governance.validate()?;
-        self.bulk_write_inner(vec![operation], Some(governance), None)
+        self.bulk_write_inner(vec![operation], Some(governance), None, false)
+            .await
+            .pop()
+            .expect("one operation has one outcome")
+            .result
+    }
+
+    pub async fn mutate_with_governance_and_backpressure(
+        &self,
+        operation: BatchOperation,
+        governance: ObjectMutationGovernance,
+    ) -> Result<MutationReceipt, MutationError> {
+        governance.validate()?;
+        self.bulk_write_inner(vec![operation], Some(governance), None, true)
             .await
             .pop()
             .expect("one operation has one outcome")
@@ -72,7 +113,22 @@ impl Store {
     ) -> Result<MutationReceipt, MutationError> {
         governance.validate()?;
         intent.validate().map_err(definition_mutation_error)?;
-        self.bulk_write_inner(vec![operation], Some(governance), Some(intent))
+        self.bulk_write_inner(vec![operation], Some(governance), Some(intent), false)
+            .await
+            .pop()
+            .expect("one operation has one outcome")
+            .result
+    }
+
+    pub async fn mutate_definition_with_governance_and_backpressure(
+        &self,
+        operation: BatchOperation,
+        governance: ObjectMutationGovernance,
+        intent: DefinitionMutationIntent,
+    ) -> Result<MutationReceipt, MutationError> {
+        governance.validate()?;
+        intent.validate().map_err(definition_mutation_error)?;
+        self.bulk_write_inner(vec![operation], Some(governance), Some(intent), true)
             .await
             .pop()
             .expect("one operation has one outcome")
@@ -83,7 +139,18 @@ impl Store {
     /// successful outcomes with one physical RocksDB write. A failed
     /// precondition is an item result, not a reason to retry the whole bulk.
     pub async fn bulk_write(&self, operations: Vec<BatchOperation>) -> Vec<BatchOutcome> {
-        self.bulk_write_inner(operations, None, None).await
+        self.bulk_write_inner(operations, None, None, false).await
+    }
+
+    /// Applies one public/internal coordinator batch with capacity
+    /// backpressure. The original prepared payloads remain owned by this call
+    /// while source-journal or receipt capacity catches up, so retrying does
+    /// not clone request bytes and command IDs retain their replay contract.
+    pub async fn bulk_write_with_backpressure(
+        &self,
+        operations: Vec<BatchOperation>,
+    ) -> Vec<BatchOutcome> {
+        self.bulk_write_inner(operations, None, None, true).await
     }
 
     async fn bulk_write_inner(
@@ -91,6 +158,7 @@ impl Store {
         operations: Vec<BatchOperation>,
         governance: Option<ObjectMutationGovernance>,
         definition_intent: Option<DefinitionMutationIntent>,
+        backpressure: bool,
     ) -> Vec<BatchOutcome> {
         if definition_intent.is_some() && operations.len() != 1 {
             return operations
@@ -104,7 +172,7 @@ impl Store {
                 })
                 .collect();
         }
-        let _policy_guard = self.policy_gate.read().await;
+        let prepare_started = std::time::Instant::now();
         let mut prepared = Vec::with_capacity(operations.len());
         let mut early = BTreeMap::new();
         let mut identity_cache =
@@ -146,153 +214,225 @@ impl Store {
                 }
             }
         }
+        let prepare_duration = prepare_started.elapsed();
+        tracing::info!(
+            histogram.anvil_store_bulk_prepare_duration_seconds = prepare_duration.as_secs_f64(),
+            operation_count = prepared.len(),
+            "object storage bulk preparation completed"
+        );
+        let mut completed = BTreeMap::<usize, Result<MutationReceipt, MutationError>>::new();
 
-        let _guards = self
-            .ordinary_locks
-            .acquire(
-                &prepared
-                    .iter()
-                    .map(|(_, operation)| object_path(operation.key()))
-                    .collect::<Vec<_>>(),
-            )
-            .await;
-        let _commit_guard = self.commit_lock.lock().await;
-        let mut batch = WriteBatch::default();
-        let now = match now_unix_millis() {
-            Ok(now) => now,
-            Err(error) => {
-                return fail_prepared_operations(early, prepared, error);
-            }
-        };
-        let mut receipt_status = match self.mutation_receipt_status() {
-            Ok(status) => status,
-            Err(error) => {
-                return fail_prepared_operations(early, prepared, error);
-            }
-        };
-        let initial_receipt_status = receipt_status;
-        let pruned_receipts =
-            match self.stage_expired_mutation_receipts(&mut batch, now, &mut receipt_status) {
-                Ok(pruned) => pruned,
-                Err(error) => {
-                    return fail_prepared_operations(early, prepared, error);
-                }
-            };
-        let mut pending_heads = BTreeMap::<Vec<u8>, Head>::new();
-        let mut pending_versions = BTreeMap::<Vec<u8>, Version>::new();
-        let mut pending_receipts = BTreeMap::<Vec<u8>, StoredReceipt>::new();
-        let mut pending_blob_references = PendingBlobReferences::new();
-        let mut pending_small_blobs = BTreeSet::<Vec<u8>>::new();
-        let mut policy_cache = BTreeMap::<Vec<u8>, Result<BucketPolicy, MutationError>>::new();
-        let mut versioning_cache =
-            BTreeMap::<Vec<u8>, Result<ObjectVersioning, MutationError>>::new();
-        if let Some(governance) = governance {
-            let identity = BucketIdentity {
-                tenant_id: TenantId(governance.tenant_id),
-                bucket_id: BucketId(governance.bucket_id),
-            }
-            .encode()
-            .to_vec();
-            policy_cache.insert(identity.clone(), Ok(governance.policy));
-            versioning_cache.insert(identity, Ok(governance.versioning));
-        }
-        let mut results = BTreeMap::<usize, Result<MutationReceipt, MutationError>>::new();
-        let mut batch_high_watermark = None;
-        let mut pending_changes = Vec::new();
-        for (index, operation) in prepared {
-            let outcome = self
-                .evaluate_operation(
-                    &operation,
-                    &mut batch,
-                    &mut pending_heads,
-                    &mut pending_versions,
-                    &mut pending_receipts,
-                    &mut pending_blob_references,
-                    &mut pending_small_blobs,
-                    &mut policy_cache,
-                    &mut versioning_cache,
-                    &pruned_receipts,
-                    &mut receipt_status,
-                    now,
-                    None,
-                    definition_intent,
+        loop {
+            let _policy_guard = self.policy_gate.read().await;
+            let lock_started = std::time::Instant::now();
+            let _guards = self
+                .ordinary_locks
+                .acquire(
+                    &prepared
+                        .iter()
+                        .map(|(_, operation)| object_path(operation.key()))
+                        .collect::<Vec<_>>(),
                 )
                 .await;
-            if let Ok(evaluated) = &outcome
-                && !evaluated.receipt.replayed
-            {
-                batch_high_watermark = Some(
-                    batch_high_watermark.map_or(evaluated.receipt.version, |current: VersionId| {
-                        current.max(evaluated.receipt.version)
-                    }),
-                );
-                pending_changes.push(PendingLocalChange::ObjectHead {
-                    identity: operation.identity(),
-                    exact_path: operation.key().path().to_owned(),
-                    path_version: evaluated.receipt.version,
-                    deleted: evaluated.receipt.deleted,
-                    reference_deltas: evaluated.reference_deltas.clone(),
-                    accounting_transition: evaluated.accounting_transition,
-                    definition_transition: evaluated.definition_transition.clone(),
-                });
+            let _commit_guard = self.commit_lock.lock().await;
+            let lock_duration = lock_started.elapsed();
+            let mut batch = WriteBatch::default();
+            let now = match now_unix_millis() {
+                Ok(now) => now,
+                Err(error) => {
+                    return fail_prepared_operations(completed, early, prepared, error);
+                }
+            };
+            let mut receipt_status = match self.mutation_receipt_status() {
+                Ok(status) => status,
+                Err(error) => {
+                    return fail_prepared_operations(completed, early, prepared, error);
+                }
+            };
+            let initial_receipt_status = receipt_status;
+            let pruned_receipts =
+                match self.stage_expired_mutation_receipts(&mut batch, now, &mut receipt_status) {
+                    Ok(pruned) => pruned,
+                    Err(error) => {
+                        return fail_prepared_operations(completed, early, prepared, error);
+                    }
+                };
+            let mut pending_heads = BTreeMap::<Vec<u8>, Head>::new();
+            let mut pending_versions = BTreeMap::<Vec<u8>, Version>::new();
+            let mut pending_receipts = BTreeMap::<Vec<u8>, StoredReceipt>::new();
+            let mut pending_blob_references = PendingBlobReferences::new();
+            let mut pending_small_blobs = BTreeSet::<Vec<u8>>::new();
+            let mut policy_cache = BTreeMap::<Vec<u8>, Result<BucketPolicy, MutationError>>::new();
+            let mut versioning_cache =
+                BTreeMap::<Vec<u8>, Result<ObjectVersioning, MutationError>>::new();
+            if let Some(governance) = governance.as_ref() {
+                let identity = BucketIdentity {
+                    tenant_id: TenantId(governance.tenant_id),
+                    bucket_id: BucketId(governance.bucket_id),
+                }
+                .encode()
+                .to_vec();
+                policy_cache.insert(identity.clone(), Ok(governance.policy.clone()));
+                versioning_cache.insert(identity, Ok(governance.versioning));
             }
-            results.insert(index, outcome.map(|evaluated| evaluated.receipt));
-        }
+            let mut results = BTreeMap::<usize, Result<MutationReceipt, MutationError>>::new();
+            let mut batch_high_watermark = None;
+            let mut pending_changes = Vec::new();
+            let mut receipt_capacity_at = None;
+            let evaluate_started = std::time::Instant::now();
+            for (prepared_index, (index, operation)) in prepared.iter().enumerate() {
+                let outcome = self
+                    .evaluate_operation(
+                        &operation,
+                        &mut batch,
+                        &mut pending_heads,
+                        &mut pending_versions,
+                        &mut pending_receipts,
+                        &mut pending_blob_references,
+                        &mut pending_small_blobs,
+                        &mut policy_cache,
+                        &mut versioning_cache,
+                        &pruned_receipts,
+                        &mut receipt_status,
+                        now,
+                        None,
+                        definition_intent,
+                    )
+                    .await;
+                if backpressure
+                    && outcome
+                        .as_ref()
+                        .is_err_and(|error| matches!(error, MutationError::ReceiptCapacity))
+                {
+                    results.insert(*index, outcome.map(|evaluated| evaluated.receipt));
+                    receipt_capacity_at = Some(prepared_index);
+                    break;
+                }
+                if let Ok(evaluated) = &outcome
+                    && !evaluated.receipt.replayed
+                {
+                    batch_high_watermark = Some(
+                        batch_high_watermark
+                            .map_or(evaluated.receipt.version, |current: VersionId| {
+                                current.max(evaluated.receipt.version)
+                            }),
+                    );
+                    pending_changes.push(PendingLocalChange::ObjectHead {
+                        identity: operation.identity(),
+                        exact_path: operation.key().path().to_owned(),
+                        path_version: evaluated.receipt.version,
+                        deleted: evaluated.receipt.deleted,
+                        reference_deltas: evaluated.reference_deltas.clone(),
+                        accounting_transition: evaluated.accounting_transition,
+                        definition_transition: evaluated.definition_transition.clone(),
+                    });
+                }
+                results.insert(*index, outcome.map(|evaluated| evaluated.receipt));
+            }
+            let evaluate_duration = evaluate_started.elapsed();
 
-        let persistence = (|| {
-            if receipt_status != initial_receipt_status {
-                self.stage_mutation_receipt_status(&mut batch, receipt_status)?;
-            }
-            self.stage_local_changes(
-                &mut batch,
-                &pending_changes,
-                LocalReferenceEffects::AppliedInline,
-            )?;
-            if let Some(high_watermark) = batch_high_watermark {
-                batch.put_cf(
-                    self.cf(CF_METADATA)?,
-                    VERSION_HIGH_WATERMARK_KEY,
-                    serde_json::to_vec(&high_watermark).map_err(storage_error)?,
-                );
-            }
-            if batch.is_empty() {
-                return Ok(());
-            }
-            let mut options = WriteOptions::default();
-            options.set_sync(self.sync_writes);
-            self.db.write_opt(batch, &options).map_err(storage_error)
-        })();
-        match persistence {
-            Ok(()) => {
-                if !pending_changes.is_empty() {
-                    if let Err(error) = self.settle_inline_source_changes() {
-                        for result in results.values_mut() {
-                            if result.is_ok() {
-                                *result = Err(error.clone());
-                            }
+            let persistence_started = std::time::Instant::now();
+            let persistence = (|| {
+                if receipt_status != initial_receipt_status {
+                    self.stage_mutation_receipt_status(&mut batch, receipt_status)?;
+                }
+                self.stage_local_changes(
+                    &mut batch,
+                    &pending_changes,
+                    LocalReferenceEffects::AppliedInline,
+                )?;
+                if let Some(high_watermark) = batch_high_watermark {
+                    batch.put_cf(
+                        self.cf(CF_METADATA)?,
+                        VERSION_HIGH_WATERMARK_KEY,
+                        serde_json::to_vec(&high_watermark).map_err(storage_error)?,
+                    );
+                }
+                if batch.is_empty() {
+                    return Ok(());
+                }
+                let mut options = WriteOptions::default();
+                options.set_sync(self.sync_writes);
+                self.db.write_opt(batch, &options).map_err(storage_error)
+            })();
+            let persistence_duration = persistence_started.elapsed();
+            tracing::info!(
+                histogram.anvil_store_bulk_lock_duration_seconds = lock_duration.as_secs_f64(),
+                histogram.anvil_store_bulk_evaluate_duration_seconds =
+                    evaluate_duration.as_secs_f64(),
+                histogram.anvil_store_bulk_persist_duration_seconds =
+                    persistence_duration.as_secs_f64(),
+                operation_count = prepared.len(),
+                "object storage bulk phases completed"
+            );
+            match persistence {
+                Ok(()) => {
+                    if !pruned_receipts.is_empty() {
+                        self.mutation_capacity_notify.notify_waiters();
+                    }
+                    if !pending_changes.is_empty() {
+                        if let Err(error) = self.settle_inline_source_changes() {
+                            fail_unresolved_prepared(&mut results, &prepared, error);
+                            completed.extend(results);
+                            return completed
+                                .into_iter()
+                                .chain(early.into_iter().map(|(index, error)| (index, Err(error))))
+                                .map(|(index, result)| BatchOutcome { index, result })
+                                .collect();
                         }
-                        return results
-                            .into_iter()
-                            .chain(early.into_iter().map(|(index, error)| (index, Err(error))))
-                            .map(|(index, result)| BatchOutcome { index, result })
-                            .collect();
-                    }
-                    self.notify_local_invalidations();
-                }
-            }
-            Err(error) => {
-                for result in results.values_mut() {
-                    if result.is_ok() {
-                        *result = Err(error.clone());
+                        self.notify_local_invalidations();
                     }
                 }
+                Err(error) if backpressure && is_mutation_capacity(&error) => {
+                    let capacity =
+                        mutation_capacity_kind(&error).expect("capacity error was matched");
+                    drop(_commit_guard);
+                    drop(_guards);
+                    drop(_policy_guard);
+                    self.wait_for_capacity_with_metrics(capacity).await;
+                    continue;
+                }
+                Err(error) => {
+                    fail_unresolved_prepared(&mut results, &prepared, error);
+                    completed.extend(results);
+                    completed.extend(early.into_iter().map(|(index, error)| (index, Err(error))));
+                    return completed
+                        .into_iter()
+                        .map(|(index, result)| BatchOutcome { index, result })
+                        .collect();
+                }
             }
+            if backpressure && let Some(retry_from) = receipt_capacity_at {
+                let retry = prepared.split_off(retry_from);
+                let capacity_index = retry
+                    .first()
+                    .map(|(index, _)| *index)
+                    .expect("receipt-capacity retry retains its first operation");
+                for (index, result) in results {
+                    if index != capacity_index {
+                        completed.insert(index, result);
+                    }
+                }
+                prepared = retry;
+                drop(_commit_guard);
+                drop(_guards);
+                drop(_policy_guard);
+                self.wait_for_capacity_with_metrics("receipt").await;
+                continue;
+            }
+            completed.extend(results);
+            completed.extend(early.into_iter().map(|(index, error)| (index, Err(error))));
+            return completed
+                .into_iter()
+                .map(|(index, result)| BatchOutcome { index, result })
+                .collect();
         }
-        results.extend(early.into_iter().map(|(index, error)| (index, Err(error))));
-        results
-            .into_iter()
-            .map(|(index, result)| BatchOutcome { index, result })
-            .collect()
+    }
+
+    async fn wait_for_capacity_with_metrics(&self, capacity: &'static str) {
+        let wait = super::MutationBackpressureWait::start(capacity);
+        self.wait_for_mutation_capacity().await;
+        wait.complete();
     }
 
     /// Evaluates and durably applies one exact-path mutation on its current
@@ -447,7 +587,7 @@ impl Store {
             .await
     }
 
-    fn prepare_verified_distributed_publish(
+    pub(super) fn prepare_verified_distributed_publish(
         &self,
         request: PublishRequest,
         identity: BucketIdentity,
@@ -560,6 +700,9 @@ impl Store {
             let mut options = WriteOptions::default();
             options.set_sync(self.sync_writes);
             self.db.write_opt(batch, &options).map_err(storage_error)?;
+        }
+        if !pruned_receipts.is_empty() {
+            self.mutation_capacity_notify.notify_waiters();
         }
         if created {
             self.notify_local_invalidations();
@@ -771,6 +914,9 @@ impl Store {
         let mut options = WriteOptions::default();
         options.set_sync(self.sync_writes);
         self.db.write_opt(batch, &options).map_err(storage_error)?;
+        if !pruned.is_empty() {
+            self.mutation_capacity_notify.notify_waiters();
+        }
         self.clock.observe(mutation.version.id);
         Ok(ReplicaObjectMutationApplied {
             version: mutation.version.id,
@@ -829,14 +975,15 @@ impl Store {
             }
             LocalReferenceEffects::Deferred => None,
         };
-        let safe_through = self
+        let reference_safe_through = self
             .source_journal_reference_safe_through
             .load(std::sync::atomic::Ordering::Acquire);
-        let first_old_key = invalidation_key(status.retention_floor.saturating_add(1));
-        let mut old_entries = self.db.iterator_cf(
-            journal,
-            IteratorMode::From(&first_old_key, Direction::Forward),
-        );
+        let (index_safe_through, accounting_safe_through) = self
+            .derived_consumer_safe_through(status)
+            .map_err(|error| MutationError::Storage(error.to_string()))?;
+        let safe_through = reference_safe_through
+            .min(index_safe_through)
+            .min(accounting_safe_through);
         let mut appended = VecDeque::new();
         for pending in changes {
             status.tail = status.tail.checked_add(1).ok_or_else(|| {
@@ -901,19 +1048,36 @@ impl Store {
                 ),
             };
             let encoded = encode_local_change(&change).map_err(storage_error)?;
+            let logical_bytes = invalidation_record_bytes(encoded.len())
+                .saturating_add(super::journal_routes::journal_route_logical_bytes(&change));
+            if logical_bytes > self.watch_retention.max_bytes {
+                return Err(MutationError::SourceJournalRecordTooLarge {
+                    bytes: logical_bytes,
+                    maximum: self.watch_retention.max_bytes,
+                });
+            }
             self.stage_journal_routes(batch, status.source_id.source_epoch, &change)?;
             status.retained_entries = status.retained_entries.checked_add(1).ok_or_else(|| {
                 MutationError::Storage("local invalidation entry count is exhausted".into())
             })?;
             status.retained_bytes = status
                 .retained_bytes
-                .checked_add(invalidation_record_bytes(encoded.len()))
+                .checked_add(logical_bytes)
                 .ok_or_else(|| {
                     MutationError::Storage("local invalidation byte count is exhausted".into())
                 })?;
             appended.push_back((status.tail, encoded));
         }
 
+        let exceeds_retention = status.retained_entries > self.watch_retention.max_entries
+            || status.retained_bytes > self.watch_retention.max_bytes;
+        let first_old_key = invalidation_key(status.retention_floor.saturating_add(1));
+        let mut old_entries = exceeds_retention.then(|| {
+            self.db.iterator_cf(
+                journal,
+                IteratorMode::From(&first_old_key, Direction::Forward),
+            )
+        });
         while status.retained_entries > self.watch_retention.max_entries
             || status.retained_bytes > self.watch_retention.max_bytes
         {
@@ -924,6 +1088,8 @@ impl Store {
                 return Err(MutationError::SourceJournalCapacity);
             }
             let (stored_key, encoded) = old_entries
+                .as_mut()
+                .expect("retention iterator exists while the journal is over capacity")
                 .next()
                 .ok_or_else(|| {
                     MutationError::Storage(format!(
@@ -948,7 +1114,9 @@ impl Store {
             status.retained_entries -= 1;
             status.retained_bytes = status
                 .retained_bytes
-                .checked_sub(invalidation_record_bytes(encoded.len()))
+                .checked_sub(invalidation_record_bytes(encoded.len()).saturating_add(
+                    super::journal_routes::journal_route_logical_bytes(&pruned_change),
+                ))
                 .ok_or_else(|| {
                     MutationError::Storage(
                         "local invalidation byte accounting is inconsistent".into(),
@@ -1011,10 +1179,16 @@ impl Store {
             return Ok(());
         }
         let mut batch = WriteBatch::default();
-        let safe_through = self
+        let reference_safe_through = self
             .source_journal_reference_safe_through
             .load(std::sync::atomic::Ordering::Acquire)
             .min(status.settled_through);
+        let (index_safe_through, accounting_safe_through) = self
+            .derived_consumer_safe_through(status)
+            .map_err(|error| WatchError::Storage(error.to_string()))?;
+        let safe_through = reference_safe_through
+            .min(index_safe_through)
+            .min(accounting_safe_through);
         while (status.retained_entries > self.watch_retention.max_entries
             || status.retained_bytes > self.watch_retention.max_bytes)
             && status.retention_floor < safe_through
@@ -1050,7 +1224,9 @@ impl Store {
             status.retained_entries -= 1;
             status.retained_bytes = status
                 .retained_bytes
-                .checked_sub(invalidation_record_bytes(encoded.len()))
+                .checked_sub(invalidation_record_bytes(encoded.len()).saturating_add(
+                    super::journal_routes::journal_route_logical_bytes(&pruned_change),
+                ))
                 .ok_or_else(|| {
                     WatchError::Storage("local invalidation byte accounting is inconsistent".into())
                 })?;
@@ -1165,8 +1341,12 @@ impl Store {
         now_unix_millis: u64,
         status: &mut MutationReceiptStatus,
     ) -> Result<BTreeSet<Vec<u8>>, MutationError> {
+        if status.entries == 0 {
+            return Ok(BTreeSet::new());
+        }
         let receipts = self.cf(CF_RECEIPTS)?;
         let mut pruned = BTreeSet::new();
+        let mut pruned_bytes = 0_u64;
         let iterator = self.db.iterator_cf(
             receipts,
             IteratorMode::From(
@@ -1205,6 +1385,13 @@ impl Store {
             }
             let logical_bytes =
                 mutation_receipt_logical_bytes(primary_key.len(), encoded.len(), index_key.len());
+            if pruned.len() >= MAX_EXPIRED_RECEIPTS_PRUNED_PER_PASS
+                || (!pruned.is_empty()
+                    && pruned_bytes.saturating_add(logical_bytes)
+                        > MAX_EXPIRED_RECEIPT_BYTES_PRUNED_PER_PASS)
+            {
+                break;
+            }
             status.entries = status.entries.checked_sub(1).ok_or_else(|| {
                 MutationError::Storage("mutation receipt count is inconsistent".into())
             })?;
@@ -1214,8 +1401,33 @@ impl Store {
             batch.delete_cf(receipts, &primary_key);
             batch.delete_cf(receipts, &index_key);
             pruned.insert(primary_key);
+            pruned_bytes = pruned_bytes.saturating_add(logical_bytes);
         }
         Ok(pruned)
+    }
+
+    /// Persist one bounded receipt-expiry maintenance pass while a writer is
+    /// waiting for capacity. Keeping this separate from the rejected mutation
+    /// guarantees progress even when that mutation's WriteBatch must be
+    /// discarded atomically.
+    pub(super) async fn prune_expired_receipts_for_capacity(&self) -> Result<bool, MutationError> {
+        let _commit_guard = self.commit_lock.lock().await;
+        let now = now_unix_millis()?;
+        let mut status = self.mutation_receipt_status()?;
+        let initial = status;
+        let mut batch = WriteBatch::default();
+        let pruned = self.stage_expired_mutation_receipts(&mut batch, now, &mut status)?;
+        if pruned.is_empty() {
+            return Ok(false);
+        }
+        if status != initial {
+            self.stage_mutation_receipt_status(&mut batch, status)?;
+        }
+        let mut options = WriteOptions::default();
+        options.set_sync(self.sync_writes);
+        self.db.write_opt(batch, &options).map_err(storage_error)?;
+        self.mutation_capacity_notify.notify_waiters();
+        Ok(true)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1262,6 +1474,12 @@ impl Store {
         let expiry_key = receipt_expiry_key(stored.expires_at_unix_millis, &primary_key)?;
         let logical_bytes =
             mutation_receipt_logical_bytes(primary_key.len(), encoded.len(), expiry_key.len());
+        if logical_bytes > self.mutation_receipt_retention.max_bytes {
+            return Err(MutationError::ReceiptTooLarge {
+                bytes: logical_bytes,
+                maximum: self.mutation_receipt_retention.max_bytes,
+            });
+        }
         let next_entries = status
             .entries
             .checked_add(1)
@@ -1302,7 +1520,7 @@ impl Store {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn evaluate_operation(
+    pub(super) async fn evaluate_operation(
         &self,
         operation: &PreparedOperation,
         batch: &mut WriteBatch,
@@ -1452,10 +1670,6 @@ impl Store {
                     object_version: current.version,
                     operation: DefinitionOperation::Upsert,
                 });
-                if let Some(transition) = definition_transition.as_ref() {
-                    self.stage_definition_transition(batch, transition)
-                        .map_err(definition_mutation_error)?;
-                }
                 let expires_at = self.stage_mutation_receipt(
                     batch,
                     receipt_key,
@@ -1468,6 +1682,10 @@ impl Store {
                     receipt_status,
                     pending_receipts,
                 )?;
+                if let Some(transition) = definition_transition.as_ref() {
+                    self.stage_definition_transition(batch, transition)
+                        .map_err(definition_mutation_error)?;
+                }
                 return Ok(EvaluatedOperation {
                     receipt: MutationReceipt {
                         command_id: operation.command_id().map(str::to_owned),
@@ -1624,7 +1842,7 @@ impl Store {
         let small_blob_value = if apply_content_lifecycle {
             match operation {
                 PreparedOperation::Put { payload, .. } => match payload.small_bytes() {
-                    Some(bytes) => self.prepare_small_blob_value(
+                    Some(bytes) => self.prepare_hashed_small_blob_value(
                         payload.reference(),
                         bytes,
                         pending_small_blobs,

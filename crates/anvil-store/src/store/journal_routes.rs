@@ -1,6 +1,7 @@
 use rocksdb::{Direction, IteratorMode, WriteBatch};
 
 use super::{CF_JOURNAL_ROUTES, CF_LOCAL_INVALIDATIONS, Store};
+#[cfg(test)]
 use crate::definition_state::DefinitionKind;
 use crate::journal_route::{JournalRoute, RoutedJournalError, RoutedLocalChangePage};
 use crate::key::STORAGE_KEY_FORMAT_VERSION;
@@ -223,6 +224,16 @@ fn routes_for_change(change: &LocalChange) -> Vec<JournalRoute> {
         }],
         LocalChange::AggregateChanged(_) | LocalChange::ContentLifecycleChanged(_) => Vec::new(),
     }
+}
+
+pub(crate) fn journal_route_logical_bytes(change: &LocalChange) -> u64 {
+    routes_for_change(change)
+        .into_iter()
+        .map(|route| match route {
+            JournalRoute::Definition(_) => DEFINITION_ROUTE_KEY_BYTES as u64,
+            JournalRoute::Bucket { .. } => BUCKET_ROUTE_KEY_BYTES as u64,
+        })
+        .sum()
 }
 
 fn route_matches(route: JournalRoute, change: &LocalChange) -> bool {

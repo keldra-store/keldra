@@ -171,6 +171,60 @@ async fn exact_current_snapshot_never_decodes_retained_history() {
 }
 
 #[tokio::test]
+async fn exact_current_snapshot_batch_preserves_current_overwritten_deleted_and_request_order() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = Store::open(StoreOptions::new(temporary.path(), 1))
+        .await
+        .unwrap();
+    put_at(&store, "docs/current", b"current", "put-current", 1).await;
+    put_at(&store, "docs/overwritten", b"old", "put-old", 2).await;
+    put_at(&store, "docs/deleted", b"deleted", "put-deleted", 3).await;
+    put_at(&store, "docs/overwritten", b"new", "put-new", 4).await;
+    store
+        .coordinate_object_mutation(
+            BatchOperation::Delete(delete("docs/deleted", "delete-current")),
+            context(5),
+        )
+        .await
+        .unwrap();
+
+    let (tenant_id, bucket_id) = store.resolve_bucket_ids("tenant", "bucket").unwrap();
+    let paths = vec![
+        "docs/deleted".to_owned(),
+        "docs/current".to_owned(),
+        "docs/missing".to_owned(),
+        "docs/overwritten".to_owned(),
+        "docs/current".to_owned(),
+    ];
+    let snapshots = store
+        .export_current_object_snapshots(tenant_id, bucket_id, &paths)
+        .unwrap();
+
+    assert_eq!(snapshots.len(), paths.len());
+    let deleted = snapshots[0].as_ref().unwrap();
+    assert_eq!(deleted.exact_path, "docs/deleted");
+    assert!(deleted.head.deleted);
+    assert!(deleted.version.deleted);
+    assert!(deleted.version.blob.is_none());
+
+    let current = snapshots[1].as_ref().unwrap();
+    assert_eq!(current.exact_path, "docs/current");
+    assert_eq!(
+        current.version.blob.as_ref().unwrap().hash,
+        *blake3::hash(b"current").as_bytes()
+    );
+    assert!(snapshots[2].is_none());
+
+    let overwritten = snapshots[3].as_ref().unwrap();
+    assert_eq!(overwritten.exact_path, "docs/overwritten");
+    assert_eq!(
+        overwritten.version.blob.as_ref().unwrap().hash,
+        *blake3::hash(b"new").as_bytes()
+    );
+    assert_eq!(snapshots[4], snapshots[1]);
+}
+
+#[tokio::test]
 async fn ordinary_definition_guard_blocks_only_its_exact_path() {
     let temporary = tempfile::tempdir().unwrap();
     let store = Store::open(StoreOptions::new(temporary.path(), 1))
@@ -377,6 +431,82 @@ async fn snapshot_filter_runs_before_bounded_frames_are_emitted() {
     assert_eq!(frame.heads[0].exact_path, "docs/b");
     assert!(scan.next_frame().await.unwrap().is_none());
     assert_eq!(scan.heads_visited(), 2);
+}
+
+#[tokio::test]
+async fn enlarged_internal_snapshot_limit_remains_strictly_byte_bounded() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = Store::open(StoreOptions::new(temporary.path(), 1))
+        .await
+        .unwrap();
+    for index in 0..8 {
+        put_at(
+            &store,
+            &format!("docs/{index}"),
+            b"value",
+            &format!("put-{index}"),
+            index + 1,
+        )
+        .await;
+    }
+    let (tenant_id, bucket_id) = store.resolve_bucket_ids("tenant", "bucket").unwrap();
+    let max_bytes = (0..8)
+        .map(|index| {
+            let head = store
+                .export_current_object_snapshot(tenant_id, bucket_id, &format!("docs/{index}"))
+                .unwrap()
+                .unwrap();
+            encoded_record_bytes(&head).unwrap()
+        })
+        .max()
+        .unwrap();
+    let mut scan = store
+        .start_current_head_snapshot_scan(
+            tenant_id,
+            bucket_id,
+            "docs/",
+            crate::MAX_CURRENT_HEAD_SNAPSHOT_RECORDS,
+            max_bytes,
+            |_| true,
+        )
+        .await
+        .unwrap();
+    let mut count = 0;
+    while let Some(frame) = scan.next_frame().await.unwrap() {
+        let frame_bytes = frame.heads.iter().try_fold(0_u64, |total, head| {
+            total.checked_add(encoded_record_bytes(head).unwrap())
+        });
+        assert!(frame_bytes.unwrap() <= max_bytes);
+        count += frame.heads.len();
+    }
+    assert_eq!(count, 8);
+}
+
+#[test]
+fn internal_snapshot_record_cap_is_distinct_from_public_export_pages() {
+    let above_public = crate::MAX_OBJECT_RECORD_EXPORT_RECORDS + 1;
+    assert!(validate_scan_request(1, 2, "docs/", above_public, 1024).is_err());
+    assert!(validate_snapshot_scan_request(1, 2, "docs/", above_public, 1024).is_ok());
+    assert!(
+        validate_snapshot_scan_request(
+            1,
+            2,
+            "docs/",
+            crate::MAX_CURRENT_HEAD_SNAPSHOT_RECORDS + 1,
+            1024,
+        )
+        .is_err()
+    );
+    assert!(
+        validate_snapshot_scan_request(
+            1,
+            2,
+            "docs/",
+            1,
+            crate::store::object_snapshot_scan::MAX_CURRENT_HEAD_SNAPSHOT_BYTES + 1,
+        )
+        .is_err()
+    );
 }
 
 #[tokio::test]

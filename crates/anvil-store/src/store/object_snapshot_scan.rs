@@ -8,7 +8,10 @@ use rocksdb::{Direction, IteratorMode};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
-use super::{CF_HEADS, CF_METADATA, CF_VERSIONS};
+use super::{
+    CF_HEADS, CF_METADATA, CF_VERSIONS, MAX_OBJECT_RECORD_EXPORT_BYTES,
+    MAX_OBJECT_RECORD_EXPORT_RECORDS,
+};
 use crate::key::{BucketId, BucketIdentity, STORAGE_KEY_FORMAT_VERSION, TenantId};
 use crate::watch::{LOCAL_INVALIDATION_EPOCH_KEY, LOCAL_INVALIDATION_OFFSET_KEY};
 use crate::{
@@ -21,6 +24,12 @@ use super::object_snapshot::ObjectSnapshotError;
 const CURRENT_HEAD_CURSOR_FORMAT: u8 = 1;
 const CURRENT_HEAD_CURSOR_EXACT_PATH_DOMAIN: u8 = 0;
 const MAX_CURRENT_HEAD_CURSOR_KEY_BYTES: usize = 16 * 1024;
+/// Internal snapshot frames are byte-bounded first. This larger record cap
+/// avoids turning a 16 MiB frame of small descriptors into 1,000-record RPCs.
+pub const MAX_CURRENT_HEAD_SNAPSHOT_RECORDS: u32 = 65_536;
+/// Internal index snapshot frames remain strictly byte bounded even though
+/// their record cap is larger than the public listing page cap.
+pub const MAX_CURRENT_HEAD_SNAPSHOT_BYTES: u64 = 16 * 1024 * 1024;
 
 /// One current object head and its exact immutable version descriptor.
 ///
@@ -234,6 +243,103 @@ impl Store {
         .map(Some)
     }
 
+    /// Reads a bounded set of exact current heads and their immutable
+    /// descriptors from one RocksDB snapshot. Results preserve request order,
+    /// including duplicate and absent paths. Historical descriptors are never
+    /// read.
+    pub fn export_current_object_snapshots(
+        &self,
+        tenant_id: u64,
+        bucket_id: u64,
+        exact_paths: &[String],
+    ) -> Result<Vec<Option<CurrentObjectSnapshot>>, ObjectSnapshotError> {
+        require_nonzero(tenant_id, "tenant ID")?;
+        require_nonzero(bucket_id, "bucket ID")?;
+        if exact_paths.len() > MAX_OBJECT_RECORD_EXPORT_RECORDS as usize {
+            return Err(ObjectSnapshotError::InvalidExportLimit(format!(
+                "current-object snapshot batch records must be at most {MAX_OBJECT_RECORD_EXPORT_RECORDS}"
+            )));
+        }
+        if exact_paths.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let identity = stable_identity(tenant_id, bucket_id);
+        let mut head_keys = Vec::with_capacity(exact_paths.len());
+        for exact_path in exact_paths {
+            validate_exact_path(exact_path)?;
+            head_keys.push(identity.head_key(exact_path));
+        }
+
+        let snapshot = self.db.snapshot();
+        let heads_cf = self.cf(CF_HEADS).map_err(object_storage)?;
+        let versions_cf = self.cf(CF_VERSIONS).map_err(object_storage)?;
+        let encoded_heads = snapshot.multi_get_cf(
+            head_keys
+                .iter()
+                .map(|head_key| (heads_cf, head_key.as_slice())),
+        );
+        if encoded_heads.len() != exact_paths.len() {
+            return Err(object_storage(
+                "current-object head multi-get returned the wrong result count",
+            ));
+        }
+
+        let mut present = Vec::new();
+        for (index, encoded_head) in encoded_heads.into_iter().enumerate() {
+            let Some(encoded_head) = encoded_head.map_err(object_storage)? else {
+                continue;
+            };
+            let head: Head = serde_json::from_slice(&encoded_head).map_err(object_storage)?;
+            present.push((
+                index,
+                head.clone(),
+                exact_version_key(&head_keys[index], head.version),
+            ));
+        }
+
+        let encoded_versions = snapshot.multi_get_cf(
+            present
+                .iter()
+                .map(|(_, _, version_key)| (versions_cf, version_key.as_slice())),
+        );
+        if encoded_versions.len() != present.len() {
+            return Err(object_storage(
+                "current-object version multi-get returned the wrong result count",
+            ));
+        }
+
+        let mut results = vec![None; exact_paths.len()];
+        let mut encoded_bytes = 0_u64;
+        for ((index, head, _), encoded_version) in
+            present.into_iter().zip(encoded_versions.into_iter())
+        {
+            let encoded_version = encoded_version.map_err(object_storage)?.ok_or_else(|| {
+                object_storage("current head references a missing version descriptor")
+            })?;
+            let version: Version =
+                serde_json::from_slice(&encoded_version).map_err(object_storage)?;
+            let record = CurrentObjectSnapshot {
+                tenant_id,
+                bucket_id,
+                exact_path: exact_paths[index].clone(),
+                head,
+                version,
+            };
+            record.validate()?;
+            encoded_bytes = encoded_bytes
+                .checked_add(encoded_record_bytes(&record)?)
+                .ok_or_else(|| object_storage("current-object snapshot byte count overflow"))?;
+            if encoded_bytes > MAX_OBJECT_RECORD_EXPORT_BYTES {
+                return Err(ObjectSnapshotError::ExportRecordTooLarge {
+                    required_bytes: encoded_bytes,
+                });
+            }
+            results[index] = Some(record);
+        }
+        Ok(results)
+    }
+
     /// Reads one bounded, sorted page across all local current heads. This is
     /// reserved for accepted cold discovery when stable bucket IDs are not yet
     /// known; scoped consumers should always use the prefix form below.
@@ -387,7 +493,7 @@ impl Store {
     where
         F: Fn(&CurrentObjectSnapshot) -> bool + Send + Sync + 'static,
     {
-        validate_scan_request(tenant_id, bucket_id, path_prefix, max_records, max_bytes)?;
+        validate_snapshot_scan_request(tenant_id, bucket_id, path_prefix, max_records, max_bytes)?;
         let identity = stable_identity(tenant_id, bucket_id);
         let prefix = identity.head_key(path_prefix);
         let path_prefix = path_prefix.to_owned();
@@ -641,6 +747,29 @@ fn validate_scan_request(
     require_nonzero(bucket_id, "bucket ID")?;
     validate_path_prefix(path_prefix)?;
     super::object_snapshot::validate_limits(max_records, max_bytes)
+}
+
+fn validate_snapshot_scan_request(
+    tenant_id: u64,
+    bucket_id: u64,
+    path_prefix: &str,
+    max_records: u32,
+    max_bytes: u64,
+) -> Result<(), ObjectSnapshotError> {
+    require_nonzero(tenant_id, "tenant ID")?;
+    require_nonzero(bucket_id, "bucket ID")?;
+    validate_path_prefix(path_prefix)?;
+    if max_records == 0
+        || max_records > MAX_CURRENT_HEAD_SNAPSHOT_RECORDS
+        || max_bytes == 0
+        || max_bytes > MAX_CURRENT_HEAD_SNAPSHOT_BYTES
+    {
+        return Err(invalid_snapshot(format!(
+            "snapshot records must be 1..={MAX_CURRENT_HEAD_SNAPSHOT_RECORDS} and bytes must be 1..={}",
+            MAX_CURRENT_HEAD_SNAPSHOT_BYTES
+        )));
+    }
+    Ok(())
 }
 
 fn validate_path_prefix(prefix: &str) -> Result<(), ObjectSnapshotError> {

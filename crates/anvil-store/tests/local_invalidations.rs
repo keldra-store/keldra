@@ -371,13 +371,18 @@ async fn an_event_larger_than_the_journal_bound_rejects_the_whole_mutation() {
     seed_bucket_identity(&store);
     let scope = WatchScope::new("tenant", "bucket", "").unwrap();
     let before = store.start_watch(&scope, WatchStart::Now).unwrap();
-    assert_eq!(
-        store
-            .put(put("record", b"value", "record"))
-            .await
-            .unwrap_err(),
-        anvil_store::MutationError::SourceJournalCapacity
-    );
+    let outcomes = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        store.bulk_write_with_backpressure(vec![BatchOperation::Put(put(
+            "record", b"value", "record",
+        ))]),
+    )
+    .await
+    .expect("an individually oversized journal record must not wait for capacity");
+    assert!(matches!(
+        &outcomes[0].result,
+        Err(anvil_store::MutationError::SourceJournalRecordTooLarge { maximum: 1, .. })
+    ));
 
     let status = store.local_watch_status().unwrap();
     assert_eq!(status.tail, 0);
@@ -441,12 +446,10 @@ async fn safe_through_cursor_is_monotonic_bounded_and_reconstructed_fail_closed(
         .await
         .unwrap();
     assert_eq!(store.local_watch_status().unwrap().settled_through, 2);
-    assert!(
-        store
-            .advance_source_journal_reference_safe_through(0)
-            .await
-            .is_err()
-    );
+    store
+        .advance_source_journal_reference_safe_through(0)
+        .await
+        .unwrap();
     store.put(put("c", b"c", "c")).await.unwrap();
     assert_eq!(store.local_watch_status().unwrap().retention_floor, 1);
 
@@ -466,6 +469,55 @@ async fn safe_through_cursor_is_monotonic_bounded_and_reconstructed_fail_closed(
         .await
         .unwrap();
     reopened.put(put("d", b"d", "d")).await.unwrap();
+}
+
+#[tokio::test]
+async fn production_bulk_waits_for_source_journal_capacity_without_losing_the_write() {
+    let temporary = tempfile::tempdir().unwrap();
+    let initial = Store::open(
+        StoreOptions::new(temporary.path(), 1)
+            .with_watch_retention(WatchRetention::new(1, 1024 * 1024).unwrap()),
+    )
+    .await
+    .unwrap();
+    seed_bucket_identity(&initial);
+    initial
+        .put(put("first", b"one", "first-command"))
+        .await
+        .unwrap();
+    drop(initial);
+
+    let store = Store::open(
+        StoreOptions::new(temporary.path(), 1)
+            .with_watch_retention(WatchRetention::new(1, 1024 * 1024).unwrap()),
+    )
+    .await
+    .unwrap();
+    let waiting = {
+        let store = store.clone();
+        tokio::spawn(async move {
+            store
+                .bulk_write_with_backpressure(vec![anvil_store::BatchOperation::Put(put(
+                    "second",
+                    b"two",
+                    "second-command",
+                ))])
+                .await
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    assert!(!waiting.is_finished());
+
+    store
+        .advance_source_journal_reference_safe_through(1)
+        .await
+        .unwrap();
+    let outcomes = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+        .await
+        .expect("safe-through progress should release the blocked writer")
+        .unwrap();
+    assert!(outcomes[0].result.is_ok());
+    assert!(store.head(&key("second")).unwrap().is_some());
 }
 
 #[tokio::test]

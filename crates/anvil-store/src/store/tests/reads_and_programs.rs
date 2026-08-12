@@ -560,6 +560,58 @@ async fn local_cluster_listing_uses_stable_ids_and_excludes_non_owned_heads() {
 }
 
 #[tokio::test]
+async fn internal_index_definition_listing_accepts_only_format_three_paths() {
+    let (_temporary, store) = store().await;
+    let identity = store.resolve_bucket_identity("tenant", "bucket").unwrap();
+
+    let format_three = "_anvil/indexes/v3/definitions/search";
+    store
+        .put(put(
+            format_three,
+            b"definition",
+            Precondition::Absent,
+            "format-three",
+        ))
+        .await
+        .unwrap();
+
+    let page = store
+        .list_local_owned_index_definitions(
+            identity.tenant_id.0,
+            identity.bucket_id.0,
+            "_anvil/indexes/v3/definitions/",
+            None,
+            10,
+            |_, _, _| true,
+        )
+        .unwrap();
+    assert_eq!(page.paths, vec![format_three.to_owned()]);
+
+    assert!(matches!(
+        store.list_local_owned_index_definitions(
+            identity.tenant_id.0,
+            identity.bucket_id.0,
+            "_anvil/indexes/v2/definitions/",
+            None,
+            10,
+            |_, _, _| true,
+        ),
+        Err(MutationError::InvalidObjectMutation(_))
+    ));
+    assert!(matches!(
+        store.list_local_owned_index_definitions(
+            identity.tenant_id.0,
+            identity.bucket_id.0,
+            "_anvil/indexes/v3/definitions/",
+            Some("_anvil/indexes/v2/definitions/search"),
+            10,
+            |_, _, _| true,
+        ),
+        Err(MutationError::InvalidObjectMutation(_))
+    ));
+}
+
+#[tokio::test]
 async fn local_cluster_listing_has_no_total_result_cap_across_pages() {
     let (_temporary, store) = store().await;
     let identity = store.resolve_bucket_identity("tenant", "bucket").unwrap();

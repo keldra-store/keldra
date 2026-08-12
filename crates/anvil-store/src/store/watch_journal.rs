@@ -1,5 +1,7 @@
 use super::*;
 
+const MUTATION_CAPACITY_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
 impl Store {
     /// Advances the highest contiguous source offset known durable at every
     /// consumer that currently constrains reference delivery. The value is
@@ -17,9 +19,7 @@ impl Store {
             .source_journal_reference_safe_through
             .load(std::sync::atomic::Ordering::Acquire);
         if offset < current {
-            return Err(MutationError::Storage(format!(
-                "source journal safe-through cursor regressed from {current} to {offset}"
-            )));
+            return Ok(());
         }
         if offset > status.tail {
             return Err(MutationError::Storage(format!(
@@ -31,6 +31,7 @@ impl Store {
             .store(offset, std::sync::atomic::Ordering::Release);
         self.enforce_local_watch_retention()
             .map_err(|error| MutationError::Storage(error.to_string()))?;
+        self.mutation_capacity_notify.notify_waiters();
         self.notify_local_invalidations();
         Ok(())
     }
@@ -71,6 +72,7 @@ impl Store {
                 &options,
             )
             .map_err(storage_error)?;
+        self.mutation_capacity_notify.notify_waiters();
         self.notify_local_invalidations();
         Ok(())
     }
@@ -83,6 +85,22 @@ impl Store {
         source: SourceId,
         offset: u64,
     ) -> Result<bool, MutationError> {
+        self.settle_source_journal_positions_if_contiguous(source, &[offset])
+            .await
+            .map(|settled| settled.is_some())
+    }
+
+    /// Settle the longest quorum-proven contiguous prefix with one durable
+    /// metadata write. Callers may supply already-settled or out-of-order
+    /// positions; neither can advance across a missing proof.
+    pub async fn settle_source_journal_positions_if_contiguous(
+        &self,
+        source: SourceId,
+        offsets: &[u64],
+    ) -> Result<Option<u64>, MutationError> {
+        if offsets.is_empty() {
+            return Ok(None);
+        }
         let _commit_guard = self.commit_lock.lock().await;
         let status = self
             .local_watch_status()
@@ -93,20 +111,25 @@ impl Store {
                 status.source_id
             )));
         }
-        if offset > status.tail {
+        if offsets.iter().any(|offset| *offset > status.tail) {
             return Err(MutationError::Storage(format!(
-                "source journal settled cursor {offset} is beyond tail {}",
+                "source journal settled cursor is beyond tail {}",
                 status.tail
             )));
         }
-        if offset <= status.settled_through {
-            return Ok(false);
+        let proven = offsets.iter().copied().collect::<BTreeSet<_>>();
+        let mut through = status.settled_through;
+        loop {
+            let next = through.checked_add(1).ok_or_else(|| {
+                MutationError::Storage("source journal settled cursor overflowed".into())
+            })?;
+            if !proven.contains(&next) {
+                break;
+            }
+            through = next;
         }
-        let next = status.settled_through.checked_add(1).ok_or_else(|| {
-            MutationError::Storage("source journal settled cursor overflowed".into())
-        })?;
-        if offset != next {
-            return Ok(false);
+        if through == status.settled_through {
+            return Ok(None);
         }
 
         let mut options = WriteOptions::default();
@@ -115,12 +138,13 @@ impl Store {
             .put_cf_opt(
                 self.cf(CF_METADATA)?,
                 LOCAL_INVALIDATION_SETTLED_KEY,
-                offset.to_be_bytes(),
+                through.to_be_bytes(),
                 &options,
             )
             .map_err(storage_error)?;
+        self.mutation_capacity_notify.notify_waiters();
         self.notify_local_invalidations();
-        Ok(true)
+        Ok(Some(through))
     }
 
     /// Reconstructs the volatile reference-safe cut after a one-node mutation.
@@ -141,7 +165,26 @@ impl Store {
         }
         self.source_journal_reference_safe_through
             .store(status.tail, std::sync::atomic::Ordering::Release);
+        self.mutation_capacity_notify.notify_waiters();
         Ok(())
+    }
+
+    /// Waits without holding a storage lock until journal or receipt capacity
+    /// may have changed. Receipt expiry has no dedicated background task, so a
+    /// bounded timer ensures a blocked writer eventually retries and prunes it.
+    pub async fn wait_for_mutation_capacity(&self) {
+        match self.prune_expired_receipts_for_capacity().await {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(%error, "bounded mutation-capacity maintenance will retry");
+            }
+        }
+        let notified = self.mutation_capacity_notify.notified();
+        tokio::select! {
+            () = notified => {}
+            () = tokio::time::sleep(MUTATION_CAPACITY_RECHECK_INTERVAL) => {}
+        }
     }
 
     /// Waits without holding the commit lock until the proof-backed source cut

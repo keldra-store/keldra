@@ -45,6 +45,17 @@ async fn routed_pages_are_target_bounded_advance_empty_intervals_and_measure_pee
     assert_eq!(tenant_id, other_tenant_id);
     let status = store.local_watch_status().unwrap();
     assert_eq!(status.tail, 3);
+    let expected_logical_bytes = store
+        .scan_local_changes(0, 10)
+        .unwrap()
+        .iter()
+        .map(|change| {
+            let encoded = crate::watch::encode_local_change(change).unwrap();
+            crate::watch::invalidation_record_bytes(encoded.len())
+                + journal_route_logical_bytes(change)
+        })
+        .sum::<u64>();
+    assert_eq!(status.retained_bytes, expected_logical_bytes);
 
     // The matching route at offset three is immediately after this captured
     // target and must not leak into the page or its byte accounting.
@@ -155,7 +166,7 @@ async fn definition_mutations_commit_locator_and_both_sparse_routes() {
         versioning: ObjectVersioning::Unversioned,
         policy: BucketPolicy::default(),
     };
-    let path = "_anvil/indexes/v2/definitions/search";
+    let path = "_anvil/indexes/v3/definitions/search";
     let intent = DefinitionMutationIntent::new(DefinitionKind::Index, 41).unwrap();
     let created = store
         .mutate_definition_with_governance(

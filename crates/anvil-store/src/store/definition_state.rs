@@ -240,6 +240,13 @@ impl Store {
         consumer_kind: DefinitionConsumerKind,
         source_node_id: u16,
     ) -> Result<Option<DefinitionCheckpoint>, DefinitionStateError> {
+        // Assignment pages persist their cursor before publishing the matching
+        // process-local notification. Taking the same lock here ensures a
+        // caller which observes that cursor can subsequently drain every
+        // notification through it without a write/notify race.
+        let _guard = self.definition_state_lock.lock().map_err(|_| {
+            DefinitionStateError::Storage("definition-state lock is poisoned".into())
+        })?;
         let key = checkpoint_key(consumer_kind, source_node_id)?;
         self.db
             .get_cf(self.definition_state_cf()?, &key)

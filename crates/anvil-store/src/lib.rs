@@ -11,6 +11,7 @@ mod bootstrap;
 mod clock;
 mod credential_secret;
 mod definition_state;
+mod derived_consumer;
 mod erasure;
 mod journal_route;
 mod key;
@@ -60,6 +61,10 @@ pub use definition_state::{
     DefinitionOperation, DefinitionStateError, DefinitionTransition,
     MAX_DEFINITION_STATE_SCAN_RECORDS,
 };
+pub use derived_consumer::{
+    DerivedConsumerCheckpoint, DerivedConsumerError, DerivedConsumerKind, DerivedConsumerStatus,
+    MAX_DERIVED_CONSUMER_NODES, SourceJournalRuntimeMetrics,
+};
 pub use erasure::{
     DEFAULT_ERASURE_DATA_SHARDS, DEFAULT_ERASURE_PARITY_SHARDS, DEFAULT_ERASURE_STRIPE_UNIT_BYTES,
     ErasureCodec, ErasureError, ErasureProfile, FRAGMENT_FORMAT_VERSION,
@@ -103,7 +108,8 @@ pub use store::{
     CurrentObjectSnapshotFrame, CurrentObjectSnapshotPage, CurrentObjectSnapshotScan,
     DEFAULT_AWAITING_PUBLISH_TTL_SECONDS, DEFAULT_MUTATION_RECEIPT_MAX_BYTES,
     DEFAULT_MUTATION_RECEIPT_MAX_ENTRIES, DEFAULT_MUTATION_RECEIPT_RETENTION_SECONDS,
-    ListObjectsPage, LocalPayloadPresence, MAX_LIST_OBJECT_VERSIONS, MAX_LIST_OBJECTS,
+    ListObjectsPage, LocalPayloadPresence, MAX_CURRENT_HEAD_SNAPSHOT_BYTES,
+    MAX_CURRENT_HEAD_SNAPSHOT_RECORDS, MAX_LIST_OBJECT_VERSIONS, MAX_LIST_OBJECTS,
     MAX_OBJECT_RECORD_EXPORT_BYTES, MAX_OBJECT_RECORD_EXPORT_RECORDS,
     MAX_PAYLOAD_HANDOFF_EXPORT_RECORDS, MAX_REFERENCE_PROOF_EXPORT_BYTES,
     MAX_REFERENCE_PROOF_EXPORT_RECORDS, MAX_REFERENCE_PROOF_PRUNE_BYTES,

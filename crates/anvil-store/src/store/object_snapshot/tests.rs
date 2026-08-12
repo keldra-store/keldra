@@ -237,7 +237,7 @@ async fn definition_locator_survives_replica_replay_handoff_and_read_repair() {
         versioning: ObjectVersioning::Unversioned,
         policy: BucketPolicy::default(),
     };
-    let path = "_anvil/indexes/v2/definitions/search";
+    let path = "_anvil/indexes/v3/definitions/search";
     let intent = DefinitionMutationIntent::new(DefinitionKind::Index, 41).unwrap();
     let coordinated = source
         .coordinate_definition_object_mutation_with_governance(

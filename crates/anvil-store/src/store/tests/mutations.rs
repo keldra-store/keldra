@@ -53,6 +53,86 @@ async fn unexpired_receipts_backpressure_new_commands_but_never_their_replay() {
 }
 
 #[tokio::test]
+async fn production_bulk_waits_for_receipt_capacity_without_losing_the_write() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = Store::open(
+        StoreOptions::new(temporary.path(), 1).with_mutation_receipt_retention(
+            MutationReceiptRetention::new(1, 1, 1024 * 1024).unwrap(),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let waiting = {
+        let store = store.clone();
+        tokio::spawn(async move {
+            store
+                .bulk_write_with_backpressure(vec![
+                    BatchOperation::Put(put(
+                        "first",
+                        b"one",
+                        Precondition::Absent,
+                        "first-command",
+                    )),
+                    BatchOperation::Put(put(
+                        "second",
+                        b"two",
+                        Precondition::Absent,
+                        "second-command",
+                    )),
+                ])
+                .await
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while store.head(&key("first")).unwrap().is_none() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the independent first bulk item should commit before capacity clears");
+    assert!(!waiting.is_finished());
+    assert!(store.head(&key("first")).unwrap().is_some());
+    assert!(store.head(&key("second")).unwrap().is_none());
+
+    let outcomes = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+        .await
+        .expect("receipt expiry should release the blocked writer")
+        .unwrap();
+    assert_eq!(outcomes.len(), 2);
+    assert!(outcomes.iter().all(|outcome| outcome.result.is_ok()));
+    assert!(store.head(&key("second")).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn an_individually_oversized_receipt_fails_without_waiting_or_mutating() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = Store::open(
+        StoreOptions::new(temporary.path(), 1)
+            .with_mutation_receipt_retention(MutationReceiptRetention::new(60, 10, 1).unwrap()),
+    )
+    .await
+    .unwrap();
+    let outcomes = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        store.bulk_write_with_backpressure(vec![BatchOperation::Put(put(
+            "oversized",
+            b"value",
+            Precondition::Absent,
+            "oversized-command",
+        ))]),
+    )
+    .await
+    .expect("an individually oversized receipt must not wait for capacity");
+    assert!(matches!(
+        &outcomes[0].result,
+        Err(MutationError::ReceiptTooLarge { maximum: 1, .. })
+    ));
+    assert!(store.head(&key("oversized")).unwrap().is_none());
+    assert_eq!(store.local_watch_status().unwrap().tail, 0);
+}
+
+#[tokio::test]
 async fn expired_receipts_are_pruned_and_the_command_id_can_be_new_again() {
     let temporary = tempfile::tempdir().unwrap();
     let store = Store::open(
@@ -74,6 +154,40 @@ async fn expired_receipts_are_pruned_and_the_command_id_can_be_new_again() {
     assert!(!second.replayed);
     assert!(second.version > first.version);
     assert_eq!(store.mutation_receipt_status().unwrap().entries, 1);
+}
+
+#[tokio::test]
+async fn capacity_maintenance_prunes_expired_receipts_in_bounded_passes() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = Store::open(
+        StoreOptions::new(temporary.path(), 1).with_mutation_receipt_retention(
+            MutationReceiptRetention::new(1, 2_000, 16 * 1024 * 1024).unwrap(),
+        ),
+    )
+    .await
+    .unwrap();
+    let outcomes = store
+        .bulk_write(
+            (0..1_025)
+                .map(|index| {
+                    BatchOperation::Put(put(
+                        &format!("receipt-{index}"),
+                        b"value",
+                        Precondition::Absent,
+                        &format!("command-{index}"),
+                    ))
+                })
+                .collect(),
+        )
+        .await;
+    assert!(outcomes.iter().all(|outcome| outcome.result.is_ok()));
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+
+    assert!(store.prune_expired_receipts_for_capacity().await.unwrap());
+    assert_eq!(store.mutation_receipt_status().unwrap().entries, 1);
+    assert!(store.prune_expired_receipts_for_capacity().await.unwrap());
+    assert_eq!(store.mutation_receipt_status().unwrap().entries, 0);
+    assert!(!store.prune_expired_receipts_for_capacity().await.unwrap());
 }
 
 #[tokio::test]

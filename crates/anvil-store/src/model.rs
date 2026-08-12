@@ -705,8 +705,16 @@ pub enum MutationError {
     DurabilityUnavailable,
     #[error("mutation receipt capacity is exhausted by unexpired guarantees")]
     ReceiptCapacity,
+    #[error(
+        "one mutation receipt requires {bytes} bytes, exceeding the configured {maximum} byte bound"
+    )]
+    ReceiptTooLarge { bytes: u64, maximum: u64 },
     #[error("source journal capacity is exhausted before required consumers are durable")]
     SourceJournalCapacity,
+    #[error(
+        "one source-journal transition requires {bytes} bytes, exceeding the configured {maximum} byte bound"
+    )]
+    SourceJournalRecordTooLarge { bytes: u64, maximum: u64 },
     #[error("invalid replicated object mutation: {0}")]
     InvalidObjectMutation(String),
     #[error(

@@ -265,7 +265,7 @@ async fn conditional_assignment_removal_deletes_only_the_exact_observed_value() 
         tenant_id: 7,
         bucket_id: 9,
         definition_id: 11,
-        definition_path: "_anvil/indexes/v2/definitions/by-path".into(),
+        definition_path: "_anvil/indexes/v3/definitions/by-path".into(),
         object_version: VersionId(13),
         observed_fence: fence(17),
         rank: 0,

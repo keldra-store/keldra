@@ -148,7 +148,7 @@ async fn retained_prefix_page_seeks_past_many_unrelated_versions() {
             .await
             .unwrap();
     }
-    let path = "_anvil/indexes/v2/9/current";
+    let path = "_anvil/indexes/v3/9/current";
     let first = store
         .put(put(path, b"one", "put-target-one"))
         .await
@@ -159,7 +159,7 @@ async fn retained_prefix_page_seeks_past_many_unrelated_versions() {
         .unwrap();
     store
         .put(put(
-            "_anvil/indexes/v2/90/current",
+            "_anvil/indexes/v3/90/current",
             b"adjacent",
             "put-adjacent-index",
         ))
@@ -171,7 +171,7 @@ async fn retained_prefix_page_seeks_past_many_unrelated_versions() {
         .export_retained_objects_by_prefix(
             tenant_id,
             bucket_id,
-            "_anvil/indexes/v2/9/",
+            "_anvil/indexes/v3/9/",
             None,
             1,
             1024 * 1024,
@@ -186,7 +186,7 @@ async fn retained_prefix_page_seeks_past_many_unrelated_versions() {
         .export_retained_objects_by_prefix(
             tenant_id,
             bucket_id,
-            "_anvil/indexes/v2/9/",
+            "_anvil/indexes/v3/9/",
             Some(&cursor),
             1,
             1024 * 1024,
@@ -203,7 +203,7 @@ async fn retained_prefix_page_seeks_past_many_unrelated_versions() {
         store.export_retained_objects_by_prefix(
             tenant_id,
             bucket_id,
-            "_anvil/indexes/v2/8/",
+            "_anvil/indexes/v3/8/",
             Some(&decoded),
             1,
             1024 * 1024,

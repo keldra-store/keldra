@@ -37,6 +37,58 @@ use crate::{
 const PROGRAM_DEFINITION_PREFIX: &str = "_anvil/programs/";
 const DEFINITION_ASSIGNMENT_NOTIFICATION_CAPACITY: usize = 64;
 
+struct MutationBackpressureWait {
+    capacity: &'static str,
+    started: std::time::Instant,
+    finished: bool,
+}
+
+impl MutationBackpressureWait {
+    fn start(capacity: &'static str) -> Self {
+        tracing::info!(
+            capacity,
+            counter.anvil_mutation_backpressure_waiting = 1_i64,
+            monotonic_counter.anvil_mutation_backpressure_waits_total = 1_u64,
+            "object mutation is waiting for bounded durable state"
+        );
+        Self {
+            capacity,
+            started: std::time::Instant::now(),
+            finished: false,
+        }
+    }
+
+    fn complete(mut self) {
+        self.emit("capacity_available", false);
+        self.finished = true;
+    }
+
+    fn emit(&self, outcome: &'static str, cancelled: bool) {
+        tracing::info!(
+            capacity = self.capacity,
+            counter.anvil_mutation_backpressure_waiting = -1_i64,
+            "object mutation capacity wait released"
+        );
+        tracing::info!(
+            capacity = self.capacity,
+            backpressure.outcome = outcome,
+            monotonic_counter.anvil_mutation_backpressure_wait_cancellations_total =
+                u64::from(cancelled),
+            histogram.anvil_mutation_backpressure_wait_duration_seconds =
+                self.started.elapsed().as_secs_f64(),
+            "object mutation capacity wait finished"
+        );
+    }
+}
+
+impl Drop for MutationBackpressureWait {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.emit("cancelled", true);
+        }
+    }
+}
+
 // RocksDB otherwise allocates one 64 MiB write buffer and one independent
 // block cache per column family. Anvil's metadata workload writes several
 // families together, so those defaults multiply native memory without buying
@@ -135,6 +187,11 @@ pub struct MetadataRuntimeMetrics {
     pub actual_delayed_write_rate_bytes_per_second: Option<u64>,
     pub write_stopped: Option<u64>,
     pub background_errors: Option<u64>,
+    pub mutation_receipt_entries: Option<u64>,
+    pub mutation_receipt_bytes: Option<u64>,
+    pub mutation_receipt_max_entries: u64,
+    pub mutation_receipt_max_bytes: u64,
+    pub mutation_receipt_oldest_age_seconds: Option<u64>,
     pub unavailable_properties: u64,
     pub property_collection_failures: u64,
     pub first_unavailable_property: Option<&'static str>,
@@ -348,6 +405,10 @@ pub struct Store {
     /// Restart initializes this to the durable floor and waits for current
     /// destination cursors before allowing any further compaction.
     pub(crate) source_journal_reference_safe_through: Arc<std::sync::atomic::AtomicU64>,
+    /// Wakes object writers when receipt expiry or source-journal progress may
+    /// have released capacity. A short timer fallback covers receipt expiry
+    /// when no other writer is active.
+    mutation_capacity_notify: Arc<tokio::sync::Notify>,
     watch_notify: tokio::sync::watch::Sender<()>,
     definition_assignment_notify:
         tokio::sync::broadcast::Sender<Vec<crate::DefinitionAssignmentMutation>>,
@@ -547,8 +608,21 @@ impl Store {
                 .write_buffer_manager
                 .get_buffer_size() as u64,
             write_buffer_usage_bytes: self._metadata_memory.write_buffer_manager.get_usage() as u64,
+            mutation_receipt_max_entries: self.mutation_receipt_retention.max_entries,
+            mutation_receipt_max_bytes: self.mutation_receipt_retention.max_bytes,
             ..MetadataRuntimeMetrics::default()
         };
+
+        match self.mutation_receipt_runtime_metrics() {
+            Ok((entries, bytes, oldest_age_seconds)) => {
+                metrics.mutation_receipt_entries = Some(entries);
+                metrics.mutation_receipt_bytes = Some(bytes);
+                metrics.mutation_receipt_oldest_age_seconds = Some(oldest_age_seconds);
+            }
+            Err(error) => {
+                metrics.note_failure(format!("read mutation receipt runtime metrics: {error}"))
+            }
+        }
 
         let value = self.db_property(
             properties::NUM_RUNNING_COMPACTIONS,
@@ -619,6 +693,43 @@ impl Store {
         );
         metrics.flush_pending_column_families = value;
         metrics
+    }
+
+    fn mutation_receipt_runtime_metrics(&self) -> Result<(u64, u64, u64), MutationError> {
+        let status = self.mutation_receipt_status()?;
+        let receipts = self.cf(CF_RECEIPTS)?;
+        let mut expiry = self.db.iterator_cf(
+            receipts,
+            IteratorMode::From(
+                &[STORAGE_KEY_FORMAT_VERSION, RECEIPT_EXPIRY_PREFIX],
+                Direction::Forward,
+            ),
+        );
+        let oldest_expiry = match expiry.next() {
+            Some(entry) => {
+                let (key, _) = entry.map_err(storage_error)?;
+                parse_receipt_expiry_key(&key)?.map(|(expires_at, _)| expires_at)
+            }
+            None => None,
+        };
+        if status.entries != 0 && oldest_expiry.is_none() {
+            return Err(MutationError::Storage(
+                "mutation receipt count is non-zero without an expiry index".into(),
+            ));
+        }
+        let retention_millis = self
+            .mutation_receipt_retention
+            .retention_seconds
+            .checked_mul(1_000)
+            .ok_or_else(|| MutationError::Storage("mutation receipt retention overflow".into()))?;
+        let now = now_unix_millis()?;
+        let oldest_age_seconds = if status.entries == 0 {
+            0
+        } else {
+            let expires_at = oldest_expiry.expect("non-zero receipt count checked above");
+            now.saturating_sub(expires_at.saturating_sub(retention_millis)) / 1_000
+        };
+        Ok((status.entries, status.bytes, oldest_age_seconds))
     }
 
     fn db_property(
@@ -739,6 +850,7 @@ impl Store {
             watch_source_epoch,
             watch_token_key,
             source_journal_reference_safe_through: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            mutation_capacity_notify: Arc::new(tokio::sync::Notify::new()),
             watch_notify: tokio::sync::watch::channel(()).0,
             definition_assignment_notify: tokio::sync::broadcast::channel(
                 DEFINITION_ASSIGNMENT_NOTIFICATION_CAPACITY,
@@ -1122,8 +1234,11 @@ mod authz_journal;
 mod blob_references;
 pub(crate) mod definition_state;
 mod delete_version;
+mod derived_consumers;
+mod distributed_publish_batch;
 mod journal_routes;
 mod mutations;
+mod object_mutation_replica_batch;
 mod object_snapshot;
 mod object_snapshot_scan;
 mod payload;
@@ -1142,7 +1257,8 @@ pub use object_snapshot::{
 };
 pub use object_snapshot_scan::{
     CurrentHeadCursor, CurrentObjectSnapshot, CurrentObjectSnapshotFrame,
-    CurrentObjectSnapshotPage, CurrentObjectSnapshotScan,
+    CurrentObjectSnapshotPage, CurrentObjectSnapshotScan, MAX_CURRENT_HEAD_SNAPSHOT_BYTES,
+    MAX_CURRENT_HEAD_SNAPSHOT_RECORDS,
 };
 pub use payload::{
     CompleteCopySealOutcome, LocalPayloadPresence, PayloadArtifactState, PayloadStoreError,
@@ -1311,14 +1427,12 @@ fn check_precondition(
 }
 
 fn fail_prepared_operations(
+    mut results: BTreeMap<usize, Result<MutationReceipt, MutationError>>,
     early: BTreeMap<usize, MutationError>,
     prepared: Vec<(usize, PreparedOperation)>,
     error: MutationError,
 ) -> Vec<BatchOutcome> {
-    let mut results = early
-        .into_iter()
-        .map(|(index, error)| (index, Err(error)))
-        .collect::<BTreeMap<_, _>>();
+    results.extend(early.into_iter().map(|(index, error)| (index, Err(error))));
     results.extend(
         prepared
             .into_iter()

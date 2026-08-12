@@ -283,6 +283,10 @@ pub enum DefinitionConsumerKind {
     IndexDelivery = 3,
     /// Source-local cursor advanced only after accounting assignment delivery.
     AccountingDelivery = 4,
+    /// Consumer-local aggregate cursor advanced only by rank-zero index proof.
+    IndexRetention = 5,
+    /// Consumer-local aggregate cursor advanced only by rank-zero accounting proof.
+    AccountingRetention = 6,
 }
 
 impl DefinitionConsumerKind {
@@ -290,6 +294,8 @@ impl DefinitionConsumerKind {
         match self {
             Self::IndexAssignments | Self::IndexDelivery => DefinitionKind::Index,
             Self::AccountingAssignments | Self::AccountingDelivery => DefinitionKind::Accounting,
+            Self::IndexRetention => DefinitionKind::Index,
+            Self::AccountingRetention => DefinitionKind::Accounting,
         }
     }
 
@@ -299,6 +305,8 @@ impl DefinitionConsumerKind {
             2 => Ok(Self::AccountingAssignments),
             3 => Ok(Self::IndexDelivery),
             4 => Ok(Self::AccountingDelivery),
+            5 => Ok(Self::IndexRetention),
+            6 => Ok(Self::AccountingRetention),
             _ => Err(DefinitionStateError::Malformed(
                 "definition consumer kind is unknown".into(),
             )),

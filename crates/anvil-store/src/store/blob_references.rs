@@ -678,6 +678,18 @@ impl Store {
         pending: &BTreeSet<Vec<u8>>,
     ) -> Result<Option<(Vec<u8>, Vec<u8>)>, MutationError> {
         validate_small_blob(reference, bytes)?;
+        self.prepare_hashed_small_blob_value(reference, bytes, pending)
+    }
+
+    /// Prepares bytes whose reference was computed from this exact immutable
+    /// slice during the current put preparation. Existing stored bytes remain
+    /// independently verified before content-address reuse.
+    pub(super) fn prepare_hashed_small_blob_value(
+        &self,
+        reference: &BlobRef,
+        bytes: &[u8],
+        pending: &BTreeSet<Vec<u8>>,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>, MutationError> {
         let key = blob_reference_key(reference);
         if pending.contains(&key) {
             return Ok(None);
