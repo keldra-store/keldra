@@ -40,7 +40,7 @@ struct QueryCpuActiveGuard {
 impl Drop for QueryCpuActiveGuard {
     fn drop(&mut self) {
         self.span.in_scope(|| {
-            tracing::info!(
+            tracing::debug!(
                 index.kind = ?self.kind,
                 counter.anvil_index_query_cpu_active = -1_i64,
                 "index query CPU chunk released"
@@ -136,19 +136,19 @@ impl IndexCpuPool {
         F: FnOnce() -> Result<T, IndexError> + Send + 'static,
         T: Send + 'static,
     {
+        // These events carry the OTLP counters and histograms for every
+        // bounded CPU chunk. The metrics and OpenTelemetry layers are
+        // intentionally unfiltered, so DEBUG preserves those signals while
+        // keeping the default INFO console log bounded by query-level events.
         let enqueued = std::time::Instant::now();
         let started = Arc::new(AtomicBool::new(false));
         let worker_started = Arc::clone(&started);
-        let span = tracing::info_span!(
-            "anvil.index.query.cpu",
-            index.kind = ?kind,
-            query.cpu_queue_seconds = tracing::field::Empty,
-            query.cpu_seconds = tracing::field::Empty,
-            query.outcome = tracing::field::Empty,
-            otel.status_code = tracing::field::Empty,
-        );
+        // One public query can execute millions of bounded CPU chunks. Keep
+        // their metrics on the enclosing query span instead of creating one
+        // exported trace span per chunk.
+        let span = tracing::Span::current();
         span.in_scope(|| {
-            tracing::info!(
+            tracing::debug!(
                 index.kind = ?kind,
                 counter.anvil_index_query_cpu_waiting = 1_i64,
                 "index query CPU chunk queued"
@@ -159,14 +159,13 @@ impl IndexCpuPool {
             .install(move || {
                 worker_started.store(true, Ordering::Release);
                 let queue_seconds = enqueued.elapsed().as_secs_f64();
-                worker_span.record("query.cpu_queue_seconds", queue_seconds);
                 worker_span.in_scope(|| {
-                    tracing::info!(
+                    tracing::debug!(
                         index.kind = ?kind,
                         counter.anvil_index_query_cpu_waiting = -1_i64,
                         "index query CPU queue wait released"
                     );
-                    tracing::info!(
+                    tracing::debug!(
                         index.kind = ?kind,
                         counter.anvil_index_query_cpu_active = 1_i64,
                         "index query CPU chunk started"
@@ -179,7 +178,6 @@ impl IndexCpuPool {
                 let cpu_started = std::time::Instant::now();
                 let result = work();
                 let cpu_seconds = cpu_started.elapsed().as_secs_f64();
-                worker_span.record("query.cpu_seconds", cpu_seconds);
                 (result, queue_seconds, cpu_seconds)
             })
             .await;
@@ -188,15 +186,13 @@ impl IndexCpuPool {
             Err(error) => {
                 if !started.load(Ordering::Acquire) {
                     span.in_scope(|| {
-                        tracing::info!(
+                        tracing::debug!(
                             index.kind = ?kind,
                             counter.anvil_index_query_cpu_waiting = -1_i64,
                             "index query CPU queue wait released after task failure"
                         );
                     });
                 }
-                span.record("query.outcome", "failed");
-                span.record("otel.status_code", "error");
                 span.in_scope(|| {
                     tracing::warn!(
                         index.kind = ?kind,
@@ -211,18 +207,28 @@ impl IndexCpuPool {
             }
         };
         let failed = result.is_err();
-        span.record("query.outcome", if failed { "failed" } else { "completed" });
-        span.record("otel.status_code", if failed { "error" } else { "ok" });
         span.in_scope(|| {
-            tracing::info!(
-                index.kind = ?kind,
-                query.outcome = if failed { "failed" } else { "completed" },
-                monotonic_counter.anvil_index_query_cpu_chunks_total = 1_u64,
-                monotonic_counter.anvil_index_query_cpu_failures_total = u64::from(failed),
-                histogram.anvil_index_query_cpu_queue_seconds = queue_seconds,
-                histogram.anvil_index_query_cpu_seconds = cpu_seconds,
-                "index query CPU chunk completed"
-            );
+            if failed {
+                tracing::warn!(
+                    index.kind = ?kind,
+                    query.outcome = "failed",
+                    monotonic_counter.anvil_index_query_cpu_chunks_total = 1_u64,
+                    monotonic_counter.anvil_index_query_cpu_failures_total = 1_u64,
+                    histogram.anvil_index_query_cpu_queue_seconds = queue_seconds,
+                    histogram.anvil_index_query_cpu_seconds = cpu_seconds,
+                    "index query CPU chunk failed"
+                );
+            } else {
+                tracing::debug!(
+                    index.kind = ?kind,
+                    query.outcome = "completed",
+                    monotonic_counter.anvil_index_query_cpu_chunks_total = 1_u64,
+                    monotonic_counter.anvil_index_query_cpu_failures_total = 0_u64,
+                    histogram.anvil_index_query_cpu_queue_seconds = queue_seconds,
+                    histogram.anvil_index_query_cpu_seconds = cpu_seconds,
+                    "index query CPU chunk completed"
+                );
+            }
         });
         result
     }
