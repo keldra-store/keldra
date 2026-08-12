@@ -564,6 +564,7 @@ pub(crate) struct IndexBlockStagingSink {
     progress: Option<CompactionProgress>,
     registry: Arc<Mutex<IndexPackRegistry>>,
     lane: Arc<tokio::sync::Mutex<IndexPackLane>>,
+    seal_permits: Arc<tokio::sync::Semaphore>,
     scratch_directory: Arc<PathBuf>,
 }
 
@@ -573,7 +574,7 @@ struct IndexPackLane {
     scratch: bool,
     current: Option<BlobUpload>,
     current_bytes: u64,
-    packs: Vec<BlobRef>,
+    packs: Vec<PackSealState>,
     /// Scratch bytes are disposable files addressed by this monotone bound.
     /// Keeping their descriptors here would make builder memory O(corpus).
     scratch_block_count: u32,
@@ -603,6 +604,38 @@ struct IndexPackRegistry {
 
 const PACK_LANE_LIMIT: u32 = (1 << 12) - 1;
 const PACKS_PER_LANE: u32 = 1 << 20;
+const MAX_CONCURRENT_PACK_SEALS: usize = 4;
+
+enum PackSealState {
+    Sealing(PendingPackSeal),
+    Sealed(BlobRef),
+    Failed(PackSealFailure),
+}
+
+struct PendingPackSeal {
+    task: tokio::task::JoinHandle<Result<BlobRef, PackSealFailure>>,
+}
+
+impl Drop for PendingPackSeal {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+#[derive(Clone)]
+enum PackSealFailure {
+    Io(String),
+    Integrity,
+}
+
+impl PackSealFailure {
+    fn into_index_error(self) -> IndexError {
+        match self {
+            Self::Io(message) => IndexError::Io(message),
+            Self::Integrity => IndexError::Integrity,
+        }
+    }
+}
 
 impl Clone for IndexBlockStagingSink {
     fn clone(&self) -> Self {
@@ -611,6 +644,7 @@ impl Clone for IndexBlockStagingSink {
             progress: self.progress.clone(),
             registry: self.registry.clone(),
             lane: self.lane.clone(),
+            seal_permits: self.seal_permits.clone(),
             scratch_directory: self.scratch_directory.clone(),
         }
     }
@@ -637,6 +671,7 @@ impl IndexBlockStagingSink {
                 finished: false,
             })),
             lane,
+            seal_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PACK_SEALS)),
             scratch_directory,
         }
     }
@@ -648,17 +683,67 @@ impl IndexBlockStagingSink {
         if lane.current_bytes == 0 {
             return Err(IndexError::InvalidFormat("empty index artifact pack"));
         }
-        let blob = self
-            .store
-            .seal_blob_upload(upload)
+        let expected_length = lane.current_bytes;
+        let local_id = u32::try_from(lane.packs.len()).map_err(|_| IndexError::OffsetOverflow)?;
+        pack_id(lane.id, local_id)?;
+        let permit = self
+            .seal_permits
+            .clone()
+            .acquire_owned()
             .await
-            .map_err(|error| IndexError::Io(error.to_string()))?;
-        if blob.length != lane.current_bytes || blob.length > MAX_INDEX_ARTIFACT_PACK_BYTES as u64 {
-            return Err(IndexError::Integrity);
-        }
-        lane.packs.push(blob);
+            .map_err(|_| IndexError::Io("index pack seal admission closed".into()))?;
+        let store = self.store.clone();
+        let task = tokio::spawn(async move {
+            let _permit = permit;
+            let blob = store
+                .seal_blob_upload(upload)
+                .await
+                .map_err(|error| PackSealFailure::Io(error.to_string()))?;
+            if blob.length != expected_length || blob.length > MAX_INDEX_ARTIFACT_PACK_BYTES as u64
+            {
+                return Err(PackSealFailure::Integrity);
+            }
+            Ok(blob)
+        });
+        lane.packs
+            .push(PackSealState::Sealing(PendingPackSeal { task }));
         lane.current_bytes = 0;
         Ok(())
+    }
+
+    async fn resolve_pack(
+        &self,
+        lane: &mut IndexPackLane,
+        local_id: usize,
+    ) -> Result<BlobRef, IndexError> {
+        let result = match lane
+            .packs
+            .get_mut(local_id)
+            .ok_or_else(|| IndexError::FileNotFound(format!("staged pack {local_id}")))?
+        {
+            PackSealState::Sealing(pending) => match (&mut pending.task).await {
+                Ok(result) => result,
+                Err(error) => Err(PackSealFailure::Io(format!(
+                    "index pack seal task failed: {error}"
+                ))),
+            },
+            PackSealState::Sealed(blob) => return Ok(blob.clone()),
+            PackSealState::Failed(error) => return Err(error.clone().into_index_error()),
+        };
+        let slot = lane
+            .packs
+            .get_mut(local_id)
+            .expect("the resolved pack slot remains present");
+        match result {
+            Ok(blob) => {
+                *slot = PackSealState::Sealed(blob.clone());
+                Ok(blob)
+            }
+            Err(error) => {
+                *slot = PackSealState::Failed(error.clone());
+                Err(error.into_index_error())
+            }
+        }
     }
 
     async fn finish(&mut self) -> Result<FinishedPacks, IndexError> {
@@ -698,7 +783,8 @@ impl IndexBlockStagingSink {
             summary.authoritative_bytes = summary
                 .authoritative_bytes
                 .saturating_add(lane.authoritative_bytes);
-            for (local_id, blob) in lane.packs.iter().cloned().enumerate() {
+            for local_id in 0..lane.packs.len() {
+                let blob = self.resolve_pack(&mut lane, local_id).await?;
                 let local_id = u32::try_from(local_id).map_err(|_| IndexError::OffsetOverflow)?;
                 packs.push(StagedPack {
                     id: pack_id(lane_id, local_id)?,
@@ -932,6 +1018,7 @@ impl IndexBlockStagingSink {
             progress: self.progress.clone(),
             registry: self.registry.clone(),
             lane,
+            seal_permits: self.seal_permits.clone(),
             scratch_directory: self.scratch_directory.clone(),
         })
     }
@@ -984,11 +1071,8 @@ impl IndexDirectoryRead for IndexBlockStagingSink {
                 .await;
         }
         let blob = {
-            let lane = lane.lock().await;
-            lane.packs
-                .get(local_id)
-                .cloned()
-                .ok_or_else(|| IndexError::FileNotFound(descriptor.logical_name()))?
+            let mut lane = lane.lock().await;
+            self.resolve_pack(&mut lane, local_id).await?
         };
         StagedIndexFile::open_window(
             &self.store,
@@ -1256,6 +1340,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authoritative_pack_seals_share_one_bounded_pool_and_finish_in_id_order() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(anvil_store::StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        let scratch_root = temporary.path().join("index-scratch");
+        let mut sink = IndexBlockStagingSink::new(store.clone(), None, &scratch_root);
+        let fork = sink.fork().unwrap();
+        assert!(Arc::ptr_eq(&sink.seal_permits, &fork.seal_permits));
+        assert_eq!(
+            sink.seal_permits.available_permits(),
+            MAX_CONCURRENT_PACK_SEALS
+        );
+
+        let mut expected = Vec::new();
+        for (writer, lane_id, payloads) in [
+            (
+                &sink,
+                0_u32,
+                [b"lane-zero-pack-zero".as_slice(), b"lane-zero-pack-one"],
+            ),
+            (
+                &fork,
+                1_u32,
+                [b"lane-one-pack-zero".as_slice(), b"lane-one-pack-one"],
+            ),
+        ] {
+            for (local_id, bytes) in payloads.into_iter().enumerate() {
+                let mut upload = store.begin_blob_upload().await.unwrap();
+                upload.write(bytes).await.unwrap();
+                let mut lane = writer.lane.lock().await;
+                lane.current = Some(upload);
+                lane.current_bytes = bytes.len() as u64;
+                writer.seal_current(&mut lane).await.unwrap();
+                expected.push((
+                    pack_id(lane_id, local_id as u32).unwrap(),
+                    BlobRef {
+                        hash: *blake3::hash(bytes).as_bytes(),
+                        length: bytes.len() as u64,
+                    },
+                ));
+            }
+        }
+
+        let finished = sink.finish().await.unwrap();
+        assert_eq!(
+            finished
+                .packs
+                .iter()
+                .map(|pack| (pack.id, pack.blob.clone()))
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            sink.seal_permits.available_permits(),
+            MAX_CONCURRENT_PACK_SEALS
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_read_waits_for_an_in_flight_pack_seal() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(anvil_store::StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        let scratch_root = temporary.path().join("index-scratch");
+        let mut sink = IndexBlockStagingSink::new(store.clone(), None, &scratch_root);
+        let bytes = b"block read while its containing pack is sealing";
+        let mut upload = store.begin_blob_upload().await.unwrap();
+        upload.write(bytes).await.unwrap();
+        {
+            let mut lane = sink.lane.lock().await;
+            lane.current = Some(upload);
+            lane.current_bytes = bytes.len() as u64;
+            sink.seal_current(&mut lane).await.unwrap();
+        }
+
+        let descriptor = scratch_descriptor(0, 0, bytes);
+        let file = sink.open_block(&descriptor).await.unwrap();
+        assert_eq!(file.read_at(0, bytes.len()).await.unwrap().as_ref(), bytes);
+        let finished = sink.finish().await.unwrap();
+        assert_eq!(finished.packs.len(), 1);
+        assert_eq!(finished.packs[0].id, 0);
+        assert_eq!(finished.packs[0].blob.hash, descriptor.hash);
+    }
+
+    #[tokio::test]
     async fn disposable_scratch_blocks_never_enter_object_writes_or_manifests() {
         let temporary = tempfile::tempdir().unwrap();
         let store = Store::open(anvil_store::StoreOptions::new(temporary.path(), 1))
@@ -1264,7 +1435,11 @@ mod tests {
         let published_blob = store.stage_blob(b"authoritative pack").await.unwrap();
         let scratch_root = temporary.path().join("index-scratch");
         let mut sink = IndexBlockStagingSink::new(store, None, &scratch_root);
-        sink.lane.lock().await.packs.push(published_blob.clone());
+        sink.lane
+            .lock()
+            .await
+            .packs
+            .push(PackSealState::Sealed(published_blob.clone()));
         let scratch = sink.fork_scratch().unwrap();
         let bytes = b"disposable external-sort block";
         tokio::fs::create_dir_all(scratch.scratch_directory.as_ref())
