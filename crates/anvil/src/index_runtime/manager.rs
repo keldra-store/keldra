@@ -892,7 +892,7 @@ async fn inspect_builder(
         await_with_builder_heartbeats(&progress, budget.acquire(snapshot_share_bytes))
             .await
             .map_err(budget_status)?;
-    let max_frame_bytes = snapshot_source_wire_limit(snapshot_share_bytes)
+    let max_frame_bytes = source_wire_limit(snapshot_share_bytes)
         .min(dependencies.config.source_quantum_bytes(job.kind));
     let plan = work_plan_for_limit(snapshot_share_bytes, max_frame_bytes)?;
     let builder = open_bulk_builder(job, dependencies, plan)?;
@@ -1686,22 +1686,6 @@ fn source_wire_limit(limit: u64) -> u64 {
     let builder_reserve = remaining / 2;
     let safe = remaining
         .saturating_sub(builder_reserve)
-        .saturating_sub(256)
-        / DECODED_SOURCE_MULTIPLIER;
-    MAX_SOURCE_WIRE_BYTES.min(safe.max(64 * 1024))
-}
-
-fn snapshot_source_wire_limit(limit: u64) -> u64 {
-    let fixed = FIXED_INDEX_SEAL_WORKSPACE_BYTES as u64;
-    let remaining = limit.saturating_sub(fixed);
-    // A direct snapshot keeps the mutable bulk builder for the whole stream.
-    // Give it half of the non-fixed share, then split the other half between
-    // the decoded source frame and the collected projection inputs/outputs.
-    let builder_reserve = remaining / 2;
-    let projection_reserve = remaining / 4;
-    let safe = remaining
-        .saturating_sub(builder_reserve)
-        .saturating_sub(projection_reserve)
         .saturating_sub(256)
         / DECODED_SOURCE_MULTIPLIER;
     MAX_SOURCE_WIRE_BYTES.min(safe.max(64 * 1024))

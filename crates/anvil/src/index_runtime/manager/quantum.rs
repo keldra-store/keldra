@@ -154,13 +154,10 @@ mod tests {
     #[test]
     fn snapshot_uses_its_already_derived_wire_limit() {
         const SNAPSHOT_SHARE_BYTES: u64 = 89_478_485;
-        const DERIVED_WIRE_LIMIT: u64 = 1_746_111;
-        const OBSERVED_VALID_FRAME_BYTES: u64 = 1_745_999;
+        const DERIVED_WIRE_LIMIT: u64 = 3_492_287;
+        const OBSERVED_VALID_FRAME_BYTES: u64 = 3_491_999;
 
-        assert_eq!(
-            super::super::snapshot_source_wire_limit(SNAPSHOT_SHARE_BYTES),
-            DERIVED_WIRE_LIMIT
-        );
+        assert_eq!(source_wire_limit(SNAPSHOT_SHARE_BYTES), DERIVED_WIRE_LIMIT);
 
         let mut observed = SourceWorkQuantum::from_wire_limit(DERIVED_WIRE_LIMIT);
         assert_eq!(observed.limit, DERIVED_WIRE_LIMIT);

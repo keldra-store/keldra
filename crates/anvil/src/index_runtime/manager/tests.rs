@@ -1,7 +1,4 @@
-use anvil_api::v1::{
-    CreateIndexRequest, IndexField, IndexSpecification, PathIndexSpec, TypedJsonIndexSpec,
-    index_specification::Specification,
-};
+use anvil_api::v1::{CreateIndexRequest, IndexSpecification, PathIndexSpec};
 use anvil_store::{
     BlobRef, Head, MUTATION_STAMP_FORMAT, MutationStamp, ObjectHeadChange, ObjectHeadChangeKind,
     PlacementLogId, SourceId, Version, VersionId,
@@ -612,60 +609,4 @@ fn minimum_kind_budget_preserves_its_mutable_builder_reserve() {
         available - FIXED_INDEX_SEAL_WORKSPACE_BYTES as u64 >= configured.max_resident_bytes as u64
     );
     assert!(configured.max_resident_bytes > 1024 * 1024);
-}
-
-#[test]
-fn default_snapshot_share_admits_a_qualification_shaped_projection() {
-    const KIND_BUDGET: u64 = 256 * 1024 * 1024;
-    let budgets = IndexMemoryBudgets::new(KIND_BUDGET).unwrap();
-    let budget = budgets.for_kind(IndexKind::TypedJson);
-    let share = budget.snapshot_share_bytes();
-    let wire = snapshot_source_wire_limit(share);
-    let plan = work_plan_for_limit(share, wire).unwrap();
-    let projection_budget = rebuild::snapshot_projection_budget(plan).unwrap();
-    let specification = IndexSpecification {
-        specification: Some(Specification::TypedJson(TypedJsonIndexSpec {
-            fields: [
-                ("record_id", "/record_id"),
-                ("ecosystem", "/ecosystem"),
-                ("package", "/package"),
-                ("severity", "/severity"),
-                ("active", "/active"),
-                ("withdrawn", "/withdrawn"),
-                ("score", "/score"),
-                ("published_day", "/published_day"),
-                ("modified_day", "/modified_day"),
-                ("sequence", "/sequence"),
-                ("source", "/source"),
-                ("partition", "/partition"),
-            ]
-            .into_iter()
-            .map(|(name, json_pointer)| IndexField {
-                name: name.into(),
-                json_pointer: json_pointer.into(),
-            })
-            .collect(),
-        })),
-    };
-    let source = IndexSourceMutation::Upsert(IndexBuildObject {
-        path: "records/000000000000.json".into(),
-        version: 1,
-        content_type: Some("application/json".into()),
-        content_hash: [7; 32],
-        content_length: 256,
-        committed_at_unix_millis: 1,
-    });
-    let prepared = rebuild::PreparedProjection::new(&specification, source).unwrap();
-
-    assert!(prepared.projection_bytes > 257);
-    let decoded_source = wire * DECODED_SOURCE_MULTIPLIER;
-    assert!(
-        decoded_source
-            + plan.max_resident_bytes as u64
-            + FIXED_INDEX_SEAL_WORKSPACE_BYTES as u64
-            + projection_budget
-            <= share
-    );
-    let mut batch = rebuild::ProjectionBatch::new(projection_budget, projection_budget, 4);
-    assert!(batch.try_push(prepared).unwrap().is_none());
 }

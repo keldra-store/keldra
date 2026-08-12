@@ -282,7 +282,13 @@ async fn process_snapshot_frame(
     // A bulk push may synchronously start an external-sort/pack CPU phase. Its
     // fixed workspace must coexist with the bulk builder's retained rows and
     // every projected result that has not been pushed yet.
-    let projection_budget = snapshot_projection_budget(plan)?;
+    let projection_budget = plan
+        .max_source_projection_bytes
+        .checked_sub(FIXED_INDEX_SEAL_WORKSPACE_BYTES)
+        .filter(|budget| *budget > 0)
+        .ok_or_else(|| {
+            Status::resource_exhausted("index kind budget leaves no snapshot projection workspace")
+        })? as u64;
     let mut batch = ProjectionBatch::new(projection_budget, projection_budget, max_parallel);
     for head in frame {
         if head.tenant_id != definition.tenant_id
@@ -322,16 +328,6 @@ async fn process_snapshot_frame(
         project_snapshot_batch(specification, batch, builder, candidate, dependencies).await?;
     }
     Ok(())
-}
-
-pub(super) fn snapshot_projection_budget(plan: SegmentMemoryPlan) -> Result<u64, Status> {
-    plan.max_source_projection_bytes
-        .checked_sub(FIXED_INDEX_SEAL_WORKSPACE_BYTES)
-        .filter(|budget| *budget > 0)
-        .and_then(|budget| u64::try_from(budget).ok())
-        .ok_or_else(|| {
-            Status::resource_exhausted("index kind budget leaves no snapshot projection workspace")
-        })
 }
 
 async fn project_snapshot_batch(
