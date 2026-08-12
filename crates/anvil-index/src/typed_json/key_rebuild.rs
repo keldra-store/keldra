@@ -102,11 +102,11 @@ where
         progress.clone(),
     )?;
     while let Some(TypedRow { ordinal, payload }) = cursor.next(&executor, &progress).await? {
+        let mut position = 0u32;
         for (field, values) in &payload.fields {
             sorter
                 .push(super::typed_exists_row(field, ordinal)?)
                 .await?;
-            let mut position = 0u32;
             for value in values {
                 sorter
                     .push(RoutedRow::new(

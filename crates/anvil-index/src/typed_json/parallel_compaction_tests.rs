@@ -472,6 +472,22 @@ async fn metadata_routed_rebuild_uses_selected_rows_without_rereading_old_keys_o
         hits[0].fields["status"],
         [ScalarValue::String("new-a".into())]
     );
+    let hits = MetadataFilterEngine::query(
+        &compacted,
+        &definition(),
+        &TypedQuery {
+            predicates: vec![TypedPredicate::Equal {
+                field: "status".into(),
+                value: ScalarValue::String("new-a".into()),
+            }],
+            order: Vec::new(),
+            limit: 10,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].document.path, "/a");
 }
 
 #[tokio::test]
