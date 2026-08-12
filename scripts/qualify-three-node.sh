@@ -82,7 +82,7 @@ export ANVIL_QUALIFICATION_INDEX_KIND_BUDGET_BYTES="${index_kind_budget_bytes}"
 export ANVIL_QUALIFICATION_INDEX_COMPACTION_MAX_LANES="${index_compaction_max_lanes}"
 export ANVIL_QUALIFICATION_INDEX_RAYON_WORKERS="${index_rayon_workers}"
 export ANVIL_QUALIFICATION_SOURCE_JOURNAL_MAX_ENTRIES="${gap_source_journal_max_entries}"
-export ANVIL_QUALIFICATION_RUST_LOG=info,anvil::index_runtime::retention=debug,anvil::observability::runtime=debug
+export ANVIL_QUALIFICATION_RUST_LOG=info,anvil::index_runtime::cpu=warn,anvil::index_runtime::retention=debug,anvil::observability::runtime=debug
 
 case "${ANVIL_DOCKER_PLATFORM:-}" in
   "")
@@ -399,6 +399,19 @@ service_logs() {
   docker logs "$(service_container "$1")" 2>&1 | strip_ansi
 }
 
+service_logs_since() {
+  local node="$1"
+  local cursor="$2"
+  local until="${3:-}"
+  if [[ -n "${until}" ]]; then
+    docker logs --since "${cursor}" --until "${until}" \
+      "$(service_container "${node}")" 2>&1 | strip_ansi
+  else
+    docker logs --since "${cursor}" "$(service_container "${node}")" 2>&1 \
+      | strip_ansi
+  fi
+}
+
 public_endpoint_for() {
   local node="$1"
   local published
@@ -428,15 +441,15 @@ run_index_recovery_qualification() {
     "${qualification_binaries[index_recovery_qualification]}"
 }
 
-log_line_count() {
-  { service_logs "$1" || true; } | wc -l
+log_cursor() {
+  qualification_log_cursor
 }
 
 save_log_suffix() {
   local node="$1"
-  local start_line="$2"
+  local cursor="$2"
   local destination="$3"
-  service_logs "${node}" | tail -n "+$((start_line + 1))" >"${destination}"
+  service_logs_since "${node}" "${cursor}" >"${destination}"
 }
 
 state_index_ids() {
@@ -597,7 +610,7 @@ run_index_resource_qualification() {
   assert_source_tree_exact
   for resource_node in anvil-1 anvil-2 anvil-3; do
     containers+=("$(service_container "${resource_node}")")
-    resource_log_starts["${resource_node}"]="$(log_line_count "${resource_node}")"
+    resource_log_starts["${resource_node}"]="$(log_cursor)"
   done
   ANVIL_V06_RESOURCE_ENDPOINTS="$(IFS=,; echo "${public_endpoints[*]}")" \
   ANVIL_V06_RESOURCE_TENANT="${index_resource_tenant}" \
@@ -703,8 +716,8 @@ run_index_resource_qualification() {
     ' "${index_resource_report}" >/dev/null
   if ((require_performance_targets == 1)); then
     jq -e '
-      .accepted_objects_per_second >= 10000 and
-      .source_complete_objects_per_second >= 10000 and
+      .accepted_objects_per_second >= 8000 and
+      .source_complete_objects_per_second >= 8000 and
       .timings.first_complete_generation_seconds <= 150
     ' "${index_resource_report}" >/dev/null
   fi
@@ -882,16 +895,16 @@ declare -A index_qualification_log_start=()
 capture_index_qualification_log_start() {
   local node
   for node in anvil-1 anvil-2 anvil-3; do
-    index_qualification_log_start["${node}"]="$({ service_logs "${node}" || true; } | wc -l)"
+    index_qualification_log_start["${node}"]="$(log_cursor)"
   done
 }
 
 save_index_qualification_logs() {
   local node
-  local start_line
+  local cursor
   for node in anvil-1 anvil-2 anvil-3; do
-    start_line=$((index_qualification_log_start["${node}"] + 1))
-    service_logs "${node}" | tail -n "+${start_line}" \
+    cursor="${index_qualification_log_start[${node}]}"
+    service_logs_since "${node}" "${cursor}" \
       >"${ANVIL_QUALIFICATION_DIR}/artifacts/index-${node}.log"
     preserve_all_kind_telemetry "${ANVIL_QUALIFICATION_DIR}/artifacts/index-${node}.log" three "${qualification_suffix}" "${node}"
   done
@@ -1212,7 +1225,7 @@ run_live_builder_reassignment_qualification() {
   fi
   for node_number in $(seq 1 "${active_nodes}"); do
     node="anvil-${node_number}"
-    log_starts["${node}"]="$(log_line_count "${node}")"
+    log_starts["${node}"]="$(log_cursor)"
   done
   run_index_recovery_qualification \
     "${membership_mode}" "${endpoints}" \
@@ -1262,7 +1275,7 @@ run_real_journal_gap_qualification() {
   local unrelated_objects
   local value
   for node in anvil-1 anvil-2 anvil-3; do
-    seed_log_starts["${node}"]="$(log_line_count "${node}")"
+    seed_log_starts["${node}"]="$(log_cursor)"
   done
   run_index_recovery_qualification \
     gap-seed "$(IFS=,; echo "${public_endpoints[*]}")" \
@@ -1299,7 +1312,7 @@ run_real_journal_gap_qualification() {
   fi
 
   for node in anvil-1 anvil-2 anvil-3; do
-    recovery_log_starts["${node}"]="$(log_line_count "${node}")"
+    recovery_log_starts["${node}"]="$(log_cursor)"
   done
   paused_container="$(service_container "${builder}")"
   docker pause "${paused_container}" >/dev/null

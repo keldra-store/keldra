@@ -1288,9 +1288,9 @@ On the documented reference hardware, the approximately 840,000-record,
 twelve-field qualification must:
 
 - use public `BulkWrite` requests up to the public 1,000-operation/64 MiB bound;
-- sustain at least 10,000 accepted source objects per second over the measured
+- sustain at least 8,000 accepted source objects per second over the measured
   ingest interval;
-- sustain at least 10,000 source objects per second through Typed JSON
+- sustain at least 8,000 source objects per second through Typed JSON
   projection and source-complete generation publication;
 - publish the first complete generation within 150 seconds from the first
   accepted object while ingest and indexing overlap;

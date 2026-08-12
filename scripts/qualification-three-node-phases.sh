@@ -16,11 +16,17 @@ preserve_journal_pressure_evidence() {
 
 capture_three_node_resource_evidence() {
   local node="$1"
-  local start_line="$2"
+  local start_cursor="$2"
   local log="${ANVIL_QUALIFICATION_DIR}/artifacts/index-resource-${node}.log"
+  local capture_cursor="${start_cursor}"
+  local next_cursor
   local attempt
+  : >"${log}"
   for attempt in $(seq 1 12); do
-    save_log_suffix "${node}" "${start_line}" "${log}"
+    next_cursor="$(qualification_log_cursor)"
+    service_logs_since "${node}" "${capture_cursor}" "${next_cursor}" \
+      >>"${log}"
+    capture_cursor="$(qualification_log_cursor_after "${next_cursor}")"
     if grep -Fq 'sampled process resources' "${log}" \
       && grep -Fq 'sampled cgroup memory resources' "${log}" \
       && grep -Fq 'sampled RocksDB resources' "${log}" \
@@ -302,7 +308,7 @@ prepare_no_event_membership_cutover_qualification() {
     echo "${node} emitted no parseable completed pre-cutover membership fence" >&2
     return 1
   fi
-  membership_cutover_source_log_start="$(log_line_count "${node}")"
+  membership_cutover_source_log_start="$(log_cursor)"
   echo "[anvil-qualification] non-coordinator source ${node_id} reached journal bound ${bound} at tail ${membership_cutover_source_tail} before the no-event 2->3 cutover"
 }
 
@@ -478,7 +484,7 @@ prepare_indexed_membership_cutover_qualification() {
       sleep 1
       continue
     fi
-    builder_log_start="$(log_line_count "${builder}")"
+    builder_log_start="$(log_cursor)"
     : >"${response}"
     chmod 0600 "${response}"
     if ! indexed_cutover_bulk_request \

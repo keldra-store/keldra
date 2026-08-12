@@ -7,6 +7,27 @@ strip_ansi() {
   LC_ALL=C sed $'s/\033\\[[0-9;?]*[ -\\/]*[@-~]//g'
 }
 
+qualification_log_cursor() {
+  date --utc +'%s.%N'
+}
+
+qualification_log_cursor_after() {
+  local cursor="$1"
+  local nanoseconds="${cursor#*.}"
+  local seconds="${cursor%%.*}"
+  if [[ ! "${seconds}" =~ ^[0-9]+$ || ! "${nanoseconds}" =~ ^[0-9]{9}$ ]]; then
+    echo "invalid qualification log cursor: ${cursor}" >&2
+    return 1
+  fi
+  if ((10#${nanoseconds} == 999999999)); then
+    seconds=$((seconds + 1))
+    nanoseconds=0
+  else
+    nanoseconds=$((10#${nanoseconds} + 1))
+  fi
+  printf '%s.%09d\n' "${seconds}" "${nanoseconds}"
+}
+
 log_unsigned_field() {
   local field="$1"
   local line="$2"

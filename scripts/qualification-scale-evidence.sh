@@ -174,22 +174,18 @@ typed_json_terminal_event_count() {
 }
 
 capture_scale_publication_evidence() {
-  local topology="$1"
+  local _topology="$1"
   local prefix="$2"
-  local node
-  if [[ "${topology}" == "single" ]]; then
-    container_logs | awk '
-      index($0, "index.kind=TypedJson") &&
-      index($0, "index generation publication metrics")
-    ' >"${prefix}.log"
-  else
-    for node in anvil-1 anvil-2 anvil-3; do
-      service_logs "${node}" | awk '
-        index($0, "index.kind=TypedJson") &&
-        index($0, "index generation publication metrics")
-      ' >"${prefix}-${node}.log"
-    done
+  local -a sources=()
+  mapfile -t sources < <(telemetry_files "${index_resource_telemetry_prefix}")
+  if ((${#sources[@]} == 0)); then
+    echo "resource telemetry is absent while capturing publication evidence" >&2
+    return 1
   fi
+  awk '
+    index($0, "index.kind=TypedJson") &&
+    index($0, "index generation publication metrics")
+  ' "${sources[@]}" >"${prefix}.log"
   while IFS= read -r file; do
     chmod 0600 "${file}"
   done < <(telemetry_files "${prefix}")
@@ -215,14 +211,14 @@ run_scale_singleton_probe() {
       binary="${qualification_example_binaries[v06_index_resource_qualification]}"
       endpoint="${public_endpoint}"
       expected_sources=1
-      single_start="$({ container_logs || true; } | wc -l)"
+      single_start="$(qualification_log_cursor)"
       ;;
     three)
       binary="${qualification_binaries[v06_index_resource_qualification]}"
       endpoint="${public_endpoints[0]}"
       expected_sources=3
       for node in anvil-1 anvil-2 anvil-3; do
-        starts["${node}"]="$(log_line_count "${node}")"
+        starts["${node}"]="$(log_cursor)"
       done
       ;;
     *)
@@ -251,7 +247,7 @@ run_scale_singleton_probe() {
 
   for attempt in $(seq 1 10); do
     if [[ "${topology}" == "single" ]]; then
-      container_logs | tail -n "+$((single_start + 1))" \
+      container_logs_since "${single_start}" \
         >"${probe_telemetry_prefix}.log"
     else
       for node in anvil-1 anvil-2 anvil-3; do

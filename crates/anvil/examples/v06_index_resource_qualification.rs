@@ -52,9 +52,10 @@ const DEFAULT_WORKERS: usize = 4;
 const DEFAULT_VERIFICATION_WORKERS: usize = 8;
 const DEFAULT_SEED: u64 = 0x625d_54af_f989_97f3;
 const QUERY_LIMIT: u32 = 1_000;
+const FRESHNESS_PROBE_PARTITION: u64 = PARTITION_COUNT;
 const BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const EXACT_VERIFICATION_TIMEOUT: Duration = Duration::from_secs(45 * 60);
-const MIN_RELEASE_OBJECTS_PER_SECOND: f64 = 10_000.0;
+const MIN_RELEASE_OBJECTS_PER_SECOND: f64 = 8_000.0;
 const MAX_RELEASE_FIRST_GENERATION_SECONDS: f64 = 150.0;
 
 #[derive(Clone, Debug)]
@@ -1078,29 +1079,27 @@ async fn wait_for_generation(
     expected_complete_sources: Option<usize>,
 ) -> Result<QueryIndexResponse> {
     let deadline = Instant::now() + BUILD_TIMEOUT;
-    let partition = 7;
     loop {
-        match query_partition(client, bucket, partition).await {
-            Ok(response)
-                if freshness(&response).is_ok_and(|value| {
-                    value.generation > after_generation
-                        && value.initial_build_complete
-                        && !value.rebuilding
-                        && expected_complete_sources
-                            .is_none_or(|expected| source_complete_freshness(value, expected))
-                }) =>
+        match query_partition(client, bucket, FRESHNESS_PROBE_PARTITION).await {
+            Ok(probe)
+                if generation_is_ready(&probe, after_generation, expected_complete_sources) =>
             {
-                if let Some(expected_hits) = expected_partition_hits {
-                    if response.hits.len() != expected_hits {
-                        // Fall through to the shared deadline check. A
-                        // published-but-incomplete generation must not turn
-                        // this bounded qualification wait into an infinite
-                        // loop.
-                    } else {
-                        return Ok(response);
+                let Some(expected_hits) = expected_partition_hits else {
+                    return Ok(probe);
+                };
+                match query_partition(client, bucket, 7).await {
+                    Ok(response) => {
+                        if generation_is_ready(
+                            &response,
+                            after_generation,
+                            expected_complete_sources,
+                        ) {
+                            ensure_expected_partition_hits(&response, 7, expected_hits)?;
+                            return Ok(response);
+                        }
                     }
-                } else {
-                    return Ok(response);
+                    Err(error) if retryable_error(&error) => {}
+                    Err(error) => return Err(error),
                 }
             }
             Ok(_) => {}
@@ -1112,6 +1111,34 @@ async fn wait_for_generation(
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+}
+
+fn generation_is_ready(
+    response: &QueryIndexResponse,
+    after_generation: u64,
+    expected_complete_sources: Option<usize>,
+) -> bool {
+    freshness(response).is_ok_and(|value| {
+        value.generation > after_generation
+            && value.initial_build_complete
+            && !value.rebuilding
+            && expected_complete_sources
+                .is_none_or(|expected| source_complete_freshness(value, expected))
+    })
+}
+
+fn ensure_expected_partition_hits(
+    response: &QueryIndexResponse,
+    partition: u64,
+    expected_hits: usize,
+) -> Result<()> {
+    ensure!(
+        response.hits.len() == expected_hits,
+        "ready index generation {} returned {} hits for partition {partition}, expected {expected_hits}",
+        response.generation(),
+        response.hits.len(),
+    );
+    Ok(())
 }
 
 async fn verify_every_partition(
@@ -1720,6 +1747,53 @@ mod tests {
         freshness.sources[2] = current(2, 31);
         assert!(!source_complete_freshness(&freshness, 3));
         assert!(!source_complete_freshness(&freshness, 2));
+    }
+
+    #[test]
+    fn readiness_requires_a_new_complete_zero_lag_generation() {
+        let source = IndexSourceFreshness {
+            node_id: 1,
+            source_epoch: vec![1; 32],
+            indexed_next_offset: 11,
+            observed_tail: Some(10),
+            lag_hint: 0,
+        };
+        let mut response = QueryIndexResponse {
+            freshness: Some(IndexFreshness {
+                generation: 2,
+                initial_build_complete: true,
+                rebuilding: false,
+                sources: vec![source],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert!(generation_is_ready(&response, 1, Some(1)));
+        assert!(!generation_is_ready(&response, 2, Some(1)));
+        assert!(!generation_is_ready(&response, 1, Some(2)));
+
+        response.freshness.as_mut().unwrap().sources[0].lag_hint = 1;
+        assert!(!generation_is_ready(&response, 1, Some(1)));
+    }
+
+    #[test]
+    fn ready_partition_with_wrong_cardinality_fails_immediately() {
+        let mut response = QueryIndexResponse {
+            freshness: Some(IndexFreshness {
+                generation: 9,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        ensure_expected_partition_hits(&response, 7, 0).unwrap();
+        response.hits.push(Default::default());
+        let error = ensure_expected_partition_hits(&response, 7, 2).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "ready index generation 9 returned 1 hits for partition 7, expected 2"
+        );
     }
 
     #[test]

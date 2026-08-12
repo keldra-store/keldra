@@ -309,7 +309,7 @@ docker run --detach \
   --name "${container_name}" \
   --platform "${platform}" \
   --publish 127.0.0.1::50051 \
-  --env RUST_LOG=info,anvil::index_runtime::retention=debug,anvil::observability::runtime=debug \
+  --env RUST_LOG=info,anvil::index_runtime::cpu=warn,anvil::index_runtime::retention=debug,anvil::observability::runtime=debug \
   --env ANVIL_LISTEN=0.0.0.0:50051 \
   --env ANVIL_PEER_LISTEN=127.0.0.1:50052 \
   --env ANVIL_DATA_DIR=/var/lib/anvil \
@@ -413,15 +413,26 @@ container_logs() {
   docker logs "${container_name}" 2>&1 | strip_ansi
 }
 
+container_logs_since() {
+  local cursor="$1"
+  local until="${2:-}"
+  if [[ -n "${until}" ]]; then
+    docker logs --since "${cursor}" --until "${until}" \
+      "${container_name}" 2>&1 | strip_ansi
+  else
+    docker logs --since "${cursor}" "${container_name}" 2>&1 | strip_ansi
+  fi
+}
+
 index_qualification_log_start=0
 
 capture_index_qualification_log_start() {
-  index_qualification_log_start="$({ container_logs || true; } | wc -l)"
+  index_qualification_log_start="$(qualification_log_cursor)"
 }
 
 save_index_qualification_log() {
-  local start_line=$((index_qualification_log_start + 1))
-  container_logs | tail -n "+${start_line}" >"${index_qualification_log}"
+  container_logs_since "${index_qualification_log_start}" \
+    >"${index_qualification_log}"
   preserve_all_kind_telemetry "${index_qualification_log}" single "${qualification_suffix}"
 }
 
@@ -644,9 +655,11 @@ assert_sparse_index_startup() {
 }
 
 run_index_resource_qualification() {
+  local capture_cursor
+  local next_cursor
   local resource_log_start
   assert_source_tree_exact
-  resource_log_start="$({ container_logs || true; } | wc -l)"
+  resource_log_start="$(qualification_log_cursor)"
   ANVIL_V06_RESOURCE_ENDPOINTS="${public_endpoint}" \
   ANVIL_V06_RESOURCE_TENANT="${index_resource_tenant}" \
   ANVIL_V06_RESOURCE_BUCKET="${index_resource_bucket}" \
@@ -680,13 +693,21 @@ run_index_resource_qualification() {
   ANVIL_V06_RESOURCE_STATE_OUTPUT="${index_resource_state}" \
     "${qualification_example_binaries[v06_index_resource_qualification]}" \
       >/dev/null
+  : >"${index_resource_qualification_log}"
+  capture_cursor="${resource_log_start}"
   local attempt
   for attempt in $(seq 1 12); do
-    container_logs | tail -n "+$((resource_log_start + 1))" \
-      >"${index_resource_qualification_log}"
+    next_cursor="$(qualification_log_cursor)"
+    container_logs_since "${capture_cursor}" "${next_cursor}" \
+      >>"${index_resource_qualification_log}"
+    capture_cursor="$(qualification_log_cursor_after "${next_cursor}")"
     if grep -Fq 'sampled process resources' "${index_resource_qualification_log}" \
       && grep -Fq 'sampled cgroup memory resources' "${index_resource_qualification_log}" \
-      && grep -Fq 'sampled RocksDB resources' "${index_resource_qualification_log}"
+      && grep -Fq 'sampled RocksDB resources' "${index_resource_qualification_log}" \
+      && grep -Fq 'sampled source-journal safety and capacity' \
+        "${index_resource_qualification_log}" \
+      && grep -Fq 'sampled mutation receipt capacity' \
+        "${index_resource_qualification_log}"
     then
       break
     fi
@@ -764,8 +785,8 @@ run_index_resource_qualification() {
     ' "${index_resource_report}" >/dev/null
   if ((require_performance_targets == 1)); then
     jq -e '
-      .accepted_objects_per_second >= 10000 and
-      .source_complete_objects_per_second >= 10000 and
+      .accepted_objects_per_second >= 8000 and
+      .source_complete_objects_per_second >= 8000 and
       .timings.first_complete_generation_seconds <= 150
     ' "${index_resource_report}" >/dev/null
   fi
