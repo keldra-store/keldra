@@ -39,6 +39,10 @@ const METRIC_ATTRIBUTE_KEYS: &[&str] = &[
     "compaction.input_level",
     "compaction.output_level",
     "compaction.lane_limit_reason",
+    "query.admission_outcome",
+    "query.outcome",
+    "fence.outcome",
+    "operation",
     "surface",
     "phase",
     "result",
@@ -389,6 +393,27 @@ mod tests {
                 counter.anvil_metric_attribute_filter_test = 1_i64,
                 "a human-readable message must not become a metric attribute"
             );
+            tracing::info!(
+                index.kind = "typed_json",
+                counter.anvil_index_query_waiting_filter_test = 1_i64
+            );
+            tracing::info!(
+                index.kind = "typed_json",
+                counter.anvil_index_query_waiting_filter_test = -1_i64
+            );
+            tracing::info!(
+                index.kind = "typed_json",
+                query.outcome = "deadline_exceeded",
+                counter.anvil_index_query_outcome_filter_test = 1_i64
+            );
+            tracing::info!(
+                operation = "serving_fence_renewal",
+                counter.anvil_control_plane_active_filter_test = 1_i64
+            );
+            tracing::info!(
+                operation = "serving_fence_renewal",
+                counter.anvil_control_plane_active_filter_test = -1_i64
+            );
         });
         meter_provider.force_flush().unwrap();
 
@@ -421,6 +446,34 @@ mod tests {
                 .iter()
                 .all(|key| key != "message" && key != "index.id" && key != "error")
         );
+
+        let query_waiting = recorded
+            .iter()
+            .rev()
+            .find(|sum| sum.name == "anvil_index_query_waiting_filter_test")
+            .expect("query waiting metric was exported");
+        assert_eq!(query_waiting.points.len(), 1);
+        assert_eq!(query_waiting.points[0].value, 0);
+        assert_eq!(query_waiting.points[0].attribute_keys, ["index.kind"]);
+
+        let query_outcome = recorded
+            .iter()
+            .rev()
+            .find(|sum| sum.name == "anvil_index_query_outcome_filter_test")
+            .expect("query outcome metric was exported");
+        assert_eq!(
+            query_outcome.points[0].attribute_keys,
+            ["index.kind", "query.outcome"]
+        );
+
+        let control_active = recorded
+            .iter()
+            .rev()
+            .find(|sum| sum.name == "anvil_control_plane_active_filter_test")
+            .expect("control-plane active metric was exported");
+        assert_eq!(control_active.points.len(), 1);
+        assert_eq!(control_active.points[0].value, 0);
+        assert_eq!(control_active.points[0].attribute_keys, ["operation"]);
         drop(recorded);
         meter_provider.shutdown().unwrap();
     }

@@ -15,6 +15,7 @@ mod cluster_placement;
 mod cluster_startup;
 mod credential_service;
 mod data_peer;
+mod derived_consumer;
 mod distributed_control_plane;
 mod distributed_list;
 mod distributed_watch;
@@ -50,6 +51,7 @@ mod programs;
 mod reference_delivery;
 mod s3;
 mod serving_fence;
+mod startup_scan_evidence;
 mod v05;
 
 use std::net::SocketAddr;
@@ -73,6 +75,7 @@ use anyhow::{Context, Result};
 
 use authentication::{JwtManager, RateLimitConfig, RequestRateLimits};
 use mutation_admission::{AdmissionSurface, MutationAdmissionService};
+use startup_scan_evidence::{StartupScanEvidence, StartupScanExtent, StartupScanKind};
 
 pub use index_config::{IndexRuntimeConfig, IndexRuntimeConfigError};
 pub use v05::ObjectServiceImpl;
@@ -102,6 +105,7 @@ pub struct ServerConfig {
     pub max_atomic_commit_entries: u32,
     pub max_atomic_commit_bytes: u64,
     pub atomic_program_timeout: Duration,
+    pub index_query_timeout: Duration,
     pub token_manager: JwtManager,
     pub rate_limits: RateLimitConfig,
     pub index_runtime: IndexRuntimeConfig,
@@ -111,11 +115,12 @@ pub struct ServerConfig {
     pub mutation_receipt_retention_seconds: u64,
     pub max_mutation_receipt_entries: u64,
     pub max_mutation_receipt_bytes: u64,
-    pub watch_max_entries: u64,
-    pub watch_max_bytes: u64,
+    pub source_journal_max_entries: u64,
+    pub source_journal_max_bytes: u64,
 }
 
 pub async fn serve(config: ServerConfig) -> Result<()> {
+    let startup_scan_evidence = StartupScanEvidence::begin();
     anyhow::ensure!(
         !config.atomic_program_timeout.is_zero()
             && tokio::time::Instant::now()
@@ -123,9 +128,26 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
                 .is_some(),
         "atomic program timeout must be greater than zero and fit the server clock"
     );
+    anyhow::ensure!(
+        !config.index_query_timeout.is_zero()
+            && tokio::time::Instant::now()
+                .checked_add(config.index_query_timeout)
+                .is_some(),
+        "index query timeout must be greater than zero and fit the server clock"
+    );
     validate_atomic_replay_gc(config.awaiting_publish_ttl_seconds)?;
-    let watch_retention = WatchRetention::new(config.watch_max_entries, config.watch_max_bytes)
-        .context("validate watch retention")?;
+    let index_runtime_config = config
+        .index_runtime
+        .with_source_journal_rebuild_defaults(
+            config.source_journal_max_entries,
+            config.source_journal_max_bytes,
+        )
+        .context("validate index automatic rebuild thresholds")?;
+    let watch_retention = WatchRetention::new(
+        config.source_journal_max_entries,
+        config.source_journal_max_bytes,
+    )
+    .context("validate source-journal retention")?;
     let mutation_receipt_retention = MutationReceiptRetention::new(
         config.mutation_receipt_retention_seconds,
         config.max_mutation_receipt_entries,
@@ -220,6 +242,18 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     )
     .await
     .context("establish initial serving fence after cutover")?;
+    let derived_checkpoints = derived_consumer::DerivedCheckpointPublisher::new(
+        local_node,
+        decisions.clone(),
+        store.clone(),
+        data_transport.clone(),
+    );
+    derived_checkpoints
+        .fence_local_source()
+        .await
+        .context("fence source-journal derived consumers")?;
+    let _derived_consumer_fence =
+        derived_consumer::DerivedConsumerFenceTask::start(derived_checkpoints.clone());
     let (reference_runtime, reference_runtime_handle) = reference_delivery::ReferenceRuntime::start(
         local_node,
         store.clone(),
@@ -382,7 +416,9 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         object_reader.clone(),
         object_lister.clone(),
         &config.data_dir,
-        config.index_runtime,
+        index_runtime_config,
+        derived_checkpoints.clone(),
+        startup_scan_evidence.clone(),
     )
     .await
     .context("initialize distributed index runtime")?;
@@ -394,6 +430,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
             config.token_manager.clone(),
             name_resolver.clone(),
             index_authorization.clone(),
+            Arc::new(object_reader.clone()),
             index_runtime.local_queries.clone(),
         )))
         .map_err(|_| anyhow::anyhow!("routed index query handler was installed more than once"))?;
@@ -406,6 +443,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         index_runtime.event_journal.clone(),
         index_runtime.artifact_router.clone(),
         accounting::AccountingTrafficConfig::default(),
+        derived_checkpoints.clone(),
     )
     .await
     .context("initialize distributed accounting runtime")?;
@@ -466,8 +504,10 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
             authorization: index_authorization,
             page_tokens: Arc::new(config.token_manager.clone()),
             definition_reader: Arc::new(object_reader.clone()),
+            live_versions: Arc::new(object_reader.clone()),
         },
         config.atomic_program_timeout,
+        config.index_query_timeout,
     );
     let personaldb_service = personaldb::PersonalDbServiceImpl::new(
         local_node,
@@ -648,10 +688,21 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         .add_service(credential_service)
         .into_axum_router();
     let gateway_router = s3::router(s3_state).merge(git_gateway::router(git_state));
+    let startup_boundary = startup_scan_evidence.clone();
     let mut public_server =
-        http_gateway::PublicServer::start(config.listen, grpc_router, gateway_router)
-            .await
-            .context("start public gRPC, S3, and Git listener")?;
+        http_gateway::PublicServer::start(config.listen, grpc_router, gateway_router, move || {
+            let startup_scans = startup_boundary.finish();
+            tracing::info!(
+                node_id = local_node.0,
+                global_object_head_scans_total = startup_scans.global_object_head_scans_total,
+                global_index_artifact_scans_total = startup_scans.global_index_artifact_scans_total,
+                global_blob_scans_total = startup_scans.global_blob_scans_total,
+                global_cache_scans_total = startup_scans.global_cache_scans_total,
+                "anvil_startup_scan_evidence"
+            );
+        })
+        .await
+        .context("start public gRPC, S3, and Git listener")?;
     let payload_gc = payload_gc::PayloadGarbageCollector::new(
         local_node,
         store.clone(),
@@ -660,7 +711,12 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         reference_runtime_handle.clone(),
         config.erasure_profile,
     );
-    let blob_gc_task = spawn_blob_gc(store, reference_runtime_handle, payload_gc);
+    let blob_gc_task = spawn_blob_gc(
+        store,
+        reference_runtime_handle,
+        payload_gc,
+        startup_scan_evidence,
+    );
     enum FirstStop {
         Signal(std::io::Result<()>),
         Public(Result<Result<()>, tokio::task::JoinError>),
@@ -728,16 +784,21 @@ fn spawn_blob_gc(
     store: Store,
     references: reference_delivery::ReferenceRuntimeHandle,
     payloads: payload_gc::PayloadGarbageCollector,
+    startup_scan_evidence: StartupScanEvidence,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         tokio::join!(
-            run_blob_gc(store, references),
-            run_payload_retirement(payloads)
+            run_blob_gc(store, references, startup_scan_evidence.clone()),
+            run_payload_retirement(payloads, startup_scan_evidence)
         );
     })
 }
 
-async fn run_blob_gc(store: Store, references: reference_delivery::ReferenceRuntimeHandle) {
+async fn run_blob_gc(
+    store: Store,
+    references: reference_delivery::ReferenceRuntimeHandle,
+    startup_scan_evidence: StartupScanEvidence,
+) {
     let mut cursor = BlobGcCursor::default();
     let budget = BlobGcBudget::new(
         BLOB_GC_RECORDS_PER_TICK,
@@ -748,6 +809,7 @@ async fn run_blob_gc(store: Store, references: reference_delivery::ReferenceRunt
     let mut delay = BLOB_GC_INTERVAL;
     loop {
         tokio::time::sleep(delay).await;
+        startup_scan_evidence.record(StartupScanKind::Blobs, StartupScanExtent::Global);
         let outcome =
             collect_blob_garbage_if_safe(&store, &references, &mut cursor, budget, "scheduled")
                 .await;
@@ -755,10 +817,14 @@ async fn run_blob_gc(store: Store, references: reference_delivery::ReferenceRunt
     }
 }
 
-async fn run_payload_retirement(payloads: payload_gc::PayloadGarbageCollector) {
+async fn run_payload_retirement(
+    payloads: payload_gc::PayloadGarbageCollector,
+    startup_scan_evidence: StartupScanEvidence,
+) {
     let mut delay = BLOB_GC_INTERVAL;
     loop {
         tokio::time::sleep(delay).await;
+        startup_scan_evidence.record(StartupScanKind::Blobs, StartupScanExtent::Global);
         match payloads.run_once().await {
             Ok(tick) => {
                 if tick.retired > 0 {

@@ -24,14 +24,22 @@ pub(crate) struct PublicServer {
 }
 
 impl PublicServer {
-    pub(crate) async fn start(
+    pub(crate) async fn start<F>(
         address: SocketAddr,
         grpc_router: Router,
         gateway_router: Router,
-    ) -> Result<Self> {
+        before_serving: F,
+    ) -> Result<Self>
+    where
+        F: FnOnce(),
+    {
         let listener = tokio::net::TcpListener::bind(address)
             .await
             .with_context(|| format!("bind public listener at {address}"))?;
+        // Nothing can accept from the bound socket until the task below is
+        // spawned. This is the exact initialization/serving boundary used by
+        // startup evidence.
+        before_serving();
         let (shutdown, stopped) = tokio::sync::oneshot::channel();
         let public = service_fn(move |request: Request| {
             let grpc_router = grpc_router.clone();

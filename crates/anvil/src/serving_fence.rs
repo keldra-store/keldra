@@ -13,6 +13,7 @@ use anvil_consensus::{
 use anvil_store::{ObjectMutationContext, PlacementLogId};
 use anyhow::{Context, Result, bail};
 use tonic::{Request, Status};
+use tracing::Instrument;
 
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
@@ -49,6 +50,12 @@ impl ServingAuthority {
 
     pub(crate) fn has_valid_lease(&self) -> bool {
         self.mutation_context().is_ok()
+    }
+
+    fn lease_margin(&self) -> Option<Duration> {
+        self.mutation_context().ok()?;
+        let state = self.state.read().ok()?;
+        state.valid_lease()?.remaining_lifetime()
     }
 
     /// Capture the exact placement and leader term authorizing a mutable
@@ -177,19 +184,126 @@ async fn renewal_loop(
 ) {
     let mut interval = tokio::time::interval(SERVING_LEASE_RENEW_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut ever_held_lease = false;
+    let mut previous_placement = None;
     loop {
-        interval.tick().await;
-        if let Err(error) = renew_once(&decisions, &transport, &authority).await {
-            tracing::debug!(%error, "serving-fence renewal did not produce a grant");
+        let scheduled = interval.tick().await;
+        let started = tokio::time::Instant::now();
+        let lateness = started.saturating_duration_since(scheduled);
+        let lease_was_valid = authority.has_valid_lease();
+        let missed_deadline = ever_held_lease && !lease_was_valid;
+        let span = tracing::info_span!(
+            "anvil.serving_fence.renewal",
+            operation = "serving_fence_renewal",
+            fence.outcome = tracing::field::Empty,
+            fence.placement_term = tracing::field::Empty,
+            fence.placement_index = tracing::field::Empty,
+            fence.leader_node_id = tracing::field::Empty,
+            fence.renewal_lateness_seconds = lateness.as_secs_f64(),
+            fence.lease_margin_seconds = tracing::field::Empty,
+            fence.elapsed_seconds = tracing::field::Empty,
+            otel.status_code = tracing::field::Empty,
+        );
+        span.in_scope(|| {
+            tracing::info!(
+                operation = "serving_fence_renewal",
+                counter.anvil_control_plane_tasks_active = 1_i64,
+                "serving-fence renewal started"
+            );
+        });
+        let result = renew_once(&decisions, &transport, &authority)
+            .instrument(span.clone())
+            .await;
+        let elapsed = started.elapsed();
+        span.record("fence.elapsed_seconds", elapsed.as_secs_f64());
+        match result {
+            Ok(observation) => {
+                ever_held_lease = true;
+                span.record("fence.outcome", "renewed");
+                span.record("fence.placement_term", observation.placement.term);
+                span.record("fence.placement_index", observation.placement.index);
+                span.record("fence.leader_node_id", observation.leader.0);
+                span.record(
+                    "fence.lease_margin_seconds",
+                    observation.lease_margin.as_secs_f64(),
+                );
+                span.record("otel.status_code", "ok");
+                let placement_changed = previous_placement != Some(observation.placement);
+                previous_placement = Some(observation.placement);
+                span.in_scope(|| {
+                    tracing::info!(
+                        operation = "serving_fence_renewal",
+                        fence.outcome = "renewed",
+                        monotonic_counter.anvil_serving_fence_renewals_total = 1_u64,
+                        monotonic_counter.anvil_serving_fence_failures_total = 0_u64,
+                        monotonic_counter.anvil_serving_fence_missed_deadlines_total =
+                            u64::from(missed_deadline),
+                        monotonic_counter.anvil_serving_fence_membership_progress_total =
+                            u64::from(placement_changed),
+                        gauge.anvil_serving_fence_valid = 1_u64,
+                        histogram.anvil_serving_fence_renewal_duration_seconds =
+                            elapsed.as_secs_f64(),
+                        histogram.anvil_serving_fence_renewal_lateness_seconds =
+                            lateness.as_secs_f64(),
+                        histogram.anvil_serving_fence_lease_margin_seconds =
+                            observation.lease_margin.as_secs_f64(),
+                        placement_term = observation.placement.term,
+                        placement_index = observation.placement.index,
+                        leader_node_id = observation.leader.0,
+                        "serving-fence renewal completed"
+                    );
+                });
+            }
+            Err(error) => {
+                let lease_margin = authority.lease_margin();
+                span.record("fence.outcome", "failed");
+                if let Some(lease_margin) = lease_margin {
+                    span.record("fence.lease_margin_seconds", lease_margin.as_secs_f64());
+                }
+                span.record("otel.status_code", "error");
+                span.in_scope(|| {
+                    tracing::warn!(
+                        operation = "serving_fence_renewal",
+                        fence.outcome = "failed",
+                        monotonic_counter.anvil_serving_fence_renewals_total = 1_u64,
+                        monotonic_counter.anvil_serving_fence_failures_total = 1_u64,
+                        monotonic_counter.anvil_serving_fence_missed_deadlines_total =
+                            u64::from(missed_deadline),
+                        gauge.anvil_serving_fence_valid = u64::from(authority.has_valid_lease()),
+                        histogram.anvil_serving_fence_renewal_duration_seconds =
+                            elapsed.as_secs_f64(),
+                        histogram.anvil_serving_fence_renewal_lateness_seconds =
+                            lateness.as_secs_f64(),
+                        histogram.anvil_serving_fence_lease_margin_seconds =
+                            lease_margin.unwrap_or(Duration::ZERO).as_secs_f64(),
+                        %error,
+                        "serving-fence renewal did not produce a grant"
+                    );
+                });
+            }
         }
+        span.in_scope(|| {
+            tracing::info!(
+                operation = "serving_fence_renewal",
+                counter.anvil_control_plane_tasks_active = -1_i64,
+                "serving-fence renewal released"
+            );
+        });
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RenewalObservation {
+    placement: PlacementLogId,
+    leader: NodeId,
+    lease_margin: Duration,
 }
 
 async fn renew_once(
     decisions: &DecisionRaft,
     transport: &TonicPeerTransport,
     authority: &ServingAuthority,
-) -> Result<()> {
+) -> Result<RenewalObservation> {
     let state = decisions.state().context("read applied serving state")?;
     let cluster_id = state
         .cluster_id()
@@ -230,13 +344,20 @@ async fn renew_once(
         .request_serving_lease(leader, &peer, pending.request())
         .await
         .context("request serving grant from current leader")?;
-    authority
+    let lease = authority
         .state
         .write()
         .map_err(|_| anyhow::anyhow!("serving-fence state lock is poisoned"))?
         .accept_grant(pending, grant)
         .context("accept current leader serving grant")?;
-    Ok(())
+    Ok(RenewalObservation {
+        placement: PlacementLogId {
+            term: placement.leader_id.term,
+            index: placement.index,
+        },
+        leader: NodeId(leader),
+        lease_margin: lease.remaining_lifetime().unwrap_or(Duration::ZERO),
+    })
 }
 
 /// Only the current ACTIVE leader repairs a missing or ineligible executor.

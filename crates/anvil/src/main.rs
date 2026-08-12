@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 #[derive(Debug, Parser)]
-#[command(name = "anvil-server", version, about = "Anvil 0.7 object server")]
+#[command(name = "anvil-server", version, about = "Anvil 0.8 object server")]
 struct Arguments {
     #[arg(long, env = "ANVIL_LISTEN", default_value = "127.0.0.1:50051")]
     listen: SocketAddr,
@@ -60,6 +60,10 @@ struct Arguments {
         default_value = "30"
     )]
     atomic_program_timeout_seconds: NonZeroU64,
+
+    /// Maximum wall time for one QueryIndex RPC; shorter client deadlines still win.
+    #[arg(long, env = "ANVIL_INDEX_QUERY_TIMEOUT_SECONDS", default_value = "300")]
+    index_query_timeout_seconds: NonZeroU64,
 
     #[arg(long, env = "ANVIL_TOKEN_SIGNING_KEY_FILE")]
     token_signing_key_file: PathBuf,
@@ -159,6 +163,13 @@ struct Arguments {
     )]
     index_path_compaction_max_lanes: u32,
 
+    #[arg(long, env = "ANVIL_INDEX_PATH_PROJECTION_MAX_LANES", default_value_t = IndexRuntimeConfig::DEFAULT_PROJECTION_MAX_LANES)]
+    index_path_projection_max_lanes: u32,
+    #[arg(long, env = "ANVIL_INDEX_PATH_SOURCE_QUANTUM_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_SOURCE_QUANTUM_BYTES)]
+    index_path_source_quantum_bytes: u64,
+    #[arg(long, env = "ANVIL_INDEX_PATH_EXTERNAL_SORT_CHUNK_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_EXTERNAL_SORT_CHUNK_BYTES)]
+    index_path_external_sort_chunk_bytes: u64,
+
     /// Metadata-filter builder-memory override; absent uses the common fallback.
     #[arg(long, env = "ANVIL_INDEX_METADATA_FILTER_BUILDER_MEMORY_BYTES")]
     index_metadata_filter_builder_memory_bytes: Option<u64>,
@@ -170,6 +181,13 @@ struct Arguments {
         default_value_t = IndexRuntimeConfig::DEFAULT_COMPACTION_MAX_LANES
     )]
     index_metadata_filter_compaction_max_lanes: u32,
+
+    #[arg(long, env = "ANVIL_INDEX_METADATA_FILTER_PROJECTION_MAX_LANES", default_value_t = IndexRuntimeConfig::DEFAULT_PROJECTION_MAX_LANES)]
+    index_metadata_filter_projection_max_lanes: u32,
+    #[arg(long, env = "ANVIL_INDEX_METADATA_FILTER_SOURCE_QUANTUM_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_SOURCE_QUANTUM_BYTES)]
+    index_metadata_filter_source_quantum_bytes: u64,
+    #[arg(long, env = "ANVIL_INDEX_METADATA_FILTER_EXTERNAL_SORT_CHUNK_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_EXTERNAL_SORT_CHUNK_BYTES)]
+    index_metadata_filter_external_sort_chunk_bytes: u64,
 
     /// Typed-JSON builder-memory override; absent uses the common fallback.
     #[arg(long, env = "ANVIL_INDEX_TYPED_JSON_BUILDER_MEMORY_BYTES")]
@@ -183,6 +201,13 @@ struct Arguments {
     )]
     index_typed_json_compaction_max_lanes: u32,
 
+    #[arg(long, env = "ANVIL_INDEX_TYPED_JSON_PROJECTION_MAX_LANES", default_value_t = IndexRuntimeConfig::DEFAULT_PROJECTION_MAX_LANES)]
+    index_typed_json_projection_max_lanes: u32,
+    #[arg(long, env = "ANVIL_INDEX_TYPED_JSON_SOURCE_QUANTUM_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_SOURCE_QUANTUM_BYTES)]
+    index_typed_json_source_quantum_bytes: u64,
+    #[arg(long, env = "ANVIL_INDEX_TYPED_JSON_EXTERNAL_SORT_CHUNK_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_EXTERNAL_SORT_CHUNK_BYTES)]
+    index_typed_json_external_sort_chunk_bytes: u64,
+
     /// Full-text builder-memory override; absent uses the common fallback.
     #[arg(long, env = "ANVIL_INDEX_FULL_TEXT_BUILDER_MEMORY_BYTES")]
     index_full_text_builder_memory_bytes: Option<u64>,
@@ -194,6 +219,13 @@ struct Arguments {
         default_value_t = IndexRuntimeConfig::DEFAULT_COMPACTION_MAX_LANES
     )]
     index_full_text_compaction_max_lanes: u32,
+
+    #[arg(long, env = "ANVIL_INDEX_FULL_TEXT_PROJECTION_MAX_LANES", default_value_t = IndexRuntimeConfig::DEFAULT_PROJECTION_MAX_LANES)]
+    index_full_text_projection_max_lanes: u32,
+    #[arg(long, env = "ANVIL_INDEX_FULL_TEXT_SOURCE_QUANTUM_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_SOURCE_QUANTUM_BYTES)]
+    index_full_text_source_quantum_bytes: u64,
+    #[arg(long, env = "ANVIL_INDEX_FULL_TEXT_EXTERNAL_SORT_CHUNK_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_EXTERNAL_SORT_CHUNK_BYTES)]
+    index_full_text_external_sort_chunk_bytes: u64,
 
     /// Vector builder-memory override; absent uses the common fallback.
     #[arg(long, env = "ANVIL_INDEX_VECTOR_BUILDER_MEMORY_BYTES")]
@@ -207,6 +239,13 @@ struct Arguments {
     )]
     index_vector_compaction_max_lanes: u32,
 
+    #[arg(long, env = "ANVIL_INDEX_VECTOR_PROJECTION_MAX_LANES", default_value_t = IndexRuntimeConfig::DEFAULT_PROJECTION_MAX_LANES)]
+    index_vector_projection_max_lanes: u32,
+    #[arg(long, env = "ANVIL_INDEX_VECTOR_SOURCE_QUANTUM_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_SOURCE_QUANTUM_BYTES)]
+    index_vector_source_quantum_bytes: u64,
+    #[arg(long, env = "ANVIL_INDEX_VECTOR_EXTERNAL_SORT_CHUNK_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_EXTERNAL_SORT_CHUNK_BYTES)]
+    index_vector_external_sort_chunk_bytes: u64,
+
     /// Hybrid builder-memory override; absent uses the common fallback.
     #[arg(long, env = "ANVIL_INDEX_HYBRID_BUILDER_MEMORY_BYTES")]
     index_hybrid_builder_memory_bytes: Option<u64>,
@@ -218,6 +257,13 @@ struct Arguments {
         default_value_t = IndexRuntimeConfig::DEFAULT_COMPACTION_MAX_LANES
     )]
     index_hybrid_compaction_max_lanes: u32,
+
+    #[arg(long, env = "ANVIL_INDEX_HYBRID_PROJECTION_MAX_LANES", default_value_t = IndexRuntimeConfig::DEFAULT_PROJECTION_MAX_LANES)]
+    index_hybrid_projection_max_lanes: u32,
+    #[arg(long, env = "ANVIL_INDEX_HYBRID_SOURCE_QUANTUM_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_SOURCE_QUANTUM_BYTES)]
+    index_hybrid_source_quantum_bytes: u64,
+    #[arg(long, env = "ANVIL_INDEX_HYBRID_EXTERNAL_SORT_CHUNK_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_EXTERNAL_SORT_CHUNK_BYTES)]
+    index_hybrid_external_sort_chunk_bytes: u64,
 
     /// Git-source builder-memory override; absent uses the common fallback.
     #[arg(long, env = "ANVIL_INDEX_GIT_SOURCE_BUILDER_MEMORY_BYTES")]
@@ -231,6 +277,13 @@ struct Arguments {
     )]
     index_git_source_compaction_max_lanes: u32,
 
+    #[arg(long, env = "ANVIL_INDEX_GIT_SOURCE_PROJECTION_MAX_LANES", default_value_t = IndexRuntimeConfig::DEFAULT_PROJECTION_MAX_LANES)]
+    index_git_source_projection_max_lanes: u32,
+    #[arg(long, env = "ANVIL_INDEX_GIT_SOURCE_SOURCE_QUANTUM_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_SOURCE_QUANTUM_BYTES)]
+    index_git_source_source_quantum_bytes: u64,
+    #[arg(long, env = "ANVIL_INDEX_GIT_SOURCE_EXTERNAL_SORT_CHUNK_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_EXTERNAL_SORT_CHUNK_BYTES)]
+    index_git_source_external_sort_chunk_bytes: u64,
+
     /// Tensor builder-memory override; absent uses the common fallback.
     #[arg(long, env = "ANVIL_INDEX_TENSOR_BUILDER_MEMORY_BYTES")]
     index_tensor_builder_memory_bytes: Option<u64>,
@@ -243,6 +296,13 @@ struct Arguments {
     )]
     index_tensor_compaction_max_lanes: u32,
 
+    #[arg(long, env = "ANVIL_INDEX_TENSOR_PROJECTION_MAX_LANES", default_value_t = IndexRuntimeConfig::DEFAULT_PROJECTION_MAX_LANES)]
+    index_tensor_projection_max_lanes: u32,
+    #[arg(long, env = "ANVIL_INDEX_TENSOR_SOURCE_QUANTUM_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_SOURCE_QUANTUM_BYTES)]
+    index_tensor_source_quantum_bytes: u64,
+    #[arg(long, env = "ANVIL_INDEX_TENSOR_EXTERNAL_SORT_CHUNK_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_EXTERNAL_SORT_CHUNK_BYTES)]
+    index_tensor_external_sort_chunk_bytes: u64,
+
     /// Threads in Anvil's process-owned index CPU pool (default: 4).
     #[arg(
         long,
@@ -250,6 +310,84 @@ struct Arguments {
         default_value_t = IndexRuntimeConfig::DEFAULT_RAYON_WORKERS
     )]
     index_rayon_workers: u32,
+
+    /// Maximum index queries executing concurrently on this node (default: 64).
+    #[arg(
+        long,
+        env = "ANVIL_INDEX_QUERY_MAX_CONCURRENCY",
+        default_value_t = IndexRuntimeConfig::DEFAULT_QUERY_MAX_CONCURRENCY
+    )]
+    index_query_max_concurrency: u32,
+
+    /// Cache-read bytes processed by one query before it cooperatively yields (default: 4 MiB).
+    #[arg(
+        long,
+        env = "ANVIL_INDEX_QUERY_WORK_QUANTUM_BYTES",
+        default_value_t = IndexRuntimeConfig::DEFAULT_QUERY_WORK_QUANTUM_BYTES
+    )]
+    index_query_work_quantum_bytes: u64,
+
+    /// Fallback maximum runs retained at one index level before builders compact (default: 64).
+    #[arg(
+        long,
+        env = "ANVIL_INDEX_MAX_RUNS_PER_LEVEL",
+        default_value_t = IndexRuntimeConfig::DEFAULT_MAX_RUNS_PER_LEVEL
+    )]
+    index_max_runs_per_level: u32,
+
+    /// Fallback maximum encoded uncompacted bytes at one index level (default: 1 GiB).
+    #[arg(
+        long,
+        env = "ANVIL_INDEX_MAX_UNCOMPACTED_BYTES_PER_LEVEL",
+        default_value_t = IndexRuntimeConfig::DEFAULT_MAX_UNCOMPACTED_BYTES_PER_LEVEL
+    )]
+    index_max_uncompacted_bytes_per_level: u64,
+
+    #[arg(long, env = "ANVIL_INDEX_PATH_MAX_RUNS_PER_LEVEL")]
+    index_path_max_runs_per_level: Option<u32>,
+    #[arg(long, env = "ANVIL_INDEX_PATH_MAX_UNCOMPACTED_BYTES_PER_LEVEL")]
+    index_path_max_uncompacted_bytes_per_level: Option<u64>,
+    #[arg(long, env = "ANVIL_INDEX_METADATA_FILTER_MAX_RUNS_PER_LEVEL")]
+    index_metadata_filter_max_runs_per_level: Option<u32>,
+    #[arg(
+        long,
+        env = "ANVIL_INDEX_METADATA_FILTER_MAX_UNCOMPACTED_BYTES_PER_LEVEL"
+    )]
+    index_metadata_filter_max_uncompacted_bytes_per_level: Option<u64>,
+    #[arg(long, env = "ANVIL_INDEX_TYPED_JSON_MAX_RUNS_PER_LEVEL")]
+    index_typed_json_max_runs_per_level: Option<u32>,
+    #[arg(long, env = "ANVIL_INDEX_TYPED_JSON_MAX_UNCOMPACTED_BYTES_PER_LEVEL")]
+    index_typed_json_max_uncompacted_bytes_per_level: Option<u64>,
+    #[arg(long, env = "ANVIL_INDEX_FULL_TEXT_MAX_RUNS_PER_LEVEL")]
+    index_full_text_max_runs_per_level: Option<u32>,
+    #[arg(long, env = "ANVIL_INDEX_FULL_TEXT_MAX_UNCOMPACTED_BYTES_PER_LEVEL")]
+    index_full_text_max_uncompacted_bytes_per_level: Option<u64>,
+    #[arg(long, env = "ANVIL_INDEX_VECTOR_MAX_RUNS_PER_LEVEL")]
+    index_vector_max_runs_per_level: Option<u32>,
+    #[arg(long, env = "ANVIL_INDEX_VECTOR_MAX_UNCOMPACTED_BYTES_PER_LEVEL")]
+    index_vector_max_uncompacted_bytes_per_level: Option<u64>,
+    #[arg(long, env = "ANVIL_INDEX_HYBRID_MAX_RUNS_PER_LEVEL")]
+    index_hybrid_max_runs_per_level: Option<u32>,
+    #[arg(long, env = "ANVIL_INDEX_HYBRID_MAX_UNCOMPACTED_BYTES_PER_LEVEL")]
+    index_hybrid_max_uncompacted_bytes_per_level: Option<u64>,
+    #[arg(long, env = "ANVIL_INDEX_GIT_SOURCE_MAX_RUNS_PER_LEVEL")]
+    index_git_source_max_runs_per_level: Option<u32>,
+    #[arg(long, env = "ANVIL_INDEX_GIT_SOURCE_MAX_UNCOMPACTED_BYTES_PER_LEVEL")]
+    index_git_source_max_uncompacted_bytes_per_level: Option<u64>,
+    #[arg(long, env = "ANVIL_INDEX_TENSOR_MAX_RUNS_PER_LEVEL")]
+    index_tensor_max_runs_per_level: Option<u32>,
+    #[arg(long, env = "ANVIL_INDEX_TENSOR_MAX_UNCOMPACTED_BYTES_PER_LEVEL")]
+    index_tensor_max_uncompacted_bytes_per_level: Option<u64>,
+
+    /// Bucket-routed source events which trigger a scoped bulk rebuild.
+    /// Absent defaults to 50% of --source-journal-max-entries.
+    #[arg(long, env = "ANVIL_INDEX_AUTO_REBUILD_LAG_ENTRIES")]
+    index_auto_rebuild_lag_entries: Option<u64>,
+
+    /// Bucket-routed source bytes which trigger a scoped bulk rebuild.
+    /// Absent defaults to 50% of --source-journal-max-bytes.
+    #[arg(long, env = "ANVIL_INDEX_AUTO_REBUILD_LAG_BYTES")]
+    index_auto_rebuild_lag_bytes: Option<u64>,
 
     /// Maximum generations retained per index, including current (default: 3).
     #[arg(
@@ -327,19 +465,21 @@ struct Arguments {
     )]
     max_mutation_receipt_bytes: u64,
 
+    /// Maximum retained entries in each node's ordered source journal.
     #[arg(
         long,
-        env = "ANVIL_WATCH_MAX_ENTRIES",
+        env = "ANVIL_SOURCE_JOURNAL_MAX_ENTRIES",
         default_value_t = anvil_store::DEFAULT_WATCH_MAX_ENTRIES
     )]
-    watch_max_entries: u64,
+    source_journal_max_entries: u64,
 
+    /// Maximum retained logical bytes in each node's ordered source journal.
     #[arg(
         long,
-        env = "ANVIL_WATCH_MAX_BYTES",
+        env = "ANVIL_SOURCE_JOURNAL_MAX_BYTES",
         default_value_t = anvil_store::DEFAULT_WATCH_MAX_BYTES
     )]
-    watch_max_bytes: u64,
+    source_journal_max_bytes: u64,
 }
 
 impl Arguments {
@@ -353,7 +493,7 @@ impl Arguments {
     }
 
     fn index_runtime_config(&self) -> Result<IndexRuntimeConfig> {
-        let mut config = IndexRuntimeConfig::new(
+        let config = IndexRuntimeConfig::new(
             self.index_disk_cache_bytes,
             self.index_memory_percent,
             self.index_builder_memory_bytes_per_kind,
@@ -362,55 +502,135 @@ impl Arguments {
             self.index_max_generation_age_hours,
             self.index_max_retained_generation_bytes,
         )
+        .context("validate index runtime configuration")?
+        .with_query_max_concurrency(self.index_query_max_concurrency)
+        .and_then(|config| {
+            config.with_query_work_quantum_bytes(self.index_query_work_quantum_bytes)
+        })
         .context("validate index runtime configuration")?;
-        for (kind, memory, lanes) in [
+        let mut config = if self.index_auto_rebuild_lag_entries.is_some()
+            || self.index_auto_rebuild_lag_bytes.is_some()
+        {
+            config.with_auto_rebuild_lag_thresholds(
+                self.index_auto_rebuild_lag_entries
+                    .unwrap_or_else(|| half_nonzero_bound(self.source_journal_max_entries)),
+                self.index_auto_rebuild_lag_bytes
+                    .unwrap_or_else(|| half_nonzero_bound(self.source_journal_max_bytes)),
+            )
+        } else {
+            config.with_source_journal_rebuild_defaults(
+                self.source_journal_max_entries,
+                self.source_journal_max_bytes,
+            )
+        }
+        .context("validate index runtime configuration")?;
+        for (
+            kind,
+            memory,
+            projection_lanes,
+            source_quantum,
+            sort_chunk,
+            compaction_lanes,
+            max_runs,
+            max_bytes,
+        ) in [
             (
                 IndexKind::Path,
                 self.index_path_builder_memory_bytes,
+                self.index_path_projection_max_lanes,
+                self.index_path_source_quantum_bytes,
+                self.index_path_external_sort_chunk_bytes,
                 self.index_path_compaction_max_lanes,
+                self.index_path_max_runs_per_level,
+                self.index_path_max_uncompacted_bytes_per_level,
             ),
             (
                 IndexKind::MetadataFilter,
                 self.index_metadata_filter_builder_memory_bytes,
+                self.index_metadata_filter_projection_max_lanes,
+                self.index_metadata_filter_source_quantum_bytes,
+                self.index_metadata_filter_external_sort_chunk_bytes,
                 self.index_metadata_filter_compaction_max_lanes,
+                self.index_metadata_filter_max_runs_per_level,
+                self.index_metadata_filter_max_uncompacted_bytes_per_level,
             ),
             (
                 IndexKind::TypedJson,
                 self.index_typed_json_builder_memory_bytes,
+                self.index_typed_json_projection_max_lanes,
+                self.index_typed_json_source_quantum_bytes,
+                self.index_typed_json_external_sort_chunk_bytes,
                 self.index_typed_json_compaction_max_lanes,
+                self.index_typed_json_max_runs_per_level,
+                self.index_typed_json_max_uncompacted_bytes_per_level,
             ),
             (
                 IndexKind::FullText,
                 self.index_full_text_builder_memory_bytes,
+                self.index_full_text_projection_max_lanes,
+                self.index_full_text_source_quantum_bytes,
+                self.index_full_text_external_sort_chunk_bytes,
                 self.index_full_text_compaction_max_lanes,
+                self.index_full_text_max_runs_per_level,
+                self.index_full_text_max_uncompacted_bytes_per_level,
             ),
             (
                 IndexKind::Vector,
                 self.index_vector_builder_memory_bytes,
+                self.index_vector_projection_max_lanes,
+                self.index_vector_source_quantum_bytes,
+                self.index_vector_external_sort_chunk_bytes,
                 self.index_vector_compaction_max_lanes,
+                self.index_vector_max_runs_per_level,
+                self.index_vector_max_uncompacted_bytes_per_level,
             ),
             (
                 IndexKind::Hybrid,
                 self.index_hybrid_builder_memory_bytes,
+                self.index_hybrid_projection_max_lanes,
+                self.index_hybrid_source_quantum_bytes,
+                self.index_hybrid_external_sort_chunk_bytes,
                 self.index_hybrid_compaction_max_lanes,
+                self.index_hybrid_max_runs_per_level,
+                self.index_hybrid_max_uncompacted_bytes_per_level,
             ),
             (
                 IndexKind::GitSource,
                 self.index_git_source_builder_memory_bytes,
+                self.index_git_source_projection_max_lanes,
+                self.index_git_source_source_quantum_bytes,
+                self.index_git_source_external_sort_chunk_bytes,
                 self.index_git_source_compaction_max_lanes,
+                self.index_git_source_max_runs_per_level,
+                self.index_git_source_max_uncompacted_bytes_per_level,
             ),
             (
                 IndexKind::Tensor,
                 self.index_tensor_builder_memory_bytes,
+                self.index_tensor_projection_max_lanes,
+                self.index_tensor_source_quantum_bytes,
+                self.index_tensor_external_sort_chunk_bytes,
                 self.index_tensor_compaction_max_lanes,
+                self.index_tensor_max_runs_per_level,
+                self.index_tensor_max_uncompacted_bytes_per_level,
             ),
         ] {
             config = config
                 .with_kind_limits(
                     kind,
                     memory.unwrap_or(self.index_builder_memory_bytes_per_kind),
-                    lanes,
+                    compaction_lanes,
                 )
+                .and_then(|config| config.with_kind_projection_max_lanes(kind, projection_lanes))
+                .and_then(|config| config.with_kind_source_quantum_bytes(kind, source_quantum))
+                .and_then(|config| config.with_kind_external_sort_chunk_bytes(kind, sort_chunk))
+                .and_then(|config| {
+                    config.with_kind_compaction_debt_limits(
+                        kind,
+                        max_runs.unwrap_or(self.index_max_runs_per_level),
+                        max_bytes.unwrap_or(self.index_max_uncompacted_bytes_per_level),
+                    )
+                })
                 .context("validate index runtime configuration")?;
         }
         Ok(config)
@@ -448,6 +668,9 @@ async fn main() -> Result<()> {
         atomic_program_timeout: std::time::Duration::from_secs(
             arguments.atomic_program_timeout_seconds.get(),
         ),
+        index_query_timeout: std::time::Duration::from_secs(
+            arguments.index_query_timeout_seconds.get(),
+        ),
         token_manager,
         rate_limits: RateLimitConfig {
             global_per_second: arguments.rate_limit_global_per_second,
@@ -467,8 +690,8 @@ async fn main() -> Result<()> {
         mutation_receipt_retention_seconds: arguments.mutation_receipt_retention_seconds,
         max_mutation_receipt_entries: arguments.max_mutation_receipt_entries,
         max_mutation_receipt_bytes: arguments.max_mutation_receipt_bytes,
-        watch_max_entries: arguments.watch_max_entries,
-        watch_max_bytes: arguments.watch_max_bytes,
+        source_journal_max_entries: arguments.source_journal_max_entries,
+        source_journal_max_bytes: arguments.source_journal_max_bytes,
     })
     .await;
     let observability_result = observability.shutdown().await;
@@ -484,6 +707,10 @@ async fn main() -> Result<()> {
             Err(server_error)
         }
     }
+}
+
+const fn half_nonzero_bound(bound: u64) -> u64 {
+    bound / 2 + bound % 2
 }
 
 #[cfg(test)]
@@ -567,6 +794,22 @@ mod tests {
     }
 
     #[test]
+    fn index_query_timeout_is_independent_from_the_ordinary_request_maximum() {
+        let defaults = parse(&[]);
+        assert_eq!(defaults.atomic_program_timeout_seconds.get(), 30);
+        assert_eq!(defaults.index_query_timeout_seconds.get(), 300);
+
+        let configured = parse(&[
+            "--atomic-program-timeout-seconds",
+            "12",
+            "--index-query-timeout-seconds",
+            "600",
+        ]);
+        assert_eq!(configured.atomic_program_timeout_seconds.get(), 12);
+        assert_eq!(configured.index_query_timeout_seconds.get(), 600);
+    }
+
+    #[test]
     fn index_runtime_defaults_are_wired_to_startup_configuration() {
         assert_eq!(
             parse(&[]).index_runtime_config().unwrap(),
@@ -587,8 +830,30 @@ mod tests {
             "67108864",
             "--index-path-compaction-max-lanes",
             "3",
+            "--index-path-projection-max-lanes",
+            "2",
+            "--index-path-source-quantum-bytes",
+            "8388608",
+            "--index-path-external-sort-chunk-bytes",
+            "4194304",
             "--index-rayon-workers",
             "6",
+            "--index-query-max-concurrency",
+            "17",
+            "--index-query-work-quantum-bytes",
+            "1048576",
+            "--index-max-runs-per-level",
+            "12",
+            "--index-max-uncompacted-bytes-per-level",
+            "10485760",
+            "--index-path-max-runs-per-level",
+            "8",
+            "--index-path-max-uncompacted-bytes-per-level",
+            "5242880",
+            "--index-auto-rebuild-lag-entries",
+            "12345",
+            "--index-auto-rebuild-lag-bytes",
+            "67890",
             "--index-max-retained-generations",
             "7",
             "--index-max-generation-age-hours",
@@ -603,12 +868,29 @@ mod tests {
         assert_eq!(config.builder_memory_bytes_per_kind(), 33_554_432);
         assert_eq!(config.builder_memory_bytes(IndexKind::Path), 67_108_864);
         assert_eq!(config.compaction_max_lanes(IndexKind::Path), 3);
+        assert_eq!(config.projection_max_lanes(IndexKind::Path), 2);
+        assert_eq!(config.source_quantum_bytes(IndexKind::Path), 8_388_608);
+        assert_eq!(config.external_sort_chunk_bytes(IndexKind::Path), 4_194_304);
         assert_eq!(
             config.builder_memory_bytes(IndexKind::TypedJson),
             33_554_432
         );
         assert_eq!(config.compaction_max_lanes(IndexKind::TypedJson), 4);
         assert_eq!(config.rayon_workers(), 6);
+        assert_eq!(config.query_max_concurrency(), 17);
+        assert_eq!(config.query_work_quantum_bytes(), 1_048_576);
+        assert_eq!(config.max_runs_per_level(IndexKind::Path), 8);
+        assert_eq!(
+            config.max_uncompacted_bytes_per_level(IndexKind::Path),
+            5_242_880
+        );
+        assert_eq!(config.max_runs_per_level(IndexKind::TypedJson), 12);
+        assert_eq!(
+            config.max_uncompacted_bytes_per_level(IndexKind::TypedJson),
+            10_485_760
+        );
+        assert_eq!(config.auto_rebuild_lag_entries(), 12_345);
+        assert_eq!(config.auto_rebuild_lag_bytes(), 67_890);
         assert_eq!(config.max_retained_generations(), 7);
         assert_eq!(config.max_generation_age_hours(), 48);
         assert_eq!(config.max_retained_generation_bytes(), 2_097_152);
@@ -622,8 +904,19 @@ mod tests {
             vec!["--index-memory-percent", "101"],
             vec!["--index-builder-memory-bytes-per-kind", "0"],
             vec!["--index-vector-builder-memory-bytes", "0"],
+            vec!["--index-vector-projection-max-lanes", "0"],
+            vec!["--index-vector-source-quantum-bytes", "0"],
+            vec!["--index-vector-external-sort-chunk-bytes", "0"],
             vec!["--index-vector-compaction-max-lanes", "0"],
             vec!["--index-rayon-workers", "0"],
+            vec!["--index-query-max-concurrency", "0"],
+            vec!["--index-query-work-quantum-bytes", "0"],
+            vec!["--index-max-runs-per-level", "0"],
+            vec!["--index-max-uncompacted-bytes-per-level", "0"],
+            vec!["--index-vector-max-runs-per-level", "0"],
+            vec!["--index-vector-max-uncompacted-bytes-per-level", "0"],
+            vec!["--index-auto-rebuild-lag-entries", "0"],
+            vec!["--index-auto-rebuild-lag-bytes", "0"],
             vec!["--index-max-retained-generations", "0"],
             vec!["--index-max-generation-age-hours", "0"],
             vec!["--index-max-retained-generation-bytes", "0"],
@@ -638,6 +931,20 @@ mod tests {
     }
 
     #[test]
+    fn automatic_rebuild_defaults_follow_source_journal_bounds() {
+        let config = parse(&[
+            "--source-journal-max-entries",
+            "101",
+            "--source-journal-max-bytes",
+            "1001",
+        ])
+        .index_runtime_config()
+        .unwrap();
+        assert_eq!(config.auto_rebuild_lag_entries(), 51);
+        assert_eq!(config.auto_rebuild_lag_bytes(), 501);
+    }
+
+    #[test]
     fn index_runtime_defaults_and_meaning_are_visible_in_help() {
         let help = Arguments::command().render_long_help().to_string();
         for expected in [
@@ -649,10 +956,32 @@ mod tests {
             "default: 256 MiB",
             "--index-path-builder-memory-bytes",
             "--index-path-compaction-max-lanes",
+            "--index-path-projection-max-lanes",
+            "--index-path-source-quantum-bytes",
+            "--index-path-external-sort-chunk-bytes",
             "--index-tensor-builder-memory-bytes",
             "--index-tensor-compaction-max-lanes",
+            "--index-tensor-projection-max-lanes",
+            "--index-tensor-source-quantum-bytes",
+            "--index-tensor-external-sort-chunk-bytes",
             "--index-rayon-workers",
+            "--index-query-max-concurrency",
+            "--index-query-work-quantum-bytes",
             "default: 4",
+            "--index-max-runs-per-level",
+            "default: 64",
+            "--index-max-uncompacted-bytes-per-level",
+            "default: 1 GiB",
+            "--index-path-max-runs-per-level",
+            "--index-path-max-uncompacted-bytes-per-level",
+            "--index-tensor-max-runs-per-level",
+            "--index-tensor-max-uncompacted-bytes-per-level",
+            "--index-auto-rebuild-lag-entries",
+            "50% of --source-journal-max-entries",
+            "--index-auto-rebuild-lag-bytes",
+            "50% of --source-journal-max-bytes",
+            "--source-journal-max-entries",
+            "--source-journal-max-bytes",
             "--index-max-retained-generations",
             "including current",
             "--index-max-generation-age-hours",

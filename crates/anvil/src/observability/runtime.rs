@@ -3,7 +3,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anvil_store::{MetadataRuntimeMetrics, Store};
+use anvil_store::{MetadataRuntimeMetrics, SourceJournalRuntimeMetrics, Store};
 use anyhow::{Context, Result, anyhow};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
@@ -22,10 +22,11 @@ impl RuntimeMetricsTask {
         let task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(SAMPLE_INTERVAL);
             let mut failure_logs = FailureLogs::default();
+            let mut receipt_capacity = ReceiptCapacityHistory::default();
             interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
-                sample_once(store.clone(), &mut failure_logs).await;
+                sample_once(store.clone(), &mut failure_logs, &mut receipt_capacity).await;
             }
         });
         Self { task }
@@ -43,16 +44,53 @@ struct FailureLogs {
     recorded: BTreeSet<&'static str>,
 }
 
-async fn sample_once(store: Store, failure_logs: &mut FailureLogs) {
+#[derive(Default)]
+struct ReceiptCapacityHistory {
+    previous: Option<ReceiptCapacitySample>,
+}
+
+#[derive(Clone, Copy)]
+struct ReceiptCapacitySample {
+    sampled_at: std::time::Instant,
+    entries: u64,
+    bytes: u64,
+}
+
+impl ReceiptCapacityHistory {
+    fn observe(&mut self, metrics: &MetadataRuntimeMetrics) -> Option<f64> {
+        let current = ReceiptCapacitySample {
+            sampled_at: std::time::Instant::now(),
+            entries: metrics.mutation_receipt_entries?,
+            bytes: metrics.mutation_receipt_bytes?,
+        };
+        let projection = self.previous.and_then(|previous| {
+            projected_receipt_capacity_seconds(
+                previous,
+                current,
+                metrics.mutation_receipt_max_entries,
+                metrics.mutation_receipt_max_bytes,
+            )
+        });
+        self.previous = Some(current);
+        projection
+    }
+}
+
+async fn sample_once(
+    store: Store,
+    failure_logs: &mut FailureLogs,
+    receipt_capacity: &mut ReceiptCapacityHistory,
+) {
     let joined = tokio::task::spawn_blocking(move || {
         (
             read_process_memory(),
             read_cgroup_memory(),
             store.metadata_runtime_metrics(),
+            store.source_journal_runtime_metrics(),
         )
     })
     .await;
-    let (process, cgroup, rocksdb) = match joined {
+    let (process, cgroup, rocksdb, source_journal) = match joined {
         Ok(sample) => sample,
         Err(error) => {
             record_collection_failure(failure_logs, "sampler", 1, &anyhow!(error));
@@ -78,7 +116,14 @@ async fn sample_once(store: Store, failure_logs: &mut FailureLogs) {
             record_collection_failure(failure_logs, "cgroup", 1, &error);
         }
     }
-    emit_rocksdb_metrics(&rocksdb);
+    emit_rocksdb_metrics(&rocksdb, receipt_capacity);
+    match source_journal {
+        Ok(source_journal) => emit_source_journal_metrics(source_journal),
+        Err(error) => {
+            tracing::debug!(gauge.anvil_source_journal_metrics_available = 0_u64);
+            record_collection_failure(failure_logs, "source_journal", 1, &error);
+        }
+    }
     if rocksdb.property_collection_failures != 0 {
         let error = rocksdb
             .first_collection_error
@@ -360,7 +405,10 @@ fn emit_cgroup_metrics(cgroup: CgroupMemory) {
     );
 }
 
-fn emit_rocksdb_metrics(rocksdb: &MetadataRuntimeMetrics) {
+fn emit_rocksdb_metrics(
+    rocksdb: &MetadataRuntimeMetrics,
+    receipt_capacity: &mut ReceiptCapacityHistory,
+) {
     tracing::debug!(
         gauge.anvil_rocksdb_block_cache_capacity_bytes = rocksdb.block_cache_capacity_bytes,
         gauge.anvil_rocksdb_block_cache_usage_bytes = rocksdb.block_cache_usage_bytes,
@@ -418,6 +466,100 @@ fn emit_rocksdb_metrics(rocksdb: &MetadataRuntimeMetrics) {
             )
         );
     }
+    let projected_capacity_seconds = receipt_capacity.observe(rocksdb);
+    match (
+        rocksdb.mutation_receipt_entries,
+        rocksdb.mutation_receipt_bytes,
+        rocksdb.mutation_receipt_oldest_age_seconds,
+    ) {
+        (Some(entries), Some(bytes), Some(oldest_age_seconds)) => tracing::debug!(
+            gauge.anvil_mutation_receipt_metrics_available = 1_u64,
+            gauge.anvil_mutation_receipt_entries = entries,
+            gauge.anvil_mutation_receipt_bytes = bytes,
+            gauge.anvil_mutation_receipt_max_entries = rocksdb.mutation_receipt_max_entries,
+            gauge.anvil_mutation_receipt_max_bytes = rocksdb.mutation_receipt_max_bytes,
+            gauge.anvil_mutation_receipt_entry_occupancy_ratio =
+                entries as f64 / rocksdb.mutation_receipt_max_entries as f64,
+            gauge.anvil_mutation_receipt_byte_occupancy_ratio =
+                bytes as f64 / rocksdb.mutation_receipt_max_bytes as f64,
+            gauge.anvil_mutation_receipt_oldest_retained_age_seconds = oldest_age_seconds,
+            gauge.anvil_mutation_receipt_projected_capacity_available =
+                u64::from(projected_capacity_seconds.is_some()),
+            gauge.anvil_mutation_receipt_time_to_projected_capacity_seconds =
+                projected_capacity_seconds.unwrap_or(0.0),
+            "sampled mutation receipt capacity"
+        ),
+        _ => tracing::debug!(
+            gauge.anvil_mutation_receipt_metrics_available = 0_u64,
+            "mutation receipt capacity metrics are unavailable"
+        ),
+    }
+}
+
+fn projected_receipt_capacity_seconds(
+    previous: ReceiptCapacitySample,
+    current: ReceiptCapacitySample,
+    maximum_entries: u64,
+    maximum_bytes: u64,
+) -> Option<f64> {
+    if current.entries >= maximum_entries || current.bytes >= maximum_bytes {
+        return Some(0.0);
+    }
+    let elapsed = current
+        .sampled_at
+        .saturating_duration_since(previous.sampled_at)
+        .as_secs_f64();
+    if elapsed == 0.0 {
+        return None;
+    }
+    let entries = capacity_seconds(previous.entries, current.entries, maximum_entries, elapsed);
+    let bytes = capacity_seconds(previous.bytes, current.bytes, maximum_bytes, elapsed);
+    match (entries, bytes) {
+        (Some(entries), Some(bytes)) => Some(entries.min(bytes)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn capacity_seconds(previous: u64, current: u64, maximum: u64, elapsed: f64) -> Option<f64> {
+    let growth = current.checked_sub(previous)?;
+    if growth == 0 {
+        return None;
+    }
+    Some(maximum.saturating_sub(current) as f64 / (growth as f64 / elapsed))
+}
+
+fn emit_source_journal_metrics(source: SourceJournalRuntimeMetrics) {
+    let prune_safe_through = source.prune_safe_through();
+    tracing::debug!(
+        gauge.anvil_source_journal_metrics_available = 1_u64,
+        gauge.anvil_source_journal_tail = source.tail,
+        gauge.anvil_source_journal_settled_through = source.settled_through,
+        gauge.anvil_source_journal_retention_floor = source.retention_floor,
+        gauge.anvil_source_journal_reference_safe_through = source.reference_safe_through,
+        gauge.anvil_source_journal_index_safe_through = source.index_safe_through,
+        gauge.anvil_source_journal_accounting_safe_through = source.accounting_safe_through,
+        gauge.anvil_source_journal_prune_safe_through = prune_safe_through,
+        gauge.anvil_source_journal_unsettled_entries =
+            source.tail.saturating_sub(source.settled_through),
+        gauge.anvil_source_journal_reference_lag_entries =
+            source.tail.saturating_sub(source.reference_safe_through),
+        gauge.anvil_source_journal_index_lag_entries =
+            source.tail.saturating_sub(source.index_safe_through),
+        gauge.anvil_source_journal_accounting_lag_entries =
+            source.tail.saturating_sub(source.accounting_safe_through),
+        gauge.anvil_source_journal_prune_lag_entries =
+            source.tail.saturating_sub(prune_safe_through),
+        gauge.anvil_source_journal_retained_entries = source.retained_entries,
+        gauge.anvil_source_journal_retained_bytes = source.retained_bytes,
+        gauge.anvil_source_journal_max_entries = source.max_entries,
+        gauge.anvil_source_journal_max_bytes = source.max_bytes,
+        gauge.anvil_source_journal_entry_occupancy_ratio =
+            source.retained_entries as f64 / source.max_entries as f64,
+        gauge.anvil_source_journal_byte_occupancy_ratio =
+            source.retained_bytes as f64 / source.max_bytes as f64,
+        "sampled source-journal safety and capacity"
+    );
 }
 
 fn record_collection_failure(
@@ -439,6 +581,48 @@ fn record_collection_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn receipt_capacity_uses_the_first_growing_bound() {
+        let now = std::time::Instant::now();
+        let previous = ReceiptCapacitySample {
+            sampled_at: now - Duration::from_secs(10),
+            entries: 10,
+            bytes: 100,
+        };
+        let current = ReceiptCapacitySample {
+            sampled_at: now,
+            entries: 20,
+            bytes: 300,
+        };
+
+        let seconds = projected_receipt_capacity_seconds(previous, current, 100, 1_000).unwrap();
+        assert!((seconds - 35.0).abs() < f64::EPSILON);
+        assert_eq!(
+            projected_receipt_capacity_seconds(previous, current, 20, 1_000),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn receipt_capacity_is_unknown_without_positive_growth() {
+        let now = std::time::Instant::now();
+        let previous = ReceiptCapacitySample {
+            sampled_at: now - Duration::from_secs(10),
+            entries: 20,
+            bytes: 300,
+        };
+        let current = ReceiptCapacitySample {
+            sampled_at: now,
+            entries: 19,
+            bytes: 250,
+        };
+
+        assert_eq!(
+            projected_receipt_capacity_seconds(previous, current, 100, 1_000),
+            None
+        );
+    }
 
     #[test]
     fn parses_linux_process_memory_without_exporting_names() {
