@@ -467,6 +467,30 @@ index_sparse_start_count() {
     || true
 }
 
+startup_scan_evidence_count() {
+  service_logs "$1" \
+    | grep -Fc 'anvil_startup_scan_evidence' \
+    || true
+}
+
+wait_for_sparse_index_startup() {
+  local node="$1"
+  local minimum_count="$2"
+  local deadline=$((SECONDS + 90))
+  while (( $(index_sparse_start_count "${node}") < minimum_count \
+    || $(startup_scan_evidence_count "${node}") < minimum_count )); do
+    if ! compose ps --status running --services | grep -Fxq "${node}"; then
+      echo "${node} exited during index startup" >&2
+      return 1
+    fi
+    if ((SECONDS >= deadline)); then
+      echo "${node} index runtime did not finish startup within 90 seconds" >&2
+      return 1
+    fi
+    sleep 1
+  done
+}
+
 assert_zero_global_startup_scan_evidence() {
   local node="$1"
   local minimum_count="$2"
@@ -515,6 +539,7 @@ assert_sparse_index_startup() {
   local node="$1"
   local minimum_count="$2"
   local observed
+  wait_for_sparse_index_startup "${node}" "${minimum_count}"
   observed="$(index_sparse_start_count "${node}")"
   if ((observed < minimum_count)); then
     echo "${node} startup omitted the sparse index-runtime marker" >&2

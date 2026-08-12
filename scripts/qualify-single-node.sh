@@ -556,6 +556,31 @@ index_sparse_start_count() {
     || true
 }
 
+startup_scan_evidence_count() {
+  container_logs \
+    | grep -Fc 'anvil_startup_scan_evidence' \
+    || true
+}
+
+wait_for_sparse_index_startup() {
+  local minimum_count="$1"
+  local deadline=$((SECONDS + 90))
+  while (( $(index_sparse_start_count) < minimum_count \
+    || $(startup_scan_evidence_count) < minimum_count )); do
+    if ! docker inspect --format '{{.State.Running}}' "${container_name}" \
+      2>/dev/null | grep -Fxq true
+    then
+      echo "single-node qualification server exited during index startup" >&2
+      return 1
+    fi
+    if ((SECONDS >= deadline)); then
+      echo "single-node index runtime did not finish startup within 90 seconds" >&2
+      return 1
+    fi
+    sleep 1
+  done
+}
+
 assert_zero_global_startup_scan_evidence() {
   local minimum_count="$1"
   local count=0
@@ -598,6 +623,7 @@ assert_zero_global_startup_scan_evidence() {
 assert_sparse_index_startup() {
   local minimum_count="$1"
   local observed
+  wait_for_sparse_index_startup "${minimum_count}"
   observed="$(index_sparse_start_count)"
   if ((observed < minimum_count)); then
     echo "single-node startup omitted the sparse index-runtime marker" >&2
