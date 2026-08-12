@@ -4,6 +4,7 @@
 # amd64 trixie builder and an arm64 image is compiled in the arm64 builder.
 FROM --platform=$TARGETPLATFORM rust:1.96-trixie AS builder
 ARG TARGETARCH
+ARG CARGO_BUILD_JOBS=1
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -27,7 +28,7 @@ COPY . .
 RUN --mount=type=cache,id=anvil-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=anvil-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=anvil-cargo-target-${TARGETARCH}-release,target=/usr/src/anvil/target,sharing=locked \
-    cargo build --release --locked \
+    cargo build --release --locked --jobs "${CARGO_BUILD_JOBS}" \
         -p anvil-server --bin anvil-server \
         -p anvil-storage-cli --bin anvil \
     && mkdir -p /usr/local/anvil-build \
