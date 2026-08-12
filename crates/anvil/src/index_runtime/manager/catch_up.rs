@@ -2,10 +2,12 @@
 
 use anvil_store::{CurrentObjectSnapshot, MAX_OBJECT_RECORD_EXPORT_RECORDS};
 use rayon::prelude::*;
-use tracing::Instrument;
 
+use super::rebuild::{
+    PreparedProjection, ProjectionBatch, fetch_projection_sources, partition_projection_lanes,
+    receive_ordered_lane_item,
+};
 use super::*;
-use crate::cluster_object_read::ClusterReadPayload;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn process_journal_page(
@@ -168,261 +170,162 @@ async fn project_sources(
     let configured_lanes = usize::try_from(dependencies.config.projection_max_lanes(kind))
         .map_err(|_| Status::resource_exhausted("projection lane limit exceeds platform"))?;
     let max_lanes = configured_lanes.min(dependencies.cpu.workers()).max(1);
-    let mut pending = sources.into_iter().collect::<VecDeque<_>>();
-
-    while !pending.is_empty() {
-        let mut wave = ProjectionWave::new(plan.max_source_projection_bytes as u64, max_lanes);
-        while let Some(source) = pending.pop_front() {
-            let prepared = PreparedProjection::new(specification, source)?;
-            match wave.try_push(prepared)? {
-                Some(pending_source) => {
-                    pending.push_front(pending_source.source);
-                    break;
-                }
-                None if wave.is_full() => break,
-                None => {}
-            }
-        }
-
-        let lane_limit = wave.lane_limit()?;
-        let projected = project_wave(specification, wave.sources, lane_limit, dependencies).await?;
-        for (mutation, diagnostics) in projected {
-            candidate.diagnostics.add(diagnostics);
-            push_or_flush(
+    let projection_budget = plan.max_source_projection_bytes as u64;
+    let mut batch = ProjectionBatch::new(projection_budget, max_lanes);
+    for source in sources {
+        let prepared = PreparedProjection::new(specification, source)?;
+        if let Some(pending) = batch.try_push(prepared)? {
+            let full = std::mem::replace(
+                &mut batch,
+                ProjectionBatch::new(projection_budget, max_lanes),
+            );
+            project_catch_up_batch(
                 definition,
                 specification,
                 kind,
                 plan,
+                full,
                 builder,
-                mutation,
                 candidate,
                 dependencies,
             )
             .await?;
+            if batch.try_push(pending)?.is_some() {
+                return Err(Status::internal(
+                    "catch-up projection source was rejected by an empty batch after admission",
+                ));
+            }
         }
+    }
+    if !batch.is_empty() {
+        project_catch_up_batch(
+            definition,
+            specification,
+            kind,
+            plan,
+            batch,
+            builder,
+            candidate,
+            dependencies,
+        )
+        .await?;
     }
     Ok(())
 }
 
-struct PreparedProjection {
-    source: IndexSourceMutation,
-    projection_bytes: u64,
-    resident_bytes: u64,
-    needs_payload: bool,
-}
-
-impl PreparedProjection {
-    fn new(
-        specification: &IndexSpecification,
-        source: IndexSourceMutation,
-    ) -> Result<Self, Status> {
-        let projection_bytes =
-            projection_admission_bytes(specification, &source).map_err(index_status)?;
-        let needs_payload =
-            source_needs_payload(specification) && matches!(source, IndexSourceMutation::Upsert(_));
-        let payload_bytes = match &source {
-            IndexSourceMutation::Upsert(object) if needs_payload => object.content_length,
-            _ => 0,
-        };
-        let payload_reserve = if payload_bytes == 0 {
-            0
-        } else if payload_bytes <= anvil_store::SMALL_BLOB_MAX_BYTES as u64 {
-            payload_bytes
-                .checked_mul(2)
-                .ok_or_else(|| Status::resource_exhausted("inline payload reserve overflow"))?
-        } else {
-            crate::payload_read::PAYLOAD_READ_FRAME_BYTES as u64
-        };
-        let resident_bytes = projection_bytes
-            .checked_add(payload_reserve)
-            .ok_or_else(|| Status::resource_exhausted("projection wave reserve overflow"))?;
-        Ok(Self {
-            source,
-            projection_bytes,
-            resident_bytes,
-            needs_payload,
-        })
-    }
-}
-
-struct ProjectionWave {
-    sources: Vec<PreparedProjection>,
-    resident_bytes: u64,
-    max_projection_bytes: u64,
-    budget: u64,
-    max_lanes: usize,
-}
-
-impl ProjectionWave {
-    fn new(budget: u64, max_lanes: usize) -> Self {
-        Self {
-            sources: Vec::new(),
-            resident_bytes: 0,
-            max_projection_bytes: 0,
-            budget,
-            max_lanes: max_lanes.max(1),
-        }
-    }
-
-    fn is_full(&self) -> bool {
-        self.sources.len() == self.max_lanes
-    }
-
-    fn lane_limit(&self) -> Result<usize, Status> {
-        let limit = self
-            .layout(
-                self.sources.len(),
-                self.resident_bytes,
-                self.max_projection_bytes,
-            )
-            .ok_or_else(|| Status::resource_exhausted("projection wave exceeds its byte budget"))?;
-        usize::try_from(limit)
-            .map_err(|_| Status::resource_exhausted("projection lane budget exceeds platform"))
-    }
-
-    fn try_push(
-        &mut self,
-        source: PreparedProjection,
-    ) -> Result<Option<PreparedProjection>, Status> {
-        if self.is_full() {
-            return Ok(Some(source));
-        }
-        let count = self.sources.len().saturating_add(1);
-        let resident = self
-            .resident_bytes
-            .checked_add(source.resident_bytes)
-            .ok_or_else(|| Status::resource_exhausted("projection wave reserve overflow"))?;
-        let maximum = self.max_projection_bytes.max(source.projection_bytes);
-        if self.layout(count, resident, maximum).is_none() {
-            if self.sources.is_empty() {
-                return Err(Status::resource_exhausted(format!(
-                    "one index source projection cannot fit the {} byte wave budget",
-                    self.budget
-                )));
-            }
-            return Ok(Some(source));
-        }
-        self.resident_bytes = resident;
-        self.max_projection_bytes = maximum;
-        self.sources.push(source);
-        Ok(None)
-    }
-
-    fn layout(&self, count: usize, resident: u64, maximum: u64) -> Option<u64> {
-        if count == 0 || count > self.max_lanes || resident >= self.budget {
-            return None;
-        }
-        let output_slots = u64::try_from(count).ok()?;
-        let lane_limit = self.budget.checked_sub(resident)? / output_slots;
-        (lane_limit >= maximum && lane_limit > 0).then_some(lane_limit)
-    }
-}
-
-type ProjectedSource = (EngineMutation, IndexBuildDiagnostics);
-
-struct FetchedProjection {
-    source: IndexSourceMutation,
-    payload: Option<ClusterReadPayload>,
-}
-
-async fn project_wave(
+#[allow(clippy::too_many_arguments)]
+async fn project_catch_up_batch(
+    definition: &CatalogDefinition,
     specification: &IndexSpecification,
-    sources: Vec<PreparedProjection>,
-    lane_limit: usize,
+    kind: IndexKind,
+    plan: SegmentMemoryPlan,
+    batch: ProjectionBatch,
+    builder: &mut EngineSegmentBuilder,
+    candidate: &mut CandidateGeneration,
     dependencies: &IndexBuilderDependencies,
-) -> Result<Vec<ProjectedSource>, Status> {
-    let fetched = fetch_projection_wave(sources, dependencies).await?;
-    let specification = specification.clone();
-    let projected = dependencies
-        .cpu
-        .install(move || {
-            fetched
+) -> Result<(), Status> {
+    let effective_lanes = batch.effective_lanes();
+    let lane_limit = batch.lane_limit()?;
+    let fetched = fetch_projection_sources(batch.sources, effective_lanes, dependencies).await?;
+    let source_count = fetched.len();
+    let lanes = partition_projection_lanes(fetched, effective_lanes);
+    let mut senders = Vec::with_capacity(lanes.len());
+    let mut receivers = Vec::with_capacity(lanes.len());
+    for _ in 0..lanes.len() {
+        let (sender, receiver) = tokio::sync::mpsc::channel::<ProjectedSource>(1);
+        senders.push(sender);
+        receivers.push(receiver);
+    }
+    let cpu = dependencies.cpu.clone();
+    let projection_specification = specification.clone();
+    let queued = Instant::now();
+    let cpu_task = tokio::spawn(async move {
+        cpu.install(move || {
+            let cpu_started = Instant::now();
+            let queue_seconds = cpu_started.saturating_duration_since(queued).as_secs_f64();
+            let lane_cpu_seconds = lanes
                 .into_par_iter()
-                .map(|mut fetched| {
-                    let reader = fetched
-                        .payload
-                        .as_mut()
-                        .map(|payload| payload as &mut dyn std::io::Read);
-                    project_mutation(&specification, fetched.source, reader, lane_limit)
+                .zip(senders.into_par_iter())
+                .map(|(lane, sender)| {
+                    lane.into_iter().fold(0.0, |cpu_seconds, mut fetched| {
+                        let started = Instant::now();
+                        let reader = fetched
+                            .payload
+                            .as_mut()
+                            .map(|payload| payload as &mut dyn std::io::Read);
+                        let projected = project_mutation(
+                            &projection_specification,
+                            fetched.source,
+                            reader,
+                            lane_limit,
+                        );
+                        let cpu_seconds = cpu_seconds + started.elapsed().as_secs_f64();
+                        let failed = projected.is_err();
+                        if sender.blocking_send(projected).is_err() || failed {
+                            return cpu_seconds;
+                        }
+                        cpu_seconds
+                    })
                 })
                 .collect::<Vec<_>>()
+                .into_iter()
+                .sum();
+            ProjectionExecution {
+                queue_seconds,
+                cpu_seconds: lane_cpu_seconds,
+            }
         })
         .await
-        .map_err(cpu_status)?;
-    projected
-        .into_iter()
-        .map(|result| result.map_err(index_status))
-        .collect()
-}
+        .map_err(cpu_status)
+    });
 
-async fn fetch_projection_wave(
-    sources: Vec<PreparedProjection>,
-    dependencies: &IndexBuilderDependencies,
-) -> Result<Vec<FetchedProjection>, Status> {
-    let source_count = sources.len();
-    let mut results = std::iter::repeat_with(|| None)
-        .take(source_count)
-        .collect::<Vec<Option<Result<FetchedProjection, Status>>>>();
-    let mut tasks = tokio::task::JoinSet::new();
-    for (position, prepared) in sources.into_iter().enumerate() {
-        if !prepared.needs_payload {
-            results[position] = Some(Ok(FetchedProjection {
-                source: prepared.source,
-                payload: None,
-            }));
-            continue;
-        }
-        let reader = dependencies.reader.clone();
-        let span = tracing::Span::current();
-        tasks.spawn(
-            async move {
-                let reference = match &prepared.source {
-                    IndexSourceMutation::Upsert(object) => anvil_store::BlobRef {
-                        hash: object.content_hash,
-                        length: object.content_length,
-                    },
-                    IndexSourceMutation::Remove(_) => {
-                        return (
-                            position,
-                            Err(Status::internal(
-                                "remove projection unexpectedly requested a payload",
-                            )),
-                        );
-                    }
-                };
-                let payload = reader.open_blob_payload(&reference).await;
-                (
-                    position,
-                    payload.map(|payload| FetchedProjection {
-                        source: prepared.source,
-                        payload: Some(payload),
-                    }),
-                )
+    let mut failure = None;
+    for position in 0..source_count {
+        let projected = match receive_ordered_lane_item(&mut receivers, position).await {
+            Some(projected) => projected,
+            None => {
+                failure = Some(Status::internal(
+                    "catch-up projection lane omitted a source",
+                ));
+                break;
             }
-            .instrument(span),
-        );
-    }
-    while let Some(joined) = tasks.join_next().await {
-        let (position, projected) =
-            joined.map_err(|error| Status::internal(format!("projection task failed: {error}")))?;
-        let slot = results
-            .get_mut(position)
-            .ok_or_else(|| Status::internal("projection returned an invalid position"))?;
-        if slot.replace(projected).is_some() {
-            return Err(Status::internal("projection returned a duplicate position"));
+        };
+        match projected {
+            Ok((mutation, diagnostics)) => {
+                candidate.diagnostics.add(diagnostics);
+                if let Err(error) = push_or_flush(
+                    definition,
+                    specification,
+                    kind,
+                    plan,
+                    builder,
+                    mutation,
+                    candidate,
+                    dependencies,
+                )
+                .await
+                {
+                    failure = Some(error);
+                    break;
+                }
+            }
+            Err(error) => {
+                failure = Some(index_status(error));
+                break;
+            }
         }
     }
-
-    collect_ordered(results)
-}
-
-fn collect_ordered<T>(results: Vec<Option<Result<T, Status>>>) -> Result<Vec<T>, Status> {
-    let mut ordered = Vec::with_capacity(results.len());
-    for result in results {
-        ordered.push(result.ok_or_else(|| Status::internal("projection omitted a source"))??);
+    drop(receivers);
+    cpu_task
+        .await
+        .map_err(|error| Status::internal(format!("catch-up projection task failed: {error}")))??;
+    if let Some(error) = failure {
+        return Err(error);
     }
-    Ok(ordered)
+    Ok(())
 }
+
+type ProjectedSource = Result<(EngineMutation, IndexBuildDiagnostics), IndexError>;
 
 #[cfg(test)]
 mod tests {
@@ -441,35 +344,75 @@ mod tests {
     }
 
     #[test]
-    fn projection_wave_never_exceeds_its_lane_limit() {
-        let mut wave = ProjectionWave::new(1_000, 2);
-        assert!(wave.try_push(prepared(0, 10, 10)).unwrap().is_none());
-        assert!(wave.try_push(prepared(1, 10, 10)).unwrap().is_none());
-        assert!(wave.try_push(prepared(2, 10, 10)).unwrap().is_some());
-        assert_eq!(wave.sources.len(), 2);
-        assert_eq!(wave.lane_limit().unwrap(), 490);
-    }
-
-    #[test]
-    fn projection_wave_rejects_work_that_exceeds_its_shared_bytes() {
-        let mut wave = ProjectionWave::new(40, 4);
-        assert!(wave.try_push(prepared(0, 10, 10)).unwrap().is_none());
-        assert!(wave.try_push(prepared(1, 10, 10)).unwrap().is_none());
-        assert!(wave.try_push(prepared(2, 10, 10)).unwrap().is_some());
-        assert_eq!(wave.sources.len(), 2);
-        assert_eq!(wave.lane_limit().unwrap(), 10);
-    }
-
-    #[test]
-    fn completed_parallel_results_are_applied_in_canonical_positions() {
-        let mut completed = vec![None, None, None];
-        completed[2] = Some(Ok("third"));
-        completed[0] = Some(Ok("first"));
-        completed[1] = Some(Ok("second"));
-
-        assert_eq!(
-            collect_ordered(completed).unwrap(),
-            ["first", "second", "third"]
+    fn catch_up_page_batch_keeps_all_sources_beyond_the_lane_count() {
+        const BUDGET: u64 = 32 * 1024 * 1024;
+        let mut batch = ProjectionBatch::new(BUDGET, 4);
+        for index in 0..MAX_OBJECT_RECORD_EXPORT_RECORDS as usize {
+            assert!(
+                batch
+                    .try_push(prepared(index, 1_024, 4_096))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(batch.sources.len(), 1_000);
+        assert_eq!(batch.effective_lanes(), 4);
+        let two_bounded_output_slots_per_lane = 2 * batch.effective_lanes() as u64;
+        assert!(
+            batch.resident_bytes
+                + two_bounded_output_slots_per_lane * batch.lane_limit().unwrap() as u64
+                <= BUDGET
         );
+    }
+
+    #[test]
+    fn catch_up_page_batch_rejects_sources_before_exceeding_its_shared_bytes() {
+        let mut batch = ProjectionBatch::new(40, 4);
+        assert!(batch.try_push(prepared(0, 10, 10)).unwrap().is_none());
+        assert!(batch.try_push(prepared(1, 10, 10)).unwrap().is_none());
+        assert!(batch.try_push(prepared(2, 10, 10)).unwrap().is_some());
+        assert_eq!(batch.sources.len(), 2);
+        assert_eq!(batch.resident_bytes, 20);
+        assert_eq!(batch.lane_limit().unwrap(), 10);
+    }
+
+    #[tokio::test]
+    async fn catch_up_lanes_progress_concurrently_and_apply_in_source_order() {
+        let lanes = partition_projection_lanes((0_u64..6).collect(), 3);
+        let (progress_sender, mut progress_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut receivers = Vec::new();
+        let mut tasks = Vec::new();
+        for lane in lanes {
+            let (sender, receiver) = tokio::sync::mpsc::channel(1);
+            receivers.push(receiver);
+            let progress_sender = progress_sender.clone();
+            tasks.push(tokio::task::spawn_blocking(move || {
+                for value in lane {
+                    sender.blocking_send(value).unwrap();
+                    progress_sender.send(value).unwrap();
+                }
+            }));
+        }
+        drop(progress_sender);
+
+        let mut first_round = Vec::new();
+        for _ in 0..3 {
+            first_round.push(progress_receiver.recv().await.unwrap());
+        }
+        first_round.sort_unstable();
+        assert_eq!(first_round, [0, 1, 2]);
+
+        let mut delivered = Vec::new();
+        for position in 0..6 {
+            delivered.push(
+                receive_ordered_lane_item(&mut receivers, position)
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert_eq!(delivered, (0_u64..6).collect::<Vec<_>>());
+        for task in tasks {
+            task.await.unwrap();
+        }
     }
 }

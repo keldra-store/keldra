@@ -453,15 +453,15 @@ struct ProjectionWaveTotals {
     cpu_seconds: f64,
 }
 
-struct PreparedProjection {
-    source: IndexSourceMutation,
-    projection_bytes: u64,
-    resident_bytes: u64,
-    needs_payload: bool,
+pub(super) struct PreparedProjection {
+    pub(super) source: IndexSourceMutation,
+    pub(super) projection_bytes: u64,
+    pub(super) resident_bytes: u64,
+    pub(super) needs_payload: bool,
 }
 
 impl PreparedProjection {
-    fn new(
+    pub(super) fn new(
         specification: &IndexSpecification,
         source: IndexSourceMutation,
     ) -> Result<Self, Status> {
@@ -497,16 +497,16 @@ impl PreparedProjection {
     }
 }
 
-struct ProjectionBatch {
-    sources: Vec<PreparedProjection>,
-    resident_bytes: u64,
+pub(super) struct ProjectionBatch {
+    pub(super) sources: Vec<PreparedProjection>,
+    pub(super) resident_bytes: u64,
     max_projection_bytes: u64,
     budget: u64,
     max_lanes: usize,
 }
 
 impl ProjectionBatch {
-    fn new(budget: u64, max_lanes: usize) -> Self {
+    pub(super) fn new(budget: u64, max_lanes: usize) -> Self {
         Self {
             sources: Vec::new(),
             resident_bytes: 0,
@@ -516,15 +516,15 @@ impl ProjectionBatch {
         }
     }
 
-    fn is_empty(&self) -> bool {
+    pub(super) fn is_empty(&self) -> bool {
         self.sources.is_empty()
     }
 
-    fn effective_lanes(&self) -> usize {
+    pub(super) fn effective_lanes(&self) -> usize {
         self.sources.len().min(self.max_lanes).max(1)
     }
 
-    fn lane_limit(&self) -> Result<usize, Status> {
+    pub(super) fn lane_limit(&self) -> Result<usize, Status> {
         let (_, limit) = self
             .layout(
                 self.sources.len(),
@@ -538,7 +538,7 @@ impl ProjectionBatch {
             .map_err(|_| Status::resource_exhausted("projection lane budget exceeds platform"))
     }
 
-    fn try_push(
+    pub(super) fn try_push(
         &mut self,
         source: PreparedProjection,
     ) -> Result<Option<PreparedProjection>, Status> {
@@ -581,9 +581,9 @@ impl ProjectionBatch {
     }
 }
 
-struct FetchedProjection {
-    source: IndexSourceMutation,
-    payload: Option<ClusterReadPayload>,
+pub(super) struct FetchedProjection {
+    pub(super) source: IndexSourceMutation,
+    pub(super) payload: Option<ClusterReadPayload>,
 }
 
 type ProjectedSource = Result<(EngineMutation, IndexBuildDiagnostics), IndexError>;
@@ -684,7 +684,7 @@ async fn project_snapshot_batch_inner(
     Ok(totals)
 }
 
-async fn receive_ordered_lane_item<T>(
+pub(super) async fn receive_ordered_lane_item<T>(
     receivers: &mut [tokio::sync::mpsc::Receiver<T>],
     position: usize,
 ) -> Option<T> {
@@ -696,7 +696,7 @@ async fn receive_ordered_lane_item<T>(
     receivers[lane].recv().await
 }
 
-async fn fetch_projection_sources(
+pub(super) async fn fetch_projection_sources(
     sources: Vec<PreparedProjection>,
     max_concurrent: usize,
     dependencies: &IndexBuilderDependencies,
@@ -787,7 +787,7 @@ fn fill_projection_fetches(
     Ok(())
 }
 
-fn partition_projection_lanes<T>(values: Vec<T>, lane_count: usize) -> Vec<Vec<T>> {
+pub(super) fn partition_projection_lanes<T>(values: Vec<T>, lane_count: usize) -> Vec<Vec<T>> {
     let lane_count = lane_count.min(values.len()).max(1);
     let mut lanes = (0..lane_count).map(|_| Vec::new()).collect::<Vec<_>>();
     for (position, value) in values.into_iter().enumerate() {
