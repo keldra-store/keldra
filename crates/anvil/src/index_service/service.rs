@@ -1150,7 +1150,7 @@ async fn authorize_rebuild_access(
 
 fn validate_query_hit(
     caller: &Caller,
-    definition: &StoredIndexDefinition,
+    definition: &LoadedDefinition,
     hit: &IndexQueryHit,
 ) -> Result<ObjectKey, Status> {
     let address = hit
@@ -1160,9 +1160,13 @@ fn validate_query_hit(
     if hit.object_version == 0 || hit.score.is_some_and(|score| !score.is_finite()) {
         return Err(Status::data_loss("index hit contains invalid result data"));
     }
+    let kind = IndexKind::try_from(definition.api.kind)
+        .map_err(|_| Status::data_loss("index definition has an unknown kind"))?;
+    let returns_referenced_object = matches!(kind, IndexKind::GitSource | IndexKind::Tensor);
     if address.tenant != caller.storage_tenant().as_str()
-        || address.bucket != definition.bucket
-        || !path_matches_prefix(&address.path, &definition.path_prefix)
+        || address.bucket != definition.stored.bucket
+        || (!returns_referenced_object
+            && !path_matches_prefix(&address.path, &definition.stored.path_prefix))
         || contains_reserved_segment(&address.path)
     {
         return Err(Status::data_loss(
@@ -1182,7 +1186,7 @@ async fn authorize_query_hits_with(
     let mut keys = Vec::with_capacity(hits.len() + 1);
     keys.push(definition.key.clone());
     for hit in &hits {
-        keys.push(validate_query_hit(caller, &definition.stored, hit)?);
+        keys.push(validate_query_hit(caller, definition, hit)?);
     }
     let requests = keys
         .into_iter()
@@ -1215,9 +1219,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use anvil_api::v1::{
-        CreateIndexRequest, IndexFreshness, IndexSourceFreshness, IndexSpecification,
-        PathIndexQuery, PathIndexSpec, TensorIndexQuery, TensorIndexSpec, index_query,
-        index_specification,
+        CreateIndexRequest, GitSourceIndexSpec, IndexFreshness, IndexSourceFreshness,
+        IndexSpecification, PathIndexQuery, PathIndexSpec, TensorIndexQuery, TensorIndexSpec,
+        index_query, index_specification,
     };
     use anvil_store::StorageTenantId;
     use tonic::metadata::MetadataValue;
@@ -1242,23 +1246,35 @@ mod tests {
     }
 
     fn loaded_definition(path_prefix: &str) -> LoadedDefinition {
+        loaded_definition_with_spec(
+            path_prefix,
+            "by-path",
+            index_specification::Specification::Path(PathIndexSpec {}),
+        )
+    }
+
+    fn loaded_definition_with_spec(
+        path_prefix: &str,
+        name: &str,
+        specification: index_specification::Specification,
+    ) -> LoadedDefinition {
         let stored = StoredIndexDefinition::create(
             "tenant".into(),
             CreateIndexRequest {
                 bucket: "objects".into(),
-                name: "by-path".into(),
+                name: name.into(),
                 path_prefix: path_prefix.into(),
                 content_type: String::new(),
                 specification: Some(IndexSpecification {
-                    specification: Some(index_specification::Specification::Path(PathIndexSpec {})),
+                    specification: Some(specification),
                 }),
-                command_id: "create-by-path".into(),
+                command_id: format!("create-{name}"),
             },
             17,
         )
         .unwrap();
         LoadedDefinition {
-            key: ObjectKey::new("tenant", "objects", definition_path("by-path").unwrap()).unwrap(),
+            key: ObjectKey::new("tenant", "objects", definition_path(name).unwrap()).unwrap(),
             api: stored.to_api(3).unwrap(),
             stored,
         }
@@ -1538,6 +1554,82 @@ mod tests {
             seen.iter()
                 .all(|(_, permission)| *permission == ObjectPermission::Get)
         );
+    }
+
+    #[tokio::test]
+    async fn reference_projection_hits_authorize_the_referenced_object_outside_source_prefix() {
+        let definitions = [
+            loaded_definition_with_spec(
+                "docs/",
+                "git-source",
+                index_specification::Specification::GitSource(GitSourceIndexSpec {
+                    repository_id: "repository".into(),
+                }),
+            ),
+            loaded_definition_with_spec(
+                "docs/",
+                "tensor",
+                index_specification::Specification::Tensor(TensorIndexSpec {
+                    model_id: "model".into(),
+                }),
+            ),
+        ];
+
+        for definition in definitions {
+            let authorization = FakeAuthorization {
+                allowed: vec![true, true],
+                revision: 37,
+                seen: Mutex::new(Vec::new()),
+            };
+            let referenced = hit("payloads/referenced.bin", 9);
+            let (visible, revision) = authorize_query_hits_with(
+                &authorization,
+                &caller(),
+                &definition,
+                vec![referenced.clone()],
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(visible, vec![referenced]);
+            assert_eq!(revision, 37);
+            let seen = authorization.seen.lock().unwrap();
+            assert_eq!(seen.len(), 2);
+            assert_eq!(seen[0].0, definition.key);
+            assert_eq!(seen[1].0.path(), "payloads/referenced.bin");
+            assert_eq!(seen[1].1, ObjectPermission::Get);
+        }
+    }
+
+    #[test]
+    fn reference_projection_hits_cannot_cross_tenant_bucket_or_reserved_namespace() {
+        let definition = loaded_definition_with_spec(
+            "docs/",
+            "git-source",
+            index_specification::Specification::GitSource(GitSourceIndexSpec {
+                repository_id: "repository".into(),
+            }),
+        );
+        for (tenant, bucket, path) in [
+            ("another-tenant", "objects", "payloads/referenced.bin"),
+            ("tenant", "another-bucket", "payloads/referenced.bin"),
+            ("tenant", "objects", "payloads/_anvil/referenced.bin"),
+        ] {
+            let invalid = IndexQueryHit {
+                address: Some(ObjectAddress {
+                    tenant: tenant.into(),
+                    bucket: bucket.into(),
+                    path: path.into(),
+                }),
+                ..hit("unused", 9)
+            };
+            assert_eq!(
+                validate_query_hit(&caller(), &definition, &invalid)
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::DataLoss
+            );
+        }
     }
 
     #[tokio::test]

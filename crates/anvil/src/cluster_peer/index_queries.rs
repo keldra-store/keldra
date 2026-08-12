@@ -579,11 +579,15 @@ fn validate_hit(
         .address
         .as_ref()
         .ok_or_else(|| Status::data_loss("routed index hit has no object address"))?;
+    let kind = IndexKind::try_from(definition.kind)
+        .map_err(|_| Status::data_loss("routed index definition has an unknown kind"))?;
+    let references_another_object = matches!(kind, IndexKind::GitSource | IndexKind::Tensor);
     if hit.object_version == 0
         || hit.score.is_some_and(|score| !score.is_finite())
         || address.tenant != caller.storage_tenant().as_str()
         || address.bucket != definition.bucket
-        || !path_matches_prefix(&address.path, &definition.path_prefix)
+        || (!references_another_object
+            && !path_matches_prefix(&address.path, &definition.path_prefix))
         || address.path.split('/').any(|segment| segment == "_anvil")
     {
         return Err(Status::data_loss(
@@ -610,7 +614,8 @@ fn require_authorization_evidence(
 #[cfg(test)]
 mod tests {
     use anvil_api::v1::{
-        IndexSpecification, PathIndexQuery, PathIndexSpec, index_query, index_specification,
+        IndexSpecification, ObjectAddress, PathIndexQuery, PathIndexSpec, index_query,
+        index_specification,
     };
 
     use super::*;
@@ -644,6 +649,70 @@ mod tests {
                 last_position: b"docs/a".to_vec(),
                 authorization_revision: 19,
             }),
+        }
+    }
+
+    fn caller() -> crate::authentication::Caller {
+        crate::authentication::Caller::from_authenticated_application(
+            StorageTenantId::parse("tenant").unwrap(),
+            "application",
+        )
+        .unwrap()
+    }
+
+    fn hit(path: &str) -> IndexQueryHit {
+        IndexQueryHit {
+            address: Some(ObjectAddress {
+                tenant: "tenant".into(),
+                bucket: "objects".into(),
+                path: path.into(),
+            }),
+            object_version: 23,
+            score: None,
+            fields_json: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn git_and_tensor_references_may_leave_the_manifest_prefix() {
+        let caller = caller();
+        for (kind, path) in [
+            (IndexKind::GitSource, "packs/repository.pack"),
+            (IndexKind::Tensor, "tensors/model.bin"),
+        ] {
+            let mut definition = request().definition;
+            definition.kind = kind as i32;
+
+            let key = validate_hit(&caller, &definition, &hit(path)).unwrap();
+            assert_eq!(key.path(), path);
+        }
+    }
+
+    #[test]
+    fn ordinary_results_remain_inside_the_manifest_prefix() {
+        let definition = request().definition;
+        let error =
+            validate_hit(&caller(), &definition, &hit("packs/repository.pack")).unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::DataLoss);
+    }
+
+    #[test]
+    fn referenced_results_remain_tenant_bucket_and_namespace_scoped() {
+        let mut definition = request().definition;
+        definition.kind = IndexKind::GitSource as i32;
+        let mut wrong_tenant = hit("packs/repository.pack");
+        wrong_tenant.address.as_mut().unwrap().tenant = "another".into();
+        let mut wrong_bucket = hit("packs/repository.pack");
+        wrong_bucket.address.as_mut().unwrap().bucket = "another".into();
+
+        for invalid in [wrong_tenant, wrong_bucket, hit("packs/_anvil/private.pack")] {
+            assert_eq!(
+                validate_hit(&caller(), &definition, &invalid)
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::DataLoss
+            );
         }
     }
 
