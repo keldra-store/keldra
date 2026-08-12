@@ -72,7 +72,7 @@ pub(super) async fn advance_rebuild(
     ),
     Status,
 > {
-    let mut quantum = SourceWorkQuantum::new(work.source_quantum_bytes);
+    let mut quantum = SourceWorkQuantum::from_wire_limit(work.source_quantum_bytes);
     loop {
         let scan_started = Instant::now();
         let scan_span = tracing::info_span!(

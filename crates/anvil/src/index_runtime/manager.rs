@@ -966,7 +966,7 @@ async fn advance_catch_up(
     let permit = await_with_builder_heartbeats(&work.progress, budget.acquire(budget.limit()))
         .await
         .map_err(budget_status)?;
-    let mut quantum = SourceWorkQuantum::new(budget.limit());
+    let mut quantum = SourceWorkQuantum::from_budget_limit(budget.limit());
     let plan = work_plan(budget, quantum.limit)?;
     // Sequential journal pages coalesce into one mutable run until this work
     // quantum ends; the source cursor advances only after each page succeeds.

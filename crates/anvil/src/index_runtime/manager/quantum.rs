@@ -17,9 +17,15 @@ pub(super) struct SourceWorkQuantum {
 }
 
 impl SourceWorkQuantum {
-    pub(super) fn new(budget_limit: u64) -> Self {
+    /// Derive one source-wire quantum from a resident-memory budget.
+    pub(super) fn from_budget_limit(budget_limit: u64) -> Self {
+        Self::from_wire_limit(source_wire_limit(budget_limit))
+    }
+
+    /// Use a source-wire limit that the snapshot scanner already derived.
+    pub(super) const fn from_wire_limit(wire_limit: u64) -> Self {
         Self {
-            limit: source_wire_limit(budget_limit),
+            limit: wire_limit,
             consumed: 0,
         }
     }
@@ -82,7 +88,7 @@ mod tests {
 
     #[test]
     fn sequential_journal_pages_share_one_builder_quantum() {
-        let mut quantum = SourceWorkQuantum::new(KIND_BUDGET);
+        let mut quantum = SourceWorkQuantum::from_budget_limit(KIND_BUDGET);
         assert_eq!(quantum.limit, MAX_SOURCE_WIRE_BYTES);
 
         for _ in 0..31 {
@@ -101,7 +107,7 @@ mod tests {
 
     #[test]
     fn journal_page_cannot_cross_the_exact_yield_boundary() {
-        let mut quantum = SourceWorkQuantum::new(KIND_BUDGET);
+        let mut quantum = SourceWorkQuantum::from_budget_limit(KIND_BUDGET);
         assert_eq!(
             quantum.advance_page(MAX_SOURCE_WIRE_BYTES - 1).unwrap(),
             SourceWorkBoundary::Continue
@@ -113,17 +119,17 @@ mod tests {
 
     #[test]
     fn a_complete_change_larger_than_remaining_credit_starts_the_next_quantum() {
-        let mut quantum = SourceWorkQuantum::new(KIND_BUDGET);
+        let mut quantum = SourceWorkQuantum::from_budget_limit(KIND_BUDGET);
         quantum.advance_page(MAX_SOURCE_WIRE_BYTES - 1).unwrap();
 
         assert!(quantum.defer_page_to_next_quantum(2));
         assert!(!quantum.defer_page_to_next_quantum(MAX_SOURCE_WIRE_BYTES + 1));
-        assert!(!SourceWorkQuantum::new(KIND_BUDGET).defer_page_to_next_quantum(2));
+        assert!(!SourceWorkQuantum::from_budget_limit(KIND_BUDGET).defer_page_to_next_quantum(2));
     }
 
     #[test]
     fn snapshot_frames_yield_after_one_bounded_overshoot() {
-        let mut quantum = SourceWorkQuantum::new(KIND_BUDGET);
+        let mut quantum = SourceWorkQuantum::from_budget_limit(KIND_BUDGET);
         assert_eq!(
             quantum.advance_frame(MAX_SOURCE_WIRE_BYTES - 1).unwrap(),
             SourceWorkBoundary::Continue
@@ -138,9 +144,36 @@ mod tests {
 
     #[test]
     fn snapshot_frame_cannot_exceed_its_stream_bound() {
-        let mut quantum = SourceWorkQuantum::new(KIND_BUDGET);
+        let mut quantum = SourceWorkQuantum::from_budget_limit(KIND_BUDGET);
         let error = quantum
             .advance_frame(MAX_SOURCE_WIRE_BYTES + 1)
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::DataLoss);
+    }
+
+    #[test]
+    fn snapshot_uses_its_already_derived_wire_limit() {
+        const SNAPSHOT_SHARE_BYTES: u64 = 89_478_485;
+        const DERIVED_WIRE_LIMIT: u64 = 3_492_287;
+        const OBSERVED_VALID_FRAME_BYTES: u64 = 3_491_999;
+
+        assert_eq!(source_wire_limit(SNAPSHOT_SHARE_BYTES), DERIVED_WIRE_LIMIT);
+
+        let mut observed = SourceWorkQuantum::from_wire_limit(DERIVED_WIRE_LIMIT);
+        assert_eq!(observed.limit, DERIVED_WIRE_LIMIT);
+        assert_eq!(
+            observed.advance_frame(OBSERVED_VALID_FRAME_BYTES).unwrap(),
+            SourceWorkBoundary::Continue
+        );
+
+        let mut exact = SourceWorkQuantum::from_wire_limit(DERIVED_WIRE_LIMIT);
+        assert_eq!(
+            exact.advance_frame(DERIVED_WIRE_LIMIT).unwrap(),
+            SourceWorkBoundary::SealAndYield
+        );
+
+        let error = SourceWorkQuantum::from_wire_limit(DERIVED_WIRE_LIMIT)
+            .advance_frame(DERIVED_WIRE_LIMIT + 1)
             .unwrap_err();
         assert_eq!(error.code(), tonic::Code::DataLoss);
     }
