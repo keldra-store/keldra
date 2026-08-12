@@ -141,6 +141,7 @@ fn queue_definition(scheduler: &mut BuilderScheduler, definition: CatalogDefinit
             definition,
             job: Some(job),
             queued: false,
+            wake_pending: false,
         },
     );
     scheduler.enqueue(identity);
@@ -166,6 +167,7 @@ fn queue_dirty_definition(scheduler: &mut BuilderScheduler, definition: CatalogD
             definition,
             job: Some(job),
             queued: false,
+            wake_pending: false,
         },
     );
     scheduler.enqueue(identity);
@@ -291,6 +293,38 @@ fn idle_builder_releases_its_bounded_lease() {
     );
     assert!(!scheduler.entries.contains_key(&identity));
     assert_eq!(scheduler.remaining_capacity(), MAX_ACTIVE_BUILDERS);
+}
+
+#[test]
+fn same_definition_wake_during_active_work_reinspects_after_idle() {
+    let mut scheduler = BuilderScheduler::default();
+    let definition = definition(1, 2, 9);
+    let identity = definition.identity();
+    queue_dirty_definition(&mut scheduler, definition.clone());
+
+    let mut job = scheduler.pop_runnable().unwrap();
+    let metadata = WorkMetadata::from_job(&job);
+    assert!(scheduler.entries[&identity].job.is_none());
+    assert!(scheduler.record_same_definition_wake(&definition));
+    assert!(scheduler.entries[&identity].wake_pending);
+
+    job.phase = BuilderPhase::Inspect;
+    scheduler.complete_with(
+        metadata,
+        BuilderStep {
+            job,
+            disposition: BuilderDisposition::Idle,
+            retention_current: None,
+        },
+        |_, _, _| true,
+    );
+
+    assert!(!scheduler.entries[&identity].wake_pending);
+    let next = scheduler
+        .pop_runnable()
+        .expect("the wake observed during active work must trigger reinspection");
+    assert_eq!(next.definition.identity(), identity);
+    assert!(matches!(next.phase, BuilderPhase::Inspect));
 }
 
 #[test]

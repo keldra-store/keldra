@@ -277,6 +277,7 @@ struct ScheduledBuilder {
     definition: CatalogDefinition,
     job: Option<BuilderJob>,
     queued: bool,
+    wake_pending: bool,
 }
 
 impl BuilderScheduler {
@@ -328,10 +329,7 @@ impl BuilderScheduler {
         retention: &IndexGenerationRetention,
     ) -> Result<(), Status> {
         let identity = definition.identity();
-        if self.entries.get(&identity).is_some_and(|entry| {
-            entry.definition.object_version == definition.object_version
-                && entry.definition.stored == definition.stored
-        }) {
+        if self.record_same_definition_wake(&definition) {
             return Ok(());
         }
         if !self.entries.contains_key(&identity) && self.entries.len() >= MAX_ACTIVE_BUILDERS {
@@ -350,10 +348,25 @@ impl BuilderScheduler {
                 definition,
                 job: Some(job),
                 queued: false,
+                wake_pending: false,
             },
         );
         self.enqueue(identity);
         Ok(())
+    }
+
+    fn record_same_definition_wake(&mut self, definition: &CatalogDefinition) -> bool {
+        let identity = definition.identity();
+        let Some(entry) = self.entries.get_mut(&identity) else {
+            return false;
+        };
+        if entry.definition.object_version != definition.object_version
+            || entry.definition.stored != definition.stored
+        {
+            return false;
+        }
+        entry.wake_pending = true;
+        true
     }
 
     fn remove(&mut self, identity: CatalogIdentity, retention: &IndexGenerationRetention) {
@@ -518,10 +531,15 @@ impl BuilderScheduler {
                 self.evict_builder(metadata.identity);
             }
             BuilderDisposition::Idle => {
-                // The published generation and durable assignment are the
-                // resume point. Idle definitions consume no scheduler state;
-                // the fair assignment walk will lease them again.
-                self.evict_builder(metadata.identity);
+                if entry.wake_pending {
+                    entry.wake_pending = false;
+                    self.enqueue(metadata.identity);
+                } else {
+                    // The published generation and durable assignment are the
+                    // resume point. Idle definitions consume no scheduler
+                    // state; the fair assignment walk will lease them again.
+                    self.evict_builder(metadata.identity);
+                }
             }
             BuilderDisposition::Failed => {
                 tracing::error!(
