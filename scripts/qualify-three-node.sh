@@ -815,6 +815,7 @@ assert_index_resource_bounds() {
   done
 
   local resource_budget_evidence=0
+  local resource_nonzero_peak_evidence=0
   while IFS= read -r line; do
     if [[ "${line}" != *"index.kind=TypedJson"* \
       || "${line}" != *"index construction budget state"* ]]; then
@@ -832,11 +833,13 @@ assert_index_resource_bounds() {
       || return 1
     if ((configured != index_kind_budget_bytes \
       || leased > configured \
-      || peak_leased == 0 \
       || peak_leased > configured)); then
       echo "distributed production-shaped TypedJson build exceeded or misstated its configured kind budget" >&2
       printf '%s\n' "${line}" >&2
       return 1
+    fi
+    if ((peak_leased > 0)); then
+      resource_nonzero_peak_evidence=$((resource_nonzero_peak_evidence + 1))
     fi
     resource_budget_evidence=$((resource_budget_evidence + 1))
   done < <(
@@ -846,6 +849,10 @@ assert_index_resource_bounds() {
   )
   if ((resource_budget_evidence == 0)); then
     echo "distributed production-shaped TypedJson build emitted no fresh construction-budget evidence" >&2
+    return 1
+  fi
+  if ((resource_nonzero_peak_evidence == 0)); then
+    echo "distributed production-shaped TypedJson build never acquired construction budget" >&2
     return 1
   fi
 

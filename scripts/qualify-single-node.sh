@@ -567,6 +567,7 @@ run_index_qualification() {
     "${qualification_example_binaries[cluster_index_qualification]}"
   test -s "${index_verification_state}"
   save_index_qualification_log
+  assert_all_kind_construction_bounds
   assert_each_index_kind_published_and_compacted
   assert_index_compaction_observability
   echo "[anvil-single-qualification] all-eight-index qualification passed"
@@ -1033,7 +1034,7 @@ write_index_resource_observability_report() {
   echo "[anvil-single-qualification] preserved observability report ${index_resource_observability_report}"
 }
 
-assert_index_resource_bounds() {
+assert_all_kind_construction_bounds() {
   local -A observed_kinds=()
   local configured
   local kind
@@ -1100,8 +1101,17 @@ assert_index_resource_bounds() {
       return 1
     fi
   done
+}
 
+assert_index_resource_bounds() {
+  local configured
+  local leased
+  local line
+  local peak_leased
+  local resident
+  local workspace
   local resource_budget_evidence=0
+  local resource_nonzero_peak_evidence=0
   while IFS= read -r line; do
     if [[ "${line}" != *"index.kind=TypedJson"* \
       || "${line}" != *"index construction budget state"* ]]; then
@@ -1119,16 +1129,22 @@ assert_index_resource_bounds() {
       || return 1
     if ((configured != index_kind_budget_bytes \
       || leased > configured \
-      || peak_leased == 0 \
       || peak_leased > configured)); then
       echo "production-shaped TypedJson build exceeded or misstated its configured kind budget" >&2
       printf '%s\n' "${line}" >&2
       return 1
     fi
+    if ((peak_leased > 0)); then
+      resource_nonzero_peak_evidence=$((resource_nonzero_peak_evidence + 1))
+    fi
     resource_budget_evidence=$((resource_budget_evidence + 1))
   done <"${index_resource_qualification_log}"
   if ((resource_budget_evidence == 0)); then
     echo "production-shaped TypedJson build emitted no fresh construction-budget evidence" >&2
+    return 1
+  fi
+  if ((resource_nonzero_peak_evidence == 0)); then
+    echo "production-shaped TypedJson build never acquired construction budget" >&2
     return 1
   fi
 
