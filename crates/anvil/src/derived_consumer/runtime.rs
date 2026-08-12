@@ -12,7 +12,7 @@ use anvil_store::{
 };
 use tonic::Status;
 
-use crate::accounting::{LoadedAccountingDefinition, read_rollup};
+use crate::accounting::{AccountingCatalog, LoadedAccountingDefinition, read_rollup};
 use crate::cluster_object_read::ClusterObjectReader;
 use crate::index_runtime::catalog::IndexCatalog;
 use crate::index_runtime::coordination::{current_placement, load_index_assignment};
@@ -81,6 +81,7 @@ pub(crate) enum DerivedEvidenceResolver {
         local_node: NodeId,
         decisions: DecisionRaft,
         reader: ClusterObjectReader,
+        catalog: AccountingCatalog,
     },
 }
 
@@ -105,11 +106,13 @@ impl DerivedEvidenceResolver {
         local_node: NodeId,
         decisions: DecisionRaft,
         reader: ClusterObjectReader,
+        catalog: AccountingCatalog,
     ) -> Self {
         Self::Accounting {
             local_node,
             decisions,
             reader,
+            catalog,
         }
     }
 
@@ -159,6 +162,7 @@ impl DerivedEvidenceResolver {
                 local_node,
                 decisions,
                 reader,
+                catalog,
             } => {
                 let Some(definition) = crate::accounting::runtime::load_assignment(
                     *local_node,
@@ -170,7 +174,11 @@ impl DerivedEvidenceResolver {
                 else {
                     return Ok(None);
                 };
-                accounting_evidence(&definition, reader).await
+                let evidence = accounting_evidence(&definition, reader).await?;
+                if !evidence_covers_effects(evidence.as_ref(), effects) {
+                    catalog.upsert(definition)?;
+                }
+                Ok(evidence)
             }
         }
     }

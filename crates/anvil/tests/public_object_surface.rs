@@ -291,9 +291,8 @@ async fn public_accounting_lifecycle_materializes_scalar_usage() {
     .await
     .unwrap();
 
-    // Idle accounting workers yield their bounded lease. The durable
-    // assignment walk revisits them every 30 seconds, so allow one revisit
-    // plus ordinary scheduling margin.
+    // Idle accounting workers yield their bounded lease. Relevant journal
+    // effects wake them through the bounded accounting handoff.
     let deadline = Instant::now() + Duration::from_secs(45);
     loop {
         let snapshot = accounting
@@ -319,7 +318,7 @@ async fn public_accounting_lifecycle_materializes_scalar_usage() {
         }
         assert!(
             Instant::now() < deadline,
-            "accounting rollup did not converge"
+            "accounting rollup did not converge: {snapshot:?}"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }

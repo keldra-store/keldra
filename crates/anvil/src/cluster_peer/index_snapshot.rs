@@ -5,7 +5,8 @@ use std::pin::Pin;
 use anvil_consensus::{DecisionRaft, NodeId, PeerSpkiSha256};
 use anvil_store::{
     CurrentObjectSnapshot, Head, MAX_CURRENT_HEAD_SNAPSHOT_BYTES,
-    MAX_CURRENT_HEAD_SNAPSHOT_RECORDS, PlacementLogId, RetainedObjectSnapshot, SourceId, Version,
+    MAX_CURRENT_HEAD_SNAPSHOT_RECORDS, MAX_OBJECT_RECORD_EXPORT_RECORDS, PlacementLogId,
+    RetainedObjectSnapshot, SourceId, Version,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -21,6 +22,7 @@ use crate::cluster_placement::ClusterPlacement;
 use crate::index_service::path_matches_prefix;
 
 const INDEX_SOURCE_FRAME_MAX_RECORDS: u32 = MAX_CURRENT_HEAD_SNAPSHOT_RECORDS;
+const RETAINED_SOURCE_FRAME_MAX_RECORDS: u32 = MAX_OBJECT_RECORD_EXPORT_RECORDS;
 pub(super) const INDEX_SOURCE_FRAME_MAX_BYTES: u64 = MAX_CURRENT_HEAD_SNAPSHOT_BYTES;
 
 pub(super) type IndexSourceSnapshotRpcStream = Pin<
@@ -481,7 +483,7 @@ impl ClusterPeerService {
                 tenant_id,
                 bucket_id,
                 &path_prefix,
-                INDEX_SOURCE_FRAME_MAX_RECORDS,
+                RETAINED_SOURCE_FRAME_MAX_RECORDS,
                 max_frame_bytes,
                 include,
             ),
@@ -858,6 +860,10 @@ mod tests {
     fn request_scoped_frame_bound_accepts_smaller_caps_and_rejects_invalid_ones() {
         assert!(INDEX_SOURCE_FRAME_MAX_RECORDS > 1_000);
         assert_eq!(INDEX_SOURCE_FRAME_MAX_RECORDS, 65_536);
+        assert_eq!(
+            RETAINED_SOURCE_FRAME_MAX_RECORDS,
+            MAX_OBJECT_RECORD_EXPORT_RECORDS
+        );
         assert!(require_snapshot_frame_bound(1024 * 1024).is_ok());
         assert!(require_snapshot_frame_bound(INDEX_SOURCE_FRAME_MAX_BYTES).is_ok());
         assert!(require_snapshot_frame_bound(0).is_err());

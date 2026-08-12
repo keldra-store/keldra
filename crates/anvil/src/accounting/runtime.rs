@@ -104,7 +104,12 @@ pub(crate) async fn start(
         store.clone(),
         event_journal.clone(),
         derived_checkpoints,
-        DerivedEvidenceResolver::accounting(local_node, decisions.clone(), reader.clone()),
+        DerivedEvidenceResolver::accounting(
+            local_node,
+            decisions.clone(),
+            reader.clone(),
+            catalog.clone(),
+        ),
     );
     let manager = AccountingManagerTask::start(
         local_node,
