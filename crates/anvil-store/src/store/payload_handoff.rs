@@ -189,12 +189,7 @@ impl Store {
         artifact.validate()?;
         match &artifact.identity {
             PayloadArtifactIdentity::Complete(reference) => {
-                if self
-                    .complete_copy_state(reference)
-                    .await
-                    .map_err(storage_error)?
-                    != PayloadArtifactState::Valid
-                {
+                if self.open_blob(reference).await.is_err() {
                     return Err(storage_error(
                         "payload handoff lifecycle cannot precede verified complete bytes",
                     ));
@@ -603,6 +598,50 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_install_accepts_verified_zero_reference_complete_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreOptions::new(dir.path(), 1)).await.unwrap();
+        let codec = ErasureCodec::new(ErasureProfile::default()).unwrap();
+        for bytes in [
+            b"zero-reference inline handoff".to_vec(),
+            vec![23_u8; SMALL_BLOB_MAX_BYTES + 1],
+        ] {
+            let reference = store.stage_blob(&bytes).await.unwrap();
+            let initial = store.blob_reference_state(&reference).unwrap().unwrap();
+            let artifact = PayloadArtifactSnapshot {
+                identity: PayloadArtifactIdentity::Complete(reference.clone()),
+                lifecycle: BlobReferenceState {
+                    ref_count: 0,
+                    flags: 0,
+                    created_at: initial.created_at,
+                    updated_at: initial.updated_at + 1,
+                },
+            };
+
+            store
+                .install_payload_artifact_lifecycle(&codec, &artifact)
+                .await
+                .unwrap();
+            // Handoff retries the same record after failures. Verification
+            // must use retained bytes once lifecycle is already zero.
+            store
+                .install_payload_artifact_lifecycle(&codec, &artifact)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                store.blob_reference_state(&reference).unwrap(),
+                Some(artifact.lifecycle)
+            );
+            assert_eq!(
+                store.complete_copy_state(&reference).await.unwrap(),
+                PayloadArtifactState::Missing
+            );
+            store.open_blob(&reference).await.unwrap();
+        }
     }
 
     #[tokio::test]
