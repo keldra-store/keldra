@@ -8,11 +8,144 @@
 //! simple one-candidate scan.
 
 use std::future::Future;
+use std::time::Duration;
+use std::time::Instant;
 
 use anvil_api::v1::{IndexFreshness, IndexQueryHit};
+use anvil_store::ObjectKey;
 use tonic::Status;
 
-use super::{ExecutedIndexQuery, IndexPageCursor};
+use super::{ExecutedIndexQuery, IndexLiveVersionReader, IndexPageCursor};
+
+struct LiveVersionFilterMetrics {
+    started: Instant,
+    candidates: u64,
+    finished: bool,
+}
+
+impl LiveVersionFilterMetrics {
+    fn start(candidates: usize) -> Self {
+        Self {
+            started: Instant::now(),
+            candidates: u64::try_from(candidates).unwrap_or(u64::MAX),
+            finished: false,
+        }
+    }
+
+    fn complete(mut self, live: usize, missing: usize, deleted: usize, overwritten: usize) {
+        self.emit("completed", live, missing, deleted, overwritten, false);
+        self.finished = true;
+    }
+
+    fn emit(
+        &self,
+        outcome: &'static str,
+        live: usize,
+        missing: usize,
+        deleted: usize,
+        overwritten: usize,
+        failed: bool,
+    ) {
+        tracing::info!(
+            operation = "query_index",
+            phase = "live_version_filter",
+            live_filter.outcome = outcome,
+            monotonic_counter.anvil_index_live_version_filter_batches_total = 1_u64,
+            monotonic_counter.anvil_index_live_version_checks_total = self.candidates,
+            monotonic_counter.anvil_index_live_version_candidates_total = self.candidates,
+            monotonic_counter.anvil_index_live_version_retained_total =
+                u64::try_from(live).unwrap_or(u64::MAX),
+            monotonic_counter.anvil_index_live_version_rejected_total =
+                u64::try_from(missing.saturating_add(deleted).saturating_add(overwritten))
+                    .unwrap_or(u64::MAX),
+            monotonic_counter.anvil_index_live_version_missing_total =
+                u64::try_from(missing).unwrap_or(u64::MAX),
+            monotonic_counter.anvil_index_live_version_deleted_total =
+                u64::try_from(deleted).unwrap_or(u64::MAX),
+            monotonic_counter.anvil_index_live_version_overwritten_total =
+                u64::try_from(overwritten).unwrap_or(u64::MAX),
+            monotonic_counter.anvil_index_live_version_filter_failures_total = u64::from(failed),
+            histogram.anvil_index_live_version_filter_duration_seconds =
+                self.started.elapsed().as_secs_f64(),
+            "index query live-version filtering reached a terminal outcome"
+        );
+    }
+}
+
+impl Drop for LiveVersionFilterMetrics {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.emit("failed", 0, 0, 0, 0, true);
+        }
+    }
+}
+
+/// Drops stale index candidates after one bounded exact-current quorum batch.
+/// Input order is preserved and no missing, deleted, or overwritten version is
+/// exposed as a live query result.
+pub(crate) async fn retain_live_query_hits(
+    reader: &dyn IndexLiveVersionReader,
+    tenant_id: u64,
+    bucket_id: u64,
+    hits: Vec<IndexQueryHit>,
+    budget: Duration,
+) -> Result<Vec<IndexQueryHit>, Status> {
+    if hits.is_empty() {
+        return Ok(hits);
+    }
+    let mut keys = Vec::with_capacity(hits.len());
+    for hit in &hits {
+        let address = hit
+            .address
+            .as_ref()
+            .ok_or_else(|| Status::data_loss("index hit has no object address"))?;
+        keys.push(
+            ObjectKey::new(&address.tenant, &address.bucket, &address.path)
+                .map_err(|_| Status::data_loss("index hit has an invalid object address"))?,
+        );
+    }
+    let metrics = LiveVersionFilterMetrics::start(hits.len());
+    let snapshots = reader
+        .current_snapshots(&keys, tenant_id, bucket_id, budget)
+        .await?;
+    if snapshots.len() != hits.len() {
+        return Err(Status::data_loss(
+            "current object batch returned the wrong result count",
+        ));
+    }
+    let mut live = Vec::with_capacity(hits.len());
+    let mut missing = 0_usize;
+    let mut deleted = 0_usize;
+    let mut overwritten = 0_usize;
+    for ((hit, key), snapshot) in hits.into_iter().zip(keys).zip(snapshots) {
+        let Some(snapshot) = snapshot else {
+            missing += 1;
+            continue;
+        };
+        snapshot
+            .validate()
+            .map_err(|error| Status::data_loss(error.to_string()))?;
+        if snapshot.tenant_id != tenant_id
+            || snapshot.bucket_id != bucket_id
+            || snapshot.exact_path != key.path()
+        {
+            return Err(Status::data_loss(
+                "current object batch returned another object identity",
+            ));
+        }
+        if snapshot.head.deleted || snapshot.version.deleted {
+            deleted += 1;
+        } else if snapshot.head.version.0 != hit.object_version
+            || snapshot.version.id.0 != hit.object_version
+        {
+            overwritten += 1;
+        } else {
+            live.push(hit);
+        }
+    }
+    metrics.complete(live.len(), missing, deleted, overwritten);
+    Ok(live)
+}
 
 pub(crate) async fn collect_authorized_page<Execute, ExecuteFuture, Authorize, AuthorizeFuture>(
     requested_limit: usize,
@@ -229,17 +362,62 @@ fn revision_changed() -> Status {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use anvil_api::v1::ObjectAddress;
-    use anvil_store::StorageTenantId;
+    use anvil_store::{BlobRef, CurrentObjectSnapshot, Head, StorageTenantId, Version, VersionId};
 
     use super::super::boundary::{IndexPageTokenBinding, IndexPageTokenCodec};
     use super::*;
     use crate::authentication::{Caller, JwtManager};
 
     const KEY: &[u8; 32] = b"0123456789abcdef0123456789abcdef";
+
+    struct FakeLiveVersions {
+        snapshots: BTreeMap<String, Option<CurrentObjectSnapshot>>,
+    }
+
+    #[tonic::async_trait]
+    impl IndexLiveVersionReader for FakeLiveVersions {
+        async fn current_snapshots(
+            &self,
+            keys: &[ObjectKey],
+            _tenant_id: u64,
+            _bucket_id: u64,
+            _budget: Duration,
+        ) -> Result<Vec<Option<CurrentObjectSnapshot>>, Status> {
+            Ok(keys
+                .iter()
+                .map(|key| self.snapshots.get(key.path()).cloned().flatten())
+                .collect())
+        }
+    }
+
+    fn live_snapshot(path: &str, version_id: u64, deleted: bool) -> CurrentObjectSnapshot {
+        let version = Version {
+            id: VersionId(version_id),
+            blob: (!deleted).then_some(BlobRef {
+                hash: [u8::try_from(version_id).unwrap_or(1); 32],
+                length: 1,
+            }),
+            content_type: (!deleted).then(|| "application/octet-stream".into()),
+            deleted,
+            committed_at_unix_millis: version_id,
+        };
+        CurrentObjectSnapshot {
+            tenant_id: 11,
+            bucket_id: 12,
+            exact_path: path.into(),
+            head: Head {
+                version: version.id,
+                deleted,
+                mutation_stamp: None,
+            },
+            version,
+        }
+    }
 
     async fn execute_page(
         paths: Arc<Vec<&'static str>>,
@@ -318,6 +496,60 @@ mod tests {
         hits: Vec<IndexQueryHit>,
     ) -> impl std::future::Future<Output = Result<(Vec<IndexQueryHit>, u64), Status>> {
         std::future::ready(Ok((hits, 17)))
+    }
+
+    #[tokio::test]
+    async fn live_filter_keeps_only_exact_current_versions_without_reordering() {
+        let reader = FakeLiveVersions {
+            snapshots: BTreeMap::from([
+                (
+                    "docs/current".into(),
+                    Some(live_snapshot("docs/current", 1, false)),
+                ),
+                (
+                    "docs/overwritten".into(),
+                    Some(live_snapshot("docs/overwritten", 3, false)),
+                ),
+                (
+                    "docs/deleted".into(),
+                    Some(live_snapshot("docs/deleted", 4, true)),
+                ),
+                (
+                    "docs/last".into(),
+                    Some(live_snapshot("docs/last", 5, false)),
+                ),
+            ]),
+        };
+        let candidates = vec![
+            hit("docs/current"),
+            hit("docs/overwritten"),
+            hit("docs/deleted"),
+            hit("docs/missing"),
+            hit("docs/last"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut hit)| {
+            hit.object_version = u64::try_from(index + 1).unwrap();
+            hit
+        })
+        .collect();
+
+        assert_eq!(
+            retain_live_query_hits(&reader, 11, 12, candidates, Duration::from_secs(1))
+                .await
+                .unwrap(),
+            vec![
+                IndexQueryHit {
+                    object_version: 1,
+                    ..hit("docs/current")
+                },
+                IndexQueryHit {
+                    object_version: 5,
+                    ..hit("docs/last")
+                },
+            ]
+        );
     }
 
     #[tokio::test]

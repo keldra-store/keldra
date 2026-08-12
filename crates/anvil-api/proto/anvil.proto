@@ -4,7 +4,7 @@ package anvil.v1;
 
 import "google/protobuf/timestamp.proto";
 
-// The public Anvil 0.7 network contract. Peer and storage-coordination services
+// The public Anvil 0.8 network contract. Peer and storage-coordination services
 // remain private. Ordinary object calls are independent. Only InvokeProgram
 // requests atomic multi-path visibility; indexes are asynchronous derived views
 // over the same visible object state.
@@ -84,6 +84,10 @@ service IndexService {
   rpc UpdateIndex(UpdateIndexRequest) returns (IndexDefinition);
   rpc GetIndex(GetIndexRequest) returns (IndexDefinition);
   rpc ListIndexes(ListIndexesRequest) returns (ListIndexesResponse);
+  // Rewrites the same authoritative definition at an exact version. This is
+  // an explicit, authorized request for a fresh scoped snapshot generation;
+  // it creates no rebuild registry or second index authority.
+  rpc RebuildIndex(RebuildIndexRequest) returns (IndexDefinition);
   rpc DeleteIndex(DeleteIndexRequest) returns (DeleteIndexResponse);
   // The only Index RPC that may omit authentication. An anonymous query must
   // name its tenant explicitly and is still filtered by Zanzibar public-read
@@ -297,6 +301,13 @@ message ListIndexesRequest {
 message ListIndexesResponse {
   repeated IndexDefinition indexes = 1;
   bool has_more = 2;
+}
+
+message RebuildIndexRequest {
+  string bucket = 1;
+  string name = 2;
+  uint64 expected_version = 3;
+  string command_id = 4;
 }
 
 message DeleteIndexRequest {
@@ -928,7 +939,7 @@ message ProvisionTenantResponse {
 
 // Application IDs and client IDs are cluster-wide authentication identities;
 // each is globally unique. An application has exactly one client credential
-// in Anvil 0.7. Supplying the same canonical application, client ID and secret is
+// in Anvil 0.8. Supplying the same canonical application, client ID and secret is
 // an idempotent replay.
 message CreateApplicationRequest {
   string app_id = 1;
@@ -1279,7 +1290,7 @@ message TupleFilter {
 
 message AuthzConsistency {
   // Latest evaluates the current authoritative revision. AtLeast evaluates
-  // current state only when it has reached the requested revision. Anvil 0.7
+  // current state only when it has reached the requested revision. Anvil 0.8
   // retains only current authorization state: Exact(current) succeeds and an
   // older exact revision fails with AUTHZ_REVISION_EXPIRED.
   oneof requirement {

@@ -19,7 +19,7 @@ pub(crate) const SYSTEM_STABLE_TENANT_ID: u64 = 1;
 #[cfg(test)]
 pub(crate) const APP_NAMESPACE: &str = "app";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum ObjectPermission {
     Get,
     Put,

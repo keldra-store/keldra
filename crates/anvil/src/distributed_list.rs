@@ -193,7 +193,7 @@ impl LocalListQuery {
     pub(crate) fn for_index_definitions(mut self) -> Result<Self, Status> {
         let suffix = self
             .prefix
-            .strip_prefix("_anvil/indexes/v2/definitions/")
+            .strip_prefix("_anvil/indexes/v3/definitions/")
             .ok_or_else(|| {
                 Status::invalid_argument(
                     "index-definition listing requires its exact reserved prefix",

@@ -15,7 +15,7 @@ use anvil_api::v1::{
     DeleteIndexResponse, Durability, GetIndexRequest, GetObjectRequest, IndexDefinition, IndexKind,
     IndexQuery, IndexQueryHit, ListIndexesRequest, ListIndexesResponse, MutationFailure,
     MutationFailureCode, MutationReceipt, ObjectAddress, QueryIndexRequest, QueryIndexResponse,
-    ReadFailureCode, UpdateIndexRequest,
+    ReadFailureCode, RebuildIndexRequest, UpdateIndexRequest,
 };
 use anvil_store::{DefinitionKind, DefinitionMutationIntent, ObjectKey, StorageTenantId};
 use prost::Message;
@@ -35,7 +35,7 @@ use super::boundary::{
 };
 use super::{
     StoredIndexDefinition, collect_authorized_page, definition_path, derive_index_id,
-    path_matches_prefix, validate_command_id, validate_create_definition,
+    path_matches_prefix, retain_live_query_hits, validate_command_id, validate_create_definition,
     validate_update_definition,
 };
 
@@ -49,7 +49,33 @@ pub(crate) struct IndexServiceImpl {
     objects: ObjectServiceImpl,
     names: LogicalNameResolver,
     dependencies: IndexServiceDependencies,
-    request_timeout: Duration,
+    timeouts: IndexRequestTimeouts,
+}
+
+#[derive(Clone, Copy)]
+struct IndexRequestTimeouts {
+    ordinary: Duration,
+    query: Duration,
+}
+
+#[derive(Clone, Copy)]
+enum IndexRequestClass {
+    Ordinary,
+    Query,
+}
+
+impl IndexRequestTimeouts {
+    fn deadline(
+        self,
+        metadata: &tonic::metadata::MetadataMap,
+        class: IndexRequestClass,
+    ) -> Result<tokio::time::Instant, Status> {
+        let maximum = match class {
+            IndexRequestClass::Ordinary => self.ordinary,
+            IndexRequestClass::Query => self.query,
+        };
+        request_deadline(metadata, maximum)
+    }
 }
 
 impl IndexServiceImpl {
@@ -58,12 +84,16 @@ impl IndexServiceImpl {
         names: LogicalNameResolver,
         dependencies: IndexServiceDependencies,
         request_timeout: Duration,
+        query_timeout: Duration,
     ) -> Self {
         Self {
             objects,
             names,
             dependencies,
-            request_timeout,
+            timeouts: IndexRequestTimeouts {
+                ordinary: request_timeout,
+                query: query_timeout,
+            },
         }
     }
 
@@ -240,7 +270,9 @@ impl IndexServiceRpc for IndexServiceImpl {
         &self,
         request: Request<CreateIndexRequest>,
     ) -> Result<Response<IndexDefinition>, Status> {
-        let deadline = request_deadline(request.metadata(), self.request_timeout)?;
+        let deadline = self
+            .timeouts
+            .deadline(request.metadata(), IndexRequestClass::Ordinary)?;
         run_request_until(
             deadline,
             async {
@@ -295,7 +327,9 @@ impl IndexServiceRpc for IndexServiceImpl {
         &self,
         request: Request<UpdateIndexRequest>,
     ) -> Result<Response<IndexDefinition>, Status> {
-        let deadline = request_deadline(request.metadata(), self.request_timeout)?;
+        let deadline = self
+            .timeouts
+            .deadline(request.metadata(), IndexRequestClass::Ordinary)?;
         run_request_until(
             deadline,
             async {
@@ -345,7 +379,9 @@ impl IndexServiceRpc for IndexServiceImpl {
         &self,
         request: Request<GetIndexRequest>,
     ) -> Result<Response<IndexDefinition>, Status> {
-        let deadline = request_deadline(request.metadata(), self.request_timeout)?;
+        let deadline = self
+            .timeouts
+            .deadline(request.metadata(), IndexRequestClass::Ordinary)?;
         run_request_until(
             deadline,
             async {
@@ -374,7 +410,9 @@ impl IndexServiceRpc for IndexServiceImpl {
         &self,
         request: Request<ListIndexesRequest>,
     ) -> Result<Response<ListIndexesResponse>, Status> {
-        let deadline = request_deadline(request.metadata(), self.request_timeout)?;
+        let deadline = self
+            .timeouts
+            .deadline(request.metadata(), IndexRequestClass::Ordinary)?;
         run_request_until(
             deadline,
             async {
@@ -445,11 +483,72 @@ impl IndexServiceRpc for IndexServiceImpl {
         .await
     }
 
+    async fn rebuild_index(
+        &self,
+        request: Request<RebuildIndexRequest>,
+    ) -> Result<Response<IndexDefinition>, Status> {
+        let deadline = self
+            .timeouts
+            .deadline(request.metadata(), IndexRequestClass::Ordinary)?;
+        run_request_until(
+            deadline,
+            async {
+                let context = request_context(&request, deadline)?;
+                let request = request.into_inner();
+                if request.expected_version == 0 {
+                    return Err(Status::invalid_argument(
+                        "expected index definition version must be non-zero",
+                    ));
+                }
+                validate_command_id(&request.command_id)?;
+                let definition_key =
+                    definition_key(context.caller(), &request.bucket, &request.name)?;
+                authorize_rebuild_access(
+                    self.dependencies.authorization.as_ref(),
+                    context.caller(),
+                    &definition_key,
+                )
+                .await?;
+                let current = self
+                    .load_definition(&context, &request.bucket, &request.name)
+                    .await?;
+                if current.api.version != request.expected_version {
+                    return Err(Status::failed_precondition(
+                        "index definition version changed before rebuild",
+                    ));
+                }
+                let receipt = self
+                    .write_definition(
+                        &context,
+                        BulkOperationValue::PutIfVersion(BulkPutIfVersionRequest {
+                            address: Some(api_address(&current.key)),
+                            bytes: current.stored.encode()?,
+                            content_type: DEFINITION_CONTENT_TYPE.into(),
+                            command_id: request.command_id,
+                            durability: Durability::Local as i32,
+                            expected_version: request.expected_version,
+                        }),
+                        DefinitionMutationIntent::new(
+                            DefinitionKind::Index,
+                            current.stored.index_id,
+                        )
+                        .map_err(|error| Status::data_loss(error.to_string()))?,
+                    )
+                    .await?;
+                current.stored.to_api(receipt.version).map(Response::new)
+            },
+            "index request deadline exceeded",
+        )
+        .await
+    }
+
     async fn delete_index(
         &self,
         request: Request<DeleteIndexRequest>,
     ) -> Result<Response<DeleteIndexResponse>, Status> {
-        let deadline = request_deadline(request.metadata(), self.request_timeout)?;
+        let deadline = self
+            .timeouts
+            .deadline(request.metadata(), IndexRequestClass::Ordinary)?;
         run_request_until(
             deadline,
             async {
@@ -522,8 +621,11 @@ impl IndexServiceRpc for IndexServiceImpl {
         &self,
         request: Request<QueryIndexRequest>,
     ) -> Result<Response<QueryIndexResponse>, Status> {
-        let deadline = request_deadline(request.metadata(), self.request_timeout)?;
-        run_request_until(
+        let started = std::time::Instant::now();
+        let deadline = self
+            .timeouts
+            .deadline(request.metadata(), IndexRequestClass::Query)?;
+        let result = run_request_until(
             deadline,
             async {
                 let context =
@@ -573,8 +675,10 @@ impl IndexServiceRpc for IndexServiceImpl {
                 let execute_definition = loaded.api.clone();
                 let execute_query = query.clone();
                 let authorization = self.dependencies.authorization.clone();
+                let live_versions = self.dependencies.live_versions.clone();
                 let authorization_caller = context.caller().clone();
                 let authorization_definition = loaded.clone();
+                let live_version_context = context.clone();
                 let executed = collect_authorized_page(
                     limit,
                     resume,
@@ -603,16 +707,27 @@ impl IndexServiceRpc for IndexServiceImpl {
                     },
                     move |hits| {
                         let authorization = authorization.clone();
+                        let live_versions = live_versions.clone();
                         let caller = authorization_caller.clone();
                         let definition = authorization_definition.clone();
+                        let context = live_version_context.clone();
                         async move {
-                            authorize_query_hits_with(
+                            let (authorized, revision) = authorize_query_hits_with(
                                 authorization.as_ref(),
                                 &caller,
                                 &definition,
                                 hits,
                             )
-                            .await
+                            .await?;
+                            let live = retain_live_query_hits(
+                                live_versions.as_ref(),
+                                tenant_id,
+                                bucket_id,
+                                authorized,
+                                context.remaining()?,
+                            )
+                            .await?;
+                            Ok((live, revision))
                         }
                     },
                 )
@@ -638,7 +753,48 @@ impl IndexServiceRpc for IndexServiceImpl {
             },
             "index request deadline exceeded",
         )
-        .await
+        .await;
+        let (outcome, status_code, failed, deadline_exceeded) = match &result {
+            Ok(_) => ("completed", "ok", false, false),
+            Err(status) if status.code() == tonic::Code::DeadlineExceeded => {
+                ("deadline_exceeded", "deadline_exceeded", true, true)
+            }
+            Err(status) => ("failed", grpc_status_code_name(status.code()), true, false),
+        };
+        tracing::info!(
+            operation = "query_index",
+            query.outcome = outcome,
+            grpc_status_code = status_code,
+            monotonic_counter.anvil_index_query_requests_total = 1_u64,
+            monotonic_counter.anvil_index_query_request_failures_total = u64::from(failed),
+            monotonic_counter.anvil_index_query_deadlines_exceeded_total =
+                u64::from(deadline_exceeded),
+            histogram.anvil_index_query_request_duration_seconds = started.elapsed().as_secs_f64(),
+            "public index query reached a terminal outcome"
+        );
+        result
+    }
+}
+
+fn grpc_status_code_name(code: tonic::Code) -> &'static str {
+    match code {
+        tonic::Code::Ok => "ok",
+        tonic::Code::Cancelled => "cancelled",
+        tonic::Code::Unknown => "unknown",
+        tonic::Code::InvalidArgument => "invalid_argument",
+        tonic::Code::DeadlineExceeded => "deadline_exceeded",
+        tonic::Code::NotFound => "not_found",
+        tonic::Code::AlreadyExists => "already_exists",
+        tonic::Code::PermissionDenied => "permission_denied",
+        tonic::Code::ResourceExhausted => "resource_exhausted",
+        tonic::Code::FailedPrecondition => "failed_precondition",
+        tonic::Code::Aborted => "aborted",
+        tonic::Code::OutOfRange => "out_of_range",
+        tonic::Code::Unimplemented => "unimplemented",
+        tonic::Code::Internal => "internal",
+        tonic::Code::Unavailable => "unavailable",
+        tonic::Code::DataLoss => "data_loss",
+        tonic::Code::Unauthenticated => "unauthenticated",
     }
 }
 
@@ -977,6 +1133,21 @@ async fn authorize_definition_access(
     }
 }
 
+async fn authorize_rebuild_access(
+    authorization: &dyn super::boundary::IndexAuthorization,
+    caller: &Caller,
+    key: &ObjectKey,
+) -> Result<(), Status> {
+    authorize_definition_access(
+        authorization,
+        caller,
+        key,
+        ObjectPermission::Put,
+        "index rebuild is not authorized",
+    )
+    .await
+}
+
 fn validate_query_hit(
     caller: &Caller,
     definition: &StoredIndexDefinition,
@@ -1165,6 +1336,57 @@ mod tests {
             authorization.seen.lock().unwrap().as_slice(),
             &[(key, ObjectPermission::Delete)]
         );
+    }
+
+    #[tokio::test]
+    async fn rebuild_authorization_checks_definition_put_permission() {
+        let authorization = FakeAuthorization {
+            allowed: vec![false],
+            revision: 3,
+            seen: Mutex::new(Vec::new()),
+        };
+        let key = ObjectKey::new("tenant", "objects", definition_path("by-path").unwrap()).unwrap();
+        let error = authorize_rebuild_access(&authorization, &caller(), &key)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        assert_eq!(
+            authorization.seen.lock().unwrap().as_slice(),
+            &[(key, ObjectPermission::Put)]
+        );
+    }
+
+    #[test]
+    fn index_query_has_a_separate_maximum_but_client_deadlines_still_win() {
+        let timeouts = IndexRequestTimeouts {
+            ordinary: Duration::from_secs(30),
+            query: Duration::from_secs(300),
+        };
+        let metadata = tonic::metadata::MetadataMap::new();
+        let ordinary_started = tokio::time::Instant::now();
+        let ordinary = timeouts
+            .deadline(&metadata, IndexRequestClass::Ordinary)
+            .unwrap();
+        let ordinary_finished = tokio::time::Instant::now();
+        let query_started = tokio::time::Instant::now();
+        let query = timeouts
+            .deadline(&metadata, IndexRequestClass::Query)
+            .unwrap();
+        let query_finished = tokio::time::Instant::now();
+        assert!(ordinary >= ordinary_started + Duration::from_secs(30));
+        assert!(ordinary <= ordinary_finished + Duration::from_secs(30));
+        assert!(query >= query_started + Duration::from_secs(300));
+        assert!(query <= query_finished + Duration::from_secs(300));
+
+        let mut client_limited = tonic::metadata::MetadataMap::new();
+        client_limited.insert("grpc-timeout", MetadataValue::from_static("2S"));
+        for class in [IndexRequestClass::Ordinary, IndexRequestClass::Query] {
+            let started = tokio::time::Instant::now();
+            let deadline = timeouts.deadline(&client_limited, class).unwrap();
+            let finished = tokio::time::Instant::now();
+            assert!(deadline >= started + Duration::from_secs(2));
+            assert!(deadline <= finished + Duration::from_secs(2));
+        }
     }
 
     #[test]

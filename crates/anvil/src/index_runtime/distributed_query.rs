@@ -12,6 +12,7 @@ use crate::cluster_peer::{
 use crate::cluster_placement::ClusterPlacement;
 use crate::index_service::{ExecuteIndexQuery, ExecutedIndexQuery, IndexQueryExecutor};
 
+use super::local_query::requires_primary_history_gap_retry;
 use super::placement::{IndexIdentity, IndexPlacement};
 
 #[derive(Clone)]
@@ -45,6 +46,36 @@ impl DistributedIndexQueryExecutor {
         ClusterPlacement::from_applied(&state)
             .map_err(|error| Status::unavailable(error.to_string()))
     }
+
+    async fn execute_on(
+        &self,
+        target: NodeId,
+        placement: &ClusterPlacement,
+        bearer: &str,
+        request: RoutedIndexQueryRequest,
+        remaining: std::time::Duration,
+    ) -> Result<ExecutedIndexQuery, Status> {
+        if target == self.local_node {
+            self.local
+                .execute_local(LocalIndexQueryRequest {
+                    storage_tenant: request.storage_tenant,
+                    tenant_id: request.tenant_id,
+                    bucket_id: request.bucket_id,
+                    definition: request.definition,
+                    query: request.query,
+                    limit: request.limit,
+                    resume: request.resume,
+                })
+                .await
+        } else {
+            let address = placement
+                .address(target)
+                .ok_or_else(|| Status::unavailable("index query replica has no peer address"))?;
+            self.peers
+                .route_index_query(target, &address.0, bearer, request, remaining)
+                .await
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -61,6 +92,7 @@ impl IndexQueryExecutor for DistributedIndexQueryExecutor {
             .map_err(|error| Status::unavailable(error.to_string()))?;
         let replicas = assignment.query_replicas();
         let target = replicas[replica_offset(&request, replicas.len())];
+        let bearer = request.context.routed_bearer().to_owned();
         let routed = RoutedIndexQueryRequest {
             storage_tenant: request
                 .context
@@ -75,36 +107,51 @@ impl IndexQueryExecutor for DistributedIndexQueryExecutor {
             limit: request.limit,
             resume: request.resume.clone(),
         };
-        let result = if target == self.local_node {
-            self.local
-                .execute_local(LocalIndexQueryRequest {
-                    storage_tenant: request
-                        .context
-                        .caller()
-                        .storage_tenant()
-                        .as_str()
-                        .to_owned(),
-                    tenant_id: routed.tenant_id,
-                    bucket_id: routed.bucket_id,
-                    definition: routed.definition,
-                    query: routed.query,
-                    limit: routed.limit,
-                    resume: routed.resume,
-                })
-                .await?
-        } else {
-            let address = placement
-                .address(target)
-                .ok_or_else(|| Status::unavailable("index query replica has no peer address"))?;
-            self.peers
-                .route_index_query(
-                    target,
-                    &address.0,
-                    request.context.routed_bearer(),
+        let result = match self
+            .execute_on(
+                target,
+                &placement,
+                &bearer,
+                routed.clone(),
+                request.context.remaining()?,
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(error)
+                if requires_primary_history_gap_retry(&error) && target != assignment.builder() =>
+            {
+                tracing::info!(
+                    index.id = request.definition.index_id,
+                    from.node_id = target.0,
+                    to.node_id = assignment.builder().0,
+                    monotonic_counter.anvil_index_query_primary_retries_total = 1_u64,
+                    "index query retried once on its rank-zero builder after a source-history gap"
+                );
+                self.execute_on(
+                    assignment.builder(),
+                    &placement,
+                    &bearer,
                     routed,
                     request.context.remaining()?,
                 )
-                .await?
+                .await
+                .map_err(|error| {
+                    if requires_primary_history_gap_retry(&error) {
+                        Status::unavailable(
+                            "index builder placement changed while recovering source history",
+                        )
+                    } else {
+                        error
+                    }
+                })?
+            }
+            Err(error) if requires_primary_history_gap_retry(&error) => {
+                return Err(Status::unavailable(
+                    "index builder placement changed while recovering source history",
+                ));
+            }
+            Err(error) => return Err(error),
         };
         if self.placement()?.fence() != placement.fence() {
             return Err(Status::unavailable(

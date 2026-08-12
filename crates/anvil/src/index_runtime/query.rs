@@ -111,7 +111,7 @@ pub(crate) async fn execute_query<D: IndexDirectoryRead>(
             Some(Query::MetadataFilter(query)),
         ) => {
             let definition = metadata_definition(&specification.fields);
-            let query = typed_query(&query.predicates, &[], page_limit(page_size)?)?;
+            let query = metadata_query(&query.predicates, page_limit(page_size)?)?;
             let hits = MetadataFilterEngine::query_after(
                 segments,
                 &definition,
@@ -119,7 +119,8 @@ pub(crate) async fn execute_query<D: IndexDirectoryRead>(
                 typed_cursor(&position)?,
             )
             .await?;
-            typed_page(hits, &query.order, page_size)
+            let order = query.order.clone();
+            finish_page_cpu(segments, move || typed_page(hits, &order, page_size)).await
         }
         (Some(Specification::TypedJson(specification)), Some(Query::TypedJson(query))) => {
             let definition = typed_definition(&specification.fields);
@@ -131,7 +132,8 @@ pub(crate) async fn execute_query<D: IndexDirectoryRead>(
                 typed_cursor(&position)?,
             )
             .await?;
-            typed_page(hits, &query.order, page_size)
+            let order = query.order.clone();
+            finish_page_cpu(segments, move || typed_page(hits, &order, page_size)).await
         }
         (Some(Specification::FullText(_)), Some(Query::FullText(query))) => {
             let hits = FullTextEngine::query_after(
@@ -146,7 +148,7 @@ pub(crate) async fn execute_query<D: IndexDirectoryRead>(
                 full_text_cursor(&position)?,
             )
             .await?;
-            full_text_page(hits, page_size)
+            finish_page_cpu(segments, move || full_text_page(hits, page_size)).await
         }
         (Some(Specification::Vector(specification)), Some(Query::Vector(query))) => {
             let definition = vector_definition(specification)?;
@@ -163,7 +165,7 @@ pub(crate) async fn execute_query<D: IndexDirectoryRead>(
                 vector_cursor(&position)?,
             )
             .await?;
-            vector_page(hits, page_size)
+            finish_page_cpu(segments, move || vector_page(hits, page_size)).await
         }
         (Some(Specification::Hybrid(specification)), Some(Query::Hybrid(query))) => {
             let vector = specification.vector.as_ref().ok_or_else(|| {
@@ -196,7 +198,7 @@ pub(crate) async fn execute_query<D: IndexDirectoryRead>(
                 hybrid_cursor(&position)?,
             )
             .await?;
-            hybrid_page(hits, page_size)
+            finish_page_cpu(segments, move || hybrid_page(hits, page_size)).await
         }
         (Some(Specification::GitSource(specification)), Some(Query::GitSource(query))) => {
             query_git(
@@ -224,6 +226,18 @@ pub(crate) async fn execute_query<D: IndexDirectoryRead>(
         (None, _) => Err(IndexError::InvalidDefinition(
             "index specification is required".into(),
         )),
+    }
+}
+
+async fn finish_page_cpu<D, T, F>(segments: &[D], work: F) -> Result<T, IndexError>
+where
+    D: IndexDirectoryRead,
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, IndexError> + Send + 'static,
+{
+    match segments.first() {
+        Some(directory) => directory.run_query_cpu(work).await,
+        None => work(),
     }
 }
 
@@ -327,26 +341,29 @@ async fn query_path<D: IndexDirectoryRead>(
         },
     )
     .await?;
-    let has_more = documents.len() > page_size;
-    let hits = documents
-        .into_iter()
-        .take(page_size)
-        .map(|document| EngineQueryHit {
-            object_path: Some(document.path),
-            object_version: document.version,
-            score: None,
-            fields_json: Vec::new(),
-        })
-        .collect::<Vec<_>>();
-    let next = has_more.then(|| {
-        IndexQueryPosition::after(IndexQueryCursor::Path {
-            after_path: hits
-                .last()
-                .and_then(|hit| hit.object_path.clone())
-                .expect("a nonempty page has a last path"),
-        })
-    });
-    Ok(EngineQueryPage { hits, next })
+    finish_page_cpu(segments, move || {
+        let has_more = documents.len() > page_size;
+        let hits = documents
+            .into_iter()
+            .take(page_size)
+            .map(|document| EngineQueryHit {
+                object_path: Some(document.path),
+                object_version: document.version,
+                score: None,
+                fields_json: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let next = has_more.then(|| {
+            IndexQueryPosition::after(IndexQueryCursor::Path {
+                after_path: hits
+                    .last()
+                    .and_then(|hit| hit.object_path.clone())
+                    .expect("a nonempty page has a last path"),
+            })
+        });
+        Ok(EngineQueryPage { hits, next })
+    })
+    .await
 }
 
 async fn query_git<D: IndexDirectoryRead>(
@@ -377,31 +394,34 @@ async fn query_git<D: IndexDirectoryRead>(
             .into_iter()
             .collect()
     };
-    let has_more = records.len() > page_size;
-    let selected = records.into_iter().take(page_size).collect::<Vec<_>>();
-    let next = has_more.then(|| {
-        IndexQueryPosition::after(IndexQueryCursor::Git {
-            after_path: selected
-                .last()
-                .expect("a nonempty page has a last record")
-                .tree_path
-                .clone(),
-        })
-    });
-    let hits = selected
-        .into_iter()
-        .map(|record| {
-            let fields_json = serde_json::to_vec(&record)
-                .map_err(|error| IndexError::Encode(error.to_string()))?;
-            Ok(EngineQueryHit {
-                object_path: Some(record.pack_path),
-                object_version: record.pack_version,
-                score: None,
-                fields_json,
+    finish_page_cpu(segments, move || {
+        let has_more = records.len() > page_size;
+        let selected = records.into_iter().take(page_size).collect::<Vec<_>>();
+        let next = has_more.then(|| {
+            IndexQueryPosition::after(IndexQueryCursor::Git {
+                after_path: selected
+                    .last()
+                    .expect("a nonempty page has a last record")
+                    .tree_path
+                    .clone(),
             })
-        })
-        .collect::<Result<Vec<_>, IndexError>>()?;
-    Ok(EngineQueryPage { hits, next })
+        });
+        let hits = selected
+            .into_iter()
+            .map(|record| {
+                let fields_json = serde_json::to_vec(&record)
+                    .map_err(|error| IndexError::Encode(error.to_string()))?;
+                Ok(EngineQueryHit {
+                    object_path: Some(record.pack_path),
+                    object_version: record.pack_version,
+                    score: None,
+                    fields_json,
+                })
+            })
+            .collect::<Result<Vec<_>, IndexError>>()?;
+        Ok(EngineQueryPage { hits, next })
+    })
+    .await
 }
 
 async fn query_tensor<D: IndexDirectoryRead>(
@@ -413,23 +433,26 @@ async fn query_tensor<D: IndexDirectoryRead>(
     if position.cursor.is_some() {
         return Err(cursor_kind_mismatch());
     }
-    let hits = TensorProjectionEngine::get(segments, model_id, tensor_name)
-        .await?
-        .into_iter()
-        .map(|record| {
-            let object_path = record.source_path.clone();
-            let object_version = record.source_version;
-            let fields_json = serde_json::to_vec(&record)
-                .map_err(|error| IndexError::Encode(error.to_string()))?;
-            Ok(EngineQueryHit {
-                object_path: Some(object_path),
-                object_version,
-                score: None,
-                fields_json,
+    let record = TensorProjectionEngine::get(segments, model_id, tensor_name).await?;
+    finish_page_cpu(segments, move || {
+        let hits = record
+            .into_iter()
+            .map(|record| {
+                let object_path = record.source_path.clone();
+                let object_version = record.source_version;
+                let fields_json = serde_json::to_vec(&record)
+                    .map_err(|error| IndexError::Encode(error.to_string()))?;
+                Ok(EngineQueryHit {
+                    object_path: Some(object_path),
+                    object_version,
+                    score: None,
+                    fields_json,
+                })
             })
-        })
-        .collect::<Result<Vec<_>, IndexError>>()?;
-    Ok(EngineQueryPage { hits, next: None })
+            .collect::<Result<Vec<_>, IndexError>>()?;
+        Ok(EngineQueryPage { hits, next: None })
+    })
+    .await
 }
 
 fn typed_page(
@@ -525,18 +548,54 @@ fn typed_query(
 }
 
 fn typed_predicate(predicate: &IndexPredicate) -> Result<TypedPredicate, IndexError> {
+    predicate_with_values(predicate, |encoded| {
+        let value: serde_json::Value = serde_json::from_slice(encoded)
+            .map_err(|_| IndexError::InvalidQuery("predicate value is invalid JSON".into()))?;
+        ScalarValue::from_json(&value)
+            .ok_or_else(|| IndexError::InvalidQuery("predicate value must be a JSON scalar".into()))
+    })
+}
+
+fn metadata_query(predicates: &[IndexPredicate], limit: usize) -> Result<TypedQuery, IndexError> {
+    Ok(TypedQuery {
+        predicates: predicates
+            .iter()
+            .map(metadata_predicate)
+            .collect::<Result<_, _>>()?,
+        order: Vec::new(),
+        limit,
+    })
+}
+
+fn metadata_predicate(predicate: &IndexPredicate) -> Result<TypedPredicate, IndexError> {
+    predicate_with_values(predicate, |encoded| {
+        let value: serde_json::Value = serde_json::from_slice(encoded)
+            .map_err(|_| IndexError::InvalidQuery("predicate value is invalid JSON".into()))?;
+        if matches!(
+            predicate.field.as_str(),
+            "version" | "content_length" | "committed_at_unix_millis"
+        ) {
+            return value.as_u64().map(ScalarValue::Unsigned).ok_or_else(|| {
+                IndexError::InvalidQuery(
+                    "unsigned metadata predicate value must be a JSON unsigned integer".into(),
+                )
+            });
+        }
+        ScalarValue::from_json(&value)
+            .ok_or_else(|| IndexError::InvalidQuery("predicate value must be a JSON scalar".into()))
+    })
+}
+
+fn predicate_with_values(
+    predicate: &IndexPredicate,
+    decode: impl Fn(&[u8]) -> Result<ScalarValue, IndexError>,
+) -> Result<TypedPredicate, IndexError> {
     let operator = IndexPredicateOperator::try_from(predicate.operator)
         .map_err(|_| IndexError::InvalidQuery("unknown predicate operator".into()))?;
     let values = predicate
         .values_json
         .iter()
-        .map(|encoded| {
-            let value: serde_json::Value = serde_json::from_slice(encoded)
-                .map_err(|_| IndexError::InvalidQuery("predicate value is invalid JSON".into()))?;
-            ScalarValue::from_json(&value).ok_or_else(|| {
-                IndexError::InvalidQuery("predicate value must be a JSON scalar".into())
-            })
-        })
+        .map(|encoded| decode(encoded))
         .collect::<Result<Vec<_>, _>>()?;
     let one = || {
         if values.len() == 1 {
@@ -743,16 +802,18 @@ mod tests {
     }
 
     impl IndexBlockSink for MemoryBlockSink {
-        async fn emit(&mut self, block: GeneratedBlock) -> Result<(), IndexError> {
-            let (descriptor, bytes) = block.into_parts();
+        async fn emit(&mut self, block: GeneratedBlock) -> Result<BlockDescriptor, IndexError> {
+            let (mut descriptor, bytes) = block.into_parts();
+            descriptor.pack_id = 0;
+            descriptor.pack_offset = 0;
             if let Some(existing) = self.blocks.get(&descriptor.hash) {
                 if existing == &bytes {
-                    return Ok(());
+                    return Ok(descriptor);
                 }
                 return Err(IndexError::Integrity);
             }
             self.blocks.insert(descriptor.hash, bytes);
-            Ok(())
+            Ok(descriptor)
         }
     }
 
@@ -822,6 +883,55 @@ mod tests {
             cursor: None,
         };
         assert!(wrong_format.validate().is_err());
+    }
+
+    #[test]
+    fn metadata_predicates_parse_exact_unsigned_json_integers() {
+        let predicate = |value: &[u8]| IndexPredicate {
+            field: "version".into(),
+            operator: IndexPredicateOperator::Equal as i32,
+            values_json: vec![value.to_vec()],
+        };
+        let parsed = metadata_predicate(&predicate(b"9007199254740993")).unwrap();
+        assert!(matches!(
+            parsed,
+            TypedPredicate::Equal {
+                value: ScalarValue::Unsigned(9_007_199_254_740_993),
+                ..
+            }
+        ));
+        let maximum = metadata_predicate(&predicate(b"18446744073709551615")).unwrap();
+        assert!(matches!(
+            maximum,
+            TypedPredicate::Equal {
+                value: ScalarValue::Unsigned(u64::MAX),
+                ..
+            }
+        ));
+        for invalid in [
+            b"-1".as_slice(),
+            b"1.5".as_slice(),
+            b"18446744073709551616".as_slice(),
+        ] {
+            assert!(metadata_predicate(&predicate(invalid)).is_err());
+        }
+    }
+
+    #[test]
+    fn typed_json_predicates_keep_existing_number_semantics() {
+        let parsed = typed_predicate(&IndexPredicate {
+            field: "amount".into(),
+            operator: IndexPredicateOperator::Equal as i32,
+            values_json: vec![b"42".to_vec()],
+        })
+        .unwrap();
+        assert!(matches!(
+            parsed,
+            TypedPredicate::Equal {
+                value: ScalarValue::Number(42.0),
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

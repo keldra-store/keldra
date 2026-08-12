@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use tonic::Status;
 
-const STORED_DEFINITION_FORMAT: u16 = 2;
-const DEFINITION_PREFIX: &str = "_anvil/indexes/v2/definitions/";
+const STORED_DEFINITION_FORMAT: u16 = 3;
+const DEFINITION_PREFIX: &str = "_anvil/indexes/v3/definitions/";
 const MAX_INDEX_NAME_BYTES: usize = 128;
 const MAX_CONTENT_TYPE_BYTES: usize = 512;
 const MAX_COMMAND_ID_BYTES: usize = 256;
@@ -452,7 +452,7 @@ mod tests {
         );
         assert_eq!(
             definition_path("by-path").unwrap(),
-            "_anvil/indexes/v2/definitions/by-path"
+            "_anvil/indexes/v3/definitions/by-path"
         );
         assert_eq!(
             derive_index_id(7, 9, "by-path", "create-index").unwrap(),

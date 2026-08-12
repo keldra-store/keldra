@@ -5,6 +5,7 @@
 //! traits own only clustered definition discovery and generation execution.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anvil_api::v1::{IndexDefinition, IndexFreshness, IndexQuery, IndexQueryHit};
 use anvil_store::ObjectKey;
@@ -121,6 +122,31 @@ pub(crate) trait IndexDefinitionReader: Send + Sync + 'static {
 }
 
 #[tonic::async_trait]
+pub(crate) trait IndexLiveVersionReader: Send + Sync + 'static {
+    async fn current_snapshots(
+        &self,
+        keys: &[ObjectKey],
+        tenant_id: u64,
+        bucket_id: u64,
+        budget: Duration,
+    ) -> Result<Vec<Option<anvil_store::CurrentObjectSnapshot>>, Status>;
+}
+
+#[tonic::async_trait]
+impl IndexLiveVersionReader for crate::cluster_object_read::ClusterObjectReader {
+    async fn current_snapshots(
+        &self,
+        keys: &[ObjectKey],
+        tenant_id: u64,
+        bucket_id: u64,
+        budget: Duration,
+    ) -> Result<Vec<Option<anvil_store::CurrentObjectSnapshot>>, Status> {
+        self.current_head_snapshots_stable(keys, tenant_id, bucket_id, budget)
+            .await
+    }
+}
+
+#[tonic::async_trait]
 impl IndexDefinitionReader for crate::cluster_object_read::ClusterObjectReader {
     async fn current_snapshot(
         &self,
@@ -203,4 +229,5 @@ pub(crate) struct IndexServiceDependencies {
     pub(crate) authorization: Arc<dyn IndexAuthorization>,
     pub(crate) page_tokens: Arc<dyn IndexPageTokenCodec>,
     pub(crate) definition_reader: Arc<dyn IndexDefinitionReader>,
+    pub(crate) live_versions: Arc<dyn IndexLiveVersionReader>,
 }

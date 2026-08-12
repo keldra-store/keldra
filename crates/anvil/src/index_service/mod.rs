@@ -7,11 +7,12 @@ mod listing;
 mod pagination;
 mod service;
 
-pub(crate) use authorized_page::collect_authorized_page;
+pub(crate) use authorized_page::{collect_authorized_page, retain_live_query_hits};
 pub(crate) use boundary::{
     ExecuteIndexQuery, ExecutedIndexQuery, IndexAuthorization, IndexAuthorizationEvidence,
     IndexDefinitionLister, IndexDefinitionReader, IndexDefinitionScan, IndexDefinitionScanPage,
-    IndexPageCursor, IndexQueryExecutor, IndexServiceDependencies, ListedIndexDefinition,
+    IndexLiveVersionReader, IndexPageCursor, IndexQueryExecutor, IndexServiceDependencies,
+    ListedIndexDefinition,
 };
 
 pub(crate) use definition::{

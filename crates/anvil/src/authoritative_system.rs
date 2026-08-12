@@ -65,9 +65,10 @@ impl AuthoritativeSystemAuthorization {
         }
     }
 
-    /// Evaluate exact-object grants first and bucket fallbacks only for the
-    /// denied entries. The fallback is pinned to the exact first revision, so
-    /// a concurrent Zanzibar mutation retries/fails instead of mixing views.
+    /// Evaluate one deduplicated bucket grant per bucket and permission, then
+    /// exact-object grants only for entries whose bucket denied access. Both
+    /// passes use one authoritative revision, so a concurrent Zanzibar
+    /// mutation retries/fails instead of mixing views.
     pub(crate) async fn allows_objects(
         &self,
         caller: &Caller,
@@ -81,7 +82,7 @@ impl AuthoritativeSystemAuthorization {
             .map(|result| result.allowed)
     }
 
-    /// The same exact-then-bucket evaluation as [`Self::allows_objects`], plus
+    /// The same bucket-then-exact evaluation as [`Self::allows_objects`], plus
     /// the authoritative revision that must bind index pagination and result
     /// filtering. This never accepts an ingress-supplied revision.
     pub(crate) async fn allows_objects_with_evidence(
@@ -95,7 +96,9 @@ impl AuthoritativeSystemAuthorization {
             ));
         }
         let mut exact = Vec::with_capacity(requests.len());
-        let mut fallback = Vec::with_capacity(requests.len());
+        let mut bucket_checks = Vec::new();
+        let mut bucket_indexes = BTreeMap::<(&str, &str, ObjectPermission), usize>::new();
+        let mut request_bucket_indexes = Vec::with_capacity(requests.len());
         for (key, permission) in requests {
             if key.tenant() != caller.storage_tenant().as_str() {
                 return Err(Status::permission_denied(
@@ -105,21 +108,38 @@ impl AuthoritativeSystemAuthorization {
             let [object, bucket] = object_authorization_checks(caller.subject(), key, *permission)
                 .map_err(crate::authz_api::authz_status)?;
             exact.push(object);
-            fallback.push(bucket);
+            let bucket_identity = (key.tenant(), key.bucket(), *permission);
+            let bucket_index = match bucket_indexes.get(&bucket_identity) {
+                Some(index) => *index,
+                None => {
+                    let index = bucket_checks.len();
+                    bucket_checks.push(bucket);
+                    bucket_indexes.insert(bucket_identity, index);
+                    index
+                }
+            };
+            request_bucket_indexes.push(bucket_index);
         }
         let bindings = self.stable_bucket_bindings(requests).await?;
         let first = self
-            .fresh_system_checks(AuthzConsistency::Latest, exact, bindings.clone())
+            .fresh_system_checks(AuthzConsistency::Latest, bucket_checks, bindings.clone())
             .await?;
-        if first.allowed.iter().all(|allowed| *allowed) {
-            return Ok(first);
+        let mut allowed = request_bucket_indexes
+            .iter()
+            .map(|index| first.allowed[*index])
+            .collect::<Vec<_>>();
+        if allowed.iter().all(|allowed| *allowed) {
+            return Ok(FreshAuthorizationResult {
+                allowed,
+                revision: first.revision,
+                binding_generation: first.binding_generation,
+            });
         }
 
-        let denied = first
-            .allowed
+        let denied = allowed
             .iter()
             .enumerate()
-            .filter_map(|(index, allowed)| (!allowed).then_some((index, fallback[index].clone())))
+            .filter_map(|(index, allowed)| (!allowed).then_some((index, exact[index].clone())))
             .collect::<Vec<_>>();
         let second = self
             .fresh_system_checks(
@@ -132,12 +152,11 @@ impl AuthoritativeSystemAuthorization {
             || second.binding_generation != first.binding_generation
         {
             return Err(Status::unavailable(
-                "authorization view changed while applying bucket fallbacks",
+                "authorization view changed while applying exact-object fallbacks",
             ));
         }
-        let mut allowed = first.allowed;
-        for ((index, _), bucket_allowed) in denied.into_iter().zip(second.allowed) {
-            allowed[index] = bucket_allowed;
+        for ((index, _), exact_allowed) in denied.into_iter().zip(second.allowed) {
+            allowed[index] = exact_allowed;
         }
         Ok(FreshAuthorizationResult {
             allowed,
@@ -284,9 +303,9 @@ impl AuthoritativeSystemAuthorization {
         &self,
         requests: &[(ObjectKey, ObjectPermission)],
     ) -> Result<Vec<StableBucketAuthorization>, Status> {
-        let mut buckets = BTreeMap::<(String, String), (u64, u64)>::new();
+        let mut buckets = BTreeMap::<(&str, &str), (u64, u64)>::new();
         for (key, _) in requests {
-            let identity = (key.tenant().to_owned(), key.bucket().to_owned());
+            let identity = (key.tenant(), key.bucket());
             if !buckets.contains_key(&identity) {
                 let resolved = self
                     .names
@@ -300,8 +319,8 @@ impl AuthoritativeSystemAuthorization {
             .map(
                 |((storage_tenant, bucket), (expected_tenant_id, expected_bucket_id))| {
                     StableBucketAuthorization {
-                        storage_tenant,
-                        bucket,
+                        storage_tenant: storage_tenant.to_owned(),
+                        bucket: bucket.to_owned(),
                         expected_tenant_id,
                         expected_bucket_id,
                     }

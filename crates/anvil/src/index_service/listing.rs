@@ -9,7 +9,7 @@ use super::{
     definition_path,
 };
 
-const DEFINITION_PREFIX: &str = "_anvil/indexes/v2/definitions/";
+const DEFINITION_PREFIX: &str = "_anvil/indexes/v3/definitions/";
 
 #[derive(Clone)]
 pub(crate) struct DistributedIndexDefinitionLister {

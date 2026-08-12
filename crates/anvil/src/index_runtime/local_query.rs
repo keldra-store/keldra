@@ -1,78 +1,446 @@
-//! Local execution against one pinned immutable v2 manifest.
+//! Local execution against one pinned immutable v3 manifest.
 
 use std::io::Read;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anvil_api::v1::{IndexFreshness, IndexQueryHit, IndexSourceFreshness, ObjectAddress};
+use anvil_consensus::{DecisionRaft, NodeId};
+use anvil_index::{BlockDescriptor, IndexDirectoryRead, IndexError, IndexFileRead};
 use anvil_store::{BlobRef, ObjectKey};
 use tonic::Status;
+use tracing::Instrument;
 
 use crate::cluster_object_read::ClusterObjectReader;
 use crate::cluster_peer::{LocalIndexQueryExecutor, LocalIndexQueryRequest};
-use crate::index_service::ExecutedIndexQuery;
+use crate::cluster_placement::ClusterPlacement;
+use crate::index_service::{ExecutedIndexQuery, StoredIndexDefinition, definition_path};
 
-use super::cache::{IndexCache, IndexCacheError, IndexSegmentFetcher, IndexSegmentId};
-use super::directory::ManifestIndexDirectory;
+use super::cache::{IndexCache, IndexCacheError, IndexSegmentFetcher, IndexSegmentId, IndexSlice};
+use super::catalog::{CatalogDefinition, IndexCatalog};
+use super::coordination::load_definition_object;
+use super::cpu::IndexCpuPool;
+use super::directory::{ManifestIndexDirectory, ManifestIndexFile};
 use super::engine::kind_for_specification;
-use super::events::{IndexBarrier, IndexEventJournal};
+use super::events::{IndexBarrier, IndexEventError, IndexEventJournal};
 use super::generation::{
     IndexCurrentPointer, IndexGenerationManifest, ManifestReference, ManifestRun,
 };
+use super::placement::{IndexIdentity, IndexPlacement};
 use super::publication::{current_path, manifest_path};
 use super::query::{IndexQueryPosition, execute_query};
 
+const RETRY_HISTORY_GAP_ON_PRIMARY: &str =
+    "index source history gap requires retry on the rank-zero builder";
+
+pub(super) fn requires_primary_history_gap_retry(error: &Status) -> bool {
+    error.code() == tonic::Code::Aborted && error.message() == RETRY_HISTORY_GAP_ON_PRIMARY
+}
+
+#[derive(Clone)]
+struct QueryReadObserver {
+    inner: Arc<QueryReadObserverInner>,
+}
+
+struct QueryReadObserverInner {
+    reads: AtomicU64,
+    bytes: AtomicU64,
+    bytes_since_yield: AtomicU64,
+    work_quantum_bytes: u64,
+    cooperative_yields: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct QueryReadSnapshot {
+    reads: u64,
+    bytes: u64,
+    partial_quantum_bytes: u64,
+    cooperative_yields: u64,
+}
+
+impl QueryReadObserver {
+    fn new(work_quantum_bytes: u64) -> Self {
+        debug_assert!(work_quantum_bytes > 0);
+        Self {
+            inner: Arc::new(QueryReadObserverInner {
+                reads: AtomicU64::new(0),
+                bytes: AtomicU64::new(0),
+                bytes_since_yield: AtomicU64::new(0),
+                work_quantum_bytes,
+                cooperative_yields: AtomicU64::new(0),
+            }),
+        }
+    }
+
+    async fn record_read_and_yield(&self, bytes: usize) {
+        self.inner.reads.fetch_add(1, Ordering::Relaxed);
+        self.inner.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        let accumulated = self
+            .inner
+            .bytes_since_yield
+            .fetch_add(bytes as u64, Ordering::Relaxed)
+            .saturating_add(bytes as u64);
+        // Cache hits can make every index read immediately ready. Each read is
+        // already block-bounded; this configurable byte quantum prevents a
+        // cached query loop from starving serving-fence renewal without
+        // imposing one scheduler yield per small block.
+        if accumulated >= self.inner.work_quantum_bytes {
+            self.inner.bytes_since_yield.store(0, Ordering::Relaxed);
+            tokio::task::yield_now().await;
+            self.inner
+                .cooperative_yields
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn snapshot(&self) -> QueryReadSnapshot {
+        QueryReadSnapshot {
+            reads: self.inner.reads.load(Ordering::Relaxed),
+            bytes: self.inner.bytes.load(Ordering::Relaxed),
+            partial_quantum_bytes: self.inner.bytes_since_yield.load(Ordering::Relaxed),
+            cooperative_yields: self.inner.cooperative_yields.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct QueryObservedDirectory {
+    inner: ManifestIndexDirectory,
+    observer: QueryReadObserver,
+    cpu: IndexCpuPool,
+    kind: anvil_index::IndexKind,
+}
+
+impl QueryObservedDirectory {
+    fn new(
+        inner: ManifestIndexDirectory,
+        observer: QueryReadObserver,
+        cpu: IndexCpuPool,
+        kind: anvil_index::IndexKind,
+    ) -> Self {
+        Self {
+            inner,
+            observer,
+            cpu,
+            kind,
+        }
+    }
+}
+
+impl IndexDirectoryRead for QueryObservedDirectory {
+    type File = QueryObservedFile;
+
+    async fn open_root(&self) -> Result<Self::File, IndexError> {
+        Ok(QueryObservedFile {
+            inner: self.inner.open_root().await?,
+            observer: self.observer.clone(),
+        })
+    }
+
+    async fn open_block(&self, descriptor: &BlockDescriptor) -> Result<Self::File, IndexError> {
+        Ok(QueryObservedFile {
+            inner: self.inner.open_block(descriptor).await?,
+            observer: self.observer.clone(),
+        })
+    }
+
+    async fn run_query_cpu<T, F>(&self, work: F) -> Result<T, IndexError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, IndexError> + Send + 'static,
+    {
+        self.cpu.query_chunk(self.kind, work).await
+    }
+}
+
+struct QueryObservedFile {
+    inner: ManifestIndexFile,
+    observer: QueryReadObserver,
+}
+
+impl IndexFileRead for QueryObservedFile {
+    type Slice = IndexSlice;
+
+    async fn read_at(&self, offset: u64, max_length: usize) -> Result<Self::Slice, IndexError> {
+        let slice = self.inner.read_at(offset, max_length).await?;
+        self.observer
+            .record_read_and_yield(slice.as_ref().len())
+            .await;
+        Ok(slice)
+    }
+}
+
+struct QueryActiveGuard {
+    kind: Option<anvil_index::IndexKind>,
+    span: tracing::Span,
+    observer: QueryReadObserver,
+    started: std::time::Instant,
+    finished: bool,
+}
+
+struct QueryWaitingGuard {
+    kind: Option<anvil_index::IndexKind>,
+    span: tracing::Span,
+    started: std::time::Instant,
+    waiting: bool,
+}
+
+impl QueryWaitingGuard {
+    fn start(kind: Option<anvil_index::IndexKind>, span: &tracing::Span) -> Self {
+        span.in_scope(|| {
+            tracing::info!(
+                index.kind = ?kind,
+                counter.anvil_index_query_waiting = 1_i64,
+                "local index query is waiting for admission"
+            );
+        });
+        Self {
+            kind,
+            span: span.clone(),
+            started: std::time::Instant::now(),
+            waiting: true,
+        }
+    }
+
+    fn admitted(mut self) -> f64 {
+        self.waiting = false;
+        let waiting_seconds = self.started.elapsed().as_secs_f64();
+        self.span.in_scope(|| {
+            tracing::info!(
+                index.kind = ?self.kind,
+                counter.anvil_index_query_waiting = -1_i64,
+                "local index query admission wait released"
+            );
+            tracing::info!(
+                index.kind = ?self.kind,
+                query.admission_outcome = "admitted",
+                histogram.anvil_index_query_wait_duration_seconds = waiting_seconds,
+                "local index query admitted"
+            );
+        });
+        waiting_seconds
+    }
+}
+
+impl Drop for QueryWaitingGuard {
+    fn drop(&mut self) {
+        if self.waiting {
+            let waiting_seconds = self.started.elapsed().as_secs_f64();
+            self.span.in_scope(|| {
+                tracing::info!(
+                    index.kind = ?self.kind,
+                    counter.anvil_index_query_waiting = -1_i64,
+                    "local index query admission wait released"
+                );
+                tracing::info!(
+                    index.kind = ?self.kind,
+                    query.admission_outcome = "cancelled",
+                    monotonic_counter.anvil_index_query_admission_cancellations_total = 1_u64,
+                    histogram.anvil_index_query_wait_duration_seconds = waiting_seconds,
+                    "local index query admission was cancelled"
+                );
+            });
+        }
+    }
+}
+
+impl QueryActiveGuard {
+    fn start(
+        kind: Option<anvil_index::IndexKind>,
+        span: &tracing::Span,
+        observer: QueryReadObserver,
+    ) -> Self {
+        if let Some(kind) = kind {
+            span.in_scope(|| {
+                tracing::info!(
+                    index.kind = ?kind,
+                    counter.anvil_index_query_active = 1_i64,
+                    monotonic_counter.anvil_index_query_runs_total = 1_u64,
+                    "local index query admitted"
+                );
+            });
+        }
+        Self {
+            kind,
+            span: span.clone(),
+            observer,
+            started: std::time::Instant::now(),
+            finished: false,
+        }
+    }
+
+    fn finish(&mut self, result: &Result<ExecutedIndexQuery, Status>) {
+        let returned = result
+            .as_ref()
+            .map_or(0_u64, |executed| executed.hits.len() as u64);
+        self.emit_terminal(
+            if result.is_err() {
+                "failed"
+            } else {
+                "completed"
+            },
+            returned,
+            result.is_err(),
+            false,
+        );
+        self.finished = true;
+    }
+
+    fn emit_terminal(&self, outcome: &'static str, returned: u64, failed: bool, cancelled: bool) {
+        let elapsed_seconds = self.started.elapsed().as_secs_f64();
+        let snapshot = self.observer.snapshot();
+        self.span.record("query.read_ops", snapshot.reads);
+        self.span.record("query.read_bytes", snapshot.bytes);
+        self.span
+            .record("query.cooperative_yields", snapshot.cooperative_yields);
+        self.span.record("query.returned_hits", returned);
+        self.span.record("query.elapsed_seconds", elapsed_seconds);
+        self.span.record("query.outcome", outcome);
+        self.span
+            .record("otel.status_code", if failed { "error" } else { "ok" });
+        if let Some(kind) = self.kind {
+            let observed_quanta = snapshot
+                .cooperative_yields
+                .saturating_add(u64::from(snapshot.partial_quantum_bytes != 0));
+            let bytes_per_quantum = snapshot.bytes as f64 / observed_quanta.max(1) as f64;
+            self.span.in_scope(|| {
+                tracing::info!(
+                    index.kind = ?kind,
+                    query.outcome = outcome,
+                    monotonic_counter.anvil_index_query_read_ops_total = snapshot.reads,
+                    monotonic_counter.anvil_index_query_read_bytes_total = snapshot.bytes,
+                    monotonic_counter.anvil_index_query_cooperative_yields_total =
+                        snapshot.cooperative_yields,
+                    monotonic_counter.anvil_index_query_failures_total = u64::from(failed),
+                    monotonic_counter.anvil_index_query_cancellations_total = u64::from(cancelled),
+                    histogram.anvil_index_query_duration_seconds = elapsed_seconds,
+                    histogram.anvil_index_query_returned_hits = returned,
+                    histogram.anvil_index_query_read_quantum_bytes = bytes_per_quantum,
+                    "local index query reached a terminal outcome"
+                );
+            });
+        }
+    }
+}
+
+impl Drop for QueryActiveGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.emit_terminal("cancelled", 0, true, true);
+        }
+        if let Some(kind) = self.kind {
+            self.span.in_scope(|| {
+                tracing::info!(
+                    index.kind = ?kind,
+                    counter.anvil_index_query_active = -1_i64,
+                    "local index query released"
+                );
+            });
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct LocalGenerationQueryExecutor {
+    local_node: NodeId,
+    decisions: DecisionRaft,
     reader: ClusterObjectReader,
     cache: IndexCache,
     events: Arc<IndexEventJournal>,
+    catalog: IndexCatalog,
+    cpu: IndexCpuPool,
+    admission: Arc<tokio::sync::Semaphore>,
+    work_quantum_bytes: u64,
 }
 
 impl LocalGenerationQueryExecutor {
     pub(crate) fn new(
+        local_node: NodeId,
+        decisions: DecisionRaft,
         reader: ClusterObjectReader,
         cache: IndexCache,
         events: Arc<IndexEventJournal>,
+        catalog: IndexCatalog,
+        cpu: IndexCpuPool,
+        max_concurrency: u32,
+        work_quantum_bytes: u64,
     ) -> Self {
+        debug_assert!(work_quantum_bytes > 0);
         Self {
+            local_node,
+            decisions,
             reader,
             cache,
             events,
+            catalog,
+            cpu,
+            admission: Arc::new(tokio::sync::Semaphore::new(max_concurrency as usize)),
+            work_quantum_bytes,
         }
     }
 
     async fn execute(&self, request: LocalIndexQueryRequest) -> Result<ExecutedIndexQuery, Status> {
-        let started = std::time::Instant::now();
+        let index_id = request.definition.index_id;
+        let tenant_id = request.tenant_id;
+        let bucket_id = request.bucket_id;
         let kind = request
             .definition
             .specification
             .as_ref()
             .and_then(|specification| kind_for_specification(specification).ok());
-        let result = self.execute_inner(request).await;
+        let span = tracing::info_span!(
+            "anvil.index.query",
+            index.id = index_id,
+            tenant.id = tenant_id,
+            bucket.id = bucket_id,
+            index.kind = ?kind,
+            query.work_quantum_bytes = self.work_quantum_bytes,
+            query.admission_wait_seconds = tracing::field::Empty,
+            query.read_ops = tracing::field::Empty,
+            query.read_bytes = tracing::field::Empty,
+            query.cooperative_yields = tracing::field::Empty,
+            query.returned_hits = tracing::field::Empty,
+            query.elapsed_seconds = tracing::field::Empty,
+            query.outcome = tracing::field::Empty,
+            otel.status_code = tracing::field::Empty,
+        );
         if let Some(kind) = kind {
-            let returned = result
-                .as_ref()
-                .map_or(0_u64, |executed| executed.hits.len() as u64);
-            tracing::info!(
-                index.kind = ?kind,
-                histogram.anvil_index_query_duration_seconds = started.elapsed().as_secs_f64(),
-                histogram.anvil_index_query_returned_hits = returned,
-                "local index query completed"
-            );
+            span.in_scope(|| {
+                tracing::info!(
+                    index.kind = ?kind,
+                    gauge.anvil_index_query_work_quantum_bytes = self.work_quantum_bytes,
+                    "local index query work quantum configured"
+                );
+            });
         }
+        let waiting = QueryWaitingGuard::start(kind, &span);
+        let permit = self
+            .admission
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Status::unavailable("index query admission is closed"))?;
+        let admission_wait_seconds = waiting.admitted();
+        span.record("query.admission_wait_seconds", admission_wait_seconds);
+        let observer = QueryReadObserver::new(self.work_quantum_bytes);
+        let mut active = QueryActiveGuard::start(kind, &span, observer.clone());
+        let result = self
+            .execute_inner(request, observer.clone())
+            .instrument(span.clone())
+            .await;
+        active.finish(&result);
+        drop(permit);
         result
     }
 
     async fn execute_inner(
         &self,
         request: LocalIndexQueryRequest,
+        observer: QueryReadObserver,
     ) -> Result<ExecutedIndexQuery, Status> {
-        // Query execution is replica-local. Freshness may use a barrier already
-        // observed by background work, but never fans out source-status RPCs.
-        let observed = query_observed_barrier(&self.events);
         let requested_generation = request.resume.as_ref().map(|resume| resume.generation);
-        let Some(loaded) = self
+        let loaded = self
             .load_generation(
                 &request.storage_tenant,
                 &request.definition.bucket,
@@ -81,8 +449,40 @@ impl LocalGenerationQueryExecutor {
                 request.definition.index_id,
                 requested_generation,
             )
-            .await?
-        else {
+            .await?;
+        let indexed = loaded
+            .as_ref()
+            .map(|loaded| {
+                loaded
+                    .manifest
+                    .barrier()
+                    .map_err(|error| Status::data_loss(error.to_string()))
+            })
+            .transpose()?;
+        let observed = match self
+            .events
+            .capture_index_bucket_barrier(request.tenant_id, request.bucket_id, indexed.as_ref())
+            .await
+        {
+            Ok(observed) => Some(observed),
+            Err(error) if query_history_requires_rebuild(&error) => {
+                if !self.is_local_builder(&request)? {
+                    return Err(Status::aborted(RETRY_HISTORY_GAP_ON_PRIMARY));
+                }
+                self.schedule_scoped_rebuild(&request).await?;
+                tracing::info!(
+                    index.id = request.definition.index_id,
+                    tenant.id = request.tenant_id,
+                    bucket.id = request.bucket_id,
+                    reason = "history_unavailable",
+                    monotonic_counter.anvil_index_query_rebuild_wakes_total = 1_u64,
+                    "index query retained the prior generation and scheduled a scoped rebuild"
+                );
+                None
+            }
+            Err(error) => return Err(Status::unavailable(error.to_string())),
+        };
+        let Some(loaded) = loaded else {
             return Ok(ExecutedIndexQuery {
                 hits: Vec::new(),
                 freshness: empty_freshness(
@@ -102,7 +502,7 @@ impl LocalGenerationQueryExecutor {
             }
             return Ok(ExecutedIndexQuery {
                 hits: Vec::new(),
-                freshness: freshness(&loaded, observed.as_ref(), false)?,
+                freshness: query_freshness(&loaded, observed.as_ref(), false)?,
                 next_position: None,
             });
         }
@@ -129,7 +529,16 @@ impl LocalGenerationQueryExecutor {
         let directories = loaded
             .runs
             .iter()
-            .map(|run| ManifestIndexDirectory::open(self.cache.clone(), run))
+            .map(|run| {
+                ManifestIndexDirectory::open(self.cache.clone(), run).map(|inner| {
+                    QueryObservedDirectory::new(
+                        inner,
+                        observer.clone(),
+                        self.cpu.clone(),
+                        expected_kind,
+                    )
+                })
+            })
             .collect::<Result<Vec<_>, _>>()
             .map_err(index_status)?;
         let page = execute_query(
@@ -164,9 +573,62 @@ impl LocalGenerationQueryExecutor {
             .transpose()?;
         Ok(ExecutedIndexQuery {
             hits,
-            freshness: freshness(&loaded, observed.as_ref(), true)?,
+            freshness: query_freshness(&loaded, observed.as_ref(), true)?,
             next_position,
         })
+    }
+
+    fn is_local_builder(&self, request: &LocalIndexQueryRequest) -> Result<bool, Status> {
+        let state = self
+            .decisions
+            .state()
+            .map_err(|_| Status::unavailable("applied cluster membership is unavailable"))?;
+        let placement = ClusterPlacement::from_applied(&state)
+            .map_err(|error| Status::unavailable(error.to_string()))?;
+        let identity = IndexIdentity::new(
+            request.tenant_id,
+            request.bucket_id,
+            request.definition.index_id,
+        )
+        .map_err(|error| Status::data_loss(error.to_string()))?;
+        Ok(IndexPlacement::derive(identity, &placement)
+            .map_err(|error| Status::unavailable(error.to_string()))?
+            .builder()
+            == self.local_node)
+    }
+
+    async fn schedule_scoped_rebuild(
+        &self,
+        request: &LocalIndexQueryRequest,
+    ) -> Result<(), Status> {
+        let path = definition_path(&request.definition.name)?;
+        let Some(opened) = load_definition_object(
+            &self.reader,
+            request.tenant_id,
+            request.bucket_id,
+            &path,
+            anvil_store::VersionId(request.definition.version),
+        )
+        .await?
+        else {
+            return Err(Status::failed_precondition(
+                "index definition changed while scheduling its scoped rebuild",
+            ));
+        };
+        let stored = StoredIndexDefinition::decode(&opened.bytes)?;
+        if stored.to_api(opened.object_version.0)? != request.definition {
+            return Err(Status::failed_precondition(
+                "index definition changed while scheduling its scoped rebuild",
+            ));
+        }
+        self.catalog
+            .upsert_wait(CatalogDefinition {
+                tenant_id: request.tenant_id,
+                bucket_id: request.bucket_id,
+                object_version: opened.object_version.0,
+                stored,
+            })
+            .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -401,6 +863,31 @@ fn freshness(
     })
 }
 
+fn query_freshness(
+    generation: &LoadedGeneration,
+    observed: Option<&IndexBarrier>,
+    initial_build_complete: bool,
+) -> Result<IndexFreshness, Status> {
+    let mut value = freshness(generation, observed, initial_build_complete)?;
+    if observed.is_none() {
+        // The published generation remains complete and queryable, but a
+        // retained-history gap prevents a provable observed tail until the
+        // scoped rebuild (or checkpoint-only publication) completes.
+        value.rebuilding = true;
+    }
+    Ok(value)
+}
+
+fn query_history_requires_rebuild(error: &IndexEventError) -> bool {
+    matches!(
+        error,
+        IndexEventError::CheckpointMismatch(_)
+            | IndexEventError::SourceEpochChanged(_)
+            | IndexEventError::SourceHistoryGap(_)
+            | IndexEventError::IncompleteSources
+    )
+}
+
 fn empty_freshness(
     index_id: u64,
     definition_version: u64,
@@ -431,10 +918,6 @@ fn empty_freshness(
     }
 }
 
-fn query_observed_barrier(events: &IndexEventJournal) -> Option<IndexBarrier> {
-    events.last_observed_barrier()
-}
-
 fn publication_time(unix_millis: u64) -> Result<std::time::SystemTime, Status> {
     std::time::UNIX_EPOCH
         .checked_add(Duration::from_millis(unix_millis))
@@ -460,42 +943,6 @@ fn index_status(error: anvil_index::IndexError) -> Status {
 mod tests {
     use super::*;
 
-    struct PanicAuthority;
-
-    impl super::super::events::IndexEventAuthority for PanicAuthority {
-        fn current(&self) -> Result<super::super::events::IndexEventPlacement, String> {
-            panic!("query attempted to consult cluster event authority")
-        }
-    }
-
-    struct PanicSources;
-
-    #[tonic::async_trait]
-    impl super::super::events::IndexEventSources for PanicSources {
-        async fn status(
-            &self,
-            _source: &super::super::events::IndexSource,
-        ) -> Result<anvil_store::WatchJournalStatus, super::super::events::IndexEventError>
-        {
-            panic!("query attempted a source status RPC")
-        }
-
-        async fn read_page(
-            &self,
-            _source: &super::super::events::IndexSource,
-            _expected_source: anvil_store::SourceId,
-            _after_offset: u64,
-            _target_offset: u64,
-            _tenant_id: u64,
-            _bucket_id: u64,
-            _limit: usize,
-            _max_bytes: u64,
-        ) -> Result<super::super::events::IndexSourcePage, super::super::events::IndexEventError>
-        {
-            panic!("query attempted a source journal RPC")
-        }
-    }
-
     #[test]
     fn millisecond_timestamp_is_exact() {
         let value = publication_time(1_234)
@@ -506,9 +953,108 @@ mod tests {
     }
 
     #[test]
-    fn query_freshness_never_polls_cluster_sources() {
-        let events = IndexEventJournal::new(Arc::new(PanicAuthority), Arc::new(PanicSources));
-        assert!(query_observed_barrier(&events).is_none());
+    fn reloaded_checkpoint_only_generation_reports_zero_lag() {
+        let source = anvil_store::SourceId {
+            node_id: 1,
+            source_epoch: [7; 32],
+        };
+        let barrier = IndexBarrier {
+            fence: anvil_store::PlacementLogId { term: 3, index: 8 },
+            atomic: super::super::events::AtomicProgramWatermark::new(None, None, 0),
+            sources: std::collections::BTreeMap::from([(
+                anvil_consensus::NodeId(1),
+                super::super::events::IndexSourceCursor {
+                    source,
+                    next_offset: 41,
+                },
+            )]),
+        };
+        let manifest = IndexGenerationManifest::new(
+            9,
+            2,
+            4,
+            anvil_index::IndexKind::Path,
+            &barrier,
+            Vec::new(),
+            None,
+            0,
+            0,
+        )
+        .unwrap();
+        let reloaded = IndexGenerationManifest::decode(&manifest.encode().unwrap()).unwrap();
+        let loaded = LoadedGeneration {
+            manifest: reloaded,
+            runs: Vec::new(),
+            published_at_unix_millis: 1_000,
+        };
+
+        let result = freshness(&loaded, Some(&barrier), true).unwrap();
+        assert!(!result.rebuilding);
+        assert_eq!(result.sources.len(), 1);
+        assert_eq!(result.sources[0].indexed_next_offset, 41);
+        assert_eq!(result.sources[0].observed_tail, Some(40));
+        assert_eq!(result.sources[0].lag_hint, 0);
+    }
+
+    #[test]
+    fn retained_history_gap_keeps_generation_queryable_without_claiming_freshness() {
+        let source = anvil_store::SourceId {
+            node_id: 1,
+            source_epoch: [7; 32],
+        };
+        let barrier = IndexBarrier {
+            fence: anvil_store::PlacementLogId { term: 3, index: 8 },
+            atomic: super::super::events::AtomicProgramWatermark::new(None, None, 0),
+            sources: std::collections::BTreeMap::from([(
+                anvil_consensus::NodeId(1),
+                super::super::events::IndexSourceCursor {
+                    source,
+                    next_offset: 41,
+                },
+            )]),
+        };
+        let loaded = LoadedGeneration {
+            manifest: IndexGenerationManifest::new(
+                9,
+                2,
+                4,
+                anvil_index::IndexKind::Path,
+                &barrier,
+                Vec::new(),
+                None,
+                0,
+                0,
+            )
+            .unwrap(),
+            runs: Vec::new(),
+            published_at_unix_millis: 1_000,
+        };
+
+        let unknown = query_freshness(&loaded, None, true).unwrap();
+        assert_eq!(unknown.generation, 2);
+        assert!(unknown.initial_build_complete);
+        assert!(unknown.rebuilding);
+        assert_eq!(unknown.sources.len(), 1);
+        assert_eq!(unknown.sources[0].indexed_next_offset, 41);
+        assert_eq!(unknown.sources[0].observed_tail, None);
+
+        let restored = query_freshness(&loaded, Some(&barrier), true).unwrap();
+        assert!(!restored.rebuilding);
+        assert_eq!(restored.sources[0].observed_tail, Some(40));
+        assert_eq!(restored.sources[0].lag_hint, 0);
+    }
+
+    #[test]
+    fn only_the_private_history_gap_sentinel_requests_primary_retry() {
+        assert!(requires_primary_history_gap_retry(&Status::aborted(
+            RETRY_HISTORY_GAP_ON_PRIMARY
+        )));
+        assert!(!requires_primary_history_gap_retry(&Status::aborted(
+            "another aborted operation"
+        )));
+        assert!(!requires_primary_history_gap_retry(&Status::unavailable(
+            RETRY_HISTORY_GAP_ON_PRIMARY
+        )));
     }
 
     #[test]
@@ -533,5 +1079,30 @@ mod tests {
             index_status(anvil_index::IndexError::Encode("failed".into())).code(),
             tonic::Code::Internal
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn observed_query_reads_yield_at_the_configured_byte_quantum() {
+        let observer = QueryReadObserver::new(14);
+        let peer_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_flag = Arc::clone(&peer_ran);
+        let peer = tokio::spawn(async move {
+            task_flag.store(true, Ordering::Relaxed);
+        });
+
+        for _ in 0..4 {
+            observer.record_read_and_yield(7).await;
+            if peer_ran.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+        let peer_ran_during_reads = peer_ran.load(Ordering::Relaxed);
+        peer.await.unwrap();
+
+        assert!(peer_ran_during_reads);
+        let snapshot = observer.snapshot();
+        assert_eq!(snapshot.reads, 2);
+        assert_eq!(snapshot.bytes, 14);
+        assert_eq!(snapshot.cooperative_yields, 1);
     }
 }
