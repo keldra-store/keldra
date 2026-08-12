@@ -52,8 +52,9 @@ struct EngineCase {
     documents: Vec<(&'static str, &'static [u8])>,
     expected_paths: Vec<&'static str>,
     replacement: (&'static str, &'static [u8]),
-    replacement_hit_version: Option<u64>,
+    replacement_hit_path: &'static str,
     delete_path: &'static str,
+    delete_hit_path: &'static str,
     expects_scores: bool,
 }
 
@@ -194,9 +195,10 @@ async fn main() -> TestResult<()> {
         }
         for (document_number, (path, bytes)) in case.documents.iter().enumerate() {
             let client = &mut objects[document_number % object_client_count];
-            put_json(
+            put_index_document(
                 client,
                 &tenant,
+                case,
                 case.bucket,
                 path,
                 bytes,
@@ -266,9 +268,10 @@ async fn main() -> TestResult<()> {
 
     for (case_number, case) in cases.iter().enumerate() {
         let put_client = &mut objects[(write_number as usize) % object_client_count];
-        put_json(
+        put_index_document(
             put_client,
             &tenant,
+            case,
             case.bucket,
             case.replacement.0,
             case.replacement.1,
@@ -301,7 +304,7 @@ async fn main() -> TestResult<()> {
         let expected = expected_after_primary_mutations(case);
         let expected_versions = BTreeMap::new();
         let before_freshness = require_freshness(before)?;
-        let before_replacement_version = hit_version(before, case.replacement.0)?;
+        let before_replacement_version = hit_version(before, case.replacement_hit_path)?;
         let responses = wait_for_queries(
             &mut indexes,
             request(case),
@@ -315,7 +318,7 @@ async fn main() -> TestResult<()> {
             endpoints.len(),
         )
         .await?;
-        let after_replacement_version = hit_version(&responses[0], case.replacement.0)?;
+        let after_replacement_version = hit_version(&responses[0], case.replacement_hit_path)?;
         if after_replacement_version <= before_replacement_version {
             return Err(invalid(format!(
                 "{} replacement remained on version {before_replacement_version}",
@@ -330,9 +333,10 @@ async fn main() -> TestResult<()> {
     for wave in 0..COMPACTION_WAVES {
         for (case_number, case) in cases.iter().enumerate() {
             let put_client = &mut objects[(case_number + wave) % object_client_count];
-            let source_object_version = put_json(
+            let hit_version = put_index_document(
                 put_client,
                 &tenant,
+                case,
                 case.bucket,
                 case.replacement.0,
                 case.replacement.1,
@@ -340,9 +344,7 @@ async fn main() -> TestResult<()> {
                 source_durability,
             )
             .await?;
-            final_hit_versions[case_number] = case
-                .replacement_hit_version
-                .unwrap_or(source_object_version);
+            final_hit_versions[case_number] = hit_version;
             write_number += 1;
         }
 
@@ -355,7 +357,7 @@ async fn main() -> TestResult<()> {
         {
             let expected = expected_after_primary_mutations(case);
             let expected_versions =
-                BTreeMap::from([(case.replacement.0, final_hit_versions[case_number])]);
+                BTreeMap::from([(case.replacement_hit_path, final_hit_versions[case_number])]);
             let before_freshness = require_freshness(before)?;
             let responses = wait_for_queries(
                 &mut indexes,
@@ -534,7 +536,7 @@ async fn collect_final_responses(
         let expected_versions = if *replacement_hit_version == 0 {
             BTreeMap::new()
         } else {
-            BTreeMap::from([(case.replacement.0, *replacement_hit_version)])
+            BTreeMap::from([(case.replacement_hit_path, *replacement_hit_version)])
         };
         let responses = wait_for_queries(
             indexes,
@@ -558,7 +560,7 @@ fn expected_after_primary_mutations<'a>(case: &'a EngineCase) -> BTreeSet<&'a st
     case.expected_paths
         .iter()
         .copied()
-        .filter(|path| *path != case.delete_path)
+        .filter(|path| *path != case.delete_hit_path)
         .collect()
 }
 
@@ -915,12 +917,76 @@ fn assert_status(actual: Code, expected: Code, context: &str) -> TestResult<()> 
     }
 }
 
-async fn put_json(
+async fn put_index_document(
+    client: &mut RawClient,
+    tenant: &str,
+    case: &EngineCase,
+    bucket: &str,
+    path: &str,
+    bytes: &[u8],
+    command_id: &str,
+    durability: Durability,
+) -> TestResult<u64> {
+    let mut manifest = serde_json::from_slice::<serde_json::Value>(bytes)?;
+    let referenced = match case.specification.specification.as_ref() {
+        Some(SpecificationValue::GitSource(_)) => Some(("pack_path", "pack_version")),
+        Some(SpecificationValue::Tensor(_)) => Some(("source_path", "source_version")),
+        _ => None,
+    };
+    let hit_version = if let Some((path_field, version_field)) = referenced {
+        let referenced_path = manifest
+            .get(path_field)
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                invalid(format!(
+                    "{case_name} omitted {path_field}",
+                    case_name = case.name
+                ))
+            })?
+            .to_owned();
+        let payload = format!("qualification payload for {referenced_path}\n");
+        let version = put_bytes(
+            client,
+            tenant,
+            bucket,
+            &referenced_path,
+            payload.as_bytes(),
+            "application/octet-stream",
+            &format!("{command_id}-payload"),
+            durability,
+        )
+        .await?;
+        manifest[version_field] = serde_json::Value::from(version);
+        version
+    } else {
+        0
+    };
+    let encoded = serde_json::to_vec(&manifest)?;
+    let manifest_version = put_bytes(
+        client,
+        tenant,
+        bucket,
+        path,
+        &encoded,
+        CONTENT_TYPE,
+        command_id,
+        durability,
+    )
+    .await?;
+    Ok(if hit_version == 0 {
+        manifest_version
+    } else {
+        hit_version
+    })
+}
+
+async fn put_bytes(
     client: &mut RawClient,
     tenant: &str,
     bucket: &str,
     path: &str,
     bytes: &[u8],
+    content_type: &str,
     command_id: &str,
     durability: Durability,
 ) -> TestResult<u64> {
@@ -932,7 +998,7 @@ async fn put_json(
                 bucket: bucket.into(),
                 path: path.into(),
             }),
-            content_type: CONTENT_TYPE.into(),
+            content_type: content_type.into(),
             command_id: command_id.into(),
             durability: durability as i32,
             operation: Some(PutOperationValue::Put(PutOperation {})),
@@ -1306,8 +1372,9 @@ fn engine_cases() -> Vec<EngineCase> {
                 "docs/l.json",
             ],
             replacement: ("docs/a.json", br#"{"value":"a-replaced"}"#),
-            replacement_hit_version: None,
+            replacement_hit_path: "docs/a.json",
             delete_path: "docs/b.json",
+            delete_hit_path: "docs/b.json",
             expects_scores: false,
         },
         EngineCase {
@@ -1337,8 +1404,9 @@ fn engine_cases() -> Vec<EngineCase> {
                 "docs/active-a.json",
                 br#"{"status":"active","revision":2}"#,
             ),
-            replacement_hit_version: None,
+            replacement_hit_path: "docs/active-a.json",
             delete_path: "docs/active-b.json",
+            delete_hit_path: "docs/active-b.json",
             expects_scores: false,
         },
         EngineCase {
@@ -1363,8 +1431,9 @@ fn engine_cases() -> Vec<EngineCase> {
             ],
             expected_paths: vec!["docs/keep-a.json", "docs/keep-b.json"],
             replacement: ("docs/keep-a.json", br#"{"value":"a-replaced"}"#),
-            replacement_hit_version: None,
+            replacement_hit_path: "docs/keep-a.json",
             delete_path: "docs/keep-b.json",
+            delete_hit_path: "docs/keep-b.json",
             expects_scores: false,
         },
         EngineCase {
@@ -1393,8 +1462,9 @@ fn engine_cases() -> Vec<EngineCase> {
                 "docs/journal-a.json",
                 br#"{"body":"durable journal replacement"}"#,
             ),
-            replacement_hit_version: None,
+            replacement_hit_path: "docs/journal-a.json",
             delete_path: "docs/journal-b.json",
+            delete_hit_path: "docs/journal-b.json",
             expects_scores: true,
         },
         EngineCase {
@@ -1410,8 +1480,9 @@ fn engine_cases() -> Vec<EngineCase> {
                 "docs/rust.json",
                 br#"{"title":"rust search replacement","embedding":[0.9,0.1,0.0]}"#,
             ),
-            replacement_hit_version: None,
+            replacement_hit_path: "docs/rust.json",
             delete_path: "docs/storage.json",
+            delete_hit_path: "docs/storage.json",
             expects_scores: true,
         },
         EngineCase {
@@ -1438,8 +1509,9 @@ fn engine_cases() -> Vec<EngineCase> {
                 "docs/rust.json",
                 br#"{"title":"rust search replacement","embedding":[0.9,0.1,0.0]}"#,
             ),
-            replacement_hit_version: None,
+            replacement_hit_path: "docs/rust.json",
             delete_path: "docs/storage.json",
+            delete_hit_path: "docs/storage.json",
             expects_scores: true,
         },
         EngineCase {
@@ -1456,24 +1528,25 @@ fn engine_cases() -> Vec<EngineCase> {
             documents: vec![
                 (
                     "docs/git-lib.json",
-                    br#"{"repository_id":"qualification-repository","commit_id":"qualification-commit","tree_path":"src/lib.rs","object_id":"1111111111111111111111111111111111111111","pack_path":"docs/git-lib.json","pack_version":1,"offset":0,"length":128}"#,
+                    br#"{"repository_id":"qualification-repository","commit_id":"qualification-commit","tree_path":"src/lib.rs","object_id":"1111111111111111111111111111111111111111","pack_path":"packs/git-lib.pack","pack_version":0,"offset":0,"length":128}"#,
                 ),
                 (
                     "docs/git-main.json",
-                    br#"{"repository_id":"qualification-repository","commit_id":"qualification-commit","tree_path":"src/main.rs","object_id":"2222222222222222222222222222222222222222","pack_path":"docs/git-main.json","pack_version":1,"offset":128,"length":256}"#,
+                    br#"{"repository_id":"qualification-repository","commit_id":"qualification-commit","tree_path":"src/main.rs","object_id":"2222222222222222222222222222222222222222","pack_path":"packs/git-main.pack","pack_version":0,"offset":128,"length":256}"#,
                 ),
                 (
                     "docs/git-readme.json",
-                    br#"{"repository_id":"qualification-repository","commit_id":"qualification-commit","tree_path":"README.md","object_id":"4444444444444444444444444444444444444444","pack_path":"docs/git-readme.json","pack_version":1,"offset":384,"length":64}"#,
+                    br#"{"repository_id":"qualification-repository","commit_id":"qualification-commit","tree_path":"README.md","object_id":"4444444444444444444444444444444444444444","pack_path":"packs/git-readme.pack","pack_version":0,"offset":384,"length":64}"#,
                 ),
             ],
-            expected_paths: vec!["docs/git-lib.json", "docs/git-main.json"],
+            expected_paths: vec!["packs/git-lib.pack", "packs/git-main.pack"],
             replacement: (
                 "docs/git-lib.json",
-                br#"{"repository_id":"qualification-repository","commit_id":"qualification-commit","tree_path":"src/lib.rs","object_id":"3333333333333333333333333333333333333333","pack_path":"docs/git-lib.json","pack_version":2,"offset":256,"length":192}"#,
+                br#"{"repository_id":"qualification-repository","commit_id":"qualification-commit","tree_path":"src/lib.rs","object_id":"3333333333333333333333333333333333333333","pack_path":"packs/git-lib.pack","pack_version":0,"offset":256,"length":192}"#,
             ),
-            replacement_hit_version: Some(2),
+            replacement_hit_path: "packs/git-lib.pack",
             delete_path: "docs/git-main.json",
+            delete_hit_path: "packs/git-main.pack",
             expects_scores: false,
         },
         EngineCase {
@@ -1488,24 +1561,25 @@ fn engine_cases() -> Vec<EngineCase> {
             documents: vec![
                 (
                     "docs/tensor-encoder.json",
-                    br#"{"model_id":"qualification-model","tensor_name":"encoder.shadow","source_path":"docs/tensor-encoder.json","source_version":1,"offset":0,"length":128,"dtype":"f32","shape":[8,4]}"#,
+                    br#"{"model_id":"qualification-model","tensor_name":"encoder.shadow","source_path":"tensors/encoder.bin","source_version":0,"offset":0,"length":128,"dtype":"f32","shape":[8,4]}"#,
                 ),
                 (
                     "docs/tensor-decoder.json",
-                    br#"{"model_id":"qualification-model","tensor_name":"decoder.bias","source_path":"docs/tensor-decoder.json","source_version":1,"offset":128,"length":32,"dtype":"f32","shape":[8]}"#,
+                    br#"{"model_id":"qualification-model","tensor_name":"decoder.bias","source_path":"tensors/decoder.bin","source_version":0,"offset":128,"length":32,"dtype":"f32","shape":[8]}"#,
                 ),
                 (
                     "docs/tensor-encoder-copy.json",
-                    br#"{"model_id":"qualification-model","tensor_name":"encoder.weight","source_path":"docs/tensor-encoder-copy.json","source_version":1,"offset":160,"length":128,"dtype":"f32","shape":[8,4]}"#,
+                    br#"{"model_id":"qualification-model","tensor_name":"encoder.weight","source_path":"tensors/encoder-copy.bin","source_version":0,"offset":160,"length":128,"dtype":"f32","shape":[8,4]}"#,
                 ),
             ],
-            expected_paths: vec!["docs/tensor-encoder-copy.json"],
+            expected_paths: vec!["tensors/encoder-copy.bin"],
             replacement: (
                 "docs/tensor-encoder-copy.json",
-                br#"{"model_id":"qualification-model","tensor_name":"encoder.weight","source_path":"docs/tensor-encoder-copy.json","source_version":2,"offset":288,"length":128,"dtype":"f32","shape":[8,4]}"#,
+                br#"{"model_id":"qualification-model","tensor_name":"encoder.weight","source_path":"tensors/encoder-copy.bin","source_version":0,"offset":288,"length":128,"dtype":"f32","shape":[8,4]}"#,
             ),
-            replacement_hit_version: Some(2),
+            replacement_hit_path: "tensors/encoder-copy.bin",
             delete_path: "docs/tensor-decoder.json",
+            delete_hit_path: "tensors/decoder.bin",
             expects_scores: false,
         },
     ]
@@ -1615,16 +1689,22 @@ mod tests {
                 case.name
             );
             assert!(!case.expected_paths.is_empty());
-            assert!(case.expected_paths.contains(&case.replacement.0));
+            assert!(case.expected_paths.contains(&case.replacement_hit_path));
             assert_ne!(case.replacement.0, case.delete_path);
             let references_another_object = matches!(
                 case.specification.specification.as_ref(),
                 Some(SpecificationValue::GitSource(_) | SpecificationValue::Tensor(_))
             );
             assert_eq!(
-                case.replacement_hit_version.is_some(),
+                case.replacement_hit_path != case.replacement.0,
                 references_another_object,
-                "{} must declare whether result versions come from a referenced object",
+                "{} must point results at the correct ordinary object",
+                case.name
+            );
+            assert_eq!(
+                case.delete_hit_path != case.delete_path,
+                references_another_object,
+                "{} must delete the manifest for the correct ordinary result object",
                 case.name
             );
             if !matches!(
@@ -1632,7 +1712,7 @@ mod tests {
                 Some(SpecificationValue::Tensor(_))
             ) {
                 assert!(case.expected_paths.len() > 1, "{} must paginate", case.name);
-                assert!(case.expected_paths.contains(&case.delete_path));
+                assert!(case.expected_paths.contains(&case.delete_hit_path));
             } else {
                 assert_eq!(
                     case.expected_paths.len(),
