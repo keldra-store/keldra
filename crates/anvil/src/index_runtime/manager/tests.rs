@@ -10,13 +10,15 @@ use crate::index_runtime::events::{AtomicProgramWatermark, IndexJournalChange, I
 fn run(sequence: u64, level: u8) -> ManifestRun {
     ManifestRun {
         sequence,
+        created_at_unix_millis: sequence.saturating_mul(1_000),
         level,
-        root_path: format!("_anvil/indexes/v2/9/runs/{:064x}/root", sequence),
+        root_path: format!("_anvil/indexes/v3/9/runs/{:064x}/root", sequence),
         root_blob: anvil_store::BlobRef {
             hash: [sequence as u8; 32],
             length: 10,
         },
         root_object_version: anvil_store::VersionId(sequence),
+        packs: Vec::new(),
         mutation_count: 1,
         live_document_count: 1,
         minimum_version: 1,
@@ -100,7 +102,7 @@ fn snapshot_frame_measurement_matches_the_streams_per_record_credit() {
         .map(|head| serde_json::to_vec(head).unwrap().len() as u64)
         .sum::<u64>();
 
-    assert_eq!(measure_snapshot_frame(&frame).unwrap(), expected);
+    assert_eq!(rebuild::measure_snapshot_frame(&frame).unwrap(), expected);
     assert!(serde_json::to_vec(&frame).unwrap().len() as u64 > expected);
 }
 
@@ -155,6 +157,7 @@ fn queue_dirty_definition(scheduler: &mut BuilderScheduler, definition: CatalogD
         candidate: CandidateGeneration::rebuild(),
         changed: true,
         must_publish: true,
+        maintenance: false,
         progress,
     });
     scheduler.entries.insert(
@@ -187,11 +190,11 @@ fn reserved_segment_matching_is_not_a_string_prefix_guess() {
 fn reserved_artifact_pages_have_no_generation_source_changes() {
     let page = journal_page(
         vec![
-            journal_change(1, 2, "_anvil/indexes/v2/9/current", 11),
+            journal_change(1, 2, "_anvil/indexes/v3/9/current", 11),
             journal_change(
                 1,
                 2,
-                "_anvil/indexes/v2/9/manifests/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "_anvil/indexes/v3/9/manifests/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 12,
             ),
         ],
@@ -202,39 +205,42 @@ fn reserved_artifact_pages_have_no_generation_source_changes() {
 }
 
 #[test]
-fn observed_artifact_progress_is_reused_for_the_next_real_mutation() {
-    let published = barrier(10);
-    let observed = ObservedGenerationProgress {
-        current_object_version: VersionId(7),
-        barrier: barrier(13),
+fn irrelevant_source_progress_is_published_and_survives_reload() {
+    let job = BuilderJob::new(definition(1, 2, 9)).unwrap();
+    let mut work = CatchUpWork {
+        current: None,
+        through: barrier(10),
+        target: barrier(13),
+        candidate: CandidateGeneration::rebuild(),
+        changed: false,
+        must_publish: false,
+        maintenance: false,
+        progress: BuilderProgress::start(job.telemetry_identity(), BuilderProgressPhase::CatchUp),
     };
-    let next_target = barrier(14);
+    let page = journal_page(vec![journal_change(1, 2, "outside/scope.json", 12)], 13);
 
-    let start = incremental_start(VersionId(7), &published, Some(&observed));
-    assert_eq!(start, &observed.barrier);
-    assert!(barriers_can_advance(start, &next_target));
-    assert_eq!(start.sources[&NodeId(1)].next_offset, 13);
-    assert_eq!(next_target.sources[&NodeId(1)].next_offset, 14);
+    assert!(journal_source_paths(1, 2, "records/", &page).is_empty());
+    record_source_page_progress(&mut work, &page);
+    assert!(!work.changed);
+    assert!(work.must_publish);
+    assert_eq!(work.through, work.target);
 
-    let page = journal_page(vec![journal_change(1, 2, "records/real.json", 13)], 14);
-    assert_eq!(
-        journal_source_paths(1, 2, "records/", &page),
-        BTreeMap::from([("records/real.json".to_owned(), 13)])
-    );
-}
-
-#[test]
-fn observed_progress_does_not_cross_a_current_pointer_change() {
-    let published = barrier(20);
-    let observed = ObservedGenerationProgress {
-        current_object_version: VersionId(7),
-        barrier: barrier(24),
-    };
-
-    assert_eq!(
-        incremental_start(VersionId(8), &published, Some(&observed)),
-        &published
-    );
+    let manifest = super::super::generation::IndexGenerationManifest::new(
+        9,
+        2,
+        1,
+        IndexKind::Path,
+        &work.through,
+        work.candidate.runs,
+        None,
+        0,
+        0,
+    )
+    .unwrap();
+    let reloaded =
+        super::super::generation::IndexGenerationManifest::decode(&manifest.encode().unwrap())
+            .unwrap();
+    assert_eq!(reloaded.barrier().unwrap(), barrier(13));
 }
 
 #[test]
@@ -388,13 +394,6 @@ fn transient_failure_yields_a_lease_to_a_later_assignment() {
 }
 
 #[test]
-fn first_overfull_level_is_selected_deterministically() {
-    let mut runs = (1..=5).map(|sequence| run(sequence, 0)).collect::<Vec<_>>();
-    runs.extend((6..=10).map(|sequence| run(sequence, 1)));
-    assert_eq!(overfull_level(&runs), Some(0));
-}
-
-#[test]
 fn lost_incremental_history_requests_a_snapshot_rebuild() {
     for error in [
         IndexEventError::CheckpointMismatch(NodeId(1)),
@@ -427,6 +426,7 @@ fn transient_catch_up_and_publish_failures_preserve_exact_work() {
         candidate: CandidateGeneration::rebuild(),
         changed: true,
         must_publish: true,
+        maintenance: false,
         progress: BuilderProgress::start(job.telemetry_identity(), BuilderProgressPhase::CatchUp),
     };
     let catch_up_step = recover_builder_failure(
@@ -501,6 +501,7 @@ fn incompatible_history_forces_the_next_inspect_to_open_a_scoped_snapshot() {
         candidate: CandidateGeneration::rebuild(),
         changed: false,
         must_publish: false,
+        maintenance: false,
         progress: BuilderProgress::start(job.telemetry_identity(), BuilderProgressPhase::CatchUp),
     };
     let step = recover_builder_failure(

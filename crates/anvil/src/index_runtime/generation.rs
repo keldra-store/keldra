@@ -1,4 +1,4 @@
-//! Version-2 immutable logical-run and generation manifests.
+//! Version-3 immutable logical-run and generation manifests.
 
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -11,9 +11,11 @@ use thiserror::Error;
 use super::events::IndexBarrier;
 use super::publication::{manifest_path, run_root_path};
 
-pub(crate) const INDEX_MANIFEST_FORMAT: u16 = 2;
-pub(crate) const INDEX_CURRENT_FORMAT: u16 = 2;
-pub(crate) const MAX_RUNS_PER_LEVEL: usize = 4;
+pub(crate) const INDEX_MANIFEST_FORMAT: u16 = 3;
+pub(crate) const INDEX_CURRENT_FORMAT: u16 = 3;
+/// Corruption guard for one published level. Runtime admission uses a lower,
+/// startup-configured debt bound and compacts before crossing it.
+pub(crate) const MAX_RUNS_PER_LEVEL: usize = 256;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -24,17 +26,33 @@ pub(crate) struct ManifestSourceCheckpoint {
     pub next_offset: u64,
 }
 
-/// One logical run. Its root recursively names every independently published
-/// block, so neither this manifest nor runtime heap grows with block count.
+/// One logical run. Its root recursively names logical blocks by deterministic
+/// pack ID; this manifest resolves those IDs to ordinary immutable objects.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManifestPack {
+    /// Deterministic writer-lane/local-pack identity carried by logical block
+    /// descriptors. It is not an object version or placement decision.
+    pub id: u32,
+    pub blob: BlobRef,
+    pub object_version: VersionId,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ManifestRun {
     /// Monotonic source-state order. Larger values are newer.
     pub sequence: u64,
+    /// Durable creation time of this immutable run, used only for retention
+    /// and exact compaction-debt age observability.
+    pub created_at_unix_millis: u64,
     pub level: u8,
     pub root_path: String,
     pub root_blob: BlobRef,
     pub root_object_version: VersionId,
+    /// Physical ordinary-object packs addressed by every logical block
+    /// descriptor below the standalone run root.
+    pub packs: Vec<ManifestPack>,
     pub mutation_count: u64,
     pub live_document_count: u64,
     pub minimum_version: u64,
@@ -50,13 +68,16 @@ impl ManifestRun {
         descriptor: &RunDescriptor,
         root_blob: BlobRef,
         root_object_version: VersionId,
+        packs: Vec<ManifestPack>,
     ) -> Result<Self, GenerationError> {
         let value = Self {
             sequence,
+            created_at_unix_millis: unix_millis(SystemTime::now())?,
             level: descriptor.level,
             root_path: run_root_path(index_id, descriptor.hash),
             root_blob,
             root_object_version,
+            packs,
             mutation_count: descriptor.mutation_count,
             live_document_count: descriptor.live_document_count,
             minimum_version: descriptor.minimum_version,
@@ -68,13 +89,33 @@ impl ManifestRun {
     }
 
     fn validate(&self, index_id: u64) -> Result<(), GenerationError> {
+        let mut previous_pack_id = None;
+        let packed_bytes = self.packs.iter().try_fold(0_u64, |total, pack| {
+            if pack.id == u32::MAX
+                || previous_pack_id.is_some_and(|previous| previous >= pack.id)
+                || pack.blob.length == 0
+                || pack.object_version.0 == 0
+            {
+                return Err(GenerationError::InvalidRun(
+                    "logical run contains invalid artifact pack metadata".into(),
+                ));
+            }
+            previous_pack_id = Some(pack.id);
+            total
+                .checked_add(pack.blob.length)
+                .ok_or(GenerationError::LengthOverflow)
+        })?;
         if self.sequence == 0
+            || self.created_at_unix_millis == 0
             || self.root_blob.length == 0
             || self.root_object_version.0 == 0
             || self.mutation_count == 0
             || self.live_document_count > self.mutation_count
             || self.maximum_version < self.minimum_version
-            || self.authoritative_bytes < self.root_blob.length
+            || packed_bytes
+                .checked_add(self.root_blob.length)
+                .ok_or(GenerationError::LengthOverflow)?
+                != self.authoritative_bytes
             || self.root_path != run_root_path(index_id, self.root_blob.hash)
         {
             return Err(GenerationError::InvalidRun(
@@ -210,7 +251,7 @@ impl IndexGenerationManifest {
             *count += 1;
             if *count > MAX_RUNS_PER_LEVEL {
                 return Err(GenerationError::InvalidManifest(
-                    "one logical run level exceeds its four-run bound".into(),
+                    "one logical run level exceeds the format debt bound".into(),
                 ));
             }
             total = total
@@ -286,13 +327,7 @@ impl IndexCurrentPointer {
         manifest_object_version: VersionId,
         published_at: SystemTime,
     ) -> Result<Self, GenerationError> {
-        let published_at_unix_millis = u64::try_from(
-            published_at
-                .duration_since(UNIX_EPOCH)
-                .map_err(|_| GenerationError::ClockBeforeEpoch)?
-                .as_millis(),
-        )
-        .map_err(|_| GenerationError::TimestampOverflow)?;
+        let published_at_unix_millis = unix_millis(published_at)?;
         let value = Self {
             format: INDEX_CURRENT_FORMAT,
             index_id: manifest.index_id,
@@ -346,6 +381,15 @@ impl IndexCurrentPointer {
     }
 }
 
+fn unix_millis(time: SystemTime) -> Result<u64, GenerationError> {
+    u64::try_from(
+        time.duration_since(UNIX_EPOCH)
+            .map_err(|_| GenerationError::ClockBeforeEpoch)?
+            .as_millis(),
+    )
+    .map_err(|_| GenerationError::TimestampOverflow)
+}
+
 #[derive(Debug, Error, Eq, PartialEq)]
 pub(crate) enum GenerationError {
     #[error("index logical run is invalid: {0}")]
@@ -358,11 +402,11 @@ pub(crate) enum GenerationError {
     LengthOverflow,
     #[error("system clock predates the Unix epoch")]
     ClockBeforeEpoch,
-    #[error("index publication timestamp overflow")]
+    #[error("index timestamp overflow")]
     TimestampOverflow,
-    #[error("encode index v2 object: {0}")]
+    #[error("encode index v3 object: {0}")]
     Encode(String),
-    #[error("decode index v2 object: {0}")]
+    #[error("decode index v3 object: {0}")]
     Decode(String),
 }
 
@@ -394,6 +438,7 @@ mod tests {
         let digest = [sequence as u8; 32];
         ManifestRun {
             sequence,
+            created_at_unix_millis: 1_000,
             level,
             root_path: run_root_path(4, digest),
             root_blob: BlobRef {
@@ -401,6 +446,14 @@ mod tests {
                 length: 10,
             },
             root_object_version: VersionId(sequence + 5),
+            packs: vec![ManifestPack {
+                id: 0,
+                blob: BlobRef {
+                    hash: [(sequence as u8).wrapping_add(1); 32],
+                    length: 10,
+                },
+                object_version: VersionId(sequence + 6),
+            }],
             mutation_count: 2,
             live_document_count: 2,
             minimum_version: 1,
@@ -410,7 +463,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_pointer_and_manifest_round_trip() {
+    fn v3_pointer_and_manifest_round_trip() {
         let manifest = IndexGenerationManifest::new(
             4,
             1,
@@ -451,7 +504,9 @@ mod tests {
             IndexGenerationManifest::new(4, 1, 8, IndexKind::Path, &barrier(), runs, None, 8, 0,)
                 .is_ok()
         );
-        let too_many = (1..=5).map(|sequence| run(sequence, 0)).collect();
+        let too_many = (1..=MAX_RUNS_PER_LEVEL as u64 + 1)
+            .map(|sequence| run(sequence, 0))
+            .collect();
         assert!(
             IndexGenerationManifest::new(
                 4,
@@ -461,7 +516,27 @@ mod tests {
                 &barrier(),
                 too_many,
                 None,
-                5,
+                MAX_RUNS_PER_LEVEL as u64 + 1,
+                0,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn run_creation_time_is_required() {
+        let mut invalid = run(1, 0);
+        invalid.created_at_unix_millis = 0;
+        assert!(
+            IndexGenerationManifest::new(
+                4,
+                1,
+                8,
+                IndexKind::Path,
+                &barrier(),
+                vec![invalid],
+                None,
+                1,
                 0,
             )
             .is_err()

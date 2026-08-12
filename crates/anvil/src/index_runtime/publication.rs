@@ -9,6 +9,7 @@ use anvil_store::{
     PublishRequest, PutMode, Store, VersionId,
 };
 use tonic::Status;
+use tracing::Instrument;
 
 use crate::bucket_governance::BucketGovernance;
 use crate::cluster_peer::ClusterPeerTransport;
@@ -19,6 +20,8 @@ use super::placement::{IndexIdentity, IndexPlacement};
 
 const INDEX_ARTIFACT_CONTENT_TYPE: &str = "application/vnd.anvil.index-artifact";
 const ACCOUNTING_ARTIFACT_CONTENT_TYPE: &str = "application/vnd.anvil.accounting+json";
+pub(crate) const MAX_INDEX_ARTIFACT_BATCH_ITEMS: usize = 1_000;
+pub(crate) const MAX_INDEX_ARTIFACT_BATCH_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DefinitionVersionGuard {
@@ -212,6 +215,13 @@ pub(crate) trait IndexArtifactPublication: Send + Sync + 'static {
         request: IndexArtifactPublish,
     ) -> Result<IndexArtifactOutcome, Status>;
 
+    async fn publish_many(
+        &self,
+        authenticated_builder: NodeId,
+        placement: ClusterPlacement,
+        requests: Vec<IndexArtifactPublish>,
+    ) -> Result<Vec<IndexArtifactOutcome>, Status>;
+
     async fn commit_guarded(
         &self,
         authenticated_definition_coordinator: NodeId,
@@ -257,6 +267,22 @@ impl IndexArtifactPublication for LateBoundIndexArtifactPublication {
             .ok_or_else(|| Status::unavailable("index artifact publisher is not ready"))?;
         handler
             .publish(authenticated_builder, placement, request)
+            .await
+    }
+
+    async fn publish_many(
+        &self,
+        authenticated_builder: NodeId,
+        placement: ClusterPlacement,
+        requests: Vec<IndexArtifactPublish>,
+    ) -> Result<Vec<IndexArtifactOutcome>, Status> {
+        let handler = self
+            .inner
+            .get()
+            .cloned()
+            .ok_or_else(|| Status::unavailable("index artifact publisher is not ready"))?;
+        handler
+            .publish_many(authenticated_builder, placement, requests)
             .await
     }
 
@@ -492,6 +518,89 @@ impl IndexArtifactCoordinator {
         })
     }
 
+    async fn publish_immutable_many(
+        &self,
+        authenticated_builder: NodeId,
+        placement: ClusterPlacement,
+        requests: Vec<IndexArtifactPublish>,
+    ) -> Result<Vec<IndexArtifactOutcome>, Status> {
+        validate_immutable_batch(&requests)?;
+        let first = &requests[0];
+        let identity = IndexIdentity::new(first.tenant_id, first.bucket_id, first.index_id)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        self.validate_index_builder(authenticated_builder, &placement, identity)?;
+        let governance = self
+            .governance
+            .resolve(&first.storage_tenant, &first.bucket)
+            .await?;
+        if (governance.tenant_id, governance.bucket_id)
+            != (identity.tenant_id(), identity.bucket_id())
+        {
+            return Err(Status::failed_precondition(
+                "index artifact mutable names no longer bind the supplied stable IDs",
+            ));
+        }
+        let first_key = first.key()?;
+        let group = self.objects.object_replica_group_stable(
+            &placement,
+            &first_key,
+            first.tenant_id,
+            first.bucket_id,
+        )?;
+        if group.coordinator() != self.objects.local_node() {
+            return Err(Status::failed_precondition(
+                "grouped index artifacts reached the wrong object coordinator",
+            ));
+        }
+        for request in &requests[1..] {
+            let key = request.key()?;
+            let candidate = self.objects.object_replica_group_stable(
+                &placement,
+                &key,
+                request.tenant_id,
+                request.bucket_id,
+            )?;
+            if candidate != group {
+                return Err(Status::invalid_argument(
+                    "grouped index artifacts span metadata replica groups",
+                ));
+            }
+        }
+        let durability = artifact_durability(
+            ArtifactPathKind::Immutable,
+            placement.placement_nodes().len(),
+        );
+        let publishes = requests
+            .into_iter()
+            .map(|request| {
+                Ok(PublishRequest {
+                    key: request.key()?,
+                    blob: request.blob,
+                    content_type: Some(INDEX_ARTIFACT_CONTENT_TYPE.into()),
+                    mode: PutMode::PutIfAbsent,
+                    command_id: Some(request.command_id),
+                    durability,
+                })
+            })
+            .collect::<Result<Vec<_>, Status>>()?;
+        self.objects
+            .publish_many_from_source_with_governance(
+                publishes,
+                authenticated_builder,
+                governance,
+                placement,
+            )
+            .await?
+            .into_iter()
+            .map(|outcome| {
+                outcome.map(|receipt| IndexArtifactOutcome {
+                    version: receipt.version,
+                    replayed: receipt.replayed,
+                })
+            })
+            .collect()
+    }
+
     async fn require_current_definition(
         &self,
         placement: &ClusterPlacement,
@@ -527,6 +636,140 @@ impl IndexArtifactCoordinator {
 
 /// Builder-side router. The builder owns orchestration, while every artifact
 /// still enters the ordinary coordinator selected for its exact object path.
+struct GroupedPublishTelemetry {
+    span: tracing::Span,
+    started: std::time::Instant,
+    requested_items: u64,
+    requested_bytes: u64,
+    groups: u64,
+    batches: u64,
+    local_batches: u64,
+    remote_batches: u64,
+    attempted_items: u64,
+    attempted_bytes: u64,
+    finished: bool,
+}
+
+impl GroupedPublishTelemetry {
+    fn start(requests: &[IndexArtifactPublish]) -> Self {
+        let first = &requests[0];
+        let requested_items = requests.len() as u64;
+        let requested_bytes = requests.iter().fold(0_u64, |total, request| {
+            total.saturating_add(request.blob.length)
+        });
+        let span = tracing::info_span!(
+            "anvil.index.grouped_publish",
+            index.id = first.index_id,
+            tenant.id = first.tenant_id,
+            bucket.id = first.bucket_id,
+            publish.requested_items = requested_items,
+            publish.requested_bytes = requested_bytes,
+            publish.groups = tracing::field::Empty,
+            publish.batches = tracing::field::Empty,
+            publish.local_batches = tracing::field::Empty,
+            publish.remote_batches = tracing::field::Empty,
+            publish.attempted_items = tracing::field::Empty,
+            publish.attempted_bytes = tracing::field::Empty,
+            publish.elapsed_seconds = tracing::field::Empty,
+            publish.outcome = tracing::field::Empty,
+            otel.status_code = tracing::field::Empty,
+        );
+        span.in_scope(|| {
+            tracing::info!(
+                operation = "index_artifact_grouped_publish",
+                counter.anvil_index_grouped_publish_active = 1_i64,
+                monotonic_counter.anvil_index_grouped_publish_attempts_total = 1_u64,
+                "grouped index artifact publication started"
+            );
+        });
+        Self {
+            span,
+            started: std::time::Instant::now(),
+            requested_items,
+            requested_bytes,
+            groups: 0,
+            batches: 0,
+            local_batches: 0,
+            remote_batches: 0,
+            attempted_items: 0,
+            attempted_bytes: 0,
+            finished: false,
+        }
+    }
+
+    fn record_batch(&mut self, local: bool, batch: &[(usize, IndexArtifactPublish)]) {
+        self.batches = self.batches.saturating_add(1);
+        if local {
+            self.local_batches = self.local_batches.saturating_add(1);
+        } else {
+            self.remote_batches = self.remote_batches.saturating_add(1);
+        }
+        self.attempted_items = self.attempted_items.saturating_add(batch.len() as u64);
+        self.attempted_bytes = self.attempted_bytes.saturating_add(
+            batch
+                .iter()
+                .map(|(_, request)| request.blob.length)
+                .sum::<u64>(),
+        );
+    }
+
+    fn finish(&mut self, failed: bool) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        let elapsed_seconds = self.started.elapsed().as_secs_f64();
+        let outcome = if failed { "failed" } else { "completed" };
+        self.span.record("publish.groups", self.groups);
+        self.span.record("publish.batches", self.batches);
+        self.span
+            .record("publish.local_batches", self.local_batches);
+        self.span
+            .record("publish.remote_batches", self.remote_batches);
+        self.span
+            .record("publish.attempted_items", self.attempted_items);
+        self.span
+            .record("publish.attempted_bytes", self.attempted_bytes);
+        self.span.record("publish.elapsed_seconds", elapsed_seconds);
+        self.span.record("publish.outcome", outcome);
+        self.span
+            .record("otel.status_code", if failed { "error" } else { "ok" });
+        self.span.in_scope(|| {
+            tracing::info!(
+                operation = "index_artifact_grouped_publish",
+                counter.anvil_index_grouped_publish_active = -1_i64,
+                "grouped index artifact publication released"
+            );
+            tracing::info!(
+                operation = "index_artifact_grouped_publish",
+                publish.outcome = outcome,
+                monotonic_counter.anvil_index_grouped_publish_failures_total = u64::from(failed),
+                monotonic_counter.anvil_index_grouped_publish_batches_total = self.batches,
+                monotonic_counter.anvil_index_grouped_publish_local_batches_total =
+                    self.local_batches,
+                monotonic_counter.anvil_index_grouped_publish_remote_batches_total =
+                    self.remote_batches,
+                monotonic_counter.anvil_index_grouped_publish_items_total = self.attempted_items,
+                monotonic_counter.anvil_index_grouped_publish_bytes_total = self.attempted_bytes,
+                histogram.anvil_index_grouped_publish_requested_items = self.requested_items,
+                histogram.anvil_index_grouped_publish_requested_bytes = self.requested_bytes,
+                histogram.anvil_index_grouped_publish_replica_groups = self.groups,
+                histogram.anvil_index_grouped_publish_batch_count = self.batches,
+                histogram.anvil_index_grouped_publish_duration_seconds = elapsed_seconds,
+                "grouped index artifact publication finished"
+            );
+        });
+    }
+}
+
+impl Drop for GroupedPublishTelemetry {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.finish(true);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct IndexArtifactRouter {
     local_node: NodeId,
@@ -585,6 +828,94 @@ impl IndexArtifactRouter {
             };
         self.require_fence(fence)?;
         Ok(outcome)
+    }
+
+    pub(crate) async fn publish_many(
+        &self,
+        requests: Vec<IndexArtifactPublish>,
+    ) -> Result<Vec<IndexArtifactOutcome>, Status> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut telemetry = GroupedPublishTelemetry::start(&requests);
+        let span = telemetry.span.clone();
+        let result = self
+            .publish_many_inner(requests, &mut telemetry)
+            .instrument(span)
+            .await;
+        telemetry.finish(result.is_err());
+        result
+    }
+
+    async fn publish_many_inner(
+        &self,
+        requests: Vec<IndexArtifactPublish>,
+        telemetry: &mut GroupedPublishTelemetry,
+    ) -> Result<Vec<IndexArtifactOutcome>, Status> {
+        let first = &requests[0];
+        let identity = (
+            first.storage_tenant.clone(),
+            first.bucket.clone(),
+            first.tenant_id,
+            first.bucket_id,
+            first.index_id,
+        );
+        let placement = self.require_local_builder(identity.2, identity.3, identity.4)?;
+        let fence = placement.fence();
+        let mut groups =
+            std::collections::BTreeMap::<Vec<NodeId>, Vec<(usize, IndexArtifactPublish)>>::new();
+        for (index, request) in requests.into_iter().enumerate() {
+            request.validate()?;
+            if request.storage_tenant != identity.0
+                || request.bucket != identity.1
+                || request.tenant_id != identity.2
+                || request.bucket_id != identity.3
+                || request.index_id != identity.4
+            {
+                return Err(Status::invalid_argument(
+                    "one grouped publication candidate must share its index identity",
+                ));
+            }
+            let key = request.key()?;
+            let group = self.objects.object_replica_group_stable(
+                &placement,
+                &key,
+                request.tenant_id,
+                request.bucket_id,
+            )?;
+            groups
+                .entry(group.replicas().to_vec())
+                .or_default()
+                .push((index, request));
+        }
+        telemetry.groups = groups.len() as u64;
+        let outcome_count = groups.values().map(Vec::len).sum();
+        let mut outcomes = vec![None; outcome_count];
+        for (replicas, group) in groups {
+            let coordinator = replicas[0];
+            for batch in bounded_artifact_batches(group)? {
+                telemetry.record_batch(coordinator == self.local_node, &batch);
+                let (indices, publications): (Vec<_>, Vec<_>) = batch.into_iter().unzip();
+                let published = if coordinator == self.local_node {
+                    self.coordinator
+                        .publish_many(self.local_node, placement.clone(), publications)
+                        .await?
+                } else {
+                    let address = placement.address(coordinator).ok_or_else(|| {
+                        Status::unavailable(format!(
+                            "ACTIVE artifact coordinator {} has no peer address",
+                            coordinator.0
+                        ))
+                    })?;
+                    self.peers
+                        .publish_index_artifacts(coordinator, &address.0, fence, &publications)
+                        .await?
+                };
+                record_grouped_artifact_outcomes(&mut outcomes, indices, published)?;
+                self.require_fence(fence)?;
+            }
+        }
+        ordered_grouped_artifact_outcomes(outcomes)
     }
 
     pub(crate) async fn delete(
@@ -650,6 +981,74 @@ impl IndexArtifactRouter {
     }
 }
 
+fn bounded_artifact_batches(
+    requests: Vec<(usize, IndexArtifactPublish)>,
+) -> Result<Vec<Vec<(usize, IndexArtifactPublish)>>, Status> {
+    let mut batches = Vec::new();
+    let mut batch = Vec::new();
+    let mut batch_bytes = 0_u64;
+    for request in requests {
+        let item_bytes = request.1.blob.length;
+        if item_bytes > MAX_INDEX_ARTIFACT_BATCH_BYTES {
+            return Err(Status::resource_exhausted(
+                "one index artifact exceeds the grouped publication byte bound",
+            ));
+        }
+        let next_bytes = batch_bytes.checked_add(item_bytes).ok_or_else(|| {
+            Status::resource_exhausted("index artifact batch byte count overflow")
+        })?;
+        if !batch.is_empty()
+            && (batch.len() == MAX_INDEX_ARTIFACT_BATCH_ITEMS
+                || next_bytes > MAX_INDEX_ARTIFACT_BATCH_BYTES)
+        {
+            batches.push(std::mem::take(&mut batch));
+            batch_bytes = 0;
+        }
+        batch_bytes = batch_bytes
+            .checked_add(item_bytes)
+            .ok_or_else(|| Status::resource_exhausted("index artifact byte count overflow"))?;
+        batch.push(request);
+    }
+    if !batch.is_empty() {
+        batches.push(batch);
+    }
+    Ok(batches)
+}
+
+fn record_grouped_artifact_outcomes(
+    outcomes: &mut [Option<IndexArtifactOutcome>],
+    indices: Vec<usize>,
+    published: Vec<IndexArtifactOutcome>,
+) -> Result<(), Status> {
+    if published.len() != indices.len() {
+        return Err(Status::data_loss(
+            "grouped index artifact outcome count differs from its request",
+        ));
+    }
+    for (index, outcome) in indices.into_iter().zip(published) {
+        let slot = outcomes.get_mut(index).ok_or_else(|| {
+            Status::data_loss("grouped index artifact outcome index is out of bounds")
+        })?;
+        if slot.replace(outcome).is_some() {
+            return Err(Status::data_loss(
+                "grouped index artifact outcome was recorded more than once",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn ordered_grouped_artifact_outcomes(
+    outcomes: Vec<Option<IndexArtifactOutcome>>,
+) -> Result<Vec<IndexArtifactOutcome>, Status> {
+    outcomes
+        .into_iter()
+        .map(|outcome| {
+            outcome.ok_or_else(|| Status::data_loss("grouped index artifact outcome is missing"))
+        })
+        .collect()
+}
+
 #[tonic::async_trait]
 impl IndexArtifactPublication for IndexArtifactCoordinator {
     async fn publish(
@@ -665,6 +1064,16 @@ impl IndexArtifactPublication for IndexArtifactCoordinator {
             self.publish_unguarded(authenticated_builder, placement, request)
                 .await
         }
+    }
+
+    async fn publish_many(
+        &self,
+        authenticated_builder: NodeId,
+        placement: ClusterPlacement,
+        requests: Vec<IndexArtifactPublish>,
+    ) -> Result<Vec<IndexArtifactOutcome>, Status> {
+        self.publish_immutable_many(authenticated_builder, placement, requests)
+            .await
     }
 
     async fn commit_guarded(
@@ -800,6 +1209,42 @@ fn require_guarded_definition(
     }
 }
 
+fn validate_immutable_batch(requests: &[IndexArtifactPublish]) -> Result<(), Status> {
+    if requests.is_empty() || requests.len() > MAX_INDEX_ARTIFACT_BATCH_ITEMS {
+        return Err(Status::resource_exhausted(format!(
+            "index artifact batch must contain 1..={MAX_INDEX_ARTIFACT_BATCH_ITEMS} items"
+        )));
+    }
+    let first = &requests[0];
+    let mut bytes = 0_u64;
+    for request in requests {
+        if request.validate()? != ArtifactPathKind::Immutable {
+            return Err(Status::invalid_argument(
+                "grouped index publication accepts immutable artifacts only",
+            ));
+        }
+        if request.storage_tenant != first.storage_tenant
+            || request.bucket != first.bucket
+            || request.tenant_id != first.tenant_id
+            || request.bucket_id != first.bucket_id
+            || request.index_id != first.index_id
+        {
+            return Err(Status::invalid_argument(
+                "grouped index artifacts must share one exact index identity",
+            ));
+        }
+        bytes = bytes.checked_add(request.blob.length).ok_or_else(|| {
+            Status::resource_exhausted("index artifact batch byte count overflow")
+        })?;
+    }
+    if bytes > MAX_INDEX_ARTIFACT_BATCH_BYTES {
+        return Err(Status::resource_exhausted(format!(
+            "index artifact batch exceeds {MAX_INDEX_ARTIFACT_BATCH_BYTES} logical bytes"
+        )));
+    }
+    Ok(())
+}
+
 fn artifact_durability(kind: ArtifactPathKind, active_nodes: usize) -> Durability {
     match kind {
         // Accounting artifacts remain ordinary placed objects. LOCAL is only
@@ -824,7 +1269,7 @@ fn parse_artifact_path(path: &str, expected_index: u64) -> Result<ArtifactPathKi
     if parts.len() < 5
         || parts[0] != "_anvil"
         || parts[1] != "indexes"
-        || parts[2] != "v2"
+        || parts[2] != "v3"
         || parse_canonical_u64(parts[3]) != Some(expected_index)
     {
         return Err(Status::invalid_argument(
@@ -837,11 +1282,13 @@ fn parse_artifact_path(path: &str, expected_index: u64) -> Result<ArtifactPathKi
             Ok(ArtifactPathKind::Immutable)
         }
         [_, _, _, _, "runs", run, "root"] if valid_digest(run) => Ok(ArtifactPathKind::Immutable),
-        [_, _, _, _, "runs", run, "blocks", block] if valid_digest(run) && valid_digest(block) => {
+        [_, _, _, _, "runs", run, "packs", ordinal]
+            if valid_digest(run) && parse_canonical_u32(ordinal).is_some() =>
+        {
             Ok(ArtifactPathKind::Immutable)
         }
         _ => Err(Status::invalid_argument(
-            "index artifact path does not name a v2 current pointer, manifest, run, or component",
+            "index artifact path does not name a v3 current pointer, manifest, run, or component",
         )),
     }
 }
@@ -878,6 +1325,11 @@ fn parse_canonical_u64(value: &str) -> Option<u64> {
     (parsed != 0 && parsed.to_string() == value).then_some(parsed)
 }
 
+fn parse_canonical_u32(value: &str) -> Option<u32> {
+    let parsed = value.parse::<u32>().ok()?;
+    (parsed.to_string() == value).then_some(parsed)
+}
+
 fn valid_digest(value: &str) -> bool {
     value.len() == 64
         && value
@@ -888,7 +1340,7 @@ fn valid_digest(value: &str) -> bool {
 pub(crate) fn index_definition_name(path: &str) -> Option<&str> {
     let parts = path.split('/').collect::<Vec<_>>();
     match parts.as_slice() {
-        ["_anvil", "indexes", "v2", "definitions", name] if valid_definition_name(name) => {
+        ["_anvil", "indexes", "v3", "definitions", name] if valid_definition_name(name) => {
             Some(name)
         }
         _ => None,
@@ -901,7 +1353,7 @@ fn valid_definition_name(name: &str) -> bool {
 
 pub(crate) fn manifest_path(index_id: u64, digest: [u8; 32]) -> String {
     format!(
-        "_anvil/indexes/v2/{index_id}/manifests/{}",
+        "_anvil/indexes/v3/{index_id}/manifests/{}",
         hex::encode(digest)
     )
 }
@@ -912,12 +1364,12 @@ pub(crate) fn run_root_path(index_id: u64, run_digest: [u8; 32]) -> String {
 
 pub(crate) fn run_prefix(index_id: u64, run_digest: [u8; 32]) -> String {
     format!(
-        "_anvil/indexes/v2/{index_id}/runs/{}/",
+        "_anvil/indexes/v3/{index_id}/runs/{}/",
         hex::encode(run_digest)
     )
 }
 
-/// Extract a run identity only from one canonical format-2 root/block path.
+/// Extract a run identity only from one canonical format-3 root/pack path.
 /// Prefix retention uses this instead of textual starts-with matching so an
 /// adjacent digest or an extra slash cannot widen a deletion scope.
 pub(crate) fn run_hash_from_artifact_path(index_id: u64, path: &str) -> Option<[u8; 32]> {
@@ -926,7 +1378,7 @@ pub(crate) fn run_hash_from_artifact_path(index_id: u64, path: &str) -> Option<[
         [
             "_anvil",
             "indexes",
-            "v2",
+            "v3",
             encoded_index,
             "runs",
             digest,
@@ -937,15 +1389,15 @@ pub(crate) fn run_hash_from_artifact_path(index_id: u64, path: &str) -> Option<[
         [
             "_anvil",
             "indexes",
-            "v2",
+            "v3",
             encoded_index,
             "runs",
             run,
-            "blocks",
-            block,
+            "packs",
+            ordinal,
         ] if parse_canonical_u64(encoded_index) == Some(index_id)
             && valid_digest(run)
-            && valid_digest(block) =>
+            && parse_canonical_u32(ordinal).is_some() =>
         {
             *run
         }
@@ -959,25 +1411,17 @@ pub(crate) fn is_manifest_artifact_path(index_id: u64, path: &str) -> bool {
     let parts = path.split('/').collect::<Vec<_>>();
     matches!(
         parts.as_slice(),
-        ["_anvil", "indexes", "v2", encoded_index, "manifests", digest]
+        ["_anvil", "indexes", "v3", encoded_index, "manifests", digest]
             if parse_canonical_u64(encoded_index) == Some(index_id) && valid_digest(digest)
     )
 }
 
-pub(crate) fn run_block_path(
-    index_id: u64,
-    run_digest: [u8; 32],
-    block_digest: [u8; 32],
-) -> String {
-    format!(
-        "{}blocks/{}",
-        run_prefix(index_id, run_digest),
-        hex::encode(block_digest)
-    )
+pub(crate) fn run_pack_path(index_id: u64, run_digest: [u8; 32], pack_id: u32) -> String {
+    format!("{}packs/{}", run_prefix(index_id, run_digest), pack_id)
 }
 
 pub(crate) fn current_path(index_id: u64) -> String {
-    format!("_anvil/indexes/v2/{index_id}/current")
+    format!("_anvil/indexes/v3/{index_id}/current")
 }
 
 pub(crate) fn is_index_recovery_path(path: &str, index_id: u64) -> bool {
@@ -1013,25 +1457,21 @@ mod tests {
     #[test]
     fn only_exact_reserved_artifact_shapes_are_accepted() {
         assert_eq!(
-            parse_artifact_path("_anvil/indexes/v2/7/current", 7).unwrap(),
+            parse_artifact_path("_anvil/indexes/v3/7/current", 7).unwrap(),
             ArtifactPathKind::Current
         );
         let digest = "a".repeat(64);
         assert_eq!(
-            parse_artifact_path(&format!("_anvil/indexes/v2/7/manifests/{digest}"), 7).unwrap(),
+            parse_artifact_path(&format!("_anvil/indexes/v3/7/manifests/{digest}"), 7).unwrap(),
             ArtifactPathKind::Immutable
         );
         assert!(
-            parse_artifact_path(
-                &format!("_anvil/indexes/v2/7/runs/{digest}/blocks/{digest}"),
-                7
-            )
-            .is_ok()
+            parse_artifact_path(&format!("_anvil/indexes/v3/7/runs/{digest}/packs/0"), 7).is_ok()
         );
         for invalid in [
-            "_anvil/indexes/v2/7/definition",
-            "_anvil/indexes/v2/7/runs/name/descriptor",
-            "_anvil/indexes/v2/07/current",
+            "_anvil/indexes/v3/7/definition",
+            "_anvil/indexes/v3/7/runs/name/descriptor",
+            "_anvil/indexes/v3/07/current",
             "_anvil/indexes/7/current",
             "ordinary/path",
         ] {
@@ -1042,15 +1482,15 @@ mod tests {
     #[test]
     fn definition_discovery_accepts_only_the_dedicated_path_shape() {
         assert_eq!(
-            index_definition_name("_anvil/indexes/v2/definitions/search"),
+            index_definition_name("_anvil/indexes/v3/definitions/search"),
             Some("search")
         );
         assert_eq!(
-            index_definition_name("_anvil/indexes/v2/12/definition"),
+            index_definition_name("_anvil/indexes/v3/12/definition"),
             None
         );
         assert_eq!(
-            index_definition_name("_anvil/indexes/v2/definitions/a/b"),
+            index_definition_name("_anvil/indexes/v3/definitions/a/b"),
             None
         );
     }
@@ -1062,7 +1502,7 @@ mod tests {
 
         let valid = DefinitionVersionGuard {
             kind: DefinitionKind::Index,
-            exact_path: "_anvil/indexes/v2/definitions/search".into(),
+            exact_path: "_anvil/indexes/v3/definitions/search".into(),
             expected_version: VersionId(9),
         };
         assert_eq!(
@@ -1093,7 +1533,7 @@ mod tests {
     fn guards_are_rejected_on_immutable_or_wrong_accounting_paths() {
         let index_guard = DefinitionVersionGuard {
             kind: DefinitionKind::Index,
-            exact_path: "_anvil/indexes/v2/definitions/search".into(),
+            exact_path: "_anvil/indexes/v3/definitions/search".into(),
             expected_version: VersionId(9),
         };
         assert!(
@@ -1145,31 +1585,31 @@ mod tests {
 
     #[test]
     fn generated_paths_round_trip_through_validation() {
-        assert_eq!(current_path(4), "_anvil/indexes/v2/4/current");
+        assert_eq!(current_path(4), "_anvil/indexes/v3/4/current");
         assert!(parse_artifact_path(&manifest_path(4, [2; 32]), 4).is_ok());
         assert!(parse_artifact_path(&run_root_path(4, [3; 32]), 4).is_ok());
-        assert!(parse_artifact_path(&run_block_path(4, [3; 32], [4; 32]), 4).is_ok());
+        assert!(parse_artifact_path(&run_pack_path(4, [3; 32], 0), 4).is_ok());
         assert_eq!(
             run_hash_from_artifact_path(4, &run_root_path(4, [3; 32])),
             Some([3; 32])
         );
         assert_eq!(
-            run_hash_from_artifact_path(4, &run_block_path(4, [3; 32], [4; 32])),
+            run_hash_from_artifact_path(4, &run_pack_path(4, [3; 32], 0)),
             Some([3; 32])
         );
         assert!(is_manifest_artifact_path(4, &manifest_path(4, [2; 32])));
     }
 
     #[test]
-    fn run_retention_parser_is_slash_safe_and_v2_only() {
+    fn run_retention_parser_is_slash_safe_and_v3_only() {
         let digest = hex::encode([3; 32]);
         for invalid in [
-            format!("_anvil/indexes/v2/4/runs/{digest}"),
-            format!("_anvil/indexes/v2/4/runs/{digest}/"),
-            format!("_anvil/indexes/v2/4/runs/{digest}/root/extra"),
-            format!("_anvil/indexes/v2/4/runs/{digest}0/root"),
+            format!("_anvil/indexes/v3/4/runs/{digest}"),
+            format!("_anvil/indexes/v3/4/runs/{digest}/"),
+            format!("_anvil/indexes/v3/4/runs/{digest}/root/extra"),
+            format!("_anvil/indexes/v3/4/runs/{digest}0/root"),
             format!("_anvil/indexes/4/runs/{digest}/root"),
-            format!("_anvil/indexes/v2/04/runs/{digest}/root"),
+            format!("_anvil/indexes/v3/04/runs/{digest}/root"),
         ] {
             assert_eq!(run_hash_from_artifact_path(4, &invalid), None, "{invalid}");
         }
@@ -1195,6 +1635,64 @@ mod tests {
         assert_eq!(
             artifact_durability(ArtifactPathKind::AccountingMutable, 3),
             Durability::Local
+        );
+    }
+
+    #[test]
+    fn multiple_packs_share_one_bounded_grouped_mutation() {
+        let first = artifact_publish(run_pack_path(7, [4; 32], 0), None);
+        let second = artifact_publish(run_pack_path(7, [4; 32], 1), None);
+        let batches = bounded_artifact_batches(vec![(0, first), (1, second)]).unwrap();
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].len(), 2);
+        assert!(
+            validate_immutable_batch(
+                &batches[0]
+                    .iter()
+                    .map(|(_, request)| request.clone())
+                    .collect::<Vec<_>>()
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn current_pointer_cannot_enter_a_pack_batch() {
+        let pack = artifact_publish(run_pack_path(7, [4; 32], 0), None);
+        let current = artifact_publish(
+            current_path(7),
+            Some(DefinitionVersionGuard {
+                kind: DefinitionKind::Index,
+                exact_path: "_anvil/indexes/v3/definitions/search".into(),
+                expected_version: VersionId(9),
+            }),
+        );
+
+        assert!(validate_immutable_batch(&[pack, current]).is_err());
+    }
+
+    #[test]
+    fn grouped_publication_restores_request_order_across_replica_groups() {
+        let outcome = |version| IndexArtifactOutcome {
+            version: VersionId(version),
+            replayed: false,
+        };
+        let mut slots = vec![None; 4];
+
+        // Replica groups are visited by their placement key, not input order.
+        record_grouped_artifact_outcomes(&mut slots, vec![2, 0], vec![outcome(30), outcome(10)])
+            .unwrap();
+        record_grouped_artifact_outcomes(&mut slots, vec![3, 1], vec![outcome(40), outcome(20)])
+            .unwrap();
+
+        let ordered = ordered_grouped_artifact_outcomes(slots).unwrap();
+        assert_eq!(
+            ordered
+                .into_iter()
+                .map(|entry| entry.version.0)
+                .collect::<Vec<_>>(),
+            vec![10, 20, 30, 40]
         );
     }
 }

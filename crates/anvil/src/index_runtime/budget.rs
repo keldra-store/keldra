@@ -13,11 +13,10 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 use crate::index_config::IndexRuntimeConfig;
 
-/// A small fixed number of pull-driven rebuild streams may remain open per
-/// kind. Each can retain only transport backpressure state; every source frame
-/// still waits in the shared FIFO byte queue before it is pulled. Three lets
-/// the release qualification prove round-robin progress for three same-kind
-/// definitions without making open streams scale with definition count.
+/// A small fixed maximum of pull-driven rebuild streams may remain open per
+/// kind. Admission shrinks this count when the kind budget cannot fund three
+/// minimum-size direct builders, and each admitted stream holds one exact
+/// lifetime byte share.
 const MAX_OPEN_SNAPSHOTS_PER_KIND: usize = 3;
 
 #[derive(Clone)]
@@ -102,6 +101,7 @@ fn validate_limit(bytes: u64) -> Result<(), IndexBudgetError> {
 pub(crate) struct IndexMemoryBudget {
     inner: Arc<BudgetInner>,
     snapshot_slot: Arc<Semaphore>,
+    snapshot_share_bytes: u64,
 }
 
 struct BudgetInner {
@@ -129,6 +129,8 @@ impl IndexMemoryBudget {
         if limit == 0 {
             return Err(IndexBudgetError::ZeroLimit);
         }
+        let usable_slots = (limit / MIN_INDEX_KIND_MEMORY_BYTES as u64)
+            .clamp(1, MAX_OPEN_SNAPSHOTS_PER_KIND as u64) as usize;
         Ok(Self {
             inner: Arc::new(BudgetInner {
                 kind,
@@ -136,7 +138,8 @@ impl IndexMemoryBudget {
                 state: Mutex::new(BudgetState::default()),
                 changed: Notify::new(),
             }),
-            snapshot_slot: Arc::new(Semaphore::new(MAX_OPEN_SNAPSHOTS_PER_KIND)),
+            snapshot_slot: Arc::new(Semaphore::new(usable_slots)),
+            snapshot_share_bytes: limit / usable_slots as u64,
         })
     }
 
@@ -150,9 +153,15 @@ impl IndexMemoryBudget {
         SegmentMemoryPlan::new(bytes).expect("validated index memory budget has a usable plan")
     }
 
+    /// Exact lifetime reservation for one admitted direct snapshot builder.
+    /// Every open builder of this kind therefore fits inside the shared cap.
+    pub(crate) fn snapshot_share_bytes(&self) -> u64 {
+        self.snapshot_share_bytes
+    }
+
     /// Admit one of the bounded pull-driven rebuild sessions for this kind.
-    /// The permit is held for the stream lifetime, while its byte permit is
-    /// released after every frame so other admitted sessions take FIFO turns.
+    /// The caller then reserves `snapshot_share_bytes` for the same lifetime;
+    /// the manager scheduler gives admitted sessions bounded source turns.
     pub(crate) async fn acquire_snapshot_slot(
         &self,
     ) -> Result<OwnedSemaphorePermit, IndexBudgetError> {
@@ -389,7 +398,9 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_sessions_are_bounded_without_serializing_three_rebuilds() {
-        let budget = IndexMemoryBudget::new(IndexKind::Path, 10).unwrap();
+        let budget =
+            IndexMemoryBudget::new(IndexKind::Path, (MIN_INDEX_KIND_MEMORY_BYTES * 3) as u64)
+                .unwrap();
         let first = budget.acquire_snapshot_slot().await.unwrap();
         let second = budget.acquire_snapshot_slot().await.unwrap();
         let third = budget.acquire_snapshot_slot().await.unwrap();

@@ -1,4 +1,4 @@
-//! Node-wide bounded retention of ordinary format-2 index artifacts.
+//! Node-wide bounded retention of ordinary format-3 index artifacts.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Read;
@@ -1211,7 +1211,7 @@ fn delete_command(index_id: u64, version: VersionId, class: &str, path: &str) ->
     hasher.update(path.as_bytes());
     hasher.update(&version.0.to_be_bytes());
     format!(
-        "index-v2-gc-{index_id}-{}",
+        "index-v3-gc-{index_id}-{}",
         &hasher.finalize().to_hex().as_str()[..24]
     )
 }
@@ -1265,13 +1265,15 @@ mod tests {
             &barrier,
             vec![ManifestRun {
                 sequence: generation,
+                created_at_unix_millis: generation.saturating_mul(1_000),
                 level: 0,
                 root_path: super::super::publication::run_root_path(9, run_hash),
                 root_blob: BlobRef {
                     hash: run_hash,
-                    length: 10,
+                    length: bytes,
                 },
                 root_object_version: VersionId(generation),
+                packs: Vec::new(),
                 mutation_count: 1,
                 live_document_count: 1,
                 minimum_version: 1,

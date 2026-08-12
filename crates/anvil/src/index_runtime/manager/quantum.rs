@@ -49,7 +49,7 @@ impl SourceWorkQuantum {
 
     /// Snapshot frame credit is fixed when the stream opens. The caller yields
     /// immediately after crossing the limit, so prior work below one quantum
-    /// plus one bounded frame is strictly below two quanta (8 MiB at the
+    /// plus one bounded frame is strictly below two quanta (32 MiB at the
     /// default maximum).
     pub(super) fn advance_frame(&mut self, bytes: u64) -> Result<SourceWorkBoundary, Status> {
         if bytes > self.limit {
@@ -85,7 +85,7 @@ mod tests {
         let mut quantum = SourceWorkQuantum::new(KIND_BUDGET);
         assert_eq!(quantum.limit, MAX_SOURCE_WIRE_BYTES);
 
-        for _ in 0..7 {
+        for _ in 0..31 {
             assert_eq!(
                 quantum.advance_page(512 * 1024).unwrap(),
                 SourceWorkBoundary::Continue

@@ -196,7 +196,20 @@ async fn distinct_cold_fetches_share_the_aggregate_memory_allowance() {
     while fetcher.reads.load(Ordering::Relaxed) == 0 {
         tokio::task::yield_now().await;
     }
-    tokio::task::yield_now().await;
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let queued = {
+                let state = cache.inner.fetch_budget.inner.state.lock().unwrap();
+                state.used == 8 && state.waiters.len() == 1
+            };
+            if queued {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the second cold fetch must queue behind the aggregate memory permit");
     assert_eq!(fetcher.reads.load(Ordering::Relaxed), 1);
     {
         let state = cache.inner.fetch_budget.inner.state.lock().unwrap();
@@ -417,7 +430,7 @@ async fn corrupt_existing_cache_file_is_atomically_replaced() {
 }
 
 #[test]
-fn startup_preserves_the_disposable_v2_cache_directory_without_inventory() {
+fn startup_preserves_the_disposable_v3_cache_directory_without_inventory() {
     let root = tempfile::tempdir().unwrap();
     let cache_directory = root.path().join(CACHE_FORMAT_DIRECTORY);
     let sibling = root.path().join("must-remain");
@@ -442,6 +455,26 @@ fn startup_preserves_the_disposable_v2_cache_directory_without_inventory() {
         b"stale"
     );
     assert_eq!(std::fs::read(sibling).unwrap(), b"ordinary-data");
+}
+
+#[test]
+fn cache_inventory_is_counted_when_it_runs_inside_the_startup_window() {
+    let root = tempfile::tempdir().unwrap();
+    let evidence = crate::startup_scan_evidence::StartupScanEvidence::begin();
+    let cache = IndexCache::new_with_startup_scan_evidence(
+        root.path(),
+        IndexCacheConfig::new(1024, 1024).unwrap(),
+        Arc::new(MemoryFetcher {
+            values: BTreeMap::new(),
+            reads: AtomicUsize::new(0),
+        }),
+        evidence.clone(),
+    )
+    .unwrap();
+
+    reconcile_cache_step(&cache.inner, 1, u64::MAX, std::time::Duration::from_secs(1)).unwrap();
+
+    assert_eq!(evidence.finish().global_cache_scans_total, 1);
 }
 
 #[tokio::test]

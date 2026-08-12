@@ -17,7 +17,9 @@ use memmap2::Mmap;
 use thiserror::Error;
 use tokio::sync::Notify;
 
-const CACHE_FORMAT_DIRECTORY: &str = "v2";
+use crate::startup_scan_evidence::{StartupScanEvidence, StartupScanExtent, StartupScanKind};
+
+const CACHE_FORMAT_DIRECTORY: &str = "v3";
 const CACHE_TEMPORARY_FILE_GRACE: Duration = Duration::from_secs(60 * 60);
 // Each mmap consumes a virtual-memory area and bookkeeping even for a tiny
 // file. Charging at least one ordinary page prevents a large disk budget from
@@ -135,6 +137,7 @@ struct IndexCacheInner {
     fetch_budget: CacheFetchBudget,
     state: Mutex<CacheState>,
     reconcile: Mutex<CacheReconcileState>,
+    startup_scan_evidence: Option<StartupScanEvidence>,
 }
 
 #[derive(Default)]
@@ -377,10 +380,29 @@ struct CacheEntry {
 }
 
 impl IndexCache {
+    #[cfg(test)]
     pub(crate) fn new(
         directory: impl AsRef<Path>,
         config: IndexCacheConfig,
         fetcher: Arc<dyn IndexSegmentFetcher>,
+    ) -> Result<Self, IndexCacheError> {
+        Self::new_inner(directory, config, fetcher, None)
+    }
+
+    pub(crate) fn new_with_startup_scan_evidence(
+        directory: impl AsRef<Path>,
+        config: IndexCacheConfig,
+        fetcher: Arc<dyn IndexSegmentFetcher>,
+        startup_scan_evidence: StartupScanEvidence,
+    ) -> Result<Self, IndexCacheError> {
+        Self::new_inner(directory, config, fetcher, Some(startup_scan_evidence))
+    }
+
+    fn new_inner(
+        directory: impl AsRef<Path>,
+        config: IndexCacheConfig,
+        fetcher: Arc<dyn IndexSegmentFetcher>,
+        startup_scan_evidence: Option<StartupScanEvidence>,
     ) -> Result<Self, IndexCacheError> {
         let directory = directory.as_ref().join(CACHE_FORMAT_DIRECTORY);
         fs::create_dir_all(&directory).map_err(IndexCacheError::Io)?;
@@ -392,6 +414,7 @@ impl IndexCache {
                 fetch_budget: CacheFetchBudget::new(config.memory_bytes),
                 state: Mutex::new(CacheState::default()),
                 reconcile: Mutex::new(CacheReconcileState::default()),
+                startup_scan_evidence,
             }),
         };
         cache.spawn_reconciler();
@@ -797,6 +820,9 @@ fn reconcile_cache_step(
         .lock()
         .map_err(|_| IndexCacheError::Poisoned)?;
     if reconcile.directory.is_none() {
+        if let Some(evidence) = &inner.startup_scan_evidence {
+            evidence.record(StartupScanKind::Cache, StartupScanExtent::Global);
+        }
         reconcile.directory = Some(fs::read_dir(&inner.directory).map_err(IndexCacheError::Io)?);
         reconcile.retained_bytes = tracked_bytes;
     }

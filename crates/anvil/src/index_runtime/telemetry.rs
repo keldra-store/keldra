@@ -1,5 +1,6 @@
 //! Low-cardinality progress telemetry for long-running index work.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -8,8 +9,121 @@ use anvil_index::compaction::{
     CompactionParallelism, CompactionProgress, CompactionProgressSnapshot,
 };
 use anvil_index::{IndexError, IndexKind};
+use tracing::Instrument;
 
 pub(crate) const PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CompactionDebtSnapshot {
+    levels: u64,
+    runs: u64,
+    bytes: u64,
+    oldest_created_at_unix_millis: u64,
+}
+
+fn compaction_debt(
+    runs: &[super::generation::ManifestRun],
+    maximum_runs_per_level: usize,
+    maximum_uncompacted_bytes_per_level: u64,
+) -> (CompactionDebtSnapshot, BTreeMap<u8, CompactionLevelDebt>) {
+    let mut levels = BTreeMap::<u8, CompactionLevelDebt>::new();
+    for run in runs {
+        let level = levels.entry(run.level).or_default();
+        level.runs = level.runs.saturating_add(1);
+        level.bytes = level.bytes.saturating_add(run.authoritative_bytes);
+        level.oldest_created_at_unix_millis = if level.oldest_created_at_unix_millis == 0 {
+            run.created_at_unix_millis
+        } else {
+            level
+                .oldest_created_at_unix_millis
+                .min(run.created_at_unix_millis)
+        };
+    }
+    let debt = levels
+        .values()
+        .filter(|level| {
+            level.runs > maximum_runs_per_level as u64
+                || level.bytes > maximum_uncompacted_bytes_per_level
+        })
+        .fold(CompactionDebtSnapshot::default(), |mut debt, level| {
+            debt.levels = debt.levels.saturating_add(1);
+            debt.runs = debt.runs.saturating_add(level.runs);
+            debt.bytes = debt.bytes.saturating_add(level.bytes);
+            debt.oldest_created_at_unix_millis = if debt.oldest_created_at_unix_millis == 0 {
+                level.oldest_created_at_unix_millis
+            } else {
+                debt.oldest_created_at_unix_millis
+                    .min(level.oldest_created_at_unix_millis)
+            };
+            debt
+        });
+    (debt, levels)
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CompactionLevelDebt {
+    runs: u64,
+    bytes: u64,
+    oldest_created_at_unix_millis: u64,
+}
+
+pub(crate) fn emit_compaction_debt(
+    kind: IndexKind,
+    runs: &[super::generation::ManifestRun],
+    maximum_runs_per_level: usize,
+    maximum_uncompacted_bytes_per_level: u64,
+    trigger: &'static str,
+) {
+    let (debt, levels) = compaction_debt(
+        runs,
+        maximum_runs_per_level,
+        maximum_uncompacted_bytes_per_level,
+    );
+    let now_millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0_u64, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        });
+    let oldest_age_seconds = debt_age_seconds(now_millis, debt.oldest_created_at_unix_millis);
+    tracing::info!(
+        index.kind = ?kind,
+        compaction.trigger = trigger,
+        gauge.anvil_index_compaction_debt_levels = debt.levels,
+        gauge.anvil_index_compaction_debt_runs = debt.runs,
+        gauge.anvil_index_compaction_debt_bytes = debt.bytes,
+        gauge.anvil_index_compaction_debt_run_limit = maximum_runs_per_level as u64,
+        gauge.anvil_index_compaction_debt_byte_limit = maximum_uncompacted_bytes_per_level,
+        gauge.anvil_index_compaction_oldest_debt_age_seconds = oldest_age_seconds,
+        "index compaction debt observed"
+    );
+    for (level, current) in levels {
+        let over_limit = current.runs > maximum_runs_per_level as u64
+            || current.bytes > maximum_uncompacted_bytes_per_level;
+        tracing::info!(
+            index.kind = ?kind,
+            index.level = level,
+            compaction.trigger = trigger,
+            gauge.anvil_index_compaction_level_debt_runs =
+                if over_limit { current.runs } else { 0 },
+            gauge.anvil_index_compaction_level_debt_bytes =
+                if over_limit { current.bytes } else { 0 },
+            gauge.anvil_index_compaction_level_oldest_debt_age_seconds = if over_limit {
+                debt_age_seconds(now_millis, current.oldest_created_at_unix_millis)
+            } else {
+                0.0
+            },
+            "index compaction level debt observed"
+        );
+    }
+}
+
+fn debt_age_seconds(now_millis: u64, created_at_unix_millis: u64) -> f64 {
+    if created_at_unix_millis == 0 {
+        0.0
+    } else {
+        now_millis.saturating_sub(created_at_unix_millis) as f64 / 1_000.0
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BuilderProgressPhase {
@@ -70,6 +184,7 @@ struct BuilderProgressEmission {
     records: u64,
     bytes: u64,
     units: u64,
+    interval_seconds: f64,
 }
 
 impl BuilderProgress {
@@ -177,7 +292,6 @@ impl BuilderProgress {
             {
                 return;
             }
-            state.last_emit = now;
             take_emission(&mut state, now)
         };
         self.record_span(emission.snapshot);
@@ -237,6 +351,8 @@ impl BuilderProgress {
     }
 
     fn emit_progress(&self, emission: BuilderProgressEmission, heartbeat: bool) {
+        let record_rate = emission.records as f64 / emission.interval_seconds.max(0.001);
+        let byte_rate = emission.bytes as f64 / emission.interval_seconds.max(0.001);
         let emit = || match self.phase {
             BuilderProgressPhase::Rebuild => tracing::info!(
                 index.kind = ?self.identity.kind,
@@ -249,6 +365,8 @@ impl BuilderProgress {
                     emission.snapshot.elapsed_seconds,
                 gauge.anvil_index_rebuild_last_progress_age_seconds =
                     emission.snapshot.last_progress_age_seconds,
+                gauge.anvil_index_rebuild_records_per_second = record_rate,
+                gauge.anvil_index_rebuild_bytes_per_second = byte_rate,
                 "index rebuild progress"
             ),
             BuilderProgressPhase::CatchUp => tracing::info!(
@@ -262,6 +380,8 @@ impl BuilderProgress {
                     emission.snapshot.elapsed_seconds,
                 gauge.anvil_index_catch_up_last_progress_age_seconds =
                     emission.snapshot.last_progress_age_seconds,
+                gauge.anvil_index_catch_up_records_per_second = record_rate,
+                gauge.anvil_index_catch_up_bytes_per_second = byte_rate,
                 "index catch-up progress"
             ),
         };
@@ -316,6 +436,10 @@ impl BuilderProgress {
         self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn span(&self) -> tracing::Span {
+        self.lock().span.clone().unwrap_or_else(tracing::Span::none)
     }
 }
 
@@ -411,12 +535,16 @@ impl CompactionTelemetry {
             compaction.range_limit = tracing::field::Empty,
             compaction.ranges_total = tracing::field::Empty,
             compaction.ranges_completed = tracing::field::Empty,
+            compaction.peak_active_lanes = tracing::field::Empty,
             compaction.actual_input_records = tracing::field::Empty,
             compaction.actual_input_bytes = tracing::field::Empty,
             compaction.input_blocks = tracing::field::Empty,
             compaction.output_records = tracing::field::Empty,
             compaction.output_bytes = tracing::field::Empty,
             compaction.output_blocks = tracing::field::Empty,
+            compaction.sort_chunks = tracing::field::Empty,
+            compaction.sort_merge_passes = tracing::field::Empty,
+            compaction.sort_peak_workspace_bytes = tracing::field::Empty,
             compaction.elapsed_seconds = tracing::field::Empty,
             compaction.last_progress_age_seconds = tracing::field::Empty,
             compaction.outcome = tracing::field::Empty,
@@ -562,6 +690,10 @@ impl CompactionTelemetry {
             emission.snapshot.ranges_completed,
         );
         span.record(
+            "compaction.peak_active_lanes",
+            emission.snapshot.peak_active_lanes,
+        );
+        span.record(
             "compaction.actual_input_records",
             emission.snapshot.input_records,
         );
@@ -576,6 +708,15 @@ impl CompactionTelemetry {
         );
         span.record("compaction.output_bytes", emission.snapshot.output_bytes);
         span.record("compaction.output_blocks", emission.snapshot.output_blocks);
+        span.record("compaction.sort_chunks", emission.snapshot.sort_chunks);
+        span.record(
+            "compaction.sort_merge_passes",
+            emission.snapshot.sort_merge_passes,
+        );
+        span.record(
+            "compaction.sort_peak_workspace_bytes",
+            emission.snapshot.sort_peak_workspace_bytes,
+        );
         span.record("compaction.elapsed_seconds", emission.elapsed_seconds);
         span.record(
             "compaction.last_progress_age_seconds",
@@ -608,12 +749,18 @@ impl CompactionTelemetry {
                     emission.delta.output_bytes,
                 monotonic_counter.anvil_index_compaction_output_blocks_total =
                     emission.delta.output_blocks,
+                monotonic_counter.anvil_index_compaction_sort_chunks_total =
+                    emission.delta.sort_chunks,
+                monotonic_counter.anvil_index_compaction_sort_merge_passes_total =
+                    emission.delta.sort_merge_passes,
                 monotonic_counter.anvil_index_compaction_progress_heartbeats_total =
                     u64::from(heartbeat),
                 gauge.anvil_index_compaction_range_limit = emission.snapshot.range_limit,
                 gauge.anvil_index_compaction_ranges_total = emission.snapshot.ranges_total,
                 gauge.anvil_index_compaction_ranges_completed = emission.snapshot.ranges_completed,
                 gauge.anvil_index_compaction_active_lanes = emission.snapshot.active_lanes,
+                gauge.anvil_index_compaction_peak_active_lanes =
+                    emission.snapshot.peak_active_lanes,
                 gauge.anvil_index_compaction_waiting_lanes = emission.snapshot.waiting_lanes,
                 gauge.anvil_index_compaction_current_input_records = emission.snapshot.input_records,
                 gauge.anvil_index_compaction_current_input_read_bytes = emission.snapshot.input_bytes,
@@ -621,6 +768,8 @@ impl CompactionTelemetry {
                 gauge.anvil_index_compaction_current_output_records = emission.snapshot.output_records,
                 gauge.anvil_index_compaction_current_output_bytes = emission.snapshot.output_bytes,
                 gauge.anvil_index_compaction_current_output_blocks = emission.snapshot.output_blocks,
+                gauge.anvil_index_compaction_sort_peak_workspace_bytes =
+                    emission.snapshot.sort_peak_workspace_bytes,
                 gauge.anvil_index_compaction_input_bytes_per_second = input_rate,
                 gauge.anvil_index_compaction_output_bytes_per_second = output_rate,
                 gauge.anvil_index_compaction_elapsed_seconds = emission.elapsed_seconds,
@@ -676,6 +825,10 @@ impl CompactionTelemetry {
                 emission.delta.output_bytes,
             monotonic_counter.anvil_index_compaction_output_blocks_total =
                 emission.delta.output_blocks,
+            monotonic_counter.anvil_index_compaction_sort_chunks_total =
+                emission.delta.sort_chunks,
+            monotonic_counter.anvil_index_compaction_sort_merge_passes_total =
+                emission.delta.sort_merge_passes,
             monotonic_counter.anvil_index_compaction_failures_total = u64::from(failed),
             gauge.anvil_index_compaction_configured_lanes =
                 self.parallelism.configured_lanes() as u64,
@@ -683,6 +836,8 @@ impl CompactionTelemetry {
             gauge.anvil_index_compaction_budget_limit = self.parallelism.budget_limit() as u64,
             gauge.anvil_index_compaction_range_limit = emission.snapshot.range_limit,
             gauge.anvil_index_compaction_active_lanes = 0_u64,
+            gauge.anvil_index_compaction_peak_active_lanes =
+                emission.snapshot.peak_active_lanes,
             gauge.anvil_index_compaction_waiting_lanes = 0_u64,
             gauge.anvil_index_compaction_ranges_total = emission.snapshot.ranges_total,
             gauge.anvil_index_compaction_ranges_completed = emission.snapshot.ranges_completed,
@@ -692,6 +847,8 @@ impl CompactionTelemetry {
             gauge.anvil_index_compaction_current_output_records = emission.snapshot.output_records,
             gauge.anvil_index_compaction_current_output_bytes = emission.snapshot.output_bytes,
             gauge.anvil_index_compaction_current_output_blocks = emission.snapshot.output_blocks,
+            gauge.anvil_index_compaction_sort_peak_workspace_bytes =
+                emission.snapshot.sort_peak_workspace_bytes,
             gauge.anvil_index_compaction_input_bytes_per_second = input_rate,
             gauge.anvil_index_compaction_output_bytes_per_second = output_rate,
             gauge.anvil_index_compaction_elapsed_seconds = emission.elapsed_seconds,
@@ -718,6 +875,10 @@ impl CompactionTelemetry {
         self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn span(&self) -> tracing::Span {
+        self.lock().span.clone().unwrap_or_else(tracing::Span::none)
     }
 }
 
@@ -773,7 +934,13 @@ fn subtract_compaction_progress(
         range_limit: current.range_limit,
         effective_lanes: current.effective_lanes,
         active_lanes: current.active_lanes,
+        peak_active_lanes: current.peak_active_lanes,
         waiting_lanes: current.waiting_lanes,
+        sort_chunks: current.sort_chunks.saturating_sub(previous.sort_chunks),
+        sort_merge_passes: current
+            .sort_merge_passes
+            .saturating_sub(previous.sort_merge_passes),
+        sort_peak_workspace_bytes: current.sort_peak_workspace_bytes,
     }
 }
 
@@ -813,6 +980,7 @@ pub(crate) async fn await_with_compaction_heartbeats<F: Future>(
     telemetry: &CompactionTelemetry,
     future: F,
 ) -> F::Output {
+    let future = future.instrument(telemetry.span());
     tokio::pin!(future);
     loop {
         let delay = tokio::time::sleep(telemetry.until_heartbeat());
@@ -842,10 +1010,12 @@ fn take_emission(state: &mut BuilderProgressState, now: Instant) -> BuilderProgr
         records: state.records.saturating_sub(state.emitted_records),
         bytes: state.bytes.saturating_sub(state.emitted_bytes),
         units: state.units.saturating_sub(state.emitted_units),
+        interval_seconds: now.saturating_duration_since(state.last_emit).as_secs_f64(),
     };
     state.emitted_records = state.records;
     state.emitted_bytes = state.bytes;
     state.emitted_units = state.units;
+    state.last_emit = now;
     emission
 }
 
@@ -853,6 +1023,7 @@ pub(crate) async fn await_with_builder_heartbeats<F: Future>(
     progress: &BuilderProgress,
     future: F,
 ) -> F::Output {
+    let future = future.instrument(progress.span());
     tokio::pin!(future);
     loop {
         let delay = tokio::time::sleep(progress.until_heartbeat());
@@ -867,6 +1038,26 @@ pub(crate) async fn await_with_builder_heartbeats<F: Future>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn run(sequence: u64, level: u8) -> super::super::generation::ManifestRun {
+        super::super::generation::ManifestRun {
+            sequence,
+            created_at_unix_millis: sequence.saturating_mul(1_000),
+            level,
+            root_path: format!("run-{sequence}"),
+            root_blob: anvil_store::BlobRef {
+                hash: [sequence as u8; 32],
+                length: 10,
+            },
+            root_object_version: anvil_store::VersionId(sequence),
+            packs: Vec::new(),
+            mutation_count: 1,
+            live_document_count: 1,
+            minimum_version: 1,
+            maximum_version: 1,
+            authoritative_bytes: 10,
+        }
+    }
 
     fn identity() -> IndexTelemetryIdentity {
         IndexTelemetryIdentity {
@@ -888,6 +1079,29 @@ mod tests {
         assert_eq!(snapshot.units, 2);
         assert_eq!(progress.lock().emitted_units, 0);
         progress.complete();
+    }
+
+    #[test]
+    fn debt_counts_only_levels_over_the_bound() {
+        let mut runs = (1..=5).map(|sequence| run(sequence, 0)).collect::<Vec<_>>();
+        runs.extend((6..=9).map(|sequence| run(sequence, 1)));
+
+        let (debt, levels) = compaction_debt(&runs, 4, u64::MAX);
+        assert_eq!(
+            debt,
+            CompactionDebtSnapshot {
+                levels: 1,
+                runs: 5,
+                bytes: 50,
+                oldest_created_at_unix_millis: 1_000,
+            }
+        );
+        assert_eq!(levels[&0].runs, 5);
+        assert_eq!(
+            compaction_debt(&runs, 5, u64::MAX).0,
+            CompactionDebtSnapshot::default()
+        );
+        assert_eq!(compaction_debt(&runs, 5, 49).0, debt);
     }
 
     #[tokio::test]

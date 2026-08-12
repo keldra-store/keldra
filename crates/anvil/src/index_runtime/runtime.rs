@@ -10,12 +10,16 @@ use crate::bucket_governance::BucketGovernance;
 use crate::cluster_object_read::ClusterObjectReader;
 use crate::cluster_peer::{ClusterPeerTransport, LocalIndexQueryExecutor};
 use crate::data_peer::DataPeerTransport;
+use crate::derived_consumer::{
+    DerivedCheckpointPublisher, DerivedConsumerRuntimeTask, DerivedEvidenceResolver,
+};
 use crate::distributed_list::DistributedObjectLister;
 use crate::index_config::IndexRuntimeConfig;
 use crate::index_service::{
     DistributedIndexDefinitionLister, IndexDefinitionLister, IndexQueryExecutor,
 };
 use crate::object_distribution::ObjectDistribution;
+use crate::startup_scan_evidence::StartupScanEvidence;
 use anvil_store::Store;
 
 use super::budget::IndexMemoryBudgets;
@@ -40,6 +44,7 @@ pub(crate) struct RunningIndexRuntime {
     pub(crate) scanner: ClusterIndexScanner,
     pub(crate) artifact_router: IndexArtifactRouter,
     _definition_coordination: DefinitionCoordinationTask,
+    _derived_retention: DerivedConsumerRuntimeTask,
     _builders: IndexBuilderManagerTask,
 }
 
@@ -56,9 +61,15 @@ pub(crate) async fn start(
     object_lister: DistributedObjectLister,
     data_directory: &Path,
     config: IndexRuntimeConfig,
+    derived_checkpoints: DerivedCheckpointPublisher,
+    startup_scan_evidence: StartupScanEvidence,
 ) -> Result<RunningIndexRuntime> {
     tracing::info!("index runtime starts from sparse assigned-definition state");
-    let scanner = ClusterIndexScanner::new(decisions.clone(), cluster_peers.clone());
+    let scanner = ClusterIndexScanner::new(
+        decisions.clone(),
+        cluster_peers.clone(),
+        startup_scan_evidence.clone(),
+    );
     let journal = Arc::new(IndexEventJournal::new(
         Arc::new(DecisionIndexEventAuthority::new(decisions.clone())),
         Arc::new(ClusterIndexEventSources::new(
@@ -79,16 +90,28 @@ pub(crate) async fn start(
     );
 
     let memory_bytes = index_memory_budget(config.memory_percent())?;
-    let cache = IndexCache::new(
+    let cache = IndexCache::new_with_startup_scan_evidence(
         data_directory.join("index-cache"),
         IndexCacheConfig::new(config.disk_cache_bytes(), memory_bytes)
             .context("validate index cache budgets")?,
         Arc::new(ClusterIndexSegmentFetcher::new(reader.clone())),
+        startup_scan_evidence,
     )
     .context("initialize disposable index cache")?;
-    let local_queries: Arc<dyn LocalIndexQueryExecutor> = Arc::new(
-        LocalGenerationQueryExecutor::new(reader.clone(), cache.clone(), journal.clone()),
-    );
+    let cpu = IndexCpuPool::new(config.rayon_workers())
+        .context("initialize the fixed index Rayon pool")?;
+    let local_queries: Arc<dyn LocalIndexQueryExecutor> =
+        Arc::new(LocalGenerationQueryExecutor::new(
+            local_node,
+            decisions.clone(),
+            reader.clone(),
+            cache.clone(),
+            journal.clone(),
+            catalog.clone(),
+            cpu.clone(),
+            config.query_max_concurrency(),
+            config.query_work_quantum_bytes(),
+        ));
     let queries: Arc<dyn IndexQueryExecutor> = Arc::new(DistributedIndexQueryExecutor::new(
         local_node,
         decisions.clone(),
@@ -103,8 +126,28 @@ pub(crate) async fn start(
         cluster_peers.clone(),
     );
     let artifact_router = IndexArtifactRouter::new(local_node, coordinator, objects, cluster_peers);
-    let publisher =
-        IndexGenerationPublisher::new(store.clone(), reader.clone(), artifact_router.clone());
+    let publisher = IndexGenerationPublisher::new(
+        store.clone(),
+        reader.clone(),
+        artifact_router.clone(),
+        data_directory.join("index-scratch"),
+    )
+    .context("initialize disposable index construction scratch")?;
+    let (derived_progress, derived_retention) = DerivedConsumerRuntimeTask::start(
+        anvil_store::DerivedConsumerKind::Index,
+        local_node,
+        decisions.clone(),
+        store.clone(),
+        journal.clone(),
+        derived_checkpoints,
+        DerivedEvidenceResolver::index(
+            local_node,
+            decisions.clone(),
+            reader.clone(),
+            publisher.clone(),
+            catalog.clone(),
+        ),
+    );
     let generation_retention = IndexGenerationRetention::new(
         scanner.clone(),
         reader.clone(),
@@ -113,8 +156,6 @@ pub(crate) async fn start(
     );
     let budgets = IndexMemoryBudgets::from_config(config)
         .context("validate per-kind index construction budgets")?;
-    let cpu = IndexCpuPool::new(config.rayon_workers())
-        .context("initialize the fixed index Rayon pool")?;
     let builders = IndexBuilderManagerTask::start(
         local_node,
         decisions,
@@ -130,20 +171,8 @@ pub(crate) async fn start(
             budgets,
             cpu,
             config,
+            derived_progress,
         },
-    );
-
-    // Give the newly started coordination tasks one scheduling turn, then
-    // report the scans actually admitted while the runtime was starting.
-    tokio::task::yield_now().await;
-    let (scoped_head_scans_total, global_head_scans_total) = scanner.scan_evidence();
-    let head_scans_total = scoped_head_scans_total.saturating_add(global_head_scans_total);
-    tracing::info!(
-        node_id = local_node.0,
-        head_scans_total,
-        global_head_scans_total,
-        scoped_head_scans_total,
-        "anvil_index_startup_scan_evidence"
     );
 
     Ok(RunningIndexRuntime {
@@ -154,6 +183,7 @@ pub(crate) async fn start(
         scanner,
         artifact_router,
         _definition_coordination: definition_coordination,
+        _derived_retention: derived_retention,
         _builders: builders,
     })
 }

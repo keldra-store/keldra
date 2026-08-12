@@ -94,13 +94,11 @@ pub(super) fn recover_builder_failure(
         BuilderFailureRecovery::Reinspect => {
             emit_retry(job.kind, recovery);
             job.phase = BuilderPhase::Inspect;
-            job.observed = None;
             BuilderDisposition::Retry(BUILDER_RETRY_INTERVAL)
         }
         BuilderFailureRecovery::ScopedRebuild => {
             emit_retry(job.kind, recovery);
             job.phase = BuilderPhase::Inspect;
-            job.observed = None;
             job.force_snapshot_rebuild = true;
             BuilderDisposition::Retry(BUILDER_RETRY_INTERVAL)
         }
@@ -111,7 +109,6 @@ pub(super) fn recover_builder_failure(
                 "index builder failed closed"
             );
             job.phase = BuilderPhase::Inspect;
-            job.observed = None;
             BuilderDisposition::Failed
         }
     };

@@ -1,7 +1,6 @@
-//! Weighted-HRW assignment and bounded v2 index generation construction.
+//! Weighted-HRW assignment and bounded v3 index generation construction.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::io;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anvil_api::v1::IndexSpecification;
@@ -12,10 +11,14 @@ use anvil_index::{
 };
 use anvil_store::{DefinitionKind, Head, LocalChange, ObjectKey, Store, VersionId};
 use tonic::Status;
+use tracing::Instrument;
 
 use crate::cluster_object_read::ClusterObjectReader;
 use crate::cluster_peer::IndexSourceSnapshotHead;
 use crate::cluster_placement::ClusterPlacement;
+use crate::derived_consumer::{
+    DerivedBarrierEvidence, DerivedDefinitionIdentity, DerivedProgressReporter,
+};
 use crate::index_config::IndexRuntimeConfig;
 use crate::index_service::{StoredIndexDefinition, definition_path, path_matches_prefix};
 
@@ -30,7 +33,7 @@ use super::engine::{
     project_mutation, projection_admission_bytes,
 };
 use super::events::{IndexBarrier, IndexEventError, IndexEventJournal, IndexJournalPage};
-use super::generation::{MAX_RUNS_PER_LEVEL, ManifestRun};
+use super::generation::ManifestRun;
 use super::placement::{IndexIdentity, IndexPlacement};
 use super::publisher::{IndexGenerationPublisher, PublishedGeneration};
 use super::retention::{IndexGenerationRetention, IndexRetentionTask};
@@ -38,8 +41,15 @@ use super::scanner::{ClusterIndexScanner, ClusterIndexSourceSnapshot};
 use super::telemetry::{
     BuilderProgress, BuilderProgressPhase, CompactionInputTotals, CompactionTelemetry,
     IndexTelemetryIdentity, await_with_builder_heartbeats, await_with_compaction_heartbeats,
+    emit_compaction_debt,
 };
 
+#[path = "manager/automatic_rebuild.rs"]
+mod automatic_rebuild;
+use automatic_rebuild::RebuildSelection;
+#[path = "manager/debt.rs"]
+mod debt;
+use debt::{DebtLimits, DebtSelection};
 #[path = "manager/recovery.rs"]
 mod recovery;
 use recovery::{BuilderFailurePhase, recover_builder_failure};
@@ -48,9 +58,12 @@ use recovery::{BuilderFailureRecovery, failure_recovery};
 #[path = "manager/quantum.rs"]
 mod quantum;
 use quantum::{SourceWorkBoundary, SourceWorkQuantum};
+#[path = "manager/rebuild.rs"]
+mod rebuild;
+use rebuild::{RebuildWork, advance_rebuild, open_bulk_builder};
 
 const BUILDER_RETRY_INTERVAL: Duration = Duration::from_secs(1);
-const MAX_SOURCE_WIRE_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_SOURCE_WIRE_BYTES: u64 = 16 * 1024 * 1024;
 const DECODED_SOURCE_MULTIPLIER: u64 = 4;
 const INDEX_KIND_COUNT: usize = 8;
 const BUILDER_CATALOG_PAGE: usize = 256;
@@ -105,6 +118,7 @@ pub(crate) struct IndexBuilderDependencies {
     pub(crate) budgets: IndexMemoryBudgets,
     pub(crate) cpu: IndexCpuPool,
     pub(crate) config: IndexRuntimeConfig,
+    pub(crate) derived_progress: DerivedProgressReporter,
 }
 
 async fn run_manager(
@@ -599,19 +613,10 @@ fn take_ready(
     None
 }
 
-// This progress is deliberately task-local: a restart may safely rescan ignored
-// reserved-artifact journal entries from the published generation barrier.
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ObservedGenerationProgress {
-    current_object_version: VersionId,
-    barrier: IndexBarrier,
-}
-
 struct BuilderJob {
     definition: CatalogDefinition,
     specification: IndexSpecification,
     kind: IndexKind,
-    observed: Option<ObservedGenerationProgress>,
     force_snapshot_rebuild: bool,
     phase: BuilderPhase,
 }
@@ -624,7 +629,6 @@ impl BuilderJob {
             definition,
             specification,
             kind,
-            observed: None,
             force_snapshot_rebuild: false,
             phase: BuilderPhase::Inspect,
         })
@@ -655,15 +659,6 @@ enum BuilderPhase {
     Publish(PublishWork),
 }
 
-struct RebuildWork {
-    current: Option<PublishedGeneration>,
-    _snapshot_slot: tokio::sync::OwnedSemaphorePermit,
-    snapshot: ClusterIndexSourceSnapshot,
-    through: IndexBarrier,
-    candidate: CandidateGeneration,
-    progress: BuilderProgress,
-}
-
 #[derive(Clone)]
 struct CatchUpWork {
     current: Option<PublishedGeneration>,
@@ -672,6 +667,7 @@ struct CatchUpWork {
     candidate: CandidateGeneration,
     changed: bool,
     must_publish: bool,
+    maintenance: bool,
     progress: BuilderProgress,
 }
 
@@ -774,20 +770,49 @@ async fn inspect_builder(
             .await
             .map_err(event_status)?;
         let published = current.manifest.barrier().map_err(generation_status)?;
-        let from = incremental_start(
-            current.current_object_version,
+        dependencies
+            .derived_progress
+            .report(
+                derived_identity(definition),
+                DerivedBarrierEvidence::Published(published.clone()),
+            )
+            .await;
+        let selection = automatic_rebuild::select(
+            definition.stored.index_id,
+            definition.tenant_id,
+            definition.bucket_id,
+            job.kind,
+            &dependencies.journal,
             &published,
-            job.observed.as_ref(),
+            &target,
+            dependencies.config,
         )
-        .clone();
-        let retention_current = Some(current.clone());
-        if barriers_can_advance(&from, &target) {
+        .await
+        .map_err(event_status)?;
+        if selection == RebuildSelection::Incremental {
+            let from = published.clone();
+            let retention_current = Some(current.clone());
             emit_source_lag(job.kind, &from, &target);
             if from == target {
-                job.observed = Some(ObservedGenerationProgress {
-                    current_object_version: current.current_object_version,
-                    barrier: target,
-                });
+                if debt::select(&current.manifest.runs, DebtLimits::maintenance()).is_some() {
+                    return Ok((
+                        BuilderPhase::CatchUp(CatchUpWork {
+                            current: Some(current.clone()),
+                            through: target.clone(),
+                            target,
+                            candidate: CandidateGeneration::incremental(current),
+                            changed: false,
+                            must_publish: true,
+                            maintenance: true,
+                            progress: BuilderProgress::start(
+                                telemetry_identity,
+                                BuilderProgressPhase::CatchUp,
+                            ),
+                        }),
+                        BuilderDisposition::Ready,
+                        retention_current,
+                    ));
+                }
                 return Ok((
                     BuilderPhase::Inspect,
                     BuilderDisposition::Idle,
@@ -803,6 +828,7 @@ async fn inspect_builder(
                     candidate,
                     changed: false,
                     must_publish: false,
+                    maintenance: false,
                     progress: BuilderProgress::start(
                         telemetry_identity,
                         BuilderProgressPhase::CatchUp,
@@ -811,6 +837,10 @@ async fn inspect_builder(
                 BuilderDisposition::Ready,
                 retention_current,
             ));
+        } else {
+            // Preserve the deterministic decision if opening the disposable
+            // snapshot must retry before this inspect quantum completes.
+            job.force_snapshot_rebuild = true;
         }
     }
 
@@ -821,13 +851,21 @@ async fn inspect_builder(
         bucket_id = job.definition.bucket_id,
         "index snapshot rebuild started"
     );
-    job.observed = None;
+    let progress = BuilderProgress::start(telemetry_identity, BuilderProgressPhase::Rebuild);
     let budget = dependencies.budgets.for_kind(job.kind);
     let snapshot_slot = budget
         .acquire_snapshot_slot()
         .await
         .map_err(budget_status)?;
-    let max_frame_bytes = source_wire_limit(budget.limit());
+    let snapshot_share_bytes = budget.snapshot_share_bytes();
+    let memory_permit =
+        await_with_builder_heartbeats(&progress, budget.acquire(snapshot_share_bytes))
+            .await
+            .map_err(budget_status)?;
+    let max_frame_bytes = source_wire_limit(snapshot_share_bytes)
+        .min(dependencies.config.source_quantum_bytes(job.kind));
+    let plan = work_plan_for_limit(snapshot_share_bytes, max_frame_bytes)?;
+    let builder = open_bulk_builder(job, dependencies, plan)?;
     let (expected_fence, expected_atomic) = dependencies
         .journal
         .snapshot_authority()
@@ -855,115 +893,30 @@ async fn inspect_builder(
         .journal
         .barrier_from_snapshot_tails(snapshot.placement_fence(), expected_atomic, &tails)
         .map_err(event_status)?;
+    dependencies
+        .derived_progress
+        .report(
+            derived_identity(definition),
+            DerivedBarrierEvidence::ScopedSnapshot(through.clone()),
+        )
+        .await;
     job.force_snapshot_rebuild = false;
-    let progress = BuilderProgress::start(telemetry_identity, BuilderProgressPhase::Rebuild);
     Ok((
         BuilderPhase::Rebuild(RebuildWork {
             current,
             _snapshot_slot: snapshot_slot,
+            _memory_permit: memory_permit,
             snapshot,
             through,
             candidate: CandidateGeneration::rebuild(),
+            builder: Some(builder),
+            plan,
+            source_quantum_bytes: max_frame_bytes,
             progress,
         }),
         BuilderDisposition::Ready,
         None,
     ))
-}
-
-async fn advance_rebuild(
-    job: &BuilderJob,
-    mut work: RebuildWork,
-    dependencies: &IndexBuilderDependencies,
-) -> Result<
-    (
-        BuilderPhase,
-        BuilderDisposition,
-        Option<PublishedGeneration>,
-    ),
-    Status,
-> {
-    if compact_one_if_needed(job, &mut work.candidate, dependencies).await? {
-        return Ok((BuilderPhase::Rebuild(work), BuilderDisposition::Ready, None));
-    }
-    let budget = dependencies.budgets.for_kind(job.kind);
-    let permit = await_with_builder_heartbeats(&work.progress, budget.acquire(budget.limit()))
-        .await
-        .map_err(budget_status)?;
-    let mut quantum = SourceWorkQuantum::new(budget.limit());
-    let plan = work_plan(budget, quantum.limit)?;
-    // Retain one mutable builder across every snapshot frame in this fair
-    // work quantum; only the immutable run crosses the scheduler yield.
-    let mut builder = EngineSegmentBuilder::new(&job.specification, plan).map_err(index_status)?;
-    loop {
-        let frame =
-            await_with_builder_heartbeats(&work.progress, work.snapshot.next_frame()).await?;
-        let Some(frame) = frame else {
-            flush_builder(
-                &job.definition,
-                job.kind,
-                builder,
-                &mut work.candidate,
-                dependencies,
-            )
-            .await?;
-            drop(permit);
-            let target = dependencies
-                .journal
-                .capture_barrier()
-                .await
-                .map_err(event_status)?;
-            work.progress.complete();
-            emit_source_lag(job.kind, &work.through, &target);
-            return Ok((
-                BuilderPhase::CatchUp(CatchUpWork {
-                    current: work.current,
-                    through: work.through,
-                    target,
-                    candidate: work.candidate,
-                    changed: false,
-                    must_publish: true,
-                    progress: BuilderProgress::start(
-                        job.telemetry_identity(),
-                        BuilderProgressPhase::CatchUp,
-                    ),
-                }),
-                BuilderDisposition::Ready,
-                None,
-            ));
-        };
-
-        let records = frame.len() as u64;
-        let encoded_bytes = measure_snapshot_frame(&frame)?;
-        await_with_builder_heartbeats(
-            &work.progress,
-            process_snapshot_frame(
-                &job.definition,
-                &job.specification,
-                job.kind,
-                &work.through,
-                frame,
-                plan,
-                &mut builder,
-                &mut work.candidate,
-                dependencies,
-            ),
-        )
-        .await?;
-        work.progress.advance(records, encoded_bytes);
-        if quantum.advance_frame(encoded_bytes)? == SourceWorkBoundary::SealAndYield {
-            flush_builder(
-                &job.definition,
-                job.kind,
-                builder,
-                &mut work.candidate,
-                dependencies,
-            )
-            .await?;
-            drop(permit);
-            return Ok((BuilderPhase::Rebuild(work), BuilderDisposition::Ready, None));
-        }
-    }
 }
 
 async fn advance_catch_up(
@@ -978,7 +931,17 @@ async fn advance_catch_up(
     ),
     Status,
 > {
-    if compact_one_if_needed(job, &mut work.candidate, dependencies).await? {
+    let debt_limits = if work.maintenance {
+        DebtLimits::maintenance()
+    } else {
+        DebtLimits::new(
+            dependencies.config.max_runs_per_level(job.kind) as usize,
+            dependencies
+                .config
+                .max_uncompacted_bytes_per_level(job.kind),
+        )
+    };
+    if compact_one_if_needed(job, &mut work.candidate, debt_limits, dependencies).await? {
         return Ok((BuilderPhase::CatchUp(work), BuilderDisposition::Ready, None));
     }
     let budget = dependencies.budgets.for_kind(job.kind);
@@ -1047,10 +1010,10 @@ async fn advance_catch_up(
                     "index catch-up did not reach its complete source barrier",
                 ));
             }
-            // The final builder flush may have made a level overfull. Re-enter
-            // catch-up so its existing compaction gate reduces the candidate
-            // before manifest validation/publication.
-            if overfull_level(&work.candidate.runs).is_some() {
+            // The final builder flush may have crossed the configured debt
+            // bound. Reduce it before publishing; source-complete generations
+            // below the bound remain queryable while maintenance continues.
+            if debt::select(&work.candidate.runs, debt_limits).is_some() {
                 return Ok((BuilderPhase::CatchUp(work), BuilderDisposition::Ready, None));
             }
             if work.must_publish || work.changed {
@@ -1069,10 +1032,6 @@ async fn advance_catch_up(
                 Status::internal("incremental builder lost its current generation")
             })?;
             work.progress.complete();
-            job.observed = Some(ObservedGenerationProgress {
-                current_object_version: current.current_object_version,
-                barrier: work.through,
-            });
             return Ok((
                 BuilderPhase::Inspect,
                 BuilderDisposition::Idle,
@@ -1097,7 +1056,7 @@ async fn advance_catch_up(
             ),
         )
         .await?;
-        work.through = page.through;
+        record_source_page_progress(&mut work, &page);
         work.progress.advance(records, encoded_bytes);
         if quantum.advance_page(encoded_bytes)? == SourceWorkBoundary::SealAndYield {
             flush_builder(
@@ -1112,6 +1071,15 @@ async fn advance_catch_up(
             return Ok((BuilderPhase::CatchUp(work), BuilderDisposition::Ready, None));
         }
     }
+}
+
+fn record_source_page_progress(work: &mut CatchUpWork, page: &IndexJournalPage) {
+    // The complete barrier is part of the durable generation, even when every
+    // object in this routed bucket page is outside the definition's narrower
+    // path or content predicate. Publishing the unchanged run set prevents an
+    // idle eviction or restart from forgetting provable zero-lag freshness.
+    work.must_publish |= work.through != page.through;
+    work.through = page.through.clone();
 }
 
 async fn publish_builder(
@@ -1140,18 +1108,31 @@ async fn publish_builder(
 }
 
 fn complete_publication(job: &mut BuilderJob) -> (BuilderPhase, BuilderDisposition) {
-    job.observed = None;
     (BuilderPhase::Inspect, BuilderDisposition::Idle)
 }
 
 async fn compact_one_if_needed(
     job: &BuilderJob,
     candidate: &mut CandidateGeneration,
+    limits: DebtLimits,
     dependencies: &IndexBuilderDependencies,
 ) -> Result<bool, Status> {
-    let Some(level) = overfull_level(&candidate.runs) else {
+    emit_compaction_debt(
+        job.kind,
+        &candidate.runs,
+        limits.maximum_runs,
+        limits.maximum_bytes,
+        "observed",
+    );
+    let Some(selection) = debt::select(&candidate.runs, limits) else {
         return Ok(false);
     };
+    tracing::info!(
+        index.kind = ?job.kind,
+        compaction.trigger = "debt",
+        monotonic_counter.anvil_index_compaction_admission_stops_total = 1_u64,
+        "index source work yielded to bounded compaction debt"
+    );
     let budget = dependencies.budgets.for_kind(job.kind);
     let permit = budget
         .acquire(budget.limit())
@@ -1161,12 +1142,19 @@ async fn compact_one_if_needed(
         &job.definition,
         &job.specification,
         job.kind,
-        level,
+        selection,
         permit.bytes(),
         candidate,
         dependencies,
     )
     .await?;
+    emit_compaction_debt(
+        job.kind,
+        &candidate.runs,
+        limits.maximum_runs,
+        limits.maximum_bytes,
+        "repaid",
+    );
     Ok(true)
 }
 
@@ -1189,29 +1177,6 @@ fn is_local_builder(
 
 fn kind_slot(kind: IndexKind) -> usize {
     kind as u8 as usize - 1
-}
-
-fn incremental_start<'a>(
-    current_object_version: VersionId,
-    published: &'a IndexBarrier,
-    observed: Option<&'a ObservedGenerationProgress>,
-) -> &'a IndexBarrier {
-    observed
-        .filter(|progress| {
-            progress.current_object_version == current_object_version
-                && barriers_can_advance(published, &progress.barrier)
-        })
-        .map_or(published, |progress| &progress.barrier)
-}
-
-fn barriers_can_advance(from: &IndexBarrier, target: &IndexBarrier) -> bool {
-    from.fence == target.fence
-        && from.sources.len() == target.sources.len()
-        && from.sources.iter().all(|(node, cursor)| {
-            target.sources.get(node).is_some_and(|latest| {
-                latest.source == cursor.source && latest.next_offset >= cursor.next_offset
-            })
-        })
 }
 
 #[derive(Clone)]
@@ -1257,62 +1222,6 @@ impl CandidateGeneration {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn process_snapshot_frame(
-    definition: &CatalogDefinition,
-    specification: &IndexSpecification,
-    kind: IndexKind,
-    barrier: &IndexBarrier,
-    frame: Vec<IndexSourceSnapshotHead>,
-    plan: SegmentMemoryPlan,
-    builder: &mut EngineSegmentBuilder,
-    candidate: &mut CandidateGeneration,
-    dependencies: &IndexBuilderDependencies,
-) -> Result<(), Status> {
-    for head in frame {
-        if head.tenant_id != definition.tenant_id
-            || head.bucket_id != definition.bucket_id
-            || head.head.version != head.version.id
-            || head.head.deleted
-            || head.version.deleted
-        {
-            return Err(Status::data_loss(
-                "index snapshot returned an invalid current live head",
-            ));
-        }
-        require_visible_head(&head.head, barrier)?;
-        if !source_matches_definition(
-            &definition.stored,
-            &head.exact_path,
-            head.version.content_type.as_deref(),
-        ) {
-            continue;
-        }
-        let object = build_object(&head.exact_path, &head.version)?;
-        let source = IndexSourceMutation::Upsert(object);
-        let (mutation, diagnostics) = project_source(
-            specification,
-            source,
-            plan.max_source_projection_bytes,
-            dependencies,
-        )
-        .await?;
-        candidate.diagnostics.add(diagnostics);
-        push_or_flush(
-            definition,
-            specification,
-            kind,
-            plan,
-            builder,
-            mutation,
-            candidate,
-            dependencies,
-        )
-        .await?;
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
 async fn process_journal_page(
     definition: &CatalogDefinition,
     specification: &IndexSpecification,
@@ -1342,7 +1251,7 @@ async fn process_journal_page(
             dependencies,
         )
         .await?;
-        let (mutation, diagnostics) = project_source(
+        let (mutation, diagnostics, _) = project_source(
             specification,
             source,
             plan.max_source_projection_bytes,
@@ -1449,7 +1358,7 @@ async fn project_source(
     source: IndexSourceMutation,
     max_projection_bytes: usize,
     dependencies: &IndexBuilderDependencies,
-) -> Result<(EngineMutation, IndexBuildDiagnostics), Status> {
+) -> Result<(EngineMutation, IndexBuildDiagnostics, ProjectionExecution), Status> {
     let admission = projection_admission_bytes(specification, &source).map_err(index_status)?;
     if admission > max_projection_bytes as u64 {
         return Err(Status::resource_exhausted(format!(
@@ -1467,18 +1376,34 @@ async fn project_source(
         _ => None,
     };
     let specification = specification.clone();
-    dependencies
+    let queued = Instant::now();
+    let (projected, timing) = dependencies
         .cpu
         .install(move || {
+            let cpu_started = Instant::now();
+            let queue_seconds = cpu_started.saturating_duration_since(queued).as_secs_f64();
             let mut payload = payload;
             let reader = payload
                 .as_mut()
                 .map(|payload| payload as &mut dyn std::io::Read);
-            project_mutation(&specification, source, reader, max_projection_bytes)
+            let projected = project_mutation(&specification, source, reader, max_projection_bytes);
+            let timing = ProjectionExecution {
+                queue_seconds,
+                cpu_seconds: cpu_started.elapsed().as_secs_f64(),
+            };
+            (projected, timing)
         })
         .await
-        .map_err(cpu_status)?
+        .map_err(cpu_status)?;
+    projected
+        .map(|(mutation, diagnostics)| (mutation, diagnostics, timing))
         .map_err(index_status)
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ProjectionExecution {
+    queue_seconds: f64,
+    cpu_seconds: f64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1534,6 +1459,7 @@ async fn flush_builder(
             definition.bucket_id,
             sequence,
             sealed,
+            sink,
         )
         .await?;
     candidate.runs.push(published.manifest);
@@ -1549,27 +1475,17 @@ async fn flush_builder(
     Ok(())
 }
 
-fn overfull_level(runs: &[ManifestRun]) -> Option<u8> {
-    let mut counts = BTreeMap::<u8, usize>::new();
-    for run in runs {
-        let count = counts.entry(run.level).or_default();
-        *count += 1;
-        if *count > MAX_RUNS_PER_LEVEL {
-            return Some(run.level);
-        }
-    }
-    None
-}
-
 async fn compact_level(
     definition: &CatalogDefinition,
     specification: &IndexSpecification,
     kind: IndexKind,
-    level: u8,
+    selection: DebtSelection,
     leased_bytes: u64,
     candidate: &mut CandidateGeneration,
     dependencies: &IndexBuilderDependencies,
 ) -> Result<(), Status> {
+    let level = selection.level;
+    let repayment_started = Instant::now();
     let output_level = level
         .checked_add(1)
         .ok_or_else(|| Status::resource_exhausted("index compaction level exhausted"))?;
@@ -1577,10 +1493,11 @@ async fn compact_level(
         .runs
         .iter()
         .filter(|run| run.level == level)
-        .take(MAX_RUNS_PER_LEVEL)
         .cloned()
         .collect::<Vec<_>>();
-    if selected.len() != MAX_RUNS_PER_LEVEL {
+    selected.sort_by_key(|run| run.sequence);
+    selected.truncate(selection.input_runs);
+    if selected.len() != selection.input_runs || selected.len() < 2 {
         return Err(Status::internal("overfull index level has too few inputs"));
     }
     // Engines resolve equal versions by input order, newest first.
@@ -1645,6 +1562,7 @@ async fn compact_level(
                 definition.bucket_id,
                 replacement_sequence,
                 sealed,
+                sink,
                 progress.clone(),
             )
             .await
@@ -1669,11 +1587,19 @@ async fn compact_level(
         .retain(|run| !selected_sequences.contains(&run.sequence));
     candidate.runs.push(published.manifest);
     candidate.runs.sort_by_key(|run| run.sequence);
+    let repayment_seconds = repayment_started.elapsed().as_secs_f64();
+    let runs_repaid = input.runs.saturating_sub(1);
+    let repayment_rate = input.bytes as f64 / repayment_seconds.max(0.001);
     tracing::info!(
         index.kind = ?kind,
+        index.level = level,
         monotonic_counter.anvil_index_compactions_total = 1_u64,
+        monotonic_counter.anvil_index_compaction_debt_runs_repaid_total = runs_repaid,
+        monotonic_counter.anvil_index_compaction_debt_bytes_processed_total = input.bytes,
+        gauge.anvil_index_compaction_debt_repayment_bytes_per_second = repayment_rate,
         histogram.anvil_index_compaction_input_runs = selected.len() as u64,
         histogram.anvil_index_compaction_output_runs = 1_u64,
+        histogram.anvil_index_compaction_debt_repayment_duration_seconds = repayment_seconds,
         "index runs compacted"
     );
     Ok(())
@@ -1696,61 +1622,119 @@ async fn publish_candidate(
     dependencies: &IndexBuilderDependencies,
 ) -> Result<PublishedGeneration, Status> {
     let started = Instant::now();
-    dependencies
-        .journal
-        .validate_publication_barrier(&barrier)
-        .await
-        .map_err(event_status)?;
-    let result = dependencies
-        .publisher
-        .publish_manifest(
-            &definition.stored,
-            definition.tenant_id,
-            definition.bucket_id,
-            definition.object_version,
-            kind,
-            barrier,
-            candidate.runs,
-            candidate.diagnostics,
-            current,
-        )
-        .await;
+    let expected_generation = current.map_or(1, |value| value.pointer.generation.saturating_add(1));
+    let run_count = candidate.runs.len() as u64;
+    let authoritative_bytes = candidate
+        .runs
+        .iter()
+        .map(|run| run.authoritative_bytes)
+        .sum::<u64>();
+    let span = tracing::info_span!(
+        "anvil.index.publication",
+        index.id = definition.stored.index_id,
+        tenant.id = definition.tenant_id,
+        bucket.id = definition.bucket_id,
+        index.kind = ?kind,
+        generation = expected_generation,
+        publication.runs = run_count,
+        publication.authoritative_bytes = authoritative_bytes,
+        publication.fence_term = barrier.fence.term,
+        publication.fence_index = barrier.fence.index,
+        publication.source_count = barrier.sources.len(),
+        publication.elapsed_seconds = tracing::field::Empty,
+        publication.outcome = tracing::field::Empty,
+        otel.status_code = tracing::field::Empty,
+    );
+    let result = async {
+        dependencies
+            .journal
+            .validate_publication_barrier(&barrier)
+            .await
+            .map_err(event_status)?;
+        dependencies
+            .publisher
+            .publish_manifest(
+                &definition.stored,
+                definition.tenant_id,
+                definition.bucket_id,
+                definition.object_version,
+                kind,
+                barrier,
+                candidate.runs,
+                candidate.diagnostics,
+                current,
+            )
+            .await
+    }
+    .instrument(span.clone())
+    .await;
+    let elapsed_seconds = started.elapsed().as_secs_f64();
+    span.record("publication.elapsed_seconds", elapsed_seconds);
+    span.record(
+        "publication.outcome",
+        if result.is_err() {
+            "failed"
+        } else {
+            "completed"
+        },
+    );
+    span.record(
+        "otel.status_code",
+        if result.is_err() { "error" } else { "ok" },
+    );
     let published = match result {
         Ok(value) => value,
         Err(error) => {
-            tracing::info!(
-                index.id = definition.stored.index_id,
-                index.kind = ?kind,
-                "index generation publication CAS failed"
-            );
-            tracing::info!(
-                index.kind = ?kind,
-                monotonic_counter.anvil_index_publication_cas_failures_total = 1_u64,
-                histogram.anvil_index_publication_duration_seconds =
-                    started.elapsed().as_secs_f64(),
-                "index generation publication failed"
-            );
+            span.in_scope(|| {
+                tracing::info!(
+                    index.kind = ?kind,
+                    publication.outcome = "failed",
+                    monotonic_counter.anvil_index_publication_failures_total = 1_u64,
+                    histogram.anvil_index_publication_duration_seconds = elapsed_seconds,
+                    "index generation publication failed"
+                );
+            });
             return Err(error);
         }
     };
-    tracing::info!(
-        index.id = definition.stored.index_id,
-        index.kind = ?kind,
-        generation = published.pointer.generation,
-        "index generation published"
-    );
-    tracing::info!(
-        index.kind = ?kind,
-        gauge.anvil_index_generation = published.pointer.generation,
-        gauge.anvil_index_publication_present = 1_u64,
-        gauge.anvil_index_publication_age_seconds = 0_f64,
-        gauge.anvil_index_publication_fresh = 1_u64,
-        gauge.anvil_index_source_lag = 0_u64,
-        monotonic_counter.anvil_index_publication_cas_total = 1_u64,
-        histogram.anvil_index_publication_duration_seconds = started.elapsed().as_secs_f64(),
-        "index generation publication metrics"
-    );
+    dependencies
+        .derived_progress
+        .report(
+            derived_identity(definition),
+            DerivedBarrierEvidence::Published(
+                published.manifest.barrier().map_err(generation_status)?,
+            ),
+        )
+        .await;
+    span.in_scope(|| {
+        tracing::info!(
+            generation = published.pointer.generation,
+            "index generation published"
+        );
+        tracing::info!(
+            index.kind = ?kind,
+            publication.outcome = "completed",
+            gauge.anvil_index_generation = published.pointer.generation,
+            gauge.anvil_index_publication_present = 1_u64,
+            gauge.anvil_index_publication_age_seconds = 0_f64,
+            gauge.anvil_index_publication_fresh = 1_u64,
+            gauge.anvil_index_source_lag = 0_u64,
+            monotonic_counter.anvil_index_publications_total = 1_u64,
+            histogram.anvil_index_publication_duration_seconds = elapsed_seconds,
+            "index generation publication metrics"
+        );
+    });
     Ok(published)
+}
+
+fn derived_identity(definition: &CatalogDefinition) -> DerivedDefinitionIdentity {
+    DerivedDefinitionIdentity {
+        kind: DefinitionKind::Index,
+        tenant_id: definition.tenant_id,
+        bucket_id: definition.bucket_id,
+        definition_id: definition.stored.index_id,
+        object_version: VersionId(definition.object_version),
+    }
 }
 
 fn source_matches_definition(
@@ -1847,7 +1831,11 @@ fn work_plan(
     budget: &IndexMemoryBudget,
     encoded_source_bytes: u64,
 ) -> Result<SegmentMemoryPlan, Status> {
-    let total = usize::try_from(budget.limit())
+    work_plan_for_limit(budget.limit(), encoded_source_bytes)
+}
+
+fn work_plan_for_limit(limit: u64, encoded_source_bytes: u64) -> Result<SegmentMemoryPlan, Status> {
+    let total = usize::try_from(limit)
         .map_err(|_| Status::resource_exhausted("index construction budget exceeds platform"))?;
     let encoded = usize::try_from(encoded_source_bytes)
         .map_err(|_| Status::resource_exhausted("index source frame exceeds platform"))?;
@@ -1862,7 +1850,7 @@ fn work_plan(
             "index source frame leaves no bounded builder workspace",
         ));
     }
-    let configured = budget.memory_plan();
+    let configured = SegmentMemoryPlan::new(total).map_err(index_status)?;
     let max_resident_bytes = configured
         .max_resident_bytes
         .min(available - FIXED_INDEX_SEAL_WORKSPACE_BYTES);
@@ -1872,31 +1860,6 @@ fn work_plan(
         max_resident_bytes,
         max_source_projection_bytes,
     })
-}
-
-fn measure_snapshot_frame(frame: &[IndexSourceSnapshotHead]) -> Result<u64, Status> {
-    let mut counter = ByteCounter(0);
-    for head in frame {
-        serde_json::to_writer(&mut counter, head)
-            .map_err(|error| Status::internal(format!("measure index snapshot frame: {error}")))?;
-    }
-    Ok(counter.0)
-}
-
-struct ByteCounter(u64);
-
-impl io::Write for ByteCounter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0 = self
-            .0
-            .checked_add(bytes.len() as u64)
-            .ok_or_else(|| io::Error::other("index source byte count overflow"))?;
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
 }
 
 fn emit_source_lag(kind: IndexKind, from: &IndexBarrier, target: &IndexBarrier) {

@@ -1,9 +1,14 @@
-//! Conversion from ordinary object state into bounded format-2 engine work.
+//! Conversion from ordinary object state into bounded format-3 engine work.
 
 use std::io::Read;
 
 use anvil_api::v1::index_specification::Specification;
 use anvil_api::v1::{IndexSpecification, VectorMetric as ApiVectorMetric};
+use anvil_index::bulk::{
+    BulkBuildOptions, FullTextBulkBuilder, GitSourceBulkBuilder, HybridBulkBuilder,
+    MetadataBulkBuilder, PathBulkBuilder, TensorBulkBuilder, TypedJsonBulkBuilder,
+    VectorBulkBuilder,
+};
 use anvil_index::compaction::{CompactionExecutor, CompactionParallelism, CompactionProgress};
 use anvil_index::full_text::{FullTextDocument, FullTextEngine, FullTextSegmentBuilder};
 use anvil_index::hybrid::{HybridDefinition, HybridDocument, HybridEngine, HybridSegmentBuilder};
@@ -256,6 +261,128 @@ impl EngineSegmentBuilder {
             Self::Hybrid(value) => value.seal(sink).await,
             Self::GitSource(value) => value.seal(sink).await,
             Self::Tensor(value) => value.seal(sink).await,
+        }
+    }
+}
+
+pub(crate) enum EngineBulkBuilder<S, E> {
+    Path(PathBulkBuilder<S>),
+    Metadata(MetadataBulkBuilder<S, E>),
+    TypedJson(TypedJsonBulkBuilder<S, E>),
+    FullText(FullTextBulkBuilder<S, E>),
+    Vector(VectorBulkBuilder<S>),
+    Hybrid(HybridBulkBuilder<S, E>),
+    GitSource(GitSourceBulkBuilder<S, E>),
+    Tensor(TensorBulkBuilder<S, E>),
+}
+
+impl<S, E> EngineBulkBuilder<S, E>
+where
+    S: IndexBlockSink + anvil_index::IndexDirectoryRead + Clone + 'static,
+    E: CompactionExecutor,
+{
+    pub(crate) fn new(
+        specification: &IndexSpecification,
+        sink: S,
+        executor: E,
+        options: BulkBuildOptions,
+    ) -> Result<Self, IndexError> {
+        match specification.specification.as_ref() {
+            Some(Specification::Path(_)) => Ok(Self::Path(PathBulkBuilder::new(sink))),
+            Some(Specification::MetadataFilter(value)) => {
+                Ok(Self::Metadata(MetadataBulkBuilder::new(
+                    metadata_definition(&value.fields),
+                    sink,
+                    executor,
+                    options,
+                )?))
+            }
+            Some(Specification::TypedJson(value)) => {
+                Ok(Self::TypedJson(TypedJsonBulkBuilder::new(
+                    typed_definition(&value.fields),
+                    sink,
+                    executor,
+                    options,
+                )?))
+            }
+            Some(Specification::FullText(_)) => Ok(Self::FullText(FullTextBulkBuilder::new(
+                sink, executor, options,
+            )?)),
+            Some(Specification::Vector(value)) => Ok(Self::Vector(VectorBulkBuilder::new(
+                vector_definition(value)?,
+                sink,
+            )?)),
+            Some(Specification::Hybrid(value)) => Ok(Self::Hybrid(HybridBulkBuilder::new(
+                hybrid_definition(value)?,
+                sink,
+                executor,
+                options,
+            )?)),
+            Some(Specification::GitSource(_)) => Ok(Self::GitSource(GitSourceBulkBuilder::new(
+                sink, executor, options,
+            )?)),
+            Some(Specification::Tensor(_)) => Ok(Self::Tensor(TensorBulkBuilder::new(
+                sink, executor, options,
+            )?)),
+            None => Err(missing_specification()),
+        }
+    }
+
+    pub(crate) async fn push(&mut self, mutation: EngineMutation) -> Result<(), IndexError> {
+        match (self, mutation) {
+            (Self::Path(builder), EngineMutation::Path(value)) => builder.push(value).await,
+            (Self::Metadata(builder), EngineMutation::Metadata(value)) => builder.push(value).await,
+            (Self::TypedJson(builder), EngineMutation::TypedJson(value)) => {
+                builder.push(value).await
+            }
+            (Self::FullText(builder), EngineMutation::FullText(value)) => builder.push(value).await,
+            (Self::Vector(builder), EngineMutation::Vector(value)) => builder.push(value).await,
+            (Self::Hybrid(builder), EngineMutation::Hybrid(value)) => builder.push(value).await,
+            (Self::GitSource(builder), EngineMutation::GitSource(value)) => {
+                builder.push(value).await
+            }
+            (Self::Tensor(builder), EngineMutation::Tensor(value)) => builder.push(value).await,
+            _ => Err(IndexError::InvalidDefinition(
+                "index mutation kind differs from its bulk builder".into(),
+            )),
+        }
+    }
+
+    pub(crate) async fn finish_range(&mut self) -> Result<(), IndexError> {
+        match self {
+            Self::Path(value) => value.finish_range().await,
+            Self::Metadata(value) => value.finish_range().await,
+            Self::TypedJson(value) => value.finish_range().await,
+            Self::FullText(value) => value.finish_range().await,
+            Self::Vector(value) => value.finish_range().await,
+            Self::Hybrid(value) => value.finish_range().await,
+            Self::GitSource(value) => value.finish_range().await,
+            Self::Tensor(value) => value.finish_range().await,
+        }
+    }
+
+    pub(crate) fn external_sort_progress(&self) -> Option<CompactionProgress> {
+        match self {
+            Self::Metadata(value) => Some(value.progress()),
+            Self::TypedJson(value) => Some(value.progress()),
+            Self::FullText(value) => Some(value.progress()),
+            Self::Hybrid(value) => Some(value.progress()),
+            Self::GitSource(value) => Some(value.progress()),
+            Self::Tensor(value) => Some(value.progress()),
+            Self::Path(_) | Self::Vector(_) => None,
+        }
+    }
+
+    pub(crate) async fn finish(self) -> Result<(Option<SealedRun>, S), IndexError> {
+        match self {
+            Self::Path(value) => value.finish().await,
+            Self::Metadata(value) => value.finish().await,
+            Self::TypedJson(value) => value.finish().await,
+            Self::FullText(value) => value.finish().await,
+            Self::Vector(value) => value.finish().await,
+            Self::Hybrid(value) => value.finish().await,
+            Self::GitSource(value) => value.finish().await,
+            Self::Tensor(value) => value.finish().await,
         }
     }
 }
@@ -808,15 +935,15 @@ fn object_metadata(object: &IndexBuildObject, fields: &[String]) -> SelectedScal
         .map(|field| {
             let value = match field.as_str() {
                 "path" => ScalarValue::String(object.path.clone()),
-                "version" => ScalarValue::Number(object.version as f64),
+                "version" => ScalarValue::Unsigned(object.version),
                 "content_type" => object
                     .content_type
                     .clone()
                     .map_or(ScalarValue::Null, ScalarValue::String),
-                "content_length" => ScalarValue::Number(object.content_length as f64),
+                "content_length" => ScalarValue::Unsigned(object.content_length),
                 "content_hash" => ScalarValue::String(hex::encode(object.content_hash)),
                 "committed_at_unix_millis" => {
-                    ScalarValue::Number(object.committed_at_unix_millis as f64)
+                    ScalarValue::Unsigned(object.committed_at_unix_millis)
                 }
                 _ => ScalarValue::Null,
             };
@@ -975,9 +1102,48 @@ mod tests {
         );
         assert_eq!(
             document.fields["content_length"],
-            vec![ScalarValue::Number(91.0)]
+            vec![ScalarValue::Unsigned(91)]
         );
         assert_eq!(diagnostics.accepted_objects, 1);
+    }
+
+    #[test]
+    fn metadata_projection_preserves_u64_values_above_json_float_precision() {
+        let specification = IndexSpecification {
+            specification: Some(Specification::MetadataFilter(MetadataFilterIndexSpec {
+                fields: vec![
+                    "version".into(),
+                    "content_length".into(),
+                    "committed_at_unix_millis".into(),
+                ],
+            })),
+        };
+        let mut object = object("records/exact", (1_u64 << 53) + 1);
+        object.version = (1_u64 << 53) + 3;
+        object.committed_at_unix_millis = u64::MAX;
+
+        let (mutation, _) = project_mutation(
+            &specification,
+            IndexSourceMutation::Upsert(object),
+            None,
+            64 * 1024,
+        )
+        .unwrap();
+        let EngineMutation::Metadata(IndexMutation::Upsert(document)) = mutation else {
+            panic!("expected metadata upsert")
+        };
+        assert_eq!(
+            document.fields["version"],
+            [ScalarValue::Unsigned((1_u64 << 53) + 3)]
+        );
+        assert_eq!(
+            document.fields["content_length"],
+            [ScalarValue::Unsigned((1_u64 << 53) + 1)]
+        );
+        assert_eq!(
+            document.fields["committed_at_unix_millis"],
+            [ScalarValue::Unsigned(u64::MAX)]
+        );
     }
 
     #[test]
