@@ -7,19 +7,15 @@ use tracing::Instrument;
 
 use super::*;
 use crate::cluster_object_read::ClusterReadPayload;
-use crate::index_runtime::budget::IndexMemoryPermit;
 use crate::index_runtime::engine::EngineBulkBuilder;
 use crate::index_runtime::publisher::IndexBlockStagingSink;
 
 pub(super) struct RebuildWork {
     pub(super) current: Option<PublishedGeneration>,
-    pub(super) _snapshot_slot: tokio::sync::OwnedSemaphorePermit,
-    pub(super) _memory_permit: IndexMemoryPermit,
     pub(super) snapshot: ClusterIndexSourceSnapshot,
     pub(super) through: IndexBarrier,
     pub(super) candidate: CandidateGeneration,
     pub(super) builder: Option<EngineBulkBuilder<IndexBlockStagingSink, IndexCompactionExecutor>>,
-    pub(super) plan: SegmentMemoryPlan,
     pub(super) source_quantum_bytes: u64,
     pub(super) progress: BuilderProgress,
 }
@@ -72,6 +68,14 @@ pub(super) async fn advance_rebuild(
     ),
     Status,
 > {
+    let budget = dependencies.budgets.for_kind(job.kind);
+    let permit = await_with_builder_heartbeats(&work.progress, budget.acquire(budget.limit()))
+        .await
+        .map_err(budget_status)?;
+    let plan = work_plan_for_limit(budget.limit(), work.source_quantum_bytes)?;
+    if work.builder.is_none() {
+        work.builder = Some(open_bulk_builder(job, dependencies, plan)?);
+    }
     let mut quantum = SourceWorkQuantum::from_wire_limit(work.source_quantum_bytes);
     loop {
         let scan_started = Instant::now();
@@ -187,6 +191,7 @@ pub(super) async fn advance_rebuild(
                     "direct index snapshot base run published"
                 );
             }
+            drop(permit);
             let target = dependencies
                 .journal
                 .capture_barrier()
@@ -222,7 +227,7 @@ pub(super) async fn advance_rebuild(
                 &job.specification,
                 &work.through,
                 frame,
-                work.plan,
+                plan,
                 work.builder
                     .as_mut()
                     .ok_or_else(|| Status::internal("snapshot bulk builder is missing"))?,
@@ -255,6 +260,7 @@ pub(super) async fn advance_rebuild(
                 "direct index bulk source range finished"
             );
             range_result.map_err(index_status)?;
+            drop(permit);
             return Ok((BuilderPhase::Rebuild(work), BuilderDisposition::Ready, None));
         }
     }

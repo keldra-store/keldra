@@ -61,7 +61,7 @@ mod quantum;
 use quantum::{SourceWorkBoundary, SourceWorkQuantum};
 #[path = "manager/rebuild.rs"]
 mod rebuild;
-use rebuild::{RebuildWork, advance_rebuild, open_bulk_builder};
+use rebuild::{RebuildWork, advance_rebuild};
 
 const BUILDER_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_SOURCE_WIRE_BYTES: u64 = 16 * 1024 * 1024;
@@ -525,11 +525,14 @@ impl BuilderScheduler {
         }
         match step.disposition {
             BuilderDisposition::Ready => self.enqueue(metadata.identity),
-            BuilderDisposition::Retry(_delay) => {
-                // The durable assignment is the retry queue. Yield this scarce
-                // process-local lease so one failing definition cannot block a
-                // later healthy definition from being discovered.
-                self.evict_builder(metadata.identity);
+            BuilderDisposition::Retry(delay) => {
+                self.delayed.insert(
+                    metadata.identity,
+                    (
+                        tokio::time::Instant::now() + delay,
+                        metadata.definition_version,
+                    ),
+                );
             }
             BuilderDisposition::Idle => {
                 if entry.wake_pending {
@@ -849,19 +852,8 @@ async fn inspect_builder(
     );
     let progress = BuilderProgress::start(telemetry_identity, BuilderProgressPhase::Rebuild);
     let budget = dependencies.budgets.for_kind(job.kind);
-    let snapshot_slot = budget
-        .acquire_snapshot_slot()
-        .await
-        .map_err(budget_status)?;
-    let snapshot_share_bytes = budget.snapshot_share_bytes();
-    let memory_permit =
-        await_with_builder_heartbeats(&progress, budget.acquire(snapshot_share_bytes))
-            .await
-            .map_err(budget_status)?;
-    let max_frame_bytes = source_wire_limit(snapshot_share_bytes)
-        .min(dependencies.config.source_quantum_bytes(job.kind));
-    let plan = work_plan_for_limit(snapshot_share_bytes, max_frame_bytes)?;
-    let builder = open_bulk_builder(job, dependencies, plan)?;
+    let max_frame_bytes =
+        source_wire_limit(budget.limit()).min(dependencies.config.source_quantum_bytes(job.kind));
     let (expected_fence, expected_atomic) = dependencies
         .journal
         .snapshot_authority()
@@ -892,13 +884,10 @@ async fn inspect_builder(
     Ok((
         BuilderPhase::Rebuild(RebuildWork {
             current,
-            _snapshot_slot: snapshot_slot,
-            _memory_permit: memory_permit,
             snapshot,
             through,
             candidate: CandidateGeneration::rebuild(),
-            builder: Some(builder),
-            plan,
+            builder: None,
             source_quantum_bytes: max_frame_bytes,
             progress,
         }),
@@ -1759,8 +1748,8 @@ fn event_status(error: IndexEventError) -> Status {
         | IndexEventError::AtomicProgramInProgress
         | IndexEventError::Source { .. }
         | IndexEventError::Task(_) => Status::unavailable(error.to_string()),
-        IndexEventError::BarrierChanged
-        | IndexEventError::CheckpointMismatch(_)
+        IndexEventError::BarrierChanged => Status::aborted(error.to_string()),
+        IndexEventError::CheckpointMismatch(_)
         | IndexEventError::SourceEpochChanged(_)
         | IndexEventError::SourceHistoryGap(_)
         | IndexEventError::IncompleteSources => Status::failed_precondition(error.to_string()),

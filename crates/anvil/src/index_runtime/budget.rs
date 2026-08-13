@@ -9,15 +9,9 @@ use std::sync::{Arc, Mutex};
 
 use anvil_index::{IndexKind, MIN_INDEX_KIND_MEMORY_BYTES, SegmentMemoryPlan};
 use thiserror::Error;
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::Notify;
 
 use crate::index_config::IndexRuntimeConfig;
-
-/// A small fixed maximum of pull-driven rebuild streams may remain open per
-/// kind. Admission shrinks this count when the kind budget cannot fund three
-/// minimum-size direct builders, and each admitted stream holds one exact
-/// lifetime byte share.
-const MAX_OPEN_SNAPSHOTS_PER_KIND: usize = 3;
 
 #[derive(Clone)]
 pub(crate) struct IndexMemoryBudgets {
@@ -100,8 +94,6 @@ fn validate_limit(bytes: u64) -> Result<(), IndexBudgetError> {
 #[derive(Clone)]
 pub(crate) struct IndexMemoryBudget {
     inner: Arc<BudgetInner>,
-    snapshot_slot: Arc<Semaphore>,
-    snapshot_share_bytes: u64,
 }
 
 struct BudgetInner {
@@ -129,8 +121,6 @@ impl IndexMemoryBudget {
         if limit == 0 {
             return Err(IndexBudgetError::ZeroLimit);
         }
-        let usable_slots = (limit / MIN_INDEX_KIND_MEMORY_BYTES as u64)
-            .clamp(1, MAX_OPEN_SNAPSHOTS_PER_KIND as u64) as usize;
         Ok(Self {
             inner: Arc::new(BudgetInner {
                 kind,
@@ -138,8 +128,6 @@ impl IndexMemoryBudget {
                 state: Mutex::new(BudgetState::default()),
                 changed: Notify::new(),
             }),
-            snapshot_slot: Arc::new(Semaphore::new(usable_slots)),
-            snapshot_share_bytes: limit / usable_slots as u64,
         })
     }
 
@@ -151,25 +139,6 @@ impl IndexMemoryBudget {
         let bytes = usize::try_from(self.inner.limit)
             .expect("validated index memory budget fits this platform");
         SegmentMemoryPlan::new(bytes).expect("validated index memory budget has a usable plan")
-    }
-
-    /// Exact lifetime reservation for one admitted direct snapshot builder.
-    /// Every open builder of this kind therefore fits inside the shared cap.
-    pub(crate) fn snapshot_share_bytes(&self) -> u64 {
-        self.snapshot_share_bytes
-    }
-
-    /// Admit one of the bounded pull-driven rebuild sessions for this kind.
-    /// The caller then reserves `snapshot_share_bytes` for the same lifetime;
-    /// the manager scheduler gives admitted sessions bounded source turns.
-    pub(crate) async fn acquire_snapshot_slot(
-        &self,
-    ) -> Result<OwnedSemaphorePermit, IndexBudgetError> {
-        self.snapshot_slot
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| IndexBudgetError::SnapshotPoolClosed)
     }
 
     /// Wait in FIFO order for an exact byte reservation.
@@ -313,8 +282,6 @@ pub(crate) enum IndexBudgetError {
     ZeroLimit,
     #[error("index work requires {requested} bytes but its kind is capped at {limit} bytes")]
     RequestExceedsLimit { requested: u64, limit: u64 },
-    #[error("index snapshot admission is closed")]
-    SnapshotPoolClosed,
     #[error("index memory budget {configured} is below the format minimum {minimum}")]
     BelowMinimum { configured: u64, minimum: u64 },
     #[error("index memory budget {0} exceeds this platform's addressable size")]
@@ -370,10 +337,6 @@ mod tests {
             &budgets.for_kind(IndexKind::Path).inner,
             &budgets.for_kind(IndexKind::Vector).inner,
         ));
-        assert!(!Arc::ptr_eq(
-            &budgets.for_kind(IndexKind::Path).snapshot_slot,
-            &budgets.for_kind(IndexKind::Vector).snapshot_slot,
-        ));
     }
 
     #[test]
@@ -397,22 +360,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_sessions_are_bounded_without_serializing_three_rebuilds() {
-        let budget =
-            IndexMemoryBudget::new(IndexKind::Path, (MIN_INDEX_KIND_MEMORY_BYTES * 3) as u64)
+    async fn completed_full_budget_turn_leaves_the_next_turn_runnable() {
+        let limit = MIN_INDEX_KIND_MEMORY_BYTES as u64;
+        let budget = IndexMemoryBudget::new(IndexKind::TypedJson, limit).unwrap();
+        let rebuild_turn = budget.acquire(limit).await.unwrap();
+        assert_eq!(budget.used(), limit);
+
+        drop(rebuild_turn);
+        assert_eq!(budget.used(), 0);
+
+        let catch_up_turn =
+            tokio::time::timeout(std::time::Duration::from_secs(1), budget.acquire(limit))
+                .await
+                .expect("a yielded rebuild turn must not pin the kind budget")
                 .unwrap();
-        let first = budget.acquire_snapshot_slot().await.unwrap();
-        let second = budget.acquire_snapshot_slot().await.unwrap();
-        let third = budget.acquire_snapshot_slot().await.unwrap();
-        let waiting_budget = budget.clone();
-        let waiting =
-            tokio::spawn(async move { waiting_budget.acquire_snapshot_slot().await.unwrap() });
-        tokio::task::yield_now().await;
-        assert!(!waiting.is_finished());
-        drop(first);
-        drop(waiting.await.unwrap());
-        drop(second);
-        drop(third);
+        assert_eq!(catch_up_turn.bytes(), limit);
     }
 
     #[tokio::test]

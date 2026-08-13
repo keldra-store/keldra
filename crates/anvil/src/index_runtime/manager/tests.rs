@@ -281,6 +281,25 @@ fn same_kind_ready_queue_gives_the_next_definition_a_turn() {
 }
 
 #[test]
+fn parked_rebuild_limit_prioritizes_same_kind_catch_up() {
+    let mut scheduler = BuilderScheduler::default();
+    let parked_inspection = definition(1, 2, 9);
+    let catch_up = definition(3, 4, 10);
+    let catch_up_identity = catch_up.identity();
+    queue_definition(&mut scheduler, parked_inspection);
+    queue_dirty_definition(&mut scheduler, catch_up);
+    scheduler.open_rebuilds[kind_slot(IndexKind::Path)] = MAX_OPEN_REBUILDS_PER_KIND;
+
+    let selected = scheduler
+        .pop_runnable()
+        .expect("same-kind catch-up must run while parked rebuild admission is full");
+
+    assert_eq!(selected.definition.identity(), catch_up_identity);
+    assert!(matches!(selected.phase, BuilderPhase::CatchUp(_)));
+    assert!(scheduler.pop_runnable().is_none());
+}
+
+#[test]
 fn scheduler_identity_includes_tenant_and_bucket() {
     let mut scheduler = BuilderScheduler::default();
     queue_definition(&mut scheduler, definition(1, 2, 9));
@@ -397,23 +416,9 @@ fn successful_publish_yields_a_lease_to_a_later_assignment() {
 }
 
 #[test]
-fn transient_failure_yields_a_lease_to_a_later_assignment() {
+fn transient_failure_keeps_exact_work_until_its_delayed_retry() {
     let mut scheduler = BuilderScheduler::default();
-    for index_id in 1..=MAX_ACTIVE_BUILDERS as u64 {
-        queue_dirty_definition(&mut scheduler, definition(1, 2, index_id));
-    }
-    let later = definition(3, 4, MAX_ACTIVE_BUILDERS as u64 + 1);
-    let later_identity = later.identity();
-    let catalog = IndexCatalog::default();
-    catalog.upsert(later).unwrap();
-
-    assert_eq!(scheduler.remaining_capacity(), 0);
-    assert!(
-        catalog
-            .take(later_identity, scheduler.can_admit(later_identity))
-            .unwrap()
-            .is_none()
-    );
+    queue_dirty_definition(&mut scheduler, definition(1, 2, 9));
 
     let failed_job = scheduler.pop_runnable().unwrap();
     let failed_identity = failed_job.definition.identity();
@@ -428,17 +433,26 @@ fn transient_failure_yields_a_lease_to_a_later_assignment() {
         |_, _, _| true,
     );
 
-    assert!(!scheduler.entries.contains_key(&failed_identity));
-    assert_eq!(scheduler.remaining_capacity(), 1);
-    let admitted = catalog
-        .take(later_identity, scheduler.can_admit(later_identity))
-        .unwrap()
-        .expect("later durable assignment should acquire the yielded lease");
-    let CatalogChange::Upsert(later) = admitted else {
-        panic!("later assignment unexpectedly became a removal");
+    assert!(scheduler.entries.contains_key(&failed_identity));
+    assert!(scheduler.pop_runnable().is_none());
+    assert_eq!(
+        scheduler.delayed[&failed_identity].1,
+        metadata.definition_version
+    );
+
+    let retry_due = scheduler.delayed[&failed_identity].0;
+    scheduler.promote_due(retry_due);
+    let resumed = scheduler
+        .pop_runnable()
+        .expect("the preserved builder was not retried after its delay");
+    assert_eq!(resumed.definition.identity(), failed_identity);
+    let BuilderPhase::CatchUp(resumed) = resumed.phase else {
+        panic!("the delayed retry discarded exact catch-up work");
     };
-    queue_definition(&mut scheduler, later);
-    assert!(scheduler.entries.contains_key(&later_identity));
+    assert_eq!(resumed.through, barrier(10));
+    assert_eq!(resumed.target, barrier(12));
+    assert!(resumed.changed);
+    assert!(resumed.must_publish);
 }
 
 #[test]
@@ -448,10 +462,19 @@ fn lost_incremental_history_is_a_failed_precondition() {
         IndexEventError::SourceEpochChanged(NodeId(1)),
         IndexEventError::SourceHistoryGap(NodeId(1)),
         IndexEventError::IncompleteSources,
-        IndexEventError::BarrierChanged,
     ] {
         assert_eq!(event_status(error).code(), tonic::Code::FailedPrecondition);
     }
+}
+
+#[test]
+fn atomic_barrier_change_reinspects_instead_of_losing_the_wake() {
+    let error = event_status(IndexEventError::BarrierChanged);
+    assert_eq!(error.code(), tonic::Code::Aborted);
+    assert_eq!(
+        failure_recovery(BuilderFailurePhase::CatchUp, &error),
+        BuilderFailureRecovery::Reinspect
+    );
 }
 
 #[test]
