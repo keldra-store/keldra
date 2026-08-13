@@ -608,6 +608,7 @@ pub(crate) struct LeafCursor<'a, D> {
     pending: Option<BlockDescriptor>,
     stack: Vec<(Vec<BlockDescriptor>, usize)>,
     range: Option<crate::compaction::KeyRange>,
+    reverse: bool,
 }
 
 /// One validated leaf retaining the original encoded allocation. Consumers
@@ -695,6 +696,7 @@ impl<'a, D: IndexDirectoryRead> LeafCursor<'a, D> {
             pending: Some(root),
             stack: Vec::new(),
             range: None,
+            reverse: false,
         }
     }
 
@@ -708,6 +710,21 @@ impl<'a, D: IndexDirectoryRead> LeafCursor<'a, D> {
             pending: Some(root),
             stack: Vec::new(),
             range: Some(range),
+            reverse: false,
+        }
+    }
+
+    pub(crate) fn in_range_reverse(
+        directory: &'a D,
+        root: BlockDescriptor,
+        range: crate::compaction::KeyRange,
+    ) -> Self {
+        Self {
+            directory,
+            pending: Some(root),
+            stack: Vec::new(),
+            range: Some(range),
+            reverse: true,
         }
     }
 
@@ -728,17 +745,26 @@ impl<'a, D: IndexDirectoryRead> LeafCursor<'a, D> {
                 if let Some(range) = &self.range {
                     children.retain(|child| range.intersects(child));
                 }
-                let Some(first) = children.first().cloned() else {
+                let Some(first) = (if self.reverse {
+                    children.last()
+                } else {
+                    children.first()
+                })
+                .cloned() else {
                     continue;
                 };
-                self.stack.push((children, 1));
+                let next = if self.reverse { children.len() - 1 } else { 1 };
+                self.stack.push((children, next));
                 self.pending = Some(first);
                 continue;
             }
             let Some((children, next)) = self.stack.last_mut() else {
                 return Ok(None);
             };
-            if *next < children.len() {
+            if self.reverse && *next > 0 {
+                *next -= 1;
+                self.pending = Some(children[*next].clone());
+            } else if !self.reverse && *next < children.len() {
                 self.pending = Some(children[*next].clone());
                 *next += 1;
             } else {
@@ -778,7 +804,7 @@ pub(crate) async fn read_leaf<D: IndexDirectoryRead>(
         .await
 }
 
-async fn read_routing_page<D: IndexDirectoryRead>(
+pub(crate) async fn read_routing_page<D: IndexDirectoryRead>(
     directory: &D,
     descriptor: &BlockDescriptor,
 ) -> Result<Vec<BlockDescriptor>, IndexError> {
@@ -790,6 +816,42 @@ async fn read_routing_page<D: IndexDirectoryRead>(
     directory
         .run_query_cpu(move || decode_routing_page(bytes.as_ref(), &descriptor))
         .await
+}
+
+/// Count rows covered by complete routing subtrees and return only the boundary
+/// leaves which require payload inspection. Planning therefore costs routing
+/// height rather than visiting every leaf in a large posting range.
+pub(crate) async fn range_descriptor_coverage<D: IndexDirectoryRead>(
+    directory: &D,
+    root: BlockDescriptor,
+    range: &crate::compaction::KeyRange,
+) -> Result<(u64, Vec<BlockDescriptor>), IndexError> {
+    let mut covered = 0u64;
+    let mut boundary = Vec::with_capacity(2);
+    let mut pending = vec![root];
+    while let Some(descriptor) = pending.pop() {
+        if !range.intersects(&descriptor) {
+            continue;
+        }
+        let fully_contained = range
+            .lower
+            .as_deref()
+            .is_none_or(|lower| descriptor.minimum_key.as_slice() >= lower)
+            && range
+                .upper
+                .as_deref()
+                .is_none_or(|upper| descriptor.maximum_key.as_slice() < upper);
+        if fully_contained {
+            covered = covered
+                .checked_add(descriptor.element_count)
+                .ok_or(IndexError::OffsetOverflow)?;
+        } else if descriptor.routing_height == 0 {
+            boundary.push(descriptor);
+        } else {
+            pending.extend(read_routing_page(directory, &descriptor).await?);
+        }
+    }
+    Ok((covered, boundary))
 }
 
 fn decode_routing_page(

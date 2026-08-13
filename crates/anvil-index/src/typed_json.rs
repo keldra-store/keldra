@@ -49,7 +49,7 @@ use identity::{TypedCursor, range_local_ordinal, typed_row};
 #[path = "typed_json/postings.rs"]
 mod postings;
 pub(crate) use postings::PostingComponentWriter;
-use postings::PostingCursor;
+use postings::{PostingCursor, count_posting_range, estimate_posting_ranges};
 
 #[path = "typed_json/key_rebuild.rs"]
 mod key_rebuild;
@@ -1088,21 +1088,9 @@ fn predicate_values(predicate: &TypedPredicate) -> &[ScalarValue] {
     }
 }
 
-fn query_driver_ranges(
-    predicates: &[TypedPredicate],
-) -> Result<Option<Vec<crate::compaction::KeyRange>>, IndexError> {
-    let Some(predicate) = predicates.iter().min_by_key(|predicate| match predicate {
-        TypedPredicate::Equal { .. } => 0,
-        TypedPredicate::Prefix { .. } => 1,
-        TypedPredicate::In { .. } => 2,
-        TypedPredicate::LessThan { .. }
-        | TypedPredicate::LessThanOrEqual { .. }
-        | TypedPredicate::GreaterThan { .. }
-        | TypedPredicate::GreaterThanOrEqual { .. } => 3,
-        TypedPredicate::Exists { .. } => 4,
-    }) else {
-        return Ok(None);
-    };
+fn predicate_ranges(
+    predicate: &TypedPredicate,
+) -> Result<Vec<crate::compaction::KeyRange>, IndexError> {
     let ranges = match predicate {
         TypedPredicate::Exists { field } => {
             vec![query_prefix_range(typed_exists_primary(field).map_err(
@@ -1157,7 +1145,7 @@ fn query_driver_ranges(
             .collect()
         }
     };
-    Ok(Some(ranges))
+    Ok(ranges)
 }
 
 fn typed_query_primary(field: &str, value: &ScalarValue) -> Result<Vec<u8>, IndexError> {
@@ -1166,14 +1154,22 @@ fn typed_query_primary(field: &str, value: &ScalarValue) -> Result<Vec<u8>, Inde
 }
 
 fn typed_scalar_prefix(field: &str, value: &ScalarValue) -> Result<Vec<u8>, IndexError> {
-    let mut key = typed_field_prefix(field)?;
-    key.push(match value {
+    typed_scalar_tag_prefix(field, scalar_tag_for_value(value))
+}
+
+fn scalar_tag_for_value(value: &ScalarValue) -> u8 {
+    match value {
         ScalarValue::Null => 0,
         ScalarValue::Boolean(_) => 1,
         ScalarValue::Number(_) => 2,
         ScalarValue::String(_) => 3,
         ScalarValue::Unsigned(_) => UNSIGNED_VALUE_TAG,
-    });
+    }
+}
+
+fn typed_scalar_tag_prefix(field: &str, scalar_tag: u8) -> Result<Vec<u8>, IndexError> {
+    let mut key = typed_field_prefix(field)?;
+    key.push(scalar_tag);
     validate_query_key(key)
 }
 

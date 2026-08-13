@@ -297,6 +297,7 @@ pub(super) struct PostingCursor<'a, D> {
     leaves: LeafCursor<'a, D>,
     rows: VecDeque<RoutedRow>,
     range: Option<crate::compaction::KeyRange>,
+    reverse: bool,
 }
 
 impl<'a, D: IndexDirectoryRead> PostingCursor<'a, D> {
@@ -318,6 +319,7 @@ impl<'a, D: IndexDirectoryRead> PostingCursor<'a, D> {
             leaves,
             rows: VecDeque::new(),
             range,
+            reverse: false,
         }
     }
 
@@ -331,12 +333,31 @@ impl<'a, D: IndexDirectoryRead> PostingCursor<'a, D> {
             leaves: LeafCursor::in_range(directory, root, range.clone()),
             rows: VecDeque::new(),
             range: Some(range),
+            reverse: false,
+        }
+    }
+
+    pub(super) fn in_range_reverse(
+        directory: &'a D,
+        root: crate::BlockDescriptor,
+        range: crate::compaction::KeyRange,
+    ) -> Self {
+        Self {
+            directory,
+            leaves: LeafCursor::in_range_reverse(directory, root, range.clone()),
+            rows: VecDeque::new(),
+            range: Some(range),
+            reverse: true,
         }
     }
 
     pub(super) async fn next(&mut self) -> Result<Option<RoutedRow>, IndexError> {
         loop {
-            while let Some(row) = self.rows.pop_front() {
+            while let Some(row) = if self.reverse {
+                self.rows.pop_back()
+            } else {
+                self.rows.pop_front()
+            } {
                 if self
                     .range
                     .as_ref()
@@ -353,6 +374,55 @@ impl<'a, D: IndexDirectoryRead> PostingCursor<'a, D> {
                 .into();
         }
     }
+}
+
+/// A cheap upper bound for choosing between predicate posting ranges. Routing
+/// descriptors are authoritative and already carry descendant row counts. A
+/// boundary leaf may include adjacent keys, which deliberately overestimates
+/// rather than decoding payload blocks during planning.
+pub(super) async fn estimate_posting_ranges<D: IndexDirectoryRead>(
+    directory: &D,
+    root: crate::BlockDescriptor,
+    ranges: &[crate::compaction::KeyRange],
+) -> Result<u64, IndexError> {
+    let mut count = 0u64;
+    for range in ranges {
+        let (covered, boundary) =
+            crate::run::range_descriptor_coverage(directory, root.clone(), range).await?;
+        let boundary = boundary.iter().try_fold(0u64, |count, descriptor| {
+            count
+                .checked_add(descriptor.element_count)
+                .ok_or(IndexError::OffsetOverflow)
+        })?;
+        count = count
+            .checked_add(covered)
+            .and_then(|count| count.checked_add(boundary))
+            .ok_or(IndexError::OffsetOverflow)?;
+    }
+    Ok(count)
+}
+
+/// Count one posting range exactly while decoding only leaves which straddle a
+/// range boundary. Interior leaf counts come directly from their descriptors.
+pub(super) async fn count_posting_range<D: IndexDirectoryRead>(
+    directory: &D,
+    root: crate::BlockDescriptor,
+    range: crate::compaction::KeyRange,
+) -> Result<u64, IndexError> {
+    let (mut count, boundary) =
+        crate::run::range_descriptor_coverage(directory, root, &range).await?;
+    for descriptor in boundary {
+        let rows = u64::try_from(
+            read_posting_block(directory, &descriptor)
+                .await?
+                .into_iter()
+                .filter(|row| range.contains(&row.primary))
+                .count(),
+        )
+        .map_err(|_| IndexError::OffsetOverflow)?;
+        count = count.checked_add(rows).ok_or(IndexError::OffsetOverflow)?;
+    }
+    Ok(count)
 }
 
 fn common_prefix(left: &[u8], right: &[u8]) -> usize {
