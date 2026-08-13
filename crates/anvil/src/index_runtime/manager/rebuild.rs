@@ -1,8 +1,8 @@
 use std::collections::VecDeque;
 use std::io;
+use std::sync::Arc;
 
 use anvil_index::bulk::BulkBuildOptions;
-use rayon::prelude::*;
 use tracing::Instrument;
 
 use super::*;
@@ -593,6 +593,66 @@ pub(super) struct FetchedProjection {
 
 type ProjectedSource = Result<(EngineMutation, IndexBuildDiagnostics), IndexError>;
 
+pub(super) async fn run_projection_lanes<T, O, F>(
+    cpu: IndexCpuPool,
+    lanes: Vec<Vec<T>>,
+    senders: Vec<tokio::sync::mpsc::Sender<Result<O, IndexError>>>,
+    work: F,
+) -> Result<ProjectionExecution, Status>
+where
+    T: Send + 'static,
+    O: Send + 'static,
+    F: Fn(T) -> Result<O, IndexError> + Send + Sync + 'static,
+{
+    if lanes.len() != senders.len() {
+        return Err(Status::internal(
+            "projection lanes and result channels do not match",
+        ));
+    }
+    let work = Arc::new(work);
+    let mut tasks = tokio::task::JoinSet::new();
+    for (lane, sender) in lanes.into_iter().zip(senders) {
+        let cpu = cpu.clone();
+        let work = Arc::clone(&work);
+        tasks.spawn(async move {
+            let mut execution = ProjectionExecution::default();
+            for value in lane {
+                let queued = Instant::now();
+                let work = Arc::clone(&work);
+                let (projected, queue_seconds, cpu_seconds) = cpu
+                    .submit(move || {
+                        let started = Instant::now();
+                        let queue_seconds = started.saturating_duration_since(queued).as_secs_f64();
+                        let projected = work(value);
+                        let cpu_seconds = started.elapsed().as_secs_f64();
+                        (projected, queue_seconds, cpu_seconds)
+                    })
+                    .await
+                    .map_err(cpu_status)?;
+                execution.queue_seconds += queue_seconds;
+                execution.cpu_seconds += cpu_seconds;
+                let failed = projected.is_err();
+                // This wait is deliberately outside the Rayon job. A full
+                // consumer channel cannot retain a worker required by a
+                // builder spill or another nested CPU operation.
+                if sender.send(projected).await.is_err() || failed {
+                    break;
+                }
+            }
+            Ok::<_, Status>(execution)
+        });
+    }
+
+    let mut execution = ProjectionExecution::default();
+    while let Some(result) = tasks.join_next().await {
+        let lane = result
+            .map_err(|error| Status::internal(format!("projection lane task failed: {error}")))??;
+        execution.queue_seconds += lane.queue_seconds;
+        execution.cpu_seconds += lane.cpu_seconds;
+    }
+    Ok(execution)
+}
+
 async fn project_snapshot_batch_inner(
     specification: &IndexSpecification,
     sources: Vec<PreparedProjection>,
@@ -614,42 +674,18 @@ async fn project_snapshot_batch_inner(
     }
     let cpu = dependencies.cpu.clone();
     let specification = specification.clone();
-    let queued = Instant::now();
-    let cpu_task = tokio::spawn(async move {
-        cpu.install(move || {
-            let cpu_started = Instant::now();
-            let queue_seconds = cpu_started.saturating_duration_since(queued).as_secs_f64();
-            let lane_cpu_seconds = lanes
-                .into_par_iter()
-                .zip(senders.into_par_iter())
-                .map(|(lane, sender)| {
-                    lane.into_iter().fold(0.0, |cpu_seconds, mut fetched| {
-                        let started = Instant::now();
-                        let reader = fetched
-                            .payload
-                            .as_mut()
-                            .map(|payload| payload as &mut dyn std::io::Read);
-                        let projected =
-                            project_mutation(&specification, fetched.source, reader, lane_limit);
-                        let cpu_seconds = cpu_seconds + started.elapsed().as_secs_f64();
-                        let failed = projected.is_err();
-                        if sender.blocking_send(projected).is_err() || failed {
-                            return cpu_seconds;
-                        }
-                        cpu_seconds
-                    })
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .sum();
-            ProjectionExecution {
-                queue_seconds,
-                cpu_seconds: lane_cpu_seconds,
-            }
-        })
-        .await
-        .map_err(cpu_status)
-    });
+    let cpu_task = tokio::spawn(run_projection_lanes(
+        cpu,
+        lanes,
+        senders,
+        move |mut fetched: FetchedProjection| {
+            let reader = fetched
+                .payload
+                .as_mut()
+                .map(|payload| payload as &mut dyn std::io::Read);
+            project_mutation(&specification, fetched.source, reader, lane_limit)
+        },
+    ));
 
     let mut totals = ProjectionWaveTotals::default();
     let mut failure = None;
@@ -878,57 +914,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn projection_lanes_all_progress_while_results_remain_ordered() {
-        let lanes = partition_projection_lanes((0_u64..6).collect(), 3);
-        let (progress_sender, mut progress_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let mut receivers = Vec::new();
-        let mut tasks = Vec::new();
-        for lane in lanes {
-            let (sender, receiver) = tokio::sync::mpsc::channel(1);
-            receivers.push(receiver);
-            let progress_sender = progress_sender.clone();
-            tasks.push(tokio::task::spawn_blocking(move || {
-                for value in lane {
-                    sender.blocking_send(value).unwrap();
-                    progress_sender.send(value).unwrap();
-                }
-            }));
-        }
-        drop(progress_sender);
+    async fn projection_backpressure_releases_workers_needed_by_nested_builder_work() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let mut first_round = Vec::new();
-        for _ in 0..3 {
-            first_round.push(progress_receiver.recv().await.unwrap());
+        let cpu = IndexCpuPool::new(2).unwrap();
+        let lanes = partition_projection_lanes((0_u64..4).collect(), 2);
+        let mut receivers = Vec::new();
+        let mut senders = Vec::new();
+        for _ in 0..lanes.len() {
+            let (sender, receiver) = tokio::sync::mpsc::channel(1);
+            senders.push(sender);
+            receivers.push(receiver);
         }
-        first_round.sort_unstable();
-        assert_eq!(first_round, [0, 1, 2]);
+        let projected = Arc::new(AtomicUsize::new(0));
+        let projected_by_work = Arc::clone(&projected);
+        let task = tokio::spawn(run_projection_lanes(
+            cpu.clone(),
+            lanes,
+            senders,
+            move |value| {
+                projected_by_work.fetch_add(1, Ordering::Release);
+                Ok::<_, IndexError>(value)
+            },
+        ));
+
+        // Each lane has filled its one-result channel and computed another
+        // result. Those second sends now exert backpressure. In the old
+        // scheduler both Rayon workers blocked here in blocking_send.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while projected.load(Ordering::Acquire) != 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all projection work should finish before results are drained");
+
+        let nested = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            cpu.install(|| "external-sort spill"),
+        )
+        .await
+        .expect("result backpressure must not starve nested CPU work")
+        .unwrap();
+        assert_eq!(nested, "external-sort spill");
 
         let mut delivered = Vec::new();
-        for position in 0..3 {
+        for position in 0..4 {
             delivered.push(
                 receive_ordered_lane_item(&mut receivers, position)
                     .await
+                    .unwrap()
                     .unwrap(),
             );
         }
-
-        let mut second_round = Vec::new();
-        for _ in 0..3 {
-            second_round.push(progress_receiver.recv().await.unwrap());
-        }
-        second_round.sort_unstable();
-        assert_eq!(second_round, [3, 4, 5]);
-
-        for position in 3..6 {
-            delivered.push(
-                receive_ordered_lane_item(&mut receivers, position)
-                    .await
-                    .unwrap(),
-            );
-        }
-        assert_eq!(delivered, (0_u64..6).collect::<Vec<_>>());
-        for task in tasks {
-            task.await.unwrap();
-        }
+        assert_eq!(delivered, (0_u64..4).collect::<Vec<_>>());
+        task.await.unwrap().unwrap();
     }
 }

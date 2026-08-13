@@ -1,6 +1,7 @@
 //! The one process-owned CPU pool for non-async index projection work.
 
 use std::future::Future;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -127,6 +128,32 @@ impl IndexCpuPool {
         tokio::task::spawn_blocking(move || pool.install(work))
             .await
             .map_err(|error| IndexCpuPoolError::Task(error.to_string()))
+    }
+
+    /// Submit one finite CPU unit without occupying a Tokio blocking thread
+    /// while it waits for a Rayon worker.
+    ///
+    /// Projection lanes use this boundary one source at a time. A completed
+    /// result can therefore wait on async consumer backpressure without
+    /// retaining the Rayon worker needed by nested index work such as an
+    /// external-sort spill.
+    pub(crate) async fn submit<F, T>(&self, work: F) -> Result<T, IndexCpuPoolError>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        self.inner.spawn(move || {
+            let outcome = catch_unwind(AssertUnwindSafe(work));
+            let _ = sender.send(outcome);
+        });
+        match receiver.await {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(_)) => Err(IndexCpuPoolError::Task(
+                "index CPU task panicked".to_owned(),
+            )),
+            Err(error) => Err(IndexCpuPoolError::Task(error.to_string())),
+        }
     }
 
     /// Execute one already-materialized query CPU chunk on the process-owned
@@ -268,6 +295,16 @@ mod tests {
             .query_chunk(IndexKind::FullText, || {
                 Ok(std::thread::current().name().unwrap_or_default().to_owned())
             })
+            .await
+            .unwrap();
+        assert!(name.starts_with("anvil-index-"));
+    }
+
+    #[tokio::test]
+    async fn submitted_work_runs_inside_the_owned_pool() {
+        let pool = IndexCpuPool::new(1).unwrap();
+        let name = pool
+            .submit(|| std::thread::current().name().unwrap_or_default().to_owned())
             .await
             .unwrap();
         assert!(name.starts_with("anvil-index-"));

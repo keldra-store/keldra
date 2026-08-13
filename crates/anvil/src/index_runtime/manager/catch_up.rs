@@ -1,11 +1,10 @@
 //! Bounded exact-current journal catch-up.
 
 use anvil_store::{CurrentObjectSnapshot, MAX_OBJECT_RECORD_EXPORT_RECORDS};
-use rayon::prelude::*;
 
 use super::rebuild::{
-    PreparedProjection, ProjectionBatch, fetch_projection_sources, partition_projection_lanes,
-    receive_ordered_lane_item,
+    FetchedProjection, PreparedProjection, ProjectionBatch, fetch_projection_sources,
+    partition_projection_lanes, receive_ordered_lane_item, run_projection_lanes,
 };
 use super::*;
 
@@ -238,46 +237,23 @@ async fn project_catch_up_batch(
     }
     let cpu = dependencies.cpu.clone();
     let projection_specification = specification.clone();
-    let queued = Instant::now();
-    let cpu_task = tokio::spawn(async move {
-        cpu.install(move || {
-            let cpu_started = Instant::now();
-            let queue_seconds = cpu_started.saturating_duration_since(queued).as_secs_f64();
-            let lane_cpu_seconds = lanes
-                .into_par_iter()
-                .zip(senders.into_par_iter())
-                .map(|(lane, sender)| {
-                    lane.into_iter().fold(0.0, |cpu_seconds, mut fetched| {
-                        let started = Instant::now();
-                        let reader = fetched
-                            .payload
-                            .as_mut()
-                            .map(|payload| payload as &mut dyn std::io::Read);
-                        let projected = project_mutation(
-                            &projection_specification,
-                            fetched.source,
-                            reader,
-                            lane_limit,
-                        );
-                        let cpu_seconds = cpu_seconds + started.elapsed().as_secs_f64();
-                        let failed = projected.is_err();
-                        if sender.blocking_send(projected).is_err() || failed {
-                            return cpu_seconds;
-                        }
-                        cpu_seconds
-                    })
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .sum();
-            ProjectionExecution {
-                queue_seconds,
-                cpu_seconds: lane_cpu_seconds,
-            }
-        })
-        .await
-        .map_err(cpu_status)
-    });
+    let cpu_task = tokio::spawn(run_projection_lanes(
+        cpu,
+        lanes,
+        senders,
+        move |mut fetched: FetchedProjection| {
+            let reader = fetched
+                .payload
+                .as_mut()
+                .map(|payload| payload as &mut dyn std::io::Read);
+            project_mutation(
+                &projection_specification,
+                fetched.source,
+                reader,
+                lane_limit,
+            )
+        },
+    ));
 
     let mut failure = None;
     for position in 0..source_count {
