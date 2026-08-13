@@ -10,7 +10,7 @@
 
 ## Workspace
 
-All workspace packages currently share version `0.8.0`:
+All workspace packages currently share version `0.8.1`:
 
 - server, CLI, and Rust client: `anvil-server`, `anvil-storage-cli`, and
   `anvil-storage`;
@@ -18,7 +18,7 @@ All workspace packages currently share version `0.8.0`:
   `anvil-consensus`, `anvil-index`, and `anvil-store`;
 - qualification tooling: `anvil-osv-qualification`.
 
-Anvil 0.8.0 runs as one flat cluster of capacity-weighted nodes with native
+Anvil 0.8.1 runs as one flat cluster of capacity-weighted nodes with native
 on-disk state, cluster-managed mTLS between peers, cluster-wide derived
 streaming indexes, and no external metadata database, external PKI, or second
 storage system. It includes PersonalDB, accounting, S3 and Git gateways, and
@@ -68,12 +68,12 @@ cargo package --locked -p anvil-storage
 ## Release
 
 The release tag must be the exact, unprefixed workspace version. After the
-validated commit is pushed, maintainers publish `0.8.0` with:
+validated commit is pushed, maintainers publish `0.8.1` with:
 
 ```sh
 validated_commit="$(git rev-parse HEAD)"
-git tag 0.8.0 "$validated_commit"
-git push origin refs/tags/0.8.0
+git tag 0.8.1 "$validated_commit"
+git push origin refs/tags/0.8.1
 ```
 
 The tag-triggered workflow reruns the static, Rust, and per-architecture image
@@ -87,15 +87,15 @@ client crate:
 
 ```sh
 cargo publish --locked -p anvil-api
-cargo info anvil-api@0.8.0
+cargo info anvil-api@0.8.1
 
 cargo publish --locked -p anvil-storage
-cargo info anvil-storage@0.8.0
+cargo info anvil-storage@0.8.1
 ```
 
-Do not publish `anvil-storage` until `cargo info anvil-api@0.8.0` resolves from
+Do not publish `anvil-storage` until `cargo info anvil-api@0.8.1` resolves from
 crates.io. After both commands succeed, run both `cargo info` checks again and
-confirm that each reports version `0.8.0` from crates.io.
+confirm that each reports version `0.8.1` from crates.io.
 
 Use Cargo's shared target directory and locking. Do not create ad-hoc target
 directories unless the task explicitly requires isolation.
