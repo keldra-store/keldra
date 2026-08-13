@@ -96,13 +96,31 @@ deterministic key ranges, progress and terminal events report
 `anvil_index_compaction_effective_lanes` as the minimum of configured lanes,
 workers, budget-admitted lanes, and `anvil_index_compaction_range_limit`. They
 also report active and waiting lanes, ranges total and completed, selected
-input runs/records/bytes, actual input records/read bytes/blocks, output
-records/bytes/blocks, elapsed time, last-progress age, attempts, failures, and
-duration. The corresponding cumulative `*_total` instruments make records,
-bytes, blocks, and completed-range rates directly queryable with the metrics
-backend's rate function. Input/output ratios are not published as a progress
-percentage because compaction can discard superseded records and change the
-encoded byte count.
+input runs/mutations/bytes, input component rows/read bytes/blocks, output
+component rows/bytes/blocks, elapsed time, last-progress age, attempts,
+failures, and duration. A selected input mutation is one mutation recorded by an input run;
+it is not necessarily a unique live object. An input component row is one row
+decoded at a path, document, typed-key, posting, vector, projection, or spill
+component boundary. Re-decoding a block counts its rows again, so this is a CPU
+and decoding-work measure and may legitimately be orders of magnitude larger
+than the selected mutation count. Output component rows similarly count rows
+emitted by canonical component writers, not unique source objects. The
+canonical instruments use
+`selected_input_mutations` and `input_component_rows` in their names. The 0.8.1
+`selected_input_records` gauge and terminal `input_records` histogram remain
+aliases for selected mutations; `input_records_total` and
+`current_input_records` remain aliases for decoded component rows. Likewise,
+the legacy `compaction.input_records` and
+`compaction.actual_input_records` span fields mean selected mutations and
+decoded component rows, respectively. The corresponding cumulative `*_total`
+instruments make component-row, byte, block, and completed-range rates directly
+queryable with the metrics backend's rate function. Input/output ratios are not
+published as a progress percentage because compaction can discard superseded
+records and change the encoded byte count.
+
+Projection `rayon_queue_seconds` is aggregate worker queue time summed across
+the finite projection units in one wave. Parallel waits can therefore make it
+larger than wall-clock duration; it is a saturation signal, not elapsed time.
 
 Rebuild and catch-up expose overlap-safe active counters, cumulative
 records/bytes and frames/pages, elapsed and last-progress-age gauges, terminal
@@ -125,13 +143,24 @@ carry stable numeric identifiers and detailed terminal snapshots; identifiers
 never become metric attributes. Artifact reads remain asynchronous, while
 decoded-page construction, filtering, ranking, bounded top-k maintenance, and
 response-page serialization execute on the process-owned index CPU pool.
+`anvil_index_query_returned_hits` is emitted only for a completed response
+page. A failed, timed-out, or otherwise cancelled query has no returned page,
+so its hit count remains unknown rather than being recorded as zero; its read
+work and terminal outcome are still emitted.
 
-The serving fence reports renewal attempts and failures, renewal duration and
-Tokio scheduling lateness, remaining lease margin, current validity, missed
-deadlines, placement progress, and the overlap-safe
+The serving fence reports renewal attempts, successful renewals, and failed
+attempts separately, plus renewal duration and Tokio scheduling lateness,
+remaining lease margin, current validity, missed deadlines, placement progress,
+and the overlap-safe
 `anvil_control_plane_tasks_active` count. `anvil.serving_fence.renewal` spans
 carry the placement term/index and leader node for diagnosis; the metric series
-uses only closed operation and outcome labels.
+uses only closed operation and outcome labels. A failed attempt while the
+previous grant remains valid is an informational
+`renewal_failed_lease_valid` outcome; only the absence of a valid fence is
+warned as `fence_unavailable`. The missed-deadline counter increments once when
+an unavailable transition is observed between renewal attempts. The legacy
+`anvil_serving_fence_renewals_total` remains an alias for attempts; use
+`anvil_serving_fence_renewal_successes_total` for successful grants.
 
 A ten-second runtime sampler exports process RSS/virtual memory/thread count,
 cgroup current/limit/peak memory and pressure/OOM events, and RocksDB block

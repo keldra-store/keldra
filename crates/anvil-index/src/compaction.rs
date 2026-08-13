@@ -351,9 +351,15 @@ struct ProgressCounters {
 pub struct CompactionProgressSnapshot {
     pub ranges_total: u64,
     pub ranges_completed: u64,
+    /// Decoded rows visited at engine-component boundaries. This includes
+    /// path, document, typed-key, posting, vector, projection, and temporary
+    /// spill rows; decoding the same block again counts its rows again. It is
+    /// compaction work, not a count of unique source objects or mutations.
     pub input_records: u64,
     pub input_bytes: u64,
     pub input_blocks: u64,
+    /// Component rows emitted by canonical writers. This is encoded index
+    /// work, not a count of unique source objects.
     pub output_records: u64,
     pub output_bytes: u64,
     pub output_blocks: u64,
@@ -374,6 +380,10 @@ pub struct CompactionProgressSnapshot {
 
 impl CompactionProgress {
     /// Add actual input work observed by an engine cursor or directory wrapper.
+    ///
+    /// `records` counts decoded component rows, including rows decoded again
+    /// after a cache miss or spill reread. It intentionally measures work and
+    /// must not be interpreted as unique source objects or selected mutations.
     pub fn record_input(&self, records: u64, bytes: u64, blocks: u64) {
         self.inner
             .input_records
@@ -383,8 +393,9 @@ impl CompactionProgress {
     }
 
     /// Add output work after it has been accepted by the canonical writer or
-    /// durably staged by the runtime. Engine code records rows; storage code
-    /// records encoded bytes and blocks so neither layer double-counts.
+    /// durably staged by the runtime. `records` counts emitted component rows;
+    /// storage code records encoded bytes and blocks so neither layer
+    /// double-counts.
     pub fn record_output(&self, records: u64, bytes: u64, blocks: u64) {
         self.inner
             .output_records

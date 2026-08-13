@@ -184,14 +184,13 @@ async fn renewal_loop(
 ) {
     let mut interval = tokio::time::interval(SERVING_LEASE_RENEW_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut ever_held_lease = false;
+    let mut availability = FenceAvailabilityTracker::default();
     let mut previous_placement = None;
     loop {
         let scheduled = interval.tick().await;
         let started = tokio::time::Instant::now();
         let lateness = started.saturating_duration_since(scheduled);
         let lease_was_valid = authority.has_valid_lease();
-        let missed_deadline = ever_held_lease && !lease_was_valid;
         let span = tracing::info_span!(
             "anvil.serving_fence.renewal",
             operation = "serving_fence_renewal",
@@ -218,7 +217,7 @@ async fn renewal_loop(
         span.record("fence.elapsed_seconds", elapsed.as_secs_f64());
         match result {
             Ok(observation) => {
-                ever_held_lease = true;
+                let missed_deadline = availability.observe(lease_was_valid, true);
                 span.record("fence.outcome", "renewed");
                 span.record("fence.placement_term", observation.placement.term);
                 span.record("fence.placement_index", observation.placement.index);
@@ -234,8 +233,10 @@ async fn renewal_loop(
                     tracing::info!(
                         operation = "serving_fence_renewal",
                         fence.outcome = "renewed",
+                        monotonic_counter.anvil_serving_fence_renewal_attempts_total = 1_u64,
+                        monotonic_counter.anvil_serving_fence_renewal_successes_total = 1_u64,
+                        // Compatibility alias: in 0.8.1 this counted attempts.
                         monotonic_counter.anvil_serving_fence_renewals_total = 1_u64,
-                        monotonic_counter.anvil_serving_fence_failures_total = 0_u64,
                         monotonic_counter.anvil_serving_fence_missed_deadlines_total =
                             u64::from(missed_deadline),
                         monotonic_counter.anvil_serving_fence_membership_progress_total =
@@ -256,20 +257,29 @@ async fn renewal_loop(
             }
             Err(error) => {
                 let lease_margin = authority.lease_margin();
-                span.record("fence.outcome", "failed");
+                let lease_remains_valid = lease_margin.is_some();
+                let missed_deadline = availability.observe(lease_was_valid, lease_remains_valid);
+                let outcome = if lease_remains_valid {
+                    "renewal_failed_lease_valid"
+                } else {
+                    "fence_unavailable"
+                };
+                span.record("fence.outcome", outcome);
                 if let Some(lease_margin) = lease_margin {
                     span.record("fence.lease_margin_seconds", lease_margin.as_secs_f64());
                 }
                 span.record("otel.status_code", "error");
                 span.in_scope(|| {
-                    tracing::warn!(
+                    tracing::info!(
                         operation = "serving_fence_renewal",
-                        fence.outcome = "failed",
+                        fence.outcome = outcome,
+                        monotonic_counter.anvil_serving_fence_renewal_attempts_total = 1_u64,
+                        // Compatibility alias: in 0.8.1 this counted attempts.
                         monotonic_counter.anvil_serving_fence_renewals_total = 1_u64,
                         monotonic_counter.anvil_serving_fence_failures_total = 1_u64,
                         monotonic_counter.anvil_serving_fence_missed_deadlines_total =
                             u64::from(missed_deadline),
-                        gauge.anvil_serving_fence_valid = u64::from(authority.has_valid_lease()),
+                        gauge.anvil_serving_fence_valid = u64::from(lease_remains_valid),
                         histogram.anvil_serving_fence_renewal_duration_seconds =
                             elapsed.as_secs_f64(),
                         histogram.anvil_serving_fence_renewal_lateness_seconds =
@@ -277,8 +287,16 @@ async fn renewal_loop(
                         histogram.anvil_serving_fence_lease_margin_seconds =
                             lease_margin.unwrap_or(Duration::ZERO).as_secs_f64(),
                         %error,
-                        "serving-fence renewal did not produce a grant"
+                        "serving-fence renewal attempt failed"
                     );
+                    if !lease_remains_valid {
+                        tracing::warn!(
+                            operation = "serving_fence_renewal",
+                            fence.outcome = outcome,
+                            %error,
+                            "serving-fence renewal failed and no valid grant remains"
+                        );
+                    }
                 });
             }
         }
@@ -289,6 +307,27 @@ async fn renewal_loop(
                 "serving-fence renewal released"
             );
         });
+    }
+}
+
+/// Tracks transitions into an unavailable serving-fence state. A failed
+/// renewal while the previous grant is still live is an attempt failure, not a
+/// missed serving deadline. Repeated attempts while already unavailable do not
+/// count the same lease loss more than once.
+#[derive(Debug, Default)]
+struct FenceAvailabilityTracker {
+    ever_held_lease: bool,
+    valid_after_last_attempt: bool,
+}
+
+impl FenceAvailabilityTracker {
+    fn observe(&mut self, valid_before_attempt: bool, valid_after_attempt: bool) -> bool {
+        let missed_deadline = self.ever_held_lease
+            && self.valid_after_last_attempt
+            && (!valid_before_attempt || !valid_after_attempt);
+        self.ever_held_lease |= valid_after_attempt;
+        self.valid_after_last_attempt = valid_after_attempt;
+        missed_deadline
     }
 }
 
@@ -418,6 +457,19 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn renewal_attempt_failure_is_distinct_from_serving_fence_loss() {
+        let mut availability = FenceAvailabilityTracker::default();
+
+        assert!(!availability.observe(false, true));
+        assert!(!availability.observe(true, true));
+        assert!(availability.observe(true, false));
+        assert!(!availability.observe(false, false));
+        assert!(!availability.observe(false, true));
+        assert!(!availability.observe(true, true));
+        assert!(availability.observe(false, true));
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn public_authority_fails_closed_and_tracks_exact_placement() {

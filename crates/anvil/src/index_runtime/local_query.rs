@@ -259,9 +259,7 @@ impl QueryActiveGuard {
     }
 
     fn finish(&mut self, result: &Result<ExecutedIndexQuery, Status>) {
-        let returned = result
-            .as_ref()
-            .map_or(0_u64, |executed| executed.hits.len() as u64);
+        let returned = completed_returned_hits(result);
         self.emit_terminal(
             if result.is_err() {
                 "failed"
@@ -275,14 +273,22 @@ impl QueryActiveGuard {
         self.finished = true;
     }
 
-    fn emit_terminal(&self, outcome: &'static str, returned: u64, failed: bool, cancelled: bool) {
+    fn emit_terminal(
+        &self,
+        outcome: &'static str,
+        returned: Option<u64>,
+        failed: bool,
+        cancelled: bool,
+    ) {
         let elapsed_seconds = self.started.elapsed().as_secs_f64();
         let snapshot = self.observer.snapshot();
         self.span.record("query.read_ops", snapshot.reads);
         self.span.record("query.read_bytes", snapshot.bytes);
         self.span
             .record("query.cooperative_yields", snapshot.cooperative_yields);
-        self.span.record("query.returned_hits", returned);
+        if let Some(returned) = returned {
+            self.span.record("query.returned_hits", returned);
+        }
         self.span.record("query.elapsed_seconds", elapsed_seconds);
         self.span.record("query.outcome", outcome);
         self.span
@@ -293,29 +299,56 @@ impl QueryActiveGuard {
                 .saturating_add(u64::from(snapshot.partial_quantum_bytes != 0));
             let bytes_per_quantum = snapshot.bytes as f64 / observed_quanta.max(1) as f64;
             self.span.in_scope(|| {
-                tracing::info!(
-                    index.kind = ?kind,
-                    query.outcome = outcome,
-                    monotonic_counter.anvil_index_query_read_ops_total = snapshot.reads,
-                    monotonic_counter.anvil_index_query_read_bytes_total = snapshot.bytes,
-                    monotonic_counter.anvil_index_query_cooperative_yields_total =
-                        snapshot.cooperative_yields,
-                    monotonic_counter.anvil_index_query_failures_total = u64::from(failed),
-                    monotonic_counter.anvil_index_query_cancellations_total = u64::from(cancelled),
-                    histogram.anvil_index_query_duration_seconds = elapsed_seconds,
-                    histogram.anvil_index_query_returned_hits = returned,
-                    histogram.anvil_index_query_read_quantum_bytes = bytes_per_quantum,
-                    "local index query reached a terminal outcome"
-                );
+                // A dropped or failed query did not return a response page. Do
+                // not turn that unknown count into a misleading zero sample.
+                if let Some(returned) = returned {
+                    tracing::info!(
+                        index.kind = ?kind,
+                        query.outcome = outcome,
+                        monotonic_counter.anvil_index_query_read_ops_total = snapshot.reads,
+                        monotonic_counter.anvil_index_query_read_bytes_total = snapshot.bytes,
+                        monotonic_counter.anvil_index_query_cooperative_yields_total =
+                            snapshot.cooperative_yields,
+                        monotonic_counter.anvil_index_query_failures_total = u64::from(failed),
+                        monotonic_counter.anvil_index_query_cancellations_total =
+                            u64::from(cancelled),
+                        histogram.anvil_index_query_duration_seconds = elapsed_seconds,
+                        histogram.anvil_index_query_returned_hits = returned,
+                        histogram.anvil_index_query_read_quantum_bytes = bytes_per_quantum,
+                        "local index query reached a terminal outcome"
+                    );
+                } else {
+                    tracing::info!(
+                        index.kind = ?kind,
+                        query.outcome = outcome,
+                        monotonic_counter.anvil_index_query_read_ops_total = snapshot.reads,
+                        monotonic_counter.anvil_index_query_read_bytes_total = snapshot.bytes,
+                        monotonic_counter.anvil_index_query_cooperative_yields_total =
+                            snapshot.cooperative_yields,
+                        monotonic_counter.anvil_index_query_failures_total = u64::from(failed),
+                        monotonic_counter.anvil_index_query_cancellations_total =
+                            u64::from(cancelled),
+                        histogram.anvil_index_query_duration_seconds = elapsed_seconds,
+                        histogram.anvil_index_query_read_quantum_bytes = bytes_per_quantum,
+                        "local index query reached a terminal outcome"
+                    );
+                }
             });
         }
     }
 }
 
+fn completed_returned_hits(result: &Result<ExecutedIndexQuery, Status>) -> Option<u64> {
+    result
+        .as_ref()
+        .ok()
+        .map(|executed| executed.hits.len() as u64)
+}
+
 impl Drop for QueryActiveGuard {
     fn drop(&mut self) {
         if !self.finished {
-            self.emit_terminal("cancelled", 0, true, true);
+            self.emit_terminal("cancelled", None, true, true);
         }
         if let Some(kind) = self.kind {
             self.span.in_scope(|| {
@@ -1017,5 +1050,18 @@ mod tests {
         assert_eq!(snapshot.reads, 2);
         assert_eq!(snapshot.bytes, 14);
         assert_eq!(snapshot.cooperative_yields, 1);
+    }
+
+    #[test]
+    fn returned_hit_telemetry_exists_only_for_a_completed_response_page() {
+        let completed = Ok(ExecutedIndexQuery {
+            hits: vec![IndexQueryHit::default(), IndexQueryHit::default()],
+            freshness: empty_freshness(7, 1, None),
+            next_position: None,
+        });
+        assert_eq!(completed_returned_hits(&completed), Some(2));
+
+        let failed = Err(Status::deadline_exceeded("query timed out"));
+        assert_eq!(completed_returned_hits(&failed), None);
     }
 }

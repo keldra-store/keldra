@@ -527,6 +527,8 @@ impl CompactionTelemetry {
             compaction.input_level = input_level,
             compaction.output_level = output_level,
             compaction.input_runs = input.runs,
+            compaction.selected_input_mutations = input.records,
+            // Compatibility alias retained for 0.8.x trace consumers.
             compaction.input_records = input.records,
             compaction.input_bytes = input.bytes,
             compaction.configured_lanes = parallelism.configured_lanes(),
@@ -536,9 +538,13 @@ impl CompactionTelemetry {
             compaction.ranges_total = tracing::field::Empty,
             compaction.ranges_completed = tracing::field::Empty,
             compaction.peak_active_lanes = tracing::field::Empty,
+            compaction.input_component_rows = tracing::field::Empty,
+            // Compatibility alias retained for 0.8.x trace consumers.
             compaction.actual_input_records = tracing::field::Empty,
             compaction.actual_input_bytes = tracing::field::Empty,
             compaction.input_blocks = tracing::field::Empty,
+            compaction.output_component_rows = tracing::field::Empty,
+            // Compatibility alias retained for 0.8.x trace consumers.
             compaction.output_records = tracing::field::Empty,
             compaction.output_bytes = tracing::field::Empty,
             compaction.output_blocks = tracing::field::Empty,
@@ -585,6 +591,8 @@ impl CompactionTelemetry {
                 gauge.anvil_index_compaction_input_level = u64::from(input_level),
                 gauge.anvil_index_compaction_output_level = u64::from(output_level),
                 gauge.anvil_index_compaction_selected_input_runs = input.runs,
+                gauge.anvil_index_compaction_selected_input_mutations = input.records,
+                // Compatibility alias retained for existing dashboards.
                 gauge.anvil_index_compaction_selected_input_records = input.records,
                 gauge.anvil_index_compaction_selected_input_bytes = input.bytes,
                 gauge.anvil_index_compaction_elapsed_seconds = 0_f64,
@@ -648,9 +656,13 @@ impl CompactionTelemetry {
                 tracing::info!(
                     ranges.total = emission.snapshot.ranges_total,
                     ranges.completed = emission.snapshot.ranges_completed,
+                    input.component_rows = emission.snapshot.input_records,
+                    // Compatibility alias retained for structured-log consumers.
                     input.records = emission.snapshot.input_records,
                     input.bytes = emission.snapshot.input_bytes,
                     input.blocks = emission.snapshot.input_blocks,
+                    output.component_rows = emission.snapshot.output_records,
+                    // Compatibility alias retained for structured-log consumers.
                     output.records = emission.snapshot.output_records,
                     output.bytes = emission.snapshot.output_bytes,
                     output.blocks = emission.snapshot.output_blocks,
@@ -694,6 +706,10 @@ impl CompactionTelemetry {
             emission.snapshot.peak_active_lanes,
         );
         span.record(
+            "compaction.input_component_rows",
+            emission.snapshot.input_records,
+        );
+        span.record(
             "compaction.actual_input_records",
             emission.snapshot.input_records,
         );
@@ -702,6 +718,10 @@ impl CompactionTelemetry {
             emission.snapshot.input_bytes,
         );
         span.record("compaction.input_blocks", emission.snapshot.input_blocks);
+        span.record(
+            "compaction.output_component_rows",
+            emission.snapshot.output_records,
+        );
         span.record(
             "compaction.output_records",
             emission.snapshot.output_records,
@@ -737,12 +757,18 @@ impl CompactionTelemetry {
                 index.kind = ?self.identity.kind,
                 monotonic_counter.anvil_index_compaction_ranges_completed_total =
                     emission.delta.ranges_completed,
+                monotonic_counter.anvil_index_compaction_input_component_rows_total =
+                    emission.delta.input_records,
+                // Compatibility alias retained for existing dashboards.
                 monotonic_counter.anvil_index_compaction_input_records_total =
                     emission.delta.input_records,
                 monotonic_counter.anvil_index_compaction_input_read_bytes_total =
                     emission.delta.input_bytes,
                 monotonic_counter.anvil_index_compaction_input_blocks_total =
                     emission.delta.input_blocks,
+                monotonic_counter.anvil_index_compaction_output_component_rows_total =
+                    emission.delta.output_records,
+                // Compatibility alias retained for existing dashboards.
                 monotonic_counter.anvil_index_compaction_output_records_total =
                     emission.delta.output_records,
                 monotonic_counter.anvil_index_compaction_output_bytes_total =
@@ -762,9 +788,15 @@ impl CompactionTelemetry {
                 gauge.anvil_index_compaction_peak_active_lanes =
                     emission.snapshot.peak_active_lanes,
                 gauge.anvil_index_compaction_waiting_lanes = emission.snapshot.waiting_lanes,
+                gauge.anvil_index_compaction_current_input_component_rows =
+                    emission.snapshot.input_records,
+                // Compatibility alias retained for existing dashboards.
                 gauge.anvil_index_compaction_current_input_records = emission.snapshot.input_records,
                 gauge.anvil_index_compaction_current_input_read_bytes = emission.snapshot.input_bytes,
                 gauge.anvil_index_compaction_current_input_blocks = emission.snapshot.input_blocks,
+                gauge.anvil_index_compaction_current_output_component_rows =
+                    emission.snapshot.output_records,
+                // Compatibility alias retained for existing dashboards.
                 gauge.anvil_index_compaction_current_output_records = emission.snapshot.output_records,
                 gauge.anvil_index_compaction_current_output_bytes = emission.snapshot.output_bytes,
                 gauge.anvil_index_compaction_current_output_blocks = emission.snapshot.output_blocks,
@@ -813,12 +845,18 @@ impl CompactionTelemetry {
             index.kind = ?self.identity.kind,
             monotonic_counter.anvil_index_compaction_ranges_completed_total =
                 emission.delta.ranges_completed,
+            monotonic_counter.anvil_index_compaction_input_component_rows_total =
+                emission.delta.input_records,
+            // Compatibility alias retained for existing dashboards.
             monotonic_counter.anvil_index_compaction_input_records_total =
                 emission.delta.input_records,
             monotonic_counter.anvil_index_compaction_input_read_bytes_total =
                 emission.delta.input_bytes,
             monotonic_counter.anvil_index_compaction_input_blocks_total =
                 emission.delta.input_blocks,
+            monotonic_counter.anvil_index_compaction_output_component_rows_total =
+                emission.delta.output_records,
+            // Compatibility alias retained for existing dashboards.
             monotonic_counter.anvil_index_compaction_output_records_total =
                 emission.delta.output_records,
             monotonic_counter.anvil_index_compaction_output_bytes_total =
@@ -841,9 +879,15 @@ impl CompactionTelemetry {
             gauge.anvil_index_compaction_waiting_lanes = 0_u64,
             gauge.anvil_index_compaction_ranges_total = emission.snapshot.ranges_total,
             gauge.anvil_index_compaction_ranges_completed = emission.snapshot.ranges_completed,
+            gauge.anvil_index_compaction_current_input_component_rows =
+                emission.snapshot.input_records,
+            // Compatibility alias retained for existing dashboards.
             gauge.anvil_index_compaction_current_input_records = emission.snapshot.input_records,
             gauge.anvil_index_compaction_current_input_read_bytes = emission.snapshot.input_bytes,
             gauge.anvil_index_compaction_current_input_blocks = emission.snapshot.input_blocks,
+            gauge.anvil_index_compaction_current_output_component_rows =
+                emission.snapshot.output_records,
+            // Compatibility alias retained for existing dashboards.
             gauge.anvil_index_compaction_current_output_records = emission.snapshot.output_records,
             gauge.anvil_index_compaction_current_output_bytes = emission.snapshot.output_bytes,
             gauge.anvil_index_compaction_current_output_blocks = emission.snapshot.output_blocks,
@@ -854,8 +898,12 @@ impl CompactionTelemetry {
             gauge.anvil_index_compaction_elapsed_seconds = emission.elapsed_seconds,
             gauge.anvil_index_compaction_last_progress_age_seconds =
                 emission.last_progress_age_seconds,
+            histogram.anvil_index_compaction_selected_input_mutations = self.input.records,
+            // Compatibility alias retained for existing dashboards.
             histogram.anvil_index_compaction_input_records = self.input.records,
             histogram.anvil_index_compaction_input_bytes = self.input.bytes,
+            histogram.anvil_index_compaction_output_component_rows = emission.snapshot.output_records,
+            // Compatibility alias retained for existing dashboards.
             histogram.anvil_index_compaction_output_records = emission.snapshot.output_records,
             histogram.anvil_index_compaction_output_bytes = emission.snapshot.output_bytes,
             histogram.anvil_index_compaction_output_blocks = emission.snapshot.output_blocks,
