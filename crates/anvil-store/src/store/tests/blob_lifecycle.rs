@@ -444,6 +444,57 @@ async fn gc_uses_awaiting_inactivity_and_removes_untracked_crash_files() {
 }
 
 #[tokio::test]
+async fn startup_reconciles_only_recognised_abandoned_upload_staging_files() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = Store::open(StoreOptions::new(temporary.path(), 1))
+        .await
+        .unwrap();
+    let staging = store.blobs.root().join(".staging");
+    std::fs::create_dir_all(&staging).unwrap();
+    let legacy = staging.join("upload-1-1.tmp");
+    let current = staging.join(format!("upload-1-{}-1.tmp", "ab".repeat(16)));
+    let shard_identity = hex::encode(
+        ShardIdentity::new(
+            BlobRef {
+                hash: [0x7a; 32],
+                length: 100_000,
+            },
+            0,
+        )
+        .encode(),
+    );
+    let legacy_shard = staging.join(format!("shard-1-1-{shard_identity}.tmp"));
+    let current_shard = staging.join(format!(
+        "shard-1-{}-1-{shard_identity}.tmp",
+        "cd".repeat(16)
+    ));
+    let malformed_shard = staging.join("shard-1-1-deadbeef.tmp");
+    let unknown = staging.join("crash-orphan.tmp");
+    for path in [
+        &legacy,
+        &current,
+        &legacy_shard,
+        &current_shard,
+        &malformed_shard,
+        &unknown,
+    ] {
+        std::fs::write(path, b"abandoned staging bytes").unwrap();
+    }
+    drop(store);
+
+    let _reopened = Store::open(StoreOptions::new(temporary.path(), 1))
+        .await
+        .unwrap();
+
+    assert!(!legacy.exists());
+    assert!(!current.exists());
+    assert!(!legacy_shard.exists());
+    assert!(!current_shard.exists());
+    assert!(malformed_shard.exists());
+    assert!(unknown.exists());
+}
+
+#[tokio::test]
 async fn identical_seals_share_one_reservation_and_zero_count_content_can_be_reused() {
     let temporary = tempfile::tempdir().unwrap();
     let store =

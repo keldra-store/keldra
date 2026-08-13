@@ -10,6 +10,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 static NEXT_UPLOAD_ID: AtomicU64 = AtomicU64::new(1);
 const VERIFY_BUFFER_BYTES: usize = 64 * 1024;
+const UPLOAD_BOOT_NONCE_BYTES: usize = 16;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobRef {
@@ -36,6 +37,7 @@ pub const AWAITING_PUBLISH: u8 = 1;
 pub struct BlobStore {
     root: PathBuf,
     pub(crate) directory_lock: Arc<tokio::sync::Mutex<()>>,
+    upload_boot_nonce: [u8; UPLOAD_BOOT_NONCE_BYTES],
 }
 
 pub struct BlobUpload {
@@ -68,6 +70,9 @@ enum BlobReaderSource {
 impl BlobStore {
     pub async fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
+        let mut upload_boot_nonce = [0_u8; UPLOAD_BOOT_NONCE_BYTES];
+        getrandom::fill(&mut upload_boot_nonce)
+            .map_err(|error| anyhow::anyhow!("generate blob upload boot nonce: {error}"))?;
         create_directory_all_durable(&root).await?;
         // Also fences a root or hash-prefix entry left visible but not
         // parent-synchronised by an older process before this store starts
@@ -77,6 +82,7 @@ impl BlobStore {
         Ok(Self {
             root,
             directory_lock: Arc::new(tokio::sync::Mutex::new(())),
+            upload_boot_nonce,
         })
     }
 
@@ -89,10 +95,10 @@ impl BlobStore {
     pub async fn begin_upload(&self) -> Result<BlobUpload> {
         let staging = self.root.join(".staging");
         tokio::fs::create_dir_all(&staging).await?;
-        let temporary = staging.join(format!(
-            "upload-{}-{}.tmp",
+        let temporary = staging.join(upload_staging_name(
             std::process::id(),
-            NEXT_UPLOAD_ID.fetch_add(1, Ordering::Relaxed)
+            &self.upload_boot_nonce,
+            NEXT_UPLOAD_ID.fetch_add(1, Ordering::Relaxed),
         ));
         let file = tokio::fs::OpenOptions::new()
             .create_new(true)
@@ -108,6 +114,46 @@ impl BlobStore {
             hasher: blake3::Hasher::new(),
             length: 0,
         })
+    }
+
+    /// Removes uploads and shards abandoned by an earlier process before this
+    /// store begins accepting work.
+    ///
+    /// [`crate::Store`] calls this while its RocksDB lock gives the process
+    /// exclusive ownership of the data root. Unrecognised or malformed staging
+    /// entries remain subject to their existing age-gated GC.
+    pub(crate) async fn reconcile_abandoned_staging(&self) -> Result<u64> {
+        let staging = self.root.join(".staging");
+        let mut entries = match tokio::fs::read_dir(&staging).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error.into()),
+        };
+        let mut removed = 0_u64;
+        while let Some(entry) = entries.next_entry().await? {
+            if !entry.file_type().await?.is_file() {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if !is_upload_staging_name(name) && !is_shard_staging_name(name) {
+                continue;
+            }
+            tokio::fs::remove_file(entry.path()).await?;
+            removed = removed
+                .checked_add(1)
+                .context("abandoned staging-file count overflow")?;
+        }
+        if removed != 0 {
+            sync_directory(&staging).await?;
+        }
+        Ok(removed)
+    }
+
+    pub(crate) fn upload_boot_nonce(&self) -> &[u8] {
+        &self.upload_boot_nonce
     }
 
     pub async fn get(&self, reference: &BlobRef) -> Result<Vec<u8>> {
@@ -167,6 +213,75 @@ impl BlobStore {
         let encoded = hex::encode(hash);
         self.root.join(&encoded[..2]).join(encoded)
     }
+}
+
+fn upload_staging_name(
+    process_id: u32,
+    boot_nonce: &[u8; UPLOAD_BOOT_NONCE_BYTES],
+    upload_id: u64,
+) -> String {
+    format!(
+        "upload-{process_id}-{}-{upload_id}.tmp",
+        hex::encode(boot_nonce)
+    )
+}
+
+fn is_upload_staging_name(name: &str) -> bool {
+    let Some(body) = name
+        .strip_prefix("upload-")
+        .and_then(|name| name.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let fields = body.split('-').collect::<Vec<_>>();
+    match fields.as_slice() {
+        // 0.8.1 and earlier used only the process and in-process counter.
+        [process_id, upload_id] => {
+            process_id.parse::<u32>().is_ok() && upload_id.parse::<u64>().is_ok()
+        }
+        [process_id, nonce, upload_id] => {
+            process_id.parse::<u32>().is_ok()
+                && nonce.len() == UPLOAD_BOOT_NONCE_BYTES * 2
+                && is_lower_hex(nonce)
+                && upload_id.parse::<u64>().is_ok()
+        }
+        _ => false,
+    }
+}
+
+fn is_shard_staging_name(name: &str) -> bool {
+    const SHARD_IDENTITY_HEX_BYTES: usize = (2 + 32 + 8 + 2) * 2;
+    let Some(body) = name
+        .strip_prefix("shard-")
+        .and_then(|name| name.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let fields = body.split('-').collect::<Vec<_>>();
+    let valid_identity =
+        |identity: &str| identity.len() == SHARD_IDENTITY_HEX_BYTES && is_lower_hex(identity);
+    match fields.as_slice() {
+        // 0.8.1 and earlier used only the process and in-process counter.
+        [process_id, upload_id, identity] => {
+            process_id.parse::<u32>().is_ok()
+                && upload_id.parse::<u64>().is_ok()
+                && valid_identity(identity)
+        }
+        [process_id, nonce, upload_id, identity] => {
+            process_id.parse::<u32>().is_ok()
+                && nonce.len() == UPLOAD_BOOT_NONCE_BYTES * 2
+                && is_lower_hex(nonce)
+                && upload_id.parse::<u64>().is_ok()
+                && valid_identity(identity)
+        }
+        _ => false,
+    }
+}
+
+fn is_lower_hex(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn parent_directory(path: &Path) -> Result<&Path> {
@@ -410,6 +525,34 @@ mod tests {
         assert!(root.join(&encoded[..2]).is_dir());
         assert!(root.join(&encoded[..2]).join(encoded).is_file());
         assert_eq!(store.get(&reference).await.unwrap(), bytes);
+    }
+
+    #[test]
+    fn upload_staging_names_are_unique_across_process_boots() {
+        let first = upload_staging_name(1, &[0x11; UPLOAD_BOOT_NONCE_BYTES], 1);
+        let second = upload_staging_name(1, &[0x22; UPLOAD_BOOT_NONCE_BYTES], 1);
+
+        assert_ne!(first, second);
+        assert!(is_upload_staging_name(&first));
+        assert!(is_upload_staging_name(&second));
+        assert!(is_upload_staging_name("upload-1-1.tmp"));
+        assert!(!is_upload_staging_name("upload-1-invalid-1.tmp"));
+        assert!(!is_upload_staging_name("shard-1-1-deadbeef.tmp"));
+    }
+
+    #[test]
+    fn shard_staging_name_recognises_legacy_and_boot_nonce_formats() {
+        let identity = "ab".repeat(2 + 32 + 8 + 2);
+
+        assert!(is_shard_staging_name(&format!("shard-1-1-{identity}.tmp")));
+        assert!(is_shard_staging_name(&format!(
+            "shard-1-{}-1-{identity}.tmp",
+            "cd".repeat(UPLOAD_BOOT_NONCE_BYTES)
+        )));
+        assert!(!is_shard_staging_name("shard-1-1-deadbeef.tmp"));
+        assert!(!is_shard_staging_name(&format!(
+            "shard-1-invalid-1-{identity}.tmp"
+        )));
     }
 
     #[tokio::test]

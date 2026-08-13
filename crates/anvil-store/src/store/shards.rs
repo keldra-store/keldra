@@ -176,8 +176,9 @@ impl Store {
             .await
             .map_err(shard_storage_error)?;
         let temporary = staging.join(format!(
-            "shard-{}-{}-{}.tmp",
+            "shard-{}-{}-{}-{}.tmp",
             std::process::id(),
+            hex::encode(self.blobs.upload_boot_nonce()),
             NEXT_SHARD_UPLOAD_ID.fetch_add(1, Ordering::Relaxed),
             hex::encode(identity.encode())
         ));
@@ -213,8 +214,9 @@ impl Store {
             .await
             .map_err(shard_storage_error)?;
         let temporary = staging.join(format!(
-            "shard-{}-{}-{}.tmp",
+            "shard-{}-{}-{}-{}.tmp",
             std::process::id(),
+            hex::encode(self.blobs.upload_boot_nonce()),
             NEXT_SHARD_UPLOAD_ID.fetch_add(1, Ordering::Relaxed),
             hex::encode(identity.encode())
         ));

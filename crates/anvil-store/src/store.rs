@@ -831,10 +831,18 @@ impl Store {
             initialize_local_watch_metadata(&db, metadata_cf, options.sync_writes)?;
         initialize_mutation_receipt_metadata(&db, metadata_cf, options.sync_writes)?;
         let db = Arc::new(db);
+        let blobs = BlobStore::open(options.root.join("blobs")).await?;
+        let abandoned_staging_files = blobs.reconcile_abandoned_staging().await?;
+        if abandoned_staging_files != 0 {
+            tracing::info!(
+                abandoned_staging_files,
+                "removed abandoned blob and shard staging files during startup"
+            );
+        }
         let store = Self {
             db,
             _metadata_memory: metadata_memory,
-            blobs: BlobStore::open(options.root.join("blobs")).await?,
+            blobs,
             clock: Arc::new(VersionClock::with_high_watermark(
                 options.node_id,
                 high_watermark,
