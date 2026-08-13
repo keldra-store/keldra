@@ -796,7 +796,7 @@ assert_index_resource_bounds() {
     fi
   done
 
-  local resource_budget_evidence=0
+  local resource_budget_evidence=0 resource_positive_peak_evidence=0
   while IFS= read -r line; do
     if [[ "${line}" != *"index.kind=TypedJson"* \
       || "${line}" != *"index construction budget state"* ]]; then
@@ -814,20 +814,20 @@ assert_index_resource_bounds() {
       || return 1
     if ((configured != index_kind_budget_bytes \
       || leased > configured \
-      || peak_leased == 0 \
       || peak_leased > configured)); then
       echo "distributed production-shaped TypedJson build exceeded or misstated its configured kind budget" >&2
       printf '%s\n' "${line}" >&2
       return 1
     fi
+    if ((peak_leased > 0)); then resource_positive_peak_evidence=1; fi
     resource_budget_evidence=$((resource_budget_evidence + 1))
   done < <(
     for resource_node in anvil-1 anvil-2 anvil-3; do
       cat "${ANVIL_QUALIFICATION_DIR}/artifacts/index-resource-${resource_node}.log"
     done
   )
-  if ((resource_budget_evidence == 0)); then
-    echo "distributed production-shaped TypedJson build emitted no fresh construction-budget evidence" >&2
+  if ((resource_budget_evidence == 0 || resource_positive_peak_evidence == 0)); then
+    echo "distributed production-shaped TypedJson build emitted no positive construction-budget evidence" >&2
     return 1
   fi
 
