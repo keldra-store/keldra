@@ -12,6 +12,7 @@ index_memory_percent="${ANVIL_QUALIFICATION_INDEX_MEMORY_PERCENT:-20}"
 index_kind_budget_bytes="${ANVIL_QUALIFICATION_INDEX_KIND_BUDGET_BYTES:-268435456}"
 index_compaction_max_lanes="${ANVIL_QUALIFICATION_INDEX_COMPACTION_MAX_LANES:-4}"
 index_rayon_workers="${ANVIL_QUALIFICATION_INDEX_RAYON_WORKERS:-4}"
+index_projection_max_lanes="${ANVIL_QUALIFICATION_INDEX_PROJECTION_MAX_LANES:-${index_rayon_workers}}"
 # The default is a fast smoke. Set this to 839980 for the full
 # production-shaped, twelve-field corpus used by the resource qualification.
 case "${qualification_mode}" in
@@ -48,6 +49,7 @@ for configured_limit in \
   "${index_kind_budget_bytes}" \
   "${index_compaction_max_lanes}" \
   "${index_rayon_workers}" \
+  "${index_projection_max_lanes}" \
   "${index_resource_records}" \
   "${index_resource_mutations}" \
   "${index_resource_max_anonymous_growth_bytes}"
@@ -336,20 +338,28 @@ start_single_node() {
     --env "ANVIL_INDEX_BUILDER_MEMORY_BYTES_PER_KIND=${index_kind_budget_bytes}" \
     --env "ANVIL_INDEX_PATH_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
     --env "ANVIL_INDEX_PATH_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
+    --env "ANVIL_INDEX_PATH_PROJECTION_MAX_LANES=${index_projection_max_lanes}" \
     --env "ANVIL_INDEX_METADATA_FILTER_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
     --env "ANVIL_INDEX_METADATA_FILTER_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
+    --env "ANVIL_INDEX_METADATA_FILTER_PROJECTION_MAX_LANES=${index_projection_max_lanes}" \
     --env "ANVIL_INDEX_TYPED_JSON_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
     --env "ANVIL_INDEX_TYPED_JSON_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
+    --env "ANVIL_INDEX_TYPED_JSON_PROJECTION_MAX_LANES=${index_projection_max_lanes}" \
     --env "ANVIL_INDEX_FULL_TEXT_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
     --env "ANVIL_INDEX_FULL_TEXT_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
+    --env "ANVIL_INDEX_FULL_TEXT_PROJECTION_MAX_LANES=${index_projection_max_lanes}" \
     --env "ANVIL_INDEX_VECTOR_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
     --env "ANVIL_INDEX_VECTOR_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
+    --env "ANVIL_INDEX_VECTOR_PROJECTION_MAX_LANES=${index_projection_max_lanes}" \
     --env "ANVIL_INDEX_HYBRID_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
     --env "ANVIL_INDEX_HYBRID_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
+    --env "ANVIL_INDEX_HYBRID_PROJECTION_MAX_LANES=${index_projection_max_lanes}" \
     --env "ANVIL_INDEX_GIT_SOURCE_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
     --env "ANVIL_INDEX_GIT_SOURCE_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
+    --env "ANVIL_INDEX_GIT_SOURCE_PROJECTION_MAX_LANES=${index_projection_max_lanes}" \
     --env "ANVIL_INDEX_TENSOR_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
     --env "ANVIL_INDEX_TENSOR_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
+    --env "ANVIL_INDEX_TENSOR_PROJECTION_MAX_LANES=${index_projection_max_lanes}" \
     --env "ANVIL_INDEX_RAYON_WORKERS=${index_rayon_workers}" \
     "${profile_environment[@]}" \
     --env ANVIL_INDEX_MAX_RETAINED_GENERATIONS=1 \
