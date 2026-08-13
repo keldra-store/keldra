@@ -188,9 +188,10 @@ jobs:
           generate_release_notes: true
           make_latest: true
           body: |
-            Anvil 0.8.1 prevents queued same-kind index rebuilds from retaining
-            the shared construction-memory permit needed by catch-up. Existing
-            0.8.0 volumes resume without a storage migration or data reimport.
+            Anvil 0.8.2 prevents projection-worker starvation, makes blob and
+            shard staging restart-safe, and seeks TypedJSON order postings with
+            selectivity-aware predicate planning. Existing 0.8.1 volumes resume
+            without a storage migration or data reimport.
 
             - Image: `${{ steps.image.outputs.image }}`
             - Manifest digest: `${{ steps.image.outputs.digest }}`

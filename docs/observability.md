@@ -28,7 +28,7 @@ API.
 Metrics and traces share these resource attributes:
 
 - `service.name=anvil`
-- `service.version=0.8.1`
+- `service.version=0.8.2`
 - `node.id=<ANVIL_NODE_ID>`
 
 Trace export uses a dedicated worker with a 2,048-span queue and batches of at

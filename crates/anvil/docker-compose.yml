@@ -1,6 +1,6 @@
 services:
   anvil:
-    image: ${ANVIL_IMAGE:-anvil:0.8.1}
+    image: ${ANVIL_IMAGE:-anvil:0.8.2}
     environment:
       RUST_LOG: ${RUST_LOG:-info}
       ANVIL_LISTEN: 0.0.0.0:50051
