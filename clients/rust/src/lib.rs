@@ -17,6 +17,13 @@ use tonic::service::Interceptor;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Status};
 
+mod typed_json_index;
+
+pub use typed_json_index::{
+    BooleanField, FloatField, IndexDefinitionError, IndexOrderToken, KeywordField,
+    SignedIntegerField, TextField, TypedJsonIndexBuilder, UnsignedIntegerField,
+};
+
 const MAX_MESSAGE_BYTES: usize = 72 * 1024 * 1024;
 
 pub use anvil_api::v1;

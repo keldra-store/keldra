@@ -6,7 +6,7 @@ import "google/protobuf/timestamp.proto";
 
 // The public Anvil 0.9 network contract. Peer and storage-coordination services
 // remain private. Ordinary object calls are independent. Only InvokeProgram
-// requests atomic multi-path visibility; indexes are asynchronous derived views
+// requests atomic multi-path visibility; indices are asynchronous derived views
 // over the same visible object state.
 service ObjectService {
   // The complete put header is unary so an upload stream can contain only
@@ -75,15 +75,15 @@ service AuthzService {
   rpc CheckPermissions(CheckPermissionsRequest) returns (CheckPermissionsResponse);
 }
 
-// Cluster-wide derived indexes. One weighted-HRW builder publishes immutable
+// Cluster-wide derived indices. One weighted-HRW builder publishes immutable
 // generations and up to three weighted-HRW query replicas materialize those
 // same files through their shared local cache. A query is executed by one
-// replica; this service never scatter-queries independent per-node indexes.
+// replica; this service never scatter-queries independent per-node indices.
 service IndexService {
   rpc CreateIndex(CreateIndexRequest) returns (IndexDefinition);
   rpc UpdateIndex(UpdateIndexRequest) returns (IndexDefinition);
   rpc GetIndex(GetIndexRequest) returns (IndexDefinition);
-  rpc ListIndexes(ListIndexesRequest) returns (ListIndexesResponse);
+  rpc ListIndices(ListIndicesRequest) returns (ListIndicesResponse);
   // Rewrites the same authoritative definition at an exact version. This is
   // an explicit, authorized request for a fresh scoped snapshot generation;
   // it creates no rebuild registry or second index authority.
@@ -179,12 +179,48 @@ enum IndexKind {
   INDEX_KIND_TENSOR = 9;
 }
 
+enum IndexFieldCapability {
+  INDEX_FIELD_CAPABILITY_EXACT = 0;
+  INDEX_FIELD_CAPABILITY_PREFIX = 1;
+  INDEX_FIELD_CAPABILITY_RANGE = 2;
+  INDEX_FIELD_CAPABILITY_ORDER = 3;
+  INDEX_FIELD_CAPABILITY_FACET = 4;
+  INDEX_FIELD_CAPABILITY_AGGREGATE = 5;
+  INDEX_FIELD_CAPABILITY_FULL_TEXT = 6;
+}
+
+enum IndexFieldCardinality {
+  INDEX_FIELD_CARDINALITY_SINGLE = 0;
+  INDEX_FIELD_CARDINALITY_MULTI = 1;
+}
+
+message BooleanIndexField {}
+message SignedIntegerIndexField {}
+message UnsignedIntegerIndexField {}
+message FloatIndexField {}
+message KeywordIndexField {}
+
+enum TextAnalyzer {
+  TEXT_ANALYZER_UNICODE_ALPHANUMERIC_LOWERCASE = 0;
+}
+
+message TextIndexField {
+  TextAnalyzer analyzer = 1;
+}
+
 message IndexField {
   string name = 1;
   string json_pointer = 2;
-  // False declares zero or one scalar value per object. True allows zero or
-  // more scalar values and therefore cannot participate in result ordering.
-  bool multi_valued = 3;
+  IndexFieldCardinality cardinality = 3;
+  repeated IndexFieldCapability capabilities = 4;
+  oneof field_type {
+    BooleanIndexField boolean = 10;
+    SignedIntegerIndexField signed_integer = 11;
+    UnsignedIntegerIndexField unsigned_integer = 12;
+    FloatIndexField float = 13;
+    KeywordIndexField keyword = 14;
+    TextIndexField text = 15;
+  }
 }
 
 message PathIndexSpec {}
@@ -199,7 +235,7 @@ message MetadataFilterIndexSpec {
 message TypedJsonIndexSpec {
   repeated IndexField fields = 1;
   // Optional exact physical result order. Every named field must be declared
-  // above with multi_valued=false. A query uses this order only when its
+  // above with SINGLE cardinality and ORDER. A query uses this order only when its
   // complete field/direction list matches exactly.
   repeated IndexOrder physical_order = 2;
 }
@@ -297,7 +333,7 @@ message GetIndexRequest {
   string name = 2;
 }
 
-message ListIndexesRequest {
+message ListIndicesRequest {
   string bucket = 1;
   optional string start_after_name = 2;
   // Zero selects 100. The maximum page size is 1000; continuation has no
@@ -305,8 +341,8 @@ message ListIndexesRequest {
   uint32 limit = 3;
 }
 
-message ListIndexesResponse {
-  repeated IndexDefinition indexes = 1;
+message ListIndicesResponse {
+  repeated IndexDefinition indices = 1;
   bool has_more = 2;
 }
 
@@ -370,6 +406,47 @@ message MetadataFilterIndexQuery {
 message TypedJsonIndexQuery {
   repeated IndexPredicate predicates = 1;
   repeated IndexOrder order = 2;
+  // A request may contain at most 32 facet and aggregate computations in
+  // total. Each facet limit must be in 1..=1000.
+  repeated IndexFacetRequest facets = 3;
+  repeated IndexAggregateRequest aggregates = 4;
+}
+
+message IndexFacetRequest {
+  string field = 1;
+  uint32 limit = 2;
+}
+
+message IndexFacetBucket {
+  bytes value_json = 1;
+  uint64 count = 2;
+}
+
+message IndexFacetResult {
+  string field = 1;
+  repeated IndexFacetBucket buckets = 2;
+}
+
+enum IndexAggregateOperation {
+  INDEX_AGGREGATE_OPERATION_COUNT = 0;
+  INDEX_AGGREGATE_OPERATION_MINIMUM = 1;
+  INDEX_AGGREGATE_OPERATION_MAXIMUM = 2;
+  INDEX_AGGREGATE_OPERATION_SUM = 3;
+  INDEX_AGGREGATE_OPERATION_AVERAGE = 4;
+}
+
+message IndexAggregateRequest {
+  string field = 1;
+  IndexAggregateOperation operation = 2;
+}
+
+message IndexAggregateResult {
+  string field = 1;
+  IndexAggregateOperation operation = 2;
+  // Absent when MINIMUM, MAXIMUM, SUM, or AVERAGE has no contributing value.
+  // COUNT always contains its canonical JSON integer result.
+  optional bytes value_json = 3;
+  uint64 contributing_count = 4;
 }
 
 message FullTextIndexQuery {
@@ -426,8 +503,6 @@ message IndexQueryHit {
   ObjectAddress address = 1;
   uint64 object_version = 2;
   optional float score = 3;
-  // Kind-specific canonical JSON fields explicitly retained by the index.
-  bytes fields_json = 4;
 }
 
 message IndexSourceFreshness {
@@ -462,6 +537,8 @@ message QueryIndexResponse {
   repeated IndexQueryHit hits = 1;
   bytes next_page_token = 2;
   IndexFreshness freshness = 3;
+  repeated IndexFacetResult facet_results = 4;
+  repeated IndexAggregateResult aggregate_results = 5;
 }
 
 message EnableAccountingRequest {

@@ -72,7 +72,7 @@ mod tests {
             "rpc createindex(createindexrequest)",
             "rpc updateindex(updateindexrequest)",
             "rpc getindex(getindexrequest)",
-            "rpc listindexes(listindexesrequest)",
+            "rpc listindices(listindicesrequest)",
             "rpc deleteindex(deleteindexrequest)",
             "rpc queryindex(queryindexrequest)",
         ] {
@@ -126,6 +126,34 @@ mod tests {
         let _: Option<
             super::v1::index_service_client::IndexServiceClient<tonic::transport::Channel>,
         > = None;
+    }
+
+    #[test]
+    fn typed_json_fields_have_explicit_type_cardinality_and_capabilities() {
+        use super::v1::{
+            IndexField, IndexFieldCapability, IndexFieldCardinality, KeywordIndexField, index_field,
+        };
+
+        let field = IndexField {
+            name: "document_id".into(),
+            json_pointer: "/id".into(),
+            cardinality: IndexFieldCardinality::Single as i32,
+            capabilities: vec![IndexFieldCapability::Exact as i32],
+            field_type: Some(index_field::FieldType::Keyword(KeywordIndexField {})),
+        };
+
+        assert!(matches!(
+            field.field_type,
+            Some(index_field::FieldType::Keyword(_))
+        ));
+        assert_eq!(field.capabilities, [IndexFieldCapability::Exact as i32]);
+
+        let schema = include_str!("../proto/anvil.proto").to_ascii_lowercase();
+        assert!(schema.contains("rpc listindices(listindicesrequest)"));
+        assert!(schema.contains("repeated indexdefinition indices = 1"));
+        assert!(!schema.contains("listindexes"));
+        assert!(!schema.contains("fields_json"));
+        assert!(!schema.contains("bool multi_valued"));
     }
 
     #[test]
