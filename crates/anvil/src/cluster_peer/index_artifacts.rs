@@ -209,7 +209,7 @@ impl IndexHeadScanScope {
         (
             self.tenant_id,
             self.bucket_id,
-            format!("_anvil/indexes/v4/{}/", self.index_id),
+            format!("_anvil/indices/v4/{}/", self.index_id),
         )
     }
 }
@@ -408,9 +408,9 @@ mod tests {
     #[test]
     fn scan_scopes_cannot_become_arbitrary_prefix_scans() {
         let digest = "a".repeat(64);
-        let generation = format!("_anvil/indexes/v4/9/manifests/{digest}");
-        let artifact = format!("_anvil/indexes/v4/9/artifacts/{digest}");
-        let current = "_anvil/indexes/v4/9/current";
+        let generation = format!("_anvil/indices/v4/9/manifests/{digest}");
+        let artifact = format!("_anvil/indices/v4/9/artifacts/{digest}");
+        let current = "_anvil/indices/v4/9/current";
 
         let scoped = IndexHeadScanScope {
             tenant_id: 4,
@@ -421,10 +421,10 @@ mod tests {
         assert!(scoped.matches(4, 5, &artifact));
         assert!(scoped.matches(4, 5, current));
         assert!(!scoped.matches(4, 5, &format!("{artifact}/child")));
-        assert!(!scoped.matches(4, 5, "_anvil/indexes/v4/definitions/search"));
-        assert!(!scoped.matches(4, 5, "_anvil/indexes/v3/9/current"));
+        assert!(!scoped.matches(4, 5, "_anvil/indices/v4/definitions/search"));
+        assert!(!scoped.matches(4, 5, "_anvil/indices/v3/9/current"));
         assert!(!scoped.matches(4, 5, "ordinary/path"));
-        assert_eq!(scoped.prefix().2, "_anvil/indexes/v4/9/");
+        assert_eq!(scoped.prefix().2, "_anvil/indices/v4/9/");
         assert!(
             !IndexHeadScanScope {
                 tenant_id: 4,
@@ -440,7 +440,7 @@ mod tests {
         let source = RetainedObjectSnapshot {
             tenant_id: 4,
             bucket_id: 5,
-            exact_path: "_anvil/indexes/v4/9/current".into(),
+            exact_path: "_anvil/indices/v4/9/current".into(),
             version: Version {
                 id: VersionId(6),
                 blob: Some(BlobRef {

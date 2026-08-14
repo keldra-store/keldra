@@ -180,7 +180,7 @@ mod tests {
             tenant_id: 1,
             bucket_id,
             definition_id,
-            definition_path: format!("_anvil/indexes/{definition_id}.json"),
+            definition_path: format!("_anvil/indices/{definition_id}.json"),
             object_version: VersionId(version),
             observed_fence: PlacementLogId { term: 1, index: 2 },
             rank: 0,

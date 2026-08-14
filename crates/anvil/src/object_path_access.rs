@@ -200,7 +200,7 @@ mod tests {
             "_anvil/programs/nested/import_osv@1",
             "_anvil/programs/import_osv@1@copy",
             index_definition.as_str(),
-            "_anvil/indexes/v3/7/current",
+            "_anvil/indices/v3/7/current",
             "_anvil/internal/00",
             "objects/_anvil/meta.json",
         ] {
@@ -218,6 +218,6 @@ mod tests {
         mark_index(&mut request);
         let access = access_for(&request);
         assert!(require_key(&access, &key(&definition_path("by-path").unwrap())).is_ok());
-        assert!(require_key(&access, &key("_anvil/indexes/v4/7/current")).is_ok());
+        assert!(require_key(&access, &key("_anvil/indices/v4/7/current")).is_ok());
     }
 }

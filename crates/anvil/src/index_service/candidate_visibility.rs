@@ -373,7 +373,6 @@ mod tests {
                 }),
                 object_version: 1,
                 score: None,
-                fields_json: Vec::new(),
             },
         }
     }

@@ -1343,7 +1343,7 @@ fn parse_artifact_path(path: &str, expected_index: u64) -> Result<ArtifactPathKi
     let parts = path.split('/').collect::<Vec<_>>();
     if parts.len() < 5
         || parts[0] != "_anvil"
-        || parts[1] != "indexes"
+        || parts[1] != "indices"
         || parts[2] != "v4"
         || parse_canonical_u64(parts[3]) != Some(expected_index)
     {
@@ -1407,7 +1407,7 @@ fn valid_digest(value: &str) -> bool {
 pub(crate) fn index_definition_name(path: &str) -> Option<&str> {
     let parts = path.split('/').collect::<Vec<_>>();
     match parts.as_slice() {
-        ["_anvil", "indexes", "v4", "definitions", name] if valid_definition_name(name) => {
+        ["_anvil", "indices", "v4", "definitions", name] if valid_definition_name(name) => {
             Some(name)
         }
         _ => None,
@@ -1438,7 +1438,7 @@ pub(crate) fn artifact_hash_from_path(index_id: u64, path: &str) -> Option<[u8; 
     let digest = match parts.as_slice() {
         [
             "_anvil",
-            "indexes",
+            "indices",
             "v4",
             encoded_index,
             "artifacts",
@@ -1460,7 +1460,7 @@ fn immutable_content_hash_from_path(index_id: u64, path: &str) -> Option<[u8; 32
     let digest = match parts.as_slice() {
         [
             "_anvil",
-            "indexes",
+            "indices",
             "v4",
             encoded_index,
             "manifests",
@@ -1482,7 +1482,7 @@ pub(crate) fn is_manifest_artifact_path(index_id: u64, path: &str) -> bool {
     let parts = path.split('/').collect::<Vec<_>>();
     matches!(
         parts.as_slice(),
-        ["_anvil", "indexes", "v4", encoded_index, "manifests", digest]
+        ["_anvil", "indices", "v4", encoded_index, "manifests", digest]
             if parse_canonical_u64(encoded_index) == Some(index_id) && valid_digest(digest)
     )
 }
@@ -1525,37 +1525,37 @@ mod tests {
     #[test]
     fn only_exact_reserved_artifact_shapes_are_accepted() {
         assert_eq!(
-            parse_artifact_path("_anvil/indexes/v4/7/current", 7).unwrap(),
+            parse_artifact_path("_anvil/indices/v4/7/current", 7).unwrap(),
             ArtifactPathKind::Current
         );
         let digest = "a".repeat(64);
         assert_eq!(
-            parse_artifact_path(&format!("_anvil/indexes/v4/7/manifests/{digest}"), 7).unwrap(),
+            parse_artifact_path(&format!("_anvil/indices/v4/7/manifests/{digest}"), 7).unwrap(),
             ArtifactPathKind::Immutable
         );
         assert_eq!(
-            parse_artifact_path(&format!("_anvil/indexes/v4/7/artifacts/{digest}"), 7).unwrap(),
+            parse_artifact_path(&format!("_anvil/indices/v4/7/artifacts/{digest}"), 7).unwrap(),
             ArtifactPathKind::Immutable
         );
         for invalid in [
-            "_anvil/indexes/v4/7/definition",
-            "_anvil/indexes/v4/7/runs/name/descriptor",
-            "_anvil/indexes/v4/07/current",
-            "_anvil/indexes/7/current",
-            "_anvil/indexes/v3/7/current",
+            "_anvil/indices/v4/7/definition",
+            "_anvil/indices/v4/7/runs/name/descriptor",
+            "_anvil/indices/v4/07/current",
+            "_anvil/indices/7/current",
+            "_anvil/indices/v3/7/current",
             "ordinary/path",
         ] {
             assert!(parse_artifact_path(invalid, 7).is_err(), "{invalid}");
         }
         assert!(
             parse_artifact_path(
-                &format!("_anvil/indexes/v4/7/artifacts/{}", "A".repeat(64)),
+                &format!("_anvil/indices/v4/7/artifacts/{}", "A".repeat(64)),
                 7,
             )
             .is_err()
         );
         assert!(
-            parse_artifact_path(&format!("_anvil/indexes/v4/8/artifacts/{digest}"), 7).is_err()
+            parse_artifact_path(&format!("_anvil/indices/v4/8/artifacts/{digest}"), 7).is_err()
         );
     }
 
@@ -1574,24 +1574,24 @@ mod tests {
     #[test]
     fn definition_discovery_accepts_only_the_dedicated_path_shape() {
         assert_eq!(
-            index_definition_name("_anvil/indexes/v4/definitions/search"),
+            index_definition_name("_anvil/indices/v4/definitions/search"),
             Some("search")
         );
         assert_eq!(
-            index_definition_name("_anvil/indexes/v4/12/definition"),
+            index_definition_name("_anvil/indices/v4/12/definition"),
             None
         );
         assert_eq!(
-            index_definition_name("_anvil/indexes/v4/definitions/a/b"),
+            index_definition_name("_anvil/indices/v4/definitions/a/b"),
             None
         );
         assert_eq!(
-            index_definition_name("_anvil/indexes/v3/definitions/search"),
+            index_definition_name("_anvil/indices/v3/definitions/search"),
             None
         );
         assert_eq!(
             index_definition_name(&format!(
-                "_anvil/indexes/v4/definitions/{}",
+                "_anvil/indices/v4/definitions/{}",
                 "a".repeat(256)
             )),
             None
@@ -1605,7 +1605,7 @@ mod tests {
 
         let valid = DefinitionVersionGuard {
             kind: DefinitionKind::Index,
-            exact_path: "_anvil/indexes/v4/definitions/search".into(),
+            exact_path: "_anvil/indices/v4/definitions/search".into(),
             expected_version: VersionId(9),
         };
         assert_eq!(
@@ -1636,7 +1636,7 @@ mod tests {
     fn guards_are_rejected_on_immutable_or_wrong_accounting_paths() {
         let index_guard = DefinitionVersionGuard {
             kind: DefinitionKind::Index,
-            exact_path: "_anvil/indexes/v4/definitions/search".into(),
+            exact_path: "_anvil/indices/v4/definitions/search".into(),
             expected_version: VersionId(9),
         };
         assert!(
@@ -1688,7 +1688,7 @@ mod tests {
 
     #[test]
     fn generated_paths_round_trip_through_validation() {
-        assert_eq!(current_path(4), "_anvil/indexes/v4/4/current");
+        assert_eq!(current_path(4), "_anvil/indices/v4/4/current");
         assert!(parse_artifact_path(&manifest_path(4, [2; 32]), 4).is_ok());
         assert!(parse_artifact_path(&artifact_path(4, [3; 32]), 4).is_ok());
         assert_eq!(
@@ -1720,12 +1720,12 @@ mod tests {
     fn artifact_retention_parser_is_slash_safe_and_v4_only() {
         let digest = hex::encode([3; 32]);
         for invalid in [
-            format!("_anvil/indexes/v4/4/artifacts/{digest}/"),
-            format!("_anvil/indexes/v4/4/artifacts/{digest}/extra"),
-            format!("_anvil/indexes/v4/4/artifacts/{digest}0"),
-            format!("_anvil/indexes/4/artifacts/{digest}"),
-            format!("_anvil/indexes/v4/04/artifacts/{digest}"),
-            format!("_anvil/indexes/v3/4/artifacts/{digest}"),
+            format!("_anvil/indices/v4/4/artifacts/{digest}/"),
+            format!("_anvil/indices/v4/4/artifacts/{digest}/extra"),
+            format!("_anvil/indices/v4/4/artifacts/{digest}0"),
+            format!("_anvil/indices/4/artifacts/{digest}"),
+            format!("_anvil/indices/v4/04/artifacts/{digest}"),
+            format!("_anvil/indices/v3/4/artifacts/{digest}"),
         ] {
             assert_eq!(artifact_hash_from_path(4, &invalid), None, "{invalid}");
         }
@@ -1781,7 +1781,7 @@ mod tests {
             current_path(7),
             Some(DefinitionVersionGuard {
                 kind: DefinitionKind::Index,
-                exact_path: "_anvil/indexes/v4/definitions/search".into(),
+                exact_path: "_anvil/indices/v4/definitions/search".into(),
                 expected_version: VersionId(9),
             }),
         );

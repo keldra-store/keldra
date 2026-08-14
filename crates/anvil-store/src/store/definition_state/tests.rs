@@ -292,7 +292,7 @@ async fn definition_delete_is_delivered_distinctly_and_removes_the_assignment() 
         tenant_id: 7,
         bucket_id: 9,
         definition_id: 11,
-        definition_path: "_anvil/indexes/v4/definitions/example".into(),
+        definition_path: "_anvil/indices/v4/definitions/example".into(),
         object_version: VersionId(13),
         observed_fence: fence(17),
         rank: 0,
@@ -350,7 +350,7 @@ async fn definition_delete_is_delivered_distinctly_and_removes_the_assignment() 
     assert_eq!(due.bucket_id, 9);
     assert_eq!(due.index_id, 11);
     assert_eq!(due.definition_object_version, VersionId(14));
-    assert_eq!(due.definition_path, "_anvil/indexes/v4/definitions/example");
+    assert_eq!(due.definition_path, "_anvil/indices/v4/definitions/example");
     assert!(due.due_at_unix_millis > 0);
     assert_eq!(
         store

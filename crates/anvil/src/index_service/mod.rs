@@ -1,4 +1,4 @@
-//! Public lifecycle and query surface for ordinary-object-backed indexes.
+//! Public lifecycle and query surface for ordinary-object-backed indices.
 
 mod boundary;
 mod candidate_visibility;

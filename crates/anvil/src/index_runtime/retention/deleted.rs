@@ -408,7 +408,7 @@ mod tests {
         IndexCurrentHead {
             tenant_id: 1,
             bucket_id: 2,
-            exact_path: "_anvil/indexes/v4/3/current".into(),
+            exact_path: "_anvil/indices/v4/3/current".into(),
             head: Head {
                 version: VersionId(4),
                 deleted,

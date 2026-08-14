@@ -492,7 +492,7 @@ mod tests {
         assert!(includes_path("tenants/7", "tenants/7/a"));
         assert!(!includes_path("tenants/7", "tenants/70/a"));
         assert!(!includes_path("", "_anvil/accounting/7/current"));
-        assert!(includes_path("", "_anvil/indexes/7/current"));
+        assert!(includes_path("", "_anvil/indices/7/current"));
     }
 
     #[test]

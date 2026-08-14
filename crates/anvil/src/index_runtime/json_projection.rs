@@ -767,6 +767,7 @@ impl ProjectionParser<'_, '_> {
             if matches!(self.targets[*index].kind, TargetKind::Vector { .. }) {
                 let number = match &value {
                     ScalarValue::Number(bits) => f64::from_bits(*bits) as f32,
+                    ScalarValue::Signed(value) => *value as f32,
                     ScalarValue::Unsigned(value) => *value as f32,
                     _ => {
                         self.slots[*index] = SelectedValue::Invalid;
@@ -1167,7 +1168,10 @@ impl<'a> Input<'a> {
             std::str::from_utf8(&bytes[..length]).map_err(|_| ProjectionFailure::Malformed)?;
         if !fractional && !exponent {
             if encoded == "-0" {
-                return Ok(Some(ScalarValue::Unsigned(0)));
+                return Ok(Some(ScalarValue::Signed(0)));
+            }
+            if negative && let Ok(value) = encoded.parse::<i64>() {
+                return Ok(Some(ScalarValue::Signed(value)));
             }
             if !negative && let Ok(value) = encoded.parse::<u64>() {
                 return Ok(Some(ScalarValue::Unsigned(value)));

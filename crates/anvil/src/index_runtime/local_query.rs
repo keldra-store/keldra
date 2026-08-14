@@ -249,7 +249,6 @@ impl CandidateGate for RuntimeCandidateGate {
                         }),
                         object_version: candidate.result.version,
                         score: None,
-                        fields_json: Vec::new(),
                     },
                 })
                 .collect::<Vec<_>>();
@@ -871,7 +870,6 @@ impl LocalGenerationQueryExecutor {
                 }),
                 object_version: hit.result.version,
                 score: hit.score,
-                fields_json: hit.fields_json,
             })
             .collect();
         let next_position = page

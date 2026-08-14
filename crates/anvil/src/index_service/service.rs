@@ -14,7 +14,7 @@ use anvil_api::v1::{
     BatchGetRequest, BulkOperation, BulkPutIfVersionRequest, BulkPutRequest, BulkWriteRequest,
     BulkWriteResponse, CreateIndexRequest, DeleteIfVersionRequest, DeleteIndexRequest,
     DeleteIndexResponse, Durability, GetIndexRequest, GetObjectRequest, IndexDefinition, IndexKind,
-    IndexQuery, ListIndexesRequest, ListIndexesResponse, MutationFailure, MutationFailureCode,
+    IndexQuery, ListIndicesRequest, ListIndicesResponse, MutationFailure, MutationFailureCode,
     MutationReceipt, ObjectAddress, QueryIndexRequest, QueryIndexResponse, ReadFailureCode,
     RebuildIndexRequest, UpdateIndexRequest,
 };
@@ -409,10 +409,10 @@ impl IndexServiceRpc for IndexServiceImpl {
         .await
     }
 
-    async fn list_indexes(
+    async fn list_indices(
         &self,
-        request: Request<ListIndexesRequest>,
-    ) -> Result<Response<ListIndexesResponse>, Status> {
+        request: Request<ListIndicesRequest>,
+    ) -> Result<Response<ListIndicesResponse>, Status> {
         let deadline = self
             .timeouts
             .deadline(request.metadata(), IndexRequestClass::Ordinary)?;
@@ -476,8 +476,8 @@ impl IndexServiceRpc for IndexServiceImpl {
                 }
                 let has_more = visible.len() > public_limit;
                 visible.truncate(public_limit);
-                Ok(Response::new(ListIndexesResponse {
-                    indexes: visible,
+                Ok(Response::new(ListIndicesResponse {
+                    indices: visible,
                     has_more,
                 }))
             },

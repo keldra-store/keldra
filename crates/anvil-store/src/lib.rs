@@ -9,7 +9,7 @@
 /// The storage kernel owns exact prefix recognition for its bounded
 /// bucket-scoped iterator. Definition-name validation remains a server
 /// concern.
-pub const INDEX_DEFINITION_PREFIX: &str = "_anvil/indexes/v4/definitions/";
+pub const INDEX_DEFINITION_PREFIX: &str = "_anvil/indices/v4/definitions/";
 
 mod authz;
 mod blob;

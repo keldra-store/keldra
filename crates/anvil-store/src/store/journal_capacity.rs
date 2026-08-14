@@ -287,7 +287,7 @@ mod tests {
         store
             .mutate_derived_progress_with_governance_and_backpressure(
                 PublishRequest {
-                    key: ObjectKey::new("tenant", "bucket", "_anvil/indexes/v4/7/current").unwrap(),
+                    key: ObjectKey::new("tenant", "bucket", "_anvil/indices/v4/7/current").unwrap(),
                     blob,
                     content_type: Some("application/vnd.anvil.index-artifact".into()),
                     mode: PutMode::PutIfAbsent,
@@ -322,7 +322,7 @@ mod tests {
         // A user-selected reserved-looking path receives ordinary bounded
         // admission. No path string grants the trusted progress capability.
         let forged = store
-            .bulk_write(vec![put("_anvil/indexes/v4/7/current", "forged-progress")])
+            .bulk_write(vec![put("_anvil/indices/v4/7/current", "forged-progress")])
             .await;
         assert_eq!(forged[0].result, Err(MutationError::SourceJournalCapacity));
 
@@ -331,7 +331,7 @@ mod tests {
         assert!(debt.progress_debt_entries() >= 1);
         assert!(
             store
-                .head(&ObjectKey::new("tenant", "bucket", "_anvil/indexes/v4/7/current").unwrap())
+                .head(&ObjectKey::new("tenant", "bucket", "_anvil/indices/v4/7/current").unwrap())
                 .unwrap()
                 .is_some()
         );

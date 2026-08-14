@@ -522,9 +522,9 @@ fn require_query_replica(
 ) -> Result<(), Status> {
     let identity = IndexIdentity::new(tenant_id, bucket_id, index_id)
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
-    let indexes = IndexPlacement::derive(identity, placement)
+    let indices = IndexPlacement::derive(identity, placement)
         .map_err(|error| Status::unavailable(error.to_string()))?;
-    if indexes.fence() != placement.fence() || !indexes.query_replicas().contains(&node) {
+    if indices.fence() != placement.fence() || !indices.query_replicas().contains(&node) {
         Err(Status::failed_precondition(
             "node is not a current weighted-HRW index query replica",
         ))

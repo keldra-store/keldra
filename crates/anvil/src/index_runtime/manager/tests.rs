@@ -192,11 +192,11 @@ fn reserved_segment_matching_is_not_a_string_prefix_guess() {
 fn reserved_artifact_pages_have_no_generation_source_changes() {
     let page = journal_page(
         vec![
-            journal_change(1, 2, "_anvil/indexes/v4/0000000000000009/current", 11),
+            journal_change(1, 2, "_anvil/indices/v4/0000000000000009/current", 11),
             journal_change(
                 1,
                 2,
-                "_anvil/indexes/v4/0000000000000009/manifests/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "_anvil/indices/v4/0000000000000009/manifests/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 12,
             ),
         ],

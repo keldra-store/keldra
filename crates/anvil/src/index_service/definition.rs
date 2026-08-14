@@ -1,7 +1,9 @@
 use anvil_api::v1::index_specification::Specification;
+use anvil_api::v1::index_field::FieldType;
 use anvil_api::v1::{
-    CreateIndexRequest, IndexDefinition, IndexField, IndexKind, IndexOrderDirection,
-    IndexSpecification, TypedJsonIndexSpec, UpdateIndexRequest,
+    CreateIndexRequest, IndexDefinition, IndexField, IndexFieldCapability,
+    IndexFieldCardinality, IndexKind, IndexOrderDirection, IndexSpecification, TextAnalyzer,
+    TypedJsonIndexSpec, UpdateIndexRequest,
 };
 use anvil_atomic_program::MAX_OBJECT_PATH_BYTES;
 use anvil_store::INDEX_DEFINITION_PREFIX;
@@ -357,8 +359,79 @@ fn validate_fields(fields: &[IndexField]) -> Result<(), Status> {
                 "typed JSON field names must be unique",
             ));
         }
+        validate_typed_json_field(field)?;
     }
     Ok(())
+}
+
+fn validate_typed_json_field(field: &IndexField) -> Result<(), Status> {
+    let cardinality = IndexFieldCardinality::try_from(field.cardinality)
+        .map_err(|_| Status::invalid_argument("typed JSON field cardinality is unknown"))?;
+    let field_type = field
+        .field_type
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("typed JSON field type is required"))?;
+    if let FieldType::Text(text) = field_type {
+        TextAnalyzer::try_from(text.analyzer)
+            .map_err(|_| Status::invalid_argument("typed JSON text analyzer is unknown"))?;
+    }
+
+    if field.capabilities.is_empty() {
+        return Err(Status::invalid_argument(
+            "typed JSON field needs at least one capability",
+        ));
+    }
+    let mut capabilities = BTreeSet::new();
+    for encoded in &field.capabilities {
+        let capability = IndexFieldCapability::try_from(*encoded)
+            .map_err(|_| Status::invalid_argument("typed JSON field capability is unknown"))?;
+        if !capabilities.insert(capability) {
+            return Err(Status::invalid_argument(
+                "typed JSON field capabilities must be unique",
+            ));
+        }
+        if !capability_allowed(field_type, capability) {
+            return Err(Status::invalid_argument(format!(
+                "typed JSON field capability {capability:?} is invalid for its field type"
+            )));
+        }
+    }
+    if cardinality == IndexFieldCardinality::Multi
+        && capabilities.contains(&IndexFieldCapability::Order)
+    {
+        return Err(Status::invalid_argument(
+            "multi-valued typed JSON fields cannot declare ORDER",
+        ));
+    }
+    Ok(())
+}
+
+fn capability_allowed(field_type: &FieldType, capability: IndexFieldCapability) -> bool {
+    match field_type {
+        FieldType::Boolean(_) => matches!(
+            capability,
+            IndexFieldCapability::Exact | IndexFieldCapability::Facet
+        ),
+        FieldType::SignedInteger(_) | FieldType::UnsignedInteger(_) | FieldType::Float(_) => {
+            matches!(
+                capability,
+                IndexFieldCapability::Exact
+                    | IndexFieldCapability::Range
+                    | IndexFieldCapability::Order
+                    | IndexFieldCapability::Facet
+                    | IndexFieldCapability::Aggregate
+            )
+        }
+        FieldType::Keyword(_) => matches!(
+            capability,
+            IndexFieldCapability::Exact
+                | IndexFieldCapability::Prefix
+                | IndexFieldCapability::Range
+                | IndexFieldCapability::Order
+                | IndexFieldCapability::Facet
+        ),
+        FieldType::Text(_) => capability == IndexFieldCapability::FullText,
+    }
 }
 
 fn validate_typed_json_specification(specification: &TypedJsonIndexSpec) -> Result<(), Status> {
@@ -367,7 +440,15 @@ fn validate_typed_json_specification(specification: &TypedJsonIndexSpec) -> Resu
     let fields = specification
         .fields
         .iter()
-        .map(|field| (field.name.as_str(), field.multi_valued))
+        .map(|field| {
+            (
+                field.name.as_str(),
+                (
+                    field.cardinality,
+                    field.capabilities.as_slice(),
+                ),
+            )
+        })
         .collect::<std::collections::BTreeMap<_, _>>();
     let mut ordered = BTreeSet::new();
     for order in &specification.physical_order {
@@ -377,14 +458,24 @@ fn validate_typed_json_specification(specification: &TypedJsonIndexSpec) -> Resu
                 "physical-order field names must be unique",
             ));
         }
-        let Some(multi_valued) = fields.get(order.field.as_str()) else {
+        let Some((cardinality, capabilities)) = fields.get(order.field.as_str()) else {
             return Err(Status::invalid_argument(
                 "physical order names a field outside the typed JSON definition",
             ));
         };
-        if *multi_valued {
+        if IndexFieldCardinality::try_from(*cardinality)
+            .is_ok_and(|value| value == IndexFieldCardinality::Multi)
+        {
             return Err(Status::invalid_argument(
                 "physical order requires single-valued typed JSON fields",
+            ));
+        }
+        if !capabilities
+            .iter()
+            .any(|value| *value == IndexFieldCapability::Order as i32)
+        {
+            return Err(Status::invalid_argument(
+                "physical order requires the typed JSON field to declare ORDER",
             ));
         }
         IndexOrderDirection::try_from(order.direction)
@@ -496,7 +587,8 @@ fn validate_explicit_rebuild(accepted_at_unix_millis: u64) -> Result<(), Status>
 #[cfg(test)]
 mod tests {
     use anvil_api::v1::{
-        IndexOrder, PathIndexSpec, TensorIndexSpec, TypedJsonIndexSpec, index_specification,
+        IndexOrder, KeywordIndexField, PathIndexSpec, SignedIntegerIndexField,
+        TensorIndexSpec, TypedJsonIndexSpec, index_specification,
     };
 
     use super::*;
@@ -525,7 +617,7 @@ mod tests {
         );
         assert_eq!(
             definition_path("by-path").unwrap(),
-            "_anvil/indexes/v4/definitions/by-path"
+            "_anvil/indices/v4/definitions/by-path"
         );
         assert_eq!(
             derive_index_id(7, 9, "by-path", "create-index").unwrap(),
@@ -587,12 +679,24 @@ mod tests {
                         IndexField {
                             name: "modified_at".into(),
                             json_pointer: "/modified_at".into(),
-                            multi_valued: false,
+                            cardinality: IndexFieldCardinality::Single as i32,
+                            capabilities: vec![
+                                IndexFieldCapability::Range as i32,
+                                IndexFieldCapability::Order as i32,
+                            ],
+                            field_type: Some(FieldType::SignedInteger(
+                                SignedIntegerIndexField {},
+                            )),
                         },
                         IndexField {
                             name: "ecosystems".into(),
                             json_pointer: "/ecosystems".into(),
-                            multi_valued: true,
+                            cardinality: IndexFieldCardinality::Multi as i32,
+                            capabilities: vec![
+                                IndexFieldCapability::Exact as i32,
+                                IndexFieldCapability::Facet as i32,
+                            ],
+                            field_type: Some(FieldType::Keyword(KeywordIndexField {})),
                         },
                     ],
                     physical_order: vec![IndexOrder {
@@ -613,6 +717,52 @@ mod tests {
         assert_eq!(
             decoded.to_api(7).unwrap().specification,
             request.specification
+        );
+    }
+
+    #[test]
+    fn typed_json_rejects_missing_types_and_invalid_or_duplicate_capabilities() {
+        let mut missing_type = typed_json_request();
+        let Some(IndexSpecification {
+            specification: Some(index_specification::Specification::TypedJson(specification)),
+        }) = missing_type.specification.as_mut()
+        else {
+            unreachable!();
+        };
+        specification.fields[0].field_type = None;
+        assert_eq!(
+            validate_create_definition(&missing_type).unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+
+        let mut invalid = typed_json_request();
+        let Some(IndexSpecification {
+            specification: Some(index_specification::Specification::TypedJson(specification)),
+        }) = invalid.specification.as_mut()
+        else {
+            unreachable!();
+        };
+        specification.fields[1]
+            .capabilities
+            .push(IndexFieldCapability::FullText as i32);
+        assert_eq!(
+            validate_create_definition(&invalid).unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+
+        let mut duplicate = typed_json_request();
+        let Some(IndexSpecification {
+            specification: Some(index_specification::Specification::TypedJson(specification)),
+        }) = duplicate.specification.as_mut()
+        else {
+            unreachable!();
+        };
+        specification.fields[0]
+            .capabilities
+            .push(IndexFieldCapability::Order as i32);
+        assert_eq!(
+            validate_create_definition(&duplicate).unwrap_err().code(),
+            tonic::Code::InvalidArgument
         );
     }
 
@@ -685,9 +835,9 @@ mod tests {
             assert!(definition_path(invalid).is_err(), "{invalid:?}");
         }
         for invalid_path in [
-            "_anvil/indexes/v3/definitions/safe-name",
-            "_anvil/indexes/v4/definitions/a/b",
-            "_anvil/indexes/v4/definitions/..",
+            "_anvil/indices/v3/definitions/safe-name",
+            "_anvil/indices/v4/definitions/a/b",
+            "_anvil/indices/v4/definitions/..",
         ] {
             assert_eq!(definition_name(invalid_path), None, "{invalid_path:?}");
         }
