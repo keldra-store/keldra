@@ -1,6 +1,6 @@
 # Anvil 0.9 index dependency record
 
-This record covers the three dependencies deliberately adopted for the Anvil
+This record covers the two dependencies deliberately adopted for the Anvil
 0.9 native-segment index implementation. `Cargo.lock` remains the authoritative
 source for exact checksums and the complete workspace graph.
 
@@ -10,14 +10,12 @@ source for exact checksums and the complete workspace graph.
 | --- | --- | --- | --- | --- |
 | [`sux`](https://crates.io/crates/sux) | `0.14.0` | default features disabled | Apache-2.0 from `Apache-2.0 OR LGPL-2.1-or-later` | Query-time Rank9/Select9 navigation over Anvil's portable dense-posting bitmap bytes |
 | [`rayon`](https://crates.io/crates/rayon) | `1.12.0` | its normal library surface, reached through `sux`/`rdst` and used directly by Anvil's fixed index worker pool | Apache-2.0 from `MIT OR Apache-2.0` | Process-owned execution for admitted, bounded source-projection CPU work |
-| [`lz4_flex`](https://crates.io/crates/lz4_flex) | `0.14.0` | default features disabled; `safe-encode` and `safe-decode` only | MIT | Pure-Rust independent compression of bounded stored-field blocks, with raw fallback |
 
 Anvil does not enable `sux`'s default `flate2` or `zstd` features, nor its
 `serde`, `epserde`, `mmap`, `cli` or `deko` features. This keeps native
 layout persistence and unused compression stacks out of the index format.
-Anvil serializes its own architecture-independent format, reconstructs checked
-`sux` structures from it, and applies `lz4_flex` only to independently bounded
-stored-field blocks with a raw fallback.
+Anvil serializes its own architecture-independent format and reconstructs
+checked `sux` structures from it.
 
 The normal Linux release graph was recorded with:
 
@@ -88,7 +86,6 @@ uses Apache-2.0 where it is offered.
 | `libm` | `0.2.16` | `MIT` |
 | `linux-raw-sys` | `0.12.1` | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` |
 | `log` | `0.4.33` | `MIT OR Apache-2.0` |
-| `lz4_flex` | `0.14.0` | `MIT` |
 | `maybe-dangling` | `0.1.2` | `Zlib OR MIT OR Apache-2.0` |
 | `mem_dbg` | `0.4.4` | `Apache-2.0 OR MIT` |
 | `mem_dbg-derive` | `0.3.4` | `Apache-2.0 OR MIT` |

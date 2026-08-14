@@ -483,6 +483,15 @@ compact typed doc values for Boolean or numeric values. A future capability or
 type extends this table explicitly; it cannot be smuggled through an unknown
 enum value or a generic payload.
 
+Integer sums use checked `i128` or `u128` accumulation and must fit the field's
+declared `i64` or `u64` result domain. Count is `u64`. Float sums and all
+averages must produce a finite JSON number. Overflow is a query error; values
+are never saturated, wrapped, or silently discarded.
+
+A facet counts one matching document once for each distinct facet value.
+Numeric aggregates count every array element, including repeated values;
+missing and explicit null values do not contribute.
+
 ### 8.2 Representative wire declaration
 
 The wire contract uses one type choice and an explicit capability list. The
@@ -1131,6 +1140,11 @@ contain bounded sorted `(value, DocId)` entries; internal nodes contain checked
 value bounds and child descriptors. Exact, set, and range traversal therefore
 find candidate DocIds without scanning a per-document column.
 
+The same point component has a reserved presence-record subrange containing
+exactly one DocId for each present source field, including explicit null. It is
+not a numeric value and is excluded from numeric bounds and range statistics.
+`EXISTS` seeks that subrange without forcing an otherwise-unused term component.
+
 Single-dimensional points are sufficient for the initial field types. A future
 multi-dimensional or geospatial type requires an accepted extension rather than
 changing the meaning of this format. Point components do not exist unless a
@@ -1170,6 +1184,9 @@ Full Text and Hybrid segments add token frequencies, positions, field lengths,
 norms, and block impact bounds. BM25 scoring operates over these components.
 Phrase and positional queries use a cheap term-conjunction approximation
 followed by positional verification.
+
+Multi-valued text analyzes every value and inserts a position gap between
+values, so a phrase never matches across two array elements.
 
 At query admission, BM25 aggregates document, field-length, and term-frequency
 statistics from the bounded segment set of the pinned generation. Segment
@@ -1899,6 +1916,10 @@ connect to the new format-v4 engine.
   and an active page token remains on its retained generation.
 - A keyword longer than 32,766 bytes supports only hashed `EXACT`; ordered,
   prefix, range, and facet capabilities reject it.
+- Typed JSON's public flat predicate list is a conjunction; `IN` is its
+  same-field disjunction. Arbitrary Boolean trees and `NOT` are not public yet.
+- Metadata Filter and the dedicated Full Text kind retain fixed built-in field
+  schemas and analysis rather than adding a second capability declaration API.
 - SQL is not a user-visible capability in this release.
 - A permanently failed definition may eventually hold journal capacity and
   backpressure affected writes until an authorized principal repairs, rebuilds,

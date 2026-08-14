@@ -587,8 +587,8 @@ let token = exchange_client_credentials(
     std::env::var("ANVIL_OWNER_SECRET")?,
 )
 .await?;
-let mut indexes = index_client(channel, &token.access_token)?;
-# let _ = &mut indexes;
+let mut indices = index_client(channel, &token.access_token)?;
+# let _ = &mut indices;
 # Ok(())
 # }
 ```
@@ -601,41 +601,33 @@ definitions:
 | --- | --- | --- | --- |
 | Path | `PathIndexSpec {}` | `PathIndexQuery { prefix, start_after }` | Any object |
 | Metadata filter | fields such as `path`, `content_type`, `content_length` | Predicates over retained head fields | Any object |
-| Typed JSON | named fields mapped to JSON Pointers, e.g. `status -> /status` | Canonical JSON scalar predicates and ordering | `{"status":"active"}` |
+| Typed JSON | typed fields mapped to JSON Pointers with explicit exact, prefix, range, order, facet, aggregate, or full-text capabilities | Capability-checked predicates, ordering, facets, and numeric aggregates | `{"status":"active"}` |
 | Full text | named text fields mapped to JSON Pointers | Text or phrase query | `{"body":"durable journal delivery"}` |
 | Vector | JSON Pointer, dimensions, cosine/dot/Euclidean metric | A vector with the declared dimensions | `{"embedding":[1.0,0.0,0.0]}` |
 | Hybrid | Full-text and vector specifications plus weights | Text and vector together | `{"title":"rust search","embedding":[1.0,0.0,0.0]}` |
 | Git source | Repository ID | Commit ID and exact/prefix tree path | Git manifest containing repository, commit, tree path, object ID, pack path/version, offset, and length |
 | Tensor | Model ID | Tensor name | Tensor manifest containing model, tensor name, source path/version, offset, length, dtype, and shape |
 
-For example, a typed JSON definition retains `/status` and queries it using one
-canonical JSON string:
+For example, the Rust builder makes the field type and its permitted operations
+explicit. This definition indexes `/status` as an exact, uninterpreted keyword;
+it neither tokenizes nor stores the source JSON:
 
 ```rust,no_run
 use anvil_storage::v1::index_query::Query as QueryValue;
-use anvil_storage::v1::index_specification::Specification as SpecValue;
 use anvil_storage::v1::*;
+use anvil_storage::{KeywordField, TypedJsonIndexBuilder};
 
-# async fn example(mut indexes: anvil_storage::v1::index_service_client::IndexServiceClient<tonic::service::interceptor::InterceptedService<tonic::transport::Channel, anvil_storage::BearerToken>>) -> Result<(), tonic::Status> {
-indexes.create_index(CreateIndexRequest {
-    bucket: "objects".into(),
-    name: "active-documents".into(),
-    path_prefix: "documents/".into(),
-    content_type: "application/json".into(),
-    specification: Some(IndexSpecification {
-        specification: Some(SpecValue::TypedJson(TypedJsonIndexSpec {
-            fields: vec![IndexField {
-                name: "status".into(),
-                json_pointer: "/status".into(),
-                multi_valued: false,
-            }],
-            physical_order: vec![],
-        })),
-    }),
-    command_id: "create-active-documents".into(),
-}).await?;
+# async fn example(mut indices: anvil_storage::v1::index_service_client::IndexServiceClient<tonic::service::interceptor::InterceptedService<tonic::transport::Channel, anvil_storage::BearerToken>>) -> Result<(), tonic::Status> {
+let definition = TypedJsonIndexBuilder::new("objects", "active-documents")
+    .path_prefix("documents/")
+    .content_type("application/json")
+    .field(KeywordField::single("status", "/status").exact())
+    .finish("create-active-documents")
+    .expect("valid static index definition");
 
-let response = indexes.query_index(QueryIndexRequest {
+indices.create_index(definition).await?;
+
+let response = indices.query_index(QueryIndexRequest {
     bucket: "objects".into(),
     index_name: "active-documents".into(),
     query: Some(IndexQuery {
@@ -646,6 +638,8 @@ let response = indexes.query_index(QueryIndexRequest {
                 values_json: vec![br#""active""#.to_vec()],
             }],
             order: vec![],
+            facets: vec![],
+            aggregates: vec![],
         })),
     }),
     limit: 100,
