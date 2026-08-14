@@ -8,9 +8,9 @@ use anvil_api::v1::{
 };
 use anvil_index::IndexError;
 use anvil_index::v4::{
-    AggregateOperation, AggregateRequest, FacetRequest, FieldCapabilities, FieldId, FieldSchema,
-    FieldType, NativeQuery, OrderDirection, OrderField, Predicate, PredicateId, RangeBound,
-    ScalarValue, Schema,
+    AggregateOperation, AggregateRequest, FacetRequest, FieldCapabilities, FieldSchema, FieldType,
+    NativeQuery, OrderDirection, OrderField, Predicate, PredicateId, RangeBound, ScalarValue,
+    Schema,
 };
 
 const MAX_COMPUTATIONS: usize = 32;
@@ -397,8 +397,7 @@ fn field<'a>(schema: &'a Schema, name: &str) -> Result<&'a FieldSchema, IndexErr
 }
 
 fn decode_scalar(encoded: &[u8], field: &FieldSchema) -> Result<ScalarValue, IndexError> {
-    let value: serde_json::Value = serde_json::from_slice(encoded)
-        .map_err(|_| IndexError::InvalidQuery("predicate value is invalid JSON".into()))?;
+    let value = decode_canonical_json_scalar(encoded)?;
     if value.is_null() && field.allow_null {
         return Ok(ScalarValue::Null);
     }
@@ -427,8 +426,7 @@ fn decode_text(encoded: &[u8], field: &FieldSchema) -> Result<ScalarValue, Index
             field.name
         )));
     }
-    let value: serde_json::Value = serde_json::from_slice(encoded)
-        .map_err(|_| IndexError::InvalidQuery("predicate value is invalid JSON".into()))?;
+    let value = decode_canonical_json_scalar(encoded)?;
     let text = value.as_str().ok_or_else(|| {
         IndexError::InvalidQuery("full-text predicate requires one JSON string".into())
     })?;
@@ -438,6 +436,23 @@ fn decode_text(encoded: &[u8], field: &FieldSchema) -> Result<ScalarValue, Index
         ));
     }
     Ok(ScalarValue::String(text.to_owned()))
+}
+
+fn decode_canonical_json_scalar(encoded: &[u8]) -> Result<serde_json::Value, IndexError> {
+    let value: serde_json::Value = serde_json::from_slice(encoded)
+        .map_err(|_| IndexError::InvalidQuery("predicate value is invalid JSON".into()))?;
+    if matches!(
+        value,
+        serde_json::Value::Array(_) | serde_json::Value::Object(_)
+    ) || serde_json::to_vec(&value)
+        .map_err(|_| IndexError::InvalidQuery("predicate value is invalid JSON".into()))?
+        != encoded
+    {
+        return Err(IndexError::InvalidQuery(
+            "predicate value must be one canonical JSON scalar".into(),
+        ));
+    }
+    Ok(value)
 }
 
 fn text_value(value: ScalarValue) -> Result<String, IndexError> {
@@ -577,6 +592,8 @@ mod tests {
             ScalarValue::String("active".into())
         );
         assert!(decode_scalar(b"4", &keyword_schema.fields[0]).is_err());
+        assert!(decode_scalar(br#""\u0061ctive""#, &keyword_schema.fields[0]).is_err());
+        assert!(decode_scalar(b" \"active\"", &keyword_schema.fields[0]).is_err());
     }
 
     #[test]
