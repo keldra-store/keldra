@@ -1,4 +1,4 @@
-//! Authenticated Rust client for Anvil 0.8 object storage.
+//! Authenticated Rust client for Anvil 0.9 object storage.
 //!
 //! The crate provides ready-to-use object, authorization, administration, and
 //! PersonalDB clients, upload helpers, and the complete generated protocol surface.
@@ -6,6 +6,7 @@
 use anvil_api::v1::administration_service_client::AdministrationServiceClient;
 use anvil_api::v1::authz_service_client::AuthzServiceClient;
 use anvil_api::v1::credential_service_client::CredentialServiceClient;
+use anvil_api::v1::index_service_client::IndexServiceClient;
 use anvil_api::v1::object_service_client::ObjectServiceClient;
 use anvil_api::v1::personal_db_service_client::PersonalDbServiceClient;
 use anvil_api::v1::{
@@ -49,6 +50,8 @@ pub type RawAdministrationClient = AdministrationServiceClient<
 >;
 pub type RawAuthzClient =
     AuthzServiceClient<tonic::service::interceptor::InterceptedService<Channel, BearerToken>>;
+pub type RawIndexClient =
+    IndexServiceClient<tonic::service::interceptor::InterceptedService<Channel, BearerToken>>;
 pub type RawPersonalDbClient =
     PersonalDbServiceClient<tonic::service::interceptor::InterceptedService<Channel, BearerToken>>;
 
@@ -80,6 +83,17 @@ pub fn authz_client(
 ) -> Result<RawAuthzClient, tonic::metadata::errors::InvalidMetadataValue> {
     Ok(
         AuthzServiceClient::with_interceptor(channel, BearerToken::new(token)?)
+            .max_encoding_message_size(MAX_MESSAGE_BYTES)
+            .max_decoding_message_size(MAX_MESSAGE_BYTES),
+    )
+}
+
+pub fn index_client(
+    channel: Channel,
+    token: &str,
+) -> Result<RawIndexClient, tonic::metadata::errors::InvalidMetadataValue> {
+    Ok(
+        IndexServiceClient::with_interceptor(channel, BearerToken::new(token)?)
             .max_encoding_message_size(MAX_MESSAGE_BYTES)
             .max_decoding_message_size(MAX_MESSAGE_BYTES),
     )
@@ -191,8 +205,9 @@ mod tests {
         Durability, ObjectVersioning, PutHeader,
     };
     use super::{
-        MAX_MESSAGE_BYTES, RawAdministrationClient, RawAuthzClient, RawClient, RawPersonalDbClient,
-        administration_client, authz_client, object_client, personaldb_client,
+        MAX_MESSAGE_BYTES, RawAdministrationClient, RawAuthzClient, RawClient, RawIndexClient,
+        RawPersonalDbClient, administration_client, authz_client, index_client, object_client,
+        personaldb_client,
     };
 
     #[test]
@@ -237,6 +252,7 @@ mod tests {
         let channel = Endpoint::from_static("http://127.0.0.1:50051").connect_lazy();
         let _: RawClient = object_client(channel.clone(), "token").unwrap();
         let _: RawAuthzClient = authz_client(channel.clone(), "token").unwrap();
+        let _: RawIndexClient = index_client(channel.clone(), "token").unwrap();
         let _: RawAdministrationClient = administration_client(channel.clone(), "token").unwrap();
         let _: RawPersonalDbClient = personaldb_client(channel, "token").unwrap();
     }

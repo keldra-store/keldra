@@ -4,7 +4,7 @@ package anvil.v1;
 
 import "google/protobuf/timestamp.proto";
 
-// The public Anvil 0.8 network contract. Peer and storage-coordination services
+// The public Anvil 0.9 network contract. Peer and storage-coordination services
 // remain private. Ordinary object calls are independent. Only InvokeProgram
 // requests atomic multi-path visibility; indexes are asynchronous derived views
 // over the same visible object state.
@@ -182,6 +182,9 @@ enum IndexKind {
 message IndexField {
   string name = 1;
   string json_pointer = 2;
+  // False declares zero or one scalar value per object. True allows zero or
+  // more scalar values and therefore cannot participate in result ordering.
+  bool multi_valued = 3;
 }
 
 message PathIndexSpec {}
@@ -195,6 +198,10 @@ message MetadataFilterIndexSpec {
 
 message TypedJsonIndexSpec {
   repeated IndexField fields = 1;
+  // Optional exact physical result order. Every named field must be declared
+  // above with multi_valued=false. A query uses this order only when its
+  // complete field/direction list matches exactly.
+  repeated IndexOrder physical_order = 2;
 }
 
 message FullTextField {
@@ -939,7 +946,7 @@ message ProvisionTenantResponse {
 
 // Application IDs and client IDs are cluster-wide authentication identities;
 // each is globally unique. An application has exactly one client credential
-// in Anvil 0.8. Supplying the same canonical application, client ID and secret is
+// in Anvil 0.9. Supplying the same canonical application, client ID and secret is
 // an idempotent replay.
 message CreateApplicationRequest {
   string app_id = 1;
@@ -1290,7 +1297,7 @@ message TupleFilter {
 
 message AuthzConsistency {
   // Latest evaluates the current authoritative revision. AtLeast evaluates
-  // current state only when it has reached the requested revision. Anvil 0.8
+  // current state only when it has reached the requested revision. Anvil 0.9
   // retains only current authorization state: Exact(current) succeeds and an
   // older exact revision fails with AUTHZ_REVISION_EXPIRED.
   oneof requirement {
