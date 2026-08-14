@@ -1,7 +1,7 @@
 use crate::IndexError;
 
 use super::FieldId;
-use super::{OrderDirection, ScalarValue, SortValue};
+use super::{INDEX_TERM_BYTES, OrderDirection, ScalarValue, SortValue};
 
 pub const TERM_TYPE_NULL: u8 = 1;
 pub const TERM_TYPE_BOOLEAN: u8 = 2;
@@ -12,6 +12,8 @@ pub const TERM_TYPE_TEXT: u8 = 6;
 /// Reserved exact term used to materialize field presence. Its distinct type
 /// keeps it disjoint from every user scalar, including null and empty string.
 pub const TERM_TYPE_FIELD_PRESENCE: u8 = 7;
+pub const TERM_TYPE_HASHED_KEYWORD: u8 = 8;
+pub const TERM_TYPE_SIGNED: u8 = 9;
 pub const FIELD_PRESENCE_TERM: &[u8] = &[0];
 
 pub fn canonical_term_key(
@@ -28,10 +30,10 @@ pub fn canonical_term_key(
     key.extend_from_slice(&field_id.get().to_be_bytes());
     key.push(term_type);
     key.extend_from_slice(term);
-    if key.len() > super::INDEX_ROUTING_KEY_BYTES {
+    if term.len() > INDEX_TERM_BYTES {
         return Err(IndexError::ResourceLimit {
-            needed: key.len(),
-            limit: super::INDEX_ROUTING_KEY_BYTES,
+            needed: term.len(),
+            limit: INDEX_TERM_BYTES,
         });
     }
     Ok(key)
@@ -43,6 +45,10 @@ pub fn scalar_term(value: &ScalarValue) -> Result<(u8, Vec<u8>), IndexError> {
     Ok(match value {
         ScalarValue::Null => (TERM_TYPE_NULL, vec![0]),
         ScalarValue::Boolean(value) => (TERM_TYPE_BOOLEAN, vec![u8::from(*value)]),
+        ScalarValue::Signed(value) => (
+            TERM_TYPE_SIGNED,
+            ((*value as u64) ^ (1 << 63)).to_be_bytes().to_vec(),
+        ),
         ScalarValue::Number(bits) => {
             let number = f64::from_bits(*bits);
             if !number.is_finite() {
@@ -59,6 +65,12 @@ pub fn scalar_term(value: &ScalarValue) -> Result<(u8, Vec<u8>), IndexError> {
         // The leading byte makes the empty string a valid non-empty term while
         // preserving bytewise exact/prefix/range order for every UTF-8 value.
         ScalarValue::String(value) => {
+            if value.len() > INDEX_TERM_BYTES {
+                let mut bytes = Vec::with_capacity(40);
+                bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
+                bytes.extend_from_slice(blake3::hash(value.as_bytes()).as_bytes());
+                return Ok((TERM_TYPE_HASHED_KEYWORD, bytes));
+            }
             let mut bytes = Vec::with_capacity(value.len() + 1);
             bytes.push(0);
             bytes.extend_from_slice(value.as_bytes());
@@ -72,6 +84,12 @@ pub fn text_term(token: &str) -> Result<(u8, Vec<u8>), IndexError> {
         return Err(IndexError::InvalidDefinition(
             "full-text token must not be empty".into(),
         ));
+    }
+    if token.len() > INDEX_TERM_BYTES {
+        return Err(IndexError::ResourceLimit {
+            needed: token.len(),
+            limit: INDEX_TERM_BYTES,
+        });
     }
     Ok((TERM_TYPE_TEXT, token.as_bytes().to_vec()))
 }
@@ -108,6 +126,10 @@ fn encode_order_scalar(value: &ScalarValue, output: &mut Vec<u8>) -> Result<(), 
             output.push(1);
             output.push(u8::from(*value));
         }
+        ScalarValue::Signed(value) => {
+            output.push(2);
+            output.extend_from_slice(&((*value as u64) ^ (1 << 63)).to_be_bytes());
+        }
         ScalarValue::Number(bits) => {
             let number = f64::from_bits(*bits);
             if !number.is_finite() {
@@ -115,15 +137,21 @@ fn encode_order_scalar(value: &ScalarValue, output: &mut Vec<u8>) -> Result<(), 
                     "format-v4 order number must be finite".into(),
                 ));
             }
-            output.push(2);
+            output.push(3);
             output.extend_from_slice(&sortable_f64(number).to_be_bytes());
         }
         ScalarValue::Unsigned(value) => {
-            output.push(3);
+            output.push(4);
             output.extend_from_slice(&value.to_be_bytes());
         }
         ScalarValue::String(value) => {
-            output.push(4);
+            if value.len() > INDEX_TERM_BYTES {
+                return Err(IndexError::ResourceLimit {
+                    needed: value.len(),
+                    limit: INDEX_TERM_BYTES,
+                });
+            }
+            output.push(5);
             encode_terminated_bytes(value.as_bytes(), output);
         }
     }

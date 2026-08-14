@@ -5,6 +5,7 @@ pub const INDEX_COMPONENT_BYTES: usize = 512 * 1024;
 pub const INDEX_DECODE_BYTES: usize = 4 * 1024 * 1024;
 pub const INDEX_ARTIFACT_PACK_BYTES: usize = 16 * 1024 * 1024;
 pub const INDEX_ROUTING_KEY_BYTES: usize = 4096;
+pub const INDEX_TERM_BYTES: usize = 32_766;
 pub const INDEX_ROUTING_FANOUT: usize = 32;
 pub const INDEX_ROUTING_HEIGHT: u8 = 8;
 pub const INDEX_GENERATION_SEGMENTS: usize = 4_096;
@@ -25,8 +26,8 @@ impl ComponentKind {
     pub const PATH_LOCATOR: Self = Self(5);
     pub const TERM_DICTIONARY: Self = Self(6);
     pub const POSTINGS: Self = Self(7);
-    pub const FAST_COLUMN: Self = Self(8);
-    pub const STORED_FIELDS: Self = Self(9);
+    pub const POINTS: Self = Self(8);
+    pub const DOC_VALUES: Self = Self(9);
     pub const POSITIONS: Self = Self(10);
     pub const NORMS: Self = Self(11);
     pub const VECTORS: Self = Self(12);
@@ -42,8 +43,8 @@ impl ComponentKind {
             5 => Ok(Self::PATH_LOCATOR),
             6 => Ok(Self::TERM_DICTIONARY),
             7 => Ok(Self::POSTINGS),
-            8 => Ok(Self::FAST_COLUMN),
-            9 => Ok(Self::STORED_FIELDS),
+            8 => Ok(Self::POINTS),
+            9 => Ok(Self::DOC_VALUES),
             10 => Ok(Self::POSITIONS),
             11 => Ok(Self::NORMS),
             12 => Ok(Self::VECTORS),
@@ -164,8 +165,8 @@ mod tests {
             ComponentKind::PATH_LOCATOR,
             ComponentKind::TERM_DICTIONARY,
             ComponentKind::POSTINGS,
-            ComponentKind::FAST_COLUMN,
-            ComponentKind::STORED_FIELDS,
+            ComponentKind::POINTS,
+            ComponentKind::DOC_VALUES,
             ComponentKind::POSITIONS,
             ComponentKind::NORMS,
             ComponentKind::VECTORS,

@@ -3,16 +3,17 @@ use std::cmp::Ordering;
 use crate::IndexError;
 
 use super::codec::{COMPONENT_HEADER_BYTES, Decoder, Encoder};
-use super::model::{DocId, INDEX_COMPONENT_BYTES};
+use super::model::{DocId, INDEX_COMPONENT_BYTES, INDEX_TERM_BYTES};
 use super::schema::FieldId;
 
-const FAST_COLUMN_CODEC_VERSION: u16 = 1;
+pub const DOC_VALUES_COMPONENT_CODEC_VERSION: u16 = 1;
 const MAX_PAYLOAD_BYTES: usize = INDEX_COMPONENT_BYTES - COMPONENT_HEADER_BYTES;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ScalarValue {
     Null,
     Boolean(bool),
+    Signed(i64),
     /// Canonical finite IEEE-754 binary64 bits. Negative zero is normalized.
     Number(u64),
     Unsigned(u64),
@@ -44,9 +45,10 @@ impl ScalarValue {
         match self {
             Self::Null => 0,
             Self::Boolean(_) => 1,
-            Self::Number(_) => 2,
+            Self::Signed(_) => 2,
             Self::Unsigned(_) => 3,
-            Self::String(_) => 4,
+            Self::Number(_) => 4,
+            Self::String(_) => 5,
         }
     }
 }
@@ -58,6 +60,7 @@ impl Ord for ScalarValue {
             .then_with(|| match (self, other) {
                 (Self::Null, Self::Null) => Ordering::Equal,
                 (Self::Boolean(left), Self::Boolean(right)) => left.cmp(right),
+                (Self::Signed(left), Self::Signed(right)) => left.cmp(right),
                 (Self::Number(left), Self::Number(right)) => {
                     f64::from_bits(*left).total_cmp(&f64::from_bits(*right))
                 }
@@ -75,7 +78,7 @@ impl PartialOrd for ScalarValue {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FastColumnCell {
+pub struct DocValueCell {
     /// Distinguishes an empty multi-valued field from a missing field.
     pub present: bool,
     /// At least one explicit JSON null occurred.
@@ -84,7 +87,7 @@ pub struct FastColumnCell {
     pub values: Vec<ScalarValue>,
 }
 
-impl FastColumnCell {
+impl DocValueCell {
     pub fn missing() -> Self {
         Self {
             present: false,
@@ -115,27 +118,27 @@ impl FastColumnCell {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FastColumnBlock {
+pub struct DocValueBlock {
     pub field_id: FieldId,
     pub first_doc_id: DocId,
     pub multi_valued: bool,
-    cells: Vec<FastColumnCell>,
+    cells: Vec<DocValueCell>,
     pub value_count: u32,
     pub null_count: u32,
     pub minimum: Option<ScalarValue>,
     pub maximum: Option<ScalarValue>,
 }
 
-impl FastColumnBlock {
+impl DocValueBlock {
     pub fn new(
         field_id: FieldId,
         first_doc_id: DocId,
         multi_valued: bool,
-        cells: Vec<FastColumnCell>,
+        cells: Vec<DocValueCell>,
     ) -> Result<Self, IndexError> {
         if cells.is_empty() {
             return Err(IndexError::InvalidDefinition(
-                "fast-column block must not be empty".into(),
+                "doc-value block must not be empty".into(),
             ));
         }
         first_doc_id
@@ -184,11 +187,11 @@ impl FastColumnBlock {
         Ok(block)
     }
 
-    pub fn cells(&self) -> &[FastColumnCell] {
+    pub fn cells(&self) -> &[DocValueCell] {
         &self.cells
     }
 
-    pub fn get(&self, doc_id: DocId) -> Option<&FastColumnCell> {
+    pub fn get(&self, doc_id: DocId) -> Option<&DocValueCell> {
         let offset = doc_id.get().checked_sub(self.first_doc_id.get())?;
         self.cells.get(offset as usize)
     }
@@ -211,11 +214,11 @@ impl FastColumnBlock {
         }
         if u32::try_from(value_count).map_err(|_| IndexError::OffsetOverflow)? != self.value_count {
             return Err(IndexError::InvalidDefinition(
-                "fast-column value count differs from its cells".into(),
+                "doc-value count differs from its cells".into(),
             ));
         }
         let mut out = Encoder::default();
-        out.u16(FAST_COLUMN_CODEC_VERSION);
+        out.u16(DOC_VALUES_COMPONENT_CODEC_VERSION);
         out.u32(self.field_id.get());
         out.u32(self.first_doc_id.get());
         out.usize_u32(self.cells.len())?;
@@ -251,8 +254,8 @@ impl FastColumnBlock {
 
     pub fn decode_payload(bytes: &[u8]) -> Result<Self, IndexError> {
         let mut input = Decoder::new(bytes)?;
-        if input.u16()? != FAST_COLUMN_CODEC_VERSION {
-            return Err(IndexError::InvalidFormat("fast-column codec version"));
+        if input.u16()? != DOC_VALUES_COMPONENT_CODEC_VERSION {
+            return Err(IndexError::InvalidFormat("doc-value codec version"));
         }
         let field_id = FieldId::new(input.u32()?);
         let first_doc_id = DocId::new(input.u32()?);
@@ -265,13 +268,13 @@ impl FastColumnBlock {
         let presence = input.owned_bytes()?;
         let nulls = input.owned_bytes()?;
         if presence.len() != count.div_ceil(8) || nulls.len() != count.div_ceil(8) {
-            return Err(IndexError::InvalidFormat("fast-column bitmap length"));
+            return Err(IndexError::InvalidFormat("doc-value bitmap length"));
         }
         validate_padding(&presence, count)?;
         validate_padding(&nulls, count)?;
         let offset_count = usize::try_from(input.u32()?).map_err(|_| IndexError::OffsetOverflow)?;
         if offset_count != count.saturating_add(1) {
-            return Err(IndexError::InvalidFormat("fast-column offset count"));
+            return Err(IndexError::InvalidFormat("doc-value offset count"));
         }
         input.claim(offset_count.saturating_mul(4))?;
         let mut offsets = Vec::with_capacity(offset_count);
@@ -293,7 +296,7 @@ impl FastColumnBlock {
         })?;
         input.claim(
             count
-                .checked_mul(std::mem::size_of::<FastColumnCell>())
+                .checked_mul(std::mem::size_of::<DocValueCell>())
                 .and_then(|bytes| {
                     bytes
                         .checked_add(value_count.saturating_mul(std::mem::size_of::<ScalarValue>()))
@@ -306,7 +309,7 @@ impl FastColumnBlock {
             || offsets.last().copied() != Some(value_count as u32)
             || offsets.windows(2).any(|pair| pair[0] > pair[1])
         {
-            return Err(IndexError::InvalidFormat("fast-column offsets"));
+            return Err(IndexError::InvalidFormat("doc-value offsets"));
         }
         let mut cells = Vec::with_capacity(count);
         for doc in 0..count {
@@ -314,12 +317,12 @@ impl FastColumnBlock {
             let end = offsets[doc + 1] as usize;
             let present = presence[doc / 8] & (1 << (doc % 8)) != 0;
             let null = nulls[doc / 8] & (1 << (doc % 8)) != 0;
-            cells.push(FastColumnCell {
+            cells.push(DocValueCell {
                 present,
                 null,
                 values: values
                     .get(start..end)
-                    .ok_or(IndexError::InvalidFormat("fast-column value range"))?
+                    .ok_or(IndexError::InvalidFormat("doc-value value range"))?
                     .to_vec(),
             });
         }
@@ -329,22 +332,25 @@ impl FastColumnBlock {
             || block.minimum != encoded_minimum
             || block.maximum != encoded_maximum
         {
-            return Err(IndexError::InvalidFormat("fast-column statistics"));
+            return Err(IndexError::InvalidFormat("doc-value statistics"));
         }
         Ok(block)
     }
 }
 
-fn validate_cell(cell: &FastColumnCell, multi: bool) -> Result<(), IndexError> {
+fn validate_cell(cell: &DocValueCell, multi: bool) -> Result<(), IndexError> {
     if (!cell.present && (cell.null || !cell.values.is_empty()))
         || (!multi && usize::from(cell.null) + cell.values.len() > 1)
         || cell
             .values
             .iter()
-            .any(|value| matches!(value, ScalarValue::Null))
+            .any(|value| {
+                matches!(value, ScalarValue::Null)
+                    || matches!(value, ScalarValue::String(value) if value.len() > INDEX_TERM_BYTES)
+            })
     {
         return Err(IndexError::InvalidDefinition(
-            "fast-column missing/null/cardinality state is invalid".into(),
+            "doc-value missing/null/cardinality state is invalid".into(),
         ));
     }
     Ok(())
@@ -370,6 +376,8 @@ pub(crate) fn encode_scalar(out: &mut Encoder, value: &ScalarValue) -> Result<()
     match value {
         ScalarValue::Null => {}
         ScalarValue::Boolean(value) => out.bool(*value),
+        ScalarValue::Signed(value) => out.u64(*value as u64),
+        ScalarValue::Unsigned(value) => out.u64(*value),
         ScalarValue::Number(bits) => {
             let value = f64::from_bits(*bits);
             if !value.is_finite() || value == 0.0 && *bits != 0.0f64.to_bits() {
@@ -379,8 +387,15 @@ pub(crate) fn encode_scalar(out: &mut Encoder, value: &ScalarValue) -> Result<()
             }
             out.u64(*bits);
         }
-        ScalarValue::Unsigned(value) => out.u64(*value),
-        ScalarValue::String(value) => out.string(value)?,
+        ScalarValue::String(value) => {
+            if value.len() > INDEX_TERM_BYTES {
+                return Err(IndexError::ResourceLimit {
+                    needed: value.len(),
+                    limit: INDEX_TERM_BYTES,
+                });
+            }
+            out.string(value)?;
+        }
     }
     Ok(())
 }
@@ -389,21 +404,25 @@ pub(crate) fn decode_scalar(input: &mut Decoder<'_>) -> Result<ScalarValue, Inde
     let value = match input.u8()? {
         0 => ScalarValue::Null,
         1 => ScalarValue::Boolean(input.bool()?),
-        2 => ScalarValue::Number(input.u64()?),
+        2 => ScalarValue::Signed(input.u64()? as i64),
         3 => ScalarValue::Unsigned(input.u64()?),
-        4 => ScalarValue::String(input.string()?),
-        _ => return Err(IndexError::InvalidFormat("fast-column scalar tag")),
+        4 => ScalarValue::Number(input.u64()?),
+        5 => ScalarValue::String(input.string()?),
+        _ => return Err(IndexError::InvalidFormat("doc-value scalar tag")),
     };
     let mut sink = Encoder::default();
     encode_scalar(&mut sink, &value)
-        .map_err(|_| IndexError::InvalidFormat("fast-column scalar"))?;
+        .map_err(|_| IndexError::InvalidFormat("doc-value scalar"))?;
+    if matches!(&value, ScalarValue::String(value) if value.len() > INDEX_TERM_BYTES) {
+        return Err(IndexError::InvalidFormat("doc-value keyword length"));
+    }
     Ok(value)
 }
 
 fn validate_padding(bitmap: &[u8], count: usize) -> Result<(), IndexError> {
     let remainder = count % 8;
     if remainder != 0 && bitmap.last().is_some_and(|byte| *byte >> remainder != 0) {
-        return Err(IndexError::InvalidFormat("fast-column bitmap padding"));
+        return Err(IndexError::InvalidFormat("doc-value bitmap padding"));
     }
     Ok(())
 }

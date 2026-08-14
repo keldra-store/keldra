@@ -41,30 +41,54 @@ pub enum IndexKind {
     Tensor = 8,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u8)]
+pub enum FieldType {
+    Boolean = 1,
+    SignedInteger = 2,
+    UnsignedInteger = 3,
+    Float = 4,
+    Keyword = 5,
+    Text = 6,
+    /// Internal fixed-width vector field used by Vector and Hybrid definitions.
+    /// It is not one of the public Typed JSON field types.
+    Vector = 7,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(transparent)]
-pub struct ScalarDomain(u8);
+pub struct FieldCapabilities(u16);
 
-impl ScalarDomain {
-    pub const BOOLEAN: Self = Self(1 << 0);
-    pub const NUMBER: Self = Self(1 << 1);
-    pub const UNSIGNED: Self = Self(1 << 2);
-    pub const STRING: Self = Self(1 << 3);
-    pub const NULL: Self = Self(1 << 4);
-    pub const ALL_JSON: Self = Self((1 << 5) - 1);
+impl FieldCapabilities {
+    pub const EXACT: Self = Self(1 << 0);
+    pub const PREFIX: Self = Self(1 << 1);
+    pub const RANGE: Self = Self(1 << 2);
+    pub const ORDER: Self = Self(1 << 3);
+    pub const FACET: Self = Self(1 << 4);
+    pub const AGGREGATE: Self = Self(1 << 5);
+    pub const FULL_TEXT: Self = Self(1 << 6);
+    const ALL: u16 = (1 << 7) - 1;
+
+    pub const fn empty() -> Self {
+        Self(0)
+    }
 
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
     }
 
-    pub const fn bits(self) -> u8 {
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    pub const fn bits(self) -> u16 {
         self.0
     }
 
     fn validate(self) -> Result<(), IndexError> {
-        if self.0 == 0 || self.0 & !Self::ALL_JSON.0 != 0 {
+        if self.0 == 0 || self.0 & !Self::ALL != 0 {
             return Err(IndexError::InvalidDefinition(
-                "field scalar domain is empty or unknown".into(),
+                "field capabilities are empty or unknown".into(),
             ));
         }
         Ok(())
@@ -77,8 +101,8 @@ pub struct FieldComponents(u16);
 
 impl FieldComponents {
     pub const TERMS: Self = Self(1 << 0);
-    pub const FAST_COLUMN: Self = Self(1 << 1);
-    pub const STORED: Self = Self(1 << 2);
+    pub const POINTS: Self = Self(1 << 1);
+    pub const DOC_VALUES: Self = Self(1 << 2);
     pub const POSITIONS: Self = Self(1 << 3);
     pub const NORMS: Self = Self(1 << 4);
     pub const VECTOR: Self = Self(1 << 5);
@@ -124,12 +148,100 @@ pub struct FieldSchema {
     pub id: FieldId,
     pub name: String,
     pub source_selector: String,
-    pub domain: ScalarDomain,
+    pub field_type: FieldType,
     pub cardinality: Cardinality,
     pub allow_missing: bool,
     pub allow_null: bool,
     pub collation: Collation,
+    pub capabilities: FieldCapabilities,
+    pub analyzer: Option<Analyzer>,
     pub components: FieldComponents,
+}
+
+impl FieldSchema {
+    pub fn compiled_components(&self) -> Result<FieldComponents, IndexError> {
+        if self.field_type == FieldType::Vector {
+            if self.capabilities != FieldCapabilities::empty() {
+                return Err(IndexError::InvalidDefinition(
+                    "vector fields do not use scalar field capabilities".into(),
+                ));
+            }
+            return Ok(FieldComponents::VECTOR);
+        }
+        self.capabilities.validate()?;
+        let capabilities = self.capabilities;
+        let mut components = match self.field_type {
+            FieldType::Boolean => {
+                reject_capabilities(
+                    capabilities,
+                    FieldCapabilities::EXACT.union(FieldCapabilities::FACET),
+                    "Boolean",
+                )?;
+                FieldComponents::TERMS
+            }
+            FieldType::SignedInteger | FieldType::UnsignedInteger | FieldType::Float => {
+                reject_capabilities(
+                    capabilities,
+                    FieldCapabilities::EXACT
+                        .union(FieldCapabilities::RANGE)
+                        .union(FieldCapabilities::ORDER)
+                        .union(FieldCapabilities::FACET)
+                        .union(FieldCapabilities::AGGREGATE),
+                    "numeric",
+                )?;
+                let mut value = FieldComponents(0);
+                if capabilities.contains(FieldCapabilities::EXACT)
+                    || capabilities.contains(FieldCapabilities::RANGE)
+                {
+                    value = value.union(FieldComponents::POINTS);
+                }
+                value
+            }
+            FieldType::Keyword => {
+                reject_capabilities(
+                    capabilities,
+                    FieldCapabilities::EXACT
+                        .union(FieldCapabilities::PREFIX)
+                        .union(FieldCapabilities::RANGE)
+                        .union(FieldCapabilities::ORDER)
+                        .union(FieldCapabilities::FACET),
+                    "keyword",
+                )?;
+                FieldComponents::TERMS
+            }
+            FieldType::Text => {
+                if capabilities != FieldCapabilities::FULL_TEXT {
+                    return Err(IndexError::InvalidDefinition(
+                        "text fields support only FULL_TEXT".into(),
+                    ));
+                }
+                FieldComponents::TERMS
+                    .union(FieldComponents::POSITIONS)
+                    .union(FieldComponents::NORMS)
+            }
+            FieldType::Vector => unreachable!("handled before scalar capability validation"),
+        };
+        if capabilities.contains(FieldCapabilities::ORDER)
+            || capabilities.contains(FieldCapabilities::FACET)
+            || capabilities.contains(FieldCapabilities::AGGREGATE)
+        {
+            components = components.union(FieldComponents::DOC_VALUES);
+        }
+        Ok(components)
+    }
+}
+
+fn reject_capabilities(
+    capabilities: FieldCapabilities,
+    allowed: FieldCapabilities,
+    kind: &str,
+) -> Result<(), IndexError> {
+    if capabilities.bits() & !allowed.bits() != 0 {
+        return Err(IndexError::InvalidDefinition(format!(
+            "{kind} field declares an unsupported capability"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -358,11 +470,31 @@ impl Schema {
                     "schema fields require dense IDs and unique valid names".into(),
                 ));
             }
-            field.domain.validate()?;
             field.components.validate()?;
-            if !field.allow_null && field.domain.bits() & ScalarDomain::NULL.bits() != 0 {
+            if field.components != field.compiled_components()? {
                 return Err(IndexError::InvalidDefinition(
-                    "field null domain conflicts with null policy".into(),
+                    "field components do not match its declared type and capabilities".into(),
+                ));
+            }
+            match (field.field_type, field.analyzer) {
+                (FieldType::Text, Some(Analyzer::UnicodeAlphanumericLowercase)) => {}
+                (FieldType::Text, _) => {
+                    return Err(IndexError::InvalidDefinition(
+                        "text field requires a supported analyzer".into(),
+                    ));
+                }
+                (_, None) => {}
+                (_, Some(_)) => {
+                    return Err(IndexError::InvalidDefinition(
+                        "only text fields may declare an analyzer".into(),
+                    ));
+                }
+            }
+            if field.field_type == FieldType::Vector
+                && !matches!(self.kind, IndexKind::Vector | IndexKind::Hybrid)
+            {
+                return Err(IndexError::InvalidDefinition(
+                    "vector fields require a Vector or Hybrid index".into(),
                 ));
             }
         }
@@ -373,11 +505,12 @@ impl Schema {
                 .get(order.field_id.get() as usize)
                 .ok_or_else(|| IndexError::InvalidDefinition("unknown order field".into()))?;
             if field.cardinality != Cardinality::Single
-                || !field.components.contains(FieldComponents::FAST_COLUMN)
+                || !field.capabilities.contains(FieldCapabilities::ORDER)
+                || !field.components.contains(FieldComponents::DOC_VALUES)
                 || !ordered.insert(order.field_id)
             {
                 return Err(IndexError::InvalidDefinition(
-                    "physical order requires unique single-valued fast-column fields".into(),
+                    "physical order requires unique single-valued ORDER fields".into(),
                 ));
             }
         }
@@ -409,7 +542,6 @@ impl Schema {
                 .checked_add(STATISTICS_PHYSICAL_BOUNDS_BYTES)
                 .ok_or(IndexError::OffsetOverflow)?;
         }
-        let mut stored = false;
         for field in &self.fields {
             statistics_payload_bytes = statistics_payload_bytes
                 .checked_add(STATISTICS_FIELD_BYTES)
@@ -437,7 +569,18 @@ impl Schema {
                     .checked_add(1)
                     .ok_or(IndexError::OffsetOverflow)?;
             }
-            if field.components.contains(FieldComponents::FAST_COLUMN) {
+            if field.components.contains(FieldComponents::DOC_VALUES) {
+                statistics_payload_bytes = statistics_payload_bytes
+                    .checked_add(STATISTICS_FIELD_COMPONENT_BYTES)
+                    .ok_or(IndexError::OffsetOverflow)?;
+                component_count = component_count
+                    .checked_add(1)
+                    .ok_or(IndexError::OffsetOverflow)?;
+                component_statistics_count = component_statistics_count
+                    .checked_add(1)
+                    .ok_or(IndexError::OffsetOverflow)?;
+            }
+            if field.components.contains(FieldComponents::POINTS) {
                 statistics_payload_bytes = statistics_payload_bytes
                     .checked_add(STATISTICS_FIELD_COMPONENT_BYTES)
                     .ok_or(IndexError::OffsetOverflow)?;
@@ -470,18 +613,6 @@ impl Schema {
                         .ok_or(IndexError::OffsetOverflow)?;
                 }
             }
-            stored |= field.components.contains(FieldComponents::STORED);
-        }
-        if stored {
-            statistics_payload_bytes = statistics_payload_bytes
-                .checked_add(STATISTICS_GLOBAL_COMPONENT_BYTES)
-                .ok_or(IndexError::OffsetOverflow)?;
-            component_count = component_count
-                .checked_add(1)
-                .ok_or(IndexError::OffsetOverflow)?;
-            component_statistics_count = component_statistics_count
-                .checked_add(1)
-                .ok_or(IndexError::OffsetOverflow)?;
         }
         Ok(SegmentSchemaShape {
             field_count: self.fields.len(),
@@ -509,11 +640,19 @@ impl Schema {
             out.u32(field.id.get());
             out.string(&field.name)?;
             out.string(&field.source_selector)?;
-            out.u8(field.domain.bits());
+            out.u8(field.field_type as u8);
             out.u8(field.cardinality as u8);
             out.bool(field.allow_missing);
             out.bool(field.allow_null);
             out.u8(field.collation as u8);
+            out.u16(field.capabilities.bits());
+            match field.analyzer {
+                Some(analyzer) => {
+                    out.bool(true);
+                    out.u8(analyzer as u8);
+                }
+                None => out.bool(false),
+            }
             out.u16(field.components.bits());
         }
         encode_semantics(&mut out, &self.semantics)?;
