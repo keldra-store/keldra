@@ -1,41 +1,18 @@
-//! Bounded immutable index segments and lazy multi-segment query engines.
+//! Portable native index components and storage-neutral query execution for
+//! Anvil.
 //!
-//! The crate owns portable version-3 component encodings. It deliberately
-//! knows nothing about RocksDB, erasure coding, placement, manifests, or cache
-//! policy. Anvil publishes every sealed component through its ordinary object
-//! path and supplies materialized bytes through [`IndexDirectoryRead`].
+//! The crate owns format-v4 codecs and algorithms. RocksDB, erasure coding,
+//! placement, authorization, cache policy, and ordinary-object publication
+//! remain Anvil runtime responsibilities.
 
-mod artifact;
-pub mod bulk;
-mod codec;
 pub mod compaction;
 mod error;
 mod io;
-mod model;
-mod query_bounds;
-mod routed;
-mod routed_sort;
-mod run;
-mod segment;
-mod succinct;
+pub mod v4;
 
-pub mod full_text;
-pub mod hybrid;
-pub mod ordered;
-pub mod projections;
-pub mod typed_json;
-pub mod vector;
-
-pub use artifact::{BlockDescriptor, GeneratedBlock, RunDescriptor, SealedRun};
-pub use error::IndexError;
-pub use io::{IndexBlockSink, IndexDirectoryRead, IndexFileRead};
-pub use model::{
-    ComponentCodec, DocumentRef, FIXED_INDEX_SEAL_WORKSPACE_BYTES, INDEX_ROUTING_FANOUT, IndexKind,
-    IndexMutation, MAX_INDEX_ARTIFACT_PACK_BYTES, MAX_INDEX_BLOCK_BYTES,
-    MAX_INDEX_DECODED_BLOCK_BYTES, MAX_INDEX_ROUTING_BLOCK_BYTES, MAX_INDEX_ROUTING_HEIGHT,
-    MAX_INDEX_ROUTING_KEY_BYTES, MAX_INDEX_ROUTING_WORKSPACE_BYTES, MAX_RUN_COMPONENTS,
-    MIN_INDEX_KIND_MEMORY_BYTES, QueryHit, SegmentBuildOptions, SegmentMemoryPlan, SegmentPush,
+pub use compaction::{
+    FIXED_INDEX_SEAL_WORKSPACE_BYTES, MIN_INDEX_KIND_MEMORY_BYTES, SegmentMemoryPlan,
 };
-pub use run::RunBlockWalker;
-
-pub const INDEX_FORMAT_VERSION: u16 = 3;
+pub use error::IndexError;
+pub use io::IndexFileRead;
+pub use v4::{INDEX_FORMAT_VERSION, IndexKind};

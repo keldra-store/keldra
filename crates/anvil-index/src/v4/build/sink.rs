@@ -1,0 +1,1286 @@
+use std::collections::BTreeMap;
+use std::future::Future;
+
+use crate::IndexError;
+
+use super::super::codec::{
+    COMPONENT_HEADER_BYTES, decode_component_header, prepare_component_payload,
+};
+use super::super::{
+    ArtifactDescriptor, ComponentKind, ComponentStatistics, FieldId, GeneratedComponent,
+    INDEX_ARTIFACT_PACK_BYTES, INDEX_DECODE_BYTES, INDEX_ROUTING_FANOUT, INDEX_ROUTING_HEIGHT,
+    RoutingEntry, RoutingNode, SegmentIdentity, artifact_path, encode_component,
+};
+
+const INDEX_ARTIFACT_PACK_COMPONENTS: usize =
+    INDEX_ARTIFACT_PACK_BYTES / super::super::INDEX_COMPONENT_BYTES;
+
+/// One asynchronous durability boundary. Every returned descriptor names
+/// exact bytes already accepted by the sink. The format layer hands over one
+/// already-packed object buffer, so a storage implementation never has to
+/// copy a component batch into a second pack before staging it.
+pub trait ComponentBatchSink: Send {
+    fn publish_pack(
+        &mut self,
+        pack: ComponentPack,
+    ) -> impl Future<Output = Result<Vec<ArtifactDescriptor>, IndexError>> + Send;
+}
+
+/// One move-only ordinary-object pack assembled by the format layer.
+///
+/// Component boundaries are recovered from their checked fixed envelopes.
+/// Keeping a second, per-component layout vector would make resident memory
+/// depend on the number of tiny components in a pack.
+#[derive(Debug)]
+pub struct ComponentPack {
+    identity: SegmentIdentity,
+    bytes: Vec<u8>,
+}
+
+impl ComponentPack {
+    fn singleton(component: GeneratedComponent) -> Result<Self, IndexError> {
+        let identity = component.header().identity;
+        let bytes = component.into_bytes();
+        if bytes.is_empty() || bytes.len() > INDEX_ARTIFACT_PACK_BYTES {
+            return Err(IndexError::ResourceLimit {
+                needed: bytes.len(),
+                limit: INDEX_ARTIFACT_PACK_BYTES,
+            });
+        }
+        Ok(Self { identity, bytes })
+    }
+
+    pub fn identity(&self) -> SegmentIdentity {
+        self.identity
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn encoded_bytes(&self) -> u64 {
+        self.bytes.len() as u64
+    }
+
+    pub fn component_count(&self) -> Result<u64, IndexError> {
+        let mut offset = 0usize;
+        let mut count = 0u64;
+        while offset < self.bytes.len() {
+            let (_, length) = self.component_at(offset)?;
+            offset = offset
+                .checked_add(length)
+                .ok_or(IndexError::OffsetOverflow)?;
+            count = count.checked_add(1).ok_or(IndexError::OffsetOverflow)?;
+            if count > INDEX_ARTIFACT_PACK_COMPONENTS as u64 {
+                return Err(IndexError::InvalidFormat(
+                    "format-v4 artifact pack has too many components",
+                ));
+            }
+        }
+        Ok(count)
+    }
+
+    pub fn descriptors(
+        &self,
+        path: String,
+        object_version: u64,
+        object_content_hash: [u8; 32],
+    ) -> Result<Vec<ArtifactDescriptor>, IndexError> {
+        if object_content_hash != *blake3::hash(&self.bytes).as_bytes() {
+            return Err(IndexError::Integrity);
+        }
+        let object_length =
+            u64::try_from(self.bytes.len()).map_err(|_| IndexError::OffsetOverflow)?;
+        let mut offset = 0usize;
+        let mut output = Vec::new();
+        while offset < self.bytes.len() {
+            let (header, length) = self.component_at(offset)?;
+            output.push(ArtifactDescriptor::new(
+                self.identity.index_id,
+                path.clone(),
+                object_version,
+                object_content_hash,
+                object_length,
+                u64::try_from(offset).map_err(|_| IndexError::OffsetOverflow)?,
+                u64::try_from(length).map_err(|_| IndexError::OffsetOverflow)?,
+                header.logical_length,
+                header.component_kind,
+                header.codec_version,
+                header.payload_checksum,
+            )?);
+            if output.len() > INDEX_ARTIFACT_PACK_COMPONENTS {
+                return Err(IndexError::InvalidFormat(
+                    "format-v4 artifact pack has too many components",
+                ));
+            }
+            offset = offset
+                .checked_add(length)
+                .ok_or(IndexError::OffsetOverflow)?;
+        }
+        Ok(output)
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    fn component_at(
+        &self,
+        offset: usize,
+    ) -> Result<(super::super::ComponentHeader, usize), IndexError> {
+        if self.bytes.is_empty() || self.bytes.len() > INDEX_ARTIFACT_PACK_BYTES {
+            return Err(IndexError::InvalidFormat("format-v4 component pack length"));
+        }
+        let remaining = self.bytes.get(offset..).ok_or(IndexError::OffsetOverflow)?;
+        let header = decode_component_header(remaining)?;
+        if header.identity != self.identity {
+            return Err(IndexError::InvalidFormat(
+                "one component pack crossed segment identities",
+            ));
+        }
+        let payload =
+            usize::try_from(header.encoded_length).map_err(|_| IndexError::OffsetOverflow)?;
+        let length = COMPONENT_HEADER_BYTES
+            .checked_add(payload)
+            .ok_or(IndexError::OffsetOverflow)?;
+        if offset
+            .checked_add(length)
+            .is_none_or(|end| end > self.bytes.len())
+        {
+            return Err(IndexError::InvalidFormat(
+                "component extends beyond its artifact pack",
+            ));
+        }
+        Ok((header, length))
+    }
+}
+
+struct ComponentPackBuilder {
+    identity: Option<SegmentIdentity>,
+    bytes: Vec<u8>,
+    component_count: usize,
+}
+
+impl ComponentPackBuilder {
+    fn new() -> Self {
+        Self {
+            identity: None,
+            bytes: Vec::with_capacity(INDEX_ARTIFACT_PACK_BYTES),
+            component_count: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn is_full(&self) -> bool {
+        self.component_count == INDEX_ARTIFACT_PACK_COMPONENTS
+    }
+
+    fn push(&mut self, component: GeneratedComponent) -> Result<(), IndexError> {
+        let header = component.header();
+        if self
+            .identity
+            .is_some_and(|identity| identity != header.identity)
+        {
+            return Err(IndexError::InvalidDefinition(
+                "one component pack cannot cross segment identities".into(),
+            ));
+        }
+        let encoded = component.bytes().len();
+        let needed = self
+            .bytes
+            .len()
+            .checked_add(encoded)
+            .ok_or(IndexError::OffsetOverflow)?;
+        if needed > INDEX_ARTIFACT_PACK_BYTES {
+            return Err(IndexError::ResourceLimit {
+                needed,
+                limit: INDEX_ARTIFACT_PACK_BYTES,
+            });
+        }
+        if self.component_count == INDEX_ARTIFACT_PACK_COMPONENTS {
+            return Err(IndexError::ResourceLimit {
+                needed: self.component_count.saturating_add(1),
+                limit: INDEX_ARTIFACT_PACK_COMPONENTS,
+            });
+        }
+        self.identity = Some(header.identity);
+        self.bytes.extend_from_slice(component.bytes());
+        self.component_count = self
+            .component_count
+            .checked_add(1)
+            .ok_or(IndexError::OffsetOverflow)?;
+        Ok(())
+    }
+
+    fn finish(self) -> Result<ComponentPack, IndexError> {
+        Ok(ComponentPack {
+            identity: self.identity.ok_or_else(|| {
+                IndexError::InvalidDefinition("component pack must not be empty".into())
+            })?,
+            bytes: self.bytes,
+        })
+    }
+}
+
+async fn publish_single_component<S: ComponentBatchSink>(
+    sink: &mut S,
+    component: GeneratedComponent,
+) -> Result<ArtifactDescriptor, IndexError> {
+    let mut descriptors = sink
+        .publish_pack(ComponentPack::singleton(component)?)
+        .await?;
+    if descriptors.len() != 1 {
+        return Err(IndexError::InvalidFormat(
+            "component sink returned the wrong descriptor count",
+        ));
+    }
+    Ok(descriptors.pop().expect("one checked component descriptor"))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublishedObject {
+    pub path: String,
+    pub object_version: u64,
+    pub bytes: Vec<u8>,
+}
+
+/// Exact in-memory ordinary-object pack sink used by format tests.
+#[derive(Debug)]
+pub struct ExactMemorySink {
+    objects: BTreeMap<String, PublishedObject>,
+    next_object_version: u64,
+    publish_calls: usize,
+}
+
+impl Default for ExactMemorySink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ExactMemorySink {
+    pub fn new() -> Self {
+        Self {
+            objects: BTreeMap::new(),
+            next_object_version: 1,
+            publish_calls: 0,
+        }
+    }
+
+    pub fn objects(&self) -> &BTreeMap<String, PublishedObject> {
+        &self.objects
+    }
+
+    pub fn publish_calls(&self) -> usize {
+        self.publish_calls
+    }
+
+    pub fn component_bytes<'a>(
+        &'a self,
+        descriptor: &ArtifactDescriptor,
+    ) -> Result<&'a [u8], IndexError> {
+        let object = self
+            .objects
+            .get(&descriptor.path)
+            .ok_or_else(|| IndexError::FileNotFound(descriptor.path.clone()))?;
+        if object.object_version != descriptor.object_version {
+            return Err(IndexError::Integrity);
+        }
+        let start = usize::try_from(descriptor.offset).map_err(|_| IndexError::OffsetOverflow)?;
+        let length =
+            usize::try_from(descriptor.encoded_length).map_err(|_| IndexError::OffsetOverflow)?;
+        let end = start
+            .checked_add(length)
+            .ok_or(IndexError::OffsetOverflow)?;
+        object
+            .bytes
+            .get(start..end)
+            .ok_or(IndexError::InvalidFormat(
+                "component range outside memory pack",
+            ))
+    }
+
+    fn publish_memory_pack(
+        &mut self,
+        pack: ComponentPack,
+    ) -> Result<Vec<ArtifactDescriptor>, IndexError> {
+        let hash = *blake3::hash(pack.bytes()).as_bytes();
+        let path = artifact_path(pack.identity().index_id, hash);
+        let existing_version = if let Some(existing) = self.objects.get(&path) {
+            if existing.bytes != pack.bytes() {
+                return Err(IndexError::Integrity);
+            }
+            Some(existing.object_version)
+        } else {
+            None
+        };
+        let object_version = match existing_version {
+            Some(version) => version,
+            None => {
+                let version = self.next_object_version;
+                self.next_object_version = self
+                    .next_object_version
+                    .checked_add(1)
+                    .ok_or(IndexError::OffsetOverflow)?;
+                version
+            }
+        };
+        let descriptors = pack.descriptors(path.clone(), object_version, hash)?;
+        if existing_version.is_none() {
+            self.objects.insert(
+                path.clone(),
+                PublishedObject {
+                    path: path.clone(),
+                    object_version,
+                    bytes: pack.into_bytes(),
+                },
+            );
+        }
+        Ok(descriptors)
+    }
+}
+
+impl ComponentBatchSink for ExactMemorySink {
+    fn publish_pack(
+        &mut self,
+        pack: ComponentPack,
+    ) -> impl Future<Output = Result<Vec<ArtifactDescriptor>, IndexError>> + Send {
+        std::future::ready((|| {
+            self.publish_calls = self
+                .publish_calls
+                .checked_add(1)
+                .ok_or(IndexError::OffsetOverflow)?;
+            self.publish_memory_pack(pack)
+        })())
+    }
+}
+
+pub struct ComponentLeaf {
+    pub minimum_key: Vec<u8>,
+    pub maximum_key: Vec<u8>,
+    pub element_count: u64,
+    pub component: GeneratedComponent,
+}
+
+/// One already-published data leaf and the exact routing evidence needed to
+/// reuse it in a replacement immutable stream. This is deliberately distinct
+/// from [`ComponentLeaf`]: rebuilding a routing root must not republish an
+/// unchanged data component.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DescriptorLeaf {
+    pub minimum_key: Vec<u8>,
+    pub maximum_key: Vec<u8>,
+    pub element_count: u64,
+    pub descriptor: ArtifactDescriptor,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublishedStream {
+    pub root: ArtifactDescriptor,
+    pub minimum_key: Vec<u8>,
+    pub maximum_key: Vec<u8>,
+    pub element_count: u64,
+    pub routing_height: u8,
+    /// Complete recursively referenced component bytes, including envelopes.
+    pub encoded_bytes: u64,
+    pub logical_bytes: u64,
+    pub leaf_count: u64,
+    pub component_count: u64,
+}
+
+impl PublishedStream {
+    pub(crate) fn statistics(
+        &self,
+        role: ComponentKind,
+        field_id: Option<FieldId>,
+    ) -> Result<Option<ComponentStatistics>, IndexError> {
+        if !super::super::text::tracks_component_statistics(role) {
+            return Ok(None);
+        }
+        Ok(Some(ComponentStatistics {
+            role,
+            field_id,
+            leaf_count: self.leaf_count,
+            component_count: self.component_count,
+            encoded_bytes: self.encoded_bytes,
+            logical_bytes: self.logical_bytes,
+            decoded_bytes_upper_bound: self
+                .component_count
+                .checked_mul(INDEX_DECODE_BYTES as u64)
+                .ok_or(IndexError::OffsetOverflow)?,
+        }))
+    }
+}
+
+struct PublishedNode {
+    minimum_key: Vec<u8>,
+    maximum_key: Vec<u8>,
+    element_count: u64,
+    descriptor: ArtifactDescriptor,
+}
+
+struct PendingLeaf {
+    minimum_key: Vec<u8>,
+    maximum_key: Vec<u8>,
+    element_count: u64,
+    header: super::super::ComponentHeader,
+    encoded_length: usize,
+}
+
+/// Fixed-memory publisher for one routed component stream.
+///
+/// Data leaves are durably placed in ordinary-object batches capped at the
+/// artifact-pack bound. At most one incomplete pack and one incomplete fanout
+/// group at each routing height are retained, so resident memory is bounded by
+/// format constants rather than by the number of leaves in the stream.
+pub struct StreamingComponentPublisher<'a, S> {
+    sink: &'a mut S,
+    identity: SegmentIdentity,
+    logical_kind: ComponentKind,
+    leaf_codec_version: u16,
+    routing_codec_version: u16,
+    pending_leaves: Vec<PendingLeaf>,
+    pending_pack: Option<ComponentPackBuilder>,
+    levels: Vec<Vec<PublishedNode>>,
+    first_minimum_key: Option<Vec<u8>>,
+    previous_maximum_key: Option<Vec<u8>>,
+    element_count: u64,
+    encoded_bytes: u64,
+    logical_bytes: u64,
+    component_count: u64,
+    leaf_count: u64,
+}
+
+impl<'a, S: ComponentBatchSink> StreamingComponentPublisher<'a, S> {
+    pub fn new(
+        sink: &'a mut S,
+        identity: SegmentIdentity,
+        logical_kind: ComponentKind,
+        leaf_codec_version: u16,
+        routing_codec_version: u16,
+    ) -> Result<Self, IndexError> {
+        identity.validate()?;
+        if logical_kind == ComponentKind::ROUTING_NODE
+            || leaf_codec_version == 0
+            || routing_codec_version == 0
+        {
+            return Err(IndexError::InvalidDefinition(
+                "streaming component publisher requires data and routing codecs".into(),
+            ));
+        }
+        Ok(Self {
+            sink,
+            identity,
+            logical_kind,
+            leaf_codec_version,
+            routing_codec_version,
+            pending_leaves: Vec::new(),
+            pending_pack: None,
+            levels: vec![Vec::new()],
+            first_minimum_key: None,
+            previous_maximum_key: None,
+            element_count: 0,
+            encoded_bytes: 0,
+            logical_bytes: 0,
+            component_count: 0,
+            leaf_count: 0,
+        })
+    }
+
+    pub fn leaf_count(&self) -> u64 {
+        self.leaf_count
+    }
+
+    pub async fn push_payload(
+        &mut self,
+        minimum_key: Vec<u8>,
+        maximum_key: Vec<u8>,
+        element_count: u64,
+        payload: Vec<u8>,
+    ) -> Result<(), IndexError> {
+        let (flags, logical_length, payload) =
+            prepare_component_payload(self.logical_kind, self.leaf_codec_version, payload)?;
+        let component = encode_component(
+            self.identity,
+            self.logical_kind,
+            self.leaf_codec_version,
+            flags,
+            logical_length,
+            payload,
+        )?;
+        self.push_leaf(ComponentLeaf {
+            minimum_key,
+            maximum_key,
+            element_count,
+            component,
+        })
+        .await
+    }
+
+    pub async fn push_leaf(&mut self, leaf: ComponentLeaf) -> Result<(), IndexError> {
+        self.validate_leaf_range(&leaf.minimum_key, &leaf.maximum_key, leaf.element_count)?;
+        let header = leaf.component.header();
+        if header.identity != self.identity
+            || header.component_kind != self.logical_kind
+            || header.codec_version != self.leaf_codec_version
+        {
+            return Err(IndexError::InvalidDefinition(
+                "streaming component leaves must have ordered disjoint ranges and one identity"
+                    .into(),
+            ));
+        }
+        let encoded = leaf.component.bytes().len();
+        if encoded > INDEX_ARTIFACT_PACK_BYTES {
+            return Err(IndexError::ResourceLimit {
+                needed: encoded,
+                limit: INDEX_ARTIFACT_PACK_BYTES,
+            });
+        }
+        let pending_bytes = self
+            .pending_pack
+            .as_ref()
+            .map(ComponentPackBuilder::len)
+            .unwrap_or(0);
+        if self.pending_pack.as_ref().is_some_and(|pack| {
+            pack.is_full() || pending_bytes.saturating_add(encoded) > INDEX_ARTIFACT_PACK_BYTES
+        }) {
+            self.flush_pending_leaves().await?;
+        }
+        self.pending_pack
+            .get_or_insert_with(ComponentPackBuilder::new)
+            .push(leaf.component)?;
+        self.pending_leaves.push(PendingLeaf {
+            minimum_key: leaf.minimum_key,
+            maximum_key: leaf.maximum_key,
+            element_count: leaf.element_count,
+            header,
+            encoded_length: encoded,
+        });
+        if self
+            .pending_pack
+            .as_ref()
+            .is_some_and(|pack| pack.is_full() || pack.len() == INDEX_ARTIFACT_PACK_BYTES)
+        {
+            self.flush_pending_leaves().await?;
+        }
+        Ok(())
+    }
+
+    /// Add one already-published leaf without opening or publishing its data
+    /// component again. The descriptor must have been obtained by traversing
+    /// this publisher's exact `SegmentIdentity`; descriptors deliberately do
+    /// not duplicate the segment identity carried by their checked envelope.
+    pub async fn push_descriptor_leaf(&mut self, leaf: DescriptorLeaf) -> Result<(), IndexError> {
+        self.validate_leaf_range(&leaf.minimum_key, &leaf.maximum_key, leaf.element_count)?;
+        leaf.descriptor.validate(self.identity.index_id)?;
+        if leaf.descriptor.component_kind != self.logical_kind
+            || leaf.descriptor.codec_version != self.leaf_codec_version
+        {
+            return Err(IndexError::InvalidDefinition(
+                "reused component leaf differs from the publisher stream".into(),
+            ));
+        }
+        self.flush_pending_leaves().await?;
+        self.push_published_leaf(leaf).await
+    }
+
+    async fn flush_pending_leaves(&mut self) -> Result<(), IndexError> {
+        if self.pending_leaves.is_empty() {
+            if self.pending_pack.is_some() {
+                return Err(IndexError::InvalidFormat(
+                    "component pack has no corresponding leaves",
+                ));
+            }
+            return Ok(());
+        }
+        let metadata = std::mem::take(&mut self.pending_leaves);
+        let pack = self
+            .pending_pack
+            .take()
+            .ok_or(IndexError::InvalidFormat("leaves have no component pack"))?
+            .finish()?;
+        let descriptors = self.sink.publish_pack(pack).await?;
+        if descriptors.len() != metadata.len() {
+            return Err(IndexError::InvalidFormat(
+                "component sink returned the wrong descriptor count",
+            ));
+        }
+        for (descriptor, leaf) in descriptors.into_iter().zip(metadata) {
+            validate_placed_component(&descriptor, leaf.header, leaf.encoded_length)?;
+            self.push_published_leaf(DescriptorLeaf {
+                minimum_key: leaf.minimum_key,
+                maximum_key: leaf.maximum_key,
+                element_count: leaf.element_count,
+                descriptor,
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn push_published_leaf(&mut self, leaf: DescriptorLeaf) -> Result<(), IndexError> {
+        self.record_descriptor(&leaf.descriptor)?;
+        if self.first_minimum_key.is_none() {
+            self.first_minimum_key = Some(leaf.minimum_key.clone());
+        }
+        self.previous_maximum_key = Some(leaf.maximum_key.clone());
+        self.element_count = self
+            .element_count
+            .checked_add(leaf.element_count)
+            .ok_or(IndexError::OffsetOverflow)?;
+        self.leaf_count = self
+            .leaf_count
+            .checked_add(1)
+            .ok_or(IndexError::OffsetOverflow)?;
+        self.levels[0].push(PublishedNode {
+            minimum_key: leaf.minimum_key,
+            maximum_key: leaf.maximum_key,
+            element_count: leaf.element_count,
+            descriptor: leaf.descriptor,
+        });
+        self.cascade_full_levels(0).await
+    }
+
+    fn validate_leaf_range(
+        &self,
+        minimum_key: &[u8],
+        maximum_key: &[u8],
+        element_count: u64,
+    ) -> Result<(), IndexError> {
+        super::super::model::validate_routing_key(minimum_key)?;
+        super::super::model::validate_routing_key(maximum_key)?;
+        let previous_maximum_key = self
+            .pending_leaves
+            .last()
+            .map(|leaf| &leaf.maximum_key)
+            .or(self.previous_maximum_key.as_ref());
+        if element_count == 0
+            || minimum_key.is_empty()
+            || minimum_key > maximum_key
+            || previous_maximum_key.is_some_and(|previous| previous.as_slice() >= minimum_key)
+        {
+            return Err(IndexError::InvalidDefinition(
+                "streaming component leaves must have ordered disjoint ranges and one identity"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn finish(mut self) -> Result<PublishedStream, IndexError> {
+        self.flush_pending_leaves().await?;
+        if self.leaf_count == 0 {
+            return Err(IndexError::InvalidDefinition(
+                "component stream requires at least one leaf".into(),
+            ));
+        }
+        loop {
+            let occupied = self
+                .levels
+                .iter()
+                .enumerate()
+                .filter(|(_, nodes)| !nodes.is_empty())
+                .collect::<Vec<_>>();
+            if occupied.len() == 1 && occupied[0].1.len() == 1 && occupied[0].0 > 0 {
+                let root_level = occupied[0].0;
+                let root = self.levels[root_level]
+                    .pop()
+                    .expect("one routing root")
+                    .descriptor;
+                return Ok(PublishedStream {
+                    root,
+                    minimum_key: self
+                        .first_minimum_key
+                        .expect("nonempty stream has a minimum key"),
+                    maximum_key: self
+                        .previous_maximum_key
+                        .expect("nonempty stream has a maximum key"),
+                    element_count: self.element_count,
+                    routing_height: u8::try_from(root_level)
+                        .map_err(|_| IndexError::OffsetOverflow)?,
+                    encoded_bytes: self.encoded_bytes,
+                    logical_bytes: self.logical_bytes,
+                    leaf_count: self.leaf_count,
+                    component_count: self.component_count,
+                });
+            }
+            let level = self
+                .levels
+                .iter()
+                .position(|nodes| !nodes.is_empty())
+                .expect("a nonempty stream has an occupied level");
+            self.publish_level(level).await?;
+            self.cascade_full_levels(level + 1).await?;
+        }
+    }
+
+    async fn cascade_full_levels(&mut self, mut level: usize) -> Result<(), IndexError> {
+        while self
+            .levels
+            .get(level)
+            .is_some_and(|nodes| nodes.len() == INDEX_ROUTING_FANOUT)
+        {
+            self.publish_level(level).await?;
+            level += 1;
+        }
+        Ok(())
+    }
+
+    async fn publish_level(&mut self, level: usize) -> Result<(), IndexError> {
+        let height = u8::try_from(level + 1).map_err(|_| IndexError::OffsetOverflow)?;
+        if height > INDEX_ROUTING_HEIGHT {
+            return Err(IndexError::ResourceLimit {
+                needed: height as usize,
+                limit: INDEX_ROUTING_HEIGHT as usize,
+            });
+        }
+        let children = std::mem::take(
+            self.levels
+                .get_mut(level)
+                .ok_or(IndexError::InvalidFormat("streaming routing level"))?,
+        );
+        if children.is_empty() || children.len() > INDEX_ROUTING_FANOUT {
+            return Err(IndexError::InvalidFormat(
+                "streaming routing fanout is invalid",
+            ));
+        }
+        let minimum_key = children.first().unwrap().minimum_key.clone();
+        let maximum_key = children.last().unwrap().maximum_key.clone();
+        let element_count = children.iter().try_fold(0u64, |sum, child| {
+            sum.checked_add(child.element_count)
+                .ok_or(IndexError::OffsetOverflow)
+        })?;
+        let entries = children
+            .into_iter()
+            .map(|child| RoutingEntry {
+                minimum_key: child.minimum_key,
+                maximum_key: child.maximum_key,
+                element_count: child.element_count,
+                child: child.descriptor,
+            })
+            .collect();
+        let routing = RoutingNode::new(self.identity.index_id, height, entries)?;
+        let payload = routing.encode_payload()?;
+        let component = encode_component(
+            self.identity,
+            ComponentKind::ROUTING_NODE,
+            self.routing_codec_version,
+            0,
+            u64::try_from(payload.len()).map_err(|_| IndexError::OffsetOverflow)?,
+            payload,
+        )?;
+        let header = component.header();
+        let encoded = component.bytes().len();
+        let descriptor = publish_single_component(self.sink, component).await?;
+        validate_placed_component(&descriptor, header, encoded)?;
+        self.record_descriptor(&descriptor)?;
+        if self.levels.len() <= level + 1 {
+            self.levels.push(Vec::new());
+        }
+        self.levels[level + 1].push(PublishedNode {
+            minimum_key,
+            maximum_key,
+            element_count,
+            descriptor,
+        });
+        Ok(())
+    }
+
+    fn record_descriptor(&mut self, descriptor: &ArtifactDescriptor) -> Result<(), IndexError> {
+        self.encoded_bytes = self
+            .encoded_bytes
+            .checked_add(descriptor.encoded_length)
+            .ok_or(IndexError::OffsetOverflow)?;
+        self.logical_bytes = self
+            .logical_bytes
+            .checked_add(descriptor.logical_length)
+            .ok_or(IndexError::OffsetOverflow)?;
+        self.component_count = self
+            .component_count
+            .checked_add(1)
+            .ok_or(IndexError::OffsetOverflow)?;
+        Ok(())
+    }
+}
+
+fn validate_placed_component(
+    descriptor: &ArtifactDescriptor,
+    header: super::super::ComponentHeader,
+    encoded: usize,
+) -> Result<(), IndexError> {
+    if descriptor.component_kind != header.component_kind
+        || descriptor.codec_version != header.codec_version
+        || descriptor.logical_length != header.logical_length
+        || descriptor.encoded_length
+            != u64::try_from(encoded).map_err(|_| IndexError::OffsetOverflow)?
+        || descriptor.checksum != header.payload_checksum
+    {
+        return Err(IndexError::InvalidFormat(
+            "component sink changed component identity",
+        ));
+    }
+    Ok(())
+}
+
+/// Publish data leaves and then each required parent routing layer. No parent
+/// can contain a provisional location because a layer is complete before the
+/// next one is encoded.
+pub async fn publish_stream<S: ComponentBatchSink>(
+    sink: &mut S,
+    identity: SegmentIdentity,
+    routing_codec_version: u16,
+    leaves: Vec<ComponentLeaf>,
+) -> Result<PublishedStream, IndexError> {
+    let mut leaves = leaves.into_iter();
+    let first = leaves.next().ok_or_else(|| {
+        IndexError::InvalidDefinition("component stream requires leaves and a routing codec".into())
+    })?;
+    if routing_codec_version == 0 {
+        return Err(IndexError::InvalidDefinition(
+            "component stream requires leaves and a routing codec".into(),
+        ));
+    }
+    let header = first.component.header();
+    let mut publisher = StreamingComponentPublisher::new(
+        sink,
+        identity,
+        header.component_kind,
+        header.codec_version,
+        routing_codec_version,
+    )?;
+    publisher.push_leaf(first).await?;
+    for leaf in leaves {
+        publisher.push_leaf(leaf).await?;
+    }
+    publisher.finish().await
+}
+
+/// Publish a new routing tree over ordered existing or newly published data
+/// leaves. Only routing parents are written. Returned totals include every
+/// referenced data leaf as well as the new routing nodes, so callers can use
+/// them directly in segment and generation accounting.
+pub async fn publish_descriptor_stream<S: ComponentBatchSink>(
+    sink: &mut S,
+    identity: SegmentIdentity,
+    logical_kind: ComponentKind,
+    routing_codec_version: u16,
+    leaves: Vec<DescriptorLeaf>,
+) -> Result<PublishedStream, IndexError> {
+    let leaf_codec_version = leaves
+        .first()
+        .map(|leaf| leaf.descriptor.codec_version)
+        .ok_or_else(|| {
+            IndexError::InvalidDefinition(
+                "descriptor stream requires data leaves and a routing codec".into(),
+            )
+        })?;
+    let mut publisher = StreamingComponentPublisher::new(
+        sink,
+        identity,
+        logical_kind,
+        leaf_codec_version,
+        routing_codec_version,
+    )?;
+    for leaf in leaves {
+        publisher.push_descriptor_leaf(leaf).await?;
+    }
+    publisher.finish().await
+}
+
+/// Assemble independently published, non-overlapping range subtrees into one
+/// routed stream. Lane completion order is irrelevant: the coordinator sorts
+/// and validates exact key ranges, promotes shorter roots, and writes only the
+/// bounded routing layers required to join them.
+pub async fn combine_published_streams<S: ComponentBatchSink>(
+    sink: &mut S,
+    identity: SegmentIdentity,
+    logical_kind: ComponentKind,
+    routing_codec_version: u16,
+    mut streams: Vec<PublishedStream>,
+) -> Result<PublishedStream, IndexError> {
+    identity.validate()?;
+    if streams.is_empty()
+        || logical_kind == ComponentKind::ROUTING_NODE
+        || routing_codec_version == 0
+    {
+        return Err(IndexError::InvalidDefinition(
+            "range subtree assembly requires at least one logical stream".into(),
+        ));
+    }
+    streams.sort_by(|left, right| left.minimum_key.cmp(&right.minimum_key));
+    let mut previous = None::<Vec<u8>>;
+    for stream in &streams {
+        super::super::model::validate_routing_key(&stream.minimum_key)?;
+        super::super::model::validate_routing_key(&stream.maximum_key)?;
+        stream.root.validate(identity.index_id)?;
+        if stream.minimum_key > stream.maximum_key
+            || stream.element_count == 0
+            || stream.routing_height == 0
+            || stream.routing_height > INDEX_ROUTING_HEIGHT
+            || stream.root.component_kind != ComponentKind::ROUTING_NODE
+            || stream.root.codec_version != routing_codec_version
+            || previous
+                .as_ref()
+                .is_some_and(|value| value.as_slice() >= stream.minimum_key.as_slice())
+        {
+            return Err(IndexError::InvalidFormat(
+                "range subtrees are not ordered, disjoint routing trees",
+            ));
+        }
+        previous = Some(stream.maximum_key.clone());
+    }
+    if streams.len() == 1 {
+        return Ok(streams.pop().expect("one checked subtree"));
+    }
+    let target_height = streams
+        .iter()
+        .map(|stream| stream.routing_height)
+        .max()
+        .expect("nonempty checked subtrees");
+    let mut promoted = Vec::with_capacity(streams.len());
+    for stream in streams {
+        promoted.push(
+            promote_stream(sink, identity, routing_codec_version, stream, target_height).await?,
+        );
+    }
+    let minimum_key = promoted.first().unwrap().minimum_key.clone();
+    let maximum_key = promoted.last().unwrap().maximum_key.clone();
+    let element_count = promoted.iter().try_fold(0u64, |sum, stream| {
+        sum.checked_add(stream.element_count)
+            .ok_or(IndexError::OffsetOverflow)
+    })?;
+    let mut encoded_bytes = promoted.iter().try_fold(0u64, |sum, stream| {
+        sum.checked_add(stream.encoded_bytes)
+            .ok_or(IndexError::OffsetOverflow)
+    })?;
+    let mut logical_bytes = promoted.iter().try_fold(0u64, |sum, stream| {
+        sum.checked_add(stream.logical_bytes)
+            .ok_or(IndexError::OffsetOverflow)
+    })?;
+    let mut component_count = promoted.iter().try_fold(0u64, |sum, stream| {
+        sum.checked_add(stream.component_count)
+            .ok_or(IndexError::OffsetOverflow)
+    })?;
+    let leaf_count = promoted.iter().try_fold(0u64, |sum, stream| {
+        sum.checked_add(stream.leaf_count)
+            .ok_or(IndexError::OffsetOverflow)
+    })?;
+    let mut nodes = promoted
+        .into_iter()
+        .map(|stream| PublishedNode {
+            minimum_key: stream.minimum_key,
+            maximum_key: stream.maximum_key,
+            element_count: stream.element_count,
+            descriptor: stream.root,
+        })
+        .collect::<Vec<_>>();
+    let mut height = target_height;
+    while nodes.len() != 1 {
+        height = height.checked_add(1).ok_or(IndexError::OffsetOverflow)?;
+        if height > INDEX_ROUTING_HEIGHT {
+            return Err(IndexError::ResourceLimit {
+                needed: height as usize,
+                limit: INDEX_ROUTING_HEIGHT as usize,
+            });
+        }
+        let mut parents = Vec::with_capacity(nodes.len().div_ceil(INDEX_ROUTING_FANOUT));
+        for children in nodes.chunks(INDEX_ROUTING_FANOUT) {
+            let node = RoutingNode::new(
+                identity.index_id,
+                height,
+                children
+                    .iter()
+                    .map(|child| RoutingEntry {
+                        minimum_key: child.minimum_key.clone(),
+                        maximum_key: child.maximum_key.clone(),
+                        element_count: child.element_count,
+                        child: child.descriptor.clone(),
+                    })
+                    .collect(),
+            )?;
+            let payload = node.encode_payload()?;
+            let component = encode_component(
+                identity,
+                ComponentKind::ROUTING_NODE,
+                routing_codec_version,
+                0,
+                payload.len() as u64,
+                payload,
+            )?;
+            let minimum_key = children.first().unwrap().minimum_key.clone();
+            let maximum_key = children.last().unwrap().maximum_key.clone();
+            let element_count = children.iter().try_fold(0u64, |sum, child| {
+                sum.checked_add(child.element_count)
+                    .ok_or(IndexError::OffsetOverflow)
+            })?;
+            let header = component.header();
+            let encoded = component.bytes().len();
+            let descriptor = publish_single_component(sink, component).await?;
+            validate_placed_component(&descriptor, header, encoded)?;
+            encoded_bytes = encoded_bytes
+                .checked_add(descriptor.encoded_length)
+                .ok_or(IndexError::OffsetOverflow)?;
+            logical_bytes = logical_bytes
+                .checked_add(descriptor.logical_length)
+                .ok_or(IndexError::OffsetOverflow)?;
+            component_count = component_count
+                .checked_add(1)
+                .ok_or(IndexError::OffsetOverflow)?;
+            parents.push(PublishedNode {
+                minimum_key,
+                maximum_key,
+                element_count,
+                descriptor,
+            });
+        }
+        nodes = parents;
+    }
+    Ok(PublishedStream {
+        root: nodes.pop().expect("one assembled routing root").descriptor,
+        minimum_key,
+        maximum_key,
+        element_count,
+        routing_height: height,
+        encoded_bytes,
+        logical_bytes,
+        leaf_count,
+        component_count,
+    })
+}
+
+async fn promote_stream<S: ComponentBatchSink>(
+    sink: &mut S,
+    identity: SegmentIdentity,
+    routing_codec_version: u16,
+    mut stream: PublishedStream,
+    target_height: u8,
+) -> Result<PublishedStream, IndexError> {
+    while stream.routing_height < target_height {
+        let height = stream
+            .routing_height
+            .checked_add(1)
+            .ok_or(IndexError::OffsetOverflow)?;
+        let node = RoutingNode::new(
+            identity.index_id,
+            height,
+            vec![RoutingEntry {
+                minimum_key: stream.minimum_key.clone(),
+                maximum_key: stream.maximum_key.clone(),
+                element_count: stream.element_count,
+                child: stream.root,
+            }],
+        )?;
+        let payload = node.encode_payload()?;
+        let component = encode_component(
+            identity,
+            ComponentKind::ROUTING_NODE,
+            routing_codec_version,
+            0,
+            payload.len() as u64,
+            payload,
+        )?;
+        let header = component.header();
+        let encoded = component.bytes().len();
+        let descriptor = publish_single_component(sink, component).await?;
+        validate_placed_component(&descriptor, header, encoded)?;
+        stream.encoded_bytes = stream
+            .encoded_bytes
+            .checked_add(descriptor.encoded_length)
+            .ok_or(IndexError::OffsetOverflow)?;
+        stream.logical_bytes = stream
+            .logical_bytes
+            .checked_add(descriptor.logical_length)
+            .ok_or(IndexError::OffsetOverflow)?;
+        stream.component_count = stream
+            .component_count
+            .checked_add(1)
+            .ok_or(IndexError::OffsetOverflow)?;
+        stream.root = descriptor;
+        stream.routing_height = height;
+    }
+    Ok(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn completed_pack_moves_into_sink_and_preserves_component_ranges() {
+        let identity = SegmentIdentity::new(1, 2, [3; 32], 4).unwrap();
+        let first =
+            encode_component(identity, ComponentKind::POSTINGS, 1, 0, 3, vec![1, 2, 3]).unwrap();
+        let first_length = first.bytes().len() as u64;
+        let second =
+            encode_component(identity, ComponentKind::POSTINGS, 1, 0, 2, vec![4, 5]).unwrap();
+        let mut builder = ComponentPackBuilder::new();
+        builder.push(first).unwrap();
+        builder.push(second).unwrap();
+        let buffer = builder.bytes.as_ptr();
+        let mut sink = ExactMemorySink::new();
+        let descriptors = sink.publish_pack(builder.finish().unwrap()).await.unwrap();
+        assert_eq!(descriptors.len(), 2);
+        assert_eq!(descriptors[0].offset, 0);
+        assert_eq!(descriptors[1].offset, first_length);
+        assert_eq!(descriptors[0].path, descriptors[1].path);
+        assert_eq!(
+            sink.objects()[&descriptors[0].path].bytes.as_ptr(),
+            buffer,
+            "publishing must move the completed pack instead of copying it",
+        );
+    }
+
+    #[tokio::test]
+    async fn child_layers_are_exact_before_parent_publication() {
+        let identity = SegmentIdentity::new(1, 2, [3; 32], 4).unwrap();
+        let mut leaves = Vec::new();
+        for value in 0..33u32 {
+            let payload = value.to_le_bytes().to_vec();
+            leaves.push(ComponentLeaf {
+                minimum_key: value.to_be_bytes().to_vec(),
+                maximum_key: value.to_be_bytes().to_vec(),
+                element_count: 1,
+                component: encode_component(
+                    identity,
+                    ComponentKind::POSTINGS,
+                    1,
+                    0,
+                    payload.len() as u64,
+                    payload,
+                )
+                .unwrap(),
+            });
+        }
+        let mut sink = ExactMemorySink::new();
+        let stream = publish_stream(&mut sink, identity, 1, leaves)
+            .await
+            .unwrap();
+        assert_eq!(sink.publish_calls(), 5);
+        assert_eq!(sink.objects().len(), 5);
+        assert_eq!(stream.component_count, 36); // 33 leaves, 2 parents, 1 root.
+        assert_eq!(stream.root.component_kind, ComponentKind::ROUTING_NODE);
+        assert!(sink.component_bytes(&stream.root).is_ok());
+    }
+
+    #[tokio::test]
+    async fn descriptor_rewrite_reuses_data_and_counts_complete_stream() {
+        let identity = SegmentIdentity::new(1, 2, [3; 32], 4).unwrap();
+        let generated = (0..2u32)
+            .map(|value| {
+                encode_component(
+                    identity,
+                    ComponentKind::LIVE_MASK,
+                    1,
+                    0,
+                    4,
+                    value.to_le_bytes().to_vec(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut sink = ExactMemorySink::new();
+        let mut pack = ComponentPackBuilder::new();
+        for component in generated {
+            pack.push(component).unwrap();
+        }
+        let descriptors = sink.publish_pack(pack.finish().unwrap()).await.unwrap();
+        let before = sink.objects().len();
+        let leaves = descriptors
+            .iter()
+            .enumerate()
+            .map(|(offset, descriptor)| DescriptorLeaf {
+                minimum_key: (offset as u32).to_be_bytes().to_vec(),
+                maximum_key: (offset as u32).to_be_bytes().to_vec(),
+                element_count: 1,
+                descriptor: descriptor.clone(),
+            })
+            .collect();
+        let stream =
+            publish_descriptor_stream(&mut sink, identity, ComponentKind::LIVE_MASK, 1, leaves)
+                .await
+                .unwrap();
+        assert_eq!(stream.component_count, 3);
+        assert_eq!(
+            stream.encoded_bytes,
+            descriptors
+                .iter()
+                .map(|value| value.encoded_length)
+                .sum::<u64>()
+                + stream.root.encoded_length
+        );
+        assert_eq!(sink.objects().len(), before + 1);
+    }
+
+    #[tokio::test]
+    async fn streaming_small_leaves_share_bounded_ordinary_packs() {
+        let identity = SegmentIdentity::new(1, 2, [3; 32], 4).unwrap();
+        let mut sink = ExactMemorySink::new();
+        let mut publisher =
+            StreamingComponentPublisher::new(&mut sink, identity, ComponentKind::POSTINGS, 1, 1)
+                .unwrap();
+        for value in 0..40_u32 {
+            publisher
+                .push_payload(
+                    value.to_be_bytes().to_vec(),
+                    value.to_be_bytes().to_vec(),
+                    1,
+                    value.to_le_bytes().to_vec(),
+                )
+                .await
+                .unwrap();
+        }
+        let stream = publisher.finish().await.unwrap();
+
+        assert_eq!(stream.component_count, 43); // 40 leaves, 2 parents, 1 root.
+        assert_eq!(sink.publish_calls(), 5);
+        assert_eq!(sink.objects().len(), 5);
+        assert!(sink.component_bytes(&stream.root).is_ok());
+    }
+
+    #[tokio::test]
+    async fn range_subtree_assembly_is_completion_order_independent() {
+        let identity = SegmentIdentity::new(1, 2, [3; 32], 4).unwrap();
+        let mut sink = ExactMemorySink::new();
+        let mut left =
+            StreamingComponentPublisher::new(&mut sink, identity, ComponentKind::POSTINGS, 1, 1)
+                .unwrap();
+        left.push_payload(vec![0], vec![0], 1, vec![10])
+            .await
+            .unwrap();
+        let left = left.finish().await.unwrap();
+        let mut right =
+            StreamingComponentPublisher::new(&mut sink, identity, ComponentKind::POSTINGS, 1, 1)
+                .unwrap();
+        right
+            .push_payload(vec![1], vec![1], 1, vec![11])
+            .await
+            .unwrap();
+        let right = right.finish().await.unwrap();
+
+        let reversed = combine_published_streams(
+            &mut sink,
+            identity,
+            ComponentKind::POSTINGS,
+            1,
+            vec![right.clone(), left.clone()],
+        )
+        .await
+        .unwrap();
+        let ordered = combine_published_streams(
+            &mut sink,
+            identity,
+            ComponentKind::POSTINGS,
+            1,
+            vec![left, right],
+        )
+        .await
+        .unwrap();
+        assert_eq!(reversed.root, ordered.root);
+        assert_eq!(reversed.minimum_key, vec![0]);
+        assert_eq!(reversed.maximum_key, vec![1]);
+        assert_eq!(reversed.element_count, 2);
+    }
+}

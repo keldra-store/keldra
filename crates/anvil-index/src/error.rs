@@ -27,13 +27,3 @@ pub enum IndexError {
     #[error("index memory limit is {limit} bytes but this operation needs {needed} bytes")]
     ResourceLimit { needed: usize, limit: usize },
 }
-
-impl From<serde_json::Error> for IndexError {
-    fn from(error: serde_json::Error) -> Self {
-        if error.is_data() || error.is_syntax() {
-            Self::Decode(error.to_string())
-        } else {
-            Self::Encode(error.to_string())
-        }
-    }
-}
