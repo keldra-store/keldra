@@ -157,6 +157,65 @@ mod tests {
     }
 
     #[test]
+    fn typed_json_queries_expose_fielded_text_facets_and_aggregates() {
+        use super::v1::{
+            IndexAggregateOperation, IndexAggregateRequest, IndexAggregateResult, IndexFacetBucket,
+            IndexFacetRequest, IndexFacetResult, IndexPredicate, IndexPredicateOperator,
+            IndexQueryHit, QueryIndexResponse, TypedJsonIndexQuery,
+        };
+
+        let query = TypedJsonIndexQuery {
+            predicates: vec![
+                IndexPredicate {
+                    field: "summary".into(),
+                    operator: IndexPredicateOperator::FullText as i32,
+                    values_json: vec![br#""memory safety""#.to_vec()],
+                },
+                IndexPredicate {
+                    field: "summary".into(),
+                    operator: IndexPredicateOperator::Phrase as i32,
+                    values_json: vec![br#""memory safety""#.to_vec()],
+                },
+            ],
+            order: Vec::new(),
+            facets: vec![IndexFacetRequest {
+                field: "ecosystem".into(),
+                limit: 10,
+            }],
+            aggregates: vec![IndexAggregateRequest {
+                field: "severity".into(),
+                operation: IndexAggregateOperation::Average as i32,
+            }],
+        };
+        let response = QueryIndexResponse {
+            hits: vec![IndexQueryHit {
+                address: None,
+                object_version: 7,
+                score: Some(0.75),
+            }],
+            next_page_token: Vec::new(),
+            freshness: None,
+            facet_results: vec![IndexFacetResult {
+                field: "ecosystem".into(),
+                buckets: vec![IndexFacetBucket {
+                    value_json: br#""cargo""#.to_vec(),
+                    count: 4,
+                }],
+            }],
+            aggregate_results: vec![IndexAggregateResult {
+                field: "severity".into(),
+                operation: IndexAggregateOperation::Average as i32,
+                value_json: Some(b"7.5".to_vec()),
+                contributing_count: 4,
+            }],
+        };
+
+        assert_eq!(query.facets[0].limit, 10);
+        assert_eq!(response.hits[0].object_version, 7);
+        assert_eq!(response.aggregate_results[0].contributing_count, 4);
+    }
+
+    #[test]
     fn generated_personaldb_client_is_publicly_exposed() {
         let _: Option<
             super::v1::personal_db_service_client::PersonalDbServiceClient<

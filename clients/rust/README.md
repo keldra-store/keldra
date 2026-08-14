@@ -56,6 +56,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 Use an HTTPS endpoint when exchanging client credentials.
 
+## Define a typed index safely
+
+Typed JSON fields expose only capabilities valid for their logical type. The
+builder below creates exact keyword postings and numeric order doc values; an
+invalid combination such as Boolean range search cannot be constructed.
+
+```rust,no_run
+use anvil_storage::{KeywordField, SignedIntegerField, TypedJsonIndexBuilder};
+
+# fn definition() -> Result<anvil_storage::v1::CreateIndexRequest, Box<dyn std::error::Error + Send + Sync>> {
+let modified = SignedIntegerField::single("modified_at", "/modified_at")
+    .range()
+    .order();
+let newest_first = modified.descending();
+
+let request = TypedJsonIndexBuilder::new("documents", "published")
+    .path_prefix("articles/")
+    .content_type("application/json")
+    .field(KeywordField::single("status", "/status").exact())
+    .field(modified)
+    .physical_order([newest_first])
+    .finish("create-published-index")?;
+# let _ = request;
+# Ok(())
+# }
+```
+
+Pass the request to `IndexServiceClient::create_index`. Query hits return the
+ordinary object address and exact version; fetch selected source objects with
+`GetObject` or `BatchGet`.
+
 ## Upload with compare-and-swap
 
 `put_chunks` performs Anvil's `StartPut`, streaming `Put`, and `PutEnd` flow.

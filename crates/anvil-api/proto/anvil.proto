@@ -228,7 +228,9 @@ message PathIndexSpec {}
 message MetadataFilterIndexSpec {
   // Names from Anvil's fixed object-head projection: path, version,
   // content_type, content_length, content_hash, and committed_at_unix_millis.
-  // Arbitrary user metadata is deliberately not part of the 0.5.2 object API.
+  // These fields retain their kind-defined fixed schemas and capabilities;
+  // arbitrary user metadata and Typed JSON capability declarations do not
+  // apply to this index kind.
   repeated string fields = 1;
 }
 
@@ -246,6 +248,8 @@ message FullTextField {
 }
 
 message FullTextIndexSpec {
+  // Dedicated Full Text indices retain their fixed built-in analyzer. Explicit
+  // analyzer and capability selection belongs to TypedJsonIndexSpec.
   repeated FullTextField fields = 1;
 }
 
@@ -374,13 +378,19 @@ enum IndexPredicateOperator {
   INDEX_PREDICATE_OPERATOR_GREATER_THAN = 6;
   INDEX_PREDICATE_OPERATOR_GREATER_THAN_OR_EQUAL = 7;
   INDEX_PREDICATE_OPERATOR_EXISTS = 8;
+  // Fielded analyzed text match. The field must declare FULL_TEXT.
+  INDEX_PREDICATE_OPERATOR_FULL_TEXT = 9;
+  // Fielded analyzed phrase match with positional verification. The field
+  // must declare FULL_TEXT.
+  INDEX_PREDICATE_OPERATOR_PHRASE = 10;
 }
 
 message IndexPredicate {
   string field = 1;
   IndexPredicateOperator operator = 2;
   // Each value is one canonical JSON scalar. IN accepts multiple values;
-  // EXISTS accepts none; every other operator accepts exactly one.
+  // EXISTS accepts none; every other operator accepts exactly one. FULL_TEXT
+  // and PHRASE require one canonical JSON string.
   repeated bytes values_json = 3;
 }
 
@@ -404,6 +414,8 @@ message MetadataFilterIndexQuery {
 }
 
 message TypedJsonIndexQuery {
+  // Predicates in this list are ANDed. IN is the bounded same-field OR form.
+  // Arbitrary Boolean expression trees and NOT are not part of this contract.
   repeated IndexPredicate predicates = 1;
   repeated IndexOrder order = 2;
   // A request may contain at most 32 facet and aggregate computations in
@@ -424,6 +436,10 @@ message IndexFacetBucket {
 
 message IndexFacetResult {
   string field = 1;
+  // Buckets contain only authorized matching documents and are ordered by
+  // descending count, then ascending canonical value bytes. Results correspond
+  // to facet requests in request order. One document contributes at most once
+  // to each distinct facet value, even if its source array repeats that value.
   repeated IndexFacetBucket buckets = 2;
 }
 
@@ -444,7 +460,12 @@ message IndexAggregateResult {
   string field = 1;
   IndexAggregateOperation operation = 2;
   // Absent when MINIMUM, MAXIMUM, SUM, or AVERAGE has no contributing value.
-  // COUNT always contains its canonical JSON integer result.
+  // COUNT always contains its canonical JSON integer result. Results correspond
+  // to aggregate requests in request order and include only authorized matches.
+  // Integer SUM remains in the field's declared i64/u64 domain; overflow fails
+  // the query. Float SUM and every AVERAGE must produce a finite JSON number.
+  // contributing_count counts numeric values, including repeated array values;
+  // missing and explicit null values do not contribute.
   optional bytes value_json = 3;
   uint64 contributing_count = 4;
 }

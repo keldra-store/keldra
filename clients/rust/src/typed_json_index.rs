@@ -32,6 +32,7 @@ pub enum IndexDefinitionError {
     DuplicateFieldName(String),
     DuplicatePhysicalOrder(String),
     UnknownPhysicalOrderField(String),
+    UnorderablePhysicalOrderField(String),
 }
 
 impl Display for IndexDefinitionError {
@@ -66,6 +67,10 @@ impl Display for IndexDefinitionError {
             Self::UnknownPhysicalOrderField(name) => write!(
                 formatter,
                 "physical-order field `{name}` is not part of this definition"
+            ),
+            Self::UnorderablePhysicalOrderField(name) => write!(
+                formatter,
+                "physical-order field `{name}` must be single-valued and declare ORDER"
             ),
         }
     }
@@ -115,7 +120,7 @@ pub trait TypedJsonField: private::Sealed {
 
 /// An order declaration that can only be obtained from a single-valued field
 /// carrying the `ORDER` capability.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct IndexOrderToken {
     order: IndexOrder,
 }
@@ -499,6 +504,35 @@ pub mod state {
 }
 
 /// Builds one complete Typed JSON index definition.
+///
+/// Invalid capability and cardinality combinations have no builder method:
+///
+/// ```compile_fail
+/// use anvil_storage::BooleanField;
+/// let _ = BooleanField::single("enabled", "/enabled").range();
+/// ```
+///
+/// Multi-valued fields cannot produce order tokens:
+///
+/// ```compile_fail
+/// use anvil_storage::KeywordField;
+/// let _ = KeywordField::multi("tags", "/tags").order();
+/// ```
+///
+/// A definition cannot be finished until it contains a complete field:
+///
+/// ```compile_fail
+/// use anvil_storage::TypedJsonIndexBuilder;
+/// let _ = TypedJsonIndexBuilder::new("documents", "search").finish("create-search");
+/// ```
+///
+/// An incomplete field cannot be added to a definition:
+///
+/// ```compile_fail
+/// use anvil_storage::{KeywordField, TypedJsonIndexBuilder};
+/// let _ = TypedJsonIndexBuilder::new("documents", "search")
+///     .field(KeywordField::single("id", "/id"));
+/// ```
 pub struct TypedJsonIndexBuilder<State = state::Empty> {
     bucket: String,
     name: String,
@@ -635,6 +669,20 @@ fn validate_definition(
                 order.field.clone(),
             ));
         }
+        let field = builder
+            .fields
+            .iter()
+            .find(|field| field.name == order.field)
+            .expect("field-name set and field list agree");
+        if field.cardinality != IndexFieldCardinality::Single as i32
+            || !field
+                .capabilities
+                .contains(&(IndexFieldCapability::Order as i32))
+        {
+            return Err(IndexDefinitionError::UnorderablePhysicalOrderField(
+                order.field.clone(),
+            ));
+        }
     }
     Ok(())
 }
@@ -646,7 +694,8 @@ mod tests {
     use anvil_api::v1::{IndexFieldCapability, IndexFieldCardinality, TextAnalyzer};
 
     use super::{
-        IndexDefinitionError, KeywordField, SignedIntegerField, TextField, TypedJsonIndexBuilder,
+        BooleanField, FloatField, IndexDefinitionError, KeywordField, SignedIntegerField,
+        TextField, TypedJsonIndexBuilder, UnsignedIntegerField,
     };
 
     #[test]
@@ -741,5 +790,59 @@ mod tests {
             error,
             IndexDefinitionError::UnknownPhysicalOrderField("created_at".into())
         );
+
+        let orderable_alias = SignedIntegerField::single("id", "/numeric_id").order();
+        let error = TypedJsonIndexBuilder::new("tenant", "objects")
+            .field(KeywordField::single("id", "/id").exact())
+            .physical_order([orderable_alias.ascending()])
+            .finish("command")
+            .unwrap_err();
+        assert_eq!(
+            error,
+            IndexDefinitionError::UnorderablePhysicalOrderField("id".into())
+        );
+    }
+
+    #[test]
+    fn every_concrete_builder_emits_only_its_valid_capabilities() {
+        let ordered_float = FloatField::single("score", "/score")
+            .range()
+            .order()
+            .aggregate();
+        let score_order = ordered_float.descending();
+        let request = TypedJsonIndexBuilder::new("tenant", "typed-fields")
+            .field(BooleanField::multi("flags", "/flags").facet().exact())
+            .field(
+                UnsignedIntegerField::multi("sizes", "/sizes")
+                    .facet()
+                    .range()
+                    .exact(),
+            )
+            .field(ordered_float)
+            .physical_order([score_order])
+            .finish("typed-fields")
+            .unwrap();
+        let Specification::TypedJson(specification) =
+            request.specification.unwrap().specification.unwrap()
+        else {
+            panic!("expected typed JSON specification")
+        };
+
+        assert!(matches!(
+            specification.fields[0].field_type,
+            Some(FieldType::Boolean(_))
+        ));
+        assert_eq!(
+            specification.fields[0].cardinality,
+            IndexFieldCardinality::Multi as i32
+        );
+        assert!(matches!(
+            specification.fields[1].field_type,
+            Some(FieldType::UnsignedInteger(_))
+        ));
+        assert!(matches!(
+            specification.fields[2].field_type,
+            Some(FieldType::Float(_))
+        ));
     }
 }
