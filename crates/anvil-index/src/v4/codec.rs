@@ -380,32 +380,25 @@ mod tests {
 
     #[test]
     fn envelope_has_exact_golden_layout() {
-        let component = encode_component(
-            identity(),
-            ComponentKind::POSTINGS,
-            3,
-            0x0506_0708,
-            99,
-            vec![1, 2, 3],
-        )
-        .unwrap();
+        let component =
+            encode_component(identity(), ComponentKind::POSTINGS, 3, 0, 3, vec![1, 2, 3]).unwrap();
         let bytes = component.bytes();
         assert_eq!(bytes.len(), COMPONENT_HEADER_BYTES + 3);
         assert_eq!(&bytes[..8], b"ANVLIDX4");
         assert_eq!(&bytes[8..10], &7u16.to_le_bytes());
         assert_eq!(&bytes[10..12], &3u16.to_le_bytes());
-        assert_eq!(&bytes[12..16], &0x0506_0708u32.to_le_bytes());
+        assert_eq!(&bytes[12..16], &0u32.to_le_bytes());
         assert_eq!(&bytes[16..24], &7u64.to_le_bytes());
         assert_eq!(&bytes[24..32], &9u64.to_le_bytes());
         assert_eq!(&bytes[32..64], &[0xAB; 32]);
         assert_eq!(&bytes[64..72], &11u64.to_le_bytes());
-        assert_eq!(&bytes[72..80], &99u64.to_le_bytes());
+        assert_eq!(&bytes[72..80], &3u64.to_le_bytes());
         assert_eq!(&bytes[80..88], &3u64.to_le_bytes());
         assert_eq!(&bytes[88..120], blake3::hash(&[1, 2, 3]).as_bytes());
         assert_eq!(&bytes[120..], &[1, 2, 3]);
         let decoded = decode_component(bytes, identity(), ComponentKind::POSTINGS, 3).unwrap();
         assert_eq!(decoded.payload, &[1, 2, 3]);
-        assert_eq!(decoded.header.logical_length, 99);
+        assert_eq!(decoded.header.logical_length, 3);
     }
 
     #[test]
@@ -466,14 +459,8 @@ mod tests {
         assert_eq!(flags, 0);
         assert_eq!(logical, payload.len() as u64);
         assert_eq!(encoded, payload);
-        assert!(encode_component(
-            identity(),
-            ComponentKind::DOC_VALUES,
-            1,
-            1,
-            4,
-            vec![0; 4],
-        )
-        .is_err());
+        assert!(
+            encode_component(identity(), ComponentKind::DOC_VALUES, 1, 1, 4, vec![0; 4],).is_err()
+        );
     }
 }

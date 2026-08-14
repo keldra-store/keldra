@@ -293,7 +293,9 @@ async fn publish_field_dictionary<S: ComponentBatchSink>(
             },
         });
         pending_bytes += row_bytes;
-        statistics.observe_unique_term(field_id.get() as usize)?;
+        if value.term_type != crate::v4::TERM_TYPE_FIELD_PRESENCE {
+            statistics.observe_unique_term(field_id.get() as usize)?;
+        }
         group_start = group_end;
     }
     if !pending.is_empty() {

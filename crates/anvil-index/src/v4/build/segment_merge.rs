@@ -125,6 +125,14 @@ where
         counts.total_term_frequency = built.counts.total_term_frequency;
         if !field.components.contains(FieldComponents::DOC_VALUES)
             && !field.components.contains(FieldComponents::POINTS)
+        {
+            counts.null_documents = built.counts.null_documents;
+            counts.value_count = built.counts.value_count;
+            counts.boolean_values = built.counts.boolean_values;
+            counts.string_values = built.counts.string_values;
+        }
+        if !field.components.contains(FieldComponents::DOC_VALUES)
+            && !field.components.contains(FieldComponents::POINTS)
             && !field.components.contains(FieldComponents::NORMS)
             && !field.components.contains(FieldComponents::VECTOR)
         {

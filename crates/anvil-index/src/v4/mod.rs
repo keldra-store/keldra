@@ -29,6 +29,9 @@ mod terms;
 mod text;
 mod vectors;
 
+#[cfg(test)]
+mod decoder_mutation_tests;
+
 pub use analyzer::analyze_unicode_alphanumeric_lowercase;
 pub use artifact::{
     ArtifactDescriptor, ArtifactReference, GeneratedComponent, SegmentComponent, SegmentDescriptor,

@@ -11,13 +11,15 @@ use crate::compaction::{
 use crate::{IndexError, IndexFileRead};
 
 use super::super::super::{
-    Analyzer, ArtifactDescriptor, ArtifactDirectoryRead, Cardinality, Collation, ComponentKind,
-    ComponentStatistics, ComponentVersion, DocValueCell, FieldCapabilities, FieldComponents,
-    CandidateGate, CandidateGateEvidence, CandidateReference, FieldId, FieldSchema,
-    FieldStatistics, FieldType, IndexKind, IndexSemantics, NativeQuery, NativeQueryExecutor,
-    NativeQueryLimits, NativeQueryRequest, ObjectIdentity, Predicate, PredicateId, RangeBound,
-    ScalarValue, Schema, SegmentComponent, SegmentComponentReader, SegmentDescriptor,
-    SegmentIdentity, VectorMetric, VectorNormalization, artifact_path,
+    AggregateOperation, AggregateRequest, Analyzer, ArtifactDescriptor, ArtifactDirectoryRead,
+    CandidateGate, CandidateGateEvidence, CandidateReference, Cardinality, Collation,
+    ComponentKind, ComponentStatistics, ComponentVersion, DocId, DocIdRange, DocValueCell,
+    FacetRequest, FieldCapabilities, FieldComponents, FieldId, FieldSchema, FieldStatistics,
+    FieldType, IndexKind, IndexSemantics, NativeQuery, NativeQueryExecutor, NativeQueryLimits,
+    NativeQueryRequest, ObjectIdentity, OrderDirection, OrderField, Predicate, PredicateId,
+    RangeBound, ScalarValue, Schema, SegmentComponent, SegmentComponentReader, SegmentDescriptor,
+    SegmentIdentity, SortValue, VectorMetric, VectorNormalization, artifact_path,
+    encode_physical_order_key, rewrite_segment_live_mask,
 };
 use super::super::{
     BuildLimits, ComponentBatchSink, ComponentPack, MergeScratchFile, MergeScratchSpace,
@@ -611,7 +613,8 @@ async fn query_paths(
     predicate: Predicate,
 ) -> BTreeSet<String> {
     let gate = AllowAllCandidates;
-    let executor = NativeQueryExecutor::new(directory, &gate, NativeQueryLimits::default()).unwrap();
+    let executor =
+        NativeQueryExecutor::new(directory, &gate, NativeQueryLimits::default()).unwrap();
     let request = NativeQueryRequest {
         schema: schema.clone(),
         segments,
@@ -626,10 +629,7 @@ async fn query_paths(
         authorization_revision: 1,
     };
     let page = executor.execute(&request).await.unwrap();
-    page.hits
-        .into_iter()
-        .map(|hit| hit.result.path)
-        .collect()
+    page.hits.into_iter().map(|hit| hit.result.path).collect()
 }
 
 #[tokio::test]
@@ -681,6 +681,14 @@ async fn numeric_point_queries_are_equivalent_before_and_after_merge() {
             Predicate::Equal {
                 id: PredicateId::new(1),
                 field_id: FieldId::new(0),
+                value: ScalarValue::Null,
+            },
+            BTreeSet::from(["objects/null".to_owned()]),
+        ),
+        (
+            Predicate::Equal {
+                id: PredicateId::new(1),
+                field_id: FieldId::new(0),
                 value: ScalarValue::Signed(10),
             },
             BTreeSet::from(["objects/ten".to_owned()]),
@@ -725,6 +733,347 @@ async fn numeric_point_queries_are_equivalent_before_and_after_merge() {
         assert_eq!(before, expected);
         assert_eq!(after, before);
     }
+}
+
+fn terms_only_keyword_schema() -> Schema {
+    Schema {
+        kind: IndexKind::TypedJson,
+        path_prefix: "objects/".into(),
+        content_type_scope: Some("application/json".into()),
+        fields: vec![FieldSchema {
+            id: FieldId::new(0),
+            name: "state".into(),
+            source_selector: "/state".into(),
+            field_type: FieldType::Keyword,
+            cardinality: Cardinality::Multi,
+            allow_missing: true,
+            allow_null: true,
+            collation: Collation::BinaryUtf8,
+            capabilities: FieldCapabilities::EXACT,
+            analyzer: None,
+            components: FieldComponents::TERMS,
+        }],
+        semantics: IndexSemantics::TypedJson,
+        physical_order: Vec::new(),
+        component_versions: versions(&[
+            ComponentKind::ROUTING_NODE,
+            ComponentKind::IDENTITY_TABLE,
+            ComponentKind::LIVE_MASK,
+            ComponentKind::PATH_LOCATOR,
+            ComponentKind::TERM_DICTIONARY,
+            ComponentKind::POSTINGS,
+            ComponentKind::SCORING_STATISTICS,
+        ]),
+    }
+}
+
+fn terms_only_keyword_source(path: &str, value: ScalarValue, frequency: u32) -> ProjectedSource {
+    let (term_type, term) = super::super::super::scalar_term(&value).unwrap();
+    let mut terms = vec![
+        ProjectedTerm {
+            field_id: FieldId::new(0),
+            term_type,
+            term,
+            frequency,
+            positions: Vec::new(),
+        },
+        ProjectedTerm {
+            field_id: FieldId::new(0),
+            term_type: super::super::super::TERM_TYPE_FIELD_PRESENCE,
+            term: super::super::super::FIELD_PRESENCE_TERM.to_vec(),
+            frequency: 1,
+            positions: Vec::new(),
+        },
+    ];
+    terms.sort_by(|left, right| {
+        (left.term_type, left.term.as_slice()).cmp(&(right.term_type, right.term.as_slice()))
+    });
+    ProjectedSource {
+        source_identity: ObjectIdentity {
+            path: path.into(),
+            version: 1,
+        },
+        records: vec![ProjectedRecord {
+            result_identity: None,
+            order_key: Vec::new(),
+            terms,
+            points: Vec::new(),
+            doc_values: Vec::new(),
+            vectors: Vec::new(),
+            field_lengths: Vec::new(),
+        }],
+    }
+}
+
+#[tokio::test]
+async fn terms_only_statistics_survive_merge_without_presence_double_counting() {
+    let schema = terms_only_keyword_schema();
+    let mut sink = SharedSink::default();
+    let left = build_segment(
+        &mut sink,
+        &schema,
+        40,
+        vec![terms_only_keyword_source(
+            "objects/null",
+            ScalarValue::Null,
+            1,
+        )],
+        64 * 1024 * 1024,
+    )
+    .await;
+    let right = build_segment(
+        &mut sink,
+        &schema,
+        41,
+        vec![terms_only_keyword_source(
+            "objects/active",
+            ScalarValue::String("active".into()),
+            2,
+        )],
+        64 * 1024 * 1024,
+    )
+    .await;
+    let inputs = vec![left.descriptor, right.descriptor];
+    let directory = SharedDirectory(sink.clone());
+    let merged = merge_segments(
+        &directory,
+        &schema,
+        &inputs,
+        SegmentIdentity::new(9, 2, schema.fingerprint().unwrap(), 42).unwrap(),
+        BuildLimits::new(64 * 1024 * 1024).unwrap(),
+        &mut sink,
+        &MemoryScratch::default(),
+        TokioExecutor,
+        CompactionParallelism::new(2, 64 * 1024 * 1024).unwrap(),
+        CompactionProgress::default(),
+    )
+    .await
+    .unwrap();
+    let directory = SharedDirectory(sink);
+    assert_eq!(
+        query_paths(
+            &directory,
+            &schema,
+            vec![merged.descriptor.clone()],
+            Predicate::Equal {
+                id: PredicateId::new(1),
+                field_id: FieldId::new(0),
+                value: ScalarValue::Null,
+            },
+        )
+        .await,
+        BTreeSet::from(["objects/null".to_owned()]),
+    );
+    let statistics = SegmentComponentReader::new(&directory, &merged.descriptor)
+        .unwrap()
+        .statistics()
+        .await
+        .unwrap();
+    let field = &statistics.fields[0];
+    assert_eq!(field.present_documents, 2);
+    assert_eq!(field.null_documents, 1);
+    assert_eq!(field.value_count, 2);
+    assert_eq!(field.string_values, 2);
+    assert_eq!(field.unique_terms, 2);
+    assert_eq!(field.total_term_frequency, 3);
+}
+
+fn numeric_computation_schema() -> Schema {
+    Schema {
+        kind: IndexKind::TypedJson,
+        path_prefix: "objects/".into(),
+        content_type_scope: Some("application/json".into()),
+        fields: vec![FieldSchema {
+            id: FieldId::new(0),
+            name: "score".into(),
+            source_selector: "/score".into(),
+            field_type: FieldType::SignedInteger,
+            cardinality: Cardinality::Single,
+            allow_missing: false,
+            allow_null: false,
+            collation: Collation::BinaryUtf8,
+            capabilities: FieldCapabilities::EXACT
+                .union(FieldCapabilities::RANGE)
+                .union(FieldCapabilities::ORDER)
+                .union(FieldCapabilities::FACET)
+                .union(FieldCapabilities::AGGREGATE),
+            analyzer: None,
+            components: FieldComponents::POINTS.union(FieldComponents::DOC_VALUES),
+        }],
+        semantics: IndexSemantics::TypedJson,
+        physical_order: vec![OrderField {
+            field_id: FieldId::new(0),
+            direction: OrderDirection::Descending,
+        }],
+        component_versions: versions(&[
+            ComponentKind::ROUTING_NODE,
+            ComponentKind::IDENTITY_TABLE,
+            ComponentKind::LIVE_MASK,
+            ComponentKind::PATH_LOCATOR,
+            ComponentKind::POINTS,
+            ComponentKind::DOC_VALUES,
+            ComponentKind::SCORING_STATISTICS,
+        ]),
+    }
+}
+
+fn numeric_computation_source(path: &str, score: i64) -> ProjectedSource {
+    let value = ScalarValue::Signed(score);
+    ProjectedSource {
+        source_identity: ObjectIdentity {
+            path: path.into(),
+            version: 1,
+        },
+        records: vec![ProjectedRecord {
+            result_identity: None,
+            order_key: encode_physical_order_key(&[(
+                SortValue::Value(value.clone()),
+                OrderDirection::Descending,
+            )])
+            .unwrap(),
+            terms: Vec::new(),
+            points: vec![ProjectedPoint {
+                field_id: FieldId::new(0),
+                present: true,
+                null: false,
+                values: vec![value.clone()],
+            }],
+            doc_values: vec![ProjectedDocValue {
+                field_id: FieldId::new(0),
+                multi_valued: false,
+                cell: DocValueCell::value(value),
+            }],
+            vectors: Vec::new(),
+            field_lengths: Vec::new(),
+        }],
+    }
+}
+
+async fn computation_page(
+    directory: &SharedDirectory,
+    schema: &Schema,
+    segments: Vec<SegmentDescriptor>,
+) -> super::super::super::NativeQueryPage {
+    let gate = AllowAllCandidates;
+    NativeQueryExecutor::new(directory, &gate, NativeQueryLimits::default())
+        .unwrap()
+        .execute(&NativeQueryRequest {
+            schema: schema.clone(),
+            segments,
+            query: NativeQuery::Filter {
+                predicate: Some(Predicate::Range {
+                    id: PredicateId::new(1),
+                    field_id: FieldId::new(0),
+                    lower: Some(RangeBound {
+                        value: ScalarValue::Signed(0),
+                        inclusive: true,
+                    }),
+                    upper: None,
+                }),
+                order: schema.physical_order.clone(),
+            },
+            after: None,
+            limit: 100,
+            facets: vec![FacetRequest {
+                field_id: FieldId::new(0),
+                limit: 10,
+            }],
+            aggregates: vec![
+                AggregateRequest {
+                    field_id: FieldId::new(0),
+                    operation: AggregateOperation::Count,
+                },
+                AggregateRequest {
+                    field_id: FieldId::new(0),
+                    operation: AggregateOperation::Sum,
+                },
+            ],
+            authorization_revision: 1,
+        })
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn exact_doc_values_facets_and_aggregates_are_merge_equivalent() {
+    let schema = numeric_computation_schema();
+    let mut sink = SharedSink::default();
+    let left = build_segment(
+        &mut sink,
+        &schema,
+        40,
+        vec![
+            numeric_computation_source("objects/one", 1),
+            numeric_computation_source("objects/two", 2),
+        ],
+        64 * 1024 * 1024,
+    )
+    .await;
+    let right = build_segment(
+        &mut sink,
+        &schema,
+        41,
+        vec![
+            numeric_computation_source("objects/three", 3),
+            numeric_computation_source("objects/two-again", 2),
+        ],
+        64 * 1024 * 1024,
+    )
+    .await;
+    let left_directory = SharedDirectory(sink.clone());
+    let left = rewrite_segment_live_mask(
+        &left_directory,
+        &mut sink,
+        &left.descriptor,
+        1,
+        &[DocIdRange {
+            segment_id: left.descriptor.identity.segment_id,
+            first_doc_id: DocId::new(0),
+            count: 1,
+        }],
+    )
+    .await
+    .unwrap();
+    let inputs = vec![left, right.descriptor];
+    let directory = SharedDirectory(sink.clone());
+    let merged = merge_segments(
+        &directory,
+        &schema,
+        &inputs,
+        SegmentIdentity::new(9, 2, schema.fingerprint().unwrap(), 42).unwrap(),
+        BuildLimits::new(64 * 1024 * 1024).unwrap(),
+        &mut sink,
+        &MemoryScratch::default(),
+        TokioExecutor,
+        CompactionParallelism::new(2, 64 * 1024 * 1024).unwrap(),
+        CompactionProgress::default(),
+    )
+    .await
+    .unwrap();
+    let directory = SharedDirectory(sink);
+    let before = computation_page(&directory, &schema, inputs).await;
+    let after = computation_page(&directory, &schema, vec![merged.descriptor]).await;
+    assert_eq!(
+        before
+            .hits
+            .iter()
+            .map(|hit| hit.result.path.as_str())
+            .collect::<Vec<_>>(),
+        after
+            .hits
+            .iter()
+            .map(|hit| hit.result.path.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(before.facet_results, after.facet_results);
+    assert_eq!(before.aggregate_results, after.aggregate_results);
+    assert_eq!(before.hits.len(), 3);
+    assert!(
+        before
+            .hits
+            .iter()
+            .all(|hit| hit.result.path != "objects/two")
+    );
 }
 
 fn doc_value_schema() -> Schema {
@@ -790,7 +1139,9 @@ async fn merged_output_may_exceed_the_complete_resident_budget() {
                 doc_values: vec![ProjectedDocValue {
                     field_id: FieldId::new(0),
                     multi_valued: false,
-                    cell: DocValueCell::value(ScalarValue::String(payload.clone())),
+                    cell: DocValueCell::value(ScalarValue::String(format!(
+                        "{ordinal:04}-{payload}"
+                    ))),
                 }],
                 vectors: Vec::new(),
                 field_lengths: Vec::new(),

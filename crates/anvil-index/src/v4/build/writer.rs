@@ -19,10 +19,10 @@ use self::streams::{
 };
 use self::terms::publish_terms;
 use super::super::{
-    Cardinality, ComponentKind, ComponentStatistics, FIELD_PRESENCE_TERM, FieldComponents,
-    FieldId, FieldType, IndexSemantics, ScalarValue, Schema, SegmentComponent, SegmentDescriptor,
+    Cardinality, ComponentKind, ComponentStatistics, FIELD_PRESENCE_TERM, FieldComponents, FieldId,
+    FieldType, IndexSemantics, ScalarValue, Schema, SegmentComponent, SegmentDescriptor,
     SegmentIdentity, TERM_TYPE_BOOLEAN, TERM_TYPE_FIELD_PRESENCE, TERM_TYPE_HASHED_KEYWORD,
-    TERM_TYPE_STRING, TERM_TYPE_TEXT,
+    TERM_TYPE_NULL, TERM_TYPE_STRING, TERM_TYPE_TEXT,
 };
 use super::{
     BuildLimits, ComponentBatchSink, ProjectedRecord, ProjectedSource, PublishedStream, SourcePush,
@@ -437,12 +437,15 @@ fn validate_record_schema(schema: &Schema, record: &ProjectedRecord) -> Result<(
             && term.term == FIELD_PRESENCE_TERM
             && term.frequency == 1
             && term.positions.is_empty()
+            || term.term_type == TERM_TYPE_NULL
+                && term.term == [0]
+                && field.allow_null
+                && matches!(field.field_type, FieldType::Boolean | FieldType::Keyword)
             || match field.field_type {
                 FieldType::Boolean => term.term_type == TERM_TYPE_BOOLEAN,
-                FieldType::Keyword => matches!(
-                    term.term_type,
-                    TERM_TYPE_STRING | TERM_TYPE_HASHED_KEYWORD
-                ),
+                FieldType::Keyword => {
+                    matches!(term.term_type, TERM_TYPE_STRING | TERM_TYPE_HASHED_KEYWORD)
+                }
                 FieldType::Text => term.term_type == TERM_TYPE_TEXT,
                 _ => false,
             };
@@ -461,9 +464,7 @@ fn validate_record_schema(schema: &Schema, record: &ProjectedRecord) -> Result<(
                 .iter()
                 .any(|value| !scalar_matches_field(value, field.field_type))
             || point.null && !field.allow_null
-            || field.cardinality == Cardinality::Single
-                && point.values.is_empty()
-                && !point.null
+            || field.cardinality == Cardinality::Single && point.values.is_empty() && !point.null
         {
             return Err(IndexError::InvalidDefinition(
                 "projected points differ from field type, cardinality, or null policy".into(),
@@ -471,8 +472,7 @@ fn validate_record_schema(schema: &Schema, record: &ProjectedRecord) -> Result<(
         }
     }
     for column in &record.doc_values {
-        let field =
-            require_field_component(schema, column.field_id, FieldComponents::DOC_VALUES)?;
+        let field = require_field_component(schema, column.field_id, FieldComponents::DOC_VALUES)?;
         if column.multi_valued != (field.cardinality == Cardinality::Multi)
             || !column.cell.present && !field.allow_missing
             || column.cell.null && !field.allow_null

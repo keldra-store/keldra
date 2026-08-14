@@ -7,11 +7,11 @@ use crate::v4::build::{
 };
 use crate::v4::locator::PathLocatorBlockBuilder;
 use crate::v4::{
-    COMPONENT_HEADER_BYTES, Cardinality, ComponentKind, DocId, DocIdRange, DocumentIdentity,
-    DocValueBlock, DocValueCell, FieldComponents, INDEX_COMPONENT_BYTES, IdentityBlock,
+    COMPONENT_HEADER_BYTES, Cardinality, ComponentKind, DocId, DocIdRange, DocValueBlock,
+    DocValueCell, DocumentIdentity, FieldComponents, INDEX_COMPONENT_BYTES, IdentityBlock,
     IndexSemantics, LIVE_MASK_BLOCK_DOCS, LiveMaskBlock, LocatorEntry, LocatorValue, NormBlock,
-    PathLocatorBlock, PointBlock, PointEntry, PointValue, ScalarValue, Schema, SegmentIdentity,
-    VectorBlock, point_entry_key,
+    PathLocatorBlock, PointBlock, PointEntry, ScalarValue, Schema, SegmentIdentity, VectorBlock,
+    point_entry_key,
 };
 
 const MAX_PAYLOAD_BYTES: usize = INDEX_COMPONENT_BYTES - COMPONENT_HEADER_BYTES;

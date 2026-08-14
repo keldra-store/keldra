@@ -98,9 +98,7 @@ impl Predicate {
             Self::In { values, .. } if values.is_empty() => Err(IndexError::InvalidQuery(
                 "IN predicate requires at least one value".into(),
             )),
-            Self::Prefix { prefix, .. }
-                if prefix.is_empty() || prefix.len() > INDEX_TERM_BYTES =>
-            {
+            Self::Prefix { prefix, .. } if prefix.is_empty() || prefix.len() > INDEX_TERM_BYTES => {
                 Err(IndexError::InvalidQuery(
                     "prefix predicate is empty or too long".into(),
                 ))
@@ -318,7 +316,7 @@ mod tests {
                 path_prefix: "/".into(),
                 zanzibar_revision: 8,
             },
-            projected_field_ids: vec![FieldId::new(0)],
+            required_doc_value_field_ids: vec![FieldId::new(0)],
             predicate_expression: Some(Predicate::And(vec![leaf.clone(), leaf])),
             required_order: vec![],
             after: None,

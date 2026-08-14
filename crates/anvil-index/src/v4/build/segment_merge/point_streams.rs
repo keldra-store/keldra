@@ -5,8 +5,8 @@ use super::super::super::{
     ArtifactDirectoryRead, ComponentKind, DocId, FieldId, FieldType, PointBlock, PointEntry,
     PointValue, ScalarValue, Schema, SegmentDescriptor, SegmentIdentity, point_entry_key,
 };
-use super::super::{ComponentBatchSink, MergeScratchFile, MergeScratchSpace};
 use super::super::sink::{PublishedStream, StreamingComponentPublisher};
+use super::super::{ComponentBatchSink, MergeScratchFile, MergeScratchSpace};
 use super::doc_components::FieldCounts;
 use super::io::{RemapReader, required_stream};
 
@@ -75,7 +75,9 @@ where
             }
             for entry in block.entries() {
                 if !point_matches_type(&entry.value, field_type) {
-                    return Err(IndexError::InvalidFormat("point value differs from field type"));
+                    return Err(IndexError::InvalidFormat(
+                        "point value differs from field type",
+                    ));
                 }
                 if let Some(new_doc_id) = remap.get(entry.doc_id.get()).await? {
                     sorter
@@ -96,8 +98,14 @@ fn point_matches_type(value: &PointValue, field_type: FieldType) -> bool {
     matches!(
         (value, field_type),
         (PointValue::Presence | PointValue::Null, _)
-            | (PointValue::Value(ScalarValue::Signed(_)), FieldType::SignedInteger)
-            | (PointValue::Value(ScalarValue::Unsigned(_)), FieldType::UnsignedInteger)
+            | (
+                PointValue::Value(ScalarValue::Signed(_)),
+                FieldType::SignedInteger
+            )
+            | (
+                PointValue::Value(ScalarValue::Unsigned(_)),
+                FieldType::UnsignedInteger
+            )
             | (PointValue::Value(ScalarValue::Number(_)), FieldType::Float)
     )
 }
@@ -158,7 +166,9 @@ where
                     .ok_or(IndexError::OffsetOverflow)?;
             }
             PointValue::Value(_) => {
-                return Err(IndexError::InvalidFormat("non-numeric point scratch record"));
+                return Err(IndexError::InvalidFormat(
+                    "non-numeric point scratch record",
+                ));
             }
         }
         entries.push(entry);
@@ -225,7 +235,12 @@ impl<'a, W: MergeScratchSpace, E: CompactionExecutor> PointSorter<'a, W, E> {
     }
 
     async fn push(&mut self, entry: PointEntry) -> Result<(), IndexError> {
-        if self.chunk.len().saturating_mul(std::mem::size_of::<PointEntry>()) >= self.chunk_limit {
+        if self
+            .chunk
+            .len()
+            .saturating_mul(std::mem::size_of::<PointEntry>())
+            >= self.chunk_limit
+        {
             self.flush().await?;
         }
         self.chunk.push(entry);
@@ -240,7 +255,11 @@ impl<'a, W: MergeScratchSpace, E: CompactionExecutor> PointSorter<'a, W, E> {
                 return Err(IndexError::InvalidFormat("merged point stream is empty"));
             }
             if total == 1 {
-                return Ok(self.levels.iter_mut().find_map(Vec::pop).expect("one point run"));
+                return Ok(self
+                    .levels
+                    .iter_mut()
+                    .find_map(Vec::pop)
+                    .expect("one point run"));
             }
             let mut inputs = Vec::with_capacity(SORT_FAN_IN);
             for level in &mut self.levels {
@@ -315,7 +334,10 @@ async fn merge_runs<W: MergeScratchSpace>(
         .min_by(|(_, left), (_, right)| compare_entry(left, right))
         .map(|(index, _)| index)
     {
-        encode_entry(cursors[selected].current.as_ref().expect("selected point"), &mut buffer)?;
+        encode_entry(
+            cursors[selected].current.as_ref().expect("selected point"),
+            &mut buffer,
+        )?;
         cursors[selected].advance().await?;
         if buffer.len() >= 64 * 1024 {
             output.append(std::mem::take(&mut buffer)).await?;
@@ -341,7 +363,9 @@ fn encode_entry(entry: &PointEntry, output: &mut Vec<u8>) -> Result<(), IndexErr
         PointValue::Value(ScalarValue::Unsigned(value)) => (3, value),
         PointValue::Value(ScalarValue::Number(bits)) => (4, bits),
         PointValue::Value(_) => {
-            return Err(IndexError::InvalidFormat("non-numeric point scratch record"));
+            return Err(IndexError::InvalidFormat(
+                "non-numeric point scratch record",
+            ));
         }
     };
     output.push(tag);
@@ -438,7 +462,10 @@ mod tests {
             },
         ];
         let encoded = encode_sorted(entries).unwrap();
-        assert_eq!(decode_entry(&encoded[..RECORD_BYTES]).unwrap().value, PointValue::Presence);
+        assert_eq!(
+            decode_entry(&encoded[..RECORD_BYTES]).unwrap().value,
+            PointValue::Presence
+        );
         assert_eq!(
             decode_entry(&encoded[RECORD_BYTES..]).unwrap().value,
             PointValue::Value(ScalarValue::Signed(-9))
