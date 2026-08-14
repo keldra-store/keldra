@@ -20,7 +20,7 @@ All workspace packages currently share version `0.9.0`:
 
 Anvil 0.9.0 runs as one flat cluster of capacity-weighted nodes with native
 on-disk state, cluster-managed mTLS between peers, cluster-wide derived
-streaming indexes, and no external metadata database, external PKI, or second
+streaming indices, and no external metadata database, external PKI, or second
 storage system. It includes PersonalDB, accounting, S3 and Git gateways, and
 online growth from one node to the configured erasure width. Native gRPC, S3,
 Git, and administrative APIs share one authorized public listener.

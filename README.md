@@ -4,7 +4,7 @@ Anvil is distributed object storage for application state. It keeps opaque bytes
 at stable paths and supplies the coordination primitives applications otherwise
 have to assemble around a blob store: streaming writes, compare-and-swap,
 immutable namespaces, Zanzibar authorization, bounded atomic programs, change
-notification, and materialized search indexes.
+notification, and materialized search indices.
 
 Run one process while developing. Add nodes when you need capacity or
 availability; clients keep using the same API, any active node can accept a
@@ -19,15 +19,15 @@ rendezvous hashing.
 | Authorization | 0.5.0 | Application credentials, short-lived JWTs, protected administration, Zanzibar schemas, tuples, roles, and checks |
 | Atomic programs | 0.5.0 | Explicitly selected, deterministic multi-path state transitions without routing ordinary uploads through a transaction system |
 | Distributed clusters | 0.5.1 | Any-node ingress, peer mTLS, replicated metadata, weighted placement, and 2+1 erasure-coded payload durability |
-| Materialized indexes | 0.5.2 | Path, object metadata, typed JSON, full text, vector, hybrid, Git-source, and tensor indexes |
+| Materialized indices | 0.5.2 | Path, object metadata, typed JSON, full text, vector, hybrid, Git-source, and tensor indices |
 | Rust client | 0.5.2 | Credential exchange, authenticated clients, streaming upload helpers, and the complete generated gRPC API |
 | PersonalDB, public reads, accounting, S3 and Git | 0.5.3 | Protocol-native PersonalDB groups and projections, authorized usage aggregates, opt-in anonymous reads, and standard S3/Git gateways |
 | Online cluster growth | 0.5.4 | Large objects use complete replicas below the configured erasure width, then move online to the fixed erasure profile as nodes join |
 | Shared public listener | 0.5.5 | Native gRPC, S3, Git, and administrative APIs share one authorized public endpoint; peer mTLS remains isolated |
-| Streaming succinct indexes | 0.6.0 | Bounded per-kind construction memory, incremental immutable runs, streaming compaction, `sux`-based merged structures, and lazy block materialization |
+| Streaming succinct indices | 0.6.0 | Bounded per-kind construction memory, incremental immutable runs, streaming compaction, `sux`-based merged structures, and lazy block materialization |
 | Sparse index coordination | 0.7.0 | Non-blocking startup, transactional definition locators, routed change journals, scoped recovery, resumable accounting, and budgeted maintenance |
-| Scalable bulk indexes | 0.8.0 | Direct bounded bulk builds, packed format-v3 artifacts, stable compressed postings, authorized rebuilds, and lossless journal backpressure |
-| Native segment indexes | 0.9.0 | Anvil-owned immutable segments, exact predicate intersection, optional physical ordering, stable cursors, bounded arbitrary sorting, and shared query-memory admission |
+| Scalable bulk indices | 0.8.0 | Direct bounded bulk builds, packed format-v3 artifacts, stable compressed postings, authorized rebuilds, and lossless journal backpressure |
+| Native segment indices | 0.9.0 | Anvil-owned immutable segments, exact predicate intersection, optional physical ordering, stable cursors, bounded arbitrary sorting, and shared query-memory admission |
 | Java client | — | TODO |
 | Python client | — | TODO |
 | Node.js client | — | TODO |
@@ -516,17 +516,18 @@ this orchestration path. A complete two-document program and invocation is kept
 executable in
 [`scripts/qualify-three-node.sh`](scripts/qualify-three-node.sh).
 
-## Create and query indexes
+## Create and query indices
 
-Indexes are bucket-local definitions scoped by an optional path prefix and
+Indices are bucket-local definitions scoped by an optional path prefix and
 content type. Each definition's HRW-selected writer consumes every node's
 ordered source journal, writes bounded immutable native segments, merges
 deterministic size tiers, and publishes complete generations through the
-ordinary object store. Seekable postings intersect selective predicates before
-stored fields are read; an optional definition-time physical order supports
-early termination and true search-after pagination. Up to three HRW-selected
-query replicas materialize only the blocks a query needs through the shared
-bounded cache.
+ordinary object store. Seekable postings and numeric points intersect selective
+predicates before typed doc values are read; an optional definition-time
+physical order supports early termination and true search-after pagination.
+Hits identify authoritative objects instead of copying source fields into the
+index. Up to three HRW-selected query replicas materialize only the blocks a
+query needs through the shared bounded cache.
 Construction memory is capped per index kind across the whole process, so
 corpus size does not become builder heap. Query responses always include
 freshness evidence; while a new complete generation is building, Anvil
@@ -696,7 +697,7 @@ uses mandatory certificates created and rotated by the cluster.
 | --- | --- |
 | `CredentialService` | Exchange durable application credentials for short-lived bearer tokens |
 | `ObjectService` | Streaming writes, CAS, bulk/batch operations, reads, versions, listing, watches, policies, and atomic programs |
-| `IndexService` | Create, update, inspect, list, delete, and query materialized indexes |
+| `IndexService` | Create, update, inspect, list, delete, and query materialized indices |
 | `PersonalDbService` | Create and authorize database groups, append protocol evidence, explicitly materialize projections, catch up, and transfer snapshots |
 | `AccountingService` | Enable and query authorization-protected bucket or path-prefix usage aggregates |
 | `AuthzService` | Manage customer Zanzibar realms, schemas, relationships, bindings, and checks |
