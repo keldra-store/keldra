@@ -7,22 +7,24 @@ use std::io;
 use std::path::Path;
 use std::time::Duration;
 
+use anvil_storage::v1::index_field::FieldType as IndexFieldType;
 use anvil_storage::v1::index_query::Query as QueryValue;
 use anvil_storage::v1::index_service_client::IndexServiceClient;
 use anvil_storage::v1::index_specification::Specification as SpecificationValue;
-use anvil_storage::v1::index_field::FieldType as IndexFieldType;
 use anvil_storage::v1::put_header::Operation as PutOperationValue;
 use anvil_storage::v1::{
-    CreateApplicationRequest, CreateBucketRequest, CreateIndexRequest, DeleteRequest, Durability,
-    FullTextField, FullTextIndexQuery, FullTextIndexSpec, GetIndexRequest, GitSourceIndexQuery,
-    GitSourceIndexSpec, HybridIndexQuery, HybridIndexSpec, IndexDefinition, IndexField,
-    IndexFieldCapability, IndexFieldCardinality, IndexFreshness, IndexOrder,
-    IndexOrderDirection, IndexPredicate, IndexPredicateOperator, IndexQuery, IndexQueryHit,
-    IndexSpecification, KeywordIndexField, MetadataFilterIndexQuery,
+    BooleanIndexField, CreateApplicationRequest, CreateBucketRequest, CreateIndexRequest,
+    DeleteRequest, Durability, FloatIndexField, FullTextField, FullTextIndexQuery,
+    FullTextIndexSpec, GetIndexRequest, GitSourceIndexQuery, GitSourceIndexSpec, HybridIndexQuery,
+    HybridIndexSpec, IndexAggregateOperation, IndexAggregateRequest, IndexDefinition,
+    IndexFacetRequest, IndexField, IndexFieldCapability, IndexFieldCardinality, IndexFreshness,
+    IndexOrder, IndexOrderDirection, IndexPredicate, IndexPredicateOperator, IndexQuery,
+    IndexQueryHit, IndexSpecification, KeywordIndexField, MetadataFilterIndexQuery,
     MetadataFilterIndexSpec, ObjectAddress, ObjectVersioning, PathIndexQuery, PathIndexSpec,
     PutHeader, PutOperation, QueryIndexRequest, QueryIndexResponse, RebuildIndexRequest,
     SetBucketPublicReadRequest, SignedIntegerIndexField, TensorIndexQuery, TensorIndexSpec,
-    TypedJsonIndexQuery, TypedJsonIndexSpec, VectorIndexQuery, VectorIndexSpec, VectorMetric,
+    TextAnalyzer, TextIndexField, TypedJsonIndexQuery, TypedJsonIndexSpec,
+    UnsignedIntegerIndexField, VectorIndexQuery, VectorIndexSpec, VectorMetric,
 };
 use anvil_storage::{
     BearerToken, RawAdministrationClient, RawClient, administration_client, connect_channel,
@@ -37,6 +39,12 @@ use tonic::{Code, Request};
 
 #[path = "cluster_index_qualification/definition_lifecycle.rs"]
 mod definition_lifecycle;
+#[path = "cluster_index_qualification/typed_capabilities.rs"]
+mod typed_capabilities;
+use typed_capabilities::{
+    boolean_field, float_field, keyword_field, keyword_multi_field, signed_integer_field,
+    signed_integer_multi_field, text_field, typed_json_order, unsigned_integer_field,
+};
 
 type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 type IndexClient = IndexServiceClient<InterceptedService<Channel, BearerToken>>;
@@ -256,6 +264,23 @@ async fn main() -> TestResult<()> {
             }
         }
     }
+
+    let typed_position = cases
+        .iter()
+        .position(|case| {
+            matches!(
+                case.specification.specification.as_ref(),
+                Some(SpecificationValue::TypedJson(_))
+            )
+        })
+        .ok_or_else(|| invalid("index qualification omitted the Typed JSON engine"))?;
+    typed_capabilities::qualify(
+        &mut indexes,
+        &tenant,
+        &cases[typed_position],
+        require_freshness(&first_generations[typed_position])?,
+    )
+    .await?;
 
     qualify_zanzibar_denial(
         &mut administrators[0],
@@ -1544,17 +1569,78 @@ fn engine_cases() -> Vec<EngineCase> {
             name: "active-documents",
             specification: specification(SpecificationValue::TypedJson(TypedJsonIndexSpec {
                 fields: vec![
-                    keyword_field("status", "/status", &[IndexFieldCapability::Exact]),
+                    keyword_field(
+                        "status",
+                        "/status",
+                        &[
+                            IndexFieldCapability::Exact,
+                            IndexFieldCapability::Prefix,
+                            IndexFieldCapability::Range,
+                            IndexFieldCapability::Facet,
+                        ],
+                    ),
                     signed_integer_field(
                         "modified_at",
                         "/modified_at",
-                        &[IndexFieldCapability::Order],
+                        &[
+                            IndexFieldCapability::Exact,
+                            IndexFieldCapability::Range,
+                            IndexFieldCapability::Order,
+                            IndexFieldCapability::Facet,
+                            IndexFieldCapability::Aggregate,
+                        ],
                     ),
                     keyword_field(
                         "source_record_id",
                         "/source_record_id",
-                        &[IndexFieldCapability::Order],
+                        &[
+                            IndexFieldCapability::Exact,
+                            IndexFieldCapability::Prefix,
+                            IndexFieldCapability::Range,
+                            IndexFieldCapability::Order,
+                            IndexFieldCapability::Facet,
+                        ],
                     ),
+                    unsigned_integer_field(
+                        "sequence",
+                        "/sequence",
+                        &[
+                            IndexFieldCapability::Exact,
+                            IndexFieldCapability::Range,
+                            IndexFieldCapability::Facet,
+                            IndexFieldCapability::Aggregate,
+                        ],
+                    ),
+                    float_field(
+                        "score",
+                        "/score",
+                        &[
+                            IndexFieldCapability::Exact,
+                            IndexFieldCapability::Range,
+                            IndexFieldCapability::Order,
+                            IndexFieldCapability::Facet,
+                            IndexFieldCapability::Aggregate,
+                        ],
+                    ),
+                    boolean_field(
+                        "enabled",
+                        "/enabled",
+                        &[IndexFieldCapability::Exact, IndexFieldCapability::Facet],
+                    ),
+                    keyword_multi_field(
+                        "labels",
+                        "/labels",
+                        &[IndexFieldCapability::Exact, IndexFieldCapability::Facet],
+                    ),
+                    signed_integer_multi_field(
+                        "measurements",
+                        "/measurements",
+                        &[
+                            IndexFieldCapability::Facet,
+                            IndexFieldCapability::Aggregate,
+                        ],
+                    ),
+                    text_field("summary", "/summary"),
                 ],
                 physical_order: typed_json_order(),
             })),
@@ -1569,10 +1655,10 @@ fn engine_cases() -> Vec<EngineCase> {
                 aggregates: Vec::new(),
             })),
             documents: vec![
-                ("docs/active-a.json", br#"{"status":"active","modified_at":100,"source_record_id":"b"}"#),
-                ("docs/inactive.json", br#"{"status":"inactive","modified_at":400,"source_record_id":"x"}"#),
-                ("docs/active-b.json", br#"{"status":"active","modified_at":200,"source_record_id":"z"}"#),
-                ("docs/active-c.json", br#"{"status":"active","modified_at":200,"source_record_id":"a"}"#),
+                ("docs/active-a.json", br#"{"status":"active","modified_at":100,"source_record_id":"b","sequence":1,"score":1.5,"enabled":true,"labels":["stable","stable","alpha"],"measurements":[1,1],"summary":"durable journal alpha"}"#),
+                ("docs/inactive.json", br#"{"status":"inactive","modified_at":400,"source_record_id":"x","sequence":4,"score":9.0,"enabled":false,"labels":["archived"],"measurements":[9],"summary":"unrelated material"}"#),
+                ("docs/active-b.json", br#"{"status":"active","modified_at":200,"source_record_id":"z","sequence":2,"score":2.5,"enabled":true,"labels":["stable","beta"],"measurements":[2,3],"summary":"durable journal beta"}"#),
+                ("docs/active-c.json", br#"{"status":"active","modified_at":200,"source_record_id":"a","sequence":3,"score":3.5,"enabled":true,"labels":["stable","gamma"],"measurements":[4],"summary":"durable journal gamma"}"#),
             ],
             expected_paths: vec![
                 "docs/active-c.json",
@@ -1581,7 +1667,7 @@ fn engine_cases() -> Vec<EngineCase> {
             ],
             replacement: (
                 "docs/active-a.json",
-                br#"{"status":"active","modified_at":100,"source_record_id":"b","revision":2}"#,
+                br#"{"status":"active","modified_at":100,"source_record_id":"b","sequence":1,"score":1.5,"enabled":true,"labels":["stable","stable","alpha"],"measurements":[1,1],"summary":"durable journal alpha","revision":2}"#,
             ),
             replacement_hit_path: "docs/active-a.json",
             delete_path: "docs/active-b.json",
@@ -1792,47 +1878,6 @@ fn vector_spec() -> VectorIndexSpec {
         metric: VectorMetric::Cosine as i32,
         normalize: true,
     }
-}
-
-fn keyword_field(
-    name: &str,
-    json_pointer: &str,
-    capabilities: &[IndexFieldCapability],
-) -> IndexField {
-    IndexField {
-        name: name.into(),
-        json_pointer: json_pointer.into(),
-        cardinality: IndexFieldCardinality::Single as i32,
-        capabilities: capabilities.iter().map(|value| *value as i32).collect(),
-        field_type: Some(IndexFieldType::Keyword(KeywordIndexField {})),
-    }
-}
-
-fn signed_integer_field(
-    name: &str,
-    json_pointer: &str,
-    capabilities: &[IndexFieldCapability],
-) -> IndexField {
-    IndexField {
-        name: name.into(),
-        json_pointer: json_pointer.into(),
-        cardinality: IndexFieldCardinality::Single as i32,
-        capabilities: capabilities.iter().map(|value| *value as i32).collect(),
-        field_type: Some(IndexFieldType::SignedInteger(SignedIntegerIndexField {})),
-    }
-}
-
-fn typed_json_order() -> Vec<IndexOrder> {
-    vec![
-        IndexOrder {
-            field: "modified_at".into(),
-            direction: IndexOrderDirection::Descending as i32,
-        },
-        IndexOrder {
-            field: "source_record_id".into(),
-            direction: IndexOrderDirection::Ascending as i32,
-        },
-    ]
 }
 
 fn specification(value: SpecificationValue) -> IndexSpecification {

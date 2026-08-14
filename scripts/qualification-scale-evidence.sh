@@ -134,8 +134,12 @@ incident_query_terminal_json() {
     monotonic_counter.anvil_index_query_candidate_doc_ids_total
     monotonic_counter.anvil_index_query_live_mask_blocks_decoded_total
     monotonic_counter.anvil_index_query_live_mask_rejects_total
-    monotonic_counter.anvil_index_query_fast_column_blocks_decoded_total
-    monotonic_counter.anvil_index_query_stored_field_blocks_decoded_total
+    monotonic_counter.anvil_index_query_point_blocks_decoded_total
+    monotonic_counter.anvil_index_query_doc_value_blocks_decoded_total
+    monotonic_counter.anvil_index_query_facet_documents_processed_total
+    monotonic_counter.anvil_index_query_facet_values_processed_total
+    monotonic_counter.anvil_index_query_aggregate_documents_processed_total
+    monotonic_counter.anvil_index_query_aggregate_values_processed_total
     monotonic_counter.anvil_index_query_cursor_seeks_total
     monotonic_counter.anvil_index_query_cursor_skipped_doc_ids_total
     monotonic_counter.anvil_index_query_physical_early_terminations_total
@@ -392,7 +396,7 @@ write_incident_query_evidence() {
             .tier == "physical" and
             .logical_read_bytes < $publication_bytes_ceiling and
             .terminal_counters["monotonic_counter.anvil_index_query_candidate_doc_ids_total"] < $record_ceiling and
-            .terminal_counters["monotonic_counter.anvil_index_query_stored_field_blocks_decoded_total"] < $record_ceiling
+            .terminal_counters["monotonic_counter.anvil_index_query_doc_value_blocks_decoded_total"] < $record_ceiling
           )) and
           ($queries[0:3] | all(
             .terminal_counters["monotonic_counter.anvil_index_query_physical_early_terminations_total"] > 0
@@ -716,11 +720,11 @@ run_scale_singleton_probe() {
     < <(isolated_typed_json_query_work "${probe_telemetry_prefix}" "${index_id}")
   publication_segments="$(matching_publication_segment_count \
     "${publication_telemetry_prefix}" "${index_id}" "${generation}")"
-  # This exact, single-valued equality probe uses at most six component
-  # streams per segment: term, posting, live-mask, exact-value verification,
-  # identity, and stored fields. Each stream traverses no more than the eight
-  # routing levels plus one leaf allowed by the v4 format. The qualification
-  # deliberately rounds the derived 54 reads per segment up to 64 and reserves
+  # This exact, single-valued keyword equality probe uses at most four
+  # component streams per segment: term dictionary, posting, live mask, and
+  # identity. Each stream traverses no more than the eight routing levels plus
+  # one leaf allowed by the v4 format. The qualification deliberately rounds
+  # the derived 36 reads per segment up to 64 and reserves
   # another 64 reads of fixed headroom rather than asserting a brittle minimum.
   read_ops_ceiling=$((64 * (publication_segments + 1)))
   if ((query_ops > read_ops_ceiling)); then
@@ -754,9 +758,9 @@ run_scale_singleton_probe() {
         },
         format_bound: {
           maximum_routing_height: 8,
-          exact_query_component_streams_per_segment: 6,
+          exact_query_component_streams_per_segment: 4,
           maximum_artifact_reads_per_component_stream: 9,
-          statically_derived_reads_per_segment: 54,
+          statically_derived_reads_per_segment: 36,
           qualification_ceiling_reads_per_segment: 64,
           fixed_headroom_reads: 64,
           formula: "64 * (publication_segments + 1)",

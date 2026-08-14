@@ -1,6 +1,9 @@
 use std::collections::BTreeSet;
 
-use anvil_storage::v1::{Durability, IndexFreshness, IndexSourceFreshness, QueryIndexResponse};
+use anvil_storage::v1::index_field::FieldType;
+use anvil_storage::v1::{
+    Durability, IndexFieldCapability, IndexFreshness, IndexSourceFreshness, QueryIndexResponse,
+};
 
 use super::{
     QueryValue, SpecificationValue, engine_cases, qualification_durability, retryable,
@@ -94,6 +97,61 @@ fn public_matrix_covers_all_eight_kinds_and_real_pagination() {
             );
         }
     }
+}
+
+#[test]
+fn typed_json_qualification_covers_every_type_and_capability() {
+    let case = engine_cases()
+        .into_iter()
+        .find(|case| {
+            matches!(
+                case.specification.specification.as_ref(),
+                Some(SpecificationValue::TypedJson(_))
+            )
+        })
+        .expect("Typed JSON qualification case");
+    let Some(SpecificationValue::TypedJson(specification)) = case.specification.specification
+    else {
+        unreachable!()
+    };
+    let types = specification
+        .fields
+        .iter()
+        .map(
+            |field| match field.field_type.as_ref().expect("field type") {
+                FieldType::Boolean(_) => "boolean",
+                FieldType::SignedInteger(_) => "signed",
+                FieldType::UnsignedInteger(_) => "unsigned",
+                FieldType::Float(_) => "float",
+                FieldType::Keyword(_) => "keyword",
+                FieldType::Text(_) => "text",
+            },
+        )
+        .collect::<BTreeSet<_>>();
+    let capabilities = specification
+        .fields
+        .iter()
+        .flat_map(|field| field.capabilities.iter().copied())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        types,
+        BTreeSet::from(["boolean", "float", "keyword", "signed", "text", "unsigned"])
+    );
+    assert_eq!(
+        capabilities,
+        BTreeSet::from([
+            IndexFieldCapability::Exact as i32,
+            IndexFieldCapability::Prefix as i32,
+            IndexFieldCapability::Range as i32,
+            IndexFieldCapability::Order as i32,
+            IndexFieldCapability::Facet as i32,
+            IndexFieldCapability::Aggregate as i32,
+            IndexFieldCapability::FullText as i32,
+        ])
+    );
+    assert!(specification.fields.iter().any(|field| {
+        field.cardinality == anvil_storage::v1::IndexFieldCardinality::Multi as i32
+    }));
 }
 
 #[test]

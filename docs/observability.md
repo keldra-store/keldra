@@ -141,7 +141,13 @@ Planner and posting telemetry reports conjunctions, reordered conjunctions,
 costed children, the selected lead cost range, posting blocks sought, decoded,
 and skipped, posting bytes, posting advances, conjunction advances, bounded
 union-heap pushes and pops, exact second-phase checks, live-mask decodes, and
-candidate-gate batches. These are counters or numeric histograms split only by
+candidate-gate batches. Point and doc-value block decodes are reported
+separately. Typed JSON computations add
+`anvil_index_query_facet_computations_requested_total`,
+`anvil_index_query_facet_computation_results_total`,
+`anvil_index_query_facet_documents_processed_total`,
+`anvil_index_query_facet_values_processed_total`, and the corresponding four
+`aggregate` counters. These are counters or numeric histograms split only by
 index kind; document, index, tenant, and bucket identifiers remain trace fields.
 `anvil_index_query_returned_hits` is emitted only for a completed response
 page. A failed, timed-out, or otherwise cancelled query has no returned page,

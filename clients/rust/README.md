@@ -87,6 +87,13 @@ Pass the request to `IndexServiceClient::create_index`. Query hits return the
 ordinary object address and exact version; fetch selected source objects with
 `GetObject` or `BatchGet`.
 
+The concrete builders are `BooleanField`, `SignedIntegerField`,
+`UnsignedIntegerField`, `FloatField`, `KeywordField`, and `TextField`. Their
+available methods mirror Anvil's native capabilities: exact matching, keyword
+prefix and range matching, numeric ranges, ordering, facets, numeric
+aggregates, and analyzed full-text search. A field emits only the index
+components required by the methods selected on its builder.
+
 ## Upload with compare-and-swap
 
 `put_chunks` performs Anvil's `StartPut`, streaming `Put`, and `PutEnd` flow.

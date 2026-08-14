@@ -655,9 +655,14 @@ println!("freshness: {:?}", response.freshness);
 # }
 ```
 
-The repository's public-API qualification constructs, populates, and queries
-all eight variants in
+The repository's public-API qualification constructs, populates, paginates,
+updates, deletes, rebuilds, and restart-verifies all eight variants in
 [`crates/anvil/examples/cluster_index_qualification.rs`](crates/anvil/examples/cluster_index_qualification.rs).
+Its Typed JSON case exercises every field type and declared capability,
+including fielded text and phrase search, identity-only hits, facets, and all
+five numeric aggregate operations. The production-shaped qualification binds
+those result checks to per-query logical reads, candidate counts, cursor seeks,
+cache fetches, CPU, memory, and elapsed time from Anvil's operational signals.
 
 ## Run a three-node cluster
 
