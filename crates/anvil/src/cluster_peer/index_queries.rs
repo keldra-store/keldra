@@ -30,6 +30,8 @@ use crate::index_service::{
 use crate::logical_name_resolution::LogicalNameResolver;
 
 const MAX_QUERY_HITS: usize = 1_000;
+const MAX_QUERY_COMPUTATIONS: usize = 32;
+const MAX_FACET_BUCKETS: usize = 1_000;
 /// The peer context represents remaining time as milliseconds in a `u32`.
 /// Public ingress already clamps this to the configured QueryIndex maximum;
 /// this is only the lossless ceiling of the existing one-hop wire field.
@@ -186,6 +188,7 @@ impl RoutedIndexQueryHandler for AuthorizedIndexQueryHandler {
         }
 
         let request = call.request;
+        let query_shape = request.query.clone();
         let authorization_revision = before.revision;
         let resume = request.resume.clone();
         let kind = IndexKind::try_from(request.definition.kind)
@@ -218,6 +221,7 @@ impl RoutedIndexQueryHandler for AuthorizedIndexQueryHandler {
             })
             .await?;
         validate_result(&result, request.resume.as_ref(), request.limit)?;
+        require_computation_shape(&result, &query_shape)?;
         require_result_authorization_revision(&result, authorization_revision)?;
         Ok(result)
     }
@@ -286,6 +290,7 @@ impl ClusterPeerTransport {
         let fence = placement.fence();
         let limit = value.limit;
         let resumed = value.resume.clone();
+        let query_shape = value.query.clone();
         let remaining = remaining.min(MAX_ROUTED_INDEX_QUERY_TIME);
         let mut request = Request::new(request_to_wire(
             self.context_with_timeout_limit(fence, 1, remaining, MAX_ROUTED_INDEX_QUERY_TIME)?,
@@ -309,6 +314,7 @@ impl ClusterPeerTransport {
         };
         let result = response_from_wire(response)?;
         validate_result(&result, resumed.as_ref(), limit)?;
+        require_computation_shape(&result, &query_shape)?;
         if response_fence != fence {
             return Err(Status::data_loss(
                 "routed index response carries another placement fence",
@@ -461,6 +467,15 @@ fn validate_result(
     limit: usize,
 ) -> Result<(), Status> {
     if result.hits.len() > limit
+        || result
+            .facet_results
+            .len()
+            .saturating_add(result.aggregate_results.len())
+            > MAX_QUERY_COMPUTATIONS
+        || result
+            .facet_results
+            .iter()
+            .any(|facet| facet.buckets.len() > MAX_FACET_BUCKETS)
         || result.next_position.as_ref().is_some_and(Vec::is_empty)
         || (result.next_position.is_some() && result.freshness.generation == 0)
     {
@@ -472,6 +487,43 @@ fn validate_result(
         ));
     }
     Ok(())
+}
+
+fn require_computation_shape(
+    result: &ExecutedIndexQuery,
+    query: &IndexQuery,
+) -> Result<(), Status> {
+    let Some(IndexQueryValue::TypedJson(query)) = query.query.as_ref() else {
+        if result.facet_results.is_empty() && result.aggregate_results.is_empty() {
+            return Ok(());
+        }
+        return Err(Status::data_loss(
+            "non-Typed-JSON routed query returned computation results",
+        ));
+    };
+    let facets_match = result.facet_results.len() == query.facets.len()
+        && result
+            .facet_results
+            .iter()
+            .zip(&query.facets)
+            .all(|(result, request)| {
+                result.field == request.field && result.buckets.len() <= request.limit as usize
+            });
+    let aggregates_match = result.aggregate_results.len() == query.aggregates.len()
+        && result
+            .aggregate_results
+            .iter()
+            .zip(&query.aggregates)
+            .all(|(result, request)| {
+                result.field == request.field && result.operation == request.operation
+            });
+    if facets_match && aggregates_match {
+        Ok(())
+    } else {
+        Err(Status::data_loss(
+            "routed query computation results do not match the request",
+        ))
+    }
 }
 
 fn require_result_authorization_revision(
@@ -565,7 +617,9 @@ fn require_authorization_evidence(
 #[cfg(test)]
 mod tests {
     use anvil_api::v1::{
-        IndexSpecification, PathIndexQuery, PathIndexSpec, index_query, index_specification,
+        IndexAggregateOperation, IndexAggregateRequest, IndexAggregateResult, IndexFacetBucket,
+        IndexFacetRequest, IndexFacetResult, IndexSpecification, PathIndexQuery, PathIndexSpec,
+        TypedJsonIndexQuery, index_query, index_specification,
     };
 
     use super::*;
@@ -690,6 +744,106 @@ mod tests {
         let freshness = response.freshness.unwrap();
         assert_eq!(freshness.placement_term, 31);
         assert_eq!(freshness.placement_index, 32);
+    }
+
+    #[test]
+    fn routed_results_preserve_facets_and_aggregates() {
+        let expected_facets = vec![IndexFacetResult {
+            field: "ecosystem".into(),
+            buckets: vec![IndexFacetBucket {
+                value_json: br#""cargo""#.to_vec(),
+                count: 7,
+            }],
+        }];
+        let expected_aggregates = vec![IndexAggregateResult {
+            field: "severity".into(),
+            operation: IndexAggregateOperation::Average as i32,
+            value_json: Some(b"6.5".to_vec()),
+            contributing_count: 4,
+        }];
+        let wire = response_to_wire(
+            ExecutedIndexQuery {
+                hits: Vec::new(),
+                facet_results: expected_facets.clone(),
+                aggregate_results: expected_aggregates.clone(),
+                freshness: anvil_api::v1::IndexFreshness {
+                    generation: 1,
+                    ..Default::default()
+                },
+                next_position: None,
+            },
+            PlacementLogId { term: 7, index: 8 },
+        )
+        .unwrap();
+        let decoded = response_from_wire(wire).unwrap();
+
+        assert_eq!(decoded.facet_results, expected_facets);
+        assert_eq!(decoded.aggregate_results, expected_aggregates);
+    }
+
+    #[test]
+    fn routed_computations_must_match_the_request_shape() {
+        let query = IndexQuery {
+            query: Some(index_query::Query::TypedJson(TypedJsonIndexQuery {
+                predicates: Vec::new(),
+                order: Vec::new(),
+                facets: vec![IndexFacetRequest {
+                    field: "ecosystem".into(),
+                    limit: 1,
+                }],
+                aggregates: vec![IndexAggregateRequest {
+                    field: "severity".into(),
+                    operation: IndexAggregateOperation::Maximum as i32,
+                }],
+            })),
+        };
+        let mut result = ExecutedIndexQuery {
+            hits: Vec::new(),
+            facet_results: vec![IndexFacetResult {
+                field: "ecosystem".into(),
+                buckets: vec![IndexFacetBucket {
+                    value_json: br#""cargo""#.to_vec(),
+                    count: 7,
+                }],
+            }],
+            aggregate_results: vec![IndexAggregateResult {
+                field: "severity".into(),
+                operation: IndexAggregateOperation::Maximum as i32,
+                value_json: Some(b"9".to_vec()),
+                contributing_count: 4,
+            }],
+            freshness: Default::default(),
+            next_position: None,
+        };
+
+        require_computation_shape(&result, &query).unwrap();
+
+        result.facet_results[0].field = "state".into();
+        assert_eq!(
+            require_computation_shape(&result, &query)
+                .unwrap_err()
+                .code(),
+            tonic::Code::DataLoss
+        );
+        result.facet_results[0].field = "ecosystem".into();
+        result.aggregate_results[0].operation = IndexAggregateOperation::Minimum as i32;
+        assert_eq!(
+            require_computation_shape(&result, &query)
+                .unwrap_err()
+                .code(),
+            tonic::Code::DataLoss
+        );
+        result.aggregate_results[0].operation = IndexAggregateOperation::Maximum as i32;
+        result.facet_results[0].buckets.push(IndexFacetBucket {
+            value_json: br#""npm""#.to_vec(),
+            count: 3,
+        });
+        assert_eq!(
+            require_computation_shape(&result, &query)
+                .unwrap_err()
+                .code(),
+            tonic::Code::DataLoss
+        );
     }
 
     #[test]

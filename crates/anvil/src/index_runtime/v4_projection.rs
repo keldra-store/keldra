@@ -451,12 +451,45 @@ fn scalar_projection_bytes(
                 .ok_or(IndexError::OffsetOverflow)?,
         )?;
         for value in &values.values {
-            let term_bytes = scalar_term_bytes(value)?;
             let string_bytes = match value {
                 ScalarValue::String(value) => value.capacity(),
                 _ => 0,
             };
             selected_bytes = checked_add(selected_bytes, string_bytes)?;
+            if field.field_type == FieldType::Text {
+                let ScalarValue::String(text) = value else {
+                    return Err(IndexError::Decode(format!(
+                        "Typed JSON text field `{}` contains a non-string value",
+                        field.name
+                    )));
+                };
+                let (token_count, normalized_bytes) = analyzed_token_measure(text)?;
+                let positions_bytes = token_count
+                    .checked_mul(std::mem::size_of::<u32>())
+                    .ok_or(IndexError::OffsetOverflow)?;
+                output_bytes = checked_add(
+                    output_bytes,
+                    token_count
+                        .checked_mul(std::mem::size_of::<ProjectedTerm>())
+                        .and_then(|bytes| bytes.checked_add(normalized_bytes))
+                        .and_then(|bytes| bytes.checked_add(positions_bytes))
+                        .ok_or(IndexError::OffsetOverflow)?,
+                )?;
+                temporary_bytes = checked_add(
+                    temporary_bytes,
+                    token_count
+                        .checked_mul(
+                            std::mem::size_of::<(String, u32)>()
+                                + std::mem::size_of::<(String, Vec<u32>)>()
+                                + 3 * std::mem::size_of::<usize>(),
+                        )
+                        .and_then(|bytes| bytes.checked_add(normalized_bytes))
+                        .and_then(|bytes| bytes.checked_add(positions_bytes))
+                        .ok_or(IndexError::OffsetOverflow)?,
+                )?;
+                continue;
+            }
+            let term_bytes = scalar_term_bytes(value)?;
             output_bytes = checked_add(
                 output_bytes,
                 std::mem::size_of::<ProjectedTerm>()
@@ -1773,6 +1806,28 @@ mod tests {
         let error = project_mutation(
             &schema,
             IndexSourceMutation::Upsert(object("records/text.json", body.len() as u64)),
+            Some(&mut payload),
+            4 * 1024,
+        )
+        .unwrap_err();
+        assert!(matches!(error, IndexError::ResourceLimit { .. }));
+        assert_eq!(payload.position(), body.len() as u64);
+    }
+
+    #[test]
+    fn typed_text_expansion_uses_the_same_bounded_preflight() {
+        let schema = schema(Specification::TypedJson(TypedJsonIndexSpec {
+            fields: vec![text_field("body", "/body", false)],
+            physical_order: Vec::new(),
+        }));
+        let body = serde_json::to_vec(&serde_json::json!({
+            "body": "a ".repeat(64),
+        }))
+        .unwrap();
+        let mut payload = Cursor::new(&body);
+        let error = project_mutation(
+            &schema,
+            IndexSourceMutation::Upsert(object("records/typed-text.json", body.len() as u64)),
             Some(&mut payload),
             4 * 1024,
         )

@@ -452,6 +452,22 @@ impl QueryActiveGuard {
             "query.doc_value_blocks_decoded",
             execution.doc_value_blocks_decoded,
         );
+        self.span.record(
+            "query.facet_documents_processed",
+            execution.facet_documents_processed,
+        );
+        self.span.record(
+            "query.facet_values_processed",
+            execution.facet_values_processed,
+        );
+        self.span.record(
+            "query.aggregate_documents_processed",
+            execution.aggregate_documents_processed,
+        );
+        self.span.record(
+            "query.aggregate_values_processed",
+            execution.aggregate_values_processed,
+        );
         self.span
             .record("query.cursor_seeks", execution.cursor_seeks);
         self.span.record(
@@ -541,6 +557,14 @@ impl QueryActiveGuard {
                     execution.point_blocks_decoded,
                 monotonic_counter.anvil_index_query_doc_value_blocks_decoded_total =
                     execution.doc_value_blocks_decoded,
+                monotonic_counter.anvil_index_query_facet_documents_processed_total =
+                    execution.facet_documents_processed,
+                monotonic_counter.anvil_index_query_facet_values_processed_total =
+                    execution.facet_values_processed,
+                monotonic_counter.anvil_index_query_aggregate_documents_processed_total =
+                    execution.aggregate_documents_processed,
+                monotonic_counter.anvil_index_query_aggregate_values_processed_total =
+                    execution.aggregate_values_processed,
                 monotonic_counter.anvil_index_query_cursor_seeks_total = execution.cursor_seeks,
                 monotonic_counter.anvil_index_query_cursor_skipped_doc_ids_total =
                     execution.cursor_skipped_doc_ids,
@@ -676,6 +700,14 @@ impl LocalGenerationQueryExecutor {
             query.live_mask_rejects = tracing::field::Empty,
             query.point_blocks_decoded = tracing::field::Empty,
             query.doc_value_blocks_decoded = tracing::field::Empty,
+            query.facet_documents_processed = tracing::field::Empty,
+            query.facet_values_processed = tracing::field::Empty,
+            query.aggregate_documents_processed = tracing::field::Empty,
+            query.aggregate_values_processed = tracing::field::Empty,
+            query.facet_computations_requested = tracing::field::Empty,
+            query.aggregate_computations_requested = tracing::field::Empty,
+            query.facet_computation_results = tracing::field::Empty,
+            query.aggregate_computation_results = tracing::field::Empty,
             query.cursor_seeks = tracing::field::Empty,
             query.cursor_skipped_doc_ids = tracing::field::Empty,
             query.physical_early_terminations = tracing::field::Empty,
@@ -721,6 +753,35 @@ impl LocalGenerationQueryExecutor {
                 "local index query has no Zanzibar authorization revision",
             ));
         }
+        let specification = request
+            .definition
+            .specification
+            .as_ref()
+            .ok_or_else(|| Status::data_loss("index definition has no specification"))?;
+        let schema = compile_schema(
+            &request.definition.path_prefix,
+            (!request.definition.content_type.is_empty())
+                .then_some(request.definition.content_type.as_str()),
+            specification,
+        )
+        .map_err(index_status)?;
+        let compiled =
+            compile_query(&schema, specification, &request.query).map_err(index_status)?;
+        record_computation_requests(
+            schema.kind,
+            compiled.facets.len(),
+            compiled.aggregates.len(),
+        )?;
+        let after = request
+            .resume
+            .as_ref()
+            .map(|resume| NativeQueryCursor::decode(&resume.last_position).map_err(index_status))
+            .transpose()?;
+        let field_names = schema
+            .fields
+            .iter()
+            .map(|field| field.name.clone())
+            .collect::<Vec<_>>();
         let requested_generation = request.resume.as_ref().map(|resume| resume.generation);
         let selected = self
             .publisher
@@ -751,10 +812,13 @@ impl LocalGenerationQueryExecutor {
         let observed =
             compatible_observed_barrier(indexed.as_ref(), self.events.last_observed_barrier());
         let Some(selected) = selected else {
+            let (facet_results, aggregate_results) =
+                empty_computation_results(&field_names, &compiled.facets, &compiled.aggregates)?;
+            record_computation_results(schema.kind, facet_results.len(), aggregate_results.len())?;
             return Ok(ExecutedIndexQuery {
                 hits: Vec::new(),
-                facet_results: Vec::new(),
-                aggregate_results: Vec::new(),
+                facet_results,
+                aggregate_results,
                 freshness: empty_freshness(
                     request.definition.index_id,
                     request.definition.version,
@@ -772,10 +836,13 @@ impl LocalGenerationQueryExecutor {
                     "requested generation belongs to another index definition version",
                 ));
             }
+            let (facet_results, aggregate_results) =
+                empty_computation_results(&field_names, &compiled.facets, &compiled.aggregates)?;
+            record_computation_results(schema.kind, facet_results.len(), aggregate_results.len())?;
             return Ok(ExecutedIndexQuery {
                 hits: Vec::new(),
-                facet_results: Vec::new(),
-                aggregate_results: Vec::new(),
+                facet_results,
+                aggregate_results,
                 freshness: query_freshness(
                     &loaded,
                     observed.as_ref(),
@@ -785,31 +852,7 @@ impl LocalGenerationQueryExecutor {
                 next_position: None,
             });
         }
-        let specification = request
-            .definition
-            .specification
-            .as_ref()
-            .ok_or_else(|| Status::data_loss("index definition has no specification"))?;
-        let schema = compile_schema(
-            &request.definition.path_prefix,
-            (!request.definition.content_type.is_empty())
-                .then_some(request.definition.content_type.as_str()),
-            specification,
-        )
-        .map_err(index_status)?;
         require_manifest_schema(&loaded.manifest, &schema)?;
-        let compiled =
-            compile_query(&schema, specification, &request.query).map_err(index_status)?;
-        let after = request
-            .resume
-            .as_ref()
-            .map(|resume| NativeQueryCursor::decode(&resume.last_position).map_err(index_status))
-            .transpose()?;
-        let field_names = schema
-            .fields
-            .iter()
-            .map(|field| field.name.clone())
-            .collect::<Vec<_>>();
         let directory = QueryObservedDirectory::new(
             ManifestArtifactDirectory::new(
                 self.cache.clone(),
@@ -861,6 +904,18 @@ impl LocalGenerationQueryExecutor {
                 "authorization revision changed during index execution",
             ));
         }
+        if page.facet_results.len() != native.facets.len()
+            || page.aggregate_results.len() != native.aggregates.len()
+        {
+            return Err(Status::data_loss(
+                "native query returned incomplete computation results",
+            ));
+        }
+        record_computation_results(
+            native.schema.kind,
+            page.facet_results.len(),
+            page.aggregate_results.len(),
+        )?;
         let hits = page
             .hits
             .into_iter()
@@ -911,6 +966,82 @@ impl LocalIndexQueryExecutor for LocalGenerationQueryExecutor {
     ) -> Result<ExecutedIndexQuery, Status> {
         self.execute(request).await
     }
+}
+
+fn record_computation_requests(
+    kind: IndexKind,
+    facets: usize,
+    aggregates: usize,
+) -> Result<(), Status> {
+    let facets = u64::try_from(facets)
+        .map_err(|_| Status::resource_exhausted("facet request count exceeds u64"))?;
+    let aggregates = u64::try_from(aggregates)
+        .map_err(|_| Status::resource_exhausted("aggregate request count exceeds u64"))?;
+    tracing::Span::current().record("query.facet_computations_requested", facets);
+    tracing::Span::current().record("query.aggregate_computations_requested", aggregates);
+    tracing::info!(
+        index.kind = ?kind,
+        monotonic_counter.anvil_index_query_facet_computations_requested_total = facets,
+        monotonic_counter.anvil_index_query_aggregate_computations_requested_total = aggregates,
+        "native index computations admitted"
+    );
+    Ok(())
+}
+
+fn record_computation_results(
+    kind: IndexKind,
+    facets: usize,
+    aggregates: usize,
+) -> Result<(), Status> {
+    let facets = u64::try_from(facets)
+        .map_err(|_| Status::resource_exhausted("facet result count exceeds u64"))?;
+    let aggregates = u64::try_from(aggregates)
+        .map_err(|_| Status::resource_exhausted("aggregate result count exceeds u64"))?;
+    tracing::Span::current().record("query.facet_computation_results", facets);
+    tracing::Span::current().record("query.aggregate_computation_results", aggregates);
+    tracing::info!(
+        index.kind = ?kind,
+        monotonic_counter.anvil_index_query_facet_computation_results_total = facets,
+        monotonic_counter.anvil_index_query_aggregate_computation_results_total = aggregates,
+        "native index computations completed"
+    );
+    Ok(())
+}
+
+fn empty_computation_results(
+    field_names: &[String],
+    facets: &[anvil_index::v4::FacetRequest],
+    aggregates: &[anvil_index::v4::AggregateRequest],
+) -> Result<(Vec<IndexFacetResult>, Vec<IndexAggregateResult>), Status> {
+    let facets = facets
+        .iter()
+        .map(|facet| {
+            Ok(IndexFacetResult {
+                field: field_name(field_names, facet.field_id)?.to_owned(),
+                buckets: Vec::new(),
+            })
+        })
+        .collect::<Result<Vec<_>, Status>>()?;
+    let aggregates = aggregates
+        .iter()
+        .map(|aggregate| {
+            let operation = match aggregate.operation {
+                AggregateOperation::Count => IndexAggregateOperation::Count,
+                AggregateOperation::Minimum => IndexAggregateOperation::Minimum,
+                AggregateOperation::Maximum => IndexAggregateOperation::Maximum,
+                AggregateOperation::Sum => IndexAggregateOperation::Sum,
+                AggregateOperation::Average => IndexAggregateOperation::Average,
+            };
+            Ok(IndexAggregateResult {
+                field: field_name(field_names, aggregate.field_id)?.to_owned(),
+                operation: operation as i32,
+                value_json: (aggregate.operation == AggregateOperation::Count)
+                    .then(|| b"0".to_vec()),
+                contributing_count: 0,
+            })
+        })
+        .collect::<Result<Vec<_>, Status>>()?;
+    Ok((facets, aggregates))
 }
 
 fn facet_result_to_api(
@@ -1319,6 +1450,38 @@ mod tests {
         let freshness = empty_freshness(7, 2, 91, None);
         assert_eq!(freshness.authorization_revision, 91);
         assert_eq!(freshness.generation, 0);
+    }
+
+    #[test]
+    fn empty_generation_returns_one_result_per_requested_computation() {
+        let (facets, aggregates) = empty_computation_results(
+            &["ecosystem".into(), "severity".into()],
+            &[anvil_index::v4::FacetRequest {
+                field_id: FieldId::new(0),
+                limit: 10,
+            }],
+            &[
+                anvil_index::v4::AggregateRequest {
+                    field_id: FieldId::new(1),
+                    operation: AggregateOperation::Count,
+                },
+                anvil_index::v4::AggregateRequest {
+                    field_id: FieldId::new(1),
+                    operation: AggregateOperation::Average,
+                },
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(facets[0].field, "ecosystem");
+        assert!(facets[0].buckets.is_empty());
+        assert_eq!(aggregates[0].value_json.as_deref(), Some(b"0".as_slice()));
+        assert_eq!(aggregates[1].value_json, None);
+        assert!(
+            aggregates
+                .iter()
+                .all(|aggregate| aggregate.contributing_count == 0)
+        );
     }
 
     #[test]

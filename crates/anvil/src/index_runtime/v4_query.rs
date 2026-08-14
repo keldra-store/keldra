@@ -388,10 +388,6 @@ fn compile_order(schema: &Schema, order: &[IndexOrder]) -> Result<Vec<OrderField
         .collect()
 }
 
-fn field_id(schema: &Schema, name: &str) -> Result<FieldId, IndexError> {
-    Ok(field(schema, name)?.id)
-}
-
 fn field<'a>(schema: &'a Schema, name: &str) -> Result<&'a FieldSchema, IndexError> {
     schema
         .fields

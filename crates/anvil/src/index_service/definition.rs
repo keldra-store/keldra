@@ -1,9 +1,9 @@
-use anvil_api::v1::index_specification::Specification;
 use anvil_api::v1::index_field::FieldType;
+use anvil_api::v1::index_specification::Specification;
 use anvil_api::v1::{
-    CreateIndexRequest, IndexDefinition, IndexField, IndexFieldCapability,
-    IndexFieldCardinality, IndexKind, IndexOrderDirection, IndexSpecification, TextAnalyzer,
-    TypedJsonIndexSpec, UpdateIndexRequest,
+    CreateIndexRequest, IndexDefinition, IndexField, IndexFieldCapability, IndexFieldCardinality,
+    IndexKind, IndexOrderDirection, IndexSpecification, TextAnalyzer, TypedJsonIndexSpec,
+    UpdateIndexRequest,
 };
 use anvil_atomic_program::MAX_OBJECT_PATH_BYTES;
 use anvil_store::INDEX_DEFINITION_PREFIX;
@@ -11,6 +11,8 @@ use prost::Message;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use tonic::Status;
+
+use crate::index_runtime::v4_schema::compile_schema;
 
 const STORED_DEFINITION_FORMAT: u16 = 4;
 const MAX_INDEX_NAME_BYTES: usize = 128;
@@ -120,6 +122,12 @@ impl StoredIndexDefinition {
         let specification = stored.specification()?;
         validate_specification(&specification)
             .map_err(|_| Status::data_loss("stored index specification is invalid"))?;
+        compile_schema(
+            &stored.path_prefix,
+            stored.content_type.as_deref(),
+            &specification,
+        )
+        .map_err(|_| Status::data_loss("stored index schema is invalid"))?;
         if let Some(accepted_at_unix_millis) = stored.last_explicit_rebuild_at_unix_millis {
             validate_explicit_rebuild(accepted_at_unix_millis)
                 .map_err(|_| Status::data_loss("stored explicit index rebuild is invalid"))?;
@@ -209,13 +217,19 @@ pub(crate) fn validate_create_definition(
     validate_bucket(&request.bucket)?;
     validate_name(&request.name)?;
     validate_path_prefix(&request.path_prefix)?;
-    optional_content_type(request.content_type.clone())?;
+    let content_type = optional_content_type(request.content_type.clone())?;
     validate_command_id(&request.command_id)?;
     let specification = request
         .specification
         .clone()
         .ok_or_else(|| Status::invalid_argument("index specification is required"))?;
     validate_specification(&specification)?;
+    compile_schema(
+        &request.path_prefix,
+        content_type.as_deref(),
+        &specification,
+    )
+    .map_err(|error| Status::invalid_argument(error.to_string()))?;
     Ok(specification)
 }
 
@@ -230,13 +244,19 @@ pub(crate) fn validate_update_definition(
     validate_bucket(&request.bucket)?;
     validate_name(&request.name)?;
     validate_path_prefix(&request.path_prefix)?;
-    optional_content_type(request.content_type.clone())?;
+    let content_type = optional_content_type(request.content_type.clone())?;
     validate_command_id(&request.command_id)?;
     let specification = request
         .specification
         .clone()
         .ok_or_else(|| Status::invalid_argument("index specification is required"))?;
     validate_specification(&specification)?;
+    compile_schema(
+        &request.path_prefix,
+        content_type.as_deref(),
+        &specification,
+    )
+    .map_err(|error| Status::invalid_argument(error.to_string()))?;
     Ok(specification)
 }
 
@@ -443,10 +463,7 @@ fn validate_typed_json_specification(specification: &TypedJsonIndexSpec) -> Resu
         .map(|field| {
             (
                 field.name.as_str(),
-                (
-                    field.cardinality,
-                    field.capabilities.as_slice(),
-                ),
+                (field.cardinality, field.capabilities.as_slice()),
             )
         })
         .collect::<std::collections::BTreeMap<_, _>>();
@@ -587,8 +604,8 @@ fn validate_explicit_rebuild(accepted_at_unix_millis: u64) -> Result<(), Status>
 #[cfg(test)]
 mod tests {
     use anvil_api::v1::{
-        IndexOrder, KeywordIndexField, PathIndexSpec, SignedIntegerIndexField,
-        TensorIndexSpec, TypedJsonIndexSpec, index_specification,
+        IndexOrder, KeywordIndexField, PathIndexSpec, SignedIntegerIndexField, TensorIndexSpec,
+        TypedJsonIndexSpec, index_specification,
     };
 
     use super::*;
@@ -684,9 +701,7 @@ mod tests {
                                 IndexFieldCapability::Range as i32,
                                 IndexFieldCapability::Order as i32,
                             ],
-                            field_type: Some(FieldType::SignedInteger(
-                                SignedIntegerIndexField {},
-                            )),
+                            field_type: Some(FieldType::SignedInteger(SignedIntegerIndexField {})),
                         },
                         IndexField {
                             name: "ecosystems".into(),
@@ -721,6 +736,32 @@ mod tests {
     }
 
     #[test]
+    fn definition_admission_rejects_a_schema_whose_statistics_cannot_fit() {
+        let mut request = request();
+        request.specification = Some(IndexSpecification {
+            specification: Some(index_specification::Specification::TypedJson(
+                TypedJsonIndexSpec {
+                    fields: (0..6_000)
+                        .map(|ordinal| IndexField {
+                            name: format!("field-{ordinal}"),
+                            json_pointer: format!("/field-{ordinal}"),
+                            cardinality: IndexFieldCardinality::Single as i32,
+                            capabilities: vec![IndexFieldCapability::Exact as i32],
+                            field_type: Some(FieldType::Keyword(KeywordIndexField {})),
+                        })
+                        .collect(),
+                    physical_order: Vec::new(),
+                },
+            )),
+        });
+
+        assert_eq!(
+            validate_create_definition(&request).unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+
+    #[test]
     fn typed_json_rejects_missing_types_and_invalid_or_duplicate_capabilities() {
         let mut missing_type = typed_json_request();
         let Some(IndexSpecification {
@@ -731,7 +772,9 @@ mod tests {
         };
         specification.fields[0].field_type = None;
         assert_eq!(
-            validate_create_definition(&missing_type).unwrap_err().code(),
+            validate_create_definition(&missing_type)
+                .unwrap_err()
+                .code(),
             tonic::Code::InvalidArgument
         );
 
