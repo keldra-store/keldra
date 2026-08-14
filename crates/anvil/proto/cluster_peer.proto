@@ -716,6 +716,8 @@ message RoutedIndexQueryResponse {
   // fence under which the returned generation was built.
   uint64 routing_placement_term = 5;
   uint64 routing_placement_index = 6;
+  repeated anvil.v1.IndexFacetResult facet_results = 7;
+  repeated anvil.v1.IndexAggregateResult aggregate_results = 8;
 }
 
 message RouteCreatePersonalDbGroupRequest {

@@ -23,15 +23,15 @@ use anvil_storage::v1::bulk_operation::Operation as BulkOperationValue;
 use anvil_storage::v1::bulk_outcome::Outcome as BulkOutcomeValue;
 use anvil_storage::v1::index_query::Query as QueryValue;
 use anvil_storage::v1::index_service_client::IndexServiceClient;
-use anvil_storage::v1::index_specification::Specification as SpecificationValue;
 use anvil_storage::v1::{
     BulkOperation, BulkPutRequest, BulkWriteRequest, CreateBucketRequest, CreateIndexRequest,
-    DeleteRequest, Durability, IndexField, IndexFreshness, IndexPredicate, IndexPredicateOperator,
-    IndexQuery, IndexSourceFreshness, IndexSpecification, ObjectAddress, ObjectVersioning,
-    QueryIndexRequest, QueryIndexResponse, TypedJsonIndexQuery, TypedJsonIndexSpec,
+    DeleteRequest, Durability, IndexFreshness, IndexPredicate, IndexPredicateOperator, IndexQuery,
+    IndexSourceFreshness, ObjectAddress, ObjectVersioning, QueryIndexRequest, QueryIndexResponse,
+    TypedJsonIndexQuery,
 };
 use anvil_storage::{
-    BearerToken, RawClient, administration_client, connect_channel, exchange_client_credentials,
+    BearerToken, BooleanField, FloatField, KeywordField, RawClient, TypedJsonIndexBuilder,
+    UnsignedIntegerField, administration_client, connect_channel, exchange_client_credentials,
     object_client,
 };
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -301,26 +301,7 @@ async fn main() -> Result<()> {
 
     let mut index = index_client(channels[0].clone(), &token)?;
     let definition = index
-        .create_index(CreateIndexRequest {
-            bucket: config.bucket.to_string(),
-            name: "records-by-field".into(),
-            path_prefix: "records/".into(),
-            content_type: CONTENT_TYPE.into(),
-            specification: Some(IndexSpecification {
-                specification: Some(SpecificationValue::TypedJson(TypedJsonIndexSpec {
-                    fields: data::indexed_fields()
-                        .into_iter()
-                        .map(|(name, json_pointer)| IndexField {
-                            name: name.into(),
-                            json_pointer: json_pointer.into(),
-                            multi_valued: false,
-                        })
-                        .collect(),
-                    physical_order: incident::physical_order(),
-                })),
-            }),
-            command_id: "v06-resource-create-index".into(),
-        })
+        .create_index(qualification_index_request(&config.bucket)?)
         .await
         .context("create qualification index")?
         .into_inner();
@@ -602,6 +583,42 @@ async fn main() -> Result<()> {
     }
     println!("{}", String::from_utf8(encoded).expect("JSON is UTF-8"));
     Ok(())
+}
+
+fn qualification_index_request(bucket: &str) -> Result<CreateIndexRequest> {
+    let record_id = UnsignedIntegerField::single("record_id", "/record_id")
+        .exact()
+        .order();
+    let record_id_order = record_id.ascending();
+    let modified_day = UnsignedIntegerField::single("modified_day", "/modified_day").order();
+    let modified_day_order = modified_day.descending();
+
+    Ok(TypedJsonIndexBuilder::new(bucket, "records-by-field")
+        .path_prefix("records/")
+        .content_type(CONTENT_TYPE)
+        .field(record_id)
+        .field(
+            KeywordField::single("ecosystem", "/ecosystem")
+                .exact()
+                .facet(),
+        )
+        .field(KeywordField::single("package", "/package").exact())
+        .field(KeywordField::single("severity", "/severity").exact())
+        .field(BooleanField::single("active", "/active").exact().facet())
+        .field(BooleanField::single("withdrawn", "/withdrawn").exact())
+        .field(
+            FloatField::single("score", "/score")
+                .range()
+                .order()
+                .aggregate(),
+        )
+        .field(UnsignedIntegerField::single("published_day", "/published_day").exact())
+        .field(modified_day)
+        .field(UnsignedIntegerField::single("sequence", "/sequence").exact())
+        .field(KeywordField::single("source", "/source").exact())
+        .field(UnsignedIntegerField::single("partition", "/partition").exact())
+        .physical_order([modified_day_order, record_id_order])
+        .finish("v06-resource-create-index")?)
 }
 
 impl Config {
@@ -1590,6 +1607,8 @@ async fn query_partition(
                         values_json: vec![partition.to_string().into_bytes()],
                     }],
                     order: Vec::new(),
+                    facets: Vec::new(),
+                    aggregates: Vec::new(),
                 })),
             }),
             limit: QUERY_LIMIT,
@@ -1739,6 +1758,83 @@ impl GenerationResponse for QueryIndexResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qualification_definition_uses_typed_capability_specific_fields() {
+        use anvil_storage::v1::IndexFieldCapability;
+        use anvil_storage::v1::index_field::FieldType;
+        use anvil_storage::v1::index_specification::Specification;
+
+        let request = qualification_index_request("qualification").unwrap();
+        let Specification::TypedJson(specification) =
+            request.specification.unwrap().specification.unwrap()
+        else {
+            panic!("qualification definition was not Typed JSON")
+        };
+        let expected = [
+            (
+                "record_id",
+                "unsigned",
+                vec![IndexFieldCapability::Exact, IndexFieldCapability::Order],
+            ),
+            (
+                "ecosystem",
+                "keyword",
+                vec![IndexFieldCapability::Exact, IndexFieldCapability::Facet],
+            ),
+            ("package", "keyword", vec![IndexFieldCapability::Exact]),
+            ("severity", "keyword", vec![IndexFieldCapability::Exact]),
+            (
+                "active",
+                "boolean",
+                vec![IndexFieldCapability::Exact, IndexFieldCapability::Facet],
+            ),
+            ("withdrawn", "boolean", vec![IndexFieldCapability::Exact]),
+            (
+                "score",
+                "float",
+                vec![
+                    IndexFieldCapability::Range,
+                    IndexFieldCapability::Order,
+                    IndexFieldCapability::Aggregate,
+                ],
+            ),
+            (
+                "published_day",
+                "unsigned",
+                vec![IndexFieldCapability::Exact],
+            ),
+            (
+                "modified_day",
+                "unsigned",
+                vec![IndexFieldCapability::Order],
+            ),
+            ("sequence", "unsigned", vec![IndexFieldCapability::Exact]),
+            ("source", "keyword", vec![IndexFieldCapability::Exact]),
+            ("partition", "unsigned", vec![IndexFieldCapability::Exact]),
+        ];
+
+        assert_eq!(specification.fields.len(), expected.len());
+        for (field, (name, kind, capabilities)) in specification.fields.iter().zip(expected) {
+            let observed_kind = match field.field_type.as_ref().unwrap() {
+                FieldType::Boolean(_) => "boolean",
+                FieldType::UnsignedInteger(_) => "unsigned",
+                FieldType::Float(_) => "float",
+                FieldType::Keyword(_) => "keyword",
+                other => panic!("unexpected qualification field type: {other:?}"),
+            };
+            assert_eq!(field.name, name);
+            assert_eq!(observed_kind, kind);
+            assert_eq!(
+                field.capabilities,
+                capabilities
+                    .into_iter()
+                    .map(|capability| capability as i32)
+                    .collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(specification.physical_order, incident::physical_order());
+    }
 
     #[test]
     fn record_path_parser_rejects_other_namespaces() {

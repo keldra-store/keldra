@@ -106,6 +106,8 @@ fn routed_response() -> QueryIndexResponse {
     QueryIndexResponse {
         hits: Vec::new(),
         next_page_token: vec![1, 2, 3],
+        facet_results: Vec::new(),
+        aggregate_results: Vec::new(),
         freshness: Some(IndexFreshness {
             generation: 7,
             published_at: None,

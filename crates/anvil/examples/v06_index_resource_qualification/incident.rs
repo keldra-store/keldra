@@ -7,8 +7,9 @@ use std::time::Instant;
 
 use anvil_storage::v1::index_query::Query as QueryValue;
 use anvil_storage::v1::{
-    IndexOrder, IndexOrderDirection, IndexPredicate, IndexPredicateOperator, IndexQuery,
-    QueryIndexRequest, QueryIndexResponse, TypedJsonIndexQuery,
+    IndexAggregateOperation, IndexAggregateRequest, IndexFacetRequest, IndexOrder,
+    IndexOrderDirection, IndexPredicate, IndexPredicateOperator, IndexQuery, QueryIndexRequest,
+    QueryIndexResponse, TypedJsonIndexQuery,
 };
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -107,14 +108,17 @@ pub(super) async fn run(
     );
 
     let incident_query = incident_query();
-    let (limit_four, limit_four_elapsed) = execute(
-        client,
-        bucket,
-        incident_query.clone(),
-        INCIDENT_LIMIT,
-        Vec::new(),
-    )
-    .await?;
+    let mut limit_four_query = incident_query.clone();
+    limit_four_query.facets.push(IndexFacetRequest {
+        field: "active".into(),
+        limit: 1,
+    });
+    limit_four_query.aggregates.push(IndexAggregateRequest {
+        field: "score".into(),
+        operation: IndexAggregateOperation::Count as i32,
+    });
+    let (limit_four, limit_four_elapsed) =
+        execute(client, bucket, limit_four_query, INCIDENT_LIMIT, Vec::new()).await?;
     let limit_four_expected = &incident_expected[..usize::try_from(INCIDENT_LIMIT)?];
     let limit_four_ids = validate_response(
         &limit_four,
@@ -122,6 +126,7 @@ pub(super) async fn run(
         initial_versions,
         expected_sources,
     )?;
+    validate_computations(&limit_four, incident_expected.len())?;
 
     let (page_one, page_one_elapsed) = execute(
         client,
@@ -297,6 +302,8 @@ fn incident_query() -> TypedJsonIndexQuery {
     TypedJsonIndexQuery {
         predicates: incident_predicates(),
         order: physical_order(),
+        facets: Vec::new(),
+        aggregates: Vec::new(),
     }
 }
 
@@ -310,6 +317,8 @@ fn zero_hit_query() -> TypedJsonIndexQuery {
     TypedJsonIndexQuery {
         predicates,
         order: physical_order(),
+        facets: Vec::new(),
+        aggregates: Vec::new(),
     }
 }
 
@@ -326,7 +335,25 @@ fn arbitrary_sort_query() -> TypedJsonIndexQuery {
                 direction: IndexOrderDirection::Ascending as i32,
             },
         ],
+        facets: Vec::new(),
+        aggregates: Vec::new(),
     }
+}
+
+fn validate_computations(response: &QueryIndexResponse, matching_documents: usize) -> Result<()> {
+    ensure!(response.facet_results.len() == 1);
+    let facet = &response.facet_results[0];
+    ensure!(facet.field == "active" && facet.buckets.len() == 1);
+    ensure!(facet.buckets[0].value_json == b"true");
+    ensure!(facet.buckets[0].count == u64::try_from(matching_documents)?);
+
+    ensure!(response.aggregate_results.len() == 1);
+    let aggregate = &response.aggregate_results[0];
+    ensure!(aggregate.field == "score");
+    ensure!(aggregate.operation == IndexAggregateOperation::Count as i32);
+    ensure!(aggregate.contributing_count == u64::try_from(matching_documents)?);
+    ensure!(aggregate.value_json.as_deref() == Some(matching_documents.to_string().as_bytes()));
+    Ok(())
 }
 
 fn incident_predicates() -> Vec<IndexPredicate> {

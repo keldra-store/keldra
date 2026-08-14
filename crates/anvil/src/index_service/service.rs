@@ -756,6 +756,8 @@ impl IndexServiceRpc for IndexServiceImpl {
                     hits: executed.hits,
                     next_page_token,
                     freshness: Some(executed.freshness),
+                    facet_results: executed.facet_results,
+                    aggregate_results: executed.aggregate_results,
                 }))
             },
             "index request deadline exceeded",
@@ -1496,6 +1498,8 @@ mod tests {
     fn lag_is_returned_as_freshness_evidence_never_an_execution_error() {
         let execution = super::super::boundary::ExecutedIndexQuery {
             hits: Vec::new(),
+            facet_results: Vec::new(),
+            aggregate_results: Vec::new(),
             freshness: IndexFreshness {
                 generation: 7,
                 sources: vec![IndexSourceFreshness {
@@ -1525,6 +1529,8 @@ mod tests {
         };
         let mut execution = super::super::boundary::ExecutedIndexQuery {
             hits: Vec::new(),
+            facet_results: Vec::new(),
+            aggregate_results: Vec::new(),
             freshness: IndexFreshness {
                 generation: 7,
                 authorization_revision: 9,

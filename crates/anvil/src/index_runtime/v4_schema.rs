@@ -2,30 +2,24 @@
 
 use std::collections::BTreeSet;
 
+use anvil_api::v1::index_field::FieldType as ApiFieldType;
 use anvil_api::v1::index_specification::Specification;
 use anvil_api::v1::{
-    FullTextIndexSpec, HybridIndexSpec, IndexOrderDirection, IndexSpecification,
-    MetadataFilterIndexSpec, TypedJsonIndexSpec, VectorIndexSpec, VectorMetric as ApiVectorMetric,
+    FullTextIndexSpec, HybridIndexSpec, IndexFieldCapability, IndexFieldCardinality,
+    IndexOrderDirection, IndexSpecification, MetadataFilterIndexSpec, TextAnalyzer,
+    TypedJsonIndexSpec, VectorIndexSpec, VectorMetric as ApiVectorMetric,
 };
 use anvil_index::IndexError;
 use anvil_index::v4::{
-    Analyzer, Cardinality, Collation, ComponentKind, ComponentVersion, FieldComponents, FieldId,
-    FieldSchema, IndexKind, IndexSemantics, OrderDirection, OrderField,
-    STORED_FIELDS_COMPONENT_CODEC_VERSION, ScalarDomain, Schema, VectorMetric, VectorNormalization,
+    Analyzer, Cardinality, Collation, ComponentKind, ComponentVersion, FieldCapabilities,
+    FieldComponents, FieldId, FieldSchema, FieldType, IndexKind, IndexSemantics, OrderDirection,
+    OrderField, Schema, VectorMetric, VectorNormalization,
 };
 
 const COMPONENT_CODEC_VERSION: u16 = 1;
 const IDENTITY_COMPONENT_CODEC_VERSION: u16 = 2;
 const BM25_K1: f64 = 1.2;
 const BM25_B: f64 = 0.75;
-
-const TERMS_AND_COLUMN: FieldComponents =
-    FieldComponents::TERMS.union(FieldComponents::FAST_COLUMN);
-const TERMS_COLUMN_AND_STORED: FieldComponents = TERMS_AND_COLUMN.union(FieldComponents::STORED);
-const FULL_TEXT_COMPONENTS: FieldComponents = FieldComponents::TERMS
-    .union(FieldComponents::POSITIONS)
-    .union(FieldComponents::NORMS)
-    .union(FieldComponents::STORED);
 
 /// Compile one already-authorized public definition into its complete,
 /// deterministic format-v4 schema. Field IDs are definition-local and dense;
@@ -72,11 +66,12 @@ fn path_schema() -> Result<SchemaParts, IndexError> {
             0,
             "path",
             "@object/path",
-            ScalarDomain::STRING,
+            FieldType::Keyword,
             Cardinality::Single,
             false,
             false,
-            FieldComponents::TERMS,
+            FieldCapabilities::EXACT.union(FieldCapabilities::PREFIX),
+            None,
         )?],
         IndexSemantics::Path,
         Vec::new(),
@@ -89,16 +84,17 @@ fn metadata_schema(specification: &MetadataFilterIndexSpec) -> Result<SchemaPart
         .iter()
         .enumerate()
         .map(|(ordinal, name)| {
-            let (domain, allow_null) = metadata_domain(name)?;
+            let (field_type, capabilities, allow_null) = metadata_field(name)?;
             field(
                 ordinal,
                 name,
                 &format!("@head/{name}"),
-                domain,
+                field_type,
                 Cardinality::Single,
                 false,
                 allow_null,
-                TERMS_COLUMN_AND_STORED,
+                capabilities,
+                None,
             )
         })
         .collect::<Result<Vec<_>, IndexError>>()?;
@@ -110,13 +106,26 @@ fn metadata_schema(specification: &MetadataFilterIndexSpec) -> Result<SchemaPart
     ))
 }
 
-fn metadata_domain(name: &str) -> Result<(ScalarDomain, bool), IndexError> {
+fn metadata_field(name: &str) -> Result<(FieldType, FieldCapabilities, bool), IndexError> {
     match name {
-        "path" | "content_hash" => Ok((ScalarDomain::STRING, false)),
-        "content_type" => Ok((ScalarDomain::STRING.union(ScalarDomain::NULL), true)),
-        "version" | "content_length" | "committed_at_unix_millis" => {
-            Ok((ScalarDomain::UNSIGNED, false))
-        }
+        "path" => Ok((
+            FieldType::Keyword,
+            FieldCapabilities::EXACT
+                .union(FieldCapabilities::PREFIX)
+                .union(FieldCapabilities::RANGE),
+            false,
+        )),
+        "content_hash" => Ok((FieldType::Keyword, FieldCapabilities::EXACT, false)),
+        "content_type" => Ok((
+            FieldType::Keyword,
+            FieldCapabilities::EXACT.union(FieldCapabilities::PREFIX),
+            true,
+        )),
+        "version" | "content_length" | "committed_at_unix_millis" => Ok((
+            FieldType::UnsignedInteger,
+            FieldCapabilities::EXACT.union(FieldCapabilities::RANGE),
+            false,
+        )),
         _ => Err(IndexError::InvalidDefinition(
             "metadata index contains an unsupported object-head field".into(),
         )),
@@ -129,19 +138,17 @@ fn typed_json_schema(specification: &TypedJsonIndexSpec) -> Result<SchemaParts, 
         .iter()
         .enumerate()
         .map(|(ordinal, value)| {
+            let (field_type, analyzer) = api_field_type(value)?;
             field(
                 ordinal,
                 &value.name,
                 &value.json_pointer,
-                ScalarDomain::ALL_JSON,
-                if value.multi_valued {
-                    Cardinality::Multi
-                } else {
-                    Cardinality::Single
-                },
+                field_type,
+                api_cardinality(value.cardinality)?,
                 true,
                 true,
-                TERMS_COLUMN_AND_STORED,
+                api_capabilities(&value.capabilities)?,
+                analyzer,
             )
         })
         .collect::<Result<Vec<_>, IndexError>>()?;
@@ -179,6 +186,73 @@ fn typed_json_schema(specification: &TypedJsonIndexSpec) -> Result<SchemaParts, 
     ))
 }
 
+fn api_field_type(
+    field: &anvil_api::v1::IndexField,
+) -> Result<(FieldType, Option<Analyzer>), IndexError> {
+    Ok(match field.field_type.as_ref() {
+        Some(ApiFieldType::Boolean(_)) => (FieldType::Boolean, None),
+        Some(ApiFieldType::SignedInteger(_)) => (FieldType::SignedInteger, None),
+        Some(ApiFieldType::UnsignedInteger(_)) => (FieldType::UnsignedInteger, None),
+        Some(ApiFieldType::Float(_)) => (FieldType::Float, None),
+        Some(ApiFieldType::Keyword(_)) => (FieldType::Keyword, None),
+        Some(ApiFieldType::Text(text)) => {
+            let analyzer = match TextAnalyzer::try_from(text.analyzer).map_err(|_| {
+                IndexError::InvalidDefinition("unknown Typed JSON text analyzer".into())
+            })? {
+                TextAnalyzer::UnicodeAlphanumericLowercase => {
+                    Analyzer::UnicodeAlphanumericLowercase
+                }
+            };
+            (FieldType::Text, Some(analyzer))
+        }
+        None => {
+            return Err(IndexError::InvalidDefinition(
+                "Typed JSON field type is required".into(),
+            ));
+        }
+    })
+}
+
+fn api_cardinality(value: i32) -> Result<Cardinality, IndexError> {
+    Ok(
+        match IndexFieldCardinality::try_from(value)
+            .map_err(|_| IndexError::InvalidDefinition("unknown field cardinality".into()))?
+        {
+            IndexFieldCardinality::Single => Cardinality::Single,
+            IndexFieldCardinality::Multi => Cardinality::Multi,
+        },
+    )
+}
+
+fn api_capabilities(values: &[i32]) -> Result<FieldCapabilities, IndexError> {
+    if values.is_empty() {
+        return Err(IndexError::InvalidDefinition(
+            "field capabilities are required".into(),
+        ));
+    }
+    let mut capabilities = FieldCapabilities::empty();
+    let mut seen = BTreeSet::new();
+    for encoded in values {
+        let capability = IndexFieldCapability::try_from(*encoded)
+            .map_err(|_| IndexError::InvalidDefinition("unknown field capability".into()))?;
+        if !seen.insert(*encoded) {
+            return Err(IndexError::InvalidDefinition(
+                "field capabilities must be unique".into(),
+            ));
+        }
+        capabilities = capabilities.union(match capability {
+            IndexFieldCapability::Exact => FieldCapabilities::EXACT,
+            IndexFieldCapability::Prefix => FieldCapabilities::PREFIX,
+            IndexFieldCapability::Range => FieldCapabilities::RANGE,
+            IndexFieldCapability::Order => FieldCapabilities::ORDER,
+            IndexFieldCapability::Facet => FieldCapabilities::FACET,
+            IndexFieldCapability::Aggregate => FieldCapabilities::AGGREGATE,
+            IndexFieldCapability::FullText => FieldCapabilities::FULL_TEXT,
+        });
+    }
+    Ok(capabilities)
+}
+
 fn full_text_schema(specification: &FullTextIndexSpec) -> Result<SchemaParts, IndexError> {
     let fields = text_fields(specification)?;
     Ok((
@@ -203,11 +277,12 @@ fn text_fields(specification: &FullTextIndexSpec) -> Result<Vec<FieldSchema>, In
                 ordinal,
                 &value.name,
                 &value.json_pointer,
-                ScalarDomain::STRING,
+                FieldType::Text,
                 Cardinality::Single,
                 true,
                 false,
-                FULL_TEXT_COMPONENTS,
+                FieldCapabilities::FULL_TEXT,
+                Some(Analyzer::UnicodeAlphanumericLowercase),
             )
         })
         .collect()
@@ -231,11 +306,12 @@ fn vector_field(
         ordinal,
         name,
         &specification.json_pointer,
-        ScalarDomain::NUMBER,
+        FieldType::Vector,
         Cardinality::Multi,
         false,
         false,
-        FieldComponents::VECTOR,
+        FieldCapabilities::empty(),
+        None,
     )
 }
 
@@ -309,33 +385,11 @@ fn effective_weight(value: f32) -> f64 {
 
 fn git_schema(repository_scope: &str) -> Result<SchemaParts, IndexError> {
     let definitions = [
+        ("repository_id", FieldCapabilities::EXACT),
+        ("commit_id", FieldCapabilities::EXACT),
         (
-            "repository_id",
-            ScalarDomain::STRING,
-            TERMS_COLUMN_AND_STORED,
-        ),
-        ("commit_id", ScalarDomain::STRING, TERMS_COLUMN_AND_STORED),
-        ("tree_path", ScalarDomain::STRING, TERMS_COLUMN_AND_STORED),
-        ("object_id", ScalarDomain::STRING, TERMS_COLUMN_AND_STORED),
-        (
-            "pack_path",
-            ScalarDomain::STRING,
-            FieldComponents::FAST_COLUMN.union(FieldComponents::STORED),
-        ),
-        (
-            "pack_version",
-            ScalarDomain::UNSIGNED,
-            FieldComponents::FAST_COLUMN.union(FieldComponents::STORED),
-        ),
-        (
-            "offset",
-            ScalarDomain::UNSIGNED,
-            FieldComponents::FAST_COLUMN.union(FieldComponents::STORED),
-        ),
-        (
-            "length",
-            ScalarDomain::UNSIGNED,
-            FieldComponents::FAST_COLUMN.union(FieldComponents::STORED),
+            "tree_path",
+            FieldCapabilities::EXACT.union(FieldCapabilities::PREFIX),
         ),
     ];
     let fields = fixed_fields("@git", &definitions)?;
@@ -351,45 +405,10 @@ fn git_schema(repository_scope: &str) -> Result<SchemaParts, IndexError> {
 
 fn tensor_schema(model_scope: &str) -> Result<SchemaParts, IndexError> {
     let definitions = [
-        ("model_id", ScalarDomain::STRING, TERMS_COLUMN_AND_STORED),
-        ("tensor_name", ScalarDomain::STRING, TERMS_COLUMN_AND_STORED),
-        (
-            "source_path",
-            ScalarDomain::STRING,
-            FieldComponents::FAST_COLUMN.union(FieldComponents::STORED),
-        ),
-        (
-            "source_version",
-            ScalarDomain::UNSIGNED,
-            FieldComponents::FAST_COLUMN.union(FieldComponents::STORED),
-        ),
-        (
-            "offset",
-            ScalarDomain::UNSIGNED,
-            FieldComponents::FAST_COLUMN.union(FieldComponents::STORED),
-        ),
-        (
-            "length",
-            ScalarDomain::UNSIGNED,
-            FieldComponents::FAST_COLUMN.union(FieldComponents::STORED),
-        ),
-        (
-            "dtype",
-            ScalarDomain::STRING,
-            FieldComponents::FAST_COLUMN.union(FieldComponents::STORED),
-        ),
+        ("model_id", FieldCapabilities::EXACT),
+        ("tensor_name", FieldCapabilities::EXACT),
     ];
-    let mut fields = fixed_fields("@tensor", &definitions)?;
-    fields.push(field(
-        fields.len(),
-        "shape",
-        "@tensor/shape",
-        ScalarDomain::UNSIGNED,
-        Cardinality::Multi,
-        false,
-        false,
-        FieldComponents::FAST_COLUMN.union(FieldComponents::STORED),
-    )?);
+    let fields = fixed_fields("@tensor", &definitions)?;
     Ok((
         IndexKind::Tensor,
         fields,
@@ -402,21 +421,22 @@ fn tensor_schema(model_scope: &str) -> Result<SchemaParts, IndexError> {
 
 fn fixed_fields(
     selector_prefix: &str,
-    definitions: &[(&str, ScalarDomain, FieldComponents)],
+    definitions: &[(&str, FieldCapabilities)],
 ) -> Result<Vec<FieldSchema>, IndexError> {
     definitions
         .iter()
         .enumerate()
-        .map(|(ordinal, (name, domain, components))| {
+        .map(|(ordinal, (name, capabilities))| {
             field(
                 ordinal,
                 name,
                 &format!("{selector_prefix}/{name}"),
-                *domain,
+                FieldType::Keyword,
                 Cardinality::Single,
                 false,
                 false,
-                *components,
+                *capabilities,
+                None,
             )
         })
         .collect()
@@ -427,23 +447,28 @@ fn field(
     ordinal: usize,
     name: &str,
     source_selector: &str,
-    domain: ScalarDomain,
+    field_type: FieldType,
     cardinality: Cardinality,
     allow_missing: bool,
     allow_null: bool,
-    components: FieldComponents,
+    capabilities: FieldCapabilities,
+    analyzer: Option<Analyzer>,
 ) -> Result<FieldSchema, IndexError> {
-    Ok(FieldSchema {
+    let mut value = FieldSchema {
         id: FieldId::new(u32::try_from(ordinal).map_err(|_| IndexError::OffsetOverflow)?),
         name: name.to_owned(),
         source_selector: source_selector.to_owned(),
-        domain,
+        field_type,
         cardinality,
         allow_missing,
         allow_null,
         collation: Collation::BinaryUtf8,
-        components,
-    })
+        capabilities,
+        analyzer,
+        components: FieldComponents::TERMS,
+    };
+    value.components = value.compiled_components()?;
+    Ok(value)
 }
 
 fn component_versions(fields: &[FieldSchema]) -> Vec<ComponentVersion> {
@@ -461,11 +486,11 @@ fn component_versions(fields: &[FieldSchema]) -> Vec<ComponentVersion> {
             kinds.insert(ComponentKind::TERM_DICTIONARY);
             kinds.insert(ComponentKind::POSTINGS);
         }
-        if field.components.contains(FieldComponents::FAST_COLUMN) {
-            kinds.insert(ComponentKind::FAST_COLUMN);
+        if field.components.contains(FieldComponents::POINTS) {
+            kinds.insert(ComponentKind::POINTS);
         }
-        if field.components.contains(FieldComponents::STORED) {
-            kinds.insert(ComponentKind::STORED_FIELDS);
+        if field.components.contains(FieldComponents::DOC_VALUES) {
+            kinds.insert(ComponentKind::DOC_VALUES);
         }
         if field.components.contains(FieldComponents::POSITIONS) {
             kinds.insert(ComponentKind::POSITIONS);
@@ -483,8 +508,6 @@ fn component_versions(fields: &[FieldSchema]) -> Vec<ComponentVersion> {
             component_kind,
             codec_version: if component_kind == ComponentKind::IDENTITY_TABLE {
                 IDENTITY_COMPONENT_CODEC_VERSION
-            } else if component_kind == ComponentKind::STORED_FIELDS {
-                STORED_FIELDS_COMPONENT_CODEC_VERSION
             } else {
                 COMPONENT_CODEC_VERSION
             },
@@ -498,8 +521,9 @@ mod tests {
 
     use anvil_api::v1::index_specification::Specification as Spec;
     use anvil_api::v1::{
-        FullTextField, GitSourceIndexSpec, IndexField, IndexOrder, MetadataFilterIndexSpec,
-        PathIndexSpec, TensorIndexSpec, TypedJsonIndexSpec, VectorIndexSpec,
+        FullTextField, GitSourceIndexSpec, IndexField, IndexOrder, KeywordIndexField,
+        MetadataFilterIndexSpec, PathIndexSpec, SignedIntegerIndexField, TensorIndexSpec,
+        TypedJsonIndexSpec, VectorIndexSpec,
     };
 
     use super::*;
@@ -545,12 +569,24 @@ mod tests {
                         IndexField {
                             name: "modified".into(),
                             json_pointer: "/modified".into(),
-                            multi_valued: false,
+                            cardinality: IndexFieldCardinality::Single as i32,
+                            capabilities: vec![
+                                IndexFieldCapability::Range as i32,
+                                IndexFieldCapability::Order as i32,
+                            ],
+                            field_type: Some(ApiFieldType::SignedInteger(
+                                SignedIntegerIndexField {},
+                            )),
                         },
                         IndexField {
                             name: "ecosystems".into(),
                             json_pointer: "/ecosystems".into(),
-                            multi_valued: true,
+                            cardinality: IndexFieldCardinality::Multi as i32,
+                            capabilities: vec![
+                                IndexFieldCapability::Exact as i32,
+                                IndexFieldCapability::Facet as i32,
+                            ],
+                            field_type: Some(ApiFieldType::Keyword(KeywordIndexField {})),
                         },
                     ],
                     physical_order: vec![IndexOrder {
@@ -626,8 +662,6 @@ mod tests {
                     version.codec_version
                         == if version.component_kind == ComponentKind::IDENTITY_TABLE {
                             IDENTITY_COMPONENT_CODEC_VERSION
-                        } else if version.component_kind == ComponentKind::STORED_FIELDS {
-                            STORED_FIELDS_COMPONENT_CODEC_VERSION
                         } else {
                             COMPONENT_CODEC_VERSION
                         }
@@ -672,7 +706,7 @@ mod tests {
         let Some(Spec::TypedJson(value)) = cardinality.specification.as_mut() else {
             unreachable!();
         };
-        value.fields[1].multi_valued = false;
+        value.fields[1].cardinality = IndexFieldCardinality::Single as i32;
         assert_ne!(
             schema.fingerprint().unwrap(),
             compile_schema("", None, &cardinality)
@@ -774,8 +808,8 @@ mod tests {
                 for (flag, required) in [
                     (FieldComponents::TERMS, ComponentKind::TERM_DICTIONARY),
                     (FieldComponents::TERMS, ComponentKind::POSTINGS),
-                    (FieldComponents::FAST_COLUMN, ComponentKind::FAST_COLUMN),
-                    (FieldComponents::STORED, ComponentKind::STORED_FIELDS),
+                    (FieldComponents::POINTS, ComponentKind::POINTS),
+                    (FieldComponents::DOC_VALUES, ComponentKind::DOC_VALUES),
                     (FieldComponents::POSITIONS, ComponentKind::POSITIONS),
                     (FieldComponents::NORMS, ComponentKind::NORMS),
                     (FieldComponents::VECTOR, ComponentKind::VECTORS),
@@ -789,197 +823,30 @@ mod tests {
     }
 
     #[test]
-    fn fixed_and_declared_field_catalogues_have_exact_v4_capabilities() {
-        let schemas = all_kinds()
+    fn typed_capabilities_compile_only_required_native_components() {
+        let (_, specification, _) = all_kinds()
             .into_iter()
-            .map(|(name, specification, _)| {
-                (name, compile_schema("", None, &specification).unwrap())
-            })
-            .collect::<BTreeMap<_, _>>();
-
-        assert_field(
-            &schemas["path"].fields[0],
-            0,
-            "path",
-            "@object/path",
-            ScalarDomain::STRING,
-            Cardinality::Single,
-            FieldComponents::TERMS,
-        );
-
-        let metadata = &schemas["metadata"].fields;
-        assert_field(
-            &metadata[0],
-            0,
-            "content_type",
-            "@head/content_type",
-            ScalarDomain::STRING.union(ScalarDomain::NULL),
-            Cardinality::Single,
-            TERMS_COLUMN_AND_STORED,
-        );
-        assert!(metadata[0].allow_null);
-        assert_field(
-            &metadata[1],
-            1,
-            "content_length",
-            "@head/content_length",
-            ScalarDomain::UNSIGNED,
-            Cardinality::Single,
-            TERMS_COLUMN_AND_STORED,
-        );
-
-        let typed = &schemas["typed"].fields;
-        assert_field(
-            &typed[0],
-            0,
-            "modified",
-            "/modified",
-            ScalarDomain::ALL_JSON,
-            Cardinality::Single,
-            TERMS_COLUMN_AND_STORED,
-        );
-        assert_field(
-            &typed[1],
-            1,
-            "ecosystems",
-            "/ecosystems",
-            ScalarDomain::ALL_JSON,
-            Cardinality::Multi,
-            TERMS_COLUMN_AND_STORED,
-        );
-        assert!(
-            typed
-                .iter()
-                .all(|field| field.allow_missing && field.allow_null)
-        );
-
-        assert_field(
-            &schemas["full-text"].fields[0],
-            0,
-            "body",
-            "/body",
-            ScalarDomain::STRING,
-            Cardinality::Single,
-            FULL_TEXT_COMPONENTS,
-        );
-        assert_field(
-            &schemas["vector"].fields[0],
-            0,
-            "vector",
-            "/embedding",
-            ScalarDomain::NUMBER,
-            Cardinality::Multi,
-            FieldComponents::VECTOR,
-        );
-
-        let hybrid = &schemas["hybrid"].fields;
-        assert_field(
-            &hybrid[0],
-            0,
-            "body",
-            "/body",
-            ScalarDomain::STRING,
-            Cardinality::Single,
-            FULL_TEXT_COMPONENTS,
-        );
-        assert_field(
-            &hybrid[1],
-            1,
-            "@vector",
-            "/embedding",
-            ScalarDomain::NUMBER,
-            Cardinality::Multi,
-            FieldComponents::VECTOR,
-        );
-
-        assert_fixed_names(
-            &schemas["git"].fields,
-            &[
-                "repository_id",
-                "commit_id",
-                "tree_path",
-                "object_id",
-                "pack_path",
-                "pack_version",
-                "offset",
-                "length",
-            ],
-        );
-        assert!(
-            schemas["git"].fields[..4]
-                .iter()
-                .all(|field| field.components.contains(FieldComponents::TERMS))
-        );
-        assert!(
-            schemas["git"].fields[4..]
-                .iter()
-                .all(|field| !field.components.contains(FieldComponents::TERMS))
-        );
-        assert_fixed_names(
-            &schemas["tensor"].fields,
-            &[
-                "model_id",
-                "tensor_name",
-                "source_path",
-                "source_version",
-                "offset",
-                "length",
-                "dtype",
-                "shape",
-            ],
-        );
-        assert_eq!(schemas["tensor"].fields[7].cardinality, Cardinality::Multi);
-        assert!(
-            schemas["tensor"].fields[..2]
-                .iter()
-                .all(|field| field.components.contains(FieldComponents::TERMS))
-        );
-        assert!(
-            schemas["tensor"].fields[2..]
-                .iter()
-                .all(|field| !field.components.contains(FieldComponents::TERMS))
-        );
-        for schema_name in ["git", "tensor"] {
-            assert!(
-                schemas[schema_name]
-                    .fields
-                    .iter()
-                    .all(|field| field.components.contains(FieldComponents::STORED)),
-                "{schema_name}"
-            );
-        }
-    }
-
-    fn assert_field(
-        field: &FieldSchema,
-        id: u32,
-        name: &str,
-        selector: &str,
-        domain: ScalarDomain,
-        cardinality: Cardinality,
-        components: FieldComponents,
-    ) {
-        assert_eq!(field.id, FieldId::new(id));
-        assert_eq!(field.name, name);
-        assert_eq!(field.source_selector, selector);
-        assert_eq!(field.domain, domain);
-        assert_eq!(field.cardinality, cardinality);
-        assert_eq!(field.collation, Collation::BinaryUtf8);
-        assert_eq!(field.components, components);
-    }
-
-    fn assert_fixed_names(fields: &[FieldSchema], names: &[&str]) {
+            .find(|(name, _, _)| *name == "typed")
+            .unwrap();
+        let schema = compile_schema("", None, &specification).unwrap();
+        let modified = &schema.fields[0];
+        assert_eq!(modified.field_type, FieldType::SignedInteger);
         assert_eq!(
-            fields
-                .iter()
-                .map(|field| field.name.as_str())
-                .collect::<Vec<_>>(),
-            names
+            modified.capabilities,
+            FieldCapabilities::RANGE.union(FieldCapabilities::ORDER)
         );
-        assert!(
-            fields
-                .iter()
-                .all(|field| !field.allow_missing && !field.allow_null)
+        assert!(modified.components.contains(FieldComponents::POINTS));
+        assert!(modified.components.contains(FieldComponents::DOC_VALUES));
+        assert!(!modified.components.contains(FieldComponents::TERMS));
+
+        let ecosystems = &schema.fields[1];
+        assert_eq!(ecosystems.field_type, FieldType::Keyword);
+        assert_eq!(
+            ecosystems.capabilities,
+            FieldCapabilities::EXACT.union(FieldCapabilities::FACET)
         );
+        assert!(ecosystems.components.contains(FieldComponents::TERMS));
+        assert!(ecosystems.components.contains(FieldComponents::DOC_VALUES));
+        assert!(!ecosystems.components.contains(FieldComponents::POINTS));
     }
 }

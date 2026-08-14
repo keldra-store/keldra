@@ -8,7 +8,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anvil_api::v1::{IndexDefinition, IndexFreshness, IndexQuery, IndexQueryHit};
+use anvil_api::v1::{
+    IndexAggregateResult, IndexDefinition, IndexFacetResult, IndexFreshness, IndexQuery,
+    IndexQueryHit,
+};
 use anvil_store::ObjectKey;
 use tonic::Status;
 use tonic::metadata::MetadataMap;
@@ -222,6 +225,8 @@ pub(crate) struct ExecuteIndexQuery {
 #[derive(Clone, Debug)]
 pub(crate) struct ExecutedIndexQuery {
     pub(crate) hits: Vec<IndexQueryHit>,
+    pub(crate) facet_results: Vec<IndexFacetResult>,
+    pub(crate) aggregate_results: Vec<IndexAggregateResult>,
     pub(crate) freshness: IndexFreshness,
     /// Engine-specific stable position following a returned, authorized and
     /// exact-current hit. Candidate-private positions never cross this boundary.

@@ -113,6 +113,8 @@ pub(super) async fn run(state_path: &Path) -> Result<()> {
                         values_json: vec![VALUE_JSON.to_vec()],
                     }],
                     order: Vec::new(),
+                    facets: Vec::new(),
+                    aggregates: Vec::new(),
                 })),
             }),
             // Two makes an accidental non-singleton result observable without

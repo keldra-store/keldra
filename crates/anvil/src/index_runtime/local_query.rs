@@ -4,15 +4,19 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use anvil_api::v1::{IndexFreshness, IndexQueryHit, IndexSourceFreshness, ObjectAddress};
+use anvil_api::v1::{
+    IndexAggregateOperation, IndexAggregateResult, IndexFacetBucket, IndexFacetResult,
+    IndexFreshness, IndexQueryHit, IndexSourceFreshness, ObjectAddress,
+};
 use anvil_atomic_program::{
     MAX_OBJECT_BUCKET_BYTES, MAX_OBJECT_PATH_BYTES, MAX_OBJECT_TENANT_BYTES,
 };
 use anvil_index::IndexError;
 use anvil_index::v4::{
-    ArtifactDescriptor, ArtifactDirectoryRead, CandidateGate, CandidateGateEvidence,
-    CandidateReference, IndexKind, NativeQueryCursor, NativeQueryExecutionError,
-    NativeQueryExecutor, NativeQueryLimits, NativeQueryRequest, NativeQueryStatisticsRecorder,
+    AggregateOperation, ArtifactDescriptor, ArtifactDirectoryRead, CandidateGate,
+    CandidateGateEvidence, CandidateReference, FieldId, IndexKind, NativeQueryCursor,
+    NativeQueryExecutionError, NativeQueryExecutor, NativeQueryLimits, NativeQueryRequest,
+    NativeQueryStatisticsRecorder, ScalarValue,
 };
 use anvil_store::{BlobRef, CurrentObjectSnapshot, MAX_CONTENT_TYPE_BYTES, ObjectKey};
 use tonic::Status;
@@ -442,13 +446,11 @@ impl QueryActiveGuard {
         );
         self.span
             .record("query.live_mask_rejects", execution.live_mask_rejects);
+        self.span
+            .record("query.point_blocks_decoded", execution.point_blocks_decoded);
         self.span.record(
-            "query.fast_column_blocks_decoded",
-            execution.fast_column_blocks_decoded,
-        );
-        self.span.record(
-            "query.stored_field_blocks_decoded",
-            execution.stored_field_blocks_decoded,
+            "query.doc_value_blocks_decoded",
+            execution.doc_value_blocks_decoded,
         );
         self.span
             .record("query.cursor_seeks", execution.cursor_seeks);
@@ -535,10 +537,10 @@ impl QueryActiveGuard {
                     execution.live_mask_blocks_decoded,
                 monotonic_counter.anvil_index_query_live_mask_rejects_total =
                     execution.live_mask_rejects,
-                monotonic_counter.anvil_index_query_fast_column_blocks_decoded_total =
-                    execution.fast_column_blocks_decoded,
-                monotonic_counter.anvil_index_query_stored_field_blocks_decoded_total =
-                    execution.stored_field_blocks_decoded,
+                monotonic_counter.anvil_index_query_point_blocks_decoded_total =
+                    execution.point_blocks_decoded,
+                monotonic_counter.anvil_index_query_doc_value_blocks_decoded_total =
+                    execution.doc_value_blocks_decoded,
                 monotonic_counter.anvil_index_query_cursor_seeks_total = execution.cursor_seeks,
                 monotonic_counter.anvil_index_query_cursor_skipped_doc_ids_total =
                     execution.cursor_skipped_doc_ids,
@@ -672,8 +674,8 @@ impl LocalGenerationQueryExecutor {
             query.candidate_doc_ids = tracing::field::Empty,
             query.live_mask_blocks_decoded = tracing::field::Empty,
             query.live_mask_rejects = tracing::field::Empty,
-            query.fast_column_blocks_decoded = tracing::field::Empty,
-            query.stored_field_blocks_decoded = tracing::field::Empty,
+            query.point_blocks_decoded = tracing::field::Empty,
+            query.doc_value_blocks_decoded = tracing::field::Empty,
             query.cursor_seeks = tracing::field::Empty,
             query.cursor_skipped_doc_ids = tracing::field::Empty,
             query.physical_early_terminations = tracing::field::Empty,
@@ -751,6 +753,8 @@ impl LocalGenerationQueryExecutor {
         let Some(selected) = selected else {
             return Ok(ExecutedIndexQuery {
                 hits: Vec::new(),
+                facet_results: Vec::new(),
+                aggregate_results: Vec::new(),
                 freshness: empty_freshness(
                     request.definition.index_id,
                     request.definition.version,
@@ -770,6 +774,8 @@ impl LocalGenerationQueryExecutor {
             }
             return Ok(ExecutedIndexQuery {
                 hits: Vec::new(),
+                facet_results: Vec::new(),
+                aggregate_results: Vec::new(),
                 freshness: query_freshness(
                     &loaded,
                     observed.as_ref(),
@@ -792,24 +798,18 @@ impl LocalGenerationQueryExecutor {
         )
         .map_err(index_status)?;
         require_manifest_schema(&loaded.manifest, &schema)?;
-        let query = compile_query(&schema, specification, &request.query).map_err(index_status)?;
+        let compiled =
+            compile_query(&schema, specification, &request.query).map_err(index_status)?;
         let after = request
             .resume
             .as_ref()
             .map(|resume| NativeQueryCursor::decode(&resume.last_position).map_err(index_status))
             .transpose()?;
-        if loaded.manifest.segments.is_empty() {
-            return Ok(ExecutedIndexQuery {
-                hits: Vec::new(),
-                freshness: query_freshness(
-                    &loaded,
-                    observed.as_ref(),
-                    true,
-                    request.authorization_revision,
-                )?,
-                next_position: None,
-            });
-        }
+        let field_names = schema
+            .fields
+            .iter()
+            .map(|field| field.name.clone())
+            .collect::<Vec<_>>();
         let directory = QueryObservedDirectory::new(
             ManifestArtifactDirectory::new(
                 self.cache.clone(),
@@ -828,11 +828,13 @@ impl LocalGenerationQueryExecutor {
         let native = NativeQueryRequest {
             schema,
             segments: loaded.manifest.segments.clone(),
-            query,
+            query: compiled.query,
             after,
             limit: u32::try_from(request.limit)
                 .map_err(|_| Status::invalid_argument("index query limit does not fit u32"))?,
             authorization_revision: request.authorization_revision,
+            facets: compiled.facets,
+            aggregates: compiled.aggregates,
         };
         native.validate().map_err(index_status)?;
         let gate = RuntimeCandidateGate {
@@ -872,12 +874,24 @@ impl LocalGenerationQueryExecutor {
                 score: hit.score,
             })
             .collect();
+        let facet_results = page
+            .facet_results
+            .into_iter()
+            .map(|result| facet_result_to_api(&field_names, result))
+            .collect::<Result<Vec<_>, _>>()?;
+        let aggregate_results = page
+            .aggregate_results
+            .into_iter()
+            .map(|result| aggregate_result_to_api(&field_names, result))
+            .collect::<Result<Vec<_>, _>>()?;
         let next_position = page
             .next
             .map(|position| position.encode().map_err(index_status))
             .transpose()?;
         Ok(ExecutedIndexQuery {
             hits,
+            facet_results,
+            aggregate_results,
             freshness: query_freshness(
                 &loaded,
                 observed.as_ref(),
@@ -897,6 +911,66 @@ impl LocalIndexQueryExecutor for LocalGenerationQueryExecutor {
     ) -> Result<ExecutedIndexQuery, Status> {
         self.execute(request).await
     }
+}
+
+fn facet_result_to_api(
+    field_names: &[String],
+    result: anvil_index::v4::FacetResult,
+) -> Result<IndexFacetResult, Status> {
+    Ok(IndexFacetResult {
+        field: field_name(field_names, result.field_id)?.to_owned(),
+        buckets: result
+            .buckets
+            .into_iter()
+            .map(|bucket| {
+                Ok(IndexFacetBucket {
+                    value_json: scalar_json(&bucket.value)?,
+                    count: bucket.count,
+                })
+            })
+            .collect::<Result<Vec<_>, Status>>()?,
+    })
+}
+
+fn aggregate_result_to_api(
+    field_names: &[String],
+    result: anvil_index::v4::AggregateResult,
+) -> Result<IndexAggregateResult, Status> {
+    let operation = match result.operation {
+        AggregateOperation::Count => IndexAggregateOperation::Count,
+        AggregateOperation::Minimum => IndexAggregateOperation::Minimum,
+        AggregateOperation::Maximum => IndexAggregateOperation::Maximum,
+        AggregateOperation::Sum => IndexAggregateOperation::Sum,
+        AggregateOperation::Average => IndexAggregateOperation::Average,
+    };
+    Ok(IndexAggregateResult {
+        field: field_name(field_names, result.field_id)?.to_owned(),
+        operation: operation as i32,
+        value_json: result.value.as_ref().map(scalar_json).transpose()?,
+        contributing_count: result.contributing_count,
+    })
+}
+
+fn field_name(field_names: &[String], field_id: FieldId) -> Result<&str, Status> {
+    field_names
+        .get(field_id.get() as usize)
+        .map(String::as_str)
+        .ok_or_else(|| Status::data_loss("native query result names an unknown field"))
+}
+
+fn scalar_json(value: &ScalarValue) -> Result<Vec<u8>, Status> {
+    let value = match value {
+        ScalarValue::Null => serde_json::Value::Null,
+        ScalarValue::Boolean(value) => serde_json::Value::Bool(*value),
+        ScalarValue::Signed(value) => serde_json::Value::Number((*value).into()),
+        ScalarValue::Unsigned(value) => serde_json::Value::Number((*value).into()),
+        ScalarValue::Number(bits) => serde_json::Number::from_f64(f64::from_bits(*bits))
+            .map(serde_json::Value::Number)
+            .ok_or_else(|| Status::data_loss("native query returned a non-finite number"))?,
+        ScalarValue::String(value) => serde_json::Value::String(value.clone()),
+    };
+    serde_json::to_vec(&value)
+        .map_err(|error| Status::internal(format!("encode index computation result: {error}")))
 }
 
 async fn execute_native_query<D, G>(

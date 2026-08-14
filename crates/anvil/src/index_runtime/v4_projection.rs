@@ -9,14 +9,14 @@ use std::io::Read;
 
 use anvil_index::IndexError;
 use anvil_index::v4::build::{
-    MergeMutation, ProjectedColumn, ProjectedRecord, ProjectedSource, ProjectedTerm,
-    ProjectedVector,
+    MergeMutation, ProjectedDocValue, ProjectedPoint, ProjectedRecord, ProjectedSource,
+    ProjectedTerm, ProjectedVector,
 };
 use anvil_index::v4::{
-    Cardinality, FIELD_PRESENCE_TERM, FastColumnCell, FieldComponents, FieldId, IndexKind,
-    IndexSemantics, MAX_ANALYZED_TOKEN_CHARS, ObjectIdentity, ScalarValue, Schema, SortValue,
-    TERM_TYPE_FIELD_PRESENCE, analyze_unicode_alphanumeric_lowercase, encode_physical_order_key,
-    scalar_term, text_term,
+    Cardinality, DocValueCell, FIELD_PRESENCE_TERM, FieldCapabilities, FieldComponents, FieldId,
+    FieldType, INDEX_TERM_BYTES, IndexKind, IndexSemantics, ObjectIdentity, ScalarValue, Schema,
+    SortValue, TERM_TYPE_FIELD_PRESENCE, analyze_unicode_alphanumeric_lowercase,
+    encode_physical_order_key, scalar_term, text_term,
 };
 use serde::{Deserialize, Serialize};
 
@@ -30,6 +30,7 @@ use super::source::{IndexBuildDiagnostics, IndexBuildObject, IndexSourceMutation
 
 const PROJECTION_FIXED_BYTES: usize = 256;
 const RECORD_PROJECTION_EXPANSION: u64 = 16;
+const TEXT_VALUE_POSITION_GAP: u32 = 1;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct GitSourceRecord {
@@ -191,7 +192,7 @@ fn project_path(schema: &Schema, object: &IndexBuildObject) -> Result<ProjectedS
             Vec::new(),
             scalar_terms(field.id, &[value])?,
             Vec::new(),
-            None,
+            Vec::new(),
             Vec::new(),
             Vec::new(),
         )],
@@ -230,7 +231,7 @@ fn project_typed_json(
     else {
         return Ok(None);
     };
-    let selected = enforce_scalar_cardinality(schema, selected)?;
+    let selected = normalize_scalar_fields(schema, enforce_scalar_cardinality(schema, selected)?)?;
     require_projection_capacity(scalar_projection_bytes(schema, &selected)?, selected_limit)?;
     Ok(Some(source_with_records(
         object,
@@ -289,7 +290,7 @@ fn project_vector(
             Vec::new(),
             Vec::new(),
             Vec::new(),
-            None,
+            Vec::new(),
             vec![ProjectedVector { field_id, values }],
             Vec::new(),
         )],
@@ -407,7 +408,7 @@ fn require_projection_capacity(needed: usize, limit: usize) -> Result<(), IndexE
 }
 
 /// Conservatively account for the selected scalar tree, the final projected
-/// record, and the temporary term/stored-value representations before any of
+/// record, and temporary term/value representations before any of
 /// those derived representations are allocated.
 fn scalar_projection_bytes(
     schema: &Schema,
@@ -418,7 +419,6 @@ fn scalar_projection_bytes(
         .checked_add(std::mem::size_of::<ProjectedRecord>())
         .ok_or(IndexError::OffsetOverflow)?;
     let mut temporary_bytes = 0usize;
-    let mut stored_bytes = 2usize;
     for field in &schema.fields {
         let Some((selected_name, values)) = selected.get_key_value(&field.name) else {
             continue;
@@ -438,20 +438,16 @@ fn scalar_projection_bytes(
                 })
                 .ok_or(IndexError::OffsetOverflow)?,
         )?;
-        output_bytes = checked_add(output_bytes, std::mem::size_of::<ProjectedColumn>())?;
+        output_bytes = checked_add(
+            output_bytes,
+            std::mem::size_of::<ProjectedPoint>()
+                .checked_add(std::mem::size_of::<ProjectedDocValue>())
+                .ok_or(IndexError::OffsetOverflow)?,
+        )?;
         output_bytes = checked_add(
             output_bytes,
             std::mem::size_of::<ProjectedTerm>()
                 .checked_add(FIELD_PRESENCE_TERM.len())
-                .ok_or(IndexError::OffsetOverflow)?,
-        )?;
-        stored_bytes = checked_add(
-            stored_bytes,
-            field
-                .name
-                .len()
-                .checked_mul(6)
-                .and_then(|bytes| bytes.checked_add(32))
                 .ok_or(IndexError::OffsetOverflow)?,
         )?;
         for value in &values.values {
@@ -479,17 +475,6 @@ fn scalar_projection_bytes(
                     .and_then(|bytes| bytes.checked_add(string_bytes))
                     .ok_or(IndexError::OffsetOverflow)?,
             )?;
-            stored_bytes = checked_add(
-                stored_bytes,
-                match value {
-                    ScalarValue::String(value) => value
-                        .len()
-                        .checked_mul(6)
-                        .and_then(|bytes| bytes.checked_add(32))
-                        .ok_or(IndexError::OffsetOverflow)?,
-                    _ => 48,
-                },
-            )?;
         }
     }
     for order in &schema.physical_order {
@@ -510,17 +495,13 @@ fn scalar_projection_bytes(
         };
         output_bytes = checked_add(output_bytes, maximum)?;
     }
-    // The stored JSON encoder owns its output while the temporary serde value
-    // tree still contains cloned selected strings.
-    output_bytes = checked_add(output_bytes, stored_bytes)?;
-    temporary_bytes = checked_add(temporary_bytes, stored_bytes)?;
     checked_add(selected_bytes, checked_add(output_bytes, temporary_bytes)?)
 }
 
 fn scalar_term_bytes(value: &ScalarValue) -> Result<usize, IndexError> {
     Ok(match value {
         ScalarValue::Null | ScalarValue::Boolean(_) => 1,
-        ScalarValue::Number(_) | ScalarValue::Unsigned(_) => 8,
+        ScalarValue::Signed(_) | ScalarValue::Number(_) | ScalarValue::Unsigned(_) => 8,
         ScalarValue::String(value) => value
             .len()
             .checked_add(1)
@@ -529,7 +510,7 @@ fn scalar_term_bytes(value: &ScalarValue) -> Result<usize, IndexError> {
 }
 
 /// Account for selected strings plus the analyzer's finite token vector,
-/// ordered term aggregation, positions, stored JSON, and optional vector.
+/// ordered term aggregation, positions, and optional vector.
 fn text_projection_bytes(
     selected: &BTreeMap<String, String>,
     vector_dimensions: usize,
@@ -537,7 +518,6 @@ fn text_projection_bytes(
     let mut selected_bytes = std::mem::size_of::<BTreeMap<String, String>>();
     let mut token_count = 0usize;
     let mut normalized_bytes = 0usize;
-    let mut stored_bytes = 2usize;
     for (name, text) in selected {
         selected_bytes = checked_add(
             selected_bytes,
@@ -550,14 +530,6 @@ fn text_projection_bytes(
         let (tokens, bytes) = analyzed_token_measure(text)?;
         token_count = checked_add(token_count, tokens)?;
         normalized_bytes = checked_add(normalized_bytes, bytes)?;
-        stored_bytes = checked_add(
-            stored_bytes,
-            name.len()
-                .checked_add(text.len())
-                .and_then(|bytes| bytes.checked_mul(6))
-                .and_then(|bytes| bytes.checked_add(8))
-                .ok_or(IndexError::OffsetOverflow)?,
-        )?;
     }
     let positions_bytes = token_count
         .checked_mul(std::mem::size_of::<u32>())
@@ -584,7 +556,6 @@ fn text_projection_bytes(
         analyzer_structures,
         normalized_bytes,
         positions_bytes,
-        stored_bytes,
         vector_bytes,
     ]
     .into_iter()
@@ -592,31 +563,11 @@ fn text_projection_bytes(
 }
 
 fn analyzed_token_measure(text: &str) -> Result<(usize, usize), IndexError> {
-    let mut tokens = 0usize;
-    let mut bytes = 0usize;
-    let mut token_chars = 0usize;
-    for character in text.chars() {
-        if !character.is_alphanumeric() {
-            if token_chars != 0 {
-                tokens = checked_add(tokens, 1)?;
-                token_chars = 0;
-            }
-            continue;
-        }
-        for lower in character.to_lowercase() {
-            if token_chars == MAX_ANALYZED_TOKEN_CHARS {
-                tokens = checked_add(tokens, 1)?;
-                token_chars = 0;
-            }
-            bytes = checked_add(bytes, lower.len_utf8())?;
-            token_chars = checked_add(token_chars, 1)?;
-        }
-    }
-    if token_chars != 0 {
-        tokens = checked_add(tokens, 1)?;
-    }
-    u32::try_from(tokens).map_err(|_| IndexError::OffsetOverflow)?;
-    Ok((tokens, bytes))
+    let tokens = analyze_unicode_alphanumeric_lowercase(text, usize::MAX)?;
+    let bytes = tokens
+        .iter()
+        .try_fold(0usize, |total, (token, _)| checked_add(total, token.len()))?;
+    Ok((tokens.len(), bytes))
 }
 
 fn vector_projection_bytes(dimensions: usize) -> Result<usize, IndexError> {
@@ -633,20 +584,28 @@ fn scalar_record(
     selected: &SelectedScalarFields,
 ) -> Result<ProjectedRecord, IndexError> {
     let mut terms = Vec::new();
-    let mut columns = Vec::new();
+    let mut points = Vec::new();
+    let mut doc_values = Vec::new();
+    let mut field_lengths = Vec::new();
     for field in &schema.fields {
         let Some(values) = selected.get(&field.name) else {
             continue;
         };
         let values = values.values.clone();
-        terms.push(ProjectedTerm {
-            field_id: field.id,
-            term_type: TERM_TYPE_FIELD_PRESENCE,
-            term: FIELD_PRESENCE_TERM.to_vec(),
-            frequency: 1,
-            positions: Vec::new(),
-        });
-        terms.extend(scalar_terms(field.id, &values)?);
+        if field.components.contains(FieldComponents::TERMS) {
+            terms.push(ProjectedTerm {
+                field_id: field.id,
+                term_type: TERM_TYPE_FIELD_PRESENCE,
+                term: FIELD_PRESENCE_TERM.to_vec(),
+                frequency: 1,
+                positions: Vec::new(),
+            });
+            if field.field_type == FieldType::Text {
+                project_analyzed_values(field, &values, &mut terms, &mut field_lengths)?;
+            } else {
+                terms.extend(scalar_terms(field.id, &values)?);
+            }
+        }
         let null = values
             .iter()
             .any(|value| matches!(value, ScalarValue::Null));
@@ -654,16 +613,25 @@ fn scalar_record(
             .iter()
             .filter(|value| !matches!(value, ScalarValue::Null))
             .cloned()
-            .collect();
-        columns.push(ProjectedColumn {
-            field_id: field.id,
-            multi_valued: field.cardinality == Cardinality::Multi,
-            cell: FastColumnCell {
+            .collect::<Vec<_>>();
+        if field.components.contains(FieldComponents::POINTS) {
+            points.push(ProjectedPoint {
+                field_id: field.id,
                 present: true,
-                null,
-                values: non_null,
-            },
-        });
+                values: non_null.clone(),
+            });
+        }
+        if field.components.contains(FieldComponents::DOC_VALUES) {
+            doc_values.push(ProjectedDocValue {
+                field_id: field.id,
+                multi_valued: field.cardinality == Cardinality::Multi,
+                cell: DocValueCell {
+                    present: true,
+                    null,
+                    values: non_null,
+                },
+            });
+        }
     }
     terms.sort_by(projected_term_order);
     let order = schema
@@ -686,10 +654,10 @@ fn scalar_record(
         None,
         order_key,
         terms,
-        columns,
-        Some(encode_scalar_fields(selected)?),
+        points,
+        doc_values,
         Vec::new(),
-        Vec::new(),
+        field_lengths,
     ))
 }
 
@@ -708,26 +676,7 @@ fn text_record(
         let Some(text) = selected.get(&field.name) else {
             continue;
         };
-        let mut by_term = BTreeMap::<String, Vec<u32>>::new();
-        let mut field_length = 0u32;
-        for (token, position) in analyze_unicode_alphanumeric_lowercase(text, usize::MAX)? {
-            by_term.entry(token).or_default().push(position);
-            field_length = field_length
-                .checked_add(1)
-                .ok_or(IndexError::OffsetOverflow)?;
-        }
-        lengths.push((field.id, field_length));
-        for (token, positions) in by_term {
-            let (term_type, term) = text_term(&token)?;
-            terms.push(ProjectedTerm {
-                field_id: field.id,
-                term_type,
-                term,
-                frequency: u32::try_from(positions.len())
-                    .map_err(|_| IndexError::OffsetOverflow)?,
-                positions,
-            });
-        }
+        project_analyzed_text(field.id, text, &mut terms, &mut lengths)?;
     }
     terms.sort_by(projected_term_order);
     Ok(record(
@@ -735,10 +684,79 @@ fn text_record(
         Vec::new(),
         terms,
         Vec::new(),
-        Some(encode_json(selected)?),
+        Vec::new(),
         vectors,
         lengths,
     ))
+}
+
+fn project_analyzed_text(
+    field_id: FieldId,
+    text: &str,
+    terms: &mut Vec<ProjectedTerm>,
+    lengths: &mut Vec<(FieldId, u32)>,
+) -> Result<(), IndexError> {
+    project_analyzed_strings(field_id, std::iter::once(text), terms, lengths)
+}
+
+fn project_analyzed_values(
+    field: &anvil_index::v4::FieldSchema,
+    values: &[ScalarValue],
+    terms: &mut Vec<ProjectedTerm>,
+    lengths: &mut Vec<(FieldId, u32)>,
+) -> Result<(), IndexError> {
+    let strings = values
+        .iter()
+        .filter(|value| !matches!(value, ScalarValue::Null))
+        .map(|value| match value {
+            ScalarValue::String(value) => Ok(value.as_str()),
+            _ => Err(IndexError::Decode(format!(
+                "text field `{}` contains a non-string value",
+                field.name
+            ))),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    project_analyzed_strings(field.id, strings, terms, lengths)
+}
+
+fn project_analyzed_strings<'a>(
+    field_id: FieldId,
+    strings: impl IntoIterator<Item = &'a str>,
+    terms: &mut Vec<ProjectedTerm>,
+    lengths: &mut Vec<(FieldId, u32)>,
+) -> Result<(), IndexError> {
+    let mut by_term = BTreeMap::<String, Vec<u32>>::new();
+    let mut next_position = 0_u32;
+    let mut field_length = 0_u32;
+    for text in strings {
+        let analyzed = analyze_unicode_alphanumeric_lowercase(text, usize::MAX)?;
+        let value_length = u32::try_from(analyzed.len()).map_err(|_| IndexError::OffsetOverflow)?;
+        for (token, position) in analyzed {
+            let position = next_position
+                .checked_add(position)
+                .ok_or(IndexError::OffsetOverflow)?;
+            by_term.entry(token).or_default().push(position);
+        }
+        field_length = field_length
+            .checked_add(value_length)
+            .ok_or(IndexError::OffsetOverflow)?;
+        next_position = next_position
+            .checked_add(value_length)
+            .and_then(|position| position.checked_add(TEXT_VALUE_POSITION_GAP))
+            .ok_or(IndexError::OffsetOverflow)?;
+    }
+    lengths.push((field_id, field_length));
+    for (token, positions) in by_term {
+        let (term_type, term) = text_term(&token)?;
+        terms.push(ProjectedTerm {
+            field_id,
+            term_type,
+            term,
+            frequency: u32::try_from(positions.len()).map_err(|_| IndexError::OffsetOverflow)?,
+            positions,
+        });
+    }
+    Ok(())
 }
 
 fn git_record(schema: &Schema, value: GitSourceRecord) -> Result<ProjectedRecord, IndexError> {
@@ -746,11 +764,6 @@ fn git_record(schema: &Schema, value: GitSourceRecord) -> Result<ProjectedRecord
         ScalarValue::String(value.repository_id.clone()),
         ScalarValue::String(value.commit_id.clone()),
         ScalarValue::String(value.tree_path.clone()),
-        ScalarValue::String(value.object_id.clone()),
-        ScalarValue::String(value.pack_path.clone()),
-        ScalarValue::Unsigned(value.pack_version),
-        ScalarValue::Unsigned(value.offset),
-        ScalarValue::Unsigned(value.length),
     ];
     fixed_record(
         schema,
@@ -759,28 +772,14 @@ fn git_record(schema: &Schema, value: GitSourceRecord) -> Result<ProjectedRecord
             path: value.pack_path.clone(),
             version: value.pack_version,
         },
-        encode_json(&value)?,
     )
 }
 
 fn tensor_record(schema: &Schema, value: TensorRecord) -> Result<ProjectedRecord, IndexError> {
-    let mut scalar = vec![
+    let scalar = vec![
         vec![ScalarValue::String(value.model_id.clone())],
         vec![ScalarValue::String(value.tensor_name.clone())],
-        vec![ScalarValue::String(value.source_path.clone())],
-        vec![ScalarValue::Unsigned(value.source_version)],
-        vec![ScalarValue::Unsigned(value.offset)],
-        vec![ScalarValue::Unsigned(value.length)],
-        vec![ScalarValue::String(value.dtype.clone())],
     ];
-    scalar.push(
-        value
-            .shape
-            .iter()
-            .copied()
-            .map(ScalarValue::Unsigned)
-            .collect(),
-    );
     fixed_multi_record(
         schema,
         scalar,
@@ -788,7 +787,6 @@ fn tensor_record(schema: &Schema, value: TensorRecord) -> Result<ProjectedRecord
             path: value.source_path.clone(),
             version: value.source_version,
         },
-        encode_json(&value)?,
     )
 }
 
@@ -796,13 +794,11 @@ fn fixed_record(
     schema: &Schema,
     values: Vec<ScalarValue>,
     result_identity: ObjectIdentity,
-    stored_fields: Vec<u8>,
 ) -> Result<ProjectedRecord, IndexError> {
     fixed_multi_record(
         schema,
         values.into_iter().map(|value| vec![value]).collect(),
         result_identity,
-        stored_fields,
     )
 }
 
@@ -810,7 +806,6 @@ fn fixed_multi_record(
     schema: &Schema,
     values: Vec<Vec<ScalarValue>>,
     result_identity: ObjectIdentity,
-    stored_fields: Vec<u8>,
 ) -> Result<ProjectedRecord, IndexError> {
     if values.len() != schema.fields.len() {
         return Err(IndexError::InvalidDefinition(
@@ -818,21 +813,14 @@ fn fixed_multi_record(
         ));
     }
     let mut terms = Vec::new();
-    let mut columns = Vec::with_capacity(values.len());
     for (field, values) in schema.fields.iter().zip(values) {
         if field.components.contains(FieldComponents::TERMS) {
             terms.extend(scalar_terms(field.id, &values)?);
         }
-        if field.components.contains(FieldComponents::FAST_COLUMN) {
-            columns.push(ProjectedColumn {
-                field_id: field.id,
-                multi_valued: field.cardinality == Cardinality::Multi,
-                cell: FastColumnCell {
-                    present: true,
-                    null: false,
-                    values,
-                },
-            });
+        if field.components.contains(FieldComponents::DOC_VALUES) {
+            return Err(IndexError::InvalidDefinition(
+                "fixed projection unexpectedly requires doc values".into(),
+            ));
         }
     }
     terms.sort_by(projected_term_order);
@@ -840,8 +828,8 @@ fn fixed_multi_record(
         Some(result_identity),
         Vec::new(),
         terms,
-        columns,
-        Some(stored_fields),
+        Vec::new(),
+        Vec::new(),
         Vec::new(),
         Vec::new(),
     ))
@@ -881,8 +869,8 @@ fn record(
     result_identity: Option<ObjectIdentity>,
     order_key: Vec<u8>,
     terms: Vec<ProjectedTerm>,
-    columns: Vec<ProjectedColumn>,
-    stored_fields: Option<Vec<u8>>,
+    points: Vec<ProjectedPoint>,
+    doc_values: Vec<ProjectedDocValue>,
     vectors: Vec<ProjectedVector>,
     field_lengths: Vec<(FieldId, u32)>,
 ) -> ProjectedRecord {
@@ -890,8 +878,8 @@ fn record(
         result_identity,
         order_key,
         terms,
-        columns,
-        stored_fields,
+        points,
+        doc_values,
         vectors,
         field_lengths,
     }
@@ -1006,6 +994,61 @@ fn enforce_scalar_cardinality(
     Ok(selected)
 }
 
+fn normalize_scalar_fields(
+    schema: &Schema,
+    mut selected: SelectedScalarFields,
+) -> Result<SelectedScalarFields, IndexError> {
+    for field in &schema.fields {
+        let Some(selected_field) = selected.get_mut(&field.name) else {
+            continue;
+        };
+        for value in &mut selected_field.values {
+            if matches!(value, ScalarValue::Null) && field.allow_null {
+                continue;
+            }
+            *value = normalize_scalar(field, std::mem::replace(value, ScalarValue::Null))?;
+        }
+    }
+    Ok(selected)
+}
+
+fn normalize_scalar(
+    field: &anvil_index::v4::FieldSchema,
+    value: ScalarValue,
+) -> Result<ScalarValue, IndexError> {
+    let invalid = || {
+        IndexError::Decode(format!(
+            "Typed JSON field `{}` contains a value outside its declared type",
+            field.name
+        ))
+    };
+    Ok(match (field.field_type, value) {
+        (FieldType::Boolean, ScalarValue::Boolean(value)) => ScalarValue::Boolean(value),
+        (FieldType::SignedInteger, ScalarValue::Signed(value)) => ScalarValue::Signed(value),
+        (FieldType::SignedInteger, ScalarValue::Unsigned(value)) => {
+            ScalarValue::Signed(i64::try_from(value).map_err(|_| invalid())?)
+        }
+        (FieldType::UnsignedInteger, ScalarValue::Unsigned(value)) => ScalarValue::Unsigned(value),
+        (FieldType::UnsignedInteger, ScalarValue::Signed(0)) => ScalarValue::Unsigned(0),
+        (FieldType::Float, ScalarValue::Number(bits)) => ScalarValue::Number(bits),
+        (FieldType::Float, ScalarValue::Signed(value)) => ScalarValue::number(value as f64)?,
+        (FieldType::Float, ScalarValue::Unsigned(value)) => ScalarValue::number(value as f64)?,
+        (FieldType::Keyword | FieldType::Text, ScalarValue::String(value)) => {
+            if field.field_type == FieldType::Keyword
+                && value.len() > INDEX_TERM_BYTES
+                && field.capabilities != FieldCapabilities::EXACT
+            {
+                return Err(IndexError::ResourceLimit {
+                    needed: value.len(),
+                    limit: INDEX_TERM_BYTES,
+                });
+            }
+            ScalarValue::String(value)
+        }
+        _ => return Err(invalid()),
+    })
+}
+
 fn metadata_value(object: &IndexBuildObject, name: &str) -> Result<ScalarValue, IndexError> {
     Ok(match name {
         "path" => ScalarValue::String(object.path.clone()),
@@ -1076,42 +1119,6 @@ fn parse_records<T: serde::de::DeserializeOwned>(
         Err(error) if error.is_syntax() || error.is_data() || error.is_eof() => Ok(None),
         Err(error) => Err(IndexError::Io(error.to_string())),
     }
-}
-
-fn encode_scalar_fields(fields: &SelectedScalarFields) -> Result<Vec<u8>, IndexError> {
-    let mut output = serde_json::Map::new();
-    for (name, field) in fields {
-        output.insert(
-            name.clone(),
-            serde_json::Value::Array(field.values.iter().map(stored_scalar).collect()),
-        );
-    }
-    encode_json(&serde_json::Value::Object(output))
-}
-
-fn stored_scalar(value: &ScalarValue) -> serde_json::Value {
-    let mut output = serde_json::Map::new();
-    let (kind, value) = match value {
-        ScalarValue::Null => ("null", None),
-        ScalarValue::Boolean(value) => ("boolean", Some(serde_json::Value::Bool(*value))),
-        ScalarValue::Number(bits) => (
-            "number",
-            serde_json::Number::from_f64(f64::from_bits(*bits)).map(serde_json::Value::Number),
-        ),
-        ScalarValue::Unsigned(value) => {
-            ("unsigned", Some(serde_json::Value::Number((*value).into())))
-        }
-        ScalarValue::String(value) => ("string", Some(serde_json::Value::String(value.clone()))),
-    };
-    output.insert("type".into(), serde_json::Value::String(kind.into()));
-    if let Some(value) = value {
-        output.insert("value".into(), value);
-    }
-    serde_json::Value::Object(output)
-}
-
-fn encode_json<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, IndexError> {
-    serde_json::to_vec(value).map_err(|error| IndexError::Encode(error.to_string()))
 }
 
 fn bounded_mutation(
@@ -1189,9 +1196,10 @@ mod tests {
     use anvil_api::v1::index_specification::Specification;
     use anvil_api::v1::{
         FullTextField, FullTextIndexSpec, GitSourceIndexSpec, HybridIndexSpec, IndexField,
-        IndexOrder, IndexOrderDirection, IndexSpecification, MetadataFilterIndexSpec,
-        PathIndexSpec, TensorIndexSpec, TypedJsonIndexSpec, VectorIndexSpec,
-        VectorMetric as ApiVectorMetric,
+        IndexFieldCapability, IndexFieldCardinality, IndexOrder, IndexOrderDirection,
+        IndexSpecification, KeywordIndexField, MetadataFilterIndexSpec, PathIndexSpec,
+        SignedIntegerIndexField, TensorIndexSpec, TextIndexField, TypedJsonIndexSpec,
+        VectorIndexSpec, VectorMetric as ApiVectorMetric, index_field,
     };
     use anvil_index::v4::{
         FIELD_PRESENCE_TERM, TERM_TYPE_FIELD_PRESENCE, TERM_TYPE_NULL, TERM_TYPE_TEXT,
@@ -1225,6 +1233,52 @@ mod tests {
         .unwrap()
     }
 
+    fn keyword_field(name: &str, pointer: &str, multi: bool) -> IndexField {
+        IndexField {
+            name: name.into(),
+            json_pointer: pointer.into(),
+            cardinality: if multi {
+                IndexFieldCardinality::Multi
+            } else {
+                IndexFieldCardinality::Single
+            } as i32,
+            capabilities: vec![
+                IndexFieldCapability::Exact as i32,
+                IndexFieldCapability::Facet as i32,
+            ],
+            field_type: Some(index_field::FieldType::Keyword(KeywordIndexField {})),
+        }
+    }
+
+    fn ordered_signed_field(name: &str, pointer: &str) -> IndexField {
+        IndexField {
+            name: name.into(),
+            json_pointer: pointer.into(),
+            cardinality: IndexFieldCardinality::Single as i32,
+            capabilities: vec![
+                IndexFieldCapability::Range as i32,
+                IndexFieldCapability::Order as i32,
+            ],
+            field_type: Some(index_field::FieldType::SignedInteger(
+                SignedIntegerIndexField {},
+            )),
+        }
+    }
+
+    fn text_field(name: &str, pointer: &str, multi: bool) -> IndexField {
+        IndexField {
+            name: name.into(),
+            json_pointer: pointer.into(),
+            cardinality: if multi {
+                IndexFieldCardinality::Multi
+            } else {
+                IndexFieldCardinality::Single
+            } as i32,
+            capabilities: vec![IndexFieldCapability::FullText as i32],
+            field_type: Some(index_field::FieldType::Text(TextIndexField::default())),
+        }
+    }
+
     fn upsert(schema: &Schema, body: Option<&[u8]>) -> (ProjectedSource, IndexBuildDiagnostics) {
         let mut input = body.map(Cursor::new);
         let payload = input.as_mut().map(|value| value as &mut dyn Read);
@@ -1255,7 +1309,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_projects_exact_u64_columns_terms_and_stored_fields() {
+    fn metadata_projects_terms_and_numeric_points_without_source_copies() {
         let schema = schema(Specification::MetadataFilter(MetadataFilterIndexSpec {
             fields: vec![
                 "path".into(),
@@ -1265,27 +1319,23 @@ mod tests {
         }));
         let (source, _) = upsert(&schema, None);
         let record = &source.records[0];
-        assert_eq!(record.columns.len(), 3);
-        assert_eq!(record.columns[1].cell.values, [ScalarValue::Unsigned(0)]);
-        let stored: serde_json::Value =
-            serde_json::from_slice(record.stored_fields.as_ref().unwrap()).unwrap();
-        assert_eq!(stored["path"][0]["value"], "records/source.json");
+        assert_eq!(record.points.len(), 1);
+        assert_eq!(record.points[0].values, [ScalarValue::Unsigned(0)]);
+        assert!(record.doc_values.is_empty());
+        assert!(
+            record
+                .terms
+                .iter()
+                .any(|term| term.field_id == FieldId::new(0))
+        );
     }
 
     #[test]
     fn typed_json_projects_tagged_scalars_and_declared_physical_order() {
         let schema = schema(Specification::TypedJson(TypedJsonIndexSpec {
             fields: vec![
-                IndexField {
-                    name: "modified".into(),
-                    json_pointer: "/modified".into(),
-                    multi_valued: false,
-                },
-                IndexField {
-                    name: "tags".into(),
-                    json_pointer: "/tags".into(),
-                    multi_valued: true,
-                },
+                ordered_signed_field("modified", "/modified"),
+                keyword_field("tags", "/tags", true),
             ],
             physical_order: vec![IndexOrder {
                 field: "modified".into(),
@@ -1298,19 +1348,67 @@ mod tests {
         );
         let record = &source.records[0];
         assert!(!record.order_key.is_empty());
-        assert!(record.columns[1].cell.null);
-        assert_eq!(record.columns[1].cell.values.len(), 2);
+        assert!(record.doc_values[1].cell.null);
+        assert_eq!(record.doc_values[1].cell.values.len(), 2);
         assert!(record.terms.iter().any(|term| term.frequency == 2));
+    }
+
+    #[test]
+    fn typed_multi_text_analyzes_every_value_without_cross_value_phrases() {
+        let schema = schema(Specification::TypedJson(TypedJsonIndexSpec {
+            fields: vec![text_field("body", "/body", true)],
+            physical_order: Vec::new(),
+        }));
+        let (source, _) = upsert(
+            &schema,
+            Some(br#"{"body":["alpha beta",null,"gamma delta"]}"#),
+        );
+        let record = &source.records[0];
+        let beta = record
+            .terms
+            .iter()
+            .find(|term| term.term == b"beta")
+            .unwrap();
+        let gamma = record
+            .terms
+            .iter()
+            .find(|term| term.term == b"gamma")
+            .unwrap();
+
+        assert_eq!(beta.positions, [1]);
+        assert_eq!(gamma.positions, [3]);
+        assert_eq!(record.field_lengths, [(FieldId::new(0), 4)]);
+    }
+
+    #[test]
+    fn point_and_doc_value_only_field_emits_no_presence_term() {
+        let schema = schema(Specification::TypedJson(TypedJsonIndexSpec {
+            fields: vec![ordered_signed_field("modified", "/modified")],
+            physical_order: vec![IndexOrder {
+                field: "modified".into(),
+                direction: IndexOrderDirection::Descending as i32,
+            }],
+        }));
+        let (source, _) = upsert(&schema, Some(br#"{"modified":9}"#));
+        let record = &source.records[0];
+
+        assert!(record.terms.is_empty());
+        assert_eq!(record.points.len(), 1);
+        assert!(record.points[0].present);
+        assert_eq!(record.doc_values.len(), 1);
+
+        let (source, _) = upsert(&schema, Some(br#"{"modified":null}"#));
+        let record = &source.records[0];
+        assert!(record.terms.is_empty());
+        assert!(record.points[0].present);
+        assert!(record.points[0].values.is_empty());
+        assert!(record.doc_values[0].cell.null);
     }
 
     #[test]
     fn typed_json_indexes_valid_documents_when_every_selected_field_is_missing() {
         let schema = schema(Specification::TypedJson(TypedJsonIndexSpec {
-            fields: vec![IndexField {
-                name: "modified".into(),
-                json_pointer: "/modified".into(),
-                multi_valued: false,
-            }],
+            fields: vec![ordered_signed_field("modified", "/modified")],
             physical_order: vec![IndexOrder {
                 field: "modified".into(),
                 direction: IndexOrderDirection::Descending as i32,
@@ -1322,28 +1420,20 @@ mod tests {
         assert_eq!(diagnostics.accepted_objects, 1);
         assert_eq!(diagnostics.skipped_objects, 0);
         assert!(record.terms.is_empty());
-        assert!(record.columns.is_empty());
+        assert!(record.points.is_empty());
+        assert!(record.doc_values.is_empty());
         assert!(!record.order_key.is_empty());
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(record.stored_fields.as_ref().unwrap())
-                .unwrap(),
-            serde_json::json!({})
-        );
     }
 
     #[test]
     fn typed_cardinality_distinguishes_empty_multi_value_and_rejects_single_value_arrays() {
         let multi = schema(Specification::TypedJson(TypedJsonIndexSpec {
-            fields: vec![IndexField {
-                name: "tags".into(),
-                json_pointer: "/tags".into(),
-                multi_valued: true,
-            }],
+            fields: vec![keyword_field("tags", "/tags", true)],
             physical_order: Vec::new(),
         }));
         let (source, _) = upsert(&multi, Some(br#"{"tags":[]}"#));
-        assert!(source.records[0].columns[0].cell.present);
-        assert!(source.records[0].columns[0].cell.values.is_empty());
+        assert!(source.records[0].doc_values[0].cell.present);
+        assert!(source.records[0].doc_values[0].cell.values.is_empty());
         assert_eq!(source.records[0].terms.len(), 1);
         assert_eq!(
             source.records[0].terms[0].term_type,
@@ -1352,18 +1442,14 @@ mod tests {
         assert_eq!(source.records[0].terms[0].term, FIELD_PRESENCE_TERM);
 
         let single = schema(Specification::TypedJson(TypedJsonIndexSpec {
-            fields: vec![IndexField {
-                name: "state".into(),
-                json_pointer: "/state".into(),
-                multi_valued: false,
-            }],
+            fields: vec![keyword_field("state", "/state", false)],
             physical_order: Vec::new(),
         }));
         let (source, _) = upsert(&single, Some(br#"{"state":null}"#));
         let record = &source.records[0];
-        assert!(record.columns[0].cell.present);
-        assert!(record.columns[0].cell.null);
-        assert!(record.columns[0].cell.values.is_empty());
+        assert!(record.doc_values[0].cell.present);
+        assert!(record.doc_values[0].cell.null);
+        assert!(record.doc_values[0].cell.values.is_empty());
         assert!(
             record
                 .terms
@@ -1396,7 +1482,7 @@ mod tests {
     }
 
     #[test]
-    fn full_text_projects_unicode_tokens_frequency_positions_norm_and_stored_text() {
+    fn full_text_projects_unicode_tokens_frequency_positions_and_norms() {
         let schema = schema(Specification::FullText(FullTextIndexSpec {
             fields: vec![FullTextField {
                 name: "body".into(),
@@ -1414,11 +1500,11 @@ mod tests {
         assert_eq!(rust.frequency, 2);
         assert_eq!(rust.positions, [0, 1]);
         assert_eq!(record.field_lengths, [(FieldId::new(0), 3)]);
-        assert!(record.stored_fields.is_some());
+        assert!(record.doc_values.is_empty());
     }
 
     #[test]
-    fn full_text_splits_long_tokens_without_losing_the_boundary_character() {
+    fn full_text_rejects_one_token_over_the_format_bound() {
         let schema = schema(Specification::FullText(FullTextIndexSpec {
             fields: vec![FullTextField {
                 name: "body".into(),
@@ -1426,14 +1512,18 @@ mod tests {
             }],
         }));
         let body = serde_json::to_vec(&serde_json::json!({
-            "body": format!("{}B", "A".repeat(128)),
+            "body": "A".repeat(INDEX_TERM_BYTES + 1),
         }))
         .unwrap();
-        let (source, _) = upsert(&schema, Some(&body));
-        let record = &source.records[0];
-
-        assert!(record.terms.iter().any(|term| term.term == b"b"));
-        assert_eq!(record.field_lengths, [(FieldId::new(0), 2)]);
+        let mut payload = Cursor::new(&body);
+        let error = project_mutation(
+            &schema,
+            IndexSourceMutation::Upsert(object("records/text.json", body.len() as u64)),
+            Some(&mut payload),
+            LIMIT,
+        )
+        .unwrap_err();
+        assert!(matches!(error, IndexError::ResourceLimit { .. }));
     }
 
     #[test]
@@ -1508,9 +1598,8 @@ mod tests {
                 version: 4,
             })
         );
-        let decoded: GitSourceRecord =
-            serde_json::from_slice(source.records[0].stored_fields.as_ref().unwrap()).unwrap();
-        assert_eq!(decoded, record);
+        assert_eq!(source.records[0].terms.len(), 3);
+        assert!(source.records[0].doc_values.is_empty());
     }
 
     #[test]
@@ -1530,7 +1619,7 @@ mod tests {
         };
         let body = serde_json::to_vec(&record).unwrap();
         let (source, _) = upsert(&schema, Some(&body));
-        assert_eq!(source.records[0].columns[7].cell.values.len(), 2);
+        assert_eq!(source.records[0].terms.len(), 2);
         assert_eq!(
             source.records[0].result_identity,
             Some(ObjectIdentity {
@@ -1538,9 +1627,7 @@ mod tests {
                 version: 9,
             })
         );
-        let decoded: TensorRecord =
-            serde_json::from_slice(source.records[0].stored_fields.as_ref().unwrap()).unwrap();
-        assert_eq!(decoded, record);
+        assert!(source.records[0].doc_values.is_empty());
     }
 
     #[test]
@@ -1599,11 +1686,7 @@ mod tests {
     #[test]
     fn malformed_out_of_scope_and_explicit_delete_all_emit_versioned_tombstones() {
         let schema = schema(Specification::TypedJson(TypedJsonIndexSpec {
-            fields: vec![IndexField {
-                name: "state".into(),
-                json_pointer: "/state".into(),
-                multi_valued: false,
-            }],
+            fields: vec![keyword_field("state", "/state", false)],
             physical_order: Vec::new(),
         }));
         let mut malformed = Cursor::new(b"not-json");
@@ -1664,7 +1747,7 @@ mod tests {
 
     #[test]
     fn text_preflight_matches_the_native_analyzer_token_boundaries() {
-        let text = format!("{}B RUST café", "A".repeat(MAX_ANALYZED_TOKEN_CHARS));
+        let text = format!("{} RUST café", "A".repeat(INDEX_TERM_BYTES));
         let analyzed = analyze_unicode_alphanumeric_lowercase(&text, usize::MAX).unwrap();
         let (tokens, bytes) = analyzed_token_measure(&text).unwrap();
         assert_eq!(tokens, analyzed.len());

@@ -10,17 +10,19 @@ use std::time::Duration;
 use anvil_storage::v1::index_query::Query as QueryValue;
 use anvil_storage::v1::index_service_client::IndexServiceClient;
 use anvil_storage::v1::index_specification::Specification as SpecificationValue;
+use anvil_storage::v1::index_field::FieldType as IndexFieldType;
 use anvil_storage::v1::put_header::Operation as PutOperationValue;
 use anvil_storage::v1::{
     CreateApplicationRequest, CreateBucketRequest, CreateIndexRequest, DeleteRequest, Durability,
     FullTextField, FullTextIndexQuery, FullTextIndexSpec, GetIndexRequest, GitSourceIndexQuery,
     GitSourceIndexSpec, HybridIndexQuery, HybridIndexSpec, IndexDefinition, IndexField,
-    IndexFreshness, IndexOrder, IndexOrderDirection, IndexPredicate, IndexPredicateOperator,
-    IndexQuery, IndexQueryHit, IndexSpecification, MetadataFilterIndexQuery,
+    IndexFieldCapability, IndexFieldCardinality, IndexFreshness, IndexOrder,
+    IndexOrderDirection, IndexPredicate, IndexPredicateOperator, IndexQuery, IndexQueryHit,
+    IndexSpecification, KeywordIndexField, MetadataFilterIndexQuery,
     MetadataFilterIndexSpec, ObjectAddress, ObjectVersioning, PathIndexQuery, PathIndexSpec,
     PutHeader, PutOperation, QueryIndexRequest, QueryIndexResponse, RebuildIndexRequest,
-    SetBucketPublicReadRequest, TensorIndexQuery, TensorIndexSpec, TypedJsonIndexQuery,
-    TypedJsonIndexSpec, VectorIndexQuery, VectorIndexSpec, VectorMetric,
+    SetBucketPublicReadRequest, SignedIntegerIndexField, TensorIndexQuery, TensorIndexSpec,
+    TypedJsonIndexQuery, TypedJsonIndexSpec, VectorIndexQuery, VectorIndexSpec, VectorMetric,
 };
 use anvil_storage::{
     BearerToken, RawAdministrationClient, RawClient, administration_client, connect_channel,
@@ -95,7 +97,6 @@ struct VerificationHit {
     path: String,
     object_version: u64,
     score_bits: Option<u32>,
-    fields_json: Vec<u8>,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -874,7 +875,6 @@ fn verification_hits(response: &QueryIndexResponse) -> TestResult<Vec<Verificati
                     .clone(),
                 object_version: hit.object_version,
                 score_bits: hit.score.map(f32::to_bits),
-                fields_json: hit.fields_json.clone(),
             })
         })
         .collect::<TestResult<Vec<_>>>()?;
@@ -1274,6 +1274,8 @@ fn routed_responses_agree(responses: &[QueryIndexResponse]) -> bool {
     responses.windows(2).all(|pair| {
         pair[0].hits == pair[1].hits
             && pair[0].next_page_token == pair[1].next_page_token
+            && pair[0].facet_results == pair[1].facet_results
+            && pair[0].aggregate_results == pair[1].aggregate_results
             && stable_freshness_agrees(pair[0].freshness.as_ref(), pair[1].freshness.as_ref())
     })
 }
@@ -1542,9 +1544,17 @@ fn engine_cases() -> Vec<EngineCase> {
             name: "active-documents",
             specification: specification(SpecificationValue::TypedJson(TypedJsonIndexSpec {
                 fields: vec![
-                    index_field("status", "/status"),
-                    index_field("modified_at", "/modified_at"),
-                    index_field("source_record_id", "/source_record_id"),
+                    keyword_field("status", "/status", &[IndexFieldCapability::Exact]),
+                    signed_integer_field(
+                        "modified_at",
+                        "/modified_at",
+                        &[IndexFieldCapability::Order],
+                    ),
+                    keyword_field(
+                        "source_record_id",
+                        "/source_record_id",
+                        &[IndexFieldCapability::Order],
+                    ),
                 ],
                 physical_order: typed_json_order(),
             })),
@@ -1555,6 +1565,8 @@ fn engine_cases() -> Vec<EngineCase> {
                     values_json: vec![br#""active""#.to_vec()],
                 }],
                 order: typed_json_order(),
+                facets: Vec::new(),
+                aggregates: Vec::new(),
             })),
             documents: vec![
                 ("docs/active-a.json", br#"{"status":"active","modified_at":100,"source_record_id":"b"}"#),
@@ -1782,11 +1794,31 @@ fn vector_spec() -> VectorIndexSpec {
     }
 }
 
-fn index_field(name: &str, json_pointer: &str) -> IndexField {
+fn keyword_field(
+    name: &str,
+    json_pointer: &str,
+    capabilities: &[IndexFieldCapability],
+) -> IndexField {
     IndexField {
         name: name.into(),
         json_pointer: json_pointer.into(),
-        multi_valued: false,
+        cardinality: IndexFieldCardinality::Single as i32,
+        capabilities: capabilities.iter().map(|value| *value as i32).collect(),
+        field_type: Some(IndexFieldType::Keyword(KeywordIndexField {})),
+    }
+}
+
+fn signed_integer_field(
+    name: &str,
+    json_pointer: &str,
+    capabilities: &[IndexFieldCapability],
+) -> IndexField {
+    IndexField {
+        name: name.into(),
+        json_pointer: json_pointer.into(),
+        cardinality: IndexFieldCardinality::Single as i32,
+        capabilities: capabilities.iter().map(|value| *value as i32).collect(),
+        field_type: Some(IndexFieldType::SignedInteger(SignedIntegerIndexField {})),
     }
 }
 

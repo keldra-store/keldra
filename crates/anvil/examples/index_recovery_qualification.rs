@@ -12,13 +12,15 @@ use anvil_storage::v1::bulk_outcome::Outcome as BulkOutcomeValue;
 use anvil_storage::v1::index_query::Query as QueryValue;
 use anvil_storage::v1::index_service_client::IndexServiceClient;
 use anvil_storage::v1::index_specification::Specification as SpecificationValue;
+use anvil_storage::v1::index_field::FieldType as IndexFieldType;
 use anvil_storage::v1::object_head::State as ObjectHeadState;
 use anvil_storage::v1::put_header::Operation as PutOperationValue;
 use anvil_storage::v1::{
     BulkOperation, BulkPutRequest, BulkWriteRequest, CreateBucketRequest, CreateIndexRequest,
     DeleteRequest, Durability, FullTextField, FullTextIndexQuery, FullTextIndexSpec,
     GitSourceIndexQuery, GitSourceIndexSpec, HeadObjectRequest, HybridIndexQuery, HybridIndexSpec,
-    IndexField, IndexPredicate, IndexPredicateOperator, IndexQuery, IndexSpecification,
+    IndexField, IndexFieldCapability, IndexFieldCardinality, IndexPredicate,
+    IndexPredicateOperator, IndexQuery, IndexSpecification, KeywordIndexField,
     MetadataFilterIndexQuery, MetadataFilterIndexSpec, MutationFailureCode, MutationReceipt,
     ObjectAddress, ObjectVersioning, PathIndexQuery, PathIndexSpec, PutHeader, PutOperation,
     QueryIndexRequest, TensorIndexQuery, TensorIndexSpec, TypedJsonIndexQuery, TypedJsonIndexSpec,
@@ -1295,7 +1297,9 @@ fn recovery_cases() -> Vec<RecoveryCase> {
                 fields: vec![IndexField {
                     name: "state".into(),
                     json_pointer: "/state".into(),
-                    multi_valued: false,
+                    cardinality: IndexFieldCardinality::Single as i32,
+                    capabilities: vec![IndexFieldCapability::Exact as i32],
+                    field_type: Some(IndexFieldType::Keyword(KeywordIndexField {})),
                 }],
                 physical_order: Vec::new(),
             })),
@@ -1306,6 +1310,8 @@ fn recovery_cases() -> Vec<RecoveryCase> {
                     values_json: vec![br#""active""#.to_vec()],
                 }],
                 order: Vec::new(),
+                facets: Vec::new(),
+                aggregates: Vec::new(),
             })),
             documents: [
                 document(

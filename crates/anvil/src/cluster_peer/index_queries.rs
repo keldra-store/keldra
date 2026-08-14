@@ -379,6 +379,8 @@ fn response_to_wire(
         next_position: result.next_position,
         routing_placement_term: routing_fence.term,
         routing_placement_index: routing_fence.index,
+        facet_results: result.facet_results,
+        aggregate_results: result.aggregate_results,
     })
 }
 
@@ -387,6 +389,8 @@ fn response_from_wire(
 ) -> Result<ExecutedIndexQuery, Status> {
     let result = ExecutedIndexQuery {
         hits: response.hits,
+        facet_results: response.facet_results,
+        aggregate_results: response.aggregate_results,
         freshness: response
             .freshness
             .ok_or_else(|| Status::data_loss("routed index response has no freshness"))?,
@@ -667,6 +671,8 @@ mod tests {
         let response = response_to_wire(
             ExecutedIndexQuery {
                 hits: Vec::new(),
+                facet_results: Vec::new(),
+                aggregate_results: Vec::new(),
                 freshness: anvil_api::v1::IndexFreshness {
                     generation: 1,
                     placement_term: 31,
@@ -690,6 +696,8 @@ mod tests {
     fn even_zero_hit_results_must_retain_the_admission_revision() {
         let mut result = ExecutedIndexQuery {
             hits: Vec::new(),
+            facet_results: Vec::new(),
+            aggregate_results: Vec::new(),
             freshness: anvil_api::v1::IndexFreshness {
                 authorization_revision: 19,
                 ..Default::default()
