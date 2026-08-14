@@ -457,11 +457,15 @@ fn scalar_projection_bytes(
             };
             selected_bytes = checked_add(selected_bytes, string_bytes)?;
             if field.field_type == FieldType::Text {
-                let ScalarValue::String(text) = value else {
-                    return Err(IndexError::Decode(format!(
-                        "Typed JSON text field `{}` contains a non-string value",
-                        field.name
-                    )));
+                let text = match value {
+                    ScalarValue::Null => continue,
+                    ScalarValue::String(text) => text,
+                    _ => {
+                        return Err(IndexError::Decode(format!(
+                            "Typed JSON text field `{}` contains a non-string value",
+                            field.name
+                        )));
+                    }
                 };
                 let (token_count, normalized_bytes) = analyzed_token_measure(text)?;
                 let positions_bytes = token_count
