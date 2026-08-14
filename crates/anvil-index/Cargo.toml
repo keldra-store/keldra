@@ -9,7 +9,6 @@ publish = false
 
 [dependencies]
 blake3 = "1.8"
-lz4_flex = { version = "=0.14.0", default-features = false, features = ["safe-decode", "safe-encode"] }
 sux = { version = "=0.14.0", default-features = false }
 thiserror = "2"
 

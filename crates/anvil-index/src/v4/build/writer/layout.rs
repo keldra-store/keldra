@@ -23,6 +23,14 @@ pub(super) struct TermRef {
     pub term_ordinal: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PointRef {
+    pub doc_id: u32,
+    pub point_ordinal: u32,
+    /// `None` is the one field-presence record for this document.
+    pub value_ordinal: Option<u32>,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct WriterCharge {
     schema_workspace_bytes: usize,
@@ -30,6 +38,7 @@ pub(super) struct WriterCharge {
     source_slots_bytes: usize,
     document_count: usize,
     term_count: usize,
+    point_count: usize,
 }
 
 impl WriterCharge {
@@ -78,6 +87,13 @@ impl WriterCharge {
                     .checked_add(record.terms.len())
                     .ok_or(IndexError::OffsetOverflow)
             })?;
+        let point_count = source.records.iter().try_fold(self.point_count, |count, record| {
+            record.points.iter().try_fold(count, |count, point| {
+                count
+                    .checked_add(point.values.len().saturating_add(1))
+                    .ok_or(IndexError::OffsetOverflow)
+            })
+        })?;
         Ok(Self {
             schema_workspace_bytes: self.schema_workspace_bytes,
             retained_source_bytes: self
@@ -93,17 +109,22 @@ impl WriterCharge {
                 .ok_or(IndexError::OffsetOverflow)?,
             document_count,
             term_count,
+            point_count,
         })
     }
 
     pub fn peak_bytes(self) -> Result<usize, IndexError> {
         let document_capacity = charged_vec_capacity(0, self.document_count)?;
         let term_capacity = charged_vec_capacity(0, self.term_count)?;
+        let point_capacity = charged_vec_capacity(0, self.point_count)?;
         let documents = document_capacity
             .checked_mul(std::mem::size_of::<DocumentRef>())
             .ok_or(IndexError::OffsetOverflow)?;
         let term_refs = term_capacity
             .checked_mul(std::mem::size_of::<TermRef>())
+            .ok_or(IndexError::OffsetOverflow)?;
+        let point_refs = point_capacity
+            .checked_mul(std::mem::size_of::<PointRef>())
             .ok_or(IndexError::OffsetOverflow)?;
         let locator_refs = document_capacity
             .checked_mul(std::mem::size_of::<SourceDocRef>())
@@ -112,7 +133,7 @@ impl WriterCharge {
             .checked_add(self.schema_workspace_bytes)
             .and_then(|bytes| bytes.checked_add(self.source_slots_bytes))
             .and_then(|bytes| bytes.checked_add(documents))
-            .and_then(|bytes| bytes.checked_add(term_refs.max(locator_refs)))
+            .and_then(|bytes| bytes.checked_add(term_refs.max(point_refs).max(locator_refs)))
             .ok_or(IndexError::OffsetOverflow)
     }
 
@@ -122,6 +143,10 @@ impl WriterCharge {
 
     pub fn term_count(self) -> usize {
         self.term_count
+    }
+
+    pub fn point_count(self) -> usize {
+        self.point_count
     }
 }
 
@@ -311,4 +336,56 @@ pub(super) fn term<'a>(
     reference: TermRef,
 ) -> &'a super::super::ProjectedTerm {
     &record(sources, documents[reference.doc_id as usize]).terms[reference.term_ordinal as usize]
+}
+
+pub(super) fn build_point_refs(
+    sources: &[ProjectedSource],
+    documents: &[DocumentRef],
+    point_count: usize,
+) -> Result<Vec<PointRef>, IndexError> {
+    let mut references = charged_vec(point_count)?;
+    for (doc_id, document) in documents.iter().copied().enumerate() {
+        for (point_ordinal, point) in record(sources, document).points.iter().enumerate() {
+            references.push(PointRef {
+                doc_id: u32::try_from(doc_id).map_err(|_| IndexError::OffsetOverflow)?,
+                point_ordinal: u32::try_from(point_ordinal)
+                    .map_err(|_| IndexError::OffsetOverflow)?,
+                value_ordinal: None,
+            });
+            for value_ordinal in 0..point.values.len() {
+                references.push(PointRef {
+                    doc_id: u32::try_from(doc_id).map_err(|_| IndexError::OffsetOverflow)?,
+                    point_ordinal: u32::try_from(point_ordinal)
+                        .map_err(|_| IndexError::OffsetOverflow)?,
+                    value_ordinal: Some(
+                        u32::try_from(value_ordinal).map_err(|_| IndexError::OffsetOverflow)?,
+                    ),
+                });
+            }
+        }
+    }
+    references.sort_unstable_by(|left, right| {
+        let (left_field, left_value) = point(sources, documents, *left);
+        let (right_field, right_value) = point(sources, documents, *right);
+        left_field
+            .cmp(&right_field)
+            .then_with(|| left_value.cmp(right_value))
+            .then_with(|| left.doc_id.cmp(&right.doc_id))
+    });
+    Ok(references)
+}
+
+pub(super) fn point<'a>(
+    sources: &'a [ProjectedSource],
+    documents: &[DocumentRef],
+    reference: PointRef,
+) -> (crate::v4::FieldId, Option<&'a crate::v4::ScalarValue>) {
+    let point = &record(sources, documents[reference.doc_id as usize]).points
+        [reference.point_ordinal as usize];
+    (
+        point.field_id,
+        reference
+            .value_ordinal
+            .map(|ordinal| &point.values[ordinal as usize]),
+    )
 }

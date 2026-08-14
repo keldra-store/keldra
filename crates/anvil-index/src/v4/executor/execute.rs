@@ -21,6 +21,7 @@ use super::score::{GlobalTextStatistics, SegmentScorer};
 use super::values::SegmentValues;
 
 mod impact;
+mod compute;
 mod result;
 
 pub const MAXIMUM_CANDIDATE_GATE_BATCH: usize = 256;
@@ -204,15 +205,87 @@ where
             )
             .await?
         };
+        let (facet_results, aggregate_results) = self
+            .compute(request, &statistics)
+            .await?;
         result::materialize(
             request,
             executions.as_mut_slice(),
             selected,
+            facet_results,
+            aggregate_results,
             self.limits.maximum_page_bytes,
             &statistics,
         )
         .await
         .map_err(NativeQueryExecutionError::Index)
+    }
+
+    async fn compute<'query>(
+        &'query self,
+        request: &'query NativeQueryRequest,
+        statistics: &NativeQueryStatisticsRecorder,
+    ) -> Result<
+        (
+            Vec<super::super::FacetResult>,
+            Vec<super::super::AggregateResult>,
+        ),
+        NativeQueryExecutionError<G::Error>,
+    > {
+        if request.facets.is_empty() && request.aggregates.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let mut state = compute::ComputationState::new(request, self.limits.maximum_page_bytes)?;
+        for (segment_index, segment) in request.segments.iter().enumerate() {
+            let plan = plan_segment(
+                self.directory,
+                segment,
+                &request.schema,
+                &request.query,
+                self.limits.maximum_expanded_terms,
+                statistics,
+            )
+            .await?;
+            let mut execution = SegmentExecution::new(
+                self.directory,
+                segment_index,
+                segment,
+                plan,
+                statistics.clone(),
+            )?;
+            let mut pending = Vec::with_capacity(self.limits.candidate_gate_batch);
+            loop {
+                while pending.len() < self.limits.candidate_gate_batch {
+                    let Some(candidate) = execution.next_unranked().await? else {
+                        break;
+                    };
+                    pending.push(candidate);
+                }
+                if pending.is_empty() {
+                    break;
+                }
+                let references = pending
+                    .iter()
+                    .map(|candidate| CandidateReference {
+                        source: candidate.identity.source.clone(),
+                        result: candidate.identity.result_or_source().clone(),
+                    })
+                    .collect::<Vec<_>>();
+                let evidence = self
+                    .gate
+                    .evaluate(&references)
+                    .await
+                    .map_err(NativeQueryExecutionError::Gate)?;
+                result::validate_gate(request, references.len(), &evidence, statistics)?;
+                for (candidate, visible) in pending.drain(..).zip(evidence.visible) {
+                    if visible {
+                        state.observe(&mut execution.values, candidate.doc_id).await?;
+                    }
+                }
+            }
+            execution.release_decoded()?;
+        }
+        state.finish().map_err(NativeQueryExecutionError::Index)
     }
 
     async fn execute_top_k<'query>(

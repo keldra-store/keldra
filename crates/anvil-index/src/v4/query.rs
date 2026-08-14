@@ -5,8 +5,8 @@ use crate::IndexError;
 
 use super::codec::{Decoder, Encoder};
 use super::{
-    INDEX_COMPONENT_BYTES, INDEX_ROUTING_KEY_BYTES, ObjectIdentity, OrderField, Predicate,
-    ScalarValue, Schema, SegmentDescriptor, SortValue,
+    FieldCapabilities, FieldId, INDEX_COMPONENT_BYTES, INDEX_ROUTING_KEY_BYTES, INDEX_TERM_BYTES,
+    ObjectIdentity, OrderField, Predicate, ScalarValue, Schema, SegmentDescriptor, SortValue,
 };
 
 const CURSOR_MAGIC: &[u8; 8] = b"ANVLQCR4";
@@ -133,22 +133,26 @@ fn encode_sort_value(out: &mut Encoder, value: &SortValue) -> Result<(), IndexEr
         SortValue::Value(ScalarValue::Null) => out.u8(1),
         SortValue::Value(ScalarValue::Boolean(false)) => out.u8(2),
         SortValue::Value(ScalarValue::Boolean(true)) => out.u8(3),
+        SortValue::Value(ScalarValue::Signed(value)) => {
+            out.u8(4);
+            out.u64(*value as u64);
+        }
         SortValue::Value(ScalarValue::Number(bits)) => {
             require_canonical_number(*bits)?;
-            out.u8(4);
+            out.u8(5);
             out.u64(*bits);
         }
         SortValue::Value(ScalarValue::Unsigned(value)) => {
-            out.u8(5);
+            out.u8(6);
             out.u64(*value);
         }
         SortValue::Value(ScalarValue::String(value)) => {
-            if value.len() > INDEX_ROUTING_KEY_BYTES {
+            if value.len() > INDEX_TERM_BYTES {
                 return Err(IndexError::InvalidQuery(
                     "query cursor string exceeds the routing-key bound".into(),
                 ));
             }
-            out.u8(6);
+            out.u8(7);
             out.string(value)?;
         }
     }
@@ -161,15 +165,16 @@ fn decode_sort_value(input: &mut Decoder<'_>) -> Result<SortValue, IndexError> {
         1 => SortValue::Value(ScalarValue::Null),
         2 => SortValue::Value(ScalarValue::Boolean(false)),
         3 => SortValue::Value(ScalarValue::Boolean(true)),
-        4 => {
+        4 => SortValue::Value(ScalarValue::Signed(input.u64()? as i64)),
+        5 => {
             let bits = input.u64()?;
             require_canonical_number(bits)?;
             SortValue::Value(ScalarValue::Number(bits))
         }
-        5 => SortValue::Value(ScalarValue::Unsigned(input.u64()?)),
-        6 => {
+        6 => SortValue::Value(ScalarValue::Unsigned(input.u64()?)),
+        7 => {
             let value = input.string()?;
-            if value.len() > INDEX_ROUTING_KEY_BYTES {
+            if value.len() > INDEX_TERM_BYTES {
                 return Err(IndexError::InvalidFormat(
                     "format-v4 query cursor string bound",
                 ));
@@ -199,6 +204,8 @@ pub struct NativeQueryRequest {
     pub query: NativeQuery,
     pub after: Option<NativeQueryCursor>,
     pub limit: u32,
+    pub facets: Vec<FacetRequest>,
+    pub aggregates: Vec<AggregateRequest>,
     /// Revision established by query admission or the validated page token.
     pub authorization_revision: u64,
 }
@@ -283,6 +290,7 @@ impl NativeQueryRequest {
             NativeQuery::Filter { predicate, order } => {
                 if let Some(predicate) = predicate {
                     predicate.validate()?;
+                    validate_predicate_capabilities(&self.schema, predicate)?;
                 }
                 let mut fields = BTreeSet::new();
                 for ordered in order {
@@ -294,15 +302,16 @@ impl NativeQueryRequest {
                     if field.id != ordered.field_id
                         || field.cardinality != super::Cardinality::Single
                         || !field
-                            .components
-                            .contains(super::FieldComponents::FAST_COLUMN)
+                            .capabilities
+                            .contains(FieldCapabilities::ORDER)
                         || !fields.insert(field.id)
                     {
                         return Err(IndexError::InvalidQuery(
-                            "query order requires unique single-valued fast columns".into(),
+                            "query order requires unique single-valued ORDER fields".into(),
                         ));
                     }
                 }
+                validate_computations(&self.schema, &self.facets, &self.aggregates)?;
             }
             NativeQuery::FullText { text, .. } if text.trim().is_empty() => {
                 return Err(IndexError::InvalidQuery(
@@ -362,6 +371,139 @@ fn validate_finite_vector(values: &[f32]) -> Result<(), IndexError> {
     Ok(())
 }
 
+fn validate_computations(
+    schema: &Schema,
+    facets: &[FacetRequest],
+    aggregates: &[AggregateRequest],
+) -> Result<(), IndexError> {
+    let mut facet_fields = BTreeSet::new();
+    for facet in facets {
+        let field = schema
+            .fields
+            .get(facet.field_id.get() as usize)
+            .ok_or_else(|| IndexError::InvalidQuery("unknown facet field".into()))?;
+        if facet.limit == 0
+            || !field.capabilities.contains(FieldCapabilities::FACET)
+            || !facet_fields.insert(facet.field_id)
+        {
+            return Err(IndexError::InvalidQuery(
+                "facets require a unique FACET field and non-zero limit".into(),
+            ));
+        }
+    }
+    let mut aggregate_keys = BTreeSet::new();
+    for aggregate in aggregates {
+        let field = schema
+            .fields
+            .get(aggregate.field_id.get() as usize)
+            .ok_or_else(|| IndexError::InvalidQuery("unknown aggregate field".into()))?;
+        if !field.capabilities.contains(FieldCapabilities::AGGREGATE)
+            || !aggregate_keys.insert((aggregate.field_id, aggregate.operation as u8))
+        {
+            return Err(IndexError::InvalidQuery(
+                "aggregates require a unique AGGREGATE field/operation".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_predicate_capabilities(schema: &Schema, predicate: &Predicate) -> Result<(), IndexError> {
+    match predicate {
+        Predicate::Equal { field_id, value, .. } => {
+            validate_field_value(schema, *field_id, value, FieldCapabilities::EXACT)
+        }
+        Predicate::In { field_id, values, .. } => values.iter().try_for_each(|value| {
+            validate_field_value(schema, *field_id, value, FieldCapabilities::EXACT)
+        }),
+        Predicate::Prefix { field_id, prefix, .. } => {
+            let field = require_capability(schema, *field_id, FieldCapabilities::PREFIX)?;
+            if field.field_type != super::FieldType::Keyword || prefix.len() > INDEX_TERM_BYTES {
+                return Err(IndexError::InvalidQuery(
+                    "PREFIX requires an in-bound keyword field".into(),
+                ));
+            }
+            Ok(())
+        }
+        Predicate::Range { field_id, lower, upper, .. } => {
+            let field = require_capability(schema, *field_id, FieldCapabilities::RANGE)?;
+            for bound in lower.iter().chain(upper.iter()) {
+                validate_value_type(field.field_type, &bound.value)?;
+                if matches!(&bound.value, ScalarValue::String(value) if value.len() > INDEX_TERM_BYTES)
+                {
+                    return Err(IndexError::InvalidQuery(
+                        "ordered keyword value exceeds 32,766 bytes".into(),
+                    ));
+                }
+            }
+            Ok(())
+        }
+        Predicate::Exists { field_id, .. } => {
+            schema.fields.get(field_id.get() as usize).ok_or_else(|| {
+                IndexError::InvalidQuery("unknown EXISTS field".into())
+            })?;
+            Ok(())
+        }
+        Predicate::FullText { field_id, .. } | Predicate::Phrase { field_id, .. } => {
+            let field = require_capability(schema, *field_id, FieldCapabilities::FULL_TEXT)?;
+            if field.field_type != super::FieldType::Text {
+                return Err(IndexError::InvalidQuery(
+                    "full-text predicate requires a text field".into(),
+                ));
+            }
+            Ok(())
+        }
+        Predicate::And(children) | Predicate::Or(children) => children
+            .iter()
+            .try_for_each(|child| validate_predicate_capabilities(schema, child)),
+        Predicate::Not(child) => validate_predicate_capabilities(schema, child),
+    }
+}
+
+fn require_capability(
+    schema: &Schema,
+    field_id: FieldId,
+    capability: FieldCapabilities,
+) -> Result<&super::FieldSchema, IndexError> {
+    let field = schema
+        .fields
+        .get(field_id.get() as usize)
+        .ok_or_else(|| IndexError::InvalidQuery("unknown predicate field".into()))?;
+    if !field.capabilities.contains(capability) {
+        return Err(IndexError::InvalidQuery(
+            "predicate requires an undeclared field capability".into(),
+        ));
+    }
+    Ok(field)
+}
+
+fn validate_field_value(
+    schema: &Schema,
+    field_id: FieldId,
+    value: &ScalarValue,
+    capability: FieldCapabilities,
+) -> Result<(), IndexError> {
+    let field = require_capability(schema, field_id, capability)?;
+    validate_value_type(field.field_type, value)
+}
+
+fn validate_value_type(field_type: super::FieldType, value: &ScalarValue) -> Result<(), IndexError> {
+    let valid = matches!(
+        (field_type, value),
+        (super::FieldType::Boolean, ScalarValue::Boolean(_))
+            | (super::FieldType::SignedInteger, ScalarValue::Signed(_))
+            | (super::FieldType::UnsignedInteger, ScalarValue::Unsigned(_))
+            | (super::FieldType::Float, ScalarValue::Number(_))
+            | (super::FieldType::Keyword, ScalarValue::String(_))
+    );
+    if !valid {
+        return Err(IndexError::InvalidQuery(
+            "query value does not match the field type".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Stable identities supplied to the mandatory authorization/exact-current
 /// boundary before a candidate can enter a top-K heap or returned page.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -396,8 +538,48 @@ pub struct NativeQueryHit {
     pub source: ObjectIdentity,
     pub result: ObjectIdentity,
     pub score: Option<f32>,
-    pub fields_json: Vec<u8>,
     pub cursor: NativeQueryCursor,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FacetRequest {
+    pub field_id: FieldId,
+    pub limit: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FacetBucket {
+    pub value: ScalarValue,
+    pub count: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FacetResult {
+    pub field_id: FieldId,
+    pub buckets: Vec<FacetBucket>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AggregateOperation {
+    Count,
+    Minimum,
+    Maximum,
+    Sum,
+    Average,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AggregateRequest {
+    pub field_id: FieldId,
+    pub operation: AggregateOperation,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AggregateResult {
+    pub field_id: FieldId,
+    pub operation: AggregateOperation,
+    pub value: Option<ScalarValue>,
+    pub contributing_count: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -405,6 +587,8 @@ pub struct NativeQueryPage {
     pub hits: Vec<NativeQueryHit>,
     pub next: Option<NativeQueryCursor>,
     pub authorization_revision: u64,
+    pub facet_results: Vec<FacetResult>,
+    pub aggregate_results: Vec<AggregateResult>,
     pub statistics: super::NativeQueryStatistics,
 }
 

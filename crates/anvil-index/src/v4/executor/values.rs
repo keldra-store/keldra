@@ -5,20 +5,18 @@ use std::pin::Pin;
 use crate::IndexError;
 
 use super::super::{
-    ArtifactDirectoryRead, DocId, DocumentIdentity, FastColumnBlock, FastColumnCell, FieldId,
+    ArtifactDirectoryRead, DocId, DocValueBlock, DocValueCell, DocumentIdentity, FieldId,
     IdentityBlock, LiveMaskBlock, NativeQueryStatisticsRecorder, NormBlock, Predicate, RangeBound,
-    ScalarValue, SegmentComponentReader, SegmentDescriptor, SortValue, StoredFieldsBlock,
-    VectorBlock,
+    ScalarValue, SegmentComponentReader, SegmentDescriptor, SortValue, VectorBlock,
 };
 
 pub(super) struct SegmentValues<'a, D> {
     reader: SegmentComponentReader<'a, D>,
     identity: Option<IdentityBlock>,
     live: Option<LiveMaskBlock>,
-    columns: BTreeMap<FieldId, FastColumnBlock>,
+    doc_values: BTreeMap<FieldId, DocValueBlock>,
     norms: BTreeMap<FieldId, NormBlock>,
     vectors: BTreeMap<FieldId, VectorBlock>,
-    stored: Option<StoredFieldsBlock>,
     statistics: NativeQueryStatisticsRecorder,
 }
 
@@ -32,10 +30,9 @@ impl<'a, D: ArtifactDirectoryRead> SegmentValues<'a, D> {
             reader: SegmentComponentReader::new(directory, segment)?,
             identity: None,
             live: None,
-            columns: BTreeMap::new(),
+            doc_values: BTreeMap::new(),
             norms: BTreeMap::new(),
             vectors: BTreeMap::new(),
-            stored: None,
             statistics,
         })
     }
@@ -90,39 +87,39 @@ impl<'a, D: ArtifactDirectoryRead> SegmentValues<'a, D> {
             ))
     }
 
-    pub(super) async fn column(
+    pub(super) async fn doc_value(
         &mut self,
         field_id: FieldId,
         doc_id: DocId,
-    ) -> Result<FastColumnCell, IndexError> {
+    ) -> Result<DocValueCell, IndexError> {
         if self
-            .columns
+            .doc_values
             .get(&field_id)
             .and_then(|block| block.get(doc_id))
             .is_none()
         {
             let blocks = self
                 .reader
-                .fast_column_blocks(field_id, Some(doc_id.get()), Some(doc_id.get()))
+                .doc_value_blocks(field_id, Some(doc_id.get()), Some(doc_id.get()))
                 .await?;
-            self.statistics.fast_column_blocks_decoded(
+            self.statistics.doc_value_blocks_decoded(
                 u64::try_from(blocks.len()).map_err(|_| IndexError::OffsetOverflow)?,
             );
             let block = one(
                 blocks,
-                "fast-column DocId did not resolve to exactly one block",
+                "doc-value DocId did not resolve to exactly one block",
             )?;
             if block.field_id != field_id {
-                return Err(IndexError::InvalidFormat("fast-column field identity"));
+                return Err(IndexError::InvalidFormat("doc-value field identity"));
             }
-            self.columns.insert(field_id, block);
+            self.doc_values.insert(field_id, block);
         }
-        self.columns
+        self.doc_values
             .get(&field_id)
             .and_then(|block| block.get(doc_id))
             .cloned()
             .ok_or(IndexError::InvalidFormat(
-                "fast-column block does not cover requested DocId",
+                "doc-value block does not cover requested DocId",
             ))
     }
 
@@ -131,7 +128,7 @@ impl<'a, D: ArtifactDirectoryRead> SegmentValues<'a, D> {
         field_id: FieldId,
         doc_id: DocId,
     ) -> Result<SortValue, IndexError> {
-        let cell = self.column(field_id, doc_id).await?;
+        let cell = self.doc_value(field_id, doc_id).await?;
         if !cell.present {
             return Ok(SortValue::Missing);
         }
@@ -163,16 +160,16 @@ impl<'a, D: ArtifactDirectoryRead> SegmentValues<'a, D> {
             Ok(match predicate {
                 Predicate::Equal {
                     field_id, value, ..
-                } => matches_value(&self.column(*field_id, doc_id).await?, value),
+                } => matches_value(&self.doc_value(*field_id, doc_id).await?, value),
                 Predicate::In {
                     field_id, values, ..
                 } => {
-                    let cell = self.column(*field_id, doc_id).await?;
+                    let cell = self.doc_value(*field_id, doc_id).await?;
                     values.iter().any(|value| matches_value(&cell, value))
                 }
                 Predicate::Prefix {
                     field_id, prefix, ..
-                } => self.column(*field_id, doc_id).await?.values.iter().any(|value| {
+                } => self.doc_value(*field_id, doc_id).await?.values.iter().any(|value| {
                     matches!(value, ScalarValue::String(value) if value.starts_with(prefix))
                 }),
                 Predicate::Range {
@@ -180,11 +177,16 @@ impl<'a, D: ArtifactDirectoryRead> SegmentValues<'a, D> {
                     lower,
                     upper,
                     ..
-                } => self.column(*field_id, doc_id).await?.values.iter().any(|value| {
+                } => self.doc_value(*field_id, doc_id).await?.values.iter().any(|value| {
                     in_range(value, lower.as_ref(), upper.as_ref())
                 }),
                 Predicate::Exists { field_id, .. } => {
-                    self.column(*field_id, doc_id).await?.present
+                    self.doc_value(*field_id, doc_id).await?.present
+                }
+                Predicate::FullText { .. } | Predicate::Phrase { .. } => {
+                    return Err(IndexError::InvalidQuery(
+                        "full-text predicates require the posting/position executor".into(),
+                    ));
                 }
                 Predicate::And(children) => {
                     let mut matched = true;
@@ -268,48 +270,18 @@ impl<'a, D: ArtifactDirectoryRead> SegmentValues<'a, D> {
             .map(<[f32]>::to_vec))
     }
 
-    pub(super) async fn stored(&mut self, doc_id: DocId) -> Result<Vec<u8>, IndexError> {
-        if self
-            .stored
-            .as_ref()
-            .is_none_or(|block| !stored_contains(block, doc_id))
-        {
-            let blocks = self
-                .reader
-                .stored_field_blocks(Some(doc_id.get()), Some(doc_id.get()))
-                .await?;
-            self.statistics.stored_field_blocks_decoded(
-                u64::try_from(blocks.len()).map_err(|_| IndexError::OffsetOverflow)?,
-            );
-            if blocks.is_empty() {
-                return Ok(Vec::new());
-            }
-            self.stored = Some(one(
-                blocks,
-                "stored-field DocId resolved to multiple blocks",
-            )?);
-        }
-        Ok(self
-            .stored
-            .as_ref()
-            .and_then(|block| block.get(doc_id))
-            .map(<[u8]>::to_vec)
-            .unwrap_or_default())
-    }
-
     /// Release disposable decoded blocks without changing the segment or
     /// cursor authority. The next lookup reopens the exact immutable block.
     pub(super) fn release_decoded(&mut self) {
         self.identity = None;
         self.live = None;
-        self.columns.clear();
+        self.doc_values.clear();
         self.norms.clear();
         self.vectors.clear();
-        self.stored = None;
     }
 }
 
-fn matches_value(cell: &FastColumnCell, value: &ScalarValue) -> bool {
+fn matches_value(cell: &DocValueCell, value: &ScalarValue) -> bool {
     match value {
         ScalarValue::Null => cell.present && cell.null,
         value => cell.values.iter().any(|candidate| candidate == value),
@@ -331,11 +303,6 @@ fn in_range(value: &ScalarValue, lower: Option<&RangeBound>, upper: Option<&Rang
 fn norm_contains(block: &NormBlock, doc_id: DocId) -> bool {
     let offset = doc_id.get().checked_sub(block.first_doc_id.get());
     offset.is_some_and(|offset| offset < block.values().len() as u32)
-}
-
-fn stored_contains(block: &StoredFieldsBlock, doc_id: DocId) -> bool {
-    let offset = doc_id.get().checked_sub(block.first_doc_id.get());
-    offset.is_some_and(|offset| offset < block.document_count() as u32)
 }
 
 fn one<T>(mut values: Vec<T>, message: &'static str) -> Result<T, IndexError> {

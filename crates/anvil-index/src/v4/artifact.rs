@@ -299,19 +299,19 @@ pub fn definition_path(name: &str) -> Result<String, IndexError> {
             "index definition name must be one non-empty path segment".into(),
         ));
     }
-    Ok(format!("_anvil/indexes/v4/definitions/{name}"))
+    Ok(format!("_anvil/indices/v4/definitions/{name}"))
 }
 
 pub fn artifact_path(index_id: u64, hash: [u8; 32]) -> String {
-    format!("_anvil/indexes/v4/{index_id}/artifacts/{}", hex(hash))
+    format!("_anvil/indices/v4/{index_id}/artifacts/{}", hex(hash))
 }
 
 pub fn manifest_path(index_id: u64, hash: [u8; 32]) -> String {
-    format!("_anvil/indexes/v4/{index_id}/manifests/{}", hex(hash))
+    format!("_anvil/indices/v4/{index_id}/manifests/{}", hex(hash))
 }
 
 pub fn current_path(index_id: u64) -> String {
-    format!("_anvil/indexes/v4/{index_id}/current")
+    format!("_anvil/indices/v4/{index_id}/current")
 }
 
 fn hex(hash: [u8; 32]) -> String {
@@ -348,7 +348,7 @@ mod tests {
         assert!(
             ArtifactDescriptor::new(
                 3,
-                "_anvil/indexes/v4/03/artifacts/no".into(),
+                "_anvil/indices/v4/03/artifacts/no".into(),
                 1,
                 [7; 32],
                 130,
@@ -367,10 +367,10 @@ mod tests {
     fn reserved_paths_are_canonical() {
         assert_eq!(
             definition_path("search").unwrap(),
-            "_anvil/indexes/v4/definitions/search"
+            "_anvil/indices/v4/definitions/search"
         );
         assert!(definition_path("a/b").is_err());
-        assert_eq!(current_path(12), "_anvil/indexes/v4/12/current");
+        assert_eq!(current_path(12), "_anvil/indices/v4/12/current");
         assert!(manifest_path(12, [0; 32]).ends_with(&"0".repeat(64)));
     }
 

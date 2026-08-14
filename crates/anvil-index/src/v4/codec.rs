@@ -1,13 +1,9 @@
 use crate::IndexError;
 
 use super::model::{ComponentKind, INDEX_COMPONENT_BYTES, INDEX_DECODE_BYTES, SegmentIdentity};
-use super::stored_fields::{
-    MAX_STORED_FIELDS_PAYLOAD_BYTES, STORED_FIELDS_COMPONENT_CODEC_VERSION,
-};
 
 const COMPONENT_MAGIC: &[u8; 8] = b"ANVLIDX4";
 pub const COMPONENT_HEADER_BYTES: usize = 120;
-const COMPONENT_FLAG_LZ4_BLOCK: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ComponentHeader {
@@ -48,25 +44,10 @@ impl ComponentHeader {
                 limit: INDEX_COMPONENT_BYTES,
             });
         }
-        if self.component_kind == ComponentKind::STORED_FIELDS
-            && self.codec_version == STORED_FIELDS_COMPONENT_CODEC_VERSION
-        {
-            if logical > MAX_STORED_FIELDS_PAYLOAD_BYTES {
-                return Err(IndexError::ResourceLimit {
-                    needed: logical,
-                    limit: MAX_STORED_FIELDS_PAYLOAD_BYTES,
-                });
-            }
-            match self.flags {
-                0 if encoded == logical => {}
-                COMPONENT_FLAG_LZ4_BLOCK if encoded < logical => {}
-                0 | COMPONENT_FLAG_LZ4_BLOCK => {
-                    return Err(IndexError::InvalidFormat("stored-fields component lengths"));
-                }
-                _ => {
-                    return Err(IndexError::InvalidFormat("stored-fields component flags"));
-                }
-            }
+        if self.flags != 0 || encoded != logical {
+            return Err(IndexError::InvalidFormat(
+                "format-v4 component flags or lengths",
+            ));
         }
         Ok(())
     }
@@ -182,42 +163,15 @@ pub fn decode_component<'a>(
     Ok(DecodedComponent { header, payload })
 }
 
-/// Prepare one independently routed logical component payload. Stored fields
-/// use bounded LZ4 blocks only when doing so reduces the bytes written; every
-/// other component remains byte-for-byte raw.
+/// Prepare one independently routed logical component payload. Every native
+/// component codec owns its compression; the common envelope remains raw.
 pub(crate) fn prepare_component_payload(
-    component_kind: ComponentKind,
-    codec_version: u16,
+    _component_kind: ComponentKind,
+    _codec_version: u16,
     payload: Vec<u8>,
 ) -> Result<(u32, u64, Vec<u8>), IndexError> {
     let logical_length = u64::try_from(payload.len()).map_err(|_| IndexError::OffsetOverflow)?;
-    if component_kind != ComponentKind::STORED_FIELDS {
-        return Ok((0, logical_length, payload));
-    }
-    if codec_version != STORED_FIELDS_COMPONENT_CODEC_VERSION {
-        return Err(IndexError::InvalidDefinition(
-            "stored-fields component requires codec version 2".into(),
-        ));
-    }
-    if payload.len() > MAX_STORED_FIELDS_PAYLOAD_BYTES {
-        return Err(IndexError::ResourceLimit {
-            needed: payload.len(),
-            limit: MAX_STORED_FIELDS_PAYLOAD_BYTES,
-        });
-    }
-    if payload.is_empty() {
-        return Ok((0, logical_length, payload));
-    }
-    let maximum = lz4_flex::block::get_maximum_output_size(payload.len());
-    let mut compressed = vec![0u8; maximum];
-    let encoded = lz4_flex::block::compress_into(&payload, &mut compressed)
-        .map_err(|error| IndexError::Encode(error.to_string()))?;
-    compressed.truncate(encoded);
-    if compressed.len() < payload.len() {
-        Ok((COMPONENT_FLAG_LZ4_BLOCK, logical_length, compressed))
-    } else {
-        Ok((0, logical_length, payload))
-    }
+    Ok((0, logical_length, payload))
 }
 
 /// Materialize the checked logical payload after the ordinary-object range,
@@ -226,48 +180,13 @@ pub(crate) fn materialize_component_payload(
     header: ComponentHeader,
     payload: &[u8],
 ) -> Result<Vec<u8>, IndexError> {
-    if header.component_kind != ComponentKind::STORED_FIELDS {
-        return Ok(payload.to_vec());
-    }
-    if header.codec_version != STORED_FIELDS_COMPONENT_CODEC_VERSION {
+    let logical = usize::try_from(header.logical_length).map_err(|_| IndexError::OffsetOverflow)?;
+    if header.flags != 0 || payload.len() != logical {
         return Err(IndexError::InvalidFormat(
-            "stored-fields component codec version",
+            "format-v4 component materialization length",
         ));
     }
-    let logical = usize::try_from(header.logical_length).map_err(|_| IndexError::OffsetOverflow)?;
-    if logical > MAX_STORED_FIELDS_PAYLOAD_BYTES {
-        return Err(IndexError::ResourceLimit {
-            needed: logical,
-            limit: MAX_STORED_FIELDS_PAYLOAD_BYTES,
-        });
-    }
-    match header.flags {
-        0 => {
-            if payload.len() != logical {
-                return Err(IndexError::InvalidFormat(
-                    "stored-fields raw payload length",
-                ));
-            }
-            Ok(payload.to_vec())
-        }
-        COMPONENT_FLAG_LZ4_BLOCK => {
-            if payload.len() >= logical {
-                return Err(IndexError::InvalidFormat(
-                    "stored-fields compressed payload length",
-                ));
-            }
-            let mut decoded = vec![0u8; logical];
-            let written = lz4_flex::block::decompress_into(payload, &mut decoded)
-                .map_err(|error| IndexError::Decode(error.to_string()))?;
-            if written != logical {
-                return Err(IndexError::InvalidFormat(
-                    "stored-fields decoded payload length",
-                ));
-            }
-            Ok(decoded)
-        }
-        _ => Err(IndexError::InvalidFormat("stored-fields component flags")),
-    }
+    Ok(payload.to_vec())
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, IndexError> {
@@ -540,90 +459,21 @@ mod tests {
     }
 
     #[test]
-    fn stored_fields_choose_smaller_lz4_or_raw_and_round_trip() {
-        let repetitive = vec![0x5a; 64 * 1024];
-        let (flags, logical, encoded) = prepare_component_payload(
-            ComponentKind::STORED_FIELDS,
-            STORED_FIELDS_COMPONENT_CODEC_VERSION,
-            repetitive.clone(),
-        )
-        .unwrap();
-        assert_eq!(flags, COMPONENT_FLAG_LZ4_BLOCK);
-        assert!(encoded.len() < repetitive.len());
-        let component = encode_component(
-            identity(),
-            ComponentKind::STORED_FIELDS,
-            STORED_FIELDS_COMPONENT_CODEC_VERSION,
-            flags,
-            logical,
-            encoded,
-        )
-        .unwrap();
-        let decoded = decode_component(
-            component.bytes(),
-            identity(),
-            ComponentKind::STORED_FIELDS,
-            STORED_FIELDS_COMPONENT_CODEC_VERSION,
-        )
-        .unwrap();
-        assert_eq!(
-            materialize_component_payload(decoded.header, decoded.payload).unwrap(),
-            repetitive
-        );
-
-        let tiny = vec![1, 2, 3];
-        let (flags, logical, encoded) = prepare_component_payload(
-            ComponentKind::STORED_FIELDS,
-            STORED_FIELDS_COMPONENT_CODEC_VERSION,
-            tiny.clone(),
-        )
-        .unwrap();
+    fn common_envelope_is_raw_and_rejects_flags() {
+        let payload = vec![0x5a; 64 * 1024];
+        let (flags, logical, encoded) =
+            prepare_component_payload(ComponentKind::DOC_VALUES, 1, payload.clone()).unwrap();
         assert_eq!(flags, 0);
-        assert_eq!(encoded, tiny);
-        assert_eq!(logical, 3);
-    }
-
-    #[test]
-    fn stored_fields_compression_metadata_fails_closed() {
-        let malformed = encode_component(
+        assert_eq!(logical, payload.len() as u64);
+        assert_eq!(encoded, payload);
+        assert!(encode_component(
             identity(),
-            ComponentKind::STORED_FIELDS,
-            STORED_FIELDS_COMPONENT_CODEC_VERSION,
-            COMPONENT_FLAG_LZ4_BLOCK,
-            100,
-            vec![0xff; 4],
+            ComponentKind::DOC_VALUES,
+            1,
+            1,
+            4,
+            vec![0; 4],
         )
-        .unwrap();
-        let decoded = decode_component(
-            malformed.bytes(),
-            identity(),
-            ComponentKind::STORED_FIELDS,
-            STORED_FIELDS_COMPONENT_CODEC_VERSION,
-        )
-        .unwrap();
-        assert!(materialize_component_payload(decoded.header, decoded.payload).is_err());
-
-        assert!(
-            encode_component(
-                identity(),
-                ComponentKind::STORED_FIELDS,
-                STORED_FIELDS_COMPONENT_CODEC_VERSION,
-                2,
-                8,
-                vec![0; 4],
-            )
-            .is_err()
-        );
-        assert!(
-            encode_component(
-                identity(),
-                ComponentKind::STORED_FIELDS,
-                STORED_FIELDS_COMPONENT_CODEC_VERSION,
-                0,
-                (MAX_STORED_FIELDS_PAYLOAD_BYTES + 1) as u64,
-                vec![0; MAX_STORED_FIELDS_PAYLOAD_BYTES + 1],
-            )
-            .is_err()
-        );
+        .is_err());
     }
 }

@@ -7,9 +7,10 @@ use crate::IndexError;
 
 use super::super::postings::DecodedPostingBlock;
 use super::super::{
-    ArtifactDescriptor, ArtifactDirectoryRead, ComponentKind, ComponentStream, DocId, FieldId,
-    NativeQueryStatisticsRecorder, PostingImpact, PostingReference, SegmentDescriptor, StreamLeaf,
-    TermDictionary, component_ordinal_key, read_artifact_component,
+    ArtifactDescriptor, ArtifactDirectoryRead, ComponentKind, ComponentStream, DocId,
+    DocValueBlock, FieldId, NativeQueryStatisticsRecorder, PointBlock, PointValue, PostingImpact,
+    PostingReference, RangeBound, ScalarValue, SegmentDescriptor, StreamLeaf, TermDictionary,
+    component_ordinal_key, read_artifact_component,
 };
 
 type CursorFuture<'a> =
@@ -289,6 +290,298 @@ pub(super) struct TermRangeStream<'a, D> {
     statistics: NativeQueryStatisticsRecorder,
 }
 
+#[derive(Clone)]
+pub(super) struct PointBounds {
+    lower: Option<RangeBound>,
+    upper: Option<RangeBound>,
+    presence: bool,
+}
+
+impl PointBounds {
+    pub(super) fn new(
+        lower: Option<RangeBound>,
+        upper: Option<RangeBound>,
+    ) -> Result<Self, IndexError> {
+        if lower.is_none() && upper.is_none() {
+            return Err(IndexError::InvalidQuery("point range requires a bound".into()));
+        }
+        if let (Some(lower), Some(upper)) = (&lower, &upper)
+            && (std::mem::discriminant(&lower.value) != std::mem::discriminant(&upper.value)
+                || lower.value > upper.value)
+        {
+            return Err(IndexError::InvalidQuery("point range bounds are reversed".into()));
+        }
+        Ok(Self { lower, upper, presence: false })
+    }
+
+    pub(super) fn presence() -> Self {
+        Self { lower: None, upper: None, presence: true }
+    }
+
+    fn contains(&self, value: &PointValue) -> bool {
+        if self.presence {
+            return value == &PointValue::Presence;
+        }
+        let PointValue::Value(value) = value else {
+            return false;
+        };
+        self.lower.as_ref().is_none_or(|bound| {
+            std::mem::discriminant(value) == std::mem::discriminant(&bound.value)
+                && (value > &bound.value || bound.inclusive && value == &bound.value)
+        }) && self.upper.as_ref().is_none_or(|bound| {
+            std::mem::discriminant(value) == std::mem::discriminant(&bound.value)
+                && (value < &bound.value || bound.inclusive && value == &bound.value)
+        })
+    }
+}
+
+pub(super) struct PointRangeStream<'a, D> {
+    directory: &'a D,
+    segment: &'a SegmentDescriptor,
+    field_id: FieldId,
+    root: ArtifactDescriptor,
+    bounds: PointBounds,
+    next_minimum: u32,
+    batch: Vec<DocId>,
+    position: usize,
+    current: Option<DocId>,
+    exhausted: bool,
+    estimated_documents: u64,
+    statistics: NativeQueryStatisticsRecorder,
+}
+
+impl<'a, D: ArtifactDirectoryRead> PointRangeStream<'a, D> {
+    pub(super) fn new(
+        directory: &'a D,
+        segment: &'a SegmentDescriptor,
+        field_id: FieldId,
+        bounds: PointBounds,
+        statistics: NativeQueryStatisticsRecorder,
+    ) -> Result<Self, IndexError> {
+        Ok(Self {
+            directory,
+            segment,
+            field_id,
+            root: component_root(segment, ComponentKind::POINTS, Some(field_id))?,
+            bounds,
+            next_minimum: 0,
+            batch: Vec::new(),
+            position: 0,
+            current: None,
+            exhausted: false,
+            estimated_documents: u64::from(segment.document_count),
+            statistics,
+        })
+    }
+
+    async fn prepare_batch(&mut self) -> Result<(), IndexError> {
+        self.batch.clear();
+        self.position = 0;
+        self.current = None;
+        if self.exhausted || self.next_minimum >= self.segment.document_count {
+            self.exhausted = true;
+            return Ok(());
+        }
+        let (minimum, maximum) = if self.bounds.presence {
+            let key = super::super::point_presence_key(self.field_id)?;
+            (Some(key.clone()), Some(key))
+        } else {
+            (
+                self.bounds.lower.as_ref()
+                    .map(|bound| super::super::point_scalar_key(self.field_id, &bound.value))
+                    .transpose()?,
+                self.bounds.upper.as_ref()
+                    .map(|bound| super::super::point_scalar_key(self.field_id, &bound.value))
+                    .transpose()?,
+            )
+        };
+        let mut stream = ComponentStream::new(
+            self.directory,
+            self.segment.identity,
+            ComponentKind::POINTS,
+            self.root.clone(),
+            minimum,
+            maximum,
+        )?;
+        let mut candidates = BTreeSet::new();
+        while let Some(leaf) = stream.next_leaf().await? {
+            let loaded = read_artifact_component(
+                self.directory,
+                self.segment.identity,
+                &leaf.descriptor,
+                ComponentKind::POINTS,
+            )
+            .await?;
+            self.statistics.point_blocks_decoded(1);
+            let block = self
+                .directory
+                .run_query_cpu(move || PointBlock::decode_payload(&loaded.payload))
+                .await?;
+            if block.field_id != self.field_id {
+                return Err(IndexError::InvalidFormat("point field identity"));
+            }
+            for entry in block.entries() {
+                if entry.doc_id.get() < self.next_minimum || !self.bounds.contains(&entry.value) {
+                    continue;
+                }
+                candidates.insert(entry.doc_id);
+                if candidates.len() > TERM_RANGE_DOCUMENT_BATCH {
+                    candidates.pop_last();
+                }
+            }
+        }
+        if candidates.is_empty() {
+            self.exhausted = true;
+            return Ok(());
+        }
+        self.batch.extend(candidates);
+        self.next_minimum = self
+            .batch
+            .last()
+            .copied()
+            .ok_or(IndexError::InvalidFormat("empty point document batch"))?
+            .checked_next()?
+            .get();
+        Ok(())
+    }
+
+    async fn next(&mut self) -> Result<Option<DocId>, IndexError> {
+        if self.position == self.batch.len() {
+            self.prepare_batch().await?;
+        }
+        let Some(value) = self.batch.get(self.position).copied() else {
+            self.current = None;
+            return Ok(None);
+        };
+        self.position += 1;
+        self.current = Some(value);
+        Ok(Some(value))
+    }
+
+    async fn advance(&mut self, target: DocId) -> Result<Option<DocId>, IndexError> {
+        if self.current.is_some_and(|current| current >= target) {
+            return Ok(self.current);
+        }
+        let remaining = &self.batch[self.position..];
+        let offset = remaining.partition_point(|value| *value < target);
+        if let Some(value) = remaining.get(offset).copied() {
+            self.position += offset + 1;
+            self.current = Some(value);
+            return Ok(Some(value));
+        }
+        self.next_minimum = self.next_minimum.max(target.get());
+        self.batch.clear();
+        self.position = 0;
+        self.current = None;
+        self.next().await
+    }
+}
+
+pub(super) struct DocValuePresenceStream<'a, D> {
+    directory: &'a D,
+    segment: &'a SegmentDescriptor,
+    field_id: FieldId,
+    stream: ComponentStream<'a, D>,
+    block: Option<DocValueBlock>,
+    offset: usize,
+    current: Option<DocId>,
+    statistics: NativeQueryStatisticsRecorder,
+}
+
+impl<'a, D: ArtifactDirectoryRead> DocValuePresenceStream<'a, D> {
+    pub(super) fn new(
+        directory: &'a D,
+        segment: &'a SegmentDescriptor,
+        field_id: FieldId,
+        statistics: NativeQueryStatisticsRecorder,
+    ) -> Result<Self, IndexError> {
+        let root = component_root(segment, ComponentKind::DOC_VALUES, Some(field_id))?;
+        Ok(Self {
+            directory,
+            segment,
+            field_id,
+            stream: ComponentStream::new(
+                directory,
+                segment.identity,
+                ComponentKind::DOC_VALUES,
+                root,
+                None,
+                None,
+            )?,
+            block: None,
+            offset: 0,
+            current: None,
+            statistics,
+        })
+    }
+
+    async fn load(&mut self) -> Result<bool, IndexError> {
+        let Some(leaf) = self.stream.next_leaf().await? else {
+            self.block = None;
+            return Ok(false);
+        };
+        let loaded = read_artifact_component(
+            self.directory,
+            self.segment.identity,
+            &leaf.descriptor,
+            ComponentKind::DOC_VALUES,
+        )
+        .await?;
+        self.statistics.doc_value_blocks_decoded(1);
+        let block = self
+            .directory
+            .run_query_cpu(move || DocValueBlock::decode_payload(&loaded.payload))
+            .await?;
+        if block.field_id != self.field_id {
+            return Err(IndexError::InvalidFormat("doc-value field identity"));
+        }
+        self.block = Some(block);
+        self.offset = 0;
+        Ok(true)
+    }
+
+    async fn next(&mut self) -> Result<Option<DocId>, IndexError> {
+        loop {
+            if self.block.is_none() && !self.load().await? {
+                self.current = None;
+                return Ok(None);
+            }
+            let block = self.block.as_ref().expect("loaded doc-value block");
+            while self.offset < block.cells().len() {
+                let offset = self.offset;
+                self.offset += 1;
+                if block.cells()[offset].present {
+                    let doc = block
+                        .first_doc_id
+                        .get()
+                        .checked_add(u32::try_from(offset).map_err(|_| IndexError::OffsetOverflow)?)
+                        .ok_or(IndexError::OffsetOverflow)?;
+                    self.current = Some(DocId::new(doc));
+                    return Ok(self.current);
+                }
+            }
+            self.block = None;
+        }
+    }
+
+    async fn advance(&mut self, target: DocId) -> Result<Option<DocId>, IndexError> {
+        if self.current.is_some_and(|current| current >= target) {
+            return Ok(self.current);
+        }
+        loop {
+            let Some(block) = self.block.as_ref() else {
+                return self.next().await;
+            };
+            let target_offset = target.get().saturating_sub(block.first_doc_id.get()) as usize;
+            self.offset = self.offset.max(target_offset.min(block.cells().len()));
+            match self.next().await? {
+                Some(doc) if doc < target => continue,
+                value => return Ok(value),
+            }
+        }
+    }
+}
+
 impl<'a, D: ArtifactDirectoryRead> TermRangeStream<'a, D> {
     pub(super) fn new(
         directory: &'a D,
@@ -433,6 +726,8 @@ pub(super) enum DocCursor<'a, D> {
     All { next: u32, end: u32 },
     Posting(PostingStream<'a, D>),
     TermRange(TermRangeStream<'a, D>),
+    PointRange(PointRangeStream<'a, D>),
+    DocValuePresence(DocValuePresenceStream<'a, D>),
     And(AndCursor<'a, D>),
     Or(OrCursor<'a, D>),
     Not(NotCursor<'a, D>),
@@ -537,6 +832,8 @@ impl<'a, D: ArtifactDirectoryRead> DocCursor<'a, D> {
             Self::All { next, end } => u64::from(end.saturating_sub(*next)),
             Self::Posting(cursor) => cursor.estimated_documents,
             Self::TermRange(cursor) => cursor.estimated_documents,
+            Self::PointRange(cursor) => cursor.estimated_documents,
+            Self::DocValuePresence(cursor) => u64::from(cursor.segment.document_count),
             Self::And(cursor) => cursor.estimated_documents,
             Self::Or(cursor) => cursor.estimated_documents,
             Self::Not(cursor) => cursor.estimated_documents,
@@ -557,6 +854,8 @@ impl<'a, D: ArtifactDirectoryRead> DocCursor<'a, D> {
                 }
                 Self::Posting(cursor) => cursor.next().await,
                 Self::TermRange(cursor) => cursor.next().await,
+                Self::PointRange(cursor) => cursor.next().await,
+                Self::DocValuePresence(cursor) => cursor.next().await,
                 Self::And(cursor) => cursor.next().await,
                 Self::Or(cursor) => cursor.next().await,
                 Self::Not(cursor) => cursor.next().await,
@@ -579,6 +878,8 @@ impl<'a, D: ArtifactDirectoryRead> DocCursor<'a, D> {
                 }
                 Self::Posting(cursor) => cursor.advance(target).await,
                 Self::TermRange(cursor) => cursor.advance(target).await,
+                Self::PointRange(cursor) => cursor.advance(target).await,
+                Self::DocValuePresence(cursor) => cursor.advance(target).await,
                 Self::And(cursor) => cursor.advance(target).await,
                 Self::Or(cursor) => cursor.advance(target).await,
                 Self::Not(cursor) => cursor.advance(target).await,
@@ -588,7 +889,11 @@ impl<'a, D: ArtifactDirectoryRead> DocCursor<'a, D> {
 
     pub(super) fn release_decoded(&mut self) -> Result<(), IndexError> {
         match self {
-            Self::Empty | Self::All { .. } | Self::TermRange(_) => Ok(()),
+            Self::Empty
+            | Self::All { .. }
+            | Self::TermRange(_)
+            | Self::PointRange(_)
+            | Self::DocValuePresence(_) => Ok(()),
             Self::Posting(cursor) => cursor.release_decoded(),
             Self::And(cursor) => cursor
                 .children

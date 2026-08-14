@@ -2,8 +2,8 @@ use crate::FIXED_INDEX_SEAL_WORKSPACE_BYTES;
 use crate::IndexError;
 
 use super::super::{
-    FastColumnCell, FieldId, INDEX_COMPONENT_BYTES, INDEX_ROUTING_KEY_BYTES, ObjectIdentity,
-    ScalarValue,
+    DocValueCell, FieldId, INDEX_COMPONENT_BYTES, INDEX_ROUTING_KEY_BYTES, INDEX_TERM_BYTES,
+    ObjectIdentity, ScalarValue,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -84,7 +84,7 @@ impl ProjectedTerm {
     fn validate(&self) -> Result<(), IndexError> {
         if self.term_type == 0
             || self.term.is_empty()
-            || self.term.len().saturating_add(5) > INDEX_ROUTING_KEY_BYTES
+            || self.term.len() > INDEX_TERM_BYTES
             || self.frequency == 0
             || !self.positions.is_empty() && self.positions.len() != self.frequency as usize
             || self.positions.windows(2).any(|pair| pair[0] >= pair[1])
@@ -107,10 +107,18 @@ impl ProjectedTerm {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProjectedColumn {
+pub struct ProjectedDocValue {
     pub field_id: FieldId,
     pub multi_valued: bool,
-    pub cell: FastColumnCell,
+    pub cell: DocValueCell,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectedPoint {
+    pub field_id: FieldId,
+    /// True when the source field exists, including an explicit JSON null.
+    pub present: bool,
+    pub values: Vec<ScalarValue>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -125,8 +133,8 @@ pub struct ProjectedRecord {
     /// Canonical physical-order bytes. Empty means stable-identity order.
     pub order_key: Vec<u8>,
     pub terms: Vec<ProjectedTerm>,
-    pub columns: Vec<ProjectedColumn>,
-    pub stored_fields: Option<Vec<u8>>,
+    pub points: Vec<ProjectedPoint>,
+    pub doc_values: Vec<ProjectedDocValue>,
     pub vectors: Vec<ProjectedVector>,
     /// Token/field length used by full-text norms.
     pub field_lengths: Vec<(FieldId, u32)>,
@@ -142,7 +150,11 @@ impl ProjectedRecord {
         }
         if self.order_key.len() > INDEX_ROUTING_KEY_BYTES
             || self
-                .columns
+                .points
+                .windows(2)
+                .any(|pair| pair[0].field_id >= pair[1].field_id)
+            || self
+                .doc_values
                 .windows(2)
                 .any(|pair| pair[0].field_id >= pair[1].field_id)
             || self
@@ -154,7 +166,23 @@ impl ProjectedRecord {
                 "projected fields must be unique, ordered, and valid".into(),
             ));
         }
-        for column in &self.columns {
+        for point in &self.points {
+            if !point.present
+                || point.values.iter().any(|value| {
+                    !matches!(
+                        value,
+                        ScalarValue::Signed(_)
+                            | ScalarValue::Unsigned(_)
+                            | ScalarValue::Number(_)
+                    )
+                })
+            {
+                return Err(IndexError::InvalidDefinition(
+                    "projected point values must be present and numeric".into(),
+                ));
+            }
+        }
+        for column in &self.doc_values {
             column.cell.validate(column.multi_valued)?;
         }
         let mut previous_vector = None;
@@ -175,9 +203,7 @@ impl ProjectedRecord {
     pub(crate) fn retained_capacity_bytes(&self) -> Result<usize, IndexError> {
         let mut bytes = self
             .order_key
-            .capacity()
-            .checked_add(self.stored_fields.as_ref().map_or(0, Vec::capacity))
-            .ok_or(IndexError::OffsetOverflow)?;
+            .capacity();
         if let Some(result) = &self.result_identity {
             bytes = bytes
                 .checked_add(result.path.capacity())
@@ -192,9 +218,16 @@ impl ProjectedRecord {
             )
             .and_then(|bytes| {
                 bytes.checked_add(
-                    self.columns
+                    self.points
                         .capacity()
-                        .checked_mul(std::mem::size_of::<ProjectedColumn>())?,
+                        .checked_mul(std::mem::size_of::<ProjectedPoint>())?,
+                )
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    self.doc_values
+                        .capacity()
+                        .checked_mul(std::mem::size_of::<ProjectedDocValue>())?,
                 )
             })
             .and_then(|bytes| {
@@ -224,7 +257,18 @@ impl ProjectedRecord {
                 })
                 .ok_or(IndexError::OffsetOverflow)?;
         }
-        for column in &self.columns {
+        for point in &self.points {
+            bytes = bytes
+                .checked_add(
+                    point
+                        .values
+                        .capacity()
+                        .checked_mul(std::mem::size_of::<ScalarValue>())
+                        .ok_or(IndexError::OffsetOverflow)?,
+                )
+                .ok_or(IndexError::OffsetOverflow)?;
+        }
+        for column in &self.doc_values {
             bytes = bytes
                 .checked_add(
                     column

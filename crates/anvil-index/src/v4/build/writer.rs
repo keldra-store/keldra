@@ -9,13 +9,13 @@ mod tests;
 use crate::IndexError;
 
 use self::layout::{
-    WriterCharge, build_document_layout, build_source_doc_refs, build_term_refs,
+    WriterCharge, build_document_layout, build_point_refs, build_source_doc_refs, build_term_refs,
     charged_vec_capacity,
 };
 use self::statistics::StatisticsAccumulator;
 use self::streams::{
-    publish_fast_columns, publish_identities, publish_live_mask, publish_locator, publish_norms,
-    publish_stored_fields, publish_vectors,
+    publish_doc_values, publish_identities, publish_live_mask, publish_locator, publish_norms,
+    publish_points, publish_vectors,
 };
 use self::terms::publish_terms;
 use super::super::{
@@ -252,17 +252,21 @@ impl NativeSegmentWriter {
         .await?;
         drop(term_references);
 
-        publish_fast_columns(
+        let point_references =
+            build_point_refs(&self.sources, &documents, self.charge.point_count())?;
+        publish_points(
             sink,
             self.identity,
             &self.schema,
             routing_codec,
             &self.sources,
             &documents,
+            &point_references,
             &mut assembly,
         )
         .await?;
-        publish_stored_fields(
+        drop(point_references);
+        publish_doc_values(
             sink,
             self.identity,
             &self.schema,
@@ -419,11 +423,15 @@ fn validate_record_schema(schema: &Schema, record: &ProjectedRecord) -> Result<(
             ));
         }
     }
-    for column in &record.columns {
-        let field = require_field_component(schema, column.field_id, FieldComponents::FAST_COLUMN)?;
+    for point in &record.points {
+        require_field_component(schema, point.field_id, FieldComponents::POINTS)?;
+    }
+    for column in &record.doc_values {
+        let field =
+            require_field_component(schema, column.field_id, FieldComponents::DOC_VALUES)?;
         if column.multi_valued != (field.cardinality == super::super::Cardinality::Multi) {
             return Err(IndexError::InvalidDefinition(
-                "projected column cardinality differs from its schema".into(),
+                "projected doc-value cardinality differs from its schema".into(),
             ));
         }
     }
@@ -446,16 +454,6 @@ fn validate_record_schema(schema: &Schema, record: &ProjectedRecord) -> Result<(
     }
     for (field_id, _) in &record.field_lengths {
         require_field_component(schema, *field_id, FieldComponents::NORMS)?;
-    }
-    if record.stored_fields.is_some()
-        && !schema
-            .fields
-            .iter()
-            .any(|field| field.components.contains(FieldComponents::STORED))
-    {
-        return Err(IndexError::InvalidDefinition(
-            "stored projection has no stored schema field".into(),
-        ));
     }
     Ok(())
 }

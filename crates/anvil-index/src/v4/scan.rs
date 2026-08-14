@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::IndexError;
 
-use super::columns::{FastColumnCell, ScalarValue};
-use super::model::{INDEX_DECODE_BYTES, INDEX_ROUTING_KEY_BYTES};
+use super::columns::{DocValueCell, ScalarValue};
+use super::model::{INDEX_DECODE_BYTES, INDEX_ROUTING_KEY_BYTES, INDEX_TERM_BYTES};
 use super::schema::{FieldId, OrderField};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -53,6 +53,16 @@ pub enum Predicate {
         id: PredicateId,
         field_id: FieldId,
     },
+    FullText {
+        id: PredicateId,
+        field_id: FieldId,
+        text: String,
+    },
+    Phrase {
+        id: PredicateId,
+        field_id: FieldId,
+        text: String,
+    },
     And(Vec<Predicate>),
     Or(Vec<Predicate>),
     Not(Box<Predicate>),
@@ -69,7 +79,9 @@ impl Predicate {
             | Self::In { id, .. }
             | Self::Prefix { id, .. }
             | Self::Range { id, .. }
-            | Self::Exists { id, .. } => Some(*id),
+            | Self::Exists { id, .. }
+            | Self::FullText { id, .. }
+            | Self::Phrase { id, .. } => Some(*id),
             Self::And(_) | Self::Or(_) | Self::Not(_) => None,
         }
     }
@@ -87,7 +99,7 @@ impl Predicate {
                 "IN predicate requires at least one value".into(),
             )),
             Self::Prefix { prefix, .. }
-                if prefix.is_empty() || prefix.len() > INDEX_ROUTING_KEY_BYTES =>
+                if prefix.is_empty() || prefix.len() > INDEX_TERM_BYTES =>
             {
                 Err(IndexError::InvalidQuery(
                     "prefix predicate is empty or too long".into(),
@@ -96,6 +108,11 @@ impl Predicate {
             Self::Range { lower, upper, .. } if lower.is_none() && upper.is_none() => Err(
                 IndexError::InvalidQuery("range predicate requires a bound".into()),
             ),
+            Self::FullText { text, .. } | Self::Phrase { text, .. } if text.trim().is_empty() => {
+                Err(IndexError::InvalidQuery(
+                    "full-text predicate must not be empty".into(),
+                ))
+            }
             Self::And(children) | Self::Or(children) => {
                 if children.is_empty() {
                     return Err(IndexError::InvalidQuery(
@@ -155,7 +172,7 @@ pub struct SortCursor {
 pub struct ScanRequest {
     pub generation: GenerationSelection,
     pub authorization_scope: AuthorizationScope,
-    pub projected_field_ids: Vec<FieldId>,
+    pub required_doc_value_field_ids: Vec<FieldId>,
     pub predicate_expression: Option<Predicate>,
     pub required_order: Vec<OrderField>,
     pub after: Option<SortCursor>,
@@ -184,12 +201,12 @@ impl ScanRequest {
             ));
         }
         if self
-            .projected_field_ids
+            .required_doc_value_field_ids
             .iter()
             .copied()
             .collect::<BTreeSet<_>>()
             .len()
-            != self.projected_field_ids.len()
+            != self.required_doc_value_field_ids.len()
         {
             return Err(IndexError::InvalidQuery(
                 "scan projection FieldIds must be unique".into(),
@@ -237,7 +254,7 @@ pub struct ScanCapabilities {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScanColumn {
     pub field_id: FieldId,
-    pub cells: Vec<FastColumnCell>,
+    pub cells: Vec<DocValueCell>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -177,7 +177,11 @@ impl FieldSchema {
                     FieldCapabilities::EXACT.union(FieldCapabilities::FACET),
                     "Boolean",
                 )?;
-                FieldComponents::TERMS
+                if capabilities.contains(FieldCapabilities::EXACT) {
+                    FieldComponents::TERMS
+                } else {
+                    FieldComponents(0)
+                }
             }
             FieldType::SignedInteger | FieldType::UnsignedInteger | FieldType::Float => {
                 reject_capabilities(
@@ -207,7 +211,14 @@ impl FieldSchema {
                         .union(FieldCapabilities::FACET),
                     "keyword",
                 )?;
-                FieldComponents::TERMS
+                if capabilities.contains(FieldCapabilities::EXACT)
+                    || capabilities.contains(FieldCapabilities::PREFIX)
+                    || capabilities.contains(FieldCapabilities::RANGE)
+                {
+                    FieldComponents::TERMS
+                } else {
+                    FieldComponents(0)
+                }
             }
             FieldType::Text => {
                 if capabilities != FieldCapabilities::FULL_TEXT {

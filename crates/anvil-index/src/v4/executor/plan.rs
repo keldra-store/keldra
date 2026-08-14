@@ -5,13 +5,16 @@ use crate::IndexError;
 
 use super::super::{
     Analyzer, ArtifactDirectoryRead, ComponentKind, ComponentStream, FIELD_PRESENCE_TERM,
-    FieldComponents, FieldId, IndexKind, IndexSemantics, NativeQuery,
+    FieldCapabilities, FieldComponents, FieldId, FieldType, IndexKind, IndexSemantics, NativeQuery,
     NativeQueryStatisticsRecorder, PostingReference, Predicate, RangeBound, ScalarValue, Schema,
     SegmentDescriptor, TERM_TYPE_FIELD_PRESENCE, TERM_TYPE_STRING, TERM_TYPE_TEXT, TermDictionary,
     analyze_unicode_alphanumeric_lowercase, canonical_term_key, read_artifact_component,
     scalar_term, text_term,
 };
-use super::posting::{DocCursor, PostingStream, TermBounds, TermRangeStream, component_root};
+use super::posting::{
+    DocCursor, PointBounds, PointRangeStream, PostingStream, TermBounds, TermRangeStream,
+    component_root,
+};
 
 pub(super) struct SegmentPlan<'a, D> {
     pub cursor: DocCursor<'a, D>,
@@ -80,6 +83,8 @@ pub(super) async fn plan_segment<'a, D: ArtifactDirectoryRead>(
             }
             if let Some(predicate) = predicate {
                 predicate.validate()?;
+                let mut text_terms = Vec::new();
+                let mut phrase_fields = Vec::new();
                 let cursor = plan_predicate(
                     directory,
                     segment,
@@ -87,9 +92,11 @@ pub(super) async fn plan_segment<'a, D: ArtifactDirectoryRead>(
                     predicate,
                     maximum_expanded_terms,
                     statistics.clone(),
+                    &mut text_terms,
+                    &mut phrase_fields,
                 )
                 .await?;
-                (cursor, Some(predicate), Vec::new(), Vec::new())
+                (cursor, None, text_terms, phrase_fields)
             } else {
                 (
                     DocCursor::all(segment.document_count),
@@ -251,16 +258,18 @@ fn plan_predicate<'a, D: ArtifactDirectoryRead>(
     predicate: &'a Predicate,
     maximum_expanded_terms: usize,
     statistics: NativeQueryStatisticsRecorder,
+    text_terms: &'a mut Vec<TextTermPlan>,
+    phrase_fields: &'a mut Vec<PhraseFieldPlan>,
 ) -> Pin<Box<dyn Future<Output = Result<DocCursor<'a, D>, IndexError>> + Send + 'a>> {
     Box::pin(async move {
         Ok(match predicate {
             Predicate::Equal {
                 field_id, value, ..
-            } => exact_scalar_cursor(directory, segment, *field_id, value, &statistics).await?,
+            } => exact_value_cursor(directory, segment, schema, *field_id, value, &statistics)
+                .await?,
             Predicate::In {
                 field_id, values, ..
             } => {
-                field(schema, *field_id, FieldComponents::TERMS)?;
                 if values.len() > maximum_expanded_terms {
                     return Err(IndexError::ResourceLimit {
                         needed: values.len(),
@@ -270,8 +279,15 @@ fn plan_predicate<'a, D: ArtifactDirectoryRead>(
                 let mut children = Vec::with_capacity(values.len());
                 for value in values {
                     children.push(
-                        exact_scalar_cursor(directory, segment, *field_id, value, &statistics)
-                            .await?,
+                        exact_value_cursor(
+                            directory,
+                            segment,
+                            schema,
+                            *field_id,
+                            value,
+                            &statistics,
+                        )
+                        .await?,
                     );
                 }
                 DocCursor::or(children, statistics.clone())
@@ -279,7 +295,12 @@ fn plan_predicate<'a, D: ArtifactDirectoryRead>(
             Predicate::Prefix {
                 field_id, prefix, ..
             } => {
-                field(schema, *field_id, FieldComponents::TERMS)?;
+                let field = field(schema, *field_id, FieldComponents::TERMS)?;
+                if !field.capabilities.contains(FieldCapabilities::PREFIX) {
+                    return Err(IndexError::InvalidQuery(
+                        "prefix predicate requires PREFIX".into(),
+                    ));
+                }
                 prefix_cursor(
                     directory,
                     segment,
@@ -295,21 +316,35 @@ fn plan_predicate<'a, D: ArtifactDirectoryRead>(
                 upper,
                 ..
             } => {
-                field(schema, *field_id, FieldComponents::TERMS)?;
-                range_cursor(
-                    directory,
-                    segment,
-                    *field_id,
-                    lower.as_ref(),
-                    upper.as_ref(),
-                    &statistics,
-                )?
+                let field = schema
+                    .fields
+                    .get(field_id.get() as usize)
+                    .ok_or_else(|| IndexError::InvalidQuery("unknown range field".into()))?;
+                if field.components.contains(FieldComponents::POINTS) {
+                    DocCursor::PointRange(PointRangeStream::new(
+                        directory,
+                        segment,
+                        *field_id,
+                        PointBounds::new(lower.clone(), upper.clone())?,
+                        statistics.clone(),
+                    )?)
+                } else {
+                    field(schema, *field_id, FieldComponents::TERMS)?;
+                    range_cursor(
+                        directory,
+                        segment,
+                        *field_id,
+                        lower.as_ref(),
+                        upper.as_ref(),
+                        &statistics,
+                    )?
+                }
             }
             Predicate::Exists { field_id, .. } => {
                 field(
                     schema,
                     *field_id,
-                    FieldComponents::TERMS.union(FieldComponents::FAST_COLUMN),
+                    FieldComponents::TERMS,
                 )?;
                 exact_term_cursor(
                     directory,
@@ -318,6 +353,22 @@ fn plan_predicate<'a, D: ArtifactDirectoryRead>(
                     TERM_TYPE_FIELD_PRESENCE,
                     FIELD_PRESENCE_TERM,
                     &statistics,
+                )
+                .await?
+            }
+            Predicate::FullText { field_id, text, .. }
+            | Predicate::Phrase { field_id, text, .. } => {
+                plan_text_field(
+                    directory,
+                    segment,
+                    schema,
+                    *field_id,
+                    text,
+                    matches!(predicate, Predicate::Phrase { .. }),
+                    maximum_expanded_terms,
+                    &statistics,
+                    text_terms,
+                    phrase_fields,
                 )
                 .await?
             }
@@ -332,6 +383,8 @@ fn plan_predicate<'a, D: ArtifactDirectoryRead>(
                             child,
                             maximum_expanded_terms,
                             statistics.clone(),
+                            text_terms,
+                            phrase_fields,
                         )
                         .await?,
                     );
@@ -355,6 +408,8 @@ fn plan_predicate<'a, D: ArtifactDirectoryRead>(
                             child,
                             maximum_expanded_terms,
                             statistics.clone(),
+                            text_terms,
+                            phrase_fields,
                         )
                         .await?,
                     );
@@ -370,6 +425,8 @@ fn plan_predicate<'a, D: ArtifactDirectoryRead>(
                     child,
                     maximum_expanded_terms,
                     statistics,
+                    text_terms,
+                    phrase_fields,
                 )
                 .await?,
             ),
@@ -493,6 +550,112 @@ async fn exact_scalar_cursor<'a, D: ArtifactDirectoryRead>(
     let (term_type, term) = scalar_term(value)
         .map_err(|_| IndexError::InvalidQuery("predicate scalar is invalid".into()))?;
     exact_term_cursor(directory, segment, field_id, term_type, &term, statistics).await
+}
+
+async fn exact_value_cursor<'a, D: ArtifactDirectoryRead>(
+    directory: &'a D,
+    segment: &'a SegmentDescriptor,
+    schema: &Schema,
+    field_id: FieldId,
+    value: &ScalarValue,
+    statistics: &NativeQueryStatisticsRecorder,
+) -> Result<DocCursor<'a, D>, IndexError> {
+    let field = schema
+        .fields
+        .get(field_id.get() as usize)
+        .ok_or_else(|| IndexError::InvalidQuery("unknown exact field".into()))?;
+    if field.components.contains(FieldComponents::POINTS) {
+        let bound = RangeBound {
+            value: value.clone(),
+            inclusive: true,
+        };
+        return Ok(DocCursor::PointRange(PointRangeStream::new(
+            directory,
+            segment,
+            field_id,
+            PointBounds::new(Some(bound.clone()), Some(bound))?,
+            statistics.clone(),
+        )?));
+    }
+    if !field.components.contains(FieldComponents::TERMS) {
+        return Err(IndexError::InvalidQuery(
+            "EXACT field has no exact access component".into(),
+        ));
+    }
+    exact_scalar_cursor(directory, segment, field_id, value, statistics).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn plan_text_field<'a, D: ArtifactDirectoryRead>(
+    directory: &'a D,
+    segment: &'a SegmentDescriptor,
+    schema: &Schema,
+    field_id: FieldId,
+    text: &str,
+    phrase: bool,
+    maximum_expanded_terms: usize,
+    statistics: &NativeQueryStatisticsRecorder,
+    text_terms: &mut Vec<TextTermPlan>,
+    phrase_fields: &mut Vec<PhraseFieldPlan>,
+) -> Result<DocCursor<'a, D>, IndexError> {
+    let field = schema
+        .fields
+        .get(field_id.get() as usize)
+        .ok_or_else(|| IndexError::InvalidQuery("unknown full-text field".into()))?;
+    if field.field_type != FieldType::Text
+        || !field.capabilities.contains(FieldCapabilities::FULL_TEXT)
+    {
+        return Err(IndexError::InvalidQuery(
+            "full-text predicate requires FULL_TEXT".into(),
+        ));
+    }
+    let analyzer = field.analyzer.ok_or_else(|| {
+        IndexError::InvalidDefinition("full-text field lacks an analyzer".into())
+    })?;
+    let tokens = analyze(analyzer, text, maximum_expanded_terms)?;
+    if tokens.is_empty() {
+        return Err(IndexError::InvalidQuery(
+            "full-text predicate contains no indexable terms".into(),
+        ));
+    }
+    let mut cursors = Vec::with_capacity(tokens.len());
+    let mut references = Vec::with_capacity(tokens.len());
+    for (token_ordinal, token) in tokens.iter().enumerate() {
+        let (_, term) = text_term(token)?;
+        let Some(resolved) = resolve_exact(
+            directory,
+            segment,
+            field_id,
+            TERM_TYPE_TEXT,
+            &term,
+            statistics,
+        )
+        .await?
+        else {
+            return Ok(DocCursor::Empty);
+        };
+        cursors.push(DocCursor::Posting(PostingStream::new(
+            directory,
+            segment,
+            field_id,
+            resolved.postings,
+            statistics.clone(),
+        )?));
+        text_terms.push(TextTermPlan {
+            field_id,
+            token_ordinal: u32::try_from(token_ordinal)
+                .map_err(|_| IndexError::OffsetOverflow)?,
+            postings: resolved.postings,
+        });
+        references.push(resolved.postings);
+    }
+    if phrase {
+        phrase_fields.push(PhraseFieldPlan {
+            field_id,
+            terms: references,
+        });
+    }
+    Ok(DocCursor::and(cursors, statistics.clone()))
 }
 
 async fn exact_term_cursor<'a, D: ArtifactDirectoryRead>(

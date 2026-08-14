@@ -29,6 +29,8 @@ pub(super) async fn materialize<D: ArtifactDirectoryRead>(
     request: &NativeQueryRequest,
     executions: &mut [SegmentExecution<'_, D>],
     selected: Vec<Selected>,
+    facet_results: Vec<super::super::super::FacetResult>,
+    aggregate_results: Vec<super::super::super::AggregateResult>,
     maximum_page_bytes: usize,
     statistics: &NativeQueryStatisticsRecorder,
 ) -> Result<NativeQueryPage, IndexError> {
@@ -52,10 +54,6 @@ pub(super) async fn materialize<D: ArtifactDirectoryRead>(
             }
             retained_segment = Some(selected.segment_index);
         }
-        let fields_json = executions[selected.segment_index]
-            .values
-            .stored(selected.doc_id)
-            .await?;
         let cursor = NativeQueryCursor {
             sort_values: selected.sort_values,
             result: selected.result.clone(),
@@ -66,7 +64,6 @@ pub(super) async fn materialize<D: ArtifactDirectoryRead>(
             source: selected.source,
             result: selected.result,
             score: selected.score,
-            fields_json,
             cursor,
         };
         let hit_bytes = super::super::memory::hit_owned_bytes(&hit)?;
@@ -101,6 +98,8 @@ pub(super) async fn materialize<D: ArtifactDirectoryRead>(
         hits,
         next,
         authorization_revision: request.authorization_revision,
+        facet_results,
+        aggregate_results,
         statistics: statistics.snapshot(),
     })
 }

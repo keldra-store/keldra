@@ -16,6 +16,7 @@ mod liveness;
 mod locator;
 mod model;
 mod mutation;
+mod points;
 mod postings;
 mod query;
 mod reader;
@@ -24,12 +25,11 @@ mod scan;
 mod schema;
 mod segment_reader;
 mod statistics;
-mod stored_fields;
 mod terms;
 mod text;
 mod vectors;
 
-pub use analyzer::{MAX_ANALYZED_TOKEN_CHARS, analyze_unicode_alphanumeric_lowercase};
+pub use analyzer::analyze_unicode_alphanumeric_lowercase;
 pub use artifact::{
     ArtifactDescriptor, ArtifactReference, GeneratedComponent, SegmentComponent, SegmentDescriptor,
     artifact_path, current_path, definition_path, manifest_path,
@@ -37,7 +37,7 @@ pub use artifact::{
 pub use codec::{
     COMPONENT_HEADER_BYTES, ComponentHeader, DecodedComponent, decode_component, encode_component,
 };
-pub use columns::{FastColumnBlock, FastColumnCell, ScalarValue};
+pub use columns::{DOC_VALUES_COMPONENT_CODEC_VERSION, DocValueBlock, DocValueCell, ScalarValue};
 pub use executor::{
     MAXIMUM_CANDIDATE_GATE_BATCH, NativeQueryExecutionError, NativeQueryExecutor, NativeQueryLimits,
 };
@@ -45,8 +45,8 @@ pub use identity::{DocumentIdentity, IdentityBlock, ObjectIdentity};
 pub use io::{ArtifactDirectoryRead, LoadedComponent, read_artifact_component};
 pub use keys::{
     FIELD_PRESENCE_TERM, TERM_TYPE_BOOLEAN, TERM_TYPE_FIELD_PRESENCE, TERM_TYPE_NULL,
-    TERM_TYPE_NUMBER, TERM_TYPE_STRING, TERM_TYPE_TEXT, TERM_TYPE_UNSIGNED, canonical_term_key,
-    encode_physical_order_key, scalar_term, text_term,
+    TERM_TYPE_HASHED_KEYWORD, TERM_TYPE_NUMBER, TERM_TYPE_SIGNED, TERM_TYPE_STRING, TERM_TYPE_TEXT,
+    TERM_TYPE_UNSIGNED, canonical_term_key, encode_physical_order_key, scalar_term, text_term,
 };
 pub use liveness::{LIVE_MASK_BLOCK_DOCS, LiveMask, LiveMaskBlock};
 pub use locator::{
@@ -55,7 +55,8 @@ pub use locator::{
 pub use model::{
     ComponentKind, DocId, INDEX_ARTIFACT_PACK_BYTES, INDEX_COMPONENT_BYTES, INDEX_DECODE_BYTES,
     INDEX_FORMAT_VERSION, INDEX_GENERATION_SEGMENTS, INDEX_ROUTING_FANOUT, INDEX_ROUTING_HEIGHT,
-    INDEX_ROUTING_KEY_BYTES, SegmentIdentity, component_ordinal_key, decode_component_ordinal_key,
+    INDEX_ROUTING_KEY_BYTES, INDEX_TERM_BYTES, SegmentIdentity, component_ordinal_key,
+    decode_component_ordinal_key,
 };
 pub use mutation::{
     LOCATOR_COMPACTION_FAN_IN, LocatorStreamRoot, compact_locator_roots, locate_path,
@@ -64,8 +65,13 @@ pub use mutation::{
 pub use postings::{
     POSTING_SKIP_INTERVAL, PostingBlock, PostingCodec, PostingCursor, PostingImpact, PostingList,
 };
+pub use points::{
+    POINTS_COMPONENT_CODEC_VERSION, PointBlock, PointEntry, PointValue, point_presence_key,
+    point_scalar_key, point_value_key,
+};
 pub use query::{
-    CandidateGate, CandidateGateEvidence, CandidateReference, NativeQuery, NativeQueryCursor,
+    AggregateOperation, AggregateRequest, AggregateResult, CandidateGate, CandidateGateEvidence,
+    CandidateReference, FacetBucket, FacetRequest, FacetResult, NativeQuery, NativeQueryCursor,
     NativeQueryHit, NativeQueryPage, NativeQueryRequest,
 };
 pub use reader::{ComponentStream, StreamLeaf, StreamTotals};
@@ -76,15 +82,14 @@ pub use scan::{
     SortCursor, SortValue,
 };
 pub use schema::{
-    Analyzer, Cardinality, Collation, ComponentVersion, FieldComponents, FieldId, FieldSchema,
-    IndexKind, IndexSemantics, OrderDirection, OrderField, ScalarDomain, Schema, VectorMetric,
-    VectorNormalization,
+    Analyzer, Cardinality, Collation, ComponentVersion, FieldCapabilities, FieldComponents, FieldId,
+    FieldSchema, FieldType, IndexKind, IndexSemantics, OrderDirection, OrderField, Schema,
+    VectorMetric, VectorNormalization,
 };
 pub use segment_reader::SegmentComponentReader;
 pub use statistics::{
     NativeQueryExecutionTier, NativeQueryStatistics, NativeQueryStatisticsRecorder,
 };
-pub use stored_fields::{STORED_FIELDS_COMPONENT_CODEC_VERSION, StoredFieldsBlock};
 pub use terms::{PostingReference, TermDictionary, TermEntry};
 pub use text::{
     ComponentStatistics, FieldStatistics, NormBlock, PhysicalOrderBounds, PositionEntry,

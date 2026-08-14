@@ -1,9 +1,9 @@
 use crate::IndexError;
 
 use super::{
-    ArtifactDirectoryRead, ComponentKind, ComponentStream, FastColumnBlock, FieldId, IdentityBlock,
-    LiveMaskBlock, NormBlock, PositionsBlock, PostingBlock, SegmentDescriptor, SegmentStatistics,
-    StoredFieldsBlock, TermDictionary, VectorBlock, component_ordinal_key, read_artifact_component,
+    ArtifactDirectoryRead, ComponentKind, ComponentStream, DocValueBlock, FieldId, IdentityBlock,
+    LiveMaskBlock, NormBlock, PointBlock, PositionsBlock, PostingBlock, SegmentDescriptor,
+    SegmentStatistics, TermDictionary, VectorBlock, component_ordinal_key, read_artifact_component,
 };
 
 /// Lazy checked access to the component streams of one immutable segment.
@@ -124,36 +124,34 @@ impl<'a, D: ArtifactDirectoryRead> SegmentComponentReader<'a, D> {
         .await
     }
 
-    pub async fn fast_column_blocks(
+    pub async fn doc_value_blocks(
         &self,
         field_id: FieldId,
         first: Option<u32>,
         last: Option<u32>,
-    ) -> Result<Vec<FastColumnBlock>, IndexError> {
+    ) -> Result<Vec<DocValueBlock>, IndexError> {
         self.decode_stream(
-            ComponentKind::FAST_COLUMN,
+            ComponentKind::DOC_VALUES,
             Some(field_id),
             doc_bound(first),
             doc_bound(last),
-            FastColumnBlock::decode_payload,
+            DocValueBlock::decode_payload,
         )
         .await
     }
 
-    pub async fn stored_field_blocks(
+    pub async fn point_blocks(
         &self,
-        first: Option<u32>,
-        last: Option<u32>,
-    ) -> Result<Vec<StoredFieldsBlock>, IndexError> {
-        if self.component(ComponentKind::STORED_FIELDS, None).is_none() {
-            return Ok(Vec::new());
-        }
+        field_id: FieldId,
+        minimum: Option<Vec<u8>>,
+        maximum: Option<Vec<u8>>,
+    ) -> Result<Vec<PointBlock>, IndexError> {
         self.decode_stream(
-            ComponentKind::STORED_FIELDS,
-            None,
-            doc_bound(first),
-            doc_bound(last),
-            StoredFieldsBlock::decode_payload,
+            ComponentKind::POINTS,
+            Some(field_id),
+            minimum,
+            maximum,
+            PointBlock::decode_payload,
         )
         .await
     }

@@ -1,9 +1,9 @@
 use crate::IndexError;
 
 use super::super::super::{
-    ArtifactDirectoryRead, Cardinality, ComponentKind, DocId, FastColumnBlock, FastColumnCell,
+    ArtifactDirectoryRead, Cardinality, ComponentKind, DocId, DocValueBlock, DocValueCell,
     FieldComponents, FieldId, INDEX_COMPONENT_BYTES, IndexSemantics, NormBlock, ScalarValue,
-    Schema, SegmentDescriptor, StoredFieldsBlock, VectorBlock,
+    Schema, SegmentDescriptor, VectorBlock,
 };
 use super::super::ComponentBatchSink;
 use super::super::scratch::MergeScratchFile;
@@ -69,8 +69,8 @@ where
     let mut streams = Vec::new();
     let mut counts = vec![FieldCounts::default(); schema.fields.len()];
     for field in &schema.fields {
-        if field.components.contains(FieldComponents::FAST_COLUMN) {
-            let (stream, field_counts) = build_columns(
+        if field.components.contains(FieldComponents::DOC_VALUES) {
+            let (stream, field_counts) = build_doc_values(
                 directory,
                 sink,
                 schema,
@@ -82,7 +82,7 @@ where
                 field.cardinality == Cardinality::Multi,
             )
             .await?;
-            streams.push((ComponentKind::FAST_COLUMN, Some(field.id), stream));
+            streams.push((ComponentKind::DOC_VALUES, Some(field.id), stream));
             counts[field.id.get() as usize].present_documents = field_counts.present_documents;
             counts[field.id.get() as usize].null_documents = field_counts.null_documents;
             counts[field.id.get() as usize].value_count = field_counts.value_count;
@@ -93,26 +93,6 @@ where
             counts[field.id.get() as usize].unsigned_values = field_counts.unsigned_values;
             counts[field.id.get() as usize].string_values = field_counts.string_values;
         }
-    }
-    if schema
-        .fields
-        .iter()
-        .any(|field| field.components.contains(FieldComponents::STORED))
-    {
-        streams.push((
-            ComponentKind::STORED_FIELDS,
-            None,
-            build_stored(
-                directory,
-                sink,
-                schema,
-                inputs,
-                output_identity,
-                permutation,
-                range,
-            )
-            .await?,
-        ));
     }
     for field in &schema.fields {
         if field.components.contains(FieldComponents::NORMS) {
@@ -129,7 +109,7 @@ where
             .await?;
             streams.push((ComponentKind::NORMS, Some(field.id), stream));
             let counts = &mut counts[field.id.get() as usize];
-            if !field.components.contains(FieldComponents::FAST_COLUMN) {
+            if !field.components.contains(FieldComponents::DOC_VALUES) {
                 counts.present_documents = present;
             }
             counts.total_field_length = total;
@@ -152,7 +132,7 @@ where
             .await?;
             streams.push((ComponentKind::VECTORS, Some(field.id), stream));
             let counts = &mut counts[field.id.get() as usize];
-            if !field.components.contains(FieldComponents::FAST_COLUMN)
+            if !field.components.contains(FieldComponents::DOC_VALUES)
                 && !field.components.contains(FieldComponents::NORMS)
             {
                 counts.present_documents = present;
@@ -165,7 +145,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn build_columns<D, S, F>(
+async fn build_doc_values<D, S, F>(
     directory: &D,
     sink: &mut S,
     schema: &Schema,
@@ -183,14 +163,14 @@ where
 {
     let mut cursors = inputs
         .iter()
-        .map(|input| ColumnCursor::new(directory, input, field_id, multi_valued))
+        .map(|input| DocValueCursor::new(directory, input, field_id, multi_valued))
         .collect::<Result<Vec<_>, _>>()?;
     let mut permutation = FixedScratchReader::new_range(permutation, 8, range.first, range.end);
     let mut publisher = StreamingComponentPublisher::new(
         sink,
         identity,
-        ComponentKind::FAST_COLUMN,
-        schema.codec_version(ComponentKind::FAST_COLUMN)?,
+        ComponentKind::DOC_VALUES,
+        schema.codec_version(ComponentKind::DOC_VALUES)?,
         schema.codec_version(ComponentKind::ROUTING_NODE)?,
     )?;
     let mut emitted = range.first;
@@ -216,11 +196,11 @@ where
             let count = match value {
                 ScalarValue::Null => {
                     return Err(IndexError::InvalidFormat(
-                        "fast-column value contains inline null",
+                        "doc-value contains inline null",
                     ));
                 }
                 ScalarValue::Boolean(_) => &mut counts.boolean_values,
-                ScalarValue::Number(_) => &mut counts.number_values,
+                ScalarValue::Signed(_) | ScalarValue::Number(_) => &mut counts.number_values,
                 ScalarValue::Unsigned(_) => &mut counts.unsigned_values,
                 ScalarValue::String(_) => &mut counts.string_values,
             };
@@ -228,7 +208,7 @@ where
         }
         let bytes = cell_resident_bytes(&cell)?;
         if !values.is_empty() && resident.saturating_add(bytes) > INDEX_COMPONENT_BYTES / 2 {
-            emitted = publish_column_values(
+            emitted = publish_doc_values(
                 directory,
                 &mut publisher,
                 field_id,
@@ -244,7 +224,7 @@ where
             .ok_or(IndexError::OffsetOverflow)?;
         values.push(cell);
     }
-    emitted = publish_column_values(
+    emitted = publish_doc_values(
         directory,
         &mut publisher,
         field_id,
@@ -254,7 +234,7 @@ where
     )
     .await?;
     if emitted != range.end {
-        return Err(IndexError::InvalidFormat("column permutation count"));
+        return Err(IndexError::InvalidFormat("doc-value permutation count"));
     }
     if range.is_last() {
         for (cursor, input) in cursors.iter_mut().zip(inputs) {
@@ -264,13 +244,13 @@ where
     Ok((publisher.finish().await?, counts))
 }
 
-async fn publish_column_values<D: ArtifactDirectoryRead, S: ComponentBatchSink>(
+async fn publish_doc_values<D: ArtifactDirectoryRead, S: ComponentBatchSink>(
     directory: &D,
     publisher: &mut StreamingComponentPublisher<'_, S>,
     field_id: FieldId,
     multi_valued: bool,
     first: u32,
-    values: &mut Vec<FastColumnCell>,
+    values: &mut Vec<DocValueCell>,
 ) -> Result<u32, IndexError> {
     if values.is_empty() {
         return Ok(first);
@@ -279,7 +259,7 @@ async fn publish_column_values<D: ArtifactDirectoryRead, S: ComponentBatchSink>(
     let values = std::mem::take(values);
     let payload = directory
         .run_query_cpu(move || {
-            FastColumnBlock::new(field_id, DocId::new(first), multi_valued, values)?
+            DocValueBlock::new(field_id, DocId::new(first), multi_valued, values)?
                 .encode_payload()
         })
         .await?;
@@ -289,81 +269,6 @@ async fn publish_column_values<D: ArtifactDirectoryRead, S: ComponentBatchSink>(
 
 // The remaining doc-aligned builders deliberately use the same bounded
 // permutation/cursor pattern. They never retain a corpus-sized value array.
-
-#[allow(clippy::too_many_arguments)]
-async fn build_stored<D, S, F>(
-    directory: &D,
-    sink: &mut S,
-    schema: &Schema,
-    inputs: &[&SegmentDescriptor],
-    identity: super::super::super::SegmentIdentity,
-    permutation: &F,
-    range: DocRange,
-) -> Result<PublishedStream, IndexError>
-where
-    D: ArtifactDirectoryRead,
-    S: ComponentBatchSink,
-    F: MergeScratchFile,
-{
-    let mut cursors = inputs
-        .iter()
-        .map(|input| StoredCursor::new(directory, input))
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut permutation = FixedScratchReader::new_range(permutation, 8, range.first, range.end);
-    let mut publisher = StreamingComponentPublisher::new(
-        sink,
-        identity,
-        ComponentKind::STORED_FIELDS,
-        schema.codec_version(ComponentKind::STORED_FIELDS)?,
-        schema.codec_version(ComponentKind::ROUTING_NODE)?,
-    )?;
-    let mut values = Vec::new();
-    let mut resident = 0usize;
-    let mut emitted = range.first;
-    while let Some(record) = permutation.next().await? {
-        let (input, old) = decode_permutation(record, cursors.len())?;
-        let value = cursors[input].get(old).await?;
-        let bytes = value
-            .as_ref()
-            .map_or(1, |value| value.len().saturating_add(1));
-        if !values.is_empty() && resident.saturating_add(bytes) > INDEX_COMPONENT_BYTES / 2 {
-            emitted = emit_stored(directory, &mut publisher, emitted, &mut values).await?;
-            resident = 0;
-        }
-        resident = resident
-            .checked_add(bytes)
-            .ok_or(IndexError::OffsetOverflow)?;
-        values.push(value);
-    }
-    emitted = emit_stored(directory, &mut publisher, emitted, &mut values).await?;
-    if emitted != range.end {
-        return Err(IndexError::InvalidFormat("stored permutation count"));
-    }
-    if range.is_last() {
-        for (cursor, input) in cursors.iter_mut().zip(inputs) {
-            cursor.finish(input.document_count).await?;
-        }
-    }
-    publisher.finish().await
-}
-
-async fn emit_stored<D: ArtifactDirectoryRead, S: ComponentBatchSink>(
-    directory: &D,
-    publisher: &mut StreamingComponentPublisher<'_, S>,
-    first: u32,
-    values: &mut Vec<Option<Vec<u8>>>,
-) -> Result<u32, IndexError> {
-    let count = u32::try_from(values.len()).map_err(|_| IndexError::OffsetOverflow)?;
-    if count == 0 {
-        return Ok(first);
-    }
-    let values = std::mem::take(values);
-    let payload = directory
-        .run_query_cpu(move || StoredFieldsBlock::new(DocId::new(first), values)?.encode_payload())
-        .await?;
-    push_doc_block(publisher, first, count, payload).await?;
-    first.checked_add(count).ok_or(IndexError::OffsetOverflow)
-}
 
 #[allow(clippy::too_many_arguments)]
 async fn build_norms<D, S, F>(

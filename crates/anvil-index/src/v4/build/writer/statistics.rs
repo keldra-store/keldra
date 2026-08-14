@@ -49,7 +49,7 @@ impl StatisticsAccumulator {
         for (doc_id, document) in documents.iter().copied().enumerate() {
             let marker = u32::try_from(doc_id).map_err(|_| IndexError::OffsetOverflow)?;
             let record = record(sources, document);
-            for column in &record.columns {
+            for column in &record.doc_values {
                 if column.cell.present {
                     mark_present(
                         &mut fields,

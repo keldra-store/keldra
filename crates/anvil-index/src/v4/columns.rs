@@ -148,6 +148,7 @@ impl DocValueBlock {
         let mut value_count = 0u32;
         let mut null_count = 0u32;
         let (mut minimum, mut maximum) = (None, None);
+        let mut value_type = None;
         for cell in &cells {
             validate_cell(cell, multi_valued)?;
             null_count = null_count
@@ -159,6 +160,13 @@ impl DocValueBlock {
                 )
                 .ok_or(IndexError::OffsetOverflow)?;
             for value in &cell.values {
+                let discriminant = std::mem::discriminant(value);
+                if value_type.is_some_and(|expected| expected != discriminant) {
+                    return Err(IndexError::InvalidDefinition(
+                        "one doc-value block cannot mix scalar types".into(),
+                    ));
+                }
+                value_type = Some(discriminant);
                 if minimum.as_ref().is_none_or(|current| value < current) {
                     minimum = Some(value.clone());
                 }
@@ -431,7 +439,7 @@ fn validate_padding(bitmap: &[u8], count: usize) -> Result<(), IndexError> {
 mod tests {
     use super::*;
 
-    fn encode_with_flattened_values(block: &FastColumnBlock) -> Vec<u8> {
+    fn encode_with_flattened_values(block: &DocValueBlock) -> Vec<u8> {
         let mut presence = vec![0u8; block.cells.len().div_ceil(8)];
         let mut nulls = vec![0u8; block.cells.len().div_ceil(8)];
         let mut offsets = Vec::with_capacity(block.cells.len() + 1);
@@ -448,7 +456,7 @@ mod tests {
             offsets.push(values.len() as u32);
         }
         let mut out = Encoder::default();
-        out.u16(FAST_COLUMN_CODEC_VERSION);
+        out.u16(DOC_VALUES_COMPONENT_CODEC_VERSION);
         out.u32(block.field_id.get());
         out.u32(block.first_doc_id.get());
         out.usize_u32(block.cells.len()).unwrap();
@@ -472,29 +480,29 @@ mod tests {
 
     #[test]
     fn missing_null_empty_and_multivalue_remain_distinct() {
-        let block = FastColumnBlock::new(
+        let block = DocValueBlock::new(
             FieldId::new(2),
             DocId::new(10),
             true,
             vec![
-                FastColumnCell::missing(),
-                FastColumnCell::null(),
-                FastColumnCell {
+                DocValueCell::missing(),
+                DocValueCell::null(),
+                DocValueCell {
                     present: true,
                     null: false,
                     values: vec![],
                 },
-                FastColumnCell {
+                DocValueCell {
                     present: true,
                     null: true,
-                    values: vec![ScalarValue::Unsigned(7), ScalarValue::String("x".into())],
+                    values: vec![ScalarValue::Unsigned(7), ScalarValue::Unsigned(9)],
                 },
             ],
         )
         .unwrap();
         let encoded = block.encode_payload().unwrap();
         assert_eq!(encoded, encode_with_flattened_values(&block));
-        let decoded = FastColumnBlock::decode_payload(&encoded).unwrap();
+        let decoded = DocValueBlock::decode_payload(&encoded).unwrap();
         assert_eq!(decoded, block);
         assert!(!decoded.get(DocId::new(10)).unwrap().present);
         assert!(decoded.get(DocId::new(11)).unwrap().null);
@@ -504,8 +512,9 @@ mod tests {
     #[test]
     fn tagged_total_order_and_negative_zero_are_canonical() {
         assert!(ScalarValue::Null < ScalarValue::Boolean(false));
-        assert!(ScalarValue::Boolean(true) < ScalarValue::number(-1.0).unwrap());
-        assert!(ScalarValue::number(100.0).unwrap() < ScalarValue::Unsigned(0));
+        assert!(ScalarValue::Boolean(true) < ScalarValue::Signed(-1));
+        assert!(ScalarValue::Signed(100) < ScalarValue::Unsigned(0));
+        assert!(ScalarValue::Unsigned(0) < ScalarValue::number(-1.0).unwrap());
         assert_eq!(
             ScalarValue::number(-0.0).unwrap(),
             ScalarValue::number(0.0).unwrap()

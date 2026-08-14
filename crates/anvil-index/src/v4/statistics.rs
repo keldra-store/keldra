@@ -43,8 +43,8 @@ pub struct NativeQueryStatistics {
     pub candidate_doc_ids: u64,
     pub live_mask_blocks_decoded: u64,
     pub live_mask_rejects: u64,
-    pub fast_column_blocks_decoded: u64,
-    pub stored_field_blocks_decoded: u64,
+    pub point_blocks_decoded: u64,
+    pub doc_value_blocks_decoded: u64,
     pub cursor_seeks: u64,
     pub cursor_skipped_doc_ids: u64,
     pub physical_early_terminations: u64,
@@ -80,8 +80,8 @@ struct NativeQueryStatisticsInner {
     candidate_doc_ids: AtomicU64,
     live_mask_blocks_decoded: AtomicU64,
     live_mask_rejects: AtomicU64,
-    fast_column_blocks_decoded: AtomicU64,
-    stored_field_blocks_decoded: AtomicU64,
+    point_blocks_decoded: AtomicU64,
+    doc_value_blocks_decoded: AtomicU64,
     cursor_seeks: AtomicU64,
     cursor_skipped_doc_ids: AtomicU64,
     physical_early_terminations: AtomicU64,
@@ -139,8 +139,8 @@ impl NativeQueryStatisticsRecorder {
             candidate_doc_ids: load(&self.inner.candidate_doc_ids),
             live_mask_blocks_decoded: load(&self.inner.live_mask_blocks_decoded),
             live_mask_rejects: load(&self.inner.live_mask_rejects),
-            fast_column_blocks_decoded: load(&self.inner.fast_column_blocks_decoded),
-            stored_field_blocks_decoded: load(&self.inner.stored_field_blocks_decoded),
+            point_blocks_decoded: load(&self.inner.point_blocks_decoded),
+            doc_value_blocks_decoded: load(&self.inner.doc_value_blocks_decoded),
             cursor_seeks: load(&self.inner.cursor_seeks),
             cursor_skipped_doc_ids: load(&self.inner.cursor_skipped_doc_ids),
             physical_early_terminations: load(&self.inner.physical_early_terminations),
@@ -252,12 +252,12 @@ impl NativeQueryStatisticsRecorder {
         add(&self.inner.live_mask_blocks_decoded, count);
     }
 
-    pub(crate) fn fast_column_blocks_decoded(&self, count: u64) {
-        add(&self.inner.fast_column_blocks_decoded, count);
+    pub(crate) fn point_blocks_decoded(&self, count: u64) {
+        add(&self.inner.point_blocks_decoded, count);
     }
 
-    pub(crate) fn stored_field_blocks_decoded(&self, count: u64) {
-        add(&self.inner.stored_field_blocks_decoded, count);
+    pub(crate) fn doc_value_blocks_decoded(&self, count: u64) {
+        add(&self.inner.doc_value_blocks_decoded, count);
     }
 
     pub(crate) fn cursor_seek(&self, skipped_doc_ids: u64) {

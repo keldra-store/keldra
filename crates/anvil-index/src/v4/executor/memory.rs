@@ -17,9 +17,7 @@ const CURSOR_STATE_BYTES: usize = 2 * INDEX_ROUTING_KEY_BYTES + 1024;
 const OWNED_VALUE_OVERHEAD_BYTES: usize = 32;
 const OWNED_IDENTITY_OVERHEAD_BYTES: usize = 64;
 
-/// Retained response bytes admitted for one native page. Four MiB permits
-/// ordinary small pages to reach the public hit limit while forcing unusually
-/// large stored projections to continue at an exact hit boundary.
+/// Retained response bytes admitted for one native page.
 pub(super) const DEFAULT_MAXIMUM_PAGE_BYTES: usize = INDEX_DECODE_BYTES;
 
 pub(crate) fn estimate_working_memory(
@@ -121,9 +119,7 @@ fn vector_workspace_bytes(query: &NativeQuery) -> Result<usize, IndexError> {
         .ok_or(IndexError::OffsetOverflow)
 }
 
-/// Fixed page structures and the exact retained `NativeQueryHit` slots. Owned
-/// strings, sort values, and stored bytes are charged separately as hits are
-/// materialized.
+/// Fixed page structures and exact retained `NativeQueryHit` slots.
 pub(super) fn page_base_bytes(hit_capacity: usize) -> Result<usize, IndexError> {
     std::mem::size_of::<NativeQueryPage>()
         .checked_add(
@@ -139,7 +135,6 @@ pub(super) fn hit_owned_bytes(hit: &NativeQueryHit) -> Result<usize, IndexError>
     let cursor = cursor_owned_bytes(&hit.cursor)?;
     identity_owned_bytes(&hit.source)
         .checked_add(identity_owned_bytes(&hit.result))
-        .and_then(|value| value.checked_add(hit.fields_json.capacity()))
         .and_then(|value| value.checked_add(cursor))
         .ok_or(IndexError::OffsetOverflow)
 }

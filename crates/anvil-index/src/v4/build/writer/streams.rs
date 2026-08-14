@@ -1,6 +1,6 @@
 use crate::IndexError;
 
-use super::layout::{DocumentRef, SourceDocRef, record, source};
+use super::layout::{DocumentRef, PointRef, SourceDocRef, point, record, source};
 use super::{SegmentAssembly, push_payload};
 use crate::v4::build::{
     ComponentBatchSink, ProjectedSource, PublishedStream, StreamingComponentPublisher,
@@ -8,9 +8,10 @@ use crate::v4::build::{
 use crate::v4::locator::PathLocatorBlockBuilder;
 use crate::v4::{
     COMPONENT_HEADER_BYTES, Cardinality, ComponentKind, DocId, DocIdRange, DocumentIdentity,
-    FastColumnBlock, FastColumnCell, FieldComponents, INDEX_COMPONENT_BYTES, IdentityBlock,
+    DocValueBlock, DocValueCell, FieldComponents, INDEX_COMPONENT_BYTES, IdentityBlock,
     IndexSemantics, LIVE_MASK_BLOCK_DOCS, LiveMaskBlock, LocatorEntry, LocatorValue, NormBlock,
-    PathLocatorBlock, ScalarValue, Schema, SegmentIdentity, StoredFieldsBlock, VectorBlock,
+    PathLocatorBlock, PointBlock, PointEntry, PointValue, ScalarValue, Schema, SegmentIdentity,
+    VectorBlock, point_value_key,
 };
 
 const MAX_PAYLOAD_BYTES: usize = INDEX_COMPONENT_BYTES - COMPONENT_HEADER_BYTES;
@@ -229,7 +230,7 @@ async fn publish_locator_block<S: ComponentBatchSink>(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn publish_fast_columns<S: ComponentBatchSink>(
+pub(super) async fn publish_doc_values<S: ComponentBatchSink>(
     sink: &mut S,
     identity: SegmentIdentity,
     schema: &Schema,
@@ -241,31 +242,31 @@ pub(super) async fn publish_fast_columns<S: ComponentBatchSink>(
     for field in schema
         .fields
         .iter()
-        .filter(|field| field.components.contains(FieldComponents::FAST_COLUMN))
+        .filter(|field| field.components.contains(FieldComponents::DOC_VALUES))
     {
         let mut publisher = StreamingComponentPublisher::new(
             sink,
             identity,
-            ComponentKind::FAST_COLUMN,
-            schema.codec_version(ComponentKind::FAST_COLUMN)?,
+            ComponentKind::DOC_VALUES,
+            schema.codec_version(ComponentKind::DOC_VALUES)?,
             routing_codec,
         )?;
         let multi_valued = field.cardinality == Cardinality::Multi;
         let mut start = 0usize;
         while start < documents.len() {
             let end = bounded_end(start, documents.len(), |index| {
-                let cell = column_cell(sources, documents[index], field.id);
-                fast_cell_upper_bound(cell)
+                let cell = doc_value_cell(sources, documents[index], field.id);
+                doc_value_cell_upper_bound(cell)
             })?;
             let cells = documents[start..end]
                 .iter()
                 .map(|document| {
-                    column_cell(sources, *document, field.id)
+                    doc_value_cell(sources, *document, field.id)
                         .cloned()
-                        .unwrap_or_else(FastColumnCell::missing)
+                        .unwrap_or_else(DocValueCell::missing)
                 })
                 .collect();
-            let block = FastColumnBlock::new(
+            let block = DocValueBlock::new(
                 field.id,
                 DocId::new(u32::try_from(start).map_err(|_| IndexError::OffsetOverflow)?),
                 multi_valued,
@@ -284,7 +285,7 @@ pub(super) async fn publish_fast_columns<S: ComponentBatchSink>(
             start = end;
         }
         assembly.add(
-            ComponentKind::FAST_COLUMN,
+            ComponentKind::DOC_VALUES,
             Some(field.id),
             publisher.finish().await?,
         )?;
@@ -293,63 +294,69 @@ pub(super) async fn publish_fast_columns<S: ComponentBatchSink>(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn publish_stored_fields<S: ComponentBatchSink>(
+pub(super) async fn publish_points<S: ComponentBatchSink>(
     sink: &mut S,
     identity: SegmentIdentity,
     schema: &Schema,
     routing_codec: u16,
     sources: &[ProjectedSource],
     documents: &[DocumentRef],
+    references: &[PointRef],
     assembly: &mut SegmentAssembly,
 ) -> Result<(), IndexError> {
-    if !documents
-        .iter()
-        .any(|document| record(sources, *document).stored_fields.is_some())
-    {
-        return Ok(());
-    }
-    let mut publisher = StreamingComponentPublisher::new(
-        sink,
-        identity,
-        ComponentKind::STORED_FIELDS,
-        schema.codec_version(ComponentKind::STORED_FIELDS)?,
-        routing_codec,
-    )?;
-    let mut start = 0usize;
-    while start < documents.len() {
-        let end = bounded_end(start, documents.len(), |index| {
-            Ok(16usize.saturating_add(
-                record(sources, documents[index])
-                    .stored_fields
-                    .as_ref()
-                    .map_or(0, Vec::len),
-            ))
-        })?;
-        let values = documents[start..end]
-            .iter()
-            .map(|document| record(sources, *document).stored_fields.clone())
-            .collect();
-        let block = StoredFieldsBlock::new(
-            DocId::new(u32::try_from(start).map_err(|_| IndexError::OffsetOverflow)?),
-            values,
+    let mut field_start = 0usize;
+    while field_start < references.len() {
+        let field_id = point(sources, documents, references[field_start]).0;
+        let field_end = references[field_start..]
+            .partition_point(|reference| point(sources, documents, *reference).0 == field_id)
+            + field_start;
+        let mut publisher = StreamingComponentPublisher::new(
+            sink,
+            identity,
+            ComponentKind::POINTS,
+            schema.codec_version(ComponentKind::POINTS)?,
+            routing_codec,
         )?;
-        let count = u32::try_from(end - start).map_err(|_| IndexError::OffsetOverflow)?;
-        let payload = block.encode_payload()?;
-        drop(block);
-        push_payload(
-            &mut publisher,
-            u32::try_from(start).map_err(|_| IndexError::OffsetOverflow)?,
-            count,
-            payload,
-        )
-        .await?;
-        start = end;
+        let mut start = field_start;
+        while start < field_end {
+            let mut end = start;
+            let mut bytes = 16usize;
+            while end < field_end && end - start < MAX_DOCS_PER_BLOCK {
+                let row = 32usize;
+                if end > start && bytes.saturating_add(row) > MAX_PAYLOAD_BYTES {
+                    break;
+                }
+                bytes = bytes.saturating_add(row);
+                end += 1;
+            }
+            let entries = references[start..end]
+                .iter()
+                .map(|reference| {
+                    let (_, value) = point(sources, documents, *reference);
+                    PointEntry {
+                        value: value.cloned().map_or(PointValue::Presence, PointValue::Value),
+                        doc_id: DocId::new(reference.doc_id),
+                    }
+                })
+                .collect();
+            let block = PointBlock::new(field_id, entries)?;
+            let minimum = point_value_key(field_id, block.minimum())?;
+            let maximum = point_value_key(field_id, block.maximum())?;
+            let element_count = block.entries().len() as u64;
+            let payload = block.encode_payload()?;
+            publisher
+                .push_payload(minimum, maximum, element_count, payload)
+                .await?;
+            start = end;
+        }
+        assembly.add(
+            ComponentKind::POINTS,
+            Some(field_id),
+            publisher.finish().await?,
+        )?;
+        field_start = field_end;
     }
-    assembly.add(
-        ComponentKind::STORED_FIELDS,
-        None,
-        publisher.finish().await?,
-    )
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -501,7 +508,7 @@ where
     Ok(end)
 }
 
-fn fast_cell_upper_bound(cell: Option<&FastColumnCell>) -> Result<usize, IndexError> {
+fn doc_value_cell_upper_bound(cell: Option<&DocValueCell>) -> Result<usize, IndexError> {
     let Some(cell) = cell else {
         return Ok(16);
     };
@@ -510,7 +517,7 @@ fn fast_cell_upper_bound(cell: Option<&FastColumnCell>) -> Result<usize, IndexEr
             .checked_add(match value {
                 ScalarValue::Null => 1,
                 ScalarValue::Boolean(_) => 6,
-                ScalarValue::Number(_) | ScalarValue::Unsigned(_) => 27,
+                ScalarValue::Signed(_) | ScalarValue::Number(_) | ScalarValue::Unsigned(_) => 27,
                 ScalarValue::String(value) => {
                     3usize.saturating_mul(5usize.saturating_add(value.len()))
                 }
@@ -519,16 +526,16 @@ fn fast_cell_upper_bound(cell: Option<&FastColumnCell>) -> Result<usize, IndexEr
     })
 }
 
-fn column_cell(
+fn doc_value_cell(
     sources: &[ProjectedSource],
     document: DocumentRef,
     field_id: crate::v4::FieldId,
-) -> Option<&FastColumnCell> {
-    let columns = &record(sources, document).columns;
-    columns
+) -> Option<&DocValueCell> {
+    let values = &record(sources, document).doc_values;
+    values
         .binary_search_by_key(&field_id, |column| column.field_id)
         .ok()
-        .map(|index| &columns[index].cell)
+        .map(|index| &values[index].cell)
 }
 
 fn vector_values(
