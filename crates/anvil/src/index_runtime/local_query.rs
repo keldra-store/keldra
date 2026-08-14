@@ -1048,18 +1048,28 @@ fn facet_result_to_api(
     field_names: &[String],
     result: anvil_index::v4::FacetResult,
 ) -> Result<IndexFacetResult, Status> {
+    let mut buckets = result
+        .buckets
+        .into_iter()
+        .map(|bucket| {
+            Ok(IndexFacetBucket {
+                value_json: scalar_json(&bucket.value)?,
+                count: bucket.count,
+            })
+        })
+        .collect::<Result<Vec<_>, Status>>()?;
+    // The native engine keeps typed scalar ordering. The public contract is
+    // deliberately language-neutral: equal-count buckets use their canonical
+    // JSON bytes as the stable tie-break.
+    buckets.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.value_json.cmp(&right.value_json))
+    });
     Ok(IndexFacetResult {
         field: field_name(field_names, result.field_id)?.to_owned(),
-        buckets: result
-            .buckets
-            .into_iter()
-            .map(|bucket| {
-                Ok(IndexFacetBucket {
-                    value_json: scalar_json(&bucket.value)?,
-                    count: bucket.count,
-                })
-            })
-            .collect::<Result<Vec<_>, Status>>()?,
+        buckets,
     })
 }
 
@@ -1482,6 +1492,31 @@ mod tests {
                 .iter()
                 .all(|aggregate| aggregate.contributing_count == 0)
         );
+    }
+
+    #[test]
+    fn public_facet_ties_use_canonical_json_byte_order() {
+        let result = facet_result_to_api(
+            &["sequence".into()],
+            anvil_index::v4::FacetResult {
+                field_id: FieldId::new(0),
+                buckets: vec![
+                    anvil_index::v4::FacetBucket {
+                        value: ScalarValue::Unsigned(2),
+                        count: 1,
+                    },
+                    anvil_index::v4::FacetBucket {
+                        value: ScalarValue::Unsigned(10),
+                        count: 1,
+                    },
+                ],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.field, "sequence");
+        assert_eq!(result.buckets[0].value_json, b"10");
+        assert_eq!(result.buckets[1].value_json, b"2");
     }
 
     #[test]

@@ -216,8 +216,21 @@ pub(super) async fn qualify(
             &["docs/inactive.json"],
         ),
         (
-            "doc-value existence",
-            predicates([predicate("score", IndexPredicateOperator::Exists, &[])]),
+            "multi-valued keyword exact",
+            predicates([predicate(
+                "labels",
+                IndexPredicateOperator::Equal,
+                &["\"stable\""],
+            )]),
+            ACTIVE,
+        ),
+        (
+            "doc-value-only existence",
+            predicates([predicate(
+                "measurements",
+                IndexPredicateOperator::Exists,
+                &[],
+            )]),
             &[
                 "docs/inactive.json",
                 "docs/active-c.json",
@@ -280,8 +293,16 @@ pub(super) async fn qualify(
             field: "enabled".into(),
             limit: 10,
         },
+        IndexFacetRequest {
+            field: "labels".into(),
+            limit: 10,
+        },
+        IndexFacetRequest {
+            field: "measurements".into(),
+            limit: 10,
+        },
     ];
-    computations.aggregates = ["modified_at", "sequence", "score"]
+    computations.aggregates = ["modified_at", "sequence", "score", "measurements"]
         .into_iter()
         .flat_map(|field| {
             [
@@ -427,7 +448,7 @@ fn verify_pages(
 }
 
 fn verify_computations(response: &QueryIndexResponse) -> TestResult<()> {
-    if response.facet_results.len() != 6 || response.aggregate_results.len() != 15 {
+    if response.facet_results.len() != 8 || response.aggregate_results.len() != 20 {
         return Err(invalid("Typed JSON computation result count changed"));
     }
     let expected_facets: &[(&str, &[(&[u8], u64)])] = &[
@@ -440,6 +461,19 @@ fn verify_computations(response: &QueryIndexResponse) -> TestResult<()> {
         ("sequence", &[(b"1", 1), (b"2", 1), (b"3", 1)]),
         ("score", &[(b"1.5", 1), (b"2.5", 1), (b"3.5", 1)]),
         ("enabled", &[(b"true", 3)]),
+        (
+            "labels",
+            &[
+                (b"\"stable\"", 3),
+                (b"\"alpha\"", 1),
+                (b"\"beta\"", 1),
+                (b"\"gamma\"", 1),
+            ],
+        ),
+        (
+            "measurements",
+            &[(b"1", 1), (b"2", 1), (b"3", 1), (b"4", 1)],
+        ),
     ];
     for (result, (field, buckets)) in response.facet_results.iter().zip(expected_facets) {
         if result.field != *field
@@ -457,23 +491,33 @@ fn verify_computations(response: &QueryIndexResponse) -> TestResult<()> {
     }
 
     let expected = [
-        ("modified_at", IndexAggregateOperation::Count, 3.0),
-        ("modified_at", IndexAggregateOperation::Minimum, 100.0),
-        ("modified_at", IndexAggregateOperation::Maximum, 200.0),
-        ("modified_at", IndexAggregateOperation::Sum, 500.0),
-        ("modified_at", IndexAggregateOperation::Average, 500.0 / 3.0),
-        ("sequence", IndexAggregateOperation::Count, 3.0),
-        ("sequence", IndexAggregateOperation::Minimum, 1.0),
-        ("sequence", IndexAggregateOperation::Maximum, 3.0),
-        ("sequence", IndexAggregateOperation::Sum, 6.0),
-        ("sequence", IndexAggregateOperation::Average, 2.0),
-        ("score", IndexAggregateOperation::Count, 3.0),
-        ("score", IndexAggregateOperation::Minimum, 1.5),
-        ("score", IndexAggregateOperation::Maximum, 3.5),
-        ("score", IndexAggregateOperation::Sum, 7.5),
-        ("score", IndexAggregateOperation::Average, 2.5),
+        ("modified_at", IndexAggregateOperation::Count, 3.0, 3),
+        ("modified_at", IndexAggregateOperation::Minimum, 100.0, 3),
+        ("modified_at", IndexAggregateOperation::Maximum, 200.0, 3),
+        ("modified_at", IndexAggregateOperation::Sum, 500.0, 3),
+        (
+            "modified_at",
+            IndexAggregateOperation::Average,
+            500.0 / 3.0,
+            3,
+        ),
+        ("sequence", IndexAggregateOperation::Count, 3.0, 3),
+        ("sequence", IndexAggregateOperation::Minimum, 1.0, 3),
+        ("sequence", IndexAggregateOperation::Maximum, 3.0, 3),
+        ("sequence", IndexAggregateOperation::Sum, 6.0, 3),
+        ("sequence", IndexAggregateOperation::Average, 2.0, 3),
+        ("score", IndexAggregateOperation::Count, 3.0, 3),
+        ("score", IndexAggregateOperation::Minimum, 1.5, 3),
+        ("score", IndexAggregateOperation::Maximum, 3.5, 3),
+        ("score", IndexAggregateOperation::Sum, 7.5, 3),
+        ("score", IndexAggregateOperation::Average, 2.5, 3),
+        ("measurements", IndexAggregateOperation::Count, 5.0, 5),
+        ("measurements", IndexAggregateOperation::Minimum, 1.0, 5),
+        ("measurements", IndexAggregateOperation::Maximum, 4.0, 5),
+        ("measurements", IndexAggregateOperation::Sum, 11.0, 5),
+        ("measurements", IndexAggregateOperation::Average, 2.2, 5),
     ];
-    for (result, (field, operation, expected_value)) in
+    for (result, (field, operation, expected_value, expected_count)) in
         response.aggregate_results.iter().zip(expected)
     {
         let value = result
@@ -483,7 +527,7 @@ fn verify_computations(response: &QueryIndexResponse) -> TestResult<()> {
         let value: f64 = serde_json::from_slice(value)?;
         if result.field != field
             || result.operation != operation as i32
-            || result.contributing_count != 3
+            || result.contributing_count != expected_count
             || (value - expected_value).abs() > 1e-12
         {
             return Err(invalid("numeric aggregate result changed"));

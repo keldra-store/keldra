@@ -1069,6 +1069,11 @@ impl IndexGenerationRetention {
         }
         let node = RoutingNode::decode_payload(job.definition.index_id, decoded.payload)
             .map_err(index_integrity_status)?;
+        if node.logical_kind() != routing.role {
+            return Err(Status::data_loss(
+                "format-v4 routing tree has the wrong logical component kind",
+            ));
+        }
         if routing
             .expected_height
             .is_some_and(|expected| node.height != expected)

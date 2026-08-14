@@ -8,7 +8,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anvil_api::v1::index_query::Query as IndexQueryValue;
-use anvil_api::v1::{IndexDefinition, IndexKind, IndexQuery};
+use anvil_api::v1::{IndexAggregateOperation, IndexDefinition, IndexKind, IndexQuery};
 use anvil_consensus::NodeId;
 use anvil_store::{ObjectKey, PlacementLogId, StorageTenantId};
 use tonic::{Request, Response, Status};
@@ -189,6 +189,8 @@ impl RoutedIndexQueryHandler for AuthorizedIndexQueryHandler {
 
         let request = call.request;
         let query_shape = request.query.clone();
+        let result_tenant = caller.storage_tenant().as_str().to_owned();
+        let result_bucket = request.definition.bucket.clone();
         let authorization_revision = before.revision;
         let resume = request.resume.clone();
         let kind = IndexKind::try_from(request.definition.kind)
@@ -221,6 +223,7 @@ impl RoutedIndexQueryHandler for AuthorizedIndexQueryHandler {
             })
             .await?;
         validate_result(&result, request.resume.as_ref(), request.limit)?;
+        require_result_scope(&result, &result_tenant, &result_bucket)?;
         require_computation_shape(&result, &query_shape)?;
         require_result_authorization_revision(&result, authorization_revision)?;
         Ok(result)
@@ -291,6 +294,8 @@ impl ClusterPeerTransport {
         let limit = value.limit;
         let resumed = value.resume.clone();
         let query_shape = value.query.clone();
+        let result_tenant = value.storage_tenant.clone();
+        let result_bucket = value.definition.bucket.clone();
         let remaining = remaining.min(MAX_ROUTED_INDEX_QUERY_TIME);
         let mut request = Request::new(request_to_wire(
             self.context_with_timeout_limit(fence, 1, remaining, MAX_ROUTED_INDEX_QUERY_TIME)?,
@@ -314,6 +319,7 @@ impl ClusterPeerTransport {
         };
         let result = response_from_wire(response)?;
         validate_result(&result, resumed.as_ref(), limit)?;
+        require_result_scope(&result, &result_tenant, &result_bucket)?;
         require_computation_shape(&result, &query_shape)?;
         if response_fence != fence {
             return Err(Status::data_loss(
@@ -476,6 +482,35 @@ fn validate_result(
             .facet_results
             .iter()
             .any(|facet| facet.buckets.len() > MAX_FACET_BUCKETS)
+        || result
+            .facet_results
+            .iter()
+            .any(|facet| !valid_facet_result(facet))
+        || result
+            .aggregate_results
+            .iter()
+            .any(|aggregate| !valid_aggregate_result(aggregate))
+        || result.freshness.index_id == 0
+        || result.freshness.definition_version == 0
+        || result.freshness.authorization_revision == 0
+        || result
+            .freshness
+            .sources
+            .iter()
+            .any(|source| source.node_id == 0 || source.source_epoch.len() != 32)
+        || result
+            .freshness
+            .sources
+            .windows(2)
+            .any(|pair| pair[0].node_id >= pair[1].node_id)
+        || (result.freshness.generation == 0
+            && (result.freshness.published_at.is_some()
+                || result.freshness.placement_term != 0
+                || result.freshness.placement_index != 0))
+        || (result.freshness.generation != 0
+            && (result.freshness.published_at.is_none()
+                || result.freshness.placement_term == 0
+                || result.freshness.placement_index == 0))
         || result.next_position.as_ref().is_some_and(Vec::is_empty)
         || (result.next_position.is_some() && result.freshness.generation == 0)
     {
@@ -487,6 +522,78 @@ fn validate_result(
         ));
     }
     Ok(())
+}
+
+fn require_result_scope(
+    result: &ExecutedIndexQuery,
+    tenant: &str,
+    bucket: &str,
+) -> Result<(), Status> {
+    for hit in &result.hits {
+        let address = hit
+            .address
+            .as_ref()
+            .ok_or_else(|| Status::data_loss("routed index hit has no object address"))?;
+        if hit.object_version == 0
+            || hit.score.is_some_and(|score| !score.is_finite())
+            || address.tenant != tenant
+            || address.bucket != bucket
+            || address.path.split('/').any(|segment| segment == "_anvil")
+            || ObjectKey::new(&address.tenant, &address.bucket, &address.path).is_err()
+        {
+            return Err(Status::data_loss(
+                "routed index hit is invalid or outside the requested scope",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn valid_facet_result(result: &anvil_api::v1::IndexFacetResult) -> bool {
+    result
+        .buckets
+        .iter()
+        .all(|bucket| bucket.count != 0 && canonical_scalar(&bucket.value_json).is_some())
+        && result.buckets.windows(2).all(|pair| {
+            pair[0].count > pair[1].count
+                || pair[0].count == pair[1].count
+                    && pair[0].value_json.as_slice() < pair[1].value_json.as_slice()
+        })
+}
+
+fn valid_aggregate_result(result: &anvil_api::v1::IndexAggregateResult) -> bool {
+    let Ok(operation) = IndexAggregateOperation::try_from(result.operation) else {
+        return false;
+    };
+    let value = result.value_json.as_deref().and_then(canonical_scalar);
+    match operation {
+        IndexAggregateOperation::Count => {
+            value.as_ref().and_then(serde_json::Value::as_u64) == Some(result.contributing_count)
+        }
+        IndexAggregateOperation::Minimum
+        | IndexAggregateOperation::Maximum
+        | IndexAggregateOperation::Sum
+        | IndexAggregateOperation::Average => {
+            if result.contributing_count == 0 {
+                result.value_json.is_none()
+            } else {
+                value.is_some_and(|value| value.is_number())
+            }
+        }
+    }
+}
+
+fn canonical_scalar(encoded: &[u8]) -> Option<serde_json::Value> {
+    let value = serde_json::from_slice::<serde_json::Value>(encoded).ok()?;
+    if matches!(
+        value,
+        serde_json::Value::Array(_) | serde_json::Value::Object(_)
+    ) || serde_json::to_vec(&value).ok()?.as_slice() != encoded
+    {
+        None
+    } else {
+        Some(value)
+    }
 }
 
 fn require_computation_shape(
@@ -656,6 +763,19 @@ mod tests {
         }
     }
 
+    fn published_freshness() -> anvil_api::v1::IndexFreshness {
+        anvil_api::v1::IndexFreshness {
+            generation: 1,
+            published_at: Some(Default::default()),
+            authorization_revision: 19,
+            placement_term: 1,
+            placement_index: 1,
+            index_id: 11,
+            definition_version: 13,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn peer_wire_round_trip_contains_no_caller_or_allow_decision() {
         let value = request();
@@ -728,10 +848,9 @@ mod tests {
                 facet_results: Vec::new(),
                 aggregate_results: Vec::new(),
                 freshness: anvil_api::v1::IndexFreshness {
-                    generation: 1,
                     placement_term: 31,
                     placement_index: 32,
-                    ..Default::default()
+                    ..published_freshness()
                 },
                 next_position: None,
             },
@@ -766,10 +885,7 @@ mod tests {
                 hits: Vec::new(),
                 facet_results: expected_facets.clone(),
                 aggregate_results: expected_aggregates.clone(),
-                freshness: anvil_api::v1::IndexFreshness {
-                    generation: 1,
-                    ..Default::default()
-                },
+                freshness: published_freshness(),
                 next_position: None,
             },
             PlacementLogId { term: 7, index: 8 },
@@ -844,6 +960,64 @@ mod tests {
                 .code(),
             tonic::Code::DataLoss
         );
+    }
+
+    #[test]
+    fn routed_hits_remain_in_the_authenticated_tenant_and_bucket() {
+        let mut result = ExecutedIndexQuery {
+            hits: vec![anvil_api::v1::IndexQueryHit {
+                address: Some(anvil_api::v1::ObjectAddress {
+                    tenant: "tenant".into(),
+                    bucket: "objects".into(),
+                    path: "docs/a".into(),
+                }),
+                object_version: 3,
+                score: Some(1.0),
+            }],
+            facet_results: Vec::new(),
+            aggregate_results: Vec::new(),
+            freshness: published_freshness(),
+            next_position: None,
+        };
+        require_result_scope(&result, "tenant", "objects").unwrap();
+
+        result.hits[0].address.as_mut().unwrap().tenant = "another".into();
+        assert_eq!(
+            require_result_scope(&result, "tenant", "objects")
+                .unwrap_err()
+                .code(),
+            tonic::Code::DataLoss
+        );
+    }
+
+    #[test]
+    fn routed_computation_payloads_are_canonical_and_ordered() {
+        let mut facet = IndexFacetResult {
+            field: "ecosystem".into(),
+            buckets: vec![
+                IndexFacetBucket {
+                    value_json: br#""cargo""#.to_vec(),
+                    count: 2,
+                },
+                IndexFacetBucket {
+                    value_json: br#""npm""#.to_vec(),
+                    count: 1,
+                },
+            ],
+        };
+        assert!(valid_facet_result(&facet));
+        facet.buckets.swap(0, 1);
+        assert!(!valid_facet_result(&facet));
+
+        let mut aggregate = IndexAggregateResult {
+            field: "severity".into(),
+            operation: IndexAggregateOperation::Count as i32,
+            value_json: Some(b"4".to_vec()),
+            contributing_count: 4,
+        };
+        assert!(valid_aggregate_result(&aggregate));
+        aggregate.value_json = Some(b"04".to_vec());
+        assert!(!valid_aggregate_result(&aggregate));
     }
 
     #[test]

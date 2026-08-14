@@ -651,6 +651,7 @@ fn scalar_record(
             points.push(ProjectedPoint {
                 field_id: field.id,
                 present: true,
+                null,
                 values: non_null.clone(),
             });
         }
@@ -1428,12 +1429,14 @@ mod tests {
         assert!(record.terms.is_empty());
         assert_eq!(record.points.len(), 1);
         assert!(record.points[0].present);
+        assert!(!record.points[0].null);
         assert_eq!(record.doc_values.len(), 1);
 
         let (source, _) = upsert(&schema, Some(br#"{"modified":null}"#));
         let record = &source.records[0];
         assert!(record.terms.is_empty());
         assert!(record.points[0].present);
+        assert!(record.points[0].null);
         assert!(record.points[0].values.is_empty());
         assert!(record.doc_values[0].cell.null);
     }
