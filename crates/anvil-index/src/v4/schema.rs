@@ -3,11 +3,12 @@ use std::collections::BTreeSet;
 use crate::IndexError;
 
 use super::codec::{COMPONENT_HEADER_BYTES, Encoder};
-use super::model::{ComponentKind, INDEX_COMPONENT_BYTES, INDEX_ROUTING_KEY_BYTES};
+use super::model::{
+    ComponentKind, INDEX_COMPONENT_BYTES, INDEX_ROUTING_KEY_BYTES, INDEX_TERM_BYTES,
+};
 
 const SCHEMA_DOMAIN: &[u8] = b"anvil.index.schema.v4";
 const STATISTICS_FIXED_PAYLOAD_BYTES: usize = 35;
-const STATISTICS_PHYSICAL_BOUNDS_BYTES: usize = 2 * (4 + INDEX_ROUTING_KEY_BYTES);
 const STATISTICS_FIELD_BYTES: usize = 103;
 const STATISTICS_LENGTH_OPTIONS_BYTES: usize = 8;
 const STATISTICS_VECTOR_DIMENSIONS_BYTES: usize = 4;
@@ -548,9 +549,15 @@ impl Schema {
         let mut component_count = 3usize;
         let mut component_statistics_count = 0usize;
         let mut statistics_payload_bytes = STATISTICS_FIXED_PAYLOAD_BYTES;
-        if !self.physical_order.is_empty() {
+        let maximum_physical_order_key_bytes = self.maximum_physical_order_key_bytes()?;
+        if maximum_physical_order_key_bytes != 0 {
             statistics_payload_bytes = statistics_payload_bytes
-                .checked_add(STATISTICS_PHYSICAL_BOUNDS_BYTES)
+                .checked_add(
+                    maximum_physical_order_key_bytes
+                        .checked_add(4)
+                        .and_then(|bytes| bytes.checked_mul(2))
+                        .ok_or(IndexError::OffsetOverflow)?,
+                )
                 .ok_or(IndexError::OffsetOverflow)?;
         }
         for field in &self.fields {
@@ -630,6 +637,34 @@ impl Schema {
             component_count,
             component_statistics_count,
             statistics_payload_bytes,
+        })
+    }
+
+    pub(crate) fn maximum_physical_order_key_bytes(&self) -> Result<usize, IndexError> {
+        self.physical_order.iter().try_fold(0usize, |total, order| {
+            let field = self
+                .fields
+                .get(order.field_id.get() as usize)
+                .ok_or_else(|| IndexError::InvalidDefinition("unknown order field".into()))?;
+            // One outer presence byte precedes every encoded scalar. Keyword
+            // bytes are zero-escaped and terminated, so an all-NUL value is
+            // the exact worst case. Other scalar widths are fixed.
+            let field_bytes = match field.field_type {
+                FieldType::Boolean => 3,
+                FieldType::SignedInteger | FieldType::UnsignedInteger | FieldType::Float => 10,
+                FieldType::Keyword => INDEX_TERM_BYTES
+                    .checked_mul(2)
+                    .and_then(|bytes| bytes.checked_add(4))
+                    .ok_or(IndexError::OffsetOverflow)?,
+                FieldType::Text | FieldType::Vector => {
+                    return Err(IndexError::InvalidDefinition(
+                        "physical order field type is not orderable".into(),
+                    ));
+                }
+            };
+            total
+                .checked_add(field_bytes)
+                .ok_or(IndexError::OffsetOverflow)
         })
     }
 
@@ -745,7 +780,7 @@ mod tests {
     use super::*;
     use crate::v4::{
         ComponentStatistics, FieldStatistics, INDEX_DECODE_BYTES, PhysicalOrderBounds,
-        SegmentStatistics,
+        ScalarValue, SegmentStatistics, SortValue, encode_physical_order_key,
     };
 
     fn component(role: ComponentKind, field_id: Option<FieldId>) -> ComponentStatistics {
@@ -816,8 +851,8 @@ mod tests {
             1,
             0,
             (!schema.physical_order.is_empty()).then(|| PhysicalOrderBounds {
-                minimum_key: vec![0; INDEX_ROUTING_KEY_BYTES],
-                maximum_key: vec![0; INDEX_ROUTING_KEY_BYTES],
+                minimum_key: vec![0; schema.maximum_physical_order_key_bytes().unwrap()],
+                maximum_key: vec![0; schema.maximum_physical_order_key_bytes().unwrap()],
             }),
             fields,
             components,
@@ -998,5 +1033,44 @@ mod tests {
         let mut invalid = schema();
         invalid.fields[0].cardinality = Cardinality::Multi;
         assert!(invalid.fingerprint().is_err());
+    }
+
+    #[test]
+    fn physical_order_admits_one_maximum_keyword_and_rejects_oversized_composites() {
+        let capabilities = FieldCapabilities::ORDER;
+        let mut one = admission_schema(1, FieldType::Keyword, capabilities, true);
+        one.physical_order[0].field_id = FieldId::new(0);
+        one.validate().unwrap();
+        assert_eq!(
+            one.maximum_physical_order_key_bytes().unwrap(),
+            2 * INDEX_TERM_BYTES + 4
+        );
+        let maximum_key = encode_physical_order_key(&[(
+            SortValue::Value(ScalarValue::String("\0".repeat(INDEX_TERM_BYTES))),
+            OrderDirection::Ascending,
+        )])
+        .unwrap();
+        assert_eq!(
+            maximum_key.len(),
+            one.maximum_physical_order_key_bytes().unwrap()
+        );
+        assert_eq!(
+            maximum_statistics(&one).encode_payload().unwrap().len(),
+            one.segment_shape().unwrap().statistics_payload_bytes
+        );
+
+        let mut composite = admission_schema(4, FieldType::Keyword, capabilities, false);
+        composite.physical_order = composite
+            .fields
+            .iter()
+            .map(|field| OrderField {
+                field_id: field.id,
+                direction: OrderDirection::Ascending,
+            })
+            .collect();
+        assert!(matches!(
+            composite.validate(),
+            Err(IndexError::ResourceLimit { .. })
+        ));
     }
 }

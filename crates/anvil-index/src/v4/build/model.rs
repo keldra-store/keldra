@@ -2,8 +2,10 @@ use crate::FIXED_INDEX_SEAL_WORKSPACE_BYTES;
 use crate::IndexError;
 
 use super::super::{
-    DocValueCell, FieldId, INDEX_COMPONENT_BYTES, INDEX_ROUTING_KEY_BYTES, INDEX_TERM_BYTES,
-    ObjectIdentity, ScalarValue,
+    DocValueCell, FieldId, INDEX_COMPONENT_BYTES, INDEX_TERM_BYTES,
+    ObjectIdentity, ScalarValue, TERM_TYPE_BOOLEAN, TERM_TYPE_FIELD_PRESENCE,
+    TERM_TYPE_HASHED_KEYWORD, TERM_TYPE_NULL, TERM_TYPE_NUMBER, TERM_TYPE_SIGNED, TERM_TYPE_STRING,
+    TERM_TYPE_TEXT, TERM_TYPE_UNSIGNED, canonical_term_key,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,9 +84,19 @@ pub struct ProjectedTerm {
 
 impl ProjectedTerm {
     fn validate(&self) -> Result<(), IndexError> {
+        let valid_width = match self.term_type {
+            TERM_TYPE_NULL | TERM_TYPE_BOOLEAN | TERM_TYPE_FIELD_PRESENCE => self.term.len() == 1,
+            TERM_TYPE_NUMBER | TERM_TYPE_SIGNED | TERM_TYPE_UNSIGNED => self.term.len() == 8,
+            TERM_TYPE_STRING => {
+                self.term.first() == Some(&0) && self.term.len() <= INDEX_TERM_BYTES + 1
+            }
+            TERM_TYPE_TEXT => self.term.len() <= INDEX_TERM_BYTES,
+            TERM_TYPE_HASHED_KEYWORD => self.term.len() == 40,
+            _ => false,
+        };
         if self.term_type == 0
             || self.term.is_empty()
-            || self.term.len() > INDEX_TERM_BYTES
+            || !valid_width
             || self.frequency == 0
             || !self.positions.is_empty() && self.positions.len() != self.frequency as usize
             || self.positions.windows(2).any(|pair| pair[0] >= pair[1])
@@ -98,11 +110,7 @@ impl ProjectedTerm {
 
     pub(crate) fn canonical_key(&self) -> Result<Vec<u8>, IndexError> {
         self.validate()?;
-        let mut key = Vec::with_capacity(5 + self.term.len());
-        key.extend_from_slice(&self.field_id.get().to_be_bytes());
-        key.push(self.term_type);
-        key.extend_from_slice(&self.term);
-        Ok(key)
+        canonical_term_key(self.field_id, self.term_type, &self.term)
     }
 }
 
@@ -118,6 +126,9 @@ pub struct ProjectedPoint {
     pub field_id: FieldId,
     /// True when the source field exists, including an explicit JSON null.
     pub present: bool,
+    /// At least one explicit JSON null occurred. This is separate from an
+    /// empty multi-valued field.
+    pub null: bool,
     pub values: Vec<ScalarValue>,
 }
 
@@ -148,7 +159,7 @@ impl ProjectedRecord {
         for term in &self.terms {
             term.validate()?;
         }
-        if self.order_key.len() > INDEX_ROUTING_KEY_BYTES
+        if self.order_key.len() > INDEX_COMPONENT_BYTES
             || self
                 .points
                 .windows(2)
@@ -385,5 +396,23 @@ mod tests {
         assert!(
             BuildLimits::with_resident_limits(total, 24 * 1024 * 1024, 16 * 1024 * 1024).is_err()
         );
+    }
+
+    #[test]
+    fn projected_keyword_accepts_the_exact_raw_length_boundary() {
+        let (term_type, term) = super::super::super::scalar_term(&ScalarValue::String(
+            "x".repeat(INDEX_TERM_BYTES),
+        ))
+        .unwrap();
+        assert_eq!(term.len(), INDEX_TERM_BYTES + 1);
+        let projected = ProjectedTerm {
+            field_id: FieldId::new(1),
+            term_type,
+            term,
+            frequency: 1,
+            positions: Vec::new(),
+        };
+        assert!(projected.validate().is_ok());
+        assert!(projected.canonical_key().is_ok());
     }
 }

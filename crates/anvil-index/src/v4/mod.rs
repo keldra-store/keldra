@@ -66,8 +66,8 @@ pub use postings::{
     POSTING_SKIP_INTERVAL, PostingBlock, PostingCodec, PostingCursor, PostingImpact, PostingList,
 };
 pub use points::{
-    POINTS_COMPONENT_CODEC_VERSION, PointBlock, PointEntry, PointValue, point_presence_key,
-    point_scalar_key, point_value_key,
+    POINTS_COMPONENT_CODEC_VERSION, PointBlock, PointEntry, PointValue, point_entry_key,
+    point_presence_key, point_scalar_key, point_value_key, point_value_range,
 };
 pub use query::{
     AggregateOperation, AggregateRequest, AggregateResult, CandidateGate, CandidateGateEvidence,

@@ -592,6 +592,7 @@ fn numeric_point_source(path: &str, present: bool, value: Option<i64>) -> Projec
                 .then(|| ProjectedPoint {
                     field_id: FieldId::new(0),
                     present: true,
+                    null: value.is_none(),
                     values: value.into_iter().map(ScalarValue::Signed).collect(),
                 })
                 .into_iter()

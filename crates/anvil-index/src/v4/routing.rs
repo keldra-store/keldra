@@ -2,9 +2,10 @@ use crate::IndexError;
 
 use super::artifact::ArtifactDescriptor;
 use super::codec::{COMPONENT_HEADER_BYTES, Decoder, Encoder};
+use super::keys::{TERM_TYPE_STRING, TERM_TYPE_TEXT};
 use super::model::{
     ComponentKind, INDEX_COMPONENT_BYTES, INDEX_ROUTING_FANOUT, INDEX_ROUTING_HEIGHT,
-    INDEX_ROUTING_KEY_BYTES, validate_term_routing_key,
+    INDEX_ROUTING_KEY_BYTES, INDEX_TERM_BYTES, validate_routing_key, validate_term_routing_key,
 };
 
 const ROUTING_CODEC_VERSION: u16 = 1;
@@ -26,49 +27,64 @@ pub struct RoutingNode {
     pub index_id: u64,
     /// One points at data blocks; larger values point at routing nodes.
     pub height: u8,
+    logical_kind: ComponentKind,
     entries: Vec<RoutingEntry>,
 }
 
 impl RoutingNode {
     pub fn new(index_id: u64, height: u8, entries: Vec<RoutingEntry>) -> Result<Self, IndexError> {
+        if height != 1 {
+            return Err(IndexError::InvalidDefinition(
+                "routing nodes above leaves require an explicit logical kind".into(),
+            ));
+        }
+        let logical_kind = entries
+            .first()
+            .map(|entry| entry.child.component_kind)
+            .ok_or_else(|| {
+                IndexError::InvalidDefinition("routing node must not be empty".into())
+            })?;
+        Self::new_for_kind(index_id, height, logical_kind, entries)
+    }
+
+    pub(crate) fn new_for_kind(
+        index_id: u64,
+        height: u8,
+        logical_kind: ComponentKind,
+        entries: Vec<RoutingEntry>,
+    ) -> Result<Self, IndexError> {
         if index_id == 0
             || height == 0
             || height > INDEX_ROUTING_HEIGHT
             || entries.is_empty()
             || entries.len() > INDEX_ROUTING_FANOUT
+            || logical_kind == ComponentKind::ROUTING_NODE
         {
             return Err(IndexError::InvalidDefinition(
                 "routing node identity, height, or fanout is invalid".into(),
             ));
         }
         let mut previous_max: Option<&[u8]> = None;
-        let mut leaf_kind = None;
         for entry in &entries {
-            validate_term_routing_key(&entry.minimum_key)?;
-            validate_term_routing_key(&entry.maximum_key)?;
+            validate_logical_routing_key(logical_kind, &entry.minimum_key)?;
+            validate_logical_routing_key(logical_kind, &entry.maximum_key)?;
             entry.child.validate(index_id)?;
             if entry.element_count == 0
                 || entry.minimum_key > entry.maximum_key
                 || previous_max.is_some_and(|previous| previous >= entry.minimum_key.as_slice())
                 || height > 1 && entry.child.component_kind != ComponentKind::ROUTING_NODE
+                || height == 1 && entry.child.component_kind != logical_kind
             {
                 return Err(IndexError::InvalidDefinition(
                     "routing child ranges must be non-empty, ordered, and non-overlapping".into(),
                 ));
-            }
-            if height == 1 {
-                if leaf_kind.is_some_and(|kind| kind != entry.child.component_kind) {
-                    return Err(IndexError::InvalidDefinition(
-                        "routing leaves must have one logical component kind".into(),
-                    ));
-                }
-                leaf_kind = Some(entry.child.component_kind);
             }
             previous_max = Some(&entry.maximum_key);
         }
         let node = Self {
             index_id,
             height,
+            logical_kind,
             entries,
         };
         let needed = node.encode_payload()?.len();
@@ -85,6 +101,10 @@ impl RoutingNode {
         &self.entries
     }
 
+    pub fn logical_kind(&self) -> ComponentKind {
+        self.logical_kind
+    }
+
     pub fn child_for(&self, key: &[u8]) -> Option<&RoutingEntry> {
         let offset = self
             .entries
@@ -98,10 +118,11 @@ impl RoutingNode {
         let mut out = Encoder::default();
         out.u16(ROUTING_CODEC_VERSION);
         out.u8(self.height);
+        out.u16(self.logical_kind.get());
         out.usize_u32(self.entries.len())?;
         for entry in &self.entries {
-            encode_routing_key(&mut out, &entry.minimum_key)?;
-            encode_routing_key(&mut out, &entry.maximum_key)?;
+            encode_routing_key(&mut out, self.logical_kind, &entry.minimum_key)?;
+            encode_routing_key(&mut out, self.logical_kind, &entry.maximum_key)?;
             out.u64(entry.element_count);
             encode_artifact(&mut out, &entry.child)?;
         }
@@ -114,6 +135,8 @@ impl RoutingNode {
             return Err(IndexError::InvalidFormat("routing codec version"));
         }
         let height = input.u8()?;
+        let logical_kind = ComponentKind::new(input.u16()?)
+            .map_err(|_| IndexError::InvalidFormat("routing logical component kind"))?;
         let count = usize::try_from(input.u32()?).map_err(|_| IndexError::OffsetOverflow)?;
         input.claim(
             count
@@ -123,32 +146,36 @@ impl RoutingNode {
         let mut entries = Vec::with_capacity(count);
         for _ in 0..count {
             entries.push(RoutingEntry {
-                minimum_key: decode_routing_key(&mut input)?,
-                maximum_key: decode_routing_key(&mut input)?,
+                minimum_key: decode_routing_key(&mut input, logical_kind)?,
+                maximum_key: decode_routing_key(&mut input, logical_kind)?,
                 element_count: input.u64()?,
                 child: decode_artifact(index_id, &mut input)?,
             });
         }
         input.finish()?;
-        Self::new(index_id, height, entries)
+        Self::new_for_kind(index_id, height, logical_kind, entries)
     }
 }
 
 /// Encode one logical boundary without ever placing more than 4,096 bytes in
 /// one routing key. Long canonical terms keep their fixed FieldId/type prefix
 /// once and split the ordered value into at most eight radix fragments.
-fn encode_routing_key(out: &mut Encoder, key: &[u8]) -> Result<(), IndexError> {
-    validate_term_routing_key(key)?;
+fn encode_routing_key(
+    out: &mut Encoder,
+    logical_kind: ComponentKind,
+    key: &[u8],
+) -> Result<(), IndexError> {
+    validate_logical_routing_key(logical_kind, key)?;
     if key.len() <= INDEX_ROUTING_KEY_BYTES {
         out.u8(INLINE_ROUTING_KEY);
         out.bytes(key)?;
         return Ok(());
     }
-    let (prefix, value) = key
-        .split_at_checked(CANONICAL_TERM_PREFIX_BYTES)
-        .ok_or(IndexError::InvalidDefinition(
-            "long routing key has no canonical term prefix".into(),
-        ))?;
+    let (prefix, value) =
+        key.split_at_checked(CANONICAL_TERM_PREFIX_BYTES)
+            .ok_or(IndexError::InvalidDefinition(
+                "long routing key has no canonical term prefix".into(),
+            ))?;
     let fragments = value.len().div_ceil(INDEX_ROUTING_KEY_BYTES);
     if fragments == 0 || fragments > MAXIMUM_RADIX_FRAGMENTS {
         return Err(IndexError::ResourceLimit {
@@ -165,14 +192,17 @@ fn encode_routing_key(out: &mut Encoder, key: &[u8]) -> Result<(), IndexError> {
     Ok(())
 }
 
-fn decode_routing_key(input: &mut Decoder<'_>) -> Result<Vec<u8>, IndexError> {
+fn decode_routing_key(
+    input: &mut Decoder<'_>,
+    logical_kind: ComponentKind,
+) -> Result<Vec<u8>, IndexError> {
     match input.u8()? {
         INLINE_ROUTING_KEY => {
             let key = input.owned_bytes()?;
             if key.len() > INDEX_ROUTING_KEY_BYTES {
                 return Err(IndexError::InvalidFormat("inline routing key length"));
             }
-            validate_term_routing_key(&key)
+            validate_logical_routing_key(logical_kind, &key)
                 .map_err(|_| IndexError::InvalidFormat("inline routing key"))?;
             Ok(key)
         }
@@ -216,11 +246,39 @@ fn decode_routing_key(input: &mut Decoder<'_>) -> Result<Vec<u8>, IndexError> {
             for fragment in fragments {
                 key.extend_from_slice(fragment);
             }
-            validate_term_routing_key(&key)
+            validate_logical_routing_key(logical_kind, &key)
                 .map_err(|_| IndexError::InvalidFormat("routing radix key"))?;
             Ok(key)
         }
         _ => Err(IndexError::InvalidFormat("routing key encoding")),
+    }
+}
+
+pub(crate) fn validate_logical_routing_key(
+    logical_kind: ComponentKind,
+    key: &[u8],
+) -> Result<(), IndexError> {
+    if logical_kind != ComponentKind::TERM_DICTIONARY {
+        return validate_routing_key(key);
+    }
+    validate_term_routing_key(key)?;
+    if key.len() <= INDEX_ROUTING_KEY_BYTES {
+        return Ok(());
+    }
+    if key.len() <= CANONICAL_TERM_PREFIX_BYTES {
+        return Err(IndexError::InvalidDefinition(
+            "long routing key has no canonical term value".into(),
+        ));
+    }
+    let term = &key[CANONICAL_TERM_PREFIX_BYTES..];
+    match key[4] {
+        TERM_TYPE_STRING if term.first() == Some(&0) && term.len() <= INDEX_TERM_BYTES + 1 => {
+            Ok(())
+        }
+        TERM_TYPE_TEXT if term.len() <= INDEX_TERM_BYTES => Ok(()),
+        _ => Err(IndexError::InvalidDefinition(
+            "long routing key is not a canonical ordered term".into(),
+        )),
     }
 }
 
@@ -350,9 +408,11 @@ mod tests {
     fn long_term_boundaries_use_bounded_radix_fragments_and_seek_exactly() {
         let prefix = [0, 0, 0, 2, 5];
         let mut first = prefix.to_vec();
-        first.extend(std::iter::repeat_n(b'a', 12_000));
+        first.push(0);
+        first.extend(vec![b'a'; 12_000]);
         let mut second = prefix.to_vec();
-        second.extend(std::iter::repeat_n(b'b', super::super::model::INDEX_TERM_BYTES));
+        second.push(0);
+        second.extend(vec![b'b'; super::super::model::INDEX_TERM_BYTES]);
         let node = RoutingNode::new(
             7,
             1,
@@ -376,5 +436,37 @@ mod tests {
         let decoded = RoutingNode::decode_payload(7, &encoded).unwrap();
         assert_eq!(decoded, node);
         assert_eq!(decoded.child_for(&second).unwrap().minimum_key, second);
+
+        let mut corrupted = encoded;
+        corrupted[3..5].copy_from_slice(&ComponentKind::POSTINGS.get().to_le_bytes());
+        assert!(RoutingNode::decode_payload(7, &corrupted).is_err());
+
+        let mut corrupted = node.encode_payload().unwrap();
+        // codec(2), height(1), logical kind(2), count(4), key encoding(1),
+        // canonical prefix(5), then the fragment count.
+        corrupted[15] = (MAXIMUM_RADIX_FRAGMENTS + 1) as u8;
+        assert!(RoutingNode::decode_payload(7, &corrupted).is_err());
+    }
+
+    #[test]
+    fn long_keys_are_rejected_outside_canonical_term_streams() {
+        let key = vec![b'x'; INDEX_ROUTING_KEY_BYTES + 1];
+        let entry = RoutingEntry {
+            minimum_key: key.clone(),
+            maximum_key: key,
+            element_count: 1,
+            child: artifact(7, ComponentKind::POSTINGS, 1),
+        };
+        assert!(RoutingNode::new_for_kind(7, 1, ComponentKind::POSTINGS, vec![entry]).is_err());
+
+        let mut invalid_term = [0, 0, 0, 2, TERM_TYPE_STRING].to_vec();
+        invalid_term.extend(vec![b'x'; INDEX_ROUTING_KEY_BYTES]);
+        let entry = RoutingEntry {
+            minimum_key: invalid_term.clone(),
+            maximum_key: invalid_term,
+            element_count: 1,
+            child: artifact(7, ComponentKind::TERM_DICTIONARY, 1),
+        };
+        assert!(RoutingNode::new(7, 1, vec![entry]).is_err());
     }
 }

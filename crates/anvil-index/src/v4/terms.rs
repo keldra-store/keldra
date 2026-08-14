@@ -1,7 +1,10 @@
 use crate::IndexError;
 
 use super::codec::{COMPONENT_HEADER_BYTES, Decoder, Encoder};
-use super::model::{INDEX_COMPONENT_BYTES, validate_term_routing_key};
+use super::keys::{TERM_TYPE_STRING, TERM_TYPE_TEXT};
+use super::model::{
+    INDEX_COMPONENT_BYTES, INDEX_ROUTING_KEY_BYTES, INDEX_TERM_BYTES, validate_term_routing_key,
+};
 
 const TERM_DICTIONARY_CODEC_VERSION: u16 = 1;
 const MAX_PAYLOAD_BYTES: usize = INDEX_COMPONENT_BYTES - COMPONENT_HEADER_BYTES;
@@ -144,7 +147,7 @@ fn validate_entries(entries: &[TermEntry]) -> Result<(), IndexError> {
         ));
     }
     for entry in entries {
-        if validate_term_routing_key(&entry.term).is_err()
+        if validate_dictionary_term(&entry.term).is_err()
             || entry.postings.document_frequency == 0
             || entry.postings.total_term_frequency < entry.postings.document_frequency
             || entry.postings.component_count == 0
@@ -163,6 +166,25 @@ fn validate_entries(entries: &[TermEntry]) -> Result<(), IndexError> {
         return Err(IndexError::UnsortedRecords);
     }
     Ok(())
+}
+
+fn validate_dictionary_term(term: &[u8]) -> Result<(), IndexError> {
+    validate_term_routing_key(term)?;
+    if term.len() <= INDEX_ROUTING_KEY_BYTES {
+        return Ok(());
+    }
+    let value = term.get(5..).ok_or_else(|| {
+        IndexError::InvalidDefinition("long dictionary term has no canonical prefix".into())
+    })?;
+    match term[4] {
+        TERM_TYPE_STRING if value.first() == Some(&0) && value.len() <= INDEX_TERM_BYTES + 1 => {
+            Ok(())
+        }
+        TERM_TYPE_TEXT if value.len() <= INDEX_TERM_BYTES => Ok(()),
+        _ => Err(IndexError::InvalidDefinition(
+            "long dictionary term is not a canonical ordered value".into(),
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -207,19 +229,17 @@ mod tests {
 
     #[test]
     fn ordered_terms_accept_every_supported_long_boundary() {
-        for length in [4_097, super::super::model::INDEX_TERM_ROUTING_BYTES] {
-            let dictionary = TermDictionary::new(vec![entry(&vec![b'x'; length], 1)]).unwrap();
+        for raw_length in [4_091, INDEX_TERM_BYTES] {
+            let mut term = vec![0, 0, 0, 1, TERM_TYPE_STRING, 0];
+            term.extend(vec![b'x'; raw_length]);
+            let dictionary = TermDictionary::new(vec![entry(&term, 1)]).unwrap();
             assert_eq!(
                 TermDictionary::decode_payload(&dictionary.encode_payload().unwrap()).unwrap(),
                 dictionary
             );
         }
-        assert!(
-            TermDictionary::new(vec![entry(
-                &vec![b'x'; super::super::model::INDEX_TERM_ROUTING_BYTES + 1],
-                1,
-            )])
-            .is_err()
-        );
+        let mut oversized = vec![0, 0, 0, 1, TERM_TYPE_STRING, 0];
+        oversized.extend(vec![b'x'; INDEX_TERM_BYTES + 1]);
+        assert!(TermDictionary::new(vec![entry(&oversized, 1)]).is_err());
     }
 }

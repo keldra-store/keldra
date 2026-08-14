@@ -26,16 +26,26 @@ pub fn canonical_term_key(
             "canonical terms require a type and value".into(),
         ));
     }
+    let limit = match term_type {
+        // STRING includes the one-byte empty-string/order marker in addition
+        // to the RFC's raw 32,766-byte keyword limit.
+        TERM_TYPE_STRING if term.first() == Some(&0) => INDEX_TERM_BYTES + 1,
+        TERM_TYPE_HASHED_KEYWORD if term.len() == 40 => 40,
+        _ => INDEX_TERM_BYTES,
+    };
+    if term.len() > limit
+        || term_type == TERM_TYPE_STRING && term.first() != Some(&0)
+        || term_type == TERM_TYPE_HASHED_KEYWORD && term.len() != 40
+    {
+        return Err(IndexError::ResourceLimit {
+            needed: term.len(),
+            limit,
+        });
+    }
     let mut key = Vec::with_capacity(5usize.saturating_add(term.len()));
     key.extend_from_slice(&field_id.get().to_be_bytes());
     key.push(term_type);
     key.extend_from_slice(term);
-    if term.len() > INDEX_TERM_BYTES {
-        return Err(IndexError::ResourceLimit {
-            needed: term.len(),
-            limit: INDEX_TERM_BYTES,
-        });
-    }
     Ok(key)
 }
 
@@ -262,5 +272,25 @@ mod tests {
             .unwrap();
             assert!(left < right);
         }
+    }
+
+    #[test]
+    fn raw_keyword_limit_accounts_for_the_order_marker_exactly() {
+        let maximum = ScalarValue::String("x".repeat(INDEX_TERM_BYTES));
+        let (term_type, term) = scalar_term(&maximum).unwrap();
+        assert_eq!(term_type, TERM_TYPE_STRING);
+        assert_eq!(term.len(), INDEX_TERM_BYTES + 1);
+        assert_eq!(
+            canonical_term_key(FieldId::new(3), term_type, &term)
+                .unwrap()
+                .len(),
+            INDEX_TERM_BYTES + 6
+        );
+
+        let oversized = ScalarValue::String("x".repeat(INDEX_TERM_BYTES + 1));
+        let (term_type, term) = scalar_term(&oversized).unwrap();
+        assert_eq!(term_type, TERM_TYPE_HASHED_KEYWORD);
+        assert_eq!(term.len(), 40);
+        assert!(canonical_term_key(FieldId::new(3), term_type, &term).is_ok());
     }
 }

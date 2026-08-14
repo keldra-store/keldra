@@ -156,8 +156,11 @@ impl<'a, D: ArtifactDirectoryRead> ComponentStream<'a, D> {
             if pending
                 .expected_height
                 .is_some_and(|height| height != routing.height)
+                || routing.logical_kind() != self.logical_kind
             {
-                return Err(IndexError::InvalidFormat("format-v4 routing child height"));
+                return Err(IndexError::InvalidFormat(
+                    "format-v4 routing child height or logical kind",
+                ));
             }
             let child_height = routing.height - 1;
             for entry in routing.entries().iter().rev() {

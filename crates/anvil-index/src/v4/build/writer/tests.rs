@@ -85,7 +85,7 @@ fn text_record(order: &str, term: String) -> ProjectedRecord {
         order_key: order.as_bytes().to_vec(),
         terms: vec![ProjectedTerm {
             field_id: FieldId::new(0),
-            term_type: 1,
+            term_type: crate::v4::TERM_TYPE_TEXT,
             term: term.clone().into_bytes(),
             frequency: 1,
             positions: vec![1],

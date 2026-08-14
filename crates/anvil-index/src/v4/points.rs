@@ -7,14 +7,21 @@ use super::{DocId, FieldId, INDEX_COMPONENT_BYTES, ScalarValue, canonical_term_k
 pub const POINTS_COMPONENT_CODEC_VERSION: u16 = 1;
 const MAX_PAYLOAD_BYTES: usize = INDEX_COMPONENT_BYTES - COMPONENT_HEADER_BYTES;
 const POINT_RECORD_PRESENCE: u8 = 1;
-const POINT_RECORD_VALUE: u8 = 2;
-const POINT_PRESENCE_TERM_TYPE: u8 = 0xfe;
+const POINT_RECORD_NULL: u8 = 2;
+const POINT_RECORD_VALUE: u8 = 3;
+// POINTS use their own key namespace. These tags intentionally sort in the
+// same order as `PointValue`: presence, null, then the numeric scalar tags.
+const POINT_PRESENCE_TERM_TYPE: u8 = 1;
 const POINT_PRESENCE_TERM: &[u8] = &[0];
+const POINT_NULL_TERM_TYPE: u8 = 2;
+const POINT_NULL_TERM: &[u8] = &[0];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PointValue {
     /// Exactly one record for every present field, including explicit null.
     Presence,
+    /// Exactly one record when at least one explicit null occurred.
+    Null,
     Value(ScalarValue),
 }
 
@@ -22,8 +29,11 @@ impl Ord for PointValue {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         match (self, other) {
             (Self::Presence, Self::Presence) => std::cmp::Ordering::Equal,
-            (Self::Presence, Self::Value(_)) => std::cmp::Ordering::Less,
-            (Self::Value(_), Self::Presence) => std::cmp::Ordering::Greater,
+            (Self::Presence, _) => std::cmp::Ordering::Less,
+            (_, Self::Presence) => std::cmp::Ordering::Greater,
+            (Self::Null, Self::Null) => std::cmp::Ordering::Equal,
+            (Self::Null, Self::Value(_)) => std::cmp::Ordering::Less,
+            (Self::Value(_), Self::Null) => std::cmp::Ordering::Greater,
             (Self::Value(left), Self::Value(right)) => left.cmp(right),
         }
     }
@@ -63,7 +73,7 @@ impl PointBlock {
             ));
         }
         let value_type = entries.iter().find_map(|entry| match &entry.value {
-            PointValue::Presence => None,
+            PointValue::Presence | PointValue::Null => None,
             PointValue::Value(value) => Some(std::mem::discriminant(value)),
         });
         if entries.iter().any(|entry| {
@@ -71,8 +81,8 @@ impl PointBlock {
                 if value_type.is_some_and(|expected| expected != std::mem::discriminant(value)))
         }) || entries.windows(2).any(|pair| {
             pair[0].doc_id == pair[1].doc_id
-                && pair[0].value == PointValue::Presence
-                && pair[1].value == PointValue::Presence
+                && pair[0].value == pair[1].value
+                && matches!(pair[0].value, PointValue::Presence | PointValue::Null)
         }) {
             return Err(IndexError::InvalidDefinition(
                 "one point block cannot mix numeric types or duplicate presence".into(),
@@ -101,6 +111,14 @@ impl PointBlock {
         &self.entries[self.entries.len() - 1].value
     }
 
+    pub fn minimum_entry(&self) -> &PointEntry {
+        &self.entries[0]
+    }
+
+    pub fn maximum_entry(&self) -> &PointEntry {
+        &self.entries[self.entries.len() - 1]
+    }
+
     pub fn encode_payload(&self) -> Result<Vec<u8>, IndexError> {
         let mut out = Encoder::default();
         out.u16(POINTS_COMPONENT_CODEC_VERSION);
@@ -109,6 +127,7 @@ impl PointBlock {
         for entry in &self.entries {
             match &entry.value {
                 PointValue::Presence => out.u8(POINT_RECORD_PRESENCE),
+                PointValue::Null => out.u8(POINT_RECORD_NULL),
                 PointValue::Value(value) => {
                     out.u8(POINT_RECORD_VALUE);
                     encode_scalar(&mut out, value)?;
@@ -135,6 +154,7 @@ impl PointBlock {
         for _ in 0..count {
             let value = match input.u8()? {
                 POINT_RECORD_PRESENCE => PointValue::Presence,
+                POINT_RECORD_NULL => PointValue::Null,
                 POINT_RECORD_VALUE => PointValue::Value(decode_scalar(&mut input)?),
                 _ => return Err(IndexError::InvalidFormat("point record kind")),
             };
@@ -152,6 +172,9 @@ pub fn point_value_key(field_id: FieldId, value: &PointValue) -> Result<Vec<u8>,
     if value == &PointValue::Presence {
         return canonical_term_key(field_id, POINT_PRESENCE_TERM_TYPE, POINT_PRESENCE_TERM);
     }
+    if value == &PointValue::Null {
+        return canonical_term_key(field_id, POINT_NULL_TERM_TYPE, POINT_NULL_TERM);
+    }
     let PointValue::Value(value) = value else { unreachable!() };
     if !is_numeric(value) {
         return Err(IndexError::InvalidDefinition(
@@ -168,6 +191,28 @@ pub fn point_scalar_key(field_id: FieldId, value: &ScalarValue) -> Result<Vec<u8
 
 pub fn point_presence_key(field_id: FieldId) -> Result<Vec<u8>, IndexError> {
     point_value_key(field_id, &PointValue::Presence)
+}
+
+/// A routed point-leaf key. The DocId suffix keeps adjacent leaves disjoint
+/// when many documents share one numeric value.
+pub fn point_entry_key(
+    field_id: FieldId,
+    value: &PointValue,
+    doc_id: DocId,
+) -> Result<Vec<u8>, IndexError> {
+    let mut key = point_value_key(field_id, value)?;
+    key.extend_from_slice(&doc_id.get().to_be_bytes());
+    Ok(key)
+}
+
+pub fn point_value_range(
+    field_id: FieldId,
+    value: &PointValue,
+) -> Result<(Vec<u8>, Vec<u8>), IndexError> {
+    Ok((
+        point_entry_key(field_id, value, DocId::new(0))?,
+        point_entry_key(field_id, value, DocId::new(u32::MAX))?,
+    ))
 }
 
 fn is_numeric(value: &ScalarValue) -> bool {
@@ -188,6 +233,10 @@ mod tests {
             vec![
                 PointEntry {
                     value: PointValue::Presence,
+                    doc_id: DocId::new(8),
+                },
+                PointEntry {
+                    value: PointValue::Null,
                     doc_id: DocId::new(8),
                 },
                 PointEntry {
@@ -216,5 +265,45 @@ mod tests {
                 PointEntry { value: PointValue::Presence, doc_id: DocId::new(4) },
             ],
         ).is_err());
+    }
+
+    #[test]
+    fn routed_keys_disambiguate_equal_values_by_doc_id() {
+        let value = PointValue::Value(ScalarValue::Signed(7));
+        let first = point_entry_key(FieldId::new(1), &value, DocId::new(1)).unwrap();
+        let second = point_entry_key(FieldId::new(1), &value, DocId::new(2)).unwrap();
+        assert!(first < second);
+        let (minimum, maximum) = point_value_range(FieldId::new(1), &value).unwrap();
+        assert!(minimum <= first && second <= maximum);
+    }
+
+    #[test]
+    fn routed_key_order_matches_point_value_order() {
+        let field = FieldId::new(1);
+        let entries = [
+            PointEntry { value: PointValue::Presence, doc_id: DocId::new(3) },
+            PointEntry { value: PointValue::Null, doc_id: DocId::new(3) },
+            PointEntry {
+                value: PointValue::Value(ScalarValue::Signed(-1)),
+                doc_id: DocId::new(3),
+            },
+            PointEntry {
+                value: PointValue::Value(ScalarValue::Signed(1)),
+                doc_id: DocId::new(3),
+            },
+        ];
+        for pair in entries.windows(2) {
+            assert!(compare_entries(&pair[0], &pair[1]).is_lt());
+            assert!(
+                point_entry_key(field, &pair[0].value, pair[0].doc_id).unwrap()
+                    < point_entry_key(field, &pair[1].value, pair[1].doc_id).unwrap()
+            );
+        }
+    }
+
+    fn compare_entries(left: &PointEntry, right: &PointEntry) -> std::cmp::Ordering {
+        left.value
+            .cmp(&right.value)
+            .then_with(|| left.doc_id.cmp(&right.doc_id))
     }
 }

@@ -27,15 +27,8 @@ fn routing_fanout(logical_kind: ComponentKind) -> usize {
     }
 }
 
-fn validate_stream_routing_key(
-    logical_kind: ComponentKind,
-    key: &[u8],
-) -> Result<(), IndexError> {
-    if logical_kind == ComponentKind::TERM_DICTIONARY {
-        super::super::model::validate_term_routing_key(key)
-    } else {
-        super::super::model::validate_routing_key(key)
-    }
+fn validate_stream_routing_key(logical_kind: ComponentKind, key: &[u8]) -> Result<(), IndexError> {
+    super::super::routing::validate_logical_routing_key(logical_kind, key)
 }
 
 /// One asynchronous durability boundary. Every returned descriptor names
@@ -785,7 +778,8 @@ impl<'a, S: ComponentBatchSink> StreamingComponentPublisher<'a, S> {
                 child: child.descriptor,
             })
             .collect();
-        let routing = RoutingNode::new(self.identity.index_id, height, entries)?;
+        let routing =
+            RoutingNode::new_for_kind(self.identity.index_id, height, self.logical_kind, entries)?;
         let payload = routing.encode_payload()?;
         let component = encode_component(
             self.identity,
@@ -966,7 +960,15 @@ pub async fn combine_published_streams<S: ComponentBatchSink>(
     let mut promoted = Vec::with_capacity(streams.len());
     for stream in streams {
         promoted.push(
-            promote_stream(sink, identity, routing_codec_version, stream, target_height).await?,
+            promote_stream(
+                sink,
+                identity,
+                logical_kind,
+                routing_codec_version,
+                stream,
+                target_height,
+            )
+            .await?,
         );
     }
     let minimum_key = promoted.first().unwrap().minimum_key.clone();
@@ -1012,9 +1014,10 @@ pub async fn combine_published_streams<S: ComponentBatchSink>(
         let fanout = routing_fanout(logical_kind);
         let mut parents = Vec::with_capacity(nodes.len().div_ceil(fanout));
         for children in nodes.chunks(fanout) {
-            let node = RoutingNode::new(
+            let node = RoutingNode::new_for_kind(
                 identity.index_id,
                 height,
+                logical_kind,
                 children
                     .iter()
                     .map(|child| RoutingEntry {
@@ -1078,6 +1081,7 @@ pub async fn combine_published_streams<S: ComponentBatchSink>(
 async fn promote_stream<S: ComponentBatchSink>(
     sink: &mut S,
     identity: SegmentIdentity,
+    logical_kind: ComponentKind,
     routing_codec_version: u16,
     mut stream: PublishedStream,
     target_height: u8,
@@ -1087,9 +1091,10 @@ async fn promote_stream<S: ComponentBatchSink>(
             .routing_height
             .checked_add(1)
             .ok_or(IndexError::OffsetOverflow)?;
-        let node = RoutingNode::new(
+        let node = RoutingNode::new_for_kind(
             identity.index_id,
             height,
+            logical_kind,
             vec![RoutingEntry {
                 minimum_key: stream.minimum_key.clone(),
                 maximum_key: stream.maximum_key.clone(),
@@ -1262,6 +1267,35 @@ mod tests {
         assert_eq!(sink.publish_calls(), 5);
         assert_eq!(sink.objects().len(), 5);
         assert!(sink.component_bytes(&stream.root).is_ok());
+    }
+
+    #[tokio::test]
+    async fn maximum_keyword_boundaries_use_bounded_term_fanout() {
+        let identity = SegmentIdentity::new(1, 2, [3; 32], 4).unwrap();
+        let mut sink = ExactMemorySink::new();
+        let mut publisher = StreamingComponentPublisher::new(
+            &mut sink,
+            identity,
+            ComponentKind::TERM_DICTIONARY,
+            1,
+            1,
+        )
+        .unwrap();
+        for discriminator in b'a'..=b'h' {
+            let mut key = vec![0, 0, 0, 1, super::super::super::TERM_TYPE_STRING, 0];
+            key.push(discriminator);
+            key.extend(vec![b'x'; super::super::super::INDEX_TERM_BYTES - 1]);
+            publisher
+                .push_payload(key.clone(), key, 1, vec![discriminator])
+                .await
+                .unwrap();
+        }
+        let stream = publisher.finish().await.unwrap();
+        assert_eq!(stream.routing_height, 2);
+        assert_eq!(stream.leaf_count, 8);
+        assert_eq!(stream.component_count, 11); // Eight leaves, two parents, one root.
+        let root = sink.component_bytes(&stream.root).unwrap();
+        assert!(root.len() <= super::super::super::INDEX_COMPONENT_BYTES);
     }
 
     #[tokio::test]

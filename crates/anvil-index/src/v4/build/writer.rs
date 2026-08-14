@@ -19,8 +19,10 @@ use self::streams::{
 };
 use self::terms::publish_terms;
 use super::super::{
-    ComponentKind, ComponentStatistics, FieldComponents, FieldId, IndexSemantics, Schema,
-    SegmentComponent, SegmentDescriptor, SegmentIdentity,
+    Cardinality, ComponentKind, ComponentStatistics, FIELD_PRESENCE_TERM, FieldComponents,
+    FieldId, FieldType, IndexSemantics, ScalarValue, Schema, SegmentComponent, SegmentDescriptor,
+    SegmentIdentity, TERM_TYPE_BOOLEAN, TERM_TYPE_FIELD_PRESENCE, TERM_TYPE_HASHED_KEYWORD,
+    TERM_TYPE_STRING, TERM_TYPE_TEXT,
 };
 use super::{
     BuildLimits, ComponentBatchSink, ProjectedRecord, ProjectedSource, PublishedStream, SourcePush,
@@ -415,6 +417,15 @@ async fn push_payload<S: ComponentBatchSink>(
 }
 
 fn validate_record_schema(schema: &Schema, record: &ProjectedRecord) -> Result<(), IndexError> {
+    let maximum_order_key_bytes = schema.maximum_physical_order_key_bytes()?;
+    if maximum_order_key_bytes == 0 && !record.order_key.is_empty()
+        || maximum_order_key_bytes != 0
+            && (record.order_key.is_empty() || record.order_key.len() > maximum_order_key_bytes)
+    {
+        return Err(IndexError::InvalidDefinition(
+            "projected physical-order key differs from its schema".into(),
+        ));
+    }
     for term in &record.terms {
         let field = require_field_component(schema, term.field_id, FieldComponents::TERMS)?;
         if !term.positions.is_empty() && !field.components.contains(FieldComponents::POSITIONS) {
@@ -422,16 +433,58 @@ fn validate_record_schema(schema: &Schema, record: &ProjectedRecord) -> Result<(
                 "projected term positions require a positions component".into(),
             ));
         }
+        let valid_term_type = term.term_type == TERM_TYPE_FIELD_PRESENCE
+            && term.term == FIELD_PRESENCE_TERM
+            && term.frequency == 1
+            && term.positions.is_empty()
+            || match field.field_type {
+                FieldType::Boolean => term.term_type == TERM_TYPE_BOOLEAN,
+                FieldType::Keyword => matches!(
+                    term.term_type,
+                    TERM_TYPE_STRING | TERM_TYPE_HASHED_KEYWORD
+                ),
+                FieldType::Text => term.term_type == TERM_TYPE_TEXT,
+                _ => false,
+            };
+        if !valid_term_type {
+            return Err(IndexError::InvalidDefinition(
+                "projected term differs from its field type".into(),
+            ));
+        }
     }
     for point in &record.points {
-        require_field_component(schema, point.field_id, FieldComponents::POINTS)?;
+        let field = require_field_component(schema, point.field_id, FieldComponents::POINTS)?;
+        if field.cardinality == Cardinality::Single
+            && point.values.len().saturating_add(usize::from(point.null)) > 1
+            || point
+                .values
+                .iter()
+                .any(|value| !scalar_matches_field(value, field.field_type))
+            || point.null && !field.allow_null
+            || field.cardinality == Cardinality::Single
+                && point.values.is_empty()
+                && !point.null
+        {
+            return Err(IndexError::InvalidDefinition(
+                "projected points differ from field type, cardinality, or null policy".into(),
+            ));
+        }
     }
     for column in &record.doc_values {
         let field =
             require_field_component(schema, column.field_id, FieldComponents::DOC_VALUES)?;
-        if column.multi_valued != (field.cardinality == super::super::Cardinality::Multi) {
+        if column.multi_valued != (field.cardinality == Cardinality::Multi)
+            || !column.cell.present && !field.allow_missing
+            || column.cell.null && !field.allow_null
+            || column
+                .cell
+                .values
+                .iter()
+                .any(|value| !scalar_matches_field(value, field.field_type))
+        {
             return Err(IndexError::InvalidDefinition(
-                "projected doc-value cardinality differs from its schema".into(),
+                "projected doc value differs from field type, cardinality, or presence policy"
+                    .into(),
             ));
         }
     }
@@ -455,7 +508,50 @@ fn validate_record_schema(schema: &Schema, record: &ProjectedRecord) -> Result<(
     for (field_id, _) in &record.field_lengths {
         require_field_component(schema, *field_id, FieldComponents::NORMS)?;
     }
+    for field in &schema.fields {
+        let present = if field.components.contains(FieldComponents::DOC_VALUES) {
+            record
+                .doc_values
+                .binary_search_by_key(&field.id, |value| value.field_id)
+                .ok()
+                .is_some_and(|index| record.doc_values[index].cell.present)
+        } else if field.components.contains(FieldComponents::POINTS) {
+            record
+                .points
+                .binary_search_by_key(&field.id, |value| value.field_id)
+                .is_ok()
+        } else if field.components.contains(FieldComponents::TERMS) {
+            record.terms.iter().any(|term| {
+                term.field_id == field.id
+                    && term.term_type == TERM_TYPE_FIELD_PRESENCE
+                    && term.term == FIELD_PRESENCE_TERM
+            })
+        } else if field.components.contains(FieldComponents::VECTOR) {
+            record
+                .vectors
+                .binary_search_by_key(&field.id, |value| value.field_id)
+                .is_ok()
+        } else {
+            false
+        };
+        if !present && !field.allow_missing {
+            return Err(IndexError::InvalidDefinition(
+                "required projected field is missing".into(),
+            ));
+        }
+    }
     Ok(())
+}
+
+fn scalar_matches_field(value: &ScalarValue, field_type: FieldType) -> bool {
+    matches!(
+        (value, field_type),
+        (ScalarValue::Boolean(_), FieldType::Boolean)
+            | (ScalarValue::Signed(_), FieldType::SignedInteger)
+            | (ScalarValue::Unsigned(_), FieldType::UnsignedInteger)
+            | (ScalarValue::Number(_), FieldType::Float)
+            | (ScalarValue::String(_), FieldType::Keyword)
+    )
 }
 
 fn require_field_component(

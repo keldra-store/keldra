@@ -2,8 +2,8 @@ use crate::IndexError;
 use crate::compaction::CompactionExecutor;
 
 use super::super::super::{
-    ArtifactDirectoryRead, ComponentKind, DocId, FieldId, PointBlock, PointEntry, PointValue,
-    ScalarValue, Schema, SegmentDescriptor, SegmentIdentity, point_value_key,
+    ArtifactDirectoryRead, ComponentKind, DocId, FieldId, FieldType, PointBlock, PointEntry,
+    PointValue, ScalarValue, Schema, SegmentDescriptor, SegmentIdentity, point_entry_key,
 };
 use super::super::{ComponentBatchSink, MergeScratchFile, MergeScratchSpace};
 use super::super::sink::{PublishedStream, StreamingComponentPublisher};
@@ -41,6 +41,12 @@ where
     if inputs.len() != remaps.len() {
         return Err(IndexError::InvalidFormat("point remap input width"));
     }
+    let field_type = schema
+        .fields
+        .get(field_id.get() as usize)
+        .filter(|field| field.id == field_id)
+        .map(|field| field.field_type)
+        .ok_or(IndexError::InvalidFormat("point field is outside schema"))?;
     let mut sorter = PointSorter::new(workspace, sort_bytes, executor)?;
     for (input, remap) in inputs.iter().zip(remaps) {
         let mut stream = required_stream(
@@ -53,13 +59,24 @@ where
         let mut remap = RemapReader::new(remap.clone(), input.document_count);
         while let Some((leaf, block)) = stream.next(PointBlock::decode_payload).await? {
             if block.field_id != field_id
-                || point_value_key(field_id, block.minimum())? != leaf.minimum_key
-                || point_value_key(field_id, block.maximum())? != leaf.maximum_key
+                || point_entry_key(
+                    field_id,
+                    &block.minimum_entry().value,
+                    block.minimum_entry().doc_id,
+                )? != leaf.minimum_key
+                || point_entry_key(
+                    field_id,
+                    &block.maximum_entry().value,
+                    block.maximum_entry().doc_id,
+                )? != leaf.maximum_key
                 || block.entries().len() as u64 != leaf.element_count
             {
                 return Err(IndexError::InvalidFormat("point stream routing evidence"));
             }
             for entry in block.entries() {
+                if !point_matches_type(&entry.value, field_type) {
+                    return Err(IndexError::InvalidFormat("point value differs from field type"));
+                }
                 if let Some(new_doc_id) = remap.get(entry.doc_id.get()).await? {
                     sorter
                         .push(PointEntry {
@@ -73,6 +90,16 @@ where
     }
     let run = sorter.finish().await?;
     publish_points(&mut sink, schema, identity, field_id, run).await
+}
+
+fn point_matches_type(value: &PointValue, field_type: FieldType) -> bool {
+    matches!(
+        (value, field_type),
+        (PointValue::Presence | PointValue::Null, _)
+            | (PointValue::Value(ScalarValue::Signed(_)), FieldType::SignedInteger)
+            | (PointValue::Value(ScalarValue::Unsigned(_)), FieldType::UnsignedInteger)
+            | (PointValue::Value(ScalarValue::Number(_)), FieldType::Float)
+    )
 }
 
 async fn publish_points<S, F>(
@@ -101,6 +128,12 @@ where
             PointValue::Presence => {
                 counts.present_documents = counts
                     .present_documents
+                    .checked_add(1)
+                    .ok_or(IndexError::OffsetOverflow)?;
+            }
+            PointValue::Null => {
+                counts.null_documents = counts
+                    .null_documents
                     .checked_add(1)
                     .ok_or(IndexError::OffsetOverflow)?;
             }
@@ -149,8 +182,16 @@ async fn emit_block<S: ComponentBatchSink>(
         return Ok(());
     }
     let block = PointBlock::new(field_id, std::mem::take(entries))?;
-    let minimum = point_value_key(field_id, block.minimum())?;
-    let maximum = point_value_key(field_id, block.maximum())?;
+    let minimum = point_entry_key(
+        field_id,
+        &block.minimum_entry().value,
+        block.minimum_entry().doc_id,
+    )?;
+    let maximum = point_entry_key(
+        field_id,
+        &block.maximum_entry().value,
+        block.maximum_entry().doc_id,
+    )?;
     let count = block.entries().len() as u64;
     publisher
         .push_payload(minimum, maximum, count, block.encode_payload()?)
@@ -295,9 +336,10 @@ fn compare_entry(left: &PointEntry, right: &PointEntry) -> std::cmp::Ordering {
 fn encode_entry(entry: &PointEntry, output: &mut Vec<u8>) -> Result<(), IndexError> {
     let (tag, bits) = match entry.value {
         PointValue::Presence => (0, 0),
-        PointValue::Value(ScalarValue::Signed(value)) => (1, value as u64),
-        PointValue::Value(ScalarValue::Unsigned(value)) => (2, value),
-        PointValue::Value(ScalarValue::Number(bits)) => (3, bits),
+        PointValue::Null => (1, 0),
+        PointValue::Value(ScalarValue::Signed(value)) => (2, value as u64),
+        PointValue::Value(ScalarValue::Unsigned(value)) => (3, value),
+        PointValue::Value(ScalarValue::Number(bits)) => (4, bits),
         PointValue::Value(_) => {
             return Err(IndexError::InvalidFormat("non-numeric point scratch record"));
         }
@@ -319,9 +361,10 @@ fn decode_entry(bytes: &[u8]) -> Result<PointEntry, IndexError> {
     );
     let value = match bytes[0] {
         0 if bits == 0 => PointValue::Presence,
-        1 => PointValue::Value(ScalarValue::Signed(bits as i64)),
-        2 => PointValue::Value(ScalarValue::Unsigned(bits)),
-        3 => PointValue::Value(
+        1 if bits == 0 => PointValue::Null,
+        2 => PointValue::Value(ScalarValue::Signed(bits as i64)),
+        3 => PointValue::Value(ScalarValue::Unsigned(bits)),
+        4 => PointValue::Value(
             ScalarValue::number(f64::from_bits(bits))
                 .map_err(|_| IndexError::InvalidFormat("point scratch number"))?,
         ),

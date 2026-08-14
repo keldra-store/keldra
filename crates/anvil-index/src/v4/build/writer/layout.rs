@@ -27,8 +27,14 @@ pub(super) struct TermRef {
 pub(super) struct PointRef {
     pub doc_id: u32,
     pub point_ordinal: u32,
-    /// `None` is the one field-presence record for this document.
-    pub value_ordinal: Option<u32>,
+    pub kind: PointRefKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PointRefKind {
+    Presence,
+    Null,
+    Value(u32),
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -90,7 +96,13 @@ impl WriterCharge {
         let point_count = source.records.iter().try_fold(self.point_count, |count, record| {
             record.points.iter().try_fold(count, |count, point| {
                 count
-                    .checked_add(point.values.len().saturating_add(1))
+                    .checked_add(
+                        point
+                            .values
+                            .len()
+                            .saturating_add(1)
+                            .saturating_add(usize::from(point.null)),
+                    )
                     .ok_or(IndexError::OffsetOverflow)
             })
         })?;
@@ -350,14 +362,22 @@ pub(super) fn build_point_refs(
                 doc_id: u32::try_from(doc_id).map_err(|_| IndexError::OffsetOverflow)?,
                 point_ordinal: u32::try_from(point_ordinal)
                     .map_err(|_| IndexError::OffsetOverflow)?,
-                value_ordinal: None,
+                kind: PointRefKind::Presence,
             });
+            if point.null {
+                references.push(PointRef {
+                    doc_id: u32::try_from(doc_id).map_err(|_| IndexError::OffsetOverflow)?,
+                    point_ordinal: u32::try_from(point_ordinal)
+                        .map_err(|_| IndexError::OffsetOverflow)?,
+                    kind: PointRefKind::Null,
+                });
+            }
             for value_ordinal in 0..point.values.len() {
                 references.push(PointRef {
                     doc_id: u32::try_from(doc_id).map_err(|_| IndexError::OffsetOverflow)?,
                     point_ordinal: u32::try_from(point_ordinal)
                         .map_err(|_| IndexError::OffsetOverflow)?,
-                    value_ordinal: Some(
+                    kind: PointRefKind::Value(
                         u32::try_from(value_ordinal).map_err(|_| IndexError::OffsetOverflow)?,
                     ),
                 });
@@ -379,13 +399,17 @@ pub(super) fn point<'a>(
     sources: &'a [ProjectedSource],
     documents: &[DocumentRef],
     reference: PointRef,
-) -> (crate::v4::FieldId, Option<&'a crate::v4::ScalarValue>) {
+) -> (crate::v4::FieldId, crate::v4::PointValue) {
     let point = &record(sources, documents[reference.doc_id as usize]).points
         [reference.point_ordinal as usize];
     (
         point.field_id,
-        reference
-            .value_ordinal
-            .map(|ordinal| &point.values[ordinal as usize]),
+        match reference.kind {
+            PointRefKind::Presence => crate::v4::PointValue::Presence,
+            PointRefKind::Null => crate::v4::PointValue::Null,
+            PointRefKind::Value(ordinal) => {
+                crate::v4::PointValue::Value(point.values[ordinal as usize].clone())
+            }
+        },
     )
 }

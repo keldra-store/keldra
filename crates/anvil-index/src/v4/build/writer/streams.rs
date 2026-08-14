@@ -11,7 +11,7 @@ use crate::v4::{
     DocValueBlock, DocValueCell, FieldComponents, INDEX_COMPONENT_BYTES, IdentityBlock,
     IndexSemantics, LIVE_MASK_BLOCK_DOCS, LiveMaskBlock, LocatorEntry, LocatorValue, NormBlock,
     PathLocatorBlock, PointBlock, PointEntry, PointValue, ScalarValue, Schema, SegmentIdentity,
-    VectorBlock, point_value_key,
+    VectorBlock, point_entry_key,
 };
 
 const MAX_PAYLOAD_BYTES: usize = INDEX_COMPONENT_BYTES - COMPONENT_HEADER_BYTES;
@@ -334,14 +334,22 @@ pub(super) async fn publish_points<S: ComponentBatchSink>(
                 .map(|reference| {
                     let (_, value) = point(sources, documents, *reference);
                     PointEntry {
-                        value: value.cloned().map_or(PointValue::Presence, PointValue::Value),
+                        value,
                         doc_id: DocId::new(reference.doc_id),
                     }
                 })
                 .collect();
             let block = PointBlock::new(field_id, entries)?;
-            let minimum = point_value_key(field_id, block.minimum())?;
-            let maximum = point_value_key(field_id, block.maximum())?;
+            let minimum = point_entry_key(
+                field_id,
+                &block.minimum_entry().value,
+                block.minimum_entry().doc_id,
+            )?;
+            let maximum = point_entry_key(
+                field_id,
+                &block.maximum_entry().value,
+                block.maximum_entry().doc_id,
+            )?;
             let element_count = block.entries().len() as u64;
             let payload = block.encode_payload()?;
             publisher

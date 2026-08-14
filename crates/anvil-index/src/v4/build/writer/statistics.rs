@@ -108,12 +108,26 @@ impl StatisticsAccumulator {
                 }
                 mark_present(&mut fields, &mut seen, marker, index)?;
                 let field = &mut fields[index];
+                field.null_documents = field
+                    .null_documents
+                    .checked_add(u64::from(point.null))
+                    .ok_or(IndexError::OffsetOverflow)?;
                 field.value_count = field
                     .value_count
                     .checked_add(
                         u64::try_from(point.values.len())
                             .map_err(|_| IndexError::OffsetOverflow)?,
                     )
+                    .ok_or(IndexError::OffsetOverflow)?;
+                field.multi_valued_documents = field
+                    .multi_valued_documents
+                    .checked_add(u64::from(
+                        point
+                            .values
+                            .len()
+                            .saturating_add(usize::from(point.null))
+                            > 1,
+                    ))
                     .ok_or(IndexError::OffsetOverflow)?;
                 for value in &point.values {
                     let counter = match value {

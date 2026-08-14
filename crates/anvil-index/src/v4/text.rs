@@ -1,9 +1,7 @@
 use crate::IndexError;
 
 use super::codec::{COMPONENT_HEADER_BYTES, Decoder, Encoder};
-use super::model::{
-    ComponentKind, DocId, INDEX_COMPONENT_BYTES, INDEX_DECODE_BYTES, INDEX_ROUTING_KEY_BYTES,
-};
+use super::model::{ComponentKind, DocId, INDEX_COMPONENT_BYTES, INDEX_DECODE_BYTES};
 use super::schema::FieldId;
 
 const POSITIONS_CODEC_VERSION: u16 = 1;
@@ -259,8 +257,8 @@ impl SegmentStatistics {
             || physical_order_bounds.as_ref().is_some_and(|bounds| {
                 bounds.minimum_key.is_empty()
                     || bounds.maximum_key.is_empty()
-                    || bounds.minimum_key.len() > INDEX_ROUTING_KEY_BYTES
-                    || bounds.maximum_key.len() > INDEX_ROUTING_KEY_BYTES
+                    || bounds.minimum_key.len() > INDEX_COMPONENT_BYTES
+                    || bounds.maximum_key.len() > INDEX_COMPONENT_BYTES
                     || bounds.minimum_key > bounds.maximum_key
             })
             || components
