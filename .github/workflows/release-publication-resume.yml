@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing 0.8 release tag to publish
+        description: Existing 0.9 release tag to publish
         required: true
         type: string
       expected_commit:
@@ -31,7 +31,7 @@ concurrency:
 
 jobs:
   publish:
-    name: Resume 0.8 publication from validated image
+    name: Resume 0.9 publication from validated image
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -89,7 +89,7 @@ jobs:
           )"
           required_jobs=(
             'Resolve immutable release context'
-            'Validate Anvil 0.8 release'
+            'Validate Anvil 0.9 release'
             'Build release image (linux/amd64)'
             'Build release image (linux/arm64)'
           )
@@ -188,10 +188,11 @@ jobs:
           generate_release_notes: true
           make_latest: true
           body: |
-            Anvil 0.8.2 prevents projection-worker starvation, makes blob and
-            shard staging restart-safe, and seeks TypedJSON order postings with
-            selectivity-aware predicate planning. Existing 0.8.1 volumes resume
-            without a storage migration or data reimport.
+            Anvil 0.9.0 introduces Anvil-owned format-v4 immutable index
+            segments, exact multi-predicate execution, optional Typed JSON
+            physical ordering, stable generation-bound cursors, and bounded
+            arbitrary sorting. It is a clean index-format release for new
+            volumes and does not carry format-v3 compatibility machinery.
 
             - Image: `${{ steps.image.outputs.image }}`
             - Manifest digest: `${{ steps.image.outputs.digest }}`

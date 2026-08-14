@@ -1,4 +1,4 @@
-# Anvil 0.8 observability
+# Anvil 0.9 observability
 
 Anvil always writes its structured `tracing` logs to stdout. OTLP export is an
 optional startup setting and carries metrics and traces only; logs remain on
@@ -28,7 +28,7 @@ API.
 Metrics and traces share these resource attributes:
 
 - `service.name=anvil`
-- `service.version=0.8.2`
+- `service.version=0.9.0`
 - `node.id=<ANVIL_NODE_ID>`
 
 Trace export uses a dedicated worker with a 2,048-span queue and batches of at
@@ -55,7 +55,7 @@ needed to join a single invocation's work; caller-selected invocation IDs,
 opaque program input, paths, and object payload bytes are never span fields or
 events.
 
-The Anvil 0.8 process metric vocabulary covers:
+The Anvil 0.9 process metric vocabulary covers:
 
 - executor nomination count;
 - atomic-program invocation counts, total and combined preparation latency,
@@ -84,8 +84,9 @@ builder state:
   pool;
 - `anvil_index_construction_resident_bytes` and
   `anvil_index_construction_workspace_bytes` describe the builder involved in
-  a completed flush. Leased bytes are a budget reservation; they are not
-  reported as resident memory.
+  a completed flush. Resident bytes are the currently buffered subset of the
+  admitted workspace, so the two values must not be added. Leased bytes are a
+  budget reservation; they are not reported as resident memory.
 
 Compaction admission reports
 `anvil_index_compaction_configured_lanes`,
@@ -96,27 +97,20 @@ deterministic key ranges, progress and terminal events report
 `anvil_index_compaction_effective_lanes` as the minimum of configured lanes,
 workers, budget-admitted lanes, and `anvil_index_compaction_range_limit`. They
 also report active and waiting lanes, ranges total and completed, selected
-input runs/mutations/bytes, input component rows/read bytes/blocks, output
+input segments/documents/bytes, input component rows/read bytes/blocks, output
 component rows/bytes/blocks, elapsed time, last-progress age, attempts,
-failures, and duration. A selected input mutation is one mutation recorded by an input run;
-it is not necessarily a unique live object. An input component row is one row
-decoded at a path, document, typed-key, posting, vector, projection, or spill
-component boundary. Re-decoding a block counts its rows again, so this is a CPU
-and decoding-work measure and may legitimately be orders of magnitude larger
-than the selected mutation count. Output component rows similarly count rows
-emitted by canonical component writers, not unique source objects. The
-canonical instruments use
-`selected_input_mutations` and `input_component_rows` in their names. The 0.8.1
-`selected_input_records` gauge and terminal `input_records` histogram remain
-aliases for selected mutations; `input_records_total` and
-`current_input_records` remain aliases for decoded component rows. Likewise,
-the legacy `compaction.input_records` and
-`compaction.actual_input_records` span fields mean selected mutations and
-decoded component rows, respectively. The corresponding cumulative `*_total`
-instruments make component-row, byte, block, and completed-range rates directly
-queryable with the metrics backend's rate function. Input/output ratios are not
-published as a progress percentage because compaction can discard superseded
-records and change the encoded byte count.
+failures, and duration. An input document is the document count declared by a
+selected immutable segment. An input component row is one row decoded at a
+path, document, typed-key, posting, vector, projection, or spill component
+boundary. Re-decoding a block counts its rows again, so this is a CPU and
+decoding-work measure and may legitimately be orders of magnitude larger than
+the selected document count. Output component rows similarly count rows emitted
+by canonical component writers, not unique source objects. The corresponding
+cumulative `*_total` instruments make component-row, byte, block, and
+completed-range rates directly queryable with the metrics backend's rate
+function. Input/output ratios are not published as a progress percentage
+because compaction can discard superseded rows and change the encoded byte
+count.
 
 Projection `rayon_queue_seconds` is aggregate worker queue time summed across
 the finite projection units in one wave. Parallel waits can therefore make it
@@ -143,6 +137,12 @@ carry stable numeric identifiers and detailed terminal snapshots; identifiers
 never become metric attributes. Artifact reads remain asynchronous, while
 decoded-page construction, filtering, ranking, bounded top-k maintenance, and
 response-page serialization execute on the process-owned index CPU pool.
+Planner and posting telemetry reports conjunctions, reordered conjunctions,
+costed children, the selected lead cost range, posting blocks sought, decoded,
+and skipped, posting bytes, posting advances, conjunction advances, bounded
+union-heap pushes and pops, exact second-phase checks, live-mask decodes, and
+candidate-gate batches. These are counters or numeric histograms split only by
+index kind; document, index, tenant, and bucket identifiers remain trace fields.
 `anvil_index_query_returned_hits` is emitted only for a completed response
 page. A failed, timed-out, or otherwise cancelled query has no returned page,
 so its hit count remains unknown rather than being recorded as zero; its read

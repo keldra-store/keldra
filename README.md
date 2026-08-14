@@ -27,6 +27,7 @@ rendezvous hashing.
 | Streaming succinct indexes | 0.6.0 | Bounded per-kind construction memory, incremental immutable runs, streaming compaction, `sux`-based merged structures, and lazy block materialization |
 | Sparse index coordination | 0.7.0 | Non-blocking startup, transactional definition locators, routed change journals, scoped recovery, resumable accounting, and budgeted maintenance |
 | Scalable bulk indexes | 0.8.0 | Direct bounded bulk builds, packed format-v3 artifacts, stable compressed postings, authorized rebuilds, and lossless journal backpressure |
+| Native segment indexes | 0.9.0 | Anvil-owned immutable segments, exact predicate intersection, optional physical ordering, stable cursors, bounded arbitrary sorting, and shared query-memory admission |
 | Java client | — | TODO |
 | Python client | — | TODO |
 | Node.js client | — | TODO |
@@ -46,7 +47,7 @@ repository are required.
 ### 1. Start a development node
 
 ```sh
-export ANVIL_IMAGE=ghcr.io/worka-ai/anvil:0.8.2
+export ANVIL_IMAGE=ghcr.io/worka-ai/anvil:0.9.0
 export ANVIL_TOKEN_SIGNING_KEY_FILE="$PWD/anvil-data/token-signing-key"
 
 mkdir -p anvil-data
@@ -158,7 +159,7 @@ Zanzibar-authorized object addressed by `(tenant, bucket, path)`.
 ## Use the Rust client
 
 ```sh
-cargo add anvil-storage@0.8.2
+cargo add anvil-storage@0.9.0
 cargo add tokio --features macros,rt-multi-thread
 ```
 
@@ -233,7 +234,7 @@ Zanzibar-authorized independently of ordinary object traffic.
 Add the public client and canonical protocol types:
 
 ```sh
-cargo add anvil-storage@0.8.2 personaldb-protocol@0.2.2 serde_json
+cargo add anvil-storage@0.9.0 personaldb-protocol@0.2.2 serde_json
 ```
 
 Use the same application credential created above to create a source group and
@@ -519,10 +520,13 @@ executable in
 
 Indexes are bucket-local definitions scoped by an optional path prefix and
 content type. Each definition's HRW-selected writer consumes every node's
-ordered source journal, flushes bounded immutable runs, compacts them as a
-stream into succinct merged structures, and publishes complete generations
-through the ordinary object store. Up to three HRW-selected query replicas
-materialize only the blocks a query needs through the shared bounded cache.
+ordered source journal, writes bounded immutable native segments, merges
+deterministic size tiers, and publishes complete generations through the
+ordinary object store. Seekable postings intersect selective predicates before
+stored fields are read; an optional definition-time physical order supports
+early termination and true search-after pagination. Up to three HRW-selected
+query replicas materialize only the blocks a query needs through the shared
+bounded cache.
 Construction memory is capped per index kind across the whole process, so
 corpus size does not become builder heap. Query responses always include
 freshness evidence; while a new complete generation is building, Anvil
@@ -540,6 +544,22 @@ override the fallback and lane cap independently with
 `METADATA_FILTER`, `TYPED_JSON`, `FULL_TEXT`, `VECTOR`, `HYBRID`, `GIT_SOURCE`,
 or `TENSOR`.
 
+Projection concurrency also defaults to four lanes per kind. Configure it with
+`ANVIL_INDEX_PATH_PROJECTION_MAX_LANES`,
+`ANVIL_INDEX_METADATA_FILTER_PROJECTION_MAX_LANES`,
+`ANVIL_INDEX_TYPED_JSON_PROJECTION_MAX_LANES`,
+`ANVIL_INDEX_FULL_TEXT_PROJECTION_MAX_LANES`,
+`ANVIL_INDEX_VECTOR_PROJECTION_MAX_LANES`,
+`ANVIL_INDEX_HYBRID_PROJECTION_MAX_LANES`,
+`ANVIL_INDEX_GIT_SOURCE_PROJECTION_MAX_LANES`, and
+`ANVIL_INDEX_TENSOR_PROJECTION_MAX_LANES`. These caps share the process Rayon
+worker pool and the corresponding kind's construction-memory budget.
+
+`ANVIL_INDEX_MAX_SEGMENTS_PER_TIER` and
+`ANVIL_INDEX_MAX_UNMERGED_BYTES_PER_TIER` bound merge debt, with per-kind
+overrides following the same naming pattern. `ANVIL_INDEX_QUERY_MEMORY_BYTES`
+is the process-wide admission budget shared by concurrent index queries.
+
 Actual compaction concurrency is the minimum of that kind's configured cap,
 the process worker ceiling, the number of deterministic key ranges, and the
 memory admission `1 + floor((kind budget - shared workspace) / incremental
@@ -556,8 +576,7 @@ client `grpc-timeout` always wins.
 Construct an authenticated index client from the same token used for objects:
 
 ```rust,no_run
-use anvil_storage::{BearerToken, connect_channel, exchange_client_credentials};
-use anvil_storage::v1::index_service_client::IndexServiceClient;
+use anvil_storage::{connect_channel, exchange_client_credentials, index_client};
 
 # async fn client() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 let channel = connect_channel("http://127.0.0.1:50051").await?;
@@ -567,10 +586,7 @@ let token = exchange_client_credentials(
     std::env::var("ANVIL_OWNER_SECRET")?,
 )
 .await?;
-let mut indexes = IndexServiceClient::with_interceptor(
-    channel,
-    BearerToken::new(&token.access_token)?,
-);
+let mut indexes = index_client(channel, &token.access_token)?;
 # let _ = &mut indexes;
 # Ok(())
 # }
@@ -610,7 +626,9 @@ indexes.create_index(CreateIndexRequest {
             fields: vec![IndexField {
                 name: "status".into(),
                 json_pointer: "/status".into(),
+                multi_valued: false,
             }],
+            physical_order: vec![],
         })),
     }),
     command_id: "create-active-documents".into(),
@@ -653,7 +671,7 @@ bundles, establishes peer mTLS, exercises replicated and erasure-coded storage,
 queries every index type, and performs a rolling restart:
 
 ```sh
-ANVIL_IMAGE=ghcr.io/worka-ai/anvil:0.8.2 \
+ANVIL_IMAGE=ghcr.io/worka-ai/anvil:0.9.0 \
   ./scripts/qualify-three-node.sh
 ```
 
@@ -707,8 +725,8 @@ acceleration, not another authoritative storage plane.
 The architecture contracts live in
 [ANVIL-0009](docs/rfcs/anvil_0009_atomic_programs.md) and
 [ANVIL-0010](docs/rfcs/anvil_0010_cluster_distribution.md). The current
-clean-break, bounded bulk and incremental index architecture is specified by
-[ANVIL-0013](docs/rfcs/anvil_0013_scalable_bulk_indexes.md).
+clean-break native-segment index architecture is specified by
+[ANVIL-0014](docs/rfcs/anvil_0014_native_segment_indexes.md).
 
 ## Build and qualify
 
@@ -741,12 +759,12 @@ The wrapper scripts above build the release-mode qualification client, bind the
 evidence to the exact image revision, and run the client directly so Cargo does
 not hold the shared build lock during the long qualification.
 
-The pinned `sux` and Rayon features, resolved versions and license choices are
+The pinned `sux` and Rayon dependencies, resolved versions, and license choices are
 recorded in [the index dependency record](docs/dependency-licenses.md).
 
-Anvil 0.8 deployments start with new volumes. Index definitions and generated
-artifacts are rebuilt from authoritative source objects rather than migrated
-from earlier releases. Current operational boundaries are collected in the
-[known limitations](docs/known-limitations.md).
+Anvil 0.9 deployments start with new volumes. Format-v4 index definitions and
+native segment artifacts are built from authoritative source objects rather
+than migrated from format v3. Current operational boundaries are collected in
+the [known limitations](docs/known-limitations.md).
 
 Apache-2.0 licensed.

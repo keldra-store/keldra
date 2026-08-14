@@ -35,10 +35,10 @@ static_gates() {
 rust_gates() {
   local build_jobs="${CARGO_BUILD_JOBS:-1}"
   local test_threads="${ANVIL_RUST_TEST_THREADS:-4}"
-  run_step "Anvil 0.8 workspace Clippy" cargo clippy --jobs "${build_jobs}" --locked --workspace \
+  run_step "Anvil 0.9 workspace Clippy" cargo clippy --jobs "${build_jobs}" --locked --workspace \
     --all-targets \
     --no-deps
-  run_step "Anvil 0.8 workspace tests" cargo test --jobs "${build_jobs}" --locked --workspace --all-targets -- \
+  run_step "Anvil 0.9 workspace tests" cargo test --jobs "${build_jobs}" --locked --workspace --all-targets -- \
     --nocapture \
     --test-threads="${test_threads}"
 }
@@ -46,7 +46,7 @@ rust_gates() {
 server_gates() {
   local build_jobs="${CARGO_BUILD_JOBS:-1}"
   local test_threads="${ANVIL_RUST_TEST_THREADS:-4}"
-  run_step "Anvil 0.8 server, client, and CLI tests" cargo test --jobs "${build_jobs}" --locked \
+  run_step "Anvil 0.9 server, client, and CLI tests" cargo test --jobs "${build_jobs}" --locked \
     -p anvil-server \
     -p anvil-storage \
     -p anvil-storage-cli \
@@ -66,7 +66,7 @@ image_gates() (
   local scratch
   scratch="$(mktemp -d)"
   chmod 0755 "${scratch}"
-  local container="anvil-v08-smoke-${$}"
+  local container="anvil-v09-smoke-${$}"
   cleanup_image_gate() {
     docker rm --force "${container}" >/dev/null 2>&1 || true
     docker run --rm --user 0 --volume "${scratch}:/smoke" "${image}" \
@@ -81,7 +81,7 @@ image_gates() (
   chmod 0600 "${scratch}/signing-key"
   docker run --rm --user 0 --volume "${scratch}:/smoke" "${image}" \
     chown 10001:10001 /smoke/signing-key
-  printf 'anvil-0.8-smoke\n' >"${scratch}/payload"
+  printf 'anvil-0.9-smoke\n' >"${scratch}/payload"
   chmod 0444 "${scratch}/payload"
   docker run --detach --name "${container}" \
     --env ANVIL_LISTEN=0.0.0.0:50051 \
@@ -153,7 +153,7 @@ image_gates() (
       anvil --endpoint http://127.0.0.1:50051 \
       get smoke objects hello
   )"
-  if [[ "${value}" != 'anvil-0.8-smoke' ]]; then
+  if [[ "${value}" != 'anvil-0.9-smoke' ]]; then
     echo "image smoke read returned unexpected bytes" >&2
     return 1
   fi

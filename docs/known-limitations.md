@@ -1,5 +1,29 @@
 # Anvil known limitations
 
+## Anvil 0.9 operational boundaries
+
+Anvil 0.9 uses the native index format 4 exclusively and starts with new
+volumes. It does not read, migrate, backfill, or dual-write format-3 index
+definitions, artifacts, caches, or page positions. Authoritative application
+objects remain ordinary Anvil data; recreating a definition builds a fresh
+format-4 generation from its declared source scope.
+
+| Area | Current boundary |
+| --- | --- |
+| Typed JSON physical order | A query uses the streaming physical-order path only when its complete ordered field/direction list exactly matches the definition. Any other order uses the exact bounded top-K path and may inspect every matching document while retaining only bounded heap state. Ordered fields must be declared single-valued. |
+| Typed JSON collation | Scalar ordering is deterministic byte/value ordering, not locale-aware collation. Missing and explicit `null` remain distinct. |
+| Query planning | Boolean conjunctions stably order exact advanceable posting iterators by exact posting document frequency. Range and all-document cursors use the segment document count as a conservative cost, and bounded OR unions use a deduplicating heap. Full-text scoring does not yet use impact/WAND skipping. Results remain exact, but broad range or text queries can still read more blocks; callers should include selective indexed predicates and exact physical ordering where available. |
+| Recent-mutation query work | Every returned candidate passes the mandatory bounded exact-current check, so an overwritten or deleted object cannot leak as a stale result. The optional disposable post-generation invalidation overlay is not yet materialized, which can increase candidate checks while a newer complete generation is building; it does not weaken result correctness or freshness evidence. |
+| Broad multi-term ranges | Prefix and scalar-range predicates stream exact posting unions with corpus-independent memory. After each 256 candidate DocIds, the cursor re-enters the bounded term range strictly after the last emitted DocId; a broad range with heavy Zanzibar filtering can therefore reread dictionary/posting blocks. Results and continuations remain exact. Narrower predicates reduce that work; a persistent range-union accelerator is deferred pending production evidence. |
+| Vector search | Vector generations use exact search; an approximate-nearest-neighbour graph remains future work. |
+| Query placement | One weighted-HRW owner executes a query against locally materialized or demand-fetched segment bytes. Anvil does not scatter one query across nodes. |
+| Query resources | Query admission and working memory are shared process resources. A request that cannot obtain its bounded workspace within its deadline fails without weakening result correctness or publication state. |
+| Index compatibility | Format 4 is a clean storage boundary. Rollback to a format-3 binary requires a separate old volume, not mixed readers or compatibility shims. |
+
+These boundaries do not weaken Zanzibar authorization, source-complete
+generation publication, stable generation-bound pagination, object durability,
+or lossless journal backpressure.
+
 ## Anvil 0.8 operational boundaries
 
 Anvil 0.8 uses index format 3 exclusively and starts with new volumes. Index

@@ -22,7 +22,7 @@ WORKDIR /usr/src/anvil
 
 COPY . .
 
-# Build the 0.8 server and CLI in release mode. BuildKit cache mounts keep
+# Build the 0.9 server and CLI in release mode. BuildKit cache mounts keep
 # Cargo's registry, git checkout cache, and target directory outside the image
 # layer so repeat local/CI Docker builds reuse compiled dependencies.
 RUN --mount=type=cache,id=anvil-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \

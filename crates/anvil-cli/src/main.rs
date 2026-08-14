@@ -34,7 +34,7 @@ const CHUNK_BYTES: usize = 256 * 1024;
 const MAX_CREDENTIAL_FILE_BYTES: u64 = 4 * 1024;
 
 #[derive(Parser)]
-#[command(name = "anvil", version, about = "Anvil 0.8 client")]
+#[command(name = "anvil", version, about = "Anvil 0.9 client")]
 struct Arguments {
     #[arg(long, env = "ANVIL_ENDPOINT", default_value = "http://127.0.0.1:50051")]
     endpoint: String,
