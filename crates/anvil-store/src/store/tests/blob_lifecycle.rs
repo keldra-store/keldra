@@ -1,3 +1,4 @@
+use super::super::blob_references::blob_gc_due_key;
 use super::*;
 use crate::{BlobGcBudget, BlobGcCursor};
 
@@ -30,6 +31,37 @@ fn blob_reference_state_is_exactly_twenty_five_bytes() {
     ));
 }
 
+#[test]
+fn blob_gc_due_keys_sort_by_update_time_before_artifact_identity() {
+    let earlier_state = BlobReferenceState {
+        ref_count: 0,
+        flags: 0,
+        created_at: 1,
+        updated_at: 10,
+    };
+    let later_state = BlobReferenceState {
+        updated_at: 11,
+        ..earlier_state
+    };
+    let lexically_late = BlobRef {
+        hash: [0xff; 32],
+        length: 1,
+    };
+    let lexically_early = BlobRef {
+        hash: [0; 32],
+        length: 1,
+    };
+
+    let earlier = blob_gc_due_key(&blob_reference_key(&lexically_late), earlier_state)
+        .unwrap()
+        .unwrap();
+    let later = blob_gc_due_key(&blob_reference_key(&lexically_early), later_state)
+        .unwrap()
+        .unwrap();
+
+    assert!(earlier < later);
+}
+
 #[tokio::test]
 async fn sealing_creates_one_reservation_and_reuse_only_refreshes_it() {
     let (_temporary, store) = store().await;
@@ -38,6 +70,16 @@ async fn sealing_creates_one_reservation_and_reuse_only_refreshes_it() {
     assert_eq!(first.ref_count, 1);
     assert_eq!(first.flags, AWAITING_PUBLISH);
     assert_eq!(first.created_at, first.updated_at);
+    let first_due = blob_gc_due_key(&blob_reference_key(&blob), first)
+        .unwrap()
+        .unwrap();
+    assert!(
+        store
+            .db
+            .get_cf(store.cf(CF_BLOB_GC_DUE).unwrap(), &first_due)
+            .unwrap()
+            .is_some()
+    );
     assert_eq!(
         store
             .db
@@ -59,6 +101,23 @@ async fn sealing_creates_one_reservation_and_reuse_only_refreshes_it() {
     assert_eq!(refreshed.flags, AWAITING_PUBLISH);
     assert_eq!(refreshed.created_at, first.created_at);
     assert_eq!(refreshed.updated_at, first.updated_at + 10);
+    let refreshed_due = blob_gc_due_key(&blob_reference_key(&blob), refreshed)
+        .unwrap()
+        .unwrap();
+    assert!(
+        store
+            .db
+            .get_cf(store.cf(CF_BLOB_GC_DUE).unwrap(), first_due)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .db
+            .get_cf(store.cf(CF_BLOB_GC_DUE).unwrap(), refreshed_due)
+            .unwrap()
+            .is_some()
+    );
     let changes = store.scan_local_changes(0, 10).unwrap();
     assert_eq!(changes.len(), 2);
     for (change, expected_revision) in changes.iter().zip([first.updated_at, refreshed.updated_at])
@@ -73,7 +132,7 @@ async fn sealing_creates_one_reservation_and_reuse_only_refreshes_it() {
 }
 
 #[tokio::test]
-async fn streamed_seal_finishes_byte_plane_io_before_waiting_for_commit_fence() {
+async fn streamed_seal_fsyncs_identified_stage_before_waiting_for_commit_fence() {
     let (_temporary, store) = store().await;
     let bytes = vec![0x5a; SMALL_BLOB_MAX_BYTES + 1];
     let expected = blob_reference_for_bytes(&bytes);
@@ -85,14 +144,19 @@ async fn streamed_seal_finishes_byte_plane_io_before_waiting_for_commit_fence() 
     let sealing = tokio::spawn(async move { sealing_store.seal_blob_upload(upload).await });
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            if store.blobs.contains(&expected).await.unwrap() {
+            let staged = std::fs::read_dir(store.blobs.root().join(".staging"))
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| entry.file_name().to_string_lossy().starts_with("blob-"));
+            if staged {
                 break;
             }
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("physical upload must finish before seal waits for the commit fence");
+    .expect("identified upload stage must finish before seal waits for the commit fence");
+    assert!(!store.blobs.contains(&expected).await.unwrap());
     assert!(!sealing.is_finished());
 
     drop(commit_guard);
@@ -169,6 +233,104 @@ async fn concurrent_seal_refresh_prevents_a_selected_blob_from_being_collected()
 }
 
 #[tokio::test]
+async fn bounded_maintenance_recovers_a_lifecycle_backed_identified_stage() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store =
+        Store::open(StoreOptions::new(temporary.path(), 1).with_awaiting_publish_ttl_seconds(1))
+            .await
+            .unwrap();
+    let bytes = vec![0x8a; SMALL_BLOB_MAX_BYTES + 17];
+    let mut upload = store.begin_blob_upload().await.unwrap();
+    upload.write(&bytes).await.unwrap();
+    let staged = upload.finish_staged().await.unwrap();
+    let reference = staged.reference().clone();
+    let staged_path = staged.path().to_path_buf();
+    let now = now_unix_millis().unwrap();
+    {
+        let _guard = store.commit_lock.lock().await;
+        store.reserve_sealed_blob(&reference, now).unwrap();
+    }
+    drop(staged);
+
+    assert!(staged_path.is_file());
+    assert!(!store.blobs.contains(&reference).await.unwrap());
+    assert_eq!(store.collect_blob_garbage_at(now).await.unwrap(), 1);
+    assert!(!staged_path.exists());
+    assert!(store.blobs.contains(&reference).await.unwrap());
+    assert!(store.blob_reference_state(&reference).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn bounded_maintenance_ages_out_an_identified_stage_without_lifecycle_state() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store =
+        Store::open(StoreOptions::new(temporary.path(), 1).with_awaiting_publish_ttl_seconds(1))
+            .await
+            .unwrap();
+    let bytes = vec![0x9b; SMALL_BLOB_MAX_BYTES + 17];
+    let mut upload = store.begin_blob_upload().await.unwrap();
+    upload.write(&bytes).await.unwrap();
+    let staged = upload.finish_staged().await.unwrap();
+    let reference = staged.reference().clone();
+    let path = staged.path().to_path_buf();
+    let modified = path
+        .metadata()
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    drop(staged);
+
+    assert_eq!(
+        store.collect_blob_garbage_at(modified + 999).await.unwrap(),
+        0
+    );
+    assert!(path.exists());
+    assert_eq!(
+        store
+            .collect_blob_garbage_at(modified + 1_000)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(!path.exists());
+    assert!(store.blob_reference_state(&reference).unwrap().is_none());
+    assert!(!store.blobs.contains(&reference).await.unwrap());
+}
+
+#[tokio::test]
+async fn bounded_maintenance_reverses_quarantine_when_authority_survived_crash() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store =
+        Store::open(StoreOptions::new(temporary.path(), 1).with_awaiting_publish_ttl_seconds(1))
+            .await
+            .unwrap();
+    let bytes = vec![0xac; SMALL_BLOB_MAX_BYTES + 17];
+    let reference = store.stage_blob(&bytes).await.unwrap();
+    let state = store.blob_reference_state(&reference).unwrap().unwrap();
+    let quarantined = store
+        .quarantine_blob_for_test(&reference)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(quarantined.is_file());
+    assert!(!store.blobs.contains(&reference).await.unwrap());
+    assert_eq!(
+        store
+            .collect_blob_garbage_at(state.updated_at)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(!quarantined.exists());
+    assert!(store.blobs.contains(&reference).await.unwrap());
+    assert_eq!(store.blob_reference_state(&reference).unwrap(), Some(state));
+}
+
+#[tokio::test]
 async fn small_blob_boundary_and_streamed_seal_use_only_rocksdb() {
     let (_temporary, store) = store().await;
     let boundary_bytes = vec![7_u8; SMALL_BLOB_MAX_BYTES];
@@ -235,6 +397,13 @@ async fn publication_consumes_then_increments_without_counting_replays() {
     let published_state = store.blob_reference_state(&blob).unwrap().unwrap();
     assert_eq!(published_state.ref_count, 2);
     assert_eq!(published_state.flags, 0);
+    assert!(
+        store
+            .db
+            .iterator_cf(store.cf(CF_BLOB_GC_DUE).unwrap(), IteratorMode::Start)
+            .next()
+            .is_none()
+    );
 
     let replay = store.publish(first_request).await.unwrap();
     assert!(replay.replayed);
@@ -290,6 +459,48 @@ async fn retirement_reaches_zero_but_gc_waits_for_the_inactivity_ttl() {
 }
 
 #[tokio::test]
+async fn due_order_applies_the_ttl_configured_after_restart() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("store");
+    let reference;
+    let updated_at;
+    {
+        let store =
+            Store::open(StoreOptions::new(&root, 1).with_awaiting_publish_ttl_seconds(60 * 60))
+                .await
+                .unwrap();
+        reference = store
+            .stage_blob(&vec![0x6c; SMALL_BLOB_MAX_BYTES + 1])
+            .await
+            .unwrap();
+        updated_at = store
+            .blob_reference_state(&reference)
+            .unwrap()
+            .unwrap()
+            .updated_at;
+    }
+
+    let reopened = Store::open(StoreOptions::new(&root, 1).with_awaiting_publish_ttl_seconds(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened
+            .collect_blob_garbage_at(updated_at + 999)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        reopened
+            .collect_blob_garbage_at(updated_at + 1_000)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(!reopened.blobs.contains(&reference).await.unwrap());
+}
+
+#[tokio::test]
 async fn blob_gc_cursor_spreads_collection_across_hard_record_budgets() {
     let temporary = tempfile::tempdir().unwrap();
     let store =
@@ -333,7 +544,7 @@ async fn blob_gc_cursor_spreads_collection_across_hard_record_budgets() {
 }
 
 #[tokio::test]
-async fn gc_uses_awaiting_inactivity_and_removes_untracked_crash_files() {
+async fn gc_uses_due_order_and_only_reconciles_bounded_maintenance_directories() {
     let temporary = tempfile::tempdir().unwrap();
     let store =
         Store::open(StoreOptions::new(temporary.path(), 1).with_awaiting_publish_ttl_seconds(1))
@@ -359,69 +570,12 @@ async fn gc_uses_awaiting_inactivity_and_removes_untracked_crash_files() {
     assert!(store.blob_reference_state(&awaiting).unwrap().is_none());
     assert!(!store.contains_blob(&awaiting).await.unwrap());
 
+    // Canonical content directories are never inventoried. All ordinary Store
+    // seal paths now create lifecycle state before publishing there.
     let orphan = store.blobs.put(b"crash orphan").await.unwrap();
     assert!(store.blob_reference_state(&orphan).unwrap().is_none());
-    let encoded_orphan_hash = hex::encode(orphan.hash);
-    let orphan_path = store
-        .blobs
-        .root()
-        .join(&encoded_orphan_hash[..2])
-        .join(encoded_orphan_hash);
-    let orphan_modified = orphan_path
-        .metadata()
-        .unwrap()
-        .modified()
-        .unwrap()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-    assert_eq!(
-        store
-            .collect_blob_garbage_at(orphan_modified + 999)
-            .await
-            .unwrap(),
-        0
-    );
-    assert_eq!(
-        store
-            .collect_blob_garbage_at(orphan_modified + 1_000)
-            .await
-            .unwrap(),
-        1
-    );
-    assert!(!store.blobs.contains(&orphan).await.unwrap());
-
-    let transition = store.stage_blob(b"sealed small transition").await.unwrap();
-    store
-        .publish(publish(
-            "sealed-small-transition",
-            transition.clone(),
-            "sealed-small-transition",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(
-        store.blobs.put(b"sealed small transition").await.unwrap(),
-        transition
-    );
-    let transition_path = blob_file_path(&store, &transition);
-    let transition_modified = transition_path
-        .metadata()
-        .unwrap()
-        .modified()
-        .unwrap()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-    assert_eq!(
-        store
-            .collect_blob_garbage_at(transition_modified + 1_000)
-            .await
-            .unwrap(),
-        1
-    );
-    assert!(!transition_path.exists());
-    assert!(store.contains_blob(&transition).await.unwrap());
+    assert_eq!(store.collect_blob_garbage_at(u64::MAX).await.unwrap(), 0);
+    assert!(store.blobs.contains(&orphan).await.unwrap());
 
     let staged = store.blobs.root().join(".staging").join("crash-orphan.tmp");
     std::fs::write(&staged, b"abandoned staging bytes").unwrap();
@@ -444,7 +598,7 @@ async fn gc_uses_awaiting_inactivity_and_removes_untracked_crash_files() {
 }
 
 #[tokio::test]
-async fn startup_reconciles_only_recognised_abandoned_upload_staging_files() {
+async fn startup_does_not_inventory_staging_and_bounded_maintenance_reconciles_it() {
     let temporary = tempfile::tempdir().unwrap();
     let store = Store::open(StoreOptions::new(temporary.path(), 1))
         .await
@@ -482,16 +636,28 @@ async fn startup_reconciles_only_recognised_abandoned_upload_staging_files() {
     }
     drop(store);
 
-    let _reopened = Store::open(StoreOptions::new(temporary.path(), 1))
+    let reopened = Store::open(StoreOptions::new(temporary.path(), 1))
         .await
         .unwrap();
 
+    for path in [
+        &legacy,
+        &current,
+        &legacy_shard,
+        &current_shard,
+        &malformed_shard,
+        &unknown,
+    ] {
+        assert!(path.exists());
+    }
+
+    assert_eq!(reopened.collect_blob_garbage_at(u64::MAX).await.unwrap(), 6);
     assert!(!legacy.exists());
     assert!(!current.exists());
     assert!(!legacy_shard.exists());
     assert!(!current_shard.exists());
-    assert!(malformed_shard.exists());
-    assert!(unknown.exists());
+    assert!(!malformed_shard.exists());
+    assert!(!unknown.exists());
 }
 
 #[tokio::test]

@@ -77,22 +77,23 @@ impl Store {
             return Err(PayloadStoreError::NotLarge);
         }
         let previous = self.complete_copy_state(expected).await?;
-        let actual = upload
-            .finish_expected(expected)
+        let staged = upload
+            .finish_staged_expected(expected)
             .await
             .map_err(|error| PayloadStoreError::Storage(error.to_string()))?;
-        if &actual != expected {
+        if staged.reference() != expected {
             return Err(PayloadStoreError::Storage(
                 "sealed complete source changed content identity".into(),
             ));
         }
         loop {
             let commit_guard = self.commit_lock.lock().await;
-            if !self
-                .blobs
-                .contains(expected)
-                .await
-                .map_err(|error| PayloadStoreError::Storage(error.to_string()))?
+            if !staged.path().is_file()
+                && !self
+                    .blobs
+                    .contains(expected)
+                    .await
+                    .map_err(|error| PayloadStoreError::Storage(error.to_string()))?
             {
                 return Err(PayloadStoreError::CompleteCopyMissing);
             }
@@ -106,6 +107,10 @@ impl Store {
                 Err(error) => return Err(error.into()),
             }
         }
+        self.blobs
+            .publish_staged(staged)
+            .await
+            .map_err(|error| PayloadStoreError::Storage(error.to_string()))?;
         Ok(if previous == PayloadArtifactState::Valid {
             CompleteCopySealOutcome::AlreadyPresent
         } else {

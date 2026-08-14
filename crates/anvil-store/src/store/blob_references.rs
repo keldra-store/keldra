@@ -3,15 +3,23 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use crate::blob::blob_reference_from_staging_name;
 use crate::blob_gc::{
-    BlobGcBudget, BlobGcCursor, BlobGcPhase, BlobGcTick, FilesystemGcChild, FilesystemGcChildKind,
-    FilesystemGcCursor,
+    BlobGcBudget, BlobGcCursor, BlobGcPhase, BlobGcTick, FilesystemGcCursor, FilesystemGcDirectory,
 };
+use crate::key::STORAGE_KEY_FORMAT_VERSION;
 
 use super::journal_capacity::SourceJournalAdmission;
 use super::*;
 
 static NEXT_GC_QUARANTINE_ID: AtomicU64 = AtomicU64::new(1);
+const BLOB_GC_DUE_DOMAIN: u8 = b'B';
+const BLOB_GC_COMPLETE_KIND: u8 = 0;
+const BLOB_GC_SHARD_KIND: u8 = 1;
+const BLOB_REFERENCE_IDENTITY_BYTES: usize = 32 + size_of::<u64>();
+const SHARD_REFERENCE_IDENTITY_BYTES: usize = 2 + 32 + size_of::<u64>() + size_of::<u16>();
+const BLOB_GC_DUE_PREFIX_BYTES: usize = 2;
+const BLOB_GC_DUE_FIXED_BYTES: usize = BLOB_GC_DUE_PREFIX_BYTES + size_of::<u64>() + 1;
 
 impl Store {
     pub async fn stage_blob(&self, bytes: &[u8]) -> Result<BlobRef, MutationError> {
@@ -64,20 +72,25 @@ impl Store {
         upload: crate::BlobUpload,
         admission: SourceJournalAdmission,
     ) -> Result<BlobRef, MutationError> {
-        // Hashing, fsync, rename and parent-directory fsync are byte-plane IO,
-        // so complete them before taking the short metadata commit fence.
-        let reference = upload.finish().await.map_err(storage_error)?;
+        // Hash and fsync under `.staging`, then make the lifecycle reservation
+        // durable before exposing the canonical content path.
+        let staged = upload.finish_staged().await.map_err(storage_error)?;
+        let reference = staged.reference().clone();
         let now = now_unix_millis()?;
         if is_small_blob(&reference) {
-            let bytes = self.blobs.get(&reference).await.map_err(storage_error)?;
+            let bytes = tokio::fs::read(staged.path())
+                .await
+                .map_err(storage_error)?;
             self.persist_small_blob_seal_with_admission(&reference, &bytes, now, admission)
                 .await?;
-            // A crash before this cleanup leaves only a normal untracked copy,
-            // which the existing age-gated orphan scan removes.
-            self.blobs.remove(&reference).map_err(storage_error)?;
+            remove_file_and_sync_parent(staged.path())?;
         } else {
             self.reserve_sealed_blob_with_admission_wait(&reference, now, admission)
                 .await?;
+            self.blobs
+                .publish_staged(staged)
+                .await
+                .map_err(storage_error)?;
         }
         Ok(reference)
     }
@@ -171,40 +184,31 @@ impl Store {
             && started.elapsed() < budget.max_duration
         {
             match &mut cursor.phase {
-                BlobGcPhase::References | BlobGcPhase::ReferencesAfter(_) => {
+                BlobGcPhase::Due | BlobGcPhase::DueAfter(_) => {
                     let after = match &cursor.phase {
-                        BlobGcPhase::References => None,
-                        BlobGcPhase::ReferencesAfter(key) => Some(key.as_slice()),
+                        BlobGcPhase::Due => None,
+                        BlobGcPhase::DueAfter(key) => Some(key.as_slice()),
                         BlobGcPhase::Filesystem(_) => unreachable!(),
                     };
-                    let Some((key, state, encoded_bytes)) = self.next_blob_gc_reference(after)?
-                    else {
+                    let cutoff = now_unix_millis.saturating_sub(self.awaiting_publish_ttl_millis);
+                    let Some(due) = self.next_blob_gc_due(after, cutoff)? else {
                         cursor.phase = BlobGcPhase::Filesystem(FilesystemGcCursor::default());
                         continue;
                     };
                     if tick.inspected_records != 0
-                        && tick.inspected_bytes.saturating_add(encoded_bytes) > budget.max_bytes
+                        && tick.inspected_bytes.saturating_add(due.encoded_bytes) > budget.max_bytes
                     {
                         break;
                     }
-                    let removed = if blob_reference_is_garbage(
-                        state,
-                        now_unix_millis,
-                        self.awaiting_publish_ttl_millis,
-                    ) {
-                        self.remove_blob_gc_reference_if_unchanged(&key, state, now_unix_millis)
-                            .await?
-                    } else {
-                        false
-                    };
-                    cursor.phase = BlobGcPhase::ReferencesAfter(key);
+                    let removed = self.collect_due_artifact(&due, now_unix_millis).await?;
+                    cursor.phase = BlobGcPhase::DueAfter(due.due_key);
                     tick.inspected_records += 1;
-                    tick.inspected_bytes = tick.inspected_bytes.saturating_add(encoded_bytes);
+                    tick.inspected_bytes = tick.inspected_bytes.saturating_add(due.encoded_bytes);
                     tick.removed = tick.removed.saturating_add(u64::from(removed));
                 }
                 BlobGcPhase::Filesystem(filesystem) => {
                     let Some(record) = self.next_filesystem_gc_record(filesystem)? else {
-                        cursor.phase = BlobGcPhase::References;
+                        cursor.phase = BlobGcPhase::Due;
                         tick.cycle_complete = true;
                         break;
                     };
@@ -227,69 +231,86 @@ impl Store {
         Ok(tick)
     }
 
-    fn next_blob_gc_reference(
+    fn next_blob_gc_due(
         &self,
         after: Option<&[u8]>,
-    ) -> Result<Option<(Vec<u8>, BlobReferenceState, u64)>, MutationError> {
-        let references = self.cf(CF_BLOB_REFERENCES)?;
-        let mode = after.map_or(IteratorMode::Start, |after| {
-            IteratorMode::From(after, Direction::Forward)
-        });
-        for entry in self.db.iterator_cf(references, mode) {
-            let (key, encoded) = entry.map_err(storage_error)?;
+        cutoff_updated_at: u64,
+    ) -> Result<Option<BlobGcDueRecord>, MutationError> {
+        let prefix = blob_gc_due_prefix();
+        let start = after.unwrap_or(&prefix);
+        for entry in self.db.iterator_cf(
+            self.cf(CF_BLOB_GC_DUE)?,
+            IteratorMode::From(start, Direction::Forward),
+        ) {
+            let (key, value) = entry.map_err(storage_error)?;
             if after.is_some_and(|after| key.as_ref() <= after) {
                 continue;
             }
-            let state = decode_blob_reference_state(&encoded)?;
-            let encoded_bytes = (key.len() + encoded.len()) as u64;
-            return Ok(Some((key.to_vec(), state, encoded_bytes)));
+            if !key.starts_with(&prefix) {
+                return Ok(None);
+            }
+            let (updated_at, identity) = decode_blob_gc_due_key(&key)?;
+            if updated_at > cutoff_updated_at {
+                return Ok(None);
+            }
+            return Ok(Some(BlobGcDueRecord {
+                due_key: key.to_vec(),
+                identity,
+                updated_at,
+                encoded_bytes: (key.len() + value.len()) as u64,
+            }));
         }
         Ok(None)
     }
 
-    pub(super) async fn remove_blob_gc_reference_if_unchanged(
+    async fn collect_due_artifact(
         &self,
-        key: &[u8],
-        expected: BlobReferenceState,
+        due: &BlobGcDueRecord,
         now_unix_millis: u64,
     ) -> Result<bool, MutationError> {
-        enum PhysicalRemoval {
-            None,
-            Blob(BlobRef),
-            Shard(ShardIdentity),
-        }
-
         let quarantined = {
             let _commit_guard = self.commit_lock.lock().await;
-            let Some(current) = self.read_blob_reference_state(key)? else {
+            let Some(current) = self.read_blob_reference_state(&due.identity)? else {
+                self.delete_stale_blob_gc_due(&due.due_key)?;
                 return Ok(false);
             };
-            if current != expected
-                || !blob_reference_is_garbage(
-                    current,
-                    now_unix_millis,
-                    self.awaiting_publish_ttl_millis,
-                )
-            {
+            if current.updated_at != due.updated_at || !blob_reference_needs_due(current) {
+                self.delete_stale_blob_gc_due(&due.due_key)?;
                 return Ok(false);
             }
-            let mut batch = WriteBatch::default();
-            let physical = if key.len() == 32 + size_of::<u64>() {
-                let reference = blob_reference_from_key(key)?;
+            if !blob_reference_is_garbage(
+                current,
+                now_unix_millis,
+                self.awaiting_publish_ttl_millis,
+            ) {
+                return Ok(false);
+            }
+
+            let physical = if due.identity.len() == BLOB_REFERENCE_IDENTITY_BYTES {
+                let reference = blob_reference_from_key(&due.identity)?;
                 if is_small_blob(&reference) {
-                    batch.delete_cf(self.cf(CF_SMALL_BLOBS)?, key);
-                    PhysicalRemoval::None
+                    None
                 } else {
-                    PhysicalRemoval::Blob(reference)
+                    self.quarantine_gc_artifact(GcArtifact::Blob(reference))
+                        .await?
                 }
             } else {
-                PhysicalRemoval::Shard(ShardIdentity::decode(key).map_err(storage_error)?)
+                let identity = ShardIdentity::decode(&due.identity).map_err(storage_error)?;
+                self.quarantine_gc_artifact(GcArtifact::Shard(identity))
+                    .await?
             };
-            batch.delete_cf(self.cf(CF_BLOB_REFERENCES)?, key);
+            let mut batch = WriteBatch::default();
+            if due.identity.len() == BLOB_REFERENCE_IDENTITY_BYTES {
+                let reference = blob_reference_from_key(&due.identity)?;
+                if is_small_blob(&reference) {
+                    batch.delete_cf(self.cf(CF_SMALL_BLOBS)?, &due.identity);
+                }
+            }
+            self.stage_blob_reference_delete(&mut batch, &due.identity, current)?;
             self.stage_local_changes(
                 &mut batch,
                 &[PendingLocalChange::ContentLifecycleChanged {
-                    blob_identity: key.to_vec(),
+                    blob_identity: due.identity.clone(),
                     revision: now_unix_millis,
                     reference_deltas: Vec::new(),
                 }],
@@ -299,20 +320,44 @@ impl Store {
             options.set_sync(self.sync_writes);
             self.db.write_opt(batch, &options).map_err(storage_error)?;
             self.notify_local_invalidations();
-            match physical {
-                PhysicalRemoval::None => None,
-                PhysicalRemoval::Blob(reference) => {
-                    self.quarantine_gc_file(&self.blobs.path(&reference.hash))?
-                }
-                PhysicalRemoval::Shard(identity) => {
-                    self.quarantine_gc_file(&shard_file_path(self.blobs.root(), &identity))?
-                }
-            }
+            physical
         };
         if let Some(path) = quarantined {
             remove_file_and_sync_parent(&path)?;
         }
         Ok(true)
+    }
+
+    fn delete_stale_blob_gc_due(&self, due_key: &[u8]) -> Result<(), MutationError> {
+        let mut options = WriteOptions::default();
+        options.set_sync(self.sync_writes);
+        self.db
+            .delete_cf_opt(self.cf(CF_BLOB_GC_DUE)?, due_key, &options)
+            .map_err(storage_error)
+    }
+
+    #[cfg(test)]
+    pub(super) async fn remove_blob_gc_reference_if_unchanged(
+        &self,
+        key: &[u8],
+        expected: BlobReferenceState,
+        now_unix_millis: u64,
+    ) -> Result<bool, MutationError> {
+        let due_key = blob_gc_due_key(key, expected)?
+            .ok_or_else(|| MutationError::Storage("blob GC state is not due-indexed".into()))?;
+        let due = BlobGcDueRecord {
+            encoded_bytes: due_key.len() as u64,
+            due_key,
+            identity: key.to_vec(),
+            updated_at: expected.updated_at,
+        };
+        let Some(current) = self.read_blob_reference_state(key)? else {
+            return Ok(false);
+        };
+        if current != expected {
+            return Ok(false);
+        }
+        self.collect_due_artifact(&due, now_unix_millis).await
     }
 
     fn next_filesystem_gc_record(
@@ -325,99 +370,50 @@ impl Store {
             return Ok(Some(record));
         }
         loop {
-            if let Some(child) = cursor.child.as_mut() {
-                let Some(entry) = child.entries.next() else {
-                    cursor.child = None;
-                    continue;
+            if cursor.entries.is_none() {
+                let name = match cursor.directory {
+                    FilesystemGcDirectory::Staging => ".staging",
+                    FilesystemGcDirectory::Quarantine => ".gc",
+                    FilesystemGcDirectory::Complete => return Ok(None),
                 };
-                let entry = entry.map_err(storage_error)?;
-                if !entry.file_type().map_err(storage_error)?.is_file() {
-                    return Err(MutationError::Storage(
-                        "blob maintenance directory contains a non-file entry".into(),
-                    ));
-                }
-                let path = entry.path();
-                let encoded_bytes = path_encoded_bytes(&path);
-                match &child.kind {
-                    FilesystemGcChildKind::Staging => {
-                        return Ok(Some(FilesystemGcRecord::Staged {
-                            modified_at: modified_unix_millis(&entry)?,
-                            path,
-                            encoded_bytes,
-                        }));
+                cursor.entries = match std::fs::read_dir(self.blobs.root().join(name)) {
+                    Ok(entries) => Some(entries),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        cursor.directory = next_filesystem_gc_directory(cursor.directory);
+                        continue;
                     }
-                    FilesystemGcChildKind::Quarantine => {
-                        return Ok(Some(FilesystemGcRecord::Quarantined {
-                            path,
-                            encoded_bytes,
-                        }));
-                    }
-                    FilesystemGcChildKind::HashPrefix(prefix) => {
-                        let name = entry.file_name();
-                        let name = name.to_str().ok_or_else(|| {
-                            MutationError::Storage("blob file name is not valid UTF-8".into())
-                        })?;
-                        let modified_at = modified_unix_millis(&entry)?;
-                        if name.len() == 64 {
-                            return Ok(Some(FilesystemGcRecord::Blob {
-                                reference: blob_reference_from_file(&entry, prefix)?,
-                                path,
-                                modified_at,
-                                encoded_bytes,
-                            }));
-                        }
-                        return Ok(Some(FilesystemGcRecord::Shard {
-                            identity: ShardIdentity::decode_file_name(prefix, name)
-                                .map_err(storage_error)?,
-                            path,
-                            modified_at,
-                            encoded_bytes,
-                        }));
-                    }
-                }
+                    Err(error) => return Err(storage_error(error)),
+                };
             }
-
-            if cursor.root.is_none() {
-                cursor.root = Some(std::fs::read_dir(self.blobs.root()).map_err(storage_error)?);
-            }
-            let root = cursor
-                .root
+            let Some(entry) = cursor
+                .entries
                 .as_mut()
-                .expect("filesystem GC root was initialized");
-            let Some(entry) = root.next() else {
-                return Ok(None);
+                .expect("maintenance directory was opened")
+                .next()
+            else {
+                cursor.entries = None;
+                cursor.directory = next_filesystem_gc_directory(cursor.directory);
+                continue;
             };
             let entry = entry.map_err(storage_error)?;
-            if !entry.file_type().map_err(storage_error)?.is_dir() {
+            if !entry.file_type().map_err(storage_error)?.is_file() {
                 return Err(MutationError::Storage(
-                    "blob root contains an unexpected non-directory entry".into(),
+                    "blob maintenance directory contains a non-file entry".into(),
                 ));
             }
-            let name = entry.file_name();
-            let kind = if name.as_os_str() == std::ffi::OsStr::new(".staging") {
-                FilesystemGcChildKind::Staging
-            } else if name.as_os_str() == std::ffi::OsStr::new(".gc") {
-                FilesystemGcChildKind::Quarantine
-            } else {
-                let prefix = name.to_str().ok_or_else(|| {
-                    MutationError::Storage("blob shard directory name is not UTF-8".into())
-                })?;
-                if prefix.len() != 2 || !prefix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                    return Err(MutationError::Storage(
-                        "blob shard directory name is malformed".into(),
-                    ));
-                }
-                FilesystemGcChildKind::HashPrefix(prefix.to_owned())
-            };
             let path = entry.path();
-            cursor.child = Some(FilesystemGcChild {
-                entries: std::fs::read_dir(&path).map_err(storage_error)?,
-                kind: kind.clone(),
-            });
-            return Ok(Some(FilesystemGcRecord::Directory {
-                encoded_bytes: path_encoded_bytes(&path),
-                path,
-                kind,
+            let encoded_bytes = path_encoded_bytes(&path);
+            return Ok(Some(match cursor.directory {
+                FilesystemGcDirectory::Staging => FilesystemGcRecord::Staged {
+                    modified_at: modified_unix_millis(&entry)?,
+                    path,
+                    encoded_bytes,
+                },
+                FilesystemGcDirectory::Quarantine => FilesystemGcRecord::Quarantined {
+                    path,
+                    encoded_bytes,
+                },
+                FilesystemGcDirectory::Complete => unreachable!(),
             }));
         }
     }
@@ -429,83 +425,39 @@ impl Store {
     ) -> Result<bool, MutationError> {
         use crate::blob_gc::FilesystemGcRecord;
 
-        let candidate = match record {
-            FilesystemGcRecord::Directory { .. } => return Ok(false),
+        match record {
             FilesystemGcRecord::Quarantined { path, .. } => {
-                remove_file_and_sync_parent(&path)?;
-                return Ok(true);
+                return self.reconcile_quarantined_file(&path).await;
             }
             FilesystemGcRecord::Staged {
                 path, modified_at, ..
             } => {
-                if now_unix_millis.saturating_sub(modified_at) < self.awaiting_publish_ttl_millis {
-                    return Ok(false);
-                }
-                let Some(path) = self.quarantine_gc_file(&path)? else {
-                    return Ok(false);
-                };
-                path
+                self.reconcile_staged_file(&path, modified_at, now_unix_millis)
+                    .await
             }
-            FilesystemGcRecord::Blob {
-                path,
-                reference,
-                modified_at,
-                ..
-            } => {
-                if now_unix_millis.saturating_sub(modified_at) < self.awaiting_publish_ttl_millis {
-                    return Ok(false);
-                }
-                let _commit_guard = self.commit_lock.lock().await;
-                if !is_small_blob(&reference)
-                    && self
-                        .read_blob_reference_state(&blob_reference_key(&reference))?
-                        .is_some()
-                {
-                    return Ok(false);
-                }
-                let Some(path) = self.quarantine_gc_file(&path)? else {
-                    return Ok(false);
-                };
-                path
-            }
-            FilesystemGcRecord::Shard {
-                path,
-                identity,
-                modified_at,
-                ..
-            } => {
-                if now_unix_millis.saturating_sub(modified_at) < self.awaiting_publish_ttl_millis {
-                    return Ok(false);
-                }
-                let _commit_guard = self.commit_lock.lock().await;
-                if self
-                    .read_blob_reference_state(&identity.encode())?
-                    .is_some()
-                {
-                    return Ok(false);
-                }
-                let Some(path) = self.quarantine_gc_file(&path)? else {
-                    return Ok(false);
-                };
-                path
-            }
-        };
-        remove_file_and_sync_parent(&candidate)?;
-        Ok(true)
+        }
     }
 
-    fn quarantine_gc_file(&self, source: &Path) -> Result<Option<PathBuf>, MutationError> {
+    async fn quarantine_gc_artifact(
+        &self,
+        artifact: GcArtifact,
+    ) -> Result<Option<PathBuf>, MutationError> {
+        let source = artifact.canonical_path(self.blobs.root());
         if !source.exists() {
             return Ok(None);
         }
         let quarantine = self.blobs.root().join(".gc");
-        std::fs::create_dir_all(&quarantine).map_err(storage_error)?;
-        let destination = quarantine.join(format!(
-            "gc-{}-{}",
+        crate::blob::create_directory_all_durable(&quarantine)
+            .await
+            .map_err(storage_error)?;
+        let destination = quarantine.join(gc_quarantine_name(
+            &artifact,
             std::process::id(),
-            NEXT_GC_QUARANTINE_ID.fetch_add(1, Ordering::Relaxed)
+            self.blobs.upload_boot_nonce(),
+            NEXT_GC_QUARANTINE_ID.fetch_add(1, Ordering::Relaxed),
         ));
-        match std::fs::rename(source, &destination) {
+        let _directory_guard = self.blobs.directory_lock.lock().await;
+        match std::fs::rename(&source, &destination) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(storage_error(error)),
@@ -515,6 +467,104 @@ impl Store {
         })?)?;
         sync_directory(&quarantine)?;
         Ok(Some(destination))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn quarantine_blob_for_test(
+        &self,
+        reference: &BlobRef,
+    ) -> Result<Option<PathBuf>, MutationError> {
+        self.quarantine_gc_artifact(GcArtifact::Blob(reference.clone()))
+            .await
+    }
+
+    pub(super) async fn quarantine_shard_for_removal(
+        &self,
+        identity: &ShardIdentity,
+    ) -> Result<Option<PathBuf>, MutationError> {
+        self.quarantine_gc_artifact(GcArtifact::Shard(identity.clone()))
+            .await
+    }
+
+    pub(super) fn remove_quarantined_artifact(&self, path: &Path) -> Result<(), MutationError> {
+        remove_file_and_sync_parent(path)
+    }
+
+    async fn reconcile_staged_file(
+        &self,
+        path: &Path,
+        modified_at: u64,
+        now_unix_millis: u64,
+    ) -> Result<bool, MutationError> {
+        if let Some(artifact) = staged_artifact_from_path(path)? {
+            let _commit_guard = self.commit_lock.lock().await;
+            if self
+                .read_blob_reference_state(&artifact.lifecycle_key())?
+                .is_some()
+            {
+                match &artifact {
+                    GcArtifact::Blob(reference) if is_small_blob(reference) => {
+                        let present = self
+                            .db
+                            .get_cf(self.cf(CF_SMALL_BLOBS)?, blob_reference_key(reference))
+                            .map_err(storage_error)?
+                            .is_some();
+                        if !present {
+                            return Err(MutationError::Storage(
+                                "small-blob lifecycle exists without inline bytes".into(),
+                            ));
+                        }
+                        remove_file_and_sync_parent(path)?;
+                    }
+                    GcArtifact::Blob(reference) => {
+                        self.blobs
+                            .publish_identified_staging(path, reference)
+                            .await
+                            .map_err(storage_error)?;
+                    }
+                    GcArtifact::Shard(identity) => {
+                        self.publish_identified_staged_shard(identity, path)
+                            .await
+                            .map_err(storage_error)?;
+                    }
+                }
+                return Ok(true);
+            }
+        }
+        if now_unix_millis.saturating_sub(modified_at) < self.awaiting_publish_ttl_millis {
+            return Ok(false);
+        }
+        remove_file_and_sync_parent(path)?;
+        Ok(true)
+    }
+
+    async fn reconcile_quarantined_file(&self, path: &Path) -> Result<bool, MutationError> {
+        let Some(artifact) = quarantined_artifact_from_path(path)? else {
+            remove_file_and_sync_parent(path)?;
+            return Ok(true);
+        };
+        let _commit_guard = self.commit_lock.lock().await;
+        if self
+            .read_blob_reference_state(&artifact.lifecycle_key())?
+            .is_none()
+        {
+            remove_file_and_sync_parent(path)?;
+            return Ok(true);
+        }
+        match artifact {
+            GcArtifact::Blob(reference) => {
+                self.blobs
+                    .publish_identified_staging(path, &reference)
+                    .await
+                    .map_err(storage_error)?;
+            }
+            GcArtifact::Shard(identity) => {
+                self.publish_identified_staged_shard(&identity, path)
+                    .await
+                    .map_err(storage_error)?;
+            }
+        }
+        Ok(true)
     }
 
     fn prepare_sealed_blob_reservation(
@@ -587,11 +637,8 @@ impl Store {
             .prepare_sealed_artifact_reservation(key, now_unix_millis)?
             .ok_or_else(|| MutationError::Storage("sealed lifecycle state is missing".into()))?;
         let mut batch = WriteBatch::default();
-        batch.put_cf(
-            self.cf(CF_BLOB_REFERENCES)?,
-            key,
-            encode_blob_reference_state(next),
-        );
+        let mut pending = PendingBlobReferences::new();
+        self.stage_blob_reference_update(&mut batch, &mut pending, key.to_vec(), next)?;
         self.stage_local_changes_with_admission(
             &mut batch,
             &[PendingLocalChange::ContentLifecycleChanged {
@@ -640,16 +687,6 @@ impl Store {
     ) -> Result<(), MutationError> {
         loop {
             let guard = self.commit_lock.lock().await;
-            // GC may have removed a stale deduplication target while finish was
-            // outside the fence. Never recreate lifecycle state without bytes.
-            if !self
-                .blobs
-                .contains(reference)
-                .await
-                .map_err(storage_error)?
-            {
-                return Err(MutationError::BlobNotFound);
-            }
             let result =
                 self.reserve_sealed_blob_with_admission(reference, now_unix_millis, admission);
             drop(guard);
@@ -704,11 +741,8 @@ impl Store {
         if let Some((small_key, small_bytes)) = value {
             batch.put_cf(self.cf(CF_SMALL_BLOBS)?, &small_key, small_bytes);
         }
-        batch.put_cf(
-            self.cf(CF_BLOB_REFERENCES)?,
-            &key,
-            encode_blob_reference_state(state),
-        );
+        let mut references = PendingBlobReferences::new();
+        self.stage_blob_reference_update(&mut batch, &mut references, key.clone(), state)?;
         self.stage_local_changes_with_admission(
             &mut batch,
             &[PendingLocalChange::ContentLifecycleChanged {
@@ -879,12 +913,37 @@ impl Store {
         key: Vec<u8>,
         state: BlobReferenceState,
     ) -> Result<(), MutationError> {
+        let previous = match pending.get(&key).copied() {
+            Some(state) => Some(state),
+            None => self.read_blob_reference_state(&key)?,
+        };
+        if let Some(previous) = previous
+            && let Some(old_due) = blob_gc_due_key(&key, previous)?
+        {
+            batch.delete_cf(self.cf(CF_BLOB_GC_DUE)?, old_due);
+        }
         batch.put_cf(
             self.cf(CF_BLOB_REFERENCES)?,
             &key,
             encode_blob_reference_state(state),
         );
+        if let Some(new_due) = blob_gc_due_key(&key, state)? {
+            batch.put_cf(self.cf(CF_BLOB_GC_DUE)?, new_due, []);
+        }
         pending.insert(key, state);
+        Ok(())
+    }
+
+    pub(super) fn stage_blob_reference_delete(
+        &self,
+        batch: &mut WriteBatch,
+        key: &[u8],
+        state: BlobReferenceState,
+    ) -> Result<(), MutationError> {
+        if let Some(due) = blob_gc_due_key(key, state)? {
+            batch.delete_cf(self.cf(CF_BLOB_GC_DUE)?, due);
+        }
+        batch.delete_cf(self.cf(CF_BLOB_REFERENCES)?, key);
         Ok(())
     }
 
@@ -924,11 +983,17 @@ fn validate_blob_gc_budget(budget: BlobGcBudget) -> Result<(), MutationError> {
 fn filesystem_record_bytes(record: &crate::blob_gc::FilesystemGcRecord) -> u64 {
     use crate::blob_gc::FilesystemGcRecord;
     match record {
-        FilesystemGcRecord::Directory { encoded_bytes, .. }
-        | FilesystemGcRecord::Staged { encoded_bytes, .. }
-        | FilesystemGcRecord::Quarantined { encoded_bytes, .. }
-        | FilesystemGcRecord::Blob { encoded_bytes, .. }
-        | FilesystemGcRecord::Shard { encoded_bytes, .. } => *encoded_bytes,
+        FilesystemGcRecord::Staged { encoded_bytes, .. }
+        | FilesystemGcRecord::Quarantined { encoded_bytes, .. } => *encoded_bytes,
+    }
+}
+
+fn next_filesystem_gc_directory(directory: FilesystemGcDirectory) -> FilesystemGcDirectory {
+    match directory {
+        FilesystemGcDirectory::Staging => FilesystemGcDirectory::Quarantine,
+        FilesystemGcDirectory::Quarantine | FilesystemGcDirectory::Complete => {
+            FilesystemGcDirectory::Complete
+        }
     }
 }
 
@@ -952,6 +1017,207 @@ fn modified_unix_millis(entry: &std::fs::DirEntry) -> Result<u64, MutationError>
 fn shard_file_path(root: &Path, identity: &ShardIdentity) -> PathBuf {
     let hash = hex::encode(identity.blob().hash);
     root.join(&hash[..2]).join(hex::encode(identity.encode()))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum GcArtifact {
+    Blob(BlobRef),
+    Shard(ShardIdentity),
+}
+
+impl GcArtifact {
+    fn lifecycle_key(&self) -> Vec<u8> {
+        match self {
+            Self::Blob(reference) => blob_reference_key(reference),
+            Self::Shard(identity) => identity.encode().to_vec(),
+        }
+    }
+
+    fn canonical_path(&self, root: &Path) -> PathBuf {
+        match self {
+            Self::Blob(reference) => {
+                let encoded = hex::encode(reference.hash);
+                root.join(&encoded[..2]).join(encoded)
+            }
+            Self::Shard(identity) => shard_file_path(root, identity),
+        }
+    }
+}
+
+struct BlobGcDueRecord {
+    due_key: Vec<u8>,
+    identity: Vec<u8>,
+    updated_at: u64,
+    encoded_bytes: u64,
+}
+
+fn blob_reference_needs_due(state: BlobReferenceState) -> bool {
+    state.ref_count == 0 || state.flags & AWAITING_PUBLISH != 0
+}
+
+fn blob_gc_due_prefix() -> [u8; BLOB_GC_DUE_PREFIX_BYTES] {
+    [STORAGE_KEY_FORMAT_VERSION, BLOB_GC_DUE_DOMAIN]
+}
+
+pub(super) fn blob_gc_due_key(
+    identity: &[u8],
+    state: BlobReferenceState,
+) -> Result<Option<Vec<u8>>, MutationError> {
+    validate_blob_reference_state(state)?;
+    if !blob_reference_needs_due(state) {
+        return Ok(None);
+    }
+    let kind = match identity.len() {
+        BLOB_REFERENCE_IDENTITY_BYTES => {
+            blob_reference_from_key(identity)?;
+            BLOB_GC_COMPLETE_KIND
+        }
+        SHARD_REFERENCE_IDENTITY_BYTES => {
+            ShardIdentity::decode(identity).map_err(storage_error)?;
+            BLOB_GC_SHARD_KIND
+        }
+        _ => {
+            return Err(MutationError::Storage(
+                "blob lifecycle identity is malformed".into(),
+            ));
+        }
+    };
+    let mut key = Vec::with_capacity(BLOB_GC_DUE_FIXED_BYTES + identity.len());
+    key.extend_from_slice(&blob_gc_due_prefix());
+    key.extend_from_slice(&state.updated_at.to_be_bytes());
+    key.push(kind);
+    key.extend_from_slice(identity);
+    Ok(Some(key))
+}
+
+fn decode_blob_gc_due_key(encoded: &[u8]) -> Result<(u64, Vec<u8>), MutationError> {
+    if encoded.len() < BLOB_GC_DUE_FIXED_BYTES || !encoded.starts_with(&blob_gc_due_prefix()) {
+        return Err(MutationError::Storage(
+            "blob GC due key is malformed".into(),
+        ));
+    }
+    let updated_at = u64::from_be_bytes(
+        encoded[BLOB_GC_DUE_PREFIX_BYTES..BLOB_GC_DUE_PREFIX_BYTES + size_of::<u64>()]
+            .try_into()
+            .expect("blob GC timestamp width was checked"),
+    );
+    let kind = encoded[BLOB_GC_DUE_PREFIX_BYTES + size_of::<u64>()];
+    let identity = &encoded[BLOB_GC_DUE_FIXED_BYTES..];
+    match kind {
+        BLOB_GC_COMPLETE_KIND if identity.len() == BLOB_REFERENCE_IDENTITY_BYTES => {
+            blob_reference_from_key(identity)?;
+        }
+        BLOB_GC_SHARD_KIND if identity.len() == SHARD_REFERENCE_IDENTITY_BYTES => {
+            ShardIdentity::decode(identity).map_err(storage_error)?;
+        }
+        _ => {
+            return Err(MutationError::Storage(
+                "blob GC due identity is malformed".into(),
+            ));
+        }
+    }
+    Ok((updated_at, identity.to_vec()))
+}
+
+fn staged_artifact_from_path(path: &Path) -> Result<Option<GcArtifact>, MutationError> {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Ok(None);
+    };
+    if let Some(reference) = blob_reference_from_staging_name(name) {
+        return Ok(Some(GcArtifact::Blob(reference)));
+    }
+    shard_identity_from_staging_name(name)
+        .map(|identity| identity.map(GcArtifact::Shard))
+        .map_err(storage_error)
+}
+
+fn shard_identity_from_staging_name(name: &str) -> Result<Option<ShardIdentity>, ShardStoreError> {
+    let Some(body) = name
+        .strip_prefix("shard-")
+        .and_then(|name| name.strip_suffix(".tmp"))
+    else {
+        return Ok(None);
+    };
+    let fields = body.split('-').collect::<Vec<_>>();
+    let identity = match fields.as_slice() {
+        [process_id, upload_id, identity]
+            if process_id.parse::<u32>().is_ok() && upload_id.parse::<u64>().is_ok() =>
+        {
+            *identity
+        }
+        [process_id, nonce, upload_id, identity]
+            if process_id.parse::<u32>().is_ok()
+                && nonce.len() == 32
+                && upload_id.parse::<u64>().is_ok() =>
+        {
+            *identity
+        }
+        _ => return Ok(None),
+    };
+    if identity.len() != SHARD_REFERENCE_IDENTITY_BYTES * 2 {
+        return Ok(None);
+    }
+    let mut encoded = [0_u8; SHARD_REFERENCE_IDENTITY_BYTES];
+    if hex::decode_to_slice(identity, &mut encoded).is_err() {
+        return Ok(None);
+    }
+    ShardIdentity::decode(&encoded).map(Some)
+}
+
+fn gc_quarantine_name(
+    artifact: &GcArtifact,
+    process_id: u32,
+    boot_nonce: &[u8],
+    sequence: u64,
+) -> String {
+    let (kind, identity) = match artifact {
+        GcArtifact::Blob(reference) => ("blob", blob_reference_key(reference)),
+        GcArtifact::Shard(identity) => ("shard", identity.encode().to_vec()),
+    };
+    format!(
+        "gc-{kind}-{process_id}-{}-{sequence}-{}.tmp",
+        hex::encode(boot_nonce),
+        hex::encode(identity),
+    )
+}
+
+fn quarantined_artifact_from_path(path: &Path) -> Result<Option<GcArtifact>, MutationError> {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Ok(None);
+    };
+    let Some(body) = name
+        .strip_prefix("gc-")
+        .and_then(|name| name.strip_suffix(".tmp"))
+    else {
+        return Ok(None);
+    };
+    let fields = body.split('-').collect::<Vec<_>>();
+    let [kind, process_id, nonce, sequence, identity] = fields.as_slice() else {
+        return Ok(None);
+    };
+    if process_id.parse::<u32>().is_err() || nonce.len() != 32 || sequence.parse::<u64>().is_err() {
+        return Ok(None);
+    }
+    let expected = match *kind {
+        "blob" => BLOB_REFERENCE_IDENTITY_BYTES,
+        "shard" => SHARD_REFERENCE_IDENTITY_BYTES,
+        _ => return Ok(None),
+    };
+    if identity.len() != expected * 2 {
+        return Ok(None);
+    }
+    let mut encoded = vec![0_u8; expected];
+    if hex::decode_to_slice(identity, &mut encoded).is_err() {
+        return Ok(None);
+    }
+    match *kind {
+        "blob" => blob_reference_from_key(&encoded).map(GcArtifact::Blob),
+        "shard" => ShardIdentity::decode(&encoded)
+            .map(GcArtifact::Shard)
+            .map_err(storage_error),
+        _ => unreachable!(),
+    }
+    .map(Some)
 }
 
 fn sync_directory(path: &Path) -> Result<(), MutationError> {

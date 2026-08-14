@@ -1,7 +1,8 @@
 use rocksdb::WriteBatch;
 
 use super::*;
-use crate::{DefinitionMutationIntent, DefinitionOperation};
+use crate::definition_state::DefinitionDeletion;
+use crate::{DefinitionMutationIntent, DefinitionOperation, INDEX_DEFINITION_PREFIX};
 
 async fn store() -> (tempfile::TempDir, Store) {
     let temporary = tempfile::tempdir().unwrap();
@@ -116,6 +117,7 @@ fn value_codecs_reject_unknown_versions_and_identity_mismatches() {
         definition_id: 11,
         path: "_anvil/indexes/by-path".into(),
         object_version: VersionId(13),
+        operation: DefinitionOperation::Upsert,
     };
     let key = locator_key(locator.kind, 7, 9, &locator.path).unwrap();
     let encoded = encode_locator(&locator);
@@ -124,6 +126,10 @@ fn value_codecs_reject_unknown_versions_and_identity_mismatches() {
     unsupported[0] += 1;
     assert!(matches!(
         decode_locator(&key, &unsupported),
+        Err(DefinitionStateError::Malformed(_))
+    ));
+    assert!(matches!(
+        decode_locator(&key, &[1; 17]),
         Err(DefinitionStateError::Malformed(_))
     ));
 
@@ -160,7 +166,7 @@ fn value_codecs_reject_unknown_versions_and_identity_mismatches() {
 }
 
 #[tokio::test]
-async fn locator_transition_is_exact_and_delete_removes_it() {
+async fn locator_transition_retains_one_current_state_tombstone_and_recreation_replaces_it() {
     let (_temporary, store) = store().await;
     let intent = DefinitionMutationIntent::new(DefinitionKind::Index, 11).unwrap();
     let transition = DefinitionTransition {
@@ -181,7 +187,7 @@ async fn locator_transition_is_exact_and_delete_removes_it() {
         store
             .definition_locator(DefinitionKind::Index, 7, 9, &transition.path)
             .unwrap(),
-        transition.locator()
+        Some(transition.locator())
     );
 
     let mut deletion = transition;
@@ -192,12 +198,32 @@ async fn locator_transition_is_exact_and_delete_removes_it() {
         .stage_definition_transition(&mut batch, &deletion)
         .unwrap();
     store.db.write(batch).unwrap();
-    assert!(
+    assert_eq!(
         store
             .definition_locator(DefinitionKind::Index, 7, 9, &deletion.path)
-            .unwrap()
-            .is_none()
+            .unwrap(),
+        Some(deletion.locator())
     );
+
+    let tombstones = store
+        .scan_definition_locators_by_bucket(DefinitionKind::Index, 7, 9, None, 10)
+        .unwrap();
+    assert_eq!(tombstones.locators, vec![deletion.locator()]);
+
+    let mut recreated = deletion;
+    recreated.definition_id = 12;
+    recreated.object_version = VersionId(15);
+    recreated.operation = DefinitionOperation::Upsert;
+    let mut batch = WriteBatch::default();
+    store
+        .stage_definition_transition(&mut batch, &recreated)
+        .unwrap();
+    store.db.write(batch).unwrap();
+    let current = store
+        .scan_definition_locators_by_bucket(DefinitionKind::Index, 7, 9, None, 10)
+        .unwrap();
+    assert_eq!(current.locators, vec![recreated.locator()]);
+    assert!(current.next_cursor.is_none());
 }
 
 #[tokio::test]
@@ -258,6 +284,83 @@ async fn assignment_page_and_checkpoint_commit_and_page_together() {
 }
 
 #[tokio::test]
+async fn definition_delete_is_delivered_distinctly_and_removes_the_assignment() {
+    let (_temporary, store) = store().await;
+    let mut changes = store.subscribe_definition_assignment_changes();
+    let assignment = DefinitionAssignment {
+        kind: DefinitionKind::Index,
+        tenant_id: 7,
+        bucket_id: 9,
+        definition_id: 11,
+        definition_path: "_anvil/indexes/v4/definitions/example".into(),
+        object_version: VersionId(13),
+        observed_fence: fence(17),
+        rank: 0,
+    };
+    store
+        .apply_definition_assignment_mutations(&[DefinitionAssignmentMutation::Upsert(
+            assignment.clone(),
+        )])
+        .unwrap();
+    assert!(matches!(
+        changes.recv().await.unwrap().as_slice(),
+        [DefinitionAssignmentMutation::Upsert(_)]
+    ));
+
+    let deletion = DefinitionDeletion {
+        kind: assignment.kind,
+        tenant_id: assignment.tenant_id,
+        bucket_id: assignment.bucket_id,
+        definition_id: assignment.definition_id,
+        definition_path: assignment.definition_path,
+        object_version: VersionId(14),
+        observed_fence: fence(18),
+        rank: 0,
+    };
+    let checkpoint = DefinitionCheckpoint {
+        consumer_kind: DefinitionConsumerKind::IndexAssignments,
+        source_id: SourceId {
+            node_id: 4,
+            source_epoch: [8; 32],
+        },
+        next_offset: 21,
+        observed_fence: deletion.observed_fence,
+    };
+    store
+        .apply_definition_assignment_page(
+            &[DefinitionAssignmentMutation::Delete(deletion.clone())],
+            &checkpoint,
+        )
+        .unwrap();
+    assert_eq!(
+        changes.recv().await.unwrap(),
+        vec![DefinitionAssignmentMutation::Delete(deletion)]
+    );
+    assert!(
+        store
+            .definition_assignment(DefinitionKind::Index, 7, 9, 11)
+            .unwrap()
+            .is_none()
+    );
+    let due = store
+        .oldest_deleted_definition_cleanup()
+        .unwrap()
+        .expect("delete delivery must atomically retain cleanup evidence");
+    assert_eq!(due.tenant_id, 7);
+    assert_eq!(due.bucket_id, 9);
+    assert_eq!(due.index_id, 11);
+    assert_eq!(due.definition_object_version, VersionId(14));
+    assert_eq!(due.definition_path, "_anvil/indexes/v4/definitions/example");
+    assert!(due.due_at_unix_millis > 0);
+    assert_eq!(
+        store
+            .definition_checkpoint(checkpoint.consumer_kind, checkpoint.source_id.node_id)
+            .unwrap(),
+        Some(checkpoint)
+    );
+}
+
+#[tokio::test]
 async fn conditional_assignment_removal_deletes_only_the_exact_observed_value() {
     let (_temporary, store) = store().await;
     let observed = DefinitionAssignment {
@@ -265,7 +368,7 @@ async fn conditional_assignment_removal_deletes_only_the_exact_observed_value() 
         tenant_id: 7,
         bucket_id: 9,
         definition_id: 11,
-        definition_path: "_anvil/indexes/v3/definitions/by-path".into(),
+        definition_path: format!("{INDEX_DEFINITION_PREFIX}by-path"),
         object_version: VersionId(13),
         observed_fence: fence(17),
         rank: 0,
@@ -459,6 +562,7 @@ async fn locator_scan_skips_corruption_with_a_bounded_raw_continuation() {
         definition_id: 12,
         path: "b".into(),
         object_version: VersionId(22),
+        operation: DefinitionOperation::Upsert,
     };
     store
         .db

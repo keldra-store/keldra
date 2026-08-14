@@ -4,6 +4,13 @@
 //! knowledge of payload contents. It stores immutable object versions and
 //! atomically moves current heads subject to small CAS preconditions.
 
+/// Reserved ordinary-object prefix containing current index definitions.
+///
+/// The storage kernel owns exact prefix recognition for its bounded
+/// bucket-scoped iterator. Definition-name validation remains a server
+/// concern.
+pub const INDEX_DEFINITION_PREFIX: &str = "_anvil/indexes/v4/definitions/";
+
 mod authz;
 mod blob;
 mod blob_gc;
@@ -13,6 +20,7 @@ mod credential_secret;
 mod definition_state;
 mod derived_consumer;
 mod erasure;
+mod index_retention_due;
 mod journal_route;
 mod key;
 mod logical_record;
@@ -56,9 +64,9 @@ pub use clock::VersionClock;
 pub use credential_secret::CredentialSecretEnvelope;
 pub use definition_state::{
     DefinitionAssignment, DefinitionAssignmentCursor, DefinitionAssignmentMutation,
-    DefinitionAssignmentPage, DefinitionCheckpoint, DefinitionConsumerKind, DefinitionKind,
-    DefinitionLocator, DefinitionLocatorCursor, DefinitionLocatorPage, DefinitionMutationIntent,
-    DefinitionOperation, DefinitionStateError, DefinitionTransition,
+    DefinitionAssignmentPage, DefinitionCheckpoint, DefinitionConsumerKind, DefinitionDeletion,
+    DefinitionKind, DefinitionLocator, DefinitionLocatorCursor, DefinitionLocatorPage,
+    DefinitionMutationIntent, DefinitionOperation, DefinitionStateError, DefinitionTransition,
     MAX_DEFINITION_STATE_SCAN_RECORDS,
 };
 pub use derived_consumer::{
@@ -68,6 +76,9 @@ pub use derived_consumer::{
 pub use erasure::{
     DEFAULT_ERASURE_DATA_SHARDS, DEFAULT_ERASURE_PARITY_SHARDS, DEFAULT_ERASURE_STRIPE_UNIT_BYTES,
     ErasureCodec, ErasureError, ErasureProfile, FRAGMENT_FORMAT_VERSION,
+};
+pub use index_retention_due::{
+    DeletedDefinitionCleanup, IndexGenerationRetentionDue, IndexRetentionDueError,
 };
 pub use journal_route::{JournalRoute, RoutedJournalError, RoutedLocalChangePage};
 pub use key::ObjectKey;

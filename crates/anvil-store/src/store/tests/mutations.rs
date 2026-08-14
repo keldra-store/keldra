@@ -484,7 +484,7 @@ async fn bulk_wal_contains_one_high_watermark_and_replay_adds_no_write() {
 }
 
 #[tokio::test]
-async fn prepared_put_keeps_small_bytes_in_memory_and_materializes_large_bytes() {
+async fn prepared_put_keeps_small_bytes_in_memory_and_reserves_materialized_large_bytes() {
     let (_temporary, store) = store().await;
     let identity = store.resolve_bucket_identity("tenant", "bucket").unwrap();
     let first_bytes = b"small payload".to_vec();
@@ -529,8 +529,9 @@ async fn prepared_put_keeps_small_bytes_in_memory_and_materializes_large_bytes()
             assert!(request.bytes.is_empty());
             assert_eq!(reference.length, blob_bytes.len() as u64);
             assert_eq!(store.blobs.get(&reference).await.unwrap(), blob_bytes);
-            assert!(store.blob_reference_state(&reference).unwrap().is_none());
-            assert_eq!(store.db.latest_sequence_number(), sequence_before_prepare);
+            let state = store.blob_reference_state(&reference).unwrap().unwrap();
+            assert_eq!((state.ref_count, state.flags), (1, AWAITING_PUBLISH));
+            assert!(store.db.latest_sequence_number() > sequence_before_prepare);
         }
         _ => panic!("large put was not durably materialized"),
     }
@@ -1122,7 +1123,7 @@ async fn first_typed_mutation_accepts_an_unstamped_050_baseline() {
 }
 
 #[tokio::test]
-async fn bulk_publishes_identical_large_payloads_in_one_rocksdb_batch() {
+async fn bulk_publishes_identical_large_payloads_after_durable_reservations() {
     let (temporary, store) = store().await;
     store.resolve_bucket_identity("tenant", "bucket").unwrap();
     let bytes = vec![0x5a; SMALL_BLOB_MAX_BYTES + 1];
@@ -1142,7 +1143,10 @@ async fn bulk_publishes_identical_large_payloads_in_one_rocksdb_batch() {
         .unwrap()
         .collect::<std::result::Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(updates.len(), 1);
+    // Each large preparation durably records or refreshes its awaiting-publish
+    // reservation. Both object publications, their final reference count,
+    // journal entries and source cursor then share one final WAL batch.
+    assert_eq!(updates.len(), 3);
     let state = store.blob_reference_state(&reference).unwrap().unwrap();
     assert_eq!(state.ref_count, 2);
     assert_eq!(state.flags, 0);
@@ -1183,9 +1187,9 @@ async fn locally_applied_reference_effect_and_source_cursor_share_one_batch() {
         .unwrap()
         .collect::<std::result::Result<Vec<_>, _>>()
         .unwrap();
-    // The complete payload file is sealed before the one metadata commit;
-    // object publication, count, journal entry and cursor are one WAL batch.
-    assert_eq!(batches.len(), 1);
+    // The first batch reserves the sealed bytes. Object publication, its final
+    // count, journal entry and source cursor share the second WAL batch.
+    assert_eq!(batches.len(), 2);
     assert_eq!(
         store
             .blob_reference_state(&reference)
@@ -1228,29 +1232,26 @@ async fn rejected_large_inline_put_leaves_only_an_age_gated_orphan() {
         rejected,
         Err(MutationError::PreconditionFailed { .. })
     ));
-    assert!(store.blob_reference_state(&reference).unwrap().is_none());
+    let state = store.blob_reference_state(&reference).unwrap().unwrap();
+    assert_eq!((state.ref_count, state.flags), (1, AWAITING_PUBLISH));
     assert!(store.blobs.contains(&reference).await.unwrap());
-    let modified = blob_file_path(&store, &reference)
-        .metadata()
-        .unwrap()
-        .modified()
-        .unwrap()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
     assert_eq!(
-        store.collect_blob_garbage_at(modified + 999).await.unwrap(),
+        store
+            .collect_blob_garbage_at(state.updated_at + 999)
+            .await
+            .unwrap(),
         0
     );
     assert!(store.blobs.contains(&reference).await.unwrap());
     assert_eq!(
         store
-            .collect_blob_garbage_at(modified + 1_000)
+            .collect_blob_garbage_at(state.updated_at + 1_000)
             .await
             .unwrap(),
         1
     );
     assert!(!store.blobs.contains(&reference).await.unwrap());
+    assert!(store.blob_reference_state(&reference).unwrap().is_none());
 }
 
 #[tokio::test]

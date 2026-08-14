@@ -1,7 +1,7 @@
 use crate::{
-    BatchOperation, BucketPolicy, DefinitionMutationIntent, DeleteRequest, Durability, ObjectKey,
-    ObjectMutationGovernance, ObjectVersioning, Precondition, PutMode, PutRequest, StoreOptions,
-    WatchRetention,
+    BatchOperation, BucketPolicy, DefinitionMutationIntent, DeleteRequest, Durability,
+    INDEX_DEFINITION_PREFIX, ObjectKey, ObjectMutationGovernance, ObjectVersioning, Precondition,
+    PutMode, PutRequest, StoreOptions, WatchRetention,
 };
 
 use super::*;
@@ -166,13 +166,13 @@ async fn definition_mutations_commit_locator_and_both_sparse_routes() {
         versioning: ObjectVersioning::Unversioned,
         policy: BucketPolicy::default(),
     };
-    let path = "_anvil/indexes/v3/definitions/search";
+    let path = format!("{INDEX_DEFINITION_PREFIX}search");
     let intent = DefinitionMutationIntent::new(DefinitionKind::Index, 41).unwrap();
     let created = store
         .mutate_definition_with_governance(
             BatchOperation::Put(PutRequest {
                 mode: PutMode::PutIfAbsent,
-                ..put("tenant", "bucket", path, "create-definition")
+                ..put("tenant", "bucket", &path, "create-definition")
             }),
             governance.clone(),
             intent,
@@ -182,7 +182,7 @@ async fn definition_mutations_commit_locator_and_both_sparse_routes() {
     let status = store.local_watch_status().unwrap();
     assert_eq!(status.tail, 1);
     let locator = store
-        .definition_locator(DefinitionKind::Index, tenant_id, bucket_id, path)
+        .definition_locator(DefinitionKind::Index, tenant_id, bucket_id, &path)
         .unwrap()
         .unwrap();
     assert_eq!(locator.definition_id, 41);
@@ -212,7 +212,7 @@ async fn definition_mutations_commit_locator_and_both_sparse_routes() {
     let deleted = store
         .mutate_definition_with_governance(
             BatchOperation::Delete(DeleteRequest {
-                key: ObjectKey::new("tenant", "bucket", path).unwrap(),
+                key: ObjectKey::new("tenant", "bucket", &path).unwrap(),
                 precondition: Precondition::Version(created.version),
                 command_id: Some("delete-definition".into()),
                 durability: Durability::Local,
@@ -223,11 +223,15 @@ async fn definition_mutations_commit_locator_and_both_sparse_routes() {
         .await
         .unwrap();
     assert!(deleted.deleted);
-    assert!(
-        store
-            .definition_locator(DefinitionKind::Index, tenant_id, bucket_id, path)
-            .unwrap()
-            .is_none()
+    let deleted_locator = store
+        .definition_locator(DefinitionKind::Index, tenant_id, bucket_id, &path)
+        .unwrap()
+        .unwrap();
+    assert_eq!(deleted_locator.definition_id, 41);
+    assert_eq!(deleted_locator.object_version, deleted.version);
+    assert_eq!(
+        deleted_locator.operation,
+        crate::DefinitionOperation::Delete
     );
     let status = store.local_watch_status().unwrap();
     let page = store
@@ -299,7 +303,7 @@ async fn accounting_definition_mutations_commit_typed_locator_and_routes() {
         DefinitionKind::Accounting
     );
 
-    store
+    let deleted = store
         .mutate_definition_with_governance(
             BatchOperation::Delete(DeleteRequest {
                 key: ObjectKey::new("tenant", "bucket", path).unwrap(),
@@ -312,11 +316,15 @@ async fn accounting_definition_mutations_commit_typed_locator_and_routes() {
         )
         .await
         .unwrap();
-    assert!(
-        store
-            .definition_locator(DefinitionKind::Accounting, tenant_id, bucket_id, path)
-            .unwrap()
-            .is_none()
+    let deleted_locator = store
+        .definition_locator(DefinitionKind::Accounting, tenant_id, bucket_id, path)
+        .unwrap()
+        .unwrap();
+    assert_eq!(deleted_locator.definition_id, 52);
+    assert_eq!(deleted_locator.object_version, deleted.version);
+    assert_eq!(
+        deleted_locator.operation,
+        crate::DefinitionOperation::Delete
     );
 }
 

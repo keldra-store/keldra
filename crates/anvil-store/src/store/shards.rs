@@ -107,23 +107,6 @@ impl ShardIdentity {
         let hash = hex::encode(self.blob.hash);
         root.join(&hash[..2]).join(hex::encode(self.encode()))
     }
-
-    pub(crate) fn decode_file_name(hash_prefix: &str, name: &str) -> Result<Self, ShardStoreError> {
-        if name.len() != SHARD_IDENTITY_BYTES * 2
-            || !name.bytes().all(|byte| byte.is_ascii_hexdigit())
-        {
-            return Err(ShardStoreError::MalformedIdentity);
-        }
-        let mut encoded = [0_u8; SHARD_IDENTITY_BYTES];
-        hex::decode_to_slice(name, &mut encoded).map_err(|_| ShardStoreError::MalformedIdentity)?;
-        let identity = Self::decode(&encoded)?;
-        let canonical = hex::encode(identity.encode());
-        let blob_hash = hex::encode(identity.blob.hash);
-        if canonical != name || !blob_hash.starts_with(hash_prefix) {
-            return Err(ShardStoreError::MalformedIdentity);
-        }
-        Ok(identity)
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -193,7 +176,7 @@ impl Store {
         drop(output);
         validate_shard_file(codec, identity, &temporary)?;
 
-        self.commit_staged_shard(codec, identity, &staging, &temporary, temporary_guard)
+        self.commit_staged_shard(codec, identity, &temporary, temporary_guard)
             .await
     }
 
@@ -234,7 +217,7 @@ impl Store {
         drop(output);
         validate_shard_file(codec, identity, &temporary)?;
 
-        self.commit_staged_shard(codec, identity, &staging, &temporary, temporary_guard)
+        self.commit_staged_shard(codec, identity, &temporary, temporary_guard)
             .await
     }
 
@@ -242,7 +225,6 @@ impl Store {
         &self,
         codec: &ErasureCodec,
         identity: &ShardIdentity,
-        staging: &Path,
         temporary: &Path,
         temporary_guard: TemporaryShard,
     ) -> Result<ShardSealOutcome, ShardStoreError> {
@@ -250,7 +232,6 @@ impl Store {
         let parent = final_path
             .parent()
             .ok_or_else(|| ShardStoreError::Storage("shard path has no parent".into()))?;
-        let created;
         {
             let _directory_guard = self.blobs.directory_lock.lock().await;
             create_directory_all_durable(parent)
@@ -258,18 +239,14 @@ impl Store {
                 .map_err(shard_storage_error)?;
             if final_path.exists() {
                 validate_shard_file(codec, identity, &final_path)?;
-                created = false;
-            } else {
-                std::fs::rename(&temporary, &final_path).map_err(shard_storage_error)?;
-                sync_directory(parent)?;
-                sync_directory(&staging)?;
-                created = true;
             }
         }
 
+        // The awaiting lifecycle and its due entry become durable while the
+        // validated bytes are still recoverably named under `.staging`.
         loop {
             let commit_guard = self.commit_lock.lock().await;
-            if !final_path.is_file() {
+            if !temporary.is_file() && !final_path.is_file() {
                 return Err(ShardStoreError::NotFound);
             }
             let reservation = self.reserve_sealed_artifact(
@@ -285,6 +262,9 @@ impl Store {
                 Err(error) => return Err(shard_error(error)),
             }
         }
+        let created = self
+            .publish_identified_staged_shard(identity, temporary)
+            .await?;
         drop(temporary_guard);
         Ok(if created {
             ShardSealOutcome::Created
@@ -342,37 +322,76 @@ impl Store {
         }
     }
 
+    /// Complete or recover publication of one validated, identity-named shard
+    /// stage after its lifecycle reservation is durable.
+    pub(super) async fn publish_identified_staged_shard(
+        &self,
+        identity: &ShardIdentity,
+        temporary: &Path,
+    ) -> Result<bool, ShardStoreError> {
+        let final_path = identity.path(self.blobs.root());
+        let parent = final_path
+            .parent()
+            .ok_or_else(|| ShardStoreError::Storage("shard path has no parent".into()))?;
+        let staging = temporary
+            .parent()
+            .ok_or_else(|| ShardStoreError::Storage("shard staging path has no parent".into()))?;
+        let _directory_guard = self.blobs.directory_lock.lock().await;
+        create_directory_all_durable(parent)
+            .await
+            .map_err(shard_storage_error)?;
+        if final_path.is_file() {
+            match std::fs::remove_file(temporary) {
+                Ok(()) => sync_directory(staging)?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(shard_storage_error(error)),
+            }
+            return Ok(false);
+        }
+        match std::fs::rename(temporary, &final_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound && final_path.is_file() => {
+                return Ok(false);
+            }
+            Err(error) => return Err(shard_storage_error(error)),
+        }
+        sync_directory(parent)?;
+        sync_directory(staging)?;
+        Ok(true)
+    }
+
     /// Removes one local shard and its local lifecycle record.
     ///
     /// Placement and reference-delta callers decide when removal is safe; this
     /// byte-plane primitive deliberately has no cluster policy.
     pub async fn remove_shard(&self, identity: &ShardIdentity) -> Result<bool, ShardStoreError> {
-        let _commit_guard = self.commit_lock.lock().await;
-        let key = identity.encode();
-        let had_state = self
-            .read_blob_reference_state(&key)
-            .map_err(shard_error)?
-            .is_some();
-        if had_state {
-            let mut options = WriteOptions::default();
-            options.set_sync(self.sync_writes);
-            self.db
-                .delete_cf_opt(
-                    self.cf(CF_BLOB_REFERENCES).map_err(shard_error)?,
-                    key,
-                    &options,
-                )
-                .map_err(shard_storage_error)?;
+        let (had_state, quarantined) = {
+            let _commit_guard = self.commit_lock.lock().await;
+            let key = identity.encode();
+            let state = self.read_blob_reference_state(&key).map_err(shard_error)?;
+            let had_state = state.is_some();
+            let quarantined = self
+                .quarantine_shard_for_removal(identity)
+                .await
+                .map_err(shard_error)?;
+            if let Some(state) = state {
+                let mut batch = WriteBatch::default();
+                self.stage_blob_reference_delete(&mut batch, &key, state)
+                    .map_err(shard_error)?;
+                let mut options = WriteOptions::default();
+                options.set_sync(self.sync_writes);
+                self.db
+                    .write_opt(batch, &options)
+                    .map_err(shard_storage_error)?;
+            }
+            (had_state, quarantined)
+        };
+        let removed = quarantined.is_some();
+        if let Some(path) = quarantined {
+            self.remove_quarantined_artifact(&path)
+                .map_err(shard_error)?;
         }
-        let removed = remove_shard_file(identity, self.blobs.root())?;
         Ok(had_state || removed)
-    }
-
-    pub(super) fn remove_shard_file(
-        &self,
-        identity: &ShardIdentity,
-    ) -> Result<bool, MutationError> {
-        remove_shard_file(identity, self.blobs.root()).map_err(storage_error)
     }
 }
 
@@ -393,21 +412,6 @@ fn validate_shard_file(
     codec
         .validate_shard(identity.blob(), identity.ordinal(), file)
         .map_err(Into::into)
-}
-
-fn remove_shard_file(identity: &ShardIdentity, root: &Path) -> Result<bool, ShardStoreError> {
-    let path = identity.path(root);
-    match std::fs::remove_file(&path) {
-        Ok(()) => {
-            let parent = path
-                .parent()
-                .ok_or_else(|| ShardStoreError::Storage("shard path has no parent".into()))?;
-            sync_directory(parent)?;
-            Ok(true)
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(shard_storage_error(error)),
-    }
 }
 
 fn sync_directory(path: &Path) -> Result<(), ShardStoreError> {
@@ -534,6 +538,43 @@ mod tests {
                 .ref_count,
             1
         );
+    }
+
+    #[tokio::test]
+    async fn bounded_maintenance_recovers_lifecycle_backed_shard_stage() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(
+            StoreOptions::new(temporary.path(), 1).with_awaiting_publish_ttl_seconds(1),
+        )
+        .await
+        .unwrap();
+        let source = vec![0x6a; SMALL_BLOB_MAX_BYTES + 23];
+        let (codec, reference, shards) = encoded_shards(&source);
+        let identity = ShardIdentity::new(reference, 0);
+        let staging = store.blobs.root().join(".staging");
+        create_directory_all_durable(&staging).await.unwrap();
+        let path = staging.join(format!(
+            "shard-1-{}-1-{}.tmp",
+            hex::encode(store.blobs.upload_boot_nonce()),
+            hex::encode(identity.encode())
+        ));
+        std::fs::write(&path, &shards[0]).unwrap();
+        File::open(&path).unwrap().sync_all().unwrap();
+        validate_shard_file(&codec, &identity, &path).unwrap();
+        let now = now_unix_millis().unwrap();
+        {
+            let _guard = store.commit_lock.lock().await;
+            store
+                .reserve_sealed_artifact(&identity.encode(), now)
+                .unwrap();
+        }
+
+        assert_eq!(store.collect_blob_garbage_at(now).await.unwrap(), 1);
+        assert!(!path.exists());
+        let mut reader = store.get_shard(&codec, &identity).unwrap();
+        let mut actual = Vec::new();
+        reader.read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, shards[0]);
     }
 
     #[tokio::test]

@@ -1,7 +1,7 @@
 use crate::{
-    BatchOperation, BucketPolicy, DefinitionKind, DefinitionMutationIntent, Durability, ObjectKey,
-    ObjectMutationContext, ObjectMutationGovernance, ObjectVersioning, PlacementLogId, PutMode,
-    PutRequest, StoreOptions,
+    BatchOperation, BucketPolicy, DefinitionKind, DefinitionMutationIntent, Durability,
+    INDEX_DEFINITION_PREFIX, ObjectKey, ObjectMutationContext, ObjectMutationGovernance,
+    ObjectVersioning, PlacementLogId, PutMode, PutRequest, StoreOptions,
 };
 
 use super::*;
@@ -237,13 +237,13 @@ async fn definition_locator_survives_replica_replay_handoff_and_read_repair() {
         versioning: ObjectVersioning::Unversioned,
         policy: BucketPolicy::default(),
     };
-    let path = "_anvil/indexes/v3/definitions/search";
+    let path = format!("{INDEX_DEFINITION_PREFIX}search");
     let intent = DefinitionMutationIntent::new(DefinitionKind::Index, 41).unwrap();
     let coordinated = source
         .coordinate_definition_object_mutation_with_governance(
             BatchOperation::Put(PutRequest {
                 mode: PutMode::PutIfAbsent,
-                ..put(path, b"definition", "create-definition")
+                ..put(&path, b"definition", "create-definition")
             }),
             governance,
             context(1),
@@ -253,7 +253,7 @@ async fn definition_locator_survives_replica_replay_handoff_and_read_repair() {
         .unwrap();
     let mutation = coordinated.mutation.as_ref().unwrap();
     let expected = source
-        .export_object_path_record(tenant_id, bucket_id, path)
+        .export_object_path_record(tenant_id, bucket_id, &path)
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -280,7 +280,7 @@ async fn definition_locator_survives_replica_replay_handoff_and_read_repair() {
     );
     assert_eq!(
         replica
-            .definition_locator(DefinitionKind::Index, tenant_id, bucket_id, path)
+            .definition_locator(DefinitionKind::Index, tenant_id, bucket_id, &path)
             .unwrap(),
         expected.definition_locator.clone()
     );
@@ -294,7 +294,7 @@ async fn definition_locator_survives_replica_replay_handoff_and_read_repair() {
         .unwrap();
     assert_eq!(
         handoff
-            .definition_locator(DefinitionKind::Index, tenant_id, bucket_id, path)
+            .definition_locator(DefinitionKind::Index, tenant_id, bucket_id, &path)
             .unwrap(),
         expected.definition_locator.clone()
     );
@@ -303,12 +303,12 @@ async fn definition_locator_survives_replica_replay_handoff_and_read_repair() {
         .await
         .unwrap();
     repaired
-        .repair_object_path_snapshot(tenant_id, bucket_id, path, None, Some(&expected))
+        .repair_object_path_snapshot(tenant_id, bucket_id, &path, None, Some(&expected))
         .await
         .unwrap();
     assert_eq!(
         repaired
-            .definition_locator(DefinitionKind::Index, tenant_id, bucket_id, path)
+            .definition_locator(DefinitionKind::Index, tenant_id, bucket_id, &path)
             .unwrap(),
         expected.definition_locator.clone()
     );

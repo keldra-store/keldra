@@ -1282,7 +1282,7 @@ impl Store {
                     let reference = blob_reference_for_bytes(&bytes);
                     PreparedPayload::Small { reference, bytes }
                 } else {
-                    PreparedPayload::Large(self.blobs.put(&bytes).await.map_err(storage_error)?)
+                    PreparedPayload::Large(self.stage_blob(&bytes).await?)
                 };
                 let fingerprint = put_fingerprint(
                     &identity.head_key(request.key.path()),

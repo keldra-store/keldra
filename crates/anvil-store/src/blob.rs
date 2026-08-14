@@ -49,6 +49,27 @@ pub struct BlobUpload {
     length: u64,
 }
 
+/// A fully hashed and fsync'd blob which still lives under `.staging`.
+///
+/// The store records its awaiting-publication lifecycle state before moving
+/// these bytes to the canonical content-addressed path. There is deliberately
+/// no drop cleanup: once the identity is known, bounded maintenance can either
+/// recover a lifecycle-backed stage or age out an untracked crash orphan.
+pub(crate) struct StagedBlob {
+    reference: BlobRef,
+    path: PathBuf,
+}
+
+impl StagedBlob {
+    pub(crate) fn reference(&self) -> &BlobRef {
+        &self.reference
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
 /// A verified, bounded-memory reader for one immutable published blob.
 ///
 /// [`BlobStore::open_verified`] validates the complete file before returning
@@ -94,7 +115,7 @@ impl BlobStore {
 
     pub async fn begin_upload(&self) -> Result<BlobUpload> {
         let staging = self.root.join(".staging");
-        tokio::fs::create_dir_all(&staging).await?;
+        create_directory_all_durable(&staging).await?;
         let temporary = staging.join(upload_staging_name(
             std::process::id(),
             &self.upload_boot_nonce,
@@ -114,42 +135,6 @@ impl BlobStore {
             hasher: blake3::Hasher::new(),
             length: 0,
         })
-    }
-
-    /// Removes uploads and shards abandoned by an earlier process before this
-    /// store begins accepting work.
-    ///
-    /// [`crate::Store`] calls this while its RocksDB lock gives the process
-    /// exclusive ownership of the data root. Unrecognised or malformed staging
-    /// entries remain subject to their existing age-gated GC.
-    pub(crate) async fn reconcile_abandoned_staging(&self) -> Result<u64> {
-        let staging = self.root.join(".staging");
-        let mut entries = match tokio::fs::read_dir(&staging).await {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-            Err(error) => return Err(error.into()),
-        };
-        let mut removed = 0_u64;
-        while let Some(entry) = entries.next_entry().await? {
-            if !entry.file_type().await?.is_file() {
-                continue;
-            }
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else {
-                continue;
-            };
-            if !is_upload_staging_name(name) && !is_shard_staging_name(name) {
-                continue;
-            }
-            tokio::fs::remove_file(entry.path()).await?;
-            removed = removed
-                .checked_add(1)
-                .context("abandoned staging-file count overflow")?;
-        }
-        if removed != 0 {
-            sync_directory(&staging).await?;
-        }
-        Ok(removed)
     }
 
     pub(crate) fn upload_boot_nonce(&self) -> &[u8] {
@@ -197,6 +182,7 @@ impl BlobStore {
         &self.root
     }
 
+    #[cfg(test)]
     pub(crate) fn remove(&self, reference: &BlobRef) -> Result<()> {
         let path = self.path(&reference.hash);
         match std::fs::remove_file(&path) {
@@ -213,6 +199,50 @@ impl BlobStore {
         let encoded = hex::encode(hash);
         self.root.join(&encoded[..2]).join(encoded)
     }
+
+    /// Publish one identified stage after its lifecycle reservation is durable.
+    pub(crate) async fn publish_staged(&self, staged: StagedBlob) -> Result<BlobRef> {
+        self.publish_identified_staging(&staged.path, &staged.reference)
+            .await?;
+        Ok(staged.reference)
+    }
+
+    /// Recover or finish publication of one lifecycle-backed identified stage.
+    pub(crate) async fn publish_identified_staging(
+        &self,
+        staging_path: &Path,
+        reference: &BlobRef,
+    ) -> Result<()> {
+        let final_path = self.path(&reference.hash);
+        let parent = final_path.parent().context("blob path has no parent")?;
+        let staging_parent = staging_path
+            .parent()
+            .context("blob staging path has no parent")?;
+        let _directory_guard = self.directory_lock.lock().await;
+        create_directory_all_durable(parent).await?;
+        if tokio::fs::try_exists(&final_path).await? {
+            verify_existing_blob(&final_path, reference).await?;
+            match tokio::fs::remove_file(staging_path).await {
+                Ok(()) => sync_directory(staging_parent).await?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            return Ok(());
+        }
+        match tokio::fs::rename(staging_path, &final_path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // A concurrent recovery may already have completed the same
+                // immutable publication.
+                verify_existing_blob(&final_path, reference).await?;
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        }
+        sync_directory(parent).await?;
+        sync_directory(staging_parent).await?;
+        Ok(())
+    }
 }
 
 fn upload_staging_name(
@@ -226,6 +256,51 @@ fn upload_staging_name(
     )
 }
 
+fn identified_blob_staging_name(
+    process_id: u32,
+    boot_nonce: &[u8; UPLOAD_BOOT_NONCE_BYTES],
+    upload_id: u64,
+    reference: &BlobRef,
+) -> String {
+    format!(
+        "blob-{process_id}-{}-{upload_id}-{}.tmp",
+        hex::encode(boot_nonce),
+        hex::encode(blob_identity_bytes(reference)),
+    )
+}
+
+pub(crate) fn blob_reference_from_staging_name(name: &str) -> Option<BlobRef> {
+    const IDENTITY_HEX_BYTES: usize = (32 + size_of::<u64>()) * 2;
+    let body = name.strip_prefix("blob-")?.strip_suffix(".tmp")?;
+    let fields = body.split('-').collect::<Vec<_>>();
+    let [process_id, nonce, upload_id, identity] = fields.as_slice() else {
+        return None;
+    };
+    if process_id.parse::<u32>().is_err()
+        || nonce.len() != UPLOAD_BOOT_NONCE_BYTES * 2
+        || !is_lower_hex(nonce)
+        || upload_id.parse::<u64>().is_err()
+        || identity.len() != IDENTITY_HEX_BYTES
+        || !is_lower_hex(identity)
+    {
+        return None;
+    }
+    let mut encoded = [0_u8; 32 + size_of::<u64>()];
+    hex::decode_to_slice(identity, &mut encoded).ok()?;
+    Some(BlobRef {
+        hash: encoded[..32].try_into().ok()?,
+        length: u64::from_be_bytes(encoded[32..].try_into().ok()?),
+    })
+}
+
+fn blob_identity_bytes(reference: &BlobRef) -> [u8; 32 + size_of::<u64>()] {
+    let mut encoded = [0_u8; 32 + size_of::<u64>()];
+    encoded[..32].copy_from_slice(&reference.hash);
+    encoded[32..].copy_from_slice(&reference.length.to_be_bytes());
+    encoded
+}
+
+#[cfg(test)]
 fn is_upload_staging_name(name: &str) -> bool {
     let Some(body) = name
         .strip_prefix("upload-")
@@ -249,6 +324,7 @@ fn is_upload_staging_name(name: &str) -> bool {
     }
 }
 
+#[cfg(test)]
 fn is_shard_staging_name(name: &str) -> bool {
     const SHARD_IDENTITY_HEX_BYTES: usize = (2 + 32 + 8 + 2) * 2;
     let Some(body) = name
@@ -450,17 +526,37 @@ impl BlobUpload {
     }
 
     pub async fn finish(mut self) -> Result<BlobRef> {
-        self.finish_inner(None).await
+        let staged = self.finish_staged_inner(None).await?;
+        let store = BlobStore {
+            root: self.root.clone(),
+            directory_lock: self.directory_lock.clone(),
+            upload_boot_nonce: [0; UPLOAD_BOOT_NONCE_BYTES],
+        };
+        store.publish_staged(staged).await
     }
 
     /// Finish only if the streamed bytes have the caller's exact immutable
     /// identity. A mismatch removes the ordinary staging file without ever
     /// publishing it under a different hash.
     pub async fn finish_expected(mut self, expected: &BlobRef) -> Result<BlobRef> {
-        self.finish_inner(Some(expected)).await
+        let staged = self.finish_staged_inner(Some(expected)).await?;
+        let store = BlobStore {
+            root: self.root.clone(),
+            directory_lock: self.directory_lock.clone(),
+            upload_boot_nonce: [0; UPLOAD_BOOT_NONCE_BYTES],
+        };
+        store.publish_staged(staged).await
     }
 
-    async fn finish_inner(&mut self, expected: Option<&BlobRef>) -> Result<BlobRef> {
+    pub(crate) async fn finish_staged(mut self) -> Result<StagedBlob> {
+        self.finish_staged_inner(None).await
+    }
+
+    pub(crate) async fn finish_staged_expected(mut self, expected: &BlobRef) -> Result<StagedBlob> {
+        self.finish_staged_inner(Some(expected)).await
+    }
+
+    async fn finish_staged_inner(&mut self, expected: Option<&BlobRef>) -> Result<StagedBlob> {
         let file = self
             .file
             .take()
@@ -472,33 +568,46 @@ impl BlobUpload {
             length: self.length,
         };
         if expected.is_some_and(|expected| expected != &reference) {
+            let _ = tokio::fs::remove_file(&self.temporary).await;
             bail!("blob failed expected length or hash verification");
         }
-        let encoded = hex::encode(reference.hash);
-        let final_path = self.root.join(&encoded[..2]).join(encoded);
-        let parent = final_path.parent().context("blob path has no parent")?;
-        {
-            // A concurrent upload must not observe a newly created prefix and
-            // publish into it before the creator synchronises the blob root.
-            let _directory_guard = self.directory_lock.lock().await;
-            create_directory_all_durable(parent).await?;
-        }
-        if tokio::fs::try_exists(&final_path).await? {
-            verify_existing_blob(&final_path, &reference).await?;
-            tokio::fs::remove_file(&self.temporary).await?;
-        } else {
-            match tokio::fs::rename(&self.temporary, &final_path).await {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    verify_existing_blob(&final_path, &reference).await?;
-                    tokio::fs::remove_file(&self.temporary).await?;
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
-        tokio::fs::File::open(parent).await?.sync_all().await?;
-        Ok(reference)
+        let staging = self
+            .temporary
+            .parent()
+            .context("blob staging path has no parent")?;
+        let identified = staging.join(identified_blob_staging_name(
+            std::process::id(),
+            // The initial filename already contains the per-boot nonce. It is
+            // parsed here rather than retained as another upload field.
+            &staging_nonce_from_upload_name(&self.temporary)?,
+            NEXT_UPLOAD_ID.fetch_add(1, Ordering::Relaxed),
+            &reference,
+        ));
+        tokio::fs::rename(&self.temporary, &identified).await?;
+        sync_directory(staging).await?;
+        Ok(StagedBlob {
+            reference,
+            path: identified,
+        })
     }
+}
+
+fn staging_nonce_from_upload_name(path: &Path) -> Result<[u8; UPLOAD_BOOT_NONCE_BYTES]> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("blob upload staging name is malformed")?;
+    let body = name
+        .strip_prefix("upload-")
+        .and_then(|name| name.strip_suffix(".tmp"))
+        .context("blob upload staging name is malformed")?;
+    let fields = body.split('-').collect::<Vec<_>>();
+    let [_, nonce, _] = fields.as_slice() else {
+        bail!("blob upload staging name is malformed");
+    };
+    let mut bytes = [0_u8; UPLOAD_BOOT_NONCE_BYTES];
+    hex::decode_to_slice(nonce, &mut bytes).context("blob upload staging nonce is malformed")?;
+    Ok(bytes)
 }
 
 impl Drop for BlobUpload {
@@ -538,6 +647,19 @@ mod tests {
         assert!(is_upload_staging_name("upload-1-1.tmp"));
         assert!(!is_upload_staging_name("upload-1-invalid-1.tmp"));
         assert!(!is_upload_staging_name("shard-1-1-deadbeef.tmp"));
+    }
+
+    #[test]
+    fn identified_blob_staging_name_round_trips_exact_identity() {
+        let reference = BlobRef {
+            hash: [0x7b; 32],
+            length: 98_765,
+        };
+        let name =
+            identified_blob_staging_name(7, &[0x31; UPLOAD_BOOT_NONCE_BYTES], 11, &reference);
+
+        assert_eq!(blob_reference_from_staging_name(&name), Some(reference));
+        assert!(blob_reference_from_staging_name("blob-invalid.tmp").is_none());
     }
 
     #[test]
@@ -628,7 +750,7 @@ mod tests {
             std::fs::read_dir(store.root().join(".staging"))
                 .unwrap()
                 .count(),
-            0
+            1
         );
     }
 

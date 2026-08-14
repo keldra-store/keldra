@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anvil_atomic_program::MAX_OBJECT_PATH_BYTES;
 use rocksdb::{Direction, IteratorMode, WriteBatch, WriteOptions};
@@ -7,22 +8,25 @@ use super::{CF_DEFINITION_STATE, Store};
 use crate::definition_state::{
     DefinitionAssignment, DefinitionAssignmentCursor, DefinitionAssignmentMutation,
     DefinitionAssignmentPage, DefinitionCheckpoint, DefinitionConsumerKind, DefinitionKind,
-    DefinitionLocator, DefinitionLocatorCursor, DefinitionLocatorPage, DefinitionStateError,
-    DefinitionTransition, MAX_DEFINITION_STATE_SCAN_RECORDS, validate_fence,
+    DefinitionLocator, DefinitionLocatorCursor, DefinitionLocatorPage, DefinitionOperation,
+    DefinitionStateError, DefinitionTransition, MAX_DEFINITION_STATE_SCAN_RECORDS, validate_fence,
 };
 use crate::key::STORAGE_KEY_FORMAT_VERSION;
-use crate::{PlacementLogId, SourceId, VersionId};
+use crate::{
+    DeletedDefinitionCleanup, IndexRetentionDueError, PlacementLogId, SourceId, VersionId,
+};
 
 const LOCATOR_DOMAIN: u8 = b'L';
 const ASSIGNMENT_DOMAIN: u8 = b'A';
 const CHECKPOINT_DOMAIN: u8 = b'C';
 const RECONCILIATION_DOMAIN: u8 = b'R';
 const VALUE_FORMAT: u8 = 1;
+const LOCATOR_VALUE_FORMAT: u8 = 2;
 const LOCATOR_KEY_FIXED_BYTES: usize = 1 + 1 + 1 + 8 + 8;
 const ASSIGNMENT_KEY_BYTES: usize = 1 + 1 + 1 + 8 + 8 + 8;
 const CHECKPOINT_KEY_BYTES: usize = 1 + 1 + 1 + 2;
 const RECONCILIATION_KEY_BYTES: usize = 1 + 1;
-const LOCATOR_VALUE_BYTES: usize = 1 + 8 + 8;
+const LOCATOR_VALUE_BYTES: usize = 1 + 1 + 8 + 8;
 const CHECKPOINT_VALUE_BYTES: usize = 1 + 32 + 8 + 8 + 8;
 const RECONCILIATION_VALUE_BYTES: usize = 1 + 8 + 8;
 const MAX_DEFINITION_STATE_CURSOR_BYTES: usize = LOCATOR_KEY_FIXED_BYTES + MAX_OBJECT_PATH_BYTES;
@@ -459,6 +463,22 @@ impl Store {
             if state.is_newer_than(mutation) {
                 continue;
             }
+            if let DefinitionAssignmentMutation::Delete(deletion) = mutation
+                && deletion.kind == DefinitionKind::Index
+            {
+                self.stage_deleted_definition_cleanup(
+                    batch,
+                    &DeletedDefinitionCleanup {
+                        tenant_id: deletion.tenant_id,
+                        bucket_id: deletion.bucket_id,
+                        index_id: deletion.definition_id,
+                        definition_path: deletion.definition_path.clone(),
+                        definition_object_version: deletion.object_version,
+                        due_at_unix_millis: now_unix_millis()?,
+                    },
+                )
+                .map_err(retention_due_state)?;
+            }
             match mutation {
                 DefinitionAssignmentMutation::Upsert(assignment)
                     if state.assignment.as_ref() != Some(assignment) =>
@@ -468,6 +488,12 @@ impl Store {
                         &key,
                         encode_assignment(assignment)?,
                     );
+                    changed.push(mutation.clone());
+                }
+                DefinitionAssignmentMutation::Delete(_) => {
+                    if state.assignment.is_some() {
+                        batch.delete_cf(self.definition_state_cf()?, &key);
+                    }
                     changed.push(mutation.clone());
                 }
                 DefinitionAssignmentMutation::Remove { .. } if state.assignment.is_some() => {
@@ -498,12 +524,11 @@ impl Store {
             transition.bucket_id,
             &transition.path,
         )?;
-        match transition.locator() {
-            Some(locator) => {
-                batch.put_cf(self.definition_state_cf()?, key, encode_locator(&locator))
-            }
-            None => batch.delete_cf(self.definition_state_cf()?, key),
-        }
+        batch.put_cf(
+            self.definition_state_cf()?,
+            key,
+            encode_locator(&transition.locator()),
+        );
         Ok(())
     }
 
@@ -522,10 +547,7 @@ impl Store {
                 &transition.path,
             )
             .map_err(|error| crate::MutationError::Storage(error.to_string()))?;
-        Ok(match transition.locator() {
-            Some(expected) => stored.as_ref() == Some(&expected),
-            None => stored.is_none(),
-        })
+        Ok(stored.as_ref() == Some(&transition.locator()))
     }
 
     fn definition_state_cf(&self) -> Result<&rocksdb::ColumnFamily, DefinitionStateError> {
@@ -565,7 +587,8 @@ impl PendingAssignment {
         self.observed_fence = Some(mutation.observed_fence());
         self.assignment = match mutation {
             DefinitionAssignmentMutation::Upsert(assignment) => Some(assignment.clone()),
-            DefinitionAssignmentMutation::Remove { .. } => None,
+            DefinitionAssignmentMutation::Delete(_)
+            | DefinitionAssignmentMutation::Remove { .. } => None,
         };
     }
 }
@@ -655,9 +678,10 @@ fn locator_bucket_prefix(kind: DefinitionKind, tenant_id: u64, bucket_id: u64) -
 
 pub(crate) fn encode_locator(locator: &DefinitionLocator) -> [u8; LOCATOR_VALUE_BYTES] {
     let mut value = [0; LOCATOR_VALUE_BYTES];
-    value[0] = VALUE_FORMAT;
-    value[1..9].copy_from_slice(&locator.definition_id.to_be_bytes());
-    value[9..17].copy_from_slice(&locator.object_version.0.to_be_bytes());
+    value[0] = LOCATOR_VALUE_FORMAT;
+    value[1] = locator.operation as u8;
+    value[2..10].copy_from_slice(&locator.definition_id.to_be_bytes());
+    value[10..18].copy_from_slice(&locator.object_version.0.to_be_bytes());
     value
 }
 
@@ -668,7 +692,7 @@ pub(crate) fn decode_locator(
     let value: &[u8; LOCATOR_VALUE_BYTES] = value.try_into().map_err(|_| {
         DefinitionStateError::Malformed("definition locator value is malformed".into())
     })?;
-    if value[0] != VALUE_FORMAT {
+    if value[0] != LOCATOR_VALUE_FORMAT {
         return Err(DefinitionStateError::Malformed(
             "definition locator value format is unsupported".into(),
         ));
@@ -678,9 +702,10 @@ pub(crate) fn decode_locator(
         kind,
         tenant_id,
         bucket_id,
-        definition_id: read_u64(&value[1..9])?,
+        definition_id: read_u64(&value[2..10])?,
         path,
-        object_version: VersionId(read_u64(&value[9..17])?),
+        object_version: VersionId(read_u64(&value[10..18])?),
+        operation: DefinitionOperation::from_byte(value[1])?,
     };
     locator.validate()?;
     Ok(locator)
@@ -941,6 +966,22 @@ fn fence_key(fence: PlacementLogId) -> (u64, u64) {
 
 fn state_storage(error: impl std::fmt::Display) -> DefinitionStateError {
     DefinitionStateError::Storage(error.to_string())
+}
+
+fn retention_due_state(error: IndexRetentionDueError) -> DefinitionStateError {
+    match error {
+        IndexRetentionDueError::Malformed(message) => DefinitionStateError::Malformed(message),
+        IndexRetentionDueError::Storage(message) => DefinitionStateError::Storage(message),
+    }
+}
+
+fn now_unix_millis() -> Result<u64, DefinitionStateError> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(state_storage)?
+        .as_millis();
+    u64::try_from(millis)
+        .map_err(|_| DefinitionStateError::Storage("system time exceeds u64 millis".into()))
 }
 
 #[cfg(test)]

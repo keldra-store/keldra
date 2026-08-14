@@ -29,9 +29,10 @@ use crate::watch::{
 use crate::{
     AWAITING_PUBLISH, AccountingHeadTransition, BatchOperation, BatchOutcome, BlobReader, BlobRef,
     BlobReferenceState, BlobStore, BucketPolicy, DefinitionTransition, DeleteRequest,
-    DeleteRetainedVersionOutcome, Durability, Head, MutationError, MutationReceipt, Object,
-    ObjectKey, ObjectVersioning, Precondition, PublishRequest, PutMode, PutRequest, ReferenceDelta,
-    SMALL_BLOB_MAX_BYTES, StorageTenantId, Version, VersionClock, VersionId,
+    DeleteRetainedVersionOutcome, Durability, Head, INDEX_DEFINITION_PREFIX, MutationError,
+    MutationReceipt, Object, ObjectKey, ObjectVersioning, Precondition, PublishRequest, PutMode,
+    PutRequest, ReferenceDelta, SMALL_BLOB_MAX_BYTES, StorageTenantId, Version, VersionClock,
+    VersionId,
 };
 
 const PROGRAM_DEFINITION_PREFIX: &str = "_anvil/programs/";
@@ -111,6 +112,7 @@ const METADATA_COLUMN_FAMILY_WRITE_BUFFER_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const CF_HEADS: &str = "heads";
 pub(crate) const CF_VERSIONS: &str = "versions";
 pub(crate) const CF_BLOB_REFERENCES: &str = "blob_references";
+pub(crate) const CF_BLOB_GC_DUE: &str = "blob_gc_due";
 pub(crate) const CF_SMALL_BLOBS: &str = "small_blobs";
 pub(crate) const CF_BUCKET_OPTIONS: &str = "bucket_options";
 pub(crate) const CF_NAMES: &str = "names";
@@ -142,6 +144,7 @@ pub(crate) const COLUMN_FAMILIES: &[&str] = &[
     CF_HEADS,
     CF_VERSIONS,
     CF_BLOB_REFERENCES,
+    CF_BLOB_GC_DUE,
     CF_SMALL_BLOBS,
     CF_BUCKET_OPTIONS,
     CF_NAMES,
@@ -594,6 +597,15 @@ struct StoredReceipt {
 pub(crate) type PendingBlobReferences = BTreeMap<Vec<u8>, BlobReferenceState>;
 
 impl Store {
+    /// Allocate one node-scoped Snowflake identity for an ordinary derived
+    /// object such as a format-v4 index segment. A durable publication made
+    /// afterward advances the same persisted high-water mark, so an identity
+    /// lost before publication is harmless and a published identity cannot be
+    /// reused after restart.
+    pub fn allocate_snowflake_id(&self) -> Result<u64> {
+        Ok(self.clock.next()?.0)
+    }
+
     /// Configured local directory for anonymous, non-authoritative payload
     /// work files. Callers must not create durable records in this directory.
     pub fn payload_spool_directory(&self) -> &std::path::Path {
@@ -832,13 +844,6 @@ impl Store {
         initialize_mutation_receipt_metadata(&db, metadata_cf, options.sync_writes)?;
         let db = Arc::new(db);
         let blobs = BlobStore::open(options.root.join("blobs")).await?;
-        let abandoned_staging_files = blobs.reconcile_abandoned_staging().await?;
-        if abandoned_staging_files != 0 {
-            tracing::info!(
-                abandoned_staging_files,
-                "removed abandoned blob and shard staging files during startup"
-            );
-        }
         let store = Self {
             db,
             _metadata_memory: metadata_memory,
@@ -1252,6 +1257,7 @@ pub(crate) mod definition_state;
 mod delete_version;
 mod derived_consumers;
 mod distributed_publish_batch;
+mod index_retention_due;
 mod journal_capacity;
 mod journal_routes;
 mod mutations;
@@ -1554,34 +1560,6 @@ fn blob_reference_from_key(encoded: &[u8]) -> Result<BlobRef, MutationError> {
             .try_into()
             .expect("blob reference length was checked"),
     );
-    Ok(BlobRef { hash, length })
-}
-
-fn blob_reference_from_file(
-    file: &std::fs::DirEntry,
-    shard: &str,
-) -> Result<BlobRef, MutationError> {
-    let name = file.file_name();
-    let name = name
-        .to_str()
-        .ok_or_else(|| MutationError::Storage("blob file name is not valid UTF-8".into()))?;
-    if name.len() != 64
-        || !name.bytes().all(|byte| byte.is_ascii_hexdigit())
-        || !name.starts_with(shard)
-    {
-        return Err(MutationError::Storage(
-            "blob file name does not match its content-address shard".into(),
-        ));
-    }
-    let mut hash = [0_u8; 32];
-    hex::decode_to_slice(name, &mut hash)
-        .map_err(|_| MutationError::Storage("blob file name is malformed".into()))?;
-    if hex::encode(hash) != name {
-        return Err(MutationError::Storage(
-            "blob file name is not canonical".into(),
-        ));
-    }
-    let length = file.metadata().map_err(storage_error)?.len();
     Ok(BlobRef { hash, length })
 }
 

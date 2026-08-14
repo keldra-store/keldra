@@ -35,6 +35,18 @@ pub enum DefinitionOperation {
     Delete = 2,
 }
 
+impl DefinitionOperation {
+    pub(crate) fn from_byte(value: u8) -> Result<Self, DefinitionStateError> {
+        match value {
+            1 => Ok(Self::Upsert),
+            2 => Ok(Self::Delete),
+            _ => Err(DefinitionStateError::Malformed(
+                "definition operation is unknown".into(),
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DefinitionMutationIntent {
     pub kind: DefinitionKind,
@@ -88,15 +100,16 @@ impl DefinitionTransition {
         Ok(())
     }
 
-    pub fn locator(&self) -> Option<DefinitionLocator> {
-        (self.operation == DefinitionOperation::Upsert).then(|| DefinitionLocator {
+    pub fn locator(&self) -> DefinitionLocator {
+        DefinitionLocator {
             kind: self.kind,
             tenant_id: self.tenant_id,
             bucket_id: self.bucket_id,
             definition_id: self.definition_id,
             path: self.path.clone(),
             object_version: self.object_version,
-        })
+            operation: self.operation,
+        }
     }
 }
 
@@ -108,6 +121,7 @@ pub struct DefinitionLocator {
     pub definition_id: u64,
     pub path: String,
     pub object_version: VersionId,
+    pub operation: DefinitionOperation,
 }
 
 impl DefinitionLocator {
@@ -117,6 +131,37 @@ impl DefinitionLocator {
         if self.object_version.0 == 0 {
             return Err(DefinitionStateError::Malformed(
                 "definition object version must be non-zero".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DefinitionDeletion {
+    pub kind: DefinitionKind,
+    pub tenant_id: u64,
+    pub bucket_id: u64,
+    pub definition_id: u64,
+    pub definition_path: String,
+    pub object_version: VersionId,
+    pub observed_fence: PlacementLogId,
+    pub rank: u8,
+}
+
+impl DefinitionDeletion {
+    pub fn validate(&self) -> Result<(), DefinitionStateError> {
+        validate_identity(self.tenant_id, self.bucket_id, self.definition_id)?;
+        validate_path(&self.definition_path)?;
+        if self.object_version.0 == 0 {
+            return Err(DefinitionStateError::Malformed(
+                "definition deletion version must be non-zero".into(),
+            ));
+        }
+        validate_fence(self.observed_fence)?;
+        if self.rank > 2 {
+            return Err(DefinitionStateError::Malformed(
+                "definition deletion rank must be 0, 1, or 2".into(),
             ));
         }
         Ok(())
@@ -178,6 +223,7 @@ impl DefinitionAssignment {
 #[serde(tag = "operation", content = "record", rename_all = "snake_case")]
 pub enum DefinitionAssignmentMutation {
     Upsert(DefinitionAssignment),
+    Delete(DefinitionDeletion),
     Remove {
         kind: DefinitionKind,
         tenant_id: u64,
@@ -192,6 +238,7 @@ impl DefinitionAssignmentMutation {
     pub fn kind(&self) -> DefinitionKind {
         match self {
             Self::Upsert(assignment) => assignment.kind,
+            Self::Delete(deletion) => deletion.kind,
             Self::Remove { kind, .. } => *kind,
         }
     }
@@ -199,6 +246,7 @@ impl DefinitionAssignmentMutation {
     pub fn object_version(&self) -> VersionId {
         match self {
             Self::Upsert(assignment) => assignment.object_version,
+            Self::Delete(deletion) => deletion.object_version,
             Self::Remove { object_version, .. } => *object_version,
         }
     }
@@ -206,6 +254,7 @@ impl DefinitionAssignmentMutation {
     pub fn observed_fence(&self) -> PlacementLogId {
         match self {
             Self::Upsert(assignment) => assignment.observed_fence,
+            Self::Delete(deletion) => deletion.observed_fence,
             Self::Remove { observed_fence, .. } => *observed_fence,
         }
     }
@@ -217,6 +266,12 @@ impl DefinitionAssignmentMutation {
                 assignment.tenant_id,
                 assignment.bucket_id,
                 assignment.definition_id,
+            ),
+            Self::Delete(deletion) => (
+                deletion.kind,
+                deletion.tenant_id,
+                deletion.bucket_id,
+                deletion.definition_id,
             ),
             Self::Remove {
                 kind,
@@ -231,6 +286,7 @@ impl DefinitionAssignmentMutation {
     pub fn validate(&self) -> Result<(), DefinitionStateError> {
         match self {
             Self::Upsert(assignment) => assignment.validate(),
+            Self::Delete(deletion) => deletion.validate(),
             Self::Remove {
                 tenant_id,
                 bucket_id,

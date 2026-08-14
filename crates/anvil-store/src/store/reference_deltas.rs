@@ -85,13 +85,10 @@ impl Store {
 
         let mut batch = WriteBatch::default();
         let mut lifecycle_changes = Vec::with_capacity(states.len());
+        let mut staged_states = PendingBlobReferences::new();
         for (key, state) in states {
-            batch.put_cf(
-                self.cf(CF_BLOB_REFERENCES)
-                    .map_err(ReferenceDeltaError::from)?,
-                &key,
-                encode_blob_reference_state(state),
-            );
+            self.stage_blob_reference_update(&mut batch, &mut staged_states, key.clone(), state)
+                .map_err(ReferenceDeltaError::from)?;
             lifecycle_changes.push(PendingLocalChange::ContentLifecycleChanged {
                 blob_identity: key,
                 revision: state.updated_at,

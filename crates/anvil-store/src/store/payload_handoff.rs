@@ -239,14 +239,10 @@ impl Store {
             }
             None => artifact.lifecycle,
         };
-        self.db
-            .put_cf_opt(
-                self.cf(CF_BLOB_REFERENCES)?,
-                key,
-                encode_blob_reference_state(lifecycle),
-                &options,
-            )
-            .map_err(storage_error)
+        let mut batch = rocksdb::WriteBatch::default();
+        let mut pending = PendingBlobReferences::new();
+        self.stage_blob_reference_update(&mut batch, &mut pending, key, lifecycle)?;
+        self.db.write_opt(batch, &options).map_err(storage_error)
     }
 
     /// Retire one physical artifact which the caller has proved is no longer
@@ -323,11 +319,8 @@ impl Store {
             updated_at: current.updated_at.max(now_unix_millis),
         };
         let mut batch = rocksdb::WriteBatch::default();
-        batch.put_cf(
-            self.cf(CF_BLOB_REFERENCES)?,
-            &key,
-            encode_blob_reference_state(retired),
-        );
+        let mut pending = PendingBlobReferences::new();
+        self.stage_blob_reference_update(&mut batch, &mut pending, key.clone(), retired)?;
         self.stage_local_changes(
             &mut batch,
             &[PendingLocalChange::ContentLifecycleChanged {
@@ -683,6 +676,13 @@ mod tests {
         let retired = store.blob_reference_state(&reference).unwrap().unwrap();
         assert_eq!((retired.ref_count, retired.flags), (0, 0));
         assert_eq!(retired.updated_at, initial.updated_at + 20);
+        let due_identity = blob_reference_key(&reference);
+        assert!(
+            store
+                .db
+                .iterator_cf(store.cf(CF_BLOB_GC_DUE).unwrap(), IteratorMode::Start)
+                .any(|entry| entry.unwrap().0.ends_with(&due_identity))
+        );
 
         assert!(
             !store

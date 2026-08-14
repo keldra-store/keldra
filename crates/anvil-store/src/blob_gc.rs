@@ -2,8 +2,6 @@ use std::fs::ReadDir;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::{BlobRef, ShardIdentity};
-
 /// Hard work limits for one ordinary blob garbage-collection tick.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlobGcBudget {
@@ -22,11 +20,11 @@ impl BlobGcBudget {
     }
 }
 
-/// Caller-owned progress for the incremental local blob collector.
+/// Caller-owned progress for incremental local lifecycle maintenance.
 ///
-/// This cursor is deliberately process-local. Losing it restarts a lazy scan
-/// after the node is already serving; it never makes startup inventory the
-/// filesystem or adds another durable source of truth.
+/// The authoritative due order is durable. This cursor is deliberately
+/// process-local: losing it merely restarts a prefix seek and bounded scans of
+/// `.staging` and `.gc`; canonical content directories are never inventoried.
 #[derive(Default)]
 pub struct BlobGcCursor {
     pub(crate) phase: BlobGcPhase,
@@ -44,52 +42,43 @@ impl std::fmt::Debug for BlobGcCursor {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum BlobGcPhaseName {
     #[default]
-    References,
+    Due,
     Filesystem,
 }
 
 #[derive(Default)]
 pub(crate) enum BlobGcPhase {
     #[default]
-    References,
-    ReferencesAfter(Vec<u8>),
+    Due,
+    DueAfter(Vec<u8>),
     Filesystem(FilesystemGcCursor),
 }
 
 impl BlobGcPhase {
     fn name(&self) -> BlobGcPhaseName {
         match self {
-            Self::References | Self::ReferencesAfter(_) => BlobGcPhaseName::References,
+            Self::Due | Self::DueAfter(_) => BlobGcPhaseName::Due,
             Self::Filesystem(_) => BlobGcPhaseName::Filesystem,
         }
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum FilesystemGcDirectory {
+    #[default]
+    Staging,
+    Quarantine,
+    Complete,
+}
+
 #[derive(Default)]
 pub(crate) struct FilesystemGcCursor {
-    pub(crate) root: Option<ReadDir>,
-    pub(crate) child: Option<FilesystemGcChild>,
+    pub(crate) directory: FilesystemGcDirectory,
+    pub(crate) entries: Option<ReadDir>,
     pub(crate) replay: Option<FilesystemGcRecord>,
 }
 
-pub(crate) struct FilesystemGcChild {
-    pub(crate) kind: FilesystemGcChildKind,
-    pub(crate) entries: ReadDir,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum FilesystemGcChildKind {
-    Staging,
-    Quarantine,
-    HashPrefix(String),
-}
-
 pub(crate) enum FilesystemGcRecord {
-    Directory {
-        path: PathBuf,
-        kind: FilesystemGcChildKind,
-        encoded_bytes: u64,
-    },
     Staged {
         path: PathBuf,
         modified_at: u64,
@@ -97,18 +86,6 @@ pub(crate) enum FilesystemGcRecord {
     },
     Quarantined {
         path: PathBuf,
-        encoded_bytes: u64,
-    },
-    Blob {
-        path: PathBuf,
-        reference: BlobRef,
-        modified_at: u64,
-        encoded_bytes: u64,
-    },
-    Shard {
-        path: PathBuf,
-        identity: ShardIdentity,
-        modified_at: u64,
         encoded_bytes: u64,
     },
 }

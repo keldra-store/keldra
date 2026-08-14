@@ -560,32 +560,68 @@ async fn local_cluster_listing_uses_stable_ids_and_excludes_non_owned_heads() {
 }
 
 #[tokio::test]
-async fn internal_index_definition_listing_accepts_only_format_three_paths() {
+async fn internal_index_definition_listing_is_format_four_and_bucket_scoped() {
     let (_temporary, store) = store().await;
-    let identity = store.resolve_bucket_identity("tenant", "bucket").unwrap();
-
-    let format_three = "_anvil/indexes/v3/definitions/search";
+    let definition = format!("{INDEX_DEFINITION_PREFIX}search");
     store
         .put(put(
-            format_three,
+            &definition,
             b"definition",
             Precondition::Absent,
-            "format-three",
+            "format-four",
         ))
         .await
         .unwrap();
+    store
+        .put(put(
+            "ordinary/object",
+            b"not a definition",
+            Precondition::Absent,
+            "ordinary-object",
+        ))
+        .await
+        .unwrap();
+    store
+        .put(PutRequest {
+            key: ObjectKey::new(
+                "tenant",
+                "another-bucket",
+                format!("{INDEX_DEFINITION_PREFIX}other"),
+            )
+            .unwrap(),
+            bytes: b"other definition".to_vec(),
+            content_type: Some("application/json".into()),
+            mode: PutMode::PutIfAbsent,
+            command_id: Some("other-bucket-definition".into()),
+            durability: Durability::Local,
+        })
+        .await
+        .unwrap();
+
+    let identity = store.resolve_bucket_identity("tenant", "bucket").unwrap();
+    let mut considered = Vec::new();
 
     let page = store
         .list_local_owned_index_definitions(
             identity.tenant_id.0,
             identity.bucket_id.0,
-            "_anvil/indexes/v3/definitions/",
+            INDEX_DEFINITION_PREFIX,
             None,
             10,
-            |_, _, _| true,
+            |tenant_id, bucket_id, path| {
+                considered.push((tenant_id, bucket_id, path.to_owned()));
+                true
+            },
         )
         .unwrap();
-    assert_eq!(page.paths, vec![format_three.to_owned()]);
+    assert_eq!(page.paths, vec![definition.clone()]);
+    // The ownership callback is invoked for every head considered by the
+    // bounded iterator. Neither the ordinary head in this bucket nor the
+    // definition in another bucket entered the scan range.
+    assert_eq!(
+        considered,
+        vec![(identity.tenant_id.0, identity.bucket_id.0, definition)]
+    );
 
     assert!(matches!(
         store.list_local_owned_index_definitions(
@@ -602,7 +638,7 @@ async fn internal_index_definition_listing_accepts_only_format_three_paths() {
         store.list_local_owned_index_definitions(
             identity.tenant_id.0,
             identity.bucket_id.0,
-            "_anvil/indexes/v3/definitions/",
+            INDEX_DEFINITION_PREFIX,
             Some("_anvil/indexes/v2/definitions/search"),
             10,
             |_, _, _| true,
