@@ -1,4 +1,4 @@
-# ANVIL-0014: Anvil-Native Segment Indexes
+# ANVIL-0014: Anvil-Native Segment Indices
 
 Status: Accepted
 
@@ -8,7 +8,7 @@ Audience: Anvil implementors, operators, client authors, and reviewers
 
 ## 1. Decision
 
-Anvil will replace format-v3 indexes with an Anvil-owned format-v4 segment
+Anvil will replace format-v3 indices with an Anvil-owned format-v4 segment
 engine. The engine adopts the proven execution contracts used by Lucene:
 
 - immutable segment cores with mutable behavior presented through new segments
@@ -16,10 +16,10 @@ engine. The engine adopts the proven execution contracts used by Lucene:
 - dense segment-local document identifiers;
 - seekable term dictionaries and blocked, advanceable postings;
 - cost-led Boolean iterator algebra instead of one-driver candidate scanning;
-- typed, independently readable column values for filtering, ordering, and
-  scoring;
-- stored fields fetched only after filtering, liveness, pagination, and
-  authorization have reduced the candidate set;
+- field types and explicitly declared query capabilities which compile only
+  the postings, points, doc values, positions, norms, or vectors they need;
+- typed, independently readable doc values for ordering, faceting,
+  aggregation, and scoring;
 - optional definition-time physical ordering for workloads which repeatedly
   request the same leading order;
 - true generation-bound search-after pagination; and
@@ -33,21 +33,16 @@ publication, authorization, and resource-control boundaries.
 
 Format v4 is a clean break. It has no format-v3 reader, converter, backfill,
 dual writer, query fallback, compatibility shim, or mixed-generation path. A
-format-v4 deployment builds indexes from authoritative ordinary objects and
+format-v4 deployment builds indices from authoritative ordinary objects and
 their retained source journals.
 
-Apache Arrow is not adopted as an authoritative Anvil storage format and no
-Arrow dependency is added by this RFC. Format-v4 postings, live masks, terms,
-columns, stored fields, vectors, manifests, and pack envelopes use explicit
-Anvil codecs. Existing RocksDB records, source journals, Raft state, opaque
-payloads, erasure shards, atomic-program artifacts, accounting objects, and
-gateway payloads also do not move to Arrow.
-
-The engine does define a generation-pinned, column-oriented scan contract so a
-future DataFusion gateway can push projection, predicates, ordering, and limits
-into Anvil and convert bounded result batches to Arrow `RecordBatch` values.
-Arrow belongs at that execution and interchange boundary, not beneath the
-index or object store.
+Format-v4 postings, points, live masks, terms, doc values, vectors, manifests,
+and pack envelopes use explicit Anvil codecs matched to their native access
+patterns. An index never stores a second copy of an ordinary source field merely
+to return it in a hit; a client retrieves the authoritative object through
+`GetObject` or `BatchGet`. The engine defines a generation-pinned scan contract
+so a future SQL gateway can push predicates, ordering, aggregation, and limits
+into the same authorized native planner rather than bypassing it.
 
 The release containing format v4 should be `0.9.0`, because the durable index
 format and execution engine are intentionally incompatible with `0.8.x`.
@@ -89,7 +84,9 @@ The cause is architectural:
 4. current-version liveness can require repeated cross-run probes;
 5. ordering and continuation filtering occur after expensive candidate work;
    and
-6. stored projected values are read too early.
+6. every selected Typed JSON field is unnecessarily emitted as a term, a
+   generic column, and a stored JSON value whether or not those capabilities
+   were requested.
 
 Compaction cannot repair an execution model which reads most of the index for
 a sparse result. More heuristics around the existing driver merely move the
@@ -105,8 +102,8 @@ Format v4 must:
 - make current-version liveness a local segment operation, not a distributed
   lookup per candidate;
 - make continuation tokens seek before candidate decoding;
-- make result ordering use fast columns or a declared physical order without
-  loading stored fields;
+- make result ordering use typed doc values or a declared physical order
+  without loading ordinary payloads;
 - bound query, build, merge, cache, and authorization memory;
 - retain complete source-journal, atomic-program, publication, durability,
   Zanzibar, and backpressure guarantees;
@@ -116,15 +113,14 @@ Format v4 must:
 - make every persistent codec portable across AMD64 and ARM64 and independent
   of Rust memory layout;
 - expose enough statistics and scan semantics for a future cost-based Anvil
-  planner and DataFusion gateway; and
+  planner and SQL gateway; and
 - prove logical read work, not merely wall-clock latency, in qualification.
 
 ## 4. Non-goals
 
 This RFC does not add:
 
-- a SQL public API or DataFusion runtime dependency;
-- Arrow IPC, Arrow Flight, or Arrow files;
+- a SQL public API or SQL runtime dependency;
 - a distributed scatter/gather query engine;
 - a second index byte plane, registry, journal, job database, or authority;
 - index data or definitions in Raft;
@@ -151,6 +147,15 @@ object identity and never appears in a public response or continuation token.
 **Stable object identity** is the exact `(path, object_version)` inside one
 stable numeric tenant and bucket scope.
 
+**Stable document identity** is the total internal identity
+`(result_path, result_version, source_path, source_version, source_record)`.
+Ordinary one-document objects normally have the same source and result
+identity with source record zero. Git Source and Tensor manifests may project
+several documents which intentionally share one result object; their source
+identity and deterministic `u32` record ordinal make those documents distinct.
+This identity survives compaction and is used only for total ordering and
+pagination. It is not a DocId and does not widen the public result identity.
+
 **Live-document view** is the generation-selected bitmap which says which
 DocIds in one segment still represent current visible object heads.
 
@@ -160,19 +165,27 @@ supports exact seek, prefix range seek, and ordered enumeration.
 **Posting iterator** enumerates matching DocIds in ascending order and supports
 `next`, `advance(target)`, and a conservative remaining-work estimate.
 
-**Fast column** is a typed, block-addressable value column keyed by segment
-DocId. It is the Anvil equivalent of Lucene DocValues and is used for ordering,
-range verification, scoring, and projected result values.
+**Point value** is a typed, order-preserving value in a seekable point tree used
+to find exact or ranged numeric candidates. It is not a returned source value.
 
-**Stored field** is a projected value retained for final result materialization
-but not required to enumerate a predicate posting.
+**Doc value** is a typed, block-addressable column keyed by segment DocId. It is
+used only for capabilities such as ordering, faceting, grouping, aggregation,
+and scoring. It is not a stored copy of the source document.
+
+**Field type** defines how one selected source value is validated, encoded,
+compared, and, for text, analyzed.
+
+**Field capability** is an operation promised by one field definition. The
+initial capabilities are exact matching, prefix matching, range matching,
+ordering, faceting, aggregation, and full-text search. A capability exists only
+when named by the definition and backed by its required component.
 
 **Physical order** is the optional definition-time document order applied
 inside every segment. It is not a promise that segments form one globally
 contiguous file; a query merges their ordered iterators.
 
 **Scan batch** is a bounded internal batch of selected logical columns and
-stable object identities. It is an Anvil type, not an Arrow type.
+stable object identities. It is an Anvil-owned type.
 
 ## 6. Required invariants
 
@@ -189,8 +202,8 @@ stable object identities. It is an Anvil type, not an Arrow type.
    live-mask block becomes visible independently.
 6. Every durable index artifact is an ordinary Anvil object and reaches the
    required artifact durability before publication.
-7. Raft contains no definition, source event, segment, posting, column, live
-   mask, manifest, cursor, query state, or cache entry.
+7. Raft contains no definition, source event, segment, posting, point, doc
+   value, live mask, manifest, cursor, query state, or cache entry.
 8. Weighted HRW chooses up to three query owners. Rank zero builds and
    publishes; any public node may proxy a query to an owner. Query execution
    never scatters across owners.
@@ -206,13 +219,12 @@ stable object identities. It is an Anvil type, not an Arrow type.
     exact-current validation. A physically ordered scan validates only
     selected/refill hits; arbitrary top-K may have to validate every exact
     Boolean match before heap admission, but never as serialized point reads.
-13. A matching physical-order continuation seeks before predicate and stored
-    value work. An arbitrary-order top-K continuation applies its bound while
-    collecting and never materializes rejected earlier-page fields, although it
-    may necessarily rescan exact Boolean matches.
-14. Stored fields and ordinary payload bytes are not read before predicate,
-    liveness, cursor, and the order plan's authorization/exact-current
-    processing have selected likely results.
+13. A matching physical-order continuation seeks before predicate and doc-value
+    work. An arbitrary-order top-K continuation applies its bound while
+    collecting, although it may necessarily rescan exact Boolean matches.
+14. An index query never reads ordinary payload bytes to reconstruct source
+    fields for a result. Hits identify the authoritative object and clients use
+    the ordinary object API when they require its payload.
 15. Authentication failure never degrades to anonymous access. Public reads
     still require the explicit Zanzibar public-read grant.
 16. CPU-heavy build, merge, decoding, scoring, and collection do not run on or
@@ -241,10 +253,13 @@ updates the existing definition locator in the same RocksDB batch as the head,
 version, source event, and sparse routes. Metadata replicas apply their typed
 object mutation without appending a second source event or route.
 
-The locator contains only stable numeric scope, definition identity, path, and
-object version. It is discovery evidence, not a definition payload, permission,
-registry, or second source of truth. A node exact-reads and validates the
-ordinary definition before acting on it.
+The locator contains only stable numeric scope, definition identity, path,
+object version, and whether that exact version is live or deleted. Deletion
+replaces the one locator value with a tombstone; recreation replaces that same
+key rather than appending history. The locator is discovery evidence, not a
+definition payload, permission, registry, or second source of truth. A node
+exact-reads and validates the matching ordinary live or deleted head before
+acting on it.
 
 Normal startup restores this node's bounded assignment projection and resumes
 its sparse source cursors. A true assignment gap scans definition locators, not
@@ -413,30 +428,110 @@ and query operations for these eight kinds:
 7. Git Source; and
 8. Tensor.
 
-Existing query predicates remain equality, membership, prefix, less-than,
-less-than-or-equal, greater-than, greater-than-or-equal, and existence. Query
-limits, result shapes, generation freshness evidence, and opaque page tokens
-remain public concepts.
+The plural noun in the public contract is **indices**. The list operation is
+`ListIndices(ListIndicesRequest) -> ListIndicesResponse`, and its repeated
+result field is `indices`. Singular names such as `IndexService`,
+`IndexDefinition`, and `CreateIndex` remain singular because they address one
+index or the index capability itself.
 
-Format v4 adds one optional physical-order declaration to Typed JSON
-definitions. It contains one or more existing indexed field names and
-directions. It is definition-versioned. Adding, removing, or changing it
-requires a new complete generation.
+### 8.1 Field type and capability
 
-Typed JSON field definitions add an explicit `multi_valued` Boolean. False is
-the default and declares zero or one scalar; true declares zero or more
-scalars. Equality, membership, range, prefix, and existence predicates continue
-to work on either cardinality. Public `IndexOrder` and physical order may name
-only a field with `multi_valued = false`; query validation rejects an ordered
-multi-valued field before opening index artifacts.
+An index definition declares both the logical type of a field and the
+capabilities required from it. Type determines validation, canonical encoding,
+comparison, and analysis. Capability determines which persistent structures
+are built and which query operations are accepted. Selecting a JSON pointer
+does not implicitly grant every capability.
 
-The public protobuf change is deliberately small and reuses `IndexOrder`:
+The initial field types are:
+
+- `BOOLEAN`;
+- `SIGNED_INTEGER`, an exact JSON integer in `i64` range;
+- `UNSIGNED_INTEGER`, an exact JSON integer in `u64` range;
+- `FLOAT`, a finite IEEE-754 binary64 value;
+- `KEYWORD`, an uninterpreted UTF-8 value with binary UTF-8 collation; and
+- `TEXT`, a UTF-8 value processed by its declared analyzer.
+
+The initial capabilities are:
+
+- `EXACT`, which permits equality, `IN`, and existence;
+- `PREFIX`, which permits raw keyword-prefix matching;
+- `RANGE`, which permits type-correct ordered comparisons;
+- `ORDER`, which permits result ordering through doc values;
+- `FACET`, which permits categorical or numeric facet collection;
+- `AGGREGATE`, which permits supported numeric aggregation; and
+- `FULL_TEXT`, which permits analyzed term and phrase matching.
+
+Existence is available through every non-empty capability and does not require
+a separate stored representation. Capabilities do not imply one another:
+`EXACT` does not permit prefix, range, order, facet, aggregate, or full-text
+operations. The same source JSON pointer may appear under several distinct
+public field names when an application intentionally needs different
+representations, such as an analyzed title and an exact title.
+
+The valid initial combinations are:
+
+| Field type | Valid capabilities |
+| --- | --- |
+| `BOOLEAN` | `EXACT`, `FACET` |
+| `SIGNED_INTEGER`, `UNSIGNED_INTEGER`, `FLOAT` | `EXACT`, `RANGE`, `ORDER`, `FACET`, `AGGREGATE` |
+| `KEYWORD` | `EXACT`, `PREFIX`, `RANGE`, `ORDER`, `FACET` |
+| `TEXT` | `FULL_TEXT` |
+
+`AGGREGATE` initially supports count, minimum, maximum, sum, and average on
+numeric fields. `FACET` uses sorted or sorted-set doc values for keywords and
+compact typed doc values for Boolean or numeric values. A future capability or
+type extends this table explicitly; it cannot be smuggled through an unknown
+enum value or a generic payload.
+
+### 8.2 Representative wire declaration
+
+The wire contract uses one type choice and an explicit capability list. The
+following is representative protobuf; exact field numbers are fixed by the
+implementation patch which realizes this accepted contract:
 
 ```protobuf
+enum IndexFieldCapability {
+  INDEX_FIELD_CAPABILITY_EXACT = 0;
+  INDEX_FIELD_CAPABILITY_PREFIX = 1;
+  INDEX_FIELD_CAPABILITY_RANGE = 2;
+  INDEX_FIELD_CAPABILITY_ORDER = 3;
+  INDEX_FIELD_CAPABILITY_FACET = 4;
+  INDEX_FIELD_CAPABILITY_AGGREGATE = 5;
+  INDEX_FIELD_CAPABILITY_FULL_TEXT = 6;
+}
+
+enum IndexFieldCardinality {
+  INDEX_FIELD_CARDINALITY_SINGLE = 0;
+  INDEX_FIELD_CARDINALITY_MULTI = 1;
+}
+
+message KeywordIndexField {}
+message BooleanIndexField {}
+message SignedIntegerIndexField {}
+message UnsignedIntegerIndexField {}
+message FloatIndexField {}
+
+enum TextAnalyzer {
+  TEXT_ANALYZER_UNICODE_ALPHANUMERIC_LOWERCASE = 0;
+}
+
+message TextIndexField {
+  TextAnalyzer analyzer = 1;
+}
+
 message IndexField {
   string name = 1;
   string json_pointer = 2;
-  bool multi_valued = 3;
+  IndexFieldCardinality cardinality = 3;
+  repeated IndexFieldCapability capabilities = 4;
+  oneof field_type {
+    BooleanIndexField boolean = 10;
+    SignedIntegerIndexField signed_integer = 11;
+    UnsignedIntegerIndexField unsigned_integer = 12;
+    FloatIndexField float = 13;
+    KeywordIndexField keyword = 14;
+    TextIndexField text = 15;
+  }
 }
 
 message TypedJsonIndexSpec {
@@ -445,11 +540,160 @@ message TypedJsonIndexSpec {
 }
 ```
 
-Physical-order fields must produce zero or one scalar value per document. A
-builder likewise fails a candidate generation with a precise definition/data
-error if any field declared single-valued produces multiple values; the
-previous complete generation remains published. This avoids silently choosing
-an array element and gives ordering one meaning.
+Using a `oneof` makes a field's logical type unambiguous on the wire. The
+server rejects a missing type, an empty or duplicate capability list, an
+invalid type/capability pair, duplicate public field names, duplicate physical
+order entries, an analyzer on a non-text field, or an order entry which lacks
+`ORDER`. Raw protobuf callers therefore fail before definition publication;
+they cannot create a partially usable definition.
+
+This protobuf text-format declaration shows the complete shape of a real
+request rather than an invented index DSL:
+
+```protobuf
+bucket: "intelligence"
+name: "advisories"
+path_prefix: "/advisories/"
+content_type: "application/json"
+specification {
+  typed_json {
+    fields {
+      name: "advisory_id"
+      json_pointer: "/id"
+      cardinality: INDEX_FIELD_CARDINALITY_SINGLE
+      capabilities: INDEX_FIELD_CAPABILITY_EXACT
+      keyword {}
+    }
+    fields {
+      name: "ecosystem"
+      json_pointer: "/ecosystem"
+      cardinality: INDEX_FIELD_CARDINALITY_SINGLE
+      capabilities: INDEX_FIELD_CAPABILITY_EXACT
+      capabilities: INDEX_FIELD_CAPABILITY_FACET
+      keyword {}
+    }
+    fields {
+      name: "modified_at"
+      json_pointer: "/modified_at_unix_millis"
+      cardinality: INDEX_FIELD_CARDINALITY_SINGLE
+      capabilities: INDEX_FIELD_CAPABILITY_EXACT
+      capabilities: INDEX_FIELD_CAPABILITY_RANGE
+      capabilities: INDEX_FIELD_CAPABILITY_ORDER
+      capabilities: INDEX_FIELD_CAPABILITY_AGGREGATE
+      signed_integer {}
+    }
+    fields {
+      name: "summary"
+      json_pointer: "/summary"
+      cardinality: INDEX_FIELD_CARDINALITY_SINGLE
+      capabilities: INDEX_FIELD_CAPABILITY_FULL_TEXT
+      text {
+        analyzer: TEXT_ANALYZER_UNICODE_ALPHANUMERIC_LOWERCASE
+      }
+    }
+    physical_order {
+      field: "modified_at"
+      direction: INDEX_ORDER_DIRECTION_DESCENDING
+    }
+  }
+}
+command_id: "01J..."
+```
+
+This definition does not tokenize `advisory_id`, cannot prefix-match or order
+by it, and stores no source JSON in the index. It builds exact postings for the
+ID, exact postings plus facet doc values for ecosystem, numeric point/doc-value
+structures for `modified_at`, and analyzed postings for `summary`.
+
+### 8.3 Rust client builder
+
+The Rust client must not make callers assemble the protobuf structure by hand.
+It provides concrete field builders and typed capability states. A capability
+method exists only for a field type which supports it; `physical_order` accepts
+only an order token produced by a single-valued field with `ORDER`; and
+`finish` consumes only a non-empty definition whose public field names are
+unique.
+
+The representative user API is:
+
+```rust
+let advisory_id = KeywordField::single("advisory_id", "/id")
+    .exact();
+
+let ecosystem = KeywordField::single("ecosystem", "/ecosystem")
+    .exact()
+    .facet();
+
+let modified_at = SignedIntegerField::single(
+        "modified_at",
+        "/modified_at_unix_millis",
+    )
+    .exact()
+    .range()
+    .order()
+    .aggregate();
+
+let modified_at_desc = modified_at.descending();
+
+let summary = TextField::single("summary", "/summary")
+    .analyzer(TextAnalyzer::UnicodeAlphanumericLowercase)
+    .full_text();
+
+let request = TypedJsonIndexBuilder::new("intelligence", "advisories")
+    .path_prefix("/advisories/")?
+    .content_type("application/json")?
+    .field(advisory_id)
+    .field(ecosystem)
+    .field(modified_at)
+    .field(summary)
+    .physical_order([modified_at_desc])
+    .finish(command_id)?;
+
+client.create_index(request).await?;
+```
+
+This API has no generic `.capability(...)` escape hatch. `TextField` does not
+offer `.exact()`, `BooleanField` does not offer `.range()`, and a field without
+`.order()` cannot create an ascending or descending order token. Multi-valued
+ordering is absent from the initial client API; a later explicit `MIN` or `MAX`
+selector requires another accepted contract rather than an arbitrary element
+choice. Each capability transition is consuming, so it cannot be declared
+twice. `finish` is the only operation which can produce a `CreateIndexRequest`,
+and it exists only after at least one field has been added. String/path
+validation and duplicate-name checks remain fallible because Rust's type
+system cannot prove properties of runtime strings; `finish` rejects them before
+producing a request. Invalid type/capability/cardinality combinations are
+unrepresentable.
+
+Other official clients provide the same concrete field concepts and validate
+before sending. The server remains the authority and repeats all checks because
+raw gRPC clients are always possible.
+
+### 8.4 Query admission and physical order
+
+Query predicates remain equality, membership, prefix, less-than,
+less-than-or-equal, greater-than, greater-than-or-equal, existence, and the
+existing full-text operations. Query limits, generation freshness evidence,
+facets, aggregates, and opaque page tokens are public concepts. Query admission
+maps every requested operator to its required capability and rejects a mismatch
+before opening an artifact:
+
+```text
+==, IN       -> EXACT
+PREFIX       -> PREFIX
+<, <=, >, >= -> RANGE
+ORDER BY     -> ORDER
+FACET        -> FACET
+aggregate    -> AGGREGATE
+text/phrase  -> FULL_TEXT
+EXISTS       -> any declared capability
+```
+
+Physical order is definition-versioned. Adding, removing, or changing it
+requires a new complete generation. Physical-order fields must be
+single-valued and have `ORDER`. A builder fails a candidate generation with a
+precise definition/data error if a field declared single-valued produces
+multiple values; the previous complete generation remains published.
 
 A query matches the physical order only when its complete explicit field and
 direction list exactly equals the definition's declaration; both then append
@@ -458,32 +702,49 @@ the same implicit stable-identity tie-break. A proper prefix does not match:
 does not match a non-empty physical declaration. Every non-matching order uses
 the arbitrary top-K path.
 
-Format v4 defines a total tagged scalar order for Typed JSON:
-
-```text
-null < boolean < number < unsigned < string
-```
-
-Values compare normally within one tag. `NaN` and infinite JSON numbers cannot
-occur, and numeric negative zero compares equal to positive zero. Strings use
-unsigned UTF-8 byte order; locale collation is outside format v4. Missing values
-sort last for ascending order and first for descending order, and remain
-distinct from explicit JSON `null`. This fixed rule applies to arbitrary and
-physical order because the current public `IndexOrder` has no missing-placement
-mode. The stable object identity is the final ascending tie-break in every
-physical or query order. Descending reverses the selected field comparison but
-not the final uniqueness of that identity.
-
-The tagged total order applies to result ordering only. Equality and range
-predicates remain type-exact: a range bound enumerates only its own scalar tag,
-so, for example, strings do not satisfy a numeric greater-than predicate merely
-because strings sort after numbers.
+Each field has one declared logical type, so there is no cross-type tagged
+order. Numbers compare numerically, keywords use unsigned UTF-8 byte order, and
+locale collation is outside format v4. `NaN`, infinity, or an out-of-domain JSON
+number is a projection error. Missing and explicit JSON `null` remain distinct;
+missing sorts last ascending and first descending. The stable document identity
+is the final ascending tie-break in every physical or query order. Descending
+reverses the selected field comparison but not that final uniqueness.
 
 Arbitrary query ordering remains correct without an exactly matching physical
-order. It uses bounded top-K collection over fast columns and may inspect every
-document which satisfies the Boolean predicate. Matching physical order
-permits early termination and is therefore the preferred definition for
-recurring sparse ordered queries.
+order. It uses bounded top-K collection over the field's doc values and may
+inspect every document which satisfies the Boolean predicate. Matching
+physical order permits early termination and is therefore the preferred
+definition for recurring sparse ordered queries.
+
+### 8.5 Value-size contract
+
+The 512 KiB component ceiling is a block bound, not a scalar-size promise.
+Format v4 adopts Lucene's 32,766-byte maximum for one raw keyword term, one
+sorted or sorted-set keyword doc value, and one analyzed token. This raises the
+current approximately 4 KiB raw term ceiling while deliberately lowering the
+accidental near-component-sized generic-column value ceiling. Numeric and Boolean
+values have fixed widths.
+
+`EXACT` remains available for a keyword longer than 32,766 bytes. Its canonical
+term is the scalar type, exact `u64` byte length, and BLAKE3 digest of the exact
+UTF-8 bytes. Equality and `IN` compare that representation. This is the only
+large-exact representation: it is consistent with Anvil's existing
+content-addressed identity model and does not create a source-payload
+verification path in the query engine.
+
+A keyword longer than 32,766 bytes cannot participate in `PREFIX`, `RANGE`,
+`ORDER`, or `FACET`. An analyzed source text may be larger because the analyzer
+streams it into bounded tokens; an individual token may not exceed the limit.
+An out-of-contract value fails that definition precisely and the index cannot
+claim a complete barrier which omits it. It is never truncated, sampled,
+silently hashed into an ordered operation, or copied into an exceptional jumbo
+component.
+
+`IndexQueryHit` contains the result object address, exact object version, and
+optional score. It contains no `fields_json` or other source projection. Facet
+and aggregation results are derived from declared doc values and returned in
+their explicit result structures; clients retrieve ordinary source data with
+`GetObject` or `BatchGet`.
 
 No segment DocId, field ordinal, block address, or implementation structure is
 added to the public API.
@@ -495,10 +756,10 @@ added to the public API.
 Format v4 uses only these canonical reserved object paths:
 
 ```text
-_anvil/indexes/v4/definitions/<index_name>
-_anvil/indexes/v4/<index_id>/artifacts/<blake3_hex>
-_anvil/indexes/v4/<index_id>/manifests/<blake3_hex>
-_anvil/indexes/v4/<index_id>/current
+_anvil/indices/v4/definitions/<index_name>
+_anvil/indices/v4/<index_id>/artifacts/<blake3_hex>
+_anvil/indices/v4/<index_id>/manifests/<blake3_hex>
+_anvil/indices/v4/<index_id>/current
 ```
 
 Definition names remain one validated path segment. Numeric index IDs use their
@@ -514,7 +775,7 @@ form and their complete object payload digest. A generation manifest uses the
 
 A format-v4 process discovers only v4 definitions. The release starts from new
 volumes and definitions are recreated through the public API. It does not scan,
-interpret, convert, delete, or treat `_anvil/indexes/v3/` objects as definitions
+interpret, convert, delete, or treat `_anvil/indices/v3/` objects as definitions
 or artifacts.
 
 Every path segment exactly equal to `_anvil` is reserved. Source events for
@@ -543,8 +804,8 @@ payload_checksum   [32]byte BLAKE3
 payload            [encoded_length]byte
 ```
 
-The exact fixed header is shared by term, posting, column, stored-field,
-position, norm, vector, live-mask, path-locator, and manifest components. A
+The exact fixed header is shared by term, posting, point, doc-value, position,
+norm, vector, live-mask, path-locator, and manifest components. A
 component-specific payload has its own explicit bounds and codec version.
 Readers validate the fixed header, checked lengths, declared upper bounds, and
 checksum before allocating or decoding.
@@ -568,16 +829,20 @@ Format v4 retains these proven portable bounds:
   header;
 - one ordinary artifact pack targets and may not exceed 16 MiB;
 - one routing key is at most 4,096 bytes;
+- one raw keyword term, sorted keyword doc value, or analyzed token is at most
+  32,766 bytes;
 - one routing node has at most 32 children and routing height is at most eight;
   and
 - one segment contains at most `u32::MAX` documents and splits before assigning
   a DocId outside that range.
 
-A posting, column, stored-field stream, or dictionary larger than one logical
-block is split into independently checked blocks. No record may straddle an
-artifact pack. Encoded counts and lengths use checked arithmetic and no decoded
-allocation is derived from an unvalidated value. These limits are format
-constants, not startup settings.
+A posting, point, doc-value stream, or dictionary larger than one logical block
+is split into independently checked blocks. The term dictionary routes a long
+keyword through bounded radix fragments; it never repeats a complete 32,766-byte
+term in one 4,096-byte routing key. Eight maximum routing fragments cover the
+complete term bound. No record may straddle an artifact pack. Encoded counts
+and lengths use checked arithmetic and no decoded allocation is derived from an
+unvalidated value. These limits are format constants, not startup settings.
 
 ### 9.4 Schema fingerprint
 
@@ -587,8 +852,8 @@ binary encoding in this order:
 
 1. index kind, path prefix, and content-type scope;
 2. every field in canonical definition order, including FieldId, public name,
-   source selector, permitted scalar domain, cardinality, null/missing policy,
-   collation, and enabled components;
+   source selector, logical type, cardinality, null/missing policy, collation,
+   declared capabilities, and compiled components;
 3. tokenizer/analyzer and full-text scoring semantics where applicable;
 4. vector dimensions, metric, normalization, and hybrid weights where
    applicable;
@@ -660,6 +925,20 @@ heads. Manifests do not form an unbounded predecessor chain. A continuation for
 a generation absent from the bounded current pointer fails with the existing
 generation-no-longer-available result.
 
+Each builder node keeps a sparse durable due index in the existing definition
+state column family. One primary record per assigned index identifies the exact
+definition/current version and reason; one time-ordered secondary key makes the
+oldest due work seekable. Updating or completing work atomically replaces or
+removes both keys. Only the currently executing bounded job is resident in
+memory, and its due record remains until exact completion, so delayed work does
+not consume an active-job slot and a crash can resume it without an inventory.
+
+Deleting a definition installs a `deleted_definition` due record before its
+delivery checkpoint advances. Cleanup exact-validates the tombstone and HRW
+fence, then scans only `_anvil/indices/v4/<index_id>/` under the normal safety
+age and exact-version deletion rules. It never deletes the ordinary definition
+tombstone and never touches another index in the bucket.
+
 ## 10. Schema and field identity
 
 Each definition version has one canonical field catalogue. A field receives a
@@ -673,32 +952,41 @@ definition_version, schema_fingerprint)` tuple matches.
 For each field, the catalogue records:
 
 - public field name and source selector;
-- permitted logical value domain: boolean, finite IEEE-754 binary64 number,
-  exact unsigned `u64`, UTF-8 string, or a declared subset;
+- one logical type: Boolean, signed integer, unsigned integer, finite
+  IEEE-754 binary64, keyword, or analyzed text;
 - definition-declared cardinality and whether missing and explicit null are
   permitted;
 - comparison and collation semantics;
+- the exact declared capabilities and the minimum compiled components which
+  realize them;
 - timestamp unit and timezone semantics when a future typed definition declares
   a timestamp;
 - decimal precision and scale when a future typed definition declares a
   decimal; and
-- whether the field has terms, fast columns, stored values, positions, norms,
-  vectors, or physical ordering.
+- whether the field participates in physical ordering.
 
-Current dynamically typed JSON definitions do not pretend to be one SQL scalar
-type. They permit the complete tagged value domain and use the definition's
-explicit single- or multi-valued cardinality. Their format-v4 columns retain
-Anvil scalar tags and separate presence and null bitmaps. Null is a value state,
-not a numeric or string scalar type. A future SQL API must either expose that
-dynamic domain conservatively or require an explicitly typed definition; it
-cannot silently coerce mixed values or collapse missing into null.
+Typed JSON definitions are not dynamically typed inside the index. One field
+has one declared type across every source object and segment. A value outside
+that type is a precise projection error; Anvil never coerces a string to a
+number, truncates an integer, treats a Boolean as a number, or invents a tagged
+cross-type order. Null is a value state, not a numeric or string type, and
+missing remains a separate presence state. A future SQL API therefore receives
+real logical types without inferring them from observed documents.
 
 Observed occurrence counts, actual scalar tags, null counts, and multi-value
 counts are segment statistics. They never alter the definition schema or its
 fingerprint as new objects arrive.
 
-Persistent type tags are Anvil constants. They are never Arrow, protobuf, Rust,
-or third-party enum discriminants.
+One complete segment-statistics record must fit one checked 512 KiB component.
+Definition admission computes its exact schema-weighted worst-case encoding
+before allocating builder state and rejects a larger definition with the
+required and supported byte counts. The bound admits at least 1,702 fields with
+every currently supported field component and up to 5,088 minimal fields. A
+larger real requirement needs a separately designed routed statistics codec;
+it does not silently create an unbounded record.
+
+Persistent type tags are Anvil constants. They are never protobuf, Rust, or
+third-party enum discriminants.
 
 ## 11. Segment identity and liveness
 
@@ -706,11 +994,13 @@ or third-party enum discriminants.
 
 A builder orders one segment's accepted projected documents deterministically
 and assigns dense DocIds from zero. All segment components use those DocIds:
-postings, fast columns, stored fields, full-text positions and norms, vectors,
-and live masks.
+postings, points, doc values, full-text positions and norms, vectors, and live
+masks.
 
-The segment identity table maps DocId to stable `(path, object_version)`. The
-public result is reconstructed from this table only for selected hits.
+The segment identity table maps DocId to the stable document identity. The
+public result's `(path, object_version)` is reconstructed from its result
+identity only for selected hits. Source identity and record ordinal remain
+internal cursor tie-break data.
 
 A segment core never changes. A merge writes a new core and new DocIds, then a
 new generation atomically replaces the old segment set.
@@ -790,6 +1080,13 @@ dictionary supports:
 - term document frequency and posting descriptor lookup; and
 - ordered iteration for range and prefix queries.
 
+An inline keyword or token is at most 32,766 bytes. Prefix-compressed leaves
+store complete terms while bounded radix routing consumes long common prefixes
+across levels; a routing node never repeats a complete long term. A keyword
+longer than the limit with only `EXACT` uses its canonical length-and-BLAKE3
+term instead. Hashed exact terms are not eligible for ordered enumeration,
+prefix matching, range matching, sorting, or faceting.
+
 The implementation may use finite-state or succinct structures in memory, but
 the durable bytes are an Anvil codec. `sux` structures may be reconstructed
 from portable arrays or used behind an Anvil wrapper; their native serializer
@@ -825,32 +1122,47 @@ approved quasi-succinct/succinct codecs. The writer selects from a small fixed
 set using deterministic thresholds recorded in the descriptor. Query semantics
 do not depend on the codec.
 
-### 12.3 Fast columns
+### 12.3 Point values
 
-Fast columns are independently addressable blocks keyed by DocId range. A
-column stores:
+Numeric `EXACT` and `RANGE` capabilities use a block point tree inspired by
+Lucene's point-value separation. Signed integers, unsigned integers, and finite
+binary64 values have canonical fixed-width order-preserving encodings. Leaves
+contain bounded sorted `(value, DocId)` entries; internal nodes contain checked
+value bounds and child descriptors. Exact, set, and range traversal therefore
+find candidate DocIds without scanning a per-document column.
 
-- a presence bitmap;
-- a separate explicit-null bitmap;
-- fixed-width values, monotone values, dictionary ordinals, or offsets plus
-  bytes according to its Anvil logical type;
-- multi-value offsets where the definition permits arrays; and
-- per-block count, null count, minimum, maximum, encoded bytes, and decoded
-  bytes.
+Single-dimensional points are sufficient for the initial field types. A future
+multi-dimensional or geospatial type requires an accepted extension rather than
+changing the meaning of this format. Point components do not exist unless a
+numeric field declares `EXACT` or `RANGE`.
 
-The planner can use these columns for range verification, ordering, scoring,
-projection, and statistics without reading a stored JSON projection.
+### 12.4 Doc values
 
-### 12.4 Stored fields
+`ORDER`, `FACET`, and `AGGREGATE` compile to independently addressable typed doc
+values keyed by DocId range:
 
-Stored projected values are grouped into independently compressed DocId-range
-blocks with a bounded offset table. They are fetched only for candidates which
-survive Boolean predicates, live masks, cursor bounds, and a bounded
-authorization selection.
+- single numeric fields use fixed-width, delta, monotone, or bit-packed numeric
+  blocks;
+- multi-valued numeric fields add one checked DocId-to-value offset stream;
+- single keyword fields use one sorted distinct-value dictionary and one
+  ordinal per present document; and
+- multi-valued keyword fields use a sorted distinct-value dictionary, sorted
+  ordinal lists, and checked per-document offsets.
 
-An index query never fetches the ordinary source payload merely to return fields
-already declared as stored by that index. Fetching the source object remains an
-explicit object API operation.
+Every representation has separate presence and explicit-null bitmaps where the
+definition permits those states. Block statistics retain counts and numeric or
+ordinal bounds. Keyword minimum and maximum are ordinals into values already
+stored in the dictionary; the codec never serializes duplicate minimum and
+maximum strings. A singleton 179 KiB keyword would therefore contain one value,
+not three copies, although it remains ineligible for `ORDER` or `FACET` because
+it exceeds the 32,766-byte ordered-key contract.
+
+One compatible doc-value representation serves every declared capability which
+can share it. `ORDER` plus `FACET` does not create two sorted keyword doc-value
+components, and `ORDER` plus `AGGREGATE` does not create two numeric doc-value
+components. A field without one of those capabilities has no doc values. Doc
+values never retain an otherwise unneeded source field for result
+materialization.
 
 ### 12.5 Full-text data
 
@@ -921,7 +1233,8 @@ components. A predicate implementation is one of:
 
 An exact public index query cannot drop an unsupported predicate. It returns a
 clear unsupported-query error unless the public contract explicitly permits
-bounded residual evaluation from indexed fast or stored fields.
+bounded residual evaluation from the field's declared point, doc-value,
+position, or vector components.
 
 ### 13.2 Boolean iterator algebra
 
@@ -933,8 +1246,8 @@ DocId. Evaluation continues until all iterators agree or one ends.
 `IN` and `OR` merge posting iterators with a bounded heap and suppress duplicate
 DocIds. `NOT` advances an exclusion iterator alongside the positive iterator.
 The live bitmap is another exact DocId filter. Two-phase predicates first
-intersect their cheap approximation and only then run positional, column, or
-other exact verification.
+intersect their cheap approximation and only then run positional, doc-value,
+or other exact verification.
 
 The planner never falls back from a selective compound query to decoding every
 document from a broad first predicate. If no useful indexed predicate exists,
@@ -951,13 +1264,14 @@ soon as it has enough authorized hits. A proper prefix, suffix, reordered list,
 direction change, or empty order does not qualify.
 
 Otherwise, Boolean execution produces matching DocIds and a bounded top-K
-collector reads only the order fast columns. Its memory is proportional to the
+collector reads only the declared order doc values. Its memory is proportional to the
 requested limit plus a bounded authorization refill window, not total matches.
 It may inspect all matching DocIds because an arbitrary exact order has no safe
 early-termination rule.
 
-The final stable identity tie-break makes ordering deterministic across
-segments and merges.
+The final stable document-identity tie-break makes ordering deterministic
+across segments and merges, including when one manifest projects multiple
+records which point at the same result object.
 
 ### 13.4 Pagination
 
@@ -968,16 +1282,16 @@ and relevant Zanzibar revision.
 For physically ordered scans, search-after seeks each segment to the first key
 strictly after the cursor. It does not reproduce page one's scan. For top-K
 scans without a matching physical order, the collector rejects keys at or
-before the cursor while reading fast columns. That avoids retaining or
-materializing the earlier page but cannot avoid re-enumerating exact Boolean
-matches: no ordered access path exists from which it could safely seek.
+before the cursor while reading doc values. That avoids retaining the earlier
+page but cannot avoid re-enumerating exact Boolean matches: no ordered access
+path exists from which it could safely seek.
 
 A token never contains a DocId. Compaction can change DocIds without changing
-the token's stable sort values and `(path, object_version)` tie-break. The token
+the token's stable sort values and stable document-identity tie-break. The token
 remains generation-bound so its candidate structures, scoring inputs, and
 retained artifacts do not change during pagination. Exact-current validation is
-still read committed and can remove an identity changed after that generation's
-barrier.
+still read committed and can remove a result object changed after that
+generation's barrier.
 
 ### 13.5 Authorization and result refill
 
@@ -1042,14 +1356,14 @@ backpressure when builders cannot keep up.
 
 ### 14.3 Merge
 
-Merge selection uses deterministic size tiers and explicit per-kind run and
+Merge selection uses deterministic size tiers and explicit per-kind segment and
 byte thresholds. A merge:
 
 - opens immutable inputs;
 - rejects any input whose exact `(index_id, definition_version,
   schema_fingerprint)` differs;
 - applies their generation-pinned live masks;
-- merges term dictionaries, postings, columns, stored fields, positions,
+- merges term dictionaries, postings, point trees, doc values, positions,
   vectors, and locator entries in deterministic key ranges;
 - assigns new segment-local DocIds;
 - preserves the declared physical order;
@@ -1082,24 +1396,31 @@ No JSON, stored payload, vector, or full-text component is needed.
 ### 15.2 Metadata Filter
 
 Fixed object-head fields receive stable definition-local FieldIds. Equality and
-membership use term postings. Numeric and time ranges use ordered terms and
-fast columns. Requested metadata values come from fast columns; path and object
-version come from the identity table.
+membership use term postings or exact numeric points. Numeric and time ranges
+use point trees. Ordering, facets, and aggregates use only the doc values
+declared for those capabilities; path and object version come from the identity
+table.
 
 Known metadata types avoid dynamic JSON coercion. A query intersects all useful
-postings before reading result columns.
+postings before reading required doc values.
 
 ### 15.3 Typed JSON
 
-The streaming projector extracts only configured JSON pointers. Each scalar
-type has a canonical tagged term lane and typed fast column. Arrays contribute
-multiple terms and multi-value column entries. Missing and explicit null remain
-different.
+The streaming projector extracts only JSON pointers named by typed field
+definitions. It validates the declared type and emits only the components
+required by that field's capabilities. An exact keyword ID produces one term
+and posting rather than token, doc-value, and source-projection copies. A
+numeric range-and-order field produces points and numeric doc values. A text
+field produces analyzed terms and the full-text components selected by its
+definition. Arrays contribute entries only to a declared multi-valued field.
+Missing and explicit null remain different.
 
-Equality, membership, prefix, exists, and ordered scalar ranges create
-advanceable posting iterators. Compound filters intersect them. Arbitrary order
-uses fast-column top-K; a matching optional physical order permits early
-termination. Final requested values are materialized only for selected hits.
+Equality, membership, prefix, existence, ordered scalar ranges, text matching,
+faceting, and aggregation are admitted only when the field declares the
+corresponding capability. Compound filters intersect their advanceable
+iterators. Arbitrary order uses doc-value top-K; a matching optional physical
+order permits early termination. Hits contain stable result identities, not
+copies of selected JSON.
 
 ### 15.4 Full Text
 
@@ -1109,16 +1430,16 @@ iterator algebra. Phrase queries use conjunction as their approximation and
 positions as exact verification. BM25 uses term statistics and norms; impact
 blocks permit safe top-K skipping.
 
-Stored snippets or projected fields are fetched only for final hits. The
-source payload is not repeatedly decoded during scoring.
+The source payload is not copied into the index or repeatedly decoded during
+scoring. A caller retrieves a selected hit through the ordinary object API.
 
 ### 15.5 Vector
 
 Vectors are fixed-width blocks aligned with common DocIds. Metadata or Typed
-JSON indexes have different definition-local DocIds and are not silently joined
+JSON indices have different definition-local DocIds and are not silently joined
 to this index. The current public Vector query therefore scores every present
 live vector in bounded blocks and keeps a bounded top-K heap. A future native or
-SQL planner may compose indexes only through stable object identities under a
+SQL planner may compose indices only through stable object identities under a
 separately specified plan; it cannot compare DocIds across definitions.
 
 ### 15.6 Hybrid
@@ -1136,33 +1457,34 @@ generation, liveness, and authorization boundary.
 ### 15.7 Git Source
 
 Repository, commit, tree path, Git object ID, and source identity form sorted
-composite terms and typed columns. Exact repository/commit lookups seek
-directly; tree traversal uses prefix enumeration. Stable Git object and pack
-bytes remain ordinary Anvil payloads and are not copied into the index unless
-explicitly projected as a stored field.
+composite terms and capability-selected doc values. Exact repository/commit
+lookups seek directly; tree traversal uses prefix enumeration. Stable Git
+object and pack bytes remain ordinary Anvil payloads and are never copied into
+the index.
 
 ### 15.8 Tensor
 
 The definition's model and the requested tensor name form the exact lookup key.
-Shape, element type, source offset/length, and stable object identity use typed
-columns or late stored fields for the returned record. Tensor payload bytes
-remain ordinary objects. Shape and type do not become new public query filters
-under this RFC.
+Shape, element type, and source offset/length use typed components only if a
+declared query capability needs them; stable object identity identifies the
+result. Tensor payload bytes remain ordinary objects. Shape and type do not
+become new public query filters under this RFC.
 
 All eight kinds therefore use the same identity, liveness, publication, cache,
 budget, iterator, pagination, authorization, and scan foundations. A kind adds
 only the components its semantics require.
 
-## 16. DataFusion-ready scan boundary
+## 16. Future native scan boundary
 
-The format-v4 engine exposes one internal async contract independent of any SQL
-library:
+Format v4 defines the internal contract a future SQL capability must consume.
+The contract is a design boundary in `0.9.0`, not a user-visible SQL API or an
+executable adapter added by this release:
 
 ```text
 ScanRequest {
   generation
   authorization_scope
-  projected_field_ids
+  required_doc_value_field_ids
   predicate_expression
   required_order
   after
@@ -1188,9 +1510,10 @@ ScanStream -> async stream<ScanBatch>
 `PredicateId` is scoped to one `ScanRequest`; it is neither durable nor drawn
 from a registry.
 
-`ScanBatch` contains definition-local FieldIds, Anvil logical types, presence
-and null information, stable object identities, and bounded column buffers. It
-does not expose internal block ownership or DocIds beyond the engine boundary.
+`ScanBatch` contains only requested definition-local doc values, their Anvil
+logical types, presence and null information, stable object identities, and
+bounded column buffers. It does not expose source JSON, internal block
+ownership, or DocIds beyond the engine boundary.
 
 Every kind exposes the same reserved system columns for stable numeric tenant,
 stable numeric bucket, path, and object version. Tenant and bucket are virtual
@@ -1201,10 +1524,10 @@ that stable identity under an explicit plan; segment DocIds from separate
 definitions are never comparable. This common identity is enough to design a
 future join/intersection operator without adding one to the format-v4 release.
 
-The contract provides the information a future DataFusion `TableProvider` and
-`ExecutionPlan` need:
+The contract provides the information a future SQL planner and physical scan
+need:
 
-- projection pushdown;
+- identity and declared-doc-value selection;
 - exact/inexact/unsupported filter pushdown;
 - limit and ordering pushdown;
 - a generation-pinned candidate view with read-committed exact-current
@@ -1216,8 +1539,8 @@ The contract provides the information a future DataFusion `TableProvider` and
 - mandatory authorization and liveness operators.
 
 Reported partitions are local execution partitions on the selected HRW owner,
-such as disjoint segment groups. They do not authorize DataFusion to scatter a
-query across Anvil nodes or bypass the owner, generation, cache, and Zanzibar
+such as disjoint segment groups. They do not authorize a SQL engine to scatter
+a query across Anvil nodes or bypass the owner, generation, cache, and Zanzibar
 boundaries. Ordering is reported per partition. A physically ordered
 multi-segment scan either adds one local k-way merge and returns one globally
 ordered stream or exposes the per-partition ordering and requires an explicit
@@ -1237,99 +1560,15 @@ return, while its replacement waits for a later published generation. The scan
 does not claim SQL snapshot isolation, repeatable read, or time-travel
 semantics.
 
-The future adapter translates DataFusion expressions to `ScanRequest`, consumes
-`ScanBatch` values, and constructs Arrow `RecordBatch` values for the user
-projection plus any columns required by an inexact residual expression. The
-residual is evaluated before the final user projection. If Anvil performs that
-bounded residual exactly, it advertises the predicate as `Exact` and need not
-return its private verification columns. The adapter can remain in a separate
-SQL-facing crate, keeping Arrow and DataFusion out of the store, consensus,
-program, gateway, and native index crates.
+The future adapter translates SQL expressions to `ScanRequest`, consumes
+bounded `ScanBatch` values, and evaluates any inexact residual from requested
+doc values. Source-field projection is a separate ordinary-object fetch stage;
+format v4 does not turn an index into another copy of the source. If Anvil
+performs a bounded residual exactly, it advertises the predicate as `Exact`.
+The adapter remains outside the store, consensus, program, gateway, and native
+index crates.
 
-Format v4 promises semantic convertibility, not zero-copy Arrow compatibility.
-If a future fast-column block can be wrapped by an Arrow buffer without copying,
-that is an implementation optimization. Alignment, compression, variable-width
-offsets, and null representation may still require conversion and never become
-an authoritative-format promise.
-
-## 17. Apache Arrow assessment across Anvil
-
-Arrow is designed for tabular analytical locality, vectorized processing, and
-interchange. Its record-batch representation does not match many Anvil
-authority access patterns. The clean format break is not a reason to use one
-representation where the access patterns do not match.
-
-| Anvil bytes | Access pattern | Arrow decision | Reason |
-| --- | --- | --- | --- |
-| Terms and postings | Exact/range seek, skip, intersect, score | Do not use | Arrow supplies no term dictionary, posting advancement, skip data, positions, impacts, or liveness |
-| Fast index columns | DocId block reads, range verification, top-K | Anvil codec on disk; Arrow adapter later | Specialized compression and small random block reads matter more than generic IPC; selected bounded columns convert naturally |
-| Stored index fields | Late sparse materialization | Do not persist as Arrow | Sparse lookup needs per-DocId offsets plus independently compressed, checksummed, range-addressable blocks; IPC adds no useful locator |
-| Live masks | Single-bit tests and bitmap algebra | Do not use | Anvil needs generation-rooted immutable block reuse, independent checksums, and range fetches; an IPC envelope adds no authority or query benefit |
-| Segment identities, path locators, and pack descriptors | Stable identity resolution, overwrite/delete lookup, and checked range addressing | Do not use | These are seekable mappings and small descriptors with independent version and integrity rules, not analytical columns |
-| Vector blocks | Fixed-width candidate scoring | Anvil fixed-vector codec | Blocks need Anvil range descriptors, integrity/versioning, and room for future quantization; selected runtime vectors can still be wrapped or converted |
-| Segment/generation manifests | Small pointer-rich control records | Do not use | Explicit bounded binary records are smaller and independently versionable |
-| Ordinary small blobs | Opaque content-addressed bytes up to 64 KiB | Never reinterpret | The payload belongs to the client and is deliberately stored directly in RocksDB |
-| Large complete replicas, staging files, and erasure fragments | Opaque streaming bytes, hashing, coding, deduplication | Never reinterpret | Arrow cannot improve object identity, restart-safe staging, streaming, erasure coding, or reference counting |
-| RocksDB heads and versions | Individual point read/update and prefix iteration | Do not use | Grouping records requires rewriting a batch, while one-record IPC batches impose disproportionate schema/envelope overhead |
-| Name mappings and blob-reference counts | Tiny fixed or scalar values | Do not use | Existing fixed-width encoding is already the suitable shape |
-| Tenant/bucket/options/policy/authentication records | Small exact control-plane point/range records | Do not use | Independent mutable authority and prefix lookup need bounded records, not analytical batches |
-| Node identity, peer TLS overlap, and join/bootstrap artifacts | Small private identity and operator-carried security records | Do not use | Explicit bounded records and mode-0600 operator artifacts need exact validation and lifecycle, not batching |
-| Zanzibar realm/tenant revisions, schemas, tuples, and bindings | Security-sensitive exact point/range evaluation | Do not use | Authorization authority needs independently versioned records and exact key access |
-| Mutation/authz receipts and reference lifecycle evidence | Idempotency windows, exact proofs, counters, and bounded pruning | Do not use | Each proof has its own identity and lifecycle; columnar grouping adds no evaluation benefit |
-| Definition locators, assignments, and consumer checkpoints | Exact discovery, disposable placement projection, and durable retention evidence | Do not use | Their independent keys, fences, and update cadence do not form an analytical batch |
-| Mixed local control metadata | High-watermarks, source epochs/counters, bootstrap/program state, and bounded consumer evidence | Do not use | Independently updated scalar and small records in `CF_METADATA` need point access and atomic RocksDB batches |
-| Source journal and sparse routes | Atomic append with mutation/routes; later settlement; per-offset pruning and prefix seek | Do not use | Primary records are heterogeneous versioned transitions and routes are empty ordered keys; RocksDB already expresses atomicity and retention |
-| Raft protocol log/metadata, applied recovery journal, and bounded state-machine snapshots | Consensus, replay, and compact cluster/atomic state | Do not use | Arrow would inflate latency-sensitive non-tabular records and add no query benefit |
-| Atomic programs | Bounded JSON DSL plus opaque ordinary-object results | Do not use | JSON Pointer/Patch semantics and opaque outputs are not columnar tables |
-| Accounting definitions, rollups, and traffic-source checkpoints | A few exact counters, scope records, and freshness checkpoints | Do not use | Scalar point updates and small ordinary objects are already direct |
-| S3, Git, PersonalDB, and public gRPC payloads | Native protocol or opaque bytes | Do not use | Gateways must preserve their public wire contracts |
-| Disposable index cache, construction scratch/spills, and Git materialization cache | Exact artifact copies or reconstructible working data | No persistent Arrow contract | These bytes follow the component, sorter, or native Git access pattern which created them and never define storage authority |
-| Peer snapshot transfer | Homogeneous bounded record stream | Defer pending evidence | Retain the current protocol until a representative transfer benchmark demonstrates a material compression, CPU, or transfer benefit |
-| Future SQL execution/results | Bounded projected columns | Use at adapter boundary | This is Arrow's intended in-memory and interchange workload |
-| Disposable SQL/query cache | Transient selected columns | Arrow is allowed at the future adapter | Cached Arrow arrays may accelerate one SQL process but remain disposable and never define storage authority |
-
-Persistent Arrow would be justified during this clean break if it removed a
-substantial custom subsystem or produced a measured material reduction in
-stored bytes, remote ranges, decode CPU, or query memory without weakening
-independent block replacement and checksumming. It does none of those for terms,
-postings, liveness, sparse stored fields, point records, or opaque payloads.
-
-Primitive fast-column and contiguous vector blocks are the closest candidates:
-their decoded buffers can resemble Arrow arrays. Persisting Arrow IPC still
-would not provide their term access paths, DocId-range routing, specialized
-compression, generation identity, integrity envelope, or future vector
-quantization. The native codec therefore stores only the buffers the native
-engine needs. A future SQL-facing crate may depend on the modular `arrow-array`
-and `arrow-schema` crates and wrap compatible uncompressed aligned buffers or
-convert selected bounded blocks. That captures the practical Arrow benefit
-without importing Arrow into the store or making its layout an Anvil durability
-contract.
-
-Several RocksDB column-family values currently use JSON serialization. Repeated
-field names and byte arrays can cost CPU and uncompressed write bytes at very
-large object counts, but Arrow is not a suitable replacement. RocksDB already
-provides block storage and compaction; these records need compact individual
-encoding, not record batches.
-
-Changing every object, authorization, receipt, and journal record codec would
-touch unrelated correctness and trust paths without fixing the measured query
-failure. This RFC therefore does not expand the format-v4 index replacement into
-a store-wide record rewrite. A separate proposal may define a store-owned,
-versioned, bounded-record envelope informed by the consensus crate's private
-framed fixed-integer encoding, but only after a representative benchmark
-reports:
-
-- encoded bytes before and after RocksDB compression;
-- encode/decode CPU and allocation rate;
-- point-read and write-batch latency;
-- WAL and compaction bytes; and
-- operational benefit large enough to justify changing those authority paths.
-
-That evidence requirement is important even on new volumes: a clean break
-removes migration cost, but it does not remove implementation and correctness
-risk.
-
-## 18. Resource control and cache
+## 17. Resource control and cache
 
 One shared construction budget remains configured per index kind for the whole
 process, not per definition. Builders, projection waves, sorters, posting
@@ -1348,17 +1587,17 @@ without relying on an operator to reserve one otherwise-idle worker.
 One process index-cache pool retains its configured disk and memory budgets.
 HRW owners materialize immutable ordinary artifacts into this disposable cache.
 The async handle reads logical ranges and transparently fetches missing packs;
-it may prefetch sequential posting, column, or stored-field blocks from planner
+it may prefetch sequential posting, point, or doc-value blocks from planner
 hints. Open handles pin only the exact cached entries they use. Eviction never
 removes authoritative bytes.
 
 Query execution has a separate bounded memory allowance for decoded posting
-blocks, iterator heaps, top-K state, fast-column pages, authorization batches,
-and returned fields. A query which cannot acquire its declared maximum waits or
-returns a resource error within the normal server deadline; it does not grow
-the process implicitly.
+blocks, point-tree and doc-value pages, iterator heaps, top-K state, facet or
+aggregate state, and authorization batches. A query which cannot acquire its
+declared maximum waits or returns a resource error within the normal server
+deadline; it does not grow the process implicitly.
 
-### 18.1 Startup defaults
+### 17.1 Startup defaults
 
 Resource values are non-zero startup configuration, may change on restart, and
 are not Raft or durable-format state. Defaults are:
@@ -1369,7 +1608,7 @@ are not Raft or durable-format state. Defaults are:
 - source quantum per kind: 16 MiB;
 - external-sort chunk per kind: 16 MiB when affordable;
 - merge lanes per kind: four;
-- merge debt per kind and level: 64 segments and 1 GiB encoded bytes;
+- merge debt per kind and size tier: 64 segments and 1 GiB encoded bytes;
 - disposable index-cache disk: 10 GiB;
 - disposable index-cache memory: 10 percent of process memory;
 - concurrent queries: 64;
@@ -1391,7 +1630,7 @@ above a fixed format bound, or a budget which cannot fit one required workspace
 fails startup and names the exact setting. Heterogeneous nodes may use different
 local budgets without changing durable bytes or query results.
 
-### 18.2 Recovery and maintenance
+### 17.2 Recovery and maintenance
 
 | Failure | Required behavior |
 | --- | --- |
@@ -1413,22 +1652,32 @@ byte, and time work with resumable scoped cursors. Core object service starts
 before them. No recovery or maintenance path triggers a global object-head,
 blob, artifact, definition-payload, or cache-file scan.
 
-## 19. Statistics and cost model
+Blob-reference lifecycle mutations atomically maintain a local derived
+eligibility key ordered by `updated_at` for states which are unpublished or
+have zero references. GC seeks only through the age cutoff, exact-rereads the
+authoritative reference state, and then quarantines and removes the bytes.
+Canonical blob directories are not inventoried. Crash-only staging and
+quarantine reconciliation is bounded, resumable, restricted to those two
+directories, and starts after serving. Cache reconciliation is likewise
+explicitly started after serving; cold reads remain correct through exact lazy
+validation and refetch.
+
+## 18. Statistics and cost model
 
 Every segment records enough metadata to plan without opening every data block:
 
 - total and live document counts;
 - per-field presence, null, and value counts;
 - per-term document frequency;
-- per-column minimum and maximum by block;
+- per-point-leaf and per-doc-value-block bounds;
 - physical-order bounds;
-- posting, position, vector, column, and stored-field encoded bytes;
+- posting, point, position, vector, and doc-value encoded bytes;
 - decoded byte upper bounds;
 - vector dimensions and present count; and
 - full-text token, frequency, norm, and impact summaries.
 
 Correctness-bearing bounds are distinct from advisory cost estimates. Block
-first/last keys, column minimum/maximum, physical-order bounds, live counts,
+first/last keys, point/doc-value bounds, physical-order bounds, live counts,
 segment-core scoring inputs, and conservative impact maxima are checksummed
 index data. Writers verify them against emitted records, readers validate their
 ordering and range, and corruption fails the definition closed. Only these
@@ -1440,7 +1689,7 @@ prefetch benefit. They choose iterator order, top-K strategy, and scheduling.
 An inaccurate advisory estimate may make a plan slower but cannot omit a block,
 predicate, or candidate; exact iterators and verification remain authoritative.
 
-Statistics are also exposed to the future native Anvil planner. A DataFusion
+Statistics are also exposed to the future native Anvil planner. A future SQL
 adapter consumes the same estimates rather than inventing a second topology or
 index catalogue. The native cost includes selected HRW owner, local cache
 residency, missing ordinary artifact ranges, expected remote bytes, and bounded
@@ -1448,7 +1697,7 @@ fetch concurrency. These locality values are advisory scheduling costs only;
 they cannot move execution away from an authorized owner or change exact query
 semantics.
 
-## 20. Freshness and query result evidence
+## 19. Freshness and query result evidence
 
 Queries use the latest complete generation available on the selected owner.
 They return the existing freshness structure containing definition version,
@@ -1466,9 +1715,9 @@ Checkpoint-only progress is itself publishable generation evidence even when
 no indexed document changes. Restart, reassignment, and compaction preserve that
 zero-lag proof.
 
-## 21. Observability
+## 20. Observability
 
-Low-cardinality metrics by index kind, phase, and level include:
+Low-cardinality metrics by index kind, phase, and size tier include:
 
 - active, queued, waiting, completed, failed, and cancelled builds and merges;
 - source records/bytes read and projected;
@@ -1479,8 +1728,9 @@ Low-cardinality metrics by index kind, phase, and level include:
 - live-mask blocks read and candidates rejected;
 - invalidation-overlay offsets applied, resident bytes, cache drops, and
   candidates rejected;
-- fast-column blocks/bytes read;
-- stored-field blocks/bytes read;
+- point nodes/leaves and bytes read;
+- doc-value blocks/bytes read;
+- facet and aggregate documents/values processed;
 - physical-order early termination and top-K documents inspected;
 - cursor seeks and documents skipped before/after the cursor;
 - authorization/exact-current batches, candidates checked, denied, stale, and
@@ -1504,10 +1754,10 @@ builder reassignment, generation publication, merge replacement, sustained
 backpressure, and a concise slow-query plan summary. They do not print payloads,
 credentials, private field values, or unbounded query text.
 
-## 22. Complexity contract
+## 21. Complexity contract
 
 For a segment with `D` documents, predicate posting sizes `P1..Pn`, `M` exact
-Boolean matches, requested limit `K`, and returned stored bytes `R`:
+Boolean matches, and requested limit `K`:
 
 - exact term lookup is logarithmic or succinct-dictionary seek plus one posting
   descriptor read;
@@ -1522,33 +1772,35 @@ Boolean matches, requested limit `K`, and returned stored bytes `R`:
   current matches, but in the worst case may inspect every candidate; its
   working memory remains bounded;
 - arbitrary ordering inspects and may authorization/current-check all `M`
-  matches, reads their order fast-column values, and retains `O(K)` top-K state
+  matches, reads their order doc values, and retains `O(K)` top-K state
   plus one bounded validation batch;
-- stored-field decoding is proportional to selected/refill candidates and `R`,
-  not a broad predicate's cardinality;
 - physical-order page continuation seeks from the cursor and does not repeat
   the previous page's complete work; arbitrary-order top-K may re-enumerate
-  `M` matches but does not reread their stored fields; and
+  `M` matches and reread their order doc values; and
 - merge memory is bounded by admitted blocks and lanes, independent of total
   corpus size.
+
+Query execution never reads ordinary source payloads. Returning source fields
+is an explicit `GetObject` or `BatchGet` operation after identity selection.
 
 No fixed complexity promise can make an unindexed predicate or arbitrary exact
 sort sublinear. The engine must identify that case explicitly instead of hiding
 it behind a broad-scan fallback.
 
-## 23. Validation
+## 22. Validation
 
-### 23.1 Codec and corruption tests
+### 22.1 Codec and corruption tests
 
 - golden vectors decode identically on AMD64 and ARM64;
 - every component kind rejects bad magic, version, lengths, offsets, enum tags,
   checksums, and allocation claims;
-- encode/decode round trips preserve missing versus null, dynamic scalar tags,
-  arrays, Unicode, numeric boundaries, positions, vectors, and stable identity;
+- encode/decode round trips preserve every declared field type and capability,
+  missing versus null, cardinality, Unicode, numeric boundaries, positions,
+  vectors, stable result/source identities, and source-record ordinals;
 - no persisted byte stream depends on Rust or `sux` native layout; and
 - fuzzed component readers remain within declared allocation bounds.
 
-### 23.2 Query correctness
+### 22.2 Query correctness
 
 - every predicate works alone and in `AND`, `OR`/`IN`, and exclusion forms;
 - conjunction results equal a trusted in-memory evaluator for varied predicate
@@ -1557,18 +1809,19 @@ it behind a broad-scan fallback.
 - post-generation overwrite/delete overlays suppress stale candidates, and a
   missing/behind overlay still returns no stale version because the bounded
   exact-current result check refills correctly;
-- pre- and post-merge exact match membership and stored values are identical;
+- pre- and post-merge exact membership, doc values, facets, and aggregates are
+  identical;
   scores and score order may change only in the newly published generation as
   documented, while an active cursor remains stable on its retained generation;
 - physical and top-K order agree, including missing, null, direction, and stable
-  tie-breaks;
-- second and later pages neither repeat nor omit results and seek before stored
-  materialization;
+  document-identity tie-breaks;
+- second and later pages neither repeat nor omit results and seek before
+  rejected-candidate doc-value work;
 - authorization denial refills from the same iterator without leakage;
 - checkpoint-only progress preserves freshness across restart; and
 - atomic-program paths become visible together at one generation CAS.
 
-### 23.3 Production-shaped regression
+### 22.3 Production-shaped regression
 
 A public-API qualification builds at least 800,000 Typed JSON objects with the
 same selectivity shape as the incident query:
@@ -1581,13 +1834,13 @@ same selectivity shape as the incident query:
 
 The verifier compares exact results and order with an independent evaluator.
 It records ingest and index rates separately and reports posting advances,
-candidate DocIds, liveness checks, fast-column reads, stored-field reads,
+candidate DocIds, liveness checks, point reads, doc-value reads,
 logical and physical bytes, cache state, CPU, memory, and elapsed time.
 
 Acceptance requires:
 
 - no 300-second timeout;
-- no full stored-field or source-payload scan;
+- no ordinary source-payload read during a query;
 - no logical-read amplification approaching one complete index per small page;
 - the regression definition declares its matching physical order, and page two
   performs a real cursor seek without repeating page one's complete candidate
@@ -1603,7 +1856,7 @@ restart, builder failover, and source-journal backpressure. A forced-spill build
 and merge with projection lanes exactly equal to Rayon workers proves that no
 nested same-pool starvation is possible.
 
-### 23.4 All-kind and distributed matrix
+### 22.4 All-kind and distributed matrix
 
 Each of the eight kinds is created, built, queried, updated, deleted, rebuilt,
 restarted, and merged through the public API on one node and a three-node Docker
@@ -1611,7 +1864,7 @@ cluster. Tests use independent buckets in one cluster. They verify HRW proxying,
 artifact durability, owner failover, Zanzibar denial/public-read behavior,
 freshness evidence, pagination, and exact results.
 
-## 24. Clean-break removal list
+## 23. Clean-break removal list
 
 The format-v4 implementation deletes, rather than wraps:
 
@@ -1619,7 +1872,8 @@ The format-v4 implementation deletes, rather than wraps:
 - range-local ordinal persistence and cross-run latest-live probing;
 - single-driver Typed JSON and Metadata query execution;
 - broad ordered-query fallback and post-scan continuation filtering;
-- per-candidate stored-row decoding before Boolean filtering;
+- automatic terms-plus-generic-column-plus-stored-field projection for every
+  selected Typed JSON field;
 - query paths whose pagination restarts from the beginning;
 - format-v3 merge and compaction code;
 - compatibility branches, feature flags, converters, and dual-write tests; and
@@ -1629,36 +1883,35 @@ Retained source-journal, definition, HRW, authorization, object publication,
 cache, accounting, gateway, and Raft code is changed only where required to
 connect to the new format-v4 engine.
 
-## 25. Known limitations
+## 24. Known limitations
 
 - Vector search remains exact and linear in the live filtered vector set. ANN
   requires a later accepted design.
-- One query executes on one HRW owner. Very large indexes may fetch ordinary
+- One query executes on one HRW owner. Very large indices may fetch ordinary
   artifact packs over the cluster, but Anvil does not scatter the query or merge
   network result sets.
 - Arbitrary order without a matching physical order may inspect every exact
   Boolean match on every page and may authorize and exact-current-check every
-  match, although it reads fast columns rather than stored fields or payloads.
+  match and reread order doc values, but it never reads source payloads.
 - Full-text merge may slightly change scores and score order in the newly
   published generation because BM25 statistics are aggregated from that
   generation's immutable segment set. Exact Boolean membership is unchanged,
   and an active page token remains on its retained generation.
-- Dynamically typed JSON does not automatically become a conventional SQL
-  column. A future SQL capability must define its exposure explicitly.
-- Arrow, DataFusion, SQL, Flight, and IPC are not user-visible capabilities in
-  this release.
+- A keyword longer than 32,766 bytes supports only hashed `EXACT`; ordered,
+  prefix, range, and facet capabilities reject it.
+- SQL is not a user-visible capability in this release.
 - A permanently failed definition may eventually hold journal capacity and
   backpressure affected writes until an authorized principal repairs, rebuilds,
   or deletes it. This preserves index visibility correctness.
 - Capacity and lane configuration changes on restart.
 - Mesh and regional coordination remain outside the single-cluster design.
 
-## 26. Consequences
+## 25. Consequences
 
 The new engine is a major internal refactor, but it removes the architectural
 cause of multi-index-sized reads for sparse compound queries. Common DocIds,
-live masks, advanceable postings, fast columns, late materialization, and one
-planner serve every index kind instead of letting each rediscover filtering,
+live masks, advanceable postings, points, typed doc values, and one planner
+serve every index kind instead of letting each rediscover filtering,
 pagination, authorization, and cache behavior.
 
 Anvil retains ownership of its durable format and can tune codecs, remote block
@@ -1667,18 +1920,16 @@ inline/erasure-coded object architecture. Following Lucene's stable execution
 contracts avoids inventing an unproven search model without binding Anvil to a
 foreign storage format.
 
-The DataFusion-ready scan boundary avoids a future SQL gateway having to bypass
-the native planner or rebuild authorization, liveness, and topology knowledge.
-Deferring Arrow to that adapter keeps today’s core dependency and persistence
-surface small while preserving bounded conversion to the industry-standard
-analytical representation when it has an actual consumer.
+The native scan boundary prevents a future SQL gateway from bypassing the
+native planner or rebuilding authorization, liveness, and topology knowledge.
+Its executable adapter remains deferred until there is an actual SQL consumer.
 
 The clean break costs one rebuild from authoritative ordinary objects. It adds
 no migration subsystem and leaves existing source data, object durability,
 Zanzibar authority, journals, Raft state, gateways, and accounting semantics
 unchanged.
 
-## 27. References
+## 26. References
 
 - Apache Lucene, [index package and segment model](https://lucene.apache.org/core/10_3_0/core/org/apache/lucene/index/package-summary.html).
 - Apache Lucene, [`DocIdSetIterator`](https://lucene.apache.org/core/10_3_2/core/org/apache/lucene/search/DocIdSetIterator.html).
@@ -1690,8 +1941,6 @@ unchanged.
 - Apache Lucene, [`Lucene103PostingsFormat`](https://lucene.apache.org/core/10_3_1/core/org/apache/lucene/codecs/lucene103/Lucene103PostingsFormat.html).
 - Apache Lucene, [`ImpactsEnum`](https://lucene.apache.org/core/10_3_2/core/org/apache/lucene/index/ImpactsEnum.html).
 - Apache Lucene, [`WANDScorer`](https://github.com/apache/lucene/blob/releases/lucene/10.3.2/lucene/core/src/java/org/apache/lucene/search/WANDScorer.java).
-- Apache Arrow, [columnar format](https://arrow.apache.org/docs/format/Columnar.html).
-- Apache Arrow Rust, [IPC support](https://arrow.apache.org/rust/arrow_ipc/index.html).
 - Apache DataFusion, [custom data sources and table providers](https://datafusion.apache.org/library-user-guide/custom-table-providers.html).
 - Gonzalo Navarro and Veli Mäkinen, [Compressed Full-Text Indexes](https://users.dcc.uchile.cl/~gnavarro/ps/acmcs06.pdf), ACM Computing Surveys 39(1), 2007.
 - Sebastiano Vigna, [Quasi-Succinct Indices](https://vigna.di.unimi.it/ftp/papers/QuasiSuccinctIndices.pdf), WSDM 2013.
