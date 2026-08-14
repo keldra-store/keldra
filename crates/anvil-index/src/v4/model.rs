@@ -6,6 +6,8 @@ pub const INDEX_DECODE_BYTES: usize = 4 * 1024 * 1024;
 pub const INDEX_ARTIFACT_PACK_BYTES: usize = 16 * 1024 * 1024;
 pub const INDEX_ROUTING_KEY_BYTES: usize = 4096;
 pub const INDEX_TERM_BYTES: usize = 32_766;
+/// FieldId, term type, and the largest bounded keyword representation.
+pub(crate) const INDEX_TERM_ROUTING_BYTES: usize = INDEX_TERM_BYTES + 6;
 pub const INDEX_ROUTING_FANOUT: usize = 32;
 pub const INDEX_ROUTING_HEIGHT: u8 = 8;
 pub const INDEX_GENERATION_SEGMENTS: usize = 4_096;
@@ -132,6 +134,18 @@ pub(crate) fn validate_routing_key(key: &[u8]) -> Result<(), IndexError> {
         return Err(IndexError::ResourceLimit {
             needed: key.len(),
             limit: INDEX_ROUTING_KEY_BYTES,
+        });
+    }
+    Ok(())
+}
+
+/// Validate one logical term boundary before its bounded radix encoding.
+/// Ordinary routing keys remain subject to [`validate_routing_key`].
+pub(crate) fn validate_term_routing_key(key: &[u8]) -> Result<(), IndexError> {
+    if key.is_empty() || key.len() > INDEX_TERM_ROUTING_BYTES {
+        return Err(IndexError::ResourceLimit {
+            needed: key.len(),
+            limit: INDEX_TERM_ROUTING_BYTES,
         });
     }
     Ok(())

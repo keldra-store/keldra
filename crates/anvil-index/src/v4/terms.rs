@@ -1,7 +1,7 @@
 use crate::IndexError;
 
 use super::codec::{COMPONENT_HEADER_BYTES, Decoder, Encoder};
-use super::model::{INDEX_COMPONENT_BYTES, INDEX_ROUTING_KEY_BYTES};
+use super::model::{INDEX_COMPONENT_BYTES, validate_term_routing_key};
 
 const TERM_DICTIONARY_CODEC_VERSION: u16 = 1;
 const MAX_PAYLOAD_BYTES: usize = INDEX_COMPONENT_BYTES - COMPONENT_HEADER_BYTES;
@@ -144,8 +144,7 @@ fn validate_entries(entries: &[TermEntry]) -> Result<(), IndexError> {
         ));
     }
     for entry in entries {
-        if entry.term.is_empty()
-            || entry.term.len() > INDEX_ROUTING_KEY_BYTES
+        if validate_term_routing_key(&entry.term).is_err()
             || entry.postings.document_frequency == 0
             || entry.postings.total_term_frequency < entry.postings.document_frequency
             || entry.postings.component_count == 0
@@ -204,5 +203,23 @@ mod tests {
         assert_eq!(decoded.lower_bound(b"aa"), 1);
         assert_eq!(decoded.prefix(b"a").count(), 3);
         assert!(decoded.exact(b"z").is_none());
+    }
+
+    #[test]
+    fn ordered_terms_accept_every_supported_long_boundary() {
+        for length in [4_097, super::super::model::INDEX_TERM_ROUTING_BYTES] {
+            let dictionary = TermDictionary::new(vec![entry(&vec![b'x'; length], 1)]).unwrap();
+            assert_eq!(
+                TermDictionary::decode_payload(&dictionary.encode_payload().unwrap()).unwrap(),
+                dictionary
+            );
+        }
+        assert!(
+            TermDictionary::new(vec![entry(
+                &vec![b'x'; super::super::model::INDEX_TERM_ROUTING_BYTES + 1],
+                1,
+            )])
+            .is_err()
+        );
     }
 }

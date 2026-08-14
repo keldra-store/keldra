@@ -89,9 +89,43 @@ impl StatisticsAccumulator {
                             ));
                         }
                         ScalarValue::Boolean(_) => &mut field.boolean_values,
-                        ScalarValue::Number(_) => &mut field.number_values,
+                        ScalarValue::Signed(_) | ScalarValue::Number(_) => {
+                            &mut field.number_values
+                        }
                         ScalarValue::Unsigned(_) => &mut field.unsigned_values,
                         ScalarValue::String(_) => &mut field.string_values,
+                    };
+                    *counter = counter.checked_add(1).ok_or(IndexError::OffsetOverflow)?;
+                }
+            }
+            for point in &record.points {
+                let index = point.field_id.get() as usize;
+                if schema.fields[index]
+                    .components
+                    .contains(FieldComponents::DOC_VALUES)
+                {
+                    continue;
+                }
+                mark_present(&mut fields, &mut seen, marker, index)?;
+                let field = &mut fields[index];
+                field.value_count = field
+                    .value_count
+                    .checked_add(
+                        u64::try_from(point.values.len())
+                            .map_err(|_| IndexError::OffsetOverflow)?,
+                    )
+                    .ok_or(IndexError::OffsetOverflow)?;
+                for value in &point.values {
+                    let counter = match value {
+                        ScalarValue::Signed(_) | ScalarValue::Number(_) => {
+                            &mut field.number_values
+                        }
+                        ScalarValue::Unsigned(_) => &mut field.unsigned_values,
+                        _ => {
+                            return Err(IndexError::InvalidDefinition(
+                                "point values must be numeric".into(),
+                            ));
+                        }
                     };
                     *counter = counter.checked_add(1).ok_or(IndexError::OffsetOverflow)?;
                 }

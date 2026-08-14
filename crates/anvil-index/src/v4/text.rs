@@ -274,12 +274,11 @@ impl SegmentStatistics {
                     || matches!(
                         component.role,
                         ComponentKind::POSTINGS
-                            | ComponentKind::FAST_COLUMN
+                            | ComponentKind::POINTS
+                            | ComponentKind::DOC_VALUES
                             | ComponentKind::POSITIONS
                             | ComponentKind::VECTORS
                     ) && component.field_id.is_none()
-                    || component.role == ComponentKind::STORED_FIELDS
-                        && component.field_id.is_some()
                     || component.leaf_count == 0
                     || component.component_count < component.leaf_count
                     || component.encoded_bytes == 0
@@ -416,8 +415,8 @@ pub(crate) fn tracks_component_statistics(role: ComponentKind) -> bool {
     matches!(
         role,
         ComponentKind::POSTINGS
-            | ComponentKind::FAST_COLUMN
-            | ComponentKind::STORED_FIELDS
+            | ComponentKind::POINTS
+            | ComponentKind::DOC_VALUES
             | ComponentKind::POSITIONS
             | ComponentKind::VECTORS
     )

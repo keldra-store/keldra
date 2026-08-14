@@ -226,6 +226,15 @@ impl NativeQueryRequest {
         }
         self.schema.validate()?;
         self.validate_query_shape()?;
+        if let Some(after) = &self.after {
+            after.result.validate()?;
+            after.source.validate()?;
+            if after.sort_values.len() != self.expected_cursor_values() {
+                return Err(IndexError::InvalidQuery(
+                    "native query cursor does not match query order".into(),
+                ));
+            }
+        }
         let Some(first) = self.segments.first().map(|segment| segment.identity) else {
             // A complete checkpoint-only generation is a valid empty index.
             return Ok(());
@@ -243,15 +252,6 @@ impl NativeQueryRequest {
             {
                 return Err(IndexError::InvalidQuery(
                     "native query segments do not belong to one generation schema".into(),
-                ));
-            }
-        }
-        if let Some(after) = &self.after {
-            after.result.validate()?;
-            after.source.validate()?;
-            if after.sort_values.len() != self.expected_cursor_values() {
-                return Err(IndexError::InvalidQuery(
-                    "native query cursor does not match query order".into(),
                 ));
             }
         }
@@ -277,6 +277,13 @@ impl NativeQueryRequest {
     }
 
     fn validate_query_shape(&self) -> Result<(), IndexError> {
+        if !matches!(self.query, NativeQuery::Filter { .. })
+            && (!self.facets.is_empty() || !self.aggregates.is_empty())
+        {
+            return Err(IndexError::InvalidQuery(
+                "facets and aggregates require a filter query".into(),
+            ));
+        }
         match &self.query {
             NativeQuery::Path {
                 prefix,

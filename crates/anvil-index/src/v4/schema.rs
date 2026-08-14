@@ -793,7 +793,6 @@ mod tests {
             })
             .collect();
         let mut components = Vec::new();
-        let mut stored = false;
         for field in &schema.fields {
             if field.components.contains(FieldComponents::TERMS) {
                 components.push(component(ComponentKind::POSTINGS, Some(field.id)));
@@ -801,16 +800,15 @@ mod tests {
                     components.push(component(ComponentKind::POSITIONS, Some(field.id)));
                 }
             }
-            if field.components.contains(FieldComponents::FAST_COLUMN) {
-                components.push(component(ComponentKind::FAST_COLUMN, Some(field.id)));
+            if field.components.contains(FieldComponents::POINTS) {
+                components.push(component(ComponentKind::POINTS, Some(field.id)));
+            }
+            if field.components.contains(FieldComponents::DOC_VALUES) {
+                components.push(component(ComponentKind::DOC_VALUES, Some(field.id)));
             }
             if field.components.contains(FieldComponents::VECTOR) {
                 components.push(component(ComponentKind::VECTORS, Some(field.id)));
             }
-            stored |= field.components.contains(FieldComponents::STORED);
-        }
-        if stored {
-            components.push(component(ComponentKind::STORED_FIELDS, None));
         }
         components.sort_by_key(|value| (value.role, value.field_id));
         SegmentStatistics::new(
@@ -827,47 +825,45 @@ mod tests {
         .unwrap()
     }
 
-    fn fields(count: usize, components: FieldComponents) -> Vec<FieldSchema> {
+    fn fields(
+        count: usize,
+        field_type: FieldType,
+        capabilities: FieldCapabilities,
+    ) -> Vec<FieldSchema> {
         (0..count)
-            .map(|ordinal| FieldSchema {
-                id: FieldId::new(u32::try_from(ordinal).unwrap()),
-                name: format!("field-{ordinal}"),
-                source_selector: format!("/field-{ordinal}"),
-                domain: ScalarDomain::STRING,
-                cardinality: Cardinality::Single,
-                allow_missing: true,
-                allow_null: false,
-                collation: Collation::BinaryUtf8,
-                components,
+            .map(|ordinal| {
+                let mut field = FieldSchema {
+                    id: FieldId::new(u32::try_from(ordinal).unwrap()),
+                    name: format!("field-{ordinal}"),
+                    source_selector: format!("/field-{ordinal}"),
+                    field_type,
+                    cardinality: Cardinality::Single,
+                    allow_missing: true,
+                    allow_null: false,
+                    collation: Collation::BinaryUtf8,
+                    capabilities,
+                    analyzer: (field_type == FieldType::Text)
+                        .then_some(Analyzer::UnicodeAlphanumericLowercase),
+                    components: FieldComponents(0),
+                };
+                field.components = field.compiled_components().unwrap();
+                field
             })
             .collect()
     }
 
-    fn admission_schema(count: usize, components: FieldComponents, ordered: bool) -> Schema {
-        let vector = components.contains(FieldComponents::VECTOR);
+    fn admission_schema(
+        count: usize,
+        field_type: FieldType,
+        capabilities: FieldCapabilities,
+        ordered: bool,
+    ) -> Schema {
         Schema {
-            kind: if vector {
-                IndexKind::Hybrid
-            } else {
-                IndexKind::TypedJson
-            },
+            kind: IndexKind::TypedJson,
             path_prefix: "/objects".into(),
             content_type_scope: Some("application/json".into()),
-            fields: fields(count, components),
-            semantics: if vector {
-                IndexSemantics::Hybrid {
-                    analyzer: Analyzer::UnicodeAlphanumericLowercase,
-                    bm25_k1: 1.2,
-                    bm25_b: 0.75,
-                    dimensions: 4,
-                    metric: VectorMetric::Cosine,
-                    normalization: VectorNormalization::L2,
-                    lexical_weight: 0.5,
-                    vector_weight: 0.5,
-                }
-            } else {
-                IndexSemantics::TypedJson
-            },
+            fields: fields(count, field_type, capabilities),
+            semantics: IndexSemantics::TypedJson,
             physical_order: ordered
                 .then_some(OrderField {
                     field_id: FieldId::new(0),
@@ -891,12 +887,15 @@ mod tests {
                 id: FieldId::new(0),
                 name: "modified".into(),
                 source_selector: "/modified".into(),
-                domain: ScalarDomain::NUMBER,
+                field_type: FieldType::SignedInteger,
                 cardinality: Cardinality::Single,
                 allow_missing: true,
                 allow_null: false,
                 collation: Collation::BinaryUtf8,
-                components: FieldComponents::TERMS.union(FieldComponents::FAST_COLUMN),
+                capabilities: FieldCapabilities::EXACT
+                    .union(FieldCapabilities::ORDER),
+                analyzer: None,
+                components: FieldComponents::POINTS.union(FieldComponents::DOC_VALUES),
             }],
             semantics: IndexSemantics::TypedJson,
             physical_order: vec![OrderField {
@@ -932,106 +931,63 @@ mod tests {
     }
 
     #[test]
-    fn statistics_admission_accepts_1702_maximal_fields_and_rejects_1703() {
-        let maximal = FieldComponents::TERMS
-            .union(FieldComponents::FAST_COLUMN)
-            .union(FieldComponents::STORED)
-            .union(FieldComponents::POSITIONS)
-            .union(FieldComponents::NORMS)
-            .union(FieldComponents::VECTOR);
-        let accepted = admission_schema(1_702, maximal, true);
-        let accepted_shape = accepted.segment_shape().unwrap();
-        assert_eq!(accepted_shape.statistics_payload_bytes, 523_984);
-        assert_eq!(
-            maximum_statistics(&accepted)
-                .encode_payload()
-                .unwrap()
-                .len(),
-            accepted_shape.statistics_payload_bytes
-        );
-        assert_eq!(accepted_shape.component_count, 10_216);
-        assert_eq!(accepted_shape.component_statistics_count, 6_809);
-        accepted.validate().unwrap();
-
-        let rejected = admission_schema(1_703, maximal, true);
-        let rejected_shape = rejected.segment_shape().unwrap();
-        assert_eq!(rejected_shape.statistics_payload_bytes, 524_287);
-        assert_eq!(
-            maximum_statistics(&rejected)
-                .encode_payload()
-                .unwrap()
-                .len(),
-            rejected_shape.statistics_payload_bytes
-        );
-        assert_eq!(
-            rejected.validate(),
-            Err(IndexError::ResourceLimit {
-                needed: 524_407,
-                limit: INDEX_COMPONENT_BYTES,
-            })
-        );
+    fn capability_selection_builds_only_required_components() {
+        let cases = [
+            (FieldType::Boolean, FieldCapabilities::EXACT, FieldComponents::TERMS),
+            (FieldType::Boolean, FieldCapabilities::FACET, FieldComponents::DOC_VALUES),
+            (FieldType::SignedInteger, FieldCapabilities::EXACT, FieldComponents::POINTS),
+            (FieldType::SignedInteger, FieldCapabilities::ORDER, FieldComponents::DOC_VALUES),
+            (FieldType::Keyword, FieldCapabilities::PREFIX, FieldComponents::TERMS),
+            (FieldType::Keyword, FieldCapabilities::FACET, FieldComponents::DOC_VALUES),
+            (
+                FieldType::Text,
+                FieldCapabilities::FULL_TEXT,
+                FieldComponents::TERMS
+                    .union(FieldComponents::POSITIONS)
+                    .union(FieldComponents::NORMS),
+            ),
+        ];
+        for (field_type, capabilities, expected) in cases {
+            let field = fields(1, field_type, capabilities).pop().unwrap();
+            assert_eq!(field.components, expected);
+        }
     }
 
     #[test]
-    fn statistics_admission_accepts_5088_bare_fields_and_rejects_5089() {
-        let accepted = admission_schema(5_088, FieldComponents::STORED, false);
-        let accepted_shape = accepted.segment_shape().unwrap();
-        assert_eq!(accepted_shape.statistics_payload_bytes, 524_142);
-        assert_eq!(
-            maximum_statistics(&accepted)
-                .encode_payload()
-                .unwrap()
-                .len(),
-            accepted_shape.statistics_payload_bytes
+    fn statistics_admission_is_exact_and_bounded() {
+        let capabilities = FieldCapabilities::EXACT
+            .union(FieldCapabilities::RANGE)
+            .union(FieldCapabilities::ORDER)
+            .union(FieldCapabilities::FACET)
+            .union(FieldCapabilities::AGGREGATE);
+        let (mut accepted, mut rejected) = (1usize, 6_000usize);
+        while accepted + 1 < rejected {
+            let midpoint = accepted + (rejected - accepted) / 2;
+            if admission_schema(midpoint, FieldType::SignedInteger, capabilities, true)
+                .validate()
+                .is_ok()
+            {
+                accepted = midpoint;
+            } else {
+                rejected = midpoint;
+            }
+        }
+        let previous = admission_schema(
+            accepted,
+            FieldType::SignedInteger,
+            capabilities,
+            true,
         );
-        accepted.validate().unwrap();
-
-        let rejected = admission_schema(5_089, FieldComponents::STORED, false);
-        let rejected_shape = rejected.segment_shape().unwrap();
-        assert_eq!(rejected_shape.statistics_payload_bytes, 524_245);
-        assert_eq!(
-            maximum_statistics(&rejected)
-                .encode_payload()
-                .unwrap()
-                .len(),
-            rejected_shape.statistics_payload_bytes
+        previous.validate().unwrap();
+        assert!(
+            admission_schema(rejected, FieldType::SignedInteger, capabilities, true)
+                .validate()
+                .is_err()
         );
         assert_eq!(
-            rejected.validate(),
-            Err(IndexError::ResourceLimit {
-                needed: 524_365,
-                limit: INDEX_COMPONENT_BYTES,
-            })
+            maximum_statistics(&previous).encode_payload().unwrap().len(),
+            previous.segment_shape().unwrap().statistics_payload_bytes
         );
-    }
-
-    #[test]
-    fn statistics_admission_weights_mixed_field_features_exactly() {
-        let maximal = FieldComponents::TERMS
-            .union(FieldComponents::FAST_COLUMN)
-            .union(FieldComponents::STORED)
-            .union(FieldComponents::POSITIONS)
-            .union(FieldComponents::NORMS)
-            .union(FieldComponents::VECTOR);
-        let mut mixed = admission_schema(1, maximal, true);
-        mixed.fields.extend(fields(1, FieldComponents::STORED));
-        mixed.fields[1].id = FieldId::new(1);
-        mixed.fields[1].name = "stored".into();
-        mixed.fields[1].source_selector = "/stored".into();
-        let mut terms = fields(1, FieldComponents::TERMS.union(FieldComponents::POSITIONS));
-        terms[0].id = FieldId::new(2);
-        terms[0].name = "terms".into();
-        terms[0].source_selector = "/terms".into();
-        mixed.fields.extend(terms);
-        let shape = mixed.segment_shape().unwrap();
-        assert_eq!(shape.statistics_payload_bytes, 8_881);
-        assert_eq!(
-            maximum_statistics(&mixed).encode_payload().unwrap().len(),
-            shape.statistics_payload_bytes
-        );
-        assert_eq!(shape.component_count, 13);
-        assert_eq!(shape.component_statistics_count, 7);
-        mixed.validate().unwrap();
     }
 
     #[test]

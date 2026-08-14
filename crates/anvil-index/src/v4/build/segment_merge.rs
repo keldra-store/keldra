@@ -9,6 +9,7 @@ mod io;
 mod locator;
 mod order;
 mod parallel;
+mod point_streams;
 mod term_streams;
 
 #[cfg(test)]
@@ -113,6 +114,7 @@ where
         executor,
         parallelism,
         progress,
+        limits.total_resident_bytes() / 8,
     )
     .await?;
     let mut term_streams = Vec::new();
@@ -121,7 +123,8 @@ where
         let counts = &mut built_doc_streams.counts[field_id.get() as usize];
         counts.unique_terms = built.counts.unique_terms;
         counts.total_term_frequency = built.counts.total_term_frequency;
-        if !field.components.contains(FieldComponents::FAST_COLUMN)
+        if !field.components.contains(FieldComponents::DOC_VALUES)
+            && !field.components.contains(FieldComponents::POINTS)
             && !field.components.contains(FieldComponents::NORMS)
             && !field.components.contains(FieldComponents::VECTOR)
         {
@@ -635,9 +638,10 @@ fn validate_component_shape(
         let postings = has(ComponentKind::POSTINGS);
         let positions = has(ComponentKind::POSITIONS);
         if terms != postings
-            || positions && !postings
-            || field.components.contains(FieldComponents::FAST_COLUMN)
-                != has(ComponentKind::FAST_COLUMN)
+            || field.components.contains(FieldComponents::POSITIONS) != positions
+            || field.components.contains(FieldComponents::POINTS) != has(ComponentKind::POINTS)
+            || field.components.contains(FieldComponents::DOC_VALUES)
+                != has(ComponentKind::DOC_VALUES)
             || field.components.contains(FieldComponents::NORMS) != has(ComponentKind::NORMS)
             || field.components.contains(FieldComponents::VECTOR) != has(ComponentKind::VECTORS)
         {

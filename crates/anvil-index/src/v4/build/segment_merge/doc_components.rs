@@ -8,7 +8,7 @@ use super::super::super::{
 use super::super::ComponentBatchSink;
 use super::super::scratch::MergeScratchFile;
 use super::super::sink::{PublishedStream, StreamingComponentPublisher};
-use super::io::{FixedScratchReader, RoutedBlockStream, optional_stream, required_stream};
+use super::io::{FixedScratchReader, RoutedBlockStream, required_stream};
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct FieldCounts {
@@ -490,10 +490,10 @@ fn decode_permutation(bytes: &[u8], input_count: usize) -> Result<(usize, u32), 
     Ok((input, old))
 }
 
-fn cell_resident_bytes(cell: &FastColumnCell) -> Result<usize, IndexError> {
+fn cell_resident_bytes(cell: &DocValueCell) -> Result<usize, IndexError> {
     cell.values
         .iter()
-        .try_fold(std::mem::size_of::<FastColumnCell>(), |bytes, value| {
+        .try_fold(std::mem::size_of::<DocValueCell>(), |bytes, value| {
             bytes
                 .checked_add(std::mem::size_of::<ScalarValue>())
                 .and_then(|bytes| {
@@ -520,16 +520,16 @@ fn dimensions(schema: &Schema) -> Result<u32, IndexError> {
 // Dense input cursors retain one checked component block and advance only in
 // old DocId order for their input segment.
 
-struct ColumnCursor<'a, D> {
+struct DocValueCursor<'a, D> {
     stream: RoutedBlockStream<'a, D>,
     field_id: FieldId,
     multi_valued: bool,
-    block: Option<FastColumnBlock>,
+    block: Option<DocValueBlock>,
     next_first: u32,
     last_requested: Option<u32>,
 }
 
-impl<'a, D: ArtifactDirectoryRead> ColumnCursor<'a, D> {
+impl<'a, D: ArtifactDirectoryRead> DocValueCursor<'a, D> {
     fn new(
         directory: &'a D,
         input: &'a SegmentDescriptor,
@@ -540,7 +540,7 @@ impl<'a, D: ArtifactDirectoryRead> ColumnCursor<'a, D> {
             stream: required_stream(
                 directory,
                 input,
-                ComponentKind::FAST_COLUMN,
+                ComponentKind::DOC_VALUES,
                 Some(field_id),
                 None,
             )?,
@@ -552,7 +552,7 @@ impl<'a, D: ArtifactDirectoryRead> ColumnCursor<'a, D> {
         })
     }
 
-    async fn get(&mut self, doc: u32) -> Result<FastColumnCell, IndexError> {
+    async fn get(&mut self, doc: u32) -> Result<DocValueCell, IndexError> {
         if self.last_requested.is_some_and(|previous| previous >= doc) {
             return Err(IndexError::InvalidFormat("non-monotonic column remap"));
         }
@@ -570,14 +570,14 @@ impl<'a, D: ArtifactDirectoryRead> ColumnCursor<'a, D> {
     async fn load(&mut self) -> Result<(), IndexError> {
         let (_, block) = self
             .stream
-            .next(FastColumnBlock::decode_payload)
+            .next(DocValueBlock::decode_payload)
             .await?
-            .ok_or(IndexError::InvalidFormat("fast-column stream ended early"))?;
+            .ok_or(IndexError::InvalidFormat("doc-value stream ended early"))?;
         if block.field_id != self.field_id
             || block.multi_valued != self.multi_valued
             || block.first_doc_id.get() != self.next_first
         {
-            return Err(IndexError::InvalidFormat("fast-column input coverage"));
+            return Err(IndexError::InvalidFormat("doc-value input coverage"));
         }
         self.next_first = self
             .next_first
@@ -594,96 +594,11 @@ impl<'a, D: ArtifactDirectoryRead> ColumnCursor<'a, D> {
         if self.next_first != total
             || self
                 .stream
-                .next(FastColumnBlock::decode_payload)
+                .next(DocValueBlock::decode_payload)
                 .await?
                 .is_some()
         {
-            return Err(IndexError::InvalidFormat("fast-column input tail"));
-        }
-        Ok(())
-    }
-}
-
-struct StoredCursor<'a, D> {
-    stream: Option<RoutedBlockStream<'a, D>>,
-    block: Option<StoredFieldsBlock>,
-    next_first: u32,
-    last_requested: Option<u32>,
-}
-
-impl<'a, D: ArtifactDirectoryRead> StoredCursor<'a, D> {
-    fn new(directory: &'a D, input: &'a SegmentDescriptor) -> Result<Self, IndexError> {
-        Ok(Self {
-            stream: optional_stream(directory, input, ComponentKind::STORED_FIELDS, None, None)?,
-            block: None,
-            next_first: 0,
-            last_requested: None,
-        })
-    }
-
-    async fn get(&mut self, doc: u32) -> Result<Option<Vec<u8>>, IndexError> {
-        if self.stream.is_none() {
-            return Ok(None);
-        }
-        if self.last_requested.is_some_and(|previous| previous >= doc) {
-            return Err(IndexError::InvalidFormat("non-monotonic stored remap"));
-        }
-        self.last_requested = Some(doc);
-        loop {
-            if let Some(block) = &self.block {
-                let end = block
-                    .first_doc_id
-                    .get()
-                    .checked_add(block.document_count() as u32)
-                    .ok_or(IndexError::OffsetOverflow)?;
-                if doc < end {
-                    return Ok(block.get(DocId::new(doc)).map(<[u8]>::to_vec));
-                }
-            }
-            self.load().await?;
-        }
-    }
-
-    async fn load(&mut self) -> Result<(), IndexError> {
-        let (_, block) = self
-            .stream
-            .as_mut()
-            .expect("present stored stream")
-            .next(StoredFieldsBlock::decode_payload)
-            .await?
-            .ok_or(IndexError::InvalidFormat("stored stream ended early"))?;
-        if block.first_doc_id.get() != self.next_first {
-            return Err(IndexError::InvalidFormat("stored input coverage"));
-        }
-        self.next_first = self
-            .next_first
-            .checked_add(block.document_count() as u32)
-            .ok_or(IndexError::OffsetOverflow)?;
-        self.block = Some(block);
-        Ok(())
-    }
-
-    async fn finish(&mut self, total: u32) -> Result<(), IndexError> {
-        let Some(stream) = self.stream.as_mut() else {
-            return Ok(());
-        };
-        while self.next_first < total {
-            let (_, block) = stream
-                .next(StoredFieldsBlock::decode_payload)
-                .await?
-                .ok_or(IndexError::InvalidFormat("stored stream ended early"))?;
-            if block.first_doc_id.get() != self.next_first {
-                return Err(IndexError::InvalidFormat("stored input coverage"));
-            }
-            self.next_first += block.document_count() as u32;
-        }
-        if self.next_first != total
-            || stream
-                .next(StoredFieldsBlock::decode_payload)
-                .await?
-                .is_some()
-        {
-            return Err(IndexError::InvalidFormat("stored input tail"));
+            return Err(IndexError::InvalidFormat("doc-value input tail"));
         }
         Ok(())
     }

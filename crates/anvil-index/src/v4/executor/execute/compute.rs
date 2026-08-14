@@ -95,6 +95,7 @@ impl ComputationState {
         &mut self,
         values: &mut SegmentValues<'_, D>,
         doc_id: DocId,
+        statistics: &NativeQueryStatisticsRecorder,
     ) -> Result<(), IndexError> {
         for facet in &mut self.facets {
             let cell = values.doc_value(facet.field_id, doc_id).await?;
@@ -103,6 +104,9 @@ impl ComputationState {
                 distinct.insert(ScalarValue::Null);
             }
             distinct.extend(cell.values);
+            statistics.facet_processed(
+                u64::try_from(distinct.len()).map_err(|_| IndexError::OffsetOverflow)?,
+            );
             for value in distinct {
                 if !facet.counts.contains_key(&value) {
                     let additional = scalar_owned_bytes(&value)?
@@ -126,6 +130,9 @@ impl ComputationState {
         }
         for aggregate in &mut self.aggregates {
             let cell = values.doc_value(aggregate.field_id, doc_id).await?;
+            statistics.aggregate_processed(
+                u64::try_from(cell.values.len()).map_err(|_| IndexError::OffsetOverflow)?,
+            );
             for value in cell.values {
                 aggregate.observe(value)?;
             }
@@ -168,11 +175,18 @@ impl ComputationState {
 impl AggregateState {
     fn observe(&mut self, value: ScalarValue) -> Result<(), IndexError> {
         self.count = self.count.checked_add(1).ok_or(IndexError::OffsetOverflow)?;
-        if self.minimum.as_ref().is_none_or(|current| value < *current) {
+        if self.operation == AggregateOperation::Minimum
+            && self.minimum.as_ref().is_none_or(|current| value < *current)
+        {
             self.minimum = Some(value.clone());
         }
-        if self.maximum.as_ref().is_none_or(|current| value > *current) {
+        if self.operation == AggregateOperation::Maximum
+            && self.maximum.as_ref().is_none_or(|current| value > *current)
+        {
             self.maximum = Some(value.clone());
+        }
+        if !matches!(self.operation, AggregateOperation::Sum | AggregateOperation::Average) {
+            return Ok(());
         }
         match value {
             ScalarValue::Signed(value) => {
@@ -249,4 +263,39 @@ fn scalar_owned_bytes(value: &ScalarValue) -> Result<usize, IndexError> {
         ScalarValue::String(value) => value.capacity(),
         _ => 0,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn aggregate(operation: AggregateOperation) -> AggregateState {
+        AggregateState {
+            field_id: FieldId::new(0),
+            operation,
+            field_type: FieldType::Float,
+            count: 0,
+            minimum: None,
+            maximum: None,
+            signed_sum: 0,
+            unsigned_sum: 0,
+            float_sum: 0.0,
+        }
+    }
+
+    #[test]
+    fn count_does_not_compute_an_irrelevant_overflowing_sum() {
+        let maximum = ScalarValue::number(f64::MAX).unwrap();
+        let mut count = aggregate(AggregateOperation::Count);
+        count.observe(maximum.clone()).unwrap();
+        count.observe(maximum.clone()).unwrap();
+        assert_eq!(
+            count.finish().unwrap().value,
+            Some(ScalarValue::Unsigned(2))
+        );
+
+        let mut sum = aggregate(AggregateOperation::Sum);
+        sum.observe(maximum.clone()).unwrap();
+        assert!(sum.observe(maximum).is_err());
+    }
 }

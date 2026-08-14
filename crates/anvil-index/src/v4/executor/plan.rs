@@ -12,8 +12,8 @@ use super::super::{
     scalar_term, text_term,
 };
 use super::posting::{
-    DocCursor, PointBounds, PointRangeStream, PostingStream, TermBounds, TermRangeStream,
-    component_root,
+    DocCursor, DocValuePresenceStream, PointBounds, PointRangeStream, PostingStream, TermBounds,
+    TermRangeStream, component_root,
 };
 
 pub(super) struct SegmentPlan<'a, D> {
@@ -341,20 +341,39 @@ fn plan_predicate<'a, D: ArtifactDirectoryRead>(
                 }
             }
             Predicate::Exists { field_id, .. } => {
-                field(
-                    schema,
-                    *field_id,
-                    FieldComponents::TERMS,
-                )?;
-                exact_term_cursor(
-                    directory,
-                    segment,
-                    *field_id,
-                    TERM_TYPE_FIELD_PRESENCE,
-                    FIELD_PRESENCE_TERM,
-                    &statistics,
-                )
-                .await?
+                let field = schema.fields.get(field_id.get() as usize).ok_or_else(|| {
+                    IndexError::InvalidQuery("unknown EXISTS field".into())
+                })?;
+                if field.components.contains(FieldComponents::TERMS) {
+                    exact_term_cursor(
+                        directory,
+                        segment,
+                        *field_id,
+                        TERM_TYPE_FIELD_PRESENCE,
+                        FIELD_PRESENCE_TERM,
+                        &statistics,
+                    )
+                    .await?
+                } else if field.components.contains(FieldComponents::POINTS) {
+                    DocCursor::PointRange(PointRangeStream::new(
+                        directory,
+                        segment,
+                        *field_id,
+                        PointBounds::presence(),
+                        statistics.clone(),
+                    )?)
+                } else if field.components.contains(FieldComponents::DOC_VALUES) {
+                    DocCursor::DocValuePresence(DocValuePresenceStream::new(
+                        directory,
+                        segment,
+                        *field_id,
+                        statistics.clone(),
+                    )?)
+                } else {
+                    return Err(IndexError::InvalidQuery(
+                        "EXISTS field has no presence-capable component".into(),
+                    ));
+                }
             }
             Predicate::FullText { field_id, text, .. }
             | Predicate::Phrase { field_id, text, .. } => {

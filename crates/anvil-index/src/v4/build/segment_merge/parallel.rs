@@ -13,15 +13,18 @@ use super::super::super::{
 use super::super::sink::{PublishedStream, combine_published_streams};
 use super::super::{ComponentBatchSink, MergeScratchSpace};
 use super::doc_components::{BuiltDocStreams, DocRange, FieldCounts, build_doc_streams};
+use super::point_streams::{BuiltPointStream, build_point_stream};
 use super::term_streams::{BuiltTermStreams, TermRange, build_term_streams, plan_term_ranges};
 
 enum RangeJob {
     Documents(DocRange),
+    Points(FieldId),
     Terms(FieldId, TermRange),
 }
 
 enum RangeResult {
     Documents(BuiltDocStreams),
+    Points(FieldId, BuiltPointStream),
     Terms(FieldId, BuiltTermStreams),
 }
 
@@ -40,6 +43,7 @@ pub(super) async fn build_parallel_components<D, S, W, E>(
     executor: E,
     parallelism: CompactionParallelism,
     progress: CompactionProgress,
+    point_sort_bytes: usize,
 ) -> Result<(BuiltDocStreams, Vec<(FieldId, BuiltTermStreams)>), IndexError>
 where
     D: ArtifactDirectoryRead + Clone + 'static,
@@ -49,12 +53,12 @@ where
 {
     let input_refs = inputs.iter().collect::<Vec<_>>();
     let needs_doc_aligned = schema.fields.iter().any(|field| {
-        field.components.contains(FieldComponents::FAST_COLUMN)
-            || field.components.contains(FieldComponents::STORED)
+        field.components.contains(FieldComponents::DOC_VALUES)
             || field.components.contains(FieldComponents::NORMS)
             || field.components.contains(FieldComponents::VECTOR)
     });
     let requested = parallelism.max_lanes();
+    let point_lane_sort_bytes = point_sort_bytes / requested.max(1);
     let mut jobs = Vec::new();
     if needs_doc_aligned {
         jobs.extend(
@@ -63,6 +67,13 @@ where
                 .map(RangeJob::Documents),
         );
     }
+    jobs.extend(
+        schema
+            .fields
+            .iter()
+            .filter(|field| field.components.contains(FieldComponents::POINTS))
+            .map(|field| RangeJob::Points(field.id)),
+    );
     for field in schema
         .fields
         .iter()
@@ -89,6 +100,7 @@ where
         for job in group {
             let job = match job {
                 RangeJob::Documents(range) => RangeJob::Documents(*range),
+                RangeJob::Points(field_id) => RangeJob::Points(*field_id),
                 RangeJob::Terms(field_id, range) => RangeJob::Terms(*field_id, range.clone()),
             };
             let directory = directory.clone();
@@ -100,6 +112,7 @@ where
             let lane_sink = sink.clone();
             let scratch = scratch.clone();
             let progress = progress.clone();
+            let lane_executor = executor.clone();
             let slot = Arc::new(Mutex::new(None));
             let output = slot.clone();
             let handle = executor.spawn_io(Box::pin(async move {
@@ -120,6 +133,20 @@ where
                         .await
                         .map(RangeResult::Documents)
                     }
+                    RangeJob::Points(field_id) => build_point_stream(
+                        &directory,
+                        lane_sink,
+                        &scratch,
+                        &schema,
+                        &input_refs,
+                        &remaps,
+                        identity,
+                        field_id,
+                        point_lane_sort_bytes,
+                        lane_executor,
+                    )
+                    .await
+                    .map(|built| RangeResult::Points(field_id, built)),
                     RangeJob::Terms(field_id, range) => build_term_streams(
                         &directory,
                         lane_sink,
@@ -197,6 +224,16 @@ async fn assemble_range_results<S: ComponentBatchSink>(
                 for (kind, field, stream) in built.streams {
                     doc_streams.entry((kind, field)).or_default().push(stream);
                 }
+            }
+            RangeResult::Points(field_id, built) => {
+                let field = &schema.fields[field_id.get() as usize];
+                if !field.components.contains(FieldComponents::DOC_VALUES) {
+                    add_one_count(&mut doc_counts[field_id.get() as usize], &built.counts)?;
+                }
+                doc_streams
+                    .entry((ComponentKind::POINTS, Some(field_id)))
+                    .or_default()
+                    .push(built.stream);
             }
             RangeResult::Terms(field_id, built) => {
                 add_one_count(term_counts.entry(field_id).or_default(), &built.counts)?;

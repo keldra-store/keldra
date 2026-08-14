@@ -45,6 +45,10 @@ pub struct NativeQueryStatistics {
     pub live_mask_rejects: u64,
     pub point_blocks_decoded: u64,
     pub doc_value_blocks_decoded: u64,
+    pub facet_documents_processed: u64,
+    pub facet_values_processed: u64,
+    pub aggregate_documents_processed: u64,
+    pub aggregate_values_processed: u64,
     pub cursor_seeks: u64,
     pub cursor_skipped_doc_ids: u64,
     pub physical_early_terminations: u64,
@@ -82,6 +86,10 @@ struct NativeQueryStatisticsInner {
     live_mask_rejects: AtomicU64,
     point_blocks_decoded: AtomicU64,
     doc_value_blocks_decoded: AtomicU64,
+    facet_documents_processed: AtomicU64,
+    facet_values_processed: AtomicU64,
+    aggregate_documents_processed: AtomicU64,
+    aggregate_values_processed: AtomicU64,
     cursor_seeks: AtomicU64,
     cursor_skipped_doc_ids: AtomicU64,
     physical_early_terminations: AtomicU64,
@@ -141,6 +149,10 @@ impl NativeQueryStatisticsRecorder {
             live_mask_rejects: load(&self.inner.live_mask_rejects),
             point_blocks_decoded: load(&self.inner.point_blocks_decoded),
             doc_value_blocks_decoded: load(&self.inner.doc_value_blocks_decoded),
+            facet_documents_processed: load(&self.inner.facet_documents_processed),
+            facet_values_processed: load(&self.inner.facet_values_processed),
+            aggregate_documents_processed: load(&self.inner.aggregate_documents_processed),
+            aggregate_values_processed: load(&self.inner.aggregate_values_processed),
             cursor_seeks: load(&self.inner.cursor_seeks),
             cursor_skipped_doc_ids: load(&self.inner.cursor_skipped_doc_ids),
             physical_early_terminations: load(&self.inner.physical_early_terminations),
@@ -258,6 +270,16 @@ impl NativeQueryStatisticsRecorder {
 
     pub(crate) fn doc_value_blocks_decoded(&self, count: u64) {
         add(&self.inner.doc_value_blocks_decoded, count);
+    }
+
+    pub(crate) fn facet_processed(&self, values: u64) {
+        add(&self.inner.facet_documents_processed, 1);
+        add(&self.inner.facet_values_processed, values);
+    }
+
+    pub(crate) fn aggregate_processed(&self, values: u64) {
+        add(&self.inner.aggregate_documents_processed, 1);
+        add(&self.inner.aggregate_values_processed, values);
     }
 
     pub(crate) fn cursor_seek(&self, skipped_doc_ids: u64) {

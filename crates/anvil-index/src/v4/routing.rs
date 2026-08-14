@@ -4,10 +4,14 @@ use super::artifact::ArtifactDescriptor;
 use super::codec::{COMPONENT_HEADER_BYTES, Decoder, Encoder};
 use super::model::{
     ComponentKind, INDEX_COMPONENT_BYTES, INDEX_ROUTING_FANOUT, INDEX_ROUTING_HEIGHT,
-    validate_routing_key,
+    INDEX_ROUTING_KEY_BYTES, validate_term_routing_key,
 };
 
 const ROUTING_CODEC_VERSION: u16 = 1;
+const INLINE_ROUTING_KEY: u8 = 0;
+const RADIX_ROUTING_KEY: u8 = 1;
+const CANONICAL_TERM_PREFIX_BYTES: usize = 5;
+const MAXIMUM_RADIX_FRAGMENTS: usize = 8;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RoutingEntry {
@@ -40,8 +44,8 @@ impl RoutingNode {
         let mut previous_max: Option<&[u8]> = None;
         let mut leaf_kind = None;
         for entry in &entries {
-            validate_routing_key(&entry.minimum_key)?;
-            validate_routing_key(&entry.maximum_key)?;
+            validate_term_routing_key(&entry.minimum_key)?;
+            validate_term_routing_key(&entry.maximum_key)?;
             entry.child.validate(index_id)?;
             if entry.element_count == 0
                 || entry.minimum_key > entry.maximum_key
@@ -96,8 +100,8 @@ impl RoutingNode {
         out.u8(self.height);
         out.usize_u32(self.entries.len())?;
         for entry in &self.entries {
-            out.bytes(&entry.minimum_key)?;
-            out.bytes(&entry.maximum_key)?;
+            encode_routing_key(&mut out, &entry.minimum_key)?;
+            encode_routing_key(&mut out, &entry.maximum_key)?;
             out.u64(entry.element_count);
             encode_artifact(&mut out, &entry.child)?;
         }
@@ -119,14 +123,104 @@ impl RoutingNode {
         let mut entries = Vec::with_capacity(count);
         for _ in 0..count {
             entries.push(RoutingEntry {
-                minimum_key: input.owned_bytes()?,
-                maximum_key: input.owned_bytes()?,
+                minimum_key: decode_routing_key(&mut input)?,
+                maximum_key: decode_routing_key(&mut input)?,
                 element_count: input.u64()?,
                 child: decode_artifact(index_id, &mut input)?,
             });
         }
         input.finish()?;
         Self::new(index_id, height, entries)
+    }
+}
+
+/// Encode one logical boundary without ever placing more than 4,096 bytes in
+/// one routing key. Long canonical terms keep their fixed FieldId/type prefix
+/// once and split the ordered value into at most eight radix fragments.
+fn encode_routing_key(out: &mut Encoder, key: &[u8]) -> Result<(), IndexError> {
+    validate_term_routing_key(key)?;
+    if key.len() <= INDEX_ROUTING_KEY_BYTES {
+        out.u8(INLINE_ROUTING_KEY);
+        out.bytes(key)?;
+        return Ok(());
+    }
+    let (prefix, value) = key
+        .split_at_checked(CANONICAL_TERM_PREFIX_BYTES)
+        .ok_or(IndexError::InvalidDefinition(
+            "long routing key has no canonical term prefix".into(),
+        ))?;
+    let fragments = value.len().div_ceil(INDEX_ROUTING_KEY_BYTES);
+    if fragments == 0 || fragments > MAXIMUM_RADIX_FRAGMENTS {
+        return Err(IndexError::ResourceLimit {
+            needed: fragments,
+            limit: MAXIMUM_RADIX_FRAGMENTS,
+        });
+    }
+    out.u8(RADIX_ROUTING_KEY);
+    out.raw(prefix);
+    out.u8(u8::try_from(fragments).map_err(|_| IndexError::OffsetOverflow)?);
+    for fragment in value.chunks(INDEX_ROUTING_KEY_BYTES) {
+        out.bytes(fragment)?;
+    }
+    Ok(())
+}
+
+fn decode_routing_key(input: &mut Decoder<'_>) -> Result<Vec<u8>, IndexError> {
+    match input.u8()? {
+        INLINE_ROUTING_KEY => {
+            let key = input.owned_bytes()?;
+            if key.len() > INDEX_ROUTING_KEY_BYTES {
+                return Err(IndexError::InvalidFormat("inline routing key length"));
+            }
+            validate_term_routing_key(&key)
+                .map_err(|_| IndexError::InvalidFormat("inline routing key"))?;
+            Ok(key)
+        }
+        RADIX_ROUTING_KEY => {
+            let prefix = input.take(CANONICAL_TERM_PREFIX_BYTES)?;
+            let fragment_count = usize::from(input.u8()?);
+            if fragment_count == 0 || fragment_count > MAXIMUM_RADIX_FRAGMENTS {
+                return Err(IndexError::InvalidFormat("routing radix fragment count"));
+            }
+            let mut fragments = Vec::with_capacity(fragment_count);
+            let mut length = CANONICAL_TERM_PREFIX_BYTES;
+            for _ in 0..fragment_count {
+                let fragment = input.bytes()?;
+                if fragment.is_empty() || fragment.len() > INDEX_ROUTING_KEY_BYTES {
+                    return Err(IndexError::InvalidFormat("routing radix fragment length"));
+                }
+                length = length
+                    .checked_add(fragment.len())
+                    .ok_or(IndexError::OffsetOverflow)?;
+                fragments.push(fragment);
+            }
+            if length <= INDEX_ROUTING_KEY_BYTES
+                || fragments[..fragments.len() - 1]
+                    .iter()
+                    .any(|fragment| fragment.len() != INDEX_ROUTING_KEY_BYTES)
+            {
+                return Err(IndexError::InvalidFormat("non-canonical routing radix"));
+            }
+            input.claim(
+                length
+                    .checked_add(
+                        fragments
+                            .len()
+                            .checked_mul(std::mem::size_of::<&[u8]>())
+                            .ok_or(IndexError::OffsetOverflow)?,
+                    )
+                    .ok_or(IndexError::OffsetOverflow)?,
+            )?;
+            let mut key = Vec::with_capacity(length);
+            key.extend_from_slice(prefix);
+            for fragment in fragments {
+                key.extend_from_slice(fragment);
+            }
+            validate_term_routing_key(&key)
+                .map_err(|_| IndexError::InvalidFormat("routing radix key"))?;
+            Ok(key)
+        }
+        _ => Err(IndexError::InvalidFormat("routing key encoding")),
     }
 }
 
@@ -250,5 +344,37 @@ mod tests {
             },
         ];
         assert!(RoutingNode::new(7, 1, overlapping).is_err());
+    }
+
+    #[test]
+    fn long_term_boundaries_use_bounded_radix_fragments_and_seek_exactly() {
+        let prefix = [0, 0, 0, 2, 5];
+        let mut first = prefix.to_vec();
+        first.extend(std::iter::repeat_n(b'a', 12_000));
+        let mut second = prefix.to_vec();
+        second.extend(std::iter::repeat_n(b'b', super::super::model::INDEX_TERM_BYTES));
+        let node = RoutingNode::new(
+            7,
+            1,
+            vec![
+                RoutingEntry {
+                    minimum_key: first.clone(),
+                    maximum_key: first.clone(),
+                    element_count: 1,
+                    child: artifact(7, ComponentKind::TERM_DICTIONARY, 1),
+                },
+                RoutingEntry {
+                    minimum_key: second.clone(),
+                    maximum_key: second.clone(),
+                    element_count: 1,
+                    child: artifact(7, ComponentKind::TERM_DICTIONARY, 2),
+                },
+            ],
+        )
+        .unwrap();
+        let encoded = node.encode_payload().unwrap();
+        let decoded = RoutingNode::decode_payload(7, &encoded).unwrap();
+        assert_eq!(decoded, node);
+        assert_eq!(decoded.child_for(&second).unwrap().minimum_key, second);
     }
 }

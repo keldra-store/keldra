@@ -14,6 +14,29 @@ use super::super::{
 
 const INDEX_ARTIFACT_PACK_COMPONENTS: usize =
     INDEX_ARTIFACT_PACK_BYTES / super::super::INDEX_COMPONENT_BYTES;
+/// Two worst-case 32,772-byte term boundaries plus one descriptor fit seven
+/// times within a 512 KiB routing component. Short-key streams retain the
+/// format-wide fanout of 32.
+const LONG_TERM_ROUTING_FANOUT: usize = 7;
+
+fn routing_fanout(logical_kind: ComponentKind) -> usize {
+    if logical_kind == ComponentKind::TERM_DICTIONARY {
+        LONG_TERM_ROUTING_FANOUT
+    } else {
+        INDEX_ROUTING_FANOUT
+    }
+}
+
+fn validate_stream_routing_key(
+    logical_kind: ComponentKind,
+    key: &[u8],
+) -> Result<(), IndexError> {
+    if logical_kind == ComponentKind::TERM_DICTIONARY {
+        super::super::model::validate_term_routing_key(key)
+    } else {
+        super::super::model::validate_routing_key(key)
+    }
+}
 
 /// One asynchronous durability boundary. Every returned descriptor names
 /// exact bytes already accepted by the sink. The format layer hands over one
@@ -650,8 +673,8 @@ impl<'a, S: ComponentBatchSink> StreamingComponentPublisher<'a, S> {
         maximum_key: &[u8],
         element_count: u64,
     ) -> Result<(), IndexError> {
-        super::super::model::validate_routing_key(minimum_key)?;
-        super::super::model::validate_routing_key(maximum_key)?;
+        validate_stream_routing_key(self.logical_kind, minimum_key)?;
+        validate_stream_routing_key(self.logical_kind, maximum_key)?;
         let previous_maximum_key = self
             .pending_leaves
             .last()
@@ -721,7 +744,7 @@ impl<'a, S: ComponentBatchSink> StreamingComponentPublisher<'a, S> {
         while self
             .levels
             .get(level)
-            .is_some_and(|nodes| nodes.len() == INDEX_ROUTING_FANOUT)
+            .is_some_and(|nodes| nodes.len() == routing_fanout(self.logical_kind))
         {
             self.publish_level(level).await?;
             level += 1;
@@ -742,7 +765,7 @@ impl<'a, S: ComponentBatchSink> StreamingComponentPublisher<'a, S> {
                 .get_mut(level)
                 .ok_or(IndexError::InvalidFormat("streaming routing level"))?,
         );
-        if children.is_empty() || children.len() > INDEX_ROUTING_FANOUT {
+        if children.is_empty() || children.len() > routing_fanout(self.logical_kind) {
             return Err(IndexError::InvalidFormat(
                 "streaming routing fanout is invalid",
             ));
@@ -913,8 +936,8 @@ pub async fn combine_published_streams<S: ComponentBatchSink>(
     streams.sort_by(|left, right| left.minimum_key.cmp(&right.minimum_key));
     let mut previous = None::<Vec<u8>>;
     for stream in &streams {
-        super::super::model::validate_routing_key(&stream.minimum_key)?;
-        super::super::model::validate_routing_key(&stream.maximum_key)?;
+        validate_stream_routing_key(logical_kind, &stream.minimum_key)?;
+        validate_stream_routing_key(logical_kind, &stream.maximum_key)?;
         stream.root.validate(identity.index_id)?;
         if stream.minimum_key > stream.maximum_key
             || stream.element_count == 0
@@ -986,8 +1009,9 @@ pub async fn combine_published_streams<S: ComponentBatchSink>(
                 limit: INDEX_ROUTING_HEIGHT as usize,
             });
         }
-        let mut parents = Vec::with_capacity(nodes.len().div_ceil(INDEX_ROUTING_FANOUT));
-        for children in nodes.chunks(INDEX_ROUTING_FANOUT) {
+        let fanout = routing_fanout(logical_kind);
+        let mut parents = Vec::with_capacity(nodes.len().div_ceil(fanout));
+        for children in nodes.chunks(fanout) {
             let node = RoutingNode::new(
                 identity.index_id,
                 height,

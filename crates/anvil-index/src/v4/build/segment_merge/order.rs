@@ -3,8 +3,8 @@ use std::cmp::Ordering;
 use crate::IndexError;
 
 use super::super::super::{
-    ArtifactDirectoryRead, Cardinality, ComponentKind, DocumentIdentity, FastColumnBlock,
-    FastColumnCell, IdentityBlock, LiveMaskBlock, ScalarValue, Schema, SegmentDescriptor,
+    ArtifactDirectoryRead, Cardinality, ComponentKind, DocValueBlock, DocValueCell,
+    DocumentIdentity, IdentityBlock, LiveMaskBlock, ScalarValue, Schema, SegmentDescriptor,
     SortValue, encode_physical_order_key,
 };
 use super::io::{RoutedBlockStream, required_stream};
@@ -64,7 +64,7 @@ impl<'a, D: ArtifactDirectoryRead> OrderedInput<'a, D> {
                     required_stream(
                         directory,
                         descriptor,
-                        ComponentKind::FAST_COLUMN,
+                        ComponentKind::DOC_VALUES,
                         Some(order.field_id),
                         None,
                     )?,
@@ -168,7 +168,7 @@ pub(super) fn compare_current(
         .then_with(|| left.old_doc_id.cmp(&right.old_doc_id))
 }
 
-fn order_value(cell: &FastColumnCell) -> Result<SortValue, IndexError> {
+fn order_value(cell: &DocValueCell) -> Result<SortValue, IndexError> {
     if !cell.present {
         return Ok(SortValue::Missing);
     }
@@ -308,7 +308,7 @@ struct ColumnCursor<'a, D> {
     stream: RoutedBlockStream<'a, D>,
     field_id: super::super::super::FieldId,
     multi_valued: bool,
-    block: Option<FastColumnBlock>,
+    block: Option<DocValueBlock>,
     offset: usize,
 }
 
@@ -327,7 +327,7 @@ impl<'a, D: ArtifactDirectoryRead> ColumnCursor<'a, D> {
         }
     }
 
-    async fn next(&mut self, expected: u32) -> Result<FastColumnCell, IndexError> {
+    async fn next(&mut self, expected: u32) -> Result<DocValueCell, IndexError> {
         if self
             .block
             .as_ref()
@@ -335,7 +335,7 @@ impl<'a, D: ArtifactDirectoryRead> ColumnCursor<'a, D> {
         {
             let (_, block) = self
                 .stream
-                .next(FastColumnBlock::decode_payload)
+                .next(DocValueBlock::decode_payload)
                 .await?
                 .ok_or(IndexError::InvalidFormat("fast-column stream ended early"))?;
             if block.field_id != self.field_id
@@ -343,7 +343,7 @@ impl<'a, D: ArtifactDirectoryRead> ColumnCursor<'a, D> {
                 || block.first_doc_id.get() != expected
             {
                 return Err(IndexError::InvalidFormat(
-                    "fast-column blocks are not dense or schema-compatible",
+                    "doc-value blocks are not dense or schema-compatible",
                 ));
             }
             self.block = Some(block);
@@ -361,12 +361,12 @@ impl<'a, D: ArtifactDirectoryRead> ColumnCursor<'a, D> {
             .is_some_and(|block| self.offset != block.cells().len())
             || self
                 .stream
-                .next(FastColumnBlock::decode_payload)
+                .next(DocValueBlock::decode_payload)
                 .await?
                 .is_some()
         {
             return Err(IndexError::InvalidFormat(
-                "fast-column stream exceeds segment document count",
+                "doc-value stream exceeds segment document count",
             ));
         }
         Ok(())

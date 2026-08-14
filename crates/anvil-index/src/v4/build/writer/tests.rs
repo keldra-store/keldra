@@ -1,9 +1,9 @@
 use super::*;
 use crate::FIXED_INDEX_SEAL_WORKSPACE_BYTES;
-use crate::v4::build::{ExactMemorySink, ProjectedColumn, ProjectedTerm, ProjectedVector};
+use crate::v4::build::{ExactMemorySink, ProjectedTerm, ProjectedVector};
 use crate::v4::{
-    Analyzer, Cardinality, Collation, ComponentVersion, FastColumnCell, FieldSchema, IndexKind,
-    ObjectIdentity, ScalarDomain, ScalarValue, VectorMetric, VectorNormalization,
+    Analyzer, Cardinality, Collation, ComponentVersion, FieldCapabilities, FieldSchema, FieldType,
+    IndexKind, ObjectIdentity, VectorMetric, VectorNormalization,
 };
 
 const TEST_TOTAL_BYTES: usize = 64 * 1024 * 1024;
@@ -13,8 +13,6 @@ fn version(component_kind: ComponentKind) -> ComponentVersion {
         component_kind,
         codec_version: if component_kind == ComponentKind::IDENTITY_TABLE {
             2
-        } else if component_kind == ComponentKind::STORED_FIELDS {
-            crate::v4::STORED_FIELDS_COMPONENT_CODEC_VERSION
         } else {
             1
         },
@@ -30,14 +28,14 @@ fn text_schema() -> Schema {
             id: FieldId::new(0),
             name: "body".into(),
             source_selector: "/body".into(),
-            domain: ScalarDomain::STRING,
+            field_type: FieldType::Text,
             cardinality: Cardinality::Single,
             allow_missing: true,
             allow_null: false,
             collation: Collation::BinaryUtf8,
+            capabilities: FieldCapabilities::FULL_TEXT,
+            analyzer: Some(Analyzer::UnicodeAlphanumericLowercase),
             components: FieldComponents::TERMS
-                .union(FieldComponents::FAST_COLUMN)
-                .union(FieldComponents::STORED)
                 .union(FieldComponents::POSITIONS)
                 .union(FieldComponents::NORMS),
         }],
@@ -54,8 +52,6 @@ fn text_schema() -> Schema {
             version(ComponentKind::PATH_LOCATOR),
             version(ComponentKind::TERM_DICTIONARY),
             version(ComponentKind::POSTINGS),
-            version(ComponentKind::FAST_COLUMN),
-            version(ComponentKind::STORED_FIELDS),
             version(ComponentKind::POSITIONS),
             version(ComponentKind::NORMS),
             version(ComponentKind::SCORING_STATISTICS),
@@ -83,7 +79,7 @@ fn source(path: String, records: Vec<ProjectedRecord>) -> ProjectedSource {
     }
 }
 
-fn text_record(order: &str, term: String, stored_bytes: usize) -> ProjectedRecord {
+fn text_record(order: &str, term: String) -> ProjectedRecord {
     ProjectedRecord {
         result_identity: None,
         order_key: order.as_bytes().to_vec(),
@@ -94,12 +90,8 @@ fn text_record(order: &str, term: String, stored_bytes: usize) -> ProjectedRecor
             frequency: 1,
             positions: vec![1],
         }],
-        columns: vec![ProjectedColumn {
-            field_id: FieldId::new(0),
-            multi_valued: false,
-            cell: FastColumnCell::value(ScalarValue::String(term)),
-        }],
-        stored_fields: Some(vec![7; stored_bytes]),
+        points: Vec::new(),
+        doc_values: Vec::new(),
         vectors: Vec::new(),
         field_lengths: vec![(FieldId::new(0), 1)],
     }
@@ -112,11 +104,11 @@ async fn build_is_deterministic_with_source_identity_retained_once() {
     let left = source(
         long_path,
         vec![
-            text_record("b", "fixed".into(), 8),
-            text_record("a", "active".into(), 8),
+            text_record("b", "fixed".into()),
+            text_record("a", "active".into()),
         ],
     );
-    let right = source("short".into(), vec![text_record("c", "pending".into(), 8)]);
+    let right = source("short".into(), vec![text_record("c", "pending".into())]);
     let build = |ordered: Vec<ProjectedSource>| {
         let schema = schema.clone();
         async move {
@@ -149,7 +141,9 @@ fn source_admission_charges_flat_document_and_term_references_before_allocation(
         source(
             path.into(),
             (0..64)
-                .map(|ordinal| text_record(&format!("{ordinal:04}"), "x".into(), 4096))
+                .map(|ordinal| {
+                    text_record(&format!("{ordinal:04}"), format!("{ordinal:04}-{}", "x".repeat(4096)))
+                })
                 .collect(),
         )
     };
@@ -171,17 +165,23 @@ fn statistics_limit_is_enforced_before_writer_buffers_are_allocated() {
     schema.kind = IndexKind::TypedJson;
     schema.semantics = IndexSemantics::TypedJson;
     schema.physical_order.clear();
-    schema.fields = (0..5_089)
+    schema.fields = (0..6_000)
         .map(|ordinal| FieldSchema {
             id: FieldId::new(ordinal),
             name: format!("field-{ordinal}"),
             source_selector: format!("/field-{ordinal}"),
-            domain: ScalarDomain::STRING,
+            field_type: FieldType::SignedInteger,
             cardinality: Cardinality::Single,
             allow_missing: true,
             allow_null: false,
             collation: Collation::BinaryUtf8,
-            components: FieldComponents::STORED,
+            capabilities: FieldCapabilities::EXACT
+                .union(FieldCapabilities::RANGE)
+                .union(FieldCapabilities::ORDER)
+                .union(FieldCapabilities::FACET)
+                .union(FieldCapabilities::AGGREGATE),
+            analyzer: None,
+            components: FieldComponents::POINTS.union(FieldComponents::DOC_VALUES),
         })
         .collect();
     // The oversized schema cannot produce its own fingerprint by design. A
@@ -192,13 +192,11 @@ fn statistics_limit_is_enforced_before_writer_buffers_are_allocated() {
         Ok(_) => panic!("oversized statistics schema must fail writer construction"),
         Err(error) => error,
     };
-    assert_eq!(
+    assert!(matches!(
         error,
-        IndexError::ResourceLimit {
-            needed: 524_365,
-            limit: crate::v4::INDEX_COMPONENT_BYTES,
-        }
-    );
+        IndexError::ResourceLimit { needed, limit }
+            if needed > limit && limit == crate::v4::INDEX_COMPONENT_BYTES
+    ));
 }
 
 #[test]
@@ -233,7 +231,7 @@ fn source_path_index_uses_owned_sources_and_rejects_duplicates() {
         writer
             .push_source(source(
                 "z/path".into(),
-                vec![text_record("z", "z".into(), 0)]
+                vec![text_record("z", "z".into())]
             ))
             .unwrap(),
         SourcePush::Accepted
@@ -242,7 +240,7 @@ fn source_path_index_uses_owned_sources_and_rejects_duplicates() {
         writer
             .push_source(source(
                 "a/path".into(),
-                vec![text_record("a", "a".into(), 0)]
+                vec![text_record("a", "a".into())]
             ))
             .unwrap(),
         SourcePush::Accepted
@@ -254,7 +252,7 @@ fn source_path_index_uses_owned_sources_and_rejects_duplicates() {
         writer
             .push_source(source(
                 "a/path".into(),
-                vec![text_record("duplicate", "duplicate".into(), 0)]
+                vec![text_record("duplicate", "duplicate".into())]
             ))
             .is_err()
     );
@@ -265,11 +263,12 @@ async fn high_cardinality_positions_and_large_values_seal_in_bounded_blocks() {
     let schema = text_schema();
     let records = (0..2048)
         .map(|ordinal| {
-            let mut record =
-                text_record(&format!("{ordinal:08}"), format!("term-{ordinal:08}"), 4096);
+            let mut record = text_record(
+                &format!("{ordinal:08}"),
+                format!("term-{ordinal:08}-{}", "v".repeat(4096)),
+            );
             record.terms[0].frequency = 16;
             record.terms[0].positions = (0..16).collect();
-            record.columns[0].cell = FastColumnCell::value(ScalarValue::String("v".repeat(4096)));
             record
         })
         .collect();
@@ -299,6 +298,9 @@ async fn high_dimension_vectors_stream_one_component_block_at_a_time() {
         metric: VectorMetric::Cosine,
         normalization: VectorNormalization::L2,
     };
+    schema.fields[0].field_type = FieldType::Vector;
+    schema.fields[0].capabilities = FieldCapabilities::empty();
+    schema.fields[0].analyzer = None;
     schema.fields[0].components = FieldComponents::VECTOR;
     schema.component_versions = vec![
         version(ComponentKind::ROUTING_NODE),
@@ -313,8 +315,8 @@ async fn high_dimension_vectors_stream_one_component_block_at_a_time() {
             result_identity: None,
             order_key: format!("{ordinal:08}").into_bytes(),
             terms: Vec::new(),
-            columns: Vec::new(),
-            stored_fields: None,
+            points: Vec::new(),
+            doc_values: Vec::new(),
             vectors: vec![ProjectedVector {
                 field_id: FieldId::new(0),
                 values: vec![1.0 / 32.0; 1024],
