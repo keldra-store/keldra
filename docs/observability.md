@@ -147,7 +147,7 @@ separately. Typed JSON computations add
 `anvil_index_query_facet_computation_results_total`,
 `anvil_index_query_facet_documents_processed_total`,
 `anvil_index_query_facet_values_processed_total`, and the corresponding four
-`aggregate` counters. These are counters or numeric histograms split only by
+`aggregate` counters. These are cumulative counters split only by
 index kind; document, index, tenant, and bucket identifiers remain trace fields.
 `anvil_index_query_returned_hits` is emitted only for a completed response
 page. A failed, timed-out, or otherwise cancelled query has no returned page,

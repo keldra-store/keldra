@@ -20,6 +20,7 @@ format-4 generation from its declared source scope.
 | Vector search | Vector generations use exact search; an approximate-nearest-neighbour graph remains future work. |
 | Query placement | One weighted-HRW owner executes a query against locally materialized or demand-fetched segment bytes. Anvil does not scatter one query across nodes. |
 | Query resources | Query admission and working memory are shared process resources. A request that cannot obtain its bounded workspace within its deadline fails without weakening result correctness or publication state. |
+| Facets and aggregates | A Typed JSON query with facet or aggregate requests performs a second authorized pass over every matching document after selecting the result page. Memory remains bounded by the shared query budget and results remain exact, but computation time is proportional to the complete authorized match set rather than the page limit. Selective predicates reduce this work. |
 | Index compatibility | Format 4 is a clean storage boundary. Rollback to a format-3 binary requires a separate old volume, not mixed readers or compatibility shims. |
 
 These boundaries do not weaken Zanzibar authorization, source-complete

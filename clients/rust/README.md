@@ -92,7 +92,9 @@ The concrete builders are `BooleanField`, `SignedIntegerField`,
 available methods mirror Anvil's native capabilities: exact matching, keyword
 prefix and range matching, numeric ranges, ordering, facets, numeric
 aggregates, and analyzed full-text search. A field emits only the index
-components required by the methods selected on its builder.
+components required by the methods selected on its builder. Multi-valued
+keyword and numeric fields retain source multiplicity for aggregate operations,
+while one document contributes at most once to each distinct facet bucket.
 
 ## Upload with compare-and-swap
 
