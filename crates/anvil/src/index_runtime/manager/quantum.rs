@@ -13,6 +13,7 @@ pub(super) enum SourceWorkBoundary {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SourceWorkQuantum {
     pub(super) limit: u64,
+    maximum_frame_bytes: u64,
     consumed: u64,
 }
 
@@ -26,6 +27,18 @@ impl SourceWorkQuantum {
     pub(super) const fn from_wire_limit(wire_limit: u64) -> Self {
         Self {
             limit: wire_limit,
+            maximum_frame_bytes: wire_limit,
+            consumed: 0,
+        }
+    }
+
+    /// A rebuild may consume several independently bounded snapshot frames in
+    /// one fair turn. Only one frame is resident at a time; cumulative work is
+    /// charged against the full kind budget.
+    pub(super) const fn for_rebuild_turn(budget_limit: u64, maximum_frame_bytes: u64) -> Self {
+        Self {
+            limit: budget_limit,
+            maximum_frame_bytes,
             consumed: 0,
         }
     }
@@ -58,7 +71,7 @@ impl SourceWorkQuantum {
     /// plus one bounded frame is strictly below two quanta (32 MiB at the
     /// default maximum).
     pub(super) fn advance_frame(&mut self, bytes: u64) -> Result<SourceWorkBoundary, Status> {
-        if bytes > self.limit {
+        if bytes > self.maximum_frame_bytes {
             return Err(Status::data_loss(
                 "index snapshot frame exceeded its configured wire limit",
             ));
@@ -153,8 +166,8 @@ mod tests {
 
     #[test]
     fn snapshot_uses_its_already_derived_wire_limit() {
-        const SNAPSHOT_SHARE_BYTES: u64 = 89_478_485;
-        const DERIVED_WIRE_LIMIT: u64 = 3_492_287;
+        const SNAPSHOT_SHARE_BYTES: u64 = 46_487_252;
+        const DERIVED_WIRE_LIMIT: u64 = 10_660_458;
         const OBSERVED_VALID_FRAME_BYTES: u64 = 3_491_999;
 
         assert_eq!(source_wire_limit(SNAPSHOT_SHARE_BYTES), DERIVED_WIRE_LIMIT);
@@ -174,6 +187,30 @@ mod tests {
 
         let error = SourceWorkQuantum::from_wire_limit(DERIVED_WIRE_LIMIT)
             .advance_frame(DERIVED_WIRE_LIMIT + 1)
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::DataLoss);
+    }
+
+    #[test]
+    fn rebuild_turn_coalesces_several_bounded_frames_under_one_kind_budget() {
+        let mut quantum = SourceWorkQuantum::for_rebuild_turn(KIND_BUDGET, MAX_SOURCE_WIRE_BYTES);
+        for _ in 0..15 {
+            assert_eq!(
+                quantum.advance_frame(MAX_SOURCE_WIRE_BYTES).unwrap(),
+                SourceWorkBoundary::Continue
+            );
+        }
+        assert_eq!(
+            quantum.advance_frame(MAX_SOURCE_WIRE_BYTES).unwrap(),
+            SourceWorkBoundary::SealAndYield
+        );
+        assert_eq!(quantum.consumed, KIND_BUDGET);
+    }
+
+    #[test]
+    fn rebuild_turn_still_rejects_one_frame_above_the_scanner_bound() {
+        let error = SourceWorkQuantum::for_rebuild_turn(KIND_BUDGET, MAX_SOURCE_WIRE_BYTES)
+            .advance_frame(MAX_SOURCE_WIRE_BYTES + 1)
             .unwrap_err();
         assert_eq!(error.code(), tonic::Code::DataLoss);
     }

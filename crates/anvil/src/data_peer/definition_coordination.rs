@@ -1,9 +1,10 @@
 use anvil_consensus::PeerRpcKind;
 use anvil_store::{
     DefinitionAssignment, DefinitionAssignmentCursor, DefinitionAssignmentMutation,
-    DefinitionCheckpoint, DefinitionConsumerKind, DefinitionKind, DefinitionLocatorCursor,
-    DefinitionStateError, JournalRoute, MAX_DEFINITION_STATE_SCAN_RECORDS, PlacementLogId,
-    RoutedJournalError, SourceId, VersionId,
+    DefinitionCheckpoint, DefinitionConsumerKind, DefinitionDeletion, DefinitionKind,
+    DefinitionLocator, DefinitionLocatorCursor, DefinitionOperation, DefinitionStateError,
+    JournalRoute, MAX_DEFINITION_STATE_SCAN_RECORDS, PlacementLogId, RoutedJournalError, SourceId,
+    VersionId,
 };
 use tonic::{Request, Response, Status};
 
@@ -331,18 +332,7 @@ pub(super) async fn scan_definition_locators_by_bucket(
     let has_more = page.next_cursor.is_some();
     Ok(Response::new(wire::DefinitionLocatorScanPage {
         schema_version: DATA_PEER_SCHEMA_VERSION,
-        locators: page
-            .locators
-            .into_iter()
-            .map(|locator| wire::DefinitionLocatorRecord {
-                kind: encode_kind(locator.kind) as i32,
-                tenant_id: locator.tenant_id,
-                bucket_id: locator.bucket_id,
-                definition_id: locator.definition_id,
-                definition_path: locator.path,
-                object_version: locator.object_version.0,
-            })
-            .collect(),
+        locators: page.locators.into_iter().map(encode_locator).collect(),
         next_cursor: page
             .next_cursor
             .map_or_else(Vec::new, |cursor| cursor.as_bytes().to_vec()),
@@ -432,22 +422,27 @@ fn encode_locator_page(
     let has_more = page.next_cursor.is_some();
     wire::DefinitionLocatorScanPage {
         schema_version: DATA_PEER_SCHEMA_VERSION,
-        locators: page
-            .locators
-            .into_iter()
-            .map(|locator| wire::DefinitionLocatorRecord {
-                kind: encode_kind(locator.kind) as i32,
-                tenant_id: locator.tenant_id,
-                bucket_id: locator.bucket_id,
-                definition_id: locator.definition_id,
-                definition_path: locator.path,
-                object_version: locator.object_version.0,
-            })
-            .collect(),
+        locators: page.locators.into_iter().map(encode_locator).collect(),
         next_cursor: page
             .next_cursor
             .map_or_else(Vec::new, |cursor| cursor.as_bytes().to_vec()),
         has_more,
+    }
+}
+
+fn encode_locator(locator: DefinitionLocator) -> wire::DefinitionLocatorRecord {
+    let state = match locator.operation {
+        DefinitionOperation::Upsert => wire::PrivateDefinitionObjectState::Live,
+        DefinitionOperation::Delete => wire::PrivateDefinitionObjectState::Deleted,
+    };
+    wire::DefinitionLocatorRecord {
+        kind: encode_kind(locator.kind) as i32,
+        tenant_id: locator.tenant_id,
+        bucket_id: locator.bucket_id,
+        definition_id: locator.definition_id,
+        definition_path: locator.path,
+        object_version: locator.object_version.0,
+        state: state as i32,
     }
 }
 
@@ -551,14 +546,32 @@ fn decode_assignment_mutation(
                 rank,
             })
         }
-        Ok(wire::DefinitionAssignmentOperation::Remove) => DefinitionAssignmentMutation::Remove {
-            kind,
-            tenant_id: value.tenant_id,
-            bucket_id: value.bucket_id,
-            definition_id: value.definition_id,
-            object_version: VersionId(value.object_version),
-            observed_fence: fence,
-        },
+        Ok(wire::DefinitionAssignmentOperation::Delete) => {
+            let rank = u8::try_from(value.rank)
+                .map_err(|_| Status::invalid_argument("definition deletion rank is invalid"))?;
+            DefinitionAssignmentMutation::Delete(DefinitionDeletion {
+                kind,
+                tenant_id: value.tenant_id,
+                bucket_id: value.bucket_id,
+                definition_id: value.definition_id,
+                definition_path: value.definition_path.clone(),
+                object_version: VersionId(value.object_version),
+                observed_fence: fence,
+                rank,
+            })
+        }
+        Ok(wire::DefinitionAssignmentOperation::Remove)
+            if value.definition_path.is_empty() && value.rank == 0 =>
+        {
+            DefinitionAssignmentMutation::Remove {
+                kind,
+                tenant_id: value.tenant_id,
+                bucket_id: value.bucket_id,
+                definition_id: value.definition_id,
+                object_version: VersionId(value.object_version),
+                observed_fence: fence,
+            }
+        }
         _ => {
             return Err(Status::invalid_argument(
                 "definition assignment operation is invalid",

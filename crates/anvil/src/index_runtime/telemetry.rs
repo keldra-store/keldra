@@ -15,113 +15,95 @@ pub(crate) const PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30)
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct CompactionDebtSnapshot {
-    levels: u64,
-    runs: u64,
+    tiers: u64,
+    segments: u64,
     bytes: u64,
-    oldest_created_at_unix_millis: u64,
 }
 
 fn compaction_debt(
-    runs: &[super::generation::ManifestRun],
-    maximum_runs_per_level: usize,
-    maximum_uncompacted_bytes_per_level: u64,
-) -> (CompactionDebtSnapshot, BTreeMap<u8, CompactionLevelDebt>) {
-    let mut levels = BTreeMap::<u8, CompactionLevelDebt>::new();
-    for run in runs {
-        let level = levels.entry(run.level).or_default();
-        level.runs = level.runs.saturating_add(1);
-        level.bytes = level.bytes.saturating_add(run.authoritative_bytes);
-        level.oldest_created_at_unix_millis = if level.oldest_created_at_unix_millis == 0 {
-            run.created_at_unix_millis
-        } else {
-            level
-                .oldest_created_at_unix_millis
-                .min(run.created_at_unix_millis)
-        };
+    segments: &[anvil_index::v4::SegmentDescriptor],
+    maximum_segments_per_tier: usize,
+    maximum_unmerged_bytes_per_tier: u64,
+) -> (CompactionDebtSnapshot, BTreeMap<u8, CompactionTierDebt>) {
+    compaction_debt_summaries(
+        segments.iter().map(|segment| {
+            (
+                segment.encoded_bytes.max(1).ilog2() as u8,
+                segment.encoded_bytes,
+            )
+        }),
+        maximum_segments_per_tier,
+        maximum_unmerged_bytes_per_tier,
+    )
+}
+
+fn compaction_debt_summaries(
+    segments: impl IntoIterator<Item = (u8, u64)>,
+    maximum_segments_per_tier: usize,
+    maximum_unmerged_bytes_per_tier: u64,
+) -> (CompactionDebtSnapshot, BTreeMap<u8, CompactionTierDebt>) {
+    let mut tiers = BTreeMap::<u8, CompactionTierDebt>::new();
+    for (tier, encoded_bytes) in segments {
+        let tier = tiers.entry(tier).or_default();
+        tier.segments = tier.segments.saturating_add(1);
+        tier.bytes = tier.bytes.saturating_add(encoded_bytes);
     }
-    let debt = levels
+    let debt = tiers
         .values()
-        .filter(|level| {
-            level.runs > maximum_runs_per_level as u64
-                || level.bytes > maximum_uncompacted_bytes_per_level
+        .filter(|tier| {
+            tier.segments > maximum_segments_per_tier as u64
+                || tier.bytes > maximum_unmerged_bytes_per_tier
         })
-        .fold(CompactionDebtSnapshot::default(), |mut debt, level| {
-            debt.levels = debt.levels.saturating_add(1);
-            debt.runs = debt.runs.saturating_add(level.runs);
-            debt.bytes = debt.bytes.saturating_add(level.bytes);
-            debt.oldest_created_at_unix_millis = if debt.oldest_created_at_unix_millis == 0 {
-                level.oldest_created_at_unix_millis
-            } else {
-                debt.oldest_created_at_unix_millis
-                    .min(level.oldest_created_at_unix_millis)
-            };
+        .fold(CompactionDebtSnapshot::default(), |mut debt, tier| {
+            debt.tiers = debt.tiers.saturating_add(1);
+            debt.segments = debt.segments.saturating_add(tier.segments);
+            debt.bytes = debt.bytes.saturating_add(tier.bytes);
             debt
         });
-    (debt, levels)
+    (debt, tiers)
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct CompactionLevelDebt {
-    runs: u64,
+struct CompactionTierDebt {
+    segments: u64,
     bytes: u64,
-    oldest_created_at_unix_millis: u64,
 }
 
 pub(crate) fn emit_compaction_debt(
     kind: IndexKind,
-    runs: &[super::generation::ManifestRun],
-    maximum_runs_per_level: usize,
-    maximum_uncompacted_bytes_per_level: u64,
+    segments: &[anvil_index::v4::SegmentDescriptor],
+    maximum_segments_per_tier: usize,
+    maximum_unmerged_bytes_per_tier: u64,
     trigger: &'static str,
 ) {
-    let (debt, levels) = compaction_debt(
-        runs,
-        maximum_runs_per_level,
-        maximum_uncompacted_bytes_per_level,
+    let (debt, tiers) = compaction_debt(
+        segments,
+        maximum_segments_per_tier,
+        maximum_unmerged_bytes_per_tier,
     );
-    let now_millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0_u64, |duration| {
-            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-        });
-    let oldest_age_seconds = debt_age_seconds(now_millis, debt.oldest_created_at_unix_millis);
     tracing::info!(
         index.kind = ?kind,
         compaction.trigger = trigger,
-        gauge.anvil_index_compaction_debt_levels = debt.levels,
-        gauge.anvil_index_compaction_debt_runs = debt.runs,
+        gauge.anvil_index_compaction_debt_tiers = debt.tiers,
+        gauge.anvil_index_compaction_debt_segments = debt.segments,
         gauge.anvil_index_compaction_debt_bytes = debt.bytes,
-        gauge.anvil_index_compaction_debt_run_limit = maximum_runs_per_level as u64,
-        gauge.anvil_index_compaction_debt_byte_limit = maximum_uncompacted_bytes_per_level,
-        gauge.anvil_index_compaction_oldest_debt_age_seconds = oldest_age_seconds,
+        gauge.anvil_index_compaction_debt_segment_limit = maximum_segments_per_tier as u64,
+        gauge.anvil_index_compaction_debt_byte_limit = maximum_unmerged_bytes_per_tier,
         "index compaction debt observed"
     );
-    for (level, current) in levels {
-        let over_limit = current.runs > maximum_runs_per_level as u64
-            || current.bytes > maximum_uncompacted_bytes_per_level;
+    for (tier, current) in tiers {
+        let over_limit = current.segments > maximum_segments_per_tier as u64
+            || current.bytes > maximum_unmerged_bytes_per_tier;
         tracing::info!(
             index.kind = ?kind,
-            index.level = level,
+            index.tier = tier,
             compaction.trigger = trigger,
-            gauge.anvil_index_compaction_level_debt_runs =
-                if over_limit { current.runs } else { 0 },
-            gauge.anvil_index_compaction_level_debt_bytes =
+            gauge.anvil_index_compaction_tier_debt_segments =
+                if over_limit { current.segments } else { 0 },
+            gauge.anvil_index_compaction_tier_debt_bytes =
                 if over_limit { current.bytes } else { 0 },
-            gauge.anvil_index_compaction_level_oldest_debt_age_seconds = if over_limit {
-                debt_age_seconds(now_millis, current.oldest_created_at_unix_millis)
-            } else {
-                0.0
-            },
-            "index compaction level debt observed"
+            "index compaction tier debt observed"
         );
-    }
-}
-
-fn debt_age_seconds(now_millis: u64, created_at_unix_millis: u64) -> f64 {
-    if created_at_unix_millis == 0 {
-        0.0
-    } else {
-        now_millis.saturating_sub(created_at_unix_millis) as f64 / 1_000.0
     }
 }
 
@@ -235,7 +217,7 @@ impl BuilderProgress {
                 BuilderProgressPhase::CatchUp => tracing::info!(
                     index.kind = ?identity.kind,
                     counter.anvil_index_catch_up_active = 1_i64,
-                    monotonic_counter.anvil_index_catch_up_runs_total = 1_u64,
+                    monotonic_counter.anvil_index_catch_up_turns_total = 1_u64,
                     gauge.anvil_index_catch_up_elapsed_seconds = 0_f64,
                     gauge.anvil_index_catch_up_last_progress_age_seconds = 0_f64,
                     "index catch-up admitted"
@@ -453,26 +435,28 @@ impl Drop for BuilderProgress {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CompactionInputTotals {
-    pub(crate) runs: u64,
-    pub(crate) records: u64,
+    pub(crate) segments: u64,
+    pub(crate) documents: u64,
     pub(crate) bytes: u64,
 }
 
 impl CompactionInputTotals {
-    pub(crate) fn from_runs(runs: &[super::generation::ManifestRun]) -> Result<Self, IndexError> {
-        let mut records = 0_u64;
+    pub(crate) fn from_segments(
+        segments: &[anvil_index::v4::SegmentDescriptor],
+    ) -> Result<Self, IndexError> {
+        let mut documents = 0_u64;
         let mut bytes = 0_u64;
-        for run in runs {
-            records = records
-                .checked_add(run.mutation_count)
+        for segment in segments {
+            documents = documents
+                .checked_add(u64::from(segment.document_count))
                 .ok_or(IndexError::OffsetOverflow)?;
             bytes = bytes
-                .checked_add(run.authoritative_bytes)
+                .checked_add(segment.encoded_bytes)
                 .ok_or(IndexError::OffsetOverflow)?;
         }
         Ok(Self {
-            runs: u64::try_from(runs.len()).map_err(|_| IndexError::OffsetOverflow)?,
-            records,
+            segments: u64::try_from(segments.len()).map_err(|_| IndexError::OffsetOverflow)?,
+            documents,
             bytes,
         })
     }
@@ -509,8 +493,8 @@ impl CompactionTelemetry {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn start(
         identity: IndexTelemetryIdentity,
-        input_level: u8,
-        output_level: u8,
+        input_tier: u8,
+        output_tier: u8,
         input: CompactionInputTotals,
         parallelism: CompactionParallelism,
         leased_bytes: u64,
@@ -524,12 +508,10 @@ impl CompactionTelemetry {
             tenant.id = identity.tenant_id,
             bucket.id = identity.bucket_id,
             index.kind = ?identity.kind,
-            compaction.input_level = input_level,
-            compaction.output_level = output_level,
-            compaction.input_runs = input.runs,
-            compaction.selected_input_mutations = input.records,
-            // Compatibility alias retained for 0.8.x trace consumers.
-            compaction.input_records = input.records,
+            compaction.input_tier = input_tier,
+            compaction.output_tier = output_tier,
+            compaction.input_segments = input.segments,
+            compaction.input_documents = input.documents,
             compaction.input_bytes = input.bytes,
             compaction.configured_lanes = parallelism.configured_lanes(),
             compaction.effective_lanes = tracing::field::Empty,
@@ -539,13 +521,9 @@ impl CompactionTelemetry {
             compaction.ranges_completed = tracing::field::Empty,
             compaction.peak_active_lanes = tracing::field::Empty,
             compaction.input_component_rows = tracing::field::Empty,
-            // Compatibility alias retained for 0.8.x trace consumers.
-            compaction.actual_input_records = tracing::field::Empty,
             compaction.actual_input_bytes = tracing::field::Empty,
             compaction.input_blocks = tracing::field::Empty,
             compaction.output_component_rows = tracing::field::Empty,
-            // Compatibility alias retained for 0.8.x trace consumers.
-            compaction.output_records = tracing::field::Empty,
             compaction.output_bytes = tracing::field::Empty,
             compaction.output_blocks = tracing::field::Empty,
             compaction.sort_chunks = tracing::field::Empty,
@@ -588,12 +566,10 @@ impl CompactionTelemetry {
                     parallelism.incremental_lane_workspace_bytes() as u64,
                 gauge.anvil_index_compaction_admitted_workspace_bytes = admitted_bytes,
                 gauge.anvil_index_compaction_leased_bytes = leased_bytes,
-                gauge.anvil_index_compaction_input_level = u64::from(input_level),
-                gauge.anvil_index_compaction_output_level = u64::from(output_level),
-                gauge.anvil_index_compaction_selected_input_runs = input.runs,
-                gauge.anvil_index_compaction_selected_input_mutations = input.records,
-                // Compatibility alias retained for existing dashboards.
-                gauge.anvil_index_compaction_selected_input_records = input.records,
+                gauge.anvil_index_compaction_input_tier = u64::from(input_tier),
+                gauge.anvil_index_compaction_output_tier = u64::from(output_tier),
+                gauge.anvil_index_compaction_selected_input_segments = input.segments,
+                gauge.anvil_index_compaction_selected_input_documents = input.documents,
                 gauge.anvil_index_compaction_selected_input_bytes = input.bytes,
                 gauge.anvil_index_compaction_elapsed_seconds = 0_f64,
                 gauge.anvil_index_compaction_last_progress_age_seconds = 0_f64,
@@ -657,19 +633,18 @@ impl CompactionTelemetry {
                     ranges.total = emission.snapshot.ranges_total,
                     ranges.completed = emission.snapshot.ranges_completed,
                     input.component_rows = emission.snapshot.input_records,
-                    // Compatibility alias retained for structured-log consumers.
-                    input.records = emission.snapshot.input_records,
                     input.bytes = emission.snapshot.input_bytes,
                     input.blocks = emission.snapshot.input_blocks,
                     output.component_rows = emission.snapshot.output_records,
-                    // Compatibility alias retained for structured-log consumers.
-                    output.records = emission.snapshot.output_records,
                     output.bytes = emission.snapshot.output_bytes,
                     output.blocks = emission.snapshot.output_blocks,
                     elapsed.seconds = emission.elapsed_seconds,
                     failed,
-                    "index compaction finished"
+                    "format-v4 index segment compaction finished"
                 );
+                if !failed {
+                    tracing::info!("format-v4 index segments compacted");
+                }
             });
         } else {
             self.emit_terminal(emission, failed);
@@ -710,20 +685,12 @@ impl CompactionTelemetry {
             emission.snapshot.input_records,
         );
         span.record(
-            "compaction.actual_input_records",
-            emission.snapshot.input_records,
-        );
-        span.record(
             "compaction.actual_input_bytes",
             emission.snapshot.input_bytes,
         );
         span.record("compaction.input_blocks", emission.snapshot.input_blocks);
         span.record(
             "compaction.output_component_rows",
-            emission.snapshot.output_records,
-        );
-        span.record(
-            "compaction.output_records",
             emission.snapshot.output_records,
         );
         span.record("compaction.output_bytes", emission.snapshot.output_bytes);
@@ -759,17 +726,11 @@ impl CompactionTelemetry {
                     emission.delta.ranges_completed,
                 monotonic_counter.anvil_index_compaction_input_component_rows_total =
                     emission.delta.input_records,
-                // Compatibility alias retained for existing dashboards.
-                monotonic_counter.anvil_index_compaction_input_records_total =
-                    emission.delta.input_records,
                 monotonic_counter.anvil_index_compaction_input_read_bytes_total =
                     emission.delta.input_bytes,
                 monotonic_counter.anvil_index_compaction_input_blocks_total =
                     emission.delta.input_blocks,
                 monotonic_counter.anvil_index_compaction_output_component_rows_total =
-                    emission.delta.output_records,
-                // Compatibility alias retained for existing dashboards.
-                monotonic_counter.anvil_index_compaction_output_records_total =
                     emission.delta.output_records,
                 monotonic_counter.anvil_index_compaction_output_bytes_total =
                     emission.delta.output_bytes,
@@ -790,14 +751,10 @@ impl CompactionTelemetry {
                 gauge.anvil_index_compaction_waiting_lanes = emission.snapshot.waiting_lanes,
                 gauge.anvil_index_compaction_current_input_component_rows =
                     emission.snapshot.input_records,
-                // Compatibility alias retained for existing dashboards.
-                gauge.anvil_index_compaction_current_input_records = emission.snapshot.input_records,
                 gauge.anvil_index_compaction_current_input_read_bytes = emission.snapshot.input_bytes,
                 gauge.anvil_index_compaction_current_input_blocks = emission.snapshot.input_blocks,
                 gauge.anvil_index_compaction_current_output_component_rows =
                     emission.snapshot.output_records,
-                // Compatibility alias retained for existing dashboards.
-                gauge.anvil_index_compaction_current_output_records = emission.snapshot.output_records,
                 gauge.anvil_index_compaction_current_output_bytes = emission.snapshot.output_bytes,
                 gauge.anvil_index_compaction_current_output_blocks = emission.snapshot.output_blocks,
                 gauge.anvil_index_compaction_sort_peak_workspace_bytes =
@@ -847,17 +804,11 @@ impl CompactionTelemetry {
                 emission.delta.ranges_completed,
             monotonic_counter.anvil_index_compaction_input_component_rows_total =
                 emission.delta.input_records,
-            // Compatibility alias retained for existing dashboards.
-            monotonic_counter.anvil_index_compaction_input_records_total =
-                emission.delta.input_records,
             monotonic_counter.anvil_index_compaction_input_read_bytes_total =
                 emission.delta.input_bytes,
             monotonic_counter.anvil_index_compaction_input_blocks_total =
                 emission.delta.input_blocks,
             monotonic_counter.anvil_index_compaction_output_component_rows_total =
-                emission.delta.output_records,
-            // Compatibility alias retained for existing dashboards.
-            monotonic_counter.anvil_index_compaction_output_records_total =
                 emission.delta.output_records,
             monotonic_counter.anvil_index_compaction_output_bytes_total =
                 emission.delta.output_bytes,
@@ -881,14 +832,10 @@ impl CompactionTelemetry {
             gauge.anvil_index_compaction_ranges_completed = emission.snapshot.ranges_completed,
             gauge.anvil_index_compaction_current_input_component_rows =
                 emission.snapshot.input_records,
-            // Compatibility alias retained for existing dashboards.
-            gauge.anvil_index_compaction_current_input_records = emission.snapshot.input_records,
             gauge.anvil_index_compaction_current_input_read_bytes = emission.snapshot.input_bytes,
             gauge.anvil_index_compaction_current_input_blocks = emission.snapshot.input_blocks,
             gauge.anvil_index_compaction_current_output_component_rows =
                 emission.snapshot.output_records,
-            // Compatibility alias retained for existing dashboards.
-            gauge.anvil_index_compaction_current_output_records = emission.snapshot.output_records,
             gauge.anvil_index_compaction_current_output_bytes = emission.snapshot.output_bytes,
             gauge.anvil_index_compaction_current_output_blocks = emission.snapshot.output_blocks,
             gauge.anvil_index_compaction_sort_peak_workspace_bytes =
@@ -898,13 +845,10 @@ impl CompactionTelemetry {
             gauge.anvil_index_compaction_elapsed_seconds = emission.elapsed_seconds,
             gauge.anvil_index_compaction_last_progress_age_seconds =
                 emission.last_progress_age_seconds,
-            histogram.anvil_index_compaction_selected_input_mutations = self.input.records,
-            // Compatibility alias retained for existing dashboards.
-            histogram.anvil_index_compaction_input_records = self.input.records,
+            histogram.anvil_index_compaction_input_segments = self.input.segments,
+            histogram.anvil_index_compaction_input_documents = self.input.documents,
             histogram.anvil_index_compaction_input_bytes = self.input.bytes,
             histogram.anvil_index_compaction_output_component_rows = emission.snapshot.output_records,
-            // Compatibility alias retained for existing dashboards.
-            histogram.anvil_index_compaction_output_records = emission.snapshot.output_records,
             histogram.anvil_index_compaction_output_bytes = emission.snapshot.output_bytes,
             histogram.anvil_index_compaction_output_blocks = emission.snapshot.output_blocks,
             histogram.anvil_index_compaction_merge_ranges = emission.snapshot.ranges_total,
@@ -1087,26 +1031,6 @@ pub(crate) async fn await_with_builder_heartbeats<F: Future>(
 mod tests {
     use super::*;
 
-    fn run(sequence: u64, level: u8) -> super::super::generation::ManifestRun {
-        super::super::generation::ManifestRun {
-            sequence,
-            created_at_unix_millis: sequence.saturating_mul(1_000),
-            level,
-            root_path: format!("run-{sequence}"),
-            root_blob: anvil_store::BlobRef {
-                hash: [sequence as u8; 32],
-                length: 10,
-            },
-            root_object_version: anvil_store::VersionId(sequence),
-            packs: Vec::new(),
-            mutation_count: 1,
-            live_document_count: 1,
-            minimum_version: 1,
-            maximum_version: 1,
-            authoritative_bytes: 10,
-        }
-    }
-
     fn identity() -> IndexTelemetryIdentity {
         IndexTelemetryIdentity {
             index_id: 7,
@@ -1130,26 +1054,25 @@ mod tests {
     }
 
     #[test]
-    fn debt_counts_only_levels_over_the_bound() {
-        let mut runs = (1..=5).map(|sequence| run(sequence, 0)).collect::<Vec<_>>();
-        runs.extend((6..=9).map(|sequence| run(sequence, 1)));
+    fn debt_counts_only_tiers_over_the_bound() {
+        let mut segments = vec![(0, 10); 5];
+        segments.extend(vec![(1, 10); 4]);
 
-        let (debt, levels) = compaction_debt(&runs, 4, u64::MAX);
+        let (debt, tiers) = compaction_debt_summaries(segments.clone(), 4, u64::MAX);
         assert_eq!(
             debt,
             CompactionDebtSnapshot {
-                levels: 1,
-                runs: 5,
+                tiers: 1,
+                segments: 5,
                 bytes: 50,
-                oldest_created_at_unix_millis: 1_000,
             }
         );
-        assert_eq!(levels[&0].runs, 5);
+        assert_eq!(tiers[&0].segments, 5);
         assert_eq!(
-            compaction_debt(&runs, 5, u64::MAX).0,
+            compaction_debt_summaries(segments.clone(), 5, u64::MAX).0,
             CompactionDebtSnapshot::default()
         );
-        assert_eq!(compaction_debt(&runs, 5, 49).0, debt);
+        assert_eq!(compaction_debt_summaries(segments, 5, 49).0, debt);
     }
 
     #[tokio::test]

@@ -8,9 +8,12 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use anvil_index::v4::Schema;
 use tonic::Status;
 
 use crate::index_service::{StoredIndexDefinition, definition_path};
+
+use super::v4_schema::compile_schema;
 
 const MAX_PENDING_CATALOG_CHANGES: usize = 1_024;
 
@@ -20,9 +23,39 @@ pub(crate) struct CatalogDefinition {
     pub(crate) bucket_id: u64,
     pub(crate) object_version: u64,
     pub(crate) stored: StoredIndexDefinition,
+    /// Deterministic runtime contract compiled from the authoritative ordinary
+    /// definition object. This is process-local and can always be reconstructed.
+    pub(crate) schema: Schema,
+    pub(crate) schema_fingerprint: [u8; 32],
 }
 
 impl CatalogDefinition {
+    pub(crate) fn new(
+        tenant_id: u64,
+        bucket_id: u64,
+        object_version: u64,
+        stored: StoredIndexDefinition,
+    ) -> Result<Self, Status> {
+        let specification = stored.specification()?;
+        let schema = compile_schema(
+            &stored.path_prefix,
+            stored.content_type.as_deref(),
+            &specification,
+        )
+        .map_err(schema_status)?;
+        let schema_fingerprint = schema.fingerprint().map_err(schema_status)?;
+        let definition = Self {
+            tenant_id,
+            bucket_id,
+            object_version,
+            stored,
+            schema,
+            schema_fingerprint,
+        };
+        definition.validate()?;
+        Ok(definition)
+    }
+
     pub(crate) fn identity(&self) -> CatalogIdentity {
         CatalogIdentity {
             tenant_id: self.tenant_id,
@@ -37,20 +70,41 @@ impl CatalogDefinition {
                 "assigned index definition has a zero stable identity",
             ));
         }
-        if definition_path(&self.stored.name)?
-            != format!("_anvil/indexes/v3/definitions/{}", self.stored.name)
+        // `definition_path` is the sole canonical path/name validator. The
+        // assignment's exact path is checked before this value enters the
+        // catalog; this handoff intentionally stores only the validated name.
+        definition_path(&self.stored.name)?;
+        let specification = self.stored.specification()?;
+        let expected_schema = compile_schema(
+            &self.stored.path_prefix,
+            self.stored.content_type.as_deref(),
+            &specification,
+        )
+        .map_err(schema_status)?;
+        if self.schema != expected_schema
+            || self.schema_fingerprint != self.schema.fingerprint().map_err(schema_status)?
         {
             return Err(Status::data_loss(
-                "assigned index definition path is not canonical",
+                "assigned index schema does not match its ordinary definition object",
             ));
         }
         Ok(())
     }
 }
 
+fn schema_status(error: anvil_index::IndexError) -> Status {
+    Status::data_loss(format!(
+        "stored index definition cannot compile to format-v4 schema: {error}"
+    ))
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum CatalogChange {
     Upsert(CatalogDefinition),
+    Delete {
+        identity: CatalogIdentity,
+        object_version: u64,
+    },
     Remove(CatalogIdentity),
 }
 
@@ -58,7 +112,16 @@ impl CatalogChange {
     pub(crate) fn identity(&self) -> CatalogIdentity {
         match self {
             Self::Upsert(definition) => definition.identity(),
+            Self::Delete { identity, .. } => *identity,
             Self::Remove(identity) => *identity,
+        }
+    }
+
+    fn object_version(&self) -> Option<u64> {
+        match self {
+            Self::Upsert(definition) => Some(definition.object_version),
+            Self::Delete { object_version, .. } => Some(*object_version),
+            Self::Remove(_) => None,
         }
     }
 }
@@ -116,12 +179,33 @@ impl IndexCatalog {
     /// authority if the process stops while waiting.
     pub(crate) async fn upsert_wait(&self, definition: CatalogDefinition) -> Result<(), Status> {
         definition.validate()?;
-        let identity = definition.identity();
+        self.enqueue_wait(CatalogChange::Upsert(definition)).await
+    }
+
+    pub(crate) async fn delete_wait(
+        &self,
+        identity: CatalogIdentity,
+        object_version: u64,
+    ) -> Result<(), Status> {
+        if object_version == 0 {
+            return Err(Status::data_loss(
+                "deleted index definition has a zero object version",
+            ));
+        }
+        self.enqueue_wait(CatalogChange::Delete {
+            identity,
+            object_version,
+        })
+        .await
+    }
+
+    async fn enqueue_wait(&self, change: CatalogChange) -> Result<(), Status> {
+        let identity = change.identity();
         loop {
             let notified = self.capacity_changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            match self.enqueue(CatalogChange::Upsert(definition.clone())) {
+            match self.enqueue(change.clone()) {
                 Ok(()) => return Ok(()),
                 Err(error) if error.code() == tonic::Code::ResourceExhausted => {
                     tracing::debug!(
@@ -158,6 +242,13 @@ impl IndexCatalog {
             return Err(Status::resource_exhausted(
                 "assigned index handoff is at its bounded capacity",
             ));
+        }
+        if state
+            .pending
+            .get(&identity)
+            .is_some_and(|current| keep_current_change(current, &change))
+        {
+            return Ok(());
         }
         state.pending.insert(identity, change);
         drop(state);
@@ -207,7 +298,7 @@ impl IndexCatalog {
             .pending
             .iter()
             .filter_map(|(identity, change)| match change {
-                CatalogChange::Remove(_) => Some(*identity),
+                CatalogChange::Delete { .. } | CatalogChange::Remove(_) => Some(*identity),
                 CatalogChange::Upsert(_) if admit_upsert(*identity) => Some(*identity),
                 CatalogChange::Upsert(_) => None,
             })
@@ -239,6 +330,18 @@ impl IndexCatalog {
     }
 }
 
+fn keep_current_change(current: &CatalogChange, incoming: &CatalogChange) -> bool {
+    match (current, incoming) {
+        (CatalogChange::Delete { .. }, CatalogChange::Remove(_)) => true,
+        (CatalogChange::Delete { .. }, CatalogChange::Upsert(_))
+        | (CatalogChange::Upsert(_), CatalogChange::Delete { .. })
+        | (CatalogChange::Delete { .. }, CatalogChange::Delete { .. }) => {
+            current.object_version() >= incoming.object_version()
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use anvil_api::v1::{CreateIndexRequest, IndexSpecification, PathIndexSpec};
@@ -246,11 +349,11 @@ mod tests {
     use super::*;
 
     fn definition(tenant_id: u64, bucket_id: u64, index_id: u64) -> CatalogDefinition {
-        CatalogDefinition {
+        CatalogDefinition::new(
             tenant_id,
             bucket_id,
-            object_version: 1,
-            stored: StoredIndexDefinition::create(
+            1,
+            StoredIndexDefinition::create(
                 "tenant".into(),
                 CreateIndexRequest {
                     bucket: "bucket".into(),
@@ -269,7 +372,8 @@ mod tests {
                 index_id,
             )
             .unwrap(),
-        }
+        )
+        .unwrap()
     }
 
     #[test]
@@ -306,6 +410,67 @@ mod tests {
     }
 
     #[test]
+    fn definition_delete_is_not_downgraded_to_assignment_removal() {
+        let catalog = IndexCatalog::with_capacity(1);
+        let definition = definition(1, 2, 9);
+        let identity = definition.identity();
+        catalog.upsert(definition).unwrap();
+        catalog
+            .enqueue(CatalogChange::Delete {
+                identity,
+                object_version: 2,
+            })
+            .unwrap();
+        catalog.remove(1, 2, 9).unwrap();
+        assert!(matches!(
+            catalog.take(identity, true).unwrap(),
+            Some(CatalogChange::Delete {
+                object_version: 2,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn recreation_replaces_one_pending_tombstone_only_when_newer() {
+        let catalog = IndexCatalog::with_capacity(1);
+        let mut stale = definition(1, 2, 9);
+        stale.object_version = 2;
+        let identity = stale.identity();
+        catalog
+            .enqueue(CatalogChange::Delete {
+                identity,
+                object_version: 3,
+            })
+            .unwrap();
+        catalog.upsert(stale).unwrap();
+        assert!(matches!(
+            catalog.take(identity, true).unwrap(),
+            Some(CatalogChange::Delete {
+                object_version: 3,
+                ..
+            })
+        ));
+
+        catalog
+            .enqueue(CatalogChange::Delete {
+                identity,
+                object_version: 3,
+            })
+            .unwrap();
+        let mut recreated = definition(1, 2, 9);
+        recreated.object_version = 4;
+        catalog.upsert(recreated).unwrap();
+        assert!(matches!(
+            catalog.take(identity, true).unwrap(),
+            Some(CatalogChange::Upsert(CatalogDefinition {
+                object_version: 4,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
     fn upserts_remain_pending_while_builder_leases_are_full() {
         let catalog = IndexCatalog::with_capacity(1);
         catalog.upsert(definition(1, 2, 9)).unwrap();
@@ -334,5 +499,47 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(catalog.take(second_identity, true).unwrap().is_some());
+    }
+
+    #[test]
+    fn ordinary_definition_compiles_one_bound_v4_schema_and_fingerprint() {
+        let definition = definition(1, 2, 9);
+        assert_eq!(definition.schema.path_prefix, "");
+        assert_eq!(definition.schema.fields[0].name, "path");
+        assert_eq!(
+            definition.schema_fingerprint,
+            definition.schema.fingerprint().unwrap()
+        );
+        definition.validate().unwrap();
+    }
+
+    #[test]
+    fn ordinary_definition_semantic_update_compiles_a_new_fingerprint() {
+        let original = definition(1, 2, 9);
+        let mut updated = original.stored.clone();
+        updated.path_prefix = "tenant/42/".into();
+        let updated = CatalogDefinition::new(1, 2, 2, updated).unwrap();
+
+        assert_ne!(original.schema_fingerprint, updated.schema_fingerprint);
+        assert_eq!(updated.schema.path_prefix, "tenant/42/");
+    }
+
+    #[test]
+    fn catalog_rejects_schema_or_fingerprint_detached_from_the_definition() {
+        let definition = definition(1, 2, 9);
+        let mut wrong_fingerprint = definition.clone();
+        wrong_fingerprint.schema_fingerprint[0] ^= 1;
+        assert_eq!(
+            wrong_fingerprint.validate().unwrap_err().code(),
+            tonic::Code::DataLoss
+        );
+
+        let mut wrong_schema = definition;
+        wrong_schema.schema.path_prefix = "other/".into();
+        wrong_schema.schema_fingerprint = wrong_schema.schema.fingerprint().unwrap();
+        assert_eq!(
+            wrong_schema.validate().unwrap_err().code(),
+            tonic::Code::DataLoss
+        );
     }
 }

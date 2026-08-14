@@ -1,7 +1,9 @@
 //! Wire validation for sparse definition coordination transport.
 
 use super::*;
-use anvil_store::{DefinitionAssignment, DefinitionLocator, PlacementLogId, VersionId};
+use anvil_store::{
+    DefinitionAssignment, DefinitionLocator, DefinitionOperation, PlacementLogId, VersionId,
+};
 
 pub(super) fn decode_routed_source_journal_page(
     response: wire::RoutedSourceJournalPage,
@@ -106,6 +108,17 @@ pub(super) fn encode_assignment_mutation(
                 value.observed_fence,
                 u32::from(value.rank),
             ),
+            DefinitionAssignmentMutation::Delete(value) => (
+                wire::DefinitionAssignmentOperation::Delete,
+                value.kind,
+                value.tenant_id,
+                value.bucket_id,
+                value.definition_id,
+                value.definition_path.clone(),
+                value.object_version,
+                value.observed_fence,
+                u32::from(value.rank),
+            ),
             DefinitionAssignmentMutation::Remove {
                 kind,
                 tenant_id,
@@ -192,6 +205,7 @@ pub(super) fn decode_locator_page(
                 definition_id: value.definition_id,
                 path: value.definition_path,
                 object_version: VersionId(value.object_version),
+                operation: decode_locator_state(value.state)?,
             };
             locator
                 .validate()
@@ -230,6 +244,16 @@ pub(super) fn decode_locator_page(
         locators,
         next_cursor,
     })
+}
+
+fn decode_locator_state(value: i32) -> Result<DefinitionOperation, Status> {
+    match wire::PrivateDefinitionObjectState::try_from(value) {
+        Ok(wire::PrivateDefinitionObjectState::Live) => Ok(DefinitionOperation::Upsert),
+        Ok(wire::PrivateDefinitionObjectState::Deleted) => Ok(DefinitionOperation::Delete),
+        _ => Err(Status::data_loss(
+            "definition locator response carries an invalid object state",
+        )),
+    }
 }
 
 pub(super) fn decode_assignment_upsert(

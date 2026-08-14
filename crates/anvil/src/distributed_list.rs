@@ -13,7 +13,8 @@ use anvil_atomic_program::MAX_OBJECT_PATH_BYTES;
 use anvil_authz::{ObjectRef, RealmId};
 use anvil_consensus::{DecisionRaft, NodeId};
 use anvil_store::{
-    ListObjectsPage, MAX_LIST_OBJECTS, ObjectKey, PlacementLogId, StorageTenantId, Store,
+    INDEX_DEFINITION_PREFIX, ListObjectsPage, MAX_LIST_OBJECTS, ObjectKey, PlacementLogId,
+    StorageTenantId, Store,
 };
 use thiserror::Error;
 use tonic::{Status, metadata::MetadataMap};
@@ -21,6 +22,7 @@ use tonic::{Status, metadata::MetadataMap};
 use crate::authentication::{Caller, JwtManager};
 use crate::authorization::{ObjectPermission, SystemAuthorizer};
 use crate::cluster_placement::ClusterPlacement;
+use crate::index_service::definition_name;
 use crate::placement::PlacementKind;
 use crate::serving_fence::ServingAuthority;
 
@@ -193,16 +195,17 @@ impl LocalListQuery {
     pub(crate) fn for_index_definitions(mut self) -> Result<Self, Status> {
         let suffix = self
             .prefix
-            .strip_prefix("_anvil/indexes/v3/definitions/")
+            .strip_prefix(INDEX_DEFINITION_PREFIX)
             .ok_or_else(|| {
                 Status::invalid_argument(
                     "index-definition listing requires its exact reserved prefix",
                 )
             })?;
         if suffix.contains('/')
-            || self.start_after.as_ref().is_some_and(|path| {
-                crate::index_runtime::publication::index_definition_name(path).is_none()
-            })
+            || self
+                .start_after
+                .as_ref()
+                .is_some_and(|path| definition_name(path).is_none())
         {
             return Err(Status::invalid_argument(
                 "index-definition listing cannot enumerate another reserved path",
@@ -824,7 +827,7 @@ async fn gather_cluster_page(
 
 fn path_is_allowed_for_query(query: &LocalListQuery, path: &str) -> bool {
     if query.includes_index_definitions() {
-        crate::index_runtime::publication::index_definition_name(path).is_some()
+        definition_name(path).is_some()
     } else if query.includes_personaldb_manifests() {
         crate::personaldb::parse_manifest_object_path(path).is_ok()
     } else {
@@ -1132,6 +1135,7 @@ mod tests {
         SystemBootstrapRequest, TupleBatchRequest, TupleMutation, TupleMutationKind,
     };
 
+    use crate::index_service::definition_path;
     use crate::placement::{PlacementNode, rank_nodes};
 
     use super::*;
@@ -1148,6 +1152,41 @@ mod tests {
                 has_more,
             },
         )
+    }
+
+    #[test]
+    fn startup_definition_discovery_is_bucket_scoped_and_excludes_general_heads() {
+        let first = definition_path("first").unwrap();
+        let query = LocalListQuery::new(
+            PlacementLogId { term: 2, index: 3 },
+            "tenant-a",
+            "bucket-a",
+            11,
+            12,
+            INDEX_DEFINITION_PREFIX,
+            Some(first.clone()),
+            64,
+        )
+        .unwrap()
+        .for_index_definitions()
+        .unwrap();
+
+        assert_eq!(query.tenant(), "tenant-a");
+        assert_eq!(query.bucket(), "bucket-a");
+        assert_eq!(query.tenant_id(), 11);
+        assert_eq!(query.bucket_id(), 12);
+        assert_eq!(query.prefix(), INDEX_DEFINITION_PREFIX);
+        assert_eq!(query.start_after(), Some(first.as_str()));
+        assert!(query.includes_index_definitions());
+        assert!(path_is_allowed_for_query(
+            &query,
+            &definition_path("second").unwrap()
+        ));
+        assert!(!path_is_allowed_for_query(&query, "ordinary/object"));
+        assert!(!path_is_allowed_for_query(
+            &query,
+            "_anvil/accounting/12/definition.json"
+        ));
     }
 
     struct AllowList;

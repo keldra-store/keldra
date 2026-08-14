@@ -1016,7 +1016,7 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::io::{Cursor, Read};
+    use std::io::Cursor;
     use std::sync::{Arc, RwLock};
 
     use anvil_consensus::{

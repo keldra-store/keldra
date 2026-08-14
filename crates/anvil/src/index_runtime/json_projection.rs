@@ -8,7 +8,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{ErrorKind, Read};
 
 use anvil_index::IndexError;
-use anvil_index::typed_json::{ScalarValue, SelectedScalarFields};
+use anvil_index::v4::ScalarValue;
+
+pub(crate) type SelectedScalarFields = BTreeMap<String, SelectedScalarField>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SelectedScalarField {
+    pub values: Vec<ScalarValue>,
+    pub from_array: bool,
+}
 
 const INPUT_BUFFER_BYTES: usize = 8 * 1024;
 const MAX_JSON_DEPTH: usize = 128;
@@ -365,7 +373,7 @@ fn decode_pointer_token_utf8(token: &str, pointer: &str) -> Result<String, Index
 enum SelectedValue {
     Missing,
     Invalid,
-    Scalars(Vec<ScalarValue>),
+    Scalars(SelectedScalarField),
     String(String),
     Vector(Vec<f32>),
 }
@@ -379,13 +387,16 @@ fn finish_projection(
         ProjectionSelection::Scalars(_) => {
             let mut fields = BTreeMap::new();
             for (target, slot) in targets.iter().zip(slots.drain(..)) {
-                if let SelectedValue::Scalars(values) = slot {
-                    if !values.is_empty() {
-                        fields.insert(target.name.clone().expect("scalar target name"), values);
+                if let SelectedValue::Scalars(field) = slot {
+                    if field.from_array || !field.values.is_empty() {
+                        fields.insert(target.name.clone().expect("scalar target name"), field);
                     }
                 }
             }
-            Ok((!fields.is_empty()).then_some(ProjectedJson::Scalars(fields)))
+            // A valid in-scope Typed JSON object with no selected fields still
+            // belongs to the index. Missing remains distinct from explicit
+            // null for predicate-free, NOT Exists, and ordered queries.
+            Ok(Some(ProjectedJson::Scalars(fields)))
         }
         ProjectionSelection::Strings(_) => {
             let strings = collect_strings(targets, slots.into_iter());
@@ -523,12 +534,9 @@ impl ProjectionParser<'_, '_> {
                 let capture = self.has_numeric_consumer(candidates, depth, array_collectors);
                 let number = self.input.number(capture)?;
                 match number {
-                    Some(number) if number.is_finite() => self.project_scalar(
-                        candidates,
-                        depth,
-                        array_collectors,
-                        ScalarValue::Number(if number == 0.0 { 0.0 } else { number }),
-                    ),
+                    Some(number) => {
+                        self.project_scalar(candidates, depth, array_collectors, number)
+                    }
                     _ => {
                         self.invalidate_exact(candidates, depth);
                         self.invalidate(array_collectors);
@@ -589,7 +597,10 @@ impl ProjectionParser<'_, '_> {
         for index in exact {
             match self.targets[index].kind {
                 TargetKind::Scalar => {
-                    self.slots[index] = SelectedValue::Scalars(Vec::new());
+                    self.slots[index] = SelectedValue::Scalars(SelectedScalarField {
+                        values: Vec::new(),
+                        from_array: true,
+                    });
                     collectors.push(index);
                 }
                 TargetKind::Vector { dimensions, .. } => {
@@ -719,16 +730,19 @@ impl ProjectionParser<'_, '_> {
             }
             match &mut self.slots[index] {
                 SelectedValue::Missing => {
-                    self.slots[index] = SelectedValue::Scalars(vec![ScalarValue::String(selected)]);
+                    self.slots[index] = SelectedValue::Scalars(SelectedScalarField {
+                        values: vec![ScalarValue::String(selected)],
+                        from_array: false,
+                    });
                 }
-                SelectedValue::Scalars(values) => {
-                    values.try_reserve_exact(1).map_err(|_| {
+                SelectedValue::Scalars(field) => {
+                    field.values.try_reserve_exact(1).map_err(|_| {
                         ProjectionFailure::Index(IndexError::ResourceLimit {
                             needed: usize::MAX,
                             limit: self.budget.limit,
                         })
                     })?;
-                    values.push(ScalarValue::String(selected));
+                    field.values.push(ScalarValue::String(selected));
                 }
                 SelectedValue::Invalid | SelectedValue::String(_) | SelectedValue::Vector(_) => {}
             }
@@ -752,7 +766,8 @@ impl ProjectionParser<'_, '_> {
         for index in array_collectors {
             if matches!(self.targets[*index].kind, TargetKind::Vector { .. }) {
                 let number = match &value {
-                    ScalarValue::Number(number) => *number as f32,
+                    ScalarValue::Number(bits) => f64::from_bits(*bits) as f32,
+                    ScalarValue::Unsigned(value) => *value as f32,
                     _ => {
                         self.slots[*index] = SelectedValue::Invalid;
                         continue;
@@ -791,16 +806,19 @@ impl ProjectionParser<'_, '_> {
         for index in scalar_targets {
             match &mut self.slots[index] {
                 SelectedValue::Missing => {
-                    self.slots[index] = SelectedValue::Scalars(vec![value.clone()]);
+                    self.slots[index] = SelectedValue::Scalars(SelectedScalarField {
+                        values: vec![value.clone()],
+                        from_array: false,
+                    });
                 }
-                SelectedValue::Scalars(values) => {
-                    values.try_reserve_exact(1).map_err(|_| {
+                SelectedValue::Scalars(field) => {
+                    field.values.try_reserve_exact(1).map_err(|_| {
                         ProjectionFailure::Index(IndexError::ResourceLimit {
                             needed: usize::MAX,
                             limit: self.budget.limit,
                         })
                     })?;
-                    values.push(value.clone());
+                    field.values.push(value.clone());
                 }
                 SelectedValue::Invalid | SelectedValue::String(_) | SelectedValue::Vector(_) => {}
             }
@@ -1071,10 +1089,13 @@ impl<'a> Input<'a> {
         Ok(value)
     }
 
-    fn number(&mut self, capture: bool) -> ProjectionResult<Option<f64>> {
+    fn number(&mut self, capture: bool) -> ProjectionResult<Option<ScalarValue>> {
         let mut bytes = [0u8; MAX_CAPTURED_NUMBER_BYTES];
         let mut length = 0usize;
         let mut overflowed = false;
+        let mut negative = false;
+        let mut fractional = false;
+        let mut exponent = false;
         let record = |byte: u8,
                       bytes: &mut [u8; MAX_CAPTURED_NUMBER_BYTES],
                       length: &mut usize,
@@ -1088,6 +1109,7 @@ impl<'a> Input<'a> {
         };
 
         if self.take_if(b'-')? {
+            negative = true;
             record(b'-', &mut bytes, &mut length, &mut overflowed);
         }
         match self.next()?.ok_or(ProjectionFailure::Malformed)? {
@@ -1107,6 +1129,7 @@ impl<'a> Input<'a> {
             _ => return Err(ProjectionFailure::Malformed),
         }
         if self.take_if(b'.')? {
+            fractional = true;
             record(b'.', &mut bytes, &mut length, &mut overflowed);
             let first = self.next()?.ok_or(ProjectionFailure::Malformed)?;
             if !first.is_ascii_digit() {
@@ -1119,6 +1142,7 @@ impl<'a> Input<'a> {
             }
         }
         if matches!(self.peek()?, Some(b'e' | b'E')) {
+            exponent = true;
             let exponent = self.next()?.expect("peeked exponent");
             record(exponent, &mut bytes, &mut length, &mut overflowed);
             if matches!(self.peek()?, Some(b'+' | b'-')) {
@@ -1141,7 +1165,24 @@ impl<'a> Input<'a> {
         }
         let encoded =
             std::str::from_utf8(&bytes[..length]).map_err(|_| ProjectionFailure::Malformed)?;
-        Ok(encoded.parse::<f64>().ok())
+        if !fractional && !exponent {
+            if encoded == "-0" {
+                return Ok(Some(ScalarValue::Unsigned(0)));
+            }
+            if !negative && let Ok(value) = encoded.parse::<u64>() {
+                return Ok(Some(ScalarValue::Unsigned(value)));
+            }
+        }
+        let Some(number) = encoded
+            .parse::<f64>()
+            .ok()
+            .filter(|number| number.is_finite())
+        else {
+            return Ok(None);
+        };
+        Ok(Some(
+            ScalarValue::number(number).map_err(ProjectionFailure::Index)?,
+        ))
     }
 }
 
@@ -1259,17 +1300,76 @@ mod tests {
             )
             .unwrap(),
             Some(ProjectedJson::Scalars(BTreeMap::from([
-                ("count".into(), vec![ScalarValue::Number(3.0)],),
+                (
+                    "count".into(),
+                    SelectedScalarField {
+                        values: vec![ScalarValue::Unsigned(3)],
+                        from_array: false,
+                    },
+                ),
                 (
                     "tags".into(),
-                    vec![
-                        ScalarValue::String("one".into()),
-                        ScalarValue::Number(2.0),
-                        ScalarValue::Boolean(true),
-                        ScalarValue::Null,
-                    ],
+                    SelectedScalarField {
+                        values: vec![
+                            ScalarValue::String("one".into()),
+                            ScalarValue::Unsigned(2),
+                            ScalarValue::Boolean(true),
+                            ScalarValue::Null,
+                        ],
+                        from_array: true,
+                    },
                 ),
             ])))
+        );
+    }
+
+    #[test]
+    fn valid_scalar_projection_preserves_an_all_missing_document() {
+        let selection = ProjectionSelection::Scalars(vec![
+            ("state".into(), "/state".into()),
+            ("modified".into(), "/modified".into()),
+        ]);
+
+        assert_eq!(
+            project(br#"{"other":"value"}"#, &selection, 64).unwrap(),
+            Some(ProjectedJson::Scalars(BTreeMap::new()))
+        );
+    }
+
+    #[test]
+    fn preserves_unsigned_integers_and_canonicalizes_lexical_negative_zero() {
+        let selection = ProjectionSelection::Scalars(vec![
+            ("maximum".into(), "/maximum".into()),
+            ("zero".into(), "/zero".into()),
+            ("negative_zero".into(), "/negative_zero".into()),
+            ("negative".into(), "/negative".into()),
+            ("decimal".into(), "/decimal".into()),
+            ("exponent".into(), "/exponent".into()),
+        ]);
+        let Some(ProjectedJson::Scalars(fields)) = project(
+            br#"{"maximum":18446744073709551615,"zero":0,"negative_zero":-0,"negative":-2,"decimal":2.0,"exponent":2e0}"#,
+            &selection,
+            1_024,
+        )
+        .unwrap()
+        else {
+            panic!("expected scalar projection")
+        };
+
+        assert_eq!(fields["maximum"].values, [ScalarValue::Unsigned(u64::MAX)]);
+        assert_eq!(fields["zero"].values, [ScalarValue::Unsigned(0)]);
+        assert_eq!(fields["negative_zero"].values, [ScalarValue::Unsigned(0)]);
+        assert_eq!(
+            fields["negative"].values,
+            [ScalarValue::number(-2.0).unwrap()]
+        );
+        assert_eq!(
+            fields["decimal"].values,
+            [ScalarValue::number(2.0).unwrap()]
+        );
+        assert_eq!(
+            fields["exponent"].values,
+            [ScalarValue::number(2.0).unwrap()]
         );
     }
 

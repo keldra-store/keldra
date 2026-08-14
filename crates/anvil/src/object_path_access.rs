@@ -180,6 +180,7 @@ fn is_program_definition(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index_service::definition_path;
 
     fn key(path: &str) -> ObjectKey {
         ObjectKey::new("tenant", "bucket", path).unwrap()
@@ -190,6 +191,7 @@ mod tests {
         let public = access_for(&Request::new(()));
         assert!(require_key(&public, &key("objects/value")).is_ok());
         assert!(require_key(&public, &key("_anvil/programs/import_osv@1")).is_ok());
+        let index_definition = definition_path("by-path").unwrap();
 
         for path in [
             "_anvil/programs/import_osv",
@@ -197,7 +199,7 @@ mod tests {
             "_anvil/programs/import_osv@",
             "_anvil/programs/nested/import_osv@1",
             "_anvil/programs/import_osv@1@copy",
-            "_anvil/indexes/v3/definitions/by-path",
+            index_definition.as_str(),
             "_anvil/indexes/v3/7/current",
             "_anvil/internal/00",
             "objects/_anvil/meta.json",
@@ -215,7 +217,7 @@ mod tests {
         let mut request = Request::new(());
         mark_index(&mut request);
         let access = access_for(&request);
-        assert!(require_key(&access, &key("_anvil/indexes/v3/definitions/by-path")).is_ok());
-        assert!(require_key(&access, &key("_anvil/indexes/v3/7/current")).is_ok());
+        assert!(require_key(&access, &key(&definition_path("by-path").unwrap())).is_ok());
+        assert!(require_key(&access, &key("_anvil/indexes/v4/7/current")).is_ok());
     }
 }

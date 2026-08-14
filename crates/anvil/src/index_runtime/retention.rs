@@ -1,32 +1,55 @@
-//! Node-wide bounded retention of ordinary format-3 index artifacts.
+//! Node-wide bounded retention of ordinary format-v4 index artifacts.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anvil_store::{ObjectKey, VersionId};
+use anvil_index::IndexError;
+use anvil_index::v4::build::{MergeScratchFile, MergeScratchSpace};
+use anvil_index::v4::{
+    ArtifactDescriptor, ComponentKind, INDEX_COMPONENT_BYTES, RoutingNode, SegmentIdentity,
+    decode_component,
+};
+use anvil_store::{
+    BlobRef, DefinitionKind, IndexGenerationRetentionDue, ObjectKey, Store, VersionId,
+};
 use tonic::Status;
 
 use crate::cluster_object_read::ClusterObjectReader;
 use crate::cluster_peer::{IndexCurrentHead, IndexHeadScanScope};
 use crate::index_config::IndexRuntimeConfig;
-use crate::index_service::StoredIndexDefinition;
+use crate::index_service::{StoredIndexDefinition, definition_path};
+use crate::logical_name_resolution::LogicalNameResolver;
 
+use super::cache::{IndexMergeScratchFile, IndexMergeScratchSpace};
+use super::coordination::load_definition_locator_object;
 use super::generation::{IndexCurrentPointer, IndexGenerationManifest, ManifestReference};
 use super::publication::{
-    IndexArtifactDelete, IndexArtifactRouter, current_path, is_manifest_artifact_path,
-    run_hash_from_artifact_path,
+    IndexArtifactDelete, IndexArtifactRouter, artifact_hash_from_path, current_path,
+    is_manifest_artifact_path, manifest_hash_from_path,
 };
-use super::publisher::PublishedGeneration;
+use super::publisher::{IndexGenerationPublisher, PublishedGeneration};
 use super::scanner::{ClusterIndexScan, ClusterIndexScanner};
+
+#[path = "retention/deleted.rs"]
+mod deleted;
+#[path = "retention/scratch.rs"]
+mod scratch;
+use deleted::DeletedDefinitionRetention;
+use scratch::{
+    RETENTION_GENERATION_SLOTS, RetainedObjectCollector, RetainedObjectProof, RetainedObjectRecord,
+    RetainedObjectSort,
+};
 
 const UNREACHABLE_ARTIFACT_SAFETY_MILLIS: u64 = 24 * 60 * 60 * 1_000;
 const PUBLIC_REQUEST_SAFETY_MILLIS: u64 = 30 * 1_000;
 const MAX_RETENTION_RECORD_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_RETENTION_TICK_INTERVAL: Duration = Duration::from_millis(100);
 const DEFAULT_RETENTION_RETRY_INTERVAL: Duration = Duration::from_secs(1);
-const MAX_ACTIVE_RETENTION_JOBS: usize = 64;
+const RETAINED_MANIFEST_CLASS: u8 = 1;
+const RETAINED_ARTIFACT_CLASS: u8 = 2;
+const ROUTING_SCRATCH_RECORD_BYTES: usize = 168;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct IndexRetentionBudget {
@@ -95,48 +118,72 @@ impl Default for IndexRetentionSchedule {
 
 #[derive(Clone)]
 pub(crate) struct IndexGenerationRetention {
+    store: Store,
     scanner: ClusterIndexScanner,
     reader: ClusterObjectReader,
     artifacts: IndexArtifactRouter,
+    publisher: IndexGenerationPublisher,
+    scratch: IndexMergeScratchSpace,
     config: IndexRuntimeConfig,
     budget: IndexRetentionBudget,
     schedule: IndexRetentionSchedule,
-    scheduler: Arc<Mutex<RetentionScheduler>>,
+    active: Arc<Mutex<Option<ActiveRetentionJob>>>,
+    deleted: DeletedDefinitionRetention,
     run_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl IndexGenerationRetention {
     pub(crate) fn new(
+        store: Store,
         scanner: ClusterIndexScanner,
         reader: ClusterObjectReader,
         artifacts: IndexArtifactRouter,
+        publisher: IndexGenerationPublisher,
+        scratch: IndexMergeScratchSpace,
+        names: LogicalNameResolver,
         config: IndexRuntimeConfig,
     ) -> Self {
+        let budget = IndexRetentionBudget::default();
+        let schedule = IndexRetentionSchedule::default();
         Self {
+            deleted: DeletedDefinitionRetention::new(
+                store.clone(),
+                scanner.clone(),
+                reader.clone(),
+                artifacts.clone(),
+                names,
+                budget,
+                schedule,
+            ),
+            store,
             scanner,
             reader,
             artifacts,
+            publisher,
+            scratch,
             config,
-            budget: IndexRetentionBudget::default(),
-            schedule: IndexRetentionSchedule::default(),
-            scheduler: Arc::new(Mutex::new(RetentionScheduler::default())),
+            budget,
+            schedule,
+            active: Arc::new(Mutex::new(None)),
             run_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
     pub(crate) fn with_budget(mut self, budget: IndexRetentionBudget) -> Self {
         self.budget = budget;
+        self.deleted = self.deleted.with_budget(budget);
         self
     }
 
     pub(crate) fn with_schedule(mut self, schedule: IndexRetentionSchedule) -> Self {
         self.schedule = schedule;
+        self.deleted = self.deleted.with_schedule(schedule);
         self
     }
 
-    /// Lease bounded retention work discovered by the durable assignment walk.
-    /// Completed work is forgotten rather than retained as one idle record per
-    /// definition; a later assignment walk leases it again.
+    /// Durably schedule the published generation immediately. The current
+    /// pointer remains the sole generation authority; this sparse record is
+    /// only restart-safe evidence that bounded retention work is due.
     pub(crate) fn schedule(
         &self,
         definition: &StoredIndexDefinition,
@@ -145,14 +192,18 @@ impl IndexGenerationRetention {
         current: &PublishedGeneration,
     ) -> Result<(), Status> {
         require_current_identity(definition, current)?;
-        let requested = RetentionIdentity::new(tenant_id, bucket_id, definition.index_id)?;
-        self.scheduler
-            .lock()
-            .map_err(|_| Status::internal("index retention scheduler lock is poisoned"))?
-            .register(
-                requested,
-                RetentionJob::new(definition.clone(), tenant_id, bucket_id, current.clone()),
-            )
+        let due = generation_due(
+            definition,
+            tenant_id,
+            bucket_id,
+            current.manifest.definition_version,
+            current.manifest.generation,
+            now_unix_millis()?,
+        )?;
+        self.store
+            .schedule_index_generation_retention(&due)
+            .map(|_| ())
+            .map_err(retention_due_status)
     }
 
     pub(crate) fn unschedule(
@@ -161,11 +212,20 @@ impl IndexGenerationRetention {
         bucket_id: u64,
         index_id: u64,
     ) -> Result<(), Status> {
-        let identity = RetentionIdentity::new(tenant_id, bucket_id, index_id)?;
-        self.scheduler
+        let mut active = self
+            .active
             .lock()
-            .map_err(|_| Status::internal("index retention scheduler lock is poisoned"))?
-            .remove(identity);
+            .map_err(|_| Status::internal("index retention active-job lock is poisoned"))?;
+        if active.as_ref().is_some_and(|active| {
+            active.due.tenant_id == tenant_id
+                && active.due.bucket_id == bucket_id
+                && active.due.index_id == index_id
+        }) {
+            *active = None;
+        }
+        self.store
+            .cancel_index_generation_retention(tenant_id, bucket_id, index_id)
+            .map_err(retention_due_status)?;
         Ok(())
     }
 
@@ -175,7 +235,7 @@ impl IndexGenerationRetention {
             let mut interval = tokio::time::interval(retention.schedule.tick_interval);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             // Maintenance never delays serving or inventories artifacts at
-            // startup. Definitions explicitly schedule work as builders load.
+            // startup. Definitions schedule work as builders load.
             interval.tick().await;
             loop {
                 interval.tick().await;
@@ -189,31 +249,84 @@ impl IndexGenerationRetention {
 
     async fn run_tick(&self) -> Result<u64, Status> {
         let _run = self.run_lock.lock().await;
-        let Some((identity, mut job)) = self
-            .scheduler
-            .lock()
-            .map_err(|_| Status::internal("index retention scheduler lock is poisoned"))?
-            .pop()
-        else {
+        if self.deleted.has_active()? {
+            return self.deleted.run_tick().await;
+        }
+        if self.has_active()? {
+            return self.run_generation_tick().await;
+        }
+        let generation = self
+            .store
+            .oldest_index_generation_retention_due()
+            .map_err(retention_due_status)?;
+        let deleted = self.deleted.oldest_due()?;
+        match (generation, deleted) {
+            (None, None) => Ok(0),
+            (Some(_), None) => self.run_generation_tick().await,
+            (None, Some(_)) => self.deleted.run_tick().await,
+            (Some(generation), Some(deleted))
+                if deleted.due_at_unix_millis <= generation.due_at_unix_millis =>
+            {
+                self.deleted.run_tick().await
+            }
+            (Some(_), Some(_)) => self.run_generation_tick().await,
+        }
+    }
+
+    async fn run_generation_tick(&self) -> Result<u64, Status> {
+        let mut active = self.take_active()?;
+        if active.is_none() {
+            let Some(due) = self
+                .store
+                .oldest_index_generation_retention_due()
+                .map_err(retention_due_status)?
+            else {
+                return Ok(0);
+            };
+            let now = now_unix_millis()?;
+            if due.due_at_unix_millis > now {
+                return Ok(0);
+            }
+            match self.load_due_job(due.clone()).await {
+                Ok(Some(job)) => active = Some(ActiveRetentionJob { due, job }),
+                Ok(None) => return Ok(0),
+                Err(error) => {
+                    self.defer_due(&due)?;
+                    return Err(error);
+                }
+            }
+        }
+        let mut active = active.expect("due retention job was loaded");
+        let index_id = active.due.index_id;
+        if !self
+            .store
+            .index_generation_retention_due_matches(&active.due)
+            .map_err(retention_due_status)?
+        {
             return Ok(0);
-        };
+        }
+        // The durable due record and ordinary current pointer are both fences,
+        // not leases. Re-read the pointer on every bounded work quantum before
+        // allowing another trim or exact artifact deletion.
+        active.job.current_validated = false;
         let mut work = RetentionWork::new(self.budget);
-        let result = self.advance_job(&mut job, &mut work).await;
+        let result = self
+            .advance_job(&active.due, &mut active.job, &mut work)
+            .await;
         match result {
             Ok(removed) => {
-                let (backlog, oldest_millis) = {
-                    let mut scheduler = self.scheduler.lock().map_err(|_| {
-                        Status::internal("index retention scheduler lock is poisoned")
-                    })?;
-                    if matches!(job.phase, RetentionPhase::Complete) {
-                        scheduler.complete(identity, job.generation);
-                    } else {
-                        scheduler.requeue(identity, job);
-                    }
-                    scheduler.backlog()
-                };
+                if matches!(active.job.phase, RetentionPhase::Complete) {
+                    self.finish_due(&active)?;
+                } else if self
+                    .store
+                    .index_generation_retention_due_matches(&active.due)
+                    .map_err(retention_due_status)?
+                {
+                    self.put_active(active)?;
+                }
+                let (backlog, oldest_millis) = self.backlog()?;
                 tracing::debug!(
-                    index.id = identity.index_id,
+                    index.id = index_id,
                     gauge.anvil_index_retention_tick_records = work.records as u64,
                     gauge.anvil_index_retention_tick_bytes = work.bytes,
                     gauge.anvil_index_retention_backlog = backlog as u64,
@@ -224,26 +337,10 @@ impl IndexGenerationRetention {
                 Ok(removed)
             }
             Err(error) => {
-                let transient = matches!(
-                    error.code(),
-                    tonic::Code::Unavailable
-                        | tonic::Code::DeadlineExceeded
-                        | tonic::Code::Aborted
-                        | tonic::Code::ResourceExhausted
-                );
-                let (backlog, oldest_millis) = {
-                    let mut scheduler = self.scheduler.lock().map_err(|_| {
-                        Status::internal("index retention scheduler lock is poisoned")
-                    })?;
-                    if transient {
-                        scheduler.retry(identity, job, self.schedule.retry_interval);
-                    } else {
-                        scheduler.fail(identity, job.generation);
-                    }
-                    scheduler.backlog()
-                };
+                self.defer_due(&active.due)?;
+                let (backlog, oldest_millis) = self.backlog()?;
                 tracing::warn!(
-                    index.id = identity.index_id,
+                    index.id = index_id,
                     gauge.anvil_index_retention_backlog = backlog as u64,
                     gauge.anvil_index_retention_oldest_pending_millis = oldest_millis,
                     monotonic_counter.anvil_index_retention_errors_total = 1_u64,
@@ -255,8 +352,164 @@ impl IndexGenerationRetention {
         }
     }
 
+    fn take_active(&self) -> Result<Option<ActiveRetentionJob>, Status> {
+        self.active
+            .lock()
+            .map_err(|_| Status::internal("index retention active-job lock is poisoned"))
+            .map(|mut active| active.take())
+    }
+
+    fn has_active(&self) -> Result<bool, Status> {
+        self.active
+            .lock()
+            .map_err(|_| Status::internal("index retention active-job lock is poisoned"))
+            .map(|active| active.is_some())
+    }
+
+    fn put_active(&self, job: ActiveRetentionJob) -> Result<(), Status> {
+        let mut active = self
+            .active
+            .lock()
+            .map_err(|_| Status::internal("index retention active-job lock is poisoned"))?;
+        *active = Some(job);
+        Ok(())
+    }
+
+    async fn load_due_job(
+        &self,
+        due: IndexGenerationRetentionDue,
+    ) -> Result<Option<RetentionJob>, Status> {
+        if !self
+            .store
+            .index_generation_retention_due_matches(&due)
+            .map_err(retention_due_status)?
+        {
+            return Ok(None);
+        }
+        let Some(locator) = self
+            .store
+            .definition_locator(
+                DefinitionKind::Index,
+                due.tenant_id,
+                due.bucket_id,
+                &due.definition_path,
+            )
+            .map_err(|error| Status::unavailable(error.to_string()))?
+        else {
+            return Err(Status::failed_precondition(
+                "scheduled index definition is no longer live",
+            ));
+        };
+        if locator.definition_id != due.index_id {
+            return Err(Status::data_loss(
+                "scheduled index locator belongs to another index",
+            ));
+        }
+        let Some(object) = load_definition_locator_object(&self.reader, &locator).await? else {
+            return Err(Status::unavailable(
+                "scheduled index definition changed during exact read",
+            ));
+        };
+        let definition = StoredIndexDefinition::decode(&object.bytes)?;
+        if definition.index_id != due.index_id
+            || definition_path(&definition.name)? != due.definition_path
+        {
+            return Err(Status::data_loss(
+                "scheduled retention definition identity is inconsistent",
+            ));
+        }
+        let current = self
+            .publisher
+            .load_current(&definition, due.tenant_id, due.bucket_id)
+            .await?
+            .ok_or_else(|| Status::unavailable("scheduled index has no current generation"))?;
+        if current.manifest.definition_version != locator.object_version.0 {
+            return Err(Status::unavailable(
+                "index definition publication has not reached its current revision",
+            ));
+        }
+        if locator.object_version != due.definition_object_version
+            || current.manifest.generation != due.generation
+        {
+            let replacement = generation_due(
+                &definition,
+                due.tenant_id,
+                due.bucket_id,
+                locator.object_version.0,
+                current.manifest.generation,
+                now_unix_millis()?,
+            )?;
+            self.store
+                .schedule_index_generation_retention(&replacement)
+                .map_err(retention_due_status)?;
+            return Ok(None);
+        }
+        RetentionJob::new(definition, due.tenant_id, due.bucket_id, current).map(Some)
+    }
+
+    fn finish_due(&self, active: &ActiveRetentionJob) -> Result<(), Status> {
+        if let Some(due_at) = active.job.next_due_unix_millis {
+            let replacement = generation_due(
+                &active.job.definition,
+                active.job.tenant_id,
+                active.job.bucket_id,
+                active.job.current.manifest.definition_version,
+                active.job.current.manifest.generation,
+                due_at,
+            )?;
+            self.store
+                .replace_index_generation_retention_due(&active.due, &replacement)
+                .map_err(retention_due_status)?;
+        } else {
+            self.store
+                .complete_index_generation_retention_due(&active.due)
+                .map_err(retention_due_status)?;
+        }
+        Ok(())
+    }
+
+    fn defer_due(&self, due: &IndexGenerationRetentionDue) -> Result<(), Status> {
+        let retry_millis =
+            u64::try_from(self.schedule.retry_interval.as_millis()).unwrap_or(u64::MAX);
+        let mut replacement = due.clone();
+        replacement.due_at_unix_millis = now_unix_millis()?.saturating_add(retry_millis);
+        self.store
+            .replace_index_generation_retention_due(due, &replacement)
+            .map_err(retention_due_status)?;
+        Ok(())
+    }
+
+    fn backlog(&self) -> Result<(usize, u64), Status> {
+        let Some(oldest) = self
+            .store
+            .oldest_index_generation_retention_due()
+            .map_err(retention_due_status)?
+        else {
+            return Ok((0, 0));
+        };
+        Ok((
+            1,
+            now_unix_millis()?.saturating_sub(oldest.due_at_unix_millis),
+        ))
+    }
+
+    fn require_due(&self, expected: &IndexGenerationRetentionDue) -> Result<(), Status> {
+        if self
+            .store
+            .index_generation_retention_due_matches(expected)
+            .map_err(retention_due_status)?
+        {
+            Ok(())
+        } else {
+            Err(Status::aborted(
+                "index retention schedule changed before exact action",
+            ))
+        }
+    }
+
     async fn advance_job(
         &self,
+        due: &IndexGenerationRetentionDue,
         job: &mut RetentionJob,
         work: &mut RetentionWork,
     ) -> Result<u64, Status> {
@@ -271,9 +524,13 @@ impl IndexGenerationRetention {
             let records_before = work.records;
             let bytes_before = work.bytes;
             let advanced = match phase {
-                RetentionPhase::Chain(chain) => self.advance_chain(job, chain, work).await,
-                RetentionPhase::Delete(delete) => self.advance_delete(job, delete, work).await,
-                RetentionPhase::Sweep(sweep) => self.advance_sweep(job, sweep, work).await,
+                RetentionPhase::Initialize => self.advance_initialize(due, job, work).await,
+                RetentionPhase::Discover(discovery) => {
+                    self.advance_discovery(job, discovery, work).await
+                }
+                RetentionPhase::Sort(sort) => self.advance_sort(sort, work).await,
+                RetentionPhase::Trim(proof) => self.advance_trim(due, job, proof, work).await,
+                RetentionPhase::Sweep(sweep) => self.advance_sweep(due, job, sweep, work).await,
                 RetentionPhase::Complete => Ok((RetentionPhase::Complete, 0)),
             };
             let (next, deleted) = match advanced {
@@ -286,11 +543,6 @@ impl IndexGenerationRetention {
             let phase_changed = phase_before != std::mem::discriminant(&next);
             job.phase = next;
             removed = removed.saturating_add(deleted);
-            // A scan page or phase cursor may advance without charging an
-            // artifact record. Yield in that case as well as when the
-            // remaining byte budget cannot admit the next bounded record;
-            // otherwise an unchanged phase could spin for the rest of the
-            // process lifetime.
             if !phase_changed && work.records == records_before && work.bytes == bytes_before {
                 break;
             }
@@ -298,12 +550,134 @@ impl IndexGenerationRetention {
         Ok(removed)
     }
 
+    async fn advance_initialize(
+        &self,
+        due: &IndexGenerationRetentionDue,
+        job: &mut RetentionJob,
+        work: &mut RetentionWork,
+    ) -> RetentionStepResult {
+        let selected = match self
+            .publisher
+            .metadata_retained(&job.current, SystemTime::now())
+        {
+            Ok(selected) => selected,
+            Err(error) => {
+                return Err(RetentionStepError::new(RetentionPhase::Initialize, error));
+            }
+        };
+        if selected != job.current.pointer.retained {
+            if let Err(error) = self.require_due(due) {
+                return Err(RetentionStepError::new(RetentionPhase::Initialize, error));
+            }
+            let trimmed = match self
+                .within(
+                    work,
+                    self.publisher.trim_retained(
+                        &job.definition,
+                        job.tenant_id,
+                        job.bucket_id,
+                        &job.current,
+                        selected,
+                    ),
+                )
+                .await
+            {
+                Ok(trimmed) => trimmed,
+                Err(error) => {
+                    return Err(RetentionStepError::new(RetentionPhase::Initialize, error));
+                }
+            };
+            job.current = trimmed;
+            work.charge(INDEX_COMPONENT_BYTES as u64);
+        }
+        job.next_due_unix_millis = next_age_due(&job.current.pointer, self.config);
+        let discovery = match self
+            .within(
+                work,
+                RetentionDiscovery::new(&job.current, self.scratch.clone()),
+            )
+            .await
+        {
+            Ok(discovery) => discovery,
+            Err(error) => {
+                return Err(RetentionStepError::new(RetentionPhase::Initialize, error));
+            }
+        };
+        Ok((RetentionPhase::Discover(discovery), 0))
+    }
+
+    async fn advance_sort(
+        &self,
+        mut sort: RetainedObjectSort,
+        work: &RetentionWork,
+    ) -> RetentionStepResult {
+        match sort.advance(work.deadline()).await {
+            Ok(Some(proof)) => Ok((RetentionPhase::Trim(proof), 0)),
+            Ok(None) => Ok((RetentionPhase::Sort(sort), 0)),
+            Err(error) => Err(RetentionStepError::new(RetentionPhase::Sort(sort), error)),
+        }
+    }
+
+    async fn advance_trim(
+        &self,
+        due: &IndexGenerationRetentionDue,
+        job: &mut RetentionJob,
+        proof: RetainedObjectProof,
+        work: &mut RetentionWork,
+    ) -> RetentionStepResult {
+        let retained = match select_byte_retained(
+            &job.current.pointer,
+            proof.contributions(),
+            self.config.max_retained_generation_bytes(),
+        ) {
+            Ok(retained) => retained,
+            Err(error) => {
+                return Err(RetentionStepError::new(RetentionPhase::Trim(proof), error));
+            }
+        };
+        if retained != job.current.pointer.retained {
+            if let Err(error) = self.require_due(due) {
+                return Err(RetentionStepError::new(RetentionPhase::Trim(proof), error));
+            }
+            let trimmed = match self
+                .within(
+                    work,
+                    self.publisher.trim_retained(
+                        &job.definition,
+                        job.tenant_id,
+                        job.bucket_id,
+                        &job.current,
+                        retained,
+                    ),
+                )
+                .await
+            {
+                Ok(trimmed) => trimmed,
+                Err(error) => {
+                    return Err(RetentionStepError::new(RetentionPhase::Trim(proof), error));
+                }
+            };
+            job.current = trimmed;
+            work.charge(INDEX_COMPONENT_BYTES as u64);
+        }
+        job.next_due_unix_millis = minimum_due(
+            job.next_due_unix_millis,
+            next_age_due(&job.current.pointer, self.config),
+        );
+        let selected_max_rank = job.current.pointer.retained.len();
+        Ok((
+            RetentionPhase::Sweep(RetentionSweep::new(proof, selected_max_rank)),
+            0,
+        ))
+    }
+
     async fn validate_scheduled_current(
         &self,
         job: &RetentionJob,
         work: &mut RetentionWork,
     ) -> Result<(), Status> {
-        if !work.can_charge(MAX_RETENTION_RECORD_BYTES) {
+        let maximum = INDEX_COMPONENT_BYTES as u64;
+        if !work.can_charge(maximum) {
             return Err(Status::resource_exhausted(
                 "index retention cannot validate the current pointer within this tick",
             ));
@@ -328,18 +702,18 @@ impl IndexGenerationRetention {
                 "scheduled index current pointer changed before retention",
             ));
         }
-        let mut payload = opened
+        let payload = opened
             .payload
             .take()
             .ok_or_else(|| Status::data_loss("live index current pointer has no payload"))?;
         let mut bytes = Vec::new();
         payload
-            .take(MAX_RETENTION_RECORD_BYTES + 1)
+            .take(maximum + 1)
             .read_to_end(&mut bytes)
             .map_err(|error| Status::internal(format!("read index current pointer: {error}")))?;
-        if bytes.len() as u64 > MAX_RETENTION_RECORD_BYTES {
+        if bytes.len() as u64 > maximum {
             return Err(Status::resource_exhausted(
-                "index current pointer exceeds the retention record bound",
+                "index current pointer exceeds the format-v4 component bound",
             ));
         }
         work.charge(bytes.len() as u64);
@@ -353,205 +727,115 @@ impl IndexGenerationRetention {
         Ok(())
     }
 
-    async fn advance_chain(
+    async fn advance_discovery(
         &self,
         job: &RetentionJob,
-        mut chain: RetentionChain,
+        mut discovery: RetentionDiscovery,
         work: &mut RetentionWork,
     ) -> RetentionStepResult {
-        let Some(reference) = chain.previous.clone() else {
-            return Ok((
-                RetentionPhase::Sweep(RetentionSweep::new(chain.retained)),
-                0,
-            ));
-        };
-        if !work.can_charge(MAX_RETENTION_RECORD_BYTES) {
-            return Ok((RetentionPhase::Chain(chain), 0));
-        }
-        if let Err(error) =
-            validate_predecessor(&reference, chain.expected_below, job.definition.index_id)
-        {
-            return Err(RetentionStepError::new(RetentionPhase::Chain(chain), error));
-        }
-        let loaded = match self.within(work, self.load_manifest(job, &reference)).await {
-            Ok(loaded) => loaded,
-            Err(error) => {
-                return Err(RetentionStepError::new(RetentionPhase::Chain(chain), error));
+        if let Some(mut pending) = discovery.pending_manifests.pop_front() {
+            if !work.can_charge(INDEX_COMPONENT_BYTES as u64) {
+                discovery.pending_manifests.push_front(pending);
+                return Ok((RetentionPhase::Discover(discovery), 0));
             }
-        };
-        let (manifest, encoded_bytes) = match loaded {
-            LoadedPredecessor::Present(manifest, encoded_bytes) => (manifest, encoded_bytes),
-            LoadedPredecessor::PreviouslyPruned => {
-                work.charge(reference.path.len() as u64 + 32);
-                return Ok((
-                    RetentionPhase::Sweep(RetentionSweep::new(chain.retained)),
-                    0,
-                ));
-            }
-        };
-        work.charge(encoded_bytes);
-        let now = match now_unix_millis() {
-            Ok(now) => now,
-            Err(error) => {
-                return Err(RetentionStepError::new(RetentionPhase::Chain(chain), error));
-            }
-        };
-        let within_bounds = !chain.obsolete
-            && retain_predecessor(
-                chain.retained_count,
-                chain.retained_bytes,
-                &reference,
-                &manifest,
-                now,
-                self.config,
-            );
-        chain.previous = manifest.previous.clone();
-        chain.expected_below = manifest.generation;
-        if within_bounds {
-            chain.retained.insert(&reference.path, &manifest);
-            chain.retained_count = chain.retained_count.saturating_add(1);
-            chain.retained_bytes = match chain
-                .retained_bytes
-                .checked_add(manifest.authoritative_bytes)
-            {
-                Some(bytes) => bytes,
-                None => {
-                    return Err(RetentionStepError::new(
-                        RetentionPhase::Chain(chain),
-                        Status::resource_exhausted("retained index generation bytes overflow"),
-                    ));
-                }
-            };
-            chain.successor_published_at = reference.published_at_unix_millis;
-            return Ok((RetentionPhase::Chain(chain), 0));
-        }
-        chain.obsolete = true;
-        let safe = now.saturating_sub(chain.successor_published_at) >= PUBLIC_REQUEST_SAFETY_MILLIS;
-        chain.successor_published_at = reference.published_at_unix_millis;
-        if safe {
-            Ok((
-                RetentionPhase::Delete(RetentionDelete::new(chain, reference, manifest)),
-                0,
-            ))
-        } else {
-            Ok((RetentionPhase::Chain(chain), 0))
-        }
-    }
-
-    async fn advance_delete(
-        &self,
-        job: &RetentionJob,
-        mut delete: RetentionDelete,
-        work: &mut RetentionWork,
-    ) -> RetentionStepResult {
-        if let Some(head) = delete.pending.pop_front() {
-            let bytes = head.exact_path.len() as u64 + 64;
-            if !work.can_charge(bytes) {
-                delete.pending.push_front(head);
-                return Ok((RetentionPhase::Delete(delete), 0));
-            }
-            work.charge(bytes);
-            if !head.head.deleted && !head.version.deleted {
-                if let Err(error) = self
-                    .within(
-                        work,
-                        self.delete_exact(job, &head.exact_path, head.version.id, "run"),
-                    )
+            let loaded = match pending.loaded.take() {
+                Some(manifest) => LoadedManifest {
+                    encoded_bytes: pending.reference.blob.length,
+                    manifest,
+                },
+                None => match self
+                    .within(work, self.load_manifest(job, &pending.reference))
                     .await
                 {
-                    delete.pending.push_front(head);
-                    return Err(RetentionStepError::new(
-                        RetentionPhase::Delete(delete),
-                        error,
-                    ));
-                }
-                return Ok((RetentionPhase::Delete(delete), 1));
-            }
-            return Ok((RetentionPhase::Delete(delete), 0));
-        }
-        while delete.run_index < delete.manifest.runs.len() {
-            let run = &delete.manifest.runs[delete.run_index];
-            if delete
-                .chain
-                .retained
-                .run_hashes
-                .contains(&run.root_blob.hash)
-            {
-                delete.run_index += 1;
-                delete.scan = None;
-                continue;
-            }
-            if delete.scan.is_none() {
-                let scan = self.scanner.begin(IndexHeadScanScope::Run {
-                    tenant_id: job.tenant_id,
-                    bucket_id: job.bucket_id,
-                    index_id: job.definition.index_id,
-                    run_hash: run.root_blob.hash,
-                });
-                delete.scan = match scan {
-                    Ok(scan) => Some(scan),
+                    Ok(loaded) => loaded,
                     Err(error) => {
+                        discovery.pending_manifests.push_front(pending);
                         return Err(RetentionStepError::new(
-                            RetentionPhase::Delete(delete),
+                            RetentionPhase::Discover(discovery),
                             error,
                         ));
                     }
-                };
-            }
-            let page = match self
-                .within(
-                    work,
-                    delete.scan.as_mut().expect("run scan exists").next_page(),
-                )
+                },
+            };
+            work.charge(loaded.encoded_bytes);
+            if let Err(error) = discovery
+                .protect_manifest(pending.rank, &pending.reference, &loaded.manifest)
                 .await
             {
-                Ok(page) => page,
-                Err(error) => {
+                pending.loaded = Some(loaded.manifest);
+                discovery.pending_manifests.push_front(pending);
+                return Err(RetentionStepError::new(
+                    RetentionPhase::Discover(discovery),
+                    error,
+                ));
+            }
+            return Ok((RetentionPhase::Discover(discovery), 0));
+        }
+
+        let routing = match discovery.pending_routing.pop().await {
+            Ok(routing) => routing,
+            Err(error) => {
+                return Err(RetentionStepError::new(
+                    RetentionPhase::Discover(discovery),
+                    error,
+                ));
+            }
+        };
+        if let Some(routing) = routing {
+            if !work.can_charge(routing.artifact.object_length) {
+                if let Err(error) = discovery.pending_routing.requeue(routing).await {
                     return Err(RetentionStepError::new(
-                        RetentionPhase::Delete(delete),
+                        RetentionPhase::Discover(discovery),
+                        error,
+                    ));
+                }
+                return Ok((RetentionPhase::Discover(discovery), 0));
+            }
+            let loaded = match self
+                .within(work, self.load_routing_node(job, &routing))
+                .await
+            {
+                Ok(loaded) => loaded,
+                Err(error) => {
+                    if let Err(queue_error) = discovery.pending_routing.requeue(routing).await {
+                        return Err(RetentionStepError::new(
+                            RetentionPhase::Discover(discovery),
+                            queue_error,
+                        ));
+                    }
+                    return Err(RetentionStepError::new(
+                        RetentionPhase::Discover(discovery),
                         error,
                     ));
                 }
             };
-            match page {
-                Some(heads) => {
-                    delete.pending.extend(heads);
-                    return Ok((RetentionPhase::Delete(delete), 0));
+            work.charge(routing.artifact.object_length);
+            if let Err(error) = discovery.protect_routing_children(&routing, loaded).await {
+                if let Err(queue_error) = discovery.pending_routing.requeue(routing).await {
+                    return Err(RetentionStepError::new(
+                        RetentionPhase::Discover(discovery),
+                        queue_error,
+                    ));
                 }
-                None => {
-                    delete.run_index += 1;
-                    delete.scan = None;
-                }
+                return Err(RetentionStepError::new(
+                    RetentionPhase::Discover(discovery),
+                    error,
+                ));
             }
+            return Ok((RetentionPhase::Discover(discovery), 0));
         }
-        let bytes = delete.reference.path.len() as u64 + 64;
-        if !work.can_charge(bytes) {
-            return Ok((RetentionPhase::Delete(delete), 0));
-        }
-        work.charge(bytes);
-        if let Err(error) = self
-            .within(
-                work,
-                self.delete_exact(
-                    job,
-                    &delete.reference.path,
-                    delete.reference.object_version,
-                    "manifest",
-                ),
-            )
-            .await
-        {
-            return Err(RetentionStepError::new(
-                RetentionPhase::Delete(delete),
-                error,
-            ));
-        }
-        Ok((RetentionPhase::Chain(delete.chain), 1))
+
+        tracing::debug!(
+            index.id = job.definition.index_id,
+            "format-v4 retained artifact graph collected into bounded scratch"
+        );
+        Ok((RetentionPhase::Sort(discovery.collector.into_sort()), 0))
     }
 
     async fn advance_sweep(
         &self,
-        job: &RetentionJob,
+        due: &IndexGenerationRetentionDue,
+        job: &mut RetentionJob,
         mut sweep: RetentionSweep,
         work: &mut RetentionWork,
     ) -> RetentionStepResult {
@@ -562,7 +846,12 @@ impl IndexGenerationRetention {
                 return Ok((RetentionPhase::Sweep(sweep), 0));
             }
             work.charge(bytes);
+            job.next_due_unix_millis = minimum_due(job.next_due_unix_millis, candidate.due_at);
             if candidate.delete {
+                if let Err(error) = self.require_due(due) {
+                    sweep.pending.push_front(candidate);
+                    return Err(RetentionStepError::new(RetentionPhase::Sweep(sweep), error));
+                }
                 if let Err(error) = self
                     .within(
                         work,
@@ -578,7 +867,7 @@ impl IndexGenerationRetention {
             return Ok((RetentionPhase::Sweep(sweep), 0));
         }
         if sweep.scan.is_none() {
-            let scan = self.scanner.begin(IndexHeadScanScope::Artifacts {
+            let scan = self.scanner.begin(IndexHeadScanScope {
                 tenant_id: job.tenant_id,
                 bucket_id: job.bucket_id,
                 index_id: job.definition.index_id,
@@ -616,31 +905,28 @@ impl IndexGenerationRetention {
             }
         };
         for head in heads {
-            sweep
-                .pending
-                .extend(sweep_candidates(job, &sweep.retained, head, now));
+            match self
+                .within(work, classify_sweep_candidate(job, &mut sweep, head, now))
+                .await
+            {
+                Ok(Some(candidate)) => sweep.pending.push_back(candidate),
+                Ok(None) => {}
+                Err(error) => {
+                    return Err(RetentionStepError::new(RetentionPhase::Sweep(sweep), error));
+                }
+            }
         }
         Ok((RetentionPhase::Sweep(sweep), 0))
-    }
-
-    async fn within<T>(
-        &self,
-        work: &RetentionWork,
-        operation: impl std::future::Future<Output = Result<T, Status>>,
-    ) -> Result<T, Status> {
-        let remaining = work.remaining().ok_or_else(|| {
-            Status::deadline_exceeded("index retention exhausted its tick time budget")
-        })?;
-        tokio::time::timeout(remaining, operation)
-            .await
-            .map_err(|_| Status::deadline_exceeded("index retention operation timed out"))?
     }
 
     async fn load_manifest(
         &self,
         job: &RetentionJob,
         reference: &ManifestReference,
-    ) -> Result<LoadedPredecessor, Status> {
+    ) -> Result<LoadedManifest, Status> {
+        reference
+            .validate(job.definition.index_id)
+            .map_err(|error| Status::data_loss(error.to_string()))?;
         let key = ObjectKey::new(
             &job.definition.tenant,
             &job.definition.bucket,
@@ -657,47 +943,141 @@ impl IndexGenerationRetention {
             )
             .await?
         else {
-            let current = self
-                .reader
-                .head_stable(&key, job.tenant_id, job.bucket_id)
-                .await?;
-            return classify_absent_predecessor(reference.object_version, current.as_ref());
+            return Err(Status::data_loss(
+                "retained format-v4 manifest object is absent",
+            ));
         };
         if opened.version.id != reference.object_version
             || opened.version.deleted
             || opened.version.blob.as_ref() != Some(&reference.blob)
         {
             return Err(Status::data_loss(
-                "index predecessor object differs from its manifest reference",
+                "retained format-v4 manifest differs from its exact reference",
+            ));
+        }
+        let payload = opened
+            .payload
+            .take()
+            .ok_or_else(|| Status::data_loss("retained format-v4 manifest has no payload"))?;
+        let mut bytes = Vec::new();
+        payload
+            .take(INDEX_COMPONENT_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| Status::internal(format!("read format-v4 manifest: {error}")))?;
+        if bytes.len() > INDEX_COMPONENT_BYTES
+            || bytes.len() as u64 != reference.blob.length
+            || blake3::hash(&bytes).as_bytes() != &reference.blob.hash
+        {
+            return Err(Status::data_loss(
+                "retained format-v4 manifest bytes differ from their reference",
+            ));
+        }
+        let manifest = IndexGenerationManifest::decode(&bytes)
+            .map_err(|error| Status::data_loss(error.to_string()))?;
+        validate_manifest_reference(reference, &manifest, job.definition.index_id)?;
+        Ok(LoadedManifest {
+            manifest,
+            encoded_bytes: bytes.len() as u64,
+        })
+    }
+
+    async fn load_routing_node(
+        &self,
+        job: &RetentionJob,
+        routing: &RoutingArtifact,
+    ) -> Result<LoadedRoutingNode, Status> {
+        let descriptor = &routing.artifact;
+        descriptor
+            .validate(job.definition.index_id)
+            .map_err(index_integrity_status)?;
+        let key = ObjectKey::new(
+            &job.definition.tenant,
+            &job.definition.bucket,
+            &descriptor.path,
+        )
+        .map_err(|error| Status::internal(error.to_string()))?;
+        let Some(mut opened) = self
+            .reader
+            .open_stable(
+                &key,
+                job.tenant_id,
+                job.bucket_id,
+                Some(VersionId(descriptor.object_version)),
+            )
+            .await?
+        else {
+            return Err(Status::data_loss(
+                "retained format-v4 routing artifact is absent",
+            ));
+        };
+        let expected_blob = BlobRef {
+            hash: descriptor.object_content_hash,
+            length: descriptor.object_length,
+        };
+        if opened.version.id != VersionId(descriptor.object_version)
+            || opened.version.deleted
+            || opened.version.blob.as_ref() != Some(&expected_blob)
+        {
+            return Err(Status::data_loss(
+                "retained format-v4 routing artifact differs from its exact reference",
             ));
         }
         let mut payload = opened
             .payload
             .take()
-            .ok_or_else(|| Status::data_loss("live index predecessor manifest has no payload"))?;
-        let mut bytes = Vec::new();
+            .ok_or_else(|| Status::data_loss("retained routing artifact has no payload"))?;
+        let skipped = std::io::copy(
+            &mut payload.by_ref().take(descriptor.offset),
+            &mut std::io::sink(),
+        )
+        .map_err(|error| Status::internal(format!("seek format-v4 routing artifact: {error}")))?;
+        if skipped != descriptor.offset {
+            return Err(Status::data_loss(
+                "format-v4 routing artifact offset exceeds its object",
+            ));
+        }
+        let mut bytes = Vec::with_capacity(
+            usize::try_from(descriptor.encoded_length)
+                .map_err(|_| Status::resource_exhausted("routing component exceeds platform"))?,
+        );
         payload
-            .take(MAX_RETENTION_RECORD_BYTES + 1)
+            .take(descriptor.encoded_length + 1)
             .read_to_end(&mut bytes)
             .map_err(|error| {
-                Status::internal(format!("read index predecessor manifest: {error}"))
+                Status::internal(format!("read format-v4 routing artifact: {error}"))
             })?;
-        if bytes.len() as u64 > MAX_RETENTION_RECORD_BYTES {
-            return Err(Status::resource_exhausted(
-                "index predecessor manifest exceeds the retention record bound",
+        if bytes.len() as u64 != descriptor.encoded_length {
+            return Err(Status::data_loss(
+                "format-v4 routing component length differs from its descriptor",
             ));
         }
-        let manifest = IndexGenerationManifest::decode(&bytes)
-            .map_err(|error| Status::data_loss(error.to_string()))?;
-        if manifest.index_id != job.definition.index_id
-            || manifest.generation != reference.generation
-            || manifest.definition_version != reference.definition_version
+        let identity = component_identity(&bytes)?;
+        routing.expected_identity.require(identity)?;
+        let decoded = decode_component(
+            &bytes,
+            identity,
+            ComponentKind::ROUTING_NODE,
+            descriptor.codec_version,
+        )
+        .map_err(index_integrity_status)?;
+        if decoded.header.logical_length != descriptor.logical_length
+            || decoded.header.payload_checksum != descriptor.checksum
         {
             return Err(Status::data_loss(
-                "index predecessor manifest identity differs from its reference",
+                "format-v4 routing component differs from its descriptor",
             ));
         }
-        Ok(LoadedPredecessor::Present(manifest, bytes.len() as u64))
+        let node = RoutingNode::decode_payload(job.definition.index_id, decoded.payload)
+            .map_err(index_integrity_status)?;
+        if routing
+            .expected_height
+            .is_some_and(|expected| node.height != expected)
+        {
+            return Err(Status::data_loss(
+                "format-v4 routing tree height is not strictly descending",
+            ));
+        }
+        Ok(LoadedRoutingNode { identity, node })
     }
 
     async fn delete_exact(
@@ -722,6 +1102,19 @@ impl IndexGenerationRetention {
             .await?;
         Ok(())
     }
+
+    async fn within<T>(
+        &self,
+        work: &RetentionWork,
+        operation: impl std::future::Future<Output = Result<T, Status>>,
+    ) -> Result<T, Status> {
+        let remaining = work.remaining().ok_or_else(|| {
+            Status::deadline_exceeded("index retention exhausted its tick time budget")
+        })?;
+        tokio::time::timeout(remaining, operation)
+            .await
+            .map_err(|_| Status::deadline_exceeded("index retention operation timed out"))?
+    }
 }
 
 pub(crate) struct IndexRetentionTask {
@@ -734,183 +1127,18 @@ impl Drop for IndexRetentionTask {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct RetentionIdentity {
-    tenant_id: u64,
-    bucket_id: u64,
-    index_id: u64,
-}
-
-impl RetentionIdentity {
-    fn new(tenant_id: u64, bucket_id: u64, index_id: u64) -> Result<Self, Status> {
-        if tenant_id == 0 || bucket_id == 0 || index_id == 0 {
-            return Err(Status::data_loss(
-                "index retention identity contains a zero stable ID",
-            ));
-        }
-        Ok(Self {
-            tenant_id,
-            bucket_id,
-            index_id,
-        })
-    }
-}
-
-#[derive(Default)]
-struct RetentionScheduler {
-    jobs: BTreeMap<RetentionIdentity, RetentionJob>,
-    running: BTreeMap<RetentionIdentity, u64>,
-    ready: VecDeque<RetentionIdentity>,
-    queued: BTreeSet<RetentionIdentity>,
-    delayed: BTreeMap<RetentionIdentity, (Instant, u64)>,
-    waiting: BTreeSet<RetentionIdentity>,
-}
-
-impl RetentionScheduler {
-    fn register(&mut self, identity: RetentionIdentity, job: RetentionJob) -> Result<(), Status> {
-        let known_generation = self
-            .jobs
-            .get(&identity)
-            .map(|job| job.generation)
-            .into_iter()
-            .chain(self.running.get(&identity).copied())
-            .max();
-        if known_generation.is_some_and(|known| known >= job.generation) {
-            return Ok(());
-        }
-        if known_generation.is_none() && self.active_len() >= MAX_ACTIVE_RETENTION_JOBS {
-            return Err(Status::resource_exhausted(
-                "node-wide active index retention lease limit reached",
-            ));
-        }
-        self.waiting.remove(&identity);
-        self.delayed.remove(&identity);
-        self.jobs.insert(identity, job);
-        self.queue_if_runnable(identity);
-        Ok(())
-    }
-
-    fn pop(&mut self) -> Option<(RetentionIdentity, RetentionJob)> {
-        let now = Instant::now();
-        let due = self
-            .delayed
-            .iter()
-            .filter_map(|(identity, (due, generation))| {
-                (*due <= now).then_some((*identity, *generation))
-            })
-            .collect::<Vec<_>>();
-        for (identity, generation) in due {
-            self.delayed.remove(&identity);
-            if self
-                .jobs
-                .get(&identity)
-                .is_some_and(|job| job.generation == generation)
-            {
-                self.waiting.remove(&identity);
-                self.queue_if_runnable(identity);
-            }
-        }
-        while let Some(identity) = self.ready.pop_front() {
-            self.queued.remove(&identity);
-            if let Some(job) = self.jobs.remove(&identity) {
-                self.running.insert(identity, job.generation);
-                return Some((identity, job));
-            }
-        }
-        None
-    }
-
-    fn requeue(&mut self, identity: RetentionIdentity, job: RetentionJob) {
-        if self.running.remove(&identity) != Some(job.generation) {
-            self.queue_if_runnable(identity);
-            return;
-        }
-        self.waiting.remove(&identity);
-        if self
-            .jobs
-            .get(&identity)
-            .is_none_or(|replacement| replacement.generation <= job.generation)
-        {
-            self.jobs.insert(identity, job);
-        }
-        self.queue_if_runnable(identity);
-    }
-
-    fn complete(&mut self, identity: RetentionIdentity, generation: u64) {
-        if self.running.remove(&identity) != Some(generation) {
-            self.queue_if_runnable(identity);
-            return;
-        }
-        self.queue_if_runnable(identity);
-    }
-
-    fn retry(&mut self, identity: RetentionIdentity, job: RetentionJob, _retry: Duration) {
-        // Durable assignment rediscovery is the retry queue. Drop disposable
-        // traversal state so one failing retention job cannot pin one of the
-        // bounded node-wide leases.
-        self.fail(identity, job.generation);
-    }
-
-    fn fail(&mut self, identity: RetentionIdentity, generation: u64) {
-        if self.running.remove(&identity) != Some(generation) {
-            self.queue_if_runnable(identity);
-            return;
-        }
-        self.queued.remove(&identity);
-        self.waiting.remove(&identity);
-        self.queue_if_runnable(identity);
-    }
-
-    fn remove(&mut self, identity: RetentionIdentity) {
-        self.jobs.remove(&identity);
-        self.running.remove(&identity);
-        self.queued.remove(&identity);
-        self.ready.retain(|queued| *queued != identity);
-        self.waiting.remove(&identity);
-        self.delayed.remove(&identity);
-    }
-
-    fn queue_if_runnable(&mut self, identity: RetentionIdentity) {
-        if self.jobs.contains_key(&identity)
-            && !self.running.contains_key(&identity)
-            && !self.waiting.contains(&identity)
-            && self.queued.insert(identity)
-        {
-            self.ready.push_back(identity);
-        }
-    }
-
-    fn active_len(&self) -> usize {
-        self.running.len()
-            + self
-                .jobs
-                .keys()
-                .filter(|identity| !self.running.contains_key(identity))
-                .count()
-    }
-
-    fn backlog(&self) -> (usize, u64) {
-        let oldest = self
-            .jobs
-            .values()
-            .map(|job| job.started.elapsed())
-            .max()
-            .unwrap_or_default();
-        (
-            self.active_len(),
-            oldest.as_millis().min(u128::from(u64::MAX)) as u64,
-        )
-    }
+struct ActiveRetentionJob {
+    due: IndexGenerationRetentionDue,
+    job: RetentionJob,
 }
 
 struct RetentionJob {
     definition: StoredIndexDefinition,
     tenant_id: u64,
     bucket_id: u64,
-    generation: u64,
     current: PublishedGeneration,
     current_validated: bool,
-    started: Instant,
+    next_due_unix_millis: Option<u64>,
     phase: RetentionPhase,
 }
 
@@ -920,35 +1148,24 @@ impl RetentionJob {
         tenant_id: u64,
         bucket_id: u64,
         current: PublishedGeneration,
-    ) -> Self {
-        let mut retained = RetainedArtifacts::default();
-        retained.insert(&current.pointer.manifest_path, &current.manifest);
-        let generation = current.manifest.generation;
-        let phase = RetentionPhase::Chain(RetentionChain {
-            retained,
-            retained_count: 1,
-            retained_bytes: current.manifest.authoritative_bytes,
-            obsolete: false,
-            successor_published_at: current.pointer.published_at_unix_millis,
-            previous: current.manifest.previous.clone(),
-            expected_below: current.manifest.generation,
-        });
-        Self {
+    ) -> Result<Self, Status> {
+        Ok(Self {
             definition,
             tenant_id,
             bucket_id,
-            generation,
             current,
             current_validated: false,
-            started: Instant::now(),
-            phase,
-        }
+            next_due_unix_millis: None,
+            phase: RetentionPhase::Initialize,
+        })
     }
 }
 
 enum RetentionPhase {
-    Chain(RetentionChain),
-    Delete(RetentionDelete),
+    Initialize,
+    Discover(RetentionDiscovery),
+    Sort(RetainedObjectSort),
+    Trim(RetainedObjectProof),
     Sweep(RetentionSweep),
     Complete,
 }
@@ -966,52 +1183,379 @@ impl RetentionStepError {
     }
 }
 
-struct RetentionChain {
-    retained: RetainedArtifacts,
-    retained_count: u32,
-    retained_bytes: u64,
-    obsolete: bool,
-    successor_published_at: u64,
-    previous: Option<ManifestReference>,
-    expected_below: u64,
+struct RetentionDiscovery {
+    index_id: u64,
+    collector: RetainedObjectCollector,
+    pending_manifests: VecDeque<RankedManifest>,
+    pending_routing: RoutingScratchQueue,
 }
 
-struct RetentionDelete {
-    chain: RetentionChain,
-    reference: ManifestReference,
-    manifest: IndexGenerationManifest,
-    run_index: usize,
-    scan: Option<ClusterIndexScan>,
-    pending: VecDeque<IndexCurrentHead>,
-}
+impl RetentionDiscovery {
+    async fn new(
+        current: &PublishedGeneration,
+        scratch: IndexMergeScratchSpace,
+    ) -> Result<Self, Status> {
+        let mut pending_manifests = VecDeque::new();
+        pending_manifests.push_back(RankedManifest {
+            rank: 0,
+            reference: current.pointer.current.clone(),
+            loaded: Some(current.manifest.clone()),
+        });
+        pending_manifests.extend(current.pointer.retained.iter().cloned().enumerate().map(
+            |(index, reference)| RankedManifest {
+                rank: index + 1,
+                reference,
+                loaded: None,
+            },
+        ));
+        Ok(Self {
+            index_id: current.manifest.index_id,
+            collector: RetainedObjectCollector::new(scratch.clone()).await?,
+            pending_manifests,
+            pending_routing: RoutingScratchQueue::new(scratch).await?,
+        })
+    }
 
-impl RetentionDelete {
-    fn new(
-        chain: RetentionChain,
-        reference: ManifestReference,
-        manifest: IndexGenerationManifest,
-    ) -> Self {
-        Self {
-            chain,
-            reference,
-            manifest,
-            run_index: 0,
-            scan: None,
-            pending: VecDeque::new(),
+    async fn protect_manifest(
+        &mut self,
+        rank: usize,
+        reference: &ManifestReference,
+        manifest: &IndexGenerationManifest,
+    ) -> Result<(), Status> {
+        validate_manifest_reference(reference, manifest, self.index_id)?;
+        let mut records = vec![RetainedObjectRecord::new(
+            RETAINED_MANIFEST_CLASS,
+            reference.blob.hash,
+            reference.object_version.0,
+            reference.blob.length,
+            rank,
+        )?];
+        let mut routing = Vec::new();
+        for segment in &manifest.segments {
+            let expected = ExpectedComponentIdentity::exact(segment.identity);
+            for component in &segment.components {
+                self.prepare_artifact(
+                    rank,
+                    component.artifact.clone(),
+                    component.role,
+                    expected,
+                    None,
+                    &mut records,
+                    &mut routing,
+                )?;
+            }
         }
+        for locator in &manifest.locator_roots {
+            self.prepare_artifact(
+                rank,
+                locator.artifact.clone(),
+                ComponentKind::PATH_LOCATOR,
+                ExpectedComponentIdentity::exact(locator.identity),
+                None,
+                &mut records,
+                &mut routing,
+            )?;
+        }
+        self.collector.append(records).await?;
+        self.pending_routing.push_many(routing).await?;
+        Ok(())
+    }
+
+    fn prepare_artifact(
+        &self,
+        rank: usize,
+        artifact: ArtifactDescriptor,
+        role: ComponentKind,
+        expected_identity: ExpectedComponentIdentity,
+        expected_height: Option<u8>,
+        records: &mut Vec<RetainedObjectRecord>,
+        routing: &mut Vec<RoutingArtifact>,
+    ) -> Result<(), Status> {
+        artifact
+            .validate(self.index_id)
+            .map_err(index_integrity_status)?;
+        if artifact.component_kind != ComponentKind::ROUTING_NODE && artifact.component_kind != role
+        {
+            return Err(Status::data_loss(
+                "format-v4 artifact graph leaf has the wrong logical role",
+            ));
+        }
+        records.push(RetainedObjectRecord::new(
+            RETAINED_ARTIFACT_CLASS,
+            artifact.object_content_hash,
+            artifact.object_version,
+            artifact.object_length,
+            rank,
+        )?);
+        if artifact.component_kind == ComponentKind::ROUTING_NODE {
+            routing.push(RoutingArtifact {
+                rank,
+                artifact,
+                role,
+                expected_identity,
+                expected_height,
+            });
+        }
+        Ok(())
+    }
+
+    async fn protect_routing_children(
+        &mut self,
+        routing: &RoutingArtifact,
+        loaded: LoadedRoutingNode,
+    ) -> Result<(), Status> {
+        let child_height = loaded.node.height.checked_sub(1);
+        let mut records = Vec::with_capacity(loaded.node.entries().len());
+        let mut pending = Vec::new();
+        for entry in loaded.node.entries() {
+            if loaded.node.height == 1 && entry.child.component_kind != routing.role {
+                return Err(Status::data_loss(
+                    "format-v4 routing leaf has the wrong logical component kind",
+                ));
+            }
+            self.prepare_artifact(
+                routing.rank,
+                entry.child.clone(),
+                routing.role,
+                ExpectedComponentIdentity::exact(loaded.identity),
+                child_height.filter(|height| *height != 0),
+                &mut records,
+                &mut pending,
+            )?;
+        }
+        self.collector.append(records).await?;
+        self.pending_routing.push_many(pending).await?;
+        Ok(())
     }
 }
 
+struct RankedManifest {
+    rank: usize,
+    reference: ManifestReference,
+    loaded: Option<IndexGenerationManifest>,
+}
+
+struct RoutingScratchQueue {
+    file: IndexMergeScratchFile,
+    next_record: u64,
+    records: u64,
+    retry: Option<RoutingArtifact>,
+}
+
+impl RoutingScratchQueue {
+    async fn new(scratch: IndexMergeScratchSpace) -> Result<Self, Status> {
+        Ok(Self {
+            file: scratch.create_file().await.map_err(scratch_status)?,
+            next_record: 0,
+            records: 0,
+            retry: None,
+        })
+    }
+
+    async fn push_many(
+        &mut self,
+        routing: impl IntoIterator<Item = RoutingArtifact>,
+    ) -> Result<(), Status> {
+        let unique = routing
+            .into_iter()
+            .map(|routing| encode_routing(&routing))
+            .collect::<BTreeSet<_>>();
+        let mut bytes = Vec::new();
+        let mut count = 0_u64;
+        for routing in unique {
+            bytes.extend_from_slice(&routing);
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| Status::resource_exhausted("routing scratch count overflowed"))?;
+        }
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        self.file.append(bytes).await.map_err(scratch_status)?;
+        self.records = self
+            .records
+            .checked_add(count)
+            .ok_or_else(|| Status::resource_exhausted("routing scratch count overflowed"))?;
+        Ok(())
+    }
+
+    async fn pop(&mut self) -> Result<Option<RoutingArtifact>, Status> {
+        if self.retry.is_some() {
+            return Ok(self.retry.take());
+        }
+        if self.next_record >= self.records {
+            return Ok(None);
+        }
+        let offset = self
+            .next_record
+            .checked_mul(ROUTING_SCRATCH_RECORD_BYTES as u64)
+            .ok_or_else(|| Status::resource_exhausted("routing scratch offset overflowed"))?;
+        let bytes = self
+            .file
+            .read_exact_at(offset, ROUTING_SCRATCH_RECORD_BYTES)
+            .await
+            .map_err(scratch_status)?;
+        self.next_record += 1;
+        decode_routing(&bytes).map(Some)
+    }
+
+    async fn requeue(&mut self, routing: RoutingArtifact) -> Result<(), Status> {
+        if self.retry.replace(routing).is_some() {
+            return Err(Status::internal(
+                "routing scratch queue has two retry records",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn encode_routing(routing: &RoutingArtifact) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(ROUTING_SCRATCH_RECORD_BYTES);
+    bytes.push(routing.rank as u8);
+    bytes.extend_from_slice(&routing.role.get().to_be_bytes());
+    bytes.extend_from_slice(&routing.expected_identity.index_id.to_be_bytes());
+    bytes.extend_from_slice(&routing.expected_identity.definition_version.to_be_bytes());
+    bytes.extend_from_slice(&routing.expected_identity.schema_fingerprint);
+    bytes.extend_from_slice(
+        &routing
+            .expected_identity
+            .segment_id
+            .unwrap_or(0)
+            .to_be_bytes(),
+    );
+    bytes.push(routing.expected_height.unwrap_or(0));
+    bytes.extend_from_slice(&routing.artifact.object_content_hash);
+    bytes.extend_from_slice(&routing.artifact.object_version.to_be_bytes());
+    bytes.extend_from_slice(&routing.artifact.object_length.to_be_bytes());
+    bytes.extend_from_slice(&routing.artifact.offset.to_be_bytes());
+    bytes.extend_from_slice(&routing.artifact.encoded_length.to_be_bytes());
+    bytes.extend_from_slice(&routing.artifact.logical_length.to_be_bytes());
+    bytes.extend_from_slice(&routing.artifact.component_kind.get().to_be_bytes());
+    bytes.extend_from_slice(&routing.artifact.codec_version.to_be_bytes());
+    bytes.extend_from_slice(&routing.artifact.checksum);
+    debug_assert_eq!(bytes.len(), ROUTING_SCRATCH_RECORD_BYTES);
+    bytes
+}
+
+fn decode_routing(bytes: &[u8]) -> Result<RoutingArtifact, Status> {
+    if bytes.len() != ROUTING_SCRATCH_RECORD_BYTES {
+        return Err(Status::data_loss("routing scratch record is truncated"));
+    }
+    let rank = usize::from(bytes[0]);
+    if rank >= RETENTION_GENERATION_SLOTS {
+        return Err(Status::data_loss(
+            "routing scratch generation rank is invalid",
+        ));
+    }
+    let role = ComponentKind::new(read_be_u16(bytes, 1)?).map_err(index_integrity_status)?;
+    let index_id = read_be_u64(bytes, 3)?;
+    let expected_identity = ExpectedComponentIdentity {
+        index_id,
+        definition_version: read_be_u64(bytes, 11)?,
+        schema_fingerprint: bytes[19..51]
+            .try_into()
+            .map_err(|_| Status::data_loss("routing scratch schema is truncated"))?,
+        segment_id: match read_be_u64(bytes, 51)? {
+            0 => None,
+            value => Some(value),
+        },
+    };
+    let expected_height = match bytes[59] {
+        0 => None,
+        height => Some(height),
+    };
+    let object_content_hash = bytes[60..92]
+        .try_into()
+        .map_err(|_| Status::data_loss("routing scratch object hash is truncated"))?;
+    let artifact = ArtifactDescriptor::new(
+        index_id,
+        super::publication::artifact_path(index_id, object_content_hash),
+        read_be_u64(bytes, 92)?,
+        object_content_hash,
+        read_be_u64(bytes, 100)?,
+        read_be_u64(bytes, 108)?,
+        read_be_u64(bytes, 116)?,
+        read_be_u64(bytes, 124)?,
+        ComponentKind::new(read_be_u16(bytes, 132)?).map_err(index_integrity_status)?,
+        read_be_u16(bytes, 134)?,
+        bytes[136..168]
+            .try_into()
+            .map_err(|_| Status::data_loss("routing scratch checksum is truncated"))?,
+    )
+    .map_err(index_integrity_status)?;
+    Ok(RoutingArtifact {
+        rank,
+        artifact,
+        role,
+        expected_identity,
+        expected_height,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ExpectedComponentIdentity {
+    index_id: u64,
+    definition_version: u64,
+    schema_fingerprint: [u8; 32],
+    segment_id: Option<u64>,
+}
+
+impl ExpectedComponentIdentity {
+    fn exact(identity: SegmentIdentity) -> Self {
+        Self {
+            index_id: identity.index_id,
+            definition_version: identity.definition_version,
+            schema_fingerprint: identity.schema_fingerprint,
+            segment_id: Some(identity.segment_id),
+        }
+    }
+
+    fn require(self, actual: SegmentIdentity) -> Result<(), Status> {
+        if actual.index_id != self.index_id
+            || actual.definition_version != self.definition_version
+            || actual.schema_fingerprint != self.schema_fingerprint
+            || self
+                .segment_id
+                .is_some_and(|expected| actual.segment_id != expected)
+        {
+            return Err(Status::data_loss(
+                "format-v4 routing component identity differs from its generation",
+            ));
+        }
+        Ok(())
+    }
+}
+
+struct RoutingArtifact {
+    rank: usize,
+    artifact: ArtifactDescriptor,
+    role: ComponentKind,
+    expected_identity: ExpectedComponentIdentity,
+    expected_height: Option<u8>,
+}
+
+struct LoadedRoutingNode {
+    identity: SegmentIdentity,
+    node: RoutingNode,
+}
+
+struct LoadedManifest {
+    manifest: IndexGenerationManifest,
+    encoded_bytes: u64,
+}
+
 struct RetentionSweep {
-    retained: RetainedArtifacts,
+    proof: RetainedObjectProof,
+    selected_max_rank: usize,
     scan: Option<ClusterIndexScan>,
     pending: VecDeque<SweepCandidate>,
 }
 
 impl RetentionSweep {
-    fn new(retained: RetainedArtifacts) -> Self {
+    fn new(proof: RetainedObjectProof, selected_max_rank: usize) -> Self {
         Self {
-            retained,
+            proof,
+            selected_max_rank,
             scan: None,
             pending: VecDeque::new(),
         }
@@ -1023,55 +1567,95 @@ struct SweepCandidate {
     version: VersionId,
     class: &'static str,
     delete: bool,
+    due_at: Option<u64>,
 }
 
-fn sweep_candidates(
+async fn classify_sweep_candidate(
     job: &RetentionJob,
-    retained: &RetainedArtifacts,
+    sweep: &mut RetentionSweep,
     head: IndexCurrentHead,
     now: u64,
-) -> Vec<SweepCandidate> {
-    if head.exact_path == current_path(job.definition.index_id) {
-        return if head.version.id != head.head.version
-            && !head.version.deleted
-            && head.version.blob.is_some()
-        {
-            vec![SweepCandidate {
-                path: head.exact_path,
-                version: head.version.id,
-                class: "current",
-                delete: true,
-            }]
+) -> Result<Option<SweepCandidate>, Status> {
+    let index_id = job.definition.index_id;
+    if head.version.deleted || head.version.blob.is_none() {
+        return Ok(None);
+    }
+    let (class, safety_age, protected) =
+        if head.exact_path == current_path(index_id) {
+            (
+                "current",
+                PUBLIC_REQUEST_SAFETY_MILLIS,
+                head.version.id == job.current.current_object_version
+                    || (!head.head.deleted && head.version.id == head.head.version),
+            )
+        } else if is_manifest_artifact_path(index_id, &head.exact_path) {
+            let blob =
+                head.version.blob.as_ref().ok_or_else(|| {
+                    Status::data_loss("live index manifest has no blob reference")
+                })?;
+            if manifest_hash_from_path(index_id, &head.exact_path) != Some(blob.hash) {
+                return Err(Status::data_loss(
+                    "index manifest path and object blob hash disagree",
+                ));
+            }
+            let protected = sweep
+                .proof
+                .lookup(RETAINED_MANIFEST_CLASS, blob.hash, head.version.id.0)
+                .await?;
+            if let Some((bytes, _)) = protected
+                && bytes != blob.length
+            {
+                return Err(Status::data_loss(
+                    "retained manifest proof has a conflicting object length",
+                ));
+            }
+            (
+                "manifest",
+                UNREACHABLE_ARTIFACT_SAFETY_MILLIS,
+                protected.is_some_and(|(_, rank)| rank <= sweep.selected_max_rank),
+            )
+        } else if let Some(hash) = artifact_hash_from_path(index_id, &head.exact_path) {
+            let blob =
+                head.version.blob.as_ref().ok_or_else(|| {
+                    Status::data_loss("live index artifact has no blob reference")
+                })?;
+            if blob.hash != hash {
+                return Err(Status::data_loss(
+                    "index artifact path and object blob hash disagree",
+                ));
+            }
+            let protected = sweep
+                .proof
+                .lookup(RETAINED_ARTIFACT_CLASS, hash, head.version.id.0)
+                .await?;
+            if let Some((bytes, _)) = protected
+                && bytes != blob.length
+            {
+                return Err(Status::data_loss(
+                    "retained artifact proof has a conflicting object length",
+                ));
+            }
+            (
+                "artifact",
+                UNREACHABLE_ARTIFACT_SAFETY_MILLIS,
+                protected.is_some_and(|(_, rank)| rank <= sweep.selected_max_rank),
+            )
         } else {
-            Vec::new()
+            return Ok(None);
         };
-    }
-    // Artifact pages carry one retained descriptor per record. Only the
-    // current descriptor determines whether a non-current-pointer artifact is
-    // presently reachable; older retained descriptors are handled by exact
-    // version deletion when their generation becomes obsolete.
-    if head.version.id != head.head.version {
-        return Vec::new();
-    }
     let age = now.saturating_sub(head.version.committed_at_unix_millis);
-    let retained_path = if is_manifest_artifact_path(job.definition.index_id, &head.exact_path) {
-        retained.manifest_paths.contains(&head.exact_path)
-    } else if let Some(run_hash) =
-        run_hash_from_artifact_path(job.definition.index_id, &head.exact_path)
-    {
-        retained.run_hashes.contains(&run_hash)
-    } else {
-        true
-    };
-    vec![SweepCandidate {
-        path: head.exact_path,
+    let due_at = (!protected && age < safety_age).then_some(
+        head.version
+            .committed_at_unix_millis
+            .saturating_add(safety_age),
+    );
+    Ok(Some(SweepCandidate {
+        path: head.exact_path.clone(),
         version: head.version.id,
-        class: "unreachable",
-        delete: !head.head.deleted
-            && !head.version.deleted
-            && age >= UNREACHABLE_ARTIFACT_SAFETY_MILLIS
-            && !retained_path,
-    }]
+        class,
+        delete: age >= safety_age && !protected,
+        due_at,
+    }))
 }
 
 struct RetentionWork {
@@ -1110,99 +1694,192 @@ impl RetentionWork {
     fn remaining(&self) -> Option<Duration> {
         self.budget.max_time.checked_sub(self.started.elapsed())
     }
+
+    fn deadline(&self) -> Instant {
+        self.started + self.budget.max_time
+    }
 }
 
-enum LoadedPredecessor {
-    Present(IndexGenerationManifest, u64),
-    PreviouslyPruned,
-}
-
-fn classify_absent_predecessor(
-    referenced_version: VersionId,
-    current: Option<&anvil_store::Version>,
-) -> Result<LoadedPredecessor, Status> {
-    match current {
-        Some(version)
-            if version.id > referenced_version && version.deleted && version.blob.is_none() =>
-        {
-            Ok(LoadedPredecessor::PreviouslyPruned)
+fn select_byte_retained(
+    pointer: &IndexCurrentPointer,
+    contributions: &[u64; RETENTION_GENERATION_SLOTS],
+    maximum_bytes: u64,
+) -> Result<Vec<ManifestReference>, Status> {
+    let mut total = contributions[0];
+    let mut retained = Vec::new();
+    for (index, reference) in pointer.retained.iter().enumerate() {
+        let rank = index + 1;
+        let candidate = total.checked_add(contributions[rank]).ok_or_else(|| {
+            Status::resource_exhausted("retained generation byte total overflowed")
+        })?;
+        if candidate > maximum_bytes {
+            break;
         }
-        Some(_) => Err(Status::data_loss(
-            "index predecessor version is absent while its object path remains live",
-        )),
-        None => Err(Status::data_loss(
-            "index predecessor version disappeared without a retention tombstone",
-        )),
+        total = candidate;
+        retained.push(reference.clone());
+    }
+    Ok(retained)
+}
+
+fn next_age_due(pointer: &IndexCurrentPointer, config: IndexRuntimeConfig) -> Option<u64> {
+    let maximum_age_millis = config
+        .max_generation_age_hours()
+        .saturating_mul(60 * 60 * 1_000);
+    pointer
+        .retained
+        .iter()
+        .map(|reference| {
+            reference
+                .published_at_unix_millis
+                .saturating_add(maximum_age_millis)
+                .saturating_add(1)
+        })
+        .min()
+}
+
+fn generation_due(
+    definition: &StoredIndexDefinition,
+    tenant_id: u64,
+    bucket_id: u64,
+    definition_object_version: u64,
+    generation: u64,
+    due_at_unix_millis: u64,
+) -> Result<IndexGenerationRetentionDue, Status> {
+    let due = IndexGenerationRetentionDue {
+        tenant_id,
+        bucket_id,
+        index_id: definition.index_id,
+        definition_path: definition_path(&definition.name)?,
+        definition_object_version: VersionId(definition_object_version),
+        generation,
+        due_at_unix_millis,
+    };
+    due.validate().map_err(retention_due_status)?;
+    Ok(due)
+}
+
+fn minimum_due(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
     }
 }
 
-#[derive(Clone, Default)]
-struct RetainedArtifacts {
-    manifest_paths: BTreeSet<String>,
-    run_hashes: BTreeSet<[u8; 32]>,
-}
-
-impl RetainedArtifacts {
-    fn insert(&mut self, path: &str, manifest: &IndexGenerationManifest) {
-        self.manifest_paths.insert(path.to_owned());
-        self.run_hashes
-            .extend(manifest.runs.iter().map(|run| run.root_blob.hash));
+fn validate_manifest_reference(
+    reference: &ManifestReference,
+    manifest: &IndexGenerationManifest,
+    index_id: u64,
+) -> Result<(), Status> {
+    reference
+        .validate(index_id)
+        .map_err(|error| Status::data_loss(error.to_string()))?;
+    if manifest.index_id != index_id
+        || manifest.generation != reference.generation
+        || manifest.definition_version != reference.definition_version
+        || manifest.schema_fingerprint != reference.schema_fingerprint
+    {
+        return Err(Status::data_loss(
+            "format-v4 manifest identity differs from its current-pointer reference",
+        ));
     }
+    let encoded = manifest
+        .encode()
+        .map_err(|error| Status::data_loss(error.to_string()))?;
+    if encoded.len() as u64 != reference.blob.length
+        || blake3::hash(&encoded).as_bytes() != &reference.blob.hash
+    {
+        return Err(Status::data_loss(
+            "format-v4 manifest bytes differ from their current-pointer reference",
+        ));
+    }
+    Ok(())
 }
 
 fn require_current_identity(
     definition: &StoredIndexDefinition,
     current: &PublishedGeneration,
 ) -> Result<(), Status> {
+    current
+        .pointer
+        .validate()
+        .map_err(|error| Status::data_loss(error.to_string()))?;
     if current.pointer.index_id != definition.index_id
         || current.manifest.index_id != definition.index_id
-        || current.pointer.generation != current.manifest.generation
-        || current.pointer.definition_version != current.manifest.definition_version
-        || current.pointer.manifest_path
-            != super::publication::manifest_path(
-                definition.index_id,
-                current.pointer.manifest_blob.hash,
-            )
     {
         return Err(Status::data_loss(
             "current index pointer and manifest identity differ during retention",
         ));
     }
-    Ok(())
+    validate_manifest_reference(
+        &current.pointer.current,
+        &current.manifest,
+        definition.index_id,
+    )
 }
 
-fn validate_predecessor(
-    reference: &ManifestReference,
-    expected_below: u64,
-    index_id: u64,
-) -> Result<(), Status> {
-    if reference.generation >= expected_below
-        || reference.path != super::publication::manifest_path(index_id, reference.blob.hash)
-    {
+fn component_identity(bytes: &[u8]) -> Result<SegmentIdentity, Status> {
+    if bytes.len() < anvil_index::v4::COMPONENT_HEADER_BYTES {
         return Err(Status::data_loss(
-            "index predecessor chain is non-canonical or cyclic",
+            "format-v4 routing component is shorter than its envelope",
         ));
     }
-    Ok(())
+    SegmentIdentity::new(
+        read_u64(bytes, 16)?,
+        read_u64(bytes, 24)?,
+        bytes[32..64]
+            .try_into()
+            .map_err(|_| Status::data_loss("format-v4 routing schema is truncated"))?,
+        read_u64(bytes, 64)?,
+    )
+    .map_err(index_integrity_status)
 }
 
-fn retain_predecessor(
-    retained_count: u32,
-    retained_bytes: u64,
-    reference: &ManifestReference,
-    manifest: &IndexGenerationManifest,
-    now: u64,
-    config: IndexRuntimeConfig,
-) -> bool {
-    let within_count = retained_count < config.max_retained_generations();
-    let within_age = now.saturating_sub(reference.published_at_unix_millis)
-        < config
-            .max_generation_age_hours()
-            .saturating_mul(60 * 60 * 1_000);
-    let within_bytes = retained_bytes
-        .checked_add(manifest.authoritative_bytes)
-        .is_some_and(|total| total <= config.max_retained_generation_bytes());
-    within_count && within_age && within_bytes
+fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, Status> {
+    bytes
+        .get(offset..offset + 8)
+        .and_then(|value| value.try_into().ok())
+        .map(u64::from_le_bytes)
+        .ok_or_else(|| Status::data_loss("format-v4 routing envelope is truncated"))
+}
+
+fn read_be_u16(bytes: &[u8], offset: usize) -> Result<u16, Status> {
+    bytes
+        .get(offset..offset + 2)
+        .and_then(|value| value.try_into().ok())
+        .map(u16::from_be_bytes)
+        .ok_or_else(|| Status::data_loss("retention scratch integer is truncated"))
+}
+
+fn read_be_u64(bytes: &[u8], offset: usize) -> Result<u64, Status> {
+    bytes
+        .get(offset..offset + 8)
+        .and_then(|value| value.try_into().ok())
+        .map(u64::from_be_bytes)
+        .ok_or_else(|| Status::data_loss("retention scratch integer is truncated"))
+}
+
+fn scratch_status(error: IndexError) -> Status {
+    match error {
+        IndexError::UnexpectedEof { .. } | IndexError::Integrity => {
+            Status::data_loss(error.to_string())
+        }
+        IndexError::ResourceLimit { .. } | IndexError::OffsetOverflow => {
+            Status::resource_exhausted(error.to_string())
+        }
+        _ => Status::unavailable(error.to_string()),
+    }
+}
+
+fn index_integrity_status(error: anvil_index::IndexError) -> Status {
+    Status::data_loss(error.to_string())
+}
+
+fn retention_due_status(error: anvil_store::IndexRetentionDueError) -> Status {
+    match error {
+        anvil_store::IndexRetentionDueError::Malformed(message) => Status::data_loss(message),
+        anvil_store::IndexRetentionDueError::Storage(message) => Status::unavailable(message),
+    }
 }
 
 fn delete_command(index_id: u64, version: VersionId, class: &str, path: &str) -> String {
@@ -1211,7 +1888,7 @@ fn delete_command(index_id: u64, version: VersionId, class: &str, path: &str) ->
     hasher.update(path.as_bytes());
     hasher.update(&version.0.to_be_bytes());
     format!(
-        "index-v3-gc-{index_id}-{}",
+        "index-v4-gc-{index_id}-{}",
         &hasher.finalize().to_hex().as_str()[..24]
     )
 }
@@ -1227,326 +1904,5 @@ fn now_unix_millis() -> Result<u64, Status> {
 }
 
 #[cfg(test)]
-mod tests {
-    use anvil_api::v1::{CreateIndexRequest, IndexSpecification, PathIndexSpec};
-    use anvil_store::{BlobRef, Head, PlacementLogId, SourceId, Version};
-    use tonic::Code;
-
-    use super::*;
-    use crate::index_runtime::events::{AtomicProgramWatermark, IndexBarrier, IndexSourceCursor};
-    use crate::index_runtime::generation::{IndexGenerationManifest, ManifestRun};
-
-    fn config(count: u32, age: u64, bytes: u64) -> IndexRuntimeConfig {
-        IndexRuntimeConfig::new(1, 1, 64 * 1024 * 1024, 1, count, age, bytes).unwrap()
-    }
-
-    fn manifest(generation: u64, bytes: u64, run_hash: [u8; 32]) -> IndexGenerationManifest {
-        let barrier = IndexBarrier {
-            fence: PlacementLogId { term: 1, index: 1 },
-            atomic: AtomicProgramWatermark::new(None, None, 0),
-            sources: [(
-                anvil_consensus::NodeId(1),
-                IndexSourceCursor {
-                    source: SourceId {
-                        node_id: 1,
-                        source_epoch: [1; 32],
-                    },
-                    next_offset: 1,
-                },
-            )]
-            .into_iter()
-            .collect(),
-        };
-        IndexGenerationManifest::new(
-            9,
-            generation,
-            1,
-            anvil_index::IndexKind::Path,
-            &barrier,
-            vec![ManifestRun {
-                sequence: generation,
-                created_at_unix_millis: generation.saturating_mul(1_000),
-                level: 0,
-                root_path: super::super::publication::run_root_path(9, run_hash),
-                root_blob: BlobRef {
-                    hash: run_hash,
-                    length: bytes,
-                },
-                root_object_version: VersionId(generation),
-                packs: Vec::new(),
-                mutation_count: 1,
-                live_document_count: 1,
-                minimum_version: 1,
-                maximum_version: 1,
-                authoritative_bytes: bytes,
-            }],
-            None,
-            1,
-            0,
-        )
-        .unwrap()
-    }
-
-    fn retention_job(tenant_id: u64, bucket_id: u64, generation: u64) -> RetentionJob {
-        let definition = StoredIndexDefinition::create(
-            format!("tenant-{tenant_id}"),
-            CreateIndexRequest {
-                bucket: format!("bucket-{bucket_id}"),
-                name: "path".to_owned(),
-                path_prefix: String::new(),
-                content_type: String::new(),
-                specification: Some(IndexSpecification {
-                    specification: Some(anvil_api::v1::index_specification::Specification::Path(
-                        PathIndexSpec {},
-                    )),
-                }),
-                command_id: format!("create-{tenant_id}-{bucket_id}"),
-            },
-            9,
-        )
-        .unwrap();
-        let manifest = manifest(generation, 10, [generation as u8; 32]);
-        let manifest_blob = BlobRef {
-            hash: [generation.saturating_add(64) as u8; 32],
-            length: 10,
-        };
-        let pointer = IndexCurrentPointer::new(
-            &manifest,
-            manifest_blob,
-            VersionId(generation),
-            UNIX_EPOCH + Duration::from_secs(1),
-        )
-        .unwrap();
-        RetentionJob::new(
-            definition,
-            tenant_id,
-            bucket_id,
-            PublishedGeneration {
-                pointer,
-                current_object_version: VersionId(generation.saturating_add(100)),
-                manifest,
-            },
-        )
-    }
-
-    #[test]
-    fn first_count_age_or_byte_bound_stops_the_retained_prefix() {
-        let candidate = manifest(2, 40, [2; 32]);
-        let reference = ManifestReference {
-            generation: 2,
-            definition_version: 1,
-            path: super::super::publication::manifest_path(9, [8; 32]),
-            blob: BlobRef {
-                hash: [8; 32],
-                length: 10,
-            },
-            object_version: VersionId(2),
-            published_at_unix_millis: 90_000_000,
-        };
-        assert!(!retain_predecessor(
-            2,
-            40,
-            &reference,
-            &candidate,
-            100_000_000,
-            config(2, 24, 100)
-        ));
-        assert!(!retain_predecessor(
-            1,
-            40,
-            &reference,
-            &candidate,
-            200_000_001,
-            config(3, 24, 100)
-        ));
-        assert!(!retain_predecessor(
-            1,
-            70,
-            &reference,
-            &candidate,
-            100_000_000,
-            config(3, 24, 100)
-        ));
-    }
-
-    #[test]
-    fn repeated_collection_stops_at_a_proven_pruned_predecessor() {
-        let referenced = VersionId(41);
-        let tombstone = Version {
-            id: VersionId(42),
-            blob: None,
-            content_type: None,
-            deleted: true,
-            committed_at_unix_millis: 100,
-        };
-        for _ in 0..2 {
-            assert!(matches!(
-                classify_absent_predecessor(referenced, Some(&tombstone)),
-                Ok(LoadedPredecessor::PreviouslyPruned)
-            ));
-        }
-    }
-
-    #[test]
-    fn absent_live_or_unmarked_predecessors_fail_closed() {
-        let referenced = VersionId(41);
-        let live = Version {
-            id: VersionId(42),
-            blob: Some(BlobRef {
-                hash: [4; 32],
-                length: 10,
-            }),
-            content_type: None,
-            deleted: false,
-            committed_at_unix_millis: 100,
-        };
-        let stale_tombstone = Version {
-            id: referenced,
-            blob: None,
-            content_type: None,
-            deleted: true,
-            committed_at_unix_millis: 100,
-        };
-        for current in [Some(&live), Some(&stale_tombstone), None] {
-            let error = match classify_absent_predecessor(referenced, current) {
-                Ok(_) => panic!("unproven predecessor pruning must fail closed"),
-                Err(error) => error,
-            };
-            assert_eq!(error.code(), Code::DataLoss);
-        }
-    }
-
-    #[test]
-    fn retention_budget_rejects_a_limit_smaller_than_one_record() {
-        assert!(
-            IndexRetentionBudget::new(1, MAX_RETENTION_RECORD_BYTES - 1, Duration::from_secs(1))
-                .is_err()
-        );
-        assert!(
-            IndexRetentionBudget::new(1, MAX_RETENTION_RECORD_BYTES, Duration::from_secs(1))
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn retention_schedule_rejects_zero_intervals() {
-        assert!(IndexRetentionSchedule::new(Duration::ZERO, Duration::from_secs(1),).is_err());
-        assert!(IndexRetentionSchedule::new(Duration::from_secs(1), Duration::ZERO,).is_err());
-    }
-
-    #[test]
-    fn retention_scheduler_gives_each_identity_a_turn() {
-        let mut scheduler = RetentionScheduler::default();
-        let first = RetentionIdentity::new(1, 2, 9).unwrap();
-        let second = RetentionIdentity::new(3, 4, 9).unwrap();
-        scheduler.register(first, retention_job(1, 2, 1)).unwrap();
-        scheduler.register(second, retention_job(3, 4, 1)).unwrap();
-
-        let (selected, job) = scheduler.pop().unwrap();
-        assert_eq!(selected, first);
-        scheduler.requeue(selected, job);
-
-        assert_eq!(scheduler.pop().unwrap().0, second);
-    }
-
-    #[test]
-    fn transient_retention_failure_yields_a_lease_to_a_later_definition() {
-        let mut scheduler = RetentionScheduler::default();
-        for tenant_id in 1..=MAX_ACTIVE_RETENTION_JOBS as u64 {
-            let identity = RetentionIdentity::new(tenant_id, 2, 9).unwrap();
-            scheduler
-                .register(identity, retention_job(tenant_id, 2, 3))
-                .unwrap();
-        }
-        let later = RetentionIdentity::new(MAX_ACTIVE_RETENTION_JOBS as u64 + 1, 2, 9).unwrap();
-        assert!(
-            scheduler
-                .register(
-                    later,
-                    retention_job(MAX_ACTIVE_RETENTION_JOBS as u64 + 1, 2, 3),
-                )
-                .is_err()
-        );
-
-        let (failing, job) = scheduler.pop().unwrap();
-        scheduler.retry(failing, job, Duration::ZERO);
-
-        assert_eq!(scheduler.active_len(), MAX_ACTIVE_RETENTION_JOBS - 1);
-        scheduler
-            .register(
-                later,
-                retention_job(MAX_ACTIVE_RETENTION_JOBS as u64 + 1, 2, 3),
-            )
-            .unwrap();
-        assert_eq!(scheduler.active_len(), MAX_ACTIVE_RETENTION_JOBS);
-    }
-
-    #[test]
-    fn completed_retention_job_releases_its_bounded_lease() {
-        let mut scheduler = RetentionScheduler::default();
-        let identity = RetentionIdentity::new(1, 2, 9).unwrap();
-        scheduler
-            .register(identity, retention_job(1, 2, 3))
-            .unwrap();
-        let (_, job) = scheduler.pop().unwrap();
-        scheduler.complete(identity, job.generation);
-        assert_eq!(scheduler.active_len(), 0);
-        assert!(scheduler.pop().is_none());
-    }
-
-    #[test]
-    fn artifact_sweep_consumes_one_retained_descriptor_at_a_time() {
-        let job = retention_job(1, 2, 3);
-        let path = current_path(9);
-        let old = Version {
-            id: VersionId(2),
-            blob: Some(BlobRef {
-                hash: [2; 32],
-                length: 10,
-            }),
-            content_type: None,
-            deleted: false,
-            committed_at_unix_millis: 1,
-        };
-        let head = IndexCurrentHead {
-            tenant_id: 1,
-            bucket_id: 2,
-            exact_path: path.clone(),
-            head: Head {
-                version: VersionId(3),
-                deleted: false,
-                mutation_stamp: None,
-            },
-            version: old.clone(),
-            versions: vec![old.clone()],
-        };
-
-        let candidates = sweep_candidates(&job, &RetainedArtifacts::default(), head, u64::MAX);
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].path, path);
-        assert_eq!(candidates[0].version, old.id);
-        assert!(candidates[0].delete);
-
-        let noncurrent_artifact = IndexCurrentHead {
-            tenant_id: 1,
-            bucket_id: 2,
-            exact_path: super::super::publication::manifest_path(9, [8; 32]),
-            head: Head {
-                version: VersionId(3),
-                deleted: false,
-                mutation_stamp: None,
-            },
-            version: old.clone(),
-            versions: vec![old],
-        };
-        assert!(
-            sweep_candidates(
-                &job,
-                &RetainedArtifacts::default(),
-                noncurrent_artifact,
-                u64::MAX,
-            )
-            .is_empty()
-        );
-    }
-}
+#[path = "retention/tests.rs"]
+mod tests;

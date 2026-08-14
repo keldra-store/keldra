@@ -9,8 +9,8 @@ use std::collections::BTreeMap;
 use anvil_consensus::NodeId;
 use anvil_store::{
     DefinitionAssignment, DefinitionAssignmentCursor, DefinitionAssignmentMutation,
-    DefinitionCheckpoint, DefinitionConsumerKind, DefinitionKind, JournalRoute,
-    MAX_DEFINITION_STATE_SCAN_RECORDS, SourceId, Store, WatchJournalStatus,
+    DefinitionCheckpoint, DefinitionDeletion, DefinitionKind, DefinitionOperation, JournalRoute,
+    MAX_DEFINITION_STATE_SCAN_RECORDS, Store, WatchJournalStatus,
 };
 use tonic::Status;
 
@@ -21,9 +21,9 @@ use crate::data_peer::DataPeerTransport;
 
 use super::{
     ClusterDefinitionLocatorScanner, MAX_INDEX_EVENT_PAGE_BYTES, apply_assignment_page,
-    apply_assignment_transfer, assignment_placement, consumer_kind, current_placement,
-    definition_reference_is_live, definition_transition, internal_status, join_status,
-    read_destination_checkpoint, require_placement,
+    apply_assignment_transfer, assignment_placement, consumer_kind, definition_reference_matches,
+    definition_transition, internal_status, join_status, read_destination_checkpoint,
+    require_placement,
 };
 
 #[derive(Clone)]
@@ -47,7 +47,7 @@ pub(super) async fn reconcile_kind(
     let sources = capture_sources(local_node, store, peers, placement).await?;
     reconcile_existing_assignments(kind, local_node, decisions, store, peers, reader, placement)
         .await?;
-    reconcile_live_locators(kind, local_node, decisions, store, peers, reader, placement).await?;
+    reconcile_locators(kind, local_node, decisions, store, peers, reader, placement).await?;
     let through = replay_suffixes(
         kind,
         local_node,
@@ -198,12 +198,13 @@ async fn correct_assignment(
     existing
         .validate()
         .map_err(|error| Status::data_loss(error.to_string()))?;
-    let live = definition_reference_is_live(
+    let live = definition_reference_matches(
         reader,
         existing.tenant_id,
         existing.bucket_id,
         &existing.definition_path,
         existing.object_version,
+        DefinitionOperation::Upsert,
     )
     .await?;
     let owners = assignment_placement(
@@ -229,7 +230,7 @@ async fn correct_assignment(
     })
 }
 
-async fn reconcile_live_locators(
+async fn reconcile_locators(
     kind: DefinitionKind,
     local_node: NodeId,
     decisions: &anvil_consensus::DecisionRaft,
@@ -254,12 +255,13 @@ async fn reconcile_live_locators(
             locator
                 .validate()
                 .map_err(|error| Status::data_loss(error.to_string()))?;
-            if !definition_reference_is_live(
+            if !definition_reference_matches(
                 reader,
                 locator.tenant_id,
                 locator.bucket_id,
                 &locator.path,
                 locator.object_version,
+                locator.operation,
             )
             .await?
             {
@@ -299,16 +301,32 @@ fn queue_locator_assignments(
         by_destination
             .entry(destination)
             .or_default()
-            .push(DefinitionAssignmentMutation::Upsert(DefinitionAssignment {
-                kind,
-                tenant_id: locator.tenant_id,
-                bucket_id: locator.bucket_id,
-                definition_id: locator.definition_id,
-                definition_path: locator.path.clone(),
-                object_version: locator.object_version,
-                observed_fence: fence,
-                rank: rank as u8,
-            }));
+            .push(match locator.operation {
+                DefinitionOperation::Upsert => {
+                    DefinitionAssignmentMutation::Upsert(DefinitionAssignment {
+                        kind,
+                        tenant_id: locator.tenant_id,
+                        bucket_id: locator.bucket_id,
+                        definition_id: locator.definition_id,
+                        definition_path: locator.path.clone(),
+                        object_version: locator.object_version,
+                        observed_fence: fence,
+                        rank: rank as u8,
+                    })
+                }
+                DefinitionOperation::Delete => {
+                    DefinitionAssignmentMutation::Delete(DefinitionDeletion {
+                        kind,
+                        tenant_id: locator.tenant_id,
+                        bucket_id: locator.bucket_id,
+                        definition_id: locator.definition_id,
+                        definition_path: locator.path.clone(),
+                        object_version: locator.object_version,
+                        observed_fence: fence,
+                        rank: rank as u8,
+                    })
+                }
+            });
     }
 }
 
@@ -316,6 +334,7 @@ fn queue_locator_assignments(
 mod tests {
     use super::*;
     use crate::index_runtime::placement::IndexPlacement;
+    use crate::index_service::definition_path;
     use anvil_store::{DefinitionLocator, StoreOptions, VersionId};
 
     #[tokio::test]
@@ -346,8 +365,9 @@ mod tests {
             tenant_id: 11,
             bucket_id: 12,
             definition_id: 13,
-            path: "_anvil/indexes/v3/definitions/example".into(),
+            path: definition_path("example").unwrap(),
             object_version: VersionId(14),
+            operation: DefinitionOperation::Upsert,
         };
         for store in stores.values() {
             assert!(
@@ -400,6 +420,37 @@ mod tests {
                 .rank,
             0
         );
+    }
+
+    #[test]
+    fn membership_reconciliation_rehydrates_deleted_definition_cleanup_on_current_owners() {
+        let fence = anvil_store::PlacementLogId { term: 3, index: 9 };
+        let locator = DefinitionLocator {
+            kind: DefinitionKind::Index,
+            tenant_id: 11,
+            bucket_id: 12,
+            definition_id: 13,
+            path: definition_path("deleted").unwrap(),
+            object_version: VersionId(15),
+            operation: DefinitionOperation::Delete,
+        };
+        let owners =
+            IndexPlacement::from_ranked(vec![NodeId(3), NodeId(1), NodeId(2), NodeId(4)], fence)
+                .unwrap();
+        let mut by_destination = BTreeMap::new();
+        queue_locator_assignments(locator.kind, &locator, &owners, fence, &mut by_destination);
+        assert_eq!(by_destination.len(), 3);
+        for (rank, destination) in owners.query_replicas().iter().copied().enumerate() {
+            assert!(matches!(
+                by_destination[&destination].as_slice(),
+                [DefinitionAssignmentMutation::Delete(DefinitionDeletion {
+                    definition_id: 13,
+                    object_version: VersionId(15),
+                    rank: actual_rank,
+                    ..
+                })] if *actual_rank == rank as u8
+            ));
+        }
     }
 }
 
@@ -600,6 +651,8 @@ fn destination_barrier_is_current(
 
 #[cfg(test)]
 mod destination_barrier_tests {
+    use anvil_store::{DefinitionConsumerKind, SourceId};
+
     use super::*;
 
     fn checkpoint(fence: anvil_store::PlacementLogId, next_offset: u64) -> DefinitionCheckpoint {

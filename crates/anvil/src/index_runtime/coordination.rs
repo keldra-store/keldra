@@ -4,18 +4,18 @@
 //! This module keeps only disposable assignment projections and never scans
 //! unrelated object heads.
 
+use std::collections::BTreeMap;
 use std::collections::VecDeque;
-use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::time::Duration;
 
 use anvil_consensus::{DecisionRaft, NodeId};
 use anvil_store::{
     DefinitionAssignment, DefinitionAssignmentCursor, DefinitionAssignmentMutation,
-    DefinitionCheckpoint, DefinitionConsumerKind, DefinitionKind, DefinitionLocator,
-    DefinitionLocatorCursor, DefinitionLocatorPage, DefinitionOperation, DefinitionTransition,
-    JournalRoute, LocalChange, MAX_DEFINITION_STATE_SCAN_RECORDS, PlacementLogId,
-    RoutedJournalError, SourceId, Store, VersionId,
+    DefinitionCheckpoint, DefinitionConsumerKind, DefinitionDeletion, DefinitionKind,
+    DefinitionLocator, DefinitionLocatorCursor, DefinitionLocatorPage, DefinitionOperation,
+    DefinitionTransition, JournalRoute, LocalChange, MAX_DEFINITION_STATE_SCAN_RECORDS,
+    PlacementLogId, RoutedJournalError, SourceId, Store, VersionId,
 };
 use tonic::Status;
 
@@ -25,7 +25,7 @@ use crate::cluster_placement::ClusterPlacement;
 use crate::data_peer::DataPeerTransport;
 use crate::index_service::{StoredIndexDefinition, definition_path};
 
-use super::catalog::{CatalogDefinition, IndexCatalog};
+use super::catalog::{CatalogDefinition, CatalogIdentity, IndexCatalog};
 use super::events::MAX_INDEX_EVENT_PAGE_BYTES;
 use super::placement::{IndexIdentity, IndexPlacement};
 
@@ -340,8 +340,7 @@ fn select_replica_locator(
             *current = candidate;
         }
         Some(current)
-            if candidate.object_version == current.object_version
-                && candidate.definition_id != current.definition_id =>
+            if candidate.object_version == current.object_version && candidate != *current =>
         {
             return Err(Status::data_loss(
                 "definition locator replicas disagree at the same object version",
@@ -394,23 +393,26 @@ pub(crate) async fn load_definition_locator_object(
     .await
 }
 
-/// Verify that a locator or assignment still names the authoritative current
-/// definition version without reconstructing its opaque payload. Gap
-/// reconciliation needs only liveness and version identity; the selected
-/// owner reads and decodes the payload when it installs the local definition.
-async fn definition_reference_is_live(
+/// Verify that a locator still names the authoritative current live or deleted
+/// definition version without reconstructing its opaque payload. The selected
+/// owner reads payload bytes only when installing a live definition.
+pub(crate) async fn definition_reference_matches(
     reader: &ClusterObjectReader,
     tenant_id: u64,
     bucket_id: u64,
     definition_path: &str,
     object_version: VersionId,
+    operation: DefinitionOperation,
 ) -> Result<bool, Status> {
     let key = anvil_store::ObjectKey::new("system", "definitions", definition_path)
         .map_err(|error| Status::data_loss(error.to_string()))?;
     Ok(reader
         .current_head_snapshot_stable(&key, tenant_id, bucket_id)
         .await?
-        .is_some_and(|current| !current.version.deleted && current.version.id == object_version))
+        .is_some_and(|current| {
+            current.version.id == object_version
+                && current.version.deleted == (operation == DefinitionOperation::Delete)
+        }))
 }
 
 pub(crate) async fn load_definition_object(
@@ -1062,14 +1064,16 @@ fn transition_mutation(
             observed_fence: fence,
             rank,
         }),
-        DefinitionOperation::Delete => DefinitionAssignmentMutation::Remove {
+        DefinitionOperation::Delete => DefinitionAssignmentMutation::Delete(DefinitionDeletion {
             kind: transition.kind,
             tenant_id: transition.tenant_id,
             bucket_id: transition.bucket_id,
             definition_id: transition.definition_id,
+            definition_path: transition.path.clone(),
             object_version: transition.object_version,
             observed_fence: fence,
-        },
+            rank,
+        }),
     }
 }
 
@@ -1365,14 +1369,14 @@ async fn run_index_assignments(
                             continue;
                         }
                         let identity = mutation_identity(&mutation);
-                        if let Err(error) = refresh_index_assignment(
-                            local_node,
-                            &decisions,
-                            &store,
-                            &reader,
-                            &catalog,
-                            identity,
-                        ).await {
+                        let result = match &mutation {
+                            DefinitionAssignmentMutation::Delete(deletion) => catalog.delete_wait(
+                                CatalogIdentity { tenant_id: identity.0, bucket_id: identity.1, index_id: identity.2 },
+                                deletion.object_version.0,
+                            ).await,
+                            _ => refresh_index_assignment(local_node, &decisions, &store, &reader, &catalog, identity).await,
+                        };
+                        if let Err(error) = result {
                             tracing::warn!(definition.id = identity.2, %error, "assigned index refresh will retry");
                             recovery = Some(AssignmentInventoryRecovery::retry());
                         }
@@ -1542,17 +1546,20 @@ pub(crate) async fn load_index_assignment(
         ));
     }
     require_placement(decisions, placement.fence())?;
-    Ok(Some(CatalogDefinition {
-        tenant_id: assignment.tenant_id,
-        bucket_id: assignment.bucket_id,
-        object_version: opened.object_version.0,
+    Ok(Some(CatalogDefinition::new(
+        assignment.tenant_id,
+        assignment.bucket_id,
+        opened.object_version.0,
         stored,
-    }))
+    )?))
 }
 
 fn mutation_identity(mutation: &DefinitionAssignmentMutation) -> (u64, u64, u64) {
     match mutation {
         DefinitionAssignmentMutation::Upsert(value) => {
+            (value.tenant_id, value.bucket_id, value.definition_id)
+        }
+        DefinitionAssignmentMutation::Delete(value) => {
             (value.tenant_id, value.bucket_id, value.definition_id)
         }
         DefinitionAssignmentMutation::Remove {
@@ -1630,7 +1637,7 @@ mod tests {
             tenant_id: 1,
             bucket_id: 2,
             definition_id: 3,
-            path: "_anvil/indexes/v3/definitions/one".into(),
+            path: definition_path("one").unwrap(),
             object_version: VersionId(4),
             operation: DefinitionOperation::Upsert,
         };
@@ -1656,11 +1663,12 @@ mod tests {
         };
         assert!(matches!(
             transition_mutation(&transition, PlacementLogId { term: 6, index: 7 }, 0,),
-            DefinitionAssignmentMutation::Remove {
+            DefinitionAssignmentMutation::Delete(DefinitionDeletion {
                 definition_id: 3,
                 object_version: VersionId(5),
+                rank: 0,
                 ..
-            }
+            })
         ));
     }
 
@@ -1674,6 +1682,7 @@ mod tests {
                 definition_id: 1,
                 path: "a".into(),
                 object_version: VersionId(1),
+                operation: DefinitionOperation::Upsert,
             },
             DefinitionLocator {
                 kind: DefinitionKind::Index,
@@ -1682,6 +1691,7 @@ mod tests {
                 definition_id: 2,
                 path: "a".into(),
                 object_version: VersionId(1),
+                operation: DefinitionOperation::Upsert,
             },
             DefinitionLocator {
                 kind: DefinitionKind::Index,
@@ -1690,6 +1700,7 @@ mod tests {
                 definition_id: 3,
                 path: "z".into(),
                 object_version: VersionId(1),
+                operation: DefinitionOperation::Upsert,
             },
         ];
         locators.sort_by(|left, right| locator_sort_key(left).cmp(&locator_sort_key(right)));
@@ -1709,8 +1720,9 @@ mod tests {
             tenant_id: 1,
             bucket_id: 2,
             definition_id: 3,
-            path: "_anvil/indexes/v3/definitions/example".into(),
+            path: definition_path("example").unwrap(),
             object_version: VersionId(4),
+            operation: DefinitionOperation::Upsert,
         });
         let error = select_replica_locator(
             &mut selected,
@@ -1719,8 +1731,9 @@ mod tests {
                 tenant_id: 1,
                 bucket_id: 2,
                 definition_id: 9,
-                path: "_anvil/indexes/v3/definitions/example".into(),
+                path: definition_path("example").unwrap(),
                 object_version: VersionId(4),
+                operation: DefinitionOperation::Upsert,
             },
         )
         .unwrap_err();
@@ -1764,7 +1777,7 @@ mod tests {
             tenant_id: 2,
             bucket_id: 3,
             definition_id: 4,
-            definition_path: "_anvil/indexes/v3/definitions/example".into(),
+            definition_path: definition_path("example").unwrap(),
             object_version: VersionId(5),
             observed_fence: fence,
             rank: 0,

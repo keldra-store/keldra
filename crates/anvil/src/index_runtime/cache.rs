@@ -6,20 +6,23 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, SeekFrom, Write};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
+use anvil_index::IndexError;
+use anvil_index::v4::build::{MergeScratchFile, MergeScratchSpace};
 use memmap2::Mmap;
 use thiserror::Error;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Notify;
 
 use crate::startup_scan_evidence::{StartupScanEvidence, StartupScanExtent, StartupScanKind};
 
-const CACHE_FORMAT_DIRECTORY: &str = "v3";
+const CACHE_FORMAT_DIRECTORY: &str = "v4";
 const CACHE_TEMPORARY_FILE_GRACE: Duration = Duration::from_secs(60 * 60);
 // Each mmap consumes a virtual-memory area and bookkeeping even for a tiny
 // file. Charging at least one ordinary page prevents a large disk budget from
@@ -137,6 +140,7 @@ struct IndexCacheInner {
     fetch_budget: CacheFetchBudget,
     state: Mutex<CacheState>,
     reconcile: Mutex<CacheReconcileState>,
+    reconciler_started: AtomicBool,
     startup_scan_evidence: Option<StartupScanEvidence>,
 }
 
@@ -298,6 +302,7 @@ impl Drop for CacheFetchPermit {
 struct CacheState {
     entries: BTreeMap<IndexSegmentId, CacheEntry>,
     in_flight: BTreeMap<IndexSegmentId, Arc<CacheFlight>>,
+    active_scratch: std::collections::BTreeSet<PathBuf>,
     clock: u64,
     disk_bytes: u64,
     memory_bytes: u64,
@@ -414,10 +419,10 @@ impl IndexCache {
                 fetch_budget: CacheFetchBudget::new(config.memory_bytes),
                 state: Mutex::new(CacheState::default()),
                 reconcile: Mutex::new(CacheReconcileState::default()),
+                reconciler_started: AtomicBool::new(false),
                 startup_scan_evidence,
             }),
         };
-        cache.spawn_reconciler();
         Ok(cache)
     }
 
@@ -425,6 +430,19 @@ impl IndexCache {
         IndexFile {
             cache: self.clone(),
             id,
+        }
+    }
+
+    /// Open one restart-disposable merge workspace inside the existing v4
+    /// cache directory. Callers receive no general cache path authority.
+    pub(crate) fn merge_scratch(&self) -> IndexMergeScratchSpace {
+        IndexMergeScratchSpace {
+            inner: Arc::new(IndexMergeScratchSpaceInner {
+                directory: self.inner.directory.clone(),
+                cache: Arc::downgrade(&self.inner),
+                nonce: uuid::Uuid::new_v4().simple().to_string(),
+                next_file: AtomicU64::new(0),
+            }),
         }
     }
 
@@ -598,9 +616,23 @@ impl IndexCache {
         Ok(selected)
     }
 
-    fn spawn_reconciler(&self) {
+    /// Start bounded disposable-cache reconciliation after public listeners
+    /// are ready. Construction itself performs no inventory and starts no
+    /// background task.
+    pub(crate) fn start_reconciler(&self) -> bool {
+        if self
+            .inner
+            .reconciler_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            return;
+            self.inner
+                .reconciler_started
+                .store(false, Ordering::Release);
+            return false;
         };
         let weak = Arc::downgrade(&self.inner);
         handle.spawn(async move {
@@ -643,7 +675,190 @@ impl IndexCache {
                 }
             }
         });
+        true
     }
+}
+
+#[derive(Clone)]
+pub(crate) struct IndexMergeScratchSpace {
+    inner: Arc<IndexMergeScratchSpaceInner>,
+}
+
+struct IndexMergeScratchSpaceInner {
+    directory: PathBuf,
+    cache: Weak<IndexCacheInner>,
+    nonce: String,
+    next_file: AtomicU64,
+}
+
+#[derive(Clone)]
+pub(crate) struct IndexMergeScratchFile {
+    inner: Arc<IndexMergeScratchFileInner>,
+}
+
+struct IndexMergeScratchFileInner {
+    path: PathBuf,
+    cache: Weak<IndexCacheInner>,
+    file: tokio::sync::Mutex<Option<tokio::fs::File>>,
+}
+
+impl MergeScratchSpace for IndexMergeScratchSpace {
+    type File = IndexMergeScratchFile;
+
+    async fn create_file(&self) -> Result<Self::File, IndexError> {
+        loop {
+            let counter = self
+                .inner
+                .next_file
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                    value.checked_add(1)
+                })
+                .map_err(|_| IndexError::OffsetOverflow)?;
+            let path = self
+                .inner
+                .directory
+                .join(format!(".merge-{}-{counter}.tmp", self.inner.nonce));
+            let file = match tokio::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .await
+            {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(scratch_io(error)),
+            };
+            if let Some(cache) = self.inner.cache.upgrade() {
+                let inserted = cache
+                    .state
+                    .lock()
+                    .map_err(|_| IndexError::Io("index cache state lock is poisoned".into()))?
+                    .active_scratch
+                    .insert(path.clone());
+                if !inserted {
+                    drop(file);
+                    let _ = fs::remove_file(&path);
+                    return Err(IndexError::Io(
+                        "merge scratch path is already active".into(),
+                    ));
+                }
+            }
+            return Ok(IndexMergeScratchFile {
+                inner: Arc::new(IndexMergeScratchFileInner {
+                    path,
+                    cache: self.inner.cache.clone(),
+                    file: tokio::sync::Mutex::new(Some(file)),
+                }),
+            });
+        }
+    }
+}
+
+impl MergeScratchFile for IndexMergeScratchFile {
+    async fn resize_zeroed(&self, length: u64) -> Result<(), IndexError> {
+        let guard = self.inner.file.lock().await;
+        let file = guard
+            .as_ref()
+            .ok_or_else(|| IndexError::Io("merge scratch file is closed".into()))?;
+        let current = file.metadata().await.map_err(scratch_io)?.len();
+        if length < current {
+            return Err(IndexError::InvalidDefinition(
+                "merge scratch resize cannot truncate bytes".into(),
+            ));
+        }
+        file.set_len(length).await.map_err(scratch_io)
+    }
+
+    async fn write_all_at(&self, offset: u64, bytes: Vec<u8>) -> Result<(), IndexError> {
+        let length = u64::try_from(bytes.len()).map_err(|_| IndexError::OffsetOverflow)?;
+        let expected = offset
+            .checked_add(length)
+            .ok_or(IndexError::OffsetOverflow)?;
+        let mut guard = self.inner.file.lock().await;
+        let file = guard
+            .as_mut()
+            .ok_or_else(|| IndexError::Io("merge scratch file is closed".into()))?;
+        let actual = file.metadata().await.map_err(scratch_io)?.len();
+        if expected > actual {
+            return Err(IndexError::UnexpectedEof { expected, actual });
+        }
+        file.seek(SeekFrom::Start(offset))
+            .await
+            .map_err(scratch_io)?;
+        file.write_all(&bytes).await.map_err(scratch_io)?;
+        file.flush().await.map_err(scratch_io)
+    }
+
+    async fn append(&self, bytes: Vec<u8>) -> Result<u64, IndexError> {
+        let mut guard = self.inner.file.lock().await;
+        let file = guard
+            .as_mut()
+            .ok_or_else(|| IndexError::Io("merge scratch file is closed".into()))?;
+        let offset = file.seek(SeekFrom::End(0)).await.map_err(scratch_io)?;
+        let length = u64::try_from(bytes.len()).map_err(|_| IndexError::OffsetOverflow)?;
+        offset
+            .checked_add(length)
+            .ok_or(IndexError::OffsetOverflow)?;
+        file.write_all(&bytes).await.map_err(scratch_io)?;
+        file.flush().await.map_err(scratch_io)?;
+        Ok(offset)
+    }
+
+    async fn read_exact_at(&self, offset: u64, length: usize) -> Result<Vec<u8>, IndexError> {
+        let requested = u64::try_from(length).map_err(|_| IndexError::OffsetOverflow)?;
+        let expected = offset
+            .checked_add(requested)
+            .ok_or(IndexError::OffsetOverflow)?;
+        let mut guard = self.inner.file.lock().await;
+        let file = guard
+            .as_mut()
+            .ok_or_else(|| IndexError::Io("merge scratch file is closed".into()))?;
+        let actual = file.metadata().await.map_err(scratch_io)?.len();
+        if expected > actual {
+            return Err(IndexError::UnexpectedEof { expected, actual });
+        }
+        file.seek(SeekFrom::Start(offset))
+            .await
+            .map_err(scratch_io)?;
+        let mut bytes = vec![0_u8; length];
+        file.read_exact(&mut bytes).await.map_err(scratch_io)?;
+        Ok(bytes)
+    }
+
+    async fn len(&self) -> Result<u64, IndexError> {
+        let guard = self.inner.file.lock().await;
+        let file = guard
+            .as_ref()
+            .ok_or_else(|| IndexError::Io("merge scratch file is closed".into()))?;
+        Ok(file.metadata().await.map_err(scratch_io)?.len())
+    }
+}
+
+impl Drop for IndexMergeScratchFileInner {
+    fn drop(&mut self) {
+        if let Ok(mut file) = self.file.try_lock() {
+            file.take();
+        }
+        if let Some(cache) = self.cache.upgrade()
+            && let Ok(mut state) = cache.state.lock()
+        {
+            state.active_scratch.remove(&self.path);
+        }
+        match fs::remove_file(&self.path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(
+                path = %self.path.display(),
+                %error,
+                "merge scratch cleanup failed"
+            ),
+        }
+    }
+}
+
+fn scratch_io(error: io::Error) -> IndexError {
+    IndexError::Io(error.to_string())
 }
 
 #[derive(Clone)]
@@ -857,7 +1072,15 @@ fn reconcile_cache_step(
         if file_type.is_file() {
             let metadata = entry.metadata().map_err(IndexCacheError::Io)?;
             let actual_bytes = metadata.len();
-            if let Some(id) = cache_id_from_file_name(&entry.file_name()) {
+            let active_scratch = inner
+                .state
+                .lock()
+                .map_err(|_| IndexCacheError::Poisoned)?
+                .active_scratch
+                .contains(&entry.path());
+            if active_scratch {
+                reconcile.retained_bytes = reconcile.retained_bytes.saturating_add(actual_bytes);
+            } else if let Some(id) = cache_id_from_file_name(&entry.file_name()) {
                 let tracked = {
                     let state = inner.state.lock().map_err(|_| IndexCacheError::Poisoned)?;
                     state.entries.contains_key(&id) || state.in_flight.contains_key(&id)

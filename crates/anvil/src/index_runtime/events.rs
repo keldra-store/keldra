@@ -2,11 +2,10 @@
 //!
 //! Builders read a bounded page only after obtaining their per-kind memory
 //! permit. There is no node-local fan-out inbox: a complete source vector is
-//! authoritative only when a manifest CAS publishes every prepared run.
+//! authoritative only when a manifest CAS publishes every prepared segment.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
-use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex, Weak};
 
 use anvil_consensus::{DecisionRaft, NodeId};
@@ -754,7 +753,7 @@ impl IndexEventJournal {
     /// Pull at most one byte-bounded page from the first source still behind.
     ///
     /// The caller advances to `page.through` only after durably preparing the
-    /// corresponding mutation run. Returning `None` proves the complete target
+    /// corresponding mutation segment. Returning `None` proves the complete target
     /// vector under the same placement and atomic watermark.
     pub(crate) async fn next_page(
         &self,

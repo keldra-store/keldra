@@ -6,6 +6,7 @@ use anvil_store::{
 
 use crate::index_runtime::events::{AtomicProgramWatermark, IndexJournalChange, IndexSourceCursor};
 
+use super::catch_up::journal_source_paths;
 use super::*;
 
 #[test]
@@ -19,26 +20,6 @@ fn publication_progress_is_narrow_and_compaction_stays_bounded() {
         DerivedArtifactAdmission::Bounded
     );
     assert_eq!(compaction_admission(), DerivedArtifactAdmission::Bounded);
-}
-
-fn run(sequence: u64, level: u8) -> ManifestRun {
-    ManifestRun {
-        sequence,
-        created_at_unix_millis: sequence.saturating_mul(1_000),
-        level,
-        root_path: format!("_anvil/indexes/v3/9/runs/{:064x}/root", sequence),
-        root_blob: anvil_store::BlobRef {
-            hash: [sequence as u8; 32],
-            length: 10,
-        },
-        root_object_version: anvil_store::VersionId(sequence),
-        packs: Vec::new(),
-        mutation_count: 1,
-        live_document_count: 1,
-        minimum_version: 1,
-        maximum_version: 1,
-        authoritative_bytes: 10,
-    }
 }
 
 fn barrier(next_offset: u64) -> IndexBarrier {
@@ -111,13 +92,32 @@ fn snapshot_head(path: &str, version: u64) -> IndexSourceSnapshotHead {
 #[test]
 fn snapshot_frame_measurement_matches_the_streams_per_record_credit() {
     let frame = vec![snapshot_head("a.json", 1), snapshot_head("b.json", 2)];
-    let expected = frame
+    let encoded = frame
         .iter()
         .map(|head| serde_json::to_vec(head).unwrap().len() as u64)
         .sum::<u64>();
+    let resident = std::mem::size_of::<Vec<IndexSourceSnapshotHead>>()
+        + frame.capacity() * std::mem::size_of::<IndexSourceSnapshotHead>()
+        + frame
+            .iter()
+            .map(|head| {
+                head.exact_path.capacity()
+                    + head
+                        .version
+                        .content_type
+                        .as_ref()
+                        .map_or(0, String::capacity)
+            })
+            .sum::<usize>();
 
-    assert_eq!(rebuild::measure_snapshot_frame(&frame).unwrap(), expected);
-    assert!(serde_json::to_vec(&frame).unwrap().len() as u64 > expected);
+    assert_eq!(
+        rebuild::measure_snapshot_frame(&frame, frame.capacity()).unwrap(),
+        rebuild::SnapshotFrameMeasure {
+            encoded_bytes: encoded,
+            resident_bytes: resident as u64,
+        }
+    );
+    assert!(serde_json::to_vec(&frame).unwrap().len() as u64 > encoded);
 }
 
 fn definition(tenant_id: u64, bucket_id: u64, index_id: u64) -> CatalogDefinition {
@@ -138,12 +138,7 @@ fn definition(tenant_id: u64, bucket_id: u64, index_id: u64) -> CatalogDefinitio
         index_id,
     )
     .unwrap();
-    CatalogDefinition {
-        tenant_id,
-        bucket_id,
-        object_version: 1,
-        stored,
-    }
+    CatalogDefinition::new(tenant_id, bucket_id, 1, stored).unwrap()
 }
 
 fn queue_definition(scheduler: &mut BuilderScheduler, definition: CatalogDefinition) {
@@ -188,15 +183,6 @@ fn queue_dirty_definition(scheduler: &mut BuilderScheduler, definition: CatalogD
 }
 
 #[test]
-fn compaction_replacement_uses_newest_input_sequence() {
-    let inputs = (1..=4).map(|sequence| run(sequence, 0)).collect::<Vec<_>>();
-    let replacement = compaction_replacement_sequence(&inputs).unwrap();
-    assert_eq!(replacement, 4);
-    let newer_uncompacted = run(5, 0);
-    assert!(replacement < newer_uncompacted.sequence);
-}
-
-#[test]
 fn reserved_segment_matching_is_not_a_string_prefix_guess() {
     assert!(contains_reserved_segment("a/_anvil/meta.json"));
     assert!(!contains_reserved_segment("a/_anvilish/meta.json"));
@@ -206,11 +192,11 @@ fn reserved_segment_matching_is_not_a_string_prefix_guess() {
 fn reserved_artifact_pages_have_no_generation_source_changes() {
     let page = journal_page(
         vec![
-            journal_change(1, 2, "_anvil/indexes/v3/9/current", 11),
+            journal_change(1, 2, "_anvil/indexes/v4/0000000000000009/current", 11),
             journal_change(
                 1,
                 2,
-                "_anvil/indexes/v3/9/manifests/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "_anvil/indexes/v4/0000000000000009/manifests/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 12,
             ),
         ],
@@ -245,10 +231,12 @@ fn irrelevant_source_progress_is_published_and_survives_reload() {
         9,
         2,
         1,
-        IndexKind::Path,
+        anvil_index::v4::IndexKind::Path,
+        job.definition.schema_fingerprint,
         &work.through,
-        work.candidate.runs,
-        None,
+        Vec::new(),
+        work.candidate.segments,
+        work.candidate.locator_roots,
         0,
         0,
     )
@@ -637,16 +625,21 @@ fn deterministic_failure_stays_quiet_until_a_new_definition_revision() {
 }
 
 #[test]
-fn minimum_kind_budget_preserves_its_mutable_builder_reserve() {
+fn resident_work_plan_charges_every_simultaneous_allocation() {
     let total = anvil_index::MIN_INDEX_KIND_MEMORY_BYTES as u64;
     let configured = SegmentMemoryPlan::new(total as usize).unwrap();
-    let encoded_source = source_wire_limit(total);
-    let decoded_source = encoded_source * DECODED_SOURCE_MULTIPLIER;
-    let available = total - decoded_source;
+    let source_resident_bytes = 8 * 1024 * 1024;
+    let plan = work_plan_for_limit(total, source_resident_bytes).unwrap();
 
-    assert!(encoded_source >= 64 * 1024);
-    assert!(
-        available - FIXED_INDEX_SEAL_WORKSPACE_BYTES as u64 >= configured.max_resident_bytes as u64
+    assert!(source_wire_limit(total) >= 64 * 1024);
+    assert_eq!(plan.max_resident_bytes, configured.max_resident_bytes);
+    assert!(plan.max_source_projection_bytes > 0);
+    assert_eq!(
+        plan.max_resident_bytes
+            + FIXED_INDEX_SEAL_WORKSPACE_BYTES
+            + plan.max_source_projection_bytes
+            + source_resident_bytes as usize,
+        plan.total_bytes
     );
     assert!(configured.max_resident_bytes > 1024 * 1024);
 }

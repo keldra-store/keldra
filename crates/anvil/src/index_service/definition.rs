@@ -1,16 +1,16 @@
 use anvil_api::v1::index_specification::Specification;
 use anvil_api::v1::{
-    CreateIndexRequest, IndexDefinition, IndexField, IndexKind, IndexSpecification,
-    UpdateIndexRequest,
+    CreateIndexRequest, IndexDefinition, IndexField, IndexKind, IndexOrderDirection,
+    IndexSpecification, TypedJsonIndexSpec, UpdateIndexRequest,
 };
 use anvil_atomic_program::MAX_OBJECT_PATH_BYTES;
+use anvil_store::INDEX_DEFINITION_PREFIX;
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use tonic::Status;
 
-const STORED_DEFINITION_FORMAT: u16 = 3;
-const DEFINITION_PREFIX: &str = "_anvil/indexes/v3/definitions/";
+const STORED_DEFINITION_FORMAT: u16 = 4;
 const MAX_INDEX_NAME_BYTES: usize = 128;
 const MAX_CONTENT_TYPE_BYTES: usize = 512;
 const MAX_COMMAND_ID_BYTES: usize = 256;
@@ -148,7 +148,13 @@ impl StoredIndexDefinition {
 
 pub(crate) fn definition_path(name: &str) -> Result<String, Status> {
     validate_name(name)?;
-    Ok(format!("{DEFINITION_PREFIX}{name}"))
+    Ok(format!("{INDEX_DEFINITION_PREFIX}{name}"))
+}
+
+pub(crate) fn definition_name(path: &str) -> Option<&str> {
+    let name = path.strip_prefix(INDEX_DEFINITION_PREFIX)?;
+    validate_name(name).ok()?;
+    Some(name)
 }
 
 /// Match an ordinary object path against the public segment-aware prefix
@@ -256,7 +262,9 @@ fn validate_specification(specification: &IndexSpecification) -> Result<(), Stat
             }
             Ok(())
         }
-        Some(Specification::TypedJson(specification)) => validate_fields(&specification.fields),
+        Some(Specification::TypedJson(specification)) => {
+            validate_typed_json_specification(specification)
+        }
         Some(Specification::FullText(specification)) => {
             if specification.fields.is_empty() {
                 return Err(Status::invalid_argument(
@@ -349,6 +357,38 @@ fn validate_fields(fields: &[IndexField]) -> Result<(), Status> {
                 "typed JSON field names must be unique",
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_typed_json_specification(specification: &TypedJsonIndexSpec) -> Result<(), Status> {
+    validate_fields(&specification.fields)?;
+
+    let fields = specification
+        .fields
+        .iter()
+        .map(|field| (field.name.as_str(), field.multi_valued))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut ordered = BTreeSet::new();
+    for order in &specification.physical_order {
+        require_text(&order.field, "physical-order field")?;
+        if !ordered.insert(order.field.as_str()) {
+            return Err(Status::invalid_argument(
+                "physical-order field names must be unique",
+            ));
+        }
+        let Some(multi_valued) = fields.get(order.field.as_str()) else {
+            return Err(Status::invalid_argument(
+                "physical order names a field outside the typed JSON definition",
+            ));
+        };
+        if *multi_valued {
+            return Err(Status::invalid_argument(
+                "physical order requires single-valued typed JSON fields",
+            ));
+        }
+        IndexOrderDirection::try_from(order.direction)
+            .map_err(|_| Status::invalid_argument("physical order direction is unknown"))?;
     }
     Ok(())
 }
@@ -455,7 +495,9 @@ fn validate_explicit_rebuild(accepted_at_unix_millis: u64) -> Result<(), Status>
 
 #[cfg(test)]
 mod tests {
-    use anvil_api::v1::{PathIndexSpec, TensorIndexSpec, index_specification};
+    use anvil_api::v1::{
+        IndexOrder, PathIndexSpec, TensorIndexSpec, TypedJsonIndexSpec, index_specification,
+    };
 
     use super::*;
 
@@ -483,7 +525,7 @@ mod tests {
         );
         assert_eq!(
             definition_path("by-path").unwrap(),
-            "_anvil/indexes/v3/definitions/by-path"
+            "_anvil/indexes/v4/definitions/by-path"
         );
         assert_eq!(
             derive_index_id(7, 9, "by-path", "create-index").unwrap(),
@@ -527,19 +569,127 @@ mod tests {
     }
 
     #[test]
-    fn format_one_definition_is_not_a_compatibility_input() {
+    fn format_three_definition_is_not_a_compatibility_input() {
         let stored = StoredIndexDefinition::create("tenant".into(), request(), 44).unwrap();
         let mut encoded = serde_json::to_value(stored).unwrap();
-        encoded["format"] = serde_json::json!(1);
+        encoded["format"] = serde_json::json!(3);
         let error =
             StoredIndexDefinition::decode(&serde_json::to_vec(&encoded).unwrap()).unwrap_err();
         assert_eq!(error.code(), tonic::Code::DataLoss);
     }
 
+    fn typed_json_request() -> CreateIndexRequest {
+        let mut request = request();
+        request.specification = Some(IndexSpecification {
+            specification: Some(index_specification::Specification::TypedJson(
+                TypedJsonIndexSpec {
+                    fields: vec![
+                        IndexField {
+                            name: "modified_at".into(),
+                            json_pointer: "/modified_at".into(),
+                            multi_valued: false,
+                        },
+                        IndexField {
+                            name: "ecosystems".into(),
+                            json_pointer: "/ecosystems".into(),
+                            multi_valued: true,
+                        },
+                    ],
+                    physical_order: vec![IndexOrder {
+                        field: "modified_at".into(),
+                        direction: IndexOrderDirection::Descending as i32,
+                    }],
+                },
+            )),
+        });
+        request
+    }
+
+    #[test]
+    fn typed_json_cardinality_and_physical_order_round_trip() {
+        let request = typed_json_request();
+        let stored = StoredIndexDefinition::create("tenant".into(), request.clone(), 44).unwrap();
+        let decoded = StoredIndexDefinition::decode(&stored.encode().unwrap()).unwrap();
+        assert_eq!(
+            decoded.to_api(7).unwrap().specification,
+            request.specification
+        );
+    }
+
+    #[test]
+    fn physical_order_requires_unique_known_single_valued_fields_and_valid_directions() {
+        let mut unknown = typed_json_request();
+        let Some(IndexSpecification {
+            specification: Some(index_specification::Specification::TypedJson(specification)),
+        }) = unknown.specification.as_mut()
+        else {
+            unreachable!();
+        };
+        specification.physical_order[0].field = "unknown".into();
+        assert_eq!(
+            validate_create_definition(&unknown).unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+
+        let mut repeated = typed_json_request();
+        let Some(IndexSpecification {
+            specification: Some(index_specification::Specification::TypedJson(specification)),
+        }) = repeated.specification.as_mut()
+        else {
+            unreachable!();
+        };
+        specification
+            .physical_order
+            .push(specification.physical_order[0].clone());
+        assert_eq!(
+            validate_create_definition(&repeated).unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+
+        let mut multi_valued = typed_json_request();
+        let Some(IndexSpecification {
+            specification: Some(index_specification::Specification::TypedJson(specification)),
+        }) = multi_valued.specification.as_mut()
+        else {
+            unreachable!();
+        };
+        specification.physical_order[0].field = "ecosystems".into();
+        assert_eq!(
+            validate_create_definition(&multi_valued)
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+
+        let mut bad_direction = typed_json_request();
+        let Some(IndexSpecification {
+            specification: Some(index_specification::Specification::TypedJson(specification)),
+        }) = bad_direction.specification.as_mut()
+        else {
+            unreachable!();
+        };
+        specification.physical_order[0].direction = 99;
+        assert_eq!(
+            validate_create_definition(&bad_direction)
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+
     #[test]
     fn names_cannot_escape_the_reserved_definition_prefix() {
+        let canonical = definition_path("safe-name").unwrap();
+        assert_eq!(definition_name(&canonical), Some("safe-name"));
         for invalid in ["", "../other", "a/b", "name\0"] {
             assert!(definition_path(invalid).is_err(), "{invalid:?}");
+        }
+        for invalid_path in [
+            "_anvil/indexes/v3/definitions/safe-name",
+            "_anvil/indexes/v4/definitions/a/b",
+            "_anvil/indexes/v4/definitions/..",
+        ] {
+            assert_eq!(definition_name(invalid_path), None, "{invalid_path:?}");
         }
     }
 

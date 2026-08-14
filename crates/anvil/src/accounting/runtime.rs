@@ -6,7 +6,7 @@ use std::time::Duration;
 use anvil_consensus::{DecisionRaft, NodeId};
 use anvil_store::{
     DefinitionAssignment, DefinitionAssignmentCursor, DefinitionAssignmentMutation, DefinitionKind,
-    MAX_DEFINITION_STATE_SCAN_RECORDS, PlacementLogId, Store,
+    MAX_DEFINITION_STATE_SCAN_RECORDS, Store,
 };
 use anyhow::Result;
 use tonic::Status;
@@ -353,6 +353,9 @@ fn mutation_identity(mutation: &DefinitionAssignmentMutation) -> (u64, u64, u64)
         DefinitionAssignmentMutation::Upsert(value) => {
             (value.tenant_id, value.bucket_id, value.definition_id)
         }
+        DefinitionAssignmentMutation::Delete(value) => {
+            (value.tenant_id, value.bucket_id, value.definition_id)
+        }
         DefinitionAssignmentMutation::Remove {
             tenant_id,
             bucket_id,
@@ -379,7 +382,7 @@ fn internal_status(error: impl std::fmt::Display) -> Status {
 
 #[cfg(test)]
 mod tests {
-    use anvil_store::{DefinitionAssignment, VersionId};
+    use anvil_store::{DefinitionAssignment, PlacementLogId, VersionId};
 
     use super::*;
 

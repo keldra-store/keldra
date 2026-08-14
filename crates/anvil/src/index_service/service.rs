@@ -1,5 +1,6 @@
 //! Public index lifecycle and query RPC implementation.
 
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anvil_api::v1::bulk_operation::Operation as BulkOperationValue;
@@ -13,11 +14,13 @@ use anvil_api::v1::{
     BatchGetRequest, BulkOperation, BulkPutIfVersionRequest, BulkPutRequest, BulkWriteRequest,
     BulkWriteResponse, CreateIndexRequest, DeleteIfVersionRequest, DeleteIndexRequest,
     DeleteIndexResponse, Durability, GetIndexRequest, GetObjectRequest, IndexDefinition, IndexKind,
-    IndexQuery, IndexQueryHit, ListIndexesRequest, ListIndexesResponse, MutationFailure,
-    MutationFailureCode, MutationReceipt, ObjectAddress, QueryIndexRequest, QueryIndexResponse,
-    ReadFailureCode, RebuildIndexRequest, UpdateIndexRequest,
+    IndexQuery, ListIndexesRequest, ListIndexesResponse, MutationFailure, MutationFailureCode,
+    MutationReceipt, ObjectAddress, QueryIndexRequest, QueryIndexResponse, ReadFailureCode,
+    RebuildIndexRequest, UpdateIndexRequest,
 };
-use anvil_store::{DefinitionKind, DefinitionMutationIntent, ObjectKey, StorageTenantId};
+use anvil_store::{
+    DefinitionKind, DefinitionMutationIntent, DefinitionOperation, ObjectKey, StorageTenantId,
+};
 use prost::Message;
 use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status};
@@ -34,9 +37,8 @@ use super::boundary::{
     IndexPageCursor, IndexPageTokenBinding, IndexRequestContext, IndexServiceDependencies,
 };
 use super::{
-    StoredIndexDefinition, collect_authorized_page, definition_path, derive_index_id,
-    path_matches_prefix, retain_live_query_hits, validate_command_id, validate_create_definition,
-    validate_update_definition,
+    AuthorizedCurrentCandidates, IndexCandidateVisibility, StoredIndexDefinition, definition_path,
+    derive_index_id, validate_command_id, validate_create_definition, validate_update_definition,
 };
 
 const DEFINITION_CONTENT_TYPE: &str = "application/vnd.anvil.index-definition+json";
@@ -608,6 +610,7 @@ impl IndexServiceRpc for IndexServiceImpl {
                     .definition_locator
                     .ok_or_else(|| Status::data_loss("index definition has no typed locator"))?;
                 if locator.kind != DefinitionKind::Index
+                    || locator.operation != DefinitionOperation::Upsert
                     || locator.tenant_id != tenant_id
                     || locator.bucket_id != bucket_id
                     || locator.path != key.path()
@@ -662,7 +665,7 @@ impl IndexServiceRpc for IndexServiceImpl {
                 let limit = page_limit(request.limit)?;
                 let definition_key =
                     definition_key(context.caller(), &request.bucket, &request.index_name)?;
-                authorize_definition_access(
+                let admission = authorize_definition_access_with_evidence(
                     self.dependencies.authorization.as_ref(),
                     context.caller(),
                     &definition_key,
@@ -680,6 +683,8 @@ impl IndexServiceRpc for IndexServiceImpl {
                     .resolve_bucket_ids(tenant, &request.bucket)
                     .await?;
                 let binding = IndexPageTokenBinding {
+                    tenant_id,
+                    bucket_id,
                     index_id: loaded.api.index_id,
                     definition_version: loaded.api.version,
                     query_hash: canonical_query_hash(&query),
@@ -695,68 +700,45 @@ impl IndexServiceRpc for IndexServiceImpl {
                     validate_page_cursor(&cursor)?;
                     Some(cursor)
                 };
-                let queries = self.dependencies.queries.clone();
-                let execute_context = context.clone();
-                let execute_definition = loaded.api.clone();
-                let execute_query = query.clone();
-                let authorization = self.dependencies.authorization.clone();
-                let live_versions = self.dependencies.live_versions.clone();
-                let authorization_caller = context.caller().clone();
-                let authorization_definition = loaded.clone();
-                let live_version_context = context.clone();
-                let executed = collect_authorized_page(
-                    limit,
-                    resume,
-                    None,
-                    move |resume, execute_limit| {
-                        let queries = queries.clone();
-                        let context = execute_context.clone();
-                        let definition = execute_definition.clone();
-                        let query = execute_query.clone();
-                        async move {
-                            let resumed = resume.clone();
-                            let result = queries
-                                .execute(ExecuteIndexQuery {
-                                    context,
-                                    tenant_id,
-                                    bucket_id,
-                                    definition,
-                                    query,
-                                    limit: execute_limit,
-                                    resume,
-                                })
-                                .await?;
-                            validate_execution(&result, resumed.as_ref(), execute_limit)?;
-                            Ok(result)
-                        }
-                    },
-                    move |hits| {
-                        let authorization = authorization.clone();
-                        let live_versions = live_versions.clone();
-                        let caller = authorization_caller.clone();
-                        let definition = authorization_definition.clone();
-                        let context = live_version_context.clone();
-                        async move {
-                            let (authorized, revision) = authorize_query_hits_with(
-                                authorization.as_ref(),
-                                &caller,
-                                &definition,
-                                hits,
-                            )
-                            .await?;
-                            let live = retain_live_query_hits(
-                                live_versions.as_ref(),
-                                tenant_id,
-                                bucket_id,
-                                authorized,
-                                context.remaining()?,
-                            )
-                            .await?;
-                            Ok((live, revision))
-                        }
-                    },
-                )
-                .await?;
+                if resume
+                    .as_ref()
+                    .is_some_and(|cursor| cursor.authorization_revision != admission.revision)
+                {
+                    return Err(Status::failed_precondition(
+                        "page token authorization revision is no longer current",
+                    ));
+                }
+                let kind = IndexKind::try_from(loaded.api.kind)
+                    .map_err(|_| Status::data_loss("index definition has an unknown kind"))?;
+                let candidate_visibility: Arc<dyn IndexCandidateVisibility> =
+                    Arc::new(AuthorizedCurrentCandidates::new(
+                        context.caller().clone(),
+                        admission.revision,
+                        loaded.stored.bucket.clone(),
+                        loaded.stored.path_prefix.clone(),
+                        kind,
+                        tenant_id,
+                        bucket_id,
+                        deadline,
+                        self.dependencies.authorization.clone(),
+                        self.dependencies.live_versions.clone(),
+                    ));
+                let executed = self
+                    .dependencies
+                    .queries
+                    .execute(ExecuteIndexQuery {
+                        context: context.clone(),
+                        tenant_id,
+                        bucket_id,
+                        definition: loaded.api.clone(),
+                        query,
+                        limit,
+                        candidate_visibility,
+                        authorization_revision: admission.revision,
+                        resume: resume.clone(),
+                    })
+                    .await?;
+                validate_execution(&executed, resume.as_ref(), limit)?;
                 let authorization_revision = executed.freshness.authorization_revision;
                 let next_page_token = match executed.next_position {
                     Some(last_position) => self.dependencies.page_tokens.encode(
@@ -1139,10 +1121,20 @@ fn validate_execution(
             "index executor returned a continuation without a generation",
         ));
     }
+    if execution.freshness.authorization_revision == 0 {
+        return Err(Status::data_loss(
+            "index executor returned no Zanzibar authorization revision",
+        ));
+    }
     if let Some(resume) = resume {
         if execution.freshness.generation != resume.generation {
             return Err(Status::failed_precondition(
                 "requested index generation is no longer available",
+            ));
+        }
+        if execution.freshness.authorization_revision != resume.authorization_revision {
+            return Err(Status::failed_precondition(
+                "authorization revision changed during index execution",
             ));
         }
     }
@@ -1175,12 +1167,30 @@ async fn authorize_definition_access(
     permission: ObjectPermission,
     denied_message: &'static str,
 ) -> Result<(), Status> {
+    authorize_definition_access_with_evidence(
+        authorization,
+        caller,
+        key,
+        permission,
+        denied_message,
+    )
+    .await
+    .map(|_| ())
+}
+
+async fn authorize_definition_access_with_evidence(
+    authorization: &dyn super::boundary::IndexAuthorization,
+    caller: &Caller,
+    key: &ObjectKey,
+    permission: ObjectPermission,
+    denied_message: &'static str,
+) -> Result<IndexAuthorizationEvidence, Status> {
     let evidence = authorization
         .allows_objects_with_evidence(caller, &[(key.clone(), permission)])
         .await?;
     validate_authorization_evidence(&evidence, 1)?;
     if evidence.allowed[0] {
-        Ok(())
+        Ok(evidence)
     } else {
         Err(Status::permission_denied(denied_message))
     }
@@ -1201,80 +1211,14 @@ async fn authorize_rebuild_access(
     .await
 }
 
-fn validate_query_hit(
-    caller: &Caller,
-    definition: &LoadedDefinition,
-    hit: &IndexQueryHit,
-) -> Result<ObjectKey, Status> {
-    let address = hit
-        .address
-        .as_ref()
-        .ok_or_else(|| Status::data_loss("index hit has no object address"))?;
-    if hit.object_version == 0 || hit.score.is_some_and(|score| !score.is_finite()) {
-        return Err(Status::data_loss("index hit contains invalid result data"));
-    }
-    let kind = IndexKind::try_from(definition.api.kind)
-        .map_err(|_| Status::data_loss("index definition has an unknown kind"))?;
-    let returns_referenced_object = matches!(kind, IndexKind::GitSource | IndexKind::Tensor);
-    if address.tenant != caller.storage_tenant().as_str()
-        || address.bucket != definition.stored.bucket
-        || (!returns_referenced_object
-            && !path_matches_prefix(&address.path, &definition.stored.path_prefix))
-        || contains_reserved_segment(&address.path)
-    {
-        return Err(Status::data_loss(
-            "index hit is outside the definition's object scope",
-        ));
-    }
-    ObjectKey::new(&address.tenant, &address.bucket, &address.path)
-        .map_err(|_| Status::data_loss("index hit has an invalid object address"))
-}
-
-async fn authorize_query_hits_with(
-    authorization: &dyn super::boundary::IndexAuthorization,
-    caller: &Caller,
-    definition: &LoadedDefinition,
-    hits: Vec<IndexQueryHit>,
-) -> Result<(Vec<IndexQueryHit>, u64), Status> {
-    let mut keys = Vec::with_capacity(hits.len() + 1);
-    keys.push(definition.key.clone());
-    for hit in &hits {
-        keys.push(validate_query_hit(caller, definition, hit)?);
-    }
-    let requests = keys
-        .into_iter()
-        .map(|key| (key, ObjectPermission::Get))
-        .collect::<Vec<_>>();
-    let evidence = authorization
-        .allows_objects_with_evidence(caller, &requests)
-        .await?;
-    validate_authorization_evidence(&evidence, hits.len() + 1)?;
-    if !evidence.allowed[0] {
-        return Err(Status::permission_denied(
-            "index definition read is no longer authorized",
-        ));
-    }
-    let visible = hits
-        .into_iter()
-        .zip(evidence.allowed.into_iter().skip(1))
-        .filter_map(|(hit, allowed)| allowed.then_some(hit))
-        .collect();
-    Ok((visible, evidence.revision))
-}
-
-fn contains_reserved_segment(path: &str) -> bool {
-    path.split('/').any(|segment| segment == "_anvil")
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use anvil_api::v1::{
-        CreateIndexRequest, GitSourceIndexSpec, IndexFreshness, IndexSourceFreshness,
-        IndexSpecification, PathIndexQuery, PathIndexSpec, TensorIndexQuery, TensorIndexSpec,
-        index_query, index_specification,
+        IndexFreshness, IndexSourceFreshness, IndexSpecification, PathIndexQuery, PathIndexSpec,
+        TensorIndexQuery, TensorIndexSpec, index_query, index_specification,
     };
     use anvil_store::StorageTenantId;
     use tonic::metadata::MetadataValue;
@@ -1295,54 +1239,6 @@ mod tests {
                 prefix: prefix.into(),
                 start_after: None,
             })),
-        }
-    }
-
-    fn loaded_definition(path_prefix: &str) -> LoadedDefinition {
-        loaded_definition_with_spec(
-            path_prefix,
-            "by-path",
-            index_specification::Specification::Path(PathIndexSpec {}),
-        )
-    }
-
-    fn loaded_definition_with_spec(
-        path_prefix: &str,
-        name: &str,
-        specification: index_specification::Specification,
-    ) -> LoadedDefinition {
-        let stored = StoredIndexDefinition::create(
-            "tenant".into(),
-            CreateIndexRequest {
-                bucket: "objects".into(),
-                name: name.into(),
-                path_prefix: path_prefix.into(),
-                content_type: String::new(),
-                specification: Some(IndexSpecification {
-                    specification: Some(specification),
-                }),
-                command_id: format!("create-{name}"),
-            },
-            17,
-        )
-        .unwrap();
-        LoadedDefinition {
-            key: ObjectKey::new("tenant", "objects", definition_path(name).unwrap()).unwrap(),
-            api: stored.to_api(3).unwrap(),
-            stored,
-        }
-    }
-
-    fn hit(path: &str, version: u64) -> IndexQueryHit {
-        IndexQueryHit {
-            address: Some(ObjectAddress {
-                tenant: "tenant".into(),
-                bucket: "objects".into(),
-                path: path.into(),
-            }),
-            object_version: version,
-            score: None,
-            fields_json: Vec::new(),
         }
     }
 
@@ -1597,155 +1493,6 @@ mod tests {
     }
 
     #[test]
-    fn reserved_internal_paths_cannot_escape_through_query_hits() {
-        assert!(contains_reserved_segment("_anvil/indexes/1/current"));
-        assert!(contains_reserved_segment("prefix/_anvil/meta.json"));
-        assert!(!contains_reserved_segment("prefix/_anvilish/value"));
-    }
-
-    #[tokio::test]
-    async fn query_authorization_checks_definition_and_every_hit_then_filters() {
-        let authorization = FakeAuthorization {
-            allowed: vec![true, true, false],
-            revision: 29,
-            seen: Mutex::new(Vec::new()),
-        };
-        let definition = loaded_definition("models");
-        let (visible, revision) = authorize_query_hits_with(
-            &authorization,
-            &caller(),
-            &definition,
-            vec![hit("models/one", 1), hit("models/two", 2)],
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(visible, vec![hit("models/one", 1)]);
-        assert_eq!(revision, 29);
-        let seen = authorization.seen.lock().unwrap();
-        assert_eq!(seen.len(), 3);
-        assert_eq!(seen[0].0.path(), definition_path("by-path").unwrap());
-        assert_eq!(seen[1].0.path(), "models/one");
-        assert_eq!(seen[2].0.path(), "models/two");
-        assert!(
-            seen.iter()
-                .all(|(_, permission)| *permission == ObjectPermission::Get)
-        );
-    }
-
-    #[tokio::test]
-    async fn reference_projection_hits_authorize_the_referenced_object_outside_source_prefix() {
-        let definitions = [
-            loaded_definition_with_spec(
-                "docs/",
-                "git-source",
-                index_specification::Specification::GitSource(GitSourceIndexSpec {
-                    repository_id: "repository".into(),
-                }),
-            ),
-            loaded_definition_with_spec(
-                "docs/",
-                "tensor",
-                index_specification::Specification::Tensor(TensorIndexSpec {
-                    model_id: "model".into(),
-                }),
-            ),
-        ];
-
-        for definition in definitions {
-            let authorization = FakeAuthorization {
-                allowed: vec![true, true],
-                revision: 37,
-                seen: Mutex::new(Vec::new()),
-            };
-            let referenced = hit("payloads/referenced.bin", 9);
-            let (visible, revision) = authorize_query_hits_with(
-                &authorization,
-                &caller(),
-                &definition,
-                vec![referenced.clone()],
-            )
-            .await
-            .unwrap();
-
-            assert_eq!(visible, vec![referenced]);
-            assert_eq!(revision, 37);
-            let seen = authorization.seen.lock().unwrap();
-            assert_eq!(seen.len(), 2);
-            assert_eq!(seen[0].0, definition.key);
-            assert_eq!(seen[1].0.path(), "payloads/referenced.bin");
-            assert_eq!(seen[1].1, ObjectPermission::Get);
-        }
-    }
-
-    #[test]
-    fn reference_projection_hits_cannot_cross_tenant_bucket_or_reserved_namespace() {
-        let definition = loaded_definition_with_spec(
-            "docs/",
-            "git-source",
-            index_specification::Specification::GitSource(GitSourceIndexSpec {
-                repository_id: "repository".into(),
-            }),
-        );
-        for (tenant, bucket, path) in [
-            ("another-tenant", "objects", "payloads/referenced.bin"),
-            ("tenant", "another-bucket", "payloads/referenced.bin"),
-            ("tenant", "objects", "payloads/_anvil/referenced.bin"),
-        ] {
-            let invalid = IndexQueryHit {
-                address: Some(ObjectAddress {
-                    tenant: tenant.into(),
-                    bucket: bucket.into(),
-                    path: path.into(),
-                }),
-                ..hit("unused", 9)
-            };
-            assert_eq!(
-                validate_query_hit(&caller(), &definition, &invalid)
-                    .unwrap_err()
-                    .code(),
-                tonic::Code::DataLoss
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn query_authorization_fails_closed_for_definition_or_scope() {
-        let denied = FakeAuthorization {
-            allowed: vec![false, true],
-            revision: 31,
-            seen: Mutex::new(Vec::new()),
-        };
-        let definition = loaded_definition("models");
-        assert_eq!(
-            authorize_query_hits_with(&denied, &caller(), &definition, vec![hit("models/one", 1)],)
-                .await
-                .unwrap_err()
-                .code(),
-            tonic::Code::PermissionDenied
-        );
-
-        let out_of_scope = FakeAuthorization {
-            allowed: vec![true, true],
-            revision: 33,
-            seen: Mutex::new(Vec::new()),
-        };
-        assert_eq!(
-            authorize_query_hits_with(
-                &out_of_scope,
-                &caller(),
-                &definition,
-                vec![hit("models-neighbour/one", 1)],
-            )
-            .await
-            .unwrap_err()
-            .code(),
-            tonic::Code::DataLoss
-        );
-        assert!(out_of_scope.seen.lock().unwrap().is_empty());
-    }
-
-    #[test]
     fn lag_is_returned_as_freshness_evidence_never_an_execution_error() {
         let execution = super::super::boundary::ExecutedIndexQuery {
             hits: Vec::new(),
@@ -1760,12 +1507,47 @@ mod tests {
                 }],
                 initial_build_complete: false,
                 rebuilding: true,
+                authorization_revision: 9,
                 ..Default::default()
             },
             next_position: None,
         };
 
         assert!(validate_execution(&execution, None, 100).is_ok());
+    }
+
+    #[test]
+    fn zero_hit_execution_still_requires_and_preserves_the_zanzibar_revision() {
+        let resume = IndexPageCursor {
+            generation: 7,
+            last_position: b"after".to_vec(),
+            authorization_revision: 9,
+        };
+        let mut execution = super::super::boundary::ExecutedIndexQuery {
+            hits: Vec::new(),
+            freshness: IndexFreshness {
+                generation: 7,
+                authorization_revision: 9,
+                ..Default::default()
+            },
+            next_position: None,
+        };
+        validate_execution(&execution, Some(&resume), 100).unwrap();
+
+        execution.freshness.authorization_revision = 0;
+        assert_eq!(
+            validate_execution(&execution, None, 100)
+                .unwrap_err()
+                .code(),
+            tonic::Code::DataLoss
+        );
+        execution.freshness.authorization_revision = 10;
+        assert_eq!(
+            validate_execution(&execution, Some(&resume), 100)
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
     }
 
     #[test]

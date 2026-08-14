@@ -11,6 +11,7 @@ use anvil_store::{
 use tonic::Code;
 
 use super::*;
+use crate::index_service::definition_path;
 use crate::payload_placement::{PayloadPlacement, select_payload_placement};
 use crate::placement::PlacementNode;
 
@@ -356,12 +357,7 @@ fn key() -> ObjectKey {
 }
 
 fn definition_key() -> ObjectKey {
-    ObjectKey::new(
-        "system",
-        "definitions",
-        "_anvil/indexes/v3/definitions/example",
-    )
-    .unwrap()
+    ObjectKey::new("system", "definitions", definition_path("example").unwrap()).unwrap()
 }
 
 fn blob(bytes: &[u8]) -> BlobRef {

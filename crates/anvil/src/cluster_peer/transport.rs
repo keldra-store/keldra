@@ -332,34 +332,17 @@ impl ClusterPeerTransport {
     ) -> Result<super::IndexHeadScanPage, Status> {
         let placement = self.placement()?;
         let fence = placement.fence();
-        let scope = match scope {
-            super::IndexHeadScanScope::Artifacts {
-                tenant_id,
-                bucket_id,
-                index_id,
-            } => wire::scan_index_heads_request::Scope::Artifacts(wire::IndexArtifactHeads {
-                tenant_id,
-                bucket_id,
-                index_id,
-            }),
-            super::IndexHeadScanScope::Run {
-                tenant_id,
-                bucket_id,
-                index_id,
-                run_hash,
-            } => wire::scan_index_heads_request::Scope::Run(wire::IndexRunHeads {
-                tenant_id,
-                bucket_id,
-                index_id,
-                run_blake3: run_hash.to_vec(),
-            }),
+        let artifacts = wire::IndexArtifactHeads {
+            tenant_id: scope.tenant_id,
+            bucket_id: scope.bucket_id,
+            index_id: scope.index_id,
         };
         let response = self
             .client(target, address)?
             .scan_index_heads(wire::ScanIndexHeadsRequest {
                 peer: Some(self.context(fence, 0, MAX_CLUSTER_OPERATION_TIME)?),
                 cursor: cursor.map(|cursor| cursor.as_token().to_owned()),
-                scope: Some(scope),
+                artifacts: Some(artifacts),
             })
             .await?
             .into_inner();
@@ -434,7 +417,7 @@ impl ClusterPeerTransport {
             })
             .await
             .map_err(|_| Status::unavailable("index snapshot request stream closed"))?;
-        let mut request = Request::new(tokio_stream::wrappers::ReceiverStream::new(receiver));
+        let request = Request::new(tokio_stream::wrappers::ReceiverStream::new(receiver));
         let mut stream = self
             .client(target, address)?
             .scan_index_source_snapshot(request)

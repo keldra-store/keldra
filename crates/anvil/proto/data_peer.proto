@@ -243,6 +243,7 @@ enum DefinitionAssignmentOperation {
   DEFINITION_ASSIGNMENT_OPERATION_UNSPECIFIED = 0;
   DEFINITION_ASSIGNMENT_OPERATION_UPSERT = 1;
   DEFINITION_ASSIGNMENT_OPERATION_REMOVE = 2;
+  DEFINITION_ASSIGNMENT_OPERATION_DELETE = 3;
 }
 
 message DefinitionAssignmentMutation {
@@ -318,6 +319,13 @@ message DefinitionLocatorRecord {
   uint64 definition_id = 4;
   string definition_path = 5;
   uint64 object_version = 6;
+  PrivateDefinitionObjectState state = 7;
+}
+
+enum PrivateDefinitionObjectState {
+  PRIVATE_DEFINITION_OBJECT_STATE_UNSPECIFIED = 0;
+  PRIVATE_DEFINITION_OBJECT_STATE_LIVE = 1;
+  PRIVATE_DEFINITION_OBJECT_STATE_DELETED = 2;
 }
 
 message DefinitionLocatorScanPage {

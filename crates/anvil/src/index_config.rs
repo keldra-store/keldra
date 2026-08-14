@@ -18,17 +18,19 @@ pub struct IndexRuntimeConfig {
     source_quantum_bytes: [NonZeroU64; 8],
     external_sort_chunk_bytes: [NonZeroU64; 8],
     compaction_max_lanes: [NonZeroU32; 8],
-    max_runs_per_level: [NonZeroU32; 8],
-    max_uncompacted_bytes_per_level: [NonZeroU64; 8],
+    max_segments_per_tier: [NonZeroU32; 8],
+    max_unmerged_bytes_per_tier: [NonZeroU64; 8],
     rayon_workers: NonZeroU32,
     query_max_concurrency: NonZeroU32,
     query_work_quantum_bytes: NonZeroU64,
+    query_memory_bytes: NonZeroU64,
     max_retained_generations: NonZeroU32,
     max_generation_age_hours: NonZeroU64,
     max_retained_generation_bytes: NonZeroU64,
 }
 
 impl IndexRuntimeConfig {
+    pub const MAX_RETAINED_GENERATIONS: u32 = 64;
     pub const DEFAULT_DISK_CACHE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
     pub const DEFAULT_MEMORY_PERCENT: u8 = 10;
     pub const DEFAULT_BUILDER_MEMORY_BYTES_PER_KIND: u64 = 256 * 1024 * 1024;
@@ -41,8 +43,9 @@ impl IndexRuntimeConfig {
     pub const DEFAULT_RAYON_WORKERS: u32 = 4;
     pub const DEFAULT_QUERY_MAX_CONCURRENCY: u32 = 64;
     pub const DEFAULT_QUERY_WORK_QUANTUM_BYTES: u64 = 4 * 1024 * 1024;
-    pub const DEFAULT_MAX_RUNS_PER_LEVEL: u32 = 64;
-    pub const DEFAULT_MAX_UNCOMPACTED_BYTES_PER_LEVEL: u64 = 1024 * 1024 * 1024;
+    pub const DEFAULT_QUERY_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
+    pub const DEFAULT_MAX_SEGMENTS_PER_TIER: u32 = 64;
+    pub const DEFAULT_MAX_UNMERGED_BYTES_PER_TIER: u64 = 1024 * 1024 * 1024;
     pub const DEFAULT_MAX_RETAINED_GENERATIONS: u32 = 3;
     pub const DEFAULT_MAX_GENERATION_AGE_HOURS: u64 = 24;
     pub const DEFAULT_MAX_RETAINED_GENERATION_BYTES: u64 = 50 * 1024 * 1024 * 1024;
@@ -72,6 +75,12 @@ impl IndexRuntimeConfig {
             NonZeroU32::new(rayon_workers).ok_or(IndexRuntimeConfigError::ZeroRayonWorkers)?;
         let max_retained_generations = NonZeroU32::new(max_retained_generations)
             .ok_or(IndexRuntimeConfigError::ZeroRetainedGenerations)?;
+        if max_retained_generations.get() > Self::MAX_RETAINED_GENERATIONS {
+            return Err(IndexRuntimeConfigError::TooManyRetainedGenerations {
+                configured: max_retained_generations.get(),
+                maximum: Self::MAX_RETAINED_GENERATIONS,
+            });
+        }
         let max_generation_age_hours = NonZeroU64::new(max_generation_age_hours)
             .ok_or(IndexRuntimeConfigError::ZeroGenerationAgeHours)?;
         let max_retained_generation_bytes = NonZeroU64::new(max_retained_generation_bytes)
@@ -94,11 +103,11 @@ impl IndexRuntimeConfig {
             compaction_max_lanes: [NonZeroU32::new(Self::DEFAULT_COMPACTION_MAX_LANES)
                 .expect("the default compaction lane limit is positive");
                 8],
-            max_runs_per_level: [NonZeroU32::new(Self::DEFAULT_MAX_RUNS_PER_LEVEL)
-                .expect("the default run-debt bound is positive");
+            max_segments_per_tier: [NonZeroU32::new(Self::DEFAULT_MAX_SEGMENTS_PER_TIER)
+                .expect("the default segment-debt bound is positive");
                 8],
-            max_uncompacted_bytes_per_level: [NonZeroU64::new(
-                Self::DEFAULT_MAX_UNCOMPACTED_BYTES_PER_LEVEL,
+            max_unmerged_bytes_per_tier: [NonZeroU64::new(
+                Self::DEFAULT_MAX_UNMERGED_BYTES_PER_TIER,
             )
             .expect("the default byte-debt bound is positive");
                 8],
@@ -107,6 +116,8 @@ impl IndexRuntimeConfig {
                 .expect("the default query concurrency is positive"),
             query_work_quantum_bytes: NonZeroU64::new(Self::DEFAULT_QUERY_WORK_QUANTUM_BYTES)
                 .expect("the default query work quantum is positive"),
+            query_memory_bytes: NonZeroU64::new(Self::DEFAULT_QUERY_MEMORY_BYTES)
+                .expect("the default query memory budget is positive"),
             max_retained_generations,
             max_generation_age_hours,
             max_retained_generation_bytes,
@@ -245,34 +256,47 @@ impl IndexRuntimeConfig {
         self.query_work_quantum_bytes.get()
     }
 
-    /// Maximum source-complete immutable runs retained at any one level
-    /// before the builder compacts instead of accepting more source work.
-    pub fn max_runs_per_level(self, kind: IndexKind) -> u32 {
-        self.max_runs_per_level[kind_slot(kind)].get()
+    pub fn with_query_memory_bytes(mut self, bytes: u64) -> Result<Self, IndexRuntimeConfigError> {
+        self.query_memory_bytes =
+            NonZeroU64::new(bytes).ok_or(IndexRuntimeConfigError::ZeroQueryMemoryBytes)?;
+        Ok(self)
+    }
+
+    /// Hard process-wide working-memory budget shared by every index query.
+    pub fn query_memory_bytes(self) -> u64 {
+        self.query_memory_bytes.get()
+    }
+
+    /// Maximum source-complete immutable segments retained in one deterministic
+    /// size tier before the builder merges instead of adding more debt.
+    pub fn max_segments_per_tier(self, kind: IndexKind) -> u32 {
+        self.max_segments_per_tier[kind_slot(kind)].get()
     }
 
     pub fn with_kind_compaction_debt_limits(
         mut self,
         kind: IndexKind,
-        max_runs_per_level: u32,
-        max_uncompacted_bytes_per_level: u64,
+        max_segments_per_tier: u32,
+        max_unmerged_bytes_per_tier: u64,
     ) -> Result<Self, IndexRuntimeConfigError> {
-        self.max_runs_per_level[kind_slot(kind)] = NonZeroU32::new(max_runs_per_level)
-            .ok_or(IndexRuntimeConfigError::ZeroRunsPerLevel(kind))?;
-        if max_runs_per_level as usize > crate::index_runtime::generation::MAX_RUNS_PER_LEVEL {
-            return Err(IndexRuntimeConfigError::TooManyRunsPerLevel {
-                configured: max_runs_per_level,
-                maximum: crate::index_runtime::generation::MAX_RUNS_PER_LEVEL as u32,
+        self.max_segments_per_tier[kind_slot(kind)] = NonZeroU32::new(max_segments_per_tier)
+            .ok_or(IndexRuntimeConfigError::ZeroSegmentsPerTier(kind))?;
+        if max_segments_per_tier as usize
+            > crate::index_runtime::generation::MAX_SEGMENTS_PER_GENERATION
+        {
+            return Err(IndexRuntimeConfigError::TooManySegmentsPerTier {
+                configured: max_segments_per_tier,
+                maximum: crate::index_runtime::generation::MAX_SEGMENTS_PER_GENERATION as u32,
             });
         }
-        self.max_uncompacted_bytes_per_level[kind_slot(kind)] =
-            NonZeroU64::new(max_uncompacted_bytes_per_level)
-                .ok_or(IndexRuntimeConfigError::ZeroUncompactedBytesPerLevel(kind))?;
+        self.max_unmerged_bytes_per_tier[kind_slot(kind)] =
+            NonZeroU64::new(max_unmerged_bytes_per_tier)
+                .ok_or(IndexRuntimeConfigError::ZeroUnmergedBytesPerTier(kind))?;
         Ok(self)
     }
 
-    pub fn max_uncompacted_bytes_per_level(self, kind: IndexKind) -> u64 {
-        self.max_uncompacted_bytes_per_level[kind_slot(kind)].get()
+    pub fn max_unmerged_bytes_per_tier(self, kind: IndexKind) -> u64 {
+        self.max_unmerged_bytes_per_tier[kind_slot(kind)].get()
     }
 
     pub fn max_retained_generations(self) -> u32 {
@@ -325,20 +349,24 @@ pub enum IndexRuntimeConfigError {
     ZeroQueryConcurrency,
     #[error("index query work quantum bytes must be greater than zero")]
     ZeroQueryWorkQuantumBytes,
+    #[error("global index query memory bytes must be greater than zero")]
+    ZeroQueryMemoryBytes,
     #[error("index projection lanes for {0:?} must be greater than zero")]
     ZeroProjectionLanesForKind(IndexKind),
     #[error("index source quantum for {0:?} must be greater than zero")]
     ZeroSourceQuantumForKind(IndexKind),
     #[error("index external-sort chunk for {0:?} must be greater than zero")]
     ZeroExternalSortChunkForKind(IndexKind),
-    #[error("maximum {0:?} index runs per level must be greater than zero")]
-    ZeroRunsPerLevel(IndexKind),
-    #[error("maximum uncompacted bytes per {0:?} index level must be greater than zero")]
-    ZeroUncompactedBytesPerLevel(IndexKind),
-    #[error("maximum index runs per level {configured} exceeds format bound {maximum}")]
-    TooManyRunsPerLevel { configured: u32, maximum: u32 },
+    #[error("maximum {0:?} index segments per size tier must be greater than zero")]
+    ZeroSegmentsPerTier(IndexKind),
+    #[error("maximum unmerged bytes per {0:?} index size tier must be greater than zero")]
+    ZeroUnmergedBytesPerTier(IndexKind),
+    #[error("maximum index segments per size tier {configured} exceeds format bound {maximum}")]
+    TooManySegmentsPerTier { configured: u32, maximum: u32 },
     #[error("maximum retained index generations must be greater than zero")]
     ZeroRetainedGenerations,
+    #[error("maximum retained index generations {configured} exceeds format bound {maximum}")]
+    TooManyRetainedGenerations { configured: u32, maximum: u32 },
     #[error("maximum index generation age hours must be greater than zero")]
     ZeroGenerationAgeHours,
     #[error("maximum retained index generation bytes must be greater than zero")]
@@ -369,17 +397,15 @@ mod tests {
         assert_eq!(config.rayon_workers(), 4);
         assert_eq!(config.query_max_concurrency(), 64);
         assert_eq!(config.query_work_quantum_bytes(), 4 * 1024 * 1024);
+        assert_eq!(config.query_memory_bytes(), 512 * 1024 * 1024);
         for kind in KINDS {
             assert_eq!(config.builder_memory_bytes(kind), 256 * 1024 * 1024);
             assert_eq!(config.projection_max_lanes(kind), 4);
             assert_eq!(config.source_quantum_bytes(kind), 16 * 1024 * 1024);
             assert_eq!(config.external_sort_chunk_bytes(kind), 16 * 1024 * 1024);
             assert_eq!(config.compaction_max_lanes(kind), 4);
-            assert_eq!(config.max_runs_per_level(kind), 64);
-            assert_eq!(
-                config.max_uncompacted_bytes_per_level(kind),
-                1024 * 1024 * 1024
-            );
+            assert_eq!(config.max_segments_per_tier(kind), 64);
+            assert_eq!(config.max_unmerged_bytes_per_tier(kind), 1024 * 1024 * 1024);
         }
         assert_eq!(config.max_retained_generations(), 3);
         assert_eq!(config.max_generation_age_hours(), 24);
@@ -488,6 +514,52 @@ mod tests {
     }
 
     #[test]
+    fn retained_generation_count_cannot_exceed_the_scratch_rank_format() {
+        assert_eq!(
+            IndexRuntimeConfig::new(
+                1,
+                10,
+                256 * 1024 * 1024,
+                4,
+                IndexRuntimeConfig::MAX_RETAINED_GENERATIONS + 1,
+                24,
+                50 * 1024 * 1024 * 1024,
+            ),
+            Err(IndexRuntimeConfigError::TooManyRetainedGenerations {
+                configured: IndexRuntimeConfig::MAX_RETAINED_GENERATIONS + 1,
+                maximum: IndexRuntimeConfig::MAX_RETAINED_GENERATIONS,
+            })
+        );
+        assert!(
+            IndexRuntimeConfig::new(
+                1,
+                10,
+                256 * 1024 * 1024,
+                4,
+                IndexRuntimeConfig::MAX_RETAINED_GENERATIONS,
+                24,
+                50 * 1024 * 1024 * 1024,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn global_query_memory_is_nonzero_and_independent() {
+        let defaults = IndexRuntimeConfig::default();
+        assert_eq!(
+            defaults.with_query_memory_bytes(0),
+            Err(IndexRuntimeConfigError::ZeroQueryMemoryBytes)
+        );
+        let configured = defaults.with_query_memory_bytes(123_456).unwrap();
+        assert_eq!(configured.query_memory_bytes(), 123_456);
+        assert_eq!(
+            configured.builder_memory_bytes(IndexKind::TypedJson),
+            defaults.builder_memory_bytes(IndexKind::TypedJson)
+        );
+    }
+
+    #[test]
     fn kind_limits_are_independent_and_keep_the_common_fallback() {
         let configured = IndexRuntimeConfig::default()
             .with_kind_builder_memory_bytes(IndexKind::Path, 96 * 1024 * 1024)
@@ -531,11 +603,13 @@ mod tests {
         );
         assert_eq!(
             defaults.with_kind_compaction_debt_limits(IndexKind::Vector, 0, 1),
-            Err(IndexRuntimeConfigError::ZeroRunsPerLevel(IndexKind::Vector))
+            Err(IndexRuntimeConfigError::ZeroSegmentsPerTier(
+                IndexKind::Vector
+            ))
         );
         assert_eq!(
             defaults.with_kind_compaction_debt_limits(IndexKind::Vector, 4, 0),
-            Err(IndexRuntimeConfigError::ZeroUncompactedBytesPerLevel(
+            Err(IndexRuntimeConfigError::ZeroUnmergedBytesPerTier(
                 IndexKind::Vector
             ))
         );
@@ -546,23 +620,23 @@ mod tests {
         let configured = IndexRuntimeConfig::default()
             .with_kind_compaction_debt_limits(IndexKind::TypedJson, 12, 99)
             .unwrap();
-        assert_eq!(configured.max_runs_per_level(IndexKind::TypedJson), 12);
+        assert_eq!(configured.max_segments_per_tier(IndexKind::TypedJson), 12);
         assert_eq!(
-            configured.max_uncompacted_bytes_per_level(IndexKind::TypedJson),
+            configured.max_unmerged_bytes_per_tier(IndexKind::TypedJson),
             99
         );
-        assert_eq!(configured.max_runs_per_level(IndexKind::Path), 64);
+        assert_eq!(configured.max_segments_per_tier(IndexKind::Path), 64);
         assert_eq!(
-            configured.max_uncompacted_bytes_per_level(IndexKind::Path),
+            configured.max_unmerged_bytes_per_tier(IndexKind::Path),
             1024 * 1024 * 1024
         );
     }
 
     #[test]
-    fn a_single_run_limit_is_valid() {
+    fn a_single_segment_limit_is_valid() {
         let configured = IndexRuntimeConfig::default()
             .with_kind_compaction_debt_limits(IndexKind::TypedJson, 1, 99)
             .unwrap();
-        assert_eq!(configured.max_runs_per_level(IndexKind::TypedJson), 1);
+        assert_eq!(configured.max_segments_per_tier(IndexKind::TypedJson), 1);
     }
 }

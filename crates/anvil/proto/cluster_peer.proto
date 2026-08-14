@@ -565,32 +565,21 @@ message IndexArtifactDeleted {
   bool replayed = 3;
 }
 
-// Every retained descriptor beneath one exact Anvil-owned index artifact
-// prefix. The server derives the prefix from index_id; peers cannot widen it.
+// Every retained descriptor beneath one exact format-v4 Anvil-owned index
+// artifact prefix. The server derives the prefix from index_id; peers cannot
+// widen it.
 message IndexArtifactHeads {
   uint64 tenant_id = 1;
   uint64 bucket_id = 2;
   uint64 index_id = 3;
 }
 
-// One immutable v2 run subtree. This is an internal, prefix-seekable retention
-// scope; it cannot be widened into an arbitrary object-prefix scan.
-message IndexRunHeads {
-  uint64 tenant_id = 1;
-  uint64 bucket_id = 2;
-  uint64 index_id = 3;
-  bytes run_blake3 = 4;
-}
-
-// A bounded index-maintenance scan with explicit derived-view scopes. Artifact
-// pages are retained `(path, version)` records; run pages are current heads.
+// A bounded format-v4 index-maintenance scan. Pages are retained
+// `(path, version)` records and the scope is always one exact index ID.
 message ScanIndexHeadsRequest {
   PeerContext peer = 1;
   optional string cursor = 2;
-  oneof scope {
-    IndexArtifactHeads artifacts = 4;
-    IndexRunHeads run = 8;
-  }
+  IndexArtifactHeads artifacts = 4;
 }
 
 message IndexHeadScanPage {

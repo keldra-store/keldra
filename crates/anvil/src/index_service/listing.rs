@@ -1,15 +1,14 @@
 //! Scoped definition-name listing over the ordinary distributed object path.
 
+use anvil_store::INDEX_DEFINITION_PREFIX;
 use tonic::Status;
 
 use crate::distributed_list::DistributedObjectLister;
 
 use super::{
     IndexDefinitionLister, IndexDefinitionScan, IndexDefinitionScanPage, ListedIndexDefinition,
-    definition_path,
+    definition_name, definition_path,
 };
-
-const DEFINITION_PREFIX: &str = "_anvil/indexes/v3/definitions/";
 
 #[derive(Clone)]
 pub(crate) struct DistributedIndexDefinitionLister {
@@ -38,7 +37,7 @@ impl IndexDefinitionLister for DistributedIndexDefinitionLister {
                 &request.bucket,
                 request.tenant_id,
                 request.bucket_id,
-                DEFINITION_PREFIX,
+                INDEX_DEFINITION_PREFIX,
                 start_after.as_deref(),
                 request.limit,
             )
@@ -47,14 +46,9 @@ impl IndexDefinitionLister for DistributedIndexDefinitionLister {
             .paths
             .into_iter()
             .map(|path| {
-                let name = path.strip_prefix(DEFINITION_PREFIX).ok_or_else(|| {
+                let name = definition_name(&path).ok_or_else(|| {
                     Status::data_loss("definition listing returned a path outside its scope")
                 })?;
-                if definition_path(name)? != path {
-                    return Err(Status::data_loss(
-                        "definition listing returned a non-canonical path",
-                    ));
-                }
                 Ok(ListedIndexDefinition {
                     name: name.to_owned(),
                 })

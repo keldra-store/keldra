@@ -10,7 +10,7 @@ use super::boundary::{IndexPageCursor, IndexPageTokenBinding, IndexPageTokenCode
 
 pub(crate) const INDEX_PAGE_TOKEN_AUDIENCE: &str = "anvil-index-page";
 pub(crate) const INDEX_PAGE_TOKEN_PURPOSE: &str = "index-page";
-const INDEX_PAGE_TOKEN_FORMAT: u8 = 2;
+const INDEX_PAGE_TOKEN_FORMAT: u8 = 4;
 
 /// Strongly typed private JWT claims. There is deliberately no expiry: the
 /// referenced immutable generation, definition version, and exact Zanzibar
@@ -24,6 +24,8 @@ pub(crate) struct IndexPageTokenClaims {
     pub(crate) purpose: String,
     pub(crate) storage_tenant: String,
     pub(crate) subject: ObjectRef,
+    pub(crate) tenant_id: u64,
+    pub(crate) bucket_id: u64,
     pub(crate) index_id: u64,
     pub(crate) definition_version: u64,
     pub(crate) generation: u64,
@@ -40,6 +42,8 @@ impl IndexPageTokenClaims {
             purpose: INDEX_PAGE_TOKEN_PURPOSE.into(),
             storage_tenant: caller.storage_tenant().as_str().to_owned(),
             subject: caller.subject().clone(),
+            tenant_id: binding.tenant_id,
+            bucket_id: binding.bucket_id,
             index_id: binding.index_id,
             definition_version: binding.definition_version,
             generation: cursor.generation,
@@ -54,6 +58,8 @@ impl IndexPageTokenClaims {
             && self.aud == INDEX_PAGE_TOKEN_AUDIENCE
             && self.purpose == INDEX_PAGE_TOKEN_PURPOSE
             && !self.storage_tenant.is_empty()
+            && self.tenant_id != 0
+            && self.bucket_id != 0
             && self.index_id != 0
             && self.definition_version != 0
             && self.generation != 0
@@ -66,7 +72,9 @@ impl IndexPageTokenClaims {
     }
 
     fn matches(&self, expected: IndexPageTokenBinding) -> bool {
-        self.index_id == expected.index_id
+        self.tenant_id == expected.tenant_id
+            && self.bucket_id == expected.bucket_id
+            && self.index_id == expected.index_id
             && self.definition_version == expected.definition_version
             && self.query_hash == expected.query_hash
     }
@@ -111,7 +119,11 @@ impl IndexPageTokenCodec for JwtManager {
 }
 
 fn require_binding(binding: IndexPageTokenBinding) -> Result<(), Status> {
-    if binding.index_id == 0 || binding.definition_version == 0 {
+    if binding.tenant_id == 0
+        || binding.bucket_id == 0
+        || binding.index_id == 0
+        || binding.definition_version == 0
+    {
         Err(Status::internal("index page binding is invalid"))
     } else {
         Ok(())
@@ -149,6 +161,8 @@ mod tests {
 
     fn binding() -> IndexPageTokenBinding {
         IndexPageTokenBinding {
+            tenant_id: 11,
+            bucket_id: 13,
             index_id: 17,
             definition_version: 23,
             query_hash: [5; 32],
@@ -176,7 +190,7 @@ mod tests {
     }
 
     #[test]
-    fn page_token_is_bound_to_caller_definition_and_query() {
+    fn page_token_is_bound_to_caller_scope_definition_and_query() {
         let manager = JwtManager::new(KEY).unwrap();
         let principal = caller("tenant-a", "app-a");
         let token = manager.encode(&principal, binding(), &cursor()).unwrap();
@@ -192,6 +206,12 @@ mod tests {
                 .is_err()
         );
         let mut changed = binding();
+        changed.tenant_id += 1;
+        assert!(manager.decode(&principal, &token, changed).is_err());
+        changed = binding();
+        changed.bucket_id += 1;
+        assert!(manager.decode(&principal, &token, changed).is_err());
+        changed = binding();
         changed.definition_version += 1;
         assert!(manager.decode(&principal, &token, changed).is_err());
         changed = binding();

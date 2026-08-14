@@ -1,6 +1,6 @@
 use anvil_store::{
-    BlobRef, CurrentHeadCursor, CurrentObjectSnapshot, DefinitionKind, DefinitionMutationIntent,
-    Head, ObjectRecordCursor, RetainedObjectCursor, RetainedObjectSnapshot, Version, VersionId,
+    BlobRef, DefinitionKind, DefinitionMutationIntent, Head, ObjectRecordCursor,
+    RetainedObjectCursor, RetainedObjectSnapshot, Version, VersionId,
 };
 use serde::{Deserialize, Serialize};
 use tonic::{Request, Response, Status};
@@ -12,25 +12,18 @@ use super::storage::{bounded_blocking, object_coordinator};
 use super::{CLUSTER_PEER_SCHEMA_VERSION, ClusterPeerService, wire};
 use crate::index_runtime::publication::{
     DefinitionVersionGuard, DerivedArtifactAdmission, IndexArtifactDelete,
-    IndexArtifactPublication, IndexArtifactPublish, is_index_recovery_path,
+    IndexArtifactPublication, IndexArtifactPublish, artifact_hash_from_path, current_path,
+    is_manifest_artifact_path,
 };
 
 const INDEX_HEAD_SCAN_MAX_RECORDS: u32 = 128;
 const INDEX_HEAD_SCAN_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum IndexHeadScanScope {
-    Artifacts {
-        tenant_id: u64,
-        bucket_id: u64,
-        index_id: u64,
-    },
-    Run {
-        tenant_id: u64,
-        bucket_id: u64,
-        index_id: u64,
-        run_hash: [u8; 32],
-    },
+pub(crate) struct IndexHeadScanScope {
+    pub(crate) tenant_id: u64,
+    pub(crate) bucket_id: u64,
+    pub(crate) index_id: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -151,82 +144,38 @@ impl ClusterPeerService {
         let scope = decode_scan_scope(request.get_ref())?;
         let fence = admitted.placement.fence();
         let store = self.store.clone();
-        let (heads, next_cursor) = if matches!(&scope, IndexHeadScanScope::Artifacts { .. }) {
-            let cursor = request
-                .get_ref()
-                .cursor
-                .clone()
-                .map(RetainedObjectCursor::from_token)
-                .transpose()
-                .map_err(|error| Status::invalid_argument(error.to_string()))?;
-            let (tenant_id, bucket_id, prefix) = scope.prefix();
-            let page = bounded_blocking(admitted.timeout, move || {
-                store
-                    .export_retained_objects_by_prefix(
-                        tenant_id,
-                        bucket_id,
-                        &prefix,
-                        cursor.as_ref(),
-                        INDEX_HEAD_SCAN_MAX_RECORDS,
-                        INDEX_HEAD_SCAN_MAX_BYTES,
-                    )
-                    .map_err(|error| Status::internal(error.to_string()))
+        let cursor = request
+            .get_ref()
+            .cursor
+            .clone()
+            .map(RetainedObjectCursor::from_token)
+            .transpose()
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let (tenant_id, bucket_id, prefix) = scope.prefix();
+        let page = bounded_blocking(admitted.timeout, move || {
+            store
+                .export_retained_objects_by_prefix(
+                    tenant_id,
+                    bucket_id,
+                    &prefix,
+                    cursor.as_ref(),
+                    INDEX_HEAD_SCAN_MAX_RECORDS,
+                    INDEX_HEAD_SCAN_MAX_BYTES,
+                )
+                .map_err(|error| Status::internal(error.to_string()))
+        })
+        .await?;
+        let heads = page
+            .records
+            .into_iter()
+            .filter(|snapshot| {
+                scope.matches(snapshot.tenant_id, snapshot.bucket_id, &snapshot.exact_path)
+                    && source_retained_coordinator(snapshot, &admitted.placement)
+                        == Some(self.local_node)
             })
-            .await?;
-            let heads = page
-                .records
-                .into_iter()
-                .filter(|snapshot| {
-                    scope.matches(snapshot.tenant_id, snapshot.bucket_id, &snapshot.exact_path)
-                        && source_retained_coordinator(snapshot, &admitted.placement)
-                            == Some(self.local_node)
-                })
-                .map(retained_object_head)
-                .collect::<Vec<_>>();
-            (
-                heads,
-                page.next_cursor.map(|cursor| cursor.as_token().to_owned()),
-            )
-        } else {
-            let cursor = request
-                .get_ref()
-                .cursor
-                .clone()
-                .map(CurrentHeadCursor::from_token)
-                .transpose()
-                .map_err(|error| Status::invalid_argument(error.to_string()))?;
-            let (tenant_id, bucket_id, prefix) = scope.prefix();
-            let page = bounded_blocking(admitted.timeout, move || {
-                store
-                    .export_current_heads_by_prefix(
-                        tenant_id,
-                        bucket_id,
-                        &prefix,
-                        cursor.as_ref(),
-                        INDEX_HEAD_SCAN_MAX_RECORDS,
-                        INDEX_HEAD_SCAN_MAX_BYTES,
-                    )
-                    .map_err(|error| Status::internal(error.to_string()))
-            })
-            .await?;
-            let heads = page
-                .heads
-                .into_iter()
-                .filter(|snapshot| {
-                    include_current_snapshot(
-                        &scope,
-                        snapshot,
-                        self.local_node,
-                        source_current_coordinator(snapshot, &admitted.placement),
-                    )
-                })
-                .map(current_object_head)
-                .collect::<Vec<_>>();
-            (
-                heads,
-                page.next_cursor.map(|cursor| cursor.as_token().to_owned()),
-            )
-        };
+            .map(retained_object_head)
+            .collect::<Vec<_>>();
+        let next_cursor = page.next_cursor.map(|cursor| cursor.as_token().to_owned());
         let status = self
             .store
             .local_watch_status()
@@ -249,90 +198,24 @@ impl ClusterPeerService {
 
 impl IndexHeadScanScope {
     fn matches(&self, candidate_tenant: u64, candidate_bucket: u64, exact_path: &str) -> bool {
-        match self {
-            Self::Artifacts {
-                tenant_id,
-                bucket_id,
-                index_id,
-            } => {
-                candidate_tenant == *tenant_id
-                    && candidate_bucket == *bucket_id
-                    && is_index_recovery_path(exact_path, *index_id)
-            }
-            Self::Run {
-                tenant_id,
-                bucket_id,
-                index_id,
-                run_hash,
-            } => {
-                candidate_tenant == *tenant_id
-                    && candidate_bucket == *bucket_id
-                    && exact_path
-                        .strip_prefix(&crate::index_runtime::publication::run_prefix(
-                            *index_id, *run_hash,
-                        ))
-                        .is_some_and(|suffix| suffix == "root" || suffix.starts_with("packs/"))
-                    && is_index_recovery_path(exact_path, *index_id)
-            }
-        }
+        candidate_tenant == self.tenant_id
+            && candidate_bucket == self.bucket_id
+            && (exact_path == current_path(self.index_id)
+                || is_manifest_artifact_path(self.index_id, exact_path)
+                || artifact_hash_from_path(self.index_id, exact_path).is_some())
     }
 
     fn prefix(&self) -> (u64, u64, String) {
-        match self {
-            Self::Artifacts {
-                tenant_id,
-                bucket_id,
-                index_id,
-            } => (
-                *tenant_id,
-                *bucket_id,
-                format!("_anvil/indexes/v3/{index_id}/"),
-            ),
-            Self::Run {
-                tenant_id,
-                bucket_id,
-                index_id,
-                run_hash,
-            } => (
-                *tenant_id,
-                *bucket_id,
-                crate::index_runtime::publication::run_prefix(*index_id, *run_hash),
-            ),
-        }
+        (
+            self.tenant_id,
+            self.bucket_id,
+            format!("_anvil/indexes/v4/{}/", self.index_id),
+        )
     }
 }
 
 fn source_retained_coordinator(
     snapshot: &RetainedObjectSnapshot,
-    placement: &crate::cluster_placement::ClusterPlacement,
-) -> Option<NodeId> {
-    object_coordinator(
-        placement,
-        snapshot.tenant_id,
-        snapshot.bucket_id,
-        &snapshot.exact_path,
-    )
-}
-
-fn include_current_snapshot(
-    scope: &IndexHeadScanScope,
-    snapshot: &CurrentObjectSnapshot,
-    local_node: NodeId,
-    source_coordinator: Option<NodeId>,
-) -> bool {
-    let matches = match scope {
-        IndexHeadScanScope::Artifacts { .. } => {
-            scope.matches(snapshot.tenant_id, snapshot.bucket_id, &snapshot.exact_path)
-        }
-        IndexHeadScanScope::Run { .. } => {
-            scope.matches(snapshot.tenant_id, snapshot.bucket_id, &snapshot.exact_path)
-        }
-    };
-    matches && source_coordinator == Some(local_node)
-}
-
-fn source_current_coordinator(
-    snapshot: &CurrentObjectSnapshot,
     placement: &crate::cluster_placement::ClusterPlacement,
 ) -> Option<NodeId> {
     object_coordinator(
@@ -375,55 +258,21 @@ fn retained_object_head(snapshot: RetainedObjectSnapshot) -> IndexCurrentHead {
     }
 }
 
-fn current_object_head(snapshot: CurrentObjectSnapshot) -> IndexCurrentHead {
-    IndexCurrentHead {
-        tenant_id: snapshot.tenant_id,
-        bucket_id: snapshot.bucket_id,
-        exact_path: snapshot.exact_path,
-        head: snapshot.head,
-        versions: vec![snapshot.version.clone()],
-        version: snapshot.version,
-    }
-}
-
 fn decode_scan_scope(request: &wire::ScanIndexHeadsRequest) -> Result<IndexHeadScanScope, Status> {
-    match request.scope.as_ref() {
-        Some(wire::scan_index_heads_request::Scope::Artifacts(scope))
-            if scope.tenant_id != 0 && scope.bucket_id != 0 && scope.index_id != 0 =>
-        {
-            Ok(IndexHeadScanScope::Artifacts {
-                tenant_id: scope.tenant_id,
-                bucket_id: scope.bucket_id,
-                index_id: scope.index_id,
-            })
-        }
-        Some(wire::scan_index_heads_request::Scope::Artifacts(_)) => Err(Status::invalid_argument(
+    let scope = request
+        .artifacts
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("index artifact scan scope is required"))?;
+    if scope.tenant_id == 0 || scope.bucket_id == 0 || scope.index_id == 0 {
+        return Err(Status::invalid_argument(
             "index artifact scan stable IDs must be non-zero",
-        )),
-        Some(wire::scan_index_heads_request::Scope::Run(scope))
-            if scope.tenant_id != 0
-                && scope.bucket_id != 0
-                && scope.index_id != 0
-                && scope.run_blake3.len() == 32 =>
-        {
-            let run_hash: [u8; 32] =
-                scope.run_blake3.as_slice().try_into().map_err(|_| {
-                    Status::invalid_argument("index run hash must contain 32 bytes")
-                })?;
-            Ok(IndexHeadScanScope::Run {
-                tenant_id: scope.tenant_id,
-                bucket_id: scope.bucket_id,
-                index_id: scope.index_id,
-                run_hash,
-            })
-        }
-        Some(wire::scan_index_heads_request::Scope::Run(_)) => Err(Status::invalid_argument(
-            "index run scan stable IDs and hash must be non-empty",
-        )),
-        None => Err(Status::invalid_argument(
-            "index head scan scope is required",
-        )),
+        ));
     }
+    Ok(IndexHeadScanScope {
+        tenant_id: scope.tenant_id,
+        bucket_id: scope.bucket_id,
+        index_id: scope.index_id,
+    })
 }
 
 pub(super) fn decode_request(
@@ -559,36 +408,25 @@ mod tests {
     #[test]
     fn scan_scopes_cannot_become_arbitrary_prefix_scans() {
         let digest = "a".repeat(64);
-        let generation = format!("_anvil/indexes/v3/9/manifests/{digest}");
-        let current = "_anvil/indexes/v3/9/current";
+        let generation = format!("_anvil/indexes/v4/9/manifests/{digest}");
+        let artifact = format!("_anvil/indexes/v4/9/artifacts/{digest}");
+        let current = "_anvil/indexes/v4/9/current";
 
-        let scoped = IndexHeadScanScope::Artifacts {
+        let scoped = IndexHeadScanScope {
             tenant_id: 4,
             bucket_id: 5,
             index_id: 9,
         };
         assert!(scoped.matches(4, 5, &generation));
+        assert!(scoped.matches(4, 5, &artifact));
         assert!(scoped.matches(4, 5, current));
-        assert!(!scoped.matches(4, 5, "_anvil/indexes/v3/definitions/search"));
-        assert!(!scoped.matches(4, 5, "_anvil/indexes/definitions/search"));
+        assert!(!scoped.matches(4, 5, &format!("{artifact}/child")));
+        assert!(!scoped.matches(4, 5, "_anvil/indexes/v4/definitions/search"));
+        assert!(!scoped.matches(4, 5, "_anvil/indexes/v3/9/current"));
         assert!(!scoped.matches(4, 5, "ordinary/path"));
-        let run_hash = [3; 32];
-        let run_root = crate::index_runtime::publication::run_root_path(9, run_hash);
-        let adjacent = format!("{run_root}extra");
-        let run = IndexHeadScanScope::Run {
-            tenant_id: 4,
-            bucket_id: 5,
-            index_id: 9,
-            run_hash,
-        };
-        assert!(run.matches(4, 5, &run_root));
-        assert!(!run.matches(4, 5, &adjacent));
-        assert_eq!(
-            run.prefix().2,
-            crate::index_runtime::publication::run_prefix(9, run_hash)
-        );
+        assert_eq!(scoped.prefix().2, "_anvil/indexes/v4/9/");
         assert!(
-            !IndexHeadScanScope::Artifacts {
+            !IndexHeadScanScope {
                 tenant_id: 4,
                 bucket_id: 6,
                 index_id: 9,
@@ -602,7 +440,7 @@ mod tests {
         let source = RetainedObjectSnapshot {
             tenant_id: 4,
             bucket_id: 5,
-            exact_path: "_anvil/indexes/v3/9/current".into(),
+            exact_path: "_anvil/indexes/v4/9/current".into(),
             version: Version {
                 id: VersionId(6),
                 blob: Some(BlobRef {

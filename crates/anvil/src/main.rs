@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 #[derive(Debug, Parser)]
-#[command(name = "anvil-server", version, about = "Anvil 0.8 object server")]
+#[command(name = "anvil-server", version, about = "Anvil 0.9 object server")]
 struct Arguments {
     #[arg(long, env = "ANVIL_LISTEN", default_value = "127.0.0.1:50051")]
     listen: SocketAddr,
@@ -327,57 +327,62 @@ struct Arguments {
     )]
     index_query_work_quantum_bytes: u64,
 
-    /// Fallback maximum runs retained at one index level before builders compact (default: 64).
+    /// Hard working-memory budget shared by all index queries (default: 512 MiB).
     #[arg(
         long,
-        env = "ANVIL_INDEX_MAX_RUNS_PER_LEVEL",
-        default_value_t = IndexRuntimeConfig::DEFAULT_MAX_RUNS_PER_LEVEL
+        env = "ANVIL_INDEX_QUERY_MEMORY_BYTES",
+        default_value_t = IndexRuntimeConfig::DEFAULT_QUERY_MEMORY_BYTES
     )]
-    index_max_runs_per_level: u32,
+    index_query_memory_bytes: u64,
 
-    /// Fallback maximum encoded uncompacted bytes at one index level (default: 1 GiB).
+    /// Fallback maximum segments retained in one size tier before builders compact (default: 64).
     #[arg(
         long,
-        env = "ANVIL_INDEX_MAX_UNCOMPACTED_BYTES_PER_LEVEL",
-        default_value_t = IndexRuntimeConfig::DEFAULT_MAX_UNCOMPACTED_BYTES_PER_LEVEL
+        env = "ANVIL_INDEX_MAX_SEGMENTS_PER_TIER",
+        default_value_t = IndexRuntimeConfig::DEFAULT_MAX_SEGMENTS_PER_TIER
     )]
-    index_max_uncompacted_bytes_per_level: u64,
+    index_max_segments_per_tier: u32,
 
-    #[arg(long, env = "ANVIL_INDEX_PATH_MAX_RUNS_PER_LEVEL")]
-    index_path_max_runs_per_level: Option<u32>,
-    #[arg(long, env = "ANVIL_INDEX_PATH_MAX_UNCOMPACTED_BYTES_PER_LEVEL")]
-    index_path_max_uncompacted_bytes_per_level: Option<u64>,
-    #[arg(long, env = "ANVIL_INDEX_METADATA_FILTER_MAX_RUNS_PER_LEVEL")]
-    index_metadata_filter_max_runs_per_level: Option<u32>,
+    /// Fallback maximum encoded unmerged bytes in one size tier (default: 1 GiB).
     #[arg(
         long,
-        env = "ANVIL_INDEX_METADATA_FILTER_MAX_UNCOMPACTED_BYTES_PER_LEVEL"
+        env = "ANVIL_INDEX_MAX_UNMERGED_BYTES_PER_TIER",
+        default_value_t = IndexRuntimeConfig::DEFAULT_MAX_UNMERGED_BYTES_PER_TIER
     )]
-    index_metadata_filter_max_uncompacted_bytes_per_level: Option<u64>,
-    #[arg(long, env = "ANVIL_INDEX_TYPED_JSON_MAX_RUNS_PER_LEVEL")]
-    index_typed_json_max_runs_per_level: Option<u32>,
-    #[arg(long, env = "ANVIL_INDEX_TYPED_JSON_MAX_UNCOMPACTED_BYTES_PER_LEVEL")]
-    index_typed_json_max_uncompacted_bytes_per_level: Option<u64>,
-    #[arg(long, env = "ANVIL_INDEX_FULL_TEXT_MAX_RUNS_PER_LEVEL")]
-    index_full_text_max_runs_per_level: Option<u32>,
-    #[arg(long, env = "ANVIL_INDEX_FULL_TEXT_MAX_UNCOMPACTED_BYTES_PER_LEVEL")]
-    index_full_text_max_uncompacted_bytes_per_level: Option<u64>,
-    #[arg(long, env = "ANVIL_INDEX_VECTOR_MAX_RUNS_PER_LEVEL")]
-    index_vector_max_runs_per_level: Option<u32>,
-    #[arg(long, env = "ANVIL_INDEX_VECTOR_MAX_UNCOMPACTED_BYTES_PER_LEVEL")]
-    index_vector_max_uncompacted_bytes_per_level: Option<u64>,
-    #[arg(long, env = "ANVIL_INDEX_HYBRID_MAX_RUNS_PER_LEVEL")]
-    index_hybrid_max_runs_per_level: Option<u32>,
-    #[arg(long, env = "ANVIL_INDEX_HYBRID_MAX_UNCOMPACTED_BYTES_PER_LEVEL")]
-    index_hybrid_max_uncompacted_bytes_per_level: Option<u64>,
-    #[arg(long, env = "ANVIL_INDEX_GIT_SOURCE_MAX_RUNS_PER_LEVEL")]
-    index_git_source_max_runs_per_level: Option<u32>,
-    #[arg(long, env = "ANVIL_INDEX_GIT_SOURCE_MAX_UNCOMPACTED_BYTES_PER_LEVEL")]
-    index_git_source_max_uncompacted_bytes_per_level: Option<u64>,
-    #[arg(long, env = "ANVIL_INDEX_TENSOR_MAX_RUNS_PER_LEVEL")]
-    index_tensor_max_runs_per_level: Option<u32>,
-    #[arg(long, env = "ANVIL_INDEX_TENSOR_MAX_UNCOMPACTED_BYTES_PER_LEVEL")]
-    index_tensor_max_uncompacted_bytes_per_level: Option<u64>,
+    index_max_unmerged_bytes_per_tier: u64,
+
+    #[arg(long, env = "ANVIL_INDEX_PATH_MAX_SEGMENTS_PER_TIER")]
+    index_path_max_segments_per_tier: Option<u32>,
+    #[arg(long, env = "ANVIL_INDEX_PATH_MAX_UNMERGED_BYTES_PER_TIER")]
+    index_path_max_unmerged_bytes_per_tier: Option<u64>,
+    #[arg(long, env = "ANVIL_INDEX_METADATA_FILTER_MAX_SEGMENTS_PER_TIER")]
+    index_metadata_filter_max_segments_per_tier: Option<u32>,
+    #[arg(long, env = "ANVIL_INDEX_METADATA_FILTER_MAX_UNMERGED_BYTES_PER_TIER")]
+    index_metadata_filter_max_unmerged_bytes_per_tier: Option<u64>,
+    #[arg(long, env = "ANVIL_INDEX_TYPED_JSON_MAX_SEGMENTS_PER_TIER")]
+    index_typed_json_max_segments_per_tier: Option<u32>,
+    #[arg(long, env = "ANVIL_INDEX_TYPED_JSON_MAX_UNMERGED_BYTES_PER_TIER")]
+    index_typed_json_max_unmerged_bytes_per_tier: Option<u64>,
+    #[arg(long, env = "ANVIL_INDEX_FULL_TEXT_MAX_SEGMENTS_PER_TIER")]
+    index_full_text_max_segments_per_tier: Option<u32>,
+    #[arg(long, env = "ANVIL_INDEX_FULL_TEXT_MAX_UNMERGED_BYTES_PER_TIER")]
+    index_full_text_max_unmerged_bytes_per_tier: Option<u64>,
+    #[arg(long, env = "ANVIL_INDEX_VECTOR_MAX_SEGMENTS_PER_TIER")]
+    index_vector_max_segments_per_tier: Option<u32>,
+    #[arg(long, env = "ANVIL_INDEX_VECTOR_MAX_UNMERGED_BYTES_PER_TIER")]
+    index_vector_max_unmerged_bytes_per_tier: Option<u64>,
+    #[arg(long, env = "ANVIL_INDEX_HYBRID_MAX_SEGMENTS_PER_TIER")]
+    index_hybrid_max_segments_per_tier: Option<u32>,
+    #[arg(long, env = "ANVIL_INDEX_HYBRID_MAX_UNMERGED_BYTES_PER_TIER")]
+    index_hybrid_max_unmerged_bytes_per_tier: Option<u64>,
+    #[arg(long, env = "ANVIL_INDEX_GIT_SOURCE_MAX_SEGMENTS_PER_TIER")]
+    index_git_source_max_segments_per_tier: Option<u32>,
+    #[arg(long, env = "ANVIL_INDEX_GIT_SOURCE_MAX_UNMERGED_BYTES_PER_TIER")]
+    index_git_source_max_unmerged_bytes_per_tier: Option<u64>,
+    #[arg(long, env = "ANVIL_INDEX_TENSOR_MAX_SEGMENTS_PER_TIER")]
+    index_tensor_max_segments_per_tier: Option<u32>,
+    #[arg(long, env = "ANVIL_INDEX_TENSOR_MAX_UNMERGED_BYTES_PER_TIER")]
+    index_tensor_max_unmerged_bytes_per_tier: Option<u64>,
 
     /// Maximum generations retained per index, including current (default: 3).
     #[arg(
@@ -497,6 +502,7 @@ impl Arguments {
         .and_then(|config| {
             config.with_query_work_quantum_bytes(self.index_query_work_quantum_bytes)
         })
+        .and_then(|config| config.with_query_memory_bytes(self.index_query_memory_bytes))
         .context("validate index runtime configuration")?;
         let mut config = config;
         for (
@@ -506,7 +512,7 @@ impl Arguments {
             source_quantum,
             sort_chunk,
             compaction_lanes,
-            max_runs,
+            max_segments,
             max_bytes,
         ) in [
             (
@@ -516,8 +522,8 @@ impl Arguments {
                 self.index_path_source_quantum_bytes,
                 self.index_path_external_sort_chunk_bytes,
                 self.index_path_compaction_max_lanes,
-                self.index_path_max_runs_per_level,
-                self.index_path_max_uncompacted_bytes_per_level,
+                self.index_path_max_segments_per_tier,
+                self.index_path_max_unmerged_bytes_per_tier,
             ),
             (
                 IndexKind::MetadataFilter,
@@ -526,8 +532,8 @@ impl Arguments {
                 self.index_metadata_filter_source_quantum_bytes,
                 self.index_metadata_filter_external_sort_chunk_bytes,
                 self.index_metadata_filter_compaction_max_lanes,
-                self.index_metadata_filter_max_runs_per_level,
-                self.index_metadata_filter_max_uncompacted_bytes_per_level,
+                self.index_metadata_filter_max_segments_per_tier,
+                self.index_metadata_filter_max_unmerged_bytes_per_tier,
             ),
             (
                 IndexKind::TypedJson,
@@ -536,8 +542,8 @@ impl Arguments {
                 self.index_typed_json_source_quantum_bytes,
                 self.index_typed_json_external_sort_chunk_bytes,
                 self.index_typed_json_compaction_max_lanes,
-                self.index_typed_json_max_runs_per_level,
-                self.index_typed_json_max_uncompacted_bytes_per_level,
+                self.index_typed_json_max_segments_per_tier,
+                self.index_typed_json_max_unmerged_bytes_per_tier,
             ),
             (
                 IndexKind::FullText,
@@ -546,8 +552,8 @@ impl Arguments {
                 self.index_full_text_source_quantum_bytes,
                 self.index_full_text_external_sort_chunk_bytes,
                 self.index_full_text_compaction_max_lanes,
-                self.index_full_text_max_runs_per_level,
-                self.index_full_text_max_uncompacted_bytes_per_level,
+                self.index_full_text_max_segments_per_tier,
+                self.index_full_text_max_unmerged_bytes_per_tier,
             ),
             (
                 IndexKind::Vector,
@@ -556,8 +562,8 @@ impl Arguments {
                 self.index_vector_source_quantum_bytes,
                 self.index_vector_external_sort_chunk_bytes,
                 self.index_vector_compaction_max_lanes,
-                self.index_vector_max_runs_per_level,
-                self.index_vector_max_uncompacted_bytes_per_level,
+                self.index_vector_max_segments_per_tier,
+                self.index_vector_max_unmerged_bytes_per_tier,
             ),
             (
                 IndexKind::Hybrid,
@@ -566,8 +572,8 @@ impl Arguments {
                 self.index_hybrid_source_quantum_bytes,
                 self.index_hybrid_external_sort_chunk_bytes,
                 self.index_hybrid_compaction_max_lanes,
-                self.index_hybrid_max_runs_per_level,
-                self.index_hybrid_max_uncompacted_bytes_per_level,
+                self.index_hybrid_max_segments_per_tier,
+                self.index_hybrid_max_unmerged_bytes_per_tier,
             ),
             (
                 IndexKind::GitSource,
@@ -576,8 +582,8 @@ impl Arguments {
                 self.index_git_source_source_quantum_bytes,
                 self.index_git_source_external_sort_chunk_bytes,
                 self.index_git_source_compaction_max_lanes,
-                self.index_git_source_max_runs_per_level,
-                self.index_git_source_max_uncompacted_bytes_per_level,
+                self.index_git_source_max_segments_per_tier,
+                self.index_git_source_max_unmerged_bytes_per_tier,
             ),
             (
                 IndexKind::Tensor,
@@ -586,8 +592,8 @@ impl Arguments {
                 self.index_tensor_source_quantum_bytes,
                 self.index_tensor_external_sort_chunk_bytes,
                 self.index_tensor_compaction_max_lanes,
-                self.index_tensor_max_runs_per_level,
-                self.index_tensor_max_uncompacted_bytes_per_level,
+                self.index_tensor_max_segments_per_tier,
+                self.index_tensor_max_unmerged_bytes_per_tier,
             ),
         ] {
             config = config
@@ -602,8 +608,8 @@ impl Arguments {
                 .and_then(|config| {
                     config.with_kind_compaction_debt_limits(
                         kind,
-                        max_runs.unwrap_or(self.index_max_runs_per_level),
-                        max_bytes.unwrap_or(self.index_max_uncompacted_bytes_per_level),
+                        max_segments.unwrap_or(self.index_max_segments_per_tier),
+                        max_bytes.unwrap_or(self.index_max_unmerged_bytes_per_tier),
                     )
                 })
                 .context("validate index runtime configuration")?;
@@ -813,13 +819,15 @@ mod tests {
             "17",
             "--index-query-work-quantum-bytes",
             "1048576",
-            "--index-max-runs-per-level",
+            "--index-query-memory-bytes",
+            "268435456",
+            "--index-max-segments-per-tier",
             "12",
-            "--index-max-uncompacted-bytes-per-level",
+            "--index-max-unmerged-bytes-per-tier",
             "10485760",
-            "--index-path-max-runs-per-level",
+            "--index-path-max-segments-per-tier",
             "8",
-            "--index-path-max-uncompacted-bytes-per-level",
+            "--index-path-max-unmerged-bytes-per-tier",
             "5242880",
             "--index-max-retained-generations",
             "7",
@@ -846,14 +854,15 @@ mod tests {
         assert_eq!(config.rayon_workers(), 6);
         assert_eq!(config.query_max_concurrency(), 17);
         assert_eq!(config.query_work_quantum_bytes(), 1_048_576);
-        assert_eq!(config.max_runs_per_level(IndexKind::Path), 8);
+        assert_eq!(config.query_memory_bytes(), 268_435_456);
+        assert_eq!(config.max_segments_per_tier(IndexKind::Path), 8);
         assert_eq!(
-            config.max_uncompacted_bytes_per_level(IndexKind::Path),
+            config.max_unmerged_bytes_per_tier(IndexKind::Path),
             5_242_880
         );
-        assert_eq!(config.max_runs_per_level(IndexKind::TypedJson), 12);
+        assert_eq!(config.max_segments_per_tier(IndexKind::TypedJson), 12);
         assert_eq!(
-            config.max_uncompacted_bytes_per_level(IndexKind::TypedJson),
+            config.max_unmerged_bytes_per_tier(IndexKind::TypedJson),
             10_485_760
         );
         assert_eq!(config.max_retained_generations(), 7);
@@ -876,10 +885,11 @@ mod tests {
             vec!["--index-rayon-workers", "0"],
             vec!["--index-query-max-concurrency", "0"],
             vec!["--index-query-work-quantum-bytes", "0"],
-            vec!["--index-max-runs-per-level", "0"],
-            vec!["--index-max-uncompacted-bytes-per-level", "0"],
-            vec!["--index-vector-max-runs-per-level", "0"],
-            vec!["--index-vector-max-uncompacted-bytes-per-level", "0"],
+            vec!["--index-query-memory-bytes", "0"],
+            vec!["--index-max-segments-per-tier", "0"],
+            vec!["--index-max-unmerged-bytes-per-tier", "0"],
+            vec!["--index-vector-max-segments-per-tier", "0"],
+            vec!["--index-vector-max-unmerged-bytes-per-tier", "0"],
             vec!["--index-max-retained-generations", "0"],
             vec!["--index-max-generation-age-hours", "0"],
             vec!["--index-max-retained-generation-bytes", "0"],
@@ -916,15 +926,17 @@ mod tests {
             "--index-rayon-workers",
             "--index-query-max-concurrency",
             "--index-query-work-quantum-bytes",
+            "--index-query-memory-bytes",
+            "default: 512 MiB",
             "default: 4",
-            "--index-max-runs-per-level",
+            "--index-max-segments-per-tier",
             "default: 64",
-            "--index-max-uncompacted-bytes-per-level",
+            "--index-max-unmerged-bytes-per-tier",
             "default: 1 GiB",
-            "--index-path-max-runs-per-level",
-            "--index-path-max-uncompacted-bytes-per-level",
-            "--index-tensor-max-runs-per-level",
-            "--index-tensor-max-uncompacted-bytes-per-level",
+            "--index-path-max-segments-per-tier",
+            "--index-path-max-unmerged-bytes-per-tier",
+            "--index-tensor-max-segments-per-tier",
+            "--index-tensor-max-unmerged-bytes-per-tier",
             "--source-journal-max-entries",
             "--source-journal-max-bytes",
             "--index-max-retained-generations",

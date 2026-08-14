@@ -8,7 +8,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anvil_api::v1::index_query::Query as IndexQueryValue;
-use anvil_api::v1::{IndexDefinition, IndexKind, IndexQuery, IndexQueryHit};
+use anvil_api::v1::{IndexDefinition, IndexKind, IndexQuery};
 use anvil_consensus::NodeId;
 use anvil_store::{ObjectKey, PlacementLogId, StorageTenantId};
 use tonic::{Request, Response, Status};
@@ -24,8 +24,8 @@ use crate::cluster_placement::ClusterPlacement;
 use crate::distributed_list::OriginalBearer;
 use crate::index_runtime::placement::{IndexIdentity, IndexPlacement};
 use crate::index_service::{
-    ExecutedIndexQuery, IndexAuthorization, IndexLiveVersionReader, IndexPageCursor,
-    collect_authorized_page, definition_path, path_matches_prefix, retain_live_query_hits,
+    AuthorizedCurrentCandidates, ExecutedIndexQuery, IndexAuthorization, IndexCandidateVisibility,
+    IndexLiveVersionReader, IndexPageCursor, definition_path,
 };
 use crate::logical_name_resolution::LogicalNameResolver;
 
@@ -46,7 +46,7 @@ pub(crate) struct RoutedIndexQueryRequest {
     pub(crate) resume: Option<IndexPageCursor>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct LocalIndexQueryRequest {
     /// Verified tenant name used only for constructing ordinary object addresses.
     /// The destination binds it to the signed bearer or fixed anonymous marker,
@@ -58,6 +58,12 @@ pub(crate) struct LocalIndexQueryRequest {
     pub(crate) query: IndexQuery,
     pub(crate) limit: usize,
     pub(crate) resume: Option<IndexPageCursor>,
+    /// Mandatory in-loop candidate authorization and exact-current check. It
+    /// is process-local and is never serialized onto the peer protocol.
+    pub(crate) candidate_visibility: Arc<dyn IndexCandidateVisibility>,
+    /// Definition-admission Zanzibar revision which the engine must retain in
+    /// freshness even when the query finds no candidates.
+    pub(crate) authorization_revision: u64,
 }
 
 #[tonic::async_trait]
@@ -180,88 +186,40 @@ impl RoutedIndexQueryHandler for AuthorizedIndexQueryHandler {
         }
 
         let request = call.request;
-        let deadline = call.deadline;
-        let limit = request.limit;
-        let tenant_id = request.tenant_id;
-        let bucket_id = request.bucket_id;
-        let resume = request.resume;
-        let executor = self.executor.clone();
-        let storage_tenant = caller.storage_tenant().as_str().to_owned();
-        let execute_definition = request.definition.clone();
-        let execute_query = request.query.clone();
-        let authorization = self.authorization.clone();
-        let live_versions = self.live_versions.clone();
-        let authorization_caller = caller.clone();
-        let authorization_definition = request.definition.clone();
-        collect_authorized_page(
-            limit,
-            resume,
-            Some(before.revision),
-            move |resume, execute_limit| {
-                let executor = executor.clone();
-                let storage_tenant = storage_tenant.clone();
-                let definition = execute_definition.clone();
-                let query = execute_query.clone();
-                async move {
-                    let resumed = resume.clone();
-                    let result = executor
-                        .execute_local(LocalIndexQueryRequest {
-                            storage_tenant,
-                            tenant_id,
-                            bucket_id,
-                            definition,
-                            query,
-                            limit: execute_limit,
-                            resume,
-                        })
-                        .await?;
-                    validate_result(&result, resumed.as_ref(), execute_limit)?;
-                    Ok(result)
-                }
-            },
-            move |hits| {
-                let authorization = authorization.clone();
-                let live_versions = live_versions.clone();
-                let caller = authorization_caller.clone();
-                let definition = authorization_definition.clone();
-                let definition_key = definition_key.clone();
-                async move {
-                    let mut keys = Vec::with_capacity(hits.len() + 1);
-                    keys.push(definition_key);
-                    for hit in &hits {
-                        keys.push(validate_hit(&caller, &definition, hit)?);
-                    }
-                    let checks = keys
-                        .into_iter()
-                        .map(|key| (key, ObjectPermission::Get))
-                        .collect::<Vec<_>>();
-                    let evidence = authorization
-                        .allows_objects_with_evidence(&caller, &checks)
-                        .await?;
-                    require_authorization_evidence(&evidence, hits.len() + 1)?;
-                    if !evidence.allowed[0] {
-                        return Err(Status::permission_denied(
-                            "index definition read is no longer authorized",
-                        ));
-                    }
-                    let authorized = hits
-                        .into_iter()
-                        .zip(evidence.allowed.into_iter().skip(1))
-                        .filter_map(|(hit, allowed)| allowed.then_some(hit))
-                        .collect();
-                    let visible = retain_live_query_hits(
-                        live_versions.as_ref(),
-                        tenant_id,
-                        bucket_id,
-                        authorized,
-                        crate::v05::deadline_remaining(deadline)?,
-                    )
-                    .await?;
-                    Ok((visible, evidence.revision))
-                }
-            },
-        )
-        .await
+        let authorization_revision = before.revision;
+        let resume = request.resume.clone();
+        let kind = IndexKind::try_from(request.definition.kind)
+            .map_err(|_| Status::data_loss("routed index definition has an unknown kind"))?;
+        let candidate_visibility: Arc<dyn IndexCandidateVisibility> =
+            Arc::new(AuthorizedCurrentCandidates::new(
+                caller.clone(),
+                authorization_revision,
+                request.definition.bucket.clone(),
+                request.definition.path_prefix.clone(),
+                kind,
+                request.tenant_id,
+                request.bucket_id,
+                call.deadline,
+                self.authorization.clone(),
+                self.live_versions.clone(),
+            ));
+        let result = self
+            .executor
+            .execute_local(LocalIndexQueryRequest {
+                storage_tenant: caller.storage_tenant().as_str().to_owned(),
+                tenant_id: request.tenant_id,
+                bucket_id: request.bucket_id,
+                definition: request.definition,
+                query: request.query,
+                limit: request.limit,
+                resume,
+                candidate_visibility,
+                authorization_revision,
+            })
+            .await?;
+        validate_result(&result, request.resume.as_ref(), request.limit)?;
+        require_result_authorization_revision(&result, authorization_revision)?;
+        Ok(result)
     }
 }
 
@@ -512,6 +470,23 @@ fn validate_result(
     Ok(())
 }
 
+fn require_result_authorization_revision(
+    result: &ExecutedIndexQuery,
+    required: u64,
+) -> Result<(), Status> {
+    if required == 0 || result.freshness.authorization_revision == 0 {
+        return Err(Status::data_loss(
+            "routed index result has no Zanzibar authorization revision",
+        ));
+    }
+    if result.freshness.authorization_revision != required {
+        return Err(Status::failed_precondition(
+            "authorization revision changed during index execution",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_query_kind(definition: &IndexDefinition, query: &IndexQuery) -> Result<(), Status> {
     let kind = IndexKind::try_from(definition.kind)
         .map_err(|_| Status::invalid_argument("routed index kind is unknown"))?;
@@ -570,34 +545,6 @@ fn definition_object_key(
     .map_err(|error| Status::invalid_argument(error.to_string()))
 }
 
-fn validate_hit(
-    caller: &crate::authentication::Caller,
-    definition: &IndexDefinition,
-    hit: &IndexQueryHit,
-) -> Result<ObjectKey, Status> {
-    let address = hit
-        .address
-        .as_ref()
-        .ok_or_else(|| Status::data_loss("routed index hit has no object address"))?;
-    let kind = IndexKind::try_from(definition.kind)
-        .map_err(|_| Status::data_loss("routed index definition has an unknown kind"))?;
-    let references_another_object = matches!(kind, IndexKind::GitSource | IndexKind::Tensor);
-    if hit.object_version == 0
-        || hit.score.is_some_and(|score| !score.is_finite())
-        || address.tenant != caller.storage_tenant().as_str()
-        || address.bucket != definition.bucket
-        || (!references_another_object
-            && !path_matches_prefix(&address.path, &definition.path_prefix))
-        || address.path.split('/').any(|segment| segment == "_anvil")
-    {
-        return Err(Status::data_loss(
-            "routed index hit is invalid or outside the definition scope",
-        ));
-    }
-    ObjectKey::new(&address.tenant, &address.bucket, &address.path)
-        .map_err(|_| Status::data_loss("routed index hit has an invalid object address"))
-}
-
 fn require_authorization_evidence(
     evidence: &crate::index_service::IndexAuthorizationEvidence,
     expected: usize,
@@ -614,8 +561,7 @@ fn require_authorization_evidence(
 #[cfg(test)]
 mod tests {
     use anvil_api::v1::{
-        IndexSpecification, ObjectAddress, PathIndexQuery, PathIndexSpec, index_query,
-        index_specification,
+        IndexSpecification, PathIndexQuery, PathIndexSpec, index_query, index_specification,
     };
 
     use super::*;
@@ -649,70 +595,6 @@ mod tests {
                 last_position: b"docs/a".to_vec(),
                 authorization_revision: 19,
             }),
-        }
-    }
-
-    fn caller() -> crate::authentication::Caller {
-        crate::authentication::Caller::from_authenticated_application(
-            StorageTenantId::parse("tenant").unwrap(),
-            "application",
-        )
-        .unwrap()
-    }
-
-    fn hit(path: &str) -> IndexQueryHit {
-        IndexQueryHit {
-            address: Some(ObjectAddress {
-                tenant: "tenant".into(),
-                bucket: "objects".into(),
-                path: path.into(),
-            }),
-            object_version: 23,
-            score: None,
-            fields_json: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn git_and_tensor_references_may_leave_the_manifest_prefix() {
-        let caller = caller();
-        for (kind, path) in [
-            (IndexKind::GitSource, "packs/repository.pack"),
-            (IndexKind::Tensor, "tensors/model.bin"),
-        ] {
-            let mut definition = request().definition;
-            definition.kind = kind as i32;
-
-            let key = validate_hit(&caller, &definition, &hit(path)).unwrap();
-            assert_eq!(key.path(), path);
-        }
-    }
-
-    #[test]
-    fn ordinary_results_remain_inside_the_manifest_prefix() {
-        let definition = request().definition;
-        let error =
-            validate_hit(&caller(), &definition, &hit("packs/repository.pack")).unwrap_err();
-
-        assert_eq!(error.code(), tonic::Code::DataLoss);
-    }
-
-    #[test]
-    fn referenced_results_remain_tenant_bucket_and_namespace_scoped() {
-        let mut definition = request().definition;
-        definition.kind = IndexKind::GitSource as i32;
-        let mut wrong_tenant = hit("packs/repository.pack");
-        wrong_tenant.address.as_mut().unwrap().tenant = "another".into();
-        let mut wrong_bucket = hit("packs/repository.pack");
-        wrong_bucket.address.as_mut().unwrap().bucket = "another".into();
-
-        for invalid in [wrong_tenant, wrong_bucket, hit("packs/_anvil/private.pack")] {
-            assert_eq!(
-                validate_hit(&caller(), &definition, &invalid)
-                    .unwrap_err()
-                    .code(),
-                tonic::Code::DataLoss
-            );
         }
     }
 
@@ -802,6 +684,34 @@ mod tests {
         let freshness = response.freshness.unwrap();
         assert_eq!(freshness.placement_term, 31);
         assert_eq!(freshness.placement_index, 32);
+    }
+
+    #[test]
+    fn even_zero_hit_results_must_retain_the_admission_revision() {
+        let mut result = ExecutedIndexQuery {
+            hits: Vec::new(),
+            freshness: anvil_api::v1::IndexFreshness {
+                authorization_revision: 19,
+                ..Default::default()
+            },
+            next_position: None,
+        };
+        require_result_authorization_revision(&result, 19).unwrap();
+
+        result.freshness.authorization_revision = 0;
+        assert_eq!(
+            require_result_authorization_revision(&result, 19)
+                .unwrap_err()
+                .code(),
+            tonic::Code::DataLoss
+        );
+        result.freshness.authorization_revision = 20;
+        assert_eq!(
+            require_result_authorization_revision(&result, 19)
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
     }
 
     #[test]

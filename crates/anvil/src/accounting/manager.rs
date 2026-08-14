@@ -23,8 +23,8 @@ use crate::index_runtime::scanner::{ClusterIndexScanner, ClusterRetainedSourceSn
 use super::{
     AccountingBaselineAccumulator, AccountingCatalog, AccountingCatalogChange, AccountingIdentity,
     AccountingObjectSnapshot, AccountingPublisher, LoadedAccountingDefinition,
-    StoredAccountingDefinition, StoredAccountingRollup, StoredTrafficCheckpoint,
-    StoredTrafficSource, current_path, definition_path, includes_path, outbound_source_path,
+    StoredAccountingRollup, StoredTrafficCheckpoint, StoredTrafficSource, current_path,
+    definition_path, outbound_source_path,
 };
 
 const RETRY_INTERVAL: Duration = Duration::from_secs(1);
@@ -907,6 +907,7 @@ mod tests {
     use anvil_store::{PlacementLogId, SourceId};
 
     use super::*;
+    use crate::accounting::StoredAccountingDefinition;
     use crate::index_runtime::events::{AtomicProgramWatermark, IndexSourceCursor};
 
     fn definition_at(path_prefix: &str) -> LoadedAccountingDefinition {

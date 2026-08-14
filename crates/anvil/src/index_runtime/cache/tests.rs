@@ -2,6 +2,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tempfile::TempDir;
 
+use anvil_index::v4::build::{MergeScratchFile as _, MergeScratchSpace as _};
+
 use super::*;
 
 struct MemoryFetcher {
@@ -430,7 +432,7 @@ async fn corrupt_existing_cache_file_is_atomically_replaced() {
 }
 
 #[test]
-fn startup_preserves_the_disposable_v3_cache_directory_without_inventory() {
+fn startup_preserves_the_disposable_v4_cache_directory_without_inventory() {
     let root = tempfile::tempdir().unwrap();
     let cache_directory = root.path().join(CACHE_FORMAT_DIRECTORY);
     let sibling = root.path().join("must-remain");
@@ -442,7 +444,7 @@ fn startup_preserves_the_disposable_v3_cache_directory_without_inventory() {
         reads: AtomicUsize::new(0),
     });
 
-    let _cache = IndexCache::new(
+    let cache = IndexCache::new(
         root.path(),
         IndexCacheConfig::new(1024, 1024).unwrap(),
         fetcher,
@@ -455,6 +457,18 @@ fn startup_preserves_the_disposable_v3_cache_directory_without_inventory() {
         b"stale"
     );
     assert_eq!(std::fs::read(sibling).unwrap(), b"ordinary-data");
+    assert!(!cache.inner.reconciler_started.load(Ordering::Acquire));
+}
+
+#[tokio::test]
+async fn cache_reconciler_starts_explicitly_and_only_once() {
+    let root = tempfile::tempdir().unwrap();
+    let (cache, _fetcher, _left, _right) = fixture(&root, 1024, 1024);
+
+    assert!(!cache.inner.reconciler_started.load(Ordering::Acquire));
+    assert!(cache.start_reconciler());
+    assert!(cache.inner.reconciler_started.load(Ordering::Acquire));
+    assert!(!cache.start_reconciler());
 }
 
 #[test]
@@ -614,4 +628,76 @@ async fn oversized_segments_remain_mmap_backed() {
     let state = cache.inner.state.lock().unwrap();
     assert_eq!(state.memory_bytes, 0);
     assert!(state.entries.get(&left).unwrap().mapped.is_none());
+}
+
+#[tokio::test]
+async fn merge_scratch_is_random_access_and_removed_on_drop() {
+    let root = tempfile::tempdir().unwrap();
+    let (cache, _fetcher, _left, _right) = fixture(&root, 1024, 1024);
+    let scratch = cache.merge_scratch();
+    let file = scratch.create_file().await.unwrap();
+    let path = file.inner.path.clone();
+
+    file.resize_zeroed(8).await.unwrap();
+    assert_eq!(file.read_exact_at(0, 8).await.unwrap(), vec![0; 8]);
+    assert!(matches!(
+        file.resize_zeroed(7).await,
+        Err(IndexError::InvalidDefinition(_))
+    ));
+    assert_eq!(
+        file.write_all_at(7, vec![1, 2]).await.unwrap_err(),
+        IndexError::UnexpectedEof {
+            expected: 9,
+            actual: 8,
+        }
+    );
+    file.write_all_at(2, vec![1, 2, 3]).await.unwrap();
+    assert_eq!(file.append(vec![9, 8]).await.unwrap(), 8);
+    assert_eq!(file.len().await.unwrap(), 10);
+    assert_eq!(
+        file.read_exact_at(1, 8).await.unwrap(),
+        vec![0, 1, 2, 3, 0, 0, 0, 9]
+    );
+    assert!(
+        cache
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .active_scratch
+            .contains(&path)
+    );
+
+    let second_lane = file.clone();
+    drop(file);
+    assert!(path.exists());
+    assert_eq!(second_lane.read_exact_at(8, 2).await.unwrap(), vec![9, 8]);
+    drop(second_lane);
+    assert!(!path.exists());
+    assert!(
+        !cache
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .active_scratch
+            .contains(&path)
+    );
+}
+
+#[tokio::test]
+async fn merge_scratch_short_read_reports_exact_file_length() {
+    let root = tempfile::tempdir().unwrap();
+    let (cache, _fetcher, _left, _right) = fixture(&root, 1024, 1024);
+    let scratch = cache.merge_scratch();
+    let file = scratch.create_file().await.unwrap();
+    file.append(vec![1, 2, 3]).await.unwrap();
+
+    assert_eq!(
+        file.read_exact_at(2, 2).await.unwrap_err(),
+        IndexError::UnexpectedEof {
+            expected: 4,
+            actual: 3,
+        }
+    );
 }

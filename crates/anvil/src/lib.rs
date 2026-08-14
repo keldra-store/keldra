@@ -6,6 +6,7 @@ mod authorization;
 mod authz_api;
 mod authz_distribution;
 mod authz_service;
+mod blob_maintenance;
 mod bootstrap;
 mod bucket_governance;
 mod cluster_list_watch;
@@ -67,15 +68,12 @@ use anvil_api::v1::index_service_server::IndexServiceServer;
 use anvil_api::v1::object_service_server::ObjectServiceServer;
 use anvil_api::v1::personal_db_service_server::PersonalDbServiceServer;
 use anvil_consensus::{ATOMIC_REPLAY_RETENTION_MILLIS, NodeId};
-use anvil_store::{
-    BlobGcBudget, BlobGcCursor, ErasureProfile, MutationReceiptRetention, Store, StoreOptions,
-    WatchRetention,
-};
+use anvil_store::{ErasureProfile, MutationReceiptRetention, Store, StoreOptions, WatchRetention};
 use anyhow::{Context, Result};
 
 use authentication::{JwtManager, RateLimitConfig, RequestRateLimits};
 use mutation_admission::{AdmissionSurface, MutationAdmissionService};
-use startup_scan_evidence::{StartupScanEvidence, StartupScanExtent, StartupScanKind};
+use startup_scan_evidence::StartupScanEvidence;
 
 pub use index_config::{IndexRuntimeConfig, IndexRuntimeConfigError};
 pub use v05::ObjectServiceImpl;
@@ -409,6 +407,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         bucket_governance.clone(),
         object_reader.clone(),
         object_lister.clone(),
+        name_resolver.clone(),
         &config.data_dir,
         index_runtime_config,
         derived_checkpoints.clone(),
@@ -697,6 +696,9 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         })
         .await
         .context("start public gRPC, S3, and Git listener")?;
+    index_runtime
+        .start_cache_reconciler()
+        .context("start bounded index cache reconciliation")?;
     let payload_gc = payload_gc::PayloadGarbageCollector::new(
         local_node,
         store.clone(),
@@ -705,7 +707,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         reference_runtime_handle.clone(),
         config.erasure_profile,
     );
-    let blob_gc_task = spawn_blob_gc(
+    let blob_maintenance = blob_maintenance::BlobMaintenanceTask::start(
         store,
         reference_runtime_handle,
         payload_gc,
@@ -747,12 +749,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
             public
         }
     };
-    blob_gc_task.abort();
-    if let Err(error) = blob_gc_task.await
-        && !error.is_cancelled()
-    {
-        tracing::error!(%error, "blob garbage-collection task stopped unexpectedly");
-    }
+    blob_maintenance.shutdown().await;
     reference_runtime.shutdown().await;
     serving_fence.shutdown().await;
     let shutdown_result = decisions
@@ -774,126 +771,6 @@ fn validate_atomic_replay_gc(awaiting_publish_ttl_seconds: u64) -> Result<()> {
     Ok(())
 }
 
-fn spawn_blob_gc(
-    store: Store,
-    references: reference_delivery::ReferenceRuntimeHandle,
-    payloads: payload_gc::PayloadGarbageCollector,
-    startup_scan_evidence: StartupScanEvidence,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        tokio::join!(
-            run_blob_gc(store, references, startup_scan_evidence.clone()),
-            run_payload_retirement(payloads, startup_scan_evidence)
-        );
-    })
-}
-
-async fn run_blob_gc(
-    store: Store,
-    references: reference_delivery::ReferenceRuntimeHandle,
-    startup_scan_evidence: StartupScanEvidence,
-) {
-    let mut cursor = BlobGcCursor::default();
-    let budget = BlobGcBudget::new(
-        BLOB_GC_RECORDS_PER_TICK,
-        BLOB_GC_BYTES_PER_TICK,
-        BLOB_GC_TIME_PER_TICK,
-    )
-    .expect("fixed blob GC budget is valid");
-    let mut delay = BLOB_GC_INTERVAL;
-    loop {
-        tokio::time::sleep(delay).await;
-        startup_scan_evidence.record(StartupScanKind::Blobs, StartupScanExtent::Global);
-        let outcome =
-            collect_blob_garbage_if_safe(&store, &references, &mut cursor, budget, "scheduled")
-                .await;
-        delay = blob_gc_next_delay(outcome);
-    }
-}
-
-async fn run_payload_retirement(
-    payloads: payload_gc::PayloadGarbageCollector,
-    startup_scan_evidence: StartupScanEvidence,
-) {
-    let mut delay = BLOB_GC_INTERVAL;
-    loop {
-        tokio::time::sleep(delay).await;
-        startup_scan_evidence.record(StartupScanKind::Blobs, StartupScanExtent::Global);
-        match payloads.run_once().await {
-            Ok(tick) => {
-                if tick.retired > 0 {
-                    tracing::info!(
-                        retired = tick.retired,
-                        "former payload artifacts entered the ordinary GC grace window"
-                    );
-                }
-                delay = payload_gc_next_delay(tick.cycle_complete);
-            }
-            Err(error) => {
-                tracing::warn!(%error, "former payload-artifact retirement paused");
-                delay = BLOB_GC_INTERVAL;
-            }
-        }
-    }
-}
-
-async fn collect_blob_garbage_if_safe(
-    store: &Store,
-    references: &reference_delivery::ReferenceRuntimeHandle,
-    cursor: &mut BlobGcCursor,
-    budget: BlobGcBudget,
-    trigger: &'static str,
-) -> Option<bool> {
-    if !references.gc_safe().await {
-        tracing::warn!(
-            monotonic_counter.anvil_blob_gc_paused_total = 1_u64,
-            trigger,
-            "blob garbage collection paused until every ACTIVE source tail is current"
-        );
-        return None;
-    }
-    match store.collect_blob_garbage_tick(cursor, budget).await {
-        Ok(tick) => {
-            tracing::debug!(
-                monotonic_counter.anvil_blob_gc_runs_total = 1_u64,
-                monotonic_counter.anvil_blob_gc_removed_total = tick.removed,
-                gauge.anvil_blob_gc_tick_records = tick.inspected_records as u64,
-                gauge.anvil_blob_gc_tick_bytes = tick.inspected_bytes,
-                cycle_complete = tick.cycle_complete,
-                trigger,
-                removed = tick.removed,
-                "bounded blob garbage-collection tick completed"
-            );
-            Some(tick.cycle_complete)
-        }
-        Err(error) => {
-            tracing::error!(
-                monotonic_counter.anvil_blob_gc_failures_total = 1_u64,
-                trigger,
-                %error,
-                "blob garbage-collection pass failed"
-            );
-            None
-        }
-    }
-}
-
-fn blob_gc_next_delay(cycle_complete: Option<bool>) -> Duration {
-    if cycle_complete == Some(false) {
-        BLOB_GC_CONTINUATION_INTERVAL
-    } else {
-        BLOB_GC_INTERVAL
-    }
-}
-
-fn payload_gc_next_delay(cycle_complete: bool) -> Duration {
-    if cycle_complete {
-        BLOB_GC_INTERVAL
-    } else {
-        BLOB_GC_CONTINUATION_INTERVAL
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -903,21 +780,5 @@ mod tests {
         let replay_seconds = ATOMIC_REPLAY_RETENTION_MILLIS / 1_000;
         assert!(validate_atomic_replay_gc(replay_seconds).is_ok());
         assert!(validate_atomic_replay_gc(replay_seconds - 1).is_err());
-    }
-
-    #[test]
-    fn incomplete_blob_gc_ticks_continue_but_complete_cycles_wait_an_hour() {
-        assert_eq!(
-            blob_gc_next_delay(Some(false)),
-            BLOB_GC_CONTINUATION_INTERVAL
-        );
-        assert_eq!(blob_gc_next_delay(Some(true)), BLOB_GC_INTERVAL);
-        assert_eq!(blob_gc_next_delay(None), BLOB_GC_INTERVAL);
-    }
-
-    #[test]
-    fn incomplete_payload_retirement_ticks_continue_but_complete_cycles_wait_an_hour() {
-        assert_eq!(payload_gc_next_delay(false), BLOB_GC_CONTINUATION_INTERVAL);
-        assert_eq!(payload_gc_next_delay(true), BLOB_GC_INTERVAL);
     }
 }

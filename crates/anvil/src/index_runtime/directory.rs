@@ -1,114 +1,147 @@
-//! Lazy cache-backed directory for one immutable v3 logical run.
+//! Lazy cache-backed access to checked ranges in immutable v4 artifact objects.
+//!
+//! A pinned query or generation verifies each distinct ordinary-object path and
+//! exact version before the disposable content cache may materialise it. Range
+//! reads then remain bounded to the component named by the manifest.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
 
-use anvil_index::compaction::CompactionProgress;
-use anvil_index::{BlockDescriptor, IndexDirectoryRead, IndexError};
+use anvil_index::{IndexError, v4::ArtifactDescriptor};
+use anvil_store::{BlobRef, ObjectKey, VersionId};
+
+use crate::cluster_object_read::ClusterObjectReader;
 
 use super::cache::{IndexCache, IndexFile, IndexSegmentId, IndexSlice};
-use super::generation::ManifestRun;
 
 #[derive(Clone)]
-pub(crate) struct ManifestIndexDirectory {
+pub(crate) struct ManifestArtifactDirectory {
     cache: IndexCache,
-    root: IndexSegmentId,
-    packs: Arc<BTreeMap<u32, IndexSegmentId>>,
-    progress: Option<CompactionProgress>,
+    reader: ClusterObjectReader,
+    storage_tenant: String,
+    bucket: String,
+    tenant_id: u64,
+    bucket_id: u64,
+    index_id: u64,
+    verified: Arc<Mutex<BTreeSet<VerifiedArtifactObject>>>,
 }
 
-impl ManifestIndexDirectory {
-    pub(crate) fn open(cache: IndexCache, run: &ManifestRun) -> Result<Self, IndexError> {
-        let root = IndexSegmentId::new(run.root_blob.hash, run.root_blob.length)
-            .map_err(|error| IndexError::InvalidDefinition(error.to_string()))?;
-        let packs = run
-            .packs
-            .iter()
-            .map(|pack| {
-                IndexSegmentId::new(pack.blob.hash, pack.blob.length)
-                    .map(|segment| (pack.id, segment))
-                    .map_err(|error| IndexError::InvalidDefinition(error.to_string()))
-            })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
+impl ManifestArtifactDirectory {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        cache: IndexCache,
+        reader: ClusterObjectReader,
+        storage_tenant: String,
+        bucket: String,
+        tenant_id: u64,
+        bucket_id: u64,
+        index_id: u64,
+    ) -> Result<Self, IndexError> {
+        if tenant_id == 0 || bucket_id == 0 || index_id == 0 {
+            return Err(IndexError::InvalidDefinition(
+                "format-v4 artifact directory requires non-zero stable IDs".into(),
+            ));
+        }
         Ok(Self {
             cache,
-            root,
-            packs: Arc::new(packs),
-            progress: None,
+            reader,
+            storage_tenant,
+            bucket,
+            tenant_id,
+            bucket_id,
+            index_id,
+            verified: Arc::new(Mutex::new(BTreeSet::new())),
         })
     }
 
-    pub(crate) fn open_observed(
-        cache: IndexCache,
-        run: &ManifestRun,
-        progress: CompactionProgress,
-    ) -> Result<Self, IndexError> {
-        let mut directory = Self::open(cache, run)?;
-        directory.progress = Some(progress);
-        Ok(directory)
-    }
-}
-
-impl IndexDirectoryRead for ManifestIndexDirectory {
-    type File = ManifestIndexFile;
-
-    async fn open_root(&self) -> Result<Self::File, IndexError> {
-        Ok(ManifestIndexFile::new(
-            self.cache.open(self.root),
-            0,
-            self.root.length,
-            self.progress.clone(),
-        ))
-    }
-
-    async fn open_block(&self, descriptor: &BlockDescriptor) -> Result<Self::File, IndexError> {
-        let id = *self
-            .packs
-            .get(&descriptor.pack_id)
-            .ok_or_else(|| IndexError::FileNotFound(descriptor.logical_name()))?;
-        let end = descriptor
-            .pack_offset
-            .checked_add(descriptor.encoded_bytes)
-            .ok_or(IndexError::OffsetOverflow)?;
-        if end > id.length {
-            return Err(IndexError::InvalidFormat("index block pack bounds"));
+    /// Resolve one exact ordinary-object reference, then open its checked
+    /// component range. Verification is retained only by this directory.
+    pub(crate) async fn open(
+        &self,
+        descriptor: &ArtifactDescriptor,
+    ) -> Result<ManifestArtifactFile, IndexError> {
+        descriptor.validate(self.index_id)?;
+        let identity = VerifiedArtifactObject::from(descriptor);
+        let verified = self
+            .verified
+            .lock()
+            .map_err(|_| IndexError::Io("index artifact verification lock is poisoned".into()))?
+            .contains(&identity);
+        if !verified {
+            self.verify(descriptor).await?;
+            self.verified
+                .lock()
+                .map_err(|_| IndexError::Io("index artifact verification lock is poisoned".into()))?
+                .insert(identity);
         }
-        Ok(ManifestIndexFile::new(
-            self.cache.open(id),
-            descriptor.pack_offset,
-            descriptor.encoded_bytes,
-            self.progress.clone(),
-        ))
+        let object = IndexSegmentId::new(descriptor.object_content_hash, descriptor.object_length)
+            .map_err(|error| IndexError::InvalidDefinition(error.to_string()))?;
+        Ok(ManifestArtifactFile {
+            inner: self.cache.open(object),
+            start: descriptor.offset,
+            length: descriptor.encoded_length,
+        })
+    }
+
+    async fn verify(&self, descriptor: &ArtifactDescriptor) -> Result<(), IndexError> {
+        let key = ObjectKey::new(
+            self.storage_tenant.clone(),
+            self.bucket.clone(),
+            descriptor.path.clone(),
+        )
+        .map_err(|error| IndexError::InvalidDefinition(error.to_string()))?;
+        let snapshot = self
+            .reader
+            .current_snapshot_stable(&key, self.tenant_id, self.bucket_id)
+            .await
+            .map_err(|error| IndexError::Io(error.to_string()))?
+            .ok_or_else(|| IndexError::FileNotFound(descriptor.path.clone()))?;
+        if snapshot.tenant_id != self.tenant_id
+            || snapshot.bucket_id != self.bucket_id
+            || snapshot.exact_path != descriptor.path
+        {
+            return Err(IndexError::Integrity);
+        }
+        let version = snapshot
+            .versions
+            .iter()
+            .find(|version| version.id == VersionId(descriptor.object_version))
+            .ok_or_else(|| IndexError::FileNotFound(descriptor.path.clone()))?;
+        let expected = BlobRef {
+            hash: descriptor.object_content_hash,
+            length: descriptor.object_length,
+        };
+        if version.deleted || version.blob.as_ref() != Some(&expected) {
+            return Err(IndexError::Integrity);
+        }
+        Ok(())
     }
 }
 
-pub(crate) struct ManifestIndexFile {
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct VerifiedArtifactObject {
+    version: u64,
+    content_hash: [u8; 32],
+    length: u64,
+}
+
+impl From<&ArtifactDescriptor> for VerifiedArtifactObject {
+    fn from(descriptor: &ArtifactDescriptor) -> Self {
+        Self {
+            version: descriptor.object_version,
+            content_hash: descriptor.object_content_hash,
+            length: descriptor.object_length,
+        }
+    }
+}
+
+pub(crate) struct ManifestArtifactFile {
     inner: IndexFile,
     start: u64,
     length: u64,
-    progress: Option<CompactionProgress>,
-    observed: AtomicBool,
 }
 
-impl ManifestIndexFile {
-    fn new(
-        inner: IndexFile,
-        start: u64,
-        length: u64,
-        progress: Option<CompactionProgress>,
-    ) -> Self {
-        Self {
-            inner,
-            start,
-            length,
-            progress,
-            observed: AtomicBool::new(false),
-        }
-    }
-}
-
-impl anvil_index::IndexFileRead for ManifestIndexFile {
+impl anvil_index::IndexFileRead for ManifestArtifactFile {
     type Slice = IndexSlice;
 
     async fn read_at(&self, offset: u64, max_length: usize) -> Result<Self::Slice, IndexError> {
@@ -120,16 +153,17 @@ impl anvil_index::IndexFileRead for ManifestIndexFile {
             .start
             .checked_add(offset)
             .ok_or(IndexError::OffsetOverflow)?;
-        let slice =
-            anvil_index::IndexFileRead::read_at(&self.inner, physical, max_length.min(remaining))
-                .await?;
-        let bytes = slice.as_ref().len() as u64;
-        if bytes != 0
-            && let Some(progress) = &self.progress
-        {
-            let blocks = u64::from(!self.observed.swap(true, Ordering::Relaxed));
-            progress.record_input(0, bytes, blocks);
-        }
-        Ok(slice)
+        anvil_index::IndexFileRead::read_at(&self.inner, physical, max_length.min(remaining)).await
+    }
+}
+
+impl anvil_index::v4::ArtifactDirectoryRead for ManifestArtifactDirectory {
+    type File = ManifestArtifactFile;
+
+    async fn open_artifact(
+        &self,
+        descriptor: &ArtifactDescriptor,
+    ) -> Result<Self::File, IndexError> {
+        self.open(descriptor).await
     }
 }

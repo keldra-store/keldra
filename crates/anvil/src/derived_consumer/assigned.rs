@@ -49,6 +49,13 @@ impl AssignedBucketInventory {
         }
         match mutation {
             DefinitionAssignmentMutation::Upsert(assignment) => self.apply_upsert(assignment),
+            DefinitionAssignmentMutation::Delete(deletion) => self.apply_remove(
+                deletion.tenant_id,
+                deletion.bucket_id,
+                deletion.definition_id,
+                deletion.object_version,
+                deletion.observed_fence,
+            ),
             DefinitionAssignmentMutation::Remove {
                 tenant_id,
                 bucket_id,

@@ -1,0 +1,541 @@
+//! Mandatory Zanzibar and exact-current validation for index candidates.
+//!
+//! Format-v4 query plans call this boundary before admitting arbitrary-order
+//! candidates to a top-K heap and while refilling a physically ordered page.
+//! Keeping the operation inside the executor makes it impossible for another
+//! query surface to omit authorization or liveness as optional post-processing.
+
+use std::sync::Arc;
+
+use anvil_api::v1::{IndexKind, IndexQueryHit};
+use anvil_store::ObjectKey;
+use tonic::Status;
+
+use super::boundary::{IndexAuthorization, IndexLiveVersionReader};
+use crate::authentication::Caller;
+use crate::authorization::ObjectPermission;
+
+pub(crate) const MAX_CANDIDATE_VISIBILITY_BATCH: usize = 256;
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct IndexCandidateIdentity {
+    /// Ordinary source object whose current version controls this projection.
+    pub(crate) source_path: String,
+    pub(crate) source_version: u64,
+    /// Public object returned and Zanzibar-authorized if this candidate wins.
+    pub(crate) result: IndexQueryHit,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CandidateVisibilityEvidence {
+    pub(crate) visible: Vec<bool>,
+    pub(crate) authorization_revision: u64,
+    pub(crate) denied: u64,
+    pub(crate) stale: u64,
+}
+
+#[tonic::async_trait]
+pub(crate) trait IndexCandidateVisibility: Send + Sync + 'static {
+    async fn evaluate(
+        &self,
+        candidates: &[IndexCandidateIdentity],
+    ) -> Result<CandidateVisibilityEvidence, Status>;
+}
+
+#[derive(Clone)]
+pub(crate) struct AuthorizedCurrentCandidates {
+    caller: Caller,
+    authorization_revision: u64,
+    bucket: String,
+    path_prefix: String,
+    kind: IndexKind,
+    tenant_id: u64,
+    bucket_id: u64,
+    deadline: tokio::time::Instant,
+    authorization: Arc<dyn IndexAuthorization>,
+    live_versions: Arc<dyn IndexLiveVersionReader>,
+}
+
+impl AuthorizedCurrentCandidates {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        caller: Caller,
+        authorization_revision: u64,
+        bucket: String,
+        path_prefix: String,
+        kind: IndexKind,
+        tenant_id: u64,
+        bucket_id: u64,
+        deadline: tokio::time::Instant,
+        authorization: Arc<dyn IndexAuthorization>,
+        live_versions: Arc<dyn IndexLiveVersionReader>,
+    ) -> Self {
+        Self {
+            caller,
+            authorization_revision,
+            bucket,
+            path_prefix,
+            kind,
+            tenant_id,
+            bucket_id,
+            deadline,
+            authorization,
+            live_versions,
+        }
+    }
+
+    fn validate_candidate(
+        &self,
+        candidate: &IndexCandidateIdentity,
+    ) -> Result<(ObjectKey, ObjectKey), Status> {
+        let address = candidate
+            .result
+            .address
+            .as_ref()
+            .ok_or_else(|| Status::data_loss("index candidate has no object address"))?;
+        let references_another_object =
+            matches!(self.kind, IndexKind::GitSource | IndexKind::Tensor);
+        if candidate.source_version == 0
+            || candidate.result.object_version == 0
+            || candidate
+                .result
+                .score
+                .is_some_and(|score| !score.is_finite())
+            || !super::path_matches_prefix(&candidate.source_path, &self.path_prefix)
+            || candidate
+                .source_path
+                .split('/')
+                .any(|segment| segment == "_anvil")
+            || address.tenant != self.caller.storage_tenant().as_str()
+            || address.bucket != self.bucket
+            || (!references_another_object
+                && !super::path_matches_prefix(&address.path, &self.path_prefix))
+            || address.path.split('/').any(|segment| segment == "_anvil")
+        {
+            return Err(Status::data_loss(
+                "index candidate is invalid or outside the definition scope",
+            ));
+        }
+        let result = ObjectKey::new(&address.tenant, &address.bucket, &address.path)
+            .map_err(|_| Status::data_loss("index candidate has an invalid result address"))?;
+        let source = ObjectKey::new(
+            self.caller.storage_tenant().as_str(),
+            &self.bucket,
+            &candidate.source_path,
+        )
+        .map_err(|_| Status::data_loss("index candidate has an invalid source address"))?;
+        Ok((source, result))
+    }
+}
+
+#[tonic::async_trait]
+impl IndexCandidateVisibility for AuthorizedCurrentCandidates {
+    async fn evaluate(
+        &self,
+        candidates: &[IndexCandidateIdentity],
+    ) -> Result<CandidateVisibilityEvidence, Status> {
+        if candidates.len() > MAX_CANDIDATE_VISIBILITY_BATCH {
+            return Err(Status::resource_exhausted(
+                "index candidate visibility batch exceeds its bound",
+            ));
+        }
+        if self.authorization_revision == 0 {
+            return Err(Status::data_loss(
+                "index candidate visibility has no Zanzibar admission revision",
+            ));
+        }
+        if candidates.is_empty() {
+            return Ok(CandidateVisibilityEvidence {
+                visible: Vec::new(),
+                authorization_revision: self.authorization_revision,
+                denied: 0,
+                stale: 0,
+            });
+        }
+
+        let mut checks = Vec::with_capacity(candidates.len());
+        let mut sources = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            let (source, result) = self.validate_candidate(candidate)?;
+            sources.push(source);
+            checks.push((result, ObjectPermission::Get));
+        }
+        let evidence = self
+            .authorization
+            .allows_objects_with_evidence(&self.caller, &checks)
+            .await?;
+        if evidence.revision == 0 || evidence.allowed.len() != checks.len() {
+            return Err(Status::data_loss(
+                "Zanzibar returned invalid index authorization evidence",
+            ));
+        }
+        if evidence.revision != self.authorization_revision {
+            return Err(Status::failed_precondition(
+                "authorization revision changed during index execution",
+            ));
+        }
+        drop(checks);
+        let mut visible = evidence.allowed;
+        let denied = u64::try_from(visible.iter().filter(|allowed| !**allowed).count())
+            .map_err(|_| Status::resource_exhausted("candidate count exceeds u64"))?;
+        let (authorized_positions, authorized_keys) = retain_authorized_sources(&visible, sources);
+        if authorized_keys.is_empty() {
+            return Ok(CandidateVisibilityEvidence {
+                visible,
+                authorization_revision: evidence.revision,
+                denied,
+                stale: 0,
+            });
+        }
+        let snapshots = self
+            .live_versions
+            .current_snapshots(
+                &authorized_keys,
+                self.tenant_id,
+                self.bucket_id,
+                crate::v05::deadline_remaining(self.deadline)?,
+            )
+            .await?;
+        if snapshots.len() != authorized_positions.len() {
+            return Err(Status::data_loss(
+                "current object batch returned the wrong result count",
+            ));
+        }
+        let mut stale = 0_u64;
+        for ((position, source), snapshot) in authorized_positions
+            .into_iter()
+            .zip(authorized_keys)
+            .zip(snapshots)
+        {
+            let candidate = &candidates[position];
+            let Some(snapshot) = snapshot else {
+                visible[position] = false;
+                stale = stale.saturating_add(1);
+                continue;
+            };
+            snapshot
+                .validate()
+                .map_err(|error| Status::data_loss(error.to_string()))?;
+            if snapshot.tenant_id != self.tenant_id
+                || snapshot.bucket_id != self.bucket_id
+                || snapshot.exact_path != source.path()
+            {
+                return Err(Status::data_loss(format!(
+                    "current object batch returned another source identity at position {position}"
+                )));
+            }
+            if snapshot.head.deleted
+                || snapshot.version.deleted
+                || snapshot.head.version.0 != candidate.source_version
+                || snapshot.version.id.0 != candidate.source_version
+            {
+                visible[position] = false;
+                stale = stale.saturating_add(1);
+            }
+        }
+        Ok(CandidateVisibilityEvidence {
+            visible,
+            authorization_revision: evidence.revision,
+            denied,
+            stale,
+        })
+    }
+}
+
+/// Retain authorized source keys in their existing allocation and separately
+/// preserve their positions in the candidate wave. The subsequent exact-head
+/// read therefore owns one source key per authorized candidate, not two cloned
+/// key vectors.
+fn retain_authorized_sources(
+    visible: &[bool],
+    mut sources: Vec<ObjectKey>,
+) -> (Vec<usize>, Vec<ObjectKey>) {
+    debug_assert_eq!(visible.len(), sources.len());
+    let mut positions = Vec::with_capacity(visible.iter().filter(|allowed| **allowed).count());
+    let mut position = 0usize;
+    sources.retain(|_| {
+        let authorized = visible[position];
+        if authorized {
+            positions.push(position);
+        }
+        position += 1;
+        authorized
+    });
+    (positions, sources)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use anvil_api::v1::ObjectAddress;
+    use anvil_store::{BlobRef, CurrentObjectSnapshot, Head, StorageTenantId, Version, VersionId};
+
+    use super::*;
+    use crate::index_service::IndexAuthorizationEvidence;
+
+    struct TestAuthorization;
+
+    #[tonic::async_trait]
+    impl IndexAuthorization for TestAuthorization {
+        async fn allows_objects_with_evidence(
+            &self,
+            _caller: &Caller,
+            requests: &[(ObjectKey, ObjectPermission)],
+        ) -> Result<IndexAuthorizationEvidence, Status> {
+            Ok(IndexAuthorizationEvidence {
+                allowed: requests
+                    .iter()
+                    .map(|(key, _)| key.path() != "docs/denied")
+                    .collect(),
+                revision: 9,
+            })
+        }
+    }
+
+    struct RecordingAuthorization {
+        seen: Mutex<Vec<String>>,
+    }
+
+    #[tonic::async_trait]
+    impl IndexAuthorization for RecordingAuthorization {
+        async fn allows_objects_with_evidence(
+            &self,
+            _caller: &Caller,
+            requests: &[(ObjectKey, ObjectPermission)],
+        ) -> Result<IndexAuthorizationEvidence, Status> {
+            *self.seen.lock().unwrap() = requests
+                .iter()
+                .map(|(key, _)| key.path().to_owned())
+                .collect();
+            Ok(IndexAuthorizationEvidence {
+                allowed: vec![true; requests.len()],
+                revision: 9,
+            })
+        }
+    }
+
+    struct TestLiveVersions;
+
+    #[tonic::async_trait]
+    impl IndexLiveVersionReader for TestLiveVersions {
+        async fn current_snapshots(
+            &self,
+            keys: &[ObjectKey],
+            _tenant_id: u64,
+            _bucket_id: u64,
+            _budget: Duration,
+        ) -> Result<Vec<Option<CurrentObjectSnapshot>>, Status> {
+            Ok(keys
+                .iter()
+                .map(|key| {
+                    let version = if key.path() == "docs/stale" { 2 } else { 1 };
+                    Some(snapshot(key.path(), version))
+                })
+                .collect())
+        }
+    }
+
+    fn snapshot(path: &str, version_id: u64) -> CurrentObjectSnapshot {
+        let version = Version {
+            id: VersionId(version_id),
+            blob: Some(BlobRef {
+                hash: [1; 32],
+                length: 1,
+            }),
+            content_type: Some("application/octet-stream".into()),
+            deleted: false,
+            committed_at_unix_millis: 1,
+        };
+        CurrentObjectSnapshot {
+            tenant_id: 11,
+            bucket_id: 12,
+            exact_path: path.into(),
+            head: Head {
+                version: version.id,
+                deleted: false,
+                mutation_stamp: None,
+            },
+            version,
+        }
+    }
+
+    fn candidate(path: &str) -> IndexCandidateIdentity {
+        IndexCandidateIdentity {
+            source_path: path.into(),
+            source_version: 1,
+            result: IndexQueryHit {
+                address: Some(ObjectAddress {
+                    tenant: "tenant".into(),
+                    bucket: "objects".into(),
+                    path: path.into(),
+                }),
+                object_version: 1,
+                score: None,
+                fields_json: Vec::new(),
+            },
+        }
+    }
+
+    fn visibility() -> AuthorizedCurrentCandidates {
+        visibility_for(IndexKind::Path)
+    }
+
+    fn visibility_for(kind: IndexKind) -> AuthorizedCurrentCandidates {
+        AuthorizedCurrentCandidates::new(
+            Caller::from_authenticated_application(
+                StorageTenantId::parse("tenant").unwrap(),
+                "application",
+            )
+            .unwrap(),
+            9,
+            "objects".into(),
+            "docs/".into(),
+            kind,
+            11,
+            12,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            Arc::new(TestAuthorization),
+            Arc::new(TestLiveVersions),
+        )
+    }
+
+    #[tokio::test]
+    async fn authorization_and_exact_current_filter_one_bounded_batch() {
+        let result = visibility()
+            .evaluate(&[
+                candidate("docs/live"),
+                candidate("docs/denied"),
+                candidate("docs/stale"),
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(result.authorization_revision, 9);
+        assert_eq!(result.visible, vec![true, false, false]);
+        assert_eq!(result.denied, 1);
+        assert_eq!(result.stale, 1);
+    }
+
+    #[tokio::test]
+    async fn malformed_scope_and_oversized_batches_fail_closed() {
+        assert_eq!(
+            visibility()
+                .evaluate(&[candidate("outside")])
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::DataLoss
+        );
+        let oversized = vec![candidate("docs/live"); MAX_CANDIDATE_VISIBILITY_BATCH + 1];
+        assert_eq!(
+            visibility().evaluate(&oversized).await.unwrap_err().code(),
+            tonic::Code::ResourceExhausted
+        );
+    }
+
+    #[test]
+    fn authorized_source_selection_moves_keys_without_cloning_paths() {
+        let sources = vec![
+            ObjectKey::new("tenant", "objects", "docs/first").unwrap(),
+            ObjectKey::new("tenant", "objects", "docs/denied").unwrap(),
+            ObjectKey::new("tenant", "objects", "docs/last").unwrap(),
+        ];
+        let retained_path_pointers = [sources[0].path().as_ptr(), sources[2].path().as_ptr()];
+
+        let (positions, retained) = retain_authorized_sources(&[true, false, true], sources);
+
+        assert_eq!(positions, [0, 2]);
+        assert_eq!(retained.len(), 2);
+        assert_eq!(retained[0].path().as_ptr(), retained_path_pointers[0]);
+        assert_eq!(retained[1].path().as_ptr(), retained_path_pointers[1]);
+    }
+
+    #[tokio::test]
+    async fn admission_revision_is_retained_for_empty_batches_and_pins_later_checks() {
+        let visibility = visibility();
+        assert_eq!(
+            visibility.evaluate(&[]).await.unwrap(),
+            CandidateVisibilityEvidence {
+                visible: Vec::new(),
+                authorization_revision: 9,
+                denied: 0,
+                stale: 0,
+            }
+        );
+
+        let mut changed = visibility;
+        changed.authorization_revision = 8;
+        assert_eq!(
+            changed
+                .evaluate(&[candidate("docs/live")])
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+    }
+
+    #[tokio::test]
+    async fn reference_projection_authorizes_result_but_checks_the_scoped_source_version() {
+        for kind in [IndexKind::GitSource, IndexKind::Tensor] {
+            let mut candidate = candidate("docs/source.json");
+            candidate.result.address.as_mut().unwrap().path = "payloads/referenced.bin".into();
+
+            let result = visibility_for(kind).evaluate(&[candidate]).await.unwrap();
+            assert_eq!(result.visible, vec![true]);
+            assert_eq!(result.authorization_revision, 9);
+        }
+    }
+
+    #[tokio::test]
+    async fn candidate_batches_do_not_repeat_definition_admission() {
+        let authorization = Arc::new(RecordingAuthorization {
+            seen: Mutex::new(Vec::new()),
+        });
+        let visibility = AuthorizedCurrentCandidates::new(
+            Caller::from_authenticated_application(
+                StorageTenantId::parse("tenant").unwrap(),
+                "application",
+            )
+            .unwrap(),
+            9,
+            "objects".into(),
+            "docs/".into(),
+            IndexKind::Path,
+            11,
+            12,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            authorization.clone(),
+            Arc::new(TestLiveVersions),
+        );
+
+        visibility
+            .evaluate(&[candidate("docs/live")])
+            .await
+            .unwrap();
+        assert_eq!(
+            *authorization.seen.lock().unwrap(),
+            vec!["docs/live".to_owned()]
+        );
+    }
+
+    #[test]
+    fn referenced_results_remain_tenant_bucket_and_namespace_scoped() {
+        let visibility = visibility_for(IndexKind::GitSource);
+        let mut wrong_tenant = candidate("docs/source.json");
+        wrong_tenant.result.address.as_mut().unwrap().tenant = "another".into();
+        let mut wrong_bucket = candidate("docs/source.json");
+        wrong_bucket.result.address.as_mut().unwrap().bucket = "another".into();
+        let mut reserved = candidate("docs/source.json");
+        reserved.result.address.as_mut().unwrap().path = "payloads/_anvil/private".into();
+
+        for invalid in [wrong_tenant, wrong_bucket, reserved] {
+            assert_eq!(
+                visibility.validate_candidate(&invalid).unwrap_err().code(),
+                tonic::Code::DataLoss
+            );
+        }
+    }
+}

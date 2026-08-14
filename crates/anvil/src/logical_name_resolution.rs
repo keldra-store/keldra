@@ -84,6 +84,41 @@ impl LogicalNameResolver {
         Ok((tenant_id, bucket_id))
     }
 
+    /// Resolve stable IDs back to their current mutable names through the
+    /// existing quorum-reconciled bucket record. Internal maintenance uses
+    /// this immediately before entering the ordinary object path; it is not a
+    /// second name authority or a cached reverse catalogue.
+    pub(crate) async fn resolve_bucket_names(
+        &self,
+        tenant_id: u64,
+        bucket_id: u64,
+    ) -> Result<(String, String), Status> {
+        if tenant_id == 0 || bucket_id == 0 {
+            return Err(Status::invalid_argument(
+                "tenant and bucket IDs must be non-zero",
+            ));
+        }
+        match self
+            .read_record(&LogicalRecordId::BucketRecord {
+                tenant_id,
+                bucket_id,
+            })
+            .await?
+        {
+            Some(LogicalRecordValue::BucketRecord(record))
+                if record.tenant_id == tenant_id && record.bucket_id == bucket_id =>
+            {
+                Ok((record.storage_tenant.as_str().to_owned(), record.bucket))
+            }
+            Some(_) => Err(Status::data_loss(
+                "bucket-record coordinator returned another logical record",
+            )),
+            None => Err(Status::unavailable(
+                "bucket record is unavailable during internal maintenance",
+            )),
+        }
+    }
+
     async fn read_record(
         &self,
         id: &LogicalRecordId,

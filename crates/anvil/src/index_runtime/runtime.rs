@@ -18,6 +18,7 @@ use crate::index_config::IndexRuntimeConfig;
 use crate::index_service::{
     DistributedIndexDefinitionLister, IndexDefinitionLister, IndexQueryExecutor,
 };
+use crate::logical_name_resolution::LogicalNameResolver;
 use crate::object_distribution::ObjectDistribution;
 use crate::startup_scan_evidence::StartupScanEvidence;
 use anvil_store::Store;
@@ -33,6 +34,7 @@ use super::local_query::{ClusterIndexSegmentFetcher, LocalGenerationQueryExecuto
 use super::manager::{IndexBuilderDependencies, IndexBuilderManagerTask};
 use super::publication::{IndexArtifactCoordinator, IndexArtifactRouter};
 use super::publisher::IndexGenerationPublisher;
+use super::query_budget::IndexQueryMemoryBudget;
 use super::retention::IndexGenerationRetention;
 use super::scanner::ClusterIndexScanner;
 
@@ -43,9 +45,22 @@ pub(crate) struct RunningIndexRuntime {
     pub(crate) event_journal: Arc<IndexEventJournal>,
     pub(crate) scanner: ClusterIndexScanner,
     pub(crate) artifact_router: IndexArtifactRouter,
+    cache: IndexCache,
     _definition_coordination: DefinitionCoordinationTask,
     _derived_retention: DerivedConsumerRuntimeTask,
     _builders: IndexBuilderManagerTask,
+}
+
+impl RunningIndexRuntime {
+    /// Start disposable cache reconciliation only after the public listener is
+    /// accepting requests. Runtime construction performs no cache inventory.
+    pub(crate) fn start_cache_reconciler(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.cache.start_reconciler(),
+            "index cache reconciler was started more than once"
+        );
+        Ok(())
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -59,6 +74,7 @@ pub(crate) async fn start(
     governance: BucketGovernance,
     reader: ClusterObjectReader,
     object_lister: DistributedObjectLister,
+    names: LogicalNameResolver,
     data_directory: &Path,
     config: IndexRuntimeConfig,
     derived_checkpoints: DerivedCheckpointPublisher,
@@ -100,12 +116,30 @@ pub(crate) async fn start(
     .context("initialize disposable index cache")?;
     let cpu = IndexCpuPool::new(config.rayon_workers())
         .context("initialize the fixed index Rayon pool")?;
+    let coordinator = IndexArtifactCoordinator::new(
+        store.clone(),
+        objects.clone(),
+        governance,
+        cluster_peers.clone(),
+    );
+    let artifact_router =
+        IndexArtifactRouter::new(local_node, coordinator, objects, cluster_peers.clone());
+    let publisher = IndexGenerationPublisher::new(
+        store.clone(),
+        reader.clone(),
+        artifact_router.clone(),
+        config,
+    );
+    let query_budget = IndexQueryMemoryBudget::new(config.query_memory_bytes())
+        .context("validate the global index query working-memory budget")?;
     let local_queries: Arc<dyn LocalIndexQueryExecutor> =
         Arc::new(LocalGenerationQueryExecutor::new(
             reader.clone(),
             cache.clone(),
             journal.clone(),
+            publisher.clone(),
             cpu.clone(),
+            query_budget,
             config.query_max_concurrency(),
             config.query_work_quantum_bytes(),
         ));
@@ -116,20 +150,6 @@ pub(crate) async fn start(
         local_queries.clone(),
     ));
 
-    let coordinator = IndexArtifactCoordinator::new(
-        store.clone(),
-        objects.clone(),
-        governance,
-        cluster_peers.clone(),
-    );
-    let artifact_router = IndexArtifactRouter::new(local_node, coordinator, objects, cluster_peers);
-    let publisher = IndexGenerationPublisher::new(
-        store.clone(),
-        reader.clone(),
-        artifact_router.clone(),
-        data_directory.join("index-scratch"),
-    )
-    .context("initialize disposable index construction scratch")?;
     let (derived_progress, derived_retention) = DerivedConsumerRuntimeTask::start(
         anvil_store::DerivedConsumerKind::Index,
         local_node,
@@ -146,9 +166,13 @@ pub(crate) async fn start(
         ),
     );
     let generation_retention = IndexGenerationRetention::new(
+        store.clone(),
         scanner.clone(),
         reader.clone(),
         artifact_router.clone(),
+        publisher.clone(),
+        cache.merge_scratch(),
+        names,
         config,
     );
     let budgets = IndexMemoryBudgets::from_config(config)
@@ -164,7 +188,7 @@ pub(crate) async fn start(
             reader,
             publisher,
             retention: generation_retention,
-            cache,
+            cache: cache.clone(),
             budgets,
             cpu,
             config,
@@ -179,6 +203,7 @@ pub(crate) async fn start(
         event_journal: journal,
         scanner,
         artifact_router,
+        cache,
         _definition_coordination: definition_coordination,
         _derived_retention: derived_retention,
         _builders: builders,

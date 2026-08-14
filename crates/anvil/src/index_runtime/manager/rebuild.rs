@@ -2,58 +2,34 @@ use std::collections::VecDeque;
 use std::io;
 use std::sync::Arc;
 
-use anvil_index::bulk::BulkBuildOptions;
 use tracing::Instrument;
 
 use super::*;
 use crate::cluster_object_read::ClusterReadPayload;
-use crate::index_runtime::engine::EngineBulkBuilder;
-use crate::index_runtime::publisher::IndexBlockStagingSink;
 
 pub(super) struct RebuildWork {
     pub(super) current: Option<PublishedGeneration>,
     pub(super) snapshot: ClusterIndexSourceSnapshot,
     pub(super) through: IndexBarrier,
     pub(super) candidate: CandidateGeneration,
-    pub(super) builder: Option<EngineBulkBuilder<IndexBlockStagingSink, IndexCompactionExecutor>>,
-    pub(super) source_quantum_bytes: u64,
+    pub(super) maximum_frame_bytes: u64,
     pub(super) progress: BuilderProgress,
 }
 
-pub(super) fn open_bulk_builder(
-    job: &BuilderJob,
-    dependencies: &IndexBuilderDependencies,
-    plan: SegmentMemoryPlan,
-) -> Result<EngineBulkBuilder<IndexBlockStagingSink, IndexCompactionExecutor>, Status> {
-    let configured = usize::try_from(dependencies.config.external_sort_chunk_bytes(job.kind))
-        .map_err(|_| Status::resource_exhausted("external-sort chunk exceeds platform"))?;
-    let sort_chunk_bytes = plan.max_resident_bytes.min(configured).max(1);
-    let configured_lanes = usize::try_from(dependencies.config.projection_max_lanes(job.kind))
-        .map_err(|_| Status::resource_exhausted("bulk rewrite lane limit exceeds platform"))?;
-    let rewrite_parallelism = CompactionParallelism::for_budget(
-        configured_lanes,
-        dependencies.cpu.workers(),
-        plan.total_bytes as u64,
-    )
-    .map_err(index_status)?;
-    let options = BulkBuildOptions::new(sort_chunk_bytes, rewrite_parallelism.max_lanes())
-        .map_err(index_status)?;
-    tracing::info!(
-        index.kind = ?job.kind,
-        builder.phase = "bulk_open",
-        gauge.anvil_index_bulk_sort_chunk_bytes = sort_chunk_bytes as u64,
-        gauge.anvil_index_bulk_rewrite_configured_lanes = configured_lanes as u64,
-        gauge.anvil_index_bulk_rewrite_effective_lanes = rewrite_parallelism.max_lanes() as u64,
-        gauge.anvil_index_bulk_workspace_bytes = plan.total_bytes as u64,
-        "direct index bulk builder configured"
-    );
-    EngineBulkBuilder::new(
-        &job.specification,
-        dependencies.publisher.staging_sink(),
-        IndexCompactionExecutor::new(dependencies.cpu.clone()),
-        options,
-    )
-    .map_err(index_status)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RebuildTurnStart {
+    RepayDebt,
+    ConsumeSnapshot,
+}
+
+fn rebuild_turn_start(candidate: &CandidateGeneration, limits: DebtLimits) -> RebuildTurnStart {
+    if debt::select(&candidate.segments, limits).is_some()
+        || debt::select_locator_roots(&candidate.locator_roots, limits).is_some()
+    {
+        RebuildTurnStart::RepayDebt
+    } else {
+        RebuildTurnStart::ConsumeSnapshot
+    }
 }
 
 pub(super) async fn advance_rebuild(
@@ -68,15 +44,27 @@ pub(super) async fn advance_rebuild(
     ),
     Status,
 > {
+    let debt_limits = DebtLimits::new(
+        dependencies.config.max_segments_per_tier(job.kind) as usize,
+        dependencies.config.max_unmerged_bytes_per_tier(job.kind),
+    );
+    // A rebuild candidate is not yet visible, so repay its bounded immutable
+    // segment and locator debt before consuming another source frame.
+    if rebuild_turn_start(&work.candidate, debt_limits) == RebuildTurnStart::RepayDebt {
+        if !compact_one_if_needed(job, &mut work.candidate, debt_limits, dependencies).await? {
+            return Err(Status::internal(
+                "rebuild compaction debt changed without manager mutation",
+            ));
+        }
+        return Ok((BuilderPhase::Rebuild(work), BuilderDisposition::Ready, None));
+    }
     let budget = dependencies.budgets.for_kind(job.kind);
     let permit = await_with_builder_heartbeats(&work.progress, budget.acquire(budget.limit()))
         .await
         .map_err(budget_status)?;
-    let plan = work_plan_for_limit(budget.limit(), work.source_quantum_bytes)?;
-    if work.builder.is_none() {
-        work.builder = Some(open_bulk_builder(job, dependencies, plan)?);
-    }
-    let mut quantum = SourceWorkQuantum::from_wire_limit(work.source_quantum_bytes);
+    let plan = work_plan_for_limit(budget.limit(), 0)?;
+    let mut builder = NativeSegmentBuild::new(job, plan, dependencies)?;
+    let mut quantum = SourceWorkQuantum::for_rebuild_turn(budget.limit(), work.maximum_frame_bytes);
     loop {
         let scan_started = Instant::now();
         let scan_span = tracing::info_span!(
@@ -84,6 +72,7 @@ pub(super) async fn advance_rebuild(
             index.kind = ?job.kind,
             scan.frame_records = tracing::field::Empty,
             scan.frame_bytes = tracing::field::Empty,
+            scan.frame_resident_bytes = tracing::field::Empty,
             scan.elapsed_seconds = tracing::field::Empty,
             scan.outcome = tracing::field::Empty,
         );
@@ -93,12 +82,17 @@ pub(super) async fn advance_rebuild(
         )
         .await;
         let scan_elapsed_seconds = scan_started.elapsed().as_secs_f64();
-        let (scan_records, scan_bytes) = match frame.as_ref() {
-            Ok(Some(frame)) => (frame.len() as u64, measure_snapshot_frame(frame)?),
-            Ok(None) | Err(_) => (0, 0),
+        let (scan_records, frame_measure) = match frame.as_ref() {
+            Ok(Some(frame)) => (
+                frame.len() as u64,
+                measure_snapshot_frame(frame, frame.capacity())?,
+            ),
+            Ok(None) | Err(_) => (0, SnapshotFrameMeasure::default()),
         };
+        let scan_bytes = frame_measure.encoded_bytes;
         scan_span.record("scan.frame_records", scan_records);
         scan_span.record("scan.frame_bytes", scan_bytes);
+        scan_span.record("scan.frame_resident_bytes", frame_measure.resident_bytes);
         scan_span.record("scan.elapsed_seconds", scan_elapsed_seconds);
         scan_span.record(
             "scan.outcome",
@@ -119,78 +113,22 @@ pub(super) async fn advance_rebuild(
                 monotonic_counter.anvil_index_bulk_scan_bytes_total = scan_bytes,
                 histogram.anvil_index_bulk_scan_frame_records = scan_records,
                 histogram.anvil_index_bulk_scan_frame_bytes = scan_bytes,
+                histogram.anvil_index_bulk_scan_frame_resident_bytes =
+                    frame_measure.resident_bytes,
                 histogram.anvil_index_bulk_scan_read_duration_seconds = scan_elapsed_seconds,
                 "index bulk source frame read"
             );
         });
         let frame = frame?;
         let Some(frame) = frame else {
-            let builder = work
-                .builder
-                .take()
-                .ok_or_else(|| Status::internal("snapshot bulk builder is missing"))?;
-            let sort_progress = builder.external_sort_progress();
-            let finish_started = Instant::now();
-            let finish_span = tracing::info_span!(
-                "anvil.index.bulk_finish",
-                index.kind = ?job.kind,
-                bulk.outcome = tracing::field::Empty,
-                bulk.elapsed_seconds = tracing::field::Empty,
-            );
-            let finished = await_with_builder_heartbeats(
-                &work.progress,
-                builder.finish().instrument(finish_span.clone()),
+            flush_builder(
+                &job.definition,
+                job.kind,
+                &mut builder,
+                &mut work.candidate,
+                dependencies,
             )
-            .await;
-            let finish_elapsed_seconds = finish_started.elapsed().as_secs_f64();
-            let finish_failed = finished.is_err();
-            let sort_snapshot = sort_progress
-                .map(|progress| progress.snapshot())
-                .unwrap_or_default();
-            finish_span.record(
-                "bulk.outcome",
-                if finish_failed { "failed" } else { "completed" },
-            );
-            finish_span.record("bulk.elapsed_seconds", finish_elapsed_seconds);
-            finish_span.in_scope(|| {
-                tracing::info!(
-                    index.kind = ?job.kind,
-                    builder.phase = "sort_and_pack",
-                    builder.outcome = if finish_failed { "failed" } else { "completed" },
-                    monotonic_counter.anvil_index_bulk_finish_failures_total =
-                        u64::from(finish_failed),
-                    monotonic_counter.anvil_index_external_sort_chunks_total =
-                        sort_snapshot.sort_chunks,
-                    monotonic_counter.anvil_index_external_sort_merge_passes_total =
-                        sort_snapshot.sort_merge_passes,
-                    gauge.anvil_index_external_sort_peak_workspace_bytes =
-                        sort_snapshot.sort_peak_workspace_bytes,
-                    histogram.anvil_index_bulk_finish_duration_seconds = finish_elapsed_seconds,
-                    "direct index bulk builder finished"
-                );
-            });
-            let (sealed, sink) = finished.map_err(index_status)?;
-            if let Some(sealed) = sealed {
-                let sequence = work.candidate.allocate_sequence()?;
-                let published = await_with_builder_heartbeats(
-                    &work.progress,
-                    dependencies.publisher.publish_run(
-                        &job.definition.stored,
-                        job.definition.tenant_id,
-                        job.definition.bucket_id,
-                        sequence,
-                        sealed,
-                        sink,
-                    ),
-                )
-                .await?;
-                work.candidate.runs.push(published.manifest);
-                tracing::info!(
-                    index.kind = ?job.kind,
-                    monotonic_counter.anvil_index_bulk_base_runs_created_total = 1_u64,
-                    "direct index snapshot base run published"
-                );
-            }
+            .await?;
             drop(permit);
             let target = dependencies
                 .journal
@@ -220,17 +158,15 @@ pub(super) async fn advance_rebuild(
 
         let records = scan_records;
         let encoded_bytes = scan_bytes;
+        let frame_plan = work_plan_for_limit(budget.limit(), frame_measure.resident_bytes)?;
         await_with_builder_heartbeats(
             &work.progress,
             process_snapshot_frame(
                 &job.definition,
-                &job.specification,
                 &work.through,
                 frame,
-                plan,
-                work.builder
-                    .as_mut()
-                    .ok_or_else(|| Status::internal("snapshot bulk builder is missing"))?,
+                frame_plan,
+                &mut builder,
                 &mut work.candidate,
                 dependencies,
             ),
@@ -238,28 +174,14 @@ pub(super) async fn advance_rebuild(
         .await?;
         work.progress.advance(records, encoded_bytes);
         if quantum.advance_frame(encoded_bytes)? == SourceWorkBoundary::SealAndYield {
-            let range_started = Instant::now();
-            let range_result = await_with_builder_heartbeats(
-                &work.progress,
-                work.builder
-                    .as_mut()
-                    .ok_or_else(|| Status::internal("snapshot bulk builder is missing"))?
-                    .finish_range(),
+            flush_builder(
+                &job.definition,
+                job.kind,
+                &mut builder,
+                &mut work.candidate,
+                dependencies,
             )
-            .await;
-            tracing::info!(
-                index.kind = ?job.kind,
-                builder.phase = "range_finish",
-                builder.outcome = if range_result.is_err() { "failed" } else { "completed" },
-                monotonic_counter.anvil_index_bulk_ranges_finished_total =
-                    u64::from(range_result.is_ok()),
-                monotonic_counter.anvil_index_bulk_range_finish_failures_total =
-                    u64::from(range_result.is_err()),
-                histogram.anvil_index_bulk_range_finish_duration_seconds =
-                    range_started.elapsed().as_secs_f64(),
-                "direct index bulk source range finished"
-            );
-            range_result.map_err(index_status)?;
+            .await?;
             drop(permit);
             return Ok((BuilderPhase::Rebuild(work), BuilderDisposition::Ready, None));
         }
@@ -269,18 +191,17 @@ pub(super) async fn advance_rebuild(
 #[allow(clippy::too_many_arguments)]
 async fn process_snapshot_frame(
     definition: &CatalogDefinition,
-    specification: &IndexSpecification,
     barrier: &IndexBarrier,
     frame: Vec<IndexSourceSnapshotHead>,
     plan: SegmentMemoryPlan,
-    builder: &mut EngineBulkBuilder<IndexBlockStagingSink, IndexCompactionExecutor>,
+    builder: &mut NativeSegmentBuild,
     candidate: &mut CandidateGeneration,
     dependencies: &IndexBuilderDependencies,
 ) -> Result<(), Status> {
     let configured_lanes = usize::try_from(
         dependencies
             .config
-            .projection_max_lanes(kind_for_specification(specification).map_err(index_status)?),
+            .projection_max_lanes(runtime_kind(definition.schema.kind)),
     )
     .map_err(|_| Status::resource_exhausted("projection lane limit exceeds platform"))?;
     let max_parallel = dependencies.cpu.workers().min(configured_lanes).max(1);
@@ -306,13 +227,13 @@ async fn process_snapshot_frame(
             continue;
         }
         let source = IndexSourceMutation::Upsert(build_object(&head.exact_path, &head.version)?);
-        let prepared = PreparedProjection::new(specification, source)?;
+        let prepared = PreparedProjection::new(&definition.schema, source)?;
         if let Some(pending) = batch.try_push(prepared)? {
             let full = std::mem::replace(
                 &mut batch,
                 ProjectionBatch::new(projection_budget, max_parallel),
             );
-            project_snapshot_batch(specification, plan, full, builder, candidate, dependencies)
+            project_snapshot_batch(definition, plan, full, builder, candidate, dependencies)
                 .await?;
             if batch.try_push(pending)?.is_some() {
                 return Err(Status::internal(
@@ -322,21 +243,20 @@ async fn process_snapshot_frame(
         }
     }
     if !batch.is_empty() {
-        project_snapshot_batch(specification, plan, batch, builder, candidate, dependencies)
-            .await?;
+        project_snapshot_batch(definition, plan, batch, builder, candidate, dependencies).await?;
     }
     Ok(())
 }
 
 async fn project_snapshot_batch(
-    specification: &IndexSpecification,
+    definition: &CatalogDefinition,
     plan: SegmentMemoryPlan,
     batch: ProjectionBatch,
-    builder: &mut EngineBulkBuilder<IndexBlockStagingSink, IndexCompactionExecutor>,
+    builder: &mut NativeSegmentBuild,
     candidate: &mut CandidateGeneration,
     dependencies: &IndexBuilderDependencies,
 ) -> Result<(), Status> {
-    let kind = kind_for_specification(specification).map_err(index_status)?;
+    let kind = runtime_kind(definition.schema.kind);
     let configured_lanes = dependencies.config.projection_max_lanes(kind);
     let source_count = batch.sources.len() as u64;
     let admitted_bytes = batch.resident_bytes;
@@ -393,7 +313,8 @@ async fn project_snapshot_batch(
         );
     });
     let result = project_snapshot_batch_inner(
-        specification,
+        definition,
+        &definition.schema,
         batch.sources,
         effective_lanes,
         lane_limit,
@@ -466,14 +387,10 @@ pub(super) struct PreparedProjection {
 }
 
 impl PreparedProjection {
-    pub(super) fn new(
-        specification: &IndexSpecification,
-        source: IndexSourceMutation,
-    ) -> Result<Self, Status> {
-        let projection_bytes =
-            projection_admission_bytes(specification, &source).map_err(index_status)?;
+    pub(super) fn new(schema: &Schema, source: IndexSourceMutation) -> Result<Self, Status> {
+        let projection_bytes = projection_admission_bytes(schema, &source).map_err(index_status)?;
         let needs_payload =
-            source_needs_payload(specification) && matches!(source, IndexSourceMutation::Upsert(_));
+            source_needs_payload(schema) && matches!(source, IndexSourceMutation::Upsert(_));
         let payload_bytes = match &source {
             IndexSourceMutation::Upsert(object) if needs_payload => object.content_length,
             _ => 0,
@@ -591,7 +508,7 @@ pub(super) struct FetchedProjection {
     pub(super) payload: Option<ClusterReadPayload>,
 }
 
-type ProjectedSource = Result<(EngineMutation, IndexBuildDiagnostics), IndexError>;
+type ProjectedSource = Result<(MergeMutation, IndexBuildDiagnostics), IndexError>;
 
 pub(super) async fn run_projection_lanes<T, O, F>(
     cpu: IndexCpuPool,
@@ -654,11 +571,12 @@ where
 }
 
 async fn project_snapshot_batch_inner(
-    specification: &IndexSpecification,
+    definition: &CatalogDefinition,
+    schema: &Schema,
     sources: Vec<PreparedProjection>,
     effective_lanes: usize,
     lane_limit: usize,
-    builder: &mut EngineBulkBuilder<IndexBlockStagingSink, IndexCompactionExecutor>,
+    builder: &mut NativeSegmentBuild,
     candidate: &mut CandidateGeneration,
     dependencies: &IndexBuilderDependencies,
 ) -> Result<ProjectionWaveTotals, Status> {
@@ -673,7 +591,7 @@ async fn project_snapshot_batch_inner(
         receivers.push(receiver);
     }
     let cpu = dependencies.cpu.clone();
-    let specification = specification.clone();
+    let projection_schema = schema.clone();
     let cpu_task = tokio::spawn(run_projection_lanes(
         cpu,
         lanes,
@@ -683,7 +601,7 @@ async fn project_snapshot_batch_inner(
                 .payload
                 .as_mut()
                 .map(|payload| payload as &mut dyn std::io::Read);
-            project_mutation(&specification, fetched.source, reader, lane_limit)
+            project_mutation(&projection_schema, fetched.source, reader, lane_limit)
         },
     ));
 
@@ -702,8 +620,18 @@ async fn project_snapshot_batch_inner(
                 totals.accepted = totals.accepted.saturating_add(diagnostics.accepted_objects);
                 totals.skipped = totals.skipped.saturating_add(diagnostics.skipped_objects);
                 candidate.diagnostics.add(diagnostics);
-                if let Err(error) = builder.push(mutation).await {
-                    failure = Some(index_status(error));
+                if let MergeMutation::Upsert(source) = mutation
+                    && let Err(error) = push_or_flush(
+                        definition,
+                        runtime_kind(definition.schema.kind),
+                        builder,
+                        source,
+                        candidate,
+                        dependencies,
+                    )
+                    .await
+                {
+                    failure = Some(error);
                     break;
                 }
             }
@@ -837,13 +765,49 @@ pub(super) fn partition_projection_lanes<T>(values: Vec<T>, lane_count: usize) -
     lanes
 }
 
-pub(super) fn measure_snapshot_frame(frame: &[IndexSourceSnapshotHead]) -> Result<u64, Status> {
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct SnapshotFrameMeasure {
+    pub(super) encoded_bytes: u64,
+    pub(super) resident_bytes: u64,
+}
+
+pub(super) fn measure_snapshot_frame(
+    frame: &[IndexSourceSnapshotHead],
+    frame_capacity: usize,
+) -> Result<SnapshotFrameMeasure, Status> {
+    if frame_capacity < frame.len() {
+        return Err(Status::internal(
+            "index snapshot frame capacity is below its length",
+        ));
+    }
     let mut counter = ByteCounter(0);
+    let mut resident_bytes = std::mem::size_of::<Vec<IndexSourceSnapshotHead>>()
+        .checked_add(
+            frame_capacity
+                .checked_mul(std::mem::size_of::<IndexSourceSnapshotHead>())
+                .ok_or_else(|| Status::resource_exhausted("index snapshot resident overflow"))?,
+        )
+        .ok_or_else(|| Status::resource_exhausted("index snapshot resident overflow"))?;
     for head in frame {
         serde_json::to_writer(&mut counter, head)
             .map_err(|error| Status::internal(format!("measure index snapshot frame: {error}")))?;
+        resident_bytes = resident_bytes
+            .checked_add(head.exact_path.capacity())
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    head.version
+                        .content_type
+                        .as_ref()
+                        .map_or(0, String::capacity),
+                )
+            })
+            .ok_or_else(|| Status::resource_exhausted("index snapshot resident overflow"))?;
     }
-    Ok(counter.0)
+    Ok(SnapshotFrameMeasure {
+        encoded_bytes: counter.0,
+        resident_bytes: u64::try_from(resident_bytes)
+            .map_err(|_| Status::resource_exhausted("index snapshot resident exceeds u64"))?,
+    })
 }
 
 struct ByteCounter(u64);
@@ -868,7 +832,7 @@ mod tests {
 
     fn prepared(index: usize, projection_bytes: u64, resident_bytes: u64) -> PreparedProjection {
         PreparedProjection {
-            source: IndexSourceMutation::Remove(DocumentRef {
+            source: IndexSourceMutation::Remove(ObjectIdentity {
                 path: format!("docs/{index}"),
                 version: 1,
             }),
@@ -876,6 +840,43 @@ mod tests {
             resident_bytes,
             needs_payload: false,
         }
+    }
+
+    fn locator_root(sequence: u64) -> LocatorRoot {
+        LocatorRoot {
+            sequence,
+            identity: SegmentIdentity::new(1, 1, [1; 32], sequence).unwrap(),
+            artifact: anvil_index::v4::ArtifactDescriptor {
+                path: String::new(),
+                object_version: 1,
+                object_content_hash: [1; 32],
+                object_length: 1,
+                offset: 0,
+                encoded_length: 1,
+                logical_length: 1,
+                component_kind: anvil_index::v4::ComponentKind::ROUTING_NODE,
+                codec_version: 1,
+                checksum: [1; 32],
+            },
+            encoded_bytes: 1,
+            logical_bytes: 1,
+        }
+    }
+
+    #[test]
+    fn rebuild_turn_repays_candidate_debt_before_consuming_another_snapshot_frame() {
+        let clean = CandidateGeneration::rebuild();
+        assert_eq!(
+            rebuild_turn_start(&clean, DebtLimits::new(1, u64::MAX)),
+            RebuildTurnStart::ConsumeSnapshot
+        );
+
+        let mut indebted = CandidateGeneration::rebuild();
+        indebted.locator_roots = vec![locator_root(1), locator_root(2)];
+        assert_eq!(
+            rebuild_turn_start(&indebted, DebtLimits::new(1, u64::MAX)),
+            RebuildTurnStart::RepayDebt
+        );
     }
 
     #[test]

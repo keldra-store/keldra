@@ -1,8 +1,9 @@
 //! Narrow boundaries between the public index API and the clustered runtime.
 //!
-//! The service owns request validation, ordinary-object lifecycle calls,
-//! Zanzibar filtering, and opaque page tokens. Implementations behind these
-//! traits own only clustered definition discovery and generation execution.
+//! The service owns request validation, definition admission, ordinary-object
+//! lifecycle calls, and opaque page tokens. Local generation execution owns
+//! mandatory candidate Zanzibar/exact-current checks through the supplied
+//! visibility boundary; it cannot return a page through optional post-filtering.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,6 +16,8 @@ use tonic::metadata::MetadataMap;
 use crate::authentication::Caller;
 use crate::authorization::ObjectPermission;
 use crate::distributed_list::OriginalBearer;
+
+use super::candidate_visibility::IndexCandidateVisibility;
 
 /// Authorized context retained when the public service calls into a query
 /// replica. The original signed token or fixed anonymous marker, rather than a
@@ -162,6 +165,8 @@ impl IndexDefinitionReader for crate::cluster_object_read::ClusterObjectReader {
 /// Immutable values to which every opaque query page token is bound.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct IndexPageTokenBinding {
+    pub(crate) tenant_id: u64,
+    pub(crate) bucket_id: u64,
     pub(crate) index_id: u64,
     pub(crate) definition_version: u64,
     pub(crate) query_hash: [u8; 32],
@@ -202,6 +207,13 @@ pub(crate) struct ExecuteIndexQuery {
     pub(crate) definition: IndexDefinition,
     pub(crate) query: IndexQuery,
     pub(crate) limit: usize,
+    /// Mandatory candidate-level Zanzibar and exact-current boundary. A local
+    /// executor must invoke it while collecting/refilling, before admitting an
+    /// arbitrary-order candidate to top-K state.
+    pub(crate) candidate_visibility: Arc<dyn IndexCandidateVisibility>,
+    /// Zanzibar revision established by the one definition-admission check for
+    /// this execution. It also binds empty results and any continuation token.
+    pub(crate) authorization_revision: u64,
     /// `None` selects the latest published generation. A continuation supplies
     /// the exact immutable generation and engine-specific last position.
     pub(crate) resume: Option<IndexPageCursor>,
@@ -211,9 +223,8 @@ pub(crate) struct ExecuteIndexQuery {
 pub(crate) struct ExecutedIndexQuery {
     pub(crate) hits: Vec<IndexQueryHit>,
     pub(crate) freshness: IndexFreshness,
-    /// Engine-specific stable position. A local engine position is private
-    /// until authorization-aware pagination replaces it with the position
-    /// following a returned, Zanzibar-authorized hit.
+    /// Engine-specific stable position following a returned, authorized and
+    /// exact-current hit. Candidate-private positions never cross this boundary.
     pub(crate) next_position: Option<Vec<u8>>,
 }
 
