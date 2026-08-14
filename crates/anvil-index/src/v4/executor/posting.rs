@@ -383,15 +383,28 @@ impl<'a, D: ArtifactDirectoryRead> PointRangeStream<'a, D> {
             return Ok(());
         }
         let (minimum, maximum) = if self.bounds.presence {
-            let key = super::super::point_presence_key(self.field_id)?;
-            (Some(key.clone()), Some(key))
+            let (minimum, maximum) =
+                super::super::point_value_range(self.field_id, &PointValue::Presence)?;
+            (Some(minimum), Some(maximum))
         } else {
             (
                 self.bounds.lower.as_ref()
-                    .map(|bound| super::super::point_scalar_key(self.field_id, &bound.value))
+                    .map(|bound| {
+                        super::super::point_value_range(
+                            self.field_id,
+                            &PointValue::Value(bound.value.clone()),
+                        )
+                        .map(|range| range.0)
+                    })
                     .transpose()?,
                 self.bounds.upper.as_ref()
-                    .map(|bound| super::super::point_scalar_key(self.field_id, &bound.value))
+                    .map(|bound| {
+                        super::super::point_value_range(
+                            self.field_id,
+                            &PointValue::Value(bound.value.clone()),
+                        )
+                        .map(|range| range.1)
+                    })
                     .transpose()?,
             )
         };
