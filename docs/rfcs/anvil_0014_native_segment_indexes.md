@@ -562,7 +562,7 @@ request rather than an invented index DSL:
 ```protobuf
 bucket: "intelligence"
 name: "advisories"
-path_prefix: "/advisories/"
+path_prefix: "advisories/"
 content_type: "application/json"
 specification {
   typed_json {
@@ -649,8 +649,8 @@ let summary = TextField::single("summary", "/summary")
     .full_text();
 
 let request = TypedJsonIndexBuilder::new("intelligence", "advisories")
-    .path_prefix("/advisories/")?
-    .content_type("application/json")?
+    .path_prefix("advisories/")
+    .content_type("application/json")
     .field(advisory_id)
     .field(ecosystem)
     .field(modified_at)

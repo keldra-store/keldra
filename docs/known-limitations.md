@@ -10,6 +10,7 @@ format-4 generation from its declared source scope.
 
 | Area | Current boundary |
 | --- | --- |
+| Index path-prefix admission | A definition may currently accept a noncanonical prefix, but such a prefix can select no objects or an ambiguous scope. Use an empty prefix for the whole bucket or canonical relative path segments, optionally ending in `/`. Zanzibar authorization and ordinary object-path validation are unaffected. |
 | Typed JSON physical order | A query uses the streaming physical-order path only when its complete ordered field/direction list exactly matches the definition. Any other order uses the exact bounded top-K path and may inspect every matching document while retaining only bounded heap state. Ordered fields must be declared single-valued. |
 | Typed JSON collation | Scalar ordering is deterministic byte/value ordering, not locale-aware collation. Missing and explicit `null` remain distinct. |
 | Typed JSON Boolean expressions | The public query's flat predicate list is a conjunction. `IN` provides same-field disjunction. Arbitrary nested Boolean expressions and `NOT` are not yet exposed by the public API; applications can issue separate queries and combine authorized result identities when needed. |
