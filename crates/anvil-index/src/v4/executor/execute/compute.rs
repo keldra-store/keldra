@@ -33,8 +33,11 @@ struct AggregateState {
 }
 
 impl ComputationState {
-    pub(super) fn new(request: &NativeQueryRequest, maximum_bytes: usize) -> Result<Self, IndexError> {
-        let facets = request
+    pub(super) fn new(
+        request: &NativeQueryRequest,
+        maximum_bytes: usize,
+    ) -> Result<Self, IndexError> {
+        let facets: Vec<FacetState> = request
             .facets
             .iter()
             .map(|request| FacetState {
@@ -44,7 +47,7 @@ impl ComputationState {
             })
             .collect();
         let schema = &request.schema;
-        let aggregates = request
+        let aggregates: Vec<AggregateState> = request
             .aggregates
             .iter()
             .map(|request| {
@@ -174,7 +177,10 @@ impl ComputationState {
 
 impl AggregateState {
     fn observe(&mut self, value: ScalarValue) -> Result<(), IndexError> {
-        self.count = self.count.checked_add(1).ok_or(IndexError::OffsetOverflow)?;
+        self.count = self
+            .count
+            .checked_add(1)
+            .ok_or(IndexError::OffsetOverflow)?;
         if self.operation == AggregateOperation::Minimum
             && self.minimum.as_ref().is_none_or(|current| value < *current)
         {
@@ -185,7 +191,10 @@ impl AggregateState {
         {
             self.maximum = Some(value.clone());
         }
-        if !matches!(self.operation, AggregateOperation::Sum | AggregateOperation::Average) {
+        if !matches!(
+            self.operation,
+            AggregateOperation::Sum | AggregateOperation::Average
+        ) {
             return Ok(());
         }
         match value {

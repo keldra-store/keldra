@@ -8,8 +8,8 @@ use crate::IndexError;
 use super::super::postings::DecodedPostingBlock;
 use super::super::{
     ArtifactDescriptor, ArtifactDirectoryRead, ComponentKind, ComponentStream, DocId,
-    DocValueBlock, FieldId, NativeQueryStatisticsRecorder, PointBlock, PointValue, PostingImpact,
-    PostingReference, RangeBound, ScalarValue, SegmentDescriptor, StreamLeaf, TermDictionary,
+    DocValueBlock, FieldId, NativeQueryStatisticsRecorder, PointBlock, PointValue, PositionsBlock,
+    PostingImpact, PostingReference, RangeBound, SegmentDescriptor, StreamLeaf, TermDictionary,
     component_ordinal_key, read_artifact_component,
 };
 
@@ -295,6 +295,7 @@ pub(super) struct PointBounds {
     lower: Option<RangeBound>,
     upper: Option<RangeBound>,
     presence: bool,
+    null: bool,
 }
 
 impl PointBounds {
@@ -303,24 +304,50 @@ impl PointBounds {
         upper: Option<RangeBound>,
     ) -> Result<Self, IndexError> {
         if lower.is_none() && upper.is_none() {
-            return Err(IndexError::InvalidQuery("point range requires a bound".into()));
+            return Err(IndexError::InvalidQuery(
+                "point range requires a bound".into(),
+            ));
         }
         if let (Some(lower), Some(upper)) = (&lower, &upper)
             && (std::mem::discriminant(&lower.value) != std::mem::discriminant(&upper.value)
                 || lower.value > upper.value)
         {
-            return Err(IndexError::InvalidQuery("point range bounds are reversed".into()));
+            return Err(IndexError::InvalidQuery(
+                "point range bounds are reversed".into(),
+            ));
         }
-        Ok(Self { lower, upper, presence: false })
+        Ok(Self {
+            lower,
+            upper,
+            presence: false,
+            null: false,
+        })
     }
 
     pub(super) fn presence() -> Self {
-        Self { lower: None, upper: None, presence: true }
+        Self {
+            lower: None,
+            upper: None,
+            presence: true,
+            null: false,
+        }
+    }
+
+    pub(super) fn null() -> Self {
+        Self {
+            lower: None,
+            upper: None,
+            presence: false,
+            null: true,
+        }
     }
 
     fn contains(&self, value: &PointValue) -> bool {
         if self.presence {
             return value == &PointValue::Presence;
+        }
+        if self.null {
+            return value == &PointValue::Null;
         }
         let PointValue::Value(value) = value else {
             return false;
@@ -386,9 +413,15 @@ impl<'a, D: ArtifactDirectoryRead> PointRangeStream<'a, D> {
             let (minimum, maximum) =
                 super::super::point_value_range(self.field_id, &PointValue::Presence)?;
             (Some(minimum), Some(maximum))
+        } else if self.bounds.null {
+            let (minimum, maximum) =
+                super::super::point_value_range(self.field_id, &PointValue::Null)?;
+            (Some(minimum), Some(maximum))
         } else {
             (
-                self.bounds.lower.as_ref()
+                self.bounds
+                    .lower
+                    .as_ref()
                     .map(|bound| {
                         super::super::point_value_range(
                             self.field_id,
@@ -397,7 +430,9 @@ impl<'a, D: ArtifactDirectoryRead> PointRangeStream<'a, D> {
                         .map(|range| range.0)
                     })
                     .transpose()?,
-                self.bounds.upper.as_ref()
+                self.bounds
+                    .upper
+                    .as_ref()
                     .map(|bound| {
                         super::super::point_value_range(
                             self.field_id,
@@ -738,12 +773,25 @@ pub(super) enum DocCursor<'a, D> {
     Empty,
     All { next: u32, end: u32 },
     Posting(PostingStream<'a, D>),
+    Phrase(PhraseCursor<'a, D>),
     TermRange(TermRangeStream<'a, D>),
     PointRange(PointRangeStream<'a, D>),
     DocValuePresence(DocValuePresenceStream<'a, D>),
     And(AndCursor<'a, D>),
     Or(OrCursor<'a, D>),
     Not(NotCursor<'a, D>),
+}
+
+pub(super) struct PhraseCursor<'a, D> {
+    directory: &'a D,
+    segment: &'a SegmentDescriptor,
+    field_id: FieldId,
+    terms: Vec<PostingStream<'a, D>>,
+    heads: Vec<Option<DocId>>,
+    initialized: bool,
+    emitted: Option<DocId>,
+    estimated_documents: u64,
+    statistics: NativeQueryStatisticsRecorder,
 }
 
 pub(super) struct AndCursor<'a, D> {
@@ -808,6 +856,40 @@ impl<'a, D: ArtifactDirectoryRead> DocCursor<'a, D> {
         })
     }
 
+    pub(super) fn phrase(
+        directory: &'a D,
+        segment: &'a SegmentDescriptor,
+        field_id: FieldId,
+        terms: Vec<PostingReference>,
+        statistics: NativeQueryStatisticsRecorder,
+    ) -> Result<Self, IndexError> {
+        if terms.is_empty() {
+            return Err(IndexError::InvalidQuery(
+                "phrase query requires at least one term".into(),
+            ));
+        }
+        let estimated_documents = terms
+            .iter()
+            .map(|term| term.document_frequency)
+            .min()
+            .unwrap_or(0);
+        let terms = terms
+            .into_iter()
+            .map(|term| PostingStream::new(directory, segment, field_id, term, statistics.clone()))
+            .collect::<Result<Vec<_>, IndexError>>()?;
+        Ok(Self::Phrase(PhraseCursor {
+            directory,
+            segment,
+            field_id,
+            heads: vec![None; terms.len()],
+            terms,
+            initialized: false,
+            emitted: None,
+            estimated_documents,
+            statistics,
+        }))
+    }
+
     pub(super) fn or(mut children: Vec<Self>, statistics: NativeQueryStatisticsRecorder) -> Self {
         children.retain(|child| !matches!(child, Self::Empty));
         if children.is_empty() {
@@ -844,6 +926,7 @@ impl<'a, D: ArtifactDirectoryRead> DocCursor<'a, D> {
             Self::Empty => 0,
             Self::All { next, end } => u64::from(end.saturating_sub(*next)),
             Self::Posting(cursor) => cursor.estimated_documents,
+            Self::Phrase(cursor) => cursor.estimated_documents,
             Self::TermRange(cursor) => cursor.estimated_documents,
             Self::PointRange(cursor) => cursor.estimated_documents,
             Self::DocValuePresence(cursor) => u64::from(cursor.segment.document_count),
@@ -866,6 +949,7 @@ impl<'a, D: ArtifactDirectoryRead> DocCursor<'a, D> {
                     Ok(Some(value))
                 }
                 Self::Posting(cursor) => cursor.next().await,
+                Self::Phrase(cursor) => cursor.next().await,
                 Self::TermRange(cursor) => cursor.next().await,
                 Self::PointRange(cursor) => cursor.next().await,
                 Self::DocValuePresence(cursor) => cursor.next().await,
@@ -890,6 +974,7 @@ impl<'a, D: ArtifactDirectoryRead> DocCursor<'a, D> {
                     Ok(Some(value))
                 }
                 Self::Posting(cursor) => cursor.advance(target).await,
+                Self::Phrase(cursor) => cursor.advance(target).await,
                 Self::TermRange(cursor) => cursor.advance(target).await,
                 Self::PointRange(cursor) => cursor.advance(target).await,
                 Self::DocValuePresence(cursor) => cursor.advance(target).await,
@@ -908,6 +993,7 @@ impl<'a, D: ArtifactDirectoryRead> DocCursor<'a, D> {
             | Self::PointRange(_)
             | Self::DocValuePresence(_) => Ok(()),
             Self::Posting(cursor) => cursor.release_decoded(),
+            Self::Phrase(cursor) => cursor.release_decoded(),
             Self::And(cursor) => cursor
                 .children
                 .iter_mut()
@@ -922,6 +1008,169 @@ impl<'a, D: ArtifactDirectoryRead> DocCursor<'a, D> {
             }
         }
     }
+}
+
+impl<'a, D: ArtifactDirectoryRead> PhraseCursor<'a, D> {
+    async fn initialize(&mut self) -> Result<bool, IndexError> {
+        if !self.initialized {
+            for (head, term) in self.heads.iter_mut().zip(&mut self.terms) {
+                *head = term.next().await?;
+            }
+            self.initialized = true;
+        }
+        Ok(self.heads.iter().all(Option::is_some))
+    }
+
+    async fn align(&mut self) -> Result<Option<DocId>, IndexError> {
+        loop {
+            let Some(target) = self.heads.iter().flatten().copied().max() else {
+                return Ok(None);
+            };
+            let mut moved = false;
+            for (head, term) in self.heads.iter_mut().zip(&mut self.terms) {
+                if head.is_some_and(|value| value < target) {
+                    self.statistics.conjunction_advance();
+                    *head = term.advance(target).await?;
+                    if head.is_none() {
+                        return Ok(None);
+                    }
+                    moved = true;
+                }
+            }
+            if !moved && self.heads.iter().all(|head| *head == Some(target)) {
+                return Ok(Some(target));
+            }
+        }
+    }
+
+    async fn positionally_matches(&mut self, doc_id: DocId) -> Result<bool, IndexError> {
+        self.statistics.two_phase_verification();
+        let mut positions = Vec::with_capacity(self.terms.len());
+        for term in &self.terms {
+            let ordinal = term
+                .current_component_ordinal()
+                .ok_or(IndexError::InvalidFormat(
+                    "phrase position lookup has no posting ordinal",
+                ))?;
+            let Some(values) =
+                positions_for(self.directory, self.segment, self.field_id, ordinal, doc_id).await?
+            else {
+                return Err(IndexError::InvalidFormat(
+                    "phrase posting has no position entry",
+                ));
+            };
+            positions.push(values);
+        }
+        self.directory
+            .run_query_cpu(move || Ok(positional_sequence(&positions)))
+            .await
+    }
+
+    async fn next(&mut self) -> Result<Option<DocId>, IndexError> {
+        if !self.initialize().await? {
+            return Ok(None);
+        }
+        loop {
+            if self.emitted.take().is_some() {
+                self.heads[0] = self.terms[0].next().await?;
+                if self.heads[0].is_none() {
+                    return Ok(None);
+                }
+            }
+            let Some(candidate) = self.align().await? else {
+                return Ok(None);
+            };
+            self.emitted = Some(candidate);
+            if self.positionally_matches(candidate).await? {
+                return Ok(Some(candidate));
+            }
+        }
+    }
+
+    async fn advance(&mut self, target: DocId) -> Result<Option<DocId>, IndexError> {
+        if self.emitted.is_some_and(|current| current >= target) {
+            return Ok(self.emitted);
+        }
+        if !self.initialize().await? {
+            return Ok(None);
+        }
+        self.emitted = None;
+        for (head, term) in self.heads.iter_mut().zip(&mut self.terms) {
+            if head.is_some_and(|value| value < target) {
+                self.statistics.conjunction_advance();
+                *head = term.advance(target).await?;
+                if head.is_none() {
+                    return Ok(None);
+                }
+            }
+        }
+        self.next().await
+    }
+
+    fn release_decoded(&mut self) -> Result<(), IndexError> {
+        self.terms
+            .iter_mut()
+            .try_for_each(PostingStream::release_decoded)
+    }
+}
+
+async fn positions_for<D: ArtifactDirectoryRead>(
+    directory: &D,
+    segment: &SegmentDescriptor,
+    field_id: FieldId,
+    ordinal: u32,
+    doc_id: DocId,
+) -> Result<Option<Vec<u32>>, IndexError> {
+    let root = component_root(segment, ComponentKind::POSITIONS, Some(field_id))?;
+    let key = component_ordinal_key(ordinal).to_vec();
+    let mut stream = ComponentStream::new(
+        directory,
+        segment.identity,
+        ComponentKind::POSITIONS,
+        root,
+        Some(key.clone()),
+        Some(key.clone()),
+    )?;
+    let Some(leaf) = stream.next_leaf().await? else {
+        return Err(IndexError::InvalidFormat(
+            "phrase posting has no position component",
+        ));
+    };
+    if leaf.minimum_key != key || leaf.maximum_key != key || stream.next_leaf().await?.is_some() {
+        return Err(IndexError::InvalidFormat("position stream ordinal"));
+    }
+    let loaded = read_artifact_component(
+        directory,
+        segment.identity,
+        &leaf.descriptor,
+        ComponentKind::POSITIONS,
+    )
+    .await?;
+    let block = directory
+        .run_query_cpu(move || PositionsBlock::decode_payload(&loaded.payload))
+        .await?;
+    Ok(block
+        .entries()
+        .binary_search_by_key(&doc_id, |entry| entry.doc_id)
+        .ok()
+        .map(|index| block.entries()[index].positions.clone()))
+}
+
+fn positional_sequence(positions: &[Vec<u32>]) -> bool {
+    let Some(first) = positions.first() else {
+        return false;
+    };
+    first.iter().any(|start| {
+        positions
+            .iter()
+            .enumerate()
+            .skip(1)
+            .all(|(offset, values)| {
+                start
+                    .checked_add(offset as u32)
+                    .is_some_and(|expected| values.binary_search(&expected).is_ok())
+            })
+    })
 }
 
 impl<'a, D: ArtifactDirectoryRead> AndCursor<'a, D> {

@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 
 use crate::IndexError;
 
-use super::{Selected, SegmentValues};
+use super::{SegmentValues, Selected};
 use crate::v4::{
     ArtifactDirectoryRead, DocId, FieldId, NativeQuery, NativeQueryCursor, NativeQueryRequest,
     ObjectIdentity, OrderDirection, OrderField, ScalarValue, SortValue,
@@ -22,10 +22,7 @@ pub(super) fn compare_selected(left: &Selected, right: &Selected) -> Ordering {
     )
 }
 
-pub(super) fn compare_to_cursor(
-    candidate: &Selected,
-    cursor: &NativeQueryCursor,
-) -> Ordering {
+pub(super) fn compare_to_cursor(candidate: &Selected, cursor: &NativeQueryCursor) -> Ordering {
     compare_parts(
         &candidate.sort_values,
         &candidate.result,
@@ -62,16 +59,17 @@ pub(super) fn compare_parts(
         .as_bytes()
         .cmp(right_result.path.as_bytes())
         .then_with(|| left_result.version.cmp(&right_result.version))
-        .then_with(|| left_source.path.as_bytes().cmp(right_source.path.as_bytes()))
+        .then_with(|| {
+            left_source
+                .path
+                .as_bytes()
+                .cmp(right_source.path.as_bytes())
+        })
         .then_with(|| left_source.version.cmp(&right_source.version))
         .then_with(|| left_source_record.cmp(&right_source_record))
 }
 
-fn compare_sort_value(
-    left: &SortValue,
-    right: &SortValue,
-    direction: OrderDirection,
-) -> Ordering {
+fn compare_sort_value(left: &SortValue, right: &SortValue, direction: OrderDirection) -> Ordering {
     let ascending = match (left, right) {
         (SortValue::Missing, SortValue::Missing) => Ordering::Equal,
         (SortValue::Missing, _) => Ordering::Greater,

@@ -10,7 +10,7 @@ use super::super::{
     ArtifactDirectoryRead, CandidateGate, CandidateReference, DocId, FieldId,
     INDEX_GENERATION_SEGMENTS, NativeQuery, NativeQueryCursor, NativeQueryExecutionTier,
     NativeQueryHit, NativeQueryPage, NativeQueryRequest, NativeQueryStatisticsRecorder,
-    ObjectIdentity, OrderDirection, OrderField, ScalarValue, SegmentComponentReader, SortValue,
+    ObjectIdentity, OrderDirection, OrderField, SegmentComponentReader, SortValue,
 };
 use super::plan::{SegmentPlan, plan_segment};
 use super::posting::DocCursor;
@@ -20,8 +20,8 @@ use super::query_semantics::{
 use super::score::{GlobalTextStatistics, SegmentScorer};
 use super::values::SegmentValues;
 
-mod impact;
 mod compute;
+mod impact;
 mod result;
 mod sorting;
 
@@ -211,9 +211,7 @@ where
             )
             .await?
         };
-        let (facet_results, aggregate_results) = self
-            .compute(request, &statistics)
-            .await?;
+        let (facet_results, aggregate_results) = self.compute(request, &statistics).await?;
         result::materialize(
             request,
             executions.as_mut_slice(),
@@ -526,7 +524,6 @@ struct SegmentExecution<'a, D> {
     segment_index: usize,
     segment: &'a super::super::SegmentDescriptor,
     cursor: DocCursor<'a, D>,
-    exact_filter: Option<&'a super::super::Predicate>,
     scorer: SegmentScorer<'a, D>,
     values: SegmentValues<'a, D>,
     prefetched: Option<DocId>,
@@ -545,14 +542,7 @@ impl<'a, D: ArtifactDirectoryRead> SegmentExecution<'a, D> {
             segment_index,
             segment,
             cursor: plan.cursor,
-            exact_filter: plan.exact_filter,
-            scorer: SegmentScorer::new(
-                directory,
-                segment,
-                plan.text_terms,
-                plan.phrase_fields,
-                &statistics,
-            )?,
+            scorer: SegmentScorer::new(directory, segment, plan.text_terms, &statistics)?,
             values: SegmentValues::new(directory, segment, statistics.clone())?,
             prefetched: None,
             statistics,
@@ -572,15 +562,6 @@ impl<'a, D: ArtifactDirectoryRead> SegmentExecution<'a, D> {
             self.statistics.candidate_doc_id();
             if !self.values.is_live(doc_id).await? {
                 self.statistics.live_mask_reject();
-                continue;
-            }
-            if let Some(predicate) = self.exact_filter {
-                self.statistics.two_phase_verification();
-                if !self.values.predicate(predicate, doc_id).await? {
-                    continue;
-                }
-            }
-            if !self.scorer.phrase_matches(doc_id).await? {
                 continue;
             }
             return Ok(Some(Unranked {

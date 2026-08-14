@@ -197,7 +197,7 @@ fn query_shape(
                 .as_ref()
                 .map_or(Ok(0), |value| predicate_shape(value, fields))?
         }
-        NativeQuery::FullText { text, phrase } => {
+        NativeQuery::FullText { text, .. } => {
             let tokens = text.split_whitespace().count().max(1);
             let text_fields = request
                 .schema
@@ -214,9 +214,9 @@ fn query_shape(
                 .count();
             tokens
                 .checked_mul(text_fields)
-                // Candidate intersection and BM25 each own a cursor; phrase
-                // verification owns one additional cursor per term.
-                .and_then(|value| value.checked_mul(2 + usize::from(*phrase)))
+                // Candidate matching (including exact positional phrases) and
+                // BM25 scoring each own one cursor per term.
+                .and_then(|value| value.checked_mul(2))
                 .ok_or(IndexError::OffsetOverflow)?
         }
         NativeQuery::Vector { .. } => {
@@ -288,6 +288,10 @@ fn predicate_shape(
         Predicate::Exists { field_id, .. } => {
             fields.insert(*field_id);
             0
+        }
+        Predicate::FullText { field_id, text, .. } | Predicate::Phrase { field_id, text, .. } => {
+            fields.insert(*field_id);
+            text.split_whitespace().count().max(1)
         }
         Predicate::And(children) | Predicate::Or(children) => {
             children.iter().try_fold(0usize, |total, child| {

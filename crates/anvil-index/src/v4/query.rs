@@ -308,9 +308,7 @@ impl NativeQueryRequest {
                         .ok_or_else(|| IndexError::InvalidQuery("unknown order field".into()))?;
                     if field.id != ordered.field_id
                         || field.cardinality != super::Cardinality::Single
-                        || !field
-                            .capabilities
-                            .contains(FieldCapabilities::ORDER)
+                        || !field.capabilities.contains(FieldCapabilities::ORDER)
                         || !fields.insert(field.id)
                     {
                         return Err(IndexError::InvalidQuery(
@@ -415,15 +413,22 @@ fn validate_computations(
     Ok(())
 }
 
-fn validate_predicate_capabilities(schema: &Schema, predicate: &Predicate) -> Result<(), IndexError> {
+fn validate_predicate_capabilities(
+    schema: &Schema,
+    predicate: &Predicate,
+) -> Result<(), IndexError> {
     match predicate {
-        Predicate::Equal { field_id, value, .. } => {
-            validate_field_value(schema, *field_id, value, FieldCapabilities::EXACT)
-        }
-        Predicate::In { field_id, values, .. } => values.iter().try_for_each(|value| {
+        Predicate::Equal {
+            field_id, value, ..
+        } => validate_field_value(schema, *field_id, value, FieldCapabilities::EXACT),
+        Predicate::In {
+            field_id, values, ..
+        } => values.iter().try_for_each(|value| {
             validate_field_value(schema, *field_id, value, FieldCapabilities::EXACT)
         }),
-        Predicate::Prefix { field_id, prefix, .. } => {
+        Predicate::Prefix {
+            field_id, prefix, ..
+        } => {
             let field = require_capability(schema, *field_id, FieldCapabilities::PREFIX)?;
             if field.field_type != super::FieldType::Keyword || prefix.len() > INDEX_TERM_BYTES {
                 return Err(IndexError::InvalidQuery(
@@ -432,7 +437,12 @@ fn validate_predicate_capabilities(schema: &Schema, predicate: &Predicate) -> Re
             }
             Ok(())
         }
-        Predicate::Range { field_id, lower, upper, .. } => {
+        Predicate::Range {
+            field_id,
+            lower,
+            upper,
+            ..
+        } => {
             let field = require_capability(schema, *field_id, FieldCapabilities::RANGE)?;
             for bound in lower.iter().chain(upper.iter()) {
                 validate_value_type(field.field_type, &bound.value)?;
@@ -446,9 +456,10 @@ fn validate_predicate_capabilities(schema: &Schema, predicate: &Predicate) -> Re
             Ok(())
         }
         Predicate::Exists { field_id, .. } => {
-            schema.fields.get(field_id.get() as usize).ok_or_else(|| {
-                IndexError::InvalidQuery("unknown EXISTS field".into())
-            })?;
+            schema
+                .fields
+                .get(field_id.get() as usize)
+                .ok_or_else(|| IndexError::InvalidQuery("unknown EXISTS field".into()))?;
             Ok(())
         }
         Predicate::FullText { field_id, .. } | Predicate::Phrase { field_id, .. } => {
@@ -491,10 +502,22 @@ fn validate_field_value(
     capability: FieldCapabilities,
 ) -> Result<(), IndexError> {
     let field = require_capability(schema, field_id, capability)?;
+    if value == &ScalarValue::Null {
+        return if field.allow_null {
+            Ok(())
+        } else {
+            Err(IndexError::InvalidQuery(
+                "query null requires a field which permits explicit null".into(),
+            ))
+        };
+    }
     validate_value_type(field.field_type, value)
 }
 
-fn validate_value_type(field_type: super::FieldType, value: &ScalarValue) -> Result<(), IndexError> {
+fn validate_value_type(
+    field_type: super::FieldType,
+    value: &ScalarValue,
+) -> Result<(), IndexError> {
     let valid = matches!(
         (field_type, value),
         (super::FieldType::Boolean, ScalarValue::Boolean(_))
@@ -602,6 +625,9 @@ pub struct NativeQueryPage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::v4::{
+        Cardinality, Collation, FieldComponents, FieldSchema, FieldType, IndexKind, IndexSemantics,
+    };
 
     fn cursor() -> NativeQueryCursor {
         NativeQueryCursor {
@@ -656,5 +682,51 @@ mod tests {
         let mut malformed = cursor().encode().unwrap();
         malformed[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(NativeQueryCursor::decode(&malformed).is_err());
+    }
+
+    fn nullable_exact_schema(allow_null: bool) -> Schema {
+        Schema {
+            kind: IndexKind::TypedJson,
+            path_prefix: "objects/".into(),
+            content_type_scope: Some("application/json".into()),
+            fields: vec![FieldSchema {
+                id: FieldId::new(0),
+                name: "state".into(),
+                source_selector: "/state".into(),
+                field_type: FieldType::Keyword,
+                cardinality: Cardinality::Single,
+                allow_missing: true,
+                allow_null,
+                collation: Collation::BinaryUtf8,
+                capabilities: FieldCapabilities::EXACT,
+                analyzer: None,
+                components: FieldComponents::TERMS,
+            }],
+            semantics: IndexSemantics::TypedJson,
+            physical_order: Vec::new(),
+            component_versions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn exact_null_requires_the_declared_null_policy() {
+        assert!(
+            validate_field_value(
+                &nullable_exact_schema(true),
+                FieldId::new(0),
+                &ScalarValue::Null,
+                FieldCapabilities::EXACT,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_field_value(
+                &nullable_exact_schema(false),
+                FieldId::new(0),
+                &ScalarValue::Null,
+                FieldCapabilities::EXACT,
+            )
+            .is_err()
+        );
     }
 }
