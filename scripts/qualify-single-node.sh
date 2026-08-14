@@ -4,7 +4,7 @@ set -Eeuo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${repo_root}/scripts/qualification-log-evidence.sh"
 source "${repo_root}/scripts/qualification-scale-evidence.sh"
-requested_image="${ANVIL_IMAGE:-anvil:0.8.2}"
+requested_image="${ANVIL_IMAGE:-anvil:0.9.0}"
 keep="${ANVIL_QUALIFICATION_KEEP:-0}"
 qualification_mode="${ANVIL_QUALIFICATION_MODE:-smoke}"
 index_disk_cache_bytes="${ANVIL_QUALIFICATION_INDEX_DISK_CACHE_BYTES:-1073741824}"
@@ -160,16 +160,16 @@ if [[ "${image_revision}" != "${source_commit}" ]]; then
 fi
 server_version="$(docker run --rm --platform "${platform}" "${image_id}" anvil-server --version)"
 client_version="$(docker run --rm --platform "${platform}" "${image_id}" anvil --version)"
-if [[ "${server_version}" != "anvil-server 0.8.2" \
-  || "${client_version}" != "anvil 0.8.2" ]]; then
-  echo "qualification requires the exact Anvil 0.8.2 image" >&2
+if [[ "${server_version}" != "anvil-server 0.9.0" \
+  || "${client_version}" != "anvil 0.9.0" ]]; then
+  echo "qualification requires the exact Anvil 0.9.0 image" >&2
   echo "server: ${server_version}" >&2
   echo "client: ${client_version}" >&2
   exit 2
 fi
-qualification_dir="$(mktemp -d /var/tmp/anvil-v080-single-qualification.XXXXXX)"
+qualification_dir="$(mktemp -d /var/tmp/anvil-v090-single-qualification.XXXXXX)"
 qualification_suffix="${qualification_dir##*.}"
-container_name="anvil-v080-single-${qualification_suffix}"
+container_name="anvil-v090-single-${qualification_suffix}"
 data_dir="${qualification_dir}/data"
 signing_key="${qualification_dir}/token-signing-key"
 index_verification_state="${qualification_dir}/index-verification-state.json"
@@ -177,9 +177,9 @@ index_qualification_log="${qualification_dir}/index-qualification.log"
 index_resource_qualification_log="${qualification_dir}/index-resource-qualification.log"
 index_resource_state="${qualification_dir}/index-resource-state.json"
 index_resource_bucket="index-resource-${qualification_suffix}"
-index_resource_report="/var/tmp/anvil-v080-single-index-resource-${qualification_suffix}.json"
-index_resource_observability_report="/var/tmp/anvil-v080-single-index-observability-${qualification_suffix}.json"
-index_resource_telemetry_prefix="/var/tmp/anvil-v080-single-index-telemetry-${qualification_suffix}"
+index_resource_report="/var/tmp/anvil-v090-single-index-resource-${qualification_suffix}.json"
+index_resource_observability_report="/var/tmp/anvil-v090-single-index-observability-${qualification_suffix}.json"
+index_resource_telemetry_prefix="/var/tmp/anvil-v090-single-index-telemetry-${qualification_suffix}"
 ANVIL_QUALIFICATION_STATE_DIR="${qualification_dir}"
 qualification_build_messages="${qualification_dir}/qualification-client-build.jsonl"
 container_started=0
@@ -202,7 +202,7 @@ cleanup() {
   if ((container_started == 1)); then
     docker rm --force "${container_name}" >/dev/null 2>&1 || true
   fi
-  if [[ "${qualification_dir}" == /var/tmp/anvil-v080-single-qualification.* ]]; then
+  if [[ "${qualification_dir}" == /var/tmp/anvil-v090-single-qualification.* ]]; then
     docker run --rm --user 0 \
       --volume "${qualification_dir}:/qualification" \
       "${image_id}" rm -rf \
@@ -310,8 +310,8 @@ start_single_node() {
   local -a profile_environment=()
   case "${profile}" in
     production-debt-default) ;;
-    four-run-compaction)
-      profile_environment=(--env ANVIL_INDEX_MAX_RUNS_PER_LEVEL=4)
+    four-segment-compaction)
+      profile_environment=(--env ANVIL_INDEX_MAX_SEGMENTS_PER_TIER=4)
       ;;
     *)
       echo "unsupported single-node qualification profile ${profile}" >&2
@@ -371,7 +371,7 @@ start_single_node() {
 }
 
 # Scale and release-performance evidence is captured with the RFC's default
-# compaction-debt limits. The four-run bound is installed only for the later
+# compaction-debt limits. The four-segment bound is installed only for the later
 # workload whose purpose is to force compaction for every public index kind.
 start_single_node production-debt-default
 
@@ -468,10 +468,9 @@ assert_each_index_kind_published_and_compacted() {
   local kind
   local message
   for kind in "${index_kinds[@]}"; do
-    for message in 'index generation published' 'index runs compacted'; do
+    for message in 'index generation published' 'format-v4 index segments compacted'; do
       if ! awk -v kind="index.kind=${kind}" -v message="${message}" '
-          index($0, kind) && index($0, message) &&
-          (message != "index runs compacted" || $0 ~ /histogram\.anvil_index_compaction_input_runs=([2-9]|[1-9][0-9]+)([[:space:]]|$)/) { found = 1 }
+          index($0, kind) && index($0, message) { found = 1 }
           END { exit !found }
         ' "${index_qualification_log}"
       then
@@ -479,6 +478,15 @@ assert_each_index_kind_published_and_compacted() {
         return 1
       fi
     done
+    if ! awk -v kind="index.kind=${kind}" '
+        index($0, kind) && index($0, "index compaction terminal metrics") &&
+        $0 ~ /histogram\.anvil_index_compaction_input_segments=([2-9]|[1-9][0-9]+)([[:space:]]|$)/ { found = 1 }
+        END { exit !found }
+      ' "${index_qualification_log}"
+    then
+      echo "${kind} emitted no terminal compaction evidence for at least two input segments" >&2
+      return 1
+    fi
   done
   echo "[anvil-single-qualification] all eight index kinds published and compacted from public mutations"
 }
@@ -685,7 +693,7 @@ assert_sparse_index_startup() {
 recreate_single_node() {
   local next_profile="$1"
   local completed_profile="$2"
-  local startup_evidence="/var/tmp/anvil-v080-single-startup-scans-${qualification_suffix}-${completed_profile}.log"
+  local startup_evidence="/var/tmp/anvil-v090-single-startup-scans-${qualification_suffix}-${completed_profile}.log"
 
   container_logs | preserve_startup_scan_evidence "${startup_evidence}"
   docker stop --timeout 30 "${container_name}" >/dev/null
@@ -718,21 +726,22 @@ run_index_resource_qualification() {
   ANVIL_V06_REQUIRE_RESOURCE_TARGETS=1 \
   ANVIL_V06_KIND_BUDGET_BYTES="${index_kind_budget_bytes}" \
   ANVIL_V06_INDEX_COMPACTION_MAX_LANES="${index_compaction_max_lanes}" \
+  ANVIL_V06_INDEX_PROJECTION_MAX_LANES="${index_projection_max_lanes}" \
   ANVIL_V06_INDEX_RAYON_WORKERS="${index_rayon_workers}" \
   ANVIL_V06_MAX_ANONYMOUS_GROWTH_BYTES="${index_resource_max_anonymous_growth_bytes}" \
-  ANVIL_V08_REQUIRE_PERFORMANCE_TARGETS="${require_performance_targets}" \
-  ANVIL_V08_EVIDENCE_SOURCE_COMMIT="${source_commit}" \
-  ANVIL_V08_EVIDENCE_CONTAINER_DIGEST="${image_id}" \
-  ANVIL_V08_EVIDENCE_NATIVE_ARCHITECTURE="${native_architecture}" \
-  ANVIL_V08_EVIDENCE_CONTAINER_PLATFORM="${container_platform}" \
-  ANVIL_V08_EVIDENCE_TOPOLOGY=single-node \
-  ANVIL_V08_EVIDENCE_NODE_COUNT=1 \
-  ANVIL_V08_EVIDENCE_HARDWARE_LOGICAL_CPUS="${hardware_logical_cpus}" \
-  ANVIL_V08_EVIDENCE_HARDWARE_MEMORY_BYTES="${hardware_memory_bytes}" \
-  ANVIL_V08_EVIDENCE_FILESYSTEM_TOTAL_BYTES="${qualification_filesystem_total_bytes}" \
-  ANVIL_V08_EVIDENCE_FILESYSTEM_AVAILABLE_BYTES="${qualification_filesystem_available_bytes}" \
-  ANVIL_V08_EVIDENCE_INDEX_DISK_CACHE_BYTES_PER_NODE="${index_disk_cache_bytes}" \
-  ANVIL_V08_EVIDENCE_INDEX_MEMORY_PERCENT_PER_NODE="${index_memory_percent}" \
+  ANVIL_V09_REQUIRE_PERFORMANCE_TARGETS="${require_performance_targets}" \
+  ANVIL_V09_EVIDENCE_SOURCE_COMMIT="${source_commit}" \
+  ANVIL_V09_EVIDENCE_CONTAINER_DIGEST="${image_id}" \
+  ANVIL_V09_EVIDENCE_NATIVE_ARCHITECTURE="${native_architecture}" \
+  ANVIL_V09_EVIDENCE_CONTAINER_PLATFORM="${container_platform}" \
+  ANVIL_V09_EVIDENCE_TOPOLOGY=single-node \
+  ANVIL_V09_EVIDENCE_NODE_COUNT=1 \
+  ANVIL_V09_EVIDENCE_HARDWARE_LOGICAL_CPUS="${hardware_logical_cpus}" \
+  ANVIL_V09_EVIDENCE_HARDWARE_MEMORY_BYTES="${hardware_memory_bytes}" \
+  ANVIL_V09_EVIDENCE_FILESYSTEM_TOTAL_BYTES="${qualification_filesystem_total_bytes}" \
+  ANVIL_V09_EVIDENCE_FILESYSTEM_AVAILABLE_BYTES="${qualification_filesystem_available_bytes}" \
+  ANVIL_V09_EVIDENCE_INDEX_DISK_CACHE_BYTES_PER_NODE="${index_disk_cache_bytes}" \
+  ANVIL_V09_EVIDENCE_INDEX_MEMORY_PERCENT_PER_NODE="${index_memory_percent}" \
   ANVIL_V06_RESOURCE_OUTPUT="${index_resource_report}" \
   ANVIL_V06_RESOURCE_STATE_OUTPUT="${index_resource_state}" \
     "${qualification_example_binaries[v06_index_resource_qualification]}" \
@@ -780,6 +789,7 @@ run_index_resource_qualification() {
     --argjson memory_percent "${index_memory_percent}" \
     --argjson kind_budget_bytes "${index_kind_budget_bytes}" \
     --argjson compaction_lanes "${index_compaction_max_lanes}" \
+    --argjson projection_lanes "${index_projection_max_lanes}" \
     --argjson rayon_workers "${index_rayon_workers}" \
     --argjson maximum_growth "${index_resource_max_anonymous_growth_bytes}" \
     --argjson performance_targets_required "${require_performance_targets}" \
@@ -809,6 +819,9 @@ run_index_resource_qualification() {
       .evidence.resource_configuration.index_memory_percent_per_node == $memory_percent and
       .evidence.resource_configuration.builder_memory_bytes_per_kind_per_node == $kind_budget_bytes and
       .evidence.resource_configuration.compaction_max_lanes_per_kind == $compaction_lanes and
+      .evidence.resource_configuration.projection_max_lanes_per_kind == $projection_lanes and
+      .evidence.resource_configuration.projection_max_lanes_per_kind ==
+        .evidence.resource_configuration.rayon_workers_per_node and
       .evidence.resource_configuration.rayon_workers_per_node == $rayon_workers and
       .evidence.resource_configuration.maximum_anonymous_growth_bytes == $maximum_growth and
       .evidence.resource_configuration.monitored_target_count == 1 and
@@ -821,6 +834,30 @@ run_index_resource_qualification() {
       .evidence.correctness.final_exact_partition_verification == true and
       .evidence.correctness.update_and_delete_verification == true and
       .evidence.correctness.resource_limits_passed == true and
+      .production_query_regression.schema == "anvil.index-production-query-regression.v1" and
+      .production_query_regression.corpus_records == .records and
+      .production_query_regression.index_id > 0 and
+      .production_query_regression.definition_version > 0 and
+      .production_query_regression.generation > 0 and
+      .production_query_regression.physical_order == ["modified_day DESC", "record_id ASC"] and
+      .production_query_regression.incident_predicates == [
+        "withdrawn = false",
+        "active = true",
+        "ecosystem IN (cargo, npm, pypi)"
+      ] and
+      .production_query_regression.limit_four.returned_hits == 4 and
+      .production_query_regression.limit_four.exact_order == true and
+      .production_query_regression.consecutive_pages.requested_page_size == 999 and
+      .production_query_regression.consecutive_pages.page_one_hits == 999 and
+      .production_query_regression.consecutive_pages.page_two_hits == 999 and
+      .production_query_regression.consecutive_pages.continuation_token_bytes > 0 and
+      .production_query_regression.consecutive_pages.page_two_used_page_one_token == true and
+      .production_query_regression.consecutive_pages.exact_order == true and
+      .production_query_regression.consecutive_pages.overlap == 0 and
+      .production_query_regression.zero_hit_sparse_conjunction.returned_hits == 0 and
+      .production_query_regression.zero_hit_sparse_conjunction.exact_order == true and
+      .production_query_regression.unselective_arbitrary_sort.returned_hits == 4 and
+      .production_query_regression.unselective_arbitrary_sort.exact_order == true and
       .evidence.correctness.performance_targets_required == ($performance_targets_required == 1) and
       (if $performance_targets_required == 1
        then .evidence.correctness.performance_targets_passed == true
@@ -848,7 +885,7 @@ verify_index_resource_state() {
     "${qualification_example_binaries[v06_index_resource_qualification]}"
 }
 
-assert_four_run_typed_json_compaction_observability() {
+assert_four_segment_typed_json_compaction_observability() {
   local telemetry_log="$1"
   local active
   local budget_limit
@@ -904,7 +941,7 @@ assert_four_run_typed_json_compaction_observability() {
       || failures != 0)) \
       || unsigned_decimal_less_than "${range_limit}" "${effective}"
     then
-      echo "four-run TypedJson compaction proof emitted inconsistent terminal telemetry" >&2
+      echo "four-segment TypedJson compaction proof emitted inconsistent terminal telemetry" >&2
       printf '%s\n' "${line}" >&2
       return 1
     fi
@@ -932,7 +969,7 @@ assert_four_run_typed_json_compaction_observability() {
       "${telemetry_log}" || true
   )
   if ((terminal_found == 0)); then
-    echo "four-run TypedJson compaction proof emitted no completed ${index_compaction_max_lanes}-lane compaction" >&2
+    echo "four-segment TypedJson compaction proof emitted no completed ${index_compaction_max_lanes}-lane compaction" >&2
     return 1
   fi
 
@@ -959,10 +996,10 @@ assert_four_run_typed_json_compaction_observability() {
     grep -F 'index compaction progress' "${telemetry_log}" || true
   )
   if ((production_compaction_peak_active_lanes < 2)); then
-    echo "four-run TypedJson compaction proof showed no concurrent compaction" >&2
+    echo "four-segment TypedJson compaction proof showed no concurrent compaction" >&2
     return 1
   fi
-  echo "[anvil-single-qualification] four-run TypedJson compaction used ${production_compaction_effective_lanes} effective lanes with ${production_compaction_peak_active_lanes} concurrently active"
+  echo "[anvil-single-qualification] four-segment TypedJson compaction used ${production_compaction_effective_lanes} effective lanes with ${production_compaction_peak_active_lanes} concurrently active"
 }
 
 assert_production_runtime_observability() {
@@ -1024,10 +1061,10 @@ assert_production_runtime_observability() {
 write_index_resource_observability_report() {
   printf '%s\n' \
     '{' \
-    '  "schema": "anvil.index-resource-observability.v1",' \
+    '  "schema": "anvil.index-resource-observability.v2",' \
     '  "index_kind": "TypedJson",' \
     '  "resource_profile": "production-compaction-debt-defaults",' \
-    '  "compaction_profile": "four-run-compaction",' \
+    '  "compaction_profile": "four-segment-compaction",' \
     "  \"configured_lanes\": ${production_compaction_configured_lanes}," \
     "  \"worker_limit\": ${production_compaction_worker_limit}," \
     "  \"budget_limit\": ${production_compaction_budget_limit}," \
@@ -1099,13 +1136,14 @@ assert_all_kind_index_resource_bounds() {
       || return 1
     workspace="$(log_unsigned_field gauge.anvil_index_construction_workspace_bytes "${line}")" \
       || return 1
-    if ((resident == 0 || resident + workspace > index_kind_budget_bytes)); then
+    if ((resident == 0 || workspace == 0 || resident > workspace \
+      || workspace > index_kind_budget_bytes)); then
       echo "${kind} emitted out-of-budget construction residency/workspace evidence" >&2
       printf '%s\n' "${line}" >&2
       return 1
     fi
     resident_kinds["${kind}"]=1
-  done < <(grep -F 'index L0 run flushed' "${index_qualification_log}" || true)
+  done < <(grep -F 'format-v4 index segment flushed' "${index_qualification_log}" || true)
   for kind in "${index_kinds[@]}"; do
     if [[ -z "${resident_kinds[${kind}]:-}" ]]; then
       echo "single-node qualification emitted no ${kind} construction residency/workspace evidence" >&2
@@ -1117,7 +1155,7 @@ assert_all_kind_index_resource_bounds() {
 assert_index_resource_bounds() {
   local debt_byte_limit
   local debt_evidence
-  local debt_run_limit
+  local debt_segment_limit
   local configured
   local leased
   local line
@@ -1162,20 +1200,21 @@ assert_index_resource_bounds() {
       || return 1
     workspace="$(log_unsigned_field gauge.anvil_index_construction_workspace_bytes "${line}")" \
       || return 1
-    if ((resident == 0 || resident + workspace > index_kind_budget_bytes)); then
+    if ((resident == 0 || workspace == 0 || resident > workspace \
+      || workspace > index_kind_budget_bytes)); then
       echo "production-shaped TypedJson build exceeded its residency/workspace budget" >&2
       printf '%s\n' "${line}" >&2
       return 1
     fi
     resource_residency_evidence=$((resource_residency_evidence + 1))
-  done < <(grep -F 'index L0 run flushed' "${index_resource_qualification_log}" || true)
+  done < <(grep -F 'format-v4 index segment flushed' "${index_resource_qualification_log}" || true)
   if ((resource_residency_evidence == 0)); then
     echo "production-shaped TypedJson build emitted no fresh residency/workspace evidence" >&2
     return 1
   fi
-  read -r debt_run_limit debt_byte_limit debt_evidence \
+  read -r debt_segment_limit debt_byte_limit debt_evidence \
     < <(terminal_typed_json_debt "${index_resource_telemetry_prefix}")
-  if ((debt_run_limit == 0 || debt_byte_limit == 0 || debt_evidence == 0)); then
+  if ((debt_segment_limit == 0 || debt_byte_limit == 0 || debt_evidence == 0)); then
     echo "production-shaped TypedJson build emitted invalid terminal debt evidence" >&2
     return 1
   fi
@@ -1217,7 +1256,7 @@ restart_populated_node() {
   public_endpoint="$(published_endpoint 50051 public)"
   elapsed=$((SECONDS - started))
   container_logs | preserve_startup_scan_evidence \
-    "/var/tmp/anvil-v080-single-startup-scans-${qualification_suffix}.log"
+    "/var/tmp/anvil-v090-single-startup-scans-${qualification_suffix}.log"
   assert_sparse_index_startup "$((before + 1))"
   verify_existing_indexes
   verify_index_resource_state
@@ -1510,20 +1549,20 @@ esac
 run_exact_resource_scale_qualification single
 verify_index_resource_state
 
-# Four runs per level is deliberately more aggressive than the production
+# Four segments per tier is deliberately more aggressive than the production
 # default. Recreate the same persisted node with it only to force compaction in
 # the public all-eight-kind workload, then return to production defaults.
-recreate_single_node four-run-compaction production-debt-default
+recreate_single_node four-segment-compaction production-debt-default
 verify_index_resource_state
 run_index_qualification
 verify_index_resource_state
 assert_all_kind_index_resource_bounds
 if [[ "${qualification_mode}" == "release" ]]; then
-  assert_four_run_typed_json_compaction_observability \
+  assert_four_segment_typed_json_compaction_observability \
     "${index_qualification_log}"
   write_index_resource_observability_report
 fi
-recreate_single_node production-debt-default four-run-compaction
+recreate_single_node production-debt-default four-segment-compaction
 verify_index_resource_state
 verify_existing_indexes
 

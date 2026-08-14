@@ -1,10 +1,12 @@
-//! Production-shaped public-API qualification for Anvil's 0.6 index builder.
+//! Production-shaped public-API qualification for Anvil's 0.9 native segment builder.
 //!
 //! The generated corpus deliberately resembles a broad, small-JSON indexing
 //! workload without embedding any private schema or source data.
 
 #[path = "v06_index_resource_qualification/data.rs"]
 mod data;
+#[path = "v06_index_resource_qualification/incident.rs"]
+mod incident;
 #[path = "v06_index_resource_qualification/resource.rs"]
 mod resource;
 #[path = "v06_index_resource_qualification/singleton_probe.rs"]
@@ -78,6 +80,7 @@ struct Config {
     require_resource_targets: bool,
     configured_kind_budget_bytes: Option<u64>,
     configured_compaction_max_lanes: Option<usize>,
+    configured_projection_max_lanes: Option<usize>,
     configured_rayon_workers: Option<usize>,
     max_anonymous_growth_bytes: Option<u64>,
     require_performance_targets: bool,
@@ -128,6 +131,7 @@ struct QualificationReport {
     final_live_objects: u64,
     configured_kind_budget_bytes: Option<u64>,
     configured_compaction_max_lanes: Option<usize>,
+    configured_projection_max_lanes: Option<usize>,
     configured_rayon_workers: Option<usize>,
     max_anonymous_growth_bytes: Option<u64>,
     observed_peak_rss_growth_bytes: Option<u64>,
@@ -137,6 +141,7 @@ struct QualificationReport {
     initial_generation: u64,
     final_generation: u64,
     timings: Timings,
+    production_query_regression: incident::IncidentReport,
     resources: Option<ResourceReport>,
     evidence: QualificationEvidence,
 }
@@ -204,6 +209,7 @@ struct ResourceConfigurationEvidence {
     index_memory_percent_per_node: u64,
     builder_memory_bytes_per_kind_per_node: u64,
     compaction_max_lanes_per_kind: usize,
+    projection_max_lanes_per_kind: usize,
     rayon_workers_per_node: usize,
     maximum_anonymous_growth_bytes: u64,
     resource_sample_interval_milliseconds: u64,
@@ -270,7 +276,7 @@ enum MutationMode {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
-    if let Some(path) = env::var_os("ANVIL_V08_RESOURCE_SINGLETON_PROBE_STATE_INPUT") {
+    if let Some(path) = env::var_os("ANVIL_V09_RESOURCE_SINGLETON_PROBE_STATE_INPUT") {
         return singleton_probe::run(Path::new(&path)).await;
     }
     if let Some(path) = env::var_os("ANVIL_V06_RESOURCE_STATE_INPUT") {
@@ -307,8 +313,10 @@ async fn main() -> Result<()> {
                         .map(|(name, json_pointer)| IndexField {
                             name: name.into(),
                             json_pointer: json_pointer.into(),
+                            multi_valued: false,
                         })
                         .collect(),
+                    physical_order: incident::physical_order(),
                 })),
             }),
             command_id: "v06-resource-create-index".into(),
@@ -415,6 +423,20 @@ async fn main() -> Result<()> {
 
     token = qualification_token(&config, channels[0].clone()).await?;
     index = index_client(channels[0].clone(), &token)?;
+    set_phase(&monitor, Phase::IncidentQuery);
+    let production_query_regression = incident::run(
+        &mut index,
+        &config.bucket,
+        config.seed,
+        config.records,
+        &initial_versions,
+        config.endpoints.len(),
+    )
+    .await?;
+
+    token = qualification_token(&config, channels[0].clone()).await?;
+    index = index_client(channels[0].clone(), &token)?;
+    set_phase(&monitor, Phase::WarmQuery);
     let started = Instant::now();
     let (initial_count, initial_generation, _) = verify_every_partition(
         &index,
@@ -545,6 +567,7 @@ async fn main() -> Result<()> {
         final_live_objects: final_live,
         configured_kind_budget_bytes: config.configured_kind_budget_bytes,
         configured_compaction_max_lanes: config.configured_compaction_max_lanes,
+        configured_projection_max_lanes: config.configured_projection_max_lanes,
         configured_rayon_workers: config.configured_rayon_workers,
         max_anonymous_growth_bytes: config.max_anonymous_growth_bytes,
         observed_peak_rss_growth_bytes,
@@ -554,6 +577,7 @@ async fn main() -> Result<()> {
         initial_generation,
         final_generation,
         timings,
+        production_query_regression,
         resources,
         evidence,
     };
@@ -612,13 +636,19 @@ impl Config {
         let configured_kind_budget_bytes = optional_number("ANVIL_V06_KIND_BUDGET_BYTES")?;
         let configured_compaction_max_lanes =
             optional_number("ANVIL_V06_INDEX_COMPACTION_MAX_LANES")?;
+        let configured_projection_max_lanes =
+            optional_number("ANVIL_V06_INDEX_PROJECTION_MAX_LANES")?;
         let configured_rayon_workers = optional_number("ANVIL_V06_INDEX_RAYON_WORKERS")?;
         let max_anonymous_growth_bytes = optional_number("ANVIL_V06_MAX_ANONYMOUS_GROWTH_BYTES")?;
-        let require_performance_targets = boolean("ANVIL_V08_REQUIRE_PERFORMANCE_TARGETS", false)?;
+        let require_performance_targets = boolean("ANVIL_V09_REQUIRE_PERFORMANCE_TARGETS", false)?;
         let evidence = EvidenceConfig::from_env(endpoints.len())?;
         ensure!(
             configured_compaction_max_lanes.is_none_or(|lanes| lanes > 0),
             "ANVIL_V06_INDEX_COMPACTION_MAX_LANES must be non-zero when configured"
+        );
+        ensure!(
+            configured_projection_max_lanes.is_none_or(|lanes| lanes > 0),
+            "ANVIL_V06_INDEX_PROJECTION_MAX_LANES must be non-zero when configured"
         );
         if require_resource_targets {
             ensure!(
@@ -632,6 +662,10 @@ impl Config {
             ensure!(
                 configured_rayon_workers.is_some_and(|workers| workers > 0),
                 "resource qualification requires a non-zero ANVIL_V06_INDEX_RAYON_WORKERS"
+            );
+            ensure!(
+                configured_projection_max_lanes == configured_rayon_workers,
+                "resource qualification requires projection lanes to equal Rayon workers"
             );
             ensure!(
                 max_anonymous_growth_bytes.is_some(),
@@ -655,6 +689,7 @@ impl Config {
             require_resource_targets,
             configured_kind_budget_bytes,
             configured_compaction_max_lanes,
+            configured_projection_max_lanes,
             configured_rayon_workers,
             max_anonymous_growth_bytes,
             require_performance_targets,
@@ -667,31 +702,31 @@ impl Config {
 
 impl EvidenceConfig {
     fn from_env(ingress_endpoint_count: usize) -> Result<Self> {
-        let source_commit = required("ANVIL_V08_EVIDENCE_SOURCE_COMMIT")?;
+        let source_commit = required("ANVIL_V09_EVIDENCE_SOURCE_COMMIT")?;
         ensure!(
             source_commit.len() == 40 && source_commit.bytes().all(|byte| byte.is_ascii_hexdigit()),
-            "ANVIL_V08_EVIDENCE_SOURCE_COMMIT must be a full Git commit ID"
+            "ANVIL_V09_EVIDENCE_SOURCE_COMMIT must be a full Git commit ID"
         );
-        let resolved_container_digest = required("ANVIL_V08_EVIDENCE_CONTAINER_DIGEST")?;
+        let resolved_container_digest = required("ANVIL_V09_EVIDENCE_CONTAINER_DIGEST")?;
         let digest_hex = resolved_container_digest
             .strip_prefix("sha256:")
-            .context("ANVIL_V08_EVIDENCE_CONTAINER_DIGEST must use sha256")?;
+            .context("ANVIL_V09_EVIDENCE_CONTAINER_DIGEST must use sha256")?;
         ensure!(
             digest_hex.len() == 64 && digest_hex.bytes().all(|byte| byte.is_ascii_hexdigit()),
-            "ANVIL_V08_EVIDENCE_CONTAINER_DIGEST must be a complete sha256 digest"
+            "ANVIL_V09_EVIDENCE_CONTAINER_DIGEST must be a complete sha256 digest"
         );
-        let native_architecture = required("ANVIL_V08_EVIDENCE_NATIVE_ARCHITECTURE")?;
+        let native_architecture = required("ANVIL_V09_EVIDENCE_NATIVE_ARCHITECTURE")?;
         ensure!(
             !native_architecture.trim().is_empty(),
             "native architecture evidence must not be empty"
         );
-        let container_platform = required("ANVIL_V08_EVIDENCE_CONTAINER_PLATFORM")?;
+        let container_platform = required("ANVIL_V09_EVIDENCE_CONTAINER_PLATFORM")?;
         ensure!(
             matches!(container_platform.as_str(), "linux/amd64" | "linux/arm64"),
             "container platform evidence must be linux/amd64 or linux/arm64"
         );
-        let topology = required("ANVIL_V08_EVIDENCE_TOPOLOGY")?;
-        let node_count = required_number("ANVIL_V08_EVIDENCE_NODE_COUNT")?;
+        let topology = required("ANVIL_V09_EVIDENCE_TOPOLOGY")?;
+        let node_count = required_number("ANVIL_V09_EVIDENCE_NODE_COUNT")?;
         ensure!(
             matches!(
                 (topology.as_str(), node_count),
@@ -703,16 +738,16 @@ impl EvidenceConfig {
             ingress_endpoint_count == node_count,
             "topology node count must equal the number of qualification ingress endpoints"
         );
-        let hardware_logical_cpus = required_number("ANVIL_V08_EVIDENCE_HARDWARE_LOGICAL_CPUS")?;
-        let hardware_memory_bytes = required_number("ANVIL_V08_EVIDENCE_HARDWARE_MEMORY_BYTES")?;
+        let hardware_logical_cpus = required_number("ANVIL_V09_EVIDENCE_HARDWARE_LOGICAL_CPUS")?;
+        let hardware_memory_bytes = required_number("ANVIL_V09_EVIDENCE_HARDWARE_MEMORY_BYTES")?;
         let qualification_filesystem_total_bytes =
-            required_number("ANVIL_V08_EVIDENCE_FILESYSTEM_TOTAL_BYTES")?;
+            required_number("ANVIL_V09_EVIDENCE_FILESYSTEM_TOTAL_BYTES")?;
         let qualification_filesystem_available_bytes_at_start =
-            required_number("ANVIL_V08_EVIDENCE_FILESYSTEM_AVAILABLE_BYTES")?;
+            required_number("ANVIL_V09_EVIDENCE_FILESYSTEM_AVAILABLE_BYTES")?;
         let index_disk_cache_bytes_per_node =
-            required_number("ANVIL_V08_EVIDENCE_INDEX_DISK_CACHE_BYTES_PER_NODE")?;
+            required_number("ANVIL_V09_EVIDENCE_INDEX_DISK_CACHE_BYTES_PER_NODE")?;
         let index_memory_percent_per_node =
-            required_number("ANVIL_V08_EVIDENCE_INDEX_MEMORY_PERCENT_PER_NODE")?;
+            required_number("ANVIL_V09_EVIDENCE_INDEX_MEMORY_PERCENT_PER_NODE")?;
         ensure!(
             hardware_logical_cpus > 0
                 && hardware_memory_bytes > 0
@@ -752,6 +787,9 @@ fn qualification_evidence(
     let compaction_max_lanes_per_kind = config
         .configured_compaction_max_lanes
         .context("qualification evidence requires the configured compaction lane limit")?;
+    let projection_max_lanes_per_kind = config
+        .configured_projection_max_lanes
+        .context("qualification evidence requires the configured projection lane limit")?;
     let rayon_workers_per_node = config
         .configured_rayon_workers
         .context("qualification evidence requires the configured Rayon worker count")?;
@@ -801,6 +839,7 @@ fn qualification_evidence(
             index_memory_percent_per_node: evidence.index_memory_percent_per_node,
             builder_memory_bytes_per_kind_per_node,
             compaction_max_lanes_per_kind,
+            projection_max_lanes_per_kind,
             rayon_workers_per_node,
             maximum_anonymous_growth_bytes,
             resource_sample_interval_milliseconds: 100,

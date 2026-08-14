@@ -188,7 +188,7 @@ pub(super) async fn run(state_path: &Path) -> Result<()> {
         returned_hits: response.hits.len(),
         object_version: hit.object_version,
     };
-    let output = required("ANVIL_V08_RESOURCE_SINGLETON_PROBE_OUTPUT")?;
+    let output = required("ANVIL_V09_RESOURCE_SINGLETON_PROBE_OUTPUT")?;
     let encoded = serde_json::to_vec_pretty(&report)?;
     std::fs::write(&output, &encoded).with_context(|| format!("write probe report {output}"))?;
     println!("{}", String::from_utf8(encoded).expect("JSON is UTF-8"));
@@ -202,7 +202,7 @@ fn validate_state(state: &VerificationState) -> Result<()> {
     // This qualification workflow deletes a range immediately before its
     // equally-sized trailing update range. The inequality proves record zero
     // was neither deleted nor updated and therefore has one posting in the
-    // final bounded run set.
+    // final bounded segment set.
     let deleted = state.records - state.final_live_objects;
     ensure!(state.records > deleted.saturating_mul(2));
     Ok(())

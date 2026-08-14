@@ -204,7 +204,7 @@ preserve_all_kind_telemetry() {
   local topology="$2"
   local suffix="$3"
   local node="${4:-}"
-  local destination="/var/tmp/anvil-v080-${topology}-all-kind-telemetry-${suffix}"
+  local destination="/var/tmp/anvil-v090-${topology}-all-kind-telemetry-${suffix}"
   [[ -n "${node}" ]] && destination="${destination}-${node}"
   preserve_qualification_log "${source}" "${destination}.log"
 }

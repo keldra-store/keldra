@@ -20,6 +20,7 @@ pub enum Phase {
     WarmQuery = 4,
     Mutation = 5,
     IncrementalBuild = 6,
+    IncidentQuery = 7,
 }
 
 impl Phase {
@@ -31,6 +32,7 @@ impl Phase {
             4 => Self::WarmQuery,
             5 => Self::Mutation,
             6 => Self::IncrementalBuild,
+            7 => Self::IncidentQuery,
             _ => Self::Ingest,
         }
     }

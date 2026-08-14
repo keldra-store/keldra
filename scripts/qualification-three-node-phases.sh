@@ -3,6 +3,91 @@
 # Three-node qualification phase transitions. The caller provides compose,
 # readiness, image, startup-evidence, and log helpers in its shell.
 
+assert_compaction_telemetry_for_kind() {
+  local kind="$1"
+  local log="$2"
+  local budget_limit
+  local completed
+  local configured
+  local effective
+  local expected
+  local input_segments
+  local line
+  local observed=0
+  local peak_active
+  local range_limit
+  local ranges
+  local worker_limit
+  while IFS= read -r line; do
+    configured="$(log_unsigned_field gauge.anvil_index_compaction_configured_lanes "${line}")" \
+      || continue
+    worker_limit="$(log_unsigned_field gauge.anvil_index_compaction_worker_limit "${line}")" \
+      || return 1
+    budget_limit="$(log_unsigned_field gauge.anvil_index_compaction_budget_limit "${line}")" \
+      || return 1
+    effective="$(log_unsigned_field compaction.effective_lanes "${line}")" \
+      || return 1
+    range_limit="$(log_unsigned_field gauge.anvil_index_compaction_range_limit "${line}")" \
+      || return 1
+    ranges="$(log_unsigned_field gauge.anvil_index_compaction_ranges_total "${line}")" \
+      || return 1
+    completed="$(log_unsigned_field gauge.anvil_index_compaction_ranges_completed "${line}")" \
+      || return 1
+    peak_active="$(log_unsigned_field gauge.anvil_index_compaction_peak_active_lanes "${line}")" \
+      || return 1
+    input_segments="$(log_unsigned_field histogram.anvil_index_compaction_input_segments "${line}")" \
+      || return 1
+    expected="${index_compaction_max_lanes}"
+    ((worker_limit < expected)) && expected="${worker_limit}"
+    ((budget_limit < expected)) && expected="${budget_limit}"
+    if unsigned_decimal_less_than "${range_limit}" "${expected}"; then
+      expected="${range_limit}"
+    fi
+    if ((configured != index_compaction_max_lanes \
+      || worker_limit != index_rayon_workers \
+      || budget_limit < 1 \
+      || input_segments < 2 \
+      || ranges < 1 \
+      || effective != expected \
+      || peak_active < 1 \
+      || peak_active > effective \
+      || completed != ranges)) \
+      || ! unsigned_decimal_is_positive "${range_limit}" \
+      || [[ "${line}" != *"anvil.index.compaction"* ]]
+    then
+      echo "${kind} emitted inconsistent bounded distributed compaction telemetry" >&2
+      printf '%s\n' "${line}" >&2
+      return 1
+    fi
+    observed=$((observed + (effective >= 2 && peak_active >= 2)))
+  done < <(
+    awk -v kind="index.kind=${kind}" '
+      index($0, kind) && index($0, "index compaction terminal metrics")
+    ' "${log}"
+  )
+  if ((observed == 0)); then
+    echo "${kind} emitted no terminal compaction with at least two effective and concurrently active lanes" >&2
+    return 1
+  fi
+  if ! awk -v kind="index.kind=${kind}" '
+      index($0, kind) && index($0, "anvil.index.builder") &&
+      index($0, "index builder phase finished") { found = 1 }
+      END { exit !found }
+    ' "${log}"
+  then
+    echo "${kind} emitted no distributed builder trace and completion log" >&2
+    return 1
+  fi
+  if ! awk -v kind="index.kind=${kind}" '
+      index($0, kind) && index($0, "format-v4 index segments compacted") { found = 1 }
+      END { exit !found }
+    ' "${log}"
+  then
+    echo "${kind} emitted no successful format-v4 segment-compaction event" >&2
+    return 1
+  fi
+}
+
 preserve_journal_pressure_evidence() {
   local destination_prefix="$1"
   local node
@@ -546,7 +631,7 @@ prepare_indexed_membership_cutover_qualification() {
         membership_cutover_index_source_tail="${tail}"
         preserve_qualification_log \
           "${builder_log}" \
-          "/var/tmp/anvil-v080-three-membership-indexed-pending-${qualification_suffix}-${builder}.log"
+          "/var/tmp/anvil-v090-three-membership-indexed-pending-${qualification_suffix}-${builder}.log"
         echo "[anvil-qualification] Path index ${membership_cutover_index_id} has accepted effect ${membership_cutover_index_path}@${membership_cutover_index_version} pending at source ${source_node_id} tail ${tail}; old-fence builder ${builder} is paused with no later publication"
         return 0
       fi
@@ -647,7 +732,7 @@ wait_for_indexed_cutover_effect() {
       for node in anvil-1 anvil-2 anvil-3; do
         preserve_qualification_log \
           "${ANVIL_QUALIFICATION_DIR}/artifacts/membership-indexed-query-${node}.json" \
-          "/var/tmp/anvil-v080-three-membership-indexed-query-${qualification_suffix}-${node}.json"
+          "/var/tmp/anvil-v090-three-membership-indexed-query-${qualification_suffix}-${node}.json"
       done
       return 0
     fi
@@ -747,7 +832,7 @@ qualify_no_event_membership_cutover() {
   save_log_suffix "${node}" "${membership_cutover_source_log_start}" "${evidence}"
   preserve_qualification_log \
     "${evidence}" \
-    "/var/tmp/anvil-v080-three-membership-no-event-${qualification_suffix}-${node}.log"
+    "/var/tmp/anvil-v090-three-membership-no-event-${qualification_suffix}-${node}.log"
   if [[ -n "${membership_cutover_index_id}" ]]; then
     echo "[anvil-qualification] indexed cutover preserved Path index ${membership_cutover_index_id}, made ${membership_cutover_index_path}@${membership_cutover_index_version} visible in generation ${membership_cutover_index_generation_after}, and proved three-source zero-lag freshness under the exact three-ACTIVE-node fence"
   fi

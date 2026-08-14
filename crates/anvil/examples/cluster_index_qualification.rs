@@ -14,10 +14,11 @@ use anvil_storage::v1::put_header::Operation as PutOperationValue;
 use anvil_storage::v1::{
     CreateApplicationRequest, CreateBucketRequest, CreateIndexRequest, DeleteRequest, Durability,
     FullTextField, FullTextIndexQuery, FullTextIndexSpec, GetIndexRequest, GitSourceIndexQuery,
-    GitSourceIndexSpec, HybridIndexQuery, HybridIndexSpec, IndexField, IndexFreshness,
-    IndexPredicate, IndexPredicateOperator, IndexQuery, IndexQueryHit, IndexSpecification,
-    MetadataFilterIndexQuery, MetadataFilterIndexSpec, ObjectAddress, ObjectVersioning,
-    PathIndexQuery, PathIndexSpec, PutHeader, PutOperation, QueryIndexRequest, QueryIndexResponse,
+    GitSourceIndexSpec, HybridIndexQuery, HybridIndexSpec, IndexDefinition, IndexField,
+    IndexFreshness, IndexOrder, IndexOrderDirection, IndexPredicate, IndexPredicateOperator,
+    IndexQuery, IndexQueryHit, IndexSpecification, MetadataFilterIndexQuery,
+    MetadataFilterIndexSpec, ObjectAddress, ObjectVersioning, PathIndexQuery, PathIndexSpec,
+    PutHeader, PutOperation, QueryIndexRequest, QueryIndexResponse, RebuildIndexRequest,
     SetBucketPublicReadRequest, TensorIndexQuery, TensorIndexSpec, TypedJsonIndexQuery,
     TypedJsonIndexSpec, VectorIndexQuery, VectorIndexSpec, VectorMetric,
 };
@@ -31,6 +32,9 @@ use tonic::metadata::MetadataValue;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 use tonic::{Code, Request};
+
+#[path = "cluster_index_qualification/definition_lifecycle.rs"]
+mod definition_lifecycle;
 
 type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 type IndexClient = IndexServiceClient<InterceptedService<Channel, BearerToken>>;
@@ -227,6 +231,7 @@ async fn main() -> TestResult<()> {
             endpoints.len(),
         )
         .await?;
+        require_physical_order(case, &responses, false)?;
         require_checkpoint_advance(before, require_freshness(&responses[0])?, endpoints.len())?;
         first_generations.push(responses[0].clone());
     }
@@ -241,7 +246,8 @@ async fn main() -> TestResult<()> {
             let paged =
                 collect_paginated_paths(client, case, require_freshness(expected_response)?)
                     .await?;
-            if paged != expected {
+            let paged_set = paged.iter().cloned().collect::<BTreeSet<_>>();
+            if paged_set != expected || !physical_order_matches(case, &paged, false) {
                 return Err(invalid(format!(
                     "{} pagination returned {paged:?}, expected {expected:?}",
                     case.name
@@ -423,6 +429,19 @@ async fn main() -> TestResult<()> {
     mutation_generations[tensor_position] = responses[0].clone();
     final_hit_versions[tensor_position] = 0;
 
+    for position in 0..cases.len() {
+        let (definition, response) = qualify_explicit_rebuild(
+            &mut indexes,
+            &cases[position],
+            &definitions[position],
+            &mutation_generations[position],
+            endpoints.len(),
+        )
+        .await?;
+        definitions[position] = definition;
+        mutation_generations[position] = response;
+    }
+
     let state_output = env::var_os("ANVIL_INDEX_QUALIFICATION_STATE_OUTPUT");
     if state_output.is_some()
         || env::var("ANVIL_INDEX_QUALIFICATION_REQUIRE_QUIESCENCE").is_ok_and(|value| value == "1")
@@ -449,14 +468,107 @@ async fn main() -> TestResult<()> {
         )?;
     }
 
+    definition_lifecycle::qualify(&mut administrators, &mut indexes, &cases).await?;
+
     println!(
-        "index qualification passed on {} node(s): {} engines, {} public mutations, {} compaction waves",
+        "index qualification passed on {} node(s): {} engines, {} public mutations, {} definition update/delete lifecycles, {} compaction waves",
         endpoints.len(),
         cases.len(),
         write_number,
+        cases.len(),
         COMPACTION_WAVES,
     );
     Ok(())
+}
+
+async fn qualify_explicit_rebuild(
+    clients: &mut [IndexClient],
+    case: &EngineCase,
+    definition: &IndexDefinition,
+    before: &QueryIndexResponse,
+    expected_sources: usize,
+) -> TestResult<(IndexDefinition, QueryIndexResponse)> {
+    let rebuilt = clients[0]
+        .rebuild_index(RebuildIndexRequest {
+            bucket: case.bucket.into(),
+            name: case.name.into(),
+            expected_version: definition.version,
+            command_id: format!("qualification-rebuild-{}", case.name),
+        })
+        .await?
+        .into_inner();
+    if rebuilt.index_id != definition.index_id
+        || rebuilt.bucket != definition.bucket
+        || rebuilt.name != definition.name
+        || rebuilt.path_prefix != definition.path_prefix
+        || rebuilt.content_type != definition.content_type
+        || rebuilt.kind != definition.kind
+        || rebuilt.specification != definition.specification
+        || rebuilt.version <= definition.version
+    {
+        return Err(invalid(format!(
+            "{} rebuild changed its immutable definition or did not advance its version",
+            case.name
+        )));
+    }
+
+    let repeated = clients[0]
+        .rebuild_index(RebuildIndexRequest {
+            bucket: case.bucket.into(),
+            name: case.name.into(),
+            expected_version: rebuilt.version,
+            command_id: format!("qualification-rebuild-rate-limit-{}", case.name),
+        })
+        .await;
+    let repeated_error = match repeated {
+        Ok(_) => {
+            return Err(invalid(format!(
+                "{} accepted a second explicit rebuild inside one hour",
+                case.name
+            )));
+        }
+        Err(status) => status,
+    };
+    if repeated_error.code() != tonic::Code::ResourceExhausted
+        || !repeated_error
+            .message()
+            .contains("index rebuild is rate limited")
+    {
+        return Err(invalid(format!(
+            "{} second explicit rebuild returned {repeated_error}",
+            case.name
+        )));
+    }
+
+    let expected = before
+        .hits
+        .iter()
+        .filter_map(hit_path)
+        .collect::<BTreeSet<_>>();
+    let expected_versions = before
+        .hits
+        .iter()
+        .filter_map(|hit| hit_path(hit).map(|path| (path, hit.object_version)))
+        .collect::<BTreeMap<_, _>>();
+    let responses = wait_for_queries(
+        clients,
+        request(case),
+        rebuilt.index_id,
+        rebuilt.version,
+        require_freshness(before)?.generation,
+        expected.len() as u64,
+        &expected,
+        &expected_versions,
+        case.expects_scores,
+        expected_sources,
+    )
+    .await?;
+    require_physical_order(case, &responses, true)?;
+    println!(
+        "{} authorized explicit rebuild published version {} and its immediate retry was rate limited",
+        case.name, rebuilt.version
+    );
+    Ok((rebuilt, responses[0].clone()))
 }
 
 async fn require_generation_quiescence(
@@ -551,6 +663,7 @@ async fn collect_final_responses(
             source_count,
         )
         .await?;
+        require_physical_order(case, &responses, true)?;
         final_responses.push(responses[0].clone());
     }
     Ok(final_responses)
@@ -562,6 +675,50 @@ fn expected_after_primary_mutations<'a>(case: &'a EngineCase) -> BTreeSet<&'a st
         .copied()
         .filter(|path| *path != case.delete_hit_path)
         .collect()
+}
+
+fn expected_physical_order(case: &EngineCase, after_mutations: bool) -> Option<Vec<&str>> {
+    let Some(SpecificationValue::TypedJson(specification)) =
+        case.specification.specification.as_ref()
+    else {
+        return None;
+    };
+    (!specification.physical_order.is_empty()).then(|| {
+        case.expected_paths
+            .iter()
+            .copied()
+            .filter(|path| !after_mutations || *path != case.delete_hit_path)
+            .collect()
+    })
+}
+
+fn physical_order_matches(case: &EngineCase, actual: &[String], after_mutations: bool) -> bool {
+    expected_physical_order(case, after_mutations)
+        .is_none_or(|expected| actual.iter().map(String::as_str).eq(expected))
+}
+
+fn require_physical_order(
+    case: &EngineCase,
+    responses: &[QueryIndexResponse],
+    after_mutations: bool,
+) -> TestResult<()> {
+    for response in responses {
+        let actual = response
+            .hits
+            .iter()
+            .filter_map(hit_path)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if actual.len() != response.hits.len()
+            || !physical_order_matches(case, &actual, after_mutations)
+        {
+            return Err(invalid(format!(
+                "{} did not return its declared physical order: {actual:?}",
+                case.name
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn write_verification_state(
@@ -662,6 +819,7 @@ async fn verify_existing_state(
             state.source_count,
         )
         .await?;
+        require_physical_order(case, &responses, true)?;
         for response in &responses {
             verify_response_state(response, expected)?;
         }
@@ -1259,11 +1417,12 @@ async fn collect_paginated_paths(
     client: &mut IndexClient,
     case: &EngineCase,
     expected_freshness: &IndexFreshness,
-) -> TestResult<BTreeSet<String>> {
+) -> TestResult<Vec<String>> {
     let mut request = request(case);
     request.limit = 1;
     let deadline = Instant::now() + WAIT_LIMIT;
-    let mut paths = BTreeSet::new();
+    let mut paths = Vec::new();
+    let mut unique = BTreeSet::new();
     let mut previous_token = Vec::new();
     loop {
         request.page_token = previous_token.clone();
@@ -1278,12 +1437,13 @@ async fn collect_paginated_paths(
         for hit in &response.hits {
             let path = hit_path(hit)
                 .ok_or_else(|| invalid("paginated index hit omitted its object address"))?;
-            if !paths.insert(path.to_owned()) {
+            if !unique.insert(path.to_owned()) {
                 return Err(invalid(format!(
                     "{} pagination returned duplicate path {path}",
                     case.name
                 )));
             }
+            paths.push(path.to_owned());
         }
         if response.next_page_token.is_empty() {
             return Ok(paths);
@@ -1381,10 +1541,12 @@ fn engine_cases() -> Vec<EngineCase> {
             bucket: "index-typed-json",
             name: "active-documents",
             specification: specification(SpecificationValue::TypedJson(TypedJsonIndexSpec {
-                fields: vec![IndexField {
-                    name: "status".into(),
-                    json_pointer: "/status".into(),
-                }],
+                fields: vec![
+                    index_field("status", "/status"),
+                    index_field("modified_at", "/modified_at"),
+                    index_field("source_record_id", "/source_record_id"),
+                ],
+                physical_order: typed_json_order(),
             })),
             query: query(QueryValue::TypedJson(TypedJsonIndexQuery {
                 predicates: vec![IndexPredicate {
@@ -1392,17 +1554,22 @@ fn engine_cases() -> Vec<EngineCase> {
                     operator: IndexPredicateOperator::Equal as i32,
                     values_json: vec![br#""active""#.to_vec()],
                 }],
-                order: Vec::new(),
+                order: typed_json_order(),
             })),
             documents: vec![
-                ("docs/active-a.json", br#"{"status":"active"}"#),
-                ("docs/inactive.json", br#"{"status":"inactive"}"#),
-                ("docs/active-b.json", br#"{"status":"active"}"#),
+                ("docs/active-a.json", br#"{"status":"active","modified_at":100,"source_record_id":"b"}"#),
+                ("docs/inactive.json", br#"{"status":"inactive","modified_at":400,"source_record_id":"x"}"#),
+                ("docs/active-b.json", br#"{"status":"active","modified_at":200,"source_record_id":"z"}"#),
+                ("docs/active-c.json", br#"{"status":"active","modified_at":200,"source_record_id":"a"}"#),
             ],
-            expected_paths: vec!["docs/active-a.json", "docs/active-b.json"],
+            expected_paths: vec![
+                "docs/active-c.json",
+                "docs/active-b.json",
+                "docs/active-a.json",
+            ],
             replacement: (
                 "docs/active-a.json",
-                br#"{"status":"active","revision":2}"#,
+                br#"{"status":"active","modified_at":100,"source_record_id":"b","revision":2}"#,
             ),
             replacement_hit_path: "docs/active-a.json",
             delete_path: "docs/active-b.json",
@@ -1615,6 +1782,27 @@ fn vector_spec() -> VectorIndexSpec {
     }
 }
 
+fn index_field(name: &str, json_pointer: &str) -> IndexField {
+    IndexField {
+        name: name.into(),
+        json_pointer: json_pointer.into(),
+        multi_valued: false,
+    }
+}
+
+fn typed_json_order() -> Vec<IndexOrder> {
+    vec![
+        IndexOrder {
+            field: "modified_at".into(),
+            direction: IndexOrderDirection::Descending as i32,
+        },
+        IndexOrder {
+            field: "source_record_id".into(),
+            direction: IndexOrderDirection::Ascending as i32,
+        },
+    ]
+}
+
 fn specification(value: SpecificationValue) -> IndexSpecification {
     IndexSpecification {
         specification: Some(value),
@@ -1634,237 +1822,5 @@ fn invalid(message: impl Into<String>) -> Box<dyn Error + Send + Sync> {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::BTreeSet;
-
-    use anvil_storage::v1::{Durability, IndexFreshness, IndexSourceFreshness, QueryIndexResponse};
-
-    use super::{
-        SpecificationValue, engine_cases, qualification_durability, retryable, retryable_transport,
-        routed_responses_agree,
-    };
-
-    #[test]
-    fn public_matrix_covers_all_eight_kinds_and_real_pagination() {
-        let cases = engine_cases();
-        let kinds = cases
-            .iter()
-            .map(|case| {
-                match case
-                    .specification
-                    .specification
-                    .as_ref()
-                    .expect("qualification specification")
-                {
-                    SpecificationValue::Path(_) => "path",
-                    SpecificationValue::MetadataFilter(_) => "metadata_filter",
-                    SpecificationValue::TypedJson(_) => "typed_json",
-                    SpecificationValue::FullText(_) => "full_text",
-                    SpecificationValue::Vector(_) => "vector",
-                    SpecificationValue::Hybrid(_) => "hybrid",
-                    SpecificationValue::GitSource(_) => "git_source",
-                    SpecificationValue::Tensor(_) => "tensor",
-                }
-            })
-            .collect::<BTreeSet<_>>();
-
-        assert_eq!(
-            kinds,
-            BTreeSet::from([
-                "full_text",
-                "git_source",
-                "hybrid",
-                "metadata_filter",
-                "path",
-                "tensor",
-                "typed_json",
-                "vector",
-            ])
-        );
-        assert_eq!(cases.len(), kinds.len());
-        for case in cases {
-            assert!(
-                case.documents.len() >= 3,
-                "{} must exercise every three-node ingress source",
-                case.name
-            );
-            assert!(!case.expected_paths.is_empty());
-            assert!(case.expected_paths.contains(&case.replacement_hit_path));
-            assert_ne!(case.replacement.0, case.delete_path);
-            let references_another_object = matches!(
-                case.specification.specification.as_ref(),
-                Some(SpecificationValue::GitSource(_) | SpecificationValue::Tensor(_))
-            );
-            assert_eq!(
-                case.replacement_hit_path != case.replacement.0,
-                references_another_object,
-                "{} must point results at the correct ordinary object",
-                case.name
-            );
-            assert_eq!(
-                case.delete_hit_path != case.delete_path,
-                references_another_object,
-                "{} must delete the manifest for the correct ordinary result object",
-                case.name
-            );
-            if !matches!(
-                case.specification.specification,
-                Some(SpecificationValue::Tensor(_))
-            ) {
-                assert!(case.expected_paths.len() > 1, "{} must paginate", case.name);
-                assert!(case.expected_paths.contains(&case.delete_hit_path));
-            } else {
-                assert_eq!(
-                    case.expected_paths.len(),
-                    1,
-                    "{} is an exact lookup",
-                    case.name
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn source_writes_request_only_satisfiable_topology_durability() {
-        assert_eq!(qualification_durability(1), Durability::Local);
-        assert_eq!(qualification_durability(3), Durability::Replicated);
-    }
-
-    fn routed_response() -> QueryIndexResponse {
-        QueryIndexResponse {
-            hits: Vec::new(),
-            next_page_token: vec![1, 2, 3],
-            freshness: Some(IndexFreshness {
-                generation: 7,
-                published_at: None,
-                sources: vec![
-                    IndexSourceFreshness {
-                        node_id: 1,
-                        source_epoch: vec![1; 32],
-                        indexed_next_offset: 11,
-                        observed_tail: Some(12),
-                        lag_hint: 1,
-                    },
-                    IndexSourceFreshness {
-                        node_id: 2,
-                        source_epoch: vec![2; 32],
-                        indexed_next_offset: 21,
-                        observed_tail: Some(22),
-                        lag_hint: 1,
-                    },
-                ],
-                initial_build_complete: true,
-                rebuilding: false,
-                authorization_revision: 31,
-                placement_term: 4,
-                placement_index: 5,
-                index_id: 41,
-                definition_version: 3,
-            }),
-        }
-    }
-
-    fn assert_freshness_disagrees(mut mutate: impl FnMut(&mut QueryIndexResponse)) {
-        let baseline = routed_response();
-        let mut changed = baseline.clone();
-        mutate(&mut changed);
-        assert!(!routed_responses_agree(&[baseline, changed]));
-    }
-
-    #[test]
-    fn retryable_statuses_include_only_transport_timeout_cancellation() {
-        assert!(retryable(&tonic::Status::unavailable("try another node")));
-        assert!(retryable(&tonic::Status::deadline_exceeded(
-            "request deadline exceeded"
-        )));
-        assert!(retryable(&tonic::Status::cancelled("Timeout expired")));
-
-        assert!(!retryable(&tonic::Status::cancelled(
-            "caller cancelled request"
-        )));
-        assert!(!retryable(&tonic::Status::invalid_argument(
-            "invalid query"
-        )));
-
-        assert!(retryable_transport(&tonic::Status::unavailable(
-            "serving fence expired"
-        )));
-        assert!(retryable_transport(&tonic::Status::deadline_exceeded(
-            "unknown mutation outcome"
-        )));
-        assert!(retryable_transport(&tonic::Status::cancelled(
-            "Timeout expired"
-        )));
-        assert!(!retryable_transport(&tonic::Status::not_found(
-            "object missing"
-        )));
-        assert!(!retryable_transport(&tonic::Status::failed_precondition(
-            "mutation rejected"
-        )));
-    }
-
-    #[test]
-    fn routed_freshness_allows_only_live_source_observations_to_differ() {
-        let baseline = routed_response();
-        let mut changed = baseline.clone();
-        let sources = &mut changed.freshness.as_mut().unwrap().sources;
-        sources[0].observed_tail = Some(100);
-        sources[0].lag_hint = 89;
-        sources[1].observed_tail = None;
-        sources[1].lag_hint = 0;
-
-        assert!(routed_responses_agree(&[baseline, changed]));
-    }
-
-    #[test]
-    fn routed_freshness_requires_stable_identity_and_checkpoints() {
-        assert_freshness_disagrees(|response| {
-            response.freshness.as_mut().unwrap().generation += 1;
-        });
-        assert_freshness_disagrees(|response| {
-            response.freshness.as_mut().unwrap().published_at = Some(Default::default());
-        });
-        assert_freshness_disagrees(|response| {
-            response.freshness.as_mut().unwrap().initial_build_complete = false;
-        });
-        assert_freshness_disagrees(|response| {
-            response.freshness.as_mut().unwrap().rebuilding = true;
-        });
-        assert_freshness_disagrees(|response| {
-            response.freshness.as_mut().unwrap().authorization_revision += 1;
-        });
-        assert_freshness_disagrees(|response| {
-            response.freshness.as_mut().unwrap().placement_term += 1;
-        });
-        assert_freshness_disagrees(|response| {
-            response.freshness.as_mut().unwrap().placement_index += 1;
-        });
-        assert_freshness_disagrees(|response| {
-            response.freshness.as_mut().unwrap().index_id += 1;
-        });
-        assert_freshness_disagrees(|response| {
-            response.freshness.as_mut().unwrap().definition_version += 1;
-        });
-        assert_freshness_disagrees(|response| {
-            response.freshness.as_mut().unwrap().sources[0].node_id += 1;
-        });
-        assert_freshness_disagrees(|response| {
-            response.freshness.as_mut().unwrap().sources[0]
-                .source_epoch
-                .push(9);
-        });
-        assert_freshness_disagrees(|response| {
-            response.freshness.as_mut().unwrap().sources[0].indexed_next_offset += 1;
-        });
-        assert_freshness_disagrees(|response| {
-            response.freshness.as_mut().unwrap().sources.swap(0, 1);
-        });
-    }
-
-    #[test]
-    fn routed_responses_still_require_matching_results_and_freshness() {
-        assert_freshness_disagrees(|response| response.next_page_token.push(4));
-        assert_freshness_disagrees(|response| response.hits.push(Default::default()));
-        assert_freshness_disagrees(|response| response.freshness = None);
-    }
-}
+#[path = "cluster_index_qualification/tests.rs"]
+mod tests;
