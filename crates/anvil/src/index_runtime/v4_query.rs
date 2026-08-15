@@ -411,9 +411,17 @@ fn decode_scalar(encoded: &[u8], field: &FieldSchema) -> Result<ScalarValue, Ind
         FieldType::Boolean => ScalarValue::Boolean(value.as_bool().ok_or_else(invalid)?),
         FieldType::SignedInteger => ScalarValue::Signed(value.as_i64().ok_or_else(invalid)?),
         FieldType::UnsignedInteger => ScalarValue::Unsigned(value.as_u64().ok_or_else(invalid)?),
-        FieldType::Float => {
-            ScalarValue::number(value.as_f64().ok_or_else(invalid)?).map_err(|_| invalid())?
-        }
+        FieldType::Float => match value {
+            serde_json::Value::Number(number) if number.is_i64() => {
+                ScalarValue::exact_number_from_i64(number.as_i64().ok_or_else(invalid)?)
+                    .ok_or_else(invalid)?
+            }
+            serde_json::Value::Number(number) if number.is_u64() => {
+                ScalarValue::exact_number_from_u64(number.as_u64().ok_or_else(invalid)?)
+                    .ok_or_else(invalid)?
+            }
+            _ => ScalarValue::number(value.as_f64().ok_or_else(invalid)?).map_err(|_| invalid())?,
+        },
         FieldType::Keyword => ScalarValue::String(value.as_str().ok_or_else(invalid)?.to_owned()),
         FieldType::Text | FieldType::Vector => return Err(invalid()),
     })
@@ -594,6 +602,18 @@ mod tests {
         assert!(decode_scalar(b"4", &keyword_schema.fields[0]).is_err());
         assert!(decode_scalar(br#""\u0061ctive""#, &keyword_schema.fields[0]).is_err());
         assert!(decode_scalar(b" \"active\"", &keyword_schema.fields[0]).is_err());
+    }
+
+    #[test]
+    fn float_query_values_reject_lossy_integer_conversion() {
+        let (_, mut schema) = typed();
+        schema.fields[0].field_type = FieldType::Float;
+        let field = &schema.fields[0];
+
+        assert!(decode_scalar(b"9007199254740992", field).is_ok());
+        assert!(decode_scalar(b"9007199254740993", field).is_err());
+        assert!(decode_scalar(b"18446744073709551615", field).is_err());
+        assert!(decode_scalar(b"1.5", field).is_ok());
     }
 
     #[test]

@@ -1069,8 +1069,12 @@ fn normalize_scalar(
         (FieldType::UnsignedInteger, ScalarValue::Unsigned(value)) => ScalarValue::Unsigned(value),
         (FieldType::UnsignedInteger, ScalarValue::Signed(0)) => ScalarValue::Unsigned(0),
         (FieldType::Float, ScalarValue::Number(bits)) => ScalarValue::Number(bits),
-        (FieldType::Float, ScalarValue::Signed(value)) => ScalarValue::number(value as f64)?,
-        (FieldType::Float, ScalarValue::Unsigned(value)) => ScalarValue::number(value as f64)?,
+        (FieldType::Float, ScalarValue::Signed(value)) => {
+            ScalarValue::exact_number_from_i64(value).ok_or_else(invalid)?
+        }
+        (FieldType::Float, ScalarValue::Unsigned(value)) => {
+            ScalarValue::exact_number_from_u64(value).ok_or_else(invalid)?
+        }
         (FieldType::Keyword | FieldType::Text, ScalarValue::String(value)) => {
             if field.field_type == FieldType::Keyword
                 && value.len() > INDEX_TERM_BYTES
@@ -1841,5 +1845,20 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, IndexError::ResourceLimit { .. }));
         assert_eq!(payload.position(), body.len() as u64);
+    }
+
+    #[test]
+    fn float_projection_rejects_lossy_integer_conversion() {
+        let mut field = schema(Specification::TypedJson(TypedJsonIndexSpec {
+            fields: vec![keyword_field("value", "/value", false)],
+            physical_order: Vec::new(),
+        }))
+        .fields
+        .remove(0);
+        field.field_type = FieldType::Float;
+
+        assert!(normalize_scalar(&field, ScalarValue::Signed(1i64 << 53)).is_ok());
+        assert!(normalize_scalar(&field, ScalarValue::Signed((1i64 << 53) + 1)).is_err());
+        assert!(normalize_scalar(&field, ScalarValue::Unsigned(u64::MAX)).is_err());
     }
 }
