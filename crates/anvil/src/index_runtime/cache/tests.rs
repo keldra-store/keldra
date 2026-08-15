@@ -23,34 +23,82 @@ struct MultiGatedFetcher {
     release: tokio::sync::Semaphore,
 }
 
+struct InterruptedFetcher {
+    value: Vec<u8>,
+}
+
+struct InterruptedReader {
+    value: std::io::Cursor<Vec<u8>>,
+    interrupted: bool,
+}
+
+impl Read for InterruptedReader {
+    fn read(&mut self, destination: &mut [u8]) -> std::io::Result<usize> {
+        if self.interrupted {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "fixture interrupted the immutable stream",
+            ));
+        }
+        let maximum = destination.len().min(4);
+        let read = std::io::Read::read(&mut self.value, &mut destination[..maximum])?;
+        self.interrupted = read != 0;
+        Ok(read)
+    }
+}
+
+#[tonic::async_trait]
+impl IndexSegmentFetcher for InterruptedFetcher {
+    async fn fetch(
+        &self,
+        _segment: IndexSegmentId,
+    ) -> Result<Box<dyn Read + Send>, IndexCacheError> {
+        Ok(Box::new(InterruptedReader {
+            value: std::io::Cursor::new(self.value.clone()),
+            interrupted: false,
+        }))
+    }
+}
+
 #[tonic::async_trait]
 impl IndexSegmentFetcher for MultiGatedFetcher {
-    async fn fetch(&self, segment: IndexSegmentId) -> Result<Vec<u8>, IndexCacheError> {
+    async fn fetch(
+        &self,
+        segment: IndexSegmentId,
+    ) -> Result<Box<dyn Read + Send>, IndexCacheError> {
         self.reads.fetch_add(1, Ordering::Relaxed);
         self.release.acquire().await.unwrap().forget();
         self.values
             .get(&segment)
             .cloned()
+            .map(|bytes| Box::new(std::io::Cursor::new(bytes)) as Box<dyn Read + Send>)
             .ok_or(IndexCacheError::InvalidFetchedSegment)
     }
 }
 
 #[tonic::async_trait]
 impl IndexSegmentFetcher for GatedFetcher {
-    async fn fetch(&self, _segment: IndexSegmentId) -> Result<Vec<u8>, IndexCacheError> {
+    async fn fetch(
+        &self,
+        _segment: IndexSegmentId,
+    ) -> Result<Box<dyn Read + Send>, IndexCacheError> {
         self.reads.fetch_add(1, Ordering::Relaxed);
         self.release.acquire().await.unwrap().forget();
-        Ok(self.value.clone())
+        Ok(Box::new(std::io::Cursor::new(self.value.clone())))
     }
 }
 
 #[tonic::async_trait]
 impl IndexSegmentFetcher for MemoryFetcher {
-    async fn fetch(&self, segment: IndexSegmentId) -> Result<Vec<u8>, IndexCacheError> {
+    async fn fetch(
+        &self,
+        segment: IndexSegmentId,
+    ) -> Result<Box<dyn Read + Send>, IndexCacheError> {
         self.reads.fetch_add(1, Ordering::Relaxed);
         self.values
             .get(&segment)
             .cloned()
+            .map(|bytes| Box::new(std::io::Cursor::new(bytes)) as Box<dyn Read + Send>)
             .ok_or(IndexCacheError::InvalidFetchedSegment)
     }
 }
@@ -113,6 +161,39 @@ async fn repeated_reads_reuse_the_verified_mapping() {
     assert_eq!(first.data(), b"abcd");
     assert_eq!(second.data(), b"efgh");
     assert_eq!(fetcher.reads.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn successful_stream_copy_atomically_publishes_the_verified_file() {
+    let root = tempfile::tempdir().unwrap();
+    let bytes = (0..(3 * 64 * 1024 + 17))
+        .map(|offset| (offset % 251) as u8)
+        .collect::<Vec<_>>();
+    let segment = id(&bytes);
+    let fetcher = Arc::new(MemoryFetcher {
+        values: BTreeMap::from([(segment, bytes.clone())]),
+        reads: AtomicUsize::new(0),
+    });
+    let cache = IndexCache::new(
+        root.path(),
+        IndexCacheConfig::new(bytes.len() as u64, bytes.len() as u64).unwrap(),
+        fetcher.clone(),
+    )
+    .unwrap();
+
+    let slice = cache.open(segment).read_at(0, bytes.len()).await.unwrap();
+
+    assert_eq!(slice.data(), bytes);
+    assert_eq!(fetcher.reads.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        std::fs::read(cache_path(&cache.inner.directory, segment)).unwrap(),
+        bytes
+    );
+    assert_eq!(
+        std::fs::read_dir(&cache.inner.directory).unwrap().count(),
+        1,
+        "verified publication must leave no staging file"
+    );
 }
 
 #[tokio::test]
@@ -415,6 +496,36 @@ async fn corrupt_fetched_bytes_are_never_materialized() {
         file.read_at(0, 8).await,
         Err(IndexCacheError::InvalidFetchedSegment)
     ));
+    assert!(!cache_path(&cache.inner.directory, expected).exists());
+    assert_eq!(
+        std::fs::read_dir(&cache.inner.directory).unwrap().count(),
+        0,
+        "failed verification must remove its unpublished cache temporary"
+    );
+}
+
+#[tokio::test]
+async fn interrupted_stream_never_publishes_a_partial_cache_file() {
+    let root = tempfile::tempdir().unwrap();
+    let value = b"interrupted immutable artifact".to_vec();
+    let segment = id(&value);
+    let cache = IndexCache::new(
+        root.path(),
+        IndexCacheConfig::new(1024, 1024).unwrap(),
+        Arc::new(InterruptedFetcher { value }),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        cache.open(segment).read_at(0, 32).await,
+        Err(IndexCacheError::Fetch(reason)) if reason.contains("fixture interrupted")
+    ));
+    assert!(!cache_path(&cache.inner.directory, segment).exists());
+    assert_eq!(
+        std::fs::read_dir(&cache.inner.directory).unwrap().count(),
+        0,
+        "an interrupted copy must remove its unpublished cache temporary"
+    );
 }
 
 #[tokio::test]

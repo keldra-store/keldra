@@ -129,6 +129,10 @@ impl QueryObservedDirectory {
 impl ArtifactDirectoryRead for QueryObservedDirectory {
     type File = QueryObservedFile;
 
+    fn query_parallelism(&self) -> usize {
+        self.cpu.workers().max(1)
+    }
+
     async fn open_artifact(
         &self,
         descriptor: &ArtifactDescriptor,
@@ -1166,13 +1170,17 @@ impl ClusterIndexSegmentFetcher {
 
 #[tonic::async_trait]
 impl IndexSegmentFetcher for ClusterIndexSegmentFetcher {
-    async fn fetch(&self, segment: IndexSegmentId) -> Result<Vec<u8>, IndexCacheError> {
+    async fn fetch(
+        &self,
+        segment: IndexSegmentId,
+    ) -> Result<Box<dyn std::io::Read + Send>, IndexCacheError> {
         self.reader
-            .read_blob_bytes(&BlobRef {
+            .open_blob_payload(&BlobRef {
                 hash: segment.blake3,
                 length: segment.length,
             })
             .await
+            .map(|payload| Box::new(payload) as Box<dyn std::io::Read + Send>)
             .map_err(|error| IndexCacheError::Fetch(error.to_string()))
     }
 }
