@@ -564,14 +564,17 @@ async fn oversized_owner_frame_is_corrupt_and_repaired_without_large_memory_grow
 #[test]
 #[cfg(target_os = "linux")]
 fn production_spools_have_no_directory_entry() {
-    let directory = tempfile::tempdir().unwrap();
-    let factory = AnonymousPayloadReadSpools::new(directory.path());
-    let before = std::fs::read_dir(directory.path()).unwrap().count();
+    let temporary = tempfile::tempdir().unwrap();
+    let directory = temporary.path().join("missing/payload-read");
+    assert!(!directory.exists());
+    let factory = AnonymousPayloadReadSpools::new(&directory).unwrap();
+    assert!(directory.is_dir());
+    let before = std::fs::read_dir(&directory).unwrap().count();
     let mut spool = factory.create().unwrap();
     spool
         .write_all(&vec![7; 2 * PAYLOAD_READ_FRAME_BYTES])
         .unwrap();
-    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), before);
+    assert_eq!(std::fs::read_dir(&directory).unwrap().count(), before);
     drop(spool);
-    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), before);
+    assert_eq!(std::fs::read_dir(&directory).unwrap().count(), before);
 }

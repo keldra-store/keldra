@@ -163,7 +163,7 @@ impl ClusterObjectReader {
         spool_directory: impl AsRef<Path>,
     ) -> Result<Self, ErasureError> {
         let spools: Arc<dyn PayloadReadSpoolFactory> =
-            Arc::new(AnonymousPayloadReadSpools::new(spool_directory));
+            Arc::new(AnonymousPayloadReadSpools::new(spool_directory)?);
         Self::with_components(Arc::new(distribution), profile, transport, spools)
     }
 
