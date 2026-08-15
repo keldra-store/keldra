@@ -38,16 +38,23 @@ pub(crate) fn estimate_working_memory(
         NativeQuery::Filter { order, .. } => order.len(),
         _ => 1,
     };
-    // Physical k-way execution retains only owned heads and compact cursor
-    // continuation per segment. Exactly one advancing segment retains decoded
-    // blocks, so consecutive candidates reuse them without multiplying the
-    // component ceiling by the generation's segment count.
+    // Physical k-way execution retains each segment's current decoded blocks.
+    // Ordered heads commonly interleave, and discarding the inactive segment's
+    // blocks would repeatedly read the same immutable components. Charge the
+    // complete per-segment state before execution instead.
     let resident_components = 2usize
         .checked_add(fields.len())
         .and_then(|value| value.checked_add(leaves))
         .ok_or(IndexError::OffsetOverflow)?;
     let decoded = resident_components
         .checked_mul(INDEX_DECODE_BYTES)
+        .and_then(|value| {
+            value.checked_mul(if physical {
+                request.segments.len().max(1)
+            } else {
+                1
+            })
+        })
         .ok_or(IndexError::OffsetOverflow)?;
     let per_segment_cursor = leaves
         .max(1)

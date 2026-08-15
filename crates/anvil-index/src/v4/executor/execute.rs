@@ -449,10 +449,7 @@ where
                     .next_physical(request, order, directions.clone())
                     .await?,
             );
-            // Only the advancing segment below retains decoded components.
-            execution.release_decoded()?;
         }
-        let mut retained_segment: Option<usize> = None;
         let mut selected = Vec::with_capacity(request.limit as usize);
         let mut refill_required = false;
         while selected.len() < request.limit as usize {
@@ -466,19 +463,9 @@ where
                     break;
                 };
                 pending.push(heads[index].take().unwrap());
-                if retained_segment != Some(index) {
-                    if let Some(previous) = retained_segment.take() {
-                        executions[previous].release_decoded()?;
-                    }
-                    retained_segment = Some(index);
-                }
                 heads[index] = executions[index]
                     .next_physical(request, order, directions.clone())
                     .await?;
-                if heads[index].is_none() {
-                    executions[index].release_decoded()?;
-                    retained_segment = None;
-                }
             }
             if pending.is_empty() {
                 break;
@@ -512,9 +499,6 @@ where
         }
         if selected.len() == request.limit as usize {
             statistics.physical_early_termination();
-        }
-        if let Some(index) = retained_segment {
-            executions[index].release_decoded()?;
         }
         Ok(selected)
     }
