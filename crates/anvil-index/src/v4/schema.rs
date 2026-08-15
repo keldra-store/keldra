@@ -779,8 +779,8 @@ fn canonical_f64_bits(value: f64) -> u64 {
 mod tests {
     use super::*;
     use crate::v4::{
-        ComponentStatistics, FieldStatistics, INDEX_DECODE_BYTES, PhysicalOrderBounds,
-        ScalarValue, SegmentStatistics, SortValue, encode_physical_order_key,
+        ComponentStatistics, FieldStatistics, INDEX_DECODE_BYTES, PhysicalOrderBounds, ScalarValue,
+        SegmentStatistics, SortValue, encode_physical_order_key,
     };
 
     fn component(role: ComponentKind, field_id: Option<FieldId>) -> ComponentStatistics {
@@ -927,8 +927,7 @@ mod tests {
                 allow_missing: true,
                 allow_null: false,
                 collation: Collation::BinaryUtf8,
-                capabilities: FieldCapabilities::EXACT
-                    .union(FieldCapabilities::ORDER),
+                capabilities: FieldCapabilities::EXACT.union(FieldCapabilities::ORDER),
                 analyzer: None,
                 components: FieldComponents::POINTS.union(FieldComponents::DOC_VALUES),
             }],
@@ -968,12 +967,36 @@ mod tests {
     #[test]
     fn capability_selection_builds_only_required_components() {
         let cases = [
-            (FieldType::Boolean, FieldCapabilities::EXACT, FieldComponents::TERMS),
-            (FieldType::Boolean, FieldCapabilities::FACET, FieldComponents::DOC_VALUES),
-            (FieldType::SignedInteger, FieldCapabilities::EXACT, FieldComponents::POINTS),
-            (FieldType::SignedInteger, FieldCapabilities::ORDER, FieldComponents::DOC_VALUES),
-            (FieldType::Keyword, FieldCapabilities::PREFIX, FieldComponents::TERMS),
-            (FieldType::Keyword, FieldCapabilities::FACET, FieldComponents::DOC_VALUES),
+            (
+                FieldType::Boolean,
+                FieldCapabilities::EXACT,
+                FieldComponents::TERMS,
+            ),
+            (
+                FieldType::Boolean,
+                FieldCapabilities::FACET,
+                FieldComponents::DOC_VALUES,
+            ),
+            (
+                FieldType::SignedInteger,
+                FieldCapabilities::EXACT,
+                FieldComponents::POINTS,
+            ),
+            (
+                FieldType::SignedInteger,
+                FieldCapabilities::ORDER,
+                FieldComponents::DOC_VALUES,
+            ),
+            (
+                FieldType::Keyword,
+                FieldCapabilities::PREFIX,
+                FieldComponents::TERMS,
+            ),
+            (
+                FieldType::Keyword,
+                FieldCapabilities::FACET,
+                FieldComponents::DOC_VALUES,
+            ),
             (
                 FieldType::Text,
                 FieldCapabilities::FULL_TEXT,
@@ -1007,12 +1030,7 @@ mod tests {
                 rejected = midpoint;
             }
         }
-        let previous = admission_schema(
-            accepted,
-            FieldType::SignedInteger,
-            capabilities,
-            true,
-        );
+        let previous = admission_schema(accepted, FieldType::SignedInteger, capabilities, true);
         previous.validate().unwrap();
         assert!(
             admission_schema(rejected, FieldType::SignedInteger, capabilities, true)
@@ -1020,7 +1038,10 @@ mod tests {
                 .is_err()
         );
         assert_eq!(
-            maximum_statistics(&previous).encode_payload().unwrap().len(),
+            maximum_statistics(&previous)
+                .encode_payload()
+                .unwrap()
+                .len(),
             previous.segment_shape().unwrap().statistics_payload_bytes
         );
     }

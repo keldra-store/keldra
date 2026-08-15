@@ -9,8 +9,8 @@ mod writer;
 
 pub use merge::{MergeMutation, MergedSources, merge_mutations};
 pub use model::{
-    BuildLimits, ProjectedDocValue, ProjectedPoint, ProjectedRecord, ProjectedSource, ProjectedTerm,
-    ProjectedVector, SourcePush,
+    BuildLimits, ProjectedDocValue, ProjectedPoint, ProjectedRecord, ProjectedSource,
+    ProjectedTerm, ProjectedVector, SourcePush,
 };
 pub use scratch::{MergeScratchFile, MergeScratchSpace};
 pub use segment_merge::{MAXIMUM_SEGMENT_MERGE_INPUTS, merge_segments};

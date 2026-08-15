@@ -9,10 +9,10 @@ use std::time::Duration;
 
 use anvil_storage::v1::bulk_operation::Operation as BulkOperationValue;
 use anvil_storage::v1::bulk_outcome::Outcome as BulkOutcomeValue;
+use anvil_storage::v1::index_field::FieldType as IndexFieldType;
 use anvil_storage::v1::index_query::Query as QueryValue;
 use anvil_storage::v1::index_service_client::IndexServiceClient;
 use anvil_storage::v1::index_specification::Specification as SpecificationValue;
-use anvil_storage::v1::index_field::FieldType as IndexFieldType;
 use anvil_storage::v1::object_head::State as ObjectHeadState;
 use anvil_storage::v1::put_header::Operation as PutOperationValue;
 use anvil_storage::v1::{
