@@ -88,6 +88,24 @@ The cause is architectural:
    generic column, and a stored JSON value whether or not those capabilities
    were requested.
 
+A later production qualification exposed a second format-bound cost on a
+healthy four-disk rotational RAID10 array. While source ingestion supplied
+about 6.5 MiB/s of encoded documents, Anvil issued about 32.7 MiB/s of
+kernel-accounted writes, about 81 MiB/s of userspace reads, and roughly 671
+write syscalls per second. The array remained 86--91 percent busy while index
+progress fell substantially behind ingestion. Logs were negligible and the
+filesystem had ample free space.
+
+The native builder had accidentally made each logical component stream its
+own ordinary-object durability boundary. A field-rich index therefore sealed
+and synchronously published many underfilled tail packs: terms, postings,
+points, doc values, identities, live masks, locators, norms, statistics, and
+routing layers could each leave a separate object. This defeated the intended
+16 MiB packing and multiplied staging-file synchronisation, RocksDB lifecycle
+commits, directory synchronisation, ordinary-object commits, and journal
+entries. Rotational storage made the regression especially visible, but the
+write amplification is wrong on every medium.
+
 Compaction cannot repair an execution model which reads most of the index for
 a sparse result. More heuristics around the existing driver merely move the
 failure to another predicate distribution. The durable structures and the
@@ -819,11 +837,32 @@ component-specific payload has its own explicit bounds and codec version.
 Readers validate the fixed header, checked lengths, declared upper bounds, and
 checksum before allocating or decoding.
 
-Logical components are packed into immutable ordinary Anvil objects. A checked
-descriptor identifies the canonical reserved object address, exact object
-version, object content hash, byte offset, encoded length, logical length,
-component kind, codec version, and checksum. The address and version retain and
-resolve the ordinary object; the content hash provides integrity and ordinary
+Logical components are packed into immutable ordinary Anvil objects. Packing is
+segment-scoped rather than component-stream-scoped: leaves, routing nodes, and
+other logical components from different streams share the same current pack
+until adding the next complete component would exceed 16 MiB. A component may
+not straddle packs.
+
+A checked component descriptor contains a segment-local `u32` pack ordinal,
+byte offset, encoded length, logical length, component kind, codec version, and
+checksum. It deliberately does not embed an ordinary-object path or object
+version. This indirection lets routing components refer to already assigned
+component locations before the enclosing packs are sealed and durably
+published; otherwise every stream tail would have to become a separate object
+before its routing parent could be encoded.
+
+After the complete segment or standalone locator tree is encoded, the builder
+seals its packs in ordinal order and publishes them through the ordinary
+grouped object-publication path. Its pack table then maps every ordinal to the
+canonical reserved object address, exact object version, content hash, and
+object length. The table is carried by the segment descriptor or standalone
+locator root in the generation manifest. Pack ordinals are meaningful only
+with that exact segment identity and table. They are never global identifiers,
+Raft state, mutable names, or another storage plane.
+
+Readers validate the ordinal and component range against the generation-bound
+pack table before resolving the ordinary object. The address and version retain
+and resolve that object; the content hash provides integrity and ordinary
 payload deduplication but is not by itself an object reference. The existing
 async index-handle/cache layer fetches the required range or pack and may mmap
 local cache files. A cache never changes authoritative bytes.
@@ -888,8 +927,10 @@ The generation manifest contains:
 - complete source and atomic-program barrier;
 - physical-order declaration, if any;
 - ordered segment descriptors;
+- each segment's canonical ordinal-to-ordinary-object pack table;
 - each segment's live-view root;
-- path-locator roots used by the builder;
+- path-locator roots used by the builder, including a pack table when the root
+  is not owned by a segment descriptor;
 - per-segment statistics;
 - artifact encoded and logical byte totals.
 
@@ -912,6 +953,14 @@ that profile without changing the index format. Artifact publication cannot
 point at process staging bytes or a coordinator-only preparation file.
 The current-pointer CAS itself uses the same topology-aware acknowledgement
 threshold as the immutable artifacts it publishes.
+
+All packs produced by one completed segment or standalone locator build are
+staged before their metadata publication and are submitted through the existing
+bounded grouped publication path. Grouping changes physical RocksDB and network
+work only: each pack remains an independently content-addressed ordinary object
+with its normal durability, reference counting, placement, and authorization
+semantics. The generation manifest is not published until every pack outcome
+has been resolved into its canonical pack table.
 
 ### 9.6 Generation retention
 
@@ -1351,9 +1400,10 @@ A first build or authorized explicit rebuild:
 5. restores deterministic order;
 6. creates one or a bounded number of format-v4 segments directly;
 7. replays the routed journal suffix, preserving atomic groups;
-8. writes all segment, locator, live-mask, and manifest artifacts through the
-   ordinary object path using the topology-aware acknowledgement threshold in
-   Section 9.5; and
+8. coalesces complete logical components across streams into segment-scoped
+   packs, publishes each completed pack set through the bounded grouped
+   ordinary-object path using the topology-aware acknowledgement threshold in
+   Section 9.5, then writes the manifest; and
 9. publishes one complete generation CAS.
 
 It does not simulate a rebuild by creating hundreds of tiny L0 segments and
