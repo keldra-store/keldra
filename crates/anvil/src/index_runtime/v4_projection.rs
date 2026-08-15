@@ -802,6 +802,7 @@ fn git_record(schema: &Schema, value: GitSourceRecord) -> Result<ProjectedRecord
         ScalarValue::String(value.repository_id.clone()),
         ScalarValue::String(value.commit_id.clone()),
         ScalarValue::String(value.tree_path.clone()),
+        ScalarValue::String(value.object_id.clone()),
     ];
     fixed_record(
         schema,
@@ -851,14 +852,28 @@ fn fixed_multi_record(
         ));
     }
     let mut terms = Vec::new();
+    let mut doc_values = Vec::new();
     for (field, values) in schema.fields.iter().zip(values) {
         if field.components.contains(FieldComponents::TERMS) {
+            terms.push(ProjectedTerm {
+                field_id: field.id,
+                term_type: TERM_TYPE_FIELD_PRESENCE,
+                term: FIELD_PRESENCE_TERM.to_vec(),
+                frequency: 1,
+                positions: Vec::new(),
+            });
             terms.extend(scalar_terms(field.id, &values)?);
         }
         if field.components.contains(FieldComponents::DOC_VALUES) {
-            return Err(IndexError::InvalidDefinition(
-                "fixed projection unexpectedly requires doc values".into(),
-            ));
+            doc_values.push(ProjectedDocValue {
+                field_id: field.id,
+                multi_valued: field.cardinality == Cardinality::Multi,
+                cell: DocValueCell {
+                    present: true,
+                    null: false,
+                    values,
+                },
+            });
         }
     }
     terms.sort_by(projected_term_order);
@@ -867,7 +882,7 @@ fn fixed_multi_record(
         Vec::new(),
         terms,
         Vec::new(),
-        Vec::new(),
+        doc_values,
         Vec::new(),
         Vec::new(),
     ))
@@ -1230,6 +1245,9 @@ fn skipped() -> IndexBuildDiagnostics {
         skipped_objects: 1,
     }
 }
+
+#[cfg(test)]
+mod query_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1642,8 +1660,16 @@ mod tests {
                 version: 4,
             })
         );
-        assert_eq!(source.records[0].terms.len(), 3);
-        assert!(source.records[0].doc_values.is_empty());
+        assert_eq!(source.records[0].terms.len(), 8);
+        let (object_term_type, object_term) =
+            scalar_term(&ScalarValue::String("def".into())).unwrap();
+        assert!(source.records[0].terms.iter().any(|term| {
+            term.field_id == FieldId::new(3)
+                && term.term_type == object_term_type
+                && term.term == object_term
+        }));
+        assert_eq!(source.records[0].doc_values.len(), 1);
+        assert_eq!(source.records[0].doc_values[0].field_id, FieldId::new(2));
     }
 
     #[test]
@@ -1663,7 +1689,7 @@ mod tests {
         };
         let body = serde_json::to_vec(&record).unwrap();
         let (source, _) = upsert(&schema, Some(&body));
-        assert_eq!(source.records[0].terms.len(), 2);
+        assert_eq!(source.records[0].terms.len(), 4);
         assert_eq!(
             source.records[0].result_identity,
             Some(ObjectIdentity {
@@ -1671,7 +1697,8 @@ mod tests {
                 version: 9,
             })
         );
-        assert!(source.records[0].doc_values.is_empty());
+        assert_eq!(source.records[0].doc_values.len(), 1);
+        assert_eq!(source.records[0].doc_values[0].field_id, FieldId::new(1));
     }
 
     #[test]

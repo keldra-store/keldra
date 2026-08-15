@@ -389,8 +389,11 @@ fn git_schema(repository_scope: &str) -> Result<SchemaParts, IndexError> {
         ("commit_id", FieldCapabilities::EXACT),
         (
             "tree_path",
-            FieldCapabilities::EXACT.union(FieldCapabilities::PREFIX),
+            FieldCapabilities::EXACT
+                .union(FieldCapabilities::PREFIX)
+                .union(FieldCapabilities::ORDER),
         ),
+        ("object_id", FieldCapabilities::EXACT),
     ];
     let fields = fixed_fields("@git", &definitions)?;
     Ok((
@@ -406,7 +409,10 @@ fn git_schema(repository_scope: &str) -> Result<SchemaParts, IndexError> {
 fn tensor_schema(model_scope: &str) -> Result<SchemaParts, IndexError> {
     let definitions = [
         ("model_id", FieldCapabilities::EXACT),
-        ("tensor_name", FieldCapabilities::EXACT),
+        (
+            "tensor_name",
+            FieldCapabilities::EXACT.union(FieldCapabilities::ORDER),
+        ),
     ];
     let fields = fixed_fields("@tensor", &definitions)?;
     Ok((
