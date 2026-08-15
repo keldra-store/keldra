@@ -3,8 +3,7 @@
 use std::time::Instant;
 
 use anvil_index::v4::{
-    ComponentKind, LOCATOR_COMPACTION_FAN_IN, LocatorStreamRoot, SegmentIdentity,
-    compact_locator_roots,
+    ComponentKind, LOCATOR_COMPACTION_FAN_IN, SegmentIdentity, compact_locator_roots,
 };
 use tracing::Instrument;
 
@@ -59,12 +58,8 @@ pub(super) async fn compact_oldest_prefix(
     .map_err(index_status)?;
     let roots = covered
         .iter()
-        .map(|root| LocatorStreamRoot {
-            sequence: root.sequence,
-            identity: root.identity,
-            artifact: root.artifact.clone(),
-        })
-        .collect::<Vec<_>>();
+        .map(|root| candidate.locator_stream_root(root))
+        .collect::<Result<Vec<_>, _>>()?;
     let input_encoded_bytes = covered.iter().fold(0_u64, |total, root| {
         total.saturating_add(root.encoded_bytes)
     });
@@ -97,20 +92,24 @@ pub(super) async fn compact_oldest_prefix(
         compaction.outcome = tracing::field::Empty,
         otel.status_code = tracing::field::Empty,
     );
-    let result = compact_locator_roots(
-        &directory,
-        &mut sink,
-        &roots,
-        identity,
-        definition
-            .schema
-            .codec_version(ComponentKind::PATH_LOCATOR)
-            .map_err(index_status)?,
-        definition
-            .schema
-            .codec_version(ComponentKind::ROUTING_NODE)
-            .map_err(index_status)?,
-    )
+    sink.begin_segment(identity, &[]).map_err(index_status)?;
+    let result = async {
+        let published = compact_locator_roots(
+            &directory,
+            &mut sink,
+            &roots,
+            identity,
+            definition
+                .schema
+                .codec_version(ComponentKind::PATH_LOCATOR)?,
+            definition
+                .schema
+                .codec_version(ComponentKind::ROUTING_NODE)?,
+        )
+        .await?;
+        let packs = sink.finalize_segment(identity).await?;
+        Ok::<_, IndexError>((published, packs))
+    }
     .instrument(span.clone())
     .await
     .map_err(index_status);
@@ -128,7 +127,7 @@ pub(super) async fn compact_oldest_prefix(
         "otel.status_code",
         if result.is_ok() { "ok" } else { "error" },
     );
-    let published = result?;
+    let (published, packs) = result?;
 
     candidate.locator_roots.drain(..selection.input_roots);
     candidate.locator_roots.insert(
@@ -137,6 +136,7 @@ pub(super) async fn compact_oldest_prefix(
             sequence: replacement_sequence,
             identity,
             artifact: published.root,
+            pack_ownership: LocatorPackOwnership::Standalone(packs),
             encoded_bytes: published.encoded_bytes,
             logical_bytes: published.logical_bytes,
         },

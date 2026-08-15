@@ -429,15 +429,7 @@ async fn apply_incremental_mutations(
         definition.stored.index_id,
     )
     .map_err(index_status)?;
-    let roots = candidate
-        .locator_roots
-        .iter()
-        .map(|root| LocatorStreamRoot {
-            sequence: root.sequence,
-            identity: root.identity,
-            artifact: root.artifact.clone(),
-        })
-        .collect::<Vec<_>>();
+    let roots = candidate.locator_stream_roots()?;
     let mutation_bytes = mutation_batch_resident_bytes(&pending, pending.capacity())?;
     let mut previous_by_ordinal = if roots.is_empty() {
         Vec::new()
@@ -563,6 +555,7 @@ async fn apply_incremental_mutations(
             definition.bucket_id,
             DerivedArtifactAdmission::PublicationProgress,
         );
+        sink.begin_segment(identity, &[]).map_err(index_status)?;
         let published = publish_locator_delta(
             &mut sink,
             identity,
@@ -578,11 +571,16 @@ async fn apply_incremental_mutations(
         )
         .await
         .map_err(index_status)?;
+        let packs = sink
+            .finalize_segment(identity)
+            .await
+            .map_err(index_status)?;
         let sequence = candidate.allocate_sequence()?;
         candidate.locator_roots.push(LocatorRoot {
             sequence,
             identity,
             artifact: published.root,
+            pack_ownership: LocatorPackOwnership::Standalone(packs),
             encoded_bytes: published.encoded_bytes,
             logical_bytes: published.logical_bytes,
         });

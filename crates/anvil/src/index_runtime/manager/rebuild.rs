@@ -859,21 +859,31 @@ mod tests {
     }
 
     fn locator_root(sequence: u64) -> LocatorRoot {
+        let hash = [1; 32];
         LocatorRoot {
             sequence,
             identity: SegmentIdentity::new(1, 1, [1; 32], sequence).unwrap(),
-            artifact: anvil_index::v4::ArtifactDescriptor {
-                path: String::new(),
-                object_version: 1,
-                object_content_hash: [1; 32],
-                object_length: 1,
-                offset: 0,
-                encoded_length: 1,
-                logical_length: 1,
-                component_kind: anvil_index::v4::ComponentKind::ROUTING_NODE,
-                codec_version: 1,
-                checksum: [1; 32],
-            },
+            artifact: anvil_index::v4::ArtifactDescriptor::new(
+                1,
+                0,
+                0,
+                anvil_index::v4::COMPONENT_HEADER_BYTES as u64,
+                0,
+                anvil_index::v4::ComponentKind::ROUTING_NODE,
+                1,
+                [1; 32],
+            )
+            .unwrap(),
+            pack_ownership: LocatorPackOwnership::Standalone(vec![
+                anvil_index::v4::ArtifactPackReference::new(
+                    1,
+                    anvil_index::v4::artifact_path(1, hash),
+                    1,
+                    hash,
+                    anvil_index::v4::COMPONENT_HEADER_BYTES as u64,
+                )
+                .unwrap(),
+            ]),
             encoded_bytes: 1,
             logical_bytes: 1,
         }

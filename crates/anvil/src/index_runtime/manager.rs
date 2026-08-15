@@ -5,8 +5,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anvil_consensus::{DecisionRaft, NodeId};
 use anvil_index::v4::build::{
-    BuildLimits, MergeMutation, NativeSegmentWriter, ProjectedSource as NativeProjectedSource,
-    SourcePush,
+    BuildLimits, ComponentBatchSink, MergeMutation, NativeSegmentWriter,
+    ProjectedSource as NativeProjectedSource, SourcePush,
 };
 use anvil_index::v4::{
     DocIdRange, LocatorEntry, LocatorStreamRoot, LocatorValue, ObjectIdentity, Schema,
@@ -33,7 +33,9 @@ use super::catalog::{CatalogChange, CatalogDefinition, CatalogIdentity, IndexCat
 use super::cpu::{IndexCpuPool, IndexCpuPoolError};
 use super::directory::ManifestArtifactDirectory;
 use super::events::{IndexBarrier, IndexEventError, IndexEventJournal, IndexJournalPage};
-use super::generation::{LocatorRoot, MAX_SEGMENTS_PER_GENERATION, ManifestPhysicalOrder};
+use super::generation::{
+    LocatorPackOwnership, LocatorRoot, MAX_SEGMENTS_PER_GENERATION, ManifestPhysicalOrder,
+};
 use super::placement::{IndexIdentity, IndexPlacement};
 use super::publication::DerivedArtifactAdmission;
 use super::publisher::{IndexGenerationPublisher, PublishedGeneration};
@@ -1280,6 +1282,55 @@ impl CandidateGeneration {
             .ok_or_else(|| Status::resource_exhausted("path-locator sequence exhausted"))?;
         Ok(sequence)
     }
+
+    fn locator_stream_roots(&self) -> Result<Vec<LocatorStreamRoot>, Status> {
+        self.locator_roots
+            .iter()
+            .map(|root| self.locator_stream_root(root))
+            .collect()
+    }
+
+    fn locator_stream_root(&self, root: &LocatorRoot) -> Result<LocatorStreamRoot, Status> {
+        let segment = self
+            .segments
+            .binary_search_by_key(&root.identity.segment_id, |segment| {
+                segment.identity.segment_id
+            })
+            .ok()
+            .map(|position| &self.segments[position]);
+        let packs = match (&root.pack_ownership, segment) {
+            (LocatorPackOwnership::Segment, Some(segment)) if segment.identity == root.identity => {
+                segment.packs.clone()
+            }
+            (LocatorPackOwnership::Standalone(packs), None) if !packs.is_empty() => packs.clone(),
+            (LocatorPackOwnership::Segment, None) => {
+                return Err(Status::data_loss(
+                    "segment-owned locator has no generation segment",
+                ));
+            }
+            (LocatorPackOwnership::Segment, Some(_)) => {
+                return Err(Status::data_loss(
+                    "segment-owned locator identity differs from its generation segment",
+                ));
+            }
+            (LocatorPackOwnership::Standalone(_), Some(_)) => {
+                return Err(Status::data_loss(
+                    "standalone locator duplicates a generation segment owner",
+                ));
+            }
+            (LocatorPackOwnership::Standalone(_), None) => {
+                return Err(Status::data_loss(
+                    "standalone locator has no artifact pack table",
+                ));
+            }
+        };
+        Ok(LocatorStreamRoot {
+            sequence: root.sequence,
+            identity: root.identity,
+            packs,
+            artifact: root.artifact.clone(),
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1401,6 +1452,7 @@ async fn flush_builder(
         sequence,
         identity: descriptor_identity,
         artifact: built.locator.root,
+        pack_ownership: LocatorPackOwnership::Segment,
         encoded_bytes: built.locator.encoded_bytes,
         logical_bytes: built.locator.logical_bytes,
     });
