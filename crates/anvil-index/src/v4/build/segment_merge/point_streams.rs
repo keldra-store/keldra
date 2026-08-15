@@ -2,8 +2,9 @@ use crate::IndexError;
 use crate::compaction::CompactionExecutor;
 
 use super::super::super::{
-    ArtifactDirectoryRead, ComponentKind, DocId, FieldId, FieldType, PointBlock, PointEntry,
-    PointValue, ScalarValue, Schema, SegmentDescriptor, SegmentIdentity, point_entry_key,
+    ArtifactDirectoryRead, ComponentKind, DocId, FieldId, FieldType, POINT_BLOCK_ENTRIES,
+    PointBlock, PointEntry, PointValue, ScalarValue, Schema, SegmentDescriptor, SegmentIdentity,
+    point_entry_key,
 };
 use super::super::sink::{PublishedStream, StreamingComponentPublisher};
 use super::super::{ComponentBatchSink, MergeScratchFile, MergeScratchSpace};
@@ -12,7 +13,6 @@ use super::io::{RemapReader, required_stream};
 
 const SORT_FAN_IN: usize = 16;
 const RECORD_BYTES: usize = 13;
-const POINTS_PER_BLOCK: usize = 4096;
 
 pub(super) struct BuiltPointStream {
     pub(super) stream: PublishedStream,
@@ -129,7 +129,7 @@ where
         schema.codec_version(ComponentKind::ROUTING_NODE)?,
     )?;
     let mut cursor = PointCursor::new(run).await?;
-    let mut entries = Vec::with_capacity(POINTS_PER_BLOCK);
+    let mut entries = Vec::with_capacity(POINT_BLOCK_ENTRIES);
     let mut counts = FieldCounts::default();
     while let Some(entry) = cursor.next().await? {
         match &entry.value {
@@ -172,7 +172,7 @@ where
             }
         }
         entries.push(entry);
-        if entries.len() == POINTS_PER_BLOCK {
+        if entries.len() == POINT_BLOCK_ENTRIES {
             emit_block(&mut publisher, field_id, &mut entries).await?;
         }
     }

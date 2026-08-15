@@ -3,9 +3,10 @@ use crate::IndexError;
 use super::super::super::{
     ArtifactDirectoryRead, ComponentKind, DocId, FieldComponents, FieldId, FieldType,
     INDEX_COMPONENT_BYTES, PositionEntry, PositionsBlock, PostingBlock, PostingImpact,
-    PostingReference, Schema, SegmentDescriptor, SegmentIdentity, TERM_TYPE_BOOLEAN,
-    TERM_TYPE_FIELD_PRESENCE, TERM_TYPE_HASHED_KEYWORD, TERM_TYPE_NULL, TERM_TYPE_STRING,
-    TermDictionary, TermEntry, component_ordinal_key, decode_component_ordinal_key,
+    PostingReference, Schema, SegmentDescriptor, SegmentIdentity, TERM_DICTIONARY_TARGET_BYTES,
+    TERM_TYPE_BOOLEAN, TERM_TYPE_FIELD_PRESENCE, TERM_TYPE_HASHED_KEYWORD, TERM_TYPE_NULL,
+    TERM_TYPE_STRING, TermDictionary, TermEntry, component_ordinal_key,
+    decode_component_ordinal_key,
 };
 use super::super::ComponentBatchSink;
 use super::super::scratch::{MergeScratchFile, MergeScratchSpace};
@@ -346,7 +347,7 @@ where
             };
             let bytes = entry.term.len().saturating_add(28);
             if !dictionary_buffer.is_empty()
-                && dictionary_bytes.saturating_add(bytes) > INDEX_COMPONENT_BYTES / 2
+                && dictionary_bytes.saturating_add(bytes) > TERM_DICTIONARY_TARGET_BYTES
             {
                 write_dictionary_leaf(directory, &dictionaries_file, &mut dictionary_buffer)
                     .await?;

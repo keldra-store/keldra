@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 use super::*;
 use crate::IndexFileRead;
@@ -8,7 +9,7 @@ use crate::v4::build::{
     ProjectedRecord, ProjectedSource, PublishedObject, SourcePush,
 };
 use crate::v4::{
-    AggregateOperation, AggregateRequest, ArtifactDescriptor, Cardinality, Collation,
+    AggregateOperation, AggregateRequest, ArtifactPackReference, Cardinality, Collation,
     ComponentKind, ComponentVersion, DocValueCell, FIELD_PRESENCE_TERM, FacetRequest,
     FieldCapabilities, FieldComponents, FieldSchema, FieldType, IndexKind, IndexSemantics,
     NativeQuery, NativeQueryRequest, ObjectIdentity, OrderDirection, OrderField, Predicate,
@@ -38,26 +39,35 @@ struct MemoryArtifacts(BTreeMap<String, PublishedObject>);
 impl ArtifactDirectoryRead for MemoryArtifacts {
     type File = MemoryFile;
 
-    async fn open_artifact(
-        &self,
-        descriptor: &ArtifactDescriptor,
-    ) -> Result<Self::File, IndexError> {
+    async fn open_artifact(&self, pack: &ArtifactPackReference) -> Result<Self::File, IndexError> {
         let object = self
             .0
-            .get(&descriptor.path)
-            .ok_or_else(|| IndexError::FileNotFound(descriptor.path.clone()))?;
-        if object.object_version != descriptor.object_version {
+            .get(&pack.path)
+            .ok_or_else(|| IndexError::FileNotFound(pack.path.clone()))?;
+        if object.object_version != pack.object_version
+            || *blake3::hash(&object.bytes).as_bytes() != pack.object_content_hash
+            || object.bytes.len() as u64 != pack.object_length
+        {
             return Err(IndexError::Integrity);
         }
-        let start = usize::try_from(descriptor.offset).map_err(|_| IndexError::OffsetOverflow)?;
-        let length =
-            usize::try_from(descriptor.encoded_length).map_err(|_| IndexError::OffsetOverflow)?;
-        let end = start
-            .checked_add(length)
-            .ok_or(IndexError::OffsetOverflow)?;
-        Ok(MemoryFile(Arc::from(
-            object.bytes.get(start..end).ok_or(IndexError::Integrity)?,
-        )))
+        Ok(MemoryFile(Arc::from(object.bytes.as_slice())))
+    }
+}
+
+struct ParallelMemoryArtifacts {
+    inner: MemoryArtifacts,
+    parallelism: usize,
+}
+
+impl ArtifactDirectoryRead for ParallelMemoryArtifacts {
+    type File = MemoryFile;
+
+    fn query_parallelism(&self) -> usize {
+        self.parallelism
+    }
+
+    async fn open_artifact(&self, pack: &ArtifactPackReference) -> Result<Self::File, IndexError> {
+        self.inner.open_artifact(pack).await
     }
 }
 
@@ -70,6 +80,32 @@ impl CandidateGate for AllowAll {
         &self,
         candidates: &[CandidateReference],
     ) -> Result<super::super::super::CandidateGateEvidence, Self::Error> {
+        Ok(super::super::super::CandidateGateEvidence {
+            visible: vec![true; candidates.len()],
+            authorization_revision: 7,
+            denied: 0,
+            stale: 0,
+        })
+    }
+}
+
+#[derive(Default)]
+struct ConcurrentGate {
+    active: AtomicUsize,
+    maximum: AtomicUsize,
+}
+
+impl CandidateGate for ConcurrentGate {
+    type Error = IndexError;
+
+    async fn evaluate(
+        &self,
+        candidates: &[CandidateReference],
+    ) -> Result<super::super::super::CandidateGateEvidence, Self::Error> {
+        let active = self.active.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+        self.maximum.fetch_max(active, AtomicOrdering::SeqCst);
+        tokio::task::yield_now().await;
+        self.active.fetch_sub(1, AtomicOrdering::SeqCst);
         Ok(super::super::super::CandidateGateEvidence {
             visible: vec![true; candidates.len()],
             authorization_revision: 7,
@@ -360,7 +396,17 @@ async fn build_fixture(
     index_id: u64,
     sources: Vec<ProjectedSource>,
 ) -> (Schema, SegmentDescriptor, MemoryArtifacts) {
-    let identity = SegmentIdentity::new(index_id, 1, schema.fingerprint().unwrap(), 1).unwrap();
+    build_segment_fixture(schema, index_id, 1, sources).await
+}
+
+async fn build_segment_fixture(
+    schema: Schema,
+    index_id: u64,
+    segment_id: u64,
+    sources: Vec<ProjectedSource>,
+) -> (Schema, SegmentDescriptor, MemoryArtifacts) {
+    let identity =
+        SegmentIdentity::new(index_id, 1, schema.fingerprint().unwrap(), segment_id).unwrap();
     let mut writer = NativeSegmentWriter::new(
         identity,
         schema.clone(),
@@ -474,6 +520,146 @@ async fn exact_prefix_range_and_exists_use_declared_native_components() {
         .await
         .unwrap();
     assert_eq!(paths(&exists), BTreeSet::from(["a", "b", "c"]));
+}
+
+#[tokio::test]
+async fn point_range_traverses_each_routed_leaf_once_for_many_matches() {
+    let schema = schema();
+    let sources = (0..1_024)
+        .map(|index| source(&format!("objects/{index:04}"), "active", 1))
+        .collect();
+    let (schema, segment, directory) = build_fixture(schema, 91, sources).await;
+    let executor =
+        NativeQueryExecutor::new(&directory, &AllowAll, NativeQueryLimits::default()).unwrap();
+    let mut query = request(
+        &schema,
+        &segment,
+        NativeQuery::Filter {
+            predicate: Some(Predicate::Range {
+                id: PredicateId::new(1),
+                field_id: FieldId::new(1),
+                lower: Some(RangeBound {
+                    value: ScalarValue::Signed(1),
+                    inclusive: true,
+                }),
+                upper: Some(RangeBound {
+                    value: ScalarValue::Signed(1),
+                    inclusive: true,
+                }),
+            }),
+            order: Vec::new(),
+        },
+    );
+    query.limit = 100;
+    let statistics = NativeQueryStatisticsRecorder::new();
+
+    let page = executor
+        .execute_observed(&query, statistics.clone())
+        .await
+        .unwrap();
+
+    assert_eq!(page.hits.len(), 100);
+    let snapshot = statistics.snapshot();
+    assert_eq!(snapshot.candidate_doc_ids, 1_024);
+    assert!(snapshot.point_blocks_decoded <= 3, "{snapshot:?}");
+}
+
+#[tokio::test]
+async fn term_prefix_traverses_the_dictionary_once_for_many_matches() {
+    let schema = keyword_schema(IndexKind::MetadataFilter, IndexSemantics::MetadataFilter);
+    let sources = (0..1_024)
+        .map(|index| keyword_source(&format!("objects/{index:04}"), &format!("value/{index:04}")))
+        .collect();
+    let (schema, segment, directory) = build_fixture(schema, 92, sources).await;
+    let executor =
+        NativeQueryExecutor::new(&directory, &AllowAll, NativeQueryLimits::default()).unwrap();
+    let mut query = request(
+        &schema,
+        &segment,
+        NativeQuery::Filter {
+            predicate: Some(Predicate::Prefix {
+                id: PredicateId::new(1),
+                field_id: FieldId::new(0),
+                prefix: "value/".into(),
+            }),
+            order: Vec::new(),
+        },
+    );
+    query.limit = 100;
+    let statistics = NativeQueryStatisticsRecorder::new();
+
+    let page = executor
+        .execute_observed(&query, statistics.clone())
+        .await
+        .unwrap();
+
+    assert_eq!(page.hits.len(), 100);
+    let snapshot = statistics.snapshot();
+    assert_eq!(snapshot.candidate_doc_ids, 1_024);
+    assert_eq!(snapshot.term_seeks, 1, "{snapshot:?}");
+}
+
+#[tokio::test]
+async fn independent_segments_rank_concurrently_and_merge_exact_top_k() {
+    let mut schema = schema();
+    schema.physical_order.clear();
+    let clear_order = |mut source: ProjectedSource| {
+        source.records[0].order_key.clear();
+        source
+    };
+    let (schema, first, first_directory) = build_segment_fixture(
+        schema,
+        93,
+        1,
+        vec![
+            clear_order(source("a", "active", 1)),
+            clear_order(source("b", "active", 4)),
+        ],
+    )
+    .await;
+    let (_, second, second_directory) = build_segment_fixture(
+        schema.clone(),
+        93,
+        2,
+        vec![
+            clear_order(source("c", "active", 2)),
+            clear_order(source("d", "active", 5)),
+        ],
+    )
+    .await;
+    let mut objects = first_directory.0;
+    objects.extend(second_directory.0);
+    let directory = ParallelMemoryArtifacts {
+        inner: MemoryArtifacts(objects),
+        parallelism: 2,
+    };
+    let gate = ConcurrentGate::default();
+    let executor =
+        NativeQueryExecutor::new(&directory, &gate, NativeQueryLimits::default()).unwrap();
+    let mut query = request(
+        &schema,
+        &first,
+        NativeQuery::Filter {
+            predicate: None,
+            order: vec![OrderField {
+                field_id: FieldId::new(1),
+                direction: OrderDirection::Descending,
+            }],
+        },
+    );
+    query.segments.push(second);
+    query.limit = 2;
+
+    let page = executor.execute(&query).await.unwrap();
+
+    assert_eq!(
+        page.hits
+            .iter()
+            .map(|hit| hit.result.path.as_str())
+            .collect::<Vec<_>>(),
+        ["d", "b"]
+    );
+    assert_eq!(gate.maximum.load(AtomicOrdering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -940,7 +1126,10 @@ async fn executor_fails_closed_on_generation_corruption_and_resource_limits() {
         .unwrap()
         .artifact
         .clone();
-    let object = corrupt_directory.0.get_mut(&identity.path).unwrap();
+    let pack = identity
+        .pack(segment.identity.index_id, &segment.packs)
+        .unwrap();
+    let object = corrupt_directory.0.get_mut(&pack.path).unwrap();
     let byte = usize::try_from(identity.offset).unwrap() + 16;
     object.bytes[byte] ^= 1;
     let corrupt =

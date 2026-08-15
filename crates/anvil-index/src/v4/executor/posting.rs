@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::collections::{BTreeSet, BinaryHeap};
+use std::collections::BinaryHeap;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -16,11 +16,58 @@ use super::super::{
 type CursorFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Option<DocId>, IndexError>> + Send + 'a>>;
 
-/// Maximum sorted document batch retained by one dictionary-range cursor.
-/// Dictionary leaves and posting blocks are streamed one at a time; this is
-/// the only state whose size does not already have a format-level component
-/// bound.
-const TERM_RANGE_DOCUMENT_BATCH: usize = 256;
+/// One exact segment-local candidate set. Lucene's point and multi-term
+/// queries likewise materialize matches once before exposing an ordered
+/// DocId iterator. The caller charges these words from the query budget before
+/// execution; total memory is independent of the number of matching values.
+struct SegmentDocSet {
+    words: Vec<u64>,
+    document_count: u32,
+}
+
+impl SegmentDocSet {
+    fn new(document_count: u32) -> Result<Self, IndexError> {
+        let words = usize::try_from(document_count)
+            .map_err(|_| IndexError::OffsetOverflow)?
+            .div_ceil(u64::BITS as usize);
+        Ok(Self {
+            words: vec![0; words],
+            document_count,
+        })
+    }
+
+    fn insert(&mut self, doc_id: DocId) -> Result<(), IndexError> {
+        if doc_id.get() >= self.document_count {
+            return Err(IndexError::InvalidFormat(
+                "candidate DocId exceeds its segment",
+            ));
+        }
+        let ordinal = doc_id.get() as usize;
+        self.words[ordinal / u64::BITS as usize] |= 1 << (ordinal % u64::BITS as usize);
+        Ok(())
+    }
+
+    fn first_at_or_after(&self, target: u32) -> Option<DocId> {
+        if target >= self.document_count {
+            return None;
+        }
+        let ordinal = target as usize;
+        let mut word_index = ordinal / u64::BITS as usize;
+        let bit = ordinal % u64::BITS as usize;
+        let mut word = self.words[word_index] & (u64::MAX << bit);
+        loop {
+            if word != 0 {
+                let candidate = word_index
+                    .checked_mul(u64::BITS as usize)?
+                    .checked_add(word.trailing_zeros() as usize)?;
+                let candidate = u32::try_from(candidate).ok()?;
+                return (candidate < self.document_count).then(|| DocId::new(candidate));
+            }
+            word_index = word_index.checked_add(1)?;
+            word = *self.words.get(word_index)?;
+        }
+    }
+}
 
 #[derive(Clone)]
 pub(super) struct TermBounds {
@@ -92,6 +139,7 @@ impl<'a, D: ArtifactDirectoryRead> PostingStream<'a, D> {
         let stream = ComponentStream::new(
             directory,
             segment.identity,
+            &segment.packs,
             ComponentKind::POSTINGS,
             root.clone(),
             Some(component_ordinal_key(reference.first_component_ordinal).to_vec()),
@@ -162,6 +210,7 @@ impl<'a, D: ArtifactDirectoryRead> PostingStream<'a, D> {
         let loaded = read_artifact_component(
             self.directory,
             self.segment.identity,
+            &self.segment.packs,
             &leaf.descriptor,
             ComponentKind::POSTINGS,
         )
@@ -252,6 +301,7 @@ impl<'a, D: ArtifactDirectoryRead> PostingStream<'a, D> {
         self.stream = ComponentStream::new(
             self.directory,
             self.segment.identity,
+            &self.segment.packs,
             ComponentKind::POSTINGS,
             self.root.clone(),
             Some(component_ordinal_key(ordinal).to_vec()),
@@ -272,18 +322,15 @@ fn required_impact(block: &DecodedPostingBlock) -> Result<PostingImpact, IndexEr
 }
 
 /// Exact union of every posting whose term falls within one ordered dictionary
-/// range. Only one dictionary leaf, one posting block, and a fixed DocId batch
-/// are resident at once. Reaching the batch boundary restarts the bounded
-/// dictionary traversal strictly after the last emitted DocId.
+/// range. Immutable dictionary and posting leaves are traversed once into a
+/// charged segment-local DocId set, then exposed as an ordered cursor.
 pub(super) struct TermRangeStream<'a, D> {
     directory: &'a D,
     segment: &'a SegmentDescriptor,
     field_id: FieldId,
     dictionary_root: ArtifactDescriptor,
     bounds: TermBounds,
-    next_minimum: u32,
-    batch: Vec<DocId>,
-    position: usize,
+    documents: Option<SegmentDocSet>,
     current: Option<DocId>,
     exhausted: bool,
     estimated_documents: u64,
@@ -368,9 +415,7 @@ pub(super) struct PointRangeStream<'a, D> {
     field_id: FieldId,
     root: ArtifactDescriptor,
     bounds: PointBounds,
-    next_minimum: u32,
-    batch: Vec<DocId>,
-    position: usize,
+    documents: Option<SegmentDocSet>,
     current: Option<DocId>,
     exhausted: bool,
     estimated_documents: u64,
@@ -391,9 +436,7 @@ impl<'a, D: ArtifactDirectoryRead> PointRangeStream<'a, D> {
             field_id,
             root: component_root(segment, ComponentKind::POINTS, Some(field_id))?,
             bounds,
-            next_minimum: 0,
-            batch: Vec::new(),
-            position: 0,
+            documents: None,
             current: None,
             exhausted: false,
             estimated_documents: u64::from(segment.document_count),
@@ -401,12 +444,8 @@ impl<'a, D: ArtifactDirectoryRead> PointRangeStream<'a, D> {
         })
     }
 
-    async fn prepare_batch(&mut self) -> Result<(), IndexError> {
-        self.batch.clear();
-        self.position = 0;
-        self.current = None;
-        if self.exhausted || self.next_minimum >= self.segment.document_count {
-            self.exhausted = true;
+    async fn prepare(&mut self) -> Result<(), IndexError> {
+        if self.documents.is_some() {
             return Ok(());
         }
         let (minimum, maximum) = if self.bounds.presence {
@@ -446,16 +485,18 @@ impl<'a, D: ArtifactDirectoryRead> PointRangeStream<'a, D> {
         let mut stream = ComponentStream::new(
             self.directory,
             self.segment.identity,
+            &self.segment.packs,
             ComponentKind::POINTS,
             self.root.clone(),
             minimum,
             maximum,
         )?;
-        let mut candidates = BTreeSet::new();
+        let mut candidates = SegmentDocSet::new(self.segment.document_count)?;
         while let Some(leaf) = stream.next_leaf().await? {
             let loaded = read_artifact_component(
                 self.directory,
                 self.segment.identity,
+                &self.segment.packs,
                 &leaf.descriptor,
                 ComponentKind::POINTS,
             )
@@ -469,59 +510,40 @@ impl<'a, D: ArtifactDirectoryRead> PointRangeStream<'a, D> {
                 return Err(IndexError::InvalidFormat("point field identity"));
             }
             for entry in block.entries() {
-                if entry.doc_id.get() < self.next_minimum || !self.bounds.contains(&entry.value) {
+                if !self.bounds.contains(&entry.value) {
                     continue;
                 }
-                candidates.insert(entry.doc_id);
-                if candidates.len() > TERM_RANGE_DOCUMENT_BATCH {
-                    candidates.pop_last();
-                }
+                candidates.insert(entry.doc_id)?;
             }
         }
-        if candidates.is_empty() {
-            self.exhausted = true;
-            return Ok(());
-        }
-        self.batch.extend(candidates);
-        self.next_minimum = self
-            .batch
-            .last()
-            .copied()
-            .ok_or(IndexError::InvalidFormat("empty point document batch"))?
-            .checked_next()?
-            .get();
+        self.documents = Some(candidates);
         Ok(())
     }
 
     async fn next(&mut self) -> Result<Option<DocId>, IndexError> {
-        if self.position == self.batch.len() {
-            self.prepare_batch().await?;
-        }
-        let Some(value) = self.batch.get(self.position).copied() else {
-            self.current = None;
-            return Ok(None);
-        };
-        self.position += 1;
-        self.current = Some(value);
-        Ok(Some(value))
+        let target = self
+            .current
+            .map(DocId::checked_next)
+            .transpose()?
+            .map_or(0, DocId::get);
+        self.advance(DocId::new(target)).await
     }
 
     async fn advance(&mut self, target: DocId) -> Result<Option<DocId>, IndexError> {
+        if self.exhausted {
+            return Ok(None);
+        }
         if self.current.is_some_and(|current| current >= target) {
             return Ok(self.current);
         }
-        let remaining = &self.batch[self.position..];
-        let offset = remaining.partition_point(|value| *value < target);
-        if let Some(value) = remaining.get(offset).copied() {
-            self.position += offset + 1;
-            self.current = Some(value);
-            return Ok(Some(value));
-        }
-        self.next_minimum = self.next_minimum.max(target.get());
-        self.batch.clear();
-        self.position = 0;
-        self.current = None;
-        self.next().await
+        self.prepare().await?;
+        self.current = self
+            .documents
+            .as_ref()
+            .expect("point candidate set prepared")
+            .first_at_or_after(target.get());
+        self.exhausted = self.current.is_none();
+        Ok(self.current)
     }
 }
 
@@ -551,6 +573,7 @@ impl<'a, D: ArtifactDirectoryRead> DocValuePresenceStream<'a, D> {
             stream: ComponentStream::new(
                 directory,
                 segment.identity,
+                &segment.packs,
                 ComponentKind::DOC_VALUES,
                 root,
                 None,
@@ -571,6 +594,7 @@ impl<'a, D: ArtifactDirectoryRead> DocValuePresenceStream<'a, D> {
         let loaded = read_artifact_component(
             self.directory,
             self.segment.identity,
+            &self.segment.packs,
             &leaf.descriptor,
             ComponentKind::DOC_VALUES,
         )
@@ -648,9 +672,7 @@ impl<'a, D: ArtifactDirectoryRead> TermRangeStream<'a, D> {
             field_id,
             dictionary_root,
             bounds,
-            next_minimum: 0,
-            batch: Vec::new(),
-            position: 0,
+            documents: None,
             current: None,
             exhausted: false,
             estimated_documents: u64::from(segment.document_count),
@@ -658,20 +680,17 @@ impl<'a, D: ArtifactDirectoryRead> TermRangeStream<'a, D> {
         })
     }
 
-    async fn prepare_batch(&mut self) -> Result<(), IndexError> {
-        self.batch.clear();
-        self.position = 0;
-        self.current = None;
-        if self.exhausted || self.next_minimum >= self.segment.document_count {
-            self.exhausted = true;
+    async fn prepare(&mut self) -> Result<(), IndexError> {
+        if self.documents.is_some() {
             return Ok(());
         }
 
         self.statistics.term_seek();
-        let mut candidates = BTreeSet::new();
+        let mut candidates = SegmentDocSet::new(self.segment.document_count)?;
         let mut dictionaries = ComponentStream::new(
             self.directory,
             self.segment.identity,
+            &self.segment.packs,
             ComponentKind::TERM_DICTIONARY,
             self.dictionary_root.clone(),
             Some(self.bounds.minimum.clone()),
@@ -681,6 +700,7 @@ impl<'a, D: ArtifactDirectoryRead> TermRangeStream<'a, D> {
             let loaded = read_artifact_component(
                 self.directory,
                 self.segment.identity,
+                &self.segment.packs,
                 &leaf.descriptor,
                 ComponentKind::TERM_DICTIONARY,
             )
@@ -702,68 +722,41 @@ impl<'a, D: ArtifactDirectoryRead> TermRangeStream<'a, D> {
                     entry.postings,
                     self.statistics.clone(),
                 )?;
-                let mut candidate = postings.advance(DocId::new(self.next_minimum)).await?;
+                let mut candidate = postings.next().await?;
                 while let Some(doc_id) = candidate {
-                    if candidates.len() == TERM_RANGE_DOCUMENT_BATCH
-                        && candidates.last().is_some_and(|largest| doc_id >= *largest)
-                    {
-                        // This posting and every value after it are ordered and
-                        // cannot enter the globally smallest retained batch.
-                        break;
-                    }
-                    candidates.insert(doc_id);
-                    if candidates.len() > TERM_RANGE_DOCUMENT_BATCH {
-                        candidates.pop_last();
-                    }
+                    candidates.insert(doc_id)?;
                     candidate = postings.next().await?;
                 }
             }
         }
-
-        if candidates.is_empty() {
-            self.exhausted = true;
-            return Ok(());
-        }
-        self.batch.extend(candidates);
-        self.next_minimum = self
-            .batch
-            .last()
-            .copied()
-            .ok_or(IndexError::InvalidFormat("empty term-range document batch"))?
-            .checked_next()?
-            .get();
+        self.documents = Some(candidates);
         Ok(())
     }
 
     async fn next(&mut self) -> Result<Option<DocId>, IndexError> {
-        if self.position == self.batch.len() {
-            self.prepare_batch().await?;
-        }
-        let Some(value) = self.batch.get(self.position).copied() else {
-            self.current = None;
-            return Ok(None);
-        };
-        self.position += 1;
-        self.current = Some(value);
-        Ok(Some(value))
+        let target = self
+            .current
+            .map(DocId::checked_next)
+            .transpose()?
+            .map_or(0, DocId::get);
+        self.advance(DocId::new(target)).await
     }
 
     async fn advance(&mut self, target: DocId) -> Result<Option<DocId>, IndexError> {
+        if self.exhausted {
+            return Ok(None);
+        }
         if self.current.is_some_and(|current| current >= target) {
             return Ok(self.current);
         }
-        let remaining = &self.batch[self.position..];
-        let offset = remaining.partition_point(|value| *value < target);
-        if let Some(value) = remaining.get(offset).copied() {
-            self.position += offset + 1;
-            self.current = Some(value);
-            return Ok(Some(value));
-        }
-        self.next_minimum = self.next_minimum.max(target.get());
-        self.batch.clear();
-        self.position = 0;
-        self.current = None;
-        self.next().await
+        self.prepare().await?;
+        self.current = self
+            .documents
+            .as_ref()
+            .expect("term-range candidate set prepared")
+            .first_at_or_after(target.get());
+        self.exhausted = self.current.is_none();
+        Ok(self.current)
     }
 }
 
@@ -1126,6 +1119,7 @@ async fn positions_for<D: ArtifactDirectoryRead>(
     let mut stream = ComponentStream::new(
         directory,
         segment.identity,
+        &segment.packs,
         ComponentKind::POSITIONS,
         root,
         Some(key.clone()),
@@ -1142,6 +1136,7 @@ async fn positions_for<D: ArtifactDirectoryRead>(
     let loaded = read_artifact_component(
         directory,
         segment.identity,
+        &segment.packs,
         &leaf.descriptor,
         ComponentKind::POSITIONS,
     )

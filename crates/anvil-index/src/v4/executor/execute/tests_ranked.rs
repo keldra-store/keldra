@@ -8,7 +8,7 @@ use crate::v4::build::{
     ProjectedSource, ProjectedTerm, ProjectedVector, PublishedObject, SourcePush,
 };
 use crate::v4::{
-    Analyzer, ArtifactDescriptor, ArtifactDirectoryRead, CandidateGate, CandidateGateEvidence,
+    Analyzer, ArtifactDirectoryRead, ArtifactPackReference, CandidateGate, CandidateGateEvidence,
     CandidateReference, Cardinality, Collation, ComponentKind, ComponentVersion, DocValueCell,
     FieldCapabilities, FieldComponents, FieldId, FieldSchema, FieldType, IndexKind, IndexSemantics,
     NativeQuery, NativeQueryExecutor, NativeQueryLimits, NativeQueryRequest, ObjectIdentity,
@@ -38,26 +38,18 @@ struct RankedMemoryArtifacts(BTreeMap<String, PublishedObject>);
 impl ArtifactDirectoryRead for RankedMemoryArtifacts {
     type File = RankedMemoryFile;
 
-    async fn open_artifact(
-        &self,
-        descriptor: &ArtifactDescriptor,
-    ) -> Result<Self::File, IndexError> {
+    async fn open_artifact(&self, pack: &ArtifactPackReference) -> Result<Self::File, IndexError> {
         let object = self
             .0
-            .get(&descriptor.path)
-            .ok_or_else(|| IndexError::FileNotFound(descriptor.path.clone()))?;
-        if object.object_version != descriptor.object_version {
+            .get(&pack.path)
+            .ok_or_else(|| IndexError::FileNotFound(pack.path.clone()))?;
+        if object.object_version != pack.object_version
+            || *blake3::hash(&object.bytes).as_bytes() != pack.object_content_hash
+            || object.bytes.len() as u64 != pack.object_length
+        {
             return Err(IndexError::Integrity);
         }
-        let start = usize::try_from(descriptor.offset).map_err(|_| IndexError::OffsetOverflow)?;
-        let length =
-            usize::try_from(descriptor.encoded_length).map_err(|_| IndexError::OffsetOverflow)?;
-        let end = start
-            .checked_add(length)
-            .ok_or(IndexError::OffsetOverflow)?;
-        Ok(RankedMemoryFile(Arc::from(
-            object.bytes.get(start..end).ok_or(IndexError::Integrity)?,
-        )))
+        Ok(RankedMemoryFile(Arc::from(object.bytes.as_slice())))
     }
 }
 

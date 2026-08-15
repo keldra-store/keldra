@@ -261,7 +261,7 @@ impl NativeQueryRequest {
     /// Conservative checked reservation for the default native executor.
     /// Custom executor limits should use `NativeQueryExecutor::working_memory_bytes`.
     pub fn working_memory_bytes(&self) -> Result<usize, IndexError> {
-        super::executor::estimate_working_memory(self, super::NativeQueryLimits::default())
+        super::executor::estimate_working_memory(self, super::NativeQueryLimits::default(), 1)
     }
 
     fn expected_cursor_values(&self) -> usize {

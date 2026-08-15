@@ -228,6 +228,7 @@ impl<'a, D: ArtifactDirectoryRead> SegmentComponentReader<'a, D> {
         let mut stream = ComponentStream::new(
             self.directory,
             self.segment.identity,
+            &self.segment.packs,
             role,
             component.artifact.clone(),
             minimum,
@@ -238,6 +239,7 @@ impl<'a, D: ArtifactDirectoryRead> SegmentComponentReader<'a, D> {
             let component = read_artifact_component(
                 self.directory,
                 self.segment.identity,
+                &self.segment.packs,
                 &leaf.descriptor,
                 role,
             )

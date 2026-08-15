@@ -9,6 +9,10 @@ use super::model::{INDEX_COMPONENT_BYTES, INDEX_TERM_BYTES, validate_term_routin
 
 const TERM_DICTIONARY_CODEC_VERSION: u16 = 1;
 const MAX_PAYLOAD_BYTES: usize = INDEX_COMPONENT_BYTES - COMPONENT_HEADER_BYTES;
+/// Target one independently addressable dictionary leaf at 32 KiB. The
+/// 512-KiB component ceiling remains the hard bound for a legal singleton
+/// long term, but ordinary exact seeks should not have to read that ceiling.
+pub(crate) const TERM_DICTIONARY_TARGET_BYTES: usize = 32 * 1024;
 
 /// A bounded range of leaf ordinals in the field's routed `POSTINGS` stream.
 /// It never denotes entries in the segment manifest: one field has one
@@ -121,7 +125,7 @@ impl TermDictionary {
                 .checked_add(entry.term.len())
                 .and_then(|value| value.checked_add(8 + 8 + 4 + 4))
                 .ok_or(IndexError::OffsetOverflow)?;
-            if !pending.is_empty() && bytes.saturating_add(row) > MAX_PAYLOAD_BYTES {
+            if !pending.is_empty() && bytes.saturating_add(row) > TERM_DICTIONARY_TARGET_BYTES {
                 blocks.push(Self::new(std::mem::take(&mut pending))?);
                 bytes = 6;
             }

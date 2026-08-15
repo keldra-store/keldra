@@ -785,6 +785,7 @@ where
     let mut stream = ComponentStream::new(
         directory,
         segment.identity,
+        &segment.packs,
         ComponentKind::TERM_DICTIONARY,
         root,
         Some(minimum),
@@ -795,6 +796,7 @@ where
         let loaded = read_artifact_component(
             directory,
             segment.identity,
+            &segment.packs,
             &leaf.descriptor,
             ComponentKind::TERM_DICTIONARY,
         )

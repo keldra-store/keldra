@@ -4,8 +4,8 @@ use crate::IndexError;
 use crate::compaction::CompactionExecutor;
 
 use super::super::super::{
-    ArtifactDirectoryRead, ComponentKind, ComponentStream, FieldId, SegmentComponent,
-    SegmentDescriptor, SegmentIdentity, StreamLeaf, read_artifact_component,
+    ArtifactDirectoryRead, ArtifactPackReference, ComponentKind, ComponentStream, FieldId,
+    SegmentComponent, SegmentDescriptor, SegmentIdentity, StreamLeaf, read_artifact_component,
 };
 use super::super::scratch::MergeScratchFile;
 
@@ -35,9 +35,9 @@ where
 
     fn open_artifact(
         &self,
-        descriptor: &super::super::super::ArtifactDescriptor,
+        pack: &ArtifactPackReference,
     ) -> impl Future<Output = Result<Self::File, IndexError>> + Send {
-        self.directory.open_artifact(descriptor)
+        self.directory.open_artifact(pack)
     }
 
     fn run_query_cpu<T, F>(&self, work: F) -> impl Future<Output = Result<T, IndexError>> + Send
@@ -52,6 +52,7 @@ where
 pub(super) struct RoutedBlockStream<'a, D> {
     directory: &'a D,
     identity: SegmentIdentity,
+    packs: &'a [ArtifactPackReference],
     kind: ComponentKind,
     stream: ComponentStream<'a, D>,
 }
@@ -64,9 +65,14 @@ impl<'a, D: ArtifactDirectoryRead> RoutedBlockStream<'a, D> {
         let Some(leaf) = self.stream.next_leaf().await? else {
             return Ok(None);
         };
-        let component =
-            read_artifact_component(self.directory, self.identity, &leaf.descriptor, self.kind)
-                .await?;
+        let component = read_artifact_component(
+            self.directory,
+            self.identity,
+            self.packs,
+            &leaf.descriptor,
+            self.kind,
+        )
+        .await?;
         let payload = component.payload;
         let decoded = self
             .directory
@@ -108,10 +114,12 @@ pub(super) fn optional_stream<'a, D: ArtifactDirectoryRead>(
     Ok(Some(RoutedBlockStream {
         directory,
         identity: segment.identity,
+        packs: &segment.packs,
         kind,
         stream: ComponentStream::new(
             directory,
             segment.identity,
+            &segment.packs,
             kind,
             component.artifact.clone(),
             minimum,

@@ -34,8 +34,9 @@ mod decoder_mutation_tests;
 
 pub use analyzer::analyze_unicode_alphanumeric_lowercase;
 pub use artifact::{
-    ArtifactDescriptor, ArtifactReference, GeneratedComponent, SegmentComponent, SegmentDescriptor,
-    artifact_path, current_path, definition_path, manifest_path,
+    ArtifactDescriptor, ArtifactPackReference, ArtifactReference, GeneratedComponent,
+    SegmentComponent, SegmentDescriptor, artifact_path, current_path, definition_path,
+    manifest_path,
 };
 pub use codec::{
     COMPONENT_HEADER_BYTES, ComponentHeader, DecodedComponent, decode_component, encode_component,
@@ -47,8 +48,8 @@ pub use executor::{
 pub use identity::{DocumentIdentity, IdentityBlock, ObjectIdentity};
 pub use io::{ArtifactDirectoryRead, LoadedComponent, read_artifact_component};
 pub use keys::{
-    FIELD_PRESENCE_TERM, TERM_TYPE_BOOLEAN, TERM_TYPE_FIELD_PRESENCE, TERM_TYPE_NULL,
-    TERM_TYPE_HASHED_KEYWORD, TERM_TYPE_NUMBER, TERM_TYPE_SIGNED, TERM_TYPE_STRING, TERM_TYPE_TEXT,
+    FIELD_PRESENCE_TERM, TERM_TYPE_BOOLEAN, TERM_TYPE_FIELD_PRESENCE, TERM_TYPE_HASHED_KEYWORD,
+    TERM_TYPE_NULL, TERM_TYPE_NUMBER, TERM_TYPE_SIGNED, TERM_TYPE_STRING, TERM_TYPE_TEXT,
     TERM_TYPE_UNSIGNED, canonical_term_key, encode_physical_order_key, scalar_term, text_term,
 };
 pub use liveness::{LIVE_MASK_BLOCK_DOCS, LiveMask, LiveMaskBlock};
@@ -65,12 +66,13 @@ pub use mutation::{
     LOCATOR_COMPACTION_FAN_IN, LocatorStreamRoot, compact_locator_roots, locate_path,
     locate_path_values, locate_paths, publish_locator_delta, rewrite_segment_live_mask,
 };
-pub use postings::{
-    POSTING_SKIP_INTERVAL, PostingBlock, PostingCodec, PostingCursor, PostingImpact, PostingList,
-};
+pub(crate) use points::POINT_BLOCK_ENTRIES;
 pub use points::{
     POINTS_COMPONENT_CODEC_VERSION, PointBlock, PointEntry, PointValue, point_entry_key,
     point_presence_key, point_scalar_key, point_value_key, point_value_range,
+};
+pub use postings::{
+    POSTING_SKIP_INTERVAL, PostingBlock, PostingCodec, PostingCursor, PostingImpact, PostingList,
 };
 pub use query::{
     AggregateOperation, AggregateRequest, AggregateResult, CandidateGate, CandidateGateEvidence,
@@ -85,14 +87,15 @@ pub use scan::{
     SortCursor, SortValue,
 };
 pub use schema::{
-    Analyzer, Cardinality, Collation, ComponentVersion, FieldCapabilities, FieldComponents, FieldId,
-    FieldSchema, FieldType, IndexKind, IndexSemantics, OrderDirection, OrderField, Schema,
+    Analyzer, Cardinality, Collation, ComponentVersion, FieldCapabilities, FieldComponents,
+    FieldId, FieldSchema, FieldType, IndexKind, IndexSemantics, OrderDirection, OrderField, Schema,
     VectorMetric, VectorNormalization,
 };
 pub use segment_reader::SegmentComponentReader;
 pub use statistics::{
     NativeQueryExecutionTier, NativeQueryStatistics, NativeQueryStatisticsRecorder,
 };
+pub(crate) use terms::TERM_DICTIONARY_TARGET_BYTES;
 pub use terms::{PostingReference, TermDictionary, TermEntry};
 pub use text::{
     ComponentStatistics, FieldStatistics, NormBlock, PhysicalOrderBounds, PositionEntry,

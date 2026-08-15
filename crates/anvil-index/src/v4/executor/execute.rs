@@ -5,6 +5,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::IndexError;
+use futures_util::future::join_all;
 
 use super::super::{
     ArtifactDirectoryRead, CandidateGate, CandidateReference, DocId, FieldId,
@@ -127,7 +128,11 @@ where
     }
 
     pub fn working_memory_bytes(&self, request: &NativeQueryRequest) -> Result<usize, IndexError> {
-        super::memory::estimate_working_memory(request, self.limits)
+        super::memory::estimate_working_memory(
+            request,
+            self.limits,
+            self.directory.query_parallelism(),
+        )
     }
 
     pub async fn execute<'query>(
@@ -303,47 +308,116 @@ where
         statistics: &NativeQueryStatisticsRecorder,
     ) -> Result<Vec<Selected>, NativeQueryExecutionError<G::Error>> {
         let directions = Arc::<[OrderDirection]>::from(query_directions(request));
-        let mut heap = BinaryHeap::new();
-        for execution in executions.iter_mut() {
-            let mut pending = Vec::with_capacity(self.limits.candidate_gate_batch);
-            while let Some(candidate) = execution
-                .next_competitive(request, global, impact::threshold(request, &heap))
-                .await?
-            {
-                statistics.top_k_inspected();
-                pending.push(candidate);
-                if pending.len() == self.limits.candidate_gate_batch {
-                    self.rank_batch(
+        let requested_lanes = self
+            .directory
+            .query_parallelism()
+            .max(1)
+            .min(executions.len().max(1));
+        // Full-text block-max pruning depends on the best score found in
+        // earlier segments. Keep that proven global threshold until a shared
+        // competitive-score implementation can parallelize it without
+        // multiplying candidate verification.
+        let lanes = if matches!(&request.query, NativeQuery::FullText { .. }) {
+            1
+        } else {
+            requested_lanes
+        };
+        if lanes == 1 {
+            let mut heap = BinaryHeap::new();
+            for execution in executions.iter_mut() {
+                heap = self
+                    .execute_segment_top_k(
                         request,
                         global,
                         scoring_query_vector,
                         execution,
                         &directions,
-                        &mut pending,
-                        &mut heap,
+                        heap,
                         statistics,
                     )
                     .await?;
-                }
             }
-            if !pending.is_empty() {
-                self.rank_batch(
+            let mut values = heap.into_vec();
+            values.sort_by(compare_selected);
+            return Ok(values);
+        }
+        // A global top K is necessarily contained in the union of every
+        // segment's local top K. This keeps parallel lanes independent and
+        // publication/order semantics identical to the serial merge.
+        let mut heap = BinaryHeap::new();
+        for chunk in executions.chunks_mut(lanes) {
+            let mut work = Vec::with_capacity(chunk.len());
+            for execution in chunk {
+                work.push(self.execute_segment_top_k(
                     request,
                     global,
                     scoring_query_vector,
                     execution,
                     &directions,
+                    BinaryHeap::new(),
+                    statistics,
+                ));
+            }
+            for selected in join_all(work).await {
+                for selected in selected? {
+                    heap.push(selected);
+                    if heap.len() > request.limit as usize {
+                        heap.pop();
+                    }
+                }
+            }
+        }
+        let mut values = heap.into_vec();
+        values.sort_by(compare_selected);
+        Ok(values)
+    }
+
+    async fn execute_segment_top_k<'query>(
+        &'query self,
+        request: &NativeQueryRequest,
+        global: &GlobalTextStatistics,
+        scoring_query_vector: Option<&Arc<[f32]>>,
+        execution: &mut SegmentExecution<'query, D>,
+        directions: &Arc<[OrderDirection]>,
+        mut heap: BinaryHeap<Selected>,
+        statistics: &NativeQueryStatisticsRecorder,
+    ) -> Result<BinaryHeap<Selected>, NativeQueryExecutionError<G::Error>> {
+        let mut pending = Vec::with_capacity(self.limits.candidate_gate_batch);
+        while let Some(candidate) = execution
+            .next_competitive(request, global, impact::threshold(request, &heap))
+            .await?
+        {
+            statistics.top_k_inspected();
+            pending.push(candidate);
+            if pending.len() == self.limits.candidate_gate_batch {
+                self.rank_batch(
+                    request,
+                    global,
+                    scoring_query_vector,
+                    execution,
+                    directions,
                     &mut pending,
                     &mut heap,
                     statistics,
                 )
                 .await?;
             }
-            execution.release_decoded()?;
         }
-        let mut values = heap.into_vec();
-        values.sort_by(compare_selected);
-        Ok(values)
+        if !pending.is_empty() {
+            self.rank_batch(
+                request,
+                global,
+                scoring_query_vector,
+                execution,
+                directions,
+                &mut pending,
+                &mut heap,
+                statistics,
+            )
+            .await?;
+        }
+        execution.release_decoded()?;
+        Ok(heap)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -437,19 +511,32 @@ where
         let order = physical_order(request).expect("checked physical plan");
         let directions = Arc::<[OrderDirection]>::from(query_directions(request));
         let after = physical_after(request, &directions)?;
-        let mut heads = Vec::with_capacity(executions.len());
-        for execution in executions.iter_mut() {
-            if let Some(after) = after.as_ref() {
-                execution
-                    .seek_after(request, order, after, &directions)
-                    .await?;
+        let lanes = self
+            .directory
+            .query_parallelism()
+            .max(1)
+            .min(executions.len().max(1));
+        let mut indexed_heads = Vec::with_capacity(executions.len());
+        for chunk in executions.chunks_mut(lanes) {
+            let mut work = Vec::with_capacity(chunk.len());
+            for execution in chunk {
+                work.push(self.initialize_physical_segment(
+                    request,
+                    order,
+                    after.as_ref(),
+                    directions.clone(),
+                    execution,
+                ));
             }
-            let head = execution
-                .next_physical(request, order, directions.clone())
-                .await?;
-            execution.release_decoded()?;
-            heads.push(head);
+            for head in join_all(work).await {
+                indexed_heads.push(head?);
+            }
         }
+        indexed_heads.sort_by_key(|(index, _)| *index);
+        let mut heads = indexed_heads
+            .into_iter()
+            .map(|(_, head)| head)
+            .collect::<Vec<_>>();
         let mut selected = Vec::with_capacity(request.limit as usize);
         let mut refill_required = false;
         while selected.len() < request.limit as usize {
@@ -502,6 +589,24 @@ where
             statistics.physical_early_termination();
         }
         Ok(selected)
+    }
+
+    async fn initialize_physical_segment<'query>(
+        &'query self,
+        request: &NativeQueryRequest,
+        order: &[OrderField],
+        after: Option<&NativeQueryCursor>,
+        directions: Arc<[OrderDirection]>,
+        execution: &mut SegmentExecution<'query, D>,
+    ) -> Result<(usize, Option<Selected>), NativeQueryExecutionError<G::Error>> {
+        if let Some(after) = after {
+            execution
+                .seek_after(request, order, after, &directions)
+                .await?;
+        }
+        let head = execution.next_physical(request, order, directions).await?;
+        execution.release_decoded()?;
+        Ok((execution.segment_index, head))
     }
 }
 

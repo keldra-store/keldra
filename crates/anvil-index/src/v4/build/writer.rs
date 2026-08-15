@@ -195,6 +195,7 @@ impl NativeSegmentWriter {
                 "cannot seal an empty native segment".into(),
             ));
         }
+        sink.begin_segment(self.identity, &[])?;
         let source_count =
             u64::try_from(self.sources.len()).map_err(|_| IndexError::OffsetOverflow)?;
         let documents = build_document_layout(&self.sources, self.charge.document_count())?;
@@ -336,12 +337,14 @@ impl NativeSegmentWriter {
         assembly
             .components
             .sort_by_key(|component| (component.role, component.field_id, component.ordinal));
+        let packs = sink.finalize_segment(self.identity).await?;
 
         Ok(BuiltSegment {
             descriptor: SegmentDescriptor::new(
                 self.identity,
                 document_count,
                 document_count,
+                packs,
                 assembly.components,
                 assembly.encoded_bytes,
                 assembly.logical_bytes,

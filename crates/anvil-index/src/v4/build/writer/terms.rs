@@ -7,7 +7,8 @@ use crate::v4::build::{ComponentBatchSink, ProjectedSource, StreamingComponentPu
 use crate::v4::{
     COMPONENT_HEADER_BYTES, ComponentKind, DocId, FieldComponents, INDEX_COMPONENT_BYTES,
     PositionEntry, PositionsBlock, PostingBlock, PostingImpact, PostingReference, Schema,
-    SegmentIdentity, TermDictionary, TermEntry, component_ordinal_key,
+    SegmentIdentity, TERM_DICTIONARY_TARGET_BYTES, TermDictionary, TermEntry,
+    component_ordinal_key,
 };
 
 const MAX_PAYLOAD_BYTES: usize = INDEX_COMPONENT_BYTES - COMPONENT_HEADER_BYTES;
@@ -263,7 +264,9 @@ async fn publish_field_dictionary<S: ComponentBatchSink>(
             .checked_add(term_key.len())
             .and_then(|bytes| bytes.checked_add(8 + 8 + 4 + 4))
             .ok_or(IndexError::OffsetOverflow)?;
-        if !pending.is_empty() && pending_bytes.saturating_add(row_bytes) > MAX_PAYLOAD_BYTES {
+        if !pending.is_empty()
+            && pending_bytes.saturating_add(row_bytes) > TERM_DICTIONARY_TARGET_BYTES
+        {
             publish_dictionary_block(&mut publisher, std::mem::take(&mut pending)).await?;
             pending_bytes = 6;
         }
