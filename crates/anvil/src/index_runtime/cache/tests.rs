@@ -797,6 +797,35 @@ async fn merge_scratch_is_random_access_and_removed_on_drop() {
 }
 
 #[tokio::test]
+async fn merge_scratch_uses_its_configured_root_and_remains_disposable() {
+    let root = tempfile::tempdir().unwrap();
+    let cache_root = root.path().join("cache");
+    let scratch_root = root.path().join("scratch");
+    let cache = IndexCache::new_with_directories_and_startup_scan_evidence(
+        &cache_root,
+        &scratch_root,
+        IndexCacheConfig::new(1024, 1024).unwrap(),
+        Arc::new(MemoryFetcher {
+            values: BTreeMap::new(),
+            reads: AtomicUsize::new(0),
+        }),
+        crate::startup_scan_evidence::StartupScanEvidence::begin(),
+    )
+    .unwrap();
+    let file = cache.merge_scratch().create_file().await.unwrap();
+    let path = file.inner.path.clone();
+
+    assert!(path.starts_with(scratch_root.join(SCRATCH_FORMAT_DIRECTORY)));
+    assert!(!path.starts_with(cache_root.join(CACHE_FORMAT_DIRECTORY)));
+    assert!(path.exists());
+
+    drop(cache);
+    assert!(path.exists());
+    drop(file);
+    assert!(!path.exists());
+}
+
+#[tokio::test]
 async fn merge_scratch_short_read_reports_exact_file_length() {
     let root = tempfile::tempdir().unwrap();
     let (cache, _fetcher, _left, _right) = fixture(&root, 1024, 1024);

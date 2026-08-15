@@ -23,6 +23,8 @@ use tokio::sync::Notify;
 use crate::startup_scan_evidence::{StartupScanEvidence, StartupScanExtent, StartupScanKind};
 
 const CACHE_FORMAT_DIRECTORY: &str = "v4";
+const SCRATCH_FORMAT_DIRECTORY: &str = "v4";
+const DEFAULT_SCRATCH_DIRECTORY: &str = "scratch";
 const CACHE_TEMPORARY_FILE_GRACE: Duration = Duration::from_secs(60 * 60);
 // Each mmap consumes a virtual-memory area and bookkeeping even for a tiny
 // file. Charging at least one ordinary page prevents a large disk budget from
@@ -138,6 +140,7 @@ pub(crate) struct IndexCache {
 
 struct IndexCacheInner {
     directory: PathBuf,
+    scratch_directory: PathBuf,
     config: IndexCacheConfig,
     fetcher: Arc<dyn IndexSegmentFetcher>,
     fetch_budget: CacheFetchBudget,
@@ -394,7 +397,8 @@ impl IndexCache {
         config: IndexCacheConfig,
         fetcher: Arc<dyn IndexSegmentFetcher>,
     ) -> Result<Self, IndexCacheError> {
-        Self::new_inner(directory, config, fetcher, None)
+        let scratch_directory = directory.as_ref().join(DEFAULT_SCRATCH_DIRECTORY);
+        Self::new_inner(directory, scratch_directory, config, fetcher, None)
     }
 
     pub(crate) fn new_with_startup_scan_evidence(
@@ -403,20 +407,47 @@ impl IndexCache {
         fetcher: Arc<dyn IndexSegmentFetcher>,
         startup_scan_evidence: StartupScanEvidence,
     ) -> Result<Self, IndexCacheError> {
-        Self::new_inner(directory, config, fetcher, Some(startup_scan_evidence))
+        let scratch_directory = directory.as_ref().join(DEFAULT_SCRATCH_DIRECTORY);
+        Self::new_inner(
+            directory,
+            scratch_directory,
+            config,
+            fetcher,
+            Some(startup_scan_evidence),
+        )
+    }
+
+    pub(crate) fn new_with_directories_and_startup_scan_evidence(
+        directory: impl AsRef<Path>,
+        scratch_directory: impl AsRef<Path>,
+        config: IndexCacheConfig,
+        fetcher: Arc<dyn IndexSegmentFetcher>,
+        startup_scan_evidence: StartupScanEvidence,
+    ) -> Result<Self, IndexCacheError> {
+        Self::new_inner(
+            directory,
+            scratch_directory,
+            config,
+            fetcher,
+            Some(startup_scan_evidence),
+        )
     }
 
     fn new_inner(
         directory: impl AsRef<Path>,
+        scratch_directory: impl AsRef<Path>,
         config: IndexCacheConfig,
         fetcher: Arc<dyn IndexSegmentFetcher>,
         startup_scan_evidence: Option<StartupScanEvidence>,
     ) -> Result<Self, IndexCacheError> {
         let directory = directory.as_ref().join(CACHE_FORMAT_DIRECTORY);
+        let scratch_directory = scratch_directory.as_ref().join(SCRATCH_FORMAT_DIRECTORY);
         fs::create_dir_all(&directory).map_err(IndexCacheError::Io)?;
+        fs::create_dir_all(&scratch_directory).map_err(IndexCacheError::Io)?;
         let cache = Self {
             inner: Arc::new(IndexCacheInner {
                 directory,
+                scratch_directory,
                 config,
                 fetcher,
                 fetch_budget: CacheFetchBudget::new(config.memory_bytes),
@@ -436,12 +467,12 @@ impl IndexCache {
         }
     }
 
-    /// Open one restart-disposable merge workspace inside the existing v4
-    /// cache directory. Callers receive no general cache path authority.
+    /// Open one restart-disposable merge workspace in the separately
+    /// configured scratch root. Callers receive no general path authority.
     pub(crate) fn merge_scratch(&self) -> IndexMergeScratchSpace {
         IndexMergeScratchSpace {
             inner: Arc::new(IndexMergeScratchSpaceInner {
-                directory: self.inner.directory.clone(),
+                directory: self.inner.scratch_directory.clone(),
                 cache: Arc::downgrade(&self.inner),
                 nonce: uuid::Uuid::new_v4().simple().to_string(),
                 next_file: AtomicU64::new(0),
