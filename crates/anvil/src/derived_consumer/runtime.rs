@@ -525,16 +525,10 @@ async fn advance_once(
         &mut state.tracker,
         assignment_changes,
     )?;
-    scan_steady(
-        kind,
-        journal,
-        resolver,
-        &state.demux,
-        &target,
-        &state.assignments,
-        &mut state.tracker,
-    )
-    .await?;
+    // Routed effects are bounded by the target captured above. Move the
+    // disposable tracker's settled view to that same target before asking it
+    // to validate those effects; validating first compares new offsets with
+    // the previous polling turn and spuriously rejects healthy live traffic.
     let statuses = publisher.source_statuses().await?;
     for mut status in statuses {
         let node = NodeId(u64::from(status.source_id.node_id));
@@ -552,6 +546,16 @@ async fn advance_once(
             .update_source_status(status)
             .map_err(tracker_status)?;
     }
+    scan_steady(
+        kind,
+        journal,
+        resolver,
+        &state.demux,
+        &target,
+        &state.assignments,
+        &mut state.tracker,
+    )
+    .await?;
     require_fence(decisions, target.fence)?;
     publisher.publish_tracker(&mut state.tracker).await?;
     state.demux = target;
