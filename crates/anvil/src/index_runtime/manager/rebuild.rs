@@ -132,7 +132,11 @@ pub(super) async fn advance_rebuild(
             drop(permit);
             let target = dependencies
                 .journal
-                .capture_barrier()
+                .capture_index_bucket_barrier(
+                    job.definition.tenant_id,
+                    job.definition.bucket_id,
+                    Some(&work.through),
+                )
                 .await
                 .map_err(event_status)?;
             work.progress.complete();
@@ -159,7 +163,7 @@ pub(super) async fn advance_rebuild(
         let records = scan_records;
         let encoded_bytes = scan_bytes;
         let frame_plan = work_plan_for_limit(budget.limit(), frame_measure.resident_bytes)?;
-        await_with_builder_heartbeats(
+        let source_payload_bytes = await_with_builder_heartbeats(
             &work.progress,
             process_snapshot_frame(
                 &job.definition,
@@ -173,7 +177,15 @@ pub(super) async fn advance_rebuild(
         )
         .await?;
         work.progress.advance(records, encoded_bytes);
-        if quantum.advance_frame(encoded_bytes)? == SourceWorkBoundary::SealAndYield {
+        tracing::info!(
+            index.kind = ?job.kind,
+            monotonic_counter.anvil_index_source_payload_bytes_total = source_payload_bytes,
+            histogram.anvil_index_source_frame_payload_bytes = source_payload_bytes,
+            "index source snapshot payload charged to work quantum"
+        );
+        if quantum.advance_frame(encoded_bytes, source_payload_bytes)?
+            == SourceWorkBoundary::SealAndYield
+        {
             flush_builder(
                 &job.definition,
                 job.kind,
@@ -197,7 +209,7 @@ async fn process_snapshot_frame(
     builder: &mut NativeSegmentBuild,
     candidate: &mut CandidateGeneration,
     dependencies: &IndexBuilderDependencies,
-) -> Result<(), Status> {
+) -> Result<u64, Status> {
     let configured_lanes = usize::try_from(
         dependencies
             .config
@@ -207,6 +219,7 @@ async fn process_snapshot_frame(
     let max_parallel = dependencies.cpu.workers().min(configured_lanes).max(1);
     let projection_budget = plan.max_source_projection_bytes as u64;
     let mut batch = ProjectionBatch::new(projection_budget, max_parallel);
+    let mut source_payload_bytes = 0_u64;
     for head in frame {
         if head.tenant_id != definition.tenant_id
             || head.bucket_id != definition.bucket_id
@@ -227,6 +240,9 @@ async fn process_snapshot_frame(
             continue;
         }
         let source = IndexSourceMutation::Upsert(build_object(&head.exact_path, &head.version)?);
+        source_payload_bytes = source_payload_bytes
+            .checked_add(source_payload_bytes_for(&definition.schema, &source))
+            .ok_or_else(|| Status::resource_exhausted("index source payload bytes overflow"))?;
         let prepared = PreparedProjection::new(&definition.schema, source)?;
         if let Some(pending) = batch.try_push(prepared)? {
             let full = std::mem::replace(
@@ -245,7 +261,7 @@ async fn process_snapshot_frame(
     if !batch.is_empty() {
         project_snapshot_batch(definition, plan, batch, builder, candidate, dependencies).await?;
     }
-    Ok(())
+    Ok(source_payload_bytes)
 }
 
 async fn project_snapshot_batch(

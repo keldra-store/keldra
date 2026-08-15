@@ -10,6 +10,11 @@ use super::rebuild::{
 };
 use super::*;
 
+pub(super) struct JournalPageWork {
+    pub(super) changed: bool,
+    pub(super) source_payload_bytes: u64,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn process_journal_page(
     definition: &CatalogDefinition,
@@ -20,7 +25,7 @@ pub(super) async fn process_journal_page(
     builder: &mut NativeSegmentBuild,
     candidate: &mut CandidateGeneration,
     dependencies: &IndexBuilderDependencies,
-) -> Result<bool, Status> {
+) -> Result<JournalPageWork, Status> {
     let paths = journal_source_paths(
         definition.tenant_id,
         definition.bucket_id,
@@ -30,11 +35,21 @@ pub(super) async fn process_journal_page(
     .into_iter()
     .collect::<Vec<_>>();
     let changed = !paths.is_empty();
+    let mut source_payload_bytes = 0_u64;
 
     // One journal page is already byte-bounded. Exact-current reads retain
     // that bound and additionally obey the store's bounded multi-get limit.
     for paths in paths.chunks(MAX_OBJECT_RECORD_EXPORT_RECORDS as usize) {
         let sources = load_target_sources(definition, paths, target, dependencies).await?;
+        source_payload_bytes = sources
+            .iter()
+            .try_fold(source_payload_bytes, |total, source| {
+                total
+                    .checked_add(source_payload_bytes_for(&definition.schema, source))
+                    .ok_or_else(|| {
+                        Status::resource_exhausted("index source payload bytes overflow")
+                    })
+            })?;
         project_sources(
             definition,
             kind,
@@ -46,7 +61,10 @@ pub(super) async fn process_journal_page(
         )
         .await?;
     }
-    Ok(changed)
+    Ok(JournalPageWork {
+        changed,
+        source_payload_bytes,
+    })
 }
 
 pub(super) fn journal_source_paths(

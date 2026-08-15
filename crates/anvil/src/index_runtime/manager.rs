@@ -791,12 +791,16 @@ async fn inspect_builder(
         && current.manifest.definition_version == definition.object_version
         && current.manifest.kind == definition.schema.kind
     {
+        let published = current.manifest.barrier().map_err(generation_status)?;
         let target = dependencies
             .journal
-            .capture_barrier()
+            .capture_index_bucket_barrier(
+                definition.tenant_id,
+                definition.bucket_id,
+                Some(&published),
+            )
             .await
             .map_err(event_status)?;
-        let published = current.manifest.barrier().map_err(generation_status)?;
         dependencies
             .derived_progress
             .report(
@@ -1038,7 +1042,7 @@ async fn advance_catch_up(
             histogram.anvil_index_journal_page_resident_bytes = page_resident_bytes,
             "index journal page admitted by concrete resident size"
         );
-        work.changed |= await_with_builder_heartbeats(
+        let page_work = await_with_builder_heartbeats(
             &work.progress,
             process_journal_page(
                 &job.definition,
@@ -1052,9 +1056,19 @@ async fn advance_catch_up(
             ),
         )
         .await?;
+        work.changed |= page_work.changed;
         record_source_page_progress(&mut work, &page);
         work.progress.advance(records, encoded_bytes);
-        if quantum.advance_page(encoded_bytes)? == SourceWorkBoundary::SealAndYield {
+        tracing::info!(
+            index.kind = ?job.kind,
+            monotonic_counter.anvil_index_source_payload_bytes_total =
+                page_work.source_payload_bytes,
+            histogram.anvil_index_source_page_payload_bytes = page_work.source_payload_bytes,
+            "index source page payload charged to work quantum"
+        );
+        if quantum.advance_page(encoded_bytes, page_work.source_payload_bytes)?
+            == SourceWorkBoundary::SealAndYield
+        {
             flush_builder(
                 &job.definition,
                 job.kind,
@@ -1649,6 +1663,15 @@ fn source_needs_payload(schema: &Schema) -> bool {
         schema.kind,
         anvil_index::v4::IndexKind::Path | anvil_index::v4::IndexKind::MetadataFilter
     )
+}
+
+fn source_payload_bytes_for(schema: &Schema, source: &IndexSourceMutation) -> u64 {
+    match source {
+        IndexSourceMutation::Upsert(object) if source_needs_payload(schema) => {
+            object.content_length
+        }
+        IndexSourceMutation::Upsert(_) | IndexSourceMutation::Remove(_) => 0,
+    }
 }
 
 fn source_wire_limit(limit: u64) -> u64 {
