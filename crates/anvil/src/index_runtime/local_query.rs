@@ -805,12 +805,17 @@ impl LocalGenerationQueryExecutor {
             .transpose()?;
         // Freshness evidence is advisory and must never turn journal lag, a
         // temporarily unavailable source, or a retained-generation cursor into
-        // query admission work. Builders and snapshot recovery update this
-        // process-local observation opportunistically. If it does not cover the
-        // pinned generation, omit the optional observed tails and serve the
-        // complete generation with its authoritative published barrier.
-        let observed =
-            compatible_observed_barrier(indexed.as_ref(), self.events.last_observed_barrier());
+        // query admission work. Observe only indexable changes in this bucket:
+        // unrelated buckets and reserved index artifacts cannot make a complete
+        // generation appear stale. If the scoped observation is unavailable or
+        // does not cover the pinned generation, serve the generation with its
+        // authoritative published barrier and omit optional observed tails.
+        let observed = self
+            .events
+            .capture_index_bucket_barrier(request.tenant_id, request.bucket_id, indexed.as_ref())
+            .await
+            .ok()
+            .and_then(|barrier| compatible_observed_barrier(indexed.as_ref(), Some(barrier)));
         let Some(selected) = selected else {
             let (facet_results, aggregate_results) =
                 empty_computation_results(&field_names, &compiled.facets, &compiled.aggregates)?;
