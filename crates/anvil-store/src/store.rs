@@ -17,14 +17,14 @@ use crate::key::{
 };
 use crate::logical_record::decode_current_value;
 use crate::watch::{
-    AggregateKind, InvalidationStateHint, LOCAL_INVALIDATION_BYTES_KEY,
+    AggregateKind, DecodedLocalChange, InvalidationStateHint, LOCAL_INVALIDATION_BYTES_KEY,
     LOCAL_INVALIDATION_COUNT_KEY, LOCAL_INVALIDATION_EPOCH_KEY, LOCAL_INVALIDATION_FLOOR_KEY,
     LOCAL_INVALIDATION_OFFSET_KEY, LOCAL_INVALIDATION_SETTLED_KEY, LOCAL_INVALIDATION_TOKEN_KEY,
     LocalChange, LocalChangePage, LocalInvalidation, MAX_LOCAL_INVALIDATION_SCAN_RECORDS,
     ObjectHeadChangeKind, OversizeLocalChange, SourceId, WatchCursor, WatchError,
     WatchJournalStatus, WatchPage, WatchRetention, WatchScope, WatchStart, decode_local_change,
-    decode_resume_token, encode_local_change, encode_resume_token, invalidation_key,
-    invalidation_record_bytes, offset_from_key,
+    decode_local_change_with_length, decode_resume_token, encode_local_change, encode_resume_token,
+    invalidation_key, invalidation_record_bytes, offset_from_key,
 };
 use crate::{
     AWAITING_PUBLISH, AccountingHeadTransition, BatchOperation, BatchOutcome, BlobReader, BlobRef,

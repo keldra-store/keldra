@@ -226,6 +226,13 @@ impl Store {
         decode_local_change(encoded).map_err(storage_error)
     }
 
+    pub(crate) fn decode_local_change_record_with_length(
+        &self,
+        encoded: &[u8],
+    ) -> Result<DecodedLocalChange, MutationError> {
+        decode_local_change_with_length(encoded).map_err(storage_error)
+    }
+
     fn watch_scope_identity(&self, scope: &WatchScope) -> Result<BucketIdentity, WatchError> {
         let tenant_id = self
             .tenant_id_by_name(scope.tenant())
@@ -543,13 +550,13 @@ impl Store {
                     "local change offset {expected_offset} is missing"
                 )));
             }
-            let change = self.decode_local_change_record(&encoded)?;
-            if change.offset() != stored_offset {
+            let decoded = self.decode_local_change_record_with_length(&encoded)?;
+            if decoded.change.offset() != stored_offset {
                 return Err(MutationError::Storage(
                     "local change key does not match its stored offset".into(),
                 ));
             }
-            let change_bytes = encoded_change_len(&change)?;
+            let change_bytes = decoded.peer_encoded_bytes;
             let projected = encoded_bytes.checked_add(change_bytes).ok_or_else(|| {
                 MutationError::Storage("local change page length overflow".into())
             })?;
@@ -569,7 +576,7 @@ impl Store {
                 break;
             }
             encoded_bytes = projected;
-            changes.push(change);
+            changes.push(decoded.change);
         }
         if !stopped_at_byte_limit && changes.len() != expected_records {
             let missing = first_offset + changes.len() as u64;
@@ -583,29 +590,6 @@ impl Store {
             encoded_bytes,
             oversize: None,
         })
-    }
-}
-
-pub(crate) fn encoded_change_len(change: &LocalChange) -> Result<u64, MutationError> {
-    let mut counter = ChangeByteCounter(0);
-    serde_json::to_writer(&mut counter, change)
-        .map_err(|error| MutationError::Storage(format!("encode local change: {error}")))?;
-    Ok(counter.0)
-}
-
-struct ChangeByteCounter(u64);
-
-impl std::io::Write for ChangeByteCounter {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0 = self
-            .0
-            .checked_add(bytes.len() as u64)
-            .ok_or_else(|| std::io::Error::other("local change length overflow"))?;
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
     }
 }
 
@@ -690,7 +674,7 @@ mod tests {
                 .unwrap();
         }
         let first = store.read_local_change(1).unwrap().unwrap();
-        let first_bytes = encoded_change_len(&first).unwrap();
+        let first_bytes = crate::watch::encoded_change_len(&first).unwrap();
 
         let page = store.scan_local_changes_bounded(0, 2, first_bytes).unwrap();
         assert_eq!(page.changes, vec![first]);
@@ -720,7 +704,7 @@ mod tests {
             .await
             .unwrap();
         let first = store.read_local_change(1).unwrap().unwrap();
-        let first_bytes = encoded_change_len(&first).unwrap();
+        let first_bytes = crate::watch::encoded_change_len(&first).unwrap();
 
         let page = store
             .scan_local_changes_bounded(0, 1, first_bytes - 1)

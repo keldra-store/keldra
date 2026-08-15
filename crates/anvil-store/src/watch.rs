@@ -5,6 +5,14 @@ use thiserror::Error;
 
 use crate::{DefinitionTransition, ObjectKey, ReferenceDelta, VersionId};
 
+mod codec;
+
+#[cfg(test)]
+pub(crate) use codec::encoded_change_len;
+pub(crate) use codec::{
+    DecodedLocalChange, decode_local_change, decode_local_change_with_length, encode_local_change,
+};
+
 /// Release defaults for the one source-local 0.5.0 invalidation journal.
 pub const DEFAULT_WATCH_MAX_ENTRIES: u64 = 1_000_000;
 pub const DEFAULT_WATCH_MAX_BYTES: u64 = 512 * 1024 * 1024;
@@ -22,7 +30,6 @@ pub(crate) const LOCAL_INVALIDATION_TOKEN_KEY: &[u8] = b"local_invalidation_toke
 
 const WATCH_TOKEN_FORMAT: u16 = 1;
 const WATCH_TOKEN_MAX_ENCODED_BYTES: usize = 16 * 1024;
-const LOCAL_CHANGE_FORMAT: u16 = 1;
 const REFERENCE_PROOF_FORMAT: u16 = 2;
 const REFERENCE_PROOF_NAMESPACE: u8 = 0xff;
 pub(crate) const REFERENCE_PROOF_KEY_BYTES: usize =
@@ -516,48 +523,12 @@ impl LocalChange {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct LocalChangeEnvelope {
-    format: u16,
-    change: LocalChange,
-}
-
-#[derive(Serialize)]
-struct LocalChangeEnvelopeRef<'a> {
-    format: u16,
-    change: &'a LocalChange,
-}
-
-#[derive(Debug, Error)]
-pub(crate) enum LocalChangeCodecError {
-    #[error("local change record is malformed: {0}")]
-    Malformed(#[from] serde_json::Error),
-    #[error("unsupported local change format {0}")]
-    UnsupportedFormat(u16),
-}
-
 #[derive(Debug, Error)]
 pub(crate) enum ReferenceProofCodecError {
     #[error("reference proof is malformed: {0}")]
     Malformed(#[from] serde_json::Error),
     #[error("unsupported reference proof format {0}")]
     UnsupportedFormat(u16),
-}
-
-pub(crate) fn encode_local_change(change: &LocalChange) -> Result<Vec<u8>, LocalChangeCodecError> {
-    serde_json::to_vec(&LocalChangeEnvelopeRef {
-        format: LOCAL_CHANGE_FORMAT,
-        change,
-    })
-    .map_err(Into::into)
-}
-
-pub(crate) fn decode_local_change(encoded: &[u8]) -> Result<LocalChange, LocalChangeCodecError> {
-    let envelope = serde_json::from_slice::<LocalChangeEnvelope>(encoded)?;
-    if envelope.format != LOCAL_CHANGE_FORMAT {
-        return Err(LocalChangeCodecError::UnsupportedFormat(envelope.format));
-    }
-    Ok(envelope.change)
 }
 
 pub(crate) fn encode_reference_proof(
@@ -773,7 +744,7 @@ mod tests {
     }
 
     #[test]
-    fn current_local_changes_have_an_explicit_format_and_type_tag() {
+    fn current_local_changes_have_an_explicit_binary_format_and_type_tag() {
         let expected = LocalChange::object_head(
             7,
             11,
@@ -786,9 +757,9 @@ mod tests {
             None,
         );
         let encoded = encode_local_change(&expected).unwrap();
-        let value = serde_json::from_slice::<serde_json::Value>(&encoded).unwrap();
-        assert_eq!(value["format"], LOCAL_CHANGE_FORMAT);
-        assert_eq!(value["change"]["kind"], "object_head");
+        assert_eq!(&encoded[..4], b"ANVJ");
+        assert_eq!(u16::from_be_bytes(encoded[4..6].try_into().unwrap()), 2);
+        assert_eq!(encoded[6], 1);
         assert_eq!(decode_local_change(&encoded).unwrap(), expected);
     }
 
@@ -805,13 +776,11 @@ mod tests {
             None,
             None,
         );
-        let encoded = encode_local_change(&change).unwrap();
-        let mut value = serde_json::from_slice::<serde_json::Value>(&encoded).unwrap();
-        value["format"] = serde_json::json!(LOCAL_CHANGE_FORMAT + 1);
-        let encoded = serde_json::to_vec(&value).unwrap();
+        let mut encoded = encode_local_change(&change).unwrap();
+        encoded[5] = 3;
         assert!(matches!(
             decode_local_change(&encoded),
-            Err(LocalChangeCodecError::UnsupportedFormat(2))
+            Err(codec::LocalChangeCodecError::UnsupportedFormat(3))
         ));
     }
 }
