@@ -251,12 +251,13 @@ async fn manifest_pack_tables_protect_and_deduplicate_exact_ordinary_objects() {
     .unwrap();
     let (manifest, shared, segment_only, standalone_only) = pack_table_manifest();
     let encoded = manifest.encode().unwrap();
+    let blob = BlobRef {
+        hash: *blake3::hash(&encoded).as_bytes(),
+        length: encoded.len() as u64,
+    };
     let reference = ManifestReference::new(
         &manifest,
-        BlobRef {
-            hash: *blake3::hash(&encoded).as_bytes(),
-            length: encoded.len() as u64,
-        },
+        blob.clone(),
         VersionId(40),
         UNIX_EPOCH + Duration::from_secs(1),
     )

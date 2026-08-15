@@ -901,16 +901,16 @@ impl IndexGenerationRetention {
             .take()
             .ok_or_else(|| Status::data_loss("retained format-v4 manifest has no payload"))?;
         let mut bytes = Vec::new();
+        let maximum = reference.blob.length.checked_add(1).ok_or_else(|| {
+            Status::resource_exhausted("retained format-v4 manifest length exceeds u64")
+        })?;
         payload
-            .take(INDEX_COMPONENT_BYTES as u64 + 1)
+            .take(maximum)
             .read_to_end(&mut bytes)
             .map_err(|error| Status::internal(format!("read format-v4 manifest: {error}")))?;
-        if bytes.len() > INDEX_COMPONENT_BYTES
-            || bytes.len() as u64 != reference.blob.length
-            || blake3::hash(&bytes).as_bytes() != &reference.blob.hash
-        {
+        if bytes.len() as u64 != reference.blob.length {
             return Err(Status::data_loss(
-                "retained format-v4 manifest bytes differ from their reference",
+                "retained format-v4 manifest length differs from its verified object reference",
             ));
         }
         let manifest = IndexGenerationManifest::decode(&bytes)
@@ -1352,16 +1352,6 @@ fn validate_manifest_reference(
     {
         return Err(Status::data_loss(
             "format-v4 manifest identity differs from its current-pointer reference",
-        ));
-    }
-    let encoded = manifest
-        .encode()
-        .map_err(|error| Status::data_loss(error.to_string()))?;
-    if encoded.len() as u64 != reference.blob.length
-        || blake3::hash(&encoded).as_bytes() != &reference.blob.hash
-    {
-        return Err(Status::data_loss(
-            "format-v4 manifest bytes differ from their current-pointer reference",
         ));
     }
     Ok(())

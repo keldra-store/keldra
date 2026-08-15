@@ -479,17 +479,18 @@ impl IndexGenerationPublisher {
             .take()
             .ok_or_else(|| Status::data_loss("format-v4 generation manifest has no payload"))?;
         let mut bytes = Vec::new();
+        let maximum =
+            reference.blob.length.checked_add(1).ok_or_else(|| {
+                Status::resource_exhausted("format-v4 manifest length exceeds u64")
+            })?;
         payload
             .by_ref()
-            .take(INDEX_COMPONENT_BYTES as u64 + 1)
+            .take(maximum)
             .read_to_end(&mut bytes)
             .map_err(|error| Status::internal(format!("read format-v4 manifest: {error}")))?;
-        if bytes.len() > INDEX_COMPONENT_BYTES
-            || bytes.len() as u64 != reference.blob.length
-            || blake3::hash(&bytes).as_bytes() != &reference.blob.hash
-        {
+        if bytes.len() as u64 != reference.blob.length {
             return Err(Status::data_loss(
-                "format-v4 generation manifest bytes differ from their reference",
+                "format-v4 generation manifest length differs from its verified object reference",
             ));
         }
         let manifest = IndexGenerationManifest::decode(&bytes)
@@ -998,14 +999,6 @@ fn validate_manifest_reference(
             "format-v4 manifest identity differs from its current-pointer reference",
         ));
     }
-    let bytes = manifest.encode().map_err(generation_status)?;
-    if bytes.len() as u64 != reference.blob.length
-        || blake3::hash(&bytes).as_bytes() != &reference.blob.hash
-    {
-        return Err(Status::data_loss(
-            "format-v4 manifest bytes differ from their current-pointer reference",
-        ));
-    }
     Ok(())
 }
 
@@ -1075,7 +1068,12 @@ fn content_command(index_id: u64, path: &str, blob: &BlobRef) -> String {
 }
 
 fn generation_status(error: super::generation::GenerationError) -> Status {
-    Status::data_loss(error.to_string())
+    match error {
+        super::generation::GenerationError::SizeLimit => {
+            Status::resource_exhausted(error.to_string())
+        }
+        _ => Status::data_loss(error.to_string()),
+    }
 }
 
 fn index_status(error: IndexError) -> Status {

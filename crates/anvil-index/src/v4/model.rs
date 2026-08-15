@@ -34,7 +34,6 @@ impl ComponentKind {
     pub const NORMS: Self = Self(11);
     pub const VECTORS: Self = Self(12);
     pub const SCORING_STATISTICS: Self = Self(13);
-    pub const GENERATION_MANIFEST: Self = Self(14);
 
     pub fn new(value: u16) -> Result<Self, IndexError> {
         match value {
@@ -51,7 +50,6 @@ impl ComponentKind {
             11 => Ok(Self::NORMS),
             12 => Ok(Self::VECTORS),
             13 => Ok(Self::SCORING_STATISTICS),
-            14 => Ok(Self::GENERATION_MANIFEST),
             _ => Err(IndexError::InvalidDefinition(
                 "unknown format-v4 component kind".into(),
             )),
@@ -185,12 +183,11 @@ mod tests {
             ComponentKind::NORMS,
             ComponentKind::VECTORS,
             ComponentKind::SCORING_STATISTICS,
-            ComponentKind::GENERATION_MANIFEST,
         ];
         for kind in known {
             assert_eq!(ComponentKind::new(kind.get()), Ok(kind));
         }
-        for unknown in [0, 15, u16::MAX] {
+        for unknown in [0, 14, 15, u16::MAX] {
             assert!(ComponentKind::new(unknown).is_err());
         }
     }

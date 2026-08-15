@@ -36,13 +36,13 @@ dual writer, query fallback, compatibility shim, or mixed-generation path. A
 format-v4 deployment builds indices from authoritative ordinary objects and
 their retained source journals.
 
-Format-v4 postings, points, live masks, terms, doc values, vectors, manifests,
-and pack envelopes use explicit Anvil codecs matched to their native access
-patterns. An index never stores a second copy of an ordinary source field merely
-to return it in a hit; a client retrieves the authoritative object through
-`GetObject` or `BatchGet`. The engine defines a generation-pinned scan contract
-so a future SQL gateway can push predicates, ordering, aggregation, and limits
-into the same authorized native planner rather than bypassing it.
+Format-v4 postings, points, live masks, terms, doc values, vectors, generation
+manifests, and pack envelopes use explicit Anvil codecs matched to their native
+access patterns. An index never stores a second copy of an ordinary source field
+merely to return it in a hit; a client retrieves the authoritative object
+through `GetObject` or `BatchGet`. The engine defines a generation-pinned scan
+contract so a future SQL gateway can push predicates, ordering, aggregation,
+and limits into the same authorized native planner rather than bypassing it.
 
 The release containing format v4 should be `0.9.0`, because the durable index
 format and execution engine are intentionally incompatible with `0.8.x`.
@@ -832,7 +832,7 @@ payload            [encoded_length]byte
 ```
 
 The exact fixed header is shared by term, posting, point, doc-value, position,
-norm, vector, live-mask, path-locator, and manifest components. A
+norm, vector, live-mask, and path-locator components. A
 component-specific payload has its own explicit bounds and codec version.
 Readers validate the fixed header, checked lengths, declared upper bounds, and
 checksum before allocating or decoding.
@@ -919,6 +919,22 @@ the definition object version may retain the same fingerprint; definition
 version remains a separate merge-identity field.
 
 ### 9.5 Generation manifest and durability
+
+The generation manifest is one ordinary immutable Anvil object, not a logical
+index component. It therefore has no 512 KiB component-block ceiling. Small
+manifests use the ordinary inline path and larger manifests use the same
+complete-replica or erasure-coded payload placement as every other object. The
+manifest codec has its own magic, version, exact payload length, checked
+collection counts, and structural validation.
+
+The ordinary object `BlobRef` is the manifest's sole content checksum. Anvil
+hashes the bytes when staging the content-addressed object and verifies that
+identity when reading a complete replica or reconstructing erasure shards. The
+manifest does not nest a second checksum over the same bytes, and callers do
+not rehash a payload already verified by the ordinary object reader. This does
+not weaken packed components: their individual checksums remain necessary
+because a query may range-read one component without reading its complete
+ordinary pack object.
 
 The generation manifest contains:
 

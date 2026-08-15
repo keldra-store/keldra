@@ -5,12 +5,13 @@
 //! no index state is stored in Raft or a side plane.
 
 use std::collections::BTreeSet;
+use std::mem::size_of;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anvil_index::v4::{
-    ArtifactDescriptor, ArtifactPackReference, COMPONENT_HEADER_BYTES, ComponentKind, FieldId,
-    INDEX_COMPONENT_BYTES, INDEX_DECODE_BYTES, INDEX_FORMAT_VERSION, INDEX_GENERATION_SEGMENTS,
-    INDEX_ROUTING_KEY_BYTES, IndexKind, LocatorStreamRoot, SegmentDescriptor,
+    ArtifactDescriptor, ArtifactPackReference, ComponentKind, FieldId, INDEX_COMPONENT_BYTES,
+    INDEX_FORMAT_VERSION, INDEX_GENERATION_SEGMENTS, INDEX_ROUTING_KEY_BYTES, IndexKind,
+    LocatorStreamRoot, SegmentDescriptor,
 };
 use anvil_store::{BlobRef, PlacementLogId, SourceId, VersionId};
 use thiserror::Error;
@@ -22,9 +23,11 @@ pub(crate) const INDEX_MANIFEST_FORMAT: u16 = INDEX_FORMAT_VERSION;
 pub(crate) const INDEX_CURRENT_FORMAT: u16 = INDEX_FORMAT_VERSION;
 pub(crate) const MAX_RETAINED_GENERATIONS: usize = 64;
 
-const COMPONENT_MAGIC: &[u8; 8] = b"ANVLIDX4";
+const MANIFEST_MAGIC: &[u8; 8] = b"ANVLMNF4";
 const CURRENT_MAGIC: &[u8; 8] = b"ANVLCUR4";
 const MANIFEST_CODEC_VERSION: u16 = 1;
+const MANIFEST_HEADER_BYTES: usize =
+    MANIFEST_MAGIC.len() + size_of::<u16>() * 2 + size_of::<u64>() * 3 + 32;
 pub(crate) const MAX_SEGMENTS_PER_GENERATION: usize = INDEX_GENERATION_SEGMENTS;
 const MAX_SEGMENT_COMPONENTS: usize = 4_096;
 pub(crate) const MAX_LOCATOR_ROOTS_PER_GENERATION: usize = 4_096;
@@ -97,10 +100,6 @@ impl ManifestReference {
         object_version: VersionId,
         published_at: SystemTime,
     ) -> Result<Self, GenerationError> {
-        let encoded = manifest.encode()?;
-        if blob.length != encoded.len() as u64 || blob.hash != *blake3::hash(&encoded).as_bytes() {
-            return Err(GenerationError::InvalidManifestReference);
-        }
         let value = Self {
             generation: manifest.generation,
             definition_version: manifest.definition_version,
@@ -118,8 +117,7 @@ impl ManifestReference {
         if index_id == 0
             || self.generation == 0
             || self.definition_version == 0
-            || self.blob.length < COMPONENT_HEADER_BYTES as u64
-            || self.blob.length > INDEX_COMPONENT_BYTES as u64
+            || self.blob.length < MANIFEST_HEADER_BYTES as u64
             || self.object_version.0 == 0
             || self.published_at_unix_millis == 0
             || self.path.len() > INDEX_ROUTING_KEY_BYTES
@@ -471,9 +469,7 @@ impl IndexGenerationManifest {
                     .map(|locator| locator.encoded_bytes),
             )
             .try_fold(0_u64, |total, bytes| {
-                total
-                    .checked_add(bytes)
-                    .ok_or(GenerationError::LengthOverflow)
+                total.checked_add(bytes).ok_or(GenerationError::SizeLimit)
             })?;
         let logical_bytes = self
             .segments
@@ -485,9 +481,7 @@ impl IndexGenerationManifest {
                     .map(|locator| locator.logical_bytes),
             )
             .try_fold(0_u64, |total, bytes| {
-                total
-                    .checked_add(bytes)
-                    .ok_or(GenerationError::LengthOverflow)
+                total.checked_add(bytes).ok_or(GenerationError::SizeLimit)
             })?;
         if self.artifact_encoded_bytes != encoded_bytes
             || self.artifact_logical_bytes != logical_bytes
@@ -599,7 +593,7 @@ impl IndexCurrentPointer {
         }
         let bytes = encoder.finish();
         if bytes.len() > INDEX_COMPONENT_BYTES {
-            return Err(GenerationError::LengthOverflow);
+            return Err(GenerationError::SizeLimit);
         }
         Ok(bytes)
     }
@@ -676,43 +670,29 @@ fn encode_manifest_envelope(
     manifest: &IndexGenerationManifest,
     payload: Vec<u8>,
 ) -> Result<Vec<u8>, GenerationError> {
-    let encoded_length =
-        u64::try_from(payload.len()).map_err(|_| GenerationError::LengthOverflow)?;
-    let total = payload
-        .len()
-        .checked_add(COMPONENT_HEADER_BYTES)
-        .ok_or(GenerationError::LengthOverflow)?;
-    if total > INDEX_COMPONENT_BYTES {
-        return Err(GenerationError::LengthOverflow);
-    }
-    let checksum = blake3::hash(&payload);
+    let encoded_length = u64::try_from(payload.len()).map_err(|_| GenerationError::SizeLimit)?;
     let mut encoder = Encoder::default();
-    encoder.fixed(COMPONENT_MAGIC);
-    encoder.u16(ComponentKind::GENERATION_MANIFEST.get());
+    encoder.fixed(MANIFEST_MAGIC);
     encoder.u16(MANIFEST_CODEC_VERSION);
-    encoder.u32(0);
+    encoder.u16(0);
     encoder.u64(manifest.index_id);
     encoder.u64(manifest.definition_version);
     encoder.fixed(&manifest.schema_fingerprint);
-    encoder.u64(0);
     encoder.u64(encoded_length);
-    encoder.u64(encoded_length);
-    encoder.fixed(checksum.as_bytes());
     encoder.fixed(&payload);
     Ok(encoder.finish())
 }
 
 fn decode_manifest_envelope(bytes: &[u8]) -> Result<ManifestEnvelope<'_>, GenerationError> {
-    if bytes.len() < COMPONENT_HEADER_BYTES || bytes.len() > INDEX_COMPONENT_BYTES {
+    if bytes.len() < MANIFEST_HEADER_BYTES {
         return Err(GenerationError::InvalidManifest(
             "manifest envelope length is invalid".into(),
         ));
     }
     let mut decoder = Decoder::new(bytes);
-    if decoder.fixed(8)? != COMPONENT_MAGIC
-        || decoder.u16()? != ComponentKind::GENERATION_MANIFEST.get()
+    if decoder.fixed(8)? != MANIFEST_MAGIC
         || decoder.u16()? != MANIFEST_CODEC_VERSION
-        || decoder.u32()? != 0
+        || decoder.u16()? != 0
     {
         return Err(GenerationError::InvalidManifest(
             "manifest envelope identity is invalid".into(),
@@ -721,31 +701,10 @@ fn decode_manifest_envelope(bytes: &[u8]) -> Result<ManifestEnvelope<'_>, Genera
     let index_id = decoder.u64()?;
     let definition_version = decoder.u64()?;
     let schema_fingerprint = decoder.array_32()?;
-    if decoder.u64()? != 0 {
-        return Err(GenerationError::InvalidManifest(
-            "manifest envelope has a segment identity".into(),
-        ));
-    }
-    let logical_length = decoder.u64()?;
     let encoded_length = decoder.u64()?;
-    let checksum = decoder.array_32()?;
-    if logical_length != encoded_length
-        || logical_length > INDEX_DECODE_BYTES as u64
-        || encoded_length > (INDEX_COMPONENT_BYTES - COMPONENT_HEADER_BYTES) as u64
-    {
-        return Err(GenerationError::InvalidManifest(
-            "manifest envelope lengths or codec are invalid".into(),
-        ));
-    }
-    let payload_length =
-        usize::try_from(encoded_length).map_err(|_| GenerationError::LengthOverflow)?;
+    let payload_length = usize::try_from(encoded_length).map_err(|_| GenerationError::SizeLimit)?;
     let payload = decoder.fixed(payload_length)?;
     decoder.finish()?;
-    if blake3::hash(payload).as_bytes() != &checksum {
-        return Err(GenerationError::InvalidManifest(
-            "manifest payload checksum differs".into(),
-        ));
-    }
     Ok(ManifestEnvelope {
         index_id,
         definition_version,
@@ -972,7 +931,7 @@ impl Encoder {
     }
 
     fn count(&mut self, value: usize) -> Result<(), GenerationError> {
-        self.u32(u32::try_from(value).map_err(|_| GenerationError::LengthOverflow)?);
+        self.u32(u32::try_from(value).map_err(|_| GenerationError::SizeLimit)?);
         Ok(())
     }
 
@@ -1005,7 +964,7 @@ impl<'a> Decoder<'a> {
         let end = self
             .offset
             .checked_add(length)
-            .ok_or(GenerationError::LengthOverflow)?;
+            .ok_or(GenerationError::SizeLimit)?;
         let value = self
             .bytes
             .get(self.offset..end)
@@ -1065,7 +1024,7 @@ impl<'a> Decoder<'a> {
         maximum: usize,
         minimum_encoded_bytes: usize,
     ) -> Result<usize, GenerationError> {
-        let value = usize::try_from(self.u32()?).map_err(|_| GenerationError::LengthOverflow)?;
+        let value = usize::try_from(self.u32()?).map_err(|_| GenerationError::SizeLimit)?;
         let remaining = self.bytes.len().saturating_sub(self.offset);
         if minimum_encoded_bytes == 0
             || value > maximum
@@ -1107,8 +1066,8 @@ pub(crate) enum GenerationError {
     InvalidManifestReference,
     #[error("index current pointer is invalid or uses an unsupported format")]
     InvalidPointer,
-    #[error("index generation length overflow")]
-    LengthOverflow,
+    #[error("index generation exceeds an encoded integer or platform size limit")]
+    SizeLimit,
     #[error("system clock predates the Unix epoch")]
     ClockBeforeEpoch,
     #[error("index timestamp overflow")]
@@ -1247,15 +1206,50 @@ mod tests {
     fn v4_manifest_round_trip_uses_checked_envelope() {
         let manifest = manifest(3);
         let encoded = manifest.encode().unwrap();
-        assert_eq!(&encoded[..8], COMPONENT_MAGIC);
+        assert_eq!(&encoded[..8], MANIFEST_MAGIC);
         assert_eq!(IndexGenerationManifest::decode(&encoded).unwrap(), manifest);
 
         let mut corrupt = encoded;
-        *corrupt.last_mut().unwrap() ^= 1;
+        corrupt.push(0);
         assert!(matches!(
             IndexGenerationManifest::decode(&corrupt),
-            Err(GenerationError::InvalidManifest(_))
+            Err(GenerationError::Decode(_))
         ));
+    }
+
+    #[test]
+    fn manifest_larger_than_one_component_round_trips_as_an_ordinary_object() {
+        let template = manifest(3);
+        let mut segments = Vec::new();
+        let mut locator_roots = Vec::new();
+        for ordinal in 0_u64..800 {
+            let mut segment = template.segments[0].clone();
+            segment.identity.segment_id = 1_000 + ordinal;
+            let mut locator = template.locator_roots[0].clone();
+            locator.sequence = ordinal + 1;
+            locator.identity = segment.identity;
+            segments.push(segment);
+            locator_roots.push(locator);
+        }
+        let value = IndexGenerationManifest::new(
+            template.index_id,
+            template.generation,
+            template.definition_version,
+            template.kind,
+            template.schema_fingerprint,
+            &barrier(),
+            template.physical_order,
+            segments,
+            locator_roots,
+            512 * 800,
+            32 * 800,
+        )
+        .unwrap();
+
+        let encoded = value.encode().unwrap();
+
+        assert!(encoded.len() > INDEX_COMPONENT_BYTES);
+        assert_eq!(IndexGenerationManifest::decode(&encoded).unwrap(), value);
     }
 
     #[test]
@@ -1328,20 +1322,18 @@ mod tests {
         let current_manifest = manifest(9);
         let old_manifest = manifest(8);
         let published = UNIX_EPOCH + Duration::from_secs(10);
+        let current_blob = manifest_blob(&current_manifest);
         let current = ManifestReference::new(
             &current_manifest,
-            manifest_blob(&current_manifest),
+            current_blob.clone(),
             VersionId(20),
             published,
         )
         .unwrap();
-        let retained = ManifestReference::new(
-            &old_manifest,
-            manifest_blob(&old_manifest),
-            VersionId(19),
-            published,
-        )
-        .unwrap();
+        let old_blob = manifest_blob(&old_manifest);
+        let retained =
+            ManifestReference::new(&old_manifest, old_blob.clone(), VersionId(19), published)
+                .unwrap();
         let pointer = IndexCurrentPointer::new(4, current, vec![retained]).unwrap();
         let encoded = pointer.encode().unwrap();
         assert_eq!(IndexCurrentPointer::decode(&encoded).unwrap(), pointer);
@@ -1352,9 +1344,9 @@ mod tests {
     fn current_pointer_rejects_duplicate_or_unordered_generations() {
         let value = manifest(9);
         let published = UNIX_EPOCH + Duration::from_secs(10);
+        let blob = manifest_blob(&value);
         let reference =
-            ManifestReference::new(&value, manifest_blob(&value), VersionId(20), published)
-                .unwrap();
+            ManifestReference::new(&value, blob.clone(), VersionId(20), published).unwrap();
         assert_eq!(
             IndexCurrentPointer::new(4, reference.clone(), vec![reference]).unwrap_err(),
             GenerationError::InvalidPointer
@@ -1362,20 +1354,19 @@ mod tests {
     }
 
     #[test]
-    fn manifest_reference_is_bound_to_exact_manifest_bytes() {
+    fn manifest_reference_uses_the_already_staged_blob_identity() {
         let value = manifest(9);
-        let mut blob = manifest_blob(&value);
-        blob.hash[0] ^= 1;
-        assert_eq!(
-            ManifestReference::new(
-                &value,
-                blob,
-                VersionId(20),
-                UNIX_EPOCH + Duration::from_secs(10),
-            )
-            .unwrap_err(),
-            GenerationError::InvalidManifestReference
-        );
+        let blob = manifest_blob(&value);
+        let reference = ManifestReference::new(
+            &value,
+            blob.clone(),
+            VersionId(20),
+            UNIX_EPOCH + Duration::from_secs(10),
+        )
+        .unwrap();
+
+        assert_eq!(reference.blob, blob);
+        assert_eq!(reference.path, manifest_path(value.index_id, blob.hash));
     }
 
     #[test]

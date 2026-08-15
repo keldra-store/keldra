@@ -485,7 +485,6 @@ fn component_versions(fields: &[FieldSchema]) -> Vec<ComponentVersion> {
         ComponentKind::LIVE_MASK,
         ComponentKind::PATH_LOCATOR,
         ComponentKind::SCORING_STATISTICS,
-        ComponentKind::GENERATION_MANIFEST,
     ]);
     for field in fields {
         if field.components.contains(FieldComponents::TERMS) {
@@ -806,7 +805,6 @@ mod tests {
                 ComponentKind::LIVE_MASK,
                 ComponentKind::PATH_LOCATOR,
                 ComponentKind::SCORING_STATISTICS,
-                ComponentKind::GENERATION_MANIFEST,
             ] {
                 assert!(kinds.contains(&common), "{name}");
             }
