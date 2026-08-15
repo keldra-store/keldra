@@ -12,8 +12,11 @@ use super::super::{
     RoutingEntry, RoutingNode, SegmentIdentity, artifact_path, encode_component,
 };
 
-const INDEX_ARTIFACT_PACK_COMPONENTS: usize =
-    INDEX_ARTIFACT_PACK_BYTES / super::super::INDEX_COMPONENT_BYTES;
+// A checked component always contains at least its fixed envelope. The byte
+// ceiling is authoritative; deriving the count ceiling from the largest legal
+// component made 32 tiny components look like a full 16 MiB pack and caused
+// tens of thousands of mostly-empty ordinary-object publications.
+const INDEX_ARTIFACT_PACK_COMPONENTS: usize = INDEX_ARTIFACT_PACK_BYTES / COMPONENT_HEADER_BYTES;
 /// Two worst-case 32,772-byte term boundaries plus one descriptor fit seven
 /// times within a 512 KiB routing component. Short-key streams retain the
 /// format-wide fanout of 32.
@@ -1187,8 +1190,8 @@ mod tests {
         let stream = publish_stream(&mut sink, identity, 1, leaves)
             .await
             .unwrap();
-        assert_eq!(sink.publish_calls(), 5);
-        assert_eq!(sink.objects().len(), 5);
+        assert_eq!(sink.publish_calls(), 4);
+        assert_eq!(sink.objects().len(), 4);
         assert_eq!(stream.component_count, 36); // 33 leaves, 2 parents, 1 root.
         assert_eq!(stream.root.component_kind, ComponentKind::ROUTING_NODE);
         assert!(sink.component_bytes(&stream.root).is_ok());
@@ -1264,9 +1267,33 @@ mod tests {
         let stream = publisher.finish().await.unwrap();
 
         assert_eq!(stream.component_count, 43); // 40 leaves, 2 parents, 1 root.
-        assert_eq!(sink.publish_calls(), 5);
-        assert_eq!(sink.objects().len(), 5);
+        assert_eq!(sink.publish_calls(), 4);
+        assert_eq!(sink.objects().len(), 4);
         assert!(sink.component_bytes(&stream.root).is_ok());
+    }
+
+    #[test]
+    fn tiny_components_are_bounded_by_pack_bytes_not_worst_case_count() {
+        let identity = SegmentIdentity::new(1, 2, [3; 32], 4).unwrap();
+        let mut builder = ComponentPackBuilder::new();
+        for value in 0..1_024_u32 {
+            builder
+                .push(
+                    encode_component(
+                        identity,
+                        ComponentKind::POSTINGS,
+                        1,
+                        0,
+                        4,
+                        value.to_le_bytes().to_vec(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        let pack = builder.finish().unwrap();
+        assert_eq!(pack.component_count().unwrap(), 1_024);
+        assert!(pack.bytes().len() < INDEX_ARTIFACT_PACK_BYTES);
     }
 
     #[tokio::test]
