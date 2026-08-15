@@ -1026,31 +1026,7 @@ impl IndexGenerationRetention {
             .payload
             .take()
             .ok_or_else(|| Status::data_loss("retained routing artifact has no payload"))?;
-        let skipped = std::io::copy(
-            &mut payload.by_ref().take(descriptor.offset),
-            &mut std::io::sink(),
-        )
-        .map_err(|error| Status::internal(format!("seek format-v4 routing artifact: {error}")))?;
-        if skipped != descriptor.offset {
-            return Err(Status::data_loss(
-                "format-v4 routing artifact offset exceeds its object",
-            ));
-        }
-        let mut bytes = Vec::with_capacity(
-            usize::try_from(descriptor.encoded_length)
-                .map_err(|_| Status::resource_exhausted("routing component exceeds platform"))?,
-        );
-        payload
-            .take(descriptor.encoded_length + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|error| {
-                Status::internal(format!("read format-v4 routing artifact: {error}"))
-            })?;
-        if bytes.len() as u64 != descriptor.encoded_length {
-            return Err(Status::data_loss(
-                "format-v4 routing component length differs from its descriptor",
-            ));
-        }
+        let bytes = read_routing_component(&mut payload, descriptor)?;
         let identity = component_identity(&bytes)?;
         routing.expected_identity.require(identity)?;
         let decoded = decode_component(
@@ -1120,6 +1096,37 @@ impl IndexGenerationRetention {
             .await
             .map_err(|_| Status::deadline_exceeded("index retention operation timed out"))?
     }
+}
+
+fn read_routing_component<R: Read>(
+    payload: &mut R,
+    descriptor: &ArtifactDescriptor,
+) -> Result<Vec<u8>, Status> {
+    let skipped = std::io::copy(
+        &mut payload.by_ref().take(descriptor.offset),
+        &mut std::io::sink(),
+    )
+    .map_err(|error| Status::internal(format!("seek format-v4 routing artifact: {error}")))?;
+    if skipped != descriptor.offset {
+        return Err(Status::data_loss(
+            "format-v4 routing artifact offset exceeds its object",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(descriptor.encoded_length)
+            .map_err(|_| Status::resource_exhausted("routing component exceeds platform"))?,
+    );
+    payload
+        .by_ref()
+        .take(descriptor.encoded_length)
+        .read_to_end(&mut bytes)
+        .map_err(|error| Status::internal(format!("read format-v4 routing artifact: {error}")))?;
+    if bytes.len() as u64 != descriptor.encoded_length {
+        return Err(Status::data_loss(
+            "format-v4 routing component length differs from its descriptor",
+        ));
+    }
+    Ok(bytes)
 }
 
 pub(crate) struct IndexRetentionTask {

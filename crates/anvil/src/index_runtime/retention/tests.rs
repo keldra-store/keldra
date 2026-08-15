@@ -131,6 +131,64 @@ fn routing_envelope_identity_is_read_from_the_portable_v4_header() {
 }
 
 #[test]
+fn routing_reader_returns_only_its_descriptor_range_from_a_shared_pack() {
+    let prefix = vec![1_u8; 7];
+    let component = vec![2_u8; anvil_index::v4::COMPONENT_HEADER_BYTES];
+    let suffix = vec![3_u8; 11];
+    let mut object = prefix.clone();
+    object.extend_from_slice(&component);
+    object.extend_from_slice(&suffix);
+    let hash = *blake3::hash(&object).as_bytes();
+    let descriptor = ArtifactDescriptor::new(
+        9,
+        artifact_path(9, hash),
+        1,
+        hash,
+        object.len() as u64,
+        prefix.len() as u64,
+        component.len() as u64,
+        0,
+        ComponentKind::ROUTING_NODE,
+        1,
+        [4; 32],
+    )
+    .unwrap();
+
+    let mut input = std::io::Cursor::new(object);
+    assert_eq!(
+        read_routing_component(&mut input, &descriptor).unwrap(),
+        component
+    );
+    assert_eq!(
+        input.position(),
+        descriptor.offset + descriptor.encoded_length
+    );
+}
+
+#[test]
+fn routing_reader_rejects_a_truncated_descriptor_range() {
+    let hash = [5; 32];
+    let descriptor = ArtifactDescriptor::new(
+        9,
+        artifact_path(9, hash),
+        1,
+        hash,
+        anvil_index::v4::COMPONENT_HEADER_BYTES as u64,
+        0,
+        anvil_index::v4::COMPONENT_HEADER_BYTES as u64,
+        0,
+        ComponentKind::ROUTING_NODE,
+        1,
+        [6; 32],
+    )
+    .unwrap();
+    let mut input = std::io::Cursor::new(vec![0_u8; 119]);
+
+    let error = read_routing_component(&mut input, &descriptor).unwrap_err();
+    assert_eq!(error.code(), tonic::Code::DataLoss);
+}
+
+#[test]
 fn retention_budget_and_schedule_reject_unbounded_ticks() {
     assert!(
         IndexRetentionBudget::new(1, MAX_RETENTION_RECORD_BYTES - 1, Duration::from_secs(1))
