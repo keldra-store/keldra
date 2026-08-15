@@ -963,8 +963,8 @@ For each field, the catalogue records:
 - public field name and source selector;
 - one logical type: Boolean, signed integer, unsigned integer, finite
   IEEE-754 binary64, keyword, or analyzed text;
-- definition-declared cardinality and whether missing and explicit null are
-  permitted;
+- definition-declared cardinality and the effective missing and explicit-null
+  policy;
 - comparison and collation semantics;
 - the exact declared capabilities and the minimum compiled components which
   realize them;
@@ -981,6 +981,12 @@ number, truncates an integer, treats a Boolean as a number, or invents a tagged
 cross-type order. Null is a value state, not a numeric or string type, and
 missing remains a separate presence state. A future SQL API therefore receives
 real logical types without inferring them from observed documents.
+
+The initial Typed JSON public definition keeps that policy deliberately small:
+missing and explicit null are both permitted. The canonical field catalogue
+records and fingerprints those effective values even though callers cannot vary
+them in this release. A later stricter policy would be an explicit public API
+extension, not an inference from observed documents.
 
 Observed occurrence counts, actual scalar tags, null counts, and multi-value
 counts are segment statistics. They never alter the definition schema or its
