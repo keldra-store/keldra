@@ -424,6 +424,48 @@ async fn bulk_returns_per_item_results_and_persists_successes_once() {
 }
 
 #[tokio::test]
+async fn bulk_repeated_path_cas_is_evaluated_in_input_order() {
+    let (_temporary, store) = store().await;
+    let outcomes = store
+        .bulk_write(vec![
+            BatchOperation::Put(put("same", b"first", Precondition::Absent, "first")),
+            BatchOperation::Put(put("same", b"rejected", Precondition::Absent, "second")),
+            BatchOperation::Put(put("same", b"last", Precondition::Any, "third")),
+        ])
+        .await;
+
+    let first = outcomes[0].result.as_ref().unwrap();
+    assert!(matches!(
+        outcomes[1].result,
+        Err(MutationError::PreconditionFailed {
+            current: Some(current)
+        }) if current == first.version
+    ));
+    let last = outcomes[2].result.as_ref().unwrap();
+    assert!(last.version > first.version);
+    assert_eq!(
+        store.get(&key("same")).await.unwrap().unwrap().bytes,
+        b"last"
+    );
+}
+
+#[tokio::test]
+async fn bulk_repeated_command_replays_the_pending_receipt() {
+    let (_temporary, store) = store().await;
+    let operation =
+        BatchOperation::Put(put("same", b"value", Precondition::Absent, "same-command"));
+    let before = store.local_watch_status().unwrap().tail;
+    let outcomes = store.bulk_write(vec![operation.clone(), operation]).await;
+
+    let first = outcomes[0].result.as_ref().unwrap();
+    let replay = outcomes[1].result.as_ref().unwrap();
+    assert!(!first.replayed);
+    assert!(replay.replayed);
+    assert_eq!(replay.version, first.version);
+    assert_eq!(store.local_watch_status().unwrap().tail, before + 1);
+}
+
+#[tokio::test]
 async fn bulk_wal_contains_one_high_watermark_and_replay_adds_no_write() {
     let (_temporary, store) = store().await;
     store.resolve_bucket_identity("tenant", "bucket").unwrap();
@@ -1255,7 +1297,7 @@ async fn rejected_large_inline_put_leaves_only_an_age_gated_orphan() {
 }
 
 #[tokio::test]
-async fn bulk_loads_each_distinct_bucket_policy_once() {
+async fn bulk_prefetches_distinct_bucket_policies_without_point_lookups() {
     let (_temporary, store) = store().await;
     let put_in = |bucket: &str, path: &str, command: &str| {
         BatchOperation::Put(PutRequest {
@@ -1283,7 +1325,7 @@ async fn bulk_loads_each_distinct_bucket_policy_once() {
         store
             .policy_lookup_count
             .load(std::sync::atomic::Ordering::Relaxed),
-        2
+        0
     );
 }
 

@@ -766,12 +766,24 @@ impl Store {
         pending: &PendingBlobReferences,
         now_unix_millis: u64,
     ) -> Result<(Vec<u8>, BlobReferenceState), MutationError> {
+        self.prepare_blob_reference_publication_cached(reference, pending, None, now_unix_millis)
+    }
+
+    pub(super) fn prepare_blob_reference_publication_cached(
+        &self,
+        reference: &BlobRef,
+        pending: &PendingBlobReferences,
+        prefetched: Option<Result<Option<BlobReferenceState>, MutationError>>,
+        now_unix_millis: u64,
+    ) -> Result<(Vec<u8>, BlobReferenceState), MutationError> {
         let key = blob_reference_key(reference);
         let state = match pending.get(&key).copied() {
             Some(state) => state,
-            None => self
-                .read_blob_reference_state(&key)?
-                .ok_or(MutationError::BlobNotFound)?,
+            None => match prefetched {
+                Some(cached) => cached?,
+                None => self.read_blob_reference_state(&key)?,
+            }
+            .ok_or(MutationError::BlobNotFound)?,
         };
         advance_blob_reference_publication(state, now_unix_millis).map(|state| (key, state))
     }
@@ -783,12 +795,16 @@ impl Store {
         &self,
         reference: &BlobRef,
         pending: &PendingBlobReferences,
+        prefetched: Option<Result<Option<BlobReferenceState>, MutationError>>,
         now_unix_millis: u64,
     ) -> Result<(Vec<u8>, BlobReferenceState), MutationError> {
         let key = blob_reference_key(reference);
         let state = match pending.get(&key).copied() {
             Some(state) => advance_blob_reference_publication(state, now_unix_millis)?,
-            None => match self.read_blob_reference_state(&key)? {
+            None => match match prefetched {
+                Some(cached) => cached?,
+                None => self.read_blob_reference_state(&key)?,
+            } {
                 Some(state) => advance_blob_reference_publication(state, now_unix_millis)?,
                 None => BlobReferenceState {
                     ref_count: 1,
@@ -820,14 +836,28 @@ impl Store {
         bytes: &[u8],
         pending: &BTreeSet<Vec<u8>>,
     ) -> Result<Option<(Vec<u8>, Vec<u8>)>, MutationError> {
+        self.prepare_hashed_small_blob_value_cached(reference, bytes, pending, None)
+    }
+
+    pub(super) fn prepare_hashed_small_blob_value_cached(
+        &self,
+        reference: &BlobRef,
+        bytes: &[u8],
+        pending: &BTreeSet<Vec<u8>>,
+        prefetched: Option<Result<Option<Vec<u8>>, MutationError>>,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>, MutationError> {
         let key = blob_reference_key(reference);
         if pending.contains(&key) {
             return Ok(None);
         }
-        let existing = self
-            .db
-            .get_cf(self.cf(CF_SMALL_BLOBS)?, &key)
-            .map_err(storage_error)?;
+        let existing = match prefetched {
+            Some(cached) => cached?,
+            None => self
+                .db
+                .get_cf(self.cf(CF_SMALL_BLOBS)?, &key)
+                .map_err(storage_error)?
+                .map(|encoded| encoded.to_vec()),
+        };
         match existing {
             Some(existing) => {
                 validate_small_blob(reference, &existing)?;
@@ -852,10 +882,24 @@ impl Store {
         pending: &PendingBlobReferences,
         now_unix_millis: u64,
     ) -> Result<(Vec<u8>, BlobReferenceState), MutationError> {
+        self.prepare_blob_reference_retirement_cached(reference, pending, None, now_unix_millis)
+    }
+
+    pub(super) fn prepare_blob_reference_retirement_cached(
+        &self,
+        reference: &BlobRef,
+        pending: &PendingBlobReferences,
+        prefetched: Option<Result<Option<BlobReferenceState>, MutationError>>,
+        now_unix_millis: u64,
+    ) -> Result<(Vec<u8>, BlobReferenceState), MutationError> {
         let key = blob_reference_key(reference);
         let mut state = match pending.get(&key).copied() {
             Some(state) => state,
-            None => self.read_blob_reference_state(&key)?.ok_or_else(|| {
+            None => match prefetched {
+                Some(cached) => cached?,
+                None => self.read_blob_reference_state(&key)?,
+            }
+            .ok_or_else(|| {
                 MutationError::Storage(
                     "retired version references missing blob lifecycle metadata".into(),
                 )
@@ -913,9 +957,23 @@ impl Store {
         key: Vec<u8>,
         state: BlobReferenceState,
     ) -> Result<(), MutationError> {
+        self.stage_blob_reference_update_cached(batch, pending, key, state, None)
+    }
+
+    pub(super) fn stage_blob_reference_update_cached(
+        &self,
+        batch: &mut WriteBatch,
+        pending: &mut PendingBlobReferences,
+        key: Vec<u8>,
+        state: BlobReferenceState,
+        prefetched: Option<Result<Option<BlobReferenceState>, MutationError>>,
+    ) -> Result<(), MutationError> {
         let previous = match pending.get(&key).copied() {
             Some(state) => Some(state),
-            None => self.read_blob_reference_state(&key)?,
+            None => match prefetched {
+                Some(cached) => cached?,
+                None => self.read_blob_reference_state(&key)?,
+            },
         };
         if let Some(previous) = previous
             && let Some(old_due) = blob_gc_due_key(&key, previous)?

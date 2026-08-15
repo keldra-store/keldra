@@ -578,6 +578,14 @@ impl PreparedOperation {
             | Self::Delete { fingerprint, .. } => *fingerprint,
         }
     }
+
+    fn payload_reference(&self) -> Option<&BlobRef> {
+        match self {
+            Self::Put { payload, .. } => Some(payload.reference()),
+            Self::Publish { request, .. } => Some(&request.blob),
+            Self::Delete { .. } => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1260,6 +1268,8 @@ mod distributed_publish_batch;
 mod index_retention_due;
 mod journal_capacity;
 mod journal_routes;
+mod mutation_prefetch;
+mod mutation_types;
 mod mutations;
 mod object_mutation_replica_batch;
 mod object_snapshot;
@@ -1586,7 +1596,9 @@ fn encode_blob_reference_state(state: BlobReferenceState) -> [u8; 25] {
     encoded
 }
 
-fn decode_blob_reference_state(encoded: &[u8]) -> Result<BlobReferenceState, MutationError> {
+pub(super) fn decode_blob_reference_state(
+    encoded: &[u8],
+) -> Result<BlobReferenceState, MutationError> {
     if encoded.len() != 25 {
         return Err(MutationError::Storage(
             "blob reference metadata value is malformed".into(),
