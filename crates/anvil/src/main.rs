@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use anvil::authentication::{JwtManager, RateLimitConfig, load_token_signing_key};
 use anvil::observability::{Observability, ObservabilityConfig};
-use anvil::{IndexRuntimeConfig, ServerConfig, serve};
+use anvil::{ExplicitAuthoritativePaths, IndexRuntimeConfig, ServerConfig, StoragePaths, serve};
 use anvil_index::IndexKind;
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -27,6 +27,38 @@ struct Arguments {
 
     #[arg(long, env = "ANVIL_DATA_DIR", default_value = "anvil-data")]
     data_dir: PathBuf,
+
+    /// Durable node identity, certificates, and Raft state. Pinned at initialization.
+    #[arg(long, env = "ANVIL_STATE_DIR")]
+    state_dir: Option<PathBuf>,
+
+    /// Durable RocksDB SST and manifest directory. Pinned at initialization.
+    #[arg(long, env = "ANVIL_METADATA_DIR")]
+    metadata_dir: Option<PathBuf>,
+
+    /// Durable RocksDB write-ahead-log directory. Pinned at initialization.
+    #[arg(long, env = "ANVIL_METADATA_WAL_DIR")]
+    metadata_wal_dir: Option<PathBuf>,
+
+    /// Durable canonical blob and erasure-shard directory. Pinned at initialization.
+    #[arg(long, env = "ANVIL_PAYLOAD_DIR")]
+    payload_dir: Option<PathBuf>,
+
+    /// Restart-disposable index construction scratch directory.
+    #[arg(long, env = "ANVIL_SCRATCH_DIR")]
+    scratch_dir: Option<PathBuf>,
+
+    /// Restart-disposable index and gateway cache directory.
+    #[arg(long, env = "ANVIL_CACHE_DIR")]
+    cache_dir: Option<PathBuf>,
+
+    /// Restart-disposable spool for unfinished, unacknowledged uploads.
+    #[arg(long, env = "ANVIL_UPLOAD_SPOOL_DIR")]
+    upload_spool_dir: Option<PathBuf>,
+
+    /// Aggregate bytes admitted to the unfinished upload spool.
+    #[arg(long, env = "ANVIL_UPLOAD_SPOOL_MAX_BYTES")]
+    upload_spool_max_bytes: Option<NonZeroU64>,
 
     #[arg(long, env = "ANVIL_RUN_SYSTEM_BOOTSTRAP", default_value_t = false)]
     run_system_bootstrap: bool,
@@ -478,6 +510,46 @@ struct Arguments {
 }
 
 impl Arguments {
+    fn storage_paths(&self) -> (StoragePaths, ExplicitAuthoritativePaths) {
+        let explicit = ExplicitAuthoritativePaths {
+            state: self.state_dir.is_some(),
+            metadata: self.metadata_dir.is_some(),
+            metadata_wal: self.metadata_wal_dir.is_some(),
+            payload: self.payload_dir.is_some(),
+        };
+        let spool_max = self
+            .upload_spool_max_bytes
+            .map(NonZeroU64::get)
+            .unwrap_or(self.max_blob_bytes);
+        let mut paths = StoragePaths::under(&self.data_dir, spool_max);
+        if let Some(path) = &self.state_dir {
+            paths.state = path.clone();
+        }
+        if let Some(path) = &self.metadata_dir {
+            paths.metadata = path.clone();
+        }
+        paths.metadata_wal = self
+            .metadata_wal_dir
+            .clone()
+            .unwrap_or_else(|| paths.metadata.clone());
+        if let Some(path) = &self.payload_dir {
+            paths.payload = path.clone();
+        }
+        paths.scratch = self
+            .scratch_dir
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join("index-scratch"));
+        paths.cache = self
+            .cache_dir
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join("cache"));
+        paths.upload_spool = self
+            .upload_spool_dir
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join("upload-spool"));
+        (paths, explicit)
+    }
+
     fn erasure_profile(&self) -> Result<anvil_store::ErasureProfile> {
         anvil_store::ErasureProfile::new(
             self.erasure_data_shards,
@@ -621,6 +693,7 @@ impl Arguments {
 #[tokio::main]
 async fn main() -> Result<()> {
     let arguments = Arguments::parse();
+    let (storage, explicit_authoritative_paths) = arguments.storage_paths();
     let erasure_profile = arguments.erasure_profile()?;
     let index_runtime = arguments.index_runtime_config()?;
     let signing_key =
@@ -640,7 +713,8 @@ async fn main() -> Result<()> {
         peer_listen: arguments.peer_listen,
         peer_advertise: arguments.peer_advertise,
         join_bundle: arguments.join_bundle,
-        data_dir: arguments.data_dir,
+        storage,
+        explicit_authoritative_paths,
         run_system_bootstrap: arguments.run_system_bootstrap,
         system_bootstrap_credential_output: arguments.system_bootstrap_credential_output,
         node_id: arguments.node_id,
@@ -715,6 +789,73 @@ mod tests {
             "127.0.0.1:50052".parse::<SocketAddr>().unwrap()
         );
         assert!(arguments.peer_advertise.is_none());
+    }
+
+    #[test]
+    fn storage_paths_default_under_the_data_directory() {
+        let arguments = parse(&[
+            "--data-dir",
+            "/var/lib/anvil",
+            "--max-blob-bytes",
+            "1048576",
+        ]);
+        let (paths, explicit) = arguments.storage_paths();
+
+        assert_eq!(paths, StoragePaths::under("/var/lib/anvil", 1_048_576));
+        assert_eq!(explicit, ExplicitAuthoritativePaths::default());
+    }
+
+    #[test]
+    fn storage_paths_accept_independent_authoritative_and_disposable_roots() {
+        let arguments = parse(&[
+            "--data-dir",
+            "/fallback",
+            "--state-dir",
+            "/state",
+            "--metadata-dir",
+            "/metadata",
+            "--metadata-wal-dir",
+            "/wal",
+            "--payload-dir",
+            "/payload",
+            "--scratch-dir",
+            "/scratch",
+            "--cache-dir",
+            "/cache",
+            "--upload-spool-dir",
+            "/spool",
+            "--upload-spool-max-bytes",
+            "2097152",
+        ]);
+        let (paths, explicit) = arguments.storage_paths();
+
+        assert_eq!(paths.state, PathBuf::from("/state"));
+        assert_eq!(paths.metadata, PathBuf::from("/metadata"));
+        assert_eq!(paths.metadata_wal, PathBuf::from("/wal"));
+        assert_eq!(paths.payload, PathBuf::from("/payload"));
+        assert_eq!(paths.scratch, PathBuf::from("/scratch"));
+        assert_eq!(paths.cache, PathBuf::from("/cache"));
+        assert_eq!(paths.upload_spool, PathBuf::from("/spool"));
+        assert_eq!(paths.upload_spool_max_bytes, 2_097_152);
+        assert_eq!(
+            explicit,
+            ExplicitAuthoritativePaths {
+                state: true,
+                metadata: true,
+                metadata_wal: true,
+                payload: true,
+            }
+        );
+    }
+
+    #[test]
+    fn metadata_wal_defaults_to_the_effective_metadata_root() {
+        let arguments = parse(&["--metadata-dir", "/metadata"]);
+        let (paths, explicit) = arguments.storage_paths();
+
+        assert_eq!(paths.metadata_wal, PathBuf::from("/metadata"));
+        assert!(explicit.metadata);
+        assert!(!explicit.metadata_wal);
     }
 
     #[test]

@@ -694,6 +694,34 @@ Production formation uses the same sequence:
 The public gRPC endpoint may sit behind an ordinary TLS terminator. Peer traffic
 uses mandatory certificates created and rotated by the cluster.
 
+### Place storage by workload
+
+`ANVIL_DATA_DIR` supplies convenient single-filesystem defaults. A new node
+logs a bootstrap warning for every authoritative path left at its default so an
+operator can distribute I/O before that storage root is pinned:
+
+| Setting | Workload | Lifecycle |
+| --- | --- | --- |
+| `ANVIL_STATE_DIR` | Node identity, peer certificates, and Raft decisions | Authoritative; pinned at node initialization |
+| `ANVIL_METADATA_DIR` | RocksDB manifests, SSTs, object metadata, Zanzibar, and journals | Authoritative; pinned |
+| `ANVIL_METADATA_WAL_DIR` | RocksDB synchronous write-ahead log | Authoritative; pinned; prefer low-latency durable storage |
+| `ANVIL_PAYLOAD_DIR` | Canonical blobs, EC shards, and authoritative index artifacts | Authoritative; pinned; prefer capacity and sequential throughput |
+| `ANVIL_SCRATCH_DIR` | Index sort and merge scratch | Disposable; may use tmpfs or local scratch storage |
+| `ANVIL_CACHE_DIR` | Materialized index and gateway caches | Disposable; may be replaced between restarts |
+| `ANVIL_UPLOAD_SPOOL_DIR` | Unfinished, unacknowledged upload bytes | Disposable; may use bounded tmpfs |
+| `ANVIL_UPLOAD_SPOOL_MAX_BYTES` | Process-wide unfinished-upload capacity | Defaults to the configured maximum object size |
+
+Each authoritative root carries a node-local identity marker. Restarting with a
+missing mount, an empty replacement directory, or another node's disk fails
+before RocksDB, Raft, or payload storage opens. Moving the same marked storage
+root to a different mount path is safe. Scratch, cache, and upload-spool paths
+are deliberately unpinned; losing them may abort active work or cause cache
+refetching, but cannot lose an acknowledged object.
+
+The WAL must not use tmpfs. Identified blob/shard staging and garbage-collection
+recovery remain under `ANVIL_PAYLOAD_DIR`; only raw uploads which have not
+reached `PutEnd` use the disposable spool.
+
 ## Public services
 
 | Service | Purpose |
