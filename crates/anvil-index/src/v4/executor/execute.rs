@@ -444,11 +444,11 @@ where
                     .seek_after(request, order, after, &directions)
                     .await?;
             }
-            heads.push(
-                execution
-                    .next_physical(request, order, directions.clone())
-                    .await?,
-            );
+            let head = execution
+                .next_physical(request, order, directions.clone())
+                .await?;
+            execution.release_decoded()?;
+            heads.push(head);
         }
         let mut selected = Vec::with_capacity(request.limit as usize);
         let mut refill_required = false;
@@ -466,6 +466,7 @@ where
                 heads[index] = executions[index]
                     .next_physical(request, order, directions.clone())
                     .await?;
+                executions[index].release_decoded()?;
             }
             if pending.is_empty() {
                 break;

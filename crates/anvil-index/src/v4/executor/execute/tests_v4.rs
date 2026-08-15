@@ -583,6 +583,39 @@ async fn physical_order_and_search_after_are_stable() {
 }
 
 #[tokio::test]
+async fn physical_order_memory_is_bounded_across_many_segments() {
+    let (schema, segment, directory) = fixture().await;
+    let executor =
+        NativeQueryExecutor::new(&directory, &AllowAll, NativeQueryLimits::default()).unwrap();
+    let one = request(
+        &schema,
+        &segment,
+        NativeQuery::Filter {
+            predicate: Some(Predicate::Equal {
+                id: PredicateId::new(1),
+                field_id: FieldId::new(0),
+                value: ScalarValue::String("active".into()),
+            }),
+            order: schema.physical_order.clone(),
+        },
+    );
+    let mut many = one.clone();
+    many.segments = (1..=64)
+        .map(|segment_id| {
+            let mut descriptor = segment.clone();
+            descriptor.identity.segment_id = segment_id;
+            descriptor
+        })
+        .collect();
+
+    let one_bytes = executor.working_memory_bytes(&one).unwrap();
+    let many_bytes = executor.working_memory_bytes(&many).unwrap();
+
+    assert!(many_bytes > one_bytes);
+    assert!(many_bytes - one_bytes < crate::v4::INDEX_DECODE_BYTES);
+}
+
+#[tokio::test]
 async fn arbitrary_top_k_agrees_with_physical_order_across_pages() {
     let (physical_schema, physical_segment, physical_directory) = fixture().await;
     let mut top_k_schema = physical_schema.clone();
