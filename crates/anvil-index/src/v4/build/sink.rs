@@ -17,6 +17,12 @@ use super::super::{
 // component made 32 tiny components look like a full 16 MiB pack and caused
 // tens of thousands of mostly-empty ordinary-object publications.
 const INDEX_ARTIFACT_PACK_COMPONENTS: usize = INDEX_ARTIFACT_PACK_BYTES / COMPONENT_HEADER_BYTES;
+// Accumulate enough child groups to fill one pack even when every routing
+// component reaches the format maximum. Shorter routing components may share
+// the same pack until the byte ceiling, but this threshold keeps streaming
+// state bounded independently of the input size.
+const ROUTING_COMPONENTS_PER_BATCH: usize =
+    INDEX_ARTIFACT_PACK_BYTES / super::super::INDEX_COMPONENT_BYTES;
 /// Two worst-case 32,772-byte term boundaries plus one descriptor fit seven
 /// times within a 512 KiB routing component. Short-key streams retain the
 /// format-wide fanout of 32.
@@ -195,6 +201,15 @@ impl ComponentPackBuilder {
 
     fn is_full(&self) -> bool {
         self.component_count == INDEX_ARTIFACT_PACK_COMPONENTS
+    }
+
+    fn accepts(&self, encoded: usize) -> bool {
+        !self.is_full()
+            && self
+                .bytes
+                .len()
+                .checked_add(encoded)
+                .is_some_and(|needed| needed <= INDEX_ARTIFACT_PACK_BYTES)
     }
 
     fn push(&mut self, component: GeneratedComponent) -> Result<(), IndexError> {
@@ -442,6 +457,14 @@ struct PublishedNode {
 }
 
 struct PendingLeaf {
+    minimum_key: Vec<u8>,
+    maximum_key: Vec<u8>,
+    element_count: u64,
+    header: super::super::ComponentHeader,
+    encoded_length: usize,
+}
+
+struct PendingRoutingNode {
     minimum_key: Vec<u8>,
     maximum_key: Vec<u8>,
     element_count: u64,
@@ -731,24 +754,31 @@ impl<'a, S: ComponentBatchSink> StreamingComponentPublisher<'a, S> {
                 .iter()
                 .position(|nodes| !nodes.is_empty())
                 .expect("a nonempty stream has an occupied level");
-            self.publish_level(level).await?;
+            self.publish_routing_groups(level, true).await?;
             self.cascade_full_levels(level + 1).await?;
         }
     }
 
     async fn cascade_full_levels(&mut self, mut level: usize) -> Result<(), IndexError> {
+        let buffered_children = routing_fanout(self.logical_kind)
+            .checked_mul(ROUTING_COMPONENTS_PER_BATCH)
+            .ok_or(IndexError::OffsetOverflow)?;
         while self
             .levels
             .get(level)
-            .is_some_and(|nodes| nodes.len() == routing_fanout(self.logical_kind))
+            .is_some_and(|nodes| nodes.len() >= buffered_children)
         {
-            self.publish_level(level).await?;
+            self.publish_routing_groups(level, false).await?;
             level += 1;
         }
         Ok(())
     }
 
-    async fn publish_level(&mut self, level: usize) -> Result<(), IndexError> {
+    async fn publish_routing_groups(
+        &mut self,
+        level: usize,
+        include_partial_group: bool,
+    ) -> Result<(), IndexError> {
         let height = u8::try_from(level + 1).map_err(|_| IndexError::OffsetOverflow)?;
         if height > INDEX_ROUTING_HEIGHT {
             return Err(IndexError::ResourceLimit {
@@ -756,56 +786,132 @@ impl<'a, S: ComponentBatchSink> StreamingComponentPublisher<'a, S> {
                 limit: INDEX_ROUTING_HEIGHT as usize,
             });
         }
-        let children = std::mem::take(
+        let mut children = std::mem::take(
             self.levels
                 .get_mut(level)
                 .ok_or(IndexError::InvalidFormat("streaming routing level"))?,
         );
-        if children.is_empty() || children.len() > routing_fanout(self.logical_kind) {
+        if children.is_empty() {
             return Err(IndexError::InvalidFormat(
                 "streaming routing fanout is invalid",
             ));
         }
-        let minimum_key = children.first().unwrap().minimum_key.clone();
-        let maximum_key = children.last().unwrap().maximum_key.clone();
-        let element_count = children.iter().try_fold(0u64, |sum, child| {
-            sum.checked_add(child.element_count)
-                .ok_or(IndexError::OffsetOverflow)
-        })?;
-        let entries = children
-            .into_iter()
-            .map(|child| RoutingEntry {
-                minimum_key: child.minimum_key,
-                maximum_key: child.maximum_key,
-                element_count: child.element_count,
-                child: child.descriptor,
-            })
-            .collect();
-        let routing =
-            RoutingNode::new_for_kind(self.identity.index_id, height, self.logical_kind, entries)?;
-        let payload = routing.encode_payload()?;
-        let component = encode_component(
-            self.identity,
-            ComponentKind::ROUTING_NODE,
-            self.routing_codec_version,
-            0,
-            u64::try_from(payload.len()).map_err(|_| IndexError::OffsetOverflow)?,
-            payload,
-        )?;
-        let header = component.header();
-        let encoded = component.bytes().len();
-        let descriptor = publish_single_component(self.sink, component).await?;
-        validate_placed_component(&descriptor, header, encoded)?;
-        self.record_descriptor(&descriptor)?;
-        if self.levels.len() <= level + 1 {
-            self.levels.push(Vec::new());
+        let fanout = routing_fanout(self.logical_kind);
+        let complete_groups = children.len() / fanout;
+        let groups = if include_partial_group {
+            children.len().div_ceil(fanout)
+        } else {
+            complete_groups - (complete_groups % ROUTING_COMPONENTS_PER_BATCH)
+        };
+        if groups == 0 {
+            self.levels[level] = children;
+            return Ok(());
         }
-        self.levels[level + 1].push(PublishedNode {
-            minimum_key,
-            maximum_key,
-            element_count,
-            descriptor,
-        });
+        let consumed = if include_partial_group {
+            children.len()
+        } else {
+            groups
+                .checked_mul(fanout)
+                .ok_or(IndexError::OffsetOverflow)?
+        };
+        let remainder = children.split_off(consumed);
+        let mut children = children.into_iter();
+        let mut pending_pack = None::<ComponentPackBuilder>;
+        let mut pending_nodes = Vec::<PendingRoutingNode>::new();
+
+        for _ in 0..groups {
+            let group = children.by_ref().take(fanout).collect::<Vec<_>>();
+            if group.is_empty() || (!include_partial_group && group.len() != fanout) {
+                return Err(IndexError::InvalidFormat(
+                    "streaming routing fanout is invalid",
+                ));
+            }
+            let minimum_key = group.first().unwrap().minimum_key.clone();
+            let maximum_key = group.last().unwrap().maximum_key.clone();
+            let element_count = group.iter().try_fold(0u64, |sum, child| {
+                sum.checked_add(child.element_count)
+                    .ok_or(IndexError::OffsetOverflow)
+            })?;
+            let entries = group
+                .into_iter()
+                .map(|child| RoutingEntry {
+                    minimum_key: child.minimum_key,
+                    maximum_key: child.maximum_key,
+                    element_count: child.element_count,
+                    child: child.descriptor,
+                })
+                .collect();
+            let routing = RoutingNode::new_for_kind(
+                self.identity.index_id,
+                height,
+                self.logical_kind,
+                entries,
+            )?;
+            let payload = routing.encode_payload()?;
+            let component = encode_component(
+                self.identity,
+                ComponentKind::ROUTING_NODE,
+                self.routing_codec_version,
+                0,
+                u64::try_from(payload.len()).map_err(|_| IndexError::OffsetOverflow)?,
+                payload,
+            )?;
+            let encoded_length = component.bytes().len();
+            if pending_pack
+                .as_ref()
+                .is_some_and(|pack| !pack.accepts(encoded_length))
+            {
+                self.publish_routing_pack(
+                    level + 1,
+                    pending_pack.take().expect("checked routing pack"),
+                    std::mem::take(&mut pending_nodes),
+                )
+                .await?;
+            }
+            pending_nodes.push(PendingRoutingNode {
+                minimum_key,
+                maximum_key,
+                element_count,
+                header: component.header(),
+                encoded_length,
+            });
+            pending_pack
+                .get_or_insert_with(ComponentPackBuilder::new)
+                .push(component)?;
+        }
+        if let Some(pack) = pending_pack {
+            self.publish_routing_pack(level + 1, pack, pending_nodes)
+                .await?;
+        }
+        self.levels[level] = remainder;
+        Ok(())
+    }
+
+    async fn publish_routing_pack(
+        &mut self,
+        parent_level: usize,
+        pack: ComponentPackBuilder,
+        nodes: Vec<PendingRoutingNode>,
+    ) -> Result<(), IndexError> {
+        let descriptors = self.sink.publish_pack(pack.finish()?).await?;
+        if descriptors.len() != nodes.len() {
+            return Err(IndexError::InvalidFormat(
+                "component sink returned the wrong descriptor count",
+            ));
+        }
+        if self.levels.len() <= parent_level {
+            self.levels.resize_with(parent_level + 1, Vec::new);
+        }
+        for (descriptor, node) in descriptors.into_iter().zip(nodes) {
+            validate_placed_component(&descriptor, node.header, node.encoded_length)?;
+            self.record_descriptor(&descriptor)?;
+            self.levels[parent_level].push(PublishedNode {
+                minimum_key: node.minimum_key,
+                maximum_key: node.maximum_key,
+                element_count: node.element_count,
+                descriptor,
+            });
+        }
         Ok(())
     }
 
@@ -1190,8 +1296,8 @@ mod tests {
         let stream = publish_stream(&mut sink, identity, 1, leaves)
             .await
             .unwrap();
-        assert_eq!(sink.publish_calls(), 4);
-        assert_eq!(sink.objects().len(), 4);
+        assert_eq!(sink.publish_calls(), 3);
+        assert_eq!(sink.objects().len(), 3);
         assert_eq!(stream.component_count, 36); // 33 leaves, 2 parents, 1 root.
         assert_eq!(stream.root.component_kind, ComponentKind::ROUTING_NODE);
         assert!(sink.component_bytes(&stream.root).is_ok());
@@ -1267,8 +1373,34 @@ mod tests {
         let stream = publisher.finish().await.unwrap();
 
         assert_eq!(stream.component_count, 43); // 40 leaves, 2 parents, 1 root.
-        assert_eq!(sink.publish_calls(), 4);
-        assert_eq!(sink.objects().len(), 4);
+        assert_eq!(sink.publish_calls(), 3);
+        assert_eq!(sink.objects().len(), 3);
+        assert!(sink.component_bytes(&stream.root).is_ok());
+    }
+
+    #[tokio::test]
+    async fn routing_layers_share_byte_bounded_ordinary_packs() {
+        let identity = SegmentIdentity::new(1, 2, [3; 32], 4).unwrap();
+        let mut sink = ExactMemorySink::new();
+        let mut publisher =
+            StreamingComponentPublisher::new(&mut sink, identity, ComponentKind::POSTINGS, 1, 1)
+                .unwrap();
+        for value in 0..1_024_u32 {
+            publisher
+                .push_payload(
+                    value.to_be_bytes().to_vec(),
+                    value.to_be_bytes().to_vec(),
+                    1,
+                    value.to_le_bytes().to_vec(),
+                )
+                .await
+                .unwrap();
+        }
+        let stream = publisher.finish().await.unwrap();
+
+        assert_eq!(stream.component_count, 1_057); // 1,024 leaves, 32 parents, 1 root.
+        assert_eq!(sink.publish_calls(), 3); // One leaf pack and two routing-layer packs.
+        assert_eq!(sink.objects().len(), 3);
         assert!(sink.component_bytes(&stream.root).is_ok());
     }
 
