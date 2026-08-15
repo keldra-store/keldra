@@ -13,7 +13,7 @@ use anvil_atomic_program::{
 };
 use anvil_index::IndexError;
 use anvil_index::v4::{
-    AggregateOperation, ArtifactDescriptor, ArtifactDirectoryRead, CandidateGate,
+    AggregateOperation, ArtifactDirectoryRead, ArtifactPackReference, CandidateGate,
     CandidateGateEvidence, CandidateReference, FieldId, IndexKind, NativeQueryCursor,
     NativeQueryExecutionError, NativeQueryExecutor, NativeQueryLimits, NativeQueryRequest,
     NativeQueryStatisticsRecorder, ScalarValue,
@@ -133,12 +133,9 @@ impl ArtifactDirectoryRead for QueryObservedDirectory {
         self.cpu.workers().max(1)
     }
 
-    async fn open_artifact(
-        &self,
-        descriptor: &ArtifactDescriptor,
-    ) -> Result<Self::File, IndexError> {
+    async fn open_artifact(&self, pack: &ArtifactPackReference) -> Result<Self::File, IndexError> {
         Ok(QueryObservedFile {
-            inner: self.inner.open(descriptor).await?,
+            inner: self.inner.open(pack).await?,
             observer: self.observer.clone(),
         })
     }

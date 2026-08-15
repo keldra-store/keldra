@@ -8,7 +8,7 @@ use anvil_index::v4::build::{
     BuildLimits, ExactMemorySink, NativeSegmentWriter, PublishedObject, SourcePush,
 };
 use anvil_index::v4::{
-    ArtifactDescriptor, ArtifactDirectoryRead, CandidateGate, CandidateGateEvidence,
+    ArtifactDirectoryRead, ArtifactPackReference, CandidateGate, CandidateGateEvidence,
     CandidateReference, NativeQuery, NativeQueryExecutor, NativeQueryLimits, NativeQueryRequest,
     Schema, SegmentIdentity,
 };
@@ -42,26 +42,18 @@ struct MemoryArtifacts(BTreeMap<String, PublishedObject>);
 impl ArtifactDirectoryRead for MemoryArtifacts {
     type File = MemoryFile;
 
-    async fn open_artifact(
-        &self,
-        descriptor: &ArtifactDescriptor,
-    ) -> Result<Self::File, IndexError> {
+    async fn open_artifact(&self, pack: &ArtifactPackReference) -> Result<Self::File, IndexError> {
         let object = self
             .0
-            .get(&descriptor.path)
-            .ok_or_else(|| IndexError::FileNotFound(descriptor.path.clone()))?;
-        if object.object_version != descriptor.object_version {
+            .get(&pack.path)
+            .ok_or_else(|| IndexError::FileNotFound(pack.path.clone()))?;
+        if object.object_version != pack.object_version
+            || object.bytes.len() as u64 != pack.object_length
+            || *blake3::hash(&object.bytes).as_bytes() != pack.object_content_hash
+        {
             return Err(IndexError::Integrity);
         }
-        let start = usize::try_from(descriptor.offset).map_err(|_| IndexError::OffsetOverflow)?;
-        let length =
-            usize::try_from(descriptor.encoded_length).map_err(|_| IndexError::OffsetOverflow)?;
-        let end = start
-            .checked_add(length)
-            .ok_or(IndexError::OffsetOverflow)?;
-        Ok(MemoryFile(Arc::from(
-            object.bytes.get(start..end).ok_or(IndexError::Integrity)?,
-        )))
+        Ok(MemoryFile(Arc::from(object.bytes.as_slice())))
     }
 }
 

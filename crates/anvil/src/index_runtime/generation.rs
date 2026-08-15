@@ -8,9 +8,9 @@ use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anvil_index::v4::{
-    ArtifactDescriptor, COMPONENT_HEADER_BYTES, ComponentKind, FieldId, INDEX_COMPONENT_BYTES,
-    INDEX_DECODE_BYTES, INDEX_FORMAT_VERSION, INDEX_GENERATION_SEGMENTS, INDEX_ROUTING_KEY_BYTES,
-    IndexKind, SegmentDescriptor,
+    ArtifactDescriptor, ArtifactPackReference, COMPONENT_HEADER_BYTES, ComponentKind, FieldId,
+    INDEX_COMPONENT_BYTES, INDEX_DECODE_BYTES, INDEX_FORMAT_VERSION, INDEX_GENERATION_SEGMENTS,
+    INDEX_ROUTING_KEY_BYTES, IndexKind, LocatorStreamRoot, SegmentDescriptor,
 };
 use anvil_store::{BlobRef, PlacementLogId, SourceId, VersionId};
 use thiserror::Error;
@@ -34,13 +34,15 @@ const MAX_SOURCE_CHECKPOINTS: usize = 1_024;
 const MAX_PHYSICAL_ORDER_FIELDS: usize = INDEX_COMPONENT_BYTES / 5;
 const MIN_ENCODED_SOURCE_CHECKPOINT_BYTES: usize = 8 + 2 + 32 + 8;
 const MIN_ENCODED_PHYSICAL_ORDER_BYTES: usize = 4 + 1;
-const MIN_ENCODED_SEGMENT_BYTES: usize = 8 + 8 + 32 + 8 + 4 + 4 + 4 + 8 + 8;
+const MIN_ENCODED_SEGMENT_BYTES: usize = 8 + 8 + 32 + 8 + 4 + 4 + 4 + 4 + 8 + 8;
 // Four path-length bytes plus the fixed fields after the path. A canonical
 // path is non-empty, so this deliberately underestimates every real record.
-const MIN_ENCODED_ARTIFACT_BYTES: usize = 4 + 8 + 32 + 8 + 8 + 8 + 8 + 2 + 2 + 32;
+const MIN_ENCODED_PACK_BYTES: usize = 4 + 8 + 32 + 8;
+const MIN_ENCODED_ARTIFACT_BYTES: usize = 4 + 8 + 8 + 8 + 2 + 2 + 32;
 const MIN_ENCODED_SEGMENT_COMPONENT_BYTES: usize = 2 + 1 + 4 + MIN_ENCODED_ARTIFACT_BYTES;
 const MIN_ENCODED_LOCATOR_ROOT_BYTES: usize =
-    8 + 8 + 8 + 32 + 8 + MIN_ENCODED_ARTIFACT_BYTES + 8 + 8;
+    8 + 8 + 8 + 32 + 8 + MIN_ENCODED_ARTIFACT_BYTES + 1 + 8 + 8;
+const MAX_PACKS_PER_OWNER: usize = INDEX_COMPONENT_BYTES / MIN_ENCODED_PACK_BYTES;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ManifestSourceCheckpoint {
@@ -57,9 +59,18 @@ pub(crate) struct LocatorRoot {
     /// Exact envelope identity needed to validate a detached locator tree.
     pub identity: anvil_index::v4::SegmentIdentity,
     pub artifact: ArtifactDescriptor,
+    pub pack_ownership: LocatorPackOwnership,
     /// Complete recursively referenced component bytes, including envelopes.
     pub encoded_bytes: u64,
     pub logical_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum LocatorPackOwnership {
+    /// The exact matching segment descriptor owns the locator's pack table.
+    Segment,
+    /// A locator which outlives or was built without a segment owns its table.
+    Standalone(Vec<ArtifactPackReference>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -214,6 +225,13 @@ impl IndexGenerationManifest {
             payload.fixed(&locator.identity.schema_fingerprint);
             payload.u64(locator.identity.segment_id);
             encode_artifact(&mut payload, &locator.artifact)?;
+            match &locator.pack_ownership {
+                LocatorPackOwnership::Segment => payload.u8(0),
+                LocatorPackOwnership::Standalone(packs) => {
+                    payload.u8(1);
+                    encode_packs(&mut payload, packs)?;
+                }
+            }
             payload.u64(locator.encoded_bytes);
             payload.u64(locator.logical_bytes);
         }
@@ -267,15 +285,28 @@ impl IndexGenerationManifest {
         )?;
         let mut locator_roots = Vec::with_capacity(locator_count);
         for _ in 0..locator_count {
+            let sequence = payload.u64()?;
+            let identity = anvil_index::v4::SegmentIdentity {
+                index_id: payload.u64()?,
+                definition_version: payload.u64()?,
+                schema_fingerprint: payload.array_32()?,
+                segment_id: payload.u64()?,
+            };
+            let artifact = decode_artifact(&mut payload)?;
+            let pack_ownership = match payload.u8()? {
+                0 => LocatorPackOwnership::Segment,
+                1 => LocatorPackOwnership::Standalone(decode_packs(&mut payload)?),
+                _ => {
+                    return Err(GenerationError::Decode(
+                        "invalid locator pack ownership".into(),
+                    ));
+                }
+            };
             locator_roots.push(LocatorRoot {
-                sequence: payload.u64()?,
-                identity: anvil_index::v4::SegmentIdentity {
-                    index_id: payload.u64()?,
-                    definition_version: payload.u64()?,
-                    schema_fingerprint: payload.array_32()?,
-                    segment_id: payload.u64()?,
-                },
-                artifact: decode_artifact(&mut payload)?,
+                sequence,
+                identity,
+                artifact,
+                pack_ownership,
                 encoded_bytes: payload.u64()?,
                 logical_bytes: payload.u64()?,
             });
@@ -352,6 +383,7 @@ impl IndexGenerationManifest {
             if segment.identity.index_id != self.index_id
                 || segment.identity.definition_version != self.definition_version
                 || segment.identity.schema_fingerprint != self.schema_fingerprint
+                || segment.packs.len() > MAX_PACKS_PER_OWNER
                 || segment.components.len() > MAX_SEGMENT_COMPONENTS
             {
                 return Err(GenerationError::InvalidSegment(
@@ -381,18 +413,44 @@ impl IndexGenerationManifest {
                 .identity
                 .validate()
                 .map_err(|error| GenerationError::InvalidSegment(error.to_string()))?;
+            let segment = self
+                .segments
+                .binary_search_by_key(&locator.identity.segment_id, |segment| {
+                    segment.identity.segment_id
+                })
+                .ok()
+                .map(|position| &self.segments[position]);
+            let packs = match (&locator.pack_ownership, segment) {
+                (LocatorPackOwnership::Segment, Some(segment))
+                    if segment.identity == locator.identity =>
+                {
+                    &segment.packs
+                }
+                (LocatorPackOwnership::Standalone(packs), None) if !packs.is_empty() => packs,
+                _ => {
+                    return Err(GenerationError::InvalidManifest(
+                        "locator pack ownership does not match the generation segments".into(),
+                    ));
+                }
+            };
+            if packs.len() > MAX_PACKS_PER_OWNER {
+                return Err(GenerationError::InvalidManifest(
+                    "locator pack table exceeds its manifest bound".into(),
+                ));
+            }
+            for pack in packs {
+                pack.validate(self.index_id)
+                    .map_err(|error| GenerationError::InvalidArtifact(error.to_string()))?;
+            }
             locator
                 .artifact
-                .validate(self.index_id)
+                .pack(self.index_id, packs)
                 .map_err(|error| GenerationError::InvalidArtifact(error.to_string()))?;
             if locator.sequence == 0
                 || locator.identity.index_id != self.index_id
                 || locator.identity.definition_version != self.definition_version
                 || locator.identity.schema_fingerprint != self.schema_fingerprint
-                || !matches!(
-                    locator.artifact.component_kind,
-                    ComponentKind::PATH_LOCATOR | ComponentKind::ROUTING_NODE
-                )
+                || locator.artifact.component_kind != ComponentKind::ROUTING_NODE
                 || locator.encoded_bytes < locator.artifact.encoded_length
                 || locator.logical_bytes < locator.artifact.logical_length
                 || previous_locator.is_some_and(|previous| previous >= locator.sequence)
@@ -439,6 +497,39 @@ impl IndexGenerationManifest {
             ));
         }
         Ok(())
+    }
+
+    /// Resolve every locator's generation-local pack ownership into the
+    /// storage-neutral roots consumed by lookup and compaction.
+    pub(crate) fn locator_stream_roots(&self) -> Result<Vec<LocatorStreamRoot>, GenerationError> {
+        self.validate()?;
+        self.locator_roots
+            .iter()
+            .map(|locator| {
+                let packs = match &locator.pack_ownership {
+                    LocatorPackOwnership::Segment => {
+                        let position = self
+                            .segments
+                            .binary_search_by_key(&locator.identity.segment_id, |segment| {
+                                segment.identity.segment_id
+                            })
+                            .map_err(|_| {
+                                GenerationError::InvalidManifest(
+                                    "segment-owned locator has no segment".into(),
+                                )
+                            })?;
+                        self.segments[position].packs.clone()
+                    }
+                    LocatorPackOwnership::Standalone(packs) => packs.clone(),
+                };
+                Ok(LocatorStreamRoot {
+                    sequence: locator.sequence,
+                    identity: locator.identity,
+                    packs,
+                    artifact: locator.artifact.clone(),
+                })
+            })
+            .collect()
     }
 
     pub(crate) fn barrier(&self) -> Result<IndexBarrier, GenerationError> {
@@ -673,6 +764,7 @@ fn encode_segment(
     encoder.u64(segment.identity.segment_id);
     encoder.u32(segment.document_count);
     encoder.u32(segment.live_document_count);
+    encode_packs(encoder, &segment.packs)?;
     encoder.count(segment.components.len())?;
     for component in &segment.components {
         encoder.u16(component.role.get());
@@ -700,6 +792,7 @@ fn decode_segment(decoder: &mut Decoder<'_>) -> Result<SegmentDescriptor, Genera
     };
     let document_count = decoder.u32()?;
     let live_document_count = decoder.u32()?;
+    let packs = decode_packs(decoder)?;
     let component_count =
         decoder.collection_count(MAX_SEGMENT_COMPONENTS, MIN_ENCODED_SEGMENT_COMPONENT_BYTES)?;
     let mut components = Vec::with_capacity(component_count);
@@ -722,6 +815,7 @@ fn decode_segment(decoder: &mut Decoder<'_>) -> Result<SegmentDescriptor, Genera
         identity,
         document_count,
         live_document_count,
+        packs,
         components,
         encoded_bytes: decoder.u64()?,
         logical_bytes: decoder.u64()?,
@@ -732,10 +826,7 @@ fn encode_artifact(
     encoder: &mut Encoder,
     artifact: &ArtifactDescriptor,
 ) -> Result<(), GenerationError> {
-    encoder.string(&artifact.path)?;
-    encoder.u64(artifact.object_version);
-    encoder.fixed(&artifact.object_content_hash);
-    encoder.u64(artifact.object_length);
+    encoder.u32(artifact.pack_ordinal);
     encoder.u64(artifact.offset);
     encoder.u64(artifact.encoded_length);
     encoder.u64(artifact.logical_length);
@@ -746,10 +837,7 @@ fn encode_artifact(
 }
 
 fn decode_artifact(decoder: &mut Decoder<'_>) -> Result<ArtifactDescriptor, GenerationError> {
-    let path = decoder.string(INDEX_ROUTING_KEY_BYTES)?;
-    let object_version = decoder.u64()?;
-    let object_content_hash = decoder.array_32()?;
-    let object_length = decoder.u64()?;
+    let pack_ordinal = decoder.u32()?;
     let offset = decoder.u64()?;
     let encoded_length = decoder.u64()?;
     let logical_length = decoder.u64()?;
@@ -758,10 +846,7 @@ fn decode_artifact(decoder: &mut Decoder<'_>) -> Result<ArtifactDescriptor, Gene
     let codec_version = decoder.u16()?;
     let checksum = decoder.array_32()?;
     Ok(ArtifactDescriptor {
-        path,
-        object_version,
-        object_content_hash,
-        object_length,
+        pack_ordinal,
         offset,
         encoded_length,
         logical_length,
@@ -769,6 +854,34 @@ fn decode_artifact(decoder: &mut Decoder<'_>) -> Result<ArtifactDescriptor, Gene
         codec_version,
         checksum,
     })
+}
+
+fn encode_packs(
+    encoder: &mut Encoder,
+    packs: &[ArtifactPackReference],
+) -> Result<(), GenerationError> {
+    encoder.count(packs.len())?;
+    for pack in packs {
+        encoder.string(&pack.path)?;
+        encoder.u64(pack.object_version);
+        encoder.fixed(&pack.object_content_hash);
+        encoder.u64(pack.object_length);
+    }
+    Ok(())
+}
+
+fn decode_packs(decoder: &mut Decoder<'_>) -> Result<Vec<ArtifactPackReference>, GenerationError> {
+    let count = decoder.collection_count(MAX_PACKS_PER_OWNER, MIN_ENCODED_PACK_BYTES)?;
+    let mut packs = Vec::with_capacity(count);
+    for _ in 0..count {
+        packs.push(ArtifactPackReference {
+            path: decoder.string(INDEX_ROUTING_KEY_BYTES)?,
+            object_version: decoder.u64()?,
+            object_content_hash: decoder.array_32()?,
+            object_length: decoder.u64()?,
+        });
+    }
+    Ok(packs)
 }
 
 fn encode_manifest_reference(
@@ -1033,19 +1146,27 @@ mod tests {
     }
 
     fn artifact(index_id: u64, seed: u8, component_kind: ComponentKind) -> ArtifactDescriptor {
-        let object_hash = [seed; 32];
         ArtifactDescriptor::new(
             index_id,
-            artifact_path(index_id, object_hash),
-            u64::from(seed) + 1,
-            object_hash,
-            512,
+            u32::from(seed - 1),
             16,
             128,
             8,
             component_kind,
             1,
             [seed.wrapping_add(1); 32],
+        )
+        .unwrap()
+    }
+
+    fn pack(index_id: u64, seed: u8) -> ArtifactPackReference {
+        let object_hash = [seed; 32];
+        ArtifactPackReference::new(
+            index_id,
+            artifact_path(index_id, object_hash),
+            u64::from(seed) + 1,
+            object_hash,
+            512,
         )
         .unwrap()
     }
@@ -1063,6 +1184,7 @@ mod tests {
             identity,
             7,
             6,
+            (1..=4).map(|seed| pack(4, seed)).collect(),
             vec![
                 anvil_index::v4::SegmentComponent {
                     role: ComponentKind::IDENTITY_TABLE,
@@ -1103,6 +1225,7 @@ mod tests {
                 sequence: 1,
                 identity,
                 artifact: artifact(4, 4, ComponentKind::ROUTING_NODE),
+                pack_ownership: LocatorPackOwnership::Segment,
                 encoded_bytes: 128,
                 logical_bytes: 8,
             }],
@@ -1146,7 +1269,16 @@ mod tests {
     fn detached_locator_root_is_bound_to_identity_and_complete_subtree_totals() {
         let mut value = manifest(3);
         value.locator_roots[0].identity.segment_id += 1;
+        value.locator_roots[0].artifact.pack_ordinal = 0;
+        value.locator_roots[0].pack_ownership = LocatorPackOwnership::Standalone(vec![pack(4, 4)]);
         assert!(value.validate().is_ok());
+
+        let encoded = value.encode().unwrap();
+        let decoded = IndexGenerationManifest::decode(&encoded).unwrap();
+        assert_eq!(decoded, value);
+        let roots = decoded.locator_stream_roots().unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].packs, vec![pack(4, 4)]);
 
         value.locator_roots[0].identity.definition_version += 1;
         assert!(matches!(
@@ -1158,6 +1290,35 @@ mod tests {
         value.locator_roots[0].encoded_bytes = 127;
         assert!(matches!(
             value.validate(),
+            Err(GenerationError::InvalidManifest(_))
+        ));
+    }
+
+    #[test]
+    fn segment_owned_locator_resolves_its_segment_pack_table() {
+        let value = manifest(3);
+        let roots = value.locator_stream_roots().unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].identity, value.segments[0].identity);
+        assert_eq!(roots[0].packs, value.segments[0].packs);
+        assert_eq!(roots[0].artifact, value.locator_roots[0].artifact);
+    }
+
+    #[test]
+    fn locator_pack_ownership_is_unambiguous() {
+        let mut missing_segment = manifest(3);
+        missing_segment.locator_roots[0].identity.segment_id += 1;
+        assert!(matches!(
+            missing_segment.validate(),
+            Err(GenerationError::InvalidManifest(_))
+        ));
+
+        let mut duplicate_owner = manifest(3);
+        duplicate_owner.locator_roots[0].pack_ownership =
+            LocatorPackOwnership::Standalone(vec![pack(4, 4)]);
+        duplicate_owner.locator_roots[0].artifact.pack_ordinal = 0;
+        assert!(matches!(
+            duplicate_owner.validate(),
             Err(GenerationError::InvalidManifest(_))
         ));
     }
@@ -1218,14 +1379,17 @@ mod tests {
     }
 
     #[test]
-    fn artifact_reference_requires_the_exact_v4_object_and_range() {
-        let mut reference = artifact(4, 1, ComponentKind::IDENTITY_TABLE);
-        reference.path.push_str("/extra");
-        assert!(reference.validate(4).is_err());
+    fn artifact_reference_requires_a_valid_pack_ordinal_and_range() {
+        let mut object = pack(4, 1);
+        object.path.push_str("/extra");
+        assert!(object.validate(4).is_err());
+
+        let reference = artifact(4, 2, ComponentKind::IDENTITY_TABLE);
+        assert!(reference.pack(4, &[pack(4, 1)]).is_err());
 
         let mut reference = artifact(4, 1, ComponentKind::IDENTITY_TABLE);
         reference.offset = 500;
-        assert!(reference.validate(4).is_err());
+        assert!(reference.pack(4, &[pack(4, 1)]).is_err());
     }
 
     #[test]

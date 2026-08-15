@@ -1,13 +1,14 @@
 //! Lazy cache-backed access to checked ranges in immutable v4 artifact objects.
 //!
-//! A pinned query or generation verifies each distinct ordinary-object path and
-//! exact version before the disposable content cache may materialise it. Range
-//! reads then remain bounded to the component named by the manifest.
+//! A pinned query or generation verifies each distinct ordinary-object pack
+//! and exact version before the disposable content cache may materialise it.
+//! Component ranges are resolved and bounded by the storage-neutral index
+//! reader after the enclosing pack has been opened.
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
-use anvil_index::{IndexError, v4::ArtifactDescriptor};
+use anvil_index::{IndexError, v4::ArtifactPackReference};
 use anvil_store::{BlobRef, ObjectKey, VersionId};
 
 use crate::cluster_object_read::ClusterObjectReader;
@@ -54,40 +55,38 @@ impl ManifestArtifactDirectory {
         })
     }
 
-    /// Resolve one exact ordinary-object reference, then open its checked
-    /// component range. Verification is retained only by this directory.
+    /// Resolve and open one exact ordinary-object pack reference. Verification
+    /// is retained only by this directory.
     pub(crate) async fn open(
         &self,
-        descriptor: &ArtifactDescriptor,
+        pack: &ArtifactPackReference,
     ) -> Result<ManifestArtifactFile, IndexError> {
-        descriptor.validate(self.index_id)?;
-        let identity = VerifiedArtifactObject::from(descriptor);
+        pack.validate(self.index_id)?;
+        let identity = VerifiedArtifactObject::from(pack);
         let verified = self
             .verified
             .lock()
             .map_err(|_| IndexError::Io("index artifact verification lock is poisoned".into()))?
             .contains(&identity);
         if !verified {
-            self.verify(descriptor).await?;
+            self.verify(pack).await?;
             self.verified
                 .lock()
                 .map_err(|_| IndexError::Io("index artifact verification lock is poisoned".into()))?
                 .insert(identity);
         }
-        let object = IndexSegmentId::new(descriptor.object_content_hash, descriptor.object_length)
+        let object = IndexSegmentId::new(pack.object_content_hash, pack.object_length)
             .map_err(|error| IndexError::InvalidDefinition(error.to_string()))?;
         Ok(ManifestArtifactFile {
             inner: self.cache.open(object),
-            start: descriptor.offset,
-            length: descriptor.encoded_length,
         })
     }
 
-    async fn verify(&self, descriptor: &ArtifactDescriptor) -> Result<(), IndexError> {
+    async fn verify(&self, pack: &ArtifactPackReference) -> Result<(), IndexError> {
         let key = ObjectKey::new(
             self.storage_tenant.clone(),
             self.bucket.clone(),
-            descriptor.path.clone(),
+            pack.path.clone(),
         )
         .map_err(|error| IndexError::InvalidDefinition(error.to_string()))?;
         let snapshot = self
@@ -95,21 +94,21 @@ impl ManifestArtifactDirectory {
             .current_snapshot_stable(&key, self.tenant_id, self.bucket_id)
             .await
             .map_err(|error| IndexError::Io(error.to_string()))?
-            .ok_or_else(|| IndexError::FileNotFound(descriptor.path.clone()))?;
+            .ok_or_else(|| IndexError::FileNotFound(pack.path.clone()))?;
         if snapshot.tenant_id != self.tenant_id
             || snapshot.bucket_id != self.bucket_id
-            || snapshot.exact_path != descriptor.path
+            || snapshot.exact_path != pack.path
         {
             return Err(IndexError::Integrity);
         }
         let version = snapshot
             .versions
             .iter()
-            .find(|version| version.id == VersionId(descriptor.object_version))
-            .ok_or_else(|| IndexError::FileNotFound(descriptor.path.clone()))?;
+            .find(|version| version.id == VersionId(pack.object_version))
+            .ok_or_else(|| IndexError::FileNotFound(pack.path.clone()))?;
         let expected = BlobRef {
-            hash: descriptor.object_content_hash,
-            length: descriptor.object_length,
+            hash: pack.object_content_hash,
+            length: pack.object_length,
         };
         if version.deleted || version.blob.as_ref() != Some(&expected) {
             return Err(IndexError::Integrity);
@@ -125,45 +124,32 @@ struct VerifiedArtifactObject {
     length: u64,
 }
 
-impl From<&ArtifactDescriptor> for VerifiedArtifactObject {
-    fn from(descriptor: &ArtifactDescriptor) -> Self {
+impl From<&ArtifactPackReference> for VerifiedArtifactObject {
+    fn from(pack: &ArtifactPackReference) -> Self {
         Self {
-            version: descriptor.object_version,
-            content_hash: descriptor.object_content_hash,
-            length: descriptor.object_length,
+            version: pack.object_version,
+            content_hash: pack.object_content_hash,
+            length: pack.object_length,
         }
     }
 }
 
 pub(crate) struct ManifestArtifactFile {
     inner: IndexFile,
-    start: u64,
-    length: u64,
 }
 
 impl anvil_index::IndexFileRead for ManifestArtifactFile {
     type Slice = IndexSlice;
 
     async fn read_at(&self, offset: u64, max_length: usize) -> Result<Self::Slice, IndexError> {
-        if offset >= self.length || max_length == 0 {
-            return anvil_index::IndexFileRead::read_at(&self.inner, 0, 0).await;
-        }
-        let remaining = usize::try_from(self.length - offset).unwrap_or(usize::MAX);
-        let physical = self
-            .start
-            .checked_add(offset)
-            .ok_or(IndexError::OffsetOverflow)?;
-        anvil_index::IndexFileRead::read_at(&self.inner, physical, max_length.min(remaining)).await
+        anvil_index::IndexFileRead::read_at(&self.inner, offset, max_length).await
     }
 }
 
 impl anvil_index::v4::ArtifactDirectoryRead for ManifestArtifactDirectory {
     type File = ManifestArtifactFile;
 
-    async fn open_artifact(
-        &self,
-        descriptor: &ArtifactDescriptor,
-    ) -> Result<Self::File, IndexError> {
-        self.open(descriptor).await
+    async fn open_artifact(&self, pack: &ArtifactPackReference) -> Result<Self::File, IndexError> {
+        self.open(pack).await
     }
 }
