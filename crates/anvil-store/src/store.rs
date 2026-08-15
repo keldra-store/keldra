@@ -334,7 +334,19 @@ impl PendingLocalChange {
 
 #[derive(Clone, Debug)]
 pub struct StoreOptions {
+    /// Legacy layout root retained for callers which use the default paths.
     pub root: PathBuf,
+    /// RocksDB directory containing the metadata column families and SSTs.
+    pub metadata_directory: PathBuf,
+    /// RocksDB directory containing the metadata write-ahead log.
+    pub metadata_wal_directory: PathBuf,
+    /// Directory containing complete blobs, erasure shards, and their lifecycle
+    /// staging directories.
+    pub payload_directory: PathBuf,
+    /// Disposable directory containing only unfinished, unacknowledged uploads.
+    pub upload_spool_directory: PathBuf,
+    /// Aggregate hard capacity for unfinished upload bytes.
+    pub upload_spool_max_bytes: u64,
     pub node_id: u16,
     pub sync_writes: bool,
     pub watch_retention: WatchRetention,
@@ -347,14 +359,41 @@ pub struct StoreOptions {
 
 impl StoreOptions {
     pub fn new(root: impl AsRef<Path>, node_id: u16) -> Self {
+        let root = root.as_ref().to_path_buf();
         Self {
-            root: root.as_ref().to_path_buf(),
+            metadata_directory: root.join("metadata"),
+            metadata_wal_directory: root.join("metadata"),
+            payload_directory: root.join("blobs"),
+            upload_spool_directory: root.join("blobs/.upload-spool"),
+            upload_spool_max_bytes: crate::blob::DEFAULT_UPLOAD_SPOOL_MAX_BYTES,
+            root,
             node_id,
             sync_writes: true,
             watch_retention: WatchRetention::default(),
             mutation_receipt_retention: MutationReceiptRetention::default(),
             awaiting_publish_ttl_seconds: DEFAULT_AWAITING_PUBLISH_TTL_SECONDS,
         }
+    }
+
+    pub fn with_metadata_directory(mut self, directory: impl AsRef<Path>) -> Self {
+        self.metadata_directory = directory.as_ref().to_path_buf();
+        self
+    }
+
+    pub fn with_metadata_wal_directory(mut self, directory: impl AsRef<Path>) -> Self {
+        self.metadata_wal_directory = directory.as_ref().to_path_buf();
+        self
+    }
+
+    pub fn with_payload_directory(mut self, directory: impl AsRef<Path>) -> Self {
+        self.payload_directory = directory.as_ref().to_path_buf();
+        self
+    }
+
+    pub fn with_upload_spool(mut self, directory: impl AsRef<Path>, max_bytes: u64) -> Self {
+        self.upload_spool_directory = directory.as_ref().to_path_buf();
+        self.upload_spool_max_bytes = max_bytes;
+        self
     }
 
     pub fn with_watch_retention(mut self, watch_retention: WatchRetention) -> Self {
@@ -828,18 +867,38 @@ impl Store {
             .awaiting_publish_ttl_seconds
             .checked_mul(1_000)
             .context("awaiting-publish blob TTL is too large")?;
-        tokio::fs::create_dir_all(&options.root).await?;
-        let metadata_path = options.root.join("metadata");
+        tokio::fs::create_dir_all(&options.metadata_directory)
+            .await
+            .with_context(|| {
+                format!(
+                    "create Anvil metadata directory {}",
+                    options.metadata_directory.display()
+                )
+            })?;
+        tokio::fs::create_dir_all(&options.metadata_wal_directory)
+            .await
+            .with_context(|| {
+                format!(
+                    "create Anvil metadata WAL directory {}",
+                    options.metadata_wal_directory.display()
+                )
+            })?;
         let mut db_options = Options::default();
         db_options.create_if_missing(true);
         db_options.create_missing_column_families(true);
+        db_options.set_wal_dir(&options.metadata_wal_directory);
         let metadata_memory = Arc::new(MetadataMemoryResources::new());
         let descriptors = std::iter::once(DEFAULT_COLUMN_FAMILY_NAME)
             .chain(COLUMN_FAMILIES.iter().copied())
             .map(|name| ColumnFamilyDescriptor::new(name, metadata_memory.column_family_options()))
             .collect::<Vec<_>>();
-        let db = DB::open_cf_descriptors(&db_options, &metadata_path, descriptors)
-            .with_context(|| format!("open Anvil metadata at {}", metadata_path.display()))?;
+        let db = DB::open_cf_descriptors(&db_options, &options.metadata_directory, descriptors)
+            .with_context(|| {
+                format!(
+                    "open Anvil metadata at {}",
+                    options.metadata_directory.display()
+                )
+            })?;
         let metadata_cf = db
             .cf_handle(CF_METADATA)
             .context("missing metadata column family")?;
@@ -851,7 +910,12 @@ impl Store {
             initialize_local_watch_metadata(&db, metadata_cf, options.sync_writes)?;
         initialize_mutation_receipt_metadata(&db, metadata_cf, options.sync_writes)?;
         let db = Arc::new(db);
-        let blobs = BlobStore::open(options.root.join("blobs")).await?;
+        let blobs = BlobStore::open_with_upload_spool(
+            &options.payload_directory,
+            &options.upload_spool_directory,
+            options.upload_spool_max_bytes,
+        )
+        .await?;
         let store = Self {
             db,
             _metadata_memory: metadata_memory,

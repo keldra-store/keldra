@@ -145,7 +145,9 @@ async fn streamed_seal_fsyncs_identified_stage_before_waiting_for_commit_fence()
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             let staged = std::fs::read_dir(store.blobs.root().join(".staging"))
-                .unwrap()
+                .ok()
+                .into_iter()
+                .flatten()
                 .filter_map(Result::ok)
                 .any(|entry| entry.file_name().to_string_lossy().starts_with("blob-"));
             if staged {

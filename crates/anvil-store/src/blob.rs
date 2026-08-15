@@ -11,6 +11,8 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 static NEXT_UPLOAD_ID: AtomicU64 = AtomicU64::new(1);
 const VERIFY_BUFFER_BYTES: usize = 64 * 1024;
 const UPLOAD_BOOT_NONCE_BYTES: usize = 16;
+const UPLOAD_SPOOL_STARTUP_CLEANUP_FILES: usize = 256;
+pub const DEFAULT_UPLOAD_SPOOL_MAX_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobRef {
@@ -38,18 +40,72 @@ pub struct BlobStore {
     root: PathBuf,
     pub(crate) directory_lock: Arc<tokio::sync::Mutex<()>>,
     upload_boot_nonce: [u8; UPLOAD_BOOT_NONCE_BYTES],
+    upload_spool: PathBuf,
+    upload_spool_budget: Arc<UploadSpoolBudget>,
 }
 
 pub struct BlobUpload {
     root: PathBuf,
     directory_lock: Arc<tokio::sync::Mutex<()>>,
+    upload_boot_nonce: [u8; UPLOAD_BOOT_NONCE_BYTES],
     temporary: PathBuf,
     file: Option<tokio::fs::File>,
     hasher: blake3::Hasher,
     length: u64,
+    spool_budget: Arc<UploadSpoolBudget>,
+    spool_reserved_bytes: u64,
 }
 
-/// A fully hashed and fsync'd blob which still lives under `.staging`.
+#[derive(Debug)]
+struct UploadSpoolBudget {
+    maximum_bytes: u64,
+    used_bytes: AtomicU64,
+}
+
+impl UploadSpoolBudget {
+    fn new(maximum_bytes: u64) -> Result<Self> {
+        if maximum_bytes == 0 {
+            bail!("upload spool byte limit must be non-zero");
+        }
+        Ok(Self {
+            maximum_bytes,
+            used_bytes: AtomicU64::new(0),
+        })
+    }
+
+    fn reserve(&self, bytes: u64) -> Result<()> {
+        let result = self
+            .used_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes)
+                    .filter(|next| *next <= self.maximum_bytes)
+            });
+        if let Err(used) = result {
+            bail!(
+                "upload spool byte limit exhausted: {used} bytes in use, {bytes} requested, {} maximum",
+                self.maximum_bytes
+            );
+        }
+        Ok(())
+    }
+
+    fn release(&self, bytes: u64) {
+        let released = self
+            .used_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_sub(bytes)
+            });
+        debug_assert!(released.is_ok(), "upload spool reservation underflow");
+    }
+
+    #[cfg(test)]
+    fn used_bytes(&self) -> u64 {
+        self.used_bytes.load(Ordering::Acquire)
+    }
+}
+
+/// A fully hashed and fsync'd blob which lives under the payload root's
+/// `.staging` directory.
 ///
 /// The store records its awaiting-publication lifecycle state before moving
 /// these bytes to the canonical content-addressed path. There is deliberately
@@ -91,10 +147,28 @@ enum BlobReaderSource {
 impl BlobStore {
     pub async fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
+        let upload_spool = root.join(".upload-spool");
+        Self::open_with_upload_spool(root, upload_spool, DEFAULT_UPLOAD_SPOOL_MAX_BYTES).await
+    }
+
+    /// Open the durable payload root with a separate disposable upload spool.
+    ///
+    /// The byte limit is shared by every upload started by this store or one
+    /// of its clones. A write which would exceed it aborts that upload instead
+    /// of allowing concurrent streams to deadlock while each holds capacity.
+    pub async fn open_with_upload_spool(
+        root: impl AsRef<Path>,
+        upload_spool: impl AsRef<Path>,
+        upload_spool_max_bytes: u64,
+    ) -> Result<Self> {
+        let root = root.as_ref().to_path_buf();
+        let upload_spool = upload_spool.as_ref().to_path_buf();
         let mut upload_boot_nonce = [0_u8; UPLOAD_BOOT_NONCE_BYTES];
         getrandom::fill(&mut upload_boot_nonce)
             .map_err(|error| anyhow::anyhow!("generate blob upload boot nonce: {error}"))?;
         create_directory_all_durable(&root).await?;
+        create_directory_all_durable(&upload_spool).await?;
+        clear_abandoned_upload_spool_tick(&upload_spool).await?;
         // Also fences a root or hash-prefix entry left visible but not
         // parent-synchronised by an older process before this store starts
         // acknowledging writes.
@@ -104,6 +178,8 @@ impl BlobStore {
             root,
             directory_lock: Arc::new(tokio::sync::Mutex::new(())),
             upload_boot_nonce,
+            upload_spool,
+            upload_spool_budget: Arc::new(UploadSpoolBudget::new(upload_spool_max_bytes)?),
         })
     }
 
@@ -114,9 +190,7 @@ impl BlobStore {
     }
 
     pub async fn begin_upload(&self) -> Result<BlobUpload> {
-        let staging = self.root.join(".staging");
-        create_directory_all_durable(&staging).await?;
-        let temporary = staging.join(upload_staging_name(
+        let temporary = self.upload_spool.join(upload_staging_name(
             std::process::id(),
             &self.upload_boot_nonce,
             NEXT_UPLOAD_ID.fetch_add(1, Ordering::Relaxed),
@@ -126,14 +200,17 @@ impl BlobStore {
             .write(true)
             .open(&temporary)
             .await
-            .with_context(|| format!("create blob staging file {}", temporary.display()))?;
+            .with_context(|| format!("create blob upload spool file {}", temporary.display()))?;
         Ok(BlobUpload {
             root: self.root.clone(),
             directory_lock: self.directory_lock.clone(),
+            upload_boot_nonce: self.upload_boot_nonce,
             temporary,
             file: Some(file),
             hasher: blake3::Hasher::new(),
             length: 0,
+            spool_budget: self.upload_spool_budget.clone(),
+            spool_reserved_bytes: 0,
         })
     }
 
@@ -213,36 +290,47 @@ impl BlobStore {
         staging_path: &Path,
         reference: &BlobRef,
     ) -> Result<()> {
-        let final_path = self.path(&reference.hash);
-        let parent = final_path.parent().context("blob path has no parent")?;
-        let staging_parent = staging_path
-            .parent()
-            .context("blob staging path has no parent")?;
-        let _directory_guard = self.directory_lock.lock().await;
-        create_directory_all_durable(parent).await?;
-        if tokio::fs::try_exists(&final_path).await? {
-            verify_existing_blob(&final_path, reference).await?;
-            match tokio::fs::remove_file(staging_path).await {
-                Ok(()) => sync_directory(staging_parent).await?,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
-            return Ok(());
-        }
-        match tokio::fs::rename(staging_path, &final_path).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                // A concurrent recovery may already have completed the same
-                // immutable publication.
-                verify_existing_blob(&final_path, reference).await?;
-                return Ok(());
-            }
+        publish_identified_staging_at(&self.root, &self.directory_lock, staging_path, reference)
+            .await
+    }
+}
+
+async fn publish_identified_staging_at(
+    root: &Path,
+    directory_lock: &tokio::sync::Mutex<()>,
+    staging_path: &Path,
+    reference: &BlobRef,
+) -> Result<()> {
+    let encoded = hex::encode(reference.hash);
+    let final_path = root.join(&encoded[..2]).join(encoded);
+    let parent = final_path.parent().context("blob path has no parent")?;
+    let staging_parent = staging_path
+        .parent()
+        .context("blob staging path has no parent")?;
+    let _directory_guard = directory_lock.lock().await;
+    create_directory_all_durable(parent).await?;
+    if tokio::fs::try_exists(&final_path).await? {
+        verify_existing_blob(&final_path, reference).await?;
+        match tokio::fs::remove_file(staging_path).await {
+            Ok(()) => sync_directory(staging_parent).await?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        sync_directory(parent).await?;
-        sync_directory(staging_parent).await?;
-        Ok(())
+        return Ok(());
     }
+    match tokio::fs::rename(staging_path, &final_path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A concurrent recovery may already have completed the same
+            // immutable publication.
+            verify_existing_blob(&final_path, reference).await?;
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    }
+    sync_directory(parent).await?;
+    sync_directory(staging_parent).await?;
+    Ok(())
 }
 
 fn upload_staging_name(
@@ -300,7 +388,6 @@ fn blob_identity_bytes(reference: &BlobRef) -> [u8; 32 + size_of::<u64>()] {
     encoded
 }
 
-#[cfg(test)]
 fn is_upload_staging_name(name: &str) -> bool {
     let Some(body) = name
         .strip_prefix("upload-")
@@ -322,6 +409,43 @@ fn is_upload_staging_name(name: &str) -> bool {
         }
         _ => false,
     }
+}
+
+async fn clear_abandoned_upload_spool_tick(upload_spool: &Path) -> Result<()> {
+    let mut entries = tokio::fs::read_dir(upload_spool).await?;
+    let mut removed = 0_usize;
+    while removed < UPLOAD_SPOOL_STARTUP_CLEANUP_FILES {
+        let Some(entry) = entries.next_entry().await? else {
+            break;
+        };
+        let file_type = entry.file_type().await?;
+        let name = entry.file_name();
+        let name = name.to_str().with_context(|| {
+            format!(
+                "upload spool entry name is not UTF-8: {}",
+                entry.path().display()
+            )
+        })?;
+        if !file_type.is_file() || !is_upload_staging_name(name) {
+            bail!(
+                "upload spool contains an unexpected entry: {}",
+                entry.path().display()
+            );
+        }
+        tokio::fs::remove_file(entry.path()).await?;
+        removed += 1;
+    }
+    if removed != 0 {
+        sync_directory(upload_spool).await?;
+    }
+    if removed == UPLOAD_SPOOL_STARTUP_CLEANUP_FILES {
+        tracing::warn!(
+            cleanup.files = removed,
+            cleanup.maximum_files = UPLOAD_SPOOL_STARTUP_CLEANUP_FILES,
+            "bounded upload-spool startup cleanup reached its file limit; later restarts may remove additional abandoned uploads"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -512,40 +636,63 @@ impl BlobReader {
 
 impl BlobUpload {
     pub async fn write(&mut self, bytes: &[u8]) -> Result<()> {
-        let file = self
+        if self.file.is_none() {
+            bail!("blob upload is already finished");
+        }
+        let additional = u64::try_from(bytes.len()).context("blob upload chunk length overflow")?;
+        let next_reserved = self
+            .spool_reserved_bytes
+            .checked_add(additional)
+            .context("blob upload spool reservation overflow")?;
+        let next_length = self
+            .length
+            .checked_add(additional)
+            .context("blob length overflow")?;
+        if let Err(error) = self.spool_budget.reserve(additional) {
+            self.abort_spool().await;
+            return Err(error);
+        }
+        self.spool_reserved_bytes = next_reserved;
+        if let Err(error) = self
             .file
             .as_mut()
-            .context("blob upload is already finished")?;
-        file.write_all(bytes).await?;
+            .expect("blob upload file was checked")
+            .write_all(bytes)
+            .await
+        {
+            self.abort_spool().await;
+            return Err(error.into());
+        }
         self.hasher.update(bytes);
-        self.length = self
-            .length
-            .checked_add(bytes.len() as u64)
-            .context("blob length overflow")?;
+        self.length = next_length;
         Ok(())
     }
 
     pub async fn finish(mut self) -> Result<BlobRef> {
         let staged = self.finish_staged_inner(None).await?;
-        let store = BlobStore {
-            root: self.root.clone(),
-            directory_lock: self.directory_lock.clone(),
-            upload_boot_nonce: [0; UPLOAD_BOOT_NONCE_BYTES],
-        };
-        store.publish_staged(staged).await
+        publish_identified_staging_at(
+            &self.root,
+            &self.directory_lock,
+            staged.path(),
+            staged.reference(),
+        )
+        .await?;
+        Ok(staged.reference)
     }
 
     /// Finish only if the streamed bytes have the caller's exact immutable
-    /// identity. A mismatch removes the ordinary staging file without ever
+    /// identity. A mismatch removes the raw spool file without ever
     /// publishing it under a different hash.
     pub async fn finish_expected(mut self, expected: &BlobRef) -> Result<BlobRef> {
         let staged = self.finish_staged_inner(Some(expected)).await?;
-        let store = BlobStore {
-            root: self.root.clone(),
-            directory_lock: self.directory_lock.clone(),
-            upload_boot_nonce: [0; UPLOAD_BOOT_NONCE_BYTES],
-        };
-        store.publish_staged(staged).await
+        publish_identified_staging_at(
+            &self.root,
+            &self.directory_lock,
+            staged.path(),
+            staged.reference(),
+        )
+        .await?;
+        Ok(staged.reference)
     }
 
     pub(crate) async fn finish_staged(mut self) -> Result<StagedBlob> {
@@ -568,51 +715,109 @@ impl BlobUpload {
             length: self.length,
         };
         if expected.is_some_and(|expected| expected != &reference) {
-            let _ = tokio::fs::remove_file(&self.temporary).await;
+            self.abort_spool().await;
             bail!("blob failed expected length or hash verification");
         }
-        let staging = self
-            .temporary
-            .parent()
-            .context("blob staging path has no parent")?;
+        let staging = self.root.join(".staging");
+        create_directory_all_durable(&staging).await?;
         let identified = staging.join(identified_blob_staging_name(
             std::process::id(),
-            // The initial filename already contains the per-boot nonce. It is
-            // parsed here rather than retained as another upload field.
-            &staging_nonce_from_upload_name(&self.temporary)?,
+            &self.upload_boot_nonce,
             NEXT_UPLOAD_ID.fetch_add(1, Ordering::Relaxed),
             &reference,
         ));
-        tokio::fs::rename(&self.temporary, &identified).await?;
-        sync_directory(staging).await?;
+        self.move_to_identified_staging(&identified, &reference)
+            .await?;
         Ok(StagedBlob {
             reference,
             path: identified,
         })
     }
-}
 
-fn staging_nonce_from_upload_name(path: &Path) -> Result<[u8; UPLOAD_BOOT_NONCE_BYTES]> {
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("blob upload staging name is malformed")?;
-    let body = name
-        .strip_prefix("upload-")
-        .and_then(|name| name.strip_suffix(".tmp"))
-        .context("blob upload staging name is malformed")?;
-    let fields = body.split('-').collect::<Vec<_>>();
-    let [_, nonce, _] = fields.as_slice() else {
-        bail!("blob upload staging name is malformed");
-    };
-    let mut bytes = [0_u8; UPLOAD_BOOT_NONCE_BYTES];
-    hex::decode_to_slice(nonce, &mut bytes).context("blob upload staging nonce is malformed")?;
-    Ok(bytes)
+    async fn move_to_identified_staging(
+        &mut self,
+        identified: &Path,
+        reference: &BlobRef,
+    ) -> Result<()> {
+        let spool = self
+            .temporary
+            .parent()
+            .context("blob upload spool path has no parent")?
+            .to_path_buf();
+        let staging = identified
+            .parent()
+            .context("identified blob staging path has no parent")?;
+        match tokio::fs::rename(&self.temporary, identified).await {
+            Ok(()) => {
+                self.release_spool_reservation();
+                sync_directory(staging).await?;
+                sync_directory(&spool).await?;
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::CrossesDevices => {}
+            Err(error) => return Err(error.into()),
+        }
+
+        let transfer = staging.join(format!(
+            "copy-{}-{}-{}.tmp",
+            std::process::id(),
+            hex::encode(self.upload_boot_nonce),
+            NEXT_UPLOAD_ID.fetch_add(1, Ordering::Relaxed),
+        ));
+        let copy_result = async {
+            let mut source = tokio::fs::File::open(&self.temporary).await?;
+            let mut destination = tokio::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&transfer)
+                .await?;
+            let copied = tokio::io::copy(&mut source, &mut destination).await?;
+            if copied != reference.length {
+                bail!("blob upload changed while moving into identified staging");
+            }
+            destination.sync_all().await?;
+            drop(destination);
+            verify_existing_blob(&transfer, reference).await?;
+            tokio::fs::rename(&transfer, identified).await?;
+            sync_directory(staging).await?;
+            tokio::fs::remove_file(&self.temporary).await?;
+            self.release_spool_reservation();
+            sync_directory(&spool).await?;
+            Result::<()>::Ok(())
+        }
+        .await;
+        if copy_result.is_err() {
+            let _ = tokio::fs::remove_file(&transfer).await;
+        }
+        copy_result
+    }
+
+    async fn abort_spool(&mut self) {
+        self.file.take();
+        match tokio::fs::remove_file(&self.temporary).await {
+            Ok(()) => self.release_spool_reservation(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.release_spool_reservation();
+            }
+            Err(_) => {}
+        }
+    }
+
+    fn release_spool_reservation(&mut self) {
+        let bytes = std::mem::take(&mut self.spool_reserved_bytes);
+        self.spool_budget.release(bytes);
+    }
 }
 
 impl Drop for BlobUpload {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.temporary);
+        match std::fs::remove_file(&self.temporary) {
+            Ok(()) => self.release_spool_reservation(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.release_spool_reservation();
+            }
+            Err(_) => {}
+        }
     }
 }
 
@@ -633,7 +838,86 @@ mod tests {
         assert!(root.is_dir());
         assert!(root.join(&encoded[..2]).is_dir());
         assert!(root.join(&encoded[..2]).join(encoded).is_file());
+        assert!(root.join(".upload-spool").is_dir());
+        assert_eq!(
+            std::fs::read_dir(root.join(".upload-spool"))
+                .unwrap()
+                .count(),
+            0
+        );
         assert_eq!(store.get(&reference).await.unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn raw_upload_spool_is_separate_from_identified_staging() {
+        let temporary = tempfile::tempdir().unwrap();
+        let payload_root = temporary.path().join("payload");
+        let upload_spool = temporary.path().join("upload-spool");
+        let store = BlobStore::open_with_upload_spool(&payload_root, &upload_spool, 1024)
+            .await
+            .unwrap();
+        let mut upload = store.begin_upload().await.unwrap();
+
+        assert_eq!(upload.temporary.parent(), Some(upload_spool.as_path()));
+        upload.write(b"identified after finish").await.unwrap();
+        assert_eq!(store.upload_spool_budget.used_bytes(), 23);
+
+        let staged = upload.finish_staged().await.unwrap();
+
+        assert_eq!(
+            staged.path().parent(),
+            Some(payload_root.join(".staging").as_path())
+        );
+        assert!(staged.path().is_file());
+        assert_eq!(store.upload_spool_budget.used_bytes(), 0);
+        assert_eq!(std::fs::read_dir(upload_spool).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn upload_spool_limit_fails_and_releases_capacity_cleanly() {
+        let temporary = tempfile::tempdir().unwrap();
+        let payload_root = temporary.path().join("payload");
+        let upload_spool = temporary.path().join("upload-spool");
+        let store = BlobStore::open_with_upload_spool(&payload_root, &upload_spool, 8)
+            .await
+            .unwrap();
+        let mut first = store.begin_upload().await.unwrap();
+        first.write(b"12345678").await.unwrap();
+        let mut blocked = store.begin_upload().await.unwrap();
+
+        let error = blocked.write(b"x").await.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("upload spool byte limit exhausted")
+        );
+        assert!(blocked.file.is_none());
+        assert_eq!(store.upload_spool_budget.used_bytes(), 8);
+        drop(first);
+        assert_eq!(store.upload_spool_budget.used_bytes(), 0);
+
+        let mut replacement = store.begin_upload().await.unwrap();
+        replacement.write(b"12345678").await.unwrap();
+        replacement.finish_staged().await.unwrap();
+        assert_eq!(store.upload_spool_budget.used_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn opening_upload_spool_removes_only_recognised_crash_orphans() {
+        let temporary = tempfile::tempdir().unwrap();
+        let payload_root = temporary.path().join("payload");
+        let upload_spool = temporary.path().join("upload-spool");
+        tokio::fs::create_dir_all(&upload_spool).await.unwrap();
+        tokio::fs::write(upload_spool.join("upload-1-1.tmp"), b"orphan")
+            .await
+            .unwrap();
+
+        BlobStore::open_with_upload_spool(&payload_root, &upload_spool, 8)
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read_dir(upload_spool).unwrap().count(), 0);
     }
 
     #[test]

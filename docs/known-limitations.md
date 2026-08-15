@@ -665,3 +665,21 @@ that same accounting path scope. The last complete rollup remains readable;
 ordinary restarts resume valid rollups, and no unrelated object heads or startup
 inventory are scanned. Operators can retry after peer health returns. A
 resumable cross-node snapshot protocol is deferred.
+
+## Abandoned raw upload-spool cleanup
+
+Anvil removes at most 256 recognized abandoned raw-upload files while opening
+one node. The bound prevents a crash-created disposable directory from turning
+into an unbounded startup inventory. If repeated hard process failures leave
+more files, later restarts remove further bounded pages; the remaining files
+consume only the configured disposable spool filesystem and are never treated
+as acknowledged objects. Operators using persistent spool storage may clear it
+while Anvil is stopped. A size-bounded tmpfs naturally discards the files on
+host reboot.
+
+`ANVIL_UPLOAD_SPOOL_MAX_BYTES` bounds bytes held by active uploads in one
+process. Because streaming puts intentionally declare no content length, Anvil
+fails the affected unacknowledged stream when its next chunk would exceed the
+shared capacity instead of allowing several partially admitted streams to wait
+on one another indefinitely. Clients may retry after another upload completes;
+no published object or durable identified stage is removed.
