@@ -6,7 +6,7 @@ source "${repo_root}/scripts/qualification-scale-evidence.sh"
 source "${repo_root}/scripts/qualification-three-node-phases.sh"
 compose_file="${repo_root}/tests/cluster/docker-compose.yml"
 start_node="${repo_root}/tests/cluster/start-node.sh"
-requested_image="${ANVIL_IMAGE:-anvil:0.9.0}"
+requested_image="${ANVIL_IMAGE:-anvil:0.9.1}"
 qualification_mode="${ANVIL_QUALIFICATION_MODE:-smoke}"
 index_disk_cache_bytes="${ANVIL_QUALIFICATION_INDEX_DISK_CACHE_BYTES:-1073741824}"
 index_memory_percent="${ANVIL_QUALIFICATION_INDEX_MEMORY_PERCENT:-20}"
@@ -206,9 +206,9 @@ client_version="$(
   docker run --rm --platform "${ANVIL_DOCKER_PLATFORM}" \
     "${image_id}" anvil --version
 )"
-if [[ "${server_version}" != "anvil-server 0.9.0" \
-  || "${client_version}" != "anvil 0.9.0" ]]; then
-  echo "qualification requires the exact Anvil 0.9.0 image" >&2
+if [[ "${server_version}" != "anvil-server 0.9.1" \
+  || "${client_version}" != "anvil 0.9.1" ]]; then
+  echo "qualification requires the exact Anvil 0.9.1 image" >&2
   echo "server: ${server_version}" >&2
   echo "client: ${client_version}" >&2
   exit 2

@@ -13,7 +13,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-anvil-api = { version = "=0.9.0", path = "../../crates/anvil-api" }
+anvil-api = { version = "=0.9.1", path = "../../crates/anvil-api" }
 tokio-stream = "0.1"
 tonic = { version = "0.14", default-features = false, features = ["transport", "tls-native-roots"] }
 

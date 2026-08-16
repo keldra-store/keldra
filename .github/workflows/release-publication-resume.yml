@@ -188,11 +188,11 @@ jobs:
           generate_release_notes: true
           make_latest: true
           body: |
-            Anvil 0.9.0 introduces Anvil-owned format-v4 immutable index
-            segments, exact multi-predicate execution, optional Typed JSON
-            physical ordering, stable generation-bound cursors, and bounded
-            arbitrary sorting. It is a clean index-format release for new
-            volumes and does not carry format-v3 compatibility machinery.
+            Anvil 0.9.1 is an in-place PersonalDB correctness hotfix. Catch-up
+            entries now use their required content-derived IDs, and replaying an
+            identical retained role grant succeeds after the original grant
+            advances the authorization revision. Storage formats are unchanged;
+            existing 0.9.0 volumes do not require a reset or rebuild.
 
             - Image: `${{ steps.image.outputs.image }}`
             - Manifest digest: `${{ steps.image.outputs.digest }}`
