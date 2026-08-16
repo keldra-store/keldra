@@ -427,9 +427,33 @@ async fn main() -> TestResult<()> {
             address: Some(ObjectAddress {
                 tenant: tenant.clone(),
                 bucket: tensor_case.bucket.into(),
-                path: tensor_case.replacement.0.into(),
+                path: tensor_case.replacement_hit_path.into(),
             }),
             command_id: "qualification-delete-tensor-result".into(),
+            durability: source_durability as i32,
+        },
+        "tensor index result delete",
+    )
+    .await?;
+    write_number += 1;
+    wait_for_exact_current_absence(
+        &mut indexes,
+        request(tensor_case),
+        tensor_case.replacement_hit_path,
+        &before_tensor_delete,
+    )
+    .await?;
+
+    let delete_client = &mut objects[(write_number as usize) % object_client_count];
+    delete_object(
+        delete_client,
+        DeleteRequest {
+            address: Some(ObjectAddress {
+                tenant: tenant.clone(),
+                bucket: tensor_case.bucket.into(),
+                path: tensor_case.replacement.0.into(),
+            }),
+            command_id: "qualification-delete-tensor-source".into(),
             durability: source_durability as i32,
         },
         "tensor index source delete",
@@ -505,6 +529,52 @@ async fn main() -> TestResult<()> {
         COMPACTION_WAVES,
     );
     Ok(())
+}
+
+async fn wait_for_exact_current_absence(
+    clients: &mut [IndexClient],
+    request: QueryIndexRequest,
+    removed_path: &str,
+    before: &IndexFreshness,
+) -> TestResult<()> {
+    let deadline = Instant::now() + WAIT_LIMIT;
+    loop {
+        let mut responses = Vec::with_capacity(clients.len());
+        for client in clients.iter_mut() {
+            match client.query_index(request.clone()).await {
+                Ok(response) => responses.push(response.into_inner()),
+                Err(status) if retryable(&status) && Instant::now() < deadline => {
+                    responses.clear();
+                    break;
+                }
+                Err(status) => return Err(status.into()),
+            }
+        }
+        if responses.len() == clients.len()
+            && routed_responses_agree(&responses)
+            && responses.iter().all(|response| {
+                response
+                    .hits
+                    .iter()
+                    .filter_map(hit_path)
+                    .all(|path| path != removed_path)
+                    && response.freshness.as_ref().is_some_and(|freshness| {
+                        freshness.index_id == before.index_id
+                            && freshness.definition_version == before.definition_version
+                            && freshness.generation >= before.generation
+                            && freshness.authorization_revision != 0
+                    })
+            })
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(invalid(format!(
+                "deleted result {removed_path} remained visible through exact-current validation"
+            )));
+        }
+        sleep(POLL_INTERVAL).await;
+    }
 }
 
 async fn qualify_explicit_rebuild(

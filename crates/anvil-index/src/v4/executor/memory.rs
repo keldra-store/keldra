@@ -23,6 +23,7 @@ pub(super) const DEFAULT_MAXIMUM_PAGE_BYTES: usize = INDEX_DECODE_BYTES;
 pub(crate) fn estimate_working_memory(
     request: &NativeQueryRequest,
     limits: NativeQueryLimits,
+    query_parallelism: usize,
 ) -> Result<usize, IndexError> {
     request.validate()?;
     let mut fields = BTreeSet::new();
@@ -38,16 +39,22 @@ pub(crate) fn estimate_working_memory(
         NativeQuery::Filter { order, .. } => order.len(),
         _ => 1,
     };
-    // Physical k-way execution retains only owned heads and compact cursor
-    // continuation per segment. Exactly one advancing segment retains decoded
-    // blocks, so consecutive candidates reuse them without multiplying the
-    // component ceiling by the generation's segment count.
+    let requested_lanes = query_parallelism.max(1).min(request.segments.len().max(1));
+    let lanes = if matches!(&request.query, NativeQuery::FullText { .. }) {
+        1
+    } else {
+        requested_lanes
+    };
+    // Physical k-way execution retains a small cursor and owned merge head for
+    // every segment. Decoded immutable blocks belong only to the segment being
+    // advanced and are released once its next head has been extracted.
     let resident_components = 2usize
         .checked_add(fields.len())
         .and_then(|value| value.checked_add(leaves))
         .ok_or(IndexError::OffsetOverflow)?;
     let decoded = resident_components
         .checked_mul(INDEX_DECODE_BYTES)
+        .and_then(|value| value.checked_mul(lanes))
         .ok_or(IndexError::OffsetOverflow)?;
     let per_segment_cursor = leaves
         .max(1)
@@ -76,24 +83,116 @@ pub(crate) fn estimate_working_memory(
         .len()
         .checked_mul(per_segment_state)
         .ok_or(IndexError::OffsetOverflow)?;
+    let document_sets = document_set_bytes(request)?;
     let heap = (request.limit as usize)
         .checked_mul(candidate_bytes)
+        .and_then(|value| {
+            value.checked_mul(if physical {
+                1
+            } else {
+                // One bounded heap in every active segment lane, plus the
+                // coordinator's final merge heap.
+                lanes.saturating_add(1)
+            })
+        })
         .ok_or(IndexError::OffsetOverflow)?;
     // A gate batch temporarily retains candidates and cloned gate references.
     let gate = limits
         .candidate_gate_batch
         .checked_mul(candidate_bytes)
         .and_then(|value| value.checked_mul(2))
+        .and_then(|value| value.checked_mul(if physical { 1 } else { lanes }))
         .ok_or(IndexError::OffsetOverflow)?;
-    let vector_workspace = vector_workspace_bytes(&request.query)?;
+    let vector_workspace = vector_workspace_bytes(&request.query)?
+        .checked_mul(lanes)
+        .ok_or(IndexError::OffsetOverflow)?;
     FIXED_EXECUTOR_BYTES
         .checked_add(decoded)
         .and_then(|value| value.checked_add(cursor_state))
+        .and_then(|value| value.checked_add(document_sets))
         .and_then(|value| value.checked_add(heap))
         .and_then(|value| value.checked_add(gate))
         .and_then(|value| value.checked_add(vector_workspace))
         .and_then(|value| value.checked_add(limits.maximum_page_bytes))
         .ok_or(IndexError::OffsetOverflow)
+}
+
+/// Term-range and point predicates materialize one dense segment-local DocId
+/// set. This is the same bounded cost whether a range matches one value or
+/// millions, and prevents repeatedly traversing immutable leaves for every
+/// small result batch.
+fn document_set_bytes(request: &NativeQueryRequest) -> Result<usize, IndexError> {
+    let sets = query_document_sets(request)?;
+    if sets == 0 {
+        return Ok(0);
+    }
+    request.segments.iter().try_fold(0usize, |total, segment| {
+        let words = usize::try_from(segment.document_count)
+            .map_err(|_| IndexError::OffsetOverflow)?
+            .div_ceil(u64::BITS as usize);
+        total
+            .checked_add(
+                words
+                    .checked_mul(std::mem::size_of::<u64>())
+                    .and_then(|value| value.checked_mul(sets))
+                    .ok_or(IndexError::OffsetOverflow)?,
+            )
+            .ok_or(IndexError::OffsetOverflow)
+    })
+}
+
+fn query_document_sets(request: &NativeQueryRequest) -> Result<usize, IndexError> {
+    Ok(match &request.query {
+        NativeQuery::Path { .. } => 1,
+        NativeQuery::Filter { predicate, .. } => predicate
+            .as_ref()
+            .map_or(Ok(0), |value| predicate_document_sets(value, request))?,
+        NativeQuery::GitSource { prefix, .. } => usize::from(*prefix),
+        NativeQuery::FullText { .. }
+        | NativeQuery::Vector { .. }
+        | NativeQuery::Hybrid { .. }
+        | NativeQuery::Tensor { .. } => 0,
+    })
+}
+
+fn predicate_document_sets(
+    predicate: &Predicate,
+    request: &NativeQueryRequest,
+) -> Result<usize, IndexError> {
+    let point_field = |field_id: FieldId| {
+        request
+            .schema
+            .fields
+            .get(field_id.get() as usize)
+            .is_some_and(|field| {
+                field
+                    .components
+                    .contains(super::super::FieldComponents::POINTS)
+            })
+    };
+    Ok(match predicate {
+        Predicate::Equal { field_id, .. } => usize::from(point_field(*field_id)),
+        Predicate::In {
+            field_id, values, ..
+        } => {
+            if point_field(*field_id) {
+                values.len()
+            } else {
+                0
+            }
+        }
+        Predicate::Prefix { .. } | Predicate::Range { .. } => 1,
+        Predicate::Exists { field_id, .. } => usize::from(point_field(*field_id)),
+        Predicate::FullText { .. } | Predicate::Phrase { .. } => 0,
+        Predicate::And(children) | Predicate::Or(children) => {
+            children.iter().try_fold(0usize, |total, child| {
+                total
+                    .checked_add(predicate_document_sets(child, request)?)
+                    .ok_or(IndexError::OffsetOverflow)
+            })?
+        }
+        Predicate::Not(child) => predicate_document_sets(child, request)?,
+    })
 }
 
 /// A normalized query vector and one owned stored vector coexist while a
@@ -197,7 +296,7 @@ fn query_shape(
                 .as_ref()
                 .map_or(Ok(0), |value| predicate_shape(value, fields))?
         }
-        NativeQuery::FullText { text, phrase } => {
+        NativeQuery::FullText { text, .. } => {
             let tokens = text.split_whitespace().count().max(1);
             let text_fields = request
                 .schema
@@ -214,9 +313,9 @@ fn query_shape(
                 .count();
             tokens
                 .checked_mul(text_fields)
-                // Candidate intersection and BM25 each own a cursor; phrase
-                // verification owns one additional cursor per term.
-                .and_then(|value| value.checked_mul(2 + usize::from(*phrase)))
+                // Candidate matching (including exact positional phrases) and
+                // BM25 scoring each own one cursor per term.
+                .and_then(|value| value.checked_mul(2))
                 .ok_or(IndexError::OffsetOverflow)?
         }
         NativeQuery::Vector { .. } => {
@@ -288,6 +387,10 @@ fn predicate_shape(
         Predicate::Exists { field_id, .. } => {
             fields.insert(*field_id);
             0
+        }
+        Predicate::FullText { field_id, text, .. } | Predicate::Phrase { field_id, text, .. } => {
+            fields.insert(*field_id);
+            text.split_whitespace().count().max(1)
         }
         Predicate::And(children) | Predicate::Or(children) => {
             children.iter().try_fold(0usize, |total, child| {

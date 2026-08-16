@@ -75,7 +75,8 @@ pub(crate) async fn start(
     reader: ClusterObjectReader,
     object_lister: DistributedObjectLister,
     names: LogicalNameResolver,
-    data_directory: &Path,
+    cache_directory: &Path,
+    scratch_directory: &Path,
     config: IndexRuntimeConfig,
     derived_checkpoints: DerivedCheckpointPublisher,
     startup_scan_evidence: StartupScanEvidence,
@@ -106,8 +107,9 @@ pub(crate) async fn start(
     );
 
     let memory_bytes = index_memory_budget(config.memory_percent())?;
-    let cache = IndexCache::new_with_startup_scan_evidence(
-        data_directory.join("index-cache"),
+    let cache = IndexCache::new_with_directories_and_startup_scan_evidence(
+        cache_directory,
+        scratch_directory,
         IndexCacheConfig::new(config.disk_cache_bytes(), memory_bytes)
             .context("validate index cache budgets")?,
         Arc::new(ClusterIndexSegmentFetcher::new(reader.clone())),

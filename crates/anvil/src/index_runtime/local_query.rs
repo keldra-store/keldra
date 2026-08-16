@@ -13,7 +13,7 @@ use anvil_atomic_program::{
 };
 use anvil_index::IndexError;
 use anvil_index::v4::{
-    AggregateOperation, ArtifactDescriptor, ArtifactDirectoryRead, CandidateGate,
+    AggregateOperation, ArtifactDirectoryRead, ArtifactPackReference, CandidateGate,
     CandidateGateEvidence, CandidateReference, FieldId, IndexKind, NativeQueryCursor,
     NativeQueryExecutionError, NativeQueryExecutor, NativeQueryLimits, NativeQueryRequest,
     NativeQueryStatisticsRecorder, ScalarValue,
@@ -129,12 +129,13 @@ impl QueryObservedDirectory {
 impl ArtifactDirectoryRead for QueryObservedDirectory {
     type File = QueryObservedFile;
 
-    async fn open_artifact(
-        &self,
-        descriptor: &ArtifactDescriptor,
-    ) -> Result<Self::File, IndexError> {
+    fn query_parallelism(&self) -> usize {
+        self.cpu.workers().max(1)
+    }
+
+    async fn open_artifact(&self, pack: &ArtifactPackReference) -> Result<Self::File, IndexError> {
         Ok(QueryObservedFile {
-            inner: self.inner.open(descriptor).await?,
+            inner: self.inner.open(pack).await?,
             observer: self.observer.clone(),
         })
     }
@@ -805,12 +806,17 @@ impl LocalGenerationQueryExecutor {
             .transpose()?;
         // Freshness evidence is advisory and must never turn journal lag, a
         // temporarily unavailable source, or a retained-generation cursor into
-        // query admission work. Builders and snapshot recovery update this
-        // process-local observation opportunistically. If it does not cover the
-        // pinned generation, omit the optional observed tails and serve the
-        // complete generation with its authoritative published barrier.
-        let observed =
-            compatible_observed_barrier(indexed.as_ref(), self.events.last_observed_barrier());
+        // query admission work. Observe only indexable changes in this bucket:
+        // unrelated buckets and reserved index artifacts cannot make a complete
+        // generation appear stale. If the scoped observation is unavailable or
+        // does not cover the pinned generation, serve the generation with its
+        // authoritative published barrier and omit optional observed tails.
+        let observed = self
+            .events
+            .capture_index_bucket_barrier(request.tenant_id, request.bucket_id, indexed.as_ref())
+            .await
+            .ok()
+            .and_then(|barrier| compatible_observed_barrier(indexed.as_ref(), Some(barrier)));
         let Some(selected) = selected else {
             let (facet_results, aggregate_results) =
                 empty_computation_results(&field_names, &compiled.facets, &compiled.aggregates)?;
@@ -1161,13 +1167,17 @@ impl ClusterIndexSegmentFetcher {
 
 #[tonic::async_trait]
 impl IndexSegmentFetcher for ClusterIndexSegmentFetcher {
-    async fn fetch(&self, segment: IndexSegmentId) -> Result<Vec<u8>, IndexCacheError> {
+    async fn fetch(
+        &self,
+        segment: IndexSegmentId,
+    ) -> Result<Box<dyn std::io::Read + Send>, IndexCacheError> {
         self.reader
-            .read_blob_bytes(&BlobRef {
+            .open_blob_payload(&BlobRef {
                 hash: segment.blake3,
                 length: segment.length,
             })
             .await
+            .map(|payload| Box::new(payload) as Box<dyn std::io::Read + Send>)
             .map_err(|error| IndexCacheError::Fetch(error.to_string()))
     }
 }

@@ -1,13 +1,18 @@
 use crate::IndexError;
 
 use super::codec::{COMPONENT_HEADER_BYTES, Decoder, Encoder};
-use super::keys::{TERM_TYPE_STRING, TERM_TYPE_TEXT};
-use super::model::{
-    INDEX_COMPONENT_BYTES, INDEX_ROUTING_KEY_BYTES, INDEX_TERM_BYTES, validate_term_routing_key,
+use super::keys::{
+    TERM_TYPE_BOOLEAN, TERM_TYPE_FIELD_PRESENCE, TERM_TYPE_HASHED_KEYWORD, TERM_TYPE_NULL,
+    TERM_TYPE_NUMBER, TERM_TYPE_SIGNED, TERM_TYPE_STRING, TERM_TYPE_TEXT, TERM_TYPE_UNSIGNED,
 };
+use super::model::{INDEX_COMPONENT_BYTES, INDEX_TERM_BYTES, validate_term_routing_key};
 
 const TERM_DICTIONARY_CODEC_VERSION: u16 = 1;
 const MAX_PAYLOAD_BYTES: usize = INDEX_COMPONENT_BYTES - COMPONENT_HEADER_BYTES;
+/// Target one independently addressable dictionary leaf at 32 KiB. The
+/// 512-KiB component ceiling remains the hard bound for a legal singleton
+/// long term, but ordinary exact seeks should not have to read that ceiling.
+pub(crate) const TERM_DICTIONARY_TARGET_BYTES: usize = 32 * 1024;
 
 /// A bounded range of leaf ordinals in the field's routed `POSTINGS` stream.
 /// It never denotes entries in the segment manifest: one field has one
@@ -120,7 +125,7 @@ impl TermDictionary {
                 .checked_add(entry.term.len())
                 .and_then(|value| value.checked_add(8 + 8 + 4 + 4))
                 .ok_or(IndexError::OffsetOverflow)?;
-            if !pending.is_empty() && bytes.saturating_add(row) > MAX_PAYLOAD_BYTES {
+            if !pending.is_empty() && bytes.saturating_add(row) > TERM_DICTIONARY_TARGET_BYTES {
                 blocks.push(Self::new(std::mem::take(&mut pending))?);
                 bytes = 6;
             }
@@ -170,21 +175,26 @@ fn validate_entries(entries: &[TermEntry]) -> Result<(), IndexError> {
 
 fn validate_dictionary_term(term: &[u8]) -> Result<(), IndexError> {
     validate_term_routing_key(term)?;
-    if term.len() <= INDEX_ROUTING_KEY_BYTES {
-        return Ok(());
-    }
     let value = term.get(5..).ok_or_else(|| {
-        IndexError::InvalidDefinition("long dictionary term has no canonical prefix".into())
+        IndexError::InvalidDefinition("dictionary term has no canonical field/type prefix".into())
     })?;
-    match term[4] {
+    let valid = match term[4] {
+        TERM_TYPE_NULL | TERM_TYPE_FIELD_PRESENCE => value == [0],
+        TERM_TYPE_BOOLEAN => matches!(value, [0] | [1]),
+        TERM_TYPE_NUMBER | TERM_TYPE_SIGNED | TERM_TYPE_UNSIGNED => value.len() == 8,
         TERM_TYPE_STRING if value.first() == Some(&0) && value.len() <= INDEX_TERM_BYTES + 1 => {
-            Ok(())
+            true
         }
-        TERM_TYPE_TEXT if value.len() <= INDEX_TERM_BYTES => Ok(()),
-        _ => Err(IndexError::InvalidDefinition(
-            "long dictionary term is not a canonical ordered value".into(),
-        )),
+        TERM_TYPE_TEXT => !value.is_empty() && value.len() <= INDEX_TERM_BYTES,
+        TERM_TYPE_HASHED_KEYWORD => value.len() == 40,
+        _ => false,
+    };
+    if !valid {
+        return Err(IndexError::InvalidDefinition(
+            "dictionary term is not canonical".into(),
+        ));
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -205,26 +215,39 @@ mod tests {
 
     #[test]
     fn exact_lower_bound_and_prefix_survive_round_trip() {
+        let key = |value: &[u8]| {
+            let mut term = vec![0, 0, 0, 1, TERM_TYPE_STRING, 0];
+            term.extend_from_slice(value);
+            term
+        };
+        let a = key(b"a");
+        let aa = key(b"aa");
+        let ab = key(b"ab");
+        let ac = key(b"ac");
+        let b = key(b"b");
+        let z = key(b"z");
         let dictionary = TermDictionary::new(vec![
-            entry(b"a", 1),
-            entry(b"ab", 2),
-            entry(b"ac", 3),
-            entry(b"b", 4),
+            entry(&a, 1),
+            entry(&ab, 2),
+            entry(&ac, 3),
+            entry(&b, 4),
         ])
         .unwrap();
         let decoded =
             TermDictionary::decode_payload(&dictionary.encode_payload().unwrap()).unwrap();
         assert_eq!(
-            decoded
-                .exact(b"ab")
-                .unwrap()
-                .postings
-                .first_component_ordinal,
+            decoded.exact(&ab).unwrap().postings.first_component_ordinal,
             2
         );
-        assert_eq!(decoded.lower_bound(b"aa"), 1);
-        assert_eq!(decoded.prefix(b"a").count(), 3);
-        assert!(decoded.exact(b"z").is_none());
+        assert_eq!(decoded.lower_bound(&aa), 1);
+        assert_eq!(decoded.prefix(&a).count(), 3);
+        assert!(decoded.exact(&z).is_none());
+    }
+
+    #[test]
+    fn malformed_short_or_unknown_terms_fail_closed() {
+        assert!(TermDictionary::new(vec![entry(b"a", 1)]).is_err());
+        assert!(TermDictionary::new(vec![entry(&[0, 0, 0, 1, u8::MAX, 0], 1)]).is_err());
     }
 
     #[test]

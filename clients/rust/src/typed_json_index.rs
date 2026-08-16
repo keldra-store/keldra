@@ -15,6 +15,7 @@ use anvil_api::v1::{
 };
 
 const MAX_INDEX_NAME_BYTES: usize = 128;
+const MAX_OBJECT_BUCKET_BYTES: usize = 256;
 const MAX_OBJECT_PATH_BYTES: usize = 4_096;
 const MAX_CONTENT_TYPE_BYTES: usize = 512;
 const MAX_COMMAND_ID_BYTES: usize = 256;
@@ -39,7 +40,9 @@ impl Display for IndexDefinitionError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidBucket => {
-                formatter.write_str("bucket must be non-empty and contain no NUL")
+                formatter.write_str(
+                    "bucket must be a 1..=256-byte canonical component without '/' or control characters",
+                )
             }
             Self::InvalidIndexName => formatter
                 .write_str("index name must be 1..=128 ASCII letters, digits, '.', '-' or '_'"),
@@ -615,7 +618,11 @@ fn validate_definition(
     builder: &TypedJsonIndexBuilder<state::NonEmpty>,
     command_id: &str,
 ) -> Result<(), IndexDefinitionError> {
-    if builder.bucket.is_empty() || builder.bucket.contains('\0') {
+    if builder.bucket.is_empty()
+        || builder.bucket.len() > MAX_OBJECT_BUCKET_BYTES
+        || builder.bucket.contains('/')
+        || builder.bucket.chars().any(char::is_control)
+    {
         return Err(IndexDefinitionError::InvalidBucket);
     }
     if builder.name.is_empty()
@@ -715,7 +722,7 @@ mod tests {
             .full_text();
 
         let request = TypedJsonIndexBuilder::new("intelligence", "advisories")
-            .path_prefix("/advisories/")
+            .path_prefix("advisories/")
             .content_type("application/json")
             .field(advisory_id)
             .field(ecosystem)
@@ -775,6 +782,21 @@ mod tests {
             bad_pointer,
             IndexDefinitionError::InvalidJsonPointer("id".into())
         );
+    }
+
+    #[test]
+    fn bucket_is_checked_as_an_object_address_component() {
+        for bucket in [
+            "nested/bucket".to_owned(),
+            "line\nbreak".to_owned(),
+            "b".repeat(super::MAX_OBJECT_BUCKET_BYTES + 1),
+        ] {
+            let error = TypedJsonIndexBuilder::new(bucket, "objects")
+                .field(KeywordField::single("id", "/id").exact())
+                .finish("command")
+                .unwrap_err();
+            assert_eq!(error, IndexDefinitionError::InvalidBucket);
+        }
     }
 
     #[test]

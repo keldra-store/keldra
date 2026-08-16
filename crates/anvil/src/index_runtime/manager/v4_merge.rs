@@ -47,6 +47,7 @@ pub(super) async fn compact_selected_segments(
         .iter()
         .all(|segment| segment.live_document_count == 0)
     {
+        detach_selected_locator_packs(candidate, &selected)?;
         candidate
             .segments
             .retain(|segment| !selected_ids.contains(&segment.identity.segment_id));
@@ -159,6 +160,7 @@ pub(super) async fn compact_selected_segments(
     let output_documents = u64::from(built.descriptor.document_count);
     let output_bytes = built.descriptor.encoded_bytes;
     let descriptor_identity = built.descriptor.identity;
+    detach_selected_locator_packs(candidate, &selected)?;
     candidate
         .segments
         .retain(|segment| !selected_ids.contains(&segment.identity.segment_id));
@@ -170,6 +172,7 @@ pub(super) async fn compact_selected_segments(
         sequence,
         identity: descriptor_identity,
         artifact: built.locator.root,
+        pack_ownership: LocatorPackOwnership::Segment,
         encoded_bytes: built.locator.encoded_bytes,
         logical_bytes: built.locator.logical_bytes,
     });
@@ -189,6 +192,29 @@ pub(super) async fn compact_selected_segments(
         gauge.anvil_index_compaction_output_tier = u64::from(output_tier),
         "format-v4 merged segment placed in its derived size tier"
     );
+    Ok(())
+}
+
+fn detach_selected_locator_packs(
+    candidate: &mut CandidateGeneration,
+    selected: &[SegmentDescriptor],
+) -> Result<(), Status> {
+    for root in &mut candidate.locator_roots {
+        let Some(segment) = selected
+            .iter()
+            .find(|segment| segment.identity.segment_id == root.identity.segment_id)
+        else {
+            continue;
+        };
+        if segment.identity != root.identity
+            || !matches!(&root.pack_ownership, LocatorPackOwnership::Segment)
+        {
+            return Err(Status::data_loss(
+                "removed segment has non-canonical locator pack ownership",
+            ));
+        }
+        root.pack_ownership = LocatorPackOwnership::Standalone(segment.packs.clone());
+    }
     Ok(())
 }
 
@@ -218,4 +244,71 @@ fn emit_repayment(
         histogram.anvil_index_compaction_debt_repayment_duration_seconds = elapsed_seconds,
         "format-v4 index segment debt repaid"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn segment(identity: SegmentIdentity) -> SegmentDescriptor {
+        let hash = [7; 32];
+        SegmentDescriptor {
+            identity,
+            document_count: 1,
+            live_document_count: 1,
+            packs: vec![
+                anvil_index::v4::ArtifactPackReference::new(
+                    identity.index_id,
+                    anvil_index::v4::artifact_path(identity.index_id, hash),
+                    4,
+                    hash,
+                    anvil_index::v4::COMPONENT_HEADER_BYTES as u64,
+                )
+                .unwrap(),
+            ],
+            components: Vec::new(),
+            encoded_bytes: 1,
+            logical_bytes: 1,
+        }
+    }
+
+    #[test]
+    fn segment_locator_is_detached_before_its_segment_is_removed() {
+        let identity = SegmentIdentity::new(7, 3, [4; 32], 9).unwrap();
+        let selected = vec![segment(identity)];
+        let mut candidate = CandidateGeneration {
+            segments: selected.clone(),
+            locator_roots: vec![LocatorRoot {
+                sequence: 1,
+                identity,
+                artifact: anvil_index::v4::ArtifactDescriptor::new(
+                    identity.index_id,
+                    0,
+                    0,
+                    anvil_index::v4::COMPONENT_HEADER_BYTES as u64,
+                    0,
+                    anvil_index::v4::ComponentKind::ROUTING_NODE,
+                    1,
+                    [8; 32],
+                )
+                .unwrap(),
+                pack_ownership: LocatorPackOwnership::Segment,
+                encoded_bytes: 1,
+                logical_bytes: 1,
+            }],
+            next_sequence: 2,
+            diagnostics: IndexBuildDiagnostics::default(),
+        };
+
+        detach_selected_locator_packs(&mut candidate, &selected).unwrap();
+        candidate.segments.clear();
+
+        let roots = candidate.locator_stream_roots().unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].packs, selected[0].packs);
+        assert!(matches!(
+            &candidate.locator_roots[0].pack_ownership,
+            LocatorPackOwnership::Standalone(packs) if packs == &selected[0].packs
+        ));
+    }
 }

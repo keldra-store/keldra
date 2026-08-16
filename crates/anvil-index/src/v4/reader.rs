@@ -1,8 +1,8 @@
 use crate::IndexError;
 
 use super::{
-    ArtifactDescriptor, ArtifactDirectoryRead, ComponentKind, RoutingNode, SegmentIdentity,
-    read_artifact_component,
+    ArtifactDescriptor, ArtifactDirectoryRead, ArtifactPackReference, ComponentKind, RoutingNode,
+    SegmentIdentity, read_artifact_component,
 };
 
 /// One routed data leaf with the exact immutable routing evidence required to
@@ -35,6 +35,7 @@ pub struct StreamTotals {
 pub struct ComponentStream<'a, D> {
     directory: &'a D,
     identity: SegmentIdentity,
+    packs: &'a [ArtifactPackReference],
     logical_kind: ComponentKind,
     minimum_key: Option<Vec<u8>>,
     maximum_key: Option<Vec<u8>>,
@@ -60,13 +61,14 @@ impl<'a, D: ArtifactDirectoryRead> ComponentStream<'a, D> {
     pub fn new(
         directory: &'a D,
         identity: SegmentIdentity,
+        packs: &'a [ArtifactPackReference],
         logical_kind: ComponentKind,
         root: ArtifactDescriptor,
         minimum_key: Option<Vec<u8>>,
         maximum_key: Option<Vec<u8>>,
     ) -> Result<Self, IndexError> {
         identity.validate()?;
-        root.validate(identity.index_id)?;
+        root.pack(identity.index_id, packs)?;
         if root.component_kind != ComponentKind::ROUTING_NODE {
             return Err(IndexError::InvalidFormat(
                 "format-v4 component stream requires a routing root",
@@ -84,6 +86,7 @@ impl<'a, D: ArtifactDirectoryRead> ComponentStream<'a, D> {
         Ok(Self {
             directory,
             identity,
+            packs,
             logical_kind,
             minimum_key,
             maximum_key,
@@ -102,6 +105,9 @@ impl<'a, D: ArtifactDirectoryRead> ComponentStream<'a, D> {
 
     pub async fn next_leaf(&mut self) -> Result<Option<StreamLeaf>, IndexError> {
         while let Some(pending) = self.pending.pop() {
+            pending
+                .descriptor
+                .pack(self.identity.index_id, self.packs)?;
             self.traversed.encoded_bytes = self
                 .traversed
                 .encoded_bytes
@@ -144,6 +150,7 @@ impl<'a, D: ArtifactDirectoryRead> ComponentStream<'a, D> {
             let component = read_artifact_component(
                 self.directory,
                 self.identity,
+                self.packs,
                 &pending.descriptor,
                 ComponentKind::ROUTING_NODE,
             )

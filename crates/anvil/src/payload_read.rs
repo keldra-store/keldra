@@ -122,10 +122,12 @@ pub(crate) struct AnonymousPayloadReadSpools {
 }
 
 impl AnonymousPayloadReadSpools {
-    pub(crate) fn new(directory: impl AsRef<Path>) -> Self {
-        Self {
-            directory: Arc::new(directory.as_ref().to_path_buf()),
-        }
+    pub(crate) fn new(directory: impl AsRef<Path>) -> io::Result<Self> {
+        let directory = directory.as_ref().to_path_buf();
+        std::fs::create_dir_all(&directory)?;
+        Ok(Self {
+            directory: Arc::new(directory),
+        })
     }
 }
 

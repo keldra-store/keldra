@@ -219,6 +219,7 @@ write_incident_query_evidence() {
   local authoritative_bytes
   local candidate_count=0
   local corpus_records
+  local expected_computation_documents
   local expected_definition_version
   local expected_generation
   local expected_index_id
@@ -230,8 +231,16 @@ write_incident_query_evidence() {
   local -a selected_fetch_bytes=()
   local -a selected_fetches=()
   local -a selected_lines=()
-  local -a expected_hits=(4 999 999 0 4)
-  local -a names=(limit_four page_one page_two zero_hit_sparse_conjunction unselective_arbitrary_sort)
+  local -a expected_hits=(4 999 999 0 4 4)
+  local -a names=(
+    limit_four
+    page_one
+    page_two
+    zero_hit_sparse_conjunction
+    unselective_arbitrary_sort
+    exact_computations
+  )
+  local query_count="${#names[@]}"
 
   if [[ -e "${output}" ]]; then
     echo "incident-query evidence output already exists: ${output}" >&2
@@ -242,6 +251,9 @@ write_incident_query_evidence() {
     jq -er '.production_query_regression.definition_version' "${client_report}"
   )"
   expected_generation="$(jq -er '.production_query_regression.generation' "${client_report}")"
+  expected_computation_documents="$(
+    jq -er '.production_query_regression.exact_computations.matching_documents' "${client_report}"
+  )"
   corpus_records="$(jq -er '.records' "${client_report}")"
   if [[ "${expected_index_id}" == "0" ]] \
     || ((expected_definition_version == 0 || expected_generation == 0 || corpus_records == 0))
@@ -298,15 +310,15 @@ write_incident_query_evidence() {
 
     local start
     local position
-    for ((start = 0; start + 4 < ${#file_lines[@]}; start++)); do
-      for ((position = 0; position < 5; position++)); do
+    for ((start = 0; start + query_count - 1 < ${#file_lines[@]}; start++)); do
+      for ((position = 0; position < query_count; position++)); do
         returned_hits="$(log_span_unsigned_field \
           histogram.anvil_index_query_returned_hits \
           "${file_lines[start + position]}" || true)"
         [[ "${returned_hits}" == "${expected_hits[position]}" ]] || break
       done
-      if ((position == 5)); then
-        for ((position = 0; position < 5; position++)); do
+      if ((position == query_count)); then
+        for ((position = 0; position < query_count; position++)); do
           [[ "$(log_span_unsigned_field definition.version \
             "${file_lines[start + position]}" || true)" \
             == "${expected_definition_version}" ]] || break
@@ -315,10 +327,10 @@ write_incident_query_evidence() {
             == "${expected_generation}" ]] || break
         done
       fi
-      if ((position == 5)); then
+      if ((position == query_count)); then
         candidate_count=$((candidate_count + 1))
         if ((candidate_count == 1)); then
-          for ((position = 0; position < 5; position++)); do
+          for ((position = 0; position < query_count; position++)); do
             selected_lines[position]="${file_lines[start + position]}"
             selected_fetches[position]="${file_fetches[start + position]}"
             selected_fetch_bytes[position]="${file_fetch_bytes[start + position]}"
@@ -335,7 +347,7 @@ write_incident_query_evidence() {
 
   local queries
   queries="$(mktemp)"
-  for ((position = 0; position < 5; position++)); do
+  for ((position = 0; position < query_count; position++)); do
     incident_query_terminal_json \
       "${names[position]}" \
       "${expected_index_id}" \
@@ -360,7 +372,8 @@ write_incident_query_evidence() {
     --argjson generation "${expected_generation}" \
     --argjson authoritative_bytes "${authoritative_bytes}" \
     --argjson publication_bytes_ceiling "${publication_bytes_ceiling}" \
-    --argjson record_ceiling "${record_ceiling}" '
+    --argjson record_ceiling "${record_ceiling}" \
+    --argjson expected_computation_documents "${expected_computation_documents}" '
       . as $queries |
       {
         schema: $schema,
@@ -377,13 +390,14 @@ write_incident_query_evidence() {
         result: "pass"
       }
       | select(
-          ($queries | length) == 5 and
+          ($queries | length) == 6 and
           ($queries | map(.name)) == [
             "limit_four", "page_one", "page_two",
-            "zero_hit_sparse_conjunction", "unselective_arbitrary_sort"
+            "zero_hit_sparse_conjunction", "unselective_arbitrary_sort",
+            "exact_computations"
           ] and
           ($queries | map(.terminal_counters["histogram.anvil_index_query_returned_hits"])) ==
-            [4, 999, 999, 0, 4] and
+            [4, 999, 999, 0, 4, 4] and
           ($queries | all(
             .index_id == $index_id and
             .definition_version == $definition_version and
@@ -398,13 +412,24 @@ write_incident_query_evidence() {
             .terminal_counters["monotonic_counter.anvil_index_query_candidate_doc_ids_total"] < $record_ceiling and
             .terminal_counters["monotonic_counter.anvil_index_query_doc_value_blocks_decoded_total"] < $record_ceiling
           )) and
+          ($queries[0:5] | all(
+            .terminal_counters["monotonic_counter.anvil_index_query_facet_documents_processed_total"] == 0 and
+            .terminal_counters["monotonic_counter.anvil_index_query_facet_values_processed_total"] == 0 and
+            .terminal_counters["monotonic_counter.anvil_index_query_aggregate_documents_processed_total"] == 0 and
+            .terminal_counters["monotonic_counter.anvil_index_query_aggregate_values_processed_total"] == 0
+          )) and
           ($queries[0:3] | all(
             .terminal_counters["monotonic_counter.anvil_index_query_physical_early_terminations_total"] > 0
           )) and
           $queries[2].terminal_counters["monotonic_counter.anvil_index_query_cursor_seeks_total"] > 0 and
           $queries[2].terminal_counters["monotonic_counter.anvil_index_query_cursor_skipped_doc_ids_total"] < $record_ceiling and
           $queries[4].tier == "top_k" and
-          $queries[4].terminal_counters["monotonic_counter.anvil_index_query_top_k_inspected_total"] > 0
+          $queries[4].terminal_counters["monotonic_counter.anvil_index_query_top_k_inspected_total"] > 0 and
+          $queries[5].tier == "physical" and
+          $queries[5].terminal_counters["monotonic_counter.anvil_index_query_facet_documents_processed_total"] == $expected_computation_documents and
+          $queries[5].terminal_counters["monotonic_counter.anvil_index_query_facet_values_processed_total"] == $expected_computation_documents and
+          $queries[5].terminal_counters["monotonic_counter.anvil_index_query_aggregate_documents_processed_total"] == $expected_computation_documents and
+          $queries[5].terminal_counters["monotonic_counter.anvil_index_query_aggregate_values_processed_total"] == $expected_computation_documents
         )
     ' "${queries}" >"${output}"
   local status=$?

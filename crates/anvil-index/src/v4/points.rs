@@ -5,6 +5,9 @@ use super::columns::{decode_scalar, encode_scalar};
 use super::{DocId, FieldId, INDEX_COMPONENT_BYTES, ScalarValue, canonical_term_key, scalar_term};
 
 pub const POINTS_COMPONENT_CODEC_VERSION: u16 = 1;
+/// Lucene-style point leaves remain deliberately small so an exact or narrow
+/// range traversal reads a bounded leaf instead of the component ceiling.
+pub(crate) const POINT_BLOCK_ENTRIES: usize = 512;
 const MAX_PAYLOAD_BYTES: usize = INDEX_COMPONENT_BYTES - COMPONENT_HEADER_BYTES;
 const POINT_RECORD_PRESENCE: u8 = 1;
 const POINT_RECORD_NULL: u8 = 2;
@@ -60,9 +63,9 @@ pub struct PointBlock {
 impl PointBlock {
     pub fn new(field_id: FieldId, entries: Vec<PointEntry>) -> Result<Self, IndexError> {
         if entries.is_empty()
-            || entries.iter().any(|entry| {
-                matches!(&entry.value, PointValue::Value(value) if !is_numeric(value))
-            })
+            || entries
+                .iter()
+                .any(|entry| matches!(&entry.value, PointValue::Value(value) if !is_numeric(value)))
             || entries.windows(2).any(|pair| {
                 pair[0].value > pair[1].value
                     || pair[0].value == pair[1].value && pair[0].doc_id >= pair[1].doc_id
@@ -175,7 +178,9 @@ pub fn point_value_key(field_id: FieldId, value: &PointValue) -> Result<Vec<u8>,
     if value == &PointValue::Null {
         return canonical_term_key(field_id, POINT_NULL_TERM_TYPE, POINT_NULL_TERM);
     }
-    let PointValue::Value(value) = value else { unreachable!() };
+    let PointValue::Value(value) = value else {
+        unreachable!()
+    };
     if !is_numeric(value) {
         return Err(IndexError::InvalidDefinition(
             "point values must be numeric".into(),
@@ -246,25 +251,46 @@ mod tests {
             ],
         )
         .unwrap();
-        assert_eq!(PointBlock::decode_payload(&block.encode_payload().unwrap()).unwrap(), block);
-        assert!(PointBlock::new(
-            FieldId::new(2),
-            vec![
-                PointEntry { value: PointValue::Value(ScalarValue::Signed(1)), doc_id: DocId::new(0) },
-                PointEntry { value: PointValue::Value(ScalarValue::Unsigned(1)), doc_id: DocId::new(1) },
-            ],
-        ).is_err());
+        assert_eq!(
+            PointBlock::decode_payload(&block.encode_payload().unwrap()).unwrap(),
+            block
+        );
+        assert!(
+            PointBlock::new(
+                FieldId::new(2),
+                vec![
+                    PointEntry {
+                        value: PointValue::Value(ScalarValue::Signed(1)),
+                        doc_id: DocId::new(0)
+                    },
+                    PointEntry {
+                        value: PointValue::Value(ScalarValue::Unsigned(1)),
+                        doc_id: DocId::new(1)
+                    },
+                ],
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn duplicate_presence_for_one_document_is_rejected() {
-        assert!(PointBlock::new(
-            FieldId::new(1),
-            vec![
-                PointEntry { value: PointValue::Presence, doc_id: DocId::new(4) },
-                PointEntry { value: PointValue::Presence, doc_id: DocId::new(4) },
-            ],
-        ).is_err());
+        assert!(
+            PointBlock::new(
+                FieldId::new(1),
+                vec![
+                    PointEntry {
+                        value: PointValue::Presence,
+                        doc_id: DocId::new(4)
+                    },
+                    PointEntry {
+                        value: PointValue::Presence,
+                        doc_id: DocId::new(4)
+                    },
+                ],
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -281,8 +307,14 @@ mod tests {
     fn routed_key_order_matches_point_value_order() {
         let field = FieldId::new(1);
         let entries = [
-            PointEntry { value: PointValue::Presence, doc_id: DocId::new(3) },
-            PointEntry { value: PointValue::Null, doc_id: DocId::new(3) },
+            PointEntry {
+                value: PointValue::Presence,
+                doc_id: DocId::new(3),
+            },
+            PointEntry {
+                value: PointValue::Null,
+                doc_id: DocId::new(3),
+            },
             PointEntry {
                 value: PointValue::Value(ScalarValue::Signed(-1)),
                 doc_id: DocId::new(3),

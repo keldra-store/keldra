@@ -79,10 +79,10 @@ fn source(path: String, records: Vec<ProjectedRecord>) -> ProjectedSource {
     }
 }
 
-fn text_record(order: &str, term: String) -> ProjectedRecord {
+fn text_record(_order: &str, term: String) -> ProjectedRecord {
     ProjectedRecord {
         result_identity: None,
-        order_key: order.as_bytes().to_vec(),
+        order_key: Vec::new(),
         terms: vec![ProjectedTerm {
             field_id: FieldId::new(0),
             term_type: crate::v4::TERM_TYPE_TEXT,
@@ -142,7 +142,10 @@ fn source_admission_charges_flat_document_and_term_references_before_allocation(
             path.into(),
             (0..64)
                 .map(|ordinal| {
-                    text_record(&format!("{ordinal:04}"), format!("{ordinal:04}-{}", "x".repeat(4096)))
+                    text_record(
+                        &format!("{ordinal:04}"),
+                        format!("{ordinal:04}-{}", "x".repeat(4096)),
+                    )
                 })
                 .collect(),
         )
@@ -229,19 +232,13 @@ fn source_path_index_uses_owned_sources_and_rejects_duplicates() {
     let mut writer = NativeSegmentWriter::new(identity(&schema), schema, limits()).unwrap();
     assert_eq!(
         writer
-            .push_source(source(
-                "z/path".into(),
-                vec![text_record("z", "z".into())]
-            ))
+            .push_source(source("z/path".into(), vec![text_record("z", "z".into())]))
             .unwrap(),
         SourcePush::Accepted
     );
     assert_eq!(
         writer
-            .push_source(source(
-                "a/path".into(),
-                vec![text_record("a", "a".into())]
-            ))
+            .push_source(source("a/path".into(), vec![text_record("a", "a".into())]))
             .unwrap(),
         SourcePush::Accepted
     );
@@ -311,9 +308,9 @@ async fn high_dimension_vectors_stream_one_component_block_at_a_time() {
         version(ComponentKind::SCORING_STATISTICS),
     ];
     let records = (0..512)
-        .map(|ordinal| ProjectedRecord {
+        .map(|_| ProjectedRecord {
             result_identity: None,
-            order_key: format!("{ordinal:08}").into_bytes(),
+            order_key: Vec::new(),
             terms: Vec::new(),
             points: Vec::new(),
             doc_values: Vec::new(),

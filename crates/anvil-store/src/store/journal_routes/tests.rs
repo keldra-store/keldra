@@ -83,6 +83,33 @@ async fn routed_pages_are_target_bounded_advance_empty_intervals_and_measure_pee
     let peer_bytes = serde_json::to_vec(&page.changes[0]).unwrap().len() as u64;
     assert_eq!(page.encoded_bytes, peer_bytes);
 
+    // The route iterator can already have observed every matching offset in
+    // the target interval before the decoded peer-byte limit stops the page.
+    // It must not advance through the unreturned second match.
+    let byte_limited = store
+        .scan_routed_local_changes(
+            JournalRoute::Bucket {
+                tenant_id,
+                bucket_id,
+            },
+            status.source_id,
+            0,
+            status.tail,
+            10,
+            peer_bytes,
+        )
+        .unwrap();
+    assert_eq!(
+        byte_limited
+            .changes
+            .iter()
+            .map(LocalChange::offset)
+            .collect::<Vec<_>>(),
+        [1]
+    );
+    assert_eq!(byte_limited.through_offset, 1);
+    assert_eq!(byte_limited.encoded_bytes, peer_bytes);
+
     let empty_between_matches = store
         .scan_routed_local_changes(
             JournalRoute::Bucket {

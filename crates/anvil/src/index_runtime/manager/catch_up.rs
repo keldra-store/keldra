@@ -10,6 +10,11 @@ use super::rebuild::{
 };
 use super::*;
 
+pub(super) struct JournalPageWork {
+    pub(super) changed: bool,
+    pub(super) source_payload_bytes: u64,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn process_journal_page(
     definition: &CatalogDefinition,
@@ -20,7 +25,7 @@ pub(super) async fn process_journal_page(
     builder: &mut NativeSegmentBuild,
     candidate: &mut CandidateGeneration,
     dependencies: &IndexBuilderDependencies,
-) -> Result<bool, Status> {
+) -> Result<JournalPageWork, Status> {
     let paths = journal_source_paths(
         definition.tenant_id,
         definition.bucket_id,
@@ -30,11 +35,21 @@ pub(super) async fn process_journal_page(
     .into_iter()
     .collect::<Vec<_>>();
     let changed = !paths.is_empty();
+    let mut source_payload_bytes = 0_u64;
 
     // One journal page is already byte-bounded. Exact-current reads retain
     // that bound and additionally obey the store's bounded multi-get limit.
     for paths in paths.chunks(MAX_OBJECT_RECORD_EXPORT_RECORDS as usize) {
         let sources = load_target_sources(definition, paths, target, dependencies).await?;
+        source_payload_bytes = sources
+            .iter()
+            .try_fold(source_payload_bytes, |total, source| {
+                total
+                    .checked_add(source_payload_bytes_for(&definition.schema, source))
+                    .ok_or_else(|| {
+                        Status::resource_exhausted("index source payload bytes overflow")
+                    })
+            })?;
         project_sources(
             definition,
             kind,
@@ -46,7 +61,10 @@ pub(super) async fn process_journal_page(
         )
         .await?;
     }
-    Ok(changed)
+    Ok(JournalPageWork {
+        changed,
+        source_payload_bytes,
+    })
 }
 
 pub(super) fn journal_source_paths(
@@ -411,15 +429,7 @@ async fn apply_incremental_mutations(
         definition.stored.index_id,
     )
     .map_err(index_status)?;
-    let roots = candidate
-        .locator_roots
-        .iter()
-        .map(|root| LocatorStreamRoot {
-            sequence: root.sequence,
-            identity: root.identity,
-            artifact: root.artifact.clone(),
-        })
-        .collect::<Vec<_>>();
+    let roots = candidate.locator_stream_roots()?;
     let mutation_bytes = mutation_batch_resident_bytes(&pending, pending.capacity())?;
     let mut previous_by_ordinal = if roots.is_empty() {
         Vec::new()
@@ -545,6 +555,7 @@ async fn apply_incremental_mutations(
             definition.bucket_id,
             DerivedArtifactAdmission::PublicationProgress,
         );
+        sink.begin_segment(identity, &[]).map_err(index_status)?;
         let published = publish_locator_delta(
             &mut sink,
             identity,
@@ -560,11 +571,16 @@ async fn apply_incremental_mutations(
         )
         .await
         .map_err(index_status)?;
+        let packs = sink
+            .finalize_segment(identity)
+            .await
+            .map_err(index_status)?;
         let sequence = candidate.allocate_sequence()?;
         candidate.locator_roots.push(LocatorRoot {
             sequence,
             identity,
             artifact: published.root,
+            pack_ownership: LocatorPackOwnership::Standalone(packs),
             encoded_bytes: published.encoded_bytes,
             logical_bytes: published.logical_bytes,
         });

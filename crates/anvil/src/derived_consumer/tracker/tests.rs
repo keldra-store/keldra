@@ -183,6 +183,36 @@ fn incremental_routed_effect_adds_one_sparse_pin_then_publication_removes_it() {
 }
 
 #[test]
+fn newly_settled_status_must_precede_new_routed_effect_validation() {
+    let old = source(1, 5);
+    let current = assignment(DefinitionKind::Index, 1);
+    let mut tracker = SparseDerivedInventory::begin(
+        DerivedConsumerKind::Index,
+        NodeId(3),
+        fence(),
+        [(old, None)],
+    )
+    .unwrap()
+    .finish();
+
+    assert!(matches!(
+        tracker.observe_routed_effect(&current, old.source_id, 10, None),
+        Err(SparseTrackerError::RoutedOffset {
+            source_id,
+            identity,
+            required_next: 10,
+            floor_next: 1,
+            settled_next: 6,
+        }) if source_id == old.source_id && identity == DerivedDefinitionIdentity::from_assignment(&current)
+    ));
+
+    tracker.update_source_status(source(1, 20)).unwrap();
+    tracker
+        .observe_routed_effect(&current, old.source_id, 10, None)
+        .unwrap();
+}
+
+#[test]
 fn durable_acknowledgement_becomes_the_floor_for_later_missing_proof() {
     let status = source(1, 20);
     let first = assignment(DefinitionKind::Index, 1);

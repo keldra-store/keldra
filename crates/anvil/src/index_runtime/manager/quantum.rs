@@ -51,12 +51,26 @@ impl SourceWorkQuantum {
             .filter(|bytes| *bytes > 0)
     }
 
-    pub(super) fn advance_page(&mut self, bytes: u64) -> Result<SourceWorkBoundary, Status> {
+    pub(super) fn advance_page(
+        &mut self,
+        wire_bytes: u64,
+        source_payload_bytes: u64,
+    ) -> Result<SourceWorkBoundary, Status> {
+        let remaining = self.remaining().ok_or_else(|| {
+            Status::data_loss("index journal page advanced a completed work quantum")
+        })?;
+        if wire_bytes > remaining {
+            return Err(Status::data_loss(
+                "index journal page exceeded its remaining wire credit",
+            ));
+        }
+        let charged = wire_bytes
+            .checked_add(source_payload_bytes)
+            .ok_or_else(|| Status::resource_exhausted("index source work quantum overflow"))?;
         self.consumed = self
             .consumed
-            .checked_add(bytes)
-            .filter(|consumed| *consumed <= self.limit)
-            .ok_or_else(|| Status::data_loss("index journal page exceeded its work quantum"))?;
+            .checked_add(charged)
+            .ok_or_else(|| Status::resource_exhausted("index source work quantum overflow"))?;
         Ok(self.boundary())
     }
 
@@ -66,19 +80,26 @@ impl SourceWorkQuantum {
         self.consumed > 0 && required_bytes <= self.limit
     }
 
-    /// Snapshot frame credit is fixed when the stream opens. The caller yields
-    /// immediately after crossing the limit, so prior work below one quantum
-    /// plus one bounded frame is strictly below two quanta (32 MiB at the
-    /// default maximum).
-    pub(super) fn advance_frame(&mut self, bytes: u64) -> Result<SourceWorkBoundary, Status> {
-        if bytes > self.maximum_frame_bytes {
+    /// Snapshot wire credit is fixed when the stream opens. Payload bytes are
+    /// known only after the complete frame has been resolved, so one frame may
+    /// cross the work limit and then must yield. This keeps arbitrarily large
+    /// objects processable without letting later frames silently join them.
+    pub(super) fn advance_frame(
+        &mut self,
+        wire_bytes: u64,
+        source_payload_bytes: u64,
+    ) -> Result<SourceWorkBoundary, Status> {
+        if wire_bytes > self.maximum_frame_bytes {
             return Err(Status::data_loss(
                 "index snapshot frame exceeded its configured wire limit",
             ));
         }
+        let charged = wire_bytes
+            .checked_add(source_payload_bytes)
+            .ok_or_else(|| Status::resource_exhausted("index source work quantum overflow"))?;
         self.consumed = self
             .consumed
-            .checked_add(bytes)
+            .checked_add(charged)
             .ok_or_else(|| Status::resource_exhausted("index source work quantum overflow"))?;
         Ok(self.boundary())
     }
@@ -106,13 +127,13 @@ mod tests {
 
         for _ in 0..31 {
             assert_eq!(
-                quantum.advance_page(512 * 1024).unwrap(),
+                quantum.advance_page(512 * 1024, 0).unwrap(),
                 SourceWorkBoundary::Continue
             );
         }
         assert_eq!(quantum.remaining(), Some(512 * 1024));
         assert_eq!(
-            quantum.advance_page(512 * 1024).unwrap(),
+            quantum.advance_page(512 * 1024, 0).unwrap(),
             SourceWorkBoundary::SealAndYield
         );
         assert_eq!(quantum.remaining(), None);
@@ -122,18 +143,31 @@ mod tests {
     fn journal_page_cannot_cross_the_exact_yield_boundary() {
         let mut quantum = SourceWorkQuantum::from_budget_limit(KIND_BUDGET);
         assert_eq!(
-            quantum.advance_page(MAX_SOURCE_WIRE_BYTES - 1).unwrap(),
+            quantum.advance_page(MAX_SOURCE_WIRE_BYTES - 1, 0).unwrap(),
             SourceWorkBoundary::Continue
         );
 
-        let error = quantum.advance_page(2).unwrap_err();
+        let error = quantum.advance_page(2, 0).unwrap_err();
         assert_eq!(error.code(), tonic::Code::DataLoss);
+    }
+
+    #[test]
+    fn source_payload_pressure_yields_after_one_complete_page() {
+        let mut quantum = SourceWorkQuantum::from_budget_limit(KIND_BUDGET);
+        assert_eq!(
+            quantum
+                .advance_page(512 * 1024, MAX_SOURCE_WIRE_BYTES)
+                .unwrap(),
+            SourceWorkBoundary::SealAndYield
+        );
+        assert!(quantum.consumed > quantum.limit);
+        assert_eq!(quantum.remaining(), None);
     }
 
     #[test]
     fn a_complete_change_larger_than_remaining_credit_starts_the_next_quantum() {
         let mut quantum = SourceWorkQuantum::from_budget_limit(KIND_BUDGET);
-        quantum.advance_page(MAX_SOURCE_WIRE_BYTES - 1).unwrap();
+        quantum.advance_page(MAX_SOURCE_WIRE_BYTES - 1, 0).unwrap();
 
         assert!(quantum.defer_page_to_next_quantum(2));
         assert!(!quantum.defer_page_to_next_quantum(MAX_SOURCE_WIRE_BYTES + 1));
@@ -144,12 +178,12 @@ mod tests {
     fn snapshot_frames_yield_after_one_bounded_overshoot() {
         let mut quantum = SourceWorkQuantum::from_budget_limit(KIND_BUDGET);
         assert_eq!(
-            quantum.advance_frame(MAX_SOURCE_WIRE_BYTES - 1).unwrap(),
+            quantum.advance_frame(MAX_SOURCE_WIRE_BYTES - 1, 0).unwrap(),
             SourceWorkBoundary::Continue
         );
 
         assert_eq!(
-            quantum.advance_frame(MAX_SOURCE_WIRE_BYTES).unwrap(),
+            quantum.advance_frame(MAX_SOURCE_WIRE_BYTES, 0).unwrap(),
             SourceWorkBoundary::SealAndYield
         );
         assert!(quantum.consumed < MAX_SOURCE_WIRE_BYTES * 2);
@@ -159,9 +193,20 @@ mod tests {
     fn snapshot_frame_cannot_exceed_its_stream_bound() {
         let mut quantum = SourceWorkQuantum::from_budget_limit(KIND_BUDGET);
         let error = quantum
-            .advance_frame(MAX_SOURCE_WIRE_BYTES + 1)
+            .advance_frame(MAX_SOURCE_WIRE_BYTES + 1, 0)
             .unwrap_err();
         assert_eq!(error.code(), tonic::Code::DataLoss);
+    }
+
+    #[test]
+    fn snapshot_payload_is_charged_without_rejecting_one_large_frame() {
+        let mut quantum = SourceWorkQuantum::from_wire_limit(MAX_SOURCE_WIRE_BYTES);
+        assert_eq!(
+            quantum
+                .advance_frame(1024, MAX_SOURCE_WIRE_BYTES * 2)
+                .unwrap(),
+            SourceWorkBoundary::SealAndYield
+        );
     }
 
     #[test]
@@ -175,18 +220,20 @@ mod tests {
         let mut observed = SourceWorkQuantum::from_wire_limit(DERIVED_WIRE_LIMIT);
         assert_eq!(observed.limit, DERIVED_WIRE_LIMIT);
         assert_eq!(
-            observed.advance_frame(OBSERVED_VALID_FRAME_BYTES).unwrap(),
+            observed
+                .advance_frame(OBSERVED_VALID_FRAME_BYTES, 0)
+                .unwrap(),
             SourceWorkBoundary::Continue
         );
 
         let mut exact = SourceWorkQuantum::from_wire_limit(DERIVED_WIRE_LIMIT);
         assert_eq!(
-            exact.advance_frame(DERIVED_WIRE_LIMIT).unwrap(),
+            exact.advance_frame(DERIVED_WIRE_LIMIT, 0).unwrap(),
             SourceWorkBoundary::SealAndYield
         );
 
         let error = SourceWorkQuantum::from_wire_limit(DERIVED_WIRE_LIMIT)
-            .advance_frame(DERIVED_WIRE_LIMIT + 1)
+            .advance_frame(DERIVED_WIRE_LIMIT + 1, 0)
             .unwrap_err();
         assert_eq!(error.code(), tonic::Code::DataLoss);
     }
@@ -196,12 +243,12 @@ mod tests {
         let mut quantum = SourceWorkQuantum::for_rebuild_turn(KIND_BUDGET, MAX_SOURCE_WIRE_BYTES);
         for _ in 0..15 {
             assert_eq!(
-                quantum.advance_frame(MAX_SOURCE_WIRE_BYTES).unwrap(),
+                quantum.advance_frame(MAX_SOURCE_WIRE_BYTES, 0).unwrap(),
                 SourceWorkBoundary::Continue
             );
         }
         assert_eq!(
-            quantum.advance_frame(MAX_SOURCE_WIRE_BYTES).unwrap(),
+            quantum.advance_frame(MAX_SOURCE_WIRE_BYTES, 0).unwrap(),
             SourceWorkBoundary::SealAndYield
         );
         assert_eq!(quantum.consumed, KIND_BUDGET);
@@ -210,7 +257,7 @@ mod tests {
     #[test]
     fn rebuild_turn_still_rejects_one_frame_above_the_scanner_bound() {
         let error = SourceWorkQuantum::for_rebuild_turn(KIND_BUDGET, MAX_SOURCE_WIRE_BYTES)
-            .advance_frame(MAX_SOURCE_WIRE_BYTES + 1)
+            .advance_frame(MAX_SOURCE_WIRE_BYTES + 1, 0)
             .unwrap_err();
         assert_eq!(error.code(), tonic::Code::DataLoss);
     }

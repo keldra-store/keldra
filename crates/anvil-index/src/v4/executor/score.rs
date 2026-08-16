@@ -4,13 +4,11 @@ use std::sync::Arc;
 use crate::IndexError;
 
 use super::super::{
-    ArtifactDirectoryRead, ComponentKind, ComponentStream, DocId, FieldId, IndexSemantics,
-    NativeQuery, NativeQueryStatisticsRecorder, PositionEntry, PositionsBlock, Schema,
-    SegmentDescriptor, SegmentStatistics, VectorMetric, component_ordinal_key,
-    read_artifact_component,
+    ArtifactDirectoryRead, DocId, FieldId, IndexSemantics, NativeQuery,
+    NativeQueryStatisticsRecorder, Schema, SegmentDescriptor, SegmentStatistics, VectorMetric,
 };
-use super::plan::{PhraseFieldPlan, TextTermPlan};
-use super::posting::{PostingStream, component_root};
+use super::plan::TextTermPlan;
+use super::posting::PostingStream;
 use super::values::SegmentValues;
 
 #[derive(Clone, Default)]
@@ -68,10 +66,8 @@ impl GlobalTextStatistics {
 
 pub(super) struct SegmentScorer<'a, D> {
     directory: &'a D,
-    segment: &'a SegmentDescriptor,
+    document_count: u32,
     terms: Vec<ScoringCursor<'a, D>>,
-    phrase_fields: Vec<PhraseCursor<'a, D>>,
-    statistics: NativeQueryStatisticsRecorder,
 }
 
 struct ScoringCursor<'a, D> {
@@ -80,17 +76,11 @@ struct ScoringCursor<'a, D> {
     cursor: PostingStream<'a, D>,
 }
 
-struct PhraseCursor<'a, D> {
-    field_id: FieldId,
-    terms: Vec<PostingStream<'a, D>>,
-}
-
 impl<'a, D: ArtifactDirectoryRead> SegmentScorer<'a, D> {
     pub(super) fn new(
         directory: &'a D,
         segment: &'a SegmentDescriptor,
         terms: Vec<TextTermPlan>,
-        phrase_fields: Vec<PhraseFieldPlan>,
         statistics: &NativeQueryStatisticsRecorder,
     ) -> Result<Self, IndexError> {
         let terms = terms
@@ -109,79 +99,11 @@ impl<'a, D: ArtifactDirectoryRead> SegmentScorer<'a, D> {
                 })
             })
             .collect::<Result<Vec<_>, IndexError>>()?;
-        let phrase_fields = phrase_fields
-            .into_iter()
-            .map(|field| {
-                Ok(PhraseCursor {
-                    field_id: field.field_id,
-                    terms: field
-                        .terms
-                        .into_iter()
-                        .map(|postings| {
-                            PostingStream::new(
-                                directory,
-                                segment,
-                                field.field_id,
-                                postings,
-                                statistics.clone(),
-                            )
-                        })
-                        .collect::<Result<Vec<_>, IndexError>>()?,
-                })
-            })
-            .collect::<Result<Vec<_>, IndexError>>()?;
         Ok(Self {
             directory,
-            segment,
+            document_count: segment.document_count,
             terms,
-            phrase_fields,
-            statistics: statistics.clone(),
         })
-    }
-
-    pub(super) async fn phrase_matches(&mut self, doc_id: DocId) -> Result<bool, IndexError> {
-        if self.phrase_fields.is_empty() {
-            return Ok(true);
-        }
-        self.statistics.two_phase_verification();
-        for field in &mut self.phrase_fields {
-            let mut positions = Vec::with_capacity(field.terms.len());
-            let mut complete = true;
-            for term in &mut field.terms {
-                if term.advance(doc_id).await? != Some(doc_id) {
-                    complete = false;
-                    break;
-                }
-                let ordinal = term
-                    .current_component_ordinal()
-                    .ok_or(IndexError::InvalidFormat(
-                        "position lookup has no posting ordinal",
-                    ))?;
-                let Some(values) = positions_for(
-                    self.directory,
-                    self.segment,
-                    field.field_id,
-                    ordinal,
-                    doc_id,
-                )
-                .await?
-                else {
-                    complete = false;
-                    break;
-                };
-                positions.push(values);
-            }
-            if complete {
-                let matched = self
-                    .directory
-                    .run_query_cpu(move || Ok(positional_sequence(&positions)))
-                    .await?;
-                if matched {
-                    return Ok(true);
-                }
-            }
-        }
-        Ok(false)
     }
 
     pub(super) async fn score(
@@ -275,14 +197,13 @@ impl<'a, D: ArtifactDirectoryRead> SegmentScorer<'a, D> {
         k1: f64,
         b: f64,
     ) -> Result<ScoreImpactWindow, IndexError> {
-        let mut through = self
-            .segment
-            .document_count
-            .checked_sub(1)
-            .map(DocId::new)
-            .ok_or(IndexError::InvalidFormat(
-                "full-text candidate belongs to an empty segment",
-            ))?;
+        let mut through =
+            self.document_count
+                .checked_sub(1)
+                .map(DocId::new)
+                .ok_or(IndexError::InvalidFormat(
+                    "full-text candidate belongs to an empty segment",
+                ))?;
         let mut upper_bound = 0.0f64;
         for term in &mut self.terms {
             let window = term.cursor.impact_window(target).await?;
@@ -337,11 +258,6 @@ impl<'a, D: ArtifactDirectoryRead> SegmentScorer<'a, D> {
         for term in &mut self.terms {
             term.cursor.release_decoded()?;
         }
-        for field in &mut self.phrase_fields {
-            for term in &mut field.terms {
-                term.release_decoded()?;
-            }
-        }
         Ok(())
     }
 }
@@ -387,65 +303,6 @@ fn round_score_up(value: f64) -> Result<f32, IndexError> {
     } else {
         Ok(rounded)
     }
-}
-
-async fn positions_for<D: ArtifactDirectoryRead>(
-    directory: &D,
-    segment: &SegmentDescriptor,
-    field_id: FieldId,
-    ordinal: u32,
-    doc_id: DocId,
-) -> Result<Option<Vec<u32>>, IndexError> {
-    let Ok(root) = component_root(segment, ComponentKind::POSITIONS, Some(field_id)) else {
-        return Ok(None);
-    };
-    let key = component_ordinal_key(ordinal).to_vec();
-    let mut stream = ComponentStream::new(
-        directory,
-        segment.identity,
-        ComponentKind::POSITIONS,
-        root,
-        Some(key.clone()),
-        Some(key.clone()),
-    )?;
-    let Some(leaf) = stream.next_leaf().await? else {
-        return Ok(None);
-    };
-    if leaf.minimum_key != key || leaf.maximum_key != key || stream.next_leaf().await?.is_some() {
-        return Err(IndexError::InvalidFormat("position stream ordinal"));
-    }
-    let loaded = read_artifact_component(
-        directory,
-        segment.identity,
-        &leaf.descriptor,
-        ComponentKind::POSITIONS,
-    )
-    .await?;
-    let block = directory
-        .run_query_cpu(move || PositionsBlock::decode_payload(&loaded.payload))
-        .await?;
-    Ok(block
-        .entries()
-        .binary_search_by_key(&doc_id, |entry: &PositionEntry| entry.doc_id)
-        .ok()
-        .map(|index| block.entries()[index].positions.clone()))
-}
-
-fn positional_sequence(positions: &[Vec<u32>]) -> bool {
-    let Some(first) = positions.first() else {
-        return false;
-    };
-    first.iter().any(|start| {
-        positions
-            .iter()
-            .enumerate()
-            .skip(1)
-            .all(|(offset, values)| {
-                start
-                    .checked_add(offset as u32)
-                    .is_some_and(|expected| values.binary_search(&expected).is_ok())
-            })
-    })
 }
 
 fn vector_field(schema: &Schema) -> Result<FieldId, IndexError> {

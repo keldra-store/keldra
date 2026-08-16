@@ -286,10 +286,7 @@ pub(crate) fn encode_artifact(
     out: &mut Encoder,
     descriptor: &ArtifactDescriptor,
 ) -> Result<(), IndexError> {
-    out.string(&descriptor.path)?;
-    out.u64(descriptor.object_version);
-    out.raw(&descriptor.object_content_hash);
-    out.u64(descriptor.object_length);
+    out.u32(descriptor.pack_ordinal);
     out.u64(descriptor.offset);
     out.u64(descriptor.encoded_length);
     out.u64(descriptor.logical_length);
@@ -303,13 +300,7 @@ pub(crate) fn decode_artifact(
     index_id: u64,
     input: &mut Decoder<'_>,
 ) -> Result<ArtifactDescriptor, IndexError> {
-    let path = input.string()?;
-    let object_version = input.u64()?;
-    let object_content_hash = input
-        .take(32)?
-        .try_into()
-        .map_err(|_| IndexError::InvalidFormat("artifact object hash"))?;
-    let object_length = input.u64()?;
+    let pack_ordinal = input.u32()?;
     let offset = input.u64()?;
     let encoded_length = input.u64()?;
     let logical_length = input.u64()?;
@@ -322,10 +313,7 @@ pub(crate) fn decode_artifact(
         .map_err(|_| IndexError::InvalidFormat("artifact checksum"))?;
     ArtifactDescriptor::new(
         index_id,
-        path,
-        object_version,
-        object_content_hash,
-        object_length,
+        pack_ordinal,
         offset,
         encoded_length,
         logical_length,
@@ -338,23 +326,8 @@ pub(crate) fn decode_artifact(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v4::artifact_path;
-
     fn artifact(index_id: u64, kind: ComponentKind, hash: u8) -> ArtifactDescriptor {
-        ArtifactDescriptor::new(
-            index_id,
-            artifact_path(index_id, [hash; 32]),
-            2,
-            [hash; 32],
-            4096,
-            0,
-            120,
-            0,
-            kind,
-            1,
-            [9; 32],
-        )
-        .unwrap()
+        ArtifactDescriptor::new(index_id, u32::from(hash), 0, 120, 0, kind, 1, [9; 32]).unwrap()
     }
 
     #[test]

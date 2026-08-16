@@ -1,13 +1,11 @@
 use std::collections::BTreeMap;
-use std::future::Future;
-use std::pin::Pin;
 
 use crate::IndexError;
 
 use super::super::{
     ArtifactDirectoryRead, DocId, DocValueBlock, DocValueCell, DocumentIdentity, FieldId,
-    IdentityBlock, LiveMaskBlock, NativeQueryStatisticsRecorder, NormBlock, Predicate, RangeBound,
-    ScalarValue, SegmentComponentReader, SegmentDescriptor, SortValue, VectorBlock,
+    IdentityBlock, LiveMaskBlock, NativeQueryStatisticsRecorder, NormBlock, ScalarValue,
+    SegmentComponentReader, SegmentDescriptor, SortValue, VectorBlock,
 };
 
 pub(super) struct SegmentValues<'a, D> {
@@ -143,76 +141,6 @@ impl<'a, D: ArtifactDirectoryRead> SegmentValues<'a, D> {
         Ok(SortValue::Value(cell.values[0].clone()))
     }
 
-    pub(super) async fn predicate(
-        &mut self,
-        predicate: &Predicate,
-        doc_id: DocId,
-    ) -> Result<bool, IndexError> {
-        self.predicate_boxed(predicate, doc_id).await
-    }
-
-    fn predicate_boxed<'b>(
-        &'b mut self,
-        predicate: &'b Predicate,
-        doc_id: DocId,
-    ) -> Pin<Box<dyn Future<Output = Result<bool, IndexError>> + Send + 'b>> {
-        Box::pin(async move {
-            Ok(match predicate {
-                Predicate::Equal {
-                    field_id, value, ..
-                } => matches_value(&self.doc_value(*field_id, doc_id).await?, value),
-                Predicate::In {
-                    field_id, values, ..
-                } => {
-                    let cell = self.doc_value(*field_id, doc_id).await?;
-                    values.iter().any(|value| matches_value(&cell, value))
-                }
-                Predicate::Prefix {
-                    field_id, prefix, ..
-                } => self.doc_value(*field_id, doc_id).await?.values.iter().any(|value| {
-                    matches!(value, ScalarValue::String(value) if value.starts_with(prefix))
-                }),
-                Predicate::Range {
-                    field_id,
-                    lower,
-                    upper,
-                    ..
-                } => self.doc_value(*field_id, doc_id).await?.values.iter().any(|value| {
-                    in_range(value, lower.as_ref(), upper.as_ref())
-                }),
-                Predicate::Exists { field_id, .. } => {
-                    self.doc_value(*field_id, doc_id).await?.present
-                }
-                Predicate::FullText { .. } | Predicate::Phrase { .. } => {
-                    return Err(IndexError::InvalidQuery(
-                        "full-text predicates require the posting/position executor".into(),
-                    ));
-                }
-                Predicate::And(children) => {
-                    let mut matched = true;
-                    for child in children {
-                        if !self.predicate_boxed(child, doc_id).await? {
-                            matched = false;
-                            break;
-                        }
-                    }
-                    matched
-                }
-                Predicate::Or(children) => {
-                    let mut matched = false;
-                    for child in children {
-                        if self.predicate_boxed(child, doc_id).await? {
-                            matched = true;
-                            break;
-                        }
-                    }
-                    matched
-                }
-                Predicate::Not(child) => !self.predicate_boxed(child, doc_id).await?,
-            })
-        })
-    }
-
     pub(super) async fn norm(
         &mut self,
         field_id: FieldId,
@@ -279,25 +207,6 @@ impl<'a, D: ArtifactDirectoryRead> SegmentValues<'a, D> {
         self.norms.clear();
         self.vectors.clear();
     }
-}
-
-fn matches_value(cell: &DocValueCell, value: &ScalarValue) -> bool {
-    match value {
-        ScalarValue::Null => cell.present && cell.null,
-        value => cell.values.iter().any(|candidate| candidate == value),
-    }
-}
-
-fn in_range(value: &ScalarValue, lower: Option<&RangeBound>, upper: Option<&RangeBound>) -> bool {
-    let same_type =
-        |other: &ScalarValue| std::mem::discriminant(value) == std::mem::discriminant(other);
-    lower.is_none_or(|bound| {
-        same_type(&bound.value)
-            && (value > &bound.value || bound.inclusive && value == &bound.value)
-    }) && upper.is_none_or(|bound| {
-        same_type(&bound.value)
-            && (value < &bound.value || bound.inclusive && value == &bound.value)
-    })
 }
 
 fn norm_contains(block: &NormBlock, doc_id: DocId) -> bool {

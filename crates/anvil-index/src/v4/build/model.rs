@@ -2,10 +2,10 @@ use crate::FIXED_INDEX_SEAL_WORKSPACE_BYTES;
 use crate::IndexError;
 
 use super::super::{
-    DocValueCell, FieldId, INDEX_COMPONENT_BYTES, INDEX_TERM_BYTES,
-    ObjectIdentity, ScalarValue, TERM_TYPE_BOOLEAN, TERM_TYPE_FIELD_PRESENCE,
-    TERM_TYPE_HASHED_KEYWORD, TERM_TYPE_NULL, TERM_TYPE_NUMBER, TERM_TYPE_SIGNED, TERM_TYPE_STRING,
-    TERM_TYPE_TEXT, TERM_TYPE_UNSIGNED, canonical_term_key,
+    DocValueCell, FieldId, INDEX_COMPONENT_BYTES, INDEX_TERM_BYTES, ObjectIdentity, ScalarValue,
+    TERM_TYPE_BOOLEAN, TERM_TYPE_FIELD_PRESENCE, TERM_TYPE_HASHED_KEYWORD, TERM_TYPE_NULL,
+    TERM_TYPE_NUMBER, TERM_TYPE_SIGNED, TERM_TYPE_STRING, TERM_TYPE_TEXT, TERM_TYPE_UNSIGNED,
+    canonical_term_key,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -182,9 +182,7 @@ impl ProjectedRecord {
                 || point.values.iter().any(|value| {
                     !matches!(
                         value,
-                        ScalarValue::Signed(_)
-                            | ScalarValue::Unsigned(_)
-                            | ScalarValue::Number(_)
+                        ScalarValue::Signed(_) | ScalarValue::Unsigned(_) | ScalarValue::Number(_)
                     )
                 })
             {
@@ -212,9 +210,7 @@ impl ProjectedRecord {
     }
 
     pub(crate) fn retained_capacity_bytes(&self) -> Result<usize, IndexError> {
-        let mut bytes = self
-            .order_key
-            .capacity();
+        let mut bytes = self.order_key.capacity();
         if let Some(result) = &self.result_identity {
             bytes = bytes
                 .checked_add(result.path.capacity())
@@ -400,10 +396,9 @@ mod tests {
 
     #[test]
     fn projected_keyword_accepts_the_exact_raw_length_boundary() {
-        let (term_type, term) = super::super::super::scalar_term(&ScalarValue::String(
-            "x".repeat(INDEX_TERM_BYTES),
-        ))
-        .unwrap();
+        let (term_type, term) =
+            super::super::super::scalar_term(&ScalarValue::String("x".repeat(INDEX_TERM_BYTES)))
+                .unwrap();
         assert_eq!(term.len(), INDEX_TERM_BYTES + 1);
         let projected = ProjectedTerm {
             field_id: FieldId::new(1),

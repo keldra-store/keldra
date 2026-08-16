@@ -36,6 +36,7 @@ pub(super) struct IncidentReport {
     consecutive_pages: PaginationEvidence,
     zero_hit_sparse_conjunction: QueryEvidence,
     unselective_arbitrary_sort: QueryEvidence,
+    exact_computations: ComputationEvidence,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -61,6 +62,16 @@ struct PaginationEvidence {
     page_one_elapsed_milliseconds: f64,
     page_two_elapsed_milliseconds: f64,
     generation: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ComputationEvidence {
+    returned_hits: usize,
+    exact_order: bool,
+    elapsed_milliseconds: f64,
+    generation: u64,
+    result_sha256: String,
+    matching_documents: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -108,17 +119,14 @@ pub(super) async fn run(
     );
 
     let incident_query = incident_query();
-    let mut limit_four_query = incident_query.clone();
-    limit_four_query.facets.push(IndexFacetRequest {
-        field: "active".into(),
-        limit: 1,
-    });
-    limit_four_query.aggregates.push(IndexAggregateRequest {
-        field: "score".into(),
-        operation: IndexAggregateOperation::Count as i32,
-    });
-    let (limit_four, limit_four_elapsed) =
-        execute(client, bucket, limit_four_query, INCIDENT_LIMIT, Vec::new()).await?;
+    let (limit_four, limit_four_elapsed) = execute(
+        client,
+        bucket,
+        incident_query.clone(),
+        INCIDENT_LIMIT,
+        Vec::new(),
+    )
+    .await?;
     let limit_four_expected = &incident_expected[..usize::try_from(INCIDENT_LIMIT)?];
     let limit_four_ids = validate_response(
         &limit_four,
@@ -126,8 +134,6 @@ pub(super) async fn run(
         initial_versions,
         expected_sources,
     )?;
-    validate_computations(&limit_four, incident_expected.len())?;
-
     let (page_one, page_one_elapsed) = execute(
         client,
         bucket,
@@ -197,8 +203,28 @@ pub(super) async fn run(
         expected_sources,
     )?;
 
+    // Keep the production-shaped limit-four query free of computation work so
+    // its read-amplification evidence measures page selection. Exact facets and
+    // aggregates deliberately visit the complete authorized match set and are
+    // qualified separately.
+    let (computations, computations_elapsed) = execute(
+        client,
+        bucket,
+        computation_query(),
+        INCIDENT_LIMIT,
+        Vec::new(),
+    )
+    .await?;
+    let computation_ids = validate_response(
+        &computations,
+        limit_four_expected,
+        initial_versions,
+        expected_sources,
+    )?;
+    validate_computations(&computations, incident_expected.len())?;
+
     let identity = freshness(&limit_four)?;
-    for response in [&page_one, &page_two, &zero_hit, &arbitrary] {
+    for response in [&page_one, &page_two, &zero_hit, &arbitrary, &computations] {
         let observed = freshness(response)?;
         ensure!(
             observed.index_id == identity.index_id
@@ -255,6 +281,14 @@ pub(super) async fn run(
             generation: freshness(&arbitrary)?.generation,
             result_sha256: result_sha256(&arbitrary_ids),
         },
+        exact_computations: ComputationEvidence {
+            returned_hits: computation_ids.len(),
+            exact_order: true,
+            elapsed_milliseconds: computations_elapsed,
+            generation: freshness(&computations)?.generation,
+            result_sha256: result_sha256(&computation_ids),
+            matching_documents: incident_expected.len(),
+        },
     })
 }
 
@@ -305,6 +339,19 @@ fn incident_query() -> TypedJsonIndexQuery {
         facets: Vec::new(),
         aggregates: Vec::new(),
     }
+}
+
+fn computation_query() -> TypedJsonIndexQuery {
+    let mut query = incident_query();
+    query.facets.push(IndexFacetRequest {
+        field: "active".into(),
+        limit: 1,
+    });
+    query.aggregates.push(IndexAggregateRequest {
+        field: "score".into(),
+        operation: IndexAggregateOperation::Count as i32,
+    });
+    query
 }
 
 fn zero_hit_query() -> TypedJsonIndexQuery {
@@ -452,4 +499,29 @@ fn result_sha256(record_ids: &[u64]) -> String {
         hash.update(record_id.to_be_bytes());
     }
     format!("sha256:{}", hex::encode(hash.finalize()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn page_selection_and_exact_computations_are_distinct_queries() {
+        let selection = incident_query();
+        assert!(selection.facets.is_empty());
+        assert!(selection.aggregates.is_empty());
+
+        let computations = computation_query();
+        assert_eq!(computations.predicates, selection.predicates);
+        assert_eq!(computations.order, selection.order);
+        assert_eq!(computations.facets.len(), 1);
+        assert_eq!(computations.facets[0].field, "active");
+        assert_eq!(computations.facets[0].limit, 1);
+        assert_eq!(computations.aggregates.len(), 1);
+        assert_eq!(computations.aggregates[0].field, "score");
+        assert_eq!(
+            computations.aggregates[0].operation,
+            IndexAggregateOperation::Count as i32
+        );
+    }
 }

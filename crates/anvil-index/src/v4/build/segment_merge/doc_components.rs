@@ -27,6 +27,8 @@ pub(super) struct FieldCounts {
     pub(super) number_values: u64,
     pub(super) unsigned_values: u64,
     pub(super) string_values: u64,
+    pub(super) term_presence_marker: bool,
+    pub(super) term_fallback_present_documents: u64,
 }
 
 pub(super) struct BuiltDocStreams {
@@ -195,9 +197,7 @@ where
         for value in &cell.values {
             let count = match value {
                 ScalarValue::Null => {
-                    return Err(IndexError::InvalidFormat(
-                        "doc-value contains inline null",
-                    ));
+                    return Err(IndexError::InvalidFormat("doc-value contains inline null"));
                 }
                 ScalarValue::Boolean(_) => &mut counts.boolean_values,
                 ScalarValue::Signed(_) | ScalarValue::Number(_) => &mut counts.number_values,
@@ -259,8 +259,7 @@ async fn publish_doc_values<D: ArtifactDirectoryRead, S: ComponentBatchSink>(
     let values = std::mem::take(values);
     let payload = directory
         .run_query_cpu(move || {
-            DocValueBlock::new(field_id, DocId::new(first), multi_valued, values)?
-                .encode_payload()
+            DocValueBlock::new(field_id, DocId::new(first), multi_valued, values)?.encode_payload()
         })
         .await?;
     push_doc_block(publisher, first, count, payload).await?;

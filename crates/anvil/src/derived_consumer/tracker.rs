@@ -125,7 +125,13 @@ impl SourceProgress {
             .checked_add(1)
             .ok_or(SparseTrackerError::OffsetOverflow)?;
         if required_next <= floor_next || required_next > settled_next {
-            return Err(SparseTrackerError::RoutedOffset);
+            return Err(SparseTrackerError::RoutedOffset {
+                source_id: self.status.source_id,
+                identity,
+                required_next,
+                floor_next,
+                settled_next,
+            });
         }
         if proof_next > settled_next {
             return Err(SparseTrackerError::EvidenceOffset);
@@ -572,8 +578,16 @@ pub(crate) enum SparseTrackerError {
     EvidenceSourceChanged,
     #[error("derived proof is beyond the settled source tail")]
     EvidenceOffset,
-    #[error("derived routed offset is outside retained settled history")]
-    RoutedOffset,
+    #[error(
+        "derived routed offset is outside retained settled history: source={source_id:?} definition={identity:?} required_next={required_next} floor_next={floor_next} settled_next={settled_next}"
+    )]
+    RoutedOffset {
+        source_id: SourceId,
+        identity: DerivedDefinitionIdentity,
+        required_next: u64,
+        floor_next: u64,
+        settled_next: u64,
+    },
     #[error("derived source incarnation changed")]
     SourceChanged,
     #[error("derived source status regressed")]

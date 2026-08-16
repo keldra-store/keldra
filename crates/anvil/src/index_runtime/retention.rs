@@ -1,19 +1,12 @@
 //! Node-wide bounded retention of ordinary format-v4 index artifacts.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::VecDeque;
 use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anvil_index::IndexError;
-use anvil_index::v4::build::{MergeScratchFile, MergeScratchSpace};
-use anvil_index::v4::{
-    ArtifactDescriptor, ComponentKind, INDEX_COMPONENT_BYTES, RoutingNode, SegmentIdentity,
-    decode_component,
-};
-use anvil_store::{
-    BlobRef, DefinitionKind, IndexGenerationRetentionDue, ObjectKey, Store, VersionId,
-};
+use anvil_index::v4::{ArtifactPackReference, INDEX_COMPONENT_BYTES};
+use anvil_store::{DefinitionKind, IndexGenerationRetentionDue, ObjectKey, Store, VersionId};
 use tonic::Status;
 
 use crate::cluster_object_read::ClusterObjectReader;
@@ -22,9 +15,11 @@ use crate::index_config::IndexRuntimeConfig;
 use crate::index_service::{StoredIndexDefinition, definition_path};
 use crate::logical_name_resolution::LogicalNameResolver;
 
-use super::cache::{IndexMergeScratchFile, IndexMergeScratchSpace};
+use super::cache::IndexMergeScratchSpace;
 use super::coordination::load_definition_locator_object;
-use super::generation::{IndexCurrentPointer, IndexGenerationManifest, ManifestReference};
+use super::generation::{
+    IndexCurrentPointer, IndexGenerationManifest, LocatorPackOwnership, ManifestReference,
+};
 use super::publication::{
     IndexArtifactDelete, IndexArtifactRouter, artifact_hash_from_path, current_path,
     is_manifest_artifact_path, manifest_hash_from_path,
@@ -49,7 +44,6 @@ const DEFAULT_RETENTION_TICK_INTERVAL: Duration = Duration::from_millis(100);
 const DEFAULT_RETENTION_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const RETAINED_MANIFEST_CLASS: u8 = 1;
 const RETAINED_ARTIFACT_CLASS: u8 = 2;
-const ROUTING_SCRATCH_RECORD_BYTES: usize = 168;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct IndexRetentionBudget {
@@ -772,62 +766,9 @@ impl IndexGenerationRetention {
             return Ok((RetentionPhase::Discover(discovery), 0));
         }
 
-        let routing = match discovery.pending_routing.pop().await {
-            Ok(routing) => routing,
-            Err(error) => {
-                return Err(RetentionStepError::new(
-                    RetentionPhase::Discover(discovery),
-                    error,
-                ));
-            }
-        };
-        if let Some(routing) = routing {
-            if !work.can_charge(routing.artifact.object_length) {
-                if let Err(error) = discovery.pending_routing.requeue(routing).await {
-                    return Err(RetentionStepError::new(
-                        RetentionPhase::Discover(discovery),
-                        error,
-                    ));
-                }
-                return Ok((RetentionPhase::Discover(discovery), 0));
-            }
-            let loaded = match self
-                .within(work, self.load_routing_node(job, &routing))
-                .await
-            {
-                Ok(loaded) => loaded,
-                Err(error) => {
-                    if let Err(queue_error) = discovery.pending_routing.requeue(routing).await {
-                        return Err(RetentionStepError::new(
-                            RetentionPhase::Discover(discovery),
-                            queue_error,
-                        ));
-                    }
-                    return Err(RetentionStepError::new(
-                        RetentionPhase::Discover(discovery),
-                        error,
-                    ));
-                }
-            };
-            work.charge(routing.artifact.object_length);
-            if let Err(error) = discovery.protect_routing_children(&routing, loaded).await {
-                if let Err(queue_error) = discovery.pending_routing.requeue(routing).await {
-                    return Err(RetentionStepError::new(
-                        RetentionPhase::Discover(discovery),
-                        queue_error,
-                    ));
-                }
-                return Err(RetentionStepError::new(
-                    RetentionPhase::Discover(discovery),
-                    error,
-                ));
-            }
-            return Ok((RetentionPhase::Discover(discovery), 0));
-        }
-
         tracing::debug!(
             index.id = job.definition.index_id,
-            "format-v4 retained artifact graph collected into bounded scratch"
+            "format-v4 retained pack tables collected into bounded scratch"
         );
         Ok((RetentionPhase::Sort(discovery.collector.into_sort()), 0))
     }
@@ -960,16 +901,16 @@ impl IndexGenerationRetention {
             .take()
             .ok_or_else(|| Status::data_loss("retained format-v4 manifest has no payload"))?;
         let mut bytes = Vec::new();
+        let maximum = reference.blob.length.checked_add(1).ok_or_else(|| {
+            Status::resource_exhausted("retained format-v4 manifest length exceeds u64")
+        })?;
         payload
-            .take(INDEX_COMPONENT_BYTES as u64 + 1)
+            .take(maximum)
             .read_to_end(&mut bytes)
             .map_err(|error| Status::internal(format!("read format-v4 manifest: {error}")))?;
-        if bytes.len() > INDEX_COMPONENT_BYTES
-            || bytes.len() as u64 != reference.blob.length
-            || blake3::hash(&bytes).as_bytes() != &reference.blob.hash
-        {
+        if bytes.len() as u64 != reference.blob.length {
             return Err(Status::data_loss(
-                "retained format-v4 manifest bytes differ from their reference",
+                "retained format-v4 manifest length differs from its verified object reference",
             ));
         }
         let manifest = IndexGenerationManifest::decode(&bytes)
@@ -979,110 +920,6 @@ impl IndexGenerationRetention {
             manifest,
             encoded_bytes: bytes.len() as u64,
         })
-    }
-
-    async fn load_routing_node(
-        &self,
-        job: &RetentionJob,
-        routing: &RoutingArtifact,
-    ) -> Result<LoadedRoutingNode, Status> {
-        let descriptor = &routing.artifact;
-        descriptor
-            .validate(job.definition.index_id)
-            .map_err(index_integrity_status)?;
-        let key = ObjectKey::new(
-            &job.definition.tenant,
-            &job.definition.bucket,
-            &descriptor.path,
-        )
-        .map_err(|error| Status::internal(error.to_string()))?;
-        let Some(mut opened) = self
-            .reader
-            .open_stable(
-                &key,
-                job.tenant_id,
-                job.bucket_id,
-                Some(VersionId(descriptor.object_version)),
-            )
-            .await?
-        else {
-            return Err(Status::data_loss(
-                "retained format-v4 routing artifact is absent",
-            ));
-        };
-        let expected_blob = BlobRef {
-            hash: descriptor.object_content_hash,
-            length: descriptor.object_length,
-        };
-        if opened.version.id != VersionId(descriptor.object_version)
-            || opened.version.deleted
-            || opened.version.blob.as_ref() != Some(&expected_blob)
-        {
-            return Err(Status::data_loss(
-                "retained format-v4 routing artifact differs from its exact reference",
-            ));
-        }
-        let mut payload = opened
-            .payload
-            .take()
-            .ok_or_else(|| Status::data_loss("retained routing artifact has no payload"))?;
-        let skipped = std::io::copy(
-            &mut payload.by_ref().take(descriptor.offset),
-            &mut std::io::sink(),
-        )
-        .map_err(|error| Status::internal(format!("seek format-v4 routing artifact: {error}")))?;
-        if skipped != descriptor.offset {
-            return Err(Status::data_loss(
-                "format-v4 routing artifact offset exceeds its object",
-            ));
-        }
-        let mut bytes = Vec::with_capacity(
-            usize::try_from(descriptor.encoded_length)
-                .map_err(|_| Status::resource_exhausted("routing component exceeds platform"))?,
-        );
-        payload
-            .take(descriptor.encoded_length + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|error| {
-                Status::internal(format!("read format-v4 routing artifact: {error}"))
-            })?;
-        if bytes.len() as u64 != descriptor.encoded_length {
-            return Err(Status::data_loss(
-                "format-v4 routing component length differs from its descriptor",
-            ));
-        }
-        let identity = component_identity(&bytes)?;
-        routing.expected_identity.require(identity)?;
-        let decoded = decode_component(
-            &bytes,
-            identity,
-            ComponentKind::ROUTING_NODE,
-            descriptor.codec_version,
-        )
-        .map_err(index_integrity_status)?;
-        if decoded.header.logical_length != descriptor.logical_length
-            || decoded.header.payload_checksum != descriptor.checksum
-        {
-            return Err(Status::data_loss(
-                "format-v4 routing component differs from its descriptor",
-            ));
-        }
-        let node = RoutingNode::decode_payload(job.definition.index_id, decoded.payload)
-            .map_err(index_integrity_status)?;
-        if node.logical_kind() != routing.role {
-            return Err(Status::data_loss(
-                "format-v4 routing tree has the wrong logical component kind",
-            ));
-        }
-        if routing
-            .expected_height
-            .is_some_and(|expected| node.height != expected)
-        {
-            return Err(Status::data_loss(
-                "format-v4 routing tree height is not strictly descending",
-            ));
-        }
-        Ok(LoadedRoutingNode { identity, node })
     }
 
     async fn delete_exact(
@@ -1192,7 +1029,6 @@ struct RetentionDiscovery {
     index_id: u64,
     collector: RetainedObjectCollector,
     pending_manifests: VecDeque<RankedManifest>,
-    pending_routing: RoutingScratchQueue,
 }
 
 impl RetentionDiscovery {
@@ -1215,9 +1051,8 @@ impl RetentionDiscovery {
         ));
         Ok(Self {
             index_id: current.manifest.index_id,
-            collector: RetainedObjectCollector::new(scratch.clone()).await?,
+            collector: RetainedObjectCollector::new(scratch).await?,
             pending_manifests,
-            pending_routing: RoutingScratchQueue::new(scratch).await?,
         })
     }
 
@@ -1235,313 +1070,44 @@ impl RetentionDiscovery {
             reference.blob.length,
             rank,
         )?];
-        let mut routing = Vec::new();
         for segment in &manifest.segments {
-            let expected = ExpectedComponentIdentity::exact(segment.identity);
-            for component in &segment.components {
-                self.prepare_artifact(
-                    rank,
-                    component.artifact.clone(),
-                    component.role,
-                    expected,
-                    None,
-                    &mut records,
-                    &mut routing,
-                )?;
+            for pack in &segment.packs {
+                prepare_pack(self.index_id, rank, pack, &mut records)?;
             }
         }
         for locator in &manifest.locator_roots {
-            self.prepare_artifact(
-                rank,
-                locator.artifact.clone(),
-                ComponentKind::PATH_LOCATOR,
-                ExpectedComponentIdentity::exact(locator.identity),
-                None,
-                &mut records,
-                &mut routing,
-            )?;
-        }
-        self.collector.append(records).await?;
-        self.pending_routing.push_many(routing).await?;
-        Ok(())
-    }
-
-    fn prepare_artifact(
-        &self,
-        rank: usize,
-        artifact: ArtifactDescriptor,
-        role: ComponentKind,
-        expected_identity: ExpectedComponentIdentity,
-        expected_height: Option<u8>,
-        records: &mut Vec<RetainedObjectRecord>,
-        routing: &mut Vec<RoutingArtifact>,
-    ) -> Result<(), Status> {
-        artifact
-            .validate(self.index_id)
-            .map_err(index_integrity_status)?;
-        if artifact.component_kind != ComponentKind::ROUTING_NODE && artifact.component_kind != role
-        {
-            return Err(Status::data_loss(
-                "format-v4 artifact graph leaf has the wrong logical role",
-            ));
-        }
-        records.push(RetainedObjectRecord::new(
-            RETAINED_ARTIFACT_CLASS,
-            artifact.object_content_hash,
-            artifact.object_version,
-            artifact.object_length,
-            rank,
-        )?);
-        if artifact.component_kind == ComponentKind::ROUTING_NODE {
-            routing.push(RoutingArtifact {
-                rank,
-                artifact,
-                role,
-                expected_identity,
-                expected_height,
-            });
-        }
-        Ok(())
-    }
-
-    async fn protect_routing_children(
-        &mut self,
-        routing: &RoutingArtifact,
-        loaded: LoadedRoutingNode,
-    ) -> Result<(), Status> {
-        let child_height = loaded.node.height.checked_sub(1);
-        let mut records = Vec::with_capacity(loaded.node.entries().len());
-        let mut pending = Vec::new();
-        for entry in loaded.node.entries() {
-            if loaded.node.height == 1 && entry.child.component_kind != routing.role {
-                return Err(Status::data_loss(
-                    "format-v4 routing leaf has the wrong logical component kind",
-                ));
+            if let LocatorPackOwnership::Standalone(packs) = &locator.pack_ownership {
+                for pack in packs {
+                    prepare_pack(self.index_id, rank, pack, &mut records)?;
+                }
             }
-            self.prepare_artifact(
-                routing.rank,
-                entry.child.clone(),
-                routing.role,
-                ExpectedComponentIdentity::exact(loaded.identity),
-                child_height.filter(|height| *height != 0),
-                &mut records,
-                &mut pending,
-            )?;
         }
         self.collector.append(records).await?;
-        self.pending_routing.push_many(pending).await?;
         Ok(())
     }
+}
+
+fn prepare_pack(
+    index_id: u64,
+    rank: usize,
+    pack: &ArtifactPackReference,
+    records: &mut Vec<RetainedObjectRecord>,
+) -> Result<(), Status> {
+    pack.validate(index_id).map_err(index_integrity_status)?;
+    records.push(RetainedObjectRecord::new(
+        RETAINED_ARTIFACT_CLASS,
+        pack.object_content_hash,
+        pack.object_version,
+        pack.object_length,
+        rank,
+    )?);
+    Ok(())
 }
 
 struct RankedManifest {
     rank: usize,
     reference: ManifestReference,
     loaded: Option<IndexGenerationManifest>,
-}
-
-struct RoutingScratchQueue {
-    file: IndexMergeScratchFile,
-    next_record: u64,
-    records: u64,
-    retry: Option<RoutingArtifact>,
-}
-
-impl RoutingScratchQueue {
-    async fn new(scratch: IndexMergeScratchSpace) -> Result<Self, Status> {
-        Ok(Self {
-            file: scratch.create_file().await.map_err(scratch_status)?,
-            next_record: 0,
-            records: 0,
-            retry: None,
-        })
-    }
-
-    async fn push_many(
-        &mut self,
-        routing: impl IntoIterator<Item = RoutingArtifact>,
-    ) -> Result<(), Status> {
-        let unique = routing
-            .into_iter()
-            .map(|routing| encode_routing(&routing))
-            .collect::<BTreeSet<_>>();
-        let mut bytes = Vec::new();
-        let mut count = 0_u64;
-        for routing in unique {
-            bytes.extend_from_slice(&routing);
-            count = count
-                .checked_add(1)
-                .ok_or_else(|| Status::resource_exhausted("routing scratch count overflowed"))?;
-        }
-        if bytes.is_empty() {
-            return Ok(());
-        }
-        self.file.append(bytes).await.map_err(scratch_status)?;
-        self.records = self
-            .records
-            .checked_add(count)
-            .ok_or_else(|| Status::resource_exhausted("routing scratch count overflowed"))?;
-        Ok(())
-    }
-
-    async fn pop(&mut self) -> Result<Option<RoutingArtifact>, Status> {
-        if self.retry.is_some() {
-            return Ok(self.retry.take());
-        }
-        if self.next_record >= self.records {
-            return Ok(None);
-        }
-        let offset = self
-            .next_record
-            .checked_mul(ROUTING_SCRATCH_RECORD_BYTES as u64)
-            .ok_or_else(|| Status::resource_exhausted("routing scratch offset overflowed"))?;
-        let bytes = self
-            .file
-            .read_exact_at(offset, ROUTING_SCRATCH_RECORD_BYTES)
-            .await
-            .map_err(scratch_status)?;
-        self.next_record += 1;
-        decode_routing(&bytes).map(Some)
-    }
-
-    async fn requeue(&mut self, routing: RoutingArtifact) -> Result<(), Status> {
-        if self.retry.replace(routing).is_some() {
-            return Err(Status::internal(
-                "routing scratch queue has two retry records",
-            ));
-        }
-        Ok(())
-    }
-}
-
-fn encode_routing(routing: &RoutingArtifact) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(ROUTING_SCRATCH_RECORD_BYTES);
-    bytes.push(routing.rank as u8);
-    bytes.extend_from_slice(&routing.role.get().to_be_bytes());
-    bytes.extend_from_slice(&routing.expected_identity.index_id.to_be_bytes());
-    bytes.extend_from_slice(&routing.expected_identity.definition_version.to_be_bytes());
-    bytes.extend_from_slice(&routing.expected_identity.schema_fingerprint);
-    bytes.extend_from_slice(
-        &routing
-            .expected_identity
-            .segment_id
-            .unwrap_or(0)
-            .to_be_bytes(),
-    );
-    bytes.push(routing.expected_height.unwrap_or(0));
-    bytes.extend_from_slice(&routing.artifact.object_content_hash);
-    bytes.extend_from_slice(&routing.artifact.object_version.to_be_bytes());
-    bytes.extend_from_slice(&routing.artifact.object_length.to_be_bytes());
-    bytes.extend_from_slice(&routing.artifact.offset.to_be_bytes());
-    bytes.extend_from_slice(&routing.artifact.encoded_length.to_be_bytes());
-    bytes.extend_from_slice(&routing.artifact.logical_length.to_be_bytes());
-    bytes.extend_from_slice(&routing.artifact.component_kind.get().to_be_bytes());
-    bytes.extend_from_slice(&routing.artifact.codec_version.to_be_bytes());
-    bytes.extend_from_slice(&routing.artifact.checksum);
-    debug_assert_eq!(bytes.len(), ROUTING_SCRATCH_RECORD_BYTES);
-    bytes
-}
-
-fn decode_routing(bytes: &[u8]) -> Result<RoutingArtifact, Status> {
-    if bytes.len() != ROUTING_SCRATCH_RECORD_BYTES {
-        return Err(Status::data_loss("routing scratch record is truncated"));
-    }
-    let rank = usize::from(bytes[0]);
-    if rank >= RETENTION_GENERATION_SLOTS {
-        return Err(Status::data_loss(
-            "routing scratch generation rank is invalid",
-        ));
-    }
-    let role = ComponentKind::new(read_be_u16(bytes, 1)?).map_err(index_integrity_status)?;
-    let index_id = read_be_u64(bytes, 3)?;
-    let expected_identity = ExpectedComponentIdentity {
-        index_id,
-        definition_version: read_be_u64(bytes, 11)?,
-        schema_fingerprint: bytes[19..51]
-            .try_into()
-            .map_err(|_| Status::data_loss("routing scratch schema is truncated"))?,
-        segment_id: match read_be_u64(bytes, 51)? {
-            0 => None,
-            value => Some(value),
-        },
-    };
-    let expected_height = match bytes[59] {
-        0 => None,
-        height => Some(height),
-    };
-    let object_content_hash = bytes[60..92]
-        .try_into()
-        .map_err(|_| Status::data_loss("routing scratch object hash is truncated"))?;
-    let artifact = ArtifactDescriptor::new(
-        index_id,
-        super::publication::artifact_path(index_id, object_content_hash),
-        read_be_u64(bytes, 92)?,
-        object_content_hash,
-        read_be_u64(bytes, 100)?,
-        read_be_u64(bytes, 108)?,
-        read_be_u64(bytes, 116)?,
-        read_be_u64(bytes, 124)?,
-        ComponentKind::new(read_be_u16(bytes, 132)?).map_err(index_integrity_status)?,
-        read_be_u16(bytes, 134)?,
-        bytes[136..168]
-            .try_into()
-            .map_err(|_| Status::data_loss("routing scratch checksum is truncated"))?,
-    )
-    .map_err(index_integrity_status)?;
-    Ok(RoutingArtifact {
-        rank,
-        artifact,
-        role,
-        expected_identity,
-        expected_height,
-    })
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct ExpectedComponentIdentity {
-    index_id: u64,
-    definition_version: u64,
-    schema_fingerprint: [u8; 32],
-    segment_id: Option<u64>,
-}
-
-impl ExpectedComponentIdentity {
-    fn exact(identity: SegmentIdentity) -> Self {
-        Self {
-            index_id: identity.index_id,
-            definition_version: identity.definition_version,
-            schema_fingerprint: identity.schema_fingerprint,
-            segment_id: Some(identity.segment_id),
-        }
-    }
-
-    fn require(self, actual: SegmentIdentity) -> Result<(), Status> {
-        if actual.index_id != self.index_id
-            || actual.definition_version != self.definition_version
-            || actual.schema_fingerprint != self.schema_fingerprint
-            || self
-                .segment_id
-                .is_some_and(|expected| actual.segment_id != expected)
-        {
-            return Err(Status::data_loss(
-                "format-v4 routing component identity differs from its generation",
-            ));
-        }
-        Ok(())
-    }
-}
-
-struct RoutingArtifact {
-    rank: usize,
-    artifact: ArtifactDescriptor,
-    role: ComponentKind,
-    expected_identity: ExpectedComponentIdentity,
-    expected_height: Option<u8>,
-}
-
-struct LoadedRoutingNode {
-    identity: SegmentIdentity,
-    node: RoutingNode,
 }
 
 struct LoadedManifest {
@@ -1788,16 +1354,6 @@ fn validate_manifest_reference(
             "format-v4 manifest identity differs from its current-pointer reference",
         ));
     }
-    let encoded = manifest
-        .encode()
-        .map_err(|error| Status::data_loss(error.to_string()))?;
-    if encoded.len() as u64 != reference.blob.length
-        || blake3::hash(&encoded).as_bytes() != &reference.blob.hash
-    {
-        return Err(Status::data_loss(
-            "format-v4 manifest bytes differ from their current-pointer reference",
-        ));
-    }
     Ok(())
 }
 
@@ -1821,59 +1377,6 @@ fn require_current_identity(
         &current.manifest,
         definition.index_id,
     )
-}
-
-fn component_identity(bytes: &[u8]) -> Result<SegmentIdentity, Status> {
-    if bytes.len() < anvil_index::v4::COMPONENT_HEADER_BYTES {
-        return Err(Status::data_loss(
-            "format-v4 routing component is shorter than its envelope",
-        ));
-    }
-    SegmentIdentity::new(
-        read_u64(bytes, 16)?,
-        read_u64(bytes, 24)?,
-        bytes[32..64]
-            .try_into()
-            .map_err(|_| Status::data_loss("format-v4 routing schema is truncated"))?,
-        read_u64(bytes, 64)?,
-    )
-    .map_err(index_integrity_status)
-}
-
-fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, Status> {
-    bytes
-        .get(offset..offset + 8)
-        .and_then(|value| value.try_into().ok())
-        .map(u64::from_le_bytes)
-        .ok_or_else(|| Status::data_loss("format-v4 routing envelope is truncated"))
-}
-
-fn read_be_u16(bytes: &[u8], offset: usize) -> Result<u16, Status> {
-    bytes
-        .get(offset..offset + 2)
-        .and_then(|value| value.try_into().ok())
-        .map(u16::from_be_bytes)
-        .ok_or_else(|| Status::data_loss("retention scratch integer is truncated"))
-}
-
-fn read_be_u64(bytes: &[u8], offset: usize) -> Result<u64, Status> {
-    bytes
-        .get(offset..offset + 8)
-        .and_then(|value| value.try_into().ok())
-        .map(u64::from_be_bytes)
-        .ok_or_else(|| Status::data_loss("retention scratch integer is truncated"))
-}
-
-fn scratch_status(error: IndexError) -> Status {
-    match error {
-        IndexError::UnexpectedEof { .. } | IndexError::Integrity => {
-            Status::data_loss(error.to_string())
-        }
-        IndexError::ResourceLimit { .. } | IndexError::OffsetOverflow => {
-            Status::resource_exhausted(error.to_string())
-        }
-        _ => Status::unavailable(error.to_string()),
-    }
 }
 
 fn index_integrity_status(error: anvil_index::IndexError) -> Status {

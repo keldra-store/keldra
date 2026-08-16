@@ -8,9 +8,9 @@ use anvil_api::v1::{
 };
 use anvil_index::IndexError;
 use anvil_index::v4::{
-    AggregateOperation, AggregateRequest, FacetRequest, FieldCapabilities, FieldId, FieldSchema,
-    FieldType, NativeQuery, OrderDirection, OrderField, Predicate, PredicateId, RangeBound,
-    ScalarValue, Schema,
+    AggregateOperation, AggregateRequest, FacetRequest, FieldCapabilities, FieldSchema, FieldType,
+    NativeQuery, OrderDirection, OrderField, Predicate, PredicateId, RangeBound, ScalarValue,
+    Schema,
 };
 
 const MAX_COMPUTATIONS: usize = 32;
@@ -397,8 +397,7 @@ fn field<'a>(schema: &'a Schema, name: &str) -> Result<&'a FieldSchema, IndexErr
 }
 
 fn decode_scalar(encoded: &[u8], field: &FieldSchema) -> Result<ScalarValue, IndexError> {
-    let value: serde_json::Value = serde_json::from_slice(encoded)
-        .map_err(|_| IndexError::InvalidQuery("predicate value is invalid JSON".into()))?;
+    let value = decode_canonical_json_scalar(encoded)?;
     if value.is_null() && field.allow_null {
         return Ok(ScalarValue::Null);
     }
@@ -412,9 +411,17 @@ fn decode_scalar(encoded: &[u8], field: &FieldSchema) -> Result<ScalarValue, Ind
         FieldType::Boolean => ScalarValue::Boolean(value.as_bool().ok_or_else(invalid)?),
         FieldType::SignedInteger => ScalarValue::Signed(value.as_i64().ok_or_else(invalid)?),
         FieldType::UnsignedInteger => ScalarValue::Unsigned(value.as_u64().ok_or_else(invalid)?),
-        FieldType::Float => {
-            ScalarValue::number(value.as_f64().ok_or_else(invalid)?).map_err(|_| invalid())?
-        }
+        FieldType::Float => match value {
+            serde_json::Value::Number(number) if number.is_i64() => {
+                ScalarValue::exact_number_from_i64(number.as_i64().ok_or_else(invalid)?)
+                    .ok_or_else(invalid)?
+            }
+            serde_json::Value::Number(number) if number.is_u64() => {
+                ScalarValue::exact_number_from_u64(number.as_u64().ok_or_else(invalid)?)
+                    .ok_or_else(invalid)?
+            }
+            _ => ScalarValue::number(value.as_f64().ok_or_else(invalid)?).map_err(|_| invalid())?,
+        },
         FieldType::Keyword => ScalarValue::String(value.as_str().ok_or_else(invalid)?.to_owned()),
         FieldType::Text | FieldType::Vector => return Err(invalid()),
     })
@@ -427,8 +434,7 @@ fn decode_text(encoded: &[u8], field: &FieldSchema) -> Result<ScalarValue, Index
             field.name
         )));
     }
-    let value: serde_json::Value = serde_json::from_slice(encoded)
-        .map_err(|_| IndexError::InvalidQuery("predicate value is invalid JSON".into()))?;
+    let value = decode_canonical_json_scalar(encoded)?;
     let text = value.as_str().ok_or_else(|| {
         IndexError::InvalidQuery("full-text predicate requires one JSON string".into())
     })?;
@@ -438,6 +444,23 @@ fn decode_text(encoded: &[u8], field: &FieldSchema) -> Result<ScalarValue, Index
         ));
     }
     Ok(ScalarValue::String(text.to_owned()))
+}
+
+fn decode_canonical_json_scalar(encoded: &[u8]) -> Result<serde_json::Value, IndexError> {
+    let value: serde_json::Value = serde_json::from_slice(encoded)
+        .map_err(|_| IndexError::InvalidQuery("predicate value is invalid JSON".into()))?;
+    if matches!(
+        value,
+        serde_json::Value::Array(_) | serde_json::Value::Object(_)
+    ) || serde_json::to_vec(&value)
+        .map_err(|_| IndexError::InvalidQuery("predicate value is invalid JSON".into()))?
+        != encoded
+    {
+        return Err(IndexError::InvalidQuery(
+            "predicate value must be one canonical JSON scalar".into(),
+        ));
+    }
+    Ok(value)
 }
 
 fn text_value(value: ScalarValue) -> Result<String, IndexError> {
@@ -577,6 +600,20 @@ mod tests {
             ScalarValue::String("active".into())
         );
         assert!(decode_scalar(b"4", &keyword_schema.fields[0]).is_err());
+        assert!(decode_scalar(br#""\u0061ctive""#, &keyword_schema.fields[0]).is_err());
+        assert!(decode_scalar(b" \"active\"", &keyword_schema.fields[0]).is_err());
+    }
+
+    #[test]
+    fn float_query_values_reject_lossy_integer_conversion() {
+        let (_, mut schema) = typed();
+        schema.fields[0].field_type = FieldType::Float;
+        let field = &schema.fields[0];
+
+        assert!(decode_scalar(b"9007199254740992", field).is_ok());
+        assert!(decode_scalar(b"9007199254740993", field).is_err());
+        assert!(decode_scalar(b"18446744073709551615", field).is_err());
+        assert!(decode_scalar(b"1.5", field).is_ok());
     }
 
     #[test]

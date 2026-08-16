@@ -5,8 +5,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anvil_consensus::{DecisionRaft, NodeId};
 use anvil_index::v4::build::{
-    BuildLimits, MergeMutation, NativeSegmentWriter, ProjectedSource as NativeProjectedSource,
-    SourcePush,
+    BuildLimits, ComponentBatchSink, MergeMutation, NativeSegmentWriter,
+    ProjectedSource as NativeProjectedSource, SourcePush,
 };
 use anvil_index::v4::{
     DocIdRange, LocatorEntry, LocatorStreamRoot, LocatorValue, ObjectIdentity, Schema,
@@ -33,7 +33,9 @@ use super::catalog::{CatalogChange, CatalogDefinition, CatalogIdentity, IndexCat
 use super::cpu::{IndexCpuPool, IndexCpuPoolError};
 use super::directory::ManifestArtifactDirectory;
 use super::events::{IndexBarrier, IndexEventError, IndexEventJournal, IndexJournalPage};
-use super::generation::{LocatorRoot, MAX_SEGMENTS_PER_GENERATION, ManifestPhysicalOrder};
+use super::generation::{
+    LocatorPackOwnership, LocatorRoot, MAX_SEGMENTS_PER_GENERATION, ManifestPhysicalOrder,
+};
 use super::placement::{IndexIdentity, IndexPlacement};
 use super::publication::DerivedArtifactAdmission;
 use super::publisher::{IndexGenerationPublisher, PublishedGeneration};
@@ -791,12 +793,16 @@ async fn inspect_builder(
         && current.manifest.definition_version == definition.object_version
         && current.manifest.kind == definition.schema.kind
     {
+        let published = current.manifest.barrier().map_err(generation_status)?;
         let target = dependencies
             .journal
-            .capture_barrier()
+            .capture_index_bucket_barrier(
+                definition.tenant_id,
+                definition.bucket_id,
+                Some(&published),
+            )
             .await
             .map_err(event_status)?;
-        let published = current.manifest.barrier().map_err(generation_status)?;
         dependencies
             .derived_progress
             .report(
@@ -1038,7 +1044,7 @@ async fn advance_catch_up(
             histogram.anvil_index_journal_page_resident_bytes = page_resident_bytes,
             "index journal page admitted by concrete resident size"
         );
-        work.changed |= await_with_builder_heartbeats(
+        let page_work = await_with_builder_heartbeats(
             &work.progress,
             process_journal_page(
                 &job.definition,
@@ -1052,9 +1058,19 @@ async fn advance_catch_up(
             ),
         )
         .await?;
+        work.changed |= page_work.changed;
         record_source_page_progress(&mut work, &page);
         work.progress.advance(records, encoded_bytes);
-        if quantum.advance_page(encoded_bytes)? == SourceWorkBoundary::SealAndYield {
+        tracing::info!(
+            index.kind = ?job.kind,
+            monotonic_counter.anvil_index_source_payload_bytes_total =
+                page_work.source_payload_bytes,
+            histogram.anvil_index_source_page_payload_bytes = page_work.source_payload_bytes,
+            "index source page payload charged to work quantum"
+        );
+        if quantum.advance_page(encoded_bytes, page_work.source_payload_bytes)?
+            == SourceWorkBoundary::SealAndYield
+        {
             flush_builder(
                 &job.definition,
                 job.kind,
@@ -1266,6 +1282,55 @@ impl CandidateGeneration {
             .ok_or_else(|| Status::resource_exhausted("path-locator sequence exhausted"))?;
         Ok(sequence)
     }
+
+    fn locator_stream_roots(&self) -> Result<Vec<LocatorStreamRoot>, Status> {
+        self.locator_roots
+            .iter()
+            .map(|root| self.locator_stream_root(root))
+            .collect()
+    }
+
+    fn locator_stream_root(&self, root: &LocatorRoot) -> Result<LocatorStreamRoot, Status> {
+        let segment = self
+            .segments
+            .binary_search_by_key(&root.identity.segment_id, |segment| {
+                segment.identity.segment_id
+            })
+            .ok()
+            .map(|position| &self.segments[position]);
+        let packs = match (&root.pack_ownership, segment) {
+            (LocatorPackOwnership::Segment, Some(segment)) if segment.identity == root.identity => {
+                segment.packs.clone()
+            }
+            (LocatorPackOwnership::Standalone(packs), None) if !packs.is_empty() => packs.clone(),
+            (LocatorPackOwnership::Segment, None) => {
+                return Err(Status::data_loss(
+                    "segment-owned locator has no generation segment",
+                ));
+            }
+            (LocatorPackOwnership::Segment, Some(_)) => {
+                return Err(Status::data_loss(
+                    "segment-owned locator identity differs from its generation segment",
+                ));
+            }
+            (LocatorPackOwnership::Standalone(_), Some(_)) => {
+                return Err(Status::data_loss(
+                    "standalone locator duplicates a generation segment owner",
+                ));
+            }
+            (LocatorPackOwnership::Standalone(_), None) => {
+                return Err(Status::data_loss(
+                    "standalone locator has no artifact pack table",
+                ));
+            }
+        };
+        Ok(LocatorStreamRoot {
+            sequence: root.sequence,
+            identity: root.identity,
+            packs,
+            artifact: root.artifact.clone(),
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1387,6 +1452,7 @@ async fn flush_builder(
         sequence,
         identity: descriptor_identity,
         artifact: built.locator.root,
+        pack_ownership: LocatorPackOwnership::Segment,
         encoded_bytes: built.locator.encoded_bytes,
         logical_bytes: built.locator.logical_bytes,
     });
@@ -1649,6 +1715,15 @@ fn source_needs_payload(schema: &Schema) -> bool {
         schema.kind,
         anvil_index::v4::IndexKind::Path | anvil_index::v4::IndexKind::MetadataFilter
     )
+}
+
+fn source_payload_bytes_for(schema: &Schema, source: &IndexSourceMutation) -> u64 {
+    match source {
+        IndexSourceMutation::Upsert(object) if source_needs_payload(schema) => {
+            object.content_length
+        }
+        IndexSourceMutation::Upsert(_) | IndexSourceMutation::Remove(_) => 0,
+    }
 }
 
 fn source_wire_limit(limit: u64) -> u64 {

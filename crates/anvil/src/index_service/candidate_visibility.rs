@@ -196,42 +196,61 @@ impl IndexCandidateVisibility for AuthorizedCurrentCandidates {
                 crate::v05::deadline_remaining(self.deadline)?,
             )
             .await?;
-        if snapshots.len() != authorized_positions.len() {
-            return Err(Status::data_loss(
-                "current object batch returned the wrong result count",
-            ));
-        }
-        let mut stale = 0_u64;
-        for ((position, source), snapshot) in authorized_positions
-            .into_iter()
-            .zip(authorized_keys)
-            .zip(snapshots)
-        {
-            let candidate = &candidates[position];
-            let Some(snapshot) = snapshot else {
-                visible[position] = false;
-                stale = stale.saturating_add(1);
+        let mut stale = apply_current_snapshots(
+            &mut visible,
+            &authorized_positions,
+            &authorized_keys,
+            snapshots,
+            self.tenant_id,
+            self.bucket_id,
+            |position| candidates[position].source_version,
+        )?;
+
+        // Git and Tensor may return an ordinary payload distinct from their
+        // source manifest. The source controls projection liveness, while the
+        // public no-stale-version contract independently requires the returned
+        // object identity to remain exact-current. Ordinary source=result
+        // candidates need only the source batch above.
+        let mut result_positions = Vec::new();
+        let mut result_keys = Vec::new();
+        for (position, candidate) in candidates.iter().enumerate() {
+            if !visible[position] {
                 continue;
-            };
-            snapshot
-                .validate()
-                .map_err(|error| Status::data_loss(error.to_string()))?;
-            if snapshot.tenant_id != self.tenant_id
-                || snapshot.bucket_id != self.bucket_id
-                || snapshot.exact_path != source.path()
-            {
-                return Err(Status::data_loss(format!(
-                    "current object batch returned another source identity at position {position}"
-                )));
             }
-            if snapshot.head.deleted
-                || snapshot.version.deleted
-                || snapshot.head.version.0 != candidate.source_version
-                || snapshot.version.id.0 != candidate.source_version
+            let address = candidate
+                .result
+                .address
+                .as_ref()
+                .expect("candidate addresses were validated before authorization");
+            if address.path != candidate.source_path
+                || candidate.result.object_version != candidate.source_version
             {
-                visible[position] = false;
-                stale = stale.saturating_add(1);
+                result_positions.push(position);
+                result_keys.push(
+                    ObjectKey::new(&address.tenant, &address.bucket, &address.path)
+                        .map_err(|_| Status::data_loss("index result address became invalid"))?,
+                );
             }
+        }
+        if !result_keys.is_empty() {
+            let snapshots = self
+                .live_versions
+                .current_snapshots(
+                    &result_keys,
+                    self.tenant_id,
+                    self.bucket_id,
+                    crate::v05::deadline_remaining(self.deadline)?,
+                )
+                .await?;
+            stale = stale.saturating_add(apply_current_snapshots(
+                &mut visible,
+                &result_positions,
+                &result_keys,
+                snapshots,
+                self.tenant_id,
+                self.bucket_id,
+                |position| candidates[position].result.object_version,
+            )?);
         }
         Ok(CandidateVisibilityEvidence {
             visible,
@@ -240,6 +259,51 @@ impl IndexCandidateVisibility for AuthorizedCurrentCandidates {
             stale,
         })
     }
+}
+
+fn apply_current_snapshots(
+    visible: &mut [bool],
+    positions: &[usize],
+    keys: &[ObjectKey],
+    snapshots: Vec<Option<anvil_store::CurrentObjectSnapshot>>,
+    tenant_id: u64,
+    bucket_id: u64,
+    mut expected_version: impl FnMut(usize) -> u64,
+) -> Result<u64, Status> {
+    if positions.len() != keys.len() || snapshots.len() != positions.len() {
+        return Err(Status::data_loss(
+            "current object batch returned the wrong result count",
+        ));
+    }
+    let mut stale = 0_u64;
+    for ((position, key), snapshot) in positions.iter().copied().zip(keys).zip(snapshots) {
+        let expected_version = expected_version(position);
+        let Some(snapshot) = snapshot else {
+            visible[position] = false;
+            stale = stale.saturating_add(1);
+            continue;
+        };
+        snapshot
+            .validate()
+            .map_err(|error| Status::data_loss(error.to_string()))?;
+        if snapshot.tenant_id != tenant_id
+            || snapshot.bucket_id != bucket_id
+            || snapshot.exact_path != key.path()
+        {
+            return Err(Status::data_loss(format!(
+                "current object batch returned another identity at position {position}"
+            )));
+        }
+        if snapshot.head.deleted
+            || snapshot.version.deleted
+            || snapshot.head.version.0 != expected_version
+            || snapshot.version.id.0 != expected_version
+        {
+            visible[position] = false;
+            stale = stale.saturating_add(1);
+        }
+    }
+    Ok(stale)
 }
 
 /// Retain authorized source keys in their existing allocation and separately
@@ -330,9 +394,37 @@ mod tests {
             Ok(keys
                 .iter()
                 .map(|key| {
-                    let version = if key.path() == "docs/stale" { 2 } else { 1 };
+                    let version = if matches!(key.path(), "docs/stale" | "payloads/stale.bin") {
+                        2
+                    } else {
+                        1
+                    };
                     Some(snapshot(key.path(), version))
                 })
+                .collect())
+        }
+    }
+
+    struct RecordingLiveVersions {
+        batches: Mutex<Vec<Vec<String>>>,
+    }
+
+    #[tonic::async_trait]
+    impl IndexLiveVersionReader for RecordingLiveVersions {
+        async fn current_snapshots(
+            &self,
+            keys: &[ObjectKey],
+            _tenant_id: u64,
+            _bucket_id: u64,
+            _budget: Duration,
+        ) -> Result<Vec<Option<CurrentObjectSnapshot>>, Status> {
+            self.batches
+                .lock()
+                .unwrap()
+                .push(keys.iter().map(|key| key.path().to_owned()).collect());
+            Ok(keys
+                .iter()
+                .map(|key| Some(snapshot(key.path(), 1)))
                 .collect())
         }
     }
@@ -477,15 +569,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reference_projection_authorizes_result_but_checks_the_scoped_source_version() {
+    async fn reference_projection_requires_current_source_and_distinct_result() {
         for kind in [IndexKind::GitSource, IndexKind::Tensor] {
-            let mut candidate = candidate("docs/source.json");
-            candidate.result.address.as_mut().unwrap().path = "payloads/referenced.bin".into();
+            let mut live_candidate = candidate("docs/source.json");
+            live_candidate.result.address.as_mut().unwrap().path = "payloads/referenced.bin".into();
 
-            let result = visibility_for(kind).evaluate(&[candidate]).await.unwrap();
+            let result = visibility_for(kind)
+                .evaluate(&[live_candidate])
+                .await
+                .unwrap();
             assert_eq!(result.visible, vec![true]);
             assert_eq!(result.authorization_revision, 9);
+
+            let mut stale_source = candidate("docs/stale");
+            stale_source.result.address.as_mut().unwrap().path = "payloads/referenced.bin".into();
+            let result = visibility_for(kind)
+                .evaluate(&[stale_source])
+                .await
+                .unwrap();
+            assert_eq!(result.visible, vec![false]);
+            assert_eq!(result.stale, 1);
+
+            let mut stale_result = candidate("docs/source.json");
+            stale_result.result.address.as_mut().unwrap().path = "payloads/stale.bin".into();
+            let result = visibility_for(kind)
+                .evaluate(&[stale_result])
+                .await
+                .unwrap();
+            assert_eq!(result.visible, vec![false]);
+            assert_eq!(result.stale, 1);
         }
+    }
+
+    #[tokio::test]
+    async fn identical_source_and_result_identity_needs_one_current_read() {
+        let live_versions = Arc::new(RecordingLiveVersions {
+            batches: Mutex::new(Vec::new()),
+        });
+        let visibility = AuthorizedCurrentCandidates::new(
+            Caller::from_authenticated_application(
+                StorageTenantId::parse("tenant").unwrap(),
+                "application",
+            )
+            .unwrap(),
+            9,
+            "objects".into(),
+            "docs/".into(),
+            IndexKind::Path,
+            11,
+            12,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            Arc::new(TestAuthorization),
+            live_versions.clone(),
+        );
+
+        let result = visibility
+            .evaluate(&[candidate("docs/live")])
+            .await
+            .unwrap();
+        assert_eq!(result.visible, vec![true]);
+        assert_eq!(
+            *live_versions.batches.lock().unwrap(),
+            vec![vec!["docs/live".to_owned()]]
+        );
     }
 
     #[tokio::test]

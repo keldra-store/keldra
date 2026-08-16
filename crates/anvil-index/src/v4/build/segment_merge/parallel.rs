@@ -243,6 +243,11 @@ async fn assemble_range_results<S: ComponentBatchSink>(
             }
         }
     }
+    for counts in term_counts.values_mut() {
+        if !counts.term_presence_marker {
+            counts.present_documents = counts.term_fallback_present_documents;
+        }
+    }
     let routing_codec = schema.codec_version(ComponentKind::ROUTING_NODE)?;
     let mut assembled_docs = Vec::with_capacity(doc_streams.len());
     for ((kind, field), streams) in doc_streams {
@@ -348,6 +353,11 @@ fn add_one_count(target: &mut FieldCounts, source: &FieldCounts) -> Result<(), I
     target.string_values = target
         .string_values
         .checked_add(source.string_values)
+        .ok_or(IndexError::OffsetOverflow)?;
+    target.term_presence_marker |= source.term_presence_marker;
+    target.term_fallback_present_documents = target
+        .term_fallback_present_documents
+        .checked_add(source.term_fallback_present_documents)
         .ok_or(IndexError::OffsetOverflow)?;
     target.minimum_field_length = match (target.minimum_field_length, source.minimum_field_length) {
         (Some(left), Some(right)) => Some(left.min(right)),

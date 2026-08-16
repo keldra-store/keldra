@@ -84,12 +84,9 @@ impl Store {
         )?;
         let route_cf = self.cf(CF_JOURNAL_ROUTES).map_err(route_storage)?;
         let journal_cf = self.cf(CF_LOCAL_INVALIDATIONS).map_err(route_storage)?;
-        let mut changes = Vec::with_capacity(limit);
-        let mut encoded_bytes = 0_u64;
-        let mut through_offset = after_offset;
-
         let mut iterator =
             snapshot.iterator_cf(route_cf, IteratorMode::From(&start, Direction::Forward));
+        let mut routed_offsets = Vec::with_capacity(limit);
         let mut complete_to_target = false;
         loop {
             let Some(item) = iterator.next() else {
@@ -117,23 +114,45 @@ impl Store {
                 complete_to_target = true;
                 break;
             }
-            if changes.len() == limit {
+            if routed_offsets.len() == limit {
                 break;
             }
-            let encoded = snapshot
-                .get_cf(journal_cf, invalidation_key(offset))
+            routed_offsets.push(offset);
+        }
+        drop(iterator);
+
+        let journal_keys = routed_offsets
+            .iter()
+            .copied()
+            .map(invalidation_key)
+            .collect::<Vec<_>>();
+        let records =
+            snapshot.multi_get_cf(journal_keys.iter().map(|key| (journal_cf, key.as_slice())));
+        if records.len() != routed_offsets.len() {
+            return Err(RoutedJournalError::Storage(
+                "routed journal multi-get returned the wrong result count".into(),
+            ));
+        }
+
+        let routed_count = routed_offsets.len();
+        let mut changes = Vec::with_capacity(routed_count);
+        let mut encoded_bytes = 0_u64;
+        let mut through_offset = after_offset;
+        let mut stopped_at_byte_limit = false;
+        for (offset, encoded) in routed_offsets.into_iter().zip(records) {
+            let encoded = encoded
                 .map_err(route_storage)?
                 .ok_or(RoutedJournalError::MissingPrimary { offset })?;
-            let change = self
-                .decode_local_change_record(&encoded)
+            let decoded = self
+                .decode_local_change_record_with_length(&encoded)
                 .map_err(route_storage)?;
-            if change.offset() != offset || !route_matches(route, &change) {
+            if decoded.change.offset() != offset || !route_matches(route, &decoded.change) {
                 return Err(RoutedJournalError::RouteMismatch { offset });
             }
-            // Private peers serialize each bare LocalChange, not the
-            // RocksDB-only versioned journal envelope or its key.
-            let change_bytes =
-                super::watch_journal::encoded_change_len(&change).map_err(route_storage)?;
+            // The binary journal envelope records the exact bare-LocalChange
+            // JSON size used by the existing private-peer protocol. No second
+            // serialization is needed while scanning.
+            let change_bytes = decoded.peer_encoded_bytes;
             let projected = encoded_bytes.checked_add(change_bytes).ok_or_else(|| {
                 RoutedJournalError::Storage("routed journal page length overflow".into())
             })?;
@@ -150,16 +169,17 @@ impl Store {
                         }),
                     });
                 }
+                stopped_at_byte_limit = true;
                 break;
             }
             encoded_bytes = projected;
             through_offset = offset;
-            changes.push(change);
+            changes.push(decoded.change);
         }
 
         // If iteration found no next matching route, every source position
         // through the captured tail is proven irrelevant to this route.
-        if complete_to_target {
+        if complete_to_target && !stopped_at_byte_limit && changes.len() == routed_count {
             through_offset = target_offset;
         }
         Ok(RoutedLocalChangePage {

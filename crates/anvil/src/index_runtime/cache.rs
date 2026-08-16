@@ -23,6 +23,8 @@ use tokio::sync::Notify;
 use crate::startup_scan_evidence::{StartupScanEvidence, StartupScanExtent, StartupScanKind};
 
 const CACHE_FORMAT_DIRECTORY: &str = "v4";
+const SCRATCH_FORMAT_DIRECTORY: &str = "v4";
+const DEFAULT_SCRATCH_DIRECTORY: &str = "scratch";
 const CACHE_TEMPORARY_FILE_GRACE: Duration = Duration::from_secs(60 * 60);
 // Each mmap consumes a virtual-memory area and bookkeeping even for a tiny
 // file. Charging at least one ordinary page prevents a large disk budget from
@@ -125,7 +127,10 @@ impl CacheReconcileConfig {
 
 #[tonic::async_trait]
 pub(crate) trait IndexSegmentFetcher: Send + Sync + 'static {
-    async fn fetch(&self, segment: IndexSegmentId) -> Result<Vec<u8>, IndexCacheError>;
+    /// Open one already-authoritatively-verified immutable segment for a
+    /// bounded streaming copy into the disposable cache.
+    async fn fetch(&self, segment: IndexSegmentId)
+    -> Result<Box<dyn Read + Send>, IndexCacheError>;
 }
 
 #[derive(Clone)]
@@ -135,6 +140,7 @@ pub(crate) struct IndexCache {
 
 struct IndexCacheInner {
     directory: PathBuf,
+    scratch_directory: PathBuf,
     config: IndexCacheConfig,
     fetcher: Arc<dyn IndexSegmentFetcher>,
     fetch_budget: CacheFetchBudget,
@@ -391,7 +397,8 @@ impl IndexCache {
         config: IndexCacheConfig,
         fetcher: Arc<dyn IndexSegmentFetcher>,
     ) -> Result<Self, IndexCacheError> {
-        Self::new_inner(directory, config, fetcher, None)
+        let scratch_directory = directory.as_ref().join(DEFAULT_SCRATCH_DIRECTORY);
+        Self::new_inner(directory, scratch_directory, config, fetcher, None)
     }
 
     pub(crate) fn new_with_startup_scan_evidence(
@@ -400,20 +407,47 @@ impl IndexCache {
         fetcher: Arc<dyn IndexSegmentFetcher>,
         startup_scan_evidence: StartupScanEvidence,
     ) -> Result<Self, IndexCacheError> {
-        Self::new_inner(directory, config, fetcher, Some(startup_scan_evidence))
+        let scratch_directory = directory.as_ref().join(DEFAULT_SCRATCH_DIRECTORY);
+        Self::new_inner(
+            directory,
+            scratch_directory,
+            config,
+            fetcher,
+            Some(startup_scan_evidence),
+        )
+    }
+
+    pub(crate) fn new_with_directories_and_startup_scan_evidence(
+        directory: impl AsRef<Path>,
+        scratch_directory: impl AsRef<Path>,
+        config: IndexCacheConfig,
+        fetcher: Arc<dyn IndexSegmentFetcher>,
+        startup_scan_evidence: StartupScanEvidence,
+    ) -> Result<Self, IndexCacheError> {
+        Self::new_inner(
+            directory,
+            scratch_directory,
+            config,
+            fetcher,
+            Some(startup_scan_evidence),
+        )
     }
 
     fn new_inner(
         directory: impl AsRef<Path>,
+        scratch_directory: impl AsRef<Path>,
         config: IndexCacheConfig,
         fetcher: Arc<dyn IndexSegmentFetcher>,
         startup_scan_evidence: Option<StartupScanEvidence>,
     ) -> Result<Self, IndexCacheError> {
         let directory = directory.as_ref().join(CACHE_FORMAT_DIRECTORY);
+        let scratch_directory = scratch_directory.as_ref().join(SCRATCH_FORMAT_DIRECTORY);
         fs::create_dir_all(&directory).map_err(IndexCacheError::Io)?;
+        fs::create_dir_all(&scratch_directory).map_err(IndexCacheError::Io)?;
         let cache = Self {
             inner: Arc::new(IndexCacheInner {
                 directory,
+                scratch_directory,
                 config,
                 fetcher,
                 fetch_budget: CacheFetchBudget::new(config.memory_bytes),
@@ -433,12 +467,12 @@ impl IndexCache {
         }
     }
 
-    /// Open one restart-disposable merge workspace inside the existing v4
-    /// cache directory. Callers receive no general cache path authority.
+    /// Open one restart-disposable merge workspace in the separately
+    /// configured scratch root. Callers receive no general path authority.
     pub(crate) fn merge_scratch(&self) -> IndexMergeScratchSpace {
         IndexMergeScratchSpace {
             inner: Arc::new(IndexMergeScratchSpaceInner {
-                directory: self.inner.directory.clone(),
+                directory: self.inner.scratch_directory.clone(),
                 cache: Arc::downgrade(&self.inner),
                 nonce: uuid::Uuid::new_v4().simple().to_string(),
                 next_file: AtomicU64::new(0),
@@ -568,23 +602,30 @@ impl IndexCache {
             monotonic_counter.anvil_index_cache_fetches_total = 1_u64,
             "index cache block fetch"
         );
-        let bytes = self.inner.fetcher.fetch(id).await?;
-        if let Err(error) = verify_bytes(id, &bytes) {
-            tracing::info!(
-                monotonic_counter.anvil_index_cache_verification_failures_total = 1_u64,
-                "index cache block verification failed"
-            );
-            return Err(error);
-        }
-        tracing::info!(
-            monotonic_counter.anvil_index_cache_fetch_bytes_total = id.length,
-            "index cache block fetched"
-        );
+        let source = self.inner.fetcher.fetch(id).await?;
         let directory = self.inner.directory.clone();
         let path = cache_path(&directory, id);
-        tokio::task::spawn_blocking(move || persist_and_map(&directory, &path, id, &bytes))
-            .await
-            .map_err(|error| IndexCacheError::Task(error.to_string()))?
+        let materialized = tokio::task::spawn_blocking(move || {
+            persist_verified_stream_and_map(&directory, &path, id, source)
+        })
+        .await
+        .map_err(|error| IndexCacheError::Task(error.to_string()))?;
+        match &materialized {
+            Err(IndexCacheError::InvalidFetchedSegment | IndexCacheError::CorruptCache) => {
+                tracing::info!(
+                    monotonic_counter.anvil_index_cache_verification_failures_total = 1_u64,
+                    "index cache block verification failed"
+                );
+            }
+            Ok(_) => {
+                tracing::info!(
+                    monotonic_counter.anvil_index_cache_fetch_bytes_total = id.length,
+                    "index cache block fetched"
+                );
+            }
+            Err(_) => {}
+        }
+        materialized
     }
 
     fn cached(&self, id: IndexSegmentId) -> Result<Option<Arc<Mmap>>, IndexCacheError> {
@@ -1168,11 +1209,11 @@ fn cache_id_from_file_name(name: &std::ffi::OsStr) -> Option<IndexSegmentId> {
     IndexSegmentId::new(hash, length).ok()
 }
 
-fn persist_and_map(
+fn persist_verified_stream_and_map(
     directory: &Path,
     path: &Path,
     id: IndexSegmentId,
-    bytes: &[u8],
+    mut source: Box<dyn Read + Send>,
 ) -> Result<Mmap, IndexCacheError> {
     if path.exists() {
         match map_verified_cache_file(path, id) {
@@ -1190,21 +1231,42 @@ fn persist_and_map(
     ));
     let result = (|| {
         let mut file = OpenOptions::new()
+            .read(true)
             .write(true)
             .create_new(true)
             .open(&temporary)?;
-        file.write_all(bytes)?;
+        let mut hasher = blake3::Hasher::new();
+        let mut observed = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = source
+                .read(&mut buffer)
+                .map_err(|error| IndexCacheError::Fetch(error.to_string()))?;
+            if read == 0 {
+                break;
+            }
+            observed = observed.saturating_add(read as u64);
+            if observed > id.length {
+                return Err(IndexCacheError::InvalidFetchedSegment);
+            }
+            hasher.update(&buffer[..read]);
+            file.write_all(&buffer[..read])?;
+        }
+        if observed != id.length || hasher.finalize().as_bytes() != &id.blake3 {
+            return Err(IndexCacheError::InvalidFetchedSegment);
+        }
         file.sync_all()?;
         // Replacing an existing corrupt cache file is atomic. Authoritative
         // bytes remain the ordinary object fetched and verified by the caller.
-        fs::rename(&temporary, path)
+        fs::rename(&temporary, path)?;
+        // SAFETY: this exact file handle was populated and identity-verified
+        // above, then atomically published. Anvil never mutates cache files.
+        unsafe { Mmap::map(&file) }.map_err(IndexCacheError::Io)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
-    result.map_err(IndexCacheError::Io)?;
-
-    map_verified_cache_file(path, id)
+    result
 }
 
 fn map_verified_cache_file(path: &Path, id: IndexSegmentId) -> Result<Mmap, IndexCacheError> {
@@ -1229,13 +1291,6 @@ fn map_verified_cache_file(path: &Path, id: IndexSegmentId) -> Result<Mmap, Inde
     // writes through this mapping and eviction only unlinks the file after no
     // external IndexSlice retains the Arc<Mmap>.
     unsafe { Mmap::map(&file) }.map_err(IndexCacheError::Io)
-}
-
-fn verify_bytes(id: IndexSegmentId, bytes: &[u8]) -> Result<(), IndexCacheError> {
-    if bytes.len() as u64 != id.length || blake3::hash(bytes).as_bytes() != &id.blake3 {
-        return Err(IndexCacheError::InvalidFetchedSegment);
-    }
-    Ok(())
 }
 
 fn cache_mapping_charge(id: IndexSegmentId) -> u64 {

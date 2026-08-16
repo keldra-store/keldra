@@ -69,15 +69,6 @@ impl<'a, D: ArtifactDirectoryRead> SegmentExecution<'a, D> {
                 self.statistics.live_mask_reject();
                 continue;
             }
-            if let Some(predicate) = self.exact_filter {
-                self.statistics.two_phase_verification();
-                if !self.values.predicate(predicate, doc_id).await? {
-                    continue;
-                }
-            }
-            if !self.scorer.phrase_matches(doc_id).await? {
-                continue;
-            }
             return Ok(Some(Unranked {
                 doc_id,
                 identity: self.values.identity(doc_id).await?,

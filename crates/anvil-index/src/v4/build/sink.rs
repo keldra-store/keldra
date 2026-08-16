@@ -7,12 +7,22 @@ use super::super::codec::{
     COMPONENT_HEADER_BYTES, decode_component_header, prepare_component_payload,
 };
 use super::super::{
-    ArtifactDescriptor, ComponentKind, ComponentStatistics, FieldId, GeneratedComponent,
-    INDEX_ARTIFACT_PACK_BYTES, INDEX_DECODE_BYTES, INDEX_ROUTING_FANOUT, INDEX_ROUTING_HEIGHT,
-    RoutingEntry, RoutingNode, SegmentIdentity, artifact_path, encode_component,
+    ArtifactDescriptor, ArtifactPackReference, ComponentKind, ComponentStatistics, FieldId,
+    GeneratedComponent, INDEX_ARTIFACT_PACK_BYTES, INDEX_DECODE_BYTES, INDEX_ROUTING_FANOUT,
+    INDEX_ROUTING_HEIGHT, RoutingEntry, RoutingNode, SegmentIdentity, artifact_path,
+    encode_component,
 };
 
-const INDEX_ARTIFACT_PACK_COMPONENTS: usize =
+// A checked component always contains at least its fixed envelope. The byte
+// ceiling is authoritative; deriving the count ceiling from the largest legal
+// component made 32 tiny components look like a full 16 MiB pack and caused
+// tens of thousands of mostly-empty ordinary-object publications.
+const INDEX_ARTIFACT_PACK_COMPONENTS: usize = INDEX_ARTIFACT_PACK_BYTES / COMPONENT_HEADER_BYTES;
+// Accumulate enough child groups to fill one pack even when every routing
+// component reaches the format maximum. Shorter routing components may share
+// the same pack until the byte ceiling, but this threshold keeps streaming
+// state bounded independently of the input size.
+const ROUTING_COMPONENTS_PER_BATCH: usize =
     INDEX_ARTIFACT_PACK_BYTES / super::super::INDEX_COMPONENT_BYTES;
 /// Two worst-case 32,772-byte term boundaries plus one descriptor fit seven
 /// times within a 512 KiB routing component. Short-key streams retain the
@@ -31,15 +41,28 @@ fn validate_stream_routing_key(logical_kind: ComponentKind, key: &[u8]) -> Resul
     super::super::routing::validate_logical_routing_key(logical_kind, key)
 }
 
-/// One asynchronous durability boundary. Every returned descriptor names
-/// exact bytes already accepted by the sink. The format layer hands over one
-/// already-packed object buffer, so a storage implementation never has to
-/// copy a component batch into a second pack before staging it.
+/// Segment-scoped artifact staging and grouped publication.
+///
+/// A sink assigns pack ordinals and checked component ranges while keeping at
+/// most one incomplete 16 MiB pack resident. Completed packs may be spooled,
+/// but no ordinary-object reference becomes authoritative until
+/// `finalize_segment` publishes the complete pack set.
 pub trait ComponentBatchSink: Send {
-    fn publish_pack(
+    fn begin_segment(
         &mut self,
-        pack: ComponentPack,
-    ) -> impl Future<Output = Result<Vec<ArtifactDescriptor>, IndexError>> + Send;
+        identity: SegmentIdentity,
+        base_packs: &[ArtifactPackReference],
+    ) -> Result<(), IndexError>;
+
+    fn stage_component(
+        &mut self,
+        component: GeneratedComponent,
+    ) -> impl Future<Output = Result<ArtifactDescriptor, IndexError>> + Send;
+
+    fn finalize_segment(
+        &mut self,
+        identity: SegmentIdentity,
+    ) -> impl Future<Output = Result<Vec<ArtifactPackReference>, IndexError>> + Send;
 }
 
 /// One move-only ordinary-object pack assembled by the format layer.
@@ -54,18 +77,6 @@ pub struct ComponentPack {
 }
 
 impl ComponentPack {
-    fn singleton(component: GeneratedComponent) -> Result<Self, IndexError> {
-        let identity = component.header().identity;
-        let bytes = component.into_bytes();
-        if bytes.is_empty() || bytes.len() > INDEX_ARTIFACT_PACK_BYTES {
-            return Err(IndexError::ResourceLimit {
-                needed: bytes.len(),
-                limit: INDEX_ARTIFACT_PACK_BYTES,
-            });
-        }
-        Ok(Self { identity, bytes })
-    }
-
     pub fn identity(&self) -> SegmentIdentity {
         self.identity
     }
@@ -96,44 +107,25 @@ impl ComponentPack {
         Ok(count)
     }
 
-    pub fn descriptors(
+    pub fn reference(
         &self,
         path: String,
         object_version: u64,
         object_content_hash: [u8; 32],
-    ) -> Result<Vec<ArtifactDescriptor>, IndexError> {
+    ) -> Result<ArtifactPackReference, IndexError> {
         if object_content_hash != *blake3::hash(&self.bytes).as_bytes() {
             return Err(IndexError::Integrity);
         }
         let object_length =
             u64::try_from(self.bytes.len()).map_err(|_| IndexError::OffsetOverflow)?;
-        let mut offset = 0usize;
-        let mut output = Vec::new();
-        while offset < self.bytes.len() {
-            let (header, length) = self.component_at(offset)?;
-            output.push(ArtifactDescriptor::new(
-                self.identity.index_id,
-                path.clone(),
-                object_version,
-                object_content_hash,
-                object_length,
-                u64::try_from(offset).map_err(|_| IndexError::OffsetOverflow)?,
-                u64::try_from(length).map_err(|_| IndexError::OffsetOverflow)?,
-                header.logical_length,
-                header.component_kind,
-                header.codec_version,
-                header.payload_checksum,
-            )?);
-            if output.len() > INDEX_ARTIFACT_PACK_COMPONENTS {
-                return Err(IndexError::InvalidFormat(
-                    "format-v4 artifact pack has too many components",
-                ));
-            }
-            offset = offset
-                .checked_add(length)
-                .ok_or(IndexError::OffsetOverflow)?;
-        }
-        Ok(output)
+        self.component_count()?;
+        ArtifactPackReference::new(
+            self.identity.index_id,
+            path,
+            object_version,
+            object_content_hash,
+            object_length,
+        )
     }
 
     pub fn into_bytes(self) -> Vec<u8> {
@@ -171,6 +163,7 @@ impl ComponentPack {
     }
 }
 
+#[derive(Debug)]
 struct ComponentPackBuilder {
     identity: Option<SegmentIdentity>,
     bytes: Vec<u8>,
@@ -192,6 +185,15 @@ impl ComponentPackBuilder {
 
     fn is_full(&self) -> bool {
         self.component_count == INDEX_ARTIFACT_PACK_COMPONENTS
+    }
+
+    fn accepts(&self, encoded: usize) -> bool {
+        !self.is_full()
+            && self
+                .bytes
+                .len()
+                .checked_add(encoded)
+                .is_some_and(|needed| needed <= INDEX_ARTIFACT_PACK_BYTES)
     }
 
     fn push(&mut self, component: GeneratedComponent) -> Result<(), IndexError> {
@@ -245,15 +247,7 @@ async fn publish_single_component<S: ComponentBatchSink>(
     sink: &mut S,
     component: GeneratedComponent,
 ) -> Result<ArtifactDescriptor, IndexError> {
-    let mut descriptors = sink
-        .publish_pack(ComponentPack::singleton(component)?)
-        .await?;
-    if descriptors.len() != 1 {
-        return Err(IndexError::InvalidFormat(
-            "component sink returned the wrong descriptor count",
-        ));
-    }
-    Ok(descriptors.pop().expect("one checked component descriptor"))
+    sink.stage_component(component).await
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -269,6 +263,15 @@ pub struct ExactMemorySink {
     objects: BTreeMap<String, PublishedObject>,
     next_object_version: u64,
     publish_calls: usize,
+    active: Option<MemorySegmentPacks>,
+}
+
+#[derive(Debug)]
+struct MemorySegmentPacks {
+    identity: SegmentIdentity,
+    base_packs: Vec<ArtifactPackReference>,
+    completed: Vec<ComponentPack>,
+    pending: ComponentPackBuilder,
 }
 
 impl Default for ExactMemorySink {
@@ -283,6 +286,7 @@ impl ExactMemorySink {
             objects: BTreeMap::new(),
             next_object_version: 1,
             publish_calls: 0,
+            active: None,
         }
     }
 
@@ -296,13 +300,22 @@ impl ExactMemorySink {
 
     pub fn component_bytes<'a>(
         &'a self,
+        packs: &[ArtifactPackReference],
         descriptor: &ArtifactDescriptor,
     ) -> Result<&'a [u8], IndexError> {
+        let pack = packs
+            .get(descriptor.pack_ordinal as usize)
+            .ok_or(IndexError::InvalidFormat("artifact pack ordinal"))?;
         let object = self
             .objects
-            .get(&descriptor.path)
-            .ok_or_else(|| IndexError::FileNotFound(descriptor.path.clone()))?;
-        if object.object_version != descriptor.object_version {
+            .get(&pack.path)
+            .ok_or_else(|| IndexError::FileNotFound(pack.path.clone()))?;
+        if object.object_version != pack.object_version {
+            return Err(IndexError::Integrity);
+        }
+        if object.bytes.len() as u64 != pack.object_length
+            || *blake3::hash(&object.bytes).as_bytes() != pack.object_content_hash
+        {
             return Err(IndexError::Integrity);
         }
         let start = usize::try_from(descriptor.offset).map_err(|_| IndexError::OffsetOverflow)?;
@@ -322,7 +335,7 @@ impl ExactMemorySink {
     fn publish_memory_pack(
         &mut self,
         pack: ComponentPack,
-    ) -> Result<Vec<ArtifactDescriptor>, IndexError> {
+    ) -> Result<ArtifactPackReference, IndexError> {
         let hash = *blake3::hash(pack.bytes()).as_bytes();
         let path = artifact_path(pack.identity().index_id, hash);
         let existing_version = if let Some(existing) = self.objects.get(&path) {
@@ -344,7 +357,7 @@ impl ExactMemorySink {
                 version
             }
         };
-        let descriptors = pack.descriptors(path.clone(), object_version, hash)?;
+        let reference = pack.reference(path.clone(), object_version, hash)?;
         if existing_version.is_none() {
             self.objects.insert(
                 path.clone(),
@@ -355,21 +368,99 @@ impl ExactMemorySink {
                 },
             );
         }
-        Ok(descriptors)
+        Ok(reference)
     }
 }
 
 impl ComponentBatchSink for ExactMemorySink {
-    fn publish_pack(
+    fn begin_segment(
         &mut self,
-        pack: ComponentPack,
-    ) -> impl Future<Output = Result<Vec<ArtifactDescriptor>, IndexError>> + Send {
+        identity: SegmentIdentity,
+        base_packs: &[ArtifactPackReference],
+    ) -> Result<(), IndexError> {
+        identity.validate()?;
+        if self.active.is_some() {
+            return Err(IndexError::InvalidDefinition(
+                "component sink already has an active segment".into(),
+            ));
+        }
+        for pack in base_packs {
+            pack.validate(identity.index_id)?;
+        }
+        self.active = Some(MemorySegmentPacks {
+            identity,
+            base_packs: base_packs.to_vec(),
+            completed: Vec::new(),
+            pending: ComponentPackBuilder::new(),
+        });
+        Ok(())
+    }
+
+    fn stage_component(
+        &mut self,
+        component: GeneratedComponent,
+    ) -> impl Future<Output = Result<ArtifactDescriptor, IndexError>> + Send {
         std::future::ready((|| {
-            self.publish_calls = self
-                .publish_calls
-                .checked_add(1)
-                .ok_or(IndexError::OffsetOverflow)?;
-            self.publish_memory_pack(pack)
+            let identity = component.header().identity;
+            let active = self.active.as_mut().ok_or(IndexError::InvalidFormat(
+                "component sink has no active segment",
+            ))?;
+            if active.identity != identity {
+                return Err(IndexError::InvalidDefinition(
+                    "component sink cannot cross segment identities".into(),
+                ));
+            }
+            let encoded = component.bytes().len();
+            if active.pending.identity.is_some() && !active.pending.accepts(encoded) {
+                let pending = std::mem::replace(&mut active.pending, ComponentPackBuilder::new());
+                active.completed.push(pending.finish()?);
+            }
+            let pack_ordinal = u32::try_from(
+                active
+                    .base_packs
+                    .len()
+                    .checked_add(active.completed.len())
+                    .ok_or(IndexError::OffsetOverflow)?,
+            )
+            .map_err(|_| IndexError::OffsetOverflow)?;
+            let offset =
+                u64::try_from(active.pending.len()).map_err(|_| IndexError::OffsetOverflow)?;
+            let descriptor = component.placed(pack_ordinal, offset)?;
+            active.pending.push(component)?;
+            if active.pending.is_full() || active.pending.len() == INDEX_ARTIFACT_PACK_BYTES {
+                let pending = std::mem::replace(&mut active.pending, ComponentPackBuilder::new());
+                active.completed.push(pending.finish()?);
+            }
+            Ok(descriptor)
+        })())
+    }
+
+    fn finalize_segment(
+        &mut self,
+        identity: SegmentIdentity,
+    ) -> impl Future<Output = Result<Vec<ArtifactPackReference>, IndexError>> + Send {
+        std::future::ready((|| {
+            let mut active = self.active.take().ok_or(IndexError::InvalidFormat(
+                "component sink has no active segment",
+            ))?;
+            if active.identity != identity {
+                return Err(IndexError::InvalidDefinition(
+                    "component sink finalized another segment identity".into(),
+                ));
+            }
+            if active.pending.identity.is_some() {
+                active.completed.push(active.pending.finish()?);
+            }
+            let mut references = active.base_packs;
+            references.reserve(active.completed.len());
+            for pack in active.completed {
+                self.publish_calls = self
+                    .publish_calls
+                    .checked_add(1)
+                    .ok_or(IndexError::OffsetOverflow)?;
+                references.push(self.publish_memory_pack(pack)?);
+            }
+            Ok(references)
         })())
     }
 }
@@ -438,28 +529,17 @@ struct PublishedNode {
     descriptor: ArtifactDescriptor,
 }
 
-struct PendingLeaf {
-    minimum_key: Vec<u8>,
-    maximum_key: Vec<u8>,
-    element_count: u64,
-    header: super::super::ComponentHeader,
-    encoded_length: usize,
-}
-
 /// Fixed-memory publisher for one routed component stream.
 ///
-/// Data leaves are durably placed in ordinary-object batches capped at the
-/// artifact-pack bound. At most one incomplete pack and one incomplete fanout
-/// group at each routing height are retained, so resident memory is bounded by
-/// format constants rather than by the number of leaves in the stream.
+/// Data leaves are staged into the segment sink's ordinary-object packs. The
+/// sink owns the one incomplete pack shared by every logical stream; this
+/// publisher retains only one incomplete fanout group at each routing height.
 pub struct StreamingComponentPublisher<'a, S> {
     sink: &'a mut S,
     identity: SegmentIdentity,
     logical_kind: ComponentKind,
     leaf_codec_version: u16,
     routing_codec_version: u16,
-    pending_leaves: Vec<PendingLeaf>,
-    pending_pack: Option<ComponentPackBuilder>,
     levels: Vec<Vec<PublishedNode>>,
     first_minimum_key: Option<Vec<u8>>,
     previous_maximum_key: Option<Vec<u8>>,
@@ -493,8 +573,6 @@ impl<'a, S: ComponentBatchSink> StreamingComponentPublisher<'a, S> {
             logical_kind,
             leaf_codec_version,
             routing_codec_version,
-            pending_leaves: Vec::new(),
-            pending_pack: None,
             levels: vec![Vec::new()],
             first_minimum_key: None,
             previous_maximum_key: None,
@@ -555,34 +633,15 @@ impl<'a, S: ComponentBatchSink> StreamingComponentPublisher<'a, S> {
                 limit: INDEX_ARTIFACT_PACK_BYTES,
             });
         }
-        let pending_bytes = self
-            .pending_pack
-            .as_ref()
-            .map(ComponentPackBuilder::len)
-            .unwrap_or(0);
-        if self.pending_pack.as_ref().is_some_and(|pack| {
-            pack.is_full() || pending_bytes.saturating_add(encoded) > INDEX_ARTIFACT_PACK_BYTES
-        }) {
-            self.flush_pending_leaves().await?;
-        }
-        self.pending_pack
-            .get_or_insert_with(ComponentPackBuilder::new)
-            .push(leaf.component)?;
-        self.pending_leaves.push(PendingLeaf {
+        let descriptor = self.sink.stage_component(leaf.component).await?;
+        validate_placed_component(&descriptor, header, encoded)?;
+        self.push_published_leaf(DescriptorLeaf {
             minimum_key: leaf.minimum_key,
             maximum_key: leaf.maximum_key,
             element_count: leaf.element_count,
-            header,
-            encoded_length: encoded,
-        });
-        if self
-            .pending_pack
-            .as_ref()
-            .is_some_and(|pack| pack.is_full() || pack.len() == INDEX_ARTIFACT_PACK_BYTES)
-        {
-            self.flush_pending_leaves().await?;
-        }
-        Ok(())
+            descriptor,
+        })
+        .await
     }
 
     /// Add one already-published leaf without opening or publishing its data
@@ -599,42 +658,7 @@ impl<'a, S: ComponentBatchSink> StreamingComponentPublisher<'a, S> {
                 "reused component leaf differs from the publisher stream".into(),
             ));
         }
-        self.flush_pending_leaves().await?;
         self.push_published_leaf(leaf).await
-    }
-
-    async fn flush_pending_leaves(&mut self) -> Result<(), IndexError> {
-        if self.pending_leaves.is_empty() {
-            if self.pending_pack.is_some() {
-                return Err(IndexError::InvalidFormat(
-                    "component pack has no corresponding leaves",
-                ));
-            }
-            return Ok(());
-        }
-        let metadata = std::mem::take(&mut self.pending_leaves);
-        let pack = self
-            .pending_pack
-            .take()
-            .ok_or(IndexError::InvalidFormat("leaves have no component pack"))?
-            .finish()?;
-        let descriptors = self.sink.publish_pack(pack).await?;
-        if descriptors.len() != metadata.len() {
-            return Err(IndexError::InvalidFormat(
-                "component sink returned the wrong descriptor count",
-            ));
-        }
-        for (descriptor, leaf) in descriptors.into_iter().zip(metadata) {
-            validate_placed_component(&descriptor, leaf.header, leaf.encoded_length)?;
-            self.push_published_leaf(DescriptorLeaf {
-                minimum_key: leaf.minimum_key,
-                maximum_key: leaf.maximum_key,
-                element_count: leaf.element_count,
-                descriptor,
-            })
-            .await?;
-        }
-        Ok(())
     }
 
     async fn push_published_leaf(&mut self, leaf: DescriptorLeaf) -> Result<(), IndexError> {
@@ -668,11 +692,7 @@ impl<'a, S: ComponentBatchSink> StreamingComponentPublisher<'a, S> {
     ) -> Result<(), IndexError> {
         validate_stream_routing_key(self.logical_kind, minimum_key)?;
         validate_stream_routing_key(self.logical_kind, maximum_key)?;
-        let previous_maximum_key = self
-            .pending_leaves
-            .last()
-            .map(|leaf| &leaf.maximum_key)
-            .or(self.previous_maximum_key.as_ref());
+        let previous_maximum_key = self.previous_maximum_key.as_ref();
         if element_count == 0
             || minimum_key.is_empty()
             || minimum_key > maximum_key
@@ -687,7 +707,6 @@ impl<'a, S: ComponentBatchSink> StreamingComponentPublisher<'a, S> {
     }
 
     pub async fn finish(mut self) -> Result<PublishedStream, IndexError> {
-        self.flush_pending_leaves().await?;
         if self.leaf_count == 0 {
             return Err(IndexError::InvalidDefinition(
                 "component stream requires at least one leaf".into(),
@@ -728,24 +747,31 @@ impl<'a, S: ComponentBatchSink> StreamingComponentPublisher<'a, S> {
                 .iter()
                 .position(|nodes| !nodes.is_empty())
                 .expect("a nonempty stream has an occupied level");
-            self.publish_level(level).await?;
+            self.publish_routing_groups(level, true).await?;
             self.cascade_full_levels(level + 1).await?;
         }
     }
 
     async fn cascade_full_levels(&mut self, mut level: usize) -> Result<(), IndexError> {
+        let buffered_children = routing_fanout(self.logical_kind)
+            .checked_mul(ROUTING_COMPONENTS_PER_BATCH)
+            .ok_or(IndexError::OffsetOverflow)?;
         while self
             .levels
             .get(level)
-            .is_some_and(|nodes| nodes.len() == routing_fanout(self.logical_kind))
+            .is_some_and(|nodes| nodes.len() >= buffered_children)
         {
-            self.publish_level(level).await?;
+            self.publish_routing_groups(level, false).await?;
             level += 1;
         }
         Ok(())
     }
 
-    async fn publish_level(&mut self, level: usize) -> Result<(), IndexError> {
+    async fn publish_routing_groups(
+        &mut self,
+        level: usize,
+        include_partial_group: bool,
+    ) -> Result<(), IndexError> {
         let height = u8::try_from(level + 1).map_err(|_| IndexError::OffsetOverflow)?;
         if height > INDEX_ROUTING_HEIGHT {
             return Err(IndexError::ResourceLimit {
@@ -753,56 +779,89 @@ impl<'a, S: ComponentBatchSink> StreamingComponentPublisher<'a, S> {
                 limit: INDEX_ROUTING_HEIGHT as usize,
             });
         }
-        let children = std::mem::take(
+        let mut children = std::mem::take(
             self.levels
                 .get_mut(level)
                 .ok_or(IndexError::InvalidFormat("streaming routing level"))?,
         );
-        if children.is_empty() || children.len() > routing_fanout(self.logical_kind) {
+        if children.is_empty() {
             return Err(IndexError::InvalidFormat(
                 "streaming routing fanout is invalid",
             ));
         }
-        let minimum_key = children.first().unwrap().minimum_key.clone();
-        let maximum_key = children.last().unwrap().maximum_key.clone();
-        let element_count = children.iter().try_fold(0u64, |sum, child| {
-            sum.checked_add(child.element_count)
-                .ok_or(IndexError::OffsetOverflow)
-        })?;
-        let entries = children
-            .into_iter()
-            .map(|child| RoutingEntry {
-                minimum_key: child.minimum_key,
-                maximum_key: child.maximum_key,
-                element_count: child.element_count,
-                child: child.descriptor,
-            })
-            .collect();
-        let routing =
-            RoutingNode::new_for_kind(self.identity.index_id, height, self.logical_kind, entries)?;
-        let payload = routing.encode_payload()?;
-        let component = encode_component(
-            self.identity,
-            ComponentKind::ROUTING_NODE,
-            self.routing_codec_version,
-            0,
-            u64::try_from(payload.len()).map_err(|_| IndexError::OffsetOverflow)?,
-            payload,
-        )?;
-        let header = component.header();
-        let encoded = component.bytes().len();
-        let descriptor = publish_single_component(self.sink, component).await?;
-        validate_placed_component(&descriptor, header, encoded)?;
-        self.record_descriptor(&descriptor)?;
-        if self.levels.len() <= level + 1 {
-            self.levels.push(Vec::new());
+        let fanout = routing_fanout(self.logical_kind);
+        let complete_groups = children.len() / fanout;
+        let groups = if include_partial_group {
+            children.len().div_ceil(fanout)
+        } else {
+            complete_groups - (complete_groups % ROUTING_COMPONENTS_PER_BATCH)
+        };
+        if groups == 0 {
+            self.levels[level] = children;
+            return Ok(());
         }
-        self.levels[level + 1].push(PublishedNode {
-            minimum_key,
-            maximum_key,
-            element_count,
-            descriptor,
-        });
+        let consumed = if include_partial_group {
+            children.len()
+        } else {
+            groups
+                .checked_mul(fanout)
+                .ok_or(IndexError::OffsetOverflow)?
+        };
+        let remainder = children.split_off(consumed);
+        let mut children = children.into_iter();
+        for _ in 0..groups {
+            let group = children.by_ref().take(fanout).collect::<Vec<_>>();
+            if group.is_empty() || (!include_partial_group && group.len() != fanout) {
+                return Err(IndexError::InvalidFormat(
+                    "streaming routing fanout is invalid",
+                ));
+            }
+            let minimum_key = group.first().unwrap().minimum_key.clone();
+            let maximum_key = group.last().unwrap().maximum_key.clone();
+            let element_count = group.iter().try_fold(0u64, |sum, child| {
+                sum.checked_add(child.element_count)
+                    .ok_or(IndexError::OffsetOverflow)
+            })?;
+            let entries = group
+                .into_iter()
+                .map(|child| RoutingEntry {
+                    minimum_key: child.minimum_key,
+                    maximum_key: child.maximum_key,
+                    element_count: child.element_count,
+                    child: child.descriptor,
+                })
+                .collect();
+            let routing = RoutingNode::new_for_kind(
+                self.identity.index_id,
+                height,
+                self.logical_kind,
+                entries,
+            )?;
+            let payload = routing.encode_payload()?;
+            let component = encode_component(
+                self.identity,
+                ComponentKind::ROUTING_NODE,
+                self.routing_codec_version,
+                0,
+                u64::try_from(payload.len()).map_err(|_| IndexError::OffsetOverflow)?,
+                payload,
+            )?;
+            let encoded_length = component.bytes().len();
+            let header = component.header();
+            let descriptor = self.sink.stage_component(component).await?;
+            validate_placed_component(&descriptor, header, encoded_length)?;
+            if self.levels.len() <= level + 1 {
+                self.levels.resize_with(level + 2, Vec::new);
+            }
+            self.record_descriptor(&descriptor)?;
+            self.levels[level + 1].push(PublishedNode {
+                minimum_key,
+                maximum_key,
+                element_count,
+                descriptor,
+            });
+        }
+        self.levels[level] = remainder;
         Ok(())
     }
 
@@ -1138,28 +1197,53 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn completed_pack_moves_into_sink_and_preserves_component_ranges() {
+    async fn completed_components_share_one_pack_and_preserve_ranges() {
         let identity = SegmentIdentity::new(1, 2, [3; 32], 4).unwrap();
         let first =
             encode_component(identity, ComponentKind::POSTINGS, 1, 0, 3, vec![1, 2, 3]).unwrap();
         let first_length = first.bytes().len() as u64;
         let second =
             encode_component(identity, ComponentKind::POSTINGS, 1, 0, 2, vec![4, 5]).unwrap();
-        let mut builder = ComponentPackBuilder::new();
-        builder.push(first).unwrap();
-        builder.push(second).unwrap();
-        let buffer = builder.bytes.as_ptr();
         let mut sink = ExactMemorySink::new();
-        let descriptors = sink.publish_pack(builder.finish().unwrap()).await.unwrap();
-        assert_eq!(descriptors.len(), 2);
-        assert_eq!(descriptors[0].offset, 0);
-        assert_eq!(descriptors[1].offset, first_length);
-        assert_eq!(descriptors[0].path, descriptors[1].path);
-        assert_eq!(
-            sink.objects()[&descriptors[0].path].bytes.as_ptr(),
-            buffer,
-            "publishing must move the completed pack instead of copying it",
-        );
+        sink.begin_segment(identity, &[]).unwrap();
+        let first = sink.stage_component(first).await.unwrap();
+        let second = sink.stage_component(second).await.unwrap();
+        let packs = sink.finalize_segment(identity).await.unwrap();
+        assert_eq!(first.offset, 0);
+        assert_eq!(second.offset, first_length);
+        assert_eq!(first.pack_ordinal, second.pack_ordinal);
+        assert_eq!(packs.len(), 1);
+        assert!(sink.component_bytes(&packs, &first).is_ok());
+        assert!(sink.component_bytes(&packs, &second).is_ok());
+    }
+
+    #[tokio::test]
+    async fn complete_components_never_straddle_pack_boundaries() {
+        let identity = SegmentIdentity::new(1, 2, [3; 32], 4).unwrap();
+        let payload_bytes = super::super::super::INDEX_COMPONENT_BYTES - COMPONENT_HEADER_BYTES;
+        let mut sink = ExactMemorySink::new();
+        sink.begin_segment(identity, &[]).unwrap();
+        let mut descriptors = Vec::new();
+        for value in 0..33_u8 {
+            let component = encode_component(
+                identity,
+                ComponentKind::POSTINGS,
+                1,
+                0,
+                payload_bytes as u64,
+                vec![value; payload_bytes],
+            )
+            .unwrap();
+            descriptors.push(sink.stage_component(component).await.unwrap());
+        }
+        let packs = sink.finalize_segment(identity).await.unwrap();
+        assert_eq!(packs.len(), 2);
+        assert_eq!(descriptors[31].pack_ordinal, 0);
+        assert_eq!(descriptors[32].pack_ordinal, 1);
+        assert_eq!(descriptors[32].offset, 0);
+        for descriptor in &descriptors {
+            descriptor.pack(identity.index_id, &packs).unwrap();
+        }
     }
 
     #[tokio::test]
@@ -1184,14 +1268,16 @@ mod tests {
             });
         }
         let mut sink = ExactMemorySink::new();
+        sink.begin_segment(identity, &[]).unwrap();
         let stream = publish_stream(&mut sink, identity, 1, leaves)
             .await
             .unwrap();
-        assert_eq!(sink.publish_calls(), 5);
-        assert_eq!(sink.objects().len(), 5);
+        let packs = sink.finalize_segment(identity).await.unwrap();
+        assert_eq!(sink.publish_calls(), 1);
+        assert_eq!(sink.objects().len(), 1);
         assert_eq!(stream.component_count, 36); // 33 leaves, 2 parents, 1 root.
         assert_eq!(stream.root.component_kind, ComponentKind::ROUTING_NODE);
-        assert!(sink.component_bytes(&stream.root).is_ok());
+        assert!(sink.component_bytes(&packs, &stream.root).is_ok());
     }
 
     #[tokio::test]
@@ -1211,12 +1297,11 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let mut sink = ExactMemorySink::new();
-        let mut pack = ComponentPackBuilder::new();
+        sink.begin_segment(identity, &[]).unwrap();
+        let mut descriptors = Vec::new();
         for component in generated {
-            pack.push(component).unwrap();
+            descriptors.push(sink.stage_component(component).await.unwrap());
         }
-        let descriptors = sink.publish_pack(pack.finish().unwrap()).await.unwrap();
-        let before = sink.objects().len();
         let leaves = descriptors
             .iter()
             .enumerate()
@@ -1231,6 +1316,7 @@ mod tests {
             publish_descriptor_stream(&mut sink, identity, ComponentKind::LIVE_MASK, 1, leaves)
                 .await
                 .unwrap();
+        let packs = sink.finalize_segment(identity).await.unwrap();
         assert_eq!(stream.component_count, 3);
         assert_eq!(
             stream.encoded_bytes,
@@ -1240,13 +1326,15 @@ mod tests {
                 .sum::<u64>()
                 + stream.root.encoded_length
         );
-        assert_eq!(sink.objects().len(), before + 1);
+        assert_eq!(sink.objects().len(), 1);
+        assert!(sink.component_bytes(&packs, &stream.root).is_ok());
     }
 
     #[tokio::test]
     async fn streaming_small_leaves_share_bounded_ordinary_packs() {
         let identity = SegmentIdentity::new(1, 2, [3; 32], 4).unwrap();
         let mut sink = ExactMemorySink::new();
+        sink.begin_segment(identity, &[]).unwrap();
         let mut publisher =
             StreamingComponentPublisher::new(&mut sink, identity, ComponentKind::POSTINGS, 1, 1)
                 .unwrap();
@@ -1262,17 +1350,71 @@ mod tests {
                 .unwrap();
         }
         let stream = publisher.finish().await.unwrap();
+        let packs = sink.finalize_segment(identity).await.unwrap();
 
         assert_eq!(stream.component_count, 43); // 40 leaves, 2 parents, 1 root.
-        assert_eq!(sink.publish_calls(), 5);
-        assert_eq!(sink.objects().len(), 5);
-        assert!(sink.component_bytes(&stream.root).is_ok());
+        assert_eq!(sink.publish_calls(), 1);
+        assert_eq!(sink.objects().len(), 1);
+        assert!(sink.component_bytes(&packs, &stream.root).is_ok());
+    }
+
+    #[tokio::test]
+    async fn routing_layers_share_byte_bounded_ordinary_packs() {
+        let identity = SegmentIdentity::new(1, 2, [3; 32], 4).unwrap();
+        let mut sink = ExactMemorySink::new();
+        sink.begin_segment(identity, &[]).unwrap();
+        let mut publisher =
+            StreamingComponentPublisher::new(&mut sink, identity, ComponentKind::POSTINGS, 1, 1)
+                .unwrap();
+        for value in 0..1_024_u32 {
+            publisher
+                .push_payload(
+                    value.to_be_bytes().to_vec(),
+                    value.to_be_bytes().to_vec(),
+                    1,
+                    value.to_le_bytes().to_vec(),
+                )
+                .await
+                .unwrap();
+        }
+        let stream = publisher.finish().await.unwrap();
+        let packs = sink.finalize_segment(identity).await.unwrap();
+
+        assert_eq!(stream.component_count, 1_057); // 1,024 leaves, 32 parents, 1 root.
+        assert_eq!(sink.publish_calls(), 1);
+        assert_eq!(sink.objects().len(), 1);
+        assert!(sink.component_bytes(&packs, &stream.root).is_ok());
+    }
+
+    #[test]
+    fn tiny_components_are_bounded_by_pack_bytes_not_worst_case_count() {
+        let identity = SegmentIdentity::new(1, 2, [3; 32], 4).unwrap();
+        let mut builder = ComponentPackBuilder::new();
+        for value in 0..1_024_u32 {
+            builder
+                .push(
+                    encode_component(
+                        identity,
+                        ComponentKind::POSTINGS,
+                        1,
+                        0,
+                        4,
+                        value.to_le_bytes().to_vec(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        let pack = builder.finish().unwrap();
+        assert_eq!(pack.component_count().unwrap(), 1_024);
+        assert!(pack.bytes().len() < INDEX_ARTIFACT_PACK_BYTES);
     }
 
     #[tokio::test]
     async fn maximum_keyword_boundaries_use_bounded_term_fanout() {
         let identity = SegmentIdentity::new(1, 2, [3; 32], 4).unwrap();
         let mut sink = ExactMemorySink::new();
+        sink.begin_segment(identity, &[]).unwrap();
         let mut publisher = StreamingComponentPublisher::new(
             &mut sink,
             identity,
@@ -1291,10 +1433,11 @@ mod tests {
                 .unwrap();
         }
         let stream = publisher.finish().await.unwrap();
+        let packs = sink.finalize_segment(identity).await.unwrap();
         assert_eq!(stream.routing_height, 2);
         assert_eq!(stream.leaf_count, 8);
         assert_eq!(stream.component_count, 11); // Eight leaves, two parents, one root.
-        let root = sink.component_bytes(&stream.root).unwrap();
+        let root = sink.component_bytes(&packs, &stream.root).unwrap();
         assert!(root.len() <= super::super::super::INDEX_COMPONENT_BYTES);
     }
 
@@ -1302,6 +1445,7 @@ mod tests {
     async fn range_subtree_assembly_is_completion_order_independent() {
         let identity = SegmentIdentity::new(1, 2, [3; 32], 4).unwrap();
         let mut sink = ExactMemorySink::new();
+        sink.begin_segment(identity, &[]).unwrap();
         let mut left =
             StreamingComponentPublisher::new(&mut sink, identity, ComponentKind::POSTINGS, 1, 1)
                 .unwrap();
@@ -1336,7 +1480,15 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(reversed.root, ordered.root);
+        let packs = sink.finalize_segment(identity).await.unwrap();
+        assert_eq!(packs.len(), 1, "all logical streams share the segment pack");
+        assert_eq!(reversed.root.checksum, ordered.root.checksum);
+        assert_eq!(reversed.root.encoded_length, ordered.root.encoded_length);
+        assert_eq!(reversed.root.logical_length, ordered.root.logical_length);
+        assert_eq!(
+            sink.component_bytes(&packs, &reversed.root).unwrap(),
+            sink.component_bytes(&packs, &ordered.root).unwrap(),
+        );
         assert_eq!(reversed.minimum_key, vec![0]);
         assert_eq!(reversed.maximum_key, vec![1]);
         assert_eq!(reversed.element_count, 2);

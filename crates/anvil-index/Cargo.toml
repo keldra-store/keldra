@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 blake3 = "1.8"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 sux = { version = "=0.14.0", default-features = false }
 thiserror = "2"
 

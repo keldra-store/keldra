@@ -93,19 +93,22 @@ impl WriterCharge {
                     .checked_add(record.terms.len())
                     .ok_or(IndexError::OffsetOverflow)
             })?;
-        let point_count = source.records.iter().try_fold(self.point_count, |count, record| {
-            record.points.iter().try_fold(count, |count, point| {
-                count
-                    .checked_add(
-                        point
-                            .values
-                            .len()
-                            .saturating_add(1)
-                            .saturating_add(usize::from(point.null)),
-                    )
-                    .ok_or(IndexError::OffsetOverflow)
-            })
-        })?;
+        let point_count = source
+            .records
+            .iter()
+            .try_fold(self.point_count, |count, record| {
+                record.points.iter().try_fold(count, |count, point| {
+                    count
+                        .checked_add(
+                            point
+                                .values
+                                .len()
+                                .saturating_add(1)
+                                .saturating_add(usize::from(point.null)),
+                        )
+                        .ok_or(IndexError::OffsetOverflow)
+                })
+            })?;
         Ok(Self {
             schema_workspace_bytes: self.schema_workspace_bytes,
             retained_source_bytes: self
@@ -389,7 +392,7 @@ pub(super) fn build_point_refs(
         let (right_field, right_value) = point(sources, documents, *right);
         left_field
             .cmp(&right_field)
-            .then_with(|| left_value.cmp(right_value))
+            .then_with(|| left_value.cmp(&right_value))
             .then_with(|| left.doc_id.cmp(&right.doc_id))
     });
     Ok(references)

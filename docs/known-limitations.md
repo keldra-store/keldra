@@ -10,14 +10,20 @@ format-4 generation from its declared source scope.
 
 | Area | Current boundary |
 | --- | --- |
+| Index path-prefix admission | A definition may currently accept a noncanonical prefix, but such a prefix can select no objects or an ambiguous scope. Use an empty prefix for the whole bucket or canonical relative path segments, optionally ending in `/`. Zanzibar authorization and ordinary object-path validation are unaffected. |
 | Typed JSON physical order | A query uses the streaming physical-order path only when its complete ordered field/direction list exactly matches the definition. Any other order uses the exact bounded top-K path and may inspect every matching document while retaining only bounded heap state. Ordered fields must be declared single-valued. |
 | Typed JSON collation | Scalar ordering is deterministic byte/value ordering, not locale-aware collation. Missing and explicit `null` remain distinct. |
+| Typed JSON missing and null policy | Selected fields currently accept missing values and explicit `null`; the public definition API does not yet expose stricter per-field rejection. These states remain distinct and queryable, and scalar values retain their declared type. Applications that require either state to be invalid should enforce that rule before writing the source object. |
 | Typed JSON Boolean expressions | The public query's flat predicate list is a conjunction. `IN` provides same-field disjunction. Arbitrary nested Boolean expressions and `NOT` are not yet exposed by the public API; applications can issue separate queries and combine authorized result identities when needed. |
 | Fixed-schema index kinds | Explicit per-field type and capability declarations initially apply to Typed JSON. Metadata Filter and the dedicated Full Text kind retain their fixed built-in field schemas and analyzer; they do not expose a second generic capability declaration surface. |
 | Query planning | Boolean conjunctions stably order exact advanceable posting iterators by exact posting document frequency. Range and all-document cursors use the segment document count as a conservative cost, and bounded OR unions use a deduplicating heap. Full-text scoring does not yet use impact/WAND skipping. Results remain exact, but broad range or text queries can still read more blocks; callers should include selective indexed predicates and exact physical ordering where available. |
+| Many-segment physical ordering | A physically ordered query currently selects the next head by comparing the active head from every segment, with a fixed maximum of 4,096 segments per generation. Results, pagination, and memory bounds remain exact, but work grows with the segment count. Normal compaction reduces that count; a one-head-per-segment heap is deferred until production evidence shows this bounded comparison is material. |
 | Recent-mutation query work | Every returned candidate passes the mandatory bounded exact-current check, so an overwritten or deleted object cannot leak as a stale result. The optional disposable post-generation invalidation overlay is not yet materialized, which can increase candidate checks while a newer complete generation is building; it does not weaken result correctness or freshness evidence. |
+| Live-mask pack reclamation | An incremental live-mask rewrite preserves the segment's existing pack ordinals and therefore retains its complete prior pack table until normal segment compaction rebuilds that segment. Packs no longer reachable from the replacement live-mask stream may be reclaimed later than their logical contents require, but remain bounded by ordinary segment compaction and generation retention; query results and durability are unaffected. |
 | Broad multi-term ranges | Prefix and scalar-range predicates stream exact posting unions with corpus-independent memory. After each 256 candidate DocIds, the cursor re-enters the bounded term range strictly after the last emitted DocId; a broad range with heavy Zanzibar filtering can therefore reread dictionary/posting blocks. Results and continuations remain exact. Narrower predicates reduce that work; a persistent range-union accelerator is deferred pending production evidence. |
-| Vector search | Vector generations use exact search; an approximate-nearest-neighbour graph remains future work. |
+| Term dictionary encoding | Format-4 term leaves store complete terms rather than front-coding adjacent terms. Lookups and bounds remain exact, but indices with many long shared-prefix terms consume more authoritative bytes than a Lucene-style prefix-compressed dictionary. This is a format-size optimization, not a query or visibility limitation. |
+| Vector and hybrid search | Vector generations use exact search; an approximate-nearest-neighbour graph remains future work. The public Vector and Hybrid query surfaces do not yet accept independent scalar filter fields, so applications should narrow the definition path or post-filter the returned authorized identities when that is viable. |
+| External-sort tuning | Format-4 construction remains bounded by the per-kind memory pool, but the per-kind external-sort chunk setting does not yet alter the format-4 merge chunk; merge sizing uses a fixed fraction of that shared budget. Increasing the shared kind budget changes available merge memory. The dedicated chunk setting will be wired only with lane-aware accounting so parallel construction cannot multiply the configured ceiling. |
 | Query placement | One weighted-HRW owner executes a query against locally materialized or demand-fetched segment bytes. Anvil does not scatter one query across nodes. |
 | Query resources | Query admission and working memory are shared process resources. A request that cannot obtain its bounded workspace within its deadline fails without weakening result correctness or publication state. |
 | Facets and aggregates | A Typed JSON query with facet or aggregate requests performs a second authorized pass over every matching document after selecting the result page. Memory remains bounded by the shared query budget and results remain exact, but computation time is proportional to the complete authorized match set rather than the page limit. Selective predicates reduce this work. |
@@ -659,3 +665,21 @@ that same accounting path scope. The last complete rollup remains readable;
 ordinary restarts resume valid rollups, and no unrelated object heads or startup
 inventory are scanned. Operators can retry after peer health returns. A
 resumable cross-node snapshot protocol is deferred.
+
+## Abandoned raw upload-spool cleanup
+
+Anvil removes at most 256 recognized abandoned raw-upload files while opening
+one node. The bound prevents a crash-created disposable directory from turning
+into an unbounded startup inventory. If repeated hard process failures leave
+more files, later restarts remove further bounded pages; the remaining files
+consume only the configured disposable spool filesystem and are never treated
+as acknowledged objects. Operators using persistent spool storage may clear it
+while Anvil is stopped. A size-bounded tmpfs naturally discards the files on
+host reboot.
+
+`ANVIL_UPLOAD_SPOOL_MAX_BYTES` bounds bytes held by active uploads in one
+process. Because streaming puts intentionally declare no content length, Anvil
+fails the affected unacknowledged stream when its next chunk would exceed the
+shared capacity instead of allowing several partially admitted streams to wait
+on one another indefinitely. Clients may retry after another upload completes;
+no published object or durable identified stage is removed.

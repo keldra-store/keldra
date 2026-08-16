@@ -64,6 +64,7 @@ where
     E: CompactionExecutor,
 {
     let inputs = validate_merge(schema, input_descriptors, output_identity, limits)?;
+    sink.begin_segment(output_identity, &[])?;
     let directory = CompactionDirectory::new(directory.clone(), executor.clone());
     let minimum_field_lengths =
         std::sync::Arc::new(load_minimum_field_lengths(&directory, schema, &inputs).await?);
@@ -125,6 +126,14 @@ where
         counts.total_term_frequency = built.counts.total_term_frequency;
         if !field.components.contains(FieldComponents::DOC_VALUES)
             && !field.components.contains(FieldComponents::POINTS)
+        {
+            counts.null_documents = built.counts.null_documents;
+            counts.value_count = built.counts.value_count;
+            counts.boolean_values = built.counts.boolean_values;
+            counts.string_values = built.counts.string_values;
+        }
+        if !field.components.contains(FieldComponents::DOC_VALUES)
+            && !field.components.contains(FieldComponents::POINTS)
             && !field.components.contains(FieldComponents::NORMS)
             && !field.components.contains(FieldComponents::VECTOR)
         {
@@ -157,10 +166,12 @@ where
     )
     .await?;
     streams.push((ComponentKind::SCORING_STATISTICS, None, statistics));
+    let packs = sink.finalize_segment(output_identity).await?;
     assemble_segment(
         output_identity,
         document_count,
         source_count,
+        packs,
         locator,
         streams,
     )
@@ -473,6 +484,7 @@ fn assemble_segment(
     identity: SegmentIdentity,
     document_count: u32,
     source_count: u64,
+    packs: Vec<super::super::ArtifactPackReference>,
     locator: PublishedStream,
     streams: Vec<SegmentStream>,
 ) -> Result<BuiltSegment, IndexError> {
@@ -498,6 +510,7 @@ fn assemble_segment(
             identity,
             document_count,
             document_count,
+            packs,
             components,
             encoded_bytes,
             logical_bytes,

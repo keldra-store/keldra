@@ -1,12 +1,17 @@
 //! Format-v4 index publication through ordinary Anvil objects.
 
+use std::collections::BTreeMap;
 use std::io::Read;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anvil_index::IndexError;
 use anvil_index::compaction::CompactionProgress;
-use anvil_index::v4::build::{ComponentBatchSink, ComponentPack};
-use anvil_index::v4::{ArtifactDescriptor, INDEX_COMPONENT_BYTES, IndexKind, SegmentDescriptor};
+use anvil_index::v4::build::ComponentBatchSink;
+use anvil_index::v4::{
+    ArtifactDescriptor, ArtifactPackReference, GeneratedComponent, INDEX_ARTIFACT_PACK_BYTES,
+    INDEX_COMPONENT_BYTES, IndexKind, SegmentDescriptor, SegmentIdentity,
+};
 use anvil_store::{BlobRef, DefinitionKind, ObjectKey, Store, VersionId};
 use tonic::Status;
 use tracing::Instrument;
@@ -78,6 +83,7 @@ impl IndexGenerationPublisher {
             bucket_id,
             admission,
             progress: None,
+            active: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -473,17 +479,18 @@ impl IndexGenerationPublisher {
             .take()
             .ok_or_else(|| Status::data_loss("format-v4 generation manifest has no payload"))?;
         let mut bytes = Vec::new();
+        let maximum =
+            reference.blob.length.checked_add(1).ok_or_else(|| {
+                Status::resource_exhausted("format-v4 manifest length exceeds u64")
+            })?;
         payload
             .by_ref()
-            .take(INDEX_COMPONENT_BYTES as u64 + 1)
+            .take(maximum)
             .read_to_end(&mut bytes)
             .map_err(|error| Status::internal(format!("read format-v4 manifest: {error}")))?;
-        if bytes.len() > INDEX_COMPONENT_BYTES
-            || bytes.len() as u64 != reference.blob.length
-            || blake3::hash(&bytes).as_bytes() != &reference.blob.hash
-        {
+        if bytes.len() as u64 != reference.blob.length {
             return Err(Status::data_loss(
-                "format-v4 generation manifest bytes differ from their reference",
+                "format-v4 generation manifest length differs from its verified object reference",
             ));
         }
         let manifest = IndexGenerationManifest::decode(&bytes)
@@ -531,29 +538,338 @@ pub(crate) struct IndexComponentBatchSink {
     bucket_id: u64,
     admission: DerivedArtifactAdmission,
     progress: Option<CompactionProgress>,
+    active: Arc<Mutex<Option<PendingSegmentPacks>>>,
+}
+
+struct PendingSegmentPacks {
+    identity: SegmentIdentity,
+    base_packs: Vec<ArtifactPackReference>,
+    staged: Vec<StagedIndexPackSlot>,
+    pending_bytes: Vec<u8>,
+    pending_components: u64,
+    finalizing: bool,
+}
+
+struct CompletedSegmentPacks {
+    base_packs: Vec<ArtifactPackReference>,
+    staged: Vec<StagedIndexPack>,
+}
+
+struct StagedIndexPack {
+    blob: BlobRef,
+    component_count: u64,
+}
+
+enum StagedIndexPackSlot {
+    Pending,
+    Ready(StagedIndexPack),
+    Failed,
+}
+
+struct ReservedIndexPack {
+    identity: SegmentIdentity,
+    slot: usize,
+    bytes: Vec<u8>,
+    component_count: u64,
+}
+
+impl PendingSegmentPacks {
+    fn must_seal_before(&self, encoded: usize) -> Result<bool, IndexError> {
+        Ok(!self.pending_bytes.is_empty()
+            && self
+                .pending_bytes
+                .len()
+                .checked_add(encoded)
+                .ok_or(IndexError::OffsetOverflow)?
+                > INDEX_ARTIFACT_PACK_BYTES)
+    }
+
+    fn next_component_location(&self) -> Result<(u32, u64), IndexError> {
+        let pack_ordinal = u32::try_from(
+            self.base_packs
+                .len()
+                .checked_add(self.staged.len())
+                .ok_or(IndexError::OffsetOverflow)?,
+        )
+        .map_err(|_| IndexError::OffsetOverflow)?;
+        let offset =
+            u64::try_from(self.pending_bytes.len()).map_err(|_| IndexError::OffsetOverflow)?;
+        Ok((pack_ordinal, offset))
+    }
+
+    fn reserve_pending_pack(&mut self) -> Result<Option<ReservedIndexPack>, IndexError> {
+        if self.pending_bytes.is_empty() {
+            return Ok(None);
+        }
+        let slot = self.staged.len();
+        let bytes = std::mem::take(&mut self.pending_bytes);
+        let component_count = std::mem::take(&mut self.pending_components);
+        if component_count == 0 {
+            return Err(IndexError::InvalidFormat(
+                "non-empty index pack has no components",
+            ));
+        }
+        self.staged.push(StagedIndexPackSlot::Pending);
+        Ok(Some(ReservedIndexPack {
+            identity: self.identity,
+            slot,
+            bytes,
+            component_count,
+        }))
+    }
+
+    fn reserve_component(
+        &mut self,
+        component: GeneratedComponent,
+    ) -> Result<(ArtifactDescriptor, Vec<ReservedIndexPack>), IndexError> {
+        if self.finalizing {
+            return Err(IndexError::InvalidDefinition(
+                "component sink is finalizing its active segment".into(),
+            ));
+        }
+        let identity = component.header().identity;
+        if self.identity != identity {
+            return Err(IndexError::InvalidDefinition(
+                "component sink cannot cross segment identities".into(),
+            ));
+        }
+        let encoded = component.bytes().len();
+        if encoded > INDEX_ARTIFACT_PACK_BYTES {
+            return Err(IndexError::ResourceLimit {
+                needed: encoded,
+                limit: INDEX_ARTIFACT_PACK_BYTES,
+            });
+        }
+        let mut reserved = Vec::new();
+        if self.must_seal_before(encoded)?
+            && let Some(pack) = self.reserve_pending_pack()?
+        {
+            reserved.push(pack);
+        }
+        let (pack_ordinal, offset) = self.next_component_location()?;
+        let descriptor = component.placed(pack_ordinal, offset)?;
+        let component_bytes = component.into_bytes();
+        if self.pending_bytes.is_empty() {
+            self.pending_bytes = component_bytes;
+        } else {
+            self.pending_bytes.extend_from_slice(&component_bytes);
+        }
+        self.pending_components = self
+            .pending_components
+            .checked_add(1)
+            .ok_or(IndexError::OffsetOverflow)?;
+        if self.pending_bytes.len() == INDEX_ARTIFACT_PACK_BYTES
+            && let Some(pack) = self.reserve_pending_pack()?
+        {
+            reserved.push(pack);
+        }
+        Ok((descriptor, reserved))
+    }
+
+    fn complete(self) -> Result<CompletedSegmentPacks, IndexError> {
+        let mut staged = Vec::with_capacity(self.staged.len());
+        for slot in self.staged {
+            match slot {
+                StagedIndexPackSlot::Ready(pack) => staged.push(pack),
+                StagedIndexPackSlot::Pending => {
+                    return Err(IndexError::InvalidFormat(
+                        "index pack staging slot is unresolved",
+                    ));
+                }
+                StagedIndexPackSlot::Failed => {
+                    return Err(IndexError::Io("index pack staging failed".into()));
+                }
+            }
+        }
+        Ok(CompletedSegmentPacks {
+            base_packs: self.base_packs,
+            staged,
+        })
+    }
+}
+
+fn deduplicate_staged_packs(
+    packs: &[StagedIndexPack],
+) -> Result<(Vec<usize>, Vec<usize>), IndexError> {
+    let mut unique_by_hash = BTreeMap::<[u8; 32], usize>::new();
+    let mut unique = Vec::<usize>::new();
+    let mut outcomes = Vec::with_capacity(packs.len());
+    for (pack_index, pack) in packs.iter().enumerate() {
+        if let Some(&ordinal) = unique_by_hash.get(&pack.blob.hash) {
+            if packs[unique[ordinal]].blob.length != pack.blob.length {
+                return Err(IndexError::Integrity);
+            }
+            outcomes.push(ordinal);
+        } else {
+            let ordinal = unique.len();
+            unique_by_hash.insert(pack.blob.hash, ordinal);
+            unique.push(pack_index);
+            outcomes.push(ordinal);
+        }
+    }
+    Ok((unique, outcomes))
 }
 
 impl ComponentBatchSink for IndexComponentBatchSink {
-    fn publish_pack(
+    fn begin_segment(
         &mut self,
-        pack: ComponentPack,
-    ) -> impl std::future::Future<Output = Result<Vec<ArtifactDescriptor>, IndexError>> + Send {
-        async move { self.publish_component_pack(pack).await }
+        identity: SegmentIdentity,
+        base_packs: &[ArtifactPackReference],
+    ) -> Result<(), IndexError> {
+        identity.validate()?;
+        let mut shared = self.lock_active()?;
+        if shared.is_some() {
+            return Err(IndexError::InvalidDefinition(
+                "component sink already has an active segment".into(),
+            ));
+        }
+        for pack in base_packs {
+            pack.validate(identity.index_id)?;
+        }
+        *shared = Some(PendingSegmentPacks {
+            identity,
+            base_packs: base_packs.to_vec(),
+            staged: Vec::new(),
+            pending_bytes: Vec::new(),
+            pending_components: 0,
+            finalizing: false,
+        });
+        Ok(())
+    }
+
+    fn stage_component(
+        &mut self,
+        component: GeneratedComponent,
+    ) -> impl std::future::Future<Output = Result<ArtifactDescriptor, IndexError>> + Send {
+        async move { self.stage_component_inner(component).await }
+    }
+
+    fn finalize_segment(
+        &mut self,
+        identity: SegmentIdentity,
+    ) -> impl std::future::Future<Output = Result<Vec<ArtifactPackReference>, IndexError>> + Send
+    {
+        async move { self.finalize_segment_inner(identity).await }
     }
 }
 
 impl IndexComponentBatchSink {
-    async fn publish_component_pack(
-        &self,
-        pack: ComponentPack,
-    ) -> Result<Vec<ArtifactDescriptor>, IndexError> {
-        if pack.identity().index_id != self.definition.index_id {
+    fn lock_active(&self) -> Result<MutexGuard<'_, Option<PendingSegmentPacks>>, IndexError> {
+        self.active
+            .lock()
+            .map_err(|_| IndexError::InvalidFormat("component sink mutex is poisoned"))
+    }
+
+    async fn stage_component_inner(
+        &mut self,
+        component: GeneratedComponent,
+    ) -> Result<ArtifactDescriptor, IndexError> {
+        let identity = component.header().identity;
+        if identity.index_id != self.definition.index_id {
             return Err(IndexError::InvalidDefinition(
                 "component publication reached the wrong index publisher".into(),
             ));
         }
-        let encoded_bytes = pack.encoded_bytes();
-        let component_count = pack.component_count()?;
+        let (descriptor, reserved) = {
+            let mut shared = self.lock_active()?;
+            let active = shared.as_mut().ok_or(IndexError::InvalidFormat(
+                "component sink has no active segment",
+            ))?;
+            active.reserve_component(component)?
+        };
+        for pack in reserved {
+            self.stage_reserved_pack(pack).await?;
+        }
+        Ok(descriptor)
+    }
+
+    async fn stage_reserved_pack(&self, pack: ReservedIndexPack) -> Result<(), IndexError> {
+        let result = stage_index_bytes(&self.store, &pack.bytes, self.admission).await;
+        // Store staging is the content-address authority and has already
+        // computed the BLAKE3 identity while writing these exact bytes.
+        let result = match result {
+            Ok(blob) if blob.length == pack.bytes.len() as u64 => Ok(StagedIndexPack {
+                blob,
+                component_count: pack.component_count,
+            }),
+            Ok(_) => Err(IndexError::Integrity),
+            Err(error) => Err(error),
+        };
+        let mut shared = self.lock_active()?;
+        let active = shared.as_mut().ok_or(IndexError::InvalidFormat(
+            "component sink has no active segment",
+        ))?;
+        if active.identity != pack.identity {
+            return Err(IndexError::InvalidDefinition(
+                "component sink changed segment while staging a pack".into(),
+            ));
+        }
+        let slot = active
+            .staged
+            .get_mut(pack.slot)
+            .ok_or(IndexError::InvalidFormat(
+                "index pack staging slot is missing",
+            ))?;
+        if !matches!(slot, StagedIndexPackSlot::Pending) {
+            return Err(IndexError::InvalidFormat(
+                "index pack staging slot resolved more than once",
+            ));
+        }
+        match result {
+            Ok(staged) => {
+                *slot = StagedIndexPackSlot::Ready(staged);
+                Ok(())
+            }
+            Err(error) => {
+                *slot = StagedIndexPackSlot::Failed;
+                Err(error)
+            }
+        }
+    }
+
+    async fn finalize_segment_inner(
+        &mut self,
+        identity: SegmentIdentity,
+    ) -> Result<Vec<ArtifactPackReference>, IndexError> {
+        let tail = {
+            let mut shared = self.lock_active()?;
+            let active = shared.as_mut().ok_or(IndexError::InvalidFormat(
+                "component sink has no active segment",
+            ))?;
+            if active.identity != identity {
+                return Err(IndexError::InvalidDefinition(
+                    "component sink finalized another segment identity".into(),
+                ));
+            }
+            if active.finalizing {
+                return Err(IndexError::InvalidDefinition(
+                    "component sink is already finalizing".into(),
+                ));
+            }
+            active.finalizing = true;
+            active.reserve_pending_pack()?
+        };
+        if let Some(pack) = tail {
+            self.stage_reserved_pack(pack).await?;
+        }
+        let active = self
+            .lock_active()?
+            .take()
+            .ok_or(IndexError::InvalidFormat(
+                "component sink has no active segment",
+            ))?
+            .complete()?;
+        let pack_count = active.staged.len() as u64;
+        let encoded_bytes = active
+            .staged
+            .iter()
+            .try_fold(0_u64, |total, pack| total.checked_add(pack.blob.length))
+            .ok_or(IndexError::OffsetOverflow)?;
+        let component_count = active
+            .staged
+            .iter()
+            .try_fold(0_u64, |total, pack| total.checked_add(pack.component_count))
+            .ok_or(IndexError::OffsetOverflow)?;
         let span = tracing::info_span!(
             "anvil.index.v4_component_publish",
             index.id = self.definition.index_id,
@@ -561,10 +877,13 @@ impl IndexComponentBatchSink {
             bucket.id = self.bucket_id,
             component.count = component_count,
             component.bytes = encoded_bytes,
-            pack.count = 1_u64,
+            pack.count = pack_count,
         );
         let started = std::time::Instant::now();
-        let result = self.publish_one_pack(pack).instrument(span.clone()).await;
+        let result = self
+            .publish_staged_packs(active)
+            .instrument(span.clone())
+            .await;
         let failed = result.is_err();
         span.in_scope(|| {
             tracing::info!(
@@ -575,6 +894,8 @@ impl IndexComponentBatchSink {
                     u64::from(failed),
                 monotonic_counter.anvil_index_v4_component_bytes_total =
                     if failed { 0 } else { encoded_bytes },
+                monotonic_counter.anvil_index_v4_packs_published_total =
+                    if failed { 0 } else { pack_count },
                 histogram.anvil_index_v4_component_publish_duration_seconds =
                     started.elapsed().as_secs_f64(),
                 "format-v4 index components publication finished"
@@ -588,36 +909,59 @@ impl IndexComponentBatchSink {
         result
     }
 
-    async fn publish_one_pack(
+    async fn publish_staged_packs(
         &self,
-        pack: ComponentPack,
-    ) -> Result<Vec<ArtifactDescriptor>, IndexError> {
-        let blob = stage_index_bytes(&self.store, pack.bytes(), self.admission).await?;
-        if blob.length != pack.encoded_bytes()
-            || blob.hash != *blake3::hash(pack.bytes()).as_bytes()
-        {
-            return Err(IndexError::Integrity);
-        }
-        let path = artifact_path(self.definition.index_id, blob.hash);
-        let outcome = self
-            .artifacts
-            .publish(IndexArtifactPublish {
+        active: CompletedSegmentPacks,
+    ) -> Result<Vec<ArtifactPackReference>, IndexError> {
+        let (unique_pack_indices, pack_outcomes) = deduplicate_staged_packs(&active.staged)?;
+        let mut requests = Vec::with_capacity(unique_pack_indices.len());
+        for pack_index in unique_pack_indices {
+            let pack = &active.staged[pack_index];
+            let path = artifact_path(self.definition.index_id, pack.blob.hash);
+            requests.push(IndexArtifactPublish {
                 storage_tenant: self.definition.tenant.clone(),
                 bucket: self.definition.bucket.clone(),
                 tenant_id: self.tenant_id,
                 bucket_id: self.bucket_id,
                 index_id: self.definition.index_id,
                 exact_path: path.clone(),
-                blob: blob.clone(),
+                blob: pack.blob.clone(),
                 expected_version: None,
-                command_id: content_command(self.definition.index_id, &path, &blob),
+                command_id: content_command(self.definition.index_id, &path, &pack.blob),
                 definition_guard: None,
                 definition_intent: None,
                 admission: self.admission,
-            })
+            });
+        }
+        let published_pack_count = requests.len();
+        let outcomes = self
+            .artifacts
+            .publish_many(requests)
             .await
             .map_err(|error| IndexError::Io(error.to_string()))?;
-        pack.descriptors(path, outcome.version.0, blob.hash)
+        if outcomes.len() != published_pack_count {
+            return Err(IndexError::InvalidFormat(
+                "grouped pack outcome count differs from staged pack count",
+            ));
+        }
+        let mut references = active.base_packs;
+        references.reserve(active.staged.len());
+        for (pack, outcome_ordinal) in active.staged.into_iter().zip(pack_outcomes) {
+            let outcome = outcomes
+                .get(outcome_ordinal)
+                .ok_or(IndexError::InvalidFormat(
+                    "grouped pack outcome ordinal is missing",
+                ))?;
+            let path = artifact_path(self.definition.index_id, pack.blob.hash);
+            references.push(ArtifactPackReference::new(
+                self.definition.index_id,
+                path,
+                outcome.version.0,
+                pack.blob.hash,
+                pack.blob.length,
+            )?);
+        }
+        Ok(references)
     }
 }
 
@@ -653,14 +997,6 @@ fn validate_manifest_reference(
     {
         return Err(Status::data_loss(
             "format-v4 manifest identity differs from its current-pointer reference",
-        ));
-    }
-    let bytes = manifest.encode().map_err(generation_status)?;
-    if bytes.len() as u64 != reference.blob.length
-        || blake3::hash(&bytes).as_bytes() != &reference.blob.hash
-    {
-        return Err(Status::data_loss(
-            "format-v4 manifest bytes differ from their current-pointer reference",
         ));
     }
     Ok(())
@@ -732,7 +1068,12 @@ fn content_command(index_id: u64, path: &str, blob: &BlobRef) -> String {
 }
 
 fn generation_status(error: super::generation::GenerationError) -> Status {
-    Status::data_loss(error.to_string())
+    match error {
+        super::generation::GenerationError::SizeLimit => {
+            Status::resource_exhausted(error.to_string())
+        }
+        _ => Status::data_loss(error.to_string()),
+    }
 }
 
 fn index_status(error: IndexError) -> Status {
@@ -760,6 +1101,154 @@ mod tests {
             object_version: VersionId(generation + 10),
             published_at_unix_millis: published_at,
         }
+    }
+
+    fn staged_pack(hash: u8, length: u64) -> StagedIndexPack {
+        StagedIndexPack {
+            blob: BlobRef {
+                hash: [hash; 32],
+                length,
+            },
+            component_count: 1,
+        }
+    }
+
+    #[test]
+    fn segment_pack_locations_follow_base_table_and_never_straddle() {
+        let identity = SegmentIdentity::new(7, 3, [4; 32], 9).unwrap();
+        let base = (0_u8..2)
+            .map(|value| {
+                let hash = [value; 32];
+                ArtifactPackReference::new(
+                    7,
+                    artifact_path(7, hash),
+                    u64::from(value) + 1,
+                    hash,
+                    128,
+                )
+                .unwrap()
+            })
+            .collect();
+        let state = PendingSegmentPacks {
+            identity,
+            base_packs: base,
+            staged: vec![StagedIndexPackSlot::Ready(staged_pack(3, 128))],
+            pending_bytes: vec![0; INDEX_ARTIFACT_PACK_BYTES - 64],
+            pending_components: 1,
+            finalizing: false,
+        };
+
+        assert_eq!(
+            state.next_component_location().unwrap(),
+            (3, (INDEX_ARTIFACT_PACK_BYTES - 64) as u64)
+        );
+        assert!(!state.must_seal_before(64).unwrap());
+        assert!(state.must_seal_before(65).unwrap());
+    }
+
+    #[test]
+    fn cloned_lane_accumulator_reserves_nonoverlapping_pack_ranges() {
+        let identity = SegmentIdentity::new(7, 3, [4; 32], 9).unwrap();
+        let shared = Arc::new(Mutex::new(Some(PendingSegmentPacks {
+            identity,
+            base_packs: Vec::new(),
+            staged: Vec::new(),
+            pending_bytes: Vec::new(),
+            pending_components: 0,
+            finalizing: false,
+        })));
+        let mut lanes = Vec::new();
+        for lane in 0..8_u8 {
+            let shared = shared.clone();
+            lanes.push(std::thread::spawn(move || {
+                let mut descriptors = Vec::new();
+                for ordinal in 0..80_u8 {
+                    let payload = vec![lane ^ ordinal; 32 * 1024];
+                    let component = anvil_index::v4::encode_component(
+                        identity,
+                        anvil_index::v4::ComponentKind::POSTINGS,
+                        1,
+                        0,
+                        payload.len() as u64,
+                        payload,
+                    )
+                    .unwrap();
+                    let (descriptor, reserved) = shared
+                        .lock()
+                        .unwrap()
+                        .as_mut()
+                        .unwrap()
+                        .reserve_component(component)
+                        .unwrap();
+                    drop(reserved);
+                    descriptors.push(descriptor);
+                }
+                descriptors
+            }));
+        }
+        let mut descriptors = lanes
+            .into_iter()
+            .flat_map(|lane| lane.join().unwrap())
+            .collect::<Vec<_>>();
+        let mut shared = shared.lock().unwrap();
+        let state = shared.as_mut().unwrap();
+        drop(state.reserve_pending_pack().unwrap());
+        assert!(state.staged.len() >= 2);
+
+        descriptors.sort_by_key(|descriptor| (descriptor.pack_ordinal, descriptor.offset));
+        assert_eq!(descriptors.len(), 640);
+        for descriptor in &descriptors {
+            assert!(
+                descriptor.offset + descriptor.encoded_length <= INDEX_ARTIFACT_PACK_BYTES as u64
+            );
+        }
+        for pair in descriptors.windows(2) {
+            if pair[0].pack_ordinal == pair[1].pack_ordinal {
+                assert_eq!(pair[0].offset + pair[0].encoded_length, pair[1].offset);
+            } else {
+                assert!(pair[0].pack_ordinal < pair[1].pack_ordinal);
+            }
+        }
+    }
+
+    #[test]
+    fn grouped_pack_publication_deduplicates_content_without_losing_ordinals() {
+        let packs = [
+            staged_pack(1, 100),
+            staged_pack(1, 100),
+            staged_pack(2, 200),
+            staged_pack(1, 100),
+        ];
+        let (unique, outcomes) = deduplicate_staged_packs(&packs).unwrap();
+
+        assert_eq!(unique, vec![0, 2]);
+        assert_eq!(outcomes, vec![0, 0, 1, 0]);
+
+        let inconsistent = [staged_pack(1, 100), staged_pack(1, 101)];
+        assert!(matches!(
+            deduplicate_staged_packs(&inconsistent),
+            Err(IndexError::Integrity)
+        ));
+    }
+
+    #[test]
+    fn finalization_fails_closed_on_an_unresolved_staging_slot() {
+        let identity = SegmentIdentity::new(7, 3, [4; 32], 9).unwrap();
+        let state = PendingSegmentPacks {
+            identity,
+            base_packs: Vec::new(),
+            staged: vec![StagedIndexPackSlot::Pending],
+            pending_bytes: Vec::new(),
+            pending_components: 0,
+            finalizing: true,
+        };
+
+        assert!(matches!(
+            state.complete(),
+            Err(IndexError::InvalidFormat(
+                "index pack staging slot is unresolved"
+            ))
+        ));
     }
 
     #[test]

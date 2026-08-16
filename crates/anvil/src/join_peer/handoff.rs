@@ -440,7 +440,9 @@ impl JoinActivationGate for TypedAddHandoff {
         // final authoritative scan.
         self.release_stale_drains(&topology, &peers).await?;
         let payload_spools: Arc<dyn crate::payload_read::PayloadReadSpoolFactory> = Arc::new(
-            AnonymousPayloadReadSpools::new(self.store.payload_spool_directory()),
+            AnonymousPayloadReadSpools::new(self.store.payload_spool_directory()).map_err(
+                |error| Status::internal(format!("create payload-read spool directory: {error}")),
+            )?,
         );
         let started = self.journal_tails(&topology, &peers).await?;
 

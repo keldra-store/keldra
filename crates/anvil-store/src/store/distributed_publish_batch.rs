@@ -1,7 +1,8 @@
 //! One physical coordinator batch for independently receipted distributed publishes.
 
 use super::journal_capacity::SourceJournalAdmission;
-use super::mutations::DistributedEvaluationContext;
+use super::mutation_prefetch::MutationReadCache;
+use super::mutation_types::DistributedEvaluationContext;
 use super::*;
 use crate::model::{CoordinatedObjectMutation, ObjectMutationContext, ObjectMutationGovernance};
 use crate::{BatchOperation, DefinitionMutationIntent};
@@ -109,6 +110,13 @@ impl Store {
         let initial_receipt_status = receipt_status;
         let pruned_receipts =
             self.stage_expired_mutation_receipts(&mut batch, now, &mut receipt_status)?;
+        let read_cache = MutationReadCache::load(
+            self,
+            &prepared
+                .iter()
+                .map(|item| &item.operation)
+                .collect::<Vec<_>>(),
+        )?;
         let mut pending_heads = BTreeMap::new();
         let mut pending_versions = BTreeMap::new();
         let mut pending_receipts = BTreeMap::new();
@@ -137,6 +145,7 @@ impl Store {
                     &mut pending_receipts,
                     &mut pending_blob_references,
                     &mut pending_small_blobs,
+                    &read_cache,
                     &mut policy_cache,
                     &mut versioning_cache,
                     &pruned_receipts,
@@ -339,6 +348,13 @@ impl Store {
         let initial_receipt_status = receipt_status;
         let pruned_receipts =
             self.stage_expired_mutation_receipts(&mut batch, now, &mut receipt_status)?;
+        let read_cache = MutationReadCache::load(
+            self,
+            &prepared
+                .iter()
+                .map(|(_, operation)| operation)
+                .collect::<Vec<_>>(),
+        )?;
         let mut pending_heads = BTreeMap::new();
         let mut pending_versions = BTreeMap::new();
         let mut pending_receipts = BTreeMap::new();
@@ -363,6 +379,7 @@ impl Store {
                     &mut pending_receipts,
                     &mut pending_blob_references,
                     &mut pending_small_blobs,
+                    &read_cache,
                     &mut policy_cache,
                     &mut versioning_cache,
                     &pruned_receipts,

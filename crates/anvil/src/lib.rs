@@ -53,6 +53,7 @@ mod reference_delivery;
 mod s3;
 mod serving_fence;
 mod startup_scan_evidence;
+mod storage_layout;
 mod v05;
 
 use std::net::SocketAddr;
@@ -76,6 +77,7 @@ use mutation_admission::{AdmissionSurface, MutationAdmissionService};
 use startup_scan_evidence::StartupScanEvidence;
 
 pub use index_config::{IndexRuntimeConfig, IndexRuntimeConfigError};
+pub use storage_layout::{ExplicitAuthoritativePaths, StoragePaths};
 pub use v05::ObjectServiceImpl;
 
 const MAX_GRPC_MESSAGE_BYTES: usize = 72 * 1024 * 1024;
@@ -96,7 +98,8 @@ pub struct ServerConfig {
     pub peer_listen: SocketAddr,
     pub peer_advertise: Option<String>,
     pub join_bundle: Option<PathBuf>,
-    pub data_dir: PathBuf,
+    pub storage: StoragePaths,
+    pub explicit_authoritative_paths: ExplicitAuthoritativePaths,
     pub run_system_bootstrap: bool,
     pub system_bootstrap_credential_output: Option<PathBuf>,
     pub node_id: u16,
@@ -134,6 +137,9 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         "index query timeout must be greater than zero and fit the server clock"
     );
     validate_atomic_replay_gc(config.awaiting_publish_ttl_seconds)?;
+    let storage_binding = storage_layout::bind_authoritative_roots(&config.storage, config.node_id)
+        .context("bind node storage layout")?;
+    log_storage_layout(&config, &storage_binding);
     let index_runtime_config = config.index_runtime;
     let watch_retention = WatchRetention::new(
         config.source_journal_max_entries,
@@ -149,17 +155,30 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     let peer_address =
         peer_runtime::peer_address(config.peer_listen, config.peer_advertise.as_deref())?;
     let store = Store::open(
-        StoreOptions::new(&config.data_dir, config.node_id)
+        StoreOptions::new(&config.storage.state, config.node_id)
+            .with_metadata_directory(&config.storage.metadata)
+            .with_metadata_wal_directory(&config.storage.metadata_wal)
+            .with_payload_directory(&config.storage.payload)
+            .with_upload_spool(
+                &config.storage.upload_spool,
+                config.storage.upload_spool_max_bytes,
+            )
             .with_watch_retention(watch_retention)
             .with_mutation_receipt_retention(mutation_receipt_retention)
             .with_awaiting_publish_ttl_seconds(config.awaiting_publish_ttl_seconds),
     )
     .await
-    .with_context(|| format!("open Anvil data at {}", config.data_dir.display()))?;
+    .with_context(|| {
+        format!(
+            "open Anvil metadata at {} with payloads at {}",
+            config.storage.metadata.display(),
+            config.storage.payload.display()
+        )
+    })?;
     let _runtime_metrics = observability::RuntimeMetricsTask::start(store.clone());
     let local_node = NodeId(u64::from(config.node_id));
     let (decisions, peer_runtime) = peer_runtime::open(peer_runtime::OpenPeerConfig {
-        data_dir: &config.data_dir,
+        data_dir: &config.storage.state,
         node_id: local_node,
         peer_address,
         join_bundle: config.join_bundle.as_deref(),
@@ -202,7 +221,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         peer_runtime::complete_pending_join(
             pending_join,
             &decisions,
-            &config.data_dir,
+            &config.storage.state,
             config.erasure_profile,
             DECISION_LEADER_TIMEOUT,
         )
@@ -281,7 +300,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         object_distribution.clone(),
         config.erasure_profile,
         std::sync::Arc::new(payload_read_transport),
-        &config.data_dir,
+        config.storage.scratch.join("payload-read"),
     )
     .context("initialize cluster object reader")?;
     let programs =
@@ -290,7 +309,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         &store,
         &decisions,
         local_node,
-        &config.data_dir,
+        &config.storage.state,
         config.run_system_bootstrap,
         config.system_bootstrap_credential_output.as_deref(),
     )
@@ -408,7 +427,8 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         object_reader.clone(),
         object_lister.clone(),
         name_resolver.clone(),
-        &config.data_dir,
+        &config.storage.cache,
+        &config.storage.scratch,
         index_runtime_config,
         derived_checkpoints.clone(),
         startup_scan_evidence.clone(),
@@ -537,7 +557,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         rate_limits: request_rate_limits.clone(),
         serving: serving_fence.authority(),
         mutation_admission: mutation_admission.clone(),
-        cache_root: config.data_dir.join("gateway-cache/git"),
+        cache_root: config.storage.cache.join("gateway-cache/git"),
         max_request_bytes: config.max_blob_bytes,
         lock: Arc::new(tokio::sync::Mutex::new(())),
         basic_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -565,7 +585,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     let administration_service = administration_service::AdministrationServiceImpl::new(
         store.clone(),
         decisions.clone(),
-        config.data_dir.clone(),
+        config.storage.state.clone(),
     )
     .with_distributed(distributed_control.clone());
     let credential_service = credential_service::CredentialServiceImpl::new(
@@ -758,6 +778,63 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         .context("shut down decision Raft");
     server_result?;
     shutdown_result
+}
+
+fn log_storage_layout(config: &ServerConfig, binding: &storage_layout::StorageBinding) {
+    tracing::info!(
+        storage.installation_id = %binding.installation_id,
+        storage.state = %config.storage.state.display(),
+        storage.metadata = %config.storage.metadata.display(),
+        storage.metadata_wal = %config.storage.metadata_wal.display(),
+        storage.payload = %config.storage.payload.display(),
+        "authoritative storage roots are pinned to this node installation"
+    );
+    tracing::info!(
+        storage.scratch = %config.storage.scratch.display(),
+        storage.cache = %config.storage.cache.display(),
+        storage.upload_spool = %config.storage.upload_spool.display(),
+        storage.upload_spool_max_bytes = config.storage.upload_spool_max_bytes,
+        "disposable storage roots may be replaced between restarts"
+    );
+    if !binding.newly_initialized {
+        return;
+    }
+    warn_default_authoritative_path(
+        config.explicit_authoritative_paths.state,
+        "ANVIL_STATE_DIR",
+        "state",
+        &config.storage.state,
+    );
+    warn_default_authoritative_path(
+        config.explicit_authoritative_paths.metadata,
+        "ANVIL_METADATA_DIR",
+        "metadata",
+        &config.storage.metadata,
+    );
+    warn_default_authoritative_path(
+        config.explicit_authoritative_paths.metadata_wal,
+        "ANVIL_METADATA_WAL_DIR",
+        "metadata_wal",
+        &config.storage.metadata_wal,
+    );
+    warn_default_authoritative_path(
+        config.explicit_authoritative_paths.payload,
+        "ANVIL_PAYLOAD_DIR",
+        "payload",
+        &config.storage.payload,
+    );
+}
+
+fn warn_default_authoritative_path(explicit: bool, setting: &str, role: &str, path: &PathBuf) {
+    if explicit {
+        return;
+    }
+    tracing::warn!(
+        storage.role = role,
+        storage.path = %path.display(),
+        storage.setting = setting,
+        "authoritative storage path used its default during node initialization; this root is now pinned, so configure separate disks before bootstrap when higher I/O isolation is required"
+    );
 }
 
 fn validate_atomic_replay_gc(awaiting_publish_ttl_seconds: u64) -> Result<()> {

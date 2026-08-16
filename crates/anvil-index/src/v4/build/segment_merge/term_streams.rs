@@ -1,9 +1,11 @@
 use crate::IndexError;
 
 use super::super::super::{
-    ArtifactDirectoryRead, ComponentKind, DocId, FieldId, INDEX_COMPONENT_BYTES, PositionEntry,
-    PositionsBlock, PostingBlock, PostingImpact, PostingReference, Schema, SegmentDescriptor,
-    SegmentIdentity, TermDictionary, TermEntry, component_ordinal_key,
+    ArtifactDirectoryRead, ComponentKind, DocId, FieldComponents, FieldId, FieldType,
+    INDEX_COMPONENT_BYTES, PositionEntry, PositionsBlock, PostingBlock, PostingImpact,
+    PostingReference, Schema, SegmentDescriptor, SegmentIdentity, TERM_DICTIONARY_TARGET_BYTES,
+    TERM_TYPE_BOOLEAN, TERM_TYPE_FIELD_PRESENCE, TERM_TYPE_HASHED_KEYWORD, TERM_TYPE_NULL,
+    TERM_TYPE_STRING, TermDictionary, TermEntry, component_ordinal_key,
     decode_component_ordinal_key,
 };
 use super::super::ComponentBatchSink;
@@ -169,7 +171,17 @@ where
     let mut dictionary_bytes = 0usize;
     let mut unique_terms = 0u64;
     let mut term_present_documents = 0u64;
+    let mut term_fallback_present_documents = 0u64;
+    let mut term_presence_marker = false;
     let mut total_term_frequency = 0u64;
+    let mut null_documents = 0u64;
+    let mut value_count = 0u64;
+    let mut boolean_values = 0u64;
+    let mut string_values = 0u64;
+    let field = &schema.fields[field_id.get() as usize];
+    let terms_are_scalar_authority = !field.components.contains(FieldComponents::DOC_VALUES)
+        && !field.components.contains(FieldComponents::POINTS)
+        && matches!(field.field_type, FieldType::Boolean | FieldType::Keyword);
     while let Some(term) = dictionaries
         .iter()
         .filter_map(|cursor| cursor.current.as_ref().map(|entry| entry.term.as_slice()))
@@ -277,18 +289,51 @@ where
                 .ok_or(IndexError::OffsetOverflow)?;
         }
         if live_frequency != 0 {
-            unique_terms = unique_terms
-                .checked_add(1)
-                .ok_or(IndexError::OffsetOverflow)?;
-            // Supported v4 schemas without another doc-aligned presence
-            // component (the path index) emit exactly one term per document.
-            // Other schemas use column/norm presence as their exact source.
-            term_present_documents = term_present_documents
-                .checked_add(live_frequency)
-                .ok_or(IndexError::OffsetOverflow)?;
-            total_term_frequency = total_term_frequency
-                .checked_add(live_total_term_frequency)
-                .ok_or(IndexError::OffsetOverflow)?;
+            let term_type = *term
+                .get(4)
+                .ok_or(IndexError::InvalidFormat("term key lacks a type tag"))?;
+            if term_type == TERM_TYPE_FIELD_PRESENCE {
+                term_presence_marker = true;
+                term_present_documents = term_present_documents
+                    .checked_add(live_frequency)
+                    .ok_or(IndexError::OffsetOverflow)?;
+            } else {
+                unique_terms = unique_terms
+                    .checked_add(1)
+                    .ok_or(IndexError::OffsetOverflow)?;
+                term_fallback_present_documents = term_fallback_present_documents
+                    .checked_add(live_frequency)
+                    .ok_or(IndexError::OffsetOverflow)?;
+                total_term_frequency = total_term_frequency
+                    .checked_add(live_total_term_frequency)
+                    .ok_or(IndexError::OffsetOverflow)?;
+                if terms_are_scalar_authority {
+                    match term_type {
+                        TERM_TYPE_NULL => {
+                            null_documents = null_documents
+                                .checked_add(live_frequency)
+                                .ok_or(IndexError::OffsetOverflow)?;
+                        }
+                        TERM_TYPE_BOOLEAN => {
+                            value_count = value_count
+                                .checked_add(live_total_term_frequency)
+                                .ok_or(IndexError::OffsetOverflow)?;
+                            boolean_values = boolean_values
+                                .checked_add(live_total_term_frequency)
+                                .ok_or(IndexError::OffsetOverflow)?;
+                        }
+                        TERM_TYPE_STRING | TERM_TYPE_HASHED_KEYWORD => {
+                            value_count = value_count
+                                .checked_add(live_total_term_frequency)
+                                .ok_or(IndexError::OffsetOverflow)?;
+                            string_values = string_values
+                                .checked_add(live_total_term_frequency)
+                                .ok_or(IndexError::OffsetOverflow)?;
+                        }
+                        _ => {}
+                    }
+                }
+            }
             let entry = TermEntry {
                 term,
                 postings: PostingReference {
@@ -302,7 +347,7 @@ where
             };
             let bytes = entry.term.len().saturating_add(28);
             if !dictionary_buffer.is_empty()
-                && dictionary_bytes.saturating_add(bytes) > INDEX_COMPONENT_BYTES / 2
+                && dictionary_bytes.saturating_add(bytes) > TERM_DICTIONARY_TARGET_BYTES
             {
                 write_dictionary_leaf(directory, &dictionaries_file, &mut dictionary_buffer)
                     .await?;
@@ -362,8 +407,14 @@ where
         streams,
         counts: FieldCounts {
             present_documents: term_present_documents,
+            null_documents,
+            value_count,
             unique_terms,
             total_term_frequency,
+            boolean_values,
+            string_values,
+            term_presence_marker,
+            term_fallback_present_documents,
             ..FieldCounts::default()
         },
     })

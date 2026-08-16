@@ -1362,11 +1362,8 @@ mod tests {
 
         assert_eq!(fields["maximum"].values, [ScalarValue::Unsigned(u64::MAX)]);
         assert_eq!(fields["zero"].values, [ScalarValue::Unsigned(0)]);
-        assert_eq!(fields["negative_zero"].values, [ScalarValue::Unsigned(0)]);
-        assert_eq!(
-            fields["negative"].values,
-            [ScalarValue::number(-2.0).unwrap()]
-        );
+        assert_eq!(fields["negative_zero"].values, [ScalarValue::Signed(0)]);
+        assert_eq!(fields["negative"].values, [ScalarValue::Signed(-2)]);
         assert_eq!(
             fields["decimal"].values,
             [ScalarValue::number(2.0).unwrap()]

@@ -4,7 +4,8 @@ use crate::{IndexError, IndexFileRead};
 
 use super::codec::materialize_component_payload;
 use super::{
-    ArtifactDescriptor, ComponentHeader, ComponentKind, SegmentIdentity, decode_component,
+    ArtifactDescriptor, ArtifactPackReference, ComponentHeader, ComponentKind, SegmentIdentity,
+    decode_component,
 };
 
 /// Storage-neutral access to one exact ordinary-object artifact reference.
@@ -16,9 +17,16 @@ use super::{
 pub trait ArtifactDirectoryRead: Send + Sync {
     type File: IndexFileRead;
 
+    /// Maximum independent segment queries this directory can sustain at
+    /// once. The default keeps embedders deterministic and single-threaded;
+    /// Anvil reports the size of its process-owned index CPU pool.
+    fn query_parallelism(&self) -> usize {
+        1
+    }
+
     fn open_artifact(
         &self,
-        descriptor: &ArtifactDescriptor,
+        pack: &ArtifactPackReference,
     ) -> impl Future<Output = Result<Self::File, IndexError>> + Send;
 
     /// Execute one finite owned CPU chunk after asynchronous artifact reads
@@ -45,10 +53,11 @@ pub struct LoadedComponent {
 pub async fn read_artifact_component<D: ArtifactDirectoryRead>(
     directory: &D,
     identity: SegmentIdentity,
+    packs: &[ArtifactPackReference],
     descriptor: &ArtifactDescriptor,
     expected_kind: ComponentKind,
 ) -> Result<LoadedComponent, IndexError> {
-    descriptor.validate(identity.index_id)?;
+    let pack = descriptor.pack(identity.index_id, packs)?;
     if descriptor.component_kind != expected_kind {
         return Err(IndexError::InvalidFormat(
             "format-v4 artifact has the wrong component kind",
@@ -56,8 +65,8 @@ pub async fn read_artifact_component<D: ArtifactDirectoryRead>(
     }
     let length =
         usize::try_from(descriptor.encoded_length).map_err(|_| IndexError::OffsetOverflow)?;
-    let file = directory.open_artifact(descriptor).await?;
-    let bytes = read_exact_at(&file, 0, length).await?;
+    let file = directory.open_artifact(pack).await?;
+    let bytes = read_exact_at(&file, descriptor.offset, length).await?;
     let codec_version = descriptor.codec_version;
     let logical_length = descriptor.logical_length;
     let checksum = descriptor.checksum;

@@ -10,11 +10,53 @@ use super::model::{
 use super::schema::FieldId;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ArtifactDescriptor {
+pub struct ArtifactPackReference {
     pub path: String,
     pub object_version: u64,
     pub object_content_hash: [u8; 32],
     pub object_length: u64,
+}
+
+impl ArtifactPackReference {
+    pub fn new(
+        index_id: u64,
+        path: String,
+        object_version: u64,
+        object_content_hash: [u8; 32],
+        object_length: u64,
+    ) -> Result<Self, IndexError> {
+        let value = Self {
+            path,
+            object_version,
+            object_content_hash,
+            object_length,
+        };
+        value.validate(index_id)?;
+        Ok(value)
+    }
+
+    pub fn validate(&self, index_id: u64) -> Result<(), IndexError> {
+        if index_id == 0
+            || self.object_version == 0
+            || self.object_length == 0
+            || usize::try_from(self.object_length)
+                .ok()
+                .is_none_or(|length| {
+                    !(COMPONENT_HEADER_BYTES..=INDEX_ARTIFACT_PACK_BYTES).contains(&length)
+                })
+            || self.path != artifact_path(index_id, self.object_content_hash)
+        {
+            return Err(IndexError::InvalidFormat(
+                "format-v4 artifact pack reference",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactDescriptor {
+    pub pack_ordinal: u32,
     pub offset: u64,
     /// Complete component bytes, including the 120-byte envelope.
     pub encoded_length: u64,
@@ -30,10 +72,7 @@ impl ArtifactDescriptor {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         index_id: u64,
-        path: String,
-        object_version: u64,
-        object_content_hash: [u8; 32],
-        object_length: u64,
+        pack_ordinal: u32,
         offset: u64,
         encoded_length: u64,
         logical_length: u64,
@@ -42,10 +81,7 @@ impl ArtifactDescriptor {
         checksum: [u8; 32],
     ) -> Result<Self, IndexError> {
         let value = Self {
-            path,
-            object_version,
-            object_content_hash,
-            object_length,
+            pack_ordinal,
             offset,
             encoded_length,
             logical_length,
@@ -59,12 +95,7 @@ impl ArtifactDescriptor {
 
     pub fn validate(&self, index_id: u64) -> Result<(), IndexError> {
         if index_id == 0
-            || self.object_version == 0
             || self.codec_version == 0
-            || self.object_length == 0
-            || usize::try_from(self.object_length)
-                .ok()
-                .is_none_or(|length| length > INDEX_ARTIFACT_PACK_BYTES)
             || usize::try_from(self.encoded_length)
                 .ok()
                 .is_none_or(|length| {
@@ -73,15 +104,33 @@ impl ArtifactDescriptor {
             || usize::try_from(self.logical_length)
                 .ok()
                 .is_none_or(|length| length > INDEX_DECODE_BYTES)
-            || self
-                .offset
-                .checked_add(self.encoded_length)
-                .is_none_or(|end| end > self.object_length)
-            || self.path != artifact_path(index_id, self.object_content_hash)
+            || self.offset.checked_add(self.encoded_length).is_none()
         {
             return Err(IndexError::InvalidFormat("format-v4 artifact descriptor"));
         }
         Ok(())
+    }
+
+    pub fn pack<'a>(
+        &self,
+        index_id: u64,
+        packs: &'a [ArtifactPackReference],
+    ) -> Result<&'a ArtifactPackReference, IndexError> {
+        self.validate(index_id)?;
+        let pack = packs
+            .get(self.pack_ordinal as usize)
+            .ok_or(IndexError::InvalidFormat("artifact pack ordinal"))?;
+        pack.validate(index_id)?;
+        if self
+            .offset
+            .checked_add(self.encoded_length)
+            .is_none_or(|end| end > pack.object_length)
+        {
+            return Err(IndexError::InvalidFormat(
+                "component range exceeds artifact pack",
+            ));
+        }
+        Ok(pack)
     }
 
     /// Verify the exact component range after the ordinary object layer has
@@ -91,9 +140,10 @@ impl ArtifactDescriptor {
     pub fn verify_component_bytes(
         &self,
         identity: SegmentIdentity,
+        packs: &[ArtifactPackReference],
         bytes: &[u8],
     ) -> Result<(), IndexError> {
-        self.validate(identity.index_id)?;
+        self.pack(identity.index_id, packs)?;
         if u64::try_from(bytes.len()).map_err(|_| IndexError::OffsetOverflow)?
             != self.encoded_length
         {
@@ -146,20 +196,10 @@ impl GeneratedComponent {
         self.bytes
     }
 
-    pub fn placed(
-        &self,
-        path: String,
-        object_version: u64,
-        object_content_hash: [u8; 32],
-        object_length: u64,
-        offset: u64,
-    ) -> Result<ArtifactDescriptor, IndexError> {
+    pub fn placed(&self, pack_ordinal: u32, offset: u64) -> Result<ArtifactDescriptor, IndexError> {
         ArtifactDescriptor::new(
             self.header.identity.index_id,
-            path,
-            object_version,
-            object_content_hash,
-            object_length,
+            pack_ordinal,
             offset,
             u64::try_from(self.bytes.len()).map_err(|_| IndexError::OffsetOverflow)?,
             self.header.logical_length,
@@ -185,6 +225,7 @@ pub struct SegmentDescriptor {
     pub identity: SegmentIdentity,
     pub document_count: u32,
     pub live_document_count: u32,
+    pub packs: Vec<ArtifactPackReference>,
     pub components: Vec<SegmentComponent>,
     pub encoded_bytes: u64,
     pub logical_bytes: u64,
@@ -195,6 +236,7 @@ impl SegmentDescriptor {
         identity: SegmentIdentity,
         document_count: u32,
         live_document_count: u32,
+        packs: Vec<ArtifactPackReference>,
         components: Vec<SegmentComponent>,
         encoded_bytes: u64,
         logical_bytes: u64,
@@ -204,6 +246,7 @@ impl SegmentDescriptor {
             identity,
             document_count,
             live_document_count,
+            packs,
             components,
             encoded_bytes,
             logical_bytes,
@@ -216,9 +259,13 @@ impl SegmentDescriptor {
         self.identity.validate()?;
         if self.document_count == 0
             || self.live_document_count > self.document_count
+            || self.packs.is_empty()
             || self.components.is_empty()
         {
             return Err(IndexError::InvalidFormat("format-v4 segment counts"));
+        }
+        for pack in &self.packs {
+            pack.validate(self.identity.index_id)?;
         }
         let mut identities = 0usize;
         let mut live_masks = 0usize;
@@ -228,7 +275,9 @@ impl SegmentDescriptor {
         let mut root_logical = 0u64;
         let mut previous_key = None;
         for component in &self.components {
-            component.artifact.validate(self.identity.index_id)?;
+            component
+                .artifact
+                .pack(self.identity.index_id, &self.packs)?;
             if component.artifact.component_kind != ComponentKind::ROUTING_NODE {
                 return Err(IndexError::InvalidFormat(
                     "segment component stream must have a routing root",
@@ -330,14 +379,12 @@ mod tests {
     use crate::v4::encode_component;
 
     #[test]
-    fn placement_binds_component_to_canonical_object_reference() {
+    fn placement_binds_component_to_a_segment_pack_ordinal() {
         let identity = SegmentIdentity::new(3, 4, [5; 32], 6).unwrap();
         let component =
             encode_component(identity, ComponentKind::IDENTITY_TABLE, 1, 0, 8, vec![9; 8]).unwrap();
-        let object = [7; 32];
-        let descriptor = component
-            .placed(artifact_path(3, object), 11, object, 4096, 17)
-            .unwrap();
+        let descriptor = component.placed(2, 17).unwrap();
+        assert_eq!(descriptor.pack_ordinal, 2);
         assert_eq!(descriptor.offset, 17);
         assert_eq!(descriptor.encoded_length, 128);
         assert_eq!(descriptor.logical_length, 8);
@@ -345,22 +392,12 @@ mod tests {
 
     #[test]
     fn noncanonical_reference_or_pack_overrun_fails_closed() {
-        assert!(
-            ArtifactDescriptor::new(
-                3,
-                "_anvil/indices/v4/03/artifacts/no".into(),
-                1,
-                [7; 32],
-                130,
-                20,
-                120,
-                0,
-                ComponentKind::POSTINGS,
-                1,
-                [8; 32],
-            )
-            .is_err()
-        );
+        assert!(ArtifactPackReference::new(3, "not-canonical".into(), 1, [7; 32], 130).is_err());
+        let descriptor =
+            ArtifactDescriptor::new(3, 0, 20, 120, 0, ComponentKind::POSTINGS, 1, [8; 32]).unwrap();
+        let pack =
+            ArtifactPackReference::new(3, artifact_path(3, [7; 32]), 1, [7; 32], 130).unwrap();
+        assert!(descriptor.pack(3, &[pack]).is_err());
     }
 
     #[test]
@@ -375,17 +412,13 @@ mod tests {
     }
 
     fn root(index_id: u64, role: ComponentKind, ordinal: u32, routed: bool) -> SegmentComponent {
-        let hash = [role.get() as u8 + ordinal as u8; 32];
         SegmentComponent {
             role,
             field_id: None,
             ordinal,
             artifact: ArtifactDescriptor::new(
                 index_id,
-                artifact_path(index_id, hash),
-                1,
-                hash,
-                4096,
+                0,
                 0,
                 120,
                 0,
@@ -401,6 +434,14 @@ mod tests {
         }
     }
 
+    fn packs(index_id: u64) -> Vec<ArtifactPackReference> {
+        let hash = [7; 32];
+        vec![
+            ArtifactPackReference::new(index_id, artifact_path(index_id, hash), 1, hash, 4096)
+                .unwrap(),
+        ]
+    }
+
     #[test]
     fn segment_accepts_canonical_routing_roots() {
         let identity = SegmentIdentity::new(5, 6, [7; 32], 8).unwrap();
@@ -410,7 +451,8 @@ mod tests {
             root(5, ComponentKind::POSTINGS, 1, true),
             root(5, ComponentKind::SCORING_STATISTICS, 0, true),
         ];
-        let segment = SegmentDescriptor::new(identity, 10, 9, components, 1024, 128).unwrap();
+        let segment =
+            SegmentDescriptor::new(identity, 10, 9, packs(5), components, 1024, 128).unwrap();
         assert_eq!(segment.components.len(), 4);
     }
 
@@ -422,7 +464,7 @@ mod tests {
             root(5, ComponentKind::LIVE_MASK, 0, false),
             root(5, ComponentKind::SCORING_STATISTICS, 0, true),
         ];
-        assert!(SegmentDescriptor::new(identity, 1, 1, components, 1024, 128).is_err());
+        assert!(SegmentDescriptor::new(identity, 1, 1, packs(5), components, 1024, 128).is_err());
     }
 
     #[test]
@@ -434,6 +476,6 @@ mod tests {
             root(5, ComponentKind::SCORING_STATISTICS, 0, false),
         ];
         components[0].ordinal = 1;
-        assert!(SegmentDescriptor::new(identity, 1, 1, components, 1024, 128).is_err());
+        assert!(SegmentDescriptor::new(identity, 1, 1, packs(5), components, 1024, 128).is_err());
     }
 }

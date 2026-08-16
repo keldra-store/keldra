@@ -1,4 +1,6 @@
 use super::journal_capacity::SourceJournalAdmission;
+use super::mutation_prefetch::MutationReadCache;
+use super::mutation_types::{DistributedEvaluationContext, EvaluatedOperation};
 use super::*;
 use crate::model::{
     CoordinatedObjectMutation, MUTATION_STAMP_FORMAT, MutationStamp, OBJECT_MUTATION_FORMAT,
@@ -10,21 +12,6 @@ use crate::{
 
 const MAX_EXPIRED_RECEIPTS_PRUNED_PER_PASS: usize = 1_024;
 const MAX_EXPIRED_RECEIPT_BYTES_PRUNED_PER_PASS: u64 = 4 * 1024 * 1024;
-
-#[derive(Clone, Copy)]
-pub(super) struct DistributedEvaluationContext {
-    pub(super) mutation: ObjectMutationContext,
-    pub(super) source_id: SourceId,
-    pub(super) source_journal_position: u64,
-}
-
-pub(super) struct EvaluatedOperation {
-    pub(super) receipt: MutationReceipt,
-    pub(super) mutation: Option<ObjectMutation>,
-    pub(super) reference_deltas: Vec<ReferenceDelta>,
-    pub(super) accounting_transition: Option<AccountingHeadTransition>,
-    pub(super) definition_transition: Option<DefinitionTransition>,
-}
 
 fn is_mutation_capacity(error: &MutationError) -> bool {
     mutation_capacity_kind(error).is_some()
@@ -297,6 +284,18 @@ impl Store {
                         return fail_prepared_operations(completed, early, prepared, error);
                     }
                 };
+            let read_cache = match MutationReadCache::load(
+                self,
+                &prepared
+                    .iter()
+                    .map(|(_, operation)| operation)
+                    .collect::<Vec<_>>(),
+            ) {
+                Ok(read_cache) => read_cache,
+                Err(error) => {
+                    return fail_prepared_operations(completed, early, prepared, error);
+                }
+            };
             let mut pending_heads = BTreeMap::<Vec<u8>, Head>::new();
             let mut pending_versions = BTreeMap::<Vec<u8>, Version>::new();
             let mut pending_receipts = BTreeMap::<Vec<u8>, StoredReceipt>::new();
@@ -315,6 +314,7 @@ impl Store {
                 policy_cache.insert(identity.clone(), Ok(governance.policy.clone()));
                 versioning_cache.insert(identity, Ok(governance.versioning));
             }
+            read_cache.seed_bucket_settings(&mut policy_cache, &mut versioning_cache);
             let mut results = BTreeMap::<usize, Result<MutationReceipt, MutationError>>::new();
             let mut batch_high_watermark = None;
             let mut pending_changes = Vec::new();
@@ -330,6 +330,7 @@ impl Store {
                         &mut pending_receipts,
                         &mut pending_blob_references,
                         &mut pending_small_blobs,
+                        &read_cache,
                         &mut policy_cache,
                         &mut versioning_cache,
                         &pruned_receipts,
@@ -701,6 +702,7 @@ impl Store {
         let mut pending_receipts = BTreeMap::new();
         let mut pending_blob_references = PendingBlobReferences::new();
         let mut pending_small_blobs = BTreeSet::new();
+        let read_cache = MutationReadCache::default();
         let encoded_bucket = prepared.identity().encode().to_vec();
         let mut policy_cache = BTreeMap::from([(encoded_bucket.clone(), Ok(governance.policy))]);
         let mut versioning_cache = BTreeMap::from([(encoded_bucket, Ok(governance.versioning))]);
@@ -713,6 +715,7 @@ impl Store {
                 &mut pending_receipts,
                 &mut pending_blob_references,
                 &mut pending_small_blobs,
+                &read_cache,
                 &mut policy_cache,
                 &mut versioning_cache,
                 &pruned_receipts,
@@ -1539,6 +1542,7 @@ impl Store {
         pending_receipts: &mut BTreeMap<Vec<u8>, StoredReceipt>,
         pending_blob_references: &mut PendingBlobReferences,
         pending_small_blobs: &mut BTreeSet<Vec<u8>>,
+        read_cache: &MutationReadCache,
         policy_cache: &mut BTreeMap<Vec<u8>, Result<BucketPolicy, MutationError>>,
         versioning_cache: &mut BTreeMap<Vec<u8>, Result<ObjectVersioning, MutationError>>,
         pruned_receipts: &BTreeSet<Vec<u8>>,
@@ -1556,7 +1560,10 @@ impl Store {
             let existing = match pending_receipts.get(receipt_key) {
                 Some(receipt) => Some(receipt.clone()),
                 None if pruned_receipts.contains(receipt_key) => None,
-                None => self.read_json(CF_RECEIPTS, receipt_key)?,
+                None => match read_cache.receipt(receipt_key) {
+                    Some(cached) => cached?,
+                    None => self.read_json(CF_RECEIPTS, receipt_key)?,
+                },
             };
             if let Some(existing) = existing {
                 if existing.expires_at_unix_millis <= now_unix_millis {
@@ -1593,16 +1600,26 @@ impl Store {
 
         let current = match pending_heads.get(&encoded_key) {
             Some(head) => Some(head.clone()),
-            None => self.head_by_storage_key(&encoded_key)?,
+            None => match read_cache.head(&encoded_key) {
+                Some(cached) => cached?,
+                None => self.head_by_storage_key(&encoded_key)?,
+            },
         };
         let current_version = match current.as_ref() {
             Some(head) => match pending_versions.get(&encoded_key) {
                 Some(version) => Some(version.clone()),
                 None => Some(
-                    self.version_metadata_by_identity(operation.identity(), key, head.version)?
-                        .ok_or_else(|| {
-                            MutationError::Storage("head references a missing version".into())
-                        })?,
+                    match read_cache.version(&encoded_key) {
+                        Some(cached) => cached?,
+                        None => self.version_metadata_by_identity(
+                            operation.identity(),
+                            key,
+                            head.version,
+                        )?,
+                    }
+                    .ok_or_else(|| {
+                        MutationError::Storage("head references a missing version".into())
+                    })?,
                 ),
             },
             None => None,
@@ -1843,19 +1860,21 @@ impl Store {
             && references_changed
             && let Some(reference) = old_blob.as_ref()
         {
-            blob_reference_updates.push(self.prepare_blob_reference_retirement(
+            blob_reference_updates.push(self.prepare_blob_reference_retirement_cached(
                 reference,
                 pending_blob_references,
+                read_cache.blob_reference(reference),
                 now_unix_millis,
             )?);
         }
         let small_blob_value = if apply_content_lifecycle {
             match operation {
                 PreparedOperation::Put { payload, .. } => match payload.small_bytes() {
-                    Some(bytes) => self.prepare_hashed_small_blob_value(
+                    Some(bytes) => self.prepare_hashed_small_blob_value_cached(
                         payload.reference(),
                         bytes,
                         pending_small_blobs,
+                        read_cache.small_blob(payload.reference()),
                     )?,
                     None => None,
                 },
@@ -1872,13 +1891,16 @@ impl Store {
                 PreparedOperation::Put { .. } => self.prepare_materialized_blob_publication(
                     reference,
                     pending_blob_references,
+                    read_cache.blob_reference(reference),
                     now_unix_millis,
                 )?,
-                PreparedOperation::Publish { .. } => self.prepare_blob_reference_publication(
-                    reference,
-                    pending_blob_references,
-                    now_unix_millis,
-                )?,
+                PreparedOperation::Publish { .. } => self
+                    .prepare_blob_reference_publication_cached(
+                        reference,
+                        pending_blob_references,
+                        read_cache.blob_reference(reference),
+                        now_unix_millis,
+                    )?,
                 PreparedOperation::Delete { .. } => unreachable!(),
             };
             blob_reference_updates.push(update);
@@ -1900,7 +1922,14 @@ impl Store {
             pending_small_blobs.insert(key);
         }
         for (key, state) in blob_reference_updates {
-            self.stage_blob_reference_update(batch, pending_blob_references, key, state)?;
+            let prefetched = read_cache.blob_reference_by_key(&key);
+            self.stage_blob_reference_update_cached(
+                batch,
+                pending_blob_references,
+                key,
+                state,
+                prefetched,
+            )?;
         }
         if versioning == ObjectVersioning::Unversioned
             && let Some(previous) = current_version.as_ref()

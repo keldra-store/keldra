@@ -4,15 +4,16 @@ use std::sync::Arc;
 use crate::IndexError;
 use crate::IndexFileRead;
 use crate::v4::build::{
-    BuildLimits, ExactMemorySink, NativeSegmentWriter, ProjectedRecord, ProjectedSource,
-    ProjectedTerm, ProjectedVector, PublishedObject, SourcePush,
+    BuildLimits, ExactMemorySink, NativeSegmentWriter, ProjectedDocValue, ProjectedRecord,
+    ProjectedSource, ProjectedTerm, ProjectedVector, PublishedObject, SourcePush,
 };
 use crate::v4::{
-    Analyzer, ArtifactDescriptor, ArtifactDirectoryRead, CandidateGate, CandidateGateEvidence,
-    CandidateReference, Cardinality, Collation, ComponentKind, ComponentVersion, FieldCapabilities,
-    FieldComponents, FieldId, FieldSchema, FieldType, IndexKind, IndexSemantics, NativeQuery,
-    NativeQueryExecutor, NativeQueryLimits, NativeQueryRequest, ObjectIdentity, Schema,
-    SegmentDescriptor, SegmentIdentity, VectorMetric, VectorNormalization, scalar_term, text_term,
+    Analyzer, ArtifactDirectoryRead, ArtifactPackReference, CandidateGate, CandidateGateEvidence,
+    CandidateReference, Cardinality, Collation, ComponentKind, ComponentVersion, DocValueCell,
+    FieldCapabilities, FieldComponents, FieldId, FieldSchema, FieldType, IndexKind, IndexSemantics,
+    NativeQuery, NativeQueryExecutor, NativeQueryLimits, NativeQueryRequest, ObjectIdentity,
+    Predicate, PredicateId, ScalarValue, Schema, SegmentDescriptor, SegmentIdentity, VectorMetric,
+    VectorNormalization, scalar_term, text_term,
 };
 
 #[derive(Clone)]
@@ -37,26 +38,18 @@ struct RankedMemoryArtifacts(BTreeMap<String, PublishedObject>);
 impl ArtifactDirectoryRead for RankedMemoryArtifacts {
     type File = RankedMemoryFile;
 
-    async fn open_artifact(
-        &self,
-        descriptor: &ArtifactDescriptor,
-    ) -> Result<Self::File, IndexError> {
+    async fn open_artifact(&self, pack: &ArtifactPackReference) -> Result<Self::File, IndexError> {
         let object = self
             .0
-            .get(&descriptor.path)
-            .ok_or_else(|| IndexError::FileNotFound(descriptor.path.clone()))?;
-        if object.object_version != descriptor.object_version {
+            .get(&pack.path)
+            .ok_or_else(|| IndexError::FileNotFound(pack.path.clone()))?;
+        if object.object_version != pack.object_version
+            || *blake3::hash(&object.bytes).as_bytes() != pack.object_content_hash
+            || object.bytes.len() as u64 != pack.object_length
+        {
             return Err(IndexError::Integrity);
         }
-        let start = usize::try_from(descriptor.offset).map_err(|_| IndexError::OffsetOverflow)?;
-        let length =
-            usize::try_from(descriptor.encoded_length).map_err(|_| IndexError::OffsetOverflow)?;
-        let end = start
-            .checked_add(length)
-            .ok_or(IndexError::OffsetOverflow)?;
-        Ok(RankedMemoryFile(Arc::from(
-            object.bytes.get(start..end).ok_or(IndexError::Integrity)?,
-        )))
+        Ok(RankedMemoryFile(Arc::from(object.bytes.as_slice())))
     }
 }
 
@@ -213,6 +206,28 @@ fn text_source(path: &str, token: &str, frequency: u32, length: u32) -> Projecte
     )
 }
 
+fn positioned_text_source(path: &str, terms: &[(&str, u32)], length: u32) -> ProjectedSource {
+    record_source(
+        path,
+        None,
+        terms
+            .iter()
+            .map(|(token, position)| {
+                let (term_type, term) = text_term(token).unwrap();
+                ProjectedTerm {
+                    field_id: FieldId::new(0),
+                    term_type,
+                    term,
+                    frequency: 1,
+                    positions: vec![*position],
+                }
+            })
+            .collect(),
+        Vec::new(),
+        vec![(FieldId::new(0), length)],
+    )
+}
+
 fn ranked_request(
     schema: Schema,
     segments: Vec<SegmentDescriptor>,
@@ -251,6 +266,256 @@ fn full_text_schema() -> Schema {
         physical_order: Vec::new(),
         component_versions: Vec::new(),
     })
+}
+
+fn typed_text_schema() -> Schema {
+    complete_schema(Schema {
+        kind: IndexKind::TypedJson,
+        path_prefix: String::new(),
+        content_type_scope: Some("application/json".into()),
+        fields: vec![
+            ranked_field(
+                0,
+                "body",
+                FieldType::Text,
+                FieldCapabilities::FULL_TEXT,
+                Some(Analyzer::UnicodeAlphanumericLowercase),
+            ),
+            ranked_field(1, "tag", FieldType::Keyword, FieldCapabilities::EXACT, None),
+        ],
+        semantics: IndexSemantics::TypedJson,
+        physical_order: Vec::new(),
+        component_versions: Vec::new(),
+    })
+}
+
+async fn text_phrase_fixture(
+    schema: &Schema,
+    index_id: u64,
+) -> (RankedMemoryArtifacts, SegmentDescriptor) {
+    let mut sink = ExactMemorySink::new();
+    let segment = ranked_segment(
+        &mut sink,
+        schema,
+        index_id,
+        1,
+        vec![
+            positioned_text_source("phrase/exact", &[("quick", 0), ("brown", 1)], 2),
+            positioned_text_source("phrase/gap", &[("quick", 0), ("brown", 2)], 3),
+            positioned_text_source("phrase/reversed", &[("quick", 1), ("brown", 0)], 2),
+        ],
+    )
+    .await;
+    (RankedMemoryArtifacts(sink.objects().clone()), segment)
+}
+
+async fn boolean_phrase_fixture() -> (Schema, RankedMemoryArtifacts, SegmentDescriptor) {
+    let schema = typed_text_schema();
+    let mut sink = ExactMemorySink::new();
+    let mut reversed = positioned_text_source(
+        "boolean/reversed",
+        &[("brown", 0), ("quick", 1), ("fox", 2), ("red", 3)],
+        4,
+    );
+    reversed.records[0]
+        .terms
+        .push(scalar_projected_term(1, "override"));
+    let segment = ranked_segment(
+        &mut sink,
+        &schema,
+        28,
+        1,
+        vec![
+            positioned_text_source(
+                "boolean/exact",
+                &[("quick", 0), ("brown", 1), ("red", 2), ("fox", 3)],
+                4,
+            ),
+            positioned_text_source(
+                "boolean/first-only",
+                &[("quick", 0), ("brown", 1), ("red", 2), ("fox", 4)],
+                5,
+            ),
+            positioned_text_source(
+                "boolean/second-only",
+                &[("quick", 0), ("brown", 2), ("red", 3), ("fox", 4)],
+                5,
+            ),
+            reversed,
+            positioned_text_source(
+                "boolean/gaps",
+                &[("quick", 0), ("brown", 2), ("red", 3), ("fox", 5)],
+                6,
+            ),
+        ],
+    )
+    .await;
+    (
+        schema,
+        RankedMemoryArtifacts(sink.objects().clone()),
+        segment,
+    )
+}
+
+fn phrase(id: u32, text: &str) -> Predicate {
+    Predicate::Phrase {
+        id: PredicateId::new(id),
+        field_id: FieldId::new(0),
+        text: text.into(),
+    }
+}
+
+fn ranked_paths(page: &crate::v4::NativeQueryPage) -> BTreeSet<&str> {
+    page.hits
+        .iter()
+        .map(|hit| hit.result.path.as_str())
+        .collect()
+}
+
+async fn execute_phrase_predicate(
+    schema: &Schema,
+    directory: &RankedMemoryArtifacts,
+    segment: &SegmentDescriptor,
+    predicate: Predicate,
+) -> crate::v4::NativeQueryPage {
+    NativeQueryExecutor::new(directory, &RankedAllowAll, NativeQueryLimits::default())
+        .unwrap()
+        .execute(&ranked_request(
+            schema.clone(),
+            vec![segment.clone()],
+            NativeQuery::Filter {
+                predicate: Some(predicate),
+                order: Vec::new(),
+            },
+            5,
+        ))
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn phrase_under_or_preserves_branch_semantics() {
+    let (schema, directory, segment) = boolean_phrase_fixture().await;
+    let page = execute_phrase_predicate(
+        &schema,
+        &directory,
+        &segment,
+        Predicate::Or(vec![
+            phrase(1, "quick brown"),
+            Predicate::Equal {
+                id: PredicateId::new(2),
+                field_id: FieldId::new(1),
+                value: crate::v4::ScalarValue::String("override".into()),
+            },
+        ]),
+    )
+    .await;
+
+    assert_eq!(
+        ranked_paths(&page),
+        BTreeSet::from(["boolean/exact", "boolean/first-only", "boolean/reversed"])
+    );
+}
+
+#[tokio::test]
+async fn phrase_under_not_excludes_only_exact_positions() {
+    let (schema, directory, segment) = boolean_phrase_fixture().await;
+    let page = execute_phrase_predicate(
+        &schema,
+        &directory,
+        &segment,
+        Predicate::Not(Box::new(phrase(1, "quick brown"))),
+    )
+    .await;
+
+    assert_eq!(
+        ranked_paths(&page),
+        BTreeSet::from(["boolean/gaps", "boolean/reversed", "boolean/second-only",])
+    );
+}
+
+#[tokio::test]
+async fn multiple_phrases_under_and_must_all_match() {
+    let (schema, directory, segment) = boolean_phrase_fixture().await;
+    let page = execute_phrase_predicate(
+        &schema,
+        &directory,
+        &segment,
+        Predicate::And(vec![phrase(1, "quick brown"), phrase(2, "red fox")]),
+    )
+    .await;
+
+    assert_eq!(ranked_paths(&page), BTreeSet::from(["boolean/exact"]));
+    assert!(page.statistics.two_phase_verifications >= 2);
+}
+
+#[tokio::test]
+async fn full_text_phrase_requires_adjacent_tokens_in_query_order() {
+    let schema = full_text_schema();
+    let (directory, segment) = text_phrase_fixture(&schema, 29).await;
+    let page = NativeQueryExecutor::new(&directory, &RankedAllowAll, NativeQueryLimits::default())
+        .unwrap()
+        .execute(&ranked_request(
+            schema,
+            vec![segment],
+            NativeQuery::FullText {
+                text: "quick brown".into(),
+                phrase: true,
+            },
+            3,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(page.hits.len(), 1);
+    assert_eq!(page.hits[0].result.path, "phrase/exact");
+    assert!(page.statistics.two_phase_verifications > 0);
+}
+
+#[tokio::test]
+async fn typed_json_full_text_and_phrase_predicates_execute_natively() {
+    let schema = typed_text_schema();
+    let (directory, segment) = text_phrase_fixture(&schema, 30).await;
+    let executor =
+        NativeQueryExecutor::new(&directory, &RankedAllowAll, NativeQueryLimits::default())
+            .unwrap();
+
+    let full_text = executor
+        .execute(&ranked_request(
+            schema.clone(),
+            vec![segment.clone()],
+            NativeQuery::Filter {
+                predicate: Some(Predicate::FullText {
+                    id: PredicateId::new(1),
+                    field_id: FieldId::new(0),
+                    text: "quick brown".into(),
+                }),
+                order: Vec::new(),
+            },
+            3,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(full_text.hits.len(), 3);
+
+    let phrase = executor
+        .execute(&ranked_request(
+            schema,
+            vec![segment],
+            NativeQuery::Filter {
+                predicate: Some(Predicate::Phrase {
+                    id: PredicateId::new(1),
+                    field_id: FieldId::new(0),
+                    text: "quick brown".into(),
+                }),
+                order: Vec::new(),
+            },
+            3,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(phrase.hits.len(), 1);
+    assert_eq!(phrase.hits[0].result.path, "phrase/exact");
 }
 
 #[tokio::test]
@@ -527,7 +792,11 @@ fn scalar_projected_term(field_id: u32, value: &str) -> ProjectedTerm {
     }
 }
 
-fn repeated_record(terms: Vec<ProjectedTerm>) -> ProjectedRecord {
+fn repeated_record(
+    terms: Vec<ProjectedTerm>,
+    ordered_field_id: u32,
+    ordered_value: &str,
+) -> ProjectedRecord {
     ProjectedRecord {
         result_identity: Some(ObjectIdentity {
             path: "shared/result".into(),
@@ -536,7 +805,11 @@ fn repeated_record(terms: Vec<ProjectedTerm>) -> ProjectedRecord {
         order_key: Vec::new(),
         terms,
         points: Vec::new(),
-        doc_values: Vec::new(),
+        doc_values: vec![ProjectedDocValue {
+            field_id: FieldId::new(ordered_field_id),
+            multi_valued: false,
+            cell: DocValueCell::value(ScalarValue::String(ordered_value.into())),
+        }],
         vectors: Vec::new(),
         field_lengths: Vec::new(),
     }
@@ -593,7 +866,9 @@ async fn git_and_tensor_pagination_uses_stable_source_record_tie_breaks() {
                 2,
                 "tree_path",
                 FieldType::Keyword,
-                FieldCapabilities::EXACT.union(FieldCapabilities::PREFIX),
+                FieldCapabilities::EXACT
+                    .union(FieldCapabilities::PREFIX)
+                    .union(FieldCapabilities::ORDER),
                 None,
             ),
         ],
@@ -618,7 +893,10 @@ async fn git_and_tensor_pagination_uses_stable_source_record_tie_breaks() {
                 path: "git/manifest".into(),
                 version: 3,
             },
-            records: vec![repeated_record(git_terms()), repeated_record(git_terms())],
+            records: vec![
+                repeated_record(git_terms(), 2, "src/lib.rs"),
+                repeated_record(git_terms(), 2, "src/lib.rs"),
+            ],
         },
         NativeQuery::GitSource {
             repository_id: "repo".into(),
@@ -645,7 +923,7 @@ async fn git_and_tensor_pagination_uses_stable_source_record_tie_breaks() {
                 1,
                 "tensor",
                 FieldType::Keyword,
-                FieldCapabilities::EXACT,
+                FieldCapabilities::EXACT.union(FieldCapabilities::ORDER),
                 None,
             ),
         ],
@@ -670,8 +948,8 @@ async fn git_and_tensor_pagination_uses_stable_source_record_tie_breaks() {
                 version: 5,
             },
             records: vec![
-                repeated_record(tensor_terms()),
-                repeated_record(tensor_terms()),
+                repeated_record(tensor_terms(), 1, "weights"),
+                repeated_record(tensor_terms(), 1, "weights"),
             ],
         },
         NativeQuery::Tensor {

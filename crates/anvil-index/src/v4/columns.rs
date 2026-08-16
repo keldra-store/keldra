@@ -44,6 +44,18 @@ impl ScalarValue {
         }
     }
 
+    /// Convert an integer only when binary64 preserves its exact value.
+    pub fn exact_number_from_i64(value: i64) -> Option<Self> {
+        let number = value as f64;
+        ((number as i128) == i128::from(value)).then(|| Self::Number(number.to_bits()))
+    }
+
+    /// Convert an integer only when binary64 preserves its exact value.
+    pub fn exact_number_from_u64(value: u64) -> Option<Self> {
+        let number = value as f64;
+        ((number as u128) == u128::from(value)).then(|| Self::Number(number.to_bits()))
+    }
+
     fn tag(&self) -> u8 {
         match self {
             Self::Null => 0,
@@ -879,6 +891,20 @@ mod tests {
             ScalarValue::number(0.0).unwrap()
         );
         assert!(ScalarValue::number(f64::NAN).is_err());
+    }
+
+    #[test]
+    fn integer_to_number_conversion_rejects_precision_loss() {
+        let exactly_representable = 1i64 << 53;
+        assert_eq!(
+            ScalarValue::exact_number_from_i64(exactly_representable),
+            ScalarValue::number(exactly_representable as f64).ok()
+        );
+        assert!(ScalarValue::exact_number_from_i64(exactly_representable + 1).is_none());
+        assert!(ScalarValue::exact_number_from_i64(i64::MAX).is_none());
+        assert!(ScalarValue::exact_number_from_u64((1u64 << 53) + 1).is_none());
+        assert!(ScalarValue::exact_number_from_u64(u64::MAX).is_none());
+        assert!(ScalarValue::exact_number_from_i64(i64::MIN).is_some());
     }
 
     #[test]

@@ -7,9 +7,9 @@ use super::build::{
 };
 use super::locator::PathLocatorBlockBuilder;
 use super::{
-    ArtifactDescriptor, ArtifactDirectoryRead, ComponentKind, ComponentStream, DocId, DocIdRange,
-    LiveMaskBlock, LocatorEntry, LocatorValue, PathLocatorBlock, SegmentDescriptor,
-    SegmentIdentity, read_artifact_component,
+    ArtifactDescriptor, ArtifactDirectoryRead, ArtifactPackReference, ComponentKind,
+    ComponentStream, DocId, DocIdRange, LiveMaskBlock, LocatorEntry, LocatorValue,
+    PathLocatorBlock, SegmentDescriptor, SegmentIdentity, read_artifact_component,
 };
 
 pub const LOCATOR_COMPACTION_FAN_IN: usize = 4;
@@ -19,6 +19,7 @@ pub const LOCATOR_COMPACTION_FAN_IN: usize = 4;
 pub struct LocatorStreamRoot {
     pub sequence: u64,
     pub identity: SegmentIdentity,
+    pub packs: Vec<ArtifactPackReference>,
     pub artifact: ArtifactDescriptor,
 }
 
@@ -30,7 +31,15 @@ impl LocatorStreamRoot {
             ));
         }
         self.identity.validate()?;
-        self.artifact.validate(self.identity.index_id)?;
+        if self.packs.is_empty() {
+            return Err(IndexError::InvalidFormat(
+                "path-locator root has no artifact packs",
+            ));
+        }
+        for pack in &self.packs {
+            pack.validate(self.identity.index_id)?;
+        }
+        self.artifact.pack(self.identity.index_id, &self.packs)?;
         if self.artifact.component_kind != ComponentKind::ROUTING_NODE {
             return Err(IndexError::InvalidFormat(
                 "path-locator root has the wrong component kind",
@@ -144,6 +153,7 @@ async fn locate_path_values_inner<D: ArtifactDirectoryRead>(
         let mut stream = ComponentStream::new(
             directory,
             root.identity,
+            &root.packs,
             ComponentKind::PATH_LOCATOR,
             root.artifact.clone(),
             Some(paths[0].as_bytes().to_vec()),
@@ -164,6 +174,7 @@ async fn locate_path_values_inner<D: ArtifactDirectoryRead>(
             let loaded = read_artifact_component(
                 directory,
                 root.identity,
+                &root.packs,
                 &leaf.descriptor,
                 ComponentKind::PATH_LOCATOR,
             )
@@ -389,7 +400,7 @@ where
     let mut ordered = roots.to_vec();
     ordered.sort_by_key(|root| root.sequence);
     let mut cursors = Vec::with_capacity(ordered.len());
-    for root in ordered {
+    for root in &ordered {
         root.validate()?;
         if root.identity.index_id != output_identity.index_id
             || root.identity.definition_version != output_identity.definition_version
@@ -453,6 +464,7 @@ struct LocatorMergeCursor<'a, D> {
     sequence: u64,
     identity: SegmentIdentity,
     directory: &'a D,
+    packs: &'a [ArtifactPackReference],
     stream: ComponentStream<'a, D>,
     entries: std::vec::IntoIter<LocatorEntry>,
     previous_path: Option<String>,
@@ -460,16 +472,18 @@ struct LocatorMergeCursor<'a, D> {
 }
 
 impl<'a, D: ArtifactDirectoryRead> LocatorMergeCursor<'a, D> {
-    fn new(directory: &'a D, root: LocatorStreamRoot) -> Result<Self, IndexError> {
+    fn new(directory: &'a D, root: &'a LocatorStreamRoot) -> Result<Self, IndexError> {
         Ok(Self {
             sequence: root.sequence,
             identity: root.identity,
             directory,
+            packs: &root.packs,
             stream: ComponentStream::new(
                 directory,
                 root.identity,
+                &root.packs,
                 ComponentKind::PATH_LOCATOR,
-                root.artifact,
+                root.artifact.clone(),
                 None,
                 None,
             )?,
@@ -502,6 +516,7 @@ impl<'a, D: ArtifactDirectoryRead> LocatorMergeCursor<'a, D> {
             let loaded = read_artifact_component(
                 self.directory,
                 self.identity,
+                self.packs,
                 &leaf.descriptor,
                 ComponentKind::PATH_LOCATOR,
             )
@@ -577,6 +592,7 @@ where
     if ranges.is_empty() {
         return Ok(segment.clone());
     }
+    sink.begin_segment(segment.identity, &segment.packs)?;
     let mut previous_end = 0u32;
     for range in ranges {
         let end = range
@@ -606,6 +622,7 @@ where
     let mut stream = ComponentStream::new(
         directory,
         segment.identity,
+        &segment.packs,
         ComponentKind::LIVE_MASK,
         component.artifact.clone(),
         None,
@@ -656,6 +673,7 @@ where
         let loaded = read_artifact_component(
             directory,
             segment.identity,
+            &segment.packs,
             &leaf.descriptor,
             ComponentKind::LIVE_MASK,
         )
@@ -694,6 +712,7 @@ where
         ))?
         .finish()
         .await?;
+    let packs = sink.finalize_segment(segment.identity).await?;
     let mut components = segment.components.clone();
     components[component_index].artifact = replacement.root;
     let encoded_bytes = replace_total(
@@ -713,6 +732,7 @@ where
             .live_document_count
             .checked_sub(cleared)
             .ok_or(IndexError::InvalidFormat("live-mask count underflow"))?,
+        packs,
         components,
         encoded_bytes,
         logical_bytes,
@@ -742,8 +762,8 @@ mod tests {
     use crate::IndexFileRead;
     use crate::v4::build::{ComponentLeaf, ExactMemorySink, PublishedObject, publish_stream};
     use crate::v4::{
-        DocumentIdentity, IdentityBlock, ObjectIdentity, SegmentComponent, SegmentStatistics,
-        encode_component,
+        ArtifactPackReference, DocumentIdentity, IdentityBlock, ObjectIdentity, SegmentComponent,
+        SegmentStatistics, encode_component,
     };
 
     struct MemoryDirectory {
@@ -767,30 +787,19 @@ mod tests {
 
         async fn open_artifact(
             &self,
-            descriptor: &ArtifactDescriptor,
+            pack: &ArtifactPackReference,
         ) -> Result<Self::File, IndexError> {
             let object = self
                 .objects
-                .get(&descriptor.path)
-                .ok_or_else(|| IndexError::FileNotFound(descriptor.path.clone()))?;
-            if object.object_version != descriptor.object_version {
+                .get(&pack.path)
+                .ok_or_else(|| IndexError::FileNotFound(pack.path.clone()))?;
+            if object.object_version != pack.object_version
+                || *blake3::hash(&object.bytes).as_bytes() != pack.object_content_hash
+                || object.bytes.len() as u64 != pack.object_length
+            {
                 return Err(IndexError::Integrity);
             }
-            let start =
-                usize::try_from(descriptor.offset).map_err(|_| IndexError::OffsetOverflow)?;
-            let length = usize::try_from(descriptor.encoded_length)
-                .map_err(|_| IndexError::OffsetOverflow)?;
-            let end = start
-                .checked_add(length)
-                .ok_or(IndexError::OffsetOverflow)?;
-            Ok(MemoryFile(
-                object
-                    .bytes
-                    .get(start..end)
-                    .ok_or(IndexError::Integrity)?
-                    .to_vec()
-                    .into(),
-            ))
+            Ok(MemoryFile(object.bytes.clone().into()))
         }
     }
 
@@ -800,16 +809,34 @@ mod tests {
         }
     }
 
+    async fn publish_locator_root(
+        sink: &mut ExactMemorySink,
+        sequence: u64,
+        identity: SegmentIdentity,
+        entries: Vec<LocatorEntry>,
+    ) -> LocatorStreamRoot {
+        sink.begin_segment(identity, &[]).unwrap();
+        let stream = publish_locator_delta(sink, identity, 1, 1, entries)
+            .await
+            .unwrap();
+        let packs = sink.finalize_segment(identity).await.unwrap();
+        LocatorStreamRoot {
+            sequence,
+            identity,
+            packs,
+            artifact: stream.root,
+        }
+    }
+
     #[tokio::test]
     async fn locator_resolution_uses_highest_version_across_deltas() {
         let first = SegmentIdentity::new(9, 1, [7; 32], 11).unwrap();
         let second = SegmentIdentity::new(9, 1, [7; 32], 12).unwrap();
         let mut sink = ExactMemorySink::new();
-        let live = publish_locator_delta(
+        let live = publish_locator_root(
             &mut sink,
+            1,
             first,
-            1,
-            1,
             vec![LocatorEntry {
                 path: "objects/a".into(),
                 value: LocatorValue::Live {
@@ -822,13 +849,11 @@ mod tests {
                 },
             }],
         )
-        .await
-        .unwrap();
-        let deleted = publish_locator_delta(
+        .await;
+        let deleted = publish_locator_root(
             &mut sink,
+            2,
             second,
-            1,
-            1,
             vec![LocatorEntry {
                 path: "objects/a".into(),
                 value: LocatorValue::Deleted {
@@ -836,20 +861,8 @@ mod tests {
                 },
             }],
         )
-        .await
-        .unwrap();
-        let roots = vec![
-            LocatorStreamRoot {
-                sequence: 2,
-                identity: second,
-                artifact: deleted.root,
-            },
-            LocatorStreamRoot {
-                sequence: 1,
-                identity: first,
-                artifact: live.root,
-            },
-        ];
+        .await;
+        let roots = vec![deleted, live];
         assert_eq!(
             locate_path(&directory(&sink), &roots, "objects/a")
                 .await
@@ -867,11 +880,10 @@ mod tests {
         let mut sink = ExactMemorySink::new();
         let mut roots = Vec::new();
         for (sequence, identity, segment_id) in [(1, first, 11), (2, second, 12)] {
-            let stream = publish_locator_delta(
+            let root = publish_locator_root(
                 &mut sink,
+                sequence,
                 identity,
-                1,
-                1,
                 vec![LocatorEntry {
                     path: "objects/a".into(),
                     value: LocatorValue::Live {
@@ -884,13 +896,8 @@ mod tests {
                     },
                 }],
             )
-            .await
-            .unwrap();
-            roots.push(LocatorStreamRoot {
-                sequence,
-                identity,
-                artifact: stream.root,
-            });
+            .await;
+            roots.push(root);
         }
         let Some(LocatorValue::Live { ranges, .. }) =
             locate_path(&directory(&sink), &roots, "objects/a")
@@ -907,11 +914,10 @@ mod tests {
         let first = SegmentIdentity::new(9, 1, [7; 32], 11).unwrap();
         let second = SegmentIdentity::new(9, 1, [7; 32], 12).unwrap();
         let mut sink = ExactMemorySink::new();
-        let first_stream = publish_locator_delta(
+        let first_root = publish_locator_root(
             &mut sink,
+            1,
             first,
-            1,
-            1,
             vec![
                 LocatorEntry {
                     path: "objects/a".into(),
@@ -932,13 +938,11 @@ mod tests {
                 },
             ],
         )
-        .await
-        .unwrap();
-        let second_stream = publish_locator_delta(
+        .await;
+        let second_root = publish_locator_root(
             &mut sink,
+            2,
             second,
-            1,
-            1,
             vec![
                 LocatorEntry {
                     path: "objects/a".into(),
@@ -964,20 +968,8 @@ mod tests {
                 },
             ],
         )
-        .await
-        .unwrap();
-        let roots = vec![
-            LocatorStreamRoot {
-                sequence: 1,
-                identity: first,
-                artifact: first_stream.root,
-            },
-            LocatorStreamRoot {
-                sequence: 2,
-                identity: second,
-                artifact: second_stream.root,
-            },
-        ];
+        .await;
+        let roots = vec![first_root, second_root];
         let paths = ('a'..='z')
             .map(|suffix| format!("objects/{suffix}"))
             .collect::<Vec<_>>();
@@ -1160,25 +1152,21 @@ mod tests {
             ),
         ] {
             let identity = SegmentIdentity::new(9, 1, [7; 32], segment_id).unwrap();
-            let stream = publish_locator_delta(&mut sink, identity, 1, 1, entries)
-                .await
-                .unwrap();
-            roots.push(LocatorStreamRoot {
-                sequence,
-                identity,
-                artifact: stream.root,
-            });
+            roots.push(publish_locator_root(&mut sink, sequence, identity, entries).await);
         }
 
         let input = directory(&sink);
         let output_identity = SegmentIdentity::new(9, 1, [7; 32], 20).unwrap();
+        sink.begin_segment(output_identity, &[]).unwrap();
         let compacted =
             compact_locator_roots(&input, &mut sink, &roots[..3], output_identity, 1, 1)
                 .await
                 .unwrap();
+        let packs = sink.finalize_segment(output_identity).await.unwrap();
         let compacted_root = LocatorStreamRoot {
             sequence: 3,
             identity: output_identity,
+            packs,
             artifact: compacted.root,
         };
         let output = directory(&sink);
@@ -1219,6 +1207,7 @@ mod tests {
     async fn live_mask_rewrite_reuses_unaffected_leaves() {
         let identity = SegmentIdentity::new(9, 1, [7; 32], 11).unwrap();
         let mut sink = ExactMemorySink::new();
+        sink.begin_segment(identity, &[]).unwrap();
         let identity_block = IdentityBlock::new(
             DocId::MIN,
             (0u32..4)
@@ -1267,10 +1256,12 @@ mod tests {
         .await;
         let encoded_bytes = identities.encoded_bytes + live.encoded_bytes + stats.encoded_bytes;
         let logical_bytes = identities.logical_bytes + live.logical_bytes + stats.logical_bytes;
+        let packs = sink.finalize_segment(identity).await.unwrap();
         let segment = SegmentDescriptor::new(
             identity,
             4,
             4,
+            packs,
             vec![
                 SegmentComponent {
                     role: ComponentKind::IDENTITY_TABLE,
@@ -1310,6 +1301,11 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(rewritten.live_document_count, 3);
+        assert_eq!(
+            &rewritten.packs[..segment.packs.len()],
+            segment.packs.as_slice(),
+            "unchanged descriptor ordinals retain the base pack table",
+        );
         let rewritten_directory = directory(&sink);
         let blocks = super::super::SegmentComponentReader::new(&rewritten_directory, &rewritten)
             .unwrap()
