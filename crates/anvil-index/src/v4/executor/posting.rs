@@ -110,8 +110,10 @@ pub(super) struct PostingStream<'a, D> {
     segment: &'a SegmentDescriptor,
     root: ArtifactDescriptor,
     stream: ComponentStream<'a, D>,
+    first_ordinal: u32,
     next_ordinal: u32,
     end_ordinal: u32,
+    component_max_doc_ids: Vec<DocId>,
     block: Option<DecodedPostingBlock>,
     position: usize,
     current: Option<DocId>,
@@ -136,6 +138,13 @@ impl<'a, D: ArtifactDirectoryRead> PostingStream<'a, D> {
         let last = end_ordinal
             .checked_sub(1)
             .ok_or_else(|| IndexError::InvalidQuery("empty posting reference".into()))?;
+        if reference
+            .component_max_doc_ids
+            .last()
+            .is_some_and(|maximum| maximum.get() >= segment.document_count)
+        {
+            return Err(IndexError::InvalidFormat("posting component bound"));
+        }
         let stream = ComponentStream::new(
             directory,
             segment.identity,
@@ -150,8 +159,10 @@ impl<'a, D: ArtifactDirectoryRead> PostingStream<'a, D> {
             segment,
             root,
             stream,
+            first_ordinal: reference.first_component_ordinal,
             next_ordinal: reference.first_component_ordinal,
             end_ordinal,
+            component_max_doc_ids: reference.component_max_doc_ids,
             block: None,
             position: 0,
             current: None,
@@ -218,11 +229,24 @@ impl<'a, D: ArtifactDirectoryRead> PostingStream<'a, D> {
         self.statistics.posting_block_sought(
             u64::try_from(loaded.payload.len()).map_err(|_| IndexError::OffsetOverflow)?,
         );
-        self.block = Some(
-            self.directory
-                .run_query_cpu(move || DecodedPostingBlock::decode_payload(&loaded.payload))
-                .await?,
-        );
+        let block = self
+            .directory
+            .run_query_cpu(move || DecodedPostingBlock::decode_payload(&loaded.payload))
+            .await?;
+        if !self.component_max_doc_ids.is_empty() {
+            let relative = self
+                .next_ordinal
+                .checked_sub(self.first_ordinal)
+                .ok_or(IndexError::InvalidFormat("posting component ordinal"))?;
+            let expected = self
+                .component_max_doc_ids
+                .get(relative as usize)
+                .ok_or(IndexError::InvalidFormat("posting component bound"))?;
+            if block.last_doc_id() != *expected {
+                return Err(IndexError::InvalidFormat("posting component bound"));
+            }
+        }
+        self.block = Some(block);
         self.statistics.posting_block_decoded();
         self.position = 0;
         self.next_ordinal = self
@@ -260,6 +284,7 @@ impl<'a, D: ArtifactDirectoryRead> PostingStream<'a, D> {
         if self.current.is_some_and(|current| current >= target) {
             return Ok(self.current);
         }
+        self.seek_component_containing(target)?;
         loop {
             if let Some(block) = &self.block {
                 if block.last_doc_id() >= target {
@@ -277,6 +302,47 @@ impl<'a, D: ArtifactDirectoryRead> PostingStream<'a, D> {
                 return Ok(None);
             }
         }
+    }
+
+    /// Position the routed stream at the first posting component which can
+    /// contain `target`. Legacy references have no component bounds and retain
+    /// their exact sequential traversal.
+    fn seek_component_containing(&mut self, target: DocId) -> Result<(), IndexError> {
+        if self.component_max_doc_ids.is_empty() {
+            return Ok(());
+        }
+        let mut relative = self
+            .component_max_doc_ids
+            .partition_point(|maximum| *maximum < target);
+        // Reading the final component proves exhaustion when the target lies
+        // beyond the declared final bound instead of trusting unvisited
+        // cross-component metadata to produce an empty result.
+        relative = relative.min(self.component_max_doc_ids.len() - 1);
+        let ordinal = self
+            .first_ordinal
+            .checked_add(u32::try_from(relative).map_err(|_| IndexError::OffsetOverflow)?)
+            .ok_or(IndexError::OffsetOverflow)?;
+        if ordinal <= self.next_ordinal {
+            return Ok(());
+        }
+        let last = self
+            .end_ordinal
+            .checked_sub(1)
+            .ok_or(IndexError::InvalidFormat("empty posting reference"))?;
+        self.stream = ComponentStream::new(
+            self.directory,
+            self.segment.identity,
+            &self.segment.packs,
+            ComponentKind::POSTINGS,
+            self.root.clone(),
+            Some(component_ordinal_key(ordinal).to_vec()),
+            Some(component_ordinal_key(last).to_vec()),
+        )?;
+        self.next_ordinal = ordinal;
+        self.block = None;
+        self.position = 0;
+        self.current = None;
+        Ok(())
     }
 
     /// Drop the decoded posting block while retaining only the immutable
@@ -719,7 +785,7 @@ impl<'a, D: ArtifactDirectoryRead> TermRangeStream<'a, D> {
                     self.directory,
                     self.segment,
                     self.field_id,
-                    entry.postings,
+                    entry.postings.clone(),
                     self.statistics.clone(),
                 )?;
                 let mut candidate = postings.next().await?;
@@ -1364,7 +1430,193 @@ fn validate_ordinal_leaf(leaf: &StreamLeaf, expected: u32) -> Result<(), IndexEr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v4::PostingBlock;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::Arc;
+
+    use crate::IndexFileRead;
+    use crate::v4::build::{
+        BuildLimits, ExactMemorySink, NativeSegmentWriter, ProjectedRecord, ProjectedSource,
+        ProjectedTerm, PublishedObject, SourcePush,
+    };
+    use crate::v4::{
+        ArtifactPackReference, Cardinality, Collation, ComponentVersion, FIELD_PRESENCE_TERM,
+        FieldCapabilities, FieldComponents, FieldSchema, FieldType, IndexKind, IndexSemantics,
+        ObjectIdentity, PostingBlock, Schema, SegmentIdentity, TERM_TYPE_FIELD_PRESENCE,
+        canonical_term_key, scalar_term,
+    };
+
+    #[derive(Clone)]
+    struct MemoryFile(Arc<[u8]>);
+
+    impl IndexFileRead for MemoryFile {
+        type Slice = Arc<[u8]>;
+
+        async fn read_at(&self, offset: u64, maximum: usize) -> Result<Self::Slice, IndexError> {
+            let start = usize::try_from(offset).map_err(|_| IndexError::OffsetOverflow)?;
+            if start >= self.0.len() {
+                return Ok(Arc::from([]));
+            }
+            Ok(Arc::from(
+                &self.0[start..start.saturating_add(maximum).min(self.0.len())],
+            ))
+        }
+    }
+
+    struct MemoryArtifacts(BTreeMap<String, PublishedObject>);
+
+    impl ArtifactDirectoryRead for MemoryArtifacts {
+        type File = MemoryFile;
+
+        async fn open_artifact(
+            &self,
+            pack: &ArtifactPackReference,
+        ) -> Result<Self::File, IndexError> {
+            let object = self
+                .0
+                .get(&pack.path)
+                .ok_or_else(|| IndexError::FileNotFound(pack.path.clone()))?;
+            if object.object_version != pack.object_version
+                || *blake3::hash(&object.bytes).as_bytes() != pack.object_content_hash
+                || object.bytes.len() as u64 != pack.object_length
+            {
+                return Err(IndexError::Integrity);
+            }
+            Ok(MemoryFile(Arc::from(object.bytes.as_slice())))
+        }
+    }
+
+    fn component_version(component_kind: ComponentKind) -> ComponentVersion {
+        ComponentVersion {
+            component_kind,
+            codec_version: u16::from(component_kind == ComponentKind::IDENTITY_TABLE) + 1,
+        }
+    }
+
+    fn keyword_schema() -> Schema {
+        let mut field = FieldSchema {
+            id: FieldId::new(0),
+            name: "value".into(),
+            source_selector: "/value".into(),
+            field_type: FieldType::Keyword,
+            cardinality: Cardinality::Single,
+            allow_missing: false,
+            allow_null: false,
+            collation: Collation::BinaryUtf8,
+            capabilities: FieldCapabilities::EXACT,
+            analyzer: None,
+            components: FieldComponents::TERMS,
+        };
+        field.components = field.compiled_components().unwrap();
+        Schema {
+            kind: IndexKind::TypedJson,
+            path_prefix: String::new(),
+            content_type_scope: Some("application/json".into()),
+            fields: vec![field],
+            semantics: IndexSemantics::TypedJson,
+            physical_order: Vec::new(),
+            component_versions: BTreeSet::from([
+                ComponentKind::ROUTING_NODE,
+                ComponentKind::IDENTITY_TABLE,
+                ComponentKind::LIVE_MASK,
+                ComponentKind::PATH_LOCATOR,
+                ComponentKind::TERM_DICTIONARY,
+                ComponentKind::POSTINGS,
+                ComponentKind::SCORING_STATISTICS,
+            ])
+            .into_iter()
+            .map(component_version)
+            .collect(),
+        }
+    }
+
+    fn keyword_source(ordinal: u32, term_type: u8, term: &[u8]) -> ProjectedSource {
+        ProjectedSource {
+            source_identity: ObjectIdentity {
+                path: format!("source-{ordinal:05}"),
+                version: 1,
+            },
+            records: vec![ProjectedRecord {
+                result_identity: None,
+                order_key: Vec::new(),
+                terms: vec![
+                    ProjectedTerm {
+                        field_id: FieldId::new(0),
+                        term_type,
+                        term: term.to_vec(),
+                        frequency: 1,
+                        positions: Vec::new(),
+                    },
+                    ProjectedTerm {
+                        field_id: FieldId::new(0),
+                        term_type: TERM_TYPE_FIELD_PRESENCE,
+                        term: FIELD_PRESENCE_TERM.to_vec(),
+                        frequency: 1,
+                        positions: Vec::new(),
+                    },
+                ],
+                points: Vec::new(),
+                doc_values: Vec::new(),
+                vectors: Vec::new(),
+                field_lengths: Vec::new(),
+            }],
+        }
+    }
+
+    async fn multi_component_postings() -> (SegmentDescriptor, MemoryArtifacts, PostingReference) {
+        let schema = keyword_schema();
+        let identity = SegmentIdentity::new(41, 1, schema.fingerprint().unwrap(), 1).unwrap();
+        let mut writer = NativeSegmentWriter::new(
+            identity,
+            schema,
+            BuildLimits::new(128 * 1024 * 1024).unwrap(),
+        )
+        .unwrap();
+        let (term_type, term) =
+            scalar_term(&super::super::super::ScalarValue::String("common".into())).unwrap();
+        for ordinal in 0..=(16 * 1024) {
+            assert_eq!(
+                writer
+                    .push_source(keyword_source(ordinal, term_type, &term))
+                    .unwrap(),
+                SourcePush::Accepted
+            );
+        }
+        let mut sink = ExactMemorySink::new();
+        let segment = writer.seal(&mut sink).await.unwrap().descriptor;
+        let directory = MemoryArtifacts(sink.objects().clone());
+        let canonical = canonical_term_key(FieldId::new(0), term_type, &term).unwrap();
+        let root = component_root(
+            &segment,
+            ComponentKind::TERM_DICTIONARY,
+            Some(FieldId::new(0)),
+        )
+        .unwrap();
+        let mut dictionaries = ComponentStream::new(
+            &directory,
+            segment.identity,
+            &segment.packs,
+            ComponentKind::TERM_DICTIONARY,
+            root,
+            Some(canonical.clone()),
+            Some(canonical.clone()),
+        )
+        .unwrap();
+        let leaf = dictionaries.next_leaf().await.unwrap().unwrap();
+        let loaded = read_artifact_component(
+            &directory,
+            segment.identity,
+            &segment.packs,
+            &leaf.descriptor,
+            ComponentKind::TERM_DICTIONARY,
+        )
+        .await
+        .unwrap();
+        let dictionary = TermDictionary::decode_payload(&loaded.payload).unwrap();
+        let reference = dictionary.exact(&canonical).unwrap().postings.clone();
+        assert_eq!(reference.component_count, 2);
+        assert_eq!(reference.component_max_doc_ids.len(), 2);
+        (segment, directory, reference)
+    }
 
     #[test]
     fn full_text_scoring_fails_closed_without_impact_data() {
@@ -1379,5 +1631,51 @@ mod tests {
                 "full-text posting block has no impact bound"
             ))
         ));
+    }
+
+    #[tokio::test]
+    async fn early_and_late_advances_each_open_only_the_selected_posting_component() {
+        let (segment, directory, reference) = multi_component_postings().await;
+        let early_statistics = NativeQueryStatisticsRecorder::new();
+        let mut early = PostingStream::new(
+            &directory,
+            &segment,
+            FieldId::new(0),
+            reference.clone(),
+            early_statistics.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            early.advance(DocId::new(0)).await.unwrap(),
+            Some(DocId::new(0))
+        );
+        let early_snapshot = early_statistics.snapshot();
+        assert_eq!(
+            early_snapshot.posting_blocks_sought, 1,
+            "{early_snapshot:?}"
+        );
+        assert_eq!(
+            early_snapshot.posting_blocks_decoded, 1,
+            "{early_snapshot:?}"
+        );
+
+        let statistics = NativeQueryStatisticsRecorder::new();
+        let mut postings = PostingStream::new(
+            &directory,
+            &segment,
+            FieldId::new(0),
+            reference,
+            statistics.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            postings.advance(DocId::new(16 * 1024)).await.unwrap(),
+            Some(DocId::new(16 * 1024))
+        );
+        let snapshot = statistics.snapshot();
+        assert_eq!(snapshot.posting_blocks_sought, 1, "{snapshot:?}");
+        assert_eq!(snapshot.posting_blocks_decoded, 1, "{snapshot:?}");
+        assert_eq!(snapshot.posting_blocks_skipped, 0, "{snapshot:?}");
     }
 }
