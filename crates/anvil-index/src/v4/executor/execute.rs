@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
@@ -10,8 +10,9 @@ use futures_util::future::join_all;
 use super::super::{
     ArtifactDirectoryRead, CandidateGate, CandidateReference, DocId, FieldId,
     INDEX_GENERATION_SEGMENTS, NativeQuery, NativeQueryCursor, NativeQueryExecutionTier,
-    NativeQueryHit, NativeQueryPage, NativeQueryRequest, NativeQueryStatisticsRecorder,
-    ObjectIdentity, OrderDirection, OrderField, SegmentComponentReader, SortValue,
+    NativeQueryHit, NativeQueryPage, NativeQueryPhase, NativeQueryRequest,
+    NativeQueryStatisticsRecorder, ObjectIdentity, OrderDirection, OrderField,
+    SegmentComponentReader, SegmentStatistics, SortValue,
 };
 use super::plan::{SegmentPlan, plan_segment};
 use super::posting::DocCursor;
@@ -27,8 +28,8 @@ mod result;
 mod sorting;
 
 use sorting::{
-    compare_parts, compare_selected, compare_to_cursor, minimum_head, physical_after,
-    physical_values, rank_values,
+    compare_parts, compare_selected, compare_to_cursor, physical_after, physical_values,
+    rank_values,
 };
 
 pub const MAXIMUM_CANDIDATE_GATE_BATCH: usize = 256;
@@ -135,6 +136,17 @@ where
         )
     }
 
+    pub fn memory_estimate(
+        &self,
+        request: &NativeQueryRequest,
+    ) -> Result<super::memory::NativeQueryMemoryEstimate, IndexError> {
+        super::memory::estimate_working_memory_range(
+            request,
+            self.limits,
+            self.directory.query_parallelism(),
+        )
+    }
+
     pub async fn execute<'query>(
         &'query self,
         request: &'query NativeQueryRequest,
@@ -151,6 +163,24 @@ where
         request: &'query NativeQueryRequest,
         statistics: NativeQueryStatisticsRecorder,
     ) -> Result<NativeQueryPage, NativeQueryExecutionError<G::Error>> {
+        self.execute_observed_with_resident_segments(
+            request,
+            statistics,
+            request.segments.len().max(1),
+        )
+        .await
+    }
+
+    /// Execute under a previously admitted decoded-state residency. The limit
+    /// bounds concurrent segment planning and physical-order retained state;
+    /// non-physical execution lanes are already part of the mandatory grant.
+    #[doc(hidden)]
+    pub async fn execute_observed_with_resident_segments<'query>(
+        &'query self,
+        request: &'query NativeQueryRequest,
+        statistics: NativeQueryStatisticsRecorder,
+        resident_segment_limit: usize,
+    ) -> Result<NativeQueryPage, NativeQueryExecutionError<G::Error>> {
         request.validate()?;
         if request.segments.len() > self.limits.maximum_segments
             || request.limit as usize > self.limits.maximum_result_limit
@@ -164,7 +194,7 @@ where
             }
             .into());
         }
-        self.working_memory_bytes(request)?;
+        let memory = self.memory_estimate(request)?;
         let scoring_query_vector = scoring_query_vector(&request.schema, &request.query)?;
         let text_scoring = text_scoring_active(&request.query);
         let physical = physical_order(request).is_some();
@@ -174,38 +204,44 @@ where
             NativeQueryExecutionTier::TopK
         });
 
+        let plan_phase = statistics.phase_timer(NativeQueryPhase::Plan);
         let mut global = GlobalTextStatistics::default();
         let mut executions = Vec::with_capacity(request.segments.len());
-        for (segment_index, segment) in request.segments.iter().enumerate() {
-            let plan = plan_segment(
-                self.directory,
-                segment,
-                &request.schema,
-                &request.query,
-                self.limits.maximum_expanded_terms,
-                &statistics,
-            )
-            .await?;
-            if text_scoring {
-                global.add_segment(
-                    &SegmentComponentReader::new(self.directory, segment)?
-                        .statistics()
-                        .await?,
-                    &plan.text_terms,
-                )?;
+        let planning_lanes = self.planning_lanes(request, resident_segment_limit);
+        let mut start = 0usize;
+        while start < request.segments.len() {
+            let end = start
+                .saturating_add(planning_lanes)
+                .min(request.segments.len());
+            for (segment_index, plan, segment_statistics) in self
+                .plan_segment_chunk(request, start..end, text_scoring, &statistics)
+                .await?
+            {
+                let segment = &request.segments[segment_index];
+                if let Some(segment_statistics) = segment_statistics {
+                    global.add_segment(&segment_statistics, &plan.text_terms)?;
+                }
+                executions.push(SegmentExecution::new(
+                    self.directory,
+                    segment_index,
+                    segment,
+                    plan,
+                    statistics.clone(),
+                )?);
             }
-            executions.push(SegmentExecution::new(
-                self.directory,
-                segment_index,
-                segment,
-                plan,
-                statistics.clone(),
-            )?);
+            start = end;
         }
+        drop(plan_phase);
 
         let selected = if physical {
-            self.execute_physical(request, &mut executions, &statistics)
-                .await?
+            self.execute_physical(
+                request,
+                &mut executions,
+                resident_segment_limit.max(1),
+                memory.resident_segment_bytes(),
+                &statistics,
+            )
+            .await?
         } else {
             self.execute_top_k(
                 request,
@@ -216,8 +252,12 @@ where
             )
             .await?
         };
-        let (facet_results, aggregate_results) = self.compute(request, &statistics).await?;
-        result::materialize(
+        let (facet_results, aggregate_results) = self
+            .compute(request, resident_segment_limit, &statistics)
+            .await?;
+        let materialization_phase =
+            statistics.phase_timer(NativeQueryPhase::ResponseMaterialization);
+        let page = result::materialize(
             request,
             executions.as_mut_slice(),
             selected,
@@ -227,12 +267,15 @@ where
             &statistics,
         )
         .await
-        .map_err(NativeQueryExecutionError::Index)
+        .map_err(NativeQueryExecutionError::Index);
+        drop(materialization_phase);
+        page
     }
 
     async fn compute<'query>(
         &'query self,
         request: &'query NativeQueryRequest,
+        resident_segment_limit: usize,
         statistics: &NativeQueryStatisticsRecorder,
     ) -> Result<
         (
@@ -245,58 +288,112 @@ where
             return Ok((Vec::new(), Vec::new()));
         }
         let mut state = compute::ComputationState::new(request, self.limits.maximum_page_bytes)?;
-        for (segment_index, segment) in request.segments.iter().enumerate() {
-            let plan = plan_segment(
-                self.directory,
-                segment,
-                &request.schema,
-                &request.query,
-                self.limits.maximum_expanded_terms,
-                statistics,
-            )
-            .await?;
-            let mut execution = SegmentExecution::new(
-                self.directory,
-                segment_index,
-                segment,
-                plan,
-                statistics.clone(),
-            )?;
-            let mut pending = Vec::with_capacity(self.limits.candidate_gate_batch);
-            loop {
-                while pending.len() < self.limits.candidate_gate_batch {
-                    let Some(candidate) = execution.next_unranked().await? else {
+        let planning_lanes = self.planning_lanes(request, resident_segment_limit);
+        let mut start = 0usize;
+        while start < request.segments.len() {
+            let end = start
+                .saturating_add(planning_lanes)
+                .min(request.segments.len());
+            let plan_phase = statistics.phase_timer(NativeQueryPhase::Plan);
+            let planned = self
+                .plan_segment_chunk(request, start..end, false, statistics)
+                .await?;
+            drop(plan_phase);
+            for (segment_index, plan, _) in planned {
+                let mut execution = SegmentExecution::new(
+                    self.directory,
+                    segment_index,
+                    &request.segments[segment_index],
+                    plan,
+                    statistics.clone(),
+                )?;
+                let mut pending = Vec::with_capacity(self.limits.candidate_gate_batch);
+                loop {
+                    while pending.len() < self.limits.candidate_gate_batch {
+                        let Some(candidate) = execution.next_unranked().await? else {
+                            break;
+                        };
+                        pending.push(candidate);
+                    }
+                    if pending.is_empty() {
                         break;
-                    };
-                    pending.push(candidate);
-                }
-                if pending.is_empty() {
-                    break;
-                }
-                let references = pending
-                    .iter()
-                    .map(|candidate| CandidateReference {
-                        source: candidate.identity.source.clone(),
-                        result: candidate.identity.result_or_source().clone(),
-                    })
-                    .collect::<Vec<_>>();
-                let evidence = self
-                    .gate
-                    .evaluate(&references)
-                    .await
-                    .map_err(NativeQueryExecutionError::Gate)?;
-                result::validate_gate(request, references.len(), &evidence, statistics)?;
-                for (candidate, visible) in pending.drain(..).zip(evidence.visible) {
-                    if visible {
-                        state
-                            .observe(&mut execution.values, candidate.doc_id, statistics)
-                            .await?;
+                    }
+                    let references = pending
+                        .iter()
+                        .map(|candidate| CandidateReference {
+                            source: candidate.identity.source.clone(),
+                            result: candidate.identity.result_or_source().clone(),
+                        })
+                        .collect::<Vec<_>>();
+                    let evidence = self
+                        .gate
+                        .evaluate(&references)
+                        .await
+                        .map_err(NativeQueryExecutionError::Gate)?;
+                    result::validate_gate(request, references.len(), &evidence, statistics)?;
+                    for (candidate, visible) in pending.drain(..).zip(evidence.visible) {
+                        if visible {
+                            state
+                                .observe(&mut execution.values, candidate.doc_id, statistics)
+                                .await?;
+                        }
                     }
                 }
+                execution.release_decoded()?;
             }
-            execution.release_decoded()?;
+            start = end;
         }
         state.finish().map_err(NativeQueryExecutionError::Index)
+    }
+
+    fn planning_lanes(&self, request: &NativeQueryRequest, resident_segment_limit: usize) -> usize {
+        self.directory
+            .query_parallelism()
+            .max(1)
+            .min(resident_segment_limit.max(1))
+            .min(request.segments.len().max(1))
+    }
+
+    async fn plan_segment_chunk<'query>(
+        &'query self,
+        request: &'query NativeQueryRequest,
+        indices: std::ops::Range<usize>,
+        read_text_statistics: bool,
+        statistics: &NativeQueryStatisticsRecorder,
+    ) -> Result<Vec<(usize, SegmentPlan<'query, D>, Option<SegmentStatistics>)>, IndexError> {
+        let mut work = Vec::with_capacity(indices.len());
+        for segment_index in indices {
+            let segment = &request.segments[segment_index];
+            work.push(async move {
+                let plan = plan_segment(
+                    self.directory,
+                    segment,
+                    &request.schema,
+                    &request.query,
+                    self.limits.maximum_expanded_terms,
+                    statistics,
+                )
+                .await?;
+                let segment_statistics = if read_text_statistics {
+                    Some(
+                        SegmentComponentReader::new(self.directory, segment)?
+                            .statistics()
+                            .await?,
+                    )
+                } else {
+                    None
+                };
+                Ok::<_, IndexError>((segment_index, plan, segment_statistics))
+            });
+        }
+        let mut planned = Vec::with_capacity(work.len());
+        // `join_all` preserves the segment-index order established above. Fold
+        // errors and global statistics only after every lane completes so the
+        // externally visible plan remains deterministic.
+        for result in join_all(work).await {
+            planned.push(result?);
+        }
+        Ok(planned)
     }
 
     async fn execute_top_k<'query>(
@@ -479,7 +576,6 @@ where
             let source_record = candidate.identity.source_record;
             let selected = Selected {
                 segment_index: execution.segment_index,
-                doc_id: candidate.doc_id,
                 source: candidate.identity.source,
                 source_record,
                 result,
@@ -506,18 +602,32 @@ where
         &'query self,
         request: &NativeQueryRequest,
         executions: &mut [SegmentExecution<'query, D>],
+        resident_segment_limit: usize,
+        resident_segment_bytes: usize,
         statistics: &NativeQueryStatisticsRecorder,
     ) -> Result<Vec<Selected>, NativeQueryExecutionError<G::Error>> {
         let order = physical_order(request).expect("checked physical plan");
         let directions = Arc::<[OrderDirection]>::from(query_directions(request));
         let after = physical_after(request, &directions)?;
+        let resident_segment_limit = resident_segment_limit.max(1).min(executions.len().max(1));
         let lanes = self
             .directory
             .query_parallelism()
             .max(1)
-            .min(executions.len().max(1));
+            .min(resident_segment_limit);
+        statistics.resident_segment_slots(resident_segment_limit);
+        let mut residency = PhysicalResidency::new(
+            resident_segment_limit,
+            executions.len(),
+            resident_segment_bytes,
+            statistics.clone(),
+        );
         let mut indexed_heads = Vec::with_capacity(executions.len());
-        for chunk in executions.chunks_mut(lanes) {
+        let mut start = 0usize;
+        while start < executions.len() {
+            let end = start.saturating_add(lanes).min(executions.len());
+            residency.activate_batch(start..end, executions)?;
+            let chunk = &mut executions[start..end];
             let mut work = Vec::with_capacity(chunk.len());
             for execution in chunk {
                 work.push(self.initialize_physical_segment(
@@ -531,12 +641,14 @@ where
             for head in join_all(work).await {
                 indexed_heads.push(head?);
             }
+            start = end;
         }
-        indexed_heads.sort_by_key(|(index, _)| *index);
-        let mut heads = indexed_heads
-            .into_iter()
-            .map(|(_, head)| head)
-            .collect::<Vec<_>>();
+        let mut heads = BinaryHeap::with_capacity(indexed_heads.len());
+        for (_, head) in indexed_heads {
+            if let Some(head) = head {
+                heads.push(PhysicalHead(head));
+            }
+        }
         let mut selected = Vec::with_capacity(request.limit as usize);
         let mut refill_required = false;
         while selected.len() < request.limit as usize {
@@ -545,16 +657,23 @@ where
                 .candidate_gate_batch
                 .min((request.limit as usize).saturating_sub(selected.len()));
             let mut pending = Vec::with_capacity(batch_target);
+            let merge_phase = statistics.phase_timer(NativeQueryPhase::PhysicalMergeAdvance);
             while pending.len() < batch_target {
-                let Some(index) = minimum_head(&heads) else {
+                let Some(PhysicalHead(head)) = heads.pop() else {
                     break;
                 };
-                pending.push(heads[index].take().unwrap());
-                heads[index] = executions[index]
+                let index = head.segment_index;
+                pending.push(head);
+                residency.activate(index, executions)?;
+                if let Some(next) = executions[index]
                     .next_physical(request, order, directions.clone())
-                    .await?;
-                executions[index].release_decoded()?;
+                    .await?
+                {
+                    debug_assert_eq!(next.segment_index, index);
+                    heads.push(PhysicalHead(next));
+                }
             }
+            drop(merge_phase);
             if pending.is_empty() {
                 break;
             }
@@ -588,6 +707,7 @@ where
         if selected.len() == request.limit as usize {
             statistics.physical_early_termination();
         }
+        residency.release_all(executions)?;
         Ok(selected)
     }
 
@@ -600,13 +720,116 @@ where
         execution: &mut SegmentExecution<'query, D>,
     ) -> Result<(usize, Option<Selected>), NativeQueryExecutionError<G::Error>> {
         if let Some(after) = after {
+            let seek_phase = execution
+                .statistics
+                .phase_timer(NativeQueryPhase::ContinuationSeek);
             execution
                 .seek_after(request, order, after, &directions)
                 .await?;
+            drop(seek_phase);
         }
+        let head_phase = execution
+            .statistics
+            .phase_timer(NativeQueryPhase::HeadInitialization);
         let head = execution.next_physical(request, order, directions).await?;
-        execution.release_decoded()?;
+        drop(head_phase);
         Ok((execution.segment_index, head))
+    }
+}
+
+/// Query-local LRU for disposable decoded segment state. Activating a segment
+/// evicts before the next read, so execution never transiently exceeds the
+/// admitted resident-segment count.
+struct PhysicalResidency {
+    capacity: usize,
+    resident: VecDeque<usize>,
+    present: Vec<bool>,
+    previously_loaded: Vec<bool>,
+    charged_bytes: u64,
+    statistics: NativeQueryStatisticsRecorder,
+}
+
+impl PhysicalResidency {
+    fn new(
+        capacity: usize,
+        segments: usize,
+        charged_bytes: usize,
+        statistics: NativeQueryStatisticsRecorder,
+    ) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            resident: VecDeque::with_capacity(capacity.min(segments)),
+            present: vec![false; segments],
+            previously_loaded: vec![false; segments],
+            charged_bytes: u64::try_from(charged_bytes).unwrap_or(u64::MAX),
+            statistics,
+        }
+    }
+
+    fn activate_batch<D: ArtifactDirectoryRead>(
+        &mut self,
+        indices: std::ops::Range<usize>,
+        executions: &mut [SegmentExecution<'_, D>],
+    ) -> Result<(), IndexError> {
+        for index in indices {
+            self.activate(index, executions)?;
+        }
+        Ok(())
+    }
+
+    fn activate<D: ArtifactDirectoryRead>(
+        &mut self,
+        index: usize,
+        executions: &mut [SegmentExecution<'_, D>],
+    ) -> Result<(), IndexError> {
+        if self.present.get(index).copied().unwrap_or(false) {
+            if let Some(position) = self.resident.iter().position(|resident| *resident == index) {
+                self.resident.remove(position);
+            }
+            self.resident.push_back(index);
+            return Ok(());
+        }
+        while self.resident.len() >= self.capacity {
+            let evicted = self
+                .resident
+                .pop_front()
+                .expect("resident capacity checked nonzero");
+            executions[evicted].release_decoded()?;
+            self.present[evicted] = false;
+            self.statistics.decoded_state_released(self.charged_bytes);
+            self.statistics.decoded_state_evicted();
+        }
+        self.resident.push_back(index);
+        self.present[index] = true;
+        if self.previously_loaded[index] {
+            self.statistics.decoded_state_reloaded();
+        }
+        self.previously_loaded[index] = true;
+        self.statistics.decoded_state_retained(self.charged_bytes);
+        Ok(())
+    }
+
+    fn release_all<D: ArtifactDirectoryRead>(
+        &mut self,
+        executions: &mut [SegmentExecution<'_, D>],
+    ) -> Result<(), IndexError> {
+        while let Some(index) = self.resident.pop_front() {
+            executions[index].release_decoded()?;
+            self.present[index] = false;
+            self.statistics.decoded_state_released(self.charged_bytes);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PhysicalResidency {
+    fn drop(&mut self) {
+        for present in &mut self.present {
+            if *present {
+                *present = false;
+                self.statistics.decoded_state_released(self.charged_bytes);
+            }
+        }
     }
 }
 
@@ -722,7 +945,6 @@ impl<'a, D: ArtifactDirectoryRead> SegmentExecution<'a, D> {
             physical_values(request, &mut self.values, candidate.doc_id, &result, order).await?;
         let selected = Selected {
             segment_index: self.segment_index,
-            doc_id: candidate.doc_id,
             source: candidate.identity.source,
             source_record,
             result,
@@ -748,13 +970,40 @@ struct Unranked {
 
 struct Selected {
     segment_index: usize,
-    doc_id: DocId,
     source: ObjectIdentity,
     source_record: u32,
     result: ObjectIdentity,
     score: Option<f32>,
     sort_values: Vec<SortValue>,
     directions: Arc<[OrderDirection]>,
+}
+
+/// Reverses `Selected`'s natural ordering for the standard max-heap while
+/// retaining a deterministic lower-segment tie-break for indistinguishable
+/// heads. The physical merge stores exactly one head per live segment and pops
+/// the globally smallest candidate in `O(log segments)`.
+struct PhysicalHead(Selected);
+
+impl PartialEq for PhysicalHead {
+    fn eq(&self, other: &Self) -> bool {
+        compare_selected(&self.0, &other.0) == Ordering::Equal
+            && self.0.segment_index == other.0.segment_index
+    }
+}
+
+impl Eq for PhysicalHead {}
+
+impl PartialOrd for PhysicalHead {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PhysicalHead {
+    fn cmp(&self, other: &Self) -> Ordering {
+        compare_selected(&other.0, &self.0)
+            .then_with(|| other.0.segment_index.cmp(&self.0.segment_index))
+    }
 }
 
 impl PartialEq for Selected {

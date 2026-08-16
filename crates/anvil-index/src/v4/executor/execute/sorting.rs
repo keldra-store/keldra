@@ -83,15 +83,6 @@ fn compare_sort_value(left: &SortValue, right: &SortValue, direction: OrderDirec
     }
 }
 
-pub(super) fn minimum_head(heads: &[Option<Selected>]) -> Option<usize> {
-    heads
-        .iter()
-        .enumerate()
-        .filter_map(|(index, value)| value.as_ref().map(|value| (index, value)))
-        .min_by(|left, right| compare_selected(left.1, right.1))
-        .map(|(index, _)| index)
-}
-
 pub(super) async fn rank_values<D: ArtifactDirectoryRead>(
     request: &NativeQueryRequest,
     values: &mut SegmentValues<'_, D>,
