@@ -47,7 +47,7 @@ repository are required.
 ### 1. Start a development node
 
 ```sh
-export ANVIL_IMAGE=ghcr.io/worka-ai/anvil:0.9.1
+export ANVIL_IMAGE=ghcr.io/worka-ai/anvil:0.9.2
 export ANVIL_TOKEN_SIGNING_KEY_FILE="$PWD/anvil-data/token-signing-key"
 
 mkdir -p anvil-data
@@ -159,7 +159,7 @@ Zanzibar-authorized object addressed by `(tenant, bucket, path)`.
 ## Use the Rust client
 
 ```sh
-cargo add anvil-storage@0.9.1
+cargo add anvil-storage@0.9.2
 cargo add tokio --features macros,rt-multi-thread
 ```
 
@@ -234,7 +234,7 @@ Zanzibar-authorized independently of ordinary object traffic.
 Add the public client and canonical protocol types:
 
 ```sh
-cargo add anvil-storage@0.9.1 personaldb-protocol@0.2.2 serde_json
+cargo add anvil-storage@0.9.2 personaldb-protocol@0.2.2 serde_json
 ```
 
 Use the same application credential created above to create a source group and
@@ -528,11 +528,13 @@ physical order supports early termination and true search-after pagination.
 Hits identify authoritative objects instead of copying source fields into the
 index. Up to three HRW-selected query replicas materialize only the blocks a
 query needs through the shared bounded cache.
-Construction memory is capped per index kind across the whole process, so
-corpus size does not become builder heap. Query responses always include
-freshness evidence; while a new complete generation is building, Anvil
-continues serving the preceding complete generation rather than exposing a
-partial one.
+Construction and query memory share one hard process-wide ceiling, so corpus
+size does not become unaccounted heap. Per-kind construction settings and the
+query setting remain fair-share planning targets; active work can borrow idle
+capacity without crossing the aggregate ceiling. Query responses always
+include freshness evidence; while a new complete generation is building,
+Anvil continues serving the preceding complete generation rather than exposing
+a partial one.
 
 The startup default is 256 MiB of construction memory and at most four
 compaction lanes for each index kind, shared by every local definition of that
@@ -559,7 +561,11 @@ worker pool and the corresponding kind's construction-memory budget.
 `ANVIL_INDEX_MAX_SEGMENTS_PER_TIER` and
 `ANVIL_INDEX_MAX_UNMERGED_BYTES_PER_TIER` bound merge debt, with per-kind
 overrides following the same naming pattern. `ANVIL_INDEX_QUERY_MEMORY_BYTES`
-is the process-wide admission budget shared by concurrent index queries.
+is the query fair share. `ANVIL_INDEX_WORKING_MEMORY_BYTES` optionally sets the
+hard aggregate query/build/compaction ceiling; without it, Anvil uses the
+checked sum of the query and eight per-kind shares (2.5 GiB with defaults).
+Queries and builders can borrow idle bytes and derive their workspace from the
+actual grant, while queued mandatory work retains FIFO priority.
 
 Actual compaction concurrency is the minimum of that kind's configured cap,
 the process worker ceiling, the number of deterministic key ranges, and the
@@ -675,7 +681,7 @@ bundles, establishes peer mTLS, exercises replicated and erasure-coded storage,
 queries every index type, and performs a rolling restart:
 
 ```sh
-ANVIL_IMAGE=ghcr.io/worka-ai/anvil:0.9.1 \
+ANVIL_IMAGE=ghcr.io/worka-ai/anvil:0.9.2 \
   ./scripts/qualify-three-node.sh
 ```
 

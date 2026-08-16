@@ -75,6 +75,7 @@ fn checked_component_decoders_reject_hostile_counts_without_panics() {
             total_term_frequency: 1,
             first_component_ordinal: 0,
             component_count: 1,
+            component_max_doc_ids: vec![DocId::new(0)],
         },
     }])
     .unwrap()

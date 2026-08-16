@@ -15,8 +15,8 @@ use anvil_index::IndexError;
 use anvil_index::v4::{
     AggregateOperation, ArtifactDirectoryRead, ArtifactPackReference, CandidateGate,
     CandidateGateEvidence, CandidateReference, FieldId, IndexKind, NativeQueryCursor,
-    NativeQueryExecutionError, NativeQueryExecutor, NativeQueryLimits, NativeQueryRequest,
-    NativeQueryStatisticsRecorder, ScalarValue,
+    NativeQueryExecutionError, NativeQueryExecutor, NativeQueryLimits, NativeQueryPhase,
+    NativeQueryRequest, NativeQueryStatisticsRecorder, ScalarValue,
 };
 use anvil_store::{BlobRef, CurrentObjectSnapshot, MAX_CONTENT_TYPE_BYTES, ObjectKey};
 use tonic::Status;
@@ -170,6 +170,7 @@ struct RuntimeCandidateGate {
     storage_tenant: String,
     bucket: String,
     visibility: Arc<dyn IndexCandidateVisibility>,
+    statistics: NativeQueryStatisticsRecorder,
 }
 
 impl RuntimeCandidateGate {
@@ -257,12 +258,16 @@ impl CandidateGate for RuntimeCandidateGate {
                     },
                 })
                 .collect::<Vec<_>>();
+            let started = std::time::Instant::now();
+            let result = self.visibility.evaluate(&candidates).await;
+            self.statistics
+                .phase_elapsed(NativeQueryPhase::CandidateVisibility, started.elapsed());
             let CandidateVisibilityEvidence {
                 visible,
                 authorization_revision,
                 denied,
                 stale,
-            } = self.visibility.evaluate(&candidates).await?;
+            } = result?;
             Ok(CandidateGateEvidence {
                 visible,
                 authorization_revision,
@@ -501,6 +506,66 @@ impl QueryActiveGuard {
         );
         self.span
             .record("query.returned_hits", execution.returned_hits);
+        self.span.record(
+            "query.memory_desired_bytes",
+            execution.query_memory_desired_bytes,
+        );
+        self.span.record(
+            "query.memory_granted_bytes",
+            execution.query_memory_granted_bytes,
+        );
+        self.span.record(
+            "query.resident_segment_slots",
+            execution.resident_segment_slots,
+        );
+        self.span.record(
+            "query.resident_segments_current",
+            execution.resident_segments_current,
+        );
+        self.span.record(
+            "query.resident_segments_peak",
+            execution.resident_segments_peak,
+        );
+        self.span.record(
+            "query.retained_decoded_charged_bytes",
+            execution.retained_decoded_charged_bytes,
+        );
+        self.span.record(
+            "query.retained_decoded_charged_peak_bytes",
+            execution.retained_decoded_charged_peak_bytes,
+        );
+        self.span.record(
+            "query.decoded_state_evictions",
+            execution.decoded_state_evictions,
+        );
+        self.span.record(
+            "query.decoded_state_reloads",
+            execution.decoded_state_reloads,
+        );
+        self.span.record(
+            "query.phase_plan_seconds",
+            duration_seconds(execution.plan_duration_nanos),
+        );
+        self.span.record(
+            "query.phase_continuation_seek_seconds",
+            duration_seconds(execution.continuation_seek_duration_nanos),
+        );
+        self.span.record(
+            "query.phase_head_initialization_seconds",
+            duration_seconds(execution.head_initialization_duration_nanos),
+        );
+        self.span.record(
+            "query.phase_physical_merge_advance_seconds",
+            duration_seconds(execution.physical_merge_advance_duration_nanos),
+        );
+        self.span.record(
+            "query.phase_candidate_visibility_seconds",
+            duration_seconds(execution.candidate_visibility_duration_nanos),
+        );
+        self.span.record(
+            "query.phase_response_materialization_seconds",
+            duration_seconds(execution.response_materialization_duration_nanos),
+        );
         self.span.record("query.elapsed_seconds", elapsed);
         self.span.record("query.outcome", outcome);
         self.span
@@ -583,8 +648,22 @@ impl QueryActiveGuard {
                     execution.candidate_gate_stale,
                 monotonic_counter.anvil_index_query_candidate_gate_refills_total =
                     execution.candidate_gate_refills,
+                monotonic_counter.anvil_index_query_decoded_state_evictions_total =
+                    execution.decoded_state_evictions,
+                monotonic_counter.anvil_index_query_decoded_state_reloads_total =
+                    execution.decoded_state_reloads,
                 histogram.anvil_index_query_duration_seconds = elapsed,
                 histogram.anvil_index_query_returned_hits = execution.returned_hits,
+                histogram.anvil_index_query_memory_desired_bytes =
+                    execution.query_memory_desired_bytes,
+                histogram.anvil_index_query_memory_granted_bytes =
+                    execution.query_memory_granted_bytes,
+                histogram.anvil_index_query_resident_segment_slots =
+                    execution.resident_segment_slots,
+                histogram.anvil_index_query_resident_segments_peak =
+                    execution.resident_segments_peak,
+                histogram.anvil_index_query_retained_decoded_charged_peak_bytes =
+                    execution.retained_decoded_charged_peak_bytes,
                 histogram.anvil_index_query_planner_lead_cost_min =
                     execution.planner_lead_cost_min,
                 histogram.anvil_index_query_planner_lead_cost_max =
@@ -594,7 +673,53 @@ impl QueryActiveGuard {
                 "local index query reached a terminal outcome"
             );
         });
+        record_query_phase(
+            self.kind,
+            NativeQueryPhase::Plan,
+            execution.plan_duration_nanos,
+        );
+        record_query_phase(
+            self.kind,
+            NativeQueryPhase::ContinuationSeek,
+            execution.continuation_seek_duration_nanos,
+        );
+        record_query_phase(
+            self.kind,
+            NativeQueryPhase::HeadInitialization,
+            execution.head_initialization_duration_nanos,
+        );
+        record_query_phase(
+            self.kind,
+            NativeQueryPhase::PhysicalMergeAdvance,
+            execution.physical_merge_advance_duration_nanos,
+        );
+        record_query_phase(
+            self.kind,
+            NativeQueryPhase::CandidateVisibility,
+            execution.candidate_visibility_duration_nanos,
+        );
+        record_query_phase(
+            self.kind,
+            NativeQueryPhase::ResponseMaterialization,
+            execution.response_materialization_duration_nanos,
+        );
     }
+}
+
+fn duration_seconds(nanos: u64) -> f64 {
+    Duration::from_nanos(nanos).as_secs_f64()
+}
+
+fn record_query_phase(kind: Option<IndexKind>, phase: NativeQueryPhase, nanos: u64) {
+    if nanos == 0 {
+        return;
+    }
+    tracing::info!(
+        index.kind = ?kind,
+        index.phase = phase.as_str(),
+        histogram.anvil_index_query_phase_duration_seconds = duration_seconds(nanos),
+        "local index query phase completed"
+    );
 }
 
 impl Drop for QueryActiveGuard {
@@ -719,6 +844,21 @@ impl LocalGenerationQueryExecutor {
             query.candidate_gate_stale = tracing::field::Empty,
             query.candidate_gate_refills = tracing::field::Empty,
             query.returned_hits = tracing::field::Empty,
+            query.memory_desired_bytes = tracing::field::Empty,
+            query.memory_granted_bytes = tracing::field::Empty,
+            query.resident_segment_slots = tracing::field::Empty,
+            query.resident_segments_current = tracing::field::Empty,
+            query.resident_segments_peak = tracing::field::Empty,
+            query.retained_decoded_charged_bytes = tracing::field::Empty,
+            query.retained_decoded_charged_peak_bytes = tracing::field::Empty,
+            query.decoded_state_evictions = tracing::field::Empty,
+            query.decoded_state_reloads = tracing::field::Empty,
+            query.phase_plan_seconds = tracing::field::Empty,
+            query.phase_continuation_seek_seconds = tracing::field::Empty,
+            query.phase_head_initialization_seconds = tracing::field::Empty,
+            query.phase_physical_merge_advance_seconds = tracing::field::Empty,
+            query.phase_candidate_visibility_seconds = tracing::field::Empty,
+            query.phase_response_materialization_seconds = tracing::field::Empty,
             query.elapsed_seconds = tracing::field::Empty,
             query.outcome = tracing::field::Empty,
             otel.status_code = tracing::field::Empty,
@@ -890,6 +1030,7 @@ impl LocalGenerationQueryExecutor {
             storage_tenant: request.storage_tenant.clone(),
             bucket: request.definition.bucket.clone(),
             visibility: request.candidate_visibility,
+            statistics: statistics.clone(),
         };
         let limits = NativeQueryLimits::default();
         let gate_memory_bytes = gate
@@ -1134,19 +1275,30 @@ where
     G: CandidateGate<Error = Status>,
 {
     let executor = NativeQueryExecutor::new(directory, gate, limits).map_err(index_status)?;
-    let requested = executor
-        .working_memory_bytes(request)
-        .map_err(index_status)?
+    let estimate = executor.memory_estimate(request).map_err(index_status)?;
+    let minimum = estimate
+        .minimum_bytes()
         .checked_add(runtime_gate_bytes)
         .ok_or_else(|| Status::resource_exhausted("index query memory requirement overflow"))?;
-    let requested = u64::try_from(requested)
+    let preferred = estimate
+        .preferred_bytes()
+        .checked_add(runtime_gate_bytes)
+        .ok_or_else(|| Status::resource_exhausted("index query memory preference overflow"))?;
+    let minimum = u64::try_from(minimum)
         .map_err(|_| Status::resource_exhausted("index query memory requirement exceeds u64"))?;
-    let _memory = budget
-        .acquire(requested)
+    let preferred = u64::try_from(preferred)
+        .map_err(|_| Status::resource_exhausted("index query memory preference exceeds u64"))?;
+    let memory = budget
+        .acquire_up_to(minimum, preferred)
         .await
         .map_err(|error| Status::resource_exhausted(error.to_string()))?;
+    statistics.query_memory(preferred, memory.charged_bytes());
+    let granted_native_bytes = usize::try_from(memory.charged_bytes())
+        .unwrap_or(usize::MAX)
+        .saturating_sub(runtime_gate_bytes);
+    let resident_segments = estimate.resident_segments_for(granted_native_bytes);
     executor
-        .execute_observed(request, statistics)
+        .execute_observed_with_resident_segments(request, statistics, resident_segments)
         .await
         .map_err(|error| match error {
             NativeQueryExecutionError::Index(error) => index_status(error),

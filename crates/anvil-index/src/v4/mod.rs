@@ -43,7 +43,8 @@ pub use codec::{
 };
 pub use columns::{DOC_VALUES_COMPONENT_CODEC_VERSION, DocValueBlock, DocValueCell, ScalarValue};
 pub use executor::{
-    MAXIMUM_CANDIDATE_GATE_BATCH, NativeQueryExecutionError, NativeQueryExecutor, NativeQueryLimits,
+    MAXIMUM_CANDIDATE_GATE_BATCH, NativeQueryExecutionError, NativeQueryExecutor,
+    NativeQueryLimits, NativeQueryMemoryEstimate,
 };
 pub use identity::{DocumentIdentity, IdentityBlock, ObjectIdentity};
 pub use io::{ArtifactDirectoryRead, LoadedComponent, read_artifact_component};
@@ -93,7 +94,8 @@ pub use schema::{
 };
 pub use segment_reader::SegmentComponentReader;
 pub use statistics::{
-    NativeQueryExecutionTier, NativeQueryStatistics, NativeQueryStatisticsRecorder,
+    NativeQueryExecutionTier, NativeQueryPhase, NativeQueryStatistics,
+    NativeQueryStatisticsRecorder,
 };
 pub(crate) use terms::TERM_DICTIONARY_TARGET_BYTES;
 pub use terms::{PostingReference, TermDictionary, TermEntry};

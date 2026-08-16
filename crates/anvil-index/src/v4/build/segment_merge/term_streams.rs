@@ -6,7 +6,7 @@ use super::super::super::{
     PostingReference, Schema, SegmentDescriptor, SegmentIdentity, TERM_DICTIONARY_TARGET_BYTES,
     TERM_TYPE_BOOLEAN, TERM_TYPE_FIELD_PRESENCE, TERM_TYPE_HASHED_KEYWORD, TERM_TYPE_NULL,
     TERM_TYPE_STRING, TermDictionary, TermEntry, component_ordinal_key,
-    decode_component_ordinal_key,
+    decode_component_ordinal_key, terms::encoded_entry_bytes,
 };
 use super::super::ComponentBatchSink;
 use super::super::scratch::{MergeScratchFile, MergeScratchSpace};
@@ -201,6 +201,7 @@ where
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
         let first_ordinal = posting_ordinal;
+        let mut component_max_doc_ids = Vec::new();
         let mut occurrence_cursors = Vec::with_capacity(selected.len());
         for input in &selected {
             occurrence_cursors.push(
@@ -208,7 +209,12 @@ where
                     directory,
                     inputs[*input],
                     field_id,
-                    dictionaries[*input].current.as_ref().unwrap().postings,
+                    dictionaries[*input]
+                        .current
+                        .as_ref()
+                        .unwrap()
+                        .postings
+                        .clone(),
                     remaps[*input].clone(),
                 )
                 .await?,
@@ -245,15 +251,17 @@ where
             if !output.is_empty() && output_bytes.saturating_add(bytes) > INDEX_COMPONENT_BYTES / 2
             {
                 ensure_ordinal_capacity(posting_ordinal, range.posting_ordinal_limit)?;
-                write_posting_leaf(
-                    directory,
-                    &postings_file,
-                    &positions_file,
-                    posting_ordinal,
-                    minimum_field_length,
-                    &mut output,
-                )
-                .await?;
+                component_max_doc_ids.push(
+                    write_posting_leaf(
+                        directory,
+                        &postings_file,
+                        &positions_file,
+                        posting_ordinal,
+                        minimum_field_length,
+                        &mut output,
+                    )
+                    .await?,
+                );
                 posting_ordinal = posting_ordinal
                     .checked_add(1)
                     .ok_or(IndexError::OffsetOverflow)?;
@@ -275,15 +283,17 @@ where
         }
         if !output.is_empty() {
             ensure_ordinal_capacity(posting_ordinal, range.posting_ordinal_limit)?;
-            write_posting_leaf(
-                directory,
-                &postings_file,
-                &positions_file,
-                posting_ordinal,
-                minimum_field_length,
-                &mut output,
-            )
-            .await?;
+            component_max_doc_ids.push(
+                write_posting_leaf(
+                    directory,
+                    &postings_file,
+                    &positions_file,
+                    posting_ordinal,
+                    minimum_field_length,
+                    &mut output,
+                )
+                .await?,
+            );
             posting_ordinal = posting_ordinal
                 .checked_add(1)
                 .ok_or(IndexError::OffsetOverflow)?;
@@ -343,9 +353,10 @@ where
                     component_count: posting_ordinal
                         .checked_sub(first_ordinal)
                         .ok_or(IndexError::OffsetOverflow)?,
+                    component_max_doc_ids,
                 },
             };
-            let bytes = entry.term.len().saturating_add(28);
+            let bytes = encoded_entry_bytes(&entry)?;
             if !dictionary_buffer.is_empty()
                 && dictionary_bytes.saturating_add(bytes) > TERM_DICTIONARY_TARGET_BYTES
             {
@@ -452,7 +463,11 @@ async fn write_posting_leaf<D: ArtifactDirectoryRead, F: MergeScratchFile>(
     ordinal: u32,
     minimum_field_length: Option<u32>,
     occurrences: &mut Vec<Occurrence>,
-) -> Result<(), IndexError> {
+) -> Result<DocId, IndexError> {
+    let maximum_doc_id = occurrences
+        .last()
+        .ok_or(IndexError::InvalidFormat("empty posting leaf"))?
+        .doc_id;
     let values = std::mem::take(occurrences);
     let (posting_count, posting_payload, position_count, position_payload) = directory
         .run_query_cpu(move || {
@@ -495,7 +510,7 @@ async fn write_posting_leaf<D: ArtifactDirectoryRead, F: MergeScratchFile>(
     if let Some(payload) = position_payload {
         append_ordinal_leaf(positions, ordinal, position_count, payload).await?;
     }
-    Ok(())
+    Ok(maximum_doc_id)
 }
 
 async fn append_ordinal_leaf<F: MergeScratchFile>(
@@ -756,8 +771,10 @@ struct PostingOccurrenceCursor<'a, D, F> {
     posting: Option<PostingBlock>,
     posting_positions: Vec<PositionEntry>,
     posting_index: usize,
+    first_ordinal: u32,
     next_ordinal: u32,
     end_ordinal: u32,
+    component_max_doc_ids: Vec<DocId>,
     expected_frequency: u64,
     observed_frequency: u64,
     expected_total_term_frequency: u64,
@@ -814,8 +831,10 @@ impl<'a, D: ArtifactDirectoryRead, F: MergeScratchFile> PostingOccurrenceCursor<
             posting: None,
             posting_positions: Vec::new(),
             posting_index: 0,
+            first_ordinal: reference.first_component_ordinal,
             next_ordinal: reference.first_component_ordinal,
             end_ordinal: end,
+            component_max_doc_ids: reference.component_max_doc_ids,
             expected_frequency: reference.document_frequency,
             observed_frequency: 0,
             expected_total_term_frequency: reference.total_term_frequency,
@@ -884,6 +903,18 @@ impl<'a, D: ArtifactDirectoryRead, F: MergeScratchFile> PostingOccurrenceCursor<
         let ordinal = exact_ordinal(&leaf)?;
         if ordinal != self.next_ordinal {
             return Err(IndexError::InvalidFormat("posting ordinal coverage"));
+        }
+        if !self.component_max_doc_ids.is_empty() {
+            let relative = ordinal
+                .checked_sub(self.first_ordinal)
+                .ok_or(IndexError::InvalidFormat("posting component ordinal"))?;
+            if self
+                .component_max_doc_ids
+                .get(relative as usize)
+                .is_none_or(|maximum| posting.doc_ids().last() != Some(maximum))
+            {
+                return Err(IndexError::InvalidFormat("posting component bound"));
+            }
         }
         self.posting_positions = match self.pending_position.take() {
             Some((position_ordinal, block)) if position_ordinal == ordinal => {

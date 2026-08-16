@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(u8)]
@@ -16,6 +17,33 @@ impl NativeQueryExecutionTier {
             Self::Unplanned => "unplanned",
             Self::Physical => "physical",
             Self::TopK => "top_k",
+        }
+    }
+}
+
+/// Bounded, low-cardinality execution phases used by process-local query
+/// observability. These values are not persisted or exposed in the query
+/// protocol.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeQueryPhase {
+    Plan,
+    ContinuationSeek,
+    HeadInitialization,
+    PhysicalMergeAdvance,
+    CandidateVisibility,
+    ResponseMaterialization,
+}
+
+impl NativeQueryPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Plan => "plan",
+            Self::ContinuationSeek => "continuation_seek",
+            Self::HeadInitialization => "head_initialization",
+            Self::PhysicalMergeAdvance => "physical_merge_advance",
+            Self::CandidateVisibility => "candidate_visibility",
+            Self::ResponseMaterialization => "response_materialization",
         }
     }
 }
@@ -59,6 +87,28 @@ pub struct NativeQueryStatistics {
     pub candidate_gate_stale: u64,
     pub candidate_gate_refills: u64,
     pub returned_hits: u64,
+    /// Working memory the executor would use when its preferred decoded state
+    /// residency can be admitted.
+    pub query_memory_desired_bytes: u64,
+    /// Conservatively charged working-memory bytes actually admitted.
+    pub query_memory_granted_bytes: u64,
+    /// Maximum number of segment decoded states the admitted memory can retain.
+    pub resident_segment_slots: u64,
+    pub resident_segments_current: u64,
+    pub resident_segments_peak: u64,
+    /// Conservative charged bytes, rather than sampled allocator residency.
+    pub retained_decoded_charged_bytes: u64,
+    pub retained_decoded_charged_peak_bytes: u64,
+    pub decoded_state_evictions: u64,
+    pub decoded_state_reloads: u64,
+    pub plan_duration_nanos: u64,
+    pub continuation_seek_duration_nanos: u64,
+    pub head_initialization_duration_nanos: u64,
+    pub physical_merge_advance_duration_nanos: u64,
+    /// Combined Zanzibar authorization and exact-current validation time. The
+    /// current visibility boundary deliberately exposes one operation.
+    pub candidate_visibility_duration_nanos: u64,
+    pub response_materialization_duration_nanos: u64,
 }
 
 #[derive(Default)]
@@ -100,6 +150,21 @@ struct NativeQueryStatisticsInner {
     candidate_gate_stale: AtomicU64,
     candidate_gate_refills: AtomicU64,
     returned_hits: AtomicU64,
+    query_memory_desired_bytes: AtomicU64,
+    query_memory_granted_bytes: AtomicU64,
+    resident_segment_slots: AtomicU64,
+    resident_segments_current: AtomicU64,
+    resident_segments_peak: AtomicU64,
+    retained_decoded_charged_bytes: AtomicU64,
+    retained_decoded_charged_peak_bytes: AtomicU64,
+    decoded_state_evictions: AtomicU64,
+    decoded_state_reloads: AtomicU64,
+    plan_duration_nanos: AtomicU64,
+    continuation_seek_duration_nanos: AtomicU64,
+    head_initialization_duration_nanos: AtomicU64,
+    physical_merge_advance_duration_nanos: AtomicU64,
+    candidate_visibility_duration_nanos: AtomicU64,
+    response_materialization_duration_nanos: AtomicU64,
 }
 
 /// Process-local progress recorder shared with the query cancellation guard.
@@ -108,6 +173,13 @@ struct NativeQueryStatisticsInner {
 #[derive(Clone, Default)]
 pub struct NativeQueryStatisticsRecorder {
     inner: Arc<NativeQueryStatisticsInner>,
+}
+
+/// Cancellation-safe timer for one native-query phase.
+pub(crate) struct NativeQueryPhaseGuard {
+    statistics: NativeQueryStatisticsRecorder,
+    phase: NativeQueryPhase,
+    started: std::time::Instant,
 }
 
 impl NativeQueryStatisticsRecorder {
@@ -163,6 +235,31 @@ impl NativeQueryStatisticsRecorder {
             candidate_gate_stale: load(&self.inner.candidate_gate_stale),
             candidate_gate_refills: load(&self.inner.candidate_gate_refills),
             returned_hits: load(&self.inner.returned_hits),
+            query_memory_desired_bytes: load(&self.inner.query_memory_desired_bytes),
+            query_memory_granted_bytes: load(&self.inner.query_memory_granted_bytes),
+            resident_segment_slots: load(&self.inner.resident_segment_slots),
+            resident_segments_current: load(&self.inner.resident_segments_current),
+            resident_segments_peak: load(&self.inner.resident_segments_peak),
+            retained_decoded_charged_bytes: load(&self.inner.retained_decoded_charged_bytes),
+            retained_decoded_charged_peak_bytes: load(
+                &self.inner.retained_decoded_charged_peak_bytes,
+            ),
+            decoded_state_evictions: load(&self.inner.decoded_state_evictions),
+            decoded_state_reloads: load(&self.inner.decoded_state_reloads),
+            plan_duration_nanos: load(&self.inner.plan_duration_nanos),
+            continuation_seek_duration_nanos: load(&self.inner.continuation_seek_duration_nanos),
+            head_initialization_duration_nanos: load(
+                &self.inner.head_initialization_duration_nanos,
+            ),
+            physical_merge_advance_duration_nanos: load(
+                &self.inner.physical_merge_advance_duration_nanos,
+            ),
+            candidate_visibility_duration_nanos: load(
+                &self.inner.candidate_visibility_duration_nanos,
+            ),
+            response_materialization_duration_nanos: load(
+                &self.inner.response_materialization_duration_nanos,
+            ),
         }
     }
 
@@ -318,6 +415,101 @@ impl NativeQueryStatisticsRecorder {
     pub(crate) fn returned_hit(&self) {
         add(&self.inner.returned_hits, 1);
     }
+
+    /// Record the preferred and admitted query-memory envelopes. Values are
+    /// maxima so a later elastic admission may safely increase either value.
+    #[doc(hidden)]
+    pub fn query_memory(&self, desired_bytes: u64, granted_bytes: u64) {
+        let _ = self
+            .inner
+            .query_memory_desired_bytes
+            .fetch_max(desired_bytes, Ordering::Relaxed);
+        let _ = self
+            .inner
+            .query_memory_granted_bytes
+            .fetch_max(granted_bytes, Ordering::Relaxed);
+    }
+
+    /// Set the admitted number of segment-residency slots.
+    #[doc(hidden)]
+    pub fn resident_segment_slots(&self, slots: usize) {
+        self.inner
+            .resident_segment_slots
+            .store(u64::try_from(slots).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
+    /// Account one segment's conservatively charged decoded state becoming
+    /// resident. This is an accounting signal, not allocator RSS sampling.
+    #[doc(hidden)]
+    pub fn decoded_state_retained(&self, charged_bytes: u64) {
+        let current = saturating_increment(&self.inner.resident_segments_current, 1);
+        let bytes = saturating_increment(&self.inner.retained_decoded_charged_bytes, charged_bytes);
+        let _ = self
+            .inner
+            .resident_segments_peak
+            .fetch_max(current, Ordering::Relaxed);
+        let _ = self
+            .inner
+            .retained_decoded_charged_peak_bytes
+            .fetch_max(bytes, Ordering::Relaxed);
+    }
+
+    /// Account one segment's charged decoded state being released.
+    #[doc(hidden)]
+    pub fn decoded_state_released(&self, charged_bytes: u64) {
+        saturating_decrement(&self.inner.resident_segments_current, 1);
+        saturating_decrement(&self.inner.retained_decoded_charged_bytes, charged_bytes);
+    }
+
+    #[doc(hidden)]
+    pub fn decoded_state_evicted(&self) {
+        add(&self.inner.decoded_state_evictions, 1);
+    }
+
+    #[doc(hidden)]
+    pub fn decoded_state_reloaded(&self) {
+        add(&self.inner.decoded_state_reloads, 1);
+    }
+
+    /// Accumulate elapsed time for an execution phase. Concurrent segment
+    /// planning may therefore report aggregate lane time rather than wall time;
+    /// callers that time the coordinator should record one wall-time sample.
+    #[doc(hidden)]
+    pub fn phase_elapsed(&self, phase: NativeQueryPhase, elapsed: Duration) {
+        let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        let target = match phase {
+            NativeQueryPhase::Plan => &self.inner.plan_duration_nanos,
+            NativeQueryPhase::ContinuationSeek => &self.inner.continuation_seek_duration_nanos,
+            NativeQueryPhase::HeadInitialization => &self.inner.head_initialization_duration_nanos,
+            NativeQueryPhase::PhysicalMergeAdvance => {
+                &self.inner.physical_merge_advance_duration_nanos
+            }
+            NativeQueryPhase::CandidateVisibility => {
+                &self.inner.candidate_visibility_duration_nanos
+            }
+            NativeQueryPhase::ResponseMaterialization => {
+                &self.inner.response_materialization_duration_nanos
+            }
+        };
+        add(target, nanos);
+    }
+
+    /// Start a timer which records even when the surrounding future fails or
+    /// is cancelled.
+    pub(crate) fn phase_timer(&self, phase: NativeQueryPhase) -> NativeQueryPhaseGuard {
+        NativeQueryPhaseGuard {
+            statistics: self.clone(),
+            phase,
+            started: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for NativeQueryPhaseGuard {
+    fn drop(&mut self) {
+        self.statistics
+            .phase_elapsed(self.phase, self.started.elapsed());
+    }
 }
 
 fn load(value: &AtomicU64) -> u64 {
@@ -327,6 +519,21 @@ fn load(value: &AtomicU64) -> u64 {
 fn add(value: &AtomicU64, amount: u64) {
     let _ = value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         Some(current.saturating_add(amount))
+    });
+}
+
+fn saturating_increment(value: &AtomicU64, amount: u64) -> u64 {
+    value
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_add(amount))
+        })
+        .unwrap_or(u64::MAX)
+        .saturating_add(amount)
+}
+
+fn saturating_decrement(value: &AtomicU64, amount: u64) {
+    let _ = value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_sub(amount))
     });
 }
 
@@ -347,6 +554,15 @@ mod tests {
         recorder.candidate_gate_batch();
         recorder.candidate_gate_checked(4);
         clone.returned_hit();
+        recorder.query_memory(900, 1_024);
+        recorder.resident_segment_slots(3);
+        recorder.decoded_state_retained(200);
+        clone.decoded_state_retained(300);
+        recorder.decoded_state_evicted();
+        clone.decoded_state_reloaded();
+        recorder.decoded_state_released(200);
+        recorder.phase_elapsed(NativeQueryPhase::Plan, Duration::from_millis(2));
+        clone.phase_elapsed(NativeQueryPhase::Plan, Duration::from_millis(3));
 
         let snapshot = recorder.snapshot();
         assert_eq!(snapshot.tier, NativeQueryExecutionTier::TopK);
@@ -363,5 +579,15 @@ mod tests {
         assert_eq!(snapshot.candidate_gate_batches, 1);
         assert_eq!(snapshot.candidate_gate_checked, 4);
         assert_eq!(snapshot.returned_hits, 1);
+        assert_eq!(snapshot.query_memory_desired_bytes, 900);
+        assert_eq!(snapshot.query_memory_granted_bytes, 1_024);
+        assert_eq!(snapshot.resident_segment_slots, 3);
+        assert_eq!(snapshot.resident_segments_current, 1);
+        assert_eq!(snapshot.resident_segments_peak, 2);
+        assert_eq!(snapshot.retained_decoded_charged_bytes, 300);
+        assert_eq!(snapshot.retained_decoded_charged_peak_bytes, 500);
+        assert_eq!(snapshot.decoded_state_evictions, 1);
+        assert_eq!(snapshot.decoded_state_reloads, 1);
+        assert_eq!(snapshot.plan_duration_nanos, 5_000_000);
     }
 }
