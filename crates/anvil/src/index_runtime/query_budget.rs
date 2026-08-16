@@ -32,10 +32,6 @@ impl IndexQueryMemoryBudget {
         }
     }
 
-    pub(crate) fn limit_bytes(&self) -> u64 {
-        self.fair_share_bytes
-    }
-
     /// Acquire a conservative reservation before decoded blocks, candidate
     /// batches, or top-K state are allocated.
     pub(crate) async fn acquire(

@@ -1043,7 +1043,6 @@ mod tests {
             vec!["--index-query-max-concurrency", "0"],
             vec!["--index-query-work-quantum-bytes", "0"],
             vec!["--index-query-memory-bytes", "0"],
-            vec!["--index-working-memory-bytes", "0"],
             vec!["--index-max-segments-per-tier", "0"],
             vec!["--index-max-unmerged-bytes-per-tier", "0"],
             vec!["--index-vector-max-segments-per-tier", "0"],
@@ -1059,6 +1058,15 @@ mod tests {
                     .contains("validate index runtime configuration")
             );
         }
+
+        let error = parse(&["--index-working-memory-bytes", "0"])
+            .index_runtime_config()
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("validate aggregate index working-memory configuration")
+        );
     }
 
     #[test]
