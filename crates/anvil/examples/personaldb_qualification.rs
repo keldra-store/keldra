@@ -176,15 +176,16 @@ async fn main() -> TestResult<()> {
             .await,
         "an application without a group role",
     )?;
+    let grant_reader = ChangePersonalDbGroupRoleRequest {
+        bucket: bucket.clone(),
+        database_id: SOURCE_DATABASE.into(),
+        group_id: SOURCE_GROUP.into(),
+        app_id: reader_app_id.clone(),
+        role: PersonalDbGroupRole::Reader as i32,
+        command_id: "personaldb-qualification-grant-reader".into(),
+    };
     let granted = databases[1 % node_count]
-        .grant_group_role(ChangePersonalDbGroupRoleRequest {
-            bucket: bucket.clone(),
-            database_id: SOURCE_DATABASE.into(),
-            group_id: SOURCE_GROUP.into(),
-            app_id: reader_app_id.clone(),
-            role: PersonalDbGroupRole::Reader as i32,
-            command_id: "personaldb-qualification-grant-reader".into(),
-        })
+        .grant_group_role(grant_reader.clone())
         .await?
         .into_inner();
     if granted.authorization_revision == 0 || granted.replayed {
@@ -196,6 +197,21 @@ async fn main() -> TestResult<()> {
         .into_inner();
     verified_group(&reader_visible)?;
     verify_reader_list(&mut readers[1 % node_count], &bucket, true).await?;
+
+    // The first grant advanced the realm revision. Reconstructing the same
+    // protocol command must still replay its retained result rather than bind
+    // the stable command ID to the newly observed revision.
+    let replayed_grant = databases[2 % node_count]
+        .grant_group_role(grant_reader)
+        .await?
+        .into_inner();
+    if !replayed_grant.replayed
+        || replayed_grant.authorization_revision != granted.authorization_revision
+    {
+        return Err(invalid(
+            "GrantGroupRole did not replay after the realm revision advanced",
+        ));
+    }
 
     let revoked = databases[2 % node_count]
         .revoke_group_role(ChangePersonalDbGroupRoleRequest {

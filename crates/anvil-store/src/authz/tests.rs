@@ -307,6 +307,65 @@ async fn tuple_batches_are_atomic_replayable_and_principal_scoped() {
 }
 
 #[tokio::test]
+async fn retained_tuple_replay_restores_the_original_revision_for_same_mutation() {
+    let (_directory, store) = store().await;
+    let repository = store.authz();
+    let acme = tenant("acme");
+    let realm = scope("acme", "default");
+    let published = publish(
+        &repository,
+        acme.clone(),
+        "documents",
+        document_schema(false),
+        AuthzRevision::ZERO,
+    );
+    bind(
+        &repository,
+        realm.clone(),
+        published.schema_ref,
+        AuthzRevision(1),
+    );
+
+    let original = TupleBatchRequest {
+        scope: realm,
+        principal: principal("writer"),
+        expected_revision: Some(AuthzRevision(2)),
+        expected_binding_generation: 1,
+        operation_id: Some("stable-protocol-operation".into()),
+        mutations: vec![TupleMutation {
+            kind: TupleMutationKind::Add,
+            tuple: viewer_tuple("one", "alice"),
+        }],
+    };
+    let applied = repository.mutate_tuples(original.clone()).unwrap();
+    assert_eq!(applied.authz_revision, AuthzRevision(3));
+
+    // A protocol adapter authorizes the retry at the new current revision.
+    // The ordinary receipt correctly rejects that as different raw input.
+    let mut reconstructed = original.clone();
+    reconstructed.expected_revision = Some(AuthzRevision(3));
+    assert!(matches!(
+        repository.mutate_tuples(reconstructed.clone()),
+        Err(AuthzStoreError::OperationMismatch)
+    ));
+
+    let restored = repository
+        .restore_retained_tuple_replay_precondition(reconstructed.clone())
+        .unwrap();
+    assert_eq!(restored.expected_revision, original.expected_revision);
+    let replay = repository.mutate_tuples(restored).unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.authz_revision, applied.authz_revision);
+    assert_eq!(repository.tenant_revision(&acme).unwrap(), AuthzRevision(3));
+
+    reconstructed.mutations[0].tuple = viewer_tuple("two", "alice");
+    assert!(matches!(
+        repository.restore_retained_tuple_replay_precondition(reconstructed),
+        Err(AuthzStoreError::OperationMismatch)
+    ));
+}
+
+#[tokio::test]
 async fn internal_tuple_set_operations_do_not_advance_revision_when_already_satisfied() {
     let (_directory, store) = store().await;
     let repository = store.authz();

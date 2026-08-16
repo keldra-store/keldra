@@ -980,6 +980,54 @@ impl AuthzRepository {
         Ok(receipt)
     }
 
+    /// Restore the original tenant-revision CAS for a retained semantic retry.
+    ///
+    /// Some trusted protocol adapters reconstruct a request after the original
+    /// mutation advanced the tenant revision. The operation ID and canonical
+    /// tuple input are stable, but copying the now-current revision would make
+    /// the ordinary receipt fingerprint look different. This helper proves the
+    /// reconstructed tuple input against the retained receipt before restoring
+    /// the exact predecessor used by the original request. The normal mutation
+    /// path still owns replay, journal recovery, and replica durability.
+    pub fn restore_retained_tuple_replay_precondition(
+        &self,
+        mut request: TupleBatchRequest,
+    ) -> Result<TupleBatchRequest, AuthzStoreError> {
+        let canonical_mutations = self.validate_mutation_request(&request)?;
+        let operation_id = request.operation_id.as_deref().ok_or_else(|| {
+            AuthzStoreError::InvalidInput("a retained tuple replay requires an operation id".into())
+        })?;
+        let key = receipt_key(
+            &request.scope.storage_tenant,
+            &request.principal,
+            operation_id,
+        )?;
+        let Some(stored) = self.read_json::<StoredTupleReceipt>(CF_AUTHZ_RECEIPTS, &key)? else {
+            return Ok(request);
+        };
+        validate_stored_tuple_receipt(&stored, &request)?;
+        if stored.expires_at_unix_millis <= current_unix_millis()? {
+            return Ok(request);
+        }
+
+        let predecessor = stored
+            .receipt
+            .authz_revision
+            .0
+            .checked_sub(1)
+            .map(AuthzRevision)
+            .ok_or_else(|| {
+                AuthzStoreError::Storage(
+                    "persisted authorization tuple receipt has no predecessor revision".into(),
+                )
+            })?;
+        request.expected_revision = Some(predecessor);
+        if stored.fingerprint != tuple_fingerprint(&request, &canonical_mutations)? {
+            return Err(AuthzStoreError::OperationMismatch);
+        }
+        Ok(request)
+    }
+
     fn tuple_receipt_inventory(
         &self,
         now_unix_millis: u64,
