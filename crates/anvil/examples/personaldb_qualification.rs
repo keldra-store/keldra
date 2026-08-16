@@ -605,8 +605,19 @@ async fn verify_catch_up(
     let PersonalDbSyncFrameV1::EntryStart(start) = &frames[1] else {
         return Err(invalid("CatchUp omitted its entry start"));
     };
+    let expected_entry_id = format!(
+        "sha256-{}",
+        hex::encode(
+            expected_certificate
+                .unsigned()
+                .entry_core
+                .entry_hash()?
+                .as_bytes()
+        )
+    );
     start.commit_certificate.verify(SOURCE_GROUP, trust)?;
-    if start.commit_certificate != *expected_certificate
+    if start.entry_id != expected_entry_id
+        || start.commit_certificate != *expected_certificate
         || start.changeset_length != changeset.len() as u64
         || start.changeset_sha256 != Sha256Digest::hash(changeset)
     {
@@ -615,7 +626,8 @@ async fn verify_catch_up(
     let PersonalDbSyncFrameV1::EntryChunk(chunk) = &frames[2] else {
         return Err(invalid("CatchUp omitted its entry bytes"));
     };
-    if chunk.offset != 0
+    if chunk.entry_id != expected_entry_id
+        || chunk.offset != 0
         || chunk.data != changeset
         || chunk.chunk_sha256 != Sha256Digest::hash(changeset)
     {
@@ -627,7 +639,8 @@ async fn verify_catch_up(
     end.committed_head.verify(SOURCE_GROUP, trust)?;
     end.committed_head
         .verify_certificate(expected_certificate)?;
-    if end.committed_head != *expected_head
+    if end.entry_id != expected_entry_id
+        || end.committed_head != *expected_head
         || end.delivered_length != changeset.len() as u64
         || end.delivered_sha256 != Sha256Digest::hash(changeset)
     {

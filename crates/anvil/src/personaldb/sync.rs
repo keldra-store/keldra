@@ -129,7 +129,10 @@ pub(super) async fn catch_up(
                 "catch-up entry is not linked to its predecessor",
             ));
         }
-        let entry_id = format!("{}:{next}", scope.group_id);
+        let entry_id = format!(
+            "sha256-{}",
+            hex::encode(core.entry_hash().map_err(protocol_status)?.as_bytes())
+        );
         frames.push(frame(PersonalDbSyncFrameV1::EntryStart(Box::new(
             SyncEntryStartV1 {
                 entry_id: entry_id.clone(),
