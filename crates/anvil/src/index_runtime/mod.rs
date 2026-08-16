@@ -28,3 +28,4 @@ pub(crate) mod telemetry;
 pub(crate) mod v4_projection;
 pub(crate) mod v4_query;
 pub(crate) mod v4_schema;
+pub(crate) mod working_memory;

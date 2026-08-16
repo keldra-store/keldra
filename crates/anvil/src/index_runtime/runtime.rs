@@ -37,6 +37,7 @@ use super::publisher::IndexGenerationPublisher;
 use super::query_budget::IndexQueryMemoryBudget;
 use super::retention::IndexGenerationRetention;
 use super::scanner::ClusterIndexScanner;
+use super::working_memory::IndexWorkingMemory;
 
 pub(crate) struct RunningIndexRuntime {
     pub(crate) definitions: Arc<dyn IndexDefinitionLister>,
@@ -132,8 +133,9 @@ pub(crate) async fn start(
         artifact_router.clone(),
         config,
     );
-    let query_budget = IndexQueryMemoryBudget::new(config.query_memory_bytes())
-        .context("validate the global index query working-memory budget")?;
+    let working_memory = IndexWorkingMemory::from_config(config)
+        .context("validate aggregate index working-memory budget")?;
+    let query_budget = IndexQueryMemoryBudget::from_shared(working_memory.clone());
     let local_queries: Arc<dyn LocalIndexQueryExecutor> =
         Arc::new(LocalGenerationQueryExecutor::new(
             reader.clone(),
@@ -177,7 +179,7 @@ pub(crate) async fn start(
         names,
         config,
     );
-    let budgets = IndexMemoryBudgets::from_config(config)
+    let budgets = IndexMemoryBudgets::from_config(config, working_memory)
         .context("validate per-kind index construction budgets")?;
     let builders = IndexBuilderManagerTask::start(
         local_node,

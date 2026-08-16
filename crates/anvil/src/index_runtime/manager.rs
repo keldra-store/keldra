@@ -27,7 +27,7 @@ use crate::derived_consumer::{
 use crate::index_config::IndexRuntimeConfig;
 use crate::index_service::{StoredIndexDefinition, definition_path, path_matches_prefix};
 
-use super::budget::{IndexBudgetError, IndexMemoryBudget, IndexMemoryBudgets};
+use super::budget::{IndexBudgetError, IndexMemoryBudgets};
 use super::cache::IndexCache;
 use super::catalog::{CatalogChange, CatalogDefinition, CatalogIdentity, IndexCatalog};
 use super::cpu::{IndexCpuPool, IndexCpuPoolError};
@@ -937,11 +937,15 @@ async fn advance_catch_up(
         return Ok((BuilderPhase::CatchUp(work), BuilderDisposition::Ready, None));
     }
     let budget = dependencies.budgets.for_kind(job.kind);
-    let permit = await_with_builder_heartbeats(&work.progress, budget.acquire(budget.limit()))
-        .await
-        .map_err(budget_status)?;
-    let mut quantum = SourceWorkQuantum::from_budget_limit(budget.limit());
-    let plan = work_plan(budget, 0)?;
+    let permit = await_with_builder_heartbeats(
+        &work.progress,
+        budget.acquire_up_to(budget.limit(), budget.working_memory_limit()),
+    )
+    .await
+    .map_err(budget_status)?;
+    let granted_bytes = permit.bytes();
+    let mut quantum = SourceWorkQuantum::from_budget_limit(granted_bytes);
+    let plan = work_plan_for_limit(granted_bytes, 0)?;
     // Sequential journal pages coalesce into one in-memory segment build until this work
     // quantum ends; the source cursor advances only after each page succeeds.
     let mut builder = NativeSegmentBuild::new(job, plan, dependencies)?;
@@ -1037,7 +1041,7 @@ async fn advance_catch_up(
         let records = page.changes.len() as u64;
         let encoded_bytes = page.encoded_bytes;
         let page_resident_bytes = catch_up::journal_page_resident_bytes(&page)?;
-        let page_plan = work_plan(budget, page_resident_bytes)?;
+        let page_plan = work_plan_for_limit(granted_bytes, page_resident_bytes)?;
         tracing::info!(
             index.kind = ?job.kind,
             gauge.anvil_index_journal_page_resident_bytes = page_resident_bytes,
@@ -1174,7 +1178,7 @@ async fn compact_one_if_needed(
     );
     let budget = dependencies.budgets.for_kind(job.kind);
     let permit = budget
-        .acquire(budget.limit())
+        .acquire_up_to(budget.limit(), budget.working_memory_limit())
         .await
         .map_err(budget_status)?;
     compact_tier(
@@ -1738,13 +1742,6 @@ fn source_wire_limit(limit: u64) -> u64 {
         .saturating_sub(builder_reserve)
         .saturating_sub(256);
     MAX_SOURCE_WIRE_BYTES.min(safe.max(64 * 1024))
-}
-
-fn work_plan(
-    budget: &IndexMemoryBudget,
-    source_resident_bytes: u64,
-) -> Result<SegmentMemoryPlan, Status> {
-    work_plan_for_limit(budget.limit(), source_resident_bytes)
 }
 
 fn work_plan_for_limit(

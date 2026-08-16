@@ -3,6 +3,17 @@ use std::num::{NonZeroU8, NonZeroU32, NonZeroU64};
 use anvil_index::IndexKind;
 use thiserror::Error;
 
+const KINDS: [IndexKind; 8] = [
+    IndexKind::Path,
+    IndexKind::MetadataFilter,
+    IndexKind::TypedJson,
+    IndexKind::FullText,
+    IndexKind::Vector,
+    IndexKind::Hybrid,
+    IndexKind::GitSource,
+    IndexKind::Tensor,
+];
+
 /// Startup-only budgets and retention bounds shared by every index on a node.
 ///
 /// Authoritative index bytes remain ordinary Anvil objects. The disk and
@@ -24,6 +35,7 @@ pub struct IndexRuntimeConfig {
     query_max_concurrency: NonZeroU32,
     query_work_quantum_bytes: NonZeroU64,
     query_memory_bytes: NonZeroU64,
+    working_memory_bytes: Option<NonZeroU64>,
     max_retained_generations: NonZeroU32,
     max_generation_age_hours: NonZeroU64,
     max_retained_generation_bytes: NonZeroU64,
@@ -118,6 +130,7 @@ impl IndexRuntimeConfig {
                 .expect("the default query work quantum is positive"),
             query_memory_bytes: NonZeroU64::new(Self::DEFAULT_QUERY_MEMORY_BYTES)
                 .expect("the default query memory budget is positive"),
+            working_memory_bytes: None,
             max_retained_generations,
             max_generation_age_hours,
             max_retained_generation_bytes,
@@ -132,9 +145,10 @@ impl IndexRuntimeConfig {
         self.memory_percent.get()
     }
 
-    /// Hard aggregate build-and-compaction heap budget for each index kind.
+    /// Build-and-compaction fair share for each index kind.
     ///
-    /// Every definition of the same kind shares this one process-wide pool.
+    /// Every definition of the same kind shares this planning target and may
+    /// borrow idle bytes under the aggregate working-memory ceiling.
     pub fn builder_memory_bytes_per_kind(self) -> u64 {
         self.builder_memory_bytes_per_kind.get()
     }
@@ -204,7 +218,7 @@ impl IndexRuntimeConfig {
             .with_kind_compaction_max_lanes(kind, compaction_max_lanes)
     }
 
-    /// Hard aggregate build-and-compaction heap budget for `kind`.
+    /// Build-and-compaction fair-share planning target for `kind`.
     pub fn builder_memory_bytes(self, kind: IndexKind) -> u64 {
         self.builder_memory_bytes[kind_slot(kind)].get()
     }
@@ -262,9 +276,49 @@ impl IndexRuntimeConfig {
         Ok(self)
     }
 
-    /// Hard process-wide working-memory budget shared by every index query.
+    /// Fair-share planning target shared by every index query.
     pub fn query_memory_bytes(self) -> u64 {
         self.query_memory_bytes.get()
+    }
+
+    /// Override the hard aggregate heap ceiling shared by index queries,
+    /// builders and compaction. When absent, the checked sum of the query and
+    /// per-kind fair shares preserves the former theoretical process maximum.
+    pub fn with_working_memory_bytes(
+        mut self,
+        bytes: u64,
+    ) -> Result<Self, IndexRuntimeConfigError> {
+        self.working_memory_bytes =
+            Some(NonZeroU64::new(bytes).ok_or(IndexRuntimeConfigError::ZeroWorkingMemoryBytes)?);
+        Ok(self)
+    }
+
+    pub fn working_memory_bytes(self) -> Result<u64, IndexRuntimeConfigError> {
+        let required = self.query_memory_bytes().max(
+            KINDS
+                .iter()
+                .map(|kind| self.builder_memory_bytes(*kind))
+                .max()
+                .unwrap_or(0),
+        );
+        if let Some(configured) = self.working_memory_bytes {
+            if configured.get() < required {
+                return Err(
+                    IndexRuntimeConfigError::WorkingMemoryBelowMandatoryMinimum {
+                        configured: configured.get(),
+                        minimum: required,
+                    },
+                );
+            }
+            return Ok(configured.get());
+        }
+        KINDS
+            .iter()
+            .try_fold(self.query_memory_bytes(), |total, kind| {
+                total
+                    .checked_add(self.builder_memory_bytes(*kind))
+                    .ok_or(IndexRuntimeConfigError::WorkingMemoryBytesOverflow)
+            })
     }
 
     /// Maximum source-complete immutable segments retained in one deterministic
@@ -351,6 +405,12 @@ pub enum IndexRuntimeConfigError {
     ZeroQueryWorkQuantumBytes,
     #[error("global index query memory bytes must be greater than zero")]
     ZeroQueryMemoryBytes,
+    #[error("aggregate index working memory bytes must be greater than zero")]
+    ZeroWorkingMemoryBytes,
+    #[error("aggregate index working memory {configured} cannot admit mandatory request {minimum}")]
+    WorkingMemoryBelowMandatoryMinimum { configured: u64, minimum: u64 },
+    #[error("default aggregate index working memory sum overflows u64")]
+    WorkingMemoryBytesOverflow,
     #[error("index projection lanes for {0:?} must be greater than zero")]
     ZeroProjectionLanesForKind(IndexKind),
     #[error("index source quantum for {0:?} must be greater than zero")]
@@ -377,17 +437,6 @@ pub enum IndexRuntimeConfigError {
 mod tests {
     use super::*;
 
-    const KINDS: [IndexKind; 8] = [
-        IndexKind::Path,
-        IndexKind::MetadataFilter,
-        IndexKind::TypedJson,
-        IndexKind::FullText,
-        IndexKind::Vector,
-        IndexKind::Hybrid,
-        IndexKind::GitSource,
-        IndexKind::Tensor,
-    ];
-
     #[test]
     fn defaults_are_conservative_and_valid() {
         let config = IndexRuntimeConfig::default();
@@ -398,6 +447,10 @@ mod tests {
         assert_eq!(config.query_max_concurrency(), 64);
         assert_eq!(config.query_work_quantum_bytes(), 4 * 1024 * 1024);
         assert_eq!(config.query_memory_bytes(), 512 * 1024 * 1024);
+        assert_eq!(
+            config.working_memory_bytes().unwrap(),
+            512 * 1024 * 1024 + 8 * 256 * 1024 * 1024
+        );
         for kind in KINDS {
             assert_eq!(config.builder_memory_bytes(kind), 256 * 1024 * 1024);
             assert_eq!(config.projection_max_lanes(kind), 4);
@@ -511,6 +564,39 @@ mod tests {
             Err(IndexRuntimeConfigError::InvalidMemoryPercent(101))
         );
         assert!(IndexRuntimeConfig::new(1, 100, 1, 1, 1, 1, 1).is_ok());
+    }
+
+    #[test]
+    fn explicit_working_memory_is_a_hard_parent_not_a_replacement_for_shares() {
+        let config = IndexRuntimeConfig::default()
+            .with_working_memory_bytes(1024 * 1024 * 1024)
+            .unwrap();
+        assert_eq!(config.working_memory_bytes().unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(config.query_memory_bytes(), 512 * 1024 * 1024);
+        assert_eq!(
+            config.builder_memory_bytes(IndexKind::TypedJson),
+            256 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn explicit_working_memory_must_admit_each_configured_share() {
+        let config = IndexRuntimeConfig::default()
+            .with_working_memory_bytes(256 * 1024 * 1024)
+            .unwrap();
+        assert_eq!(
+            config.working_memory_bytes(),
+            Err(
+                IndexRuntimeConfigError::WorkingMemoryBelowMandatoryMinimum {
+                    configured: 256 * 1024 * 1024,
+                    minimum: 512 * 1024 * 1024,
+                }
+            )
+        );
+        assert_eq!(
+            IndexRuntimeConfig::default().with_working_memory_bytes(0),
+            Err(IndexRuntimeConfigError::ZeroWorkingMemoryBytes)
+        );
     }
 
     #[test]

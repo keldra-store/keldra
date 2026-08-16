@@ -59,12 +59,16 @@ pub(super) async fn advance_rebuild(
         return Ok((BuilderPhase::Rebuild(work), BuilderDisposition::Ready, None));
     }
     let budget = dependencies.budgets.for_kind(job.kind);
-    let permit = await_with_builder_heartbeats(&work.progress, budget.acquire(budget.limit()))
-        .await
-        .map_err(budget_status)?;
-    let plan = work_plan_for_limit(budget.limit(), 0)?;
+    let permit = await_with_builder_heartbeats(
+        &work.progress,
+        budget.acquire_up_to(budget.limit(), budget.working_memory_limit()),
+    )
+    .await
+    .map_err(budget_status)?;
+    let granted_bytes = permit.bytes();
+    let plan = work_plan_for_limit(granted_bytes, 0)?;
     let mut builder = NativeSegmentBuild::new(job, plan, dependencies)?;
-    let mut quantum = SourceWorkQuantum::for_rebuild_turn(budget.limit(), work.maximum_frame_bytes);
+    let mut quantum = SourceWorkQuantum::for_rebuild_turn(granted_bytes, work.maximum_frame_bytes);
     loop {
         let scan_started = Instant::now();
         let scan_span = tracing::info_span!(

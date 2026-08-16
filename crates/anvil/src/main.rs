@@ -175,7 +175,7 @@ struct Arguments {
     )]
     index_memory_percent: u8,
 
-    /// Hard aggregate build/compaction heap budget for each index kind (default: 256 MiB).
+    /// Build/compaction fair share for each index kind (default: 256 MiB).
     #[arg(
         long,
         env = "ANVIL_INDEX_BUILDER_MEMORY_BYTES_PER_KIND",
@@ -359,13 +359,18 @@ struct Arguments {
     )]
     index_query_work_quantum_bytes: u64,
 
-    /// Hard working-memory budget shared by all index queries (default: 512 MiB).
+    /// Query working-memory fair share (default: 512 MiB).
     #[arg(
         long,
         env = "ANVIL_INDEX_QUERY_MEMORY_BYTES",
         default_value_t = IndexRuntimeConfig::DEFAULT_QUERY_MEMORY_BYTES
     )]
     index_query_memory_bytes: u64,
+
+    /// Hard aggregate heap ceiling shared by index queries, builders and compaction.
+    /// Absent uses the checked sum of the query and per-kind fair shares.
+    #[arg(long, env = "ANVIL_INDEX_WORKING_MEMORY_BYTES")]
+    index_working_memory_bytes: Option<u64>,
 
     /// Fallback maximum segments retained in one size tier before builders compact (default: 64).
     #[arg(
@@ -686,6 +691,14 @@ impl Arguments {
                 })
                 .context("validate index runtime configuration")?;
         }
+        if let Some(bytes) = self.index_working_memory_bytes {
+            config = config
+                .with_working_memory_bytes(bytes)
+                .context("validate aggregate index working-memory configuration")?;
+        }
+        config
+            .working_memory_bytes()
+            .context("validate aggregate index working-memory configuration")?;
         Ok(config)
     }
 }
@@ -962,6 +975,8 @@ mod tests {
             "1048576",
             "--index-query-memory-bytes",
             "268435456",
+            "--index-working-memory-bytes",
+            "1073741824",
             "--index-max-segments-per-tier",
             "12",
             "--index-max-unmerged-bytes-per-tier",
@@ -996,6 +1011,7 @@ mod tests {
         assert_eq!(config.query_max_concurrency(), 17);
         assert_eq!(config.query_work_quantum_bytes(), 1_048_576);
         assert_eq!(config.query_memory_bytes(), 268_435_456);
+        assert_eq!(config.working_memory_bytes().unwrap(), 1_073_741_824);
         assert_eq!(config.max_segments_per_tier(IndexKind::Path), 8);
         assert_eq!(
             config.max_unmerged_bytes_per_tier(IndexKind::Path),
@@ -1027,6 +1043,7 @@ mod tests {
             vec!["--index-query-max-concurrency", "0"],
             vec!["--index-query-work-quantum-bytes", "0"],
             vec!["--index-query-memory-bytes", "0"],
+            vec!["--index-working-memory-bytes", "0"],
             vec!["--index-max-segments-per-tier", "0"],
             vec!["--index-max-unmerged-bytes-per-tier", "0"],
             vec!["--index-vector-max-segments-per-tier", "0"],
@@ -1068,6 +1085,7 @@ mod tests {
             "--index-query-max-concurrency",
             "--index-query-work-quantum-bytes",
             "--index-query-memory-bytes",
+            "--index-working-memory-bytes",
             "default: 512 MiB",
             "default: 4",
             "--index-max-segments-per-tier",
