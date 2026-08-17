@@ -249,8 +249,11 @@ stable object identities. It is an Anvil-owned type.
     block the serving-fence and membership executor.
 17. Startup work is proportional to this node's assigned definitions and
     retained cursors, never to all ordinary object heads, blobs, or cache files.
-18. Builder and query memory is charged before use to the existing shared
-    per-index-kind budgets. Parallelism cannot multiply the budget silently.
+18. Builder, compaction, and query working memory is charged before use to one
+    hard process-wide ceiling. Query and per-index-kind settings are fair-share
+    planning targets: work may borrow currently idle capacity, but it cannot
+    bypass queued mandatory work or exceed the aggregate ceiling. Parallelism
+    cannot multiply the admitted grant silently.
 19. No Rust struct layout, crate-private enum discriminant, pointer, native
     `usize`, or third-party serializer memory image is durable format.
 20. A malformed, unsupported, over-sized, or checksum-invalid artifact fails
@@ -1184,6 +1187,14 @@ blocks with:
 - a skip directory; and
 - compressed DocId gaps and optional frequencies.
 
+The term reference records the inclusive maximum DocId of every posting block.
+An `advance(target)` binary-searches those bounds and opens the first block
+which can contain the target; it does not replay preceding blocks merely to
+reach a later page. The opened block's actual maximum must equal its declared
+bound. This is one flat four-byte bound per block, not an independently
+authoritative skip tree. Readers of the preceding term-reference codec retain
+the exact sequential path until normal rebuild or compaction emits the bounds.
+
 Every iterator implements the semantic operations:
 
 ```text
@@ -1346,10 +1357,13 @@ in traces.
 ### 13.3 Ordering and top-K
 
 When the complete explicit query order exactly equals the definition's physical
-order, each segment produces candidates in that order. A bounded heap merges
-segment iterators, tests the remaining predicates and live mask, and stops as
-soon as it has enough authorized hits. A proper prefix, suffix, reordered list,
-direction change, or empty order does not qualify.
+order, each segment produces candidates in that order. A one-head-per-segment
+min-heap merges segment iterators in `O(log segments)` per advance, tests the
+remaining predicates and live mask, and stops as soon as it has enough
+authorized hits. Decoded state is retained in an admitted query-local LRU;
+eviction drops only disposable decoded blocks and preserves each cursor's exact
+logical position. A proper prefix, suffix, reordered list, direction change,
+or empty order does not qualify.
 
 Otherwise, Boolean execution produces matching DocIds and a bounded top-K
 collector reads only the declared order doc values. Its memory is proportional to the
@@ -1659,11 +1673,17 @@ index crates.
 
 ## 17. Resource control and cache
 
-One shared construction budget remains configured per index kind for the whole
-process, not per definition. Builders, projection waves, sorters, posting
-writers, live-mask writers, pack buffers, and merge lanes acquire exact or
-conservative byte permits from it. Fair scheduling prevents one tenant,
-bucket, or definition from monopolizing a kind.
+One hard aggregate working-memory ceiling covers query execution and all eight
+index kinds. The query setting and each kind's construction setting remain
+fair-share planning targets, not isolated heaps. Builders, projection waves,
+sorters, posting writers, live-mask writers, pack buffers, merge lanes, and
+queries acquire exact or conservative byte permits from the shared parent.
+The global FIFO admits mandatory work before optional borrowing. An active
+bounded loan is not revoked; it is returned at the existing query, build-turn,
+or compaction boundary. Catch-up, rebuild, and segment compaction derive their
+actual workspace from the granted bytes. Locator-root compaction is globally
+charged but requests only its fixed fair-share workspace because a larger
+grant cannot accelerate that path.
 
 Long-lived projection and merge lanes are async orchestration tasks outside the
 Rayon pool. They acquire work and memory, submit one finite leaf CPU chunk, await
@@ -1680,11 +1700,13 @@ it may prefetch sequential posting, point, or doc-value blocks from planner
 hints. Open handles pin only the exact cached entries they use. Eviction never
 removes authoritative bytes.
 
-Query execution has a separate bounded memory allowance for decoded posting
-blocks, point-tree and doc-value pages, iterator heaps, top-K state, facet or
-aggregate state, and authorization batches. A query which cannot acquire its
-declared maximum waits or returns a resource error within the normal server
-deadline; it does not grow the process implicitly.
+Query admission distinguishes mandatory memory from preferred decoded-state
+residency. A query waits for its mandatory cursor, heap, response, authorization,
+and minimum decoded workspace, then borrows immediately idle aggregate capacity
+up to its preferred segment residency. A physically ordered query evicts and
+reloads decoded segment state within the grant when every segment cannot remain
+resident. A mandatory request may exceed its query fair share when the aggregate
+ceiling can admit it; only the aggregate ceiling is a hard rejection boundary.
 
 ### 17.1 Startup defaults
 
@@ -1702,7 +1724,10 @@ are not Raft or durable-format state. Defaults are:
 - disposable index-cache memory: 10 percent of process memory;
 - concurrent queries: 64;
 - query CPU work quantum between cooperative yields: 4 MiB;
-- global query working memory shared by all kinds: 512 MiB;
+- query working-memory fair share: 512 MiB;
+- aggregate query/build/compaction working-memory ceiling: the checked sum of
+  the query and eight per-kind fair shares, 2.5 GiB with defaults, unless the
+  administrator explicitly sets `ANVIL_INDEX_WORKING_MEMORY_BYTES`;
 - retained generations: three, 24 hours, or 50 GiB, whichever bound is reached
   first; and
 - index-query server maximum: 300 seconds, clamped by a shorter valid client
@@ -1710,9 +1735,10 @@ are not Raft or durable-format state. Defaults are:
 
 Each kind's memory, projection, sort, merge, and debt values can be overridden
 independently. Effective lanes are reduced to available workers, work, and
-affordable workspace; a smaller budget never permits hidden allocation. With
-all eight default construction pools saturated, their explicit aggregate is
-2 GiB.
+affordable workspace; a smaller grant never permits hidden allocation. The
+aggregate override must admit the largest configured share. Without an
+override, the checked sum preserves the former maximum concurrent allowance
+while allowing idle shares to accelerate active work.
 
 Invalid zero values, a memory percentage outside 1..=100, a segment/debt count
 above a fixed format bound, or a budget which cannot fit one required workspace
@@ -1822,13 +1848,17 @@ Low-cardinality metrics by index kind, phase, and size tier include:
 - facet and aggregate documents/values processed;
 - physical-order early termination and top-K documents inspected;
 - cursor seeks and documents skipped before/after the cursor;
+- query phase time for planning, continuation seek, head initialization,
+  physical merge/advance, candidate visibility, and response materialization;
+- desired and granted query memory, resident segment slots/current/peak,
+  conservatively charged retained decoded bytes, evictions, and reloads;
 - authorization/exact-current batches, candidates checked, denied, stale, and
   refill work;
 - cache hits, misses, fetched bytes, evictions, and pinned bytes;
 - output hits, logical/physical read bytes, duration, timeout, and cancellation;
 - generation age, source lag, publication time, and current merge debt;
-- construction/query budget capacity, used bytes, waiting bytes, and permit
-  duration; and
+- aggregate and per-class working-memory capacity, fair share, used, borrowed,
+  waiting, desired, granted, peak, and permit duration; and
 - journal occupancy, limits, backpressure, publication debt, and last consumer
   progress.
 

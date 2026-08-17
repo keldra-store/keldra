@@ -4,7 +4,7 @@ set -Eeuo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${repo_root}/scripts/qualification-log-evidence.sh"
 source "${repo_root}/scripts/qualification-scale-evidence.sh"
-requested_image="${ANVIL_IMAGE:-anvil:0.9.0}"
+requested_image="${ANVIL_IMAGE:-anvil:0.9.2}"
 keep="${ANVIL_QUALIFICATION_KEEP:-0}"
 qualification_mode="${ANVIL_QUALIFICATION_MODE:-smoke}"
 index_disk_cache_bytes="${ANVIL_QUALIFICATION_INDEX_DISK_CACHE_BYTES:-1073741824}"
@@ -160,9 +160,9 @@ if [[ "${image_revision}" != "${source_commit}" ]]; then
 fi
 server_version="$(docker run --rm --platform "${platform}" "${image_id}" anvil-server --version)"
 client_version="$(docker run --rm --platform "${platform}" "${image_id}" anvil --version)"
-if [[ "${server_version}" != "anvil-server 0.9.0" \
-  || "${client_version}" != "anvil 0.9.0" ]]; then
-  echo "qualification requires the exact Anvil 0.9.0 image" >&2
+if [[ "${server_version}" != "anvil-server 0.9.2" \
+  || "${client_version}" != "anvil 0.9.2" ]]; then
+  echo "qualification requires the exact Anvil 0.9.2 image" >&2
   echo "server: ${server_version}" >&2
   echo "client: ${client_version}" >&2
   exit 2

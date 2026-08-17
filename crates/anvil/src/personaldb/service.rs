@@ -643,7 +643,7 @@ impl PersonalDbServiceImpl {
         let operation_id = role_operation_id(&scope, &call.request, call.granted);
         let result = self
             .zanzibar
-            .mutate_tuples_journaled(
+            .mutate_tuples_journaled_restoring_retained_precondition(
                 scope.tenant_id,
                 &self.store,
                 TupleBatchRequest {

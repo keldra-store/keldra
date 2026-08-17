@@ -20,11 +20,68 @@ const OWNED_IDENTITY_OVERHEAD_BYTES: usize = 64;
 /// Retained response bytes admitted for one native page.
 pub(super) const DEFAULT_MAXIMUM_PAGE_BYTES: usize = INDEX_DECODE_BYTES;
 
+/// Conservative native-query memory bounds used by process-wide admission.
+///
+/// `minimum_bytes` is required for correct execution at the configured query
+/// parallelism. Physical-order execution can use every byte up to
+/// `preferred_bytes` to keep additional segment state decoded between
+/// candidates. The grant is converted back into an exact resident-segment
+/// limit before execution, so disposable decoded state never exceeds the
+/// admitted query memory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeQueryMemoryEstimate {
+    minimum_bytes: usize,
+    preferred_bytes: usize,
+    resident_segment_bytes: usize,
+    minimum_resident_segments: usize,
+    preferred_resident_segments: usize,
+}
+
+impl NativeQueryMemoryEstimate {
+    pub fn minimum_bytes(self) -> usize {
+        self.minimum_bytes
+    }
+
+    pub fn preferred_bytes(self) -> usize {
+        self.preferred_bytes
+    }
+
+    pub fn resident_segment_bytes(self) -> usize {
+        self.resident_segment_bytes
+    }
+
+    pub fn minimum_resident_segments(self) -> usize {
+        self.minimum_resident_segments
+    }
+
+    pub fn preferred_resident_segments(self) -> usize {
+        self.preferred_resident_segments
+    }
+
+    pub fn resident_segments_for(self, granted_bytes: usize) -> usize {
+        if self.resident_segment_bytes == 0 {
+            return self.preferred_resident_segments;
+        }
+        let extra = granted_bytes.saturating_sub(self.minimum_bytes);
+        self.minimum_resident_segments
+            .saturating_add(extra / self.resident_segment_bytes)
+            .min(self.preferred_resident_segments)
+    }
+}
+
 pub(crate) fn estimate_working_memory(
     request: &NativeQueryRequest,
     limits: NativeQueryLimits,
     query_parallelism: usize,
 ) -> Result<usize, IndexError> {
+    Ok(estimate_working_memory_range(request, limits, query_parallelism)?.preferred_bytes())
+}
+
+pub(crate) fn estimate_working_memory_range(
+    request: &NativeQueryRequest,
+    limits: NativeQueryLimits,
+    query_parallelism: usize,
+) -> Result<NativeQueryMemoryEstimate, IndexError> {
     request.validate()?;
     let mut fields = BTreeSet::new();
     let leaves = query_shape(request, &mut fields)?;
@@ -45,16 +102,25 @@ pub(crate) fn estimate_working_memory(
     } else {
         requested_lanes
     };
-    // Physical k-way execution retains a small cursor and owned merge head for
-    // every segment. Decoded immutable blocks belong only to the segment being
-    // advanced and are released once its next head has been extracted.
+    // Every concurrently initialized segment needs one complete conservative
+    // decoded-state allowance. Physical k-way execution prefers one allowance
+    // per segment so interleaved candidates reuse their immutable blocks, but
+    // it can evict decoded state when admission grants fewer resident slots.
     let resident_components = 2usize
         .checked_add(fields.len())
         .and_then(|value| value.checked_add(leaves))
         .ok_or(IndexError::OffsetOverflow)?;
-    let decoded = resident_components
+    let resident_segment_bytes = resident_components
         .checked_mul(INDEX_DECODE_BYTES)
-        .and_then(|value| value.checked_mul(lanes))
+        .ok_or(IndexError::OffsetOverflow)?;
+    let minimum_resident_segments = if physical { 1 } else { lanes };
+    let preferred_resident_segments = if physical {
+        request.segments.len().max(1)
+    } else {
+        lanes
+    };
+    let decoded = resident_segment_bytes
+        .checked_mul(minimum_resident_segments)
         .ok_or(IndexError::OffsetOverflow)?;
     let per_segment_cursor = leaves
         .max(1)
@@ -106,7 +172,7 @@ pub(crate) fn estimate_working_memory(
     let vector_workspace = vector_workspace_bytes(&request.query)?
         .checked_mul(lanes)
         .ok_or(IndexError::OffsetOverflow)?;
-    FIXED_EXECUTOR_BYTES
+    let minimum_bytes = FIXED_EXECUTOR_BYTES
         .checked_add(decoded)
         .and_then(|value| value.checked_add(cursor_state))
         .and_then(|value| value.checked_add(document_sets))
@@ -114,7 +180,19 @@ pub(crate) fn estimate_working_memory(
         .and_then(|value| value.checked_add(gate))
         .and_then(|value| value.checked_add(vector_workspace))
         .and_then(|value| value.checked_add(limits.maximum_page_bytes))
-        .ok_or(IndexError::OffsetOverflow)
+        .ok_or(IndexError::OffsetOverflow)?;
+    let preferred_bytes = preferred_resident_segments
+        .saturating_sub(minimum_resident_segments)
+        .checked_mul(resident_segment_bytes)
+        .and_then(|extra| minimum_bytes.checked_add(extra))
+        .ok_or(IndexError::OffsetOverflow)?;
+    Ok(NativeQueryMemoryEstimate {
+        minimum_bytes,
+        preferred_bytes,
+        resident_segment_bytes: if physical { resident_segment_bytes } else { 0 },
+        minimum_resident_segments,
+        preferred_resident_segments,
+    })
 }
 
 /// Term-range and point predicates materialize one dense segment-local DocId

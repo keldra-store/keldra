@@ -8,7 +8,7 @@ use crate::v4::{
     COMPONENT_HEADER_BYTES, ComponentKind, DocId, FieldComponents, INDEX_COMPONENT_BYTES,
     PositionEntry, PositionsBlock, PostingBlock, PostingImpact, PostingReference, Schema,
     SegmentIdentity, TERM_DICTIONARY_TARGET_BYTES, TermDictionary, TermEntry,
-    component_ordinal_key,
+    component_ordinal_key, terms::encoded_entry_bytes,
 };
 
 const MAX_PAYLOAD_BYTES: usize = INDEX_COMPONENT_BYTES - COMPONENT_HEADER_BYTES;
@@ -250,20 +250,44 @@ async fn publish_field_dictionary<S: ComponentBatchSink>(
     while group_start < references.len() {
         let group_end = term_group_end(sources, documents, references, group_start);
         let first_component_ordinal = posting_ordinal;
+        let mut component_max_doc_ids = Vec::new();
         let mut block_start = group_start;
         while block_start < group_end {
             block_start =
                 posting_block_end(sources, documents, references, block_start, group_end)?;
+            component_max_doc_ids.push(DocId::new(references[block_start - 1].doc_id));
             posting_ordinal = posting_ordinal
                 .checked_add(1)
                 .ok_or(IndexError::OffsetOverflow)?;
         }
         let value = term(sources, documents, references[group_start]);
         let term_key = value.canonical_key()?;
-        let row_bytes = 4usize
-            .checked_add(term_key.len())
-            .and_then(|bytes| bytes.checked_add(8 + 8 + 4 + 4))
-            .ok_or(IndexError::OffsetOverflow)?;
+        let posting_reference = PostingReference {
+            document_frequency: u64::try_from(group_end - group_start)
+                .map_err(|_| IndexError::OffsetOverflow)?,
+            total_term_frequency: 0,
+            first_component_ordinal,
+            component_count: posting_ordinal
+                .checked_sub(first_component_ordinal)
+                .ok_or(IndexError::OffsetOverflow)?,
+            component_max_doc_ids,
+        };
+        let total_term_frequency =
+            references[group_start..group_end]
+                .iter()
+                .try_fold(0u64, |sum, reference| {
+                    sum.checked_add(u64::from(term(sources, documents, *reference).frequency))
+                        .ok_or(IndexError::OffsetOverflow)
+                })?;
+        let entry = TermEntry {
+            term: term_key,
+            postings: PostingReference {
+                document_frequency: posting_reference.document_frequency,
+                total_term_frequency,
+                ..posting_reference
+            },
+        };
+        let row_bytes = encoded_entry_bytes(&entry)?;
         if !pending.is_empty()
             && pending_bytes.saturating_add(row_bytes) > TERM_DICTIONARY_TARGET_BYTES
         {
@@ -276,25 +300,7 @@ async fn publish_field_dictionary<S: ComponentBatchSink>(
                 limit: INDEX_COMPONENT_BYTES,
             });
         }
-        let total_term_frequency =
-            references[group_start..group_end]
-                .iter()
-                .try_fold(0u64, |sum, reference| {
-                    sum.checked_add(u64::from(term(sources, documents, *reference).frequency))
-                        .ok_or(IndexError::OffsetOverflow)
-                })?;
-        pending.push(TermEntry {
-            term: term_key,
-            postings: PostingReference {
-                document_frequency: u64::try_from(group_end - group_start)
-                    .map_err(|_| IndexError::OffsetOverflow)?,
-                total_term_frequency,
-                first_component_ordinal,
-                component_count: posting_ordinal
-                    .checked_sub(first_component_ordinal)
-                    .ok_or(IndexError::OffsetOverflow)?,
-            },
-        });
+        pending.push(entry);
         pending_bytes += row_bytes;
         if value.term_type != crate::v4::TERM_TYPE_FIELD_PRESENCE {
             statistics.observe_unique_term(field_id.get() as usize)?;

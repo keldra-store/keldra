@@ -326,11 +326,13 @@ jobs:
           generate_release_notes: true
           make_latest: true
           body: |
-            Anvil 0.9.0 introduces Anvil-owned format-v4 immutable index
-            segments, exact multi-predicate execution, optional Typed JSON
-            physical ordering, stable generation-bound cursors, and bounded
-            arbitrary sorting. It is a clean index-format release for new
-            volumes and does not carry format-v3 compatibility machinery.
+            Anvil 0.9.2 accelerates native-segment queries by retaining admitted
+            decoded state, heap-merging segment heads, seeking directly to
+            continuation posting components, and planning segments concurrently.
+            Query, build, and compaction work now share one elastic hard memory
+            ceiling with per-kind fair shares, and expose phase, residency,
+            borrowing, eviction, and reload telemetry. Existing 0.9.x volumes can
+            be upgraded in place.
 
             - Image: `${{ steps.image.outputs.image }}`
             - Manifest digest: `${{ steps.image.outputs.digest }}`

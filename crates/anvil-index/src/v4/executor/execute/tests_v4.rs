@@ -71,6 +71,30 @@ impl ArtifactDirectoryRead for ParallelMemoryArtifacts {
     }
 }
 
+struct PlanningMemoryArtifacts {
+    inner: MemoryArtifacts,
+    parallelism: usize,
+    active_reads: AtomicUsize,
+    maximum_reads: AtomicUsize,
+}
+
+impl ArtifactDirectoryRead for PlanningMemoryArtifacts {
+    type File = MemoryFile;
+
+    fn query_parallelism(&self) -> usize {
+        self.parallelism
+    }
+
+    async fn open_artifact(&self, pack: &ArtifactPackReference) -> Result<Self::File, IndexError> {
+        let active = self.active_reads.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+        self.maximum_reads.fetch_max(active, AtomicOrdering::SeqCst);
+        tokio::task::yield_now().await;
+        let result = self.inner.open_artifact(pack).await;
+        self.active_reads.fetch_sub(1, AtomicOrdering::SeqCst);
+        result
+    }
+}
+
 struct AllowAll;
 
 impl CandidateGate for AllowAll {
@@ -663,6 +687,107 @@ async fn independent_segments_rank_concurrently_and_merge_exact_top_k() {
 }
 
 #[tokio::test]
+async fn segment_planning_overlaps_within_admission_and_matches_serial_pages() {
+    let schema = schema();
+    let (schema, first, first_directory) = build_segment_fixture(
+        schema,
+        99,
+        1,
+        vec![source("a", "active", 1), source("d", "active", 4)],
+    )
+    .await;
+    let (_, second, second_directory) = build_segment_fixture(
+        schema.clone(),
+        99,
+        2,
+        vec![source("b", "active", 2), source("e", "active", 5)],
+    )
+    .await;
+    let (_, third, third_directory) = build_segment_fixture(
+        schema.clone(),
+        99,
+        3,
+        vec![source("c", "active", 3), source("f", "active", 6)],
+    )
+    .await;
+    let mut objects = first_directory.0;
+    objects.extend(second_directory.0);
+    objects.extend(third_directory.0);
+    let serial_directory = MemoryArtifacts(objects.clone());
+    let parallel_directory = PlanningMemoryArtifacts {
+        inner: MemoryArtifacts(objects),
+        parallelism: 3,
+        active_reads: AtomicUsize::new(0),
+        maximum_reads: AtomicUsize::new(0),
+    };
+    let parallel =
+        NativeQueryExecutor::new(&parallel_directory, &AllowAll, NativeQueryLimits::default())
+            .unwrap();
+    let serial =
+        NativeQueryExecutor::new(&serial_directory, &AllowAll, NativeQueryLimits::default())
+            .unwrap();
+    let mut missing = request(
+        &schema,
+        &first,
+        NativeQuery::Filter {
+            predicate: Some(Predicate::Equal {
+                id: PredicateId::new(1),
+                field_id: FieldId::new(0),
+                value: ScalarValue::String("missing".into()),
+            }),
+            order: schema.physical_order.clone(),
+        },
+    );
+    missing.segments.extend([second.clone(), third.clone()]);
+
+    let parallel_missing = parallel
+        .execute_observed_with_resident_segments(&missing, NativeQueryStatisticsRecorder::new(), 2)
+        .await
+        .unwrap();
+    let serial_missing = serial.execute(&missing).await.unwrap();
+
+    assert!(parallel_missing.hits.is_empty());
+    assert_eq!(parallel_missing.hits, serial_missing.hits);
+    assert_eq!(parallel_missing.next, serial_missing.next);
+    let maximum_planning_reads = parallel_directory
+        .maximum_reads
+        .load(AtomicOrdering::SeqCst);
+    assert!(
+        maximum_planning_reads > 1,
+        "independent segment plans did not overlap"
+    );
+    assert!(
+        maximum_planning_reads <= 2,
+        "planning exceeded admitted resident slots: {maximum_planning_reads}"
+    );
+
+    let mut query = request(
+        &schema,
+        &first,
+        NativeQuery::Filter {
+            predicate: Some(Predicate::Equal {
+                id: PredicateId::new(2),
+                field_id: FieldId::new(0),
+                value: ScalarValue::String("active".into()),
+            }),
+            order: schema.physical_order.clone(),
+        },
+    );
+    query.segments.extend([second, third]);
+    query.limit = 4;
+    let parallel_first = parallel.execute(&query).await.unwrap();
+    let serial_first = serial.execute(&query).await.unwrap();
+    assert_eq!(parallel_first.hits, serial_first.hits);
+    assert_eq!(parallel_first.next, serial_first.next);
+
+    query.after = parallel_first.next;
+    let parallel_second = parallel.execute(&query).await.unwrap();
+    let serial_second = serial.execute(&query).await.unwrap();
+    assert_eq!(parallel_second.hits, serial_second.hits);
+    assert_eq!(parallel_second.next, serial_second.next);
+}
+
+#[tokio::test]
 async fn boolean_and_or_in_and_not_match_exact_sets() {
     let (schema, segment, directory) = fixture().await;
     let executor =
@@ -769,7 +894,7 @@ async fn physical_order_and_search_after_are_stable() {
 }
 
 #[tokio::test]
-async fn physical_order_memory_is_bounded_across_many_segments() {
+async fn physical_order_memory_admits_bounded_elastic_segment_residency() {
     let (schema, segment, directory) = fixture().await;
     let executor =
         NativeQueryExecutor::new(&directory, &AllowAll, NativeQueryLimits::default()).unwrap();
@@ -794,11 +919,224 @@ async fn physical_order_memory_is_bounded_across_many_segments() {
         })
         .collect();
 
-    let one_bytes = executor.working_memory_bytes(&one).unwrap();
-    let many_bytes = executor.working_memory_bytes(&many).unwrap();
+    let one_memory = executor.memory_estimate(&one).unwrap();
+    let many_memory = executor.memory_estimate(&many).unwrap();
 
-    assert!(many_bytes > one_bytes);
-    assert!(many_bytes - one_bytes < crate::v4::INDEX_DECODE_BYTES);
+    assert_eq!(many_memory.minimum_resident_segments(), 1);
+    assert_eq!(many_memory.preferred_resident_segments(), 64);
+    assert_eq!(
+        many_memory.resident_segments_for(many_memory.minimum_bytes()),
+        1
+    );
+    assert_eq!(
+        many_memory.resident_segments_for(many_memory.preferred_bytes()),
+        64
+    );
+    assert_eq!(
+        many_memory.preferred_bytes() - many_memory.minimum_bytes(),
+        63 * many_memory.resident_segment_bytes()
+    );
+    assert_eq!(
+        executor.working_memory_bytes(&many).unwrap(),
+        many_memory.preferred_bytes()
+    );
+    assert!(many_memory.minimum_bytes() > one_memory.minimum_bytes());
+}
+
+#[tokio::test]
+async fn physical_order_reuses_decoded_blocks_across_many_hits() {
+    let sources = (0..1_024)
+        .map(|index| source(&format!("objects/{index:04}"), "active", i64::from(index)))
+        .collect();
+    let (schema, segment, directory) = build_fixture(schema(), 96, sources).await;
+    let executor =
+        NativeQueryExecutor::new(&directory, &AllowAll, NativeQueryLimits::default()).unwrap();
+    let mut query = request(
+        &schema,
+        &segment,
+        NativeQuery::Filter {
+            predicate: Some(Predicate::Equal {
+                id: PredicateId::new(1),
+                field_id: FieldId::new(0),
+                value: ScalarValue::String("active".into()),
+            }),
+            order: schema.physical_order.clone(),
+        },
+    );
+    query.limit = 999;
+    let statistics = NativeQueryStatisticsRecorder::new();
+
+    let page = executor
+        .execute_observed(&query, statistics.clone())
+        .await
+        .unwrap();
+    let snapshot = statistics.snapshot();
+
+    assert_eq!(page.hits.len(), 999);
+    assert!(snapshot.posting_blocks_decoded < 10, "{snapshot:?}");
+    assert!(snapshot.live_mask_blocks_decoded < 10, "{snapshot:?}");
+    assert!(snapshot.doc_value_blocks_decoded < 10, "{snapshot:?}");
+    assert_eq!(snapshot.decoded_state_evictions, 0, "{snapshot:?}");
+    assert_eq!(snapshot.decoded_state_reloads, 0, "{snapshot:?}");
+}
+
+#[tokio::test]
+async fn physical_order_evicts_within_a_smaller_admitted_residency() {
+    let schema = schema();
+    let (schema, first, first_directory) = build_segment_fixture(
+        schema,
+        97,
+        1,
+        vec![
+            source("a6", "active", 6),
+            source("a3", "active", 3),
+            source("a0", "active", 0),
+        ],
+    )
+    .await;
+    let (_, second, second_directory) = build_segment_fixture(
+        schema.clone(),
+        97,
+        2,
+        vec![source("b5", "active", 5), source("b2", "active", 2)],
+    )
+    .await;
+    let (_, third, third_directory) = build_segment_fixture(
+        schema.clone(),
+        97,
+        3,
+        vec![source("c4", "active", 4), source("c1", "active", 1)],
+    )
+    .await;
+    let mut objects = first_directory.0;
+    objects.extend(second_directory.0);
+    objects.extend(third_directory.0);
+    let directory = ParallelMemoryArtifacts {
+        inner: MemoryArtifacts(objects),
+        parallelism: 3,
+    };
+    let executor =
+        NativeQueryExecutor::new(&directory, &AllowAll, NativeQueryLimits::default()).unwrap();
+    let mut query = request(
+        &schema,
+        &first,
+        NativeQuery::Filter {
+            predicate: Some(Predicate::Equal {
+                id: PredicateId::new(1),
+                field_id: FieldId::new(0),
+                value: ScalarValue::String("active".into()),
+            }),
+            order: schema.physical_order.clone(),
+        },
+    );
+    query.segments.extend([second, third]);
+    query.limit = 7;
+    let statistics = NativeQueryStatisticsRecorder::new();
+
+    let page = executor
+        .execute_observed_with_resident_segments(&query, statistics.clone(), 1)
+        .await
+        .unwrap();
+    let snapshot = statistics.snapshot();
+
+    assert_eq!(
+        page.hits
+            .iter()
+            .map(|hit| hit.result.path.as_str())
+            .collect::<Vec<_>>(),
+        ["a6", "b5", "c4", "a3", "b2", "c1", "a0"]
+    );
+    assert_eq!(snapshot.resident_segment_slots, 1, "{snapshot:?}");
+    assert_eq!(snapshot.resident_segments_peak, 1, "{snapshot:?}");
+    assert_eq!(snapshot.resident_segments_current, 0, "{snapshot:?}");
+    assert!(snapshot.decoded_state_evictions > 0, "{snapshot:?}");
+    assert!(snapshot.decoded_state_reloads > 0, "{snapshot:?}");
+}
+
+#[tokio::test]
+async fn physical_order_heap_preserves_multi_segment_pagination() {
+    let schema = schema();
+    let (schema, first, first_directory) = build_segment_fixture(
+        schema,
+        98,
+        1,
+        vec![
+            source("a6", "active", 6),
+            source("a3", "active", 3),
+            source("a0", "active", 0),
+        ],
+    )
+    .await;
+    let (_, second, second_directory) = build_segment_fixture(
+        schema.clone(),
+        98,
+        2,
+        vec![source("b5", "active", 5), source("b2", "active", 2)],
+    )
+    .await;
+    let (_, third, third_directory) = build_segment_fixture(
+        schema.clone(),
+        98,
+        3,
+        vec![source("c4", "active", 4), source("c1", "active", 1)],
+    )
+    .await;
+    let mut objects = first_directory.0;
+    objects.extend(second_directory.0);
+    objects.extend(third_directory.0);
+    let directory = ParallelMemoryArtifacts {
+        inner: MemoryArtifacts(objects),
+        parallelism: 3,
+    };
+    let executor =
+        NativeQueryExecutor::new(&directory, &AllowAll, NativeQueryLimits::default()).unwrap();
+    let mut query = request(
+        &schema,
+        &first,
+        NativeQuery::Filter {
+            predicate: Some(Predicate::Equal {
+                id: PredicateId::new(1),
+                field_id: FieldId::new(0),
+                value: ScalarValue::String("active".into()),
+            }),
+            order: schema.physical_order.clone(),
+        },
+    );
+    query.segments.extend([second, third]);
+    query.limit = 3;
+
+    let first = executor.execute(&query).await.unwrap();
+    assert_eq!(
+        first
+            .hits
+            .iter()
+            .map(|hit| hit.result.path.as_str())
+            .collect::<Vec<_>>(),
+        ["a6", "b5", "c4"]
+    );
+
+    query.after = first.next;
+    let second = executor.execute(&query).await.unwrap();
+    assert_eq!(
+        second
+            .hits
+            .iter()
+            .map(|hit| hit.result.path.as_str())
+            .collect::<Vec<_>>(),
+        ["a3", "b2", "c1"]
+    );
+
+    query.after = second.next;
+    let third = executor.execute(&query).await.unwrap();
+    assert_eq!(
+        third
+            .hits
+            .iter()
+            .map(|hit| hit.result.path.as_str())
+            .collect::<Vec<_>>(),
+        ["a0"]
+    );
+    assert!(third.next.is_none());
 }
 
 #[tokio::test]

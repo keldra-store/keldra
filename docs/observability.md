@@ -28,7 +28,7 @@ API.
 Metrics and traces share these resource attributes:
 
 - `service.name=anvil`
-- `service.version=0.9.0`
+- `service.version=0.9.2`
 - `node.id=<ANVIL_NODE_ID>`
 
 Trace export uses a dedicated worker with a 2,048-span queue and batches of at
@@ -74,14 +74,25 @@ values, and range-aware compaction measurements carry the bounded
 `compaction.lane_limit_reason=configured|workers|budget|ranges` value. Index,
 tenant, and bucket IDs are deliberately absent from metrics.
 
-Construction memory is split into configuration, admission, and observed
+Index working memory has one hard aggregate ceiling. Query and per-kind
+construction settings are fair-share planning targets, and idle bytes may be
+borrowed without crossing that ceiling. The low-cardinality `memory.class`
+dimension is `query` or one of the eight fixed index kinds. The shared parent
+reports `anvil_index_working_memory_configured_bytes`, `used_bytes`,
+`peak_bytes`, `share_bytes`, `class_used_bytes`, `borrowed_bytes`, `waiting`,
+and `waiting_bytes`.
+
+Construction memory is then split into configuration, admission, and observed
 builder state:
 
 - `anvil_index_construction_configured_bytes`,
   `anvil_index_construction_leased_bytes`,
   `anvil_index_construction_peak_leased_bytes`, and
   `anvil_index_construction_waiting` describe each kind's shared admission
-  pool;
+  class. The existing names remain available for operational dashboard
+  continuity;
+- `anvil_index_construction_minimum_bytes`, `desired_bytes`, `granted_bytes`,
+  and `borrowed_bytes` show each elastic admission;
 - `anvil_index_construction_resident_bytes` and
   `anvil_index_construction_workspace_bytes` describe the builder involved in
   a completed flush. Resident bytes are the currently buffered subset of the
@@ -149,6 +160,15 @@ separately. Typed JSON computations add
 `anvil_index_query_facet_values_processed_total`, and the corresponding four
 `aggregate` counters. These are cumulative counters split only by
 index kind; document, index, tenant, and bucket identifiers remain trace fields.
+Each terminal query also reports desired and granted memory, admitted resident
+segment slots, current and peak resident segments, conservatively charged
+decoded bytes, evictions, and reloads. The fixed `index.phase` dimension reports
+planning, continuation seek, head initialization, physical merge/advance,
+candidate visibility, and response materialization duration. These are charged
+or phase-boundary measurements, not sampled process RSS. A phase which runs
+several segment lanes concurrently reports aggregate lane time; coordinator
+phases report wall time, so the phase value is a work/saturation diagnostic and
+must not be summed to reconstruct request latency.
 `anvil_index_query_returned_hits` is emitted only for a completed response
 page. A failed, timed-out, or otherwise cancelled query has no returned page,
 so its hit count remains unknown rather than being recorded as zero; its read

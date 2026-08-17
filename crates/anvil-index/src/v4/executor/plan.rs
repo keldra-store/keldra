@@ -462,14 +462,14 @@ async fn plan_text<'a, D: ArtifactDirectoryRead>(
                     directory,
                     segment,
                     field.id,
-                    resolved.postings,
+                    resolved.postings.clone(),
                     statistics.clone(),
                 )?));
                 text_terms.push(TextTermPlan {
                     field_id: field.id,
                     token_ordinal: u32::try_from(token_ordinal)
                         .map_err(|_| IndexError::OffsetOverflow)?,
-                    postings: resolved.postings,
+                    postings: resolved.postings.clone(),
                 });
                 per_field[field_index].push(Some(resolved.postings));
             } else {
@@ -604,7 +604,7 @@ async fn plan_text_field<'a, D: ArtifactDirectoryRead>(
             directory,
             segment,
             field_id,
-            resolved.postings,
+            resolved.postings.clone(),
             statistics.clone(),
         )?));
         references.push(resolved.postings);
@@ -817,7 +817,7 @@ where
                 });
             }
             output.push(ResolvedTerm {
-                postings: entry.postings,
+                postings: entry.postings.clone(),
             });
         }
     }

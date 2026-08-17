@@ -1,17 +1,16 @@
-//! Fair hard byte admission for index building and compaction.
+//! Fair-share admission for index building and compaction.
 //!
-//! Each public index kind owns one process-wide pool. Builders are sequential
-//! clients of the pool, so strict FIFO admission gives every definition and
-//! compaction pass a turn without retaining an in-memory work queue.
-
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+//! Kind settings remain planning targets, while every actual allocation is
+//! charged to the shared hard index working-memory ceiling.
 
 use anvil_index::{IndexKind, MIN_INDEX_KIND_MEMORY_BYTES, SegmentMemoryPlan};
 use thiserror::Error;
-use tokio::sync::Notify;
 
 use crate::index_config::IndexRuntimeConfig;
+
+use super::working_memory::{
+    IndexWorkingMemory, WorkingMemoryAccount, WorkingMemoryError, WorkingMemoryPermit,
+};
 
 #[derive(Clone)]
 pub(crate) struct IndexMemoryBudgets {
@@ -26,15 +25,26 @@ pub(crate) struct IndexMemoryBudgets {
 }
 
 impl IndexMemoryBudgets {
+    #[cfg(test)]
     pub(crate) fn new(bytes_per_kind: u64) -> Result<Self, IndexBudgetError> {
-        Self::from_limits(|_| bytes_per_kind)
+        let aggregate = bytes_per_kind
+            .checked_mul(9)
+            .ok_or(IndexBudgetError::LimitExceedsPlatform(bytes_per_kind))?;
+        let memory = IndexWorkingMemory::new(aggregate, [bytes_per_kind; 9])?;
+        Self::from_limits(memory, |_| bytes_per_kind)
     }
 
-    pub(crate) fn from_config(config: IndexRuntimeConfig) -> Result<Self, IndexBudgetError> {
-        Self::from_limits(|kind| config.builder_memory_bytes(kind))
+    pub(crate) fn from_config(
+        config: IndexRuntimeConfig,
+        memory: IndexWorkingMemory,
+    ) -> Result<Self, IndexBudgetError> {
+        Self::from_limits(memory, |kind| config.builder_memory_bytes(kind))
     }
 
-    fn from_limits(mut limit: impl FnMut(IndexKind) -> u64) -> Result<Self, IndexBudgetError> {
+    fn from_limits(
+        memory: IndexWorkingMemory,
+        mut limit: impl FnMut(IndexKind) -> u64,
+    ) -> Result<Self, IndexBudgetError> {
         let path = limit(IndexKind::Path);
         let metadata_filter = limit(IndexKind::MetadataFilter);
         let typed_json = limit(IndexKind::TypedJson);
@@ -56,14 +66,18 @@ impl IndexMemoryBudgets {
             validate_limit(bytes)?;
         }
         Ok(Self {
-            path: IndexMemoryBudget::new(IndexKind::Path, path)?,
-            metadata_filter: IndexMemoryBudget::new(IndexKind::MetadataFilter, metadata_filter)?,
-            typed_json: IndexMemoryBudget::new(IndexKind::TypedJson, typed_json)?,
-            full_text: IndexMemoryBudget::new(IndexKind::FullText, full_text)?,
-            vector: IndexMemoryBudget::new(IndexKind::Vector, vector)?,
-            hybrid: IndexMemoryBudget::new(IndexKind::Hybrid, hybrid)?,
-            git_source: IndexMemoryBudget::new(IndexKind::GitSource, git_source)?,
-            tensor: IndexMemoryBudget::new(IndexKind::Tensor, tensor)?,
+            path: IndexMemoryBudget::new(IndexKind::Path, path, memory.clone())?,
+            metadata_filter: IndexMemoryBudget::new(
+                IndexKind::MetadataFilter,
+                metadata_filter,
+                memory.clone(),
+            )?,
+            typed_json: IndexMemoryBudget::new(IndexKind::TypedJson, typed_json, memory.clone())?,
+            full_text: IndexMemoryBudget::new(IndexKind::FullText, full_text, memory.clone())?,
+            vector: IndexMemoryBudget::new(IndexKind::Vector, vector, memory.clone())?,
+            hybrid: IndexMemoryBudget::new(IndexKind::Hybrid, hybrid, memory.clone())?,
+            git_source: IndexMemoryBudget::new(IndexKind::GitSource, git_source, memory.clone())?,
+            tensor: IndexMemoryBudget::new(IndexKind::Tensor, tensor, memory)?,
         })
     }
 
@@ -93,156 +107,85 @@ fn validate_limit(bytes: u64) -> Result<(), IndexBudgetError> {
 
 #[derive(Clone)]
 pub(crate) struct IndexMemoryBudget {
-    inner: Arc<BudgetInner>,
-}
-
-struct BudgetInner {
     kind: IndexKind,
-    limit: u64,
-    state: Mutex<BudgetState>,
-    changed: Notify,
-}
-
-#[derive(Default)]
-struct BudgetState {
-    used: u64,
-    peak: u64,
-    next_ticket: u64,
-    waiters: VecDeque<BudgetWaiter>,
-}
-
-#[derive(Clone, Copy)]
-struct BudgetWaiter {
-    ticket: u64,
+    fair_share: u64,
+    memory: IndexWorkingMemory,
 }
 
 impl IndexMemoryBudget {
-    fn new(kind: IndexKind, limit: u64) -> Result<Self, IndexBudgetError> {
-        if limit == 0 {
+    fn new(
+        kind: IndexKind,
+        fair_share: u64,
+        memory: IndexWorkingMemory,
+    ) -> Result<Self, IndexBudgetError> {
+        if fair_share == 0 {
             return Err(IndexBudgetError::ZeroLimit);
         }
         Ok(Self {
-            inner: Arc::new(BudgetInner {
-                kind,
-                limit,
-                state: Mutex::new(BudgetState::default()),
-                changed: Notify::new(),
-            }),
+            kind,
+            fair_share,
+            memory,
         })
     }
 
+    /// Configured planning target for this kind, not a separate hard pool.
     pub(crate) fn limit(&self) -> u64 {
-        self.inner.limit
+        self.fair_share
+    }
+
+    pub(crate) fn working_memory_limit(&self) -> u64 {
+        self.memory.hard_limit()
     }
 
     pub(crate) fn memory_plan(&self) -> SegmentMemoryPlan {
-        let bytes = usize::try_from(self.inner.limit)
-            .expect("validated index memory budget fits this platform");
-        SegmentMemoryPlan::new(bytes).expect("validated index memory budget has a usable plan")
+        let bytes = usize::try_from(self.fair_share)
+            .expect("validated index memory fair share fits this platform");
+        SegmentMemoryPlan::new(bytes).expect("validated index memory share has a usable plan")
     }
 
-    /// Wait in FIFO order for an exact byte reservation.
-    ///
-    /// Callers must not fetch a source page or payload until this returns.
-    /// Dropping the future removes its queue entry synchronously.
+    /// Wait in global FIFO order for one exact reservation.
     pub(crate) async fn acquire(&self, bytes: u64) -> Result<IndexMemoryPermit, IndexBudgetError> {
-        if bytes == 0 {
-            return Ok(IndexMemoryPermit {
-                inner: self.inner.clone(),
-                bytes: 0,
-            });
-        }
-        if bytes > self.inner.limit {
-            return Err(IndexBudgetError::RequestExceedsLimit {
-                requested: bytes,
-                limit: self.inner.limit,
-            });
-        }
-
-        let ticket = {
-            let mut state = lock_state(&self.inner);
-            let ticket = state.next_ticket;
-            state.next_ticket = state.next_ticket.wrapping_add(1);
-            state.waiters.push_back(BudgetWaiter { ticket });
-            emit_budget_state(&self.inner, &state);
-            ticket
-        };
-        let mut queued = QueuedRequest {
-            inner: self.inner.clone(),
-            ticket: Some(ticket),
-        };
-        loop {
-            // Register before testing the condition so a release between the
-            // test and await cannot be missed.
-            let changed = self.inner.changed.notified();
-            let admitted = {
-                let mut state = lock_state(&self.inner);
-                let first = state
-                    .waiters
-                    .front()
-                    .is_some_and(|waiter| waiter.ticket == ticket);
-                if first && state.used <= self.inner.limit.saturating_sub(bytes) {
-                    state.waiters.pop_front();
-                    state.used += bytes;
-                    state.peak = state.peak.max(state.used);
-                    emit_budget_state(&self.inner, &state);
-                    true
-                } else {
-                    false
-                }
-            };
-            if admitted {
-                queued.ticket = None;
-                self.inner.changed.notify_waiters();
-                return Ok(IndexMemoryPermit {
-                    inner: self.inner.clone(),
-                    bytes,
-                });
-            }
-            changed.await;
-        }
+        self.acquire_up_to(bytes, bytes).await
     }
 
-    #[cfg(test)]
-    fn used(&self) -> u64 {
-        lock_state(&self.inner).used
-    }
-}
-
-fn lock_state(inner: &BudgetInner) -> std::sync::MutexGuard<'_, BudgetState> {
-    inner
-        .state
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-struct QueuedRequest {
-    inner: Arc<BudgetInner>,
-    ticket: Option<u64>,
-}
-
-impl Drop for QueuedRequest {
-    fn drop(&mut self) {
-        let Some(ticket) = self.ticket else {
-            return;
-        };
-        let mut state = lock_state(&self.inner);
-        if let Some(index) = state
-            .waiters
-            .iter()
-            .position(|waiter| waiter.ticket == ticket)
-        {
-            state.waiters.remove(index);
-        }
-        emit_budget_state(&self.inner, &state);
-        drop(state);
-        self.inner.changed.notify_waiters();
+    /// Admit mandatory bytes fairly, then borrow idle aggregate capacity up to
+    /// the preferred amount. Callers must derive their memory plan from the
+    /// returned permit rather than the configured fair share.
+    pub(crate) async fn acquire_up_to(
+        &self,
+        minimum: u64,
+        preferred: u64,
+    ) -> Result<IndexMemoryPermit, IndexBudgetError> {
+        tracing::info!(
+            index.kind = ?self.kind,
+            gauge.anvil_index_construction_configured_bytes = self.fair_share,
+            gauge.anvil_index_construction_working_memory_bytes = self.memory.hard_limit(),
+            "index construction is waiting for working-memory admission"
+        );
+        let permit = self
+            .memory
+            .acquire_up_to(WorkingMemoryAccount::Builder(self.kind), minimum, preferred)
+            .await?;
+        let bytes = permit.bytes();
+        tracing::info!(
+            index.kind = ?self.kind,
+            gauge.anvil_index_construction_configured_bytes = self.fair_share,
+            histogram.anvil_index_construction_minimum_bytes = minimum,
+            histogram.anvil_index_construction_desired_bytes = preferred,
+            histogram.anvil_index_construction_granted_bytes = bytes,
+            histogram.anvil_index_construction_borrowed_bytes = bytes.saturating_sub(self.fair_share),
+            "index construction working memory admitted"
+        );
+        Ok(IndexMemoryPermit {
+            bytes,
+            _permit: permit,
+        })
     }
 }
 
 pub(crate) struct IndexMemoryPermit {
-    inner: Arc<BudgetInner>,
     bytes: u64,
+    _permit: WorkingMemoryPermit,
 }
 
 impl IndexMemoryPermit {
@@ -251,102 +194,31 @@ impl IndexMemoryPermit {
     }
 }
 
-impl Drop for IndexMemoryPermit {
-    fn drop(&mut self) {
-        if self.bytes == 0 {
-            return;
-        }
-        let mut state = lock_state(&self.inner);
-        debug_assert!(state.used >= self.bytes);
-        state.used = state.used.saturating_sub(self.bytes);
-        emit_budget_state(&self.inner, &state);
-        drop(state);
-        self.inner.changed.notify_waiters();
-    }
-}
-
-fn emit_budget_state(inner: &BudgetInner, state: &BudgetState) {
-    tracing::info!(
-        index.kind = ?inner.kind,
-        gauge.anvil_index_construction_configured_bytes = inner.limit,
-        gauge.anvil_index_construction_leased_bytes = state.used,
-        gauge.anvil_index_construction_peak_leased_bytes = state.peak,
-        gauge.anvil_index_construction_waiting = state.waiters.len() as u64,
-        "index construction budget state"
-    );
-}
-
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub(crate) enum IndexBudgetError {
     #[error("index memory budget must be greater than zero")]
     ZeroLimit,
-    #[error("index work requires {requested} bytes but its kind is capped at {limit} bytes")]
-    RequestExceedsLimit { requested: u64, limit: u64 },
     #[error("index memory budget {configured} is below the format minimum {minimum}")]
     BelowMinimum { configured: u64, minimum: u64 },
     #[error("index memory budget {0} exceeds this platform's addressable size")]
     LimitExceedsPlatform(u64),
+    #[error(transparent)]
+    WorkingMemory(#[from] WorkingMemoryError),
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use super::*;
 
-    #[tokio::test]
-    async fn aggregate_use_never_exceeds_the_hard_limit() {
-        let budget = IndexMemoryBudget::new(IndexKind::Path, 10).unwrap();
-        let first = budget.acquire(7).await.unwrap();
-        let waiting_budget = budget.clone();
-        let waiting = tokio::spawn(async move { waiting_budget.acquire(4).await.unwrap() });
-        tokio::task::yield_now().await;
-        assert_eq!(budget.used(), 7);
-        assert!(!waiting.is_finished());
-        drop(first);
-        let second = waiting.await.unwrap();
-        assert_eq!(second.bytes(), 4);
-        assert_eq!(budget.used(), 4);
-    }
-
-    #[tokio::test]
-    async fn cancelled_front_waiter_does_not_block_the_queue() {
-        let budget = IndexMemoryBudget::new(IndexKind::Path, 10).unwrap();
-        let held = budget.acquire(10).await.unwrap();
-        let first_budget = budget.clone();
-        let first = tokio::spawn(async move { first_budget.acquire(10).await.unwrap() });
-        let second_budget = budget.clone();
-        let second = tokio::spawn(async move { second_budget.acquire(1).await.unwrap() });
-        tokio::task::yield_now().await;
-        first.abort();
-        let _ = first.await;
-        drop(held);
-        assert_eq!(second.await.unwrap().bytes(), 1);
-    }
-
     #[test]
-    fn every_kind_has_an_independent_pool() {
-        let limit = MIN_INDEX_KIND_MEMORY_BYTES as u64;
-        let budgets = IndexMemoryBudgets::new(limit).unwrap();
-        assert_eq!(budgets.for_kind(IndexKind::Path).limit(), limit);
-        assert_eq!(
-            budgets.for_kind(IndexKind::Path).memory_plan().total_bytes,
-            MIN_INDEX_KIND_MEMORY_BYTES
-        );
-        assert!(!Arc::ptr_eq(
-            &budgets.for_kind(IndexKind::Path).inner,
-            &budgets.for_kind(IndexKind::Vector).inner,
-        ));
-    }
-
-    #[test]
-    fn configured_kind_overrides_create_distinct_pool_limits() {
+    fn configured_kind_overrides_remain_distinct_fair_shares() {
         let baseline = MIN_INDEX_KIND_MEMORY_BYTES as u64;
         let config = IndexRuntimeConfig::new(1, 1, baseline, 1, 1, 1, 1)
             .unwrap()
             .with_kind_limits(IndexKind::Vector, baseline * 2, 2)
             .unwrap();
-        let budgets = IndexMemoryBudgets::from_config(config).unwrap();
+        let memory = IndexWorkingMemory::from_config(config).unwrap();
+        let budgets = IndexMemoryBudgets::from_config(config, memory).unwrap();
         assert_eq!(budgets.for_kind(IndexKind::Path).limit(), baseline);
         assert_eq!(budgets.for_kind(IndexKind::Vector).limit(), baseline * 2);
     }
@@ -360,43 +232,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_full_budget_turn_leaves_the_next_turn_runnable() {
-        let limit = MIN_INDEX_KIND_MEMORY_BYTES as u64;
-        let budget = IndexMemoryBudget::new(IndexKind::TypedJson, limit).unwrap();
-        let rebuild_turn = budget.acquire(limit).await.unwrap();
-        assert_eq!(budget.used(), limit);
-
+    async fn completed_full_share_turn_leaves_the_next_turn_runnable() {
+        let share = MIN_INDEX_KIND_MEMORY_BYTES as u64;
+        let budgets = IndexMemoryBudgets::new(share).unwrap();
+        let budget = budgets.for_kind(IndexKind::TypedJson);
+        let rebuild_turn = budget.acquire(share).await.unwrap();
+        assert_eq!(rebuild_turn.bytes(), share);
         drop(rebuild_turn);
-        assert_eq!(budget.used(), 0);
 
         let catch_up_turn =
-            tokio::time::timeout(std::time::Duration::from_secs(1), budget.acquire(limit))
+            tokio::time::timeout(std::time::Duration::from_secs(1), budget.acquire(share))
                 .await
-                .expect("a yielded rebuild turn must not pin the kind budget")
+                .expect("a yielded rebuild turn must not pin working memory")
                 .unwrap();
-        assert_eq!(catch_up_turn.bytes(), limit);
+        assert_eq!(catch_up_turn.bytes(), share);
     }
 
     #[tokio::test]
-    async fn three_same_kind_full_quanta_make_fifo_progress() {
-        let budget = IndexMemoryBudget::new(IndexKind::Path, 10).unwrap();
-        let held = budget.acquire(10).await.unwrap();
-        let order = Arc::new(Mutex::new(Vec::new()));
-        let mut tasks = Vec::new();
-        for id in 1..=3 {
-            let budget = budget.clone();
-            let order = order.clone();
-            tasks.push(tokio::spawn(async move {
-                let permit = budget.acquire(10).await.unwrap();
-                order.lock().unwrap().push(id);
-                drop(permit);
-            }));
-            tokio::task::yield_now().await;
-        }
-        drop(held);
-        for task in tasks {
-            task.await.unwrap();
-        }
-        assert_eq!(*order.lock().unwrap(), vec![1, 2, 3]);
+    async fn one_kind_can_borrow_idle_capacity_from_the_shared_parent() {
+        let share = MIN_INDEX_KIND_MEMORY_BYTES as u64;
+        let budgets = IndexMemoryBudgets::new(share).unwrap();
+        let budget = budgets.for_kind(IndexKind::TypedJson);
+        let permit = budget
+            .acquire_up_to(share, share.checked_mul(2).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(permit.bytes(), share * 2);
     }
 }

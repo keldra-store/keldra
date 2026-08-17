@@ -176,15 +176,16 @@ async fn main() -> TestResult<()> {
             .await,
         "an application without a group role",
     )?;
+    let grant_reader = ChangePersonalDbGroupRoleRequest {
+        bucket: bucket.clone(),
+        database_id: SOURCE_DATABASE.into(),
+        group_id: SOURCE_GROUP.into(),
+        app_id: reader_app_id.clone(),
+        role: PersonalDbGroupRole::Reader as i32,
+        command_id: "personaldb-qualification-grant-reader".into(),
+    };
     let granted = databases[1 % node_count]
-        .grant_group_role(ChangePersonalDbGroupRoleRequest {
-            bucket: bucket.clone(),
-            database_id: SOURCE_DATABASE.into(),
-            group_id: SOURCE_GROUP.into(),
-            app_id: reader_app_id.clone(),
-            role: PersonalDbGroupRole::Reader as i32,
-            command_id: "personaldb-qualification-grant-reader".into(),
-        })
+        .grant_group_role(grant_reader.clone())
         .await?
         .into_inner();
     if granted.authorization_revision == 0 || granted.replayed {
@@ -196,6 +197,21 @@ async fn main() -> TestResult<()> {
         .into_inner();
     verified_group(&reader_visible)?;
     verify_reader_list(&mut readers[1 % node_count], &bucket, true).await?;
+
+    // The first grant advanced the realm revision. Reconstructing the same
+    // protocol command must still replay its retained result rather than bind
+    // the stable command ID to the newly observed revision.
+    let replayed_grant = databases[2 % node_count]
+        .grant_group_role(grant_reader)
+        .await?
+        .into_inner();
+    if !replayed_grant.replayed
+        || replayed_grant.authorization_revision != granted.authorization_revision
+    {
+        return Err(invalid(
+            "GrantGroupRole did not replay after the realm revision advanced",
+        ));
+    }
 
     let revoked = databases[2 % node_count]
         .revoke_group_role(ChangePersonalDbGroupRoleRequest {
@@ -605,8 +621,19 @@ async fn verify_catch_up(
     let PersonalDbSyncFrameV1::EntryStart(start) = &frames[1] else {
         return Err(invalid("CatchUp omitted its entry start"));
     };
+    let expected_entry_id = format!(
+        "sha256-{}",
+        hex::encode(
+            expected_certificate
+                .unsigned()
+                .entry_core
+                .entry_hash()?
+                .as_bytes()
+        )
+    );
     start.commit_certificate.verify(SOURCE_GROUP, trust)?;
-    if start.commit_certificate != *expected_certificate
+    if start.entry_id != expected_entry_id
+        || start.commit_certificate != *expected_certificate
         || start.changeset_length != changeset.len() as u64
         || start.changeset_sha256 != Sha256Digest::hash(changeset)
     {
@@ -615,7 +642,8 @@ async fn verify_catch_up(
     let PersonalDbSyncFrameV1::EntryChunk(chunk) = &frames[2] else {
         return Err(invalid("CatchUp omitted its entry bytes"));
     };
-    if chunk.offset != 0
+    if chunk.entry_id != expected_entry_id
+        || chunk.offset != 0
         || chunk.data != changeset
         || chunk.chunk_sha256 != Sha256Digest::hash(changeset)
     {
@@ -627,7 +655,8 @@ async fn verify_catch_up(
     end.committed_head.verify(SOURCE_GROUP, trust)?;
     end.committed_head
         .verify_certificate(expected_certificate)?;
-    if end.committed_head != *expected_head
+    if end.entry_id != expected_entry_id
+        || end.committed_head != *expected_head
         || end.delivered_length != changeset.len() as u64
         || end.delivered_sha256 != Sha256Digest::hash(changeset)
     {

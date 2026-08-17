@@ -761,6 +761,29 @@ impl ZanzibarDistribution {
         store: &Store,
         request: TupleBatchRequest,
     ) -> Result<CoordinatedAuthzRealmMutation, Status> {
+        self.mutate_tuples_journaled_inner(stable_tenant_id, store, request, false)
+            .await
+    }
+
+    /// Replay a trusted adapter's reconstructed tuple request against the
+    /// retained original CAS before entering the ordinary mutation path.
+    pub(crate) async fn mutate_tuples_journaled_restoring_retained_precondition(
+        &self,
+        stable_tenant_id: u64,
+        store: &Store,
+        request: TupleBatchRequest,
+    ) -> Result<CoordinatedAuthzRealmMutation, Status> {
+        self.mutate_tuples_journaled_inner(stable_tenant_id, store, request, true)
+            .await
+    }
+
+    async fn mutate_tuples_journaled_inner(
+        &self,
+        stable_tenant_id: u64,
+        store: &Store,
+        request: TupleBatchRequest,
+        restore_retained_precondition: bool,
+    ) -> Result<CoordinatedAuthzRealmMutation, Status> {
         loop {
             let serial = self.core.coordinator_serial.lock().await;
             let permit = self.mutation_admission.enter()?;
@@ -775,10 +798,18 @@ impl ZanzibarDistribution {
                     "authorization serving fence changed during reconciliation",
                 ));
             }
+            let request = if restore_retained_precondition {
+                self.core
+                    .repository
+                    .restore_retained_tuple_replay_precondition(request.clone())
+                    .map_err(authz_status)?
+            } else {
+                request.clone()
+            };
             let coordinated = match store
                 .coordinate_journaled_authz_tuple_mutation(
                     stable_tenant_id,
-                    request.clone(),
+                    request,
                     serving.active_placement_log_id,
                     serving.serving_fence_term,
                 )
