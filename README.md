@@ -47,7 +47,7 @@ repository are required.
 ### 1. Start a development node
 
 ```sh
-export ANVIL_IMAGE=ghcr.io/worka-ai/anvil:0.9.2
+export ANVIL_IMAGE=ghcr.io/worka-ai/anvil:0.9.3
 export ANVIL_TOKEN_SIGNING_KEY_FILE="$PWD/anvil-data/token-signing-key"
 
 mkdir -p anvil-data
@@ -159,7 +159,7 @@ Zanzibar-authorized object addressed by `(tenant, bucket, path)`.
 ## Use the Rust client
 
 ```sh
-cargo add anvil-storage@0.9.2
+cargo add anvil-storage@0.9.3
 cargo add tokio --features macros,rt-multi-thread
 ```
 
@@ -234,7 +234,7 @@ Zanzibar-authorized independently of ordinary object traffic.
 Add the public client and canonical protocol types:
 
 ```sh
-cargo add anvil-storage@0.9.2 personaldb-protocol@0.2.2 serde_json
+cargo add anvil-storage@0.9.3 personaldb-protocol@0.2.2 serde_json
 ```
 
 Use the same application credential created above to create a source group and
@@ -681,7 +681,7 @@ bundles, establishes peer mTLS, exercises replicated and erasure-coded storage,
 queries every index type, and performs a rolling restart:
 
 ```sh
-ANVIL_IMAGE=ghcr.io/worka-ai/anvil:0.9.2 \
+ANVIL_IMAGE=ghcr.io/worka-ai/anvil:0.9.3 \
   ./scripts/qualify-three-node.sh
 ```
 
