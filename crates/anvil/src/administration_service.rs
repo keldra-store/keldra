@@ -334,8 +334,8 @@ impl AdministrationService for AdministrationServiceImpl {
         let receipt = run(move || {
             let system = authorizer.load().map_err(authz_status)?;
             require_credential_recovery(&system, &caller)?;
-            let storage_tenant =
-                StorageTenantId::parse(request.storage_tenant).map_err(authz_status)?;
+            let storage_tenant = StorageTenantId::parse(request.storage_tenant)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
             store
                 .rotate_application_credential(
                     ApplicationCredentialRequest {

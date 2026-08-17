@@ -848,8 +848,8 @@ impl DistributedControlPlane {
         let _serial = self.administration_serial.lock().await;
         self.require_local_executor()?;
         self.authorize_credential_recovery(&caller).await?;
-        let storage_tenant =
-            StorageTenantId::parse(request.storage_tenant).map_err(authz_status)?;
+        let storage_tenant = StorageTenantId::parse(request.storage_tenant)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
         match self
             .read_record(&LogicalRecordId::TenantNameClaim {
                 storage_tenant: storage_tenant.clone(),
