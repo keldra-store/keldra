@@ -47,7 +47,7 @@ repository are required.
 ### 1. Start a development node
 
 ```sh
-export ANVIL_IMAGE=ghcr.io/worka-ai/anvil:0.9.3
+export ANVIL_IMAGE=ghcr.io/worka-ai/anvil:0.9.4
 export ANVIL_TOKEN_SIGNING_KEY_FILE="$PWD/anvil-data/token-signing-key"
 
 mkdir -p anvil-data
@@ -159,7 +159,7 @@ Zanzibar-authorized object addressed by `(tenant, bucket, path)`.
 ## Use the Rust client
 
 ```sh
-cargo add anvil-storage@0.9.3
+cargo add anvil-storage@0.9.4
 cargo add tokio --features macros,rt-multi-thread
 ```
 
@@ -234,7 +234,7 @@ Zanzibar-authorized independently of ordinary object traffic.
 Add the public client and canonical protocol types:
 
 ```sh
-cargo add anvil-storage@0.9.3 personaldb-protocol@0.2.2 serde_json
+cargo add anvil-storage@0.9.4 personaldb-protocol@0.2.2 serde_json
 ```
 
 Use the same application credential created above to create a source group and
@@ -455,6 +455,30 @@ Tenant roles are `owner`, `admin`, `reader`, `manage_tenant`, `read_tenant`,
 `reader`, `writer`, `get`, `put`, `delete`, and `manage_policy`. A bucket owner
 may delegate the narrowest useful role to another application; index results
 are authorization-filtered before they are returned.
+
+Tenant administrators rotate credentials only for applications in their own
+tenant. If an application has lost its usable credential, a protected `_anvil`
+system administrator can recover that existing identity without recreating the
+tenant, application, roles, buckets, or objects. Put the replacement in a
+mode-`0600` file so it never appears in process arguments:
+
+```sh
+umask 077
+openssl rand -hex 32 > replacement.secret
+
+anvil --endpoint https://anvil.example.com \
+  --credentials-file /run/secrets/anvil-system-admin.json \
+  recover-application-credential \
+  --storage-tenant example \
+  --app-id example-owner \
+  --client-id example-client \
+  --client-secret-file replacement.secret
+```
+
+Recovery requires both a caller from the protected `_anvil` tenant and
+`system#manage_system`; ordinary tenant credentials cannot target another
+tenant. The old secret stops minting tokens immediately. Bearer tokens issued
+before recovery remain valid until their existing expiry.
 
 A bucket owner can enable public reads with the CLI or
 `AdministrationService.SetBucketPublicRead`:
@@ -681,7 +705,7 @@ bundles, establishes peer mTLS, exercises replicated and erasure-coded storage,
 queries every index type, and performs a rolling restart:
 
 ```sh
-ANVIL_IMAGE=ghcr.io/worka-ai/anvil:0.9.3 \
+ANVIL_IMAGE=ghcr.io/worka-ai/anvil:0.9.4 \
   ./scripts/qualify-three-node.sh
 ```
 

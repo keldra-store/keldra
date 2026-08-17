@@ -188,12 +188,14 @@ jobs:
           generate_release_notes: true
           make_latest: true
           body: |
-            Anvil 0.9.3 preserves atomic-program commit barriers through index
-            journal routing, so program-written records become queryable without
-            starving behind unrelated traffic. Deleted-index retention now
-            retires obsolete cleanup safely while preserving isolated cleanup
-            when a path is recreated with a new index identity. Storage formats
-            are unchanged; existing 0.9.x volumes can be upgraded in place.
+            Anvil 0.9.4 adds an explicitly privileged, Zanzibar-authorized
+            recovery path for replacing an existing tenant application's
+            credential without weakening ordinary tenant-scoped rotation. The
+            CLI reads replacement secrets only from protected mode-0600 files.
+            Public-API adversarial qualification covers unauthenticated,
+            malformed, unprivileged-system, cross-tenant, mismatched-identity,
+            concurrent, and idempotent-replay cases. Storage formats are
+            unchanged; existing 0.9.x volumes can be upgraded in place.
 
             - Image: `${{ steps.image.outputs.image }}`
             - Manifest digest: `${{ steps.image.outputs.digest }}`
