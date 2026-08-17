@@ -1046,8 +1046,14 @@ fn load_credential_file(path: &Path) -> Result<Vec<u8>> {
 }
 
 fn load_client_secret_file(path: &Path) -> Result<String> {
-    String::from_utf8(load_credential_file(path)?)
-        .context("client secret file must contain valid UTF-8")
+    let secret = String::from_utf8(load_credential_file(path)?)
+        .context("client secret file must contain valid UTF-8")?;
+    if secret.bytes().any(|byte| matches!(byte, b'\r' | b'\n')) {
+        bail!(
+            "client secret file must not contain CR or LF; write the exact secret with printf '%s'"
+        );
+    }
+    Ok(secret)
 }
 
 fn decode_bootstrap_credential(bytes: &[u8]) -> Result<CredentialFile> {
@@ -1539,6 +1545,23 @@ mod tests {
 
         std::fs::write(&secret, [0xff]).unwrap();
         assert!(load_client_secret_file(&secret).is_err());
+
+        for newline in [
+            b"replacement-secret\n".as_slice(),
+            b"replacement-secret\r",
+            b"replacement-secret\r\n",
+        ] {
+            std::fs::write(&secret, newline).unwrap();
+            let error = load_client_secret_file(&secret).unwrap_err();
+            assert!(error.to_string().contains("must not contain CR or LF"));
+        }
+
+        std::fs::write(&secret, b" replacement-secret ").unwrap();
+        assert_eq!(
+            load_client_secret_file(&secret).unwrap(),
+            " replacement-secret ",
+            "non-newline whitespace remains part of the exact secret"
+        );
     }
 
     #[cfg(not(unix))]

@@ -464,7 +464,7 @@ mode-`0600` file so it never appears in process arguments:
 
 ```sh
 umask 077
-openssl rand -hex 32 > replacement.secret
+printf '%s' "$(openssl rand -hex 32)" > replacement.secret
 
 anvil --endpoint https://anvil.example.com \
   --credentials-file /run/secrets/anvil-system-admin.json \
