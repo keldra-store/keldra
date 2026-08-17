@@ -4,7 +4,8 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use anvil_store::{
-    DefinitionKind, DefinitionOperation, DeletedDefinitionCleanup, Store, VersionId,
+    DefinitionKind, DefinitionLocator, DefinitionOperation, DeletedDefinitionCleanup, Store,
+    VersionId,
 };
 use tonic::Status;
 
@@ -86,7 +87,13 @@ impl DeletedDefinitionRetention {
             if due.due_at_unix_millis > now_unix_millis()? {
                 return Ok(0);
             }
-            active = self.load_job(due).await?;
+            match self.load_job(due.clone()).await {
+                Ok(job) => active = job,
+                Err(error) => {
+                    self.defer(&due)?;
+                    return Err(error);
+                }
+            }
             if active.is_none() {
                 return Ok(0);
             }
@@ -150,7 +157,11 @@ impl DeletedDefinitionRetention {
             self.complete(&due)?;
             return Ok(None);
         }
-        self.require_deleted_definition(&due).await?;
+        if self.deleted_definition_state(&due).await? == DeletedDefinitionState::ReusedNamespace {
+            self.complete(&due)?;
+            self.record_reused_namespace(&due);
+            return Ok(None);
+        }
         let (storage_tenant, bucket) = self
             .names
             .resolve_bucket_names(due.tenant_id, due.bucket_id)
@@ -192,7 +203,15 @@ impl DeletedDefinitionRetention {
                     );
                     continue;
                 }
-                self.require_deleted_definition(&job.due).await?;
+                if self.deleted_definition_state(&job.due).await?
+                    == DeletedDefinitionState::ReusedNamespace
+                {
+                    job.pending.clear();
+                    job.next_due_unix_millis = None;
+                    job.complete = true;
+                    self.record_reused_namespace(&job.due);
+                    continue;
+                }
                 self.artifacts
                     .delete(IndexArtifactDelete {
                         storage_tenant: job.storage_tenant.clone(),
@@ -230,10 +249,10 @@ impl DeletedDefinitionRetention {
         Ok(removed)
     }
 
-    async fn require_deleted_definition(
+    async fn deleted_definition_state(
         &self,
         due: &DeletedDefinitionCleanup,
-    ) -> Result<(), Status> {
+    ) -> Result<DeletedDefinitionState, Status> {
         if !self.due_matches(due)? {
             return Err(Status::aborted(
                 "deleted-index cleanup schedule changed before exact action",
@@ -257,17 +276,9 @@ impl DeletedDefinitionRetention {
             )
             .map_err(|error| Status::unavailable(error.to_string()))?
             .ok_or_else(|| Status::unavailable("deleted index locator is unavailable"))?;
-        if locator.kind != DefinitionKind::Index
-            || locator.operation != DefinitionOperation::Delete
-            || locator.tenant_id != due.tenant_id
-            || locator.bucket_id != due.bucket_id
-            || locator.definition_id != due.index_id
-            || locator.path != due.definition_path
-            || locator.object_version != due.definition_object_version
-        {
-            return Err(Status::aborted(
-                "deleted index locator changed before cleanup",
-            ));
+        let state = classify_deleted_definition_locator(&locator, due)?;
+        if state != DeletedDefinitionState::ExactDelete {
+            return Ok(state);
         }
         if !definition_reference_matches(
             &self.reader,
@@ -283,7 +294,7 @@ impl DeletedDefinitionRetention {
                 "deleted index tombstone is not yet exact-readable",
             ));
         }
-        Ok(())
+        Ok(DeletedDefinitionState::ExactDelete)
     }
 
     async fn within<T>(
@@ -356,6 +367,56 @@ impl DeletedDefinitionRetention {
             "bounded deleted-index cleanup tick completed"
         );
     }
+
+    fn record_reused_namespace(&self, due: &DeletedDefinitionCleanup) {
+        tracing::debug!(
+            index.id = due.index_id,
+            definition.version = due.definition_object_version.0,
+            monotonic_counter.anvil_index_deleted_cleanup_reused_namespace_total = 1_u64,
+            "retired deleted-index cleanup because a newer definition reused its artifact namespace"
+        );
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeletedDefinitionState {
+    ExactDelete,
+    SupersededPath,
+    ReusedNamespace,
+}
+
+fn classify_deleted_definition_locator(
+    locator: &DefinitionLocator,
+    due: &DeletedDefinitionCleanup,
+) -> Result<DeletedDefinitionState, Status> {
+    if locator.kind != DefinitionKind::Index
+        || locator.tenant_id != due.tenant_id
+        || locator.bucket_id != due.bucket_id
+        || locator.path != due.definition_path
+    {
+        return Err(Status::data_loss(
+            "deleted index locator identity is inconsistent",
+        ));
+    }
+    if locator.object_version < due.definition_object_version {
+        return Err(Status::unavailable(
+            "deleted index locator has not reached the cleanup revision",
+        ));
+    }
+    if locator.object_version == due.definition_object_version {
+        if locator.operation == DefinitionOperation::Delete && locator.definition_id == due.index_id
+        {
+            return Ok(DeletedDefinitionState::ExactDelete);
+        }
+        return Err(Status::data_loss(
+            "deleted index locator does not match its cleanup revision",
+        ));
+    }
+    if locator.definition_id == due.index_id {
+        Ok(DeletedDefinitionState::ReusedNamespace)
+    } else {
+        Ok(DeletedDefinitionState::SupersededPath)
+    }
 }
 
 struct DeletedCleanupJob {
@@ -426,6 +487,81 @@ mod tests {
             },
             versions: Vec::new(),
         }
+    }
+
+    fn cleanup() -> DeletedDefinitionCleanup {
+        DeletedDefinitionCleanup {
+            tenant_id: 1,
+            bucket_id: 2,
+            index_id: 3,
+            definition_path: "_anvil/indexes/by-path".into(),
+            definition_object_version: VersionId(4),
+            due_at_unix_millis: 5,
+        }
+    }
+
+    fn locator() -> DefinitionLocator {
+        DefinitionLocator {
+            kind: DefinitionKind::Index,
+            tenant_id: 1,
+            bucket_id: 2,
+            definition_id: 3,
+            path: "_anvil/indexes/by-path".into(),
+            object_version: VersionId(4),
+            operation: DefinitionOperation::Delete,
+        }
+    }
+
+    #[test]
+    fn exact_delete_locator_allows_cleanup() {
+        assert_eq!(
+            classify_deleted_definition_locator(&locator(), &cleanup()).unwrap(),
+            DeletedDefinitionState::ExactDelete
+        );
+    }
+
+    #[test]
+    fn recreated_definition_supersedes_old_cleanup() {
+        let mut current = locator();
+        current.definition_id = 9;
+        current.object_version = VersionId(6);
+        current.operation = DefinitionOperation::Upsert;
+        assert_eq!(
+            classify_deleted_definition_locator(&current, &cleanup()).unwrap(),
+            DeletedDefinitionState::SupersededPath
+        );
+    }
+
+    #[test]
+    fn recreated_definition_reusing_index_id_retires_old_cleanup() {
+        let mut current = locator();
+        current.object_version = VersionId(6);
+        current.operation = DefinitionOperation::Upsert;
+        assert_eq!(
+            classify_deleted_definition_locator(&current, &cleanup()).unwrap(),
+            DeletedDefinitionState::ReusedNamespace
+        );
+    }
+
+    #[test]
+    fn stale_or_inconsistent_locators_still_fail_closed() {
+        let mut stale = locator();
+        stale.object_version = VersionId(3);
+        assert_eq!(
+            classify_deleted_definition_locator(&stale, &cleanup())
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unavailable
+        );
+
+        let mut inconsistent = locator();
+        inconsistent.definition_id = 9;
+        assert_eq!(
+            classify_deleted_definition_locator(&inconsistent, &cleanup())
+                .unwrap_err()
+                .code(),
+            tonic::Code::DataLoss
+        );
     }
 
     #[test]
