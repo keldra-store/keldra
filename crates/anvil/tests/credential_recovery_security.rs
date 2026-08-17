@@ -273,6 +273,10 @@ async fn hostile_callers_fail_closed_and_system_recovery_is_exact_and_idempotent
         Code::Unauthenticated,
         "the replaced secret must stop minting tokens"
     );
+    // A rejected exchange consumes the same per-client credential admission
+    // token as a successful exchange. Keep this security test independent of
+    // the production limiter's refill timing before proving the replacement.
+    tokio::time::sleep(Duration::from_millis(500)).await;
     let replacement_token = exchange(&fixture.channel, "acme-owner-client", &target.client_secret)
         .await
         .expect("the replacement secret must mint tokens");
