@@ -50,6 +50,27 @@ impl ClusterPeerTransport {
             .into_inner())
     }
 
+    pub(crate) async fn route_admin_recover_credential(
+        &self,
+        target: NodeId,
+        address: &str,
+        bearer: &str,
+        value: api::RecoverApplicationCredentialRequest,
+        remaining: Duration,
+    ) -> Result<api::ApplicationCredential, Status> {
+        let fence = self.placement()?.fence();
+        let mut request = Request::new(wire::RouteAdminRecoverCredentialRequest {
+            peer: Some(self.context(fence, 1, remaining)?),
+            request: Some(value),
+        });
+        add_bearer_and_timeout(&mut request, bearer, remaining)?;
+        Ok(self
+            .client(target, address)?
+            .route_admin_recover_credential(request)
+            .await?
+            .into_inner())
+    }
+
     pub(crate) async fn route_admin_disable_credential(
         &self,
         target: NodeId,

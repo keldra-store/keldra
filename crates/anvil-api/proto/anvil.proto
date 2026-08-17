@@ -126,6 +126,9 @@ service AdministrationService {
   rpc ProvisionTenant(ProvisionTenantRequest) returns (ProvisionTenantResponse);
   rpc CreateApplication(CreateApplicationRequest) returns (ApplicationCredential);
   rpc RotateApplicationCredential(RotateApplicationCredentialRequest) returns (ApplicationCredential);
+  // Replaces one existing application credential in a named tenant. This is a
+  // system-only recovery operation; tenant-scoped rotation remains unchanged.
+  rpc RecoverApplicationCredential(RecoverApplicationCredentialRequest) returns (ApplicationCredential);
   rpc DisableApplicationCredential(DisableApplicationCredentialRequest) returns (ApplicationCredentialState);
   rpc CreateBucket(CreateBucketRequest) returns (CreateBucketResponse);
   // Bucket versioning can move only from UNVERSIONED to ENABLED. Disabling a
@@ -1064,6 +1067,16 @@ message RotateApplicationCredentialRequest {
   string app_id = 1;
   string client_id = 2;
   string client_secret = 3;
+}
+
+// Conspicuously privileged credential recovery for an existing application.
+// The caller must belong to the protected `_anvil` tenant and hold
+// system#manage_system. The server never returns either credential secret.
+message RecoverApplicationCredentialRequest {
+  string storage_tenant = 1;
+  string app_id = 2;
+  string client_id = 3;
+  string client_secret = 4;
 }
 
 // Stops future exchanges. Access tokens already issued to this application

@@ -857,6 +857,13 @@ impl wire::cluster_peer_server::ClusterPeer for ClusterPeerService {
         self.route_admin_rotate_credential_call(request).await
     }
 
+    async fn route_admin_recover_credential(
+        &self,
+        request: Request<wire::RouteAdminRecoverCredentialRequest>,
+    ) -> Result<Response<anvil_api::v1::ApplicationCredential>, Status> {
+        self.route_admin_recover_credential_call(request).await
+    }
+
     async fn route_admin_disable_credential(
         &self,
         request: Request<wire::RouteAdminDisableCredentialRequest>,

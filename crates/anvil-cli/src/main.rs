@@ -19,10 +19,10 @@ use anvil_storage::v1::{
     HeadObjectRequest, InvokeProgramRequest, ListObjectVersionsRequest, ListObjectsRequest,
     ObjectAddress, ObjectVersioning, PrepareNodeRequest, ProvisionTenantRequest, PutHeader,
     PutIfAbsentOperation, PutIfVersionOperation, PutImmutableOperation,
-    PutOperation as UnconditionalPutOperation, PutRequest, RotateApplicationCredentialRequest,
-    SetBucketPolicyRequest, SetBucketPublicReadRequest, SetBucketVersioningRequest,
-    TenantApplicationRole, TenantApplicationRoleTarget, WatchNow, WatchPrefixRequest,
-    WatchRetainedBeginning, WatchStateHint,
+    PutOperation as UnconditionalPutOperation, PutRequest, RecoverApplicationCredentialRequest,
+    RotateApplicationCredentialRequest, SetBucketPolicyRequest, SetBucketPublicReadRequest,
+    SetBucketVersioningRequest, TenantApplicationRole, TenantApplicationRoleTarget, WatchNow,
+    WatchPrefixRequest, WatchRetainedBeginning, WatchStateHint,
 };
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -184,6 +184,17 @@ enum Command {
         client_id: String,
         #[arg(long, env = "ANVIL_NEW_CLIENT_SECRET", hide_env_values = true)]
         client_secret: String,
+    },
+    /// Recover an existing tenant application's credential as a system administrator.
+    RecoverApplicationCredential {
+        #[arg(long)]
+        storage_tenant: String,
+        #[arg(long)]
+        app_id: String,
+        #[arg(long)]
+        client_id: String,
+        #[arg(long)]
+        client_secret_file: PathBuf,
     },
     /// Stop future token exchanges for an application credential.
     DisableApplicationCredential { app_id: String, client_id: String },
@@ -744,6 +755,24 @@ async fn main() -> Result<()> {
                 .into_inner();
             print_credential(&credential);
         }
+        Command::RecoverApplicationCredential {
+            storage_tenant,
+            app_id,
+            client_id,
+            client_secret_file,
+        } => {
+            let client_secret = load_client_secret_file(&client_secret_file)?;
+            let credential = administration
+                .recover_application_credential(RecoverApplicationCredentialRequest {
+                    storage_tenant,
+                    app_id,
+                    client_id,
+                    client_secret,
+                })
+                .await?
+                .into_inner();
+            print_credential(&credential);
+        }
         Command::DisableApplicationCredential { app_id, client_id } => {
             let credential = administration
                 .disable_application_credential(DisableApplicationCredentialRequest {
@@ -1016,6 +1045,17 @@ fn load_credential_file(path: &Path) -> Result<Vec<u8>> {
     }
 }
 
+fn load_client_secret_file(path: &Path) -> Result<String> {
+    let secret = String::from_utf8(load_credential_file(path)?)
+        .context("client secret file must contain valid UTF-8")?;
+    if secret.bytes().any(|byte| matches!(byte, b'\r' | b'\n')) {
+        bail!(
+            "client secret file must not contain CR or LF; write the exact secret with printf '%s'"
+        );
+    }
+    Ok(secret)
+}
+
 fn decode_bootstrap_credential(bytes: &[u8]) -> Result<CredentialFile> {
     let credential: CredentialFile =
         serde_json::from_slice(bytes).context("decode credential file JSON")?;
@@ -1206,8 +1246,8 @@ fn present_head_line(version: u64, content_length: u64, content_hash: &[u8]) -> 
 mod tests {
     use super::{
         Arguments, BucketRoleArgument, Command, PublicReadArgument, TenantRoleArgument,
-        VersioningArgument, decode_bootstrap_credential, load_credential_file, parse_hex,
-        present_head_line, put_operation, versioning_name,
+        VersioningArgument, decode_bootstrap_credential, load_client_secret_file,
+        load_credential_file, parse_hex, present_head_line, put_operation, versioning_name,
     };
     use anvil_storage::v1::put_header::Operation;
     use clap::Parser as _;
@@ -1383,6 +1423,34 @@ mod tests {
             Command::CreateApplication { ref app_id, .. } if app_id == "worker"
         ));
 
+        let recover = Arguments::try_parse_from([
+            "anvil",
+            "--token",
+            "token",
+            "recover-application-credential",
+            "--storage-tenant",
+            "acme",
+            "--app-id",
+            "worker",
+            "--client-id",
+            "client-worker",
+            "--client-secret-file",
+            "/run/secrets/replacement",
+        ])
+        .unwrap();
+        assert!(matches!(
+            recover.command,
+            Command::RecoverApplicationCredential {
+                ref storage_tenant,
+                ref app_id,
+                ref client_id,
+                ref client_secret_file,
+            } if storage_tenant == "acme"
+                && app_id == "worker"
+                && client_id == "client-worker"
+                && client_secret_file == std::path::Path::new("/run/secrets/replacement")
+        ));
+
         let tenant = Arguments::try_parse_from([
             "anvil",
             "--token",
@@ -1466,6 +1534,34 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&oversized, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(load_credential_file(&oversized).is_err());
+
+        let secret = directory.path().join("replacement.secret");
+        std::fs::write(&secret, b"replacement-secret").unwrap();
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            load_client_secret_file(&secret).unwrap(),
+            "replacement-secret"
+        );
+
+        std::fs::write(&secret, [0xff]).unwrap();
+        assert!(load_client_secret_file(&secret).is_err());
+
+        for newline in [
+            b"replacement-secret\n".as_slice(),
+            b"replacement-secret\r",
+            b"replacement-secret\r\n",
+        ] {
+            std::fs::write(&secret, newline).unwrap();
+            let error = load_client_secret_file(&secret).unwrap_err();
+            assert!(error.to_string().contains("must not contain CR or LF"));
+        }
+
+        std::fs::write(&secret, b" replacement-secret ").unwrap();
+        assert_eq!(
+            load_client_secret_file(&secret).unwrap(),
+            " replacement-secret ",
+            "non-newline whitespace remains part of the exact secret"
+        );
     }
 
     #[cfg(not(unix))]
