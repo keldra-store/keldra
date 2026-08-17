@@ -50,6 +50,14 @@ impl AtomicProgramWatermark {
         self.unfinalized_commits == 0 && self.last_commit_cursor == self.finalized_through
     }
 
+    /// A clear captured watermark remains a valid lower-bound proof after
+    /// later commits begin or finish. Index work is bounded by the captured
+    /// source vector, so a later atomic program belongs to a later generation
+    /// rather than invalidating the one already being built.
+    pub(crate) fn covers(self, captured: Self) -> bool {
+        captured.is_clear() && self.finalized_through >= captured.finalized_through
+    }
+
     pub(crate) const fn finalized_through(self) -> Option<u64> {
         self.finalized_through
     }
@@ -669,21 +677,49 @@ impl IndexEventJournal {
     }
 
     /// Revalidate the authority named by a completed candidate immediately
-    /// before its current-pointer CAS. Later ordinary writes may make the
-    /// candidate stale, but cannot invalidate it; a membership/source epoch or
-    /// atomic-program watermark change does invalidate the candidate.
+    /// before its current-pointer CAS. Later ordinary or atomic writes may make
+    /// the candidate stale, but cannot invalidate its captured lower-bound
+    /// proof; a membership or source-epoch change still invalidates it.
     pub(crate) async fn validate_publication_barrier(
         &self,
         candidate: &IndexBarrier,
     ) -> Result<(), IndexEventError> {
-        let observed = self.capture_barrier().await?;
-        if observed.fence != candidate.fence || observed.atomic != candidate.atomic {
+        let before = self
+            .authority
+            .current()
+            .map_err(IndexEventError::Placement)?;
+        require_authority_covers(candidate, &before)?;
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for source in before.sources.iter().cloned() {
+            let sources = self.sources.clone();
+            tasks.spawn(async move {
+                let status = sources.status(&source).await;
+                (source, status)
+            });
+        }
+        let mut observed = BTreeMap::new();
+        while let Some(joined) = tasks.join_next().await {
+            let (source, result) =
+                joined.map_err(|error| IndexEventError::Task(error.to_string()))?;
+            let status = result?;
+            validate_status(source.node, &status)?;
+            observed.insert(source.node, status);
+        }
+
+        let after = self
+            .authority
+            .current()
+            .map_err(IndexEventError::Placement)?;
+        if before.fence != after.fence || before.sources != after.sources {
             return Err(IndexEventError::BarrierChanged);
         }
-        if observed.sources.len() != candidate.sources.len()
+        require_authority_covers(candidate, &after)?;
+        if observed.len() != candidate.sources.len()
             || candidate.sources.iter().any(|(node, cursor)| {
-                observed.sources.get(node).is_none_or(|latest| {
-                    latest.source != cursor.source || latest.next_offset < cursor.next_offset
+                observed.get(node).is_none_or(|latest| {
+                    latest.source_id != cursor.source
+                        || latest.settled_through.saturating_add(1) < cursor.next_offset
                 })
             })
         {
@@ -853,6 +889,10 @@ impl IndexEventJournal {
             }
             cursor.next_offset = next_offset;
         }
+        // The routed scan proved the complete source interval through
+        // `target`. Preserve bucket-scoped source offsets while promoting the
+        // global atomic lower-bound proof to that same captured boundary.
+        observed.atomic = target.atomic;
         Ok(observed)
     }
 
@@ -1007,12 +1047,11 @@ impl IndexEventJournal {
         {
             return Err(IndexEventError::SourceEpochChanged(source.node));
         }
-        if self
+        let current = self
             .authority
             .current()
-            .map_err(IndexEventError::Placement)?
-            != placement
-        {
+            .map_err(IndexEventError::Placement)?;
+        if !same_source_authority(&placement, &current) || !current.atomic.covers(target.atomic) {
             return Err(IndexEventError::BarrierChanged);
         }
         let mut advanced = from.clone();
@@ -1154,12 +1193,11 @@ impl IndexEventJournal {
         {
             return Err(IndexEventError::SourceEpochChanged(source.node));
         }
-        if self
+        let current = self
             .authority
             .current()
-            .map_err(IndexEventError::Placement)?
-            != placement
-        {
+            .map_err(IndexEventError::Placement)?;
+        if !same_source_authority(&placement, &current) || !current.atomic.covers(target.atomic) {
             return Err(IndexEventError::BarrierChanged);
         }
         let mut advanced = from.clone();
@@ -1236,7 +1274,7 @@ fn require_compatible(
     if from.fence != target.fence || target.fence != placement.fence {
         return Err(IndexEventError::CheckpointMismatch(NodeId(0)));
     }
-    if !target.atomic.is_clear() || target.atomic != placement.atomic {
+    if !placement.atomic.covers(target.atomic) {
         return Err(IndexEventError::BarrierChanged);
     }
     let expected = placement
@@ -1254,6 +1292,28 @@ fn require_compatible(
         return Err(IndexEventError::IncompleteSources);
     }
     Ok(())
+}
+
+fn require_authority_covers(
+    candidate: &IndexBarrier,
+    authority: &IndexEventPlacement,
+) -> Result<(), IndexEventError> {
+    if candidate.fence != authority.fence || !authority.atomic.covers(candidate.atomic) {
+        return Err(IndexEventError::BarrierChanged);
+    }
+    let expected = authority
+        .sources
+        .iter()
+        .map(|source| source.node)
+        .collect::<Vec<_>>();
+    if candidate.sources.keys().copied().collect::<Vec<_>>() != expected {
+        return Err(IndexEventError::IncompleteSources);
+    }
+    Ok(())
+}
+
+fn same_source_authority(left: &IndexEventPlacement, right: &IndexEventPlacement) -> bool {
+    left.fence == right.fence && left.sources == right.sources
 }
 
 fn validate_status(node: NodeId, status: &WatchJournalStatus) -> Result<(), IndexEventError> {

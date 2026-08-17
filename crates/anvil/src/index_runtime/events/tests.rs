@@ -240,6 +240,45 @@ fn journal(
     .with_page_size(1)
 }
 
+fn barrier(atomic: AtomicProgramWatermark, node_one_next: u64, node_two_next: u64) -> IndexBarrier {
+    IndexBarrier {
+        fence: PlacementLogId { term: 3, index: 7 },
+        atomic,
+        sources: BTreeMap::from([
+            (
+                NodeId(1),
+                IndexSourceCursor {
+                    source: source_id(1),
+                    next_offset: node_one_next,
+                },
+            ),
+            (
+                NodeId(2),
+                IndexSourceCursor {
+                    source: source_id(2),
+                    next_offset: node_two_next,
+                },
+            ),
+        ]),
+    }
+}
+
+#[test]
+fn later_atomic_state_covers_a_clear_captured_watermark() {
+    let captured = AtomicProgramWatermark::new(Some(40), Some(40), 0);
+
+    assert!(AtomicProgramWatermark::new(Some(41), Some(41), 0).covers(captured));
+    assert!(AtomicProgramWatermark::new(Some(42), Some(40), 1).covers(captured));
+    assert!(!AtomicProgramWatermark::new(Some(40), Some(39), 1).covers(captured));
+    assert!(
+        !AtomicProgramWatermark::new(Some(41), Some(41), 0).covers(AtomicProgramWatermark::new(
+            Some(42),
+            Some(41),
+            1
+        ))
+    );
+}
+
 #[test]
 fn snapshot_tails_form_the_exact_active_source_vector() {
     let clear = AtomicProgramWatermark::new(Some(40), Some(40), 0);
@@ -595,6 +634,114 @@ async fn query_bucket_barrier_ignores_an_unrelated_bucket() {
             .iter()
             .all(|(_, tenant, bucket)| (*tenant, *bucket) == (1, 2))
     );
+}
+
+#[tokio::test]
+async fn bucket_barrier_promotes_the_captured_atomic_watermark() {
+    let published = AtomicProgramWatermark::new(Some(40), Some(40), 0);
+    let captured = AtomicProgramWatermark::new(Some(42), Some(42), 0);
+    let sources = MemorySources::default();
+    sources.journals.lock().unwrap().insert(
+        NodeId(1),
+        (status(1, 1), vec![change_in_bucket(1, 1, 1, 2)]),
+    );
+    sources
+        .journals
+        .lock()
+        .unwrap()
+        .insert(NodeId(2), (status(2, 0), Vec::new()));
+    let events = journal(vec![placement(captured)], &sources);
+
+    let observed = events
+        .capture_index_bucket_barrier(1, 2, Some(&barrier(published, 1, 1)))
+        .await
+        .unwrap();
+
+    assert_eq!(observed.atomic, captured);
+    assert_eq!(observed.sources[&NodeId(1)].next_offset, 2);
+    assert_eq!(observed.sources[&NodeId(2)].next_offset, 1);
+}
+
+#[tokio::test]
+async fn unrelated_bucket_activity_advances_only_the_atomic_proof() {
+    let published = AtomicProgramWatermark::new(Some(40), Some(40), 0);
+    let captured = AtomicProgramWatermark::new(Some(42), Some(42), 0);
+    let sources = MemorySources::default();
+    sources.journals.lock().unwrap().insert(
+        NodeId(1),
+        (status(1, 1), vec![change_in_bucket(1, 1, 9, 9)]),
+    );
+    sources
+        .journals
+        .lock()
+        .unwrap()
+        .insert(NodeId(2), (status(2, 0), Vec::new()));
+    let events = journal(vec![placement(captured)], &sources);
+
+    let observed = events
+        .capture_index_bucket_barrier(1, 2, Some(&barrier(published, 1, 1)))
+        .await
+        .unwrap();
+
+    assert_eq!(observed.atomic, captured);
+    assert_eq!(observed.sources[&NodeId(1)].next_offset, 1);
+    assert_eq!(observed.sources[&NodeId(2)].next_offset, 1);
+}
+
+#[tokio::test]
+async fn later_in_progress_program_does_not_invalidate_a_bounded_page() {
+    let captured = AtomicProgramWatermark::new(Some(40), Some(40), 0);
+    let later_pending = AtomicProgramWatermark::new(Some(41), Some(40), 1);
+    let sources = MemorySources::default();
+    sources
+        .journals
+        .lock()
+        .unwrap()
+        .insert(NodeId(1), (status(1, 1), vec![change(1, 1)]));
+    sources
+        .journals
+        .lock()
+        .unwrap()
+        .insert(NodeId(2), (status(2, 0), Vec::new()));
+    let events = journal(vec![placement(later_pending)], &sources);
+
+    let page = events
+        .next_page(
+            1,
+            2,
+            &barrier(captured, 1, 1),
+            &barrier(captured, 2, 1),
+            MAX_INDEX_EVENT_PAGE_BYTES,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(page.changes.len(), 1);
+    assert_eq!(page.through, barrier(captured, 2, 1));
+}
+
+#[tokio::test]
+async fn later_in_progress_program_does_not_invalidate_publication() {
+    let captured = AtomicProgramWatermark::new(Some(40), Some(40), 0);
+    let later_pending = AtomicProgramWatermark::new(Some(41), Some(40), 1);
+    let sources = MemorySources::default();
+    sources
+        .journals
+        .lock()
+        .unwrap()
+        .insert(NodeId(1), (status(1, 1), vec![change(1, 1)]));
+    sources
+        .journals
+        .lock()
+        .unwrap()
+        .insert(NodeId(2), (status(2, 0), Vec::new()));
+    let events = journal(vec![placement(later_pending)], &sources);
+
+    events
+        .validate_publication_barrier(&barrier(captured, 2, 1))
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
