@@ -201,6 +201,37 @@ impl DistributedControlPlane {
         self.execute_rotate_credential(caller, request).await
     }
 
+    pub(crate) async fn recover_application_credential(
+        &self,
+        caller: Caller,
+        bearer: OriginalBearer,
+        request: api::RecoverApplicationCredentialRequest,
+    ) -> Result<api::ApplicationCredential, Status> {
+        if let Some(target) = self.executor_target()? {
+            return self
+                .peers
+                .route_admin_recover_credential(
+                    target.node_id,
+                    &target.address,
+                    bearer.signed_token(),
+                    request,
+                    CONTROL_OPERATION_TIMEOUT,
+                )
+                .await;
+        }
+        self.execute_recover_credential(caller, request).await
+    }
+
+    pub(crate) async fn execute_routed_recover_credential(
+        &self,
+        bearer: &str,
+        request: api::RecoverApplicationCredentialRequest,
+    ) -> Result<api::ApplicationCredential, Status> {
+        let caller = self.verify_routed_bearer(bearer)?;
+        self.require_local_executor()?;
+        self.execute_recover_credential(caller, request).await
+    }
+
     pub(crate) async fn disable_application_credential(
         &self,
         caller: Caller,
@@ -808,6 +839,99 @@ impl DistributedControlPlane {
         Ok(credential_to_api(credential, false))
     }
 
+    async fn execute_recover_credential(
+        &self,
+        caller: Caller,
+        request: api::RecoverApplicationCredentialRequest,
+    ) -> Result<api::ApplicationCredential, Status> {
+        self.require_local_executor()?;
+        let _serial = self.administration_serial.lock().await;
+        self.require_local_executor()?;
+        self.authorize_credential_recovery(&caller).await?;
+        let storage_tenant =
+            StorageTenantId::parse(request.storage_tenant).map_err(authz_status)?;
+        match self
+            .read_record(&LogicalRecordId::TenantNameClaim {
+                storage_tenant: storage_tenant.clone(),
+            })
+            .await?
+        {
+            Some(LogicalRecordValue::TenantNameClaim {
+                storage_tenant: resolved,
+                ..
+            }) if resolved == storage_tenant => {}
+            Some(_) => {
+                return Err(Status::data_loss(
+                    "tenant-name claim has the wrong identity",
+                ));
+            }
+            None => return Err(Status::not_found("storage tenant does not exist")),
+        }
+        let application = self
+            .read_record(&LogicalRecordId::Application {
+                app_id: request.app_id.clone(),
+            })
+            .await?
+            .ok_or_else(|| Status::not_found("application does not exist"))?;
+        require_application_value(
+            &application,
+            &storage_tenant,
+            &request.app_id,
+            &request.client_id,
+        )?;
+        let credential_id = LogicalRecordId::Credential {
+            client_id: request.client_id.clone(),
+        };
+        let current = self
+            .read_record(&credential_id)
+            .await?
+            .ok_or_else(|| Status::not_found("application credential does not exist"))?;
+        let current = require_credential_value(
+            &current,
+            &storage_tenant,
+            &request.app_id,
+            &request.client_id,
+        )?;
+        if let Some(credential) = current
+            .verify_secret(&request.client_secret)
+            .map_err(credential_status)?
+        {
+            return Ok(credential_to_api(credential, true));
+        }
+        let mut prepared = self
+            .store
+            .prepare_credential_rotation(ApplicationCredentialRequest {
+                storage_tenant: storage_tenant.clone(),
+                app_id: request.app_id.clone(),
+                client_id: request.client_id.clone(),
+                client_secret: request.client_secret.clone(),
+            })
+            .map_err(credential_status)?;
+        install_sigv4_secret(
+            &self.tokens,
+            &mut prepared.logical_records,
+            &storage_tenant,
+            &request.app_id,
+            &request.client_id,
+            &request.client_secret,
+        )?;
+        let value =
+            prepared.logical_records.into_iter().next().ok_or_else(|| {
+                Status::internal("credential recovery produced no logical record")
+            })?;
+        self.write_record(value).await?;
+        let credential = self
+            .read_and_verify_credential(
+                &request.client_id,
+                &request.app_id,
+                &storage_tenant,
+                &request.client_secret,
+            )
+            .await?;
+        self.require_local_executor()?;
+        Ok(credential_to_api(credential, false))
+    }
+
     async fn execute_disable_credential(
         &self,
         caller: Caller,
@@ -1326,6 +1450,25 @@ impl DistributedControlPlane {
             )
             .await
         }
+    }
+
+    async fn authorize_credential_recovery(
+        &self,
+        caller: &Caller,
+    ) -> Result<AdministrationAuthorization, Status> {
+        if !caller.storage_tenant().is_system() {
+            return Err(Status::permission_denied(
+                "application credential recovery is not authorized",
+            ));
+        }
+        self.authorize_system(
+            caller.subject(),
+            ObjectRef::opaque("system", anvil_store::SYSTEM_STORAGE_TENANT_ID)
+                .map_err(authz_evaluation_status)?,
+            "manage_system",
+            "application credential recovery is not authorized",
+        )
+        .await
     }
 
     async fn authorize_role_management(

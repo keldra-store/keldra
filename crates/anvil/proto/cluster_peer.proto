@@ -344,6 +344,11 @@ message RouteAdminRotateCredentialRequest {
   anvil.v1.RotateApplicationCredentialRequest request = 2;
 }
 
+message RouteAdminRecoverCredentialRequest {
+  PeerContext peer = 1;
+  anvil.v1.RecoverApplicationCredentialRequest request = 2;
+}
+
 message RouteAdminDisableCredentialRequest {
   PeerContext peer = 1;
   anvil.v1.DisableApplicationCredentialRequest request = 2;
@@ -862,6 +867,7 @@ service ClusterPeer {
   rpc RouteCredentialExchange(RouteCredentialExchangeRequest) returns (anvil.v1.AccessToken);
   rpc RouteAdminCreateApplication(RouteAdminCreateApplicationRequest) returns (anvil.v1.ApplicationCredential);
   rpc RouteAdminRotateCredential(RouteAdminRotateCredentialRequest) returns (anvil.v1.ApplicationCredential);
+  rpc RouteAdminRecoverCredential(RouteAdminRecoverCredentialRequest) returns (anvil.v1.ApplicationCredential);
   rpc RouteAdminDisableCredential(RouteAdminDisableCredentialRequest) returns (anvil.v1.ApplicationCredentialState);
   rpc RouteAdminSetBucketVersioning(RouteAdminSetBucketVersioningRequest) returns (anvil.v1.SetBucketVersioningResponse);
   rpc RouteAdminSetBucketPublicRead(RouteAdminSetBucketPublicReadRequest) returns (anvil.v1.SetBucketPublicReadResponse);

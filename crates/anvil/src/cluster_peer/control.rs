@@ -147,6 +147,29 @@ impl ClusterPeerService {
         Ok(Response::new(response))
     }
 
+    pub(super) async fn route_admin_recover_credential_call(
+        &self,
+        request: Request<wire::RouteAdminRecoverCredentialRequest>,
+    ) -> Result<Response<anvil_api::v1::ApplicationCredential>, Status> {
+        let admitted = self.admit(&request, request.get_ref().peer.as_ref(), 1)?;
+        let bearer = OriginalBearer::from_metadata(request.metadata())?;
+        let value =
+            request.get_ref().request.clone().ok_or_else(|| {
+                Status::invalid_argument("credential recovery request is required")
+            })?;
+        let fence = admitted.placement.fence();
+        let response = tokio::time::timeout(
+            admitted.timeout,
+            self.distributed_control
+                .get()?
+                .execute_routed_recover_credential(bearer.signed_token(), value),
+        )
+        .await
+        .map_err(|_| Status::deadline_exceeded("routed credential recovery deadline exceeded"))??;
+        self.require_unchanged_control(fence)?;
+        Ok(Response::new(response))
+    }
+
     pub(super) async fn route_admin_disable_credential_call(
         &self,
         request: Request<wire::RouteAdminDisableCredentialRequest>,

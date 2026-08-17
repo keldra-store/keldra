@@ -329,6 +329,7 @@ fn is_public_mutation(path: &str) -> bool {
             | "ProvisionTenant"
             | "CreateApplication"
             | "RotateApplicationCredential"
+            | "RecoverApplicationCredential"
             | "DisableApplicationCredential"
             | "CreateBucket"
             | "SetBucketVersioning"
@@ -363,6 +364,7 @@ fn is_cluster_peer_mutation(path: &str) -> bool {
             | "RouteCreateBucket"
             | "RouteAdminCreateApplication"
             | "RouteAdminRotateCredential"
+            | "RouteAdminRecoverCredential"
             | "RouteAdminDisableCredential"
             | "RouteAdminSetBucketVersioning"
             | "RouteAdminSetBucketPublicRead"
@@ -544,6 +546,9 @@ mod tests {
         assert!(is_public_mutation("/anvil.v1.ObjectService/BulkWrite"));
         assert!(is_public_mutation("/anvil.v1.AuthzService/MutateTuples"));
         assert!(is_public_mutation("/anvil.v1.IndexService/RebuildIndex"));
+        assert!(is_public_mutation(
+            "/anvil.v1.AdministrationService/RecoverApplicationCredential"
+        ));
         assert!(!is_public_mutation("/anvil.v1.ObjectService/GetObject"));
         assert!(is_cluster_peer_mutation(
             "/anvil.cluster_peer.v1.ClusterPeer/RoutePutEnd"
@@ -556,6 +561,9 @@ mod tests {
         ));
         assert!(is_cluster_peer_mutation(
             "/anvil.cluster_peer.v1.ClusterPeer/RouteProvisionTenant"
+        ));
+        assert!(is_cluster_peer_mutation(
+            "/anvil.cluster_peer.v1.ClusterPeer/RouteAdminRecoverCredential"
         ));
         assert!(!is_cluster_peer_mutation(
             "/anvil.cluster_peer.v1.ClusterPeer/ReadLogicalRecord"
