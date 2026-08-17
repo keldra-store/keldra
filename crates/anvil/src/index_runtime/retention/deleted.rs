@@ -157,9 +157,9 @@ impl DeletedDefinitionRetention {
             self.complete(&due)?;
             return Ok(None);
         }
-        if self.deleted_definition_state(&due).await? == DeletedDefinitionState::Superseded {
+        if self.deleted_definition_state(&due).await? == DeletedDefinitionState::ReusedNamespace {
             self.complete(&due)?;
-            self.record_superseded(&due);
+            self.record_reused_namespace(&due);
             return Ok(None);
         }
         let (storage_tenant, bucket) = self
@@ -204,12 +204,12 @@ impl DeletedDefinitionRetention {
                     continue;
                 }
                 if self.deleted_definition_state(&job.due).await?
-                    == DeletedDefinitionState::Superseded
+                    == DeletedDefinitionState::ReusedNamespace
                 {
                     job.pending.clear();
                     job.next_due_unix_millis = None;
                     job.complete = true;
-                    self.record_superseded(&job.due);
+                    self.record_reused_namespace(&job.due);
                     continue;
                 }
                 self.artifacts
@@ -277,7 +277,7 @@ impl DeletedDefinitionRetention {
             .map_err(|error| Status::unavailable(error.to_string()))?
             .ok_or_else(|| Status::unavailable("deleted index locator is unavailable"))?;
         let state = classify_deleted_definition_locator(&locator, due)?;
-        if state == DeletedDefinitionState::Superseded {
+        if state != DeletedDefinitionState::ExactDelete {
             return Ok(state);
         }
         if !definition_reference_matches(
@@ -294,7 +294,7 @@ impl DeletedDefinitionRetention {
                 "deleted index tombstone is not yet exact-readable",
             ));
         }
-        Ok(DeletedDefinitionState::Exact)
+        Ok(DeletedDefinitionState::ExactDelete)
     }
 
     async fn within<T>(
@@ -368,20 +368,21 @@ impl DeletedDefinitionRetention {
         );
     }
 
-    fn record_superseded(&self, due: &DeletedDefinitionCleanup) {
+    fn record_reused_namespace(&self, due: &DeletedDefinitionCleanup) {
         tracing::debug!(
             index.id = due.index_id,
             definition.version = due.definition_object_version.0,
-            monotonic_counter.anvil_index_deleted_cleanup_superseded_total = 1_u64,
-            "retired deleted-index cleanup superseded by a newer definition state"
+            monotonic_counter.anvil_index_deleted_cleanup_reused_namespace_total = 1_u64,
+            "retired deleted-index cleanup because a newer definition reused its artifact namespace"
         );
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DeletedDefinitionState {
-    Exact,
-    Superseded,
+    ExactDelete,
+    SupersededPath,
+    ReusedNamespace,
 }
 
 fn classify_deleted_definition_locator(
@@ -402,15 +403,20 @@ fn classify_deleted_definition_locator(
             "deleted index locator has not reached the cleanup revision",
         ));
     }
-    if locator.object_version > due.definition_object_version {
-        return Ok(DeletedDefinitionState::Superseded);
-    }
-    if locator.operation != DefinitionOperation::Delete || locator.definition_id != due.index_id {
+    if locator.object_version == due.definition_object_version {
+        if locator.operation == DefinitionOperation::Delete && locator.definition_id == due.index_id
+        {
+            return Ok(DeletedDefinitionState::ExactDelete);
+        }
         return Err(Status::data_loss(
             "deleted index locator does not match its cleanup revision",
         ));
     }
-    Ok(DeletedDefinitionState::Exact)
+    if locator.definition_id == due.index_id {
+        Ok(DeletedDefinitionState::ReusedNamespace)
+    } else {
+        Ok(DeletedDefinitionState::SupersededPath)
+    }
 }
 
 struct DeletedCleanupJob {
@@ -510,7 +516,7 @@ mod tests {
     fn exact_delete_locator_allows_cleanup() {
         assert_eq!(
             classify_deleted_definition_locator(&locator(), &cleanup()).unwrap(),
-            DeletedDefinitionState::Exact
+            DeletedDefinitionState::ExactDelete
         );
     }
 
@@ -522,7 +528,18 @@ mod tests {
         current.operation = DefinitionOperation::Upsert;
         assert_eq!(
             classify_deleted_definition_locator(&current, &cleanup()).unwrap(),
-            DeletedDefinitionState::Superseded
+            DeletedDefinitionState::SupersededPath
+        );
+    }
+
+    #[test]
+    fn recreated_definition_reusing_index_id_retires_old_cleanup() {
+        let mut current = locator();
+        current.object_version = VersionId(6);
+        current.operation = DefinitionOperation::Upsert;
+        assert_eq!(
+            classify_deleted_definition_locator(&current, &cleanup()).unwrap(),
+            DeletedDefinitionState::ReusedNamespace
         );
     }
 
