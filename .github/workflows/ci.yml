@@ -57,13 +57,13 @@ jobs:
         run: ./scripts/release-gates.sh static
 
   rust:
-    name: Keldra 0.10 workspace tests
+    name: Keldra 0.11 workspace tests
     needs: static
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
-      ANVIL_GATE_STEP_TIMEOUT_SECONDS: '4800'
-      ANVIL_RUST_TEST_THREADS: '8'
+      KELDRA_GATE_STEP_TIMEOUT_SECONDS: '4800'
+      KELDRA_RUST_TEST_THREADS: '8'
       CARGO_BUILD_JOBS: '8'
       CARGO_PROFILE_TEST_DEBUG: '0'
     steps:
@@ -104,8 +104,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     env:
-      ANVIL_DOCKER_PLATFORM: ${{ matrix.platform }}
-      ANVIL_IMAGE: keldra:test-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+      KELDRA_DOCKER_PLATFORM: ${{ matrix.platform }}
+      KELDRA_IMAGE: keldra:test-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
     strategy:
       fail-fast: false
       matrix:
@@ -131,4 +131,4 @@ jobs:
 
       - name: Remove local image
         if: always()
-        run: docker image rm "$ANVIL_IMAGE" || true
+        run: docker image rm "$KELDRA_IMAGE" || true

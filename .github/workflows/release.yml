@@ -59,13 +59,13 @@ jobs:
           printf 'tag=%s\ncommit=%s\n' "$tag" "$commit" >>"$GITHUB_OUTPUT"
 
   validate:
-    name: Validate Keldra 0.10 release
+    name: Validate Keldra 0.11 release
     needs: release-context
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
-      ANVIL_GATE_STEP_TIMEOUT_SECONDS: '5400'
-      ANVIL_RUST_TEST_THREADS: '8'
+      KELDRA_GATE_STEP_TIMEOUT_SECONDS: '5400'
+      KELDRA_RUST_TEST_THREADS: '8'
       CARGO_BUILD_JOBS: '8'
       CARGO_PROFILE_TEST_DEBUG: '0'
     steps:
@@ -118,8 +118,8 @@ jobs:
       contents: read
       packages: write
     env:
-      ANVIL_IMAGE: keldra:release-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
-      ANVIL_DOCKER_PLATFORM: ${{ matrix.platform }}
+      KELDRA_IMAGE: keldra:release-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+      KELDRA_DOCKER_PLATFORM: ${{ matrix.platform }}
     strategy:
       fail-fast: false
       matrix:
@@ -157,8 +157,8 @@ jobs:
           metadata_file="${RUNNER_TEMP}/keldra-image-metadata-${{ matrix.arch }}.json"
 
           docker buildx build \
-            --platform "$ANVIL_DOCKER_PLATFORM" \
-            --build-arg "ANVIL_SOURCE_REVISION=${SOURCE_COMMIT}" \
+            --platform "$KELDRA_DOCKER_PLATFORM" \
+            --build-arg "KELDRA_SOURCE_REVISION=${SOURCE_COMMIT}" \
             --provenance=false \
             --sbom=false \
             --output "type=image,name=${repository},push=true,push-by-digest=true,name-canonical=true" \
@@ -174,7 +174,7 @@ jobs:
           ' "$metadata_file"
           )"
           if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "native ${ANVIL_DOCKER_PLATFORM} build did not report a valid digest" >&2
+            echo "native ${KELDRA_DOCKER_PLATFORM} build did not report a valid digest" >&2
             exit 1
           fi
           printf '%s\n' "$digest" >"$DIGEST_FILE"
@@ -186,8 +186,8 @@ jobs:
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
-          docker pull --platform "$ANVIL_DOCKER_PLATFORM" "${IMAGE_REPOSITORY}@${IMAGE_DIGEST}"
-          docker tag "${IMAGE_REPOSITORY}@${IMAGE_DIGEST}" "$ANVIL_IMAGE"
+          docker pull --platform "$KELDRA_DOCKER_PLATFORM" "${IMAGE_REPOSITORY}@${IMAGE_DIGEST}"
+          docker tag "${IMAGE_REPOSITORY}@${IMAGE_DIGEST}" "$KELDRA_IMAGE"
 
       - name: Smoke release image through gRPC
         run: ./scripts/release-gates.sh image
@@ -206,13 +206,13 @@ jobs:
           IMAGE_REPOSITORY: ${{ steps.build.outputs.repository }}
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
-          docker image rm "$ANVIL_IMAGE" || true
+          docker image rm "$KELDRA_IMAGE" || true
           if [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
             docker image rm "${IMAGE_REPOSITORY}@${IMAGE_DIGEST}" || true
           fi
 
   publish:
-    name: Publish Keldra 0.10 image and release
+    name: Publish Keldra 0.11 image and release
     needs: [release-context, validate, build-image]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -326,7 +326,7 @@ jobs:
           generate_release_notes: true
           make_latest: true
           body: |
-            Keldra 0.10.0 is the first release under the Keldra name. It includes
+            Keldra 0.11.0 completes the public Keldra product rename. It includes
             the `keldra` Rust crate and CLI, the multi-platform Keldra server
             image, and the authorized HTTP plugin broker used by separately
             deployed protocol plugins. Object, index, PersonalDB, accounting,
