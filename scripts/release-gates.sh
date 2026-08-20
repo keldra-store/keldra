@@ -35,10 +35,10 @@ static_gates() {
 rust_gates() {
   local build_jobs="${CARGO_BUILD_JOBS:-1}"
   local test_threads="${ANVIL_RUST_TEST_THREADS:-4}"
-  run_step "Anvil 0.9 workspace Clippy" cargo clippy --jobs "${build_jobs}" --locked --workspace \
+  run_step "Keldra 0.1 workspace Clippy" cargo clippy --jobs "${build_jobs}" --locked --workspace \
     --all-targets \
     --no-deps
-  run_step "Anvil 0.9 workspace tests" cargo test --jobs "${build_jobs}" --locked --workspace --all-targets -- \
+  run_step "Keldra 0.1 workspace tests" cargo test --jobs "${build_jobs}" --locked --workspace --all-targets -- \
     --nocapture \
     --test-threads="${test_threads}"
 }
@@ -46,7 +46,7 @@ rust_gates() {
 server_gates() {
   local build_jobs="${CARGO_BUILD_JOBS:-1}"
   local test_threads="${ANVIL_RUST_TEST_THREADS:-4}"
-  run_step "Anvil 0.9 server, client, and CLI tests" cargo test --jobs "${build_jobs}" --locked \
+  run_step "Keldra 0.1 server, client, and CLI tests" cargo test --jobs "${build_jobs}" --locked \
     -p keldra-server \
     -p keldra \
     -p keldra-cli \
@@ -81,7 +81,7 @@ image_gates() (
   chmod 0600 "${scratch}/signing-key"
   docker run --rm --user 0 --volume "${scratch}:/smoke" "${image}" \
     chown 10001:10001 /smoke/signing-key
-  printf 'anvil-0.9-smoke\n' >"${scratch}/payload"
+  printf 'keldra-0.1-smoke\n' >"${scratch}/payload"
   chmod 0444 "${scratch}/payload"
   docker run --detach --name "${container}" \
     --env ANVIL_LISTEN=0.0.0.0:50051 \
@@ -104,7 +104,7 @@ image_gates() (
         --volume "${scratch}/data:/var/lib/anvil:ro" \
         --env ANVIL_NEW_CLIENT_SECRET="${owner_client_secret}" \
         "${image}" \
-        anvil --endpoint http://127.0.0.1:50051 \
+        keldra --endpoint http://127.0.0.1:50051 \
         --credentials-file /var/lib/anvil/system-bootstrap-credential.json \
         provision-tenant smoke smoke-owner "${owner_client_id}" 2>&1 || true
     )"
@@ -125,7 +125,7 @@ image_gates() (
     --env ANVIL_CLIENT_ID="${owner_client_id}" \
     --env ANVIL_CLIENT_SECRET="${owner_client_secret}" \
     "${image}" \
-    anvil --endpoint http://127.0.0.1:50051 create-bucket objects
+    keldra --endpoint http://127.0.0.1:50051 create-bucket objects
 
   docker run --rm --volume "${scratch}/data:/var/lib/anvil" "${image}" \
     rm /var/lib/anvil/system-bootstrap-credential.json
@@ -140,7 +140,7 @@ image_gates() (
     --env ANVIL_CLIENT_ID="${owner_client_id}" \
     --env ANVIL_CLIENT_SECRET="${owner_client_secret}" \
     "${image}" \
-    anvil --endpoint http://127.0.0.1:50051 \
+    keldra --endpoint http://127.0.0.1:50051 \
     put smoke objects hello /smoke/payload \
       --command-id image-smoke --durability local --if-absent
 
@@ -150,10 +150,10 @@ image_gates() (
       --env ANVIL_CLIENT_ID="${owner_client_id}" \
       --env ANVIL_CLIENT_SECRET="${owner_client_secret}" \
       "${image}" \
-      anvil --endpoint http://127.0.0.1:50051 \
+      keldra --endpoint http://127.0.0.1:50051 \
       get smoke objects hello
   )"
-  if [[ "${value}" != 'anvil-0.9-smoke' ]]; then
+  if [[ "${value}" != 'keldra-0.1-smoke' ]]; then
     echo "image smoke read returned unexpected bytes" >&2
     return 1
   fi

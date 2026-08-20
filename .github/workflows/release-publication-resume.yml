@@ -1,10 +1,10 @@
-name: Resume Anvil Release Publication
+name: Resume Keldra Release Publication
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing 0.9 release tag to publish
+        description: Existing 0.1 release tag to publish
         required: true
         type: string
       expected_commit:
@@ -26,12 +26,12 @@ permissions:
   packages: read
 
 concurrency:
-  group: anvil-release
+  group: keldra-release
   cancel-in-progress: false
 
 jobs:
   publish:
-    name: Resume 0.9 publication from validated image
+    name: Resume Keldra 0.1 publication from validated image
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -79,7 +79,7 @@ jobs:
               "${api_headers[@]}" \
               "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}"
           )"
-          test "$(jq -r '.name' <<<"$run_json")" = 'Anvil Release'
+          test "$(jq -r '.name' <<<"$run_json")" = 'Keldra Release'
           test "$(jq -r '.head_sha' <<<"$run_json")" = "$EXPECTED_COMMIT"
 
           jobs_json="$(
@@ -89,7 +89,7 @@ jobs:
           )"
           required_jobs=(
             'Resolve immutable release context'
-            'Validate Anvil 0.9 release'
+            'Validate Keldra 0.1 release'
             'Build release image (linux/amd64)'
             'Build release image (linux/arm64)'
           )
@@ -116,8 +116,8 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           repository: ${{ github.repository }}
           run-id: ${{ inputs.source_run_id }}
-          pattern: anvil-release-digest-*
-          path: ${{ runner.temp }}/anvil-image-digests
+          pattern: keldra-release-digest-*
+          path: ${{ runner.temp }}/keldra-image-digests
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -138,9 +138,9 @@ jobs:
           set -euo pipefail
           image="ghcr.io/${GITHUB_REPOSITORY,,}:${RELEASE_TAG}"
           amd64_digest="$(tr -d '[:space:]' < \
-            "${RUNNER_TEMP}/anvil-image-digests/anvil-release-digest-amd64/anvil-image-digest-amd64.txt")"
+            "${RUNNER_TEMP}/keldra-image-digests/keldra-release-digest-amd64/keldra-image-digest-amd64.txt")"
           arm64_digest="$(tr -d '[:space:]' < \
-            "${RUNNER_TEMP}/anvil-image-digests/anvil-release-digest-arm64/anvil-image-digest-arm64.txt")"
+            "${RUNNER_TEMP}/keldra-image-digests/keldra-release-digest-arm64/keldra-image-digest-arm64.txt")"
           for digest in "$amd64_digest" "$arm64_digest" "$EXPECTED_IMAGE_DIGEST"; do
             if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
               echo "release evidence did not contain a valid image digest" >&2
@@ -188,14 +188,11 @@ jobs:
           generate_release_notes: true
           make_latest: true
           body: |
-            Anvil 0.9.4 adds an explicitly privileged, Zanzibar-authorized
-            recovery path for replacing an existing tenant application's
-            credential without weakening ordinary tenant-scoped rotation. The
-            CLI reads replacement secrets only from protected mode-0600 files.
-            Public-API adversarial qualification covers unauthenticated,
-            malformed, unprivileged-system, cross-tenant, mismatched-identity,
-            concurrent, and idempotent-replay cases. Storage formats are
-            unchanged; existing 0.9.x volumes can be upgraded in place.
+            Keldra 0.1.0 is the first release under the Keldra name. It includes
+            the `keldra` Rust crate and CLI, the multi-platform Keldra server
+            image, and the authorized HTTP plugin broker used by separately
+            deployed protocol plugins. Object, index, PersonalDB, accounting,
+            S3, Git, authorization, and cluster capabilities remain available.
 
             - Image: `${{ steps.image.outputs.image }}`
             - Manifest digest: `${{ steps.image.outputs.digest }}`

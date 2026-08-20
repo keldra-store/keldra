@@ -4,7 +4,7 @@ set -Eeuo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${repo_root}/scripts/qualification-log-evidence.sh"
 source "${repo_root}/scripts/qualification-scale-evidence.sh"
-requested_image="${ANVIL_IMAGE:-anvil:0.9.4}"
+requested_image="${ANVIL_IMAGE:-anvil:0.1.0}"
 keep="${ANVIL_QUALIFICATION_KEEP:-0}"
 qualification_mode="${ANVIL_QUALIFICATION_MODE:-smoke}"
 index_disk_cache_bytes="${ANVIL_QUALIFICATION_INDEX_DISK_CACHE_BYTES:-1073741824}"
@@ -159,10 +159,10 @@ if [[ "${image_revision}" != "${source_commit}" ]]; then
   exit 2
 fi
 server_version="$(docker run --rm --platform "${platform}" "${image_id}" keldra-server --version)"
-client_version="$(docker run --rm --platform "${platform}" "${image_id}" anvil --version)"
-if [[ "${server_version}" != "keldra-server 0.9.4" \
-  || "${client_version}" != "anvil 0.9.4" ]]; then
-  echo "qualification requires the exact Anvil 0.9.4 image" >&2
+client_version="$(docker run --rm --platform "${platform}" "${image_id}" keldra --version)"
+if [[ "${server_version}" != "keldra-server 0.1.0" \
+  || "${client_version}" != "keldra 0.1.0" ]]; then
+  echo "qualification requires the exact Keldra 0.1.0 image" >&2
   echo "server: ${server_version}" >&2
   echo "client: ${client_version}" >&2
   exit 2
@@ -407,7 +407,7 @@ provision_owner() {
     if output="$(docker exec \
       --env "ANVIL_NEW_CLIENT_SECRET=${provisioned_secret}" \
       "${container_name}" \
-      anvil --endpoint http://127.0.0.1:50051 \
+      keldra --endpoint http://127.0.0.1:50051 \
         --credentials-file /var/lib/anvil/system-bootstrap-credential.json \
         provision-tenant "${provisioned_tenant}" "${provisioned_app}" \
           "${provisioned_client}" 2>&1)"
@@ -1244,7 +1244,7 @@ restart_populated_node() {
     --env "ANVIL_CLIENT_ID=${owner_client}" \
     --env "ANVIL_CLIENT_SECRET=${owner_secret}" \
     "${container_name}" \
-    anvil --endpoint http://127.0.0.1:50051 \
+    keldra --endpoint http://127.0.0.1:50051 \
       head "${tenant}" index-journal-events docs/a.json >/dev/null 2>&1
   do
     if ((SECONDS >= deadline)); then
@@ -1391,7 +1391,7 @@ run_large_object_qualification() {
     --env "ANVIL_CLIENT_ID=${owner_client}"
     --env "ANVIL_CLIENT_SECRET=${owner_secret}"
     "${container_name}"
-    anvil --endpoint http://127.0.0.1:50051
+    keldra --endpoint http://127.0.0.1:50051
   )
 
   dd if=/dev/zero of="${input}" bs=1M count=2 status=none
@@ -1473,7 +1473,7 @@ run_git_qualification() {
     --env "ANVIL_CLIENT_ID=${owner_client}" \
     --env "ANVIL_CLIENT_SECRET=${owner_secret}" \
     "${container_name}" \
-    anvil --endpoint http://127.0.0.1:50051 create-bucket "${bucket}" \
+    keldra --endpoint http://127.0.0.1:50051 create-bucket "${bucket}" \
     | grep -Fq "bucket=${bucket}"
 
   mkdir -p "${git_root}"
@@ -1504,7 +1504,7 @@ run_git_qualification() {
     --env "ANVIL_CLIENT_ID=${owner_client}" \
     --env "ANVIL_CLIENT_SECRET=${owner_secret}" \
     "${container_name}" \
-    anvil --endpoint http://127.0.0.1:50051 \
+    keldra --endpoint http://127.0.0.1:50051 \
       set-bucket-public-read "${bucket}" enabled >/dev/null
   git clone --quiet --branch main "${git_url}" "${public_clone}"
   cmp "${source_repository}/README.md" "${public_clone}/README.md"

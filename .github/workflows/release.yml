@@ -1,4 +1,4 @@
-name: Anvil Release
+name: Keldra Release
 
 on:
   push:
@@ -14,7 +14,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: anvil-release
+  group: keldra-release
   cancel-in-progress: false
 
 jobs:
@@ -59,7 +59,7 @@ jobs:
           printf 'tag=%s\ncommit=%s\n' "$tag" "$commit" >>"$GITHUB_OUTPUT"
 
   validate:
-    name: Validate Anvil 0.9 release
+    name: Validate Keldra 0.1 release
     needs: release-context
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -149,12 +149,12 @@ jobs:
       - name: Build and push release image by digest
         id: build
         env:
-          DIGEST_FILE: ${{ runner.temp }}/anvil-image-digest-${{ matrix.arch }}.txt
+          DIGEST_FILE: ${{ runner.temp }}/keldra-image-digest-${{ matrix.arch }}.txt
           SOURCE_COMMIT: ${{ needs.release-context.outputs.commit }}
         run: |
           set -euo pipefail
           repository="ghcr.io/${GITHUB_REPOSITORY,,}"
-          metadata_file="${RUNNER_TEMP}/anvil-image-metadata-${{ matrix.arch }}.json"
+          metadata_file="${RUNNER_TEMP}/keldra-image-metadata-${{ matrix.arch }}.json"
 
           docker buildx build \
             --platform "$ANVIL_DOCKER_PLATFORM" \
@@ -195,8 +195,8 @@ jobs:
       - name: Upload tested release image digest
         uses: actions/upload-artifact@v4
         with:
-          name: anvil-release-digest-${{ matrix.arch }}
-          path: ${{ runner.temp }}/anvil-image-digest-${{ matrix.arch }}.txt
+          name: keldra-release-digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/keldra-image-digest-${{ matrix.arch }}.txt
           if-no-files-found: error
           retention-days: 2
 
@@ -212,7 +212,7 @@ jobs:
           fi
 
   publish:
-    name: Publish Anvil 0.9 image and release
+    name: Publish Keldra 0.1 image and release
     needs: [release-context, validate, build-image]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -228,8 +228,8 @@ jobs:
       - name: Download tested release image digests
         uses: actions/download-artifact@v4
         with:
-          pattern: anvil-release-digest-*
-          path: ${{ runner.temp }}/anvil-image-digests
+          pattern: keldra-release-digest-*
+          path: ${{ runner.temp }}/keldra-image-digests
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -263,9 +263,9 @@ jobs:
           repository="ghcr.io/${GITHUB_REPOSITORY,,}"
           final_image="${repository}:${RELEASE_TAG}"
           amd64_digest="$(tr -d '[:space:]' < \
-            "${RUNNER_TEMP}/anvil-image-digests/anvil-release-digest-amd64/anvil-image-digest-amd64.txt")"
+            "${RUNNER_TEMP}/keldra-image-digests/keldra-release-digest-amd64/keldra-image-digest-amd64.txt")"
           arm64_digest="$(tr -d '[:space:]' < \
-            "${RUNNER_TEMP}/anvil-image-digests/anvil-release-digest-arm64/anvil-image-digest-arm64.txt")"
+            "${RUNNER_TEMP}/keldra-image-digests/keldra-release-digest-arm64/keldra-image-digest-arm64.txt")"
 
           for digest in "$amd64_digest" "$arm64_digest"; do
             if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
@@ -326,14 +326,11 @@ jobs:
           generate_release_notes: true
           make_latest: true
           body: |
-            Anvil 0.9.4 adds an explicitly privileged, Zanzibar-authorized
-            recovery path for replacing an existing tenant application's
-            credential without weakening ordinary tenant-scoped rotation. The
-            CLI reads replacement secrets only from protected mode-0600 files.
-            Public-API adversarial qualification covers unauthenticated,
-            malformed, unprivileged-system, cross-tenant, mismatched-identity,
-            concurrent, and idempotent-replay cases. Storage formats are
-            unchanged; existing 0.9.x volumes can be upgraded in place.
+            Keldra 0.1.0 is the first release under the Keldra name. It includes
+            the `keldra` Rust crate and CLI, the multi-platform Keldra server
+            image, and the authorized HTTP plugin broker used by separately
+            deployed protocol plugins. Object, index, PersonalDB, accounting,
+            S3, Git, authorization, and cluster capabilities remain available.
 
             - Image: `${{ steps.image.outputs.image }}`
             - Manifest digest: `${{ steps.image.outputs.digest }}`

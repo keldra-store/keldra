@@ -151,7 +151,7 @@ provision_owner() {
     if output="$(ANVIL_NEW_CLIENT_SECRET="${owner_secret}" docker exec \
       --env ANVIL_NEW_CLIENT_SECRET \
       "${container_name}" \
-      anvil --endpoint http://127.0.0.1:50051 \
+      keldra --endpoint http://127.0.0.1:50051 \
         --credentials-file /var/lib/anvil/system-bootstrap-credential.json \
         provision-tenant "${tenant}" "${owner_app}" "${owner_client}" 2>&1)"
     then
@@ -179,7 +179,7 @@ run_owner_cli() {
     --env "ANVIL_CLIENT_ID=${owner_client}" \
     --env "ANVIL_CLIENT_SECRET=${owner_secret}" \
     "${container_name}" \
-    anvil --endpoint http://127.0.0.1:50051 "$@"
+    keldra --endpoint http://127.0.0.1:50051 "$@"
 }
 
 wait_for_owner_access() {

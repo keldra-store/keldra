@@ -6,7 +6,7 @@ source "${repo_root}/scripts/qualification-scale-evidence.sh"
 source "${repo_root}/scripts/qualification-three-node-phases.sh"
 compose_file="${repo_root}/tests/cluster/docker-compose.yml"
 start_node="${repo_root}/tests/cluster/start-node.sh"
-requested_image="${ANVIL_IMAGE:-anvil:0.9.4}"
+requested_image="${ANVIL_IMAGE:-anvil:0.1.0}"
 qualification_mode="${ANVIL_QUALIFICATION_MODE:-smoke}"
 index_disk_cache_bytes="${ANVIL_QUALIFICATION_INDEX_DISK_CACHE_BYTES:-1073741824}"
 index_memory_percent="${ANVIL_QUALIFICATION_INDEX_MEMORY_PERCENT:-20}"
@@ -204,11 +204,11 @@ server_version="$(
 )"
 client_version="$(
   docker run --rm --platform "${ANVIL_DOCKER_PLATFORM}" \
-    "${image_id}" anvil --version
+    "${image_id}" keldra --version
 )"
-if [[ "${server_version}" != "keldra-server 0.9.4" \
-  || "${client_version}" != "anvil 0.9.4" ]]; then
-  echo "qualification requires the exact Anvil 0.9.4 image" >&2
+if [[ "${server_version}" != "keldra-server 0.1.0" \
+  || "${client_version}" != "keldra 0.1.0" ]]; then
+  echo "qualification requires the exact Keldra 0.1.0 image" >&2
   echo "server: ${server_version}" >&2
   echo "client: ${client_version}" >&2
   exit 2
@@ -335,7 +335,7 @@ run_cli() {
     --env "ANVIL_CLIENT_ID=${client_id}" \
     --env "ANVIL_CLIENT_SECRET=${client_secret}" \
     "${image_id}" \
-    anvil --endpoint "http://${node}:50051" "$@"
+    keldra --endpoint "http://${node}:50051" "$@"
 }
 run_bootstrap_cli() {
   local node="$1"
@@ -349,7 +349,7 @@ run_bootstrap_cli() {
     --volume "${ANVIL_QUALIFICATION_DIR}:/qualification" \
     "${secret_environment[@]}" \
     "${image_id}" \
-    anvil --endpoint "http://${node}:50051" \
+    keldra --endpoint "http://${node}:50051" \
       --credentials-file /qualification/node-1/system-bootstrap-credential.json "$@"
 }
 wait_for_bootstrap() {
