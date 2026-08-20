@@ -1,9 +1,9 @@
 # keldra-api
 
-Generated Rust messages and gRPC clients for the Anvil 0.9 protocol.
+Generated Rust messages and gRPC clients for the Keldra 0.10 protocol.
 
 Most applications should depend on
-[`keldra-storage`](https://crates.io/crates/keldra-storage), which adds
+[`keldra`](https://crates.io/crates/keldra), which adds
 authenticated client constructors and upload helpers. Use `keldra-api` directly
 when integrating the generated protocol types with a custom transport.
 
