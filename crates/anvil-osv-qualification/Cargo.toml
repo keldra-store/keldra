@@ -1,6 +1,6 @@
 [package]
 name = "anvil-osv-qualification"
-version = "0.9.4"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true

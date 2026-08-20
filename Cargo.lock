@@ -167,7 +167,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-api"
-version = "0.9.4"
+version = "0.1.0"
 dependencies = [
  "prost",
  "prost-types",
@@ -178,7 +178,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-atomic-program"
-version = "0.9.4"
+version = "0.1.0"
 dependencies = [
  "blake3",
  "serde",
@@ -189,7 +189,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-authz"
-version = "0.9.4"
+version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -197,7 +197,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-consensus"
-version = "0.9.4"
+version = "0.1.0"
 dependencies = [
  "bincode",
  "hyper-util",
@@ -219,7 +219,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-index"
-version = "0.9.4"
+version = "0.1.0"
 dependencies = [
  "blake3",
  "futures-util",
@@ -230,7 +230,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-osv-qualification"
-version = "0.9.4"
+version = "0.1.0"
 dependencies = [
  "anvil-api",
  "anyhow",
@@ -257,7 +257,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-store"
-version = "0.9.4"
+version = "0.1.0"
 dependencies = [
  "anvil-atomic-program",
  "anvil-authz",
