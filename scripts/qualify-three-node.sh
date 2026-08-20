@@ -6,7 +6,7 @@ source "${repo_root}/scripts/qualification-scale-evidence.sh"
 source "${repo_root}/scripts/qualification-three-node-phases.sh"
 compose_file="${repo_root}/tests/cluster/docker-compose.yml"
 start_node="${repo_root}/tests/cluster/start-node.sh"
-requested_image="${ANVIL_IMAGE:-anvil:0.9.4}"
+requested_image="${ANVIL_IMAGE:-keldra:0.10.0}"
 qualification_mode="${ANVIL_QUALIFICATION_MODE:-smoke}"
 index_disk_cache_bytes="${ANVIL_QUALIFICATION_INDEX_DISK_CACHE_BYTES:-1073741824}"
 index_memory_percent="${ANVIL_QUALIFICATION_INDEX_MEMORY_PERCENT:-20}"
@@ -83,7 +83,7 @@ export ANVIL_QUALIFICATION_INDEX_COMPACTION_MAX_LANES="${index_compaction_max_la
 export ANVIL_QUALIFICATION_INDEX_RAYON_WORKERS="${index_rayon_workers}"
 export ANVIL_QUALIFICATION_INDEX_PROJECTION_MAX_LANES="${index_projection_max_lanes}"
 export ANVIL_QUALIFICATION_SOURCE_JOURNAL_MAX_ENTRIES="${release_source_journal_max_entries}"
-export ANVIL_QUALIFICATION_RUST_LOG=info,anvil::index_runtime::cpu=warn,anvil::index_runtime::retention=debug,anvil::observability::runtime=debug
+export ANVIL_QUALIFICATION_RUST_LOG=info,keldra::index_runtime::cpu=warn,keldra::index_runtime::retention=debug,keldra::observability::runtime=debug
 case "${ANVIL_DOCKER_PLATFORM:-}" in
   "")
     case "$(uname -m)" in
@@ -166,7 +166,7 @@ cargo_target_dir="$(
     | jq --exit-status --raw-output \
       '.target_directory | select(type == "string" and length > 0)'
 )"
-cargo build --quiet --release --locked --package anvil-server \
+cargo build --quiet --release --locked --package keldra-server \
   --jobs "${CARGO_BUILD_JOBS:-1}" \
   --manifest-path "${repo_root}/Cargo.toml" \
   "${qualification_example_flags[@]}"
@@ -178,7 +178,7 @@ for qualification_example in "${qualification_examples[@]}"; do
     exit 1
   fi
 done
-echo "[anvil-qualification] optimized qualification clients are ready; Cargo is no longer needed"
+echo "[keldra-qualification] optimized qualification clients are ready; Cargo is no longer needed"
 image_id="$("${repo_root}/scripts/resolve-docker-image-id.sh" "${requested_image}")"
 if [[ ! "${image_id}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
   echo "qualification image did not resolve to an immutable sha256 digest" >&2
@@ -200,22 +200,22 @@ if [[ "${image_revision}" != "${source_commit}" ]]; then
 fi
 server_version="$(
   docker run --rm --platform "${ANVIL_DOCKER_PLATFORM}" \
-    "${image_id}" anvil-server --version
+    "${image_id}" keldra-server --version
 )"
 client_version="$(
   docker run --rm --platform "${ANVIL_DOCKER_PLATFORM}" \
-    "${image_id}" anvil --version
+    "${image_id}" keldra --version
 )"
-if [[ "${server_version}" != "anvil-server 0.9.4" \
-  || "${client_version}" != "anvil 0.9.4" ]]; then
-  echo "qualification requires the exact Anvil 0.9.4 image" >&2
+if [[ "${server_version}" != "keldra-server 0.10.0" \
+  || "${client_version}" != "keldra 0.10.0" ]]; then
+  echo "qualification requires the exact Keldra 0.10.0 image" >&2
   echo "server: ${server_version}" >&2
   echo "client: ${client_version}" >&2
   exit 2
 fi
 export ANVIL_IMAGE="${image_id}"
-export ANVIL_QUALIFICATION_PROJECT="${ANVIL_QUALIFICATION_PROJECT:-anvil-v090-${$}}"
-export ANVIL_QUALIFICATION_DIR="$(mktemp -d /var/tmp/anvil-v090-qualification.XXXXXX)"
+export ANVIL_QUALIFICATION_PROJECT="${ANVIL_QUALIFICATION_PROJECT:-keldra-v090-${$}}"
+export ANVIL_QUALIFICATION_DIR="$(mktemp -d /var/tmp/keldra-v090-qualification.XXXXXX)"
 export ANVIL_QUALIFICATION_START_NODE="${start_node}"
 qualification_suffix="${ANVIL_QUALIFICATION_DIR##*.}"
 index_verification_state="${ANVIL_QUALIFICATION_DIR}/artifacts/index-verification-state.json"
@@ -225,9 +225,9 @@ index_pressure_release="${ANVIL_QUALIFICATION_DIR}/artifacts/index-pressure-rele
 index_pressure_writer_output="${ANVIL_QUALIFICATION_DIR}/artifacts/index-pressure-writer.log"
 index_resource_state="${ANVIL_QUALIFICATION_DIR}/artifacts/index-resource-state.json"
 index_resource_bucket="index-resource-${$}"
-index_resource_report="/var/tmp/anvil-v090-three-index-resource-${qualification_suffix}.json"
-index_resource_telemetry_prefix="/var/tmp/anvil-v090-three-index-telemetry-${qualification_suffix}"
-journal_pressure_evidence_prefix="/var/tmp/anvil-v090-three-journal-pressure-${qualification_suffix}"
+index_resource_report="/var/tmp/keldra-v090-three-index-resource-${qualification_suffix}.json"
+index_resource_telemetry_prefix="/var/tmp/keldra-v090-three-index-telemetry-${qualification_suffix}"
+journal_pressure_evidence_prefix="/var/tmp/keldra-v090-three-journal-pressure-${qualification_suffix}"
 ANVIL_QUALIFICATION_STATE_DIR="${ANVIL_QUALIFICATION_DIR}/artifacts"
 keep="${ANVIL_QUALIFICATION_KEEP:-0}"
 paused_container=""
@@ -268,16 +268,16 @@ cleanup() {
     docker unpause "${paused_container}" >/dev/null 2>&1 || true
   fi
   if ((status != 0)); then
-    echo "[anvil-qualification] FAILED; container status and logs follow" >&2
+    echo "[keldra-qualification] FAILED; container status and logs follow" >&2
     compose ps --all >&2 || true
     compose logs --no-color >&2 || true
   fi
   if [[ "${keep}" == "1" ]]; then
-    echo "[anvil-qualification] retained project ${ANVIL_QUALIFICATION_PROJECT}" >&2
-    echo "[anvil-qualification] retained files ${ANVIL_QUALIFICATION_DIR}" >&2
+    echo "[keldra-qualification] retained project ${ANVIL_QUALIFICATION_PROJECT}" >&2
+    echo "[keldra-qualification] retained files ${ANVIL_QUALIFICATION_DIR}" >&2
   else
     compose down --volumes --remove-orphans >/dev/null 2>&1 || true
-    if [[ "${ANVIL_QUALIFICATION_DIR}" == /var/tmp/anvil-v090-qualification.* ]]; then
+    if [[ "${ANVIL_QUALIFICATION_DIR}" == /var/tmp/keldra-v090-qualification.* ]]; then
       docker run --rm --user 0 \
         --volume "${ANVIL_QUALIFICATION_DIR}:/qualification" \
         "${image_id}" rm -rf \
@@ -296,14 +296,14 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
-server_help="$(docker run --rm "${image_id}" anvil-server --help)"
+server_help="$(docker run --rm "${image_id}" keldra-server --help)"
 for required in --peer-listen --peer-advertise --join-bundle; do
   if ! grep -Fq -- "${required}" <<<"${server_help}"; then
     echo "qualification image is missing required server option ${required}" >&2
     exit 1
   fi
 done
-cli_help="$(docker run --rm "${image_id}" anvil --help)"
+cli_help="$(docker run --rm "${image_id}" keldra --help)"
 for required in prepare-node provision-tenant create-bucket; do
   if ! grep -Fq -- "${required}" <<<"${cli_help}"; then
     echo "qualification image is missing required CLI command ${required}" >&2
@@ -321,8 +321,8 @@ docker run --rm --user 0 \
   --volume "${ANVIL_QUALIFICATION_DIR}/token-signing-key:/qualification-key" \
   "${image_id}" chown 10001:10001 /qualification-key
 compose config --quiet
-compose up --detach anvil-1
-require_service_image anvil-1 "${image_id}" candidate
+compose up --detach keldra-1
+require_service_image keldra-1 "${image_id}" candidate
 network="${ANVIL_QUALIFICATION_PROJECT}_default"
 run_cli() {
   local node="$1"
@@ -335,7 +335,7 @@ run_cli() {
     --env "ANVIL_CLIENT_ID=${client_id}" \
     --env "ANVIL_CLIENT_SECRET=${client_secret}" \
     "${image_id}" \
-    anvil --endpoint "http://${node}:50051" "$@"
+    keldra --endpoint "http://${node}:50051" "$@"
 }
 run_bootstrap_cli() {
   local node="$1"
@@ -349,14 +349,14 @@ run_bootstrap_cli() {
     --volume "${ANVIL_QUALIFICATION_DIR}:/qualification" \
     "${secret_environment[@]}" \
     "${image_id}" \
-    anvil --endpoint "http://${node}:50051" \
+    keldra --endpoint "http://${node}:50051" \
       --credentials-file /qualification/node-1/system-bootstrap-credential.json "$@"
 }
 wait_for_bootstrap() {
   local attempt
   for attempt in $(seq 1 60); do
-    if compose exec -T anvil-1 \
-      test -f /var/lib/anvil/system-bootstrap-credential.json \
+    if compose exec -T keldra-1 \
+      test -f /var/lib/keldra/system-bootstrap-credential.json \
       >/dev/null 2>&1
     then
       return 0
@@ -468,7 +468,7 @@ index_sparse_start_count() {
 
 startup_scan_evidence_count() {
   service_logs "$1" \
-    | grep -Fc 'anvil_startup_scan_evidence' \
+    | grep -Fc 'keldra_startup_scan_evidence' \
     || true
 }
 
@@ -494,7 +494,7 @@ assert_zero_global_startup_scan_evidence() {
   local node="$1"
   local minimum_count="$2"
   local count=0
-  local expected_node_id="${node#anvil-}"
+  local expected_node_id="${node#keldra-}"
   local field
   local line
   local node_id
@@ -526,7 +526,7 @@ assert_zero_global_startup_scan_evidence() {
     count=$((count + 1))
   done < <(
     service_logs "${node}" \
-      | grep -F 'anvil_startup_scan_evidence' || true
+      | grep -F 'keldra_startup_scan_evidence' || true
   )
   if ((count < minimum_count)); then
     echo "${node} startup emitted ${count} measured scan samples; expected at least ${minimum_count}" >&2
@@ -560,7 +560,7 @@ provision_tenant() {
   local client_secret="$3"
   local node
   local output=""
-  for node in anvil-1 anvil-2 anvil-3; do
+  for node in keldra-1 keldra-2 keldra-3; do
     if ! compose ps --status running --services | grep -Fxq "${node}"; then
       continue
     fi
@@ -594,7 +594,7 @@ run_index_resource_qualification() {
   local containers=()
   local resource_node
   assert_source_tree_exact
-  for resource_node in anvil-1 anvil-2 anvil-3; do
+  for resource_node in keldra-1 keldra-2 keldra-3; do
     containers+=("$(service_container "${resource_node}")")
     resource_log_starts["${resource_node}"]="$(log_cursor)"
   done
@@ -631,7 +631,7 @@ run_index_resource_qualification() {
   ANVIL_V06_RESOURCE_OUTPUT="${index_resource_report}" \
   ANVIL_V06_RESOURCE_STATE_OUTPUT="${index_resource_state}" \
     "${qualification_binaries[v06_index_resource_qualification]}" >/dev/null
-  for resource_node in anvil-1 anvil-2 anvil-3; do
+  for resource_node in keldra-1 keldra-2 keldra-3; do
     capture_three_node_resource_evidence \
       "${resource_node}" "${resource_log_starts[${resource_node}]}"
   done
@@ -667,7 +667,7 @@ run_index_resource_qualification() {
       .evidence.hardware.memory_bytes == $hardware_memory_bytes and
       .evidence.hardware.qualification_filesystem_total_bytes == $filesystem_total_bytes and
       .evidence.hardware.qualification_filesystem_available_bytes_at_start == $filesystem_available_bytes and
-      .evidence.corpus.identity == "anvil.synthetic-index-resource.initial.v1" and
+      .evidence.corpus.identity == "keldra.synthetic-index-resource.initial.v1" and
       (.evidence.corpus.initial_corpus_sha256 | test("^sha256:[0-9a-f]{64}$")) and
       .evidence.corpus.records == .records and
       .evidence.corpus.indexed_fields == .indexed_fields and
@@ -699,7 +699,7 @@ run_index_resource_qualification() {
       .evidence.correctness.final_exact_partition_verification == true and
       .evidence.correctness.update_and_delete_verification == true and
       .evidence.correctness.resource_limits_passed == true and
-      .production_query_regression.schema == "anvil.index-production-query-regression.v1" and
+      .production_query_regression.schema == "keldra.index-production-query-regression.v1" and
       .production_query_regression.corpus_records == .records and
       .production_query_regression.index_id > 0 and
       .production_query_regression.definition_version > 0 and
@@ -735,9 +735,9 @@ run_index_resource_qualification() {
       .source_complete_objects_per_second >= 1000
     ' "${index_resource_report}" >/dev/null
   fi
-  echo "[anvil-qualification] bounded distributed index resource qualification passed scope=${index_resource_scope} records=${index_resource_records} kind_budget=${index_kind_budget_bytes}"
-  echo "[anvil-qualification] preserved resource report ${index_resource_report}"
-  echo "[anvil-qualification] preserved full production telemetry ${index_resource_telemetry_prefix}-anvil-{1,2,3}.log"
+  echo "[keldra-qualification] bounded distributed index resource qualification passed scope=${index_resource_scope} records=${index_resource_records} kind_budget=${index_kind_budget_bytes}"
+  echo "[keldra-qualification] preserved resource report ${index_resource_report}"
+  echo "[keldra-qualification] preserved full production telemetry ${index_resource_telemetry_prefix}-keldra-{1,2,3}.log"
 }
 
 verify_index_resource_state() {
@@ -766,11 +766,11 @@ assert_index_resource_bounds() {
     else
       continue
     fi
-    configured="$(log_unsigned_field gauge.anvil_index_construction_configured_bytes "${line}")" \
+    configured="$(log_unsigned_field gauge.keldra_index_construction_configured_bytes "${line}")" \
       || continue
-    leased="$(log_unsigned_field gauge.anvil_index_construction_leased_bytes "${line}")" \
+    leased="$(log_unsigned_field gauge.keldra_index_construction_leased_bytes "${line}")" \
       || return 1
-    peak_leased="$(log_unsigned_field gauge.anvil_index_construction_peak_leased_bytes "${line}")" \
+    peak_leased="$(log_unsigned_field gauge.keldra_index_construction_peak_leased_bytes "${line}")" \
       || return 1
     if ((configured != index_kind_budget_bytes \
       || leased > configured \
@@ -782,7 +782,7 @@ assert_index_resource_bounds() {
     observed_kinds["${kind}"]=1
     observed=$((observed + 1))
   done < <(
-    for resource_node in anvil-1 anvil-2 anvil-3; do
+    for resource_node in keldra-1 keldra-2 keldra-3; do
       grep -F 'index construction budget state' \
         "${ANVIL_QUALIFICATION_DIR}/artifacts/index-${resource_node}.log" || true
     done
@@ -805,9 +805,9 @@ assert_index_resource_bounds() {
     [[ "${line}" =~ index\.kind=(Path|MetadataFilter|TypedJson|FullText|Vector|Hybrid|GitSource|Tensor) ]] \
       || continue
     kind="${BASH_REMATCH[1]}"
-    resident="$(log_unsigned_field gauge.anvil_index_construction_resident_bytes "${line}")" \
+    resident="$(log_unsigned_field gauge.keldra_index_construction_resident_bytes "${line}")" \
       || return 1
-    workspace="$(log_unsigned_field gauge.anvil_index_construction_workspace_bytes "${line}")" \
+    workspace="$(log_unsigned_field gauge.keldra_index_construction_workspace_bytes "${line}")" \
       || return 1
     if ((resident == 0 || workspace == 0 || resident > workspace \
       || workspace > index_kind_budget_bytes)); then
@@ -817,7 +817,7 @@ assert_index_resource_bounds() {
     fi
     resident_kinds["${kind}"]=1
   done < <(
-    for resource_node in anvil-1 anvil-2 anvil-3; do
+    for resource_node in keldra-1 keldra-2 keldra-3; do
       grep -F 'format-v4 index segment flushed' \
         "${ANVIL_QUALIFICATION_DIR}/artifacts/index-${resource_node}.log" || true
     done
@@ -835,15 +835,15 @@ assert_index_resource_bounds() {
       || "${line}" != *"index construction budget state"* ]]; then
       continue
     fi
-    configured="$(log_unsigned_field gauge.anvil_index_construction_configured_bytes "${line}")" \
+    configured="$(log_unsigned_field gauge.keldra_index_construction_configured_bytes "${line}")" \
       || {
       echo "distributed production-shaped TypedJson build emitted malformed budget evidence" >&2
       printf '%s\n' "${line}" >&2
       return 1
     }
-    leased="$(log_unsigned_field gauge.anvil_index_construction_leased_bytes "${line}")" \
+    leased="$(log_unsigned_field gauge.keldra_index_construction_leased_bytes "${line}")" \
       || return 1
-    peak_leased="$(log_unsigned_field gauge.anvil_index_construction_peak_leased_bytes "${line}")" \
+    peak_leased="$(log_unsigned_field gauge.keldra_index_construction_peak_leased_bytes "${line}")" \
       || return 1
     if ((configured != index_kind_budget_bytes \
       || leased > configured \
@@ -855,7 +855,7 @@ assert_index_resource_bounds() {
     if ((peak_leased > 0)); then resource_positive_peak_evidence=1; fi
     resource_budget_evidence=$((resource_budget_evidence + 1))
   done < <(
-    for resource_node in anvil-1 anvil-2 anvil-3; do
+    for resource_node in keldra-1 keldra-2 keldra-3; do
       cat "${ANVIL_QUALIFICATION_DIR}/artifacts/index-resource-${resource_node}.log"
     done
   )
@@ -867,9 +867,9 @@ assert_index_resource_bounds() {
   local resource_residency_evidence=0
   while IFS= read -r line; do
     [[ "${line}" == *"index.kind=TypedJson"* ]] || continue
-    resident="$(log_unsigned_field gauge.anvil_index_construction_resident_bytes "${line}")" \
+    resident="$(log_unsigned_field gauge.keldra_index_construction_resident_bytes "${line}")" \
       || return 1
-    workspace="$(log_unsigned_field gauge.anvil_index_construction_workspace_bytes "${line}")" \
+    workspace="$(log_unsigned_field gauge.keldra_index_construction_workspace_bytes "${line}")" \
       || return 1
     if ((resident == 0 || workspace == 0 || resident > workspace \
       || workspace > index_kind_budget_bytes)); then
@@ -879,7 +879,7 @@ assert_index_resource_bounds() {
     fi
     resource_residency_evidence=$((resource_residency_evidence + 1))
   done < <(
-    for resource_node in anvil-1 anvil-2 anvil-3; do
+    for resource_node in keldra-1 keldra-2 keldra-3; do
       grep -F 'format-v4 index segment flushed' \
         "${ANVIL_QUALIFICATION_DIR}/artifacts/index-resource-${resource_node}.log" || true
     done
@@ -899,18 +899,18 @@ assert_index_resource_bounds() {
       -type f -printf '%s\n' \
       | awk '{ total += $1 } END { print total + 0 }')"
     if ((cache_bytes > index_disk_cache_bytes)); then
-      echo "anvil-${resource_node} disposable index cache exceeded its ${index_disk_cache_bytes}-byte budget: ${cache_bytes}" >&2
+      echo "keldra-${resource_node} disposable index cache exceeded its ${index_disk_cache_bytes}-byte budget: ${cache_bytes}" >&2
       return 1
     fi
   done
-  echo "[anvil-qualification] distributed index construction and disk caches remained within configured bounds"
+  echo "[keldra-qualification] distributed index construction and disk caches remained within configured bounds"
 }
 
 declare -A index_qualification_log_start=()
 
 capture_index_qualification_log_start() {
   local node
-  for node in anvil-1 anvil-2 anvil-3; do
+  for node in keldra-1 keldra-2 keldra-3; do
     index_qualification_log_start["${node}"]="$(log_cursor)"
   done
 }
@@ -918,7 +918,7 @@ capture_index_qualification_log_start() {
 save_index_qualification_logs() {
   local node
   local cursor
-  for node in anvil-1 anvil-2 anvil-3; do
+  for node in keldra-1 keldra-2 keldra-3; do
     cursor="${index_qualification_log_start[${node}]}"
     service_logs_since "${node}" "${cursor}" \
       >"${ANVIL_QUALIFICATION_DIR}/artifacts/index-${node}.log"
@@ -931,7 +931,7 @@ assert_production_resource_compaction() {
   local builders=0
   local node
   local log
-  for node in anvil-1 anvil-2 anvil-3; do
+  for node in keldra-1 keldra-2 keldra-3; do
     log="${ANVIL_QUALIFICATION_DIR}/artifacts/index-resource-${node}.log"
     if awk '
           index($0, "index.kind=TypedJson") &&
@@ -949,7 +949,7 @@ assert_production_resource_compaction() {
   fi
   assert_compaction_telemetry_for_kind \
     TypedJson "${ANVIL_QUALIFICATION_DIR}/artifacts/index-resource-${builder}.log"
-  echo "[anvil-qualification] production-shaped TypedJson compaction completed on its sole builder"
+  echo "[keldra-qualification] production-shaped TypedJson compaction completed on its sole builder"
 }
 
 assert_one_builder_published_and_compacted_each_index_kind() {
@@ -964,7 +964,7 @@ assert_one_builder_published_and_compacted_each_index_kind() {
     compactor_node=
     publisher_node=
     publishers=0
-    for node in anvil-1 anvil-2 anvil-3; do
+    for node in keldra-1 keldra-2 keldra-3; do
       if awk -v kind="index.kind=${kind}" '
             index($0, kind) && index($0, "index generation published") { found = 1 }
             END { exit !found }
@@ -997,7 +997,7 @@ assert_one_builder_published_and_compacted_each_index_kind() {
     assert_compaction_telemetry_for_kind \
       "${kind}" "${ANVIL_QUALIFICATION_DIR}/artifacts/index-${compactor_node}.log"
   done
-  echo "[anvil-qualification] all eight kinds consumed all three ingress journals and emitted bounded range-compaction metrics with trace-backed completion logs on their sole builder"
+  echo "[keldra-qualification] all eight kinds consumed all three ingress journals and emitted bounded range-compaction metrics with trace-backed completion logs on their sole builder"
 }
 
 verify_existing_indexes() {
@@ -1027,7 +1027,7 @@ assert_index_retention_converged() {
   fi
   while true; do
     failed="$({
-      for node in anvil-1 anvil-2 anvil-3; do
+      for node in keldra-1 keldra-2 keldra-3; do
         service_logs "${node}"
       done
     } | grep -F 'bounded index retention work failed' | tail -n 1 || true)"
@@ -1039,15 +1039,15 @@ assert_index_retention_converged() {
     pending=0
     for index_id in "${index_ids[@]}"; do
       converged=0
-      for node in anvil-1 anvil-2 anvil-3; do
+      for node in keldra-1 keldra-2 keldra-3; do
         if service_logs "${node}" | awk -v marker="index.id=${index_id} " '
             index($0, marker) && index($0, "bounded node-wide index retention tick completed") &&
-            $0 ~ /monotonic_counter.anvil_index_retention_artifacts_deleted_total=[1-9][0-9]*/ {
+            $0 ~ /monotonic_counter.keldra_index_retention_artifacts_deleted_total=[1-9][0-9]*/ {
               deleted = 1
             }
             deleted && index($0, marker) &&
             index($0, "bounded node-wide index retention tick completed") &&
-            $0 ~ /gauge.anvil_index_retention_backlog=0/ {
+            $0 ~ /gauge.keldra_index_retention_backlog=0/ {
               converged = 1
             }
             END { exit !converged }
@@ -1062,7 +1062,7 @@ assert_index_retention_converged() {
       fi
     done
     if ((pending == 0)); then
-      echo "[anvil-qualification] all eight indexes deleted obsolete artifacts and drained their retention backlog"
+      echo "[keldra-qualification] all eight indexes deleted obsolete artifacts and drained their retention backlog"
       return 0
     fi
     if ((SECONDS >= deadline)); then
@@ -1098,7 +1098,7 @@ run_git_qualification() {
   local authorization
 
   provision_tenant "${tenant}" "${client_id}" "${client_secret}"
-  create_bucket anvil-1 "${client_id}" "${client_secret}" "${bucket}"
+  create_bucket keldra-1 "${client_id}" "${client_secret}" "${bucket}"
 
   mkdir -p "${git_root}"
   git init --quiet --initial-branch=main "${source_repository}"
@@ -1125,12 +1125,12 @@ run_git_qualification() {
     return 1
   fi
 
-  run_cli anvil-3 "${client_id}" "${client_secret}" \
+  run_cli keldra-3 "${client_id}" "${client_secret}" \
     set-bucket-public-read "${bucket}" enabled >/dev/null
   git clone --quiet --branch main "${public_clone_url}" "${public_clone}"
   cmp "${source_repository}/README.md" "${public_clone}/README.md"
 
-  echo "[anvil-qualification] cross-node Git push, authenticated clone, and public clone passed"
+  echo "[keldra-qualification] cross-node Git push, authenticated clone, and public clone passed"
 }
 
 run_atomic_index_qualification() {
@@ -1140,7 +1140,7 @@ run_atomic_index_qualification() {
   ANVIL_ATOMIC_INDEX_QUALIFICATION_CLIENT_ID=qatomic-client \
   ANVIL_ATOMIC_INDEX_QUALIFICATION_CLIENT_SECRET="${atomic_secret}" \
     "${qualification_binaries[atomic_index_qualification]}"
-  echo "[anvil-qualification] distributed atomic-program index visibility passed"
+  echo "[keldra-qualification] distributed atomic-program index visibility passed"
 }
 
 run_live_builder_reassignment_qualification() {
@@ -1167,7 +1167,7 @@ run_live_builder_reassignment_qualification() {
     return 1
   fi
   for node_number in $(seq 1 "${active_nodes}"); do
-    node="anvil-${node_number}"
+    node="keldra-${node_number}"
     log_starts["${node}"]="$(log_cursor)"
   done
   run_index_recovery_qualification \
@@ -1175,7 +1175,7 @@ run_live_builder_reassignment_qualification() {
     qindex-membership qindex-membership-client "${index_membership_secret}" \
     "${index_membership_state}"
   for node_number in $(seq 1 "${active_nodes}"); do
-    node="anvil-${node_number}"
+    node="keldra-${node_number}"
     save_log_suffix \
       "${node}" "${log_starts[${node}]}" \
       "${ANVIL_QUALIFICATION_DIR}/artifacts/index-reassignment-${active_nodes}-${node}.log"
@@ -1193,7 +1193,7 @@ run_live_builder_reassignment_qualification() {
     echo "no pre-growth Path index published from ${new_builder_node} after the ${active_nodes}-node cutover" >&2
     return 1
   fi
-  echo "[anvil-qualification] pre-growth indexes remained exact and published from ${new_builder_node} after online $((active_nodes - 1))->${active_nodes} reassignment"
+  echo "[keldra-qualification] pre-growth indexes remained exact and published from ${new_builder_node} after online $((active_nodes - 1))->${active_nodes} reassignment"
 }
 
 run_journal_pressure_qualification() {
@@ -1210,7 +1210,7 @@ run_journal_pressure_qualification() {
     echo "journal-pressure state did not contain exactly one fixture index ID" >&2
     return 1
   fi
-  for node in anvil-1 anvil-2 anvil-3; do
+  for node in keldra-1 keldra-2 keldra-3; do
     seed_log="${ANVIL_QUALIFICATION_DIR}/artifacts/index-pressure-seed-${node}.log"
     save_log_suffix "${node}" "${seed_cursor}" "${seed_log}"
     if log_has_index_event "${seed_log}" "${pressure_index_id}" \
@@ -1224,7 +1224,7 @@ run_journal_pressure_qualification() {
     echo "journal-pressure seed was published by ${builder_count} nodes; expected one builder" >&2
     return 1
   fi
-  for node in anvil-1 anvil-2 anvil-3; do
+  for node in keldra-1 keldra-2 keldra-3; do
     if [[ "${node}" != "${builder}" ]]; then
       ingress="${node}"
       break
@@ -1260,7 +1260,7 @@ run_journal_pressure_qualification() {
         "${index_pressure_state}" 2>/dev/null || true
     )
     capacity_node=""
-    for node in anvil-1 anvil-2 anvil-3; do
+    for node in keldra-1 keldra-2 keldra-3; do
       pressure_log="${ANVIL_QUALIFICATION_DIR}/artifacts/index-pressure-live-${node}.log"
       save_log_suffix "${node}" "${pressure_cursor}" "${pressure_log}"
       if grep -F 'distributed object mutation is waiting for bounded durable state' \
@@ -1304,7 +1304,7 @@ run_journal_pressure_qualification() {
     return 1
   fi
 
-  for node in anvil-1 anvil-2 anvil-3; do
+  for node in keldra-1 keldra-2 keldra-3; do
     pressure_log="${ANVIL_QUALIFICATION_DIR}/artifacts/index-pressure-${node}.log"
     save_log_suffix "${node}" "${pressure_cursor}" "${pressure_log}"
     if grep -Fq 'index snapshot rebuild started' "${pressure_log}"; then
@@ -1341,7 +1341,7 @@ run_journal_pressure_qualification() {
     qindex-pressure qindex-pressure-client "${index_pressure_secret}" \
     "${index_pressure_state}"
 
-  for node in anvil-1 anvil-2 anvil-3; do
+  for node in keldra-1 keldra-2 keldra-3; do
     pressure_log="${ANVIL_QUALIFICATION_DIR}/artifacts/index-pressure-${node}.log"
     save_log_suffix "${node}" "${pressure_cursor}" "${pressure_log}"
     if grep -Fq 'index snapshot rebuild started' "${pressure_log}"; then
@@ -1359,7 +1359,7 @@ run_journal_pressure_qualification() {
     echo "${capacity_node} did not report that source-journal capacity released its writer" >&2
     return 1
   fi
-  echo "[anvil-qualification] hard source-journal capacity kept a public write pending and uncommitted, then woke it and reached an exact incremental index generation"
+  echo "[keldra-qualification] hard source-journal capacity kept a public write pending and uncommitted, then woke it and reached an exact incremental index generation"
 }
 
 assert_zero_accounting_traffic_drops() {
@@ -1370,9 +1370,9 @@ assert_zero_accounting_traffic_drops() {
   local line
   local node
   local node_id
-  for node in anvil-1 anvil-2 anvil-3; do
+  for node in keldra-1 keldra-2 keldra-3; do
     count=0
-    expected_node_id="${node#anvil-}"
+    expected_node_id="${node#keldra-}"
     while IFS= read -r line; do
       node_id="$(log_unsigned_field node_id "${line}")" || {
         echo "${node} accounting drop evidence omitted node_id" >&2
@@ -1394,21 +1394,21 @@ assert_zero_accounting_traffic_drops() {
       count=$((count + 1))
     done < <(
       service_logs "${node}" \
-        | grep -F 'anvil_accounting_traffic_drop_state' || true
+        | grep -F 'keldra_accounting_traffic_drop_state' || true
     )
     if ((count == 0)); then
       echo "${node} emitted no accounting drop-state evidence" >&2
       return 1
     fi
   done
-  echo "[anvil-qualification] accounting traffic reported zero dropped batches and bytes on every node"
+  echo "[keldra-qualification] accounting traffic reported zero dropped batches and bytes on every node"
 }
 
 wait_for_bootstrap
-assert_sparse_index_startup anvil-1 1
+assert_sparse_index_startup keldra-1 1
 qprobe_secret=qualification-probe-secret-000000000000000000000000
 provision_tenant qprobe qprobe-client "${qprobe_secret}"
-create_bucket anvil-1 qprobe-client \
+create_bucket keldra-1 qprobe-client \
   "${qprobe_secret}" objects
 
 # Every index below is created while node 1 is the only ACTIVE member. The
@@ -1418,11 +1418,11 @@ index_membership_secret=qualification-index-membership-secret-0000000000000000
 provision_tenant \
   qindex-membership qindex-membership-client "${index_membership_secret}"
 run_index_recovery_qualification \
-  membership-seed "$(public_endpoint_for anvil-1)" \
+  membership-seed "$(public_endpoint_for keldra-1)" \
   qindex-membership qindex-membership-client "${index_membership_secret}" \
   "${index_membership_state}"
 test -s "${index_membership_state}"
-echo "[anvil-qualification] one-node index assignment fixtures seeded before online growth"
+echo "[keldra-qualification] one-node index assignment fixtures seeded before online growth"
 
 require_qprobe_head() {
   local node="$1"
@@ -1454,7 +1454,7 @@ head_blake3() {
 
 complete_blob_path() {
   local hash="$1"
-  printf '/var/lib/anvil/blobs/%s/%s\n' "${hash:0:2}" "${hash}"
+  printf '/var/lib/keldra/blobs/%s/%s\n' "${hash:0:2}" "${hash}"
 }
 
 move_complete_blob() {
@@ -1481,7 +1481,7 @@ restore_complete_blob() {
 shard_path_on_node() {
   local node="$1"
   local hash="$2"
-  local directory="/var/lib/anvil/blobs/${hash:0:2}"
+  local directory="/var/lib/keldra/blobs/${hash:0:2}"
   local -a paths=()
   mapfile -t paths < <(
     compose exec -T --user 0 "${node}" \
@@ -1529,53 +1529,53 @@ chmod 0444 \
   "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-large.bin" \
   "${ANVIL_QUALIFICATION_DIR}/artifacts/one-node-replicated-rejected.bin"
 expect_failure "one-node REPLICATED large Put" \
-  run_cli anvil-1 qprobe-client "${qprobe_secret}" \
+  run_cli keldra-1 qprobe-client "${qprobe_secret}" \
     put qprobe objects growth/replicated-must-fail.bin \
       /qualification/artifacts/one-node-replicated-rejected.bin \
       --command-id qprobe-one-node-replicated-rejected \
       --durability replicated --if-absent
-rejected_head="$(run_cli anvil-1 qprobe-client "${qprobe_secret}" \
+rejected_head="$(run_cli keldra-1 qprobe-client "${qprobe_secret}" \
   head qprobe objects growth/replicated-must-fail.bin)"
 if [[ "${rejected_head}" != "never-existed" ]]; then
   echo "failed one-node REPLICATED Put published an object head: ${rejected_head}" >&2
   exit 1
 fi
-echo "[anvil-qualification] one-node REPLICATED large Put failed closed without a head"
-run_cli anvil-1 qprobe-client \
+echo "[keldra-qualification] one-node REPLICATED large Put failed closed without a head"
+run_cli keldra-1 qprobe-client \
   "${qprobe_secret}" \
   put qprobe objects growth/from-one.bin \
     /qualification/artifacts/growth-large.bin \
     --command-id qprobe-growth-one --durability local >/dev/null
-growth_one_head="$(run_cli anvil-1 qprobe-client "${qprobe_secret}" \
+growth_one_head="$(run_cli keldra-1 qprobe-client "${qprobe_secret}" \
   head qprobe objects growth/from-one.bin)"
-run_cli anvil-1 qprobe-client \
+run_cli keldra-1 qprobe-client \
   "${qprobe_secret}" \
   get qprobe objects growth/from-one.bin \
     --output /qualification/artifacts/growth-one-read.bin
 cmp "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-large.bin" \
   "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-one-read.bin"
-echo "[anvil-qualification] one-node large-object read passed"
+echo "[keldra-qualification] one-node large-object read passed"
 
 # Restart the exact installation that will grow. This proves the durable
 # one-node representation and reference-journal recovery before ADD begins.
-compose restart anvil-1
-wait_for_node anvil-1
+compose restart keldra-1
+wait_for_node keldra-1
 rm -f "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-one-read.bin"
-run_cli anvil-1 qprobe-client \
+run_cli keldra-1 qprobe-client \
   "${qprobe_secret}" \
   get qprobe objects growth/from-one.bin \
     --output /qualification/artifacts/growth-one-read.bin
 cmp "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-large.bin" \
   "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-one-read.bin"
-require_qprobe_head anvil-1 growth/from-one.bin "${growth_one_head}"
-echo "[anvil-qualification] one-node large object survived restart before growth"
+require_qprobe_head keldra-1 growth/from-one.bin "${growth_one_head}"
+echo "[keldra-qualification] one-node large object survived restart before growth"
 
 prepare_and_start_node 2
-membership_two_endpoints="$(public_endpoint_for anvil-1),$(public_endpoint_for anvil-2)"
+membership_two_endpoints="$(public_endpoint_for keldra-1),$(public_endpoint_for keldra-2)"
 run_live_builder_reassignment_qualification \
-  2 "${membership_two_endpoints}" anvil-2
+  2 "${membership_two_endpoints}" keldra-2
 
-growth_one_two_node_head="$(run_cli anvil-2 qprobe-client "${qprobe_secret}" \
+growth_one_two_node_head="$(run_cli keldra-2 qprobe-client "${qprobe_secret}" \
   head qprobe objects growth/from-one.bin)"
 if [[ "${growth_one_two_node_head}" != "${growth_one_head}" ]]; then
   echo "node 2 observed another head for the one-node object after ADD" >&2
@@ -1584,17 +1584,17 @@ if [[ "${growth_one_two_node_head}" != "${growth_one_head}" ]]; then
   exit 1
 fi
 growth_one_hash="$(head_blake3 "${growth_one_two_node_head}")"
-move_complete_blob anvil-1 "${growth_one_hash}"
+move_complete_blob keldra-1 "${growth_one_hash}"
 rm -f "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-one-read.bin"
-run_cli anvil-2 qprobe-client \
+run_cli keldra-2 qprobe-client \
   "${qprobe_secret}" \
   get qprobe objects growth/from-one.bin \
     --output /qualification/artifacts/growth-one-read.bin
-restore_complete_blob anvil-1 "${growth_one_hash}"
+restore_complete_blob keldra-1 "${growth_one_hash}"
 cmp "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-large.bin" \
   "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-one-read.bin"
-require_qprobe_head anvil-2 growth/from-one.bin "${growth_one_head}"
-echo "[anvil-qualification] two-node read succeeded without node 1's complete blob"
+require_qprobe_head keldra-2 growth/from-one.bin "${growth_one_head}"
+echo "[keldra-qualification] two-node read succeeded without node 1's complete blob"
 
 # Use a different content identity so this is a real two-node payload write,
 # not a second logical reference to the preexisting deduplicated blob.
@@ -1605,41 +1605,41 @@ printf '\001' | dd \
   of="${ANVIL_QUALIFICATION_DIR}/artifacts/growth-two-large.bin" \
   bs=1 seek=0 count=1 conv=notrunc status=none
 chmod 0444 "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-two-large.bin"
-run_cli anvil-2 qprobe-client \
+run_cli keldra-2 qprobe-client \
   "${qprobe_secret}" \
   put qprobe objects growth/from-two.bin \
     /qualification/artifacts/growth-two-large.bin \
     --command-id qprobe-growth-two --durability replicated >/dev/null
-growth_two_head="$(run_cli anvil-2 qprobe-client "${qprobe_secret}" \
+growth_two_head="$(run_cli keldra-2 qprobe-client "${qprobe_secret}" \
   head qprobe objects growth/from-two.bin)"
 growth_two_hash="$(head_blake3 "${growth_two_head}")"
-move_complete_blob anvil-2 "${growth_two_hash}"
-run_cli anvil-1 qprobe-client \
+move_complete_blob keldra-2 "${growth_two_hash}"
+run_cli keldra-1 qprobe-client \
   "${qprobe_secret}" \
   get qprobe objects growth/from-two.bin \
     --output /qualification/artifacts/growth-two-read.bin
-restore_complete_blob anvil-2 "${growth_two_hash}"
+restore_complete_blob keldra-2 "${growth_two_hash}"
 cmp "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-two-large.bin" \
   "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-two-read.bin"
-require_qprobe_head anvil-1 growth/from-two.bin "${growth_two_head}"
-echo "[anvil-qualification] two-node REPLICATED read succeeded without its ingress copy"
+require_qprobe_head keldra-1 growth/from-two.bin "${growth_two_head}"
+echo "[keldra-qualification] two-node REPLICATED read succeeded without its ingress copy"
 
-start_source_journal_phase "${pressure_source_journal_max_entries}" anvil-1 anvil-2
-echo "[anvil-qualification] topology handoff passed; cutover and pressure phases use source-journal max entries ${pressure_source_journal_max_entries}"
-prepare_no_event_membership_cutover_qualification anvil-2 2 qprobe-client "${qprobe_secret}" qprobe objects "${pressure_source_journal_max_entries}"
+start_source_journal_phase "${pressure_source_journal_max_entries}" keldra-1 keldra-2
+echo "[keldra-qualification] topology handoff passed; cutover and pressure phases use source-journal max entries ${pressure_source_journal_max_entries}"
+prepare_no_event_membership_cutover_qualification keldra-2 2 qprobe-client "${qprobe_secret}" qprobe objects "${pressure_source_journal_max_entries}"
 prepare_joining_node 3
 prepare_indexed_membership_cutover_qualification \
-  anvil-1 1 anvil-2 qindex-membership \
+  keldra-1 1 keldra-2 qindex-membership \
   qindex-membership-client "${index_membership_secret}" \
   "${index_membership_state}" "${pressure_source_journal_max_entries}"
 start_prepared_node_during_indexed_cutover 3
-qualify_no_event_membership_cutover anvil-2 2 qprobe-client "${qprobe_secret}" qprobe objects "${pressure_source_journal_max_entries}"
-membership_three_endpoints="$(public_endpoint_for anvil-1),$(public_endpoint_for anvil-2),$(public_endpoint_for anvil-3)"
+qualify_no_event_membership_cutover keldra-2 2 qprobe-client "${qprobe_secret}" qprobe objects "${pressure_source_journal_max_entries}"
+membership_three_endpoints="$(public_endpoint_for keldra-1),$(public_endpoint_for keldra-2),$(public_endpoint_for keldra-3)"
 run_live_builder_reassignment_qualification \
-  3 "${membership_three_endpoints}" anvil-3
+  3 "${membership_three_endpoints}" keldra-3
 
 declare -a moved_complete_blobs=()
-for growth_node in anvil-1 anvil-2 anvil-3; do
+for growth_node in keldra-1 keldra-2 keldra-3; do
   for growth_hash in "${growth_one_hash}" "${growth_two_hash}"; do
     growth_complete_path="$(complete_blob_path "${growth_hash}")"
     if compose exec -T --user 0 "${growth_node}" test -f "${growth_complete_path}"; then
@@ -1652,7 +1652,7 @@ for growth_node in anvil-1 anvil-2 anvil-3; do
   done
 done
 
-for unavailable_node in anvil-1 anvil-2 anvil-3; do
+for unavailable_node in keldra-1 keldra-2 keldra-3; do
   declare -a moved_shards=()
   for growth_hash in "${growth_one_hash}" "${growth_two_hash}"; do
     moved_shards+=("$(move_shard "${unavailable_node}" "${growth_hash}")")
@@ -1664,7 +1664,7 @@ for unavailable_node in anvil-1 anvil-2 anvil-3; do
     esac
     growth_output="${ANVIL_QUALIFICATION_DIR}/artifacts/growth-without-${unavailable_node}-${growth_object}.bin"
     rm -f "${growth_output}"
-    run_cli anvil-1 qprobe-client \
+    run_cli keldra-1 qprobe-client \
       "${qprobe_secret}" \
       get qprobe objects "growth/${growth_object}.bin" \
         --output "/qualification/artifacts/growth-without-${unavailable_node}-${growth_object}.bin"
@@ -1674,7 +1674,7 @@ for unavailable_node in anvil-1 anvil-2 anvil-3; do
       from-two) growth_expected_head="${growth_two_head}" ;;
     esac
     require_qprobe_head \
-      anvil-1 "growth/${growth_object}.bin" "${growth_expected_head}"
+      keldra-1 "growth/${growth_object}.bin" "${growth_expected_head}"
   done
   for moved_shard in "${moved_shards[@]}"; do
     restore_shard "${unavailable_node}" "${moved_shard}"
@@ -1684,35 +1684,35 @@ for moved_complete_blob in "${moved_complete_blobs[@]}"; do
   read -r growth_node growth_hash <<<"${moved_complete_blob}"
   restore_complete_blob "${growth_node}" "${growth_hash}"
 done
-echo "[anvil-qualification] three-node 2+1 reads preserved both large object heads and bytes without complete copies after every one-shard loss"
+echo "[keldra-qualification] three-node 2+1 reads preserved both large object heads and bytes without complete copies after every one-shard loss"
 
-echo "[anvil-qualification] three-node cluster is ACTIVE"
+echo "[keldra-qualification] three-node cluster is ACTIVE"
 case "${index_resource_scope}" in
   release-corpus)
-    echo "[anvil-qualification] index resource scope=release-corpus records=839980 indexed_fields=12"
+    echo "[keldra-qualification] index resource scope=release-corpus records=839980 indexed_fields=12"
     ;;
   smoke)
-    echo "[anvil-qualification] index resource scope=smoke records=${index_resource_records}; this does not satisfy the required 839980-record release-resource gate"
+    echo "[keldra-qualification] index resource scope=smoke records=${index_resource_records}; this does not satisfy the required 839980-record release-resource gate"
     ;;
   custom)
-    echo "[anvil-qualification] index resource scope=custom records=${index_resource_records}; this does not satisfy the required 839980-record release-resource gate"
+    echo "[keldra-qualification] index resource scope=custom records=${index_resource_records}; this does not satisfy the required 839980-record release-resource gate"
     ;;
 esac
 
 public_endpoints=()
-for index_node in anvil-1 anvil-2 anvil-3; do
+for index_node in keldra-1 keldra-2 keldra-3; do
   public_endpoints+=("$(public_endpoint_for "${index_node}")")
 done
 
 index_pressure_secret=qualification-index-pressure-secret-000000000000000000
 provision_tenant qindex-pressure qindex-pressure-client "${index_pressure_secret}"
 run_journal_pressure_qualification
-for pressure_node in anvil-1 anvil-2 anvil-3; do
+for pressure_node in keldra-1 keldra-2 keldra-3; do
   preserve_qualification_log \
     "${ANVIL_QUALIFICATION_DIR}/artifacts/index-pressure-${pressure_node}.log" \
     "${journal_pressure_evidence_prefix}-${pressure_node}.log"
 done
-echo "[anvil-qualification] preserved journal-pressure evidence ${journal_pressure_evidence_prefix}-anvil-{1,2,3}.log"
+echo "[keldra-qualification] preserved journal-pressure evidence ${journal_pressure_evidence_prefix}-keldra-{1,2,3}.log"
 start_release_source_journal_phase "${release_source_journal_max_entries}"
 
 index_secret=qualification-index-secret-00000000000000000000000
@@ -1727,7 +1727,7 @@ ANVIL_INDEX_QUALIFICATION_STATE_OUTPUT="${index_verification_state}" \
   "${qualification_binaries[cluster_index_qualification]}"
 test -s "${index_verification_state}"
 save_index_qualification_logs
-echo "[anvil-qualification] distributed index qualification passed"
+echo "[keldra-qualification] distributed index qualification passed"
 assert_one_builder_published_and_compacted_each_index_kind
 
 configure_three_node_resource_qualification
@@ -1745,7 +1745,7 @@ ANVIL_ACCOUNTING_QUALIFICATION_BUCKET="accounting-three-${$}" \
 ANVIL_ACCOUNTING_QUALIFICATION_CLIENT_ID=qaccounting-client \
 ANVIL_ACCOUNTING_QUALIFICATION_CLIENT_SECRET="${accounting_secret}" \
   "${qualification_binaries[accounting_qualification]}"
-echo "[anvil-qualification] distributed accounting qualification passed"
+echo "[keldra-qualification] distributed accounting qualification passed"
 
 personaldb_secret=qualification-personaldb-secret-0000000000000000000
 provision_tenant qpersonaldb qpersonaldb-client "${personaldb_secret}"
@@ -1754,7 +1754,7 @@ ANVIL_PERSONALDB_QUALIFICATION_TENANT=qpersonaldb \
 ANVIL_PERSONALDB_QUALIFICATION_CLIENT_ID=qpersonaldb-client \
 ANVIL_PERSONALDB_QUALIFICATION_CLIENT_SECRET="${personaldb_secret}" \
   "${qualification_binaries[personaldb_qualification]}"
-echo "[anvil-qualification] distributed PersonalDB qualification passed"
+echo "[keldra-qualification] distributed PersonalDB qualification passed"
 
 s3_secret=qualification-s3-secret-00000000000000000000000000
 provision_tenant qs3 qs3-client "${s3_secret}"
@@ -1763,31 +1763,31 @@ ANVIL_S3_QUALIFICATION_CLIENT_ID=qs3-client \
 ANVIL_S3_QUALIFICATION_CLIENT_SECRET="${s3_secret}" \
 ANVIL_S3_QUALIFICATION_BUCKET="s3-three-${$}" \
   "${qualification_binaries[s3_qualification]}"
-echo "[anvil-qualification] distributed official AWS SDK S3 qualification passed"
+echo "[keldra-qualification] distributed official AWS SDK S3 qualification passed"
 run_git_qualification
 
 cas_secret=qualification-cas-secret-000000000000000000000000
 provision_tenant qcas qcas-client "${cas_secret}"
-create_bucket anvil-2 qcas-client "${cas_secret}" objects
+create_bucket keldra-2 qcas-client "${cas_secret}" objects
 printf 'three-node-cas\n' >"${ANVIL_QUALIFICATION_DIR}/artifacts/cas.txt"
 chmod 0444 "${ANVIL_QUALIFICATION_DIR}/artifacts/cas.txt"
-run_cli anvil-1 qcas-client "${cas_secret}" \
+run_cli keldra-1 qcas-client "${cas_secret}" \
   put qcas objects cas/value.txt /qualification/artifacts/cas.txt \
   --command-id qcas-first --if-absent >/dev/null
 expect_failure "second PutIfAbsent" \
-  run_cli anvil-3 qcas-client "${cas_secret}" \
+  run_cli keldra-3 qcas-client "${cas_secret}" \
   put qcas objects cas/value.txt /qualification/artifacts/cas.txt \
   --command-id qcas-second --if-absent
-run_cli anvil-2 qcas-client "${cas_secret}" \
+run_cli keldra-2 qcas-client "${cas_secret}" \
   get qcas objects cas/value.txt \
   --output /qualification/artifacts/cas-read.txt
 cmp "${ANVIL_QUALIFICATION_DIR}/artifacts/cas.txt" \
   "${ANVIL_QUALIFICATION_DIR}/artifacts/cas-read.txt"
-echo "[anvil-qualification] cross-node CAS test passed"
+echo "[keldra-qualification] cross-node CAS test passed"
 
 version_secret=qualification-version-secret-00000000000000000000
 provision_tenant qversion qversion-client "${version_secret}"
-run_cli anvil-2 qversion-client "${version_secret}" \
+run_cli keldra-2 qversion-client "${version_secret}" \
   create-bucket objects --versioning enabled \
   | grep -Fq "bucket=objects versioning=enabled"
 printf 'retained-version-one\n' \
@@ -1795,35 +1795,35 @@ printf 'retained-version-one\n' \
 printf 'retained-version-two\n' \
   >"${ANVIL_QUALIFICATION_DIR}/artifacts/version-two.txt"
 chmod 0444 "${ANVIL_QUALIFICATION_DIR}/artifacts/version-"*.txt
-version_one="$(run_cli anvil-1 qversion-client "${version_secret}" \
+version_one="$(run_cli keldra-1 qversion-client "${version_secret}" \
   put qversion objects retained/value.txt /qualification/artifacts/version-one.txt \
   --command-id qversion-one --durability replicated)"
-version_two="$(run_cli anvil-3 qversion-client "${version_secret}" \
+version_two="$(run_cli keldra-3 qversion-client "${version_secret}" \
   put qversion objects retained/value.txt /qualification/artifacts/version-two.txt \
   --command-id qversion-two --durability replicated)"
 if [[ ! "${version_one}" =~ ^[1-9][0-9]*$ || ! "${version_two}" =~ ^[1-9][0-9]*$ ]]; then
   echo "distributed puts returned invalid versions: ${version_one}, ${version_two}" >&2
   exit 1
 fi
-old_delete="$(run_cli anvil-2 qversion-client "${version_secret}" \
+old_delete="$(run_cli keldra-2 qversion-client "${version_secret}" \
   delete-version qversion objects retained/value.txt "${version_one}" --durability replicated)"
 if [[ "${old_delete}" != 'deleted=true replacement_tombstone_version=none' ]]; then
   echo "distributed historical DeleteVersion returned: ${old_delete}" >&2
   exit 1
 fi
-run_cli anvil-1 qversion-client "${version_secret}" \
+run_cli keldra-1 qversion-client "${version_secret}" \
   get qversion objects retained/value.txt \
   --output /qualification/artifacts/version-current.txt
 cmp "${ANVIL_QUALIFICATION_DIR}/artifacts/version-two.txt" \
   "${ANVIL_QUALIFICATION_DIR}/artifacts/version-current.txt"
-current_delete="$(run_cli anvil-3 qversion-client "${version_secret}" \
+current_delete="$(run_cli keldra-3 qversion-client "${version_secret}" \
   delete-version qversion objects retained/value.txt "${version_two}" --durability replicated)"
 if [[ ! "${current_delete}" =~ ^deleted=true\ replacement_tombstone_version=([1-9][0-9]*)$ ]]; then
   echo "distributed current DeleteVersion returned: ${current_delete}" >&2
   exit 1
 fi
 replacement_tombstone_version="${BASH_REMATCH[1]}"
-for version_node in anvil-1 anvil-2 anvil-3; do
+for version_node in keldra-1 keldra-2 keldra-3; do
   version_head="$(run_cli "${version_node}" qversion-client "${version_secret}" \
     head qversion objects retained/value.txt)"
   if [[ "${version_head}" != "deleted version=${replacement_tombstone_version}" ]]; then
@@ -1831,25 +1831,25 @@ for version_node in anvil-1 anvil-2 anvil-3; do
     exit 1
   fi
 done
-echo "[anvil-qualification] distributed retained-version deletion test passed"
+echo "[keldra-qualification] distributed retained-version deletion test passed"
 
 list_secret=qualification-list-secret-00000000000000000000000
 provision_tenant qlist qlist-client "${list_secret}"
-create_bucket anvil-3 qlist-client "${list_secret}" objects
+create_bucket keldra-3 qlist-client "${list_secret}" objects
 printf 'cluster-list\n' >"${ANVIL_QUALIFICATION_DIR}/artifacts/list.txt"
 chmod 0444 "${ANVIL_QUALIFICATION_DIR}/artifacts/list.txt"
 for item in alpha bravo charlie delta; do
   case "${item}" in
-    alpha) list_node=anvil-1 ;;
-    bravo) list_node=anvil-2 ;;
-    charlie|delta) list_node=anvil-3 ;;
+    alpha) list_node=keldra-1 ;;
+    bravo) list_node=keldra-2 ;;
+    charlie|delta) list_node=keldra-3 ;;
   esac
   run_cli "${list_node}" qlist-client "${list_secret}" \
     put qlist objects "prefix/${item}.txt" /qualification/artifacts/list.txt \
     --command-id "qlist-${item}" --durability replicated >/dev/null
 done
 expected_list=$'prefix/alpha.txt\nprefix/bravo.txt\nprefix/charlie.txt\nprefix/delta.txt'
-for list_node in anvil-1 anvil-2 anvil-3; do
+for list_node in keldra-1 keldra-2 keldra-3; do
   actual_list="$(run_cli "${list_node}" qlist-client "${list_secret}" \
     list qlist objects --prefix prefix/ --limit 100)"
   if [[ "${actual_list}" != "${expected_list}" ]]; then
@@ -1858,18 +1858,18 @@ for list_node in anvil-1 anvil-2 anvil-3; do
     exit 1
   fi
 done
-page_one="$(run_cli anvil-2 qlist-client "${list_secret}" \
+page_one="$(run_cli keldra-2 qlist-client "${list_secret}" \
   list qlist objects --prefix prefix/ --limit 2 2>/dev/null)"
-page_two="$(run_cli anvil-1 qlist-client "${list_secret}" \
+page_two="$(run_cli keldra-1 qlist-client "${list_secret}" \
   list qlist objects --prefix prefix/ --start-after prefix/bravo.txt --limit 2)"
 if [[ "${page_one}" != $'prefix/alpha.txt\nprefix/bravo.txt' \
   || "${page_two}" != $'prefix/charlie.txt\nprefix/delta.txt' ]]; then
   echo "distributed ListObjects pagination is incorrect" >&2
   exit 1
 fi
-echo "[anvil-qualification] distributed listing and pagination test passed"
+echo "[keldra-qualification] distributed listing and pagination test passed"
 
-watch_paths="$(run_cli anvil-3 qlist-client "${list_secret}" \
+watch_paths="$(run_cli keldra-3 qlist-client "${list_secret}" \
   watch qlist objects --prefix prefix --retained --events 4 \
   --idle-timeout-seconds 30 \
   | cut -f2 | sort)"
@@ -1878,7 +1878,7 @@ if [[ "${watch_paths}" != "${expected_list}" ]]; then
   printf 'expected:\n%s\nactual:\n%s\n' "${expected_list}" "${watch_paths}" >&2
   exit 1
 fi
-echo "[anvil-qualification] distributed retained watch test passed"
+echo "[keldra-qualification] distributed retained watch test passed"
 
 atomic_secret=qualification-atomic-secret-000000000000000000000
 provision_tenant qatomic qatomic-client "${atomic_secret}"
@@ -1886,30 +1886,30 @@ run_atomic_index_qualification
 
 ec_secret=qualification-ec-secret-0000000000000000000000000
 provision_tenant qec qec-client "${ec_secret}"
-create_bucket anvil-3 qec-client "${ec_secret}" objects
+create_bucket keldra-3 qec-client "${ec_secret}" objects
 dd if=/dev/urandom of="${ANVIL_QUALIFICATION_DIR}/artifacts/large.bin" \
   bs=1M count=2 status=none
 chmod 0444 "${ANVIL_QUALIFICATION_DIR}/artifacts/large.bin"
-run_cli anvil-2 qec-client "${ec_secret}" \
+run_cli keldra-2 qec-client "${ec_secret}" \
   put qec objects ec/large.bin /qualification/artifacts/large.bin \
   --command-id qec-replicated --durability replicated >/dev/null
-run_cli anvil-1 qec-client "${ec_secret}" \
+run_cli keldra-1 qec-client "${ec_secret}" \
   get qec objects ec/large.bin \
   --output /qualification/artifacts/large-read.bin
 cmp "${ANVIL_QUALIFICATION_DIR}/artifacts/large.bin" \
   "${ANVIL_QUALIFICATION_DIR}/artifacts/large-read.bin"
-echo "[anvil-qualification] 2+1 replicated payload test passed"
+echo "[keldra-qualification] 2+1 replicated payload test passed"
 
 restart_secret=qualification-restart-secret-000000000000000000000
 provision_tenant qrestart qrestart-client "${restart_secret}"
-create_bucket anvil-1 qrestart-client "${restart_secret}" objects
+create_bucket keldra-1 qrestart-client "${restart_secret}" objects
 printf 'survives-rolling-restart\n' \
   >"${ANVIL_QUALIFICATION_DIR}/artifacts/restart.txt"
 chmod 0444 "${ANVIL_QUALIFICATION_DIR}/artifacts/restart.txt"
-run_cli anvil-3 qrestart-client "${restart_secret}" \
+run_cli keldra-3 qrestart-client "${restart_secret}" \
   put qrestart objects restart/value.txt /qualification/artifacts/restart.txt \
   --command-id qrestart-seed --durability replicated >/dev/null
-for node in anvil-1 anvil-2 anvil-3; do
+for node in keldra-1 keldra-2 keldra-3; do
   sparse_starts_before="$(index_sparse_start_count "${node}")"
   populated_restart_started="${SECONDS}"
   compose restart "${node}"
@@ -1919,7 +1919,7 @@ for node in anvil-1 anvil-2 anvil-3; do
     exit 1
   fi
   service_logs "${node}" | preserve_startup_scan_evidence \
-    "/var/tmp/anvil-v090-three-startup-scans-${qualification_suffix}-${node}.log"
+    "/var/tmp/keldra-v090-three-startup-scans-${qualification_suffix}-${node}.log"
   assert_sparse_index_startup "${node}" "$((sparse_starts_before + 1))"
   rm -f "${ANVIL_QUALIFICATION_DIR}/artifacts/restart-read.txt"
   run_cli "${node}" qrestart-client "${restart_secret}" \
@@ -1929,7 +1929,7 @@ for node in anvil-1 anvil-2 anvil-3; do
     "${ANVIL_QUALIFICATION_DIR}/artifacts/restart-read.txt"
   verify_existing_indexes
   verify_index_resource_state "$(public_endpoint_for "${node}")"
-  echo "[anvil-qualification] ${node} restart preserved every final complete index generation through all public endpoints"
+  echo "[keldra-qualification] ${node} restart preserved every final complete index generation through all public endpoints"
   for growth_object in from-one from-two; do
     case "${growth_object}" in
       from-one)
@@ -1951,12 +1951,12 @@ for node in anvil-1 anvil-2 anvil-3; do
       "${node}" "growth/${growth_object}.bin" "${growth_expected_head}"
   done
 done
-echo "[anvil-qualification] rolling populated restart preserved objects and indexes; sparse startup markers were present and no legacy definition barrier was reported"
+echo "[keldra-qualification] rolling populated restart preserved objects and indexes; sparse startup markers were present and no legacy definition barrier was reported"
 assert_index_retention_converged
 assert_zero_accounting_traffic_drops
 
 if [[ "${qualification_mode}" == "release" ]]; then
-  echo "[anvil-qualification] PASS scope=release-corpus records=${index_resource_records} image=${image_id} platform=${ANVIL_DOCKER_PLATFORM}"
+  echo "[keldra-qualification] PASS scope=release-corpus records=${index_resource_records} image=${image_id} platform=${ANVIL_DOCKER_PLATFORM}"
 else
-  echo "[anvil-qualification] SMOKE PASS records=${index_resource_records} image=${image_id} platform=${ANVIL_DOCKER_PLATFORM}"
+  echo "[keldra-qualification] SMOKE PASS records=${index_resource_records} image=${image_id} platform=${ANVIL_DOCKER_PLATFORM}"
 fi

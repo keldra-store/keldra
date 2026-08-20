@@ -21,7 +21,7 @@ The normal Linux release graph was recorded with:
 
 ```sh
 cargo tree --locked -p sux --edges normal
-cargo tree --locked -p anvil-index --edges features
+cargo tree --locked -p keldra-index --edges features
 ```
 
 The resolved `sux` closure is listed below. License expressions are copied from

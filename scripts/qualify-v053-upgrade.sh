@@ -39,9 +39,9 @@ if [[ "${legacy_id}" == "${candidate_id}" ]]; then
   exit 2
 fi
 
-qualification_dir="$(mktemp -d /tmp/anvil-v053-upgrade-qualification.XXXXXX)"
+qualification_dir="$(mktemp -d /tmp/keldra-v053-upgrade-qualification.XXXXXX)"
 qualification_suffix="${qualification_dir##*.}"
-container_name="anvil-v053-upgrade-${qualification_suffix}"
+container_name="keldra-v053-upgrade-${qualification_suffix}"
 data_dir="${qualification_dir}/data"
 artifacts_dir="${qualification_dir}/artifacts"
 signing_key="${qualification_dir}/token-signing-key"
@@ -52,19 +52,19 @@ cleanup() {
   trap - EXIT INT TERM
 
   if ((container_started == 1)) && ((status != 0)); then
-    echo "[anvil-v053-upgrade] FAILED; container logs follow" >&2
+    echo "[keldra-v053-upgrade] FAILED; container logs follow" >&2
     docker logs "${container_name}" >&2 || true
   fi
   if [[ "${keep}" == "1" ]]; then
-    echo "[anvil-v053-upgrade] retained container ${container_name}" >&2
-    echo "[anvil-v053-upgrade] retained files ${qualification_dir}" >&2
+    echo "[keldra-v053-upgrade] retained container ${container_name}" >&2
+    echo "[keldra-v053-upgrade] retained files ${qualification_dir}" >&2
     exit "${status}"
   fi
 
   if ((container_started == 1)); then
     docker rm --force "${container_name}" >/dev/null 2>&1 || true
   fi
-  if [[ "${qualification_dir}" == /tmp/anvil-v053-upgrade-qualification.* ]]; then
+  if [[ "${qualification_dir}" == /tmp/keldra-v053-upgrade-qualification.* ]]; then
     docker run --rm --user 0 \
       --volume "${qualification_dir}:/qualification" \
       "${legacy_id}" rm -rf \
@@ -106,13 +106,13 @@ start_server() {
     --env RUST_LOG="${RUST_LOG:-info}" \
     --env ANVIL_LISTEN=0.0.0.0:50051 \
     --env ANVIL_PEER_LISTEN=127.0.0.1:50052 \
-    --env ANVIL_DATA_DIR=/var/lib/anvil \
+    --env ANVIL_DATA_DIR=/var/lib/keldra \
     --env ANVIL_NODE_ID=1 \
-    --env ANVIL_TOKEN_SIGNING_KEY_FILE=/run/secrets/anvil-token-signing-key \
+    --env ANVIL_TOKEN_SIGNING_KEY_FILE=/run/secrets/keldra-token-signing-key \
     --env ANVIL_RUN_SYSTEM_BOOTSTRAP=true \
-    --volume "${data_dir}:/var/lib/anvil" \
+    --volume "${data_dir}:/var/lib/keldra" \
     --volume "${artifacts_dir}:/qualification/artifacts" \
-    --volume "${signing_key}:/run/secrets/anvil-token-signing-key:ro" \
+    --volume "${signing_key}:/run/secrets/keldra-token-signing-key:ro" \
     "${image_id}" >/dev/null
   container_started=1
 }
@@ -127,7 +127,7 @@ wait_for_bootstrap() {
   local attempt
   for attempt in $(seq 1 90); do
     if docker exec "${container_name}" \
-      test -f /var/lib/anvil/system-bootstrap-credential.json \
+      test -f /var/lib/keldra/system-bootstrap-credential.json \
       >/dev/null 2>&1
     then
       return 0
@@ -151,8 +151,8 @@ provision_owner() {
     if output="$(ANVIL_NEW_CLIENT_SECRET="${owner_secret}" docker exec \
       --env ANVIL_NEW_CLIENT_SECRET \
       "${container_name}" \
-      anvil --endpoint http://127.0.0.1:50051 \
-        --credentials-file /var/lib/anvil/system-bootstrap-credential.json \
+      keldra --endpoint http://127.0.0.1:50051 \
+        --credentials-file /var/lib/keldra/system-bootstrap-credential.json \
         provision-tenant "${tenant}" "${owner_app}" "${owner_client}" 2>&1)"
     then
       if grep -Fq "tenant=${tenant}" <<<"${output}"; then
@@ -179,7 +179,7 @@ run_owner_cli() {
     --env "ANVIL_CLIENT_ID=${owner_client}" \
     --env "ANVIL_CLIENT_SECRET=${owner_secret}" \
     "${container_name}" \
-    anvil --endpoint http://127.0.0.1:50051 "$@"
+    keldra --endpoint http://127.0.0.1:50051 "$@"
 }
 
 wait_for_owner_access() {
@@ -217,7 +217,7 @@ docker cp "${container_name}:/tmp/legacy-small-read.txt" \
   "${artifacts_dir}/legacy-small-before-upgrade.txt"
 cmp "${artifacts_dir}/legacy-small.txt" \
   "${artifacts_dir}/legacy-small-before-upgrade.txt"
-echo "[anvil-v053-upgrade] released 0.5.3 legacy object created"
+echo "[keldra-v053-upgrade] released 0.5.3 legacy object created"
 
 stop_server
 start_server "${candidate_id}"
@@ -228,7 +228,7 @@ docker cp "${container_name}:/tmp/legacy-small-after-upgrade.txt" \
   "${artifacts_dir}/legacy-small-after-upgrade.txt"
 cmp "${artifacts_dir}/legacy-small.txt" \
   "${artifacts_dir}/legacy-small-after-upgrade.txt"
-echo "[anvil-v053-upgrade] candidate recovered the legacy proofless journal"
+echo "[keldra-v053-upgrade] candidate recovered the legacy proofless journal"
 
 run_owner_cli put "${tenant}" "${bucket}" candidate/large.bin \
   /qualification/artifacts/candidate-large.bin \
@@ -249,4 +249,4 @@ docker cp "${container_name}:/tmp/candidate-large-after-restart.bin" \
 cmp "${artifacts_dir}/candidate-large.bin" \
   "${artifacts_dir}/candidate-large-after-restart.bin"
 
-echo "[anvil-v053-upgrade] PASS legacy=${legacy_id} candidate=${candidate_id} platform=${platform}"
+echo "[keldra-v053-upgrade] PASS legacy=${legacy_id} candidate=${candidate_id} platform=${platform}"

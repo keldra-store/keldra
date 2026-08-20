@@ -1,0 +1,629 @@
+syntax = "proto3";
+
+package keldra.data_peer.v1;
+
+// Every private operation carries the caller identity asserted by its mTLS
+// certificate. The server rechecks this tuple against freshly applied cluster
+// state for every RPC.
+message PeerContext {
+  uint32 schema_version = 1;
+  bytes cluster_id = 2;
+  uint64 source_node_id = 3;
+}
+
+// One exact in-progress ADD transition. Handoff RPCs are valid only while the
+// authenticated caller is the current Raft leader and this exact transition
+// remains locally applied.
+message HandoffScope {
+  uint64 joining_node_id = 1;
+  uint64 started_log_index = 2;
+}
+
+message MutationDrainRequest {
+  PeerContext peer = 1;
+  HandoffScope handoff = 2;
+}
+
+message MutationDrained {
+  uint32 schema_version = 1;
+}
+
+message TypedMutationRequest {
+  PeerContext peer = 1;
+  bytes mutation_json = 2;
+}
+
+// One bounded set of coordinator-produced mutations for the same exact
+// metadata replica group and placement fence. The receiver recomputes both
+// properties from every typed mutation before applying the batch.
+message TypedMutationBatchRequest {
+  PeerContext peer = 1;
+  repeated bytes mutation_json = 2;
+}
+
+message ObjectMutationApplied {
+  uint32 schema_version = 1;
+  uint64 version = 2;
+  bool replayed = 3;
+}
+
+message ObjectMutationBatchApplied {
+  uint32 schema_version = 1;
+  repeated ObjectMutationApplied outcomes = 2;
+}
+
+message RetainedVersionDeleteApplied {
+  uint32 schema_version = 1;
+  bytes outcome_json = 2;
+  bool replayed = 3;
+}
+
+message ObjectPathSnapshotRequest {
+  PeerContext peer = 1;
+  uint64 tenant_id = 2;
+  uint64 bucket_id = 3;
+  string exact_path = 4;
+}
+
+// `snapshot_json` is the typed JSON encoding of
+// `Option<keldra_store::ObjectPathSnapshot>`; JSON null means the path is
+// absent. It never contains raw RocksDB keys or values.
+message ObjectPathSnapshotResponse {
+  uint32 schema_version = 1;
+  bytes snapshot_json = 2;
+}
+
+// `snapshot_json` is the typed JSON encoding of
+// `Option<keldra_store::CurrentObjectSnapshot>`; it contains exactly the
+// current head and the immutable descriptor named by that head.
+message CurrentObjectSnapshotResponse {
+  uint32 schema_version = 1;
+  bytes snapshot_json = 2;
+}
+
+// One bounded, ordered exact-current read for paths in the same stable
+// tenant/bucket. `snapshots_json` encodes
+// `Vec<Option<keldra_store::CurrentObjectSnapshot>>` in request order.
+message CurrentObjectSnapshotBatchRequest {
+  PeerContext peer = 1;
+  uint64 tenant_id = 2;
+  uint64 bucket_id = 3;
+  repeated string exact_paths = 4;
+}
+
+message CurrentObjectSnapshotBatchResponse {
+  uint32 schema_version = 1;
+  bytes snapshots_json = 2;
+}
+
+message RepairObjectPathSnapshotRequest {
+  PeerContext peer = 1;
+  uint64 tenant_id = 2;
+  uint64 bucket_id = 3;
+  string exact_path = 4;
+  bytes expected_snapshot_json = 5;
+  bytes selected_snapshot_json = 6;
+  uint64 placement_fence_term = 7;
+  uint64 placement_fence_index = 8;
+}
+
+message ObjectPathSnapshotApplied {
+  uint32 schema_version = 1;
+  bool present = 2;
+  uint64 version = 3;
+  bool replayed = 4;
+}
+
+message AuthzRealmMutationApplied {
+  uint32 schema_version = 1;
+  uint64 revision = 2;
+  bool replayed = 3;
+}
+
+message ReferenceDeltaApplied {
+  uint32 schema_version = 1;
+  uint64 through = 2;
+  bool replayed = 3;
+}
+
+message ReferenceDeltaStatusRequest {
+  PeerContext peer = 1;
+  bytes source_id_json = 2;
+}
+
+message ReferenceDeltaStatus {
+  uint32 schema_version = 1;
+  uint64 through = 2;
+}
+
+message SourceJournalStatusRequest {
+  PeerContext peer = 1;
+}
+
+message SourceJournalStatus {
+  uint32 schema_version = 1;
+  bytes source_id_json = 2;
+  uint64 tail = 3;
+  uint64 retention_floor = 4;
+  uint64 retained_entries = 5;
+  uint64 retained_bytes = 6;
+  uint64 settled_through = 7;
+}
+
+message SourceJournalReadRequest {
+  PeerContext peer = 1;
+  uint64 after_offset = 2;
+  uint32 limit = 3;
+  uint64 max_bytes = 4;
+}
+
+message SourceJournalPage {
+  uint32 schema_version = 1;
+  repeated bytes changes_json = 2;
+  uint64 encoded_bytes = 3;
+  uint64 oversize_offset = 4;
+  uint64 oversize_encoded_bytes = 5;
+  bytes source_id_json = 6;
+}
+
+enum RoutedJournalKind {
+  ROUTED_JOURNAL_KIND_UNSPECIFIED = 0;
+  ROUTED_JOURNAL_KIND_INDEX_DEFINITIONS = 1;
+  ROUTED_JOURNAL_KIND_ACCOUNTING_DEFINITIONS = 2;
+  ROUTED_JOURNAL_KIND_BUCKET = 3;
+}
+
+message RoutedSourceJournalReadRequest {
+  PeerContext peer = 1;
+  RoutedJournalKind route = 2;
+  uint64 tenant_id = 3;
+  uint64 bucket_id = 4;
+  bytes source_id_json = 5;
+  uint64 after_offset = 6;
+  uint64 target_offset = 7;
+  uint32 limit = 8;
+  uint64 max_bytes = 9;
+}
+
+message RoutedSourceJournalPage {
+  uint32 schema_version = 1;
+  repeated bytes changes_json = 2;
+  uint64 encoded_bytes = 3;
+  uint64 source_node_id = 4;
+  bytes source_epoch = 5;
+  uint64 through_offset = 6;
+  uint64 oversize_offset = 7;
+  uint64 oversize_encoded_bytes = 8;
+}
+
+enum PrivateDefinitionKind {
+  PRIVATE_DEFINITION_KIND_UNSPECIFIED = 0;
+  PRIVATE_DEFINITION_KIND_INDEX = 1;
+  PRIVATE_DEFINITION_KIND_ACCOUNTING = 2;
+}
+
+enum PrivateDefinitionConsumerKind {
+  PRIVATE_DEFINITION_CONSUMER_KIND_UNSPECIFIED = 0;
+  PRIVATE_DEFINITION_CONSUMER_KIND_INDEX_ASSIGNMENTS = 1;
+  PRIVATE_DEFINITION_CONSUMER_KIND_ACCOUNTING_ASSIGNMENTS = 2;
+}
+
+enum PrivateDerivedConsumerKind {
+  PRIVATE_DERIVED_CONSUMER_KIND_UNSPECIFIED = 0;
+  PRIVATE_DERIVED_CONSUMER_KIND_INDEX = 1;
+  PRIVATE_DERIVED_CONSUMER_KIND_ACCOUNTING = 2;
+}
+
+// One node-wide aggregate retention proof. The authenticated consumer may
+// advance only its own entry on the exact ACTIVE membership fence.
+message ApplyDerivedConsumerCheckpointRequest {
+  PeerContext peer = 1;
+  PrivateDerivedConsumerKind consumer_kind = 2;
+  uint64 source_node_id = 3;
+  bytes source_epoch = 4;
+  uint64 consumer_node_id = 5;
+  uint64 next_offset = 6;
+  uint64 observed_fence_term = 7;
+  uint64 observed_fence_index = 8;
+}
+
+message DerivedConsumerCheckpointApplied {
+  uint32 schema_version = 1;
+  PrivateDerivedConsumerKind consumer_kind = 2;
+  uint64 source_node_id = 3;
+  uint64 consumer_node_id = 4;
+  uint64 next_offset = 5;
+  uint64 observed_fence_term = 6;
+  uint64 observed_fence_index = 7;
+  uint64 index_safe_through = 8;
+  uint64 accounting_safe_through = 9;
+}
+
+enum DefinitionAssignmentOperation {
+  DEFINITION_ASSIGNMENT_OPERATION_UNSPECIFIED = 0;
+  DEFINITION_ASSIGNMENT_OPERATION_UPSERT = 1;
+  DEFINITION_ASSIGNMENT_OPERATION_REMOVE = 2;
+  DEFINITION_ASSIGNMENT_OPERATION_DELETE = 3;
+}
+
+message DefinitionAssignmentMutation {
+  DefinitionAssignmentOperation operation = 1;
+  PrivateDefinitionKind kind = 2;
+  uint64 tenant_id = 3;
+  uint64 bucket_id = 4;
+  uint64 definition_id = 5;
+  string definition_path = 6;
+  uint64 object_version = 7;
+  uint64 observed_fence_term = 8;
+  uint64 observed_fence_index = 9;
+  uint32 rank = 10;
+}
+
+message ApplyDefinitionAssignmentPageRequest {
+  PeerContext peer = 1;
+  repeated DefinitionAssignmentMutation mutations = 2;
+  PrivateDefinitionConsumerKind consumer_kind = 3;
+  uint64 source_node_id = 4;
+  bytes source_epoch = 5;
+  uint64 next_offset = 6;
+  uint64 observed_fence_term = 7;
+  uint64 observed_fence_index = 8;
+}
+
+message DefinitionAssignmentPageApplied {
+  uint32 schema_version = 1;
+  uint32 mutation_count = 2;
+}
+
+// Exact destination-side progress for one sparse definition source. The
+// source lazily reads this after restart and then caches successful advances;
+// it is not a sender-side journal or another authority.
+message DefinitionCheckpointRequest {
+  PeerContext peer = 1;
+  PrivateDefinitionConsumerKind consumer_kind = 2;
+  uint64 source_node_id = 3;
+}
+
+message DefinitionCheckpointState {
+  uint32 schema_version = 1;
+  bool present = 2;
+  PrivateDefinitionConsumerKind consumer_kind = 3;
+  uint64 source_node_id = 4;
+  bytes source_epoch = 5;
+  uint64 next_offset = 6;
+  uint64 observed_fence_term = 7;
+  uint64 observed_fence_index = 8;
+}
+
+// Membership cutover transfers only already-derived assignment records. It
+// does not advance a source checkpoint because an assignment does not retain
+// a second copy of its source-journal identity.
+message ApplyDefinitionAssignmentsRequest {
+  PeerContext peer = 1;
+  repeated DefinitionAssignmentMutation mutations = 2;
+}
+
+message DefinitionLocatorScanRequest {
+  PeerContext peer = 1;
+  PrivateDefinitionKind kind = 2;
+  uint64 tenant_id = 3;
+  uint64 bucket_id = 4;
+  bytes cursor = 5;
+  uint32 limit = 6;
+}
+
+message DefinitionLocatorRecord {
+  PrivateDefinitionKind kind = 1;
+  uint64 tenant_id = 2;
+  uint64 bucket_id = 3;
+  uint64 definition_id = 4;
+  string definition_path = 5;
+  uint64 object_version = 6;
+  PrivateDefinitionObjectState state = 7;
+}
+
+enum PrivateDefinitionObjectState {
+  PRIVATE_DEFINITION_OBJECT_STATE_UNSPECIFIED = 0;
+  PRIVATE_DEFINITION_OBJECT_STATE_LIVE = 1;
+  PRIVATE_DEFINITION_OBJECT_STATE_DELETED = 2;
+}
+
+message DefinitionLocatorScanPage {
+  uint32 schema_version = 1;
+  repeated DefinitionLocatorRecord locators = 2;
+  bytes next_cursor = 3;
+  bool has_more = 4;
+}
+
+message DefinitionLocatorKindScanRequest {
+  PeerContext peer = 1;
+  PrivateDefinitionKind kind = 2;
+  bytes cursor = 3;
+  uint32 limit = 4;
+}
+
+message DefinitionAssignmentScanRequest {
+  PeerContext peer = 1;
+  PrivateDefinitionKind kind = 2;
+  bytes cursor = 3;
+  uint32 limit = 4;
+}
+
+message DefinitionAssignmentScanPage {
+  uint32 schema_version = 1;
+  repeated DefinitionAssignmentMutation assignments = 2;
+  bytes next_cursor = 3;
+  bool has_more = 4;
+}
+
+message BlobIdentity {
+  bytes blake3 = 1;
+  uint64 length = 2;
+}
+
+message ContentRequest {
+  PeerContext peer = 1;
+  BlobIdentity blob = 2;
+}
+
+message ShardRequest {
+  PeerContext peer = 1;
+  uint32 fragment_format_version = 2;
+  BlobIdentity blob = 3;
+  uint32 ordinal = 4;
+}
+
+message ExistsResponse {
+  uint32 schema_version = 1;
+  bool exists = 2;
+}
+
+message ContentFrame {
+  uint32 schema_version = 1;
+  uint64 offset = 2;
+  bytes content = 3;
+  bool end = 4;
+}
+
+message SmallContentPutFrame {
+  PeerContext peer = 1;
+  BlobIdentity blob = 2;
+  uint64 offset = 3;
+  bytes content = 4;
+  bool end = 5;
+}
+
+message ContentStored {
+  uint32 schema_version = 1;
+}
+
+message CompleteSourcePutFrame {
+  PeerContext peer = 1;
+  BlobIdentity blob = 2;
+  uint64 offset = 3;
+  bytes content = 4;
+  bool end = 5;
+}
+
+message CompleteSourceStored {
+  uint32 schema_version = 1;
+  bool already_present = 2;
+}
+
+message ShardPutFrame {
+  ShardRequest shard = 1;
+  uint64 offset = 2;
+  bytes content = 3;
+  bool end = 4;
+}
+
+message ShardStored {
+  uint32 schema_version = 1;
+  bool already_present = 2;
+}
+
+// Bounded typed state-transfer pages. `cursor_json` is empty at the start;
+// `page_json` carries the corresponding versioned storage-kernel page type.
+message HandoffPageRequest {
+  PeerContext peer = 1;
+  bytes cursor_json = 2;
+  uint32 max_records = 3;
+  uint64 max_bytes = 4;
+  HandoffScope handoff = 5;
+}
+
+message HandoffPage {
+  uint32 schema_version = 1;
+  bytes page_json = 2;
+}
+
+message HandoffRecordRequest {
+  PeerContext peer = 1;
+  bytes record_json = 2;
+  HandoffScope handoff = 3;
+}
+
+message HandoffRecordApplied {
+  uint32 schema_version = 1;
+  bool replayed = 2;
+}
+
+message LogicalRecordRequest {
+  PeerContext peer = 1;
+  bytes id_json = 2;
+  HandoffScope handoff = 3;
+}
+
+message LogicalRecordResponse {
+  uint32 schema_version = 1;
+  bool present = 2;
+  bytes candidate_json = 3;
+}
+
+message RepairLogicalRecordRequest {
+  PeerContext peer = 1;
+  bytes id_json = 2;
+  bool present = 3;
+  bytes candidate_json = 4;
+  HandoffScope handoff = 5;
+}
+
+message AuthzRealmRequest {
+  PeerContext peer = 1;
+  bytes scope_json = 2;
+  HandoffScope handoff = 3;
+}
+
+message AuthzRealmManifest {
+  uint32 schema_version = 1;
+  bool present = 2;
+  bytes manifest_json = 3;
+}
+
+message AuthzSchemaCatalogueRequest {
+  PeerContext peer = 1;
+  string storage_tenant = 2;
+  HandoffScope handoff = 3;
+}
+
+message AuthzSchemaCatalogueResponse {
+  uint32 schema_version = 1;
+  bool present = 2;
+  bytes catalogue_json = 3;
+}
+
+message RepairAuthzSchemaCatalogueRequest {
+  PeerContext peer = 1;
+  string storage_tenant = 2;
+  bool present = 3;
+  bytes catalogue_json = 4;
+  HandoffScope handoff = 5;
+}
+
+// The first frame carries `manifest_json` and no content. Later frames carry
+// contiguous canonical aggregate bytes; exactly one final empty frame ends it.
+message AuthzRealmFrame {
+  uint32 schema_version = 1;
+  uint64 offset = 2;
+  bytes content = 3;
+  bool end = 4;
+  bytes manifest_json = 5;
+}
+
+message AuthzRealmPutFrame {
+  PeerContext peer = 1;
+  uint64 offset = 2;
+  bytes content = 3;
+  bool end = 4;
+  bytes manifest_json = 5;
+  HandoffScope handoff = 6;
+}
+
+message HandoffObjectPathSnapshotRequest {
+  PeerContext peer = 1;
+  HandoffScope handoff = 2;
+  uint64 tenant_id = 3;
+  uint64 bucket_id = 4;
+  string exact_path = 5;
+}
+
+message RepairHandoffObjectPathSnapshotRequest {
+  PeerContext peer = 1;
+  HandoffScope handoff = 2;
+  uint64 tenant_id = 3;
+  uint64 bucket_id = 4;
+  string exact_path = 5;
+  bytes expected_snapshot_json = 6;
+  bytes selected_snapshot_json = 7;
+}
+
+message HandoffSourceJournalStatusRequest {
+  PeerContext peer = 1;
+  HandoffScope handoff = 2;
+}
+
+message CompleteSystemBootstrapHandoffRequest {
+  PeerContext peer = 1;
+  HandoffScope handoff = 2;
+}
+
+message HandoffSourceJournalReadRequest {
+  PeerContext peer = 1;
+  HandoffScope handoff = 2;
+  uint64 after_offset = 3;
+  uint32 limit = 4;
+  uint64 max_bytes = 5;
+}
+
+message HandoffReferenceCursorRequest {
+  PeerContext peer = 1;
+  HandoffScope handoff = 2;
+  bytes source_id_json = 3;
+}
+
+message HandoffReferenceCursorAdvanceRequest {
+  PeerContext peer = 1;
+  HandoffScope handoff = 2;
+  bytes source_id_json = 3;
+  uint64 through = 4;
+}
+
+service DataPeer {
+  rpc DrainMutations(MutationDrainRequest) returns (MutationDrained);
+  rpc ReleaseMutationDrain(MutationDrainRequest) returns (MutationDrained);
+  rpc ApplyObjectMutation(TypedMutationRequest) returns (ObjectMutationApplied);
+  rpc ApplyObjectMutationBatch(TypedMutationBatchRequest) returns (ObjectMutationBatchApplied);
+  rpc ApplyRetainedVersionDelete(TypedMutationRequest) returns (RetainedVersionDeleteApplied);
+  rpc ReadObjectPathSnapshot(ObjectPathSnapshotRequest) returns (ObjectPathSnapshotResponse);
+  rpc ReadCurrentObjectSnapshot(ObjectPathSnapshotRequest) returns (CurrentObjectSnapshotResponse);
+  rpc ReadCurrentObjectSnapshots(CurrentObjectSnapshotBatchRequest) returns (CurrentObjectSnapshotBatchResponse);
+  rpc RepairObjectPathSnapshot(RepairObjectPathSnapshotRequest) returns (ObjectPathSnapshotApplied);
+  rpc ApplyAuthzRealmMutation(TypedMutationRequest) returns (AuthzRealmMutationApplied);
+  rpc ApplyReferenceDeltas(TypedMutationRequest) returns (ReferenceDeltaApplied);
+  rpc GetReferenceDeltaStatus(ReferenceDeltaStatusRequest) returns (ReferenceDeltaStatus);
+
+  rpc GetSourceJournalStatus(SourceJournalStatusRequest) returns (SourceJournalStatus);
+  rpc ReadSourceJournal(SourceJournalReadRequest) returns (SourceJournalPage);
+  rpc ReadRoutedSourceJournal(RoutedSourceJournalReadRequest) returns (RoutedSourceJournalPage);
+  rpc ApplyDerivedConsumerCheckpoint(ApplyDerivedConsumerCheckpointRequest) returns (DerivedConsumerCheckpointApplied);
+  rpc GetDefinitionCheckpoint(DefinitionCheckpointRequest) returns (DefinitionCheckpointState);
+  rpc ApplyDefinitionAssignmentPage(ApplyDefinitionAssignmentPageRequest) returns (DefinitionAssignmentPageApplied);
+  rpc ApplyDefinitionAssignments(ApplyDefinitionAssignmentsRequest) returns (DefinitionAssignmentPageApplied);
+  rpc ScanDefinitionLocatorsByBucket(DefinitionLocatorScanRequest) returns (DefinitionLocatorScanPage);
+  rpc ScanDefinitionLocatorsByKind(DefinitionLocatorKindScanRequest) returns (DefinitionLocatorScanPage);
+  rpc ScanDefinitionAssignmentsByKind(DefinitionAssignmentScanRequest) returns (DefinitionAssignmentScanPage);
+
+  rpc SmallContentExists(ContentRequest) returns (ExistsResponse);
+  rpc GetSmallContent(ContentRequest) returns (stream ContentFrame);
+  rpc PutSmallContent(stream SmallContentPutFrame) returns (ContentStored);
+
+  rpc GetCompleteSource(ContentRequest) returns (stream ContentFrame);
+  rpc PutCompleteSource(stream CompleteSourcePutFrame) returns (CompleteSourceStored);
+
+  rpc ShardExists(ShardRequest) returns (ExistsResponse);
+  rpc GetShard(ShardRequest) returns (stream ContentFrame);
+  rpc PutShard(stream ShardPutFrame) returns (ShardStored);
+
+  rpc ReadHandoffObjectPathSnapshot(HandoffObjectPathSnapshotRequest) returns (ObjectPathSnapshotResponse);
+  rpc RepairHandoffObjectPathSnapshot(RepairHandoffObjectPathSnapshotRequest) returns (ObjectPathSnapshotApplied);
+  rpc GetHandoffSourceJournalStatus(HandoffSourceJournalStatusRequest) returns (SourceJournalStatus);
+  rpc CompleteSystemBootstrapHandoff(CompleteSystemBootstrapHandoffRequest) returns (HandoffRecordApplied);
+  rpc ReadHandoffSourceJournal(HandoffSourceJournalReadRequest) returns (SourceJournalPage);
+  rpc GetHandoffReferenceCursor(HandoffReferenceCursorRequest) returns (ReferenceDeltaStatus);
+  rpc AdvanceHandoffReferenceCursor(HandoffReferenceCursorAdvanceRequest) returns (ReferenceDeltaApplied);
+  rpc ExportObjectRecords(HandoffPageRequest) returns (HandoffPage);
+  rpc InstallObjectRecord(HandoffRecordRequest) returns (HandoffRecordApplied);
+  rpc ExportLogicalRecords(HandoffPageRequest) returns (HandoffPage);
+  rpc InstallLogicalRecord(HandoffRecordRequest) returns (HandoffRecordApplied);
+  rpc ReadLogicalRecord(LogicalRecordRequest) returns (LogicalRecordResponse);
+  rpc RepairLogicalRecord(RepairLogicalRecordRequest) returns (HandoffRecordApplied);
+  rpc ExportAuthzRealmKeys(HandoffPageRequest) returns (HandoffPage);
+  rpc ReadAuthzSchemaCatalogue(AuthzSchemaCatalogueRequest) returns (AuthzSchemaCatalogueResponse);
+  rpc RepairAuthzSchemaCatalogue(RepairAuthzSchemaCatalogueRequest) returns (HandoffRecordApplied);
+  rpc ReadAuthzRealmManifest(AuthzRealmRequest) returns (AuthzRealmManifest);
+  rpc RepairAuthzRealmAbsence(AuthzRealmRequest) returns (HandoffRecordApplied);
+  rpc GetAuthzRealm(AuthzRealmRequest) returns (stream AuthzRealmFrame);
+  rpc PutAuthzRealm(stream AuthzRealmPutFrame) returns (HandoffRecordApplied);
+  rpc ExportPayloadArtifacts(HandoffPageRequest) returns (HandoffPage);
+  rpc InstallPayloadLifecycle(HandoffRecordRequest) returns (HandoffRecordApplied);
+}

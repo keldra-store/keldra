@@ -581,7 +581,7 @@ application client ID and secret through Anvil's normal credential path;
 Bearer authentication accepts a normal Anvil access token. Pulls may omit
 credentials only when current Zanzibar policy permits anonymous reads for the
 bucket. Every push is Zanzibar-authorized and publishes one authoritative Git
-bundle as an ordinary object below the protected `_anvil/git` namespace using
+bundle as an ordinary object below the protected `_keldra/git` namespace using
 `PutIfAbsent` or `PutIfVersion`.
 
 Anvil 0.5.3 deliberately uses `git-http-backend` and a disposable node-local

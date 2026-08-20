@@ -1,15 +1,15 @@
-//! Authenticated Rust client for Anvil 0.9 object storage.
+//! Authenticated Rust client for Keldra object storage.
 //!
 //! The crate provides ready-to-use object, authorization, administration, and
 //! PersonalDB clients, upload helpers, and the complete generated protocol surface.
 
-use anvil_api::v1::administration_service_client::AdministrationServiceClient;
-use anvil_api::v1::authz_service_client::AuthzServiceClient;
-use anvil_api::v1::credential_service_client::CredentialServiceClient;
-use anvil_api::v1::index_service_client::IndexServiceClient;
-use anvil_api::v1::object_service_client::ObjectServiceClient;
-use anvil_api::v1::personal_db_service_client::PersonalDbServiceClient;
-use anvil_api::v1::{
+use keldra_api::v1::administration_service_client::AdministrationServiceClient;
+use keldra_api::v1::authz_service_client::AuthzServiceClient;
+use keldra_api::v1::credential_service_client::CredentialServiceClient;
+use keldra_api::v1::index_service_client::IndexServiceClient;
+use keldra_api::v1::object_service_client::ObjectServiceClient;
+use keldra_api::v1::personal_db_service_client::PersonalDbServiceClient;
+use keldra_api::v1::{
     AccessToken, ExchangeClientCredentialsRequest, MutationReceipt, PutHeader, PutRequest,
 };
 use tonic::metadata::{Ascii, MetadataValue};
@@ -26,7 +26,7 @@ pub use typed_json_index::{
 
 const MAX_MESSAGE_BYTES: usize = 72 * 1024 * 1024;
 
-pub use anvil_api::v1;
+pub use keldra_api::v1;
 
 #[derive(Clone)]
 pub struct BearerToken {

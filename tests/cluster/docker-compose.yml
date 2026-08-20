@@ -1,10 +1,10 @@
-name: ${ANVIL_QUALIFICATION_PROJECT:-anvil-v090-qualification}
+name: ${ANVIL_QUALIFICATION_PROJECT:-keldra-v090-qualification}
 
-x-anvil-environment: &anvil-environment
-  RUST_LOG: ${ANVIL_QUALIFICATION_RUST_LOG:-info,anvil::index_runtime::retention=debug}
+x-keldra-environment: &keldra-environment
+  RUST_LOG: ${ANVIL_QUALIFICATION_RUST_LOG:-info,keldra::index_runtime::retention=debug}
   ANVIL_LISTEN: 0.0.0.0:50051
   ANVIL_PEER_LISTEN: 0.0.0.0:50052
-  ANVIL_TOKEN_SIGNING_KEY_FILE: /run/secrets/anvil-token-signing-key
+  ANVIL_TOKEN_SIGNING_KEY_FILE: /run/secrets/keldra-token-signing-key
   # Qualification starts a fresh CLI process for each operation, so every
   # operation performs a credential exchange. Keep production defaults out of
   # the way while the rate limiter itself remains covered by focused tests.
@@ -46,7 +46,7 @@ x-anvil-environment: &anvil-environment
   # the release corpus.
   ANVIL_SOURCE_JOURNAL_MAX_ENTRIES: "${ANVIL_QUALIFICATION_SOURCE_JOURNAL_MAX_ENTRIES:-1000000}"
 
-x-anvil-service: &anvil-service
+x-keldra-service: &keldra-service
   image: ${ANVIL_IMAGE:?ANVIL_IMAGE must name the already-built qualification image}
   platform: ${ANVIL_DOCKER_PLATFORM:-linux/amd64}
   restart: "no"
@@ -57,40 +57,40 @@ x-anvil-service: &anvil-service
     - "127.0.0.1::50051"
 
 services:
-  anvil-1:
-    <<: *anvil-service
+  keldra-1:
+    <<: *keldra-service
     environment:
-      <<: *anvil-environment
+      <<: *keldra-environment
       ANVIL_NODE_ID: "1"
-      ANVIL_PEER_ADVERTISE: anvil-1:50052
-      ANVIL_DATA_DIR: /var/lib/anvil
+      ANVIL_PEER_ADVERTISE: keldra-1:50052
+      ANVIL_DATA_DIR: /var/lib/keldra
       ANVIL_RUN_SYSTEM_BOOTSTRAP: "true"
     volumes:
       - type: bind
         source: ${ANVIL_QUALIFICATION_DIR:?ANVIL_QUALIFICATION_DIR must be set}/node-1
-        target: /var/lib/anvil
+        target: /var/lib/keldra
       - type: bind
         source: ${ANVIL_QUALIFICATION_DIR:?ANVIL_QUALIFICATION_DIR must be set}/token-signing-key
-        target: /run/secrets/anvil-token-signing-key
+        target: /run/secrets/keldra-token-signing-key
         read_only: true
 
-  anvil-2:
-    <<: *anvil-service
+  keldra-2:
+    <<: *keldra-service
     entrypoint:
       - /qualification/start-node.sh
     environment:
-      <<: *anvil-environment
+      <<: *keldra-environment
       ANVIL_NODE_ID: "2"
-      ANVIL_PEER_ADVERTISE: anvil-2:50052
-      ANVIL_DATA_DIR: /var/lib/anvil
+      ANVIL_PEER_ADVERTISE: keldra-2:50052
+      ANVIL_DATA_DIR: /var/lib/keldra
       ANVIL_RUN_SYSTEM_BOOTSTRAP: "false"
     volumes:
       - type: bind
         source: ${ANVIL_QUALIFICATION_DIR:?ANVIL_QUALIFICATION_DIR must be set}/node-2
-        target: /var/lib/anvil
+        target: /var/lib/keldra
       - type: bind
         source: ${ANVIL_QUALIFICATION_DIR:?ANVIL_QUALIFICATION_DIR must be set}/token-signing-key
-        target: /run/secrets/anvil-token-signing-key
+        target: /run/secrets/keldra-token-signing-key
         read_only: true
       - type: bind
         source: ${ANVIL_QUALIFICATION_START_NODE:?ANVIL_QUALIFICATION_START_NODE must be set}
@@ -100,23 +100,23 @@ services:
         source: ${ANVIL_QUALIFICATION_DIR:?ANVIL_QUALIFICATION_DIR must be set}/artifacts
         target: /qualification/artifacts
 
-  anvil-3:
-    <<: *anvil-service
+  keldra-3:
+    <<: *keldra-service
     entrypoint:
       - /qualification/start-node.sh
     environment:
-      <<: *anvil-environment
+      <<: *keldra-environment
       ANVIL_NODE_ID: "3"
-      ANVIL_PEER_ADVERTISE: anvil-3:50052
-      ANVIL_DATA_DIR: /var/lib/anvil
+      ANVIL_PEER_ADVERTISE: keldra-3:50052
+      ANVIL_DATA_DIR: /var/lib/keldra
       ANVIL_RUN_SYSTEM_BOOTSTRAP: "false"
     volumes:
       - type: bind
         source: ${ANVIL_QUALIFICATION_DIR:?ANVIL_QUALIFICATION_DIR must be set}/node-3
-        target: /var/lib/anvil
+        target: /var/lib/keldra
       - type: bind
         source: ${ANVIL_QUALIFICATION_DIR:?ANVIL_QUALIFICATION_DIR must be set}/token-signing-key
-        target: /run/secrets/anvil-token-signing-key
+        target: /run/secrets/keldra-token-signing-key
         read_only: true
       - type: bind
         source: ${ANVIL_QUALIFICATION_START_NODE:?ANVIL_QUALIFICATION_START_NODE must be set}

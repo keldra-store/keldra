@@ -1,6 +1,6 @@
 # Anvil 0.9 OSV import qualification
 
-`anvil-osv-qualification` measures a deterministic OSV import over Anvil 0.9
+`keldra-osv-qualification` measures a deterministic OSV import over Anvil 0.9
 `BulkWrite`. It never invokes an atomic program and it does not create a raw
 object plus mutable head for every input document.
 
@@ -12,16 +12,16 @@ the Anvil revision, and targets a clean bucket.
 
 The qualification uses one checked-in deterministic transform:
 
-1. Write the immutable `anvil.osv.source-definition.v1` document at
+1. Write the immutable `keldra.osv.source-definition.v1` document at
    `entities/source-definition/{sha256("source-definition\0osv")}/current.json`.
 2. Group OSV package records, normalize their fields, derive stable identities,
    and serialize deterministic JSON.
 3. Build partitioned
-   `anvil.osv.source-record.ndjson.v1` shards, including the final
+   `keldra.osv.source-record.ndjson.v1` shards, including the final
    newline; compress each with zstd level 6; and write it immutably at
    `shards/v1/{records_sha256[0..2]}/{records_sha256}.ndjson.zst`.
 4. After exact shard versions are known, write the immutable
-   `anvil.osv.snapshot-manifest.v1` at
+   `keldra.osv.snapshot-manifest.v1` at
    `snapshots/{snapshot_id}/manifest.json`.
 
 The manifest is authoritative for partition, record count, compressed and
@@ -35,23 +35,23 @@ The snapshot identity is
 
 ## Run the gate
 
-Create the `anvil-osv-qualification` bucket for the qualification application.
+Create the `keldra-osv-qualification` bucket for the qualification application.
 It needs bucket list/get/put/manage-policy authority. Before the timer starts,
 the tool enables one-way versioning, installs immutable policy for the three
 path families above, and uses `ListObjects(limit=1)` to prove the bucket is
 empty.
 
 ```sh
-cargo run -p anvil-osv-qualification --release -- \
+cargo run -p keldra-osv-qualification --release -- \
   --endpoint http://127.0.0.1:50051 \
-  --client-id anvil-osv-qualification \
+  --client-id keldra-osv-qualification \
   --client-secret-file /absolute/path/to/mode-0600-client-secret \
-  --tenant anvil-osv-qualification \
-  --bucket anvil-osv-qualification \
+  --tenant keldra-osv-qualification \
+  --bucket keldra-osv-qualification \
   --corpus /absolute/path/to/osv-corpus.zip \
   --corpus-sha256 <64-lowercase-hex-digits> \
   --snapshot-day YYYY-MM-DD \
-  --anvil-commit <40-hex-digit-revision> \
+  --keldra-commit <40-hex-digit-revision> \
   --durability local \
   --shard-uncompressed-bytes 67108864 \
   --batch-size 256 \

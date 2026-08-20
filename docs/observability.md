@@ -8,8 +8,8 @@ Set the standard OpenTelemetry endpoint variable or its equivalent command-line
 flag:
 
 ```console
-OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4318 anvil-server ...
-anvil-server --otlp-endpoint http://collector:4318 ...
+OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4318 keldra-server ...
+keldra-server --otlp-endpoint http://collector:4318 ...
 ```
 
 The endpoint is treated as the OTLP HTTP base URL. Anvil uses protobuf over HTTP
@@ -27,7 +27,7 @@ API.
 
 Metrics and traces share these resource attributes:
 
-- `service.name=anvil`
+- `service.name=keldra`
 - `service.version=0.9.4`
 - `node.id=<ANVIL_NODE_ID>`
 
@@ -78,35 +78,35 @@ Index working memory has one hard aggregate ceiling. Query and per-kind
 construction settings are fair-share planning targets, and idle bytes may be
 borrowed without crossing that ceiling. The low-cardinality `memory.class`
 dimension is `query` or one of the eight fixed index kinds. The shared parent
-reports `anvil_index_working_memory_configured_bytes`, `used_bytes`,
+reports `keldra_index_working_memory_configured_bytes`, `used_bytes`,
 `peak_bytes`, `share_bytes`, `class_used_bytes`, `borrowed_bytes`, `waiting`,
 and `waiting_bytes`.
 
 Construction memory is then split into configuration, admission, and observed
 builder state:
 
-- `anvil_index_construction_configured_bytes`,
-  `anvil_index_construction_leased_bytes`,
-  `anvil_index_construction_peak_leased_bytes`, and
-  `anvil_index_construction_waiting` describe each kind's shared admission
+- `keldra_index_construction_configured_bytes`,
+  `keldra_index_construction_leased_bytes`,
+  `keldra_index_construction_peak_leased_bytes`, and
+  `keldra_index_construction_waiting` describe each kind's shared admission
   class. The existing names remain available for operational dashboard
   continuity;
-- `anvil_index_construction_minimum_bytes`, `desired_bytes`, `granted_bytes`,
+- `keldra_index_construction_minimum_bytes`, `desired_bytes`, `granted_bytes`,
   and `borrowed_bytes` show each elastic admission;
-- `anvil_index_construction_resident_bytes` and
-  `anvil_index_construction_workspace_bytes` describe the builder involved in
+- `keldra_index_construction_resident_bytes` and
+  `keldra_index_construction_workspace_bytes` describe the builder involved in
   a completed flush. Resident bytes are the currently buffered subset of the
   admitted workspace, so the two values must not be added. Leased bytes are a
   budget reservation; they are not reported as resident memory.
 
 Compaction admission reports
-`anvil_index_compaction_configured_lanes`,
-`anvil_index_compaction_worker_limit`,
-`anvil_index_compaction_budget_limit`, shared and incremental workspace bytes,
+`keldra_index_compaction_configured_lanes`,
+`keldra_index_compaction_worker_limit`,
+`keldra_index_compaction_budget_limit`, shared and incremental workspace bytes,
 admitted workspace bytes, and leased bytes. Once the engine has planned its
 deterministic key ranges, progress and terminal events report
-`anvil_index_compaction_effective_lanes` as the minimum of configured lanes,
-workers, budget-admitted lanes, and `anvil_index_compaction_range_limit`. They
+`keldra_index_compaction_effective_lanes` as the minimum of configured lanes,
+workers, budget-admitted lanes, and `keldra_index_compaction_range_limit`. They
 also report active and waiting lanes, ranges total and completed, selected
 input segments/documents/bytes, input component rows/read bytes/blocks, output
 component rows/bytes/blocks, elapsed time, last-progress age, attempts,
@@ -131,19 +131,19 @@ Rebuild and catch-up expose overlap-safe active counters, cumulative
 records/bytes and frames/pages, elapsed and last-progress-age gauges, terminal
 records/bytes/work-unit and duration histograms, and failure counters. Builder
 failures, selected recovery actions, retries, and fail-closed outcomes use the
-`anvil_index_builder_*` counters. Publication exposes generation, presence,
+`keldra_index_builder_*` counters. Publication exposes generation, presence,
 age, freshness, source lag, CAS success/failure, and publication duration; a
 successful publication resets age and source lag to zero and marks the
 generation fresh.
 
 Query execution exposes the complete request and local-work path. Public RPCs
-report `anvil_index_query_requests_total`, failures, deadline expirations, and
+report `keldra_index_query_requests_total`, failures, deadline expirations, and
 request duration. Local execution reports admission waiting/active counts,
 wait duration, runs, cancellation and failure counts, returned hits, artifact
 read operations and bytes, cooperative yields, and query duration. CPU chunks
 report waiting/active counts, queue time, execution time, chunk count, and
 failures. These metrics are split only by bounded index kind and closed outcome
-or status values. The `anvil.index.query` and `anvil.index.query.cpu` spans may
+or status values. The `keldra.index.query` and `keldra.index.query.cpu` spans may
 carry stable numeric identifiers and detailed terminal snapshots; identifiers
 never become metric attributes. Artifact reads remain asynchronous, while
 decoded-page construction, filtering, ranking, bounded top-k maintenance, and
@@ -154,10 +154,10 @@ and skipped, posting bytes, posting advances, conjunction advances, bounded
 union-heap pushes and pops, exact second-phase checks, live-mask decodes, and
 candidate-gate batches. Point and doc-value block decodes are reported
 separately. Typed JSON computations add
-`anvil_index_query_facet_computations_requested_total`,
-`anvil_index_query_facet_computation_results_total`,
-`anvil_index_query_facet_documents_processed_total`,
-`anvil_index_query_facet_values_processed_total`, and the corresponding four
+`keldra_index_query_facet_computations_requested_total`,
+`keldra_index_query_facet_computation_results_total`,
+`keldra_index_query_facet_documents_processed_total`,
+`keldra_index_query_facet_values_processed_total`, and the corresponding four
 `aggregate` counters. These are cumulative counters split only by
 index kind; document, index, tenant, and bucket identifiers remain trace fields.
 Each terminal query also reports desired and granted memory, admitted resident
@@ -169,7 +169,7 @@ or phase-boundary measurements, not sampled process RSS. A phase which runs
 several segment lanes concurrently reports aggregate lane time; coordinator
 phases report wall time, so the phase value is a work/saturation diagnostic and
 must not be summed to reconstruct request latency.
-`anvil_index_query_returned_hits` is emitted only for a completed response
+`keldra_index_query_returned_hits` is emitted only for a completed response
 page. A failed, timed-out, or otherwise cancelled query has no returned page,
 so its hit count remains unknown rather than being recorded as zero; its read
 work and terminal outcome are still emitted.
@@ -178,15 +178,15 @@ The serving fence reports renewal attempts, successful renewals, and failed
 attempts separately, plus renewal duration and Tokio scheduling lateness,
 remaining lease margin, current validity, missed deadlines, placement progress,
 and the overlap-safe
-`anvil_control_plane_tasks_active` count. `anvil.serving_fence.renewal` spans
+`keldra_control_plane_tasks_active` count. `keldra.serving_fence.renewal` spans
 carry the placement term/index and leader node for diagnosis; the metric series
 uses only closed operation and outcome labels. A failed attempt while the
 previous grant remains valid is an informational
 `renewal_failed_lease_valid` outcome; only the absence of a valid fence is
 warned as `fence_unavailable`. The missed-deadline counter increments once when
 an unavailable transition is observed between renewal attempts. The legacy
-`anvil_serving_fence_renewals_total` remains an alias for attempts; use
-`anvil_serving_fence_renewal_successes_total` for successful grants.
+`keldra_serving_fence_renewals_total` remains an alias for attempts; use
+`keldra_serving_fence_renewal_successes_total` for successful grants.
 
 A ten-second runtime sampler exports process RSS/virtual memory/thread count,
 cgroup current/limit/peak memory and pressure/OOM events, and RocksDB block
@@ -196,7 +196,7 @@ plus mutation-receipt occupancy and projected capacity. Collection runs on a
 blocking worker and optional kernel or RocksDB properties fail independently,
 so telemetry sampling cannot stall or fail the storage path.
 
-`anvil.index.builder` and `anvil.index.compaction` are phase-lifetime spans.
+`keldra.index.builder` and `keldra.index.compaction` are phase-lifetime spans.
 They contain stable numeric index, tenant, and bucket IDs for investigation,
 plus the same progress snapshots and terminal outcome. A phase emits at start,
 at most one heartbeat every 30 seconds, and at completion or failure; it does

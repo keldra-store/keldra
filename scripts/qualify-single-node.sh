@@ -4,7 +4,7 @@ set -Eeuo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${repo_root}/scripts/qualification-log-evidence.sh"
 source "${repo_root}/scripts/qualification-scale-evidence.sh"
-requested_image="${ANVIL_IMAGE:-anvil:0.9.4}"
+requested_image="${ANVIL_IMAGE:-keldra:0.10.0}"
 keep="${ANVIL_QUALIFICATION_KEEP:-0}"
 qualification_mode="${ANVIL_QUALIFICATION_MODE:-smoke}"
 index_disk_cache_bytes="${ANVIL_QUALIFICATION_INDEX_DISK_CACHE_BYTES:-1073741824}"
@@ -158,18 +158,18 @@ if [[ "${image_revision}" != "${source_commit}" ]]; then
   echo "qualification image revision ${image_revision} does not match source commit ${source_commit}" >&2
   exit 2
 fi
-server_version="$(docker run --rm --platform "${platform}" "${image_id}" anvil-server --version)"
-client_version="$(docker run --rm --platform "${platform}" "${image_id}" anvil --version)"
-if [[ "${server_version}" != "anvil-server 0.9.4" \
-  || "${client_version}" != "anvil 0.9.4" ]]; then
-  echo "qualification requires the exact Anvil 0.9.4 image" >&2
+server_version="$(docker run --rm --platform "${platform}" "${image_id}" keldra-server --version)"
+client_version="$(docker run --rm --platform "${platform}" "${image_id}" keldra --version)"
+if [[ "${server_version}" != "keldra-server 0.10.0" \
+  || "${client_version}" != "keldra 0.10.0" ]]; then
+  echo "qualification requires the exact Keldra 0.10.0 image" >&2
   echo "server: ${server_version}" >&2
   echo "client: ${client_version}" >&2
   exit 2
 fi
-qualification_dir="$(mktemp -d /var/tmp/anvil-v090-single-qualification.XXXXXX)"
+qualification_dir="$(mktemp -d /var/tmp/keldra-v090-single-qualification.XXXXXX)"
 qualification_suffix="${qualification_dir##*.}"
-container_name="anvil-v090-single-${qualification_suffix}"
+container_name="keldra-v090-single-${qualification_suffix}"
 data_dir="${qualification_dir}/data"
 signing_key="${qualification_dir}/token-signing-key"
 index_verification_state="${qualification_dir}/index-verification-state.json"
@@ -177,9 +177,9 @@ index_qualification_log="${qualification_dir}/index-qualification.log"
 index_resource_qualification_log="${qualification_dir}/index-resource-qualification.log"
 index_resource_state="${qualification_dir}/index-resource-state.json"
 index_resource_bucket="index-resource-${qualification_suffix}"
-index_resource_report="/var/tmp/anvil-v090-single-index-resource-${qualification_suffix}.json"
-index_resource_observability_report="/var/tmp/anvil-v090-single-index-observability-${qualification_suffix}.json"
-index_resource_telemetry_prefix="/var/tmp/anvil-v090-single-index-telemetry-${qualification_suffix}"
+index_resource_report="/var/tmp/keldra-v090-single-index-resource-${qualification_suffix}.json"
+index_resource_observability_report="/var/tmp/keldra-v090-single-index-observability-${qualification_suffix}.json"
+index_resource_telemetry_prefix="/var/tmp/keldra-v090-single-index-telemetry-${qualification_suffix}"
 ANVIL_QUALIFICATION_STATE_DIR="${qualification_dir}"
 qualification_build_messages="${qualification_dir}/qualification-client-build.jsonl"
 container_started=0
@@ -189,20 +189,20 @@ cleanup() {
   trap - EXIT INT TERM
 
   if ((container_started == 1)) && ((status != 0)); then
-    echo "[anvil-single-qualification] FAILED; container logs follow" >&2
+    echo "[keldra-single-qualification] FAILED; container logs follow" >&2
     docker logs "${container_name}" >&2 || true
   fi
 
   if [[ "${keep}" == "1" ]]; then
-    echo "[anvil-single-qualification] retained container ${container_name}" >&2
-    echo "[anvil-single-qualification] retained files ${qualification_dir}" >&2
+    echo "[keldra-single-qualification] retained container ${container_name}" >&2
+    echo "[keldra-single-qualification] retained files ${qualification_dir}" >&2
     exit "${status}"
   fi
 
   if ((container_started == 1)); then
     docker rm --force "${container_name}" >/dev/null 2>&1 || true
   fi
-  if [[ "${qualification_dir}" == /var/tmp/anvil-v090-single-qualification.* ]]; then
+  if [[ "${qualification_dir}" == /var/tmp/keldra-v090-single-qualification.* ]]; then
     docker run --rm --user 0 \
       --volume "${qualification_dir}:/qualification" \
       "${image_id}" rm -rf \
@@ -229,7 +229,7 @@ build_qualification_clients() {
     --quiet
     --release
     --locked
-    --package anvil-server
+    --package keldra-server
     --manifest-path "${repo_root}/Cargo.toml"
     --message-format json-render-diagnostics
   )
@@ -251,7 +251,7 @@ build_qualification_clients() {
     build_command+=(--example "${example}")
   done
 
-  echo "[anvil-single-qualification] building public qualification clients in ${cargo_target_directory}"
+  echo "[keldra-single-qualification] building public qualification clients in ${cargo_target_directory}"
   if ! "${build_command[@]}" >"${qualification_build_messages}"; then
     jq -r '
       select(.reason == "compiler-message")
@@ -290,7 +290,7 @@ build_qualification_clients() {
     qualification_example_binaries["${example}"]="${executable}"
   done
   rm -f -- "${qualification_build_messages}"
-  echo "[anvil-single-qualification] public qualification clients are ready; Cargo is no longer needed"
+  echo "[keldra-single-qualification] public qualification clients are ready; Cargo is no longer needed"
 }
 
 build_qualification_clients
@@ -323,12 +323,12 @@ start_single_node() {
     --name "${container_name}" \
     --platform "${platform}" \
     --publish 127.0.0.1::50051 \
-    --env RUST_LOG=info,anvil::index_runtime::cpu=warn,anvil::index_runtime::retention=debug,anvil::observability::runtime=debug \
+    --env RUST_LOG=info,keldra::index_runtime::cpu=warn,keldra::index_runtime::retention=debug,keldra::observability::runtime=debug \
     --env ANVIL_LISTEN=0.0.0.0:50051 \
     --env ANVIL_PEER_LISTEN=127.0.0.1:50052 \
-    --env ANVIL_DATA_DIR=/var/lib/anvil \
+    --env ANVIL_DATA_DIR=/var/lib/keldra \
     --env ANVIL_NODE_ID=1 \
-    --env ANVIL_TOKEN_SIGNING_KEY_FILE=/run/secrets/anvil-token-signing-key \
+    --env ANVIL_TOKEN_SIGNING_KEY_FILE=/run/secrets/keldra-token-signing-key \
     --env ANVIL_RATE_LIMIT_CREDENTIAL_GLOBAL_PER_MINUTE=6000 \
     --env ANVIL_RATE_LIMIT_CREDENTIAL_GLOBAL_BURST=1000 \
     --env ANVIL_RATE_LIMIT_CREDENTIAL_CLIENT_PER_MINUTE=600 \
@@ -364,8 +364,8 @@ start_single_node() {
     "${profile_environment[@]}" \
     --env ANVIL_INDEX_MAX_RETAINED_GENERATIONS=1 \
     --env ANVIL_RUN_SYSTEM_BOOTSTRAP=true \
-    --volume "${data_dir}:/var/lib/anvil" \
-    --volume "${signing_key}:/run/secrets/anvil-token-signing-key:ro" \
+    --volume "${data_dir}:/var/lib/keldra" \
+    --volume "${signing_key}:/run/secrets/keldra-token-signing-key:ro" \
     "${image_id}" >/dev/null
   container_started=1
 }
@@ -379,7 +379,7 @@ wait_for_bootstrap() {
   local attempt
   for attempt in $(seq 1 90); do
     if docker exec "${container_name}" \
-      test -f /var/lib/anvil/system-bootstrap-credential.json \
+      test -f /var/lib/keldra/system-bootstrap-credential.json \
       >/dev/null 2>&1
     then
       return 0
@@ -407,8 +407,8 @@ provision_owner() {
     if output="$(docker exec \
       --env "ANVIL_NEW_CLIENT_SECRET=${provisioned_secret}" \
       "${container_name}" \
-      anvil --endpoint http://127.0.0.1:50051 \
-        --credentials-file /var/lib/anvil/system-bootstrap-credential.json \
+      keldra --endpoint http://127.0.0.1:50051 \
+        --credentials-file /var/lib/keldra/system-bootstrap-credential.json \
         provision-tenant "${provisioned_tenant}" "${provisioned_app}" \
           "${provisioned_client}" 2>&1)"
     then
@@ -480,7 +480,7 @@ assert_each_index_kind_published_and_compacted() {
     done
     if ! awk -v kind="index.kind=${kind}" '
         index($0, kind) && index($0, "index compaction terminal metrics") &&
-        $0 ~ /histogram\.anvil_index_compaction_input_segments=([2-9]|[1-9][0-9]+)([[:space:]]|$)/ { found = 1 }
+        $0 ~ /histogram\.keldra_index_compaction_input_segments=([2-9]|[1-9][0-9]+)([[:space:]]|$)/ { found = 1 }
         END { exit !found }
       ' "${index_qualification_log}"
     then
@@ -488,7 +488,7 @@ assert_each_index_kind_published_and_compacted() {
       return 1
     fi
   done
-  echo "[anvil-single-qualification] all eight index kinds published and compacted from public mutations"
+  echo "[keldra-single-qualification] all eight index kinds published and compacted from public mutations"
 }
 
 assert_index_compaction_observability() {
@@ -508,21 +508,21 @@ assert_index_compaction_observability() {
     [[ "${line}" =~ index\.kind=(Path|MetadataFilter|TypedJson|FullText|Vector|Hybrid|GitSource|Tensor) ]] \
       || continue
     kind="${BASH_REMATCH[1]}"
-    configured="$(log_unsigned_field gauge.anvil_index_compaction_configured_lanes "${line}")" \
+    configured="$(log_unsigned_field gauge.keldra_index_compaction_configured_lanes "${line}")" \
       || continue
-    worker_limit="$(log_unsigned_field gauge.anvil_index_compaction_worker_limit "${line}")" \
+    worker_limit="$(log_unsigned_field gauge.keldra_index_compaction_worker_limit "${line}")" \
       || return 1
-    budget_limit="$(log_unsigned_field gauge.anvil_index_compaction_budget_limit "${line}")" \
+    budget_limit="$(log_unsigned_field gauge.keldra_index_compaction_budget_limit "${line}")" \
       || return 1
     effective="$(log_unsigned_field compaction.effective_lanes "${line}")" \
       || return 1
-    range_limit="$(log_unsigned_field gauge.anvil_index_compaction_range_limit "${line}")" \
+    range_limit="$(log_unsigned_field gauge.keldra_index_compaction_range_limit "${line}")" \
       || return 1
-    ranges="$(log_unsigned_field gauge.anvil_index_compaction_ranges_total "${line}")" \
+    ranges="$(log_unsigned_field gauge.keldra_index_compaction_ranges_total "${line}")" \
       || return 1
-    completed="$(log_unsigned_field gauge.anvil_index_compaction_ranges_completed "${line}")" \
+    completed="$(log_unsigned_field gauge.keldra_index_compaction_ranges_completed "${line}")" \
       || return 1
-    peak_active="$(log_unsigned_field gauge.anvil_index_compaction_peak_active_lanes "${line}")" \
+    peak_active="$(log_unsigned_field gauge.keldra_index_compaction_peak_active_lanes "${line}")" \
       || return 1
     expected="${index_compaction_max_lanes}"
     ((worker_limit < expected)) && expected="${worker_limit}"
@@ -539,7 +539,7 @@ assert_index_compaction_observability() {
       || peak_active > effective \
       || completed != ranges)) \
       || ! unsigned_decimal_is_positive "${range_limit}" \
-      || [[ "${line}" != *"anvil.index.compaction"* ]]
+      || [[ "${line}" != *"keldra.index.compaction"* ]]
     then
       echo "${kind} emitted inconsistent bounded compaction telemetry" >&2
       printf '%s\n' "${line}" >&2
@@ -553,7 +553,7 @@ assert_index_compaction_observability() {
       return 1
     fi
     if ! awk -v kind="index.kind=${kind}" '
-        index($0, kind) && index($0, "anvil.index.builder") &&
+        index($0, kind) && index($0, "keldra.index.builder") &&
         index($0, "index builder phase finished") { found = 1 }
         END { exit !found }
       ' "${index_qualification_log}"
@@ -562,7 +562,7 @@ assert_index_compaction_observability() {
       return 1
     fi
   done
-  echo "[anvil-single-qualification] all eight index kinds emitted bounded range-compaction metrics and trace-backed completion logs"
+  echo "[keldra-single-qualification] all eight index kinds emitted bounded range-compaction metrics and trace-backed completion logs"
 }
 
 run_public_read_qualification() {
@@ -572,7 +572,7 @@ run_public_read_qualification() {
   ANVIL_PUBLIC_QUALIFICATION_CLIENT_ID="${owner_client}" \
   ANVIL_PUBLIC_QUALIFICATION_CLIENT_SECRET="${owner_secret}" \
     "${qualification_example_binaries[public_read_qualification]}"
-  echo "[anvil-single-qualification] public-read qualification passed"
+  echo "[keldra-single-qualification] public-read qualification passed"
 }
 
 run_index_qualification() {
@@ -588,7 +588,7 @@ run_index_qualification() {
   save_index_qualification_log
   assert_each_index_kind_published_and_compacted
   assert_index_compaction_observability
-  echo "[anvil-single-qualification] all-eight-index qualification passed"
+  echo "[keldra-single-qualification] all-eight-index qualification passed"
 }
 
 verify_existing_indexes() {
@@ -598,7 +598,7 @@ verify_existing_indexes() {
   ANVIL_INDEX_QUALIFICATION_CLIENT_SECRET="${owner_secret}" \
   ANVIL_INDEX_QUALIFICATION_STATE_INPUT="${index_verification_state}" \
     "${qualification_example_binaries[cluster_index_qualification]}"
-  echo "[anvil-single-qualification] final complete generations remained queryable after restart"
+  echo "[keldra-single-qualification] final complete generations remained queryable after restart"
 }
 
 index_sparse_start_count() {
@@ -609,7 +609,7 @@ index_sparse_start_count() {
 
 startup_scan_evidence_count() {
   container_logs \
-    | grep -Fc 'anvil_startup_scan_evidence' \
+    | grep -Fc 'keldra_startup_scan_evidence' \
     || true
 }
 
@@ -664,7 +664,7 @@ assert_zero_global_startup_scan_evidence() {
       fi
     done
     count=$((count + 1))
-  done < <(container_logs | grep -F 'anvil_startup_scan_evidence' || true)
+  done < <(container_logs | grep -F 'keldra_startup_scan_evidence' || true)
   if ((count < minimum_count)); then
     echo "single-node startup emitted ${count} measured scan samples; expected at least ${minimum_count}" >&2
     return 1
@@ -693,7 +693,7 @@ assert_sparse_index_startup() {
 recreate_single_node() {
   local next_profile="$1"
   local completed_profile="$2"
-  local startup_evidence="/var/tmp/anvil-v090-single-startup-scans-${qualification_suffix}-${completed_profile}.log"
+  local startup_evidence="/var/tmp/keldra-v090-single-startup-scans-${qualification_suffix}-${completed_profile}.log"
 
   container_logs | preserve_startup_scan_evidence "${startup_evidence}"
   docker stop --timeout 30 "${container_name}" >/dev/null
@@ -703,7 +703,7 @@ recreate_single_node() {
   wait_for_bootstrap
   assert_sparse_index_startup 1
   public_endpoint="$(published_endpoint 50051 public)"
-  echo "[anvil-single-qualification] recreated persisted node profile=${next_profile} public=${public_endpoint}"
+  echo "[keldra-single-qualification] recreated persisted node profile=${next_profile} public=${public_endpoint}"
 }
 
 run_index_resource_qualification() {
@@ -802,7 +802,7 @@ run_index_resource_qualification() {
       .evidence.hardware.memory_bytes == $hardware_memory_bytes and
       .evidence.hardware.qualification_filesystem_total_bytes == $filesystem_total_bytes and
       .evidence.hardware.qualification_filesystem_available_bytes_at_start == $filesystem_available_bytes and
-      .evidence.corpus.identity == "anvil.synthetic-index-resource.initial.v1" and
+      .evidence.corpus.identity == "keldra.synthetic-index-resource.initial.v1" and
       (.evidence.corpus.initial_corpus_sha256 | test("^sha256:[0-9a-f]{64}$")) and
       .evidence.corpus.records == .records and
       .evidence.corpus.indexed_fields == .indexed_fields and
@@ -834,7 +834,7 @@ run_index_resource_qualification() {
       .evidence.correctness.final_exact_partition_verification == true and
       .evidence.correctness.update_and_delete_verification == true and
       .evidence.correctness.resource_limits_passed == true and
-      .production_query_regression.schema == "anvil.index-production-query-regression.v1" and
+      .production_query_regression.schema == "keldra.index-production-query-regression.v1" and
       .production_query_regression.corpus_records == .records and
       .production_query_regression.index_id > 0 and
       .production_query_regression.definition_version > 0 and
@@ -870,8 +870,8 @@ run_index_resource_qualification() {
       .source_complete_objects_per_second >= 1000
     ' "${index_resource_report}" >/dev/null
   fi
-  echo "[anvil-single-qualification] bounded index resource qualification passed scope=${index_resource_scope} records=${index_resource_records} kind_budget=${index_kind_budget_bytes} disk_cache=${index_disk_cache_bytes}"
-  echo "[anvil-single-qualification] preserved resource report ${index_resource_report}"
+  echo "[keldra-single-qualification] bounded index resource qualification passed scope=${index_resource_scope} records=${index_resource_records} kind_budget=${index_kind_budget_bytes} disk_cache=${index_disk_cache_bytes}"
+  echo "[keldra-single-qualification] preserved resource report ${index_resource_report}"
 }
 
 verify_index_resource_state() {
@@ -908,27 +908,27 @@ assert_four_segment_typed_json_compaction_observability() {
 
   while IFS= read -r line; do
     [[ "${line}" == *"index.kind=TypedJson"* ]] || continue
-    configured="$(log_unsigned_field gauge.anvil_index_compaction_configured_lanes "${line}")" \
+    configured="$(log_unsigned_field gauge.keldra_index_compaction_configured_lanes "${line}")" \
       || return 1
-    worker_limit="$(log_unsigned_field gauge.anvil_index_compaction_worker_limit "${line}")" \
+    worker_limit="$(log_unsigned_field gauge.keldra_index_compaction_worker_limit "${line}")" \
       || return 1
-    budget_limit="$(log_unsigned_field gauge.anvil_index_compaction_budget_limit "${line}")" \
+    budget_limit="$(log_unsigned_field gauge.keldra_index_compaction_budget_limit "${line}")" \
       || return 1
     effective="$(log_unsigned_field compaction.effective_lanes "${line}")" \
       || return 1
-    range_limit="$(log_unsigned_field gauge.anvil_index_compaction_range_limit "${line}")" \
+    range_limit="$(log_unsigned_field gauge.keldra_index_compaction_range_limit "${line}")" \
       || return 1
-    ranges="$(log_unsigned_field gauge.anvil_index_compaction_ranges_total "${line}")" \
+    ranges="$(log_unsigned_field gauge.keldra_index_compaction_ranges_total "${line}")" \
       || return 1
-    completed="$(log_unsigned_field gauge.anvil_index_compaction_ranges_completed "${line}")" \
+    completed="$(log_unsigned_field gauge.keldra_index_compaction_ranges_completed "${line}")" \
       || return 1
-    peak_active="$(log_unsigned_field gauge.anvil_index_compaction_peak_active_lanes "${line}")" \
+    peak_active="$(log_unsigned_field gauge.keldra_index_compaction_peak_active_lanes "${line}")" \
       || return 1
-    failures="$(log_unsigned_field monotonic_counter.anvil_index_compaction_failures_total "${line}")" \
+    failures="$(log_unsigned_field monotonic_counter.keldra_index_compaction_failures_total "${line}")" \
       || return 1
-    input_rate="$(log_number_field gauge.anvil_index_compaction_input_bytes_per_second "${line}")" \
+    input_rate="$(log_number_field gauge.keldra_index_compaction_input_bytes_per_second "${line}")" \
       || return 1
-    output_rate="$(log_number_field gauge.anvil_index_compaction_output_bytes_per_second "${line}")" \
+    output_rate="$(log_number_field gauge.keldra_index_compaction_output_bytes_per_second "${line}")" \
       || return 1
     if ((configured != index_compaction_max_lanes \
       || worker_limit != index_rayon_workers \
@@ -975,13 +975,13 @@ assert_four_segment_typed_json_compaction_observability() {
 
   while IFS= read -r line; do
     [[ "${line}" == *"index.kind=TypedJson"* ]] || continue
-    active="$(log_unsigned_field gauge.anvil_index_compaction_active_lanes "${line}")" \
+    active="$(log_unsigned_field gauge.keldra_index_compaction_active_lanes "${line}")" \
       || continue
     effective="$(log_unsigned_field compaction.effective_lanes "${line}")" \
       || continue
-    input_rate="$(log_number_field gauge.anvil_index_compaction_input_bytes_per_second "${line}")" \
+    input_rate="$(log_number_field gauge.keldra_index_compaction_input_bytes_per_second "${line}")" \
       || continue
-    output_rate="$(log_number_field gauge.anvil_index_compaction_output_bytes_per_second "${line}")" \
+    output_rate="$(log_number_field gauge.keldra_index_compaction_output_bytes_per_second "${line}")" \
       || continue
     if ((active >= 2 && effective == index_compaction_max_lanes)) \
       && { number_is_positive "${input_rate}" || number_is_positive "${output_rate}"; }
@@ -999,7 +999,7 @@ assert_four_segment_typed_json_compaction_observability() {
     echo "four-segment TypedJson compaction proof showed no concurrent compaction" >&2
     return 1
   fi
-  echo "[anvil-single-qualification] four-segment TypedJson compaction used ${production_compaction_effective_lanes} effective lanes with ${production_compaction_peak_active_lanes} concurrently active"
+  echo "[keldra-single-qualification] four-segment TypedJson compaction used ${production_compaction_effective_lanes} effective lanes with ${production_compaction_peak_active_lanes} concurrently active"
 }
 
 assert_production_runtime_observability() {
@@ -1007,10 +1007,10 @@ assert_production_runtime_observability() {
 
   line="$(grep -F 'sampled process resources' "${index_resource_qualification_log}" | tail -n 1 || true)"
   if [[ -z "${line}" ]] \
-    || [[ "$(log_unsigned_field gauge.anvil_process_memory_metrics_available "${line}" || true)" != "1" ]] \
-    || ! log_unsigned_field gauge.anvil_process_resident_memory_bytes "${line}" >/dev/null \
-    || ! log_unsigned_field gauge.anvil_process_virtual_memory_bytes "${line}" >/dev/null \
-    || ! log_unsigned_field gauge.anvil_process_threads "${line}" >/dev/null
+    || [[ "$(log_unsigned_field gauge.keldra_process_memory_metrics_available "${line}" || true)" != "1" ]] \
+    || ! log_unsigned_field gauge.keldra_process_resident_memory_bytes "${line}" >/dev/null \
+    || ! log_unsigned_field gauge.keldra_process_virtual_memory_bytes "${line}" >/dev/null \
+    || ! log_unsigned_field gauge.keldra_process_threads "${line}" >/dev/null
   then
     echo "production qualification emitted no complete process resource sample" >&2
     return 1
@@ -1019,17 +1019,17 @@ assert_production_runtime_observability() {
 
   line="$(grep -F 'sampled cgroup memory resources' "${index_resource_qualification_log}" | tail -n 1 || true)"
   if [[ -z "${line}" ]] \
-    || [[ "$(log_unsigned_field gauge.anvil_cgroup_memory_metrics_available "${line}" || true)" != "1" ]] \
-    || ! log_unsigned_field gauge.anvil_cgroup_memory_current_bytes "${line}" >/dev/null \
-    || ! log_unsigned_field gauge.anvil_cgroup_memory_limit_bytes "${line}" >/dev/null \
-    || ! log_unsigned_field gauge.anvil_cgroup_memory_limited "${line}" >/dev/null \
-    || ! log_unsigned_field gauge.anvil_cgroup_memory_peak_bytes "${line}" >/dev/null \
-    || ! log_unsigned_field gauge.anvil_cgroup_memory_low_events "${line}" >/dev/null \
-    || ! log_unsigned_field gauge.anvil_cgroup_memory_high_events "${line}" >/dev/null \
-    || ! log_unsigned_field gauge.anvil_cgroup_memory_max_events "${line}" >/dev/null \
-    || ! log_unsigned_field gauge.anvil_cgroup_memory_oom_events "${line}" >/dev/null \
-    || ! log_unsigned_field gauge.anvil_cgroup_memory_oom_kill_events "${line}" >/dev/null \
-    || ! log_unsigned_field gauge.anvil_cgroup_memory_oom_group_kill_events "${line}" >/dev/null
+    || [[ "$(log_unsigned_field gauge.keldra_cgroup_memory_metrics_available "${line}" || true)" != "1" ]] \
+    || ! log_unsigned_field gauge.keldra_cgroup_memory_current_bytes "${line}" >/dev/null \
+    || ! log_unsigned_field gauge.keldra_cgroup_memory_limit_bytes "${line}" >/dev/null \
+    || ! log_unsigned_field gauge.keldra_cgroup_memory_limited "${line}" >/dev/null \
+    || ! log_unsigned_field gauge.keldra_cgroup_memory_peak_bytes "${line}" >/dev/null \
+    || ! log_unsigned_field gauge.keldra_cgroup_memory_low_events "${line}" >/dev/null \
+    || ! log_unsigned_field gauge.keldra_cgroup_memory_high_events "${line}" >/dev/null \
+    || ! log_unsigned_field gauge.keldra_cgroup_memory_max_events "${line}" >/dev/null \
+    || ! log_unsigned_field gauge.keldra_cgroup_memory_oom_events "${line}" >/dev/null \
+    || ! log_unsigned_field gauge.keldra_cgroup_memory_oom_kill_events "${line}" >/dev/null \
+    || ! log_unsigned_field gauge.keldra_cgroup_memory_oom_group_kill_events "${line}" >/dev/null
   then
     echo "production qualification emitted no complete cgroup resource sample" >&2
     return 1
@@ -1044,24 +1044,24 @@ assert_production_runtime_observability() {
 
   line="$(grep -F 'sampled RocksDB resources' "${index_resource_qualification_log}" | tail -n 1 || true)"
   if [[ -z "${line}" ]] \
-    || ! log_unsigned_field gauge.anvil_rocksdb_block_cache_capacity_bytes "${line}" >/dev/null \
-    || ! log_unsigned_field gauge.anvil_rocksdb_block_cache_usage_bytes "${line}" >/dev/null \
-    || ! log_unsigned_field gauge.anvil_rocksdb_block_cache_pinned_bytes "${line}" >/dev/null \
-    || ! log_unsigned_field gauge.anvil_rocksdb_write_buffer_capacity_bytes "${line}" >/dev/null \
-    || ! log_unsigned_field gauge.anvil_rocksdb_write_buffer_usage_bytes "${line}" >/dev/null \
-    || ! log_unsigned_field gauge.anvil_rocksdb_unavailable_properties "${line}" >/dev/null
+    || ! log_unsigned_field gauge.keldra_rocksdb_block_cache_capacity_bytes "${line}" >/dev/null \
+    || ! log_unsigned_field gauge.keldra_rocksdb_block_cache_usage_bytes "${line}" >/dev/null \
+    || ! log_unsigned_field gauge.keldra_rocksdb_block_cache_pinned_bytes "${line}" >/dev/null \
+    || ! log_unsigned_field gauge.keldra_rocksdb_write_buffer_capacity_bytes "${line}" >/dev/null \
+    || ! log_unsigned_field gauge.keldra_rocksdb_write_buffer_usage_bytes "${line}" >/dev/null \
+    || ! log_unsigned_field gauge.keldra_rocksdb_unavailable_properties "${line}" >/dev/null
   then
     echo "production qualification emitted no complete RocksDB resource sample" >&2
     return 1
   fi
   production_rocksdb_samples="$(grep -Fc 'sampled RocksDB resources' "${index_resource_qualification_log}")"
-  echo "[anvil-single-qualification] process, cgroup, and RocksDB operational signals were present during the production run"
+  echo "[keldra-single-qualification] process, cgroup, and RocksDB operational signals were present during the production run"
 }
 
 write_index_resource_observability_report() {
   printf '%s\n' \
     '{' \
-    '  "schema": "anvil.index-resource-observability.v2",' \
+    '  "schema": "keldra.index-resource-observability.v2",' \
     '  "index_kind": "TypedJson",' \
     '  "resource_profile": "production-compaction-debt-defaults",' \
     '  "compaction_profile": "four-segment-compaction",' \
@@ -1079,7 +1079,7 @@ write_index_resource_observability_report() {
     "  \"cgroup_samples\": ${production_cgroup_samples}," \
     "  \"rocksdb_samples\": ${production_rocksdb_samples}" \
     '}' >"${index_resource_observability_report}"
-  echo "[anvil-single-qualification] preserved observability report ${index_resource_observability_report}"
+  echo "[keldra-single-qualification] preserved observability report ${index_resource_observability_report}"
 }
 
 assert_all_kind_index_resource_bounds() {
@@ -1096,11 +1096,11 @@ assert_all_kind_index_resource_bounds() {
     else
       continue
     fi
-    configured="$(log_unsigned_field gauge.anvil_index_construction_configured_bytes "${line}")" \
+    configured="$(log_unsigned_field gauge.keldra_index_construction_configured_bytes "${line}")" \
       || continue
-    leased="$(log_unsigned_field gauge.anvil_index_construction_leased_bytes "${line}")" \
+    leased="$(log_unsigned_field gauge.keldra_index_construction_leased_bytes "${line}")" \
       || return 1
-    peak_leased="$(log_unsigned_field gauge.anvil_index_construction_peak_leased_bytes "${line}")" \
+    peak_leased="$(log_unsigned_field gauge.keldra_index_construction_peak_leased_bytes "${line}")" \
       || return 1
     if ((configured != index_kind_budget_bytes \
       || leased > configured \
@@ -1132,9 +1132,9 @@ assert_all_kind_index_resource_bounds() {
     [[ "${line}" =~ index\.kind=(Path|MetadataFilter|TypedJson|FullText|Vector|Hybrid|GitSource|Tensor) ]] \
       || continue
     kind="${BASH_REMATCH[1]}"
-    resident="$(log_unsigned_field gauge.anvil_index_construction_resident_bytes "${line}")" \
+    resident="$(log_unsigned_field gauge.keldra_index_construction_resident_bytes "${line}")" \
       || return 1
-    workspace="$(log_unsigned_field gauge.anvil_index_construction_workspace_bytes "${line}")" \
+    workspace="$(log_unsigned_field gauge.keldra_index_construction_workspace_bytes "${line}")" \
       || return 1
     if ((resident == 0 || workspace == 0 || resident > workspace \
       || workspace > index_kind_budget_bytes)); then
@@ -1168,15 +1168,15 @@ assert_index_resource_bounds() {
       || "${line}" != *"index construction budget state"* ]]; then
       continue
     fi
-    configured="$(log_unsigned_field gauge.anvil_index_construction_configured_bytes "${line}")" \
+    configured="$(log_unsigned_field gauge.keldra_index_construction_configured_bytes "${line}")" \
       || {
       echo "production-shaped TypedJson build emitted malformed budget evidence" >&2
       printf '%s\n' "${line}" >&2
       return 1
     }
-    leased="$(log_unsigned_field gauge.anvil_index_construction_leased_bytes "${line}")" \
+    leased="$(log_unsigned_field gauge.keldra_index_construction_leased_bytes "${line}")" \
       || return 1
-    peak_leased="$(log_unsigned_field gauge.anvil_index_construction_peak_leased_bytes "${line}")" \
+    peak_leased="$(log_unsigned_field gauge.keldra_index_construction_peak_leased_bytes "${line}")" \
       || return 1
     if ((configured != index_kind_budget_bytes \
       || leased > configured \
@@ -1196,9 +1196,9 @@ assert_index_resource_bounds() {
   local resource_residency_evidence=0
   while IFS= read -r line; do
     [[ "${line}" == *"index.kind=TypedJson"* ]] || continue
-    resident="$(log_unsigned_field gauge.anvil_index_construction_resident_bytes "${line}")" \
+    resident="$(log_unsigned_field gauge.keldra_index_construction_resident_bytes "${line}")" \
       || return 1
-    workspace="$(log_unsigned_field gauge.anvil_index_construction_workspace_bytes "${line}")" \
+    workspace="$(log_unsigned_field gauge.keldra_index_construction_workspace_bytes "${line}")" \
       || return 1
     if ((resident == 0 || workspace == 0 || resident > workspace \
       || workspace > index_kind_budget_bytes)); then
@@ -1227,8 +1227,8 @@ assert_index_resource_bounds() {
     return 1
   fi
   assert_production_runtime_observability
-  echo "[anvil-single-qualification] preserved full production telemetry ${index_resource_telemetry_prefix}.log"
-  echo "[anvil-single-qualification] index construction and disk cache remained within configured bounds"
+  echo "[keldra-single-qualification] preserved full production telemetry ${index_resource_telemetry_prefix}.log"
+  echo "[keldra-single-qualification] index construction and disk cache remained within configured bounds"
 }
 
 restart_populated_node() {
@@ -1244,7 +1244,7 @@ restart_populated_node() {
     --env "ANVIL_CLIENT_ID=${owner_client}" \
     --env "ANVIL_CLIENT_SECRET=${owner_secret}" \
     "${container_name}" \
-    anvil --endpoint http://127.0.0.1:50051 \
+    keldra --endpoint http://127.0.0.1:50051 \
       head "${tenant}" index-journal-events docs/a.json >/dev/null 2>&1
   do
     if ((SECONDS >= deadline)); then
@@ -1256,11 +1256,11 @@ restart_populated_node() {
   public_endpoint="$(published_endpoint 50051 public)"
   elapsed=$((SECONDS - started))
   container_logs | preserve_startup_scan_evidence \
-    "/var/tmp/anvil-v090-single-startup-scans-${qualification_suffix}.log"
+    "/var/tmp/keldra-v090-single-startup-scans-${qualification_suffix}.log"
   assert_sparse_index_startup "$((before + 1))"
   verify_existing_indexes
   verify_index_resource_state
-  echo "[anvil-single-qualification] populated restart served in ${elapsed}s; sparse startup marker was present and no legacy definition barrier was reported"
+  echo "[keldra-single-qualification] populated restart served in ${elapsed}s; sparse startup marker was present and no legacy definition barrier was reported"
 }
 
 assert_index_retention_converged() {
@@ -1292,12 +1292,12 @@ assert_index_retention_converged() {
     for index_id in "${index_ids[@]}"; do
       if ! container_logs | awk -v marker="index.id=${index_id} " '
           index($0, marker) && index($0, "bounded node-wide index retention tick completed") &&
-          $0 ~ /monotonic_counter.anvil_index_retention_artifacts_deleted_total=[1-9][0-9]*/ {
+          $0 ~ /monotonic_counter.keldra_index_retention_artifacts_deleted_total=[1-9][0-9]*/ {
             deleted = 1
           }
           deleted && index($0, marker) &&
           index($0, "bounded node-wide index retention tick completed") &&
-          $0 ~ /gauge.anvil_index_retention_backlog=0/ {
+          $0 ~ /gauge.keldra_index_retention_backlog=0/ {
             converged = 1
           }
           END { exit !converged }
@@ -1307,7 +1307,7 @@ assert_index_retention_converged() {
       fi
     done
     if ((pending == 0)); then
-      echo "[anvil-single-qualification] bounded index retention deleted obsolete artifacts and drained its backlog"
+      echo "[keldra-single-qualification] bounded index retention deleted obsolete artifacts and drained its backlog"
       return 0
     fi
     if ((SECONDS >= deadline)); then
@@ -1325,7 +1325,7 @@ run_accounting_qualification() {
   ANVIL_ACCOUNTING_QUALIFICATION_CLIENT_ID="${owner_client}" \
   ANVIL_ACCOUNTING_QUALIFICATION_CLIENT_SECRET="${owner_secret}" \
     "${qualification_example_binaries[accounting_qualification]}"
-  echo "[anvil-single-qualification] accounting qualification passed"
+  echo "[keldra-single-qualification] accounting qualification passed"
 }
 
 run_atomic_index_qualification() {
@@ -1335,7 +1335,7 @@ run_atomic_index_qualification() {
   ANVIL_ATOMIC_INDEX_QUALIFICATION_CLIENT_ID="${owner_client}" \
   ANVIL_ATOMIC_INDEX_QUALIFICATION_CLIENT_SECRET="${owner_secret}" \
     "${qualification_example_binaries[atomic_index_qualification]}"
-  echo "[anvil-single-qualification] atomic-program index visibility passed"
+  echo "[keldra-single-qualification] atomic-program index visibility passed"
 }
 
 assert_zero_accounting_traffic_drops() {
@@ -1363,13 +1363,13 @@ assert_zero_accounting_traffic_drops() {
     fi
     count=$((count + 1))
   done < <(
-    container_logs | grep -F 'anvil_accounting_traffic_drop_state' || true
+    container_logs | grep -F 'keldra_accounting_traffic_drop_state' || true
   )
   if ((count == 0)); then
     echo "single-node qualification emitted no accounting drop-state evidence" >&2
     return 1
   fi
-  echo "[anvil-single-qualification] accounting traffic reported zero dropped batches and bytes"
+  echo "[keldra-single-qualification] accounting traffic reported zero dropped batches and bytes"
 }
 
 run_personaldb_qualification() {
@@ -1378,7 +1378,7 @@ run_personaldb_qualification() {
   ANVIL_PERSONALDB_QUALIFICATION_CLIENT_ID="${owner_client}" \
   ANVIL_PERSONALDB_QUALIFICATION_CLIENT_SECRET="${owner_secret}" \
     "${qualification_example_binaries[personaldb_qualification]}"
-  echo "[anvil-single-qualification] PersonalDB qualification passed"
+  echo "[keldra-single-qualification] PersonalDB qualification passed"
 }
 
 run_large_object_qualification() {
@@ -1391,18 +1391,18 @@ run_large_object_qualification() {
     --env "ANVIL_CLIENT_ID=${owner_client}"
     --env "ANVIL_CLIENT_SECRET=${owner_secret}"
     "${container_name}"
-    anvil --endpoint http://127.0.0.1:50051
+    keldra --endpoint http://127.0.0.1:50051
   )
 
   dd if=/dev/zero of="${input}" bs=1M count=2 status=none
   chmod 0444 "${input}"
-  docker cp "${input}" "${container_name}:/tmp/anvil-large-input.bin"
+  docker cp "${input}" "${container_name}:/tmp/keldra-large-input.bin"
   "${command[@]}" create-bucket "${bucket}" | grep -Fq "bucket=${bucket}"
 
   # One node cannot prove survival of one owner loss. REPLICATED must fail
   # closed without publishing a head; callers can explicitly choose LOCAL.
   if "${command[@]}" put "${tenant}" "${bucket}" fixtures/replicated.bin \
-    /tmp/anvil-large-input.bin --command-id single-large-replicated \
+    /tmp/keldra-large-input.bin --command-id single-large-replicated \
     --durability replicated --if-absent >/dev/null 2>&1
   then
     echo "single-node large REPLICATED put unexpectedly succeeded" >&2
@@ -1417,11 +1417,11 @@ run_large_object_qualification() {
   fi
 
   "${command[@]}" put "${tenant}" "${bucket}" fixtures/large.bin \
-    /tmp/anvil-large-input.bin --command-id single-large --durability local \
+    /tmp/keldra-large-input.bin --command-id single-large --durability local \
     --if-absent >/dev/null
   "${command[@]}" get "${tenant}" "${bucket}" fixtures/large.bin \
-    --output /tmp/anvil-large-before-restart.bin
-  docker cp "${container_name}:/tmp/anvil-large-before-restart.bin" "${before_restart}"
+    --output /tmp/keldra-large-before-restart.bin
+  docker cp "${container_name}:/tmp/keldra-large-before-restart.bin" "${before_restart}"
   cmp "${input}" "${before_restart}"
 
   docker restart "${container_name}" >/dev/null
@@ -1440,14 +1440,14 @@ run_large_object_qualification() {
   done
   public_endpoint="$(published_endpoint 50051 public)"
   "${command[@]}" get "${tenant}" "${bucket}" fixtures/large.bin \
-    --output /tmp/anvil-large-after-restart.bin
-  docker cp "${container_name}:/tmp/anvil-large-after-restart.bin" "${after_restart}"
+    --output /tmp/keldra-large-after-restart.bin
+  docker cp "${container_name}:/tmp/keldra-large-after-restart.bin" "${after_restart}"
   cmp "${input}" "${after_restart}"
   docker exec --user 0 "${container_name}" rm -f \
-    /tmp/anvil-large-input.bin \
-    /tmp/anvil-large-before-restart.bin \
-    /tmp/anvil-large-after-restart.bin
-  echo "[anvil-single-qualification] large LOCAL object survived restart; REPLICATED failed closed"
+    /tmp/keldra-large-input.bin \
+    /tmp/keldra-large-before-restart.bin \
+    /tmp/keldra-large-after-restart.bin
+  echo "[keldra-single-qualification] large LOCAL object survived restart; REPLICATED failed closed"
 }
 
 run_s3_qualification() {
@@ -1456,7 +1456,7 @@ run_s3_qualification() {
   ANVIL_S3_QUALIFICATION_CLIENT_SECRET="${s3_secret}" \
   ANVIL_S3_QUALIFICATION_BUCKET="s3-single-${$}" \
     "${qualification_example_binaries[s3_qualification]}"
-  echo "[anvil-single-qualification] official AWS SDK S3 qualification passed"
+  echo "[keldra-single-qualification] official AWS SDK S3 qualification passed"
 }
 
 run_git_qualification() {
@@ -1473,7 +1473,7 @@ run_git_qualification() {
     --env "ANVIL_CLIENT_ID=${owner_client}" \
     --env "ANVIL_CLIENT_SECRET=${owner_secret}" \
     "${container_name}" \
-    anvil --endpoint http://127.0.0.1:50051 create-bucket "${bucket}" \
+    keldra --endpoint http://127.0.0.1:50051 create-bucket "${bucket}" \
     | grep -Fq "bucket=${bucket}"
 
   mkdir -p "${git_root}"
@@ -1504,12 +1504,12 @@ run_git_qualification() {
     --env "ANVIL_CLIENT_ID=${owner_client}" \
     --env "ANVIL_CLIENT_SECRET=${owner_secret}" \
     "${container_name}" \
-    anvil --endpoint http://127.0.0.1:50051 \
+    keldra --endpoint http://127.0.0.1:50051 \
       set-bucket-public-read "${bucket}" enabled >/dev/null
   git clone --quiet --branch main "${git_url}" "${public_clone}"
   cmp "${source_repository}/README.md" "${public_clone}/README.md"
 
-  echo "[anvil-single-qualification] Git push, authenticated clone, and public clone passed"
+  echo "[keldra-single-qualification] Git push, authenticated clone, and public clone passed"
 }
 
 wait_for_bootstrap
@@ -1530,16 +1530,16 @@ s3_secret=qualification-single-s3-secret-000000000000000000000
 
 public_endpoint="$(published_endpoint 50051 public)"
 
-echo "[anvil-single-qualification] node ready public=${public_endpoint}"
+echo "[keldra-single-qualification] node ready public=${public_endpoint}"
 case "${index_resource_scope}" in
   release-corpus)
-    echo "[anvil-single-qualification] index resource scope=release-corpus records=839980 indexed_fields=12"
+    echo "[keldra-single-qualification] index resource scope=release-corpus records=839980 indexed_fields=12"
     ;;
   smoke)
-    echo "[anvil-single-qualification] index resource scope=smoke records=${index_resource_records}; this does not satisfy the required 839980-record release-resource gate"
+    echo "[keldra-single-qualification] index resource scope=smoke records=${index_resource_records}; this does not satisfy the required 839980-record release-resource gate"
     ;;
   custom)
-    echo "[anvil-single-qualification] index resource scope=custom records=${index_resource_records}; this does not satisfy the required 839980-record release-resource gate"
+    echo "[keldra-single-qualification] index resource scope=custom records=${index_resource_records}; this does not satisfy the required 839980-record release-resource gate"
     ;;
 esac
 
@@ -1579,7 +1579,7 @@ assert_index_retention_converged
 assert_zero_accounting_traffic_drops
 
 if [[ "${qualification_mode}" == "release" ]]; then
-  echo "[anvil-single-qualification] PASS scope=release-corpus records=${index_resource_records} image=${image_id} platform=${platform}"
+  echo "[keldra-single-qualification] PASS scope=release-corpus records=${index_resource_records} image=${image_id} platform=${platform}"
 else
-  echo "[anvil-single-qualification] SMOKE PASS records=${index_resource_records} image=${image_id} platform=${platform}"
+  echo "[keldra-single-qualification] SMOKE PASS records=${index_resource_records} image=${image_id} platform=${platform}"
 fi

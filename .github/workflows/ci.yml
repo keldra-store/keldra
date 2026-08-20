@@ -1,4 +1,4 @@
-name: Anvil CI
+name: Keldra CI
 
 on:
   push:
@@ -57,7 +57,7 @@ jobs:
         run: ./scripts/release-gates.sh static
 
   rust:
-    name: Anvil 0.9 workspace tests
+    name: Keldra 0.10 workspace tests
     needs: static
     runs-on: ubuntu-24.04
     timeout-minutes: 90
@@ -99,13 +99,13 @@ jobs:
         run: ./scripts/release-gates.sh rust
 
   build-image:
-    name: Build and smoke Anvil image (${{ matrix.platform }})
+    name: Build and smoke Keldra image (${{ matrix.platform }})
     needs: static
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     env:
       ANVIL_DOCKER_PLATFORM: ${{ matrix.platform }}
-      ANVIL_IMAGE: anvil:test-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+      ANVIL_IMAGE: keldra:test-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
     strategy:
       fail-fast: false
       matrix:

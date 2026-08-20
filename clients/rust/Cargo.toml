@@ -1,19 +1,20 @@
 [package]
-name = "anvil-storage"
+name = "keldra"
 version.workspace = true
 edition.workspace = true
-description = "Authenticated Rust client for Anvil objects and indices"
+description = "Authenticated Rust client for Keldra objects and indices"
 rust-version.workspace = true
 license-file = "../../LICENSE"
 homepage.workspace = true
-documentation = "https://docs.rs/anvil-storage"
+repository.workspace = true
+documentation = "https://docs.rs/keldra"
 readme = "README.md"
 authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-anvil-api = { version = "=0.9.4", path = "../../crates/anvil-api" }
+keldra-api = { version = "=0.10.0", path = "../../crates/keldra-api" }
 tokio-stream = "0.1"
 tonic = { version = "0.14", default-features = false, features = ["transport", "tls-native-roots"] }
 

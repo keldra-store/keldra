@@ -50,13 +50,13 @@ fi
 
 if grep -REn --exclude='check-release-image-surface.sh' \
   'CARGO_TARGET_DIR|--target-dir' \
-  .cargo .github/workflows crates/anvil scripts
+  .cargo .github/workflows crates/keldra scripts
 then
   echo "release tooling must use Cargo's configured target directory" >&2
   exit 1
 fi
 
-if [[ -e crates/anvil/Dockerfile.prebuilt ]]; then
+if [[ -e crates/keldra/Dockerfile.prebuilt ]]; then
   echo "the prebuilt-binary image path must remain removed" >&2
   exit 1
 fi
@@ -66,7 +66,7 @@ for excluded_context in \
   '.idea/' \
   '.DS_Store' \
   '**/.DS_Store' \
-  '**/anvil-data/' \
+  '**/keldra-data/' \
   'docs/decisions/*.local.md' \
   'tmp/'
 do
@@ -78,20 +78,20 @@ done
 
 if grep -REn \
   'Dockerfile\.prebuilt|cargo-zigbuild|zigbuild|tmp/docker-bin|ANVIL_ZIG_TARGET|ANVIL_USE_NATIVE_CARGO|ANVIL_RUNTIME_BASE' \
-  .github/workflows scripts/build-image.sh README.md .dockerignore crates/anvil/build-and-run.sh
+  .github/workflows scripts/build-image.sh README.md .dockerignore crates/keldra/build-and-run.sh
 then
   echo "image tooling must build from source in the target-platform Dockerfile" >&2
   exit 1
 fi
 
-grep -Fq 'FROM --platform=$TARGETPLATFORM rust:1.96-trixie AS builder' crates/anvil/Dockerfile
-grep -Fq 'FROM --platform=$TARGETPLATFORM debian:trixie-slim' crates/anvil/Dockerfile
-grep -Fq 'org.opencontainers.image.revision=' crates/anvil/Dockerfile
-grep -Fxq 'EXPOSE 50051 50052' crates/anvil/Dockerfile
+grep -Fq 'FROM --platform=$TARGETPLATFORM rust:1.96-trixie AS builder' crates/keldra/Dockerfile
+grep -Fq 'FROM --platform=$TARGETPLATFORM debian:trixie-slim' crates/keldra/Dockerfile
+grep -Fq 'org.opencontainers.image.revision=' crates/keldra/Dockerfile
+grep -Fxq 'EXPOSE 50051 50052' crates/keldra/Dockerfile
 if grep -REn 'ANVIL_GATEWAY_LISTEN|50053' \
-  crates/anvil/src \
-  crates/anvil/Dockerfile \
-  crates/anvil/docker-compose.yml \
+  crates/keldra/src \
+  crates/keldra/Dockerfile \
+  crates/keldra/docker-compose.yml \
   tests/cluster/docker-compose.yml \
   scripts/qualify-single-node.sh \
   scripts/qualify-three-node.sh \
@@ -100,7 +100,7 @@ then
   echo "release deployment and qualification surfaces must use one public port" >&2
   exit 1
 fi
-grep -Fq -- '--file crates/anvil/Dockerfile' scripts/build-image.sh
-grep -Fq -- '--file crates/anvil/Dockerfile' "${release_workflow}"
+grep -Fq -- '--file crates/keldra/Dockerfile' scripts/build-image.sh
+grep -Fq -- '--file crates/keldra/Dockerfile' "${release_workflow}"
 grep -Fq -- '--build-arg "ANVIL_SOURCE_REVISION=${source_revision}"' scripts/build-image.sh
 grep -Fq -- '--build-arg "ANVIL_SOURCE_REVISION=${SOURCE_COMMIT}"' "${release_workflow}"

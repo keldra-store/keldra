@@ -87,7 +87,7 @@ assert_zero_cgroup_oom_samples() {
   local samples=0
   local value
   while IFS= read -r line; do
-    available="$(log_unsigned_field gauge.anvil_cgroup_memory_metrics_available "${line}")" || {
+    available="$(log_unsigned_field gauge.keldra_cgroup_memory_metrics_available "${line}")" || {
       echo "${label} emitted a malformed cgroup resource sample" >&2
       return 1
     }
@@ -96,9 +96,9 @@ assert_zero_cgroup_oom_samples() {
       return 1
     fi
     for field in \
-      gauge.anvil_cgroup_memory_oom_events \
-      gauge.anvil_cgroup_memory_oom_kill_events \
-      gauge.anvil_cgroup_memory_oom_group_kill_events
+      gauge.keldra_cgroup_memory_oom_events \
+      gauge.keldra_cgroup_memory_oom_kill_events \
+      gauge.keldra_cgroup_memory_oom_group_kill_events
     do
       value="$(log_unsigned_field "${field}" "${line}")" || {
         echo "${label} cgroup sample omitted ${field}" >&2
@@ -126,28 +126,28 @@ assert_capacity_samples() {
   local value
   line="$(grep -F 'sampled source-journal safety and capacity' "${log}" | tail -n 1 || true)"
   if [[ -z "${line}" ]] \
-    || [[ "$(log_unsigned_field gauge.anvil_source_journal_metrics_available "${line}" || true)" != "1" ]]
+    || [[ "$(log_unsigned_field gauge.keldra_source_journal_metrics_available "${line}" || true)" != "1" ]]
   then
     echo "${label} emitted no available source-journal capacity sample" >&2
     return 1
   fi
   for field in \
-    gauge.anvil_source_journal_retained_entries \
-    gauge.anvil_source_journal_retained_bytes \
-    gauge.anvil_source_journal_max_entries \
-    gauge.anvil_source_journal_max_bytes \
-    gauge.anvil_source_journal_index_lag_entries \
-    gauge.anvil_source_journal_progress_debt_entries \
-    gauge.anvil_source_journal_progress_debt_bytes \
-    gauge.anvil_source_journal_progress_debt_peak_entries \
-    gauge.anvil_source_journal_progress_debt_peak_bytes
+    gauge.keldra_source_journal_retained_entries \
+    gauge.keldra_source_journal_retained_bytes \
+    gauge.keldra_source_journal_max_entries \
+    gauge.keldra_source_journal_max_bytes \
+    gauge.keldra_source_journal_index_lag_entries \
+    gauge.keldra_source_journal_progress_debt_entries \
+    gauge.keldra_source_journal_progress_debt_bytes \
+    gauge.keldra_source_journal_progress_debt_peak_entries \
+    gauge.keldra_source_journal_progress_debt_peak_bytes
   do
     log_unsigned_field "${field}" "${line}" >/dev/null || {
       echo "${label} source-journal sample omitted ${field}" >&2
       return 1
     }
   done
-  value="$(log_unsigned_field gauge.anvil_source_journal_max_entries "${line}")"
+  value="$(log_unsigned_field gauge.keldra_source_journal_max_entries "${line}")"
   if [[ "${expected_journal_entries}" != "0" && "${value}" != "${expected_journal_entries}" ]]; then
     echo "${label} used source-journal max entries ${value}, expected ${expected_journal_entries}" >&2
     return 1
@@ -155,16 +155,16 @@ assert_capacity_samples() {
 
   line="$(grep -F 'sampled mutation receipt capacity' "${log}" | tail -n 1 || true)"
   if [[ -z "${line}" ]] \
-    || [[ "$(log_unsigned_field gauge.anvil_mutation_receipt_metrics_available "${line}" || true)" != "1" ]]
+    || [[ "$(log_unsigned_field gauge.keldra_mutation_receipt_metrics_available "${line}" || true)" != "1" ]]
   then
     echo "${label} emitted no available mutation-receipt capacity sample" >&2
     return 1
   fi
   for field in \
-    gauge.anvil_mutation_receipt_entries \
-    gauge.anvil_mutation_receipt_bytes \
-    gauge.anvil_mutation_receipt_max_entries \
-    gauge.anvil_mutation_receipt_max_bytes
+    gauge.keldra_mutation_receipt_entries \
+    gauge.keldra_mutation_receipt_bytes \
+    gauge.keldra_mutation_receipt_max_entries \
+    gauge.keldra_mutation_receipt_max_bytes
   do
     log_unsigned_field "${field}" "${line}" >/dev/null || {
       echo "${label} mutation-receipt sample omitted ${field}" >&2
@@ -185,8 +185,8 @@ assert_zero_current_source_journal_progress_debt() {
     return 1
   fi
   for field in \
-    gauge.anvil_source_journal_progress_debt_entries \
-    gauge.anvil_source_journal_progress_debt_bytes
+    gauge.keldra_source_journal_progress_debt_entries \
+    gauge.keldra_source_journal_progress_debt_bytes
   do
     value="$(log_unsigned_field "${field}" "${line}")" || {
       echo "${label} terminal source-journal sample omitted ${field}" >&2
@@ -204,14 +204,14 @@ preserve_all_kind_telemetry() {
   local topology="$2"
   local suffix="$3"
   local node="${4:-}"
-  local destination="/var/tmp/anvil-v090-${topology}-all-kind-telemetry-${suffix}"
+  local destination="/var/tmp/keldra-v090-${topology}-all-kind-telemetry-${suffix}"
   [[ -n "${node}" ]] && destination="${destination}-${node}"
   preserve_qualification_log "${source}" "${destination}.log"
 }
 
 preserve_startup_scan_evidence() {
   local destination="$1"
-  grep -F 'anvil_startup_scan_evidence' >"${destination}"
+  grep -F 'keldra_startup_scan_evidence' >"${destination}"
   test -s "${destination}"
   chmod 0600 "${destination}"
 }

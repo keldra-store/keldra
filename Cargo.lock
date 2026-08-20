@@ -166,197 +166,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "anvil-api"
-version = "0.9.4"
-dependencies = [
- "prost",
- "prost-types",
- "tonic",
- "tonic-prost",
- "tonic-prost-build",
-]
-
-[[package]]
-name = "anvil-atomic-program"
-version = "0.9.4"
-dependencies = [
- "blake3",
- "serde",
- "serde_json",
- "thiserror 2.0.19",
- "tokio",
-]
-
-[[package]]
-name = "anvil-authz"
-version = "0.9.4"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "anvil-consensus"
-version = "0.9.4"
-dependencies = [
- "bincode",
- "hyper-util",
- "libc",
- "openraft",
- "prost",
- "rocksdb",
- "rustls 0.23.43",
- "serde",
- "sha2 0.10.9",
- "tempfile",
- "thiserror 2.0.19",
- "tokio",
- "tokio-rustls 0.26.4",
- "tonic",
- "tonic-prost",
- "tonic-prost-build",
-]
-
-[[package]]
-name = "anvil-index"
-version = "0.9.4"
-dependencies = [
- "blake3",
- "futures-util",
- "sux",
- "thiserror 2.0.19",
- "tokio",
-]
-
-[[package]]
-name = "anvil-osv-qualification"
-version = "0.9.4"
-dependencies = [
- "anvil-api",
- "anyhow",
- "blake3",
- "clap",
- "futures-util",
- "hex",
- "prost",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tokio",
- "tonic",
- "zip",
- "zstd",
-]
-
-[[package]]
-name = "anvil-server"
-version = "0.9.4"
-dependencies = [
- "aes-gcm",
- "anvil-api",
- "anvil-atomic-program",
- "anvil-authz",
- "anvil-consensus",
- "anvil-index",
- "anvil-storage",
- "anvil-store",
- "anyhow",
- "async-stream",
- "aws-credential-types",
- "aws-sdk-s3",
- "aws-sigv4",
- "aws-smithy-runtime-api",
- "axum",
- "base64",
- "blake3",
- "bytes",
- "clap",
- "ed25519-dalek",
- "getrandom 0.3.4",
- "governor",
- "hex",
- "hmac 0.12.1",
- "http-body-util",
- "hyper-util",
- "jsonwebtoken",
- "libc",
- "memmap2",
- "opentelemetry",
- "opentelemetry-otlp",
- "opentelemetry_sdk",
- "personaldb-protocol",
- "prost",
- "prost-types",
- "rayon",
- "rcgen",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "subtle",
- "tempfile",
- "thiserror 2.0.19",
- "time",
- "tokio",
- "tokio-rustls 0.26.4",
- "tokio-stream",
- "tonic",
- "tonic-prost",
- "tonic-prost-build",
- "tower",
- "tracing",
- "tracing-opentelemetry",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
 name = "anvil-storage"
-version = "0.9.4"
+version = "0.9.5"
 dependencies = [
- "anvil-api",
- "tokio",
- "tokio-stream",
- "tonic",
-]
-
-[[package]]
-name = "anvil-storage-cli"
-version = "0.9.4"
-dependencies = [
- "anvil-storage",
- "anyhow",
- "blake3",
- "clap",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-stream",
- "tonic",
-]
-
-[[package]]
-name = "anvil-store"
-version = "0.9.4"
-dependencies = [
- "anvil-atomic-program",
- "anvil-authz",
- "anyhow",
- "argon2",
- "base64",
- "blake3",
- "crc32c",
- "getrandom 0.3.4",
- "hex",
- "reed-solomon-erasure",
- "rocksdb",
- "serde",
- "serde_json",
- "subtle",
- "tempfile",
- "thiserror 2.0.19",
- "tokio",
- "tracing",
+ "keldra",
 ]
 
 [[package]]
@@ -2852,6 +2665,201 @@ dependencies = [
  "serde",
  "serde_json",
  "simple_asn1",
+]
+
+[[package]]
+name = "keldra"
+version = "0.10.0"
+dependencies = [
+ "keldra-api",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+]
+
+[[package]]
+name = "keldra-api"
+version = "0.10.0"
+dependencies = [
+ "prost",
+ "prost-types",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+]
+
+[[package]]
+name = "keldra-atomic-program"
+version = "0.10.0"
+dependencies = [
+ "blake3",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+]
+
+[[package]]
+name = "keldra-authz"
+version = "0.10.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "keldra-cli"
+version = "0.10.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "clap",
+ "keldra",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+]
+
+[[package]]
+name = "keldra-consensus"
+version = "0.10.0"
+dependencies = [
+ "bincode",
+ "hyper-util",
+ "libc",
+ "openraft",
+ "prost",
+ "rocksdb",
+ "rustls 0.23.43",
+ "serde",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-rustls 0.26.4",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+]
+
+[[package]]
+name = "keldra-index"
+version = "0.10.0"
+dependencies = [
+ "blake3",
+ "futures-util",
+ "sux",
+ "thiserror 2.0.19",
+ "tokio",
+]
+
+[[package]]
+name = "keldra-osv-qualification"
+version = "0.10.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "clap",
+ "futures-util",
+ "hex",
+ "keldra-api",
+ "prost",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "tonic",
+ "zip",
+ "zstd",
+]
+
+[[package]]
+name = "keldra-server"
+version = "0.10.0"
+dependencies = [
+ "aes-gcm",
+ "anyhow",
+ "async-stream",
+ "aws-credential-types",
+ "aws-sdk-s3",
+ "aws-sigv4",
+ "aws-smithy-runtime-api",
+ "axum",
+ "base64",
+ "blake3",
+ "bytes",
+ "clap",
+ "ed25519-dalek",
+ "getrandom 0.3.4",
+ "governor",
+ "hex",
+ "hmac 0.12.1",
+ "http-body-util",
+ "hyper 1.11.0",
+ "hyper-util",
+ "jsonwebtoken",
+ "keldra",
+ "keldra-api",
+ "keldra-atomic-program",
+ "keldra-authz",
+ "keldra-consensus",
+ "keldra-index",
+ "keldra-store",
+ "libc",
+ "memmap2",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "personaldb-protocol",
+ "prost",
+ "prost-types",
+ "rayon",
+ "rcgen",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.19",
+ "time",
+ "tokio",
+ "tokio-rustls 0.26.4",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tower",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "keldra-store"
+version = "0.10.0"
+dependencies = [
+ "anyhow",
+ "argon2",
+ "base64",
+ "blake3",
+ "crc32c",
+ "getrandom 0.3.4",
+ "hex",
+ "keldra-atomic-program",
+ "keldra-authz",
+ "reed-solomon-erasure",
+ "rocksdb",
+ "serde",
+ "serde_json",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

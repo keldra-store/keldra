@@ -3,28 +3,30 @@ resolver = "3"
 
 members = [
     "clients/rust",
-    "crates/anvil",
-    "crates/anvil-api",
-    "crates/anvil-authz",
-    "crates/anvil-atomic-program",
-    "crates/anvil-cli",
-    "crates/anvil-consensus",
-    "crates/anvil-index",
-    "crates/anvil-osv-qualification",
-    "crates/anvil-store",
+    "clients/rust-legacy",
+    "crates/keldra",
+    "crates/keldra-api",
+    "crates/keldra-authz",
+    "crates/keldra-atomic-program",
+    "crates/keldra-cli",
+    "crates/keldra-consensus",
+    "crates/keldra-index",
+    "crates/keldra-osv-qualification",
+    "crates/keldra-store",
 ]
 
 [workspace.package]
-version = "0.9.4"
+version = "0.10.0"
 edition = "2024"
 readme = "README.md"
 description = "Opaque versioned object storage with bounded atomic programs"
 keywords = ["object-store", "storage", "compare-and-swap", "distributed-systems"]
 categories = ["database-implementations"]
-authors = ["Anvil maintainers <maintainers@anvil.storage>"]
+authors = ["Keldra maintainers <maintainers@keldra.store>"]
 license = "Apache-2.0"
-homepage = "https://anvil.storage"
-documentation = "https://anvil.storage"
+homepage = "https://keldra.store"
+documentation = "https://keldra.store"
+repository = "https://github.com/keldra-store/keldra"
 rust-version = "1.96.0"
 
 [profile.ci]

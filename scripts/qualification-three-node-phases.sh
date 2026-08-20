@@ -19,23 +19,23 @@ assert_compaction_telemetry_for_kind() {
   local ranges
   local worker_limit
   while IFS= read -r line; do
-    configured="$(log_unsigned_field gauge.anvil_index_compaction_configured_lanes "${line}")" \
+    configured="$(log_unsigned_field gauge.keldra_index_compaction_configured_lanes "${line}")" \
       || continue
-    worker_limit="$(log_unsigned_field gauge.anvil_index_compaction_worker_limit "${line}")" \
+    worker_limit="$(log_unsigned_field gauge.keldra_index_compaction_worker_limit "${line}")" \
       || return 1
-    budget_limit="$(log_unsigned_field gauge.anvil_index_compaction_budget_limit "${line}")" \
+    budget_limit="$(log_unsigned_field gauge.keldra_index_compaction_budget_limit "${line}")" \
       || return 1
     effective="$(log_unsigned_field compaction.effective_lanes "${line}")" \
       || return 1
-    range_limit="$(log_unsigned_field gauge.anvil_index_compaction_range_limit "${line}")" \
+    range_limit="$(log_unsigned_field gauge.keldra_index_compaction_range_limit "${line}")" \
       || return 1
-    ranges="$(log_unsigned_field gauge.anvil_index_compaction_ranges_total "${line}")" \
+    ranges="$(log_unsigned_field gauge.keldra_index_compaction_ranges_total "${line}")" \
       || return 1
-    completed="$(log_unsigned_field gauge.anvil_index_compaction_ranges_completed "${line}")" \
+    completed="$(log_unsigned_field gauge.keldra_index_compaction_ranges_completed "${line}")" \
       || return 1
-    peak_active="$(log_unsigned_field gauge.anvil_index_compaction_peak_active_lanes "${line}")" \
+    peak_active="$(log_unsigned_field gauge.keldra_index_compaction_peak_active_lanes "${line}")" \
       || return 1
-    input_segments="$(log_unsigned_field histogram.anvil_index_compaction_input_segments "${line}")" \
+    input_segments="$(log_unsigned_field histogram.keldra_index_compaction_input_segments "${line}")" \
       || return 1
     expected="${index_compaction_max_lanes}"
     ((worker_limit < expected)) && expected="${worker_limit}"
@@ -53,7 +53,7 @@ assert_compaction_telemetry_for_kind() {
       || peak_active > effective \
       || completed != ranges)) \
       || ! unsigned_decimal_is_positive "${range_limit}" \
-      || [[ "${line}" != *"anvil.index.compaction"* ]]
+      || [[ "${line}" != *"keldra.index.compaction"* ]]
     then
       echo "${kind} emitted inconsistent bounded distributed compaction telemetry" >&2
       printf '%s\n' "${line}" >&2
@@ -70,7 +70,7 @@ assert_compaction_telemetry_for_kind() {
     return 1
   fi
   if ! awk -v kind="index.kind=${kind}" '
-      index($0, kind) && index($0, "anvil.index.builder") &&
+      index($0, kind) && index($0, "keldra.index.builder") &&
       index($0, "index builder phase finished") { found = 1 }
       END { exit !found }
     ' "${log}"
@@ -91,12 +91,12 @@ assert_compaction_telemetry_for_kind() {
 preserve_journal_pressure_evidence() {
   local destination_prefix="$1"
   local node
-  for node in anvil-1 anvil-2 anvil-3; do
+  for node in keldra-1 keldra-2 keldra-3; do
     preserve_qualification_log \
       "${ANVIL_QUALIFICATION_DIR}/artifacts/index-gap-recovery-${node}.log" \
       "${destination_prefix}-${node}.log"
   done
-  echo "[anvil-qualification] preserved journal-pressure evidence ${destination_prefix}-anvil-{1,2,3}.log"
+  echo "[keldra-qualification] preserved journal-pressure evidence ${destination_prefix}-keldra-{1,2,3}.log"
 }
 
 capture_three_node_resource_evidence() {
@@ -140,7 +140,7 @@ wait_for_source_journal_entry_bound() {
         | tail -n 1 || true
     )"
     if [[ -n "${line}" ]] \
-      && [[ "$(log_unsigned_field gauge.anvil_source_journal_max_entries "${line}" || true)" == "${expected}" ]]
+      && [[ "$(log_unsigned_field gauge.keldra_source_journal_max_entries "${line}" || true)" == "${expected}" ]]
     then
       return 0
     fi
@@ -167,23 +167,23 @@ start_source_journal_phase() {
 start_release_source_journal_phase() {
   local bound="$1"
   local node
-  start_source_journal_phase "${bound}" anvil-1 anvil-2 anvil-3
+  start_source_journal_phase "${bound}" keldra-1 keldra-2 keldra-3
   public_endpoints=()
-  for node in anvil-1 anvil-2 anvil-3; do
+  for node in keldra-1 keldra-2 keldra-3; do
     public_endpoints+=("$(public_endpoint_for "${node}")")
   done
-  echo "[anvil-qualification] journal-pressure phase ended; release phases use source-journal max entries ${bound}"
+  echo "[keldra-qualification] journal-pressure phase ended; release phases use source-journal max entries ${bound}"
 }
 
 prepare_joining_node() {
   local node_id="$1"
-  local service="anvil-${node_id}"
+  local service="keldra-${node_id}"
   local peer_address="${service}:50052"
   local leader
   local output=""
   local bundle_path=""
   local source_service=""
-  for leader in anvil-1 anvil-2 anvil-3; do
+  for leader in keldra-1 keldra-2 keldra-3; do
     if ! compose ps --status running --services | grep -Fxq "${leader}"; then
       continue
     fi
@@ -195,13 +195,13 @@ prepare_joining_node() {
       break
     fi
   done
-  if [[ "${bundle_path}" != "/var/lib/anvil/anvil-node-${node_id}.join.json" ]]; then
+  if [[ "${bundle_path}" != "/var/lib/keldra/keldra-node-${node_id}.join.json" ]]; then
     echo "node ${node_id} preparation did not return its expected private bundle" >&2
     echo "last administration output: ${output}" >&2
     return 1
   fi
 
-  local copied="${ANVIL_QUALIFICATION_DIR}/artifacts/anvil-node-${node_id}.join.json"
+  local copied="${ANVIL_QUALIFICATION_DIR}/artifacts/keldra-node-${node_id}.join.json"
   compose cp "${source_service}:${bundle_path}" "${copied}"
   chmod 0600 "${copied}"
   docker run --rm --user 0 \
@@ -211,11 +211,11 @@ prepare_joining_node() {
 
 start_prepared_node() {
   local node_id="$1"
-  local service="anvil-${node_id}"
+  local service="keldra-${node_id}"
   compose up --detach "${service}"
   wait_for_node "${service}"
   assert_sparse_index_startup "${service}" 1
-  if [[ -e "${ANVIL_QUALIFICATION_DIR}/artifacts/anvil-node-${node_id}.join.json" ]]; then
+  if [[ -e "${ANVIL_QUALIFICATION_DIR}/artifacts/keldra-node-${node_id}.join.json" ]]; then
     echo "${service} became ready without consuming and deleting its join bundle" >&2
     return 1
   fi
@@ -228,7 +228,7 @@ prepare_and_start_node() {
 
 start_prepared_node_during_indexed_cutover() {
   local node_id="$1"
-  local service="anvil-${node_id}"
+  local service="keldra-${node_id}"
   if [[ -z "${paused_container}" ]]; then
     echo "indexed membership cutover has no paused pre-cutover builder" >&2
     return 1
@@ -242,7 +242,7 @@ start_prepared_node_during_indexed_cutover() {
   paused_container=""
   wait_for_node "${service}"
   assert_sparse_index_startup "${service}" 1
-  if [[ -e "${ANVIL_QUALIFICATION_DIR}/artifacts/anvil-node-${node_id}.join.json" ]]; then
+  if [[ -e "${ANVIL_QUALIFICATION_DIR}/artifacts/keldra-node-${node_id}.join.json" ]]; then
     echo "${service} became ready without consuming and deleting its join bundle" >&2
     return 1
   fi
@@ -295,12 +295,12 @@ source_journal_sample_is_clear_at_bound() {
   local settled
   local tail
   [[ -n "${line}" ]] || return 1
-  tail="$(log_unsigned_field gauge.anvil_source_journal_tail "${line}" || true)"
-  settled="$(log_unsigned_field gauge.anvil_source_journal_settled_through "${line}" || true)"
-  index="$(log_unsigned_field gauge.anvil_source_journal_index_safe_through "${line}" || true)"
-  accounting="$(log_unsigned_field gauge.anvil_source_journal_accounting_safe_through "${line}" || true)"
-  retained="$(log_unsigned_field gauge.anvil_source_journal_retained_entries "${line}" || true)"
-  maximum="$(log_unsigned_field gauge.anvil_source_journal_max_entries "${line}" || true)"
+  tail="$(log_unsigned_field gauge.keldra_source_journal_tail "${line}" || true)"
+  settled="$(log_unsigned_field gauge.keldra_source_journal_settled_through "${line}" || true)"
+  index="$(log_unsigned_field gauge.keldra_source_journal_index_safe_through "${line}" || true)"
+  accounting="$(log_unsigned_field gauge.keldra_source_journal_accounting_safe_through "${line}" || true)"
+  retained="$(log_unsigned_field gauge.keldra_source_journal_retained_entries "${line}" || true)"
+  maximum="$(log_unsigned_field gauge.keldra_source_journal_max_entries "${line}" || true)"
   [[ -n "${tail}" \
     && "${settled}" == "${tail}" \
     && "${index}" == "${tail}" \
@@ -385,7 +385,7 @@ prepare_no_event_membership_cutover_qualification() {
     return 1
   fi
   membership_cutover_source_tail="$(
-    log_unsigned_field gauge.anvil_source_journal_tail "${line}"
+    log_unsigned_field gauge.keldra_source_journal_tail "${line}"
   )"
   fence="$(latest_completed_membership_fence "${node}" "${node_id}")"
   membership_cutover_source_fence_term="$(
@@ -401,7 +401,7 @@ prepare_no_event_membership_cutover_qualification() {
     return 1
   fi
   membership_cutover_source_log_start="$(log_cursor)"
-  echo "[anvil-qualification] non-coordinator source ${node_id} reached journal bound ${bound} at tail ${membership_cutover_source_tail} before the no-event 2->3 cutover"
+  echo "[keldra-qualification] non-coordinator source ${node_id} reached journal bound ${bound} at tail ${membership_cutover_source_tail} before the no-event 2->3 cutover"
 }
 
 new_cutover_fence_line() {
@@ -443,8 +443,8 @@ grpcurl_public() {
     return 2
   }
   grpcurl -plaintext -max-time 35 \
-    -import-path "${repo_root}/crates/anvil-api/proto" \
-    -import-path /usr/include -proto anvil.proto "$@" "${endpoint}"
+    -import-path "${repo_root}/crates/keldra-api/proto" \
+    -import-path /usr/include -proto keldra.proto "$@" "${endpoint}"
 }
 
 cutover_access_token() {
@@ -456,7 +456,7 @@ cutover_access_token() {
     jq -nc --arg client_id "${client_id}" --arg client_secret "${client_secret}" \
       '{clientId:$client_id,clientSecret:$client_secret}' \
       | grpcurl_public "${endpoint}" -d @ \
-          anvil.v1.CredentialService/ExchangeClientCredentials
+          keldra.v1.CredentialService/ExchangeClientCredentials
   )"
   jq -er '.accessToken | select(type == "string" and length > 0)' <<<"${response}"
 }
@@ -570,7 +570,7 @@ prepare_indexed_membership_cutover_qualification() {
     last_index=$((membership_cutover_index_burst - 1))
     before_line="$(latest_source_journal_sample "${source_node}")"
     before_tail="$(
-      log_unsigned_field gauge.anvil_source_journal_tail "${before_line}" || true
+      log_unsigned_field gauge.keldra_source_journal_tail "${before_line}" || true
     )"
     if [[ -z "${before_tail}" ]]; then
       sleep 1
@@ -584,7 +584,7 @@ prepare_indexed_membership_cutover_qualification() {
         "${first}" "${membership_cutover_index_burst}" \
       | grpcurl_public "${endpoint}" \
           -H "authorization: Bearer ${membership_cutover_index_token}" -d @ \
-          anvil.v1.ObjectService/BulkWrite >"${response}"
+          keldra.v1.ObjectService/BulkWrite >"${response}"
     then
       sleep 1
       continue
@@ -621,9 +621,9 @@ prepare_indexed_membership_cutover_qualification() {
     )"
     for sample_attempt in $(seq 1 15); do
       line="$(latest_source_journal_sample "${source_node}")"
-      tail="$(log_unsigned_field gauge.anvil_source_journal_tail "${line}" || true)"
+      tail="$(log_unsigned_field gauge.keldra_source_journal_tail "${line}" || true)"
       index_safe="$(
-        log_unsigned_field gauge.anvil_source_journal_index_safe_through "${line}" || true
+        log_unsigned_field gauge.keldra_source_journal_index_safe_through "${line}" || true
       )"
       if [[ -n "${tail}" && -n "${index_safe}" ]] \
         && ((tail > before_tail && index_safe < tail))
@@ -631,8 +631,8 @@ prepare_indexed_membership_cutover_qualification() {
         membership_cutover_index_source_tail="${tail}"
         preserve_qualification_log \
           "${builder_log}" \
-          "/var/tmp/anvil-v090-three-membership-indexed-pending-${qualification_suffix}-${builder}.log"
-        echo "[anvil-qualification] Path index ${membership_cutover_index_id} has accepted effect ${membership_cutover_index_path}@${membership_cutover_index_version} pending at source ${source_node_id} tail ${tail}; old-fence builder ${builder} is paused with no later publication"
+          "/var/tmp/keldra-v090-three-membership-indexed-pending-${qualification_suffix}-${builder}.log"
+        echo "[keldra-qualification] Path index ${membership_cutover_index_id} has accepted effect ${membership_cutover_index_path}@${membership_cutover_index_version} pending at source ${source_node_id} tail ${tail}; old-fence builder ${builder} is paused with no later publication"
         return 0
       fi
       sleep 1
@@ -710,7 +710,7 @@ wait_for_indexed_cutover_effect() {
   local all_ready
   for attempt in $(seq 1 90); do
     all_ready=1
-    for node in anvil-1 anvil-2 anvil-3; do
+    for node in keldra-1 keldra-2 keldra-3; do
       endpoint="$(public_endpoint_for "${node}")"
       response="${ANVIL_QUALIFICATION_DIR}/artifacts/membership-indexed-query-${node}.json"
       : >"${response}"
@@ -718,7 +718,7 @@ wait_for_indexed_cutover_effect() {
       if ! indexed_cutover_query_request "${tenant}" \
         | grpcurl_public "${endpoint}" \
             -H "authorization: Bearer ${membership_cutover_index_token}" -d @ \
-            anvil.v1.IndexService/QueryIndex >"${response}" 2>/dev/null \
+            keldra.v1.IndexService/QueryIndex >"${response}" 2>/dev/null \
         || ! indexed_cutover_response_matches \
           "${response}" "${tenant}" "${fence_term}" "${fence_index}"
       then
@@ -729,10 +729,10 @@ wait_for_indexed_cutover_effect() {
     done
     if ((all_ready == 1)); then
       membership_cutover_index_generation_after="${generation}"
-      for node in anvil-1 anvil-2 anvil-3; do
+      for node in keldra-1 keldra-2 keldra-3; do
         preserve_qualification_log \
           "${ANVIL_QUALIFICATION_DIR}/artifacts/membership-indexed-query-${node}.json" \
-          "/var/tmp/anvil-v090-three-membership-indexed-query-${qualification_suffix}-${node}.json"
+          "/var/tmp/keldra-v090-three-membership-indexed-query-${qualification_suffix}-${node}.json"
       done
       return 0
     fi
@@ -779,9 +779,9 @@ qualify_no_event_membership_cutover() {
     if [[ -n "${membership_cutover_index_id}" ]]; then
       fence_term="$(log_unsigned_field membership.term "${fence}" || true)"
       fence_index="$(log_unsigned_field membership.index "${fence}" || true)"
-      indexed_line="$(latest_source_journal_sample anvil-1)"
+      indexed_line="$(latest_source_journal_sample keldra-1)"
       if [[ -n "${fence_term}" && -n "${fence_index}" ]] \
-        && [[ "$(log_unsigned_field gauge.anvil_source_journal_index_safe_through "${indexed_line}" || true)" \
+        && [[ "$(log_unsigned_field gauge.keldra_source_journal_index_safe_through "${indexed_line}" || true)" \
           == "${membership_cutover_index_source_tail}" ]]
       then
         wait_for_indexed_cutover_effect \
@@ -793,7 +793,7 @@ qualify_no_event_membership_cutover() {
       fi
     fi
     if source_journal_sample_is_clear_at_bound "${line}" "${bound}"; then
-      tail="$(log_unsigned_field gauge.anvil_source_journal_tail "${line}")"
+      tail="$(log_unsigned_field gauge.keldra_source_journal_tail "${line}")"
       if [[ "${tail}" != "${membership_cutover_source_tail}" ]]; then
         echo "${node} appended source events during the intended no-event cutover" >&2
         echo "pre-cutover tail: ${membership_cutover_source_tail}; post-cutover tail: ${tail}" >&2
@@ -819,7 +819,7 @@ qualify_no_event_membership_cutover() {
     post 0 "${bound}"
   for attempt in $(seq 1 30); do
     line="$(latest_source_journal_sample "${node}")"
-    tail="$(log_unsigned_field gauge.anvil_source_journal_tail "${line}" || true)"
+    tail="$(log_unsigned_field gauge.keldra_source_journal_tail "${line}" || true)"
     [[ -n "${tail}" ]] \
       && ((tail > membership_cutover_source_tail)) \
       && break
@@ -832,9 +832,9 @@ qualify_no_event_membership_cutover() {
   save_log_suffix "${node}" "${membership_cutover_source_log_start}" "${evidence}"
   preserve_qualification_log \
     "${evidence}" \
-    "/var/tmp/anvil-v090-three-membership-no-event-${qualification_suffix}-${node}.log"
+    "/var/tmp/keldra-v090-three-membership-no-event-${qualification_suffix}-${node}.log"
   if [[ -n "${membership_cutover_index_id}" ]]; then
-    echo "[anvil-qualification] indexed cutover preserved Path index ${membership_cutover_index_id}, made ${membership_cutover_index_path}@${membership_cutover_index_version} visible in generation ${membership_cutover_index_generation_after}, and proved three-source zero-lag freshness under the exact three-ACTIVE-node fence"
+    echo "[keldra-qualification] indexed cutover preserved Path index ${membership_cutover_index_id}, made ${membership_cutover_index_path}@${membership_cutover_index_version} visible in generation ${membership_cutover_index_generation_after}, and proved three-source zero-lag freshness under the exact three-ACTIVE-node fence"
   fi
-  echo "[anvil-qualification] cutover advanced index/accounting through source ${node_id} tail ${membership_cutover_source_tail} under the new fence; the next ordinary write advanced it to ${tail}"
+  echo "[keldra-qualification] cutover advanced index/accounting through source ${node_id} tail ${membership_cutover_source_tail} under the new fence; the next ordinary write advanced it to ${tail}"
 }
