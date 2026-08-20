@@ -1,17 +1,17 @@
-# ANVIL-0011: Streaming Succinct Indexes in Anvil 0.6.0
+# KELDRA-0011: Streaming Succinct Indexes in Keldra 0.6.0
 
-Status: Superseded by ANVIL-0012.
+Status: Superseded by KELDRA-0012.
 
-Audience: Anvil implementors, operators, client authors, and reviewers
+Audience: Keldra implementors, operators, client authors, and reviewers
 
-Compatibility: None for indexes. Anvil 0.6.0 does not read, convert, migrate,
-dual-publish, or fall back to an Anvil 0.5.x index definition, artifact,
+Compatibility: None for indexes. Keldra 0.6.0 does not read, convert, migrate,
+dual-publish, or fall back to an Keldra 0.5.x index definition, artifact,
 generation, cache entry, or page token. The index subsystem is implemented as
 a clean replacement.
 
 ## 1. Decision
 
-Anvil 0.6.0 replaces whole-generation index construction with a bounded,
+Keldra 0.6.0 replaces whole-generation index construction with a bounded,
 streaming segment architecture:
 
 ```text
@@ -21,7 +21,7 @@ cluster source journals and snapshot barriers
   -> immutable write-optimized L0 segments
   -> streaming size-tiered compaction
   -> immutable quasi-succinct merged segments
-  -> ordinary Anvil objects with the strongest available acknowledgement
+  -> ordinary Keldra objects with the strongest available acknowledgement
   -> one CAS-published generation manifest
 ```
 
@@ -33,10 +33,10 @@ in place.
 One complete query is always evaluated on one node. Weighted rendezvous
 hashing (weighted HRW) selects one builder and up to three query replicas from
 the active cluster membership. A query may enter through any node, but it is
-proxied to one selected query replica. Anvil never scatter-queries independent
+proxied to one selected query replica. Keldra never scatter-queries independent
 per-node index partitions and never merges network-distributed result sets.
 
-Index components and their independently fetchable blocks are ordinary Anvil
+Index components and their independently fetchable blocks are ordinary Keldra
 objects. Small components use the ordinary inline path; larger components use
 the ordinary erasure-coded byte plane. The index cache is disposable. Raft
 contains neither index bytes, index paths, index assignments, index cursors nor
@@ -48,14 +48,14 @@ consume another index's allowance, and many indexes of one kind cannot multiply
 that kind's configured limit. Work pauses or flushes before the limit is
 exceeded; it does not buffer an unbounded backlog in memory.
 
-Anvil adopts the pure-Rust [`sux`](https://github.com/vigna/sux-rs) crate for
+Keldra adopts the pure-Rust [`sux`](https://github.com/vigna/sux-rs) crate for
 succinct structures and adopts [Rayon](https://github.com/rayon-rs/rayon) for
 bounded CPU parallelism. Both dependencies are approved for this design.
 Rayon work must still hold the same byte-budget permits as synchronous work;
 parallelism is never an escape from memory accounting.
 
 The 0.6.0 dependency is pinned to `sux = 0.14.0` with default features disabled
-and only its `rayon` feature enabled. Anvil uses the Apache-2.0 option of
+and only its `rayon` feature enabled. Keldra uses the Apache-2.0 option of
 `sux`'s `Apache-2.0 OR LGPL-2.1-or-later` license. This deliberately excludes
 its unrelated Flate, Zstandard, Serde and epserde features. The resolved Rayon
 version is 1.12.0 under its `MIT OR Apache-2.0` license. `Cargo.lock` is the
@@ -79,9 +79,9 @@ anonymized facts are:
   records indexed over 12 fields;
 - ingress used four concurrent batches of 256 items with a 60 MiB maximum
   encoded batch size;
-- the run reached 687,395 records before Anvil became unavailable and the host
+- the run reached 687,395 records before Keldra became unavailable and the host
   ultimately required recovery after an out-of-memory event;
-- four complete samples showed Anvil RSS grow from about 37.2 GiB to 45.7 GiB
+- four complete samples showed Keldra RSS grow from about 37.2 GiB to 45.7 GiB
   in 25.25 seconds, an increase of about 9.19 GiB during that short interval;
 - the detailed memory map attributed about 46.3 GiB to anonymous RSS and only
   about 0.63 GiB to file-backed RSS, so approximately 98.7% of process RSS was
@@ -109,7 +109,7 @@ an emergent property of corpus size.
 
 ## 3. Research basis
 
-MG4J's construction process is a close match for Anvil's execution boundary.
+MG4J's construction process is a close match for Keldra's execution boundary.
 MG4J accumulates a bounded batch, writes it as a separately queryable subindex,
 and combines batches later. Its manual explicitly describes flushing a batch
 when a document threshold is reached or available memory is low, and exposing
@@ -129,15 +129,15 @@ known.
 
 The modern Rust [`sux`](https://github.com/vigna/sux-rs) project supplies
 Elias-Fano dictionaries, rank/select bit vectors, prefix-omission string lists,
-static filters and related succinct structures. Anvil uses those structures in
+static filters and related succinct structures. Keldra uses those structures in
 merged index components instead of porting MG4J's Java implementation.
 
 [`epserde`](https://github.com/vigna/epserde-rs) demonstrates a useful owned-to-
 borrowed model for opening large immutable Rust structures with very little
 copying. Its own documentation warns that validation and padding cleaning are
-the caller's responsibility. Anvil adopts the design lesson—flat immutable
+the caller's responsibility. Keldra adopts the design lesson—flat immutable
 arrays behind pinned handles—but does not make epserde's native-layout format
-the authoritative 0.6 storage format. Authoritative blocks use Anvil's explicit,
+the authoritative 0.6 storage format. Authoritative blocks use Keldra's explicit,
 versioned, fixed-width encoding so AMD64 and ARM64 nodes can exchange them.
 
 Navarro and Mäkinen's survey of
@@ -161,7 +161,7 @@ BM25-style ranking and phrase queries.
 4. One query executes completely on one selected node. There is no distributed
    scatter/gather query plan.
 5. Index definitions, segments, components, blocks, manifests and current
-   pointers use ordinary Anvil objects and ordinary reference accounting.
+   pointers use ordinary Keldra objects and ordinary reference accounting.
 6. Every artifact named by a published generation has completed the artifact
    acknowledgement defined in Section 14 before the current pointer can name
    it.
@@ -174,7 +174,7 @@ BM25-style ranking and phrase queries.
 10. An atomic program becomes index-visible no less atomically than it becomes
     visible through ordinary object reads.
 11. A journal gap, source-epoch change or unprovable snapshot boundary triggers
-    a complete rebuild. Anvil never guesses past missing evidence.
+    a complete rebuild. Keldra never guesses past missing evidence.
 12. Zanzibar authorization applies to definition management, querying and
     every exact result whose visibility is not proven by a coarser authorized
     boundary.
@@ -206,7 +206,7 @@ BM25-style ranking and phrase queries.
 
 ## 6. Non-goals
 
-Anvil 0.6.0 does not provide:
+Keldra 0.6.0 does not provide:
 
 - a mutable in-place B-tree, posting file, HNSW graph or other authoritative
   index page;
@@ -248,7 +248,7 @@ changes.
 
 **Block** is the independently fetched, checksummed ordinary object holding a
 bounded range of one component. An index block is not an erasure-code shard.
-The ordinary Anvil byte plane may erasure-code the block's payload.
+The ordinary Keldra byte plane may erasure-code the block's payload.
 
 **Generation manifest** is the immutable description of the exact active
 run set and source coverage presented to queries.
@@ -287,7 +287,7 @@ Every ACTIVE node retains its locally ordered, gap-detecting source journal.
 The current builder pulls all required source journals over the authenticated
 peer API. A source event is an invalidation, not trusted index content: the
 builder rereads the current authoritative head and, when needed, its payload
-through ordinary Anvil APIs.
+through ordinary Keldra APIs.
 
 The builder records one `(source_epoch, next_offset)` cursor per source. Events
 from different sources need no global order. Exact-path versions are monotonic,
@@ -321,7 +321,7 @@ Lag remains evidence for the client, not a query-admission error.
 Startup configuration supplies one positive byte limit for each enabled
 `IndexKind`. For example, all full-text definitions assigned to a node share
 the full-text limit; all vector definitions share a separate vector limit. The
-sum of the configured per-kind limits is the maximum heap Anvil deliberately
+sum of the configured per-kind limits is the maximum heap Keldra deliberately
 offers to simultaneous index construction, apart from small fixed scheduler,
 task and allocator overhead which must be measured and reported.
 
@@ -631,7 +631,7 @@ disagree by showing only part of an atomic program at one claimed checkpoint.
 
 The selected query replica reads and validates one current pointer and pins its
 immutable generation for the request. A generation directory exposes an async,
-file-like Anvil API; it does not return `std::fs::File` and does not borrow a
+file-like Keldra API; it does not return `std::fs::File` and does not borrow a
 caller-owned mutable slice across an async boundary. Reads return an immutable
 reference-counted slice for at most the requested length together with its
 logical offset.
@@ -651,7 +651,7 @@ sets.
 Mapped immutable blocks are useful, but a mapped virtual range is not counted
 as free memory. The cache manager tracks pinned decoded bytes and open mappings,
 keeps roots preferentially, and avoids pinning a whole index solely because a
-query touches one term. Linux may reclaim clean file-backed pages; Anvil's hard
+query touches one term. Linux may reclaim clean file-backed pages; Keldra's hard
 construction budgets still apply to anonymous builder allocations independently
 of page-cache behavior.
 
@@ -665,8 +665,8 @@ kind-specific data. A definition for `/tenant/123` does not include
 
 Every management request is authenticated and Zanzibar authorized. A query may
 instead omit credentials, in which case it must name its tenant explicitly and
-Anvil binds it to the fixed anonymous subject. Authenticated queries may omit
-the tenant; a supplied tenant must match the signed identity. Anvil checks the
+Keldra binds it to the fixed anonymous subject. Authenticated queries may omit
+the tenant; a supplied tenant must match the signed identity. Keldra checks the
 coarse index/bucket capability first. Segment path ranges, definition scope and
 query predicates then eliminate impossible candidates. Remaining exact object
 results are checked in bounded Zanzibar batches at the generation's
@@ -834,7 +834,7 @@ routed keys for commit/path and object-ID lookup. Exact commit/path lookup seeks
 one key range; prefix tree lookup streams the contiguous path range; object
 lookup streams its locations. One source projection group must fit a format-2
 leaf in 0.6.0 and is rejected before admission otherwise. Object bodies remain
-ordinary Anvil objects and are not copied into the index.
+ordinary Keldra objects and are not copied into the index.
 
 ### 21.8 Tensor
 
@@ -851,7 +851,7 @@ remain in their ordinary objects.
 
 A genuinely mutable compressed index would require in-place page updates,
 write-ahead recovery, latches, split/merge coordination and erasure-stripe
-rewrites. In Anvil it would also turn derived data into a new distributed
+rewrites. In Keldra it would also turn derived data into a new distributed
 authority and make a small logical update rewrite parity-bearing storage.
 
 Those costs are justified when a database index is part of the authoritative
@@ -867,7 +867,7 @@ generation-manifest boundary.
 ## 23. Future exact substring/self-index type
 
 An FM index or compressed suffix array serves arbitrary substring search,
-whereas Anvil's full-text kind serves tokenized fields, phrase positions and
+whereas Keldra's full-text kind serves tokenized fields, phrase positions and
 ranked document retrieval. Combining them under one kind would create ambiguous
 query and scoring semantics.
 
@@ -878,7 +878,7 @@ A future `SUBSTRING` or `SEQUENCE` kind may use the Navarro–Mäkinen technique
 - sampling for locate and display tradeoffs; and
 - run-length representations for highly repetitive corpora.
 
-It must still use bounded immutable segments, ordinary Anvil component blocks,
+It must still use bounded immutable segments, ordinary Keldra component blocks,
 one-node query execution and generation CAS. Deletes and overwrites must pass
 through the common path/version visibility layer because a static self-index
 otherwise continues to contain deleted suffix occurrences. It is explicitly
@@ -1037,14 +1037,14 @@ explicitly. Discovery rejects unsupported definitions; generation loading
 rejects unsupported current pointers, manifests, roots and blocks. An invalid
 candidate is never CAS-published, so the preceding valid generation stays
 current. Corruption of an already-published current pointer makes that one
-definition unavailable and causes its builder to report and retry. Anvil does
+definition unavailable and causes its builder to report and retry. Keldra does
 not add a cluster-wide startup scan merely to discover dormant corrupt derived
 objects. The implementation never probes a format-1 current pointer and never
 mistakes it for an empty v2 index.
 
 ## 28. Release acceptance
 
-Anvil 0.6.0 is ready to tag only when:
+Keldra 0.6.0 is ready to tag only when:
 
 1. the old index implementation and dependencies used only by it are removed;
 2. `sux` and Rayon licenses, features and locked dependency trees are recorded;

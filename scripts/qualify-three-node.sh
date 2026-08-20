@@ -6,34 +6,34 @@ source "${repo_root}/scripts/qualification-scale-evidence.sh"
 source "${repo_root}/scripts/qualification-three-node-phases.sh"
 compose_file="${repo_root}/tests/cluster/docker-compose.yml"
 start_node="${repo_root}/tests/cluster/start-node.sh"
-requested_image="${ANVIL_IMAGE:-keldra:0.10.0}"
-qualification_mode="${ANVIL_QUALIFICATION_MODE:-smoke}"
-index_disk_cache_bytes="${ANVIL_QUALIFICATION_INDEX_DISK_CACHE_BYTES:-1073741824}"
-index_memory_percent="${ANVIL_QUALIFICATION_INDEX_MEMORY_PERCENT:-20}"
-index_kind_budget_bytes="${ANVIL_QUALIFICATION_INDEX_KIND_BUDGET_BYTES:-268435456}"
-index_compaction_max_lanes="${ANVIL_QUALIFICATION_INDEX_COMPACTION_MAX_LANES:-4}"
-index_rayon_workers="${ANVIL_QUALIFICATION_INDEX_RAYON_WORKERS:-4}"
-index_projection_max_lanes="${ANVIL_QUALIFICATION_INDEX_PROJECTION_MAX_LANES:-${index_rayon_workers}}"
+requested_image="${KELDRA_IMAGE:-keldra:0.11.0}"
+qualification_mode="${KELDRA_QUALIFICATION_MODE:-smoke}"
+index_disk_cache_bytes="${KELDRA_QUALIFICATION_INDEX_DISK_CACHE_BYTES:-1073741824}"
+index_memory_percent="${KELDRA_QUALIFICATION_INDEX_MEMORY_PERCENT:-20}"
+index_kind_budget_bytes="${KELDRA_QUALIFICATION_INDEX_KIND_BUDGET_BYTES:-268435456}"
+index_compaction_max_lanes="${KELDRA_QUALIFICATION_INDEX_COMPACTION_MAX_LANES:-4}"
+index_rayon_workers="${KELDRA_QUALIFICATION_INDEX_RAYON_WORKERS:-4}"
+index_projection_max_lanes="${KELDRA_QUALIFICATION_INDEX_PROJECTION_MAX_LANES:-${index_rayon_workers}}"
 # The default is a fast smoke. Set this to 839980 for the full
 # production-shaped, twelve-field corpus used by the resource qualification.
 case "${qualification_mode}" in
   release)
-    index_resource_records="${ANVIL_QUALIFICATION_INDEX_RECORDS:-839980}"
+    index_resource_records="${KELDRA_QUALIFICATION_INDEX_RECORDS:-839980}"
     require_performance_targets=1
     ;;
   smoke)
-    index_resource_records="${ANVIL_QUALIFICATION_INDEX_RECORDS:-16384}"
+    index_resource_records="${KELDRA_QUALIFICATION_INDEX_RECORDS:-16384}"
     require_performance_targets=0
     ;;
   *)
-    echo "ANVIL_QUALIFICATION_MODE must be release or smoke" >&2
+    echo "KELDRA_QUALIFICATION_MODE must be release or smoke" >&2
     exit 2
     ;;
 esac
-index_resource_mutations="${ANVIL_QUALIFICATION_INDEX_MUTATIONS:-512}"
-index_resource_max_anonymous_growth_bytes="${ANVIL_QUALIFICATION_INDEX_MAX_ANONYMOUS_GROWTH_BYTES:-2147483648}"
-release_source_journal_max_entries="${ANVIL_QUALIFICATION_SOURCE_JOURNAL_MAX_ENTRIES:-1000000}"
-pressure_source_journal_max_entries="${ANVIL_QUALIFICATION_PRESSURE_SOURCE_JOURNAL_MAX_ENTRIES:-64}"
+index_resource_mutations="${KELDRA_QUALIFICATION_INDEX_MUTATIONS:-512}"
+index_resource_max_anonymous_growth_bytes="${KELDRA_QUALIFICATION_INDEX_MAX_ANONYMOUS_GROWTH_BYTES:-2147483648}"
+release_source_journal_max_entries="${KELDRA_QUALIFICATION_SOURCE_JOURNAL_MAX_ENTRIES:-1000000}"
+pressure_source_journal_max_entries="${KELDRA_QUALIFICATION_PRESSURE_SOURCE_JOURNAL_MAX_ENTRIES:-64}"
 index_kinds=(Path MetadataFilter TypedJson FullText Vector Hybrid GitSource Tensor)
 for configured_limit in \
   "${index_disk_cache_bytes}" \
@@ -54,7 +54,7 @@ do
   fi
 done
 if ((index_memory_percent > 100)); then
-  echo "ANVIL_QUALIFICATION_INDEX_MEMORY_PERCENT must not exceed 100" >&2
+  echo "KELDRA_QUALIFICATION_INDEX_MEMORY_PERCENT must not exceed 100" >&2
   exit 2
 fi
 case "${index_resource_records}" in
@@ -76,19 +76,19 @@ if ((pressure_source_journal_max_entries >= release_source_journal_max_entries))
   echo "journal-pressure entry bound must be smaller than the release entry bound" >&2
   exit 2
 fi
-export ANVIL_QUALIFICATION_INDEX_DISK_CACHE_BYTES="${index_disk_cache_bytes}"
-export ANVIL_QUALIFICATION_INDEX_MEMORY_PERCENT="${index_memory_percent}"
-export ANVIL_QUALIFICATION_INDEX_KIND_BUDGET_BYTES="${index_kind_budget_bytes}"
-export ANVIL_QUALIFICATION_INDEX_COMPACTION_MAX_LANES="${index_compaction_max_lanes}"
-export ANVIL_QUALIFICATION_INDEX_RAYON_WORKERS="${index_rayon_workers}"
-export ANVIL_QUALIFICATION_INDEX_PROJECTION_MAX_LANES="${index_projection_max_lanes}"
-export ANVIL_QUALIFICATION_SOURCE_JOURNAL_MAX_ENTRIES="${release_source_journal_max_entries}"
-export ANVIL_QUALIFICATION_RUST_LOG=info,keldra::index_runtime::cpu=warn,keldra::index_runtime::retention=debug,keldra::observability::runtime=debug
-case "${ANVIL_DOCKER_PLATFORM:-}" in
+export KELDRA_QUALIFICATION_INDEX_DISK_CACHE_BYTES="${index_disk_cache_bytes}"
+export KELDRA_QUALIFICATION_INDEX_MEMORY_PERCENT="${index_memory_percent}"
+export KELDRA_QUALIFICATION_INDEX_KIND_BUDGET_BYTES="${index_kind_budget_bytes}"
+export KELDRA_QUALIFICATION_INDEX_COMPACTION_MAX_LANES="${index_compaction_max_lanes}"
+export KELDRA_QUALIFICATION_INDEX_RAYON_WORKERS="${index_rayon_workers}"
+export KELDRA_QUALIFICATION_INDEX_PROJECTION_MAX_LANES="${index_projection_max_lanes}"
+export KELDRA_QUALIFICATION_SOURCE_JOURNAL_MAX_ENTRIES="${release_source_journal_max_entries}"
+export KELDRA_QUALIFICATION_RUST_LOG=info,keldra::index_runtime::cpu=warn,keldra::index_runtime::retention=debug,keldra::observability::runtime=debug
+case "${KELDRA_DOCKER_PLATFORM:-}" in
   "")
     case "$(uname -m)" in
-      x86_64|amd64) export ANVIL_DOCKER_PLATFORM=linux/amd64 ;;
-      aarch64|arm64) export ANVIL_DOCKER_PLATFORM=linux/arm64 ;;
+      x86_64|amd64) export KELDRA_DOCKER_PLATFORM=linux/amd64 ;;
+      aarch64|arm64) export KELDRA_DOCKER_PLATFORM=linux/arm64 ;;
       *)
         echo "unsupported host architecture: $(uname -m)" >&2
         exit 2
@@ -97,7 +97,7 @@ case "${ANVIL_DOCKER_PLATFORM:-}" in
     ;;
   linux/amd64|linux/arm64) ;;
   *)
-    echo "unsupported ANVIL_DOCKER_PLATFORM=${ANVIL_DOCKER_PLATFORM}" >&2
+    echo "unsupported KELDRA_DOCKER_PLATFORM=${KELDRA_DOCKER_PLATFORM}" >&2
     exit 2
     ;;
 esac
@@ -185,8 +185,8 @@ if [[ ! "${image_id}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
   exit 2
 fi
 container_platform="$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "${image_id}")"
-if [[ "${container_platform}" != "${ANVIL_DOCKER_PLATFORM}" ]]; then
-  echo "qualification image platform ${container_platform} does not match ${ANVIL_DOCKER_PLATFORM}" >&2
+if [[ "${container_platform}" != "${KELDRA_DOCKER_PLATFORM}" ]]; then
+  echo "qualification image platform ${container_platform} does not match ${KELDRA_DOCKER_PLATFORM}" >&2
   exit 2
 fi
 image_revision="$(
@@ -199,42 +199,42 @@ if [[ "${image_revision}" != "${source_commit}" ]]; then
   exit 2
 fi
 server_version="$(
-  docker run --rm --platform "${ANVIL_DOCKER_PLATFORM}" \
+  docker run --rm --platform "${KELDRA_DOCKER_PLATFORM}" \
     "${image_id}" keldra-server --version
 )"
 client_version="$(
-  docker run --rm --platform "${ANVIL_DOCKER_PLATFORM}" \
+  docker run --rm --platform "${KELDRA_DOCKER_PLATFORM}" \
     "${image_id}" keldra --version
 )"
-if [[ "${server_version}" != "keldra-server 0.10.0" \
-  || "${client_version}" != "keldra 0.10.0" ]]; then
-  echo "qualification requires the exact Keldra 0.10.0 image" >&2
+if [[ "${server_version}" != "keldra-server 0.11.0" \
+  || "${client_version}" != "keldra 0.11.0" ]]; then
+  echo "qualification requires the exact Keldra 0.11.0 image" >&2
   echo "server: ${server_version}" >&2
   echo "client: ${client_version}" >&2
   exit 2
 fi
-export ANVIL_IMAGE="${image_id}"
-export ANVIL_QUALIFICATION_PROJECT="${ANVIL_QUALIFICATION_PROJECT:-keldra-v090-${$}}"
-export ANVIL_QUALIFICATION_DIR="$(mktemp -d /var/tmp/keldra-v090-qualification.XXXXXX)"
-export ANVIL_QUALIFICATION_START_NODE="${start_node}"
-qualification_suffix="${ANVIL_QUALIFICATION_DIR##*.}"
-index_verification_state="${ANVIL_QUALIFICATION_DIR}/artifacts/index-verification-state.json"
-index_membership_state="${ANVIL_QUALIFICATION_DIR}/artifacts/index-membership-state.json"
-index_pressure_state="${ANVIL_QUALIFICATION_DIR}/artifacts/index-pressure-state.json"
-index_pressure_release="${ANVIL_QUALIFICATION_DIR}/artifacts/index-pressure-release"
-index_pressure_writer_output="${ANVIL_QUALIFICATION_DIR}/artifacts/index-pressure-writer.log"
-index_resource_state="${ANVIL_QUALIFICATION_DIR}/artifacts/index-resource-state.json"
+export KELDRA_IMAGE="${image_id}"
+export KELDRA_QUALIFICATION_PROJECT="${KELDRA_QUALIFICATION_PROJECT:-keldra-v090-${$}}"
+export KELDRA_QUALIFICATION_DIR="$(mktemp -d /var/tmp/keldra-v090-qualification.XXXXXX)"
+export KELDRA_QUALIFICATION_START_NODE="${start_node}"
+qualification_suffix="${KELDRA_QUALIFICATION_DIR##*.}"
+index_verification_state="${KELDRA_QUALIFICATION_DIR}/artifacts/index-verification-state.json"
+index_membership_state="${KELDRA_QUALIFICATION_DIR}/artifacts/index-membership-state.json"
+index_pressure_state="${KELDRA_QUALIFICATION_DIR}/artifacts/index-pressure-state.json"
+index_pressure_release="${KELDRA_QUALIFICATION_DIR}/artifacts/index-pressure-release"
+index_pressure_writer_output="${KELDRA_QUALIFICATION_DIR}/artifacts/index-pressure-writer.log"
+index_resource_state="${KELDRA_QUALIFICATION_DIR}/artifacts/index-resource-state.json"
 index_resource_bucket="index-resource-${$}"
 index_resource_report="/var/tmp/keldra-v090-three-index-resource-${qualification_suffix}.json"
 index_resource_telemetry_prefix="/var/tmp/keldra-v090-three-index-telemetry-${qualification_suffix}"
 journal_pressure_evidence_prefix="/var/tmp/keldra-v090-three-journal-pressure-${qualification_suffix}"
-ANVIL_QUALIFICATION_STATE_DIR="${ANVIL_QUALIFICATION_DIR}/artifacts"
-keep="${ANVIL_QUALIFICATION_KEEP:-0}"
+KELDRA_QUALIFICATION_STATE_DIR="${KELDRA_QUALIFICATION_DIR}/artifacts"
+keep="${KELDRA_QUALIFICATION_KEEP:-0}"
 paused_container=""
 pressure_writer_pid=""
 compose() {
   docker compose \
-    --project-name "${ANVIL_QUALIFICATION_PROJECT}" \
+    --project-name "${KELDRA_QUALIFICATION_PROJECT}" \
     --file "${compose_file}" \
     "$@"
 }
@@ -273,22 +273,22 @@ cleanup() {
     compose logs --no-color >&2 || true
   fi
   if [[ "${keep}" == "1" ]]; then
-    echo "[keldra-qualification] retained project ${ANVIL_QUALIFICATION_PROJECT}" >&2
-    echo "[keldra-qualification] retained files ${ANVIL_QUALIFICATION_DIR}" >&2
+    echo "[keldra-qualification] retained project ${KELDRA_QUALIFICATION_PROJECT}" >&2
+    echo "[keldra-qualification] retained files ${KELDRA_QUALIFICATION_DIR}" >&2
   else
     compose down --volumes --remove-orphans >/dev/null 2>&1 || true
-    if [[ "${ANVIL_QUALIFICATION_DIR}" == /var/tmp/keldra-v090-qualification.* ]]; then
+    if [[ "${KELDRA_QUALIFICATION_DIR}" == /var/tmp/keldra-v090-qualification.* ]]; then
       docker run --rm --user 0 \
-        --volume "${ANVIL_QUALIFICATION_DIR}:/qualification" \
+        --volume "${KELDRA_QUALIFICATION_DIR}:/qualification" \
         "${image_id}" rm -rf \
           /qualification/node-1 \
           /qualification/node-2 \
           /qualification/node-3 \
           /qualification/artifacts \
           /qualification/token-signing-key >/dev/null 2>&1 || true
-      rm -rf -- "${ANVIL_QUALIFICATION_DIR}"
+      rm -rf -- "${KELDRA_QUALIFICATION_DIR}"
     else
-      echo "refusing to remove unexpected qualification path ${ANVIL_QUALIFICATION_DIR}" >&2
+      echo "refusing to remove unexpected qualification path ${KELDRA_QUALIFICATION_DIR}" >&2
       status=1
     fi
   fi
@@ -311,19 +311,19 @@ for required in prepare-node provision-tenant create-bucket; do
   fi
 done
 for directory in node-1 node-2 node-3 artifacts; do
-  mkdir "${ANVIL_QUALIFICATION_DIR}/${directory}"
-  chmod 0777 "${ANVIL_QUALIFICATION_DIR}/${directory}"
+  mkdir "${KELDRA_QUALIFICATION_DIR}/${directory}"
+  chmod 0777 "${KELDRA_QUALIFICATION_DIR}/${directory}"
 done
-chmod 0755 "${ANVIL_QUALIFICATION_DIR}"
-head -c 64 /dev/urandom >"${ANVIL_QUALIFICATION_DIR}/token-signing-key"
-chmod 0600 "${ANVIL_QUALIFICATION_DIR}/token-signing-key"
+chmod 0755 "${KELDRA_QUALIFICATION_DIR}"
+head -c 64 /dev/urandom >"${KELDRA_QUALIFICATION_DIR}/token-signing-key"
+chmod 0600 "${KELDRA_QUALIFICATION_DIR}/token-signing-key"
 docker run --rm --user 0 \
-  --volume "${ANVIL_QUALIFICATION_DIR}/token-signing-key:/qualification-key" \
+  --volume "${KELDRA_QUALIFICATION_DIR}/token-signing-key:/qualification-key" \
   "${image_id}" chown 10001:10001 /qualification-key
 compose config --quiet
 compose up --detach keldra-1
 require_service_image keldra-1 "${image_id}" candidate
-network="${ANVIL_QUALIFICATION_PROJECT}_default"
+network="${KELDRA_QUALIFICATION_PROJECT}_default"
 run_cli() {
   local node="$1"
   local client_id="$2"
@@ -331,9 +331,9 @@ run_cli() {
   shift 3
   docker run --rm \
     --network "${network}" \
-    --volume "${ANVIL_QUALIFICATION_DIR}:/qualification" \
-    --env "ANVIL_CLIENT_ID=${client_id}" \
-    --env "ANVIL_CLIENT_SECRET=${client_secret}" \
+    --volume "${KELDRA_QUALIFICATION_DIR}:/qualification" \
+    --env "KELDRA_CLIENT_ID=${client_id}" \
+    --env "KELDRA_CLIENT_SECRET=${client_secret}" \
     "${image_id}" \
     keldra --endpoint "http://${node}:50051" "$@"
 }
@@ -341,12 +341,12 @@ run_bootstrap_cli() {
   local node="$1"
   shift
   local -a secret_environment=()
-  if [[ -n "${ANVIL_NEW_CLIENT_SECRET:-}" ]]; then
-    secret_environment=(--env ANVIL_NEW_CLIENT_SECRET)
+  if [[ -n "${KELDRA_NEW_CLIENT_SECRET:-}" ]]; then
+    secret_environment=(--env KELDRA_NEW_CLIENT_SECRET)
   fi
   docker run --rm \
     --network "${network}" \
-    --volume "${ANVIL_QUALIFICATION_DIR}:/qualification" \
+    --volume "${KELDRA_QUALIFICATION_DIR}:/qualification" \
     "${secret_environment[@]}" \
     "${image_id}" \
     keldra --endpoint "http://${node}:50051" \
@@ -423,14 +423,14 @@ run_index_recovery_qualification() {
   local state_path="$6"
   local bucket="${7:-}"
   local release_path="${8:-}"
-  ANVIL_INDEX_RECOVERY_QUALIFICATION_MODE="${mode}" \
-  ANVIL_INDEX_RECOVERY_QUALIFICATION_ENDPOINTS="${endpoints}" \
-  ANVIL_INDEX_RECOVERY_QUALIFICATION_TENANT="${tenant}" \
-  ANVIL_INDEX_RECOVERY_QUALIFICATION_CLIENT_ID="${client_id}" \
-  ANVIL_INDEX_RECOVERY_QUALIFICATION_CLIENT_SECRET="${client_secret}" \
-  ANVIL_INDEX_RECOVERY_QUALIFICATION_STATE="${state_path}" \
-  ANVIL_INDEX_RECOVERY_QUALIFICATION_BUCKET="${bucket}" \
-  ANVIL_INDEX_RECOVERY_QUALIFICATION_RELEASE="${release_path}" \
+  KELDRA_INDEX_RECOVERY_QUALIFICATION_MODE="${mode}" \
+  KELDRA_INDEX_RECOVERY_QUALIFICATION_ENDPOINTS="${endpoints}" \
+  KELDRA_INDEX_RECOVERY_QUALIFICATION_TENANT="${tenant}" \
+  KELDRA_INDEX_RECOVERY_QUALIFICATION_CLIENT_ID="${client_id}" \
+  KELDRA_INDEX_RECOVERY_QUALIFICATION_CLIENT_SECRET="${client_secret}" \
+  KELDRA_INDEX_RECOVERY_QUALIFICATION_STATE="${state_path}" \
+  KELDRA_INDEX_RECOVERY_QUALIFICATION_BUCKET="${bucket}" \
+  KELDRA_INDEX_RECOVERY_QUALIFICATION_RELEASE="${release_path}" \
     "${qualification_binaries[index_recovery_qualification]}"
 }
 
@@ -564,7 +564,7 @@ provision_tenant() {
     if ! compose ps --status running --services | grep -Fxq "${node}"; then
       continue
     fi
-    if output="$(ANVIL_NEW_CLIENT_SECRET="${client_secret}" \
+    if output="$(KELDRA_NEW_CLIENT_SECRET="${client_secret}" \
       run_bootstrap_cli "${node}" provision-tenant \
         "${tenant}" "${tenant}-owner" "${client_id}" 2>&1)"
     then
@@ -598,38 +598,38 @@ run_index_resource_qualification() {
     containers+=("$(service_container "${resource_node}")")
     resource_log_starts["${resource_node}"]="$(log_cursor)"
   done
-  ANVIL_V06_RESOURCE_ENDPOINTS="$(IFS=,; echo "${public_endpoints[*]}")" \
-  ANVIL_V06_RESOURCE_TENANT="${index_resource_tenant}" \
-  ANVIL_V06_RESOURCE_BUCKET="${index_resource_bucket}" \
-  ANVIL_V06_RESOURCE_CLIENT_ID="${index_resource_client}" \
-  ANVIL_V06_RESOURCE_CLIENT_SECRET="${index_resource_secret}" \
-  ANVIL_V06_RESOURCE_RECORDS="${index_resource_records}" \
-  ANVIL_V06_RESOURCE_MUTATIONS="${index_resource_mutations}" \
-  ANVIL_V06_RESOURCE_BATCH_SIZE=1000 \
-  ANVIL_V06_RESOURCE_WORKERS=6 \
-  ANVIL_V06_RESOURCE_VERIFICATION_WORKERS=8 \
-  ANVIL_V06_RESOURCE_CONTAINERS="$(IFS=,; echo "${containers[*]}")" \
-  ANVIL_V06_REQUIRE_RESOURCE_TARGETS=1 \
-  ANVIL_V06_KIND_BUDGET_BYTES="${index_kind_budget_bytes}" \
-  ANVIL_V06_INDEX_COMPACTION_MAX_LANES="${index_compaction_max_lanes}" \
-  ANVIL_V06_INDEX_PROJECTION_MAX_LANES="${index_projection_max_lanes}" \
-  ANVIL_V06_INDEX_RAYON_WORKERS="${index_rayon_workers}" \
-  ANVIL_V06_MAX_ANONYMOUS_GROWTH_BYTES="${index_resource_max_anonymous_growth_bytes}" \
-  ANVIL_V09_REQUIRE_PERFORMANCE_TARGETS="${require_performance_targets}" \
-  ANVIL_V09_EVIDENCE_SOURCE_COMMIT="${source_commit}" \
-  ANVIL_V09_EVIDENCE_CONTAINER_DIGEST="${image_id}" \
-  ANVIL_V09_EVIDENCE_NATIVE_ARCHITECTURE="${native_architecture}" \
-  ANVIL_V09_EVIDENCE_CONTAINER_PLATFORM="${container_platform}" \
-  ANVIL_V09_EVIDENCE_TOPOLOGY=three-node \
-  ANVIL_V09_EVIDENCE_NODE_COUNT=3 \
-  ANVIL_V09_EVIDENCE_HARDWARE_LOGICAL_CPUS="${hardware_logical_cpus}" \
-  ANVIL_V09_EVIDENCE_HARDWARE_MEMORY_BYTES="${hardware_memory_bytes}" \
-  ANVIL_V09_EVIDENCE_FILESYSTEM_TOTAL_BYTES="${qualification_filesystem_total_bytes}" \
-  ANVIL_V09_EVIDENCE_FILESYSTEM_AVAILABLE_BYTES="${qualification_filesystem_available_bytes}" \
-  ANVIL_V09_EVIDENCE_INDEX_DISK_CACHE_BYTES_PER_NODE="${index_disk_cache_bytes}" \
-  ANVIL_V09_EVIDENCE_INDEX_MEMORY_PERCENT_PER_NODE="${index_memory_percent}" \
-  ANVIL_V06_RESOURCE_OUTPUT="${index_resource_report}" \
-  ANVIL_V06_RESOURCE_STATE_OUTPUT="${index_resource_state}" \
+  KELDRA_V06_RESOURCE_ENDPOINTS="$(IFS=,; echo "${public_endpoints[*]}")" \
+  KELDRA_V06_RESOURCE_TENANT="${index_resource_tenant}" \
+  KELDRA_V06_RESOURCE_BUCKET="${index_resource_bucket}" \
+  KELDRA_V06_RESOURCE_CLIENT_ID="${index_resource_client}" \
+  KELDRA_V06_RESOURCE_CLIENT_SECRET="${index_resource_secret}" \
+  KELDRA_V06_RESOURCE_RECORDS="${index_resource_records}" \
+  KELDRA_V06_RESOURCE_MUTATIONS="${index_resource_mutations}" \
+  KELDRA_V06_RESOURCE_BATCH_SIZE=1000 \
+  KELDRA_V06_RESOURCE_WORKERS=6 \
+  KELDRA_V06_RESOURCE_VERIFICATION_WORKERS=8 \
+  KELDRA_V06_RESOURCE_CONTAINERS="$(IFS=,; echo "${containers[*]}")" \
+  KELDRA_V06_REQUIRE_RESOURCE_TARGETS=1 \
+  KELDRA_V06_KIND_BUDGET_BYTES="${index_kind_budget_bytes}" \
+  KELDRA_V06_INDEX_COMPACTION_MAX_LANES="${index_compaction_max_lanes}" \
+  KELDRA_V06_INDEX_PROJECTION_MAX_LANES="${index_projection_max_lanes}" \
+  KELDRA_V06_INDEX_RAYON_WORKERS="${index_rayon_workers}" \
+  KELDRA_V06_MAX_ANONYMOUS_GROWTH_BYTES="${index_resource_max_anonymous_growth_bytes}" \
+  KELDRA_V09_REQUIRE_PERFORMANCE_TARGETS="${require_performance_targets}" \
+  KELDRA_V09_EVIDENCE_SOURCE_COMMIT="${source_commit}" \
+  KELDRA_V09_EVIDENCE_CONTAINER_DIGEST="${image_id}" \
+  KELDRA_V09_EVIDENCE_NATIVE_ARCHITECTURE="${native_architecture}" \
+  KELDRA_V09_EVIDENCE_CONTAINER_PLATFORM="${container_platform}" \
+  KELDRA_V09_EVIDENCE_TOPOLOGY=three-node \
+  KELDRA_V09_EVIDENCE_NODE_COUNT=3 \
+  KELDRA_V09_EVIDENCE_HARDWARE_LOGICAL_CPUS="${hardware_logical_cpus}" \
+  KELDRA_V09_EVIDENCE_HARDWARE_MEMORY_BYTES="${hardware_memory_bytes}" \
+  KELDRA_V09_EVIDENCE_FILESYSTEM_TOTAL_BYTES="${qualification_filesystem_total_bytes}" \
+  KELDRA_V09_EVIDENCE_FILESYSTEM_AVAILABLE_BYTES="${qualification_filesystem_available_bytes}" \
+  KELDRA_V09_EVIDENCE_INDEX_DISK_CACHE_BYTES_PER_NODE="${index_disk_cache_bytes}" \
+  KELDRA_V09_EVIDENCE_INDEX_MEMORY_PERCENT_PER_NODE="${index_memory_percent}" \
+  KELDRA_V06_RESOURCE_OUTPUT="${index_resource_report}" \
+  KELDRA_V06_RESOURCE_STATE_OUTPUT="${index_resource_state}" \
     "${qualification_binaries[v06_index_resource_qualification]}" >/dev/null
   for resource_node in keldra-1 keldra-2 keldra-3; do
     capture_three_node_resource_evidence \
@@ -742,13 +742,13 @@ run_index_resource_qualification() {
 
 verify_index_resource_state() {
   local endpoint="$1"
-  ANVIL_V06_RESOURCE_ENDPOINTS="${endpoint}" \
-  ANVIL_V06_RESOURCE_TENANT="${index_resource_tenant}" \
-  ANVIL_V06_RESOURCE_BUCKET="${index_resource_bucket}" \
-  ANVIL_V06_RESOURCE_CLIENT_ID="${index_resource_client}" \
-  ANVIL_V06_RESOURCE_CLIENT_SECRET="${index_resource_secret}" \
-  ANVIL_V06_RESOURCE_VERIFICATION_WORKERS=8 \
-  ANVIL_V06_RESOURCE_STATE_INPUT="${index_resource_state}" \
+  KELDRA_V06_RESOURCE_ENDPOINTS="${endpoint}" \
+  KELDRA_V06_RESOURCE_TENANT="${index_resource_tenant}" \
+  KELDRA_V06_RESOURCE_BUCKET="${index_resource_bucket}" \
+  KELDRA_V06_RESOURCE_CLIENT_ID="${index_resource_client}" \
+  KELDRA_V06_RESOURCE_CLIENT_SECRET="${index_resource_secret}" \
+  KELDRA_V06_RESOURCE_VERIFICATION_WORKERS=8 \
+  KELDRA_V06_RESOURCE_STATE_INPUT="${index_resource_state}" \
     "${qualification_binaries[v06_index_resource_qualification]}"
 }
 assert_index_resource_bounds() {
@@ -784,7 +784,7 @@ assert_index_resource_bounds() {
   done < <(
     for resource_node in keldra-1 keldra-2 keldra-3; do
       grep -F 'index construction budget state' \
-        "${ANVIL_QUALIFICATION_DIR}/artifacts/index-${resource_node}.log" || true
+        "${KELDRA_QUALIFICATION_DIR}/artifacts/index-${resource_node}.log" || true
     done
   )
   if ((observed == 0)); then
@@ -819,7 +819,7 @@ assert_index_resource_bounds() {
   done < <(
     for resource_node in keldra-1 keldra-2 keldra-3; do
       grep -F 'format-v4 index segment flushed' \
-        "${ANVIL_QUALIFICATION_DIR}/artifacts/index-${resource_node}.log" || true
+        "${KELDRA_QUALIFICATION_DIR}/artifacts/index-${resource_node}.log" || true
     done
   )
   for kind in "${index_kinds[@]}"; do
@@ -856,7 +856,7 @@ assert_index_resource_bounds() {
     resource_budget_evidence=$((resource_budget_evidence + 1))
   done < <(
     for resource_node in keldra-1 keldra-2 keldra-3; do
-      cat "${ANVIL_QUALIFICATION_DIR}/artifacts/index-resource-${resource_node}.log"
+      cat "${KELDRA_QUALIFICATION_DIR}/artifacts/index-resource-${resource_node}.log"
     done
   )
   if ((resource_budget_evidence == 0 || resource_positive_peak_evidence == 0)); then
@@ -881,7 +881,7 @@ assert_index_resource_bounds() {
   done < <(
     for resource_node in keldra-1 keldra-2 keldra-3; do
       grep -F 'format-v4 index segment flushed' \
-        "${ANVIL_QUALIFICATION_DIR}/artifacts/index-resource-${resource_node}.log" || true
+        "${KELDRA_QUALIFICATION_DIR}/artifacts/index-resource-${resource_node}.log" || true
     done
   )
   if ((resource_residency_evidence == 0)); then
@@ -895,7 +895,7 @@ assert_index_resource_bounds() {
   local cache_bytes
   for resource_node in 1 2 3; do
     cache_bytes="$(find \
-      "${ANVIL_QUALIFICATION_DIR}/node-${resource_node}/index-cache" \
+      "${KELDRA_QUALIFICATION_DIR}/node-${resource_node}/index-cache" \
       -type f -printf '%s\n' \
       | awk '{ total += $1 } END { print total + 0 }')"
     if ((cache_bytes > index_disk_cache_bytes)); then
@@ -921,8 +921,8 @@ save_index_qualification_logs() {
   for node in keldra-1 keldra-2 keldra-3; do
     cursor="${index_qualification_log_start[${node}]}"
     service_logs_since "${node}" "${cursor}" \
-      >"${ANVIL_QUALIFICATION_DIR}/artifacts/index-${node}.log"
-    preserve_all_kind_telemetry "${ANVIL_QUALIFICATION_DIR}/artifacts/index-${node}.log" three "${qualification_suffix}" "${node}"
+      >"${KELDRA_QUALIFICATION_DIR}/artifacts/index-${node}.log"
+    preserve_all_kind_telemetry "${KELDRA_QUALIFICATION_DIR}/artifacts/index-${node}.log" three "${qualification_suffix}" "${node}"
   done
 }
 
@@ -932,7 +932,7 @@ assert_production_resource_compaction() {
   local node
   local log
   for node in keldra-1 keldra-2 keldra-3; do
-    log="${ANVIL_QUALIFICATION_DIR}/artifacts/index-resource-${node}.log"
+    log="${KELDRA_QUALIFICATION_DIR}/artifacts/index-resource-${node}.log"
     if awk '
           index($0, "index.kind=TypedJson") &&
           index($0, "index compaction terminal metrics") { found = 1 }
@@ -948,7 +948,7 @@ assert_production_resource_compaction() {
     return 1
   fi
   assert_compaction_telemetry_for_kind \
-    TypedJson "${ANVIL_QUALIFICATION_DIR}/artifacts/index-resource-${builder}.log"
+    TypedJson "${KELDRA_QUALIFICATION_DIR}/artifacts/index-resource-${builder}.log"
   echo "[keldra-qualification] production-shaped TypedJson compaction completed on its sole builder"
 }
 
@@ -968,7 +968,7 @@ assert_one_builder_published_and_compacted_each_index_kind() {
       if awk -v kind="index.kind=${kind}" '
             index($0, kind) && index($0, "index generation published") { found = 1 }
             END { exit !found }
-          ' "${ANVIL_QUALIFICATION_DIR}/artifacts/index-${node}.log"
+          ' "${KELDRA_QUALIFICATION_DIR}/artifacts/index-${node}.log"
       then
         publishers=$((publishers + 1))
         publisher_node="${node}"
@@ -976,7 +976,7 @@ assert_one_builder_published_and_compacted_each_index_kind() {
       if awk -v kind="index.kind=${kind}" '
             index($0, kind) && index($0, "format-v4 index segments compacted") { found = 1 }
             END { exit !found }
-          ' "${ANVIL_QUALIFICATION_DIR}/artifacts/index-${node}.log"
+          ' "${KELDRA_QUALIFICATION_DIR}/artifacts/index-${node}.log"
       then
         compactors=$((compactors + 1))
         compactor_node="${node}"
@@ -995,17 +995,17 @@ assert_one_builder_published_and_compacted_each_index_kind() {
       return 1
     fi
     assert_compaction_telemetry_for_kind \
-      "${kind}" "${ANVIL_QUALIFICATION_DIR}/artifacts/index-${compactor_node}.log"
+      "${kind}" "${KELDRA_QUALIFICATION_DIR}/artifacts/index-${compactor_node}.log"
   done
   echo "[keldra-qualification] all eight kinds consumed all three ingress journals and emitted bounded range-compaction metrics with trace-backed completion logs on their sole builder"
 }
 
 verify_existing_indexes() {
-  ANVIL_INDEX_QUALIFICATION_ENDPOINTS="$(IFS=,; echo "${public_endpoints[*]}")" \
-  ANVIL_INDEX_QUALIFICATION_TENANT=qindex \
-  ANVIL_INDEX_QUALIFICATION_CLIENT_ID=qindex-client \
-  ANVIL_INDEX_QUALIFICATION_CLIENT_SECRET="${index_secret}" \
-  ANVIL_INDEX_QUALIFICATION_STATE_INPUT="${index_verification_state}" \
+  KELDRA_INDEX_QUALIFICATION_ENDPOINTS="$(IFS=,; echo "${public_endpoints[*]}")" \
+  KELDRA_INDEX_QUALIFICATION_TENANT=qindex \
+  KELDRA_INDEX_QUALIFICATION_CLIENT_ID=qindex-client \
+  KELDRA_INDEX_QUALIFICATION_CLIENT_SECRET="${index_secret}" \
+  KELDRA_INDEX_QUALIFICATION_STATE_INPUT="${index_verification_state}" \
     "${qualification_binaries[cluster_index_qualification]}"
 }
 
@@ -1087,7 +1087,7 @@ run_git_qualification() {
   local client_id=qgit-client
   local client_secret=qualification-git-secret-0000000000000000000000000
   local bucket="git-three-${$}"
-  local git_root="${ANVIL_QUALIFICATION_DIR}/git"
+  local git_root="${KELDRA_QUALIFICATION_DIR}/git"
   local source_repository="${git_root}/source"
   local authenticated_clone="${git_root}/authenticated-clone"
   local denied_clone="${git_root}/denied-clone"
@@ -1102,7 +1102,7 @@ run_git_qualification() {
 
   mkdir -p "${git_root}"
   git init --quiet --initial-branch=main "${source_repository}"
-  git -C "${source_repository}" config user.name "Anvil Qualification"
+  git -C "${source_repository}" config user.name "Keldra Qualification"
   git -C "${source_repository}" config user.email "qualification@example.invalid"
   printf 'three-node smart HTTP gateway\n' >"${source_repository}/README.md"
   git -C "${source_repository}" add README.md
@@ -1134,11 +1134,11 @@ run_git_qualification() {
 }
 
 run_atomic_index_qualification() {
-  ANVIL_ATOMIC_INDEX_QUALIFICATION_ENDPOINTS="$(IFS=,; echo "${public_endpoints[*]}")" \
-  ANVIL_ATOMIC_INDEX_QUALIFICATION_TENANT=qatomic \
-  ANVIL_ATOMIC_INDEX_QUALIFICATION_BUCKET="atomic-index-three-${$}" \
-  ANVIL_ATOMIC_INDEX_QUALIFICATION_CLIENT_ID=qatomic-client \
-  ANVIL_ATOMIC_INDEX_QUALIFICATION_CLIENT_SECRET="${atomic_secret}" \
+  KELDRA_ATOMIC_INDEX_QUALIFICATION_ENDPOINTS="$(IFS=,; echo "${public_endpoints[*]}")" \
+  KELDRA_ATOMIC_INDEX_QUALIFICATION_TENANT=qatomic \
+  KELDRA_ATOMIC_INDEX_QUALIFICATION_BUCKET="atomic-index-three-${$}" \
+  KELDRA_ATOMIC_INDEX_QUALIFICATION_CLIENT_ID=qatomic-client \
+  KELDRA_ATOMIC_INDEX_QUALIFICATION_CLIENT_SECRET="${atomic_secret}" \
     "${qualification_binaries[atomic_index_qualification]}"
   echo "[keldra-qualification] distributed atomic-program index visibility passed"
 }
@@ -1178,11 +1178,11 @@ run_live_builder_reassignment_qualification() {
     node="keldra-${node_number}"
     save_log_suffix \
       "${node}" "${log_starts[${node}]}" \
-      "${ANVIL_QUALIFICATION_DIR}/artifacts/index-reassignment-${active_nodes}-${node}.log"
+      "${KELDRA_QUALIFICATION_DIR}/artifacts/index-reassignment-${active_nodes}-${node}.log"
   done
   for index_id in "${index_ids[@]}"; do
     if log_has_index_event \
-      "${ANVIL_QUALIFICATION_DIR}/artifacts/index-reassignment-${active_nodes}-${new_builder_node}.log" \
+      "${KELDRA_QUALIFICATION_DIR}/artifacts/index-reassignment-${active_nodes}-${new_builder_node}.log" \
       "${index_id}" "index generation published"
     then
       reassigned=1
@@ -1211,7 +1211,7 @@ run_journal_pressure_qualification() {
     return 1
   fi
   for node in keldra-1 keldra-2 keldra-3; do
-    seed_log="${ANVIL_QUALIFICATION_DIR}/artifacts/index-pressure-seed-${node}.log"
+    seed_log="${KELDRA_QUALIFICATION_DIR}/artifacts/index-pressure-seed-${node}.log"
     save_log_suffix "${node}" "${seed_cursor}" "${seed_log}"
     if log_has_index_event "${seed_log}" "${pressure_index_id}" \
       "index generation published"
@@ -1261,7 +1261,7 @@ run_journal_pressure_qualification() {
     )
     capacity_node=""
     for node in keldra-1 keldra-2 keldra-3; do
-      pressure_log="${ANVIL_QUALIFICATION_DIR}/artifacts/index-pressure-live-${node}.log"
+      pressure_log="${KELDRA_QUALIFICATION_DIR}/artifacts/index-pressure-live-${node}.log"
       save_log_suffix "${node}" "${pressure_cursor}" "${pressure_log}"
       if grep -F 'distributed object mutation is waiting for bounded durable state' \
         "${pressure_log}" | grep -Fq 'capacity="source_journal"'
@@ -1305,7 +1305,7 @@ run_journal_pressure_qualification() {
   fi
 
   for node in keldra-1 keldra-2 keldra-3; do
-    pressure_log="${ANVIL_QUALIFICATION_DIR}/artifacts/index-pressure-${node}.log"
+    pressure_log="${KELDRA_QUALIFICATION_DIR}/artifacts/index-pressure-${node}.log"
     save_log_suffix "${node}" "${pressure_cursor}" "${pressure_log}"
     if grep -Fq 'index snapshot rebuild started' "${pressure_log}"; then
       echo "${node} started an unauthorized automatic snapshot rebuild under journal pressure" >&2
@@ -1342,7 +1342,7 @@ run_journal_pressure_qualification() {
     "${index_pressure_state}"
 
   for node in keldra-1 keldra-2 keldra-3; do
-    pressure_log="${ANVIL_QUALIFICATION_DIR}/artifacts/index-pressure-${node}.log"
+    pressure_log="${KELDRA_QUALIFICATION_DIR}/artifacts/index-pressure-${node}.log"
     save_log_suffix "${node}" "${pressure_cursor}" "${pressure_log}"
     if grep -Fq 'index snapshot rebuild started' "${pressure_log}"; then
       echo "${node} started an unauthorized automatic snapshot rebuild while catching up" >&2
@@ -1354,7 +1354,7 @@ run_journal_pressure_qualification() {
     index($0, "capacity=\"source_journal\"") &&
     index($0, "backpressure.outcome=\"capacity_available\"") { found = 1 }
     END { exit !found }
-  ' "${ANVIL_QUALIFICATION_DIR}/artifacts/index-pressure-${capacity_node}.log"
+  ' "${KELDRA_QUALIFICATION_DIR}/artifacts/index-pressure-${capacity_node}.log"
   then
     echo "${capacity_node} did not report that source-journal capacity released its writer" >&2
     return 1
@@ -1518,16 +1518,16 @@ restore_shard() {
 # inline RocksDB representation. The object is created before either joining
 # node exists and must remain readable after both membership cutovers.
 dd if=/dev/zero \
-  of="${ANVIL_QUALIFICATION_DIR}/artifacts/growth-large.bin" \
+  of="${KELDRA_QUALIFICATION_DIR}/artifacts/growth-large.bin" \
   bs=1M count=2 status=none
-cp "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-large.bin" \
-  "${ANVIL_QUALIFICATION_DIR}/artifacts/one-node-replicated-rejected.bin"
+cp "${KELDRA_QUALIFICATION_DIR}/artifacts/growth-large.bin" \
+  "${KELDRA_QUALIFICATION_DIR}/artifacts/one-node-replicated-rejected.bin"
 printf '\177' | dd \
-  of="${ANVIL_QUALIFICATION_DIR}/artifacts/one-node-replicated-rejected.bin" \
+  of="${KELDRA_QUALIFICATION_DIR}/artifacts/one-node-replicated-rejected.bin" \
   bs=1 seek=0 count=1 conv=notrunc status=none
 chmod 0444 \
-  "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-large.bin" \
-  "${ANVIL_QUALIFICATION_DIR}/artifacts/one-node-replicated-rejected.bin"
+  "${KELDRA_QUALIFICATION_DIR}/artifacts/growth-large.bin" \
+  "${KELDRA_QUALIFICATION_DIR}/artifacts/one-node-replicated-rejected.bin"
 expect_failure "one-node REPLICATED large Put" \
   run_cli keldra-1 qprobe-client "${qprobe_secret}" \
     put qprobe objects growth/replicated-must-fail.bin \
@@ -1552,21 +1552,21 @@ run_cli keldra-1 qprobe-client \
   "${qprobe_secret}" \
   get qprobe objects growth/from-one.bin \
     --output /qualification/artifacts/growth-one-read.bin
-cmp "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-large.bin" \
-  "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-one-read.bin"
+cmp "${KELDRA_QUALIFICATION_DIR}/artifacts/growth-large.bin" \
+  "${KELDRA_QUALIFICATION_DIR}/artifacts/growth-one-read.bin"
 echo "[keldra-qualification] one-node large-object read passed"
 
 # Restart the exact installation that will grow. This proves the durable
 # one-node representation and reference-journal recovery before ADD begins.
 compose restart keldra-1
 wait_for_node keldra-1
-rm -f "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-one-read.bin"
+rm -f "${KELDRA_QUALIFICATION_DIR}/artifacts/growth-one-read.bin"
 run_cli keldra-1 qprobe-client \
   "${qprobe_secret}" \
   get qprobe objects growth/from-one.bin \
     --output /qualification/artifacts/growth-one-read.bin
-cmp "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-large.bin" \
-  "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-one-read.bin"
+cmp "${KELDRA_QUALIFICATION_DIR}/artifacts/growth-large.bin" \
+  "${KELDRA_QUALIFICATION_DIR}/artifacts/growth-one-read.bin"
 require_qprobe_head keldra-1 growth/from-one.bin "${growth_one_head}"
 echo "[keldra-qualification] one-node large object survived restart before growth"
 
@@ -1585,26 +1585,26 @@ if [[ "${growth_one_two_node_head}" != "${growth_one_head}" ]]; then
 fi
 growth_one_hash="$(head_blake3 "${growth_one_two_node_head}")"
 move_complete_blob keldra-1 "${growth_one_hash}"
-rm -f "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-one-read.bin"
+rm -f "${KELDRA_QUALIFICATION_DIR}/artifacts/growth-one-read.bin"
 run_cli keldra-2 qprobe-client \
   "${qprobe_secret}" \
   get qprobe objects growth/from-one.bin \
     --output /qualification/artifacts/growth-one-read.bin
 restore_complete_blob keldra-1 "${growth_one_hash}"
-cmp "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-large.bin" \
-  "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-one-read.bin"
+cmp "${KELDRA_QUALIFICATION_DIR}/artifacts/growth-large.bin" \
+  "${KELDRA_QUALIFICATION_DIR}/artifacts/growth-one-read.bin"
 require_qprobe_head keldra-2 growth/from-one.bin "${growth_one_head}"
 echo "[keldra-qualification] two-node read succeeded without node 1's complete blob"
 
 # Use a different content identity so this is a real two-node payload write,
 # not a second logical reference to the preexisting deduplicated blob.
-cp "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-large.bin" \
-  "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-two-large.bin"
-chmod 0644 "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-two-large.bin"
+cp "${KELDRA_QUALIFICATION_DIR}/artifacts/growth-large.bin" \
+  "${KELDRA_QUALIFICATION_DIR}/artifacts/growth-two-large.bin"
+chmod 0644 "${KELDRA_QUALIFICATION_DIR}/artifacts/growth-two-large.bin"
 printf '\001' | dd \
-  of="${ANVIL_QUALIFICATION_DIR}/artifacts/growth-two-large.bin" \
+  of="${KELDRA_QUALIFICATION_DIR}/artifacts/growth-two-large.bin" \
   bs=1 seek=0 count=1 conv=notrunc status=none
-chmod 0444 "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-two-large.bin"
+chmod 0444 "${KELDRA_QUALIFICATION_DIR}/artifacts/growth-two-large.bin"
 run_cli keldra-2 qprobe-client \
   "${qprobe_secret}" \
   put qprobe objects growth/from-two.bin \
@@ -1619,8 +1619,8 @@ run_cli keldra-1 qprobe-client \
   get qprobe objects growth/from-two.bin \
     --output /qualification/artifacts/growth-two-read.bin
 restore_complete_blob keldra-2 "${growth_two_hash}"
-cmp "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-two-large.bin" \
-  "${ANVIL_QUALIFICATION_DIR}/artifacts/growth-two-read.bin"
+cmp "${KELDRA_QUALIFICATION_DIR}/artifacts/growth-two-large.bin" \
+  "${KELDRA_QUALIFICATION_DIR}/artifacts/growth-two-read.bin"
 require_qprobe_head keldra-1 growth/from-two.bin "${growth_two_head}"
 echo "[keldra-qualification] two-node REPLICATED read succeeded without its ingress copy"
 
@@ -1659,10 +1659,10 @@ for unavailable_node in keldra-1 keldra-2 keldra-3; do
   done
   for growth_object in from-one from-two; do
     case "${growth_object}" in
-      from-one) growth_expected="${ANVIL_QUALIFICATION_DIR}/artifacts/growth-large.bin" ;;
-      from-two) growth_expected="${ANVIL_QUALIFICATION_DIR}/artifacts/growth-two-large.bin" ;;
+      from-one) growth_expected="${KELDRA_QUALIFICATION_DIR}/artifacts/growth-large.bin" ;;
+      from-two) growth_expected="${KELDRA_QUALIFICATION_DIR}/artifacts/growth-two-large.bin" ;;
     esac
-    growth_output="${ANVIL_QUALIFICATION_DIR}/artifacts/growth-without-${unavailable_node}-${growth_object}.bin"
+    growth_output="${KELDRA_QUALIFICATION_DIR}/artifacts/growth-without-${unavailable_node}-${growth_object}.bin"
     rm -f "${growth_output}"
     run_cli keldra-1 qprobe-client \
       "${qprobe_secret}" \
@@ -1709,7 +1709,7 @@ provision_tenant qindex-pressure qindex-pressure-client "${index_pressure_secret
 run_journal_pressure_qualification
 for pressure_node in keldra-1 keldra-2 keldra-3; do
   preserve_qualification_log \
-    "${ANVIL_QUALIFICATION_DIR}/artifacts/index-pressure-${pressure_node}.log" \
+    "${KELDRA_QUALIFICATION_DIR}/artifacts/index-pressure-${pressure_node}.log" \
     "${journal_pressure_evidence_prefix}-${pressure_node}.log"
 done
 echo "[keldra-qualification] preserved journal-pressure evidence ${journal_pressure_evidence_prefix}-keldra-{1,2,3}.log"
@@ -1718,12 +1718,12 @@ start_release_source_journal_phase "${release_source_journal_max_entries}"
 index_secret=qualification-index-secret-00000000000000000000000
 provision_tenant qindex qindex-client "${index_secret}"
 capture_index_qualification_log_start
-ANVIL_INDEX_QUALIFICATION_ENDPOINTS="$(IFS=,; echo "${public_endpoints[*]}")" \
-ANVIL_INDEX_QUALIFICATION_TENANT=qindex \
-ANVIL_INDEX_QUALIFICATION_CLIENT_ID=qindex-client \
-ANVIL_INDEX_QUALIFICATION_CLIENT_SECRET="${index_secret}" \
-ANVIL_INDEX_QUALIFICATION_REQUIRE_QUIESCENCE=1 \
-ANVIL_INDEX_QUALIFICATION_STATE_OUTPUT="${index_verification_state}" \
+KELDRA_INDEX_QUALIFICATION_ENDPOINTS="$(IFS=,; echo "${public_endpoints[*]}")" \
+KELDRA_INDEX_QUALIFICATION_TENANT=qindex \
+KELDRA_INDEX_QUALIFICATION_CLIENT_ID=qindex-client \
+KELDRA_INDEX_QUALIFICATION_CLIENT_SECRET="${index_secret}" \
+KELDRA_INDEX_QUALIFICATION_REQUIRE_QUIESCENCE=1 \
+KELDRA_INDEX_QUALIFICATION_STATE_OUTPUT="${index_verification_state}" \
   "${qualification_binaries[cluster_index_qualification]}"
 test -s "${index_verification_state}"
 save_index_qualification_logs
@@ -1739,29 +1739,29 @@ verify_index_resource_state "${public_endpoints[0]}"
 
 accounting_secret=qualification-accounting-secret-000000000000000000000
 provision_tenant qaccounting qaccounting-client "${accounting_secret}"
-ANVIL_ACCOUNTING_QUALIFICATION_ENDPOINTS="$(IFS=,; echo "${public_endpoints[*]}")" \
-ANVIL_ACCOUNTING_QUALIFICATION_TENANT=qaccounting \
-ANVIL_ACCOUNTING_QUALIFICATION_BUCKET="accounting-three-${$}" \
-ANVIL_ACCOUNTING_QUALIFICATION_CLIENT_ID=qaccounting-client \
-ANVIL_ACCOUNTING_QUALIFICATION_CLIENT_SECRET="${accounting_secret}" \
+KELDRA_ACCOUNTING_QUALIFICATION_ENDPOINTS="$(IFS=,; echo "${public_endpoints[*]}")" \
+KELDRA_ACCOUNTING_QUALIFICATION_TENANT=qaccounting \
+KELDRA_ACCOUNTING_QUALIFICATION_BUCKET="accounting-three-${$}" \
+KELDRA_ACCOUNTING_QUALIFICATION_CLIENT_ID=qaccounting-client \
+KELDRA_ACCOUNTING_QUALIFICATION_CLIENT_SECRET="${accounting_secret}" \
   "${qualification_binaries[accounting_qualification]}"
 echo "[keldra-qualification] distributed accounting qualification passed"
 
 personaldb_secret=qualification-personaldb-secret-0000000000000000000
 provision_tenant qpersonaldb qpersonaldb-client "${personaldb_secret}"
-ANVIL_PERSONALDB_QUALIFICATION_ENDPOINTS="$(IFS=,; echo "${public_endpoints[*]}")" \
-ANVIL_PERSONALDB_QUALIFICATION_TENANT=qpersonaldb \
-ANVIL_PERSONALDB_QUALIFICATION_CLIENT_ID=qpersonaldb-client \
-ANVIL_PERSONALDB_QUALIFICATION_CLIENT_SECRET="${personaldb_secret}" \
+KELDRA_PERSONALDB_QUALIFICATION_ENDPOINTS="$(IFS=,; echo "${public_endpoints[*]}")" \
+KELDRA_PERSONALDB_QUALIFICATION_TENANT=qpersonaldb \
+KELDRA_PERSONALDB_QUALIFICATION_CLIENT_ID=qpersonaldb-client \
+KELDRA_PERSONALDB_QUALIFICATION_CLIENT_SECRET="${personaldb_secret}" \
   "${qualification_binaries[personaldb_qualification]}"
 echo "[keldra-qualification] distributed PersonalDB qualification passed"
 
 s3_secret=qualification-s3-secret-00000000000000000000000000
 provision_tenant qs3 qs3-client "${s3_secret}"
-ANVIL_S3_QUALIFICATION_ENDPOINTS="$(IFS=,; echo "${public_endpoints[*]}")" \
-ANVIL_S3_QUALIFICATION_CLIENT_ID=qs3-client \
-ANVIL_S3_QUALIFICATION_CLIENT_SECRET="${s3_secret}" \
-ANVIL_S3_QUALIFICATION_BUCKET="s3-three-${$}" \
+KELDRA_S3_QUALIFICATION_ENDPOINTS="$(IFS=,; echo "${public_endpoints[*]}")" \
+KELDRA_S3_QUALIFICATION_CLIENT_ID=qs3-client \
+KELDRA_S3_QUALIFICATION_CLIENT_SECRET="${s3_secret}" \
+KELDRA_S3_QUALIFICATION_BUCKET="s3-three-${$}" \
   "${qualification_binaries[s3_qualification]}"
 echo "[keldra-qualification] distributed official AWS SDK S3 qualification passed"
 run_git_qualification
@@ -1769,8 +1769,8 @@ run_git_qualification
 cas_secret=qualification-cas-secret-000000000000000000000000
 provision_tenant qcas qcas-client "${cas_secret}"
 create_bucket keldra-2 qcas-client "${cas_secret}" objects
-printf 'three-node-cas\n' >"${ANVIL_QUALIFICATION_DIR}/artifacts/cas.txt"
-chmod 0444 "${ANVIL_QUALIFICATION_DIR}/artifacts/cas.txt"
+printf 'three-node-cas\n' >"${KELDRA_QUALIFICATION_DIR}/artifacts/cas.txt"
+chmod 0444 "${KELDRA_QUALIFICATION_DIR}/artifacts/cas.txt"
 run_cli keldra-1 qcas-client "${cas_secret}" \
   put qcas objects cas/value.txt /qualification/artifacts/cas.txt \
   --command-id qcas-first --if-absent >/dev/null
@@ -1781,8 +1781,8 @@ expect_failure "second PutIfAbsent" \
 run_cli keldra-2 qcas-client "${cas_secret}" \
   get qcas objects cas/value.txt \
   --output /qualification/artifacts/cas-read.txt
-cmp "${ANVIL_QUALIFICATION_DIR}/artifacts/cas.txt" \
-  "${ANVIL_QUALIFICATION_DIR}/artifacts/cas-read.txt"
+cmp "${KELDRA_QUALIFICATION_DIR}/artifacts/cas.txt" \
+  "${KELDRA_QUALIFICATION_DIR}/artifacts/cas-read.txt"
 echo "[keldra-qualification] cross-node CAS test passed"
 
 version_secret=qualification-version-secret-00000000000000000000
@@ -1791,10 +1791,10 @@ run_cli keldra-2 qversion-client "${version_secret}" \
   create-bucket objects --versioning enabled \
   | grep -Fq "bucket=objects versioning=enabled"
 printf 'retained-version-one\n' \
-  >"${ANVIL_QUALIFICATION_DIR}/artifacts/version-one.txt"
+  >"${KELDRA_QUALIFICATION_DIR}/artifacts/version-one.txt"
 printf 'retained-version-two\n' \
-  >"${ANVIL_QUALIFICATION_DIR}/artifacts/version-two.txt"
-chmod 0444 "${ANVIL_QUALIFICATION_DIR}/artifacts/version-"*.txt
+  >"${KELDRA_QUALIFICATION_DIR}/artifacts/version-two.txt"
+chmod 0444 "${KELDRA_QUALIFICATION_DIR}/artifacts/version-"*.txt
 version_one="$(run_cli keldra-1 qversion-client "${version_secret}" \
   put qversion objects retained/value.txt /qualification/artifacts/version-one.txt \
   --command-id qversion-one --durability replicated)"
@@ -1814,8 +1814,8 @@ fi
 run_cli keldra-1 qversion-client "${version_secret}" \
   get qversion objects retained/value.txt \
   --output /qualification/artifacts/version-current.txt
-cmp "${ANVIL_QUALIFICATION_DIR}/artifacts/version-two.txt" \
-  "${ANVIL_QUALIFICATION_DIR}/artifacts/version-current.txt"
+cmp "${KELDRA_QUALIFICATION_DIR}/artifacts/version-two.txt" \
+  "${KELDRA_QUALIFICATION_DIR}/artifacts/version-current.txt"
 current_delete="$(run_cli keldra-3 qversion-client "${version_secret}" \
   delete-version qversion objects retained/value.txt "${version_two}" --durability replicated)"
 if [[ ! "${current_delete}" =~ ^deleted=true\ replacement_tombstone_version=([1-9][0-9]*)$ ]]; then
@@ -1836,8 +1836,8 @@ echo "[keldra-qualification] distributed retained-version deletion test passed"
 list_secret=qualification-list-secret-00000000000000000000000
 provision_tenant qlist qlist-client "${list_secret}"
 create_bucket keldra-3 qlist-client "${list_secret}" objects
-printf 'cluster-list\n' >"${ANVIL_QUALIFICATION_DIR}/artifacts/list.txt"
-chmod 0444 "${ANVIL_QUALIFICATION_DIR}/artifacts/list.txt"
+printf 'cluster-list\n' >"${KELDRA_QUALIFICATION_DIR}/artifacts/list.txt"
+chmod 0444 "${KELDRA_QUALIFICATION_DIR}/artifacts/list.txt"
 for item in alpha bravo charlie delta; do
   case "${item}" in
     alpha) list_node=keldra-1 ;;
@@ -1887,25 +1887,25 @@ run_atomic_index_qualification
 ec_secret=qualification-ec-secret-0000000000000000000000000
 provision_tenant qec qec-client "${ec_secret}"
 create_bucket keldra-3 qec-client "${ec_secret}" objects
-dd if=/dev/urandom of="${ANVIL_QUALIFICATION_DIR}/artifacts/large.bin" \
+dd if=/dev/urandom of="${KELDRA_QUALIFICATION_DIR}/artifacts/large.bin" \
   bs=1M count=2 status=none
-chmod 0444 "${ANVIL_QUALIFICATION_DIR}/artifacts/large.bin"
+chmod 0444 "${KELDRA_QUALIFICATION_DIR}/artifacts/large.bin"
 run_cli keldra-2 qec-client "${ec_secret}" \
   put qec objects ec/large.bin /qualification/artifacts/large.bin \
   --command-id qec-replicated --durability replicated >/dev/null
 run_cli keldra-1 qec-client "${ec_secret}" \
   get qec objects ec/large.bin \
   --output /qualification/artifacts/large-read.bin
-cmp "${ANVIL_QUALIFICATION_DIR}/artifacts/large.bin" \
-  "${ANVIL_QUALIFICATION_DIR}/artifacts/large-read.bin"
+cmp "${KELDRA_QUALIFICATION_DIR}/artifacts/large.bin" \
+  "${KELDRA_QUALIFICATION_DIR}/artifacts/large-read.bin"
 echo "[keldra-qualification] 2+1 replicated payload test passed"
 
 restart_secret=qualification-restart-secret-000000000000000000000
 provision_tenant qrestart qrestart-client "${restart_secret}"
 create_bucket keldra-1 qrestart-client "${restart_secret}" objects
 printf 'survives-rolling-restart\n' \
-  >"${ANVIL_QUALIFICATION_DIR}/artifacts/restart.txt"
-chmod 0444 "${ANVIL_QUALIFICATION_DIR}/artifacts/restart.txt"
+  >"${KELDRA_QUALIFICATION_DIR}/artifacts/restart.txt"
+chmod 0444 "${KELDRA_QUALIFICATION_DIR}/artifacts/restart.txt"
 run_cli keldra-3 qrestart-client "${restart_secret}" \
   put qrestart objects restart/value.txt /qualification/artifacts/restart.txt \
   --command-id qrestart-seed --durability replicated >/dev/null
@@ -1921,27 +1921,27 @@ for node in keldra-1 keldra-2 keldra-3; do
   service_logs "${node}" | preserve_startup_scan_evidence \
     "/var/tmp/keldra-v090-three-startup-scans-${qualification_suffix}-${node}.log"
   assert_sparse_index_startup "${node}" "$((sparse_starts_before + 1))"
-  rm -f "${ANVIL_QUALIFICATION_DIR}/artifacts/restart-read.txt"
+  rm -f "${KELDRA_QUALIFICATION_DIR}/artifacts/restart-read.txt"
   run_cli "${node}" qrestart-client "${restart_secret}" \
     get qrestart objects restart/value.txt \
     --output /qualification/artifacts/restart-read.txt
-  cmp "${ANVIL_QUALIFICATION_DIR}/artifacts/restart.txt" \
-    "${ANVIL_QUALIFICATION_DIR}/artifacts/restart-read.txt"
+  cmp "${KELDRA_QUALIFICATION_DIR}/artifacts/restart.txt" \
+    "${KELDRA_QUALIFICATION_DIR}/artifacts/restart-read.txt"
   verify_existing_indexes
   verify_index_resource_state "$(public_endpoint_for "${node}")"
   echo "[keldra-qualification] ${node} restart preserved every final complete index generation through all public endpoints"
   for growth_object in from-one from-two; do
     case "${growth_object}" in
       from-one)
-        growth_expected="${ANVIL_QUALIFICATION_DIR}/artifacts/growth-large.bin"
+        growth_expected="${KELDRA_QUALIFICATION_DIR}/artifacts/growth-large.bin"
         growth_expected_head="${growth_one_head}"
         ;;
       from-two)
-        growth_expected="${ANVIL_QUALIFICATION_DIR}/artifacts/growth-two-large.bin"
+        growth_expected="${KELDRA_QUALIFICATION_DIR}/artifacts/growth-two-large.bin"
         growth_expected_head="${growth_two_head}"
         ;;
     esac
-    growth_output="${ANVIL_QUALIFICATION_DIR}/artifacts/restart-${node}-${growth_object}.bin"
+    growth_output="${KELDRA_QUALIFICATION_DIR}/artifacts/restart-${node}-${growth_object}.bin"
     rm -f "${growth_output}"
     run_cli "${node}" qprobe-client "${qprobe_secret}" \
       get qprobe objects "growth/${growth_object}.bin" \
@@ -1956,7 +1956,7 @@ assert_index_retention_converged
 assert_zero_accounting_traffic_drops
 
 if [[ "${qualification_mode}" == "release" ]]; then
-  echo "[keldra-qualification] PASS scope=release-corpus records=${index_resource_records} image=${image_id} platform=${ANVIL_DOCKER_PLATFORM}"
+  echo "[keldra-qualification] PASS scope=release-corpus records=${index_resource_records} image=${image_id} platform=${KELDRA_DOCKER_PLATFORM}"
 else
-  echo "[keldra-qualification] SMOKE PASS records=${index_resource_records} image=${image_id} platform=${ANVIL_DOCKER_PLATFORM}"
+  echo "[keldra-qualification] SMOKE PASS records=${index_resource_records} image=${image_id} platform=${KELDRA_DOCKER_PLATFORM}"
 fi

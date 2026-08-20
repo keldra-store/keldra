@@ -1,17 +1,17 @@
-# ANVIL-0010: Single-Cluster Distribution in Anvil 0.5.1
+# KELDRA-0010: Single-Cluster Distribution in Keldra 0.5.1
 
 Status: Accepted architecture. Section 24 records the final implementation
 decisions approved before release work continued.
 
-Audience: Anvil implementors, operators, client authors, and reviewers
+Audience: Keldra implementors, operators, client authors, and reviewers
 
-Compatibility: An existing Anvil 0.5.0 data directory can become the first
-node of a 0.5.1 cluster in place. Anvil 0.5.1 does not restore an older product
+Compatibility: An existing Keldra 0.5.0 data directory can become the first
+node of a 0.5.1 cluster in place. Keldra 0.5.1 does not restore an older product
 surface or introduce PersonalDB, index, gateway, region, or mesh APIs.
 
 ## 1. Decision
 
-Anvil 0.5.1 adds one flat cluster containing `N` heterogeneous Anvil nodes.
+Keldra 0.5.1 adds one flat cluster containing `N` heterogeneous Keldra nodes.
 Raft decides the cluster's small control-plane state. Weighted rendezvous
 hashing derives ownership of the much larger data-plane state from the active
 membership. Neither object paths nor per-object placement decisions enter
@@ -83,7 +83,7 @@ node. PersonalDB and index APIs are not part of 0.5.1.
     authorization.
 14. Joining, removing, or reweighting a node moves only keys whose weighted
     HRW ranking changes.
-15. Loss, lag, or corruption is reported. Anvil does not return a successful
+15. Loss, lag, or corruption is reported. Keldra does not return a successful
     partial listing, silently use an older object version, or manufacture an
     authorization answer from stale state.
 
@@ -106,7 +106,7 @@ node. PersonalDB and index APIs are not part of 0.5.1.
 
 ## 4. Non-goals
 
-Anvil 0.5.1 does not provide:
+Keldra 0.5.1 does not provide:
 
 - regions, zones, topology-aware placement, cross-cluster mesh, federation,
   or disaster recovery between clusters;
@@ -382,7 +382,7 @@ This layout remains directly seekable for literal-prefix RocksDB iteration.
 ## 9. Serving fences and stale owners
 
 Weighted HRW says who should own a key but cannot stop an isolated node from
-continuing to use an older membership. Anvil therefore requires one short
+continuing to use an older membership. Keldra therefore requires one short
 node-wide serving fence, not a per-path lease or lock service.
 
 The current Raft leader may grant a serving lease only while it has recently
@@ -403,7 +403,7 @@ never extends it without a fresh leader grant.
 
 A successful linearizable quorum confirmation may be reused for at most 500
 milliseconds. A grant issued after that confirmation expires is rejected until
-the leader confirms again; Anvil does not perform a quorum round trip for every
+the leader confirms again; Keldra does not perform a quorum round trip for every
 recipient or ordinary request.
 
 A node may coordinate current heads, accept mutable operations, grant positive
@@ -474,7 +474,7 @@ replication, repair, source-journal, and atomic-program RPCs. This is a separate
 operational listener because it has a node-membership trust model, not because
 the RPCs are safe when accidentally exposed.
 
-Anvil does not operate a certificate authority. Each node uses a self-signed
+Keldra does not operate a certificate authority. Each node uses a self-signed
 certificate. After the TLS handshake proves possession of its private key, the
 receiver verifies:
 
@@ -554,7 +554,7 @@ Startup behavior is:
 | Empty | None | Absent | Refuse to start |
 
 When seeds are supplied, `--run-system-bootstrap` cannot create a cluster and
-Anvil logs that the flag is ignored. A joining node queries seeds until it
+Keldra logs that the flag is ignored. A joining node queries seeds until it
 finds the authoritative leader or another node that can redirect it. Its join
 capability and pinned seed identity authenticate this pre-activation traffic.
 
@@ -565,7 +565,7 @@ join bundles. Several wholly uninitialized nodes cannot securely form a new
 cluster simultaneously merely by sharing seed addresses. A seed-started node
 must already possess a join bundle issued by the bootstrapped cluster.
 
-Creating the Raft group and bootstrapping Anvil's protected identity are
+Creating the Raft group and bootstrapping Keldra's protected identity are
 different operations. Raft permanently snapshots one bounded state:
 
 ```text
@@ -587,7 +587,7 @@ receive the system state before becoming ready. A 0.5.0 directory with a valid
 bootstrap marker converts that marker exactly once into the cluster's
 `COMPLETE` state and never creates a new administrator credential.
 
-Anvil's JWT signing key remains operator-supplied and never enters Raft, a join
+Keldra's JWT signing key remains operator-supplied and never enters Raft, a join
 bundle, or cluster state transfer. Genesis commits this domain-separated
 BLAKE3 fingerprint as immutable bounded cluster configuration:
 
@@ -602,7 +602,7 @@ signing-key rotation is not a 0.5.1 capability.
 
 ## 13. Complete logical replication of mutable records
 
-RocksDB is not physically replicated. Anvil replicates typed logical records to
+RocksDB is not physically replicated. Keldra replicates typed logical records to
 the weighted-HRW-selected replica group:
 
 ```text
@@ -968,7 +968,7 @@ Forced removal is an explicit authorized administrator action. It first checks
 that surviving complete-record replicas and payload fragments meet the promised
 recovery requirements. It reconstructs changed content owners, disables GC for
 affected ranges, waits for old serving leases to expire, and only then commits
-removal. If evidence is insufficient, Anvil reports the affected data-loss
+removal. If evidence is insufficient, Keldra reports the affected data-loss
 risk and does not pretend removal is safe.
 
 There is no automatic unreachable-node eviction in 0.5.1.
@@ -981,7 +981,7 @@ copied and fenced. Live disk measurements never trigger this automatically.
 
 ## 16. Zanzibar in one cluster
 
-Zanzibar remains Anvil's sole authorization mechanism. Its schemas, bindings,
+Zanzibar remains Keldra's sole authorization mechanism. Its schemas, bindings,
 tuples, revisions, receipts, application identities, and verifier records are
 typed authoritative data placed and replicated like other mutable RocksDB
 records. They do not enter Raft.
@@ -1074,7 +1074,7 @@ RocksDB snapshot for its page; the merge is not a single point-in-time snapshot
 of the cluster.
 
 Failure or stale membership at any required active source makes the page
-unavailable. Anvil never returns a successful partial listing. A later path
+unavailable. Keldra never returns a successful partial listing. A later path
 index removes this all-node query fanout, but 0.5.1 does not implement that
 index.
 
@@ -1128,7 +1128,7 @@ A consumer reconnects through any active node, which verifies the checkpoint
 and resumes each source. Loss of a source epoch, passage below a retained floor,
 or a membership transition for which the cursor lacks required source evidence
 returns `RESUME_EXPIRED`. The client performs a current-state rescan and starts
-from a new checkpoint. Anvil never skips a gap and calls the watch resumed.
+from a new checkpoint. Keldra never skips a gap and calls the watch resumed.
 
 Source journals are bounded and compactable. They are not replicated as
 authority. Join handoff attempts to transfer the needed tail, but permanent
@@ -1144,7 +1144,7 @@ one index definition
   -> one logical cluster index
   -> WeightedHRW(index_id) selects one active owner
   -> one owner builds, caches, and executes queries
-  -> immutable index artifacts live as ordinary Anvil objects
+  -> immutable index artifacts live as ordinary Keldra objects
 ```
 
 One definition must never create one independently queried index per node.
@@ -1158,7 +1158,7 @@ RAM/disk cache.
 The one future index owner maintains a durable checkpoint vector containing one
 source epoch and offset for every required cluster journal. It streams all
 sources into one local builder. For every invalidation it rereads the current
-head, payload, and associated user metadata through ordinary Anvil APIs and
+head, payload, and associated user metadata through ordinary Keldra APIs and
 compares the current path version with the version already represented.
 
 Out-of-order cross-source arrival is harmless:
@@ -1180,7 +1180,7 @@ idempotent. A membership change restarts or explicitly rebases the build; it
 does not guess which events moved.
 
 The resulting immutable segments, definition, manifest, and checkpoint vector
-are normal `REPLICATED` Anvil objects. Only the owner CAS-publishes a manifest.
+are normal `REPLICATED` Keldra objects. Only the owner CAS-publishes a manifest.
 No index-specific authoritative column family or segment-placement plane is
 created. A replacement owner downloads the manifest and required segments on
 demand.
@@ -1219,7 +1219,7 @@ the associated metadata path is:
 /a/b/c.txt/_keldra/meta.json
 ```
 
-Any path segment exactly `_keldra` is reserved for Anvil-defined behavior. The
+Any path segment exactly `_keldra` is reserved for Keldra-defined behavior. The
 metadata bytes therefore use the normal object path, inline storage, erasure
 coding, durability, deduplication, reference counts, GC, and authorization.
 No metadata-specific storage plane or fields are added to the object version
@@ -1228,7 +1228,7 @@ descriptor.
 The metadata document identifies its subject version. A read or future index
 builder returns it only when that version matches the current subject head.
 Delete and recreation cannot resurrect stale metadata. Ordinary public listing
-and watch hide reserved descendants unless a defined Anvil capability exposes
+and watch hide reserved descendants unless a defined Keldra capability exposes
 them.
 
 0.5.1 reserves this representation and transports the object normally. It does
@@ -1383,7 +1383,7 @@ baselines and acquire a predecessor-linked stamp on their first mutation.
 
 Reference effects use the single ordered source journal and destination cursor
 protocol in section 14.3. When cursor-safe compaction cannot free enough space,
-all mutations that require a source-journal append apply backpressure. Anvil
+all mutations that require a source-journal append apply backpressure. Keldra
 does not drop only the reference effect, omit an index/watch event, create a
 gap, or add an unbounded secondary log.
 
@@ -1405,7 +1405,7 @@ command, snapshot, storage, and peer capability negotiation established here
 for rolling upgrades.
 
 Unknown or incompatible on-disk, peer, or Raft formats fail before the node
-becomes ready. Anvil never partially opens a newer cluster with older serving
+becomes ready. Keldra never partially opens a newer cluster with older serving
 semantics.
 
 ## 26. Test and release evidence
@@ -1482,7 +1482,7 @@ The design accepts several explicit trade-offs:
 - indexes, PersonalDB, regions, mesh, and gateways remain later capabilities
   built on this cluster rather than being stitched into 0.5.1.
 
-In exchange, Anvil gains one coherent distributed foundation: compact Raft
+In exchange, Keldra gains one coherent distributed foundation: compact Raft
 coordination, deterministic capacity-aware placement, exact mutable-record
 replication, economical payload redundancy, cluster-managed peer trust,
 recoverable explicit atomic programs, and a sound future indexing feed without

@@ -3,7 +3,7 @@ set -euo pipefail
 
 command -v rg >/dev/null 2>&1 || { echo "ripgrep (rg) is required for this gate" >&2; exit 2; }
 
-# Anvil must not depend on an external relational metadata store.
+# Keldra must not depend on an external relational metadata store.
 # Build the matcher from fragments so this checker can scan the whole repo
 # without matching its own source.
 db_a='post''gres'
@@ -20,6 +20,6 @@ if rg -n -i -uu "$pattern" . \
   -g '!target/**' \
   -g '!**/.git/**' \
   -g '!docs/**'; then
-  echo "External relational metadata-store reference found; Anvil must be self-contained." >&2
+  echo "External relational metadata-store reference found; Keldra must be self-contained." >&2
   exit 1
 fi

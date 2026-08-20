@@ -8,7 +8,7 @@ GEMINI.md
 /target
 keldra-data
 
-# Local Anvil runtime state and secrets
+# Local Keldra runtime state and secrets
 crates/keldra/.env
 crates/keldra/keldra-data/
 

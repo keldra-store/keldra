@@ -1,20 +1,20 @@
-# Anvil 0.9 index dependency record
+# Keldra 0.9 index dependency record
 
-This record covers the two dependencies deliberately adopted for the Anvil
+This record covers the two dependencies deliberately adopted for the Keldra
 0.9 native-segment index implementation. `Cargo.lock` remains the authoritative
 source for exact checksums and the complete workspace graph.
 
-## Anvil 0.9 direct choices
+## Keldra 0.9 direct choices
 
 | Dependency | Locked release | Enabled features | License choice | Purpose |
 | --- | --- | --- | --- | --- |
-| [`sux`](https://crates.io/crates/sux) | `0.14.0` | default features disabled | Apache-2.0 from `Apache-2.0 OR LGPL-2.1-or-later` | Query-time Rank9/Select9 navigation over Anvil's portable dense-posting bitmap bytes |
-| [`rayon`](https://crates.io/crates/rayon) | `1.12.0` | its normal library surface, reached through `sux`/`rdst` and used directly by Anvil's fixed index worker pool | Apache-2.0 from `MIT OR Apache-2.0` | Process-owned execution for admitted, bounded source-projection CPU work |
+| [`sux`](https://crates.io/crates/sux) | `0.14.0` | default features disabled | Apache-2.0 from `Apache-2.0 OR LGPL-2.1-or-later` | Query-time Rank9/Select9 navigation over Keldra's portable dense-posting bitmap bytes |
+| [`rayon`](https://crates.io/crates/rayon) | `1.12.0` | its normal library surface, reached through `sux`/`rdst` and used directly by Keldra's fixed index worker pool | Apache-2.0 from `MIT OR Apache-2.0` | Process-owned execution for admitted, bounded source-projection CPU work |
 
-Anvil does not enable `sux`'s default `flate2` or `zstd` features, nor its
+Keldra does not enable `sux`'s default `flate2` or `zstd` features, nor its
 `serde`, `epserde`, `mmap`, `cli` or `deko` features. This keeps native
 layout persistence and unused compression stacks out of the index format.
-Anvil serializes its own architecture-independent format and reconstructs
+Keldra serializes its own architecture-independent format and reconstructs
 checked `sux` structures from it.
 
 The normal Linux release graph was recorded with:
@@ -25,7 +25,7 @@ cargo tree --locked -p keldra-index --edges features
 ```
 
 The resolved `sux` closure is listed below. License expressions are copied from
-the crates' Cargo metadata. Every disjunction has a permissive option; Anvil
+the crates' Cargo metadata. Every disjunction has a permissive option; Keldra
 uses Apache-2.0 where it is offered.
 
 | Package | Version | Declared license |

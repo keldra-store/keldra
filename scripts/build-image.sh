@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-image="${ANVIL_IMAGE:-keldra:test}"
+image="${KELDRA_IMAGE:-keldra:test}"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source_commit="$(git -C "${repo_root}" rev-parse --verify 'HEAD^{commit}')"
 source_revision="${source_commit}"
@@ -9,7 +9,7 @@ if [[ -n "$(git -C "${repo_root}" status --porcelain=v1 --untracked-files=normal
   source_revision="${source_commit}-dirty"
 fi
 
-case "${ANVIL_DOCKER_PLATFORM:-}" in
+case "${KELDRA_DOCKER_PLATFORM:-}" in
   "")
     case "$(uname -m)" in
       arm64|aarch64)
@@ -31,7 +31,7 @@ case "${ANVIL_DOCKER_PLATFORM:-}" in
     platform="linux/amd64"
     ;;
   *)
-    echo "unsupported ANVIL_DOCKER_PLATFORM=${ANVIL_DOCKER_PLATFORM}" >&2
+    echo "unsupported KELDRA_DOCKER_PLATFORM=${KELDRA_DOCKER_PLATFORM}" >&2
     exit 2
     ;;
 esac
@@ -41,7 +41,7 @@ iid_file="$(mktemp -t keldra-image.XXXXXX)"
 trap 'rm -f "${iid_file}"' EXIT
 docker buildx build \
   --platform "${platform}" \
-  --build-arg "ANVIL_SOURCE_REVISION=${source_revision}" \
+  --build-arg "KELDRA_SOURCE_REVISION=${source_revision}" \
   --load \
   --iidfile "${iid_file}" \
   --file crates/keldra/Dockerfile \

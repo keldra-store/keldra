@@ -4,33 +4,33 @@ set -Eeuo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${repo_root}/scripts/qualification-log-evidence.sh"
 source "${repo_root}/scripts/qualification-scale-evidence.sh"
-requested_image="${ANVIL_IMAGE:-keldra:0.10.0}"
-keep="${ANVIL_QUALIFICATION_KEEP:-0}"
-qualification_mode="${ANVIL_QUALIFICATION_MODE:-smoke}"
-index_disk_cache_bytes="${ANVIL_QUALIFICATION_INDEX_DISK_CACHE_BYTES:-1073741824}"
-index_memory_percent="${ANVIL_QUALIFICATION_INDEX_MEMORY_PERCENT:-20}"
-index_kind_budget_bytes="${ANVIL_QUALIFICATION_INDEX_KIND_BUDGET_BYTES:-268435456}"
-index_compaction_max_lanes="${ANVIL_QUALIFICATION_INDEX_COMPACTION_MAX_LANES:-4}"
-index_rayon_workers="${ANVIL_QUALIFICATION_INDEX_RAYON_WORKERS:-4}"
-index_projection_max_lanes="${ANVIL_QUALIFICATION_INDEX_PROJECTION_MAX_LANES:-${index_rayon_workers}}"
+requested_image="${KELDRA_IMAGE:-keldra:0.11.0}"
+keep="${KELDRA_QUALIFICATION_KEEP:-0}"
+qualification_mode="${KELDRA_QUALIFICATION_MODE:-smoke}"
+index_disk_cache_bytes="${KELDRA_QUALIFICATION_INDEX_DISK_CACHE_BYTES:-1073741824}"
+index_memory_percent="${KELDRA_QUALIFICATION_INDEX_MEMORY_PERCENT:-20}"
+index_kind_budget_bytes="${KELDRA_QUALIFICATION_INDEX_KIND_BUDGET_BYTES:-268435456}"
+index_compaction_max_lanes="${KELDRA_QUALIFICATION_INDEX_COMPACTION_MAX_LANES:-4}"
+index_rayon_workers="${KELDRA_QUALIFICATION_INDEX_RAYON_WORKERS:-4}"
+index_projection_max_lanes="${KELDRA_QUALIFICATION_INDEX_PROJECTION_MAX_LANES:-${index_rayon_workers}}"
 # The default is a fast smoke. Set this to 839980 for the full
 # production-shaped, twelve-field corpus used by the resource qualification.
 case "${qualification_mode}" in
   release)
-    index_resource_records="${ANVIL_QUALIFICATION_INDEX_RECORDS:-839980}"
+    index_resource_records="${KELDRA_QUALIFICATION_INDEX_RECORDS:-839980}"
     require_performance_targets=1
     ;;
   smoke)
-    index_resource_records="${ANVIL_QUALIFICATION_INDEX_RECORDS:-16384}"
+    index_resource_records="${KELDRA_QUALIFICATION_INDEX_RECORDS:-16384}"
     require_performance_targets=0
     ;;
   *)
-    echo "ANVIL_QUALIFICATION_MODE must be release or smoke" >&2
+    echo "KELDRA_QUALIFICATION_MODE must be release or smoke" >&2
     exit 2
     ;;
 esac
-index_resource_mutations="${ANVIL_QUALIFICATION_INDEX_MUTATIONS:-512}"
-index_resource_max_anonymous_growth_bytes="${ANVIL_QUALIFICATION_INDEX_MAX_ANONYMOUS_GROWTH_BYTES:-2147483648}"
+index_resource_mutations="${KELDRA_QUALIFICATION_INDEX_MUTATIONS:-512}"
+index_resource_max_anonymous_growth_bytes="${KELDRA_QUALIFICATION_INDEX_MAX_ANONYMOUS_GROWTH_BYTES:-2147483648}"
 index_kinds=(Path MetadataFilter TypedJson FullText Vector Hybrid GitSource Tensor)
 qualification_examples=(
   accounting_qualification
@@ -60,7 +60,7 @@ do
   fi
 done
 if ((index_memory_percent > 100)); then
-  echo "ANVIL_QUALIFICATION_INDEX_MEMORY_PERCENT must not exceed 100" >&2
+  echo "KELDRA_QUALIFICATION_INDEX_MEMORY_PERCENT must not exceed 100" >&2
   exit 2
 fi
 case "${index_resource_records}" in
@@ -74,7 +74,7 @@ if [[ "${qualification_mode}" == "release" \
   exit 2
 fi
 
-case "${ANVIL_DOCKER_PLATFORM:-}" in
+case "${KELDRA_DOCKER_PLATFORM:-}" in
   "")
     case "$(uname -m)" in
       x86_64|amd64) platform=linux/amd64 ;;
@@ -85,9 +85,9 @@ case "${ANVIL_DOCKER_PLATFORM:-}" in
         ;;
     esac
     ;;
-  linux/amd64|linux/arm64) platform="${ANVIL_DOCKER_PLATFORM}" ;;
+  linux/amd64|linux/arm64) platform="${KELDRA_DOCKER_PLATFORM}" ;;
   *)
-    echo "unsupported ANVIL_DOCKER_PLATFORM=${ANVIL_DOCKER_PLATFORM}" >&2
+    echo "unsupported KELDRA_DOCKER_PLATFORM=${KELDRA_DOCKER_PLATFORM}" >&2
     exit 2
     ;;
 esac
@@ -160,9 +160,9 @@ if [[ "${image_revision}" != "${source_commit}" ]]; then
 fi
 server_version="$(docker run --rm --platform "${platform}" "${image_id}" keldra-server --version)"
 client_version="$(docker run --rm --platform "${platform}" "${image_id}" keldra --version)"
-if [[ "${server_version}" != "keldra-server 0.10.0" \
-  || "${client_version}" != "keldra 0.10.0" ]]; then
-  echo "qualification requires the exact Keldra 0.10.0 image" >&2
+if [[ "${server_version}" != "keldra-server 0.11.0" \
+  || "${client_version}" != "keldra 0.11.0" ]]; then
+  echo "qualification requires the exact Keldra 0.11.0 image" >&2
   echo "server: ${server_version}" >&2
   echo "client: ${client_version}" >&2
   exit 2
@@ -180,7 +180,7 @@ index_resource_bucket="index-resource-${qualification_suffix}"
 index_resource_report="/var/tmp/keldra-v090-single-index-resource-${qualification_suffix}.json"
 index_resource_observability_report="/var/tmp/keldra-v090-single-index-observability-${qualification_suffix}.json"
 index_resource_telemetry_prefix="/var/tmp/keldra-v090-single-index-telemetry-${qualification_suffix}"
-ANVIL_QUALIFICATION_STATE_DIR="${qualification_dir}"
+KELDRA_QUALIFICATION_STATE_DIR="${qualification_dir}"
 qualification_build_messages="${qualification_dir}/qualification-client-build.jsonl"
 container_started=0
 
@@ -311,7 +311,7 @@ start_single_node() {
   case "${profile}" in
     production-debt-default) ;;
     four-segment-compaction)
-      profile_environment=(--env ANVIL_INDEX_MAX_SEGMENTS_PER_TIER=4)
+      profile_environment=(--env KELDRA_INDEX_MAX_SEGMENTS_PER_TIER=4)
       ;;
     *)
       echo "unsupported single-node qualification profile ${profile}" >&2
@@ -324,46 +324,46 @@ start_single_node() {
     --platform "${platform}" \
     --publish 127.0.0.1::50051 \
     --env RUST_LOG=info,keldra::index_runtime::cpu=warn,keldra::index_runtime::retention=debug,keldra::observability::runtime=debug \
-    --env ANVIL_LISTEN=0.0.0.0:50051 \
-    --env ANVIL_PEER_LISTEN=127.0.0.1:50052 \
-    --env ANVIL_DATA_DIR=/var/lib/keldra \
-    --env ANVIL_NODE_ID=1 \
-    --env ANVIL_TOKEN_SIGNING_KEY_FILE=/run/secrets/keldra-token-signing-key \
-    --env ANVIL_RATE_LIMIT_CREDENTIAL_GLOBAL_PER_MINUTE=6000 \
-    --env ANVIL_RATE_LIMIT_CREDENTIAL_GLOBAL_BURST=1000 \
-    --env ANVIL_RATE_LIMIT_CREDENTIAL_CLIENT_PER_MINUTE=600 \
-    --env ANVIL_RATE_LIMIT_CREDENTIAL_CLIENT_BURST=100 \
-    --env "ANVIL_INDEX_DISK_CACHE_BYTES=${index_disk_cache_bytes}" \
-    --env "ANVIL_INDEX_MEMORY_PERCENT=${index_memory_percent}" \
-    --env "ANVIL_INDEX_BUILDER_MEMORY_BYTES_PER_KIND=${index_kind_budget_bytes}" \
-    --env "ANVIL_INDEX_PATH_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
-    --env "ANVIL_INDEX_PATH_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
-    --env "ANVIL_INDEX_PATH_PROJECTION_MAX_LANES=${index_projection_max_lanes}" \
-    --env "ANVIL_INDEX_METADATA_FILTER_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
-    --env "ANVIL_INDEX_METADATA_FILTER_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
-    --env "ANVIL_INDEX_METADATA_FILTER_PROJECTION_MAX_LANES=${index_projection_max_lanes}" \
-    --env "ANVIL_INDEX_TYPED_JSON_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
-    --env "ANVIL_INDEX_TYPED_JSON_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
-    --env "ANVIL_INDEX_TYPED_JSON_PROJECTION_MAX_LANES=${index_projection_max_lanes}" \
-    --env "ANVIL_INDEX_FULL_TEXT_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
-    --env "ANVIL_INDEX_FULL_TEXT_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
-    --env "ANVIL_INDEX_FULL_TEXT_PROJECTION_MAX_LANES=${index_projection_max_lanes}" \
-    --env "ANVIL_INDEX_VECTOR_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
-    --env "ANVIL_INDEX_VECTOR_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
-    --env "ANVIL_INDEX_VECTOR_PROJECTION_MAX_LANES=${index_projection_max_lanes}" \
-    --env "ANVIL_INDEX_HYBRID_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
-    --env "ANVIL_INDEX_HYBRID_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
-    --env "ANVIL_INDEX_HYBRID_PROJECTION_MAX_LANES=${index_projection_max_lanes}" \
-    --env "ANVIL_INDEX_GIT_SOURCE_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
-    --env "ANVIL_INDEX_GIT_SOURCE_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
-    --env "ANVIL_INDEX_GIT_SOURCE_PROJECTION_MAX_LANES=${index_projection_max_lanes}" \
-    --env "ANVIL_INDEX_TENSOR_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
-    --env "ANVIL_INDEX_TENSOR_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
-    --env "ANVIL_INDEX_TENSOR_PROJECTION_MAX_LANES=${index_projection_max_lanes}" \
-    --env "ANVIL_INDEX_RAYON_WORKERS=${index_rayon_workers}" \
+    --env KELDRA_LISTEN=0.0.0.0:50051 \
+    --env KELDRA_PEER_LISTEN=127.0.0.1:50052 \
+    --env KELDRA_DATA_DIR=/var/lib/keldra \
+    --env KELDRA_NODE_ID=1 \
+    --env KELDRA_TOKEN_SIGNING_KEY_FILE=/run/secrets/keldra-token-signing-key \
+    --env KELDRA_RATE_LIMIT_CREDENTIAL_GLOBAL_PER_MINUTE=6000 \
+    --env KELDRA_RATE_LIMIT_CREDENTIAL_GLOBAL_BURST=1000 \
+    --env KELDRA_RATE_LIMIT_CREDENTIAL_CLIENT_PER_MINUTE=600 \
+    --env KELDRA_RATE_LIMIT_CREDENTIAL_CLIENT_BURST=100 \
+    --env "KELDRA_INDEX_DISK_CACHE_BYTES=${index_disk_cache_bytes}" \
+    --env "KELDRA_INDEX_MEMORY_PERCENT=${index_memory_percent}" \
+    --env "KELDRA_INDEX_BUILDER_MEMORY_BYTES_PER_KIND=${index_kind_budget_bytes}" \
+    --env "KELDRA_INDEX_PATH_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
+    --env "KELDRA_INDEX_PATH_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
+    --env "KELDRA_INDEX_PATH_PROJECTION_MAX_LANES=${index_projection_max_lanes}" \
+    --env "KELDRA_INDEX_METADATA_FILTER_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
+    --env "KELDRA_INDEX_METADATA_FILTER_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
+    --env "KELDRA_INDEX_METADATA_FILTER_PROJECTION_MAX_LANES=${index_projection_max_lanes}" \
+    --env "KELDRA_INDEX_TYPED_JSON_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
+    --env "KELDRA_INDEX_TYPED_JSON_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
+    --env "KELDRA_INDEX_TYPED_JSON_PROJECTION_MAX_LANES=${index_projection_max_lanes}" \
+    --env "KELDRA_INDEX_FULL_TEXT_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
+    --env "KELDRA_INDEX_FULL_TEXT_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
+    --env "KELDRA_INDEX_FULL_TEXT_PROJECTION_MAX_LANES=${index_projection_max_lanes}" \
+    --env "KELDRA_INDEX_VECTOR_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
+    --env "KELDRA_INDEX_VECTOR_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
+    --env "KELDRA_INDEX_VECTOR_PROJECTION_MAX_LANES=${index_projection_max_lanes}" \
+    --env "KELDRA_INDEX_HYBRID_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
+    --env "KELDRA_INDEX_HYBRID_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
+    --env "KELDRA_INDEX_HYBRID_PROJECTION_MAX_LANES=${index_projection_max_lanes}" \
+    --env "KELDRA_INDEX_GIT_SOURCE_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
+    --env "KELDRA_INDEX_GIT_SOURCE_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
+    --env "KELDRA_INDEX_GIT_SOURCE_PROJECTION_MAX_LANES=${index_projection_max_lanes}" \
+    --env "KELDRA_INDEX_TENSOR_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
+    --env "KELDRA_INDEX_TENSOR_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
+    --env "KELDRA_INDEX_TENSOR_PROJECTION_MAX_LANES=${index_projection_max_lanes}" \
+    --env "KELDRA_INDEX_RAYON_WORKERS=${index_rayon_workers}" \
     "${profile_environment[@]}" \
-    --env ANVIL_INDEX_MAX_RETAINED_GENERATIONS=1 \
-    --env ANVIL_RUN_SYSTEM_BOOTSTRAP=true \
+    --env KELDRA_INDEX_MAX_RETAINED_GENERATIONS=1 \
+    --env KELDRA_RUN_SYSTEM_BOOTSTRAP=true \
     --volume "${data_dir}:/var/lib/keldra" \
     --volume "${signing_key}:/run/secrets/keldra-token-signing-key:ro" \
     "${image_id}" >/dev/null
@@ -405,7 +405,7 @@ provision_owner() {
   local attempt
   for attempt in $(seq 1 90); do
     if output="$(docker exec \
-      --env "ANVIL_NEW_CLIENT_SECRET=${provisioned_secret}" \
+      --env "KELDRA_NEW_CLIENT_SECRET=${provisioned_secret}" \
       "${container_name}" \
       keldra --endpoint http://127.0.0.1:50051 \
         --credentials-file /var/lib/keldra/system-bootstrap-credential.json \
@@ -566,23 +566,23 @@ assert_index_compaction_observability() {
 }
 
 run_public_read_qualification() {
-  ANVIL_PUBLIC_QUALIFICATION_ENDPOINTS="${public_endpoint}" \
-  ANVIL_PUBLIC_QUALIFICATION_TENANT="${tenant}" \
-  ANVIL_PUBLIC_QUALIFICATION_BUCKET=single-public-read \
-  ANVIL_PUBLIC_QUALIFICATION_CLIENT_ID="${owner_client}" \
-  ANVIL_PUBLIC_QUALIFICATION_CLIENT_SECRET="${owner_secret}" \
+  KELDRA_PUBLIC_QUALIFICATION_ENDPOINTS="${public_endpoint}" \
+  KELDRA_PUBLIC_QUALIFICATION_TENANT="${tenant}" \
+  KELDRA_PUBLIC_QUALIFICATION_BUCKET=single-public-read \
+  KELDRA_PUBLIC_QUALIFICATION_CLIENT_ID="${owner_client}" \
+  KELDRA_PUBLIC_QUALIFICATION_CLIENT_SECRET="${owner_secret}" \
     "${qualification_example_binaries[public_read_qualification]}"
   echo "[keldra-single-qualification] public-read qualification passed"
 }
 
 run_index_qualification() {
   capture_index_qualification_log_start
-  ANVIL_INDEX_QUALIFICATION_ENDPOINTS="${public_endpoint}" \
-  ANVIL_INDEX_QUALIFICATION_TENANT="${tenant}" \
-  ANVIL_INDEX_QUALIFICATION_CLIENT_ID="${owner_client}" \
-  ANVIL_INDEX_QUALIFICATION_CLIENT_SECRET="${owner_secret}" \
-  ANVIL_INDEX_QUALIFICATION_REQUIRE_QUIESCENCE=1 \
-  ANVIL_INDEX_QUALIFICATION_STATE_OUTPUT="${index_verification_state}" \
+  KELDRA_INDEX_QUALIFICATION_ENDPOINTS="${public_endpoint}" \
+  KELDRA_INDEX_QUALIFICATION_TENANT="${tenant}" \
+  KELDRA_INDEX_QUALIFICATION_CLIENT_ID="${owner_client}" \
+  KELDRA_INDEX_QUALIFICATION_CLIENT_SECRET="${owner_secret}" \
+  KELDRA_INDEX_QUALIFICATION_REQUIRE_QUIESCENCE=1 \
+  KELDRA_INDEX_QUALIFICATION_STATE_OUTPUT="${index_verification_state}" \
     "${qualification_example_binaries[cluster_index_qualification]}"
   test -s "${index_verification_state}"
   save_index_qualification_log
@@ -592,11 +592,11 @@ run_index_qualification() {
 }
 
 verify_existing_indexes() {
-  ANVIL_INDEX_QUALIFICATION_ENDPOINTS="${public_endpoint}" \
-  ANVIL_INDEX_QUALIFICATION_TENANT="${tenant}" \
-  ANVIL_INDEX_QUALIFICATION_CLIENT_ID="${owner_client}" \
-  ANVIL_INDEX_QUALIFICATION_CLIENT_SECRET="${owner_secret}" \
-  ANVIL_INDEX_QUALIFICATION_STATE_INPUT="${index_verification_state}" \
+  KELDRA_INDEX_QUALIFICATION_ENDPOINTS="${public_endpoint}" \
+  KELDRA_INDEX_QUALIFICATION_TENANT="${tenant}" \
+  KELDRA_INDEX_QUALIFICATION_CLIENT_ID="${owner_client}" \
+  KELDRA_INDEX_QUALIFICATION_CLIENT_SECRET="${owner_secret}" \
+  KELDRA_INDEX_QUALIFICATION_STATE_INPUT="${index_verification_state}" \
     "${qualification_example_binaries[cluster_index_qualification]}"
   echo "[keldra-single-qualification] final complete generations remained queryable after restart"
 }
@@ -712,38 +712,38 @@ run_index_resource_qualification() {
   local resource_log_start
   assert_source_tree_exact
   resource_log_start="$(qualification_log_cursor)"
-  ANVIL_V06_RESOURCE_ENDPOINTS="${public_endpoint}" \
-  ANVIL_V06_RESOURCE_TENANT="${index_resource_tenant}" \
-  ANVIL_V06_RESOURCE_BUCKET="${index_resource_bucket}" \
-  ANVIL_V06_RESOURCE_CLIENT_ID="${index_resource_client}" \
-  ANVIL_V06_RESOURCE_CLIENT_SECRET="${index_resource_secret}" \
-  ANVIL_V06_RESOURCE_RECORDS="${index_resource_records}" \
-  ANVIL_V06_RESOURCE_MUTATIONS="${index_resource_mutations}" \
-  ANVIL_V06_RESOURCE_BATCH_SIZE=1000 \
-  ANVIL_V06_RESOURCE_WORKERS=4 \
-  ANVIL_V06_RESOURCE_VERIFICATION_WORKERS=8 \
-  ANVIL_V06_RESOURCE_CONTAINERS="${container_name}" \
-  ANVIL_V06_REQUIRE_RESOURCE_TARGETS=1 \
-  ANVIL_V06_KIND_BUDGET_BYTES="${index_kind_budget_bytes}" \
-  ANVIL_V06_INDEX_COMPACTION_MAX_LANES="${index_compaction_max_lanes}" \
-  ANVIL_V06_INDEX_PROJECTION_MAX_LANES="${index_projection_max_lanes}" \
-  ANVIL_V06_INDEX_RAYON_WORKERS="${index_rayon_workers}" \
-  ANVIL_V06_MAX_ANONYMOUS_GROWTH_BYTES="${index_resource_max_anonymous_growth_bytes}" \
-  ANVIL_V09_REQUIRE_PERFORMANCE_TARGETS="${require_performance_targets}" \
-  ANVIL_V09_EVIDENCE_SOURCE_COMMIT="${source_commit}" \
-  ANVIL_V09_EVIDENCE_CONTAINER_DIGEST="${image_id}" \
-  ANVIL_V09_EVIDENCE_NATIVE_ARCHITECTURE="${native_architecture}" \
-  ANVIL_V09_EVIDENCE_CONTAINER_PLATFORM="${container_platform}" \
-  ANVIL_V09_EVIDENCE_TOPOLOGY=single-node \
-  ANVIL_V09_EVIDENCE_NODE_COUNT=1 \
-  ANVIL_V09_EVIDENCE_HARDWARE_LOGICAL_CPUS="${hardware_logical_cpus}" \
-  ANVIL_V09_EVIDENCE_HARDWARE_MEMORY_BYTES="${hardware_memory_bytes}" \
-  ANVIL_V09_EVIDENCE_FILESYSTEM_TOTAL_BYTES="${qualification_filesystem_total_bytes}" \
-  ANVIL_V09_EVIDENCE_FILESYSTEM_AVAILABLE_BYTES="${qualification_filesystem_available_bytes}" \
-  ANVIL_V09_EVIDENCE_INDEX_DISK_CACHE_BYTES_PER_NODE="${index_disk_cache_bytes}" \
-  ANVIL_V09_EVIDENCE_INDEX_MEMORY_PERCENT_PER_NODE="${index_memory_percent}" \
-  ANVIL_V06_RESOURCE_OUTPUT="${index_resource_report}" \
-  ANVIL_V06_RESOURCE_STATE_OUTPUT="${index_resource_state}" \
+  KELDRA_V06_RESOURCE_ENDPOINTS="${public_endpoint}" \
+  KELDRA_V06_RESOURCE_TENANT="${index_resource_tenant}" \
+  KELDRA_V06_RESOURCE_BUCKET="${index_resource_bucket}" \
+  KELDRA_V06_RESOURCE_CLIENT_ID="${index_resource_client}" \
+  KELDRA_V06_RESOURCE_CLIENT_SECRET="${index_resource_secret}" \
+  KELDRA_V06_RESOURCE_RECORDS="${index_resource_records}" \
+  KELDRA_V06_RESOURCE_MUTATIONS="${index_resource_mutations}" \
+  KELDRA_V06_RESOURCE_BATCH_SIZE=1000 \
+  KELDRA_V06_RESOURCE_WORKERS=4 \
+  KELDRA_V06_RESOURCE_VERIFICATION_WORKERS=8 \
+  KELDRA_V06_RESOURCE_CONTAINERS="${container_name}" \
+  KELDRA_V06_REQUIRE_RESOURCE_TARGETS=1 \
+  KELDRA_V06_KIND_BUDGET_BYTES="${index_kind_budget_bytes}" \
+  KELDRA_V06_INDEX_COMPACTION_MAX_LANES="${index_compaction_max_lanes}" \
+  KELDRA_V06_INDEX_PROJECTION_MAX_LANES="${index_projection_max_lanes}" \
+  KELDRA_V06_INDEX_RAYON_WORKERS="${index_rayon_workers}" \
+  KELDRA_V06_MAX_ANONYMOUS_GROWTH_BYTES="${index_resource_max_anonymous_growth_bytes}" \
+  KELDRA_V09_REQUIRE_PERFORMANCE_TARGETS="${require_performance_targets}" \
+  KELDRA_V09_EVIDENCE_SOURCE_COMMIT="${source_commit}" \
+  KELDRA_V09_EVIDENCE_CONTAINER_DIGEST="${image_id}" \
+  KELDRA_V09_EVIDENCE_NATIVE_ARCHITECTURE="${native_architecture}" \
+  KELDRA_V09_EVIDENCE_CONTAINER_PLATFORM="${container_platform}" \
+  KELDRA_V09_EVIDENCE_TOPOLOGY=single-node \
+  KELDRA_V09_EVIDENCE_NODE_COUNT=1 \
+  KELDRA_V09_EVIDENCE_HARDWARE_LOGICAL_CPUS="${hardware_logical_cpus}" \
+  KELDRA_V09_EVIDENCE_HARDWARE_MEMORY_BYTES="${hardware_memory_bytes}" \
+  KELDRA_V09_EVIDENCE_FILESYSTEM_TOTAL_BYTES="${qualification_filesystem_total_bytes}" \
+  KELDRA_V09_EVIDENCE_FILESYSTEM_AVAILABLE_BYTES="${qualification_filesystem_available_bytes}" \
+  KELDRA_V09_EVIDENCE_INDEX_DISK_CACHE_BYTES_PER_NODE="${index_disk_cache_bytes}" \
+  KELDRA_V09_EVIDENCE_INDEX_MEMORY_PERCENT_PER_NODE="${index_memory_percent}" \
+  KELDRA_V06_RESOURCE_OUTPUT="${index_resource_report}" \
+  KELDRA_V06_RESOURCE_STATE_OUTPUT="${index_resource_state}" \
     "${qualification_example_binaries[v06_index_resource_qualification]}" \
       >/dev/null
   : >"${index_resource_qualification_log}"
@@ -875,13 +875,13 @@ run_index_resource_qualification() {
 }
 
 verify_index_resource_state() {
-  ANVIL_V06_RESOURCE_ENDPOINTS="${public_endpoint}" \
-  ANVIL_V06_RESOURCE_TENANT="${index_resource_tenant}" \
-  ANVIL_V06_RESOURCE_BUCKET="${index_resource_bucket}" \
-  ANVIL_V06_RESOURCE_CLIENT_ID="${index_resource_client}" \
-  ANVIL_V06_RESOURCE_CLIENT_SECRET="${index_resource_secret}" \
-  ANVIL_V06_RESOURCE_VERIFICATION_WORKERS=8 \
-  ANVIL_V06_RESOURCE_STATE_INPUT="${index_resource_state}" \
+  KELDRA_V06_RESOURCE_ENDPOINTS="${public_endpoint}" \
+  KELDRA_V06_RESOURCE_TENANT="${index_resource_tenant}" \
+  KELDRA_V06_RESOURCE_BUCKET="${index_resource_bucket}" \
+  KELDRA_V06_RESOURCE_CLIENT_ID="${index_resource_client}" \
+  KELDRA_V06_RESOURCE_CLIENT_SECRET="${index_resource_secret}" \
+  KELDRA_V06_RESOURCE_VERIFICATION_WORKERS=8 \
+  KELDRA_V06_RESOURCE_STATE_INPUT="${index_resource_state}" \
     "${qualification_example_binaries[v06_index_resource_qualification]}"
 }
 
@@ -1241,8 +1241,8 @@ restart_populated_node() {
   docker restart "${container_name}" >/dev/null
   deadline=$((SECONDS + 30))
   while ! docker exec \
-    --env "ANVIL_CLIENT_ID=${owner_client}" \
-    --env "ANVIL_CLIENT_SECRET=${owner_secret}" \
+    --env "KELDRA_CLIENT_ID=${owner_client}" \
+    --env "KELDRA_CLIENT_SECRET=${owner_secret}" \
     "${container_name}" \
     keldra --endpoint http://127.0.0.1:50051 \
       head "${tenant}" index-journal-events docs/a.json >/dev/null 2>&1
@@ -1319,21 +1319,21 @@ assert_index_retention_converged() {
 }
 
 run_accounting_qualification() {
-  ANVIL_ACCOUNTING_QUALIFICATION_ENDPOINTS="${public_endpoint}" \
-  ANVIL_ACCOUNTING_QUALIFICATION_TENANT="${tenant}" \
-  ANVIL_ACCOUNTING_QUALIFICATION_BUCKET="single-accounting-${$}" \
-  ANVIL_ACCOUNTING_QUALIFICATION_CLIENT_ID="${owner_client}" \
-  ANVIL_ACCOUNTING_QUALIFICATION_CLIENT_SECRET="${owner_secret}" \
+  KELDRA_ACCOUNTING_QUALIFICATION_ENDPOINTS="${public_endpoint}" \
+  KELDRA_ACCOUNTING_QUALIFICATION_TENANT="${tenant}" \
+  KELDRA_ACCOUNTING_QUALIFICATION_BUCKET="single-accounting-${$}" \
+  KELDRA_ACCOUNTING_QUALIFICATION_CLIENT_ID="${owner_client}" \
+  KELDRA_ACCOUNTING_QUALIFICATION_CLIENT_SECRET="${owner_secret}" \
     "${qualification_example_binaries[accounting_qualification]}"
   echo "[keldra-single-qualification] accounting qualification passed"
 }
 
 run_atomic_index_qualification() {
-  ANVIL_ATOMIC_INDEX_QUALIFICATION_ENDPOINTS="${public_endpoint}" \
-  ANVIL_ATOMIC_INDEX_QUALIFICATION_TENANT="${tenant}" \
-  ANVIL_ATOMIC_INDEX_QUALIFICATION_BUCKET="atomic-index-single-${$}" \
-  ANVIL_ATOMIC_INDEX_QUALIFICATION_CLIENT_ID="${owner_client}" \
-  ANVIL_ATOMIC_INDEX_QUALIFICATION_CLIENT_SECRET="${owner_secret}" \
+  KELDRA_ATOMIC_INDEX_QUALIFICATION_ENDPOINTS="${public_endpoint}" \
+  KELDRA_ATOMIC_INDEX_QUALIFICATION_TENANT="${tenant}" \
+  KELDRA_ATOMIC_INDEX_QUALIFICATION_BUCKET="atomic-index-single-${$}" \
+  KELDRA_ATOMIC_INDEX_QUALIFICATION_CLIENT_ID="${owner_client}" \
+  KELDRA_ATOMIC_INDEX_QUALIFICATION_CLIENT_SECRET="${owner_secret}" \
     "${qualification_example_binaries[atomic_index_qualification]}"
   echo "[keldra-single-qualification] atomic-program index visibility passed"
 }
@@ -1373,10 +1373,10 @@ assert_zero_accounting_traffic_drops() {
 }
 
 run_personaldb_qualification() {
-  ANVIL_PERSONALDB_QUALIFICATION_ENDPOINTS="${public_endpoint}" \
-  ANVIL_PERSONALDB_QUALIFICATION_TENANT="${tenant}" \
-  ANVIL_PERSONALDB_QUALIFICATION_CLIENT_ID="${owner_client}" \
-  ANVIL_PERSONALDB_QUALIFICATION_CLIENT_SECRET="${owner_secret}" \
+  KELDRA_PERSONALDB_QUALIFICATION_ENDPOINTS="${public_endpoint}" \
+  KELDRA_PERSONALDB_QUALIFICATION_TENANT="${tenant}" \
+  KELDRA_PERSONALDB_QUALIFICATION_CLIENT_ID="${owner_client}" \
+  KELDRA_PERSONALDB_QUALIFICATION_CLIENT_SECRET="${owner_secret}" \
     "${qualification_example_binaries[personaldb_qualification]}"
   echo "[keldra-single-qualification] PersonalDB qualification passed"
 }
@@ -1388,8 +1388,8 @@ run_large_object_qualification() {
   local after_restart="${qualification_dir}/large-after-restart.bin"
   local command=(
     docker exec
-    --env "ANVIL_CLIENT_ID=${owner_client}"
-    --env "ANVIL_CLIENT_SECRET=${owner_secret}"
+    --env "KELDRA_CLIENT_ID=${owner_client}"
+    --env "KELDRA_CLIENT_SECRET=${owner_secret}"
     "${container_name}"
     keldra --endpoint http://127.0.0.1:50051
   )
@@ -1451,10 +1451,10 @@ run_large_object_qualification() {
 }
 
 run_s3_qualification() {
-  ANVIL_S3_QUALIFICATION_ENDPOINTS="${public_endpoint}" \
-  ANVIL_S3_QUALIFICATION_CLIENT_ID="${s3_client}" \
-  ANVIL_S3_QUALIFICATION_CLIENT_SECRET="${s3_secret}" \
-  ANVIL_S3_QUALIFICATION_BUCKET="s3-single-${$}" \
+  KELDRA_S3_QUALIFICATION_ENDPOINTS="${public_endpoint}" \
+  KELDRA_S3_QUALIFICATION_CLIENT_ID="${s3_client}" \
+  KELDRA_S3_QUALIFICATION_CLIENT_SECRET="${s3_secret}" \
+  KELDRA_S3_QUALIFICATION_BUCKET="s3-single-${$}" \
     "${qualification_example_binaries[s3_qualification]}"
   echo "[keldra-single-qualification] official AWS SDK S3 qualification passed"
 }
@@ -1470,15 +1470,15 @@ run_git_qualification() {
   local authorization
 
   docker exec \
-    --env "ANVIL_CLIENT_ID=${owner_client}" \
-    --env "ANVIL_CLIENT_SECRET=${owner_secret}" \
+    --env "KELDRA_CLIENT_ID=${owner_client}" \
+    --env "KELDRA_CLIENT_SECRET=${owner_secret}" \
     "${container_name}" \
     keldra --endpoint http://127.0.0.1:50051 create-bucket "${bucket}" \
     | grep -Fq "bucket=${bucket}"
 
   mkdir -p "${git_root}"
   git init --quiet --initial-branch=main "${source_repository}"
-  git -C "${source_repository}" config user.name "Anvil Qualification"
+  git -C "${source_repository}" config user.name "Keldra Qualification"
   git -C "${source_repository}" config user.email "qualification@example.invalid"
   printf 'single-node smart HTTP gateway\n' >"${source_repository}/README.md"
   git -C "${source_repository}" add README.md
@@ -1501,8 +1501,8 @@ run_git_qualification() {
   fi
 
   docker exec \
-    --env "ANVIL_CLIENT_ID=${owner_client}" \
-    --env "ANVIL_CLIENT_SECRET=${owner_secret}" \
+    --env "KELDRA_CLIENT_ID=${owner_client}" \
+    --env "KELDRA_CLIENT_SECRET=${owner_secret}" \
     "${container_name}" \
     keldra --endpoint http://127.0.0.1:50051 \
       set-bucket-public-read "${bucket}" enabled >/dev/null

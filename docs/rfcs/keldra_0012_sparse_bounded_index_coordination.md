@@ -1,19 +1,19 @@
-# ANVIL-0012: Sparse, Bounded Index Coordination in Anvil 0.7.0
+# KELDRA-0012: Sparse, Bounded Index Coordination in Keldra 0.7.0
 
-Status: Accepted architecture for Anvil 0.7.0.
+Status: Accepted architecture for Keldra 0.7.0.
 
-Supersedes: ANVIL-0011 in full.
+Supersedes: KELDRA-0011 in full.
 
-Audience: Anvil implementors, operators, client authors, and reviewers
+Audience: Keldra implementors, operators, client authors, and reviewers
 
-Upgrade contract: Anvil 0.7.0 deployments start with new volumes. There is no
+Upgrade contract: Keldra 0.7.0 deployments start with new volumes. There is no
 old-volume detection, migration, scan, backfill, dual-write, compatibility
 reader, or rejection subsystem. Behavior when pointing 0.7.0 at a volume
 created by an earlier release is outside the supported contract.
 
 ## 1. Decision
 
-Anvil retains the bounded immutable-run index engines introduced in 0.6.0 and
+Keldra retains the bounded immutable-run index engines introduced in 0.6.0 and
 replaces their discovery, change-routing, recovery, accounting, and maintenance
 coordination. Index construction must be bounded, but bounded construction is
 not sufficient if startup or recovery still scans the entire object corpus.
@@ -36,7 +36,7 @@ snapshot-bound scoped source stream + routed journal suffix
   -> bounded per-kind mutable builder
   -> immutable L0 runs
   -> streaming size-tiered compaction
-  -> ordinary Anvil objects
+  -> ordinary Keldra objects
   -> one CAS-published generation manifest
 ```
 
@@ -188,7 +188,7 @@ write optimized; merged runs are read optimized.
 
 **Component block** is an independently fetched, checksummed ordinary object
 holding a bounded range of one run component. It is not an erasure-code shard;
-the ordinary Anvil byte plane may erasure-code its payload.
+the ordinary Keldra byte plane may erasure-code its payload.
 
 ## 6. Existing source journal
 
@@ -414,7 +414,7 @@ epoch and retained floor through tail.
 One bucket route serves all definitions in that bucket. A process-local bucket
 dispatcher may decode a page once and use a prefix trie to wake matching index,
 accounting, and watch consumers. The dispatcher is a cache; durable consumers
-advance only their own complete checkpoints. Anvil does not create one journal,
+advance only their own complete checkpoints. Keldra does not create one journal,
 tail, or durable cursor per bucket or definition.
 
 The resulting steady-state work is:
@@ -578,7 +578,7 @@ is that a small amount of traffic may be absent from reported bandwidth during:
   the disposable bucket cache.
 
 Those windows affect bandwidth totals only. They never alter stored-byte,
-object-count, object, reference, authorization, or index correctness. Anvil
+object-count, object, reference, authorization, or index correctness. Keldra
 exports dropped batch and byte counts, pending bytes, oldest pending age,
 matcher retries, cache generation/age, and definition-propagation lag. Queue
 exhaustion is never silent. Release qualification must show zero drops under the
@@ -694,13 +694,13 @@ correctness or durable bytes; setting a kind to one lane selects the sequential
 execution profile.
 
 The public API therefore appears mutable while durable index storage stays
-immutable. Anvil does not add mutable distributed index pages, another WAL, or
+immutable. Keldra does not add mutable distributed index pages, another WAL, or
 an index-specific replication plane.
 
 ## 13. Ordinary-object publication and retention
 
 Definitions, run components, component blocks, run roots, generation manifests,
-and current pointers are ordinary Anvil objects under reserved paths. Small
+and current pointers are ordinary Keldra objects under reserved paths. Small
 objects use the inline path; larger ones use the ordinary erasure-coded byte
 plane. Index publication requests `REPLICATED` acknowledgement when the cluster
 can provide it and degrades to `LOCAL` on a one-node cluster, matching the
@@ -802,7 +802,7 @@ replaces both component families together.
 ### 15.7 Git source
 
 Commit, tree-path, and object relationships use sorted tuples and routed lookup
-keys. Object bodies remain ordinary Anvil objects and are never copied into the
+keys. Object bodies remain ordinary Keldra objects and are never copied into the
 index.
 
 ### 15.8 Tensor

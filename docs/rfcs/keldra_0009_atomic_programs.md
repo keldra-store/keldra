@@ -1,15 +1,15 @@
-# ANVIL-0009: Bounded Atomic Programs in the Anvil 0.5 Core
+# KELDRA-0009: Bounded Atomic Programs in the Keldra 0.5 Core
 
-Status: Accepted architecture for the Anvil 0.5.0 core.
+Status: Accepted architecture for the Keldra 0.5.0 core.
 
-Audience: Anvil implementors, client authors, operators, and reviewers
+Audience: Keldra implementors, client authors, operators, and reviewers
 
-Compatibility: None. Anvil 0.5 is a new capability architecture, not a
+Compatibility: None. Keldra 0.5 is a new capability architecture, not a
 restoration or emulation of an earlier API.
 
 ## 1. Decision
 
-Anvil 0.5.0 is an exact-path, opaque object store with monotonic path versions
+Keldra 0.5.0 is an exact-path, opaque object store with monotonic path versions
 and deliberately optional historical-version retention. Its core is small:
 
 - exact-path reads;
@@ -18,7 +18,7 @@ and deliberately optional historical-version retention. Its core is small:
 - explicit bounded atomic-program APIs for paths marked `PROGRAM_ONLY`; and
 - an unordered, resumable `WatchPrefix` invalidation feed; and
 - realm-scoped Zanzibar schemas, relationship tuples, and permission checks
-  used both by Anvil itself and by applications.
+  used both by Keldra itself and by applications.
 
 Ordinary `Put`, `Delete`, CAS, and bulk operations are never transactions. They
 do not accept a transaction ID, do not stage work for a later client commit,
@@ -27,7 +27,7 @@ transport and bounded server work, but each item succeeds or fails
 independently.
 
 An atomic program is different because it deliberately changes several exact
-paths under one visibility decision. Anvil 0.5.0 is a single-node release. Its
+paths under one visibility decision. Keldra 0.5.0 is a single-node release. Its
 sole node is the nominated atomic-program executor and executes explicit atomic
 API calls locally. There is no 0.5.0 peer transport, request proxy, or claim of
 node-loss availability.
@@ -72,7 +72,7 @@ plane must preserve this separation.
 
 ## 2. Why this boundary exists
 
-Anvil stores opaque bytes at exact paths. Most writes need only a version and an
+Keldra stores opaque bytes at exact paths. Most writes need only a version and an
 exact-path condition. Turning every write into a transaction would add latency,
 state, recovery work, and API ceremony without adding useful correctness.
 
@@ -108,12 +108,12 @@ There is no general transaction class between them.
    sequence.
 8. Ingest the pinned OSV corpus into the qualification schema on one node in at
    most 150 seconds.
-9. Use one Zanzibar authorization engine for Anvil's own request decisions and
+9. Use one Zanzibar authorization engine for Keldra's own request decisions and
    for application-defined relationship realms.
 
 ## 4. Non-goals
 
-Anvil 0.5.0 does not provide:
+Keldra 0.5.0 does not provide:
 
 - `BeginTransaction`, staged mutation, client `Commit`, rollback, transaction
   status, or certification;
@@ -355,7 +355,7 @@ state. `created_at` records first creation; `updated_at` records the most recent
 lifecycle activity.
 
 Every immutable version descriptor contains only a content-addressed
-reference. Payload bytes are never copied inline into the descriptor. Anvil
+reference. Payload bytes are never copied inline into the descriptor. Keldra
 0.5.0 stores payloads of at most 64 KiB as raw bytes in a dedicated RocksDB
 column family keyed by `(content_hash, content_length)` and larger payloads in
 the filesystem byte plane under the same identity. The location is therefore
@@ -445,7 +445,7 @@ and are never expanded into Raft state.
 ### 5.7 Core Zanzibar authorization
 
 Zanzibar authorization is part of the 0.5 storage core. It is not an index,
-gateway, compatibility feature, or optional policy plug-in. Anvil uses the same
+gateway, compatibility feature, or optional policy plug-in. Keldra uses the same
 schema, tuple, revision, and evaluator primitives that it exposes to
 applications.
 
@@ -489,9 +489,9 @@ explicit output path or, by default:
 
 The file is created without replacement at mode `0600`, flushed durably, and
 contains the system tenant, stable bootstrap application ID, client ID, and
-client secret. Anvil logs the exact path and tells the administrator to copy it
+client secret. Keldra logs the exact path and tells the administrator to copy it
 to their secret store and delete this generated copy; it never logs the secret.
-Only a salted verifier is stored in Anvil.
+Only a salted verifier is stored in Keldra.
 
 The credential file is durable before one atomic metadata write installs the
 schema, binding, application/verifier, `bootstrap_admin` tuple, authorization
@@ -515,7 +515,7 @@ the reserved system scope or add an administrator bypass.
 
 Every server start requires an operator-managed token-signing key through
 `--token-signing-key-file`. It must be a regular non-symlink file, mode `0600`,
-at most 4 KiB, and contain at least 32 bytes. Anvil reads it at startup and
+at most 4 KiB, and contain at least 32 bytes. Keldra reads it at startup and
 never persists or logs it. Every node that must accept the same tokens receives
 the same key through the operator's secret distribution mechanism. The
 credential-exchange RPC sends a long-lived secret and therefore requires TLS
@@ -537,10 +537,10 @@ relation, and userset identities remain structurally inside their realm;
 implementations must not emulate isolation by exposing realm prefixes in
 namespace strings. A userset cannot cross a realm.
 
-There is one protected system scope whose identity is reserved to Anvil:
+There is one protected system scope whose identity is reserved to Keldra:
 
 ```text
-storage tenant = Anvil's internal system tenant
+storage tenant = Keldra's internal system tenant
 realm          = _keldra/system
 schema         = keldra-system
 ```
@@ -551,13 +551,13 @@ types, storage operations, limits, and evaluator as every application realm.
 There is no separate ACL engine and no hard-coded administrator role that
 short-circuits checks.
 
-Only Anvil's internal bootstrap and system operations may target the reserved
+Only Keldra's internal bootstrap and system operations may target the reserved
 system scope for mutation. Public realm APIs reject that scope even if a caller
 spells it explicitly. This protects mutation authority, not representation:
 internal system writes still execute the same validated schema/binding/tuple
 operations as third-party writes.
 
-The system schema models the resources Anvil currently exposes. The 0.5.0
+The system schema models the resources Keldra currently exposes. The 0.5.0
 schema includes the system root, storage tenants, buckets, exact objects, and
 authorization realms. Later capability releases add their own resource
 namespaces to a new immutable system-schema revision; they do not add a second
@@ -580,7 +580,7 @@ authenticated subject. In particular:
   the corresponding system `authz_realm` resource.
 
 The bucket fallback is evaluated structurally from the exact object address.
-Anvil must not write a `parent_bucket` tuple for every object merely to recover
+Keldra must not write a `parent_bucket` tuple for every object merely to recover
 information already present in that address.
 
 The protected `authz_realm` resource exposes relations and derived permissions
@@ -669,7 +669,7 @@ An atomic program is an immutable, bounded server capability. An invocation
 supplies a stable invocation ID, a pinned program identity, and bounded input.
 It does not supply arbitrary code or a transaction plan.
 
-A program definition is an ordinary immutable Anvil object whose exact path is
+A program definition is an ordinary immutable Keldra object whose exact path is
 under the reserved `_keldra/programs/` prefix. For example:
 
 ```text
@@ -679,7 +679,7 @@ _keldra/programs/import_osv@1
 The definition is created through the ordinary object write API using the
 `Absent` condition. The same Zanzibar path authorisation used for every other
 object decides whether the caller may write it. There is no program registry,
-registry root, registration RPC, or Anvil-defined administrator role. The
+registry root, registration RPC, or Keldra-defined administrator role. The
 nominated executor loads the exact program object and verifies its pinned
 content hash before execution.
 
@@ -943,7 +943,7 @@ distributed capability must define a new
 cluster-wide finalized-through criterion before it adds followers.
 
 The tail has hard entry and byte limits. If finalization cannot advance and the
-tail reaches its bound, Anvil applies backpressure to new atomic-program
+tail reaches its bound, Keldra applies backpressure to new atomic-program
 commits. It must not grow Raft without bound, discard recovery information, or
 pretend an unfinalized batch is safe. Independent ordinary object operations do
 not become transactions merely because atomic-program admission is stalled.
@@ -965,7 +965,7 @@ new `CommitBatch`, Raft deterministically removes entries whose committed
 expiry is at or before that command's proposal time, but only when those
 entries are already at or below `FinalizedThrough`. Expired entries may
 therefore remain harmlessly bounded until the next atomic commit. After the
-reported expiry Anvil does not
+reported expiry Keldra does not
 promise that an old invocation can be distinguished from a new submission or
 that its original response can be reconstructed. A caller must not blindly
 retry an expired financial or otherwise non-repeatable operation; it must
@@ -1217,7 +1217,7 @@ InvokeAtomicProgramResult {
 ```
 
 Authorization uses a separate bounded service surface over the same core
-repository Anvil consults internally:
+repository Keldra consults internally:
 
 ```text
 PutAuthzSchema {
@@ -1290,7 +1290,7 @@ failures are not automatically retryable.
 
 ## 14. Capability release sequence
 
-Anvil 0.5 is delivered as capabilities, not as layers of compatibility code.
+Keldra 0.5 is delivered as capabilities, not as layers of compatibility code.
 
 1. **0.5.0 Core:** opaque versioned objects, ordinary CAS/immutable/bulk
    writes, bounded atomic programs, executor nomination and recovery,
@@ -1521,7 +1521,7 @@ byte, outcome, and request-latency measurements. The qualification tool records
 end-to-end OSV ingest time and throughput in its JSON report;
 those benchmark results are not OTLP process metrics. Exact lock-wait timing,
 separate durability-wait timing, finalized-through lag, and instantaneous
-orphan-byte inventory are explicit 0.5.0 limitations; Anvil does not add scans
+orphan-byte inventory are explicit 0.5.0 limitations; Keldra does not add scans
 or durable side state solely to manufacture them. Traces carry a derived
 invocation hash, program hash, nomination log index, and commit log index
 without logging caller-selected IDs, paths, or opaque payloads.
@@ -1534,7 +1534,7 @@ local preparation, and one Raft decision only when they invoke an explicit
 atomic capability.
 
 Authorization has one model rather than an operational ACL layer beside a
-product tuple layer. The protected system realm governs Anvil requests; custom
+product tuple layer. The protected system realm governs Keldra requests; custom
 realms govern application relationships. Protection changes who may mutate the
 system scope, not how that scope is stored or evaluated. Schema and tuple
 cardinality stay outside Raft, and structural object addresses avoid one

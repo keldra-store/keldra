@@ -93,7 +93,7 @@ preserve_journal_pressure_evidence() {
   local node
   for node in keldra-1 keldra-2 keldra-3; do
     preserve_qualification_log \
-      "${ANVIL_QUALIFICATION_DIR}/artifacts/index-gap-recovery-${node}.log" \
+      "${KELDRA_QUALIFICATION_DIR}/artifacts/index-gap-recovery-${node}.log" \
       "${destination_prefix}-${node}.log"
   done
   echo "[keldra-qualification] preserved journal-pressure evidence ${destination_prefix}-keldra-{1,2,3}.log"
@@ -102,7 +102,7 @@ preserve_journal_pressure_evidence() {
 capture_three_node_resource_evidence() {
   local node="$1"
   local start_cursor="$2"
-  local log="${ANVIL_QUALIFICATION_DIR}/artifacts/index-resource-${node}.log"
+  local log="${KELDRA_QUALIFICATION_DIR}/artifacts/index-resource-${node}.log"
   local capture_cursor="${start_cursor}"
   local next_cursor
   local attempt
@@ -125,7 +125,7 @@ capture_three_node_resource_evidence() {
   preserve_qualification_log "${log}" "${index_resource_telemetry_prefix}-${node}.log"
   assert_zero_cgroup_oom_samples "${log}" "${node} production qualification"
   assert_capacity_samples "${log}" "${node} production qualification" \
-    "${ANVIL_QUALIFICATION_SOURCE_JOURNAL_MAX_ENTRIES}"
+    "${KELDRA_QUALIFICATION_SOURCE_JOURNAL_MAX_ENTRIES}"
 }
 
 wait_for_source_journal_entry_bound() {
@@ -154,7 +154,7 @@ start_source_journal_phase() {
   local bound="$1"
   shift
   local node
-  export ANVIL_QUALIFICATION_SOURCE_JOURNAL_MAX_ENTRIES="${bound}"
+  export KELDRA_QUALIFICATION_SOURCE_JOURNAL_MAX_ENTRIES="${bound}"
   for node in "$@"; do
     compose up --detach --no-deps --force-recreate "${node}"
     wait_for_node "${node}"
@@ -201,7 +201,7 @@ prepare_joining_node() {
     return 1
   fi
 
-  local copied="${ANVIL_QUALIFICATION_DIR}/artifacts/keldra-node-${node_id}.join.json"
+  local copied="${KELDRA_QUALIFICATION_DIR}/artifacts/keldra-node-${node_id}.join.json"
   compose cp "${source_service}:${bundle_path}" "${copied}"
   chmod 0600 "${copied}"
   docker run --rm --user 0 \
@@ -215,7 +215,7 @@ start_prepared_node() {
   compose up --detach "${service}"
   wait_for_node "${service}"
   assert_sparse_index_startup "${service}" 1
-  if [[ -e "${ANVIL_QUALIFICATION_DIR}/artifacts/keldra-node-${node_id}.join.json" ]]; then
+  if [[ -e "${KELDRA_QUALIFICATION_DIR}/artifacts/keldra-node-${node_id}.join.json" ]]; then
     echo "${service} became ready without consuming and deleting its join bundle" >&2
     return 1
   fi
@@ -242,7 +242,7 @@ start_prepared_node_during_indexed_cutover() {
   paused_container=""
   wait_for_node "${service}"
   assert_sparse_index_startup "${service}" 1
-  if [[ -e "${ANVIL_QUALIFICATION_DIR}/artifacts/keldra-node-${node_id}.join.json" ]]; then
+  if [[ -e "${KELDRA_QUALIFICATION_DIR}/artifacts/keldra-node-${node_id}.join.json" ]]; then
     echo "${service} became ready without consuming and deleting its join bundle" >&2
     return 1
   fi
@@ -365,8 +365,8 @@ prepare_no_event_membership_cutover_qualification() {
     echo "no-event membership cutover source must not be the reconciliation coordinator" >&2
     return 1
   fi
-  printf 'x' >"${ANVIL_QUALIFICATION_DIR}/artifacts/membership-cutover-byte.bin"
-  chmod 0444 "${ANVIL_QUALIFICATION_DIR}/artifacts/membership-cutover-byte.bin"
+  printf 'x' >"${KELDRA_QUALIFICATION_DIR}/artifacts/membership-cutover-byte.bin"
+  chmod 0444 "${KELDRA_QUALIFICATION_DIR}/artifacts/membership-cutover-byte.bin"
 
   for round in 0 1; do
     run_cutover_writes \
@@ -476,7 +476,7 @@ latest_index_generation_from_log() {
 select_indexed_cutover_fixture() {
   local state="$1"
   local builder="$2"
-  local reassignment_log="${ANVIL_QUALIFICATION_DIR}/artifacts/index-reassignment-2-${builder}.log"
+  local reassignment_log="${KELDRA_QUALIFICATION_DIR}/artifacts/index-reassignment-2-${builder}.log"
   local line
   while IFS= read -r line; do
     membership_cutover_index_id="$(log_unsigned_field index.id "${line}" || true)"
@@ -537,8 +537,8 @@ prepare_indexed_membership_cutover_qualification() {
   local state="$7"
   local bound="$8"
   local endpoint
-  local response="${ANVIL_QUALIFICATION_DIR}/artifacts/membership-indexed-bulk.json"
-  local builder_log="${ANVIL_QUALIFICATION_DIR}/artifacts/membership-indexed-pending-${builder}.log"
+  local response="${KELDRA_QUALIFICATION_DIR}/artifacts/membership-indexed-bulk.json"
+  local builder_log="${KELDRA_QUALIFICATION_DIR}/artifacts/membership-indexed-pending-${builder}.log"
   local builder_log_start
   local before_line
   local before_tail
@@ -712,7 +712,7 @@ wait_for_indexed_cutover_effect() {
     all_ready=1
     for node in keldra-1 keldra-2 keldra-3; do
       endpoint="$(public_endpoint_for "${node}")"
-      response="${ANVIL_QUALIFICATION_DIR}/artifacts/membership-indexed-query-${node}.json"
+      response="${KELDRA_QUALIFICATION_DIR}/artifacts/membership-indexed-query-${node}.json"
       : >"${response}"
       chmod 0600 "${response}"
       if ! indexed_cutover_query_request "${tenant}" \
@@ -731,7 +731,7 @@ wait_for_indexed_cutover_effect() {
       membership_cutover_index_generation_after="${generation}"
       for node in keldra-1 keldra-2 keldra-3; do
         preserve_qualification_log \
-          "${ANVIL_QUALIFICATION_DIR}/artifacts/membership-indexed-query-${node}.json" \
+          "${KELDRA_QUALIFICATION_DIR}/artifacts/membership-indexed-query-${node}.json" \
           "/var/tmp/keldra-v090-three-membership-indexed-query-${qualification_suffix}-${node}.json"
       done
       return 0
@@ -760,7 +760,7 @@ qualify_no_event_membership_cutover() {
   local tenant="$5"
   local bucket="$6"
   local bound="$7"
-  local evidence="${ANVIL_QUALIFICATION_DIR}/artifacts/membership-no-event-${node}.log"
+  local evidence="${KELDRA_QUALIFICATION_DIR}/artifacts/membership-no-event-${node}.log"
   local fence=
   local fence_index=
   local fence_term=

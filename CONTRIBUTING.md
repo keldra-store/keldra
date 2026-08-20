@@ -1,4 +1,4 @@
-# Contributing to Anvil
+# Contributing to Keldra
 
 ## Prerequisites
 
@@ -18,7 +18,7 @@ All workspace packages currently share version `0.9.4`:
   `keldra-consensus`, `keldra-index`, and `keldra-store`;
 - qualification tooling: `keldra-osv-qualification`.
 
-Anvil 0.9.4 runs as one flat cluster of capacity-weighted nodes with native
+Keldra 0.9.4 runs as one flat cluster of capacity-weighted nodes with native
 on-disk state, cluster-managed mTLS between peers, cluster-wide derived
 streaming indices, and no external metadata database, external PKI, or second
 storage system. It includes PersonalDB, accounting, S3 and Git gateways, and
@@ -48,13 +48,13 @@ For a focused server, client, and CLI test run:
 Build and smoke-test a native-architecture image:
 
 ```sh
-ANVIL_IMAGE=keldra:test ./scripts/build-image.sh
-ANVIL_IMAGE=keldra:test ./scripts/release-gates.sh image
+KELDRA_IMAGE=keldra:test ./scripts/build-image.sh
+KELDRA_IMAGE=keldra:test ./scripts/release-gates.sh image
 ```
 
 Before a release, repeat the image build and smoke test with
-`ANVIL_DOCKER_PLATFORM=linux/amd64` and `linux/arm64`, using a distinct local
-`ANVIL_IMAGE` tag for each architecture.
+`KELDRA_DOCKER_PLATFORM=linux/amd64` and `linux/arm64`, using a distinct local
+`KELDRA_IMAGE` tag for each architecture.
 
 Inspect and verify the two publishable crate archives locally before tagging:
 

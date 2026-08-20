@@ -6,7 +6,7 @@ group="${1:-all}"
 run_step() {
   local name="$1"
   shift
-  local timeout_seconds="${ANVIL_GATE_STEP_TIMEOUT_SECONDS:-1800}"
+  local timeout_seconds="${KELDRA_GATE_STEP_TIMEOUT_SECONDS:-1800}"
   local started
   started="$(date +%s)"
   echo "::group::${name}"
@@ -34,19 +34,19 @@ static_gates() {
 
 rust_gates() {
   local build_jobs="${CARGO_BUILD_JOBS:-1}"
-  local test_threads="${ANVIL_RUST_TEST_THREADS:-4}"
-  run_step "Keldra 0.10 workspace Clippy" cargo clippy --jobs "${build_jobs}" --locked --workspace \
+  local test_threads="${KELDRA_RUST_TEST_THREADS:-4}"
+  run_step "Keldra 0.11 workspace Clippy" cargo clippy --jobs "${build_jobs}" --locked --workspace \
     --all-targets \
     --no-deps
-  run_step "Keldra 0.10 workspace tests" cargo test --jobs "${build_jobs}" --locked --workspace --all-targets -- \
+  run_step "Keldra 0.11 workspace tests" cargo test --jobs "${build_jobs}" --locked --workspace --all-targets -- \
     --nocapture \
     --test-threads="${test_threads}"
 }
 
 server_gates() {
   local build_jobs="${CARGO_BUILD_JOBS:-1}"
-  local test_threads="${ANVIL_RUST_TEST_THREADS:-4}"
-  run_step "Keldra 0.10 server, client, and CLI tests" cargo test --jobs "${build_jobs}" --locked \
+  local test_threads="${KELDRA_RUST_TEST_THREADS:-4}"
+  run_step "Keldra 0.11 server, client, and CLI tests" cargo test --jobs "${build_jobs}" --locked \
     -p keldra-server \
     -p keldra \
     -p keldra-cli \
@@ -57,7 +57,7 @@ server_gates() {
 }
 
 image_gates() (
-  local configured_image="${ANVIL_IMAGE:-keldra:test}"
+  local configured_image="${KELDRA_IMAGE:-keldra:test}"
   local image
   image="$(./scripts/resolve-docker-image-id.sh "${configured_image}")"
   run_step "image server version" docker run --rm "${image}" keldra-server --version
@@ -84,11 +84,11 @@ image_gates() (
   printf 'keldra-0.1-smoke\n' >"${scratch}/payload"
   chmod 0444 "${scratch}/payload"
   docker run --detach --name "${container}" \
-    --env ANVIL_LISTEN=0.0.0.0:50051 \
-    --env ANVIL_DATA_DIR=/var/lib/keldra \
-    --env ANVIL_NODE_ID=1 \
-    --env ANVIL_TOKEN_SIGNING_KEY_FILE=/run/secrets/keldra-token-signing-key \
-    --env ANVIL_RUN_SYSTEM_BOOTSTRAP=true \
+    --env KELDRA_LISTEN=0.0.0.0:50051 \
+    --env KELDRA_DATA_DIR=/var/lib/keldra \
+    --env KELDRA_NODE_ID=1 \
+    --env KELDRA_TOKEN_SIGNING_KEY_FILE=/run/secrets/keldra-token-signing-key \
+    --env KELDRA_RUN_SYSTEM_BOOTSTRAP=true \
     --volume "${scratch}/data:/var/lib/keldra" \
     --volume "${scratch}/signing-key:/run/secrets/keldra-token-signing-key:ro" \
     "${image}" >/dev/null
@@ -102,7 +102,7 @@ image_gates() (
     probe="$(
       docker run --rm --network "container:${container}" \
         --volume "${scratch}/data:/var/lib/keldra:ro" \
-        --env ANVIL_NEW_CLIENT_SECRET="${owner_client_secret}" \
+        --env KELDRA_NEW_CLIENT_SECRET="${owner_client_secret}" \
         "${image}" \
         keldra --endpoint http://127.0.0.1:50051 \
         --credentials-file /var/lib/keldra/system-bootstrap-credential.json \
@@ -116,14 +116,14 @@ image_gates() (
   done
   if [[ "${ready}" != "1" ]]; then
     docker logs "${container}" >&2 || true
-    echo "Anvil did not bootstrap and provision the smoke tenant within 30 seconds" >&2
+    echo "Keldra did not bootstrap and provision the smoke tenant within 30 seconds" >&2
     return 1
   fi
 
   run_step "image authenticated bucket provisioning" docker run --rm \
     --network "container:${container}" \
-    --env ANVIL_CLIENT_ID="${owner_client_id}" \
-    --env ANVIL_CLIENT_SECRET="${owner_client_secret}" \
+    --env KELDRA_CLIENT_ID="${owner_client_id}" \
+    --env KELDRA_CLIENT_SECRET="${owner_client_secret}" \
     "${image}" \
     keldra --endpoint http://127.0.0.1:50051 create-bucket objects
 
@@ -137,8 +137,8 @@ image_gates() (
   run_step "image authenticated put" docker run --rm \
     --network "container:${container}" \
     --volume "${scratch}:/smoke:ro" \
-    --env ANVIL_CLIENT_ID="${owner_client_id}" \
-    --env ANVIL_CLIENT_SECRET="${owner_client_secret}" \
+    --env KELDRA_CLIENT_ID="${owner_client_id}" \
+    --env KELDRA_CLIENT_SECRET="${owner_client_secret}" \
     "${image}" \
     keldra --endpoint http://127.0.0.1:50051 \
     put smoke objects hello /smoke/payload \
@@ -147,8 +147,8 @@ image_gates() (
   local value
   value="$(
     docker run --rm --network "container:${container}" \
-      --env ANVIL_CLIENT_ID="${owner_client_id}" \
-      --env ANVIL_CLIENT_SECRET="${owner_client_secret}" \
+      --env KELDRA_CLIENT_ID="${owner_client_id}" \
+      --env KELDRA_CLIENT_SECRET="${owner_client_secret}" \
       "${image}" \
       keldra --endpoint http://127.0.0.1:50051 \
       get smoke objects hello
