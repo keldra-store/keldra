@@ -6,6 +6,7 @@ description = "Authenticated Rust client for Keldra objects and indices"
 rust-version.workspace = true
 license-file = "../../LICENSE"
 homepage.workspace = true
+repository.workspace = true
 documentation = "https://docs.rs/keldra"
 readme = "README.md"
 authors.workspace = true

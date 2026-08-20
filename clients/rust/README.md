@@ -1,14 +1,14 @@
 # keldra
 
-The official Rust client for Anvil. It provides authenticated object upload
-helpers and the complete generated Anvil 0.9 protocol, including object,
+The official Rust client for Keldra. It provides authenticated object upload
+helpers and the complete generated Keldra 0.1 protocol, including object,
 authorization, administration, cluster-wide index, accounting, and PersonalDB
 clients.
 
 ## Install
 
 ```sh
-cargo add keldra@0.9.4
+cargo add keldra@0.1.0
 cargo add tokio --features macros,rt-multi-thread
 ```
 
@@ -89,7 +89,7 @@ ordinary object address and exact version; fetch selected source objects with
 
 The concrete builders are `BooleanField`, `SignedIntegerField`,
 `UnsignedIntegerField`, `FloatField`, `KeywordField`, and `TextField`. Their
-available methods mirror Anvil's native capabilities: exact matching, keyword
+available methods mirror Keldra's native capabilities: exact matching, keyword
 prefix and range matching, numeric ranges, ordering, facets, numeric
 aggregates, and analyzed full-text search. A field emits only the index
 components required by the methods selected on its builder. Multi-valued
@@ -98,7 +98,7 @@ while one document contributes at most once to each distinct facet bucket.
 
 ## Upload with compare-and-swap
 
-`put_chunks` performs Anvil's `StartPut`, streaming `Put`, and `PutEnd` flow.
+`put_chunks` performs Keldra's `StartPut`, streaming `Put`, and `PutEnd` flow.
 The operation below publishes only when version 41 is still current:
 
 ```rust,no_run

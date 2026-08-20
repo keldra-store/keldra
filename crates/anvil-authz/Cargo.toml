@@ -1,6 +1,6 @@
 [package]
 name = "anvil-authz"
-version.workspace = true
+version = "0.9.4"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

@@ -1,6 +1,6 @@
 [package]
 name = "anvil-api"
-version.workspace = true
+version = "0.9.4"
 edition.workspace = true
 license-file = "../../LICENSE"
 rust-version.workspace = true
