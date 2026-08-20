@@ -1,8 +1,8 @@
 [package]
-name = "anvil-server"
+name = "keldra-server"
 version.workspace = true
 edition.workspace = true
-description = "The Anvil 0.9 object server"
+description = "The Keldra object server"
 rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
@@ -18,7 +18,7 @@ name = "anvil"
 path = "src/lib.rs"
 
 [[bin]]
-name = "anvil-server"
+name = "keldra-server"
 path = "src/main.rs"
 
 [dependencies]
@@ -75,7 +75,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-anvil-storage = { path = "../../clients/rust" }
+anvil-storage = { package = "keldra", path = "../../clients/rust" }
 aws-sdk-s3 = "=1.18.0"
 tempfile = "3"
 

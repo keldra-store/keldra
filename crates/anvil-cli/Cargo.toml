@@ -1,8 +1,8 @@
 [package]
-name = "anvil-storage-cli"
+name = "keldra-cli"
 version.workspace = true
 edition.workspace = true
-description = "Command-line client for Anvil 0.9"
+description = "Command-line client for Keldra"
 rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
@@ -14,11 +14,11 @@ categories.workspace = true
 publish = false
 
 [[bin]]
-name = "anvil"
+name = "keldra"
 path = "src/main.rs"
 
 [dependencies]
-anvil-storage = { path = "../../clients/rust" }
+anvil-storage = { package = "keldra", path = "../../clients/rust" }
 anyhow = "1"
 blake3 = "1.8"
 clap = { version = "4.5", features = ["derive", "env"] }

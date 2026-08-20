@@ -21,10 +21,10 @@ readme = "README.md"
 description = "Opaque versioned object storage with bounded atomic programs"
 keywords = ["object-store", "storage", "compare-and-swap", "distributed-systems"]
 categories = ["database-implementations"]
-authors = ["Anvil maintainers <maintainers@anvil.storage>"]
+authors = ["Keldra maintainers <maintainers@keldra.store>"]
 license = "Apache-2.0"
-homepage = "https://anvil.storage"
-documentation = "https://anvil.storage"
+homepage = "https://keldra.store"
+documentation = "https://keldra.store"
 rust-version = "1.96.0"
 
 [profile.ci]

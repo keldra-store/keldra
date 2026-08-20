@@ -511,28 +511,28 @@ pub mod state {
 /// Invalid capability and cardinality combinations have no builder method:
 ///
 /// ```compile_fail
-/// use anvil_storage::BooleanField;
+/// use keldra::BooleanField;
 /// let _ = BooleanField::single("enabled", "/enabled").range();
 /// ```
 ///
 /// Multi-valued fields cannot produce order tokens:
 ///
 /// ```compile_fail
-/// use anvil_storage::KeywordField;
+/// use keldra::KeywordField;
 /// let _ = KeywordField::multi("tags", "/tags").order();
 /// ```
 ///
 /// A definition cannot be finished until it contains a complete field:
 ///
 /// ```compile_fail
-/// use anvil_storage::TypedJsonIndexBuilder;
+/// use keldra::TypedJsonIndexBuilder;
 /// let _ = TypedJsonIndexBuilder::new("documents", "search").finish("create-search");
 /// ```
 ///
 /// An incomplete field cannot be added to a definition:
 ///
 /// ```compile_fail
-/// use anvil_storage::{KeywordField, TypedJsonIndexBuilder};
+/// use keldra::{KeywordField, TypedJsonIndexBuilder};
 /// let _ = TypedJsonIndexBuilder::new("documents", "search")
 ///     .field(KeywordField::single("id", "/id"));
 /// ```

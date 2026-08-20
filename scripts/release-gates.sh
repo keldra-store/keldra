@@ -47,9 +47,9 @@ server_gates() {
   local build_jobs="${CARGO_BUILD_JOBS:-1}"
   local test_threads="${ANVIL_RUST_TEST_THREADS:-4}"
   run_step "Anvil 0.9 server, client, and CLI tests" cargo test --jobs "${build_jobs}" --locked \
-    -p anvil-server \
-    -p anvil-storage \
-    -p anvil-storage-cli \
+    -p keldra-server \
+    -p keldra \
+    -p keldra-cli \
     --all-targets \
     -- \
     --nocapture \
@@ -60,8 +60,8 @@ image_gates() (
   local configured_image="${ANVIL_IMAGE:-anvil:test}"
   local image
   image="$(./scripts/resolve-docker-image-id.sh "${configured_image}")"
-  run_step "image server version" docker run --rm "${image}" anvil-server --version
-  run_step "image CLI version" docker run --rm "${image}" anvil --version
+  run_step "image server version" docker run --rm "${image}" keldra-server --version
+  run_step "image CLI version" docker run --rm "${image}" keldra --version
 
   local scratch
   scratch="$(mktemp -d)"

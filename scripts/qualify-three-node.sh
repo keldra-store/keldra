@@ -166,7 +166,7 @@ cargo_target_dir="$(
     | jq --exit-status --raw-output \
       '.target_directory | select(type == "string" and length > 0)'
 )"
-cargo build --quiet --release --locked --package anvil-server \
+cargo build --quiet --release --locked --package keldra-server \
   --jobs "${CARGO_BUILD_JOBS:-1}" \
   --manifest-path "${repo_root}/Cargo.toml" \
   "${qualification_example_flags[@]}"
@@ -200,13 +200,13 @@ if [[ "${image_revision}" != "${source_commit}" ]]; then
 fi
 server_version="$(
   docker run --rm --platform "${ANVIL_DOCKER_PLATFORM}" \
-    "${image_id}" anvil-server --version
+    "${image_id}" keldra-server --version
 )"
 client_version="$(
   docker run --rm --platform "${ANVIL_DOCKER_PLATFORM}" \
     "${image_id}" anvil --version
 )"
-if [[ "${server_version}" != "anvil-server 0.9.4" \
+if [[ "${server_version}" != "keldra-server 0.9.4" \
   || "${client_version}" != "anvil 0.9.4" ]]; then
   echo "qualification requires the exact Anvil 0.9.4 image" >&2
   echo "server: ${server_version}" >&2
@@ -296,7 +296,7 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
-server_help="$(docker run --rm "${image_id}" anvil-server --help)"
+server_help="$(docker run --rm "${image_id}" keldra-server --help)"
 for required in --peer-listen --peer-advertise --join-bundle; do
   if ! grep -Fq -- "${required}" <<<"${server_help}"; then
     echo "qualification image is missing required server option ${required}" >&2

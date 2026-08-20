@@ -158,9 +158,9 @@ if [[ "${image_revision}" != "${source_commit}" ]]; then
   echo "qualification image revision ${image_revision} does not match source commit ${source_commit}" >&2
   exit 2
 fi
-server_version="$(docker run --rm --platform "${platform}" "${image_id}" anvil-server --version)"
+server_version="$(docker run --rm --platform "${platform}" "${image_id}" keldra-server --version)"
 client_version="$(docker run --rm --platform "${platform}" "${image_id}" anvil --version)"
-if [[ "${server_version}" != "anvil-server 0.9.4" \
+if [[ "${server_version}" != "keldra-server 0.9.4" \
   || "${client_version}" != "anvil 0.9.4" ]]; then
   echo "qualification requires the exact Anvil 0.9.4 image" >&2
   echo "server: ${server_version}" >&2
@@ -229,7 +229,7 @@ build_qualification_clients() {
     --quiet
     --release
     --locked
-    --package anvil-server
+    --package keldra-server
     --manifest-path "${repo_root}/Cargo.toml"
     --message-format json-render-diagnostics
   )

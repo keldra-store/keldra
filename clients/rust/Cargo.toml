@@ -1,12 +1,12 @@
 [package]
-name = "anvil-storage"
+name = "keldra"
 version.workspace = true
 edition.workspace = true
-description = "Authenticated Rust client for Anvil objects and indices"
+description = "Authenticated Rust client for Keldra objects and indices"
 rust-version.workspace = true
 license-file = "../../LICENSE"
 homepage.workspace = true
-documentation = "https://docs.rs/anvil-storage"
+documentation = "https://docs.rs/keldra"
 readme = "README.md"
 authors.workspace = true
 keywords.workspace = true

@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 #[derive(Debug, Parser)]
-#[command(name = "anvil-server", version, about = "Anvil 0.9 object server")]
+#[command(name = "keldra-server", version, about = "Keldra object server")]
 struct Arguments {
     #[arg(long, env = "ANVIL_LISTEN", default_value = "127.0.0.1:50051")]
     listen: SocketAddr,

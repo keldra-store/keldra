@@ -1,4 +1,4 @@
-//! Authenticated Rust client for Anvil 0.9 object storage.
+//! Authenticated Rust client for Keldra object storage.
 //!
 //! The crate provides ready-to-use object, authorization, administration, and
 //! PersonalDB clients, upload helpers, and the complete generated protocol surface.

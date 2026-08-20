@@ -1,6 +1,6 @@
-# Anvil
+# Keldra
 
-Anvil is distributed object storage for application state. It keeps opaque bytes
+Keldra is distributed object storage for application state. It keeps opaque bytes
 at stable paths and supplies the coordination primitives applications otherwise
 have to assemble around a blob store: streaming writes, compare-and-swap,
 immutable namespaces, Zanzibar authorization, bounded atomic programs, change
@@ -8,7 +8,7 @@ notification, and materialized search indices.
 
 Run one process while developing. Add nodes when you need capacity or
 availability; clients keep using the same API, any active node can accept a
-request, and Anvil places data across heterogeneous nodes with capacity-weighted
+request, and Keldra places data across heterogeneous nodes with capacity-weighted
 rendezvous hashing.
 
 ## What is available
@@ -47,7 +47,7 @@ repository are required.
 ### 1. Start a development node
 
 ```sh
-export ANVIL_IMAGE=ghcr.io/worka-ai/anvil:0.9.4
+export ANVIL_IMAGE=ghcr.io/keldra-store/keldra:0.9.4
 export ANVIL_TOKEN_SIGNING_KEY_FILE="$PWD/anvil-data/token-signing-key"
 
 mkdir -p anvil-data
@@ -159,7 +159,7 @@ Zanzibar-authorized object addressed by `(tenant, bucket, path)`.
 ## Use the Rust client
 
 ```sh
-cargo add anvil-storage@0.9.4
+cargo add keldra@0.9.4
 cargo add tokio --features macros,rt-multi-thread
 ```
 
@@ -168,14 +168,14 @@ above. Tenant and bucket are part of each object address, not connection-wide
 state.
 
 ```rust,no_run
-use anvil_storage::v1::{
+use keldra::v1::{
     Durability, HeadObjectRequest, ObjectAddress, PutHeader, PutOperation,
     put_header,
 };
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut objects = anvil_storage::connect_with_credentials(
+    let mut objects = keldra::connect_with_credentials(
         "http://127.0.0.1:50051",
         "example-client",
         std::env::var("ANVIL_OWNER_SECRET")?,
@@ -188,7 +188,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         path: "greetings/from-rust.txt".into(),
     };
 
-    let receipt = anvil_storage::put_chunks(
+    let receipt = keldra::put_chunks(
         &mut objects,
         PutHeader {
             address: Some(address.clone()),
@@ -234,28 +234,28 @@ Zanzibar-authorized independently of ordinary object traffic.
 Add the public client and canonical protocol types:
 
 ```sh
-cargo add anvil-storage@0.9.4 personaldb-protocol@0.2.2 serde_json
+cargo add keldra@0.9.4 personaldb-protocol@0.2.2 serde_json
 ```
 
 Use the same application credential created above to create a source group and
 verify Anvil's signed descriptor:
 
 ```rust,no_run
-use anvil_storage::v1::{CreatePersonalDbGroupRequest, PersonalDbGroupKind};
+use keldra::v1::{CreatePersonalDbGroupRequest, PersonalDbGroupKind};
 use personaldb_protocol::{
     GroupDescriptor, PublicKeyTrustRecord, PublicKeyTrustStore, Sha256Digest,
 };
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let channel = anvil_storage::connect_channel("http://127.0.0.1:50051").await?;
-    let token = anvil_storage::exchange_client_credentials(
+    let channel = keldra::connect_channel("http://127.0.0.1:50051").await?;
+    let token = keldra::exchange_client_credentials(
         channel.clone(),
         "example-client",
         std::env::var("ANVIL_OWNER_SECRET")?,
     )
     .await?;
-    let mut personaldb = anvil_storage::personaldb_client(channel, &token.access_token)?;
+    let mut personaldb = keldra::personaldb_client(channel, &token.access_token)?;
 
     let group = personaldb
         .create_group(CreatePersonalDbGroupRequest {
@@ -303,9 +303,9 @@ Use an empty `path_prefix` for the whole bucket, or a canonical prefix such as
 `customers/acme` for one application's billing boundary:
 
 ```rust,no_run
-use anvil_storage::{BearerToken, connect_channel, exchange_client_credentials};
-use anvil_storage::v1::accounting_service_client::AccountingServiceClient;
-use anvil_storage::v1::{EnableAccountingRequest, GetAccountingRequest};
+use keldra::{BearerToken, connect_channel, exchange_client_credentials};
+use keldra::v1::accounting_service_client::AccountingServiceClient;
+use keldra::v1::{EnableAccountingRequest, GetAccountingRequest};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -607,7 +607,7 @@ client `grpc-timeout` always wins.
 Construct an authenticated index client from the same token used for objects:
 
 ```rust,no_run
-use anvil_storage::{connect_channel, exchange_client_credentials, index_client};
+use keldra::{connect_channel, exchange_client_credentials, index_client};
 
 # async fn client() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 let channel = connect_channel("http://127.0.0.1:50051").await?;
@@ -643,11 +643,11 @@ explicit. This definition indexes `/status` as an exact, uninterpreted keyword;
 it neither tokenizes nor stores the source JSON:
 
 ```rust,no_run
-use anvil_storage::v1::index_query::Query as QueryValue;
-use anvil_storage::v1::*;
-use anvil_storage::{KeywordField, TypedJsonIndexBuilder};
+use keldra::v1::index_query::Query as QueryValue;
+use keldra::v1::*;
+use keldra::{KeywordField, TypedJsonIndexBuilder};
 
-# async fn example(mut indices: anvil_storage::v1::index_service_client::IndexServiceClient<tonic::service::interceptor::InterceptedService<tonic::transport::Channel, anvil_storage::BearerToken>>) -> Result<(), tonic::Status> {
+# async fn example(mut indices: keldra::v1::index_service_client::IndexServiceClient<tonic::service::interceptor::InterceptedService<tonic::transport::Channel, keldra::BearerToken>>) -> Result<(), tonic::Status> {
 let definition = TypedJsonIndexBuilder::new("objects", "active-documents")
     .path_prefix("documents/")
     .content_type("application/json")
@@ -705,7 +705,7 @@ bundles, establishes peer mTLS, exercises replicated and erasure-coded storage,
 queries every index type, and performs a rolling restart:
 
 ```sh
-ANVIL_IMAGE=ghcr.io/worka-ai/anvil:0.9.4 \
+ANVIL_IMAGE=ghcr.io/keldra-store/keldra:0.9.4 \
   ./scripts/qualify-three-node.sh
 ```
 
@@ -717,7 +717,7 @@ Production formation uses the same sequence:
 2. From an authorized active node, run
    `anvil prepare-node <node-id> <peer-address>`.
 3. Copy the generated mode-`0600` join bundle to the configured joining node,
-   delete the source copy, and start `anvil-server --join-bundle <path>` there.
+   delete the source copy, and start `keldra-server --join-bundle <path>` there.
 4. Repeat for additional nodes. Set each node's storage weight to its usable
    capacity; weighted HRW moves only ownership affected by membership changes.
 

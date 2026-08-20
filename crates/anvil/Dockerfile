@@ -29,12 +29,12 @@ RUN --mount=type=cache,id=anvil-cargo-registry,target=/usr/local/cargo/registry,
     --mount=type=cache,id=anvil-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=anvil-cargo-target-${TARGETARCH}-release,target=/usr/src/anvil/target,sharing=locked \
     cargo build --release --locked --jobs "${CARGO_BUILD_JOBS}" \
-        -p anvil-server --bin anvil-server \
-        -p anvil-storage-cli --bin anvil \
+        -p keldra-server --bin keldra-server \
+        -p keldra-cli --bin keldra \
     && mkdir -p /usr/local/anvil-build \
     && cp \
-        target/release/anvil-server \
-        target/release/anvil \
+        target/release/keldra-server \
+        target/release/keldra \
         /usr/local/anvil-build/
 
 # Rust tooling is deliberately absent from the matching target-platform
@@ -55,8 +55,8 @@ RUN useradd --uid 10001 --no-create-home --home-dir /var/lib/anvil --shell /usr/
     && install -d /usr/share/doc/anvil
 
 # Copy the compiled binaries from the builder stage.
-COPY --from=builder /usr/local/anvil-build/anvil-server /usr/local/bin/anvil-server
-COPY --from=builder /usr/local/anvil-build/anvil /usr/local/bin/anvil
+COPY --from=builder /usr/local/anvil-build/keldra-server /usr/local/bin/keldra-server
+COPY --from=builder /usr/local/anvil-build/keldra /usr/local/bin/keldra
 COPY --from=builder /usr/src/anvil/LICENSE /usr/share/doc/anvil/LICENSE
 COPY --from=builder /usr/src/anvil/docs/dependency-licenses.md /usr/share/doc/anvil/dependency-licenses.md
 
@@ -81,4 +81,4 @@ WORKDIR /var/lib/anvil
 # Public gRPC, S3 and Git share 50051. Cluster-managed mTLS peers use 50052.
 EXPOSE 50051 50052
 
-CMD ["anvil-server"]
+CMD ["keldra-server"]

@@ -249,7 +249,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "anvil-server"
+name = "keldra-server"
 version = "0.9.4"
 dependencies = [
  "aes-gcm",
@@ -258,7 +258,7 @@ dependencies = [
  "anvil-authz",
  "anvil-consensus",
  "anvil-index",
- "anvil-storage",
+ "keldra",
  "anvil-store",
  "anyhow",
  "async-stream",
@@ -310,7 +310,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "anvil-storage"
+name = "keldra"
 version = "0.9.4"
 dependencies = [
  "anvil-api",
@@ -320,10 +320,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "anvil-storage-cli"
+name = "keldra-cli"
 version = "0.9.4"
 dependencies = [
- "anvil-storage",
+ "keldra",
  "anyhow",
  "blake3",
  "clap",

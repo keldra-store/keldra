@@ -1,4 +1,4 @@
-# anvil-storage
+# keldra
 
 The official Rust client for Anvil. It provides authenticated object upload
 helpers and the complete generated Anvil 0.9 protocol, including object,
@@ -8,7 +8,7 @@ clients.
 ## Install
 
 ```sh
-cargo add anvil-storage@0.9.4
+cargo add keldra@0.9.4
 cargo add tokio --features macros,rt-multi-thread
 ```
 
@@ -17,11 +17,11 @@ cargo add tokio --features macros,rt-multi-thread
 Set `ANVIL_ENDPOINT`, `ANVIL_CLIENT_ID`, and `ANVIL_CLIENT_SECRET`, then run:
 
 ```rust,no_run
-use anvil_storage::v1::{HeadObjectRequest, ObjectAddress, object_head};
+use keldra::v1::{HeadObjectRequest, ObjectAddress, object_head};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut client = anvil_storage::connect_with_credentials(
+    let mut client = keldra::connect_with_credentials(
         std::env::var("ANVIL_ENDPOINT")?,
         std::env::var("ANVIL_CLIENT_ID")?,
         std::env::var("ANVIL_CLIENT_SECRET")?,
@@ -63,9 +63,9 @@ builder below creates exact keyword postings and numeric order doc values; an
 invalid combination such as Boolean range search cannot be constructed.
 
 ```rust,no_run
-use anvil_storage::{KeywordField, SignedIntegerField, TypedJsonIndexBuilder};
+use keldra::{KeywordField, SignedIntegerField, TypedJsonIndexBuilder};
 
-# fn definition() -> Result<anvil_storage::v1::CreateIndexRequest, Box<dyn std::error::Error + Send + Sync>> {
+# fn definition() -> Result<keldra::v1::CreateIndexRequest, Box<dyn std::error::Error + Send + Sync>> {
 let modified = SignedIntegerField::single("modified_at", "/modified_at")
     .range()
     .order();
@@ -102,14 +102,14 @@ while one document contributes at most once to each distinct facet bucket.
 The operation below publishes only when version 41 is still current:
 
 ```rust,no_run
-use anvil_storage::v1::{
+use keldra::v1::{
     Durability, ObjectAddress, PutHeader, PutIfVersionOperation, put_header,
 };
 
 # async fn upload(
-#     client: &mut anvil_storage::RawClient,
+#     client: &mut keldra::RawClient,
 # ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-let receipt = anvil_storage::put_chunks(
+let receipt = keldra::put_chunks(
     client,
     PutHeader {
         address: Some(ObjectAddress {
@@ -135,7 +135,7 @@ println!("published version: {}", receipt.version);
 # }
 ```
 
-All generated clients and messages are available under `anvil_storage::v1`.
+All generated clients and messages are available under `keldra::v1`.
 Use `connect_channel` to share a transport; `object_client`, `index_client`,
 `authz_client`, `administration_client`, and `personaldb_client` construct the
 authenticated public service clients with the same bearer token.
