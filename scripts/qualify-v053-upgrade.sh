@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-legacy_image="ghcr.io/worka-ai/keldra:0.5.3"
+legacy_image="ghcr.io/worka-ai/anvil:0.5.3"
 candidate_image="${ANVIL_IMAGE:?ANVIL_IMAGE must name the already-built candidate image}"
 keep="${ANVIL_QUALIFICATION_KEEP:-0}"
 
