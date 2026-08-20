@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package keldra.peer.v1;
 
-// Private, mTLS-only transport for the compact Anvil decision Raft group and
+// Private, mTLS-only transport for the compact Keldra decision Raft group and
 // its transient serving fence.
 service RaftPeer {
   rpc AppendEntries(RaftRequest) returns (RaftResponse);

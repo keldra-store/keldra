@@ -15,92 +15,100 @@ use keldra_index::IndexKind;
 #[derive(Debug, Parser)]
 #[command(name = "keldra-server", version, about = "Keldra object server")]
 struct Arguments {
-    #[arg(long, env = "ANVIL_LISTEN", default_value = "127.0.0.1:50051")]
+    #[arg(long, env = "KELDRA_LISTEN", default_value = "127.0.0.1:50051")]
     listen: SocketAddr,
 
-    #[arg(long, env = "ANVIL_PEER_LISTEN", default_value = "127.0.0.1:50052")]
+    #[arg(long, env = "KELDRA_PEER_LISTEN", default_value = "127.0.0.1:50052")]
     peer_listen: SocketAddr,
 
-    #[arg(long, env = "ANVIL_PEER_ADVERTISE")]
+    #[arg(long, env = "KELDRA_PEER_ADVERTISE")]
     peer_advertise: Option<String>,
 
     /// Consume one operator-copied mode-0600 bundle to join an existing cluster.
-    #[arg(long, env = "ANVIL_JOIN_BUNDLE")]
+    #[arg(long, env = "KELDRA_JOIN_BUNDLE")]
     join_bundle: Option<PathBuf>,
 
-    #[arg(long, env = "ANVIL_DATA_DIR", default_value = "keldra-data")]
+    #[arg(long, env = "KELDRA_DATA_DIR", default_value = "keldra-data")]
     data_dir: PathBuf,
 
     /// Durable node identity, certificates, and Raft state. Pinned at initialization.
-    #[arg(long, env = "ANVIL_STATE_DIR")]
+    #[arg(long, env = "KELDRA_STATE_DIR")]
     state_dir: Option<PathBuf>,
 
     /// Durable RocksDB SST and manifest directory. Pinned at initialization.
-    #[arg(long, env = "ANVIL_METADATA_DIR")]
+    #[arg(long, env = "KELDRA_METADATA_DIR")]
     metadata_dir: Option<PathBuf>,
 
     /// Durable RocksDB write-ahead-log directory. Pinned at initialization.
-    #[arg(long, env = "ANVIL_METADATA_WAL_DIR")]
+    #[arg(long, env = "KELDRA_METADATA_WAL_DIR")]
     metadata_wal_dir: Option<PathBuf>,
 
     /// Durable canonical blob and erasure-shard directory. Pinned at initialization.
-    #[arg(long, env = "ANVIL_PAYLOAD_DIR")]
+    #[arg(long, env = "KELDRA_PAYLOAD_DIR")]
     payload_dir: Option<PathBuf>,
 
     /// Restart-disposable index construction scratch directory.
-    #[arg(long, env = "ANVIL_SCRATCH_DIR")]
+    #[arg(long, env = "KELDRA_SCRATCH_DIR")]
     scratch_dir: Option<PathBuf>,
 
     /// Restart-disposable index and gateway cache directory.
-    #[arg(long, env = "ANVIL_CACHE_DIR")]
+    #[arg(long, env = "KELDRA_CACHE_DIR")]
     cache_dir: Option<PathBuf>,
 
     /// Restart-disposable spool for unfinished, unacknowledged uploads.
-    #[arg(long, env = "ANVIL_UPLOAD_SPOOL_DIR")]
+    #[arg(long, env = "KELDRA_UPLOAD_SPOOL_DIR")]
     upload_spool_dir: Option<PathBuf>,
 
     /// Aggregate bytes admitted to the unfinished upload spool.
-    #[arg(long, env = "ANVIL_UPLOAD_SPOOL_MAX_BYTES")]
+    #[arg(long, env = "KELDRA_UPLOAD_SPOOL_MAX_BYTES")]
     upload_spool_max_bytes: Option<NonZeroU64>,
 
-    #[arg(long, env = "ANVIL_RUN_SYSTEM_BOOTSTRAP", default_value_t = false)]
+    #[arg(long, env = "KELDRA_RUN_SYSTEM_BOOTSTRAP", default_value_t = false)]
     run_system_bootstrap: bool,
 
     #[arg(
         long,
-        env = "ANVIL_SYSTEM_BOOTSTRAP_CREDENTIAL_OUTPUT",
+        env = "KELDRA_SYSTEM_BOOTSTRAP_CREDENTIAL_OUTPUT",
         requires = "run_system_bootstrap"
     )]
     system_bootstrap_credential_output: Option<PathBuf>,
 
-    #[arg(long, env = "ANVIL_NODE_ID", default_value_t = 1)]
+    #[arg(long, env = "KELDRA_NODE_ID", default_value_t = 1)]
     node_id: u16,
 
     #[arg(long, env = "OTEL_EXPORTER_OTLP_ENDPOINT")]
     otlp_endpoint: Option<String>,
 
-    #[arg(long, env = "ANVIL_MAX_ATOMIC_COMMIT_ENTRIES", default_value_t = 4_096)]
+    #[arg(
+        long,
+        env = "KELDRA_MAX_ATOMIC_COMMIT_ENTRIES",
+        default_value_t = 4_096
+    )]
     max_atomic_commit_entries: u32,
 
     #[arg(
         long,
-        env = "ANVIL_MAX_ATOMIC_COMMIT_BYTES",
+        env = "KELDRA_MAX_ATOMIC_COMMIT_BYTES",
         default_value_t = 16 * 1024 * 1024_u64
     )]
     max_atomic_commit_bytes: u64,
 
     #[arg(
         long,
-        env = "ANVIL_ATOMIC_PROGRAM_TIMEOUT_SECONDS",
+        env = "KELDRA_ATOMIC_PROGRAM_TIMEOUT_SECONDS",
         default_value = "30"
     )]
     atomic_program_timeout_seconds: NonZeroU64,
 
     /// Maximum wall time for one QueryIndex RPC; shorter client deadlines still win.
-    #[arg(long, env = "ANVIL_INDEX_QUERY_TIMEOUT_SECONDS", default_value = "300")]
+    #[arg(
+        long,
+        env = "KELDRA_INDEX_QUERY_TIMEOUT_SECONDS",
+        default_value = "300"
+    )]
     index_query_timeout_seconds: NonZeroU64,
 
-    #[arg(long, env = "ANVIL_TOKEN_SIGNING_KEY_FILE")]
+    #[arg(long, env = "KELDRA_TOKEN_SIGNING_KEY_FILE")]
     token_signing_key_file: PathBuf,
 
     /// DNS suffix used by HTTP plugins: <bucket>.<tenant>.<domain>.
@@ -121,59 +129,59 @@ struct Arguments {
 
     #[arg(
         long,
-        env = "ANVIL_RATE_LIMIT_GLOBAL_PER_SECOND",
+        env = "KELDRA_RATE_LIMIT_GLOBAL_PER_SECOND",
         default_value = "10000"
     )]
     rate_limit_global_per_second: NonZeroU32,
 
-    #[arg(long, env = "ANVIL_RATE_LIMIT_GLOBAL_BURST", default_value = "10000")]
+    #[arg(long, env = "KELDRA_RATE_LIMIT_GLOBAL_BURST", default_value = "10000")]
     rate_limit_global_burst: NonZeroU32,
 
     #[arg(
         long,
-        env = "ANVIL_RATE_LIMIT_AUTHENTICATED_PER_SECOND",
+        env = "KELDRA_RATE_LIMIT_AUTHENTICATED_PER_SECOND",
         default_value = "1000"
     )]
     rate_limit_authenticated_per_second: NonZeroU32,
 
     #[arg(
         long,
-        env = "ANVIL_RATE_LIMIT_AUTHENTICATED_BURST",
+        env = "KELDRA_RATE_LIMIT_AUTHENTICATED_BURST",
         default_value = "1000"
     )]
     rate_limit_authenticated_burst: NonZeroU32,
 
     #[arg(
         long,
-        env = "ANVIL_RATE_LIMIT_CREDENTIAL_GLOBAL_PER_MINUTE",
+        env = "KELDRA_RATE_LIMIT_CREDENTIAL_GLOBAL_PER_MINUTE",
         default_value = "100"
     )]
     rate_limit_credential_global_per_minute: NonZeroU32,
 
     #[arg(
         long,
-        env = "ANVIL_RATE_LIMIT_CREDENTIAL_GLOBAL_BURST",
+        env = "KELDRA_RATE_LIMIT_CREDENTIAL_GLOBAL_BURST",
         default_value = "20"
     )]
     rate_limit_credential_global_burst: NonZeroU32,
 
     #[arg(
         long,
-        env = "ANVIL_RATE_LIMIT_CREDENTIAL_CLIENT_PER_MINUTE",
+        env = "KELDRA_RATE_LIMIT_CREDENTIAL_CLIENT_PER_MINUTE",
         default_value = "10"
     )]
     rate_limit_credential_client_per_minute: NonZeroU32,
 
     #[arg(
         long,
-        env = "ANVIL_RATE_LIMIT_CREDENTIAL_CLIENT_BURST",
+        env = "KELDRA_RATE_LIMIT_CREDENTIAL_CLIENT_BURST",
         default_value = "3"
     )]
     rate_limit_credential_client_burst: NonZeroU32,
 
     #[arg(
         long,
-        env = "ANVIL_RATE_LIMIT_KEYED_CLEANUP_INTERVAL",
+        env = "KELDRA_RATE_LIMIT_KEYED_CLEANUP_INTERVAL",
         default_value = "1024"
     )]
     rate_limit_keyed_cleanup_interval: NonZeroU64,
@@ -181,7 +189,7 @@ struct Arguments {
     /// Shared disposable index disk-cache budget in bytes (default: 10 GiB).
     #[arg(
         long,
-        env = "ANVIL_INDEX_DISK_CACHE_BYTES",
+        env = "KELDRA_INDEX_DISK_CACHE_BYTES",
         default_value_t = IndexRuntimeConfig::DEFAULT_DISK_CACHE_BYTES
     )]
     index_disk_cache_bytes: u64,
@@ -189,7 +197,7 @@ struct Arguments {
     /// Percentage of node memory bounding concurrent index block materialization (default: 10).
     #[arg(
         long,
-        env = "ANVIL_INDEX_MEMORY_PERCENT",
+        env = "KELDRA_INDEX_MEMORY_PERCENT",
         default_value_t = IndexRuntimeConfig::DEFAULT_MEMORY_PERCENT
     )]
     index_memory_percent: u8,
@@ -197,167 +205,167 @@ struct Arguments {
     /// Build/compaction fair share for each index kind (default: 256 MiB).
     #[arg(
         long,
-        env = "ANVIL_INDEX_BUILDER_MEMORY_BYTES_PER_KIND",
+        env = "KELDRA_INDEX_BUILDER_MEMORY_BYTES_PER_KIND",
         default_value_t = IndexRuntimeConfig::DEFAULT_BUILDER_MEMORY_BYTES_PER_KIND
     )]
     index_builder_memory_bytes_per_kind: u64,
 
     /// Path builder-memory override; absent uses the common per-kind fallback.
-    #[arg(long, env = "ANVIL_INDEX_PATH_BUILDER_MEMORY_BYTES")]
+    #[arg(long, env = "KELDRA_INDEX_PATH_BUILDER_MEMORY_BYTES")]
     index_path_builder_memory_bytes: Option<u64>,
 
     /// Maximum parallel Path compaction lanes (default: 4).
     #[arg(
         long,
-        env = "ANVIL_INDEX_PATH_COMPACTION_MAX_LANES",
+        env = "KELDRA_INDEX_PATH_COMPACTION_MAX_LANES",
         default_value_t = IndexRuntimeConfig::DEFAULT_COMPACTION_MAX_LANES
     )]
     index_path_compaction_max_lanes: u32,
 
-    #[arg(long, env = "ANVIL_INDEX_PATH_PROJECTION_MAX_LANES", default_value_t = IndexRuntimeConfig::DEFAULT_PROJECTION_MAX_LANES)]
+    #[arg(long, env = "KELDRA_INDEX_PATH_PROJECTION_MAX_LANES", default_value_t = IndexRuntimeConfig::DEFAULT_PROJECTION_MAX_LANES)]
     index_path_projection_max_lanes: u32,
-    #[arg(long, env = "ANVIL_INDEX_PATH_SOURCE_QUANTUM_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_SOURCE_QUANTUM_BYTES)]
+    #[arg(long, env = "KELDRA_INDEX_PATH_SOURCE_QUANTUM_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_SOURCE_QUANTUM_BYTES)]
     index_path_source_quantum_bytes: u64,
-    #[arg(long, env = "ANVIL_INDEX_PATH_EXTERNAL_SORT_CHUNK_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_EXTERNAL_SORT_CHUNK_BYTES)]
+    #[arg(long, env = "KELDRA_INDEX_PATH_EXTERNAL_SORT_CHUNK_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_EXTERNAL_SORT_CHUNK_BYTES)]
     index_path_external_sort_chunk_bytes: u64,
 
     /// Metadata-filter builder-memory override; absent uses the common fallback.
-    #[arg(long, env = "ANVIL_INDEX_METADATA_FILTER_BUILDER_MEMORY_BYTES")]
+    #[arg(long, env = "KELDRA_INDEX_METADATA_FILTER_BUILDER_MEMORY_BYTES")]
     index_metadata_filter_builder_memory_bytes: Option<u64>,
 
     /// Maximum parallel Metadata-filter compaction lanes (default: 4).
     #[arg(
         long,
-        env = "ANVIL_INDEX_METADATA_FILTER_COMPACTION_MAX_LANES",
+        env = "KELDRA_INDEX_METADATA_FILTER_COMPACTION_MAX_LANES",
         default_value_t = IndexRuntimeConfig::DEFAULT_COMPACTION_MAX_LANES
     )]
     index_metadata_filter_compaction_max_lanes: u32,
 
-    #[arg(long, env = "ANVIL_INDEX_METADATA_FILTER_PROJECTION_MAX_LANES", default_value_t = IndexRuntimeConfig::DEFAULT_PROJECTION_MAX_LANES)]
+    #[arg(long, env = "KELDRA_INDEX_METADATA_FILTER_PROJECTION_MAX_LANES", default_value_t = IndexRuntimeConfig::DEFAULT_PROJECTION_MAX_LANES)]
     index_metadata_filter_projection_max_lanes: u32,
-    #[arg(long, env = "ANVIL_INDEX_METADATA_FILTER_SOURCE_QUANTUM_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_SOURCE_QUANTUM_BYTES)]
+    #[arg(long, env = "KELDRA_INDEX_METADATA_FILTER_SOURCE_QUANTUM_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_SOURCE_QUANTUM_BYTES)]
     index_metadata_filter_source_quantum_bytes: u64,
-    #[arg(long, env = "ANVIL_INDEX_METADATA_FILTER_EXTERNAL_SORT_CHUNK_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_EXTERNAL_SORT_CHUNK_BYTES)]
+    #[arg(long, env = "KELDRA_INDEX_METADATA_FILTER_EXTERNAL_SORT_CHUNK_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_EXTERNAL_SORT_CHUNK_BYTES)]
     index_metadata_filter_external_sort_chunk_bytes: u64,
 
     /// Typed-JSON builder-memory override; absent uses the common fallback.
-    #[arg(long, env = "ANVIL_INDEX_TYPED_JSON_BUILDER_MEMORY_BYTES")]
+    #[arg(long, env = "KELDRA_INDEX_TYPED_JSON_BUILDER_MEMORY_BYTES")]
     index_typed_json_builder_memory_bytes: Option<u64>,
 
     /// Maximum parallel Typed-JSON compaction lanes (default: 4).
     #[arg(
         long,
-        env = "ANVIL_INDEX_TYPED_JSON_COMPACTION_MAX_LANES",
+        env = "KELDRA_INDEX_TYPED_JSON_COMPACTION_MAX_LANES",
         default_value_t = IndexRuntimeConfig::DEFAULT_COMPACTION_MAX_LANES
     )]
     index_typed_json_compaction_max_lanes: u32,
 
-    #[arg(long, env = "ANVIL_INDEX_TYPED_JSON_PROJECTION_MAX_LANES", default_value_t = IndexRuntimeConfig::DEFAULT_PROJECTION_MAX_LANES)]
+    #[arg(long, env = "KELDRA_INDEX_TYPED_JSON_PROJECTION_MAX_LANES", default_value_t = IndexRuntimeConfig::DEFAULT_PROJECTION_MAX_LANES)]
     index_typed_json_projection_max_lanes: u32,
-    #[arg(long, env = "ANVIL_INDEX_TYPED_JSON_SOURCE_QUANTUM_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_SOURCE_QUANTUM_BYTES)]
+    #[arg(long, env = "KELDRA_INDEX_TYPED_JSON_SOURCE_QUANTUM_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_SOURCE_QUANTUM_BYTES)]
     index_typed_json_source_quantum_bytes: u64,
-    #[arg(long, env = "ANVIL_INDEX_TYPED_JSON_EXTERNAL_SORT_CHUNK_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_EXTERNAL_SORT_CHUNK_BYTES)]
+    #[arg(long, env = "KELDRA_INDEX_TYPED_JSON_EXTERNAL_SORT_CHUNK_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_EXTERNAL_SORT_CHUNK_BYTES)]
     index_typed_json_external_sort_chunk_bytes: u64,
 
     /// Full-text builder-memory override; absent uses the common fallback.
-    #[arg(long, env = "ANVIL_INDEX_FULL_TEXT_BUILDER_MEMORY_BYTES")]
+    #[arg(long, env = "KELDRA_INDEX_FULL_TEXT_BUILDER_MEMORY_BYTES")]
     index_full_text_builder_memory_bytes: Option<u64>,
 
     /// Maximum parallel Full-text compaction lanes (default: 4).
     #[arg(
         long,
-        env = "ANVIL_INDEX_FULL_TEXT_COMPACTION_MAX_LANES",
+        env = "KELDRA_INDEX_FULL_TEXT_COMPACTION_MAX_LANES",
         default_value_t = IndexRuntimeConfig::DEFAULT_COMPACTION_MAX_LANES
     )]
     index_full_text_compaction_max_lanes: u32,
 
-    #[arg(long, env = "ANVIL_INDEX_FULL_TEXT_PROJECTION_MAX_LANES", default_value_t = IndexRuntimeConfig::DEFAULT_PROJECTION_MAX_LANES)]
+    #[arg(long, env = "KELDRA_INDEX_FULL_TEXT_PROJECTION_MAX_LANES", default_value_t = IndexRuntimeConfig::DEFAULT_PROJECTION_MAX_LANES)]
     index_full_text_projection_max_lanes: u32,
-    #[arg(long, env = "ANVIL_INDEX_FULL_TEXT_SOURCE_QUANTUM_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_SOURCE_QUANTUM_BYTES)]
+    #[arg(long, env = "KELDRA_INDEX_FULL_TEXT_SOURCE_QUANTUM_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_SOURCE_QUANTUM_BYTES)]
     index_full_text_source_quantum_bytes: u64,
-    #[arg(long, env = "ANVIL_INDEX_FULL_TEXT_EXTERNAL_SORT_CHUNK_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_EXTERNAL_SORT_CHUNK_BYTES)]
+    #[arg(long, env = "KELDRA_INDEX_FULL_TEXT_EXTERNAL_SORT_CHUNK_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_EXTERNAL_SORT_CHUNK_BYTES)]
     index_full_text_external_sort_chunk_bytes: u64,
 
     /// Vector builder-memory override; absent uses the common fallback.
-    #[arg(long, env = "ANVIL_INDEX_VECTOR_BUILDER_MEMORY_BYTES")]
+    #[arg(long, env = "KELDRA_INDEX_VECTOR_BUILDER_MEMORY_BYTES")]
     index_vector_builder_memory_bytes: Option<u64>,
 
     /// Maximum parallel Vector compaction lanes (default: 4).
     #[arg(
         long,
-        env = "ANVIL_INDEX_VECTOR_COMPACTION_MAX_LANES",
+        env = "KELDRA_INDEX_VECTOR_COMPACTION_MAX_LANES",
         default_value_t = IndexRuntimeConfig::DEFAULT_COMPACTION_MAX_LANES
     )]
     index_vector_compaction_max_lanes: u32,
 
-    #[arg(long, env = "ANVIL_INDEX_VECTOR_PROJECTION_MAX_LANES", default_value_t = IndexRuntimeConfig::DEFAULT_PROJECTION_MAX_LANES)]
+    #[arg(long, env = "KELDRA_INDEX_VECTOR_PROJECTION_MAX_LANES", default_value_t = IndexRuntimeConfig::DEFAULT_PROJECTION_MAX_LANES)]
     index_vector_projection_max_lanes: u32,
-    #[arg(long, env = "ANVIL_INDEX_VECTOR_SOURCE_QUANTUM_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_SOURCE_QUANTUM_BYTES)]
+    #[arg(long, env = "KELDRA_INDEX_VECTOR_SOURCE_QUANTUM_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_SOURCE_QUANTUM_BYTES)]
     index_vector_source_quantum_bytes: u64,
-    #[arg(long, env = "ANVIL_INDEX_VECTOR_EXTERNAL_SORT_CHUNK_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_EXTERNAL_SORT_CHUNK_BYTES)]
+    #[arg(long, env = "KELDRA_INDEX_VECTOR_EXTERNAL_SORT_CHUNK_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_EXTERNAL_SORT_CHUNK_BYTES)]
     index_vector_external_sort_chunk_bytes: u64,
 
     /// Hybrid builder-memory override; absent uses the common fallback.
-    #[arg(long, env = "ANVIL_INDEX_HYBRID_BUILDER_MEMORY_BYTES")]
+    #[arg(long, env = "KELDRA_INDEX_HYBRID_BUILDER_MEMORY_BYTES")]
     index_hybrid_builder_memory_bytes: Option<u64>,
 
     /// Maximum parallel Hybrid compaction lanes (default: 4).
     #[arg(
         long,
-        env = "ANVIL_INDEX_HYBRID_COMPACTION_MAX_LANES",
+        env = "KELDRA_INDEX_HYBRID_COMPACTION_MAX_LANES",
         default_value_t = IndexRuntimeConfig::DEFAULT_COMPACTION_MAX_LANES
     )]
     index_hybrid_compaction_max_lanes: u32,
 
-    #[arg(long, env = "ANVIL_INDEX_HYBRID_PROJECTION_MAX_LANES", default_value_t = IndexRuntimeConfig::DEFAULT_PROJECTION_MAX_LANES)]
+    #[arg(long, env = "KELDRA_INDEX_HYBRID_PROJECTION_MAX_LANES", default_value_t = IndexRuntimeConfig::DEFAULT_PROJECTION_MAX_LANES)]
     index_hybrid_projection_max_lanes: u32,
-    #[arg(long, env = "ANVIL_INDEX_HYBRID_SOURCE_QUANTUM_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_SOURCE_QUANTUM_BYTES)]
+    #[arg(long, env = "KELDRA_INDEX_HYBRID_SOURCE_QUANTUM_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_SOURCE_QUANTUM_BYTES)]
     index_hybrid_source_quantum_bytes: u64,
-    #[arg(long, env = "ANVIL_INDEX_HYBRID_EXTERNAL_SORT_CHUNK_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_EXTERNAL_SORT_CHUNK_BYTES)]
+    #[arg(long, env = "KELDRA_INDEX_HYBRID_EXTERNAL_SORT_CHUNK_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_EXTERNAL_SORT_CHUNK_BYTES)]
     index_hybrid_external_sort_chunk_bytes: u64,
 
     /// Git-source builder-memory override; absent uses the common fallback.
-    #[arg(long, env = "ANVIL_INDEX_GIT_SOURCE_BUILDER_MEMORY_BYTES")]
+    #[arg(long, env = "KELDRA_INDEX_GIT_SOURCE_BUILDER_MEMORY_BYTES")]
     index_git_source_builder_memory_bytes: Option<u64>,
 
     /// Maximum parallel Git-source compaction lanes (default: 4).
     #[arg(
         long,
-        env = "ANVIL_INDEX_GIT_SOURCE_COMPACTION_MAX_LANES",
+        env = "KELDRA_INDEX_GIT_SOURCE_COMPACTION_MAX_LANES",
         default_value_t = IndexRuntimeConfig::DEFAULT_COMPACTION_MAX_LANES
     )]
     index_git_source_compaction_max_lanes: u32,
 
-    #[arg(long, env = "ANVIL_INDEX_GIT_SOURCE_PROJECTION_MAX_LANES", default_value_t = IndexRuntimeConfig::DEFAULT_PROJECTION_MAX_LANES)]
+    #[arg(long, env = "KELDRA_INDEX_GIT_SOURCE_PROJECTION_MAX_LANES", default_value_t = IndexRuntimeConfig::DEFAULT_PROJECTION_MAX_LANES)]
     index_git_source_projection_max_lanes: u32,
-    #[arg(long, env = "ANVIL_INDEX_GIT_SOURCE_SOURCE_QUANTUM_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_SOURCE_QUANTUM_BYTES)]
+    #[arg(long, env = "KELDRA_INDEX_GIT_SOURCE_SOURCE_QUANTUM_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_SOURCE_QUANTUM_BYTES)]
     index_git_source_source_quantum_bytes: u64,
-    #[arg(long, env = "ANVIL_INDEX_GIT_SOURCE_EXTERNAL_SORT_CHUNK_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_EXTERNAL_SORT_CHUNK_BYTES)]
+    #[arg(long, env = "KELDRA_INDEX_GIT_SOURCE_EXTERNAL_SORT_CHUNK_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_EXTERNAL_SORT_CHUNK_BYTES)]
     index_git_source_external_sort_chunk_bytes: u64,
 
     /// Tensor builder-memory override; absent uses the common fallback.
-    #[arg(long, env = "ANVIL_INDEX_TENSOR_BUILDER_MEMORY_BYTES")]
+    #[arg(long, env = "KELDRA_INDEX_TENSOR_BUILDER_MEMORY_BYTES")]
     index_tensor_builder_memory_bytes: Option<u64>,
 
     /// Maximum parallel Tensor compaction lanes (default: 4).
     #[arg(
         long,
-        env = "ANVIL_INDEX_TENSOR_COMPACTION_MAX_LANES",
+        env = "KELDRA_INDEX_TENSOR_COMPACTION_MAX_LANES",
         default_value_t = IndexRuntimeConfig::DEFAULT_COMPACTION_MAX_LANES
     )]
     index_tensor_compaction_max_lanes: u32,
 
-    #[arg(long, env = "ANVIL_INDEX_TENSOR_PROJECTION_MAX_LANES", default_value_t = IndexRuntimeConfig::DEFAULT_PROJECTION_MAX_LANES)]
+    #[arg(long, env = "KELDRA_INDEX_TENSOR_PROJECTION_MAX_LANES", default_value_t = IndexRuntimeConfig::DEFAULT_PROJECTION_MAX_LANES)]
     index_tensor_projection_max_lanes: u32,
-    #[arg(long, env = "ANVIL_INDEX_TENSOR_SOURCE_QUANTUM_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_SOURCE_QUANTUM_BYTES)]
+    #[arg(long, env = "KELDRA_INDEX_TENSOR_SOURCE_QUANTUM_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_SOURCE_QUANTUM_BYTES)]
     index_tensor_source_quantum_bytes: u64,
-    #[arg(long, env = "ANVIL_INDEX_TENSOR_EXTERNAL_SORT_CHUNK_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_EXTERNAL_SORT_CHUNK_BYTES)]
+    #[arg(long, env = "KELDRA_INDEX_TENSOR_EXTERNAL_SORT_CHUNK_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_EXTERNAL_SORT_CHUNK_BYTES)]
     index_tensor_external_sort_chunk_bytes: u64,
 
-    /// Threads in Anvil's process-owned index CPU pool (default: 4).
+    /// Threads in Keldra's process-owned index CPU pool (default: 4).
     #[arg(
         long,
-        env = "ANVIL_INDEX_RAYON_WORKERS",
+        env = "KELDRA_INDEX_RAYON_WORKERS",
         default_value_t = IndexRuntimeConfig::DEFAULT_RAYON_WORKERS
     )]
     index_rayon_workers: u32,
@@ -365,7 +373,7 @@ struct Arguments {
     /// Maximum index queries executing concurrently on this node (default: 64).
     #[arg(
         long,
-        env = "ANVIL_INDEX_QUERY_MAX_CONCURRENCY",
+        env = "KELDRA_INDEX_QUERY_MAX_CONCURRENCY",
         default_value_t = IndexRuntimeConfig::DEFAULT_QUERY_MAX_CONCURRENCY
     )]
     index_query_max_concurrency: u32,
@@ -373,7 +381,7 @@ struct Arguments {
     /// Cache-read bytes processed by one query before it cooperatively yields (default: 4 MiB).
     #[arg(
         long,
-        env = "ANVIL_INDEX_QUERY_WORK_QUANTUM_BYTES",
+        env = "KELDRA_INDEX_QUERY_WORK_QUANTUM_BYTES",
         default_value_t = IndexRuntimeConfig::DEFAULT_QUERY_WORK_QUANTUM_BYTES
     )]
     index_query_work_quantum_bytes: u64,
@@ -381,20 +389,20 @@ struct Arguments {
     /// Query working-memory fair share (default: 512 MiB).
     #[arg(
         long,
-        env = "ANVIL_INDEX_QUERY_MEMORY_BYTES",
+        env = "KELDRA_INDEX_QUERY_MEMORY_BYTES",
         default_value_t = IndexRuntimeConfig::DEFAULT_QUERY_MEMORY_BYTES
     )]
     index_query_memory_bytes: u64,
 
     /// Hard aggregate heap ceiling shared by index queries, builders and compaction.
     /// Absent uses the checked sum of the query and per-kind fair shares.
-    #[arg(long, env = "ANVIL_INDEX_WORKING_MEMORY_BYTES")]
+    #[arg(long, env = "KELDRA_INDEX_WORKING_MEMORY_BYTES")]
     index_working_memory_bytes: Option<u64>,
 
     /// Fallback maximum segments retained in one size tier before builders compact (default: 64).
     #[arg(
         long,
-        env = "ANVIL_INDEX_MAX_SEGMENTS_PER_TIER",
+        env = "KELDRA_INDEX_MAX_SEGMENTS_PER_TIER",
         default_value_t = IndexRuntimeConfig::DEFAULT_MAX_SEGMENTS_PER_TIER
     )]
     index_max_segments_per_tier: u32,
@@ -402,48 +410,48 @@ struct Arguments {
     /// Fallback maximum encoded unmerged bytes in one size tier (default: 1 GiB).
     #[arg(
         long,
-        env = "ANVIL_INDEX_MAX_UNMERGED_BYTES_PER_TIER",
+        env = "KELDRA_INDEX_MAX_UNMERGED_BYTES_PER_TIER",
         default_value_t = IndexRuntimeConfig::DEFAULT_MAX_UNMERGED_BYTES_PER_TIER
     )]
     index_max_unmerged_bytes_per_tier: u64,
 
-    #[arg(long, env = "ANVIL_INDEX_PATH_MAX_SEGMENTS_PER_TIER")]
+    #[arg(long, env = "KELDRA_INDEX_PATH_MAX_SEGMENTS_PER_TIER")]
     index_path_max_segments_per_tier: Option<u32>,
-    #[arg(long, env = "ANVIL_INDEX_PATH_MAX_UNMERGED_BYTES_PER_TIER")]
+    #[arg(long, env = "KELDRA_INDEX_PATH_MAX_UNMERGED_BYTES_PER_TIER")]
     index_path_max_unmerged_bytes_per_tier: Option<u64>,
-    #[arg(long, env = "ANVIL_INDEX_METADATA_FILTER_MAX_SEGMENTS_PER_TIER")]
+    #[arg(long, env = "KELDRA_INDEX_METADATA_FILTER_MAX_SEGMENTS_PER_TIER")]
     index_metadata_filter_max_segments_per_tier: Option<u32>,
-    #[arg(long, env = "ANVIL_INDEX_METADATA_FILTER_MAX_UNMERGED_BYTES_PER_TIER")]
+    #[arg(long, env = "KELDRA_INDEX_METADATA_FILTER_MAX_UNMERGED_BYTES_PER_TIER")]
     index_metadata_filter_max_unmerged_bytes_per_tier: Option<u64>,
-    #[arg(long, env = "ANVIL_INDEX_TYPED_JSON_MAX_SEGMENTS_PER_TIER")]
+    #[arg(long, env = "KELDRA_INDEX_TYPED_JSON_MAX_SEGMENTS_PER_TIER")]
     index_typed_json_max_segments_per_tier: Option<u32>,
-    #[arg(long, env = "ANVIL_INDEX_TYPED_JSON_MAX_UNMERGED_BYTES_PER_TIER")]
+    #[arg(long, env = "KELDRA_INDEX_TYPED_JSON_MAX_UNMERGED_BYTES_PER_TIER")]
     index_typed_json_max_unmerged_bytes_per_tier: Option<u64>,
-    #[arg(long, env = "ANVIL_INDEX_FULL_TEXT_MAX_SEGMENTS_PER_TIER")]
+    #[arg(long, env = "KELDRA_INDEX_FULL_TEXT_MAX_SEGMENTS_PER_TIER")]
     index_full_text_max_segments_per_tier: Option<u32>,
-    #[arg(long, env = "ANVIL_INDEX_FULL_TEXT_MAX_UNMERGED_BYTES_PER_TIER")]
+    #[arg(long, env = "KELDRA_INDEX_FULL_TEXT_MAX_UNMERGED_BYTES_PER_TIER")]
     index_full_text_max_unmerged_bytes_per_tier: Option<u64>,
-    #[arg(long, env = "ANVIL_INDEX_VECTOR_MAX_SEGMENTS_PER_TIER")]
+    #[arg(long, env = "KELDRA_INDEX_VECTOR_MAX_SEGMENTS_PER_TIER")]
     index_vector_max_segments_per_tier: Option<u32>,
-    #[arg(long, env = "ANVIL_INDEX_VECTOR_MAX_UNMERGED_BYTES_PER_TIER")]
+    #[arg(long, env = "KELDRA_INDEX_VECTOR_MAX_UNMERGED_BYTES_PER_TIER")]
     index_vector_max_unmerged_bytes_per_tier: Option<u64>,
-    #[arg(long, env = "ANVIL_INDEX_HYBRID_MAX_SEGMENTS_PER_TIER")]
+    #[arg(long, env = "KELDRA_INDEX_HYBRID_MAX_SEGMENTS_PER_TIER")]
     index_hybrid_max_segments_per_tier: Option<u32>,
-    #[arg(long, env = "ANVIL_INDEX_HYBRID_MAX_UNMERGED_BYTES_PER_TIER")]
+    #[arg(long, env = "KELDRA_INDEX_HYBRID_MAX_UNMERGED_BYTES_PER_TIER")]
     index_hybrid_max_unmerged_bytes_per_tier: Option<u64>,
-    #[arg(long, env = "ANVIL_INDEX_GIT_SOURCE_MAX_SEGMENTS_PER_TIER")]
+    #[arg(long, env = "KELDRA_INDEX_GIT_SOURCE_MAX_SEGMENTS_PER_TIER")]
     index_git_source_max_segments_per_tier: Option<u32>,
-    #[arg(long, env = "ANVIL_INDEX_GIT_SOURCE_MAX_UNMERGED_BYTES_PER_TIER")]
+    #[arg(long, env = "KELDRA_INDEX_GIT_SOURCE_MAX_UNMERGED_BYTES_PER_TIER")]
     index_git_source_max_unmerged_bytes_per_tier: Option<u64>,
-    #[arg(long, env = "ANVIL_INDEX_TENSOR_MAX_SEGMENTS_PER_TIER")]
+    #[arg(long, env = "KELDRA_INDEX_TENSOR_MAX_SEGMENTS_PER_TIER")]
     index_tensor_max_segments_per_tier: Option<u32>,
-    #[arg(long, env = "ANVIL_INDEX_TENSOR_MAX_UNMERGED_BYTES_PER_TIER")]
+    #[arg(long, env = "KELDRA_INDEX_TENSOR_MAX_UNMERGED_BYTES_PER_TIER")]
     index_tensor_max_unmerged_bytes_per_tier: Option<u64>,
 
     /// Maximum generations retained per index, including current (default: 3).
     #[arg(
         long,
-        env = "ANVIL_INDEX_MAX_RETAINED_GENERATIONS",
+        env = "KELDRA_INDEX_MAX_RETAINED_GENERATIONS",
         default_value_t = IndexRuntimeConfig::DEFAULT_MAX_RETAINED_GENERATIONS
     )]
     index_max_retained_generations: u32,
@@ -451,7 +459,7 @@ struct Arguments {
     /// Maximum age of an obsolete index generation in hours (default: 24).
     #[arg(
         long,
-        env = "ANVIL_INDEX_MAX_GENERATION_AGE_HOURS",
+        env = "KELDRA_INDEX_MAX_GENERATION_AGE_HOURS",
         default_value_t = IndexRuntimeConfig::DEFAULT_MAX_GENERATION_AGE_HOURS
     )]
     index_max_generation_age_hours: u64,
@@ -459,59 +467,59 @@ struct Arguments {
     /// Maximum authoritative bytes retained across all generations per index (default: 50 GiB).
     #[arg(
         long,
-        env = "ANVIL_INDEX_MAX_RETAINED_GENERATION_BYTES",
+        env = "KELDRA_INDEX_MAX_RETAINED_GENERATION_BYTES",
         default_value_t = IndexRuntimeConfig::DEFAULT_MAX_RETAINED_GENERATION_BYTES
     )]
     index_max_retained_generation_bytes: u64,
 
-    #[arg(long, env = "ANVIL_MAX_BLOB_BYTES", default_value_t = 16 * 1024 * 1024 * 1024_u64)]
+    #[arg(long, env = "KELDRA_MAX_BLOB_BYTES", default_value_t = 16 * 1024 * 1024 * 1024_u64)]
     max_blob_bytes: u64,
 
     #[arg(
         long,
-        env = "ANVIL_ERASURE_DATA_SHARDS",
+        env = "KELDRA_ERASURE_DATA_SHARDS",
         default_value_t = keldra_store::DEFAULT_ERASURE_DATA_SHARDS
     )]
     erasure_data_shards: u16,
 
     #[arg(
         long,
-        env = "ANVIL_ERASURE_PARITY_SHARDS",
+        env = "KELDRA_ERASURE_PARITY_SHARDS",
         default_value_t = keldra_store::DEFAULT_ERASURE_PARITY_SHARDS
     )]
     erasure_parity_shards: u16,
 
     #[arg(
         long,
-        env = "ANVIL_ERASURE_STRIPE_UNIT_BYTES",
+        env = "KELDRA_ERASURE_STRIPE_UNIT_BYTES",
         default_value_t = keldra_store::DEFAULT_ERASURE_STRIPE_UNIT_BYTES
     )]
     erasure_stripe_unit_bytes: u32,
 
     #[arg(
         long,
-        env = "ANVIL_AWAITING_PUBLISH_TTL_SECONDS",
+        env = "KELDRA_AWAITING_PUBLISH_TTL_SECONDS",
         default_value_t = keldra_store::DEFAULT_AWAITING_PUBLISH_TTL_SECONDS
     )]
     awaiting_publish_ttl_seconds: u64,
 
     #[arg(
         long,
-        env = "ANVIL_MUTATION_RECEIPT_RETENTION_SECONDS",
+        env = "KELDRA_MUTATION_RECEIPT_RETENTION_SECONDS",
         default_value_t = keldra_store::DEFAULT_MUTATION_RECEIPT_RETENTION_SECONDS
     )]
     mutation_receipt_retention_seconds: u64,
 
     #[arg(
         long,
-        env = "ANVIL_MAX_MUTATION_RECEIPT_ENTRIES",
+        env = "KELDRA_MAX_MUTATION_RECEIPT_ENTRIES",
         default_value_t = keldra_store::DEFAULT_MUTATION_RECEIPT_MAX_ENTRIES
     )]
     max_mutation_receipt_entries: u64,
 
     #[arg(
         long,
-        env = "ANVIL_MAX_MUTATION_RECEIPT_BYTES",
+        env = "KELDRA_MAX_MUTATION_RECEIPT_BYTES",
         default_value_t = keldra_store::DEFAULT_MUTATION_RECEIPT_MAX_BYTES
     )]
     max_mutation_receipt_bytes: u64,
@@ -519,7 +527,7 @@ struct Arguments {
     /// Maximum retained entries in each node's ordered source journal.
     #[arg(
         long,
-        env = "ANVIL_SOURCE_JOURNAL_MAX_ENTRIES",
+        env = "KELDRA_SOURCE_JOURNAL_MAX_ENTRIES",
         default_value_t = keldra_store::DEFAULT_WATCH_MAX_ENTRIES
     )]
     source_journal_max_entries: u64,
@@ -527,7 +535,7 @@ struct Arguments {
     /// Maximum retained logical bytes in each node's ordered source journal.
     #[arg(
         long,
-        env = "ANVIL_SOURCE_JOURNAL_MAX_BYTES",
+        env = "KELDRA_SOURCE_JOURNAL_MAX_BYTES",
         default_value_t = keldra_store::DEFAULT_WATCH_MAX_BYTES
     )]
     source_journal_max_bytes: u64,

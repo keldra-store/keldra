@@ -15,7 +15,7 @@ pub(crate) const USED_NODE_ID_WORDS: usize = 16;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct NodeId(pub u64);
 
-/// Stable identity of one Anvil cluster.
+/// Stable identity of one Keldra cluster.
 ///
 /// The identity is generated once when the Raft group is created and retained
 /// in every state-machine snapshot. An all-zero value is reserved as invalid.
@@ -189,7 +189,7 @@ impl ClusterControlState {
 
 /// Compact identity of a canonical reserved program object path.
 ///
-/// The immutable program object itself is stored through Anvil's ordinary
+/// The immutable program object itself is stored through Keldra's ordinary
 /// object API at a path such as `_keldra/programs/import_osv@1`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ProgramPathHash(pub [u8; 32]);
@@ -239,7 +239,7 @@ pub struct ExecutorNomination {
     pub nomination_log_index: u64,
 }
 
-/// Whether Anvil's protected system identity has been durably bootstrapped.
+/// Whether Keldra's protected system identity has been durably bootstrapped.
 ///
 /// `committed_log_index` is the original completion decision and is preserved
 /// when an idempotent retry is applied at a later log index.
@@ -351,7 +351,7 @@ pub enum Command {
         through_commit_cursor: u64,
     },
     /// Set the stable cluster identity exactly once. This variant is appended
-    /// to preserve all command discriminants released in Anvil 0.5.0.
+    /// to preserve all command discriminants released in Keldra 0.5.0.
     InitializeCluster {
         cluster_id: ClusterId,
     },

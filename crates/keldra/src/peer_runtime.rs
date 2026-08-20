@@ -1,4 +1,4 @@
-//! Production wiring for Anvil's private Raft listener.
+//! Production wiring for Keldra's private Raft listener.
 //!
 //! This module owns no membership policy. It binds the already-approved peer
 //! address, loads one local identity, and connects the Tonic transport to the

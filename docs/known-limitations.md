@@ -1,11 +1,11 @@
-# Anvil known limitations
+# Keldra known limitations
 
-## Anvil 0.9 operational boundaries
+## Keldra 0.9 operational boundaries
 
-Anvil 0.9 uses the native index format 4 exclusively and starts with new
+Keldra 0.9 uses the native index format 4 exclusively and starts with new
 volumes. It does not read, migrate, backfill, or dual-write format-3 index
 definitions, artifacts, caches, or page positions. Authoritative application
-objects remain ordinary Anvil data; recreating a definition builds a fresh
+objects remain ordinary Keldra data; recreating a definition builds a fresh
 format-4 generation from its declared source scope.
 
 | Area | Current boundary |
@@ -23,7 +23,7 @@ format-4 generation from its declared source scope.
 | Term dictionary encoding | Format-4 term leaves store complete terms rather than front-coding adjacent terms. Lookups and bounds remain exact, but indices with many long shared-prefix terms consume more authoritative bytes than a Lucene-style prefix-compressed dictionary. This is a format-size optimization, not a query or visibility limitation. |
 | Vector and hybrid search | Vector generations use exact search; an approximate-nearest-neighbour graph remains future work. The public Vector and Hybrid query surfaces do not yet accept independent scalar filter fields, so applications should narrow the definition path or post-filter the returned authorized identities when that is viable. |
 | External-sort tuning | Format-4 construction is charged to the aggregate working-memory ceiling. The per-kind external-sort chunk setting does not yet alter the format-4 merge chunk; merge sizing uses a fixed fraction of the actual elastic grant. Increasing the kind fair share or aggregate ceiling can increase an idle system's granted merge memory. The dedicated chunk setting will be wired only with lane-aware accounting so parallel construction cannot multiply the ceiling. |
-| Query placement | One weighted-HRW owner executes a query against locally materialized or demand-fetched segment bytes. Anvil does not scatter one query across nodes. |
+| Query placement | One weighted-HRW owner executes a query against locally materialized or demand-fetched segment bytes. Keldra does not scatter one query across nodes. |
 | Query resources | Query admission and working memory are shared process resources. Mandatory workspace may borrow beyond the query fair share but cannot exceed the configured aggregate working-memory ceiling. A request that cannot obtain that bounded workspace within its deadline fails without weakening result correctness or publication state. |
 | Facets and aggregates | A Typed JSON query with facet or aggregate requests performs a second authorized pass over every matching document after selecting the result page. Memory remains bounded by the shared query budget and results remain exact, but computation time is proportional to the complete authorized match set rather than the page limit. Selective predicates reduce this work. |
 | Index compatibility | Format 4 is a clean storage boundary. Rollback to a format-3 binary requires a separate old volume, not mixed readers or compatibility shims. |
@@ -32,9 +32,9 @@ These boundaries do not weaken Zanzibar authorization, source-complete
 generation publication, stable generation-bound pagination, object durability,
 or lossless journal backpressure.
 
-## Anvil 0.8 operational boundaries
+## Keldra 0.8 operational boundaries
 
-Anvil 0.8 uses index format 3 exclusively and starts with new volumes. Index
+Keldra 0.8 uses index format 3 exclusively and starts with new volumes. Index
 definitions build fresh packed generations from authoritative ordinary source
 objects; there is no format-2 decoder, converter, dual writer, or fallback.
 This clean boundary keeps the serving and recovery paths small and predictable.
@@ -60,7 +60,7 @@ logs, and pre-mutation backpressure.
 
 ## Sparse index coordination in 0.7.0
 
-Anvil 0.7.0 supersedes the 0.5.2 and 0.6.x cold definition-discovery
+Keldra 0.7.0 supersedes the 0.5.2 and 0.6.x cold definition-discovery
 limitation. Startup and recovery read bounded pages from the transactional
 definition locator and this node's sparse assignment state; they do not scan
 ordinary object heads, the stored corpus, or every bucket. Normal serving
@@ -75,7 +75,7 @@ ledger. Each ingress node buffers small idempotent batches and sends them to
 the weighted-HRW matcher for the affected bucket. A process loss before
 acknowledgement, bounded-queue exhaustion, or the short propagation interval
 after an accounting definition or matcher changes can omit traffic bytes.
-Anvil reports dropped batches and bytes; supported-load qualification requires
+Keldra reports dropped batches and bytes; supported-load qualification requires
 both to remain zero. These windows do not affect stored objects, stored-byte
 totals, object counts, authorization, references, or index correctness.
 
@@ -107,7 +107,7 @@ is deferred until production evidence justifies it.
 
 ## Streaming indexes in 0.6.0
 
-Index format 2 is a clean break. Anvil 0.6 does not read, migrate, dual-write or
+Index format 2 is a clean break. Keldra 0.6 does not read, migrate, dual-write or
 fall back to 0.5 index definitions, artifacts, cache entries or page tokens.
 Authoritative source objects are unaffected; recreate each definition to build
 its new index.
@@ -122,7 +122,7 @@ engines. These are query-feature and performance limits, not weaker
 authorization or visibility semantics.
 
 In the historical 0.6 implementation, rebuilding a node's disposable
-assignment cache scanned the reserved definition prefix. Anvil 0.7 replaces
+assignment cache scanned the reserved definition prefix. Keldra 0.7 replaces
 that cold path with the sparse locator described above. Query materialization
 remains disposable and cold queries may fetch index blocks before executing. A
 query always includes freshness evidence and continues to serve the preceding
@@ -143,7 +143,7 @@ preceding complete generation. Splitting that application record across
 ordinary source objects is the current workaround.
 
 Each level contains at most four runs. A fifth run triggers compaction of the
-four oldest inputs into one run at the next level. Anvil 0.7 divides every
+four oldest inputs into one run at the next level. Keldra 0.7 divides every
 index kind's merge into deterministic, non-overlapping key ranges and prepares
 up to four ranges concurrently by default. The actual lane count is capped by
 that kind's configured lane limit, the process Rayon workers, the ranges
@@ -173,7 +173,7 @@ index size, ranking quality and query throughput, not path/version visibility,
 freshness, durability or Zanzibar filtering.
 
 Format-2 cache reads remain mmap-backed and do not copy immutable blocks into a
-second managed heap cache. `ANVIL_INDEX_MEMORY_PERCENT` independently bounds
+second managed heap cache. `KELDRA_INDEX_MEMORY_PERCENT` independently bounds
 concurrent block-fetch buffers and retained mappings; each mapping is charged at
 least one 4 KiB page so a large disk cache cannot retain an unbounded number of
 tiny mappings. Live query slices pin their mappings and may temporarily exceed
@@ -219,7 +219,7 @@ unrelated object storage from starting. An authorized principal can use the
 public `RebuildIndex` operation to rebuild it from authoritative source objects.
 
 The implementation dependencies and their selected license options are
-recorded in [the Anvil 0.6 index dependency record](dependency-licenses.md).
+recorded in [the Keldra 0.6 index dependency record](dependency-licenses.md).
 
 ## Capabilities introduced in 0.5.x
 
@@ -257,7 +257,7 @@ incremental, and does not retain one in-memory entry per object.
 Index definition create, update, inspect, list, delete, and rebuild requests use
 one absolute deadline: the shorter of the client `grpc-timeout` and the
 startup-configured 30-second maximum. `QueryIndex` instead uses the shorter of
-the client deadline and `ANVIL_INDEX_QUERY_TIMEOUT_SECONDS`, whose default is
+the client deadline and `KELDRA_INDEX_QUERY_TIMEOUT_SECONDS`, whose default is
 five minutes. The same remaining budget is propagated across object and peer
 calls. These maxima are deliberately not transport-wide timeouts because `Put`
 and `WatchPrefix` are long-lived streams. Local authorization, administration,
@@ -266,7 +266,7 @@ terminator to supply a deadline; extending the shared deadline wrapper to those
 existing services is deferred.
 
 Authorization-aware index pagination batches the common case where every
-candidate is visible. If Zanzibar filters or reorders a candidate, Anvil falls
+candidate is visible. If Zanzibar filters or reorders a candidate, Keldra falls
 back to a one-candidate scan so a continuation never exposes an unauthorized
 position. A large, heavily filtered cold query can therefore exhaust its
 configured query request budget; the transport timeout is safely retryable.
@@ -392,11 +392,11 @@ maintenance capability will collect those unreachable index generations.
 This historical limitation is superseded by the sparse, bounded 0.7.0 locator
 recovery described at the start of this document.
 
-Index definitions are ordinary authoritative Anvil objects and there is no
+Index definitions are ordinary authoritative Keldra objects and there is no
 separate registry or index-specific persistence plane. A node without its
 disposable assignment cache scans the reserved definition paths at startup,
 then applies weighted HRW to determine which indexes it builds or serves. The
-cold-start work therefore grows with the number of index definitions. Anvil
+cold-start work therefore grows with the number of index definitions. Keldra
 0.5.2 accepts that startup cost rather than adding an unmeasured catalogue or
 side plane; later releases can optimize discovery without changing the stored
 definition format.
@@ -407,7 +407,7 @@ A mutation can be durably present on fewer than its required logical-record
 replicas if the remaining replicas become unavailable after the coordinator's
 local commit. When no quorum can prove either that exact candidate or a
 different valid successor, ordered reference delivery cannot determine whether
-the candidate's journal effect is authoritative. Anvil fails closed at that
+the candidate's journal effect is authoritative. Keldra fails closed at that
 source position: destination cursors do not advance beyond it, the source
 journal prefix is retained, and reference garbage collection remains disabled
 for the affected work. If the retained journal reaches its configured bound,
@@ -416,13 +416,13 @@ later mutations that need to append a source event receive backpressure.
 A quorum reporting only that the candidate is absent is not enough to discard
 it because a previously issued replica apply may still complete. Mutations
 already proven by a metadata quorum and other ACTIVE nodes remain unaffected;
-Anvil does not trade reference correctness for recovery availability.
+Keldra does not trade reference correctness for recovery availability.
 
 After metadata quorum is available again, retrying the unknown-outcome
 operation with the same command ID allows the deterministic candidate to
 complete. Restoring a replica that holds the required lineage can likewise
 provide the missing proof. If neither the original candidate nor a
-quorum-proven valid successor can be recovered, Anvil 0.6.0 has no unsafe
+quorum-proven valid successor can be recovered, Keldra 0.6.0 has no unsafe
 operator bypass; automatic lineage reconciliation for that case is deferred.
 
 ## Legacy one-node reference journal recovery
@@ -437,7 +437,7 @@ Consequently, an existing one-node installation must complete startup reference
 reconciliation before beginning an online ADD. Once it has, large objects use
 complete replicas while membership is undersized and the normal typed handoff
 supports online growth from one to two to three ACTIVE nodes. Skipping that
-ordered recovery boundary is unsupported; it does not cause Anvil to infer or
+ordered recovery boundary is unsupported; it does not cause Keldra to infer or
 weaken reference-proof semantics.
 
 ## Online ADD boundaries in 0.5.4
@@ -479,7 +479,7 @@ lineage for retained-history maintenance.
 ## First custom-realm binding in a multi-node 0.5.1 cluster
 
 The first schema binding for a custom Zanzibar realm must atomically create
-the realm binding and its protected-system ownership grant. Anvil 0.5.1 keeps
+the realm binding and its protected-system ownership grant. Keldra 0.5.1 keeps
 that guarantee on a one-node cluster, but rejects the first binding with
 `UNAVAILABLE` when more than one node is active. Existing realms can be
 rebound and used normally across the cluster. A later capability must add one
@@ -488,7 +488,7 @@ clusters; 0.5.1 does not weaken the atomic ownership guarantee.
 
 ## Cluster lifecycle operations
 
-Anvil supports genesis, authorized node preparation, learner catch-up, typed
+Keldra supports genesis, authorized node preparation, learner catch-up, typed
 ownership handoff, and online ADD activation for ordinary cluster formation.
 The bounded Raft state machine also validates removal, capacity-reweight, and
 peer-certificate-overlap transitions, but 0.5.4 does not expose public
@@ -497,7 +497,7 @@ ownership handoff and live TLS-reload orchestration are not yet complete.
 Operators must not submit those internal Raft commands directly.
 
 There is no public drain or detailed cluster-health RPC in 0.5.4. Public
-listener availability is the readiness boundary: Anvil binds it only after
+listener availability is the readiness boundary: Keldra binds it only after
 membership, serving-fence, bootstrap, authorization, atomic recovery, and
 ordered reference startup checks complete. Normal process termination stops
 the public listener before the peer runtime and flushes the local store; it
@@ -507,7 +507,7 @@ does not remove the node from committed membership.
 
 Under concurrent cluster activity, ordered reference delivery can transiently
 observe a destination cursor one position beyond the source-tail snapshot and
-pause that source until a later retry. Anvil fails closed while this condition
+pause that source until a later retry. Keldra fails closed while this condition
 exists: blob garbage collection remains disabled and source-journal entries
 remain retained, so acknowledged object data is not collected prematurely. A
 persistent condition can delay reference-count convergence and eventually
@@ -538,7 +538,7 @@ prefix. Clients must use the gRPC status code rather than matching that text in
 
 ## Per-object user metadata
 
-Anvil 0.5.0 accepts the bounded `content_type` header but does not accept
+Keldra 0.5.0 accepts the bounded `content_type` header but does not accept
 arbitrary caller-defined metadata on an object version. Applications that need
 descriptive or index input fields must currently carry them in their payload or
 in an application-owned manifest.
@@ -551,7 +551,7 @@ native gRPC API.
 It does not yet implement ListBuckets, DeleteBucket, multipart upload, copy,
 delimiter/common-prefix grouping, presigned query authentication, virtual-host
 bucket routing, object tags, ACLs, lifecycle configuration or website APIs.
-Applications needing those operations must use Anvil's native API or wait for
+Applications needing those operations must use Keldra's native API or wait for
 a later gateway capability.
 
 Authenticated requests derive the tenant from the client credential, so an
@@ -560,12 +560,12 @@ read has no credential from which to derive a tenant and therefore uses
 `/tenant/bucket/key`; public ListObjectsV2 similarly uses `/tenant/bucket`.
 
 SigV4 verification needs plaintext-equivalent signing material, whereas
-pre-0.5.3 Anvil credentials intentionally retained only an Argon2id verifier.
+pre-0.5.3 Keldra credentials intentionally retained only an Argon2id verifier.
 New and rotated credentials contain an AES-256-GCM envelope in their existing
 replicated credential record. Its key is domain-separated from the cluster JWT
 signing material and its associated data binds tenant, application and client
 identity. Existing credentials continue to work unchanged with gRPC but must
-be rotated once before S3 use. Anvil never stores this material in a separate
+be rotated once before S3 use. Keldra never stores this material in a separate
 column family or side plane.
 
 PutObject accepts a signed SHA-256 payload or the fully chained
@@ -577,19 +577,19 @@ reported as unsupported rather than accepting unbound payload bytes.
 
 The shared public listener supports Git smart HTTP push and pull at
 `/git/{tenant}/{bucket}/{repository}.git`. Basic authentication exchanges the
-application client ID and secret through Anvil's normal credential path;
-Bearer authentication accepts a normal Anvil access token. Pulls may omit
+application client ID and secret through Keldra's normal credential path;
+Bearer authentication accepts a normal Keldra access token. Pulls may omit
 credentials only when current Zanzibar policy permits anonymous reads for the
 bucket. Every push is Zanzibar-authorized and publishes one authoritative Git
 bundle as an ordinary object below the protected `_keldra/git` namespace using
 `PutIfAbsent` or `PutIfVersion`.
 
-Anvil 0.5.3 deliberately uses `git-http-backend` and a disposable node-local
+Keldra 0.5.3 deliberately uses `git-http-backend` and a disposable node-local
 bare-repository cache. Each request rematerializes the repository from the
 authoritative bundle, and each successful push rewrites the complete bundle.
 The first implementation serializes Git CGI requests per node. Request bodies,
 CGI responses and the bundle being published are buffered in memory and are
-bounded by the configured object maximum where Anvil controls the input; Git's
+bounded by the configured object maximum where Keldra controls the input; Git's
 CGI response itself does not yet have an independent streaming limit. These
 costs make this surface suitable for ordinary small-repository workflows,
 not yet for very large repositories or high-concurrency Git hosting.
@@ -610,7 +610,7 @@ unusually long delay in staging, waiting for the commit gate, or recovering an
 earlier commit therefore reduces the effective post-commit replay and recovery
 retention by the length of that delay.
 
-The normal path is expected to take milliseconds. Anvil 0.5.0 does not refresh
+The normal path is expected to take milliseconds. Keldra 0.5.0 does not refresh
 the prepared blobs immediately before `CommitBatch`, and it does not add a
 special lease, side store, or second lifecycle clock for atomic programs.
 
@@ -620,14 +620,14 @@ A version-enabled `PROGRAM_ONLY` path retains its historical payload versions.
 Path policy correctly prohibits the ordinary `DeleteVersion` API from mutating
 that path, and the 0.5.0 atomic-program DSL has no operation for deleting one
 exact retained version. Operators therefore cannot permanently prune that
-history in Anvil 0.5.0.
+history in Keldra 0.5.0.
 
 ## Fixed accounting traffic bounds in 0.7.0
 
 The process-local accounting traffic queue, per-bucket matcher cache, and
 traffic-batch limits use fixed bounded defaults in 0.7.0. A
 sustained ingress rate above those bounds can drop bandwidth-accounting entries;
-Anvil reports the dropped batches and bytes, and stored-byte and object-count
+Keldra reports the dropped batches and bytes, and stored-byte and object-count
 accounting remains exact. Operators can reduce the risk by sizing or scaling
 ingress nodes so the supported workload records zero drops. Runtime and startup
 configuration for these bounds is deferred to a later release.
@@ -659,7 +659,7 @@ the maintenance budgets and cadence is deferred.
 
 A first accounting build or genuine retained-journal gap consumes a scoped,
 snapshot-bound baseline stream. If that stream ends with a terminal peer error,
-its held RocksDB snapshots cannot be resumed, so Anvil restarts the baseline for
+its held RocksDB snapshots cannot be resumed, so Keldra restarts the baseline for
 that same accounting path scope. The last complete rollup remains readable;
 ordinary restarts resume valid rollups, and no unrelated object heads or startup
 inventory are scanned. Operators can retry after peer health returns. A
@@ -667,17 +667,17 @@ resumable cross-node snapshot protocol is deferred.
 
 ## Abandoned raw upload-spool cleanup
 
-Anvil removes at most 256 recognized abandoned raw-upload files while opening
+Keldra removes at most 256 recognized abandoned raw-upload files while opening
 one node. The bound prevents a crash-created disposable directory from turning
 into an unbounded startup inventory. If repeated hard process failures leave
 more files, later restarts remove further bounded pages; the remaining files
 consume only the configured disposable spool filesystem and are never treated
 as acknowledged objects. Operators using persistent spool storage may clear it
-while Anvil is stopped. A size-bounded tmpfs naturally discards the files on
+while Keldra is stopped. A size-bounded tmpfs naturally discards the files on
 host reboot.
 
-`ANVIL_UPLOAD_SPOOL_MAX_BYTES` bounds bytes held by active uploads in one
-process. Because streaming puts intentionally declare no content length, Anvil
+`KELDRA_UPLOAD_SPOOL_MAX_BYTES` bounds bytes held by active uploads in one
+process. Because streaming puts intentionally declare no content length, Keldra
 fails the affected unacknowledged stream when its next chunk would exceed the
 shared capacity instead of allowing several partially admitted streams to wait
 on one another indefinitely. Clients may retry after another upload completes;

@@ -1,4 +1,4 @@
-//! Production-shaped public-API qualification for Anvil's 0.9 native segment builder.
+//! Production-shaped public-API qualification for Keldra's 0.9 native segment builder.
 //!
 //! The generated corpus deliberately resembles a broad, small-JSON indexing
 //! workload without embedding any private schema or source data.
@@ -276,10 +276,10 @@ enum MutationMode {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
-    if let Some(path) = env::var_os("ANVIL_V09_RESOURCE_SINGLETON_PROBE_STATE_INPUT") {
+    if let Some(path) = env::var_os("KELDRA_V09_RESOURCE_SINGLETON_PROBE_STATE_INPUT") {
         return singleton_probe::run(Path::new(&path)).await;
     }
-    if let Some(path) = env::var_os("ANVIL_V06_RESOURCE_STATE_INPUT") {
+    if let Some(path) = env::var_os("KELDRA_V06_RESOURCE_STATE_INPUT") {
         return verify_existing_state(Path::new(&path)).await;
     }
     let config = Config::from_env()?;
@@ -512,7 +512,7 @@ async fn main() -> Result<()> {
                     .peaks
                     .values()
                     .all(|peak| peak.minimum_sampled_processes == resources.targets.len()),
-            "one or more monitored Anvil processes disappeared during qualification"
+            "one or more monitored Keldra processes disappeared during qualification"
         );
         let maximum_growth = config
             .max_anonymous_growth_bytes
@@ -623,12 +623,12 @@ fn qualification_index_request(bucket: &str) -> Result<CreateIndexRequest> {
 
 impl Config {
     fn from_env() -> Result<Self> {
-        let records = number("ANVIL_V06_RESOURCE_RECORDS", DEFAULT_RECORDS)?;
-        let mutation_count = number("ANVIL_V06_RESOURCE_MUTATIONS", DEFAULT_MUTATIONS)?;
-        let batch_size = number("ANVIL_V06_RESOURCE_BATCH_SIZE", DEFAULT_BATCH_SIZE)?;
-        let workers = number("ANVIL_V06_RESOURCE_WORKERS", DEFAULT_WORKERS)?;
+        let records = number("KELDRA_V06_RESOURCE_RECORDS", DEFAULT_RECORDS)?;
+        let mutation_count = number("KELDRA_V06_RESOURCE_MUTATIONS", DEFAULT_MUTATIONS)?;
+        let batch_size = number("KELDRA_V06_RESOURCE_BATCH_SIZE", DEFAULT_BATCH_SIZE)?;
+        let workers = number("KELDRA_V06_RESOURCE_WORKERS", DEFAULT_WORKERS)?;
         let verification_workers = number(
-            "ANVIL_V06_RESOURCE_VERIFICATION_WORKERS",
+            "KELDRA_V06_RESOURCE_VERIFICATION_WORKERS",
             DEFAULT_VERIFICATION_WORKERS,
         )?;
         ensure!(records > 0, "record count must be non-zero");
@@ -638,34 +638,34 @@ impl Config {
             verification_workers > 0,
             "verification worker count must be non-zero"
         );
-        let endpoints = required("ANVIL_V06_RESOURCE_ENDPOINTS")?
+        let endpoints = required("KELDRA_V06_RESOURCE_ENDPOINTS")?
             .split(',')
             .filter(|value| !value.is_empty())
             .map(str::to_owned)
             .collect::<Vec<_>>();
         ensure!(!endpoints.is_empty(), "at least one endpoint is required");
-        let resource_pids = optional_list("ANVIL_V06_RESOURCE_PIDS")
+        let resource_pids = optional_list("KELDRA_V06_RESOURCE_PIDS")
             .into_iter()
             .map(|value| value.parse().context("invalid resource PID"))
             .collect::<Result<Vec<_>>>()?;
-        let resource_containers = optional_list("ANVIL_V06_RESOURCE_CONTAINERS");
-        let require_resource_targets = boolean("ANVIL_V06_REQUIRE_RESOURCE_TARGETS", true)?;
-        let configured_kind_budget_bytes = optional_number("ANVIL_V06_KIND_BUDGET_BYTES")?;
+        let resource_containers = optional_list("KELDRA_V06_RESOURCE_CONTAINERS");
+        let require_resource_targets = boolean("KELDRA_V06_REQUIRE_RESOURCE_TARGETS", true)?;
+        let configured_kind_budget_bytes = optional_number("KELDRA_V06_KIND_BUDGET_BYTES")?;
         let configured_compaction_max_lanes =
-            optional_number("ANVIL_V06_INDEX_COMPACTION_MAX_LANES")?;
+            optional_number("KELDRA_V06_INDEX_COMPACTION_MAX_LANES")?;
         let configured_projection_max_lanes =
-            optional_number("ANVIL_V06_INDEX_PROJECTION_MAX_LANES")?;
-        let configured_rayon_workers = optional_number("ANVIL_V06_INDEX_RAYON_WORKERS")?;
-        let max_anonymous_growth_bytes = optional_number("ANVIL_V06_MAX_ANONYMOUS_GROWTH_BYTES")?;
-        let require_performance_targets = boolean("ANVIL_V09_REQUIRE_PERFORMANCE_TARGETS", false)?;
+            optional_number("KELDRA_V06_INDEX_PROJECTION_MAX_LANES")?;
+        let configured_rayon_workers = optional_number("KELDRA_V06_INDEX_RAYON_WORKERS")?;
+        let max_anonymous_growth_bytes = optional_number("KELDRA_V06_MAX_ANONYMOUS_GROWTH_BYTES")?;
+        let require_performance_targets = boolean("KELDRA_V09_REQUIRE_PERFORMANCE_TARGETS", false)?;
         let evidence = EvidenceConfig::from_env(endpoints.len())?;
         ensure!(
             configured_compaction_max_lanes.is_none_or(|lanes| lanes > 0),
-            "ANVIL_V06_INDEX_COMPACTION_MAX_LANES must be non-zero when configured"
+            "KELDRA_V06_INDEX_COMPACTION_MAX_LANES must be non-zero when configured"
         );
         ensure!(
             configured_projection_max_lanes.is_none_or(|lanes| lanes > 0),
-            "ANVIL_V06_INDEX_PROJECTION_MAX_LANES must be non-zero when configured"
+            "KELDRA_V06_INDEX_PROJECTION_MAX_LANES must be non-zero when configured"
         );
         if require_resource_targets {
             ensure!(
@@ -674,11 +674,11 @@ impl Config {
             );
             ensure!(
                 configured_kind_budget_bytes.is_some_and(|bytes| bytes > 0),
-                "resource qualification requires a non-zero ANVIL_V06_KIND_BUDGET_BYTES"
+                "resource qualification requires a non-zero KELDRA_V06_KIND_BUDGET_BYTES"
             );
             ensure!(
                 configured_rayon_workers.is_some_and(|workers| workers > 0),
-                "resource qualification requires a non-zero ANVIL_V06_INDEX_RAYON_WORKERS"
+                "resource qualification requires a non-zero KELDRA_V06_INDEX_RAYON_WORKERS"
             );
             ensure!(
                 configured_projection_max_lanes == configured_rayon_workers,
@@ -686,21 +686,21 @@ impl Config {
             );
             ensure!(
                 max_anonymous_growth_bytes.is_some(),
-                "resource qualification requires ANVIL_V06_MAX_ANONYMOUS_GROWTH_BYTES"
+                "resource qualification requires KELDRA_V06_MAX_ANONYMOUS_GROWTH_BYTES"
             );
         }
         Ok(Self {
             endpoints,
-            tenant: required("ANVIL_V06_RESOURCE_TENANT")?.into(),
-            bucket: required("ANVIL_V06_RESOURCE_BUCKET")?.into(),
-            client_id: required("ANVIL_V06_RESOURCE_CLIENT_ID")?,
-            client_secret: required("ANVIL_V06_RESOURCE_CLIENT_SECRET")?,
+            tenant: required("KELDRA_V06_RESOURCE_TENANT")?.into(),
+            bucket: required("KELDRA_V06_RESOURCE_BUCKET")?.into(),
+            client_id: required("KELDRA_V06_RESOURCE_CLIENT_ID")?,
+            client_secret: required("KELDRA_V06_RESOURCE_CLIENT_SECRET")?,
             records,
             mutation_count,
             batch_size,
             workers,
             verification_workers,
-            seed: number("ANVIL_V06_RESOURCE_SEED", DEFAULT_SEED)?,
+            seed: number("KELDRA_V06_RESOURCE_SEED", DEFAULT_SEED)?,
             resource_pids,
             resource_containers,
             require_resource_targets,
@@ -711,39 +711,39 @@ impl Config {
             max_anonymous_growth_bytes,
             require_performance_targets,
             evidence,
-            output: env::var_os("ANVIL_V06_RESOURCE_OUTPUT").map(PathBuf::from),
-            state_output: env::var_os("ANVIL_V06_RESOURCE_STATE_OUTPUT").map(PathBuf::from),
+            output: env::var_os("KELDRA_V06_RESOURCE_OUTPUT").map(PathBuf::from),
+            state_output: env::var_os("KELDRA_V06_RESOURCE_STATE_OUTPUT").map(PathBuf::from),
         })
     }
 }
 
 impl EvidenceConfig {
     fn from_env(ingress_endpoint_count: usize) -> Result<Self> {
-        let source_commit = required("ANVIL_V09_EVIDENCE_SOURCE_COMMIT")?;
+        let source_commit = required("KELDRA_V09_EVIDENCE_SOURCE_COMMIT")?;
         ensure!(
             source_commit.len() == 40 && source_commit.bytes().all(|byte| byte.is_ascii_hexdigit()),
-            "ANVIL_V09_EVIDENCE_SOURCE_COMMIT must be a full Git commit ID"
+            "KELDRA_V09_EVIDENCE_SOURCE_COMMIT must be a full Git commit ID"
         );
-        let resolved_container_digest = required("ANVIL_V09_EVIDENCE_CONTAINER_DIGEST")?;
+        let resolved_container_digest = required("KELDRA_V09_EVIDENCE_CONTAINER_DIGEST")?;
         let digest_hex = resolved_container_digest
             .strip_prefix("sha256:")
-            .context("ANVIL_V09_EVIDENCE_CONTAINER_DIGEST must use sha256")?;
+            .context("KELDRA_V09_EVIDENCE_CONTAINER_DIGEST must use sha256")?;
         ensure!(
             digest_hex.len() == 64 && digest_hex.bytes().all(|byte| byte.is_ascii_hexdigit()),
-            "ANVIL_V09_EVIDENCE_CONTAINER_DIGEST must be a complete sha256 digest"
+            "KELDRA_V09_EVIDENCE_CONTAINER_DIGEST must be a complete sha256 digest"
         );
-        let native_architecture = required("ANVIL_V09_EVIDENCE_NATIVE_ARCHITECTURE")?;
+        let native_architecture = required("KELDRA_V09_EVIDENCE_NATIVE_ARCHITECTURE")?;
         ensure!(
             !native_architecture.trim().is_empty(),
             "native architecture evidence must not be empty"
         );
-        let container_platform = required("ANVIL_V09_EVIDENCE_CONTAINER_PLATFORM")?;
+        let container_platform = required("KELDRA_V09_EVIDENCE_CONTAINER_PLATFORM")?;
         ensure!(
             matches!(container_platform.as_str(), "linux/amd64" | "linux/arm64"),
             "container platform evidence must be linux/amd64 or linux/arm64"
         );
-        let topology = required("ANVIL_V09_EVIDENCE_TOPOLOGY")?;
-        let node_count = required_number("ANVIL_V09_EVIDENCE_NODE_COUNT")?;
+        let topology = required("KELDRA_V09_EVIDENCE_TOPOLOGY")?;
+        let node_count = required_number("KELDRA_V09_EVIDENCE_NODE_COUNT")?;
         ensure!(
             matches!(
                 (topology.as_str(), node_count),
@@ -755,16 +755,16 @@ impl EvidenceConfig {
             ingress_endpoint_count == node_count,
             "topology node count must equal the number of qualification ingress endpoints"
         );
-        let hardware_logical_cpus = required_number("ANVIL_V09_EVIDENCE_HARDWARE_LOGICAL_CPUS")?;
-        let hardware_memory_bytes = required_number("ANVIL_V09_EVIDENCE_HARDWARE_MEMORY_BYTES")?;
+        let hardware_logical_cpus = required_number("KELDRA_V09_EVIDENCE_HARDWARE_LOGICAL_CPUS")?;
+        let hardware_memory_bytes = required_number("KELDRA_V09_EVIDENCE_HARDWARE_MEMORY_BYTES")?;
         let qualification_filesystem_total_bytes =
-            required_number("ANVIL_V09_EVIDENCE_FILESYSTEM_TOTAL_BYTES")?;
+            required_number("KELDRA_V09_EVIDENCE_FILESYSTEM_TOTAL_BYTES")?;
         let qualification_filesystem_available_bytes_at_start =
-            required_number("ANVIL_V09_EVIDENCE_FILESYSTEM_AVAILABLE_BYTES")?;
+            required_number("KELDRA_V09_EVIDENCE_FILESYSTEM_AVAILABLE_BYTES")?;
         let index_disk_cache_bytes_per_node =
-            required_number("ANVIL_V09_EVIDENCE_INDEX_DISK_CACHE_BYTES_PER_NODE")?;
+            required_number("KELDRA_V09_EVIDENCE_INDEX_DISK_CACHE_BYTES_PER_NODE")?;
         let index_memory_percent_per_node =
-            required_number("ANVIL_V09_EVIDENCE_INDEX_MEMORY_PERCENT_PER_NODE")?;
+            required_number("KELDRA_V09_EVIDENCE_INDEX_MEMORY_PERCENT_PER_NODE")?;
         ensure!(
             hardware_logical_cpus > 0
                 && hardware_memory_bytes > 0
@@ -1308,8 +1308,8 @@ async fn verify_existing_state(path: &Path) -> Result<()> {
     ensure!(state.source_count > 0, "qualification state has no sources");
     validate_sha256(&state.final_result_sha256)?;
 
-    let tenant = required("ANVIL_V06_RESOURCE_TENANT")?;
-    let bucket = required("ANVIL_V06_RESOURCE_BUCKET")?;
+    let tenant = required("KELDRA_V06_RESOURCE_TENANT")?;
+    let bucket = required("KELDRA_V06_RESOURCE_BUCKET")?;
     ensure!(
         tenant == state.tenant,
         "qualification state tenant mismatch"
@@ -1318,17 +1318,17 @@ async fn verify_existing_state(path: &Path) -> Result<()> {
         bucket == state.bucket,
         "qualification state bucket mismatch"
     );
-    let client_id = required("ANVIL_V06_RESOURCE_CLIENT_ID")?;
-    let client_secret = required("ANVIL_V06_RESOURCE_CLIENT_SECRET")?;
+    let client_id = required("KELDRA_V06_RESOURCE_CLIENT_ID")?;
+    let client_secret = required("KELDRA_V06_RESOURCE_CLIENT_SECRET")?;
     let verification_workers = number(
-        "ANVIL_V06_RESOURCE_VERIFICATION_WORKERS",
+        "KELDRA_V06_RESOURCE_VERIFICATION_WORKERS",
         DEFAULT_VERIFICATION_WORKERS,
     )?;
     ensure!(
         verification_workers > 0,
         "verification worker count must be non-zero"
     );
-    let endpoints = required("ANVIL_V06_RESOURCE_ENDPOINTS")?
+    let endpoints = required("KELDRA_V06_RESOURCE_ENDPOINTS")?
         .split(',')
         .filter(|value| !value.is_empty())
         .map(str::to_owned)

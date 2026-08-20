@@ -183,7 +183,7 @@ impl RuntimeCandidateGate {
 /// authorized and checked against exact-current heads. The native executor
 /// already charges its pending candidates and `CandidateReference`s; this
 /// charge covers the concrete API candidate, object-key, evidence, and snapshot
-/// representations created by Anvil around that boundary.
+/// representations created by Keldra around that boundary.
 fn runtime_gate_envelope_bytes(
     batch: usize,
     tenant_bytes: usize,

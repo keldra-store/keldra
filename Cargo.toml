@@ -3,7 +3,6 @@ resolver = "3"
 
 members = [
     "clients/rust",
-    "clients/rust-legacy",
     "crates/keldra",
     "crates/keldra-api",
     "crates/keldra-authz",
@@ -16,7 +15,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.10.0"
+version = "0.11.0"
 edition = "2024"
 readme = "README.md"
 description = "Opaque versioned object storage with bounded atomic programs"

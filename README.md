@@ -47,20 +47,20 @@ repository are required.
 ### 1. Start a development node
 
 ```sh
-export ANVIL_IMAGE=ghcr.io/keldra-store/keldra:0.10.0
-export ANVIL_TOKEN_SIGNING_KEY_FILE="$PWD/keldra-data/token-signing-key"
+export KELDRA_IMAGE=ghcr.io/keldra-store/keldra:0.11.0
+export KELDRA_TOKEN_SIGNING_KEY_FILE="$PWD/keldra-data/token-signing-key"
 
 mkdir -p keldra-data
-head -c 64 /dev/urandom > "$ANVIL_TOKEN_SIGNING_KEY_FILE"
-chmod 0600 "$ANVIL_TOKEN_SIGNING_KEY_FILE"
+head -c 64 /dev/urandom > "$KELDRA_TOKEN_SIGNING_KEY_FILE"
+chmod 0600 "$KELDRA_TOKEN_SIGNING_KEY_FILE"
 
 # The container runs as UID 10001 and deliberately rejects a broadly readable
 # signing key.
 docker run --rm --user 0 \
-  -v "$ANVIL_TOKEN_SIGNING_KEY_FILE:/key" \
-  "$ANVIL_IMAGE" chown 10001:10001 /key
+  -v "$KELDRA_TOKEN_SIGNING_KEY_FILE:/key" \
+  "$KELDRA_IMAGE" chown 10001:10001 /key
 
-ANVIL_RUN_SYSTEM_BOOTSTRAP=true \
+KELDRA_RUN_SYSTEM_BOOTSTRAP=true \
   docker compose -f crates/keldra/docker-compose.yml up -d
 ```
 
@@ -80,7 +80,7 @@ Bootstrap is explicit and one-shot. Recreate the process without the flag after
 the first successful start; the named data volume is retained:
 
 ```sh
-ANVIL_RUN_SYSTEM_BOOTSTRAP=false \
+KELDRA_RUN_SYSTEM_BOOTSTRAP=false \
   docker compose -f crates/keldra/docker-compose.yml up -d --force-recreate
 ```
 
@@ -93,7 +93,7 @@ that exchange for you.
 Choose and retain a strong application secret:
 
 ```sh
-export ANVIL_OWNER_SECRET="$(openssl rand -hex 32)"
+export KELDRA_OWNER_SECRET="$(openssl rand -hex 32)"
 ```
 
 Use the system credential to create tenant `example`, owner application
@@ -101,7 +101,7 @@ Use the system credential to create tenant `example`, owner application
 
 ```sh
 docker compose -f crates/keldra/docker-compose.yml exec \
-  -e ANVIL_NEW_CLIENT_SECRET="$ANVIL_OWNER_SECRET" keldra \
+  -e KELDRA_NEW_CLIENT_SECRET="$KELDRA_OWNER_SECRET" keldra \
   keldra --endpoint http://127.0.0.1:50051 \
   --credentials-file /var/lib/keldra/system-bootstrap-credential.json \
   provision-tenant example example-owner example-client
@@ -122,8 +122,8 @@ becomes its owner:
 
 ```sh
 docker compose -f crates/keldra/docker-compose.yml exec \
-  -e ANVIL_CLIENT_ID=example-client \
-  -e ANVIL_CLIENT_SECRET="$ANVIL_OWNER_SECRET" keldra \
+  -e KELDRA_CLIENT_ID=example-client \
+  -e KELDRA_CLIENT_SECRET="$KELDRA_OWNER_SECRET" keldra \
   keldra --endpoint http://127.0.0.1:50051 \
   create-bucket objects
 ```
@@ -140,15 +140,15 @@ docker compose -f crates/keldra/docker-compose.yml cp \
   keldra-data/hello.txt keldra:/tmp/hello.txt
 
 docker compose -f crates/keldra/docker-compose.yml exec \
-  -e ANVIL_CLIENT_ID=example-client \
-  -e ANVIL_CLIENT_SECRET="$ANVIL_OWNER_SECRET" keldra \
+  -e KELDRA_CLIENT_ID=example-client \
+  -e KELDRA_CLIENT_SECRET="$KELDRA_OWNER_SECRET" keldra \
   keldra --endpoint http://127.0.0.1:50051 \
   put example objects greetings/hello.txt /tmp/hello.txt \
   --content-type text/plain --command-id first-upload
 
 docker compose -f crates/keldra/docker-compose.yml exec \
-  -e ANVIL_CLIENT_ID=example-client \
-  -e ANVIL_CLIENT_SECRET="$ANVIL_OWNER_SECRET" keldra \
+  -e KELDRA_CLIENT_ID=example-client \
+  -e KELDRA_CLIENT_SECRET="$KELDRA_OWNER_SECRET" keldra \
   keldra --endpoint http://127.0.0.1:50051 \
   get example objects greetings/hello.txt
 ```
@@ -159,7 +159,7 @@ Zanzibar-authorized object addressed by `(tenant, bucket, path)`.
 ## Use the Rust client
 
 ```sh
-cargo add keldra@0.10.0
+cargo add keldra@0.11.0
 cargo add tokio --features macros,rt-multi-thread
 ```
 
@@ -178,7 +178,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut objects = keldra::connect_with_credentials(
         "http://127.0.0.1:50051",
         "example-client",
-        std::env::var("ANVIL_OWNER_SECRET")?,
+        std::env::var("KELDRA_OWNER_SECRET")?,
     )
     .await?;
 
@@ -234,7 +234,7 @@ Zanzibar-authorized independently of ordinary object traffic.
 Add the public client and canonical protocol types:
 
 ```sh
-cargo add keldra@0.10.0 personaldb-protocol@0.2.2 serde_json
+cargo add keldra@0.11.0 personaldb-protocol@0.2.2 serde_json
 ```
 
 Use the same application credential created above to create a source group and
@@ -252,7 +252,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let token = keldra::exchange_client_credentials(
         channel.clone(),
         "example-client",
-        std::env::var("ANVIL_OWNER_SECRET")?,
+        std::env::var("KELDRA_OWNER_SECRET")?,
     )
     .await?;
     let mut personaldb = keldra::personaldb_client(channel, &token.access_token)?;
@@ -313,7 +313,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let token = exchange_client_credentials(
         channel.clone(),
         "example-client",
-        std::env::var("ANVIL_OWNER_SECRET")?,
+        std::env::var("KELDRA_OWNER_SECRET")?,
     )
     .await?;
     let mut accounting = AccountingServiceClient::with_interceptor(
@@ -365,24 +365,24 @@ the minimum S3 surface directly:
 
 ```sh
 export AWS_ACCESS_KEY_ID=example-client
-export AWS_SECRET_ACCESS_KEY="$ANVIL_OWNER_SECRET"
+export AWS_SECRET_ACCESS_KEY="$KELDRA_OWNER_SECRET"
 export AWS_DEFAULT_REGION=eu-west-2
-export ANVIL_S3_ENDPOINT=http://127.0.0.1:50051
+export KELDRA_S3_ENDPOINT=http://127.0.0.1:50051
 
-aws --endpoint-url "$ANVIL_S3_ENDPOINT" s3api create-bucket \
+aws --endpoint-url "$KELDRA_S3_ENDPOINT" s3api create-bucket \
   --bucket s3-demo
 printf 'hello through S3\n' > keldra-data/s3-hello.txt
-aws --endpoint-url "$ANVIL_S3_ENDPOINT" s3api put-object \
+aws --endpoint-url "$KELDRA_S3_ENDPOINT" s3api put-object \
   --bucket s3-demo --key greetings/hello.txt \
   --content-type text/plain --body keldra-data/s3-hello.txt
-aws --endpoint-url "$ANVIL_S3_ENDPOINT" s3api head-object \
+aws --endpoint-url "$KELDRA_S3_ENDPOINT" s3api head-object \
   --bucket s3-demo --key greetings/hello.txt
-aws --endpoint-url "$ANVIL_S3_ENDPOINT" s3api get-object \
+aws --endpoint-url "$KELDRA_S3_ENDPOINT" s3api get-object \
   --bucket s3-demo --key greetings/hello.txt keldra-data/s3-downloaded.txt
 cmp keldra-data/s3-hello.txt keldra-data/s3-downloaded.txt
-aws --endpoint-url "$ANVIL_S3_ENDPOINT" s3api list-objects-v2 \
+aws --endpoint-url "$KELDRA_S3_ENDPOINT" s3api list-objects-v2 \
   --bucket s3-demo --prefix greetings/
-aws --endpoint-url "$ANVIL_S3_ENDPOINT" s3api delete-object \
+aws --endpoint-url "$KELDRA_S3_ENDPOINT" s3api delete-object \
   --bucket s3-demo --key greetings/hello.txt
 ```
 
@@ -407,15 +407,15 @@ printf '# Stored in Keldra\n' > keldra-data/git-demo/README.md
 git -C keldra-data/git-demo add README.md
 git -C keldra-data/git-demo commit -m initial
 
-export ANVIL_GIT_URL=http://127.0.0.1:50051/git/example/objects/demo.git
-export ANVIL_GIT_AUTH="$(printf '%s:%s' example-client "$ANVIL_OWNER_SECRET" | base64 | tr -d '\n')"
+export KELDRA_GIT_URL=http://127.0.0.1:50051/git/example/objects/demo.git
+export KELDRA_GIT_AUTH="$(printf '%s:%s' example-client "$KELDRA_OWNER_SECRET" | base64 | tr -d '\n')"
 git -C keldra-data/git-demo \
-  -c "http.extraHeader=Authorization: Basic $ANVIL_GIT_AUTH" \
-  push "$ANVIL_GIT_URL" main
-git -c "http.extraHeader=Authorization: Basic $ANVIL_GIT_AUTH" \
-  clone --branch main "$ANVIL_GIT_URL" keldra-data/authenticated-clone
+  -c "http.extraHeader=Authorization: Basic $KELDRA_GIT_AUTH" \
+  push "$KELDRA_GIT_URL" main
+git -c "http.extraHeader=Authorization: Basic $KELDRA_GIT_AUTH" \
+  clone --branch main "$KELDRA_GIT_URL" keldra-data/authenticated-clone
 git -C keldra-data/authenticated-clone \
-  -c "http.extraHeader=Authorization: Basic $ANVIL_GIT_AUTH" pull
+  -c "http.extraHeader=Authorization: Basic $KELDRA_GIT_AUTH" pull
 ```
 
 To make pulls and clones public, enable public reads for the repository's
@@ -424,12 +424,12 @@ header:
 
 ```sh
 docker compose -f crates/keldra/docker-compose.yml exec \
-  -e ANVIL_CLIENT_ID=example-client \
-  -e ANVIL_CLIENT_SECRET="$ANVIL_OWNER_SECRET" keldra \
+  -e KELDRA_CLIENT_ID=example-client \
+  -e KELDRA_CLIENT_SECRET="$KELDRA_OWNER_SECRET" keldra \
   keldra --endpoint http://127.0.0.1:50051 \
   set-bucket-public-read objects enabled
 
-git clone --branch main "$ANVIL_GIT_URL" keldra-data/public-clone
+git clone --branch main "$KELDRA_GIT_URL" keldra-data/public-clone
 ```
 
 Push always requires an authorized application. A real-client push, pull, and
@@ -485,8 +485,8 @@ A bucket owner can enable public reads with the CLI or
 
 ```sh
 docker compose -f crates/keldra/docker-compose.yml exec \
-  -e ANVIL_CLIENT_ID=example-client \
-  -e ANVIL_CLIENT_SECRET="$ANVIL_OWNER_SECRET" keldra \
+  -e KELDRA_CLIENT_ID=example-client \
+  -e KELDRA_CLIENT_SECRET="$KELDRA_OWNER_SECRET" keldra \
   keldra --endpoint http://127.0.0.1:50051 \
   set-bucket-public-read objects enabled
 ```
@@ -563,29 +563,29 @@ a partial one.
 The startup default is 256 MiB of construction memory and at most four
 compaction lanes for each index kind, shared by every local definition of that
 kind, with four Rayon workers across the process. Set
-`ANVIL_INDEX_BUILDER_MEMORY_BYTES_PER_KIND` for the common memory fallback and
-`ANVIL_INDEX_RAYON_WORKERS` for the process-wide worker ceiling. Every kind can
+`KELDRA_INDEX_BUILDER_MEMORY_BYTES_PER_KIND` for the common memory fallback and
+`KELDRA_INDEX_RAYON_WORKERS` for the process-wide worker ceiling. Every kind can
 override the fallback and lane cap independently with
-`ANVIL_INDEX_<KIND>_BUILDER_MEMORY_BYTES` and
-`ANVIL_INDEX_<KIND>_COMPACTION_MAX_LANES`, where `<KIND>` is `PATH`,
+`KELDRA_INDEX_<KIND>_BUILDER_MEMORY_BYTES` and
+`KELDRA_INDEX_<KIND>_COMPACTION_MAX_LANES`, where `<KIND>` is `PATH`,
 `METADATA_FILTER`, `TYPED_JSON`, `FULL_TEXT`, `VECTOR`, `HYBRID`, `GIT_SOURCE`,
 or `TENSOR`.
 
 Projection concurrency also defaults to four lanes per kind. Configure it with
-`ANVIL_INDEX_PATH_PROJECTION_MAX_LANES`,
-`ANVIL_INDEX_METADATA_FILTER_PROJECTION_MAX_LANES`,
-`ANVIL_INDEX_TYPED_JSON_PROJECTION_MAX_LANES`,
-`ANVIL_INDEX_FULL_TEXT_PROJECTION_MAX_LANES`,
-`ANVIL_INDEX_VECTOR_PROJECTION_MAX_LANES`,
-`ANVIL_INDEX_HYBRID_PROJECTION_MAX_LANES`,
-`ANVIL_INDEX_GIT_SOURCE_PROJECTION_MAX_LANES`, and
-`ANVIL_INDEX_TENSOR_PROJECTION_MAX_LANES`. These caps share the process Rayon
+`KELDRA_INDEX_PATH_PROJECTION_MAX_LANES`,
+`KELDRA_INDEX_METADATA_FILTER_PROJECTION_MAX_LANES`,
+`KELDRA_INDEX_TYPED_JSON_PROJECTION_MAX_LANES`,
+`KELDRA_INDEX_FULL_TEXT_PROJECTION_MAX_LANES`,
+`KELDRA_INDEX_VECTOR_PROJECTION_MAX_LANES`,
+`KELDRA_INDEX_HYBRID_PROJECTION_MAX_LANES`,
+`KELDRA_INDEX_GIT_SOURCE_PROJECTION_MAX_LANES`, and
+`KELDRA_INDEX_TENSOR_PROJECTION_MAX_LANES`. These caps share the process Rayon
 worker pool and the corresponding kind's construction-memory budget.
 
-`ANVIL_INDEX_MAX_SEGMENTS_PER_TIER` and
-`ANVIL_INDEX_MAX_UNMERGED_BYTES_PER_TIER` bound merge debt, with per-kind
-overrides following the same naming pattern. `ANVIL_INDEX_QUERY_MEMORY_BYTES`
-is the query fair share. `ANVIL_INDEX_WORKING_MEMORY_BYTES` optionally sets the
+`KELDRA_INDEX_MAX_SEGMENTS_PER_TIER` and
+`KELDRA_INDEX_MAX_UNMERGED_BYTES_PER_TIER` bound merge debt, with per-kind
+overrides following the same naming pattern. `KELDRA_INDEX_QUERY_MEMORY_BYTES`
+is the query fair share. `KELDRA_INDEX_WORKING_MEMORY_BYTES` optionally sets the
 hard aggregate query/build/compaction ceiling; without it, Keldra uses the
 checked sum of the query and eight per-kind shares (2.5 GiB with defaults).
 Queries and builders can borrow idle bytes and derive their workspace from the
@@ -595,13 +595,13 @@ Actual compaction concurrency is the minimum of that kind's configured cap,
 the process worker ceiling, the number of deterministic key ranges, and the
 memory admission `1 + floor((kind budget - shared workspace) / incremental
 lane workspace)`. A cap of one preserves the sequential merge path. Cache
-limits remain separate: `ANVIL_INDEX_DISK_CACHE_BYTES` controls the shared
-disposable disk cache and `ANVIL_INDEX_MEMORY_PERCENT` caps aggregate in-flight
+limits remain separate: `KELDRA_INDEX_DISK_CACHE_BYTES` controls the shared
+disposable disk cache and `KELDRA_INDEX_MEMORY_PERCENT` caps aggregate in-flight
 block materialization. Immutable cache files are read through mmap, allowing
 the operating system to retain clean hot pages and reclaim them under pressure.
 `QueryIndex` has a separate five-minute server maximum so a cold first page can
 materialize the required blocks without inheriting the ordinary 30-second RPC
-limit. Set `ANVIL_INDEX_QUERY_TIMEOUT_SECONDS` at startup to tune it; a shorter
+limit. Set `KELDRA_INDEX_QUERY_TIMEOUT_SECONDS` at startup to tune it; a shorter
 client `grpc-timeout` always wins.
 
 Construct an authenticated index client from the same token used for objects:
@@ -614,7 +614,7 @@ let channel = connect_channel("http://127.0.0.1:50051").await?;
 let token = exchange_client_credentials(
     channel.clone(),
     "example-client",
-    std::env::var("ANVIL_OWNER_SECRET")?,
+    std::env::var("KELDRA_OWNER_SECRET")?,
 )
 .await?;
 let mut indices = index_client(channel, &token.access_token)?;
@@ -705,7 +705,7 @@ bundles, establishes peer mTLS, exercises replicated and erasure-coded storage,
 queries every index type, and performs a rolling restart:
 
 ```sh
-ANVIL_IMAGE=ghcr.io/keldra-store/keldra:0.10.0 \
+KELDRA_IMAGE=ghcr.io/keldra-store/keldra:0.11.0 \
   ./scripts/qualify-three-node.sh
 ```
 
@@ -726,20 +726,20 @@ uses mandatory certificates created and rotated by the cluster.
 
 ### Place storage by workload
 
-`ANVIL_DATA_DIR` supplies convenient single-filesystem defaults. A new node
+`KELDRA_DATA_DIR` supplies convenient single-filesystem defaults. A new node
 logs a bootstrap warning for every authoritative path left at its default so an
 operator can distribute I/O before that storage root is pinned:
 
 | Setting | Workload | Lifecycle |
 | --- | --- | --- |
-| `ANVIL_STATE_DIR` | Node identity, peer certificates, and Raft decisions | Authoritative; pinned at node initialization |
-| `ANVIL_METADATA_DIR` | RocksDB manifests, SSTs, object metadata, Zanzibar, and journals | Authoritative; pinned |
-| `ANVIL_METADATA_WAL_DIR` | RocksDB synchronous write-ahead log | Authoritative; pinned; prefer low-latency durable storage |
-| `ANVIL_PAYLOAD_DIR` | Canonical blobs, EC shards, and authoritative index artifacts | Authoritative; pinned; prefer capacity and sequential throughput |
-| `ANVIL_SCRATCH_DIR` | Index sort and merge scratch | Disposable; may use tmpfs or local scratch storage |
-| `ANVIL_CACHE_DIR` | Materialized index and gateway caches | Disposable; may be replaced between restarts |
-| `ANVIL_UPLOAD_SPOOL_DIR` | Unfinished, unacknowledged upload bytes | Disposable; may use bounded tmpfs |
-| `ANVIL_UPLOAD_SPOOL_MAX_BYTES` | Process-wide unfinished-upload capacity | Defaults to the configured maximum object size |
+| `KELDRA_STATE_DIR` | Node identity, peer certificates, and Raft decisions | Authoritative; pinned at node initialization |
+| `KELDRA_METADATA_DIR` | RocksDB manifests, SSTs, object metadata, Zanzibar, and journals | Authoritative; pinned |
+| `KELDRA_METADATA_WAL_DIR` | RocksDB synchronous write-ahead log | Authoritative; pinned; prefer low-latency durable storage |
+| `KELDRA_PAYLOAD_DIR` | Canonical blobs, EC shards, and authoritative index artifacts | Authoritative; pinned; prefer capacity and sequential throughput |
+| `KELDRA_SCRATCH_DIR` | Index sort and merge scratch | Disposable; may use tmpfs or local scratch storage |
+| `KELDRA_CACHE_DIR` | Materialized index and gateway caches | Disposable; may be replaced between restarts |
+| `KELDRA_UPLOAD_SPOOL_DIR` | Unfinished, unacknowledged upload bytes | Disposable; may use bounded tmpfs |
+| `KELDRA_UPLOAD_SPOOL_MAX_BYTES` | Process-wide unfinished-upload capacity | Defaults to the configured maximum object size |
 
 Each authoritative root carries a node-local identity marker. Restarting with a
 missing mount, an empty replacement directory, or another node's disk fails
@@ -749,7 +749,7 @@ are deliberately unpinned; losing them may abort active work or cause cache
 refetching, but cannot lose an acknowledged object.
 
 The WAL must not use tmpfs. Identified blob/shard staging and garbage-collection
-recovery remain under `ANVIL_PAYLOAD_DIR`; only raw uploads which have not
+recovery remain under `KELDRA_PAYLOAD_DIR`; only raw uploads which have not
 reached `PutEnd` use the disposable spool.
 
 ## Public services
@@ -785,10 +785,10 @@ artifacts are ordinary Keldra objects; local materialization is disposable
 acceleration, not another authoritative storage plane.
 
 The architecture contracts live in
-[ANVIL-0009](docs/rfcs/keldra_0009_atomic_programs.md) and
-[ANVIL-0010](docs/rfcs/keldra_0010_cluster_distribution.md). The current
+[KELDRA-0009](docs/rfcs/keldra_0009_atomic_programs.md) and
+[KELDRA-0010](docs/rfcs/keldra_0010_cluster_distribution.md). The current
 clean-break native-segment index architecture is specified by
-[ANVIL-0014](docs/rfcs/keldra_0014_native_segment_indexes.md).
+[KELDRA-0014](docs/rfcs/keldra_0014_native_segment_indexes.md).
 
 ## Build and qualify
 
@@ -802,16 +802,16 @@ cargo test --workspace
 Build and qualify the container locally before CI:
 
 ```sh
-ANVIL_IMAGE=keldra:local ./scripts/build-image.sh
-ANVIL_IMAGE=keldra:local ./scripts/release-gates.sh image
-ANVIL_QUALIFICATION_MODE=release \
-ANVIL_QUALIFICATION_INDEX_KIND_BUDGET_BYTES=268435456 \
-ANVIL_QUALIFICATION_INDEX_COMPACTION_MAX_LANES=4 \
-ANVIL_QUALIFICATION_INDEX_RAYON_WORKERS=4 \
-ANVIL_QUALIFICATION_INDEX_MAX_ANONYMOUS_GROWTH_BYTES=2147483648 \
-  ANVIL_IMAGE=keldra:local ./scripts/qualify-single-node.sh
-ANVIL_QUALIFICATION_MODE=release \
-  ANVIL_IMAGE=keldra:local ./scripts/qualify-three-node.sh
+KELDRA_IMAGE=keldra:local ./scripts/build-image.sh
+KELDRA_IMAGE=keldra:local ./scripts/release-gates.sh image
+KELDRA_QUALIFICATION_MODE=release \
+KELDRA_QUALIFICATION_INDEX_KIND_BUDGET_BYTES=268435456 \
+KELDRA_QUALIFICATION_INDEX_COMPACTION_MAX_LANES=4 \
+KELDRA_QUALIFICATION_INDEX_RAYON_WORKERS=4 \
+KELDRA_QUALIFICATION_INDEX_MAX_ANONYMOUS_GROWTH_BYTES=2147483648 \
+  KELDRA_IMAGE=keldra:local ./scripts/qualify-single-node.sh
+KELDRA_QUALIFICATION_MODE=release \
+  KELDRA_IMAGE=keldra:local ./scripts/qualify-three-node.sh
 ```
 
 The production-shaped index qualification generates 839,980 private-data-free
@@ -824,7 +824,7 @@ not hold the shared build lock during the long qualification.
 The pinned `sux` and Rayon dependencies, resolved versions, and license choices are
 recorded in [the index dependency record](docs/dependency-licenses.md).
 
-Keldra 0.10 deployments start with new volumes. Format-v4 index definitions and
+Keldra 0.11 deployments start with new volumes. Format-v4 index definitions and
 native segment artifacts are built from authoritative source objects rather
 than migrated from format v3. Current operational boundaries are collected in
 the [known limitations](docs/known-limitations.md).

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # Bounded scale comparison built from the existing public resource workload and
-# the low-cardinality telemetry emitted by Anvil itself.
+# the low-cardinality telemetry emitted by Keldra itself.
 
 telemetry_files() {
   local prefix="$1"
@@ -671,13 +671,13 @@ run_scale_singleton_probe() {
     return 1
   fi
   assert_source_tree_exact
-  if ANVIL_V06_RESOURCE_ENDPOINTS="${endpoint}" \
-    ANVIL_V06_RESOURCE_TENANT="${index_resource_tenant}" \
-    ANVIL_V06_RESOURCE_BUCKET="${index_resource_bucket}" \
-    ANVIL_V06_RESOURCE_CLIENT_ID="${index_resource_client}" \
-    ANVIL_V06_RESOURCE_CLIENT_SECRET="${index_resource_secret}" \
-    ANVIL_V09_RESOURCE_SINGLETON_PROBE_STATE_INPUT="${index_resource_state}" \
-    ANVIL_V09_RESOURCE_SINGLETON_PROBE_OUTPUT="${probe_report}" \
+  if KELDRA_V06_RESOURCE_ENDPOINTS="${endpoint}" \
+    KELDRA_V06_RESOURCE_TENANT="${index_resource_tenant}" \
+    KELDRA_V06_RESOURCE_BUCKET="${index_resource_bucket}" \
+    KELDRA_V06_RESOURCE_CLIENT_ID="${index_resource_client}" \
+    KELDRA_V06_RESOURCE_CLIENT_SECRET="${index_resource_secret}" \
+    KELDRA_V09_RESOURCE_SINGLETON_PROBE_STATE_INPUT="${index_resource_state}" \
+    KELDRA_V09_RESOURCE_SINGLETON_PROBE_OUTPUT="${probe_report}" \
       "${binary}" >/dev/null
   then
     probe_status=0
@@ -836,7 +836,7 @@ run_scale_baseline_resource_qualification() {
   index_resource_report="${scale_baseline_resource_report}"
   index_resource_scope=scale-baseline
   index_resource_secret="${scale_baseline_resource_secret}"
-  index_resource_state="${ANVIL_QUALIFICATION_STATE_DIR}/index-scale-baseline-state.json"
+  index_resource_state="${KELDRA_QUALIFICATION_STATE_DIR}/index-scale-baseline-state.json"
   index_resource_telemetry_prefix="${scale_baseline_telemetry_prefix}"
   index_resource_tenant="${scale_baseline_resource_tenant}"
   require_performance_targets=0

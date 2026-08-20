@@ -1,20 +1,20 @@
 # keldra
 
 The official Rust client for Keldra. It provides authenticated object upload
-helpers and the complete generated Keldra 0.10 protocol, including object,
+helpers and the complete generated Keldra 0.11 protocol, including object,
 authorization, administration, cluster-wide index, accounting, and PersonalDB
 clients.
 
 ## Install
 
 ```sh
-cargo add keldra@0.10.0
+cargo add keldra@0.11.0
 cargo add tokio --features macros,rt-multi-thread
 ```
 
 ## Connect and read an object head
 
-Set `ANVIL_ENDPOINT`, `ANVIL_CLIENT_ID`, and `ANVIL_CLIENT_SECRET`, then run:
+Set `KELDRA_ENDPOINT`, `KELDRA_CLIENT_ID`, and `KELDRA_CLIENT_SECRET`, then run:
 
 ```rust,no_run
 use keldra::v1::{HeadObjectRequest, ObjectAddress, object_head};
@@ -22,9 +22,9 @@ use keldra::v1::{HeadObjectRequest, ObjectAddress, object_head};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut client = keldra::connect_with_credentials(
-        std::env::var("ANVIL_ENDPOINT")?,
-        std::env::var("ANVIL_CLIENT_ID")?,
-        std::env::var("ANVIL_CLIENT_SECRET")?,
+        std::env::var("KELDRA_ENDPOINT")?,
+        std::env::var("KELDRA_CLIENT_ID")?,
+        std::env::var("KELDRA_CLIENT_SECRET")?,
     )
     .await?;
 

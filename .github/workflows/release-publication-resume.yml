@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing 0.10 release tag to publish
+        description: Existing 0.11 release tag to publish
         required: true
         type: string
       expected_commit:
@@ -31,7 +31,7 @@ concurrency:
 
 jobs:
   publish:
-    name: Resume Keldra 0.10 publication from validated image
+    name: Resume Keldra 0.11 publication from validated image
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -89,7 +89,7 @@ jobs:
           )"
           required_jobs=(
             'Resolve immutable release context'
-            'Validate Keldra 0.10 release'
+            'Validate Keldra 0.11 release'
             'Build release image (linux/amd64)'
             'Build release image (linux/arm64)'
           )
@@ -188,7 +188,7 @@ jobs:
           generate_release_notes: true
           make_latest: true
           body: |
-            Keldra 0.10.0 is the first release under the Keldra name. It includes
+            Keldra 0.11.0 completes the public Keldra product rename. It includes
             the `keldra` Rust crate and CLI, the multi-platform Keldra server
             image, and the authorized HTTP plugin broker used by separately
             deployed protocol plugins. Object, index, PersonalDB, accounting,

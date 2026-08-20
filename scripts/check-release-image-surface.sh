@@ -12,7 +12,7 @@ for required in \
   'final_image="${repository}:${RELEASE_TAG}"' \
   'runner: ubuntu-24.04' \
   'runner: ubuntu-24.04-arm' \
-  '--platform "$ANVIL_DOCKER_PLATFORM"' \
+  '--platform "$KELDRA_DOCKER_PLATFORM"' \
   '--provenance=false' \
   '--sbom=false' \
   'push-by-digest=true' \
@@ -77,7 +77,7 @@ do
 done
 
 if grep -REn \
-  'Dockerfile\.prebuilt|cargo-zigbuild|zigbuild|tmp/docker-bin|ANVIL_ZIG_TARGET|ANVIL_USE_NATIVE_CARGO|ANVIL_RUNTIME_BASE' \
+  'Dockerfile\.prebuilt|cargo-zigbuild|zigbuild|tmp/docker-bin|KELDRA_ZIG_TARGET|KELDRA_USE_NATIVE_CARGO|KELDRA_RUNTIME_BASE' \
   .github/workflows scripts/build-image.sh README.md .dockerignore crates/keldra/build-and-run.sh
 then
   echo "image tooling must build from source in the target-platform Dockerfile" >&2
@@ -88,7 +88,7 @@ grep -Fq 'FROM --platform=$TARGETPLATFORM rust:1.96-trixie AS builder' crates/ke
 grep -Fq 'FROM --platform=$TARGETPLATFORM debian:trixie-slim' crates/keldra/Dockerfile
 grep -Fq 'org.opencontainers.image.revision=' crates/keldra/Dockerfile
 grep -Fxq 'EXPOSE 50051 50052' crates/keldra/Dockerfile
-if grep -REn 'ANVIL_GATEWAY_LISTEN|50053' \
+if grep -REn 'KELDRA_GATEWAY_LISTEN|50053' \
   crates/keldra/src \
   crates/keldra/Dockerfile \
   crates/keldra/docker-compose.yml \
@@ -102,5 +102,5 @@ then
 fi
 grep -Fq -- '--file crates/keldra/Dockerfile' scripts/build-image.sh
 grep -Fq -- '--file crates/keldra/Dockerfile' "${release_workflow}"
-grep -Fq -- '--build-arg "ANVIL_SOURCE_REVISION=${source_revision}"' scripts/build-image.sh
-grep -Fq -- '--build-arg "ANVIL_SOURCE_REVISION=${SOURCE_COMMIT}"' "${release_workflow}"
+grep -Fq -- '--build-arg "KELDRA_SOURCE_REVISION=${source_revision}"' scripts/build-image.sh
+grep -Fq -- '--build-arg "KELDRA_SOURCE_REVISION=${SOURCE_COMMIT}"' "${release_workflow}"

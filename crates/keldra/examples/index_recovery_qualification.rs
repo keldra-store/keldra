@@ -112,9 +112,9 @@ struct Context {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> TestResult<()> {
-    let mode = required("ANVIL_INDEX_RECOVERY_QUALIFICATION_MODE")?;
+    let mode = required("KELDRA_INDEX_RECOVERY_QUALIFICATION_MODE")?;
     let context = Context::connect().await?;
-    let state_path = PathBuf::from(required("ANVIL_INDEX_RECOVERY_QUALIFICATION_STATE")?);
+    let state_path = PathBuf::from(required("KELDRA_INDEX_RECOVERY_QUALIFICATION_STATE")?);
     match mode.as_str() {
         "membership-seed" => membership_seed(&context, state_path).await?,
         "membership-verify-two" => membership_verify(&context, state_path, 2).await?,
@@ -130,7 +130,7 @@ async fn main() -> TestResult<()> {
 
 impl Context {
     async fn connect() -> TestResult<Self> {
-        let endpoints = required("ANVIL_INDEX_RECOVERY_QUALIFICATION_ENDPOINTS")?
+        let endpoints = required("KELDRA_INDEX_RECOVERY_QUALIFICATION_ENDPOINTS")?
             .split(',')
             .filter(|value| !value.is_empty())
             .map(str::to_owned)
@@ -142,11 +142,11 @@ impl Context {
         for endpoint in endpoints {
             channels.push(connect_channel(&endpoint).await?);
         }
-        let tenant = required("ANVIL_INDEX_RECOVERY_QUALIFICATION_TENANT")?;
+        let tenant = required("KELDRA_INDEX_RECOVERY_QUALIFICATION_TENANT")?;
         let token = exchange_client_credentials(
             channels[0].clone(),
-            required("ANVIL_INDEX_RECOVERY_QUALIFICATION_CLIENT_ID")?,
-            required("ANVIL_INDEX_RECOVERY_QUALIFICATION_CLIENT_SECRET")?,
+            required("KELDRA_INDEX_RECOVERY_QUALIFICATION_CLIENT_ID")?,
+            required("KELDRA_INDEX_RECOVERY_QUALIFICATION_CLIENT_SECRET")?,
         )
         .await?
         .access_token;
@@ -427,7 +427,7 @@ async fn pressure_seed(context: &Context, state_path: PathBuf) -> TestResult<()>
     if context.channels.len() != 3 {
         return Err(invalid("journal-pressure seed requires three endpoints"));
     }
-    let bucket = required("ANVIL_INDEX_RECOVERY_QUALIFICATION_BUCKET")?;
+    let bucket = required("KELDRA_INDEX_RECOVERY_QUALIFICATION_BUCKET")?;
     let mut administrator = administration_client(context.channels[0].clone(), &context.token)?;
     create_bucket(&mut administrator, &bucket).await?;
     let mut indexes = context.index_clients()?;
@@ -477,7 +477,7 @@ async fn pressure_write(context: &Context, state_path: PathBuf) -> TestResult<()
             "journal-pressure writer requires one selected ingress endpoint",
         ));
     }
-    let release_path = PathBuf::from(required("ANVIL_INDEX_RECOVERY_QUALIFICATION_RELEASE")?);
+    let release_path = PathBuf::from(required("KELDRA_INDEX_RECOVERY_QUALIFICATION_RELEASE")?);
     if release_path.exists() {
         return Err(invalid(
             "journal-pressure release marker already exists before the writer starts",

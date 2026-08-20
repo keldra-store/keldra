@@ -1,16 +1,16 @@
-# ANVIL-0013: Scalable Bulk and Incremental Indexes in Anvil 0.8.0
+# KELDRA-0013: Scalable Bulk and Incremental Indexes in Keldra 0.8.0
 
-Status: Accepted architecture for Anvil 0.8.0
+Status: Accepted architecture for Keldra 0.8.0
 
-Supersedes: ANVIL-0012 in full
+Supersedes: KELDRA-0012 in full
 
-Audience: Anvil implementors, operators, client authors, and reviewers
+Audience: Keldra implementors, operators, client authors, and reviewers
 
 ## 1. Decision
 
-Anvil 0.8.0 replaces the index artifact format and the initial-build execution
+Keldra 0.8.0 replaces the index artifact format and the initial-build execution
 path. It keeps one authoritative object store, one ordered source-journal
-mechanism, ordinary Anvil objects for durable index artifacts, weighted-HRW
+mechanism, ordinary Keldra objects for durable index artifacts, weighted-HRW
 builder and query placement, and one compare-and-swap publication point per
 index generation.
 
@@ -39,7 +39,7 @@ an initial build by producing hundreds or thousands of small L0 runs and then
 rewriting them through every compaction level.
 
 Format v3 stores logical index blocks inside immutable 16 MiB target-size pack
-objects. A logical block descriptor addresses an ordinary Anvil object plus a
+objects. A logical block descriptor addresses an ordinary Keldra object plus a
 checked byte offset and length. Pack objects, run roots, generation manifests,
 and current pointers all use the ordinary inline or erasure-coded object path.
 There is no index byte plane, index database, artifact registry, or index WAL.
@@ -53,7 +53,7 @@ the barrier are indexed.
 The source journal and mutation-receipt store remain bounded. Their entry and
 byte limits are startup configuration which may change on restart. Reaching a
 limit no longer drops required index evidence or turns a committed object into
-an apparently missing indexed object. Anvil first prunes proven-safe state,
+an apparently missing indexed object. Keldra first prunes proven-safe state,
 then applies write backpressure until consumers advance. If a request deadline
 expires before admission, the mutation has not started and the client may
 retry its command identity.
@@ -77,7 +77,7 @@ with twelve Typed JSON fields. Its relevant results were:
 | Peak process/cgroup memory during qualification | approximately 4.3 GiB |
 
 The run did not lose data, exhaust memory, restart, or report RocksDB write
-stalls. The result is nevertheless not viable at Anvil's intended scale.
+stalls. The result is nevertheless not viable at Keldra's intended scale.
 Linear extrapolation alone puts 100 million objects at roughly 15.6 hours to
 ingest and 55 hours to index. Size-tiered rewrite amplification makes the index
 projection worse as levels are added. A 400 million-object corpus would take
@@ -113,7 +113,7 @@ or creating a larger thread pool does not remove them.
 
 ## 3. Goals
 
-Anvil 0.8.0 must:
+Keldra 0.8.0 must:
 
 - build a large initial or replacement generation in one bounded bulk pass plus
   a bounded journal suffix;
@@ -193,7 +193,7 @@ alone never selects this path.
 **Logical block** is one independently checksummed and decoded leaf, routing,
 dictionary, posting, document, or vector block in format v3.
 
-**Pack object** is one immutable ordinary Anvil object containing multiple
+**Pack object** is one immutable ordinary Keldra object containing multiple
 logical blocks. Its target payload size is 16 MiB. It is not an erasure-code
 shard; ordinary storage may erasure-code the pack payload.
 
@@ -227,7 +227,7 @@ window. It is not an index artifact or an event-delivery acknowledgement.
    content, version, scope, and Zanzibar authorization.
 5. The existing source journal remains the sole ordered change authority.
    Sparse routes and local scheduler state cannot create or reorder events.
-6. Format-v3 pack objects and manifests are ordinary immutable Anvil objects.
+6. Format-v3 pack objects and manifests are ordinary immutable Keldra objects.
    Their durability and garbage collection use the ordinary data plane.
 7. Publication remains one current-pointer compare-and-swap by the current
    weighted-HRW rank-zero builder.
@@ -403,7 +403,7 @@ explicit publication progress debt in Section 8.5.
 
 ### 8.3 Receipt backpressure
 
-Before a new command is evaluated, Anvil removes expired receipts within a
+Before a new command is evaluated, Keldra removes expired receipts within a
 bounded work budget and computes the exact entry and logical-byte reservation
 for the new receipt. If that reservation exceeds either bound because retained
 receipts are still inside their guarantee window, the request waits in a
@@ -411,12 +411,12 @@ bounded, process-local admission queue. The queue is not durable and is not an
 authority: no object mutation has started while the request is waiting.
 
 Expiry pruning and completed capacity maintenance wake waiters. If the clamped
-request deadline expires first, Anvil returns a retryable capacity failure and
+request deadline expires first, Keldra returns a retryable capacity failure and
 does not commit the object, receipt, journal entry, or reference delta. Once a
 request is admitted, its existing command identity and unknown-outcome retry
 rules apply normally.
 
-Anvil never shortens the configured retention promise, evicts an unexpired
+Keldra never shortens the configured retention promise, evicts an unexpired
 receipt, or acknowledges a non-idempotently-retryable command merely to admit
 more writes.
 
@@ -470,7 +470,7 @@ On restart, a consumer loads its local aggregate checkpoint and every assigned
 definition's last published barrier. If the source still retains the suffix, it
 resumes normal demultiplexing. If a required cursor is below the retained floor
 or belongs to an unavailable source epoch, that definition fails closed until
-an authorized principal explicitly requests a rebuild. Anvil does not capture
+an authorized principal explicitly requests a rebuild. Keldra does not capture
 a replacement snapshot merely because history is missing. Only published
 source-complete generations or complete accounting rollups justify the next
 aggregate acknowledgement. A malformed, future-fence, or future-offset
@@ -500,7 +500,7 @@ best-effort-delivering its index evidence.
 A failed or deliberately disabled definition can eventually apply backpressure
 to writes routed through a source it pins. This is intentional fail-closed
 behavior. A principal authorized to update that definition can repair it,
-request a scoped rebuild, or delete it through the public API. Anvil does not
+request a scoped rebuild, or delete it through the public API. Keldra does not
 silently make customer data disappear from indexed results to preserve write
 throughput.
 
@@ -513,7 +513,7 @@ object path also requires journal entries. Refusing those exact entries at the
 capacity boundary would prevent the only durable publication which can advance
 the consumer cursor and permit pruning.
 
-Anvil therefore gives one narrow trusted path an admission exception. The
+Keldra therefore gives one narrow trusted path an admission exception. The
 internal publisher of an already constructed source-complete index generation
 or complete accounting rollup may reserve the exact journal entries and logical
 bytes needed to durably write that publication even when the reservation takes
@@ -583,7 +583,7 @@ Admission is rate-limited by the exact stable
   unknown outcome neither shorten nor reset that interval.
 
 Authorization happens before replay, CAS, or rate decisions. When the supplied
-expected version is not current, Anvil safely submits the unchanged current
+expected version is not current, Keldra safely submits the unchanged current
 definition through the ordinary mutation path: an exact retry of the immediately
 preceding accepted rebuild replays its retained receipt, while another command
 can only return the ordinary CAS or idempotency error and cannot create a build.
@@ -737,7 +737,7 @@ the maximum logical decode allocation.
 
 ### 12.3 Async cached access
 
-The shared cache exposes Anvil's async file-like index handle, not a Rust
+The shared cache exposes Keldra's async file-like index handle, not a Rust
 `File`. A read requests `(offset, max_length)` and returns an owned or
 reference-counted immutable byte slice whose length is the available result.
 The handle may materialize or range-fetch the required pack in the background.
@@ -808,7 +808,7 @@ by another published run until compaction has restored the bound. The scheduler
 will not publish another
 incremental run which would cross either bound. It prioritizes compaction for
 that definition while retaining the last complete generation. Continued source
-lag is protected by the journal backpressure rules in Section 8; Anvil does not
+lag is protected by the journal backpressure rules in Section 8; Keldra does not
 create an unbounded manifest to avoid applying pressure.
 
 Compaction reads immutable runs, writes replacement packs, and CAS-publishes a
@@ -917,14 +917,14 @@ and metadata replica group and executed as bounded multi-gets/batches. A query
 does not issue one serialized distributed read per candidate when the same
 authority can evaluate a page.
 
-Anvil maintains a small process-owned control-plane executor reserved for
+Keldra maintains a small process-owned control-plane executor reserved for
 serving-fence renewal, membership progress, assignment fences, and peer-health
 work. Index queries, projection, compression, sorting, merge, ranking, and
 decoded-page construction never execute CPU work on that executor. Async index
 tasks perform bounded I/O and submit CPU chunks to the shared Rayon pool; they
 yield between chunks and never hold cache or scheduler locks across `await`.
 
-This is scheduling isolation inside one Anvil process. It is not another
+This is scheduling isolation inside one Keldra process. It is not another
 server, port, persistence plane, or authority.
 
 Authorization proceeds coarse to fine:
@@ -1055,7 +1055,7 @@ and compaction replace both families together, never one partial side.
 
 Commit, tree-path, and object relationships use sorted tuples and compressed
 routed postings over stable source identities. Object bodies remain ordinary
-Anvil objects and are not copied into packs. Commit and tree-prefix queries seek
+Keldra objects and are not copied into packs. Commit and tree-prefix queries seek
 only matching tuple ranges.
 
 ### 19.8 Tensor
@@ -1160,7 +1160,7 @@ durable bytes and query results remain portable and deterministic.
 
 ## 24. Observability
 
-Anvil exports OTLP metrics and traces for the complete critical path. Metrics
+Keldra exports OTLP metrics and traces for the complete critical path. Metrics
 use low-cardinality labels such as operation, index kind, phase, level,
 trigger, outcome, and limiting factor. Stable numeric IDs belong in trace and
 structured-log fields, never metric labels. Mutable tenant, bucket, index,
@@ -1431,7 +1431,7 @@ than reasons to weaken these gates.
   intersect multiple compressed posting streams; an unselective driver may
   therefore read more candidate rows than a range-local intersection.
 - One index query executes on one owner. Very large indexes may fetch packs over
-  the ordinary distributed object path, but Anvil does not scatter the query or
+  the ordinary distributed object path, but Keldra does not scatter the query or
   merge network result sets.
 - A permanently failed index or accounting definition can hold journal space
   and apply write backpressure. This preserves visibility correctness; the

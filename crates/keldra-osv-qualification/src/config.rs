@@ -26,7 +26,7 @@ pub(super) fn validate_and_pin(args: Args) -> Result<(RuntimeConfig, String, Str
     );
     ensure!(
         matches!(args.durability, DurabilityArgument::Local),
-        "the Anvil 0.9 OSV qualification requires --durability local"
+        "the Keldra 0.9 OSV qualification requires --durability local"
     );
     ensure!(
         (1..=SERVER_MAX_BULK_ITEMS).contains(&args.batch_size),

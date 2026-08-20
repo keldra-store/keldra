@@ -1,4 +1,4 @@
-//! Bounded distributed decisions for Anvil atomic programs.
+//! Bounded distributed decisions for Keldra atomic programs.
 //!
 //! This crate retains one Raft-nominated executor and a bounded globally
 //! ordered suffix of compact committed-batch references. Program objects,

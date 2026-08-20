@@ -1,4 +1,4 @@
-//! Public authorization RPCs backed by the same repository Anvil consults.
+//! Public authorization RPCs backed by the same repository Keldra consults.
 
 use keldra_api::v1 as api;
 use keldra_api::v1::authz_service_server::AuthzService;

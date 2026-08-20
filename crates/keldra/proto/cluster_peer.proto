@@ -570,7 +570,7 @@ message IndexArtifactDeleted {
   bool replayed = 3;
 }
 
-// Every retained descriptor beneath one exact format-v4 Anvil-owned index
+// Every retained descriptor beneath one exact format-v4 Keldra-owned index
 // artifact prefix. The server derives the prefix from index_id; peers cannot
 // widen it.
 message IndexArtifactHeads {
@@ -828,7 +828,7 @@ message AccountingMatcherCacheInvalidated {
   uint32 schema_version = 1;
 }
 
-// This service is installed only on Anvil's mandatory-mTLS peer listener.
+// This service is installed only on Keldra's mandatory-mTLS peer listener.
 // It exposes typed logical operations, never RocksDB keys, column-family
 // values, or a generic public-method tunnel.
 service ClusterPeer {

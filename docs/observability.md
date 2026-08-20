@@ -1,6 +1,6 @@
-# Anvil 0.9 observability
+# Keldra 0.9 observability
 
-Anvil always writes its structured `tracing` logs to stdout. OTLP export is an
+Keldra always writes its structured `tracing` logs to stdout. OTLP export is an
 optional startup setting and carries metrics and traces only; logs remain on
 stdout.
 
@@ -12,10 +12,10 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4318 keldra-server ...
 keldra-server --otlp-endpoint http://collector:4318 ...
 ```
 
-The endpoint is treated as the OTLP HTTP base URL. Anvil uses protobuf over HTTP
-and the exporter appends `/v1/metrics` and `/v1/traces`. Anvil's successful
+The endpoint is treated as the OTLP HTTP base URL. Keldra uses protobuf over HTTP
+and the exporter appends `/v1/metrics` and `/v1/traces`. Keldra's successful
 startup log does not print the endpoint. If the option and environment variable
-are both absent (or empty), Anvil does not construct an exporter, start an
+are both absent (or empty), Keldra does not construct an exporter, start an
 OpenTelemetry worker, or make a collector connection.
 
 Observability configuration is read once at process startup. Enabling,
@@ -29,7 +29,7 @@ Metrics and traces share these resource attributes:
 
 - `service.name=keldra`
 - `service.version=0.9.4`
-- `node.id=<ANVIL_NODE_ID>`
+- `node.id=<KELDRA_NODE_ID>`
 
 Trace export uses a dedicated worker with a 2,048-span queue and batches of at
 most 512 spans. A full queue drops new telemetry instead of blocking request
@@ -39,7 +39,7 @@ HTTP export has a five-second timeout. Shutdown flushes and stops both providers
 from a blocking worker so it does not occupy a Tokio request worker.
 
 OTLP setup errors, such as an invalid endpoint, fail startup. Collector
-unavailability after startup does not add a dependency to the Anvil data path.
+unavailability after startup does not add a dependency to the Keldra data path.
 
 ## Signal contract
 
@@ -55,7 +55,7 @@ needed to join a single invocation's work; caller-selected invocation IDs,
 opaque program input, paths, and object payload bytes are never span fields or
 events.
 
-The Anvil 0.9 process metric vocabulary covers:
+The Keldra 0.9 process metric vocabulary covers:
 
 - executor nomination count;
 - atomic-program invocation counts, total and combined preparation latency,
@@ -208,7 +208,7 @@ report. It is benchmark output, not an OTLP process metric.
 Two requested signals are deliberately not approximated in 0.5.2.
 The store does not expose an exact instantaneous orphan-byte/count inventory,
 and the atomic engine does not expose lock acquisition separately from its
-combined prepare operation. Anvil does not add full-store scans or new durable
+combined prepare operation. Keldra does not add full-store scans or new durable
 state solely to manufacture those numbers. Separate durability-wait and
 finalized-through-lag instruments are also absent. Garbage-collection results
 and combined preparation timing are the bounded alternatives.

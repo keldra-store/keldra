@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-join_bundle="/qualification/artifacts/keldra-node-${ANVIL_NODE_ID:?ANVIL_NODE_ID must be set}.join.json"
+join_bundle="/qualification/artifacts/keldra-node-${KELDRA_NODE_ID:?KELDRA_NODE_ID must be set}.join.json"
 if [ -f "${join_bundle}" ]; then
     exec keldra-server --join-bundle "${join_bundle}"
 fi

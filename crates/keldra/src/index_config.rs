@@ -16,7 +16,7 @@ const KINDS: [IndexKind; 8] = [
 
 /// Startup-only budgets and retention bounds shared by every index on a node.
 ///
-/// Authoritative index bytes remain ordinary Anvil objects. The disk and
+/// Authoritative index bytes remain ordinary Keldra objects. The disk and
 /// memory values here only bound disposable local materialisations. Retention
 /// bounds apply per index and always preserve its current generation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

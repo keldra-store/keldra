@@ -182,7 +182,7 @@ impl AuthorizationLimits {
     }
 }
 
-/// An exact Anvil object path. No ancestor or prefix grant is implied.
+/// An exact Keldra object path. No ancestor or prefix grant is implied.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ExactPath {
     pub tenant: String,
@@ -333,7 +333,7 @@ pub enum AllowedSubject {
     Exact { subject: TupleSubject },
     /// An object in this namespace whose ID equals the tuple resource ID.
     SameResourceId { namespace: String },
-    /// Only Anvil's reserved `app:_keldra/public` principal.
+    /// Only Keldra's reserved `app:_keldra/public` principal.
     Public,
 }
 

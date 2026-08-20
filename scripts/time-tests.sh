@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-out_dir="${ANVIL_TEST_TIMING_DIR:-target/keldra/test-timings}"
+out_dir="${KELDRA_TEST_TIMING_DIR:-target/keldra/test-timings}"
 mkdir -p "$out_dir"
 
 printf 'Writing timing outputs to %s\n' "$out_dir"
@@ -9,7 +9,7 @@ printf 'Writing timing outputs to %s\n' "$out_dir"
 cargo test --workspace --no-run --timings 2>&1 | tee "$out_dir/cargo-no-run.log"
 
 if command -v cargo-nextest >/dev/null 2>&1; then
-  ANVIL_TEST_TIMINGS=1 cargo nextest run \
+  KELDRA_TEST_TIMINGS=1 cargo nextest run \
     --workspace \
     --no-fail-fast \
     --status-level slow \
@@ -20,5 +20,5 @@ if command -v cargo-nextest >/dev/null 2>&1; then
 else
   printf 'cargo-nextest not found; falling back to cargo test with --nocapture so timing stderr is visible.\n' \
     | tee "$out_dir/nextest.log"
-  ANVIL_TEST_TIMINGS=1 cargo test --workspace -- --nocapture 2>&1 | tee "$out_dir/cargo-test-nocapture.log"
+  KELDRA_TEST_TIMINGS=1 cargo test --workspace -- --nocapture 2>&1 | tee "$out_dir/cargo-test-nocapture.log"
 fi

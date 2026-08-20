@@ -1,4 +1,4 @@
-//! Fail-closed boundary for addressed access to Anvil's reserved object paths.
+//! Fail-closed boundary for addressed access to Keldra's reserved object paths.
 //!
 //! The capability below exists only in a tonic request's in-process extension
 //! map. It has no protobuf representation and is never inferred from caller
@@ -122,7 +122,7 @@ pub(crate) fn require_path(access: &ObjectPathAccess, path: &str) -> Result<(), 
         | ObjectPathClass::PluginBinding => Ok(()),
         ObjectPathClass::Internal if access.internal => Ok(()),
         ObjectPathClass::Internal => Err(Status::permission_denied(
-            "the addressed object path is reserved for an internal Anvil capability",
+            "the addressed object path is reserved for an internal Keldra capability",
         )),
     }
 }

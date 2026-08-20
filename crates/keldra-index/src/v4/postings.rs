@@ -233,7 +233,7 @@ impl DensePostingDocs {
         }
         // SAFETY: `validate_bitmap_layout` proves that the encoded byte length
         // covers `span`; converting every byte into explicit little-endian u64
-        // words preserves Anvil's portable least-significant-bit-first codec.
+        // words preserves Keldra's portable least-significant-bit-first codec.
         let vector = unsafe { BitVec::from_raw_parts(words.into_boxed_slice(), span) };
         let rank = Rank9::new(vector);
         if rank.num_ones() != count {

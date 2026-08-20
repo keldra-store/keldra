@@ -1,14 +1,14 @@
-# ANVIL-0014: Anvil-Native Segment Indices
+# KELDRA-0014: Keldra-Native Segment Indices
 
 Status: Accepted
 
-Supersedes: ANVIL-0013 in full
+Supersedes: KELDRA-0013 in full
 
-Audience: Anvil implementors, operators, client authors, and reviewers
+Audience: Keldra implementors, operators, client authors, and reviewers
 
 ## 1. Decision
 
-Anvil will replace format-v3 indices with an Anvil-owned format-v4 segment
+Keldra will replace format-v3 indices with an Keldra-owned format-v4 segment
 engine. The engine adopts the proven execution contracts used by Lucene:
 
 - immutable segment cores with mutable behavior presented through new segments
@@ -27,8 +27,8 @@ engine. The engine adopts the proven execution contracts used by Lucene:
   newly published generation may recompute ranking statistics.
 
 Lucene is the reference for these contracts and their operational maturity. It
-is not Anvil's storage authority, file format, library dependency, or public
-API. Anvil owns every durable byte and keeps its existing distributed object,
+is not Keldra's storage authority, file format, library dependency, or public
+API. Keldra owns every durable byte and keeps its existing distributed object,
 publication, authorization, and resource-control boundaries.
 
 Format v4 is a clean break. It has no format-v3 reader, converter, backfill,
@@ -37,7 +37,7 @@ format-v4 deployment builds indices from authoritative ordinary objects and
 their retained source journals.
 
 Format-v4 postings, points, live masks, terms, doc values, vectors, generation
-manifests, and pack envelopes use explicit Anvil codecs matched to their native
+manifests, and pack envelopes use explicit Keldra codecs matched to their native
 access patterns. An index never stores a second copy of an ordinary source field
 merely to return it in a hit; a client retrieves the authoritative object
 through `GetObject` or `BatchGet`. The engine defines a generation-pinned scan
@@ -90,7 +90,7 @@ The cause is architectural:
 
 A later production qualification exposed a second format-bound cost on a
 healthy four-disk rotational RAID10 array. While source ingestion supplied
-about 6.5 MiB/s of encoded documents, Anvil issued about 32.7 MiB/s of
+about 6.5 MiB/s of encoded documents, Keldra issued about 32.7 MiB/s of
 kernel-accounted writes, about 81 MiB/s of userspace reads, and roughly 671
 write syscalls per second. The array remained 86--91 percent busy while index
 progress fell substantially behind ingestion. Logs were negligible and the
@@ -130,7 +130,7 @@ Format v4 must:
   path;
 - make every persistent codec portable across AMD64 and ARM64 and independent
   of Rust memory layout;
-- expose enough statistics and scan semantics for a future cost-based Anvil
+- expose enough statistics and scan semantics for a future cost-based Keldra
   planner and SQL gateway; and
 - prove logical read work, not merely wall-clock latency, in qualification.
 
@@ -203,7 +203,7 @@ inside every segment. It is not a promise that segments form one globally
 contiguous file; a query merges their ordered iterators.
 
 **Scan batch** is a bounded internal batch of selected logical columns and
-stable object identities. It is an Anvil-owned type.
+stable object identities. It is an Keldra-owned type.
 
 ## 6. Required invariants
 
@@ -218,7 +218,7 @@ stable object identities. It is an Anvil-owned type.
    atomic-program barrier. A partially built segment is never queryable.
 5. One generation-pointer CAS is the only publication point. No segment or
    live-mask block becomes visible independently.
-6. Every durable index artifact is an ordinary Anvil object and reaches the
+6. Every durable index artifact is an ordinary Keldra object and reaches the
    required artifact durability before publication.
 7. Raft contains no definition, source event, segment, posting, point, doc
    value, live mask, manifest, cursor, query state, or cache entry.
@@ -433,7 +433,7 @@ numeric bucket. It lazily loads only that bucket's enabled accounting prefixes,
 aggregates batches idempotently, and exports dropped batch/byte signals. A
 failure or reassignment window can therefore miss a bounded amount of billable
 traffic; stored-byte and object totals remain exact at their reported complete
-barrier. Anvil adds no global traffic log or per-bucket Raft record.
+barrier. Keldra adds no global traffic log or per-bucket Raft record.
 
 ## 8. Public contract
 
@@ -758,7 +758,7 @@ values have fixed widths.
 `EXACT` remains available for a keyword longer than 32,766 bytes. Its canonical
 term is the scalar type, exact `u64` byte length, and BLAKE3 digest of the exact
 UTF-8 bytes. Equality and `IN` compare that representation. This is the only
-large-exact representation: it is consistent with Anvil's existing
+large-exact representation: it is consistent with Keldra's existing
 content-addressed identity model and does not create a source-payload
 verification path in the query engine.
 
@@ -840,7 +840,7 @@ component-specific payload has its own explicit bounds and codec version.
 Readers validate the fixed header, checked lengths, declared upper bounds, and
 checksum before allocating or decoding.
 
-Logical components are packed into immutable ordinary Anvil objects. Packing is
+Logical components are packed into immutable ordinary Keldra objects. Packing is
 segment-scoped rather than component-stream-scoped: leaves, routing nodes, and
 other logical components from different streams share the same current pack
 until adding the next complete component would exceed 16 MiB. A component may
@@ -912,7 +912,7 @@ binary encoding in this order:
 6. physical order and stable tie-break semantics; and
 7. every required component codec semantic version.
 
-Integers use fixed-width little-endian encoding, enums use documented Anvil
+Integers use fixed-width little-endian encoding, enums use documented Keldra
 tags, strings and byte fields use a `u32` byte length followed by exact bytes,
 and lists use a `u32` count. Protobuf wire bytes, JSON serialization, map
 iteration order, and observed segment statistics are not fingerprint inputs.
@@ -923,14 +923,14 @@ version remains a separate merge-identity field.
 
 ### 9.5 Generation manifest and durability
 
-The generation manifest is one ordinary immutable Anvil object, not a logical
+The generation manifest is one ordinary immutable Keldra object, not a logical
 index component. It therefore has no 512 KiB component-block ceiling. Small
 manifests use the ordinary inline path and larger manifests use the same
 complete-replica or erasure-coded payload placement as every other object. The
 manifest codec has its own magic, version, exact payload length, checked
 collection counts, and structural validation.
 
-The ordinary object `BlobRef` is the manifest's sole content checksum. Anvil
+The ordinary object `BlobRef` is the manifest's sole content checksum. Keldra
 hashes the bytes when staging the content-addressed object and verifies that
 identity when reading a complete replica or reconstructing erasure shards. The
 manifest does not nest a second checksum over the same bytes, and callers do
@@ -1044,7 +1044,7 @@ For each field, the catalogue records:
 
 Typed JSON definitions are not dynamically typed inside the index. One field
 has one declared type across every source object and segment. A value outside
-that type is a precise projection error; Anvil never coerces a string to a
+that type is a precise projection error; Keldra never coerces a string to a
 number, truncates an integer, treats a Boolean as a number, or invents a tagged
 cross-type order. Null is a value state, not a numeric or string type, and
 missing remains a separate presence state. A future SQL API therefore receives
@@ -1068,7 +1068,7 @@ every currently supported field component and up to 5,088 minimal fields. A
 larger real requirement needs a separately designed routed statistics codec;
 it does not silently create an unbounded record.
 
-Persistent type tags are Anvil constants. They are never protobuf, Rust, or
+Persistent type tags are Keldra constants. They are never protobuf, Rust, or
 third-party enum discriminants.
 
 ## 11. Segment identity and liveness
@@ -1120,10 +1120,10 @@ DocId, and clear that DocId locally. The overlay never adds a new document and
 cannot claim index freshness; it only prevents avoidably stale candidates while
 the next complete generation is building. Losing it costs catch-up work, not
 correctness or source data. Its memory is charged to the query/cache budget; if
-that budget cannot retain it, Anvil drops or partially rebuilds the overlay and
+that budget cannot retain it, Keldra drops or partially rebuilds the overlay and
 relies on the mandatory bounded exact-current result check.
 
-Before returning results, Anvil exact-reads current heads in bounded multi-get
+Before returning results, Keldra exact-reads current heads in bounded multi-get
 batches and removes any object whose exact current version or delete state
 differs. This preserves the existing no-stale-version result contract even when
 the disposable overlay is behind or a mutation commits concurrently. A
@@ -1171,8 +1171,8 @@ term instead. Hashed exact terms are not eligible for ordered enumeration,
 prefix matching, range matching, sorting, or faceting.
 
 The implementation may use finite-state or succinct structures in memory, but
-the durable bytes are an Anvil codec. `sux` structures may be reconstructed
-from portable arrays or used behind an Anvil wrapper; their native serializer
+the durable bytes are an Keldra codec. `sux` structures may be reconstructed
+from portable arrays or used behind an Keldra wrapper; their native serializer
 is never the format contract.
 
 ### 12.2 Postings
@@ -1279,7 +1279,7 @@ generation may have slightly different scores and score order. A page token
 continues on its retained generation, so ranking cannot change within one
 pagination sequence.
 
-Anvil does not add a generation-global term-stat registry, high-cardinality
+Keldra does not add a generation-global term-stat registry, high-cardinality
 delta dictionary, or per-document forward term list solely to freeze scores
 across compaction. Impact blocks persist raw frequency/norm maxima from which a
 conservative bound is computed using the pinned query statistics. An invalid
@@ -1562,7 +1562,7 @@ generation, liveness, and authorization boundary.
 Repository, commit, tree path, Git object ID, and source identity form sorted
 composite terms and capability-selected doc values. Exact repository/commit
 lookups seek directly; tree traversal uses prefix enumeration. Stable Git
-object and pack bytes remain ordinary Anvil payloads and are never copied into
+object and pack bytes remain ordinary Keldra payloads and are never copied into
 the index.
 
 ### 15.8 Tensor
@@ -1613,7 +1613,7 @@ ScanStream -> async stream<ScanBatch>
 `PredicateId` is scoped to one `ScanRequest`; it is neither durable nor drawn
 from a registry.
 
-`ScanBatch` contains only requested definition-local doc values, their Anvil
+`ScanBatch` contains only requested definition-local doc values, their Keldra
 logical types, presence and null information, stable object identities, and
 bounded column buffers. It does not expose source JSON, internal block
 ownership, or DocIds beyond the engine boundary.
@@ -1643,7 +1643,7 @@ need:
 
 Reported partitions are local execution partitions on the selected HRW owner,
 such as disjoint segment groups. They do not authorize a SQL engine to scatter
-a query across Anvil nodes or bypass the owner, generation, cache, and Zanzibar
+a query across Keldra nodes or bypass the owner, generation, cache, and Zanzibar
 boundaries. Ordering is reported per partition. A physically ordered
 multi-segment scan either adds one local k-way merge and returns one globally
 ordered stream or exposes the per-partition ordering and requires an explicit
@@ -1666,7 +1666,7 @@ semantics.
 The future adapter translates SQL expressions to `ScanRequest`, consumes
 bounded `ScanBatch` values, and evaluates any inexact residual from requested
 doc values. Source-field projection is a separate ordinary-object fetch stage;
-format v4 does not turn an index into another copy of the source. If Anvil
+format v4 does not turn an index into another copy of the source. If Keldra
 performs a bounded residual exactly, it advertises the predicate as `Exact`.
 The adapter remains outside the store, consensus, program, gateway, and native
 index crates.
@@ -1727,7 +1727,7 @@ are not Raft or durable-format state. Defaults are:
 - query working-memory fair share: 512 MiB;
 - aggregate query/build/compaction working-memory ceiling: the checked sum of
   the query and eight per-kind fair shares, 2.5 GiB with defaults, unless the
-  administrator explicitly sets `ANVIL_INDEX_WORKING_MEMORY_BYTES`;
+  administrator explicitly sets `KELDRA_INDEX_WORKING_MEMORY_BYTES`;
 - retained generations: three, 24 hours, or 50 GiB, whichever bound is reached
   first; and
 - index-query server maximum: 300 seconds, clamped by a shorter valid client
@@ -1804,7 +1804,7 @@ prefetch benefit. They choose iterator order, top-K strategy, and scheduling.
 An inaccurate advisory estimate may make a plan slower but cannot omit a block,
 predicate, or candidate; exact iterators and verification remain authoritative.
 
-Statistics are also exposed to the future native Anvil planner. A future SQL
+Statistics are also exposed to the future native Keldra planner. A future SQL
 adapter consumes the same estimates rather than inventing a second topology or
 index catalogue. The native cost includes selected HRW owner, local cache
 residency, missing ordinary artifact ranges, expected remote bytes, and bounded
@@ -2007,7 +2007,7 @@ connect to the new format-v4 engine.
 - Vector search remains exact and linear in the live filtered vector set. ANN
   requires a later accepted design.
 - One query executes on one HRW owner. Very large indices may fetch ordinary
-  artifact packs over the cluster, but Anvil does not scatter the query or merge
+  artifact packs over the cluster, but Keldra does not scatter the query or merge
   network result sets.
 - Arbitrary order without a matching physical order may inspect every exact
   Boolean match on every page and may authorize and exact-current-check every
@@ -2037,10 +2037,10 @@ live masks, advanceable postings, points, typed doc values, and one planner
 serve every index kind instead of letting each rediscover filtering,
 pagination, authorization, and cache behavior.
 
-Anvil retains ownership of its durable format and can tune codecs, remote block
+Keldra retains ownership of its durable format and can tune codecs, remote block
 layout, cache hints, compaction, and future ANN structures for its
 inline/erasure-coded object architecture. Following Lucene's stable execution
-contracts avoids inventing an unproven search model without binding Anvil to a
+contracts avoids inventing an unproven search model without binding Keldra to a
 foreign storage format.
 
 The native scan boundary prevents a future SQL gateway from bypassing the

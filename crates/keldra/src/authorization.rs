@@ -12,7 +12,7 @@ pub(crate) const OBJECT_NAMESPACE: &str = "object";
 pub(crate) const AUTHZ_REALM_NAMESPACE: &str = "authz_realm";
 /// Stable ID assigned to the protected `_keldra` tenant during bootstrap.
 ///
-/// Object addresses belong to customer tenants, but Anvil's own object and
+/// Object addresses belong to customer tenants, but Keldra's own object and
 /// administration permissions are always evaluated in this one protected
 /// tenant-wide Zanzibar group.
 pub(crate) const SYSTEM_STABLE_TENANT_ID: u64 = 1;
@@ -65,7 +65,7 @@ pub(crate) struct SystemAuthorization {
     pub(crate) binding_generation: u64,
 }
 
-/// Revision-keyed cache for Anvil's own protected realm. Customer realms use
+/// Revision-keyed cache for Keldra's own protected realm. Customer realms use
 /// the same repository and evaluator; this cache only avoids recompiling the
 /// one graph consulted by nearly every public request.
 #[derive(Clone, Debug)]

@@ -63,8 +63,8 @@ pub(super) async fn run(state_path: &Path) -> Result<()> {
     .with_context(|| format!("parse qualification state {}", state_path.display()))?;
     validate_state(&state)?;
 
-    let tenant = required("ANVIL_V06_RESOURCE_TENANT")?;
-    let bucket = required("ANVIL_V06_RESOURCE_BUCKET")?;
+    let tenant = required("KELDRA_V06_RESOURCE_TENANT")?;
+    let bucket = required("KELDRA_V06_RESOURCE_BUCKET")?;
     ensure!(
         tenant == state.tenant,
         "qualification state tenant mismatch"
@@ -73,7 +73,7 @@ pub(super) async fn run(state_path: &Path) -> Result<()> {
         bucket == state.bucket,
         "qualification state bucket mismatch"
     );
-    let endpoints = required("ANVIL_V06_RESOURCE_ENDPOINTS")?
+    let endpoints = required("KELDRA_V06_RESOURCE_ENDPOINTS")?
         .split(',')
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -89,8 +89,8 @@ pub(super) async fn run(state_path: &Path) -> Result<()> {
         .map_err(|error| anyhow!("connect to {endpoint}: {error}"))?;
     let token = exchange_client_credentials(
         channel.clone(),
-        required("ANVIL_V06_RESOURCE_CLIENT_ID")?,
-        required("ANVIL_V06_RESOURCE_CLIENT_SECRET")?,
+        required("KELDRA_V06_RESOURCE_CLIENT_ID")?,
+        required("KELDRA_V06_RESOURCE_CLIENT_SECRET")?,
     )
     .await
     .context("credential exchange failed")?
@@ -190,7 +190,7 @@ pub(super) async fn run(state_path: &Path) -> Result<()> {
         returned_hits: response.hits.len(),
         object_version: hit.object_version,
     };
-    let output = required("ANVIL_V09_RESOURCE_SINGLETON_PROBE_OUTPUT")?;
+    let output = required("KELDRA_V09_RESOURCE_SINGLETON_PROBE_OUTPUT")?;
     let encoded = serde_json::to_vec_pretty(&report)?;
     std::fs::write(&output, &encoded).with_context(|| format!("write probe report {output}"))?;
     println!("{}", String::from_utf8(encoded).expect("JSON is UTF-8"));

@@ -4,7 +4,7 @@ package keldra.v1;
 
 import "google/protobuf/timestamp.proto";
 
-// The public Anvil 0.9 network contract. Peer and storage-coordination services
+// The public Keldra 0.9 network contract. Peer and storage-coordination services
 // remain private. Ordinary object calls are independent. Only InvokeProgram
 // requests atomic multi-path visibility; indices are asynchronous derived views
 // over the same visible object state.
@@ -105,7 +105,7 @@ service AccountingService {
 }
 
 // Credential exchange is the only unauthenticated mutation. Long-lived client
-// credentials are verified against durable Anvil state and exchanged for a
+// credentials are verified against durable Keldra state and exchanged for a
 // short-lived bearer token. The deployment must protect this service with TLS
 // termination because the request contains a long-lived secret. QueryIndex may
 // also omit credentials, but then represents the caller as the fixed anonymous
@@ -114,7 +114,7 @@ service CredentialService {
   rpc ExchangeClientCredentials(ExchangeClientCredentialsRequest) returns (AccessToken);
 }
 
-// Small, typed management operations for Anvil's protected system realm.
+// Small, typed management operations for Keldra's protected system realm.
 // These RPCs do not bypass Zanzibar: each request is authorized against the
 // same protected realm used by object and authorization requests, and each
 // resulting ownership or grant is an ordinary system-realm tuple.
@@ -229,7 +229,7 @@ message IndexField {
 message PathIndexSpec {}
 
 message MetadataFilterIndexSpec {
-  // Names from Anvil's fixed object-head projection: path, version,
+  // Names from Keldra's fixed object-head projection: path, version,
   // content_type, content_length, content_hash, and committed_at_unix_millis.
   // These fields retain their kind-defined fixed schemas and capabilities;
   // arbitrary user metadata and Typed JSON capability declarations do not
@@ -714,7 +714,7 @@ message DeleteVersionRequest {
 
 message DeleteVersionResponse {
   bool deleted = 1;
-  // Present only when the target was the current live payload. Anvil removes
+  // Present only when the target was the current live payload. Keldra removes
   // that payload and publishes this fresh tombstone as the new head. Removing
   // a non-current version never changes the head.
   optional uint64 replacement_tombstone_version = 2;
@@ -989,7 +989,7 @@ message InvokeProgramRequest {
   // Exactly the 32-byte BLAKE3 hash returned by HeadObject for the pinned
   // immutable program definition.
   bytes program_hash = 3;
-  // UTF-8 JSON object containing arguments, inputs, blobs and bindings. Anvil
+  // UTF-8 JSON object containing arguments, inputs, blobs and bindings. Keldra
   // validates and canonicalizes it before deriving the invocation fingerprint.
   bytes input_json = 4;
   Durability durability = 5;
@@ -1030,7 +1030,7 @@ message AccessToken {
 // system#manage_system may perform this operation.
 message ProvisionTenantRequest {
   // Exact lowercase ASCII DNS label (1..63 bytes). The server rejects rather
-  // than normalizes other spellings. `_keldra` is reserved for Anvil's
+  // than normalizes other spellings. `_keldra` is reserved for Keldra's
   // protected system tenant. Once claimed, a name remains bound to its first
   // stable tenant identity even after any future tenant release.
   string storage_tenant = 1;
@@ -1047,7 +1047,7 @@ message ProvisionTenantResponse {
 
 // Application IDs and client IDs are cluster-wide authentication identities;
 // each is globally unique. An application has exactly one client credential
-// in Anvil 0.9. Supplying the same canonical application, client ID and secret is
+// in Keldra 0.9. Supplying the same canonical application, client ID and secret is
 // an idempotent replay.
 message CreateApplicationRequest {
   string app_id = 1;
@@ -1193,7 +1193,7 @@ message ApplicationRoleResponse {
 
 // The structural boundary for an authorization graph. `default` is the
 // conventional application realm. `_keldra/system` is deliberately
-// representable here because Anvil uses the same data model internally;
+// representable here because Keldra uses the same data model internally;
 // public calls targeting that reserved scope are rejected by the server. For
 // every public call, storage_tenant must equal the authenticated caller's
 // immutable storage tenant; spelling another tenant never changes identity.
@@ -1408,7 +1408,7 @@ message TupleFilter {
 
 message AuthzConsistency {
   // Latest evaluates the current authoritative revision. AtLeast evaluates
-  // current state only when it has reached the requested revision. Anvil 0.9
+  // current state only when it has reached the requested revision. Keldra 0.9
   // retains only current authorization state: Exact(current) succeeds and an
   // older exact revision fails with AUTHZ_REVISION_EXPIRED.
   oneof requirement {

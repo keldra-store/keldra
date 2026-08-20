@@ -31,8 +31,8 @@ use crate::{
 pub const LOGICAL_RECORD_FORMAT: u16 = 1;
 // These are persisted protocol domains, not product-facing branding. Changing
 // them would change the identity of records written by existing installations.
-const BASELINE_HASH_DOMAIN: &str = "anvil.logical-record-baseline.v1";
-const MUTATION_HASH_DOMAIN: &str = "anvil.logical-record-mutation.v1";
+const BASELINE_HASH_DOMAIN: &str = "keldra.logical-record-baseline.v1";
+const MUTATION_HASH_DOMAIN: &str = "keldra.logical-record-mutation.v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]

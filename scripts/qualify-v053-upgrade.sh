@@ -2,11 +2,11 @@
 set -Eeuo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-legacy_image="ghcr.io/worka-ai/anvil:0.5.3"
-candidate_image="${ANVIL_IMAGE:?ANVIL_IMAGE must name the already-built candidate image}"
-keep="${ANVIL_QUALIFICATION_KEEP:-0}"
+legacy_image="ghcr.io/worka-ai/keldra:0.5.3"
+candidate_image="${KELDRA_IMAGE:?KELDRA_IMAGE must name the already-built candidate image}"
+keep="${KELDRA_QUALIFICATION_KEEP:-0}"
 
-case "${ANVIL_DOCKER_PLATFORM:-}" in
+case "${KELDRA_DOCKER_PLATFORM:-}" in
   "")
     case "$(uname -m)" in
       x86_64|amd64) platform=linux/amd64 ;;
@@ -17,9 +17,9 @@ case "${ANVIL_DOCKER_PLATFORM:-}" in
         ;;
     esac
     ;;
-  linux/amd64|linux/arm64) platform="${ANVIL_DOCKER_PLATFORM}" ;;
+  linux/amd64|linux/arm64) platform="${KELDRA_DOCKER_PLATFORM}" ;;
   *)
-    echo "unsupported ANVIL_DOCKER_PLATFORM=${ANVIL_DOCKER_PLATFORM}" >&2
+    echo "unsupported KELDRA_DOCKER_PLATFORM=${KELDRA_DOCKER_PLATFORM}" >&2
     exit 2
     ;;
 esac
@@ -104,12 +104,12 @@ start_server() {
     --name "${container_name}" \
     --platform "${platform}" \
     --env RUST_LOG="${RUST_LOG:-info}" \
-    --env ANVIL_LISTEN=0.0.0.0:50051 \
-    --env ANVIL_PEER_LISTEN=127.0.0.1:50052 \
-    --env ANVIL_DATA_DIR=/var/lib/keldra \
-    --env ANVIL_NODE_ID=1 \
-    --env ANVIL_TOKEN_SIGNING_KEY_FILE=/run/secrets/keldra-token-signing-key \
-    --env ANVIL_RUN_SYSTEM_BOOTSTRAP=true \
+    --env KELDRA_LISTEN=0.0.0.0:50051 \
+    --env KELDRA_PEER_LISTEN=127.0.0.1:50052 \
+    --env KELDRA_DATA_DIR=/var/lib/keldra \
+    --env KELDRA_NODE_ID=1 \
+    --env KELDRA_TOKEN_SIGNING_KEY_FILE=/run/secrets/keldra-token-signing-key \
+    --env KELDRA_RUN_SYSTEM_BOOTSTRAP=true \
     --volume "${data_dir}:/var/lib/keldra" \
     --volume "${artifacts_dir}:/qualification/artifacts" \
     --volume "${signing_key}:/run/secrets/keldra-token-signing-key:ro" \
@@ -148,8 +148,8 @@ provision_owner() {
   local attempt
   local output=""
   for attempt in $(seq 1 90); do
-    if output="$(ANVIL_NEW_CLIENT_SECRET="${owner_secret}" docker exec \
-      --env ANVIL_NEW_CLIENT_SECRET \
+    if output="$(KELDRA_NEW_CLIENT_SECRET="${owner_secret}" docker exec \
+      --env KELDRA_NEW_CLIENT_SECRET \
       "${container_name}" \
       keldra --endpoint http://127.0.0.1:50051 \
         --credentials-file /var/lib/keldra/system-bootstrap-credential.json \
@@ -176,8 +176,8 @@ bucket=objects
 
 run_owner_cli() {
   docker exec \
-    --env "ANVIL_CLIENT_ID=${owner_client}" \
-    --env "ANVIL_CLIENT_SECRET=${owner_secret}" \
+    --env "KELDRA_CLIENT_ID=${owner_client}" \
+    --env "KELDRA_CLIENT_SECRET=${owner_secret}" \
     "${container_name}" \
     keldra --endpoint http://127.0.0.1:50051 "$@"
 }

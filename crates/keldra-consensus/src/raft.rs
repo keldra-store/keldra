@@ -116,7 +116,7 @@ struct LegacyMachineStateV2 {
     snapshot_generation: u64,
 }
 
-/// Exact state-machine layout written by Anvil 0.5.0 snapshots.
+/// Exact state-machine layout written by Keldra 0.5.0 snapshots.
 #[derive(Debug, Serialize, Deserialize)]
 struct LegacyStateMachineV050 {
     max_commit_entries: u32,
@@ -128,7 +128,7 @@ struct LegacyStateMachineV050 {
     finalized_through: Option<u64>,
 }
 
-/// Exact outer state layout written by Anvil 0.5.0 snapshots.
+/// Exact outer state layout written by Keldra 0.5.0 snapshots.
 #[derive(Debug, Serialize, Deserialize)]
 struct LegacyMachineStateV050 {
     decisions: LegacyStateMachineV050,

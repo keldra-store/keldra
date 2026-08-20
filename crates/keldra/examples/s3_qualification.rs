@@ -10,11 +10,11 @@ use aws_sdk_s3::primitives::ByteStream;
 type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 const OBJECT_KEY: &str = "qualification/payload.bin";
-const PAYLOAD: &[u8] = b"Anvil official AWS SDK qualification payload\0\x01\x02";
+const PAYLOAD: &[u8] = b"Keldra official AWS SDK qualification payload\0\x01\x02";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> TestResult<()> {
-    let endpoints = required("ANVIL_S3_QUALIFICATION_ENDPOINTS")?
+    let endpoints = required("KELDRA_S3_QUALIFICATION_ENDPOINTS")?
         .split(',')
         .map(str::to_owned)
         .collect::<Vec<_>>();
@@ -23,9 +23,9 @@ async fn main() -> TestResult<()> {
             "S3 qualification requires either one or three gateway endpoints",
         ));
     }
-    let client_id = required("ANVIL_S3_QUALIFICATION_CLIENT_ID")?;
-    let client_secret = required("ANVIL_S3_QUALIFICATION_CLIENT_SECRET")?;
-    let bucket = required("ANVIL_S3_QUALIFICATION_BUCKET")?;
+    let client_id = required("KELDRA_S3_QUALIFICATION_CLIENT_ID")?;
+    let client_secret = required("KELDRA_S3_QUALIFICATION_CLIENT_SECRET")?;
+    let bucket = required("KELDRA_S3_QUALIFICATION_BUCKET")?;
     let clients = endpoints
         .iter()
         .map(|endpoint| s3_client(endpoint, &client_id, &client_secret))

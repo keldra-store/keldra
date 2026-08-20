@@ -28,7 +28,7 @@ async fn real_git_client_pushes_pulls_and_clones_a_public_repository() {
     let work = tempfile::tempdir().unwrap();
     let source = work.path().join("source");
     git_ok(["init", "--initial-branch=master", path(&source)]).await;
-    git_ok(["-C", path(&source), "config", "user.name", "Anvil Test"]).await;
+    git_ok(["-C", path(&source), "config", "user.name", "Keldra Test"]).await;
     git_ok([
         "-C",
         path(&source),
@@ -37,7 +37,7 @@ async fn real_git_client_pushes_pulls_and_clones_a_public_repository() {
         "keldra@example.invalid",
     ])
     .await;
-    tokio::fs::write(source.join("README.md"), b"hello from Anvil Git\n")
+    tokio::fs::write(source.join("README.md"), b"hello from Keldra Git\n")
         .await
         .unwrap();
     git_ok(["-C", path(&source), "add", "README.md"]).await;
@@ -71,7 +71,7 @@ async fn real_git_client_pushes_pulls_and_clones_a_public_repository() {
         tokio::fs::read(authenticated_clone.join("README.md"))
             .await
             .unwrap(),
-        b"hello from Anvil Git\n"
+        b"hello from Keldra Git\n"
     );
 
     let public = format!("http://{}/git/acme/repositories/demo.git", fixture.gateway);
@@ -85,7 +85,7 @@ async fn real_git_client_pushes_pulls_and_clones_a_public_repository() {
         tokio::fs::read(public_clone.join("README.md"))
             .await
             .unwrap(),
-        b"hello from Anvil Git\n"
+        b"hello from Keldra Git\n"
     );
 
     fixture.stop().await;
@@ -296,7 +296,7 @@ async fn connect_when_ready(listen: SocketAddr) -> Channel {
             Err(_) if Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
-            Err(error) => panic!("Anvil test server did not start: {error}"),
+            Err(error) => panic!("Keldra test server did not start: {error}"),
         }
     }
 }
@@ -309,7 +309,7 @@ async fn wait_for_http(listen: SocketAddr) {
             Err(_) if Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
-            Err(error) => panic!("Anvil HTTP gateway did not start: {error}"),
+            Err(error) => panic!("Keldra HTTP gateway did not start: {error}"),
         }
     }
 }

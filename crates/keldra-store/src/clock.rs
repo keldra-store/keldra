@@ -58,7 +58,7 @@ impl VersionClock {
 
     fn next_at(&self, unix_millis: u64) -> Result<VersionId> {
         if unix_millis < CUSTOM_EPOCH_MILLIS {
-            bail!("system clock predates the Anvil version epoch");
+            bail!("system clock predates the Keldra version epoch");
         }
         let mut state = self.state.lock().expect("version clock poisoned");
         let mut logical = unix_millis.saturating_sub(CUSTOM_EPOCH_MILLIS);

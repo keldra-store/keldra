@@ -10,7 +10,7 @@ use super::{
 
 /// Storage-neutral access to one exact ordinary-object artifact reference.
 ///
-/// Anvil's implementation verifies the referenced object path, version,
+/// Keldra's implementation verifies the referenced object path, version,
 /// content hash, and length before opening the descriptor's checked range.
 /// The index crate therefore owns codecs and traversal without owning storage,
 /// placement, caching, or authority.
@@ -19,7 +19,7 @@ pub trait ArtifactDirectoryRead: Send + Sync {
 
     /// Maximum independent segment queries this directory can sustain at
     /// once. The default keeps embedders deterministic and single-threaded;
-    /// Anvil reports the size of its process-owned index CPU pool.
+    /// Keldra reports the size of its process-owned index CPU pool.
     fn query_parallelism(&self) -> usize {
         1
     }
@@ -30,7 +30,7 @@ pub trait ArtifactDirectoryRead: Send + Sync {
     ) -> impl Future<Output = Result<Self::File, IndexError>> + Send;
 
     /// Execute one finite owned CPU chunk after asynchronous artifact reads
-    /// complete. Production implementations route this to Anvil's one
+    /// complete. Production implementations route this to Keldra's one
     /// process-owned CPU pool; tests and simple embedders may run inline.
     fn run_query_cpu<T, F>(&self, work: F) -> impl Future<Output = Result<T, IndexError>> + Send
     where

@@ -40,9 +40,9 @@ RUN --mount=type=cache,id=keldra-cargo-registry,target=/usr/local/cargo/registry
 # Rust tooling is deliberately absent from the matching target-platform
 # runtime image.
 FROM --platform=$TARGETPLATFORM debian:trixie-slim
-ARG ANVIL_SOURCE_REVISION=unknown
+ARG KELDRA_SOURCE_REVISION=unknown
 
-LABEL org.opencontainers.image.revision="${ANVIL_SOURCE_REVISION}"
+LABEL org.opencontainers.image.revision="${KELDRA_SOURCE_REVISION}"
 LABEL org.opencontainers.image.title="Keldra"
 LABEL org.opencontainers.image.source="https://github.com/keldra-store/keldra"
 
@@ -62,23 +62,23 @@ COPY --from=builder /usr/local/keldra-build/keldra /usr/local/bin/keldra
 COPY --from=builder /usr/src/keldra/LICENSE /usr/share/doc/keldra/LICENSE
 COPY --from=builder /usr/src/keldra/docs/dependency-licenses.md /usr/share/doc/keldra/dependency-licenses.md
 
-ENV ANVIL_LISTEN=0.0.0.0:50051 \
-    ANVIL_DATA_DIR=/var/lib/keldra \
-    ANVIL_NODE_ID=1 \
-    ANVIL_TOKEN_SIGNING_KEY_FILE=/run/secrets/keldra-token-signing-key \
-    ANVIL_MAX_ATOMIC_COMMIT_ENTRIES=4096 \
-    ANVIL_MAX_ATOMIC_COMMIT_BYTES=16777216 \
-    ANVIL_AWAITING_PUBLISH_TTL_SECONDS=86400 \
-    ANVIL_MUTATION_RECEIPT_RETENTION_SECONDS=86400 \
-    ANVIL_MAX_MUTATION_RECEIPT_ENTRIES=2000000 \
-    ANVIL_MAX_MUTATION_RECEIPT_BYTES=536870912 \
-    ANVIL_SOURCE_JOURNAL_MAX_ENTRIES=1000000 \
-    ANVIL_SOURCE_JOURNAL_MAX_BYTES=536870912
+ENV KELDRA_LISTEN=0.0.0.0:50051 \
+    KELDRA_DATA_DIR=/var/lib/keldra \
+    KELDRA_NODE_ID=1 \
+    KELDRA_TOKEN_SIGNING_KEY_FILE=/run/secrets/keldra-token-signing-key \
+    KELDRA_MAX_ATOMIC_COMMIT_ENTRIES=4096 \
+    KELDRA_MAX_ATOMIC_COMMIT_BYTES=16777216 \
+    KELDRA_AWAITING_PUBLISH_TTL_SECONDS=86400 \
+    KELDRA_MUTATION_RECEIPT_RETENTION_SECONDS=86400 \
+    KELDRA_MAX_MUTATION_RECEIPT_ENTRIES=2000000 \
+    KELDRA_MAX_MUTATION_RECEIPT_BYTES=536870912 \
+    KELDRA_SOURCE_JOURNAL_MAX_ENTRIES=1000000 \
+    KELDRA_SOURCE_JOURNAL_MAX_BYTES=536870912
 USER keldra
 WORKDIR /var/lib/keldra
 
 # Mount a distinct mode-0600 signing key at the configured path. On the first
-# start only, set ANVIL_RUN_SYSTEM_BOOTSTRAP=true and then copy and delete the
+# start only, set KELDRA_RUN_SYSTEM_BOOTSTRAP=true and then copy and delete the
 # generated /var/lib/keldra/system-bootstrap-credential.json file.
 # Public gRPC, S3 and Git share 50051. Cluster-managed mTLS peers use 50052.
 EXPOSE 50051 50052

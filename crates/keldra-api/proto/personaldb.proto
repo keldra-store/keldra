@@ -3,7 +3,7 @@ syntax = "proto3";
 package keldra.v1;
 
 // PersonalDB stores its canonical protocol evidence and SQLite changesets as
-// ordinary Anvil objects. The server witnesses one predecessor-linked history
+// ordinary Keldra objects. The server witnesses one predecessor-linked history
 // per database group; it does not execute application SQL.
 service PersonalDbService {
   rpc CreateGroup(CreatePersonalDbGroupRequest) returns (PersonalDbGroup);
@@ -13,7 +13,7 @@ service PersonalDbService {
   rpc RevokeGroupRole(ChangePersonalDbGroupRoleRequest) returns (PersonalDbGroupRoleChange);
   rpc AppendEntry(AppendPersonalDbEntryRequest) returns (PersonalDbCommit);
   // Projection materialisation is explicit. An authorised caller selects a
-  // source checkpoint; Anvil derives, signs and commits the bounded mirror
+  // source checkpoint; Keldra derives, signs and commits the bounded mirror
   // output. The caller never supplies projection changesets.
   rpc MaterializeProjection(MaterializePersonalDbProjectionRequest) returns (PersonalDbMaterialization);
   rpc CatchUp(PersonalDbCatchUpRequest) returns (stream PersonalDbCanonicalFrame);
@@ -34,7 +34,7 @@ message CreatePersonalDbGroupRequest {
   string group_id = 3;
   PersonalDbGroupKind kind = 4;
   bytes schema_hash_sha256 = 5;
-  // Required only for a projection group. Anvil supports the deliberately
+  // Required only for a projection group. Keldra supports the deliberately
   // bounded mirror template in 0.5.3 and produces its output from source log
   // entries; callers never submit projection changesets.
   PersonalDbMirrorProjectionDefinition mirror_projection = 6;
@@ -57,7 +57,7 @@ message PersonalDbGroup {
   // Canonical personaldb-protocol GroupDescriptor bytes.
   bytes descriptor = 1;
   // Canonical JSON PublicKeyTrustRecord values required to verify descriptors,
-  // commit evidence, projection derivations and snapshots returned by Anvil.
+  // commit evidence, projection derivations and snapshots returned by Keldra.
   repeated bytes trust_records_json = 2;
   bool replayed = 3;
 }
