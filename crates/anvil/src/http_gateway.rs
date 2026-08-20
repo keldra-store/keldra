@@ -60,7 +60,7 @@ impl PublicServer {
                 .await
                 .context("serve public listener")
         });
-        tracing::info!(%address, "Anvil public gRPC, S3, and Git listener started");
+        tracing::info!(%address, "Keldra public gRPC and HTTP gateway listener started");
         Ok(Self {
             shutdown: Some(shutdown),
             task,

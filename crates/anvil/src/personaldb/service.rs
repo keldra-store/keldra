@@ -635,7 +635,7 @@ impl PersonalDbServiceImpl {
             self.require_manager(&scope).await?
         };
         self.control
-            .require_personaldb_application(scope.caller.storage_tenant(), &call.request.app_id)
+            .require_application(scope.caller.storage_tenant(), &call.request.app_id)
             .await?;
         let subject = ObjectRef::opaque("app", call.request.app_id.clone())
             .map_err(crate::authz_api::authz_status)?;

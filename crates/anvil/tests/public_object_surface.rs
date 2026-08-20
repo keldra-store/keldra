@@ -1454,6 +1454,7 @@ fn test_server_config(
         token_manager,
         rate_limits: RateLimitConfig::default(),
         index_runtime: anvil::IndexRuntimeConfig::default(),
+        plugin_gateway: anvil::PluginGatewayConfig::default(),
         max_blob_bytes: 1024 * 1024,
         erasure_profile: anvil_store::ErasureProfile::default(),
         awaiting_publish_ttl_seconds: anvil_store::DEFAULT_AWAITING_PUBLISH_TTL_SECONDS,

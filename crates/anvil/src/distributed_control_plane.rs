@@ -1404,7 +1404,7 @@ impl DistributedControlPlane {
         Ok(receipt)
     }
 
-    pub(crate) async fn require_personaldb_application(
+    pub(crate) async fn require_application(
         &self,
         storage_tenant: &StorageTenantId,
         app_id: &str,

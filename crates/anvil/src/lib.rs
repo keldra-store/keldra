@@ -44,6 +44,7 @@ mod payload_read_transport;
 mod peer_runtime;
 mod personaldb;
 mod placement;
+mod plugin_gateway;
 mod programs;
 #[allow(
     dead_code,
@@ -77,6 +78,7 @@ use mutation_admission::{AdmissionSurface, MutationAdmissionService};
 use startup_scan_evidence::StartupScanEvidence;
 
 pub use index_config::{IndexRuntimeConfig, IndexRuntimeConfigError};
+pub use plugin_gateway::PluginGatewayConfig;
 pub use storage_layout::{ExplicitAuthoritativePaths, StoragePaths};
 pub use v05::ObjectServiceImpl;
 
@@ -110,6 +112,7 @@ pub struct ServerConfig {
     pub token_manager: JwtManager,
     pub rate_limits: RateLimitConfig,
     pub index_runtime: IndexRuntimeConfig,
+    pub plugin_gateway: PluginGatewayConfig,
     pub max_blob_bytes: u64,
     pub erasure_profile: ErasureProfile,
     pub awaiting_publish_ttl_seconds: u64,
@@ -551,7 +554,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         mutation_admission: mutation_admission.clone(),
     };
     let git_state = git_gateway::GitGatewayState {
-        objects: gateway_objects,
+        objects: gateway_objects.clone(),
         control: distributed_control.clone(),
         tokens: config.token_manager.clone(),
         rate_limits: request_rate_limits.clone(),
@@ -562,6 +565,14 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         lock: Arc::new(tokio::sync::Mutex::new(())),
         basic_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
+    let plugin_state = plugin_gateway::PluginGatewayState::new(
+        gateway_objects,
+        distributed_control.clone(),
+        config.token_manager.clone(),
+        request_rate_limits.clone(),
+        serving_fence.authority(),
+        config.plugin_gateway.clone(),
+    );
     routed_public_handlers
         .install(object_service.routed_public_handler())
         .map_err(|_| anyhow::anyhow!("routed public handler was installed more than once"))?;
@@ -700,7 +711,9 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         // requires the node-wide serving fence.
         .add_service(credential_service)
         .into_axum_router();
-    let gateway_router = s3::router(s3_state).merge(git_gateway::router(git_state));
+    let gateway_router = plugin_gateway::router(plugin_state)
+        .merge(s3::router(s3_state))
+        .merge(git_gateway::router(git_state));
     let startup_boundary = startup_scan_evidence.clone();
     let mut public_server =
         http_gateway::PublicServer::start(config.listen, grpc_router, gateway_router, move || {
@@ -715,7 +728,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
             );
         })
         .await
-        .context("start public gRPC, S3, and Git listener")?;
+        .context("start public gRPC and HTTP gateway listener")?;
     index_runtime
         .start_cache_reconciler()
         .context("start bounded index cache reconciliation")?;

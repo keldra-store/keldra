@@ -4,7 +4,10 @@ use std::path::PathBuf;
 
 use anvil::authentication::{JwtManager, RateLimitConfig, load_token_signing_key};
 use anvil::observability::{Observability, ObservabilityConfig};
-use anvil::{ExplicitAuthoritativePaths, IndexRuntimeConfig, ServerConfig, StoragePaths, serve};
+use anvil::{
+    ExplicitAuthoritativePaths, IndexRuntimeConfig, PluginGatewayConfig, ServerConfig,
+    StoragePaths, serve,
+};
 use anvil_index::IndexKind;
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -99,6 +102,22 @@ struct Arguments {
 
     #[arg(long, env = "ANVIL_TOKEN_SIGNING_KEY_FILE")]
     token_signing_key_file: PathBuf,
+
+    /// DNS suffix used by HTTP plugins: <bucket>.<tenant>.<domain>.
+    #[arg(long, env = "KELDRA_PUBLIC_BASE_DOMAIN")]
+    public_base_domain: Option<String>,
+
+    /// Scheme advertised by plugin authentication challenges.
+    #[arg(long, env = "KELDRA_PUBLIC_SCHEME", default_value = "https")]
+    public_scheme: String,
+
+    /// Installed HTTP plugin origin in name@version=http://host:port form.
+    #[arg(
+        long = "http-plugin",
+        env = "KELDRA_HTTP_PLUGINS",
+        value_delimiter = ','
+    )]
+    http_plugins: Vec<String>,
 
     #[arg(
         long,
@@ -709,6 +728,11 @@ async fn main() -> Result<()> {
     let (storage, explicit_authoritative_paths) = arguments.storage_paths();
     let erasure_profile = arguments.erasure_profile()?;
     let index_runtime = arguments.index_runtime_config()?;
+    let plugin_gateway = PluginGatewayConfig::new(
+        arguments.public_base_domain.clone(),
+        Some(arguments.public_scheme.clone()),
+        arguments.http_plugins.clone(),
+    )?;
     let signing_key =
         load_token_signing_key(&arguments.token_signing_key_file).with_context(|| {
             format!(
@@ -752,6 +776,7 @@ async fn main() -> Result<()> {
             keyed_cleanup_interval: arguments.rate_limit_keyed_cleanup_interval,
         },
         index_runtime,
+        plugin_gateway,
         max_blob_bytes: arguments.max_blob_bytes,
         erasure_profile,
         awaiting_publish_ttl_seconds: arguments.awaiting_publish_ttl_seconds,

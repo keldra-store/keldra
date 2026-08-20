@@ -249,93 +249,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "keldra-server"
-version = "0.9.4"
-dependencies = [
- "aes-gcm",
- "anvil-api",
- "anvil-atomic-program",
- "anvil-authz",
- "anvil-consensus",
- "anvil-index",
- "keldra",
- "anvil-store",
- "anyhow",
- "async-stream",
- "aws-credential-types",
- "aws-sdk-s3",
- "aws-sigv4",
- "aws-smithy-runtime-api",
- "axum",
- "base64",
- "blake3",
- "bytes",
- "clap",
- "ed25519-dalek",
- "getrandom 0.3.4",
- "governor",
- "hex",
- "hmac 0.12.1",
- "http-body-util",
- "hyper-util",
- "jsonwebtoken",
- "libc",
- "memmap2",
- "opentelemetry",
- "opentelemetry-otlp",
- "opentelemetry_sdk",
- "personaldb-protocol",
- "prost",
- "prost-types",
- "rayon",
- "rcgen",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "subtle",
- "tempfile",
- "thiserror 2.0.19",
- "time",
- "tokio",
- "tokio-rustls 0.26.4",
- "tokio-stream",
- "tonic",
- "tonic-prost",
- "tonic-prost-build",
- "tower",
- "tracing",
- "tracing-opentelemetry",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "keldra"
-version = "0.9.4"
-dependencies = [
- "anvil-api",
- "tokio",
- "tokio-stream",
- "tonic",
-]
-
-[[package]]
-name = "keldra-cli"
-version = "0.9.4"
-dependencies = [
- "keldra",
- "anyhow",
- "blake3",
- "clap",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-stream",
- "tonic",
-]
-
-[[package]]
 name = "anvil-store"
 version = "0.9.4"
 dependencies = [
@@ -2852,6 +2765,94 @@ dependencies = [
  "serde",
  "serde_json",
  "simple_asn1",
+]
+
+[[package]]
+name = "keldra"
+version = "0.9.4"
+dependencies = [
+ "anvil-api",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+]
+
+[[package]]
+name = "keldra-cli"
+version = "0.9.4"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "clap",
+ "keldra",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+]
+
+[[package]]
+name = "keldra-server"
+version = "0.9.4"
+dependencies = [
+ "aes-gcm",
+ "anvil-api",
+ "anvil-atomic-program",
+ "anvil-authz",
+ "anvil-consensus",
+ "anvil-index",
+ "anvil-store",
+ "anyhow",
+ "async-stream",
+ "aws-credential-types",
+ "aws-sdk-s3",
+ "aws-sigv4",
+ "aws-smithy-runtime-api",
+ "axum",
+ "base64",
+ "blake3",
+ "bytes",
+ "clap",
+ "ed25519-dalek",
+ "getrandom 0.3.4",
+ "governor",
+ "hex",
+ "hmac 0.12.1",
+ "http-body-util",
+ "hyper 1.11.0",
+ "hyper-util",
+ "jsonwebtoken",
+ "keldra",
+ "libc",
+ "memmap2",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "personaldb-protocol",
+ "prost",
+ "prost-types",
+ "rayon",
+ "rcgen",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.19",
+ "time",
+ "tokio",
+ "tokio-rustls 0.26.4",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tower",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

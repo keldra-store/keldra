@@ -45,7 +45,8 @@ governor = "=0.10.4"
 hex = "0.4"
 hmac = "0.12.1"
 http-body-util = "0.1.1"
-hyper-util = { version = "0.1", features = ["tokio"] }
+hyper = { version = "1", features = ["client", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"] }
 jsonwebtoken = "9.3"
 libc = "0.2"
 memmap2 = "0.9"
