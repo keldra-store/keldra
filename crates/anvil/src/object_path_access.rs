@@ -10,11 +10,13 @@ use anvil_store::{DefinitionMutationIntent, ObjectKey};
 use tonic::{Request, Status};
 
 const PROGRAM_DEFINITION_PREFIX: &str = "_anvil/programs/";
+const PLUGIN_BINDING_PREFIX: &str = "_anvil/plugins/";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ObjectPathClass {
     Public,
     ProgramDefinition,
+    PluginBinding,
     Internal,
 }
 
@@ -115,7 +117,9 @@ pub(crate) fn require_public_key(key: &ObjectKey) -> Result<(), Status> {
 
 pub(crate) fn require_path(access: &ObjectPathAccess, path: &str) -> Result<(), Status> {
     match classify(path) {
-        ObjectPathClass::Public | ObjectPathClass::ProgramDefinition => Ok(()),
+        ObjectPathClass::Public
+        | ObjectPathClass::ProgramDefinition
+        | ObjectPathClass::PluginBinding => Ok(()),
         ObjectPathClass::Internal if access.internal => Ok(()),
         ObjectPathClass::Internal => Err(Status::permission_denied(
             "the addressed object path is reserved for an internal Anvil capability",
@@ -158,11 +162,33 @@ pub(crate) fn validate_definition_intents(
 fn classify(path: &str) -> ObjectPathClass {
     if is_program_definition(path) {
         ObjectPathClass::ProgramDefinition
+    } else if is_plugin_binding(path) {
+        ObjectPathClass::PluginBinding
     } else if path.split('/').any(|segment| segment == "_anvil") {
         ObjectPathClass::Internal
     } else {
         ObjectPathClass::Public
     }
+}
+
+pub(crate) fn is_plugin_binding(path: &str) -> bool {
+    let Some(name_and_version) = path.strip_prefix(PLUGIN_BINDING_PREFIX) else {
+        return false;
+    };
+    !name_and_version.contains('/')
+        && name_and_version.matches('@').count() == 1
+        && name_and_version
+            .split_once('@')
+            .is_some_and(|(name, version)| {
+                canonical_plugin_component(name) && canonical_plugin_component(version)
+            })
+}
+
+fn canonical_plugin_component(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 fn is_program_definition(path: &str) -> bool {
@@ -203,6 +229,27 @@ mod tests {
             "_anvil/indices/v3/7/current",
             "_anvil/internal/00",
             "objects/_anvil/meta.json",
+        ] {
+            assert_eq!(
+                require_key(&public, &key(path)).unwrap_err().code(),
+                tonic::Code::PermissionDenied,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_exact_versioned_plugin_bindings_are_public_reserved_paths() {
+        let public = access_for(&Request::new(()));
+        assert!(require_key(&public, &key("_anvil/plugins/oci@1")).is_ok());
+
+        for path in [
+            "_anvil/plugins/oci",
+            "_anvil/plugins/@1",
+            "_anvil/plugins/oci@",
+            "_anvil/plugins/oci@1/config",
+            "_anvil/plugins/oci@1@copy",
+            "_anvil/plugins/oci plugin@1",
         ] {
             assert_eq!(
                 require_key(&public, &key(path)).unwrap_err().code(),

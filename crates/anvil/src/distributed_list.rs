@@ -343,9 +343,18 @@ impl AuthoritativeListAuthorizer for CoordinatedListAuthorizer {
                     .map_err(|error| Status::invalid_argument(error.to_string()))?,
             )
         } else {
-            self.tokens
-                .verify(bearer.signed_token())
-                .map_err(|_| Status::unauthenticated("the bearer token is invalid or expired"))?
+            let (caller, plugin_scope) = self
+                .tokens
+                .verify_object_bearer(bearer.signed_token())
+                .map_err(|_| Status::unauthenticated("the bearer token is invalid or expired"))?;
+            if let Some(scope) = plugin_scope
+                && !scope.allows_prefix(query.tenant(), query.bucket(), query.prefix())
+            {
+                return Err(Status::permission_denied(
+                    "plugin object token does not cover the listed prefix",
+                ));
+            }
+            caller
         };
         if caller.storage_tenant().as_str() != query.tenant() {
             return Err(Status::permission_denied(

@@ -5,12 +5,14 @@ pub(super) async fn start_put(
     request: Request<PutHeader>,
 ) -> Result<Response<PutToken>, Status> {
     let path_access = object_path_access::access_for(&request);
+    let plugin_scope = plugin_object_scope(&request);
     let surface = UploadSurface::from_internal(object_path_access::is_internal(&path_access));
     let started = Instant::now();
     let result = async {
         let caller = authenticated_caller(&request)?;
         let metadata = put_metadata(request.into_inner())?;
         object_path_access::require_key(&path_access, &metadata.key)?;
+        require_plugin_key_scope(plugin_scope.as_ref(), &metadata.key)?;
         service
             .authorize_object(&caller, &metadata.key, ObjectPermission::Put)
             .await?;
@@ -31,6 +33,7 @@ pub(super) async fn put(
     request: Request<Streaming<ApiPutRequest>>,
 ) -> Result<Response<PutToken>, Status> {
     let path_access = object_path_access::access_for(&request);
+    let plugin_scope = plugin_object_scope(&request);
     let surface = UploadSurface::from_internal(object_path_access::is_internal(&path_access));
     let started = Instant::now();
     let mut received_bytes = 0_u64;
@@ -47,6 +50,7 @@ pub(super) async fn put(
         let header = require_upload_phase(capability)?;
         let metadata = header.to_metadata()?;
         object_path_access::require_key(&path_access, &metadata.key)?;
+        require_plugin_key_scope(plugin_scope.as_ref(), &metadata.key)?;
         service
             .authorize_object(&caller, &metadata.key, ObjectPermission::Put)
             .await?;
@@ -108,6 +112,7 @@ pub(super) async fn put_end(
         .get::<routed_writes::RoutedDestination>()
         .is_some();
     let path_access = object_path_access::access_for(&request);
+    let plugin_scope = plugin_object_scope(&request);
     let surface = if peer_routed {
         UploadSurface::Peer
     } else {
@@ -125,6 +130,7 @@ pub(super) async fn put_end(
         payload_bytes = ready.blob_length;
         let metadata = ready.header.to_metadata()?;
         object_path_access::require_key(&path_access, &metadata.key)?;
+        require_plugin_key_scope(plugin_scope.as_ref(), &metadata.key)?;
         service
             .authorize_object(&caller, &metadata.key, ObjectPermission::Put)
             .await?;

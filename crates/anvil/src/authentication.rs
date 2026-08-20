@@ -39,6 +39,9 @@ const MIN_SIGNING_KEY_BYTES: usize = 32;
 const MAX_SIGNING_KEY_BYTES: u64 = 4 * 1024;
 const ACCESS_TOKEN_AUDIENCE: &str = "anvil-access";
 const ACCESS_TOKEN_PURPOSE: &str = "access";
+const PLUGIN_TOKEN_AUDIENCE: &str = "keldra-plugin-object";
+const PLUGIN_TOKEN_PURPOSE: &str = "plugin-object";
+const PLUGIN_TOKEN_LIFETIME: Duration = Duration::from_secs(5 * 60);
 const PUT_TOKEN_AUDIENCE: &str = "anvil-put";
 const PUT_TOKEN_PURPOSE: &str = "put";
 const JWT_SIGNING_KEY_FINGERPRINT_CONTEXT: &str = "anvil.auth/jwt-signing-key/v1";
@@ -68,6 +71,30 @@ pub(crate) struct AnonymousObjectRequest;
 /// management RPC continues to require an authenticated [`Caller`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AnonymousIndexRequest;
+
+/// A signed, additional restriction on one plugin service application's
+/// ordinary Zanzibar authority. It never grants access by itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PluginObjectScope {
+    tenant: StorageTenantId,
+    bucket: String,
+    path_prefix: String,
+}
+
+impl PluginObjectScope {
+    pub(crate) fn allows(&self, tenant: &str, bucket: &str, path: &str) -> bool {
+        self.tenant.as_str() == tenant
+            && self.bucket == bucket
+            && (path == self.path_prefix
+                || path
+                    .strip_prefix(&self.path_prefix)
+                    .is_some_and(|suffix| suffix.starts_with('/')))
+    }
+
+    pub(crate) fn allows_prefix(&self, tenant: &str, bucket: &str, prefix: &str) -> bool {
+        self.allows(tenant, bucket, prefix)
+    }
+}
 
 /// Explicit server rate-limit policy. All values are non-zero so a deployed
 /// server cannot accidentally construct a disabled or unusable GCRA quota.
@@ -190,7 +217,14 @@ impl RequestRateLimits {
             request.extensions_mut().insert(AnonymousObjectRequest);
             return Ok(request);
         }
-        self.authenticate_after_global_limit(tokens, request)
+        let request = tokens.authenticate_object(request)?;
+        let caller = request
+            .extensions()
+            .get::<Caller>()
+            .ok_or_else(|| Status::internal("authenticated caller identity was not installed"))?;
+        check_keyed(&self.authenticated, caller, "authenticated caller")?;
+        self.retain_authenticated_recently();
+        Ok(request)
     }
 
     /// Applies the normal authenticated path when a bearer is present and
@@ -424,6 +458,7 @@ pub struct JwtManager {
     encoding_key: Arc<EncodingKey>,
     decoding_key: Arc<DecodingKey>,
     access_validation: Arc<Validation>,
+    plugin_validation: Arc<Validation>,
     put_validation: Arc<Validation>,
     watch_checkpoint_validation: Arc<Validation>,
     index_page_validation: Arc<Validation>,
@@ -461,6 +496,19 @@ impl std::fmt::Debug for JwtManager {
 struct AccessTokenClaims {
     sub: String,
     storage_tenant: String,
+    exp: u64,
+    jti: String,
+    aud: String,
+    purpose: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PluginTokenClaims {
+    sub: String,
+    storage_tenant: String,
+    bucket: String,
+    path_prefix: String,
+    iat: u64,
     exp: u64,
     jti: String,
     aud: String,
@@ -510,6 +558,7 @@ impl JwtManager {
             encoding_key: Arc::new(EncodingKey::from_secret(signing_secret)),
             decoding_key: Arc::new(DecodingKey::from_secret(signing_secret)),
             access_validation: Arc::new(token_validation(ACCESS_TOKEN_AUDIENCE)),
+            plugin_validation: Arc::new(token_validation(PLUGIN_TOKEN_AUDIENCE)),
             put_validation: Arc::new(token_validation(PUT_TOKEN_AUDIENCE)),
             watch_checkpoint_validation: Arc::new(watch_checkpoint_validation()),
             index_page_validation: Arc::new(index_page_validation()),
@@ -627,6 +676,119 @@ impl JwtManager {
         let tenant = StorageTenantId::parse(token.claims.storage_tenant)
             .map_err(|error| AuthenticationError::InvalidIdentity(error.to_string()))?;
         Caller::from_authenticated_application(tenant, token.claims.sub)
+    }
+
+    /// Mints a short-lived Object-service token for one plugin application and
+    /// one exact bucket-relative root. Zanzibar remains independently required.
+    pub(crate) fn mint_plugin_token(
+        &self,
+        storage_tenant: StorageTenantId,
+        app_id: impl Into<String>,
+        bucket: impl Into<String>,
+        path_prefix: impl Into<String>,
+    ) -> Result<String, AuthenticationError> {
+        let app_id = app_id.into();
+        let bucket = bucket.into();
+        let path_prefix = path_prefix.into();
+        let _caller =
+            Caller::from_authenticated_application(storage_tenant.clone(), app_id.clone())?;
+        if bucket.is_empty()
+            || path_prefix.is_empty()
+            || path_prefix.starts_with('/')
+            || path_prefix.ends_with('/')
+            || path_prefix.split('/').any(|segment| {
+                segment.is_empty() || segment == "." || segment == ".." || segment == "_anvil"
+            })
+        {
+            return Err(AuthenticationError::InvalidIdentity(
+                "plugin object scope is not a canonical public path prefix".into(),
+            ));
+        }
+        let now = unix_seconds()?;
+        let exp = now
+            .checked_add(PLUGIN_TOKEN_LIFETIME.as_secs())
+            .ok_or(AuthenticationError::TimestampOverflow)?;
+        encode(
+            &Header::new(Algorithm::HS256),
+            &PluginTokenClaims {
+                sub: app_id,
+                storage_tenant: storage_tenant.as_str().to_owned(),
+                bucket,
+                path_prefix,
+                iat: now,
+                exp,
+                jti: uuid::Uuid::new_v4().to_string(),
+                aud: PLUGIN_TOKEN_AUDIENCE.into(),
+                purpose: PLUGIN_TOKEN_PURPOSE.into(),
+            },
+            self.encoding_key.as_ref(),
+        )
+        .map_err(AuthenticationError::Encode)
+    }
+
+    fn verify_plugin_token(
+        &self,
+        token: &str,
+    ) -> Result<(Caller, PluginObjectScope), AuthenticationError> {
+        let token = decode::<PluginTokenClaims>(
+            token,
+            self.decoding_key.as_ref(),
+            self.plugin_validation.as_ref(),
+        )
+        .map_err(AuthenticationError::Verify)?;
+        if token.claims.purpose != PLUGIN_TOKEN_PURPOSE
+            || token.claims.exp.checked_sub(token.claims.iat)
+                != Some(PLUGIN_TOKEN_LIFETIME.as_secs())
+            || token.claims.iat > unix_seconds()?
+        {
+            return Err(AuthenticationError::WrongTokenPurpose);
+        }
+        let tenant = StorageTenantId::parse(token.claims.storage_tenant)
+            .map_err(|error| AuthenticationError::InvalidIdentity(error.to_string()))?;
+        let caller =
+            Caller::from_authenticated_application(tenant.clone(), token.claims.sub.clone())?;
+        let scope = PluginObjectScope {
+            tenant,
+            bucket: token.claims.bucket,
+            path_prefix: token.claims.path_prefix,
+        };
+        if scope.bucket.is_empty()
+            || scope.path_prefix.is_empty()
+            || scope.path_prefix.starts_with('/')
+            || scope.path_prefix.ends_with('/')
+            || scope.path_prefix.split('/').any(|segment| {
+                segment.is_empty() || segment == "." || segment == ".." || segment == "_anvil"
+            })
+        {
+            return Err(AuthenticationError::InvalidIdentity(
+                "plugin object scope is malformed".into(),
+            ));
+        }
+        Ok((caller, scope))
+    }
+
+    pub(crate) fn verify_object_bearer(
+        &self,
+        token: &str,
+    ) -> Result<(Caller, Option<PluginObjectScope>), AuthenticationError> {
+        match self.verify(token) {
+            Ok(caller) => Ok((caller, None)),
+            Err(_) => self
+                .verify_plugin_token(token)
+                .map(|(caller, scope)| (caller, Some(scope))),
+        }
+    }
+
+    fn authenticate_object<T>(&self, mut request: Request<T>) -> Result<Request<T>, Status> {
+        let token = bearer_token(request.metadata())?;
+        let (caller, scope) = self
+            .verify_object_bearer(token)
+            .map_err(|_| Status::unauthenticated("the bearer token is invalid or expired"))?;
+        request.extensions_mut().insert(caller);
+        if let Some(scope) = scope {
+            request.extensions_mut().insert(scope);
+        }
+        Ok(request)
     }
 
     /// Mints a five-minute admission token containing the complete canonical
@@ -747,28 +909,31 @@ impl JwtManager {
     /// the tonic request. Apply this only to protected services; token exchange
     /// remains a separate unauthenticated service boundary.
     pub fn authenticate<T>(&self, mut request: Request<T>) -> Result<Request<T>, Status> {
-        let mut authorization = request.metadata().get_all("authorization").iter();
-        let value = authorization
-            .next()
-            .ok_or_else(|| Status::unauthenticated("a bearer token is required"))?;
-        if authorization.next().is_some() {
-            return Err(Status::unauthenticated(
-                "exactly one bearer token is required",
-            ));
-        }
-        let value = value
-            .to_str()
-            .map_err(|_| Status::unauthenticated("the bearer token is malformed"))?;
-        let token = value
-            .strip_prefix("Bearer ")
-            .filter(|token| !token.is_empty())
-            .ok_or_else(|| Status::unauthenticated("the bearer token is malformed"))?;
+        let token = bearer_token(request.metadata())?;
         let caller = self
             .verify(token)
             .map_err(|_| Status::unauthenticated("the bearer token is invalid or expired"))?;
         request.extensions_mut().insert(caller);
         Ok(request)
     }
+}
+
+fn bearer_token(metadata: &tonic::metadata::MetadataMap) -> Result<&str, Status> {
+    let mut authorization = metadata.get_all("authorization").iter();
+    let value = authorization
+        .next()
+        .ok_or_else(|| Status::unauthenticated("a bearer token is required"))?;
+    if authorization.next().is_some() {
+        return Err(Status::unauthenticated(
+            "exactly one bearer token is required",
+        ));
+    }
+    value
+        .to_str()
+        .map_err(|_| Status::unauthenticated("the bearer token is malformed"))?
+        .strip_prefix("Bearer ")
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| Status::unauthenticated("the bearer token is malformed"))
 }
 
 impl WatchCheckpointCodec for JwtManager {
@@ -1316,6 +1481,68 @@ mod tests {
         let access_token = manager.mint(tenant("acme"), "app-7").unwrap();
         assert!(manager.verify(&put_token).is_err());
         assert!(manager.verify_put_token(&access_token).is_err());
+    }
+
+    #[test]
+    fn plugin_tokens_are_purpose_separated_and_path_restricted() {
+        let manager = JwtManager::new(TEST_SIGNING_SECRET).unwrap();
+        let token = manager
+            .mint_plugin_token(
+                tenant("acme"),
+                "oci-service",
+                "images",
+                "container-registry",
+            )
+            .unwrap();
+        let (caller, scope) = manager.verify_object_bearer(&token).unwrap();
+
+        assert_eq!(caller.storage_tenant().as_str(), "acme");
+        assert!(scope.as_ref().unwrap().allows(
+            "acme",
+            "images",
+            "container-registry/repositories/team/app"
+        ));
+        assert!(!scope.as_ref().unwrap().allows(
+            "acme",
+            "images",
+            "another-root/repositories/team/app"
+        ));
+        assert!(
+            !scope
+                .as_ref()
+                .unwrap()
+                .allows("other", "images", "container-registry")
+        );
+        assert!(manager.verify(&token).is_err());
+
+        let access = manager.mint(tenant("acme"), "oci-service").unwrap();
+        let (_, scope) = manager.verify_object_bearer(&access).unwrap();
+        assert!(scope.is_none());
+
+        let mut object_request = Request::new(());
+        object_request
+            .metadata_mut()
+            .insert("authorization", format!("Bearer {token}").parse().unwrap());
+        let object_request = manager.authenticate_object(object_request).unwrap();
+        assert!(object_request.extensions().get::<Caller>().is_some());
+        assert!(
+            object_request
+                .extensions()
+                .get::<PluginObjectScope>()
+                .is_some()
+        );
+
+        let mut administration_request = Request::new(());
+        administration_request
+            .metadata_mut()
+            .insert("authorization", format!("Bearer {token}").parse().unwrap());
+        assert_eq!(
+            manager
+                .authenticate(administration_request)
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unauthenticated
+        );
     }
 
     #[test]

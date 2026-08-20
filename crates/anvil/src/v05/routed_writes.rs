@@ -43,10 +43,10 @@ impl RoutedObjectWrites {
     ) -> Result<Request<T>, Status> {
         let definition_intents = call.definition_intents().to_vec();
         let bearer = call.bearer().to_owned();
-        let caller = self
+        let (caller, plugin_scope) = self
             .service
             .jwt_manager
-            .verify(&bearer)
+            .verify_object_bearer(&bearer)
             .map_err(|_| Status::unauthenticated("the bearer token is invalid or expired"))?;
         let authorization = format!("Bearer {bearer}")
             .parse::<MetadataValue<_>>()
@@ -56,6 +56,9 @@ impl RoutedObjectWrites {
             .metadata_mut()
             .insert("authorization", authorization);
         request.extensions_mut().insert(caller);
+        if let Some(scope) = plugin_scope {
+            request.extensions_mut().insert(scope);
+        }
         request.extensions_mut().insert(RoutedDestination);
         if internal {
             if definition_intents.is_empty() {

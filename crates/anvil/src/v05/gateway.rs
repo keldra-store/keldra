@@ -142,6 +142,45 @@ impl GatewayObjectAdapter {
         .map(|response| response.into_inner())
     }
 
+    pub(crate) async fn plugin_binding_get(
+        &self,
+        identity: &GatewayIdentity,
+        key: &ObjectKey,
+    ) -> Result<GetObjectStream, Status> {
+        if !crate::object_path_access::is_plugin_binding(key.path()) {
+            return Err(Status::permission_denied(
+                "plugin binding read is outside the canonical binding path",
+            ));
+        }
+        ObjectService::get_object(
+            &self.service,
+            identity.internal_request(GetObjectRequest {
+                address: Some(address(key)),
+                version: None,
+            })?,
+        )
+        .await
+        .map(|response| response.into_inner())
+    }
+
+    pub(crate) async fn require(
+        &self,
+        identity: &GatewayIdentity,
+        key: &ObjectKey,
+        permission: ObjectPermission,
+    ) -> Result<(), Status> {
+        let caller = match identity {
+            GatewayIdentity::Authenticated { caller, .. } => caller.clone(),
+            GatewayIdentity::Anonymous => Caller::from_anonymous(
+                StorageTenantId::parse(key.tenant())
+                    .map_err(|error| Status::invalid_argument(error.to_string()))?,
+            ),
+        };
+        self.service
+            .authorize_object(&caller, key, permission)
+            .await
+    }
+
     pub(crate) async fn list(
         &self,
         identity: &GatewayIdentity,

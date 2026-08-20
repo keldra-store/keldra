@@ -65,6 +65,7 @@ mod distributed_watch_stream;
 mod gateway;
 mod mutation_failures;
 mod read_identity;
+mod request_auth;
 mod routed_writes;
 mod upload;
 
@@ -72,6 +73,10 @@ mod upload;
 use mutation_failures::api_failure;
 use mutation_failures::{api_mutation_failure, api_request_failure};
 use read_identity::ObjectReadIdentity;
+use request_auth::{
+    authenticated_caller, plugin_object_scope, reject_plugin_token, require_authorized,
+    require_caller_tenant, require_plugin_key_scope, require_plugin_list_scope,
+};
 
 pub(crate) use gateway::{GatewayIdentity, GatewayObjectAdapter, GatewayPutMode};
 
@@ -257,6 +262,7 @@ impl ObjectService for ObjectServiceImpl {
         &self,
         request: Request<ApiDeleteRequest>,
     ) -> Result<Response<ApiMutationReceipt>, Status> {
+        let plugin_scope = plugin_object_scope(&request);
         let peer_routed = request
             .extensions()
             .get::<routed_writes::RoutedDestination>()
@@ -268,6 +274,7 @@ impl ObjectService for ObjectServiceImpl {
         let api_request = request.into_inner();
         let mutation = delete_request(api_request.clone(), Precondition::Any)?;
         object_path_access::require_key(&path_access, &mutation.key)?;
+        require_plugin_key_scope(plugin_scope.as_ref(), &mutation.key)?;
         self.authorize_object(&caller, &mutation.key, ObjectPermission::Delete)
             .await?;
         let receipt = match self.distribution.routing_target(&mutation.key)? {
@@ -303,6 +310,7 @@ impl ObjectService for ObjectServiceImpl {
         &self,
         request: Request<DeleteIfVersionRequest>,
     ) -> Result<Response<ApiMutationReceipt>, Status> {
+        let plugin_scope = plugin_object_scope(&request);
         let peer_routed = request
             .extensions()
             .get::<routed_writes::RoutedDestination>()
@@ -315,6 +323,7 @@ impl ObjectService for ObjectServiceImpl {
         let precondition = Precondition::Version(VersionId(api_request.expected_version));
         let mutation = delete_if_version_request(api_request.clone(), precondition)?;
         object_path_access::require_key(&path_access, &mutation.key)?;
+        require_plugin_key_scope(plugin_scope.as_ref(), &mutation.key)?;
         self.authorize_object(&caller, &mutation.key, ObjectPermission::Delete)
             .await?;
         let receipt = match self.distribution.routing_target(&mutation.key)? {
@@ -362,6 +371,7 @@ impl ObjectService for ObjectServiceImpl {
         &self,
         request: Request<DeleteVersionRequest>,
     ) -> Result<Response<DeleteVersionResponse>, Status> {
+        let plugin_scope = plugin_object_scope(&request);
         let peer_routed = request
             .extensions()
             .get::<routed_writes::RoutedDestination>()
@@ -374,6 +384,7 @@ impl ObjectService for ObjectServiceImpl {
         let durability = durability(api_request.durability)?;
         let key = object_key(api_request.address.clone())?;
         object_path_access::require_key(&path_access, &key)?;
+        require_plugin_key_scope(plugin_scope.as_ref(), &key)?;
         self.authorize_object(&caller, &key, ObjectPermission::Delete)
             .await?;
         let governance = self
@@ -425,12 +436,14 @@ impl ObjectService for ObjectServiceImpl {
         &self,
         request: Request<HeadObjectRequest>,
     ) -> Result<Response<ObjectHead>, Status> {
+        let plugin_scope = plugin_object_scope(&request);
         let deadline = request_deadline(request.metadata(), self.atomic_program_timeout)?;
         let identity = ObjectReadIdentity::from_request(&request)?;
         let path_access = object_path_access::access_for(&request);
         let key = object_key(request.into_inner().address)?;
         let caller = identity.caller_for_tenant(key.tenant())?;
         object_path_access::require_key(&path_access, &key)?;
+        require_plugin_key_scope(plugin_scope.as_ref(), &key)?;
         self.authorize_object(&caller, &key, ObjectPermission::Get)
             .await?;
         loop {
@@ -456,9 +469,16 @@ impl ObjectService for ObjectServiceImpl {
         &self,
         request: Request<ListObjectsRequest>,
     ) -> Result<Response<ListObjectsResponse>, Status> {
+        let plugin_scope = plugin_object_scope(&request);
         let identity = ObjectReadIdentity::from_request(&request)?;
         let bearer = identity.original_bearer(request.metadata())?;
         let query = list_objects_query(request.into_inner())?;
+        require_plugin_list_scope(
+            plugin_scope.as_ref(),
+            &query.tenant,
+            &query.bucket,
+            &query.prefix,
+        )?;
         let caller = identity.caller_for_tenant(&query.tenant)?;
         if caller.storage_tenant().as_str() != query.tenant.as_str() {
             return Err(Status::permission_denied(
@@ -494,6 +514,7 @@ impl ObjectService for ObjectServiceImpl {
         &self,
         request: Request<GetObjectRequest>,
     ) -> Result<Response<Self::GetObjectStream>, Status> {
+        let plugin_scope = plugin_object_scope(&request);
         let deadline = request_deadline(request.metadata(), self.atomic_program_timeout)?;
         let identity = ObjectReadIdentity::from_request(&request)?;
         let path_access = object_path_access::access_for(&request);
@@ -501,6 +522,7 @@ impl ObjectService for ObjectServiceImpl {
         let key = object_key(request.address)?;
         let caller = identity.caller_for_tenant(key.tenant())?;
         object_path_access::require_key(&path_access, &key)?;
+        require_plugin_key_scope(plugin_scope.as_ref(), &key)?;
         if !object_path_access::is_internal(&path_access) {
             self.authorize_object(&caller, &key, ObjectPermission::Get)
                 .await?;
@@ -545,12 +567,14 @@ impl ObjectService for ObjectServiceImpl {
         &self,
         request: Request<ListObjectVersionsRequest>,
     ) -> Result<Response<Self::ListObjectVersionsStream>, Status> {
+        let plugin_scope = plugin_object_scope(&request);
         let deadline = request_deadline(request.metadata(), self.atomic_program_timeout)?;
         let identity = ObjectReadIdentity::from_request(&request)?;
         let path_access = object_path_access::access_for(&request);
         let key = object_key(request.into_inner().address)?;
         let caller = identity.caller_for_tenant(key.tenant())?;
         object_path_access::require_key(&path_access, &key)?;
+        require_plugin_key_scope(plugin_scope.as_ref(), &key)?;
         self.authorize_object(&caller, &key, ObjectPermission::Get)
             .await?;
         let governance = self
@@ -582,6 +606,7 @@ impl ObjectService for ObjectServiceImpl {
         &self,
         request: Request<BulkWriteRequest>,
     ) -> Result<Response<BulkWriteResponse>, Status> {
+        let plugin_scope = plugin_object_scope(&request);
         let peer_routed = request
             .extensions()
             .get::<routed_writes::RoutedDestination>()
@@ -621,6 +646,7 @@ impl ObjectService for ObjectServiceImpl {
                 match bulk::validate_operation(&operation, self.max_blob_bytes) {
                     Ok((key, permission)) => {
                         match object_path_access::require_key(&path_access, &key)
+                            .and_then(|()| require_plugin_key_scope(plugin_scope.as_ref(), &key))
                             .and_then(|()| require_caller_tenant(&caller, &key))
                         {
                             Ok(()) => pending.push((
@@ -818,6 +844,7 @@ impl ObjectService for ObjectServiceImpl {
         &self,
         request: Request<WatchPrefixRequest>,
     ) -> Result<Response<Self::WatchPrefixStream>, Status> {
+        reject_plugin_token(&request, "WatchPrefix")?;
         let caller = authenticated_caller(&request)?;
         let bearer = OriginalBearer::from_metadata(request.metadata())?;
         let request = request.into_inner();
@@ -864,6 +891,7 @@ impl ObjectService for ObjectServiceImpl {
         &self,
         request: Request<BatchGetRequest>,
     ) -> Result<Response<BatchGetResponse>, Status> {
+        let plugin_scope = plugin_object_scope(&request);
         let deadline = request_deadline(request.metadata(), self.atomic_program_timeout)?;
         let identity = ObjectReadIdentity::from_request(&request)?;
         let path_access = object_path_access::access_for(&request);
@@ -895,6 +923,10 @@ impl ObjectService for ObjectServiceImpl {
                 }
             };
             if let Err(error) = object_path_access::require_key(&path_access, &key) {
+                outcomes.push(batch_get_authorization_failure(index, &key, &error));
+                continue;
+            }
+            if let Err(error) = require_plugin_key_scope(plugin_scope.as_ref(), &key) {
                 outcomes.push(batch_get_authorization_failure(index, &key, &error));
                 continue;
             }
@@ -991,6 +1023,7 @@ impl ObjectService for ObjectServiceImpl {
         &self,
         request: Request<SetBucketPolicyRequest>,
     ) -> Result<Response<BucketPolicy>, Status> {
+        reject_plugin_token(&request, "SetBucketPolicy")?;
         let peer_routed = request
             .extensions()
             .get::<routed_writes::RoutedDestination>()
@@ -1056,6 +1089,7 @@ impl ObjectService for ObjectServiceImpl {
         &self,
         request: Request<InvokeProgramRequest>,
     ) -> Result<Response<InvokeProgramResponse>, Status> {
+        reject_plugin_token(&request, "InvokeProgram")?;
         atomic_program::invoke(self, request).await
     }
 }
@@ -1142,6 +1176,14 @@ impl ObjectServiceImpl {
         permission: ObjectPermission,
     ) -> Result<(), Status> {
         require_caller_tenant(caller, key)?;
+        if object_path_access::is_plugin_binding(key.path()) {
+            return require_authorized(
+                self.authoritative_system
+                    .allows_bucket_policy(caller, key.tenant(), key.bucket())
+                    .await?,
+                "plugin binding access requires bucket policy management",
+            );
+        }
         require_authorized(
             self.authoritative_system
                 .allows_object(caller, key, permission)
@@ -1278,32 +1320,6 @@ impl CanonicalPutHeader {
             durability,
             mode,
         })
-    }
-}
-
-fn authenticated_caller<T>(request: &Request<T>) -> Result<Caller, Status> {
-    request
-        .extensions()
-        .get::<Caller>()
-        .cloned()
-        .ok_or_else(|| Status::unauthenticated("authenticated caller identity is missing"))
-}
-
-fn require_caller_tenant(caller: &Caller, key: &ObjectKey) -> Result<(), Status> {
-    if caller.storage_tenant().as_str() == key.tenant() {
-        Ok(())
-    } else {
-        Err(Status::permission_denied(
-            "object address does not belong to the authenticated tenant",
-        ))
-    }
-}
-
-fn require_authorized(allowed: bool, message: &'static str) -> Result<(), Status> {
-    if allowed {
-        Ok(())
-    } else {
-        Err(Status::permission_denied(message))
     }
 }
 
