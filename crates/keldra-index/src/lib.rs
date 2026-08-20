@@ -1,9 +1,9 @@
 //! Portable native index components and storage-neutral query execution for
-//! Anvil.
+//! Keldra.
 //!
 //! The crate owns format-v4 codecs and algorithms. RocksDB, erasure coding,
 //! placement, authorization, cache policy, and ordinary-object publication
-//! remain Anvil runtime responsibilities.
+//! remain Keldra runtime responsibilities.
 
 pub mod compaction;
 mod error;

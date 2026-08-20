@@ -825,7 +825,7 @@ impl IndexEventJournal {
     }
 
     /// Return only bucket effects which can be source data for an index.
-    /// Reserved Anvil objects still advance the authoritative journal but
+    /// Reserved Keldra objects still advance the authoritative journal but
     /// cannot wake an index builder or make a query appear stale.
     pub(crate) async fn routed_index_effects(
         &self,

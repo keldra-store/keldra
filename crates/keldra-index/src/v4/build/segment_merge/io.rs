@@ -10,7 +10,7 @@ use super::super::super::{
 use super::super::scratch::MergeScratchFile;
 
 /// Routes finite component decode/encode chunks through the one executor
-/// supplied by the Anvil process while leaving all artifact I/O asynchronous.
+/// supplied by the Keldra process while leaving all artifact I/O asynchronous.
 #[derive(Clone)]
 pub(super) struct CompactionDirectory<D, E> {
     directory: D,

@@ -1,4 +1,4 @@
-//! Format-v4 index publication through ordinary Anvil objects.
+//! Format-v4 index publication through ordinary Keldra objects.
 
 use std::collections::BTreeMap;
 use std::io::Read;

@@ -38,7 +38,7 @@ const PROGRAM: &[u8] = br#"{"schema_version":1,"documents":[{"name":"primary","p
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> TestResult<()> {
-    let endpoints = required("ANVIL_ATOMIC_INDEX_QUALIFICATION_ENDPOINTS")?
+    let endpoints = required("KELDRA_ATOMIC_INDEX_QUALIFICATION_ENDPOINTS")?
         .split(',')
         .map(str::to_owned)
         .collect::<Vec<_>>();
@@ -47,10 +47,10 @@ async fn main() -> TestResult<()> {
             "atomic index qualification requires either one or three endpoints",
         ));
     }
-    let tenant = required("ANVIL_ATOMIC_INDEX_QUALIFICATION_TENANT")?;
-    let bucket = required("ANVIL_ATOMIC_INDEX_QUALIFICATION_BUCKET")?;
-    let client_id = required("ANVIL_ATOMIC_INDEX_QUALIFICATION_CLIENT_ID")?;
-    let client_secret = required("ANVIL_ATOMIC_INDEX_QUALIFICATION_CLIENT_SECRET")?;
+    let tenant = required("KELDRA_ATOMIC_INDEX_QUALIFICATION_TENANT")?;
+    let bucket = required("KELDRA_ATOMIC_INDEX_QUALIFICATION_BUCKET")?;
+    let client_id = required("KELDRA_ATOMIC_INDEX_QUALIFICATION_CLIENT_ID")?;
+    let client_secret = required("KELDRA_ATOMIC_INDEX_QUALIFICATION_CLIENT_SECRET")?;
 
     let mut channels = Vec::with_capacity(endpoints.len());
     for endpoint in &endpoints {

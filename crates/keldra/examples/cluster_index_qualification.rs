@@ -109,7 +109,7 @@ struct VerificationHit {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> TestResult<()> {
-    let endpoints = required("ANVIL_INDEX_QUALIFICATION_ENDPOINTS")?
+    let endpoints = required("KELDRA_INDEX_QUALIFICATION_ENDPOINTS")?
         .split(',')
         .map(str::to_owned)
         .collect::<Vec<_>>();
@@ -118,9 +118,9 @@ async fn main() -> TestResult<()> {
             "index qualification requires either one or three endpoints",
         ));
     }
-    let tenant = required("ANVIL_INDEX_QUALIFICATION_TENANT")?;
-    let client_id = required("ANVIL_INDEX_QUALIFICATION_CLIENT_ID")?;
-    let client_secret = required("ANVIL_INDEX_QUALIFICATION_CLIENT_SECRET")?;
+    let tenant = required("KELDRA_INDEX_QUALIFICATION_TENANT")?;
+    let client_id = required("KELDRA_INDEX_QUALIFICATION_CLIENT_ID")?;
+    let client_secret = required("KELDRA_INDEX_QUALIFICATION_CLIENT_SECRET")?;
 
     let mut channels = Vec::new();
     for endpoint in &endpoints {
@@ -135,7 +135,7 @@ async fn main() -> TestResult<()> {
         .map(|channel| index_client(channel, &token))
         .collect::<Result<Vec<_>, _>>()?;
     let cases = engine_cases();
-    if let Some(path) = env::var_os("ANVIL_INDEX_QUALIFICATION_STATE_INPUT") {
+    if let Some(path) = env::var_os("KELDRA_INDEX_QUALIFICATION_STATE_INPUT") {
         verify_existing_state(Path::new(&path), &tenant, &cases, &mut indexes).await?;
         println!(
             "verified {} final index generations through {} endpoint(s)",
@@ -492,9 +492,9 @@ async fn main() -> TestResult<()> {
         mutation_generations[position] = response;
     }
 
-    let state_output = env::var_os("ANVIL_INDEX_QUALIFICATION_STATE_OUTPUT");
+    let state_output = env::var_os("KELDRA_INDEX_QUALIFICATION_STATE_OUTPUT");
     if state_output.is_some()
-        || env::var("ANVIL_INDEX_QUALIFICATION_REQUIRE_QUIESCENCE").is_ok_and(|value| value == "1")
+        || env::var("KELDRA_INDEX_QUALIFICATION_REQUIRE_QUIESCENCE").is_ok_and(|value| value == "1")
     {
         require_generation_quiescence(&mut indexes[0], &cases).await?;
     }

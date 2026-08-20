@@ -1,7 +1,7 @@
 //! Authentication establishes caller identity; Zanzibar decides authority.
 //!
 //! Long-lived application credentials are deliberately outside this module.
-//! They must be resolved from durable Anvil state before [`JwtManager::mint`]
+//! They must be resolved from durable Keldra state before [`JwtManager::mint`]
 //! is called. Protected services use [`JwtManager::authenticate`] as a tonic
 //! interceptor and consume the resulting [`Caller`] request extension.
 
@@ -398,7 +398,7 @@ pub enum AuthenticationError {
 }
 
 /// Loads a bounded operator-managed key without accepting a symbolic link.
-/// Anvil never persists or logs the returned bytes.
+/// Keldra never persists or logs the returned bytes.
 pub fn load_token_signing_key(path: &Path) -> Result<Vec<u8>, AuthenticationError> {
     #[cfg(not(unix))]
     {
@@ -986,7 +986,7 @@ fn token_validation(audience: &'static str) -> Validation {
     let mut validation = Validation::new(Algorithm::HS256);
     validation.leeway = 0;
     // jsonwebtoken recognizes only registered JWT claim names here. The
-    // strongly typed serde claim structs make every Anvil-specific field
+    // strongly typed serde claim structs make every Keldra-specific field
     // mandatory during decoding.
     validation.set_required_spec_claims(&["exp", "sub", "aud"]);
     validation.set_audience(&[audience]);

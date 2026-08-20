@@ -91,7 +91,7 @@ impl Drop for MutationBackpressureWait {
 }
 
 // RocksDB otherwise allocates one 64 MiB write buffer and one independent
-// block cache per column family. Anvil's metadata workload writes several
+// block cache per column family. Keldra's metadata workload writes several
 // families together, so those defaults multiply native memory without buying
 // useful locality. These process-local resources are shared by every metadata
 // column family, including RocksDB's unused default family:
@@ -871,7 +871,7 @@ impl Store {
             .await
             .with_context(|| {
                 format!(
-                    "create Anvil metadata directory {}",
+                    "create Keldra metadata directory {}",
                     options.metadata_directory.display()
                 )
             })?;
@@ -879,7 +879,7 @@ impl Store {
             .await
             .with_context(|| {
                 format!(
-                    "create Anvil metadata WAL directory {}",
+                    "create Keldra metadata WAL directory {}",
                     options.metadata_wal_directory.display()
                 )
             })?;
@@ -895,7 +895,7 @@ impl Store {
         let db = DB::open_cf_descriptors(&db_options, &options.metadata_directory, descriptors)
             .with_context(|| {
                 format!(
-                    "open Anvil metadata at {}",
+                    "open Keldra metadata at {}",
                     options.metadata_directory.display()
                 )
             })?;

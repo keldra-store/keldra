@@ -66,14 +66,14 @@ type AuthValue = MetadataValue<Ascii>;
 #[derive(Debug, Parser)]
 #[command(
     name = "keldra-osv-qualification",
-    about = "Qualify Anvil 0.9 with a deterministic OSV shard workload"
+    about = "Qualify Keldra 0.9 with a deterministic OSV shard workload"
 )]
 struct Args {
-    /// URL of one clean Anvil 0.9 node, for example http://127.0.0.1:50051.
+    /// URL of one clean Keldra 0.9 node, for example http://127.0.0.1:50051.
     #[arg(long)]
     endpoint: String,
 
-    /// An Anvil endpoint used for data writes. Repeat to stripe writes across nodes.
+    /// An Keldra endpoint used for data writes. Repeat to stripe writes across nodes.
     /// Defaults to --endpoint when absent.
     #[arg(long = "write-endpoint")]
     write_endpoints: Vec<String>,
@@ -104,7 +104,7 @@ struct Args {
     #[arg(long)]
     snapshot_day: String,
 
-    /// Exact Anvil source revision being qualified.
+    /// Exact Keldra source revision being qualified.
     #[arg(long)]
     keldra_commit: String,
 
@@ -809,7 +809,7 @@ async fn main() -> Result<()> {
         },
         limitations: vec![
             "The authoritative qualification shape is one source definition, immutable compressed content-addressed shards, and one immutable manifest; it deliberately does not create a raw object and mutable head for every upstream JSON document.",
-            "Shard attributes are carried by the authoritative manifest. Anvil 0.9 receives no per-object user metadata and this tool creates no metadata sidecar.",
+            "Shard attributes are carried by the authoritative manifest. Keldra 0.9 receives no per-object user metadata and this tool creates no metadata sidecar.",
             "The required --snapshot-day and pinned archive hash determine the snapshot identity; the local clock never participates.",
             "This qualification uses local acknowledgement. Repeated --write-endpoint values stripe independent data batches across nodes, while setup, manifest publication, and verification stay on the primary --endpoint.",
             "Independent verification checks each current version, content length, content type, and BLAKE3 payload digest through HeadObject without downloading the payload again.",

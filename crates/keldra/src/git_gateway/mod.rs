@@ -322,7 +322,7 @@ impl IntoResponse for GitError {
         if self.status == StatusCode::UNAUTHORIZED {
             response.headers_mut().insert(
                 axum::http::header::WWW_AUTHENTICATE,
-                axum::http::HeaderValue::from_static("Basic realm=\"Anvil Git\""),
+                axum::http::HeaderValue::from_static("Basic realm=\"Keldra Git\""),
             );
         }
         response

@@ -45,7 +45,7 @@ pub struct TonicRaftPeerService {
     serving_leases: ServingLeaseIssuer,
 }
 
-/// Generated Tonic service with Anvil's explicit message bounds applied.
+/// Generated Tonic service with Keldra's explicit message bounds applied.
 pub type TonicRaftPeerServer = wire::raft_peer_server::RaftPeerServer<TonicRaftPeerService>;
 
 impl TonicRaftPeerService {

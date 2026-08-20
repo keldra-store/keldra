@@ -27,17 +27,17 @@ const CONTENT: &[u8] = b"public qualification payload";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> TestResult<()> {
-    let endpoints = required("ANVIL_PUBLIC_QUALIFICATION_ENDPOINTS")?
+    let endpoints = required("KELDRA_PUBLIC_QUALIFICATION_ENDPOINTS")?
         .split(',')
         .map(str::to_owned)
         .collect::<Vec<_>>();
     if endpoints.is_empty() {
         return Err(invalid("at least one qualification endpoint is required"));
     }
-    let tenant = required("ANVIL_PUBLIC_QUALIFICATION_TENANT")?;
-    let bucket = required("ANVIL_PUBLIC_QUALIFICATION_BUCKET")?;
-    let client_id = required("ANVIL_PUBLIC_QUALIFICATION_CLIENT_ID")?;
-    let client_secret = required("ANVIL_PUBLIC_QUALIFICATION_CLIENT_SECRET")?;
+    let tenant = required("KELDRA_PUBLIC_QUALIFICATION_TENANT")?;
+    let bucket = required("KELDRA_PUBLIC_QUALIFICATION_BUCKET")?;
+    let client_id = required("KELDRA_PUBLIC_QUALIFICATION_CLIENT_ID")?;
+    let client_secret = required("KELDRA_PUBLIC_QUALIFICATION_CLIENT_SECRET")?;
     let path = "public/readable.txt";
     let address = ObjectAddress {
         tenant: tenant.clone(),

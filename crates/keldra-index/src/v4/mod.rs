@@ -1,6 +1,6 @@
 //! Native format-v4 immutable segment foundations.
 //!
-//! Durable bytes use explicit little-endian Anvil codecs and never Rust,
+//! Durable bytes use explicit little-endian Keldra codecs and never Rust,
 //! `sux`, protobuf, or JSON memory layouts.
 
 mod analyzer;

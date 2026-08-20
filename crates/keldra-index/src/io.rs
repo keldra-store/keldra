@@ -2,7 +2,7 @@ use std::future::Future;
 
 use crate::IndexError;
 
-/// An immutable byte source supplied by Anvil's cache manager.
+/// An immutable byte source supplied by Keldra's cache manager.
 ///
 /// A returned slice owns or pins its backing bytes. Reads may return fewer
 /// bytes than requested at a cache-segment boundary and return an empty slice

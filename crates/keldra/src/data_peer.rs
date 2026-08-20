@@ -1,4 +1,4 @@
-//! Typed storage operations on Anvil's mandatory-mTLS private peer listener.
+//! Typed storage operations on Keldra's mandatory-mTLS private peer listener.
 //!
 //! This is deliberately not a RocksDB endpoint. Each method decodes one
 //! versioned logical store type and invokes the corresponding storage-kernel boundary.

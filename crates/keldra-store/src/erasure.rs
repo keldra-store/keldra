@@ -1,4 +1,4 @@
-//! Versioned systematic Reed-Solomon shards for Anvil's large-byte plane.
+//! Versioned systematic Reed-Solomon shards for Keldra's large-byte plane.
 //!
 //! This module deliberately knows nothing about placement, acknowledgement,
 //! reference counts, or peer transport. It transforms one verified complete

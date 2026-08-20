@@ -327,7 +327,7 @@ async fn connect_when_ready(listen: SocketAddr) -> Channel {
             Err(_) if Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
-            Err(error) => panic!("Anvil test server did not start: {error}"),
+            Err(error) => panic!("Keldra test server did not start: {error}"),
         }
     }
 }
@@ -340,7 +340,7 @@ async fn wait_for_http(listen: SocketAddr) {
             Err(_) if Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
-            Err(error) => panic!("Anvil HTTP gateway did not start: {error}"),
+            Err(error) => panic!("Keldra HTTP gateway did not start: {error}"),
         }
     }
 }

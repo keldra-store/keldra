@@ -173,7 +173,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     .await
     .with_context(|| {
         format!(
-            "open Anvil metadata at {} with payloads at {}",
+            "open Keldra metadata at {} with payloads at {}",
             config.storage.metadata.display(),
             config.storage.payload.display()
         )
@@ -814,25 +814,25 @@ fn log_storage_layout(config: &ServerConfig, binding: &storage_layout::StorageBi
     }
     warn_default_authoritative_path(
         config.explicit_authoritative_paths.state,
-        "ANVIL_STATE_DIR",
+        "KELDRA_STATE_DIR",
         "state",
         &config.storage.state,
     );
     warn_default_authoritative_path(
         config.explicit_authoritative_paths.metadata,
-        "ANVIL_METADATA_DIR",
+        "KELDRA_METADATA_DIR",
         "metadata",
         &config.storage.metadata,
     );
     warn_default_authoritative_path(
         config.explicit_authoritative_paths.metadata_wal,
-        "ANVIL_METADATA_WAL_DIR",
+        "KELDRA_METADATA_WAL_DIR",
         "metadata_wal",
         &config.storage.metadata_wal,
     );
     warn_default_authoritative_path(
         config.explicit_authoritative_paths.payload,
-        "ANVIL_PAYLOAD_DIR",
+        "KELDRA_PAYLOAD_DIR",
         "payload",
         &config.storage.payload,
     );

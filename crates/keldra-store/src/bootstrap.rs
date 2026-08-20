@@ -1537,7 +1537,7 @@ pub(crate) fn application_ref(app_id: &str) -> Result<ObjectRef, CredentialRepos
         .map_err(|error| CredentialRepositoryError::InvalidInput(error.to_string()))?;
     if application.is_public() || application.is_anonymous() {
         return Err(CredentialRepositoryError::InvalidInput(
-            "application cannot use a reserved Anvil subject".into(),
+            "application cannot use a reserved Keldra subject".into(),
         ));
     }
     Ok(application)

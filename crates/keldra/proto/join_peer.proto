@@ -30,7 +30,7 @@ message JoinResponse {
   optional JoinSeed leader = 4;
 }
 
-// This service is private, bounded, and available only over Anvil's mandatory
+// This service is private, bounded, and available only over Keldra's mandatory
 // mTLS peer listener. Catch-up cannot activate a node; activation is a separate
 // call made only after typed ownership handoff has completed.
 service JoinPeer {

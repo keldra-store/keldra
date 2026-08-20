@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Bounded deterministic Zanzibar-style authorization for Anvil 0.9"
+description = "Bounded deterministic Zanzibar-style authorization for Keldra 0.9"
 publish = false
 
 [dependencies]

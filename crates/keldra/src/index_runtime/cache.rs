@@ -1,6 +1,6 @@
 //! Shared, disposable local materialisation of immutable index segments.
 //!
-//! Authoritative bytes always remain ordinary Anvil objects. Cache files and
+//! Authoritative bytes always remain ordinary Keldra objects. Cache files and
 //! mappings can be deleted at any time and are reconstructed through the
 //! supplied segment fetcher.
 
@@ -1260,7 +1260,7 @@ fn persist_verified_stream_and_map(
         // bytes remain the ordinary object fetched and verified by the caller.
         fs::rename(&temporary, path)?;
         // SAFETY: this exact file handle was populated and identity-verified
-        // above, then atomically published. Anvil never mutates cache files.
+        // above, then atomically published. Keldra never mutates cache files.
         unsafe { Mmap::map(&file) }.map_err(IndexCacheError::Io)
     })();
     if result.is_err() {
@@ -1287,7 +1287,7 @@ fn map_verified_cache_file(path: &Path, id: IndexSegmentId) -> Result<Mmap, Inde
     if hasher.finalize().as_bytes() != &id.blake3 {
         return Err(IndexCacheError::CorruptCache);
     }
-    // SAFETY: cache files are immutable after atomic publication. Anvil never
+    // SAFETY: cache files are immutable after atomic publication. Keldra never
     // writes through this mapping and eviction only unlinks the file after no
     // external IndexSlice retains the Arc<Mmap>.
     unsafe { Mmap::map(&file) }.map_err(IndexCacheError::Io)

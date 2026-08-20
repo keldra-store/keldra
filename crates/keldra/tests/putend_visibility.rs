@@ -203,7 +203,7 @@ async fn connect_when_ready(listen: SocketAddr) -> Channel {
                 let _ = error;
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
-            Err(error) => panic!("Anvil test server did not start: {error}"),
+            Err(error) => panic!("Keldra test server did not start: {error}"),
         }
     }
 }

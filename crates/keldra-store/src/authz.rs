@@ -296,7 +296,7 @@ pub struct AtomicRealmBinding {
     pub system_grant: TupleBatchReceipt,
 }
 
-/// Current-state consistency. Anvil 0.5 retains exactly the current
+/// Current-state consistency. Keldra 0.5 retains exactly the current
 /// authorization revision, so `Exact(current)` works and an older exact
 /// revision has a stable expired result rather than silently moving forward.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -118,7 +118,7 @@ impl IndexCpuPool {
         self.workers
     }
 
-    /// Run CPU work inside Anvil's pool, never Rayon's global registry.
+    /// Run CPU work inside Keldra's pool, never Rayon's global registry.
     pub(crate) async fn install<F, T>(&self, work: F) -> Result<T, IndexCpuPoolError>
     where
         F: FnOnce() -> T + Send + 'static,

@@ -195,7 +195,7 @@ impl DecisionRaft {
     }
 
     /// Current committed OpenRaft voters, exposed without duplicating their
-    /// role in Anvil's descriptor state.
+    /// role in Keldra's descriptor state.
     pub fn committed_voter_ids(&self) -> Result<BTreeSet<NodeId>, DecisionRaftError> {
         Ok(self.membership_view()?.voters)
     }

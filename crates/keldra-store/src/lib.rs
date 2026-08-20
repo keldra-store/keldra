@@ -1,4 +1,4 @@
-//! Anvil's storage kernel.
+//! Keldra's storage kernel.
 //!
 //! The kernel deliberately has no transaction lifecycle, snapshot protocol or
 //! knowledge of payload contents. It stores immutable object versions and

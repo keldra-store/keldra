@@ -20,7 +20,7 @@ const MAX_OBJECT_PATH_BYTES: usize = 4_096;
 const MAX_CONTENT_TYPE_BYTES: usize = 512;
 const MAX_COMMAND_ID_BYTES: usize = 256;
 
-/// A definition rejected before a request is sent to Anvil.
+/// A definition rejected before a request is sent to Keldra.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum IndexDefinitionError {
     InvalidBucket,

@@ -4,7 +4,7 @@ version.workspace = true
 edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.96.0"
-description = "Bounded consensus decisions for Anvil atomic programs"
+description = "Bounded consensus decisions for Keldra atomic programs"
 publish = false
 
 [dependencies]

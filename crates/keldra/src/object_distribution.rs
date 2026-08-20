@@ -1,7 +1,7 @@
 //! Cluster coordination for exact-path object mutations.
 //!
 //! The storage crate evaluates and applies typed mutations. This module adds
-//! only the placement and acknowledgement policy from ANVIL-0010: rank zero
+//! only the placement and acknowledgement policy from KELDRA-0010: rank zero
 //! coordinates one exact path and the first three HRW owners hold complete
 //! logical replicas. Ownership itself is never persisted here or in Raft.
 

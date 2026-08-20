@@ -1,7 +1,7 @@
 //! Portable format-v4 index generation and current-pointer records.
 //!
 //! These records contain only ordinary-object references. Component bytes,
-//! manifests, and the mutable current pointer remain ordinary Anvil objects;
+//! manifests, and the mutable current pointer remain ordinary Keldra objects;
 //! no index state is stored in Raft or a side plane.
 
 use std::collections::BTreeSet;

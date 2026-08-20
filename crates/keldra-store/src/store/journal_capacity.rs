@@ -50,7 +50,7 @@ impl Store {
     }
 
     /// Trusted derived-artifact staging. This is hidden from the supported
-    /// storage API and is entered only by Anvil's validated index/accounting
+    /// storage API and is entered only by Keldra's validated index/accounting
     /// publication boundary.
     #[doc(hidden)]
     pub async fn stage_derived_progress_blob(

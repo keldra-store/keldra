@@ -185,7 +185,7 @@ pub(crate) struct IndexPageCursor {
 }
 
 /// Opaque token codec. Its production implementation is backed by the same
-/// JWT key as other Anvil capabilities and must bind the complete `Caller`.
+/// JWT key as other Keldra capabilities and must bind the complete `Caller`.
 pub(crate) trait IndexPageTokenCodec: Send + Sync + 'static {
     fn decode(
         &self,

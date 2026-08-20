@@ -12,7 +12,7 @@ use crate::{
     types::{ClusterId, MAX_RAFT_NODE_ID, SystemBootstrapState},
 };
 
-/// Pure deterministic state for Anvil's compact consensus log.
+/// Pure deterministic state for Keldra's compact consensus log.
 ///
 /// The state machine deliberately has no cluster-membership table. The
 /// OpenRaft adapter checks that a nominated executor is a current voter or
@@ -61,7 +61,7 @@ impl StateMachine {
         })
     }
 
-    /// Convert the exact state-machine body written by Anvil 0.5.0.
+    /// Convert the exact state-machine body written by Keldra 0.5.0.
     ///
     /// Snapshot decoding owns the legacy wire type; this constructor only
     /// supplies the two fields introduced after that release.
@@ -234,7 +234,7 @@ impl StateMachine {
     ///
     /// The full identity fences active placement. Its index also supplies
     /// executor nominations and batch commit cursors; none is independently
-    /// allocated by Anvil.
+    /// allocated by Keldra.
     pub fn apply(
         &mut self,
         committed_log_id: LogId<u64>,
