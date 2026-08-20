@@ -22,7 +22,7 @@ WORKDIR /usr/src/anvil
 
 COPY . .
 
-# Build the 0.9 server and CLI in release mode. BuildKit cache mounts keep
+# Build the Keldra server and CLI in release mode. BuildKit cache mounts keep
 # Cargo's registry, git checkout cache, and target directory outside the image
 # layer so repeat local/CI Docker builds reuse compiled dependencies.
 RUN --mount=type=cache,id=anvil-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
@@ -43,6 +43,8 @@ FROM --platform=$TARGETPLATFORM debian:trixie-slim
 ARG ANVIL_SOURCE_REVISION=unknown
 
 LABEL org.opencontainers.image.revision="${ANVIL_SOURCE_REVISION}"
+LABEL org.opencontainers.image.title="Keldra"
+LABEL org.opencontainers.image.source="https://github.com/keldra-store/keldra"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \

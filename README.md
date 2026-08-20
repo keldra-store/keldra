@@ -15,24 +15,24 @@ rendezvous hashing.
 
 | Capability | Release | Status |
 | --- | --- | --- |
-| Object storage | 0.5.0 | Streaming puts, deduplication, CAS, immutable puts, bulk writes, batch reads, deletes, optional version retention, prefix listing, and watches |
-| Authorization | 0.5.0 | Application credentials, short-lived JWTs, protected administration, Zanzibar schemas, tuples, roles, and checks |
-| Atomic programs | 0.5.0 | Explicitly selected, deterministic multi-path state transitions without routing ordinary uploads through a transaction system |
-| Distributed clusters | 0.5.1 | Any-node ingress, peer mTLS, replicated metadata, weighted placement, and 2+1 erasure-coded payload durability |
-| Materialized indices | 0.5.2 | Path, object metadata, typed JSON, full text, vector, hybrid, Git-source, and tensor indices |
-| Rust client | 0.5.2 | Credential exchange, authenticated clients, streaming upload helpers, and the complete generated gRPC API |
-| PersonalDB, public reads, accounting, S3 and Git | 0.5.3 | Protocol-native PersonalDB groups and projections, authorized usage aggregates, opt-in anonymous reads, and standard S3/Git gateways |
-| Online cluster growth | 0.5.4 | Large objects use complete replicas below the configured erasure width, then move online to the fixed erasure profile as nodes join |
-| Shared public listener | 0.5.5 | Native gRPC, S3, Git, and administrative APIs share one authorized public endpoint; peer mTLS remains isolated |
-| Streaming succinct indices | 0.6.0 | Bounded per-kind construction memory, incremental immutable runs, streaming compaction, `sux`-based merged structures, and lazy block materialization |
-| Sparse index coordination | 0.7.0 | Non-blocking startup, transactional definition locators, routed change journals, scoped recovery, resumable accounting, and budgeted maintenance |
-| Scalable bulk indices | 0.8.0 | Direct bounded bulk builds, packed format-v3 artifacts, stable compressed postings, authorized rebuilds, and lossless journal backpressure |
-| Native segment indices | 0.9.0 | Anvil-owned immutable segments, exact predicate intersection, optional physical ordering, stable cursors, bounded arbitrary sorting, and shared query-memory admission |
+| Object storage | 0.1.0 | Streaming puts, deduplication, CAS, immutable puts, bulk writes, batch reads, deletes, optional version retention, prefix listing, and watches |
+| Authorization | 0.1.0 | Application credentials, short-lived JWTs, protected administration, Zanzibar schemas, tuples, roles, and checks |
+| Atomic programs | 0.1.0 | Explicitly selected, deterministic multi-path state transitions without routing ordinary uploads through a transaction system |
+| Distributed clusters | 0.1.0 | Any-node ingress, peer mTLS, replicated metadata, weighted placement, and 2+1 erasure-coded payload durability |
+| Materialized indices | 0.1.0 | Path, object metadata, typed JSON, full text, vector, hybrid, Git-source, and tensor indices |
+| Rust client | 0.1.0 | Credential exchange, authenticated clients, streaming upload helpers, and the complete generated gRPC API |
+| PersonalDB, public reads, accounting, S3 and Git | 0.1.0 | Protocol-native PersonalDB groups and projections, authorized usage aggregates, opt-in anonymous reads, and standard S3/Git gateways |
+| Online cluster growth | 0.1.0 | Large objects use complete replicas below the configured erasure width, then move online to the fixed erasure profile as nodes join |
+| Shared public listener | 0.1.0 | Native gRPC, S3, Git, administrative APIs and configured HTTP plugins share one authorized public endpoint; peer mTLS remains isolated |
+| Streaming succinct indices | 0.1.0 | Bounded per-kind construction memory, incremental immutable runs, streaming compaction, `sux`-based merged structures, and lazy block materialization |
+| Sparse index coordination | 0.1.0 | Non-blocking startup, transactional definition locators, routed change journals, scoped recovery, resumable accounting, and budgeted maintenance |
+| Scalable bulk indices | 0.1.0 | Direct bounded bulk builds, packed artifacts, stable compressed postings, authorized rebuilds, and lossless journal backpressure |
+| Native segment indices | 0.1.0 | Keldra-owned immutable segments, exact predicate intersection, optional physical ordering, stable cursors, bounded arbitrary sorting, and shared query-memory admission |
 | Java client | — | TODO |
 | Python client | — | TODO |
 | Node.js client | — | TODO |
 | Ruby client | — | TODO |
-| Network plugins | — | Planned |
+| Authorized HTTP plugin broker | 0.1.0 | Host-routed private services receive short-lived, tenant/bucket/path-scoped object tokens after Zanzibar authorization |
 
 The published container is a single multi-platform image for Linux AMD64 and
 ARM64.
@@ -47,10 +47,10 @@ repository are required.
 ### 1. Start a development node
 
 ```sh
-export ANVIL_IMAGE=ghcr.io/keldra-store/keldra:0.9.4
-export ANVIL_TOKEN_SIGNING_KEY_FILE="$PWD/anvil-data/token-signing-key"
+export ANVIL_IMAGE=ghcr.io/keldra-store/keldra:0.1.0
+export ANVIL_TOKEN_SIGNING_KEY_FILE="$PWD/keldra-data/token-signing-key"
 
-mkdir -p anvil-data
+mkdir -p keldra-data
 head -c 64 /dev/urandom > "$ANVIL_TOKEN_SIGNING_KEY_FILE"
 chmod 0600 "$ANVIL_TOKEN_SIGNING_KEY_FILE"
 
@@ -71,9 +71,9 @@ remove the generated copy:
 
 ```sh
 docker compose -f crates/anvil/docker-compose.yml cp \
-  anvil:/var/lib/anvil/system-bootstrap-credential.json \
-  anvil-data/system-bootstrap-credential.json
-chmod 0600 anvil-data/system-bootstrap-credential.json
+  keldra:/var/lib/anvil/system-bootstrap-credential.json \
+  keldra-data/system-bootstrap-credential.json
+chmod 0600 keldra-data/system-bootstrap-credential.json
 ```
 
 Bootstrap is explicit and one-shot. Recreate the process without the flag after
@@ -101,8 +101,8 @@ Use the system credential to create tenant `example`, owner application
 
 ```sh
 docker compose -f crates/anvil/docker-compose.yml exec \
-  -e ANVIL_NEW_CLIENT_SECRET="$ANVIL_OWNER_SECRET" anvil \
-  anvil --endpoint http://127.0.0.1:50051 \
+  -e ANVIL_NEW_CLIENT_SECRET="$ANVIL_OWNER_SECRET" keldra \
+  keldra --endpoint http://127.0.0.1:50051 \
   --credentials-file /var/lib/anvil/system-bootstrap-credential.json \
   provision-tenant example example-owner example-client
 ```
@@ -111,7 +111,7 @@ The generated system credential should not remain on the server after you have
 copied it and completed bootstrap:
 
 ```sh
-docker compose -f crates/anvil/docker-compose.yml exec --user 0 anvil \
+docker compose -f crates/anvil/docker-compose.yml exec --user 0 keldra \
   rm /var/lib/anvil/system-bootstrap-credential.json
 ```
 
@@ -123,8 +123,8 @@ becomes its owner:
 ```sh
 docker compose -f crates/anvil/docker-compose.yml exec \
   -e ANVIL_CLIENT_ID=example-client \
-  -e ANVIL_CLIENT_SECRET="$ANVIL_OWNER_SECRET" anvil \
-  anvil --endpoint http://127.0.0.1:50051 \
+  -e ANVIL_CLIENT_SECRET="$ANVIL_OWNER_SECRET" keldra \
+  keldra --endpoint http://127.0.0.1:50051 \
   create-bucket objects
 ```
 
@@ -135,31 +135,31 @@ enabled` when retained versions are part of the application contract.
 ### 4. Upload and read an object
 
 ```sh
-printf 'hello from Anvil\n' > anvil-data/hello.txt
+printf 'hello from Keldra\n' > keldra-data/hello.txt
 docker compose -f crates/anvil/docker-compose.yml cp \
-  anvil-data/hello.txt anvil:/tmp/hello.txt
+  keldra-data/hello.txt keldra:/tmp/hello.txt
 
 docker compose -f crates/anvil/docker-compose.yml exec \
   -e ANVIL_CLIENT_ID=example-client \
-  -e ANVIL_CLIENT_SECRET="$ANVIL_OWNER_SECRET" anvil \
-  anvil --endpoint http://127.0.0.1:50051 \
+  -e ANVIL_CLIENT_SECRET="$ANVIL_OWNER_SECRET" keldra \
+  keldra --endpoint http://127.0.0.1:50051 \
   put example objects greetings/hello.txt /tmp/hello.txt \
   --content-type text/plain --command-id first-upload
 
 docker compose -f crates/anvil/docker-compose.yml exec \
   -e ANVIL_CLIENT_ID=example-client \
-  -e ANVIL_CLIENT_SECRET="$ANVIL_OWNER_SECRET" anvil \
-  anvil --endpoint http://127.0.0.1:50051 \
+  -e ANVIL_CLIENT_SECRET="$ANVIL_OWNER_SECRET" keldra \
+  keldra --endpoint http://127.0.0.1:50051 \
   get example objects greetings/hello.txt
 ```
 
-The last command prints `hello from Anvil`. You now have a tenant-isolated,
+The last command prints `hello from Keldra`. You now have a tenant-isolated,
 Zanzibar-authorized object addressed by `(tenant, bucket, path)`.
 
 ## Use the Rust client
 
 ```sh
-cargo add keldra@0.9.4
+cargo add keldra@0.1.0
 cargo add tokio --features macros,rt-multi-thread
 ```
 
@@ -234,11 +234,11 @@ Zanzibar-authorized independently of ordinary object traffic.
 Add the public client and canonical protocol types:
 
 ```sh
-cargo add keldra@0.9.4 personaldb-protocol@0.2.2 serde_json
+cargo add keldra@0.1.0 personaldb-protocol@0.2.2 serde_json
 ```
 
 Use the same application credential created above to create a source group and
-verify Anvil's signed descriptor:
+verify Keldra's signed descriptor:
 
 ```rust,no_run
 use keldra::v1::{CreatePersonalDbGroupRequest, PersonalDbGroupKind};
@@ -293,7 +293,7 @@ projection output server-side. The complete public workflow is executable in
 
 ## Track billable usage
 
-Accounting is opt-in for a whole bucket or one path prefix. Anvil maintains the
+Accounting is opt-in for a whole bucket or one path prefix. Keldra maintains the
 aggregate asynchronously and authorizes both configuration and reads through
 Zanzibar. Each snapshot reports current object count and logical stored bytes,
 cumulative accepted inbound and served outbound bytes, and a source checkpoint
@@ -356,7 +356,7 @@ The complete enable, traffic, convergence, and disable flow is executable in
 ## Use the S3 endpoint
 
 The public endpoint on port `50051` accepts both native gRPC and standard
-SigV4 path-style S3 requests. Use an Anvil application `client_id` as the AWS
+SigV4 path-style S3 requests. Use an Keldra application `client_id` as the AWS
 access-key ID and its `client_secret` as the AWS secret-access key; Zanzibar
 still decides what that application may do.
 
@@ -371,15 +371,15 @@ export ANVIL_S3_ENDPOINT=http://127.0.0.1:50051
 
 aws --endpoint-url "$ANVIL_S3_ENDPOINT" s3api create-bucket \
   --bucket s3-demo
-printf 'hello through S3\n' > anvil-data/s3-hello.txt
+printf 'hello through S3\n' > keldra-data/s3-hello.txt
 aws --endpoint-url "$ANVIL_S3_ENDPOINT" s3api put-object \
   --bucket s3-demo --key greetings/hello.txt \
-  --content-type text/plain --body anvil-data/s3-hello.txt
+  --content-type text/plain --body keldra-data/s3-hello.txt
 aws --endpoint-url "$ANVIL_S3_ENDPOINT" s3api head-object \
   --bucket s3-demo --key greetings/hello.txt
 aws --endpoint-url "$ANVIL_S3_ENDPOINT" s3api get-object \
-  --bucket s3-demo --key greetings/hello.txt anvil-data/s3-downloaded.txt
-cmp anvil-data/s3-hello.txt anvil-data/s3-downloaded.txt
+  --bucket s3-demo --key greetings/hello.txt keldra-data/s3-downloaded.txt
+cmp keldra-data/s3-hello.txt keldra-data/s3-downloaded.txt
 aws --endpoint-url "$ANVIL_S3_ENDPOINT" s3api list-objects-v2 \
   --bucket s3-demo --prefix greetings/
 aws --endpoint-url "$ANVIL_S3_ENDPOINT" s3api delete-object \
@@ -392,29 +392,29 @@ uses one or three public endpoints and verifies every returned byte in
 
 ## Push and clone Git repositories
 
-Anvil serves Git's smart HTTP protocol at
+Keldra serves Git's smart HTTP protocol at
 `/git/<tenant>/<bucket>/<repository>.git` on the same public port `50051`.
 The first authenticated push creates the repository; subsequent pushes use CAS
-when publishing its ordinary Anvil bundle object. Basic authentication accepts
+when publishing its ordinary Keldra bundle object. Basic authentication accepts
 the same application client ID and secret used by the gRPC and S3 APIs.
 
 ```sh
-mkdir -p anvil-data/git-demo
-git -C anvil-data/git-demo init --initial-branch=main
-git -C anvil-data/git-demo config user.name "Anvil Example"
-git -C anvil-data/git-demo config user.email "anvil@example.invalid"
-printf '# Stored in Anvil\n' > anvil-data/git-demo/README.md
-git -C anvil-data/git-demo add README.md
-git -C anvil-data/git-demo commit -m initial
+mkdir -p keldra-data/git-demo
+git -C keldra-data/git-demo init --initial-branch=main
+git -C keldra-data/git-demo config user.name "Keldra Example"
+git -C keldra-data/git-demo config user.email "anvil@example.invalid"
+printf '# Stored in Keldra\n' > keldra-data/git-demo/README.md
+git -C keldra-data/git-demo add README.md
+git -C keldra-data/git-demo commit -m initial
 
 export ANVIL_GIT_URL=http://127.0.0.1:50051/git/example/objects/demo.git
 export ANVIL_GIT_AUTH="$(printf '%s:%s' example-client "$ANVIL_OWNER_SECRET" | base64 | tr -d '\n')"
-git -C anvil-data/git-demo \
+git -C keldra-data/git-demo \
   -c "http.extraHeader=Authorization: Basic $ANVIL_GIT_AUTH" \
   push "$ANVIL_GIT_URL" main
 git -c "http.extraHeader=Authorization: Basic $ANVIL_GIT_AUTH" \
-  clone --branch main "$ANVIL_GIT_URL" anvil-data/authenticated-clone
-git -C anvil-data/authenticated-clone \
+  clone --branch main "$ANVIL_GIT_URL" keldra-data/authenticated-clone
+git -C keldra-data/authenticated-clone \
   -c "http.extraHeader=Authorization: Basic $ANVIL_GIT_AUTH" pull
 ```
 
@@ -425,11 +425,11 @@ header:
 ```sh
 docker compose -f crates/anvil/docker-compose.yml exec \
   -e ANVIL_CLIENT_ID=example-client \
-  -e ANVIL_CLIENT_SECRET="$ANVIL_OWNER_SECRET" anvil \
-  anvil --endpoint http://127.0.0.1:50051 \
+  -e ANVIL_CLIENT_SECRET="$ANVIL_OWNER_SECRET" keldra \
+  keldra --endpoint http://127.0.0.1:50051 \
   set-bucket-public-read objects enabled
 
-git clone --branch main "$ANVIL_GIT_URL" anvil-data/public-clone
+git clone --branch main "$ANVIL_GIT_URL" keldra-data/public-clone
 ```
 
 Push always requires an authorized application. A real-client push, pull, and
@@ -446,7 +446,7 @@ boundary.
 2. The JWT identifies one stable application and tenant. It contains no trusted
    caller-supplied roles.
 3. Every protected RPC evaluates that identity through Zanzibar relationships.
-4. The protected `_anvil/system` realm governs Anvil administration. Customer
+4. The protected `_anvil/system` realm governs Keldra administration. Customer
    realms use the same Zanzibar primitives for application-domain models, but
    cannot modify the system realm.
 
@@ -466,7 +466,7 @@ mode-`0600` file so it never appears in process arguments:
 umask 077
 printf '%s' "$(openssl rand -hex 32)" > replacement.secret
 
-anvil --endpoint https://anvil.example.com \
+keldra --endpoint https://anvil.example.com \
   --credentials-file /run/secrets/anvil-system-admin.json \
   recover-application-credential \
   --storage-tenant example \
@@ -486,12 +486,12 @@ A bucket owner can enable public reads with the CLI or
 ```sh
 docker compose -f crates/anvil/docker-compose.yml exec \
   -e ANVIL_CLIENT_ID=example-client \
-  -e ANVIL_CLIENT_SECRET="$ANVIL_OWNER_SECRET" anvil \
-  anvil --endpoint http://127.0.0.1:50051 \
+  -e ANVIL_CLIENT_SECRET="$ANVIL_OWNER_SECRET" keldra \
+  keldra --endpoint http://127.0.0.1:50051 \
   set-bucket-public-read objects enabled
 ```
 
-A request with no bearer token is then evaluated as Anvil's built-in,
+A request with no bearer token is then evaluated as Keldra's built-in,
 unmanageable anonymous application. It may read only where the owner
 explicitly granted that bucket policy. Supplying an invalid token remains an
 authentication error, and anonymous callers never bypass Zanzibar or gain
@@ -505,7 +505,7 @@ Index creation, updates, discovery, and deletion always require credentials.
 
 ## Compare-and-swap and immutable data
 
-Anvil exposes separate operations so intent is visible in code:
+Keldra exposes separate operations so intent is visible in code:
 
 - `Put` always advances the path version.
 - `PutIfAbsent` succeeds only if the path has never had a live value.
@@ -532,7 +532,7 @@ The lifecycle is deliberately explicit:
 2. `HeadObject` it and retain the returned BLAKE3 hash.
 3. Mark every path the program may read or write as `PROGRAM_ONLY`.
 4. Invoke the exact path and hash with a unique invocation ID and JSON bindings.
-5. Anvil authorizes and locks the declared paths, evaluates the bounded DSL on
+5. Keldra authorizes and locks the declared paths, evaluates the bounded DSL on
    the nominated executor, and publishes every resulting head atomically.
 
 Ordinary uploads—including large media—continue to use `Put`; they never enter
@@ -557,7 +557,7 @@ size does not become unaccounted heap. Per-kind construction settings and the
 query setting remain fair-share planning targets; active work can borrow idle
 capacity without crossing the aggregate ceiling. Query responses always
 include freshness evidence; while a new complete generation is building,
-Anvil continues serving the preceding complete generation rather than exposing
+Keldra continues serving the preceding complete generation rather than exposing
 a partial one.
 
 The startup default is 256 MiB of construction memory and at most four
@@ -586,7 +586,7 @@ worker pool and the corresponding kind's construction-memory budget.
 `ANVIL_INDEX_MAX_UNMERGED_BYTES_PER_TIER` bound merge debt, with per-kind
 overrides following the same naming pattern. `ANVIL_INDEX_QUERY_MEMORY_BYTES`
 is the query fair share. `ANVIL_INDEX_WORKING_MEMORY_BYTES` optionally sets the
-hard aggregate query/build/compaction ceiling; without it, Anvil uses the
+hard aggregate query/build/compaction ceiling; without it, Keldra uses the
 checked sum of the query and eight per-kind shares (2.5 GiB with defaults).
 Queries and builders can borrow idle bytes and derive their workspace from the
 actual grant, while queued mandatory work retains FIFO priority.
@@ -696,7 +696,7 @@ including multi-valued exact/facet/aggregate semantics, fielded text and phrase
 search, identity-only hits, facets, and all five numeric aggregate operations.
 The production-shaped qualification binds
 those result checks to per-query logical reads, candidate counts, cursor seeks,
-cache fetches, CPU, memory, and elapsed time from Anvil's operational signals.
+cache fetches, CPU, memory, and elapsed time from Keldra's operational signals.
 
 ## Run a three-node cluster
 
@@ -705,7 +705,7 @@ bundles, establishes peer mTLS, exercises replicated and erasure-coded storage,
 queries every index type, and performs a rolling restart:
 
 ```sh
-ANVIL_IMAGE=ghcr.io/keldra-store/keldra:0.9.4 \
+ANVIL_IMAGE=ghcr.io/keldra-store/keldra:0.1.0 \
   ./scripts/qualify-three-node.sh
 ```
 
@@ -715,7 +715,7 @@ Production formation uses the same sequence:
    `--peer-advertise` address, durable storage, and the operator-managed JWT
    signing key.
 2. From an authorized active node, run
-   `anvil prepare-node <node-id> <peer-address>`.
+   `keldra prepare-node <node-id> <peer-address>`.
 3. Copy the generated mode-`0600` join bundle to the configured joining node,
    delete the source copy, and start `keldra-server --join-bundle <path>` there.
 4. Repeat for additional nodes. Set each node's storage weight to its usable
@@ -781,7 +781,7 @@ locks, and index files do not.
 Names resolve to stable numeric IDs, so renaming human-facing identifiers does
 not rewrite every storage key. Ordered per-node source journals feed watches,
 reference accounting, and the single writer for each materialized index. Index
-artifacts are ordinary Anvil objects; local materialization is disposable
+artifacts are ordinary Keldra objects; local materialization is disposable
 acceleration, not another authoritative storage plane.
 
 The architecture contracts live in
@@ -792,7 +792,7 @@ clean-break native-segment index architecture is specified by
 
 ## Build and qualify
 
-Anvil requires Rust 1.96 or newer.
+Keldra requires Rust 1.96 or newer.
 
 ```sh
 cargo fmt --all -- --check
@@ -802,16 +802,16 @@ cargo test --workspace
 Build and qualify the container locally before CI:
 
 ```sh
-ANVIL_IMAGE=anvil:local ./scripts/build-image.sh
-ANVIL_IMAGE=anvil:local ./scripts/release-gates.sh image
+ANVIL_IMAGE=keldra:local ./scripts/build-image.sh
+ANVIL_IMAGE=keldra:local ./scripts/release-gates.sh image
 ANVIL_QUALIFICATION_MODE=release \
 ANVIL_QUALIFICATION_INDEX_KIND_BUDGET_BYTES=268435456 \
 ANVIL_QUALIFICATION_INDEX_COMPACTION_MAX_LANES=4 \
 ANVIL_QUALIFICATION_INDEX_RAYON_WORKERS=4 \
 ANVIL_QUALIFICATION_INDEX_MAX_ANONYMOUS_GROWTH_BYTES=2147483648 \
-  ANVIL_IMAGE=anvil:local ./scripts/qualify-single-node.sh
+  ANVIL_IMAGE=keldra:local ./scripts/qualify-single-node.sh
 ANVIL_QUALIFICATION_MODE=release \
-  ANVIL_IMAGE=anvil:local ./scripts/qualify-three-node.sh
+  ANVIL_IMAGE=keldra:local ./scripts/qualify-three-node.sh
 ```
 
 The production-shaped index qualification generates 839,980 private-data-free
@@ -824,7 +824,7 @@ not hold the shared build lock during the long qualification.
 The pinned `sux` and Rayon dependencies, resolved versions, and license choices are
 recorded in [the index dependency record](docs/dependency-licenses.md).
 
-Anvil 0.9 deployments start with new volumes. Format-v4 index definitions and
+Keldra 0.1 deployments start with new volumes. Format-v4 index definitions and
 native segment artifacts are built from authoritative source objects rather
 than migrated from format v3. Current operational boundaries are collected in
 the [known limitations](docs/known-limitations.md).

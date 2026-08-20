@@ -1,6 +1,6 @@
 services:
-  anvil:
-    image: ${ANVIL_IMAGE:-anvil:0.9.4}
+  keldra:
+    image: ${ANVIL_IMAGE:-ghcr.io/keldra-store/keldra:0.1.0}
     environment:
       RUST_LOG: ${RUST_LOG:-info}
       ANVIL_LISTEN: 0.0.0.0:50051
@@ -19,9 +19,9 @@ services:
     ports:
       - "50051:50051"
     volumes:
-      - anvil_data:/var/lib/anvil
+      - keldra_data:/var/lib/anvil
       - ${ANVIL_TOKEN_SIGNING_KEY_FILE:?ANVIL_TOKEN_SIGNING_KEY_FILE must name a mode-0600 file}:/run/secrets/anvil-token-signing-key:ro
     restart: unless-stopped
 
 volumes:
-  anvil_data:
+  keldra_data:
