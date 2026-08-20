@@ -8,8 +8,8 @@ target/
 **/.tmp/
 .DS_Store
 **/.DS_Store
-anvil-data/
-**/anvil-data/
+keldra-data/
+**/keldra-data/
 docs/decisions/*.local.md
 clients/python/
 clients/typescript/

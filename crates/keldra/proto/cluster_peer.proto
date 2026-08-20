@@ -1,0 +1,916 @@
+syntax = "proto3";
+
+package keldra.cluster_peer.v1;
+
+import "keldra.proto";
+import "personaldb.proto";
+
+// Versioned identity and placement binding shared by every cluster operation.
+// The authenticated source is still established by mandatory mTLS; these
+// fields bind that identity to the exact applied membership used by the
+// caller. hop_count is zero for replica/source operations and exactly one for
+// a routed public operation.
+message PeerContext {
+  uint32 schema_version = 1;
+  bytes cluster_id = 2;
+  uint64 source_node_id = 3;
+  uint64 placement_term = 4;
+  uint64 placement_index = 5;
+  uint32 hop_count = 6;
+  uint32 remaining_deadline_millis = 7;
+}
+
+message LogicalRecordReadRequest {
+  PeerContext peer = 1;
+  bytes id_json = 2;
+}
+
+message ResolveTenantNameRequest {
+  PeerContext peer = 1;
+  string storage_tenant = 2;
+}
+
+message ResolveTenantNameResult {
+  uint32 schema_version = 1;
+  bool present = 2;
+  uint64 tenant_id = 3;
+}
+
+message ResolveBucketNameRequest {
+  PeerContext peer = 1;
+  uint64 tenant_id = 2;
+  string bucket = 3;
+}
+
+message ResolveBucketNameResult {
+  uint32 schema_version = 1;
+  bool present = 2;
+  uint64 bucket_id = 3;
+}
+
+message LogicalRecordCandidate {
+  uint32 schema_version = 1;
+  bool present = 2;
+  bytes candidate_json = 3;
+}
+
+message LogicalRecordRepairRequest {
+  PeerContext peer = 1;
+  bytes id_json = 2;
+  bool present = 3;
+  bytes candidate_json = 4;
+}
+
+message LogicalRecordMutationRequest {
+  PeerContext peer = 1;
+  bytes mutation_json = 2;
+}
+
+message LogicalRecordApplied {
+  uint32 schema_version = 1;
+  uint64 record_version = 2;
+  bool replayed = 3;
+}
+
+message LogicalRecordSnapshotApplied {
+  uint32 schema_version = 1;
+  bool present = 2;
+  uint64 record_version = 3;
+  bool replayed = 4;
+}
+
+message SchemaPublicationApplyRequest {
+  PeerContext peer = 1;
+  uint64 stable_tenant_id = 2;
+  bytes mutation_json = 3;
+}
+
+message SchemaPublicationApplied {
+  uint32 schema_version = 1;
+  uint64 revision = 2;
+  bool replayed = 3;
+}
+
+message SchemaPublicationQueryRequest {
+  PeerContext peer = 1;
+  uint64 stable_tenant_id = 2;
+  bytes query_json = 3;
+}
+
+message RealmMutationApplyRequest {
+  PeerContext peer = 1;
+  uint64 stable_tenant_id = 2;
+  bytes mutation_json = 3;
+}
+
+message RealmMutationApplied {
+  uint32 schema_version = 1;
+  uint64 revision = 2;
+  bool replayed = 3;
+}
+
+message RealmCandidateReadRequest {
+  PeerContext peer = 1;
+  uint64 stable_tenant_id = 2;
+  bytes scope_json = 3;
+}
+
+message RealmCandidate {
+  uint32 schema_version = 1;
+  bool present = 2;
+  bytes manifest_json = 3;
+}
+
+message RealmAggregateReadRequest {
+  PeerContext peer = 1;
+  uint64 stable_tenant_id = 2;
+  bytes scope_json = 3;
+}
+
+message RealmAggregateFrame {
+  uint32 schema_version = 1;
+  uint64 offset = 2;
+  bytes content = 3;
+  bool end = 4;
+  bytes manifest_json = 5;
+}
+
+message RealmCandidateInstallFrame {
+  PeerContext peer = 1;
+  uint64 stable_tenant_id = 2;
+  bytes scope_json = 3;
+  bool present = 4;
+  bytes manifest_json = 5;
+  uint64 offset = 6;
+  bytes content = 7;
+  bool end = 8;
+}
+
+message RealmCandidateInstalled {
+  uint32 schema_version = 1;
+  uint64 revision = 2;
+  bool replayed = 3;
+  uint64 retained_receipts = 4;
+}
+
+enum AuthorizationConsistencyMode {
+  AUTHORIZATION_CONSISTENCY_LATEST = 0;
+  AUTHORIZATION_CONSISTENCY_AT_LEAST = 1;
+  AUTHORIZATION_CONSISTENCY_EXACT = 2;
+}
+
+message StableBucketBinding {
+  string storage_tenant = 1;
+  string bucket = 2;
+  uint64 expected_tenant_id = 3;
+  uint64 expected_bucket_id = 4;
+}
+
+message FreshAuthorizationCheckRequest {
+  PeerContext peer = 1;
+  uint64 stable_tenant_id = 2;
+  bytes scope_json = 3;
+  bytes check_json = 4;
+  AuthorizationConsistencyMode consistency = 5;
+  uint64 consistency_revision = 6;
+  optional StableBucketBinding stable_bucket = 7;
+}
+
+message FreshAuthorizationCheckResult {
+  uint32 schema_version = 1;
+  bool allowed = 2;
+  uint64 revision = 3;
+  uint64 binding_generation = 4;
+}
+
+message FreshAuthorizationChecksRequest {
+  PeerContext peer = 1;
+  uint64 stable_tenant_id = 2;
+  bytes scope_json = 3;
+  repeated bytes checks_json = 4;
+  AuthorizationConsistencyMode consistency = 5;
+  uint64 consistency_revision = 6;
+  repeated StableBucketBinding stable_buckets = 7;
+}
+
+message FreshAuthorizationChecksResult {
+  uint32 schema_version = 1;
+  repeated bool allowed = 2;
+  uint64 revision = 3;
+  uint64 binding_generation = 4;
+}
+
+message Exists {
+  uint32 schema_version = 1;
+  bool exists = 2;
+}
+
+message ReferenceProofReadRequest {
+  PeerContext peer = 1;
+  bytes source_id_json = 2;
+  uint64 source_offset = 3;
+  uint64 tenant_id = 4;
+  uint64 bucket_id = 5;
+  string exact_path = 6;
+}
+
+message ReferenceProofReadResponse {
+  uint32 schema_version = 1;
+  bool present = 2;
+  bytes proof_json = 3;
+}
+
+message LocalListRequest {
+  PeerContext peer = 1;
+  string tenant = 2;
+  string bucket = 3;
+  uint64 tenant_id = 4;
+  uint64 bucket_id = 5;
+  string prefix = 6;
+  optional string start_after = 7;
+  uint32 limit = 8;
+  bool include_index_definitions = 9;
+  bool include_personaldb_manifests = 11;
+}
+
+message LocalListPage {
+  uint32 schema_version = 1;
+  uint64 source_node_id = 2;
+  uint64 placement_term = 3;
+  uint64 placement_index = 4;
+  repeated string paths = 5;
+  bool has_more = 6;
+}
+
+message WatchStatusRequest {
+  PeerContext peer = 1;
+  bytes scope_json = 2;
+}
+
+message WatchStatus {
+  uint32 schema_version = 1;
+  uint64 source_node_id = 2;
+  uint64 placement_term = 3;
+  uint64 placement_index = 4;
+  bytes source_id_json = 5;
+  uint64 tail = 6;
+  uint64 retention_floor = 7;
+  uint64 retained_entries = 8;
+  uint64 retained_bytes = 9;
+  uint64 settled_through = 10;
+}
+
+message WatchPageRequest {
+  PeerContext peer = 1;
+  bytes expected_source_json = 2;
+  bytes scope_json = 3;
+  uint64 next_offset = 4;
+  uint32 max_records = 5;
+}
+
+message WatchPage {
+  uint32 schema_version = 1;
+  uint64 source_node_id = 2;
+  uint64 placement_term = 3;
+  uint64 placement_index = 4;
+  bytes source_id_json = 5;
+  uint64 tail = 6;
+  uint64 retention_floor = 7;
+  uint64 retained_entries = 8;
+  uint64 retained_bytes = 9;
+  uint64 next_offset = 10;
+  repeated bytes object_heads_json = 11;
+  uint64 settled_through = 12;
+}
+
+message RoutePutEndRequest {
+  PeerContext peer = 1;
+  keldra.v1.PutToken request = 2;
+}
+
+message RouteDeleteRequest {
+  PeerContext peer = 1;
+  keldra.v1.DeleteRequest request = 2;
+}
+
+message RouteDeleteIfVersionRequest {
+  PeerContext peer = 1;
+  keldra.v1.DeleteIfVersionRequest request = 2;
+}
+
+message RouteBulkWriteRequest {
+  PeerContext peer = 1;
+  keldra.v1.BulkWriteRequest request = 2;
+  repeated RoutedDefinitionMutationIntent definition_intents = 3;
+}
+
+enum RoutedDefinitionKind {
+  ROUTED_DEFINITION_KIND_UNSPECIFIED = 0;
+  ROUTED_DEFINITION_KIND_INDEX = 1;
+  ROUTED_DEFINITION_KIND_ACCOUNTING = 2;
+}
+
+// Typed evidence produced by a trusted definition lifecycle service. This is
+// accepted only on the mandatory-mTLS internal bulk route; public clients have
+// no corresponding field.
+message RoutedDefinitionMutationIntent {
+  uint32 operation_index = 1;
+  RoutedDefinitionKind kind = 2;
+  uint64 definition_id = 3;
+}
+
+message RouteProvisionTenantRequest {
+  PeerContext peer = 1;
+  keldra.v1.ProvisionTenantRequest request = 2;
+}
+
+message RouteCreateBucketRequest {
+  PeerContext peer = 1;
+  keldra.v1.CreateBucketRequest request = 2;
+}
+
+message RouteCredentialExchangeRequest {
+  PeerContext peer = 1;
+  keldra.v1.ExchangeClientCredentialsRequest request = 2;
+}
+
+message RouteAdminCreateApplicationRequest {
+  PeerContext peer = 1;
+  keldra.v1.CreateApplicationRequest request = 2;
+}
+
+message RouteAdminRotateCredentialRequest {
+  PeerContext peer = 1;
+  keldra.v1.RotateApplicationCredentialRequest request = 2;
+}
+
+message RouteAdminRecoverCredentialRequest {
+  PeerContext peer = 1;
+  keldra.v1.RecoverApplicationCredentialRequest request = 2;
+}
+
+message RouteAdminDisableCredentialRequest {
+  PeerContext peer = 1;
+  keldra.v1.DisableApplicationCredentialRequest request = 2;
+}
+
+message RouteAdminSetBucketVersioningRequest {
+  PeerContext peer = 1;
+  keldra.v1.SetBucketVersioningRequest request = 2;
+}
+
+message RouteAdminSetBucketPublicReadRequest {
+  PeerContext peer = 1;
+  keldra.v1.SetBucketPublicReadRequest request = 2;
+}
+
+message RouteAdminChangeApplicationRoleRequest {
+  PeerContext peer = 1;
+  keldra.v1.ApplicationRoleRequest request = 2;
+  bool granted = 3;
+}
+
+message RouteAuthzPutSchemaRequest {
+  PeerContext peer = 1;
+  keldra.v1.PutSchemaRequest request = 2;
+}
+
+message RouteAuthzBindSchemaRequest {
+  PeerContext peer = 1;
+  keldra.v1.BindSchemaRequest request = 2;
+}
+
+message RouteAuthzGetBindingRequest {
+  PeerContext peer = 1;
+  keldra.v1.GetBindingRequest request = 2;
+}
+
+message RouteAuthzGetSchemaRequest {
+  PeerContext peer = 1;
+  keldra.v1.GetSchemaRequest request = 2;
+}
+
+message RouteAuthzMutateTuplesRequest {
+  PeerContext peer = 1;
+  keldra.v1.MutateTuplesRequest request = 2;
+}
+
+message RouteAuthzReadTuplesRequest {
+  PeerContext peer = 1;
+  keldra.v1.ReadTuplesRequest request = 2;
+}
+
+message RouteAuthzCheckPermissionRequest {
+  PeerContext peer = 1;
+  keldra.v1.CheckPermissionRequest request = 2;
+}
+
+message RouteAuthzCheckPermissionsRequest {
+  PeerContext peer = 1;
+  keldra.v1.CheckPermissionsRequest request = 2;
+}
+
+message RouteSetBucketPolicyRequest {
+  PeerContext peer = 1;
+  keldra.v1.SetBucketPolicyRequest request = 2;
+}
+
+message RouteDeleteVersionRequest {
+  PeerContext peer = 1;
+  keldra.v1.DeleteVersionRequest request = 2;
+}
+
+message CoordinateLogicalRecordRequest {
+  PeerContext peer = 1;
+  bytes typed_value_json = 2;
+}
+
+message CoordinateLogicalRecordResponse {
+  uint32 schema_version = 1;
+}
+
+message CoordinatedLogicalReadRequest {
+  PeerContext peer = 1;
+  bytes id_json = 2;
+}
+
+message CoordinatedLogicalReadResponse {
+  uint32 schema_version = 1;
+  bool present = 2;
+  bytes typed_value_json = 3;
+}
+
+message CoordinateSystemGrantRequest {
+  PeerContext peer = 1;
+  bytes tuple_batch_json = 2;
+}
+
+message CoordinateSystemGrantResponse {
+  uint32 schema_version = 1;
+  bytes receipt_json = 2;
+}
+
+message RouteInvokeProgramRequest {
+  PeerContext peer = 1;
+  keldra.v1.InvokeProgramRequest request = 2;
+}
+
+message ProgramStagePathRequest {
+  PeerContext peer = 1;
+  uint64 executor_nomination_log_index = 2;
+  bytes stage_json = 3;
+}
+
+message ProgramStagePathResponse {
+  uint32 schema_version = 1;
+  bytes stage_blob_hash = 2;
+  uint64 stage_blob_length = 3;
+}
+
+message ProgramCoordinatePathFinalizationRequest {
+  PeerContext peer = 1;
+  uint64 executor_nomination_log_index = 2;
+  uint64 commit_cursor = 3;
+  bytes stage_json = 4;
+}
+
+message ProgramCoordinatedPathFinalization {
+  uint32 schema_version = 1;
+  bytes mutation_json = 2;
+  bool replayed = 3;
+}
+
+message ProgramApplyPathFinalizationRequest {
+  PeerContext peer = 1;
+  uint64 executor_nomination_log_index = 2;
+  bytes mutation_json = 3;
+}
+
+message ProgramPathFinalizationApplied {
+  uint32 schema_version = 1;
+  uint64 version = 2;
+  bool replayed = 3;
+}
+
+// Narrow internal route for one immutable index artifact or CAS current
+// pointer. The authenticated caller must be this index's current weighted-HRW
+// builder. Bytes remain on the ordinary upload-source node and the destination
+// enters the normal object coordinator pipeline.
+message PublishIndexArtifactRequest {
+  PeerContext peer = 1;
+  string storage_tenant = 2;
+  string bucket = 3;
+  uint64 tenant_id = 4;
+  uint64 bucket_id = 5;
+  uint64 index_id = 6;
+  string exact_path = 7;
+  bytes blob_blake3 = 8;
+  uint64 blob_length = 9;
+  optional uint64 expected_version = 10;
+  string command_id = 11;
+  // Non-zero only for a trusted ordinary definition mutation. Generic index
+  // and accounting artifacts leave this unspecified.
+  RoutedDefinitionKind definition_kind = 12;
+  // Present together only for current-pointer/accounting-rollup publication.
+  // The first hop is routed to this definition path's coordinator, which
+  // holds its ordinary exact-path lock through the artifact CAS.
+  RoutedDefinitionKind guarded_definition_kind = 13;
+  string guarded_definition_path = 14;
+  uint64 guarded_definition_version = 15;
+  // Private builder-selected admission. Only an authenticated current HRW
+  // builder may send this peer request; public APIs cannot set it.
+  bool publication_progress = 16;
+}
+
+// Second hop emitted only by the authenticated definition-path coordinator
+// while it still holds the ordinary definition lock.
+message CommitGuardedIndexArtifactRequest {
+  PeerContext peer = 1;
+  uint64 builder_node_id = 2;
+  PublishIndexArtifactRequest publication = 3;
+}
+
+message IndexArtifactPublished {
+  uint32 schema_version = 1;
+  uint64 version = 2;
+  bool replayed = 3;
+}
+
+// Bounded internal publication for immutable artifacts which share one exact
+// metadata replica group. Nested items carry no PeerContext; the outer mTLS
+// request authenticates the current weighted-HRW builder once.
+message PublishIndexArtifactsRequest {
+  PeerContext peer = 1;
+  repeated PublishIndexArtifactRequest publications = 2;
+}
+
+message IndexArtifactsPublished {
+  uint32 schema_version = 1;
+  repeated IndexArtifactPublished outcomes = 2;
+}
+
+// Deletes exactly one obsolete immutable generation artifact through the
+// ordinary DeleteIfVersion path. `current` and definitions are never valid.
+message DeleteIndexArtifactRequest {
+  PeerContext peer = 1;
+  string storage_tenant = 2;
+  string bucket = 3;
+  uint64 tenant_id = 4;
+  uint64 bucket_id = 5;
+  uint64 index_id = 6;
+  string exact_path = 7;
+  uint64 expected_version = 8;
+  string command_id = 9;
+  RoutedDefinitionKind definition_kind = 10;
+}
+
+message IndexArtifactDeleted {
+  uint32 schema_version = 1;
+  uint64 version = 2;
+  bool replayed = 3;
+}
+
+// Every retained descriptor beneath one exact format-v4 Anvil-owned index
+// artifact prefix. The server derives the prefix from index_id; peers cannot
+// widen it.
+message IndexArtifactHeads {
+  uint64 tenant_id = 1;
+  uint64 bucket_id = 2;
+  uint64 index_id = 3;
+}
+
+// A bounded format-v4 index-maintenance scan. Pages are retained
+// `(path, version)` records and the scope is always one exact index ID.
+message ScanIndexHeadsRequest {
+  PeerContext peer = 1;
+  optional string cursor = 2;
+  IndexArtifactHeads artifacts = 4;
+}
+
+message IndexHeadScanPage {
+  uint32 schema_version = 1;
+  uint64 source_node_id = 2;
+  bytes source_epoch = 3;
+  uint64 placement_term = 4;
+  uint64 placement_index = 5;
+  repeated bytes heads_json = 6;
+  optional string next_cursor = 7;
+}
+
+// Begin one gap-free, ephemeral rebuild cursor. The small acknowledgement
+// contains only the snapshot identity and captured source tail.
+message IndexSourceSnapshotBegin {
+  PeerContext peer = 1;
+  uint64 tenant_id = 2;
+  uint64 bucket_id = 3;
+  string path_prefix = 4;
+  uint64 max_frame_bytes = 5;
+}
+
+// One pull credit. The server may decode and return exactly one frame only
+// after receiving this command; a builder sends it while holding its kind
+// memory permit.
+message IndexSourceSnapshotPull {
+  uint64 sequence = 1;
+}
+
+message IndexSourceSnapshotRequest {
+  oneof command {
+    IndexSourceSnapshotBegin begin = 1;
+    IndexSourceSnapshotPull pull = 2;
+  }
+}
+
+message IndexSourceSnapshotBegun {
+  uint32 schema_version = 1;
+  uint64 source_node_id = 2;
+  bytes source_epoch = 3;
+  uint64 captured_source_tail = 4;
+  uint64 placement_term = 5;
+  uint64 placement_index = 6;
+}
+
+message IndexSourceSnapshotFrame {
+  uint32 schema_version = 1;
+  uint64 source_node_id = 2;
+  bytes source_epoch = 3;
+  uint64 captured_source_tail = 4;
+  uint64 placement_term = 5;
+  uint64 placement_index = 6;
+  uint64 sequence = 7;
+  repeated bytes heads_json = 8;
+  bool end = 9;
+}
+
+message IndexSourceSnapshotResponse {
+  oneof event {
+    IndexSourceSnapshotBegun begun = 1;
+    IndexSourceSnapshotFrame frame = 2;
+  }
+}
+
+// Credit-driven retained `(path, version)` snapshot used by accounting
+// baselines. It is deliberately separate from the current-head rebuild stream
+// so neither consumer can accidentally decode the other record shape.
+message RetainedSourceSnapshotBegin {
+  PeerContext peer = 1;
+  uint64 tenant_id = 2;
+  uint64 bucket_id = 3;
+  string path_prefix = 4;
+  uint64 max_frame_bytes = 5;
+}
+
+message RetainedSourceSnapshotRequest {
+  oneof command {
+    RetainedSourceSnapshotBegin begin = 1;
+    IndexSourceSnapshotPull pull = 2;
+  }
+}
+
+message RetainedSourceSnapshotFrame {
+  uint32 schema_version = 1;
+  uint64 source_node_id = 2;
+  bytes source_epoch = 3;
+  uint64 captured_source_tail = 4;
+  uint64 placement_term = 5;
+  uint64 placement_index = 6;
+  uint64 sequence = 7;
+  repeated bytes records_json = 8;
+  bool end = 9;
+}
+
+message RetainedSourceSnapshotResponse {
+  oneof event {
+    IndexSourceSnapshotBegun begun = 1;
+    RetainedSourceSnapshotFrame frame = 2;
+  }
+}
+
+// One decoded, signed public continuation. The public JWT itself is verified
+// by ingress; the destination independently verifies the original bearer and
+// requires this Zanzibar revision to remain current before returning results.
+message RoutedIndexQueryResume {
+  uint64 generation = 1;
+  bytes last_position = 2;
+  uint64 authorization_revision = 3;
+}
+
+// A one-hop request to exactly one current weighted-HRW query replica. No
+// Caller or authorization decision crosses the wire. The original access JWT
+// or fixed anonymous marker is carried in gRPC metadata; the destination
+// independently binds it to storage_tenant and evaluates Zanzibar.
+message RouteIndexQueryRequest {
+  PeerContext peer = 1;
+  uint64 tenant_id = 2;
+  uint64 bucket_id = 3;
+  keldra.v1.IndexDefinition definition = 4;
+  keldra.v1.IndexQuery query = 5;
+  uint32 limit = 6;
+  optional RoutedIndexQueryResume resume = 7;
+  string storage_tenant = 8;
+}
+
+// Raw generation results. Public page tokens are minted only by public ingress
+// after its own final authorization pass; replicas return engine positions.
+message RoutedIndexQueryResponse {
+  uint32 schema_version = 1;
+  repeated keldra.v1.IndexQueryHit hits = 2;
+  keldra.v1.IndexFreshness freshness = 3;
+  optional bytes next_position = 4;
+  // The peer-routing fence is distinct from freshness. Freshness retains the
+  // fence under which the returned generation was built.
+  uint64 routing_placement_term = 5;
+  uint64 routing_placement_index = 6;
+  repeated keldra.v1.IndexFacetResult facet_results = 7;
+  repeated keldra.v1.IndexAggregateResult aggregate_results = 8;
+}
+
+message RouteCreatePersonalDbGroupRequest {
+  PeerContext peer = 1;
+  keldra.v1.CreatePersonalDbGroupRequest request = 2;
+}
+
+message RouteChangePersonalDbGroupRoleRequest {
+  PeerContext peer = 1;
+  keldra.v1.ChangePersonalDbGroupRoleRequest request = 2;
+  bool granted = 3;
+}
+
+message RouteAppendPersonalDbEntryRequest {
+  PeerContext peer = 1;
+  keldra.v1.AppendPersonalDbEntryRequest request = 2;
+}
+
+message RouteMaterializePersonalDbProjectionRequest {
+  PeerContext peer = 1;
+  keldra.v1.MaterializePersonalDbProjectionRequest request = 2;
+}
+
+message RouteRegisterPersonalDbSnapshotRequest {
+  PeerContext peer = 1;
+  keldra.v1.RegisterPersonalDbSnapshotRequest request = 2;
+}
+
+message ApplyPersonalDbRoleRequest {
+  PeerContext peer = 1;
+  uint64 tenant_id = 2;
+  uint64 bucket_id = 3;
+  keldra.v1.ChangePersonalDbGroupRoleRequest request = 4;
+  bool granted = 5;
+  bool creator_owner = 6;
+}
+
+message RouteEnableAccountingRequest {
+  PeerContext peer = 1;
+  keldra.v1.EnableAccountingRequest request = 2;
+}
+
+message RouteDisableAccountingRequest {
+  PeerContext peer = 1;
+  keldra.v1.DisableAccountingRequest request = 2;
+}
+
+message RouteGetAccountingRequest {
+  PeerContext peer = 1;
+  keldra.v1.GetAccountingRequest request = 2;
+}
+
+message FlushAccountingTrafficRequest {
+  PeerContext peer = 1;
+  uint64 accounting_id = 2;
+  uint64 source_node_id = 3;
+  uint64 accepted_inbound_bytes = 4;
+  uint64 served_outbound_bytes = 5;
+  string flush_id = 6;
+  uint64 tenant_id = 7;
+  uint64 bucket_id = 8;
+}
+
+message FlushAccountingTrafficResponse {
+  uint32 schema_version = 1;
+  bool replayed = 2;
+}
+
+message AccountingTrafficEntry {
+  string exact_path = 1;
+  uint64 accepted_inbound_bytes = 2;
+  uint64 served_outbound_bytes = 3;
+}
+
+// One bounded source batch sent to the current weighted-HRW bucket matcher.
+// The matcher resolves the bucket's sparse accounting definitions and forwards
+// idempotent per-definition totals to each rank-zero accounting builder.
+message MatchAccountingTrafficRequest {
+  PeerContext peer = 1;
+  uint64 source_node_id = 2;
+  bytes source_epoch = 3;
+  uint64 sequence = 4;
+  uint64 tenant_id = 5;
+  uint64 bucket_id = 6;
+  repeated AccountingTrafficEntry entries = 7;
+}
+
+message MatchAccountingTrafficResponse {
+  uint32 schema_version = 1;
+}
+
+message InvalidateAccountingMatcherBucketRequest {
+  PeerContext peer = 1;
+  uint64 tenant_id = 2;
+  uint64 bucket_id = 3;
+}
+
+message ClearAccountingMatcherCacheRequest {
+  PeerContext peer = 1;
+}
+
+message AccountingMatcherCacheInvalidated {
+  uint32 schema_version = 1;
+}
+
+// This service is installed only on Anvil's mandatory-mTLS peer listener.
+// It exposes typed logical operations, never RocksDB keys, column-family
+// values, or a generic public-method tunnel.
+service ClusterPeer {
+  rpc ResolveTenantName(ResolveTenantNameRequest) returns (ResolveTenantNameResult);
+  rpc ResolveBucketName(ResolveBucketNameRequest) returns (ResolveBucketNameResult);
+  rpc ReadLogicalRecord(LogicalRecordReadRequest) returns (LogicalRecordCandidate);
+  rpc RepairLogicalRecord(LogicalRecordRepairRequest) returns (LogicalRecordSnapshotApplied);
+  rpc ApplyLogicalRecord(LogicalRecordMutationRequest) returns (LogicalRecordApplied);
+
+  rpc ApplySchemaPublication(SchemaPublicationApplyRequest) returns (SchemaPublicationApplied);
+  rpc HasSchemaPublication(SchemaPublicationQueryRequest) returns (Exists);
+  rpc ApplyRealmMutation(RealmMutationApplyRequest) returns (RealmMutationApplied);
+  rpc ReadRealmCandidate(RealmCandidateReadRequest) returns (RealmCandidate);
+  rpc ReadRealmAggregate(RealmAggregateReadRequest) returns (stream RealmAggregateFrame);
+  rpc InstallRealmCandidate(stream RealmCandidateInstallFrame) returns (RealmCandidateInstalled);
+  rpc FreshAuthorizationCheck(FreshAuthorizationCheckRequest) returns (FreshAuthorizationCheckResult);
+  rpc FreshAuthorizationChecks(FreshAuthorizationChecksRequest) returns (FreshAuthorizationChecksResult);
+
+  rpc ReadReferenceProof(ReferenceProofReadRequest) returns (ReferenceProofReadResponse);
+  rpc ListLocalObjects(LocalListRequest) returns (LocalListPage);
+  rpc GetWatchStatus(WatchStatusRequest) returns (WatchStatus);
+  rpc ReadWatchPage(WatchPageRequest) returns (WatchPage);
+
+  rpc RoutePutEnd(RoutePutEndRequest) returns (keldra.v1.MutationReceipt);
+  rpc RouteDelete(RouteDeleteRequest) returns (keldra.v1.MutationReceipt);
+  rpc RouteDeleteIfVersion(RouteDeleteIfVersionRequest) returns (keldra.v1.MutationReceipt);
+  rpc RouteBulkWrite(RouteBulkWriteRequest) returns (keldra.v1.BulkWriteResponse);
+  // Dedicated mandatory-mTLS routes for an in-process trusted adapter. The
+  // internal capability is reconstructed at the destination and is never a
+  // protobuf field or caller-controlled metadata value.
+  rpc RouteInternalPutEnd(RoutePutEndRequest) returns (keldra.v1.MutationReceipt);
+  rpc RouteInternalDeleteIfVersion(RouteDeleteIfVersionRequest) returns (keldra.v1.MutationReceipt);
+  rpc RouteInternalBulkWrite(RouteBulkWriteRequest) returns (keldra.v1.BulkWriteResponse);
+  rpc RouteProvisionTenant(RouteProvisionTenantRequest) returns (keldra.v1.ProvisionTenantResponse);
+  rpc RouteCreateBucket(RouteCreateBucketRequest) returns (keldra.v1.CreateBucketResponse);
+  rpc RouteCredentialExchange(RouteCredentialExchangeRequest) returns (keldra.v1.AccessToken);
+  rpc RouteAdminCreateApplication(RouteAdminCreateApplicationRequest) returns (keldra.v1.ApplicationCredential);
+  rpc RouteAdminRotateCredential(RouteAdminRotateCredentialRequest) returns (keldra.v1.ApplicationCredential);
+  rpc RouteAdminRecoverCredential(RouteAdminRecoverCredentialRequest) returns (keldra.v1.ApplicationCredential);
+  rpc RouteAdminDisableCredential(RouteAdminDisableCredentialRequest) returns (keldra.v1.ApplicationCredentialState);
+  rpc RouteAdminSetBucketVersioning(RouteAdminSetBucketVersioningRequest) returns (keldra.v1.SetBucketVersioningResponse);
+  rpc RouteAdminSetBucketPublicRead(RouteAdminSetBucketPublicReadRequest) returns (keldra.v1.SetBucketPublicReadResponse);
+  rpc RouteAdminChangeApplicationRole(RouteAdminChangeApplicationRoleRequest) returns (keldra.v1.ApplicationRoleResponse);
+  rpc RouteInvokeProgram(RouteInvokeProgramRequest) returns (keldra.v1.InvokeProgramResponse);
+  rpc RouteAuthzPutSchema(RouteAuthzPutSchemaRequest) returns (keldra.v1.PutSchemaResponse);
+  rpc RouteAuthzBindSchema(RouteAuthzBindSchemaRequest) returns (keldra.v1.BindSchemaResponse);
+  rpc RouteAuthzGetBinding(RouteAuthzGetBindingRequest) returns (keldra.v1.GetBindingResponse);
+  rpc RouteAuthzGetSchema(RouteAuthzGetSchemaRequest) returns (keldra.v1.GetSchemaResponse);
+  rpc RouteAuthzMutateTuples(RouteAuthzMutateTuplesRequest) returns (keldra.v1.MutateTuplesResponse);
+  rpc RouteAuthzReadTuples(RouteAuthzReadTuplesRequest) returns (keldra.v1.ReadTuplesResponse);
+  rpc RouteAuthzCheckPermission(RouteAuthzCheckPermissionRequest) returns (keldra.v1.CheckPermissionResponse);
+  rpc RouteAuthzCheckPermissions(RouteAuthzCheckPermissionsRequest) returns (keldra.v1.CheckPermissionsResponse);
+  rpc RouteSetBucketPolicy(RouteSetBucketPolicyRequest) returns (keldra.v1.BucketPolicy);
+  rpc RouteDeleteVersion(RouteDeleteVersionRequest) returns (keldra.v1.DeleteVersionResponse);
+
+  rpc StageProgramPath(ProgramStagePathRequest) returns (ProgramStagePathResponse);
+  rpc CoordinateProgramPathFinalization(ProgramCoordinatePathFinalizationRequest) returns (ProgramCoordinatedPathFinalization);
+  rpc ApplyProgramPathFinalization(ProgramApplyPathFinalizationRequest) returns (ProgramPathFinalizationApplied);
+
+  rpc PublishIndexArtifact(PublishIndexArtifactRequest) returns (IndexArtifactPublished);
+  rpc PublishIndexArtifacts(PublishIndexArtifactsRequest) returns (IndexArtifactsPublished);
+  rpc CommitGuardedIndexArtifact(CommitGuardedIndexArtifactRequest) returns (IndexArtifactPublished);
+  rpc DeleteIndexArtifact(DeleteIndexArtifactRequest) returns (IndexArtifactDeleted);
+  rpc ScanIndexHeads(ScanIndexHeadsRequest) returns (IndexHeadScanPage);
+  rpc ScanIndexSourceSnapshot(stream IndexSourceSnapshotRequest) returns (stream IndexSourceSnapshotResponse);
+  rpc ScanRetainedSourceSnapshot(stream RetainedSourceSnapshotRequest) returns (stream RetainedSourceSnapshotResponse);
+  rpc RouteIndexQuery(RouteIndexQueryRequest) returns (RoutedIndexQueryResponse);
+  rpc RouteCreatePersonalDbGroup(RouteCreatePersonalDbGroupRequest) returns (keldra.v1.PersonalDbGroup);
+  rpc RouteChangePersonalDbGroupRole(RouteChangePersonalDbGroupRoleRequest) returns (keldra.v1.PersonalDbGroupRoleChange);
+  rpc RouteAppendPersonalDbEntry(RouteAppendPersonalDbEntryRequest) returns (keldra.v1.PersonalDbCommit);
+  rpc RouteMaterializePersonalDbProjection(RouteMaterializePersonalDbProjectionRequest) returns (keldra.v1.PersonalDbMaterialization);
+  rpc RouteRegisterPersonalDbSnapshot(RouteRegisterPersonalDbSnapshotRequest) returns (keldra.v1.PersonalDbSnapshot);
+  rpc ApplyPersonalDbRole(ApplyPersonalDbRoleRequest) returns (keldra.v1.PersonalDbGroupRoleChange);
+  rpc RouteEnableAccounting(RouteEnableAccountingRequest) returns (keldra.v1.AccountingDefinition);
+  rpc RouteDisableAccounting(RouteDisableAccountingRequest) returns (keldra.v1.DisableAccountingResponse);
+  rpc RouteGetAccounting(RouteGetAccountingRequest) returns (keldra.v1.AccountingSnapshot);
+  rpc MatchAccountingTraffic(MatchAccountingTrafficRequest) returns (MatchAccountingTrafficResponse);
+  rpc FlushAccountingTraffic(FlushAccountingTrafficRequest) returns (FlushAccountingTrafficResponse);
+  rpc InvalidateAccountingMatcherBucket(InvalidateAccountingMatcherBucketRequest) returns (AccountingMatcherCacheInvalidated);
+  rpc ClearAccountingMatcherCache(ClearAccountingMatcherCacheRequest) returns (AccountingMatcherCacheInvalidated);
+
+  rpc CoordinateLogicalRecord(CoordinateLogicalRecordRequest) returns (CoordinateLogicalRecordResponse);
+  rpc ReadCoordinatedLogicalRecord(CoordinatedLogicalReadRequest) returns (CoordinatedLogicalReadResponse);
+  rpc CoordinateSystemGrant(CoordinateSystemGrantRequest) returns (CoordinateSystemGrantResponse);
+}

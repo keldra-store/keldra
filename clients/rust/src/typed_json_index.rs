@@ -5,9 +5,9 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::marker::PhantomData;
 
-use anvil_api::v1::index_field::FieldType;
-use anvil_api::v1::index_specification::Specification;
-use anvil_api::v1::{
+use keldra_api::v1::index_field::FieldType;
+use keldra_api::v1::index_specification::Specification;
+use keldra_api::v1::{
     BooleanIndexField, CreateIndexRequest, FloatIndexField, IndexField, IndexFieldCapability,
     IndexFieldCardinality, IndexOrder, IndexOrderDirection, IndexSpecification, KeywordIndexField,
     SignedIntegerIndexField, TextAnalyzer, TextIndexField, TypedJsonIndexSpec,
@@ -696,9 +696,9 @@ fn validate_definition(
 
 #[cfg(test)]
 mod tests {
-    use anvil_api::v1::index_field::FieldType;
-    use anvil_api::v1::index_specification::Specification;
-    use anvil_api::v1::{IndexFieldCapability, IndexFieldCardinality, TextAnalyzer};
+    use keldra_api::v1::index_field::FieldType;
+    use keldra_api::v1::index_specification::Specification;
+    use keldra_api::v1::{IndexFieldCapability, IndexFieldCardinality, TextAnalyzer};
 
     use super::{
         BooleanField, FloatField, IndexDefinitionError, KeywordField, SignedIntegerField,

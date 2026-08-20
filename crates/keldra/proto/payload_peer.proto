@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+package keldra.payload_peer.v1;
+
+message PeerContext {
+  uint32 schema_version = 1;
+  bytes cluster_id = 2;
+  uint64 source_node_id = 3;
+}
+
+message BlobIdentity {
+  bytes hash = 1;
+  uint64 length = 2;
+}
+
+enum Durability {
+  LOCAL = 0;
+  REPLICATED = 1;
+}
+
+message PreparePayloadRequest {
+  PeerContext peer = 1;
+  BlobIdentity blob = 2;
+  Durability durability = 3;
+}
+
+message ArtifactEvidence {
+  uint64 node_id = 1;
+  bool complete_copy = 2;
+  optional uint32 shard_ordinal = 3;
+}
+
+message PreparedPayloadEvidence {
+  uint32 schema_version = 1;
+  uint64 placement_fence_term = 2;
+  uint64 placement_fence_index = 3;
+  BlobIdentity blob = 4;
+  uint64 upload_source_node_id = 5;
+  repeated ArtifactEvidence artifacts = 6;
+}
+
+service PayloadPeer {
+  rpc PreparePayload(PreparePayloadRequest) returns (PreparedPayloadEvidence);
+}

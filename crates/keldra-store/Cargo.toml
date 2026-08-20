@@ -1,0 +1,31 @@
+[package]
+name = "keldra-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The small versioned object kernel for Anvil"
+publish = false
+
+[dependencies]
+keldra-atomic-program = { path = "../keldra-atomic-program" }
+keldra-authz = { path = "../keldra-authz" }
+anyhow = "1"
+argon2 = "0.5.3"
+base64 = "0.22"
+blake3 = "1.8"
+crc32c = "0.6.8"
+hex = "0.4"
+getrandom = "0.3"
+reed-solomon-erasure = { version = "6.0.0", default-features = false, features = ["std"] }
+rocksdb = { version = "0.24", default-features = false, features = ["bindgen-runtime"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+subtle = "2.6"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1.47", features = ["fs", "io-util", "sync"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "time"] }

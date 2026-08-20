@@ -6,11 +6,11 @@ GEMINI.md
 # Added by cargo
 
 /target
-anvil-data
+keldra-data
 
 # Local Anvil runtime state and secrets
-crates/anvil/.env
-crates/anvil/anvil-data/
+crates/keldra/.env
+crates/keldra/keldra-data/
 
 # Client package build outputs
 clients/typescript/dist/
@@ -19,8 +19,8 @@ clients/typescript/*.tgz
 clients/python/build/
 clients/python/dist/
 clients/python/*.egg-info/
-clients/python/src/anvil_storage_client.egg-info/
-clients/python/src/anvil_storage_client/anvil_pb2.py
-clients/python/src/anvil_storage_client/anvil_pb2_grpc.py
+clients/python/src/keldra_storage_client.egg-info/
+clients/python/src/keldra_storage_client/keldra_pb2.py
+clients/python/src/keldra_storage_client/keldra_pb2_grpc.py
 tmp
 .tmp/

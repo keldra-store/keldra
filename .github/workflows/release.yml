@@ -59,7 +59,7 @@ jobs:
           printf 'tag=%s\ncommit=%s\n' "$tag" "$commit" >>"$GITHUB_OUTPUT"
 
   validate:
-    name: Validate Keldra 0.1 release
+    name: Validate Keldra 0.10 release
     needs: release-context
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -118,7 +118,7 @@ jobs:
       contents: read
       packages: write
     env:
-      ANVIL_IMAGE: anvil:release-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+      ANVIL_IMAGE: keldra:release-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
       ANVIL_DOCKER_PLATFORM: ${{ matrix.platform }}
     strategy:
       fail-fast: false
@@ -163,7 +163,7 @@ jobs:
             --sbom=false \
             --output "type=image,name=${repository},push=true,push-by-digest=true,name-canonical=true" \
             --metadata-file "$metadata_file" \
-            --file crates/anvil/Dockerfile \
+            --file crates/keldra/Dockerfile \
             .
 
           digest="$(
@@ -212,7 +212,7 @@ jobs:
           fi
 
   publish:
-    name: Publish Keldra 0.1 image and release
+    name: Publish Keldra 0.10 image and release
     needs: [release-context, validate, build-image]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -326,7 +326,7 @@ jobs:
           generate_release_notes: true
           make_latest: true
           body: |
-            Keldra 0.1.0 is the first release under the Keldra name. It includes
+            Keldra 0.10.0 is the first release under the Keldra name. It includes
             the `keldra` Rust crate and CLI, the multi-platform Keldra server
             image, and the authorized HTTP plugin broker used by separately
             deployed protocol plugins. Object, index, PersonalDB, accounting,

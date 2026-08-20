@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-image="${ANVIL_IMAGE:-anvil:test}"
+image="${ANVIL_IMAGE:-keldra:test}"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source_commit="$(git -C "${repo_root}" rev-parse --verify 'HEAD^{commit}')"
 source_revision="${source_commit}"
@@ -36,15 +36,15 @@ case "${ANVIL_DOCKER_PLATFORM:-}" in
     ;;
 esac
 
-echo "[anvil] building ${image} in the ${platform} trixie builder"
-iid_file="$(mktemp -t anvil-image.XXXXXX)"
+echo "[keldra] building ${image} in the ${platform} trixie builder"
+iid_file="$(mktemp -t keldra-image.XXXXXX)"
 trap 'rm -f "${iid_file}"' EXIT
 docker buildx build \
   --platform "${platform}" \
   --build-arg "ANVIL_SOURCE_REVISION=${source_revision}" \
   --load \
   --iidfile "${iid_file}" \
-  --file crates/anvil/Dockerfile \
+  --file crates/keldra/Dockerfile \
   -t "${image}" \
   .
 
@@ -58,4 +58,4 @@ fi
 docker image inspect "${image_id}" >/dev/null
 docker tag "$image_id" "$image"
 
-echo "[anvil] built ${image} (${image_id})"
+echo "[keldra] built ${image} (${image_id})"

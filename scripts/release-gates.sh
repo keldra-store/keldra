@@ -10,7 +10,7 @@ run_step() {
   local started
   started="$(date +%s)"
   echo "::group::${name}"
-  echo "[anvil-gate] start ${name}"
+  echo "[keldra-gate] start ${name}"
   set +e
   if [[ "${timeout_seconds}" != "0" ]] && command -v timeout >/dev/null 2>&1; then
     timeout --kill-after=30s "${timeout_seconds}s" "$@"
@@ -19,7 +19,7 @@ run_step() {
   fi
   local status=$?
   set -e
-  echo "[anvil-gate] finish ${name} status=${status} elapsed=$(($(date +%s) - started))s"
+  echo "[keldra-gate] finish ${name} status=${status} elapsed=$(($(date +%s) - started))s"
   echo "::endgroup::"
   return "${status}"
 }
@@ -35,10 +35,10 @@ static_gates() {
 rust_gates() {
   local build_jobs="${CARGO_BUILD_JOBS:-1}"
   local test_threads="${ANVIL_RUST_TEST_THREADS:-4}"
-  run_step "Keldra 0.1 workspace Clippy" cargo clippy --jobs "${build_jobs}" --locked --workspace \
+  run_step "Keldra 0.10 workspace Clippy" cargo clippy --jobs "${build_jobs}" --locked --workspace \
     --all-targets \
     --no-deps
-  run_step "Keldra 0.1 workspace tests" cargo test --jobs "${build_jobs}" --locked --workspace --all-targets -- \
+  run_step "Keldra 0.10 workspace tests" cargo test --jobs "${build_jobs}" --locked --workspace --all-targets -- \
     --nocapture \
     --test-threads="${test_threads}"
 }
@@ -46,7 +46,7 @@ rust_gates() {
 server_gates() {
   local build_jobs="${CARGO_BUILD_JOBS:-1}"
   local test_threads="${ANVIL_RUST_TEST_THREADS:-4}"
-  run_step "Keldra 0.1 server, client, and CLI tests" cargo test --jobs "${build_jobs}" --locked \
+  run_step "Keldra 0.10 server, client, and CLI tests" cargo test --jobs "${build_jobs}" --locked \
     -p keldra-server \
     -p keldra \
     -p keldra-cli \
@@ -57,7 +57,7 @@ server_gates() {
 }
 
 image_gates() (
-  local configured_image="${ANVIL_IMAGE:-anvil:test}"
+  local configured_image="${ANVIL_IMAGE:-keldra:test}"
   local image
   image="$(./scripts/resolve-docker-image-id.sh "${configured_image}")"
   run_step "image server version" docker run --rm "${image}" keldra-server --version
@@ -66,7 +66,7 @@ image_gates() (
   local scratch
   scratch="$(mktemp -d)"
   chmod 0755 "${scratch}"
-  local container="anvil-v09-smoke-${$}"
+  local container="keldra-v09-smoke-${$}"
   cleanup_image_gate() {
     docker rm --force "${container}" >/dev/null 2>&1 || true
     docker run --rm --user 0 --volume "${scratch}:/smoke" "${image}" \
@@ -85,12 +85,12 @@ image_gates() (
   chmod 0444 "${scratch}/payload"
   docker run --detach --name "${container}" \
     --env ANVIL_LISTEN=0.0.0.0:50051 \
-    --env ANVIL_DATA_DIR=/var/lib/anvil \
+    --env ANVIL_DATA_DIR=/var/lib/keldra \
     --env ANVIL_NODE_ID=1 \
-    --env ANVIL_TOKEN_SIGNING_KEY_FILE=/run/secrets/anvil-token-signing-key \
+    --env ANVIL_TOKEN_SIGNING_KEY_FILE=/run/secrets/keldra-token-signing-key \
     --env ANVIL_RUN_SYSTEM_BOOTSTRAP=true \
-    --volume "${scratch}/data:/var/lib/anvil" \
-    --volume "${scratch}/signing-key:/run/secrets/anvil-token-signing-key:ro" \
+    --volume "${scratch}/data:/var/lib/keldra" \
+    --volume "${scratch}/signing-key:/run/secrets/keldra-token-signing-key:ro" \
     "${image}" >/dev/null
 
   local owner_client_id="smoke-owner-client"
@@ -101,11 +101,11 @@ image_gates() (
     local probe
     probe="$(
       docker run --rm --network "container:${container}" \
-        --volume "${scratch}/data:/var/lib/anvil:ro" \
+        --volume "${scratch}/data:/var/lib/keldra:ro" \
         --env ANVIL_NEW_CLIENT_SECRET="${owner_client_secret}" \
         "${image}" \
         keldra --endpoint http://127.0.0.1:50051 \
-        --credentials-file /var/lib/anvil/system-bootstrap-credential.json \
+        --credentials-file /var/lib/keldra/system-bootstrap-credential.json \
         provision-tenant smoke smoke-owner "${owner_client_id}" 2>&1 || true
     )"
     if grep -Fq 'tenant=smoke' <<<"${probe}"; then
@@ -127,8 +127,8 @@ image_gates() (
     "${image}" \
     keldra --endpoint http://127.0.0.1:50051 create-bucket objects
 
-  docker run --rm --volume "${scratch}/data:/var/lib/anvil" "${image}" \
-    rm /var/lib/anvil/system-bootstrap-credential.json
+  docker run --rm --volume "${scratch}/data:/var/lib/keldra" "${image}" \
+    rm /var/lib/keldra/system-bootstrap-credential.json
   if [[ -e "${scratch}/data/system-bootstrap-credential.json" ]]; then
     echo "generated bootstrap credential was not deleted after provisioning" >&2
     return 1

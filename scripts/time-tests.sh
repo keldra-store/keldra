@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-out_dir="${ANVIL_TEST_TIMING_DIR:-target/anvil/test-timings}"
+out_dir="${ANVIL_TEST_TIMING_DIR:-target/keldra/test-timings}"
 mkdir -p "$out_dir"
 
 printf 'Writing timing outputs to %s\n' "$out_dir"

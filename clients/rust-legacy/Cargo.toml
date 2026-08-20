@@ -14,4 +14,4 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-keldra = { version = "=0.1.0", path = "../rust" }
+keldra = { version = "=0.10.0", path = "../rust" }

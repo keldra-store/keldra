@@ -111,47 +111,47 @@ incident_query_terminal_json() {
   local tier
   local value
   local -a fields=(
-    monotonic_counter.anvil_index_query_read_ops_total
-    monotonic_counter.anvil_index_query_read_bytes_total
-    monotonic_counter.anvil_index_query_cooperative_yields_total
-    monotonic_counter.anvil_index_query_failures_total
-    monotonic_counter.anvil_index_query_cancellations_total
-    monotonic_counter.anvil_index_query_planner_conjunctions_total
-    monotonic_counter.anvil_index_query_planner_reordered_conjunctions_total
-    monotonic_counter.anvil_index_query_planner_costed_children_total
-    monotonic_counter.anvil_index_query_planner_child_cost_total
-    monotonic_counter.anvil_index_query_term_seeks_total
-    monotonic_counter.anvil_index_query_enumerated_terms_total
-    monotonic_counter.anvil_index_query_posting_blocks_decoded_total
-    monotonic_counter.anvil_index_query_posting_blocks_sought_total
-    monotonic_counter.anvil_index_query_posting_blocks_skipped_total
-    monotonic_counter.anvil_index_query_posting_bytes_read_total
-    monotonic_counter.anvil_index_query_posting_advance_calls_total
-    monotonic_counter.anvil_index_query_conjunction_advances_total
-    monotonic_counter.anvil_index_query_union_heap_pushes_total
-    monotonic_counter.anvil_index_query_union_heap_pops_total
-    monotonic_counter.anvil_index_query_two_phase_verifications_total
-    monotonic_counter.anvil_index_query_candidate_doc_ids_total
-    monotonic_counter.anvil_index_query_live_mask_blocks_decoded_total
-    monotonic_counter.anvil_index_query_live_mask_rejects_total
-    monotonic_counter.anvil_index_query_point_blocks_decoded_total
-    monotonic_counter.anvil_index_query_doc_value_blocks_decoded_total
-    monotonic_counter.anvil_index_query_facet_documents_processed_total
-    monotonic_counter.anvil_index_query_facet_values_processed_total
-    monotonic_counter.anvil_index_query_aggregate_documents_processed_total
-    monotonic_counter.anvil_index_query_aggregate_values_processed_total
-    monotonic_counter.anvil_index_query_cursor_seeks_total
-    monotonic_counter.anvil_index_query_cursor_skipped_doc_ids_total
-    monotonic_counter.anvil_index_query_physical_early_terminations_total
-    monotonic_counter.anvil_index_query_top_k_inspected_total
-    monotonic_counter.anvil_index_query_candidate_gate_checked_total
-    monotonic_counter.anvil_index_query_candidate_gate_batches_total
-    monotonic_counter.anvil_index_query_candidate_gate_denied_total
-    monotonic_counter.anvil_index_query_candidate_gate_stale_total
-    monotonic_counter.anvil_index_query_candidate_gate_refills_total
-    histogram.anvil_index_query_returned_hits
-    histogram.anvil_index_query_planner_lead_cost_min
-    histogram.anvil_index_query_planner_lead_cost_max
+    monotonic_counter.keldra_index_query_read_ops_total
+    monotonic_counter.keldra_index_query_read_bytes_total
+    monotonic_counter.keldra_index_query_cooperative_yields_total
+    monotonic_counter.keldra_index_query_failures_total
+    monotonic_counter.keldra_index_query_cancellations_total
+    monotonic_counter.keldra_index_query_planner_conjunctions_total
+    monotonic_counter.keldra_index_query_planner_reordered_conjunctions_total
+    monotonic_counter.keldra_index_query_planner_costed_children_total
+    monotonic_counter.keldra_index_query_planner_child_cost_total
+    monotonic_counter.keldra_index_query_term_seeks_total
+    monotonic_counter.keldra_index_query_enumerated_terms_total
+    monotonic_counter.keldra_index_query_posting_blocks_decoded_total
+    monotonic_counter.keldra_index_query_posting_blocks_sought_total
+    monotonic_counter.keldra_index_query_posting_blocks_skipped_total
+    monotonic_counter.keldra_index_query_posting_bytes_read_total
+    monotonic_counter.keldra_index_query_posting_advance_calls_total
+    monotonic_counter.keldra_index_query_conjunction_advances_total
+    monotonic_counter.keldra_index_query_union_heap_pushes_total
+    monotonic_counter.keldra_index_query_union_heap_pops_total
+    monotonic_counter.keldra_index_query_two_phase_verifications_total
+    monotonic_counter.keldra_index_query_candidate_doc_ids_total
+    monotonic_counter.keldra_index_query_live_mask_blocks_decoded_total
+    monotonic_counter.keldra_index_query_live_mask_rejects_total
+    monotonic_counter.keldra_index_query_point_blocks_decoded_total
+    monotonic_counter.keldra_index_query_doc_value_blocks_decoded_total
+    monotonic_counter.keldra_index_query_facet_documents_processed_total
+    monotonic_counter.keldra_index_query_facet_values_processed_total
+    monotonic_counter.keldra_index_query_aggregate_documents_processed_total
+    monotonic_counter.keldra_index_query_aggregate_values_processed_total
+    monotonic_counter.keldra_index_query_cursor_seeks_total
+    monotonic_counter.keldra_index_query_cursor_skipped_doc_ids_total
+    monotonic_counter.keldra_index_query_physical_early_terminations_total
+    monotonic_counter.keldra_index_query_top_k_inspected_total
+    monotonic_counter.keldra_index_query_candidate_gate_checked_total
+    monotonic_counter.keldra_index_query_candidate_gate_batches_total
+    monotonic_counter.keldra_index_query_candidate_gate_denied_total
+    monotonic_counter.keldra_index_query_candidate_gate_stale_total
+    monotonic_counter.keldra_index_query_candidate_gate_refills_total
+    histogram.keldra_index_query_returned_hits
+    histogram.keldra_index_query_planner_lead_cost_min
+    histogram.keldra_index_query_planner_lead_cost_max
   )
   [[ "$(log_span_unsigned_field index.id "${line}")" == "${expected_index_id}" ]] \
     || return 1
@@ -162,10 +162,10 @@ incident_query_terminal_json() {
   log_field_equals query.outcome completed "${line}" || return 1
   tier="$(log_word_field index.tier "${line}")" || return 1
   duration="$(
-    log_span_number_field histogram.anvil_index_query_duration_seconds "${line}"
+    log_span_number_field histogram.keldra_index_query_duration_seconds "${line}"
   )" || return 1
   read_quantum="$(
-    log_span_number_field histogram.anvil_index_query_read_quantum_bytes "${line}"
+    log_span_number_field histogram.keldra_index_query_read_quantum_bytes "${line}"
   )" || return 1
   local rows
   rows="$(mktemp)"
@@ -196,8 +196,8 @@ incident_query_terminal_json() {
         generation: $generation,
         tier: $tier,
         expected_hits: $expected_hits,
-        logical_read_ops: $c["monotonic_counter.anvil_index_query_read_ops_total"],
-        logical_read_bytes: $c["monotonic_counter.anvil_index_query_read_bytes_total"],
+        logical_read_ops: $c["monotonic_counter.keldra_index_query_read_ops_total"],
+        logical_read_bytes: $c["monotonic_counter.keldra_index_query_read_bytes_total"],
         physical_cache_fetches: $physical_fetches,
         physical_cache_fetch_bytes: $physical_fetch_bytes,
         cache_warm_for_required_blocks: ($physical_fetch_bytes == 0),
@@ -282,7 +282,7 @@ write_incident_query_evidence() {
       [[ "${session_index_id}" == "${expected_index_id}" ]] || continue
       if [[ "${line}" == *"local index query admitted"* ]] \
         && [[ "$(log_span_unsigned_field \
-          monotonic_counter.anvil_index_query_runs_total "${line}" || true)" == "1" ]]
+          monotonic_counter.keldra_index_query_runs_total "${line}" || true)" == "1" ]]
       then
         active=1
         fetch_bytes=0
@@ -292,12 +292,12 @@ write_incident_query_evidence() {
       ((active == 1)) || continue
       if [[ "${line}" == *"index cache block fetch"* ]]; then
         value="$(log_span_unsigned_field \
-          monotonic_counter.anvil_index_cache_fetches_total "${line}" || true)"
+          monotonic_counter.keldra_index_cache_fetches_total "${line}" || true)"
         [[ -z "${value}" ]] || fetches=$((fetches + value))
       fi
       if [[ "${line}" == *"index cache block fetched"* ]]; then
         value="$(log_span_unsigned_field \
-          monotonic_counter.anvil_index_cache_fetch_bytes_total "${line}" || true)"
+          monotonic_counter.keldra_index_cache_fetch_bytes_total "${line}" || true)"
         [[ -z "${value}" ]] || fetch_bytes=$((fetch_bytes + value))
       fi
       if [[ "${line}" == *"local index query reached a terminal outcome"* ]]; then
@@ -313,7 +313,7 @@ write_incident_query_evidence() {
     for ((start = 0; start + query_count - 1 < ${#file_lines[@]}; start++)); do
       for ((position = 0; position < query_count; position++)); do
         returned_hits="$(log_span_unsigned_field \
-          histogram.anvil_index_query_returned_hits \
+          histogram.keldra_index_query_returned_hits \
           "${file_lines[start + position]}" || true)"
         [[ "${returned_hits}" == "${expected_hits[position]}" ]] || break
       done
@@ -363,7 +363,7 @@ write_incident_query_evidence() {
   done
 
   jq -s \
-    --arg schema anvil.index-production-query-server-evidence.v1 \
+    --arg schema keldra.index-production-query-server-evidence.v1 \
     --arg topology "${topology}" \
     --arg source_commit "${source_commit}" \
     --argjson corpus_records "${corpus_records}" \
@@ -396,40 +396,40 @@ write_incident_query_evidence() {
             "zero_hit_sparse_conjunction", "unselective_arbitrary_sort",
             "exact_computations"
           ] and
-          ($queries | map(.terminal_counters["histogram.anvil_index_query_returned_hits"])) ==
+          ($queries | map(.terminal_counters["histogram.keldra_index_query_returned_hits"])) ==
             [4, 999, 999, 0, 4, 4] and
           ($queries | all(
             .index_id == $index_id and
             .definition_version == $definition_version and
             .generation == $generation and
-            .terminal_counters["monotonic_counter.anvil_index_query_failures_total"] == 0 and
-            .terminal_counters["monotonic_counter.anvil_index_query_cancellations_total"] == 0 and
+            .terminal_counters["monotonic_counter.keldra_index_query_failures_total"] == 0 and
+            .terminal_counters["monotonic_counter.keldra_index_query_cancellations_total"] == 0 and
             .logical_read_ops > 0 and .logical_read_bytes > 0 and .duration_seconds > 0
           )) and
           ($queries[0:4] | all(
             .tier == "physical" and
             .logical_read_bytes < $publication_bytes_ceiling and
-            .terminal_counters["monotonic_counter.anvil_index_query_candidate_doc_ids_total"] < $record_ceiling and
-            .terminal_counters["monotonic_counter.anvil_index_query_doc_value_blocks_decoded_total"] < $record_ceiling
+            .terminal_counters["monotonic_counter.keldra_index_query_candidate_doc_ids_total"] < $record_ceiling and
+            .terminal_counters["monotonic_counter.keldra_index_query_doc_value_blocks_decoded_total"] < $record_ceiling
           )) and
           ($queries[0:5] | all(
-            .terminal_counters["monotonic_counter.anvil_index_query_facet_documents_processed_total"] == 0 and
-            .terminal_counters["monotonic_counter.anvil_index_query_facet_values_processed_total"] == 0 and
-            .terminal_counters["monotonic_counter.anvil_index_query_aggregate_documents_processed_total"] == 0 and
-            .terminal_counters["monotonic_counter.anvil_index_query_aggregate_values_processed_total"] == 0
+            .terminal_counters["monotonic_counter.keldra_index_query_facet_documents_processed_total"] == 0 and
+            .terminal_counters["monotonic_counter.keldra_index_query_facet_values_processed_total"] == 0 and
+            .terminal_counters["monotonic_counter.keldra_index_query_aggregate_documents_processed_total"] == 0 and
+            .terminal_counters["monotonic_counter.keldra_index_query_aggregate_values_processed_total"] == 0
           )) and
           ($queries[0:3] | all(
-            .terminal_counters["monotonic_counter.anvil_index_query_physical_early_terminations_total"] > 0
+            .terminal_counters["monotonic_counter.keldra_index_query_physical_early_terminations_total"] > 0
           )) and
-          $queries[2].terminal_counters["monotonic_counter.anvil_index_query_cursor_seeks_total"] > 0 and
-          $queries[2].terminal_counters["monotonic_counter.anvil_index_query_cursor_skipped_doc_ids_total"] < $record_ceiling and
+          $queries[2].terminal_counters["monotonic_counter.keldra_index_query_cursor_seeks_total"] > 0 and
+          $queries[2].terminal_counters["monotonic_counter.keldra_index_query_cursor_skipped_doc_ids_total"] < $record_ceiling and
           $queries[4].tier == "top_k" and
-          $queries[4].terminal_counters["monotonic_counter.anvil_index_query_top_k_inspected_total"] > 0 and
+          $queries[4].terminal_counters["monotonic_counter.keldra_index_query_top_k_inspected_total"] > 0 and
           $queries[5].tier == "physical" and
-          $queries[5].terminal_counters["monotonic_counter.anvil_index_query_facet_documents_processed_total"] == $expected_computation_documents and
-          $queries[5].terminal_counters["monotonic_counter.anvil_index_query_facet_values_processed_total"] == $expected_computation_documents and
-          $queries[5].terminal_counters["monotonic_counter.anvil_index_query_aggregate_documents_processed_total"] == $expected_computation_documents and
-          $queries[5].terminal_counters["monotonic_counter.anvil_index_query_aggregate_values_processed_total"] == $expected_computation_documents
+          $queries[5].terminal_counters["monotonic_counter.keldra_index_query_facet_documents_processed_total"] == $expected_computation_documents and
+          $queries[5].terminal_counters["monotonic_counter.keldra_index_query_facet_values_processed_total"] == $expected_computation_documents and
+          $queries[5].terminal_counters["monotonic_counter.keldra_index_query_aggregate_documents_processed_total"] == $expected_computation_documents and
+          $queries[5].terminal_counters["monotonic_counter.keldra_index_query_aggregate_values_processed_total"] == $expected_computation_documents
         )
     ' "${queries}" >"${output}"
   local status=$?
@@ -440,7 +440,7 @@ write_incident_query_evidence() {
     return 1
   fi
   chmod 0600 "${output}"
-  echo "[anvil-qualification] preserved incident-query server evidence ${output}"
+  echo "[keldra-qualification] preserved incident-query server evidence ${output}"
 }
 
 isolated_typed_json_query_work() {
@@ -456,15 +456,15 @@ isolated_typed_json_query_work() {
     while IFS= read -r line; do
       terminal_count=$((terminal_count + 1))
       index_id="$(log_span_unsigned_field index.id "${line}")" || return 1
-      ops="$(log_unsigned_field monotonic_counter.anvil_index_query_read_ops_total "${line}")" \
+      ops="$(log_unsigned_field monotonic_counter.keldra_index_query_read_ops_total "${line}")" \
         || return 1
-      bytes="$(log_unsigned_field monotonic_counter.anvil_index_query_read_bytes_total "${line}")" \
+      bytes="$(log_unsigned_field monotonic_counter.keldra_index_query_read_bytes_total "${line}")" \
         || return 1
       if [[ "${index_id}" != "${expected_index_id}" ]] \
         || ! log_field_equals query.outcome completed "${line}" \
-        || [[ "$(log_unsigned_field monotonic_counter.anvil_index_query_failures_total "${line}")" != "0" ]] \
-        || [[ "$(log_unsigned_field monotonic_counter.anvil_index_query_cancellations_total "${line}")" != "0" ]] \
-        || [[ "$(log_unsigned_field histogram.anvil_index_query_returned_hits "${line}")" != "1" ]] \
+        || [[ "$(log_unsigned_field monotonic_counter.keldra_index_query_failures_total "${line}")" != "0" ]] \
+        || [[ "$(log_unsigned_field monotonic_counter.keldra_index_query_cancellations_total "${line}")" != "0" ]] \
+        || [[ "$(log_unsigned_field histogram.keldra_index_query_returned_hits "${line}")" != "1" ]] \
         || ((ops == 0 || bytes == 0))
       then
         echo "isolated TypedJson query emitted inconsistent terminal telemetry" >&2
@@ -536,15 +536,15 @@ terminal_typed_json_debt() {
         END { print line }
       ' "${file}")"
     [[ -n "${line}" ]] || continue
-    debt_tiers="$(log_unsigned_field gauge.anvil_index_compaction_debt_tiers "${line}")" \
+    debt_tiers="$(log_unsigned_field gauge.keldra_index_compaction_debt_tiers "${line}")" \
       || return 1
-    debt_segments="$(log_unsigned_field gauge.anvil_index_compaction_debt_segments "${line}")" \
+    debt_segments="$(log_unsigned_field gauge.keldra_index_compaction_debt_segments "${line}")" \
       || return 1
-    debt_bytes="$(log_unsigned_field gauge.anvil_index_compaction_debt_bytes "${line}")" \
+    debt_bytes="$(log_unsigned_field gauge.keldra_index_compaction_debt_bytes "${line}")" \
       || return 1
-    observed_segment_limit="$(log_unsigned_field gauge.anvil_index_compaction_debt_segment_limit "${line}")" \
+    observed_segment_limit="$(log_unsigned_field gauge.keldra_index_compaction_debt_segment_limit "${line}")" \
       || return 1
-    observed_byte_limit="$(log_unsigned_field gauge.anvil_index_compaction_debt_byte_limit "${line}")" \
+    observed_byte_limit="$(log_unsigned_field gauge.keldra_index_compaction_debt_byte_limit "${line}")" \
       || return 1
     if ((debt_tiers != 0 || debt_segments != 0 || debt_bytes != 0)); then
       echo "TypedJson scale run ended with compaction debt" >&2
@@ -592,14 +592,14 @@ assert_typed_json_full_pool_projection() {
   local line
   while IFS= read -r file; do
     while IFS= read -r line; do
-      configured="$(log_unsigned_field gauge.anvil_index_projection_configured_lanes "${line}")" \
+      configured="$(log_unsigned_field gauge.keldra_index_projection_configured_lanes "${line}")" \
         || continue
-      effective="$(log_unsigned_field gauge.anvil_index_projection_effective_lanes "${line}")" \
+      effective="$(log_unsigned_field gauge.keldra_index_projection_effective_lanes "${line}")" \
         || continue
       if [[ "${configured}" == "${expected_workers}" \
         && "${effective}" == "${expected_workers}" ]]
       then
-        echo "[anvil-qualification] TypedJson projection exercised all ${expected_workers} Rayon workers"
+        echo "[keldra-qualification] TypedJson projection exercised all ${expected_workers} Rayon workers"
         return 0
       fi
     done < <(
@@ -657,7 +657,7 @@ run_scale_singleton_probe() {
       binary="${qualification_binaries[v06_index_resource_qualification]}"
       endpoint="${public_endpoints[0]}"
       expected_sources=3
-      for node in anvil-1 anvil-2 anvil-3; do
+      for node in keldra-1 keldra-2 keldra-3; do
         starts["${node}"]="$(log_cursor)"
       done
       ;;
@@ -690,7 +690,7 @@ run_scale_singleton_probe() {
       container_logs_since "${single_start}" \
         >"${probe_telemetry_prefix}.log"
     else
-      for node in anvil-1 anvil-2 anvil-3; do
+      for node in keldra-1 keldra-2 keldra-3; do
         save_log_suffix "${node}" "${starts[${node}]}" \
           "${probe_telemetry_prefix}-${node}.log"
       done
@@ -722,7 +722,7 @@ run_scale_singleton_probe() {
     --arg tenant "${index_resource_tenant}" \
     --arg bucket "${index_resource_bucket}" \
     --argjson expected_sources "${expected_sources}" '
-      .schema == "anvil.index-resource-singleton-probe.v1" and
+      .schema == "keldra.index-resource-singleton-probe.v1" and
       .endpoint == $endpoint and .tenant == $tenant and .bucket == $bucket and
       .index_name == "records-by-field" and .field == "record_id" and
       .operator == "EQUAL" and .value_json == "0" and
@@ -758,7 +758,7 @@ run_scale_singleton_probe() {
   fi
 
   jq -n \
-    --arg schema anvil.index-scale-singleton-query-proof.v2 \
+    --arg schema keldra.index-scale-singleton-query-proof.v2 \
     --arg source_commit "${source_commit}" \
     --argjson records "${records}" \
     --argjson expected_sources "${expected_sources}" \
@@ -791,24 +791,24 @@ run_scale_singleton_probe() {
           formula: "64 * (publication_segments + 1)",
           scope: "exact single-valued TypedJson equality probe with one materialized hit",
           source_locations: [
-            "crates/anvil-index/src/v4/model.rs::INDEX_ROUTING_HEIGHT",
-            "crates/anvil-index/src/v4/reader.rs::ComponentStream::next_leaf",
-            "crates/anvil-index/src/v4/executor/plan.rs::resolve_exact",
-            "crates/anvil-index/src/v4/executor/posting.rs::PostingStream",
-            "crates/anvil-index/src/v4/executor/execute.rs::SegmentExecution::next_unranked",
-            "crates/anvil-index/src/v4/executor/execute.rs::SegmentExecution::materialize",
-            "crates/anvil-index/src/v4/executor/values.rs::SegmentValues",
-            "crates/anvil-index/src/v4/io.rs::read_exact_at",
-            "crates/anvil/src/index_runtime/cache.rs::IndexFile::read_at",
-            "crates/anvil/src/index_runtime/local_query.rs::QueryObservedFile::read_at"
+            "crates/keldra-index/src/v4/model.rs::INDEX_ROUTING_HEIGHT",
+            "crates/keldra-index/src/v4/reader.rs::ComponentStream::next_leaf",
+            "crates/keldra-index/src/v4/executor/plan.rs::resolve_exact",
+            "crates/keldra-index/src/v4/executor/posting.rs::PostingStream",
+            "crates/keldra-index/src/v4/executor/execute.rs::SegmentExecution::next_unranked",
+            "crates/keldra-index/src/v4/executor/execute.rs::SegmentExecution::materialize",
+            "crates/keldra-index/src/v4/executor/values.rs::SegmentValues",
+            "crates/keldra-index/src/v4/io.rs::read_exact_at",
+            "crates/keldra/src/index_runtime/cache.rs::IndexFile::read_at",
+            "crates/keldra/src/index_runtime/local_query.rs::QueryObservedFile::read_at"
           ]
         },
         result: "pass"
       }
     ' >"${proof_report}"
   chmod 0600 "${proof_report}"
-  echo "[anvil-qualification] singleton query stayed within ${query_ops}/${read_ops_ceiling} format-bounded reads"
-  echo "[anvil-qualification] preserved singleton query proof ${proof_report}"
+  echo "[keldra-qualification] singleton query stayed within ${query_ops}/${read_ops_ceiling} format-bounded reads"
+  echo "[keldra-qualification] preserved singleton query proof ${proof_report}"
 }
 
 run_scale_baseline_resource_qualification() {
@@ -824,12 +824,12 @@ run_scale_baseline_resource_qualification() {
   local exact_tenant="${index_resource_tenant}"
   local exact_targets="${require_performance_targets}"
 
-  scale_baseline_resource_report="/var/tmp/anvil-v090-${topology}-index-scale-baseline-${qualification_suffix}.json"
-  scale_baseline_telemetry_prefix="/var/tmp/anvil-v090-${topology}-index-scale-baseline-telemetry-${qualification_suffix}"
-  scale_baseline_probe_report="/var/tmp/anvil-v090-${topology}-index-scale-baseline-singleton-${qualification_suffix}.json"
-  scale_baseline_probe_telemetry_prefix="/var/tmp/anvil-v090-${topology}-index-scale-baseline-singleton-telemetry-${qualification_suffix}"
-  scale_baseline_probe_proof="/var/tmp/anvil-v090-${topology}-index-scale-baseline-singleton-proof-${qualification_suffix}.json"
-  scale_comparison_report="/var/tmp/anvil-v090-${topology}-index-scale-comparison-${qualification_suffix}.json"
+  scale_baseline_resource_report="/var/tmp/keldra-v090-${topology}-index-scale-baseline-${qualification_suffix}.json"
+  scale_baseline_telemetry_prefix="/var/tmp/keldra-v090-${topology}-index-scale-baseline-telemetry-${qualification_suffix}"
+  scale_baseline_probe_report="/var/tmp/keldra-v090-${topology}-index-scale-baseline-singleton-${qualification_suffix}.json"
+  scale_baseline_probe_telemetry_prefix="/var/tmp/keldra-v090-${topology}-index-scale-baseline-singleton-telemetry-${qualification_suffix}"
+  scale_baseline_probe_proof="/var/tmp/keldra-v090-${topology}-index-scale-baseline-singleton-proof-${qualification_suffix}.json"
+  scale_comparison_report="/var/tmp/keldra-v090-${topology}-index-scale-comparison-${qualification_suffix}.json"
   index_resource_bucket="index-scale-baseline-${qualification_suffix}"
   index_resource_client="${scale_baseline_resource_client}"
   index_resource_records=16384
@@ -895,9 +895,9 @@ run_exact_resource_scale_qualification() {
   if [[ "${qualification_mode}" != "release" ]]; then
     return 0
   fi
-  index_resource_probe_report="/var/tmp/anvil-v090-${topology}-index-scale-exact-singleton-${qualification_suffix}.json"
-  index_resource_probe_telemetry_prefix="/var/tmp/anvil-v090-${topology}-index-scale-exact-singleton-telemetry-${qualification_suffix}"
-  index_resource_probe_proof="/var/tmp/anvil-v090-${topology}-index-scale-exact-singleton-proof-${qualification_suffix}.json"
+  index_resource_probe_report="/var/tmp/keldra-v090-${topology}-index-scale-exact-singleton-${qualification_suffix}.json"
+  index_resource_probe_telemetry_prefix="/var/tmp/keldra-v090-${topology}-index-scale-exact-singleton-telemetry-${qualification_suffix}"
+  index_resource_probe_proof="/var/tmp/keldra-v090-${topology}-index-scale-exact-singleton-proof-${qualification_suffix}.json"
   run_scale_singleton_probe "${topology}" \
     "${index_resource_probe_report}" \
     "${index_resource_probe_telemetry_prefix}" \
@@ -935,7 +935,7 @@ write_scale_comparison_report() {
     return 1
   fi
   jq -n \
-    --arg schema anvil.index-scale-comparison.v2 \
+    --arg schema keldra.index-scale-comparison.v2 \
     --argjson small_records "${small_records}" \
     --argjson large_records "${large_records}" \
     --argjson debt_segment_limit "${large_debt_segments}" \
@@ -999,5 +999,5 @@ write_scale_comparison_report() {
     ' >"${scale_comparison_report}"
   test -s "${scale_comparison_report}"
   chmod 0600 "${scale_comparison_report}"
-  echo "[anvil-qualification] preserved bounded scale comparison ${scale_comparison_report}"
+  echo "[keldra-qualification] preserved bounded scale comparison ${scale_comparison_report}"
 }

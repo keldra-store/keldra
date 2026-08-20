@@ -1,5 +1,5 @@
 {
-  "schema": "anvil.perf.osv_import.v3",
+  "schema": "keldra.perf.osv_import.v3",
   "measured": false,
   "passed": false,
   "target_seconds": 150.0,
@@ -12,15 +12,15 @@
     "snapshot_id": null
   },
   "schema_shape": {
-    "source_definition_schema": "anvil.osv.source-definition.v1",
-    "source_record_schema": "anvil.osv.source-record.v1",
-    "snapshot_manifest_schema": "anvil.osv.snapshot-manifest.v1",
+    "source_definition_schema": "keldra.osv.source-definition.v1",
+    "source_record_schema": "keldra.osv.source-record.v1",
+    "snapshot_manifest_schema": "keldra.osv.snapshot-manifest.v1",
     "source": "osv",
-    "bucket": "anvil-osv-qualification",
+    "bucket": "keldra-osv-qualification",
     "source_definition_path": "entities/source-definition/{sha256(source-definition\\0osv)}/current.json",
     "shard_path": "shards/v1/{records_sha256[0..2]}/{records_sha256}.ndjson.zst",
     "manifest_path": "snapshots/{snapshot_id}/manifest.json",
-    "shard_format": "anvil.osv.source-record.ndjson.v1",
+    "shard_format": "keldra.osv.source-record.ndjson.v1",
     "shard_compression": "zstd-6",
     "manifest_is_authoritative": true,
     "per_object_user_metadata": false,
@@ -31,12 +31,12 @@
     ]
   },
   "software": {
-    "anvil_commit": null
+    "keldra_commit": null
   },
   "workload": {
     "endpoint": null,
     "tenant": null,
-    "bucket": "anvil-osv-qualification",
+    "bucket": "keldra-osv-qualification",
     "source_url": "https://osv-vulnerabilities.storage.googleapis.com/all.zip",
     "source_cadence_hours": 6,
     "durability_class": "local",

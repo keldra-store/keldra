@@ -166,117 +166,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "anvil-api"
-version = "0.1.0"
-dependencies = [
- "prost",
- "prost-types",
- "tonic",
- "tonic-prost",
- "tonic-prost-build",
-]
-
-[[package]]
-name = "anvil-atomic-program"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "serde",
- "serde_json",
- "thiserror 2.0.19",
- "tokio",
-]
-
-[[package]]
-name = "anvil-authz"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "anvil-consensus"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "hyper-util",
- "libc",
- "openraft",
- "prost",
- "rocksdb",
- "rustls 0.23.43",
- "serde",
- "sha2 0.10.9",
- "tempfile",
- "thiserror 2.0.19",
- "tokio",
- "tokio-rustls 0.26.4",
- "tonic",
- "tonic-prost",
- "tonic-prost-build",
-]
-
-[[package]]
-name = "anvil-index"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "futures-util",
- "sux",
- "thiserror 2.0.19",
- "tokio",
-]
-
-[[package]]
-name = "anvil-osv-qualification"
-version = "0.1.0"
-dependencies = [
- "anvil-api",
- "anyhow",
- "blake3",
- "clap",
- "futures-util",
- "hex",
- "prost",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tokio",
- "tonic",
- "zip",
- "zstd",
-]
-
-[[package]]
 name = "anvil-storage"
 version = "0.9.5"
 dependencies = [
  "keldra",
-]
-
-[[package]]
-name = "anvil-store"
-version = "0.1.0"
-dependencies = [
- "anvil-atomic-program",
- "anvil-authz",
- "anyhow",
- "argon2",
- "base64",
- "blake3",
- "crc32c",
- "getrandom 0.3.4",
- "hex",
- "reed-solomon-erasure",
- "rocksdb",
- "serde",
- "serde_json",
- "subtle",
- "tempfile",
- "thiserror 2.0.19",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -2776,17 +2669,47 @@ dependencies = [
 
 [[package]]
 name = "keldra"
-version = "0.1.0"
+version = "0.10.0"
 dependencies = [
- "anvil-api",
+ "keldra-api",
  "tokio",
  "tokio-stream",
  "tonic",
 ]
 
 [[package]]
+name = "keldra-api"
+version = "0.10.0"
+dependencies = [
+ "prost",
+ "prost-types",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+]
+
+[[package]]
+name = "keldra-atomic-program"
+version = "0.10.0"
+dependencies = [
+ "blake3",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+]
+
+[[package]]
+name = "keldra-authz"
+version = "0.10.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "keldra-cli"
-version = "0.1.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2801,16 +2724,63 @@ dependencies = [
 ]
 
 [[package]]
+name = "keldra-consensus"
+version = "0.10.0"
+dependencies = [
+ "bincode",
+ "hyper-util",
+ "libc",
+ "openraft",
+ "prost",
+ "rocksdb",
+ "rustls 0.23.43",
+ "serde",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-rustls 0.26.4",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+]
+
+[[package]]
+name = "keldra-index"
+version = "0.10.0"
+dependencies = [
+ "blake3",
+ "futures-util",
+ "sux",
+ "thiserror 2.0.19",
+ "tokio",
+]
+
+[[package]]
+name = "keldra-osv-qualification"
+version = "0.10.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "clap",
+ "futures-util",
+ "hex",
+ "keldra-api",
+ "prost",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "tonic",
+ "zip",
+ "zstd",
+]
+
+[[package]]
 name = "keldra-server"
-version = "0.1.0"
+version = "0.10.0"
 dependencies = [
  "aes-gcm",
- "anvil-api",
- "anvil-atomic-program",
- "anvil-authz",
- "anvil-consensus",
- "anvil-index",
- "anvil-store",
  "anyhow",
  "async-stream",
  "aws-credential-types",
@@ -2832,6 +2802,12 @@ dependencies = [
  "hyper-util",
  "jsonwebtoken",
  "keldra",
+ "keldra-api",
+ "keldra-atomic-program",
+ "keldra-authz",
+ "keldra-consensus",
+ "keldra-index",
+ "keldra-store",
  "libc",
  "memmap2",
  "opentelemetry",
@@ -2860,6 +2836,30 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "keldra-store"
+version = "0.10.0"
+dependencies = [
+ "anyhow",
+ "argon2",
+ "base64",
+ "blake3",
+ "crc32c",
+ "getrandom 0.3.4",
+ "hex",
+ "keldra-atomic-program",
+ "keldra-authz",
+ "reed-solomon-erasure",
+ "rocksdb",
+ "serde",
+ "serde_json",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

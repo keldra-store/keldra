@@ -1,0 +1,964 @@
+//! Tenant-wide Zanzibar coordination over complete realm replicas.
+//!
+//! Every realm belonging to one stable tenant ID uses the same weighted-HRW
+//! replica group. Raft contributes only ACTIVE membership and the serving
+//! fence; no realm, revision counter, or ownership decision is stored in it.
+
+use std::sync::Arc;
+
+use keldra_authz::{AuthorizationCheck, Schema};
+use keldra_consensus::{DecisionRaft, NodeId};
+use keldra_store::{
+    AuthzConsistency, AuthzRealmAggregate, AuthzRealmMutation, AuthzRealmMutationContext,
+    AuthzRealmSnapshotApplied, AuthzRealmTransferManifest, AuthzRepository, AuthzRevision,
+    AuthzSchemaPublicationMutation, AuthzScope, AuthzStoreError, BindSchemaRequest,
+    CoordinatedAuthzRealmMutation, CoordinatedAuthzSchemaPublication, PublishSchemaRequest,
+    ReplicaAuthzRealmMutationApplied, ReplicaAuthzSchemaPublicationApplied, SchemaRef,
+    StorageTenantId, Store, TupleBatchRequest,
+};
+use tonic::Status;
+
+use crate::cluster_placement::ClusterPlacement;
+use crate::mutable_record_replica_group::MutableRecordReplicaGroup;
+use crate::placement::PlacementKind;
+use crate::serving_fence::ServingAuthority;
+
+/// Exact identity and lineage summary for one complete streamed aggregate.
+/// The manifest hash covers the canonical aggregate bytes, including the
+/// stamp; the copied summary lets a failed quorum distinguish siblings/gaps
+/// without accepting either one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AuthzRealmReplicaCandidate {
+    pub(crate) manifest: AuthzRealmTransferManifest,
+    pub(crate) predecessor_revision: Option<AuthzRevision>,
+    pub(crate) mutation_fingerprint: Option<[u8; 32]>,
+}
+
+impl AuthzRealmReplicaCandidate {
+    pub(crate) fn from_aggregate(
+        aggregate: &AuthzRealmAggregate,
+        manifest: AuthzRealmTransferManifest,
+    ) -> Result<Self, Status> {
+        if manifest.scope != aggregate.scope || manifest.revision != aggregate.revision {
+            return Err(Status::data_loss(
+                "authorization realm manifest disagrees with its aggregate",
+            ));
+        }
+        Ok(Self {
+            predecessor_revision: manifest.predecessor_revision,
+            mutation_fingerprint: manifest.mutation_fingerprint,
+            manifest,
+        })
+    }
+
+    pub(crate) fn from_manifest(manifest: AuthzRealmTransferManifest) -> Result<Self, Status> {
+        let candidate = Self {
+            predecessor_revision: manifest.predecessor_revision,
+            mutation_fingerprint: manifest.mutation_fingerprint,
+            manifest,
+        };
+        let scope = candidate.manifest.scope.clone();
+        candidate.validate_for(&scope)?;
+        Ok(candidate)
+    }
+
+    pub(crate) fn validate_for(&self, scope: &AuthzScope) -> Result<(), Status> {
+        if self.manifest.scope != *scope || self.manifest.revision == AuthzRevision::ZERO {
+            return Err(Status::data_loss(
+                "authorization replica returned another realm or a zero revision",
+            ));
+        }
+        match (self.predecessor_revision, self.mutation_fingerprint) {
+            (None, None) => Ok(()),
+            (predecessor, Some(fingerprint))
+                if fingerprint != [0; 32]
+                    && predecessor.is_none_or(|revision| {
+                        revision != AuthzRevision::ZERO && revision < self.manifest.revision
+                    }) =>
+            {
+                Ok(())
+            }
+            _ => Err(Status::data_loss(
+                "authorization replica returned inconsistent realm lineage",
+            )),
+        }
+    }
+}
+
+/// Typed private transport seam. Implementations stream complete aggregates
+/// between the named source and target and invoke only the storage kernel's
+/// explicitly quorum-reconciled install boundary.
+#[tonic::async_trait]
+pub(crate) trait AuthzReplicaTransport: Send + Sync + 'static {
+    async fn apply_schema_publication(
+        &self,
+        target: NodeId,
+        address: &str,
+        stable_tenant_id: u64,
+        mutation: &AuthzSchemaPublicationMutation,
+    ) -> Result<ReplicaAuthzSchemaPublicationApplied, Status>;
+
+    async fn has_schema_publication(
+        &self,
+        target: NodeId,
+        address: &str,
+        stable_tenant_id: u64,
+        query: &AuthzSchemaReplicaQuery,
+    ) -> Result<bool, Status>;
+
+    async fn apply_realm_mutation(
+        &self,
+        target: NodeId,
+        address: &str,
+        stable_tenant_id: u64,
+        mutation: &AuthzRealmMutation,
+    ) -> Result<ReplicaAuthzRealmMutationApplied, Status>;
+
+    async fn read_realm_candidate(
+        &self,
+        target: NodeId,
+        address: &str,
+        stable_tenant_id: u64,
+        scope: &AuthzScope,
+    ) -> Result<Option<AuthzRealmReplicaCandidate>, Status>;
+
+    async fn install_realm_candidate(
+        &self,
+        target: NodeId,
+        address: &str,
+        stable_tenant_id: u64,
+        source: Option<(NodeId, String)>,
+        scope: &AuthzScope,
+        winner: Option<&AuthzRealmReplicaCandidate>,
+    ) -> Result<AuthzRealmSnapshotApplied, Status>;
+}
+
+/// Exact read-only proof used when an apply response or the original client
+/// response was lost. It transfers no catalogue and performs no repair.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AuthzSchemaReplicaQuery {
+    pub(crate) storage_tenant: StorageTenantId,
+    pub(crate) schema_ref: SchemaRef,
+    pub(crate) schema: Schema,
+    pub(crate) published_at_revision: AuthzRevision,
+    pub(crate) publication_mutation: Option<AuthzSchemaPublicationMutation>,
+}
+
+#[derive(Clone, Debug)]
+struct ReplicaEndpoint {
+    node_id: NodeId,
+    address: String,
+}
+
+#[derive(Clone, Debug)]
+struct TenantReplicaSet {
+    stable_tenant_id: u64,
+    group: MutableRecordReplicaGroup,
+    endpoints: Vec<ReplicaEndpoint>,
+}
+
+impl TenantReplicaSet {
+    fn from_placement(placement: &ClusterPlacement, tenant_id: u64) -> Result<Self, Status> {
+        if tenant_id == 0 {
+            return Err(Status::failed_precondition(
+                "stable authorization tenant ID must be non-zero",
+            ));
+        }
+        let group = MutableRecordReplicaGroup::select(
+            PlacementKind::ZanzibarRealm,
+            placement.cluster_id(),
+            &tenant_id.to_be_bytes(),
+            placement.placement_nodes(),
+        )
+        .ok_or_else(|| Status::unavailable("cluster has no authorization replica"))?;
+        let endpoints = group
+            .replicas()
+            .iter()
+            .map(|node_id| {
+                let address = placement.address(*node_id).ok_or_else(|| {
+                    Status::unavailable(format!(
+                        "ACTIVE authorization node {} has no peer address",
+                        node_id.0
+                    ))
+                })?;
+                Ok(ReplicaEndpoint {
+                    node_id: *node_id,
+                    address: address.0.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, Status>>()?;
+        Ok(Self {
+            stable_tenant_id: tenant_id,
+            group,
+            endpoints,
+        })
+    }
+}
+
+#[derive(Clone)]
+struct AuthzDistributionCore {
+    local_node: NodeId,
+    repository: AuthzRepository,
+    peers: Arc<dyn AuthzReplicaTransport>,
+    /// Routing and fencing provide one active tenant-group coordinator. This
+    /// single local gate keeps its reconcile/repair/mutate sequences ordered
+    /// without a per-tenant registry or distributed lock.
+    coordinator_serial: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl AuthzDistributionCore {
+    async fn replicate_schema_publication(
+        &self,
+        replicas: &TenantReplicaSet,
+        storage_tenant: &StorageTenantId,
+        coordinated: &CoordinatedAuthzSchemaPublication,
+    ) -> Result<(), Status> {
+        let schema = self
+            .repository
+            .get_schema(storage_tenant, &coordinated.result.schema_ref)
+            .map_err(authz_status)?
+            .ok_or_else(|| Status::data_loss("coordinated schema revision is missing locally"))?;
+        let query = AuthzSchemaReplicaQuery {
+            storage_tenant: storage_tenant.clone(),
+            schema_ref: coordinated.result.schema_ref.clone(),
+            schema,
+            published_at_revision: coordinated.result.authz_revision,
+            publication_mutation: coordinated.mutation.clone(),
+        };
+        if self
+            .repository
+            .tenant_revision(storage_tenant)
+            .map_err(authz_status)?
+            < query.published_at_revision
+        {
+            return Err(Status::data_loss(
+                "coordinated schema revision exceeds the local tenant revision",
+            ));
+        }
+        if let Some(mutation) = coordinated.mutation.as_ref()
+            && (mutation.storage_tenant != *storage_tenant
+                || mutation.schema_ref != query.schema_ref
+                || mutation.schema != query.schema
+                || mutation.revision() != query.published_at_revision)
+        {
+            return Err(Status::data_loss(
+                "coordinated schema mutation disagrees with its local result",
+            ));
+        }
+        if coordinated.mutation.is_none() && !coordinated.result.replayed {
+            return Err(Status::data_loss(
+                "new schema publication omitted its typed mutation",
+            ));
+        }
+
+        let mut durable = vec![self.local_node];
+        if let Some(mutation) = coordinated.mutation.as_ref() {
+            let mut tasks = tokio::task::JoinSet::new();
+            let stable_tenant_id = replicas.stable_tenant_id;
+            for endpoint in replicas
+                .endpoints
+                .iter()
+                .filter(|endpoint| endpoint.node_id != self.local_node)
+                .cloned()
+            {
+                let peers = self.peers.clone();
+                let mutation = mutation.clone();
+                tasks.spawn(async move {
+                    let result = peers
+                        .apply_schema_publication(
+                            endpoint.node_id,
+                            &endpoint.address,
+                            stable_tenant_id,
+                            &mutation,
+                        )
+                        .await;
+                    (endpoint.node_id, result)
+                });
+            }
+            while let Some(joined) = tasks.join_next().await {
+                let (node_id, result) = joined.map_err(|error| {
+                    Status::internal(format!("authorization schema peer task failed: {error}"))
+                })?;
+                if matches!(result, Ok(applied) if applied.revision == query.published_at_revision)
+                {
+                    durable.push(node_id);
+                }
+            }
+        }
+        if replicas.group.is_acknowledged_by(&durable) {
+            return Ok(());
+        }
+
+        // An apply may have committed even when its response was lost. A
+        // digest replay has no new mutation, so it uses the same exact proof.
+        // This proves durability only; it never copies or repairs a catalogue.
+        let mut tasks = tokio::task::JoinSet::new();
+        let stable_tenant_id = replicas.stable_tenant_id;
+        for endpoint in replicas
+            .endpoints
+            .iter()
+            .filter(|endpoint| !durable.contains(&endpoint.node_id))
+            .cloned()
+        {
+            let peers = self.peers.clone();
+            let query = query.clone();
+            tasks.spawn(async move {
+                let result = peers
+                    .has_schema_publication(
+                        endpoint.node_id,
+                        &endpoint.address,
+                        stable_tenant_id,
+                        &query,
+                    )
+                    .await;
+                (endpoint.node_id, result)
+            });
+        }
+        while let Some(joined) = tasks.join_next().await {
+            let (node_id, result) = joined.map_err(|error| {
+                Status::internal(format!("authorization schema proof task failed: {error}"))
+            })?;
+            if matches!(result, Ok(true)) {
+                durable.push(node_id);
+            }
+        }
+        if replicas.group.is_acknowledged_by(&durable) {
+            Ok(())
+        } else {
+            Err(Status::unavailable(format!(
+                "authorization schema publication reached {} of {} required replicas",
+                durable.len(),
+                replicas.group.required_acknowledgements()
+            )))
+        }
+    }
+
+    async fn replicate(
+        &self,
+        replicas: &TenantReplicaSet,
+        scope: &AuthzScope,
+        coordinated: &CoordinatedAuthzRealmMutation,
+    ) -> Result<(), Status> {
+        let Some(mutation) = coordinated.mutation.as_ref() else {
+            self.reconcile(replicas, scope).await?;
+            return Ok(());
+        };
+        let mut durable = vec![self.local_node];
+        let mut tasks = tokio::task::JoinSet::new();
+        let stable_tenant_id = replicas.stable_tenant_id;
+        for endpoint in replicas
+            .endpoints
+            .iter()
+            .filter(|endpoint| endpoint.node_id != self.local_node)
+            .cloned()
+        {
+            let peers = self.peers.clone();
+            let mutation = mutation.clone();
+            tasks.spawn(async move {
+                let result = peers
+                    .apply_realm_mutation(
+                        endpoint.node_id,
+                        &endpoint.address,
+                        stable_tenant_id,
+                        &mutation,
+                    )
+                    .await;
+                (endpoint.node_id, result)
+            });
+        }
+        while let Some(joined) = tasks.join_next().await {
+            let (node_id, result) = joined.map_err(|error| {
+                Status::internal(format!("authorization peer task failed: {error}"))
+            })?;
+            if matches!(result, Ok(applied) if applied.revision == mutation.revision()) {
+                durable.push(node_id);
+            }
+        }
+        if replicas.group.is_acknowledged_by(&durable) {
+            Ok(())
+        } else {
+            Err(Status::unavailable(format!(
+                "authorization mutation reached {} of {} required replicas",
+                durable.len(),
+                replicas.group.required_acknowledgements()
+            )))
+        }
+    }
+
+    async fn reconcile(
+        &self,
+        replicas: &TenantReplicaSet,
+        scope: &AuthzScope,
+    ) -> Result<Option<AuthzRealmReplicaCandidate>, Status> {
+        let mut tasks = tokio::task::JoinSet::new();
+        let stable_tenant_id = replicas.stable_tenant_id;
+        for endpoint in replicas.endpoints.iter().cloned() {
+            let peers = self.peers.clone();
+            let scope = scope.clone();
+            tasks.spawn(async move {
+                let result = peers
+                    .read_realm_candidate(
+                        endpoint.node_id,
+                        &endpoint.address,
+                        stable_tenant_id,
+                        &scope,
+                    )
+                    .await;
+                (endpoint, result)
+            });
+        }
+        let mut observations = Vec::with_capacity(replicas.endpoints.len());
+        while let Some(joined) = tasks.join_next().await {
+            observations.push(joined.map_err(|error| {
+                Status::internal(format!("authorization read task failed: {error}"))
+            })?);
+        }
+        let successful = observations
+            .iter()
+            .filter_map(|(_, result)| result.as_ref().ok())
+            .collect::<Vec<_>>();
+        if successful.len() < replicas.group.required_acknowledgements() {
+            return Err(Status::unavailable(
+                "authorization realm did not reach its read quorum",
+            ));
+        }
+        for candidate in successful.iter().filter_map(|candidate| candidate.as_ref()) {
+            candidate.validate_for(scope)?;
+        }
+        let winner =
+            exact_quorum_candidate(&successful, replicas.group.required_acknowledgements())?;
+        let source = winner.as_ref().and_then(|winner| {
+            observations.iter().find_map(|(endpoint, observed)| {
+                (observed.as_ref().ok().and_then(Option::as_ref) == Some(winner))
+                    .then(|| (endpoint.node_id, endpoint.address.clone()))
+            })
+        });
+
+        self.require_local_winner(
+            &observations,
+            replicas.stable_tenant_id,
+            source.clone(),
+            scope,
+            winner.as_ref(),
+        )
+        .await?;
+        for (endpoint, observed) in observations {
+            if endpoint.node_id == self.local_node || observed.as_ref().ok() == Some(&winner) {
+                continue;
+            }
+            if let Err(error) = self
+                .peers
+                .install_realm_candidate(
+                    endpoint.node_id,
+                    &endpoint.address,
+                    replicas.stable_tenant_id,
+                    source.clone(),
+                    scope,
+                    winner.as_ref(),
+                )
+                .await
+            {
+                tracing::warn!(
+                    node_id = endpoint.node_id.0,
+                    %error,
+                    "authorization minority read repair did not complete"
+                );
+            }
+        }
+        Ok(winner)
+    }
+
+    async fn require_local_winner(
+        &self,
+        observations: &[(
+            ReplicaEndpoint,
+            Result<Option<AuthzRealmReplicaCandidate>, Status>,
+        )],
+        stable_tenant_id: u64,
+        source: Option<(NodeId, String)>,
+        scope: &AuthzScope,
+        winner: Option<&AuthzRealmReplicaCandidate>,
+    ) -> Result<(), Status> {
+        let local = observations
+            .iter()
+            .find(|(endpoint, _)| endpoint.node_id == self.local_node)
+            .ok_or_else(|| Status::internal("local authorization replica is not selected"))?;
+        if local.1.as_ref().ok() == Some(&winner.cloned()) {
+            return Ok(());
+        }
+        self.peers
+            .install_realm_candidate(
+                self.local_node,
+                &local.0.address,
+                stable_tenant_id,
+                source,
+                scope,
+                winner,
+            )
+            .await?;
+        let installed = self
+            .peers
+            .read_realm_candidate(self.local_node, &local.0.address, stable_tenant_id, scope)
+            .await?;
+        if installed.as_ref() != winner {
+            return Err(Status::data_loss(
+                "local authorization read repair did not install the quorum winner",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn fresh_check(
+        &self,
+        replicas: &TenantReplicaSet,
+        scope: AuthzScope,
+        consistency: AuthzConsistency,
+        check: AuthorizationCheck,
+    ) -> Result<(bool, AuthzRevision), Status> {
+        let (allowed, revision) = self
+            .fresh_checks(replicas, scope, consistency, vec![check])
+            .await?;
+        Ok((allowed[0], revision))
+    }
+
+    async fn fresh_checks(
+        &self,
+        replicas: &TenantReplicaSet,
+        scope: AuthzScope,
+        consistency: AuthzConsistency,
+        checks: Vec<AuthorizationCheck>,
+    ) -> Result<(Vec<bool>, AuthzRevision), Status> {
+        if self.reconcile(replicas, &scope).await?.is_none() {
+            return Err(Status::failed_precondition(
+                "authorization realm has no schema binding",
+            ));
+        }
+        let repository = self.repository.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            repository.batch_check(&scope, consistency, &checks)
+        })
+        .await
+        .map_err(|error| Status::internal(format!("authorization worker failed: {error}")))?
+        .map_err(authz_status)?;
+        Ok((result.allowed, result.revision))
+    }
+}
+
+/// Production placement/fence wrapper. Public service routing is deliberately
+/// not installed until system-tenant identity and protected-owner semantics
+/// are resolved.
+#[derive(Clone)]
+pub(crate) struct ZanzibarDistribution {
+    local_node: NodeId,
+    decisions: DecisionRaft,
+    serving: ServingAuthority,
+    core: AuthzDistributionCore,
+    mutation_admission: crate::mutation_admission::MutationAdmission,
+}
+
+impl ZanzibarDistribution {
+    pub(crate) fn new(
+        local_node: NodeId,
+        repository: AuthzRepository,
+        decisions: DecisionRaft,
+        serving: ServingAuthority,
+        peers: Arc<dyn AuthzReplicaTransport>,
+        mutation_admission: crate::mutation_admission::MutationAdmission,
+    ) -> Self {
+        Self {
+            local_node,
+            decisions,
+            serving,
+            core: AuthzDistributionCore {
+                local_node,
+                repository,
+                peers,
+                coordinator_serial: Arc::new(tokio::sync::Mutex::new(())),
+            },
+            mutation_admission,
+        }
+    }
+
+    pub(crate) async fn bind_schema(
+        &self,
+        stable_tenant_id: u64,
+        request: BindSchemaRequest,
+        context: AuthzRealmMutationContext,
+    ) -> Result<CoordinatedAuthzRealmMutation, Status> {
+        let _serial = self.core.coordinator_serial.lock().await;
+        let _permit = self.mutation_admission.enter()?;
+        let mut replicas = self.require_coordinator(stable_tenant_id)?;
+        self.require_context(&context, replicas.group.coordinator())?;
+        let scope = request.scope.clone();
+        self.core.reconcile(&replicas, &scope).await?;
+        replicas = self.require_coordinator(stable_tenant_id)?;
+        self.require_context(&context, replicas.group.coordinator())?;
+        let repository = self.core.repository.clone();
+        let coordinated = tokio::task::spawn_blocking(move || {
+            repository.coordinate_bind_schema_mutation(request, context)
+        })
+        .await
+        .map_err(|error| Status::internal(format!("authorization worker failed: {error}")))?
+        .map_err(authz_status)?;
+        self.core.replicate(&replicas, &scope, &coordinated).await?;
+        Ok(coordinated)
+    }
+
+    pub(crate) async fn bind_schema_journaled(
+        &self,
+        stable_tenant_id: u64,
+        store: &Store,
+        request: BindSchemaRequest,
+    ) -> Result<CoordinatedAuthzRealmMutation, Status> {
+        loop {
+            let serial = self.core.coordinator_serial.lock().await;
+            let permit = self.mutation_admission.enter()?;
+            let mut replicas = self.require_coordinator(stable_tenant_id)?;
+            let serving = self.serving.mutation_context()?;
+            let scope = request.scope.clone();
+            self.core.reconcile(&replicas, &scope).await?;
+            replicas = self.require_coordinator(stable_tenant_id)?;
+            let current = self.serving.mutation_context()?;
+            if current != serving {
+                return Err(Status::unavailable(
+                    "authorization serving fence changed during reconciliation",
+                ));
+            }
+            let coordinated = match store
+                .coordinate_journaled_authz_schema_binding(
+                    stable_tenant_id,
+                    request.clone(),
+                    serving.active_placement_log_id,
+                    serving.serving_fence_term,
+                )
+                .await
+            {
+                Ok(coordinated) => coordinated,
+                Err(AuthzStoreError::SourceJournalCapacity) => {
+                    drop(permit);
+                    drop(serial);
+                    store.wait_for_mutation_capacity().await;
+                    continue;
+                }
+                Err(error) => return Err(authz_status(error)),
+            };
+            self.core.replicate(&replicas, &scope, &coordinated).await?;
+            return Ok(coordinated);
+        }
+    }
+
+    pub(crate) async fn publish_schema(
+        &self,
+        stable_tenant_id: u64,
+        request: PublishSchemaRequest,
+        context: AuthzRealmMutationContext,
+    ) -> Result<CoordinatedAuthzSchemaPublication, Status> {
+        let _serial = self.core.coordinator_serial.lock().await;
+        let _permit = self.mutation_admission.enter()?;
+        let replicas = self.require_coordinator(stable_tenant_id)?;
+        self.require_context(&context, replicas.group.coordinator())?;
+        let storage_tenant = request.storage_tenant.clone();
+        let repository = self.core.repository.clone();
+        let coordinated = tokio::task::spawn_blocking(move || {
+            repository.coordinate_schema_publication(request, context)
+        })
+        .await
+        .map_err(|error| Status::internal(format!("authorization worker failed: {error}")))?
+        .map_err(authz_status)?;
+        self.core
+            .replicate_schema_publication(&replicas, &storage_tenant, &coordinated)
+            .await?;
+        Ok(coordinated)
+    }
+
+    pub(crate) async fn publish_schema_journaled(
+        &self,
+        stable_tenant_id: u64,
+        store: &Store,
+        request: PublishSchemaRequest,
+    ) -> Result<CoordinatedAuthzSchemaPublication, Status> {
+        loop {
+            let serial = self.core.coordinator_serial.lock().await;
+            let permit = self.mutation_admission.enter()?;
+            let replicas = self.require_coordinator(stable_tenant_id)?;
+            let serving = self.serving.mutation_context()?;
+            let storage_tenant = request.storage_tenant.clone();
+            let coordinated = match store
+                .coordinate_journaled_authz_schema_publication(
+                    stable_tenant_id,
+                    request.clone(),
+                    serving.active_placement_log_id,
+                    serving.serving_fence_term,
+                )
+                .await
+            {
+                Ok(coordinated) => coordinated,
+                Err(AuthzStoreError::SourceJournalCapacity) => {
+                    drop(permit);
+                    drop(serial);
+                    store.wait_for_mutation_capacity().await;
+                    continue;
+                }
+                Err(error) => return Err(authz_status(error)),
+            };
+            self.core
+                .replicate_schema_publication(&replicas, &storage_tenant, &coordinated)
+                .await?;
+            return Ok(coordinated);
+        }
+    }
+
+    pub(crate) async fn reconcile_realm(
+        &self,
+        stable_tenant_id: u64,
+        scope: &AuthzScope,
+    ) -> Result<(), Status> {
+        let _serial = self.core.coordinator_serial.lock().await;
+        let replicas = self.require_coordinator(stable_tenant_id)?;
+        self.serving.mutation_context()?;
+        if self.core.reconcile(&replicas, scope).await?.is_none() {
+            return Err(Status::failed_precondition(
+                "authorization realm has no schema binding",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn repository(&self) -> &AuthzRepository {
+        &self.core.repository
+    }
+
+    pub(crate) async fn mutate_tuples(
+        &self,
+        stable_tenant_id: u64,
+        request: TupleBatchRequest,
+        context: AuthzRealmMutationContext,
+    ) -> Result<CoordinatedAuthzRealmMutation, Status> {
+        let _serial = self.core.coordinator_serial.lock().await;
+        let _permit = self.mutation_admission.enter()?;
+        let mut replicas = self.require_coordinator(stable_tenant_id)?;
+        self.require_context(&context, replicas.group.coordinator())?;
+        let scope = request.scope.clone();
+        self.core.reconcile(&replicas, &scope).await?;
+        replicas = self.require_coordinator(stable_tenant_id)?;
+        self.require_context(&context, replicas.group.coordinator())?;
+        let repository = self.core.repository.clone();
+        let coordinated = tokio::task::spawn_blocking(move || {
+            repository.coordinate_tuple_mutation(request, context)
+        })
+        .await
+        .map_err(|error| Status::internal(format!("authorization worker failed: {error}")))?
+        .map_err(authz_status)?;
+        self.core.replicate(&replicas, &scope, &coordinated).await?;
+        Ok(coordinated)
+    }
+
+    /// Coordinates a tuple mutation through the storage kernel boundary that
+    /// commits its AggregateChanged record in the same RocksDB WriteBatch.
+    pub(crate) async fn mutate_tuples_journaled(
+        &self,
+        stable_tenant_id: u64,
+        store: &Store,
+        request: TupleBatchRequest,
+    ) -> Result<CoordinatedAuthzRealmMutation, Status> {
+        self.mutate_tuples_journaled_inner(stable_tenant_id, store, request, false)
+            .await
+    }
+
+    /// Replay a trusted adapter's reconstructed tuple request against the
+    /// retained original CAS before entering the ordinary mutation path.
+    pub(crate) async fn mutate_tuples_journaled_restoring_retained_precondition(
+        &self,
+        stable_tenant_id: u64,
+        store: &Store,
+        request: TupleBatchRequest,
+    ) -> Result<CoordinatedAuthzRealmMutation, Status> {
+        self.mutate_tuples_journaled_inner(stable_tenant_id, store, request, true)
+            .await
+    }
+
+    async fn mutate_tuples_journaled_inner(
+        &self,
+        stable_tenant_id: u64,
+        store: &Store,
+        request: TupleBatchRequest,
+        restore_retained_precondition: bool,
+    ) -> Result<CoordinatedAuthzRealmMutation, Status> {
+        loop {
+            let serial = self.core.coordinator_serial.lock().await;
+            let permit = self.mutation_admission.enter()?;
+            let mut replicas = self.require_coordinator(stable_tenant_id)?;
+            let serving = self.serving.mutation_context()?;
+            let scope = request.scope.clone();
+            self.core.reconcile(&replicas, &scope).await?;
+            replicas = self.require_coordinator(stable_tenant_id)?;
+            let current = self.serving.mutation_context()?;
+            if current != serving {
+                return Err(Status::unavailable(
+                    "authorization serving fence changed during reconciliation",
+                ));
+            }
+            let request = if restore_retained_precondition {
+                self.core
+                    .repository
+                    .restore_retained_tuple_replay_precondition(request.clone())
+                    .map_err(authz_status)?
+            } else {
+                request.clone()
+            };
+            let coordinated = match store
+                .coordinate_journaled_authz_tuple_mutation(
+                    stable_tenant_id,
+                    request,
+                    serving.active_placement_log_id,
+                    serving.serving_fence_term,
+                )
+                .await
+            {
+                Ok(coordinated) => coordinated,
+                Err(AuthzStoreError::SourceJournalCapacity) => {
+                    drop(permit);
+                    drop(serial);
+                    store.wait_for_mutation_capacity().await;
+                    continue;
+                }
+                Err(error) => return Err(authz_status(error)),
+            };
+            self.core.replicate(&replicas, &scope, &coordinated).await?;
+            return Ok(coordinated);
+        }
+    }
+
+    pub(crate) async fn fresh_check(
+        &self,
+        stable_tenant_id: u64,
+        scope: AuthzScope,
+        consistency: AuthzConsistency,
+        check: AuthorizationCheck,
+    ) -> Result<(bool, AuthzRevision), Status> {
+        self.fresh_check_with_generation(stable_tenant_id, scope, consistency, check)
+            .await
+            .map(|(allowed, revision, _)| (allowed, revision))
+    }
+
+    pub(crate) async fn fresh_check_with_generation(
+        &self,
+        stable_tenant_id: u64,
+        scope: AuthzScope,
+        consistency: AuthzConsistency,
+        check: AuthorizationCheck,
+    ) -> Result<(bool, AuthzRevision, u64), Status> {
+        let _serial = self.core.coordinator_serial.lock().await;
+        let replicas = self.require_coordinator(stable_tenant_id)?;
+        self.serving.mutation_context()?;
+        let checked_scope = scope.clone();
+        let (allowed, revision) = self
+            .core
+            .fresh_check(&replicas, scope, consistency, check)
+            .await?;
+        let binding = self
+            .core
+            .repository
+            .get_binding(&checked_scope)
+            .map_err(authz_status)?
+            .ok_or_else(|| Status::failed_precondition("authorization realm has no binding"))?;
+        Ok((allowed, revision, binding.generation))
+    }
+
+    pub(crate) async fn fresh_checks_with_generation(
+        &self,
+        stable_tenant_id: u64,
+        scope: AuthzScope,
+        consistency: AuthzConsistency,
+        checks: Vec<AuthorizationCheck>,
+    ) -> Result<(Vec<bool>, AuthzRevision, u64), Status> {
+        let _serial = self.core.coordinator_serial.lock().await;
+        let replicas = self.require_coordinator(stable_tenant_id)?;
+        self.serving.mutation_context()?;
+        let checked_scope = scope.clone();
+        let (allowed, revision) = self
+            .core
+            .fresh_checks(&replicas, scope, consistency, checks)
+            .await?;
+        let binding = self
+            .core
+            .repository
+            .get_binding(&checked_scope)
+            .map_err(authz_status)?
+            .ok_or_else(|| Status::failed_precondition("authorization realm has no binding"))?;
+        Ok((allowed, revision, binding.generation))
+    }
+
+    fn require_coordinator(&self, stable_tenant_id: u64) -> Result<TenantReplicaSet, Status> {
+        let state = self
+            .decisions
+            .state()
+            .map_err(|_| Status::unavailable("applied cluster membership is unavailable"))?;
+        let placement = ClusterPlacement::from_applied(&state)
+            .map_err(|error| Status::unavailable(error.to_string()))?;
+        let replicas = TenantReplicaSet::from_placement(&placement, stable_tenant_id)?;
+        if replicas.group.coordinator() != self.local_node {
+            return Err(Status::failed_precondition(format!(
+                "authorization tenant is coordinated by node {}",
+                replicas.group.coordinator().0
+            )));
+        }
+        Ok(replicas)
+    }
+
+    fn require_context(
+        &self,
+        context: &AuthzRealmMutationContext,
+        coordinator: NodeId,
+    ) -> Result<(), Status> {
+        let current = self.serving.mutation_context()?;
+        if coordinator != self.local_node
+            || context.active_placement_log_id != current.active_placement_log_id
+            || context.serving_fence_term != current.serving_fence_term
+            || u64::from(context.source_id.node_id) != self.local_node.0
+        {
+            return Err(Status::unavailable(
+                "authorization mutation context does not match the current coordinator fence",
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn exact_quorum_candidate(
+    observed: &[&Option<AuthzRealmReplicaCandidate>],
+    required: usize,
+) -> Result<Option<AuthzRealmReplicaCandidate>, Status> {
+    for candidate in observed {
+        if observed.iter().filter(|other| *other == candidate).count() >= required {
+            return Ok((*candidate).clone());
+        }
+    }
+    let present = observed
+        .iter()
+        .filter_map(|candidate| candidate.as_ref())
+        .collect::<Vec<_>>();
+    let sibling = present.iter().enumerate().any(|(index, left)| {
+        present[index + 1..].iter().any(|right| {
+            left.manifest.revision == right.manifest.revision
+                && left.mutation_fingerprint != right.mutation_fingerprint
+        })
+    });
+    let reason = if sibling { "sibling" } else { "lineage gap" };
+    Err(Status::unavailable(format!(
+        "authorization realm has no exact read quorum ({reason})"
+    )))
+}
+
+fn authz_status(error: AuthzStoreError) -> Status {
+    match error {
+        AuthzStoreError::ReceiptCapacity
+        | AuthzStoreError::SourceJournalCapacity
+        | AuthzStoreError::RevisionNotAvailable { .. } => Status::unavailable(error.to_string()),
+        AuthzStoreError::Storage(_) => Status::internal(error.to_string()),
+        _ => Status::failed_precondition(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests;
