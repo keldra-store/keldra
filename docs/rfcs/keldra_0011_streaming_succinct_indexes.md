@@ -502,10 +502,10 @@ it does not reinterpret old bytes.
 The format-2 reserved paths are:
 
 ```text
-_anvil/indexes/v2/definitions/{index_name}
-_anvil/indexes/v2/{index_id}/runs/{run_hash}/...
-_anvil/indexes/v2/{index_id}/manifests/{manifest_hash}
-_anvil/indexes/v2/{index_id}/current
+_keldra/indexes/v2/definitions/{index_name}
+_keldra/indexes/v2/{index_id}/runs/{run_hash}/...
+_keldra/indexes/v2/{index_id}/manifests/{manifest_hash}
+_keldra/indexes/v2/{index_id}/current
 ```
 
 The run hash is not known while its component blocks are being streamed. Each
@@ -551,7 +551,7 @@ Publishing a new L0 batch or compaction result follows one sequence:
    segment set and complete source checkpoint vector with the selected artifact
    acknowledgement;
 5. revalidate builder placement, definition version and atomic watermark; and
-6. CAS `_anvil/indexes/v2/{index_id}/current` from the exact previously observed
+6. CAS `_keldra/indexes/v2/{index_id}/current` from the exact previously observed
    object version to the new generation, also using the selected artifact
    acknowledgement.
 

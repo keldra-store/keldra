@@ -477,7 +477,7 @@ authorization repository, establishes one durable bootstrap application
 identity and credential, and adds the ordinary tuple:
 
 ```text
-system:_anvil#bootstrap_admin@app:<bootstrap-app-id>
+system:_keldra#bootstrap_admin@app:<bootstrap-app-id>
 ```
 
 Bootstrap generates a high-entropy credential document at the operator's
@@ -541,8 +541,8 @@ There is one protected system scope whose identity is reserved to Anvil:
 
 ```text
 storage tenant = Anvil's internal system tenant
-realm          = _anvil/system
-schema         = anvil-system
+realm          = _keldra/system
+schema         = keldra-system
 ```
 
 The system realm is otherwise an ordinary realm. Its schema revisions,
@@ -670,10 +670,10 @@ supplies a stable invocation ID, a pinned program identity, and bounded input.
 It does not supply arbitrary code or a transaction plan.
 
 A program definition is an ordinary immutable Anvil object whose exact path is
-under the reserved `_anvil/programs/` prefix. For example:
+under the reserved `_keldra/programs/` prefix. For example:
 
 ```text
-_anvil/programs/import_osv@1
+_keldra/programs/import_osv@1
 ```
 
 The definition is created through the ordinary object write API using the

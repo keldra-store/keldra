@@ -786,10 +786,10 @@ added to the public API.
 Format v4 uses only these canonical reserved object paths:
 
 ```text
-_anvil/indices/v4/definitions/<index_name>
-_anvil/indices/v4/<index_id>/artifacts/<blake3_hex>
-_anvil/indices/v4/<index_id>/manifests/<blake3_hex>
-_anvil/indices/v4/<index_id>/current
+_keldra/indices/v4/definitions/<index_name>
+_keldra/indices/v4/<index_id>/artifacts/<blake3_hex>
+_keldra/indices/v4/<index_id>/manifests/<blake3_hex>
+_keldra/indices/v4/<index_id>/current
 ```
 
 Definition names remain one validated path segment. Numeric index IDs use their
@@ -805,10 +805,10 @@ form and their complete object payload digest. A generation manifest uses the
 
 A format-v4 process discovers only v4 definitions. The release starts from new
 volumes and definitions are recreated through the public API. It does not scan,
-interpret, convert, delete, or treat `_anvil/indices/v3/` objects as definitions
+interpret, convert, delete, or treat `_keldra/indices/v3/` objects as definitions
 or artifacts.
 
-Every path segment exactly equal to `_anvil` is reserved. Source events for
+Every path segment exactly equal to `_keldra` is reserved. Source events for
 reserved objects continue to participate in ordinary durability, reference,
 retention, and accounting machinery, but no index definition may project them
 as user documents. This rule applies even to a whole-bucket definition and
@@ -898,7 +898,7 @@ unvalidated value. These limits are format constants, not startup settings.
 ### 9.4 Schema fingerprint
 
 The schema fingerprint is BLAKE3 with domain separator
-`anvil.index.schema.v4`. Its input is one explicit length-prefixed canonical
+`keldra.index.schema.v4`. Its input is one explicit length-prefixed canonical
 binary encoding in this order:
 
 1. index kind, path prefix, and content-type scope;
@@ -1012,7 +1012,7 @@ not consume an active-job slot and a crash can resume it without an inventory.
 
 Deleting a definition installs a `deleted_definition` due record before its
 delivery checkpoint advances. Cleanup exact-validates the tombstone and HRW
-fence, then scans only `_anvil/indices/v4/<index_id>/` under the normal safety
+fence, then scans only `_keldra/indices/v4/<index_id>/` under the normal safety
 age and exact-version deletion rules. It never deletes the ordinary definition
 tombstone and never touches another index in the bucket.
 

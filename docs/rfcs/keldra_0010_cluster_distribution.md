@@ -274,7 +274,7 @@ The following rules are fixed:
 
 The placement calculation is an integer protocol. A weight is a positive
 `u32` number of millionths, where `1_000_000` means `1.0`. For node `n`,
-BLAKE3 derive-key mode uses context `anvil.storage/weighted-hrw/v1` and hashes
+BLAKE3 derive-key mode uses context `keldra.storage/weighted-hrw/v1` and hashes
 this exact tuple:
 
 ```text
@@ -592,7 +592,7 @@ bundle, or cluster state transfer. Genesis commits this domain-separated
 BLAKE3 fingerprint as immutable bounded cluster configuration:
 
 ```text
-BLAKE3-DERIVE("anvil.auth/jwt-signing-key/v1", signing_secret)
+BLAKE3-DERIVE("keldra.auth/jwt-signing-key/v1", signing_secret)
 ```
 
 A 0.5.0 in-place upgrade commits the first node's existing fingerprint once.
@@ -1035,7 +1035,7 @@ External tenant names are canonical lowercase ASCII DNS labels: one through 63
 characters, containing only `a` through `z`, `0` through `9`, and interior
 hyphens, with an alphanumeric first and last character. Input is rejected
 rather than lowercased or Unicode-normalized. Unicode, punycode aliases, and
-confusable display spellings are not tenant identifiers. `_anvil` is the one
+confusable display spellings are not tenant identifiers. `_keldra` is the one
 reserved system-tenant exception and cannot be registered by a client.
 
 Tenant name is the one identity intended eventually to be unique across a
@@ -1063,7 +1063,7 @@ For a request scoped to one tenant, bucket, literal prefix, and exclusive
    `[format][tenant_id][bucket_id][prefix]`;
 2. walks in byte-lexical order while the literal prefix matches;
 3. emits only live heads for which it is current weighted-HRW rank zero;
-4. omits tombstones and paths containing the reserved `_anvil` segment; and
+4. omits tombstones and paths containing the reserved `_keldra` segment; and
 5. returns a bounded sorted page plus continuation evidence.
 
 The ingress k-way merges those sorted pages into the public page. The maximum
@@ -1216,10 +1216,10 @@ Application-supplied metadata uses ordinary object storage. For subject path:
 the associated metadata path is:
 
 ```text
-/a/b/c.txt/_anvil/meta.json
+/a/b/c.txt/_keldra/meta.json
 ```
 
-Any path segment exactly `_anvil` is reserved for Anvil-defined behavior. The
+Any path segment exactly `_keldra` is reserved for Anvil-defined behavior. The
 metadata bytes therefore use the normal object path, inline storage, erasure
 coding, durability, deduplication, reference counts, GC, and authorization.
 No metadata-specific storage plane or fields are added to the object version
@@ -1352,7 +1352,7 @@ continuation after a response and reference deltas follow section 14.3.
 ### 24.2 Tenant-name canonicalization
 
 Tenant identifiers use the lowercase ASCII DNS-label rule in section 17.
-Noncanonical input is rejected, `_anvil` is reserved, and a claim is never
+Noncanonical input is rejected, `_keldra` is reserved, and a claim is never
 reassigned to another stable tenant.
 
 ### 24.3 Zanzibar aggregate and cross-aggregate administration

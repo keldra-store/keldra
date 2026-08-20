@@ -12,11 +12,11 @@
 
 All workspace packages currently share version `0.9.4`:
 
-- server, CLI, and Rust client: `anvil-server`, `anvil-storage-cli`, and
-  `anvil-storage`;
-- core crates: `anvil-api`, `anvil-authz`, `anvil-atomic-program`,
-  `anvil-consensus`, `anvil-index`, and `anvil-store`;
-- qualification tooling: `anvil-osv-qualification`.
+- server, CLI, and Rust client: `keldra-server`, `keldra-storage-cli`, and
+  `keldra-storage`;
+- core crates: `keldra-api`, `keldra-authz`, `keldra-atomic-program`,
+  `keldra-consensus`, `keldra-index`, and `keldra-store`;
+- qualification tooling: `keldra-osv-qualification`.
 
 Anvil 0.9.4 runs as one flat cluster of capacity-weighted nodes with native
 on-disk state, cluster-managed mTLS between peers, cluster-wide derived
@@ -48,8 +48,8 @@ For a focused server, client, and CLI test run:
 Build and smoke-test a native-architecture image:
 
 ```sh
-ANVIL_IMAGE=anvil:test ./scripts/build-image.sh
-ANVIL_IMAGE=anvil:test ./scripts/release-gates.sh image
+ANVIL_IMAGE=keldra:test ./scripts/build-image.sh
+ANVIL_IMAGE=keldra:test ./scripts/release-gates.sh image
 ```
 
 Before a release, repeat the image build and smoke test with
@@ -59,10 +59,10 @@ Before a release, repeat the image build and smoke test with
 Inspect and verify the two publishable crate archives locally before tagging:
 
 ```sh
-cargo package --locked -p anvil-api --list
-cargo package --locked -p anvil-storage --list
-cargo package --locked -p anvil-api
-cargo package --locked -p anvil-storage
+cargo package --locked -p keldra-api --list
+cargo package --locked -p keldra-storage --list
+cargo package --locked -p keldra-api
+cargo package --locked -p keldra-storage
 ```
 
 ## Release
@@ -81,19 +81,19 @@ gates, then publishes the single multi-architecture image for the repository
 and creates the GitHub release. Do not publish
 public architecture-specific or `v`-prefixed image tags.
 
-Publish the crates from the same validated commit. `anvil-storage` depends on
-the exact `anvil-api` release, so publish and verify the API crate before the
+Publish the crates from the same validated commit. `keldra-storage` depends on
+the exact `keldra-api` release, so publish and verify the API crate before the
 client crate:
 
 ```sh
-cargo publish --locked -p anvil-api
-cargo info anvil-api@0.9.4
+cargo publish --locked -p keldra-api
+cargo info keldra-api@0.9.4
 
-cargo publish --locked -p anvil-storage
-cargo info anvil-storage@0.9.4
+cargo publish --locked -p keldra-storage
+cargo info keldra-storage@0.9.4
 ```
 
-Do not publish `anvil-storage` until `cargo info anvil-api@0.9.4` resolves from
+Do not publish `keldra-storage` until `cargo info keldra-api@0.9.4` resolves from
 crates.io. After both commands succeed, run both `cargo info` checks again and
 confirm that each reports version `0.9.4` from crates.io.
 
