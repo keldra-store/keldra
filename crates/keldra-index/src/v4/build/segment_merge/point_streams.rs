@@ -31,7 +31,7 @@ pub(super) async fn build_point_stream<D, S, W, E>(
     field_id: FieldId,
     sort_bytes: usize,
     executor: E,
-) -> Result<BuiltPointStream, IndexError>
+) -> Result<Option<BuiltPointStream>, IndexError>
 where
     D: ArtifactDirectoryRead,
     S: ComponentBatchSink,
@@ -93,8 +93,12 @@ where
             }
         }
     }
-    let run = sorter.finish().await?;
-    publish_points(&mut sink, schema, identity, field_id, run).await
+    let Some(run) = sorter.finish().await? else {
+        return Ok(None);
+    };
+    publish_points(&mut sink, schema, identity, field_id, run)
+        .await
+        .map(Some)
 }
 
 fn point_matches_type(value: &PointValue, field_type: FieldType) -> bool {
@@ -250,19 +254,20 @@ impl<'a, W: MergeScratchSpace, E: CompactionExecutor> PointSorter<'a, W, E> {
         Ok(())
     }
 
-    async fn finish(mut self) -> Result<W::File, IndexError> {
+    async fn finish(mut self) -> Result<Option<W::File>, IndexError> {
         self.flush().await?;
         loop {
             let total = self.levels.iter().map(Vec::len).sum::<usize>();
             if total == 0 {
-                return Err(IndexError::InvalidFormat("merged point stream is empty"));
+                return Ok(None);
             }
             if total == 1 {
-                return Ok(self
-                    .levels
-                    .iter_mut()
-                    .find_map(Vec::pop)
-                    .expect("one point run"));
+                return Ok(Some(
+                    self.levels
+                        .iter_mut()
+                        .find_map(Vec::pop)
+                        .expect("one point run"),
+                ));
             }
             let mut inputs = Vec::with_capacity(SORT_FAN_IN);
             for level in &mut self.levels {

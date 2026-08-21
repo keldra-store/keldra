@@ -784,6 +784,52 @@ async fn merge_accepts_a_segment_where_an_optional_point_field_is_entirely_missi
     assert_eq!(merged.descriptor.document_count, 2);
 }
 
+#[tokio::test]
+async fn merge_omits_an_optional_point_stream_when_every_input_is_missing() {
+    let schema = numeric_point_schema();
+    let mut sink = SharedSink::default();
+    let left = build_segment(
+        &mut sink,
+        &schema,
+        36,
+        vec![numeric_point_source("objects/left", false, None)],
+        64 * 1024 * 1024,
+    )
+    .await;
+    let right = build_segment(
+        &mut sink,
+        &schema,
+        37,
+        vec![numeric_point_source("objects/right", false, None)],
+        64 * 1024 * 1024,
+    )
+    .await;
+    let directory = SharedDirectory(sink.clone());
+    let merged = merge_segments(
+        &directory,
+        &schema,
+        &[left.descriptor, right.descriptor],
+        SegmentIdentity::new(9, 2, schema.fingerprint().unwrap(), 38).unwrap(),
+        BuildLimits::new(64 * 1024 * 1024).unwrap(),
+        &mut sink,
+        &MemoryScratch::default(),
+        TokioExecutor,
+        CompactionParallelism::new(2, 64 * 1024 * 1024).unwrap(),
+        CompactionProgress::default(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(merged.descriptor.document_count, 2);
+    assert!(
+        merged
+            .descriptor
+            .components
+            .iter()
+            .all(|component| component.role != ComponentKind::POINTS)
+    );
+}
+
 fn terms_only_keyword_schema() -> Schema {
     Schema {
         kind: IndexKind::TypedJson,

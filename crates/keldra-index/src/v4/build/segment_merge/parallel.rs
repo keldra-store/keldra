@@ -24,7 +24,7 @@ enum RangeJob {
 
 enum RangeResult {
     Documents(BuiltDocStreams),
-    Points(FieldId, BuiltPointStream),
+    Points(FieldId, Option<BuiltPointStream>),
     Terms(FieldId, BuiltTermStreams),
 }
 
@@ -226,14 +226,16 @@ async fn assemble_range_results<S: ComponentBatchSink>(
                 }
             }
             RangeResult::Points(field_id, built) => {
-                let field = &schema.fields[field_id.get() as usize];
-                if !field.components.contains(FieldComponents::DOC_VALUES) {
-                    add_one_count(&mut doc_counts[field_id.get() as usize], &built.counts)?;
+                if let Some(built) = built {
+                    let field = &schema.fields[field_id.get() as usize];
+                    if !field.components.contains(FieldComponents::DOC_VALUES) {
+                        add_one_count(&mut doc_counts[field_id.get() as usize], &built.counts)?;
+                    }
+                    doc_streams
+                        .entry((ComponentKind::POINTS, Some(field_id)))
+                        .or_default()
+                        .push(built.stream);
                 }
-                doc_streams
-                    .entry((ComponentKind::POINTS, Some(field_id)))
-                    .or_default()
-                    .push(built.stream);
             }
             RangeResult::Terms(field_id, built) => {
                 add_one_count(term_counts.entry(field_id).or_default(), &built.counts)?;
