@@ -651,8 +651,9 @@ fn validate_component_shape(
         let postings = has(ComponentKind::POSTINGS);
         let positions = has(ComponentKind::POSITIONS);
         if terms != postings
-            || field.components.contains(FieldComponents::POSITIONS) != positions
-            || field.components.contains(FieldComponents::POINTS) != has(ComponentKind::POINTS)
+            || terms && !field.components.contains(FieldComponents::TERMS)
+            || positions && (!terms || !field.components.contains(FieldComponents::POSITIONS))
+            || has(ComponentKind::POINTS) && !field.components.contains(FieldComponents::POINTS)
             || field.components.contains(FieldComponents::DOC_VALUES)
                 != has(ComponentKind::DOC_VALUES)
             || field.components.contains(FieldComponents::NORMS) != has(ComponentKind::NORMS)

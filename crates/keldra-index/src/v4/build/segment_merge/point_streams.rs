@@ -9,7 +9,7 @@ use super::super::super::{
 use super::super::sink::{PublishedStream, StreamingComponentPublisher};
 use super::super::{ComponentBatchSink, MergeScratchFile, MergeScratchSpace};
 use super::doc_components::FieldCounts;
-use super::io::{RemapReader, required_stream};
+use super::io::{RemapReader, optional_stream};
 
 const SORT_FAN_IN: usize = 16;
 const RECORD_BYTES: usize = 13;
@@ -49,13 +49,16 @@ where
         .ok_or(IndexError::InvalidFormat("point field is outside schema"))?;
     let mut sorter = PointSorter::new(workspace, sort_bytes, executor)?;
     for (input, remap) in inputs.iter().zip(remaps) {
-        let mut stream = required_stream(
+        let Some(mut stream) = optional_stream(
             directory,
             input,
             ComponentKind::POINTS,
             Some(field_id),
             None,
-        )?;
+        )?
+        else {
+            continue;
+        };
         let mut remap = RemapReader::new(remap.clone(), input.document_count);
         while let Some((leaf, block)) = stream.next(PointBlock::decode_payload).await? {
             if block.field_id != field_id

@@ -737,6 +737,53 @@ async fn numeric_point_queries_are_equivalent_before_and_after_merge() {
     }
 }
 
+#[tokio::test]
+async fn merge_accepts_a_segment_where_an_optional_point_field_is_entirely_missing() {
+    let schema = numeric_point_schema();
+    let mut sink = SharedSink::default();
+    let missing = build_segment(
+        &mut sink,
+        &schema,
+        33,
+        vec![numeric_point_source("objects/missing", false, None)],
+        64 * 1024 * 1024,
+    )
+    .await;
+    let populated = build_segment(
+        &mut sink,
+        &schema,
+        34,
+        vec![numeric_point_source("objects/value", true, Some(10))],
+        64 * 1024 * 1024,
+    )
+    .await;
+
+    assert!(
+        missing
+            .descriptor
+            .components
+            .iter()
+            .all(|component| component.role != ComponentKind::POINTS)
+    );
+    let directory = SharedDirectory(sink.clone());
+    let merged = merge_segments(
+        &directory,
+        &schema,
+        &[missing.descriptor, populated.descriptor],
+        SegmentIdentity::new(9, 2, schema.fingerprint().unwrap(), 35).unwrap(),
+        BuildLimits::new(64 * 1024 * 1024).unwrap(),
+        &mut sink,
+        &MemoryScratch::default(),
+        TokioExecutor,
+        CompactionParallelism::new(2, 64 * 1024 * 1024).unwrap(),
+        CompactionProgress::default(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(merged.descriptor.document_count, 2);
+}
+
 fn terms_only_keyword_schema() -> Schema {
     Schema {
         kind: IndexKind::TypedJson,
