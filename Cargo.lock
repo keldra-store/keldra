@@ -2662,7 +2662,7 @@ dependencies = [
 
 [[package]]
 name = "keldra"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "keldra-api",
  "tokio",
@@ -2672,7 +2672,7 @@ dependencies = [
 
 [[package]]
 name = "keldra-api"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "prost",
  "prost-types",
@@ -2683,7 +2683,7 @@ dependencies = [
 
 [[package]]
 name = "keldra-atomic-program"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "blake3",
  "serde",
@@ -2694,7 +2694,7 @@ dependencies = [
 
 [[package]]
 name = "keldra-authz"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2702,7 +2702,7 @@ dependencies = [
 
 [[package]]
 name = "keldra-cli"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2718,7 +2718,7 @@ dependencies = [
 
 [[package]]
 name = "keldra-consensus"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "bincode",
  "hyper-util",
@@ -2740,7 +2740,7 @@ dependencies = [
 
 [[package]]
 name = "keldra-index"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "blake3",
  "futures-util",
@@ -2751,7 +2751,7 @@ dependencies = [
 
 [[package]]
 name = "keldra-osv-qualification"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2771,7 +2771,7 @@ dependencies = [
 
 [[package]]
 name = "keldra-server"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2833,7 +2833,7 @@ dependencies = [
 
 [[package]]
 name = "keldra-store"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "anyhow",
  "argon2",

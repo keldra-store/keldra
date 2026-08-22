@@ -59,7 +59,7 @@ jobs:
           printf 'tag=%s\ncommit=%s\n' "$tag" "$commit" >>"$GITHUB_OUTPUT"
 
   validate:
-    name: Validate Keldra 0.11 release
+    name: Validate Keldra release
     needs: release-context
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -212,7 +212,7 @@ jobs:
           fi
 
   publish:
-    name: Publish Keldra 0.11 image and release
+    name: Publish Keldra image and release
     needs: [release-context, validate, build-image]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -326,11 +326,11 @@ jobs:
           generate_release_notes: true
           make_latest: true
           body: |
-            Keldra 0.11.0 completes the public Keldra product rename. It includes
-            the `keldra` Rust crate and CLI, the multi-platform Keldra server
-            image, and the authorized HTTP plugin broker used by separately
-            deployed protocol plugins. Object, index, PersonalDB, accounting,
-            S3, Git, authorization, and cluster capabilities remain available.
+            Keldra ${{ needs.release-context.outputs.tag }} fixes sparse Typed JSON
+            point-segment merging and preserves the logical-record identities
+            written by released Keldra and Anvil-compatible installations.
+            It includes the multi-platform Keldra server image, CLI, and the
+            authorized HTTP plugin broker.
 
             - Image: `${{ steps.image.outputs.image }}`
             - Manifest digest: `${{ steps.image.outputs.digest }}`

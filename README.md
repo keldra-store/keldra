@@ -47,7 +47,7 @@ repository are required.
 ### 1. Start a development node
 
 ```sh
-export KELDRA_IMAGE=ghcr.io/keldra-store/keldra:0.11.0
+export KELDRA_IMAGE=ghcr.io/keldra-store/keldra:0.11.1
 export KELDRA_TOKEN_SIGNING_KEY_FILE="$PWD/keldra-data/token-signing-key"
 
 mkdir -p keldra-data
@@ -705,7 +705,7 @@ bundles, establishes peer mTLS, exercises replicated and erasure-coded storage,
 queries every index type, and performs a rolling restart:
 
 ```sh
-KELDRA_IMAGE=ghcr.io/keldra-store/keldra:0.11.0 \
+KELDRA_IMAGE=ghcr.io/keldra-store/keldra:0.11.1 \
   ./scripts/qualify-three-node.sh
 ```
 
