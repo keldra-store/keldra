@@ -31,15 +31,16 @@ async fn hostile_callers_fail_closed_and_system_recovery_is_exact_and_idempotent
         .expect("bootstrap credential must exchange");
     let mut system = administration(&fixture.channel, &system_token);
 
-    system
-        .provision_tenant(ProvisionTenantRequest {
+    provision_tenant_when_serving(
+        &mut system,
+        ProvisionTenantRequest {
             storage_tenant: "acme".into(),
             owner_app_id: "acme-owner".into(),
             owner_client_id: "acme-owner-client".into(),
             owner_client_secret: ACME_SECRET.into(),
-        })
-        .await
-        .unwrap();
+        },
+    )
+    .await;
     system
         .provision_tenant(ProvisionTenantRequest {
             storage_tenant: "beta".into(),
@@ -362,6 +363,26 @@ impl Fixture {
 
 fn administration(channel: &Channel, token: &str) -> keldra_storage::RawAdministrationClient {
     keldra_storage::administration_client(channel.clone(), token).unwrap()
+}
+
+async fn provision_tenant_when_serving(
+    client: &mut keldra_storage::RawAdministrationClient,
+    request: ProvisionTenantRequest,
+) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        match client.provision_tenant(request.clone()).await {
+            Ok(_) => return,
+            Err(status)
+                if status.code() == Code::Unavailable
+                    && status.message() == "this node does not hold a current serving fence"
+                    && Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(status) => panic!("Keldra test server did not become writable: {status}"),
+        }
+    }
 }
 
 async fn exchange(
