@@ -846,7 +846,6 @@ impl ObjectService for ObjectServiceImpl {
     ) -> Result<Response<Self::WatchPrefixStream>, Status> {
         reject_plugin_token(&request, "WatchPrefix")?;
         let caller = authenticated_caller(&request)?;
-        let bearer = OriginalBearer::from_metadata(request.metadata())?;
         let request = request.into_inner();
         let prefix = request
             .prefix
@@ -883,7 +882,7 @@ impl ObjectService for ObjectServiceImpl {
             .await?;
         let distributed_scope = DistributedWatchScope::new(&scope, tenant_id, bucket_id)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        distributed_watch_stream::response(self.watch.clone(), distributed_scope, bearer, start)
+        distributed_watch_stream::response(self.watch.clone(), distributed_scope, caller, start)
             .await
     }
 

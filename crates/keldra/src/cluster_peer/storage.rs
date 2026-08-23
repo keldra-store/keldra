@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use tonic::{Request, Response, Status};
 
 use super::{CLUSTER_PEER_SCHEMA_VERSION, ClusterPeerService, decode_json, encode_json, wire};
+use crate::authentication::Caller;
 use crate::distributed_list::{LocalListQuery, OriginalBearer, OwnedListPage};
 use crate::distributed_watch::{DistributedWatchScope, filter_public_changes};
 use crate::mutable_record_replica_group::MutableRecordReplicaGroup;
@@ -574,11 +575,14 @@ impl wire::cluster_peer_server::ClusterPeer for ClusterPeerService {
         request: Request<wire::WatchStatusRequest>,
     ) -> Result<Response<wire::WatchStatus>, Status> {
         let admitted = self.admit(&request, request.get_ref().peer.as_ref(), 0)?;
-        let bearer = OriginalBearer::from_metadata(request.metadata())?;
+        let caller = watch_caller(
+            &request.get_ref().storage_tenant,
+            &request.get_ref().application_id,
+        )?;
         let scope: DistributedWatchScope = decode_json(&request.get_ref().scope_json)?;
         self.list_authorizer
-            .authorize(
-                &bearer,
+            .authorize_caller(
+                &caller,
                 &watch_authorization_query(admitted.placement.fence(), &scope)?,
             )
             .await?;
@@ -611,12 +615,15 @@ impl wire::cluster_peer_server::ClusterPeer for ClusterPeerService {
         request: Request<wire::WatchPageRequest>,
     ) -> Result<Response<wire::WatchPage>, Status> {
         let admitted = self.admit(&request, request.get_ref().peer.as_ref(), 0)?;
-        let bearer = OriginalBearer::from_metadata(request.metadata())?;
+        let caller = watch_caller(
+            &request.get_ref().storage_tenant,
+            &request.get_ref().application_id,
+        )?;
         let expected_source: SourceId = decode_json(&request.get_ref().expected_source_json)?;
         let scope: DistributedWatchScope = decode_json(&request.get_ref().scope_json)?;
         self.list_authorizer
-            .authorize(
-                &bearer,
+            .authorize_caller(
+                &caller,
                 &watch_authorization_query(admitted.placement.fence(), &scope)?,
             )
             .await?;
@@ -941,6 +948,13 @@ impl wire::cluster_peer_server::ClusterPeer for ClusterPeerService {
     ) -> Result<Response<wire::CoordinateSystemGrantResponse>, Status> {
         self.coordinate_system_grant_call(request).await
     }
+}
+
+fn watch_caller(storage_tenant: &str, application_id: &str) -> Result<Caller, Status> {
+    let storage_tenant = StorageTenantId::parse(storage_tenant)
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    Caller::from_authenticated_application(storage_tenant, application_id)
+        .map_err(|error| Status::invalid_argument(error.to_string()))
 }
 
 fn watch_authorization_query(

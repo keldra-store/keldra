@@ -24,6 +24,7 @@ use super::{
     CLUSTER_PEER_SCHEMA_VERSION, MAX_CLUSTER_OPERATION_TIME, MAX_CLUSTER_PEER_MESSAGE_BYTES,
     MAX_INDEX_SOURCE_SNAPSHOT_TIME, decode_json, encode_json, require_response_schema, wire,
 };
+use crate::authentication::Caller;
 use crate::authz_distribution::AuthzSchemaReplicaQuery;
 use crate::cluster_placement::ClusterPlacement;
 use crate::data_peer::DataPeerTransport;
@@ -1248,19 +1249,21 @@ impl ClusterWatchSources for ClusterPeerTransport {
         target: NodeId,
         address: &str,
         membership_revision: PlacementLogId,
-        bearer: OriginalBearer,
+        caller: Caller,
         scope: DistributedWatchScope,
     ) -> Result<WatchSourceStatus, WatchSourceError> {
         let result = async {
+            let application_id = caller
+                .authenticated_app_id()
+                .map_err(|error| Status::unauthenticated(error.to_string()))?
+                .to_owned();
             let mut request = Request::new(wire::WatchStatusRequest {
                 peer: Some(self.context(membership_revision, 0, MAX_CLUSTER_OPERATION_TIME)?),
                 scope_json: encode_json(&scope)?,
+                storage_tenant: caller.storage_tenant().as_str().to_owned(),
+                application_id,
             });
-            add_bearer_and_timeout(
-                &mut request,
-                bearer.signed_token(),
-                MAX_CLUSTER_OPERATION_TIME,
-            )?;
+            request.set_timeout(MAX_CLUSTER_OPERATION_TIME);
             let response = self
                 .client(target, address)?
                 .get_watch_status(request)
@@ -1291,10 +1294,14 @@ impl ClusterWatchSources for ClusterPeerTransport {
         &self,
         target: NodeId,
         address: &str,
-        bearer: OriginalBearer,
+        caller: Caller,
         query: WatchSourceQuery,
     ) -> Result<WatchSourcePage, WatchSourceError> {
         let result = async {
+            let application_id = caller
+                .authenticated_app_id()
+                .map_err(|error| Status::unauthenticated(error.to_string()))?
+                .to_owned();
             let mut request = Request::new(wire::WatchPageRequest {
                 peer: Some(self.context(
                     query.membership_revision,
@@ -1306,12 +1313,10 @@ impl ClusterWatchSources for ClusterPeerTransport {
                 next_offset: query.next_offset,
                 max_records: u32::try_from(query.max_records)
                     .map_err(|_| Status::invalid_argument("watch page limit exceeds u32"))?,
+                storage_tenant: caller.storage_tenant().as_str().to_owned(),
+                application_id,
             });
-            add_bearer_and_timeout(
-                &mut request,
-                bearer.signed_token(),
-                MAX_CLUSTER_OPERATION_TIME,
-            )?;
+            request.set_timeout(MAX_CLUSTER_OPERATION_TIME);
             let response = self
                 .client(target, address)?
                 .read_watch_page(request)
@@ -1433,6 +1438,11 @@ pub(super) fn add_bearer_and_timeout_with_limit<T>(
 fn watch_error(status: Status) -> WatchSourceError {
     if status.code() == tonic::Code::OutOfRange && status.message() == "RESUME_EXPIRED" {
         WatchSourceError::ResumeExpired
+    } else if matches!(
+        status.code(),
+        tonic::Code::PermissionDenied | tonic::Code::Unauthenticated
+    ) {
+        WatchSourceError::AccessRevoked
     } else {
         WatchSourceError::Unavailable(status.to_string())
     }

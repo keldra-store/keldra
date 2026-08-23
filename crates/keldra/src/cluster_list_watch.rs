@@ -12,9 +12,10 @@ use keldra_consensus::{DecisionRaft, NodeId};
 use keldra_store::{JournalRoute, PlacementLogId, RoutedJournalError, SourceId, Store};
 use tonic::{Code, Status};
 
+use crate::authentication::Caller;
 use crate::cluster_peer::ClusterPeerTransport;
 use crate::cluster_placement::ClusterPlacement;
-use crate::distributed_list::{AuthoritativeListAuthorizer, LocalListQuery, OriginalBearer};
+use crate::distributed_list::{AuthoritativeListAuthorizer, LocalListQuery};
 use crate::distributed_watch::{
     ClusterWatchSources, DistributedWatchScope, WatchPlacement, WatchPlacementAuthority,
     WatchSourceError, WatchSourcePage, WatchSourceQuery, WatchSourceStatus, filter_public_changes,
@@ -55,7 +56,8 @@ impl WatchPlacementAuthority for DecisionWatchPlacement {
 }
 
 /// Local-source fast path plus the mandatory-mTLS transport for every other
-/// ACTIVE source. Both paths evaluate the original bearer at the source.
+/// ACTIVE source. Both paths make a fresh Zanzibar decision for the caller
+/// admitted at the public watch boundary.
 #[derive(Clone)]
 pub(crate) struct ClusterWatchSourcesAdapter {
     local_node: NodeId,
@@ -109,13 +111,13 @@ impl ClusterWatchSourcesAdapter {
 
     async fn authorize(
         &self,
-        bearer: &OriginalBearer,
+        caller: &Caller,
         scope: &DistributedWatchScope,
         fence: PlacementLogId,
     ) -> Result<(), WatchSourceError> {
         let query = watch_authorization_query(fence, scope).map_err(status_to_watch_error)?;
         self.authorization
-            .authorize(bearer, &query)
+            .authorize_caller(caller, &query)
             .await
             .map_err(status_to_watch_error)
     }
@@ -128,17 +130,17 @@ impl ClusterWatchSources for ClusterWatchSourcesAdapter {
         target: NodeId,
         address: &str,
         membership_revision: PlacementLogId,
-        bearer: OriginalBearer,
+        caller: Caller,
         scope: DistributedWatchScope,
     ) -> Result<WatchSourceStatus, WatchSourceError> {
         if target != self.local_node {
             return self
                 .remote
-                .status(target, address, membership_revision, bearer, scope)
+                .status(target, address, membership_revision, caller, scope)
                 .await;
         }
         self.require_local_placement(target, membership_revision)?;
-        self.authorize(&bearer, &scope, membership_revision).await?;
+        self.authorize(&caller, &scope, membership_revision).await?;
         loop {
             let store = self.store.clone();
             let status = tokio::task::spawn_blocking(move || store.local_watch_status())
@@ -165,14 +167,14 @@ impl ClusterWatchSources for ClusterWatchSourcesAdapter {
         &self,
         target: NodeId,
         address: &str,
-        bearer: OriginalBearer,
+        caller: Caller,
         query: WatchSourceQuery,
     ) -> Result<WatchSourcePage, WatchSourceError> {
         if target != self.local_node {
-            return self.remote.read_page(target, address, bearer, query).await;
+            return self.remote.read_page(target, address, caller, query).await;
         }
         self.require_local_placement(target, query.membership_revision)?;
-        self.authorize(&bearer, &query.scope, query.membership_revision)
+        self.authorize(&caller, &query.scope, query.membership_revision)
             .await?;
         loop {
             let store = self.store.clone();
@@ -284,6 +286,11 @@ fn require_source_identity(local_node: NodeId, source: SourceId) -> Result<(), W
 fn status_to_watch_error(status: Status) -> WatchSourceError {
     if status.code() == Code::OutOfRange && status.message() == "RESUME_EXPIRED" {
         WatchSourceError::ResumeExpired
+    } else if matches!(
+        status.code(),
+        Code::PermissionDenied | Code::Unauthenticated
+    ) {
+        WatchSourceError::AccessRevoked
     } else {
         WatchSourceError::Unavailable(status.to_string())
     }

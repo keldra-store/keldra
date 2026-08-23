@@ -1,10 +1,11 @@
 use std::net::{SocketAddr, TcpListener};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use keldra::authentication::{JwtManager, RateLimitConfig};
 use keldra::{ServerConfig, serve};
 use keldra_api::v1::accounting_service_client::AccountingServiceClient;
 use keldra_api::v1::administration_service_client::AdministrationServiceClient;
+use keldra_api::v1::application_role_request::Target as ApplicationRoleTarget;
 use keldra_api::v1::batch_get_outcome::Outcome as BatchOutcomeValue;
 use keldra_api::v1::bulk_operation::Operation as BulkOperationValue;
 use keldra_api::v1::bulk_outcome::Outcome as BulkOutcomeValue;
@@ -16,22 +17,23 @@ use keldra_api::v1::put_header::Operation as PutOperationValue;
 use keldra_api::v1::watch_message::Message as WatchMessageValue;
 use keldra_api::v1::watch_prefix_request::Start as WatchStart;
 use keldra_api::v1::{
-    BatchGetRequest, BucketPolicy, BulkOperation, BulkPutRequest, BulkWriteRequest,
-    CreateIndexRequest, DeleteIfVersionRequest, DeleteRequest, DeleteVersionRequest,
-    DisableAccountingRequest, Durability, EnableAccountingRequest, GetAccountingRequest,
-    GetIndexRequest, GetObjectRequest, HeadObjectRequest, IndexQuery, IndexSpecification,
-    InvokeProgramRequest, ListObjectVersionsRequest, ListObjectsRequest, MutationFailureCode,
-    ObjectAddress, ObjectVersioning as ApiObjectVersioning, PathIndexQuery, PathIndexSpec,
-    PutHeader, PutIfAbsentOperation, PutIfVersionOperation, PutImmutableOperation, PutOperation,
-    PutRequest, PutToken, QueryIndexRequest, ReadFailureCode, RebuildIndexRequest,
-    SetBucketPolicyRequest, SetBucketVersioningRequest, UpdateIndexRequest, WatchNow,
-    WatchPrefixRequest, WatchStateHint,
+    ApplicationRoleRequest, BatchGetRequest, BucketApplicationRole, BucketApplicationRoleTarget,
+    BucketPolicy, BulkOperation, BulkPutRequest, BulkWriteRequest, CreateIndexRequest,
+    DeleteIfVersionRequest, DeleteRequest, DeleteVersionRequest, DisableAccountingRequest,
+    Durability, EnableAccountingRequest, GetAccountingRequest, GetIndexRequest, GetObjectRequest,
+    HeadObjectRequest, IndexQuery, IndexSpecification, InvokeProgramRequest,
+    ListObjectVersionsRequest, ListObjectsRequest, MutationFailureCode, ObjectAddress,
+    ObjectVersioning as ApiObjectVersioning, PathIndexQuery, PathIndexSpec, PutHeader,
+    PutIfAbsentOperation, PutIfVersionOperation, PutImmutableOperation, PutOperation, PutRequest,
+    PutToken, QueryIndexRequest, ReadFailureCode, RebuildIndexRequest, SetBucketPolicyRequest,
+    SetBucketVersioningRequest, UpdateIndexRequest, WatchNow, WatchPrefixRequest, WatchStateHint,
 };
 use keldra_authz::ObjectRef;
 use keldra_store::{
     AuthzRevision, CreateBucketRequest, ObjectVersioning as StoreObjectVersioning,
     ProvisionTenantRequest, StorageTenantId, Store, StoreOptions, SystemBootstrapRequest,
 };
+use serde::Serialize;
 use tempfile::TempDir;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Request, Response, Status};
@@ -1356,6 +1358,131 @@ async fn watch_prefix_streams_present_and_deleted_invalidations_with_checkpoints
         WatchStateHint::Deleted
     );
     assert!(!checkpoint(next_watch(&mut resumed).await).is_empty());
+
+    fixture.stop().await;
+}
+
+#[derive(Serialize)]
+struct ShortLivedAccessClaims<'a> {
+    sub: &'a str,
+    storage_tenant: &'a str,
+    exp: u64,
+    jti: &'a str,
+    aud: &'a str,
+    purpose: &'a str,
+}
+
+fn short_lived_access_token(lifetime: Duration) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+        &ShortLivedAccessClaims {
+            sub: "owner-app",
+            storage_tenant: "acme",
+            exp: now + lifetime.as_secs(),
+            jti: "short-lived-watch-test",
+            aud: "keldra-access",
+            purpose: "access",
+        },
+        &jsonwebtoken::EncodingKey::from_secret(SIGNING_KEY),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn admitted_watch_survives_access_token_expiry() {
+    let fixture = Fixture::start().await;
+    let short_token = short_lived_access_token(Duration::from_secs(2));
+    let mut watch_client = ObjectServiceClient::new(fixture.channel.clone());
+    let mut writer = ObjectServiceClient::new(fixture.channel.clone());
+    let mut watch = watch_client
+        .watch_prefix(authorized(
+            WatchPrefixRequest {
+                prefix: Some(address("long-lived")),
+                start: Some(WatchStart::Now(WatchNow {})),
+            },
+            &short_token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!checkpoint(next_watch(&mut watch).await).is_empty());
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_unauthenticated(
+        watch_client
+            .head_object(authorized(
+                HeadObjectRequest {
+                    address: Some(address("long-lived/item")),
+                },
+                &short_token,
+            ))
+            .await,
+    );
+
+    let created = put_object(
+        &mut writer,
+        &fixture.access_token,
+        address("long-lived/item"),
+        b"still-watching",
+        "watch-after-token-expiry",
+        PutOperationValue::Put(PutOperation {}),
+    )
+    .await
+    .unwrap();
+    let invalidation = next_invalidation(&mut watch).await;
+    assert_eq!(invalidation.minimum_path_version, created.version);
+
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn established_watch_terminates_when_zanzibar_access_is_revoked() {
+    let fixture = Fixture::start().await;
+    let mut watch_client = ObjectServiceClient::new(fixture.channel.clone());
+    let mut administration = AdministrationServiceClient::new(fixture.channel.clone());
+    let mut watch = watch_client
+        .watch_prefix(authorized(
+            WatchPrefixRequest {
+                prefix: Some(address("revoked")),
+                start: Some(WatchStart::Now(WatchNow {})),
+            },
+            &fixture.access_token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!checkpoint(next_watch(&mut watch).await).is_empty());
+
+    administration
+        .revoke_application_role(authorized(
+            ApplicationRoleRequest {
+                app_id: "owner-app".into(),
+                target: Some(ApplicationRoleTarget::Bucket(BucketApplicationRoleTarget {
+                    bucket: "objects".into(),
+                    role: BucketApplicationRole::Owner as i32,
+                })),
+            },
+            &fixture.access_token,
+        ))
+        .await
+        .unwrap();
+
+    let status = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match watch.message().await {
+                Err(status) => break status,
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("revoked watch ended without a terminal status"),
+            }
+        }
+    })
+    .await
+    .expect("revoked watch did not terminate");
+    assert_eq!(status.code(), Code::PermissionDenied);
 
     fixture.stop().await;
 }

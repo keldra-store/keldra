@@ -14,7 +14,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-keldra-api = { version = "=0.11.2", path = "../../crates/keldra-api" }
+keldra-api = { version = "=0.11.3", path = "../../crates/keldra-api" }
 tokio-stream = "0.1"
 tonic = { version = "0.14", default-features = false, features = ["transport", "tls-native-roots"] }
 

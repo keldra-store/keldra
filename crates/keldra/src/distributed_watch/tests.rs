@@ -163,7 +163,7 @@ impl ClusterWatchSources for MemorySources {
         target: NodeId,
         _address: &str,
         membership_revision: PlacementLogId,
-        _bearer: OriginalBearer,
+        _caller: Caller,
         _scope: DistributedWatchScope,
     ) -> Result<WatchSourceStatus, WatchSourceError> {
         let journal = self.snapshot(target)?;
@@ -181,7 +181,7 @@ impl ClusterWatchSources for MemorySources {
         &self,
         target: NodeId,
         _address: &str,
-        _bearer: OriginalBearer,
+        _caller: Caller,
         query: WatchSourceQuery,
     ) -> Result<WatchSourcePage, WatchSourceError> {
         let journal = self.snapshot(target)?;
@@ -269,8 +269,12 @@ fn scope(prefix: &str) -> DistributedWatchScope {
     .unwrap()
 }
 
-fn bearer() -> OriginalBearer {
-    OriginalBearer::from_signed_token("test-bearer")
+fn bearer() -> Caller {
+    Caller::from_authenticated_application(
+        keldra_store::StorageTenantId::parse("tenant").unwrap(),
+        "test-application",
+    )
+    .unwrap()
 }
 
 fn watch(
@@ -391,6 +395,26 @@ async fn one_required_source_failure_never_returns_a_partial_batch() {
             node_id: Some(NodeId(2)),
             message: "peer is down".into(),
         }
+    );
+}
+
+#[tokio::test]
+async fn authorization_loss_terminates_an_established_watch() {
+    let placement = Arc::new(MutablePlacement::new(placement(10, &[1])));
+    let sources = Arc::new(MemorySources::default());
+    sources.insert(NodeId(1), 0);
+    let codec = Arc::new(MemoryCodec::default());
+    let watch = watch(placement, sources.clone(), codec);
+    let checkpoint = watch.start_now(scope(""), bearer()).await.unwrap();
+
+    sources.fail(NodeId(1), WatchSourceError::AccessRevoked);
+
+    assert_eq!(
+        watch
+            .poll_once(scope(""), &checkpoint, bearer())
+            .await
+            .unwrap_err(),
+        DistributedWatchError::AccessRevoked
     );
 }
 
@@ -590,7 +614,7 @@ async fn malformed_filtered_page_fails_closed() {
             target: NodeId,
             _address: &str,
             revision: PlacementLogId,
-            _bearer: OriginalBearer,
+            _caller: Caller,
             _scope: DistributedWatchScope,
         ) -> Result<WatchSourceStatus, WatchSourceError> {
             Ok(WatchSourceStatus {
@@ -614,7 +638,7 @@ async fn malformed_filtered_page_fails_closed() {
             &self,
             target: NodeId,
             _address: &str,
-            _bearer: OriginalBearer,
+            _caller: Caller,
             query: WatchSourceQuery,
         ) -> Result<WatchSourcePage, WatchSourceError> {
             Ok(WatchSourcePage {

@@ -47,7 +47,7 @@ repository are required.
 ### 1. Start a development node
 
 ```sh
-export KELDRA_IMAGE=ghcr.io/keldra-store/keldra:0.11.2
+export KELDRA_IMAGE=ghcr.io/keldra-store/keldra:0.11.3
 export KELDRA_TOKEN_SIGNING_KEY_FILE="$PWD/keldra-data/token-signing-key"
 
 mkdir -p keldra-data
@@ -450,6 +450,12 @@ boundary.
    realms use the same Zanzibar primitives for application-domain models, but
    cannot modify the system realm.
 
+`WatchPrefix` validates the access token when the stream opens rather than
+limiting the connection to the token's one-hour lifetime. While the stream is
+open, Keldra continues to evaluate the admitted application against current
+Zanzibar relationships on every source poll. Revoking its applicable access
+therefore terminates the established stream with `PERMISSION_DENIED`.
+
 Tenant roles are `owner`, `admin`, `reader`, `manage_tenant`, `read_tenant`,
 `manage_buckets`, and `manage_authz`. Bucket roles are `owner`, `admin`,
 `reader`, `writer`, `get`, `put`, `delete`, and `manage_policy`. A bucket owner
@@ -705,7 +711,7 @@ bundles, establishes peer mTLS, exercises replicated and erasure-coded storage,
 queries every index type, and performs a rolling restart:
 
 ```sh
-KELDRA_IMAGE=ghcr.io/keldra-store/keldra:0.11.2 \
+KELDRA_IMAGE=ghcr.io/keldra-store/keldra:0.11.3 \
   ./scripts/qualify-three-node.sh
 ```
 

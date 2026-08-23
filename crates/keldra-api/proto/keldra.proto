@@ -57,6 +57,10 @@ service ObjectService {
   rpc ListObjectVersions(ListObjectVersionsRequest) returns (stream ObjectVersion);
   rpc BulkWrite(BulkWriteRequest) returns (BulkWriteResponse);
   rpc BatchGet(BatchGetRequest) returns (BatchGetResponse);
+  // The access token is validated when the stream is admitted. Its later
+  // expiry does not terminate an established watch. Keldra continues to
+  // evaluate the admitted application through Zanzibar while the stream is
+  // open and terminates it with PERMISSION_DENIED if access is revoked.
   rpc WatchPrefix(WatchPrefixRequest) returns (stream WatchMessage);
   rpc SetBucketPolicy(SetBucketPolicyRequest) returns (BucketPolicy);
   rpc InvokeProgram(InvokeProgramRequest) returns (InvokeProgramResponse);
