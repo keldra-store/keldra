@@ -326,11 +326,14 @@ jobs:
           generate_release_notes: true
           make_latest: true
           body: |
-            Keldra ${{ needs.release-context.outputs.tag }} fixes sparse Typed JSON
-            point-segment merging and preserves the logical-record identities
-            written by released Keldra and Anvil-compatible installations.
-            It includes the multi-platform Keldra server image, CLI, and the
-            authorized HTTP plugin broker.
+            Keldra ${{ needs.release-context.outputs.tag }} keeps an admitted
+            `WatchPrefix` stream open after its access token expires while
+            continuing fresh Zanzibar authorization on every source poll.
+            Revoking the applicable access terminates the established stream
+            with `PERMISSION_DENIED`.
+
+            It includes the multi-platform Keldra server image, CLI, and Rust
+            client.
 
             - Image: `${{ steps.image.outputs.image }}`
             - Manifest digest: `${{ steps.image.outputs.digest }}`
