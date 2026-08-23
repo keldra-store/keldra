@@ -18,7 +18,7 @@ use keldra_store::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::distributed_list::OriginalBearer;
+use crate::authentication::Caller;
 
 const CHECKPOINT_FORMAT: u16 = 1;
 pub(crate) const CHECKPOINT_AUDIENCE: &str = "keldra-watch-checkpoint";
@@ -179,6 +179,8 @@ pub(crate) struct WatchSourcePage {
 pub(crate) enum WatchSourceError {
     #[error("RESUME_EXPIRED")]
     ResumeExpired,
+    #[error("watch authorization was revoked")]
+    AccessRevoked,
     #[error("{0}")]
     Unavailable(String),
 }
@@ -192,7 +194,7 @@ pub(crate) trait ClusterWatchSources: Send + Sync + 'static {
         target: NodeId,
         address: &str,
         membership_revision: PlacementLogId,
-        bearer: OriginalBearer,
+        caller: Caller,
         scope: DistributedWatchScope,
     ) -> Result<WatchSourceStatus, WatchSourceError>;
 
@@ -200,7 +202,7 @@ pub(crate) trait ClusterWatchSources: Send + Sync + 'static {
         &self,
         target: NodeId,
         address: &str,
-        bearer: OriginalBearer,
+        caller: Caller,
         query: WatchSourceQuery,
     ) -> Result<WatchSourcePage, WatchSourceError>;
 }
@@ -273,25 +275,25 @@ impl DistributedWatch {
     pub(crate) async fn start_now(
         &self,
         scope: DistributedWatchScope,
-        bearer: OriginalBearer,
+        caller: Caller,
     ) -> Result<Vec<u8>, DistributedWatchError> {
-        self.start(scope, bearer, WatchInitialPosition::Now).await
+        self.start(scope, caller, WatchInitialPosition::Now).await
     }
 
     /// Capture the first position still retained by every ACTIVE source.
     pub(crate) async fn start_retained_beginning(
         &self,
         scope: DistributedWatchScope,
-        bearer: OriginalBearer,
+        caller: Caller,
     ) -> Result<Vec<u8>, DistributedWatchError> {
-        self.start(scope, bearer, WatchInitialPosition::RetainedBeginning)
+        self.start(scope, caller, WatchInitialPosition::RetainedBeginning)
             .await
     }
 
     async fn start(
         &self,
         scope: DistributedWatchScope,
-        bearer: OriginalBearer,
+        caller: Caller,
         position: WatchInitialPosition,
     ) -> Result<Vec<u8>, DistributedWatchError> {
         let placement = self.current_placement()?;
@@ -299,11 +301,11 @@ impl DistributedWatch {
         for (node, address) in placement.sources.clone() {
             let sources = self.sources.clone();
             let revision = placement.membership_revision;
-            let bearer = bearer.clone();
+            let caller = caller.clone();
             let scope = scope.clone();
             tasks.spawn(async move {
                 let status = sources
-                    .status(node, &address, revision, bearer, scope)
+                    .status(node, &address, revision, caller, scope)
                     .await;
                 (node, status)
             });
@@ -366,7 +368,7 @@ impl DistributedWatch {
         &self,
         scope: DistributedWatchScope,
         checkpoint: &[u8],
-        bearer: OriginalBearer,
+        caller: Caller,
     ) -> Result<DistributedWatchBatch, DistributedWatchError> {
         let placement = self.current_placement()?;
         let claims = self.open_checkpoint(checkpoint, &scope, placement.cluster_id)?;
@@ -375,7 +377,7 @@ impl DistributedWatch {
         for (node, address) in placement.sources.clone() {
             let cursor = cursors[&node];
             let sources = self.sources.clone();
-            let bearer = bearer.clone();
+            let caller = caller.clone();
             let query = WatchSourceQuery {
                 membership_revision: placement.membership_revision,
                 expected_source: cursor.source,
@@ -385,7 +387,7 @@ impl DistributedWatch {
             };
             tasks.spawn(async move {
                 let page = sources
-                    .read_page(node, &address, bearer, query.clone())
+                    .read_page(node, &address, caller, query.clone())
                     .await;
                 (node, query, page)
             });
@@ -495,6 +497,8 @@ pub(crate) enum DistributedWatchError {
     InvalidCheckpoint,
     #[error("RESUME_EXPIRED")]
     ResumeExpired,
+    #[error("watch authorization was revoked")]
+    AccessRevoked,
     #[error("ACTIVE watch placement is unavailable: {0}")]
     Placement(String),
     #[error("required watch source {node_id:?} is unavailable: {message}")]
@@ -522,6 +526,7 @@ fn map_source_result<T>(
     match result {
         Ok(value) => Ok(value),
         Err(WatchSourceError::ResumeExpired) => Err(DistributedWatchError::ResumeExpired),
+        Err(WatchSourceError::AccessRevoked) => Err(DistributedWatchError::AccessRevoked),
         Err(WatchSourceError::Unavailable(message)) => {
             Err(DistributedWatchError::SourceUnavailable {
                 node_id: Some(node),

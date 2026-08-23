@@ -450,6 +450,12 @@ boundary.
    realms use the same Zanzibar primitives for application-domain models, but
    cannot modify the system realm.
 
+`WatchPrefix` validates the access token when the stream opens rather than
+limiting the connection to the token's one-hour lifetime. While the stream is
+open, Keldra continues to evaluate the admitted application against current
+Zanzibar relationships on every source poll. Revoking its applicable access
+therefore terminates the established stream with `PERMISSION_DENIED`.
+
 Tenant roles are `owner`, `admin`, `reader`, `manage_tenant`, `read_tenant`,
 `manage_buckets`, and `manage_authz`. Bucket roles are `owner`, `admin`,
 `reader`, `writer`, `get`, `put`, `delete`, and `manage_policy`. A bucket owner

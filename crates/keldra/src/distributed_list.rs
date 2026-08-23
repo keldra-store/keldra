@@ -231,12 +231,15 @@ impl LocalListQuery {
     }
 }
 
-/// Destination-side authorization for a listing source.
+/// Destination-side authorization for a listing or watch source.
 ///
 /// An implementation may evaluate locally only when it can prove that its
 /// system-realm replica is current for the exact placement. A later N>3
-/// adapter may instead call the HRW Zanzibar coordinator. Neither form may
-/// accept a serialized caller or an ingress allow/deny decision.
+/// adapter may instead call the HRW Zanzibar coordinator. Ordinary listings
+/// retain source-side bearer verification. A watch may instead present the
+/// caller identity admitted once at the public stream boundary, but only over
+/// the authenticated peer API; the source still makes its own fresh Zanzibar
+/// decision on every poll.
 #[tonic::async_trait]
 pub(crate) trait AuthoritativeListAuthorizer: Send + Sync + 'static {
     async fn authorize(
@@ -244,6 +247,9 @@ pub(crate) trait AuthoritativeListAuthorizer: Send + Sync + 'static {
         bearer: &OriginalBearer,
         query: &LocalListQuery,
     ) -> Result<(), Status>;
+
+    async fn authorize_caller(&self, caller: &Caller, query: &LocalListQuery)
+    -> Result<(), Status>;
 }
 
 /// Fail-closed startup bridge for the private listener.
@@ -279,6 +285,19 @@ impl AuthoritativeListAuthorizer for LateBoundListAuthorizer {
             .cloned()
             .ok_or_else(|| Status::unavailable("list authorization is not ready"))?;
         authorizer.authorize(bearer, query).await
+    }
+
+    async fn authorize_caller(
+        &self,
+        caller: &Caller,
+        query: &LocalListQuery,
+    ) -> Result<(), Status> {
+        let authorizer = self
+            .inner
+            .get()
+            .cloned()
+            .ok_or_else(|| Status::unavailable("list authorization is not ready"))?;
+        authorizer.authorize_caller(caller, query).await
     }
 }
 
@@ -356,6 +375,14 @@ impl AuthoritativeListAuthorizer for CoordinatedListAuthorizer {
             }
             caller
         };
+        self.authorize_caller(&caller, query).await
+    }
+
+    async fn authorize_caller(
+        &self,
+        caller: &Caller,
+        query: &LocalListQuery,
+    ) -> Result<(), Status> {
         if caller.storage_tenant().as_str() != query.tenant() {
             return Err(Status::permission_denied(
                 "object list does not belong to the authenticated tenant",
@@ -1205,6 +1232,14 @@ mod tests {
         async fn authorize(
             &self,
             _bearer: &OriginalBearer,
+            _query: &LocalListQuery,
+        ) -> Result<(), Status> {
+            Ok(())
+        }
+
+        async fn authorize_caller(
+            &self,
+            _caller: &Caller,
             _query: &LocalListQuery,
         ) -> Result<(), Status> {
             Ok(())

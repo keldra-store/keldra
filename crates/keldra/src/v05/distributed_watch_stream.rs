@@ -8,7 +8,7 @@ use tokio_stream::Stream;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Response, Status};
 
-use crate::distributed_list::OriginalBearer;
+use crate::authentication::Caller;
 use crate::distributed_watch::{DistributedWatch, DistributedWatchError, DistributedWatchScope};
 
 use super::api_watch_invalidation;
@@ -27,20 +27,20 @@ pub(super) enum ClusterWatchStart {
 pub(super) async fn response(
     watch: Arc<DistributedWatch>,
     scope: DistributedWatchScope,
-    bearer: OriginalBearer,
+    caller: Caller,
     start: ClusterWatchStart,
 ) -> Result<Response<ClusterWatchStream>, Status> {
     let (checkpoint, authenticated) = match start {
         ClusterWatchStart::Now => (
             watch
-                .start_now(scope.clone(), bearer.clone())
+                .start_now(scope.clone(), caller.clone())
                 .await
                 .map_err(watch_status)?,
             true,
         ),
         ClusterWatchStart::RetainedBeginning => (
             watch
-                .start_retained_beginning(scope.clone(), bearer.clone())
+                .start_retained_beginning(scope.clone(), caller.clone())
                 .await
                 .map_err(watch_status)?,
             true,
@@ -52,7 +52,7 @@ pub(super) async fn response(
     tokio::spawn(run_watch(
         watch,
         scope,
-        bearer,
+        caller,
         checkpoint,
         authenticated,
         sender,
@@ -63,7 +63,7 @@ pub(super) async fn response(
 async fn run_watch(
     watch: Arc<DistributedWatch>,
     scope: DistributedWatchScope,
-    bearer: OriginalBearer,
+    caller: Caller,
     mut checkpoint: Vec<u8>,
     mut authenticated: bool,
     sender: tokio::sync::mpsc::Sender<Result<WatchMessage, Status>>,
@@ -73,7 +73,7 @@ async fn run_watch(
     }
     loop {
         let batch = match watch
-            .poll_once(scope.clone(), &checkpoint, bearer.clone())
+            .poll_once(scope.clone(), &checkpoint, caller.clone())
             .await
         {
             Ok(batch) => batch,
@@ -134,6 +134,9 @@ fn watch_status(error: DistributedWatchError) -> Status {
             Status::invalid_argument("invalid watch checkpoint")
         }
         DistributedWatchError::ResumeExpired => Status::failed_precondition("RESUME_EXPIRED"),
+        DistributedWatchError::AccessRevoked => {
+            Status::permission_denied("watch authorization was revoked")
+        }
         DistributedWatchError::Placement(message) => Status::unavailable(message),
         DistributedWatchError::SourceUnavailable { message, .. }
         | DistributedWatchError::InvalidSource { message, .. } => Status::unavailable(message),
