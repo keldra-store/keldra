@@ -395,8 +395,11 @@ uses one or three public endpoints and verifies every returned byte in
 Keldra serves Git's smart HTTP protocol at
 `/git/<tenant>/<bucket>/<repository>.git` on the same public port `50051`.
 The first authenticated push creates the repository; subsequent pushes use CAS
-when publishing its ordinary Keldra bundle object. Basic authentication accepts
-the same application client ID and secret used by the gRPC and S3 APIs.
+to publish an ordered repository generation. New Git packs are immutable
+ordinary Keldra objects; small reference batches and checkpoints make a warm
+native repository incremental rather than rewriting the repository after every
+push. Basic authentication accepts the same application client ID and secret
+used by the gRPC and S3 APIs.
 
 ```sh
 mkdir -p keldra-data/git-demo
