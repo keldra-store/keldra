@@ -602,6 +602,11 @@ receive-pack status. Git gateway transfer bytes are not yet included in path
 accounting, and internal derived bundle writes are intentionally not billed as
 client object ingress.
 
+The accepted replacement architecture is specified in
+[`KELDRA-0015`](rfcs/keldra_0015_incremental_git_repositories.md). This section
+continues to describe the shipped bundle implementation until that RFC is
+implemented and qualified.
+
 ## Atomic preparation and the blob inactivity clock
 
 Staging an atomic program's prepared output blobs and bundle sets their
