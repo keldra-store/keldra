@@ -74,6 +74,53 @@ async fn real_git_client_pushes_pulls_and_clones_a_public_repository() {
         b"hello from Keldra Git\n"
     );
 
+    tokio::fs::write(source.join("README.md"), b"incremental Keldra Git\n")
+        .await
+        .unwrap();
+    git_ok(["-C", path(&source), "commit", "-am", "incremental"]).await;
+    git_ok(["-C", path(&source), "push", "origin", "master"]).await;
+    git_ok(["-C", path(&authenticated_clone), "pull", "--ff-only"]).await;
+    assert_eq!(
+        tokio::fs::read(authenticated_clone.join("README.md"))
+            .await
+            .unwrap(),
+        b"incremental Keldra Git\n"
+    );
+
+    git_ok(["-C", path(&source), "branch", "temporary"]).await;
+    git_ok(["-C", path(&source), "push", "origin", "temporary"]).await;
+    git_ok([
+        "-C",
+        path(&source),
+        "push",
+        "origin",
+        "--delete",
+        "temporary",
+    ])
+    .await;
+
+    // Native repositories are disposable. Removing one proves that a fresh
+    // request reconstructs the same repository from its checkpoint and push
+    // batches instead of relying on a process-local whole-repository bundle.
+    fixture.remove_git_cache().await;
+    let rebuilt_clone = work.path().join("rebuilt-clone");
+    git_ok([
+        "clone",
+        "--branch",
+        "master",
+        &authenticated,
+        path(&rebuilt_clone),
+    ])
+    .await;
+    assert_eq!(
+        tokio::fs::read(rebuilt_clone.join("README.md"))
+            .await
+            .unwrap(),
+        b"incremental Keldra Git\n"
+    );
+    let remote_refs = git_ok(["ls-remote", "--heads", &authenticated, "temporary"]).await;
+    assert!(remote_refs.stdout.is_empty());
+
     let public = format!("http://{}/git/acme/repositories/demo.git", fixture.gateway);
     let denied_clone = work.path().join("denied-clone");
     git_fails(["clone", "--branch", "master", &public, path(&denied_clone)]).await;
@@ -85,7 +132,7 @@ async fn real_git_client_pushes_pulls_and_clones_a_public_repository() {
         tokio::fs::read(public_clone.join("README.md"))
             .await
             .unwrap(),
-        b"hello from Keldra Git\n"
+        b"incremental Keldra Git\n"
     );
 
     fixture.stop().await;
@@ -147,6 +194,15 @@ impl Fixture {
             ))
             .await
             .expect("owner enables public repository reads");
+    }
+
+    async fn remove_git_cache(&self) {
+        let path = self._directory.path().join("cache/gateway-cache/git");
+        match tokio::fs::remove_dir_all(path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("remove disposable Git cache: {error}"),
+        }
     }
 
     async fn stop(self) {
