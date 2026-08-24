@@ -417,10 +417,11 @@ mod traffic_tests {
             },
         );
 
-        assert_eq!(*inbound.lock().unwrap(), [17]);
+        assert!(inbound.lock().unwrap().is_empty());
         assert!(outbound.lock().unwrap().is_empty());
         let body = metered.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(body.as_ref(), b"git response");
+        assert_eq!(*inbound.lock().unwrap(), [17]);
         assert_eq!(*outbound.lock().unwrap(), [12]);
     }
 
