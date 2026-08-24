@@ -35,10 +35,10 @@ static_gates() {
 rust_gates() {
   local build_jobs="${CARGO_BUILD_JOBS:-1}"
   local test_threads="${KELDRA_RUST_TEST_THREADS:-4}"
-  run_step "Keldra 0.11 workspace Clippy" cargo clippy --jobs "${build_jobs}" --locked --workspace \
+  run_step "Keldra workspace Clippy" cargo clippy --jobs "${build_jobs}" --locked --workspace \
     --all-targets \
     --no-deps
-  run_step "Keldra 0.11 workspace tests" cargo test --jobs "${build_jobs}" --locked --workspace --all-targets -- \
+  run_step "Keldra workspace tests" cargo test --jobs "${build_jobs}" --locked --workspace --all-targets -- \
     --nocapture \
     --test-threads="${test_threads}"
 }
@@ -46,7 +46,7 @@ rust_gates() {
 server_gates() {
   local build_jobs="${CARGO_BUILD_JOBS:-1}"
   local test_threads="${KELDRA_RUST_TEST_THREADS:-4}"
-  run_step "Keldra 0.11 server, client, and CLI tests" cargo test --jobs "${build_jobs}" --locked \
+  run_step "Keldra server, client, and CLI tests" cargo test --jobs "${build_jobs}" --locked \
     -p keldra-server \
     -p keldra \
     -p keldra-cli \

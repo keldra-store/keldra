@@ -1,6 +1,6 @@
 # keldra-api
 
-Generated Rust messages and gRPC clients for the Keldra 0.11 protocol.
+Generated Rust messages and gRPC clients for the Keldra 0.12 protocol.
 
 Most applications should depend on
 [`keldra`](https://crates.io/crates/keldra), which adds

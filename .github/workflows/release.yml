@@ -326,11 +326,12 @@ jobs:
           generate_release_notes: true
           make_latest: true
           body: |
-            Keldra ${{ needs.release-context.outputs.tag }} keeps an admitted
-            `WatchPrefix` stream open after its access token expires while
-            continuing fresh Zanzibar authorization on every source poll.
-            Revoking the applicable access terminates the established stream
-            with `PERMISSION_DENIED`.
+            Keldra ${{ needs.release-context.outputs.tag }} stores Git
+            repositories as immutable packs, checkpoints, and ordered push
+            batches published through one exact-version current-pointer CAS.
+            Native bare repositories are disposable persistent
+            materializations, so ordinary pushes and warm reads no longer
+            rewrite or rematerialize a complete repository bundle.
 
             It includes the multi-platform Keldra server image, CLI, and Rust
             client.
