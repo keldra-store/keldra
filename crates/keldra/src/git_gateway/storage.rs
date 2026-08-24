@@ -393,12 +393,28 @@ async fn require_existing_identity(
         .git_head(identity, key)
         .await
         .map_err(GitError::from_status)?;
-    let Some(HeadState::Present(present)) = head.state else {
+    let Some(HeadState::Present(_)) = head.state else {
         return Err(GitError::conflict(
             "Git immutable artifact disappeared during replay",
         ));
     };
-    if hex::encode(present.content_hash) != expected {
+    let mut stream = state
+        .objects
+        .git_get(identity, key)
+        .await
+        .map_err(GitError::from_status)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut saw_head = false;
+    while let Some(chunk) = stream.next().await {
+        match chunk.map_err(GitError::from_status)?.value {
+            Some(ChunkValue::Head(_)) if !saw_head => saw_head = true,
+            Some(ChunkValue::Bytes(bytes)) if saw_head => {
+                hasher.update(&bytes);
+            }
+            _ => return Err(GitError::internal("Git object stream is malformed")),
+        }
+    }
+    if !saw_head || hasher.finalize().to_hex().as_str() != expected {
         return Err(GitError::conflict(
             "Git immutable artifact identity is already bound to different bytes",
         ));
@@ -429,15 +445,19 @@ async fn file_body(path: std::path::PathBuf) -> Result<Body, GitError> {
     let mut file = tokio::fs::File::open(path)
         .await
         .map_err(|error| GitError::internal(format!("open Git pack: {error}")))?;
-    let stream = async_stream::try_stream! {
-        Ok::<(), std::io::Error>(())?;
+    let stream = async_stream::stream! {
         let mut buffer = vec![0_u8; 1024 * 1024];
         loop {
-            let read = file.read(&mut buffer).await?;
-            if read == 0 {
-                break;
+            match file.read(&mut buffer).await {
+                Ok(0) => break,
+                Ok(read) => {
+                    yield Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::copy_from_slice(&buffer[..read]));
+                }
+                Err(error) => {
+                    yield Err(error);
+                    return;
+                }
             }
-            yield bytes::Bytes::copy_from_slice(&buffer[..read]);
         }
     };
     Ok(Body::from_stream(stream))
