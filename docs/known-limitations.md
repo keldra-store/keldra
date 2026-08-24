@@ -573,34 +573,38 @@ PutObject accepts a signed SHA-256 payload or the fully chained
 bytes before publication. Other aws-chunked trailer/checksum variants are
 reported as unsupported rather than accepting unbound payload bytes.
 
-## Git smart HTTP gateway in 0.5.3
+## Incremental Git smart HTTP gateway
 
 The shared public listener supports Git smart HTTP push and pull at
 `/git/{tenant}/{bucket}/{repository}.git`. Basic authentication exchanges the
 application client ID and secret through Keldra's normal credential path;
 Bearer authentication accepts a normal Keldra access token. Pulls may omit
 credentials only when current Zanzibar policy permits anonymous reads for the
-bucket. Every push is Zanzibar-authorized and publishes one authoritative Git
-bundle as an ordinary object below the protected `_keldra/git` namespace using
-`PutIfAbsent` or `PutIfVersion`.
+bucket. Every push is Zanzibar-authorized. Immutable Git packs, reference
+batches, and checkpoints are ordinary objects below the protected
+`_keldra/git/v2` namespace; one exact-version CAS of the small `current` object
+publishes a complete generation. Native bare repositories under
+`KELDRA_CACHE_DIR` are disposable persistent materializations and recover from
+the current checkpoint plus its bounded batch tail when their cache is absent.
+Fetch responses and request bodies stream without the old whole-object gateway
+buffer.
 
-Keldra 0.5.3 deliberately uses `git-http-backend` and a disposable node-local
-bare-repository cache. Each request rematerializes the repository from the
-authoritative bundle, and each successful push rewrites the complete bundle.
-The first implementation serializes Git CGI requests per node. Request bodies,
-CGI responses and the bundle being published are buffered in memory and are
-bounded by the configured object maximum where Keldra controls the input; Git's
-CGI response itself does not yet have an independent streaming limit. These
-costs make this surface suitable for ordinary small-repository workflows,
-not yet for very large repositories or high-concurrency Git hosting.
+The first incremental release publishes one accepted push per batch and
+serializes receive-pack for that repository on one node. Unrelated repositories
+do not share a process lock, and competing nodes remain protected by the exact
+`current` CAS, but bounded multi-push group publication and preferred-writer
+peer proxying are not yet enabled. A losing cross-node push returns a conflict
+and must fetch then retry.
 
-Concurrent pushes on different gateway nodes are protected by the bundle
-object CAS, so one cannot silently overwrite the other. The losing client gets
-an HTTP conflict after its local receive-pack completes and must fetch then
-retry; 0.5.3 does not translate that late CAS conflict into a polished Git
-receive-pack status. Git gateway transfer bytes are not yet included in path
-accounting, and internal derived bundle writes are intentionally not billed as
-client object ingress.
+Checkpoint compaction is requested in the background at a fixed tail depth of
+64. The additional pack-count, byte, age, loose-object, and authorized manual
+triggers are not yet runtime settings. Obsolete immutable Git generations are
+not yet removed by repository-scoped retention, and the Git materialization
+directory does not yet enforce its own LRU byte budget; operators should size
+and monitor `KELDRA_CACHE_DIR` accordingly. These affect write concurrency and
+space reclamation, not ref atomicity, authorization, durability, or recovery.
+The complete target architecture and remaining qualification gates are in
+[`KELDRA-0015`](rfcs/keldra_0015_incremental_git_repositories.md).
 
 ## Atomic preparation and the blob inactivity clock
 

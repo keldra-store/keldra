@@ -47,7 +47,7 @@ repository are required.
 ### 1. Start a development node
 
 ```sh
-export KELDRA_IMAGE=ghcr.io/keldra-store/keldra:0.11.3
+export KELDRA_IMAGE=ghcr.io/keldra-store/keldra:0.12.0
 export KELDRA_TOKEN_SIGNING_KEY_FILE="$PWD/keldra-data/token-signing-key"
 
 mkdir -p keldra-data
@@ -159,7 +159,7 @@ Zanzibar-authorized object addressed by `(tenant, bucket, path)`.
 ## Use the Rust client
 
 ```sh
-cargo add keldra@0.11.0
+cargo add keldra@0.12.0
 cargo add tokio --features macros,rt-multi-thread
 ```
 
@@ -234,7 +234,7 @@ Zanzibar-authorized independently of ordinary object traffic.
 Add the public client and canonical protocol types:
 
 ```sh
-cargo add keldra@0.11.0 personaldb-protocol@0.2.2 serde_json
+cargo add keldra@0.12.0 personaldb-protocol@0.2.2 serde_json
 ```
 
 Use the same application credential created above to create a source group and
@@ -395,8 +395,11 @@ uses one or three public endpoints and verifies every returned byte in
 Keldra serves Git's smart HTTP protocol at
 `/git/<tenant>/<bucket>/<repository>.git` on the same public port `50051`.
 The first authenticated push creates the repository; subsequent pushes use CAS
-when publishing its ordinary Keldra bundle object. Basic authentication accepts
-the same application client ID and secret used by the gRPC and S3 APIs.
+to publish an ordered repository generation. New Git packs are immutable
+ordinary Keldra objects; small reference batches and checkpoints make a warm
+native repository incremental rather than rewriting the repository after every
+push. Basic authentication accepts the same application client ID and secret
+used by the gRPC and S3 APIs.
 
 ```sh
 mkdir -p keldra-data/git-demo
@@ -711,7 +714,7 @@ bundles, establishes peer mTLS, exercises replicated and erasure-coded storage,
 queries every index type, and performs a rolling restart:
 
 ```sh
-KELDRA_IMAGE=ghcr.io/keldra-store/keldra:0.11.3 \
+KELDRA_IMAGE=ghcr.io/keldra-store/keldra:0.12.0 \
   ./scripts/qualify-three-node.sh
 ```
 

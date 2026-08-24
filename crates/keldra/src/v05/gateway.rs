@@ -267,16 +267,6 @@ impl GatewayObjectAdapter {
         key: &ObjectKey,
     ) -> Result<GetObjectStream, Status> {
         require_git_key(key)?;
-        let caller = match identity {
-            GatewayIdentity::Authenticated { caller, .. } => caller.clone(),
-            GatewayIdentity::Anonymous => Caller::from_anonymous(
-                StorageTenantId::parse(key.tenant())
-                    .map_err(|error| Status::invalid_argument(error.to_string()))?,
-            ),
-        };
-        self.service
-            .authorize_object(&caller, key, ObjectPermission::Get)
-            .await?;
         ObjectService::get_object(
             &self.service,
             identity.internal_request(GetObjectRequest {
@@ -302,24 +292,45 @@ impl GatewayObjectAdapter {
             .await
     }
 
+    pub(crate) async fn git_require_read(
+        &self,
+        identity: &GatewayIdentity,
+        key: &ObjectKey,
+    ) -> Result<(), Status> {
+        require_git_key(key)?;
+        let caller = match identity {
+            GatewayIdentity::Authenticated { caller, .. } => caller.clone(),
+            GatewayIdentity::Anonymous => Caller::from_anonymous(
+                StorageTenantId::parse(key.tenant())
+                    .map_err(|error| Status::invalid_argument(error.to_string()))?,
+            ),
+        };
+        self.service
+            .authorize_object(&caller, key, ObjectPermission::Get)
+            .await
+    }
+
     pub(crate) async fn git_put(
         &self,
         identity: &GatewayIdentity,
         key: &ObjectKey,
+        content_type: &str,
         command_id: String,
         mode: GatewayPutMode,
+        durability: Durability,
         body: Body,
     ) -> Result<GatewayPutResult, Status> {
         require_git_key(key)?;
-        self.put_with_access(
+        self.put_with_access_and_durability(
             identity,
             key,
-            Some("application/vnd.git.bundle".into()),
+            Some(content_type.into()),
             command_id,
             mode,
             None,
             body,
             true,
+            durability,
         )
         .await
     }
@@ -333,8 +344,35 @@ impl GatewayObjectAdapter {
         command_id: String,
         mode: GatewayPutMode,
         expected_sha256: Option<[u8; 32]>,
+        body: Body,
+        internal: bool,
+    ) -> Result<GatewayPutResult, Status> {
+        self.put_with_access_and_durability(
+            identity,
+            key,
+            content_type,
+            command_id,
+            mode,
+            expected_sha256,
+            body,
+            internal,
+            Durability::Local,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn put_with_access_and_durability(
+        &self,
+        identity: &GatewayIdentity,
+        key: &ObjectKey,
+        content_type: Option<String>,
+        command_id: String,
+        mode: GatewayPutMode,
+        expected_sha256: Option<[u8; 32]>,
         mut body: Body,
         internal: bool,
+        durability: Durability,
     ) -> Result<GatewayPutResult, Status> {
         if matches!(identity, GatewayIdentity::Anonymous) {
             return Err(Status::unauthenticated(
@@ -352,7 +390,7 @@ impl GatewayObjectAdapter {
             address: Some(address(key)),
             content_type: content_type.unwrap_or_default(),
             command_id,
-            durability: Durability::Local as i32,
+            durability: durability as i32,
             operation: Some(operation),
         };
         let request = if internal {

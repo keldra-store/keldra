@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use axum::Router;
 use axum::extract::{Path, Request, State};
@@ -17,7 +18,10 @@ use crate::v05::GatewayObjectAdapter;
 
 mod auth;
 mod backend;
+pub(crate) mod cache;
+mod model;
 mod repository;
+mod storage;
 
 #[derive(Clone)]
 pub(crate) struct GitGatewayState {
@@ -28,8 +32,7 @@ pub(crate) struct GitGatewayState {
     pub(crate) serving: ServingAuthority,
     pub(crate) mutation_admission: crate::mutation_admission::MutationAdmission,
     pub(crate) cache_root: PathBuf,
-    pub(crate) max_request_bytes: u64,
-    pub(crate) lock: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) repository_locks: Arc<cache::RepositoryLocks>,
     pub(crate) basic_tokens: Arc<std::sync::Mutex<HashMap<[u8; 32], String>>>,
 }
 
@@ -60,7 +63,7 @@ async fn handle(
     if identity.caller().is_none() && !target.operation.is_pull() {
         return GitError::unauthorized("Git push requires credentials").into_response();
     }
-    let key = match target.bundle_key() {
+    let key = match target.authorization_key() {
         Ok(key) => key,
         Err(error) => return error.into_response(),
     };
@@ -69,7 +72,16 @@ async fn handle(
     {
         return GitError::from_status(error).into_response();
     }
-    let _mutation_permit = if target.operation.is_push() {
+    if target.operation.is_pull()
+        && let Err(error) = state.objects.git_require_read(&identity, &key).await
+    {
+        if identity.caller().is_none() && error.code() == tonic::Code::PermissionDenied {
+            return GitError::unauthorized("credentials are required for this repository")
+                .into_response();
+        }
+        return GitError::from_status(error).into_response();
+    }
+    let _mutation_permit = if target.operation.mutates_repository() {
         match state.mutation_admission.enter() {
             Ok(permit) => Some(permit),
             Err(error) => return GitError::from_status(error).into_response(),
@@ -78,10 +90,26 @@ async fn handle(
         None
     };
 
-    // The 0.5.3 cache is disposable and one process-wide lock keeps a CGI
-    // request plus its bundle CAS coherent without inventing a lock service.
-    let _guard = state.lock.lock().await;
-    let materialized = match repository::materialize(&state, &identity, &target, &key).await {
+    let location = match storage::RepositoryLocation::resolve(
+        &state,
+        &identity,
+        &target,
+        target.operation.is_push(),
+    )
+    .await
+    {
+        Ok(Some(location)) => location,
+        Ok(None) => return GitError::not_found().into_response(),
+        Err(error) => return error.into_response(),
+    };
+    let storage = storage::GitStorage::new(&state, &identity, location);
+    let materialized = match repository::materialize(
+        &state,
+        &storage,
+        target.operation.mutates_repository(),
+    )
+    .await
+    {
         Ok(materialized) => materialized,
         Err(error) if identity.caller().is_none() && error.status == StatusCode::FORBIDDEN => {
             return GitError::unauthorized("credentials are required for this repository")
@@ -89,31 +117,28 @@ async fn handle(
         }
         Err(error) => return error.into_response(),
     };
-    let before = if target.operation.is_push() {
-        match repository::refs(&materialized.repository).await {
-            Ok(refs) => Some(refs),
-            Err(error) => return error.into_response(),
-        }
-    } else {
-        None
-    };
     let method = request.method().as_str().to_owned();
     let content_type = request
         .headers()
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    let body = match backend::bounded_body(request.body_mut(), state.max_request_bytes).await {
-        Ok(body) => body,
-        Err(error) => return error.into_response(),
-    };
-    let inbound_bytes = u64::try_from(body.len()).unwrap_or(u64::MAX);
-    let response = match backend::execute(
+    let content_length = request
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    let body = std::mem::replace(request.body_mut(), axum::body::Body::empty());
+    if target.operation.mutates_repository() {
+        repository::begin_push(&materialized).await;
+    }
+    let executed = match backend::execute(
         &target,
         &identity,
         &materialized.repository,
         &method,
         content_type.as_deref(),
+        content_length,
         body,
     )
     .await
@@ -121,25 +146,25 @@ async fn handle(
         Ok(response) => response,
         Err(error) => return error.into_response(),
     };
-    if target.operation.is_push() && response.status().is_success() {
-        let after = match repository::refs(&materialized.repository).await {
-            Ok(refs) => refs,
+    let response = executed.response;
+    if target.operation.mutates_repository() && response.status().is_success() {
+        match repository::publish(&storage, &materialized).await {
+            Ok(true) => repository::spawn_compaction(state.clone(), storage.clone()),
+            Ok(false) => {}
             Err(error) => return error.into_response(),
-        };
-        if before.as_deref() != Some(after.as_str())
-            && let Err(error) =
-                repository::publish(&state, &identity, &target, &key, &materialized).await
-        {
-            return error.into_response();
         }
     }
+    let keepalive = target.operation.streams_response().then_some(materialized);
     let ingress = state.objects.clone();
     let ingress_key = key.clone();
     let egress = state.objects.clone();
     let egress_key = key;
     meter_successful_response(
         response,
-        inbound_bytes,
+        executed.inbound_bytes,
+        executed.request_complete,
+        keepalive,
+        target.operation.metric_name(),
         move |bytes| ingress.record_gateway_ingress(&ingress_key, bytes),
         move |bytes| egress.record_gateway_egress(&egress_key, bytes),
     )
@@ -147,20 +172,26 @@ async fn handle(
 
 fn meter_successful_response<Ingress, Egress>(
     response: Response,
-    inbound_bytes: u64,
+    inbound_bytes: Arc<AtomicU64>,
+    request_complete: Arc<AtomicBool>,
+    keepalive: Option<repository::MaterializedRepository>,
+    operation: &'static str,
     record_ingress: Ingress,
     record_egress: Egress,
 ) -> Response
 where
-    Ingress: FnOnce(u64),
+    Ingress: FnOnce(u64) + Send + 'static,
     Egress: FnOnce(u64) + Send + 'static,
 {
     if !response.status().is_success() {
         return response;
     }
-    record_ingress(inbound_bytes);
     let (parts, body) = response.into_parts();
     let stream = async_stream::stream! {
+        // The repository read guard pins native pack/index files until the Git
+        // subprocess response is fully consumed. It is deliberately not used
+        // as authority; `materialize` already bound it to an exact `current`.
+        let _keepalive = keepalive;
         let mut body = body.into_data_stream();
         let mut completed_bytes = 0_u64;
         while let Some(next) = body.next().await {
@@ -175,7 +206,18 @@ where
                 }
             }
         }
+        if !request_complete.load(Ordering::Acquire) {
+            return;
+        }
+        record_ingress(inbound_bytes.load(Ordering::Relaxed));
         record_egress(completed_bytes);
+        tracing::info!(
+            monotonic_counter.keldra_git_requests_completed_total = 1_u64,
+            monotonic_counter.keldra_git_ingress_bytes_total = inbound_bytes.load(Ordering::Relaxed),
+            monotonic_counter.keldra_git_egress_bytes_total = completed_bytes,
+            operation,
+            "Git smart HTTP request completed"
+        );
     };
     Response::from_parts(parts, axum::body::Body::from_stream(stream))
 }
@@ -195,6 +237,23 @@ impl Operation {
 
     const fn is_push(self) -> bool {
         matches!(self, Self::AdvertisePush | Self::Push)
+    }
+
+    const fn streams_response(self) -> bool {
+        !matches!(self, Self::Push)
+    }
+
+    const fn mutates_repository(self) -> bool {
+        matches!(self, Self::Push)
+    }
+
+    const fn metric_name(self) -> &'static str {
+        match self {
+            Self::AdvertisePull => "advertise_pull",
+            Self::Pull => "pull",
+            Self::AdvertisePush => "advertise_push",
+            Self::Push => "push",
+        }
     }
 }
 
@@ -251,14 +310,8 @@ impl Target {
         })
     }
 
-    fn bundle_key(&self) -> Result<ObjectKey, GitError> {
-        let repository_id = blake3::hash(self.repository.as_bytes()).to_hex();
-        ObjectKey::new(
-            self.tenant.clone(),
-            self.bucket.clone(),
-            format!("_keldra/git/{repository_id}/repository.bundle"),
-        )
-        .map_err(|error| GitError::bad_request(error.to_string()))
+    fn authorization_key(&self) -> Result<ObjectKey, GitError> {
+        storage::name_key(self)
     }
 }
 
@@ -350,7 +403,10 @@ mod traffic_tests {
             .unwrap();
         let metered = meter_successful_response(
             response,
-            17,
+            Arc::new(AtomicU64::new(17)),
+            Arc::new(AtomicBool::new(true)),
+            None,
+            "test",
             {
                 let inbound = inbound.clone();
                 move |bytes| inbound.lock().unwrap().push(bytes)
@@ -361,10 +417,11 @@ mod traffic_tests {
             },
         );
 
-        assert_eq!(*inbound.lock().unwrap(), [17]);
+        assert!(inbound.lock().unwrap().is_empty());
         assert!(outbound.lock().unwrap().is_empty());
         let body = metered.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(body.as_ref(), b"git response");
+        assert_eq!(*inbound.lock().unwrap(), [17]);
         assert_eq!(*outbound.lock().unwrap(), [12]);
     }
 
@@ -376,7 +433,10 @@ mod traffic_tests {
                 .status(StatusCode::CONFLICT)
                 .body(Body::from("failed"))
                 .unwrap(),
-            9,
+            Arc::new(AtomicU64::new(9)),
+            Arc::new(AtomicBool::new(true)),
+            None,
+            "test",
             {
                 let failed = failed.clone();
                 move |bytes| failed.lock().unwrap().push(("in", bytes))
@@ -390,11 +450,18 @@ mod traffic_tests {
         assert!(failed.lock().unwrap().is_empty());
 
         let incomplete_egress = Arc::new(Mutex::new(Vec::new()));
-        let response =
-            meter_successful_response(Response::new(Body::from("not consumed")), 11, |_| {}, {
+        let response = meter_successful_response(
+            Response::new(Body::from("not consumed")),
+            Arc::new(AtomicU64::new(11)),
+            Arc::new(AtomicBool::new(true)),
+            None,
+            "test",
+            |_| {},
+            {
                 let incomplete_egress = incomplete_egress.clone();
                 move |bytes| incomplete_egress.lock().unwrap().push(bytes)
-            });
+            },
+        );
         drop(response);
         assert!(incomplete_egress.lock().unwrap().is_empty());
 
@@ -403,10 +470,18 @@ mod traffic_tests {
             Ok::<_, io::Error>(Bytes::from_static(b"partial")),
             Err(io::Error::other("broken response")),
         ]));
-        let response = meter_successful_response(Response::new(body), 7, |_| {}, {
-            let errored_egress = errored_egress.clone();
-            move |bytes| errored_egress.lock().unwrap().push(bytes)
-        });
+        let response = meter_successful_response(
+            Response::new(body),
+            Arc::new(AtomicU64::new(7)),
+            Arc::new(AtomicBool::new(true)),
+            None,
+            "test",
+            |_| {},
+            {
+                let errored_egress = errored_egress.clone();
+                move |bytes| errored_egress.lock().unwrap().push(bytes)
+            },
+        );
         assert!(response.into_body().collect().await.is_err());
         assert!(errored_egress.lock().unwrap().is_empty());
     }

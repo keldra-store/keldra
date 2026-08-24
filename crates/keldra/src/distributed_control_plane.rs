@@ -71,6 +71,10 @@ impl DistributedControlPlane {
         }
     }
 
+    pub(crate) fn active_node_count(&self) -> Result<usize, Status> {
+        Ok(self.placement()?.active_node_ids().len())
+    }
+
     pub(crate) async fn provision_tenant(
         &self,
         caller: Caller,

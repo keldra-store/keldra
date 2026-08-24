@@ -561,8 +561,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         serving: serving_fence.authority(),
         mutation_admission: mutation_admission.clone(),
         cache_root: config.storage.cache.join("gateway-cache/git"),
-        max_request_bytes: config.max_blob_bytes,
-        lock: Arc::new(tokio::sync::Mutex::new(())),
+        repository_locks: Arc::new(git_gateway::cache::RepositoryLocks::default()),
         basic_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
     let plugin_state = plugin_gateway::PluginGatewayState::new(
