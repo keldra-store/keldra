@@ -203,6 +203,7 @@ impl Store {
         let mut deleted_records = 0_u32;
         let mut deleted_bytes = 0_u64;
         let mut complete = true;
+        let mut retired_version_keys = BTreeSet::new();
 
         for entry in self.db.iterator_cf(
             column,
@@ -255,6 +256,12 @@ impl Store {
                 complete = false;
                 break;
             }
+            self.stage_pruned_reference_proof_version_retirement(
+                &mut batch,
+                &mut retired_version_keys,
+                &proof,
+            )
+            .map_err(prune_storage)?;
             batch.delete_cf(column, key.as_ref());
             deleted_records += 1;
             deleted_bytes = deleted_bytes.checked_add(record_bytes).ok_or_else(|| {
@@ -526,13 +533,14 @@ fn validate_stored_proof(proof: &ReferenceProof) -> Result<(), String> {
             {
                 return Err("reference proof program-path mutation coordinates disagree".into());
             }
-            LocalChange::object_head(
+            LocalChange::object_head_with_program_cursor(
                 mutation.stamp.source_journal_position,
                 mutation.stage.tenant_id,
                 mutation.stage.bucket_id,
                 mutation.stage.path.path.clone(),
                 mutation.stage.version.id,
                 mutation.stage.version.deleted,
+                Some(mutation.commit_cursor),
                 mutation.reference_deltas.clone(),
                 Some(AccountingHeadTransition::new(
                     mutation

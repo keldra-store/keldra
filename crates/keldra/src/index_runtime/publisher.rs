@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use keldra_index::IndexError;
 use keldra_index::compaction::CompactionProgress;
@@ -12,26 +12,109 @@ use keldra_index::v4::{
     ArtifactDescriptor, ArtifactPackReference, GeneratedComponent, INDEX_ARTIFACT_PACK_BYTES,
     INDEX_COMPONENT_BYTES, IndexKind, SegmentDescriptor, SegmentIdentity,
 };
-use keldra_store::{BlobRef, DefinitionKind, ObjectKey, Store, VersionId};
+use keldra_store::{BlobRef, DefinitionKind, MutationError, ObjectKey, Store, VersionId};
 use tonic::Status;
 use tracing::Instrument;
+
+#[path = "publisher/rebuild_checkpoint.rs"]
+mod rebuild_checkpoint;
+pub(crate) use rebuild_checkpoint::LoadedRebuildRoot;
+#[path = "publisher/merge_rebase.rs"]
+mod merge_rebase;
 
 use crate::cluster_object_read::ClusterObjectReader;
 use crate::index_config::IndexRuntimeConfig;
 use crate::index_service::{StoredIndexDefinition, definition_path};
 
-use super::events::IndexBarrier;
-use super::generation::{
-    IndexCurrentPointer, IndexGenerationManifest, LocatorRoot, ManifestPhysicalOrder,
-    ManifestReference,
+use super::committed_view::{
+    CommitManifestReference, IndexCommitManifest, IndexCurrentPointer, LocatorRoot,
+    MAX_RELEASING_COMMIT_REVISIONS, ManifestPhysicalOrder, PendingAtomicBatch,
+    ReleasingManifestReference,
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IndexPointerCasClass {
+    Incremental,
+    Merge,
+    Retention,
+    Rebuild,
+}
+
+impl IndexPointerCasClass {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Incremental => "incremental",
+            Self::Merge => "merge",
+            Self::Retention => "retention",
+            Self::Rebuild => "rebuild",
+        }
+    }
+}
+
+fn emit_pointer_cas_metrics(
+    index_id: u64,
+    tenant_id: u64,
+    bucket_id: u64,
+    class: IndexPointerCasClass,
+    pointer_bytes: u64,
+    duration: Duration,
+    failed: bool,
+    lost: bool,
+) {
+    tracing::debug!(
+        index.id = index_id,
+        tenant.id = tenant_id,
+        bucket.id = bucket_id,
+        publication.cas_class = class.as_str(),
+        publication.outcome = if lost {
+            "lost"
+        } else if failed {
+            "failed"
+        } else {
+            "completed"
+        },
+        monotonic_counter.keldra_index_current_pointer_cas_attempts_total = 1_u64,
+        monotonic_counter.keldra_index_current_pointer_cas_successes_total = u64::from(!failed),
+        monotonic_counter.keldra_index_current_pointer_cas_failures_total = u64::from(failed),
+        monotonic_counter.keldra_index_current_pointer_cas_losses_total = u64::from(lost),
+        histogram.keldra_index_current_pointer_bytes = pointer_bytes,
+        histogram.keldra_index_current_pointer_cas_duration_seconds = duration.as_secs_f64(),
+        "index current-pointer CAS finished"
+    );
+}
+
+fn emit_pointer_cas_result<T>(
+    index_id: u64,
+    tenant_id: u64,
+    bucket_id: u64,
+    class: IndexPointerCasClass,
+    pointer_bytes: u64,
+    duration: Duration,
+    result: &Result<T, Status>,
+) {
+    let failed = result.is_err();
+    let lost = result
+        .as_ref()
+        .is_err_and(|error| error.code() == tonic::Code::Aborted);
+    emit_pointer_cas_metrics(
+        index_id,
+        tenant_id,
+        bucket_id,
+        class,
+        pointer_bytes,
+        duration,
+        failed,
+        lost,
+    );
+}
+use super::events::IndexBarrier;
 use super::publication::{
     DefinitionVersionGuard, DerivedArtifactAdmission, IndexArtifactPublish, IndexArtifactRouter,
     artifact_path, current_path, manifest_path,
 };
 
 #[derive(Clone)]
-pub(crate) struct IndexGenerationPublisher {
+pub(crate) struct IndexCommitPublisher {
     store: Store,
     reader: ClusterObjectReader,
     artifacts: IndexArtifactRouter,
@@ -39,21 +122,21 @@ pub(crate) struct IndexGenerationPublisher {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct PublishedGeneration {
+pub(crate) struct CommittedIndexView {
     pub(crate) pointer: IndexCurrentPointer,
     pub(crate) current_object_version: VersionId,
-    pub(crate) manifest: IndexGenerationManifest,
+    pub(crate) manifest: IndexCommitManifest,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct SelectedPublishedGeneration {
+pub(crate) struct SelectedCommittedIndexView {
     pub(crate) pointer: IndexCurrentPointer,
     pub(crate) current_object_version: VersionId,
-    pub(crate) reference: ManifestReference,
-    pub(crate) manifest: IndexGenerationManifest,
+    pub(crate) reference: CommitManifestReference,
+    pub(crate) manifest: IndexCommitManifest,
 }
 
-impl IndexGenerationPublisher {
+impl IndexCommitPublisher {
     pub(crate) fn new(
         store: Store,
         reader: ClusterObjectReader,
@@ -109,178 +192,301 @@ impl IndexGenerationPublisher {
         definition_version: u64,
         kind: IndexKind,
         schema_fingerprint: [u8; 32],
-        barrier: IndexBarrier,
+        mut barrier: IndexBarrier,
+        mut pending_atomic_batches: Vec<PendingAtomicBatch>,
         physical_order: Vec<ManifestPhysicalOrder>,
         mut segments: Vec<SegmentDescriptor>,
         mut locator_roots: Vec<LocatorRoot>,
-        current: Option<&PublishedGeneration>,
+        current: Option<&CommittedIndexView>,
         admission: DerivedArtifactAdmission,
-    ) -> Result<PublishedGeneration, Status> {
-        segments.sort_by_key(|segment| segment.identity.segment_id);
-        locator_roots.sort_by_key(|locator| locator.sequence);
-        let generation = current
-            .map(|value| value.pointer.current.generation)
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or_else(|| Status::resource_exhausted("index generation revision overflow"))?;
-        let (artifact_encoded_bytes, artifact_logical_bytes) =
-            generation_artifact_totals(&segments, &locator_roots)?;
-        let manifest = IndexGenerationManifest::new(
-            definition.index_id,
-            generation,
-            definition_version,
-            kind,
-            schema_fingerprint,
-            &barrier,
-            physical_order,
-            segments,
-            locator_roots,
-            artifact_encoded_bytes,
-            artifact_logical_bytes,
-        )
-        .map_err(generation_status)?;
+        cas_class: IndexPointerCasClass,
+    ) -> Result<CommittedIndexView, Status> {
+        if cas_class == IndexPointerCasClass::Merge {
+            let base = current.ok_or_else(|| {
+                Status::failed_precondition("merge publication requires a committed base view")
+            })?;
+            if base.manifest.barrier().map_err(commit_view_status)? != barrier
+                || base.manifest.pending_atomic_batches != pending_atomic_batches
+            {
+                return Err(Status::failed_precondition(
+                    "merge publication must preserve its base source and atomic checkpoints",
+                ));
+            }
+        }
+        let mut expected_current = current.cloned();
+        'publication: loop {
+            let current = expected_current.as_ref();
+            segments.sort_by_key(|segment| segment.identity.segment_id);
+            locator_roots.sort_by_key(|locator| locator.sequence);
+            let revision = current
+                .map(|value| value.pointer.current.revision)
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or_else(|| Status::resource_exhausted("index commit revision overflow"))?;
+            let (artifact_encoded_bytes, artifact_logical_bytes) =
+                commit_artifact_totals(&segments, &locator_roots)?;
+            let manifest = IndexCommitManifest::new(
+                definition.index_id,
+                revision,
+                definition_version,
+                kind,
+                schema_fingerprint,
+                &barrier,
+                pending_atomic_batches.clone(),
+                // A rebuild is a new physical lineage from source authority. It
+                // deliberately does not name the superseded serving manifest;
+                // incremental and merge publications retain non-owning ancestry
+                // for diagnosis without turning it into retention authority.
+                (cas_class != IndexPointerCasClass::Rebuild)
+                    .then(|| current.map(|view| view.pointer.current.blob.hash))
+                    .flatten(),
+                physical_order.clone(),
+                segments.clone(),
+                locator_roots.clone(),
+                artifact_encoded_bytes,
+                artifact_logical_bytes,
+            )
+            .map_err(commit_view_status)?;
 
-        let manifest_bytes = manifest.encode().map_err(generation_status)?;
-        let manifest_length = manifest_bytes.len() as u64;
-        let manifest_span = tracing::info_span!(
-            "keldra.index.manifest_publish",
-            index.id = definition.index_id,
-            tenant.id = tenant_id,
-            bucket.id = bucket_id,
-            index.kind = ?kind,
-            generation,
-            manifest.bytes = manifest_length,
-        );
-        let manifest_started = std::time::Instant::now();
-        let manifest_result = async {
-            let blob = stage_artifact_bytes(&self.store, &manifest_bytes, admission).await?;
-            let path = manifest_path(definition.index_id, blob.hash);
-            let version = self
-                .publish_immutable(
-                    definition,
-                    tenant_id,
-                    bucket_id,
-                    &path,
-                    blob.clone(),
-                    admission,
-                )
+            let manifest_bytes = manifest.encode().map_err(commit_view_status)?;
+            let manifest_length = manifest_bytes.len() as u64;
+            let manifest_span = tracing::debug_span!(
+                "keldra.index.manifest_publish",
+                index.id = definition.index_id,
+                tenant.id = tenant_id,
+                bucket.id = bucket_id,
+                index.kind = ?kind,
+                revision,
+                manifest.bytes = manifest_length,
+            );
+            let manifest_started = std::time::Instant::now();
+            let manifest_result = async {
+                let blob = stage_artifact_bytes(&self.store, &manifest_bytes, admission).await?;
+                let path = manifest_path(definition.index_id, blob.hash);
+                let version = self
+                    .publish_immutable(
+                        definition,
+                        tenant_id,
+                        bucket_id,
+                        &path,
+                        blob.clone(),
+                        admission,
+                    )
+                    .await?;
+                Ok::<_, Status>((blob, version))
+            }
+            .instrument(manifest_span.clone())
+            .await;
+            let manifest_failed = manifest_result.is_err();
+            manifest_span.in_scope(|| {
+                tracing::debug!(
+                    index.kind = ?kind,
+                    publish.phase = "manifest",
+                    publish.outcome = if manifest_failed { "failed" } else { "completed" },
+                    monotonic_counter.keldra_index_manifests_published_total =
+                        u64::from(!manifest_failed),
+                    monotonic_counter.keldra_index_manifest_publish_failures_total =
+                        u64::from(manifest_failed),
+                    histogram.keldra_index_manifest_bytes = manifest_length,
+                    histogram.keldra_index_manifest_publish_duration_seconds =
+                        manifest_started.elapsed().as_secs_f64(),
+                    "format-v4 index revision manifest publication finished"
+                );
+            });
+            let (manifest_blob, manifest_object_version) = manifest_result?;
+            let published_at = SystemTime::now();
+            let current_reference = CommitManifestReference::new(
+                &manifest,
+                manifest_blob,
+                manifest_object_version,
+                published_at,
+            )
+            .map_err(commit_view_status)?;
+            // Serialize the small mutable-root transaction with retention. The
+            // immutable manifest above remains useful even if another commit won;
+            // retention-only rewrites of this same revision are rebased here.
+            let current_guard = self
+                .artifacts
+                .acquire_current_mutation(definition.index_id)
                 .await?;
-            Ok::<_, Status>((blob, version))
-        }
-        .instrument(manifest_span.clone())
-        .await;
-        let manifest_failed = manifest_result.is_err();
-        manifest_span.in_scope(|| {
-            tracing::info!(
-                index.kind = ?kind,
-                publish.phase = "manifest",
-                publish.outcome = if manifest_failed { "failed" } else { "completed" },
-                monotonic_counter.keldra_index_manifests_published_total =
-                    u64::from(!manifest_failed),
-                monotonic_counter.keldra_index_manifest_publish_failures_total =
-                    u64::from(manifest_failed),
-                histogram.keldra_index_manifest_bytes = manifest_length,
-                histogram.keldra_index_manifest_publish_duration_seconds =
-                    manifest_started.elapsed().as_secs_f64(),
-                "format-v4 index generation manifest publication finished"
-            );
-        });
-        let (manifest_blob, manifest_object_version) = manifest_result?;
-        let published_at = SystemTime::now();
-        let current_reference = ManifestReference::new(
-            &manifest,
-            manifest_blob,
-            manifest_object_version,
-            published_at,
-        )
-        .map_err(generation_status)?;
-        // Publication stays O(pointer references). Exact distinct-object byte
-        // enforcement is deliberately performed later by bounded retention
-        // maintenance, never while making a new generation visible.
-        let retained = select_retained_metadata(
-            self.config,
-            current.into_iter().flat_map(|previous| {
-                std::iter::once(&previous.pointer.current).chain(previous.pointer.retained.iter())
-            }),
-            published_at,
-        )?;
-        let pointer = IndexCurrentPointer::new(definition.index_id, current_reference, retained)
-            .map_err(generation_status)?;
-        let pointer_bytes = pointer.encode().map_err(generation_status)?;
-        let pointer_length = pointer_bytes.len() as u64;
-        let path = current_path(definition.index_id);
-        let current_span = tracing::info_span!(
-            "keldra.index.current_pointer_cas",
-            index.id = definition.index_id,
-            tenant.id = tenant_id,
-            bucket.id = bucket_id,
-            index.kind = ?kind,
-            generation,
-            current.bytes = pointer_length,
-            retained.generations = pointer.retained.len() as u64,
-        );
-        let current_started = std::time::Instant::now();
-        let current_result = async {
-            let blob = stage_artifact_bytes(&self.store, &pointer_bytes, admission).await?;
-            self.artifacts
-                .publish(IndexArtifactPublish {
-                    storage_tenant: definition.tenant.clone(),
-                    bucket: definition.bucket.clone(),
+            let observed = self.load_current(definition, tenant_id, bucket_id).await?;
+            let expected_revision = current.map(|value| value.pointer.current.revision);
+            let observed_revision = observed
+                .as_ref()
+                .map(|value| value.pointer.current.revision);
+            if observed_revision != expected_revision {
+                if let Some(observed) = observed
+                    && observed_revision > expected_revision
+                {
+                    if cas_class == IndexPointerCasClass::Incremental
+                        && manifest_covers_barrier(&observed.manifest, &barrier)
+                    {
+                        return Ok(observed);
+                    }
+                    if cas_class == IndexPointerCasClass::Merge {
+                        let base = current.ok_or_else(|| {
+                            Status::failed_precondition(
+                                "merge publication has no committed base view",
+                            )
+                        })?;
+                        if !manifest_covers_barrier(&observed.manifest, &barrier)
+                            || !manifest_preserves_pending_atomic_batches(
+                                &observed.manifest,
+                                &base.manifest.pending_atomic_batches,
+                            )
+                        {
+                            return Err(Status::aborted(
+                                "newer committed view does not cover the merge base checkpoint and atomic lineage",
+                            ));
+                        }
+                        let rebased = merge_rebase::rebase_merge_candidate(
+                            &base.manifest,
+                            &segments,
+                            &locator_roots,
+                            &observed.manifest,
+                        )?;
+                        barrier = observed.manifest.barrier().map_err(commit_view_status)?;
+                        pending_atomic_batches = observed.manifest.pending_atomic_batches.clone();
+                        segments = rebased.segments;
+                        locator_roots = rebased.locator_roots;
+                        expected_current = Some(observed);
+                        drop(current_guard);
+                        continue 'publication;
+                    }
+                }
+                emit_pointer_cas_metrics(
+                    definition.index_id,
                     tenant_id,
                     bucket_id,
-                    index_id: definition.index_id,
-                    exact_path: path.clone(),
-                    blob: blob.clone(),
-                    expected_version: current.map(|value| value.current_object_version),
-                    command_id: content_command(definition.index_id, &path, &blob),
-                    definition_guard: Some(DefinitionVersionGuard {
-                        kind: DefinitionKind::Index,
-                        exact_path: definition_path(&definition.name)?,
-                        expected_version: VersionId(definition_version),
-                    }),
-                    definition_intent: None,
-                    admission,
-                })
-                .await
-        }
-        .instrument(current_span.clone())
-        .await;
-        let current_failed = current_result.is_err();
-        current_span.in_scope(|| {
-            tracing::info!(
+                    cas_class,
+                    0,
+                    Duration::ZERO,
+                    true,
+                    true,
+                );
+                return Err(Status::aborted(
+                    "a newer committed index revision superseded this publication candidate",
+                ));
+            }
+            if let (Some(expected), Some(observed)) = (current, observed.as_ref())
+                && expected.pointer.current != observed.pointer.current
+            {
+                return Err(Status::data_loss(
+                    "current index revision identity changed without advancing",
+                ));
+            }
+
+            // Publication stays O(pointer references). Exact distinct-object byte
+            // enforcement is deliberately performed later by bounded retention
+            // maintenance, never while making a new revision visible.
+            let retained = select_retained_metadata(
+                self.config,
+                current_reference.retained_bytes,
+                observed.iter().flat_map(|previous| {
+                    std::iter::once(&previous.pointer.current)
+                        .chain(previous.pointer.retained.iter())
+                }),
+                published_at,
+            )?;
+            let releasing = publication_releasing_roots(
+                observed.as_ref().map(|value| &value.pointer),
+                retained.len(),
+                published_at,
+            )?;
+            let pointer = IndexCurrentPointer::new(
+                definition.index_id,
+                current_reference,
+                retained,
+                releasing,
+            )
+            .map_err(commit_view_status)?;
+            let pointer_bytes = pointer.encode().map_err(commit_view_status)?;
+            let pointer_length = pointer_bytes.len() as u64;
+            let path = current_path(definition.index_id);
+            let current_span = tracing::debug_span!(
+                "keldra.index.current_pointer_cas",
+                index.id = definition.index_id,
+                tenant.id = tenant_id,
+                bucket.id = bucket_id,
                 index.kind = ?kind,
-                publish.phase = "current_pointer_cas",
-                publish.outcome = if current_failed { "failed" } else { "completed" },
-                monotonic_counter.keldra_index_current_pointer_cas_attempts_total = 1_u64,
-                monotonic_counter.keldra_index_current_pointer_cas_successes_total =
-                    u64::from(!current_failed),
-                monotonic_counter.keldra_index_current_pointer_cas_failures_total =
-                    u64::from(current_failed),
-                histogram.keldra_index_current_pointer_bytes = pointer_length,
-                histogram.keldra_index_current_pointer_cas_duration_seconds =
-                    current_started.elapsed().as_secs_f64(),
-                "format-v4 index current-pointer CAS finished"
+                revision,
+                current.bytes = pointer_length,
+                retained.revisions = pointer.retained.len() as u64,
             );
-        });
-        let outcome = current_result?;
-        Ok(PublishedGeneration {
-            pointer,
-            current_object_version: outcome.version,
-            manifest,
-        })
+            let current_started = std::time::Instant::now();
+            let current_result = async {
+                let blob = stage_artifact_bytes(&self.store, &pointer_bytes, admission).await?;
+                self.artifacts
+                    .publish_while_current_mutation_held(
+                        IndexArtifactPublish {
+                            storage_tenant: definition.tenant.clone(),
+                            bucket: definition.bucket.clone(),
+                            tenant_id,
+                            bucket_id,
+                            index_id: definition.index_id,
+                            exact_path: path.clone(),
+                            blob: blob.clone(),
+                            expected_version: observed
+                                .as_ref()
+                                .map(|value| value.current_object_version),
+                            command_id: content_command(definition.index_id, &path, &blob),
+                            definition_guard: Some(DefinitionVersionGuard {
+                                kind: DefinitionKind::Index,
+                                exact_path: definition_path(&definition.name)?,
+                                expected_version: VersionId(definition_version),
+                            }),
+                            definition_intent: None,
+                            admission,
+                        },
+                        Some(&current_guard),
+                    )
+                    .await
+            }
+            .instrument(current_span.clone())
+            .await;
+            let current_failed = current_result.is_err();
+            current_span.in_scope(|| {
+                let cas_lost = current_result
+                    .as_ref()
+                    .is_err_and(|error| error.code() == tonic::Code::Aborted);
+                tracing::debug!(
+                    index.kind = ?kind,
+                    publication.cas_class = cas_class.as_str(),
+                    publish.phase = "current_pointer_cas",
+                    publish.outcome = if current_failed { "failed" } else { "completed" },
+                    monotonic_counter.keldra_index_current_pointer_cas_attempts_total = 1_u64,
+                    monotonic_counter.keldra_index_current_pointer_cas_successes_total =
+                        u64::from(!current_failed),
+                    monotonic_counter.keldra_index_current_pointer_cas_failures_total =
+                        u64::from(current_failed),
+                    monotonic_counter.keldra_index_current_pointer_cas_losses_total =
+                        u64::from(cas_lost),
+                    histogram.keldra_index_current_pointer_bytes = pointer_length,
+                    histogram.keldra_index_current_pointer_cas_duration_seconds =
+                        current_started.elapsed().as_secs_f64(),
+                    "format-v4 index current-pointer CAS finished"
+                );
+            });
+            let outcome = current_result?;
+            return Ok(CommittedIndexView {
+                pointer,
+                current_object_version: outcome.version,
+                manifest,
+            });
+        }
     }
 
     /// CAS a strictly smaller retained suffix while preserving the exact
-    /// current generation. The caller owns the complete retention proof; this
+    /// current committed view. The caller owns the complete retention proof; this
     /// operation intentionally performs no manifest or artifact traversal.
     pub(crate) async fn trim_retained(
         &self,
         definition: &StoredIndexDefinition,
         tenant_id: u64,
         bucket_id: u64,
-        current: &PublishedGeneration,
-        retained: Vec<ManifestReference>,
-    ) -> Result<PublishedGeneration, Status> {
+        current: &CommittedIndexView,
+        retained: Vec<CommitManifestReference>,
+    ) -> Result<CommittedIndexView, Status> {
         validate_manifest_reference(
             &current.pointer.current,
             &current.manifest,
@@ -300,13 +506,29 @@ impl IndexGenerationPublisher {
             return Ok(current.clone());
         }
 
+        let released_at = SystemTime::now();
+        let mut releasing = current.pointer.releasing.clone();
+        releasing.extend(
+            current.pointer.retained[retained.len()..]
+                .iter()
+                .cloned()
+                .map(|reference| ReleasingManifestReference::new(reference, released_at))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(commit_view_status)?,
+        );
+        if releasing.len() > MAX_RELEASING_COMMIT_REVISIONS {
+            return Err(Status::resource_exhausted(
+                "releasing manifest root queue reached its durable pointer bound",
+            ));
+        }
         let pointer = IndexCurrentPointer::new(
             definition.index_id,
             current.pointer.current.clone(),
             retained,
+            releasing,
         )
-        .map_err(generation_status)?;
-        let pointer_bytes = pointer.encode().map_err(generation_status)?;
+        .map_err(commit_view_status)?;
+        let pointer_bytes = pointer.encode().map_err(commit_view_status)?;
         let blob = stage_artifact_bytes(
             &self.store,
             &pointer_bytes,
@@ -314,6 +536,7 @@ impl IndexGenerationPublisher {
         )
         .await?;
         let path = current_path(definition.index_id);
+        let cas_started = std::time::Instant::now();
         let outcome = self
             .artifacts
             .publish(IndexArtifactPublish {
@@ -334,8 +557,119 @@ impl IndexGenerationPublisher {
                 definition_intent: None,
                 admission: DerivedArtifactAdmission::Bounded,
             })
+            .await;
+        emit_pointer_cas_result(
+            definition.index_id,
+            tenant_id,
+            bucket_id,
+            IndexPointerCasClass::Retention,
+            pointer_bytes.len() as u64,
+            cas_started.elapsed(),
+            &outcome,
+        );
+        let outcome = outcome?;
+        Ok(CommittedIndexView {
+            pointer,
+            current_object_version: outcome.version,
+            manifest: current.manifest.clone(),
+        })
+    }
+
+    /// Remove only releasing roots whose exact object graphs have completed
+    /// cleanup. Pointer identity is protected by the ordinary exact CAS.
+    pub(crate) async fn finish_releasing(
+        &self,
+        definition: &StoredIndexDefinition,
+        tenant_id: u64,
+        bucket_id: u64,
+        completed: &[ReleasingManifestReference],
+    ) -> Result<CommittedIndexView, Status> {
+        let current_guard = self
+            .artifacts
+            .acquire_current_mutation(definition.index_id)
             .await?;
-        Ok(PublishedGeneration {
+        let current = self
+            .load_current(definition, tenant_id, bucket_id)
+            .await?
+            .ok_or_else(|| {
+                Status::aborted("current pointer disappeared before releasing-root cleanup")
+            })?;
+        let (completed, releasing) =
+            select_completed_releasing(&current.pointer.releasing, completed);
+        if completed.is_empty() {
+            return Ok(current);
+        }
+        let pointer = IndexCurrentPointer::new(
+            definition.index_id,
+            current.pointer.current.clone(),
+            current.pointer.retained.clone(),
+            releasing,
+        )
+        .map_err(commit_view_status)?;
+        let pointer_bytes = pointer.encode().map_err(commit_view_status)?;
+        let blob = stage_artifact_bytes(
+            &self.store,
+            &pointer_bytes,
+            DerivedArtifactAdmission::Bounded,
+        )
+        .await?;
+        let path = current_path(definition.index_id);
+        let completed_roots = completed.len() as u64;
+        let completed_bytes = completed.iter().fold(0_u64, |total, root| {
+            total.saturating_add(root.manifest.retained_bytes)
+        });
+        let cas_started = std::time::Instant::now();
+        let outcome = self
+            .artifacts
+            .publish_while_current_mutation_held(
+                IndexArtifactPublish {
+                    storage_tenant: definition.tenant.clone(),
+                    bucket: definition.bucket.clone(),
+                    tenant_id,
+                    bucket_id,
+                    index_id: definition.index_id,
+                    exact_path: path.clone(),
+                    blob: blob.clone(),
+                    expected_version: Some(current.current_object_version),
+                    command_id: content_command(definition.index_id, &path, &blob),
+                    definition_guard: Some(DefinitionVersionGuard {
+                        kind: DefinitionKind::Index,
+                        exact_path: definition_path(&definition.name)?,
+                        expected_version: VersionId(current.manifest.definition_version),
+                    }),
+                    definition_intent: None,
+                    admission: DerivedArtifactAdmission::Bounded,
+                },
+                Some(&current_guard),
+            )
+            .await;
+        emit_pointer_cas_result(
+            definition.index_id,
+            tenant_id,
+            bucket_id,
+            IndexPointerCasClass::Retention,
+            pointer_bytes.len() as u64,
+            cas_started.elapsed(),
+            &outcome,
+        );
+        let failed = outcome.is_err();
+        tracing::debug!(
+            index.id = definition.index_id,
+            tenant.id = tenant_id,
+            bucket.id = bucket_id,
+            cleanup.outcome = if failed { "failed" } else { "completed" },
+            monotonic_counter.keldra_index_releasing_root_cleanups_total =
+                if failed { 0 } else { completed_roots },
+            monotonic_counter.keldra_index_releasing_root_cleanup_failures_total =
+                u64::from(failed),
+            monotonic_counter.keldra_index_releasing_root_cleanup_bytes_total =
+                if failed { 0 } else { completed_bytes },
+            histogram.keldra_index_releasing_roots_per_cleanup = completed_roots,
+            histogram.keldra_index_releasing_bytes_per_cleanup = completed_bytes,
+            "exact released index roots finished cleanup"
+        );
+        let outcome = outcome?;
+        Ok(CommittedIndexView {
             pointer,
             current_object_version: outcome.version,
             manifest: current.manifest.clone(),
@@ -344,10 +678,15 @@ impl IndexGenerationPublisher {
 
     pub(crate) fn metadata_retained(
         &self,
-        current: &PublishedGeneration,
+        current: &CommittedIndexView,
         now: SystemTime,
-    ) -> Result<Vec<ManifestReference>, Status> {
-        select_retained_metadata(self.config, current.pointer.retained.iter(), now)
+    ) -> Result<Vec<CommitManifestReference>, Status> {
+        select_retained_metadata(
+            self.config,
+            current.pointer.current.retained_bytes,
+            current.pointer.retained.iter(),
+            now,
+        )
     }
 
     pub(crate) async fn load_current(
@@ -355,9 +694,9 @@ impl IndexGenerationPublisher {
         definition: &StoredIndexDefinition,
         tenant_id: u64,
         bucket_id: u64,
-    ) -> Result<Option<PublishedGeneration>, Status> {
+    ) -> Result<Option<CommittedIndexView>, Status> {
         Ok(self
-            .load_generation(
+            .load_committed_view(
                 &definition.tenant,
                 &definition.bucket,
                 tenant_id,
@@ -366,7 +705,7 @@ impl IndexGenerationPublisher {
                 None,
             )
             .await?
-            .map(|selected| PublishedGeneration {
+            .map(|selected| CommittedIndexView {
                 pointer: selected.pointer,
                 current_object_version: selected.current_object_version,
                 manifest: selected.manifest,
@@ -374,15 +713,15 @@ impl IndexGenerationPublisher {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn load_generation(
+    pub(crate) async fn load_committed_view(
         &self,
         storage_tenant: &str,
         bucket: &str,
         tenant_id: u64,
         bucket_id: u64,
         index_id: u64,
-        exact_generation: Option<u64>,
-    ) -> Result<Option<SelectedPublishedGeneration>, Status> {
+        exact_revision: Option<u64>,
+    ) -> Result<Option<SelectedCommittedIndexView>, Status> {
         let path = current_path(index_id);
         let key = ObjectKey::new(storage_tenant, bucket, &path)
             .map_err(|error| Status::internal(error.to_string()))?;
@@ -418,14 +757,14 @@ impl IndexGenerationPublisher {
                 "current index pointer belongs to another index",
             ));
         }
-        let requested = exact_generation.unwrap_or(pointer.current.generation);
-        if requested > pointer.current.generation {
+        let requested = exact_revision.unwrap_or(pointer.current.revision);
+        if requested > pointer.current.revision {
             return Err(Status::failed_precondition(
-                "requested index generation was never published",
+                "requested index revision was never published",
             ));
         }
-        let reference = pointer.generation(requested).cloned().ok_or_else(|| {
-            Status::failed_precondition("requested index generation is no longer retained")
+        let reference = pointer.revision(requested).cloned().ok_or_else(|| {
+            Status::failed_precondition("requested index revision is no longer retained")
         })?;
         let manifest = self
             .load_manifest_reference(
@@ -437,7 +776,7 @@ impl IndexGenerationPublisher {
                 &reference,
             )
             .await?;
-        Ok(Some(SelectedPublishedGeneration {
+        Ok(Some(SelectedCommittedIndexView {
             pointer,
             current_object_version: opened.version.id,
             reference,
@@ -452,9 +791,9 @@ impl IndexGenerationPublisher {
         tenant_id: u64,
         bucket_id: u64,
         index_id: u64,
-        reference: &ManifestReference,
-    ) -> Result<IndexGenerationManifest, Status> {
-        reference.validate(index_id).map_err(generation_status)?;
+        reference: &CommitManifestReference,
+    ) -> Result<IndexCommitManifest, Status> {
+        reference.validate(index_id).map_err(commit_view_status)?;
         let key = ObjectKey::new(storage_tenant, bucket, &reference.path)
             .map_err(|error| Status::internal(error.to_string()))?;
         let Some(mut opened) = self
@@ -463,7 +802,7 @@ impl IndexGenerationPublisher {
             .await?
         else {
             return Err(Status::data_loss(
-                "format-v4 generation manifest object is absent",
+                "format-v4 revision manifest object is absent",
             ));
         };
         if opened.version.id != reference.object_version
@@ -471,13 +810,13 @@ impl IndexGenerationPublisher {
             || opened.version.blob.as_ref() != Some(&reference.blob)
         {
             return Err(Status::data_loss(
-                "format-v4 generation manifest differs from its exact reference",
+                "format-v4 revision manifest differs from its exact reference",
             ));
         }
         let mut payload = opened
             .payload
             .take()
-            .ok_or_else(|| Status::data_loss("format-v4 generation manifest has no payload"))?;
+            .ok_or_else(|| Status::data_loss("format-v4 revision manifest has no payload"))?;
         let mut bytes = Vec::new();
         let maximum =
             reference.blob.length.checked_add(1).ok_or_else(|| {
@@ -490,10 +829,10 @@ impl IndexGenerationPublisher {
             .map_err(|error| Status::internal(format!("read format-v4 manifest: {error}")))?;
         if bytes.len() as u64 != reference.blob.length {
             return Err(Status::data_loss(
-                "format-v4 generation manifest length differs from its verified object reference",
+                "format-v4 revision manifest length differs from its verified object reference",
             ));
         }
-        let manifest = IndexGenerationManifest::decode(&bytes)
+        let manifest = IndexCommitManifest::decode(&bytes)
             .map_err(|error| Status::data_loss(error.to_string()))?;
         validate_manifest_reference(reference, &manifest, index_id)?;
         Ok(manifest)
@@ -784,7 +1123,7 @@ impl IndexComponentBatchSink {
     }
 
     async fn stage_reserved_pack(&self, pack: ReservedIndexPack) -> Result<(), IndexError> {
-        let result = stage_index_bytes(&self.store, &pack.bytes, self.admission).await;
+        let result = stage_index_bytes_with_retry(&self.store, &pack.bytes, self.admission).await;
         // Store staging is the content-address authority and has already
         // computed the BLAKE3 identity while writing these exact bytes.
         let result = match result {
@@ -870,7 +1209,7 @@ impl IndexComponentBatchSink {
             .iter()
             .try_fold(0_u64, |total, pack| total.checked_add(pack.component_count))
             .ok_or(IndexError::OffsetOverflow)?;
-        let span = tracing::info_span!(
+        let span = tracing::debug_span!(
             "keldra.index.v4_component_publish",
             index.id = self.definition.index_id,
             tenant.id = self.tenant_id,
@@ -886,7 +1225,7 @@ impl IndexComponentBatchSink {
             .await;
         let failed = result.is_err();
         span.in_scope(|| {
-            tracing::info!(
+            tracing::debug!(
                 publish.outcome = if failed { "failed" } else { "completed" },
                 monotonic_counter.keldra_index_v4_components_published_total =
                     if failed { 0 } else { component_count },
@@ -914,31 +1253,36 @@ impl IndexComponentBatchSink {
         active: CompletedSegmentPacks,
     ) -> Result<Vec<ArtifactPackReference>, IndexError> {
         let (unique_pack_indices, pack_outcomes) = deduplicate_staged_packs(&active.staged)?;
-        let mut requests = Vec::with_capacity(unique_pack_indices.len());
-        for pack_index in unique_pack_indices {
-            let pack = &active.staged[pack_index];
-            let path = artifact_path(self.definition.index_id, pack.blob.hash);
-            requests.push(IndexArtifactPublish {
-                storage_tenant: self.definition.tenant.clone(),
-                bucket: self.definition.bucket.clone(),
-                tenant_id: self.tenant_id,
-                bucket_id: self.bucket_id,
-                index_id: self.definition.index_id,
-                exact_path: path.clone(),
-                blob: pack.blob.clone(),
-                expected_version: None,
-                command_id: content_command(self.definition.index_id, &path, &pack.blob),
-                definition_guard: None,
-                definition_intent: None,
-                admission: self.admission,
-            });
-        }
-        let published_pack_count = requests.len();
-        let outcomes = self
-            .artifacts
-            .publish_many(requests)
-            .await
-            .map_err(|error| IndexError::Io(error.to_string()))?;
+        let published_pack_count = unique_pack_indices.len();
+        let outcomes = loop {
+            let mut requests = Vec::with_capacity(unique_pack_indices.len());
+            for &pack_index in &unique_pack_indices {
+                let pack = &active.staged[pack_index];
+                let path = artifact_path(self.definition.index_id, pack.blob.hash);
+                requests.push(IndexArtifactPublish {
+                    storage_tenant: self.definition.tenant.clone(),
+                    bucket: self.definition.bucket.clone(),
+                    tenant_id: self.tenant_id,
+                    bucket_id: self.bucket_id,
+                    index_id: self.definition.index_id,
+                    exact_path: path.clone(),
+                    blob: pack.blob.clone(),
+                    expected_version: None,
+                    command_id: content_command(self.definition.index_id, &path, &pack.blob),
+                    definition_guard: None,
+                    definition_intent: None,
+                    admission: self.admission,
+                });
+            }
+            match self.artifacts.publish_many(requests).await {
+                Err(error) if retryable_pack_publish_status(&error) => {
+                    tracing::debug!(%error, "retrying retained immutable index pack commit");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                Err(error) => return Err(IndexError::Io(error.to_string())),
+                Ok(outcomes) => break outcomes,
+            }
+        };
         if outcomes.len() != published_pack_count {
             return Err(IndexError::InvalidFormat(
                 "grouped pack outcome count differs from staged pack count",
@@ -965,7 +1309,17 @@ impl IndexComponentBatchSink {
     }
 }
 
-fn generation_artifact_totals(
+fn retryable_pack_publish_status(error: &Status) -> bool {
+    matches!(
+        error.code(),
+        tonic::Code::Unavailable
+            | tonic::Code::DeadlineExceeded
+            | tonic::Code::Cancelled
+            | tonic::Code::Unknown
+    )
+}
+
+fn commit_artifact_totals(
     segments: &[SegmentDescriptor],
     locator_roots: &[LocatorRoot],
 ) -> Result<(u64, u64), Status> {
@@ -984,14 +1338,48 @@ fn generation_artifact_totals(
     Ok((encoded, logical))
 }
 
+fn manifest_covers_barrier(manifest: &IndexCommitManifest, required: &IndexBarrier) -> bool {
+    manifest.placement_fence == required.fence
+        && required.sources.iter().all(|(node, cursor)| {
+            manifest.sources.iter().any(|indexed| {
+                indexed.node_id == node.0
+                    && indexed.source == cursor.source
+                    && indexed.next_offset >= cursor.next_offset
+            })
+        })
+        && required.atomic.finalized_through().is_none_or(|required| {
+            manifest
+                .atomic_through
+                .is_some_and(|indexed| indexed >= required)
+        })
+}
+
+fn manifest_preserves_pending_atomic_batches(
+    manifest: &IndexCommitManifest,
+    required: &[PendingAtomicBatch],
+) -> bool {
+    required.iter().all(|pending| {
+        manifest
+            .atomic_through
+            .is_some_and(|finalized| finalized >= pending.cursor)
+            || manifest
+                .pending_atomic_batches
+                .binary_search_by_key(&pending.cursor, |candidate| candidate.cursor)
+                .ok()
+                .is_some_and(|position| {
+                    manifest.pending_atomic_batches[position].bundle_hash == pending.bundle_hash
+                })
+    })
+}
+
 fn validate_manifest_reference(
-    reference: &ManifestReference,
-    manifest: &IndexGenerationManifest,
+    reference: &CommitManifestReference,
+    manifest: &IndexCommitManifest,
     index_id: u64,
 ) -> Result<(), Status> {
-    reference.validate(index_id).map_err(generation_status)?;
+    reference.validate(index_id).map_err(commit_view_status)?;
     if manifest.index_id != index_id
-        || manifest.generation != reference.generation
+        || manifest.revision != reference.revision
         || manifest.definition_version != reference.definition_version
         || manifest.schema_fingerprint != reference.schema_fingerprint
     {
@@ -1013,25 +1401,66 @@ fn unix_millis(time: SystemTime) -> Result<u64, Status> {
 
 fn select_retained_metadata<'a>(
     config: IndexRuntimeConfig,
-    candidates: impl IntoIterator<Item = &'a ManifestReference>,
+    current_retained_bytes: u64,
+    candidates: impl IntoIterator<Item = &'a CommitManifestReference>,
     now: SystemTime,
-) -> Result<Vec<ManifestReference>, Status> {
+) -> Result<Vec<CommitManifestReference>, Status> {
     let now_millis = unix_millis(now)?;
     let maximum_age_millis = config
-        .max_generation_age_hours()
+        .max_commit_revision_age_hours()
         .saturating_mul(60 * 60 * 1_000);
-    let maximum_count = config.max_retained_generations() as usize;
+    let maximum_count = config.max_retained_commit_revisions() as usize;
+    let maximum_bytes = config.max_retained_commit_bytes();
+    // The current manifest occupies the first count and byte slot. Candidates
+    // are a newest-to-oldest prefix; stopping at the first exceeded bound keeps
+    // the current pointer canonical and makes retention a bounded metadata CAS.
+    let mut retained_bytes = current_retained_bytes;
     let mut retained = Vec::new();
     for reference in candidates {
-        // The new/current generation occupies the first retained-count slot.
+        let candidate_bytes = retained_bytes.saturating_add(reference.retained_bytes);
+        // The new/current revision occupies the first retained-count slot.
         if retained.len().saturating_add(1) >= maximum_count
             || now_millis.saturating_sub(reference.published_at_unix_millis) > maximum_age_millis
+            || candidate_bytes > maximum_bytes
         {
             break;
         }
+        retained_bytes = candidate_bytes;
         retained.push(reference.clone());
     }
     Ok(retained)
+}
+
+fn publication_releasing_roots(
+    observed: Option<&IndexCurrentPointer>,
+    retained_count: usize,
+    released_at: SystemTime,
+) -> Result<Vec<ReleasingManifestReference>, Status> {
+    let Some(observed) = observed else {
+        return Ok(Vec::new());
+    };
+    let previous = std::iter::once(&observed.current)
+        .chain(observed.retained.iter())
+        .collect::<Vec<_>>();
+    if retained_count > previous.len() {
+        return Err(Status::internal(
+            "publication retained more roots than the observed pointer contains",
+        ));
+    }
+    let mut releasing = observed.releasing.clone();
+    releasing.extend(
+        previous[retained_count..]
+            .iter()
+            .map(|reference| ReleasingManifestReference::new((*reference).clone(), released_at))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(commit_view_status)?,
+    );
+    if releasing.len() > MAX_RELEASING_COMMIT_REVISIONS {
+        return Err(Status::resource_exhausted(
+            "releasing manifest root queue reached its durable pointer bound",
+        ));
+    }
+    Ok(releasing)
 }
 
 async fn stage_index_bytes(
@@ -1046,6 +1475,38 @@ async fn stage_index_bytes(
         }
     }
     .map_err(|error| IndexError::Io(error.to_string()))
+}
+
+async fn stage_index_bytes_with_retry(
+    store: &Store,
+    bytes: &[u8],
+    admission: DerivedArtifactAdmission,
+) -> Result<BlobRef, IndexError> {
+    loop {
+        let result = match admission {
+            DerivedArtifactAdmission::Bounded => store.stage_blob(bytes).await,
+            DerivedArtifactAdmission::PublicationProgress => {
+                store.stage_derived_progress_blob(bytes).await
+            }
+        };
+        match result {
+            Ok(blob) => return Ok(blob),
+            Err(error) if retryable_pack_stage_error(&error) => {
+                tracing::debug!(%error, "retrying retained immutable index pack staging");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Err(error) => return Err(IndexError::Io(error.to_string())),
+        }
+    }
+}
+
+fn retryable_pack_stage_error(error: &MutationError) -> bool {
+    matches!(
+        error,
+        MutationError::SourceJournalCapacity
+            | MutationError::DurabilityUnavailable
+            | MutationError::ReceiptCapacity
+    )
 }
 
 async fn stage_artifact_bytes(
@@ -1067,9 +1528,29 @@ fn content_command(index_id: u64, path: &str, blob: &BlobRef) -> String {
     format!("index-v4-{index_id}-{}", &digest.to_hex().as_str()[..24])
 }
 
-fn generation_status(error: super::generation::GenerationError) -> Status {
+fn select_completed_releasing(
+    current: &[ReleasingManifestReference],
+    completed: &[ReleasingManifestReference],
+) -> (
+    Vec<ReleasingManifestReference>,
+    Vec<ReleasingManifestReference>,
+) {
+    let completed = completed
+        .iter()
+        .filter(|candidate| current.contains(candidate))
+        .cloned()
+        .collect::<Vec<_>>();
+    let remaining = current
+        .iter()
+        .filter(|candidate| !completed.contains(candidate))
+        .cloned()
+        .collect();
+    (completed, remaining)
+}
+
+fn commit_view_status(error: super::committed_view::CommitViewError) -> Status {
     match error {
-        super::generation::GenerationError::SizeLimit => {
+        super::committed_view::CommitViewError::SizeLimit => {
             Status::resource_exhausted(error.to_string())
         }
         _ => Status::data_loss(error.to_string()),
@@ -1090,17 +1571,43 @@ mod tests {
 
     use super::*;
 
-    fn manifest_reference(generation: u64, published_at: u64) -> ManifestReference {
-        let hash = [generation as u8; 32];
-        ManifestReference {
-            generation,
+    fn manifest_reference(revision: u64, published_at: u64) -> CommitManifestReference {
+        let hash = [revision as u8; 32];
+        CommitManifestReference {
+            revision,
             definition_version: 1,
             schema_fingerprint: [1; 32],
             path: manifest_path(7, hash),
             blob: BlobRef { hash, length: 120 },
-            object_version: VersionId(generation + 10),
+            object_version: VersionId(revision + 10),
             published_at_unix_millis: published_at,
+            retained_bytes: 1_024,
         }
+    }
+
+    fn releasing(revision: u64) -> ReleasingManifestReference {
+        ReleasingManifestReference::new(
+            manifest_reference(revision, revision * 100),
+            UNIX_EPOCH + Duration::from_secs(revision),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn releasing_completion_is_idempotent_and_preserves_newer_roots() {
+        let old = releasing(1);
+        let already_unlinked = releasing(2);
+        let newer = releasing(3);
+        let (completed, remaining) = select_completed_releasing(
+            &[old.clone(), newer.clone()],
+            &[old.clone(), already_unlinked],
+        );
+        assert_eq!(completed, vec![old]);
+        assert_eq!(remaining, vec![newer]);
+
+        let (completed, remaining) = select_completed_releasing(&remaining, &completed);
+        assert!(completed.is_empty(), "crash replay is an idempotent no-op");
+        assert_eq!(remaining, vec![releasing(3)]);
     }
 
     fn staged_pack(hash: u8, length: u64) -> StagedIndexPack {
@@ -1262,6 +1769,7 @@ mod tests {
         ];
         let selected = select_retained_metadata(
             IndexRuntimeConfig::default(),
+            1_024,
             candidates.iter(),
             UNIX_EPOCH + Duration::from_millis(now_millis),
         )
@@ -1272,11 +1780,79 @@ mod tests {
         assert!(
             select_retained_metadata(
                 IndexRuntimeConfig::default(),
+                1_024,
                 old.iter(),
                 UNIX_EPOCH + Duration::from_millis(now_millis),
             )
             .unwrap()
             .is_empty()
         );
+
+        let mut too_large = manifest_reference(1, now_millis - hour);
+        too_large.retained_bytes = IndexRuntimeConfig::DEFAULT_MAX_RETAINED_COMMIT_BYTES;
+        assert!(
+            select_retained_metadata(
+                IndexRuntimeConfig::default(),
+                1,
+                [&too_large],
+                UNIX_EPOCH + Duration::from_millis(now_millis),
+            )
+            .unwrap()
+            .is_empty()
+        );
+
+        let existing_release = releasing(2);
+        let pointer = IndexCurrentPointer::new(
+            7,
+            manifest_reference(5, now_millis - hour),
+            vec![
+                manifest_reference(4, now_millis - 2 * hour),
+                manifest_reference(3, now_millis - 3 * hour),
+            ],
+            vec![existing_release.clone()],
+        )
+        .unwrap();
+        let released = publication_releasing_roots(
+            Some(&pointer),
+            1,
+            UNIX_EPOCH + Duration::from_millis(now_millis),
+        )
+        .unwrap();
+        assert_eq!(released[0], existing_release);
+        assert_eq!(
+            released
+                .iter()
+                .skip(1)
+                .map(|root| root.manifest.revision)
+                .collect::<Vec<_>>(),
+            vec![4, 3],
+            "normal publication must durably root every omitted suffix",
+        );
+    }
+
+    #[test]
+    fn immutable_pack_retries_only_typed_transient_failures() {
+        for error in [
+            MutationError::SourceJournalCapacity,
+            MutationError::DurabilityUnavailable,
+            MutationError::ReceiptCapacity,
+        ] {
+            assert!(retryable_pack_stage_error(&error));
+        }
+        assert!(!retryable_pack_stage_error(&MutationError::Storage(
+            "corrupt".into()
+        )));
+        for code in [
+            tonic::Code::Unavailable,
+            tonic::Code::DeadlineExceeded,
+            tonic::Code::Cancelled,
+            tonic::Code::Unknown,
+        ] {
+            assert!(retryable_pack_publish_status(&Status::new(code, "retry")));
+        }
+        assert!(!retryable_pack_publish_status(&Status::permission_denied(
+            "permanent"
+        )));
+        assert!(!retryable_pack_publish_status(&Status::aborted("fence")));
     }
 }

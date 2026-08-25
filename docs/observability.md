@@ -131,10 +131,15 @@ Rebuild and catch-up expose overlap-safe active counters, cumulative
 records/bytes and frames/pages, elapsed and last-progress-age gauges, terminal
 records/bytes/work-unit and duration histograms, and failure counters. Builder
 failures, selected recovery actions, retries, and fail-closed outcomes use the
-`keldra_index_builder_*` counters. Publication exposes generation, presence,
-age, freshness, source lag, CAS success/failure, and publication duration; a
-successful publication resets age and source lag to zero and marks the
-generation fresh.
+`keldra_index_builder_*` counters. Publication exposes the committed manifest
+revision, presence, age, freshness, source lag, CAS success/failure, and
+publication duration; a successful publication resets age and source lag to
+zero and marks the committed view fresh. Publication logs use the stable
+`revision` field and the `index commit published` and
+`index commit publication metrics` events. The latter separates
+`publication.new_segment_bytes` from
+`publication.committed_artifact_bytes`, the total immutable artifact bytes in
+the newly selected committed view.
 
 Query execution exposes the complete request and local-work path. Public RPCs
 report `keldra_index_query_requests_total`, failures, deadline expirations, and

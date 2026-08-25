@@ -9,8 +9,9 @@ mod service;
 
 pub(crate) use boundary::{
     ExecuteIndexQuery, ExecutedIndexQuery, IndexAuthorization, IndexAuthorizationEvidence,
-    IndexDefinitionLister, IndexDefinitionScan, IndexDefinitionScanPage, IndexLiveVersionReader,
-    IndexPageCursor, IndexQueryExecutor, IndexServiceDependencies, ListedIndexDefinition,
+    IndexDefinitionLister, IndexDefinitionScan, IndexDefinitionScanPage, IndexFreshnessRequirement,
+    IndexLiveVersionReader, IndexPageCursor, IndexQueryExecutor, IndexServiceDependencies,
+    ListedIndexDefinition, RequiredIndexSourceCheckpoint,
 };
 pub(crate) use candidate_visibility::{
     AuthorizedCurrentCandidates, CandidateVisibilityEvidence, IndexCandidateIdentity,

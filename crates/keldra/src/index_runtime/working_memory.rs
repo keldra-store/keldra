@@ -1,10 +1,10 @@
 //! One fair hard ceiling for accounted index heap memory.
 //!
-//! Query and construction settings remain fair-share planning targets. Idle
-//! shares may be borrowed for optional work, but queued mandatory work always
-//! has FIFO priority and the process-wide ceiling is never exceeded. This pool
-//! intentionally excludes mmap cache, tmpfs pages, RocksDB and ordinary runtime
-//! allocations.
+//! Query and construction settings remain fair-share planning targets. The
+//! query share is reserved from background construction, queries have priority
+//! over queued builders, and FIFO ordering is preserved within each class. The
+//! process-wide ceiling is never exceeded. This pool intentionally excludes
+//! mmap cache, tmpfs pages, RocksDB and ordinary runtime allocations.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -122,9 +122,9 @@ impl IndexWorkingMemory {
         self.inner.shares[account.slot()]
     }
 
-    /// Wait for `minimum` bytes in global FIFO order, then take immediately
-    /// idle bytes up to `preferred`. Optional bytes are never granted while a
-    /// mandatory request is already queued.
+    /// Wait for `minimum` bytes with query priority and per-class FIFO, then
+    /// take immediately idle bytes up to `preferred`. Builders cannot consume
+    /// the reserved query share.
     pub(crate) async fn acquire_up_to(
         &self,
         account: WorkingMemoryAccount,
@@ -159,22 +159,48 @@ impl IndexWorkingMemory {
             let changed = self.inner.changed.notified();
             let granted = {
                 let mut state = lock_state(&self.inner);
-                let first = state
+                let waiter_index = state
                     .waiters
-                    .front()
-                    .is_some_and(|waiter| waiter.ticket == ticket);
+                    .iter()
+                    .position(|waiter| waiter.ticket == ticket);
+                let eligible = waiter_index.is_some_and(|index| match account {
+                    // Queries retain FIFO ordering with each other but bypass
+                    // queued background work so an idle query reservation can
+                    // never be head-of-line blocked by a builder.
+                    WorkingMemoryAccount::Query => !state
+                        .waiters
+                        .iter()
+                        .take(index)
+                        .any(|waiter| waiter.account == WorkingMemoryAccount::Query),
+                    WorkingMemoryAccount::Builder(_) => {
+                        index == 0
+                            && !state
+                                .waiters
+                                .iter()
+                                .any(|waiter| waiter.account == WorkingMemoryAccount::Query)
+                    }
+                });
                 let free = self.inner.hard_limit.saturating_sub(state.used);
-                if first && free >= minimum {
+                let available = match account {
+                    WorkingMemoryAccount::Query => free,
+                    WorkingMemoryAccount::Builder(_) => free.saturating_sub(
+                        self.inner.shares[WorkingMemoryAccount::Query.slot()]
+                            .saturating_sub(state.account_used[WorkingMemoryAccount::Query.slot()]),
+                    ),
+                };
+                if eligible && available >= minimum {
                     // Existing mandatory waiters get priority over optional
                     // borrowing. If this is the only waiter, all currently idle
                     // bytes are safely available until this bounded permit ends.
                     let no_other_waiter = state.waiters.len() == 1;
                     let bytes = if no_other_waiter {
-                        preferred.min(free).max(minimum)
+                        preferred.min(available).max(minimum)
                     } else {
                         minimum
                     };
-                    state.waiters.pop_front();
+                    state
+                        .waiters
+                        .remove(waiter_index.expect("eligible waiter remains queued"));
                     state.used += bytes;
                     state.peak = state.peak.max(state.used);
                     let account_slot = account.slot();
@@ -361,16 +387,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queued_mandatory_work_is_not_bypassed_by_optional_borrowing() {
-        let memory = pool(100, 50, 40);
+    async fn query_bypasses_a_blocked_builder_without_exceeding_the_ceiling() {
+        let memory = pool(12, 4, 8);
         let held = memory
-            .acquire_up_to(WorkingMemoryAccount::Query, 50, 90)
+            .acquire_up_to(WorkingMemoryAccount::Builder(IndexKind::Path), 8, 8)
             .await
             .unwrap();
         let builder_memory = memory.clone();
         let builder = tokio::spawn(async move {
             builder_memory
-                .acquire_up_to(WorkingMemoryAccount::Builder(IndexKind::Path), 40, 40)
+                .acquire_up_to(WorkingMemoryAccount::Builder(IndexKind::Path), 8, 8)
                 .await
                 .unwrap()
         });
@@ -379,18 +405,32 @@ mod tests {
         let query_memory = memory.clone();
         let query = tokio::spawn(async move {
             query_memory
-                .acquire_up_to(WorkingMemoryAccount::Query, 20, 60)
+                .acquire_up_to(WorkingMemoryAccount::Query, 4, 4)
                 .await
                 .unwrap()
         });
         tokio::task::yield_now().await;
-        assert!(!query.is_finished());
+        let query = query.await.unwrap();
+        assert_eq!(query.bytes(), 4);
+        assert_eq!(memory.used(), 12);
+        assert!(!builder.is_finished());
+        drop(query);
+        assert!(!builder.is_finished());
         drop(held);
         let builder = builder.await.unwrap();
-        assert_eq!(builder.bytes(), 40);
-        let query = query.await.unwrap();
-        assert_eq!(query.bytes(), 60);
-        assert_eq!(memory.used(), 100);
+        assert_eq!(builder.bytes(), 8);
+        assert_eq!(memory.used(), 8);
+    }
+
+    #[tokio::test]
+    async fn builders_cannot_consume_the_idle_query_reservation() {
+        let memory = pool(12, 4, 8);
+        let permit = memory
+            .acquire_up_to(WorkingMemoryAccount::Builder(IndexKind::Path), 8, 12)
+            .await
+            .unwrap();
+        assert_eq!(permit.bytes(), 8);
+        assert_eq!(memory.available(), 4);
     }
 
     #[tokio::test]

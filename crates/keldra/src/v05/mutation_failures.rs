@@ -57,7 +57,8 @@ pub(super) fn api_failure(error: MutationError) -> MutationFailure {
             (MutationFailureCode::ResourceLimit, None)
         }
         MutationError::ReceiptTooLarge { .. }
-        | MutationError::SourceJournalRecordTooLarge { .. } => {
+        | MutationError::SourceJournalRecordTooLarge { .. }
+        | MutationError::SourceJournalTransitionTooLarge { .. } => {
             (MutationFailureCode::ResourceLimit, None)
         }
         MutationError::ObjectMutationLineageGap { .. }

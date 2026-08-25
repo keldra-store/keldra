@@ -252,6 +252,9 @@ mod tests {
     use std::path::Path;
     use std::time::Duration;
 
+    use keldra_consensus::{
+        CapabilityRange, JoinCapabilityHash, NodeDescriptor, NodeState, PeerAddress, PeerSpkiSha256,
+    };
     use keldra_store::{StoreOptions, SystemBootstrapRequest};
 
     use super::*;
@@ -421,10 +424,49 @@ mod tests {
             .await
             .unwrap();
         ensure_genesis_identity(&decisions).await.unwrap();
+        commit_test_active_placement(&decisions).await;
         let programs = ProgramCoordinator::start(store.clone(), decisions.clone(), NodeId(1))
             .await
             .unwrap();
         (store, decisions, programs)
+    }
+
+    async fn commit_test_active_placement(decisions: &DecisionRaft) {
+        if decisions
+            .state()
+            .unwrap()
+            .cluster_control()
+            .active_placement_log_id()
+            .is_some()
+        {
+            return;
+        }
+        let begun = decisions
+            .submit(Command::BeginAddNode {
+                format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+                descriptor: NodeDescriptor {
+                    node_id: NodeId(1),
+                    peer_address: PeerAddress("keldra-local://1".into()),
+                    storage_weight_millionths: 1_000_000,
+                    state: NodeState::Joining,
+                    current_peer_spki_sha256: PeerSpkiSha256([1; 32]),
+                    overlap_peer_spki_sha256: None,
+                    join_capability_hash: Some(JoinCapabilityHash([2; 32])),
+                    supported_protocol: CapabilityRange { min: 1, max: 1 },
+                    supported_storage_format: CapabilityRange { min: 1, max: 1 },
+                },
+            })
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            decisions
+                .submit(Command::CompleteMembershipTransition {
+                    format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+                    started_log_index: begun.log_index,
+                })
+                .await
+                .unwrap();
+        }
     }
 
     async fn stop_runtime(store: Store, decisions: DecisionRaft, programs: ProgramCoordinator) {

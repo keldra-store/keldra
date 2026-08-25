@@ -316,7 +316,15 @@ async fn one_snapshot_binds_heads_and_tail_across_concurrent_put_delete_and_epoc
     // The credit-driven cursor remains bound to its original RocksDB snapshot
     // while later commits proceed; it decodes no frame until `next_frame`.
     let mut scan = store
-        .start_current_head_snapshot_scan(tenant_id, bucket_id, "docs/", 1, 1024 * 1024, |_| true)
+        .start_current_head_snapshot_scan(
+            tenant_id,
+            bucket_id,
+            "docs/",
+            None,
+            1,
+            1024 * 1024,
+            |_| true,
+        )
         .await
         .unwrap();
     assert_eq!(scan.source(), before.source_id);
@@ -387,9 +395,15 @@ async fn snapshot_waits_for_the_proof_backed_tail_without_holding_the_commit_loc
     let scanning = store.clone();
     let mut scan = tokio::spawn(async move {
         scanning
-            .start_current_head_snapshot_scan(tenant_id, bucket_id, "docs/", 1, 1024 * 1024, |_| {
-                true
-            })
+            .start_current_head_snapshot_scan(
+                tenant_id,
+                bucket_id,
+                "docs/",
+                None,
+                1,
+                1024 * 1024,
+                |_| true,
+            )
             .await
     });
     assert!(
@@ -421,9 +435,15 @@ async fn snapshot_filter_runs_before_bounded_frames_are_emitted() {
     put_at(&store, "docs/b", b"b", "put-b", 2).await;
     let (tenant_id, bucket_id) = store.resolve_bucket_ids("tenant", "bucket").unwrap();
     let mut scan = store
-        .start_current_head_snapshot_scan(tenant_id, bucket_id, "docs/", 1, 1024 * 1024, |head| {
-            head.exact_path.ends_with("/b")
-        })
+        .start_current_head_snapshot_scan(
+            tenant_id,
+            bucket_id,
+            "docs/",
+            None,
+            1,
+            1024 * 1024,
+            |head| head.exact_path.ends_with("/b"),
+        )
         .await
         .unwrap();
     let frame = scan.next_frame().await.unwrap().unwrap();
@@ -431,6 +451,47 @@ async fn snapshot_filter_runs_before_bounded_frames_are_emitted() {
     assert_eq!(frame.heads[0].exact_path, "docs/b");
     assert!(scan.next_frame().await.unwrap().is_none());
     assert_eq!(scan.heads_visited(), 2);
+}
+
+#[tokio::test]
+async fn current_head_snapshot_resumes_exclusively_after_canonical_path() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = Store::open(StoreOptions::new(temporary.path(), 1))
+        .await
+        .unwrap();
+    for (ordinal, path) in ["docs/a", "docs/b", "docs/c"].into_iter().enumerate() {
+        put_at(
+            &store,
+            path,
+            path.as_bytes(),
+            &format!("put-{path}"),
+            ordinal as u64 + 1,
+        )
+        .await;
+    }
+    let (tenant_id, bucket_id) = store.resolve_bucket_ids("tenant", "bucket").unwrap();
+    let mut scan = store
+        .start_current_head_snapshot_scan(
+            tenant_id,
+            bucket_id,
+            "docs/",
+            Some("docs/b"),
+            10,
+            1024 * 1024,
+            |_| true,
+        )
+        .await
+        .unwrap();
+    let frame = scan.next_frame().await.unwrap().unwrap();
+    assert_eq!(
+        frame
+            .heads
+            .iter()
+            .map(|head| head.exact_path.as_str())
+            .collect::<Vec<_>>(),
+        ["docs/c"]
+    );
+    assert!(scan.next_frame().await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -465,6 +526,7 @@ async fn enlarged_internal_snapshot_limit_remains_strictly_byte_bounded() {
             tenant_id,
             bucket_id,
             "docs/",
+            None,
             crate::MAX_CURRENT_HEAD_SNAPSHOT_RECORDS,
             max_bytes,
             |_| true,
@@ -541,6 +603,7 @@ async fn dropping_a_broken_stream_stops_the_snapshot_worker() {
             tenant_id,
             bucket_id,
             "docs/",
+            None,
             1,
             1024 * 1024,
             move |_| {

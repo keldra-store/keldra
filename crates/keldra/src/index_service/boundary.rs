@@ -1,7 +1,7 @@
 //! Narrow boundaries between the public index API and the clustered runtime.
 //!
 //! The service owns request validation, definition admission, ordinary-object
-//! lifecycle calls, and opaque page tokens. Local generation execution owns
+//! lifecycle calls, and opaque page tokens. Local revision execution owns
 //! mandatory candidate Zanzibar/exact-current checks through the supplied
 //! visibility boundary; it cannot return a page through optional post-filtering.
 
@@ -68,6 +68,19 @@ impl IndexRequestContext {
     pub(crate) fn remaining(&self) -> Result<std::time::Duration, Status> {
         crate::v05::deadline_remaining(self.deadline)
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RequiredIndexSourceCheckpoint {
+    pub(crate) node_id: u64,
+    pub(crate) source_epoch: [u8; 32],
+    pub(crate) next_offset: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct IndexFreshnessRequirement {
+    pub(crate) sources: Vec<RequiredIndexSourceCheckpoint>,
+    pub(crate) atomic_through: Option<u64>,
 }
 
 /// One definition name returned by a scoped ordinary-object prefix listing.
@@ -176,10 +189,10 @@ pub(crate) struct IndexPageTokenBinding {
 }
 
 /// Mutable cursor evidence carried by a valid page token. A continuation is
-/// always pinned to one immutable generation and one Zanzibar revision.
+/// always pinned to one immutable revision and one Zanzibar revision.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct IndexPageCursor {
-    pub(crate) generation: u64,
+    pub(crate) commit_revision: u64,
     pub(crate) last_position: Vec<u8>,
     pub(crate) authorization_revision: u64,
 }
@@ -217,9 +230,10 @@ pub(crate) struct ExecuteIndexQuery {
     /// Zanzibar revision established by the one definition-admission check for
     /// this execution. It also binds empty results and any continuation token.
     pub(crate) authorization_revision: u64,
-    /// `None` selects the latest published generation. A continuation supplies
-    /// the exact immutable generation and engine-specific last position.
+    /// `None` selects the latest published revision. A continuation supplies
+    /// the exact immutable revision and engine-specific last position.
     pub(crate) resume: Option<IndexPageCursor>,
+    pub(crate) required_freshness: Option<IndexFreshnessRequirement>,
 }
 
 #[derive(Clone, Debug)]

@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 
 use keldra_index::v4::SegmentDescriptor;
 
-use super::super::generation::{LocatorRoot, MAX_LOCATOR_ROOTS_PER_GENERATION};
+use super::super::committed_view::{
+    LocatorRoot, MAX_LOCATOR_ROOTS_PER_COMMIT, MAX_SEGMENTS_PER_COMMIT,
+};
 
 pub(super) const PREFERRED_FAN_IN: usize = 4;
 
@@ -39,16 +41,51 @@ pub(super) struct LocatorDebtSelection {
 }
 
 pub(super) fn select(segments: &[SegmentDescriptor], limits: DebtLimits) -> Option<DebtSelection> {
-    select_summaries(
-        segments.iter().map(|segment| {
+    let summaries = segments
+        .iter()
+        .map(|segment| {
             (
                 segment_size_tier(segment.encoded_bytes),
                 segment.identity.segment_id,
                 segment.encoded_bytes,
             )
-        }),
-        limits,
-    )
+        })
+        .collect::<Vec<_>>();
+    select_summaries(summaries.iter().copied(), limits).or_else(|| {
+        (segments.len() >= MAX_SEGMENTS_PER_COMMIT.saturating_sub(1))
+            .then(|| select_headroom_summaries(summaries))
+            .flatten()
+    })
+}
+
+pub(super) fn select_before_locator_limit(
+    segments: &[SegmentDescriptor],
+    locator_roots: usize,
+    limits: DebtLimits,
+) -> Option<DebtSelection> {
+    (!locator_headroom_requires_compaction(locator_roots))
+        .then(|| select(segments, limits))
+        .flatten()
+}
+
+pub(super) const fn locator_headroom_requires_compaction(locator_roots: usize) -> bool {
+    locator_roots >= MAX_LOCATOR_ROOTS_PER_COMMIT.saturating_sub(1)
+}
+
+fn select_headroom_summaries(
+    summaries: impl IntoIterator<Item = (u8, u64, u64)>,
+) -> Option<DebtSelection> {
+    let mut tiers = BTreeMap::<u8, usize>::new();
+    for (tier, _, _) in summaries {
+        *tiers.entry(tier).or_default() += 1;
+    }
+    tiers
+        .into_iter()
+        .find(|(_, count)| *count >= 2)
+        .map(|(tier, count)| DebtSelection {
+            tier,
+            input_segments: count.min(PREFERRED_FAN_IN),
+        })
 }
 
 /// Power-of-two encoded-size tier. It is derived from immutable descriptor
@@ -81,8 +118,8 @@ fn select_locator_summaries(
     // always has room to enter the in-memory candidate before debt is repaid.
     let maximum_roots = limits
         .maximum_segments
-        .min(MAX_LOCATOR_ROOTS_PER_GENERATION.saturating_sub(1));
-    let count_debt = roots.len() > maximum_roots;
+        .min(MAX_LOCATOR_ROOTS_PER_COMMIT.saturating_sub(1));
+    let count_debt = roots.len() >= maximum_roots;
     let unmerged_bytes = roots
         .iter()
         .skip(1)
@@ -121,6 +158,19 @@ fn select_summaries(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use keldra_index::v4::SegmentIdentity;
+
+    fn segment(id: u64, encoded_bytes: u64) -> SegmentDescriptor {
+        SegmentDescriptor {
+            identity: SegmentIdentity::new(1, 1, [1; 32], id).unwrap(),
+            document_count: 1,
+            live_document_count: 1,
+            packs: Vec::new(),
+            components: Vec::new(),
+            encoded_bytes,
+            logical_bytes: encoded_bytes,
+        }
+    }
 
     #[test]
     fn count_debt_selects_lowest_tier_and_preferred_fan_in() {
@@ -168,6 +218,40 @@ mod tests {
             Some(DebtSelection {
                 tier: 0,
                 input_segments: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn format_headroom_forces_a_merge_before_the_last_slot_is_consumed() {
+        assert_eq!(
+            select_headroom_summaries([(1, 1, 2), (1, 2, 2), (2, 3, 4)]),
+            Some(DebtSelection {
+                tier: 1,
+                input_segments: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn exhausted_locator_headroom_prioritizes_locator_compaction() {
+        let segments = [segment(1, 1), segment(2, 1)];
+
+        assert_eq!(
+            select_before_locator_limit(
+                &segments,
+                MAX_LOCATOR_ROOTS_PER_COMMIT - 1,
+                DebtLimits::maintenance(),
+            ),
+            None
+        );
+        assert_eq!(
+            select_locator_summaries(
+                std::iter::repeat_n(1, MAX_LOCATOR_ROOTS_PER_COMMIT - 1),
+                DebtLimits::new(MAX_LOCATOR_ROOTS_PER_COMMIT, u64::MAX),
+            ),
+            Some(LocatorDebtSelection {
+                input_roots: PREFERRED_FAN_IN,
             })
         );
     }

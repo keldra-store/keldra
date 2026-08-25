@@ -109,7 +109,7 @@ struct EvidenceConfig {
 struct Timings {
     ingest_seconds: f64,
     initial_build_seconds: f64,
-    first_complete_generation_seconds: f64,
+    first_complete_commit_revision_seconds: f64,
     exact_verification_seconds: f64,
     cold_query_milliseconds: f64,
     warm_query_milliseconds: f64,
@@ -138,8 +138,8 @@ struct QualificationReport {
     observed_peak_anonymous_growth_bytes: Option<u64>,
     accepted_objects_per_second: f64,
     source_complete_objects_per_second: f64,
-    initial_generation: u64,
-    final_generation: u64,
+    initial_commit_revision: u64,
+    final_commit_revision: u64,
     timings: Timings,
     production_query_regression: incident::IncidentReport,
     resources: Option<ResourceReport>,
@@ -228,7 +228,7 @@ struct TimerBoundaryEvidence {
     clock: &'static str,
     ingest_seconds: TimerBoundary,
     initial_build_seconds: TimerBoundary,
-    first_complete_generation_seconds: TimerBoundary,
+    first_complete_commit_revision_seconds: TimerBoundary,
     exact_verification_seconds: TimerBoundary,
     cold_query_milliseconds: TimerBoundary,
     warm_query_milliseconds: TimerBoundary,
@@ -239,7 +239,7 @@ struct TimerBoundaryEvidence {
 #[derive(Debug, Clone, Serialize)]
 struct CorrectnessEvidence {
     result: &'static str,
-    source_complete_generation_observed: bool,
+    source_complete_commit_revision_observed: bool,
     source_complete_sources_observed: usize,
     initial_exact_partition_verification: bool,
     final_exact_partition_verification: bool,
@@ -256,7 +256,7 @@ struct VerificationState {
     bucket: String,
     records: u64,
     final_live_objects: u64,
-    final_generation: u64,
+    final_commit_revision: u64,
     final_result_sha256: String,
     source_count: usize,
 }
@@ -313,7 +313,7 @@ async fn main() -> Result<()> {
     // one-hour qualification deadline.
     token = qualification_token(&config, channels[0].clone()).await?;
     index = index_client(channels[0].clone(), &token)?;
-    let baseline = wait_for_generation(&mut index, &config.bucket, 0, None, None).await?;
+    let baseline = wait_for_commit_revision(&mut index, &config.bucket, 0, None, None).await?;
     token = qualification_token(&config, channels[0].clone()).await?;
     let monitor = ResourceMonitor::start(
         &config.resource_pids,
@@ -325,7 +325,7 @@ async fn main() -> Result<()> {
     let mut timings = Timings::default();
     set_phase(&monitor, Phase::Ingest);
     // This starts before the first request, so the measured time to a complete
-    // generation is conservatively no shorter than the RFC's first-accepted
+    // commit_revision is conservatively no shorter than the RFC's first-accepted
     // object boundary.
     let first_object_started = Instant::now();
     let started = first_object_started;
@@ -359,26 +359,26 @@ async fn main() -> Result<()> {
     index = index_client(channels[0].clone(), &token)?;
     set_phase(&monitor, Phase::InitialBuild);
     let started = Instant::now();
-    let initial_response = wait_for_generation(
+    let initial_response = wait_for_commit_revision(
         &mut index,
         &config.bucket,
-        baseline.generation(),
+        baseline.commit_revision(),
         Some(data::partition_paths(config.records, 7).len()),
         Some(config.endpoints.len()),
     )
     .await?;
     timings.initial_build_seconds = started.elapsed().as_secs_f64();
-    timings.first_complete_generation_seconds = first_object_started.elapsed().as_secs_f64();
-    let initial_ready_generation = freshness(&initial_response)?.generation;
-    let source_complete_generation_observed =
+    timings.first_complete_commit_revision_seconds = first_object_started.elapsed().as_secs_f64();
+    let initial_ready_commit_revision = freshness(&initial_response)?.commit_revision;
+    let source_complete_commit_revision_observed =
         source_complete_freshness(freshness(&initial_response)?, config.endpoints.len());
     ensure!(
-        source_complete_generation_observed,
-        "first complete generation did not prove zero lag for every source"
+        source_complete_commit_revision_observed,
+        "first complete commit_revision did not prove zero lag for every source"
     );
     let accepted_objects_per_second = config.records as f64 / timings.ingest_seconds;
     let source_complete_objects_per_second =
-        config.records as f64 / timings.first_complete_generation_seconds;
+        config.records as f64 / timings.first_complete_commit_revision_seconds;
     if config.require_performance_targets {
         ensure!(
             accepted_objects_per_second >= MIN_RELEASE_INGEST_OBJECTS_PER_SECOND,
@@ -419,7 +419,7 @@ async fn main() -> Result<()> {
     index = index_client(channels[0].clone(), &token)?;
     set_phase(&monitor, Phase::WarmQuery);
     let started = Instant::now();
-    let (initial_count, initial_generation, _) = verify_every_partition(
+    let (initial_count, initial_commit_revision, _) = verify_every_partition(
         &index,
         &config.bucket,
         config.records,
@@ -431,7 +431,7 @@ async fn main() -> Result<()> {
     .await?;
     timings.exact_verification_seconds = started.elapsed().as_secs_f64();
     ensure!(initial_count == config.records);
-    ensure!(initial_generation >= initial_ready_generation);
+    ensure!(initial_commit_revision >= initial_ready_commit_revision);
 
     // Mutation receives its own fresh access token. The independently bounded
     // incremental polling and verification loops renew again below.
@@ -475,17 +475,17 @@ async fn main() -> Result<()> {
     set_phase(&monitor, Phase::IncrementalBuild);
     let started = Instant::now();
     let final_live = config.records - deleted.len() as u64;
-    let _final_ready = wait_for_generation(
+    let _final_ready = wait_for_commit_revision(
         &mut index,
         &config.bucket,
-        initial_generation,
+        initial_commit_revision,
         None,
         Some(config.endpoints.len()),
     )
     .await?;
     token = qualification_token(&config, channels[0].clone()).await?;
     index = index_client(channels[0].clone(), &token)?;
-    let (final_count, final_generation, final_result_sha256) = verify_every_partition(
+    let (final_count, final_commit_revision, final_result_sha256) = verify_every_partition(
         &index,
         &config.bucket,
         config.records,
@@ -533,10 +533,10 @@ async fn main() -> Result<()> {
     let evidence = qualification_evidence(
         &config,
         initial_corpus_sha256,
-        source_complete_generation_observed,
+        source_complete_commit_revision_observed,
     )?;
     let report = QualificationReport {
-        schema: "keldra.index-resource-qualification.v1",
+        schema: "keldra.index-resource-qualification.v2",
         records: config.records,
         indexed_fields: data::FIELD_COUNT,
         partitions: PARTITION_COUNT,
@@ -555,8 +555,8 @@ async fn main() -> Result<()> {
         observed_peak_anonymous_growth_bytes,
         accepted_objects_per_second,
         source_complete_objects_per_second,
-        initial_generation,
-        final_generation,
+        initial_commit_revision,
+        final_commit_revision,
         timings,
         production_query_regression,
         resources,
@@ -564,12 +564,12 @@ async fn main() -> Result<()> {
     };
     if let Some(path) = &config.state_output {
         let state = VerificationState {
-            schema: "keldra.index-resource-verification.v1".into(),
+            schema: "keldra.index-resource-verification.v2".into(),
             tenant: config.tenant.to_string(),
             bucket: config.bucket.to_string(),
             records: config.records,
             final_live_objects: final_live,
-            final_generation,
+            final_commit_revision,
             final_result_sha256,
             source_count: config.endpoints.len(),
         };
@@ -796,7 +796,7 @@ impl EvidenceConfig {
 fn qualification_evidence(
     config: &Config,
     initial_corpus_sha256: String,
-    source_complete_generation_observed: bool,
+    source_complete_commit_revision_observed: bool,
 ) -> Result<QualificationEvidence> {
     let builder_memory_bytes_per_kind_per_node = config
         .configured_kind_budget_bytes
@@ -871,15 +871,15 @@ fn qualification_evidence(
             },
             initial_build_seconds: TimerBoundary {
                 starts: "immediately before polling after every initial BulkWrite receipt is accepted",
-                stops: "when one generation proves zero lag through the observed tail of every topology source",
+                stops: "when one commit_revision proves zero lag through the observed tail of every topology source",
             },
-            first_complete_generation_seconds: TimerBoundary {
+            first_complete_commit_revision_seconds: TimerBoundary {
                 starts: "immediately before the first initial BulkWrite request",
-                stops: "when one generation proves zero lag through the observed tail of every topology source",
+                stops: "when one commit_revision proves zero lag through the observed tail of every topology source",
             },
             exact_verification_seconds: TimerBoundary {
                 starts: "before initial exact partition verification",
-                stops: "after one complete generation exactly matches every initial object",
+                stops: "after one complete commit_revision exactly matches every initial object",
             },
             cold_query_milliseconds: TimerBoundary {
                 starts: "immediately before the first representative query request",
@@ -895,12 +895,12 @@ fn qualification_evidence(
             },
             incremental_build_seconds: TimerBoundary {
                 starts: "immediately before polling after every update and delete receipt is accepted",
-                stops: "after a newer complete generation passes exact final verification",
+                stops: "after a newer complete commit_revision passes exact final verification",
             },
         },
         correctness: CorrectnessEvidence {
             result: "pass",
-            source_complete_generation_observed,
+            source_complete_commit_revision_observed,
             source_complete_sources_observed: config.endpoints.len(),
             initial_exact_partition_verification: true,
             final_exact_partition_verification: true,
@@ -1124,10 +1124,10 @@ fn command_id(mode: MutationMode, record_id: u64) -> String {
     format!("v06-resource-{label}-{record_id}")
 }
 
-async fn wait_for_generation(
+async fn wait_for_commit_revision(
     client: &mut IndexClient,
     bucket: &str,
-    after_generation: u64,
+    after_commit_revision: u64,
     expected_partition_hits: Option<usize>,
     expected_complete_sources: Option<usize>,
 ) -> Result<QueryIndexResponse> {
@@ -1135,16 +1135,20 @@ async fn wait_for_generation(
     loop {
         match query_partition(client, bucket, FRESHNESS_PROBE_PARTITION).await {
             Ok(probe)
-                if generation_is_ready(&probe, after_generation, expected_complete_sources) =>
+                if commit_revision_is_ready(
+                    &probe,
+                    after_commit_revision,
+                    expected_complete_sources,
+                ) =>
             {
                 let Some(expected_hits) = expected_partition_hits else {
                     return Ok(probe);
                 };
                 match query_partition(client, bucket, 7).await {
                     Ok(response) => {
-                        if generation_is_ready(
+                        if commit_revision_is_ready(
                             &response,
-                            after_generation,
+                            after_commit_revision,
                             expected_complete_sources,
                         ) {
                             ensure_expected_partition_hits(&response, 7, expected_hits)?;
@@ -1160,19 +1164,19 @@ async fn wait_for_generation(
             Err(error) => return Err(error),
         }
         if Instant::now() >= deadline {
-            bail!("index generation did not become ready within {BUILD_TIMEOUT:?}");
+            bail!("index commit_revision did not become ready within {BUILD_TIMEOUT:?}");
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 
-fn generation_is_ready(
+fn commit_revision_is_ready(
     response: &QueryIndexResponse,
-    after_generation: u64,
+    after_commit_revision: u64,
     expected_complete_sources: Option<usize>,
 ) -> bool {
     freshness(response).is_ok_and(|value| {
-        value.generation > after_generation
+        value.commit_revision > after_commit_revision
             && value.initial_build_complete
             && !value.rebuilding
             && expected_complete_sources
@@ -1187,8 +1191,8 @@ fn ensure_expected_partition_hits(
 ) -> Result<()> {
     ensure!(
         response.hits.len() == expected_hits,
-        "ready index generation {} returned {} hits for partition {partition}, expected {expected_hits}",
-        response.generation(),
+        "ready index commit_revision {} returned {} hits for partition {partition}, expected {expected_hits}",
+        response.commit_revision(),
         response.hits.len(),
     );
     Ok(())
@@ -1206,7 +1210,7 @@ async fn verify_every_partition(
     let deadline = Instant::now() + EXACT_VERIFICATION_TIMEOUT;
     loop {
         let mut count = 0u64;
-        let mut generation = None;
+        let mut commit_revision = None;
         let mut partition_digests = BTreeMap::new();
         let mut complete = true;
         let mut next_partition = 0;
@@ -1232,12 +1236,12 @@ async fn verify_every_partition(
                 }
                 Err(error) => return Err(error),
             };
-            let response_generation = freshness(&response)?.generation;
-            if generation.is_some_and(|value| value != response_generation) {
+            let response_commit_revision = freshness(&response)?.commit_revision;
+            if commit_revision.is_some_and(|value| value != response_commit_revision) {
                 complete = false;
                 break;
             }
-            generation = Some(response_generation);
+            commit_revision = Some(response_commit_revision);
             match validate_partition_response(
                 &response,
                 records,
@@ -1273,7 +1277,7 @@ async fn verify_every_partition(
         if complete && count == expected {
             return Ok((
                 count,
-                generation.context("verification returned no generation")?,
+                commit_revision.context("verification returned no commit_revision")?,
                 qualification_result_digest(&partition_digests)?,
             ));
         }
@@ -1293,7 +1297,7 @@ async fn verify_existing_state(path: &Path) -> Result<()> {
     )
     .with_context(|| format!("parse qualification state {}", path.display()))?;
     ensure!(
-        state.schema == "keldra.index-resource-verification.v1",
+        state.schema == "keldra.index-resource-verification.v2",
         "unsupported qualification state schema"
     );
     ensure!(state.records > 0, "qualification state has no records");
@@ -1302,8 +1306,8 @@ async fn verify_existing_state(path: &Path) -> Result<()> {
         "qualification state has more live objects than records"
     );
     ensure!(
-        state.final_generation > 0,
-        "qualification state has no final generation"
+        state.final_commit_revision > 0,
+        "qualification state has no final commit_revision"
     );
     ensure!(state.source_count > 0, "qualification state has no sources");
     validate_sha256(&state.final_result_sha256)?;
@@ -1343,7 +1347,7 @@ async fn verify_existing_state(path: &Path) -> Result<()> {
                 .with_context(|| format!("credential exchange through {endpoint} failed"))?
                 .access_token;
         let index = index_client(channel, &token)?;
-        let (count, generation, digest) = digest_every_partition(
+        let (count, commit_revision, digest) = digest_every_partition(
             &index,
             &state.bucket,
             state.records,
@@ -1358,15 +1362,15 @@ async fn verify_existing_state(path: &Path) -> Result<()> {
             "resource index live-object count changed through {endpoint}"
         );
         ensure!(
-            generation >= state.final_generation,
-            "resource index generation regressed through {endpoint}"
+            commit_revision >= state.final_commit_revision,
+            "resource index commit_revision regressed through {endpoint}"
         );
         ensure!(
             digest == state.final_result_sha256,
             "resource index result digest changed through {endpoint}"
         );
         println!(
-            "verified resource index through {endpoint}: generation={generation} objects={count} digest={digest}"
+            "verified resource index through {endpoint}: commit_revision={commit_revision} objects={count} digest={digest}"
         );
     }
     Ok(())
@@ -1383,7 +1387,7 @@ async fn digest_every_partition(
     let deadline = Instant::now() + EXACT_VERIFICATION_TIMEOUT;
     loop {
         let mut count = 0u64;
-        let mut generation = None;
+        let mut commit_revision = None;
         let mut partition_digests = BTreeMap::new();
         let mut complete = true;
         let mut next_partition = 0;
@@ -1414,12 +1418,12 @@ async fn digest_every_partition(
             if !response_freshness.initial_build_complete
                 || response_freshness.rebuilding
                 || !source_complete_freshness(response_freshness, expected_sources)
-                || generation.is_some_and(|value| value != response_freshness.generation)
+                || commit_revision.is_some_and(|value| value != response_freshness.commit_revision)
             {
                 complete = false;
                 break;
             }
-            generation = Some(response_freshness.generation);
+            commit_revision = Some(response_freshness.commit_revision);
             match validate_digest_partition_response(&response, records, partition) {
                 Ok((partition_count, partition_digest)) => {
                     count += partition_count;
@@ -1447,7 +1451,7 @@ async fn digest_every_partition(
         if complete && count == expected_objects {
             return Ok((
                 count,
-                generation.context("verification returned no generation")?,
+                commit_revision.context("verification returned no commit_revision")?,
                 qualification_result_digest(&partition_digests)?,
             ));
         }
@@ -1614,6 +1618,7 @@ async fn query_partition(
             limit: QUERY_LIMIT,
             page_token: Vec::new(),
             tenant: String::new(),
+            required_freshness: None,
         })
         .await
         .map(tonic::Response::into_inner)
@@ -1745,13 +1750,15 @@ fn boolean(name: &str, default: bool) -> Result<bool> {
     }
 }
 
-trait GenerationResponse {
-    fn generation(&self) -> u64;
+trait CommitRevisionResponse {
+    fn commit_revision(&self) -> u64;
 }
 
-impl GenerationResponse for QueryIndexResponse {
-    fn generation(&self) -> u64 {
-        self.freshness.as_ref().map_or(0, |value| value.generation)
+impl CommitRevisionResponse for QueryIndexResponse {
+    fn commit_revision(&self) -> u64 {
+        self.freshness
+            .as_ref()
+            .map_or(0, |value| value.commit_revision)
     }
 }
 
@@ -1882,7 +1889,7 @@ mod tests {
     }
 
     #[test]
-    fn readiness_requires_a_new_complete_zero_lag_generation() {
+    fn readiness_requires_a_new_complete_zero_lag_commit_revision() {
         let source = IndexSourceFreshness {
             node_id: 1,
             source_epoch: vec![1; 32],
@@ -1892,7 +1899,7 @@ mod tests {
         };
         let mut response = QueryIndexResponse {
             freshness: Some(IndexFreshness {
-                generation: 2,
+                commit_revision: 2,
                 initial_build_complete: true,
                 rebuilding: false,
                 sources: vec![source],
@@ -1901,19 +1908,19 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(generation_is_ready(&response, 1, Some(1)));
-        assert!(!generation_is_ready(&response, 2, Some(1)));
-        assert!(!generation_is_ready(&response, 1, Some(2)));
+        assert!(commit_revision_is_ready(&response, 1, Some(1)));
+        assert!(!commit_revision_is_ready(&response, 2, Some(1)));
+        assert!(!commit_revision_is_ready(&response, 1, Some(2)));
 
         response.freshness.as_mut().unwrap().sources[0].lag_hint = 1;
-        assert!(!generation_is_ready(&response, 1, Some(1)));
+        assert!(!commit_revision_is_ready(&response, 1, Some(1)));
     }
 
     #[test]
     fn ready_partition_with_wrong_cardinality_fails_immediately() {
         let mut response = QueryIndexResponse {
             freshness: Some(IndexFreshness {
-                generation: 9,
+                commit_revision: 9,
                 ..Default::default()
             }),
             ..Default::default()
@@ -1924,7 +1931,7 @@ mod tests {
         let error = ensure_expected_partition_hits(&response, 7, 2).unwrap_err();
         assert_eq!(
             error.to_string(),
-            "ready index generation 9 returned 1 hits for partition 7, expected 2"
+            "ready index commit_revision 9 returned 1 hits for partition 7, expected 2"
         );
     }
 

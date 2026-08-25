@@ -327,6 +327,7 @@ impl Store {
                 blob_identity: key,
                 revision: retired.updated_at,
                 reference_deltas: Vec::new(),
+                accounting_transition: None,
             }],
             LocalReferenceEffects::NoReferenceEffects,
         )?;

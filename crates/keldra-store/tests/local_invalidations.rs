@@ -296,7 +296,7 @@ async fn public_watch_hides_reserved_segments_and_advances_its_checkpoint() {
 }
 
 #[tokio::test]
-async fn entry_retention_prunes_in_the_head_batch_and_expires_stale_tokens() {
+async fn capacity_retention_prunes_before_retry_and_expires_stale_tokens() {
     let temporary = tempfile::tempdir().unwrap();
     let store = Store::open(
         StoreOptions::new(temporary.path(), 1)
@@ -315,9 +315,10 @@ async fn entry_retention_prunes_in_the_head_batch_and_expires_stale_tokens() {
             .await
             .unwrap();
     }
-    // A one-node mutation applies its reference effects in the same durable
-    // batch, so the reference-safe cut advances without a delivery worker and
-    // the third put can prune offset 1 atomically.
+    // A one-node mutation applies its reference effects inline. Capacity
+    // retirement remains a separate proof-backed durable pass before the
+    // unchanged third put is retried.
+    store.wait_for_mutation_capacity().await;
     store.put(put("c", b"c", "c")).await.unwrap();
 
     let status = store.local_watch_status().unwrap();
@@ -450,6 +451,7 @@ async fn safe_through_cursor_is_monotonic_bounded_and_reconstructed_fail_closed(
         .advance_source_journal_reference_safe_through(0)
         .await
         .unwrap();
+    store.wait_for_mutation_capacity().await;
     store.put(put("c", b"c", "c")).await.unwrap();
     assert_eq!(store.local_watch_status().unwrap().retention_floor, 1);
 
@@ -468,6 +470,7 @@ async fn safe_through_cursor_is_monotonic_bounded_and_reconstructed_fail_closed(
         .advance_source_journal_reference_safe_through(2)
         .await
         .unwrap();
+    reopened.wait_for_mutation_capacity().await;
     reopened.put(put("d", b"d", "d")).await.unwrap();
 }
 

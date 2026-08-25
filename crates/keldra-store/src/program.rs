@@ -12,13 +12,14 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::key::BucketIdentity;
+use crate::model::{MUTATION_STAMP_FORMAT, MutationStamp};
 use crate::store::{
     CF_HEADS, CF_METADATA, CF_VERSIONS, LocalReferenceEffects, PendingBlobReferences,
-    PendingLocalChange, VERSION_HIGH_WATERMARK_KEY, is_program_definition_path, now_unix_millis,
-    version_blob_reference, version_key,
+    PendingLocalChange, StoredVersion, StoredVersionRetention, VERSION_HIGH_WATERMARK_KEY,
+    is_program_definition_path, now_unix_millis, version_blob_reference, version_key,
 };
 use crate::{
-    AccountingHeadTransition, BlobRef, Head, MutationError, ObjectKey, ObjectVersioning,
+    AccountingHeadTransition, BlobRef, Head, MutationError, ObjectKey, ObjectMutationContext,
     ReferenceDelta, Store, Version, VersionId,
 };
 
@@ -38,6 +39,7 @@ pub use distributed::{
 const PREPARED_BUNDLE_FORMAT: u16 = 4;
 const DURABILITY_EVIDENCE_FORMAT: u16 = 1;
 const APPLIED_PROGRAM_COMMIT_KEY: &[u8] = b"applied_program_commit";
+const ATOMIC_BATCH_PUBLISHED_KEY: &[u8] = b"atomic_batch_published";
 const LOCAL_DURABILITY_CLASS: &str = "local";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -269,6 +271,96 @@ pub struct AppliedProgramCommit {
     pub durability_evidence_hash: ProgramDurabilityEvidenceHash,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct AtomicBatchPublicationMarker {
+    cursor: u64,
+    bundle_hash: PreparedBundleHash,
+}
+
+/// A complete atomic delivery unit whose descriptors have been proven to be
+/// the exact writes in one sealed prepared bundle.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SealedAtomicBatchPublication {
+    cursor: u64,
+    bundle_hash: PreparedBundleHash,
+    affected_routes: Vec<crate::AtomicBatchRoute>,
+    mutations: Vec<crate::AtomicBatchMutation>,
+}
+
+impl SealedAtomicBatchPublication {
+    pub fn from_prepared(
+        cursor: u64,
+        bundle_ref: PreparedBundleRef,
+        bundle_hash: PreparedBundleHash,
+        record: &PreparedProgramRecord,
+        stages: &[ProgramPathStage],
+        finalized: &[ProgramPathMutation],
+    ) -> Result<Self, ProgramStoreError> {
+        validate_prepared_record(record)?;
+        let encoded = serde_json::to_vec(record).map_err(program_storage_error)?;
+        if cursor == 0
+            || bundle_ref.length != encoded.len() as u64
+            || bundle_ref.hash != bundle_hash.0
+            || *blake3::hash(&encoded).as_bytes() != bundle_ref.hash
+            || stages.len() != record.writes.len()
+            || finalized.len() != stages.len()
+        {
+            return Err(ProgramStoreError::PreparedBundleMismatch);
+        }
+        for ((stage, mutation), write) in stages.iter().zip(finalized).zip(&record.writes) {
+            stage.validate()?;
+            mutation.validate()?;
+            if stage.bundle_hash != bundle_hash
+                || stage.program_hash != record.program_hash
+                || stage.path != write.path
+                || stage.expected != write.expected
+                || stage.previous_version != write.previous_version
+                || stage.version != write.version
+                || mutation.commit_cursor != cursor
+                || mutation.stage != *stage
+            {
+                return Err(ProgramStoreError::PreparedBundleMismatch);
+            }
+        }
+        let (affected_routes, mutations) = atomic_batch_descriptors(finalized);
+        let publication = Self {
+            cursor,
+            bundle_hash,
+            affected_routes,
+            mutations,
+        };
+        publication.validate_bound()?;
+        Ok(publication)
+    }
+
+    fn validate_bound(&self) -> Result<(), ProgramStoreError> {
+        if self.mutations.is_empty() && self.affected_routes.is_empty() {
+            return Ok(());
+        }
+        let event = crate::LocalChange::atomic_batch_published(
+            u64::MAX,
+            self.cursor,
+            self.bundle_hash,
+            self.affected_routes.clone(),
+            self.mutations.clone(),
+        );
+        let crate::LocalChange::AtomicBatchPublished(batch) = &event else {
+            unreachable!("atomic constructor returned another change kind");
+        };
+        batch
+            .validate()
+            .map_err(|message| ProgramStoreError::InvalidBundle(message.into()))?;
+        let bytes = crate::watch::encoded_change_len(&event).map_err(program_storage_error)?;
+        if bytes > crate::MAX_ATOMIC_BATCH_PUBLISHED_BYTES {
+            return Err(ProgramStoreError::InvalidBundle(format!(
+                "atomic batch publication requires {bytes} bytes; maximum is {}",
+                crate::MAX_ATOMIC_BATCH_PUBLISHED_BYTES
+            )));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct CommittedProgramResult {
     pub receipt: CommandReceipt,
@@ -327,6 +419,15 @@ pub enum ProgramStoreError {
     ExecutorLocalDurability,
     #[error("source journal capacity is exhausted before required consumers are durable")]
     SourceJournalCapacity,
+    #[error(
+        "one atomic source-journal transition requires {entries} records and {bytes} bytes, exceeding the configured bounds of {maximum_entries} records and {maximum_bytes} bytes"
+    )]
+    SourceJournalTransitionTooLarge {
+        entries: u64,
+        bytes: u64,
+        maximum_entries: u64,
+        maximum_bytes: u64,
+    },
     #[error("storage error: {0}")]
     Storage(String),
 }
@@ -446,7 +547,8 @@ impl StateReader for Store {
                             .map_err(|error| error.to_string())?
                             .ok_or_else(|| "head references a missing version".to_owned())
                             .and_then(|encoded| {
-                                serde_json::from_slice::<Version>(&encoded)
+                                StoredVersion::decode(&encoded)
+                                    .map(|stored| stored.version)
                                     .map_err(|error| error.to_string())
                             })?,
                     ),
@@ -640,7 +742,180 @@ fn validate_prepared_record(record: &StoredPreparedBundle) -> Result<(), Program
             ));
         }
     }
+    validate_atomic_delivery_bound(record)?;
     Ok(())
+}
+
+fn validate_atomic_delivery_bound(record: &StoredPreparedBundle) -> Result<(), ProgramStoreError> {
+    if record.writes.is_empty() {
+        return Ok(());
+    }
+    if record.writes.len() > crate::MAX_ATOMIC_BATCH_MUTATIONS {
+        return Err(ProgramStoreError::InvalidBundle(format!(
+            "atomic batch has {} writes; maximum is {}",
+            record.writes.len(),
+            crate::MAX_ATOMIC_BATCH_MUTATIONS
+        )));
+    }
+    let mut affected_routes = Vec::with_capacity(record.writes.len());
+    let mut mutations = Vec::with_capacity(record.writes.len());
+    for (index, write) in record.writes.iter().enumerate() {
+        let ordinal = u64::try_from(index).map_err(|_| {
+            ProgramStoreError::InvalidBundle("atomic batch write count is exhausted".into())
+        })?;
+        let tenant_id = u64::MAX.checked_sub(ordinal).ok_or_else(|| {
+            ProgramStoreError::InvalidBundle("atomic batch route identity is exhausted".into())
+        })?;
+        affected_routes.push(crate::AtomicBatchRoute {
+            tenant_id,
+            bucket_id: u64::MAX,
+        });
+        mutations.push(crate::AtomicBatchMutation {
+            tenant_id,
+            bucket_id: u64::MAX,
+            exact_path: write.path.path.clone(),
+            path_version: VersionId(u64::MAX),
+            // `false` is the longer JSON spelling and therefore conservative.
+            deleted: false,
+            source_id: crate::SourceId {
+                node_id: u16::MAX,
+                source_epoch: [u8::MAX; 32],
+            },
+            source_journal_position: u64::MAX,
+        });
+    }
+    affected_routes.sort_unstable();
+    mutations.sort_unstable();
+    let event = crate::LocalChange::atomic_batch_published(
+        u64::MAX,
+        u64::MAX,
+        PreparedBundleHash([u8::MAX; 32]),
+        affected_routes,
+        mutations,
+    );
+    let bytes = crate::watch::encoded_change_len(&event).map_err(program_storage_error)?;
+    if bytes > crate::MAX_ATOMIC_BATCH_PUBLISHED_BYTES {
+        return Err(ProgramStoreError::InvalidBundle(format!(
+            "atomic batch publication requires at most {bytes} bytes; maximum is {}",
+            crate::MAX_ATOMIC_BATCH_PUBLISHED_BYTES
+        )));
+    }
+    Ok(())
+}
+
+fn conservative_atomic_source_journal_changes(
+    source: &AtomicWriteBundle,
+) -> Result<Vec<crate::LocalChange>, ProgramStoreError> {
+    if source.writes.is_empty() {
+        return Ok(Vec::new());
+    }
+    if source.writes.len() > crate::MAX_ATOMIC_BATCH_MUTATIONS {
+        return Err(ProgramStoreError::InvalidBundle(format!(
+            "atomic batch has {} writes; maximum is {}",
+            source.writes.len(),
+            crate::MAX_ATOMIC_BATCH_MUTATIONS
+        )));
+    }
+    let capacity = source.writes.len().checked_add(1).ok_or_else(|| {
+        ProgramStoreError::InvalidBundle("atomic batch count is exhausted".into())
+    })?;
+    let mut changes = Vec::with_capacity(capacity);
+    let mut routes = Vec::with_capacity(source.writes.len());
+    let mut mutations = Vec::with_capacity(source.writes.len());
+    for (index, write) in source.writes.iter().enumerate() {
+        let ordinal = u64::try_from(index).map_err(|_| {
+            ProgramStoreError::InvalidBundle("atomic batch write count is exhausted".into())
+        })?;
+        let tenant_id = u64::MAX.checked_sub(ordinal).ok_or_else(|| {
+            ProgramStoreError::InvalidBundle("atomic batch route identity is exhausted".into())
+        })?;
+        let bucket_id = u64::MAX;
+        let reference = BlobRef {
+            hash: [u8::MAX; 32],
+            length: u64::MAX,
+        };
+        changes.push(crate::LocalChange::object_head_with_program_cursor(
+            u64::MAX,
+            tenant_id,
+            bucket_id,
+            write.path.path.clone(),
+            VersionId(u64::MAX),
+            false,
+            Some(u64::MAX),
+            vec![
+                ReferenceDelta {
+                    blob: reference.clone(),
+                    change: i64::MIN,
+                },
+                ReferenceDelta {
+                    blob: reference,
+                    change: i64::MAX,
+                },
+            ],
+            Some(AccountingHeadTransition::new(
+                Some(u64::MAX),
+                Some(u64::MAX),
+            )),
+            None,
+        ));
+        routes.push(crate::AtomicBatchRoute {
+            tenant_id,
+            bucket_id,
+        });
+        mutations.push(crate::AtomicBatchMutation {
+            tenant_id,
+            bucket_id,
+            exact_path: write.path.path.clone(),
+            path_version: VersionId(u64::MAX),
+            deleted: false,
+            source_id: crate::SourceId {
+                node_id: u16::MAX,
+                source_epoch: [u8::MAX; 32],
+            },
+            source_journal_position: u64::MAX,
+        });
+    }
+    routes.sort_unstable();
+    mutations.sort_unstable();
+    changes.push(crate::LocalChange::atomic_batch_published(
+        u64::MAX,
+        u64::MAX,
+        PreparedBundleHash([u8::MAX; 32]),
+        routes,
+        mutations,
+    ));
+    Ok(changes)
+}
+
+fn atomic_batch_descriptors(
+    finalized: &[ProgramPathMutation],
+) -> (
+    Vec<crate::AtomicBatchRoute>,
+    Vec<crate::AtomicBatchMutation>,
+) {
+    let mut affected_routes = finalized
+        .iter()
+        .map(|mutation| crate::AtomicBatchRoute {
+            tenant_id: mutation.stage.tenant_id,
+            bucket_id: mutation.stage.bucket_id,
+        })
+        .collect::<Vec<_>>();
+    affected_routes.sort_unstable();
+    affected_routes.dedup();
+    let mut mutations = finalized
+        .iter()
+        .map(|mutation| crate::AtomicBatchMutation {
+            tenant_id: mutation.stage.tenant_id,
+            bucket_id: mutation.stage.bucket_id,
+            exact_path: mutation.stage.path.path.clone(),
+            path_version: mutation.stage.version.id,
+            deleted: mutation.stage.version.deleted,
+            source_id: mutation.stamp.source_id,
+            source_journal_position: mutation.stamp.source_journal_position,
+        })
+        .collect::<Vec<_>>();
+    mutations.sort_unstable();
+    (affected_routes, mutations)
 }
 
 fn validate_observed_head(head: &ObservedHead) -> Result<(), ProgramStoreError> {
@@ -789,6 +1064,17 @@ fn program_storage_error(error: impl std::fmt::Display) -> ProgramStoreError {
 fn program_mutation_error(error: MutationError) -> ProgramStoreError {
     match error {
         MutationError::SourceJournalCapacity => ProgramStoreError::SourceJournalCapacity,
+        MutationError::SourceJournalTransitionTooLarge {
+            entries,
+            bytes,
+            maximum_entries,
+            maximum_bytes,
+        } => ProgramStoreError::SourceJournalTransitionTooLarge {
+            entries,
+            bytes,
+            maximum_entries,
+            maximum_bytes,
+        },
         other => ProgramStoreError::Storage(other.to_string()),
     }
 }
@@ -803,6 +1089,7 @@ impl Store {
         lease: ProgramExecutionLease,
         prepared: &PreparedProgramBundle,
         commit: ProgramCommit,
+        mutation_context: ObjectMutationContext,
     ) -> Result<CommittedProgramResult, ProgramStoreError> {
         let result = async {
             let source = lease.bundle();
@@ -837,7 +1124,7 @@ impl Store {
                     self.match_applied_commit(&existing, &commit)?;
                     Ok(committed_result(&loaded.record))
                 } else {
-                    self.apply_prepared_record(&loaded, &commit)
+                    self.apply_prepared_record(&loaded, &commit, mutation_context)
                 };
                 drop(commit_guard);
                 match attempt {
@@ -857,6 +1144,7 @@ impl Store {
     pub async fn recover_program_bundle(
         &self,
         commit: ProgramCommit,
+        mutation_context: ObjectMutationContext,
     ) -> Result<CommittedProgramResult, ProgramStoreError> {
         let _policy_guard = self.policy_gate.read().await;
         if let Some(existing) = self.applied_program_commit()?
@@ -897,7 +1185,7 @@ impl Store {
                 self.match_applied_commit(&existing, &commit)?;
                 Ok(committed_result(&loaded.record))
             } else {
-                self.apply_prepared_record(&loaded, &commit)
+                self.apply_prepared_record(&loaded, &commit, mutation_context)
             };
             drop(commit_guard);
             match attempt {
@@ -937,6 +1225,70 @@ impl Store {
         Ok(self
             .applied_program_commit()?
             .map(|applied| applied.commit_cursor))
+    }
+
+    /// Publish the one complete derived-consumer delivery unit after every
+    /// distributed path has reached its durability quorum. The compact marker
+    /// and source-journal record share one synced RocksDB batch, making retry
+    /// idempotent without retaining a second event stream.
+    pub async fn publish_atomic_batch(
+        &self,
+        publication: SealedAtomicBatchPublication,
+    ) -> Result<bool, ProgramStoreError> {
+        publication.validate_bound()?;
+        if publication.mutations.is_empty() {
+            return Ok(false);
+        }
+        let cursor = publication.cursor;
+        let bundle_hash = publication.bundle_hash;
+        let expected = AtomicBatchPublicationMarker {
+            cursor,
+            bundle_hash,
+        };
+        loop {
+            let _commit_guard = self.commit_lock.lock().await;
+            if let Some(existing) = self.read_program_json::<AtomicBatchPublicationMarker>(
+                CF_METADATA,
+                ATOMIC_BATCH_PUBLISHED_KEY,
+            )? {
+                if existing == expected {
+                    return Ok(false);
+                }
+                if existing.cursor >= cursor {
+                    return Err(ProgramStoreError::CommitCorruption { cursor });
+                }
+            }
+
+            let mut batch = WriteBatch::default();
+            let pending = PendingLocalChange::AtomicBatchPublished {
+                cursor,
+                bundle_hash,
+                affected_routes: publication.affected_routes.clone(),
+                mutations: publication.mutations.clone(),
+            };
+            let attempt = self.stage_local_changes(
+                &mut batch,
+                &[pending],
+                LocalReferenceEffects::NoReferenceEffects,
+            );
+            match attempt {
+                Ok(()) => {
+                    batch.put_cf(
+                        self.program_cf(CF_METADATA)?,
+                        ATOMIC_BATCH_PUBLISHED_KEY,
+                        serde_json::to_vec(&expected).map_err(program_storage_error)?,
+                    );
+                    self.write_program_batch(batch)?;
+                    self.notify_local_invalidations();
+                    return Ok(true);
+                }
+                Err(MutationError::SourceJournalCapacity) => {
+                    drop(_commit_guard);
+                    self.wait_for_mutation_capacity().await;
+                }
+                Err(error) => return Err(program_mutation_error(error)),
+            }
+        }
     }
 
     fn version_high_watermark(&self) -> Result<Option<VersionId>, ProgramStoreError> {
@@ -1023,6 +1375,7 @@ impl Store {
         &self,
         loaded: &LoadedPreparedBundle,
         commit: &ProgramCommit,
+        mutation_context: ObjectMutationContext,
     ) -> Result<CommittedProgramResult, ProgramStoreError> {
         let record = &loaded.record;
         validate_prepared_record(record)?;
@@ -1032,9 +1385,12 @@ impl Store {
             || commit
                 .previous_commit_cursor
                 .is_some_and(|previous| previous >= commit.commit_cursor)
+            || mutation_context.active_placement_log_id.term == 0
+            || mutation_context.active_placement_log_id.index == 0
+            || mutation_context.serving_fence_term == 0
         {
             return Err(ProgramStoreError::InvalidBundle(
-                "commit cursors must be non-zero and strictly increasing".into(),
+                "commit cursors and mutation authority must be non-zero and ordered".into(),
             ));
         }
         let applied_commit = self.applied_program_commit()?;
@@ -1119,7 +1475,6 @@ impl Store {
             current_versions.insert(precondition.path.clone(), current_version);
         }
 
-        let mut versioning_by_path = BTreeMap::new();
         for write in &record.writes {
             let identity = *identities
                 .get(&(write.path.tenant.clone(), write.path.bucket.clone()))
@@ -1150,11 +1505,6 @@ impl Store {
                     path: write.path.clone(),
                 });
             }
-            versioning_by_path.insert(
-                write.path.clone(),
-                self.bucket_versioning_by_key(&identity.encode())
-                    .map_err(program_mutation_error)?,
-            );
         }
         let result = committed_result(record);
         let applied = AppliedProgramCommit {
@@ -1166,11 +1516,14 @@ impl Store {
             durability_evidence_hash: commit.durability_evidence_hash,
         };
 
+        let journal_status = self
+            .local_watch_status()
+            .map_err(|error| ProgramStoreError::Storage(error.to_string()))?;
         let mut batch = WriteBatch::default();
         let mut changes = Vec::with_capacity(record.writes.len());
         let mut pending_blob_references = PendingBlobReferences::new();
         let publication_at_unix_millis = now_unix_millis().map_err(program_mutation_error)?;
-        for write in &record.writes {
+        for (write_index, write) in record.writes.iter().enumerate() {
             let mut reference_deltas = Vec::new();
             let key = object_key(&write.path)?;
             let identity = *identities
@@ -1178,19 +1531,64 @@ impl Store {
                 .ok_or_else(|| {
                     ProgramStoreError::Storage("write has no stable bucket identity".into())
                 })?;
+            let retention = self
+                .version_retention_for_bucket(identity)
+                .map_err(program_mutation_error)?;
             let version_bytes =
-                serde_json::to_vec(&write.version).map_err(program_storage_error)?;
+                serde_json::to_vec(&StoredVersion::new(write.version.clone(), retention))
+                    .map_err(program_storage_error)?;
             let old_version = current_versions
                 .get(&write.path)
                 .ok_or_else(|| {
                     ProgramStoreError::Storage("write has no current-version observation".into())
                 })?
                 .as_ref();
+            let mut released_predecessor_blob = None;
+            if let Some(old_version) = old_version {
+                let old_key = version_key(identity, &key, old_version.id);
+                if let Some(mut stored) = self
+                    .stored_version_by_key(&old_key)
+                    .map_err(program_mutation_error)?
+                {
+                    match stored.retention {
+                        StoredVersionRetention::JournalPending
+                            if retention == StoredVersionRetention::UserRetained =>
+                        {
+                            stored.retention = StoredVersionRetention::UserRetained;
+                            batch.put_cf(
+                                self.program_cf(CF_VERSIONS)?,
+                                old_key,
+                                serde_json::to_vec(&stored).map_err(program_storage_error)?,
+                            );
+                        }
+                        StoredVersionRetention::JournalReleased
+                            if retention == StoredVersionRetention::UserRetained =>
+                        {
+                            stored.retention = StoredVersionRetention::UserRetained;
+                            batch.put_cf(
+                                self.program_cf(CF_VERSIONS)?,
+                                old_key,
+                                serde_json::to_vec(&stored).map_err(program_storage_error)?,
+                            );
+                        }
+                        StoredVersionRetention::JournalReleased => {
+                            released_predecessor_blob = stored.version.blob;
+                            batch.delete_cf(self.program_cf(CF_VERSIONS)?, old_key);
+                        }
+                        StoredVersionRetention::JournalPending
+                        | StoredVersionRetention::UserRetained => {}
+                    }
+                }
+            }
             let accounting_transition = AccountingHeadTransition::new(
                 old_version.and_then(live_version_length),
                 live_version_length(&write.version),
             );
             let encoded_version_key = version_key(identity, &key, write.version.id);
+            let released_same_as_new = released_predecessor_blob
+                .as_ref()
+                .zip(write.version.blob.as_ref())
+                .is_some_and(|(old, new)| old == new);
             let existing = self.raw_get(CF_VERSIONS, &encoded_version_key)?;
             if let Some(existing) = &existing {
                 if existing.as_slice() != version_bytes.as_slice() {
@@ -1199,42 +1597,9 @@ impl Store {
                     });
                 }
             } else {
-                let versioning = *versioning_by_path.get(&write.path).ok_or_else(|| {
-                    ProgramStoreError::Storage("write has no bucket versioning decision".into())
-                })?;
-                let old_blob = old_version
-                    .map(version_blob_reference)
-                    .transpose()
-                    .map_err(program_mutation_error)?
-                    .flatten();
                 let new_blob =
                     version_blob_reference(&write.version).map_err(program_mutation_error)?;
-                let references_changed = old_blob.as_ref() != new_blob.as_ref();
-                if versioning == ObjectVersioning::Unversioned && references_changed {
-                    if let Some(reference) = old_blob.as_ref() {
-                        let (reference_key, state) = self
-                            .prepare_blob_reference_retirement(
-                                reference,
-                                &pending_blob_references,
-                                publication_at_unix_millis,
-                            )
-                            .map_err(program_mutation_error)?;
-                        self.stage_blob_reference_update(
-                            &mut batch,
-                            &mut pending_blob_references,
-                            reference_key,
-                            state,
-                        )
-                        .map_err(program_mutation_error)?;
-                        reference_deltas.push(ReferenceDelta {
-                            blob: reference.clone(),
-                            change: -1,
-                        });
-                    }
-                }
-                if let Some(reference) = new_blob.as_ref()
-                    && (versioning == ObjectVersioning::Enabled || references_changed)
-                {
+                if !released_same_as_new && let Some(reference) = new_blob.as_ref() {
                     let (reference_key, state) = self
                         .prepare_blob_reference_publication(
                             reference,
@@ -1254,14 +1619,26 @@ impl Store {
                         change: 1,
                     });
                 }
-                if versioning == ObjectVersioning::Unversioned
-                    && let Some(previous) = old_version
-                {
-                    batch.delete_cf(
-                        self.program_cf(CF_VERSIONS)?,
-                        version_key(identity, &key, previous.id),
-                    );
-                }
+            }
+            if !released_same_as_new && let Some(reference) = released_predecessor_blob.as_ref() {
+                let (reference_key, state) = self
+                    .prepare_blob_reference_retirement(
+                        reference,
+                        &pending_blob_references,
+                        publication_at_unix_millis,
+                    )
+                    .map_err(program_mutation_error)?;
+                self.stage_blob_reference_update(
+                    &mut batch,
+                    &mut pending_blob_references,
+                    reference_key,
+                    state,
+                )
+                .map_err(program_mutation_error)?;
+                reference_deltas.push(ReferenceDelta {
+                    blob: reference.clone(),
+                    change: -1,
+                });
             }
             batch.put_cf(
                 self.program_cf(CF_VERSIONS)?,
@@ -1274,7 +1651,28 @@ impl Store {
                 serde_json::to_vec(&Head {
                     version: write.version.id,
                     deleted: write.version.deleted,
-                    mutation_stamp: None,
+                    mutation_stamp: Some(MutationStamp {
+                        format: MUTATION_STAMP_FORMAT,
+                        predecessor_version: old_version.map(|version| version.id),
+                        program_commit_cursor: Some(commit.commit_cursor),
+                        mutation_fingerprint: commit.bundle_hash.0,
+                        active_placement_log_id: mutation_context.active_placement_log_id,
+                        serving_fence_term: mutation_context.serving_fence_term,
+                        source_id: journal_status.source_id,
+                        source_journal_position: journal_status
+                            .tail
+                            .checked_add(u64::try_from(write_index).map_err(|_| {
+                                ProgramStoreError::Storage(
+                                    "atomic source-journal position is exhausted".into(),
+                                )
+                            })?)
+                            .and_then(|offset| offset.checked_add(1))
+                            .ok_or_else(|| {
+                                ProgramStoreError::Storage(
+                                    "atomic source-journal position is exhausted".into(),
+                                )
+                            })?,
+                    }),
                 })
                 .map_err(program_storage_error)?,
             );
@@ -1283,9 +1681,50 @@ impl Store {
                 exact_path: key.path().to_owned(),
                 path_version: write.version.id,
                 deleted: write.version.deleted,
+                program_commit_cursor: Some(commit.commit_cursor),
                 reference_deltas,
                 accounting_transition: Some(accounting_transition),
                 definition_transition: None,
+            });
+        }
+        let mut mutations = record
+            .writes
+            .iter()
+            .enumerate()
+            .map(|(write_index, write)| {
+                let identity = identities[&(write.path.tenant.clone(), write.path.bucket.clone())];
+                let source_journal_position = journal_status
+                    .tail
+                    .checked_add(u64::try_from(write_index).unwrap_or(u64::MAX))
+                    .and_then(|offset| offset.checked_add(1))
+                    .expect("validated atomic source-journal bound");
+                crate::AtomicBatchMutation {
+                    tenant_id: identity.tenant_id.0,
+                    bucket_id: identity.bucket_id.0,
+                    exact_path: write.path.path.clone(),
+                    path_version: write.version.id,
+                    deleted: write.version.deleted,
+                    source_id: journal_status.source_id,
+                    source_journal_position,
+                }
+            })
+            .collect::<Vec<_>>();
+        mutations.sort_unstable();
+        let mut affected_routes = mutations
+            .iter()
+            .map(|mutation| crate::AtomicBatchRoute {
+                tenant_id: mutation.tenant_id,
+                bucket_id: mutation.bucket_id,
+            })
+            .collect::<Vec<_>>();
+        affected_routes.sort_unstable();
+        affected_routes.dedup();
+        if !mutations.is_empty() {
+            changes.push(PendingLocalChange::AtomicBatchPublished {
+                cursor: commit.commit_cursor,
+                bundle_hash: commit.bundle_hash,
+                affected_routes,
+                mutations,
             });
         }
         let bundle_reference = BlobRef::from(loaded.bundle);
@@ -1370,6 +1809,14 @@ impl Store {
         previous_versions: Option<&BTreeMap<ObjectPath, Version>>,
     ) -> Result<PreparedProgramBundle, ProgramStoreError> {
         validate_source_bundle(source)?;
+        // This is deliberately before payload staging and, critically, before
+        // the prepared bundle can be proposed to consensus. The synthetic
+        // records use worst-case route identities, reference deltas and
+        // accounting widths, so every actual one-node atomic publication is
+        // no larger than the transition proven here.
+        let journal_changes = conservative_atomic_source_journal_changes(source)?;
+        self.preflight_source_journal_transition(&journal_changes)
+            .map_err(program_mutation_error)?;
         let source_encoded = serde_json::to_vec(source).map_err(program_storage_error)?;
         let source_bundle_hash = PreparedBundleHash(tagged_hash(
             b"keldra.atomic-source-bundle.v1",

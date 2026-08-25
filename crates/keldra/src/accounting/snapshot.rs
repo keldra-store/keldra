@@ -61,6 +61,41 @@ impl AccountingObjectSnapshot {
                     )?;
                     changed = true;
                 }
+                LocalChange::ContentLifecycleChanged(content)
+                    if content
+                        .accounting_transition
+                        .as_ref()
+                        .is_some_and(|transition| {
+                            transition.tenant_id == definition.tenant_id
+                                && transition.bucket_id == definition.bucket_id
+                                && includes_path(
+                                    &definition.stored.path_prefix,
+                                    &transition.exact_path,
+                                )
+                        }) =>
+                {
+                    let transition = content
+                        .accounting_transition
+                        .as_ref()
+                        .expect("content accounting transition was matched");
+                    let removed = content
+                        .reference_deltas
+                        .iter()
+                        .filter(|delta| delta.change < 0)
+                        .try_fold(0_u64, |total, delta| {
+                            total
+                                .checked_add(delta.blob.length)
+                                .ok_or(AccountingAdvanceError::Overflow)
+                        })?;
+                    if removed != transition.retained_bytes_removed {
+                        return Err(AccountingAdvanceError::TransitionEvidenceUnavailable);
+                    }
+                    apply_reference_deltas(
+                        &mut next.logical_stored_bytes,
+                        &content.reference_deltas,
+                    )?;
+                    changed = true;
+                }
                 _ => {}
             }
         }

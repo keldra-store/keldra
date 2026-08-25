@@ -95,6 +95,7 @@ impl Store {
                 // These are destination lifecycle invalidations. Re-emitting
                 // the source reference effects would apply them twice.
                 reference_deltas: Vec::new(),
+                accounting_transition: None,
             });
         }
         batch.put_cf(

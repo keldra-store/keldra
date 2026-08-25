@@ -98,6 +98,39 @@ fn validate_current_snapshot_batch_request(
     Ok(())
 }
 
+fn validate_exact_version_batch_request(
+    tenant_id: u64,
+    bucket_id: u64,
+    exact_paths: &[String],
+    version_ids: &[u64],
+) -> Result<(), Status> {
+    validate_current_snapshot_batch_request(tenant_id, bucket_id, exact_paths)?;
+    if version_ids.len() != exact_paths.len() || version_ids.contains(&0) {
+        return Err(Status::invalid_argument(
+            "exact-version batch paths and non-zero version IDs must have equal lengths",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_exact_version_batch(
+    versions: &[Option<keldra_store::Version>],
+    expected: &[u64],
+) -> Result<(), Status> {
+    if versions.len() != expected.len()
+        || versions.iter().zip(expected).any(|(version, expected)| {
+            version
+                .as_ref()
+                .is_some_and(|version| version.id.0 != *expected)
+        })
+    {
+        return Err(Status::data_loss(
+            "exact-version batch result disagrees with its request",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_current_snapshot_batch(
     snapshots: &[Option<CurrentObjectSnapshot>],
     tenant_id: u64,
@@ -225,6 +258,47 @@ impl DataPeerService {
         Ok(Response::new(wire::CurrentObjectSnapshotBatchResponse {
             schema_version: DATA_PEER_SCHEMA_VERSION,
             snapshots_json,
+        }))
+    }
+
+    pub(super) async fn read_exact_object_versions_call(
+        &self,
+        mut request: Request<wire::ExactObjectVersionBatchRequest>,
+    ) -> Result<Response<wire::ExactObjectVersionBatchResponse>, Status> {
+        let peer = request.get_ref().peer.clone();
+        self.authorize(&mut request, peer.as_ref(), PeerRpcKind::DataPlane)?;
+        validate_exact_version_batch_request(
+            request.get_ref().tenant_id,
+            request.get_ref().bucket_id,
+            &request.get_ref().exact_paths,
+            &request.get_ref().version_ids,
+        )?;
+        let metadata = request.metadata().clone();
+        let request = request.into_inner();
+        let selections = request
+            .exact_paths
+            .into_iter()
+            .zip(request.version_ids.into_iter().map(keldra_store::VersionId))
+            .collect::<Vec<_>>();
+        let store = self.store.clone();
+        let versions = self
+            .bounded(&metadata, async move {
+                tokio::task::spawn_blocking(move || {
+                    store.export_exact_object_versions(
+                        request.tenant_id,
+                        request.bucket_id,
+                        &selections,
+                    )
+                })
+                .await
+                .map_err(|error| Status::internal(format!("exact-version batch read: {error}")))?
+                .map_err(map_object_snapshot_error)
+            })
+            .await?;
+        let versions_json = encode_object_snapshot(&versions)?;
+        Ok(Response::new(wire::ExactObjectVersionBatchResponse {
+            schema_version: DATA_PEER_SCHEMA_VERSION,
+            versions_json,
         }))
     }
 
@@ -356,6 +430,41 @@ impl DataPeerTransport {
         let snapshots: Vec<Option<CurrentObjectSnapshot>> = decode_typed(&response.snapshots_json)?;
         validate_current_snapshot_batch(&snapshots, tenant_id, bucket_id, exact_paths)?;
         Ok(snapshots)
+    }
+
+    pub(crate) async fn read_exact_object_versions(
+        &self,
+        target: NodeId,
+        address: &str,
+        tenant_id: u64,
+        bucket_id: u64,
+        selections: &[(String, keldra_store::VersionId)],
+    ) -> Result<Vec<Option<keldra_store::Version>>, Status> {
+        let exact_paths = selections
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        let version_ids = selections
+            .iter()
+            .map(|(_, version)| version.0)
+            .collect::<Vec<_>>();
+        validate_exact_version_batch_request(tenant_id, bucket_id, &exact_paths, &version_ids)?;
+        let response = self
+            .client(target, address)?
+            .read_exact_object_versions(wire::ExactObjectVersionBatchRequest {
+                peer: Some(self.context()),
+                tenant_id,
+                bucket_id,
+                exact_paths,
+                version_ids: version_ids.clone(),
+            })
+            .await?
+            .into_inner();
+        require_response_schema(response.schema_version)?;
+        require_object_snapshot_bound(&response.versions_json)?;
+        let versions: Vec<Option<keldra_store::Version>> = decode_typed(&response.versions_json)?;
+        validate_exact_version_batch(&versions, &version_ids)?;
+        Ok(versions)
     }
 
     pub(crate) async fn repair_object_path_snapshot(

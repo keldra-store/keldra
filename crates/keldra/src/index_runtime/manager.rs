@@ -1,11 +1,11 @@
-//! Weighted-HRW assignment and bounded format-v4 index generation construction.
+//! Weighted-HRW assignment and bounded format-v4 index commit construction.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use keldra_consensus::{DecisionRaft, NodeId};
 use keldra_index::v4::build::{
-    BuildLimits, ComponentBatchSink, MergeMutation, NativeSegmentWriter,
+    BuildLimits, BuiltSegment, ComponentBatchSink, MergeMutation, NativeSegmentWriter,
     ProjectedSource as NativeProjectedSource, SourcePush,
 };
 use keldra_index::v4::{
@@ -13,8 +13,11 @@ use keldra_index::v4::{
     SegmentDescriptor, SegmentIdentity, locate_path_values, publish_locator_delta,
     rewrite_segment_live_mask,
 };
-use keldra_index::{FIXED_INDEX_SEAL_WORKSPACE_BYTES, IndexError, IndexKind, SegmentMemoryPlan};
-use keldra_store::{DefinitionKind, Head, LocalChange, ObjectKey, Store, VersionId};
+use keldra_index::{
+    FIXED_INDEX_SEAL_WORKSPACE_BYTES, IndexError, IndexKind, MIN_INDEX_KIND_MEMORY_BYTES,
+    SegmentMemoryPlan,
+};
+use keldra_store::{DefinitionKind, LocalChange, ObjectKey, Store, VersionId};
 use tonic::Status;
 use tracing::Instrument;
 
@@ -27,19 +30,19 @@ use crate::derived_consumer::{
 use crate::index_config::IndexRuntimeConfig;
 use crate::index_service::{StoredIndexDefinition, definition_path, path_matches_prefix};
 
-use super::budget::{IndexBudgetError, IndexMemoryBudgets};
+use super::budget::{IndexBudgetError, IndexMemoryBudgets, IndexMemoryPermit};
 use super::cache::IndexCache;
 use super::catalog::{CatalogChange, CatalogDefinition, CatalogIdentity, IndexCatalog};
+use super::committed_view::{
+    LocatorPackOwnership, LocatorRoot, MAX_LOCATOR_ROOTS_PER_COMMIT, MAX_SEGMENTS_PER_COMMIT,
+};
 use super::cpu::{IndexCpuPool, IndexCpuPoolError};
 use super::directory::ManifestArtifactDirectory;
 use super::events::{IndexBarrier, IndexEventError, IndexEventJournal, IndexJournalPage};
-use super::generation::{
-    LocatorPackOwnership, LocatorRoot, MAX_SEGMENTS_PER_GENERATION, ManifestPhysicalOrder,
-};
 use super::placement::{IndexIdentity, IndexPlacement};
 use super::publication::DerivedArtifactAdmission;
-use super::publisher::{IndexGenerationPublisher, PublishedGeneration};
-use super::retention::{IndexGenerationRetention, IndexRetentionTask};
+use super::publisher::{CommittedIndexView, IndexCommitPublisher, IndexPointerCasClass};
+use super::retention::{IndexCommitRetention, IndexRetentionTask};
 use super::scanner::{ClusterIndexScanner, ClusterIndexSourceSnapshot};
 use super::source::{IndexBuildDiagnostics, IndexBuildObject, IndexSourceMutation};
 use super::telemetry::{
@@ -51,22 +54,34 @@ use super::v4_projection::{project_mutation, projection_admission_bytes};
 #[path = "manager/catch_up.rs"]
 mod catch_up;
 use catch_up::process_journal_page;
+#[path = "manager/candidate.rs"]
+mod candidate;
+use candidate::{CandidateCommit, manifest_physical_order, runtime_kind};
 #[path = "manager/debt.rs"]
 mod debt;
 use debt::{DebtLimits, DebtSelection};
 #[path = "manager/locator_debt.rs"]
 mod locator_debt;
+#[path = "manager/observability.rs"]
+mod observability;
+#[path = "manager/publication.rs"]
+mod publication;
+pub(crate) use publication::IndexPublicationSlots;
+use publication::{AbortOnDropTask, publication_cas_class, start_candidate_publication};
 #[path = "manager/recovery.rs"]
 mod recovery;
 use recovery::{BuilderFailurePhase, recover_builder_failure};
 #[cfg(test)]
 use recovery::{BuilderFailureRecovery, failure_recovery};
+#[path = "manager/support.rs"]
+mod support;
+use support::*;
 #[path = "manager/quantum.rs"]
 mod quantum;
 use quantum::{SourceWorkBoundary, SourceWorkQuantum};
 #[path = "manager/rebuild.rs"]
 mod rebuild;
-use rebuild::{RebuildWork, advance_rebuild};
+use rebuild::{RebuildWork, advance_rebuild, resume_durable_rebuild, start_rebuild_work};
 #[path = "manager/v4_merge.rs"]
 mod v4_merge;
 
@@ -119,13 +134,14 @@ pub(crate) struct IndexBuilderDependencies {
     pub(crate) journal: std::sync::Arc<IndexEventJournal>,
     pub(crate) scanner: ClusterIndexScanner,
     pub(crate) reader: ClusterObjectReader,
-    pub(crate) publisher: IndexGenerationPublisher,
-    pub(crate) retention: IndexGenerationRetention,
+    pub(crate) publisher: IndexCommitPublisher,
+    pub(crate) retention: IndexCommitRetention,
     pub(crate) cache: IndexCache,
     pub(crate) budgets: IndexMemoryBudgets,
     pub(crate) cpu: IndexCpuPool,
     pub(crate) config: IndexRuntimeConfig,
     pub(crate) derived_progress: DerivedProgressReporter,
+    pub(crate) publication_slots: IndexPublicationSlots,
 }
 
 async fn run_manager(
@@ -138,6 +154,7 @@ async fn run_manager(
     let mut scheduler = BuilderScheduler::default();
     let mut workers = tokio::task::JoinSet::new();
     let mut inflight = HashMap::new();
+    let mut running = HashMap::new();
 
     loop {
         let mut available = scheduler.remaining_capacity();
@@ -153,6 +170,7 @@ async fn run_manager(
         }) {
             Ok(page) => {
                 for change in page {
+                    abort_replaced_worker(&change, &scheduler, &mut running, &mut inflight);
                     if let Err(error) = scheduler.apply_change(
                         change,
                         local_node,
@@ -190,7 +208,9 @@ async fn run_manager(
                 let step = advance_builder(work, task_dependencies).await;
                 (metadata, step)
             });
-            inflight.insert(handle.id(), metadata);
+            let task_id = handle.id();
+            running.insert(metadata.identity, (task_id, handle));
+            inflight.insert(task_id, metadata);
         }
 
         let next_wake = scheduler
@@ -201,14 +221,16 @@ async fn run_manager(
             received = changes.recv() => match received {
                 Ok(identity) => {
                     if let Ok(Some(change)) = catalog.take(identity, scheduler.can_admit(identity))
-                        && let Err(error) = scheduler.apply_change(
+                    {
+                        abort_replaced_worker(&change, &scheduler, &mut running, &mut inflight);
+                        if let Err(error) = scheduler.apply_change(
                             change,
                             local_node,
                             &decisions,
                             &dependencies.retention,
-                        )
-                    {
-                        tracing::debug!(%error, "bounded index builder admission deferred to assignment rediscovery");
+                        ) {
+                            tracing::debug!(%error, "bounded index builder admission deferred to assignment rediscovery");
+                        }
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
@@ -218,12 +240,14 @@ async fn run_manager(
                 match completed {
                     Some(Ok((task_id, (metadata, step)))) => {
                         inflight.remove(&task_id);
+                        remove_running_task(&mut running, metadata.identity, task_id);
                         scheduler.complete(metadata, step, &dependencies.retention);
                     }
                     Some(Err(error)) => {
                         let metadata = inflight.remove(&error.id());
-                        tracing::warn!(%error, "bounded index builder work task failed");
+                        tracing::debug!(%error, "bounded index builder work task will retry");
                         if let Some(metadata) = metadata {
+                            remove_running_task(&mut running, metadata.identity, error.id());
                             scheduler.lost(metadata, &dependencies.retention);
                         }
                     }
@@ -235,12 +259,51 @@ async fn run_manager(
     }
 }
 
+fn abort_replaced_worker(
+    change: &CatalogChange,
+    scheduler: &BuilderScheduler,
+    running: &mut HashMap<CatalogIdentity, (tokio::task::Id, tokio::task::AbortHandle)>,
+    inflight: &mut HashMap<tokio::task::Id, WorkMetadata>,
+) {
+    let identity = change.identity();
+    let replaces = match change {
+        CatalogChange::Upsert(definition) => {
+            scheduler.entries.get(&identity).is_some_and(|entry| {
+                entry.definition.object_version != definition.object_version
+                    || entry.definition.stored != definition.stored
+            })
+        }
+        CatalogChange::Delete { .. } | CatalogChange::Remove(_) => true,
+    };
+    if !replaces {
+        return;
+    }
+    if let Some((task_id, handle)) = running.remove(&identity) {
+        inflight.remove(&task_id);
+        handle.abort();
+    }
+}
+
+fn remove_running_task(
+    running: &mut HashMap<CatalogIdentity, (tokio::task::Id, tokio::task::AbortHandle)>,
+    identity: CatalogIdentity,
+    task_id: tokio::task::Id,
+) {
+    if running
+        .get(&identity)
+        .is_some_and(|(running_id, _)| *running_id == task_id)
+    {
+        running.remove(&identity);
+    }
+}
+
 #[derive(Clone, Copy)]
 struct WorkMetadata {
     identity: CatalogIdentity,
     definition_version: u64,
     kind: IndexKind,
     held_snapshot: bool,
+    inspecting: bool,
 }
 
 impl WorkMetadata {
@@ -250,6 +313,7 @@ impl WorkMetadata {
             definition_version: job.definition.object_version,
             kind: job.kind,
             held_snapshot: job.holds_snapshot(),
+            inspecting: matches!(job.phase, BuilderPhase::Inspect),
         }
     }
 }
@@ -259,7 +323,7 @@ struct BuilderScheduler {
     ready_active: [VecDeque<CatalogIdentity>; INDEX_KIND_COUNT],
     ready_inspect: [VecDeque<CatalogIdentity>; INDEX_KIND_COUNT],
     delayed: BTreeMap<CatalogIdentity, (tokio::time::Instant, u64)>,
-    running_kinds: [bool; INDEX_KIND_COUNT],
+    running_inspects: [usize; INDEX_KIND_COUNT],
     open_rebuilds: [usize; INDEX_KIND_COUNT],
     prefer_active: [bool; INDEX_KIND_COUNT],
     next_kind: usize,
@@ -272,7 +336,7 @@ impl Default for BuilderScheduler {
             ready_active: std::array::from_fn(|_| VecDeque::new()),
             ready_inspect: std::array::from_fn(|_| VecDeque::new()),
             delayed: BTreeMap::new(),
-            running_kinds: [false; INDEX_KIND_COUNT],
+            running_inspects: [0; INDEX_KIND_COUNT],
             open_rebuilds: [0; INDEX_KIND_COUNT],
             prefer_active: [false; INDEX_KIND_COUNT],
             next_kind: 0,
@@ -301,7 +365,7 @@ impl BuilderScheduler {
         change: CatalogChange,
         local_node: NodeId,
         decisions: &DecisionRaft,
-        retention: &IndexGenerationRetention,
+        retention: &IndexCommitRetention,
     ) -> Result<(), Status> {
         match change {
             CatalogChange::Upsert(definition) => {
@@ -326,7 +390,7 @@ impl BuilderScheduler {
         definition: CatalogDefinition,
         local_node: NodeId,
         decisions: &DecisionRaft,
-        retention: &IndexGenerationRetention,
+        retention: &IndexCommitRetention,
     ) -> Result<(), Status> {
         let identity = definition.identity();
         if is_local_builder(&definition, local_node, &current_placement(decisions)?)? {
@@ -340,7 +404,7 @@ impl BuilderScheduler {
     fn insert(
         &mut self,
         definition: CatalogDefinition,
-        retention: &IndexGenerationRetention,
+        retention: &IndexCommitRetention,
     ) -> Result<(), Status> {
         let identity = definition.identity();
         if self.record_same_definition_wake(&definition) {
@@ -383,7 +447,7 @@ impl BuilderScheduler {
         true
     }
 
-    fn remove(&mut self, identity: CatalogIdentity, retention: &IndexGenerationRetention) {
+    fn remove(&mut self, identity: CatalogIdentity, retention: &IndexCommitRetention) {
         self.evict_builder(identity);
         if let Err(error) =
             retention.unschedule(identity.tenant_id, identity.bucket_id, identity.index_id)
@@ -449,10 +513,8 @@ impl BuilderScheduler {
     fn pop_runnable(&mut self) -> Option<BuilderJob> {
         for offset in 0..INDEX_KIND_COUNT {
             let slot = (self.next_kind + offset) % INDEX_KIND_COUNT;
-            if self.running_kinds[slot] {
-                continue;
-            }
-            let can_inspect = self.open_rebuilds[slot] < MAX_OPEN_REBUILDS_PER_KIND;
+            let can_inspect = self.open_rebuilds[slot].saturating_add(self.running_inspects[slot])
+                < MAX_OPEN_REBUILDS_PER_KIND;
             let active_first = self.prefer_active[slot] || !can_inspect;
             let identity = if active_first {
                 take_ready(&mut self.ready_active[slot], &mut self.entries, true).or_else(|| {
@@ -471,7 +533,9 @@ impl BuilderScheduler {
             };
             let entry = self.entries.get_mut(&identity).expect("ready entry exists");
             entry.queued = false;
-            self.running_kinds[slot] = true;
+            if !entry.job.as_ref().is_some_and(BuilderJob::is_active) {
+                self.running_inspects[slot] = self.running_inspects[slot].saturating_add(1);
+            }
             self.prefer_active[slot] = !active_first;
             self.next_kind = (slot + 1) % INDEX_KIND_COUNT;
             return entry.job.take();
@@ -483,7 +547,7 @@ impl BuilderScheduler {
         &mut self,
         metadata: WorkMetadata,
         step: BuilderStep,
-        retention: &IndexGenerationRetention,
+        retention: &IndexCommitRetention,
     ) {
         self.complete_with(metadata, step, |definition, identity, current| {
             match retention.schedule(
@@ -508,11 +572,13 @@ impl BuilderScheduler {
         mut schedule_retention: impl FnMut(
             &StoredIndexDefinition,
             CatalogIdentity,
-            &PublishedGeneration,
+            &CommittedIndexView,
         ) -> bool,
     ) {
         let slot = kind_slot(metadata.kind);
-        self.running_kinds[slot] = false;
+        if metadata.inspecting {
+            self.running_inspects[slot] = self.running_inspects[slot].saturating_sub(1);
+        }
         if metadata.held_snapshot {
             self.open_rebuilds[slot] = self.open_rebuilds[slot].saturating_sub(1);
         }
@@ -551,9 +617,6 @@ impl BuilderScheduler {
                     entry.wake_pending = false;
                     self.enqueue(metadata.identity);
                 } else {
-                    // The published generation and durable assignment are the
-                    // resume point. Idle definitions consume no scheduler
-                    // state; the fair assignment walk will lease them again.
                     self.evict_builder(metadata.identity);
                 }
             }
@@ -568,13 +631,15 @@ impl BuilderScheduler {
         }
     }
 
-    fn lost(&mut self, metadata: WorkMetadata, retention: &IndexGenerationRetention) {
+    fn lost(&mut self, metadata: WorkMetadata, retention: &IndexCommitRetention) {
         self.release(metadata, retention);
     }
 
-    fn release(&mut self, metadata: WorkMetadata, retention: &IndexGenerationRetention) {
+    fn release(&mut self, metadata: WorkMetadata, retention: &IndexCommitRetention) {
         let slot = kind_slot(metadata.kind);
-        self.running_kinds[slot] = false;
+        if metadata.inspecting {
+            self.running_inspects[slot] = self.running_inspects[slot].saturating_sub(1);
+        }
         if metadata.held_snapshot {
             self.open_rebuilds[slot] = self.open_rebuilds[slot].saturating_sub(1);
         }
@@ -685,33 +750,43 @@ enum BuilderPhase {
     Inspect,
     Rebuild(RebuildWork),
     CatchUp(CatchUpWork),
-    Publish(PublishWork),
 }
 
-#[derive(Clone)]
 struct CatchUpWork {
-    current: Option<PublishedGeneration>,
+    current: Option<CommittedIndexView>,
     through: IndexBarrier,
     target: IndexBarrier,
-    candidate: CandidateGeneration,
+    candidate: CandidateCommit,
     changed: bool,
     must_publish: bool,
+    checkpoint_started: Option<Instant>,
     maintenance: bool,
     progress: BuilderProgress,
+    active: Option<ActiveIncrementalBuffer>,
+    publishing: Option<InFlightPublication>,
+    atomic_projection: Option<catch_up::AtomicProjectionWork>,
 }
 
-#[derive(Clone)]
-struct PublishWork {
-    current: Option<PublishedGeneration>,
+struct InFlightPublication {
+    current: Option<CommittedIndexView>,
     barrier: IndexBarrier,
-    candidate: CandidateGeneration,
+    candidate: CandidateCommit,
     admission: DerivedArtifactAdmission,
+    task: AbortOnDropTask<Result<CommittedIndexView, Status>>,
+}
+
+struct ActiveIncrementalBuffer {
+    builder: NativeSegmentBuild,
+    permit: IndexMemoryPermit,
+    quantum: SourceWorkQuantum,
+    started: Option<Instant>,
+    operations: u64,
 }
 
 struct BuilderStep {
     job: BuilderJob,
     disposition: BuilderDisposition,
-    retention_current: Option<PublishedGeneration>,
+    retention_current: Option<CommittedIndexView>,
 }
 
 enum BuilderDisposition {
@@ -737,22 +812,11 @@ async fn advance_builder(
             None,
             advance_rebuild(&job, work, &dependencies).await,
         ),
-        BuilderPhase::CatchUp(work) => {
-            let retry = work.clone();
-            (
-                BuilderFailurePhase::CatchUp,
-                Some(BuilderPhase::CatchUp(retry)),
-                advance_catch_up(&mut job, work, &dependencies).await,
-            )
-        }
-        BuilderPhase::Publish(work) => {
-            let retry = work.clone();
-            (
-                BuilderFailurePhase::Publish,
-                Some(BuilderPhase::Publish(retry)),
-                publish_builder(&mut job, work, &dependencies).await,
-            )
-        }
+        BuilderPhase::CatchUp(work) => (
+            BuilderFailurePhase::CatchUp,
+            None,
+            advance_catch_up(&mut job, work, &dependencies).await,
+        ),
     };
     match result {
         Ok((next, disposition, retention_current)) => {
@@ -770,14 +834,7 @@ async fn advance_builder(
 async fn inspect_builder(
     job: &BuilderJob,
     dependencies: &IndexBuilderDependencies,
-) -> Result<
-    (
-        BuilderPhase,
-        BuilderDisposition,
-        Option<PublishedGeneration>,
-    ),
-    Status,
-> {
+) -> Result<(BuilderPhase, BuilderDisposition, Option<CommittedIndexView>), Status> {
     let telemetry_identity = job.telemetry_identity();
     let definition = &job.definition;
     let current = dependencies
@@ -788,12 +845,27 @@ async fn inspect_builder(
             definition.bucket_id,
         )
         .await?;
+    let progress = BuilderProgress::start(telemetry_identity, BuilderProgressPhase::Rebuild);
+    let budget = dependencies.budgets.for_kind(job.kind);
+    let max_frame_bytes =
+        source_wire_limit(budget.limit()).min(dependencies.config.source_quantum_bytes(job.kind));
+    if let Some(work) = resume_durable_rebuild(
+        job,
+        current.clone(),
+        max_frame_bytes,
+        progress.clone(),
+        dependencies,
+    )
+    .await?
+    {
+        return Ok((BuilderPhase::Rebuild(work), BuilderDisposition::Ready, None));
+    }
     emit_publication_age(job.kind, current.as_ref());
     if let Some(current) = current.as_ref()
         && current.manifest.definition_version == definition.object_version
         && current.manifest.kind == definition.schema.kind
     {
-        let published = current.manifest.barrier().map_err(generation_status)?;
+        let published = current.manifest.barrier().map_err(commit_view_status)?;
         let target = dependencies
             .journal
             .capture_index_bucket_barrier(
@@ -824,14 +896,18 @@ async fn inspect_builder(
                         current: Some(current.clone()),
                         through: target.clone(),
                         target,
-                        candidate: CandidateGeneration::incremental(current),
+                        candidate: CandidateCommit::incremental(current),
                         changed: false,
                         must_publish: true,
+                        checkpoint_started: None,
                         maintenance: true,
                         progress: BuilderProgress::start(
                             telemetry_identity,
                             BuilderProgressPhase::CatchUp,
                         ),
+                        active: None,
+                        publishing: None,
+                        atomic_projection: None,
                     }),
                     BuilderDisposition::Ready,
                     retention_current,
@@ -843,7 +919,7 @@ async fn inspect_builder(
                 retention_current,
             ));
         }
-        let candidate = CandidateGeneration::incremental(current);
+        let candidate = CandidateCommit::incremental(current);
         return Ok((
             BuilderPhase::CatchUp(CatchUpWork {
                 current: Some(current.clone()),
@@ -852,8 +928,12 @@ async fn inspect_builder(
                 candidate,
                 changed: false,
                 must_publish: false,
+                checkpoint_started: None,
                 maintenance: false,
                 progress: BuilderProgress::start(telemetry_identity, BuilderProgressPhase::CatchUp),
+                active: None,
+                publishing: None,
+                atomic_projection: None,
             }),
             BuilderDisposition::Ready,
             retention_current,
@@ -867,10 +947,6 @@ async fn inspect_builder(
         bucket_id = job.definition.bucket_id,
         "index snapshot rebuild started"
     );
-    let progress = BuilderProgress::start(telemetry_identity, BuilderProgressPhase::Rebuild);
-    let budget = dependencies.budgets.for_kind(job.kind);
-    let max_frame_bytes =
-        source_wire_limit(budget.limit()).min(dependencies.config.source_quantum_bytes(job.kind));
     let (expected_fence, expected_atomic) = dependencies
         .journal
         .snapshot_authority()
@@ -881,6 +957,7 @@ async fn inspect_builder(
             definition.tenant_id,
             definition.bucket_id,
             definition.stored.path_prefix.clone(),
+            None,
             max_frame_bytes,
         )
         .await?;
@@ -898,32 +975,24 @@ async fn inspect_builder(
         .journal
         .barrier_from_snapshot_tails(snapshot.placement_fence(), expected_atomic, &tails)
         .map_err(event_status)?;
-    Ok((
-        BuilderPhase::Rebuild(RebuildWork {
-            current,
-            snapshot,
-            through,
-            candidate: CandidateGeneration::rebuild(),
-            maximum_frame_bytes: max_frame_bytes,
-            progress,
-        }),
-        BuilderDisposition::Ready,
-        None,
-    ))
+    let work = start_rebuild_work(
+        job,
+        current,
+        snapshot,
+        through,
+        max_frame_bytes,
+        progress,
+        dependencies,
+    )
+    .await?;
+    Ok((BuilderPhase::Rebuild(work), BuilderDisposition::Ready, None))
 }
 
 async fn advance_catch_up(
     job: &BuilderJob,
     mut work: CatchUpWork,
     dependencies: &IndexBuilderDependencies,
-) -> Result<
-    (
-        BuilderPhase,
-        BuilderDisposition,
-        Option<PublishedGeneration>,
-    ),
-    Status,
-> {
+) -> Result<(BuilderPhase, BuilderDisposition, Option<CommittedIndexView>), Status> {
     let debt_limits = if work.maintenance {
         DebtLimits::maintenance()
     } else {
@@ -933,33 +1002,152 @@ async fn advance_catch_up(
         )
     };
     let admission = publication_admission(work.maintenance);
-    if compact_one_if_needed(job, &mut work.candidate, debt_limits, dependencies).await? {
+    if work
+        .publishing
+        .as_ref()
+        .is_some_and(|publication| publication.task.is_finished())
+    {
+        let publication = work
+            .publishing
+            .take()
+            .expect("finished publication remains installed");
+        let InFlightPublication {
+            current,
+            barrier,
+            candidate,
+            admission,
+            task,
+        } = publication;
+        let publication_class =
+            publication_cas_class(&job.definition, &barrier, &candidate, current.as_ref())?;
+        match task.join().await {
+            Ok(Ok(published)) => {
+                if catch_up::published_candidate_requires_locator_maintenance(&work, &published)? {
+                    work.progress.complete();
+                    return Ok((
+                        BuilderPhase::Inspect,
+                        BuilderDisposition::Ready,
+                        Some(published),
+                    ));
+                }
+                work.current = Some(published.clone());
+                return Ok((
+                    BuilderPhase::CatchUp(work),
+                    BuilderDisposition::Ready,
+                    Some(published),
+                ));
+            }
+            result => {
+                let error = match result {
+                    Ok(Err(error)) => error,
+                    Err(error) => Status::internal(format!(
+                        "asynchronous index publication task failed: {error}"
+                    )),
+                    Ok(Ok(_)) => unreachable!("successful publication handled above"),
+                };
+                if publication_class == IndexPointerCasClass::Merge
+                    && error.code() == tonic::Code::Aborted
+                {
+                    tracing::debug!(
+                        index.kind = ?job.kind,
+                        %error,
+                        "discarding superseded immutable merge output and rescheduling from current"
+                    );
+                    work.progress.complete();
+                    return Ok((BuilderPhase::Inspect, BuilderDisposition::Ready, None));
+                }
+                tracing::debug!(
+                    index.kind = ?job.kind,
+                    %error,
+                    "retrying exact failed index publication without discarding later intake"
+                );
+                let task = start_candidate_publication(
+                    job.definition.clone(),
+                    job.kind,
+                    barrier.clone(),
+                    candidate.clone(),
+                    current.clone(),
+                    admission,
+                    dependencies.clone(),
+                );
+                work.publishing = Some(InFlightPublication {
+                    current,
+                    barrier,
+                    candidate,
+                    admission,
+                    task,
+                });
+                return Ok((
+                    BuilderPhase::CatchUp(work),
+                    BuilderDisposition::Retry(BUILDER_RETRY_INTERVAL),
+                    None,
+                ));
+            }
+        }
+    }
+    if work.active.is_none()
+        && catch_up::should_compact_before_catch_up(
+            work.maintenance,
+            work.candidate.segments.len(),
+            work.candidate.locator_roots.len(),
+        )
+        && compact_one_if_needed(job, &mut work.candidate, debt_limits, dependencies).await?
+    {
         return Ok((BuilderPhase::CatchUp(work), BuilderDisposition::Ready, None));
     }
-    let budget = dependencies.budgets.for_kind(job.kind);
-    let permit = await_with_builder_heartbeats(
-        &work.progress,
-        budget.acquire_up_to(budget.limit(), budget.working_memory_limit()),
-    )
-    .await
-    .map_err(budget_status)?;
-    let granted_bytes = permit.bytes();
-    let mut quantum = SourceWorkQuantum::from_budget_limit(granted_bytes);
-    let plan = work_plan_for_limit(granted_bytes, 0)?;
-    // Sequential journal pages coalesce into one in-memory segment build until this work
-    // quantum ends; the source cursor advances only after each page succeeds.
-    let mut builder = NativeSegmentBuild::new(job, plan, dependencies)?;
-    loop {
-        let Some(page_limit) = quantum.remaining() else {
-            flush_builder(
-                &job.definition,
-                job.kind,
-                &mut builder,
-                &mut work.candidate,
-                dependencies,
+    let mut active = match work.active.take() {
+        Some(active) => active,
+        None => {
+            let budget = dependencies.budgets.for_kind(job.kind);
+            let permit = await_with_builder_heartbeats(
+                &work.progress,
+                budget.acquire_up_to(MIN_INDEX_KIND_MEMORY_BYTES as u64, budget.limit()),
             )
-            .await?;
-            drop(permit);
+            .await
+            .map_err(budget_status)?;
+            let granted_bytes = permit.bytes();
+            let plan = work_plan_for_limit(
+                granted_bytes,
+                0,
+                dependencies.config.segment_flush_bytes(job.kind),
+            )?;
+            ActiveIncrementalBuffer {
+                builder: NativeSegmentBuild::new(
+                    job,
+                    plan,
+                    SegmentPublicationLane::Incremental,
+                    dependencies,
+                )?,
+                permit,
+                quantum: SourceWorkQuantum::from_budget_limit(granted_bytes),
+                started: None,
+                operations: 0,
+            }
+        }
+    };
+    loop {
+        // A staged atomic unit was based on this exact candidate graph. Finish
+        // it before publication or maintenance can replace that base; the
+        // staged graph remains invisible until its Done transition.
+        if work.atomic_projection.is_none()
+            && catch_up::locator_publication_required(&work.candidate, &active.builder)
+        {
+            return catch_up::stop_at_locator_headroom(job, work, active, admission, dependencies)
+                .await;
+        }
+        let Some(page_limit) = active.quantum.remaining() else {
+            if !active.builder.is_empty() {
+                freeze_builder(
+                    &job.definition,
+                    job.kind,
+                    &mut active.builder,
+                    &mut work.candidate,
+                    dependencies,
+                )
+                .await?;
+            }
+            active.quantum = SourceWorkQuantum::from_budget_limit(active.permit.bytes());
+            work.active = Some(active);
             return Ok((BuilderPhase::CatchUp(work), BuilderDisposition::Ready, None));
         };
         let page = await_with_builder_heartbeats(
@@ -976,59 +1164,80 @@ async fn advance_catch_up(
         let page = match page {
             Ok(page) => page,
             Err(IndexEventError::PageBytesExceeded { bytes, .. })
-                if quantum.defer_page_to_next_quantum(bytes) =>
+                if active.quantum.defer_page_to_next_quantum(bytes) =>
             {
-                flush_builder(
-                    &job.definition,
-                    job.kind,
-                    &mut builder,
-                    &mut work.candidate,
-                    dependencies,
-                )
-                .await?;
-                drop(permit);
+                if !active.builder.is_empty() {
+                    freeze_builder(
+                        &job.definition,
+                        job.kind,
+                        &mut active.builder,
+                        &mut work.candidate,
+                        dependencies,
+                    )
+                    .await?;
+                }
+                active.quantum = SourceWorkQuantum::from_budget_limit(active.permit.bytes());
+                work.active = Some(active);
                 return Ok((BuilderPhase::CatchUp(work), BuilderDisposition::Ready, None));
             }
             Err(error) => return Err(event_status(error)),
         };
         let Some(page) = page else {
-            flush_builder(
-                &job.definition,
-                job.kind,
-                &mut builder,
-                &mut work.candidate,
-                dependencies,
-            )
-            .await?;
-            drop(permit);
             if work.through != work.target {
                 return Err(Status::unavailable(
                     "index catch-up did not reach its complete source barrier",
                 ));
             }
-            // The final builder flush may have crossed the configured debt
-            // bound. Reduce it before publishing; source-complete generations
-            // below the bound remain queryable while maintenance continues.
-            if debt::select(&work.candidate.segments, debt_limits).is_some()
-                || debt::select_locator_roots(&work.candidate.locator_roots, debt_limits).is_some()
-            {
-                return Ok((BuilderPhase::CatchUp(work), BuilderDisposition::Ready, None));
+            if !work.maintenance && (work.changed || work.must_publish) {
+                let publication_started =
+                    catch_up::earliest_publication_start(active.started, work.checkpoint_started);
+                let remaining = publication_started
+                    .map(|started| started + dependencies.config.segment_flush_max_age())
+                    .and_then(|deadline| deadline.checked_duration_since(Instant::now()))
+                    .filter(|remaining| !remaining.is_zero());
+                if let Some(remaining) = remaining {
+                    work.active = Some(active);
+                    return Ok((
+                        BuilderPhase::CatchUp(work),
+                        BuilderDisposition::Retry(remaining),
+                        None,
+                    ));
+                }
             }
-            if work.must_publish || work.changed {
-                work.progress.complete();
+            if work.publishing.is_some() {
+                work.active = Some(active);
                 return Ok((
-                    BuilderPhase::Publish(PublishWork {
-                        current: work.current,
-                        barrier: work.through,
-                        candidate: work.candidate,
-                        admission,
-                    }),
-                    BuilderDisposition::Ready,
+                    BuilderPhase::CatchUp(work),
+                    BuilderDisposition::Retry(Duration::from_millis(10)),
+                    None,
+                ));
+            }
+            flush_builder(
+                &job.definition,
+                job.kind,
+                &mut active.builder,
+                &mut work.candidate,
+                dependencies,
+            )
+            .await?;
+            // Incremental publication owns the journal-retention critical
+            // path. Segment and locator debt is repaid only after this exact
+            // checkpoint is committed; a merge must never delay source
+            // checkpoint publication.
+            if work.must_publish || work.changed {
+                enqueue_candidate_publication(job, &mut work, admission, dependencies).await?;
+                active.started = None;
+                active.operations = 0;
+                active.quantum = SourceWorkQuantum::from_budget_limit(active.permit.bytes());
+                work.active = Some(active);
+                return Ok((
+                    BuilderPhase::CatchUp(work),
+                    BuilderDisposition::Retry(Duration::from_millis(10)),
                     None,
                 ));
             }
             let current = work.current.ok_or_else(|| {
-                Status::internal("incremental builder lost its current generation")
+                Status::internal("incremental builder lost its current committed view")
             })?;
             work.progress.complete();
             return Ok((
@@ -1038,11 +1247,59 @@ async fn advance_catch_up(
             ));
         };
 
-        let records = page.changes.len() as u64;
-        let encoded_bytes = page.encoded_bytes;
         let page_resident_bytes = catch_up::journal_page_resident_bytes(&page)?;
-        let page_plan = work_plan_for_limit(granted_bytes, page_resident_bytes)?;
-        tracing::info!(
+        let admitted_resident_bytes = page_resident_bytes
+            .checked_add(active.builder.frozen_resident_charge())
+            .ok_or_else(|| Status::resource_exhausted("index pipeline resident bytes overflow"))?;
+        let page_plan = work_plan_for_limit(
+            active.permit.bytes(),
+            admitted_resident_bytes,
+            dependencies.config.segment_flush_bytes(job.kind),
+        );
+        let page_plan = match page_plan {
+            Ok(plan) => plan,
+            Err(_) if active.builder.frozen.is_some() => {
+                // The one frozen slot has consumed this permit's remaining
+                // projection capacity. Join it and retry the exact page rather
+                // than allocating outside the global budget.
+                finish_frozen_segment(job.kind, &mut active.builder, &mut work.candidate).await?;
+                work_plan_for_limit(
+                    active.permit.bytes(),
+                    page_resident_bytes,
+                    dependencies.config.segment_flush_bytes(job.kind),
+                )?
+            }
+            Err(error) => return Err(error),
+        };
+        let atomic_plan = if page
+            .changes
+            .iter()
+            .any(|entry| matches!(entry.change, LocalChange::AtomicBatchPublished(_)))
+        {
+            let atomic_resident_bytes = page_resident_bytes
+                .checked_add(active.builder.frozen_resident_charge())
+                .ok_or_else(|| Status::resource_exhausted("atomic unit resident bytes overflow"))?;
+            match work_plan_for_limit(
+                active.permit.bytes(),
+                atomic_resident_bytes,
+                active.permit.bytes(),
+            ) {
+                Ok(plan) => plan,
+                Err(_) if active.builder.frozen.is_some() => {
+                    finish_frozen_segment(job.kind, &mut active.builder, &mut work.candidate)
+                        .await?;
+                    work_plan_for_limit(
+                        active.permit.bytes(),
+                        page_resident_bytes,
+                        active.permit.bytes(),
+                    )?
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            page_plan
+        };
+        tracing::debug!(
             index.kind = ?job.kind,
             gauge.keldra_index_journal_page_resident_bytes = page_resident_bytes,
             histogram.keldra_index_journal_page_resident_bytes = page_resident_bytes,
@@ -1053,84 +1310,142 @@ async fn advance_catch_up(
             process_journal_page(
                 &job.definition,
                 job.kind,
-                &work.target,
+                &work.through,
                 &page,
                 page_plan,
-                &mut builder,
+                atomic_plan,
+                &mut active.builder,
                 &mut work.candidate,
+                &mut work.atomic_projection,
                 dependencies,
+                active
+                    .started
+                    .map(|started| started + dependencies.config.segment_flush_max_age()),
+                dependencies.config.segment_flush_max_age(),
             ),
         )
         .await?;
+        if page_work.changed {
+            active
+                .started
+                .get_or_insert(page_work.first_changed_at.unwrap_or_else(Instant::now));
+        }
         work.changed |= page_work.changed;
-        record_source_page_progress(&mut work, &page);
-        work.progress.advance(records, encoded_bytes);
-        tracing::info!(
+        active.operations = active
+            .operations
+            .saturating_add(page_work.processed_records);
+        catch_up::record_source_page_progress(&mut work, &page_work.through);
+        work.progress.advance(
+            page_work.processed_records,
+            page_work.processed_encoded_bytes,
+        );
+        tracing::debug!(
             index.kind = ?job.kind,
             monotonic_counter.keldra_index_source_payload_bytes_total =
                 page_work.source_payload_bytes,
             histogram.keldra_index_source_page_payload_bytes = page_work.source_payload_bytes,
             "index source page payload charged to work quantum"
         );
-        if quantum.advance_page(encoded_bytes, page_work.source_payload_bytes)?
-            == SourceWorkBoundary::SealAndYield
-        {
+        if page_work.atomic_pending {
+            work.active = Some(active);
+            return Ok((
+                BuilderPhase::CatchUp(work),
+                BuilderDisposition::Retry(Duration::from_millis(10)),
+                None,
+            ));
+        }
+        let quantum_boundary = active.quantum.advance_page(
+            page_work.processed_encoded_bytes,
+            page_work.source_payload_bytes,
+        )? == SourceWorkBoundary::SealAndYield;
+        let age_boundary = active.started.is_some_and(|started| {
+            started.elapsed() >= dependencies.config.segment_flush_max_age()
+        });
+        let operation_boundary =
+            active.operations >= dependencies.config.segment_flush_max_operations(job.kind);
+        if age_boundary {
+            if work.publishing.is_some() {
+                work.active = Some(active);
+                return Ok((
+                    BuilderPhase::CatchUp(work),
+                    BuilderDisposition::Retry(Duration::from_millis(10)),
+                    None,
+                ));
+            }
             flush_builder(
                 &job.definition,
                 job.kind,
-                &mut builder,
+                &mut active.builder,
                 &mut work.candidate,
                 dependencies,
             )
             .await?;
-            drop(permit);
+            enqueue_candidate_publication(job, &mut work, admission, dependencies).await?;
+            active.started = None;
+            active.operations = 0;
+            active.quantum = SourceWorkQuantum::from_budget_limit(active.permit.bytes());
+            work.active = Some(active);
+            return Ok((BuilderPhase::CatchUp(work), BuilderDisposition::Ready, None));
+        }
+        if quantum_boundary || operation_boundary {
+            // Size/operation/fairness boundaries detach the active buffer but
+            // do not force a commit. Journal intake continues through the
+            // replacement buffer while the single frozen slot seals. Only its
+            // explicit queue saturation can make the next detach wait.
+            if !active.builder.is_empty() {
+                freeze_builder(
+                    &job.definition,
+                    job.kind,
+                    &mut active.builder,
+                    &mut work.candidate,
+                    dependencies,
+                )
+                .await?;
+            }
+            active.quantum = SourceWorkQuantum::from_budget_limit(active.permit.bytes());
+            active.operations = 0;
+            work.active = Some(active);
             return Ok((BuilderPhase::CatchUp(work), BuilderDisposition::Ready, None));
         }
     }
 }
 
-fn record_source_page_progress(work: &mut CatchUpWork, page: &IndexJournalPage) {
-    // The complete barrier is part of the durable generation, even when every
-    // object in this routed bucket page is outside the definition's narrower
-    // path or content predicate. Publishing the unchanged segment set prevents an
-    // idle eviction or restart from forgetting provable zero-lag freshness.
-    work.must_publish |= work.through != page.through;
-    work.through = page.through.clone();
-}
-
-async fn publish_builder(
-    job: &mut BuilderJob,
-    work: PublishWork,
+async fn enqueue_candidate_publication(
+    job: &BuilderJob,
+    work: &mut CatchUpWork,
+    admission: DerivedArtifactAdmission,
     dependencies: &IndexBuilderDependencies,
-) -> Result<
-    (
-        BuilderPhase,
-        BuilderDisposition,
-        Option<PublishedGeneration>,
-    ),
-    Status,
-> {
-    let published = publish_candidate(
-        &job.definition,
+) -> Result<(), Status> {
+    debug_assert!(work.publishing.is_none());
+    rebuild::checkpoint_catch_up_root(job, work, dependencies).await?;
+    let current = work.current.clone();
+    let barrier = work.through.clone();
+    let candidate = work.candidate.clone();
+    let task = start_candidate_publication(
+        job.definition.clone(),
         job.kind,
-        work.barrier,
-        work.candidate,
-        work.current.as_ref(),
-        work.admission,
-        dependencies,
-    )
-    .await?;
-    let (next, disposition) = complete_publication(job);
-    Ok((next, disposition, Some(published)))
-}
-
-fn complete_publication(_job: &mut BuilderJob) -> (BuilderPhase, BuilderDisposition) {
-    (BuilderPhase::Inspect, BuilderDisposition::Idle)
+        barrier.clone(),
+        candidate.clone(),
+        current.clone(),
+        admission,
+        dependencies.clone(),
+    );
+    work.publishing = Some(InFlightPublication {
+        current,
+        barrier,
+        candidate,
+        admission,
+        task,
+    });
+    work.changed = false;
+    work.must_publish = false;
+    work.checkpoint_started = None;
+    Ok(())
 }
 
 async fn compact_one_if_needed(
     job: &BuilderJob,
-    candidate: &mut CandidateGeneration,
+    candidate: &mut CandidateCommit,
     limits: DebtLimits,
     dependencies: &IndexBuilderDependencies,
 ) -> Result<bool, Status> {
@@ -1141,7 +1456,11 @@ async fn compact_one_if_needed(
         limits.maximum_bytes,
         "observed",
     );
-    let Some(selection) = debt::select(&candidate.segments, limits) else {
+    let Some(selection) = debt::select_before_locator_limit(
+        &candidate.segments,
+        candidate.locator_roots.len(),
+        limits,
+    ) else {
         let Some(locator_selection) = debt::select_locator_roots(&candidate.locator_roots, limits)
         else {
             return Ok(false);
@@ -1159,6 +1478,7 @@ async fn compact_one_if_needed(
             .acquire(budget.limit())
             .await
             .map_err(budget_status)?;
+        let _publication_slot = dependencies.publication_slots.acquire_maintenance().await?;
         locator_debt::compact_oldest_prefix(
             &job.definition,
             job.kind,
@@ -1181,6 +1501,7 @@ async fn compact_one_if_needed(
         .acquire_up_to(budget.limit(), budget.working_memory_limit())
         .await
         .map_err(budget_status)?;
+    let _publication_slot = dependencies.publication_slots.acquire_maintenance().await?;
     compact_tier(
         &job.definition,
         job.kind,
@@ -1222,124 +1543,6 @@ fn kind_slot(kind: IndexKind) -> usize {
     kind as u8 as usize - 1
 }
 
-fn runtime_kind(kind: keldra_index::v4::IndexKind) -> IndexKind {
-    match kind {
-        keldra_index::v4::IndexKind::Path => IndexKind::Path,
-        keldra_index::v4::IndexKind::MetadataFilter => IndexKind::MetadataFilter,
-        keldra_index::v4::IndexKind::TypedJson => IndexKind::TypedJson,
-        keldra_index::v4::IndexKind::FullText => IndexKind::FullText,
-        keldra_index::v4::IndexKind::Vector => IndexKind::Vector,
-        keldra_index::v4::IndexKind::Hybrid => IndexKind::Hybrid,
-        keldra_index::v4::IndexKind::GitSource => IndexKind::GitSource,
-        keldra_index::v4::IndexKind::Tensor => IndexKind::Tensor,
-    }
-}
-
-fn manifest_physical_order(schema: &Schema) -> Vec<ManifestPhysicalOrder> {
-    schema
-        .physical_order
-        .iter()
-        .map(|order| ManifestPhysicalOrder {
-            field_id: order.field_id,
-            descending: matches!(
-                order.direction,
-                keldra_index::v4::OrderDirection::Descending
-            ),
-        })
-        .collect()
-}
-
-#[derive(Clone)]
-struct CandidateGeneration {
-    segments: Vec<SegmentDescriptor>,
-    locator_roots: Vec<LocatorRoot>,
-    next_sequence: u64,
-    diagnostics: IndexBuildDiagnostics,
-}
-
-impl CandidateGeneration {
-    fn rebuild() -> Self {
-        Self {
-            segments: Vec::new(),
-            locator_roots: Vec::new(),
-            next_sequence: 1,
-            diagnostics: IndexBuildDiagnostics::default(),
-        }
-    }
-
-    fn incremental(current: &PublishedGeneration) -> Self {
-        let next_sequence = current
-            .manifest
-            .locator_roots
-            .last()
-            .map_or(1, |root| root.sequence.saturating_add(1));
-        Self {
-            segments: current.manifest.segments.clone(),
-            locator_roots: current.manifest.locator_roots.clone(),
-            next_sequence,
-            diagnostics: IndexBuildDiagnostics::default(),
-        }
-    }
-
-    fn allocate_sequence(&mut self) -> Result<u64, Status> {
-        let sequence = self.next_sequence;
-        self.next_sequence = self
-            .next_sequence
-            .checked_add(1)
-            .ok_or_else(|| Status::resource_exhausted("path-locator sequence exhausted"))?;
-        Ok(sequence)
-    }
-
-    fn locator_stream_roots(&self) -> Result<Vec<LocatorStreamRoot>, Status> {
-        self.locator_roots
-            .iter()
-            .map(|root| self.locator_stream_root(root))
-            .collect()
-    }
-
-    fn locator_stream_root(&self, root: &LocatorRoot) -> Result<LocatorStreamRoot, Status> {
-        let segment = self
-            .segments
-            .binary_search_by_key(&root.identity.segment_id, |segment| {
-                segment.identity.segment_id
-            })
-            .ok()
-            .map(|position| &self.segments[position]);
-        let packs = match (&root.pack_ownership, segment) {
-            (LocatorPackOwnership::Segment, Some(segment)) if segment.identity == root.identity => {
-                segment.packs.clone()
-            }
-            (LocatorPackOwnership::Standalone(packs), None) if !packs.is_empty() => packs.clone(),
-            (LocatorPackOwnership::Segment, None) => {
-                return Err(Status::data_loss(
-                    "segment-owned locator has no generation segment",
-                ));
-            }
-            (LocatorPackOwnership::Segment, Some(_)) => {
-                return Err(Status::data_loss(
-                    "segment-owned locator identity differs from its generation segment",
-                ));
-            }
-            (LocatorPackOwnership::Standalone(_), Some(_)) => {
-                return Err(Status::data_loss(
-                    "standalone locator duplicates a generation segment owner",
-                ));
-            }
-            (LocatorPackOwnership::Standalone(_), None) => {
-                return Err(Status::data_loss(
-                    "standalone locator has no artifact pack table",
-                ));
-            }
-        };
-        Ok(LocatorStreamRoot {
-            sequence: root.sequence,
-            identity: root.identity,
-            packs,
-            artifact: root.artifact.clone(),
-        })
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default)]
 struct ProjectionExecution {
     queue_seconds: f64,
@@ -1349,20 +1552,62 @@ struct ProjectionExecution {
 struct NativeSegmentBuild {
     writer: NativeSegmentWriter,
     plan: SegmentMemoryPlan,
+    maximum_operations: u64,
+    started: Option<Instant>,
+    source_paths: BTreeMap<String, u64>,
+    frozen: Option<FrozenSegmentTask>,
+    publication_lane: SegmentPublicationLane,
+    maximum_segments: usize,
+}
+
+#[derive(Clone, Copy)]
+enum SegmentPublicationLane {
+    Incremental,
+    Maintenance,
+}
+
+struct FrozenSegmentTask {
+    task: AbortOnDropTask<Result<FrozenSegment, Status>>,
+    source_paths: BTreeMap<String, u64>,
+    resident_charge: u64,
+}
+
+struct FrozenSegment {
+    built: BuiltSegment,
+    resident_bytes: u64,
+    seal_workspace_bytes: u64,
 }
 
 impl NativeSegmentBuild {
     fn new(
         job: &BuilderJob,
         plan: SegmentMemoryPlan,
+        publication_lane: SegmentPublicationLane,
         dependencies: &IndexBuilderDependencies,
     ) -> Result<Self, Status> {
-        Self::open(&job.definition, plan, dependencies)
+        Self::open(&job.definition, plan, publication_lane, dependencies)
     }
 
     fn open(
         definition: &CatalogDefinition,
         plan: SegmentMemoryPlan,
+        publication_lane: SegmentPublicationLane,
+        dependencies: &IndexBuilderDependencies,
+    ) -> Result<Self, Status> {
+        Self::open_with_segment_limit(
+            definition,
+            plan,
+            publication_lane,
+            MAX_SEGMENTS_PER_COMMIT,
+            dependencies,
+        )
+    }
+
+    fn open_with_segment_limit(
+        definition: &CatalogDefinition,
+        plan: SegmentMemoryPlan,
+        publication_lane: SegmentPublicationLane,
+        maximum_segments: usize,
         dependencies: &IndexBuilderDependencies,
     ) -> Result<Self, Status> {
         let segment_id = dependencies
@@ -1384,11 +1629,28 @@ impl NativeSegmentBuild {
         .map_err(index_status)?;
         let writer = NativeSegmentWriter::new(identity, definition.schema.clone(), limits)
             .map_err(index_status)?;
-        Ok(Self { writer, plan })
+        Ok(Self {
+            writer,
+            plan,
+            maximum_operations: dependencies
+                .config
+                .segment_flush_max_operations(runtime_kind(definition.schema.kind)),
+            started: None,
+            source_paths: BTreeMap::new(),
+            frozen: None,
+            publication_lane,
+            maximum_segments,
+        })
     }
 
     fn is_empty(&self) -> bool {
         self.writer.source_count() == 0
+    }
+
+    fn frozen_resident_charge(&self) -> u64 {
+        self.frozen
+            .as_ref()
+            .map_or(0, |frozen| frozen.resident_charge)
     }
 }
 
@@ -1397,21 +1659,59 @@ async fn push_or_flush(
     kind: IndexKind,
     builder: &mut NativeSegmentBuild,
     source: NativeProjectedSource,
-    candidate: &mut CandidateGeneration,
+    candidate: &mut CandidateCommit,
     dependencies: &IndexBuilderDependencies,
+    soft_flush_allowed: bool,
 ) -> Result<(), Status> {
+    let age_boundary = soft_flush_allowed
+        && builder.started.is_some_and(|started| {
+            started.elapsed() >= dependencies.config.segment_flush_max_age()
+        });
+    if soft_flush_allowed
+        && (builder.writer.source_count() as u64 >= builder.maximum_operations || age_boundary)
+    {
+        freeze_builder(definition, kind, builder, candidate, dependencies).await?;
+    }
     if let Some(version) = builder.writer.source_version(&source.source_identity.path) {
         if version == source.source_identity.version {
             return Ok(());
         }
         flush_builder(definition, kind, builder, candidate, dependencies).await?;
     }
+    let path = source.source_identity.path.clone();
+    let version = source.source_identity.version;
     match builder.writer.push_source(source).map_err(index_status)? {
-        SourcePush::Accepted => Ok(()),
+        SourcePush::Accepted => {
+            builder.started.get_or_insert_with(Instant::now);
+            builder.source_paths.insert(path, version);
+            observability::emit_active_buffer(
+                definition.stored.index_id,
+                kind,
+                builder.writer.buffered_source_bytes() as u64,
+                builder.writer.source_count() as u64,
+                builder
+                    .started
+                    .map_or(Duration::ZERO, |started| started.elapsed()),
+            );
+            Ok(())
+        }
         SourcePush::Full(pending) => {
-            flush_builder(definition, kind, builder, candidate, dependencies).await?;
+            freeze_builder(definition, kind, builder, candidate, dependencies).await?;
             match builder.writer.push_source(pending).map_err(index_status)? {
-                SourcePush::Accepted => Ok(()),
+                SourcePush::Accepted => {
+                    builder.started.get_or_insert_with(Instant::now);
+                    builder.source_paths.insert(path, version);
+                    observability::emit_active_buffer(
+                        definition.stored.index_id,
+                        kind,
+                        builder.writer.buffered_source_bytes() as u64,
+                        builder.writer.source_count() as u64,
+                        builder
+                            .started
+                            .map_or(Duration::ZERO, |started| started.elapsed()),
+                    );
+                    Ok(())
+                }
                 SourcePush::Full(_) => Err(Status::resource_exhausted(
                     "one projected source cannot fit an empty format-v4 segment",
                 )),
@@ -1424,31 +1724,111 @@ async fn flush_builder(
     definition: &CatalogDefinition,
     kind: IndexKind,
     builder: &mut NativeSegmentBuild,
-    candidate: &mut CandidateGeneration,
+    candidate: &mut CandidateCommit,
+    dependencies: &IndexBuilderDependencies,
+) -> Result<(), Status> {
+    if !builder.is_empty() {
+        freeze_builder(definition, kind, builder, candidate, dependencies).await?;
+    }
+    finish_frozen_segment(kind, builder, candidate).await
+}
+
+async fn freeze_builder(
+    definition: &CatalogDefinition,
+    kind: IndexKind,
+    builder: &mut NativeSegmentBuild,
+    candidate: &mut CandidateCommit,
     dependencies: &IndexBuilderDependencies,
 ) -> Result<(), Status> {
     if builder.is_empty() {
         return Ok(());
     }
-    if candidate.segments.len() >= MAX_SEGMENTS_PER_GENERATION {
+    let flush_reason = if builder
+        .started
+        .is_some_and(|started| started.elapsed() >= dependencies.config.segment_flush_max_age())
+    {
+        "maximum_age"
+    } else if builder.writer.source_count() as u64 >= builder.maximum_operations {
+        "maximum_operations"
+    } else if builder.writer.buffered_source_bytes() >= builder.plan.max_resident_bytes {
+        "maximum_bytes"
+    } else {
+        "explicit_boundary"
+    };
+    // The queue contains exactly one detached buffer. Saturation pauses only
+    // this definition; it cannot allocate an unbounded sequence of frozen
+    // builders or consume another definition's memory budget.
+    finish_frozen_segment(kind, builder, candidate).await?;
+    if candidate.segments.len() >= builder.maximum_segments {
         return Err(Status::resource_exhausted(
-            "format-v4 generation reached its immutable segment bound",
+            "format-v4 commit reached its immutable segment bound",
         ));
     }
-    let replacement = NativeSegmentBuild::open(definition, builder.plan, dependencies)?;
+    let publication_lane = builder.publication_lane;
+    let replacement =
+        NativeSegmentBuild::open(definition, builder.plan, publication_lane, dependencies)?;
     let full = std::mem::replace(builder, replacement);
     let resident = full.writer.buffered_source_bytes() as u64;
     let seal_workspace = full
         .plan
         .seal_workspace_bytes(full.writer.buffered_source_bytes())
         .map_err(index_status)?;
+    let publication_slots = dependencies.publication_slots.clone();
     let mut sink = dependencies.publisher.component_sink(
         &definition.stored,
         definition.tenant_id,
         definition.bucket_id,
         DerivedArtifactAdmission::PublicationProgress,
     );
-    let built = full.writer.seal(&mut sink).await.map_err(index_status)?;
+    builder.frozen = Some(FrozenSegmentTask {
+        source_paths: full.source_paths,
+        // The active permit owns the complete bounded pipeline. Every later
+        // source-page plan subtracts this detached seal footprint before it
+        // admits projection work, so active and frozen state cannot each spend
+        // the same reserved bytes.
+        resident_charge: seal_workspace as u64,
+        task: AbortOnDropTask::new(tokio::spawn(async move {
+            let _publication_slot = match publication_lane {
+                SegmentPublicationLane::Incremental => {
+                    publication_slots.acquire_incremental().await?
+                }
+                SegmentPublicationLane::Maintenance => {
+                    publication_slots.acquire_maintenance().await?
+                }
+            };
+            let built = full.writer.seal(&mut sink).await.map_err(index_status)?;
+            Ok(FrozenSegment {
+                built,
+                resident_bytes: resident,
+                seal_workspace_bytes: seal_workspace as u64,
+            })
+        })),
+    });
+    observability::emit_active_buffer(definition.stored.index_id, kind, 0, 0, Duration::ZERO);
+    observability::emit_frozen_buffer(
+        definition.stored.index_id,
+        kind,
+        1,
+        seal_workspace as u64,
+        flush_reason,
+    );
+    Ok(())
+}
+
+async fn finish_frozen_segment(
+    kind: IndexKind,
+    builder: &mut NativeSegmentBuild,
+    candidate: &mut CandidateCommit,
+) -> Result<(), Status> {
+    let Some(frozen_task) = builder.frozen.take() else {
+        return Ok(());
+    };
+    let frozen =
+        frozen_task.task.join().await.map_err(|error| {
+            Status::internal(format!("index segment flush task failed: {error}"))
+        })??;
+    let built = frozen.built;
+    observability::emit_frozen_buffer(built.descriptor.identity.index_id, kind, 0, 0, "completed");
     let sequence = candidate.allocate_sequence()?;
     let descriptor_identity = built.descriptor.identity;
     candidate.segments.push(built.descriptor);
@@ -1466,8 +1846,8 @@ async fn flush_builder(
     candidate.locator_roots.sort_by_key(|root| root.sequence);
     tracing::info!(
         index.kind = ?kind,
-        gauge.keldra_index_construction_resident_bytes = resident,
-        gauge.keldra_index_construction_workspace_bytes = seal_workspace as u64,
+        gauge.keldra_index_construction_resident_bytes = frozen.resident_bytes,
+        gauge.keldra_index_construction_workspace_bytes = frozen.seal_workspace_bytes,
         monotonic_counter.keldra_index_flushes_total = 1_u64,
         monotonic_counter.keldra_index_segments_created_total = 1_u64,
         "format-v4 index segment flushed"
@@ -1481,7 +1861,7 @@ async fn compact_tier(
     selection: DebtSelection,
     leased_bytes: u64,
     admission: DerivedArtifactAdmission,
-    candidate: &mut CandidateGeneration,
+    candidate: &mut CandidateCommit,
     dependencies: &IndexBuilderDependencies,
 ) -> Result<(), Status> {
     v4_merge::compact_selected_segments(
@@ -1494,138 +1874,6 @@ async fn compact_tier(
         dependencies,
     )
     .await
-}
-
-async fn publish_candidate(
-    definition: &CatalogDefinition,
-    kind: IndexKind,
-    barrier: IndexBarrier,
-    candidate: CandidateGeneration,
-    current: Option<&PublishedGeneration>,
-    admission: DerivedArtifactAdmission,
-    dependencies: &IndexBuilderDependencies,
-) -> Result<PublishedGeneration, Status> {
-    let started = Instant::now();
-    let expected_generation = current.map_or(1, |value| {
-        value.pointer.current.generation.saturating_add(1)
-    });
-    let segment_count = candidate.segments.len() as u64;
-    let accepted_objects = candidate.diagnostics.accepted_objects;
-    let skipped_objects = candidate.diagnostics.skipped_objects;
-    let authoritative_bytes = candidate
-        .segments
-        .iter()
-        .map(|segment| segment.encoded_bytes)
-        .chain(
-            candidate
-                .locator_roots
-                .iter()
-                .map(|root| root.encoded_bytes),
-        )
-        .sum::<u64>();
-    let span = tracing::info_span!(
-        "keldra.index.publication",
-        index.id = definition.stored.index_id,
-        tenant.id = definition.tenant_id,
-        bucket.id = definition.bucket_id,
-        index.kind = ?kind,
-        generation = expected_generation,
-        publication.segments = segment_count,
-        publication.authoritative_bytes = authoritative_bytes,
-        publication.accepted_objects = accepted_objects,
-        publication.skipped_objects = skipped_objects,
-        publication.fence_term = barrier.fence.term,
-        publication.fence_index = barrier.fence.index,
-        publication.source_count = barrier.sources.len(),
-        publication.elapsed_seconds = tracing::field::Empty,
-        publication.outcome = tracing::field::Empty,
-        otel.status_code = tracing::field::Empty,
-    );
-    let result = async {
-        dependencies
-            .journal
-            .validate_publication_barrier(&barrier)
-            .await
-            .map_err(event_status)?;
-        dependencies
-            .publisher
-            .publish_manifest(
-                &definition.stored,
-                definition.tenant_id,
-                definition.bucket_id,
-                definition.object_version,
-                definition.schema.kind,
-                definition.schema_fingerprint,
-                barrier,
-                manifest_physical_order(&definition.schema),
-                candidate.segments,
-                candidate.locator_roots,
-                current,
-                admission,
-            )
-            .await
-    }
-    .instrument(span.clone())
-    .await;
-    let elapsed_seconds = started.elapsed().as_secs_f64();
-    span.record("publication.elapsed_seconds", elapsed_seconds);
-    span.record(
-        "publication.outcome",
-        if result.is_err() {
-            "failed"
-        } else {
-            "completed"
-        },
-    );
-    span.record(
-        "otel.status_code",
-        if result.is_err() { "error" } else { "ok" },
-    );
-    let published = match result {
-        Ok(value) => value,
-        Err(error) => {
-            span.in_scope(|| {
-                tracing::info!(
-                    index.kind = ?kind,
-                    publication.outcome = "failed",
-                    monotonic_counter.keldra_index_publication_failures_total = 1_u64,
-                    histogram.keldra_index_publication_duration_seconds = elapsed_seconds,
-                    "index generation publication failed"
-                );
-            });
-            return Err(error);
-        }
-    };
-    dependencies
-        .derived_progress
-        .report(
-            derived_identity(definition),
-            DerivedBarrierEvidence::Published(
-                published.manifest.barrier().map_err(generation_status)?,
-            ),
-        )
-        .await;
-    span.in_scope(|| {
-        tracing::info!(
-            generation = published.pointer.current.generation,
-            "index generation published"
-        );
-        tracing::info!(
-            index.kind = ?kind,
-            publication.outcome = "completed",
-            gauge.keldra_index_generation = published.pointer.current.generation,
-            gauge.keldra_index_publication_present = 1_u64,
-            gauge.keldra_index_publication_age_seconds = 0_f64,
-            gauge.keldra_index_publication_fresh = 1_u64,
-            gauge.keldra_index_source_lag = 0_u64,
-            monotonic_counter.keldra_index_generation_accepted_objects_total = accepted_objects,
-            monotonic_counter.keldra_index_generation_skipped_objects_total = skipped_objects,
-            monotonic_counter.keldra_index_publications_total = 1_u64,
-            histogram.keldra_index_publication_duration_seconds = elapsed_seconds,
-            "index generation publication metrics"
-        );
-    });
-    Ok(published)
 }
 
 const fn publication_admission(maintenance: bool) -> DerivedArtifactAdmission {
@@ -1682,41 +1930,6 @@ fn build_object(path: &str, version: &keldra_store::Version) -> Result<IndexBuil
     })
 }
 
-fn require_visible_head(head: &Head, barrier: &IndexBarrier) -> Result<(), Status> {
-    let Some(stamp) = head.mutation_stamp else {
-        return Ok(());
-    };
-    if !barrier.atomic.permits(stamp.program_commit_cursor) {
-        return Err(Status::unavailable(
-            "index source belongs to an unfinalized atomic program",
-        ));
-    }
-    let stamp_fence = (
-        stamp.active_placement_log_id.term,
-        stamp.active_placement_log_id.index,
-    );
-    let barrier_fence = (barrier.fence.term, barrier.fence.index);
-    if stamp_fence > barrier_fence {
-        return Err(Status::aborted(
-            "index source advanced beyond its captured placement fence",
-        ));
-    }
-    if stamp_fence == barrier_fence {
-        let node = NodeId(u64::from(stamp.source_id.node_id));
-        let Some(cursor) = barrier.sources.get(&node) else {
-            return Err(Status::aborted(
-                "index source mutation is absent from the captured source vector",
-            ));
-        };
-        if cursor.source != stamp.source_id || stamp.source_journal_position >= cursor.next_offset {
-            return Err(Status::aborted(
-                "index source mutation advanced beyond its captured journal target",
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn source_needs_payload(schema: &Schema) -> bool {
     !matches!(
         schema.kind,
@@ -1731,136 +1944,6 @@ fn source_payload_bytes_for(schema: &Schema, source: &IndexSourceMutation) -> u6
         }
         IndexSourceMutation::Upsert(_) | IndexSourceMutation::Remove(_) => 0,
     }
-}
-
-fn source_wire_limit(limit: u64) -> u64 {
-    let fixed = FIXED_INDEX_SEAL_WORKSPACE_BYTES as u64;
-    let remaining = limit.saturating_sub(fixed);
-    // SegmentMemoryPlan reserves half of the non-fixed budget for the mutable
-    // builder. Source framing may use only the other half, so the minimum
-    // accepted kind budget remains useful instead of consuming all of its
-    // builder capacity in the decoded-source reserve.
-    let builder_reserve = remaining / 2;
-    let safe = remaining
-        .saturating_sub(builder_reserve)
-        .saturating_sub(256);
-    MAX_SOURCE_WIRE_BYTES.min(safe.max(64 * 1024))
-}
-
-fn work_plan_for_limit(
-    limit: u64,
-    source_resident_bytes: u64,
-) -> Result<SegmentMemoryPlan, Status> {
-    let total = usize::try_from(limit)
-        .map_err(|_| Status::resource_exhausted("index construction budget exceeds platform"))?;
-    let source_resident = usize::try_from(source_resident_bytes)
-        .map_err(|_| Status::resource_exhausted("index source frame exceeds platform"))?;
-    let available = total.checked_sub(source_resident).ok_or_else(|| {
-        Status::resource_exhausted("resident index source frame exhausts its kind budget")
-    })?;
-    let configured = SegmentMemoryPlan::new(total).map_err(index_status)?;
-    let max_source_projection_bytes = available
-        .checked_sub(FIXED_INDEX_SEAL_WORKSPACE_BYTES)
-        .and_then(|bytes| bytes.checked_sub(configured.max_resident_bytes))
-        .filter(|bytes| *bytes > 0)
-        .ok_or_else(|| {
-            Status::resource_exhausted("index source frame leaves no bounded projection workspace")
-        })?;
-    Ok(SegmentMemoryPlan {
-        total_bytes: total,
-        max_resident_bytes: configured.max_resident_bytes,
-        max_source_projection_bytes,
-    })
-}
-
-fn emit_source_lag(kind: IndexKind, from: &IndexBarrier, target: &IndexBarrier) {
-    let lag = from.sources.iter().fold(0_u64, |total, (node, cursor)| {
-        total.saturating_add(target.sources.get(node).map_or(0, |latest| {
-            latest.next_offset.saturating_sub(cursor.next_offset)
-        }))
-    });
-    tracing::info!(
-        index.kind = ?kind,
-        gauge.keldra_index_source_lag = lag,
-        gauge.keldra_index_publication_fresh = u64::from(lag == 0),
-        "index source lag observed"
-    );
-}
-
-fn emit_publication_age(kind: IndexKind, current: Option<&PublishedGeneration>) {
-    let Some(current) = current else {
-        tracing::info!(
-            index.kind = ?kind,
-            gauge.keldra_index_publication_present = 0_u64,
-            gauge.keldra_index_publication_age_seconds = 0_f64,
-            gauge.keldra_index_publication_fresh = 0_u64,
-            "index has no published generation"
-        );
-        return;
-    };
-    let now_millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0_u64, |duration| {
-            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-        });
-    let age_seconds = now_millis.saturating_sub(current.pointer.current.published_at_unix_millis)
-        as f64
-        / 1_000.0;
-    tracing::info!(
-        index.kind = ?kind,
-        gauge.keldra_index_publication_present = 1_u64,
-        gauge.keldra_index_publication_age_seconds = age_seconds,
-        "index publication age observed"
-    );
-}
-
-fn current_placement(decisions: &DecisionRaft) -> Result<ClusterPlacement, Status> {
-    let state = decisions
-        .state()
-        .map_err(|_| Status::unavailable("applied cluster membership is unavailable"))?;
-    ClusterPlacement::from_applied(&state).map_err(|error| Status::unavailable(error.to_string()))
-}
-
-fn budget_status(error: IndexBudgetError) -> Status {
-    Status::resource_exhausted(error.to_string())
-}
-
-fn cpu_status(error: IndexCpuPoolError) -> Status {
-    Status::internal(error.to_string())
-}
-
-fn index_status(error: IndexError) -> Status {
-    match error {
-        IndexError::ResourceLimit { .. } => Status::resource_exhausted(error.to_string()),
-        IndexError::Io(_) => Status::unavailable(error.to_string()),
-        _ => Status::data_loss(error.to_string()),
-    }
-}
-
-fn event_status(error: IndexEventError) -> Status {
-    match error {
-        IndexEventError::Placement(_)
-        | IndexEventError::AtomicProgramInProgress
-        | IndexEventError::Source { .. }
-        | IndexEventError::Task(_) => Status::unavailable(error.to_string()),
-        IndexEventError::BarrierChanged => Status::aborted(error.to_string()),
-        IndexEventError::CheckpointMismatch(_)
-        | IndexEventError::SourceEpochChanged(_)
-        | IndexEventError::SourceHistoryGap(_)
-        | IndexEventError::IncompleteSources => Status::failed_precondition(error.to_string()),
-        IndexEventError::PageBytesExceeded { .. } => Status::resource_exhausted(error.to_string()),
-        IndexEventError::ZeroPageByteLimit => Status::invalid_argument(error.to_string()),
-        IndexEventError::InvalidSourceStatus(_)
-        | IndexEventError::NonContiguousSource(_)
-        | IndexEventError::OffsetOverflow(_)
-        | IndexEventError::PageLengthOverflow
-        | IndexEventError::PageLengthMismatch { .. }
-        | IndexEventError::Encode(_) => Status::data_loss(error.to_string()),
-    }
-}
-
-fn generation_status(error: super::generation::GenerationError) -> Status {
-    Status::data_loss(error.to_string())
 }
 
 #[cfg(test)]

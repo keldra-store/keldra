@@ -10,7 +10,7 @@ use tonic::Status;
 
 use crate::index_runtime::cache::{IndexMergeScratchFile, IndexMergeScratchSpace};
 
-pub(super) const RETENTION_GENERATION_SLOTS: usize = 64;
+pub(super) const RETENTION_COMMIT_SLOTS: usize = 64;
 const RECORD_BYTES: usize = 50;
 const SORT_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 const SORT_CHUNK_RECORDS: usize = SORT_CHUNK_BYTES / RECORD_BYTES;
@@ -25,7 +25,7 @@ pub(super) struct RetainedObjectRecord {
     digest: [u8; 32],
     version: u64,
     bytes: u64,
-    generation_rank: u8,
+    commit_rank: u8,
 }
 
 impl RetainedObjectRecord {
@@ -34,10 +34,9 @@ impl RetainedObjectRecord {
         digest: [u8; 32],
         version: u64,
         bytes: u64,
-        generation_rank: usize,
+        commit_rank: usize,
     ) -> Result<Self, Status> {
-        if class == 0 || version == 0 || bytes == 0 || generation_rank >= RETENTION_GENERATION_SLOTS
-        {
+        if class == 0 || version == 0 || bytes == 0 || commit_rank >= RETENTION_COMMIT_SLOTS {
             return Err(Status::data_loss(
                 "retained object-version scratch record is invalid",
             ));
@@ -47,7 +46,7 @@ impl RetainedObjectRecord {
             digest,
             version,
             bytes,
-            generation_rank: generation_rank as u8,
+            commit_rank: commit_rank as u8,
         })
     }
 
@@ -55,12 +54,16 @@ impl RetainedObjectRecord {
         (self.class, self.digest, self.version)
     }
 
+    pub(super) fn parts(&self) -> (u8, [u8; 32], u64, u64) {
+        (self.class, self.digest, self.version, self.bytes)
+    }
+
     fn encode(self, output: &mut Vec<u8>) {
         output.push(self.class);
         output.extend_from_slice(&self.digest);
         output.extend_from_slice(&self.version.to_be_bytes());
         output.extend_from_slice(&self.bytes.to_be_bytes());
-        output.push(self.generation_rank);
+        output.push(self.commit_rank);
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, Status> {
@@ -93,7 +96,7 @@ impl Ord for RetainedObjectRecord {
     fn cmp(&self, other: &Self) -> Ordering {
         self.key()
             .cmp(&other.key())
-            .then(self.generation_rank.cmp(&other.generation_rank))
+            .then(self.commit_rank.cmp(&other.commit_rank))
     }
 }
 
@@ -436,7 +439,7 @@ struct ContributionSum {
     run: SortedRun,
     inputs: MergeInputs,
     pending: Option<RetainedObjectRecord>,
-    contributions: [u64; RETENTION_GENERATION_SLOTS],
+    contributions: [u64; RETENTION_COMMIT_SLOTS],
 }
 
 impl ContributionSum {
@@ -451,14 +454,14 @@ impl ContributionSum {
             run,
             inputs: MergeInputs::new(runs)?,
             pending: None,
-            contributions: [0; RETENTION_GENERATION_SLOTS],
+            contributions: [0; RETENTION_COMMIT_SLOTS],
         })
     }
 
     async fn advance(
         &mut self,
         deadline: Instant,
-    ) -> Result<Option<[u64; RETENTION_GENERATION_SLOTS]>, Status> {
+    ) -> Result<Option<[u64; RETENTION_COMMIT_SLOTS]>, Status> {
         let mut processed = 0_usize;
         while processed < MERGE_STEP_RECORDS && Instant::now() < deadline {
             let Some(record) = self.inputs.pop_min().await? else {
@@ -483,13 +486,13 @@ impl ContributionSum {
 
 pub(super) struct RetainedObjectProof {
     run: SortedRun,
-    contributions: [u64; RETENTION_GENERATION_SLOTS],
+    contributions: [u64; RETENTION_COMMIT_SLOTS],
     cache: BTreeMap<u64, Vec<RetainedObjectRecord>>,
     cache_order: VecDeque<u64>,
 }
 
 impl RetainedObjectProof {
-    fn new(run: SortedRun, contributions: [u64; RETENTION_GENERATION_SLOTS]) -> Self {
+    fn new(run: SortedRun, contributions: [u64; RETENTION_COMMIT_SLOTS]) -> Self {
         Self {
             run,
             contributions,
@@ -498,8 +501,21 @@ impl RetainedObjectProof {
         }
     }
 
-    pub(super) fn contributions(&self) -> &[u64; RETENTION_GENERATION_SLOTS] {
+    pub(super) fn contributions(&self) -> &[u64; RETENTION_COMMIT_SLOTS] {
         &self.contributions
+    }
+
+    pub(super) fn len(&self) -> u64 {
+        self.run.records
+    }
+
+    pub(super) async fn record(&mut self, index: u64) -> Result<RetainedObjectRecord, Status> {
+        if index >= self.run.records {
+            return Err(Status::invalid_argument(
+                "retention proof record index is out of bounds",
+            ));
+        }
+        self.record_at(index).await
     }
 
     pub(super) async fn lookup(
@@ -518,7 +534,7 @@ impl RetainedObjectProof {
                 Ordering::Less => low = middle + 1,
                 Ordering::Greater => high = middle,
                 Ordering::Equal => {
-                    return Ok(Some((record.bytes, usize::from(record.generation_rank))));
+                    return Ok(Some((record.bytes, usize::from(record.commit_rank))));
                 }
             }
         }
@@ -570,7 +586,7 @@ fn merge_pending(
                     "one retained ordinary object version has conflicting lengths",
                 ));
             }
-            current.generation_rank = current.generation_rank.min(record.generation_rank);
+            current.commit_rank = current.commit_rank.min(record.commit_rank);
         }
         Some(_) => {
             let previous = pending.replace(record).expect("pending record exists");
@@ -582,13 +598,13 @@ fn merge_pending(
 }
 
 fn add_contribution(
-    contributions: &mut [u64; RETENTION_GENERATION_SLOTS],
+    contributions: &mut [u64; RETENTION_COMMIT_SLOTS],
     record: RetainedObjectRecord,
 ) -> Result<(), Status> {
-    let slot = usize::from(record.generation_rank);
+    let slot = usize::from(record.commit_rank);
     contributions[slot] = contributions[slot]
         .checked_add(record.bytes)
-        .ok_or_else(|| Status::resource_exhausted("retained generation bytes overflowed"))?;
+        .ok_or_else(|| Status::resource_exhausted("retained revision bytes overflowed"))?;
     Ok(())
 }
 

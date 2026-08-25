@@ -6,7 +6,7 @@ use super::INDEX_TERM_BYTES;
 ///
 /// A lexical token is never split or truncated. After Unicode lowercase
 /// expansion, a token larger than the format's 32,766-byte term bound fails
-/// precisely so a generation cannot claim a complete barrier while omitting
+/// precisely so a commit cannot claim a complete barrier while omitting
 /// part of a source value.
 pub fn analyze_unicode_alphanumeric_lowercase(
     text: &str,

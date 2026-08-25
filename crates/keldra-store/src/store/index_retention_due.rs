@@ -2,14 +2,14 @@ use rocksdb::{Direction, IteratorMode, WriteBatch, WriteOptions};
 
 use super::{CF_DEFINITION_STATE, Store};
 use crate::key::STORAGE_KEY_FORMAT_VERSION;
-use crate::{
-    DeletedDefinitionCleanup, IndexGenerationRetentionDue, IndexRetentionDueError, VersionId,
-};
+use crate::{DeletedDefinitionCleanup, IndexCommitRetentionDue, IndexRetentionDueError, VersionId};
 
 const DUE_DOMAIN: u8 = b'D';
 const IDENTITY_DOMAIN: u8 = b'd';
-const VALUE_FORMAT: u8 = 1;
-const GENERATION_KIND: u8 = 1;
+// KELDRA-0016 deliberately rejects the previous candidate-generation due
+// record. Retention work now names an exact committed manifest revision.
+const VALUE_FORMAT: u8 = 2;
+const COMMIT_KIND: u8 = 1;
 const DELETED_DEFINITION_KIND: u8 = 2;
 const DUE_KEY_BYTES: usize = 1 + 1 + 1 + 8 + 8 + 8 + 8;
 const IDENTITY_KEY_BYTES: usize = 1 + 1 + 8 + 8 + 8;
@@ -17,61 +17,83 @@ const IDENTITY_VALUE_BYTES: usize = 1 + 1 + 8;
 const DUE_VALUE_FIXED_BYTES: usize = 1 + 8 + 8;
 
 impl Store {
-    /// Idempotently installs the newest generation-retention schedule for one
+    /// Idempotently installs the newest commit-retention schedule for one
     /// index. One identity locator and one due-ordered record are committed in
     /// the same local RocksDB batch; replacing a schedule never scans.
-    pub fn schedule_index_generation_retention(
+    pub fn schedule_index_commit_retention(
         &self,
-        due: &IndexGenerationRetentionDue,
+        due: &IndexCommitRetentionDue,
     ) -> Result<bool, IndexRetentionDueError> {
         due.validate()?;
-        let record = StoredDue::Generation(due.clone());
+        let record = StoredDue::Commit(due.clone());
         self.schedule_index_retention_due(&record)
     }
 
-    pub fn oldest_index_generation_retention_due(
+    pub fn oldest_index_commit_retention_due(
         &self,
-    ) -> Result<Option<IndexGenerationRetentionDue>, IndexRetentionDueError> {
+    ) -> Result<Option<IndexCommitRetentionDue>, IndexRetentionDueError> {
         let _guard = self.due_lock()?;
-        self.oldest_due(StoredDueKind::Generation)?
-            .map(StoredDue::into_generation)
+        self.oldest_due(StoredDueKind::Commit)?
+            .map(StoredDue::into_commit)
             .transpose()
     }
 
-    pub fn index_generation_retention_due_matches(
+    pub fn index_commit_retention_due_matches(
         &self,
-        expected: &IndexGenerationRetentionDue,
+        expected: &IndexCommitRetentionDue,
     ) -> Result<bool, IndexRetentionDueError> {
         expected.validate()?;
         let _guard = self.due_lock()?;
-        self.due_matches(&StoredDue::Generation(expected.clone()))
+        self.due_matches(&StoredDue::Commit(expected.clone()))
     }
 
-    pub fn replace_index_generation_retention_due(
+    pub fn index_commit_retention_due(
         &self,
-        expected: &IndexGenerationRetentionDue,
-        replacement: &IndexGenerationRetentionDue,
+        tenant_id: u64,
+        bucket_id: u64,
+        index_id: u64,
+    ) -> Result<Option<IndexCommitRetentionDue>, IndexRetentionDueError> {
+        if tenant_id == 0 || bucket_id == 0 || index_id == 0 {
+            return Err(IndexRetentionDueError::Malformed(
+                "stable IDs must be non-zero".into(),
+            ));
+        }
+        let _guard = self.due_lock()?;
+        match self.due_for_identity(DueIdentity {
+            tenant_id,
+            bucket_id,
+            index_id,
+        })? {
+            Some(StoredDue::Commit(due)) => Ok(Some(due)),
+            Some(StoredDue::DeletedDefinition(_)) | None => Ok(None),
+        }
+    }
+
+    pub fn replace_index_commit_retention_due(
+        &self,
+        expected: &IndexCommitRetentionDue,
+        replacement: &IndexCommitRetentionDue,
     ) -> Result<bool, IndexRetentionDueError> {
         expected.validate()?;
         replacement.validate()?;
-        let expected = StoredDue::Generation(expected.clone());
-        let replacement = StoredDue::Generation(replacement.clone());
+        let expected = StoredDue::Commit(expected.clone());
+        let replacement = StoredDue::Commit(replacement.clone());
         require_same_work(&expected, &replacement)?;
         self.replace_index_retention_due(&expected, &replacement)
     }
 
-    pub fn complete_index_generation_retention_due(
+    pub fn complete_index_commit_retention_due(
         &self,
-        expected: &IndexGenerationRetentionDue,
+        expected: &IndexCommitRetentionDue,
     ) -> Result<bool, IndexRetentionDueError> {
         expected.validate()?;
-        self.complete_index_retention_due(&StoredDue::Generation(expected.clone()))
+        self.complete_index_retention_due(&StoredDue::Commit(expected.clone()))
     }
 
-    /// Removes generation-retention work when this node loses the assignment.
+    /// Removes commit-retention work when this node loses the assignment.
     /// A definition-deletion schedule for the same identity is intentionally
     /// left intact because it is a separate durable cleanup handoff.
-    pub fn cancel_index_generation_retention(
+    pub fn cancel_index_commit_retention(
         &self,
         tenant_id: u64,
         bucket_id: u64,
@@ -88,7 +110,7 @@ impl Store {
             index_id,
         };
         let _guard = self.due_lock()?;
-        let Some(existing @ StoredDue::Generation(_)) = self.due_for_identity(identity)? else {
+        let Some(existing @ StoredDue::Commit(_)) = self.due_for_identity(identity)? else {
             return Ok(false);
         };
         let cf = self.due_cf()?;
@@ -315,21 +337,21 @@ impl Store {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StoredDueKind {
-    Generation,
+    Commit,
     DeletedDefinition,
 }
 
 impl StoredDueKind {
     fn byte(self) -> u8 {
         match self {
-            Self::Generation => GENERATION_KIND,
+            Self::Commit => COMMIT_KIND,
             Self::DeletedDefinition => DELETED_DEFINITION_KIND,
         }
     }
 
     fn from_byte(byte: u8) -> Result<Self, IndexRetentionDueError> {
         match byte {
-            GENERATION_KIND => Ok(Self::Generation),
+            COMMIT_KIND => Ok(Self::Commit),
             DELETED_DEFINITION_KIND => Ok(Self::DeletedDefinition),
             _ => Err(IndexRetentionDueError::Malformed(
                 "due-record kind is unknown".into(),
@@ -347,21 +369,21 @@ struct DueIdentity {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum StoredDue {
-    Generation(IndexGenerationRetentionDue),
+    Commit(IndexCommitRetentionDue),
     DeletedDefinition(DeletedDefinitionCleanup),
 }
 
 impl StoredDue {
     fn kind(&self) -> StoredDueKind {
         match self {
-            Self::Generation(_) => StoredDueKind::Generation,
+            Self::Commit(_) => StoredDueKind::Commit,
             Self::DeletedDefinition(_) => StoredDueKind::DeletedDefinition,
         }
     }
 
     fn identity(&self) -> DueIdentity {
         match self {
-            Self::Generation(record) => DueIdentity {
+            Self::Commit(record) => DueIdentity {
                 tenant_id: record.tenant_id,
                 bucket_id: record.bucket_id,
                 index_id: record.index_id,
@@ -376,28 +398,28 @@ impl StoredDue {
 
     fn definition_path(&self) -> &str {
         match self {
-            Self::Generation(record) => &record.definition_path,
+            Self::Commit(record) => &record.definition_path,
             Self::DeletedDefinition(record) => &record.definition_path,
         }
     }
 
     fn definition_version(&self) -> VersionId {
         match self {
-            Self::Generation(record) => record.definition_object_version,
+            Self::Commit(record) => record.definition_object_version,
             Self::DeletedDefinition(record) => record.definition_object_version,
         }
     }
 
-    fn generation(&self) -> u64 {
+    fn commit_revision(&self) -> u64 {
         match self {
-            Self::Generation(record) => record.generation,
+            Self::Commit(record) => record.commit_revision,
             Self::DeletedDefinition(_) => 0,
         }
     }
 
     fn due_at(&self) -> u64 {
         match self {
-            Self::Generation(record) => record.due_at_unix_millis,
+            Self::Commit(record) => record.due_at_unix_millis,
             Self::DeletedDefinition(record) => record.due_at_unix_millis,
         }
     }
@@ -406,21 +428,21 @@ impl StoredDue {
         let incoming = (
             self.definition_version().0,
             u8::from(matches!(self, Self::DeletedDefinition(_))),
-            self.generation(),
+            self.commit_revision(),
         );
         let existing = (
             current.definition_version().0,
             u8::from(matches!(current, Self::DeletedDefinition(_))),
-            current.generation(),
+            current.commit_revision(),
         );
         incoming > existing
     }
 
-    fn into_generation(self) -> Result<IndexGenerationRetentionDue, IndexRetentionDueError> {
+    fn into_commit(self) -> Result<IndexCommitRetentionDue, IndexRetentionDueError> {
         match self {
-            Self::Generation(record) => Ok(record),
+            Self::Commit(record) => Ok(record),
             Self::DeletedDefinition(_) => Err(IndexRetentionDueError::Malformed(
-                "generation range contains deleted-definition cleanup".into(),
+                "commit-retention range contains deleted-definition cleanup".into(),
             )),
         }
     }
@@ -428,8 +450,8 @@ impl StoredDue {
     fn into_deleted_definition(self) -> Result<DeletedDefinitionCleanup, IndexRetentionDueError> {
         match self {
             Self::DeletedDefinition(record) => Ok(record),
-            Self::Generation(_) => Err(IndexRetentionDueError::Malformed(
-                "deleted-definition range contains generation retention".into(),
+            Self::Commit(_) => Err(IndexRetentionDueError::Malformed(
+                "deleted-definition range contains commit retention".into(),
             )),
         }
     }
@@ -440,7 +462,7 @@ fn require_same_work(left: &StoredDue, right: &StoredDue) -> Result<(), IndexRet
         || left.identity() != right.identity()
         || left.definition_path() != right.definition_path()
         || left.definition_version() != right.definition_version()
-        || left.generation() != right.generation()
+        || left.commit_revision() != right.commit_revision()
     {
         return Err(IndexRetentionDueError::Malformed(
             "replacement must identify the same exact retention work".into(),
@@ -503,7 +525,7 @@ fn encode_due_value(record: &StoredDue) -> Vec<u8> {
     let mut value = Vec::with_capacity(DUE_VALUE_FIXED_BYTES + record.definition_path().len());
     value.push(VALUE_FORMAT);
     value.extend_from_slice(&record.definition_version().0.to_be_bytes());
-    value.extend_from_slice(&record.generation().to_be_bytes());
+    value.extend_from_slice(&record.commit_revision().to_be_bytes());
     value.extend_from_slice(record.definition_path().as_bytes());
     value
 }
@@ -528,24 +550,24 @@ fn decode_due(key: &[u8], value: &[u8]) -> Result<StoredDue, IndexRetentionDueEr
     let bucket_id = read_u64(&key[19..27])?;
     let index_id = read_u64(&key[27..35])?;
     let definition_object_version = VersionId(read_u64(&value[1..9])?);
-    let generation = read_u64(&value[9..17])?;
+    let commit_revision = read_u64(&value[9..17])?;
     let definition_path = std::str::from_utf8(&value[17..])
         .map_err(|_| IndexRetentionDueError::Malformed("definition path is not UTF-8".into()))?
         .to_owned();
     let record = match kind {
-        StoredDueKind::Generation => StoredDue::Generation(IndexGenerationRetentionDue {
+        StoredDueKind::Commit => StoredDue::Commit(IndexCommitRetentionDue {
             tenant_id,
             bucket_id,
             index_id,
             definition_path,
             definition_object_version,
-            generation,
+            commit_revision,
             due_at_unix_millis,
         }),
         StoredDueKind::DeletedDefinition => {
-            if generation != 0 {
+            if commit_revision != 0 {
                 return Err(IndexRetentionDueError::Malformed(
-                    "deleted-definition cleanup has a generation".into(),
+                    "deleted-definition cleanup has a commit revision".into(),
                 ));
             }
             StoredDue::DeletedDefinition(DeletedDefinitionCleanup {
@@ -559,7 +581,7 @@ fn decode_due(key: &[u8], value: &[u8]) -> Result<StoredDue, IndexRetentionDueEr
         }
     };
     match &record {
-        StoredDue::Generation(record) => record.validate()?,
+        StoredDue::Commit(record) => record.validate()?,
         StoredDue::DeletedDefinition(record) => record.validate()?,
     }
     Ok(record)

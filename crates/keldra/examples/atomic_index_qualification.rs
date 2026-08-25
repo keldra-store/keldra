@@ -90,7 +90,7 @@ async fn main() -> TestResult<()> {
             "atomic qualification index has an invalid identity",
         ));
     }
-    let baseline_generation = wait_for_empty(&mut indexes, &bucket).await?;
+    let baseline_commit_revision = wait_for_empty(&mut indexes, &bucket).await?;
 
     let durability = if endpoints.len() == 1 {
         Durability::Local
@@ -146,7 +146,7 @@ async fn main() -> TestResult<()> {
         input_json: input.into_bytes(),
         durability: durability as i32,
     });
-    let observation = observe_all_or_nothing(&mut indexes, &bucket, baseline_generation);
+    let observation = observe_all_or_nothing(&mut indexes, &bucket, baseline_commit_revision);
     let (invoked, observed) = tokio::join!(invocation, observation);
     let invoked = invoked?.into_inner();
     let observed = observed?;
@@ -176,7 +176,7 @@ async fn main() -> TestResult<()> {
     }
 
     println!(
-        "atomic-program index visibility passed on {} node(s): every observed generation contained zero or both paths",
+        "atomic-program index visibility passed on {} node(s): every observed commit_revision contained zero or both paths",
         endpoints.len()
     );
     Ok(())
@@ -185,7 +185,7 @@ async fn main() -> TestResult<()> {
 async fn wait_for_empty(clients: &mut [IndexClient], bucket: &str) -> TestResult<u64> {
     let deadline = Instant::now() + WAIT_LIMIT;
     loop {
-        let mut generation = 0;
+        let mut commit_revision = 0;
         let mut ready = true;
         for client in clients.iter_mut() {
             match client.query_index(query(bucket)).await {
@@ -201,7 +201,7 @@ async fn wait_for_empty(clients: &mut [IndexClient], bucket: &str) -> TestResult
                         ready = false;
                         break;
                     }
-                    generation = generation.max(freshness.generation);
+                    commit_revision = commit_revision.max(freshness.commit_revision);
                 }
                 Err(status) if retryable(&status) => {
                     ready = false;
@@ -210,8 +210,8 @@ async fn wait_for_empty(clients: &mut [IndexClient], bucket: &str) -> TestResult
                 Err(status) => return Err(status.into()),
             }
         }
-        if ready && generation != 0 {
-            return Ok(generation);
+        if ready && commit_revision != 0 {
+            return Ok(commit_revision);
         }
         if Instant::now() >= deadline {
             return Err(invalid("atomic index baseline did not become ready"));
@@ -223,7 +223,7 @@ async fn wait_for_empty(clients: &mut [IndexClient], bucket: &str) -> TestResult
 async fn observe_all_or_nothing(
     clients: &mut [IndexClient],
     bucket: &str,
-    baseline_generation: u64,
+    baseline_commit_revision: u64,
 ) -> TestResult<BTreeMap<String, u64>> {
     let deadline = Instant::now() + WAIT_LIMIT;
     let mut complete = vec![None; clients.len()];
@@ -234,7 +234,7 @@ async fn observe_all_or_nothing(
                     let response = response.into_inner();
                     if response.hits.len() == 1 {
                         return Err(invalid(
-                            "an index generation exposed only one atomic-program path",
+                            "an index commit_revision exposed only one atomic-program path",
                         ));
                     }
                     if response.hits.len() > 2 {
@@ -245,12 +245,12 @@ async fn observe_all_or_nothing(
                             .freshness
                             .as_ref()
                             .ok_or_else(|| invalid("atomic index query omitted freshness"))?;
-                        if freshness.generation <= baseline_generation
+                        if freshness.commit_revision <= baseline_commit_revision
                             || !freshness.initial_build_complete
                             || freshness.rebuilding
                         {
                             return Err(invalid(
-                                "atomic paths appeared in an incomplete generation",
+                                "atomic paths appeared in an incomplete commit_revision",
                             ));
                         }
                         let versions = response
@@ -310,6 +310,7 @@ fn query(bucket: &str) -> QueryIndexRequest {
         limit: 100,
         page_token: Vec::new(),
         tenant: String::new(),
+        required_freshness: None,
     }
 }
 

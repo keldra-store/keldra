@@ -30,6 +30,7 @@ const CACHE_TEMPORARY_FILE_GRACE: Duration = Duration::from_secs(60 * 60);
 // file. Charging at least one ordinary page prevents a large disk budget from
 // retaining millions of one-byte mappings under a byte-only memory limit.
 const CACHE_MAPPING_MINIMUM_BYTES: u64 = 4 * 1024;
+pub(crate) const CACHE_DISK_LEASE_MINIMUM_BYTES: u64 = 4 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct IndexSegmentId {
@@ -310,6 +311,7 @@ struct CacheState {
     in_flight: BTreeMap<IndexSegmentId, Arc<CacheFlight>>,
     active_scratch: std::collections::BTreeSet<PathBuf>,
     clock: u64,
+    /// Conservative residency charge: file bytes or one metadata/inode floor.
     disk_bytes: u64,
     memory_bytes: u64,
     in_flight_bytes: u64,
@@ -388,6 +390,7 @@ struct CacheEntry {
     mapped: Option<Arc<Mmap>>,
     path: PathBuf,
     touched: u64,
+    disk_pins: u32,
 }
 
 impl IndexCache {
@@ -465,6 +468,39 @@ impl IndexCache {
             cache: self.clone(),
             id,
         }
+    }
+
+    /// Materialize and hash-verify an immutable pack, then retain only a
+    /// lightweight lease preventing its local file from being unlinked. The
+    /// mmap used for verification is dropped before this returns and remains
+    /// governed solely by the configured memory budget.
+    pub(crate) async fn lease_disk(
+        &self,
+        id: IndexSegmentId,
+    ) -> Result<IndexDiskLease, IndexCacheError> {
+        let mapped = self.materialize(id).await?;
+        let inner = self.inner.clone();
+        {
+            let mut state = inner.state.lock().map_err(|_| IndexCacheError::Poisoned)?;
+            let entry = state
+                .entries
+                .get_mut(&id)
+                .ok_or(IndexCacheError::CorruptCache)?;
+            entry.disk_pins = entry.disk_pins.checked_add(1).ok_or_else(|| {
+                IndexCacheError::InvalidLayout("cache disk pin overflowed".into())
+            })?;
+        }
+        drop(mapped);
+        Ok(IndexDiskLease {
+            inner: Arc::new(IndexDiskLeaseInner {
+                cache: Arc::downgrade(&inner),
+                id,
+            }),
+        })
+    }
+
+    pub(crate) fn disk_budget_bytes(&self) -> u64 {
+        self.inner.config.disk_bytes
     }
 
     /// Open one restart-disposable merge workspace in the separately
@@ -549,13 +585,14 @@ impl IndexCache {
                         entry.mapped = Some(mapped.clone());
                         entry.touched = touched;
                     } else {
-                        state.disk_bytes = state.disk_bytes.saturating_add(id.length);
+                        state.disk_bytes = state.disk_bytes.saturating_add(cache_disk_charge(id));
                         state.entries.insert(
                             id,
                             CacheEntry {
                                 mapped: Some(mapped.clone()),
                                 path: cache_path(&self.inner.directory, id),
                                 touched,
+                                disk_pins: 0,
                             },
                         );
                     }
@@ -598,9 +635,10 @@ impl IndexCache {
 
     async fn fetch_and_map(&self, id: IndexSegmentId) -> Result<Mmap, IndexCacheError> {
         let _fetch_permit = self.inner.fetch_budget.acquire(id.length).await;
-        tracing::info!(
-            monotonic_counter.keldra_index_cache_fetches_total = 1_u64,
-            "index cache block fetch"
+        let started = std::time::Instant::now();
+        tracing::debug!(
+            monotonic_counter.keldra_index_local_materialization_fetches_total = 1_u64,
+            "durable index pack local materialization fetch started"
         );
         let source = self.inner.fetcher.fetch(id).await?;
         let directory = self.inner.directory.clone();
@@ -612,18 +650,36 @@ impl IndexCache {
         .map_err(|error| IndexCacheError::Task(error.to_string()))?;
         match &materialized {
             Err(IndexCacheError::InvalidFetchedSegment | IndexCacheError::CorruptCache) => {
-                tracing::info!(
-                    monotonic_counter.keldra_index_cache_verification_failures_total = 1_u64,
-                    "index cache block verification failed"
+                tracing::debug!(
+                    monotonic_counter
+                        .keldra_index_local_materialization_verification_failures_total = 1_u64,
+                    monotonic_counter.keldra_index_local_materialization_fetch_failures_total =
+                        1_u64,
+                    histogram.keldra_index_local_materialization_fetch_duration_seconds =
+                        started.elapsed().as_secs_f64(),
+                    "durable index pack local materialization verification failed"
                 );
             }
             Ok(_) => {
-                tracing::info!(
-                    monotonic_counter.keldra_index_cache_fetch_bytes_total = id.length,
-                    "index cache block fetched"
+                tracing::debug!(
+                    monotonic_counter.keldra_index_local_materialization_fetch_bytes_total =
+                        id.length,
+                    monotonic_counter.keldra_index_local_materialization_fetch_failures_total =
+                        0_u64,
+                    histogram.keldra_index_local_materialization_fetch_duration_seconds =
+                        started.elapsed().as_secs_f64(),
+                    "durable index pack locally materialized"
                 );
             }
-            Err(_) => {}
+            Err(_) => {
+                tracing::debug!(
+                    monotonic_counter.keldra_index_local_materialization_fetch_failures_total =
+                        1_u64,
+                    histogram.keldra_index_local_materialization_fetch_duration_seconds =
+                        started.elapsed().as_secs_f64(),
+                    "durable index pack local materialization failed"
+                );
+            }
         }
         materialized
     }
@@ -966,6 +1022,50 @@ pub(crate) struct IndexSlice {
     end: usize,
 }
 
+#[derive(Clone)]
+pub(crate) struct IndexDiskLease {
+    inner: Arc<IndexDiskLeaseInner>,
+}
+
+struct IndexDiskLeaseInner {
+    cache: Weak<IndexCacheInner>,
+    id: IndexSegmentId,
+}
+
+impl IndexDiskLease {
+    pub(crate) fn bytes(&self) -> u64 {
+        cache_disk_charge(self.inner.id)
+    }
+}
+
+impl Drop for IndexDiskLeaseInner {
+    fn drop(&mut self) {
+        let Some(cache) = self.cache.upgrade() else {
+            return;
+        };
+        let (evicted_bytes, snapshot) = {
+            let Ok(mut state) = cache.state.lock() else {
+                return;
+            };
+            if let Some(entry) = state.entries.get_mut(&self.id) {
+                entry.disk_pins = entry.disk_pins.saturating_sub(1);
+            }
+            let evicted_bytes = evict_unpinned_disk(&mut state, cache.config.disk_bytes);
+            let snapshot = (evicted_bytes != 0).then(|| cache_snapshot(&state));
+            (evicted_bytes, snapshot)
+        };
+        if let Some(snapshot) = snapshot {
+            emit_cache_snapshot(snapshot);
+        }
+        if evicted_bytes != 0 {
+            tracing::debug!(
+                monotonic_counter.keldra_index_cache_eviction_bytes_total = evicted_bytes,
+                "released committed-view disk leases evicted cache blocks"
+            );
+        }
+    }
+}
+
 impl IndexSlice {
     fn empty() -> Self {
         Self {
@@ -1001,7 +1101,8 @@ impl Drop for IndexSlice {
             let Ok(mut state) = inner.state.lock() else {
                 return;
             };
-            let evicted_bytes = evict_unpinned_memory(&mut state, inner.config.memory_bytes);
+            let evicted_bytes = evict_unpinned_disk(&mut state, inner.config.disk_bytes)
+                .saturating_add(evict_unpinned_memory(&mut state, inner.config.memory_bytes));
             let snapshot = (evicted_bytes != 0).then(|| cache_snapshot(&state));
             (evicted_bytes, snapshot)
         };
@@ -1009,9 +1110,9 @@ impl Drop for IndexSlice {
             emit_cache_snapshot(snapshot);
         }
         if evicted_bytes != 0 {
-            tracing::info!(
+            tracing::debug!(
                 monotonic_counter.keldra_index_cache_eviction_bytes_total = evicted_bytes,
-                "unpinned index cache mappings evicted"
+                "unpinned index cache entries evicted"
             );
         }
     }
@@ -1120,7 +1221,9 @@ fn reconcile_cache_step(
                 .active_scratch
                 .contains(&entry.path());
             if active_scratch {
-                reconcile.retained_bytes = reconcile.retained_bytes.saturating_add(actual_bytes);
+                reconcile.retained_bytes = reconcile
+                    .retained_bytes
+                    .saturating_add(cache_file_charge(actual_bytes));
             } else if let Some(id) = cache_id_from_file_name(&entry.file_name()) {
                 let tracked = {
                     let state = inner.state.lock().map_err(|_| IndexCacheError::Poisoned)?;
@@ -1128,7 +1231,9 @@ fn reconcile_cache_step(
                 };
                 if !tracked {
                     let valid_length = actual_bytes == id.length;
-                    let projected = reconcile.retained_bytes.saturating_add(actual_bytes);
+                    let projected = reconcile
+                        .retained_bytes
+                        .saturating_add(cache_disk_charge(id));
                     if !valid_length || projected > inner.config.disk_bytes {
                         remove_cache_file(&entry.path(), actual_bytes, &mut progress)?;
                     } else {
@@ -1136,7 +1241,9 @@ fn reconcile_cache_step(
                     }
                 }
             } else if recent_cache_temporary(&entry.file_name(), &metadata) {
-                reconcile.retained_bytes = reconcile.retained_bytes.saturating_add(actual_bytes);
+                reconcile.retained_bytes = reconcile
+                    .retained_bytes
+                    .saturating_add(cache_file_charge(actual_bytes));
             } else {
                 remove_cache_file(&entry.path(), actual_bytes, &mut progress)?;
             }
@@ -1297,6 +1404,14 @@ fn cache_mapping_charge(id: IndexSegmentId) -> u64 {
     id.length.max(CACHE_MAPPING_MINIMUM_BYTES)
 }
 
+fn cache_disk_charge(id: IndexSegmentId) -> u64 {
+    cache_file_charge(id.length)
+}
+
+fn cache_file_charge(length: u64) -> u64 {
+    length.max(CACHE_DISK_LEASE_MINIMUM_BYTES)
+}
+
 fn evict_unpinned_disk(state: &mut CacheState, budget: u64) -> u64 {
     let mut evicted = 0_u64;
     while state.disk_bytes > budget {
@@ -1304,10 +1419,11 @@ fn evict_unpinned_disk(state: &mut CacheState, budget: u64) -> u64 {
             .entries
             .iter()
             .filter(|(_, entry)| {
-                entry
-                    .mapped
-                    .as_ref()
-                    .is_none_or(|mapped| Arc::strong_count(mapped) == 1)
+                entry.disk_pins == 0
+                    && entry
+                        .mapped
+                        .as_ref()
+                        .is_none_or(|mapped| Arc::strong_count(mapped) == 1)
             })
             .min_by_key(|(_, entry)| entry.touched)
             .map(|(id, _)| *id);
@@ -1315,7 +1431,9 @@ fn evict_unpinned_disk(state: &mut CacheState, budget: u64) -> u64 {
             break;
         };
         if let Some(entry) = state.entries.remove(&candidate) {
-            state.disk_bytes = state.disk_bytes.saturating_sub(candidate.length);
+            state.disk_bytes = state
+                .disk_bytes
+                .saturating_sub(cache_disk_charge(candidate));
             if entry.mapped.is_some() {
                 state.memory_bytes = state
                     .memory_bytes

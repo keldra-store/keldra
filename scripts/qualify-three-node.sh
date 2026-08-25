@@ -659,6 +659,7 @@ run_index_resource_qualification() {
     --argjson maximum_growth "${index_resource_max_anonymous_growth_bytes}" \
     --argjson performance_targets_required "${require_performance_targets}" \
     '
+      .schema == "keldra.index-resource-qualification.v2" and
       .evidence.source_commit == $source_commit and
       .evidence.resolved_container_digest == $container_digest and
       .evidence.native_architecture == $native_architecture and
@@ -693,17 +694,17 @@ run_index_resource_qualification() {
       .evidence.resource_configuration.resource_targets_required == true and
       (.evidence.timer_boundaries | to_entries | all(.value | if type == "object" then (.starts | length > 0) and (.stops | length > 0) else length > 0 end)) and
       .evidence.correctness.result == "pass" and
-      .evidence.correctness.source_complete_generation_observed == true and
+      .evidence.correctness.source_complete_commit_revision_observed == true and
       .evidence.correctness.source_complete_sources_observed == 3 and
       .evidence.correctness.initial_exact_partition_verification == true and
       .evidence.correctness.final_exact_partition_verification == true and
       .evidence.correctness.update_and_delete_verification == true and
       .evidence.correctness.resource_limits_passed == true and
-      .production_query_regression.schema == "keldra.index-production-query-regression.v1" and
+      .production_query_regression.schema == "keldra.index-production-query-regression.v2" and
       .production_query_regression.corpus_records == .records and
       .production_query_regression.index_id > 0 and
       .production_query_regression.definition_version > 0 and
-      .production_query_regression.generation > 0 and
+      .production_query_regression.commit_revision > 0 and
       .production_query_regression.physical_order == ["modified_day DESC", "record_id ASC"] and
       .production_query_regression.incident_predicates == [
         "withdrawn = false",
@@ -966,7 +967,7 @@ assert_one_builder_published_and_compacted_each_index_kind() {
     publishers=0
     for node in keldra-1 keldra-2 keldra-3; do
       if awk -v kind="index.kind=${kind}" '
-            index($0, kind) && index($0, "index generation published") { found = 1 }
+            index($0, kind) && index($0, "index commit published") { found = 1 }
             END { exit !found }
           ' "${KELDRA_QUALIFICATION_DIR}/artifacts/index-${node}.log"
       then
@@ -983,7 +984,7 @@ assert_one_builder_published_and_compacted_each_index_kind() {
       fi
     done
     if ((publishers != 1)); then
-      echo "${kind} index generations were published by ${publishers} nodes; expected exactly one builder" >&2
+      echo "${kind} index commits were published by ${publishers} nodes; expected exactly one builder" >&2
       return 1
     fi
     if ((compactors != 1)); then
@@ -1183,7 +1184,7 @@ run_live_builder_reassignment_qualification() {
   for index_id in "${index_ids[@]}"; do
     if log_has_index_event \
       "${KELDRA_QUALIFICATION_DIR}/artifacts/index-reassignment-${active_nodes}-${new_builder_node}.log" \
-      "${index_id}" "index generation published"
+      "${index_id}" "index commit published"
     then
       reassigned=1
       break
@@ -1214,7 +1215,7 @@ run_journal_pressure_qualification() {
     seed_log="${KELDRA_QUALIFICATION_DIR}/artifacts/index-pressure-seed-${node}.log"
     save_log_suffix "${node}" "${seed_cursor}" "${seed_log}"
     if log_has_index_event "${seed_log}" "${pressure_index_id}" \
-      "index generation published"
+      "index commit published"
     then
       builder="${node}"
       builder_count=$((builder_count + 1))
@@ -1359,7 +1360,7 @@ run_journal_pressure_qualification() {
     echo "${capacity_node} did not report that source-journal capacity released its writer" >&2
     return 1
   fi
-  echo "[keldra-qualification] hard source-journal capacity kept a public write pending and uncommitted, then woke it and reached an exact incremental index generation"
+  echo "[keldra-qualification] hard source-journal capacity kept a public write pending and uncommitted, then woke it and reached an exact incremental index commit revision"
 }
 
 assert_zero_accounting_traffic_drops() {
@@ -1929,7 +1930,7 @@ for node in keldra-1 keldra-2 keldra-3; do
     "${KELDRA_QUALIFICATION_DIR}/artifacts/restart-read.txt"
   verify_existing_indexes
   verify_index_resource_state "$(public_endpoint_for "${node}")"
-  echo "[keldra-qualification] ${node} restart preserved every final complete index generation through all public endpoints"
+  echo "[keldra-qualification] ${node} restart preserved every final committed index view through all public endpoints"
   for growth_object in from-one from-two; do
     case "${growth_object}" in
       from-one)

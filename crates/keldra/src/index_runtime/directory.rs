@@ -1,6 +1,6 @@
 //! Lazy cache-backed access to checked ranges in immutable v4 artifact objects.
 //!
-//! A pinned query or generation verifies each distinct ordinary-object pack
+//! A pinned query or committed view verifies each distinct ordinary-object pack
 //! and exact version before the disposable content cache may materialise it.
 //! Component ranges are resolved and bounded by the storage-neutral index
 //! reader after the enclosing pack has been opened.

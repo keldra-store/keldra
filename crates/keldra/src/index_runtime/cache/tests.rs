@@ -313,7 +313,7 @@ async fn distinct_cold_fetches_share_the_aggregate_memory_allowance() {
 #[tokio::test]
 async fn pinned_slices_may_temporarily_exceed_the_disk_budget() {
     let root = tempfile::tempdir().unwrap();
-    let (cache, _fetcher, left, right) = fixture(&root, 8, 8);
+    let (cache, _fetcher, left, right) = fixture(&root, CACHE_DISK_LEASE_MINIMUM_BYTES, 8);
     let file = cache.open(left);
     let other_file = cache.open(right);
 
@@ -326,6 +326,43 @@ async fn pinned_slices_may_temporarily_exceed_the_disk_budget() {
     // one segment. A later cache operation can evict them after these guards
     // are dropped.
     assert_eq!(held.data(), b"abcdefgh");
+}
+
+#[tokio::test]
+async fn disk_lease_does_not_pin_mmap_and_prevents_unlink_until_drop() {
+    let root = tempfile::tempdir().unwrap();
+    let (cache, _fetcher, left, right) = fixture(&root, 8, CACHE_MAPPING_MINIMUM_BYTES);
+    let left_path = cache_path(&cache.inner.directory, left);
+
+    let lease = cache.lease_disk(left).await.unwrap();
+    assert_eq!(lease.bytes(), CACHE_DISK_LEASE_MINIMUM_BYTES);
+    {
+        let state = cache.inner.state.lock().unwrap();
+        assert_eq!(state.memory_bytes, CACHE_MAPPING_MINIMUM_BYTES);
+        assert_eq!(
+            Arc::strong_count(state.entries[&left].mapped.as_ref().unwrap()),
+            1,
+            "disk lease must not retain the materialization mmap"
+        );
+    }
+
+    // A second pack forces memory eviction, proving the lease retained no mmap
+    // strong reference, while the leased file itself remains on disk.
+    drop(cache.open(right).read_at(0, 8).await.unwrap());
+    assert!(left_path.exists());
+    assert!(
+        cache
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .entries
+            .get(&left)
+            .is_some_and(|entry| entry.mapped.is_none() && entry.disk_pins == 1)
+    );
+
+    drop(lease);
+    assert!(!left_path.exists());
 }
 
 #[tokio::test]
@@ -342,9 +379,10 @@ async fn tiny_segments_cannot_leave_retained_mappings_above_the_memory_budget() 
         reads: AtomicUsize::new(0),
     });
     let memory_bytes = CACHE_MAPPING_MINIMUM_BYTES * 3;
+    let disk_bytes = CACHE_DISK_LEASE_MINIMUM_BYTES * values.len() as u64;
     let cache = IndexCache::new(
         root.path(),
-        IndexCacheConfig::new(1024, memory_bytes).unwrap(),
+        IndexCacheConfig::new(disk_bytes, memory_bytes).unwrap(),
         fetcher.clone(),
     )
     .unwrap();
@@ -374,7 +412,7 @@ async fn tiny_segments_cannot_leave_retained_mappings_above_the_memory_budget() 
 }
 
 #[tokio::test]
-async fn memory_eviction_keeps_disk_entries_until_the_independent_disk_limit() {
+async fn tiny_disk_entries_are_bounded_by_their_metadata_charge() {
     let root = tempfile::tempdir().unwrap();
     let values = (0_u8..4)
         .map(|byte| {
@@ -388,7 +426,11 @@ async fn memory_eviction_keeps_disk_entries_until_the_independent_disk_limit() {
     });
     let cache = IndexCache::new(
         root.path(),
-        IndexCacheConfig::new(3, CACHE_MAPPING_MINIMUM_BYTES).unwrap(),
+        IndexCacheConfig::new(
+            3 * CACHE_DISK_LEASE_MINIMUM_BYTES,
+            CACHE_MAPPING_MINIMUM_BYTES,
+        )
+        .unwrap(),
         fetcher.clone(),
     )
     .unwrap();
@@ -400,7 +442,7 @@ async fn memory_eviction_keeps_disk_entries_until_the_independent_disk_limit() {
     }
 
     let state = cache.inner.state.lock().unwrap();
-    assert_eq!(state.disk_bytes, 3);
+    assert_eq!(state.disk_bytes, 3 * CACHE_DISK_LEASE_MINIMUM_BYTES);
     assert_eq!(state.memory_bytes, CACHE_MAPPING_MINIMUM_BYTES);
     assert_eq!(state.entries.len(), 3);
     assert_eq!(
@@ -430,7 +472,11 @@ async fn memory_eviction_keeps_disk_entries_until_the_independent_disk_limit() {
     assert_eq!(remapped.data(), values.get(&disk_only).unwrap());
     assert_eq!(fetcher.reads.load(Ordering::Relaxed), 4);
     let state = cache.inner.state.lock().unwrap();
-    assert_eq!(state.disk_bytes, 3, "a remap must not charge disk twice");
+    assert_eq!(
+        state.disk_bytes,
+        3 * CACHE_DISK_LEASE_MINIMUM_BYTES,
+        "a remap must not charge disk twice"
+    );
     assert_eq!(state.memory_bytes, CACHE_MAPPING_MINIMUM_BYTES);
 }
 
@@ -454,14 +500,17 @@ async fn live_slices_pin_mappings_until_the_last_over_budget_pin_drops() {
 }
 
 #[tokio::test]
-async fn reconciliation_reclaims_a_temporary_pin_overrun_after_the_slice_drops() {
+async fn dropping_the_last_slice_reclaims_a_disk_charge_overrun() {
     let root = tempfile::tempdir().unwrap();
     let (cache, _fetcher, left, _right) = fixture(&root, 4, 8);
     let path = cache_path(&cache.inner.directory, left);
 
     let held = cache.open(left).read_at(0, 8).await.unwrap();
     assert!(path.exists());
-    assert_eq!(cache.inner.state.lock().unwrap().disk_bytes, 8);
+    assert_eq!(
+        cache.inner.state.lock().unwrap().disk_bytes,
+        CACHE_DISK_LEASE_MINIMUM_BYTES
+    );
 
     let pinned =
         reconcile_cache_step(&cache.inner, 8, u64::MAX, std::time::Duration::from_secs(1)).unwrap();
@@ -469,10 +518,11 @@ async fn reconciliation_reclaims_a_temporary_pin_overrun_after_the_slice_drops()
     assert!(path.exists());
 
     drop(held);
-    let unpinned =
-        reconcile_cache_step(&cache.inner, 8, u64::MAX, std::time::Duration::from_secs(1)).unwrap();
-    assert_eq!(unpinned.removed_bytes, 8);
     assert!(!path.exists());
+    assert_eq!(cache.inner.state.lock().unwrap().disk_bytes, 0);
+    let reconciled =
+        reconcile_cache_step(&cache.inner, 8, u64::MAX, std::time::Duration::from_secs(1)).unwrap();
+    assert_eq!(reconciled.removed_bytes, 0);
     assert_eq!(cache.inner.state.lock().unwrap().disk_bytes, 0);
 }
 
@@ -628,7 +678,7 @@ async fn valid_warm_file_is_verified_and_reused_without_a_fetch() {
 }
 
 #[test]
-fn reconciliation_advances_in_bounded_steps_and_evicts_only_after_budget() {
+fn reconciliation_charges_tiny_warm_files_and_evicts_only_after_budget() {
     let root = tempfile::tempdir().unwrap();
     let directory = root.path().join(CACHE_FORMAT_DIRECTORY);
     std::fs::create_dir_all(&directory).unwrap();
@@ -638,7 +688,7 @@ fn reconciliation_advances_in_bounded_steps_and_evicts_only_after_budget() {
     }
     let cache = IndexCache::new(
         root.path(),
-        IndexCacheConfig::new(6, 1024).unwrap(),
+        IndexCacheConfig::new(CACHE_DISK_LEASE_MINIMUM_BYTES, 1024).unwrap(),
         Arc::new(MemoryFetcher {
             values: BTreeMap::new(),
             reads: AtomicUsize::new(0),
@@ -725,7 +775,7 @@ async fn small_segments_remain_mmap_backed() {
 #[tokio::test]
 async fn oversized_segments_remain_mmap_backed() {
     let root = tempfile::tempdir().unwrap();
-    let (cache, _fetcher, left, _right) = fixture(&root, 1024, 4);
+    let (cache, _fetcher, left, _right) = fixture(&root, CACHE_DISK_LEASE_MINIMUM_BYTES, 4);
     let file = cache.open(left);
 
     let slice = file.read_at(0, 8).await.unwrap();

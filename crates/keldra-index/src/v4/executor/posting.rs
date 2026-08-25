@@ -138,10 +138,11 @@ impl<'a, D: ArtifactDirectoryRead> PostingStream<'a, D> {
         let last = end_ordinal
             .checked_sub(1)
             .ok_or_else(|| IndexError::InvalidQuery("empty posting reference".into()))?;
-        if reference
-            .component_max_doc_ids
-            .last()
-            .is_some_and(|maximum| maximum.get() >= segment.document_count)
+        if reference.component_max_doc_ids.len() != reference.component_count as usize
+            || reference
+                .component_max_doc_ids
+                .last()
+                .is_some_and(|maximum| maximum.get() >= segment.document_count)
         {
             return Err(IndexError::InvalidFormat("posting component bound"));
         }
@@ -233,18 +234,16 @@ impl<'a, D: ArtifactDirectoryRead> PostingStream<'a, D> {
             .directory
             .run_query_cpu(move || DecodedPostingBlock::decode_payload(&loaded.payload))
             .await?;
-        if !self.component_max_doc_ids.is_empty() {
-            let relative = self
-                .next_ordinal
-                .checked_sub(self.first_ordinal)
-                .ok_or(IndexError::InvalidFormat("posting component ordinal"))?;
-            let expected = self
-                .component_max_doc_ids
-                .get(relative as usize)
-                .ok_or(IndexError::InvalidFormat("posting component bound"))?;
-            if block.last_doc_id() != *expected {
-                return Err(IndexError::InvalidFormat("posting component bound"));
-            }
+        let relative = self
+            .next_ordinal
+            .checked_sub(self.first_ordinal)
+            .ok_or(IndexError::InvalidFormat("posting component ordinal"))?;
+        let expected = self
+            .component_max_doc_ids
+            .get(relative as usize)
+            .ok_or(IndexError::InvalidFormat("posting component bound"))?;
+        if block.last_doc_id() != *expected {
+            return Err(IndexError::InvalidFormat("posting component bound"));
         }
         self.block = Some(block);
         self.statistics.posting_block_decoded();
@@ -305,12 +304,8 @@ impl<'a, D: ArtifactDirectoryRead> PostingStream<'a, D> {
     }
 
     /// Position the routed stream at the first posting component which can
-    /// contain `target`. Legacy references have no component bounds and retain
-    /// their exact sequential traversal.
+    /// contain `target`.
     fn seek_component_containing(&mut self, target: DocId) -> Result<(), IndexError> {
-        if self.component_max_doc_ids.is_empty() {
-            return Ok(());
-        }
         let mut relative = self
             .component_max_doc_ids
             .partition_point(|maximum| *maximum < target);

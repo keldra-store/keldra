@@ -12,6 +12,7 @@ use keldra_store::{
     PayloadArtifactSnapshotPage, RoutedLocalChangePage, StorageTenantId,
 };
 use std::io::{self, Read};
+use std::pin::Pin;
 use std::task::{Context, Poll};
 
 mod definition_coordination;
@@ -1780,6 +1781,7 @@ mod tests {
             exact_path: format!("objects/{offset}"),
             path_version: VersionId(offset),
             kind: ObjectHeadChangeKind::Put,
+            program_commit_cursor: None,
             reference_deltas: Vec::new(),
             accounting_transition: None,
             definition_transition: None,

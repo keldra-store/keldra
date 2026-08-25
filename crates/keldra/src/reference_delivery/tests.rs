@@ -481,6 +481,70 @@ async fn publish(source: &Store, path: &str, bytes: &[u8], command: &str) -> Blo
     blob
 }
 
+async fn publish_after_capacity_maintenance(
+    source: &Store,
+    path: &str,
+    bytes: &[u8],
+    command: &str,
+) -> BlobRef {
+    let blob = source.stage_blob(bytes).await.expect("stage test payload");
+    let request = || PublishRequest {
+        key: ObjectKey::new("tenant", "bucket", path).expect("test object key"),
+        blob: blob.clone(),
+        content_type: None,
+        mode: PutMode::Put,
+        command_id: Some(command.into()),
+        durability: Durability::Local,
+    };
+    let context = ObjectMutationContext {
+        active_placement_log_id: PlacementLogId { term: 1, index: 1 },
+        serving_fence_term: 1,
+    };
+    for attempt in 0..3 {
+        match source
+            .coordinate_distributed_publish(request(), context)
+            .await
+        {
+            Ok(_) => return blob,
+            Err(keldra_store::MutationError::SourceJournalCapacity) if attempt < 2 => {
+                // Capacity pruning is deliberately a separate durable
+                // maintenance batch. The caller must already have installed
+                // all retention proofs. A publish appends two records, so at
+                // most two one-record headroom passes can be required.
+                source.wait_for_mutation_capacity().await;
+            }
+            Err(error) => panic!("coordinate test publish after capacity maintenance: {error}"),
+        }
+    }
+    unreachable!("bounded publish retry either succeeds or panics")
+}
+
+async fn checkpoint_all_derived_consumers(
+    source: &Store,
+    source_id: SourceId,
+    next_offset: u64,
+    fence: PlacementLogId,
+    active_nodes: &[u16],
+) {
+    for consumer_kind in keldra_store::DerivedConsumerKind::ALL {
+        for &consumer_node_id in active_nodes {
+            source
+                .apply_derived_consumer_checkpoint(
+                    keldra_store::DerivedConsumerCheckpoint {
+                        consumer_kind,
+                        source_id,
+                        consumer_node_id,
+                        next_offset,
+                        observed_fence: fence,
+                    },
+                    active_nodes,
+                )
+                .await
+                .expect("checkpoint test derived consumer");
+        }
+    }
+}
+
 struct ProofFixture {
     _stores: TestStores,
     source: Store,
@@ -748,7 +812,15 @@ async fn a_destination_gap_stops_before_any_delivery() {
         .advance_source_journal_reference_safe_through(first_tail)
         .await
         .unwrap();
-    publish(&source, "two", b"two", "two").await;
+    checkpoint_all_derived_consumers(
+        &source,
+        source.local_watch_status().unwrap().source_id,
+        first_tail + 1,
+        PlacementLogId { term: 1, index: 1 },
+        &[1, 2, 3],
+    )
+    .await;
+    publish_after_capacity_maintenance(&source, "two", b"two", "two").await;
     assert_eq!(
         source.local_watch_status().unwrap().retention_floor,
         first_tail
@@ -1099,9 +1171,12 @@ async fn absence_only_blocks_reference_delivery_until_a_replica_confirms() {
     runner.deliver_once().await.unwrap();
 
     for owner in routes.keys() {
+        // Deleting the head is metadata-complete, but the predecessor remains
+        // owned by its retained journal event until every replay consumer has
+        // checkpointed past that event and retention prunes it.
         assert_eq!(
             lifecycle(&stores.stores[owner], &blob).unwrap().ref_count,
-            0
+            1
         );
     }
 }
@@ -1164,15 +1239,35 @@ async fn missing_lineage_never_advances_past_the_unproven_event() {
 async fn zero_reference_object_event_still_requires_metadata_proof() {
     let stores = TestStores::open(&[1, 2, 3]).await;
     let source = stores.stores[&NodeId(1)].clone();
-    publish(&source, "same-content", b"unchanged", "same-content-first").await;
-    publish(&source, "same-content", b"unchanged", "same-content-second").await;
+    let path = node_one_coordinator_path("zero-reference");
+    publish(&source, &path, b"deleted", "deleted-create").await;
+    source
+        .coordinate_object_mutation(
+            BatchOperation::Delete(DeleteRequest {
+                key: ObjectKey::new("tenant", "bucket", path).unwrap(),
+                precondition: Precondition::Any,
+                command_id: Some("deleted-delete".into()),
+                durability: Durability::Local,
+            }),
+            ObjectMutationContext {
+                active_placement_log_id: PlacementLogId { term: 1, index: 1 },
+                serving_fence_term: 1,
+            },
+        )
+        .await
+        .unwrap();
     let changes = source.scan_local_changes(0, 16).unwrap();
     let zero_delta = changes
         .iter()
         .find(|change| {
-            matches!(change, LocalChange::ObjectHead(head) if head.reference_deltas.is_empty())
+            matches!(
+                change,
+                LocalChange::ObjectHead(head)
+                    if head.kind == ObjectHeadChangeKind::Delete
+                        && head.reference_deltas.is_empty()
+            )
         })
-        .expect("same-content update has no reference effect")
+        .expect("delete retains its predecessor until journal retirement")
         .offset();
     let commits = Arc::new(TestCommits::default());
     commits.set(zero_delta, Err("metadata quorum is still pending".into()));
@@ -1388,25 +1483,16 @@ async fn compaction_uses_only_every_current_active_destination() {
     let before_third = source.local_watch_status().unwrap();
     assert_eq!(caught_up.reference_safe_through, before_third.tail);
     let active_nodes = [1_u16, 2, 3];
-    for consumer_kind in keldra_store::DerivedConsumerKind::ALL {
-        for consumer_node_id in active_nodes {
-            source
-                .apply_derived_consumer_checkpoint(
-                    keldra_store::DerivedConsumerCheckpoint {
-                        consumer_kind,
-                        source_id: before_third.source_id,
-                        consumer_node_id,
-                        next_offset: before_third.tail + 1,
-                        observed_fence: PlacementLogId { term: 1, index: 2 },
-                    },
-                    &active_nodes,
-                )
-                .await
-                .unwrap();
-        }
-    }
-    publish(&source, "three", b"three", "three").await;
-    publish(&source, "four", b"four", "four").await;
+    checkpoint_all_derived_consumers(
+        &source,
+        before_third.source_id,
+        before_third.tail + 1,
+        PlacementLogId { term: 1, index: 2 },
+        &active_nodes,
+    )
+    .await;
+    publish_after_capacity_maintenance(&source, "three", b"three", "three").await;
+    publish_after_capacity_maintenance(&source, "four", b"four", "four").await;
     let status = source.local_watch_status().unwrap();
     assert_eq!(status.tail, before_third.tail + 4);
     assert_eq!(status.retained_entries, 8);

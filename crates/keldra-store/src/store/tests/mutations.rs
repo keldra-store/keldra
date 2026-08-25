@@ -630,10 +630,10 @@ fn assert_same_mutation_metadata(coordinator: &Store, replica: &Store, mutation:
     );
     assert_eq!(
         coordinator
-            .read_json::<Version>(CF_VERSIONS, &version_key)
+            .read_json::<StoredVersion>(CF_VERSIONS, &version_key)
             .unwrap(),
         replica
-            .read_json::<Version>(CF_VERSIONS, &version_key)
+            .read_json::<StoredVersion>(CF_VERSIONS, &version_key)
             .unwrap()
     );
     assert_eq!(
@@ -749,7 +749,7 @@ async fn verified_distributed_publish_does_not_require_payload_on_path_coordinat
 
 #[tokio::test]
 async fn typed_mutation_replicates_exactly_and_retries_after_head_and_journal_move() {
-    let (_temporary, coordinator, replica) = two_stores(2).await;
+    let (_temporary, coordinator, replica) = two_stores(4).await;
     let first_request = put(
         "replicated",
         b"first",
@@ -810,16 +810,24 @@ async fn typed_mutation_replicates_exactly_and_retries_after_head_and_journal_mo
         .advance_source_journal_reference_safe_through(2)
         .await
         .unwrap();
+    // Match the production distributed path: seal the payload once, then
+    // coordinate its compact publish descriptor.
+    let second_put = put(
+        "replicated",
+        b"second",
+        Precondition::Version(first_mutation.version.id),
+        "second-command",
+    );
+    let second_request = PublishRequest {
+        key: second_put.key,
+        blob: coordinator.stage_blob(&second_put.bytes).await.unwrap(),
+        content_type: second_put.content_type,
+        mode: second_put.mode,
+        command_id: second_put.command_id,
+        durability: second_put.durability,
+    };
     let second = coordinator
-        .coordinate_object_mutation(
-            BatchOperation::Put(put(
-                "replicated",
-                b"second",
-                Precondition::Version(first_mutation.version.id),
-                "second-command",
-            )),
-            distributed_context(11),
-        )
+        .coordinate_distributed_publish(second_request, distributed_context(11))
         .await
         .unwrap();
     let second_mutation = second.mutation.clone().unwrap();
@@ -838,6 +846,12 @@ async fn typed_mutation_replicates_exactly_and_retries_after_head_and_journal_mo
             .unwrap()
     );
     assert_same_mutation_metadata(&coordinator, &replica, &second_mutation);
+    // Force two bounded proof-backed passes: the payload lifecycle record and
+    // then the first object-head record. This deterministically moves the
+    // journal and retires the superseded unversioned descriptor without an
+    // unbounded retry loop in the test.
+    coordinator.wait_for_mutation_capacity().await;
+    coordinator.wait_for_mutation_capacity().await;
     assert!(
         coordinator
             .read_local_change(first_mutation.stamp.source_journal_position)
@@ -846,7 +860,7 @@ async fn typed_mutation_replicates_exactly_and_retries_after_head_and_journal_mo
     );
     assert!(
         coordinator
-            .read_json::<Version>(CF_VERSIONS, &mutation_version_key(&first_mutation))
+            .read_json::<StoredVersion>(CF_VERSIONS, &mutation_version_key(&first_mutation))
             .unwrap()
             .is_none()
     );
@@ -1098,9 +1112,9 @@ async fn first_typed_mutation_accepts_an_unstamped_050_baseline() {
         .version_metadata(&logical_key, baseline.version)
         .unwrap()
         .unwrap();
-    let baseline_reference = baseline_version.blob.as_ref().unwrap();
+    let baseline_reference = baseline_version.blob.clone().unwrap();
     let baseline_lifecycle = coordinator
-        .blob_reference_state(baseline_reference)
+        .blob_reference_state(&baseline_reference)
         .unwrap()
         .unwrap();
     assert_eq!(baseline_lifecycle.flags, 0);
@@ -1113,7 +1127,11 @@ async fn first_typed_mutation_accepts_an_unstamped_050_baseline() {
     seed.put_cf(
         replica.cf(CF_VERSIONS).unwrap(),
         version_key(identity, &logical_key, baseline.version),
-        serde_json::to_vec(&baseline_version).unwrap(),
+        serde_json::to_vec(&StoredVersion::new(
+            baseline_version,
+            StoredVersionRetention::JournalPending,
+        ))
+        .unwrap(),
     );
     replica.db.write(seed).unwrap();
 
@@ -1134,7 +1152,7 @@ async fn first_typed_mutation_accepts_an_unstamped_050_baseline() {
     assert_eq!(typed.stamp.predecessor_version, Some(baseline.version));
     assert_eq!(
         coordinator
-            .blob_reference_state(baseline_reference)
+            .blob_reference_state(&baseline_reference)
             .unwrap()
             .unwrap(),
         baseline_lifecycle

@@ -20,7 +20,7 @@ pub(super) async fn compact_selected_segments(
     selection: DebtSelection,
     leased_bytes: u64,
     admission: DerivedArtifactAdmission,
-    candidate: &mut CandidateGeneration,
+    candidate: &mut CandidateCommit,
     dependencies: &IndexBuilderDependencies,
 ) -> Result<(), Status> {
     let started = Instant::now();
@@ -196,7 +196,7 @@ pub(super) async fn compact_selected_segments(
 }
 
 fn detach_selected_locator_packs(
-    candidate: &mut CandidateGeneration,
+    candidate: &mut CandidateCommit,
     selected: &[SegmentDescriptor],
 ) -> Result<(), Status> {
     for root in &mut candidate.locator_roots {
@@ -276,7 +276,7 @@ mod tests {
     fn segment_locator_is_detached_before_its_segment_is_removed() {
         let identity = SegmentIdentity::new(7, 3, [4; 32], 9).unwrap();
         let selected = vec![segment(identity)];
-        let mut candidate = CandidateGeneration {
+        let mut candidate = CandidateCommit {
             segments: selected.clone(),
             locator_roots: vec![LocatorRoot {
                 sequence: 1,
@@ -296,6 +296,7 @@ mod tests {
                 encoded_bytes: 1,
                 logical_bytes: 1,
             }],
+            pending_atomic_batches: Vec::new(),
             next_sequence: 2,
             diagnostics: IndexBuildDiagnostics::default(),
         };

@@ -1,6 +1,7 @@
-//! Narrow ordinary-object publication boundary for index generations.
+//! Narrow ordinary-object publication boundary for index commits.
 
-use std::sync::{Arc, OnceLock};
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use keldra_consensus::NodeId;
 use keldra_store::{
@@ -47,9 +48,10 @@ impl DefinitionVersionGuard {
             ));
         }
         let valid_path = match (artifact_kind, self.kind) {
-            (ArtifactPathKind::Current, DefinitionKind::Index) => {
-                index_definition_name(&self.exact_path).is_some()
-            }
+            (
+                ArtifactPathKind::Current | ArtifactPathKind::RebuildMutable,
+                DefinitionKind::Index,
+            ) => index_definition_name(&self.exact_path).is_some(),
             (ArtifactPathKind::AccountingMutable, DefinitionKind::Accounting) => {
                 crate::accounting::definition_path(request.index_id)
                     .ok()
@@ -77,7 +79,7 @@ pub(crate) struct IndexArtifactPublish {
     pub index_id: u64,
     pub exact_path: String,
     pub blob: BlobRef,
-    /// Absence creates an immutable generation artifact/current pointer.
+    /// Absence creates an immutable commit artifact/current pointer.
     /// Presence replaces only the current pointer at this exact version.
     pub expected_version: Option<VersionId>,
     pub command_id: String,
@@ -85,7 +87,7 @@ pub(crate) struct IndexArtifactPublish {
     /// the mutable current pointer or accounting rollup is committed.
     pub definition_guard: Option<DefinitionVersionGuard>,
     /// Trusted typed evidence for an ordinary definition mutation. Generic
-    /// generation, current, rollup, and traffic-source artifacts leave this
+    /// commit, current, rollup, and traffic-source artifacts leave this
     /// absent.
     pub definition_intent: Option<DefinitionMutationIntent>,
     /// Private admission selected by the current authenticated HRW builder.
@@ -188,7 +190,9 @@ impl IndexArtifactPublish {
         if self.admission.is_publication_progress() {
             let eligible = matches!(
                 kind,
-                ArtifactPathKind::Current | ArtifactPathKind::Immutable
+                ArtifactPathKind::Current
+                    | ArtifactPathKind::RebuildMutable
+                    | ArtifactPathKind::Immutable
             ) || (kind == ArtifactPathKind::AccountingMutable
                 && crate::accounting::current_path(self.index_id)
                     .ok()
@@ -196,7 +200,7 @@ impl IndexArtifactPublish {
                     == Some(self.exact_path.as_str()));
             if !eligible || self.definition_intent.is_some() {
                 return Err(Status::invalid_argument(
-                    "publication-progress admission is valid only for index generation or complete accounting-rollup publication",
+                    "publication-progress admission is valid only for an index commit or complete accounting-rollup publication",
                 ));
             }
         }
@@ -204,21 +208,31 @@ impl IndexArtifactPublish {
             (ArtifactPathKind::Current, Some(VersionId(0))) => Err(Status::invalid_argument(
                 "index current-pointer expected version must be non-zero",
             )),
+            (ArtifactPathKind::RebuildMutable, Some(VersionId(0))) => Err(
+                Status::invalid_argument("index rebuild-root expected version must be non-zero"),
+            ),
             (ArtifactPathKind::AccountingMutable, Some(VersionId(0))) => Err(
                 Status::invalid_argument("accounting artifact expected version must be non-zero"),
             ),
-            (ArtifactPathKind::Current | ArtifactPathKind::AccountingMutable, _)
+            (
+                ArtifactPathKind::Current
+                | ArtifactPathKind::RebuildMutable
+                | ArtifactPathKind::AccountingMutable,
+                _,
+            )
             | (ArtifactPathKind::Immutable, None) => Ok(kind),
             (ArtifactPathKind::Immutable, Some(_)) => Err(Status::invalid_argument(
-                "immutable index generation artifacts cannot be replaced",
+                "immutable index commit artifacts cannot be replaced",
             )),
         }?;
-        let guard_required = kind == ArtifactPathKind::Current
-            || (kind == ArtifactPathKind::AccountingMutable
-                && crate::accounting::current_path(self.index_id)
-                    .ok()
-                    .as_deref()
-                    == Some(self.exact_path.as_str()));
+        let guard_required = matches!(
+            kind,
+            ArtifactPathKind::Current | ArtifactPathKind::RebuildMutable
+        ) || (kind == ArtifactPathKind::AccountingMutable
+            && crate::accounting::current_path(self.index_id)
+                .ok()
+                .as_deref()
+                == Some(self.exact_path.as_str()));
         match (guard_required, self.definition_guard.as_ref()) {
             (true, Some(guard)) => guard.validate(self, kind)?,
             (false, None) => {}
@@ -240,6 +254,7 @@ impl IndexArtifactPublish {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ArtifactPathKind {
     Current,
+    RebuildMutable,
     Immutable,
     AccountingMutable,
 }
@@ -519,11 +534,15 @@ impl IndexArtifactCoordinator {
         }
         self.validate_builder(authenticated_builder, &placement, identity, &key)?;
         let mode = match (kind, request.expected_version) {
-            (ArtifactPathKind::Current | ArtifactPathKind::AccountingMutable, Some(version)) => {
-                PutMode::PutIfVersion(version)
-            }
             (
                 ArtifactPathKind::Current
+                | ArtifactPathKind::RebuildMutable
+                | ArtifactPathKind::AccountingMutable,
+                Some(version),
+            ) => PutMode::PutIfVersion(version),
+            (
+                ArtifactPathKind::Current
+                | ArtifactPathKind::RebuildMutable
                 | ArtifactPathKind::Immutable
                 | ArtifactPathKind::AccountingMutable,
                 None,
@@ -532,7 +551,9 @@ impl IndexArtifactCoordinator {
         };
         let content_type = match kind {
             ArtifactPathKind::AccountingMutable => ACCOUNTING_ARTIFACT_CONTENT_TYPE,
-            ArtifactPathKind::Current | ArtifactPathKind::Immutable => INDEX_ARTIFACT_CONTENT_TYPE,
+            ArtifactPathKind::Current
+            | ArtifactPathKind::RebuildMutable
+            | ArtifactPathKind::Immutable => INDEX_ARTIFACT_CONTENT_TYPE,
         };
         let derived_progress = request.admission.is_publication_progress();
         let durability = artifact_durability(kind, placement.placement_nodes().len());
@@ -843,6 +864,12 @@ pub(crate) struct IndexArtifactRouter {
     coordinator: IndexArtifactCoordinator,
     objects: ObjectDistribution,
     peers: ClusterPeerTransport,
+    current_mutations: Arc<Mutex<BTreeMap<u64, Arc<tokio::sync::Mutex<()>>>>>,
+}
+
+pub(crate) struct IndexCurrentMutationGuard {
+    index_id: u64,
+    _guard: tokio::sync::OwnedMutexGuard<()>,
 }
 
 impl IndexArtifactRouter {
@@ -857,7 +884,30 @@ impl IndexArtifactRouter {
             coordinator,
             objects,
             peers,
+            current_mutations: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    /// Serializes one current-pointer mutation with a destructive artifact
+    /// decision for the same index. Immutable component publication does not
+    /// use this gate and remains independently concurrent.
+    pub(crate) async fn acquire_current_mutation(
+        &self,
+        index_id: u64,
+    ) -> Result<IndexCurrentMutationGuard, Status> {
+        let gate = {
+            let mut gates = self.current_mutations.lock().map_err(|_| {
+                Status::internal("index current-mutation gate registry is poisoned")
+            })?;
+            gates
+                .entry(index_id)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        Ok(IndexCurrentMutationGuard {
+            index_id,
+            _guard: gate.lock_owned().await,
+        })
     }
 
     pub(crate) async fn publish(
@@ -865,6 +915,28 @@ impl IndexArtifactRouter {
         request: IndexArtifactPublish,
     ) -> Result<IndexArtifactOutcome, Status> {
         request.validate()?;
+        let _current_guard = if request.exact_path == current_path(request.index_id) {
+            Some(self.acquire_current_mutation(request.index_id).await?)
+        } else {
+            None
+        };
+        self.publish_while_current_mutation_held(request, _current_guard.as_ref())
+            .await
+    }
+
+    pub(crate) async fn publish_while_current_mutation_held(
+        &self,
+        request: IndexArtifactPublish,
+        guard: Option<&IndexCurrentMutationGuard>,
+    ) -> Result<IndexArtifactOutcome, Status> {
+        request.validate()?;
+        if request.exact_path == current_path(request.index_id)
+            && guard.is_none_or(|guard| guard.index_id != request.index_id)
+        {
+            return Err(Status::internal(
+                "current-pointer publication has no matching mutation guard",
+            ));
+        }
         let placement =
             self.require_local_builder(request.tenant_id, request.bucket_id, request.index_id)?;
         let fence = placement.fence();
@@ -988,6 +1060,27 @@ impl IndexArtifactRouter {
     pub(crate) async fn delete(
         &self,
         request: IndexArtifactDelete,
+    ) -> Result<IndexArtifactOutcome, Status> {
+        self.delete_inner(request, None).await
+    }
+
+    pub(crate) async fn delete_while_current_mutation_held(
+        &self,
+        request: IndexArtifactDelete,
+        guard: &IndexCurrentMutationGuard,
+    ) -> Result<IndexArtifactOutcome, Status> {
+        if guard.index_id != request.index_id {
+            return Err(Status::internal(
+                "artifact deletion has another index's current-mutation guard",
+            ));
+        }
+        self.delete_inner(request, Some(guard)).await
+    }
+
+    async fn delete_inner(
+        &self,
+        request: IndexArtifactDelete,
+        _guard: Option<&IndexCurrentMutationGuard>,
     ) -> Result<IndexArtifactOutcome, Status> {
         request.validate()?;
         let placement =
@@ -1329,10 +1422,16 @@ fn artifact_durability(kind: ArtifactPathKind, active_nodes: usize) -> Durabilit
         // Once more than one node is ACTIVE, keep the stronger request and let
         // the ordinary object path fail closed unless its exact requirements
         // can be met.
-        ArtifactPathKind::Current | ArtifactPathKind::Immutable if active_nodes == 1 => {
+        ArtifactPathKind::Current
+        | ArtifactPathKind::RebuildMutable
+        | ArtifactPathKind::Immutable
+            if active_nodes == 1 =>
+        {
             Durability::Local
         }
-        ArtifactPathKind::Current | ArtifactPathKind::Immutable => Durability::Replicated,
+        ArtifactPathKind::Current
+        | ArtifactPathKind::RebuildMutable
+        | ArtifactPathKind::Immutable => Durability::Replicated,
     }
 }
 
@@ -1353,6 +1452,7 @@ fn parse_artifact_path(path: &str, expected_index: u64) -> Result<ArtifactPathKi
     }
     match parts.as_slice() {
         [_, _, _, _, "current"] => Ok(ArtifactPathKind::Current),
+        [_, _, _, _, "rebuild"] => Ok(ArtifactPathKind::RebuildMutable),
         [_, _, _, _, "manifests", digest] if valid_digest(digest) => {
             Ok(ArtifactPathKind::Immutable)
         }
@@ -1489,6 +1589,10 @@ pub(crate) fn is_manifest_artifact_path(index_id: u64, path: &str) -> bool {
 
 pub(crate) fn current_path(index_id: u64) -> String {
     keldra_index::v4::current_path(index_id)
+}
+
+pub(crate) fn rebuild_path(index_id: u64) -> String {
+    format!("_keldra/indices/v4/{index_id}/rebuild")
 }
 
 pub(crate) fn is_index_recovery_path(path: &str, index_id: u64) -> bool {

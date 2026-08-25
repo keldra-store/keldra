@@ -40,7 +40,7 @@ x-keldra-environment: &keldra-environment
   # Force the public all-kind workload through genuine four-input compaction;
   # this is qualification configuration, not Keldra's production default.
   KELDRA_INDEX_MAX_SEGMENTS_PER_TIER: "4"
-  KELDRA_INDEX_MAX_RETAINED_GENERATIONS: "1"
+  KELDRA_INDEX_MAX_RETAINED_COMMIT_REVISIONS: "1"
   # The qualification wrapper temporarily selects a tiny bound only for its
   # isolated pressure phase, then restarts onto this production default before
   # the release corpus.

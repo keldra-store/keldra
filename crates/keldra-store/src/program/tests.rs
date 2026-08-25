@@ -10,13 +10,21 @@ use tempfile::TempDir;
 use super::*;
 use crate::{
     BucketPolicy, DeleteRetainedVersionOutcome, DestinationReferenceArtifact,
-    DestinationReferenceDelta, Durability, LogicalRecordCandidate, LogicalRecordMutationContext,
-    LogicalRecordValue, ObjectMutationContext, ObjectMutationGovernance, ObjectVersioning,
-    PlacementLogId, PutMode, PutRequest, ReferenceDeltaBatch, StoreOptions,
+    DestinationReferenceDelta, Durability, LocalChange, LogicalRecordCandidate,
+    LogicalRecordMutationContext, LogicalRecordValue, ObjectMutationContext,
+    ObjectMutationGovernance, ObjectVersioning, PlacementLogId, PutMode, PutRequest,
+    ReferenceDeltaBatch, StoreOptions, WatchRetention,
 };
 
 fn counter_path() -> ObjectPath {
     ObjectPath::new("tenant", "bucket", "managed/counter").unwrap()
+}
+
+fn mutation_context() -> ObjectMutationContext {
+    ObjectMutationContext {
+        active_placement_log_id: PlacementLogId { term: 3, index: 7 },
+        serving_fence_term: 3,
+    }
 }
 
 fn definition() -> ProgramDefinition {
@@ -240,7 +248,7 @@ async fn ordinary_blob_plane_attests_executor_local_durability() {
     };
     let before_apply = store.db.latest_sequence_number();
     let applied = store
-        .apply_program_bundle(lease, &prepared, local_commit.clone())
+        .apply_program_bundle(lease, &prepared, local_commit.clone(), mutation_context())
         .await
         .unwrap();
     let apply_batches = store
@@ -285,6 +293,18 @@ async fn ordinary_blob_plane_attests_executor_local_durability() {
     );
     let applied_key = object_key(&counter_path()).unwrap();
     let applied_head = store.head(&applied_key).unwrap().unwrap();
+    let applied_stamp = applied_head
+        .mutation_stamp
+        .expect("one-node atomic head carries visibility lineage");
+    assert_eq!(applied_stamp.program_commit_cursor, Some(1));
+    assert_eq!(
+        applied_stamp.active_placement_log_id,
+        mutation_context().active_placement_log_id
+    );
+    assert_eq!(
+        applied_stamp.serving_fence_term,
+        mutation_context().serving_fence_term
+    );
     let applied_version = store
         .version_metadata(&applied_key, applied_head.version)
         .unwrap()
@@ -310,7 +330,13 @@ async fn ordinary_blob_plane_attests_executor_local_durability() {
         .into_iter()
         .filter_map(|change| change.into_object_head())
         .collect::<Vec<_>>();
+    let journal = store.local_watch_status().unwrap();
     assert_eq!(invalidations.len(), 1);
+    assert_eq!(applied_stamp.source_id, journal.source_id);
+    assert_eq!(
+        applied_stamp.source_journal_position,
+        invalidations[0].offset
+    );
     let counter_key = object_key(&counter_path()).unwrap();
     assert_eq!(invalidations[0].exact_path, counter_key.path());
     assert_eq!(
@@ -325,7 +351,6 @@ async fn ordinary_blob_plane_attests_executor_local_durability() {
         store.head(&counter_key).unwrap().unwrap().version
     );
     let journal_tail_before_replay = store.local_invalidation_offset().unwrap();
-    let journal = store.local_watch_status().unwrap();
     assert_eq!(
         store.reference_delta_cursor(journal.source_id).unwrap(),
         journal.tail
@@ -335,15 +360,18 @@ async fn ordinary_blob_plane_attests_executor_local_durability() {
     // invalidation. The compact commit marker, head and journal move together in
     // the one local RocksDB WriteBatch above.
     let replayed = store
-        .recover_program_bundle(ProgramCommit {
-            previous_commit_cursor: None,
-            commit_cursor: 1,
-            bundle_ref: prepared.bundle,
-            bundle_hash: prepared.hash,
-            program_hash: prepared.program_hash,
-            durability_class: ProgramDurabilityClassHash::for_class(LOCAL_DURABILITY_CLASS),
-            durability_evidence_hash: prepared.durability_evidence_hash,
-        })
+        .recover_program_bundle(
+            ProgramCommit {
+                previous_commit_cursor: None,
+                commit_cursor: 1,
+                bundle_ref: prepared.bundle,
+                bundle_hash: prepared.hash,
+                program_hash: prepared.program_hash,
+                durability_class: ProgramDurabilityClassHash::for_class(LOCAL_DURABILITY_CLASS),
+                durability_evidence_hash: prepared.durability_evidence_hash,
+            },
+            mutation_context(),
+        )
         .await
         .unwrap();
     assert_eq!(replayed, applied);
@@ -376,6 +404,64 @@ async fn ordinary_blob_plane_attests_executor_local_durability() {
         store.read_blob_bytes(&bundle_blob).await.unwrap_err(),
         MutationError::BlobNotFound
     );
+}
+
+#[tokio::test]
+async fn preparation_rejects_an_atomic_transition_that_cannot_fit_the_source_journal() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = Store::open(
+        StoreOptions::new(temporary.path(), 1)
+            .with_watch_retention(WatchRetention::new(1, 64 * 1024 * 1024).unwrap()),
+    )
+    .await
+    .unwrap();
+    configure_policy(&store).await;
+    let engine = store.program_engine(&verified_definition()).unwrap();
+    let lease = engine
+        .prepare(
+            &InvocationContext::new("tenant").unwrap(),
+            &invocation("journal-bound", ExpectedHead::Absent),
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        store.prepare_program_bundle(&lease).await.unwrap_err(),
+        ProgramStoreError::SourceJournalTransitionTooLarge {
+            entries: 2,
+            maximum_entries: 1,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn preparation_rejects_an_atomic_transition_over_the_aggregate_journal_byte_bound() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = Store::open(
+        StoreOptions::new(temporary.path(), 1)
+            .with_watch_retention(WatchRetention::new(100, 1).unwrap()),
+    )
+    .await
+    .unwrap();
+    configure_policy(&store).await;
+    let engine = store.program_engine(&verified_definition()).unwrap();
+    let lease = engine
+        .prepare(
+            &InvocationContext::new("tenant").unwrap(),
+            &invocation("journal-byte-bound", ExpectedHead::Absent),
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        store.prepare_program_bundle(&lease).await.unwrap_err(),
+        ProgramStoreError::SourceJournalTransitionTooLarge {
+            entries: 2,
+            maximum_bytes: 1,
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -415,7 +501,7 @@ async fn apply_is_all_old_or_all_new_and_records_only_the_compact_cursor() {
     assert!(before.documents.is_empty());
     let first_commit = commit(&prepared, None, 1);
     let first = store
-        .apply_program_bundle(lease, &prepared, first_commit)
+        .apply_program_bundle(lease, &prepared, first_commit, mutation_context())
         .await
         .unwrap();
     let after = snapshot(&store).await;
@@ -435,7 +521,12 @@ async fn apply_is_all_old_or_all_new_and_records_only_the_compact_cursor() {
     let second_prepared = store.prepare_program_bundle(&second_lease).await.unwrap();
     let second_commit = commit(&second_prepared, Some(1), 2);
     let second = store
-        .apply_program_bundle(second_lease, &second_prepared, second_commit)
+        .apply_program_bundle(
+            second_lease,
+            &second_prepared,
+            second_commit,
+            mutation_context(),
+        )
         .await
         .unwrap();
     assert!(second.published_versions[&counter_path()].version > current_version.version);
@@ -550,7 +641,11 @@ async fn exact_head_is_rechecked_before_atomic_apply() {
     batch.put_cf(
         store.program_cf(CF_VERSIONS).unwrap(),
         version_key(identity, &key, rogue_id),
-        serde_json::to_vec(&rogue).unwrap(),
+        serde_json::to_vec(&StoredVersion::new(
+            rogue,
+            StoredVersionRetention::JournalPending,
+        ))
+        .unwrap(),
     );
     batch.put_cf(
         store.program_cf(CF_HEADS).unwrap(),
@@ -567,7 +662,7 @@ async fn exact_head_is_rechecked_before_atomic_apply() {
     let stale_commit = commit(&prepared, None, 1);
     assert_eq!(
         store
-            .apply_program_bundle(lease, &prepared, stale_commit)
+            .apply_program_bundle(lease, &prepared, stale_commit, mutation_context())
             .await
             .unwrap_err(),
         ProgramStoreError::PreconditionFailed {
@@ -612,7 +707,7 @@ async fn ordinary_prepared_blobs_survive_reopen_for_recovery() {
         Some(prepared.clone())
     );
     let applied = reopened
-        .recover_program_bundle(commit(&prepared, None, 1))
+        .recover_program_bundle(commit(&prepared, None, 1), mutation_context())
         .await
         .unwrap();
     assert_eq!(applied.receipt.command_id, "recover");
@@ -645,7 +740,7 @@ async fn recovery_rejects_committed_bundle_reference_and_durability_class_mismat
     };
     assert_eq!(
         store
-            .recover_program_bundle(wrong_reference)
+            .recover_program_bundle(wrong_reference, mutation_context())
             .await
             .unwrap_err(),
         ProgramStoreError::PreparedBundleMismatch
@@ -654,7 +749,10 @@ async fn recovery_rejects_committed_bundle_reference_and_durability_class_mismat
     let mut wrong_class = commit(&prepared, None, 1);
     wrong_class.durability_class = ProgramDurabilityClassHash::for_class("other-remote");
     assert_eq!(
-        store.recover_program_bundle(wrong_class).await.unwrap_err(),
+        store
+            .recover_program_bundle(wrong_class, mutation_context())
+            .await
+            .unwrap_err(),
         ProgramStoreError::DurabilityClassMismatch
     );
     assert_eq!(store.applied_program_commit_cursor().unwrap(), None);
@@ -678,7 +776,7 @@ async fn finalization_rejects_a_committed_durability_class_mismatch_before_publi
 
     assert_eq!(
         store
-            .apply_program_bundle(lease, &prepared, wrong_class)
+            .apply_program_bundle(lease, &prepared, wrong_class, mutation_context())
             .await
             .unwrap_err(),
         ProgramStoreError::DurabilityClassMismatch
@@ -701,11 +799,11 @@ async fn finalization_is_idempotent_and_rejects_cursor_corruption() {
     let prepared = store.prepare_program_bundle(&lease).await.unwrap();
     let first_commit = commit(&prepared, None, 10);
     let first = store
-        .apply_program_bundle(lease, &prepared, first_commit)
+        .apply_program_bundle(lease, &prepared, first_commit, mutation_context())
         .await
         .unwrap();
     let replay = store
-        .recover_program_bundle(commit(&prepared, None, 10))
+        .recover_program_bundle(commit(&prepared, None, 10), mutation_context())
         .await
         .unwrap();
     assert_eq!(replay, first);
@@ -713,7 +811,10 @@ async fn finalization_is_idempotent_and_rejects_cursor_corruption() {
     let mut corrupt = commit(&prepared, None, 10);
     corrupt.program_hash = ProgramHash([9; 32]);
     assert_eq!(
-        store.recover_program_bundle(corrupt).await.unwrap_err(),
+        store
+            .recover_program_bundle(corrupt, mutation_context())
+            .await
+            .unwrap_err(),
         ProgramStoreError::CommitCorruption { cursor: 10 }
     );
 
@@ -723,14 +824,20 @@ async fn finalization_is_idempotent_and_rejects_cursor_corruption() {
         length: prepared.bundle.length,
     };
     assert_eq!(
-        store.recover_program_bundle(corrupt).await.unwrap_err(),
+        store
+            .recover_program_bundle(corrupt, mutation_context())
+            .await
+            .unwrap_err(),
         ProgramStoreError::CommitCorruption { cursor: 10 }
     );
 
     let mut corrupt = commit(&prepared, None, 10);
     corrupt.durability_class = ProgramDurabilityClassHash([7; 32]);
     assert_eq!(
-        store.recover_program_bundle(corrupt).await.unwrap_err(),
+        store
+            .recover_program_bundle(corrupt, mutation_context())
+            .await
+            .unwrap_err(),
         ProgramStoreError::CommitCorruption { cursor: 10 }
     );
     assert_eq!(store.applied_program_commit_cursor().unwrap(), Some(10));
@@ -752,7 +859,7 @@ async fn predecessor_cursor_prevents_out_of_order_publication() {
 
     assert_eq!(
         store
-            .recover_program_bundle(commit(&prepared, Some(20), 30))
+            .recover_program_bundle(commit(&prepared, Some(20), 30), mutation_context())
             .await
             .unwrap_err(),
         ProgramStoreError::OutOfOrderCommit {
@@ -1010,6 +1117,41 @@ async fn distributed_path_stage_is_invisible_until_commit_bound_finalization() {
         .unwrap();
     assert!(replay.replayed);
     assert_eq!(replay.version, stage.version.id);
+
+    let publication = SealedAtomicBatchPublication::from_prepared(
+        42,
+        prepared.bundle,
+        prepared.hash,
+        &record,
+        &[stage.clone()],
+        &[finalized.mutation.clone()],
+    )
+    .unwrap();
+    assert!(
+        store
+            .publish_atomic_batch(publication.clone())
+            .await
+            .unwrap()
+    );
+    let tail = store.local_watch_status().unwrap().tail;
+    assert!(!store.publish_atomic_batch(publication).await.unwrap());
+    assert_eq!(store.local_watch_status().unwrap().tail, tail);
+    let published = store.read_local_change(tail).unwrap().unwrap();
+    let LocalChange::AtomicBatchPublished(published) = published else {
+        panic!("last source event is not the complete atomic batch");
+    };
+    assert_eq!(published.cursor, 42);
+    assert_eq!(published.bundle_hash, prepared.hash);
+    assert_eq!(published.mutations.len(), 1);
+    let truncated = SealedAtomicBatchPublication::from_prepared(
+        43,
+        prepared.bundle,
+        prepared.hash,
+        &record,
+        &[],
+        &[],
+    );
+    assert_eq!(truncated, Err(ProgramStoreError::PreparedBundleMismatch));
 }
 
 #[tokio::test]
@@ -1051,7 +1193,6 @@ async fn distributed_versioned_program_counts_each_same_blob_retained_version() 
         )
         .await
         .unwrap();
-    assert!(!first.mutation.retire_predecessor);
     assert_eq!(
         first.mutation.reference_deltas,
         [ReferenceDelta {
@@ -1104,7 +1245,6 @@ async fn distributed_versioned_program_counts_each_same_blob_retained_version() 
         )
         .await
         .unwrap();
-    assert!(!second.mutation.retire_predecessor);
     assert_eq!(
         second.mutation.reference_deltas,
         [ReferenceDelta {
@@ -1159,15 +1299,10 @@ async fn distributed_versioned_program_counts_each_same_blob_retained_version() 
         .apply_program_path_finalization_replica(&first.mutation)
         .await
         .unwrap();
-    assert_eq!(
-        replica
-            .apply_program_path_finalization_replica(&second.mutation)
-            .await
-            .unwrap_err(),
-        ProgramStoreError::InvalidBundle(
-            "distributed program path mutation disagrees with local bucket versioning".into()
-        )
-    );
+    replica
+        .apply_program_path_finalization_replica(&second.mutation)
+        .await
+        .unwrap();
 
     let deletion = store
         .coordinate_retained_version_delete(

@@ -7,7 +7,6 @@ pub(super) enum BuilderFailurePhase {
     Inspect,
     Rebuild,
     CatchUp,
-    Publish,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -22,22 +21,22 @@ pub(super) fn failure_recovery(
     error: &Status,
 ) -> BuilderFailureRecovery {
     match error.code() {
-        Code::FailedPrecondition if phase == BuilderFailurePhase::Publish => {
-            BuilderFailureRecovery::Reinspect
-        }
         Code::FailedPrecondition if phase == BuilderFailurePhase::Rebuild => {
-            // An explicitly requested or first build has no resumable snapshot
-            // stream. Reinspection restarts that same accepted definition
-            // version; it does not turn incremental lag into a rebuild.
+            // Reinspection reloads the durable non-serving rebuild root and
+            // reopens the source scan after its canonical path checkpoint.
             BuilderFailureRecovery::Reinspect
         }
         Code::FailedPrecondition => BuilderFailureRecovery::FailClosed,
         Code::Aborted => BuilderFailureRecovery::Reinspect,
         Code::Unavailable | Code::DeadlineExceeded | Code::Cancelled | Code::Unknown => {
-            if phase == BuilderFailurePhase::Rebuild {
-                // Snapshot streams are ephemeral and cannot resume after a
-                // transport error. Reinspect restarts only the same first or
-                // explicitly requested definition version.
+            if matches!(
+                phase,
+                BuilderFailurePhase::Rebuild | BuilderFailurePhase::CatchUp
+            ) {
+                // Snapshot streams are ephemeral; the durable rebuild root
+                // makes rebuild reinspection resumable. Catch-up has moved its
+                // transient state into the failed future, so it must replay
+                // from the last committed cut rather than claim preservation.
                 BuilderFailureRecovery::Reinspect
             } else {
                 BuilderFailureRecovery::Preserve
@@ -70,7 +69,7 @@ pub(super) fn recover_builder_failure(
         ?phase,
         ?recovery,
         %error,
-        "bounded index build quantum failed; prior generation remains current"
+        "bounded index build quantum failed; prior committed view remains current"
     );
     tracing::info!(
         index.kind = ?job.kind,

@@ -6,7 +6,6 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::io::Read;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -17,12 +16,11 @@ use keldra_consensus::{
 };
 use keldra_store::{
     AuthzRealmMutation, BlobRef, CompleteCopySealOutcome, CurrentObjectSnapshot, ErasureCodec,
-    ErasureProfile, LocalChange, MAX_LOCAL_INVALIDATION_SCAN_RECORDS,
-    MAX_OBJECT_RECORD_EXPORT_BYTES, MutationError, ObjectKey, ObjectMutation, ObjectPathSnapshot,
-    ObjectSnapshotApplied, ObjectSnapshotError, PayloadStoreError, ReferenceDeltaApplied,
-    ReferenceDeltaBatch, ReplicaAuthzRealmMutationApplied, ReplicaObjectMutationApplied,
-    RetainedVersionDeleteMutation, ShardIdentity, ShardSealOutcome, ShardStoreError, SourceId,
-    Store, WatchJournalStatus,
+    ErasureProfile, LocalChange, MAX_LOCAL_INVALIDATION_SCAN_RECORDS, MutationError, ObjectKey,
+    ObjectMutation, ObjectPathSnapshot, ObjectSnapshotApplied, ObjectSnapshotError,
+    PayloadStoreError, ReferenceDeltaApplied, ReferenceDeltaBatch,
+    ReplicaAuthzRealmMutationApplied, ReplicaObjectMutationApplied, RetainedVersionDeleteMutation,
+    ShardIdentity, ShardSealOutcome, ShardStoreError, SourceId, Store, WatchJournalStatus,
 };
 use tokio::io::AsyncWriteExt;
 use tonic::codegen::Service;
@@ -41,12 +39,14 @@ mod mutation_admission;
 mod object_mutation;
 mod object_mutation_batch;
 mod object_snapshot;
+mod protocol;
 mod retained_version_delete;
 mod source_journal;
 mod stream;
 mod timeout;
 mod transport;
 mod typed_json;
+mod wire;
 mod wire_value;
 
 use errors::{map_mutation_error, map_payload_error, map_shard_error};
@@ -54,6 +54,14 @@ use handoff_scope::{HandoffAuthority, HandoffTarget};
 use mutation_admission::MutationAdmission;
 use object_snapshot::{
     encode_object_snapshot, map_object_snapshot_error, require_object_snapshot_bound,
+};
+use protocol::{
+    AuthzRealmStream, ContentStream, MAX_DATA_PEER_MESSAGE_BYTES, MAX_OBJECT_SNAPSHOT_BYTES,
+    MAX_TYPED_MUTATION_BYTES,
+};
+pub(crate) use protocol::{
+    DATA_PEER_FRAME_BYTES, DATA_PEER_SCHEMA_VERSION, MAX_OBJECT_MUTATION_BATCH_BYTES,
+    MAX_OBJECT_MUTATION_BATCH_ITEMS,
 };
 use stream::{next_stream_message, require_large_blob, stream_blob, validate_stream_frame};
 use timeout::effective_timeout;
@@ -63,18 +71,6 @@ use wire_value::{
     content_end, content_frame, parse_blob, parse_cluster_id, parse_shard, parse_small_blob,
     require_response_schema, wire_blob, wire_shard,
 };
-
-pub(crate) mod wire {
-    tonic::include_proto!("keldra.data_peer.v1");
-}
-
-pub(crate) const DATA_PEER_SCHEMA_VERSION: u32 = 1;
-pub(crate) const DATA_PEER_FRAME_BYTES: usize = 64 * 1024;
-const MAX_TYPED_MUTATION_BYTES: usize = 16 * 1024 * 1024;
-pub(crate) const MAX_OBJECT_MUTATION_BATCH_ITEMS: usize = 1_000;
-pub(crate) const MAX_OBJECT_MUTATION_BATCH_BYTES: usize = 64 * 1024 * 1024;
-const MAX_OBJECT_SNAPSHOT_BYTES: usize = MAX_OBJECT_RECORD_EXPORT_BYTES as usize;
-const MAX_DATA_PEER_MESSAGE_BYTES: usize = MAX_OBJECT_SNAPSHOT_BYTES + 1024;
 
 #[derive(Clone)]
 pub(crate) struct DataPeerService {
@@ -89,10 +85,6 @@ pub(crate) struct DataPeerService {
 }
 
 pub(crate) type DataPeerServer = wire::data_peer_server::DataPeerServer<DataPeerService>;
-type ContentStream =
-    Pin<Box<dyn tokio_stream::Stream<Item = Result<wire::ContentFrame, Status>> + Send>>;
-type AuthzRealmStream =
-    Pin<Box<dyn tokio_stream::Stream<Item = Result<wire::AuthzRealmFrame, Status>> + Send>>;
 
 impl DataPeerService {
     pub(crate) fn new(
@@ -295,6 +287,12 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
         request: Request<wire::CurrentObjectSnapshotBatchRequest>,
     ) -> Result<Response<wire::CurrentObjectSnapshotBatchResponse>, Status> {
         self.read_current_object_snapshots_call(request).await
+    }
+    async fn read_exact_object_versions(
+        &self,
+        request: Request<wire::ExactObjectVersionBatchRequest>,
+    ) -> Result<Response<wire::ExactObjectVersionBatchResponse>, Status> {
+        self.read_exact_object_versions_call(request).await
     }
     async fn repair_object_path_snapshot(
         &self,
@@ -1647,6 +1645,8 @@ mod tests {
                 deleted: true,
                 committed_at_unix_millis: 1,
             }],
+            journal_pending_versions: Vec::new(),
+            journal_released_versions: Vec::new(),
             definition_locator: None,
         });
         store

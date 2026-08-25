@@ -470,7 +470,6 @@ mod tests {
                 deleted: true,
                 committed_at_unix_millis: 1,
             },
-            retire_predecessor: false,
             receipt_expires_at_unix_millis: 1,
             stamp: MutationStamp {
                 format: MUTATION_STAMP_FORMAT,

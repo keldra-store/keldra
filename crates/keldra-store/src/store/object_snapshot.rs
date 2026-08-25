@@ -81,6 +81,8 @@ pub struct ObjectPathSnapshot {
     pub exact_path: String,
     pub head: Head,
     pub versions: Vec<Version>,
+    pub journal_pending_versions: Vec<VersionId>,
+    pub journal_released_versions: Vec<VersionId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub definition_locator: Option<DefinitionLocator>,
 }
@@ -196,6 +198,30 @@ impl ObjectPathSnapshot {
             }
             previous = Some(version.id);
         }
+        if !self
+            .journal_pending_versions
+            .windows(2)
+            .all(|pair| pair[0] < pair[1])
+            || self.journal_pending_versions.iter().any(|id| {
+                self.versions
+                    .binary_search_by_key(id, |version| version.id)
+                    .is_err()
+            })
+            || !self
+                .journal_released_versions
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+            || self.journal_released_versions.iter().any(|id| {
+                self.versions
+                    .binary_search_by_key(id, |version| version.id)
+                    .is_err()
+                    || self.journal_pending_versions.binary_search(id).is_ok()
+            })
+        {
+            return Err(invalid_snapshot(
+                "journal-only descriptor identities are not an ordered subset",
+            ));
+        }
         let current = current.ok_or_else(|| {
             invalid_snapshot("head references a missing retained version descriptor")
         })?;
@@ -220,6 +246,27 @@ impl ObjectPathSnapshot {
             }
         }
         Ok(())
+    }
+}
+
+fn snapshot_retention(
+    snapshot: &ObjectPathSnapshot,
+    version: VersionId,
+) -> super::StoredVersionRetention {
+    if snapshot
+        .journal_pending_versions
+        .binary_search(&version)
+        .is_ok()
+    {
+        super::StoredVersionRetention::JournalPending
+    } else if snapshot
+        .journal_released_versions
+        .binary_search(&version)
+        .is_ok()
+    {
+        super::StoredVersionRetention::JournalReleased
+    } else {
+        super::StoredVersionRetention::UserRetained
     }
 }
 
@@ -511,10 +558,12 @@ impl Store {
 
         if let Some(selected) = selected {
             for version in &selected.versions {
+                let retention = snapshot_retention(selected, version.id);
                 batch.put_cf(
                     versions,
                     exact_version_key(&head_key, version.id),
-                    serde_json::to_vec(version).map_err(object_storage)?,
+                    serde_json::to_vec(&super::StoredVersion::new(version.clone(), retention))
+                        .map_err(object_storage)?,
                 );
             }
             batch.put_cf(
@@ -570,10 +619,12 @@ impl Store {
 
         let mut batch = WriteBatch::default();
         for version in &record.versions {
+            let retention = snapshot_retention(record, version.id);
             batch.put_cf(
                 self.cf(CF_VERSIONS).map_err(object_storage)?,
                 exact_version_key(&head_key, version.id),
-                serde_json::to_vec(version).map_err(object_storage)?,
+                serde_json::to_vec(&super::StoredVersion::new(version.clone(), retention))
+                    .map_err(object_storage)?,
             );
         }
         batch.put_cf(
@@ -818,6 +869,8 @@ where
     let head: Head = serde_json::from_slice(encoded_head).map_err(object_storage)?;
     let version_prefix = version_prefix_for_head(encoded_head_key);
     let mut retained = Vec::new();
+    let mut journal_pending_versions = Vec::new();
+    let mut journal_released_versions = Vec::new();
     for item in versions {
         let (key, encoded) = item.map_err(object_storage)?;
         if !key.starts_with(&version_prefix) {
@@ -827,11 +880,17 @@ where
             return Err(object_storage("retained version key is malformed"));
         }
         let key_version = VersionId(read_u64(&key[version_prefix.len()..])?);
-        let version: Version = serde_json::from_slice(&encoded).map_err(object_storage)?;
+        let stored = super::StoredVersion::decode(&encoded).map_err(object_storage)?;
+        let version = stored.version;
         if version.id != key_version {
             return Err(object_storage(
                 "retained version key and descriptor disagree",
             ));
+        }
+        if stored.retention == super::StoredVersionRetention::JournalPending {
+            journal_pending_versions.push(version.id);
+        } else if stored.retention == super::StoredVersionRetention::JournalReleased {
+            journal_released_versions.push(version.id);
         }
         retained.push(version);
     }
@@ -841,6 +900,8 @@ where
         exact_path,
         head,
         versions: retained,
+        journal_pending_versions,
+        journal_released_versions,
         definition_locator,
     };
     record.validate()?;

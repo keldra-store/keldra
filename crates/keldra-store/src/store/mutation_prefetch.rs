@@ -76,10 +76,21 @@ impl MutationReadCache {
                 version_key_by_head.insert(head_key.clone(), key);
             }
         }
-        let (versions_by_key, elapsed) =
-            multi_get_json::<Version>(store, CF_VERSIONS, &version_keys)?;
+        let started = std::time::Instant::now();
+        let versions_by_key = multi_get_raw(store, CF_VERSIONS, &version_keys)?
+            .into_iter()
+            .map(|(key, cached)| {
+                let decoded = cached.and_then(|value| {
+                    value
+                        .map(|encoded| StoredVersion::decode(&encoded).map(|stored| stored.version))
+                        .transpose()
+                });
+                (key, decoded)
+            })
+            .collect::<BTreeMap<_, _>>();
+        let elapsed = started.elapsed();
         metrics.version_keys = version_keys.len() as u64;
-        metrics.version_seconds = elapsed;
+        metrics.version_seconds = elapsed.as_secs_f64();
         let versions: BTreeMap<Vec<u8>, Cached<Version>> = version_key_by_head
             .into_iter()
             .map(|(head_key, version_key)| {

@@ -231,7 +231,7 @@ impl Store {
         }
         let selected = {
             let _commit_guard = self.commit_lock.lock().await;
-            let selected = self.version_metadata_by_identity(identity, key, version_id)?;
+            let selected = self.user_retained_version(identity, key, version_id)?;
             if let Some(version) = &selected {
                 validate_selected_version_id(version_id, version)?;
             }
@@ -282,7 +282,30 @@ impl Store {
         key: &ObjectKey,
         version_id: VersionId,
     ) -> Result<Option<Version>, MutationError> {
-        self.read_json(CF_VERSIONS, &version_key(identity, key, version_id))
+        Ok(self
+            .stored_version_by_key(&version_key(identity, key, version_id))?
+            .map(|stored| stored.version))
+    }
+
+    pub(super) fn user_retained_version(
+        &self,
+        identity: BucketIdentity,
+        key: &ObjectKey,
+        version_id: VersionId,
+    ) -> Result<Option<Version>, MutationError> {
+        let Some(stored) = self.stored_version_by_key(&version_key(identity, key, version_id))?
+        else {
+            return Ok(None);
+        };
+        if stored.retention == StoredVersionRetention::UserRetained
+            || self
+                .head_by_storage_key(&identity.head_key(key.path()))?
+                .is_some_and(|head| head.version == version_id)
+        {
+            Ok(Some(stored.version))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Returns the current descriptor without loading its payload.
@@ -328,8 +351,12 @@ impl Store {
                     None => return Ok(None),
                 },
             };
-            let Some(version) = self.version_metadata_by_identity(identity, key, version_id)?
-            else {
+            let selected = if selected_head.is_some() {
+                self.version_metadata_by_identity(identity, key, version_id)?
+            } else {
+                self.user_retained_version(identity, key, version_id)?
+            };
+            let Some(version) = selected else {
                 return if selected_head.is_some() {
                     Err(MutationError::Storage(
                         "head references a missing version descriptor".into(),
@@ -389,7 +416,11 @@ impl Store {
             if after.is_some_and(|after| stored_id <= after) {
                 continue;
             }
-            let version = serde_json::from_slice::<Version>(&encoded).map_err(storage_error)?;
+            let stored = StoredVersion::decode(&encoded)?;
+            if stored.retention != StoredVersionRetention::UserRetained {
+                continue;
+            }
+            let version = stored.version;
             if version.id != stored_id {
                 return Err(MutationError::Storage(
                     "retained version key and descriptor disagree".into(),
@@ -482,7 +513,11 @@ impl Store {
             batch.put_cf(
                 self.cf(CF_VERSIONS)?,
                 version_key(identity, key, tombstone_id),
-                serde_json::to_vec(&tombstone).map_err(storage_error)?,
+                serde_json::to_vec(&StoredVersion::new(
+                    tombstone.clone(),
+                    StoredVersionRetention::UserRetained,
+                ))
+                .map_err(storage_error)?,
             );
             batch.put_cf(
                 self.cf(CF_HEADS)?,
@@ -509,6 +544,7 @@ impl Store {
                     exact_path: key.path().to_owned(),
                     path_version: tombstone_id,
                     deleted: true,
+                    program_commit_cursor: None,
                     reference_deltas: Vec::new(),
                     // The retained-version event carries the live-head
                     // decrement.  Mark the companion tombstone event as an
@@ -593,11 +629,9 @@ impl Store {
                             version_key(identity, key, version_id),
                         )
                         .map_err(storage_error)?
-                        .map(|bytes| {
-                            serde_json::from_slice::<Version>(&bytes).map_err(storage_error)
-                        })
+                        .map(|bytes| StoredVersion::decode(&bytes))
                         .transpose()?;
-                    let Some(version) = selected else {
+                    let Some(stored) = selected else {
                         return if selected_head.is_some() {
                             Err(MutationError::Storage(
                                 "head references a missing version descriptor".into(),
@@ -606,6 +640,12 @@ impl Store {
                             Ok(None)
                         };
                     };
+                    if selected_head.is_none()
+                        && stored.retention != StoredVersionRetention::UserRetained
+                    {
+                        return Ok(None);
+                    }
+                    let version = stored.version;
                     match &selected_head {
                         Some(head) => validate_selected_head(head, &version)?,
                         None => validate_selected_version_id(version_id, &version)?,

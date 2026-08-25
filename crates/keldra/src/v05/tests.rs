@@ -664,6 +664,8 @@ fn distributed_batch_preflight_selects_current_and_exact_descriptors() {
             mutation_stamp: None,
         },
         versions: vec![live, deleted],
+        journal_pending_versions: Vec::new(),
+        journal_released_versions: Vec::new(),
         definition_locator: None,
     };
 
@@ -703,6 +705,8 @@ fn distributed_read_preflight_rejects_another_exact_path() {
             mutation_stamp: None,
         },
         versions: vec![version],
+        journal_pending_versions: Vec::new(),
+        journal_released_versions: Vec::new(),
         definition_locator: None,
     };
 

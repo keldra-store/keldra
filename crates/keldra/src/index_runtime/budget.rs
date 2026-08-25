@@ -143,7 +143,8 @@ impl IndexMemoryBudget {
         SegmentMemoryPlan::new(bytes).expect("validated index memory share has a usable plan")
     }
 
-    /// Wait in global FIFO order for one exact reservation.
+    /// Wait in background FIFO order for one exact reservation while retaining
+    /// the node's query reservation.
     pub(crate) async fn acquire(&self, bytes: u64) -> Result<IndexMemoryPermit, IndexBudgetError> {
         self.acquire_up_to(bytes, bytes).await
     }
@@ -258,5 +259,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(permit.bytes(), share * 2);
+    }
+
+    #[tokio::test]
+    async fn persistent_active_buffers_do_not_lease_the_global_hard_limit() {
+        let minimum = MIN_INDEX_KIND_MEMORY_BYTES as u64;
+        let fair_share = minimum * 4;
+        let budgets = IndexMemoryBudgets::new(fair_share).unwrap();
+        let budget = budgets.for_kind(IndexKind::TypedJson);
+
+        let first = budget.acquire_up_to(minimum, fair_share).await.unwrap();
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            budget.acquire_up_to(minimum, fair_share),
+        )
+        .await
+        .expect("one active buffer must not monopolize global builder memory")
+        .unwrap();
+
+        assert_eq!(first.bytes(), fair_share);
+        assert_eq!(second.bytes(), fair_share);
     }
 }

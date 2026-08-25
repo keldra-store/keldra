@@ -313,6 +313,7 @@ impl Store {
                     blob_identity: due.identity.clone(),
                     revision: now_unix_millis,
                     reference_deltas: Vec::new(),
+                    accounting_transition: None,
                 }],
                 LocalReferenceEffects::NoReferenceEffects,
             )?;
@@ -645,6 +646,7 @@ impl Store {
                 blob_identity: key.to_vec(),
                 revision: next.updated_at,
                 reference_deltas: Vec::new(),
+                accounting_transition: None,
             }],
             LocalReferenceEffects::NoReferenceEffects,
             admission,
@@ -749,6 +751,7 @@ impl Store {
                 blob_identity: key,
                 revision: state.updated_at,
                 reference_deltas: Vec::new(),
+                accounting_transition: None,
             }],
             LocalReferenceEffects::NoReferenceEffects,
             admission,

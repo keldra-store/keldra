@@ -292,7 +292,14 @@ impl ClusterPeerService {
             0,
             MAX_INDEX_SOURCE_SNAPSHOT_TIME,
         )?;
-        if begin.tenant_id == 0 || begin.bucket_id == 0 || !valid_source_prefix(&begin.path_prefix)
+        if begin.tenant_id == 0
+            || begin.bucket_id == 0
+            || !valid_source_prefix(&begin.path_prefix)
+            || begin.resume_after_path.as_ref().is_some_and(|path| {
+                !path_matches_prefix(path, &begin.path_prefix)
+                    || contains_reserved_segment(path)
+                    || keldra_store::ObjectKey::new("resume", "resume", path).is_err()
+            })
         {
             return Err(Status::invalid_argument(
                 "index source snapshot stable IDs or path prefix are invalid",
@@ -302,6 +309,7 @@ impl ClusterPeerService {
         let tenant_id = begin.tenant_id;
         let bucket_id = begin.bucket_id;
         let path_prefix = begin.path_prefix;
+        let resume_after_path = begin.resume_after_path;
         let max_frame_bytes = begin.max_frame_bytes;
         let fence = admitted.placement.fence();
         let placement = admitted.placement;
@@ -325,6 +333,7 @@ impl ClusterPeerService {
                 tenant_id,
                 bucket_id,
                 &path_prefix,
+                resume_after_path.as_deref(),
                 INDEX_SOURCE_FRAME_MAX_RECORDS,
                 max_frame_bytes,
                 include,

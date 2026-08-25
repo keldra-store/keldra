@@ -14,7 +14,7 @@ use super::{
 
 pub const LOCATOR_COMPACTION_FAN_IN: usize = 4;
 
-/// One immutable path-locator delta in generation order.
+/// One immutable path-locator delta in commit order.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocatorStreamRoot {
     pub sequence: u64,

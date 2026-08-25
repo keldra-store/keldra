@@ -13,7 +13,6 @@ const STATISTICS_FIELD_BYTES: usize = 103;
 const STATISTICS_LENGTH_OPTIONS_BYTES: usize = 8;
 const STATISTICS_VECTOR_DIMENSIONS_BYTES: usize = 4;
 const STATISTICS_FIELD_COMPONENT_BYTES: usize = 47;
-const STATISTICS_GLOBAL_COMPONENT_BYTES: usize = 43;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]

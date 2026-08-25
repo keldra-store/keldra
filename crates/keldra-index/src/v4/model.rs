@@ -10,7 +10,7 @@ pub const INDEX_TERM_BYTES: usize = 32_766;
 pub(crate) const INDEX_TERM_ROUTING_BYTES: usize = INDEX_TERM_BYTES + 6;
 pub const INDEX_ROUTING_FANOUT: usize = 32;
 pub const INDEX_ROUTING_HEIGHT: u8 = 8;
-pub const INDEX_GENERATION_SEGMENTS: usize = 4_096;
+pub const INDEX_COMMIT_SEGMENTS: usize = 4_096;
 
 /// Stable format-v4 component identifiers.
 ///

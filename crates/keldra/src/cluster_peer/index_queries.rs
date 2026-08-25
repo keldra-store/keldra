@@ -25,7 +25,8 @@ use crate::distributed_list::OriginalBearer;
 use crate::index_runtime::placement::{IndexIdentity, IndexPlacement};
 use crate::index_service::{
     AuthorizedCurrentCandidates, ExecutedIndexQuery, IndexAuthorization, IndexCandidateVisibility,
-    IndexLiveVersionReader, IndexPageCursor, definition_path,
+    IndexFreshnessRequirement, IndexLiveVersionReader, IndexPageCursor,
+    RequiredIndexSourceCheckpoint, definition_path,
 };
 use crate::logical_name_resolution::LogicalNameResolver;
 
@@ -46,6 +47,7 @@ pub(crate) struct RoutedIndexQueryRequest {
     pub(crate) query: IndexQuery,
     pub(crate) limit: usize,
     pub(crate) resume: Option<IndexPageCursor>,
+    pub(crate) required_freshness: Option<IndexFreshnessRequirement>,
 }
 
 #[derive(Clone)]
@@ -66,6 +68,8 @@ pub(crate) struct LocalIndexQueryRequest {
     /// Definition-admission Zanzibar revision which the engine must retain in
     /// freshness even when the query finds no candidates.
     pub(crate) authorization_revision: u64,
+    pub(crate) required_freshness: Option<IndexFreshnessRequirement>,
+    pub(crate) deadline: tokio::time::Instant,
 }
 
 #[tonic::async_trait]
@@ -220,6 +224,8 @@ impl RoutedIndexQueryHandler for AuthorizedIndexQueryHandler {
                 resume,
                 candidate_visibility,
                 authorization_revision,
+                required_freshness: request.required_freshness,
+                deadline: call.deadline,
             })
             .await?;
         validate_result(&result, request.resume.as_ref(), request.limit)?;
@@ -345,10 +351,11 @@ fn request_to_wire(
         query: Some(request.query),
         limit,
         resume: request.resume.map(|resume| wire::RoutedIndexQueryResume {
-            generation: resume.generation,
+            commit_revision: resume.commit_revision,
             last_position: resume.last_position,
             authorization_revision: resume.authorization_revision,
         }),
+        required_freshness: request.required_freshness.map(freshness_to_wire),
     })
 }
 
@@ -370,10 +377,15 @@ fn request_from_wire(
         limit: usize::try_from(request.limit)
             .map_err(|_| Status::invalid_argument("routed index limit does not fit this node"))?,
         resume: request.resume.as_ref().map(|resume| IndexPageCursor {
-            generation: resume.generation,
+            commit_revision: resume.commit_revision,
             last_position: resume.last_position.clone(),
             authorization_revision: resume.authorization_revision,
         }),
+        required_freshness: request
+            .required_freshness
+            .as_ref()
+            .map(freshness_from_wire)
+            .transpose()?,
     };
     validate_request(&value)?;
     Ok(value)
@@ -432,7 +444,7 @@ fn validate_request(request: &RoutedIndexQueryRequest) -> Result<(), Status> {
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
     validate_query_kind(&request.definition, &request.query)?;
     if let Some(resume) = request.resume.as_ref() {
-        if resume.generation == 0
+        if resume.commit_revision == 0
             || resume.authorization_revision == 0
             || resume.last_position.is_empty()
         {
@@ -441,7 +453,70 @@ fn validate_request(request: &RoutedIndexQueryRequest) -> Result<(), Status> {
             ));
         }
     }
+    if request.resume.is_some() && request.required_freshness.is_some() {
+        return Err(Status::invalid_argument(
+            "routed required freshness cannot be combined with a continuation",
+        ));
+    }
     Ok(())
+}
+
+fn freshness_to_wire(
+    requirement: IndexFreshnessRequirement,
+) -> wire::RoutedIndexFreshnessRequirement {
+    wire::RoutedIndexFreshnessRequirement {
+        sources: requirement
+            .sources
+            .into_iter()
+            .map(|source| wire::RoutedIndexRequiredSourceCheckpoint {
+                node_id: source.node_id,
+                source_epoch: source.source_epoch.to_vec(),
+                next_offset: source.next_offset,
+            })
+            .collect(),
+        atomic_through: requirement.atomic_through,
+    }
+}
+
+fn freshness_from_wire(
+    requirement: &wire::RoutedIndexFreshnessRequirement,
+) -> Result<IndexFreshnessRequirement, Status> {
+    if requirement.sources.is_empty() && requirement.atomic_through.is_none() {
+        return Err(Status::invalid_argument(
+            "routed required freshness has no checkpoint",
+        ));
+    }
+    let mut sources = requirement
+        .sources
+        .iter()
+        .map(|source| {
+            let node_id = u16::try_from(source.node_id).map_err(|_| {
+                Status::invalid_argument("routed freshness source node ID is invalid")
+            })?;
+            let source_epoch = source.source_epoch.as_slice().try_into().map_err(|_| {
+                Status::invalid_argument("routed freshness source epoch is invalid")
+            })?;
+            Ok(RequiredIndexSourceCheckpoint {
+                node_id: u64::from(node_id),
+                source_epoch,
+                next_offset: source.next_offset,
+            })
+        })
+        .collect::<Result<Vec<_>, Status>>()?;
+    sources.sort_by_key(|source| source.node_id);
+    if sources.len() > 1_024
+        || sources
+            .windows(2)
+            .any(|pair| pair[0].node_id == pair[1].node_id)
+    {
+        return Err(Status::invalid_argument(
+            "routed required freshness source vector is invalid",
+        ));
+    }
+    Ok(IndexFreshnessRequirement {
+        sources,
+        atomic_through: requirement.atomic_through,
+    })
 }
 
 fn routed_caller(
@@ -503,22 +578,22 @@ fn validate_result(
             .sources
             .windows(2)
             .any(|pair| pair[0].node_id >= pair[1].node_id)
-        || (result.freshness.generation == 0
+        || (result.freshness.commit_revision == 0
             && (result.freshness.published_at.is_some()
                 || result.freshness.placement_term != 0
                 || result.freshness.placement_index != 0))
-        || (result.freshness.generation != 0
+        || (result.freshness.commit_revision != 0
             && (result.freshness.published_at.is_none()
                 || result.freshness.placement_term == 0
                 || result.freshness.placement_index == 0))
         || result.next_position.as_ref().is_some_and(Vec::is_empty)
-        || (result.next_position.is_some() && result.freshness.generation == 0)
+        || (result.next_position.is_some() && result.freshness.commit_revision == 0)
     {
         return Err(Status::data_loss("routed index result is invalid"));
     }
-    if resume.is_some_and(|resume| resume.generation != result.freshness.generation) {
+    if resume.is_some_and(|resume| resume.commit_revision != result.freshness.commit_revision) {
         return Err(Status::failed_precondition(
-            "requested index generation is no longer available",
+            "requested index commit revision is no longer available",
         ));
     }
     Ok(())
@@ -756,16 +831,17 @@ mod tests {
             },
             limit: 100,
             resume: Some(IndexPageCursor {
-                generation: 17,
+                commit_revision: 17,
                 last_position: b"docs/a".to_vec(),
                 authorization_revision: 19,
             }),
+            required_freshness: None,
         }
     }
 
     fn published_freshness() -> keldra_api::v1::IndexFreshness {
         keldra_api::v1::IndexFreshness {
-            generation: 1,
+            commit_revision: 1,
             published_at: Some(Default::default()),
             authorization_revision: 19,
             placement_term: 1,
@@ -841,7 +917,7 @@ mod tests {
     }
 
     #[test]
-    fn routing_fence_does_not_replace_generation_freshness_fence() {
+    fn routing_fence_does_not_replace_committed_view_freshness_fence() {
         let response = response_to_wire(
             ExecutedIndexQuery {
                 hits: Vec::new(),

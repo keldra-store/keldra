@@ -1484,7 +1484,8 @@ fn mutation_status(error: MutationError) -> Status {
         | MutationError::DurabilityUnavailable
         | MutationError::ReceiptCapacity => Status::unavailable(error.to_string()),
         MutationError::ReceiptTooLarge { .. }
-        | MutationError::SourceJournalRecordTooLarge { .. } => {
+        | MutationError::SourceJournalRecordTooLarge { .. }
+        | MutationError::SourceJournalTransitionTooLarge { .. } => {
             Status::resource_exhausted(error.to_string())
         }
         _ => Status::internal(error.to_string()),

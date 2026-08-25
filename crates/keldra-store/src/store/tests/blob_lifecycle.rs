@@ -2,6 +2,21 @@ use super::super::blob_references::blob_gc_due_key;
 use super::*;
 use crate::{BlobGcBudget, BlobGcCursor};
 
+fn deliver_retirement_effects(store: &Store, blob: &BlobRef, count: usize) {
+    let mut batch = WriteBatch::default();
+    let mut pending = PendingBlobReferences::new();
+    let now = now_unix_millis().unwrap();
+    for _ in 0..count {
+        let (key, state) = store
+            .prepare_blob_reference_retirement(blob, &pending, now)
+            .unwrap();
+        store
+            .stage_blob_reference_update(&mut batch, &mut pending, key, state)
+            .unwrap();
+    }
+    store.db.write(batch).unwrap();
+}
+
 #[test]
 fn blob_reference_state_is_exactly_twenty_five_bytes() {
     let state = BlobReferenceState {
@@ -191,6 +206,9 @@ async fn concurrent_seal_refresh_prevents_a_selected_blob_from_being_collected()
         })
         .await
         .unwrap();
+    // Derived-source retention now delays the physical -1 until its durable
+    // release event is delivered to this payload owner.
+    deliver_retirement_effects(&store, &blob, 1);
     let retired = store.blob_reference_state(&blob).unwrap().unwrap();
     assert_eq!(retired.ref_count, 0);
 
@@ -709,6 +727,7 @@ async fn identical_seals_share_one_reservation_and_zero_count_content_can_be_reu
             .await
             .unwrap();
     }
+    deliver_retirement_effects(&store, &first, 2);
     let retired = store.blob_reference_state(&first).unwrap().unwrap();
     assert_eq!(retired.ref_count, 0);
     assert_eq!(

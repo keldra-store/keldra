@@ -61,6 +61,32 @@ trait ObjectReadMetadata: Send + Sync {
         Ok(snapshots)
     }
 
+    async fn reconciled_exact_versions_stable(
+        &self,
+        keys: &[ObjectKey],
+        versions: &[VersionId],
+        tenant_id: u64,
+        bucket_id: u64,
+    ) -> Result<Vec<Option<Version>>, Status> {
+        if keys.len() != versions.len() {
+            return Err(Status::invalid_argument(
+                "exact-version keys and versions have different lengths",
+            ));
+        }
+        let mut selected = Vec::with_capacity(keys.len());
+        for (key, version) in keys.iter().zip(versions) {
+            let snapshot = self
+                .reconciled_snapshot_stable(key, tenant_id, bucket_id)
+                .await?;
+            selected.push(select_descriptor(
+                snapshot.as_ref(),
+                key,
+                Selection::Exact(*version),
+            )?);
+        }
+        Ok(selected)
+    }
+
     async fn wait_for_program_cursors(
         &self,
         _cursors: &[u64],
@@ -110,6 +136,17 @@ impl ObjectReadMetadata for ObjectDistribution {
         bucket_id: u64,
     ) -> Result<Vec<Option<CurrentObjectSnapshot>>, Status> {
         self.reconciled_current_object_snapshots_stable(keys, tenant_id, bucket_id)
+            .await
+    }
+
+    async fn reconciled_exact_versions_stable(
+        &self,
+        keys: &[ObjectKey],
+        versions: &[VersionId],
+        tenant_id: u64,
+        bucket_id: u64,
+    ) -> Result<Vec<Option<Version>>, Status> {
+        self.reconciled_exact_object_versions_stable(keys, versions, tenant_id, bucket_id)
             .await
     }
 
@@ -326,6 +363,40 @@ impl ClusterObjectReader {
             }
             return Ok(snapshots);
         }
+    }
+
+    /// Reads the immutable descriptors named by source-journal mutations.
+    /// Missing descriptors are preserved in the result so the index builder
+    /// can distinguish a source-retention violation from a tombstone.
+    pub(crate) async fn exact_versions_stable(
+        &self,
+        keys: &[ObjectKey],
+        versions: &[VersionId],
+        tenant_id: u64,
+        bucket_id: u64,
+    ) -> Result<Vec<Option<Version>>, Status> {
+        let placement = self.metadata.current_placement()?;
+        let selected = self
+            .metadata
+            .reconciled_exact_versions_stable(keys, versions, tenant_id, bucket_id)
+            .await?;
+        if selected.len() != keys.len() || keys.len() != versions.len() {
+            return Err(Status::data_loss(
+                "exact-version batch returned the wrong result count",
+            ));
+        }
+        for (selected, expected) in selected.iter().zip(versions) {
+            if selected
+                .as_ref()
+                .is_some_and(|selected| selected.id != *expected)
+            {
+                return Err(Status::data_loss(
+                    "exact-version batch returned another version identity",
+                ));
+            }
+        }
+        self.metadata.require_current_fence(placement.fence())?;
+        Ok(selected)
     }
 
     /// Opens only the authoritative current descriptor through the bounded

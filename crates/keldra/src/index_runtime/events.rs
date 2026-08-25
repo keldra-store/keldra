@@ -52,7 +52,7 @@ impl AtomicProgramWatermark {
 
     /// A clear captured watermark remains a valid lower-bound proof after
     /// later commits begin or finish. Index work is bounded by the captured
-    /// source vector, so a later atomic program belongs to a later generation
+    /// source vector, so a later atomic program belongs to a later committed view
     /// rather than invalidating the one already being built.
     pub(crate) fn covers(self, captured: Self) -> bool {
         captured.is_clear() && self.finalized_through >= captured.finalized_through
@@ -137,6 +137,13 @@ pub(crate) struct IndexSourcePage {
     pub encoded_bytes: u64,
     pub through_offset: u64,
     pub oversize: Option<OversizeLocalChange>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RoutedSourceEffect {
+    pub(crate) next_offset: u64,
+    pub(crate) required_atomic_cursor: Option<u64>,
+    pub(crate) atomic_hold_next: Option<u64>,
 }
 
 #[tonic::async_trait]
@@ -573,7 +580,6 @@ pub(crate) struct IndexEventJournal {
     authority: Arc<dyn IndexEventAuthority>,
     sources: Arc<dyn IndexEventSources>,
     page_size: usize,
-    observed: std::sync::RwLock<Option<IndexBarrier>>,
 }
 
 impl IndexEventJournal {
@@ -585,7 +591,6 @@ impl IndexEventJournal {
             authority,
             sources,
             page_size: MAX_LOCAL_INVALIDATION_SCAN_RECORDS,
-            observed: std::sync::RwLock::new(None),
         }
     }
 
@@ -645,18 +650,7 @@ impl IndexEventJournal {
             atomic: before.atomic,
             sources: cursors,
         };
-        *self
-            .observed
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(barrier.clone());
         Ok(barrier)
-    }
-
-    pub(crate) fn last_observed_barrier(&self) -> Option<IndexBarrier> {
-        self.observed
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
     }
 
     /// Capture the membership and atomic-program fence before any source
@@ -779,10 +773,6 @@ impl IndexEventJournal {
             atomic: expected_atomic,
             sources: cursors,
         };
-        *self
-            .observed
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(barrier.clone());
         Ok(barrier)
     }
 
@@ -810,20 +800,6 @@ impl IndexEventJournal {
         .await
     }
 
-    /// Return the newest routed offset per source for one bucket interval.
-    /// Empty source ranges consume no caller memory and still advance the
-    /// disposable scan cursor to the complete target vector.
-    pub(crate) async fn routed_effects(
-        &self,
-        tenant_id: u64,
-        bucket_id: u64,
-        from: &IndexBarrier,
-        target: &IndexBarrier,
-    ) -> Result<BTreeMap<SourceId, u64>, IndexEventError> {
-        self.routed_effects_filtered(tenant_id, bucket_id, from, target, |_| true)
-            .await
-    }
-
     /// Return only bucket effects which can be source data for an index.
     /// Reserved Keldra objects still advance the authoritative journal but
     /// cannot wake an index builder or make a query appear stale.
@@ -833,7 +809,7 @@ impl IndexEventJournal {
         bucket_id: u64,
         from: &IndexBarrier,
         target: &IndexBarrier,
-    ) -> Result<BTreeMap<SourceId, u64>, IndexEventError> {
+    ) -> Result<BTreeMap<SourceId, RoutedSourceEffect>, IndexEventError> {
         self.routed_effects_filtered(tenant_id, bucket_id, from, target, is_index_source_change)
             .await
     }
@@ -847,7 +823,7 @@ impl IndexEventJournal {
         bucket_id: u64,
         from: &IndexBarrier,
         target: &IndexBarrier,
-    ) -> Result<BTreeMap<SourceId, u64>, IndexEventError> {
+    ) -> Result<BTreeMap<SourceId, RoutedSourceEffect>, IndexEventError> {
         self.routed_effects_filtered(
             tenant_id,
             bucket_id,
@@ -878,7 +854,8 @@ impl IndexEventJournal {
             .routed_index_effects(tenant_id, bucket_id, indexed, &target)
             .await?;
         let mut observed = indexed.clone();
-        for (source, next_offset) in effects {
+        for (source, effect) in effects {
+            let next_offset = effect.next_offset;
             let node = NodeId(u64::from(source.node_id));
             let cursor = observed
                 .sources
@@ -903,9 +880,9 @@ impl IndexEventJournal {
         from: &IndexBarrier,
         target: &IndexBarrier,
         include: fn(&LocalChange) -> bool,
-    ) -> Result<BTreeMap<SourceId, u64>, IndexEventError> {
+    ) -> Result<BTreeMap<SourceId, RoutedSourceEffect>, IndexEventError> {
         let mut through = from.clone();
-        let mut affected = BTreeMap::<SourceId, u64>::new();
+        let mut affected = BTreeMap::<SourceId, RoutedSourceEffect>::new();
         while let Some(page) = self
             .next_page_limited(
                 tenant_id,
@@ -922,15 +899,36 @@ impl IndexEventJournal {
                     continue;
                 }
                 let source = page.through.sources[&change.node].source;
-                let next = change
-                    .change
-                    .offset()
-                    .checked_add(1)
-                    .ok_or(IndexEventError::OffsetOverflow(change.node))?;
-                affected
-                    .entry(source)
-                    .and_modify(|current| *current = (*current).max(next))
-                    .or_insert(next);
+                for effect in source_change_effects(source, &change.change)? {
+                    let source = effect.source;
+                    let next = effect.next_offset;
+                    let node = NodeId(u64::from(source.node_id));
+                    let target_cursor = target
+                        .sources
+                        .get(&node)
+                        .ok_or(IndexEventError::IncompleteSources)?;
+                    if target_cursor.source != source || next > target_cursor.next_offset {
+                        return Err(IndexEventError::SourceEpochChanged(node));
+                    }
+                    affected
+                        .entry(source)
+                        .and_modify(|current| {
+                            current.next_offset = current.next_offset.max(next);
+                            current.required_atomic_cursor = current
+                                .required_atomic_cursor
+                                .max(effect.required_atomic_cursor);
+                            current.atomic_hold_next = current
+                                .atomic_hold_next
+                                .into_iter()
+                                .chain(effect.atomic_hold_next)
+                                .min();
+                        })
+                        .or_insert(RoutedSourceEffect {
+                            next_offset: next,
+                            required_atomic_cursor: effect.required_atomic_cursor,
+                            atomic_hold_next: effect.atomic_hold_next,
+                        });
+                }
             }
             through = page.through;
         }
@@ -1019,6 +1017,7 @@ impl IndexEventJournal {
         let mut encoded_bytes = 0_u64;
         let mut changes = Vec::with_capacity(page.changes.len());
         for change in page.changes {
+            validate_index_change(&change)?;
             expected_offset = expected_offset
                 .checked_add(1)
                 .ok_or(IndexEventError::OffsetOverflow(source.node))?;
@@ -1156,6 +1155,7 @@ impl IndexEventJournal {
         let mut encoded_bytes = 0_u64;
         let mut changes = Vec::with_capacity(page.changes.len());
         for change in page.changes {
+            validate_index_change(&change)?;
             if change.offset() <= previous || change.offset() > page.through_offset {
                 return Err(IndexEventError::NonContiguousSource(source.node));
             }
@@ -1223,6 +1223,50 @@ impl IndexEventJournal {
     }
 }
 
+pub(crate) struct SourceChangeEffect {
+    pub(crate) source: SourceId,
+    pub(crate) next_offset: u64,
+    pub(crate) required_atomic_cursor: Option<u64>,
+    pub(crate) atomic_hold_next: Option<u64>,
+}
+
+pub(crate) fn source_change_effects(
+    event_source: SourceId,
+    change: &LocalChange,
+) -> Result<Vec<SourceChangeEffect>, IndexEventError> {
+    let event_node = NodeId(u64::from(event_source.node_id));
+    let required_atomic_cursor = match change {
+        LocalChange::ObjectHead(change) => change.program_commit_cursor,
+        LocalChange::AtomicBatchPublished(change) => Some(change.cursor),
+        _ => None,
+    };
+    let mut effects = vec![SourceChangeEffect {
+        source: event_source,
+        next_offset: change
+            .offset()
+            .checked_add(1)
+            .ok_or(IndexEventError::OffsetOverflow(event_node))?,
+        required_atomic_cursor,
+        atomic_hold_next: required_atomic_cursor.map(|_| change.offset()),
+    }];
+    if let LocalChange::AtomicBatchPublished(batch) = change {
+        for mutation in &batch.mutations {
+            let node = NodeId(u64::from(mutation.source_id.node_id));
+            let next = mutation
+                .source_journal_position
+                .checked_add(1)
+                .ok_or(IndexEventError::OffsetOverflow(node))?;
+            effects.push(SourceChangeEffect {
+                source: mutation.source_id,
+                next_offset: next,
+                required_atomic_cursor: Some(batch.cursor),
+                atomic_hold_next: Some(mutation.source_journal_position),
+            });
+        }
+    }
+    Ok(effects)
+}
+
 fn barriers_are_routable(from: &IndexBarrier, target: &IndexBarrier) -> bool {
     from.fence == target.fence
         && target.atomic.is_clear()
@@ -1236,11 +1280,23 @@ fn barriers_are_routable(from: &IndexBarrier, target: &IndexBarrier) -> bool {
 
 pub(crate) fn is_index_source_change(change: &LocalChange) -> bool {
     let path = match change {
-        LocalChange::ObjectHead(change) => &change.exact_path,
+        LocalChange::ObjectHead(change) if change.program_commit_cursor.is_none() => {
+            &change.exact_path
+        }
         LocalChange::RetainedVersionDeleted(change) => &change.exact_path,
+        LocalChange::AtomicBatchPublished(_) => return true,
         _ => return false,
     };
     !path.split('/').any(|segment| segment == "_keldra")
+}
+
+fn validate_index_change(change: &LocalChange) -> Result<(), IndexEventError> {
+    if let LocalChange::AtomicBatchPublished(batch) = change {
+        batch
+            .validate()
+            .map_err(|message| IndexEventError::InvalidAtomicBatch(message.into()))?;
+    }
+    Ok(())
 }
 
 fn encoded_len(change: &LocalChange) -> Result<u64, IndexEventError> {
@@ -1248,6 +1304,12 @@ fn encoded_len(change: &LocalChange) -> Result<u64, IndexEventError> {
     serde_json::to_writer(&mut counter, change)
         .map_err(|error| IndexEventError::Encode(error.to_string()))?;
     Ok(counter.0)
+}
+
+pub(crate) fn index_journal_change_encoded_len(
+    change: &IndexJournalChange,
+) -> Result<u64, IndexEventError> {
+    encoded_len(&change.change)
 }
 
 struct ByteCounter(u64);
@@ -1364,6 +1426,8 @@ pub(crate) enum IndexEventError {
     PageLengthMismatch { measured: u64, reported: u64 },
     #[error("measure index event: {0}")]
     Encode(String),
+    #[error("invalid atomic batch publication: {0}")]
+    InvalidAtomicBatch(String),
 }
 
 #[cfg(test)]

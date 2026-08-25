@@ -448,29 +448,53 @@ struct Arguments {
     #[arg(long, env = "KELDRA_INDEX_TENSOR_MAX_UNMERGED_BYTES_PER_TIER")]
     index_tensor_max_unmerged_bytes_per_tier: Option<u64>,
 
-    /// Maximum generations retained per index, including current (default: 3).
+    /// Accounted active-builder RAM which freezes a non-empty segment (default: 16 MiB).
     #[arg(
         long,
-        env = "KELDRA_INDEX_MAX_RETAINED_GENERATIONS",
-        default_value_t = IndexRuntimeConfig::DEFAULT_MAX_RETAINED_GENERATIONS
+        env = "KELDRA_INDEX_SEGMENT_FLUSH_BYTES",
+        default_value_t = IndexRuntimeConfig::DEFAULT_SEGMENT_FLUSH_BYTES
     )]
-    index_max_retained_generations: u32,
+    index_segment_flush_bytes: u64,
 
-    /// Maximum age of an obsolete index generation in hours (default: 24).
+    /// Maximum age in milliseconds of a mutation in a non-empty active segment (default: 1000).
     #[arg(
         long,
-        env = "KELDRA_INDEX_MAX_GENERATION_AGE_HOURS",
-        default_value_t = IndexRuntimeConfig::DEFAULT_MAX_GENERATION_AGE_HOURS
+        env = "KELDRA_INDEX_SEGMENT_FLUSH_MAX_AGE_MILLIS",
+        default_value_t = IndexRuntimeConfig::DEFAULT_SEGMENT_FLUSH_MAX_AGE_MILLIS
     )]
-    index_max_generation_age_hours: u64,
+    index_segment_flush_max_age_millis: u64,
 
-    /// Maximum authoritative bytes retained across all generations per index (default: 50 GiB).
+    /// Maximum complete mutation units accumulated in one segment (default: 65536).
     #[arg(
         long,
-        env = "KELDRA_INDEX_MAX_RETAINED_GENERATION_BYTES",
-        default_value_t = IndexRuntimeConfig::DEFAULT_MAX_RETAINED_GENERATION_BYTES
+        env = "KELDRA_INDEX_SEGMENT_FLUSH_MAX_OPERATIONS",
+        default_value_t = IndexRuntimeConfig::DEFAULT_SEGMENT_FLUSH_MAX_OPERATIONS
     )]
-    index_max_retained_generation_bytes: u64,
+    index_segment_flush_max_operations: u64,
+
+    /// Maximum committed revisions retained per index, including current (default: 3).
+    #[arg(
+        long,
+        env = "KELDRA_INDEX_MAX_RETAINED_COMMIT_REVISIONS",
+        default_value_t = IndexRuntimeConfig::DEFAULT_MAX_RETAINED_COMMIT_REVISIONS
+    )]
+    index_max_retained_commit_revisions: u32,
+
+    /// Maximum age of an obsolete committed revision in hours (default: 24).
+    #[arg(
+        long,
+        env = "KELDRA_INDEX_MAX_COMMIT_REVISION_AGE_HOURS",
+        default_value_t = IndexRuntimeConfig::DEFAULT_MAX_COMMIT_REVISION_AGE_HOURS
+    )]
+    index_max_commit_revision_age_hours: u64,
+
+    /// Maximum authoritative bytes retained across committed revisions per index (default: 50 GiB).
+    #[arg(
+        long,
+        env = "KELDRA_INDEX_MAX_RETAINED_COMMIT_BYTES",
+        default_value_t = IndexRuntimeConfig::DEFAULT_MAX_RETAINED_COMMIT_BYTES
+    )]
+    index_max_retained_commit_bytes: u64,
 
     #[arg(long, env = "KELDRA_MAX_BLOB_BYTES", default_value_t = 16 * 1024 * 1024 * 1024_u64)]
     max_blob_bytes: u64,
@@ -597,9 +621,9 @@ impl Arguments {
             self.index_memory_percent,
             self.index_builder_memory_bytes_per_kind,
             self.index_rayon_workers,
-            self.index_max_retained_generations,
-            self.index_max_generation_age_hours,
-            self.index_max_retained_generation_bytes,
+            self.index_max_retained_commit_revisions,
+            self.index_max_commit_revision_age_hours,
+            self.index_max_retained_commit_bytes,
         )
         .context("validate index runtime configuration")?
         .with_query_max_concurrency(self.index_query_max_concurrency)
@@ -607,6 +631,13 @@ impl Arguments {
             config.with_query_work_quantum_bytes(self.index_query_work_quantum_bytes)
         })
         .and_then(|config| config.with_query_memory_bytes(self.index_query_memory_bytes))
+        .and_then(|config| {
+            config.with_segment_flush_boundaries(
+                self.index_segment_flush_bytes,
+                self.index_segment_flush_max_age_millis,
+                self.index_segment_flush_max_operations,
+            )
+        })
         .context("validate index runtime configuration")?;
         let mut config = config;
         for (
@@ -1014,15 +1045,21 @@ mod tests {
             "12",
             "--index-max-unmerged-bytes-per-tier",
             "10485760",
+            "--index-segment-flush-bytes",
+            "12582912",
+            "--index-segment-flush-max-age-millis",
+            "750",
+            "--index-segment-flush-max-operations",
+            "32768",
             "--index-path-max-segments-per-tier",
             "8",
             "--index-path-max-unmerged-bytes-per-tier",
             "5242880",
-            "--index-max-retained-generations",
+            "--index-max-retained-commit-revisions",
             "7",
-            "--index-max-generation-age-hours",
+            "--index-max-commit-revision-age-hours",
             "48",
-            "--index-max-retained-generation-bytes",
+            "--index-max-retained-commit-bytes",
             "2097152",
         ])
         .index_runtime_config()
@@ -1055,9 +1092,12 @@ mod tests {
             config.max_unmerged_bytes_per_tier(IndexKind::TypedJson),
             10_485_760
         );
-        assert_eq!(config.max_retained_generations(), 7);
-        assert_eq!(config.max_generation_age_hours(), 48);
-        assert_eq!(config.max_retained_generation_bytes(), 2_097_152);
+        assert_eq!(config.segment_flush_bytes(IndexKind::Path), 12_582_912);
+        assert_eq!(config.segment_flush_max_age().as_millis(), 750);
+        assert_eq!(config.segment_flush_max_operations(IndexKind::Path), 32_768);
+        assert_eq!(config.max_retained_commit_revisions(), 7);
+        assert_eq!(config.max_commit_revision_age_hours(), 48);
+        assert_eq!(config.max_retained_commit_bytes(), 2_097_152);
     }
 
     #[test]
@@ -1078,11 +1118,14 @@ mod tests {
             vec!["--index-query-memory-bytes", "0"],
             vec!["--index-max-segments-per-tier", "0"],
             vec!["--index-max-unmerged-bytes-per-tier", "0"],
+            vec!["--index-segment-flush-bytes", "0"],
+            vec!["--index-segment-flush-max-age-millis", "0"],
+            vec!["--index-segment-flush-max-operations", "0"],
             vec!["--index-vector-max-segments-per-tier", "0"],
             vec!["--index-vector-max-unmerged-bytes-per-tier", "0"],
-            vec!["--index-max-retained-generations", "0"],
-            vec!["--index-max-generation-age-hours", "0"],
-            vec!["--index-max-retained-generation-bytes", "0"],
+            vec!["--index-max-retained-commit-revisions", "0"],
+            vec!["--index-max-commit-revision-age-hours", "0"],
+            vec!["--index-max-retained-commit-bytes", "0"],
         ] {
             let error = parse(&extra).index_runtime_config().unwrap_err();
             assert!(
@@ -1133,17 +1176,23 @@ mod tests {
             "default: 64",
             "--index-max-unmerged-bytes-per-tier",
             "default: 1 GiB",
+            "--index-segment-flush-bytes",
+            "default: 16 MiB",
+            "--index-segment-flush-max-age-millis",
+            "default: 1000",
+            "--index-segment-flush-max-operations",
+            "default: 65536",
             "--index-path-max-segments-per-tier",
             "--index-path-max-unmerged-bytes-per-tier",
             "--index-tensor-max-segments-per-tier",
             "--index-tensor-max-unmerged-bytes-per-tier",
             "--source-journal-max-entries",
             "--source-journal-max-bytes",
-            "--index-max-retained-generations",
+            "--index-max-retained-commit-revisions",
             "including current",
-            "--index-max-generation-age-hours",
+            "--index-max-commit-revision-age-hours",
             "default: 24",
-            "--index-max-retained-generation-bytes",
+            "--index-max-retained-commit-bytes",
             "default: 50 GiB",
         ] {
             assert!(

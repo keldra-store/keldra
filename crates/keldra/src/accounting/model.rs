@@ -411,6 +411,10 @@ pub(crate) fn is_accounting_source_change(change: &LocalChange) -> bool {
     let path = match change {
         LocalChange::ObjectHead(change) => &change.exact_path,
         LocalChange::RetainedVersionDeleted(change) => &change.exact_path,
+        LocalChange::ContentLifecycleChanged(change) => match &change.accounting_transition {
+            Some(transition) => &transition.exact_path,
+            None => return false,
+        },
         _ => return false,
     };
     !is_accounting_path(path) || is_outbound_source_path(path)

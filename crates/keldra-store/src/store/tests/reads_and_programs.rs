@@ -117,7 +117,7 @@ async fn batch_get_selection_releases_the_fence_before_blob_reads_and_keeps_sele
 }
 
 #[tokio::test]
-async fn unversioned_retirement_does_not_block_or_break_selected_blob_reads() {
+async fn checkpoint_retention_does_not_block_or_break_selected_blob_reads() {
     let (_temporary, store) = store().await;
     let original_bytes = vec![0x41; SMALL_BLOB_MAX_BYTES + 1];
     let original = store
@@ -155,7 +155,7 @@ async fn unversioned_retirement_does_not_block_or_break_selected_blob_reads() {
         store
             .version_metadata(&key("retired-after-selection"), original.version)
             .unwrap()
-            .is_none()
+            .is_some()
     );
     assert_eq!(
         store
@@ -163,7 +163,7 @@ async fn unversioned_retirement_does_not_block_or_break_selected_blob_reads() {
             .unwrap()
             .unwrap()
             .ref_count,
-        0
+        1
     );
 
     let selected = store.read_batch_get_selection(selection).await;

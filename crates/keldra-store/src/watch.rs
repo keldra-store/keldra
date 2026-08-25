@@ -7,10 +7,9 @@ use crate::{DefinitionTransition, ObjectKey, ReferenceDelta, VersionId};
 
 mod codec;
 
-#[cfg(test)]
-pub(crate) use codec::encoded_change_len;
 pub(crate) use codec::{
     DecodedLocalChange, decode_local_change, decode_local_change_with_length, encode_local_change,
+    encoded_change_len,
 };
 
 /// Release defaults for the one source-local 0.5.0 invalidation journal.
@@ -19,6 +18,11 @@ pub const DEFAULT_WATCH_MAX_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Maximum number of source-local invalidations returned by one storage scan.
 pub const MAX_LOCAL_INVALIDATION_SCAN_RECORDS: usize = 1_024;
+/// One complete atomic delivery unit must fit an empty index journal page.
+pub const MAX_ATOMIC_BATCH_PUBLISHED_BYTES: u64 = 16 * 1024 * 1024;
+/// A separate count bound keeps descriptor construction and validation bounded
+/// even when paths are very short.
+pub const MAX_ATOMIC_BATCH_MUTATIONS: usize = 4_096;
 
 pub(crate) const LOCAL_INVALIDATION_OFFSET_KEY: &[u8] = b"local_invalidation_offset";
 pub(crate) const LOCAL_INVALIDATION_SETTLED_KEY: &[u8] = b"local_invalidation_settled_through";
@@ -208,22 +212,6 @@ pub struct LocalInvalidation {
     pub state_hint: InvalidationStateHint,
 }
 
-impl LocalInvalidation {
-    #[cfg(test)]
-    pub(crate) fn new(offset: u64, key: ObjectKey, version: VersionId, deleted: bool) -> Self {
-        Self {
-            offset,
-            key,
-            minimum_path_version: version,
-            state_hint: if deleted {
-                InvalidationStateHint::Deleted
-            } else {
-                InvalidationStateHint::Present
-            },
-        }
-    }
-}
-
 /// The current state selected by one exact-path head mutation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -272,6 +260,11 @@ pub struct ObjectHeadChange {
     pub exact_path: String,
     pub path_version: VersionId,
     pub kind: ObjectHeadChangeKind,
+    /// Present only when this path was finalized as part of an atomic program.
+    /// Derived indexes advance past these path-scoped records without
+    /// projecting them; the corresponding `AtomicBatchPublished` record is
+    /// the sole index mutation unit.
+    pub program_commit_cursor: Option<u64>,
     /// Exact logical content-reference effects selected by this mutation.
     /// Public watches ignore these; peer replication consumes them from the
     /// same ordered source journal.
@@ -326,6 +319,88 @@ pub struct ContentLifecycleChanged {
     pub revision: u64,
     #[serde(default)]
     pub reference_deltas: Vec<ReferenceDelta>,
+    pub accounting_transition: Option<ContentAccountingTransition>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentAccountingTransition {
+    pub tenant_id: u64,
+    pub bucket_id: u64,
+    pub exact_path: String,
+    pub retained_bytes_removed: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct AtomicBatchRoute {
+    pub tenant_id: u64,
+    pub bucket_id: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct AtomicBatchMutation {
+    pub tenant_id: u64,
+    pub bucket_id: u64,
+    pub exact_path: String,
+    pub path_version: VersionId,
+    pub deleted: bool,
+    /// Source-local journal identity of the path finalization which made this
+    /// exact version visible. Derived retention must keep that prefix until
+    /// the complete atomic batch is represented by a committed view.
+    pub source_id: SourceId,
+    pub source_journal_position: u64,
+}
+
+/// One complete, durable derived-consumer delivery unit emitted only after
+/// every path of an atomic program is globally visible.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AtomicBatchPublished {
+    pub offset: u64,
+    pub cursor: u64,
+    pub bundle_hash: crate::PreparedBundleHash,
+    pub affected_routes: Vec<AtomicBatchRoute>,
+    pub mutations: Vec<AtomicBatchMutation>,
+}
+
+impl AtomicBatchPublished {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.offset == 0
+            || self.cursor == 0
+            || self.bundle_hash.0 == [0; 32]
+            || self.affected_routes.is_empty()
+            || self.mutations.is_empty()
+            || self.affected_routes.len() > MAX_ATOMIC_BATCH_MUTATIONS
+            || self.mutations.len() > MAX_ATOMIC_BATCH_MUTATIONS
+            || !self
+                .affected_routes
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+            || !self.mutations.windows(2).all(|pair| pair[0] < pair[1])
+            || self
+                .affected_routes
+                .iter()
+                .any(|route| route.tenant_id == 0 || route.bucket_id == 0)
+            || self.mutations.iter().any(|mutation| {
+                mutation.tenant_id == 0
+                    || mutation.bucket_id == 0
+                    || mutation.exact_path.is_empty()
+                    || mutation.path_version.0 == 0
+                    || mutation.source_id.node_id == 0
+                    || mutation.source_id.source_epoch == [0; 32]
+                    || mutation.source_journal_position == 0
+                    || self
+                        .affected_routes
+                        .binary_search(&AtomicBatchRoute {
+                            tenant_id: mutation.tenant_id,
+                            bucket_id: mutation.bucket_id,
+                        })
+                        .is_err()
+            })
+        {
+            Err("atomic batch publication is malformed")
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// One typed record in a source-local change journal.
@@ -340,6 +415,7 @@ pub enum LocalChange {
     RetainedVersionDeleted(RetainedVersionDeletedChange),
     AggregateChanged(AggregateChanged),
     ContentLifecycleChanged(ContentLifecycleChanged),
+    AtomicBatchPublished(AtomicBatchPublished),
 }
 
 /// One source-local journal page admitted under an explicit encoded-byte cap.
@@ -422,6 +498,33 @@ impl LocalChange {
         accounting_transition: Option<AccountingHeadTransition>,
         definition_transition: Option<DefinitionTransition>,
     ) -> Self {
+        Self::object_head_with_program_cursor(
+            offset,
+            tenant_id,
+            bucket_id,
+            exact_path,
+            path_version,
+            deleted,
+            None,
+            reference_deltas,
+            accounting_transition,
+            definition_transition,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn object_head_with_program_cursor(
+        offset: u64,
+        tenant_id: u64,
+        bucket_id: u64,
+        exact_path: String,
+        path_version: VersionId,
+        deleted: bool,
+        program_commit_cursor: Option<u64>,
+        reference_deltas: Vec<ReferenceDelta>,
+        accounting_transition: Option<AccountingHeadTransition>,
+        definition_transition: Option<DefinitionTransition>,
+    ) -> Self {
         Self::ObjectHead(ObjectHeadChange {
             offset,
             tenant_id,
@@ -433,6 +536,7 @@ impl LocalChange {
             } else {
                 ObjectHeadChangeKind::Put
             },
+            program_commit_cursor,
             reference_deltas,
             accounting_transition,
             definition_transition,
@@ -480,12 +584,30 @@ impl LocalChange {
         blob_identity: Vec<u8>,
         revision: u64,
         reference_deltas: Vec<ReferenceDelta>,
+        accounting_transition: Option<ContentAccountingTransition>,
     ) -> Self {
         Self::ContentLifecycleChanged(ContentLifecycleChanged {
             offset,
             blob_identity,
             revision,
             reference_deltas,
+            accounting_transition,
+        })
+    }
+
+    pub(crate) fn atomic_batch_published(
+        offset: u64,
+        cursor: u64,
+        bundle_hash: crate::PreparedBundleHash,
+        affected_routes: Vec<AtomicBatchRoute>,
+        mutations: Vec<AtomicBatchMutation>,
+    ) -> Self {
+        Self::AtomicBatchPublished(AtomicBatchPublished {
+            offset,
+            cursor,
+            bundle_hash,
+            affected_routes,
+            mutations,
         })
     }
 
@@ -495,6 +617,7 @@ impl LocalChange {
             Self::RetainedVersionDeleted(change) => change.offset,
             Self::AggregateChanged(change) => change.offset,
             Self::ContentLifecycleChanged(change) => change.offset,
+            Self::AtomicBatchPublished(change) => change.offset,
         }
     }
 
@@ -504,6 +627,7 @@ impl LocalChange {
             Self::RetainedVersionDeleted(change) => &change.reference_deltas,
             Self::AggregateChanged(_) => &[],
             Self::ContentLifecycleChanged(change) => &change.reference_deltas,
+            Self::AtomicBatchPublished(_) => &[],
         }
     }
 
@@ -518,6 +642,7 @@ impl LocalChange {
             Self::RetainedVersionDeleted(_) => None,
             Self::AggregateChanged(_) => None,
             Self::ContentLifecycleChanged(_) => None,
+            Self::AtomicBatchPublished(_) => None,
             _ => None,
         }
     }
@@ -758,7 +883,7 @@ mod tests {
         );
         let encoded = encode_local_change(&expected).unwrap();
         assert_eq!(&encoded[..4], b"ANVJ");
-        assert_eq!(u16::from_be_bytes(encoded[4..6].try_into().unwrap()), 2);
+        assert_eq!(u16::from_be_bytes(encoded[4..6].try_into().unwrap()), 5);
         assert_eq!(encoded[6], 1);
         assert_eq!(decode_local_change(&encoded).unwrap(), expected);
     }
@@ -777,10 +902,10 @@ mod tests {
             None,
         );
         let mut encoded = encode_local_change(&change).unwrap();
-        encoded[5] = 3;
+        encoded[5] = 4;
         assert!(matches!(
             decode_local_change(&encoded),
-            Err(codec::LocalChangeCodecError::UnsupportedFormat(3))
+            Err(codec::LocalChangeCodecError::UnsupportedFormat(4))
         ));
     }
 }

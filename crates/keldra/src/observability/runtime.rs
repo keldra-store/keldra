@@ -23,10 +23,17 @@ impl RuntimeMetricsTask {
             let mut interval = tokio::time::interval(SAMPLE_INTERVAL);
             let mut failure_logs = FailureLogs::default();
             let mut receipt_capacity = ReceiptCapacityHistory::default();
+            let mut source_journal_capacity = SourceJournalCapacityHistory::default();
             interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
-                sample_once(store.clone(), &mut failure_logs, &mut receipt_capacity).await;
+                sample_once(
+                    store.clone(),
+                    &mut failure_logs,
+                    &mut receipt_capacity,
+                    &mut source_journal_capacity,
+                )
+                .await;
             }
         });
         Self { task }
@@ -56,6 +63,38 @@ struct ReceiptCapacitySample {
     bytes: u64,
 }
 
+#[derive(Default)]
+struct SourceJournalCapacityHistory {
+    previous: Option<SourceJournalCapacitySample>,
+}
+
+#[derive(Clone, Copy)]
+struct SourceJournalCapacitySample {
+    sampled_at: std::time::Instant,
+    entries: u64,
+    bytes: u64,
+}
+
+impl SourceJournalCapacityHistory {
+    fn observe(&mut self, metrics: &SourceJournalRuntimeMetrics) -> Option<f64> {
+        let current = SourceJournalCapacitySample {
+            sampled_at: std::time::Instant::now(),
+            entries: metrics.retained_entries,
+            bytes: metrics.retained_bytes,
+        };
+        let projection = self.previous.and_then(|previous| {
+            projected_source_journal_capacity_seconds(
+                previous,
+                current,
+                metrics.max_entries,
+                metrics.max_bytes,
+            )
+        });
+        self.previous = Some(current);
+        projection
+    }
+}
+
 impl ReceiptCapacityHistory {
     fn observe(&mut self, metrics: &MetadataRuntimeMetrics) -> Option<f64> {
         let current = ReceiptCapacitySample {
@@ -80,6 +119,7 @@ async fn sample_once(
     store: Store,
     failure_logs: &mut FailureLogs,
     receipt_capacity: &mut ReceiptCapacityHistory,
+    source_journal_capacity: &mut SourceJournalCapacityHistory,
 ) {
     let joined = tokio::task::spawn_blocking(move || {
         (
@@ -118,7 +158,7 @@ async fn sample_once(
     }
     emit_rocksdb_metrics(&rocksdb, receipt_capacity);
     match source_journal {
-        Ok(source_journal) => emit_source_journal_metrics(source_journal),
+        Ok(source_journal) => emit_source_journal_metrics(source_journal, source_journal_capacity),
         Err(error) => {
             tracing::debug!(gauge.keldra_source_journal_metrics_available = 0_u64);
             record_collection_failure(failure_logs, "source_journal", 1, &error);
@@ -529,8 +569,37 @@ fn capacity_seconds(previous: u64, current: u64, maximum: u64, elapsed: f64) -> 
     Some(maximum.saturating_sub(current) as f64 / (growth as f64 / elapsed))
 }
 
-fn emit_source_journal_metrics(source: SourceJournalRuntimeMetrics) {
+fn projected_source_journal_capacity_seconds(
+    previous: SourceJournalCapacitySample,
+    current: SourceJournalCapacitySample,
+    maximum_entries: u64,
+    maximum_bytes: u64,
+) -> Option<f64> {
+    if current.entries >= maximum_entries || current.bytes >= maximum_bytes {
+        return Some(0.0);
+    }
+    let elapsed = current
+        .sampled_at
+        .saturating_duration_since(previous.sampled_at)
+        .as_secs_f64();
+    if elapsed == 0.0 {
+        return None;
+    }
+    let entries = capacity_seconds(previous.entries, current.entries, maximum_entries, elapsed);
+    let bytes = capacity_seconds(previous.bytes, current.bytes, maximum_bytes, elapsed);
+    match (entries, bytes) {
+        (Some(entries), Some(bytes)) => Some(entries.min(bytes)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn emit_source_journal_metrics(
+    source: SourceJournalRuntimeMetrics,
+    capacity: &mut SourceJournalCapacityHistory,
+) {
     let prune_safe_through = source.prune_safe_through();
+    let projected_capacity_seconds = capacity.observe(&source);
     tracing::debug!(
         gauge.keldra_source_journal_metrics_available = 1_u64,
         gauge.keldra_source_journal_tail = source.tail,
@@ -554,6 +623,14 @@ fn emit_source_journal_metrics(source: SourceJournalRuntimeMetrics) {
         gauge.keldra_source_journal_retained_bytes = source.retained_bytes,
         gauge.keldra_source_journal_max_entries = source.max_entries,
         gauge.keldra_source_journal_max_bytes = source.max_bytes,
+        gauge.keldra_source_journal_remaining_entries =
+            source.max_entries.saturating_sub(source.retained_entries),
+        gauge.keldra_source_journal_remaining_bytes =
+            source.max_bytes.saturating_sub(source.retained_bytes),
+        gauge.keldra_source_journal_projected_capacity_available =
+            u64::from(projected_capacity_seconds.is_some()),
+        gauge.keldra_source_journal_time_to_projected_backpressure_seconds =
+            projected_capacity_seconds.unwrap_or(0.0),
         gauge.keldra_source_journal_progress_debt_entries = source.progress_debt_entries(),
         gauge.keldra_source_journal_progress_debt_bytes = source.progress_debt_bytes(),
         gauge.keldra_source_journal_progress_debt_peak_entries = source.progress_debt_peak_entries,
@@ -624,6 +701,49 @@ mod tests {
 
         assert_eq!(
             projected_receipt_capacity_seconds(previous, current, 100, 1_000),
+            None
+        );
+    }
+
+    #[test]
+    fn source_journal_capacity_uses_the_first_growing_bound() {
+        let now = std::time::Instant::now();
+        let previous = SourceJournalCapacitySample {
+            sampled_at: now - Duration::from_secs(10),
+            entries: 10,
+            bytes: 100,
+        };
+        let current = SourceJournalCapacitySample {
+            sampled_at: now,
+            entries: 20,
+            bytes: 300,
+        };
+
+        let seconds =
+            projected_source_journal_capacity_seconds(previous, current, 100, 1_000).unwrap();
+        assert!((seconds - 35.0).abs() < f64::EPSILON);
+        assert_eq!(
+            projected_source_journal_capacity_seconds(previous, current, 20, 1_000),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn source_journal_capacity_is_unknown_while_retention_is_repaying_pressure() {
+        let now = std::time::Instant::now();
+        let previous = SourceJournalCapacitySample {
+            sampled_at: now - Duration::from_secs(10),
+            entries: 20,
+            bytes: 300,
+        };
+        let current = SourceJournalCapacitySample {
+            sampled_at: now,
+            entries: 19,
+            bytes: 250,
+        };
+
+        assert_eq!(
+            projected_source_journal_capacity_seconds(previous, current, 100, 1_000),
             None
         );
     }

@@ -14,7 +14,8 @@ use keldra_consensus::{
 };
 use keldra_store::{
     BlobRef, PreparedBundleHash, PreparedBundleRef, PreparedProgramBundle, PreparedProgramRecord,
-    ProgramHash, ProgramPathMutation, ProgramPathStage, Store, Version, path_stage_from_prepared,
+    ProgramHash, ProgramPathMutation, ProgramPathStage, SealedAtomicBatchPublication, Store,
+    Version, path_stage_from_prepared,
 };
 use tonic::Status;
 
@@ -170,7 +171,7 @@ impl super::ProgramCoordinator {
                 .load_distributed_result(committed.invocation, true)
                 .await;
         }
-        distributed
+        let finalized = distributed
             .finalize(
                 &prepared.stages,
                 committed.invocation.committed_batch.commit_cursor,
@@ -178,6 +179,20 @@ impl super::ProgramCoordinator {
                 budget,
             )
             .await?;
+        self.store
+            .publish_atomic_batch(
+                SealedAtomicBatchPublication::from_prepared(
+                    committed.invocation.committed_batch.commit_cursor,
+                    prepared.prepared.bundle,
+                    prepared.prepared.hash,
+                    &prepared.record,
+                    &prepared.stages,
+                    &finalized,
+                )
+                .map_err(super::program_store_status)?,
+            )
+            .await
+            .map_err(super::program_store_status)?;
         self.advance_finalized_through(
             nomination,
             committed.invocation.committed_batch.commit_cursor,
@@ -199,8 +214,8 @@ impl super::ProgramCoordinator {
         drop(state);
         let mut through = None;
         for invocation in invocations {
-            let (_record, stages) = distributed.recover_record(invocation).await?;
-            distributed
+            let (record, stages) = distributed.recover_record(invocation).await?;
+            let finalized = distributed
                 .finalize(
                     &stages,
                     invocation.committed_batch.commit_cursor,
@@ -208,6 +223,23 @@ impl super::ProgramCoordinator {
                     Duration::from_secs(30),
                 )
                 .await?;
+            self.store
+                .publish_atomic_batch(
+                    SealedAtomicBatchPublication::from_prepared(
+                        invocation.committed_batch.commit_cursor,
+                        PreparedBundleRef {
+                            hash: invocation.committed_batch.bundle_ref.hash,
+                            length: invocation.committed_batch.bundle_ref.length,
+                        },
+                        PreparedBundleHash(invocation.committed_batch.bundle_hash.0),
+                        &record,
+                        &stages,
+                        &finalized,
+                    )
+                    .map_err(super::program_store_status)?,
+                )
+                .await
+                .map_err(super::program_store_status)?;
             through = Some(invocation.committed_batch.commit_cursor);
         }
         if let Some(through) = through {
@@ -437,12 +469,15 @@ impl DistributedPrograms {
         commit_cursor: u64,
         nomination: ExecutorNomination,
         budget: Duration,
-    ) -> Result<(), Status> {
+    ) -> Result<Vec<ProgramPathMutation>, Status> {
+        let mut finalized = Vec::with_capacity(stages.len());
         for stage in stages {
-            self.finalize_path(stage, commit_cursor, nomination, budget)
-                .await?;
+            finalized.push(
+                self.finalize_path(stage, commit_cursor, nomination, budget)
+                    .await?,
+            );
         }
-        Ok(())
+        Ok(finalized)
     }
 
     async fn finalize_path(
@@ -451,7 +486,7 @@ impl DistributedPrograms {
         commit_cursor: u64,
         nomination: ExecutorNomination,
         budget: Duration,
-    ) -> Result<(), Status> {
+    ) -> Result<ProgramPathMutation, Status> {
         let placement = self.objects.current_program_placement()?;
         let group = self.objects.program_replica_group(
             stage.tenant_id,
@@ -537,7 +572,7 @@ impl DistributedPrograms {
                 "placement changed during program path finalization",
             ));
         }
-        Ok(())
+        Ok(mutation)
     }
 
     pub(super) async fn recover_record(

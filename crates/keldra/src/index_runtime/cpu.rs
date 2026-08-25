@@ -13,7 +13,8 @@ use thiserror::Error;
 
 #[derive(Clone)]
 pub(crate) struct IndexCpuPool {
-    inner: Arc<rayon::ThreadPool>,
+    background: Arc<rayon::ThreadPool>,
+    query: Arc<rayon::ThreadPool>,
     workers: usize,
 }
 
@@ -103,14 +104,28 @@ impl IndexCpuPool {
             return Err(IndexCpuPoolError::ZeroWorkers);
         }
         let workers = usize::try_from(workers).map_err(|_| IndexCpuPoolError::WorkerOverflow)?;
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(workers)
-            .thread_name(|index| format!("keldra-index-{index}"))
+        let background_workers = workers.saturating_sub(1).max(1);
+        let background = rayon::ThreadPoolBuilder::new()
+            .num_threads(background_workers)
+            .thread_name(|index| format!("keldra-index-background-{index}"))
             .build()
             .map_err(|error| IndexCpuPoolError::Build(error.to_string()))?;
+        let query = if workers == 1 {
+            None
+        } else {
+            Some(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(1)
+                    .thread_name(|index| format!("keldra-index-query-{index}"))
+                    .build()
+                    .map_err(|error| IndexCpuPoolError::Build(error.to_string()))?,
+            )
+        };
+        let background = Arc::new(background);
         Ok(Self {
-            inner: Arc::new(pool),
-            workers,
+            query: query.map_or_else(|| background.clone(), Arc::new),
+            background,
+            workers: background_workers,
         })
     }
 
@@ -124,7 +139,7 @@ impl IndexCpuPool {
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
-        let pool = self.inner.clone();
+        let pool = self.background.clone();
         tokio::task::spawn_blocking(move || pool.install(work))
             .await
             .map_err(|error| IndexCpuPoolError::Task(error.to_string()))
@@ -143,7 +158,7 @@ impl IndexCpuPool {
         T: Send + 'static,
     {
         let (sender, receiver) = tokio::sync::oneshot::channel();
-        self.inner.spawn(move || {
+        self.background.spawn(move || {
             let outcome = catch_unwind(AssertUnwindSafe(work));
             let _ = sender.send(outcome);
         });
@@ -182,8 +197,9 @@ impl IndexCpuPool {
             );
         });
         let worker_span = span.clone();
-        let execution = self
-            .install(move || {
+        let pool = self.query.clone();
+        let execution = tokio::task::spawn_blocking(move || {
+            pool.install(move || {
                 worker_started.store(true, Ordering::Release);
                 let queue_seconds = enqueued.elapsed().as_secs_f64();
                 worker_span.in_scope(|| {
@@ -207,7 +223,9 @@ impl IndexCpuPool {
                 let cpu_seconds = cpu_started.elapsed().as_secs_f64();
                 (result, queue_seconds, cpu_seconds)
             })
-            .await;
+        })
+        .await
+        .map_err(|error| IndexCpuPoolError::Task(error.to_string()));
         let (result, queue_seconds, cpu_seconds) = match execution {
             Ok(execution) => execution,
             Err(error) => {
@@ -308,5 +326,24 @@ mod tests {
             .await
             .unwrap();
         assert!(name.starts_with("keldra-index-"));
+    }
+
+    #[tokio::test]
+    async fn query_cpu_has_reserved_capacity_when_multiple_workers_are_configured() {
+        let pool = IndexCpuPool::new(2).unwrap();
+        let background_name = pool
+            .submit(|| std::thread::current().name().unwrap_or_default().to_owned())
+            .await
+            .unwrap();
+        let query_name = pool
+            .query_chunk(IndexKind::FullText, || {
+                Ok(std::thread::current().name().unwrap_or_default().to_owned())
+            })
+            .await
+            .unwrap();
+
+        assert!(background_name.starts_with("keldra-index-background-"));
+        assert!(query_name.starts_with("keldra-index-query-"));
+        assert_eq!(pool.workers(), 1);
     }
 }

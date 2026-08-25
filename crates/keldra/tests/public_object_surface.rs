@@ -581,6 +581,7 @@ async fn index_lifecycle_requires_zanzibar_access_to_the_definition_object() {
                     limit: 10,
                     page_token: Vec::new(),
                     tenant: String::new(),
+                    required_freshness: None,
                 },
                 &denied_token,
             ))
@@ -1589,7 +1590,7 @@ fn test_server_config(
         max_mutation_receipt_entries: 512,
         max_mutation_receipt_bytes: 1024 * 1024,
         source_journal_max_entries: 512,
-        source_journal_max_bytes: 1024 * 1024,
+        source_journal_max_bytes: keldra_store::MAX_ATOMIC_BATCH_PUBLISHED_BYTES,
     }
 }
 

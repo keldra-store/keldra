@@ -37,9 +37,16 @@ fn assignment(kind: DefinitionKind, id: u64) -> DefinitionAssignment {
 }
 
 fn barrier(cursors: &[(WatchJournalStatus, u64)]) -> DerivedBarrierEvidence {
+    barrier_atomic(cursors, 2)
+}
+
+fn barrier_atomic(
+    cursors: &[(WatchJournalStatus, u64)],
+    atomic_through: u64,
+) -> DerivedBarrierEvidence {
     DerivedBarrierEvidence::Published(IndexBarrier {
         fence: fence(),
-        atomic: AtomicProgramWatermark::new(Some(2), Some(2), 0),
+        atomic: AtomicProgramWatermark::new(Some(atomic_through), Some(atomic_through), 0),
         sources: cursors
             .iter()
             .map(|(status, next_offset)| {
@@ -53,6 +60,61 @@ fn barrier(cursors: &[(WatchJournalStatus, u64)]) -> DerivedBarrierEvidence {
             })
             .collect::<BTreeMap<_, _>>(),
     })
+}
+
+#[test]
+fn atomic_effect_holds_its_earliest_source_offset_until_atomic_proof_covers_it() {
+    let status = source(1, 20);
+    let assignment = assignment(DefinitionKind::Index, 1);
+    let mut inventory = SparseDerivedInventory::begin(
+        DerivedConsumerKind::Index,
+        NodeId(3),
+        fence(),
+        [(status, None)],
+    )
+    .unwrap();
+    inventory
+        .record_affected(
+            &assignment,
+            status.source_id,
+            5,
+            Some(20),
+            Some(4),
+            Some(&barrier_atomic(&[(status, 5)], 15)),
+        )
+        .unwrap();
+    inventory
+        .record_affected(
+            &assignment,
+            status.source_id,
+            8,
+            Some(25),
+            Some(7),
+            Some(&barrier_atomic(&[(status, 8)], 15)),
+        )
+        .unwrap();
+    inventory
+        .record_affected(
+            &assignment,
+            status.source_id,
+            10,
+            None,
+            None,
+            Some(&barrier_atomic(&[(status, 10)], 15)),
+        )
+        .unwrap();
+    let mut tracker = inventory.finish();
+    assert_eq!(tracker.checkpoints().unwrap()[0].next_offset, 4);
+
+    tracker
+        .observe_proof(&assignment, &barrier_atomic(&[(status, 10)], 20))
+        .unwrap();
+    assert_eq!(tracker.checkpoints().unwrap()[0].next_offset, 4);
+    tracker
+        .observe_proof(&assignment, &barrier_atomic(&[(status, 10)], 25))
+        .unwrap();
+    assert_eq!(tracker.affected_len(status.source_id), 0);
+    assert_eq!(tracker.checkpoints().unwrap()[0].next_offset, 21);
 }
 
 fn current(
@@ -102,10 +164,10 @@ fn inventory_retains_only_sparse_affected_definitions_and_uses_the_minimum_proof
     )
     .unwrap();
     inventory
-        .record_affected(&first, status.source_id, 18, Some(&proof))
+        .record_affected(&first, status.source_id, 18, None, None, Some(&proof))
         .unwrap();
     inventory
-        .record_affected(&second, status.source_id, 15, Some(&older))
+        .record_affected(&second, status.source_id, 15, None, None, Some(&older))
         .unwrap();
     let tracker = inventory.finish();
     assert_eq!(tracker.affected_len(status.source_id), 2);
@@ -125,7 +187,14 @@ fn published_proof_releases_only_the_effects_it_covers() {
     )
     .unwrap();
     inventory
-        .record_affected(&assignment, status.source_id, 14, Some(&initial))
+        .record_affected(
+            &assignment,
+            status.source_id,
+            14,
+            None,
+            None,
+            Some(&initial),
+        )
         .unwrap();
     let mut tracker = inventory.finish();
     tracker
@@ -147,7 +216,7 @@ fn unpublished_construction_state_cannot_release_a_routed_effect() {
     )
     .unwrap();
     inventory
-        .record_affected(&assignment, status.source_id, 14, None)
+        .record_affected(&assignment, status.source_id, 14, None, None, None)
         .unwrap();
 
     let tracker = inventory.finish();
@@ -172,7 +241,14 @@ fn incremental_routed_effect_adds_one_sparse_pin_then_publication_removes_it() {
     .unwrap()
     .finish();
     tracker
-        .observe_routed_effect(&assignment, status.source_id, 13, Some(&initial))
+        .observe_routed_effect(
+            &assignment,
+            status.source_id,
+            13,
+            None,
+            None,
+            Some(&initial),
+        )
         .unwrap();
     assert_eq!(tracker.checkpoints().unwrap()[0].next_offset, 10);
     tracker
@@ -196,7 +272,7 @@ fn newly_settled_status_must_precede_new_routed_effect_validation() {
     .finish();
 
     assert!(matches!(
-        tracker.observe_routed_effect(&current, old.source_id, 10, None),
+        tracker.observe_routed_effect(&current, old.source_id, 10, None, None, None),
         Err(SparseTrackerError::RoutedOffset {
             source_id,
             identity,
@@ -208,7 +284,7 @@ fn newly_settled_status_must_precede_new_routed_effect_validation() {
 
     tracker.update_source_status(source(1, 20)).unwrap();
     tracker
-        .observe_routed_effect(&current, old.source_id, 10, None)
+        .observe_routed_effect(&current, old.source_id, 10, None, None, None)
         .unwrap();
 }
 
@@ -228,12 +304,12 @@ fn durable_acknowledgement_becomes_the_floor_for_later_missing_proof() {
     let checkpoint = tracker.checkpoints().unwrap()[0];
     tracker.acknowledge(checkpoint).unwrap();
     tracker
-        .observe_routed_effect(&first, status.source_id, 21, None)
+        .observe_routed_effect(&first, status.source_id, 21, None, None, None)
         .unwrap();
     assert_eq!(tracker.checkpoints().unwrap()[0].next_offset, 21);
     tracker.remove_assignment(&first).unwrap();
     tracker
-        .observe_routed_effect(&second, status.source_id, 21, None)
+        .observe_routed_effect(&second, status.source_id, 21, None, None, None)
         .unwrap();
     assert_eq!(tracker.checkpoints().unwrap()[0].next_offset, 21);
 }
@@ -253,7 +329,7 @@ fn missing_or_behind_proof_never_regresses_the_durable_baseline() {
     )
     .unwrap();
     inventory
-        .record_affected(&assignment, status.source_id, 18, None)
+        .record_affected(&assignment, status.source_id, 18, None, None, None)
         .unwrap();
     let tracker = inventory.finish();
     assert_eq!(tracker.checkpoints().unwrap()[0].next_offset, 12);
@@ -275,13 +351,15 @@ fn wrong_kind_or_query_replica_cannot_enter_the_inventory() {
             status.source_id,
             2,
             None,
+            None,
+            None,
         ),
         Err(SparseTrackerError::WrongAssignment)
     );
     let mut replica = assignment(DefinitionKind::Index, 2);
     replica.rank = 1;
     assert_eq!(
-        inventory.record_affected(&replica, status.source_id, 2, None),
+        inventory.record_affected(&replica, status.source_id, 2, None, None, None),
         Err(SparseTrackerError::WrongAssignment)
     );
 }

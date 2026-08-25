@@ -18,9 +18,10 @@ use keldra_consensus::{
     InvocationId, NodeId, ProgramHash as DecisionProgramHash, ProgramPathHash,
 };
 use keldra_store::{
-    CommittedProgramResult, ObjectKey, PreparedBundleHash, PreparedBundleRef, ProgramCommit,
-    ProgramDurabilityClassHash, ProgramDurabilityEvidenceHash, ProgramDurabilityScope, ProgramHash,
-    ProgramStoreError, PublishedProgramVersion, Store, VerifiedProgramDefinition,
+    CommittedProgramResult, ObjectKey, ObjectMutationContext, PlacementLogId, PreparedBundleHash,
+    PreparedBundleRef, ProgramCommit, ProgramDurabilityClassHash, ProgramDurabilityEvidenceHash,
+    ProgramDurabilityScope, ProgramHash, ProgramStoreError, PublishedProgramVersion, Store,
+    VerifiedProgramDefinition,
 };
 use tonic::Status;
 use tracing::Instrument as _;
@@ -515,6 +516,7 @@ impl ProgramCoordinator {
                     "EXECUTOR_MOVED: atomic executor moved while the program was preparing; retry the same invocation id",
                 ));
             }
+            let mutation_context = self.one_node_mutation_context(current)?;
             let proposal_at_unix_millis = current_unix_millis().map_err(internal)?;
             let replay_expires_at_unix_millis = proposal_at_unix_millis
                 .checked_add(ATOMIC_REPLAY_RETENTION_MILLIS)
@@ -567,6 +569,7 @@ impl ProgramCoordinator {
                     lease,
                     &prepared,
                     program_commit(applied_cursor, committed.invocation.committed_batch),
+                    mutation_context,
                 )
                 .await
                 .map_err(program_store_status)?;
@@ -625,12 +628,39 @@ impl ProgramCoordinator {
         Ok(nomination)
     }
 
+    fn one_node_mutation_context(
+        &self,
+        nomination: ExecutorNomination,
+    ) -> Result<ObjectMutationContext, Status> {
+        let state = self.decisions.state().map_err(decision_status)?;
+        let placement = state
+            .cluster_control()
+            .active_placement_log_id()
+            .ok_or_else(|| Status::unavailable("ACTIVE placement has no committed log identity"))?;
+        Ok(ObjectMutationContext {
+            active_placement_log_id: PlacementLogId {
+                term: placement.leader_id.term,
+                index: placement.index,
+            },
+            // As on the distributed path, executor nomination is the atomic
+            // mutation's serving fence while the commit gate excludes a
+            // membership cutover.
+            serving_fence_term: nomination.nomination_log_index,
+        })
+    }
+
     async fn recover_committed_tail(&self) -> Result<()> {
         let _guard = self.commit_gate.lock().await;
         self.recover_committed_tail_locked().await
     }
 
     async fn recover_committed_tail_locked(&self) -> Result<()> {
+        let nomination = self
+            .current_nomination()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let mutation_context = self
+            .one_node_mutation_context(nomination)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         let state = self.decisions.state().context("read decision state")?;
         let mut applied = self
             .store
@@ -666,7 +696,7 @@ impl ProgramCoordinator {
             }
             let result = self
                 .store
-                .recover_program_bundle(program_commit(applied, batch))
+                .recover_program_bundle(program_commit(applied, batch), mutation_context)
                 .await
                 .with_context(|| format!("finalize atomic commit {}", batch.commit_cursor))?;
             require_result_matches_consensus(&result, invocation)
@@ -675,9 +705,6 @@ impl ProgramCoordinator {
             finalized_through = Some(batch.commit_cursor);
         }
         if let Some(through_commit_cursor) = finalized_through {
-            let nomination = state
-                .executor()
-                .context("cannot finalize atomic recovery tail without an executor")?;
             self.advance_finalized_through(nomination, through_commit_cursor)
                 .await
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?;
@@ -1017,7 +1044,8 @@ fn mutation_status(error: keldra_store::MutationError) -> Status {
             Status::resource_exhausted(format!("RESOURCE_LIMIT: {error}"))
         }
         keldra_store::MutationError::ReceiptTooLarge { .. }
-        | keldra_store::MutationError::SourceJournalRecordTooLarge { .. } => {
+        | keldra_store::MutationError::SourceJournalRecordTooLarge { .. }
+        | keldra_store::MutationError::SourceJournalTransitionTooLarge { .. } => {
             Status::resource_exhausted(format!("RESOURCE_LIMIT: {error}"))
         }
         keldra_store::MutationError::ObjectMutationLineageGap { .. }
@@ -1044,6 +1072,9 @@ fn program_store_status(error: ProgramStoreError) -> Status {
         }
         ProgramStoreError::SourceJournalCapacity => {
             Status::unavailable(format!("RESOURCE_LIMIT: {error}"))
+        }
+        ProgramStoreError::SourceJournalTransitionTooLarge { .. } => {
+            Status::resource_exhausted(format!("RESOURCE_LIMIT: {error}"))
         }
         ProgramStoreError::ProgramPolicy { .. } | ProgramStoreError::PreconditionFailed { .. } => {
             Status::failed_precondition(format!("PROGRAM_CONCURRENCY_VIOLATION: {error}"))
@@ -1114,6 +1145,10 @@ mod tests {
         Operation, PathBinding, PathTemplate, ProgramCaps, ProgramDefinition, ReturnDefinition,
     };
     use keldra_authz::ObjectRef;
+    use keldra_consensus::{
+        CLUSTER_CONTROL_COMMAND_VERSION, CapabilityRange, ClusterId, JoinCapabilityHash,
+        NodeDescriptor, NodeState, PeerAddress, PeerSpkiSha256,
+    };
     use keldra_store::{
         AuthzRevision, BucketPolicy, CreateBucketRequest, Durability, ObjectVersioning,
         ProvisionTenantRequest, PutMode, PutRequest, StorageTenantId, StoreOptions,
@@ -1269,9 +1304,51 @@ mod tests {
             .wait_for_leader(Duration::from_secs(10))
             .await
             .unwrap();
+        commit_test_active_placement(&decisions).await;
         ProgramCoordinator::start(store, decisions, NodeId(1))
             .await
             .unwrap()
+    }
+
+    async fn commit_test_active_placement(decisions: &DecisionRaft) {
+        let state = decisions.state().unwrap();
+        if state.cluster_control().active_placement_log_id().is_some() {
+            return;
+        }
+        if state.cluster_id().is_none() {
+            decisions
+                .submit(Command::InitializeCluster {
+                    cluster_id: ClusterId([1; 16]),
+                })
+                .await
+                .unwrap();
+        }
+        let begun = decisions
+            .submit(Command::BeginAddNode {
+                format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+                descriptor: NodeDescriptor {
+                    node_id: NodeId(1),
+                    peer_address: PeerAddress("keldra-local://1".into()),
+                    storage_weight_millionths: 1_000_000,
+                    state: NodeState::Joining,
+                    current_peer_spki_sha256: PeerSpkiSha256([1; 32]),
+                    overlap_peer_spki_sha256: None,
+                    join_capability_hash: Some(JoinCapabilityHash([2; 32])),
+                    supported_protocol: CapabilityRange { min: 1, max: 1 },
+                    supported_storage_format: CapabilityRange { min: 1, max: 1 },
+                },
+            })
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            decisions
+                .submit(Command::CompleteMembershipTransition {
+                    format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+                    started_log_index: begun.log_index,
+                })
+                .await
+                .unwrap();
+        }
     }
 
     #[tokio::test]
@@ -1520,6 +1597,10 @@ mod tests {
                 first_lease,
                 &first_prepared,
                 program_commit(None, first_consensus.invocation.committed_batch),
+                ObjectMutationContext {
+                    active_placement_log_id: PlacementLogId { term: 1, index: 1 },
+                    serving_fence_term: nomination.nomination_log_index,
+                },
             )
             .await
             .unwrap();
@@ -1577,6 +1658,10 @@ mod tests {
                     Some(first_cursor),
                     second_consensus.invocation.committed_batch,
                 ),
+                ObjectMutationContext {
+                    active_placement_log_id: PlacementLogId { term: 1, index: 1 },
+                    serving_fence_term: nomination.nomination_log_index,
+                },
             )
             .await
             .unwrap();

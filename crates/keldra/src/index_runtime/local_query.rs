@@ -1,5 +1,6 @@
-//! Local execution against one pinned immutable format-v4 generation.
+//! Local execution against one pinned immutable format-v4 revision.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -30,15 +31,24 @@ use crate::index_service::{
     IndexCandidateVisibility,
 };
 
-use super::cache::{IndexCache, IndexCacheError, IndexSegmentFetcher, IndexSegmentId, IndexSlice};
+use super::cache::{
+    IndexCache, IndexCacheError, IndexDiskLease, IndexSegmentFetcher, IndexSegmentId, IndexSlice,
+};
+use super::committed_view::{CommitManifestReference, IndexCommitManifest, ManifestPhysicalOrder};
 use super::cpu::IndexCpuPool;
 use super::directory::{ManifestArtifactDirectory, ManifestArtifactFile};
-use super::events::{IndexBarrier, IndexEventJournal};
-use super::generation::{IndexGenerationManifest, ManifestPhysicalOrder, ManifestReference};
-use super::publisher::{IndexGenerationPublisher, SelectedPublishedGeneration};
+use super::events::IndexBarrier;
+use super::publisher::{IndexCommitPublisher, SelectedCommittedIndexView};
 use super::query_budget::IndexQueryMemoryBudget;
 use super::v4_query::compile_query;
 use super::v4_schema::compile_schema;
+
+#[path = "local_query/opened_views.rs"]
+mod opened_views;
+use opened_views::{
+    CommittedViewOpenReason, OpenedCommittedIndexView, OpenedCommittedViewKey,
+    OpenedCommittedViewRegistry, opened_pack_charge,
+};
 
 #[derive(Clone)]
 struct QueryReadObserver {
@@ -738,40 +748,324 @@ impl Drop for QueryActiveGuard {
 }
 
 #[derive(Clone)]
-pub(crate) struct LocalGenerationQueryExecutor {
+pub(crate) struct LocalRevisionQueryExecutor {
     reader: ClusterObjectReader,
     cache: IndexCache,
-    events: Arc<IndexEventJournal>,
-    publisher: IndexGenerationPublisher,
+    publisher: IndexCommitPublisher,
+    opened_views: OpenedCommittedViewRegistry,
     cpu: IndexCpuPool,
     query_budget: IndexQueryMemoryBudget,
     admission: Arc<tokio::sync::Semaphore>,
     work_quantum_bytes: u64,
 }
 
-impl LocalGenerationQueryExecutor {
+impl LocalRevisionQueryExecutor {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         reader: ClusterObjectReader,
         cache: IndexCache,
-        events: Arc<IndexEventJournal>,
-        publisher: IndexGenerationPublisher,
+        publisher: IndexCommitPublisher,
         cpu: IndexCpuPool,
         query_budget: IndexQueryMemoryBudget,
         max_concurrency: u32,
         work_quantum_bytes: u64,
     ) -> Self {
         debug_assert!(work_quantum_bytes > 0);
+        let disk_budget_bytes = cache.disk_budget_bytes();
         Self {
             reader,
             cache,
-            events,
             publisher,
+            opened_views: OpenedCommittedViewRegistry::new(
+                (max_concurrency as usize).saturating_mul(64).max(1_024),
+                disk_budget_bytes,
+            ),
             cpu,
             query_budget,
             admission: Arc::new(tokio::sync::Semaphore::new(max_concurrency as usize)),
             work_quantum_bytes,
         }
+    }
+
+    async fn select_committed_view(
+        &self,
+        request: &LocalIndexQueryRequest,
+        exact_revision: Option<u64>,
+    ) -> Result<Option<OpenedCommittedIndexView>, Status> {
+        let key = OpenedCommittedViewKey {
+            storage_tenant: request.storage_tenant.clone(),
+            bucket: request.definition.bucket.clone(),
+            tenant_id: request.tenant_id,
+            bucket_id: request.bucket_id,
+            index_id: request.definition.index_id,
+            definition_version: request.definition.version,
+        };
+        if let Some(revision) = exact_revision {
+            if let Some(Some(opened)) = self.opened_views.get(&key)
+                && opened.selected.manifest.revision == revision
+            {
+                return Ok(Some(opened));
+            }
+            let selected = self
+                .publisher
+                .load_committed_view(
+                    &key.storage_tenant,
+                    &key.bucket,
+                    key.tenant_id,
+                    key.bucket_id,
+                    key.index_id,
+                    Some(revision),
+                )
+                .await?;
+            return self
+                .open_selected_view(request, selected, CommittedViewOpenReason::ExactRevision)
+                .await;
+        }
+
+        if request.required_freshness.is_some() {
+            return self.select_fresh_committed_view(request, key).await;
+        }
+
+        if let Some(opened) = self.opened_views.get(&key) {
+            self.refresh_committed_view(key, Duration::from_secs(1));
+            return Ok(opened);
+        }
+
+        let selected = self
+            .publisher
+            .load_committed_view(
+                &key.storage_tenant,
+                &key.bucket,
+                key.tenant_id,
+                key.bucket_id,
+                key.index_id,
+                None,
+            )
+            .await?;
+        let opened = self
+            .open_selected_view(request, selected, CommittedViewOpenReason::Initial)
+            .await?;
+        self.opened_views.install(key, opened.clone());
+        Ok(opened)
+    }
+
+    async fn select_fresh_committed_view(
+        &self,
+        request: &LocalIndexQueryRequest,
+        key: OpenedCommittedViewKey,
+    ) -> Result<Option<OpenedCommittedIndexView>, Status> {
+        let wait_started = std::time::Instant::now();
+        let requirement = request
+            .required_freshness
+            .as_ref()
+            .expect("freshness selection requires a checkpoint");
+        loop {
+            if let Some(Some(opened)) = self.opened_views.get(&key)
+                && opened.selected.manifest.definition_version == request.definition.version
+                && committed_view_covers(&opened, requirement)
+            {
+                emit_freshness_wait(&key, wait_started, "completed", false);
+                return Ok(Some(opened));
+            }
+            if tokio::time::Instant::now() >= request.deadline {
+                emit_freshness_wait(&key, wait_started, "deadline_exceeded", true);
+                return Err(Status::deadline_exceeded(
+                    "no committed local index view reached the required freshness checkpoint",
+                ));
+            }
+
+            let changed = self.opened_views.changed();
+            if self.opened_views.get(&key).is_none() {
+                let selected = self
+                    .publisher
+                    .load_committed_view(
+                        &key.storage_tenant,
+                        &key.bucket,
+                        key.tenant_id,
+                        key.bucket_id,
+                        key.index_id,
+                        None,
+                    )
+                    .await?;
+                let opened = self
+                    .open_selected_view(request, selected, CommittedViewOpenReason::Freshness)
+                    .await?;
+                self.opened_views.install(key.clone(), opened);
+            } else {
+                self.refresh_committed_view(key.clone(), Duration::from_millis(25));
+                tokio::select! {
+                    _ = changed => {}
+                    _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+                    _ = tokio::time::sleep_until(request.deadline) => {
+                        emit_freshness_wait(&key, wait_started, "deadline_exceeded", true);
+                        return Err(Status::deadline_exceeded(
+                            "no committed local index view reached the required freshness checkpoint",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    async fn open_selected_view(
+        &self,
+        request: &LocalIndexQueryRequest,
+        selected: Option<SelectedCommittedIndexView>,
+        reason: CommittedViewOpenReason,
+    ) -> Result<Option<OpenedCommittedIndexView>, Status> {
+        self.open_selected_view_for_key(
+            &OpenedCommittedViewKey {
+                storage_tenant: request.storage_tenant.clone(),
+                bucket: request.definition.bucket.clone(),
+                tenant_id: request.tenant_id,
+                bucket_id: request.bucket_id,
+                index_id: request.definition.index_id,
+                definition_version: request.definition.version,
+            },
+            selected,
+            reason,
+        )
+        .await
+    }
+
+    fn refresh_committed_view(&self, key: OpenedCommittedViewKey, minimum_interval: Duration) {
+        if !self.opened_views.begin_refresh(&key, minimum_interval) {
+            return;
+        }
+        let publisher = self.publisher.clone();
+        let executor = self.clone();
+        let opened_views = self.opened_views.clone();
+        tokio::spawn(async move {
+            let result = publisher
+                .load_committed_view(
+                    &key.storage_tenant,
+                    &key.bucket,
+                    key.tenant_id,
+                    key.bucket_id,
+                    key.index_id,
+                    None,
+                )
+                .await;
+            match result {
+                Ok(selected) => match executor
+                    .open_selected_view_for_key(&key, selected, CommittedViewOpenReason::Background)
+                    .await
+                {
+                    Ok(opened) => opened_views.finish_refresh(key, Some(opened)),
+                    Err(error) => {
+                        opened_views.finish_refresh(key.clone(), None);
+                        tracing::debug!(index.id = key.index_id, %error, "background index committed-view open will retry");
+                    }
+                },
+                Err(error) => {
+                    opened_views.finish_refresh(key.clone(), None);
+                    tracing::debug!(
+                        index.id = key.index_id,
+                        %error,
+                        "background index committed-view reopen will retry"
+                    );
+                }
+            }
+        });
+    }
+
+    async fn open_selected_view_for_key(
+        &self,
+        key: &OpenedCommittedViewKey,
+        selected: Option<SelectedCommittedIndexView>,
+        reason: CommittedViewOpenReason,
+    ) -> Result<Option<OpenedCommittedIndexView>, Status> {
+        let started = std::time::Instant::now();
+        let revision = selected
+            .as_ref()
+            .map_or(0, |selected| selected.manifest.revision);
+        let result = self.materialize_selected_view_for_key(key, selected).await;
+        let (pack_count, pack_bytes) = result
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .map_or((0, 0), |opened| {
+                committed_view_pack_totals(&opened.selected.manifest)
+            });
+        let failed = result.is_err();
+        tracing::debug!(
+            index.id = key.index_id,
+            tenant.id = key.tenant_id,
+            bucket.id = key.bucket_id,
+            revision,
+            reader.open_reason = reason.as_str(),
+            reader.outcome = if failed { "failed" } else { "completed" },
+            monotonic_counter.keldra_index_local_reader_reopens_total = u64::from(!failed),
+            monotonic_counter.keldra_index_local_reader_reopen_failures_total = u64::from(failed),
+            histogram.keldra_index_local_reader_materialized_packs = pack_count,
+            histogram.keldra_index_local_reader_materialized_bytes = pack_bytes,
+            histogram.keldra_index_local_reader_reopen_duration_seconds =
+                started.elapsed().as_secs_f64(),
+            "local committed index view open finished"
+        );
+        result
+    }
+
+    async fn materialize_selected_view_for_key(
+        &self,
+        key: &OpenedCommittedViewKey,
+        selected: Option<SelectedCommittedIndexView>,
+    ) -> Result<Option<OpenedCommittedIndexView>, Status> {
+        let Some(selected) = selected else {
+            return Ok(None);
+        };
+        let directory = ManifestArtifactDirectory::new(
+            self.cache.clone(),
+            self.reader.clone(),
+            key.storage_tenant.clone(),
+            key.bucket.clone(),
+            key.tenant_id,
+            key.bucket_id,
+            key.index_id,
+        )
+        .map_err(index_status)?;
+        let mut unique = BTreeMap::new();
+        for pack in selected
+            .manifest
+            .segments
+            .iter()
+            .flat_map(|segment| &segment.packs)
+        {
+            unique
+                .entry((pack.object_content_hash, pack.object_length))
+                .or_insert(pack);
+        }
+        for locator in &selected.manifest.locator_roots {
+            if let super::committed_view::LocatorPackOwnership::Standalone(packs) =
+                &locator.pack_ownership
+            {
+                for pack in packs {
+                    unique
+                        .entry((pack.object_content_hash, pack.object_length))
+                        .or_insert(pack);
+                }
+            }
+        }
+        let total_bytes = opened_pack_charge(unique.values().map(|pack| pack.object_length));
+        if total_bytes > self.cache.disk_budget_bytes() {
+            return Err(Status::resource_exhausted(
+                "committed index view exceeds the local disk cache data and metadata budget",
+            ));
+        }
+        let mut disk_leases = Vec::with_capacity(unique.len());
+        for pack in unique.into_values() {
+            // Resolve and exact-version verify the durable object before the
+            // local immutable bytes may be selected by a reader.
+            drop(directory.open(pack).await.map_err(index_status)?);
+            let id = IndexSegmentId::new(pack.object_content_hash, pack.object_length)
+                .map_err(cache_status)?;
+            disk_leases.push(self.cache.lease_disk(id).await.map_err(cache_status)?);
+        }
+        Ok(Some(OpenedCommittedIndexView {
+            selected,
+            directory,
+            disk_leases,
+        }))
     }
 
     async fn execute(&self, request: LocalIndexQueryRequest) -> Result<ExecutedIndexQuery, Status> {
@@ -793,7 +1087,7 @@ impl LocalGenerationQueryExecutor {
             "keldra.index.query",
             index.id = request.definition.index_id,
             definition.version = request.definition.version,
-            generation = tracing::field::Empty,
+            revision = tracing::field::Empty,
             tenant.id = request.tenant_id,
             bucket.id = request.bucket_id,
             index.kind = ?kind,
@@ -923,40 +1217,15 @@ impl LocalGenerationQueryExecutor {
             .iter()
             .map(|field| field.name.clone())
             .collect::<Vec<_>>();
-        let requested_generation = request.resume.as_ref().map(|resume| resume.generation);
+        let requested_revision = request.resume.as_ref().map(|resume| resume.commit_revision);
         let selected = self
-            .publisher
-            .load_generation(
-                &request.storage_tenant,
-                &request.definition.bucket,
-                request.tenant_id,
-                request.bucket_id,
-                request.definition.index_id,
-                requested_generation,
-            )
+            .select_committed_view(&request, requested_revision)
             .await?;
-        let indexed = selected
-            .as_ref()
-            .map(|selected| {
-                selected
-                    .manifest
-                    .barrier()
-                    .map_err(|error| Status::data_loss(error.to_string()))
-            })
-            .transpose()?;
-        // Freshness evidence is advisory and must never turn journal lag, a
-        // temporarily unavailable source, or a retained-generation cursor into
-        // query admission work. Observe only indexable changes in this bucket:
-        // unrelated buckets and reserved index artifacts cannot make a complete
-        // generation appear stale. If the scoped observation is unavailable or
-        // does not cover the pinned generation, serve the generation with its
-        // authoritative published barrier and omit optional observed tails.
-        let observed = self
-            .events
-            .capture_index_bucket_barrier(request.tenant_id, request.bucket_id, indexed.as_ref())
-            .await
-            .ok()
-            .and_then(|barrier| compatible_observed_barrier(indexed.as_ref(), Some(barrier)));
+        // Ordinary queries never inspect source journals. The pinned manifest
+        // is complete freshness authority for this request; optional observed
+        // tails are omitted until a background bucket-scoped monitor supplies
+        // them without adding query admission work.
+        let observed = None;
         let Some(selected) = selected else {
             let (facet_results, aggregate_results) =
                 empty_computation_results(&field_names, &compiled.facets, &compiled.aggregates)?;
@@ -974,12 +1243,13 @@ impl LocalGenerationQueryExecutor {
                 next_position: None,
             });
         };
-        let loaded = LoadedGeneration::new(selected);
-        tracing::Span::current().record("generation", loaded.manifest.generation);
+        let directory = selected.directory.clone();
+        let loaded = LoadedCommittedView::new(selected.selected);
+        tracing::Span::current().record("revision", loaded.manifest.revision);
         if loaded.manifest.definition_version != request.definition.version {
-            if requested_generation.is_some() {
+            if requested_revision.is_some() {
                 return Err(Status::failed_precondition(
-                    "requested generation belongs to another index definition version",
+                    "requested revision belongs to another index definition version",
                 ));
             }
             let (facet_results, aggregate_results) =
@@ -999,21 +1269,8 @@ impl LocalGenerationQueryExecutor {
             });
         }
         require_manifest_schema(&loaded.manifest, &schema)?;
-        let directory = QueryObservedDirectory::new(
-            ManifestArtifactDirectory::new(
-                self.cache.clone(),
-                self.reader.clone(),
-                request.storage_tenant.clone(),
-                request.definition.bucket.clone(),
-                request.tenant_id,
-                request.bucket_id,
-                request.definition.index_id,
-            )
-            .map_err(index_status)?,
-            observer,
-            self.cpu.clone(),
-            schema.kind,
-        );
+        let directory =
+            QueryObservedDirectory::new(directory, observer, self.cpu.clone(), schema.kind);
         let native = NativeQueryRequest {
             schema,
             segments: loaded.manifest.segments.clone(),
@@ -1105,8 +1362,52 @@ impl LocalGenerationQueryExecutor {
     }
 }
 
+fn emit_freshness_wait(
+    key: &OpenedCommittedViewKey,
+    started: std::time::Instant,
+    outcome: &'static str,
+    timed_out: bool,
+) {
+    tracing::debug!(
+        index.id = key.index_id,
+        tenant.id = key.tenant_id,
+        bucket.id = key.bucket_id,
+        freshness.outcome = outcome,
+        monotonic_counter.keldra_index_freshness_waits_total = 1_u64,
+        monotonic_counter.keldra_index_freshness_wait_timeouts_total = u64::from(timed_out),
+        histogram.keldra_index_freshness_wait_duration_seconds = started.elapsed().as_secs_f64(),
+        "required index freshness wait finished"
+    );
+}
+
+fn committed_view_pack_totals(manifest: &IndexCommitManifest) -> (u64, u64) {
+    let mut unique = BTreeMap::new();
+    for pack in manifest.segments.iter().flat_map(|segment| &segment.packs) {
+        unique
+            .entry((pack.object_content_hash, pack.object_length))
+            .or_insert(pack.object_length);
+    }
+    for locator in &manifest.locator_roots {
+        if let super::committed_view::LocatorPackOwnership::Standalone(packs) =
+            &locator.pack_ownership
+        {
+            for pack in packs {
+                unique
+                    .entry((pack.object_content_hash, pack.object_length))
+                    .or_insert(pack.object_length);
+            }
+        }
+    }
+    (
+        u64::try_from(unique.len()).unwrap_or(u64::MAX),
+        unique
+            .values()
+            .fold(0_u64, |total, bytes| total.saturating_add(*bytes)),
+    )
+}
+
 #[tonic::async_trait]
-impl LocalIndexQueryExecutor for LocalGenerationQueryExecutor {
+impl LocalIndexQueryExecutor for LocalRevisionQueryExecutor {
     async fn execute_local(
         &self,
         request: LocalIndexQueryRequest,
@@ -1334,13 +1635,13 @@ impl IndexSegmentFetcher for ClusterIndexSegmentFetcher {
     }
 }
 
-struct LoadedGeneration {
-    manifest: IndexGenerationManifest,
-    reference: ManifestReference,
+struct LoadedCommittedView {
+    manifest: IndexCommitManifest,
+    reference: CommitManifestReference,
 }
 
-impl LoadedGeneration {
-    fn new(selected: SelectedPublishedGeneration) -> Self {
+impl LoadedCommittedView {
+    fn new(selected: SelectedCommittedIndexView) -> Self {
         Self {
             manifest: selected.manifest,
             reference: selected.reference,
@@ -1349,7 +1650,7 @@ impl LoadedGeneration {
 }
 
 fn require_manifest_schema(
-    manifest: &IndexGenerationManifest,
+    manifest: &IndexCommitManifest,
     schema: &keldra_index::v4::Schema,
 ) -> Result<(), Status> {
     let fingerprint = schema.fingerprint().map_err(index_status)?;
@@ -1376,12 +1677,12 @@ fn require_manifest_schema(
 }
 
 fn freshness(
-    generation: &LoadedGeneration,
+    revision: &LoadedCommittedView,
     observed: Option<&IndexBarrier>,
     initial_build_complete: bool,
     authorization_revision: u64,
 ) -> Result<IndexFreshness, Status> {
-    let indexed = generation
+    let indexed = revision
         .manifest
         .sources
         .iter()
@@ -1401,7 +1702,7 @@ fn freshness(
     node_ids.sort_unstable();
     node_ids.dedup();
     let mut rebuilding =
-        observed.is_some_and(|barrier| generation.manifest.placement_fence != barrier.fence);
+        observed.is_some_and(|barrier| revision.manifest.placement_fence != barrier.fence);
     let sources = node_ids
         .into_iter()
         .map(
@@ -1440,55 +1741,50 @@ fn freshness(
         )
         .collect();
     Ok(IndexFreshness {
-        generation: generation.manifest.generation,
-        published_at: Some(publication_time(generation.reference.published_at_unix_millis)?.into()),
+        commit_revision: revision.manifest.revision,
+        published_at: Some(publication_time(revision.reference.published_at_unix_millis)?.into()),
         sources,
         initial_build_complete,
         rebuilding,
         authorization_revision,
-        placement_term: generation.manifest.placement_fence.term,
-        placement_index: generation.manifest.placement_fence.index,
-        index_id: generation.manifest.index_id,
-        definition_version: generation.manifest.definition_version,
+        placement_term: revision.manifest.placement_fence.term,
+        placement_index: revision.manifest.placement_fence.index,
+        index_id: revision.manifest.index_id,
+        definition_version: revision.manifest.definition_version,
     })
 }
 
 fn query_freshness(
-    generation: &LoadedGeneration,
+    revision: &LoadedCommittedView,
     observed: Option<&IndexBarrier>,
     initial_build_complete: bool,
     authorization_revision: u64,
 ) -> Result<IndexFreshness, Status> {
-    let mut value = freshness(
-        generation,
+    freshness(
+        revision,
         observed,
         initial_build_complete,
         authorization_revision,
-    )?;
-    if observed.is_none() {
-        value.rebuilding = true;
-    }
-    Ok(value)
+    )
 }
 
-fn compatible_observed_barrier(
-    indexed: Option<&IndexBarrier>,
-    observed: Option<IndexBarrier>,
-) -> Option<IndexBarrier> {
-    let observed = observed?;
-    let Some(indexed) = indexed else {
-        return Some(observed);
-    };
-    if observed.fence != indexed.fence
-        || indexed.sources.iter().any(|(node, indexed)| {
-            observed.sources.get(node).is_none_or(|observed| {
-                observed.source != indexed.source || observed.next_offset < indexed.next_offset
-            })
+fn committed_view_covers(
+    opened: &OpenedCommittedIndexView,
+    requirement: &crate::index_service::IndexFreshnessRequirement,
+) -> bool {
+    requirement.sources.iter().all(|required| {
+        opened.selected.manifest.sources.iter().any(|indexed| {
+            indexed.node_id == required.node_id
+                && indexed.source.source_epoch == required.source_epoch
+                && indexed.next_offset >= required.next_offset
         })
-    {
-        return None;
-    }
-    Some(observed)
+    }) && requirement.atomic_through.is_none_or(|required| {
+        opened
+            .selected
+            .manifest
+            .atomic_through
+            .is_some_and(|indexed| indexed >= required)
+    })
 }
 
 fn empty_freshness(
@@ -1509,7 +1805,7 @@ fn empty_freshness(
         })
         .collect();
     IndexFreshness {
-        generation: 0,
+        commit_revision: 0,
         published_at: None,
         sources,
         initial_build_complete: false,
@@ -1539,6 +1835,10 @@ fn index_status(error: IndexError) -> Status {
     }
 }
 
+fn cache_status(error: IndexCacheError) -> Status {
+    Status::unavailable(error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1550,54 +1850,6 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap();
         assert_eq!(value, Duration::from_millis(1_234));
-    }
-
-    #[test]
-    fn query_uses_only_compatible_already_observed_freshness() {
-        use keldra_consensus::NodeId;
-        use keldra_store::{PlacementLogId, SourceId};
-
-        use crate::index_runtime::events::{AtomicProgramWatermark, IndexSourceCursor};
-
-        fn barrier(fence_index: u64, next_offset: u64) -> IndexBarrier {
-            IndexBarrier {
-                fence: PlacementLogId {
-                    term: 1,
-                    index: fence_index,
-                },
-                atomic: AtomicProgramWatermark::new(None, None, 0),
-                sources: [(
-                    NodeId(1),
-                    IndexSourceCursor {
-                        source: SourceId {
-                            node_id: 1,
-                            source_epoch: [7; 32],
-                        },
-                        next_offset,
-                    },
-                )]
-                .into_iter()
-                .collect(),
-            }
-        }
-
-        let indexed = barrier(4, 20);
-        assert_eq!(
-            compatible_observed_barrier(Some(&indexed), Some(barrier(4, 25)))
-                .unwrap()
-                .sources[&NodeId(1)]
-                .next_offset,
-            25
-        );
-        assert!(compatible_observed_barrier(Some(&indexed), Some(barrier(4, 19))).is_none());
-        assert!(compatible_observed_barrier(Some(&indexed), Some(barrier(5, 25))).is_none());
-        assert_eq!(
-            compatible_observed_barrier(None, Some(barrier(5, 25)))
-                .unwrap()
-                .fence
-                .index,
-            5
-        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1624,11 +1876,11 @@ mod tests {
     fn empty_results_keep_authorization_evidence() {
         let freshness = empty_freshness(7, 2, 91, None);
         assert_eq!(freshness.authorization_revision, 91);
-        assert_eq!(freshness.generation, 0);
+        assert_eq!(freshness.commit_revision, 0);
     }
 
     #[test]
-    fn empty_generation_returns_one_result_per_requested_computation() {
+    fn empty_commit_returns_one_result_per_requested_computation() {
         let (facets, aggregates) = empty_computation_results(
             &["ecosystem".into(), "severity".into()],
             &[keldra_index::v4::FacetRequest {

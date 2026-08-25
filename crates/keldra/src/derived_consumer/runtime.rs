@@ -16,8 +16,10 @@ use crate::accounting::{AccountingCatalog, LoadedAccountingDefinition, read_roll
 use crate::cluster_object_read::ClusterObjectReader;
 use crate::index_runtime::catalog::IndexCatalog;
 use crate::index_runtime::coordination::{current_placement, load_index_assignment};
-use crate::index_runtime::events::{IndexBarrier, IndexEventJournal, MAX_INDEX_EVENT_PAGE_BYTES};
-use crate::index_runtime::publisher::IndexGenerationPublisher;
+use crate::index_runtime::events::{
+    IndexBarrier, IndexEventJournal, MAX_INDEX_EVENT_PAGE_BYTES, RoutedSourceEffect,
+};
+use crate::index_runtime::publisher::IndexCommitPublisher;
 
 use super::{
     DerivedBarrierEvidence, DerivedCheckpointPublisher, DerivedDefinitionIdentity,
@@ -74,7 +76,7 @@ pub(crate) enum DerivedEvidenceResolver {
         local_node: NodeId,
         decisions: DecisionRaft,
         reader: ClusterObjectReader,
-        publisher: IndexGenerationPublisher,
+        publisher: IndexCommitPublisher,
         catalog: IndexCatalog,
     },
     Accounting {
@@ -90,7 +92,7 @@ impl DerivedEvidenceResolver {
         local_node: NodeId,
         decisions: DecisionRaft,
         reader: ClusterObjectReader,
-        publisher: IndexGenerationPublisher,
+        publisher: IndexCommitPublisher,
         catalog: IndexCatalog,
     ) -> Self {
         Self::Index {
@@ -119,7 +121,7 @@ impl DerivedEvidenceResolver {
     async fn affected(
         &self,
         assignment: &DefinitionAssignment,
-        effects: &BTreeMap<SourceId, u64>,
+        effects: &BTreeMap<SourceId, RoutedSourceEffect>,
     ) -> Result<Option<DerivedBarrierEvidence>, Status> {
         match self {
             Self::Index {
@@ -472,9 +474,20 @@ async fn scan_inventory(
                 continue;
             }
             let evidence = resolver.affected(&assignment, &effects).await?;
-            for (&source, &latest_next) in &effects {
+            for (&source, effect) in &effects {
                 inventory
-                    .record_affected(&assignment, source, latest_next, evidence.as_ref())
+                    .record_affected(
+                        &assignment,
+                        source,
+                        effect.next_offset,
+                        (kind == DerivedConsumerKind::Index)
+                            .then_some(effect.required_atomic_cursor)
+                            .flatten(),
+                        (kind == DerivedConsumerKind::Index)
+                            .then_some(effect.atomic_hold_next)
+                            .flatten(),
+                        evidence.as_ref(),
+                    )
                     .map_err(tracker_status)?;
             }
         }
@@ -605,26 +618,46 @@ async fn scan_raw_interval(
         .await
         .map_err(event_status)?
     {
-        let mut effects = BTreeMap::<(u64, u64), BTreeMap<SourceId, u64>>::new();
+        let mut effects = BTreeMap::<(u64, u64), BTreeMap<SourceId, RoutedSourceEffect>>::new();
         for change in &page.changes {
-            let Some(bucket) = change_bucket(kind, &change.change) else {
-                continue;
-            };
-            if assignments.definitions(bucket.0, bucket.1).is_none() {
-                continue;
+            let event_source = page.through.sources[&change.node].source;
+            let source_effects =
+                crate::index_runtime::events::source_change_effects(event_source, &change.change)
+                    .map_err(event_status)?;
+            for bucket in change_buckets(kind, &change.change) {
+                if assignments.definitions(bucket.0, bucket.1).is_none() {
+                    continue;
+                }
+                let bucket_effects = effects.entry(bucket).or_default();
+                for effect in &source_effects {
+                    let source = effect.source;
+                    let next = effect.next_offset;
+                    bucket_effects
+                        .entry(source)
+                        .and_modify(|current| {
+                            current.next_offset = current.next_offset.max(next);
+                            if kind == DerivedConsumerKind::Index {
+                                current.required_atomic_cursor = current
+                                    .required_atomic_cursor
+                                    .max(effect.required_atomic_cursor);
+                                current.atomic_hold_next = current
+                                    .atomic_hold_next
+                                    .into_iter()
+                                    .chain(effect.atomic_hold_next)
+                                    .min();
+                            }
+                        })
+                        .or_insert(RoutedSourceEffect {
+                            next_offset: next,
+                            required_atomic_cursor: (kind == DerivedConsumerKind::Index)
+                                .then_some(effect.required_atomic_cursor)
+                                .flatten(),
+                            atomic_hold_next: (kind == DerivedConsumerKind::Index)
+                                .then_some(effect.atomic_hold_next)
+                                .flatten(),
+                        });
+                }
             }
-            let source = page.through.sources[&change.node].source;
-            let next = change
-                .change
-                .offset()
-                .checked_add(1)
-                .ok_or_else(|| Status::resource_exhausted("source offset exhausted"))?;
-            effects
-                .entry(bucket)
-                .or_default()
-                .entry(source)
-                .and_modify(|current| *current = (*current).max(next))
-                .or_insert(next);
         }
         for ((tenant_id, bucket_id), effects) in effects {
             let definitions = assignments
@@ -644,8 +677,8 @@ async fn routed_effects(
     bucket_id: u64,
     from: &IndexBarrier,
     target: &IndexBarrier,
-) -> Result<BTreeMap<SourceId, u64>, Status> {
-    match kind {
+) -> Result<BTreeMap<SourceId, RoutedSourceEffect>, Status> {
+    let mut effects = match kind {
         DerivedConsumerKind::Index => {
             journal
                 .routed_index_effects(tenant_id, bucket_id, from, target)
@@ -657,20 +690,34 @@ async fn routed_effects(
                 .await
         }
     }
-    .map_err(event_status)
+    .map_err(event_status)?;
+    if kind == DerivedConsumerKind::Accounting {
+        for effect in effects.values_mut() {
+            effect.required_atomic_cursor = None;
+            effect.atomic_hold_next = None;
+        }
+    }
+    Ok(effects)
 }
 
 async fn apply_bucket_effects(
     definitions: &BTreeMap<u64, DefinitionAssignment>,
-    effects: &BTreeMap<SourceId, u64>,
+    effects: &BTreeMap<SourceId, RoutedSourceEffect>,
     resolver: &DerivedEvidenceResolver,
     tracker: &mut SparseDerivedTracker,
 ) -> Result<(), Status> {
     for assignment in definitions.values() {
         let evidence = resolver.affected(assignment, effects).await?;
-        for (&source, &latest_next) in effects {
+        for (&source, effect) in effects {
             tracker
-                .observe_routed_effect(assignment, source, latest_next, evidence.as_ref())
+                .observe_routed_effect(
+                    assignment,
+                    source,
+                    effect.next_offset,
+                    effect.required_atomic_cursor,
+                    effect.atomic_hold_next,
+                    evidence.as_ref(),
+                )
                 .map_err(tracker_status)?;
         }
     }
@@ -679,7 +726,7 @@ async fn apply_bucket_effects(
 
 fn evidence_covers_effects(
     evidence: Option<&DerivedBarrierEvidence>,
-    effects: &BTreeMap<SourceId, u64>,
+    effects: &BTreeMap<SourceId, RoutedSourceEffect>,
 ) -> bool {
     let Some(evidence) = evidence else {
         return false;
@@ -687,12 +734,18 @@ fn evidence_covers_effects(
     let barrier = match evidence {
         DerivedBarrierEvidence::Published(barrier) => barrier,
     };
-    effects.iter().all(|(source, required_next)| {
+    effects.iter().all(|(source, effect)| {
         let node = NodeId(u64::from(source.node_id));
-        barrier
-            .sources
-            .get(&node)
-            .is_some_and(|cursor| cursor.source == *source && cursor.next_offset >= *required_next)
+        let source_covered = barrier.sources.get(&node).is_some_and(|cursor| {
+            cursor.source == *source && cursor.next_offset >= effect.next_offset
+        });
+        source_covered
+            && effect.required_atomic_cursor.is_none_or(|required| {
+                barrier
+                    .atomic
+                    .finalized_through()
+                    .is_some_and(|through| through >= required)
+            })
     })
 }
 
@@ -736,19 +789,31 @@ fn demux_strategy(
     }
 }
 
-fn change_bucket(kind: DerivedConsumerKind, change: &LocalChange) -> Option<(u64, u64)> {
+fn change_buckets(kind: DerivedConsumerKind, change: &LocalChange) -> Vec<(u64, u64)> {
     let included = match kind {
         DerivedConsumerKind::Index => crate::index_runtime::events::is_index_source_change(change),
         DerivedConsumerKind::Accounting => crate::accounting::is_accounting_source_change(change),
     };
     if !included {
-        return None;
+        return Vec::new();
     }
     match change {
-        LocalChange::ObjectHead(change) => Some((change.tenant_id, change.bucket_id)),
-        LocalChange::RetainedVersionDeleted(change) => Some((change.tenant_id, change.bucket_id)),
-        LocalChange::AggregateChanged(_) | LocalChange::ContentLifecycleChanged(_) => None,
-        _ => None,
+        LocalChange::ObjectHead(change) => vec![(change.tenant_id, change.bucket_id)],
+        LocalChange::RetainedVersionDeleted(change) => {
+            vec![(change.tenant_id, change.bucket_id)]
+        }
+        LocalChange::AtomicBatchPublished(change) => change
+            .affected_routes
+            .iter()
+            .map(|route| (route.tenant_id, route.bucket_id))
+            .collect(),
+        LocalChange::ContentLifecycleChanged(change) => change
+            .accounting_transition
+            .as_ref()
+            .map(|transition| vec![(transition.tenant_id, transition.bucket_id)])
+            .unwrap_or_default(),
+        LocalChange::AggregateChanged(_) => Vec::new(),
+        _ => Vec::new(),
     }
 }
 
@@ -974,7 +1039,14 @@ mod tests {
             node_id: 1,
             source_epoch: [4; 32],
         };
-        let effects = BTreeMap::from([(source, 12)]);
+        let effects = BTreeMap::from([(
+            source,
+            RoutedSourceEffect {
+                next_offset: 12,
+                required_atomic_cursor: None,
+                atomic_hold_next: None,
+            },
+        )]);
         let evidence = DerivedBarrierEvidence::Published(IndexBarrier {
             fence: PlacementLogId { term: 3, index: 7 },
             atomic: crate::index_runtime::events::AtomicProgramWatermark::new(None, None, 0),
@@ -991,7 +1063,14 @@ mod tests {
         assert!(!evidence_covers_effects(None, &effects));
         assert!(!evidence_covers_effects(
             Some(&evidence),
-            &BTreeMap::from([(source, 13)])
+            &BTreeMap::from([(
+                source,
+                RoutedSourceEffect {
+                    next_offset: 13,
+                    required_atomic_cursor: None,
+                    atomic_hold_next: None,
+                },
+            )])
         ));
     }
 
@@ -1005,6 +1084,7 @@ mod tests {
                 exact_path: path.into(),
                 path_version: keldra_store::VersionId(9),
                 kind: keldra_store::ObjectHeadChangeKind::Put,
+                program_commit_cursor: None,
                 reference_deltas: Vec::new(),
                 definition_transition: None,
                 accounting_transition: None,
@@ -1012,32 +1092,32 @@ mod tests {
         };
 
         assert_eq!(
-            change_bucket(
+            change_buckets(
                 DerivedConsumerKind::Index,
                 &change("objects/_keldra/index-pack")
             ),
-            None
+            Vec::<(u64, u64)>::new()
         );
         assert_eq!(
-            change_bucket(
+            change_buckets(
                 DerivedConsumerKind::Accounting,
                 &change("_keldra/accounting/7/current")
             ),
-            None
+            Vec::<(u64, u64)>::new()
         );
         assert_eq!(
-            change_bucket(
+            change_buckets(
                 DerivedConsumerKind::Accounting,
                 &change("_keldra/accounting/7/sources/3")
             ),
-            Some((1, 2))
+            vec![(1, 2)]
         );
         assert_eq!(
-            change_bucket(
+            change_buckets(
                 DerivedConsumerKind::Accounting,
                 &change("customer/ordinary.json")
             ),
-            Some((1, 2))
+            vec![(1, 2)]
         );
     }
 }

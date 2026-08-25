@@ -27,7 +27,7 @@ struct VerificationState {
     bucket: String,
     records: u64,
     final_live_objects: u64,
-    final_generation: u64,
+    final_commit_revision: u64,
     source_count: usize,
 }
 
@@ -47,7 +47,7 @@ struct ProbeReport {
     elapsed_milliseconds: f64,
     index_id: u64,
     definition_version: u64,
-    generation: u64,
+    commit_revision: u64,
     placement_term: u64,
     placement_index: u64,
     source_count: usize,
@@ -122,6 +122,7 @@ pub(super) async fn run(state_path: &Path) -> Result<()> {
             limit: 2,
             page_token: Vec::new(),
             tenant: String::new(),
+            required_freshness: None,
         })
         .await
         .context("singleton Typed JSON equality query failed")?
@@ -153,8 +154,8 @@ pub(super) async fn run(state_path: &Path) -> Result<()> {
         .as_ref()
         .context("singleton response omitted freshness")?;
     ensure!(
-        freshness.generation >= state.final_generation,
-        "index generation regressed"
+        freshness.commit_revision >= state.final_commit_revision,
+        "index commit_revision regressed"
     );
     ensure!(freshness.initial_build_complete && !freshness.rebuilding);
     ensure!(
@@ -169,7 +170,7 @@ pub(super) async fn run(state_path: &Path) -> Result<()> {
     ));
 
     let report = ProbeReport {
-        schema: "keldra.index-resource-singleton-probe.v1",
+        schema: "keldra.index-resource-singleton-probe.v2",
         endpoint,
         tenant,
         bucket,
@@ -183,7 +184,7 @@ pub(super) async fn run(state_path: &Path) -> Result<()> {
         elapsed_milliseconds,
         index_id: freshness.index_id,
         definition_version: freshness.definition_version,
-        generation: freshness.generation,
+        commit_revision: freshness.commit_revision,
         placement_term: freshness.placement_term,
         placement_index: freshness.placement_index,
         source_count: freshness.sources.len(),
@@ -198,9 +199,9 @@ pub(super) async fn run(state_path: &Path) -> Result<()> {
 }
 
 fn validate_state(state: &VerificationState) -> Result<()> {
-    ensure!(state.schema == "keldra.index-resource-verification.v1");
+    ensure!(state.schema == "keldra.index-resource-verification.v2");
     ensure!(state.records > 0 && state.final_live_objects <= state.records);
-    ensure!(state.final_generation > 0 && state.source_count > 0);
+    ensure!(state.final_commit_revision > 0 && state.source_count > 0);
     // This qualification workflow deletes a range immediately before its
     // equally-sized trailing update range. The inequality proves record zero
     // was neither deleted nor updated and therefore has one posting in the
@@ -247,12 +248,12 @@ mod tests {
     #[test]
     fn singleton_state_requires_record_zero_to_be_untouched() {
         let state = |records, live| VerificationState {
-            schema: "keldra.index-resource-verification.v1".into(),
+            schema: "keldra.index-resource-verification.v2".into(),
             tenant: "tenant".into(),
             bucket: "bucket".into(),
             records,
             final_live_objects: live,
-            final_generation: 1,
+            final_commit_revision: 1,
             source_count: 1,
         };
         assert!(validate_state(&state(16_384, 14_336)).is_ok());

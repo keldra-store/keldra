@@ -181,8 +181,8 @@ fn test_server_config(
         mutation_receipt_retention_seconds: 60,
         max_mutation_receipt_entries: 128,
         max_mutation_receipt_bytes: 1024 * 1024,
-        source_journal_max_entries: 128,
-        source_journal_max_bytes: 1024 * 1024,
+        source_journal_max_entries: 129,
+        source_journal_max_bytes: keldra_store::MAX_ATOMIC_BATCH_PUBLISHED_BYTES,
     }
 }
 

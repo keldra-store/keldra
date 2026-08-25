@@ -937,7 +937,7 @@ pub async fn publish_stream<S: ComponentBatchSink>(
 /// Publish a new routing tree over ordered existing or newly published data
 /// leaves. Only routing parents are written. Returned totals include every
 /// referenced data leaf as well as the new routing nodes, so callers can use
-/// them directly in segment and generation accounting.
+/// them directly in segment and commit accounting.
 pub async fn publish_descriptor_stream<S: ComponentBatchSink>(
     sink: &mut S,
     identity: SegmentIdentity,

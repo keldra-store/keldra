@@ -1,4 +1,5 @@
 use std::num::{NonZeroU8, NonZeroU32, NonZeroU64};
+use std::time::Duration;
 
 use keldra_index::IndexKind;
 use thiserror::Error;
@@ -18,7 +19,7 @@ const KINDS: [IndexKind; 8] = [
 ///
 /// Authoritative index bytes remain ordinary Keldra objects. The disk and
 /// memory values here only bound disposable local materialisations. Retention
-/// bounds apply per index and always preserve its current generation.
+/// bounds apply per index and always preserve its current committed view.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IndexRuntimeConfig {
     disk_cache_bytes: NonZeroU64,
@@ -27,6 +28,9 @@ pub struct IndexRuntimeConfig {
     builder_memory_bytes: [NonZeroU64; 8],
     projection_max_lanes: [NonZeroU32; 8],
     source_quantum_bytes: [NonZeroU64; 8],
+    segment_flush_bytes: [NonZeroU64; 8],
+    segment_flush_max_age_millis: NonZeroU64,
+    segment_flush_max_operations: [NonZeroU64; 8],
     external_sort_chunk_bytes: [NonZeroU64; 8],
     compaction_max_lanes: [NonZeroU32; 8],
     max_segments_per_tier: [NonZeroU32; 8],
@@ -36,18 +40,21 @@ pub struct IndexRuntimeConfig {
     query_work_quantum_bytes: NonZeroU64,
     query_memory_bytes: NonZeroU64,
     working_memory_bytes: Option<NonZeroU64>,
-    max_retained_generations: NonZeroU32,
-    max_generation_age_hours: NonZeroU64,
-    max_retained_generation_bytes: NonZeroU64,
+    max_retained_commit_revisions: NonZeroU32,
+    max_commit_revision_age_hours: NonZeroU64,
+    max_retained_commit_bytes: NonZeroU64,
 }
 
 impl IndexRuntimeConfig {
-    pub const MAX_RETAINED_GENERATIONS: u32 = 64;
+    pub const MAX_RETAINED_COMMIT_REVISIONS: u32 = 64;
     pub const DEFAULT_DISK_CACHE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
     pub const DEFAULT_MEMORY_PERCENT: u8 = 10;
     pub const DEFAULT_BUILDER_MEMORY_BYTES_PER_KIND: u64 = 256 * 1024 * 1024;
     pub const DEFAULT_PROJECTION_MAX_LANES: u32 = 4;
     pub const DEFAULT_SOURCE_QUANTUM_BYTES: u64 = 16 * 1024 * 1024;
+    pub const DEFAULT_SEGMENT_FLUSH_BYTES: u64 = 16 * 1024 * 1024;
+    pub const DEFAULT_SEGMENT_FLUSH_MAX_AGE_MILLIS: u64 = 1_000;
+    pub const DEFAULT_SEGMENT_FLUSH_MAX_OPERATIONS: u64 = 65_536;
     pub const DEFAULT_EXTERNAL_SORT_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
     /// Four lanes fit the default per-kind construction budget. Setting one
     /// explicitly preserves the byte-for-byte sequential compaction path.
@@ -58,18 +65,18 @@ impl IndexRuntimeConfig {
     pub const DEFAULT_QUERY_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
     pub const DEFAULT_MAX_SEGMENTS_PER_TIER: u32 = 64;
     pub const DEFAULT_MAX_UNMERGED_BYTES_PER_TIER: u64 = 1024 * 1024 * 1024;
-    pub const DEFAULT_MAX_RETAINED_GENERATIONS: u32 = 3;
-    pub const DEFAULT_MAX_GENERATION_AGE_HOURS: u64 = 24;
-    pub const DEFAULT_MAX_RETAINED_GENERATION_BYTES: u64 = 50 * 1024 * 1024 * 1024;
+    pub const DEFAULT_MAX_RETAINED_COMMIT_REVISIONS: u32 = 3;
+    pub const DEFAULT_MAX_COMMIT_REVISION_AGE_HOURS: u64 = 24;
+    pub const DEFAULT_MAX_RETAINED_COMMIT_BYTES: u64 = 50 * 1024 * 1024 * 1024;
 
     pub fn new(
         disk_cache_bytes: u64,
         memory_percent: u8,
         builder_memory_bytes_per_kind: u64,
         rayon_workers: u32,
-        max_retained_generations: u32,
-        max_generation_age_hours: u64,
-        max_retained_generation_bytes: u64,
+        max_retained_commit_revisions: u32,
+        max_commit_revision_age_hours: u64,
+        max_retained_commit_bytes: u64,
     ) -> Result<Self, IndexRuntimeConfigError> {
         let disk_cache_bytes =
             NonZeroU64::new(disk_cache_bytes).ok_or(IndexRuntimeConfigError::ZeroDiskCacheBytes)?;
@@ -85,18 +92,18 @@ impl IndexRuntimeConfig {
             .ok_or(IndexRuntimeConfigError::ZeroBuilderMemoryBytesPerKind)?;
         let rayon_workers =
             NonZeroU32::new(rayon_workers).ok_or(IndexRuntimeConfigError::ZeroRayonWorkers)?;
-        let max_retained_generations = NonZeroU32::new(max_retained_generations)
-            .ok_or(IndexRuntimeConfigError::ZeroRetainedGenerations)?;
-        if max_retained_generations.get() > Self::MAX_RETAINED_GENERATIONS {
-            return Err(IndexRuntimeConfigError::TooManyRetainedGenerations {
-                configured: max_retained_generations.get(),
-                maximum: Self::MAX_RETAINED_GENERATIONS,
+        let max_retained_commit_revisions = NonZeroU32::new(max_retained_commit_revisions)
+            .ok_or(IndexRuntimeConfigError::ZeroRetainedRevisions)?;
+        if max_retained_commit_revisions.get() > Self::MAX_RETAINED_COMMIT_REVISIONS {
+            return Err(IndexRuntimeConfigError::TooManyRetainedRevisions {
+                configured: max_retained_commit_revisions.get(),
+                maximum: Self::MAX_RETAINED_COMMIT_REVISIONS,
             });
         }
-        let max_generation_age_hours = NonZeroU64::new(max_generation_age_hours)
-            .ok_or(IndexRuntimeConfigError::ZeroGenerationAgeHours)?;
-        let max_retained_generation_bytes = NonZeroU64::new(max_retained_generation_bytes)
-            .ok_or(IndexRuntimeConfigError::ZeroRetainedGenerationBytes)?;
+        let max_commit_revision_age_hours = NonZeroU64::new(max_commit_revision_age_hours)
+            .ok_or(IndexRuntimeConfigError::ZeroRevisionAgeHours)?;
+        let max_retained_commit_bytes = NonZeroU64::new(max_retained_commit_bytes)
+            .ok_or(IndexRuntimeConfigError::ZeroRetainedRevisionBytes)?;
 
         Ok(Self {
             disk_cache_bytes,
@@ -108,6 +115,18 @@ impl IndexRuntimeConfig {
                 8],
             source_quantum_bytes: [NonZeroU64::new(Self::DEFAULT_SOURCE_QUANTUM_BYTES)
                 .expect("the default source quantum is positive");
+                8],
+            segment_flush_bytes: [NonZeroU64::new(Self::DEFAULT_SEGMENT_FLUSH_BYTES)
+                .expect("the default segment flush byte target is positive");
+                8],
+            segment_flush_max_age_millis: NonZeroU64::new(
+                Self::DEFAULT_SEGMENT_FLUSH_MAX_AGE_MILLIS,
+            )
+            .expect("the default segment flush maximum age is positive"),
+            segment_flush_max_operations: [NonZeroU64::new(
+                Self::DEFAULT_SEGMENT_FLUSH_MAX_OPERATIONS,
+            )
+            .expect("the default segment flush operation limit is positive");
                 8],
             external_sort_chunk_bytes: [NonZeroU64::new(Self::DEFAULT_EXTERNAL_SORT_CHUNK_BYTES)
                 .expect("the default external-sort chunk is positive");
@@ -131,9 +150,9 @@ impl IndexRuntimeConfig {
             query_memory_bytes: NonZeroU64::new(Self::DEFAULT_QUERY_MEMORY_BYTES)
                 .expect("the default query memory budget is positive"),
             working_memory_bytes: None,
-            max_retained_generations,
-            max_generation_age_hours,
-            max_retained_generation_bytes,
+            max_retained_commit_revisions,
+            max_commit_revision_age_hours,
+            max_retained_commit_bytes,
         })
     }
 
@@ -229,6 +248,37 @@ impl IndexRuntimeConfig {
 
     pub fn source_quantum_bytes(self, kind: IndexKind) -> u64 {
         self.source_quantum_bytes[kind_slot(kind)].get()
+    }
+
+    /// Accounted active-builder RAM which freezes one non-empty segment.
+    pub fn segment_flush_bytes(self, kind: IndexKind) -> u64 {
+        self.segment_flush_bytes[kind_slot(kind)].get()
+    }
+
+    /// Maximum age of the oldest mutation in a non-empty active segment.
+    pub fn segment_flush_max_age(self) -> Duration {
+        Duration::from_millis(self.segment_flush_max_age_millis.get())
+    }
+
+    /// Maximum complete source mutation units accumulated in one segment.
+    pub fn segment_flush_max_operations(self, kind: IndexKind) -> u64 {
+        self.segment_flush_max_operations[kind_slot(kind)].get()
+    }
+
+    pub fn with_segment_flush_boundaries(
+        mut self,
+        bytes: u64,
+        max_age_millis: u64,
+        max_operations: u64,
+    ) -> Result<Self, IndexRuntimeConfigError> {
+        self.segment_flush_bytes =
+            [NonZeroU64::new(bytes).ok_or(IndexRuntimeConfigError::ZeroSegmentFlushBytes)?; 8];
+        self.segment_flush_max_age_millis = NonZeroU64::new(max_age_millis)
+            .ok_or(IndexRuntimeConfigError::ZeroSegmentFlushMaxAgeMillis)?;
+        self.segment_flush_max_operations = [NonZeroU64::new(max_operations)
+            .ok_or(IndexRuntimeConfigError::ZeroSegmentFlushOperations)?;
+            8];
+        Ok(self)
     }
 
     pub fn external_sort_chunk_bytes(self, kind: IndexKind) -> u64 {
@@ -336,11 +386,11 @@ impl IndexRuntimeConfig {
         self.max_segments_per_tier[kind_slot(kind)] = NonZeroU32::new(max_segments_per_tier)
             .ok_or(IndexRuntimeConfigError::ZeroSegmentsPerTier(kind))?;
         if max_segments_per_tier as usize
-            > crate::index_runtime::generation::MAX_SEGMENTS_PER_GENERATION
+            > crate::index_runtime::committed_view::MAX_SEGMENTS_PER_COMMIT
         {
             return Err(IndexRuntimeConfigError::TooManySegmentsPerTier {
                 configured: max_segments_per_tier,
-                maximum: crate::index_runtime::generation::MAX_SEGMENTS_PER_GENERATION as u32,
+                maximum: crate::index_runtime::committed_view::MAX_SEGMENTS_PER_COMMIT as u32,
             });
         }
         self.max_unmerged_bytes_per_tier[kind_slot(kind)] =
@@ -353,16 +403,16 @@ impl IndexRuntimeConfig {
         self.max_unmerged_bytes_per_tier[kind_slot(kind)].get()
     }
 
-    pub fn max_retained_generations(self) -> u32 {
-        self.max_retained_generations.get()
+    pub fn max_retained_commit_revisions(self) -> u32 {
+        self.max_retained_commit_revisions.get()
     }
 
-    pub fn max_generation_age_hours(self) -> u64 {
-        self.max_generation_age_hours.get()
+    pub fn max_commit_revision_age_hours(self) -> u64 {
+        self.max_commit_revision_age_hours.get()
     }
 
-    pub fn max_retained_generation_bytes(self) -> u64 {
-        self.max_retained_generation_bytes.get()
+    pub fn max_retained_commit_bytes(self) -> u64 {
+        self.max_retained_commit_bytes.get()
     }
 }
 
@@ -377,9 +427,9 @@ impl Default for IndexRuntimeConfig {
             Self::DEFAULT_MEMORY_PERCENT,
             Self::DEFAULT_BUILDER_MEMORY_BYTES_PER_KIND,
             Self::DEFAULT_RAYON_WORKERS,
-            Self::DEFAULT_MAX_RETAINED_GENERATIONS,
-            Self::DEFAULT_MAX_GENERATION_AGE_HOURS,
-            Self::DEFAULT_MAX_RETAINED_GENERATION_BYTES,
+            Self::DEFAULT_MAX_RETAINED_COMMIT_REVISIONS,
+            Self::DEFAULT_MAX_COMMIT_REVISION_AGE_HOURS,
+            Self::DEFAULT_MAX_RETAINED_COMMIT_BYTES,
         )
         .expect("the built-in index runtime configuration must be valid")
     }
@@ -415,6 +465,12 @@ pub enum IndexRuntimeConfigError {
     ZeroProjectionLanesForKind(IndexKind),
     #[error("index source quantum for {0:?} must be greater than zero")]
     ZeroSourceQuantumForKind(IndexKind),
+    #[error("index segment flush byte target must be greater than zero")]
+    ZeroSegmentFlushBytes,
+    #[error("index segment flush maximum age milliseconds must be greater than zero")]
+    ZeroSegmentFlushMaxAgeMillis,
+    #[error("index segment flush operation limit must be greater than zero")]
+    ZeroSegmentFlushOperations,
     #[error("index external-sort chunk for {0:?} must be greater than zero")]
     ZeroExternalSortChunkForKind(IndexKind),
     #[error("maximum {0:?} index segments per size tier must be greater than zero")]
@@ -423,14 +479,14 @@ pub enum IndexRuntimeConfigError {
     ZeroUnmergedBytesPerTier(IndexKind),
     #[error("maximum index segments per size tier {configured} exceeds format bound {maximum}")]
     TooManySegmentsPerTier { configured: u32, maximum: u32 },
-    #[error("maximum retained index generations must be greater than zero")]
-    ZeroRetainedGenerations,
-    #[error("maximum retained index generations {configured} exceeds format bound {maximum}")]
-    TooManyRetainedGenerations { configured: u32, maximum: u32 },
-    #[error("maximum index generation age hours must be greater than zero")]
-    ZeroGenerationAgeHours,
-    #[error("maximum retained index generation bytes must be greater than zero")]
-    ZeroRetainedGenerationBytes,
+    #[error("maximum retained index commit revisions must be greater than zero")]
+    ZeroRetainedRevisions,
+    #[error("maximum retained index commit revisions {configured} exceeds format bound {maximum}")]
+    TooManyRetainedRevisions { configured: u32, maximum: u32 },
+    #[error("maximum index revision age hours must be greater than zero")]
+    ZeroRevisionAgeHours,
+    #[error("maximum retained index revision bytes must be greater than zero")]
+    ZeroRetainedRevisionBytes,
 }
 
 #[cfg(test)]
@@ -460,12 +516,14 @@ mod tests {
             assert_eq!(config.max_segments_per_tier(kind), 64);
             assert_eq!(config.max_unmerged_bytes_per_tier(kind), 1024 * 1024 * 1024);
         }
-        assert_eq!(config.max_retained_generations(), 3);
-        assert_eq!(config.max_generation_age_hours(), 24);
-        assert_eq!(
-            config.max_retained_generation_bytes(),
-            50 * 1024 * 1024 * 1024
-        );
+        for kind in KINDS {
+            assert_eq!(config.segment_flush_bytes(kind), 16 * 1024 * 1024);
+            assert_eq!(config.segment_flush_max_operations(kind), 65_536);
+        }
+        assert_eq!(config.segment_flush_max_age(), Duration::from_secs(1));
+        assert_eq!(config.max_retained_commit_revisions(), 3);
+        assert_eq!(config.max_commit_revision_age_hours(), 24);
+        assert_eq!(config.max_retained_commit_bytes(), 50 * 1024 * 1024 * 1024);
     }
 
     #[test]
@@ -477,9 +535,9 @@ mod tests {
                 defaults.memory_percent(),
                 defaults.builder_memory_bytes_per_kind(),
                 defaults.rayon_workers(),
-                defaults.max_retained_generations(),
-                defaults.max_generation_age_hours(),
-                defaults.max_retained_generation_bytes(),
+                defaults.max_retained_commit_revisions(),
+                defaults.max_commit_revision_age_hours(),
+                defaults.max_retained_commit_bytes(),
             ),
             Err(IndexRuntimeConfigError::ZeroDiskCacheBytes)
         );
@@ -489,9 +547,9 @@ mod tests {
                 0,
                 defaults.builder_memory_bytes_per_kind(),
                 defaults.rayon_workers(),
-                defaults.max_retained_generations(),
-                defaults.max_generation_age_hours(),
-                defaults.max_retained_generation_bytes(),
+                defaults.max_retained_commit_revisions(),
+                defaults.max_commit_revision_age_hours(),
+                defaults.max_retained_commit_bytes(),
             ),
             Err(IndexRuntimeConfigError::InvalidMemoryPercent(0))
         );
@@ -501,9 +559,9 @@ mod tests {
                 defaults.memory_percent(),
                 0,
                 defaults.rayon_workers(),
-                defaults.max_retained_generations(),
-                defaults.max_generation_age_hours(),
-                defaults.max_retained_generation_bytes(),
+                defaults.max_retained_commit_revisions(),
+                defaults.max_commit_revision_age_hours(),
+                defaults.max_retained_commit_bytes(),
             ),
             Err(IndexRuntimeConfigError::ZeroBuilderMemoryBytesPerKind)
         );
@@ -513,9 +571,9 @@ mod tests {
                 defaults.memory_percent(),
                 defaults.builder_memory_bytes_per_kind(),
                 0,
-                defaults.max_retained_generations(),
-                defaults.max_generation_age_hours(),
-                defaults.max_retained_generation_bytes(),
+                defaults.max_retained_commit_revisions(),
+                defaults.max_commit_revision_age_hours(),
+                defaults.max_retained_commit_bytes(),
             ),
             Err(IndexRuntimeConfigError::ZeroRayonWorkers)
         );
@@ -526,10 +584,10 @@ mod tests {
                 defaults.builder_memory_bytes_per_kind(),
                 defaults.rayon_workers(),
                 0,
-                defaults.max_generation_age_hours(),
-                defaults.max_retained_generation_bytes(),
+                defaults.max_commit_revision_age_hours(),
+                defaults.max_retained_commit_bytes(),
             ),
-            Err(IndexRuntimeConfigError::ZeroRetainedGenerations)
+            Err(IndexRuntimeConfigError::ZeroRetainedRevisions)
         );
         assert_eq!(
             IndexRuntimeConfig::new(
@@ -537,11 +595,11 @@ mod tests {
                 defaults.memory_percent(),
                 defaults.builder_memory_bytes_per_kind(),
                 defaults.rayon_workers(),
-                defaults.max_retained_generations(),
+                defaults.max_retained_commit_revisions(),
                 0,
-                defaults.max_retained_generation_bytes(),
+                defaults.max_retained_commit_bytes(),
             ),
-            Err(IndexRuntimeConfigError::ZeroGenerationAgeHours)
+            Err(IndexRuntimeConfigError::ZeroRevisionAgeHours)
         );
         assert_eq!(
             IndexRuntimeConfig::new(
@@ -549,11 +607,34 @@ mod tests {
                 defaults.memory_percent(),
                 defaults.builder_memory_bytes_per_kind(),
                 defaults.rayon_workers(),
-                defaults.max_retained_generations(),
-                defaults.max_generation_age_hours(),
+                defaults.max_retained_commit_revisions(),
+                defaults.max_commit_revision_age_hours(),
                 0,
             ),
-            Err(IndexRuntimeConfigError::ZeroRetainedGenerationBytes)
+            Err(IndexRuntimeConfigError::ZeroRetainedRevisionBytes)
+        );
+    }
+
+    #[test]
+    fn segment_flush_boundaries_are_explicit_and_nonzero() {
+        let config = IndexRuntimeConfig::default()
+            .with_segment_flush_boundaries(8 * 1024 * 1024, 250, 4_096)
+            .unwrap();
+        assert_eq!(config.segment_flush_bytes(IndexKind::Path), 8 * 1024 * 1024);
+        assert_eq!(config.segment_flush_max_age(), Duration::from_millis(250));
+        assert_eq!(config.segment_flush_max_operations(IndexKind::Path), 4_096);
+
+        assert_eq!(
+            IndexRuntimeConfig::default().with_segment_flush_boundaries(0, 1, 1),
+            Err(IndexRuntimeConfigError::ZeroSegmentFlushBytes)
+        );
+        assert_eq!(
+            IndexRuntimeConfig::default().with_segment_flush_boundaries(1, 0, 1),
+            Err(IndexRuntimeConfigError::ZeroSegmentFlushMaxAgeMillis)
+        );
+        assert_eq!(
+            IndexRuntimeConfig::default().with_segment_flush_boundaries(1, 1, 0),
+            Err(IndexRuntimeConfigError::ZeroSegmentFlushOperations)
         );
     }
 
@@ -607,13 +688,13 @@ mod tests {
                 10,
                 256 * 1024 * 1024,
                 4,
-                IndexRuntimeConfig::MAX_RETAINED_GENERATIONS + 1,
+                IndexRuntimeConfig::MAX_RETAINED_COMMIT_REVISIONS + 1,
                 24,
                 50 * 1024 * 1024 * 1024,
             ),
-            Err(IndexRuntimeConfigError::TooManyRetainedGenerations {
-                configured: IndexRuntimeConfig::MAX_RETAINED_GENERATIONS + 1,
-                maximum: IndexRuntimeConfig::MAX_RETAINED_GENERATIONS,
+            Err(IndexRuntimeConfigError::TooManyRetainedRevisions {
+                configured: IndexRuntimeConfig::MAX_RETAINED_COMMIT_REVISIONS + 1,
+                maximum: IndexRuntimeConfig::MAX_RETAINED_COMMIT_REVISIONS,
             })
         );
         assert!(
@@ -622,7 +703,7 @@ mod tests {
                 10,
                 256 * 1024 * 1024,
                 4,
-                IndexRuntimeConfig::MAX_RETAINED_GENERATIONS,
+                IndexRuntimeConfig::MAX_RETAINED_COMMIT_REVISIONS,
                 24,
                 50 * 1024 * 1024 * 1024,
             )

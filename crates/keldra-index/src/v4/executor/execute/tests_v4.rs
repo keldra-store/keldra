@@ -1315,7 +1315,7 @@ async fn facets_and_aggregates_are_exact_and_observed() {
 }
 
 #[tokio::test]
-async fn query_admission_checks_computations_and_empty_generation_cursors() {
+async fn query_admission_checks_computations_and_empty_commit_cursors() {
     let (schema, segment, _) = fixture().await;
     let mut non_filter = request(
         &schema,
@@ -1415,11 +1415,11 @@ async fn path_and_metadata_filter_complete_the_all_kind_native_matrix() {
 }
 
 #[tokio::test]
-async fn executor_fails_closed_on_generation_corruption_and_resource_limits() {
+async fn executor_fails_closed_on_commit_corruption_and_resource_limits() {
     let (schema, segment, directory) = fixture().await;
-    let mut wrong_generation = segment.clone();
-    wrong_generation.identity.definition_version += 1;
-    wrong_generation.identity.segment_id += 1;
+    let mut wrong_commit = segment.clone();
+    wrong_commit.identity.definition_version += 1;
+    wrong_commit.identity.segment_id += 1;
     let mut invalid = request(
         &schema,
         &segment,
@@ -1428,7 +1428,7 @@ async fn executor_fails_closed_on_generation_corruption_and_resource_limits() {
             order: Vec::new(),
         },
     );
-    invalid.segments.push(wrong_generation);
+    invalid.segments.push(wrong_commit);
     assert!(invalid.validate().is_err());
 
     let limited = NativeQueryExecutor::new(

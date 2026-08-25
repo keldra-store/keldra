@@ -184,6 +184,7 @@ fn change_at_path(
         exact_path: path.to_owned(),
         path_version: VersionId(offset),
         kind: ObjectHeadChangeKind::Put,
+        program_commit_cursor: None,
         reference_deltas: Vec::<ReferenceDelta>::new(),
         accounting_transition: None,
         definition_transition: None,
@@ -294,7 +295,6 @@ fn snapshot_tails_form_the_exact_active_source_vector() {
     assert_eq!(barrier.atomic, clear);
     assert_eq!(barrier.sources[&NodeId(1)].next_offset, 9);
     assert_eq!(barrier.sources[&NodeId(2)].next_offset, 14);
-    assert_eq!(journal.last_observed_barrier(), Some(barrier));
 }
 
 #[test]
@@ -395,7 +395,7 @@ async fn concurrent_atomic_commit_invalidates_tail_capture() {
 }
 
 #[tokio::test]
-async fn unfinalized_atomic_tail_cannot_form_a_generation_barrier() {
+async fn unfinalized_atomic_tail_cannot_form_a_commit_barrier() {
     let pending = AtomicProgramWatermark::new(Some(41), Some(40), 1);
     let error = journal(vec![placement(pending)], &MemorySources::default())
         .capture_barrier()
@@ -465,7 +465,7 @@ async fn bounded_pages_advance_every_source_through_the_exact_vector() {
 }
 
 #[tokio::test]
-async fn routed_effects_do_no_source_reads_for_an_idle_vector() {
+async fn routed_index_effects_do_no_source_reads_for_an_idle_vector() {
     let clear = AtomicProgramWatermark::new(None, None, 0);
     let sources = MemorySources::default();
     sources
@@ -484,7 +484,7 @@ async fn routed_effects_do_no_source_reads_for_an_idle_vector() {
         .unwrap();
 
     let effects = journal(vec![placement(clear)], &sources)
-        .routed_effects(1, 2, &barrier, &barrier)
+        .routed_index_effects(1, 2, &barrier, &barrier)
         .await
         .unwrap();
 
@@ -493,7 +493,7 @@ async fn routed_effects_do_no_source_reads_for_an_idle_vector() {
 }
 
 #[tokio::test]
-async fn routed_effects_never_fetch_or_process_an_irrelevant_bucket() {
+async fn routed_index_effects_never_fetch_or_process_an_irrelevant_bucket() {
     let clear = AtomicProgramWatermark::new(None, None, 0);
     let sources = MemorySources::default();
     sources.journals.lock().unwrap().insert(
@@ -513,7 +513,7 @@ async fn routed_effects_never_fetch_or_process_an_irrelevant_bucket() {
     from.sources.get_mut(&NodeId(1)).unwrap().next_offset = 1;
 
     let effects = journal(vec![placement(clear)], &sources)
-        .routed_effects(1, 2, &from, &target)
+        .routed_index_effects(1, 2, &from, &target)
         .await
         .unwrap();
 
@@ -529,7 +529,7 @@ async fn routed_effects_never_fetch_or_process_an_irrelevant_bucket() {
 }
 
 #[tokio::test]
-async fn routed_effects_report_only_the_relevant_sources_newest_offset() {
+async fn routed_index_effects_report_only_the_relevant_sources_newest_offset() {
     let clear = AtomicProgramWatermark::new(None, None, 0);
     let sources = MemorySources::default();
     sources.journals.lock().unwrap().insert(
@@ -556,11 +556,21 @@ async fn routed_effects_report_only_the_relevant_sources_newest_offset() {
     from.sources.get_mut(&NodeId(1)).unwrap().next_offset = 1;
 
     let effects = journal(vec![placement(clear)], &sources)
-        .routed_effects(1, 2, &from, &target)
+        .routed_index_effects(1, 2, &from, &target)
         .await
         .unwrap();
 
-    assert_eq!(effects, BTreeMap::from([(source_id(1), 4)]));
+    assert_eq!(
+        effects,
+        BTreeMap::from([(
+            source_id(1),
+            RoutedSourceEffect {
+                next_offset: 4,
+                required_atomic_cursor: None,
+                atomic_hold_next: None,
+            },
+        )])
+    );
     assert!(
         sources
             .reads

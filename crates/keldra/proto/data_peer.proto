@@ -96,6 +96,22 @@ message CurrentObjectSnapshotBatchResponse {
   bytes snapshots_json = 2;
 }
 
+// One bounded ordered read of immutable version descriptors. `exact_paths`
+// and `version_ids` are parallel arrays; `versions_json` encodes
+// `Vec<Option<keldra_store::Version>>` in request order.
+message ExactObjectVersionBatchRequest {
+  PeerContext peer = 1;
+  uint64 tenant_id = 2;
+  uint64 bucket_id = 3;
+  repeated string exact_paths = 4;
+  repeated uint64 version_ids = 5;
+}
+
+message ExactObjectVersionBatchResponse {
+  uint32 schema_version = 1;
+  bytes versions_json = 2;
+}
+
 message RepairObjectPathSnapshotRequest {
   PeerContext peer = 1;
   uint64 tenant_id = 2;
@@ -577,6 +593,7 @@ service DataPeer {
   rpc ReadObjectPathSnapshot(ObjectPathSnapshotRequest) returns (ObjectPathSnapshotResponse);
   rpc ReadCurrentObjectSnapshot(ObjectPathSnapshotRequest) returns (CurrentObjectSnapshotResponse);
   rpc ReadCurrentObjectSnapshots(CurrentObjectSnapshotBatchRequest) returns (CurrentObjectSnapshotBatchResponse);
+  rpc ReadExactObjectVersions(ExactObjectVersionBatchRequest) returns (ExactObjectVersionBatchResponse);
   rpc RepairObjectPathSnapshot(RepairObjectPathSnapshotRequest) returns (ObjectPathSnapshotApplied);
   rpc ApplyAuthzRealmMutation(TypedMutationRequest) returns (AuthzRealmMutationApplied);
   rpc ApplyReferenceDeltas(TypedMutationRequest) returns (ReferenceDeltaApplied);

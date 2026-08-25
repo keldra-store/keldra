@@ -36,7 +36,7 @@ impl Store {
         let before = self
             .local_watch_status()
             .map_err(|error| MutationError::Storage(error.to_string()))?;
-        self.enforce_local_watch_retention()
+        self.enforce_local_watch_retention_inner(true)
             .map_err(|error| MutationError::Storage(error.to_string()))?;
         let after = self
             .local_watch_status()
@@ -141,6 +141,10 @@ impl Store {
     }
 
     pub(super) fn enforce_local_watch_retention(&self) -> Result<(), WatchError> {
+        self.enforce_local_watch_retention_inner(false)
+    }
+
+    fn enforce_local_watch_retention_inner(&self, force_headroom: bool) -> Result<(), WatchError> {
         let journal = self
             .cf(CF_LOCAL_INVALIDATIONS)
             .map_err(|error| WatchError::Storage(error.to_string()))?;
@@ -148,7 +152,8 @@ impl Store {
             .cf(CF_METADATA)
             .map_err(|error| WatchError::Storage(error.to_string()))?;
         let mut status = self.local_watch_status()?;
-        if status.retained_entries <= self.watch_retention.max_entries
+        if !force_headroom
+            && status.retained_entries <= self.watch_retention.max_entries
             && status.retained_bytes <= self.watch_retention.max_bytes
         {
             return Ok(());
@@ -164,8 +169,12 @@ impl Store {
         let safe_through = reference_safe_through
             .min(index_safe_through)
             .min(accounting_safe_through);
+        let mut retired_version_keys = BTreeSet::new();
+        let mut delayed_releases = Vec::new();
+        let mut pruned_records = 0_u64;
         while (status.retained_entries > self.watch_retention.max_entries
-            || status.retained_bytes > self.watch_retention.max_bytes)
+            || status.retained_bytes > self.watch_retention.max_bytes
+            || (force_headroom && pruned_records == 0))
             && status.retention_floor < safe_through
         {
             let offset = status.retention_floor.checked_add(1).ok_or_else(|| {
@@ -194,8 +203,19 @@ impl Store {
                 &pruned_change,
             )
             .map_err(|error| WatchError::Storage(error.to_string()))?;
+            if let Some(release) = self
+                .stage_pruned_change_version_retirement(
+                    &mut batch,
+                    &mut retired_version_keys,
+                    &pruned_change,
+                )
+                .map_err(|error| WatchError::Storage(error.to_string()))?
+            {
+                delayed_releases.push(release);
+            }
             batch.delete_cf(journal, invalidation_key(offset));
             status.retention_floor = offset;
+            pruned_records += 1;
             status.retained_entries -= 1;
             status.retained_bytes = status
                 .retained_bytes
@@ -206,6 +226,48 @@ impl Store {
                     WatchError::Storage("local invalidation byte accounting is inconsistent".into())
                 })?;
         }
+        for release in delayed_releases {
+            let PendingLocalChange::ContentLifecycleChanged {
+                blob_identity,
+                revision,
+                reference_deltas,
+                accounting_transition,
+            } = release
+            else {
+                unreachable!("source-version retirement emits one lifecycle release")
+            };
+            status.tail = status.tail.checked_add(1).ok_or_else(|| {
+                WatchError::Storage("local invalidation offset is exhausted".into())
+            })?;
+            let release = LocalChange::content_lifecycle_changed(
+                status.tail,
+                blob_identity,
+                revision,
+                reference_deltas,
+                accounting_transition,
+            );
+            let encoded = encode_local_change(&release)
+                .map_err(|error| WatchError::Storage(error.to_string()))?;
+            let logical_bytes = invalidation_record_bytes(encoded.len())
+                .saturating_add(super::journal_routes::journal_route_logical_bytes(&release));
+            self.stage_journal_routes(&mut batch, status.source_id.source_epoch, &release)
+                .map_err(|error| WatchError::Storage(error.to_string()))?;
+            batch.put_cf(journal, invalidation_key(status.tail), encoded);
+            status.retained_entries = status.retained_entries.checked_add(1).ok_or_else(|| {
+                WatchError::Storage("local invalidation entry count is exhausted".into())
+            })?;
+            status.retained_bytes = status
+                .retained_bytes
+                .checked_add(logical_bytes)
+                .ok_or_else(|| {
+                    WatchError::Storage("local invalidation byte count is exhausted".into())
+                })?;
+        }
+        batch.put_cf(
+            metadata,
+            LOCAL_INVALIDATION_OFFSET_KEY,
+            status.tail.to_be_bytes(),
+        );
         batch.put_cf(
             metadata,
             LOCAL_INVALIDATION_FLOOR_KEY,
@@ -397,6 +459,11 @@ mod tests {
                 .progress_debt_entries(),
             0
         );
+        // The first pass repays publication debt without admitting an
+        // ordinary append in the same batch. A second forced pass creates
+        // ordinary headroom, just as the production retry loop does when its
+        // first retry still observes a full (but no longer indebted) journal.
+        assert!(store.prune_source_journal_for_capacity().await.unwrap());
         assert!(
             store.bulk_write(vec![put("source", "after-prune")]).await[0]
                 .result

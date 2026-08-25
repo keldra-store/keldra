@@ -62,45 +62,45 @@ log_word_field() {
   return 1
 }
 
-matching_publication_authoritative_bytes() {
+matching_publication_committed_artifact_bytes() {
   local prefix="$1"
   local expected_index_id="$2"
-  local expected_generation="$3"
-  local authoritative_bytes=0
+  local expected_commit_revision="$3"
+  local committed_artifact_bytes=0
   local count=0
   local file
-  local generation
+  local commit_revision
   local index_id
   local line
   while IFS= read -r file; do
     while IFS= read -r line; do
       index_id="$(log_span_unsigned_field index.id "${line}")" || continue
-      generation="$(log_span_unsigned_field generation "${line}")" || continue
+      commit_revision="$(log_span_unsigned_field revision "${line}")" || continue
       [[ "${index_id}" == "${expected_index_id}" \
-        && "${generation}" == "${expected_generation}" ]] || continue
-      authoritative_bytes="$(
-        log_span_unsigned_field publication.authoritative_bytes "${line}"
+        && "${commit_revision}" == "${expected_commit_revision}" ]] || continue
+      committed_artifact_bytes="$(
+        log_span_unsigned_field publication.committed_artifact_bytes "${line}"
       )" || return 1
       count=$((count + 1))
     done < <(
       awk '
         index($0, "index.kind=TypedJson") &&
-        index($0, "index generation publication metrics")
+        index($0, "index commit publication metrics")
       ' "${file}"
     )
   done < <(telemetry_files "${prefix}")
-  if ((count != 1 || authoritative_bytes == 0)); then
-    echo "TypedJson incident generation matched ${count} publication records; expected exactly one" >&2
+  if ((count != 1 || committed_artifact_bytes == 0)); then
+    echo "TypedJson incident commit_revision matched ${count} publication records; expected exactly one" >&2
     return 1
   fi
-  printf '%s\n' "${authoritative_bytes}"
+  printf '%s\n' "${committed_artifact_bytes}"
 }
 
 incident_query_terminal_json() {
   local name="$1"
   local expected_index_id="$2"
   local expected_definition_version="$3"
-  local expected_generation="$4"
+  local expected_commit_revision="$4"
   local expected_hits="$5"
   local physical_fetches="$6"
   local physical_fetch_bytes="$7"
@@ -157,7 +157,7 @@ incident_query_terminal_json() {
     || return 1
   [[ "$(log_span_unsigned_field definition.version "${line}")" \
     == "${expected_definition_version}" ]] || return 1
-  [[ "$(log_span_unsigned_field generation "${line}")" == "${expected_generation}" ]] \
+  [[ "$(log_span_unsigned_field revision "${line}")" == "${expected_commit_revision}" ]] \
     || return 1
   log_field_equals query.outcome completed "${line}" || return 1
   tier="$(log_word_field index.tier "${line}")" || return 1
@@ -182,7 +182,7 @@ incident_query_terminal_json() {
     --arg tier "${tier}" \
     --argjson index_id "${expected_index_id}" \
     --argjson definition_version "${expected_definition_version}" \
-    --argjson generation "${expected_generation}" \
+    --argjson commit_revision "${expected_commit_revision}" \
     --argjson expected_hits "${expected_hits}" \
     --argjson physical_fetches "${physical_fetches}" \
     --argjson physical_fetch_bytes "${physical_fetch_bytes}" \
@@ -193,7 +193,7 @@ incident_query_terminal_json() {
         name: $name,
         index_id: $index_id,
         definition_version: $definition_version,
-        generation: $generation,
+        commit_revision: $commit_revision,
         tier: $tier,
         expected_hits: $expected_hits,
         logical_read_ops: $c["monotonic_counter.keldra_index_query_read_ops_total"],
@@ -216,12 +216,12 @@ write_incident_query_evidence() {
   local client_report="$2"
   local telemetry_prefix="$3"
   local output="$4"
-  local authoritative_bytes
+  local committed_artifact_bytes
   local candidate_count=0
   local corpus_records
   local expected_computation_documents
   local expected_definition_version
-  local expected_generation
+  local expected_commit_revision
   local expected_index_id
   local file
   local line
@@ -250,20 +250,20 @@ write_incident_query_evidence() {
   expected_definition_version="$(
     jq -er '.production_query_regression.definition_version' "${client_report}"
   )"
-  expected_generation="$(jq -er '.production_query_regression.generation' "${client_report}")"
+  expected_commit_revision="$(jq -er '.production_query_regression.commit_revision' "${client_report}")"
   expected_computation_documents="$(
     jq -er '.production_query_regression.exact_computations.matching_documents' "${client_report}"
   )"
   corpus_records="$(jq -er '.records' "${client_report}")"
   if [[ "${expected_index_id}" == "0" ]] \
-    || ((expected_definition_version == 0 || expected_generation == 0 || corpus_records == 0))
+    || ((expected_definition_version == 0 || expected_commit_revision == 0 || corpus_records == 0))
   then
     echo "incident-query client report omitted its immutable index identity" >&2
     return 1
   fi
-  authoritative_bytes="$(matching_publication_authoritative_bytes \
-    "${telemetry_prefix}" "${expected_index_id}" "${expected_generation}")"
-  publication_bytes_ceiling=$((authoritative_bytes / 4))
+  committed_artifact_bytes="$(matching_publication_committed_artifact_bytes \
+    "${telemetry_prefix}" "${expected_index_id}" "${expected_commit_revision}")"
+  publication_bytes_ceiling=$((committed_artifact_bytes / 4))
   record_ceiling=$((corpus_records / 4))
   ((publication_bytes_ceiling > 0)) || publication_bytes_ceiling=1
   ((record_ceiling > 0)) || record_ceiling=1
@@ -322,9 +322,9 @@ write_incident_query_evidence() {
           [[ "$(log_span_unsigned_field definition.version \
             "${file_lines[start + position]}" || true)" \
             == "${expected_definition_version}" ]] || break
-          [[ "$(log_span_unsigned_field generation \
+          [[ "$(log_span_unsigned_field revision \
             "${file_lines[start + position]}" || true)" \
-            == "${expected_generation}" ]] || break
+            == "${expected_commit_revision}" ]] || break
         done
       fi
       if ((position == query_count)); then
@@ -352,7 +352,7 @@ write_incident_query_evidence() {
       "${names[position]}" \
       "${expected_index_id}" \
       "${expected_definition_version}" \
-      "${expected_generation}" \
+      "${expected_commit_revision}" \
       "${expected_hits[position]}" \
       "${selected_fetches[position]}" \
       "${selected_fetch_bytes[position]}" \
@@ -363,14 +363,14 @@ write_incident_query_evidence() {
   done
 
   jq -s \
-    --arg schema keldra.index-production-query-server-evidence.v1 \
+    --arg schema keldra.index-production-query-server-evidence.v2 \
     --arg topology "${topology}" \
     --arg source_commit "${source_commit}" \
     --argjson corpus_records "${corpus_records}" \
     --argjson index_id "${expected_index_id}" \
     --argjson definition_version "${expected_definition_version}" \
-    --argjson generation "${expected_generation}" \
-    --argjson authoritative_bytes "${authoritative_bytes}" \
+    --argjson commit_revision "${expected_commit_revision}" \
+    --argjson committed_artifact_bytes "${committed_artifact_bytes}" \
     --argjson publication_bytes_ceiling "${publication_bytes_ceiling}" \
     --argjson record_ceiling "${record_ceiling}" \
     --argjson expected_computation_documents "${expected_computation_documents}" '
@@ -382,8 +382,8 @@ write_incident_query_evidence() {
         corpus_records: $corpus_records,
         index_id: $index_id,
         definition_version: $definition_version,
-        generation: $generation,
-        authoritative_generation_bytes: $authoritative_bytes,
+        commit_revision: $commit_revision,
+        committed_artifact_bytes: $committed_artifact_bytes,
         ordered_query_logical_read_bytes_ceiling: $publication_bytes_ceiling,
         ordered_query_candidate_doc_ids_ceiling: $record_ceiling,
         queries: $queries,
@@ -401,7 +401,7 @@ write_incident_query_evidence() {
           ($queries | all(
             .index_id == $index_id and
             .definition_version == $definition_version and
-            .generation == $generation and
+            .commit_revision == $commit_revision and
             .terminal_counters["monotonic_counter.keldra_index_query_failures_total"] == 0 and
             .terminal_counters["monotonic_counter.keldra_index_query_cancellations_total"] == 0 and
             .logical_read_ops > 0 and .logical_read_bytes > 0 and .duration_seconds > 0
@@ -488,30 +488,30 @@ isolated_typed_json_query_work() {
 matching_publication_segment_count() {
   local prefix="$1"
   local expected_index_id="$2"
-  local expected_generation="$3"
+  local expected_commit_revision="$3"
   local count=0
   local file
-  local generation
+  local commit_revision
   local index_id
   local line
   local segments=0
   while IFS= read -r file; do
     while IFS= read -r line; do
       index_id="$(log_span_unsigned_field index.id "${line}")" || continue
-      generation="$(log_span_unsigned_field generation "${line}")" || continue
+      commit_revision="$(log_span_unsigned_field revision "${line}")" || continue
       [[ "${index_id}" == "${expected_index_id}" \
-        && "${generation}" == "${expected_generation}" ]] || continue
+        && "${commit_revision}" == "${expected_commit_revision}" ]] || continue
       segments="$(log_span_unsigned_field publication.segments "${line}")" || return 1
       count=$((count + 1))
     done < <(
       awk '
         index($0, "index.kind=TypedJson") &&
-        index($0, "index generation publication metrics")
+        index($0, "index commit publication metrics")
       ' "${file}"
     )
   done < <(telemetry_files "${prefix}")
   if ((count != 1 || segments == 0)); then
-    echo "TypedJson probe generation matched ${count} publication records; expected exactly one" >&2
+    echo "TypedJson probe commit_revision matched ${count} publication records; expected exactly one" >&2
     return 1
   fi
   printf '%s\n' "${segments}"
@@ -624,7 +624,7 @@ capture_scale_publication_evidence() {
   fi
   awk '
     index($0, "index.kind=TypedJson") &&
-    index($0, "index generation publication metrics")
+    index($0, "index commit publication metrics")
   ' "${sources[@]}" >"${prefix}.log"
   while IFS= read -r file; do
     chmod 0600 "${file}"
@@ -714,7 +714,7 @@ run_scale_singleton_probe() {
   capture_scale_publication_evidence \
     "${topology}" "${publication_telemetry_prefix}"
 
-  local generation
+  local commit_revision
   local index_id
   local records
   jq -e \
@@ -722,19 +722,19 @@ run_scale_singleton_probe() {
     --arg tenant "${index_resource_tenant}" \
     --arg bucket "${index_resource_bucket}" \
     --argjson expected_sources "${expected_sources}" '
-      .schema == "keldra.index-resource-singleton-probe.v1" and
+      .schema == "keldra.index-resource-singleton-probe.v2" and
       .endpoint == $endpoint and .tenant == $tenant and .bucket == $bucket and
       .index_name == "records-by-field" and .field == "record_id" and
       .operator == "EQUAL" and .value_json == "0" and
       .expected_path == "records/000000000000.json" and
       .source_count == $expected_sources and .returned_hits == 1 and
-      .index_id > 0 and .definition_version > 0 and .generation > 0 and
+      .index_id > 0 and .definition_version > 0 and .commit_revision > 0 and
       .placement_term > 0 and .placement_index > 0 and .object_version > 0 and
       .started_at_unix_millis <= .completed_at_unix_millis and
       .elapsed_milliseconds >= 0
     ' "${probe_report}" >/dev/null
   index_id="$(jq -er '.index_id' "${probe_report}")"
-  generation="$(jq -er '.generation' "${probe_report}")"
+  commit_revision="$(jq -er '.commit_revision' "${probe_report}")"
   records="$(jq -er '.records' "${index_resource_report}")"
 
   local query_ops
@@ -744,7 +744,7 @@ run_scale_singleton_probe() {
   read -r query_ops query_bytes \
     < <(isolated_typed_json_query_work "${probe_telemetry_prefix}" "${index_id}")
   publication_segments="$(matching_publication_segment_count \
-    "${publication_telemetry_prefix}" "${index_id}" "${generation}")"
+    "${publication_telemetry_prefix}" "${index_id}" "${commit_revision}")"
   # This exact, single-valued keyword equality probe uses at most four
   # component streams per segment: term dictionary, posting, live mask, and
   # identity. Each stream traverses no more than the eight routing levels plus
@@ -758,7 +758,7 @@ run_scale_singleton_probe() {
   fi
 
   jq -n \
-    --arg schema keldra.index-scale-singleton-query-proof.v2 \
+    --arg schema keldra.index-scale-singleton-query-proof.v3 \
     --arg source_commit "${source_commit}" \
     --argjson records "${records}" \
     --argjson expected_sources "${expected_sources}" \
@@ -775,7 +775,7 @@ run_scale_singleton_probe() {
         freshness: {expected_sources: $expected_sources, client_validated_complete_zero_lag: true},
         server_telemetry: {
           isolated_terminal_events: 1,
-          generation_publication_events: 1,
+          commit_publication_events: 1,
           publication_segments: $publication_segments,
           query_read_ops: $query_ops,
           query_read_bytes: $query_bytes,
@@ -935,7 +935,7 @@ write_scale_comparison_report() {
     return 1
   fi
   jq -n \
-    --arg schema keldra.index-scale-comparison.v2 \
+    --arg schema keldra.index-scale-comparison.v3 \
     --argjson small_records "${small_records}" \
     --argjson large_records "${large_records}" \
     --argjson debt_segment_limit "${large_debt_segments}" \

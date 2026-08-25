@@ -69,6 +69,12 @@ impl DistributedIndexQueryExecutor {
                     resume: request.resume,
                     candidate_visibility: local_visibility,
                     authorization_revision: local_authorization_revision,
+                    required_freshness: request.required_freshness,
+                    deadline: tokio::time::Instant::now()
+                        .checked_add(remaining)
+                        .ok_or_else(|| {
+                            Status::invalid_argument("index query deadline overflowed")
+                        })?,
                 })
                 .await?;
             require_local_authorization_revision(&result, local_authorization_revision)?;
@@ -112,6 +118,7 @@ impl IndexQueryExecutor for DistributedIndexQueryExecutor {
             query: request.query.clone(),
             limit: request.limit,
             resume: request.resume.clone(),
+            required_freshness: request.required_freshness.clone(),
         };
         let placement_ref = &placement;
         let bearer_ref = bearer.as_str();
@@ -279,7 +286,7 @@ mod tests {
         assert!(retryable_owner_failure(&Status::unavailable("transport")));
         for error in [
             Status::deadline_exceeded("query deadline"),
-            Status::failed_precondition("generation changed"),
+            Status::failed_precondition("commit revision changed"),
             Status::permission_denied("not authorized"),
             Status::data_loss("corrupt artifact"),
             Status::resource_exhausted("query budget"),

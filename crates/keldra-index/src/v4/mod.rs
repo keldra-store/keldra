@@ -58,8 +58,8 @@ pub use locator::{
     DocIdRange, LocatorEntry, LocatorValue, PathLocatorBlock, merge_locator_entries,
 };
 pub use model::{
-    ComponentKind, DocId, INDEX_ARTIFACT_PACK_BYTES, INDEX_COMPONENT_BYTES, INDEX_DECODE_BYTES,
-    INDEX_FORMAT_VERSION, INDEX_GENERATION_SEGMENTS, INDEX_ROUTING_FANOUT, INDEX_ROUTING_HEIGHT,
+    ComponentKind, DocId, INDEX_ARTIFACT_PACK_BYTES, INDEX_COMMIT_SEGMENTS, INDEX_COMPONENT_BYTES,
+    INDEX_DECODE_BYTES, INDEX_FORMAT_VERSION, INDEX_ROUTING_FANOUT, INDEX_ROUTING_HEIGHT,
     INDEX_ROUTING_KEY_BYTES, INDEX_TERM_BYTES, SegmentIdentity, component_ordinal_key,
     decode_component_ordinal_key,
 };
@@ -83,7 +83,7 @@ pub use query::{
 pub use reader::{ComponentStream, StreamLeaf, StreamTotals};
 pub use routing::{RoutingEntry, RoutingNode};
 pub use scan::{
-    AuthorizationScope, CandidateIdentity, GenerationSelection, Predicate, PredicateId,
+    AuthorizationScope, CandidateIdentity, CommitSelection, Predicate, PredicateId,
     PredicatePushdown, RangeBound, ScanBatch, ScanCapabilities, ScanColumn, ScanRequest,
     SortCursor, SortValue,
 };

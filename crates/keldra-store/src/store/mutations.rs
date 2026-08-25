@@ -1,4 +1,8 @@
 use super::journal_capacity::SourceJournalAdmission;
+use super::mutation_helpers::{
+    definition_mutation_error, definition_receipt_matches_intent, exact_version_key,
+    fail_unresolved_prepared, is_mutation_capacity, live_version_length, mutation_capacity_kind,
+};
 use super::mutation_prefetch::MutationReadCache;
 use super::mutation_types::{DistributedEvaluationContext, EvaluatedOperation};
 use super::*;
@@ -6,37 +10,10 @@ use crate::model::{
     CoordinatedObjectMutation, MUTATION_STAMP_FORMAT, MutationStamp, OBJECT_MUTATION_FORMAT,
     ObjectMutation, ObjectMutationContext, ObjectMutationGovernance, ReplicaObjectMutationApplied,
 };
-use crate::{
-    DefinitionMutationIntent, DefinitionOperation, DefinitionStateError, DefinitionTransition,
-};
+use crate::{DefinitionMutationIntent, DefinitionOperation, DefinitionTransition};
 
 const MAX_EXPIRED_RECEIPTS_PRUNED_PER_PASS: usize = 1_024;
 const MAX_EXPIRED_RECEIPT_BYTES_PRUNED_PER_PASS: u64 = 4 * 1024 * 1024;
-
-fn is_mutation_capacity(error: &MutationError) -> bool {
-    mutation_capacity_kind(error).is_some()
-}
-
-fn mutation_capacity_kind(error: &MutationError) -> Option<&'static str> {
-    match error {
-        MutationError::ReceiptCapacity => Some("receipt"),
-        MutationError::SourceJournalCapacity => Some("source_journal"),
-        _ => None,
-    }
-}
-
-fn fail_unresolved_prepared(
-    results: &mut BTreeMap<usize, Result<MutationReceipt, MutationError>>,
-    prepared: &[(usize, PreparedOperation)],
-    error: MutationError,
-) {
-    for (index, _) in prepared {
-        let result = results.entry(*index).or_insert_with(|| Err(error.clone()));
-        if result.is_ok() || result.as_ref().is_err_and(is_mutation_capacity) {
-            *result = Err(error.clone());
-        }
-    }
-}
 
 impl Store {
     pub async fn put(&self, request: PutRequest) -> Result<MutationReceipt, MutationError> {
@@ -161,10 +138,8 @@ impl Store {
         .await
     }
 
-    /// Applies one public/internal coordinator batch with capacity
-    /// backpressure. The original prepared payloads remain owned by this call
-    /// while source-journal or receipt capacity catches up, so retrying does
-    /// not clone request bytes and command IDs retain their replay contract.
+    /// Applies one coordinator batch with capacity backpressure while retaining
+    /// the original payloads and command replay contract across retries.
     pub async fn bulk_write_with_backpressure(
         &self,
         operations: Vec<BatchOperation>,
@@ -363,6 +338,7 @@ impl Store {
                         exact_path: operation.key().path().to_owned(),
                         path_version: evaluated.receipt.version,
                         deleted: evaluated.receipt.deleted,
+                        program_commit_cursor: None,
                         reference_deltas: evaluated.reference_deltas.clone(),
                         accounting_transition: evaluated.accounting_transition,
                         definition_transition: evaluated.definition_transition.clone(),
@@ -567,12 +543,7 @@ impl Store {
     }
 
     /// Coordinates a distributed publish whose payload evidence was verified
-    /// by the cluster layer on the current path coordinator.
-    ///
-    /// Unlike [`Store::coordinate_object_mutation`], this exact boundary does
-    /// not require the complete payload source to be present on the metadata
-    /// coordinator. Ordinary local publishes and every other operation retain
-    /// their existing local-byte check.
+    /// by the cluster layer; the metadata coordinator need not hold its bytes.
     pub async fn coordinate_distributed_publish(
         &self,
         request: PublishRequest,
@@ -747,6 +718,7 @@ impl Store {
                     exact_path: prepared.key().path().to_owned(),
                     path_version: evaluated.receipt.version,
                     deleted: evaluated.receipt.deleted,
+                    program_commit_cursor: None,
                     reference_deltas: evaluated.reference_deltas.clone(),
                     accounting_transition: evaluated.accounting_transition,
                     definition_transition: evaluated.definition_transition.clone(),
@@ -839,7 +811,8 @@ impl Store {
             None => {}
             Some(head) if head.version == mutation.version.id => {
                 let descriptor = self
-                    .read_json::<Version>(CF_VERSIONS, &encoded_version_key)?
+                    .stored_version_by_key(&encoded_version_key)?
+                    .map(|stored| stored.version)
                     .ok_or_else(|| {
                         MutationError::Storage(
                             "replicated head references a missing version descriptor".into(),
@@ -898,8 +871,8 @@ impl Store {
             }
         }
 
-        if let Some(existing) = self.read_json::<Version>(CF_VERSIONS, &encoded_version_key)?
-            && existing != mutation.version
+        if let Some(existing) = self.stored_version_by_key(&encoded_version_key)?
+            && existing.version != mutation.version
         {
             return Err(MutationError::ObjectMutationConflict);
         }
@@ -917,21 +890,51 @@ impl Store {
         }
 
         if !already_applied {
-            if mutation.retire_predecessor {
-                let predecessor = mutation.stamp.predecessor_version.ok_or_else(|| {
-                    MutationError::InvalidObjectMutation(
-                        "retired predecessor is missing from mutation lineage".into(),
-                    )
-                })?;
-                batch.delete_cf(
-                    self.cf(CF_VERSIONS)?,
-                    exact_version_key(identity, &mutation.exact_path, predecessor),
-                );
+            let retention = self.version_retention_for_bucket(identity)?;
+            if let Some(predecessor) = mutation.stamp.predecessor_version {
+                let predecessor_key =
+                    exact_version_key(identity, &mutation.exact_path, predecessor);
+                if let Some(stored) = self.stored_version_by_key(&predecessor_key)? {
+                    match stored.retention {
+                        StoredVersionRetention::JournalPending
+                            if retention == StoredVersionRetention::UserRetained =>
+                        {
+                            batch.put_cf(
+                                self.cf(CF_VERSIONS)?,
+                                predecessor_key,
+                                serde_json::to_vec(&StoredVersion::new(
+                                    stored.version,
+                                    StoredVersionRetention::UserRetained,
+                                ))
+                                .map_err(storage_error)?,
+                            );
+                        }
+                        StoredVersionRetention::JournalReleased
+                            if retention == StoredVersionRetention::UserRetained =>
+                        {
+                            batch.put_cf(
+                                self.cf(CF_VERSIONS)?,
+                                predecessor_key,
+                                serde_json::to_vec(&StoredVersion::new(
+                                    stored.version,
+                                    StoredVersionRetention::UserRetained,
+                                ))
+                                .map_err(storage_error)?,
+                            );
+                        }
+                        StoredVersionRetention::JournalReleased => {
+                            batch.delete_cf(self.cf(CF_VERSIONS)?, predecessor_key);
+                        }
+                        StoredVersionRetention::JournalPending
+                        | StoredVersionRetention::UserRetained => {}
+                    }
+                }
             }
             batch.put_cf(
                 self.cf(CF_VERSIONS)?,
                 &encoded_version_key,
-                serde_json::to_vec(&mutation.version).map_err(storage_error)?,
+                serde_json::to_vec(&StoredVersion::new(mutation.version.clone(), retention))
+                    .map_err(storage_error)?,
             );
             batch.put_cf(
                 self.cf(CF_HEADS)?,
@@ -1024,14 +1027,13 @@ impl Store {
         let mut status = self
             .local_watch_status()
             .map_err(|error| MutationError::Storage(error.to_string()))?;
+        let retained_entries_before = status.retained_entries;
+        let retained_bytes_before = status.retained_bytes;
         if admission == SourceJournalAdmission::Bounded
             && (status.retained_entries > self.watch_retention.max_entries
                 || status.retained_bytes > self.watch_retention.max_bytes)
         {
-            // Publication progress debt is repaid by advancing the durable
-            // consumer cuts and pruning before an ordinary writer retries. Do
-            // not combine that repayment with a new source append: while debt
-            // exists, every bounded mutation remains under backpressure.
+            // Repay publication debt before an ordinary append retries.
             return Err(MutationError::SourceJournalCapacity);
         }
         let old_tail = status.tail;
@@ -1070,15 +1072,6 @@ impl Store {
             }
             LocalReferenceEffects::Deferred => None,
         };
-        let reference_safe_through = self
-            .source_journal_reference_safe_through
-            .load(std::sync::atomic::Ordering::Acquire);
-        let (index_safe_through, accounting_safe_through) = self
-            .derived_consumer_safe_through(status)
-            .map_err(|error| MutationError::Storage(error.to_string()))?;
-        let safe_through = reference_safe_through
-            .min(index_safe_through)
-            .min(accounting_safe_through);
         let mut appended = VecDeque::new();
         for pending in changes {
             status.tail = status.tail.checked_add(1).ok_or_else(|| {
@@ -1090,16 +1083,18 @@ impl Store {
                     exact_path,
                     path_version,
                     deleted,
+                    program_commit_cursor,
                     reference_deltas,
                     accounting_transition,
                     definition_transition,
-                } => LocalChange::object_head(
+                } => LocalChange::object_head_with_program_cursor(
                     status.tail,
                     identity.tenant_id.0,
                     identity.bucket_id.0,
                     exact_path.clone(),
                     *path_version,
                     *deleted,
+                    *program_commit_cursor,
                     reference_deltas.clone(),
                     *accounting_transition,
                     definition_transition.clone(),
@@ -1135,11 +1130,25 @@ impl Store {
                     blob_identity,
                     revision,
                     reference_deltas,
+                    accounting_transition,
                 } => LocalChange::content_lifecycle_changed(
                     status.tail,
                     blob_identity.clone(),
                     *revision,
                     reference_deltas.clone(),
+                    accounting_transition.clone(),
+                ),
+                PendingLocalChange::AtomicBatchPublished {
+                    cursor,
+                    bundle_hash,
+                    affected_routes,
+                    mutations,
+                } => LocalChange::atomic_batch_published(
+                    status.tail,
+                    *cursor,
+                    *bundle_hash,
+                    affected_routes.clone(),
+                    mutations.clone(),
                 ),
             };
             let encoded = encode_local_change(&change).map_err(storage_error)?;
@@ -1166,62 +1175,27 @@ impl Store {
             appended.push_back((status.tail, encoded));
         }
 
-        let exceeds_retention = status.retained_entries > self.watch_retention.max_entries
-            || status.retained_bytes > self.watch_retention.max_bytes;
-        let first_old_key = invalidation_key(status.retention_floor.saturating_add(1));
-        let mut old_entries = exceeds_retention.then(|| {
-            self.db.iterator_cf(
-                journal,
-                IteratorMode::From(&first_old_key, Direction::Forward),
-            )
-        });
-        while status.retained_entries > self.watch_retention.max_entries
-            || status.retained_bytes > self.watch_retention.max_bytes
-        {
-            let pruned = status.retention_floor.checked_add(1).ok_or_else(|| {
-                MutationError::Storage("local invalidation retention floor is exhausted".into())
-            })?;
-            if pruned > old_tail || pruned > safe_through || pruned > status.settled_through {
-                if admission == SourceJournalAdmission::DerivedProgress {
-                    break;
-                }
+        if admission == SourceJournalAdmission::Bounded {
+            let appended_entries = status
+                .retained_entries
+                .saturating_sub(retained_entries_before);
+            let appended_bytes = status.retained_bytes.saturating_sub(retained_bytes_before);
+            if appended_entries > self.watch_retention.max_entries
+                || appended_bytes > self.watch_retention.max_bytes
+            {
+                return Err(MutationError::SourceJournalTransitionTooLarge {
+                    entries: appended_entries,
+                    bytes: appended_bytes,
+                    maximum_entries: self.watch_retention.max_entries,
+                    maximum_bytes: self.watch_retention.max_bytes,
+                });
+            }
+            if status.retained_entries > self.watch_retention.max_entries
+                || status.retained_bytes > self.watch_retention.max_bytes
+            {
+                // Keep capacity retirement in a separate committed prune.
                 return Err(MutationError::SourceJournalCapacity);
             }
-            let (stored_key, encoded) = old_entries
-                .as_mut()
-                .expect("retention iterator exists while the journal is over capacity")
-                .next()
-                .ok_or_else(|| {
-                    MutationError::Storage(format!(
-                        "retained local invalidation offset {pruned} is missing"
-                    ))
-                })?
-                .map_err(storage_error)?;
-            if offset_from_key(&stored_key) != Some(pruned) {
-                return Err(MutationError::Storage(format!(
-                    "retained local invalidation offset {pruned} is missing"
-                )));
-            }
-            let pruned_change = self.decode_local_change_record(&encoded)?;
-            if pruned_change.offset() != pruned {
-                return Err(MutationError::Storage(
-                    "local change key does not match its stored offset".into(),
-                ));
-            }
-            self.stage_journal_route_removal(batch, status.source_id.source_epoch, &pruned_change)?;
-            batch.delete_cf(journal, invalidation_key(pruned));
-            status.retention_floor = pruned;
-            status.retained_entries -= 1;
-            status.retained_bytes = status
-                .retained_bytes
-                .checked_sub(invalidation_record_bytes(encoded.len()).saturating_add(
-                    super::journal_routes::journal_route_logical_bytes(&pruned_change),
-                ))
-                .ok_or_else(|| {
-                    MutationError::Storage(
-                        "local invalidation byte accounting is inconsistent".into(),
-                    )
-                })?;
         }
         for (offset, encoded) in appended {
             batch.put_cf(journal, invalidation_key(offset), encoded);
@@ -1778,30 +1752,43 @@ impl Store {
         }
         let fingerprint = operation.fingerprint();
         let apply_content_lifecycle = distributed.is_none();
-        let old_blob = current_version
-            .as_ref()
-            .map(version_blob_reference)
+        let released_predecessor = (versioning == ObjectVersioning::Unversioned)
+            .then_some(current_version.as_ref())
+            .flatten()
+            .map(|previous| {
+                self.stored_version_by_key(&version_key(operation.identity(), key, previous.id))
+                    .map(|stored| {
+                        stored.filter(|stored| {
+                            stored.retention == StoredVersionRetention::JournalReleased
+                        })
+                    })
+            })
             .transpose()?
             .flatten();
-        let references_changed = old_blob.as_ref() != new_blob.as_ref();
         let mut reference_deltas = Vec::with_capacity(2);
-        if versioning == ObjectVersioning::Unversioned
-            && references_changed
-            && let Some(reference) = old_blob.as_ref()
-        {
-            reference_deltas.push(ReferenceDelta {
-                blob: reference.clone(),
-                change: -1,
-            });
-        }
-        if let Some(reference) = new_blob.as_ref()
-            && (versioning == ObjectVersioning::Enabled || references_changed)
-        {
+        if let Some(reference) = new_blob.as_ref() {
             reference_deltas.push(ReferenceDelta {
                 blob: reference.clone(),
                 change: 1,
             });
         }
+        if let Some(reference) = released_predecessor
+            .as_ref()
+            .and_then(|stored| stored.version.blob.clone())
+        {
+            reference_deltas.push(ReferenceDelta {
+                blob: reference,
+                change: -1,
+            });
+        }
+        if reference_deltas.len() == 2 && reference_deltas[0].blob == reference_deltas[1].blob {
+            reference_deltas.clear();
+        }
+        let released_same_as_new = released_predecessor
+            .as_ref()
+            .and_then(|stored| stored.version.blob.as_ref())
+            .zip(new_blob.as_ref())
+            .is_some_and(|(old, new)| old == new);
         let receipt_expires_at_unix_millis = if receipt_key.is_some() {
             now_unix_millis
                 .checked_add(self.mutation_receipt_retention.retention_millis())
@@ -1822,8 +1809,6 @@ impl Store {
                     command_id: command_id.to_owned(),
                     input_fingerprint: fingerprint,
                     version: version.clone(),
-                    retire_predecessor: versioning == ObjectVersioning::Unversioned
-                        && current.is_some(),
                     receipt_expires_at_unix_millis,
                     stamp: MutationStamp {
                         format: MUTATION_STAMP_FORMAT,
@@ -1849,24 +1834,17 @@ impl Store {
             deleted,
             mutation_stamp: object_mutation.as_ref().map(|mutation| mutation.stamp),
         };
-        let encoded_version = serde_json::to_vec(&version).map_err(storage_error)?;
+        let retention = match versioning {
+            ObjectVersioning::Unversioned => StoredVersionRetention::JournalPending,
+            ObjectVersioning::Enabled => StoredVersionRetention::UserRetained,
+        };
+        let encoded_version = serde_json::to_vec(&StoredVersion::new(version.clone(), retention))
+            .map_err(storage_error)?;
         let encoded_head = serde_json::to_vec(&head).map_err(storage_error)?;
         let versions = self.cf(CF_VERSIONS)?;
         let heads = self.cf(CF_HEADS)?;
         let encoded_version_key = version_key(operation.identity(), key, id);
         let mut blob_reference_updates = Vec::with_capacity(2);
-        if apply_content_lifecycle
-            && versioning == ObjectVersioning::Unversioned
-            && references_changed
-            && let Some(reference) = old_blob.as_ref()
-        {
-            blob_reference_updates.push(self.prepare_blob_reference_retirement_cached(
-                reference,
-                pending_blob_references,
-                read_cache.blob_reference(reference),
-                now_unix_millis,
-            )?);
-        }
         let small_blob_value = if apply_content_lifecycle {
             match operation {
                 PreparedOperation::Put { payload, .. } => match payload.small_bytes() {
@@ -1884,8 +1862,8 @@ impl Store {
             None
         };
         if apply_content_lifecycle
+            && !released_same_as_new
             && let Some(reference) = new_blob.as_ref()
-            && (versioning == ObjectVersioning::Enabled || references_changed)
         {
             let update = match operation {
                 PreparedOperation::Put { .. } => self.prepare_materialized_blob_publication(
@@ -1931,13 +1909,64 @@ impl Store {
                 prefetched,
             )?;
         }
-        if versioning == ObjectVersioning::Unversioned
-            && let Some(previous) = current_version.as_ref()
+        if apply_content_lifecycle
+            && !released_same_as_new
+            && let Some(reference) = released_predecessor
+                .as_ref()
+                .and_then(|stored| stored.version.blob.as_ref())
         {
-            batch.delete_cf(
-                versions,
-                version_key(operation.identity(), key, previous.id),
-            );
+            let (key, state) = self.prepare_blob_reference_retirement_cached(
+                reference,
+                pending_blob_references,
+                read_cache.blob_reference(reference),
+                now_unix_millis,
+            )?;
+            self.stage_blob_reference_update(batch, pending_blob_references, key, state)?;
+        }
+        if let Some(previous) = current_version.as_ref() {
+            let previous_key = version_key(operation.identity(), key, previous.id);
+            if let Some(stored) = self.stored_version_by_key(&previous_key)? {
+                match stored.retention {
+                    StoredVersionRetention::JournalPending
+                        if versioning == ObjectVersioning::Enabled =>
+                    {
+                        batch.put_cf(
+                            versions,
+                            previous_key,
+                            serde_json::to_vec(&StoredVersion::new(
+                                stored.version,
+                                StoredVersionRetention::UserRetained,
+                            ))
+                            .map_err(storage_error)?,
+                        );
+                    }
+                    StoredVersionRetention::JournalReleased
+                        if versioning == ObjectVersioning::Enabled =>
+                    {
+                        batch.put_cf(
+                            versions,
+                            previous_key,
+                            serde_json::to_vec(&StoredVersion::new(
+                                stored.version,
+                                StoredVersionRetention::UserRetained,
+                            ))
+                            .map_err(storage_error)?,
+                        );
+                    }
+                    StoredVersionRetention::JournalReleased => {
+                        batch.delete_cf(versions, previous_key);
+                    }
+                    StoredVersionRetention::JournalPending
+                    | StoredVersionRetention::UserRetained => {}
+                }
+            } else if pending_versions
+                .get(&encoded_key)
+                .is_none_or(|pending| pending.id != previous.id)
+            {
+                return Err(MutationError::Storage(
+                    "current predecessor descriptor is missing".into(),
+                ));
+            }
         }
         batch.put_cf(versions, encoded_version_key, encoded_version);
         batch.put_cf(heads, &encoded_key, encoded_head);
@@ -1962,39 +1991,4 @@ impl Store {
             definition_transition,
         })
     }
-}
-
-fn live_version_length(version: &Version) -> Option<u64> {
-    (!version.deleted)
-        .then(|| version.blob.as_ref().map(|blob| blob.length))
-        .flatten()
-}
-
-fn definition_receipt_matches_intent(
-    stored: Option<&DefinitionTransition>,
-    intent: Option<DefinitionMutationIntent>,
-    operation: &PreparedOperation,
-) -> bool {
-    match (stored, intent) {
-        (None, None) => true,
-        (Some(stored), Some(intent)) => {
-            stored.kind == intent.kind
-                && stored.definition_id == intent.definition_id
-                && stored.tenant_id == operation.identity().tenant_id.0
-                && stored.bucket_id == operation.identity().bucket_id.0
-                && stored.path == operation.key().path()
-        }
-        (Some(_), None) | (None, Some(_)) => false,
-    }
-}
-
-fn definition_mutation_error(error: DefinitionStateError) -> MutationError {
-    MutationError::InvalidObjectMutation(error.to_string())
-}
-
-fn exact_version_key(identity: BucketIdentity, exact_path: &str, version: VersionId) -> Vec<u8> {
-    let mut encoded = identity.head_key(exact_path);
-    encoded.push(0);
-    encoded.extend_from_slice(&version.0.to_be_bytes());
-    encoded
 }

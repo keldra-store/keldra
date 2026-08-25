@@ -640,6 +640,7 @@ mod tests {
             blob_identity: vec![7; 40],
             revision: 2,
             reference_deltas,
+            accounting_transition: None,
         })
     }
 
@@ -670,6 +671,7 @@ mod tests {
             exact_path: "objects/value".into(),
             path_version: VersionId(4),
             kind: ObjectHeadChangeKind::Put,
+            program_commit_cursor: None,
             reference_deltas: Vec::new(),
             accounting_transition: None,
             definition_transition: None,

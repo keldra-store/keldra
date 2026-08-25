@@ -80,7 +80,7 @@ service AuthzService {
 }
 
 // Cluster-wide derived indices. One weighted-HRW builder publishes immutable
-// generations and up to three weighted-HRW query replicas materialize those
+// committed views and up to three weighted-HRW query replicas materialize those
 // same files through their shared local cache. A query is executed by one
 // replica; this service never scatter-queries independent per-node indices.
 service IndexService {
@@ -89,7 +89,7 @@ service IndexService {
   rpc GetIndex(GetIndexRequest) returns (IndexDefinition);
   rpc ListIndices(ListIndicesRequest) returns (ListIndicesResponse);
   // Rewrites the same authoritative definition at an exact version. This is
-  // an explicit, authorized request for a fresh scoped snapshot generation;
+  // an explicit, authorized request for a fresh scoped committed view;
   // it creates no rebuild registry or second index authority.
   rpc RebuildIndex(RebuildIndexRequest) returns (IndexDefinition);
   rpc DeleteIndex(DeleteIndexRequest) returns (DeleteIndexResponse);
@@ -525,6 +525,22 @@ message QueryIndexRequest {
   // Required for anonymous queries because no credential supplies a tenant.
   // Authenticated callers may omit it; when supplied it must match their token.
   string tenant = 6;
+  // When present, the selected committed and locally opened view must cover
+  // every supplied source-local cursor and the atomic cursor, if supplied.
+  // The server waits only until this request's deadline.
+  IndexFreshnessRequirement required_freshness = 7;
+}
+
+message IndexRequiredSourceCheckpoint {
+  uint64 node_id = 1;
+  bytes source_epoch = 2;
+  // First source-local offset not required by the caller.
+  uint64 next_offset = 3;
+}
+
+message IndexFreshnessRequirement {
+  repeated IndexRequiredSourceCheckpoint sources = 1;
+  optional uint64 atomic_through = 2;
 }
 
 message IndexQueryHit {
@@ -536,17 +552,18 @@ message IndexQueryHit {
 message IndexSourceFreshness {
   uint64 node_id = 1;
   bytes source_epoch = 2;
-  // First source offset not represented by this generation.
+  // First source offset not represented by this committed view.
   uint64 indexed_next_offset = 3;
   // Latest tail observed by the query replica's background source monitor.
   optional uint64 observed_tail = 4;
   uint64 lag_hint = 5;
 }
 
-// Freshness is evidence, not an admission rule. A query returns the available
-// generation and this structure; it never fails solely because indexing lags.
+// Freshness is evidence for ordinary queries. A query with required_freshness
+// opts into waiting for a covering committed view and can reach its deadline
+// solely because indexing still lags that explicit checkpoint.
 message IndexFreshness {
-  uint64 generation = 1;
+  uint64 commit_revision = 1;
   google.protobuf.Timestamp published_at = 2;
   repeated IndexSourceFreshness sources = 3;
   bool initial_build_complete = 4;

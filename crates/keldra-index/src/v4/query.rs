@@ -54,7 +54,7 @@ pub struct NativeQueryCursor {
 }
 
 impl NativeQueryCursor {
-    /// Stable opaque engine position embedded by the outer generation-bound
+    /// Stable opaque engine position embedded by the outer commit-bound
     /// page token. It contains no DocId or Rust/serde representation.
     pub fn encode(&self) -> Result<Vec<u8>, IndexError> {
         self.result.validate()?;
@@ -236,7 +236,7 @@ impl NativeQueryRequest {
             }
         }
         let Some(first) = self.segments.first().map(|segment| segment.identity) else {
-            // A complete checkpoint-only generation is a valid empty index.
+            // A complete checkpoint-only commit is a valid empty index.
             return Ok(());
         };
         if self.schema.fingerprint()? != first.schema_fingerprint {
@@ -251,7 +251,7 @@ impl NativeQueryRequest {
                 || segment.identity.schema_fingerprint != first.schema_fingerprint
             {
                 return Err(IndexError::InvalidQuery(
-                    "native query segments do not belong to one generation schema".into(),
+                    "native query segments do not belong to one committed schema".into(),
                 ));
             }
         }

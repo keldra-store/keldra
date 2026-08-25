@@ -553,7 +553,7 @@ message IndexArtifactsPublished {
   repeated IndexArtifactPublished outcomes = 2;
 }
 
-// Deletes exactly one obsolete immutable generation artifact through the
+// Deletes exactly one obsolete immutable commit artifact through the
 // ordinary DeleteIfVersion path. `current` and definitions are never valid.
 message DeleteIndexArtifactRequest {
   PeerContext peer = 1;
@@ -609,6 +609,8 @@ message IndexSourceSnapshotBegin {
   uint64 bucket_id = 3;
   string path_prefix = 4;
   uint64 max_frame_bytes = 5;
+  // Exclusive canonical path checkpoint for a durable non-serving rebuild.
+  optional string resume_after_path = 6;
 }
 
 // One pull credit. The server may decode and return exactly one frame only
@@ -694,9 +696,20 @@ message RetainedSourceSnapshotResponse {
 // by ingress; the destination independently verifies the original bearer and
 // requires this Zanzibar revision to remain current before returning results.
 message RoutedIndexQueryResume {
-  uint64 generation = 1;
+  uint64 commit_revision = 1;
   bytes last_position = 2;
   uint64 authorization_revision = 3;
+}
+
+message RoutedIndexRequiredSourceCheckpoint {
+  uint64 node_id = 1;
+  bytes source_epoch = 2;
+  uint64 next_offset = 3;
+}
+
+message RoutedIndexFreshnessRequirement {
+  repeated RoutedIndexRequiredSourceCheckpoint sources = 1;
+  optional uint64 atomic_through = 2;
 }
 
 // A one-hop request to exactly one current weighted-HRW query replica. No
@@ -712,9 +725,10 @@ message RouteIndexQueryRequest {
   uint32 limit = 6;
   optional RoutedIndexQueryResume resume = 7;
   string storage_tenant = 8;
+  optional RoutedIndexFreshnessRequirement required_freshness = 9;
 }
 
-// Raw generation results. Public page tokens are minted only by public ingress
+// Raw committed-view results. Public page tokens are minted only by public ingress
 // after its own final authorization pass; replicas return engine positions.
 message RoutedIndexQueryResponse {
   uint32 schema_version = 1;
@@ -722,7 +736,7 @@ message RoutedIndexQueryResponse {
   keldra.v1.IndexFreshness freshness = 3;
   optional bytes next_position = 4;
   // The peer-routing fence is distinct from freshness. Freshness retains the
-  // fence under which the returned generation was built.
+  // fence under which the returned committed view was built.
   uint64 routing_placement_term = 5;
   uint64 routing_placement_index = 6;
   repeated keldra.v1.IndexFacetResult facet_results = 7;

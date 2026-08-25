@@ -64,14 +64,14 @@ struct RecoveryCase {
 struct FixtureState {
     bucket: String,
     index_id: u64,
-    generation: u64,
+    commit_revision: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 struct KindFixtureState {
     bucket: String,
     engine_id: u64,
-    generation: u64,
+    commit_revision: u64,
     placement_term: u64,
     placement_index: u64,
     kind: String,
@@ -79,7 +79,7 @@ struct KindFixtureState {
 
 #[derive(Clone, Copy)]
 struct RecoveryEvidence {
-    generation: u64,
+    commit_revision: u64,
     placement_term: u64,
     placement_index: u64,
 }
@@ -204,7 +204,7 @@ async fn membership_seed(context: &Context, state_path: PathBuf) -> TestResult<(
             1,
         )
         .await?
-        .generation;
+        .commit_revision;
         let document = &path_case.documents[0];
         put_recovery_document(
             &mut objects[0],
@@ -215,7 +215,7 @@ async fn membership_seed(context: &Context, state_path: PathBuf) -> TestResult<(
             &format!("index-membership-before-{position}"),
         )
         .await?;
-        let generation = wait_for_recovery_case(
+        let commit_revision = wait_for_recovery_case(
             &mut indexes,
             &bucket,
             path_case,
@@ -225,11 +225,11 @@ async fn membership_seed(context: &Context, state_path: PathBuf) -> TestResult<(
             1,
         )
         .await?
-        .generation;
+        .commit_revision;
         fixtures.push(FixtureState {
             bucket,
             index_id: definition.index_id,
-            generation,
+            commit_revision,
         });
     }
     // Keep the original 16 Path identities because the outer harness uses
@@ -252,7 +252,7 @@ async fn membership_seed(context: &Context, state_path: PathBuf) -> TestResult<(
             1,
         )
         .await?
-        .generation;
+        .commit_revision;
         let document = &case.documents[0];
         put_recovery_document(
             &mut objects[0],
@@ -276,7 +276,7 @@ async fn membership_seed(context: &Context, state_path: PathBuf) -> TestResult<(
         kind_fixtures.push(KindFixtureState {
             bucket,
             engine_id: definition.index_id,
-            generation: evidence.generation,
+            commit_revision: evidence.commit_revision,
             placement_term: evidence.placement_term,
             placement_index: evidence.placement_index,
             kind: case.kind.into(),
@@ -385,17 +385,17 @@ async fn membership_verify(
     }
     for fixture in &mut state.fixtures {
         let after_paths = expected_recovery_paths(path_case, active_nodes);
-        fixture.generation = wait_for_recovery_case(
+        fixture.commit_revision = wait_for_recovery_case(
             &mut indexes,
             &fixture.bucket,
             path_case,
             fixture.index_id,
             &after_paths,
-            fixture.generation,
+            fixture.commit_revision,
             active_nodes,
         )
         .await?
-        .generation;
+        .commit_revision;
     }
     for fixture in &mut state.kind_fixtures {
         let case = recovery_case(&cases, &fixture.kind)?;
@@ -406,11 +406,11 @@ async fn membership_verify(
             case,
             fixture.engine_id,
             &after_paths,
-            fixture.generation,
+            fixture.commit_revision,
             active_nodes,
         )
         .await?;
-        fixture.generation = evidence.generation;
+        fixture.commit_revision = evidence.commit_revision;
         fixture.placement_term = evidence.placement_term;
         fixture.placement_index = evidence.placement_index;
     }
@@ -443,7 +443,7 @@ async fn pressure_seed(context: &Context, state_path: PathBuf) -> TestResult<()>
         br#"{"qualified":true}"#,
     )
     .await?;
-    let generation = wait_for_paths(
+    let commit_revision = wait_for_paths(
         &mut indexes,
         &bucket,
         &paths(["pressure/seed.json"]),
@@ -457,7 +457,7 @@ async fn pressure_seed(context: &Context, state_path: PathBuf) -> TestResult<()>
             fixture: FixtureState {
                 bucket,
                 index_id: definition.index_id,
-                generation,
+                commit_revision,
             },
             next_candidate: 0,
             pressure_path: None,
@@ -667,13 +667,13 @@ async fn pressure_verify(context: &Context, state_path: PathBuf) -> TestResult<(
         &mut indexes,
         &state.fixture.bucket,
         &expected,
-        state.fixture.generation,
+        state.fixture.commit_revision,
         pressure_path,
         state.last_version,
     )
     .await?;
     println!(
-        "journal-pressure release reached an exact zero-lag generation at version {}",
+        "journal-pressure release reached an exact zero-lag commit_revision at version {}",
         state.last_version
     );
     Ok(())
@@ -956,7 +956,7 @@ async fn wait_for_recovery_case(
     case: &RecoveryCase,
     index_id: u64,
     expected: &BTreeSet<String>,
-    after_generation: u64,
+    after_commit_revision: u64,
     expected_sources: usize,
 ) -> TestResult<RecoveryEvidence> {
     let deadline = Instant::now() + WAIT_LIMIT;
@@ -1001,12 +1001,12 @@ async fn wait_for_recovery_case(
                         || freshness.authorization_revision == 0
                         || freshness.placement_term == 0
                         || freshness.placement_index == 0
-                        || freshness.generation <= after_generation
+                        || freshness.commit_revision <= after_commit_revision
                         || !freshness.initial_build_complete
                         || freshness.rebuilding
                         || !zero_lag
                         || evidence.is_some_and(|value| {
-                            value.generation != freshness.generation
+                            value.commit_revision != freshness.commit_revision
                                 || value.placement_term != freshness.placement_term
                                 || value.placement_index != freshness.placement_index
                         })
@@ -1015,7 +1015,7 @@ async fn wait_for_recovery_case(
                         break;
                     }
                     evidence = Some(RecoveryEvidence {
-                        generation: freshness.generation,
+                        commit_revision: freshness.commit_revision,
                         placement_term: freshness.placement_term,
                         placement_index: freshness.placement_index,
                     });
@@ -1045,11 +1045,11 @@ async fn wait_for_paths(
     clients: &mut [IndexClient],
     bucket: &str,
     expected: &BTreeSet<String>,
-    after_generation: u64,
+    after_commit_revision: u64,
 ) -> TestResult<u64> {
     let deadline = Instant::now() + WAIT_LIMIT;
     loop {
-        let mut generation = u64::MAX;
+        let mut commit_revision = u64::MAX;
         let mut ready = true;
         for client in clients.iter_mut() {
             match client.query_index(query(bucket)).await {
@@ -1065,14 +1065,14 @@ async fn wait_for_paths(
                         .collect::<BTreeSet<_>>();
                     if &paths != expected
                         || response.hits.len() != expected.len()
-                        || freshness.generation <= after_generation
+                        || freshness.commit_revision <= after_commit_revision
                         || !freshness.initial_build_complete
                         || freshness.rebuilding
                     {
                         ready = false;
                         break;
                     }
-                    generation = generation.min(freshness.generation);
+                    commit_revision = commit_revision.min(freshness.commit_revision);
                 }
                 Err(status) if retryable(&status) => {
                     ready = false;
@@ -1081,8 +1081,8 @@ async fn wait_for_paths(
                 Err(status) => return Err(status.into()),
             }
         }
-        if ready && generation != u64::MAX {
-            return Ok(generation);
+        if ready && commit_revision != u64::MAX {
+            return Ok(commit_revision);
         }
         if Instant::now() >= deadline {
             return Err(invalid(format!(
@@ -1098,7 +1098,7 @@ async fn wait_for_pressure_index(
     clients: &mut [IndexClient],
     bucket: &str,
     expected: &BTreeSet<String>,
-    after_generation: u64,
+    after_commit_revision: u64,
     pressure_path: &str,
     expected_version: u64,
 ) -> TestResult<()> {
@@ -1142,7 +1142,7 @@ async fn wait_for_pressure_index(
                     if paths != *expected
                         || response.hits.len() != expected.len()
                         || !expected_version_present
-                        || freshness.generation <= after_generation
+                        || freshness.commit_revision <= after_commit_revision
                         || !freshness.initial_build_complete
                         || freshness.rebuilding
                         || !zero_lag
@@ -1184,6 +1184,7 @@ fn query(bucket: &str) -> QueryIndexRequest {
         limit: 1_000,
         page_token: Vec::new(),
         tenant: String::new(),
+        required_freshness: None,
     }
 }
 
@@ -1195,6 +1196,7 @@ fn recovery_query(bucket: &str, case: &RecoveryCase) -> QueryIndexRequest {
         limit: 1_000,
         page_token: Vec::new(),
         tenant: String::new(),
+        required_freshness: None,
     }
 }
 

@@ -20,6 +20,7 @@ mod credential_secret;
 mod definition_state;
 mod derived_consumer;
 mod erasure;
+mod index_orphan_scrub_due;
 mod index_retention_due;
 mod journal_route;
 mod key;
@@ -77,8 +78,11 @@ pub use erasure::{
     DEFAULT_ERASURE_DATA_SHARDS, DEFAULT_ERASURE_PARITY_SHARDS, DEFAULT_ERASURE_STRIPE_UNIT_BYTES,
     ErasureCodec, ErasureError, ErasureProfile, FRAGMENT_FORMAT_VERSION,
 };
+pub use index_orphan_scrub_due::{
+    IndexOrphanScrubDue, IndexOrphanScrubDueError, MAX_INDEX_ORPHAN_CURSOR_BYTES,
+};
 pub use index_retention_due::{
-    DeletedDefinitionCleanup, IndexGenerationRetentionDue, IndexRetentionDueError,
+    DeletedDefinitionCleanup, IndexCommitRetentionDue, IndexRetentionDueError,
 };
 pub use journal_route::{JournalRoute, RoutedJournalError, RoutedLocalChangePage};
 pub use key::ObjectKey;
@@ -107,8 +111,8 @@ pub use program::{
     PreparedProgramWrite, ProgramCommit, ProgramDurabilityClassHash, ProgramDurabilityEvidence,
     ProgramDurabilityEvidenceHash, ProgramDurabilityScope, ProgramExecutionLease, ProgramHash,
     ProgramPathMutation, ProgramPathStage, ProgramStoreError, PublishedProgramVersion,
-    ReplicaProgramPathApplied, StoreProgramEngine, VerifiedProgramDefinition,
-    path_stage_from_prepared,
+    ReplicaProgramPathApplied, SealedAtomicBatchPublication, StoreProgramEngine,
+    VerifiedProgramDefinition, path_stage_from_prepared,
 };
 pub use reference_delta::{
     DestinationReferenceArtifact, DestinationReferenceDelta, ReferenceDelta, ReferenceDeltaApplied,
@@ -135,9 +139,11 @@ pub use store::{
     ShardReader, ShardSealOutcome, ShardStoreError, Store, StoreOptions,
 };
 pub use watch::{
-    AccountingHeadTransition, AggregateChanged, AggregateKind, ContentLifecycleChanged,
+    AccountingHeadTransition, AggregateChanged, AggregateKind, AtomicBatchMutation,
+    AtomicBatchPublished, AtomicBatchRoute, ContentAccountingTransition, ContentLifecycleChanged,
     DEFAULT_WATCH_MAX_BYTES, DEFAULT_WATCH_MAX_ENTRIES, InvalidationStateHint, LocalChange,
-    LocalChangePage, LocalInvalidation, MAX_LOCAL_INVALIDATION_SCAN_RECORDS, ObjectHeadChange,
+    LocalChangePage, LocalInvalidation, MAX_ATOMIC_BATCH_MUTATIONS,
+    MAX_ATOMIC_BATCH_PUBLISHED_BYTES, MAX_LOCAL_INVALIDATION_SCAN_RECORDS, ObjectHeadChange,
     ObjectHeadChangeKind, OversizeLocalChange, ReferenceProof, ReferenceProofMutation,
     RetainedVersionDeletedChange, SourceId, WatchCursor, WatchError, WatchJournalStatus, WatchPage,
     WatchRetention, WatchScope, WatchStart,

@@ -127,7 +127,7 @@ pub(super) async fn qualify(
     clients: &mut [IndexClient],
     tenant: &str,
     case: &EngineCase,
-    generation: &IndexFreshness,
+    commit_revision: &IndexFreshness,
 ) -> TestResult<()> {
     let checks = [
         (
@@ -260,7 +260,14 @@ pub(super) async fn qualify(
 
     for (label, query, expected) in checks {
         let responses = execute(clients, case, query).await?;
-        verify_pages(&responses, tenant, case.bucket, generation, expected, label)?;
+        verify_pages(
+            &responses,
+            tenant,
+            case.bucket,
+            commit_revision,
+            expected,
+            label,
+        )?;
     }
 
     let mut computations = predicates([predicate(
@@ -324,7 +331,7 @@ pub(super) async fn qualify(
         &responses,
         tenant,
         case.bucket,
-        generation,
+        commit_revision,
         ACTIVE,
         "facets and aggregates",
     )?;
@@ -375,6 +382,7 @@ async fn execute(
         limit: 100,
         page_token: Vec::new(),
         tenant: String::new(),
+        required_freshness: None,
     };
     let deadline = Instant::now() + WAIT_LIMIT;
     loop {
@@ -406,16 +414,16 @@ fn verify_pages(
     responses: &[QueryIndexResponse],
     tenant: &str,
     bucket: &str,
-    generation: &IndexFreshness,
+    commit_revision: &IndexFreshness,
     expected: &[&str],
     label: &str,
 ) -> TestResult<()> {
     for response in responses {
         if !response.next_page_token.is_empty()
-            || !stable_freshness_agrees(response.freshness.as_ref(), Some(generation))
+            || !stable_freshness_agrees(response.freshness.as_ref(), Some(commit_revision))
         {
             return Err(invalid(format!(
-                "{label} did not remain on the complete qualification generation"
+                "{label} did not remain on the complete qualification commit_revision"
             )));
         }
         let paths = response

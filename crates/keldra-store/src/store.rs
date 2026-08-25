@@ -280,6 +280,7 @@ pub(crate) enum PendingLocalChange {
         exact_path: String,
         path_version: VersionId,
         deleted: bool,
+        program_commit_cursor: Option<u64>,
         reference_deltas: Vec<ReferenceDelta>,
         accounting_transition: Option<crate::AccountingHeadTransition>,
         definition_transition: Option<DefinitionTransition>,
@@ -301,6 +302,13 @@ pub(crate) enum PendingLocalChange {
         blob_identity: Vec<u8>,
         revision: u64,
         reference_deltas: Vec<ReferenceDelta>,
+        accounting_transition: Option<crate::ContentAccountingTransition>,
+    },
+    AtomicBatchPublished {
+        cursor: u64,
+        bundle_hash: crate::PreparedBundleHash,
+        affected_routes: Vec<crate::AtomicBatchRoute>,
+        mutations: Vec<crate::AtomicBatchMutation>,
     },
 }
 
@@ -327,7 +335,7 @@ impl PendingLocalChange {
             | Self::ContentLifecycleChanged {
                 reference_deltas, ..
             } => !reference_deltas.is_empty(),
-            Self::AggregateChanged { .. } => false,
+            Self::AggregateChanged { .. } | Self::AtomicBatchPublished { .. } => false,
         }
     }
 }
@@ -1329,9 +1337,11 @@ pub(crate) mod definition_state;
 mod delete_version;
 mod derived_consumers;
 mod distributed_publish_batch;
+mod index_orphan_scrub_due;
 mod index_retention_due;
 mod journal_capacity;
 mod journal_routes;
+mod mutation_helpers;
 mod mutation_prefetch;
 mod mutation_types;
 mod mutations;
@@ -1345,6 +1355,9 @@ mod reference_deltas;
 mod reference_proofs;
 mod retained_snapshot_scan;
 mod shards;
+mod source_journal_preflight;
+mod source_version_retention;
+pub(crate) use source_version_retention::{StoredVersion, StoredVersionRetention};
 mod watch_journal;
 
 pub use object_snapshot::{

@@ -1,4 +1,4 @@
-//! Signed, generation-bound public index pagination.
+//! Signed, revision-bound public index pagination.
 
 use keldra_authz::ObjectRef;
 use serde::{Deserialize, Serialize};
@@ -10,11 +10,11 @@ use super::boundary::{IndexPageCursor, IndexPageTokenBinding, IndexPageTokenCode
 
 pub(crate) const INDEX_PAGE_TOKEN_AUDIENCE: &str = "keldra-index-page";
 pub(crate) const INDEX_PAGE_TOKEN_PURPOSE: &str = "index-page";
-const INDEX_PAGE_TOKEN_FORMAT: u8 = 4;
+const INDEX_PAGE_TOKEN_FORMAT: u8 = 5;
 
 /// Strongly typed private JWT claims. There is deliberately no expiry: the
-/// referenced immutable generation, definition version, and exact Zanzibar
-/// revision define useful validity, while normal generation retention bounds
+/// referenced immutable revision, definition version, and exact Zanzibar
+/// revision define useful validity, while normal revision retention bounds
 /// how long the continuation can actually be served.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -28,7 +28,7 @@ pub(crate) struct IndexPageTokenClaims {
     pub(crate) bucket_id: u64,
     pub(crate) index_id: u64,
     pub(crate) definition_version: u64,
-    pub(crate) generation: u64,
+    pub(crate) commit_revision: u64,
     pub(crate) query_hash: [u8; 32],
     pub(crate) authorization_revision: u64,
     pub(crate) last_position: Vec<u8>,
@@ -46,7 +46,7 @@ impl IndexPageTokenClaims {
             bucket_id: binding.bucket_id,
             index_id: binding.index_id,
             definition_version: binding.definition_version,
-            generation: cursor.generation,
+            commit_revision: cursor.commit_revision,
             query_hash: binding.query_hash,
             authorization_revision: cursor.authorization_revision,
             last_position: cursor.last_position.clone(),
@@ -62,7 +62,7 @@ impl IndexPageTokenClaims {
             && self.bucket_id != 0
             && self.index_id != 0
             && self.definition_version != 0
-            && self.generation != 0
+            && self.commit_revision != 0
             && self.authorization_revision != 0
             && !self.last_position.is_empty()
     }
@@ -81,7 +81,7 @@ impl IndexPageTokenClaims {
 
     fn cursor(self) -> IndexPageCursor {
         IndexPageCursor {
-            generation: self.generation,
+            commit_revision: self.commit_revision,
             last_position: self.last_position,
             authorization_revision: self.authorization_revision,
         }
@@ -131,7 +131,7 @@ fn require_binding(binding: IndexPageTokenBinding) -> Result<(), Status> {
 }
 
 fn require_cursor(cursor: &IndexPageCursor) -> Result<(), Status> {
-    if cursor.generation == 0
+    if cursor.commit_revision == 0
         || cursor.authorization_revision == 0
         || cursor.last_position.is_empty()
     {
@@ -171,7 +171,7 @@ mod tests {
 
     fn cursor() -> IndexPageCursor {
         IndexPageCursor {
-            generation: 31,
+            commit_revision: 31,
             last_position: b"engine-position".to_vec(),
             authorization_revision: 41,
         }

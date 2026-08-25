@@ -1889,7 +1889,8 @@ fn status(error: MutationError) -> Status {
             Status::resource_exhausted(error.to_string())
         }
         MutationError::ReceiptTooLarge { .. }
-        | MutationError::SourceJournalRecordTooLarge { .. } => {
+        | MutationError::SourceJournalRecordTooLarge { .. }
+        | MutationError::SourceJournalTransitionTooLarge { .. } => {
             Status::resource_exhausted(error.to_string())
         }
         MutationError::ObjectMutationLineageGap { .. }

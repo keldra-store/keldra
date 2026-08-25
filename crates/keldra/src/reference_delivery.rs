@@ -791,12 +791,13 @@ impl ReferenceDelivery {
                 LocalChange::ObjectHead(_) | LocalChange::RetainedVersionDeleted(_) => {
                     self.commits.classify(status.source_id, &change).await
                 }
-                // Aggregate and lifecycle changes describe effects committed
-                // in the same local RocksDB batch as the journal event. They
-                // do not feed object/index/accounting/Watch visibility; any
-                // carried reference deltas remain governed independently by
-                // destination reference cursors.
-                LocalChange::AggregateChanged(_) | LocalChange::ContentLifecycleChanged(_) => {
+                // These records are self-proving local commits and require no
+                // object reference proof. Atomic batch publication occurs only
+                // after every path quorum is visible; aggregate and lifecycle
+                // effects share their originating local RocksDB commit.
+                LocalChange::AggregateChanged(_)
+                | LocalChange::ContentLifecycleChanged(_)
+                | LocalChange::AtomicBatchPublished(_) => {
                     Ok(ReferenceCommitDisposition::CommittedOrAncestor)
                 }
                 _ => Err("source journal change type is not supported for settlement".into()),

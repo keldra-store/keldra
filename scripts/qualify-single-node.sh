@@ -362,7 +362,7 @@ start_single_node() {
     --env "KELDRA_INDEX_TENSOR_PROJECTION_MAX_LANES=${index_projection_max_lanes}" \
     --env "KELDRA_INDEX_RAYON_WORKERS=${index_rayon_workers}" \
     "${profile_environment[@]}" \
-    --env KELDRA_INDEX_MAX_RETAINED_GENERATIONS=1 \
+    --env KELDRA_INDEX_MAX_RETAINED_COMMIT_REVISIONS=1 \
     --env KELDRA_RUN_SYSTEM_BOOTSTRAP=true \
     --volume "${data_dir}:/var/lib/keldra" \
     --volume "${signing_key}:/run/secrets/keldra-token-signing-key:ro" \
@@ -468,7 +468,7 @@ assert_each_index_kind_published_and_compacted() {
   local kind
   local message
   for kind in "${index_kinds[@]}"; do
-    for message in 'index generation published' 'format-v4 index segments compacted'; do
+    for message in 'index commit published' 'format-v4 index segments compacted'; do
       if ! awk -v kind="index.kind=${kind}" -v message="${message}" '
           index($0, kind) && index($0, message) { found = 1 }
           END { exit !found }
@@ -598,7 +598,7 @@ verify_existing_indexes() {
   KELDRA_INDEX_QUALIFICATION_CLIENT_SECRET="${owner_secret}" \
   KELDRA_INDEX_QUALIFICATION_STATE_INPUT="${index_verification_state}" \
     "${qualification_example_binaries[cluster_index_qualification]}"
-  echo "[keldra-single-qualification] final complete generations remained queryable after restart"
+  echo "[keldra-single-qualification] final committed views remained queryable after restart"
 }
 
 index_sparse_start_count() {
@@ -794,6 +794,7 @@ run_index_resource_qualification() {
     --argjson maximum_growth "${index_resource_max_anonymous_growth_bytes}" \
     --argjson performance_targets_required "${require_performance_targets}" \
     '
+      .schema == "keldra.index-resource-qualification.v2" and
       .evidence.source_commit == $source_commit and
       .evidence.resolved_container_digest == $container_digest and
       .evidence.native_architecture == $native_architecture and
@@ -828,17 +829,17 @@ run_index_resource_qualification() {
       .evidence.resource_configuration.resource_targets_required == true and
       (.evidence.timer_boundaries | to_entries | all(.value | if type == "object" then (.starts | length > 0) and (.stops | length > 0) else length > 0 end)) and
       .evidence.correctness.result == "pass" and
-      .evidence.correctness.source_complete_generation_observed == true and
+      .evidence.correctness.source_complete_commit_revision_observed == true and
       .evidence.correctness.source_complete_sources_observed == 1 and
       .evidence.correctness.initial_exact_partition_verification == true and
       .evidence.correctness.final_exact_partition_verification == true and
       .evidence.correctness.update_and_delete_verification == true and
       .evidence.correctness.resource_limits_passed == true and
-      .production_query_regression.schema == "keldra.index-production-query-regression.v1" and
+      .production_query_regression.schema == "keldra.index-production-query-regression.v2" and
       .production_query_regression.corpus_records == .records and
       .production_query_regression.index_id > 0 and
       .production_query_regression.definition_version > 0 and
-      .production_query_regression.generation > 0 and
+      .production_query_regression.commit_revision > 0 and
       .production_query_regression.physical_order == ["modified_day DESC", "record_id ASC"] and
       .production_query_regression.incident_predicates == [
         "withdrawn = false",

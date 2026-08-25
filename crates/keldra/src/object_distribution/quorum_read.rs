@@ -6,7 +6,7 @@ use std::time::Duration;
 use keldra_consensus::NodeId;
 use keldra_store::{
     CurrentObjectSnapshot, MAX_OBJECT_RECORD_EXPORT_RECORDS, ObjectKey, ObjectMutationContext,
-    ObjectPathSnapshot, ObjectSnapshotError, PlacementLogId, VersionId,
+    ObjectPathSnapshot, ObjectSnapshotError, PlacementLogId, Version, VersionId,
 };
 use tonic::Status;
 
@@ -333,6 +333,131 @@ impl ObjectDistribution {
             .collect()
     }
 
+    /// Selects immutable descriptors by the exact `(path, version)` identities
+    /// carried by source-journal records. There is deliberately no
+    /// current-head fallback: doing so could project a later mutation into an
+    /// earlier committed checkpoint.
+    pub(crate) async fn reconciled_exact_object_versions_stable(
+        &self,
+        keys: &[ObjectKey],
+        versions: &[VersionId],
+        tenant_id: u64,
+        bucket_id: u64,
+    ) -> Result<Vec<Option<Version>>, Status> {
+        if keys.is_empty() || keys.len() != versions.len() {
+            return Err(Status::invalid_argument(
+                "exact-version read requires equal non-empty key and version arrays",
+            ));
+        }
+        if keys.len() > MAX_OBJECT_RECORD_EXPORT_RECORDS as usize
+            || versions.iter().any(|version| version.0 == 0)
+        {
+            return Err(Status::resource_exhausted(format!(
+                "exact-version quorum batch must contain at most {MAX_OBJECT_RECORD_EXPORT_RECORDS} non-zero versions"
+            )));
+        }
+        let initial_fence = self.serving.mutation_context()?.active_placement_log_id;
+        let placement = self.placement()?;
+        if placement.fence() != initial_fence {
+            return Err(changed_fence());
+        }
+
+        let mut grouped = BTreeMap::<Vec<NodeId>, ExactVersionBatchGroup>::new();
+        for (index, (key, version)) in keys.iter().zip(versions).enumerate() {
+            let group = self.replica_group_stable(&placement, tenant_id, bucket_id, key)?;
+            grouped
+                .entry(group.replicas().to_vec())
+                .or_insert_with(|| ExactVersionBatchGroup {
+                    replicas: group.replicas().to_vec(),
+                    required: group.required_acknowledgements(),
+                    entries: Vec::new(),
+                })
+                .entries
+                .push((index, key.path().to_owned(), *version));
+        }
+        let groups = grouped.into_values().collect::<Vec<_>>();
+        let mut observations = vec![Vec::new(); groups.len()];
+        let mut reads = tokio::task::JoinSet::new();
+        for (group_index, group) in groups.iter().enumerate() {
+            let selections = group
+                .entries
+                .iter()
+                .map(|(_, path, version)| (path.clone(), *version))
+                .collect::<Vec<_>>();
+            for node in group.replicas.iter().copied() {
+                if node == self.local_node {
+                    let store = self.store.clone();
+                    let selections = selections.clone();
+                    reads.spawn(async move {
+                        let result = tokio::task::spawn_blocking(move || {
+                            store.export_exact_object_versions(tenant_id, bucket_id, &selections)
+                        })
+                        .await
+                        .map_err(|error| {
+                            Status::internal(format!(
+                                "local exact-version batch read task failed: {error}"
+                            ))
+                        })?
+                        .map_err(snapshot_status);
+                        Ok::<_, Status>((group_index, node, result))
+                    });
+                    continue;
+                }
+                let Some(address) = placement.address(node).cloned() else {
+                    tracing::warn!(node_id = node.0, "object replica has no peer address");
+                    continue;
+                };
+                let peers = self.peers.clone();
+                let selections = selections.clone();
+                reads.spawn(async move {
+                    let result = peers
+                        .read_exact_object_versions(
+                            node,
+                            &address.0,
+                            tenant_id,
+                            bucket_id,
+                            &selections,
+                        )
+                        .await;
+                    Ok::<_, Status>((group_index, node, result))
+                });
+            }
+        }
+        while let Some(result) = reads.join_next().await {
+            match result {
+                Ok(Ok((group_index, _node, Ok(batch)))) => observations[group_index].push(batch),
+                Ok(Ok((_group_index, node, Err(error)))) => tracing::warn!(
+                    node_id = node.0,
+                    %error,
+                    "exact-version batch replica read failed"
+                ),
+                Ok(Err(error)) => tracing::warn!(
+                    %error,
+                    "exact-version batch replica read setup failed"
+                ),
+                Err(error) => tracing::warn!(
+                    %error,
+                    "exact-version batch replica read task failed"
+                ),
+            }
+        }
+
+        let mut selected = vec![None; keys.len()];
+        for (group, observations) in groups.iter().zip(&observations) {
+            let group_selected = select_exact_version_batch_quorum(
+                observations,
+                group.required,
+                group.replicas.len(),
+                &group.entries,
+            )?;
+            for ((index, _, _), version) in group.entries.iter().zip(group_selected) {
+                selected[*index] = version;
+            }
+        }
+        self.require_unchanged_read_fence(initial_fence)?;
+        Ok(selected)
+    }
+
     /// Guarded derived-view publication is stricter than an ordinary read. The
     /// expected live definition must itself have an exact quorum, and no
     /// successfully read replica may expose a different current candidate.
@@ -488,6 +613,64 @@ struct CurrentObjectBatchGroup {
     replicas: Vec<NodeId>,
     required: usize,
     entries: Vec<(usize, String)>,
+}
+
+struct ExactVersionBatchGroup {
+    replicas: Vec<NodeId>,
+    required: usize,
+    entries: Vec<(usize, String, VersionId)>,
+}
+
+fn select_exact_version_batch_quorum(
+    observations: &[Vec<Option<Version>>],
+    required: usize,
+    replica_count: usize,
+    entries: &[(usize, String, VersionId)],
+) -> Result<Vec<Option<Version>>, Status> {
+    if required == 0 || required > replica_count || observations.len() < required {
+        return Err(Status::unavailable(format!(
+            "exact-version metadata read reached {} of {} required replicas",
+            observations.len(),
+            required
+        )));
+    }
+    if observations
+        .iter()
+        .any(|observation| observation.len() != entries.len())
+    {
+        return Err(Status::data_loss(
+            "exact-version replica batch returned the wrong result count",
+        ));
+    }
+    let mut selected = Vec::with_capacity(entries.len());
+    for (index, (_, _, expected)) in entries.iter().enumerate() {
+        let candidates = observations
+            .iter()
+            .map(|observation| observation[index].clone())
+            .collect::<Vec<_>>();
+        if candidates
+            .iter()
+            .flatten()
+            .any(|candidate| candidate.id != *expected)
+        {
+            return Err(Status::data_loss(
+                "exact-version replica returned another version identity",
+            ));
+        }
+        let Some(winner) = candidates.iter().find(|candidate| {
+            candidates
+                .iter()
+                .filter(|other| *other == *candidate)
+                .count()
+                >= required
+        }) else {
+            return Err(Status::unavailable(
+                "exact-version replicas do not have an exact quorum",
+            ));
+        };
+        selected.push(winner.clone());
+    }
+    Ok(selected)
 }
 
 fn select_quorum_snapshot(

@@ -1,12 +1,14 @@
 use keldra_api::v1::{CreateIndexRequest, IndexSpecification, PathIndexSpec};
 use keldra_store::{
-    BlobRef, Head, MUTATION_STAMP_FORMAT, MutationStamp, ObjectHeadChange, ObjectHeadChangeKind,
-    PlacementLogId, SourceId, Version, VersionId,
+    BlobRef, Head, ObjectHeadChange, ObjectHeadChangeKind, PlacementLogId, SourceId, Version,
+    VersionId,
 };
 
 use crate::index_runtime::events::{AtomicProgramWatermark, IndexJournalChange, IndexSourceCursor};
 
-use super::catch_up::journal_source_paths;
+use super::catch_up::{
+    earliest_publication_start, exact_source, journal_source_paths, record_source_page_progress,
+};
 use super::*;
 
 #[test]
@@ -20,6 +22,79 @@ fn publication_progress_is_narrow_and_compaction_stays_bounded() {
         DerivedArtifactAdmission::Bounded
     );
     assert_eq!(compaction_admission(), DerivedArtifactAdmission::Bounded);
+}
+
+#[test]
+fn journal_catch_up_never_waits_for_normal_merge_debt() {
+    assert!(!catch_up::should_compact_before_catch_up(false, 0, 0));
+    assert!(!catch_up::should_compact_before_catch_up(
+        false, 1_000, 1_000
+    ));
+    assert!(catch_up::should_compact_before_catch_up(true, 0, 0));
+    assert!(catch_up::should_compact_before_catch_up(
+        false,
+        MAX_SEGMENTS_PER_COMMIT - 1,
+        0,
+    ));
+    assert!(catch_up::should_compact_before_catch_up(
+        false,
+        0,
+        MAX_LOCATOR_ROOTS_PER_COMMIT - 1,
+    ));
+}
+
+#[tokio::test]
+async fn publication_slots_are_fifo_and_bounded() {
+    let slots = IndexPublicationSlots::new(1, 1);
+    let first = slots.acquire_incremental().await.unwrap();
+    let waiting = tokio::spawn({
+        let slots = slots.clone();
+        async move { slots.acquire_incremental().await.unwrap() }
+    });
+    tokio::task::yield_now().await;
+    assert!(!waiting.is_finished());
+    drop(first);
+    let _permit = tokio::time::timeout(Duration::from_secs(1), waiting)
+        .await
+        .expect("the oldest publication waiter must run after capacity is released")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn maintenance_publication_does_not_consume_incremental_capacity() {
+    let slots = IndexPublicationSlots::new(1, 1);
+    let _maintenance = slots.acquire_maintenance().await.unwrap();
+    let _permit = tokio::time::timeout(Duration::from_secs(1), slots.acquire_incremental())
+        .await
+        .expect("incremental admission must remain independent of maintenance")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn owned_background_task_is_aborted_when_dropped() {
+    let (started, started_rx) = tokio::sync::oneshot::channel();
+    let (dropped, dropped_rx) = tokio::sync::oneshot::channel();
+    struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            let _ = self
+                .0
+                .take()
+                .expect("drop signal remains installed")
+                .send(());
+        }
+    }
+    let task = AbortOnDropTask::new(tokio::spawn(async move {
+        let _signal = DropSignal(Some(dropped));
+        let _ = started.send(());
+        std::future::pending::<()>().await;
+    }));
+    started_rx.await.unwrap();
+    drop(task);
+    tokio::time::timeout(Duration::from_secs(1), dropped_rx)
+        .await
+        .expect("dropping task ownership must cancel the detached future")
+        .unwrap();
 }
 
 fn barrier(next_offset: u64) -> IndexBarrier {
@@ -51,6 +126,7 @@ fn journal_change(tenant_id: u64, bucket_id: u64, path: &str, offset: u64) -> In
             exact_path: path.to_owned(),
             path_version: VersionId(offset),
             kind: ObjectHeadChangeKind::Put,
+            program_commit_cursor: None,
             reference_deltas: Vec::new(),
             definition_transition: None,
             accounting_transition: None,
@@ -164,11 +240,15 @@ fn queue_dirty_definition(scheduler: &mut BuilderScheduler, definition: CatalogD
         current: None,
         through: barrier(10),
         target: barrier(12),
-        candidate: CandidateGeneration::rebuild(),
+        candidate: CandidateCommit::rebuild(),
         changed: true,
         must_publish: true,
+        checkpoint_started: None,
         maintenance: false,
         progress,
+        active: None,
+        publishing: None,
+        atomic_projection: None,
     });
     scheduler.entries.insert(
         identity,
@@ -189,7 +269,7 @@ fn reserved_segment_matching_is_not_a_string_prefix_guess() {
 }
 
 #[test]
-fn reserved_artifact_pages_have_no_generation_source_changes() {
+fn reserved_artifact_pages_have_no_commit_source_changes() {
     let page = journal_page(
         vec![
             journal_change(1, 2, "_keldra/indices/v4/0000000000000009/current", 11),
@@ -207,33 +287,44 @@ fn reserved_artifact_pages_have_no_generation_source_changes() {
 }
 
 #[test]
-fn irrelevant_source_progress_is_published_and_survives_reload() {
+fn routed_nonmatching_progress_gets_a_publication_clock_without_an_active_buffer() {
     let job = BuilderJob::new(definition(1, 2, 9)).unwrap();
     let mut work = CatchUpWork {
         current: None,
         through: barrier(10),
         target: barrier(13),
-        candidate: CandidateGeneration::rebuild(),
+        candidate: CandidateCommit::rebuild(),
         changed: false,
         must_publish: false,
+        checkpoint_started: None,
         maintenance: false,
         progress: BuilderProgress::start(job.telemetry_identity(), BuilderProgressPhase::CatchUp),
+        active: None,
+        publishing: None,
+        atomic_projection: None,
     };
     let page = journal_page(vec![journal_change(1, 2, "outside/scope.json", 12)], 13);
 
     assert!(journal_source_paths(1, 2, "records/", &page).is_empty());
-    record_source_page_progress(&mut work, &page);
+    record_source_page_progress(&mut work, &page.through);
     assert!(!work.changed);
     assert!(work.must_publish);
+    assert!(work.checkpoint_started.is_some());
+    assert_eq!(
+        earliest_publication_start(None, work.checkpoint_started),
+        work.checkpoint_started
+    );
     assert_eq!(work.through, work.target);
 
-    let manifest = super::super::generation::IndexGenerationManifest::new(
+    let manifest = super::super::committed_view::IndexCommitManifest::new(
         9,
         2,
         1,
         keldra_index::v4::IndexKind::Path,
         job.definition.schema_fingerprint,
         &work.through,
+        Vec::new(),
+        None,
         Vec::new(),
         work.candidate.segments,
         work.candidate.locator_roots,
@@ -242,30 +333,36 @@ fn irrelevant_source_progress_is_published_and_survives_reload() {
     )
     .unwrap();
     let reloaded =
-        super::super::generation::IndexGenerationManifest::decode(&manifest.encode().unwrap())
+        super::super::committed_view::IndexCommitManifest::decode(&manifest.encode().unwrap())
             .unwrap();
     assert_eq!(reloaded.barrier().unwrap(), barrier(13));
 }
 
 #[test]
-fn same_kind_ready_queue_gives_the_next_definition_a_turn() {
+fn same_kind_ready_queue_admits_bounded_inspections_in_fifo_order() {
     let mut scheduler = BuilderScheduler::default();
-    let first = definition(1, 2, 9);
-    let second = definition(3, 4, 9);
-    let first_identity = first.identity();
-    let second_identity = second.identity();
-    queue_definition(&mut scheduler, first);
-    queue_definition(&mut scheduler, second);
+    let definitions = (0..=MAX_OPEN_REBUILDS_PER_KIND)
+        .map(|offset| definition(1 + offset as u64, 2, 9))
+        .collect::<Vec<_>>();
+    let identities = definitions
+        .iter()
+        .map(CatalogDefinition::identity)
+        .collect::<Vec<_>>();
+    for definition in definitions {
+        queue_definition(&mut scheduler, definition);
+    }
 
-    let first_job = scheduler.pop_runnable().unwrap();
-    assert_eq!(first_job.definition.identity(), first_identity);
+    for expected in identities.iter().take(MAX_OPEN_REBUILDS_PER_KIND) {
+        assert_eq!(
+            scheduler.pop_runnable().unwrap().definition.identity(),
+            *expected
+        );
+    }
+    assert_eq!(
+        scheduler.running_inspects[kind_slot(IndexKind::Path)],
+        MAX_OPEN_REBUILDS_PER_KIND
+    );
     assert!(scheduler.pop_runnable().is_none());
-
-    scheduler.running_kinds[kind_slot(IndexKind::Path)] = false;
-    scheduler.entries.get_mut(&first_identity).unwrap().job = Some(first_job);
-    scheduler.enqueue(first_identity);
-    let next = scheduler.pop_runnable().unwrap();
-    assert_eq!(next.definition.identity(), second_identity);
 }
 
 #[test]
@@ -285,6 +382,26 @@ fn parked_rebuild_limit_prioritizes_same_kind_catch_up() {
     assert_eq!(selected.definition.identity(), catch_up_identity);
     assert!(matches!(selected.phase, BuilderPhase::CatchUp(_)));
     assert!(scheduler.pop_runnable().is_none());
+}
+
+#[test]
+fn same_kind_active_buffers_are_bounded_by_global_admission_not_a_kind_lock() {
+    let mut scheduler = BuilderScheduler::default();
+    let first = definition(1, 2, 9);
+    let second = definition(3, 4, 10);
+    let first_identity = first.identity();
+    let second_identity = second.identity();
+    queue_dirty_definition(&mut scheduler, first);
+    queue_dirty_definition(&mut scheduler, second);
+
+    assert_eq!(
+        scheduler.pop_runnable().unwrap().definition.identity(),
+        first_identity
+    );
+    assert_eq!(
+        scheduler.pop_runnable().unwrap().definition.identity(),
+        second_identity
+    );
 }
 
 #[test]
@@ -369,13 +486,12 @@ fn successful_publish_yields_a_lease_to_a_later_assignment() {
 
     let mut published_job = scheduler.pop_runnable().unwrap();
     let metadata = WorkMetadata::from_job(&published_job);
-    let (phase, disposition) = complete_publication(&mut published_job);
-    published_job.phase = phase;
+    published_job.phase = BuilderPhase::Inspect;
     scheduler.complete_with(
         metadata,
         BuilderStep {
             job: published_job,
-            disposition,
+            disposition: BuilderDisposition::Idle,
             retention_current: None,
         },
         |_, _, _| true,
@@ -476,79 +592,72 @@ fn malformed_source_evidence_fails_the_definition_closed() {
 }
 
 #[test]
-fn transient_catch_up_and_publish_failures_preserve_exact_work() {
+fn transient_catch_up_reinspects_and_replays_from_the_committed_cut() {
     let job = BuilderJob::new(definition(1, 2, 9)).unwrap();
     let catch_up = CatchUpWork {
         current: None,
         through: barrier(10),
         target: barrier(12),
-        candidate: CandidateGeneration::rebuild(),
+        candidate: CandidateCommit::rebuild(),
         changed: true,
         must_publish: true,
+        checkpoint_started: None,
         maintenance: false,
         progress: BuilderProgress::start(job.telemetry_identity(), BuilderProgressPhase::CatchUp),
+        active: None,
+        publishing: None,
+        atomic_projection: None,
     };
     let catch_up_step = recover_builder_failure(
         job,
         BuilderFailurePhase::CatchUp,
-        Some(BuilderPhase::CatchUp(catch_up)),
+        None,
         Status::unavailable("temporary peer failure"),
     );
     assert!(matches!(
         catch_up_step.disposition,
         BuilderDisposition::Retry(_)
     ));
-    let BuilderPhase::CatchUp(resumed) = catch_up_step.job.phase else {
-        panic!("transient catch-up failure discarded its resumable phase");
-    };
-    assert_eq!(resumed.through, barrier(10));
-    assert_eq!(resumed.target, barrier(12));
-    assert!(resumed.changed);
-    assert!(resumed.must_publish);
-
-    let publish = PublishWork {
-        current: None,
-        barrier: barrier(12),
-        candidate: CandidateGeneration::rebuild(),
-        admission: DerivedArtifactAdmission::PublicationProgress,
-    };
-    let publish_step = recover_builder_failure(
-        BuilderJob::new(definition(1, 2, 9)).unwrap(),
-        BuilderFailurePhase::Publish,
-        Some(BuilderPhase::Publish(publish)),
-        Status::deadline_exceeded("temporary publication timeout"),
-    );
-    assert!(matches!(
-        publish_step.disposition,
-        BuilderDisposition::Retry(_)
-    ));
-    assert!(matches!(publish_step.job.phase, BuilderPhase::Publish(_)));
+    assert!(matches!(catch_up_step.job.phase, BuilderPhase::Inspect));
+    drop(catch_up);
 }
 
 #[test]
-fn head_advanced_past_a_fixed_target_reinspects_instead_of_retrying_forever() {
-    let target = barrier(12);
-    let head = Head {
-        version: VersionId(13),
-        deleted: false,
-        mutation_stamp: Some(MutationStamp {
-            format: MUTATION_STAMP_FORMAT,
-            predecessor_version: Some(VersionId(12)),
-            program_commit_cursor: None,
-            mutation_fingerprint: [9; 32],
-            active_placement_log_id: target.fence,
-            serving_fence_term: 3,
-            source_id: target.sources[&NodeId(1)].source,
-            source_journal_position: 12,
+fn exact_projection_uses_the_journal_version_not_a_newer_head() {
+    let definition = definition(1, 2, 9);
+    let at_n = Version {
+        id: VersionId(12),
+        blob: Some(BlobRef {
+            hash: [12; 32],
+            length: 17,
         }),
+        deleted: false,
+        content_type: Some("application/json".into()),
+        committed_at_unix_millis: 12,
     };
+    let selected = exact_source(&definition, "docs/a", 12, Some(at_n)).unwrap();
+    let IndexSourceMutation::Upsert(selected) = selected else {
+        panic!("live exact version must project as an upsert")
+    };
+    assert_eq!(selected.version, 12);
+    assert_eq!(selected.content_hash, [12; 32]);
+}
 
-    let error = require_visible_head(&head, &target).unwrap_err();
-    assert_eq!(error.code(), tonic::Code::Aborted);
-    assert_eq!(
-        failure_recovery(BuilderFailurePhase::CatchUp, &error),
-        BuilderFailureRecovery::Reinspect
-    );
+#[test]
+fn exact_projection_rejects_n_plus_one_at_checkpoint_n() {
+    let definition = definition(1, 2, 9);
+    let at_n_plus_one = Version {
+        id: VersionId(13),
+        blob: Some(BlobRef {
+            hash: [13; 32],
+            length: 17,
+        }),
+        content_type: Some("application/json".into()),
+        deleted: false,
+        committed_at_unix_millis: 13,
+    };
+    let error = exact_source(&definition, "docs/a", 12, Some(at_n_plus_one)).unwrap_err();
+    assert_eq!(error.code(), tonic::Code::DataLoss);
 }
 
 #[test]
@@ -558,11 +667,15 @@ fn incompatible_incremental_history_fails_closed_without_opening_a_snapshot() {
         current: None,
         through: barrier(10),
         target: barrier(12),
-        candidate: CandidateGeneration::rebuild(),
+        candidate: CandidateCommit::rebuild(),
         changed: false,
         must_publish: false,
+        checkpoint_started: None,
         maintenance: false,
         progress: BuilderProgress::start(job.telemetry_identity(), BuilderProgressPhase::CatchUp),
+        active: None,
+        publishing: None,
+        atomic_projection: None,
     };
     let step = recover_builder_failure(
         job,
@@ -584,13 +697,6 @@ fn incompatible_incremental_history_fails_closed_without_opening_a_snapshot() {
         failure_recovery(
             BuilderFailurePhase::Rebuild,
             &Status::unavailable("terminal snapshot stream")
-        ),
-        BuilderFailureRecovery::Reinspect
-    );
-    assert_eq!(
-        failure_recovery(
-            BuilderFailurePhase::Publish,
-            &Status::failed_precondition("definition changed before CAS")
         ),
         BuilderFailureRecovery::Reinspect
     );
@@ -629,10 +735,11 @@ fn resident_work_plan_charges_every_simultaneous_allocation() {
     let total = keldra_index::MIN_INDEX_KIND_MEMORY_BYTES as u64;
     let configured = SegmentMemoryPlan::new(total as usize).unwrap();
     let source_resident_bytes = 8 * 1024 * 1024;
-    let plan = work_plan_for_limit(total, source_resident_bytes).unwrap();
+    let flush_bytes = 16 * 1024 * 1024;
+    let plan = work_plan_for_limit(total, source_resident_bytes, flush_bytes).unwrap();
 
     assert!(source_wire_limit(total) >= 64 * 1024);
-    assert_eq!(plan.max_resident_bytes, configured.max_resident_bytes);
+    assert_eq!(plan.max_resident_bytes, flush_bytes as usize);
     assert!(plan.max_source_projection_bytes > 0);
     assert_eq!(
         plan.max_resident_bytes
@@ -642,4 +749,18 @@ fn resident_work_plan_charges_every_simultaneous_allocation() {
         plan.total_bytes
     );
     assert!(configured.max_resident_bytes > 1024 * 1024);
+}
+
+#[test]
+fn segment_work_plan_never_exceeds_the_configured_flush_target() {
+    let total = keldra_index::MIN_INDEX_KIND_MEMORY_BYTES as u64;
+    let plan = work_plan_for_limit(total, 0, 4 * 1024 * 1024).unwrap();
+
+    assert_eq!(plan.max_resident_bytes, 4 * 1024 * 1024);
+    assert_eq!(
+        plan.max_resident_bytes
+            + FIXED_INDEX_SEAL_WORKSPACE_BYTES
+            + plan.max_source_projection_bytes,
+        plan.total_bytes
+    );
 }

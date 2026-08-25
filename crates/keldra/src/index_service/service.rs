@@ -34,7 +34,8 @@ use crate::v05::{ObjectServiceImpl, request_deadline, run_request_until};
 
 use super::boundary::{
     ExecuteIndexQuery, IndexAuthorizationEvidence, IndexDefinitionScan, IndexDefinitionScanPage,
-    IndexPageCursor, IndexPageTokenBinding, IndexRequestContext, IndexServiceDependencies,
+    IndexFreshnessRequirement, IndexPageCursor, IndexPageTokenBinding, IndexRequestContext,
+    IndexServiceDependencies, RequiredIndexSourceCheckpoint,
 };
 use super::{
     AuthorizedCurrentCandidates, IndexCandidateVisibility, StoredIndexDefinition, definition_path,
@@ -659,6 +660,7 @@ impl IndexServiceRpc for IndexServiceImpl {
                 let context =
                     query_request_context(&request, request.get_ref().tenant.as_str(), deadline)?;
                 let request = request.into_inner();
+                let required_freshness = decode_required_freshness(request.required_freshness)?;
                 let query = request
                     .query
                     .ok_or_else(|| Status::invalid_argument("index query is required"))?;
@@ -700,6 +702,11 @@ impl IndexServiceRpc for IndexServiceImpl {
                     validate_page_cursor(&cursor)?;
                     Some(cursor)
                 };
+                if resume.is_some() && required_freshness.is_some() {
+                    return Err(Status::invalid_argument(
+                        "required freshness cannot be combined with a continuation token",
+                    ));
+                }
                 if resume
                     .as_ref()
                     .is_some_and(|cursor| cursor.authorization_revision != admission.revision)
@@ -736,6 +743,7 @@ impl IndexServiceRpc for IndexServiceImpl {
                         candidate_visibility,
                         authorization_revision: admission.revision,
                         resume: resume.clone(),
+                        required_freshness,
                     })
                     .await?;
                 validate_execution(&executed, resume.as_ref(), limit)?;
@@ -745,7 +753,7 @@ impl IndexServiceRpc for IndexServiceImpl {
                         context.caller(),
                         binding,
                         &IndexPageCursor {
-                            generation: executed.freshness.generation,
+                            commit_revision: executed.freshness.commit_revision,
                             last_position,
                             authorization_revision,
                         },
@@ -1024,6 +1032,53 @@ fn page_limit(value: u32) -> Result<usize, Status> {
     }
 }
 
+fn decode_required_freshness(
+    requirement: Option<keldra_api::v1::IndexFreshnessRequirement>,
+) -> Result<Option<IndexFreshnessRequirement>, Status> {
+    let Some(requirement) = requirement else {
+        return Ok(None);
+    };
+    if requirement.sources.is_empty() && requirement.atomic_through.is_none() {
+        return Err(Status::invalid_argument(
+            "required freshness must contain a source or atomic checkpoint",
+        ));
+    }
+    if requirement.sources.len() > 1_024 {
+        return Err(Status::invalid_argument(
+            "required freshness contains too many source checkpoints",
+        ));
+    }
+    let mut sources = requirement
+        .sources
+        .into_iter()
+        .map(|source| {
+            let node_id = u16::try_from(source.node_id)
+                .map_err(|_| Status::invalid_argument("freshness source node ID is invalid"))?;
+            let source_epoch: [u8; 32] = source.source_epoch.try_into().map_err(|_| {
+                Status::invalid_argument("freshness source epoch must contain exactly 32 bytes")
+            })?;
+            Ok(RequiredIndexSourceCheckpoint {
+                node_id: u64::from(node_id),
+                source_epoch,
+                next_offset: source.next_offset,
+            })
+        })
+        .collect::<Result<Vec<_>, Status>>()?;
+    sources.sort_by_key(|source| source.node_id);
+    if sources
+        .windows(2)
+        .any(|pair| pair[0].node_id == pair[1].node_id)
+    {
+        return Err(Status::invalid_argument(
+            "required freshness contains duplicate source nodes",
+        ));
+    }
+    Ok(Some(IndexFreshnessRequirement {
+        sources,
+        atomic_through: requirement.atomic_through,
+    }))
+}
+
 fn validate_scan_page(page: &IndexDefinitionScanPage, after: Option<&str>) -> Result<(), Status> {
     if page.definitions.len() > MAX_PAGE_LIMIT {
         return Err(Status::data_loss(
@@ -1065,7 +1120,7 @@ fn canonical_query_hash(query: &IndexQuery) -> [u8; 32] {
 }
 
 fn validate_page_cursor(cursor: &IndexPageCursor) -> Result<(), Status> {
-    if cursor.generation == 0
+    if cursor.commit_revision == 0
         || cursor.last_position.is_empty()
         || cursor.authorization_revision == 0
     {
@@ -1118,9 +1173,9 @@ fn validate_execution(
             "index executor returned an empty continuation position",
         ));
     }
-    if execution.next_position.is_some() && execution.freshness.generation == 0 {
+    if execution.next_position.is_some() && execution.freshness.commit_revision == 0 {
         return Err(Status::data_loss(
-            "index executor returned a continuation without a generation",
+            "index executor returned a continuation without a commit revision",
         ));
     }
     if execution.freshness.authorization_revision == 0 {
@@ -1129,9 +1184,9 @@ fn validate_execution(
         ));
     }
     if let Some(resume) = resume {
-        if execution.freshness.generation != resume.generation {
+        if execution.freshness.commit_revision != resume.commit_revision {
             return Err(Status::failed_precondition(
-                "requested index generation is no longer available",
+                "requested index commit revision is no longer available",
             ));
         }
         if execution.freshness.authorization_revision != resume.authorization_revision {
@@ -1464,10 +1519,10 @@ mod tests {
     }
 
     #[test]
-    fn continuations_require_generation_position_and_authorization_revision() {
+    fn continuations_require_commit_position_and_authorization_revision() {
         assert!(
             validate_page_cursor(&IndexPageCursor {
-                generation: 4,
+                commit_revision: 4,
                 last_position: b"after".to_vec(),
                 authorization_revision: 8,
             })
@@ -1475,17 +1530,17 @@ mod tests {
         );
         for cursor in [
             IndexPageCursor {
-                generation: 0,
+                commit_revision: 0,
                 last_position: b"after".to_vec(),
                 authorization_revision: 8,
             },
             IndexPageCursor {
-                generation: 4,
+                commit_revision: 4,
                 last_position: Vec::new(),
                 authorization_revision: 8,
             },
             IndexPageCursor {
-                generation: 4,
+                commit_revision: 4,
                 last_position: b"after".to_vec(),
                 authorization_revision: 0,
             },
@@ -1501,7 +1556,7 @@ mod tests {
             facet_results: Vec::new(),
             aggregate_results: Vec::new(),
             freshness: IndexFreshness {
-                generation: 7,
+                commit_revision: 7,
                 sources: vec![IndexSourceFreshness {
                     node_id: 2,
                     source_epoch: vec![3; 16],
@@ -1523,7 +1578,7 @@ mod tests {
     #[test]
     fn zero_hit_execution_still_requires_and_preserves_the_zanzibar_revision() {
         let resume = IndexPageCursor {
-            generation: 7,
+            commit_revision: 7,
             last_position: b"after".to_vec(),
             authorization_revision: 9,
         };
@@ -1532,7 +1587,7 @@ mod tests {
             facet_results: Vec::new(),
             aggregate_results: Vec::new(),
             freshness: IndexFreshness {
-                generation: 7,
+                commit_revision: 7,
                 authorization_revision: 9,
                 ..Default::default()
             },
@@ -1601,6 +1656,54 @@ mod tests {
             validate_query_kind(&path_definition, &tensor)
                 .unwrap_err()
                 .code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn freshness_requirement_is_canonicalized_and_exact() {
+        let decoded = decode_required_freshness(Some(keldra_api::v1::IndexFreshnessRequirement {
+            sources: vec![
+                keldra_api::v1::IndexRequiredSourceCheckpoint {
+                    node_id: 9,
+                    source_epoch: vec![9; 32],
+                    next_offset: 41,
+                },
+                keldra_api::v1::IndexRequiredSourceCheckpoint {
+                    node_id: 3,
+                    source_epoch: vec![3; 32],
+                    next_offset: 17,
+                },
+            ],
+            atomic_through: Some(12),
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            decoded
+                .sources
+                .iter()
+                .map(|source| source.node_id)
+                .collect::<Vec<_>>(),
+            vec![3, 9]
+        );
+        assert_eq!(decoded.atomic_through, Some(12));
+    }
+
+    #[test]
+    fn freshness_requirement_rejects_duplicate_sources() {
+        let source = keldra_api::v1::IndexRequiredSourceCheckpoint {
+            node_id: 3,
+            source_epoch: vec![3; 32],
+            next_offset: 17,
+        };
+        assert_eq!(
+            decode_required_freshness(Some(keldra_api::v1::IndexFreshnessRequirement {
+                sources: vec![source.clone(), source],
+                atomic_through: None,
+            }))
+            .unwrap_err()
+            .code(),
             tonic::Code::InvalidArgument
         );
     }

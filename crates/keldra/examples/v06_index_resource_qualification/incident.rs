@@ -29,7 +29,7 @@ pub(super) struct IncidentReport {
     corpus_records: u64,
     index_id: u64,
     definition_version: u64,
-    generation: u64,
+    commit_revision: u64,
     physical_order: [&'static str; 2],
     incident_predicates: [&'static str; 3],
     limit_four: QueryEvidence,
@@ -44,7 +44,7 @@ struct QueryEvidence {
     returned_hits: usize,
     exact_order: bool,
     elapsed_milliseconds: f64,
-    generation: u64,
+    commit_revision: u64,
     result_sha256: String,
 }
 
@@ -61,7 +61,7 @@ struct PaginationEvidence {
     overlap: usize,
     page_one_elapsed_milliseconds: f64,
     page_two_elapsed_milliseconds: f64,
-    generation: u64,
+    commit_revision: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -69,7 +69,7 @@ struct ComputationEvidence {
     returned_hits: usize,
     exact_order: bool,
     elapsed_milliseconds: f64,
-    generation: u64,
+    commit_revision: u64,
     result_sha256: String,
     matching_documents: usize,
 }
@@ -176,8 +176,8 @@ pub(super) async fn run(
         .count();
     ensure!(overlap == 0, "consecutive incident-query pages overlap");
     ensure!(
-        freshness(&page_one)?.generation == freshness(&page_two)?.generation,
-        "consecutive incident-query pages crossed generations"
+        freshness(&page_one)?.commit_revision == freshness(&page_two)?.commit_revision,
+        "consecutive incident-query pages crossed commit revisions"
     );
 
     let (zero_hit, zero_hit_elapsed) =
@@ -229,17 +229,17 @@ pub(super) async fn run(
         ensure!(
             observed.index_id == identity.index_id
                 && observed.definition_version == identity.definition_version
-                && observed.generation == identity.generation,
-            "production-shaped query sequence crossed index identity or generation"
+                && observed.commit_revision == identity.commit_revision,
+            "production-shaped query sequence crossed index identity or commit_revision"
         );
     }
 
     Ok(IncidentReport {
-        schema: "keldra.index-production-query-regression.v1",
+        schema: "keldra.index-production-query-regression.v2",
         corpus_records: records,
         index_id: identity.index_id,
         definition_version: identity.definition_version,
-        generation: identity.generation,
+        commit_revision: identity.commit_revision,
         physical_order: ["modified_day DESC", "record_id ASC"],
         incident_predicates: [
             "withdrawn = false",
@@ -250,7 +250,7 @@ pub(super) async fn run(
             returned_hits: limit_four_ids.len(),
             exact_order: true,
             elapsed_milliseconds: limit_four_elapsed,
-            generation: freshness(&limit_four)?.generation,
+            commit_revision: freshness(&limit_four)?.commit_revision,
             result_sha256: result_sha256(&limit_four_ids),
         },
         consecutive_pages: PaginationEvidence {
@@ -265,27 +265,27 @@ pub(super) async fn run(
             overlap,
             page_one_elapsed_milliseconds: page_one_elapsed,
             page_two_elapsed_milliseconds: page_two_elapsed,
-            generation: freshness(&page_two)?.generation,
+            commit_revision: freshness(&page_two)?.commit_revision,
         },
         zero_hit_sparse_conjunction: QueryEvidence {
             returned_hits: zero_hit_ids.len(),
             exact_order: true,
             elapsed_milliseconds: zero_hit_elapsed,
-            generation: freshness(&zero_hit)?.generation,
+            commit_revision: freshness(&zero_hit)?.commit_revision,
             result_sha256: result_sha256(&zero_hit_ids),
         },
         unselective_arbitrary_sort: QueryEvidence {
             returned_hits: arbitrary_ids.len(),
             exact_order: true,
             elapsed_milliseconds: arbitrary_elapsed,
-            generation: freshness(&arbitrary)?.generation,
+            commit_revision: freshness(&arbitrary)?.commit_revision,
             result_sha256: result_sha256(&arbitrary_ids),
         },
         exact_computations: ComputationEvidence {
             returned_hits: computation_ids.len(),
             exact_order: true,
             elapsed_milliseconds: computations_elapsed,
-            generation: freshness(&computations)?.generation,
+            commit_revision: freshness(&computations)?.commit_revision,
             result_sha256: result_sha256(&computation_ids),
             matching_documents: incident_expected.len(),
         },
@@ -448,6 +448,7 @@ async fn execute(
             limit,
             page_token,
             tenant: String::new(),
+            required_freshness: None,
         })
         .await
         .context("run production-shaped TypedJson query")?

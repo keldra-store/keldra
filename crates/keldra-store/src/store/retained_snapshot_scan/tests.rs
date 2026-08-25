@@ -69,7 +69,7 @@ async fn one_path_with_many_versions_streams_in_bounded_path_version_order() {
 }
 
 #[tokio::test]
-async fn unversioned_overwrite_exposes_only_the_current_retained_descriptor() {
+async fn unversioned_overwrite_keeps_checkpoint_retained_descriptors_reachable() {
     let temporary = tempfile::tempdir().unwrap();
     let store = Store::open(StoreOptions::new(temporary.path(), 1))
         .await
@@ -89,9 +89,14 @@ async fn unversioned_overwrite_exposes_only_the_current_retained_descriptor() {
         .await
         .unwrap();
     let frame = scan.next_frame().await.unwrap().unwrap();
-    assert_eq!(frame.records.len(), 1);
-    assert_eq!(frame.records[0].version.id, current.version);
-    assert_eq!(frame.records[0].current_head.version, current.version);
+    assert_eq!(frame.records.len(), 2);
+    assert_eq!(frame.records[1].version.id, current.version);
+    assert!(
+        frame
+            .records
+            .iter()
+            .all(|record| record.current_head.version == current.version)
+    );
     assert!(scan.next_frame().await.unwrap().is_none());
 }
 

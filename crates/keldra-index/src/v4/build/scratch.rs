@@ -5,7 +5,7 @@ use crate::IndexError;
 /// One restart-disposable random-access file used while merging immutable
 /// format-v4 segments.
 ///
-/// Scratch bytes are never referenced by a segment, generation manifest,
+/// Scratch bytes are never referenced by a segment, commit manifest,
 /// Raft record, or ordinary object.  A caller owns their lifetime and may
 /// discard the complete workspace after success, failure, or restart.
 pub trait MergeScratchFile: Clone + Send + Sync + 'static {

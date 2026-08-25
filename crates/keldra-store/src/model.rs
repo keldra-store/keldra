@@ -18,7 +18,7 @@ pub const SMALL_BLOB_MAX_BYTES: usize = 64 * 1024;
 pub struct VersionId(pub u64);
 
 pub const MUTATION_STAMP_FORMAT: u16 = 1;
-pub const OBJECT_MUTATION_FORMAT: u16 = 1;
+pub const OBJECT_MUTATION_FORMAT: u16 = 2;
 pub const RETAINED_VERSION_DELETE_FORMAT: u16 = 1;
 pub const MAX_OBJECT_MUTATION_REFERENCE_DELTAS: usize = 2;
 pub const MAX_CONTENT_TYPE_BYTES: usize = 512;
@@ -216,7 +216,6 @@ pub struct ObjectMutation {
     pub command_id: String,
     pub input_fingerprint: [u8; 32],
     pub version: Version,
-    pub retire_predecessor: bool,
     pub receipt_expires_at_unix_millis: u64,
     pub stamp: MutationStamp,
     pub reference_deltas: Vec<ReferenceDelta>,
@@ -233,7 +232,7 @@ impl ObjectMutation {
 
     pub fn computed_fingerprint(&self) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"keldra.object-mutation.v1");
+        hasher.update(b"keldra.object-mutation.v2");
         hash_u16(&mut hasher, self.format);
         hash_u64(&mut hasher, self.tenant_id);
         hash_u64(&mut hasher, self.bucket_id);
@@ -241,7 +240,6 @@ impl ObjectMutation {
         hash_bytes(&mut hasher, self.command_id.as_bytes());
         hasher.update(&self.input_fingerprint);
         hash_version(&mut hasher, &self.version);
-        hasher.update(&[u8::from(self.retire_predecessor)]);
         hash_u64(&mut hasher, self.receipt_expires_at_unix_millis);
         hash_u16(&mut hasher, self.stamp.format);
         hash_optional_version(&mut hasher, self.stamp.predecessor_version);
@@ -328,11 +326,6 @@ impl ObjectMutation {
         {
             return Err(MutationError::InvalidObjectMutation(
                 "new version must follow its predecessor".into(),
-            ));
-        }
-        if self.retire_predecessor && self.stamp.predecessor_version.is_none() {
-            return Err(MutationError::InvalidObjectMutation(
-                "predecessor retirement does not match mutation lineage".into(),
             ));
         }
         if self.stamp.program_commit_cursor.is_some() {
@@ -715,6 +708,15 @@ pub enum MutationError {
         "one source-journal transition requires {bytes} bytes, exceeding the configured {maximum} byte bound"
     )]
     SourceJournalRecordTooLarge { bytes: u64, maximum: u64 },
+    #[error(
+        "one indivisible source-journal transition requires {entries} records and {bytes} bytes, exceeding the configured bounds of {maximum_entries} records and {maximum_bytes} bytes"
+    )]
+    SourceJournalTransitionTooLarge {
+        entries: u64,
+        bytes: u64,
+        maximum_entries: u64,
+        maximum_bytes: u64,
+    },
     #[error("invalid replicated object mutation: {0}")]
     InvalidObjectMutation(String),
     #[error(

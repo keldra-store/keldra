@@ -14,7 +14,7 @@ pub(super) async fn compact_oldest_prefix(
     kind: IndexKind,
     selection: debt::LocatorDebtSelection,
     admission: DerivedArtifactAdmission,
-    candidate: &mut CandidateGeneration,
+    candidate: &mut CandidateCommit,
     dependencies: &IndexBuilderDependencies,
 ) -> Result<(), Status> {
     if !(2..=LOCATOR_COMPACTION_FAN_IN).contains(&selection.input_roots)

@@ -129,10 +129,10 @@ impl Predicate {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GenerationSelection {
+pub struct CommitSelection {
     pub index_id: u64,
     pub definition_version: u64,
-    pub generation: u64,
+    pub commit_revision: u64,
     pub schema_fingerprint: [u8; 32],
     pub manifest_hash: [u8; 32],
 }
@@ -168,7 +168,7 @@ pub struct SortCursor {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScanRequest {
-    pub generation: GenerationSelection,
+    pub commit: CommitSelection,
     pub authorization_scope: AuthorizationScope,
     pub required_doc_value_field_ids: Vec<FieldId>,
     pub predicate_expression: Option<Predicate>,
@@ -180,11 +180,11 @@ pub struct ScanRequest {
 
 impl ScanRequest {
     pub fn validate(&self) -> Result<(), IndexError> {
-        if self.generation.index_id == 0
-            || self.generation.definition_version == 0
-            || self.generation.generation == 0
-            || self.generation.schema_fingerprint == [0; 32]
-            || self.generation.manifest_hash == [0; 32]
+        if self.commit.index_id == 0
+            || self.commit.definition_version == 0
+            || self.commit.commit_revision == 0
+            || self.commit.schema_fingerprint == [0; 32]
+            || self.commit.manifest_hash == [0; 32]
             || self.authorization_scope.tenant_id == 0
             || self.authorization_scope.bucket_id == 0
             || self.authorization_scope.zanzibar_revision == 0
@@ -303,10 +303,10 @@ mod tests {
             field_id: FieldId::new(2),
         };
         let request = ScanRequest {
-            generation: GenerationSelection {
+            commit: CommitSelection {
                 index_id: 1,
                 definition_version: 2,
-                generation: 3,
+                commit_revision: 3,
                 schema_fingerprint: [4; 32],
                 manifest_hash: [5; 32],
             },

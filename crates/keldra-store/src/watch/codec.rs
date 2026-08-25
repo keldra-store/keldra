@@ -7,15 +7,16 @@
 use thiserror::Error;
 
 use super::{
-    AccountingHeadTransition, AggregateChanged, AggregateKind, ContentLifecycleChanged,
-    LocalChange, ObjectHeadChange, ObjectHeadChangeKind, RetainedVersionDeletedChange,
+    AccountingHeadTransition, AggregateChanged, AggregateKind, ContentAccountingTransition,
+    ContentLifecycleChanged, LocalChange, ObjectHeadChange, ObjectHeadChangeKind,
+    RetainedVersionDeletedChange,
 };
 use crate::{
     BlobRef, DefinitionKind, DefinitionOperation, DefinitionTransition, ReferenceDelta, VersionId,
 };
 
 const MAGIC: &[u8; 4] = b"ANVJ";
-const FORMAT: u16 = 2;
+const FORMAT: u16 = 5;
 const RESERVED: u8 = 0;
 const HEADER_BYTES: usize = 4 + 2 + 1 + 1 + 8 + 8;
 
@@ -23,6 +24,7 @@ const OBJECT_HEAD: u8 = 1;
 const RETAINED_VERSION_DELETED: u8 = 2;
 const AGGREGATE_CHANGED: u8 = 3;
 const CONTENT_LIFECYCLE_CHANGED: u8 = 4;
+const ATOMIC_BATCH_PUBLISHED: u8 = 5;
 
 const PUT: u8 = 1;
 const DELETE: u8 = 2;
@@ -121,6 +123,7 @@ fn encode_body(change: &LocalChange) -> Result<(u8, Vec<u8>), LocalChangeCodecEr
                     ObjectHeadChangeKind::Delete => DELETE,
                 },
             );
+            put_optional_u64(&mut body, change.program_commit_cursor);
             put_reference_deltas(&mut body, &change.reference_deltas)?;
             put_accounting_transition(&mut body, change.accounting_transition);
             put_definition_transition(&mut body, change.definition_transition.as_ref())?;
@@ -158,7 +161,48 @@ fn encode_body(change: &LocalChange) -> Result<(u8, Vec<u8>), LocalChangeCodecEr
             put_bytes(&mut body, &change.blob_identity)?;
             put_u64(&mut body, change.revision);
             put_reference_deltas(&mut body, &change.reference_deltas)?;
+            match &change.accounting_transition {
+                Some(transition) => {
+                    put_u8(&mut body, 1);
+                    put_u64(&mut body, transition.tenant_id);
+                    put_u64(&mut body, transition.bucket_id);
+                    put_string(&mut body, &transition.exact_path)?;
+                    put_u64(&mut body, transition.retained_bytes_removed);
+                }
+                None => put_u8(&mut body, 0),
+            }
             Ok((CONTENT_LIFECYCLE_CHANGED, body))
+        }
+        LocalChange::AtomicBatchPublished(change) => {
+            change.validate().map_err(malformed)?;
+            put_u64(&mut body, change.offset);
+            put_u64(&mut body, change.cursor);
+            body.extend_from_slice(&change.bundle_hash.0);
+            put_u64(
+                &mut body,
+                u64::try_from(change.affected_routes.len())
+                    .map_err(|_| malformed("atomic route count is exhausted"))?,
+            );
+            for route in &change.affected_routes {
+                put_u64(&mut body, route.tenant_id);
+                put_u64(&mut body, route.bucket_id);
+            }
+            put_u64(
+                &mut body,
+                u64::try_from(change.mutations.len())
+                    .map_err(|_| malformed("atomic mutation count is exhausted"))?,
+            );
+            for mutation in &change.mutations {
+                put_u64(&mut body, mutation.tenant_id);
+                put_u64(&mut body, mutation.bucket_id);
+                put_string(&mut body, &mutation.exact_path)?;
+                put_u64(&mut body, mutation.path_version.0);
+                put_u8(&mut body, u8::from(mutation.deleted));
+                put_u16(&mut body, mutation.source_id.node_id);
+                body.extend_from_slice(&mutation.source_id.source_epoch);
+                put_u64(&mut body, mutation.source_journal_position);
+            }
+            Ok((ATOMIC_BATCH_PUBLISHED, body))
         }
     }
 }
@@ -176,6 +220,7 @@ fn decode_body(kind: u8, input: &mut Input<'_>) -> Result<LocalChange, LocalChan
                 DELETE => ObjectHeadChangeKind::Delete,
                 _ => return Err(malformed("object-head operation is unknown")),
             },
+            program_commit_cursor: input.optional_u64()?,
             reference_deltas: input.reference_deltas()?,
             accounting_transition: input.accounting_transition()?,
             definition_transition: input.definition_transition()?,
@@ -208,8 +253,73 @@ fn decode_body(kind: u8, input: &mut Input<'_>) -> Result<LocalChange, LocalChan
                 blob_identity: input.bytes()?.to_vec(),
                 revision: input.u64()?,
                 reference_deltas: input.reference_deltas()?,
+                accounting_transition: match input.u8()? {
+                    0 => None,
+                    1 => Some(ContentAccountingTransition {
+                        tenant_id: input.u64()?,
+                        bucket_id: input.u64()?,
+                        exact_path: input.string()?.to_owned(),
+                        retained_bytes_removed: input.u64()?,
+                    }),
+                    _ => return Err(malformed("content accounting marker is invalid")),
+                },
             },
         )),
+        ATOMIC_BATCH_PUBLISHED => {
+            let offset = input.u64()?;
+            let cursor = input.u64()?;
+            let bundle_hash = crate::PreparedBundleHash(input.array()?);
+            let route_count = input.length_count("atomic route", 16)?;
+            if route_count > super::MAX_ATOMIC_BATCH_MUTATIONS {
+                return Err(malformed("atomic route count exceeds the format bound"));
+            }
+            let mut affected_routes = Vec::new();
+            affected_routes
+                .try_reserve_exact(route_count)
+                .map_err(|_| malformed("atomic route allocation failed"))?;
+            for _ in 0..route_count {
+                affected_routes.push(super::AtomicBatchRoute {
+                    tenant_id: input.u64()?,
+                    bucket_id: input.u64()?,
+                });
+            }
+            // tenant + bucket + string length + version + deleted + source + position
+            let mutation_count = input.length_count("atomic mutation", 75)?;
+            if mutation_count > super::MAX_ATOMIC_BATCH_MUTATIONS {
+                return Err(malformed("atomic mutation count exceeds the format bound"));
+            }
+            let mut mutations = Vec::new();
+            mutations
+                .try_reserve_exact(mutation_count)
+                .map_err(|_| malformed("atomic mutation allocation failed"))?;
+            for _ in 0..mutation_count {
+                mutations.push(super::AtomicBatchMutation {
+                    tenant_id: input.u64()?,
+                    bucket_id: input.u64()?,
+                    exact_path: input.string()?,
+                    path_version: VersionId(input.u64()?),
+                    deleted: match input.u8()? {
+                        0 => false,
+                        1 => true,
+                        _ => return Err(malformed("atomic mutation delete flag is invalid")),
+                    },
+                    source_id: crate::SourceId {
+                        node_id: input.u16()?,
+                        source_epoch: input.array()?,
+                    },
+                    source_journal_position: input.u64()?,
+                });
+            }
+            let change = super::AtomicBatchPublished {
+                offset,
+                cursor,
+                bundle_hash,
+                affected_routes,
+                mutations,
+            };
+            change.validate().map_err(malformed)?;
+            Ok(LocalChange::AtomicBatchPublished(change))
+        }
         _ => Err(malformed("local change kind is unknown")),
     }
 }
@@ -530,6 +640,28 @@ mod tests {
                     },
                     change: -1,
                 }],
+                None,
+            ),
+            LocalChange::atomic_batch_published(
+                11,
+                73,
+                crate::PreparedBundleHash([7; 32]),
+                vec![crate::AtomicBatchRoute {
+                    tenant_id: 11,
+                    bucket_id: 12,
+                }],
+                vec![crate::AtomicBatchMutation {
+                    tenant_id: 11,
+                    bucket_id: 12,
+                    exact_path: "documents/two".into(),
+                    path_version: VersionId(42),
+                    deleted: false,
+                    source_id: crate::SourceId {
+                        node_id: 3,
+                        source_epoch: [9; 32],
+                    },
+                    source_journal_position: 17,
+                }],
             ),
         ];
 
@@ -554,7 +686,7 @@ mod tests {
             b'V',
             b'J', // magic
             0,
-            2, // format
+            5, // format
             AGGREGATE_CHANGED,
             0, // reserved
             0,
@@ -609,6 +741,12 @@ mod tests {
     #[test]
     fn malformed_headers_lengths_tags_and_utf8_fail_closed() {
         let encoded = encode_local_change(&object_change()).unwrap();
+        let mut old_format = encoded.clone();
+        old_format[5] = 4;
+        assert!(matches!(
+            decode_local_change(&old_format),
+            Err(LocalChangeCodecError::UnsupportedFormat(4))
+        ));
         let mutations: [fn(&mut Vec<u8>); 4] = [
             |bytes| bytes[0] ^= 1,
             |bytes| bytes[7] = 1,

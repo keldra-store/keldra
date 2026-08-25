@@ -25,6 +25,97 @@ async fn store() -> (tempfile::TempDir, Store) {
     (temporary, store)
 }
 
+fn source() -> crate::SourceId {
+    crate::SourceId {
+        node_id: 1,
+        source_epoch: [3; 32],
+    }
+}
+
+#[test]
+fn atomic_batch_routes_once_to_each_affected_bucket() {
+    let change = LocalChange::atomic_batch_published(
+        9,
+        77,
+        crate::PreparedBundleHash([7; 32]),
+        vec![
+            crate::AtomicBatchRoute {
+                tenant_id: 1,
+                bucket_id: 2,
+            },
+            crate::AtomicBatchRoute {
+                tenant_id: 3,
+                bucket_id: 4,
+            },
+        ],
+        vec![
+            crate::AtomicBatchMutation {
+                tenant_id: 1,
+                bucket_id: 2,
+                exact_path: "a".into(),
+                path_version: crate::VersionId(5),
+                deleted: false,
+                source_id: source(),
+                source_journal_position: 7,
+            },
+            crate::AtomicBatchMutation {
+                tenant_id: 3,
+                bucket_id: 4,
+                exact_path: "b".into(),
+                path_version: crate::VersionId(6),
+                deleted: true,
+                source_id: source(),
+                source_journal_position: 8,
+            },
+        ],
+    );
+    assert_eq!(
+        routes_for_change(&change),
+        vec![
+            JournalRoute::Bucket {
+                tenant_id: 1,
+                bucket_id: 2
+            },
+            JournalRoute::Bucket {
+                tenant_id: 3,
+                bucket_id: 4
+            }
+        ]
+    );
+    assert!(route_matches(
+        JournalRoute::Bucket {
+            tenant_id: 3,
+            bucket_id: 4
+        },
+        &change
+    ));
+
+    let projected = project_change_for_route(
+        JournalRoute::Bucket {
+            tenant_id: 3,
+            bucket_id: 4,
+        },
+        change.clone(),
+    )
+    .unwrap();
+    let LocalChange::AtomicBatchPublished(projected_batch) = &projected else {
+        panic!("atomic batch projection changed the event kind");
+    };
+    assert_eq!(
+        projected_batch.affected_routes,
+        vec![crate::AtomicBatchRoute {
+            tenant_id: 3,
+            bucket_id: 4,
+        }]
+    );
+    assert_eq!(projected_batch.mutations.len(), 1);
+    assert_eq!(projected_batch.mutations[0].exact_path, "b");
+    assert!(
+        crate::watch::encoded_change_len(&projected).unwrap()
+            < crate::watch::encoded_change_len(&change).unwrap()
+    );
+}
+
 #[tokio::test]
 async fn routed_pages_are_target_bounded_advance_empty_intervals_and_measure_peer_bytes() {
     let (_temporary, store) = store().await;
@@ -356,7 +447,7 @@ async fn accounting_definition_mutations_commit_typed_locator_and_routes() {
 }
 
 #[tokio::test]
-async fn primary_journal_retention_prunes_its_routes_in_the_same_batch() {
+async fn capacity_retention_prunes_primary_journal_routes_before_retry() {
     let temporary = tempfile::tempdir().unwrap();
     let store = Store::open(
         StoreOptions::new(temporary.path(), 1)
@@ -391,6 +482,10 @@ async fn primary_journal_retention_prunes_its_routes_in_the_same_batch() {
         .advance_source_journal_reference_safe_through(1)
         .await
         .unwrap();
+    // The rejected append and proof-backed retention pass are deliberately
+    // separate durable operations. Production writers wait here and retry
+    // the unchanged mutation.
+    store.wait_for_mutation_capacity().await;
     store
         .put(put("tenant", "bucket", "b", "put-b"))
         .await

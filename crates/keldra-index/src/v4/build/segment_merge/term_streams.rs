@@ -795,7 +795,9 @@ impl<'a, D: ArtifactDirectoryRead, F: MergeScratchFile> PostingOccurrenceCursor<
             .first_component_ordinal
             .checked_add(reference.component_count)
             .ok_or(IndexError::OffsetOverflow)?;
-        if reference.component_count == 0 {
+        if reference.component_count == 0
+            || reference.component_max_doc_ids.len() != reference.component_count as usize
+        {
             return Err(IndexError::InvalidFormat("posting reference is empty"));
         }
         let range = Some((
@@ -904,17 +906,15 @@ impl<'a, D: ArtifactDirectoryRead, F: MergeScratchFile> PostingOccurrenceCursor<
         if ordinal != self.next_ordinal {
             return Err(IndexError::InvalidFormat("posting ordinal coverage"));
         }
-        if !self.component_max_doc_ids.is_empty() {
-            let relative = ordinal
-                .checked_sub(self.first_ordinal)
-                .ok_or(IndexError::InvalidFormat("posting component ordinal"))?;
-            if self
-                .component_max_doc_ids
-                .get(relative as usize)
-                .is_none_or(|maximum| posting.doc_ids().last() != Some(maximum))
-            {
-                return Err(IndexError::InvalidFormat("posting component bound"));
-            }
+        let relative = ordinal
+            .checked_sub(self.first_ordinal)
+            .ok_or(IndexError::InvalidFormat("posting component ordinal"))?;
+        if self
+            .component_max_doc_ids
+            .get(relative as usize)
+            .is_none_or(|maximum| posting.doc_ids().last() != Some(maximum))
+        {
+            return Err(IndexError::InvalidFormat("posting component bound"));
         }
         self.posting_positions = match self.pending_position.take() {
             Some((position_ordinal, block)) if position_ordinal == ordinal => {

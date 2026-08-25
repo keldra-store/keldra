@@ -42,6 +42,8 @@ fn snapshot(version: u64, predecessor: Option<u64>, branch: u8) -> ObjectPathSna
             deleted: false,
             committed_at_unix_millis: version,
         }],
+        journal_pending_versions: Vec::new(),
+        journal_released_versions: Vec::new(),
         definition_locator: None,
     }
 }
@@ -177,6 +179,43 @@ fn current_only_batch_selector_rejects_short_replica_batches() {
         2,
         2,
         1,
+    )
+    .unwrap_err();
+    assert_eq!(error.code(), Code::DataLoss);
+}
+
+#[test]
+fn exact_version_batch_never_substitutes_a_newer_descriptor() {
+    let version_n = current_snapshot(8, Some(7), 8).version;
+    let version_n_plus_one = current_snapshot(9, Some(8), 9).version;
+    let entries = vec![(0, "docs/a".into(), VersionId(8))];
+
+    let error = select_exact_version_batch_quorum(
+        &[
+            vec![Some(version_n.clone())],
+            vec![Some(version_n)],
+            vec![Some(version_n_plus_one)],
+        ],
+        2,
+        3,
+        &entries,
+    )
+    .unwrap_err();
+    assert_eq!(error.code(), Code::DataLoss);
+}
+
+#[test]
+fn exact_version_batch_fails_closed_when_only_the_newer_head_remains() {
+    let version_n_plus_one = current_snapshot(9, Some(8), 9).version;
+    let entries = vec![(0, "docs/a".into(), VersionId(8))];
+    let error = select_exact_version_batch_quorum(
+        &[
+            vec![Some(version_n_plus_one.clone())],
+            vec![Some(version_n_plus_one)],
+        ],
+        2,
+        2,
+        &entries,
     )
     .unwrap_err();
     assert_eq!(error.code(), Code::DataLoss);

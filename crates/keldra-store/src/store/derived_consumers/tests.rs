@@ -262,6 +262,10 @@ async fn pruning_waits_for_settlement_references_indexes_and_accounting() {
         .await
         .unwrap();
     assert_eq!(store.local_watch_status().unwrap().retention_floor, 0);
+    // Capacity retirement is an independent proof-backed durable pass. The
+    // production writer performs this wait before retrying the unchanged
+    // mutation.
+    store.wait_for_mutation_capacity().await;
     put(&store, "two-after-progress").await;
     assert_eq!(store.local_watch_status().unwrap().retention_floor, 1);
 }

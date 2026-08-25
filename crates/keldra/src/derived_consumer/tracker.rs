@@ -1,7 +1,7 @@
 //! Disposable sparse-route aggregation for derived-consumer retention.
 //!
 //! The tracker contains only definitions with a routed effect not yet covered
-//! by a published source-complete generation or rollup. Construction snapshots
+//! by a published source-complete commit or rollup. Construction snapshots
 //! are not durable publication evidence and therefore cannot release retained
 //! source history. The tracker cannot emit a checkpoint until the caller has
 //! completed one explicit assigned-definition inventory.
@@ -58,6 +58,37 @@ struct PendingEffect {
     proof_next: u64,
     /// First source offset after the newest routed effect observed so far.
     required_next: u64,
+    required_atomic_cursor: Option<u64>,
+    atomic_hold_next: Option<u64>,
+    proof_atomic_through: Option<u64>,
+}
+
+impl PendingEffect {
+    fn is_satisfied(self) -> bool {
+        self.proof_next >= self.required_next
+            && self.required_atomic_cursor.is_none_or(|required| {
+                self.proof_atomic_through
+                    .is_some_and(|through| through >= required)
+            })
+    }
+
+    fn retention_next(self) -> u64 {
+        let source_hold = (self.proof_next < self.required_next).then_some(self.proof_next);
+        let atomic_hold = self
+            .required_atomic_cursor
+            .is_some_and(|required| {
+                !self
+                    .proof_atomic_through
+                    .is_some_and(|through| through >= required)
+            })
+            .then_some(self.atomic_hold_next)
+            .flatten();
+        source_hold
+            .into_iter()
+            .chain(atomic_hold)
+            .min()
+            .unwrap_or(self.proof_next)
+    }
 }
 
 #[derive(Debug)]
@@ -113,6 +144,9 @@ impl SourceProgress {
         identity: DerivedDefinitionIdentity,
         required_next: u64,
         proof_next: u64,
+        required_atomic_cursor: Option<u64>,
+        atomic_hold_next: Option<u64>,
+        proof_atomic_through: Option<u64>,
     ) -> Result<(), SparseTrackerError> {
         let settled_next = self
             .status
@@ -139,16 +173,27 @@ impl SourceProgress {
         let proof_next = proof_next.max(self.baseline_next);
         let previous = self.pending.remove(&identity);
         if let Some(previous) = previous {
-            self.remove_minimum(previous.proof_next)?;
+            self.remove_minimum(previous.retention_next())?;
         }
         let effect = PendingEffect {
             proof_next: previous.map_or(proof_next, |previous| previous.proof_next.max(proof_next)),
             required_next: previous.map_or(required_next, |previous| {
                 previous.required_next.max(required_next)
             }),
+            required_atomic_cursor: previous.map_or(required_atomic_cursor, |previous| {
+                previous.required_atomic_cursor.max(required_atomic_cursor)
+            }),
+            atomic_hold_next: previous
+                .and_then(|previous| previous.atomic_hold_next)
+                .into_iter()
+                .chain(atomic_hold_next)
+                .min(),
+            proof_atomic_through: previous.map_or(proof_atomic_through, |previous| {
+                previous.proof_atomic_through.max(proof_atomic_through)
+            }),
         };
-        if effect.proof_next < effect.required_next {
-            self.add_minimum(effect.proof_next)?;
+        if !effect.is_satisfied() {
+            self.add_minimum(effect.retention_next())?;
             self.pending.insert(identity, effect);
         }
         Ok(())
@@ -158,6 +203,7 @@ impl SourceProgress {
         &mut self,
         identity: DerivedDefinitionIdentity,
         proof_next: u64,
+        proof_atomic_through: Option<u64>,
     ) -> Result<(), SparseTrackerError> {
         let settled_next = self
             .status
@@ -170,13 +216,16 @@ impl SourceProgress {
         let Some(previous) = self.pending.remove(&identity) else {
             return Ok(());
         };
-        self.remove_minimum(previous.proof_next)?;
+        self.remove_minimum(previous.retention_next())?;
         let effect = PendingEffect {
             proof_next: previous.proof_next.max(proof_next.max(self.baseline_next)),
             required_next: previous.required_next,
+            required_atomic_cursor: previous.required_atomic_cursor,
+            atomic_hold_next: previous.atomic_hold_next,
+            proof_atomic_through: previous.proof_atomic_through.max(proof_atomic_through),
         };
-        if effect.proof_next < effect.required_next {
-            self.add_minimum(effect.proof_next)?;
+        if !effect.is_satisfied() {
+            self.add_minimum(effect.retention_next())?;
             self.pending.insert(identity, effect);
         }
         Ok(())
@@ -184,7 +233,7 @@ impl SourceProgress {
 
     fn remove(&mut self, identity: DerivedDefinitionIdentity) -> Result<(), SparseTrackerError> {
         if let Some(previous) = self.pending.remove(&identity) {
-            self.remove_minimum(previous.proof_next)?;
+            self.remove_minimum(previous.retention_next())?;
         }
         Ok(())
     }
@@ -304,6 +353,8 @@ impl SparseDerivedInventory {
         assignment: &DefinitionAssignment,
         source_id: SourceId,
         latest_routed_next: u64,
+        required_atomic_cursor: Option<u64>,
+        atomic_hold_next: Option<u64>,
         evidence: Option<&DerivedBarrierEvidence>,
     ) -> Result<(), SparseTrackerError> {
         validate_assignment(self.kind, self.fence, assignment)?;
@@ -312,8 +363,15 @@ impl SparseDerivedInventory {
             .sources
             .get_mut(&source_id)
             .ok_or(SparseTrackerError::UnknownSource)?;
-        let proof_next = proof_next(self.fence, source, evidence)?;
-        source.observe(identity, latest_routed_next, proof_next)
+        let (proof_next, proof_atomic_through) = proof(self.fence, source, evidence)?;
+        source.observe(
+            identity,
+            latest_routed_next,
+            proof_next,
+            required_atomic_cursor,
+            atomic_hold_next,
+            proof_atomic_through,
+        )
     }
 
     pub(crate) fn finish(self) -> SparseDerivedTracker {
@@ -341,6 +399,8 @@ impl SparseDerivedTracker {
         assignment: &DefinitionAssignment,
         source_id: SourceId,
         routed_next: u64,
+        required_atomic_cursor: Option<u64>,
+        atomic_hold_next: Option<u64>,
         evidence: Option<&DerivedBarrierEvidence>,
     ) -> Result<(), SparseTrackerError> {
         validate_assignment(self.kind, self.fence, assignment)?;
@@ -349,8 +409,15 @@ impl SparseDerivedTracker {
             .sources
             .get_mut(&source_id)
             .ok_or(SparseTrackerError::UnknownSource)?;
-        let proof_next = proof_next(self.fence, source, evidence)?;
-        source.observe(identity, routed_next, proof_next)
+        let (proof_next, proof_atomic_through) = proof(self.fence, source, evidence)?;
+        source.observe(
+            identity,
+            routed_next,
+            proof_next,
+            required_atomic_cursor,
+            atomic_hold_next,
+            proof_atomic_through,
+        )
     }
 
     pub(crate) fn observe_proof(
@@ -372,8 +439,8 @@ impl SparseDerivedTracker {
             return Err(SparseTrackerError::WrongAssignment);
         }
         for source in self.sources.values_mut() {
-            let next = proof_next(self.fence, source, Some(evidence))?;
-            source.observe_proof(identity, next)?;
+            let (next, atomic_through) = proof(self.fence, source, Some(evidence))?;
+            source.observe_proof(identity, next, atomic_through)?;
         }
         Ok(())
     }
@@ -461,13 +528,13 @@ impl SparseDerivedTracker {
     }
 }
 
-fn proof_next(
+fn proof(
     fence: PlacementLogId,
     source: &SourceProgress,
     evidence: Option<&DerivedBarrierEvidence>,
-) -> Result<u64, SparseTrackerError> {
+) -> Result<(u64, Option<u64>), SparseTrackerError> {
     let Some(evidence) = evidence else {
-        return Ok(source.baseline_next);
+        return Ok((source.baseline_next, None));
     };
     let barrier = evidence.barrier();
     if barrier.fence != fence {
@@ -481,7 +548,7 @@ fn proof_next(
     if cursor.source != source.status.source_id {
         return Err(SparseTrackerError::EvidenceSourceChanged);
     }
-    Ok(cursor.next_offset)
+    Ok((cursor.next_offset, barrier.atomic.finalized_through()))
 }
 
 fn validate_assignment(

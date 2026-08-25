@@ -30,12 +30,12 @@ use super::coordination::DefinitionCoordinationTask;
 use super::cpu::IndexCpuPool;
 use super::distributed_query::DistributedIndexQueryExecutor;
 use super::events::{ClusterIndexEventSources, DecisionIndexEventAuthority, IndexEventJournal};
-use super::local_query::{ClusterIndexSegmentFetcher, LocalGenerationQueryExecutor};
-use super::manager::{IndexBuilderDependencies, IndexBuilderManagerTask};
+use super::local_query::{ClusterIndexSegmentFetcher, LocalRevisionQueryExecutor};
+use super::manager::{IndexBuilderDependencies, IndexBuilderManagerTask, IndexPublicationSlots};
 use super::publication::{IndexArtifactCoordinator, IndexArtifactRouter};
-use super::publisher::IndexGenerationPublisher;
+use super::publisher::IndexCommitPublisher;
 use super::query_budget::IndexQueryMemoryBudget;
-use super::retention::IndexGenerationRetention;
+use super::retention::IndexCommitRetention;
 use super::scanner::ClusterIndexScanner;
 use super::working_memory::IndexWorkingMemory;
 
@@ -127,7 +127,7 @@ pub(crate) async fn start(
     );
     let artifact_router =
         IndexArtifactRouter::new(local_node, coordinator, objects, cluster_peers.clone());
-    let publisher = IndexGenerationPublisher::new(
+    let publisher = IndexCommitPublisher::new(
         store.clone(),
         reader.clone(),
         artifact_router.clone(),
@@ -137,10 +137,9 @@ pub(crate) async fn start(
         .context("validate aggregate index working-memory budget")?;
     let query_budget = IndexQueryMemoryBudget::from_shared(working_memory.clone());
     let local_queries: Arc<dyn LocalIndexQueryExecutor> =
-        Arc::new(LocalGenerationQueryExecutor::new(
+        Arc::new(LocalRevisionQueryExecutor::new(
             reader.clone(),
             cache.clone(),
-            journal.clone(),
             publisher.clone(),
             cpu.clone(),
             query_budget,
@@ -169,7 +168,7 @@ pub(crate) async fn start(
             catalog.clone(),
         ),
     );
-    let generation_retention = IndexGenerationRetention::new(
+    let commit_retention = IndexCommitRetention::new(
         store.clone(),
         scanner.clone(),
         reader.clone(),
@@ -191,12 +190,13 @@ pub(crate) async fn start(
             scanner: scanner.clone(),
             reader,
             publisher,
-            retention: generation_retention,
+            retention: commit_retention,
             cache: cache.clone(),
             budgets,
             cpu,
             config,
             derived_progress,
+            publication_slots: IndexPublicationSlots::default(),
         },
     );
 

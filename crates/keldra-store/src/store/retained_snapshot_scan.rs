@@ -7,7 +7,7 @@ use tokio::sync::{mpsc, oneshot};
 use rocksdb::{Direction, IteratorMode};
 use serde::{Deserialize, Serialize};
 
-use super::{CF_HEADS, CF_METADATA, CF_VERSIONS, Store};
+use super::{CF_HEADS, CF_METADATA, CF_VERSIONS, Store, StoredVersion};
 use crate::key::{BucketId, BucketIdentity, TenantId};
 use crate::watch::{LOCAL_INVALIDATION_EPOCH_KEY, LOCAL_INVALIDATION_OFFSET_KEY};
 use crate::{Head, ObjectKey, SourceId, Version, VersionId};
@@ -503,7 +503,9 @@ fn decode_retained_record(
     let key_version = VersionId(u64::from_be_bytes(
         key[key.len() - 8..].try_into().expect("fixed slice"),
     ));
-    let version: Version = serde_json::from_slice(encoded).map_err(object_storage)?;
+    let version = StoredVersion::decode(encoded)
+        .map_err(object_storage)?
+        .version;
     if version.id != key_version {
         return Err(object_storage(
             "retained version key and descriptor disagree",

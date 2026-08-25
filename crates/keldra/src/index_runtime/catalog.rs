@@ -126,7 +126,7 @@ impl CatalogChange {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct CatalogIdentity {
     pub(crate) tenant_id: u64,
     pub(crate) bucket_id: u64,

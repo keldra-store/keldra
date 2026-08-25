@@ -89,6 +89,11 @@ const BLOB_GC_RECORDS_PER_TICK: u32 = 128;
 const BLOB_GC_BYTES_PER_TICK: u64 = 1024 * 1024;
 const BLOB_GC_TIME_PER_TICK: Duration = Duration::from_secs(30);
 const DECISION_LEADER_TIMEOUT: Duration = Duration::from_secs(10);
+// A complete atomic publication is one indivisible index mutation unit. Keep
+// its authoritative ingress bound below the minimum admitted builder quantum
+// so no accepted journal record can permanently wedge catch-up.
+const MAX_INDEXABLE_ATOMIC_COMMIT_ENTRIES: u32 = 4_096;
+const MAX_INDEXABLE_ATOMIC_COMMIT_BYTES: u64 = 16 * 1024 * 1024;
 // A maximum 1,000-item authorization batch can contain two maximum-size exact
 // paths per tuple plus identifiers and protobuf framing.
 const MIN_AUTHZ_BATCH_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
@@ -138,6 +143,26 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
                 .checked_add(config.index_query_timeout)
                 .is_some(),
         "index query timeout must be greater than zero and fit the server clock"
+    );
+    anyhow::ensure!(
+        config.max_atomic_commit_entries > 0
+            && config.max_atomic_commit_entries <= MAX_INDEXABLE_ATOMIC_COMMIT_ENTRIES,
+        "maximum atomic commit entries must be within 1..={MAX_INDEXABLE_ATOMIC_COMMIT_ENTRIES} so one complete batch is index-admissible"
+    );
+    anyhow::ensure!(
+        config.max_atomic_commit_bytes > 0
+            && config.max_atomic_commit_bytes <= MAX_INDEXABLE_ATOMIC_COMMIT_BYTES,
+        "maximum atomic commit bytes must be within 1..={MAX_INDEXABLE_ATOMIC_COMMIT_BYTES} so one complete batch is index-admissible"
+    );
+    anyhow::ensure!(
+        config.source_journal_max_bytes >= keldra_store::MAX_ATOMIC_BATCH_PUBLISHED_BYTES,
+        "source-journal byte capacity must be at least {} so one admitted atomic batch can be retained",
+        keldra_store::MAX_ATOMIC_BATCH_PUBLISHED_BYTES,
+    );
+    anyhow::ensure!(
+        config.source_journal_max_entries
+            >= u64::from(config.max_atomic_commit_entries).saturating_add(1),
+        "source-journal entry capacity must hold every path record plus the complete atomic batch event",
     );
     validate_atomic_replay_gc(config.awaiting_publish_ttl_seconds)?;
     let storage_binding = storage_layout::bind_authoritative_roots(&config.storage, config.node_id)

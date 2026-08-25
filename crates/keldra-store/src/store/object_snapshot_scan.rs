@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::{
     CF_HEADS, CF_METADATA, CF_VERSIONS, MAX_OBJECT_RECORD_EXPORT_BYTES,
-    MAX_OBJECT_RECORD_EXPORT_RECORDS,
+    MAX_OBJECT_RECORD_EXPORT_RECORDS, StoredVersion,
 };
 use crate::key::{BucketId, BucketIdentity, STORAGE_KEY_FORMAT_VERSION, TenantId};
 use crate::watch::{LOCAL_INVALIDATION_EPOCH_KEY, LOCAL_INVALIDATION_OFFSET_KEY};
@@ -317,8 +317,9 @@ impl Store {
             let encoded_version = encoded_version.map_err(object_storage)?.ok_or_else(|| {
                 object_storage("current head references a missing version descriptor")
             })?;
-            let version: Version =
-                serde_json::from_slice(&encoded_version).map_err(object_storage)?;
+            let version = StoredVersion::decode(&encoded_version)
+                .map_err(object_storage)?
+                .version;
             let record = CurrentObjectSnapshot {
                 tenant_id,
                 bucket_id,
@@ -338,6 +339,76 @@ impl Store {
             results[index] = Some(record);
         }
         Ok(results)
+    }
+
+    /// Reads a bounded ordered set of immutable version descriptors from one
+    /// RocksDB snapshot. Incremental derived consumers use the exact versions
+    /// named by their journal records; consulting a later current head would
+    /// mix source cuts and can livelock under sustained replacement writes.
+    pub fn export_exact_object_versions(
+        &self,
+        tenant_id: u64,
+        bucket_id: u64,
+        selections: &[(String, VersionId)],
+    ) -> Result<Vec<Option<Version>>, ObjectSnapshotError> {
+        require_nonzero(tenant_id, "tenant ID")?;
+        require_nonzero(bucket_id, "bucket ID")?;
+        if selections.len() > MAX_OBJECT_RECORD_EXPORT_RECORDS as usize {
+            return Err(ObjectSnapshotError::InvalidExportLimit(format!(
+                "exact-version batch records must be at most {MAX_OBJECT_RECORD_EXPORT_RECORDS}"
+            )));
+        }
+        if selections.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let identity = stable_identity(tenant_id, bucket_id);
+        let mut keys = Vec::with_capacity(selections.len());
+        for (exact_path, version) in selections {
+            validate_exact_path(exact_path)?;
+            if version.0 == 0 {
+                return Err(ObjectSnapshotError::InvalidRecord(
+                    "exact-version batch contains a zero version".into(),
+                ));
+            }
+            keys.push(exact_version_key(&identity.head_key(exact_path), *version));
+        }
+
+        let snapshot = self.db.snapshot();
+        let versions_cf = self.cf(CF_VERSIONS).map_err(object_storage)?;
+        let encoded = snapshot.multi_get_cf(keys.iter().map(|key| (versions_cf, key.as_slice())));
+        if encoded.len() != selections.len() {
+            return Err(object_storage(
+                "exact-version multi-get returned the wrong result count",
+            ));
+        }
+        let mut encoded_bytes = 0_u64;
+        encoded
+            .into_iter()
+            .zip(selections)
+            .map(|(encoded, (_, expected))| {
+                let Some(encoded) = encoded.map_err(object_storage)? else {
+                    return Ok(None);
+                };
+                encoded_bytes = encoded_bytes
+                    .checked_add(encoded.len() as u64)
+                    .ok_or_else(|| object_storage("exact-version byte count overflow"))?;
+                if encoded_bytes > MAX_OBJECT_RECORD_EXPORT_BYTES {
+                    return Err(ObjectSnapshotError::ExportRecordTooLarge {
+                        required_bytes: encoded_bytes,
+                    });
+                }
+                let version = StoredVersion::decode(&encoded)
+                    .map_err(object_storage)?
+                    .version;
+                if version.id != *expected {
+                    return Err(object_storage(
+                        "exact-version key and descriptor identity disagree",
+                    ));
+                }
+                Ok(Some(version))
+            })
+            .collect()
     }
 
     /// Reads one bounded, sorted page across all local current heads. This is
@@ -486,6 +557,7 @@ impl Store {
         tenant_id: u64,
         bucket_id: u64,
         path_prefix: &str,
+        resume_after_path: Option<&str>,
         max_records: u32,
         max_bytes: u64,
         include: F,
@@ -494,9 +566,16 @@ impl Store {
         F: Fn(&CurrentObjectSnapshot) -> bool + Send + Sync + 'static,
     {
         validate_snapshot_scan_request(tenant_id, bucket_id, path_prefix, max_records, max_bytes)?;
+        if let Some(resume_after_path) = resume_after_path {
+            validate_resume_after_path(path_prefix, resume_after_path)?;
+        }
         let identity = stable_identity(tenant_id, bucket_id);
         let prefix = identity.head_key(path_prefix);
+        let start = resume_after_path
+            .map(|path| identity.head_key(path))
+            .unwrap_or_else(|| prefix.clone());
         let path_prefix = path_prefix.to_owned();
+        let resume_after_path = resume_after_path.map(str::to_owned);
         let store = self.clone();
         let heads_visited = Arc::new(AtomicU64::new(0));
         let worker_heads_visited = heads_visited.clone();
@@ -518,7 +597,9 @@ impl Store {
                     store,
                     identity,
                     prefix,
+                    start,
                     path_prefix,
+                    resume_after_path,
                     max_records,
                     max_bytes,
                     include,
@@ -548,7 +629,9 @@ fn run_snapshot_worker<F>(
     store: Store,
     identity: BucketIdentity,
     prefix: Vec<u8>,
+    start: Vec<u8>,
     path_prefix: String,
+    resume_after_path: Option<String>,
     max_records: u32,
     max_bytes: u64,
     include: F,
@@ -599,7 +682,7 @@ fn run_snapshot_worker<F>(
         let heads_cf = store.cf(CF_HEADS).map_err(object_storage)?;
         let versions_cf = store.cf(CF_VERSIONS).map_err(object_storage)?;
         let mut iterator =
-            snapshot.iterator_cf(heads_cf, IteratorMode::From(&prefix, Direction::Forward));
+            snapshot.iterator_cf(heads_cf, IteratorMode::From(&start, Direction::Forward));
         let mut pending = None;
         let mut exhausted = false;
         while let Some(SnapshotCommand::Pull(response)) = commands.blocking_recv() {
@@ -608,6 +691,7 @@ fn run_snapshot_worker<F>(
                 &prefix,
                 identity,
                 &path_prefix,
+                resume_after_path.as_deref(),
                 max_records,
                 max_bytes,
                 &include,
@@ -636,6 +720,7 @@ fn pull_snapshot_frame<F, I>(
     prefix: &[u8],
     identity: BucketIdentity,
     path_prefix: &str,
+    resume_after_path: Option<&str>,
     max_records: u32,
     max_bytes: u64,
     include: &F,
@@ -670,7 +755,10 @@ where
                 heads_visited.fetch_add(1, Ordering::Relaxed);
                 let record =
                     decode_current_head(identity, &key, &encoded_head, snapshot, versions_cf)?;
-                if path_is_within_prefix(&record.exact_path, path_prefix) && include(&record) {
+                if path_is_within_prefix(&record.exact_path, path_prefix)
+                    && resume_after_path.is_none_or(|resume| record.exact_path.as_str() > resume)
+                    && include(&record)
+                {
                     break Some(record);
                 }
             },
@@ -724,7 +812,9 @@ fn decode_current_head(
         )
         .map_err(object_storage)?
         .ok_or_else(|| object_storage("current head references a missing version descriptor"))?;
-    let version: Version = serde_json::from_slice(&encoded_version).map_err(object_storage)?;
+    let version = StoredVersion::decode(&encoded_version)
+        .map_err(object_storage)?
+        .version;
     let record = CurrentObjectSnapshot {
         tenant_id: identity.tenant_id.0,
         bucket_id: identity.bucket_id.0,
@@ -784,6 +874,19 @@ fn validate_path_prefix(prefix: &str) -> Result<(), ObjectSnapshotError> {
                 .any(|segment| segment.is_empty() || matches!(segment, "." | "..")))
     {
         return Err(invalid_snapshot("object path prefix is invalid"));
+    }
+    Ok(())
+}
+
+fn validate_resume_after_path(
+    prefix: &str,
+    resume_after_path: &str,
+) -> Result<(), ObjectSnapshotError> {
+    validate_exact_path(resume_after_path)?;
+    if !path_is_within_prefix(resume_after_path, prefix) {
+        return Err(invalid_snapshot(
+            "snapshot resume path is outside the requested prefix",
+        ));
     }
     Ok(())
 }

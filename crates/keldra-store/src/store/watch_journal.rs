@@ -751,16 +751,10 @@ mod tests {
         );
         assert_eq!(
             changes[1].reference_deltas(),
-            &[
-                ReferenceDelta {
-                    blob: blob_reference_for_bytes(b"first"),
-                    change: -1,
-                },
-                ReferenceDelta {
-                    blob: blob_reference_for_bytes(b"second"),
-                    change: 1,
-                },
-            ]
+            &[ReferenceDelta {
+                blob: blob_reference_for_bytes(b"second"),
+                change: 1,
+            }]
         );
     }
 }

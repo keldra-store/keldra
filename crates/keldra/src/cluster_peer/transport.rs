@@ -393,6 +393,7 @@ impl ClusterPeerTransport {
         tenant_id: u64,
         bucket_id: u64,
         path_prefix: String,
+        resume_after_path: Option<String>,
         max_frame_bytes: u64,
     ) -> Result<super::IndexSourceSnapshot, Status> {
         super::index_snapshot::require_snapshot_frame_bound(max_frame_bytes)?;
@@ -413,6 +414,7 @@ impl ClusterPeerTransport {
                         bucket_id,
                         path_prefix,
                         max_frame_bytes,
+                        resume_after_path,
                     },
                 )),
             })

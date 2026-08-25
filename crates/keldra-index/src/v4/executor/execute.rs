@@ -9,7 +9,7 @@ use futures_util::future::join_all;
 
 use super::super::{
     ArtifactDirectoryRead, CandidateGate, CandidateReference, DocId, FieldId,
-    INDEX_GENERATION_SEGMENTS, NativeQuery, NativeQueryCursor, NativeQueryExecutionTier,
+    INDEX_COMMIT_SEGMENTS, NativeQuery, NativeQueryCursor, NativeQueryExecutionTier,
     NativeQueryHit, NativeQueryPage, NativeQueryPhase, NativeQueryRequest,
     NativeQueryStatisticsRecorder, ObjectIdentity, OrderDirection, OrderField,
     SegmentComponentReader, SegmentStatistics, SortValue,
@@ -77,7 +77,7 @@ pub struct NativeQueryLimits {
 impl Default for NativeQueryLimits {
     fn default() -> Self {
         Self {
-            maximum_segments: INDEX_GENERATION_SEGMENTS,
+            maximum_segments: INDEX_COMMIT_SEGMENTS,
             maximum_expanded_terms: 64,
             maximum_result_limit: 100_000,
             candidate_gate_batch: MAXIMUM_CANDIDATE_GATE_BATCH,
@@ -89,7 +89,7 @@ impl Default for NativeQueryLimits {
 impl NativeQueryLimits {
     pub fn validate(&self) -> Result<(), IndexError> {
         if self.maximum_segments == 0
-            || self.maximum_segments > INDEX_GENERATION_SEGMENTS
+            || self.maximum_segments > INDEX_COMMIT_SEGMENTS
             || self.maximum_expanded_terms == 0
             || self.maximum_result_limit == 0
             || self.candidate_gate_batch == 0

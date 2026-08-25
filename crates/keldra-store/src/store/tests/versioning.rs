@@ -15,7 +15,7 @@ fn program_definition_paths_are_direct_versioned_children() {
 }
 
 #[tokio::test]
-async fn unversioned_put_replaces_the_descriptor_and_exact_cas_moves_the_head() {
+async fn unversioned_put_retains_replay_descriptor_and_exact_cas_moves_the_head() {
     let (_temporary, store) = store().await;
     let first = store
         .put(put("a", b"one", Precondition::Absent, "one"))
@@ -36,7 +36,7 @@ async fn unversioned_put_replaces_the_descriptor_and_exact_cas_moves_the_head() 
         store
             .version_metadata(&key("a"), first.version)
             .unwrap()
-            .is_none()
+            .is_some()
     );
     assert_eq!(
         store
@@ -125,17 +125,18 @@ async fn get_version_rejects_a_descriptor_id_that_disagrees_with_its_key() {
     let identity = store
         .resolve_bucket_identity(object_key.tenant(), object_key.bucket())
         .unwrap();
-    let mut descriptor = store
-        .version_metadata(&object_key, created.version)
+    let descriptor_key = version_key(identity, &object_key, created.version);
+    let mut stored = store
+        .stored_version_by_key(&descriptor_key)
         .unwrap()
         .unwrap();
-    descriptor.id = VersionId(u64::MAX);
+    stored.version.id = VersionId(u64::MAX);
     store
         .db
         .put_cf(
             store.cf(CF_VERSIONS).unwrap(),
-            version_key(identity, &object_key, created.version),
-            serde_json::to_vec(&descriptor).unwrap(),
+            descriptor_key,
+            serde_json::to_vec(&stored).unwrap(),
         )
         .unwrap();
 
@@ -161,18 +162,19 @@ async fn batch_get_rejects_a_descriptor_that_disagrees_with_its_current_head() {
     let identity = store
         .resolve_bucket_identity(object_key.tenant(), object_key.bucket())
         .unwrap();
-    let mut descriptor = store
-        .version_metadata(&object_key, created.version)
+    let descriptor_key = version_key(identity, &object_key, created.version);
+    let mut stored = store
+        .stored_version_by_key(&descriptor_key)
         .unwrap()
         .unwrap();
-    descriptor.blob = None;
-    descriptor.deleted = true;
+    stored.version.blob = None;
+    stored.version.deleted = true;
     store
         .db
         .put_cf(
             store.cf(CF_VERSIONS).unwrap(),
-            version_key(identity, &object_key, created.version),
-            serde_json::to_vec(&descriptor).unwrap(),
+            descriptor_key,
+            serde_json::to_vec(&stored).unwrap(),
         )
         .unwrap();
 
@@ -238,7 +240,7 @@ async fn enabling_versioning_retains_the_existing_current_value_and_survives_reo
 }
 
 #[tokio::test]
-async fn unversioned_reference_delta_handles_same_content_replace_and_delete() {
+async fn unversioned_reference_ownership_remains_pinned_until_checkpoint() {
     let (_temporary, store) = store().await;
     let same_reference = blob_reference_for_bytes(b"same");
     let other_reference = blob_reference_for_bytes(b"other");
@@ -261,13 +263,13 @@ async fn unversioned_reference_delta_handles_same_content_replace_and_delete() {
             .unwrap()
             .unwrap()
             .ref_count,
-        1
+        2
     );
     assert!(
         store
             .version_metadata(&key("a"), first.version)
             .unwrap()
-            .is_none()
+            .is_some()
     );
 
     let third = store
@@ -285,7 +287,7 @@ async fn unversioned_reference_delta_handles_same_content_replace_and_delete() {
             .unwrap()
             .unwrap()
             .ref_count,
-        0
+        2
     );
     assert_eq!(
         store
@@ -311,13 +313,13 @@ async fn unversioned_reference_delta_handles_same_content_replace_and_delete() {
             .unwrap()
             .unwrap()
             .ref_count,
-        0
+        1
     );
     assert!(
         store
             .version_metadata(&key("a"), third.version)
             .unwrap()
-            .is_none()
+            .is_some()
     );
     assert!(
         store

@@ -62,6 +62,31 @@ impl ClusterIndexScanner {
         })
     }
 
+    /// Resume one persisted per-definition maintenance cursor. A placement
+    /// change invalidates the cursor and makes the caller restart from the
+    /// beginning; cursor state is never reinterpreted under another fence.
+    pub(crate) fn begin_at(
+        &self,
+        scope: IndexHeadScanScope,
+        expected_fence: PlacementLogId,
+        node: NodeId,
+        cursor: Option<ObjectRecordCursor>,
+    ) -> Result<ClusterIndexScan, Status> {
+        let mut scan = self.begin(scope)?;
+        if scan.fence != expected_fence {
+            return Err(Status::aborted(
+                "persisted index scan cursor belongs to another placement fence",
+            ));
+        }
+        scan.node_index = scan
+            .nodes
+            .iter()
+            .position(|source| source.node == node)
+            .ok_or_else(|| Status::aborted("persisted index scan source is no longer ACTIVE"))?;
+        scan.cursor = cursor;
+        Ok(scan)
+    }
+
     /// Open one snapshot-bound current-head stream for every ACTIVE source.
     ///
     /// Every stream is opened before the first frame is consumed so its source
@@ -73,6 +98,7 @@ impl ClusterIndexScanner {
         tenant_id: u64,
         bucket_id: u64,
         path_prefix: String,
+        resume_after_path: Option<String>,
         max_frame_bytes: u64,
     ) -> Result<ClusterIndexSourceSnapshot, Status> {
         self.startup_scan_evidence
@@ -110,6 +136,7 @@ impl ClusterIndexScanner {
         for (node, address) in sources {
             let peers = self.peers.clone();
             let path_prefix = path_prefix.clone();
+            let resume_after_path = resume_after_path.clone();
             tasks.spawn(async move {
                 let snapshot = peers
                     .scan_index_source_snapshot(
@@ -118,6 +145,7 @@ impl ClusterIndexScanner {
                         tenant_id,
                         bucket_id,
                         path_prefix,
+                        resume_after_path,
                         source_frame_bytes,
                     )
                     .await;
@@ -493,6 +521,18 @@ pub(crate) struct ClusterIndexScan {
 }
 
 impl ClusterIndexScan {
+    pub(crate) fn checkpoint(
+        &self,
+    ) -> Option<(PlacementLogId, NodeId, Option<ObjectRecordCursor>)> {
+        (!self.finished)
+            .then(|| {
+                self.nodes
+                    .get(self.node_index)
+                    .map(|node| (self.fence, node.node, self.cursor.clone()))
+            })
+            .flatten()
+    }
+
     pub(crate) async fn next_page(&mut self) -> Result<Option<Vec<IndexCurrentHead>>, Status> {
         if self.finished {
             return Ok(None);

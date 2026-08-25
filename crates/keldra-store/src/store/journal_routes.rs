@@ -7,7 +7,7 @@ use crate::journal_route::{JournalRoute, RoutedJournalError, RoutedLocalChangePa
 use crate::key::STORAGE_KEY_FORMAT_VERSION;
 use crate::watch::{
     LocalChange, MAX_LOCAL_INVALIDATION_SCAN_RECORDS, OversizeLocalChange, SourceId,
-    invalidation_key,
+    encoded_change_len, invalidation_key,
 };
 
 const DEFINITION_ROUTE_DOMAIN: u8 = b'D';
@@ -149,10 +149,22 @@ impl Store {
             if decoded.change.offset() != offset || !route_matches(route, &decoded.change) {
                 return Err(RoutedJournalError::RouteMismatch { offset });
             }
-            // The binary journal envelope records the exact bare-LocalChange
-            // JSON size used by the existing private-peer protocol. No second
-            // serialization is needed while scanning.
-            let change_bytes = decoded.peer_encoded_bytes;
+            // Atomic publication is one authoritative source-journal record,
+            // but a routed consumer needs only its own bucket descriptors.
+            // Projecting the response here avoids multiplying the complete
+            // batch by every affected route without creating another durable
+            // event or cursor authority.
+            let atomic = matches!(decoded.change, LocalChange::AtomicBatchPublished(_));
+            let peer_encoded_bytes = decoded.peer_encoded_bytes;
+            let change = project_change_for_route(route, decoded.change)?;
+            let change_bytes = if atomic {
+                encoded_change_len(&change).map_err(route_storage)?
+            } else {
+                // Ordinary routed events are unchanged, so the envelope's
+                // exact peer JSON length remains authoritative without a
+                // second serialization.
+                peer_encoded_bytes
+            };
             let projected = encoded_bytes.checked_add(change_bytes).ok_or_else(|| {
                 RoutedJournalError::Storage("routed journal page length overflow".into())
             })?;
@@ -174,7 +186,7 @@ impl Store {
             }
             encoded_bytes = projected;
             through_offset = offset;
-            changes.push(decoded.change);
+            changes.push(change);
         }
 
         // If iteration found no next matching route, every source position
@@ -226,6 +238,37 @@ impl Store {
     }
 }
 
+fn project_change_for_route(
+    route: JournalRoute,
+    change: LocalChange,
+) -> Result<LocalChange, RoutedJournalError> {
+    let mut batch = match change {
+        LocalChange::AtomicBatchPublished(batch) => batch,
+        change => return Ok(change),
+    };
+    let JournalRoute::Bucket {
+        tenant_id,
+        bucket_id,
+    } = route
+    else {
+        return Err(RoutedJournalError::RouteMismatch {
+            offset: batch.offset,
+        });
+    };
+    batch
+        .affected_routes
+        .retain(|candidate| candidate.tenant_id == tenant_id && candidate.bucket_id == bucket_id);
+    batch
+        .mutations
+        .retain(|mutation| mutation.tenant_id == tenant_id && mutation.bucket_id == bucket_id);
+    batch
+        .validate()
+        .map_err(|_| RoutedJournalError::RouteMismatch {
+            offset: batch.offset,
+        })?;
+    Ok(LocalChange::AtomicBatchPublished(batch))
+}
+
 fn routes_for_change(change: &LocalChange) -> Vec<JournalRoute> {
     match change {
         LocalChange::ObjectHead(change) => {
@@ -242,7 +285,25 @@ fn routes_for_change(change: &LocalChange) -> Vec<JournalRoute> {
             tenant_id: change.tenant_id,
             bucket_id: change.bucket_id,
         }],
-        LocalChange::AggregateChanged(_) | LocalChange::ContentLifecycleChanged(_) => Vec::new(),
+        LocalChange::AtomicBatchPublished(change) => change
+            .affected_routes
+            .iter()
+            .map(|route| JournalRoute::Bucket {
+                tenant_id: route.tenant_id,
+                bucket_id: route.bucket_id,
+            })
+            .collect(),
+        LocalChange::ContentLifecycleChanged(change) => change
+            .accounting_transition
+            .as_ref()
+            .map(|transition| {
+                vec![JournalRoute::Bucket {
+                    tenant_id: transition.tenant_id,
+                    bucket_id: transition.bucket_id,
+                }]
+            })
+            .unwrap_or_default(),
+        LocalChange::AggregateChanged(_) => Vec::new(),
     }
 }
 
@@ -272,10 +333,35 @@ fn route_matches(route: JournalRoute, change: &LocalChange) -> bool {
             },
             LocalChange::RetainedVersionDeleted(change),
         ) => change.tenant_id == tenant_id && change.bucket_id == bucket_id,
+        (
+            JournalRoute::Bucket {
+                tenant_id,
+                bucket_id,
+            },
+            LocalChange::ContentLifecycleChanged(change),
+        ) => change
+            .accounting_transition
+            .as_ref()
+            .is_some_and(|transition| {
+                transition.tenant_id == tenant_id && transition.bucket_id == bucket_id
+            }),
         (JournalRoute::Definition(kind), LocalChange::ObjectHead(change)) => change
             .definition_transition
             .as_ref()
             .is_some_and(|transition| transition.kind == kind),
+        (
+            JournalRoute::Bucket {
+                tenant_id,
+                bucket_id,
+            },
+            LocalChange::AtomicBatchPublished(change),
+        ) => change
+            .affected_routes
+            .binary_search(&crate::AtomicBatchRoute {
+                tenant_id,
+                bucket_id,
+            })
+            .is_ok(),
         _ => false,
     }
 }

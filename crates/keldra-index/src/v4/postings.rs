@@ -19,7 +19,7 @@ pub enum PostingCodec {
 
 /// Corpus-independent inputs for a conservative block score bound. Query-time
 /// BM25 statistics are deliberately not persisted because they change when a
-/// new immutable generation is published.
+/// new immutable commit is published.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PostingImpact {
     pub maximum_frequency: u32,

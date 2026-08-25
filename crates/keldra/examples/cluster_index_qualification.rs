@@ -51,8 +51,8 @@ type IndexClient = IndexServiceClient<InterceptedService<Channel, BearerToken>>;
 
 const WAIT_LIMIT: Duration = Duration::from_secs(90);
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
-const GENERATION_QUIET_WINDOW: Duration = Duration::from_secs(3);
-const GENERATION_QUIET_LIMIT: Duration = Duration::from_secs(12);
+const COMMIT_REVISION_QUIET_WINDOW: Duration = Duration::from_secs(3);
+const COMMIT_REVISION_QUIET_LIMIT: Duration = Duration::from_secs(12);
 const CONTENT_TYPE: &str = "application/json";
 const COMPACTION_WAVES: usize = 5;
 const VERIFICATION_STATE_SCHEMA: &str = "keldra.index-qualification-state.v1";
@@ -86,7 +86,7 @@ struct VerificationIndex {
     name: String,
     index_id: u64,
     definition_version: u64,
-    generation: u64,
+    commit_revision: u64,
     placement_term: u64,
     placement_index: u64,
     sources: Vec<VerificationSource>,
@@ -138,7 +138,7 @@ async fn main() -> TestResult<()> {
     if let Some(path) = env::var_os("KELDRA_INDEX_QUALIFICATION_STATE_INPUT") {
         verify_existing_state(Path::new(&path), &tenant, &cases, &mut indexes).await?;
         println!(
-            "verified {} final index generations through {} endpoint(s)",
+            "verified {} final index commit revisions through {} endpoint(s)",
             cases.len(),
             endpoints.len()
         );
@@ -223,7 +223,7 @@ async fn main() -> TestResult<()> {
         }
     }
 
-    let mut first_generations = Vec::new();
+    let mut first_commit_revisions = Vec::new();
     for ((case, definition), before) in cases.iter().zip(&definitions).zip(&baseline) {
         let expected = case.expected_paths.iter().copied().collect::<BTreeSet<_>>();
         let expected_versions = BTreeMap::new();
@@ -232,7 +232,7 @@ async fn main() -> TestResult<()> {
             request(case),
             definition.index_id,
             definition.version,
-            before.generation,
+            before.commit_revision,
             case.documents.len() as u64,
             &expected,
             &expected_versions,
@@ -242,10 +242,10 @@ async fn main() -> TestResult<()> {
         .await?;
         require_physical_order(case, &responses, false)?;
         require_checkpoint_advance(before, require_freshness(&responses[0])?, endpoints.len())?;
-        first_generations.push(responses[0].clone());
+        first_commit_revisions.push(responses[0].clone());
     }
 
-    for (case, expected_response) in cases.iter().zip(&first_generations) {
+    for (case, expected_response) in cases.iter().zip(&first_commit_revisions) {
         let expected = case
             .expected_paths
             .iter()
@@ -278,7 +278,7 @@ async fn main() -> TestResult<()> {
         &mut indexes,
         &tenant,
         &cases[typed_position],
-        require_freshness(&first_generations[typed_position])?,
+        require_freshness(&first_commit_revisions[typed_position])?,
     )
     .await?;
 
@@ -294,7 +294,7 @@ async fn main() -> TestResult<()> {
         &channels,
         &tenant,
         &cases[0],
-        &first_generations[0],
+        &first_commit_revisions[0],
     )
     .await?;
 
@@ -331,8 +331,9 @@ async fn main() -> TestResult<()> {
         write_number += 1;
     }
 
-    let mut mutation_generations = Vec::with_capacity(cases.len());
-    for ((case, definition), before) in cases.iter().zip(&definitions).zip(&first_generations) {
+    let mut mutation_commit_revisions = Vec::with_capacity(cases.len());
+    for ((case, definition), before) in cases.iter().zip(&definitions).zip(&first_commit_revisions)
+    {
         let expected = expected_after_primary_mutations(case);
         let expected_versions = BTreeMap::new();
         let before_freshness = require_freshness(before)?;
@@ -342,7 +343,7 @@ async fn main() -> TestResult<()> {
             request(case),
             definition.index_id,
             definition.version,
-            before_freshness.generation,
+            before_freshness.commit_revision,
             case.documents.len() as u64 + 2,
             &expected,
             &expected_versions,
@@ -358,7 +359,7 @@ async fn main() -> TestResult<()> {
             )));
         }
         require_checkpoint_advance(before_freshness, require_freshness(&responses[0])?, 1)?;
-        mutation_generations.push(responses[0].clone());
+        mutation_commit_revisions.push(responses[0].clone());
     }
 
     let mut final_hit_versions = vec![0_u64; cases.len()];
@@ -380,11 +381,11 @@ async fn main() -> TestResult<()> {
             write_number += 1;
         }
 
-        let previous_generations = mutation_generations.clone();
+        let previous_commit_revisions = mutation_commit_revisions.clone();
         for (case_number, ((case, definition), before)) in cases
             .iter()
             .zip(&definitions)
-            .zip(&previous_generations)
+            .zip(&previous_commit_revisions)
             .enumerate()
         {
             let expected = expected_after_primary_mutations(case);
@@ -396,7 +397,7 @@ async fn main() -> TestResult<()> {
                 request(case),
                 definition.index_id,
                 definition.version,
-                before_freshness.generation,
+                before_freshness.commit_revision,
                 case.documents.len() as u64 + 3 + wave as u64,
                 &expected,
                 &expected_versions,
@@ -405,7 +406,7 @@ async fn main() -> TestResult<()> {
             )
             .await?;
             require_checkpoint_advance(before_freshness, require_freshness(&responses[0])?, 1)?;
-            mutation_generations[case_number] = responses[0].clone();
+            mutation_commit_revisions[case_number] = responses[0].clone();
         }
     }
 
@@ -419,7 +420,8 @@ async fn main() -> TestResult<()> {
         })
         .ok_or_else(|| invalid("index qualification omitted the Tensor engine"))?;
     let tensor_case = &cases[tensor_position];
-    let before_tensor_delete = require_freshness(&mutation_generations[tensor_position])?.clone();
+    let before_tensor_delete =
+        require_freshness(&mutation_commit_revisions[tensor_position])?.clone();
     let delete_client = &mut objects[(write_number as usize) % object_client_count];
     delete_object(
         delete_client,
@@ -467,7 +469,7 @@ async fn main() -> TestResult<()> {
         request(tensor_case),
         definitions[tensor_position].index_id,
         definitions[tensor_position].version,
-        before_tensor_delete.generation,
+        before_tensor_delete.commit_revision,
         tensor_case.documents.len() as u64 + 3,
         &expected,
         &expected_versions,
@@ -476,7 +478,7 @@ async fn main() -> TestResult<()> {
     )
     .await?;
     require_checkpoint_advance(&before_tensor_delete, require_freshness(&responses[0])?, 1)?;
-    mutation_generations[tensor_position] = responses[0].clone();
+    mutation_commit_revisions[tensor_position] = responses[0].clone();
     final_hit_versions[tensor_position] = 0;
 
     for position in 0..cases.len() {
@@ -484,19 +486,19 @@ async fn main() -> TestResult<()> {
             &mut indexes,
             &cases[position],
             &definitions[position],
-            &mutation_generations[position],
+            &mutation_commit_revisions[position],
             endpoints.len(),
         )
         .await?;
         definitions[position] = definition;
-        mutation_generations[position] = response;
+        mutation_commit_revisions[position] = response;
     }
 
     let state_output = env::var_os("KELDRA_INDEX_QUALIFICATION_STATE_OUTPUT");
     if state_output.is_some()
         || env::var("KELDRA_INDEX_QUALIFICATION_REQUIRE_QUIESCENCE").is_ok_and(|value| value == "1")
     {
-        require_generation_quiescence(&mut indexes[0], &cases).await?;
+        require_commit_revision_quiescence(&mut indexes[0], &cases).await?;
     }
     if let Some(path) = state_output {
         let final_responses = collect_final_responses(
@@ -561,7 +563,7 @@ async fn wait_for_exact_current_absence(
                     && response.freshness.as_ref().is_some_and(|freshness| {
                         freshness.index_id == before.index_id
                             && freshness.definition_version == before.definition_version
-                            && freshness.generation >= before.generation
+                            && freshness.commit_revision >= before.commit_revision
                             && freshness.authorization_revision != 0
                     })
             })
@@ -651,7 +653,7 @@ async fn qualify_explicit_rebuild(
         request(case),
         rebuilt.index_id,
         rebuilt.version,
-        require_freshness(before)?.generation,
+        require_freshness(before)?.commit_revision,
         expected.len() as u64,
         &expected,
         &expected_versions,
@@ -667,54 +669,54 @@ async fn qualify_explicit_rebuild(
     Ok((rebuilt, responses[0].clone()))
 }
 
-async fn require_generation_quiescence(
+async fn require_commit_revision_quiescence(
     client: &mut IndexClient,
     cases: &[EngineCase],
 ) -> TestResult<()> {
-    let deadline = Instant::now() + GENERATION_QUIET_LIMIT;
-    let mut observed_generations = None;
+    let deadline = Instant::now() + COMMIT_REVISION_QUIET_LIMIT;
+    let mut observed_commit_revisions = None;
     let mut stable_since = Instant::now();
     let mut advances = 0_u64;
 
     loop {
-        let mut generations = Vec::with_capacity(cases.len());
+        let mut commit_revisions = Vec::with_capacity(cases.len());
         for case in cases {
             let response = client.query_index(request(case)).await?.into_inner();
-            let generation = require_freshness(&response)?.generation;
-            if generation == 0 {
+            let commit_revision = require_freshness(&response)?.commit_revision;
+            if commit_revision == 0 {
                 return Err(invalid(format!(
-                    "{} generation disappeared while checking quiescence",
+                    "{} commit_revision disappeared while checking quiescence",
                     case.name
                 )));
             }
-            generations.push(generation);
+            commit_revisions.push(commit_revision);
         }
-        match observed_generations.as_ref() {
-            Some(previous) if previous == &generations => {}
+        match observed_commit_revisions.as_ref() {
+            Some(previous) if previous == &commit_revisions => {}
             Some(_) => {
-                observed_generations = Some(generations.clone());
+                observed_commit_revisions = Some(commit_revisions.clone());
                 stable_since = Instant::now();
                 advances = advances.saturating_add(1);
             }
             None => {
-                observed_generations = Some(generations.clone());
+                observed_commit_revisions = Some(commit_revisions.clone());
                 stable_since = Instant::now();
             }
         }
 
-        if stable_since.elapsed() >= GENERATION_QUIET_WINDOW {
+        if stable_since.elapsed() >= COMMIT_REVISION_QUIET_WINDOW {
             println!(
-                "all {} index generations remained stable for {} seconds",
-                generations.len(),
-                GENERATION_QUIET_WINDOW.as_secs()
+                "all {} index commit revisions remained stable for {} seconds",
+                commit_revisions.len(),
+                COMMIT_REVISION_QUIET_WINDOW.as_secs()
             );
             return Ok(());
         }
         if Instant::now() >= deadline {
             return Err(invalid(format!(
-                "index generations did not quiesce without source mutations: \
-                 observed {advances} vector advances in {} seconds (latest {generations:?})",
-                GENERATION_QUIET_LIMIT.as_secs()
+                "index commit revisions did not quiesce without source mutations: \
+                 observed {advances} vector advances in {} seconds (latest {commit_revisions:?})",
+                COMMIT_REVISION_QUIET_LIMIT.as_secs()
             )));
         }
         sleep(POLL_INTERVAL).await;
@@ -852,7 +854,7 @@ fn write_verification_state(
                 name: case.name.into(),
                 index_id: definition.index_id,
                 definition_version: definition.version,
-                generation: freshness.generation,
+                commit_revision: freshness.commit_revision,
                 placement_term: freshness.placement_term,
                 placement_index: freshness.placement_index,
                 sources,
@@ -907,7 +909,7 @@ async fn verify_existing_state(
             request(case),
             expected.index_id,
             expected.definition_version,
-            expected.generation.saturating_sub(1),
+            expected.commit_revision.saturating_sub(1),
             u64::MAX,
             &expected_paths,
             &expected_versions,
@@ -938,7 +940,7 @@ fn verify_response_state(
         })
         .collect::<Vec<_>>();
     sources.sort_by_key(|source| source.node_id);
-    if freshness.generation != expected.generation
+    if freshness.commit_revision != expected.commit_revision
         || freshness.index_id != expected.index_id
         || freshness.definition_version != expected.definition_version
         || freshness.placement_term != expected.placement_term
@@ -949,8 +951,8 @@ fn verify_response_state(
         || verification_hits(response)? != expected.hits
     {
         return Err(invalid(format!(
-            "{}:{} did not preserve its final complete generation {}",
-            expected.bucket, expected.name, expected.generation
+            "{}:{} did not preserve its final complete commit_revision {}",
+            expected.bucket, expected.name, expected.commit_revision
         )));
     }
     Ok(())
@@ -1302,7 +1304,7 @@ async fn wait_for_queries(
     request: QueryIndexRequest,
     index_id: u64,
     definition_version: u64,
-    after_generation: u64,
+    after_commit_revision: u64,
     indexed_objects: u64,
     expected_paths: &BTreeSet<&str>,
     expected_versions: &BTreeMap<&str, u64>,
@@ -1330,7 +1332,7 @@ async fn wait_for_queries(
                     response,
                     index_id,
                     definition_version,
-                    after_generation,
+                    after_commit_revision,
                     indexed_objects,
                     expected_paths,
                     expected_versions,
@@ -1348,8 +1350,8 @@ async fn wait_for_queries(
                 .map(|response| {
                     let freshness = response.freshness.as_ref();
                     format!(
-                        "generation={} hits={}",
-                        freshness.map_or(0, |value| value.generation),
+                        "commit_revision={} hits={}",
+                        freshness.map_or(0, |value| value.commit_revision),
                         response.hits.len(),
                     )
                 })
@@ -1396,7 +1398,7 @@ fn response_matches(
     response: &QueryIndexResponse,
     index_id: u64,
     definition_version: u64,
-    after_generation: u64,
+    after_commit_revision: u64,
     indexed_objects: u64,
     expected_paths: &BTreeSet<&str>,
     expected_versions: &BTreeMap<&str, u64>,
@@ -1406,7 +1408,7 @@ fn response_matches(
     let Some(freshness) = response.freshness.as_ref() else {
         return false;
     };
-    if freshness.generation <= after_generation
+    if freshness.commit_revision <= after_commit_revision
         || freshness.published_at.is_none()
         || !freshness.initial_build_complete
         || freshness.rebuilding
@@ -1468,12 +1470,12 @@ fn require_checkpoint_advance(
                 && new.indexed_next_offset > old.indexed_next_offset
         })
         .count();
-    if after.generation <= before.generation
+    if after.commit_revision <= before.commit_revision
         || after.sources.len() != before.sources.len()
         || advanced_sources < minimum_sources
     {
         return Err(invalid(format!(
-            "published index generation advanced {advanced_sources} cluster source checkpoints; expected at least {minimum_sources}"
+            "published index commit_revision advanced {advanced_sources} cluster source checkpoints; expected at least {minimum_sources}"
         )));
     }
     Ok(())
@@ -1507,6 +1509,7 @@ fn request(case: &EngineCase) -> QueryIndexRequest {
         limit: 100,
         page_token: Vec::new(),
         tenant: String::new(),
+        required_freshness: None,
     }
 }
 
@@ -1527,7 +1530,7 @@ async fn collect_paginated_paths(
         let freshness = require_freshness(&response)?;
         if !stable_freshness_agrees(Some(expected_freshness), Some(freshness)) {
             return Err(invalid(format!(
-                "{} pagination changed its pinned generation",
+                "{} pagination changed its pinned commit_revision",
                 case.name
             )));
         }

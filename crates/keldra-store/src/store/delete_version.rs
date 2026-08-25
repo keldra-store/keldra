@@ -75,7 +75,7 @@ impl Store {
         let Some(expected_head) = self.head_by_storage_key(&head_key)? else {
             return Ok(not_found());
         };
-        let Some(target) = self.version_metadata_by_identity(identity, key, version_id)? else {
+        let Some(target) = self.user_retained_version(identity, key, version_id)? else {
             if expected_head.version == version_id {
                 return Err(MutationError::Storage(
                     "head references a missing retained version".into(),
@@ -285,7 +285,11 @@ impl Store {
             batch.put_cf(
                 self.cf(CF_VERSIONS)?,
                 version_key(identity, &key, replacement.id),
-                serde_json::to_vec(replacement).map_err(storage_error)?,
+                serde_json::to_vec(&StoredVersion::new(
+                    replacement.clone(),
+                    StoredVersionRetention::UserRetained,
+                ))
+                .map_err(storage_error)?,
             );
             batch.put_cf(
                 self.cf(CF_HEADS)?,

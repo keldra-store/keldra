@@ -3,7 +3,8 @@ use rocksdb::WriteBatchIteratorCf;
 use crate::key::STORAGE_KEY_FORMAT_VERSION;
 use crate::watch::{REFERENCE_PROOF_KEY_BYTES, offset_from_key};
 use crate::{
-    BatchOperation, Durability, ObjectMutationContext, PlacementLogId, PutMode, PutRequest,
+    BatchOperation, DestinationReferenceArtifact, DestinationReferenceDelta, Durability,
+    ObjectMutationContext, PlacementLogId, PutMode, PutRequest, ReferenceDeltaBatch,
     ReplicaObjectMutationApplied, StoreOptions, VersionId,
 };
 
@@ -40,6 +41,107 @@ async fn stores() -> (tempfile::TempDir, Store, Store) {
         .await
         .unwrap();
     (temporary, source, replica)
+}
+
+#[tokio::test]
+async fn unversioned_source_version_retires_only_with_its_checkpointed_journal_record() {
+    let (_temporary, source, _replica) = stores().await;
+    let first = source
+        .coordinate_object_mutation(BatchOperation::Put(put("retained", "first")), context())
+        .await
+        .unwrap()
+        .mutation
+        .unwrap();
+    let first_after = source
+        .reference_delta_cursor(first.stamp.source_id)
+        .unwrap();
+    assert_eq!(first_after + 1, first.stamp.source_journal_position);
+    source
+        .apply_reference_deltas(ReferenceDeltaBatch {
+            source: first.stamp.source_id,
+            // Sealing the distributed payload is itself a locally consumed
+            // lifecycle record. Consume only the subsequent object-head
+            // effect described by this mutation proof.
+            after: first_after,
+            through: first.stamp.source_journal_position,
+            deltas: first
+                .reference_deltas
+                .iter()
+                .map(|delta| DestinationReferenceDelta {
+                    artifact: DestinationReferenceArtifact::CompleteBlob(delta.blob.clone()),
+                    change: delta.change,
+                })
+                .collect(),
+        })
+        .await
+        .unwrap();
+    let mut replacement = put("retained", "second");
+    replacement.mode = PutMode::Put;
+    let second = source
+        .coordinate_object_mutation(BatchOperation::Put(replacement), context())
+        .await
+        .unwrap()
+        .mutation
+        .unwrap();
+    let second_after = source
+        .reference_delta_cursor(second.stamp.source_id)
+        .unwrap();
+    assert!(second_after < second.stamp.source_journal_position);
+    source
+        .apply_reference_deltas(ReferenceDeltaBatch {
+            source: second.stamp.source_id,
+            // The range also covers intervening destination-lifecycle and
+            // payload-seal records. They carry no source reference effect, so
+            // this one contiguous delivery contains only the head delta.
+            after: second_after,
+            through: second.stamp.source_journal_position,
+            deltas: second
+                .reference_deltas
+                .iter()
+                .map(|delta| DestinationReferenceDelta {
+                    artifact: DestinationReferenceArtifact::CompleteBlob(delta.blob.clone()),
+                    change: delta.change,
+                })
+                .collect(),
+        })
+        .await
+        .unwrap();
+
+    let identity = BucketIdentity {
+        tenant_id: TenantId(first.tenant_id),
+        bucket_id: BucketId(first.bucket_id),
+    };
+    let retained_key = key("retained");
+    assert!(
+        source
+            .version_metadata_by_identity(identity, &retained_key, first.version.id)
+            .unwrap()
+            .is_some()
+    );
+    source
+        .advance_source_journal_reference_safe_through(second.stamp.source_journal_position)
+        .await
+        .unwrap();
+    source
+        .advance_source_journal_settled_through(second.stamp.source_journal_position)
+        .await
+        .unwrap();
+    assert!(source.prune_source_journal_for_capacity().await.unwrap());
+    assert!(source.prune_source_journal_for_capacity().await.unwrap());
+    assert!(
+        source
+            .version_metadata_by_identity(identity, &retained_key, first.version.id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        source
+            .head_by_storage_key(&identity.head_key("retained"))
+            .unwrap()
+            .unwrap()
+            .version,
+        second.version.id
+    );
 }
 
 #[tokio::test]

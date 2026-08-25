@@ -167,7 +167,7 @@ fn routed_response() -> QueryIndexResponse {
         facet_results: Vec::new(),
         aggregate_results: Vec::new(),
         freshness: Some(IndexFreshness {
-            generation: 7,
+            commit_revision: 7,
             published_at: None,
             sources: vec![
                 IndexSourceFreshness {
@@ -251,7 +251,7 @@ fn routed_freshness_allows_only_live_source_observations_to_differ() {
 #[test]
 fn routed_freshness_requires_stable_identity_and_checkpoints() {
     assert_freshness_disagrees(|response| {
-        response.freshness.as_mut().unwrap().generation += 1;
+        response.freshness.as_mut().unwrap().commit_revision += 1;
     });
     assert_freshness_disagrees(|response| {
         response.freshness.as_mut().unwrap().published_at = Some(Default::default());

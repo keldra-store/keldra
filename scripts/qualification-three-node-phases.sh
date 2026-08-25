@@ -259,8 +259,8 @@ membership_cutover_index_id=
 membership_cutover_index_bucket=
 membership_cutover_index_path=
 membership_cutover_index_version=
-membership_cutover_index_generation_before=
-membership_cutover_index_generation_after=
+membership_cutover_index_commit_revision_before=
+membership_cutover_index_commit_revision_after=
 membership_cutover_index_attempts=
 membership_cutover_index_burst=
 membership_cutover_index_token=
@@ -461,16 +461,16 @@ cutover_access_token() {
   jq -er '.accessToken | select(type == "string" and length > 0)' <<<"${response}"
 }
 
-latest_index_generation_from_log() {
+latest_index_commit_revision_from_log() {
   local log="$1"
   local index_id="$2"
   local line
   line="$(awk -v marker="index.id=${index_id} " '
       index($0, marker) && index($0, "index.kind=Path") &&
-      index($0, "index generation published") { line = $0 }
+      index($0, "index commit published") { line = $0 }
       END { if (line != "") print line }
     ' "${log}")"
-  log_unsigned_field generation "${line}"
+  log_unsigned_field revision "${line}"
 }
 
 select_indexed_cutover_fixture() {
@@ -482,7 +482,7 @@ select_indexed_cutover_fixture() {
     membership_cutover_index_id="$(log_unsigned_field index.id "${line}" || true)"
     [[ -n "${membership_cutover_index_id}" ]] && break
   done < <(awk '
-      index($0, "index.kind=Path") && index($0, "index generation published")
+      index($0, "index.kind=Path") && index($0, "index commit published")
     ' "${reassignment_log}")
   if [[ ! "${membership_cutover_index_id}" =~ ^[1-9][0-9]*$ ]]; then
     echo "${builder} published no selectable pre-cutover Path index" >&2
@@ -493,14 +493,14 @@ select_indexed_cutover_fixture() {
       '.fixtures[] | select(.index_id == $index_id) | .bucket' "${state}" \
       | head -n 1
   )"
-  membership_cutover_index_generation_before="$(
-    latest_index_generation_from_log "${reassignment_log}" \
+  membership_cutover_index_commit_revision_before="$(
+    latest_index_commit_revision_from_log "${reassignment_log}" \
       "${membership_cutover_index_id}"
   )"
   if [[ -z "${membership_cutover_index_bucket}" \
-    || ! "${membership_cutover_index_generation_before}" =~ ^[1-9][0-9]*$ ]]
+    || ! "${membership_cutover_index_commit_revision_before}" =~ ^[1-9][0-9]*$ ]]
   then
-    echo "selected cutover index omitted its bucket or published generation" >&2
+    echo "selected cutover index omitted its bucket or published commit_revision" >&2
     return 1
   fi
 }
@@ -604,7 +604,7 @@ prepare_indexed_membership_cutover_qualification() {
     save_log_suffix "${builder}" "${builder_log_start}" "${builder_log}"
     if log_has_index_event \
       "${builder_log}" "${membership_cutover_index_id}" \
-      "index generation published"
+      "index commit published"
     then
       docker unpause "${paused_container}" >/dev/null
       paused_container=""
@@ -670,7 +670,7 @@ indexed_cutover_response_matches() {
     --arg path "${membership_cutover_index_path}" \
     --arg version "${membership_cutover_index_version}" \
     --argjson index_id "${membership_cutover_index_id}" \
-    --argjson generation_before "${membership_cutover_index_generation_before}" \
+    --argjson commit_revision_before "${membership_cutover_index_commit_revision_before}" \
     --argjson pending_source_node "${membership_cutover_index_source_node_id}" \
     --argjson pending_tail "${membership_cutover_index_source_tail}" \
     --argjson fence_term "${fence_term}" \
@@ -683,7 +683,7 @@ indexed_cutover_response_matches() {
       .freshness.initialBuildComplete == true and
       ((.freshness.rebuilding // false) == false) and
       (.freshness.indexId | tonumber) == $index_id and
-      (.freshness.generation | tonumber) > $generation_before and
+      (.freshness.commitRevision | tonumber) > $commit_revision_before and
       (.freshness.placementTerm | tonumber) == $fence_term and
       (.freshness.placementIndex | tonumber) == $fence_index and
       (.freshness.sources | length) == 3 and
@@ -706,7 +706,7 @@ wait_for_indexed_cutover_effect() {
   local endpoint
   local node
   local response
-  local generation=""
+  local commit_revision=""
   local all_ready
   for attempt in $(seq 1 90); do
     all_ready=1
@@ -725,10 +725,10 @@ wait_for_indexed_cutover_effect() {
         all_ready=0
         break
       fi
-      generation="$(jq -er '.freshness.generation' "${response}")"
+      commit_revision="$(jq -er '.freshness.commitRevision' "${response}")"
     done
     if ((all_ready == 1)); then
-      membership_cutover_index_generation_after="${generation}"
+      membership_cutover_index_commit_revision_after="${commit_revision}"
       for node in keldra-1 keldra-2 keldra-3; do
         preserve_qualification_log \
           "${KELDRA_QUALIFICATION_DIR}/artifacts/membership-indexed-query-${node}.json" \
@@ -834,7 +834,7 @@ qualify_no_event_membership_cutover() {
     "${evidence}" \
     "/var/tmp/keldra-v090-three-membership-no-event-${qualification_suffix}-${node}.log"
   if [[ -n "${membership_cutover_index_id}" ]]; then
-    echo "[keldra-qualification] indexed cutover preserved Path index ${membership_cutover_index_id}, made ${membership_cutover_index_path}@${membership_cutover_index_version} visible in generation ${membership_cutover_index_generation_after}, and proved three-source zero-lag freshness under the exact three-ACTIVE-node fence"
+    echo "[keldra-qualification] indexed cutover preserved Path index ${membership_cutover_index_id}, made ${membership_cutover_index_path}@${membership_cutover_index_version} visible in commit revision ${membership_cutover_index_commit_revision_after}, and proved three-source zero-lag freshness under the exact three-ACTIVE-node fence"
   fi
   echo "[keldra-qualification] cutover advanced index/accounting through source ${node_id} tail ${membership_cutover_source_tail} under the new fence; the next ordinary write advanced it to ${tail}"
 }

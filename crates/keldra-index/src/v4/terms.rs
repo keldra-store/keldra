@@ -8,7 +8,6 @@ use super::keys::{
 use super::model::{INDEX_COMPONENT_BYTES, INDEX_TERM_BYTES, validate_term_routing_key};
 
 const TERM_DICTIONARY_CODEC_VERSION: u16 = 2;
-const LEGACY_TERM_DICTIONARY_CODEC_VERSION: u16 = 1;
 const MAX_PAYLOAD_BYTES: usize = INDEX_COMPONENT_BYTES - COMPONENT_HEADER_BYTES;
 /// Target one independently addressable dictionary leaf at 32 KiB. The
 /// 512-KiB component ceiling remains the hard bound for a legal singleton
@@ -25,9 +24,6 @@ pub struct PostingReference {
     pub first_component_ordinal: u32,
     pub component_count: u32,
     /// Inclusive maximum DocId for each posting component, in component order.
-    ///
-    /// Empty only for a format-v4 term dictionary written before codec version
-    /// 2. Such references retain the exact sequential fallback.
     pub component_max_doc_ids: Vec<super::DocId>,
 }
 
@@ -45,7 +41,7 @@ pub struct TermDictionary {
 
 impl TermDictionary {
     pub fn new(entries: Vec<TermEntry>) -> Result<Self, IndexError> {
-        validate_entries(&entries, true)?;
+        validate_entries(&entries)?;
         let value = Self { entries };
         let length = value.encode_payload()?.len();
         if length > MAX_PAYLOAD_BYTES {
@@ -80,7 +76,7 @@ impl TermDictionary {
     }
 
     pub fn encode_payload(&self) -> Result<Vec<u8>, IndexError> {
-        validate_entries(&self.entries, true)?;
+        validate_entries(&self.entries)?;
         let mut out = Encoder::default();
         out.u16(TERM_DICTIONARY_CODEC_VERSION);
         out.usize_u32(self.entries.len())?;
@@ -100,10 +96,7 @@ impl TermDictionary {
     pub fn decode_payload(bytes: &[u8]) -> Result<Self, IndexError> {
         let mut input = Decoder::new(bytes)?;
         let version = input.u16()?;
-        if !matches!(
-            version,
-            LEGACY_TERM_DICTIONARY_CODEC_VERSION | TERM_DICTIONARY_CODEC_VERSION
-        ) {
+        if version != TERM_DICTIONARY_CODEC_VERSION {
             return Err(IndexError::InvalidFormat("term dictionary codec version"));
         }
         let count = usize::try_from(input.u32()?).map_err(|_| IndexError::OffsetOverflow)?;
@@ -119,19 +112,15 @@ impl TermDictionary {
             let total_term_frequency = input.u64()?;
             let first_component_ordinal = input.u32()?;
             let component_count = input.u32()?;
-            let component_max_doc_ids = if version == TERM_DICTIONARY_CODEC_VERSION {
-                input.claim(
-                    usize::try_from(component_count)
-                        .map_err(|_| IndexError::OffsetOverflow)?
-                        .checked_mul(std::mem::size_of::<u32>())
-                        .ok_or(IndexError::OffsetOverflow)?,
-                )?;
-                (0..component_count)
-                    .map(|_| input.u32().map(super::DocId::new))
-                    .collect::<Result<Vec<_>, _>>()?
-            } else {
-                Vec::new()
-            };
+            input.claim(
+                usize::try_from(component_count)
+                    .map_err(|_| IndexError::OffsetOverflow)?
+                    .checked_mul(std::mem::size_of::<u32>())
+                    .ok_or(IndexError::OffsetOverflow)?,
+            )?;
+            let component_max_doc_ids = (0..component_count)
+                .map(|_| input.u32().map(super::DocId::new))
+                .collect::<Result<Vec<_>, _>>()?;
             entries.push(TermEntry {
                 term,
                 postings: PostingReference {
@@ -144,12 +133,12 @@ impl TermDictionary {
             });
         }
         input.finish()?;
-        validate_entries(&entries, version == TERM_DICTIONARY_CODEC_VERSION)?;
+        validate_entries(&entries)?;
         Ok(Self { entries })
     }
 
     pub fn split(entries: Vec<TermEntry>) -> Result<Vec<Self>, IndexError> {
-        validate_entries(&entries, true)?;
+        validate_entries(&entries)?;
         let mut blocks = Vec::new();
         let mut pending = Vec::new();
         let mut bytes = 6usize;
@@ -191,10 +180,7 @@ pub(crate) fn encoded_entry_bytes(entry: &TermEntry) -> Result<usize, IndexError
         .ok_or(IndexError::OffsetOverflow)
 }
 
-fn validate_entries(
-    entries: &[TermEntry],
-    require_component_bounds: bool,
-) -> Result<(), IndexError> {
+fn validate_entries(entries: &[TermEntry]) -> Result<(), IndexError> {
     if entries.is_empty() {
         return Err(IndexError::InvalidDefinition(
             "term dictionary must not be empty".into(),
@@ -206,17 +192,12 @@ fn validate_entries(
             || entry.postings.total_term_frequency < entry.postings.document_frequency
             || entry.postings.component_count == 0
             || u64::from(entry.postings.component_count) > entry.postings.document_frequency
-            || require_component_bounds
-                && entry.postings.component_max_doc_ids.len()
-                    != entry.postings.component_count as usize
-            || !entry.postings.component_max_doc_ids.is_empty()
-                && (entry.postings.component_max_doc_ids.len()
-                    != entry.postings.component_count as usize
-                    || entry
-                        .postings
-                        .component_max_doc_ids
-                        .windows(2)
-                        .any(|pair| pair[0] >= pair[1]))
+            || entry.postings.component_max_doc_ids.len() != entry.postings.component_count as usize
+            || entry
+                .postings
+                .component_max_doc_ids
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
             || entry
                 .postings
                 .first_component_ordinal
@@ -308,10 +289,10 @@ mod tests {
     }
 
     #[test]
-    fn legacy_dictionary_decodes_without_component_bounds() {
+    fn old_dictionary_codec_is_rejected() {
         let term = [0, 0, 0, 1, TERM_TYPE_STRING, 0, b'a'];
         let mut out = Encoder::default();
-        out.u16(LEGACY_TERM_DICTIONARY_CODEC_VERSION);
+        out.u16(1);
         out.u32(1);
         out.bytes(&term).unwrap();
         out.u64(3);
@@ -319,11 +300,7 @@ mod tests {
         out.u32(7);
         out.u32(2);
 
-        let decoded = TermDictionary::decode_payload(&out.finish()).unwrap();
-        let reference = &decoded.entries()[0].postings;
-        assert_eq!(reference.first_component_ordinal, 7);
-        assert_eq!(reference.component_count, 2);
-        assert!(reference.component_max_doc_ids.is_empty());
+        assert!(TermDictionary::decode_payload(&out.finish()).is_err());
     }
 
     #[test]

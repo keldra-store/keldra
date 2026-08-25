@@ -402,6 +402,8 @@ fn snapshot_at(exact_path: &str, head: &Version, versions: Vec<Version>) -> Obje
             mutation_stamp: None,
         },
         versions,
+        journal_pending_versions: Vec::new(),
+        journal_released_versions: Vec::new(),
         definition_locator: None,
     }
 }

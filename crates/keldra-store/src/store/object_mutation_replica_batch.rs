@@ -170,22 +170,51 @@ impl Store {
             }
 
             if !already_applied {
-                if mutation.retire_predecessor {
-                    let predecessor = mutation.stamp.predecessor_version.ok_or_else(|| {
-                        MutationError::InvalidObjectMutation(
-                            "retired predecessor is missing from mutation lineage".into(),
-                        )
-                    })?;
+                let retention = self.version_retention_for_bucket(identity)?;
+                if let Some(predecessor) = mutation.stamp.predecessor_version {
                     let predecessor_key =
                         replica_version_key(identity, &mutation.exact_path, predecessor);
-                    batch.delete_cf(self.cf(CF_VERSIONS)?, &predecessor_key);
-                    pending_versions.remove(&predecessor_key);
-                    deleted_versions.insert(predecessor_key);
+                    if let Some(stored) = self.stored_version_by_key(&predecessor_key)? {
+                        match stored.retention {
+                            StoredVersionRetention::JournalPending
+                                if retention == StoredVersionRetention::UserRetained =>
+                            {
+                                batch.put_cf(
+                                    self.cf(CF_VERSIONS)?,
+                                    predecessor_key,
+                                    serde_json::to_vec(&StoredVersion::new(
+                                        stored.version,
+                                        StoredVersionRetention::UserRetained,
+                                    ))
+                                    .map_err(storage_error)?,
+                                );
+                            }
+                            StoredVersionRetention::JournalReleased
+                                if retention == StoredVersionRetention::UserRetained =>
+                            {
+                                batch.put_cf(
+                                    self.cf(CF_VERSIONS)?,
+                                    predecessor_key,
+                                    serde_json::to_vec(&StoredVersion::new(
+                                        stored.version,
+                                        StoredVersionRetention::UserRetained,
+                                    ))
+                                    .map_err(storage_error)?,
+                                );
+                            }
+                            StoredVersionRetention::JournalReleased => {
+                                batch.delete_cf(self.cf(CF_VERSIONS)?, predecessor_key);
+                            }
+                            StoredVersionRetention::JournalPending
+                            | StoredVersionRetention::UserRetained => {}
+                        }
+                    }
                 }
                 batch.put_cf(
                     self.cf(CF_VERSIONS)?,
                     &encoded_version_key,
-                    serde_json::to_vec(&mutation.version).map_err(storage_error)?,
+                    serde_json::to_vec(&StoredVersion::new(mutation.version.clone(), retention))
+                        .map_err(storage_error)?,
                 );
                 let head = Head {
                     version: mutation.version.id,
@@ -278,7 +307,9 @@ fn read_replica_version(
     }
     match pending.get(key) {
         Some(version) => Ok(Some(version.clone())),
-        None => store.read_json(CF_VERSIONS, key),
+        None => Ok(store
+            .stored_version_by_key(key)?
+            .map(|stored| stored.version)),
     }
 }
 
@@ -404,7 +435,6 @@ mod tests {
                 deleted: true,
                 committed_at_unix_millis: first.version.committed_at_unix_millis + 1,
             },
-            retire_predecessor: true,
             stamp: crate::MutationStamp {
                 predecessor_version: Some(first.version.id),
                 source_journal_position: first.stamp.source_journal_position + 1,

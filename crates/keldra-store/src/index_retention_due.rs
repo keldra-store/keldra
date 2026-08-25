@@ -3,17 +3,17 @@ use thiserror::Error;
 use crate::VersionId;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct IndexGenerationRetentionDue {
+pub struct IndexCommitRetentionDue {
     pub tenant_id: u64,
     pub bucket_id: u64,
     pub index_id: u64,
     pub definition_path: String,
     pub definition_object_version: VersionId,
-    pub generation: u64,
+    pub commit_revision: u64,
     pub due_at_unix_millis: u64,
 }
 
-impl IndexGenerationRetentionDue {
+impl IndexCommitRetentionDue {
     pub fn validate(&self) -> Result<(), IndexRetentionDueError> {
         validate_common(
             self.tenant_id,
@@ -22,9 +22,9 @@ impl IndexGenerationRetentionDue {
             &self.definition_path,
             self.definition_object_version,
         )?;
-        if self.generation == 0 {
+        if self.commit_revision == 0 {
             return Err(IndexRetentionDueError::Malformed(
-                "index generation must be non-zero".into(),
+                "index commit revision must be non-zero".into(),
             ));
         }
         Ok(())

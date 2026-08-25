@@ -2,18 +2,321 @@ use std::collections::VecDeque;
 use std::io;
 use std::sync::Arc;
 
+use keldra_store::Head;
 use tracing::Instrument;
 
 use super::*;
 use crate::cluster_object_read::ClusterReadPayload;
+use crate::index_runtime::committed_view::IndexCommitManifest;
+use crate::index_runtime::publisher::LoadedRebuildRoot;
+use crate::index_runtime::rebuild_root::DurableRebuildRoot;
 
 pub(super) struct RebuildWork {
-    pub(super) current: Option<PublishedGeneration>,
+    pub(super) current: Option<CommittedIndexView>,
     pub(super) snapshot: ClusterIndexSourceSnapshot,
     pub(super) through: IndexBarrier,
-    pub(super) candidate: CandidateGeneration,
+    pub(super) candidate: CandidateCommit,
     pub(super) maximum_frame_bytes: u64,
     pub(super) progress: BuilderProgress,
+    pub(super) attempt_id: u64,
+    pub(super) root_version: VersionId,
+    pub(super) last_canonical_path: Option<String>,
+    pub(super) scanned_records: u64,
+    pub(super) scanned_bytes: u64,
+    pub(super) resumed_from_durable_root: bool,
+}
+
+pub(super) async fn start_rebuild_work(
+    job: &BuilderJob,
+    current: Option<CommittedIndexView>,
+    snapshot: ClusterIndexSourceSnapshot,
+    through: IndexBarrier,
+    maximum_frame_bytes: u64,
+    progress: BuilderProgress,
+    dependencies: &IndexBuilderDependencies,
+) -> Result<RebuildWork, Status> {
+    let attempt_id = dependencies
+        .store
+        .allocate_snowflake_id()
+        .map_err(|error| Status::internal(format!("allocate rebuild attempt ID: {error}")))?;
+    let candidate = CandidateCommit::rebuild();
+    let manifest = IndexCommitManifest::new(
+        job.definition.stored.index_id,
+        attempt_id,
+        job.definition.object_version,
+        job.definition.schema.kind,
+        job.definition.schema_fingerprint,
+        &through,
+        Vec::new(),
+        None,
+        manifest_physical_order(&job.definition.schema),
+        Vec::new(),
+        Vec::new(),
+        0,
+        0,
+    )
+    .map_err(|error| Status::internal(error.to_string()))?;
+    let root = DurableRebuildRoot {
+        index_id: job.definition.stored.index_id,
+        definition_version: job.definition.object_version,
+        attempt_id,
+        baseline: through.clone(),
+        last_canonical_path: None,
+        baseline_complete: false,
+        scanned_records: 0,
+        scanned_bytes: 0,
+        candidate: manifest,
+    };
+    let loaded = dependencies
+        .publisher
+        .publish_rebuild_root(
+            &job.definition.stored,
+            job.definition.tenant_id,
+            job.definition.bucket_id,
+            &root,
+            None,
+        )
+        .await?;
+    Ok(RebuildWork {
+        current,
+        snapshot,
+        through,
+        candidate,
+        maximum_frame_bytes,
+        progress,
+        attempt_id,
+        root_version: loaded.object_version,
+        last_canonical_path: None,
+        scanned_records: 0,
+        scanned_bytes: 0,
+        resumed_from_durable_root: false,
+    })
+}
+
+pub(super) fn resume_rebuild_work(
+    current: Option<CommittedIndexView>,
+    snapshot: ClusterIndexSourceSnapshot,
+    loaded: LoadedRebuildRoot,
+    maximum_frame_bytes: u64,
+    progress: BuilderProgress,
+) -> Result<RebuildWork, Status> {
+    let root = loaded.root;
+    for checkpoint in snapshot.checkpoints() {
+        let baseline = root.baseline.sources.get(&checkpoint.node).ok_or_else(|| {
+            Status::failed_precondition("rebuild source set changed while resuming")
+        })?;
+        if checkpoint.source != baseline.source
+            || checkpoint.captured_tail.saturating_add(1) < baseline.next_offset
+        {
+            return Err(Status::failed_precondition(
+                "rebuild source epoch or retained baseline changed while resuming",
+            ));
+        }
+    }
+    if snapshot.checkpoints().len() != root.baseline.sources.len()
+        || snapshot.placement_fence() != root.baseline.fence
+    {
+        return Err(Status::failed_precondition(
+            "rebuild placement changed while resuming",
+        ));
+    }
+    Ok(RebuildWork {
+        current,
+        snapshot,
+        through: root.baseline,
+        candidate: CandidateCommit::from_rebuild_manifest(&root.candidate),
+        maximum_frame_bytes,
+        progress,
+        attempt_id: root.attempt_id,
+        root_version: loaded.object_version,
+        last_canonical_path: root.last_canonical_path,
+        scanned_records: root.scanned_records,
+        scanned_bytes: root.scanned_bytes,
+        resumed_from_durable_root: true,
+    })
+}
+
+pub(super) async fn resume_durable_rebuild(
+    job: &BuilderJob,
+    current: Option<CommittedIndexView>,
+    maximum_frame_bytes: u64,
+    progress: BuilderProgress,
+    dependencies: &IndexBuilderDependencies,
+) -> Result<Option<RebuildWork>, Status> {
+    let Some(loaded) = dependencies
+        .publisher
+        .load_rebuild_root(
+            &job.definition.stored,
+            job.definition.tenant_id,
+            job.definition.bucket_id,
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+    if let Some(serving) = current.as_ref()
+        && serving_completes_rebuild(
+            &loaded.root,
+            &serving.manifest,
+            job.definition.object_version,
+        )
+    {
+        dependencies
+            .publisher
+            .delete_rebuild_root(
+                &job.definition.stored,
+                job.definition.tenant_id,
+                job.definition.bucket_id,
+                loaded.object_version,
+            )
+            .await?;
+        return Ok(None);
+    }
+    if rebuild_root_requires_replacement(
+        &loaded.root,
+        job.definition.object_version,
+        job.definition.schema.kind,
+        job.definition.schema_fingerprint,
+    ) {
+        dependencies
+            .publisher
+            .delete_rebuild_root(
+                &job.definition.stored,
+                job.definition.tenant_id,
+                job.definition.bucket_id,
+                loaded.object_version,
+            )
+            .await?;
+        return Ok(None);
+    }
+    let snapshot = dependencies
+        .scanner
+        .begin_source_snapshot(
+            job.definition.tenant_id,
+            job.definition.bucket_id,
+            job.definition.stored.path_prefix.clone(),
+            loaded.root.last_canonical_path.clone(),
+            maximum_frame_bytes,
+        )
+        .await?;
+    let root_version = loaded.object_version;
+    match resume_rebuild_work(current, snapshot, loaded, maximum_frame_bytes, progress) {
+        Ok(work) => Ok(Some(work)),
+        Err(error) if error.code() == tonic::Code::FailedPrecondition => {
+            // A topology/source-epoch change invalidates only this non-serving
+            // attempt. Exact-delete it so Inspect can establish a fresh
+            // baseline instead of retrying an impossible resume forever.
+            dependencies
+                .publisher
+                .delete_rebuild_root(
+                    &job.definition.stored,
+                    job.definition.tenant_id,
+                    job.definition.bucket_id,
+                    root_version,
+                )
+                .await?;
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn serving_completes_rebuild(
+    root: &DurableRebuildRoot,
+    serving: &IndexCommitManifest,
+    definition_version: u64,
+) -> bool {
+    root.definition_version == definition_version
+        && root.baseline_complete
+        && root.candidate.segments == serving.segments
+        && root.candidate.locator_roots == serving.locator_roots
+}
+
+fn rebuild_root_requires_replacement(
+    root: &DurableRebuildRoot,
+    definition_version: u64,
+    kind: keldra_index::v4::IndexKind,
+    schema_fingerprint: [u8; 32],
+) -> bool {
+    root.definition_version != definition_version
+        || root.candidate.kind != kind
+        || root.candidate.schema_fingerprint != schema_fingerprint
+}
+
+pub(super) async fn checkpoint_catch_up_root(
+    job: &BuilderJob,
+    work: &CatchUpWork,
+    dependencies: &IndexBuilderDependencies,
+) -> Result<(), Status> {
+    let Some(loaded) = dependencies
+        .publisher
+        .load_rebuild_root(
+            &job.definition.stored,
+            job.definition.tenant_id,
+            job.definition.bucket_id,
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    let encoded_bytes = work
+        .candidate
+        .segments
+        .iter()
+        .map(|segment| segment.encoded_bytes)
+        .chain(
+            work.candidate
+                .locator_roots
+                .iter()
+                .map(|root| root.encoded_bytes),
+        )
+        .try_fold(0_u64, |total, bytes| total.checked_add(bytes))
+        .ok_or_else(|| Status::resource_exhausted("rebuild artifact bytes overflow"))?;
+    let logical_bytes = work
+        .candidate
+        .segments
+        .iter()
+        .map(|segment| segment.logical_bytes)
+        .chain(
+            work.candidate
+                .locator_roots
+                .iter()
+                .map(|root| root.logical_bytes),
+        )
+        .try_fold(0_u64, |total, bytes| total.checked_add(bytes))
+        .ok_or_else(|| Status::resource_exhausted("rebuild logical bytes overflow"))?;
+    let candidate = IndexCommitManifest::new(
+        job.definition.stored.index_id,
+        loaded.root.attempt_id,
+        job.definition.object_version,
+        job.definition.schema.kind,
+        job.definition.schema_fingerprint,
+        &work.through,
+        work.candidate.pending_atomic_batches.clone(),
+        None,
+        manifest_physical_order(&job.definition.schema),
+        work.candidate.segments.clone(),
+        work.candidate.locator_roots.clone(),
+        encoded_bytes,
+        logical_bytes,
+    )
+    .map_err(commit_view_status)?;
+    let checkpoint = DurableRebuildRoot {
+        candidate,
+        baseline_complete: true,
+        ..loaded.root
+    };
+    dependencies
+        .publisher
+        .publish_rebuild_root(
+            &job.definition.stored,
+            job.definition.tenant_id,
+            job.definition.bucket_id,
+            &checkpoint,
+            Some(loaded.object_version),
+        )
+        .await?;
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -22,7 +325,7 @@ enum RebuildTurnStart {
     ConsumeSnapshot,
 }
 
-fn rebuild_turn_start(candidate: &CandidateGeneration, limits: DebtLimits) -> RebuildTurnStart {
+fn rebuild_turn_start(candidate: &CandidateCommit, limits: DebtLimits) -> RebuildTurnStart {
     if debt::select(&candidate.segments, limits).is_some()
         || debt::select_locator_roots(&candidate.locator_roots, limits).is_some()
     {
@@ -36,14 +339,7 @@ pub(super) async fn advance_rebuild(
     job: &BuilderJob,
     mut work: RebuildWork,
     dependencies: &IndexBuilderDependencies,
-) -> Result<
-    (
-        BuilderPhase,
-        BuilderDisposition,
-        Option<PublishedGeneration>,
-    ),
-    Status,
-> {
+) -> Result<(BuilderPhase, BuilderDisposition, Option<CommittedIndexView>), Status> {
     let debt_limits = DebtLimits::new(
         dependencies.config.max_segments_per_tier(job.kind) as usize,
         dependencies.config.max_unmerged_bytes_per_tier(job.kind),
@@ -66,8 +362,13 @@ pub(super) async fn advance_rebuild(
     .await
     .map_err(budget_status)?;
     let granted_bytes = permit.bytes();
-    let plan = work_plan_for_limit(granted_bytes, 0)?;
-    let mut builder = NativeSegmentBuild::new(job, plan, dependencies)?;
+    let plan = work_plan_for_limit(
+        granted_bytes,
+        0,
+        dependencies.config.segment_flush_bytes(job.kind),
+    )?;
+    let mut builder =
+        NativeSegmentBuild::new(job, plan, SegmentPublicationLane::Maintenance, dependencies)?;
     let mut quantum = SourceWorkQuantum::for_rebuild_turn(granted_bytes, work.maximum_frame_bytes);
     loop {
         let scan_started = Instant::now();
@@ -133,6 +434,7 @@ pub(super) async fn advance_rebuild(
                 dependencies,
             )
             .await?;
+            work.root_version = persist_rebuild_root(job, &work, true, dependencies).await?;
             drop(permit);
             let target = dependencies
                 .journal
@@ -153,11 +455,15 @@ pub(super) async fn advance_rebuild(
                     candidate: work.candidate,
                     changed: false,
                     must_publish: true,
+                    checkpoint_started: None,
                     maintenance: false,
                     progress: BuilderProgress::start(
                         job.telemetry_identity(),
                         BuilderProgressPhase::CatchUp,
                     ),
+                    active: None,
+                    publishing: None,
+                    atomic_projection: None,
                 }),
                 BuilderDisposition::Ready,
                 None,
@@ -166,12 +472,18 @@ pub(super) async fn advance_rebuild(
 
         let records = scan_records;
         let encoded_bytes = scan_bytes;
-        let frame_plan = work_plan_for_limit(budget.limit(), frame_measure.resident_bytes)?;
+        let last_canonical_path = frame.last().map(|head| head.exact_path.clone());
+        let frame_plan = work_plan_for_limit(
+            budget.limit(),
+            frame_measure.resident_bytes,
+            dependencies.config.segment_flush_bytes(job.kind),
+        )?;
         let source_payload_bytes = await_with_builder_heartbeats(
             &work.progress,
             process_snapshot_frame(
                 &job.definition,
                 &work.through,
+                work.resumed_from_durable_root,
                 frame,
                 frame_plan,
                 &mut builder,
@@ -181,6 +493,11 @@ pub(super) async fn advance_rebuild(
         )
         .await?;
         work.progress.advance(records, encoded_bytes);
+        work.scanned_records = work.scanned_records.saturating_add(records);
+        work.scanned_bytes = work.scanned_bytes.saturating_add(encoded_bytes);
+        if let Some(path) = last_canonical_path {
+            work.last_canonical_path = Some(path);
+        }
         tracing::info!(
             index.kind = ?job.kind,
             monotonic_counter.keldra_index_source_payload_bytes_total = source_payload_bytes,
@@ -198,20 +515,94 @@ pub(super) async fn advance_rebuild(
                 dependencies,
             )
             .await?;
+            work.root_version = persist_rebuild_root(job, &work, false, dependencies).await?;
             drop(permit);
             return Ok((BuilderPhase::Rebuild(work), BuilderDisposition::Ready, None));
         }
     }
 }
 
+async fn persist_rebuild_root(
+    job: &BuilderJob,
+    work: &RebuildWork,
+    baseline_complete: bool,
+    dependencies: &IndexBuilderDependencies,
+) -> Result<VersionId, Status> {
+    let encoded_bytes = work
+        .candidate
+        .segments
+        .iter()
+        .map(|segment| segment.encoded_bytes)
+        .chain(
+            work.candidate
+                .locator_roots
+                .iter()
+                .map(|root| root.encoded_bytes),
+        )
+        .try_fold(0_u64, |total, bytes| total.checked_add(bytes))
+        .ok_or_else(|| Status::resource_exhausted("rebuild artifact bytes overflow"))?;
+    let logical_bytes = work
+        .candidate
+        .segments
+        .iter()
+        .map(|segment| segment.logical_bytes)
+        .chain(
+            work.candidate
+                .locator_roots
+                .iter()
+                .map(|root| root.logical_bytes),
+        )
+        .try_fold(0_u64, |total, bytes| total.checked_add(bytes))
+        .ok_or_else(|| Status::resource_exhausted("rebuild logical bytes overflow"))?;
+    let candidate = IndexCommitManifest::new(
+        job.definition.stored.index_id,
+        work.attempt_id,
+        job.definition.object_version,
+        job.definition.schema.kind,
+        job.definition.schema_fingerprint,
+        &work.through,
+        work.candidate.pending_atomic_batches.clone(),
+        None,
+        manifest_physical_order(&job.definition.schema),
+        work.candidate.segments.clone(),
+        work.candidate.locator_roots.clone(),
+        encoded_bytes,
+        logical_bytes,
+    )
+    .map_err(|error| Status::internal(error.to_string()))?;
+    let root = DurableRebuildRoot {
+        index_id: job.definition.stored.index_id,
+        definition_version: job.definition.object_version,
+        attempt_id: work.attempt_id,
+        baseline: work.through.clone(),
+        last_canonical_path: work.last_canonical_path.clone(),
+        baseline_complete,
+        scanned_records: work.scanned_records,
+        scanned_bytes: work.scanned_bytes,
+        candidate,
+    };
+    dependencies
+        .publisher
+        .publish_rebuild_root(
+            &job.definition.stored,
+            job.definition.tenant_id,
+            job.definition.bucket_id,
+            &root,
+            Some(work.root_version),
+        )
+        .await
+        .map(|loaded| loaded.object_version)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn process_snapshot_frame(
     definition: &CatalogDefinition,
     barrier: &IndexBarrier,
+    resumed_from_durable_root: bool,
     frame: Vec<IndexSourceSnapshotHead>,
     plan: SegmentMemoryPlan,
     builder: &mut NativeSegmentBuild,
-    candidate: &mut CandidateGeneration,
+    candidate: &mut CandidateCommit,
     dependencies: &IndexBuilderDependencies,
 ) -> Result<u64, Status> {
     let configured_lanes = usize::try_from(
@@ -235,7 +626,15 @@ async fn process_snapshot_frame(
                 "index snapshot returned an invalid current live head",
             ));
         }
-        require_visible_head(&head.head, barrier)?;
+        if let Err(error) = require_visible_head(&head.head, barrier) {
+            if skip_post_baseline_head(&error, resumed_from_durable_root) {
+                // A reopened scan is newer than the durable baseline. Its
+                // post-baseline state is reconstructed from the retained
+                // journal suffix, never admitted early into the baseline.
+                continue;
+            }
+            return Err(error);
+        }
         if !source_matches_definition(
             &definition.stored,
             &head.exact_path,
@@ -268,12 +667,55 @@ async fn process_snapshot_frame(
     Ok(source_payload_bytes)
 }
 
+fn skip_post_baseline_head(error: &Status, resumed_from_durable_root: bool) -> bool {
+    resumed_from_durable_root
+        && matches!(
+            error.code(),
+            tonic::Code::Aborted | tonic::Code::Unavailable
+        )
+}
+
+fn require_visible_head(head: &Head, barrier: &IndexBarrier) -> Result<(), Status> {
+    let Some(stamp) = head.mutation_stamp else {
+        return Ok(());
+    };
+    if !barrier.atomic.permits(stamp.program_commit_cursor) {
+        return Err(Status::unavailable(
+            "index source belongs to an unfinalized atomic program",
+        ));
+    }
+    let stamp_fence = (
+        stamp.active_placement_log_id.term,
+        stamp.active_placement_log_id.index,
+    );
+    let barrier_fence = (barrier.fence.term, barrier.fence.index);
+    if stamp_fence > barrier_fence {
+        return Err(Status::aborted(
+            "index source advanced beyond its captured placement fence",
+        ));
+    }
+    if stamp_fence == barrier_fence {
+        let node = NodeId(u64::from(stamp.source_id.node_id));
+        let Some(cursor) = barrier.sources.get(&node) else {
+            return Err(Status::aborted(
+                "index source mutation is absent from the captured source vector",
+            ));
+        };
+        if cursor.source != stamp.source_id || stamp.source_journal_position >= cursor.next_offset {
+            return Err(Status::aborted(
+                "index source mutation advanced beyond its captured journal target",
+            ));
+        }
+    }
+    Ok(())
+}
+
 async fn project_snapshot_batch(
     definition: &CatalogDefinition,
     plan: SegmentMemoryPlan,
     batch: ProjectionBatch,
     builder: &mut NativeSegmentBuild,
-    candidate: &mut CandidateGeneration,
+    candidate: &mut CandidateCommit,
     dependencies: &IndexBuilderDependencies,
 ) -> Result<(), Status> {
     let kind = runtime_kind(definition.schema.kind);
@@ -597,7 +1039,7 @@ async fn project_snapshot_batch_inner(
     effective_lanes: usize,
     lane_limit: usize,
     builder: &mut NativeSegmentBuild,
-    candidate: &mut CandidateGeneration,
+    candidate: &mut CandidateCommit,
     dependencies: &IndexBuilderDependencies,
 ) -> Result<ProjectionWaveTotals, Status> {
     let fetched = fetch_projection_sources(sources, effective_lanes, dependencies).await?;
@@ -648,6 +1090,7 @@ async fn project_snapshot_batch_inner(
                         source,
                         candidate,
                         dependencies,
+                        true,
                     )
                     .await
                 {
@@ -848,7 +1291,105 @@ impl io::Write for ByteCounter {
 
 #[cfg(test)]
 mod tests {
+    use keldra_store::{PlacementLogId, SourceId};
+
+    use crate::index_runtime::events::{AtomicProgramWatermark, IndexSourceCursor};
+
     use super::*;
+
+    #[test]
+    fn stale_rebuild_root_does_not_match_replaced_definition() {
+        let barrier = IndexBarrier {
+            fence: PlacementLogId { term: 1, index: 2 },
+            atomic: AtomicProgramWatermark::new(None, None, 0),
+            sources: BTreeMap::from([(
+                NodeId(1),
+                IndexSourceCursor {
+                    source: SourceId {
+                        node_id: 1,
+                        source_epoch: [3; 32],
+                    },
+                    next_offset: 1,
+                },
+            )]),
+        };
+        let candidate = IndexCommitManifest::new(
+            7,
+            9,
+            4,
+            keldra_index::v4::IndexKind::Path,
+            [5; 32],
+            &barrier,
+            Vec::new(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            0,
+            0,
+        )
+        .unwrap();
+        let mut root = DurableRebuildRoot {
+            index_id: 7,
+            definition_version: 4,
+            attempt_id: 9,
+            baseline: barrier,
+            last_canonical_path: None,
+            baseline_complete: false,
+            scanned_records: 0,
+            scanned_bytes: 0,
+            candidate,
+        };
+        assert!(!rebuild_root_requires_replacement(
+            &root,
+            4,
+            keldra_index::v4::IndexKind::Path,
+            [5; 32]
+        ));
+        assert!(rebuild_root_requires_replacement(
+            &root,
+            5,
+            keldra_index::v4::IndexKind::Path,
+            [5; 32]
+        ));
+        assert!(rebuild_root_requires_replacement(
+            &root,
+            4,
+            keldra_index::v4::IndexKind::FullText,
+            [5; 32]
+        ));
+        assert!(rebuild_root_requires_replacement(
+            &root,
+            4,
+            keldra_index::v4::IndexKind::Path,
+            [6; 32]
+        ));
+        let serving = root.candidate.clone();
+        assert!(!serving_completes_rebuild(&root, &serving, 4));
+        root.baseline_complete = true;
+        assert!(serving_completes_rebuild(&root, &serving, 4));
+        assert!(!serving_completes_rebuild(&root, &serving, 5));
+    }
+
+    #[test]
+    fn resumed_scan_defers_post_baseline_heads_to_journal_replay() {
+        assert!(skip_post_baseline_head(
+            &Status::aborted("newer source position"),
+            true
+        ));
+        assert!(skip_post_baseline_head(
+            &Status::unavailable("atomic program not finalized at baseline"),
+            true
+        ));
+        assert!(!skip_post_baseline_head(
+            &Status::aborted("newer source position"),
+            false
+        ));
+        assert!(!skip_post_baseline_head(
+            &Status::data_loss("corrupt head"),
+            true
+        ));
+    }
 
     fn prepared(index: usize, projection_bytes: u64, resident_bytes: u64) -> PreparedProjection {
         PreparedProjection {
@@ -895,13 +1436,13 @@ mod tests {
 
     #[test]
     fn rebuild_turn_repays_candidate_debt_before_consuming_another_snapshot_frame() {
-        let clean = CandidateGeneration::rebuild();
+        let clean = CandidateCommit::rebuild();
         assert_eq!(
             rebuild_turn_start(&clean, DebtLimits::new(1, u64::MAX)),
             RebuildTurnStart::ConsumeSnapshot
         );
 
-        let mut indebted = CandidateGeneration::rebuild();
+        let mut indebted = CandidateCommit::rebuild();
         indebted.locator_roots = vec![locator_root(1), locator_root(2)];
         assert_eq!(
             rebuild_turn_start(&indebted, DebtLimits::new(1, u64::MAX)),
