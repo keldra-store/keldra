@@ -66,6 +66,8 @@ use candidate::{CandidateCommit, manifest_physical_order, runtime_kind};
 #[path = "manager/debt.rs"]
 mod debt;
 use debt::{DebtLimits, DebtSelection};
+#[path = "manager/invalidation.rs"]
+mod invalidation;
 #[path = "manager/locator_debt.rs"]
 mod locator_debt;
 #[path = "manager/observability.rs"]
@@ -1131,9 +1133,17 @@ async fn advance_catch_up(
             .await
             .map_err(budget_status)?;
             let granted_bytes = permit.bytes();
+            let pending_invalidation_bytes = u64::try_from(
+                work.candidate.pending_invalidation_resident_bytes()?,
+            )
+            .map_err(|_| {
+                Status::resource_exhausted(
+                    "pending live-mask invalidations exceed the resident byte domain",
+                )
+            })?;
             let plan = work_plan_for_limit(
                 granted_bytes,
-                0,
+                pending_invalidation_bytes,
                 dependencies.config.segment_flush_bytes(job.kind),
             )?;
             ActiveIncrementalBuffer {
@@ -1268,8 +1278,15 @@ async fn advance_catch_up(
         };
 
         let page_resident_bytes = catch_up::journal_page_resident_bytes(&page)?;
+        let pending_invalidation_bytes =
+            u64::try_from(work.candidate.pending_invalidation_resident_bytes()?).map_err(|_| {
+                Status::resource_exhausted(
+                    "pending live-mask invalidations exceed the resident byte domain",
+                )
+            })?;
         let admitted_resident_bytes = page_resident_bytes
             .checked_add(active.builder.frozen_resident_charge())
+            .and_then(|bytes| bytes.checked_add(pending_invalidation_bytes))
             .ok_or_else(|| Status::resource_exhausted("index pipeline resident bytes overflow"))?;
         let page_plan = work_plan_for_limit(
             active.permit.bytes(),
@@ -1278,6 +1295,24 @@ async fn advance_catch_up(
         );
         let page_plan = match page_plan {
             Ok(plan) => plan,
+            Err(_) if work.candidate.has_pending_live_mask_invalidations() => {
+                invalidation::materialize_pending_live_masks(
+                    &job.definition,
+                    &mut work.candidate,
+                    dependencies,
+                )
+                .await?;
+                let admitted = page_resident_bytes
+                    .checked_add(active.builder.frozen_resident_charge())
+                    .ok_or_else(|| {
+                        Status::resource_exhausted("index pipeline resident bytes overflow")
+                    })?;
+                work_plan_for_limit(
+                    active.permit.bytes(),
+                    admitted,
+                    dependencies.config.segment_flush_bytes(job.kind),
+                )?
+            }
             Err(_) if active.builder.frozen.is_some() => {
                 // The one frozen slot has consumed this permit's remaining
                 // projection capacity. Join it and retry the exact page rather
@@ -1296,8 +1331,17 @@ async fn advance_catch_up(
             .iter()
             .any(|entry| matches!(entry.change, LocalChange::AtomicBatchPublished(_)))
         {
+            let pending_invalidation_bytes = u64::try_from(
+                work.candidate.pending_invalidation_resident_bytes()?,
+            )
+            .map_err(|_| {
+                Status::resource_exhausted(
+                    "pending live-mask invalidations exceed the resident byte domain",
+                )
+            })?;
             let atomic_resident_bytes = page_resident_bytes
                 .checked_add(active.builder.frozen_resident_charge())
+                .and_then(|bytes| bytes.checked_add(pending_invalidation_bytes))
                 .ok_or_else(|| Status::resource_exhausted("atomic unit resident bytes overflow"))?;
             match work_plan_for_limit(
                 active.permit.bytes(),
@@ -1305,6 +1349,20 @@ async fn advance_catch_up(
                 active.permit.bytes(),
             ) {
                 Ok(plan) => plan,
+                Err(_) if work.candidate.has_pending_live_mask_invalidations() => {
+                    invalidation::materialize_pending_live_masks(
+                        &job.definition,
+                        &mut work.candidate,
+                        dependencies,
+                    )
+                    .await?;
+                    let admitted = page_resident_bytes
+                        .checked_add(active.builder.frozen_resident_charge())
+                        .ok_or_else(|| {
+                            Status::resource_exhausted("atomic unit resident bytes overflow")
+                        })?;
+                    work_plan_for_limit(active.permit.bytes(), admitted, active.permit.bytes())?
+                }
                 Err(_) if active.builder.frozen.is_some() => {
                     finish_frozen_segment(job.kind, &mut active.builder, &mut work.candidate)
                         .await?;
@@ -1441,6 +1499,13 @@ async fn enqueue_candidate_publication(
     dependencies: &IndexBuilderDependencies,
 ) -> Result<(), Status> {
     debug_assert!(work.publishing.is_none());
+    invalidation::materialize_pending_live_masks(
+        &job.definition,
+        &mut work.candidate,
+        dependencies,
+    )
+    .await?;
+    debug_assert!(!work.candidate.has_pending_live_mask_invalidations());
     rebuild::checkpoint_catch_up_root(job, work, dependencies).await?;
     let current = work.current.clone();
     let barrier = work.through.clone();
@@ -1473,6 +1538,7 @@ async fn compact_one_if_needed(
     limits: DebtLimits,
     dependencies: &IndexBuilderDependencies,
 ) -> Result<bool, Status> {
+    invalidation::materialize_pending_live_masks(&job.definition, candidate, dependencies).await?;
     emit_compaction_debt(
         job.kind,
         &candidate.segments,
@@ -1831,6 +1897,7 @@ async fn compact_tier(
     candidate: &mut CandidateCommit,
     dependencies: &IndexBuilderDependencies,
 ) -> Result<(), Status> {
+    invalidation::materialize_pending_live_masks(definition, candidate, dependencies).await?;
     v4_merge::compact_selected_segments(
         definition,
         kind,

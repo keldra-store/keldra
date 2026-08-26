@@ -154,6 +154,11 @@ pub(super) async fn publish_candidate(
     admission: DerivedArtifactAdmission,
     dependencies: &IndexBuilderDependencies,
 ) -> Result<CommittedIndexView, Status> {
+    if candidate.has_pending_live_mask_invalidations() {
+        return Err(Status::failed_precondition(
+            "index publication candidate contains unmaterialized live-mask invalidations",
+        ));
+    }
     let started = Instant::now();
     let cas_class = publication_cas_class(definition, &barrier, &candidate, current)?;
     let expected_revision =
