@@ -6,9 +6,7 @@ use keldra_store::{
 
 use crate::index_runtime::events::{AtomicProgramWatermark, IndexJournalChange, IndexSourceCursor};
 
-use super::catch_up::{
-    earliest_publication_start, exact_source, journal_source_paths, record_source_page_progress,
-};
+use super::catch_up::{exact_source, journal_source_paths, record_source_page_progress};
 use super::*;
 
 #[test]
@@ -352,12 +350,13 @@ fn routed_nonmatching_progress_gets_a_publication_clock_without_an_active_buffer
     let page = journal_page(vec![journal_change(1, 2, "outside/scope.json", 12)], 13);
 
     assert!(journal_source_paths(1, 2, "records/", &page).is_empty());
-    record_source_page_progress(&mut work, &page.through);
+    let runnable = BuilderRunnableClock::default();
+    record_source_page_progress(&mut work, &page.through, &runnable);
     assert!(!work.changed);
     assert!(work.must_publish);
     assert!(work.checkpoint_started.is_some());
     assert_eq!(
-        earliest_publication_start(None, work.checkpoint_started),
+        BufferAge::earliest(None, work.checkpoint_started),
         work.checkpoint_started
     );
     assert_eq!(work.through, work.target);

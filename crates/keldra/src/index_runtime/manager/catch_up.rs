@@ -19,7 +19,7 @@ pub(super) struct JournalPageWork {
     pub(super) processed_records: u64,
     pub(super) processed_encoded_bytes: u64,
     pub(super) through: IndexBarrier,
-    pub(super) first_changed_at: Option<Instant>,
+    pub(super) first_changed_at: Option<BufferAge>,
     pub(super) atomic_pending: bool,
 }
 
@@ -128,27 +128,21 @@ pub(super) const fn should_compact_before_catch_up(
         || debt::locator_headroom_requires_compaction(locator_root_count)
 }
 
-pub(super) fn record_source_page_progress(work: &mut CatchUpWork, through: &IndexBarrier) {
+pub(super) fn record_source_page_progress(
+    work: &mut CatchUpWork,
+    through: &IndexBarrier,
+    runnable: &BuilderRunnableClock,
+) {
     // Persist even zero-effect routed pages so restart cannot forget a proven
     // checkpoint and freshness does not wait on already-inspected source work.
     if work.through != *through {
         work.must_publish = true;
-        work.checkpoint_started.get_or_insert_with(Instant::now);
+        work.checkpoint_started
+            .get_or_insert_with(|| runnable.stamp());
     }
     work.through = through.clone();
     work.candidate
         .prune_finalized_atomic_batches(work.through.atomic.finalized_through());
-}
-
-pub(super) fn earliest_publication_start(
-    mutation_started: Option<Instant>,
-    checkpoint_started: Option<Instant>,
-) -> Option<Instant> {
-    match (mutation_started, checkpoint_started) {
-        (Some(left), Some(right)) => Some(left.min(right)),
-        (Some(started), None) | (None, Some(started)) => Some(started),
-        (None, None) => None,
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -163,7 +157,7 @@ pub(super) async fn process_journal_page(
     candidate: &mut CandidateCommit,
     atomic_projection: &mut Option<AtomicProjectionWork>,
     dependencies: &IndexBuilderDependencies,
-    mut deadline: Option<Instant>,
+    mut deadline: Option<BufferAge>,
     maximum_age: Duration,
 ) -> Result<JournalPageWork, Status> {
     let mut changed = false;
@@ -243,9 +237,9 @@ pub(super) async fn process_journal_page(
                         "pending atomic projection differs from replayed journal event",
                     ));
                 }
-                let changed_at = Instant::now();
+                let changed_at = builder.runnable.stamp();
                 first_changed_at.get_or_insert(changed_at);
-                deadline.get_or_insert(changed_at + maximum_age);
+                deadline.get_or_insert(changed_at);
                 let advance =
                     advance_atomic_projection(definition, kind, projection, dependencies).await;
                 if let Err(error) = advance {
@@ -291,9 +285,9 @@ pub(super) async fn process_journal_page(
                 &page.changes[position..end],
             );
             if !paths.is_empty() {
-                let changed_at = Instant::now();
+                let changed_at = builder.runnable.stamp();
                 first_changed_at.get_or_insert(changed_at);
-                deadline.get_or_insert(changed_at + maximum_age);
+                deadline.get_or_insert(changed_at);
             }
             changed |= !paths.is_empty();
             for paths in paths.chunks(MAX_OBJECT_RECORD_EXPORT_RECORDS as usize) {
@@ -318,7 +312,7 @@ pub(super) async fn process_journal_page(
             .checked_add(processed_journal_encoded_bytes(&page.changes[start..end])?)
             .ok_or_else(|| Status::resource_exhausted("processed journal bytes overflow"))?;
         if locator_publication_required(candidate, builder)
-            || deadline.is_some_and(|deadline| Instant::now() >= deadline)
+            || deadline.is_some_and(|age| age.reached(&builder.runnable, maximum_age))
         {
             break;
         }
@@ -372,6 +366,7 @@ async fn start_atomic_projection(
         plan,
         builder.publication_lane,
         staging_segment_limit,
+        builder.runnable.clone(),
         dependencies,
     )?;
     Ok(AtomicProjectionWork {
@@ -1083,16 +1078,19 @@ async fn project_catch_up_batch(
     }
     let cpu = dependencies.cpu.clone();
     let projection_schema = definition.schema.clone();
+    let runnable = builder.runnable.clone();
     let cpu_task = tokio::spawn(run_projection_lanes(
         cpu,
         lanes,
         senders,
         move |mut fetched: FetchedProjection| {
-            let reader = fetched
-                .payload
-                .as_mut()
-                .map(|payload| payload as &mut dyn std::io::Read);
-            project_mutation(&projection_schema, fetched.source, reader, lane_limit)
+            runnable.measure(|| {
+                let reader = fetched
+                    .payload
+                    .as_mut()
+                    .map(|payload| payload as &mut dyn std::io::Read);
+                project_mutation(&projection_schema, fetched.source, reader, lane_limit)
+            })
         },
     ));
 
