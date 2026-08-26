@@ -39,6 +39,25 @@ KELDRA_INDEX_CONTENTION_MATRIX=1,4,16,64 \
   ./scripts/qualify-index-contention.sh
 ```
 
+Mutation intensity is independent of the definition-count matrix. The defaults
+(`4` workers, `32` objects per batch, queue depth `32`) intentionally drive the
+server toward its ingress limit. For a resource-constrained controller, start
+with a bounded load and increase it only after the prior run passes:
+
+```bash
+KELDRA_IMAGE=keldra:qa-<commit> \
+KELDRA_INDEX_CONTENTION_MODE=sustained \
+KELDRA_INDEX_CONTENTION_TOPOLOGY=single \
+KELDRA_INDEX_CONTENTION_MATRIX=1 \
+KELDRA_INDEX_CONTENTION_MUTATION_WORKERS=1 \
+KELDRA_INDEX_CONTENTION_MUTATION_BATCH_SIZE=8 \
+KELDRA_INDEX_CONTENTION_MUTATION_QUEUE_DEPTH=8 \
+  ./scripts/qualify-index-contention.sh
+```
+
+The evidence records all three settings. A result at one intensity must not be
+compared with another intensity as a before/after performance claim.
+
 For supplementary three-node Docker evidence, use:
 
 ```bash
@@ -118,7 +137,8 @@ watch -n 2 cat ../../releases/keldra/index-contention/latest/status.json
 
 `run.json` records the source commit, immutable image ID and revision, image
 platform, topology, matrix, phase durations, host resources, and Docker resource
-allocation. It also records the request, drain, visibility polling and total
+allocation. It also records mutation workers, batch size and queue depth, plus
+the request, drain, visibility polling and total
 visibility-observation timeouts, sampling interval, and both absolute p99
 acceptance bounds. Every cell retains the client report, client stdout/stderr, and
 server logs. Docker cells use `container-resources.jsonl` for CPU, memory,
