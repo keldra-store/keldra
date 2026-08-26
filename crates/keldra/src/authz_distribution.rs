@@ -12,9 +12,9 @@ use keldra_store::{
     AuthzConsistency, AuthzRealmAggregate, AuthzRealmMutation, AuthzRealmMutationContext,
     AuthzRealmSnapshotApplied, AuthzRealmTransferManifest, AuthzRepository, AuthzRevision,
     AuthzSchemaPublicationMutation, AuthzScope, AuthzStoreError, BindSchemaRequest,
-    CoordinatedAuthzRealmMutation, CoordinatedAuthzSchemaPublication, PublishSchemaRequest,
-    ReplicaAuthzRealmMutationApplied, ReplicaAuthzSchemaPublicationApplied, SchemaRef,
-    StorageTenantId, Store, TupleBatchRequest,
+    CoordinatedAuthzRealmMutation, CoordinatedAuthzSchemaPublication, ObjectMutationContext,
+    PublishSchemaRequest, ReplicaAuthzRealmMutationApplied, ReplicaAuthzSchemaPublicationApplied,
+    SchemaRef, StorageTenantId, Store, TupleBatchRequest,
 };
 use tonic::Status;
 
@@ -201,9 +201,10 @@ struct AuthzDistributionCore {
     repository: AuthzRepository,
     peers: Arc<dyn AuthzReplicaTransport>,
     /// Routing and fencing provide one active tenant-group coordinator. This
-    /// single local gate keeps its reconcile/repair/mutate sequences ordered
+    /// single local gate keeps reconcile/repair/mutate sequences ordered while
+    /// allowing independent fresh checks to reconcile and read concurrently,
     /// without a per-tenant registry or distributed lock.
-    coordinator_serial: Arc<tokio::sync::Mutex<()>>,
+    coordinator_serial: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl AuthzDistributionCore {
@@ -573,7 +574,7 @@ impl ZanzibarDistribution {
                 local_node,
                 repository,
                 peers,
-                coordinator_serial: Arc::new(tokio::sync::Mutex::new(())),
+                coordinator_serial: Arc::new(tokio::sync::RwLock::new(())),
             },
             mutation_admission,
         }
@@ -585,7 +586,7 @@ impl ZanzibarDistribution {
         request: BindSchemaRequest,
         context: AuthzRealmMutationContext,
     ) -> Result<CoordinatedAuthzRealmMutation, Status> {
-        let _serial = self.core.coordinator_serial.lock().await;
+        let _serial = self.core.coordinator_serial.write().await;
         let _permit = self.mutation_admission.enter()?;
         let mut replicas = self.require_coordinator(stable_tenant_id)?;
         self.require_context(&context, replicas.group.coordinator())?;
@@ -611,7 +612,7 @@ impl ZanzibarDistribution {
         request: BindSchemaRequest,
     ) -> Result<CoordinatedAuthzRealmMutation, Status> {
         loop {
-            let serial = self.core.coordinator_serial.lock().await;
+            let serial = self.core.coordinator_serial.write().await;
             let permit = self.mutation_admission.enter()?;
             let mut replicas = self.require_coordinator(stable_tenant_id)?;
             let serving = self.serving.mutation_context()?;
@@ -653,7 +654,7 @@ impl ZanzibarDistribution {
         request: PublishSchemaRequest,
         context: AuthzRealmMutationContext,
     ) -> Result<CoordinatedAuthzSchemaPublication, Status> {
-        let _serial = self.core.coordinator_serial.lock().await;
+        let _serial = self.core.coordinator_serial.write().await;
         let _permit = self.mutation_admission.enter()?;
         let replicas = self.require_coordinator(stable_tenant_id)?;
         self.require_context(&context, replicas.group.coordinator())?;
@@ -678,7 +679,7 @@ impl ZanzibarDistribution {
         request: PublishSchemaRequest,
     ) -> Result<CoordinatedAuthzSchemaPublication, Status> {
         loop {
-            let serial = self.core.coordinator_serial.lock().await;
+            let serial = self.core.coordinator_serial.write().await;
             let permit = self.mutation_admission.enter()?;
             let replicas = self.require_coordinator(stable_tenant_id)?;
             let serving = self.serving.mutation_context()?;
@@ -713,7 +714,7 @@ impl ZanzibarDistribution {
         stable_tenant_id: u64,
         scope: &AuthzScope,
     ) -> Result<(), Status> {
-        let _serial = self.core.coordinator_serial.lock().await;
+        let _serial = self.core.coordinator_serial.write().await;
         let replicas = self.require_coordinator(stable_tenant_id)?;
         self.serving.mutation_context()?;
         if self.core.reconcile(&replicas, scope).await?.is_none() {
@@ -734,7 +735,7 @@ impl ZanzibarDistribution {
         request: TupleBatchRequest,
         context: AuthzRealmMutationContext,
     ) -> Result<CoordinatedAuthzRealmMutation, Status> {
-        let _serial = self.core.coordinator_serial.lock().await;
+        let _serial = self.core.coordinator_serial.write().await;
         let _permit = self.mutation_admission.enter()?;
         let mut replicas = self.require_coordinator(stable_tenant_id)?;
         self.require_context(&context, replicas.group.coordinator())?;
@@ -785,7 +786,7 @@ impl ZanzibarDistribution {
         restore_retained_precondition: bool,
     ) -> Result<CoordinatedAuthzRealmMutation, Status> {
         loop {
-            let serial = self.core.coordinator_serial.lock().await;
+            let serial = self.core.coordinator_serial.write().await;
             let permit = self.mutation_admission.enter()?;
             let mut replicas = self.require_coordinator(stable_tenant_id)?;
             let serving = self.serving.mutation_context()?;
@@ -848,9 +849,9 @@ impl ZanzibarDistribution {
         consistency: AuthzConsistency,
         check: AuthorizationCheck,
     ) -> Result<(bool, AuthzRevision, u64), Status> {
-        let _serial = self.core.coordinator_serial.lock().await;
+        let _serial = self.core.coordinator_serial.read().await;
         let replicas = self.require_coordinator(stable_tenant_id)?;
-        self.serving.mutation_context()?;
+        let serving = self.serving.mutation_context()?;
         let checked_scope = scope.clone();
         let (allowed, revision) = self
             .core
@@ -862,6 +863,7 @@ impl ZanzibarDistribution {
             .get_binding(&checked_scope)
             .map_err(authz_status)?
             .ok_or_else(|| Status::failed_precondition("authorization realm has no binding"))?;
+        self.require_unchanged_fresh_context(stable_tenant_id, &replicas.group, serving)?;
         Ok((allowed, revision, binding.generation))
     }
 
@@ -872,9 +874,9 @@ impl ZanzibarDistribution {
         consistency: AuthzConsistency,
         checks: Vec<AuthorizationCheck>,
     ) -> Result<(Vec<bool>, AuthzRevision, u64), Status> {
-        let _serial = self.core.coordinator_serial.lock().await;
+        let _serial = self.core.coordinator_serial.read().await;
         let replicas = self.require_coordinator(stable_tenant_id)?;
-        self.serving.mutation_context()?;
+        let serving = self.serving.mutation_context()?;
         let checked_scope = scope.clone();
         let (allowed, revision) = self
             .core
@@ -886,7 +888,26 @@ impl ZanzibarDistribution {
             .get_binding(&checked_scope)
             .map_err(authz_status)?
             .ok_or_else(|| Status::failed_precondition("authorization realm has no binding"))?;
+        self.require_unchanged_fresh_context(stable_tenant_id, &replicas.group, serving)?;
         Ok((allowed, revision, binding.generation))
+    }
+
+    fn require_unchanged_fresh_context(
+        &self,
+        stable_tenant_id: u64,
+        original_group: &MutableRecordReplicaGroup,
+        original_serving: ObjectMutationContext,
+    ) -> Result<(), Status> {
+        let current_replicas = self.require_coordinator(stable_tenant_id).map_err(|_| {
+            Status::unavailable("authorization coordinator changed during fresh check")
+        })?;
+        let current_serving = self.serving.mutation_context()?;
+        if current_replicas.group != *original_group || current_serving != original_serving {
+            return Err(Status::unavailable(
+                "authorization serving fence or replica group changed during fresh check",
+            ));
+        }
+        Ok(())
     }
 
     fn require_coordinator(&self, stable_tenant_id: u64) -> Result<TenantReplicaSet, Status> {
