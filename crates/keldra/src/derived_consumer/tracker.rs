@@ -95,6 +95,10 @@ impl PendingEffect {
 struct SourceProgress {
     status: WatchJournalStatus,
     baseline_next: u64,
+    /// True only when `baseline_next` was durably acknowledged for this exact
+    /// consumer/source/fence identity. A newly fenced tracker must publish its
+    /// initial floor even when there is no offset advance.
+    baseline_acknowledged: bool,
     pending: BTreeMap<DerivedDefinitionIdentity, PendingEffect>,
     proof_minima: BTreeMap<u64, usize>,
 }
@@ -115,18 +119,18 @@ impl SourceProgress {
             .settled_through
             .checked_add(1)
             .ok_or(SparseTrackerError::OffsetOverflow)?;
-        let baseline_next = match current {
+        let (baseline_next, baseline_acknowledged) = match current {
             Some(current)
                 if current.consumer_kind == retention_kind(kind)
                     && current.source_id == status.source_id
                     && current.observed_fence == fence =>
             {
-                current.next_offset
+                (current.next_offset, true)
             }
             Some(current) if fence_order(current.observed_fence) > fence_order(fence) => {
                 return Err(SparseTrackerError::FutureLocalFence);
             }
-            _ => floor_next,
+            _ => (floor_next, false),
         };
         if baseline_next < floor_next || baseline_next > settled_next {
             return Err(SparseTrackerError::InvalidLocalCheckpoint);
@@ -134,6 +138,7 @@ impl SourceProgress {
         Ok(Self {
             status,
             baseline_next,
+            baseline_acknowledged,
             pending: BTreeMap::new(),
             proof_minima: BTreeMap::new(),
         })
@@ -480,18 +485,21 @@ impl SparseDerivedTracker {
     pub(crate) fn checkpoints(&self) -> Result<Vec<DerivedConsumerCheckpoint>, SparseTrackerError> {
         let consumer_node_id = u16::try_from(self.consumer_node.0)
             .map_err(|_| SparseTrackerError::InvalidConsumerNode)?;
-        self.sources
-            .values()
-            .map(|source| {
-                Ok(DerivedConsumerCheckpoint {
-                    consumer_kind: self.kind,
-                    source_id: source.status.source_id,
-                    consumer_node_id,
-                    next_offset: source.checkpoint_next()?,
-                    observed_fence: self.fence,
-                })
-            })
-            .collect()
+        let mut checkpoints = Vec::with_capacity(self.sources.len());
+        for source in self.sources.values() {
+            let next_offset = source.checkpoint_next()?;
+            if source.baseline_acknowledged && next_offset == source.baseline_next {
+                continue;
+            }
+            checkpoints.push(DerivedConsumerCheckpoint {
+                consumer_kind: self.kind,
+                source_id: source.status.source_id,
+                consumer_node_id,
+                next_offset,
+                observed_fence: self.fence,
+            });
+        }
+        Ok(checkpoints)
     }
 
     /// Advances the disposable baseline only after the publisher has durably
@@ -517,6 +525,7 @@ impl SparseDerivedTracker {
             return Err(SparseTrackerError::CheckpointOffset);
         }
         source.baseline_next = checkpoint.next_offset;
+        source.baseline_acknowledged = true;
         Ok(())
     }
 

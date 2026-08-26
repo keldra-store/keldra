@@ -150,6 +150,28 @@ fn completed_empty_inventory_advances_each_source_to_its_settled_tail() {
 }
 
 #[test]
+fn a_new_membership_fence_publishes_its_floor_once_without_an_offset_advance() {
+    let status = source(1, 0);
+    let mut previous = current(DerivedConsumerKind::Index, status, 1);
+    previous.observed_fence = PlacementLogId { term: 2, index: 8 };
+    let mut tracker = SparseDerivedInventory::begin(
+        DerivedConsumerKind::Index,
+        NodeId(3),
+        fence(),
+        [(status, Some(previous))],
+    )
+    .unwrap()
+    .finish();
+
+    let checkpoints = tracker.checkpoints().unwrap();
+    assert_eq!(checkpoints.len(), 1);
+    assert_eq!(checkpoints[0].next_offset, 1);
+    assert_eq!(checkpoints[0].observed_fence, fence());
+    tracker.acknowledge(checkpoints[0]).unwrap();
+    assert!(tracker.checkpoints().unwrap().is_empty());
+}
+
+#[test]
 fn inventory_retains_only_sparse_affected_definitions_and_uses_the_minimum_proof() {
     let status = source(1, 20);
     let first = assignment(DefinitionKind::Index, 1);
@@ -306,12 +328,12 @@ fn durable_acknowledgement_becomes_the_floor_for_later_missing_proof() {
     tracker
         .observe_routed_effect(&first, status.source_id, 21, None, None, None)
         .unwrap();
-    assert_eq!(tracker.checkpoints().unwrap()[0].next_offset, 21);
+    assert!(tracker.checkpoints().unwrap().is_empty());
     tracker.remove_assignment(&first).unwrap();
     tracker
         .observe_routed_effect(&second, status.source_id, 21, None, None, None)
         .unwrap();
-    assert_eq!(tracker.checkpoints().unwrap()[0].next_offset, 21);
+    assert!(tracker.checkpoints().unwrap().is_empty());
 }
 
 #[test]
@@ -332,7 +354,57 @@ fn missing_or_behind_proof_never_regresses_the_durable_baseline() {
         .record_affected(&assignment, status.source_id, 18, None, None, None)
         .unwrap();
     let tracker = inventory.finish();
-    assert_eq!(tracker.checkpoints().unwrap()[0].next_offset, 12);
+    assert!(tracker.checkpoints().unwrap().is_empty());
+}
+
+#[test]
+fn only_unacknowledged_checkpoint_advances_are_emitted_and_failures_retry() {
+    let status = source(1, 20);
+    let assignment = assignment(DefinitionKind::Index, 1);
+    let mut inventory = SparseDerivedInventory::begin(
+        DerivedConsumerKind::Index,
+        NodeId(3),
+        fence(),
+        [(
+            status,
+            Some(current(DerivedConsumerKind::Index, status, 12)),
+        )],
+    )
+    .unwrap();
+    inventory
+        .record_affected(&assignment, status.source_id, 18, None, None, None)
+        .unwrap();
+    let mut tracker = inventory.finish();
+
+    // Proof that cannot pass the existing durable baseline causes no write.
+    assert!(tracker.checkpoints().unwrap().is_empty());
+    tracker
+        .observe_proof(&assignment, &barrier(&[(status, 12)]))
+        .unwrap();
+    assert!(tracker.checkpoints().unwrap().is_empty());
+
+    // A real proof advance is emitted. Withholding acknowledgement models a
+    // failed durable publication, so the exact checkpoint remains retryable.
+    tracker
+        .observe_proof(&assignment, &barrier(&[(status, 18)]))
+        .unwrap();
+    let advanced = tracker.checkpoints().unwrap();
+    assert_eq!(advanced.len(), 1);
+    assert_eq!(advanced[0].next_offset, 21);
+    assert_eq!(tracker.checkpoints().unwrap(), advanced);
+
+    tracker.acknowledge(advanced[0]).unwrap();
+    assert!(tracker.checkpoints().unwrap().is_empty());
+    tracker
+        .observe_proof(&assignment, &barrier(&[(status, 18)]))
+        .unwrap();
+    assert!(tracker.checkpoints().unwrap().is_empty());
+
+    // Settled source progress beyond the durable baseline is a new advance.
+    tracker.update_source_status(source(1, 25)).unwrap();
+    let advanced = tracker.checkpoints().unwrap();
+    assert_eq!(advanced.len(), 1);
+    assert_eq!(advanced[0].next_offset, 26);
 }
 
 #[test]
