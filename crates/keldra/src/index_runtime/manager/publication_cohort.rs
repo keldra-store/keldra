@@ -178,7 +178,12 @@ where
         F: Fn(PublicationCohortClass, K, Vec<P>) -> Fut + Clone + Send + 'static,
         Fut: Future<Output = Vec<Result<O, E>>> + Send + 'static,
     {
-        Self::start_with_admission(bounds, |_class| async { Ok::<(), E>(()) }, dispatch)
+        Self::start_named_with_admission(
+            "test",
+            bounds,
+            |_class| async { Ok::<(), E>(()) },
+            dispatch,
+        )
     }
 
     /// Starts workers whose physical admission is acquired before an epoch is
@@ -195,14 +200,32 @@ where
         F: Fn(PublicationCohortClass, K, Vec<P>) -> Fut + Clone + Send + 'static,
         Fut: Future<Output = Vec<Result<O, E>>> + Send + 'static,
     {
+        Self::start_named_with_admission("test", bounds, acquire, dispatch)
+    }
+
+    fn start_named_with_admission<A, Acquire, AcquireFuture, F, Fut>(
+        stage: &'static str,
+        bounds: PublicationCohortBounds,
+        acquire: Acquire,
+        dispatch: F,
+    ) -> Self
+    where
+        A: Send + 'static,
+        Acquire: Fn(PublicationCohortClass) -> AcquireFuture + Clone + Send + 'static,
+        AcquireFuture: Future<Output = Result<A, E>> + Send + 'static,
+        F: Fn(PublicationCohortClass, K, Vec<P>) -> Fut + Clone + Send + 'static,
+        Fut: Future<Output = Vec<Result<O, E>>> + Send + 'static,
+    {
         let active = Arc::new(Mutex::new(HashSet::new()));
         let incremental = start_queue(
+            stage,
             PublicationCohortClass::Incremental,
             bounds,
             acquire.clone(),
             dispatch.clone(),
         );
         let maintenance = start_queue(
+            stage,
             PublicationCohortClass::Maintenance,
             bounds,
             acquire,
@@ -301,13 +324,14 @@ struct CurrentPublicationCandidate {
 
 /// The concrete node-local cohort boundary used by index publication.
 ///
-/// Pack and manifest stages are deliberately separate: a manifest cannot be
-/// encoded until every pack has an exact durable outcome. Current publication
-/// is separate again because its payload owns the current-mutation guard.
+/// Packs and manifests share one immutable queue so independent definitions at
+/// different phases can use one physical batch. Per-index exclusion plus the
+/// publisher's awaited pack outcome preserve pack-before-manifest ordering.
+/// Current publication remains separate because its payload owns the
+/// current-mutation guard.
 #[derive(Clone)]
 pub(crate) struct IndexPublicationCohorts {
-    packs: ImmutablePublicationScheduler,
-    manifests: ImmutablePublicationScheduler,
+    immutable: ImmutablePublicationScheduler,
     currents: CurrentPublicationScheduler,
     current_router: IndexArtifactRouter,
 }
@@ -327,8 +351,7 @@ impl IndexPublicationCohorts {
             MAX_MAINTENANCE_PHYSICAL_BATCHES,
         );
         Self {
-            packs: immutable_scheduler(router.clone(), slots.clone(), bounds),
-            manifests: immutable_scheduler(router.clone(), slots.clone(), bounds),
+            immutable: immutable_scheduler(router.clone(), slots.clone(), bounds),
             currents: current_scheduler(router.clone(), journal, slots, bounds),
             current_router: router,
         }
@@ -342,7 +365,8 @@ impl IndexPublicationCohorts {
         requests: Vec<IndexArtifactPublish>,
         class: PublicationCohortClass,
     ) -> Result<Vec<IndexArtifactPublicationOutcome>, Status> {
-        self.publish_immutable(&self.packs, requests, class).await
+        self.publish_immutable(&self.immutable, requests, class)
+            .await
     }
 
     pub(crate) async fn publish_manifest(
@@ -351,7 +375,7 @@ impl IndexPublicationCohorts {
         class: PublicationCohortClass,
     ) -> Result<IndexArtifactOutcome, Status> {
         let mut outcomes = self
-            .publish_immutable(&self.manifests, vec![request], class)
+            .publish_immutable(&self.immutable, vec![request], class)
             .await?;
         outcomes
             .pop()
@@ -426,7 +450,8 @@ fn immutable_scheduler(
     slots: IndexPublicationSlots,
     bounds: PublicationCohortBounds,
 ) -> ImmutablePublicationScheduler {
-    PublicationCohortScheduler::start_with_admission(
+    PublicationCohortScheduler::start_named_with_admission(
+        "immutable",
         bounds,
         {
             let slots = slots.clone();
@@ -456,7 +481,8 @@ fn current_scheduler(
     slots: IndexPublicationSlots,
     bounds: PublicationCohortBounds,
 ) -> CurrentPublicationScheduler {
-    PublicationCohortScheduler::start_with_admission(
+    PublicationCohortScheduler::start_named_with_admission(
+        "current",
         bounds,
         {
             let slots = slots.clone();
@@ -653,6 +679,7 @@ struct QueuedCandidate<I: Eq + Hash, K, P, O, E> {
 }
 
 fn start_queue<I, K, P, O, E, A, Acquire, AcquireFuture, F, Fut>(
+    stage: &'static str,
     class: PublicationCohortClass,
     bounds: PublicationCohortBounds,
     acquire: Acquire,
@@ -671,7 +698,7 @@ where
     Fut: Future<Output = Vec<Result<O, E>>> + Send + 'static,
 {
     let (sender, receiver) = mpsc::channel(bounds.max_queued_candidates);
-    tokio::spawn(run_queue(class, bounds, receiver, acquire, dispatch));
+    tokio::spawn(run_queue(stage, class, bounds, receiver, acquire, dispatch));
     QueueHandle {
         sender,
         capacity: Arc::new(Semaphore::new(bounds.max_queued_candidates)),
@@ -679,6 +706,7 @@ where
 }
 
 async fn run_queue<I, K, P, O, E, A, Acquire, AcquireFuture, F, Fut>(
+    stage: &'static str,
     class: PublicationCohortClass,
     bounds: PublicationCohortBounds,
     mut receiver: mpsc::Receiver<QueuedCandidate<I, K, P, O, E>>,
@@ -714,7 +742,7 @@ async fn run_queue<I, K, P, O, E, A, Acquire, AcquireFuture, F, Fut>(
             _ = first.completion.closed() => None,
         } {
             None => {
-                record_cancelled(class);
+                record_cancelled(stage, class);
                 continue;
             }
             Some(result) => match result {
@@ -727,7 +755,7 @@ async fn run_queue<I, K, P, O, E, A, Acquire, AcquireFuture, F, Fut>(
         };
         if first.completion.is_closed() {
             drop(admission);
-            record_cancelled(class);
+            record_cancelled(stage, class);
             continue;
         }
         let cohort = first.cohort.clone();
@@ -746,6 +774,7 @@ async fn run_queue<I, K, P, O, E, A, Acquire, AcquireFuture, F, Fut>(
             &mut batch,
         );
         drain_ready(
+            stage,
             class,
             &cohort,
             bounds,
@@ -767,7 +796,7 @@ async fn run_queue<I, K, P, O, E, A, Acquire, AcquireFuture, F, Fut>(
                 break;
             };
             if candidate.completion.is_closed() {
-                record_cancelled(class);
+                record_cancelled(stage, class);
                 continue;
             }
             if candidate.cohort == cohort
@@ -793,7 +822,7 @@ async fn run_queue<I, K, P, O, E, A, Acquire, AcquireFuture, F, Fut>(
         batch.retain(|candidate| {
             let live = !candidate.completion.is_closed();
             if !live {
-                record_cancelled(class);
+                record_cancelled(stage, class);
             }
             live
         });
@@ -813,7 +842,7 @@ async fn run_queue<I, K, P, O, E, A, Acquire, AcquireFuture, F, Fut>(
             .map(|candidate| candidate.queued_at.elapsed())
             .max()
             .unwrap_or_default();
-        record_batch(class, bounds, candidates, items, bytes, oldest_wait);
+        record_batch(stage, class, bounds, candidates, items, bytes, oldest_wait);
         let dispatch = dispatch.clone();
         inflight.spawn(async move {
             dispatch_batch(class, cohort, batch, admission, dispatch).await;
@@ -933,6 +962,7 @@ fn collect_pending<I, K, P, O, E>(
 
 #[allow(clippy::too_many_arguments)]
 fn drain_ready<I, K, P, O, E>(
+    stage: &'static str,
     class: PublicationCohortClass,
     cohort: &K,
     bounds: PublicationCohortBounds,
@@ -953,7 +983,7 @@ fn drain_ready<I, K, P, O, E>(
             }
         };
         if candidate.completion.is_closed() {
-            record_cancelled(class);
+            record_cancelled(stage, class);
         } else if &candidate.cohort == cohort
             && fits(
                 bounds,
@@ -983,8 +1013,9 @@ fn fits(
         && bytes.saturating_add(candidate_bytes) <= bounds.max_batch_bytes
 }
 
-fn record_cancelled(class: PublicationCohortClass) {
+fn record_cancelled(stage: &'static str, class: PublicationCohortClass) {
     tracing::debug!(
+        publication.stage = stage,
         publication.class = class.as_str(),
         monotonic_counter.keldra_index_publication_cohort_cancelled_total = 1_u64,
         "cancelled index publication cohort candidate discarded"
@@ -992,6 +1023,7 @@ fn record_cancelled(class: PublicationCohortClass) {
 }
 
 fn record_batch(
+    stage: &'static str,
     class: PublicationCohortClass,
     bounds: PublicationCohortBounds,
     candidates: u64,
@@ -1000,6 +1032,7 @@ fn record_batch(
     oldest_wait: Duration,
 ) {
     tracing::debug!(
+        publication.stage = stage,
         publication.class = class.as_str(),
         publication.cohort_candidates = candidates,
         publication.cohort_items = items,
@@ -1145,6 +1178,130 @@ mod tests {
             }
             assert_eq!(*batches.lock().await, vec![(0, 1), (7, candidate_count)]);
         }
+    }
+
+    #[tokio::test]
+    async fn shared_immutable_stage_coalesces_cross_index_pack_and_manifest_in_order() {
+        #[derive(Debug, Eq, PartialEq)]
+        enum ImmutableCandidate {
+            Pack(u64),
+            Manifest(u64),
+        }
+
+        let admission = Arc::new(Semaphore::new(0));
+        let batches = Arc::new(AsyncMutex::new(Vec::new()));
+        let scheduler = PublicationCohortScheduler::start_with_admission(
+            bounds(8, 8),
+            {
+                let admission = admission.clone();
+                move |_class| {
+                    let admission = admission.clone();
+                    async move { admission.acquire_owned().await.map_err(|_| ()) }
+                }
+            },
+            {
+                let batches = batches.clone();
+                move |_class, _cohort: u8, payloads: Vec<ImmutableCandidate>| {
+                    let batches = batches.clone();
+                    async move {
+                        batches.lock().await.push(
+                            payloads
+                                .iter()
+                                .map(|payload| match payload {
+                                    ImmutableCandidate::Pack(index) => ("pack", *index),
+                                    ImmutableCandidate::Manifest(index) => ("manifest", *index),
+                                })
+                                .collect::<Vec<_>>(),
+                        );
+                        payloads.into_iter().map(Ok::<_, ()>).collect()
+                    }
+                }
+            },
+        );
+        let pack = tokio::spawn({
+            let scheduler = scheduler.clone();
+            async move {
+                scheduler
+                    .submit(
+                        PublicationCohortClass::Incremental,
+                        1_u64,
+                        0,
+                        ImmutableCandidate::Pack(1),
+                        1,
+                        1,
+                        1,
+                    )
+                    .await
+            }
+        });
+        let other_manifest = tokio::spawn({
+            let scheduler = scheduler.clone();
+            async move {
+                scheduler
+                    .submit(
+                        PublicationCohortClass::Incremental,
+                        2_u64,
+                        0,
+                        ImmutableCandidate::Manifest(2),
+                        1,
+                        1,
+                        1,
+                    )
+                    .await
+            }
+        });
+        while scheduler
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+            != 2
+        {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            scheduler
+                .submit(
+                    PublicationCohortClass::Incremental,
+                    1,
+                    0,
+                    ImmutableCandidate::Manifest(1),
+                    1,
+                    1,
+                    1,
+                )
+                .await,
+            Err(PublicationCohortError::DuplicateIndex)
+        );
+        admission.add_permits(1);
+        assert_eq!(pack.await.unwrap(), Ok(ImmutableCandidate::Pack(1)));
+        assert_eq!(
+            other_manifest.await.unwrap(),
+            Ok(ImmutableCandidate::Manifest(2))
+        );
+        {
+            let batches = batches.lock().await;
+            let first_batch = &batches[0];
+            assert_eq!(first_batch.len(), 2);
+            assert!(first_batch.contains(&("pack", 1)));
+            assert!(first_batch.contains(&("manifest", 2)));
+        }
+
+        assert_eq!(
+            scheduler
+                .submit(
+                    PublicationCohortClass::Incremental,
+                    1,
+                    0,
+                    ImmutableCandidate::Manifest(1),
+                    1,
+                    1,
+                    1,
+                )
+                .await,
+            Ok(ImmutableCandidate::Manifest(1))
+        );
     }
 
     #[tokio::test]
