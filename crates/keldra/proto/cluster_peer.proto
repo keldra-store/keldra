@@ -540,6 +540,23 @@ message IndexArtifactPublished {
   bool replayed = 3;
 }
 
+// One ordered plural-publication failure. Code uses the canonical gRPC code
+// number so the originating coordinator's retry classification is preserved.
+message IndexArtifactPublicationFailed {
+  uint32 schema_version = 1;
+  int32 code = 2;
+  string message = 3;
+}
+
+message IndexedIndexArtifactPublicationOutcome {
+  uint32 schema_version = 1;
+  uint32 request_index = 2;
+  oneof result {
+    IndexArtifactPublished published = 3;
+    IndexArtifactPublicationFailed failed = 4;
+  }
+}
+
 // Bounded internal publication for immutable artifacts which share one exact
 // metadata replica group. Nested items carry no PeerContext; the outer mTLS
 // request authenticates the current weighted-HRW builder once.
@@ -550,7 +567,24 @@ message PublishIndexArtifactsRequest {
 
 message IndexArtifactsPublished {
   uint32 schema_version = 1;
-  repeated IndexArtifactPublished outcomes = 2;
+  repeated IndexedIndexArtifactPublicationOutcome outcomes = 2;
+}
+
+// Builder-to-definition-coordinator plural current-pointer publication. Every
+// nested item carries its own exact definition guard. The destination acquires
+// the complete definition-path set in canonical order before revalidation and
+// retains those locks until every guarded pointer outcome is known.
+message PublishGuardedIndexArtifactsRequest {
+  PeerContext peer = 1;
+  repeated PublishIndexArtifactRequest publications = 2;
+}
+
+// Definition-coordinator-to-object-coordinator hop emitted while all of the
+// definition locks for this batch remain held.
+message CommitGuardedIndexArtifactsRequest {
+  PeerContext peer = 1;
+  uint64 builder_node_id = 2;
+  repeated PublishIndexArtifactRequest publications = 3;
 }
 
 // Deletes exactly one obsolete immutable commit artifact through the
@@ -908,7 +942,9 @@ service ClusterPeer {
 
   rpc PublishIndexArtifact(PublishIndexArtifactRequest) returns (IndexArtifactPublished);
   rpc PublishIndexArtifacts(PublishIndexArtifactsRequest) returns (IndexArtifactsPublished);
+  rpc PublishGuardedIndexArtifacts(PublishGuardedIndexArtifactsRequest) returns (IndexArtifactsPublished);
   rpc CommitGuardedIndexArtifact(CommitGuardedIndexArtifactRequest) returns (IndexArtifactPublished);
+  rpc CommitGuardedIndexArtifacts(CommitGuardedIndexArtifactsRequest) returns (IndexArtifactsPublished);
   rpc DeleteIndexArtifact(DeleteIndexArtifactRequest) returns (IndexArtifactDeleted);
   rpc ScanIndexHeads(ScanIndexHeadsRequest) returns (IndexHeadScanPage);
   rpc ScanIndexSourceSnapshot(stream IndexSourceSnapshotRequest) returns (stream IndexSourceSnapshotResponse);

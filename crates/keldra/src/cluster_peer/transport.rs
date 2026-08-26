@@ -34,7 +34,8 @@ use crate::distributed_watch::{
     WatchSourceQuery, WatchSourceStatus,
 };
 use crate::index_runtime::publication::{
-    IndexArtifactDelete, IndexArtifactOutcome, IndexArtifactPublish,
+    IndexArtifactDelete, IndexArtifactOutcome, IndexArtifactPublicationOutcome,
+    IndexArtifactPublish,
 };
 use crate::logical_record_distribution::LogicalRecordReplicaTransport;
 use crate::reference_delivery::{ReferenceProofPeers, ReferenceProofRead};
@@ -248,7 +249,7 @@ impl ClusterPeerTransport {
         address: &str,
         expected_fence: PlacementLogId,
         requests: &[IndexArtifactPublish],
-    ) -> Result<Vec<IndexArtifactOutcome>, Status> {
+    ) -> Result<Vec<IndexArtifactPublicationOutcome>, Status> {
         let response = self
             .client(target, address)?
             .publish_index_artifacts(wire::PublishIndexArtifactsRequest {
@@ -261,19 +262,29 @@ impl ClusterPeerTransport {
             .await?
             .into_inner();
         require_response_schema(response.schema_version)?;
-        if response.outcomes.len() != requests.len() {
-            return Err(Status::data_loss(
-                "grouped index artifact outcome count differs from its request",
-            ));
-        }
-        response
-            .outcomes
-            .into_iter()
-            .map(|outcome| {
-                require_response_schema(outcome.schema_version)?;
-                nonzero_artifact_outcome(outcome.version, outcome.replayed)
+        decode_indexed_artifact_outcomes(response.outcomes, requests.len())
+    }
+
+    pub(crate) async fn publish_guarded_index_artifacts(
+        &self,
+        target: NodeId,
+        address: &str,
+        expected_fence: PlacementLogId,
+        requests: &[IndexArtifactPublish],
+    ) -> Result<Vec<IndexArtifactPublicationOutcome>, Status> {
+        let response = self
+            .client(target, address)?
+            .publish_guarded_index_artifacts(wire::PublishGuardedIndexArtifactsRequest {
+                peer: Some(self.context(expected_fence, 0, MAX_CLUSTER_OPERATION_TIME)?),
+                publications: requests
+                    .iter()
+                    .map(|request| wire_index_artifact_publish(request, None))
+                    .collect(),
             })
-            .collect()
+            .await?
+            .into_inner();
+        require_response_schema(response.schema_version)?;
+        decode_indexed_artifact_outcomes(response.outcomes, requests.len())
     }
 
     pub(crate) async fn commit_guarded_index_artifact(
@@ -295,6 +306,30 @@ impl ClusterPeerTransport {
             .into_inner();
         require_response_schema(response.schema_version)?;
         nonzero_artifact_outcome(response.version, response.replayed)
+    }
+
+    pub(crate) async fn commit_guarded_index_artifacts(
+        &self,
+        target: NodeId,
+        address: &str,
+        expected_fence: PlacementLogId,
+        builder: NodeId,
+        requests: &[IndexArtifactPublish],
+    ) -> Result<Vec<IndexArtifactPublicationOutcome>, Status> {
+        let response = self
+            .client(target, address)?
+            .commit_guarded_index_artifacts(wire::CommitGuardedIndexArtifactsRequest {
+                peer: Some(self.context(expected_fence, 0, MAX_CLUSTER_OPERATION_TIME)?),
+                builder_node_id: builder.0,
+                publications: requests
+                    .iter()
+                    .map(|request| wire_index_artifact_publish(request, None))
+                    .collect(),
+            })
+            .await?
+            .into_inner();
+        require_response_schema(response.schema_version)?;
+        decode_indexed_artifact_outcomes(response.outcomes, requests.len())
     }
 
     pub(crate) async fn delete_index_artifact(
@@ -1395,6 +1430,53 @@ fn nonzero_artifact_outcome(version: u64, replayed: bool) -> Result<IndexArtifac
         version: VersionId(version),
         replayed,
     })
+}
+
+pub(super) fn decode_indexed_artifact_outcomes(
+    encoded: Vec<wire::IndexedIndexArtifactPublicationOutcome>,
+    expected: usize,
+) -> Result<Vec<IndexArtifactPublicationOutcome>, Status> {
+    if encoded.len() != expected {
+        return Err(Status::data_loss(
+            "grouped index artifact outcome count differs from its request",
+        ));
+    }
+    let mut outcomes = vec![None; expected];
+    for encoded in encoded {
+        require_response_schema(encoded.schema_version)?;
+        let index = usize::try_from(encoded.request_index)
+            .map_err(|_| Status::data_loss("index artifact outcome index does not fit usize"))?;
+        let slot = outcomes.get_mut(index).ok_or_else(|| {
+            Status::data_loss("index artifact outcome index is outside the request")
+        })?;
+        if slot.is_some() {
+            return Err(Status::data_loss(
+                "index artifact outcome index was returned more than once",
+            ));
+        }
+        let outcome = match encoded.result.ok_or_else(|| {
+            Status::data_loss("index artifact outcome has no published or failed result")
+        })? {
+            wire::indexed_index_artifact_publication_outcome::Result::Published(published) => {
+                require_response_schema(published.schema_version)?;
+                nonzero_artifact_outcome(published.version, published.replayed)
+            }
+            wire::indexed_index_artifact_publication_outcome::Result::Failed(failed) => {
+                require_response_schema(failed.schema_version)?;
+                Err(Status::new(
+                    tonic::Code::from_i32(failed.code),
+                    failed.message,
+                ))
+            }
+        };
+        *slot = Some(outcome);
+    }
+    outcomes
+        .into_iter()
+        .map(|outcome| {
+            outcome.ok_or_else(|| Status::data_loss("index artifact outcome is missing"))
+        })
+        .collect()
 }
 
 fn validate_index_head(head: &super::IndexCurrentHead) -> Result<(), Status> {

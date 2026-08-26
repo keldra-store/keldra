@@ -12,8 +12,9 @@ use super::storage::{bounded_blocking, object_coordinator};
 use super::{CLUSTER_PEER_SCHEMA_VERSION, ClusterPeerService, wire};
 use crate::index_runtime::publication::{
     DefinitionVersionGuard, DerivedArtifactAdmission, IndexArtifactDelete,
-    IndexArtifactPublication, IndexArtifactPublish, artifact_hash_from_path, current_path,
-    is_manifest_artifact_path,
+    IndexArtifactPublication, IndexArtifactPublicationOutcome, IndexArtifactPublish,
+    MAX_INDEX_ARTIFACT_BATCH_BYTES, MAX_INDEX_ARTIFACT_BATCH_ITEMS, artifact_hash_from_path,
+    current_path, is_manifest_artifact_path,
 };
 
 const INDEX_HEAD_SCAN_MAX_RECORDS: u32 = 128;
@@ -111,6 +112,79 @@ impl ClusterPeerService {
             schema_version: CLUSTER_PEER_SCHEMA_VERSION,
             version: receipt.version.0,
             replayed: receipt.replayed,
+        }))
+    }
+
+    pub(super) async fn publish_guarded_index_artifacts_call(
+        &self,
+        request: Request<wire::PublishGuardedIndexArtifactsRequest>,
+    ) -> Result<Response<wire::IndexArtifactsPublished>, Status> {
+        let admitted = self.admit(&request, request.get_ref().peer.as_ref(), 0)?;
+        let publications = decode_bounded_publications(&request.get_ref().publications)?;
+        if publications
+            .iter()
+            .any(|publication| publication.definition_guard.is_none())
+        {
+            return Err(Status::invalid_argument(
+                "every grouped guarded publication requires a definition guard",
+            ));
+        }
+        let fence = admitted.placement.fence();
+        let outcomes = tokio::time::timeout(
+            admitted.timeout,
+            self.index_artifacts.publish_guarded_many(
+                admitted.authenticated.node_id,
+                admitted.placement,
+                publications,
+            ),
+        )
+        .await
+        .map_err(|_| Status::deadline_exceeded("guarded artifact batch deadline exceeded"))??;
+        self.require_unchanged(fence)?;
+        Ok(Response::new(wire::IndexArtifactsPublished {
+            schema_version: CLUSTER_PEER_SCHEMA_VERSION,
+            outcomes: encode_publication_outcomes(outcomes),
+        }))
+    }
+
+    pub(super) async fn commit_guarded_index_artifacts_call(
+        &self,
+        request: Request<wire::CommitGuardedIndexArtifactsRequest>,
+    ) -> Result<Response<wire::IndexArtifactsPublished>, Status> {
+        let admitted = self.admit(&request, request.get_ref().peer.as_ref(), 0)?;
+        let request = request.into_inner();
+        if request.builder_node_id == 0 {
+            return Err(Status::invalid_argument(
+                "guarded artifact batch builder must be non-zero",
+            ));
+        }
+        let publications = decode_bounded_publications(&request.publications)?;
+        if publications
+            .iter()
+            .any(|publication| publication.definition_guard.is_none())
+        {
+            return Err(Status::invalid_argument(
+                "every guarded artifact commit requires a definition guard",
+            ));
+        }
+        let fence = admitted.placement.fence();
+        let outcomes = tokio::time::timeout(
+            admitted.timeout,
+            self.index_artifacts.commit_guarded_many(
+                admitted.authenticated.node_id,
+                NodeId(request.builder_node_id),
+                admitted.placement,
+                publications,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            Status::deadline_exceeded("guarded artifact commit batch deadline exceeded")
+        })??;
+        self.require_unchanged(fence)?;
+        Ok(Response::new(wire::IndexArtifactsPublished {
+            schema_version: CLUSTER_PEER_SCHEMA_VERSION,
+            outcomes: encode_publication_outcomes(outcomes),
         }))
     }
 
@@ -306,6 +380,70 @@ pub(super) fn decode_request(
     })
 }
 
+pub(super) fn decode_bounded_publications(
+    encoded: &[wire::PublishIndexArtifactRequest],
+) -> Result<Vec<IndexArtifactPublish>, Status> {
+    if encoded.is_empty() || encoded.len() > MAX_INDEX_ARTIFACT_BATCH_ITEMS {
+        return Err(Status::resource_exhausted(format!(
+            "index artifact batch must contain 1..={MAX_INDEX_ARTIFACT_BATCH_ITEMS} items"
+        )));
+    }
+    let mut logical_bytes = 0_u64;
+    let mut publications = Vec::with_capacity(encoded.len());
+    for publication in encoded {
+        if publication.peer.is_some() {
+            return Err(Status::invalid_argument(
+                "nested index artifact publication must not carry peer context",
+            ));
+        }
+        logical_bytes = logical_bytes
+            .checked_add(publication.blob_length)
+            .ok_or_else(|| {
+                Status::resource_exhausted("index artifact batch byte count overflow")
+            })?;
+        if logical_bytes > MAX_INDEX_ARTIFACT_BATCH_BYTES {
+            return Err(Status::resource_exhausted(format!(
+                "index artifact batch exceeds {MAX_INDEX_ARTIFACT_BATCH_BYTES} logical bytes"
+            )));
+        }
+        publications.push(decode_request(publication)?);
+    }
+    Ok(publications)
+}
+
+pub(super) fn encode_publication_outcomes(
+    outcomes: Vec<IndexArtifactPublicationOutcome>,
+) -> Vec<wire::IndexedIndexArtifactPublicationOutcome> {
+    outcomes
+        .into_iter()
+        .enumerate()
+        .map(
+            |(index, outcome)| wire::IndexedIndexArtifactPublicationOutcome {
+                schema_version: CLUSTER_PEER_SCHEMA_VERSION,
+                request_index: index as u32,
+                result: Some(match outcome {
+                    Ok(outcome) => {
+                        wire::indexed_index_artifact_publication_outcome::Result::Published(
+                            wire::IndexArtifactPublished {
+                                schema_version: CLUSTER_PEER_SCHEMA_VERSION,
+                                version: outcome.version.0,
+                                replayed: outcome.replayed,
+                            },
+                        )
+                    }
+                    Err(error) => wire::indexed_index_artifact_publication_outcome::Result::Failed(
+                        wire::IndexArtifactPublicationFailed {
+                            schema_version: CLUSTER_PEER_SCHEMA_VERSION,
+                            code: error.code() as i32,
+                            message: error.message().to_owned(),
+                        },
+                    ),
+                }),
+            },
+        )
+        .collect()
+}
+
 fn decode_definition_guard(
     request: &wire::PublishIndexArtifactRequest,
 ) -> Result<Option<DefinitionVersionGuard>, Status> {
@@ -376,6 +514,7 @@ mod tests {
     use keldra_store::{RetainedHeadState, Version};
 
     use super::*;
+    use crate::index_runtime::publication::IndexArtifactOutcome;
 
     #[test]
     fn private_artifact_admission_round_trips_over_the_peer_protocol() {
@@ -403,6 +542,49 @@ mod tests {
             let encoded = super::super::transport::wire_index_artifact_publish(&request, None);
             assert_eq!(decode_request(&encoded).unwrap().admission, admission);
         }
+    }
+
+    #[test]
+    fn plural_outcomes_preserve_request_order_and_individual_failures() {
+        let encoded = encode_publication_outcomes(vec![
+            Ok(IndexArtifactOutcome {
+                version: VersionId(17),
+                replayed: true,
+            }),
+            Err(Status::aborted("pointer compare-and-swap lost")),
+            Ok(IndexArtifactOutcome {
+                version: VersionId(19),
+                replayed: false,
+            }),
+        ]);
+
+        let decoded = super::super::transport::decode_indexed_artifact_outcomes(encoded, 3)
+            .expect("valid indexed outcomes");
+        assert_eq!(decoded[0].as_ref().unwrap().version, VersionId(17));
+        assert!(decoded[0].as_ref().unwrap().replayed);
+        let failed = decoded[1].as_ref().unwrap_err();
+        assert_eq!(failed.code(), tonic::Code::Aborted);
+        assert_eq!(failed.message(), "pointer compare-and-swap lost");
+        assert_eq!(decoded[2].as_ref().unwrap().version, VersionId(19));
+    }
+
+    #[test]
+    fn plural_outcome_decoder_rejects_duplicate_indices() {
+        let mut encoded = encode_publication_outcomes(vec![
+            Ok(IndexArtifactOutcome {
+                version: VersionId(17),
+                replayed: false,
+            }),
+            Ok(IndexArtifactOutcome {
+                version: VersionId(18),
+                replayed: false,
+            }),
+        ]);
+        encoded[1].request_index = 0;
+
+        let error =
+            super::super::transport::decode_indexed_artifact_outcomes(encoded, 2).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::DataLoss);
     }
 
     #[test]

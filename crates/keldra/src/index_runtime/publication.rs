@@ -6,11 +6,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use keldra_consensus::NodeId;
 use keldra_store::{
     BatchOperation, BlobRef, DefinitionKind, DefinitionMutationIntent, DeleteRequest,
-    DeleteRetainedVersionOutcome, Durability, ObjectKey, ObjectVersioning, Precondition,
-    PublishRequest, PutMode, Store, VersionId,
+    DeleteRetainedVersionOutcome, Durability, ObjectKey, ObjectVersioning, PlacementLogId,
+    Precondition, PublishRequest, PutMode, Store, VersionId,
 };
 use tonic::Status;
-use tracing::Instrument;
 
 use crate::bucket_governance::BucketGovernance;
 use crate::cluster_peer::ClusterPeerTransport;
@@ -18,6 +17,8 @@ use crate::cluster_placement::ClusterPlacement;
 use crate::object_distribution::ObjectDistribution;
 
 use super::placement::{IndexIdentity, IndexPlacement};
+
+mod cohort;
 
 const INDEX_ARTIFACT_CONTENT_TYPE: &str = "application/vnd.keldra.index-artifact";
 const ACCOUNTING_ARTIFACT_CONTENT_TYPE: &str = "application/vnd.keldra.accounting+json";
@@ -112,6 +113,42 @@ impl DerivedArtifactAdmission {
 pub(crate) struct IndexArtifactOutcome {
     pub version: VersionId,
     pub replayed: bool,
+}
+
+pub(crate) type IndexArtifactPublicationOutcome = Result<IndexArtifactOutcome, Status>;
+
+/// Exact physical routing identity for one guarded current-pointer cohort.
+/// The placement fence prevents candidates prepared across membership cuts
+/// from sharing a queue epoch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GuardedIndexArtifactCohort {
+    storage_tenant: String,
+    bucket: String,
+    tenant_id: u64,
+    bucket_id: u64,
+    admission: DerivedArtifactAdmission,
+    fence: PlacementLogId,
+    definition_replicas: Vec<NodeId>,
+    current_replicas: Vec<NodeId>,
+}
+
+#[cfg(test)]
+impl GuardedIndexArtifactCohort {
+    pub(crate) fn test_key(
+        definition_replicas: Vec<NodeId>,
+        current_replicas: Vec<NodeId>,
+    ) -> Self {
+        Self {
+            storage_tenant: "tenant".into(),
+            bucket: "bucket".into(),
+            tenant_id: 1,
+            bucket_id: 2,
+            admission: DerivedArtifactAdmission::PublicationProgress,
+            fence: PlacementLogId { term: 3, index: 7 },
+            definition_replicas,
+            current_replicas,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -274,7 +311,14 @@ pub(crate) trait IndexArtifactPublication: Send + Sync + 'static {
         authenticated_builder: NodeId,
         placement: ClusterPlacement,
         requests: Vec<IndexArtifactPublish>,
-    ) -> Result<Vec<IndexArtifactOutcome>, Status>;
+    ) -> Result<Vec<IndexArtifactPublicationOutcome>, Status>;
+
+    async fn publish_guarded_many(
+        &self,
+        authenticated_builder: NodeId,
+        placement: ClusterPlacement,
+        requests: Vec<IndexArtifactPublish>,
+    ) -> Result<Vec<IndexArtifactPublicationOutcome>, Status>;
 
     async fn commit_guarded(
         &self,
@@ -283,6 +327,14 @@ pub(crate) trait IndexArtifactPublication: Send + Sync + 'static {
         placement: ClusterPlacement,
         request: IndexArtifactPublish,
     ) -> Result<IndexArtifactOutcome, Status>;
+
+    async fn commit_guarded_many(
+        &self,
+        authenticated_definition_coordinator: NodeId,
+        authenticated_builder: NodeId,
+        placement: ClusterPlacement,
+        requests: Vec<IndexArtifactPublish>,
+    ) -> Result<Vec<IndexArtifactPublicationOutcome>, Status>;
 
     async fn delete(
         &self,
@@ -329,7 +381,7 @@ impl IndexArtifactPublication for LateBoundIndexArtifactPublication {
         authenticated_builder: NodeId,
         placement: ClusterPlacement,
         requests: Vec<IndexArtifactPublish>,
-    ) -> Result<Vec<IndexArtifactOutcome>, Status> {
+    ) -> Result<Vec<IndexArtifactPublicationOutcome>, Status> {
         let handler = self
             .inner
             .get()
@@ -337,6 +389,22 @@ impl IndexArtifactPublication for LateBoundIndexArtifactPublication {
             .ok_or_else(|| Status::unavailable("index artifact publisher is not ready"))?;
         handler
             .publish_many(authenticated_builder, placement, requests)
+            .await
+    }
+
+    async fn publish_guarded_many(
+        &self,
+        authenticated_builder: NodeId,
+        placement: ClusterPlacement,
+        requests: Vec<IndexArtifactPublish>,
+    ) -> Result<Vec<IndexArtifactPublicationOutcome>, Status> {
+        let handler = self
+            .inner
+            .get()
+            .cloned()
+            .ok_or_else(|| Status::unavailable("index artifact publisher is not ready"))?;
+        handler
+            .publish_guarded_many(authenticated_builder, placement, requests)
             .await
     }
 
@@ -374,6 +442,28 @@ impl IndexArtifactPublication for LateBoundIndexArtifactPublication {
                 authenticated_builder,
                 placement,
                 request,
+            )
+            .await
+    }
+
+    async fn commit_guarded_many(
+        &self,
+        authenticated_definition_coordinator: NodeId,
+        authenticated_builder: NodeId,
+        placement: ClusterPlacement,
+        requests: Vec<IndexArtifactPublish>,
+    ) -> Result<Vec<IndexArtifactPublicationOutcome>, Status> {
+        let handler = self
+            .inner
+            .get()
+            .cloned()
+            .ok_or_else(|| Status::unavailable("index artifact publisher is not ready"))?;
+        handler
+            .commit_guarded_many(
+                authenticated_definition_coordinator,
+                authenticated_builder,
+                placement,
+                requests,
             )
             .await
     }
@@ -593,102 +683,6 @@ impl IndexArtifactCoordinator {
         })
     }
 
-    async fn publish_immutable_many(
-        &self,
-        authenticated_builder: NodeId,
-        placement: ClusterPlacement,
-        requests: Vec<IndexArtifactPublish>,
-    ) -> Result<Vec<IndexArtifactOutcome>, Status> {
-        validate_immutable_batch(&requests)?;
-        let first = &requests[0];
-        let admission = first.admission;
-        let identity = IndexIdentity::new(first.tenant_id, first.bucket_id, first.index_id)
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        self.validate_index_builder(authenticated_builder, &placement, identity)?;
-        let governance = self
-            .governance
-            .resolve(&first.storage_tenant, &first.bucket)
-            .await?;
-        if (governance.tenant_id, governance.bucket_id)
-            != (identity.tenant_id(), identity.bucket_id())
-        {
-            return Err(Status::failed_precondition(
-                "index artifact mutable names no longer bind the supplied stable IDs",
-            ));
-        }
-        let first_key = first.key()?;
-        let group = self.objects.object_replica_group_stable(
-            &placement,
-            &first_key,
-            first.tenant_id,
-            first.bucket_id,
-        )?;
-        if group.coordinator() != self.objects.local_node() {
-            return Err(Status::failed_precondition(
-                "grouped index artifacts reached the wrong object coordinator",
-            ));
-        }
-        for request in &requests[1..] {
-            let key = request.key()?;
-            let candidate = self.objects.object_replica_group_stable(
-                &placement,
-                &key,
-                request.tenant_id,
-                request.bucket_id,
-            )?;
-            if candidate != group {
-                return Err(Status::invalid_argument(
-                    "grouped index artifacts span metadata replica groups",
-                ));
-            }
-        }
-        let durability = artifact_durability(
-            ArtifactPathKind::Immutable,
-            placement.placement_nodes().len(),
-        );
-        let publishes = requests
-            .into_iter()
-            .map(|request| {
-                Ok(PublishRequest {
-                    key: request.key()?,
-                    blob: request.blob,
-                    content_type: Some(INDEX_ARTIFACT_CONTENT_TYPE.into()),
-                    mode: PutMode::PutIfAbsent,
-                    command_id: Some(request.command_id),
-                    durability,
-                })
-            })
-            .collect::<Result<Vec<_>, Status>>()?;
-        let results = if admission.is_publication_progress() {
-            self.objects
-                .publish_many_derived_progress_from_source_with_governance(
-                    publishes,
-                    authenticated_builder,
-                    governance,
-                    placement,
-                )
-                .await?
-        } else {
-            self.objects
-                .publish_many_from_source_with_governance(
-                    publishes,
-                    authenticated_builder,
-                    governance,
-                    placement,
-                )
-                .await?
-        };
-        results
-            .into_iter()
-            .map(|outcome| {
-                outcome.map(|receipt| IndexArtifactOutcome {
-                    version: receipt.version,
-                    replayed: receipt.replayed,
-                })
-            })
-            .collect()
-    }
-
     async fn require_current_definition(
         &self,
         placement: &ClusterPlacement,
@@ -724,140 +718,6 @@ impl IndexArtifactCoordinator {
 
 /// Builder-side router. The builder owns orchestration, while every artifact
 /// still enters the ordinary coordinator selected for its exact object path.
-struct GroupedPublishTelemetry {
-    span: tracing::Span,
-    started: std::time::Instant,
-    requested_items: u64,
-    requested_bytes: u64,
-    groups: u64,
-    batches: u64,
-    local_batches: u64,
-    remote_batches: u64,
-    attempted_items: u64,
-    attempted_bytes: u64,
-    finished: bool,
-}
-
-impl GroupedPublishTelemetry {
-    fn start(requests: &[IndexArtifactPublish]) -> Self {
-        let first = &requests[0];
-        let requested_items = requests.len() as u64;
-        let requested_bytes = requests.iter().fold(0_u64, |total, request| {
-            total.saturating_add(request.blob.length)
-        });
-        let span = tracing::debug_span!(
-            "keldra.index.grouped_publish",
-            index.id = first.index_id,
-            tenant.id = first.tenant_id,
-            bucket.id = first.bucket_id,
-            publish.requested_items = requested_items,
-            publish.requested_bytes = requested_bytes,
-            publish.groups = tracing::field::Empty,
-            publish.batches = tracing::field::Empty,
-            publish.local_batches = tracing::field::Empty,
-            publish.remote_batches = tracing::field::Empty,
-            publish.attempted_items = tracing::field::Empty,
-            publish.attempted_bytes = tracing::field::Empty,
-            publish.elapsed_seconds = tracing::field::Empty,
-            publish.outcome = tracing::field::Empty,
-            otel.status_code = tracing::field::Empty,
-        );
-        span.in_scope(|| {
-            tracing::debug!(
-                operation = "index_artifact_grouped_publish",
-                counter.keldra_index_grouped_publish_active = 1_i64,
-                monotonic_counter.keldra_index_grouped_publish_attempts_total = 1_u64,
-                "grouped index artifact publication started"
-            );
-        });
-        Self {
-            span,
-            started: std::time::Instant::now(),
-            requested_items,
-            requested_bytes,
-            groups: 0,
-            batches: 0,
-            local_batches: 0,
-            remote_batches: 0,
-            attempted_items: 0,
-            attempted_bytes: 0,
-            finished: false,
-        }
-    }
-
-    fn record_batch(&mut self, local: bool, batch: &[(usize, IndexArtifactPublish)]) {
-        self.batches = self.batches.saturating_add(1);
-        if local {
-            self.local_batches = self.local_batches.saturating_add(1);
-        } else {
-            self.remote_batches = self.remote_batches.saturating_add(1);
-        }
-        self.attempted_items = self.attempted_items.saturating_add(batch.len() as u64);
-        self.attempted_bytes = self.attempted_bytes.saturating_add(
-            batch
-                .iter()
-                .map(|(_, request)| request.blob.length)
-                .sum::<u64>(),
-        );
-    }
-
-    fn finish(&mut self, failed: bool) {
-        if self.finished {
-            return;
-        }
-        self.finished = true;
-        let elapsed_seconds = self.started.elapsed().as_secs_f64();
-        let outcome = if failed { "failed" } else { "completed" };
-        self.span.record("publish.groups", self.groups);
-        self.span.record("publish.batches", self.batches);
-        self.span
-            .record("publish.local_batches", self.local_batches);
-        self.span
-            .record("publish.remote_batches", self.remote_batches);
-        self.span
-            .record("publish.attempted_items", self.attempted_items);
-        self.span
-            .record("publish.attempted_bytes", self.attempted_bytes);
-        self.span.record("publish.elapsed_seconds", elapsed_seconds);
-        self.span.record("publish.outcome", outcome);
-        self.span
-            .record("otel.status_code", if failed { "error" } else { "ok" });
-        self.span.in_scope(|| {
-            tracing::debug!(
-                operation = "index_artifact_grouped_publish",
-                counter.keldra_index_grouped_publish_active = -1_i64,
-                "grouped index artifact publication released"
-            );
-            tracing::debug!(
-                operation = "index_artifact_grouped_publish",
-                publish.outcome = outcome,
-                monotonic_counter.keldra_index_grouped_publish_failures_total = u64::from(failed),
-                monotonic_counter.keldra_index_grouped_publish_batches_total = self.batches,
-                monotonic_counter.keldra_index_grouped_publish_local_batches_total =
-                    self.local_batches,
-                monotonic_counter.keldra_index_grouped_publish_remote_batches_total =
-                    self.remote_batches,
-                monotonic_counter.keldra_index_grouped_publish_items_total = self.attempted_items,
-                monotonic_counter.keldra_index_grouped_publish_bytes_total = self.attempted_bytes,
-                histogram.keldra_index_grouped_publish_requested_items = self.requested_items,
-                histogram.keldra_index_grouped_publish_requested_bytes = self.requested_bytes,
-                histogram.keldra_index_grouped_publish_replica_groups = self.groups,
-                histogram.keldra_index_grouped_publish_batch_count = self.batches,
-                histogram.keldra_index_grouped_publish_duration_seconds = elapsed_seconds,
-                "grouped index artifact publication finished"
-            );
-        });
-    }
-}
-
-impl Drop for GroupedPublishTelemetry {
-    fn drop(&mut self) {
-        if !self.finished {
-            self.finish(true);
-        }
-    }
-}
-
 #[derive(Clone)]
 pub(crate) struct IndexArtifactRouter {
     local_node: NodeId,
@@ -870,6 +730,11 @@ pub(crate) struct IndexArtifactRouter {
 pub(crate) struct IndexCurrentMutationGuard {
     index_id: u64,
     _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+pub(crate) struct GuardedIndexArtifactPublish {
+    pub request: IndexArtifactPublish,
+    pub current_guard: IndexCurrentMutationGuard,
 }
 
 impl IndexArtifactRouter {
@@ -967,94 +832,6 @@ impl IndexArtifactRouter {
             };
         self.require_fence(fence)?;
         Ok(outcome)
-    }
-
-    pub(crate) async fn publish_many(
-        &self,
-        requests: Vec<IndexArtifactPublish>,
-    ) -> Result<Vec<IndexArtifactOutcome>, Status> {
-        if requests.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut telemetry = GroupedPublishTelemetry::start(&requests);
-        let span = telemetry.span.clone();
-        let result = self
-            .publish_many_inner(requests, &mut telemetry)
-            .instrument(span)
-            .await;
-        telemetry.finish(result.is_err());
-        result
-    }
-
-    async fn publish_many_inner(
-        &self,
-        requests: Vec<IndexArtifactPublish>,
-        telemetry: &mut GroupedPublishTelemetry,
-    ) -> Result<Vec<IndexArtifactOutcome>, Status> {
-        let first = &requests[0];
-        let identity = (
-            first.storage_tenant.clone(),
-            first.bucket.clone(),
-            first.tenant_id,
-            first.bucket_id,
-            first.index_id,
-        );
-        let placement = self.require_local_builder(identity.2, identity.3, identity.4)?;
-        let fence = placement.fence();
-        let mut groups =
-            std::collections::BTreeMap::<Vec<NodeId>, Vec<(usize, IndexArtifactPublish)>>::new();
-        for (index, request) in requests.into_iter().enumerate() {
-            request.validate()?;
-            if request.storage_tenant != identity.0
-                || request.bucket != identity.1
-                || request.tenant_id != identity.2
-                || request.bucket_id != identity.3
-                || request.index_id != identity.4
-            {
-                return Err(Status::invalid_argument(
-                    "one grouped publication candidate must share its index identity",
-                ));
-            }
-            let key = request.key()?;
-            let group = self.objects.object_replica_group_stable(
-                &placement,
-                &key,
-                request.tenant_id,
-                request.bucket_id,
-            )?;
-            groups
-                .entry(group.replicas().to_vec())
-                .or_default()
-                .push((index, request));
-        }
-        telemetry.groups = groups.len() as u64;
-        let outcome_count = groups.values().map(Vec::len).sum();
-        let mut outcomes = vec![None; outcome_count];
-        for (replicas, group) in groups {
-            let coordinator = replicas[0];
-            for batch in bounded_artifact_batches(group)? {
-                telemetry.record_batch(coordinator == self.local_node, &batch);
-                let (indices, publications): (Vec<_>, Vec<_>) = batch.into_iter().unzip();
-                let published = if coordinator == self.local_node {
-                    self.coordinator
-                        .publish_many(self.local_node, placement.clone(), publications)
-                        .await?
-                } else {
-                    let address = placement.address(coordinator).ok_or_else(|| {
-                        Status::unavailable(format!(
-                            "ACTIVE artifact coordinator {} has no peer address",
-                            coordinator.0
-                        ))
-                    })?;
-                    self.peers
-                        .publish_index_artifacts(coordinator, &address.0, fence, &publications)
-                        .await?
-                };
-                record_grouped_artifact_outcomes(&mut outcomes, indices, published)?;
-                self.require_fence(fence)?;
-            }
-        }
-        ordered_grouped_artifact_outcomes(outcomes)
     }
 
     pub(crate) async fn delete(
@@ -1190,9 +967,9 @@ fn bounded_artifact_batches(
 }
 
 fn record_grouped_artifact_outcomes(
-    outcomes: &mut [Option<IndexArtifactOutcome>],
+    outcomes: &mut [Option<IndexArtifactPublicationOutcome>],
     indices: Vec<usize>,
-    published: Vec<IndexArtifactOutcome>,
+    published: Vec<IndexArtifactPublicationOutcome>,
 ) -> Result<(), Status> {
     if published.len() != indices.len() {
         return Err(Status::data_loss(
@@ -1212,9 +989,34 @@ fn record_grouped_artifact_outcomes(
     Ok(())
 }
 
+fn record_batch_publication_result(
+    outcomes: &mut [Option<IndexArtifactPublicationOutcome>],
+    indices: Vec<usize>,
+    published: Result<Vec<IndexArtifactPublicationOutcome>, Status>,
+) -> Result<(), Status> {
+    let published = match published {
+        Ok(published) if published.len() == indices.len() => published,
+        Ok(_) => repeated_artifact_outcome_error(
+            indices.len(),
+            Status::internal("physical index artifact outcome count differs from its request"),
+        ),
+        Err(error) => repeated_artifact_outcome_error(indices.len(), error),
+    };
+    record_grouped_artifact_outcomes(outcomes, indices, published)
+}
+
+fn repeated_artifact_outcome_error(
+    count: usize,
+    error: Status,
+) -> Vec<IndexArtifactPublicationOutcome> {
+    (0..count)
+        .map(|_| Err(Status::new(error.code(), error.message().to_owned())))
+        .collect()
+}
+
 fn ordered_grouped_artifact_outcomes(
-    outcomes: Vec<Option<IndexArtifactOutcome>>,
-) -> Result<Vec<IndexArtifactOutcome>, Status> {
+    outcomes: Vec<Option<IndexArtifactPublicationOutcome>>,
+) -> Result<Vec<IndexArtifactPublicationOutcome>, Status> {
     outcomes
         .into_iter()
         .map(|outcome| {
@@ -1245,8 +1047,116 @@ impl IndexArtifactPublication for IndexArtifactCoordinator {
         authenticated_builder: NodeId,
         placement: ClusterPlacement,
         requests: Vec<IndexArtifactPublish>,
-    ) -> Result<Vec<IndexArtifactOutcome>, Status> {
+    ) -> Result<Vec<IndexArtifactPublicationOutcome>, Status> {
         self.publish_immutable_many(authenticated_builder, placement, requests)
+            .await
+    }
+
+    async fn publish_guarded_many(
+        &self,
+        authenticated_builder: NodeId,
+        placement: ClusterPlacement,
+        requests: Vec<IndexArtifactPublish>,
+    ) -> Result<Vec<IndexArtifactPublicationOutcome>, Status> {
+        validate_guarded_batch(&requests)?;
+        let _permit = self.objects.enter_mutation()?;
+        self.require_fence(placement.fence())?;
+        let mut definition_keys = Vec::with_capacity(requests.len());
+        for request in &requests {
+            let identity =
+                IndexIdentity::new(request.tenant_id, request.bucket_id, request.index_id)
+                    .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            self.validate_index_builder(authenticated_builder, &placement, identity)?;
+            let key = request
+                .definition_guard
+                .as_ref()
+                .ok_or_else(|| Status::invalid_argument("guarded publication has no guard"))?
+                .key(&request.storage_tenant, &request.bucket)?;
+            if self.objects.object_coordinator_stable(
+                &placement,
+                &key,
+                request.tenant_id,
+                request.bucket_id,
+            )? != self.objects.local_node()
+            {
+                return Err(Status::failed_precondition(
+                    "grouped guarded publication did not reach the shared definition-path coordinator",
+                ));
+            }
+            definition_keys.push(key);
+        }
+        let locked_keys = definition_keys.clone();
+        self.store
+            .with_ordinary_object_path_locks(&definition_keys, move || async move {
+                let request_count = requests.len();
+                let mut outcomes = std::iter::repeat_with(|| None)
+                    .take(request_count)
+                    .collect::<Vec<_>>();
+                let mut valid = Vec::with_capacity(request_count);
+                for (index, (key, request)) in locked_keys.iter().zip(requests).enumerate() {
+                    let validation = self
+                        .require_current_definition(&placement, key, &request)
+                        .await;
+                    cohort::record_definition_guard_outcome(
+                        &mut outcomes,
+                        &mut valid,
+                        index,
+                        request,
+                        validation,
+                    )?;
+                }
+                let Some((_, first)) = valid.first() else {
+                    return ordered_grouped_artifact_outcomes(outcomes);
+                };
+                let artifact_group = self.objects.object_replica_group_stable(
+                    &placement,
+                    &first.key()?,
+                    first.tenant_id,
+                    first.bucket_id,
+                )?;
+                for (_, request) in &valid[1..] {
+                    let candidate = self.objects.object_replica_group_stable(
+                        &placement,
+                        &request.key()?,
+                        request.tenant_id,
+                        request.bucket_id,
+                    )?;
+                    if candidate != artifact_group {
+                        return Err(Status::invalid_argument(
+                            "grouped guarded publication spans current-pointer replica groups",
+                        ));
+                    }
+                }
+                let coordinator = artifact_group.coordinator();
+                let (indices, publications): (Vec<_>, Vec<_>) = valid.into_iter().unzip();
+                let published = if coordinator == self.objects.local_node() {
+                    self.publish_mutable_many(
+                        authenticated_builder,
+                        placement.clone(),
+                        publications,
+                    )
+                    .await?
+                } else {
+                    let address = placement.address(coordinator).ok_or_else(|| {
+                        Status::unavailable(format!(
+                            "ACTIVE artifact coordinator {} has no peer address",
+                            coordinator.0
+                        ))
+                    })?;
+                    self.peers
+                        .commit_guarded_index_artifacts(
+                            coordinator,
+                            &address.0,
+                            placement.fence(),
+                            authenticated_builder,
+                            &publications,
+                        )
+                        .await?
+                };
+                record_grouped_artifact_outcomes(&mut outcomes, indices, published)?;
+                self.require_fence(placement.fence())?;
+                ordered_grouped_artifact_outcomes(outcomes)
+            })
             .await
     }
 
@@ -1278,6 +1188,39 @@ impl IndexArtifactPublication for IndexArtifactCoordinator {
             ));
         }
         self.publish_unguarded(authenticated_builder, placement, request)
+            .await
+    }
+
+    async fn commit_guarded_many(
+        &self,
+        authenticated_definition_coordinator: NodeId,
+        authenticated_builder: NodeId,
+        placement: ClusterPlacement,
+        requests: Vec<IndexArtifactPublish>,
+    ) -> Result<Vec<IndexArtifactPublicationOutcome>, Status> {
+        validate_guarded_batch(&requests)?;
+        for request in &requests {
+            let identity =
+                IndexIdentity::new(request.tenant_id, request.bucket_id, request.index_id)
+                    .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            self.validate_index_builder(authenticated_builder, &placement, identity)?;
+            let guard = request.definition_guard.as_ref().ok_or_else(|| {
+                Status::invalid_argument("guarded commit has no definition guard")
+            })?;
+            let definition_key = guard.key(&request.storage_tenant, &request.bucket)?;
+            if self.objects.object_coordinator_stable(
+                &placement,
+                &definition_key,
+                request.tenant_id,
+                request.bucket_id,
+            )? != authenticated_definition_coordinator
+            {
+                return Err(Status::permission_denied(
+                    "guarded artifact batch caller is not every definition-path coordinator",
+                ));
+            }
+        }
+        self.publish_mutable_many(authenticated_builder, placement, requests)
             .await
     }
 
@@ -1394,11 +1337,10 @@ fn validate_immutable_batch(requests: &[IndexArtifactPublish]) -> Result<(), Sta
             || request.bucket != first.bucket
             || request.tenant_id != first.tenant_id
             || request.bucket_id != first.bucket_id
-            || request.index_id != first.index_id
             || request.admission != first.admission
         {
             return Err(Status::invalid_argument(
-                "grouped index artifacts must share one exact index identity and admission",
+                "grouped index artifacts must share one governed bucket and admission",
             ));
         }
         bytes = bytes.checked_add(request.blob.length).ok_or_else(|| {
@@ -1408,6 +1350,42 @@ fn validate_immutable_batch(requests: &[IndexArtifactPublish]) -> Result<(), Sta
     if bytes > MAX_INDEX_ARTIFACT_BATCH_BYTES {
         return Err(Status::resource_exhausted(format!(
             "index artifact batch exceeds {MAX_INDEX_ARTIFACT_BATCH_BYTES} logical bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_guarded_batch(requests: &[IndexArtifactPublish]) -> Result<(), Status> {
+    if requests.is_empty() || requests.len() > MAX_INDEX_ARTIFACT_BATCH_ITEMS {
+        return Err(Status::resource_exhausted(format!(
+            "guarded index artifact batch must contain 1..={MAX_INDEX_ARTIFACT_BATCH_ITEMS} items"
+        )));
+    }
+    let first = &requests[0];
+    let mut bytes = 0_u64;
+    for request in requests {
+        if request.validate()? != ArtifactPathKind::Current {
+            return Err(Status::invalid_argument(
+                "grouped guarded publication accepts current pointers only",
+            ));
+        }
+        if request.storage_tenant != first.storage_tenant
+            || request.bucket != first.bucket
+            || request.tenant_id != first.tenant_id
+            || request.bucket_id != first.bucket_id
+            || request.admission != first.admission
+        {
+            return Err(Status::invalid_argument(
+                "grouped guarded index artifacts must share one governed bucket and admission",
+            ));
+        }
+        bytes = bytes.checked_add(request.blob.length).ok_or_else(|| {
+            Status::resource_exhausted("guarded index artifact batch byte count overflow")
+        })?;
+    }
+    if bytes > MAX_INDEX_ARTIFACT_BATCH_BYTES {
+        return Err(Status::resource_exhausted(format!(
+            "guarded index artifact batch exceeds {MAX_INDEX_ARTIFACT_BATCH_BYTES} logical bytes"
         )));
     }
     Ok(())
@@ -1899,21 +1877,59 @@ mod tests {
             version: VersionId(version),
             replayed: false,
         };
-        let mut slots = vec![None; 4];
+        let mut slots = std::iter::repeat_with(|| None).take(4).collect::<Vec<_>>();
 
         // Replica groups are visited by their placement key, not input order.
-        record_grouped_artifact_outcomes(&mut slots, vec![2, 0], vec![outcome(30), outcome(10)])
-            .unwrap();
-        record_grouped_artifact_outcomes(&mut slots, vec![3, 1], vec![outcome(40), outcome(20)])
-            .unwrap();
+        record_grouped_artifact_outcomes(
+            &mut slots,
+            vec![2, 0],
+            vec![Ok(outcome(30)), Ok(outcome(10))],
+        )
+        .unwrap();
+        record_grouped_artifact_outcomes(
+            &mut slots,
+            vec![3, 1],
+            vec![Ok(outcome(40)), Ok(outcome(20))],
+        )
+        .unwrap();
 
         let ordered = ordered_grouped_artifact_outcomes(slots).unwrap();
         assert_eq!(
             ordered
                 .into_iter()
-                .map(|entry| entry.version.0)
+                .map(|entry| entry.unwrap().version.0)
                 .collect::<Vec<_>>(),
             vec![10, 20, 30, 40]
+        );
+    }
+
+    #[test]
+    fn immutable_batch_accepts_multiple_indices_in_one_governed_bucket() {
+        let first = artifact_publish(artifact_path(7, [3; 32]), None);
+        let mut second = artifact_publish(artifact_path(11, [5; 32]), None);
+        second.index_id = 11;
+        second.blob.hash = [5; 32];
+        assert!(validate_immutable_batch(&[first, second]).is_ok());
+    }
+
+    #[test]
+    fn grouped_publication_preserves_partial_failure_at_its_request_index() {
+        let outcome = IndexArtifactOutcome {
+            version: VersionId(10),
+            replayed: false,
+        };
+        let mut slots = std::iter::repeat_with(|| None).take(2).collect::<Vec<_>>();
+        record_grouped_artifact_outcomes(
+            &mut slots,
+            vec![1, 0],
+            vec![Err(Status::aborted("lost CAS")), Ok(outcome)],
+        )
+        .unwrap();
+        let ordered = ordered_grouped_artifact_outcomes(slots).unwrap();
+        assert_eq!(ordered[0].as_ref().unwrap().version, VersionId(10));
+        assert_eq!(
+            ordered[1].as_ref().unwrap_err().code(),
+            tonic::Code::Aborted
         );
     }
 }

@@ -1131,6 +1131,24 @@ impl Store {
         operation().await
     }
 
+    /// Runs one internal orchestration step while holding the ordinary locks
+    /// for a complete bounded logical-path set. The lock manager deduplicates
+    /// the paths and acquires them in canonical [`ObjectPath`] order, so
+    /// callers cannot introduce lock-order inversions by request ordering.
+    pub async fn with_ordinary_object_path_locks<T, F, Fut>(
+        &self,
+        keys: &[ObjectKey],
+        operation: F,
+    ) -> T
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let paths = keys.iter().map(object_path).collect::<Vec<_>>();
+        let _guard = self.ordinary_locks.acquire(&paths).await;
+        operation().await
+    }
+
     /// Adds immutable namespaces. Existing immutable policy may only become
     /// stricter; removing a prefix would silently invalidate a durability
     /// promise made to existing callers.
