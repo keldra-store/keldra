@@ -24,3 +24,6 @@ clients/python/src/keldra_storage_client/keldra_pb2.py
 clients/python/src/keldra_storage_client/keldra_pb2_grpc.py
 tmp
 .tmp/
+
+# Private implementation-decision logs excluded from image build contexts
+docs/decisions/*.local.md

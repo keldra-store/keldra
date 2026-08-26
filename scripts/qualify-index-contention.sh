@@ -19,6 +19,102 @@ index_projection_lanes="${KELDRA_INDEX_CONTENTION_INDEX_PROJECTION_MAX_LANES:-4}
 index_rayon_workers="${KELDRA_INDEX_CONTENTION_INDEX_RAYON_WORKERS:-4}"
 source_journal_entries="${KELDRA_INDEX_CONTENTION_SOURCE_JOURNAL_MAX_ENTRIES:-1000000}"
 max_concurrent_query_p99_ms="${KELDRA_INDEX_CONTENTION_MAX_CONCURRENT_QUERY_P99_MILLISECONDS:-2000}"
+remote_host="${KELDRA_INDEX_CONTENTION_REMOTE_HOST:-zcourts@192.168.64.3}"
+remote_repo="${KELDRA_INDEX_CONTENTION_REMOTE_REPO:-/home/zcourts/projects/projects/keldra/keldra}"
+
+dispatch_to_docker_vm() {
+  local dispatch_dir dispatch_environment dispatch_name dispatch_ssh_pid dispatch_status
+  local environment_name environment_value remote_dispatch_environment
+  command -v ssh >/dev/null 2>&1 || {
+    echo "docker is unavailable locally and ssh is required for remote qualification" >&2
+    return 2
+  }
+  case "${remote_host}" in
+    *[!a-zA-Z0-9_.@:-]*|"")
+      echo "KELDRA_INDEX_CONTENTION_REMOTE_HOST contains unsupported characters" >&2
+      return 2
+      ;;
+  esac
+  case "${remote_repo}" in
+    /*[!a-zA-Z0-9_./-]*)
+      echo "KELDRA_INDEX_CONTENTION_REMOTE_REPO must be an absolute simple path" >&2
+      return 2
+      ;;
+    /*) ;;
+    *)
+      echo "KELDRA_INDEX_CONTENTION_REMOTE_REPO must be an absolute simple path" >&2
+      return 2
+      ;;
+  esac
+  dispatch_dir="${repo_root}/../../releases/keldra/index-contention/.dispatch"
+  mkdir -p "${dispatch_dir}"
+  chmod 0700 "${dispatch_dir}"
+  dispatch_environment="$(mktemp "${dispatch_dir}/environment.XXXXXX")"
+  chmod 0600 "${dispatch_environment}"
+  dispatch_name="${dispatch_environment##*/}"
+  remote_dispatch_environment="${remote_repo}/../../releases/keldra/index-contention/.dispatch/${dispatch_name}"
+
+  for environment_name in KELDRA_IMAGE KELDRA_DOCKER_PLATFORM CARGO_BUILD_JOBS; do
+    if printenv "${environment_name}" >/dev/null 2>&1; then
+      environment_value="$(printenv "${environment_name}")"
+      printf 'export %s=' "${environment_name}" >>"${dispatch_environment}"
+      printf '%q\n' "${environment_value}" >>"${dispatch_environment}"
+    fi
+  done
+  while IFS= read -r environment_name; do
+    [[ "${environment_name}" == KELDRA_INDEX_CONTENTION_REMOTE_DISPATCHED ]] && continue
+    environment_value="$(printenv "${environment_name}")"
+    printf 'export %s=' "${environment_name}" >>"${dispatch_environment}"
+    printf '%q\n' "${environment_value}" >>"${dispatch_environment}"
+  done < <(compgen -v KELDRA_INDEX_CONTENTION_)
+
+  cleanup_dispatch_environment() {
+    rm -f -- "${dispatch_environment}"
+  }
+  cancel_remote_dispatch() {
+    if [[ -n "${dispatch_ssh_pid:-}" ]]; then
+      kill -TERM "${dispatch_ssh_pid}" >/dev/null 2>&1 || true
+      wait "${dispatch_ssh_pid}" >/dev/null 2>&1 || true
+    fi
+    cleanup_dispatch_environment
+    exit 130
+  }
+  trap cancel_remote_dispatch INT TERM HUP
+  set +e
+  ssh -- "${remote_host}" /bin/bash -s -- \
+    "${remote_repo}" "${remote_dispatch_environment}" <<'KELDRA_REMOTE_DISPATCH' &
+set -Eeuo pipefail
+remote_repo="$1"
+dispatch_environment="$2"
+cleanup_dispatch_environment() {
+  rm -f -- "${dispatch_environment}"
+}
+trap cleanup_dispatch_environment EXIT INT TERM HUP
+source "${dispatch_environment}"
+cleanup_dispatch_environment
+trap - EXIT INT TERM HUP
+export KELDRA_INDEX_CONTENTION_REMOTE_DISPATCHED=1
+cd "${remote_repo}"
+exec /bin/bash "${remote_repo}/scripts/qualify-index-contention.sh"
+KELDRA_REMOTE_DISPATCH
+  dispatch_ssh_pid=$!
+  wait "${dispatch_ssh_pid}"
+  dispatch_status=$?
+  dispatch_ssh_pid=""
+  set -e
+  trap - INT TERM HUP
+  cleanup_dispatch_environment
+  return "${dispatch_status}"
+}
+
+if ! command -v docker >/dev/null 2>&1; then
+  if [[ "${KELDRA_INDEX_CONTENTION_REMOTE_DISPATCHED:-0}" == 1 ]]; then
+    echo "docker is unavailable on remote qualification target ${remote_host}; refusing recursive dispatch" >&2
+    exit 2
+  fi
+  dispatch_to_docker_vm
+  exit $?
+fi
 
 case "${mode}" in
   smoke)

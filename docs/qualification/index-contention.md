@@ -59,6 +59,24 @@ because their revision is wrong. A missing released baseline is a hard error;
 the wrapper never manufactures baseline evidence from the current checkout. The
 wrapper is compatible with the Bash 3.2 system shell shipped by macOS.
 
+If Docker itself is unavailable, the wrapper dispatches the complete
+qualification to the Debian Docker VM over SSH. The defaults are
+`zcourts@192.168.64.3` and
+`/home/zcourts/projects/projects/keldra/keldra`; override them with
+`KELDRA_INDEX_CONTENTION_REMOTE_HOST` and
+`KELDRA_INDEX_CONTENTION_REMOTE_REPO`. The checkout is shared, so source is not
+copied. The remote invocation builds the native Rust driver, builds a missing
+Linux candidate image through the same repository entrypoint, and runs the
+Docker topology there.
+
+`KELDRA_IMAGE`, `KELDRA_DOCKER_PLATFORM`, `CARGO_BUILD_JOBS`, and every
+`KELDRA_INDEX_CONTENTION_*` setting are forwarded through a temporary mode-0600
+file in the shared releases tree. Values are shell-quoted, are not printed or
+placed in the SSH command line, and the file is removed before the remote
+workload starts. Standard output, standard error, exit status, and terminal
+cancellation flow through the foreground SSH process. A recursion guard makes a
+missing Docker installation on the target a hard error.
+
 A baseline responsiveness failure is evidence, not a reason to skip the
 candidate. The wrapper continues when the baseline's correctness and workload
 validity checks pass, records its nonzero driver exit and timeout/drop/p99
