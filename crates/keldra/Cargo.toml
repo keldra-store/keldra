@@ -78,6 +78,7 @@ uuid = { version = "1", features = ["v4"] }
 [dev-dependencies]
 keldra-storage = { package = "keldra", path = "../../clients/rust" }
 aws-sdk-s3 = "=1.18.0"
+hdrhistogram = { version = "7.5", default-features = false }
 tempfile = "3"
 
 [build-dependencies]

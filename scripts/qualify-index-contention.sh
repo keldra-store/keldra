@@ -1,0 +1,564 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+compose_file="${repo_root}/tests/cluster/docker-compose.yml"
+start_node="${repo_root}/tests/cluster/start-node.sh"
+requested_image="${KELDRA_IMAGE:?KELDRA_IMAGE must name the clean QA image}"
+baseline_image="${KELDRA_INDEX_CONTENTION_BASELINE_IMAGE:-}"
+comparison_order="${KELDRA_INDEX_CONTENTION_COMPARISON_ORDER:-baseline-first}"
+mode="${KELDRA_INDEX_CONTENTION_MODE:-smoke}"
+topology="${KELDRA_INDEX_CONTENTION_TOPOLOGY:-single}"
+keep="${KELDRA_INDEX_CONTENTION_KEEP:-0}"
+server_rust_log="${KELDRA_INDEX_CONTENTION_RUST_LOG:-info,keldra::index_runtime::cpu=warn}"
+index_disk_cache_bytes="${KELDRA_INDEX_CONTENTION_INDEX_DISK_CACHE_BYTES:-1073741824}"
+index_memory_percent="${KELDRA_INDEX_CONTENTION_INDEX_MEMORY_PERCENT:-20}"
+index_kind_budget_bytes="${KELDRA_INDEX_CONTENTION_INDEX_KIND_BUDGET_BYTES:-268435456}"
+index_compaction_lanes="${KELDRA_INDEX_CONTENTION_INDEX_COMPACTION_MAX_LANES:-4}"
+index_projection_lanes="${KELDRA_INDEX_CONTENTION_INDEX_PROJECTION_MAX_LANES:-4}"
+index_rayon_workers="${KELDRA_INDEX_CONTENTION_INDEX_RAYON_WORKERS:-4}"
+source_journal_entries="${KELDRA_INDEX_CONTENTION_SOURCE_JOURNAL_MAX_ENTRIES:-1000000}"
+max_concurrent_query_p99_ms="${KELDRA_INDEX_CONTENTION_MAX_CONCURRENT_QUERY_P99_MILLISECONDS:-2000}"
+
+case "${mode}" in
+  smoke)
+    matrix="${KELDRA_INDEX_CONTENTION_MATRIX:-1}"
+    baseline_seconds="${KELDRA_INDEX_CONTENTION_BASELINE_SECONDS:-2}"
+    concurrent_seconds="${KELDRA_INDEX_CONTENTION_CONCURRENT_SECONDS:-5}"
+    post_seconds="${KELDRA_INDEX_CONTENTION_POST_SECONDS:-2}"
+    ;;
+  sustained)
+    matrix="${KELDRA_INDEX_CONTENTION_MATRIX:-1,4,16,64}"
+    baseline_seconds="${KELDRA_INDEX_CONTENTION_BASELINE_SECONDS:-120}"
+    concurrent_seconds="${KELDRA_INDEX_CONTENTION_CONCURRENT_SECONDS:-600}"
+    post_seconds="${KELDRA_INDEX_CONTENTION_POST_SECONDS:-120}"
+    ;;
+  *) echo "KELDRA_INDEX_CONTENTION_MODE must be smoke or sustained" >&2; exit 2 ;;
+esac
+case "${topology}" in
+  single) driver_topology=single-node; durability=LOCAL ;;
+  three) driver_topology=three-node; durability=REPLICATED ;;
+  *) echo "KELDRA_INDEX_CONTENTION_TOPOLOGY must be single or three" >&2; exit 2 ;;
+esac
+case "${keep}" in 0|1) ;; *) echo "KELDRA_INDEX_CONTENTION_KEEP must be 0 or 1" >&2; exit 2 ;; esac
+for phase_seconds in "${baseline_seconds}" "${concurrent_seconds}" "${post_seconds}"; do
+  if [[ ! "${phase_seconds}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "contention phase durations must be positive decimal integers" >&2
+    exit 2
+  fi
+done
+for server_limit in "${index_disk_cache_bytes}" "${index_memory_percent}" \
+  "${index_kind_budget_bytes}" "${index_compaction_lanes}" \
+  "${index_projection_lanes}" "${index_rayon_workers}" "${source_journal_entries}"
+do
+  if [[ ! "${server_limit}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "contention server limits must be positive decimal integers" >&2
+    exit 2
+  fi
+done
+if ((index_memory_percent > 100)); then
+  echo "KELDRA_INDEX_CONTENTION_INDEX_MEMORY_PERCENT must not exceed 100" >&2
+  exit 2
+fi
+if [[ "${max_concurrent_query_p99_ms}" != disabled ]] \
+  && { [[ ! "${max_concurrent_query_p99_ms}" =~ ^[0-9]+([.][0-9]+)?$ ]] \
+    || ! awk -v value="${max_concurrent_query_p99_ms}" 'BEGIN {exit !(value > 0)}'; }
+then
+  echo "concurrent-query p99 gate must be positive milliseconds or disabled" >&2
+  exit 2
+fi
+IFS=, read -r -a builder_matrix <<<"${matrix}"
+if ((${#builder_matrix[@]} == 0)); then
+  echo "KELDRA_INDEX_CONTENTION_MATRIX must not be empty" >&2
+  exit 2
+fi
+declare -A seen_builders=()
+for builders in "${builder_matrix[@]}"; do
+  if [[ ! "${builders}" =~ ^(1|4|16|64)$ ]] || [[ -n "${seen_builders[${builders}]:-}" ]]; then
+    echo "KELDRA_INDEX_CONTENTION_MATRIX must contain unique values from 1,4,16,64" >&2
+    exit 2
+  fi
+  seen_builders["${builders}"]=1
+done
+
+for command in cargo docker git jq; do
+  command -v "${command}" >/dev/null 2>&1 || {
+    echo "${command} is required" >&2
+    exit 2
+  }
+done
+if [[ "${topology}" == three ]]; then
+  docker compose version >/dev/null
+fi
+
+source_commit="$(git -C "${repo_root}" rev-parse --verify 'HEAD^{commit}')"
+if [[ ! "${source_commit}" =~ ^[0-9a-f]{40}$ ]] \
+  || [[ -n "$(git -C "${repo_root}" status --porcelain=v1 --untracked-files=normal)" ]]
+then
+  echo "qualification requires an unchanged clean tree so its source revision is exact" >&2
+  exit 2
+fi
+candidate_image_id="$("${repo_root}/scripts/resolve-docker-image-id.sh" "${requested_image}")"
+if [[ ! "${candidate_image_id}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+  echo "qualification image did not resolve to an immutable image ID" >&2
+  exit 2
+fi
+candidate_revision="$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "${candidate_image_id}")"
+if [[ "${candidate_revision}" != "${source_commit}" ]]; then
+  echo "candidate image revision ${candidate_revision} does not match harness source ${source_commit}" >&2
+  exit 2
+fi
+platform="$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "${candidate_image_id}")"
+declare -a comparison_roles=(candidate)
+declare -A comparison_image_ids=([candidate]="${candidate_image_id}")
+declare -A comparison_image_revisions=([candidate]="${candidate_revision}")
+if [[ -n "${baseline_image}" ]]; then
+  baseline_image_id="$("${repo_root}/scripts/resolve-docker-image-id.sh" "${baseline_image}")"
+  baseline_revision="$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "${baseline_image_id}")"
+  baseline_platform="$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "${baseline_image_id}")"
+  if [[ ! "${baseline_image_id}" =~ ^sha256:[0-9a-f]{64}$ \
+    || ! "${baseline_revision}" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "baseline image requires an immutable ID and full source-revision label" >&2
+    exit 2
+  fi
+  if [[ "${baseline_platform}" != "${platform}" ]]; then
+    echo "baseline platform ${baseline_platform} differs from candidate ${platform}" >&2
+    exit 2
+  fi
+  case "${comparison_order}" in
+    baseline-first) comparison_roles=(baseline candidate) ;;
+    candidate-first) comparison_roles=(candidate baseline) ;;
+    *) echo "comparison order must be baseline-first or candidate-first" >&2; exit 2 ;;
+  esac
+  comparison_image_ids[baseline]="${baseline_image_id}"
+  comparison_image_revisions[baseline]="${baseline_revision}"
+fi
+
+cargo_target_dir="$(
+  cargo metadata --quiet --locked --no-deps --format-version 1 \
+    --manifest-path "${repo_root}/Cargo.toml" \
+    | jq -er '.target_directory | select(type == "string" and length > 0)'
+)"
+cargo build --quiet --release --locked --package keldra-server \
+  --jobs "${CARGO_BUILD_JOBS:-1}" \
+  --manifest-path "${repo_root}/Cargo.toml" \
+  --example index_contention_qualification
+driver="${cargo_target_dir}/release/examples/index_contention_qualification"
+if [[ ! -x "${driver}" ]]; then
+  echo "Cargo did not produce ${driver}" >&2
+  exit 1
+fi
+
+utc_run_stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+run_id="${utc_run_stamp}-${topology}-${source_commit:0:12}-$$"
+evidence_root="${KELDRA_INDEX_CONTENTION_EVIDENCE_ROOT:-${repo_root}/../../releases/keldra/index-contention}"
+run_dir="${evidence_root}/${run_id}"
+mkdir -p "${evidence_root}"
+mkdir "${run_dir}"
+chmod 0755 "${run_dir}"
+progress="${run_dir}/progress.jsonl"
+status_file="${run_dir}/status.json"
+: >"${progress}"
+ln -sfn "${run_id}" "${evidence_root}/latest"
+
+emit_event() {
+  local event="$1"
+  local cell="${2:-}"
+  local definition_count="${3:-0}"
+  local detail="${4:-}"
+  local event_json status_tmp
+  event_json="$(jq -cn \
+    --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg run_id "${run_id}" --arg event "${event}" --arg cell "${cell}" \
+    --arg comparison_role "${current_role:-}" \
+    --argjson definition_count "${definition_count}" --arg detail "${detail}" \
+    '{timestamp:$timestamp,run_id:$run_id,event:$event,cell:$cell,comparison_role:$comparison_role,index_definition_count:$definition_count,detail:$detail}')"
+  printf '%s\n' "${event_json}" >>"${progress}"
+  status_tmp="${status_file}.tmp.$$"
+  printf '%s\n' "${event_json}" >"${status_tmp}"
+  mv -f "${status_tmp}" "${status_file}"
+}
+
+host_memory_bytes=0
+if [[ -r /proc/meminfo ]]; then
+  host_memory_bytes="$(awk '$1 == "MemTotal:" {printf "%.0f", $2 * 1024}' /proc/meminfo)"
+elif command -v sysctl >/dev/null 2>&1; then
+  host_memory_bytes="$(sysctl -n hw.memsize 2>/dev/null || printf 0)"
+fi
+docker_cpus="$(docker info --format '{{.NCPU}}')"
+docker_memory_bytes="$(docker info --format '{{.MemTotal}}')"
+read -r filesystem_kib filesystem_available_kib < <(
+  df -Pk "${run_dir}" | awk 'NR == 2 {print $2, $4}'
+)
+images_json="$(jq -cn \
+  --arg candidate_name "${requested_image}" --arg candidate_id "${candidate_image_id}" \
+  --arg candidate_revision "${candidate_revision}" --arg platform "${platform}" \
+  --arg baseline_name "${baseline_image}" --arg baseline_id "${baseline_image_id:-}" \
+  --arg baseline_revision "${baseline_revision:-}" \
+  '{candidate:{requested:$candidate_name,id:$candidate_id,revision:$candidate_revision,platform:$platform}}
+   + if $baseline_name == "" then {} else {baseline:{requested:$baseline_name,id:$baseline_id,revision:$baseline_revision,platform:$platform}} end')"
+jq -n \
+  --arg run_id "${run_id}" --arg source_commit "${source_commit}" \
+  --argjson images "${images_json}" \
+  --arg mode "${mode}" --arg topology "${driver_topology}" --arg durability "${durability}" --arg matrix "${matrix}" \
+  --arg comparison_order "${comparison_order}" \
+  --arg server_rust_log "${server_rust_log}" \
+  --arg max_concurrent_query_p99_ms "${max_concurrent_query_p99_ms}" \
+  --argjson index_disk_cache_bytes "${index_disk_cache_bytes}" \
+  --argjson index_memory_percent "${index_memory_percent}" \
+  --argjson index_kind_budget_bytes "${index_kind_budget_bytes}" \
+  --argjson index_compaction_lanes "${index_compaction_lanes}" \
+  --argjson index_projection_lanes "${index_projection_lanes}" \
+  --argjson index_rayon_workers "${index_rayon_workers}" \
+  --argjson source_journal_entries "${source_journal_entries}" \
+  --arg uname "$(uname -a)" --argjson baseline_seconds "${baseline_seconds}" \
+  --argjson concurrent_seconds "${concurrent_seconds}" --argjson post_seconds "${post_seconds}" \
+  --argjson host_logical_cpus "$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf 0)" \
+  --argjson host_memory_bytes "${host_memory_bytes:-0}" \
+  --argjson docker_cpus "${docker_cpus}" --argjson docker_memory_bytes "${docker_memory_bytes}" \
+  --argjson filesystem_kib "${filesystem_kib}" \
+  --argjson filesystem_available_kib "${filesystem_available_kib}" \
+  '{schema_version:1,run_id:$run_id,harness_source_commit:$source_commit,images:$images,workload:{mode:$mode,topology:$topology,durability:$durability,comparison_order:$comparison_order,index_definition_count_matrix:($matrix|split(",")|map(tonumber)),baseline_seconds:$baseline_seconds,concurrent_seconds:$concurrent_seconds,post_seconds:$post_seconds,max_concurrent_query_p99_milliseconds:(if $max_concurrent_query_p99_ms == "disabled" then null else ($max_concurrent_query_p99_ms|tonumber) end)},server:{rust_log:$server_rust_log,index_disk_cache_bytes:$index_disk_cache_bytes,index_memory_percent:$index_memory_percent,index_kind_budget_bytes:$index_kind_budget_bytes,index_compaction_max_lanes:$index_compaction_lanes,index_projection_max_lanes:$index_projection_lanes,index_rayon_workers:$index_rayon_workers,source_journal_max_entries:$source_journal_entries},hardware:{uname:$uname,host_logical_cpus:$host_logical_cpus,host_memory_bytes:$host_memory_bytes,docker_logical_cpus:$docker_cpus,docker_memory_bytes:$docker_memory_bytes,evidence_filesystem_kib:$filesystem_kib,evidence_filesystem_available_kib:$filesystem_available_kib}}' \
+  >"${run_dir}/run.json"
+
+current_container=""
+current_project=""
+current_state=""
+current_cell=""
+current_builders=0
+current_image_id="${candidate_image_id}"
+current_role=""
+sampler_pid=""
+run_complete=0
+stop_sampler() {
+  if [[ -n "${sampler_pid}" ]] && kill -0 "${sampler_pid}" 2>/dev/null; then
+    kill "${sampler_pid}" >/dev/null 2>&1 || true
+    wait "${sampler_pid}" >/dev/null 2>&1 || true
+  fi
+  sampler_pid=""
+}
+cleanup_cell() {
+  stop_sampler
+  if [[ "${keep}" == 1 ]]; then
+    echo "retained ${current_project:-${current_container}} state=${current_state}" >&2
+    current_container=""
+    current_project=""
+    current_state=""
+    return
+  fi
+  if [[ -n "${current_project}" ]]; then
+    KELDRA_QUALIFICATION_PROJECT="${current_project}" \
+    KELDRA_QUALIFICATION_DIR="${current_state}" \
+    KELDRA_QUALIFICATION_START_NODE="${start_node}" \
+    KELDRA_IMAGE="${current_image_id}" \
+      docker compose --project-name "${current_project}" --file "${compose_file}" \
+        down --volumes --remove-orphans >/dev/null 2>&1 || true
+  elif [[ -n "${current_container}" ]]; then
+    docker rm --force "${current_container}" >/dev/null 2>&1 || true
+  fi
+  current_container=""
+  current_project=""
+  if [[ "${keep}" != 1 && -n "${current_state}" && "${current_state}" == /var/tmp/keldra-index-contention.* ]]; then
+    docker run --rm --user 0 --volume "${current_state}:/state" "${current_image_id}" \
+      rm -rf /state/node-1 /state/node-2 /state/node-3 /state/artifacts \
+        /state/data /state/token-signing-key >/dev/null 2>&1 || true
+    rm -rf -- "${current_state}"
+  fi
+  current_state=""
+}
+cleanup() {
+  local exit_status=$?
+  trap - EXIT INT TERM
+  if ((run_complete == 0)); then
+    emit_event failed "${current_cell}" "${current_builders}" "qualification interrupted or failed (exit ${exit_status})" || true
+    if [[ -n "${current_container}" ]]; then
+      docker logs "${current_container}" >"${run_dir}/failure-server.log" 2>&1 || true
+    elif [[ -n "${current_project}" ]]; then
+      KELDRA_QUALIFICATION_PROJECT="${current_project}" KELDRA_QUALIFICATION_DIR="${current_state}" \
+      KELDRA_QUALIFICATION_START_NODE="${start_node}" KELDRA_IMAGE="${current_image_id}" \
+        docker compose --project-name "${current_project}" --file "${compose_file}" \
+          logs --no-color >"${run_dir}/failure-server.log" 2>&1 || true
+    fi
+  fi
+  cleanup_cell
+  exit "${exit_status}"
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+wait_for_file() {
+  local container="$1" path="$2" attempt
+  for attempt in $(seq 1 90); do
+    docker exec "${container}" test -f "${path}" >/dev/null 2>&1 && return 0
+    docker inspect --format '{{.State.Running}}' "${container}" 2>/dev/null | grep -Fxq true || return 1
+    sleep 1
+  done
+  return 1
+}
+
+start_resource_sampler() {
+  local output="$1"
+  shift
+  local -a containers=("$@")
+  (
+    while true; do
+      timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      docker stats --no-stream --format '{{json .}}' "${containers[@]}" 2>/dev/null \
+        | jq -c --arg timestamp "${timestamp}" '. + {sampled_at:$timestamp}' \
+        >>"${output}" || true
+      sleep 1
+    done
+  ) &
+  sampler_pid=$!
+}
+
+emit_event run_started "" 0 "evidence=${run_dir}"
+for current_role in "${comparison_roles[@]}"; do
+current_image_id="${comparison_image_ids[${current_role}]}"
+current_image_revision="${comparison_image_revisions[${current_role}]}"
+for builders in "${builder_matrix[@]}"; do
+  cell="${current_role}-definitions-${builders}"
+  cell_dir="${run_dir}/${cell}"
+  mkdir "${cell_dir}"
+  current_cell="${cell}"
+  current_builders="${builders}"
+  current_state="$(mktemp -d /var/tmp/keldra-index-contention.XXXXXX)"
+  mkdir "${current_state}/artifacts"
+  chmod 0777 "${current_state}/artifacts"
+  head -c 64 /dev/urandom >"${current_state}/token-signing-key"
+  chmod 0600 "${current_state}/token-signing-key"
+  tenant="qcontention-${current_role:0:1}-${source_commit:0:8}-${builders}-${$}"
+  bucket="objects-${builders}"
+  client_id="contention-client-${builders}"
+  client_secret="contention-secret-${run_id}-${builders}-0000000000000000"
+  emit_event cell_start "${cell}" "${builders}" "creating fresh ${topology}-node state"
+
+  endpoints=()
+  resource_containers=()
+  if [[ "${topology}" == single ]]; then
+    mkdir "${current_state}/data"
+    docker run --rm --user 0 --volume "${current_state}:/state" "${current_image_id}" \
+      chown -R 10001:10001 /state/data /state/token-signing-key
+    current_container="keldra-contention-${run_id//[^a-zA-Z0-9_.-]/-}-${current_role}-${builders}"
+    docker run --detach --name "${current_container}" --platform "${platform}" \
+      --publish 127.0.0.1::50051 \
+      --env "RUST_LOG=${server_rust_log}" \
+      --env KELDRA_LISTEN=0.0.0.0:50051 --env KELDRA_PEER_LISTEN=127.0.0.1:50052 \
+      --env KELDRA_DATA_DIR=/var/lib/keldra --env KELDRA_NODE_ID=1 \
+      --env KELDRA_TOKEN_SIGNING_KEY_FILE=/run/secrets/keldra-token-signing-key \
+      --env KELDRA_RUN_SYSTEM_BOOTSTRAP=true \
+      --env KELDRA_RATE_LIMIT_CREDENTIAL_GLOBAL_PER_MINUTE=1000000 \
+      --env KELDRA_RATE_LIMIT_CREDENTIAL_GLOBAL_BURST=100000 \
+      --env KELDRA_RATE_LIMIT_CREDENTIAL_CLIENT_PER_MINUTE=1000000 \
+      --env KELDRA_RATE_LIMIT_CREDENTIAL_CLIENT_BURST=100000 \
+      --env "KELDRA_INDEX_DISK_CACHE_BYTES=${index_disk_cache_bytes}" \
+      --env "KELDRA_INDEX_MEMORY_PERCENT=${index_memory_percent}" \
+      --env "KELDRA_INDEX_BUILDER_MEMORY_BYTES_PER_KIND=${index_kind_budget_bytes}" \
+      --env "KELDRA_INDEX_TYPED_JSON_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
+      --env "KELDRA_INDEX_TYPED_JSON_COMPACTION_MAX_LANES=${index_compaction_lanes}" \
+      --env "KELDRA_INDEX_TYPED_JSON_PROJECTION_MAX_LANES=${index_projection_lanes}" \
+      --env "KELDRA_INDEX_RAYON_WORKERS=${index_rayon_workers}" \
+      --env "KELDRA_SOURCE_JOURNAL_MAX_ENTRIES=${source_journal_entries}" \
+      --volume "${current_state}/data:/var/lib/keldra" \
+      --volume "${current_state}/token-signing-key:/run/secrets/keldra-token-signing-key:ro" \
+      "${current_image_id}" >/dev/null
+    wait_for_file "${current_container}" /var/lib/keldra/system-bootstrap-credential.json || {
+      echo "single node did not bootstrap" >&2; exit 1;
+    }
+    provisioned=0
+    for attempt in $(seq 1 90); do
+      if KELDRA_NEW_CLIENT_SECRET="${client_secret}" \
+        docker exec --env KELDRA_NEW_CLIENT_SECRET "${current_container}" \
+          keldra --endpoint http://127.0.0.1:50051 \
+          --credentials-file /var/lib/keldra/system-bootstrap-credential.json \
+          provision-tenant "${tenant}" contention-owner "${client_id}" \
+          >/dev/null 2>&1
+      then
+        provisioned=1
+        break
+      fi
+      sleep 1
+    done
+    if ((provisioned == 0)); then
+      echo "single node did not accept tenant provisioning" >&2
+      exit 1
+    fi
+    published="$(docker port "${current_container}" 50051/tcp)"
+    [[ "${published}" =~ ^127\.0\.0\.1:[1-9][0-9]*$ ]] || { echo "invalid public endpoint ${published}" >&2; exit 1; }
+    endpoints+=("http://${published}")
+    resource_containers+=("${current_container}")
+  else
+    current_project="keldra-contention-${run_id//[^a-zA-Z0-9_.-]/-}-${current_role}-${builders}"
+    for directory in node-1 node-2 node-3; do mkdir "${current_state}/${directory}"; chmod 0777 "${current_state}/${directory}"; done
+    chmod 0755 "${current_state}"
+    docker run --rm --user 0 --volume "${current_state}/token-signing-key:/key" "${current_image_id}" chown 10001:10001 /key
+    export KELDRA_QUALIFICATION_PROJECT="${current_project}" KELDRA_QUALIFICATION_DIR="${current_state}"
+    export KELDRA_QUALIFICATION_START_NODE="${start_node}" KELDRA_IMAGE="${current_image_id}" KELDRA_DOCKER_PLATFORM="${platform}"
+    export KELDRA_QUALIFICATION_RUST_LOG="${server_rust_log}"
+    export KELDRA_QUALIFICATION_INDEX_DISK_CACHE_BYTES="${index_disk_cache_bytes}"
+    export KELDRA_QUALIFICATION_INDEX_MEMORY_PERCENT="${index_memory_percent}"
+    export KELDRA_QUALIFICATION_INDEX_KIND_BUDGET_BYTES="${index_kind_budget_bytes}"
+    export KELDRA_QUALIFICATION_INDEX_COMPACTION_MAX_LANES="${index_compaction_lanes}"
+    export KELDRA_QUALIFICATION_INDEX_PROJECTION_MAX_LANES="${index_projection_lanes}"
+    export KELDRA_QUALIFICATION_INDEX_RAYON_WORKERS="${index_rayon_workers}"
+    export KELDRA_QUALIFICATION_SOURCE_JOURNAL_MAX_ENTRIES="${source_journal_entries}"
+    compose=(docker compose --project-name "${current_project}" --file "${compose_file}")
+    "${compose[@]}" config --quiet
+    "${compose[@]}" up --detach keldra-1
+    node_one="$("${compose[@]}" ps --quiet keldra-1)"
+    wait_for_file "${node_one}" /var/lib/keldra/system-bootstrap-credential.json || { echo "node 1 did not bootstrap" >&2; exit 1; }
+    network="${current_project}_default"
+    run_bootstrap() {
+      docker run --rm --network "${network}" --volume "${current_state}:/qualification" \
+        --env KELDRA_NEW_CLIENT_SECRET "${current_image_id}" \
+        keldra --endpoint http://keldra-1:50051 \
+        --credentials-file /qualification/node-1/system-bootstrap-credential.json "$@"
+    }
+    provisioned=0
+    for attempt in $(seq 1 90); do
+      if KELDRA_NEW_CLIENT_SECRET="${client_secret}" run_bootstrap \
+        provision-tenant "${tenant}" contention-owner "${client_id}" \
+        >/dev/null 2>&1
+      then
+        provisioned=1
+        break
+      fi
+      sleep 1
+    done
+    if ((provisioned == 0)); then
+      echo "node 1 did not accept tenant provisioning" >&2
+      exit 1
+    fi
+    run_client() {
+      local node="$1"
+      shift
+      docker run --rm --network "${network}" \
+        --env "KELDRA_CLIENT_ID=${client_id}" \
+        --env "KELDRA_CLIENT_SECRET=${client_secret}" \
+        "${current_image_id}" keldra --endpoint "http://${node}:50051" "$@"
+    }
+    run_client keldra-1 create-bucket readiness >/dev/null
+    for node_id in 2 3; do
+      output="$(run_bootstrap prepare-node "${node_id}" "keldra-${node_id}:50052")"
+      bundle="$(sed -n 's/^bundle=\([^ ]*\) .*/\1/p' <<<"${output}")"
+      [[ "${bundle}" == "/var/lib/keldra/keldra-node-${node_id}.join.json" ]] || { echo "node ${node_id} returned invalid join bundle" >&2; exit 1; }
+      "${compose[@]}" cp "keldra-1:${bundle}" "${current_state}/artifacts/keldra-node-${node_id}.join.json"
+      chmod 0600 "${current_state}/artifacts/keldra-node-${node_id}.join.json"
+      docker run --rm --user 0 --volume "${current_state}/artifacts/keldra-node-${node_id}.join.json:/bundle" "${current_image_id}" chown 10001:10001 /bundle
+      "${compose[@]}" up --detach "keldra-${node_id}"
+      ready=0
+      for attempt in $(seq 1 90); do
+        if run_client "keldra-${node_id}" list "${tenant}" readiness --limit 1 \
+          >/dev/null 2>&1
+        then
+          ready=1
+          break
+        fi
+        sleep 1
+      done
+      if ((ready == 0)); then
+        echo "keldra-${node_id} did not become authenticated and ACTIVE" >&2
+        exit 1
+      fi
+    done
+    for node in keldra-1 keldra-2 keldra-3; do
+      published="$("${compose[@]}" port "${node}" 50051)"
+      [[ "${published}" =~ ^127\.0\.0\.1:[1-9][0-9]*$ ]] || { echo "${node} returned invalid endpoint ${published}" >&2; exit 1; }
+      endpoints+=("http://${published}")
+      resource_containers+=("$("${compose[@]}" ps --quiet "${node}")")
+    done
+  fi
+  endpoint_csv="$(IFS=,; echo "${endpoints[*]}")"
+  emit_event topology_ready "${cell}" "${builders}" "endpoints=${#endpoints[@]}"
+  start_resource_sampler "${cell_dir}/container-resources.jsonl" "${resource_containers[@]}"
+  ln -sfn "${cell}/driver-progress.jsonl" "${run_dir}/active-driver-progress.jsonl"
+  emit_event workload_started "${cell}" "${builders}" "progress=${cell_dir}/driver-progress.jsonl"
+  set +e
+  KELDRA_INDEX_CONTENTION_ENDPOINTS="${endpoint_csv}" \
+  KELDRA_INDEX_CONTENTION_TENANT="${tenant}" \
+  KELDRA_INDEX_CONTENTION_BUCKET="${bucket}" \
+  KELDRA_INDEX_CONTENTION_CLIENT_ID="${client_id}" \
+  KELDRA_INDEX_CONTENTION_CLIENT_SECRET="${client_secret}" \
+  KELDRA_INDEX_CONTENTION_SERVER_SOURCE_COMMIT="${current_image_revision}" \
+  KELDRA_INDEX_CONTENTION_IMAGE="${current_image_id}" \
+  KELDRA_INDEX_CONTENTION_TOPOLOGY="${driver_topology}" \
+  KELDRA_INDEX_CONTENTION_DURABILITY="${durability}" \
+  KELDRA_INDEX_CONTENTION_DEFINITION_COUNT="${builders}" \
+  KELDRA_INDEX_CONTENTION_BASELINE_SECONDS="${baseline_seconds}" \
+  KELDRA_INDEX_CONTENTION_CONCURRENT_SECONDS="${concurrent_seconds}" \
+  KELDRA_INDEX_CONTENTION_POST_SECONDS="${post_seconds}" \
+  KELDRA_INDEX_CONTENTION_MAX_CONCURRENT_QUERY_P99_MILLISECONDS="${max_concurrent_query_p99_ms}" \
+  KELDRA_INDEX_CONTENTION_OUTPUT="${cell_dir}/report.json" \
+  KELDRA_INDEX_CONTENTION_PROGRESS_JSONL="${cell_dir}/driver-progress.jsonl" \
+    "${driver}" >"${cell_dir}/driver.stdout.log" 2>"${cell_dir}/driver.stderr.log"
+  driver_status=$?
+  set -e
+  stop_sampler
+  if [[ "${topology}" == single ]]; then
+    docker logs "${current_container}" >"${cell_dir}/server.log" 2>&1 || true
+  else
+    "${compose[@]}" logs --no-color >"${cell_dir}/server.log" 2>&1 || true
+  fi
+  report_gate='.result == "pass"'
+  if [[ "${current_role}" == baseline ]]; then
+    report_gate='.correctness.passed == true and .workload_validity.passed == true'
+  fi
+  if [[ ! -s "${cell_dir}/report.json" ]] \
+    || ! jq -e "${report_gate}" "${cell_dir}/report.json" >/dev/null \
+    || [[ ! -s "${cell_dir}/container-resources.jsonl" ]] \
+    || ! jq -e . "${cell_dir}/container-resources.jsonl" >/dev/null; then
+    emit_event cell_failed "${cell}" "${builders}" "driver_exit=${driver_status}"
+    echo "contention cell ${cell} failed (driver exit ${driver_status}); evidence retained in ${cell_dir}" >&2
+    exit 1
+  fi
+  if [[ "${current_role}" == baseline && "${driver_status}" != 0 ]]; then
+    emit_event baseline_performance_failed "${cell}" "${builders}" \
+      "correctness and workload valid; responsiveness failure retained for comparison"
+  else
+    emit_event cell_passed "${cell}" "${builders}" "report=${cell_dir}/report.json"
+  fi
+  cleanup_cell
+done
+done
+if [[ -n "${baseline_image}" ]]; then
+  comparison_rows="${run_dir}/comparison-rows.jsonl"
+  : >"${comparison_rows}"
+  for builders in "${builder_matrix[@]}"; do
+    jq -cn \
+      --argjson definition_count "${builders}" \
+      --slurpfile before "${run_dir}/baseline-definitions-${builders}/report.json" \
+      --slurpfile after "${run_dir}/candidate-definitions-${builders}/report.json" '
+      def latency($report; $path):
+        ($report | getpath($path)) | {samples,p50_ms,p95_ms,p99_ms,max_ms};
+      def delta($after; $before):
+        if $after.samples > 0 and $before.samples > 0 then
+          {p50_ms:($after.p50_ms-$before.p50_ms),
+           p95_ms:($after.p95_ms-$before.p95_ms),
+           p99_ms:($after.p99_ms-$before.p99_ms),
+           max_ms:($after.max_ms-$before.max_ms)}
+        else null end;
+      (latency($before[0];["concurrent","schedule_to_response"])) as $before_query |
+      (latency($after[0];["concurrent","schedule_to_response"])) as $after_query |
+      (latency($before[0];["concurrent","dispatch_to_response"])) as $before_service |
+      (latency($after[0];["concurrent","dispatch_to_response"])) as $after_service |
+      (latency($before[0];["mutations","publication_visibility_lag"])) as $before_visible |
+      (latency($after[0];["mutations","publication_visibility_lag"])) as $after_visible |
+      {index_definition_count:$definition_count,
+       outcomes:{baseline:{result:$before[0].result,responsiveness:$before[0].responsiveness,concurrent:{offered:$before[0].concurrent.offered_schedules,completed:$before[0].concurrent.completed,dropped:$before[0].concurrent.dropped_schedules,request_errors:$before[0].concurrent.request_errors,timeouts:$before[0].concurrent.timeouts}},candidate:{result:$after[0].result,responsiveness:$after[0].responsiveness,concurrent:{offered:$after[0].concurrent.offered_schedules,completed:$after[0].concurrent.completed,dropped:$after[0].concurrent.dropped_schedules,request_errors:$after[0].concurrent.request_errors,timeouts:$after[0].concurrent.timeouts}}},
+       query_concurrent:{baseline:$before_query,candidate:$after_query,delta_candidate_minus_baseline:(delta($after_query;$before_query))},
+       query_service_concurrent:{baseline:$before_service,candidate:$after_service,delta_candidate_minus_baseline:(delta($after_service;$before_service))},
+       publication_visibility_lag:{definition:"mutation acceptance to first ordinary-query observation of exact version",baseline:$before_visible,candidate:$after_visible,delta_candidate_minus_baseline:(delta($after_visible;$before_visible))}}
+    ' >>"${comparison_rows}"
+  done
+  jq -s '{schema:"keldra.index-contention-comparison.v1",cells:.}' \
+    "${comparison_rows}" >"${run_dir}/comparison.json"
+  rm -f -- "${comparison_rows}"
+fi
+run_complete=1
+if [[ -n "${baseline_image}" ]]; then
+  emit_event run_qualified "" 0 \
+    "candidate matrix passed; baseline correctness/workload valid and responsiveness retained as comparison evidence"
+else
+  emit_event run_passed "" 0 "candidate matrix passed"
+fi
+echo "index contention qualification passed; evidence=${run_dir}"
