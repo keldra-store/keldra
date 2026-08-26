@@ -195,7 +195,7 @@ impl Store {
             });
         }
 
-        let _commit_guard = self.commit_lock.lock().await;
+        let _commit_guard = self.lock_commit("reference_proof").await;
         let column = self.cf(CF_LOCAL_INVALIDATIONS).map_err(prune_storage)?;
         let prefix = reference_proof_source_prefix(source);
         let first = reference_proof_key(source, 1);
@@ -290,7 +290,7 @@ impl Store {
         proof: &ReferenceProof,
     ) -> Result<bool, MutationError> {
         validate_stored_proof(proof).map_err(MutationError::InvalidObjectMutation)?;
-        let _guard = self.commit_lock.lock().await;
+        let _guard = self.lock_commit("reference_proof").await;
         if let Some(existing) = self.read_reference_proof(proof.source_id, proof.offset())? {
             if existing == *proof {
                 return Ok(true);
@@ -345,7 +345,7 @@ impl Store {
         expected: &ReferenceProof,
     ) -> Result<bool, MutationError> {
         validate_stored_proof(expected).map_err(MutationError::InvalidObjectMutation)?;
-        let _commit_guard = self.commit_lock.lock().await;
+        let _commit_guard = self.lock_commit("reference_proof").await;
         let Some(actual) = self.read_reference_proof(expected.source_id, expected.offset())? else {
             return Ok(false);
         };

@@ -237,9 +237,8 @@ impl Store {
                 )
                 .await;
             let path_lock_wait = path_lock_started.elapsed();
-            let commit_lock_started = std::time::Instant::now();
-            let _commit_guard = self.commit_lock.lock().await;
-            let commit_lock_wait = commit_lock_started.elapsed();
+            let _commit_guard = self.lock_commit("bulk_mutation").await;
+            let commit_lock_wait = _commit_guard.wait_duration();
             let lock_duration = lock_started.elapsed();
             let mut batch = WriteBatch::default();
             let now = match now_unix_millis() {
@@ -661,7 +660,7 @@ impl Store {
             .ordinary_locks
             .acquire(&[object_path(prepared.key())])
             .await;
-        let _commit_guard = self.commit_lock.lock().await;
+        let _commit_guard = self.lock_commit("coordinated_object_mutation").await;
         let source = self
             .local_watch_status()
             .map_err(|error| MutationError::Storage(error.to_string()))?;
@@ -777,7 +776,7 @@ impl Store {
         let encoded_version_key =
             exact_version_key(identity, &mutation.exact_path, mutation.version.id);
         let primary_receipt_key = receipt_key(identity, &mutation.command_id);
-        let _commit_guard = self.commit_lock.lock().await;
+        let _commit_guard = self.lock_commit("object_mutation_replica").await;
         let now = now_unix_millis()?;
 
         let retained_identical_receipt = if let Some(existing) =
@@ -1404,7 +1403,7 @@ impl Store {
     /// guarantees progress even when that mutation's WriteBatch must be
     /// discarded atomically.
     pub(super) async fn prune_expired_receipts_for_capacity(&self) -> Result<bool, MutationError> {
-        let _commit_guard = self.commit_lock.lock().await;
+        let _commit_guard = self.lock_commit("receipt_pruning").await;
         let now = now_unix_millis()?;
         let mut status = self.mutation_receipt_status()?;
         let initial = status;

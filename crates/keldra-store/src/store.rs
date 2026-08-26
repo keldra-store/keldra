@@ -1249,7 +1249,7 @@ impl Store {
         // Enabling version retention and an ordinary/program commit must have
         // one order. Once this write returns, no mutation may still commit
         // using the old unversioned replacement rule.
-        let _commit_guard = self.commit_lock.lock().await;
+        let _commit_guard = self.lock_commit("store_metadata").await;
         let _guard = self
             .bucket_options_lock
             .lock()
@@ -1351,6 +1351,8 @@ impl MetadataRuntimeMetrics {
 
 mod authz_journal;
 mod blob_references;
+mod commit_lock;
+pub(crate) use commit_lock::{CommitLockGuard, OwnedCommitLockGuard};
 pub(crate) mod definition_state;
 mod delete_version;
 mod derived_consumers;

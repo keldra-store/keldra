@@ -32,7 +32,7 @@ impl Store {
     /// This deliberately cannot share the rejected mutation's RocksDB batch:
     /// publication debt must be fully repaid before an ordinary append begins.
     pub(super) async fn prune_source_journal_for_capacity(&self) -> Result<bool, MutationError> {
-        let _commit_guard = self.commit_lock.lock().await;
+        let _commit_guard = self.lock_commit("journal_capacity").await;
         let before = self
             .local_watch_status()
             .map_err(|error| MutationError::Storage(error.to_string()))?;

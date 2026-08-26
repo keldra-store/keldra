@@ -200,7 +200,7 @@ impl Store {
     pub async fn get(&self, key: &ObjectKey) -> Result<Option<Object>, MutationError> {
         let identity = self.resolve_bucket_identity(key.tenant(), key.bucket())?;
         let selected = {
-            let _commit_guard = self.commit_lock.lock().await;
+            let _commit_guard = self.lock_commit("object_read").await;
             let Some(head) = self.head_by_storage_key(&identity.head_key(key.path()))? else {
                 return Ok(None);
             };
@@ -230,7 +230,7 @@ impl Store {
             return Err(MutationError::ObjectVersioningNotEnabled);
         }
         let selected = {
-            let _commit_guard = self.commit_lock.lock().await;
+            let _commit_guard = self.lock_commit("object_read").await;
             let selected = self.user_retained_version(identity, key, version_id)?;
             if let Some(version) = &selected {
                 validate_selected_version_id(version_id, version)?;
@@ -318,7 +318,7 @@ impl Store {
         key: &ObjectKey,
     ) -> Result<Option<Version>, MutationError> {
         let identity = self.resolve_bucket_identity(key.tenant(), key.bucket())?;
-        let _commit_guard = self.commit_lock.lock().await;
+        let _commit_guard = self.lock_commit("object_read").await;
         let Some(head) = self.head_by_storage_key(&identity.head_key(key.path()))? else {
             return Ok(None);
         };
@@ -343,7 +343,7 @@ impl Store {
             return Err(MutationError::ObjectVersioningNotEnabled);
         }
         let version = {
-            let _commit_guard = self.commit_lock.lock().await;
+            let _commit_guard = self.lock_commit("object_read").await;
             let (version_id, selected_head) = match requested_version {
                 Some(version) => (version, None),
                 None => match self.head_by_storage_key(&identity.head_key(key.path()))? {
@@ -446,7 +446,7 @@ impl Store {
         }
         let _policy_guard = self.policy_gate.read().await;
         let _path_guard = self.ordinary_locks.acquire(&[object_path(key)]).await;
-        let _commit_guard = self.commit_lock.lock().await;
+        let _commit_guard = self.lock_commit("object_read").await;
         let policy = self
             .bucket_policy_by_key(&identity.encode())?
             .unwrap_or_default();
@@ -586,7 +586,7 @@ impl Store {
         &self,
         requests: &[(ObjectKey, Option<VersionId>)],
     ) -> BatchGetSelection {
-        let commit_guard = self.commit_lock.lock().await;
+        let commit_guard = self.lock_commit("object_read").await;
         let entries = {
             let snapshot = self.db.snapshot();
             let mut identity_cache =

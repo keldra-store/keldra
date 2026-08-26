@@ -600,7 +600,7 @@ impl Store {
         &self,
         mutation: &LogicalRecordMutation,
     ) -> Result<LogicalRecordApplied, LogicalRecordError> {
-        let _commit_guard = self.commit_lock.lock().await;
+        let _commit_guard = self.lock_commit("logical_record").await;
         let applied = self.apply_logical_record_mutation(mutation, true)?;
         if !applied.replayed {
             self.notify_local_invalidations();

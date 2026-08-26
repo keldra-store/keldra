@@ -33,7 +33,7 @@ impl Store {
                 request.schema_id.as_str(),
             ),
         )?;
-        let _commit_guard = self.commit_lock.lock().await;
+        let _commit_guard = self.lock_commit("authorization_journal").await;
         let source = self.authz_source()?;
         let position = next_position(source.tail)?;
         let repository = self.authz();
@@ -85,7 +85,7 @@ impl Store {
         let mut aggregate_key = Vec::with_capacity(8 + scope_key.len());
         aggregate_key.extend_from_slice(&stable_tenant_id.to_be_bytes());
         aggregate_key.extend_from_slice(&scope_key);
-        let _commit_guard = self.commit_lock.lock().await;
+        let _commit_guard = self.lock_commit("authorization_journal").await;
         let source = self.authz_source()?;
         let position = next_position(source.tail)?;
         let repository = self.authz();
@@ -143,7 +143,7 @@ impl Store {
         })?;
         let scope_key = request.scope.handoff_order_key()?;
 
-        let _commit_guard = self.commit_lock.lock().await;
+        let _commit_guard = self.lock_commit("authorization_journal").await;
         let source = self
             .local_watch_status()
             .map_err(|error| AuthzStoreError::Storage(error.to_string()))?;

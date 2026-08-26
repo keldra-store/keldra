@@ -269,7 +269,7 @@ impl Store {
         now_unix_millis: u64,
     ) -> Result<bool, MutationError> {
         let quarantined = {
-            let _commit_guard = self.commit_lock.lock().await;
+            let _commit_guard = self.lock_commit("blob_reference").await;
             let Some(current) = self.read_blob_reference_state(&due.identity)? else {
                 self.delete_stale_blob_gc_due(&due.due_key)?;
                 return Ok(false);
@@ -498,7 +498,7 @@ impl Store {
         now_unix_millis: u64,
     ) -> Result<bool, MutationError> {
         if let Some(artifact) = staged_artifact_from_path(path)? {
-            let _commit_guard = self.commit_lock.lock().await;
+            let _commit_guard = self.lock_commit("blob_reference").await;
             if self
                 .read_blob_reference_state(&artifact.lifecycle_key())?
                 .is_some()
@@ -544,7 +544,7 @@ impl Store {
             remove_file_and_sync_parent(path)?;
             return Ok(true);
         };
-        let _commit_guard = self.commit_lock.lock().await;
+        let _commit_guard = self.lock_commit("blob_reference").await;
         if self
             .read_blob_reference_state(&artifact.lifecycle_key())?
             .is_none()
@@ -688,7 +688,7 @@ impl Store {
         admission: SourceJournalAdmission,
     ) -> Result<(), MutationError> {
         loop {
-            let guard = self.commit_lock.lock().await;
+            let guard = self.lock_commit("blob_reference").await;
             let result =
                 self.reserve_sealed_blob_with_admission(reference, now_unix_millis, admission);
             drop(guard);
@@ -711,7 +711,7 @@ impl Store {
         admission: SourceJournalAdmission,
     ) -> Result<(), MutationError> {
         loop {
-            let guard = self.commit_lock.lock().await;
+            let guard = self.lock_commit("blob_reference").await;
             let result = self.persist_small_blob_seal(reference, bytes, now_unix_millis, admission);
             drop(guard);
             match result {

@@ -487,7 +487,7 @@ impl Store {
         record: &ObjectRecordExport,
     ) -> Result<ObjectSnapshotApplied, ObjectSnapshotError> {
         record.validate()?;
-        let _guard = self.commit_lock.lock().await;
+        let _guard = self.lock_commit("object_snapshot").await;
         match record {
             ObjectRecordExport::ExactPath(record) => self.install_path_snapshot(record),
             ObjectRecordExport::Receipt(mutation) => self.install_receipt_snapshot(mutation),
@@ -519,7 +519,7 @@ impl Store {
             validate_snapshot_request(snapshot, tenant_id, bucket_id, exact_path)?;
         }
 
-        let _guard = self.commit_lock.lock().await;
+        let _guard = self.lock_commit("object_snapshot").await;
         let identity = stable_identity(tenant_id, bucket_id);
         let head_key = identity.head_key(exact_path);
         let current = self.current_path_snapshot(&head_key)?;

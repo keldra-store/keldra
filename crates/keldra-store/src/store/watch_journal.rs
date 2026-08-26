@@ -11,7 +11,7 @@ impl Store {
         &self,
         offset: u64,
     ) -> Result<(), MutationError> {
-        let _commit_guard = self.commit_lock.lock().await;
+        let _commit_guard = self.lock_commit("watch_journal").await;
         let status = self
             .local_watch_status()
             .map_err(|error| MutationError::Storage(error.to_string()))?;
@@ -43,7 +43,7 @@ impl Store {
         &self,
         offset: u64,
     ) -> Result<(), MutationError> {
-        let _commit_guard = self.commit_lock.lock().await;
+        let _commit_guard = self.lock_commit("watch_journal").await;
         let status = self
             .local_watch_status()
             .map_err(|error| MutationError::Storage(error.to_string()))?;
@@ -101,7 +101,7 @@ impl Store {
         if offsets.is_empty() {
             return Ok(None);
         }
-        let _commit_guard = self.commit_lock.lock().await;
+        let _commit_guard = self.lock_commit("watch_journal").await;
         let status = self
             .local_watch_status()
             .map_err(|error| MutationError::Storage(error.to_string()))?;
@@ -200,7 +200,7 @@ impl Store {
     /// snapshot worker captures its RocksDB snapshot.
     pub(crate) async fn lock_settled_source_snapshot(
         &self,
-    ) -> Result<tokio::sync::OwnedMutexGuard<()>, WatchError> {
+    ) -> Result<OwnedCommitLockGuard, WatchError> {
         loop {
             let mut notifications = self.watch_notify.subscribe();
             let status = self.local_watch_status()?;
@@ -210,7 +210,7 @@ impl Store {
                 })?;
                 continue;
             }
-            let guard = self.commit_lock.clone().lock_owned().await;
+            let guard = self.lock_commit_owned("settled_source_snapshot").await;
             let status = self.local_watch_status()?;
             if status.settled_through == status.tail {
                 return Ok(guard);
@@ -355,7 +355,7 @@ impl Store {
         cursor: WatchCursor,
         limit: usize,
     ) -> Result<WatchPage, WatchError> {
-        let _commit_guard = self.commit_lock.lock().await;
+        let _commit_guard = self.lock_commit("watch_journal").await;
         let scope_identity = self.watch_scope_identity(scope)?;
         let status = self.local_watch_status()?;
         if cursor.offset() < status.retention_floor || cursor.offset() > status.settled_through {

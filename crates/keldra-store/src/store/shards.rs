@@ -245,7 +245,7 @@ impl Store {
         // The awaiting lifecycle and its due entry become durable while the
         // validated bytes are still recoverably named under `.staging`.
         loop {
-            let commit_guard = self.commit_lock.lock().await;
+            let commit_guard = self.lock_commit("shard_state").await;
             if !temporary.is_file() && !final_path.is_file() {
                 return Err(ShardStoreError::NotFound);
             }
@@ -366,7 +366,7 @@ impl Store {
     /// byte-plane primitive deliberately has no cluster policy.
     pub async fn remove_shard(&self, identity: &ShardIdentity) -> Result<bool, ShardStoreError> {
         let (had_state, quarantined) = {
-            let _commit_guard = self.commit_lock.lock().await;
+            let _commit_guard = self.lock_commit("shard_state").await;
             let key = identity.encode();
             let state = self.read_blob_reference_state(&key).map_err(shard_error)?;
             let had_state = state.is_some();
@@ -563,7 +563,7 @@ mod tests {
         validate_shard_file(&codec, &identity, &path).unwrap();
         let now = now_unix_millis().unwrap();
         {
-            let _guard = store.commit_lock.lock().await;
+            let _guard = store.lock_commit("shard_state").await;
             store
                 .reserve_sealed_artifact(&identity.encode(), now)
                 .unwrap();

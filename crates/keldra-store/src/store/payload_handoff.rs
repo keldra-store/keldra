@@ -201,7 +201,7 @@ impl Store {
             }
         }
 
-        let _guard = self.commit_lock.lock().await;
+        let _guard = self.lock_commit("payload_handoff").await;
         let key = artifact.identity.key();
         let present = match &artifact.identity {
             PayloadArtifactIdentity::Complete(reference) if is_small_blob(reference) => self
@@ -294,7 +294,7 @@ impl Store {
         F: FnOnce() -> bool,
     {
         expected.validate()?;
-        let _guard = self.commit_lock.lock().await;
+        let _guard = self.lock_commit("payload_handoff").await;
         let key = expected.identity.key();
         let Some(encoded) = self
             .db
