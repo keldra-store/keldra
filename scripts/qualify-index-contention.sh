@@ -72,13 +72,19 @@ if ((${#builder_matrix[@]} == 0)); then
   echo "KELDRA_INDEX_CONTENTION_MATRIX must not be empty" >&2
   exit 2
 fi
-declare -A seen_builders=()
+seen_builder_values=,
 for builders in "${builder_matrix[@]}"; do
-  if [[ ! "${builders}" =~ ^(1|4|16|64)$ ]] || [[ -n "${seen_builders[${builders}]:-}" ]]; then
+  if [[ ! "${builders}" =~ ^(1|4|16|64)$ ]]; then
     echo "KELDRA_INDEX_CONTENTION_MATRIX must contain unique values from 1,4,16,64" >&2
     exit 2
   fi
-  seen_builders["${builders}"]=1
+  case "${seen_builder_values}" in
+    *,"${builders}",*)
+      echo "KELDRA_INDEX_CONTENTION_MATRIX must contain unique values from 1,4,16,64" >&2
+      exit 2
+      ;;
+  esac
+  seen_builder_values="${seen_builder_values}${builders},"
 done
 
 for command in cargo docker git jq; do
@@ -98,7 +104,30 @@ then
   echo "qualification requires an unchanged clean tree so its source revision is exact" >&2
   exit 2
 fi
-candidate_image_id="$("${repo_root}/scripts/resolve-docker-image-id.sh" "${requested_image}")"
+if ! candidate_image_id="$(
+  "${repo_root}/scripts/resolve-docker-image-id.sh" "${requested_image}" 2>/dev/null
+)"; then
+  case "${KELDRA_DOCKER_PLATFORM:-}" in
+    linux/arm64|linux/amd64) auto_build_platform="${KELDRA_DOCKER_PLATFORM}" ;;
+    "")
+      case "$(uname -m)" in
+        arm64|aarch64) auto_build_platform=linux/arm64 ;;
+        x86_64|amd64) auto_build_platform=linux/amd64 ;;
+        *) echo "cannot auto-build an image for host architecture $(uname -m)" >&2; exit 2 ;;
+      esac
+      ;;
+    *) echo "unsupported KELDRA_DOCKER_PLATFORM=${KELDRA_DOCKER_PLATFORM}" >&2; exit 2 ;;
+  esac
+  echo "candidate image ${requested_image} is absent; building ${auto_build_platform} through scripts/build-image.sh"
+  (
+    cd "${repo_root}"
+    KELDRA_IMAGE="${requested_image}" KELDRA_DOCKER_PLATFORM="${auto_build_platform}" \
+      "${repo_root}/scripts/build-image.sh"
+  )
+  candidate_image_id="$(
+    "${repo_root}/scripts/resolve-docker-image-id.sh" "${requested_image}"
+  )"
+fi
 if [[ ! "${candidate_image_id}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
   echo "qualification image did not resolve to an immutable image ID" >&2
   exit 2
@@ -110,10 +139,13 @@ if [[ "${candidate_revision}" != "${source_commit}" ]]; then
 fi
 platform="$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "${candidate_image_id}")"
 declare -a comparison_roles=(candidate)
-declare -A comparison_image_ids=([candidate]="${candidate_image_id}")
-declare -A comparison_image_revisions=([candidate]="${candidate_revision}")
 if [[ -n "${baseline_image}" ]]; then
-  baseline_image_id="$("${repo_root}/scripts/resolve-docker-image-id.sh" "${baseline_image}")"
+  if ! baseline_image_id="$(
+    "${repo_root}/scripts/resolve-docker-image-id.sh" "${baseline_image}" 2>/dev/null
+  )"; then
+    echo "baseline image ${baseline_image} is absent; released baselines are never auto-built" >&2
+    exit 2
+  fi
   baseline_revision="$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "${baseline_image_id}")"
   baseline_platform="$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "${baseline_image_id}")"
   if [[ ! "${baseline_image_id}" =~ ^sha256:[0-9a-f]{64}$ \
@@ -130,9 +162,23 @@ if [[ -n "${baseline_image}" ]]; then
     candidate-first) comparison_roles=(candidate baseline) ;;
     *) echo "comparison order must be baseline-first or candidate-first" >&2; exit 2 ;;
   esac
-  comparison_image_ids[baseline]="${baseline_image_id}"
-  comparison_image_revisions[baseline]="${baseline_revision}"
 fi
+
+image_id_for_role() {
+  case "$1" in
+    candidate) printf '%s\n' "${candidate_image_id}" ;;
+    baseline) printf '%s\n' "${baseline_image_id:?baseline role requires an image}" ;;
+    *) echo "unknown comparison role $1" >&2; return 2 ;;
+  esac
+}
+
+image_revision_for_role() {
+  case "$1" in
+    candidate) printf '%s\n' "${candidate_revision}" ;;
+    baseline) printf '%s\n' "${baseline_revision:?baseline role requires a revision}" ;;
+    *) echo "unknown comparison role $1" >&2; return 2 ;;
+  esac
+}
 
 cargo_target_dir="$(
   cargo metadata --quiet --locked --no-deps --format-version 1 \
@@ -288,10 +334,12 @@ trap 'exit 130' INT TERM
 
 wait_for_file() {
   local container="$1" path="$2" attempt
-  for attempt in $(seq 1 90); do
+  attempt=1
+  while ((attempt <= 90)); do
     docker exec "${container}" test -f "${path}" >/dev/null 2>&1 && return 0
     docker inspect --format '{{.State.Running}}' "${container}" 2>/dev/null | grep -Fxq true || return 1
     sleep 1
+    attempt=$((attempt + 1))
   done
   return 1
 }
@@ -314,8 +362,8 @@ start_resource_sampler() {
 
 emit_event run_started "" 0 "evidence=${run_dir}"
 for current_role in "${comparison_roles[@]}"; do
-current_image_id="${comparison_image_ids[${current_role}]}"
-current_image_revision="${comparison_image_revisions[${current_role}]}"
+current_image_id="$(image_id_for_role "${current_role}")"
+current_image_revision="$(image_revision_for_role "${current_role}")"
 for builders in "${builder_matrix[@]}"; do
   cell="${current_role}-definitions-${builders}"
   cell_dir="${run_dir}/${cell}"
@@ -325,7 +373,8 @@ for builders in "${builder_matrix[@]}"; do
   current_state="$(mktemp -d /var/tmp/keldra-index-contention.XXXXXX)"
   mkdir "${current_state}/artifacts"
   chmod 0777 "${current_state}/artifacts"
-  head -c 64 /dev/urandom >"${current_state}/token-signing-key"
+  dd if=/dev/urandom of="${current_state}/token-signing-key" \
+    bs=64 count=1 2>/dev/null
   chmod 0600 "${current_state}/token-signing-key"
   tenant="qcontention-${current_role:0:1}-${source_commit:0:8}-${builders}-${$}"
   bucket="objects-${builders}"
@@ -366,7 +415,8 @@ for builders in "${builder_matrix[@]}"; do
       echo "single node did not bootstrap" >&2; exit 1;
     }
     provisioned=0
-    for attempt in $(seq 1 90); do
+    attempt=1
+    while ((attempt <= 90)); do
       if KELDRA_NEW_CLIENT_SECRET="${client_secret}" \
         docker exec --env KELDRA_NEW_CLIENT_SECRET "${current_container}" \
           keldra --endpoint http://127.0.0.1:50051 \
@@ -378,6 +428,7 @@ for builders in "${builder_matrix[@]}"; do
         break
       fi
       sleep 1
+      attempt=$((attempt + 1))
     done
     if ((provisioned == 0)); then
       echo "single node did not accept tenant provisioning" >&2
@@ -415,7 +466,8 @@ for builders in "${builder_matrix[@]}"; do
         --credentials-file /qualification/node-1/system-bootstrap-credential.json "$@"
     }
     provisioned=0
-    for attempt in $(seq 1 90); do
+    attempt=1
+    while ((attempt <= 90)); do
       if KELDRA_NEW_CLIENT_SECRET="${client_secret}" run_bootstrap \
         provision-tenant "${tenant}" contention-owner "${client_id}" \
         >/dev/null 2>&1
@@ -424,6 +476,7 @@ for builders in "${builder_matrix[@]}"; do
         break
       fi
       sleep 1
+      attempt=$((attempt + 1))
     done
     if ((provisioned == 0)); then
       echo "node 1 did not accept tenant provisioning" >&2
@@ -447,7 +500,8 @@ for builders in "${builder_matrix[@]}"; do
       docker run --rm --user 0 --volume "${current_state}/artifacts/keldra-node-${node_id}.join.json:/bundle" "${current_image_id}" chown 10001:10001 /bundle
       "${compose[@]}" up --detach "keldra-${node_id}"
       ready=0
-      for attempt in $(seq 1 90); do
+      attempt=1
+      while ((attempt <= 90)); do
         if run_client "keldra-${node_id}" list "${tenant}" readiness --limit 1 \
           >/dev/null 2>&1
         then
@@ -455,6 +509,7 @@ for builders in "${builder_matrix[@]}"; do
           break
         fi
         sleep 1
+        attempt=$((attempt + 1))
       done
       if ((ready == 0)); then
         echo "keldra-${node_id} did not become authenticated and ACTIVE" >&2

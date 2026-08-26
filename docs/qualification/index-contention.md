@@ -50,6 +50,15 @@ the qualification. A baseline may have another revision, but must carry a full
 revision label. The wrapper resolves both to immutable IDs and records the
 harness commit separately from both server revisions.
 
+If the candidate tag named by `KELDRA_IMAGE` is absent locally, the wrapper runs
+the repository's `scripts/build-image.sh` entrypoint before qualification. It
+selects `linux/arm64` on an Apple or Linux ARM64 host and `linux/amd64` on a
+supported x86-64 host, unless `KELDRA_DOCKER_PLATFORM` explicitly selects one of
+those platforms. Existing candidate images are never silently rebuilt merely
+because their revision is wrong. A missing released baseline is a hard error;
+the wrapper never manufactures baseline evidence from the current checkout. The
+wrapper is compatible with the Bash 3.2 system shell shipped by macOS.
+
 A baseline responsiveness failure is evidence, not a reason to skip the
 candidate. The wrapper continues when the baseline's correctness and workload
 validity checks pass, records its nonzero driver exit and timeout/drop/p99
