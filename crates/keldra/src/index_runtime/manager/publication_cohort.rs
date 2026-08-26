@@ -737,6 +737,8 @@ async fn run_queue<I, K, P, O, E, A, Acquire, AcquireFuture, F, Fut>(
         let Some(mut first) = next_live(&mut pending, &mut receiver).await else {
             break;
         };
+        let original_deadline =
+            tokio::time::Instant::from_std(first.queued_at + bounds.max_collection_delay);
         let admission = match tokio::select! {
             result = acquire(class) => Some(result),
             _ = first.completion.closed() => None,
@@ -753,14 +755,22 @@ async fn run_queue<I, K, P, O, E, A, Acquire, AcquireFuture, F, Fut>(
                 }
             },
         };
+        let admitted_at = tokio::time::Instant::now();
         if first.completion.is_closed() {
             drop(admission);
             record_cancelled(stage, class);
             continue;
         }
         let cohort = first.cohort.clone();
-        let deadline =
-            tokio::time::Instant::from_std(first.queued_at + bounds.max_collection_delay);
+        // A candidate that spent its original collection epoch waiting for a
+        // physical lane would otherwise freeze the cohort immediately upon
+        // admission. Give only that saturated path one fresh, bounded spill
+        // window; an immediately admitted candidate keeps its original epoch.
+        let deadline = if admitted_at >= original_deadline {
+            admitted_at + bounds.max_collection_delay
+        } else {
+            original_deadline
+        };
         let mut items = first.logical_items;
         let mut bytes = first.logical_bytes;
         let mut batch = vec![first];
@@ -1051,6 +1061,10 @@ fn record_batch(
         "index publication physical cohort dispatched"
     );
 }
+
+#[cfg(test)]
+#[path = "publication_cohort_spill_tests.rs"]
+mod spill_tests;
 
 #[cfg(test)]
 mod tests {
