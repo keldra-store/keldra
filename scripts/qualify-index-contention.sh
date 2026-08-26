@@ -289,6 +289,9 @@ run_native_qualification() {
     provisioned=0
     attempt=1
     while ((attempt <= 90)); do
+      kill -0 "${native_server_pid}" 2>/dev/null || {
+        echo "native Keldra server exited during tenant provisioning" >&2; exit 1;
+      }
       if KELDRA_NEW_CLIENT_SECRET="${native_secret}" "${native_cli}" \
         --endpoint "${native_endpoint}" \
         --credentials-file "${native_state}/data/system-bootstrap-credential.json" \
