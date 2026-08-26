@@ -28,7 +28,7 @@ use super::support::event_status;
 
 const MAX_COLLECTION_DELAY: Duration = Duration::from_millis(5);
 const MAX_QUEUED_CANDIDATES: usize = 256;
-const MAX_INCREMENTAL_PHYSICAL_BATCHES: usize = 2;
+const MAX_INCREMENTAL_PHYSICAL_BATCHES: usize = 1;
 const MAX_MAINTENANCE_PHYSICAL_BATCHES: usize = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -739,6 +739,7 @@ async fn run_queue<I, K, P, O, E, A, Acquire, AcquireFuture, F, Fut>(
         };
         let original_deadline =
             tokio::time::Instant::from_std(first.queued_at + bounds.max_collection_delay);
+        let slot_wait_started = Instant::now();
         let admission = match tokio::select! {
             result = acquire(class) => Some(result),
             _ = first.completion.closed() => None,
@@ -756,6 +757,7 @@ async fn run_queue<I, K, P, O, E, A, Acquire, AcquireFuture, F, Fut>(
             },
         };
         let admitted_at = tokio::time::Instant::now();
+        let slot_wait = slot_wait_started.elapsed();
         if first.completion.is_closed() {
             drop(admission);
             record_cancelled(stage, class);
@@ -852,16 +854,26 @@ async fn run_queue<I, K, P, O, E, A, Acquire, AcquireFuture, F, Fut>(
             .map(|candidate| candidate.queued_at.elapsed())
             .max()
             .unwrap_or_default();
-        record_batch(stage, class, bounds, candidates, items, bytes, oldest_wait);
+        record_batch(
+            stage,
+            class,
+            bounds,
+            candidates,
+            items,
+            bytes,
+            oldest_wait,
+            slot_wait,
+        );
         let dispatch = dispatch.clone();
         inflight.spawn(async move {
-            dispatch_batch(class, cohort, batch, admission, dispatch).await;
+            dispatch_batch(stage, class, cohort, batch, admission, dispatch).await;
         });
     }
     while inflight.join_next().await.is_some() {}
 }
 
 async fn dispatch_batch<I, K, P, O, E, A, F, Fut>(
+    stage: &'static str,
     class: PublicationCohortClass,
     cohort: K,
     batch: Vec<QueuedCandidate<I, K, P, O, E>>,
@@ -872,13 +884,23 @@ async fn dispatch_batch<I, K, P, O, E, A, F, Fut>(
     F: Fn(PublicationCohortClass, K, Vec<P>) -> Fut,
     Fut: Future<Output = Vec<Result<O, E>>>,
 {
+    let candidate_count = batch.len() as u64;
     let mut completions = Vec::with_capacity(batch.len());
     let mut payloads = Vec::with_capacity(batch.len());
     for candidate in batch {
         completions.push((candidate.completion, candidate._capacity, candidate._active));
         payloads.push(candidate.payload);
     }
+    let service_started = Instant::now();
     let outcomes = dispatch(class, cohort, payloads).await;
+    let service_duration = service_started.elapsed();
+    tracing::debug!(
+        publication.stage = stage,
+        publication.class = class.as_str(),
+        publication.cohort_candidates = candidate_count,
+        histogram.keldra_index_publication_cohort_service_seconds = service_duration.as_secs_f64(),
+        "index publication physical cohort service finished"
+    );
     drop(admission);
     if outcomes.len() != completions.len() {
         for (completion, capacity, active) in completions {
@@ -1040,6 +1062,7 @@ fn record_batch(
     items: u64,
     bytes: u64,
     oldest_wait: Duration,
+    slot_wait: Duration,
 ) {
     tracing::debug!(
         publication.stage = stage,
@@ -1058,6 +1081,7 @@ fn record_batch(
         histogram.keldra_index_publication_cohort_byte_fill_ratio =
             (bytes as f64 / bounds.max_batch_bytes as f64).min(1.0),
         histogram.keldra_index_publication_cohort_wait_seconds = oldest_wait.as_secs_f64(),
+        histogram.keldra_index_publication_cohort_slot_wait_seconds = slot_wait.as_secs_f64(),
         "index publication physical cohort dispatched"
     );
 }

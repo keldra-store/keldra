@@ -2,7 +2,7 @@
 
 use super::*;
 
-const MAX_CONCURRENT_INCREMENTAL_PUBLICATIONS: usize = 2;
+const MAX_CONCURRENT_INCREMENTAL_PUBLICATIONS: usize = 1;
 const MAX_CONCURRENT_MAINTENANCE_PUBLICATIONS: usize = 1;
 
 /// Independent node-wide FIFO bounds keep merge and rebuild I/O from occupying

@@ -42,25 +42,46 @@ fn journal_catch_up_never_waits_for_normal_merge_debt() {
 }
 
 #[tokio::test]
-async fn publication_slots_are_fifo_and_bounded() {
-    let slots = IndexPublicationSlots::new(1, 1);
-    let first = slots.acquire_incremental().await.unwrap();
-    let waiting = tokio::spawn({
+async fn default_publication_slots_admit_one_incremental_dispatch_in_fifo_order() {
+    let slots = IndexPublicationSlots::default();
+    let immutable_dispatch = slots.acquire_incremental().await.unwrap();
+    let current_waiter = tokio::spawn({
         let slots = slots.clone();
         async move { slots.acquire_incremental().await.unwrap() }
     });
     tokio::task::yield_now().await;
-    assert!(!waiting.is_finished());
-    drop(first);
-    let _permit = tokio::time::timeout(Duration::from_secs(1), waiting)
+    let next_immutable_waiter = tokio::spawn({
+        let slots = slots.clone();
+        async move { slots.acquire_incremental().await.unwrap() }
+    });
+    tokio::task::yield_now().await;
+    assert!(!current_waiter.is_finished());
+    assert!(!next_immutable_waiter.is_finished());
+    let maintenance = tokio::time::timeout(Duration::from_secs(1), slots.acquire_maintenance())
         .await
-        .expect("the oldest publication waiter must run after capacity is released")
+        .expect("maintenance must overlap the independent incremental writer")
         .unwrap();
+
+    drop(immutable_dispatch);
+    let current_dispatch = tokio::time::timeout(Duration::from_secs(1), current_waiter)
+        .await
+        .expect("the current stage must preserve FIFO after immutable releases")
+        .unwrap();
+    assert!(
+        !next_immutable_waiter.is_finished(),
+        "immutable and current must never overlap on the incremental writer"
+    );
+    drop(current_dispatch);
+    let _next_immutable = tokio::time::timeout(Duration::from_secs(1), next_immutable_waiter)
+        .await
+        .expect("the next immutable stage must make FIFO progress")
+        .unwrap();
+    drop(maintenance);
 }
 
 #[tokio::test]
 async fn maintenance_publication_does_not_consume_incremental_capacity() {
-    let slots = IndexPublicationSlots::new(1, 1);
+    let slots = IndexPublicationSlots::default();
     let _maintenance = slots.acquire_maintenance().await.unwrap();
     let _permit = tokio::time::timeout(Duration::from_secs(1), slots.acquire_incremental())
         .await
