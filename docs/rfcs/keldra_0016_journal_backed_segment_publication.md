@@ -456,6 +456,17 @@ acknowledgements, and metadata commits. The architectural property is that
 these durability operations are amortized over one complete segment rather than
 performed for every source mutation or builder intermediate.
 
+Ready definitions may share bounded physical publication cohorts without
+sharing logical authority. Pack objects are published first with one exact
+outcome per item; only definitions whose packs are durable enter an immutable
+manifest cohort; only definitions whose manifests are durable enter a guarded
+current-pointer cohort. Each pointer keeps its own definition fence,
+expected-version CAS, outcome, checkpoint, and retry state. A failed item never
+rolls back or prevents an unrelated successful item, and no manifest names an
+unacknowledged pack. Incremental and maintenance cohorts have independent
+bounded admission, while all stages retain count, byte, age, and in-flight
+bounds.
+
 The manifest and current-pointer CAS are the only publication authority. A
 durable segment which is not named by a committed manifest is not searchable
 authority.
@@ -736,7 +747,8 @@ that consequence.
    frozen-buffer queue, encoder workspaces, and permitted mutation-unit
    overshoot.
 9. Segment-publication and merge concurrency and bytes are independently
-   bounded.
+   bounded. Cross-definition physical publication cohorts retain independent
+   per-definition receipts, CAS outcomes, and checkpoints.
 10. Journal pressure prioritizes incremental publication over merge and rebuild
     work.
 11. A saturated derived pipeline backpressures journal consumption and
@@ -756,6 +768,8 @@ Per definition, Keldra exposes at least:
 - active-buffer accounted bytes, mutation count, and oldest age;
 - number and bytes of frozen buffers;
 - segment encode, flush, durability, manifest-write, and pointer-CAS latency;
+- publication cohort queue wait, logical item count, physical batch count,
+  item/byte fill ratio, and incremental-versus-maintenance class;
 - logical segment bytes and physical artifact-pack count;
 - current source checkpoint vector and atomic checkpoint;
 - journal head distance in records and bytes for every constraining source;
