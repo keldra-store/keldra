@@ -223,10 +223,10 @@ impl Store {
             "object storage bulk preparation completed"
         );
         let mut completed = BTreeMap::<usize, Result<MutationReceipt, MutationError>>::new();
-
         loop {
             let _policy_guard = self.policy_gate.read().await;
             let lock_started = std::time::Instant::now();
+            let path_lock_started = lock_started;
             let _guards = self
                 .ordinary_locks
                 .acquire(
@@ -236,7 +236,10 @@ impl Store {
                         .collect::<Vec<_>>(),
                 )
                 .await;
+            let path_lock_wait = path_lock_started.elapsed();
+            let commit_lock_started = std::time::Instant::now();
             let _commit_guard = self.commit_lock.lock().await;
+            let commit_lock_wait = commit_lock_started.elapsed();
             let lock_duration = lock_started.elapsed();
             let mut batch = WriteBatch::default();
             let now = match now_unix_millis() {
@@ -347,7 +350,6 @@ impl Store {
                 results.insert(*index, outcome.map(|evaluated| evaluated.receipt));
             }
             let evaluate_duration = evaluate_started.elapsed();
-
             let persistence_started = std::time::Instant::now();
             let persistence = (|| {
                 if receipt_status != initial_receipt_status {
@@ -376,6 +378,10 @@ impl Store {
             let persistence_duration = persistence_started.elapsed();
             tracing::info!(
                 histogram.keldra_store_bulk_lock_duration_seconds = lock_duration.as_secs_f64(),
+                histogram.keldra_store_bulk_ordinary_path_lock_wait_duration_seconds =
+                    path_lock_wait.as_secs_f64(),
+                histogram.keldra_store_bulk_commit_lock_wait_duration_seconds =
+                    commit_lock_wait.as_secs_f64(),
                 histogram.keldra_store_bulk_evaluate_duration_seconds =
                     evaluate_duration.as_secs_f64(),
                 histogram.keldra_store_bulk_persist_duration_seconds =
