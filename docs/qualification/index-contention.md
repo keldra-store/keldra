@@ -1,9 +1,13 @@
 # Index contention qualification
 
 `scripts/qualify-index-contention.sh` is the black-box acceptance workload for
-KELDRA-0016. It drives mutations and ordinary queries concurrently through the
-public Rust client against the exact checked-out native binary or packaged
-Keldra image. Each matrix cell
+KELDRA-0016. It runs the packaged Linux Keldra server in fresh Docker state on
+the Debian controller and drives mutations and ordinary queries through a
+native macOS build of the public Rust client on the physical Mac. The default
+split is explicit: Docker publishes the single-node API through
+`192.168.64.3`, while the driver is built and run over SSH on
+`zcourts@192.168.64.1` from `/Users/zcourts/projects/keldra/keldra`. Keldra is
+never run as a native macOS server. Each matrix cell
 starts with fresh durable state and creates the requested number of independent,
 simultaneously lagging index definitions; the matrix value is definition count,
 not projection-lane configuration. On one node, `1,4,16,64` is the normative
@@ -11,19 +15,21 @@ node-wide admitted-builder pressure matrix. Three-node placement distributes
 definitions using HRW, so its definition count is cluster-wide and is
 supplementary evidence, not a claim that every node ran that many builders.
 
-The smoke mode is deliberately small. It proves setup, authentication, workload
+The smoke mode is deliberately small. It proves setup, cross-host connectivity,
+authentication, workload
 correctness, report generation, and cleanup, but it is not performance evidence:
 
 ```bash
+KELDRA_IMAGE=keldra:qa-<commit> \
 KELDRA_INDEX_CONTENTION_MODE=smoke \
 KELDRA_INDEX_CONTENTION_TOPOLOGY=single \
   ./scripts/qualify-index-contention.sh
 ```
 
-On a machine without a Docker daemon, run the sustained native macOS matrix
-directly:
+Run the sustained matrix through the same split topology:
 
 ```bash
+KELDRA_IMAGE=keldra:qa-<commit> \
 KELDRA_INDEX_CONTENTION_MODE=sustained \
 KELDRA_INDEX_CONTENTION_TOPOLOGY=single \
 KELDRA_INDEX_CONTENTION_BASELINE_SECONDS=120 \
@@ -67,18 +73,26 @@ absent locally, the wrapper runs `scripts/build-image.sh`; an existing image wit
 the wrong revision is rejected rather than silently rebuilt. A missing released
 baseline is also a hard error and is never manufactured from the current tree.
 
-When the Docker CLI or daemon is unavailable, the wrapper uses a native-process
-backend. It builds
-the host-native `keldra-server`, `keldra` CLI, and qualification client through
-Cargo, starts a fresh loopback server and durable state directory for every
-matrix cell, provisions through the native CLI, then runs the same public Rust
-client workload. `KELDRA_IMAGE` is not used by this backend. Native mode supports
-both smoke and sustained `single` topology runs with `LOCAL` durability,
-including the full `1,4,16,64` sustained matrix. Three-node and image-baseline
-requests fail explicitly rather than falling back to another machine or
-silently changing topology. Override its derived loopback port with
-`KELDRA_INDEX_CONTENTION_NATIVE_PORT` when necessary. The wrapper remains
-compatible with the Bash 3.2 system shell shipped by macOS.
+The Linux server backend is always Docker and `KELDRA_IMAGE` is always required.
+The wrapper fails if the local Docker daemon is unavailable; it never substitutes
+a native server. The driver backend defaults to `ssh-macos`. Override
+`KELDRA_INDEX_CONTENTION_DRIVER_HOST`,
+`KELDRA_INDEX_CONTENTION_DRIVER_IDENTITY_FILE`,
+`KELDRA_INDEX_CONTENTION_DRIVER_REPO_ROOT`, or
+`KELDRA_INDEX_CONTENTION_SERVER_ADVERTISE_HOST` only when the physical-host
+layout differs. `KELDRA_INDEX_CONTENTION_DRIVER_EVIDENCE_ROOT` must name the
+macOS view of the same shared evidence directory. The wrapper verifies that the
+remote checkout is clean, matches the harness commit, and can read the bound
+`run.json` before starting a workload. Secrets travel in the SSH input stream,
+not command arguments or logs. SSH defaults to the controller-owned
+`$HOME/.ssh/debian1_id_ed25519` with `IdentitiesOnly=yes`.
+
+`KELDRA_INDEX_CONTENTION_DRIVER_BACKEND=local` retains the controller-local
+driver for diagnostics. The default `ssh-macos` driver currently supports the
+normative single-node smoke and sustained matrices. It rejects three-node mode
+explicitly because the existing Compose topology publishes its APIs on Debian
+loopback only; use the local driver backend for supplementary three-node
+evidence until that topology has an intentionally external publication surface.
 
 A baseline responsiveness failure is evidence, not a reason to skip the
 candidate. The wrapper continues when the baseline's correctness and workload
