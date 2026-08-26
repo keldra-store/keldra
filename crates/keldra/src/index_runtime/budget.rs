@@ -157,7 +157,7 @@ impl IndexMemoryBudget {
         minimum: u64,
         preferred: u64,
     ) -> Result<IndexMemoryPermit, IndexBudgetError> {
-        tracing::info!(
+        tracing::debug!(
             index.kind = ?self.kind,
             gauge.keldra_index_construction_configured_bytes = self.fair_share,
             gauge.keldra_index_construction_working_memory_bytes = self.memory.hard_limit(),
@@ -168,7 +168,7 @@ impl IndexMemoryBudget {
             .acquire_up_to(WorkingMemoryAccount::Builder(self.kind), minimum, preferred)
             .await?;
         let bytes = permit.bytes();
-        tracing::info!(
+        tracing::debug!(
             index.kind = ?self.kind,
             gauge.keldra_index_construction_configured_bytes = self.fair_share,
             histogram.keldra_index_construction_minimum_bytes = minimum,

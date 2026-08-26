@@ -307,7 +307,7 @@ struct QueryWaitingGuard {
 impl QueryWaitingGuard {
     fn start(kind: Option<IndexKind>, span: &tracing::Span) -> Self {
         span.in_scope(|| {
-            tracing::info!(
+            tracing::debug!(
                 index.kind = ?kind,
                 counter.keldra_index_query_waiting = 1_i64,
                 "local index query is waiting for admission"
@@ -325,7 +325,7 @@ impl QueryWaitingGuard {
         self.waiting = false;
         let waiting_seconds = self.started.elapsed().as_secs_f64();
         self.span.in_scope(|| {
-            tracing::info!(
+            tracing::debug!(
                 index.kind = ?self.kind,
                 counter.keldra_index_query_waiting = -1_i64,
                 histogram.keldra_index_query_wait_duration_seconds = waiting_seconds,
@@ -340,7 +340,7 @@ impl Drop for QueryWaitingGuard {
     fn drop(&mut self) {
         if self.waiting {
             self.span.in_scope(|| {
-                tracing::info!(
+                tracing::debug!(
                     index.kind = ?self.kind,
                     counter.keldra_index_query_waiting = -1_i64,
                     monotonic_counter.keldra_index_query_admission_cancellations_total = 1_u64,
@@ -361,7 +361,7 @@ impl QueryActiveGuard {
         statistics: NativeQueryStatisticsRecorder,
     ) -> Self {
         span.in_scope(|| {
-            tracing::info!(
+            tracing::debug!(
                 index.kind = ?kind,
                 counter.keldra_index_query_active = 1_i64,
                 monotonic_counter.keldra_index_query_runs_total = 1_u64,
@@ -584,7 +584,7 @@ impl QueryActiveGuard {
             .cooperative_yields
             .saturating_add(u64::from(snapshot.partial_quantum_bytes != 0));
         self.span.in_scope(|| {
-            tracing::info!(
+            tracing::debug!(
                 index.kind = ?self.kind,
                 index.phase = "execute",
                 index.tier = tier,
@@ -724,7 +724,7 @@ fn record_query_phase(kind: Option<IndexKind>, phase: NativeQueryPhase, nanos: u
     if nanos == 0 {
         return;
     }
-    tracing::info!(
+    tracing::debug!(
         index.kind = ?kind,
         index.phase = phase.as_str(),
         histogram.keldra_index_query_phase_duration_seconds = duration_seconds(nanos),
@@ -738,7 +738,7 @@ impl Drop for QueryActiveGuard {
             self.emit_terminal("cancelled", true, true);
         }
         self.span.in_scope(|| {
-            tracing::info!(
+            tracing::debug!(
                 index.kind = ?self.kind,
                 counter.keldra_index_query_active = -1_i64,
                 "local index query released"
@@ -1083,7 +1083,7 @@ impl LocalRevisionQueryExecutor {
                 .ok()
                 .map(|schema| schema.kind)
             });
-        let span = tracing::info_span!(
+        let span = tracing::debug_span!(
             "keldra.index.query",
             index.id = request.definition.index_id,
             definition.version = request.definition.version,
@@ -1427,7 +1427,7 @@ fn record_computation_requests(
         .map_err(|_| Status::resource_exhausted("aggregate request count exceeds u64"))?;
     tracing::Span::current().record("query.facet_computations_requested", facets);
     tracing::Span::current().record("query.aggregate_computations_requested", aggregates);
-    tracing::info!(
+    tracing::debug!(
         index.kind = ?kind,
         monotonic_counter.keldra_index_query_facet_computations_requested_total = facets,
         monotonic_counter.keldra_index_query_aggregate_computations_requested_total = aggregates,
@@ -1447,7 +1447,7 @@ fn record_computation_results(
         .map_err(|_| Status::resource_exhausted("aggregate result count exceeds u64"))?;
     tracing::Span::current().record("query.facet_computation_results", facets);
     tracing::Span::current().record("query.aggregate_computation_results", aggregates);
-    tracing::info!(
+    tracing::debug!(
         index.kind = ?kind,
         monotonic_counter.keldra_index_query_facet_computation_results_total = facets,
         monotonic_counter.keldra_index_query_aggregate_computation_results_total = aggregates,

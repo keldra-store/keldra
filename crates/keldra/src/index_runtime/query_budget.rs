@@ -62,7 +62,7 @@ impl IndexQueryMemoryBudget {
         let minimum_charged = minimum_bytes;
         let preferred_charged = preferred_bytes.min(self.memory.hard_limit());
         let started = Instant::now();
-        tracing::info!(
+        tracing::debug!(
             gauge.keldra_index_query_memory_configured_bytes = self.fair_share_bytes,
             counter.keldra_index_query_memory_waiting_bytes = minimum_charged as i64,
             "index query is waiting for working-memory admission"
@@ -77,7 +77,7 @@ impl IndexQueryMemoryBudget {
             .await
             .map_err(QueryBudgetError::WorkingMemory)?;
         let granted = permit.bytes();
-        tracing::info!(
+        tracing::debug!(
             counter.keldra_index_query_memory_waiting_bytes = -(minimum_charged as i64),
             counter.keldra_index_query_memory_leased_bytes = granted as i64,
             histogram.keldra_index_query_memory_wait_seconds = started.elapsed().as_secs_f64(),
@@ -108,7 +108,7 @@ impl IndexQueryMemoryPermit {
 
 impl Drop for IndexQueryMemoryPermit {
     fn drop(&mut self) {
-        tracing::info!(
+        tracing::debug!(
             counter.keldra_index_query_memory_leased_bytes = -(self.bytes as i64),
             "index query working memory released"
         );

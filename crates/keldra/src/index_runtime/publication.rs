@@ -745,7 +745,7 @@ impl GroupedPublishTelemetry {
         let requested_bytes = requests.iter().fold(0_u64, |total, request| {
             total.saturating_add(request.blob.length)
         });
-        let span = tracing::info_span!(
+        let span = tracing::debug_span!(
             "keldra.index.grouped_publish",
             index.id = first.index_id,
             tenant.id = first.tenant_id,
@@ -763,7 +763,7 @@ impl GroupedPublishTelemetry {
             otel.status_code = tracing::field::Empty,
         );
         span.in_scope(|| {
-            tracing::info!(
+            tracing::debug!(
                 operation = "index_artifact_grouped_publish",
                 counter.keldra_index_grouped_publish_active = 1_i64,
                 monotonic_counter.keldra_index_grouped_publish_attempts_total = 1_u64,
@@ -823,12 +823,12 @@ impl GroupedPublishTelemetry {
         self.span
             .record("otel.status_code", if failed { "error" } else { "ok" });
         self.span.in_scope(|| {
-            tracing::info!(
+            tracing::debug!(
                 operation = "index_artifact_grouped_publish",
                 counter.keldra_index_grouped_publish_active = -1_i64,
                 "grouped index artifact publication released"
             );
-            tracing::info!(
+            tracing::debug!(
                 operation = "index_artifact_grouped_publish",
                 publish.outcome = outcome,
                 monotonic_counter.keldra_index_grouped_publish_failures_total = u64::from(failed),

@@ -71,6 +71,52 @@ async fn maintenance_publication_does_not_consume_incremental_capacity() {
 }
 
 #[tokio::test]
+async fn maintenance_waits_for_its_lane_before_leasing_working_memory() {
+    let share = MIN_INDEX_KIND_MEMORY_BYTES as u64;
+    let budgets = IndexMemoryBudgets::new(share).unwrap();
+    let kinds = [
+        IndexKind::Path,
+        IndexKind::MetadataFilter,
+        IndexKind::TypedJson,
+        IndexKind::FullText,
+        IndexKind::Vector,
+        IndexKind::Hybrid,
+        IndexKind::GitSource,
+        IndexKind::Tensor,
+    ];
+    let mut occupied = Vec::new();
+    for kind in kinds.into_iter().take(7) {
+        occupied.push(budgets.for_kind(kind).acquire(share).await.unwrap());
+    }
+
+    let slots = IndexPublicationSlots::new(1, 1);
+    let held_lane = slots.acquire_maintenance().await.unwrap();
+    let waiting = tokio::spawn({
+        let slots = slots.clone();
+        let budget = budgets.for_kind(IndexKind::TypedJson).clone();
+        async move { acquire_maintenance_memory(&slots, &budget, share, share).await }
+    });
+    tokio::task::yield_now().await;
+    assert!(!waiting.is_finished());
+
+    let last_free_share = tokio::time::timeout(
+        Duration::from_secs(1),
+        budgets.for_kind(IndexKind::Path).acquire(share),
+    )
+    .await
+    .expect("a lane waiter must not lease the last free working-memory share")
+    .unwrap();
+    drop(last_free_share);
+    drop(occupied);
+    drop(held_lane);
+    let (_slot, _permit) = tokio::time::timeout(Duration::from_secs(1), waiting)
+        .await
+        .expect("maintenance must proceed after lane and memory become available")
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
 async fn owned_background_task_is_aborted_when_dropped() {
     let (started, started_rx) = tokio::sync::oneshot::channel();
     let (dropped, dropped_rx) = tokio::sync::oneshot::channel();

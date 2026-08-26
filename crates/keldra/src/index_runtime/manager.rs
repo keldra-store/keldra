@@ -845,18 +845,11 @@ async fn inspect_builder(
             definition.bucket_id,
         )
         .await?;
-    let progress = BuilderProgress::start(telemetry_identity, BuilderProgressPhase::Rebuild);
     let budget = dependencies.budgets.for_kind(job.kind);
     let max_frame_bytes =
         source_wire_limit(budget.limit()).min(dependencies.config.source_quantum_bytes(job.kind));
-    if let Some(work) = resume_durable_rebuild(
-        job,
-        current.clone(),
-        max_frame_bytes,
-        progress.clone(),
-        dependencies,
-    )
-    .await?
+    if let Some(work) =
+        resume_durable_rebuild(job, current.clone(), max_frame_bytes, dependencies).await?
     {
         return Ok((BuilderPhase::Rebuild(work), BuilderDisposition::Ready, None));
     }
@@ -981,7 +974,7 @@ async fn inspect_builder(
         snapshot,
         through,
         max_frame_bytes,
-        progress,
+        BuilderProgress::start(telemetry_identity, BuilderProgressPhase::Rebuild),
         dependencies,
     )
     .await?;
@@ -1084,6 +1077,22 @@ async fn advance_catch_up(
                 ));
             }
         }
+    }
+    if work.publishing.is_some()
+        && work.atomic_projection.is_none()
+        && work
+            .active
+            .as_ref()
+            .is_some_and(|active| active.builder.is_empty() && active.builder.frozen.is_none())
+    {
+        work.active = None;
+    }
+    if work.publishing.is_some() && work.active.is_none() {
+        return Ok((
+            BuilderPhase::CatchUp(work),
+            BuilderDisposition::Retry(Duration::from_millis(10)),
+            None,
+        ));
     }
     if work.active.is_none()
         && catch_up::should_compact_before_catch_up(
@@ -1226,10 +1235,7 @@ async fn advance_catch_up(
             // checkpoint publication.
             if work.must_publish || work.changed {
                 enqueue_candidate_publication(job, &mut work, admission, dependencies).await?;
-                active.started = None;
-                active.operations = 0;
-                active.quantum = SourceWorkQuantum::from_budget_limit(active.permit.bytes());
-                work.active = Some(active);
+                drop(active);
                 return Ok((
                     BuilderPhase::CatchUp(work),
                     BuilderDisposition::Retry(Duration::from_millis(10)),
@@ -1381,10 +1387,7 @@ async fn advance_catch_up(
             )
             .await?;
             enqueue_candidate_publication(job, &mut work, admission, dependencies).await?;
-            active.started = None;
-            active.operations = 0;
-            active.quantum = SourceWorkQuantum::from_budget_limit(active.permit.bytes());
-            work.active = Some(active);
+            drop(active);
             return Ok((BuilderPhase::CatchUp(work), BuilderDisposition::Ready, None));
         }
         if quantum_boundary || operation_boundary {
@@ -1474,11 +1477,13 @@ async fn compact_one_if_needed(
             "index source work yielded to bounded locator compaction debt"
         );
         let budget = dependencies.budgets.for_kind(job.kind);
-        let _permit = budget
-            .acquire(budget.limit())
-            .await
-            .map_err(budget_status)?;
-        let _publication_slot = dependencies.publication_slots.acquire_maintenance().await?;
+        let (_publication_slot, _permit) = acquire_maintenance_memory(
+            &dependencies.publication_slots,
+            budget,
+            budget.limit(),
+            budget.limit(),
+        )
+        .await?;
         locator_debt::compact_oldest_prefix(
             &job.definition,
             job.kind,
@@ -1497,11 +1502,13 @@ async fn compact_one_if_needed(
         "index source work yielded to bounded compaction debt"
     );
     let budget = dependencies.budgets.for_kind(job.kind);
-    let permit = budget
-        .acquire_up_to(budget.limit(), budget.working_memory_limit())
-        .await
-        .map_err(budget_status)?;
-    let _publication_slot = dependencies.publication_slots.acquire_maintenance().await?;
+    let (_publication_slot, permit) = acquire_maintenance_memory(
+        &dependencies.publication_slots,
+        budget,
+        budget.limit(),
+        budget.working_memory_limit(),
+    )
+    .await?;
     compact_tier(
         &job.definition,
         job.kind,
@@ -1520,6 +1527,23 @@ async fn compact_one_if_needed(
         "repaid",
     );
     Ok(true)
+}
+
+async fn acquire_maintenance_memory(
+    slots: &IndexPublicationSlots,
+    budget: &super::budget::IndexMemoryBudget,
+    minimum: u64,
+    preferred: u64,
+) -> Result<(tokio::sync::OwnedSemaphorePermit, IndexMemoryPermit), Status> {
+    // Queue for the scarce maintenance lane before leasing construction
+    // memory. Waiting maintenance must not pin bytes that incremental builders
+    // can use while it is not runnable.
+    let slot = slots.acquire_maintenance().await?;
+    let permit = budget
+        .acquire_up_to(minimum, preferred)
+        .await
+        .map_err(budget_status)?;
+    Ok((slot, permit))
 }
 
 fn is_local_builder(
@@ -1844,7 +1868,7 @@ async fn finish_frozen_segment(
         logical_bytes: built.locator.logical_bytes,
     });
     candidate.locator_roots.sort_by_key(|root| root.sequence);
-    tracing::info!(
+    tracing::debug!(
         index.kind = ?kind,
         gauge.keldra_index_construction_resident_bytes = frozen.resident_bytes,
         gauge.keldra_index_construction_workspace_bytes = frozen.seal_workspace_bytes,

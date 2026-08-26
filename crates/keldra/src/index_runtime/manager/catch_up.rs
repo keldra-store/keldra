@@ -104,11 +104,13 @@ pub(super) async fn stop_at_locator_headroom(
         .await?;
         work.must_publish = true;
         enqueue_candidate_publication(job, &mut work, admission, dependencies).await?;
-        active.started = None;
-        active.operations = 0;
-        active.quantum = SourceWorkQuantum::from_budget_limit(active.permit.bytes());
+        // The sealed candidate owns no active builder state. Release its
+        // working memory while commit admission is pending; a later turn
+        // reacquires an exact permit only after publication completes.
+        drop(active);
+    } else {
+        work.active = Some(active);
     }
-    work.active = Some(active);
     Ok((
         BuilderPhase::CatchUp(work),
         BuilderDisposition::Retry(Duration::from_millis(10)),
