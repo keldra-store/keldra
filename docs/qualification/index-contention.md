@@ -2,7 +2,8 @@
 
 `scripts/qualify-index-contention.sh` is the black-box acceptance workload for
 KELDRA-0016. It drives mutations and ordinary queries concurrently through the
-public Rust client against the exact packaged Keldra image. Each matrix cell
+public Rust client against the exact checked-out native binary or packaged
+Keldra image. Each matrix cell
 starts with fresh durable state and creates the requested number of independent,
 simultaneously lagging index definitions; the matrix value is definition count,
 not projection-lane configuration. On one node, `1,4,16,64` is the normative
@@ -14,14 +15,25 @@ The smoke mode is deliberately small. It proves setup, authentication, workload
 correctness, report generation, and cleanup, but it is not performance evidence:
 
 ```bash
-KELDRA_IMAGE=keldra:qa-<commit> \
 KELDRA_INDEX_CONTENTION_MODE=smoke \
 KELDRA_INDEX_CONTENTION_TOPOLOGY=single \
   ./scripts/qualify-index-contention.sh
 ```
 
-Run the sustained matrix on the host with Docker allocated enough CPU, memory,
-and disk for the intended qualification environment:
+On a machine without a Docker daemon, run the sustained native macOS matrix
+directly:
+
+```bash
+KELDRA_INDEX_CONTENTION_MODE=sustained \
+KELDRA_INDEX_CONTENTION_TOPOLOGY=single \
+KELDRA_INDEX_CONTENTION_BASELINE_SECONDS=120 \
+KELDRA_INDEX_CONTENTION_CONCURRENT_SECONDS=600 \
+KELDRA_INDEX_CONTENTION_POST_SECONDS=120 \
+KELDRA_INDEX_CONTENTION_MATRIX=1,4,16,64 \
+  ./scripts/qualify-index-contention.sh
+```
+
+For supplementary three-node Docker evidence, use:
 
 ```bash
 KELDRA_IMAGE=keldra:qa-<commit> \
@@ -50,32 +62,23 @@ the qualification. A baseline may have another revision, but must carry a full
 revision label. The wrapper resolves both to immutable IDs and records the
 harness commit separately from both server revisions.
 
-If the candidate tag named by `KELDRA_IMAGE` is absent locally, the wrapper runs
-the repository's `scripts/build-image.sh` entrypoint before qualification. It
-selects `linux/arm64` on an Apple or Linux ARM64 host and `linux/amd64` on a
-supported x86-64 host, unless `KELDRA_DOCKER_PLATFORM` explicitly selects one of
-those platforms. Existing candidate images are never silently rebuilt merely
-because their revision is wrong. A missing released baseline is a hard error;
-the wrapper never manufactures baseline evidence from the current checkout. The
-wrapper is compatible with the Bash 3.2 system shell shipped by macOS.
+When Docker is available, `KELDRA_IMAGE` selects the candidate. If that tag is
+absent locally, the wrapper runs `scripts/build-image.sh`; an existing image with
+the wrong revision is rejected rather than silently rebuilt. A missing released
+baseline is also a hard error and is never manufactured from the current tree.
 
-If Docker itself is unavailable, the wrapper dispatches the complete
-qualification to the Debian Docker VM over SSH. The defaults are
-`zcourts@192.168.64.3` and
-`/home/zcourts/projects/projects/keldra/keldra`; override them with
-`KELDRA_INDEX_CONTENTION_REMOTE_HOST` and
-`KELDRA_INDEX_CONTENTION_REMOTE_REPO`. The checkout is shared, so source is not
-copied. The remote invocation builds the native Rust driver, builds a missing
-Linux candidate image through the same repository entrypoint, and runs the
-Docker topology there.
-
-`KELDRA_IMAGE`, `KELDRA_DOCKER_PLATFORM`, `CARGO_BUILD_JOBS`, and every
-`KELDRA_INDEX_CONTENTION_*` setting are forwarded through a temporary mode-0600
-file in the shared releases tree. Values are shell-quoted, are not printed or
-placed in the SSH command line, and the file is removed before the remote
-workload starts. Standard output, standard error, exit status, and terminal
-cancellation flow through the foreground SSH process. A recursion guard makes a
-missing Docker installation on the target a hard error.
+When the Docker CLI or daemon is unavailable, the wrapper uses a native-process
+backend. It builds
+the host-native `keldra-server`, `keldra` CLI, and qualification client through
+Cargo, starts a fresh loopback server and durable state directory for every
+matrix cell, provisions through the native CLI, then runs the same public Rust
+client workload. `KELDRA_IMAGE` is not used by this backend. Native mode supports
+both smoke and sustained `single` topology runs with `LOCAL` durability,
+including the full `1,4,16,64` sustained matrix. Three-node and image-baseline
+requests fail explicitly rather than falling back to another machine or
+silently changing topology. Override its derived loopback port with
+`KELDRA_INDEX_CONTENTION_NATIVE_PORT` when necessary. The wrapper remains
+compatible with the Bash 3.2 system shell shipped by macOS.
 
 A baseline responsiveness failure is evidence, not a reason to skip the
 candidate. The wrapper continues when the baseline's correctness and workload
@@ -102,9 +105,10 @@ watch -n 2 cat ../../releases/keldra/index-contention/latest/status.json
 `run.json` records the source commit, immutable image ID and revision, image
 platform, topology, matrix, phase durations, host resources, and Docker resource
 allocation. Every cell retains the client report, client stdout/stderr, and
-server logs. `container-resources.jsonl` samples Docker CPU, memory, network,
-block-I/O, and process counters throughout the workload. `progress.jsonl` is
-the append-only orchestration lifecycle;
+server logs. Docker cells use `container-resources.jsonl` for CPU, memory,
+network, block-I/O, and process counters; native cells use
+`process-resources.jsonl` for host-reported server CPU and RSS.
+`progress.jsonl` is the append-only orchestration lifecycle;
 `active-driver-progress.jsonl` points to the current cell's flushed, one-second
 cumulative snapshots; latency histograms are reset at phase transitions, while
 operation counters remain cumulative. `status.json` is replaced atomically

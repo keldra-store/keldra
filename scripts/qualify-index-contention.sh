@@ -4,7 +4,7 @@ set -Eeuo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 compose_file="${repo_root}/tests/cluster/docker-compose.yml"
 start_node="${repo_root}/tests/cluster/start-node.sh"
-requested_image="${KELDRA_IMAGE:?KELDRA_IMAGE must name the clean QA image}"
+requested_image="${KELDRA_IMAGE:-}"
 baseline_image="${KELDRA_INDEX_CONTENTION_BASELINE_IMAGE:-}"
 comparison_order="${KELDRA_INDEX_CONTENTION_COMPARISON_ORDER:-baseline-first}"
 mode="${KELDRA_INDEX_CONTENTION_MODE:-smoke}"
@@ -19,101 +19,10 @@ index_projection_lanes="${KELDRA_INDEX_CONTENTION_INDEX_PROJECTION_MAX_LANES:-4}
 index_rayon_workers="${KELDRA_INDEX_CONTENTION_INDEX_RAYON_WORKERS:-4}"
 source_journal_entries="${KELDRA_INDEX_CONTENTION_SOURCE_JOURNAL_MAX_ENTRIES:-1000000}"
 max_concurrent_query_p99_ms="${KELDRA_INDEX_CONTENTION_MAX_CONCURRENT_QUERY_P99_MILLISECONDS:-2000}"
-remote_host="${KELDRA_INDEX_CONTENTION_REMOTE_HOST:-zcourts@192.168.64.3}"
-remote_repo="${KELDRA_INDEX_CONTENTION_REMOTE_REPO:-/home/zcourts/projects/projects/keldra/keldra}"
-
-dispatch_to_docker_vm() {
-  local dispatch_dir dispatch_environment dispatch_name dispatch_ssh_pid dispatch_status
-  local environment_name environment_value remote_dispatch_environment
-  command -v ssh >/dev/null 2>&1 || {
-    echo "docker is unavailable locally and ssh is required for remote qualification" >&2
-    return 2
-  }
-  case "${remote_host}" in
-    *[!a-zA-Z0-9_.@:-]*|"")
-      echo "KELDRA_INDEX_CONTENTION_REMOTE_HOST contains unsupported characters" >&2
-      return 2
-      ;;
-  esac
-  case "${remote_repo}" in
-    /*[!a-zA-Z0-9_./-]*)
-      echo "KELDRA_INDEX_CONTENTION_REMOTE_REPO must be an absolute simple path" >&2
-      return 2
-      ;;
-    /*) ;;
-    *)
-      echo "KELDRA_INDEX_CONTENTION_REMOTE_REPO must be an absolute simple path" >&2
-      return 2
-      ;;
-  esac
-  dispatch_dir="${repo_root}/../../releases/keldra/index-contention/.dispatch"
-  mkdir -p "${dispatch_dir}"
-  chmod 0700 "${dispatch_dir}"
-  dispatch_environment="$(mktemp "${dispatch_dir}/environment.XXXXXX")"
-  chmod 0600 "${dispatch_environment}"
-  dispatch_name="${dispatch_environment##*/}"
-  remote_dispatch_environment="${remote_repo}/../../releases/keldra/index-contention/.dispatch/${dispatch_name}"
-
-  for environment_name in KELDRA_IMAGE KELDRA_DOCKER_PLATFORM CARGO_BUILD_JOBS; do
-    if printenv "${environment_name}" >/dev/null 2>&1; then
-      environment_value="$(printenv "${environment_name}")"
-      printf 'export %s=' "${environment_name}" >>"${dispatch_environment}"
-      printf '%q\n' "${environment_value}" >>"${dispatch_environment}"
-    fi
-  done
-  while IFS= read -r environment_name; do
-    [[ "${environment_name}" == KELDRA_INDEX_CONTENTION_REMOTE_DISPATCHED ]] && continue
-    environment_value="$(printenv "${environment_name}")"
-    printf 'export %s=' "${environment_name}" >>"${dispatch_environment}"
-    printf '%q\n' "${environment_value}" >>"${dispatch_environment}"
-  done < <(compgen -v KELDRA_INDEX_CONTENTION_)
-
-  cleanup_dispatch_environment() {
-    rm -f -- "${dispatch_environment}"
-  }
-  cancel_remote_dispatch() {
-    if [[ -n "${dispatch_ssh_pid:-}" ]]; then
-      kill -TERM "${dispatch_ssh_pid}" >/dev/null 2>&1 || true
-      wait "${dispatch_ssh_pid}" >/dev/null 2>&1 || true
-    fi
-    cleanup_dispatch_environment
-    exit 130
-  }
-  trap cancel_remote_dispatch INT TERM HUP
-  set +e
-  ssh -- "${remote_host}" /bin/bash -s -- \
-    "${remote_repo}" "${remote_dispatch_environment}" <<'KELDRA_REMOTE_DISPATCH' &
-set -Eeuo pipefail
-remote_repo="$1"
-dispatch_environment="$2"
-cleanup_dispatch_environment() {
-  rm -f -- "${dispatch_environment}"
-}
-trap cleanup_dispatch_environment EXIT INT TERM HUP
-source "${dispatch_environment}"
-cleanup_dispatch_environment
-trap - EXIT INT TERM HUP
-export KELDRA_INDEX_CONTENTION_REMOTE_DISPATCHED=1
-cd "${remote_repo}"
-exec /bin/bash "${remote_repo}/scripts/qualify-index-contention.sh"
-KELDRA_REMOTE_DISPATCH
-  dispatch_ssh_pid=$!
-  wait "${dispatch_ssh_pid}"
-  dispatch_status=$?
-  dispatch_ssh_pid=""
-  set -e
-  trap - INT TERM HUP
-  cleanup_dispatch_environment
-  return "${dispatch_status}"
-}
-
-if ! command -v docker >/dev/null 2>&1; then
-  if [[ "${KELDRA_INDEX_CONTENTION_REMOTE_DISPATCHED:-0}" == 1 ]]; then
-    echo "docker is unavailable on remote qualification target ${remote_host}; refusing recursive dispatch" >&2
-    exit 2
-  fi
-  dispatch_to_docker_vm
-  exit $?
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+  qualification_backend=docker
+else
+  qualification_backend=native
 fi
 
 case "${mode}" in
@@ -183,13 +92,13 @@ for builders in "${builder_matrix[@]}"; do
   seen_builder_values="${seen_builder_values}${builders},"
 done
 
-for command in cargo docker git jq; do
+for command in cargo git jq; do
   command -v "${command}" >/dev/null 2>&1 || {
     echo "${command} is required" >&2
     exit 2
   }
 done
-if [[ "${topology}" == three ]]; then
+if [[ "${qualification_backend}" == docker && "${topology}" == three ]]; then
   docker compose version >/dev/null
 fi
 
@@ -198,6 +107,260 @@ if [[ ! "${source_commit}" =~ ^[0-9a-f]{40}$ ]] \
   || [[ -n "$(git -C "${repo_root}" status --porcelain=v1 --untracked-files=normal)" ]]
 then
   echo "qualification requires an unchanged clean tree so its source revision is exact" >&2
+  exit 2
+fi
+
+run_native_qualification() {
+  local build_messages cli_build_messages cargo_target_dir driver native_cli native_server
+  local native_evidence_root native_run_dir native_run_id native_progress native_status
+  local native_state="" native_server_pid="" native_sampler_pid="" native_cell=""
+  local native_cell_dir native_port native_peer_port native_endpoint native_secret
+  local driver_status provisioned attempt builders sample pid_value cpu_value rss_value elapsed_value
+  local native_fd_limit
+
+  if [[ "${topology}" != single ]]; then
+    echo "native-process qualification currently supports single-node topology only" >&2
+    return 2
+  fi
+  if [[ -n "${baseline_image}" ]]; then
+    echo "native-process qualification does not support Docker-image baseline comparison" >&2
+    return 2
+  fi
+  if [[ -n "${KELDRA_INDEX_CONTENTION_NATIVE_PORT:-}" ]]; then
+    native_port="${KELDRA_INDEX_CONTENTION_NATIVE_PORT}"
+  else
+    native_port=$((55051 + ($$ % 9000)))
+  fi
+  if [[ ! "${native_port}" =~ ^[1-9][0-9]*$ ]] \
+    || ((native_port > 65534)); then
+    echo "KELDRA_INDEX_CONTENTION_NATIVE_PORT must be in 1..65534" >&2
+    return 2
+  fi
+  native_peer_port=$((native_port + 1))
+  if ! ulimit -n 65536 2>/dev/null; then
+    echo "native qualification requires a file-descriptor limit of at least 65536" >&2
+    return 2
+  fi
+  native_fd_limit="$(ulimit -n)"
+
+  cargo_target_dir="$(
+    cargo metadata --quiet --locked --no-deps --format-version 1 \
+      --manifest-path "${repo_root}/Cargo.toml" \
+      | jq -er '.target_directory | select(type == "string" and length > 0)'
+  )"
+  build_messages="$(mktemp /var/tmp/keldra-contention-native-build.XXXXXX)"
+  cli_build_messages="$(mktemp /var/tmp/keldra-contention-native-cli-build.XXXXXX)"
+  cargo build --release --locked --package keldra-server \
+    --jobs "${CARGO_BUILD_JOBS:-1}" --manifest-path "${repo_root}/Cargo.toml" \
+    --bin keldra-server --example index_contention_qualification \
+    --message-format json-render-diagnostics >"${build_messages}"
+  cargo build --release --locked --package keldra-cli \
+    --jobs "${CARGO_BUILD_JOBS:-1}" --manifest-path "${repo_root}/Cargo.toml" \
+    --bin keldra --message-format json-render-diagnostics >"${cli_build_messages}"
+  native_server="$(jq -er 'select(.reason == "compiler-artifact" and .target.name == "keldra-server" and (.target.kind | index("bin"))) | .executable' "${build_messages}" | tail -n 1)"
+  driver="$(jq -er 'select(.reason == "compiler-artifact" and .target.name == "index_contention_qualification" and (.target.kind | index("example"))) | .executable' "${build_messages}" | tail -n 1)"
+  native_cli="$(jq -er 'select(.reason == "compiler-artifact" and .target.name == "keldra" and (.target.kind | index("bin"))) | .executable' "${cli_build_messages}" | tail -n 1)"
+  rm -f -- "${build_messages}" "${cli_build_messages}"
+  for native_binary in "${native_server}" "${driver}" "${native_cli}"; do
+    if [[ ! -x "${native_binary}" ]]; then
+      echo "native Cargo build omitted executable ${native_binary}" >&2
+      return 1
+    fi
+    case "${native_binary}" in
+      "${cargo_target_dir}"/*) ;;
+      *) echo "Cargo produced native executable outside its target directory" >&2; return 1 ;;
+    esac
+  done
+
+  native_run_id="$(date -u +%Y%m%dT%H%M%SZ)-native-${mode}-single-${source_commit:0:12}-$$"
+  native_evidence_root="${KELDRA_INDEX_CONTENTION_EVIDENCE_ROOT:-${repo_root}/../../releases/keldra/index-contention}"
+  native_run_dir="${native_evidence_root}/${native_run_id}"
+  mkdir -p "${native_evidence_root}"
+  mkdir "${native_run_dir}"
+  chmod 0755 "${native_run_dir}"
+  native_progress="${native_run_dir}/progress.jsonl"
+  native_status="${native_run_dir}/status.json"
+  : >"${native_progress}"
+  ln -sfn "${native_run_id}" "${native_evidence_root}/latest"
+  jq -n --arg run_id "${native_run_id}" --arg source_commit "${source_commit}" \
+    --arg platform "$(uname -s)/$(uname -m)" --arg matrix "${matrix}" \
+    --arg server_binary "${native_server}" --arg client_binary "${driver}" \
+    --arg cli_binary "${native_cli}" --arg server_rust_log "${server_rust_log}" \
+    --argjson file_descriptor_limit "${native_fd_limit}" \
+    --argjson baseline_seconds "${baseline_seconds}" \
+    --argjson concurrent_seconds "${concurrent_seconds}" \
+    --argjson post_seconds "${post_seconds}" \
+    --argjson index_disk_cache_bytes "${index_disk_cache_bytes}" \
+    --argjson index_memory_percent "${index_memory_percent}" \
+    --argjson index_kind_budget_bytes "${index_kind_budget_bytes}" \
+    --argjson index_compaction_lanes "${index_compaction_lanes}" \
+    --argjson index_projection_lanes "${index_projection_lanes}" \
+    --argjson index_rayon_workers "${index_rayon_workers}" \
+    --argjson source_journal_entries "${source_journal_entries}" \
+    --arg mode "${mode}" \
+    '{schema_version:1,run_id:$run_id,harness_source_commit:$source_commit,backend:"native-process",native_platform:$platform,binaries:{server:$server_binary,client:$client_binary,cli:$cli_binary},workload:{mode:$mode,topology:"single-node",durability:"LOCAL",index_definition_count_matrix:($matrix|split(",")|map(tonumber)),baseline_seconds:$baseline_seconds,concurrent_seconds:$concurrent_seconds,post_seconds:$post_seconds},server:{rust_log:$server_rust_log,file_descriptor_limit:$file_descriptor_limit,index_disk_cache_bytes:$index_disk_cache_bytes,index_memory_percent:$index_memory_percent,index_kind_budget_bytes:$index_kind_budget_bytes,index_compaction_max_lanes:$index_compaction_lanes,index_projection_max_lanes:$index_projection_lanes,index_rayon_workers:$index_rayon_workers,source_journal_max_entries:$source_journal_entries}}' \
+    >"${native_run_dir}/run.json"
+
+  native_emit() {
+    local event="$1" cell="${2:-}" count="${3:-0}" detail="${4:-}" encoded temporary
+    encoded="$(jq -cn --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      --arg run_id "${native_run_id}" --arg event "${event}" --arg cell "${cell}" \
+      --argjson count "${count}" --arg detail "${detail}" \
+      '{timestamp:$timestamp,run_id:$run_id,event:$event,cell:$cell,comparison_role:"native",index_definition_count:$count,detail:$detail}')"
+    printf '%s\n' "${encoded}" >>"${native_progress}"
+    temporary="${native_status}.tmp.$$"
+    printf '%s\n' "${encoded}" >"${temporary}"
+    mv -f "${temporary}" "${native_status}"
+  }
+  native_stop_sampler() {
+    if [[ -n "${native_sampler_pid}" ]] && kill -0 "${native_sampler_pid}" 2>/dev/null; then
+      kill -TERM "${native_sampler_pid}" >/dev/null 2>&1 || true
+      wait "${native_sampler_pid}" >/dev/null 2>&1 || true
+    fi
+    native_sampler_pid=""
+  }
+  native_cleanup_cell() {
+    native_stop_sampler
+    if [[ -n "${native_server_pid}" ]] && kill -0 "${native_server_pid}" 2>/dev/null; then
+      kill -TERM "${native_server_pid}" >/dev/null 2>&1 || true
+      wait "${native_server_pid}" >/dev/null 2>&1 || true
+    fi
+    native_server_pid=""
+    if [[ "${keep}" != 1 && -n "${native_state}" \
+      && "${native_state}" == /var/tmp/keldra-index-contention-native.* ]]; then
+      rm -rf -- "${native_state}"
+    elif [[ "${keep}" == 1 && -n "${native_state}" ]]; then
+      echo "retained native state ${native_state}" >&2
+    fi
+    native_state=""
+  }
+  native_abort() {
+    local status=$?
+    trap - EXIT INT TERM HUP
+    native_emit failed "${native_cell}" 0 "native qualification failed (exit ${status})" || true
+    native_cleanup_cell
+    exit "${status}"
+  }
+  trap native_abort EXIT
+  trap 'exit 130' INT TERM HUP
+
+  native_emit run_started "" 0 "backend=native-process evidence=${native_run_dir}"
+  for builders in "${builder_matrix[@]}"; do
+    native_cell="native-definitions-${builders}"
+    native_cell_dir="${native_run_dir}/${native_cell}"
+    mkdir "${native_cell_dir}"
+    native_state="$(mktemp -d /var/tmp/keldra-index-contention-native.XXXXXX)"
+    mkdir "${native_state}/data"
+    dd if=/dev/urandom of="${native_state}/token-signing-key" bs=64 count=1 2>/dev/null
+    chmod 0600 "${native_state}/token-signing-key"
+    native_endpoint="http://127.0.0.1:${native_port}"
+    native_secret="contention-native-secret-${source_commit:0:8}-${builders}-$$-0000000000000000"
+    native_emit cell_start "${native_cell}" "${builders}" "creating fresh native server state"
+    RUST_LOG="${server_rust_log}" KELDRA_LISTEN="127.0.0.1:${native_port}" \
+    KELDRA_PEER_LISTEN="127.0.0.1:${native_peer_port}" KELDRA_DATA_DIR="${native_state}/data" \
+    KELDRA_NODE_ID=1 KELDRA_TOKEN_SIGNING_KEY_FILE="${native_state}/token-signing-key" \
+    KELDRA_RUN_SYSTEM_BOOTSTRAP=true KELDRA_RATE_LIMIT_CREDENTIAL_GLOBAL_PER_MINUTE=1000000 \
+    KELDRA_RATE_LIMIT_CREDENTIAL_GLOBAL_BURST=100000 \
+    KELDRA_RATE_LIMIT_CREDENTIAL_CLIENT_PER_MINUTE=1000000 \
+    KELDRA_RATE_LIMIT_CREDENTIAL_CLIENT_BURST=100000 \
+    KELDRA_INDEX_DISK_CACHE_BYTES="${index_disk_cache_bytes}" \
+    KELDRA_INDEX_MEMORY_PERCENT="${index_memory_percent}" \
+    KELDRA_INDEX_BUILDER_MEMORY_BYTES_PER_KIND="${index_kind_budget_bytes}" \
+    KELDRA_INDEX_TYPED_JSON_BUILDER_MEMORY_BYTES="${index_kind_budget_bytes}" \
+    KELDRA_INDEX_TYPED_JSON_COMPACTION_MAX_LANES="${index_compaction_lanes}" \
+    KELDRA_INDEX_TYPED_JSON_PROJECTION_MAX_LANES="${index_projection_lanes}" \
+    KELDRA_INDEX_RAYON_WORKERS="${index_rayon_workers}" \
+    KELDRA_INDEX_MAX_RETAINED_COMMIT_REVISIONS=1 \
+    KELDRA_SOURCE_JOURNAL_MAX_ENTRIES="${source_journal_entries}" \
+      "${native_server}" >"${native_cell_dir}/server.log" 2>&1 &
+    native_server_pid=$!
+    attempt=1
+    while ((attempt <= 90)); do
+      [[ -f "${native_state}/data/system-bootstrap-credential.json" ]] && break
+      kill -0 "${native_server_pid}" 2>/dev/null || {
+        echo "native Keldra server exited during bootstrap" >&2; return 1;
+      }
+      sleep 1
+      attempt=$((attempt + 1))
+    done
+    [[ -f "${native_state}/data/system-bootstrap-credential.json" ]] || {
+      echo "native Keldra server did not bootstrap within 90 seconds" >&2; return 1;
+    }
+    provisioned=0
+    attempt=1
+    while ((attempt <= 90)); do
+      if KELDRA_NEW_CLIENT_SECRET="${native_secret}" "${native_cli}" \
+        --endpoint "${native_endpoint}" \
+        --credentials-file "${native_state}/data/system-bootstrap-credential.json" \
+        provision-tenant "qcontention-native-${builders}-$$" contention-owner \
+          "contention-client-${builders}" >/dev/null 2>&1; then
+        provisioned=1
+        break
+      fi
+      sleep 1
+      attempt=$((attempt + 1))
+    done
+    ((provisioned == 1)) || { echo "native server rejected tenant provisioning" >&2; return 1; }
+    native_emit topology_ready "${native_cell}" "${builders}" "endpoint_count=1"
+    (
+      while kill -0 "${native_server_pid}" 2>/dev/null; do
+        sample="$(LC_ALL=C ps -p "${native_server_pid}" -o pid= -o pcpu= -o rss= -o etime= 2>/dev/null || true)"
+        if [[ -n "${sample}" ]]; then
+          read -r pid_value cpu_value rss_value elapsed_value <<<"${sample}"
+          jq -cn --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --argjson pid "${pid_value}" --argjson cpu_percent "${cpu_value}" \
+            --argjson rss_kib "${rss_value}" --arg elapsed "${elapsed_value}" \
+            '{sampled_at:$timestamp,pid:$pid,cpu_percent:$cpu_percent,rss_kib:$rss_kib,elapsed:$elapsed}' \
+            >>"${native_cell_dir}/process-resources.jsonl"
+        fi
+        sleep 1
+      done
+    ) &
+    native_sampler_pid=$!
+    ln -sfn "${native_cell}/driver-progress.jsonl" "${native_run_dir}/active-driver-progress.jsonl"
+    native_emit workload_started "${native_cell}" "${builders}" "progress=${native_cell_dir}/driver-progress.jsonl"
+    set +e
+    KELDRA_INDEX_CONTENTION_ENDPOINTS="${native_endpoint}" \
+    KELDRA_INDEX_CONTENTION_TENANT="qcontention-native-${builders}-$$" \
+    KELDRA_INDEX_CONTENTION_BUCKET="objects-${builders}" \
+    KELDRA_INDEX_CONTENTION_CLIENT_ID="contention-client-${builders}" \
+    KELDRA_INDEX_CONTENTION_CLIENT_SECRET="${native_secret}" \
+    KELDRA_INDEX_CONTENTION_SERVER_SOURCE_COMMIT="${source_commit}" \
+    KELDRA_INDEX_CONTENTION_IMAGE="native:$(uname -s)-$(uname -m)-${source_commit}" \
+    KELDRA_INDEX_CONTENTION_TOPOLOGY=single-node KELDRA_INDEX_CONTENTION_DURABILITY=LOCAL \
+    KELDRA_INDEX_CONTENTION_DEFINITION_COUNT="${builders}" \
+    KELDRA_INDEX_CONTENTION_BASELINE_SECONDS="${baseline_seconds}" \
+    KELDRA_INDEX_CONTENTION_CONCURRENT_SECONDS="${concurrent_seconds}" \
+    KELDRA_INDEX_CONTENTION_POST_SECONDS="${post_seconds}" \
+    KELDRA_INDEX_CONTENTION_MAX_CONCURRENT_QUERY_P99_MILLISECONDS="${max_concurrent_query_p99_ms}" \
+    KELDRA_INDEX_CONTENTION_OUTPUT="${native_cell_dir}/report.json" \
+    KELDRA_INDEX_CONTENTION_PROGRESS_JSONL="${native_cell_dir}/driver-progress.jsonl" \
+      "${driver}" >"${native_cell_dir}/driver.stdout.log" 2>"${native_cell_dir}/driver.stderr.log"
+    driver_status=$?
+    set -e
+    native_stop_sampler
+    if ((driver_status != 0)) || [[ ! -s "${native_cell_dir}/report.json" ]] \
+      || ! jq -e '.result == "pass"' "${native_cell_dir}/report.json" >/dev/null \
+      || [[ ! -s "${native_cell_dir}/process-resources.jsonl" ]] \
+      || ! jq -e . "${native_cell_dir}/process-resources.jsonl" >/dev/null; then
+      echo "native contention cell failed; evidence retained in ${native_cell_dir}" >&2
+      return 1
+    fi
+    native_emit cell_passed "${native_cell}" "${builders}" "report=${native_cell_dir}/report.json"
+    native_cleanup_cell
+  done
+  native_emit run_passed "" 0 "native ${mode} matrix passed"
+  trap - EXIT INT TERM HUP
+  echo "native index contention ${mode} passed; evidence=${native_run_dir}"
+}
+
+if [[ "${qualification_backend}" == native ]]; then
+  run_native_qualification
+  exit $?
+fi
+
+if [[ -z "${requested_image}" ]]; then
+  echo "KELDRA_IMAGE must name the clean QA image for Docker qualification" >&2
   exit 2
 fi
 if ! candidate_image_id="$(
