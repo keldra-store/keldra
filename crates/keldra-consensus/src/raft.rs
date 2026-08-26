@@ -385,8 +385,8 @@ impl LeaderQuorumProof {
     }
 }
 
-/// A process-local Linux boot-time reading. It includes suspended time so a
-/// proof obtained before host suspension cannot become usable after resume.
+/// A process-local boot-time reading. It includes suspended time so a proof
+/// obtained before host suspension cannot become usable after resume.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct QuorumProofInstant(Duration);
 
@@ -417,14 +417,57 @@ fn quorum_proof_now() -> Result<QuorumProofInstant, DecisionRaftError> {
     Ok(QuorumProofInstant(Duration::new(seconds, nanoseconds)))
 }
 
+#[cfg(target_os = "macos")]
+fn quorum_proof_now() -> Result<QuorumProofInstant, DecisionRaftError> {
+    #[repr(C)]
+    struct MachTimebaseInfo {
+        numer: u32,
+        denom: u32,
+    }
+
+    unsafe extern "C" {
+        fn mach_continuous_time() -> u64;
+        fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
+    }
+
+    let mut timebase = MachTimebaseInfo { numer: 0, denom: 0 };
+    // SAFETY: `timebase` is writable storage for the documented Darwin
+    // `mach_timebase_info_data_t`, and the function does not retain it.
+    let result = unsafe { mach_timebase_info(&mut timebase) };
+    if result != 0 || timebase.denom == 0 {
+        return Err(DecisionRaftError::Unavailable(format!(
+            "mach_timebase_info failed with kernel status {result}"
+        )));
+    }
+
+    // SAFETY: `mach_continuous_time` has no arguments or memory contract. Its
+    // ticks include host suspension, matching Linux CLOCK_BOOTTIME semantics.
+    let ticks = unsafe { mach_continuous_time() };
+    let nanoseconds = u128::from(ticks)
+        .checked_mul(u128::from(timebase.numer))
+        .ok_or_else(|| {
+            DecisionRaftError::Unavailable("mach_continuous_time range is exhausted".into())
+        })?
+        / u128::from(timebase.denom);
+    let seconds = u64::try_from(nanoseconds / 1_000_000_000).map_err(|_| {
+        DecisionRaftError::Unavailable("mach_continuous_time range is exhausted".into())
+    })?;
+    let subsecond_nanoseconds = u32::try_from(nanoseconds % 1_000_000_000)
+        .expect("a nanosecond remainder always fits in u32");
+    Ok(QuorumProofInstant(Duration::new(
+        seconds,
+        subsecond_nanoseconds,
+    )))
+}
+
 pub(crate) fn boot_time_now() -> Result<Duration, DecisionRaftError> {
     quorum_proof_now().map(|instant| instant.0)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn quorum_proof_now() -> Result<QuorumProofInstant, DecisionRaftError> {
     Err(DecisionRaftError::Unavailable(
-        "leader quorum proofs require Linux CLOCK_BOOTTIME".into(),
+        "leader quorum proofs require a suspend-aware boot clock".into(),
     ))
 }
 
@@ -1333,6 +1376,14 @@ fn write_error(error: DurableStorageError) -> StorageError<u64> {
 #[cfg(test)]
 mod open_tests {
     use super::*;
+
+    #[test]
+    fn suspend_aware_boot_clock_is_available_and_monotonic() {
+        let first = boot_time_now().unwrap();
+        let second = boot_time_now().unwrap();
+
+        assert!(second >= first);
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn open_retries_the_exact_transient_same_process_lock() {

@@ -278,13 +278,13 @@ run_native_qualification() {
     while ((attempt <= 90)); do
       [[ -f "${native_state}/data/system-bootstrap-credential.json" ]] && break
       kill -0 "${native_server_pid}" 2>/dev/null || {
-        echo "native Keldra server exited during bootstrap" >&2; return 1;
+        echo "native Keldra server exited during bootstrap" >&2; exit 1;
       }
       sleep 1
       attempt=$((attempt + 1))
     done
     [[ -f "${native_state}/data/system-bootstrap-credential.json" ]] || {
-      echo "native Keldra server did not bootstrap within 90 seconds" >&2; return 1;
+      echo "native Keldra server did not bootstrap within 90 seconds" >&2; exit 1;
     }
     provisioned=0
     attempt=1
@@ -300,7 +300,7 @@ run_native_qualification() {
       sleep 1
       attempt=$((attempt + 1))
     done
-    ((provisioned == 1)) || { echo "native server rejected tenant provisioning" >&2; return 1; }
+    ((provisioned == 1)) || { echo "native server rejected tenant provisioning" >&2; exit 1; }
     native_emit topology_ready "${native_cell}" "${builders}" "endpoint_count=1"
     (
       while kill -0 "${native_server_pid}" 2>/dev/null; do
@@ -344,7 +344,7 @@ run_native_qualification() {
       || [[ ! -s "${native_cell_dir}/process-resources.jsonl" ]] \
       || ! jq -e . "${native_cell_dir}/process-resources.jsonl" >/dev/null; then
       echo "native contention cell failed; evidence retained in ${native_cell_dir}" >&2
-      return 1
+      exit 1
     fi
     native_emit cell_passed "${native_cell}" "${builders}" "report=${native_cell_dir}/report.json"
     native_cleanup_cell
