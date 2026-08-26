@@ -429,7 +429,12 @@ impl IndexCommitPublisher {
                             expected_version: observed
                                 .as_ref()
                                 .map(|value| value.current_object_version),
-                            command_id: content_command(definition.index_id, &path, &blob),
+                            command_id: publish_command(
+                                definition.index_id,
+                                &path,
+                                &blob,
+                                observed.as_ref().map(|value| value.current_object_version),
+                            ),
                             definition_guard: Some(DefinitionVersionGuard {
                                 kind: DefinitionKind::Index,
                                 exact_path: definition_path(&definition.name)?,
@@ -548,7 +553,12 @@ impl IndexCommitPublisher {
                 exact_path: path.clone(),
                 blob: blob.clone(),
                 expected_version: Some(current.current_object_version),
-                command_id: content_command(definition.index_id, &path, &blob),
+                command_id: publish_command(
+                    definition.index_id,
+                    &path,
+                    &blob,
+                    Some(current.current_object_version),
+                ),
                 definition_guard: Some(DefinitionVersionGuard {
                     kind: DefinitionKind::Index,
                     exact_path: definition_path(&definition.name)?,
@@ -631,7 +641,12 @@ impl IndexCommitPublisher {
                     exact_path: path.clone(),
                     blob: blob.clone(),
                     expected_version: Some(current.current_object_version),
-                    command_id: content_command(definition.index_id, &path, &blob),
+                    command_id: publish_command(
+                        definition.index_id,
+                        &path,
+                        &blob,
+                        Some(current.current_object_version),
+                    ),
                     definition_guard: Some(DefinitionVersionGuard {
                         kind: DefinitionKind::Index,
                         exact_path: definition_path(&definition.name)?,
@@ -856,7 +871,7 @@ impl IndexCommitPublisher {
                 bucket_id,
                 index_id: definition.index_id,
                 exact_path: path.to_owned(),
-                command_id: content_command(definition.index_id, path, &blob),
+                command_id: publish_command(definition.index_id, path, &blob, None),
                 blob,
                 expected_version: None,
                 definition_guard: None,
@@ -1268,7 +1283,7 @@ impl IndexComponentBatchSink {
                     exact_path: path.clone(),
                     blob: pack.blob.clone(),
                     expected_version: None,
-                    command_id: content_command(self.definition.index_id, &path, &pack.blob),
+                    command_id: publish_command(self.definition.index_id, &path, &pack.blob, None),
                     definition_guard: None,
                     definition_intent: None,
                     admission: self.admission,
@@ -1519,11 +1534,26 @@ async fn stage_artifact_bytes(
         .map_err(index_status)
 }
 
-fn content_command(index_id: u64, path: &str, blob: &BlobRef) -> String {
+fn publish_command(
+    index_id: u64,
+    path: &str,
+    blob: &BlobRef,
+    expected_version: Option<VersionId>,
+) -> String {
     let mut hasher = blake3::Hasher::new();
+    hasher.update(b"keldra.index.publish.v1");
     hasher.update(path.as_bytes());
     hasher.update(&blob.hash);
     hasher.update(&blob.length.to_be_bytes());
+    match expected_version {
+        None => {
+            hasher.update(&[0]);
+        }
+        Some(version) => {
+            hasher.update(&[1]);
+            hasher.update(&version.0.to_be_bytes());
+        }
+    }
     let digest = hasher.finalize();
     format!("index-v4-{index_id}-{}", &digest.to_hex().as_str()[..24])
 }
@@ -1591,6 +1621,27 @@ mod tests {
             UNIX_EPOCH + Duration::from_secs(revision),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn publish_command_binds_the_exact_cas_precondition() {
+        let blob = BlobRef {
+            hash: [7; 32],
+            length: 91,
+        };
+        let absent = publish_command(11, "_keldra/index", &blob, None);
+        let version_3 = publish_command(11, "_keldra/index", &blob, Some(VersionId(3)));
+
+        assert_eq!(absent, publish_command(11, "_keldra/index", &blob, None));
+        assert_eq!(
+            version_3,
+            publish_command(11, "_keldra/index", &blob, Some(VersionId(3)))
+        );
+        assert_ne!(absent, version_3);
+        assert_ne!(
+            version_3,
+            publish_command(11, "_keldra/index", &blob, Some(VersionId(4)))
+        );
     }
 
     #[test]

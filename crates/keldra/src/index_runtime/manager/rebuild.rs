@@ -304,8 +304,11 @@ pub(super) async fn checkpoint_catch_up_root(
     let checkpoint = DurableRebuildRoot {
         candidate,
         baseline_complete: true,
-        ..loaded.root
+        ..loaded.root.clone()
     };
+    if checkpoint == loaded.root {
+        return Ok(());
+    }
     dependencies
         .publisher
         .publish_rebuild_root(
