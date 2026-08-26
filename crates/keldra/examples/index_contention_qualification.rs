@@ -112,6 +112,8 @@ struct MutationReport {
     visibility_samples_completed: u64,
     visibility_samples_skipped_busy: u64,
     visibility_sample_errors: u64,
+    visibility_sample_failures: Vec<VisibilitySampleFailure>,
+    visibility_sample_failures_omitted: u64,
     publication_visibility_lag: LatencyReport,
     visibility_definition: &'static str,
 }
@@ -142,7 +144,27 @@ struct ResponsivenessReport {
     zero_dropped_schedules: bool,
     concurrent_query_p99_within_configured_limit: bool,
     publication_visibility_samples_complete: bool,
+    publication_visibility_p99_within_configured_limit: bool,
 }
+
+#[derive(Debug, Serialize)]
+struct VisibilitySampleFailure {
+    canary_id: u64,
+    object_version: u64,
+    definition_position: usize,
+    definition_name: String,
+    error: String,
+}
+
+struct VisibilitySampleOutcome {
+    canary: Canary,
+    definition_position: usize,
+    definition_name: String,
+    result: Result<Duration>,
+}
+
+const MAX_VISIBILITY_SAMPLE_FAILURE_DETAILS: usize = 16;
+const MAX_VISIBILITY_SAMPLE_ERROR_CHARS: usize = 512;
 
 #[derive(Clone, Copy)]
 struct MutationJob {
@@ -300,6 +322,9 @@ async fn main() -> Result<()> {
     let concurrent_p99_passed = config
         .max_concurrent_query_p99_ms
         .is_none_or(|maximum| concurrent.schedule_to_response.p99_ms <= maximum);
+    let publication_visibility_p99_passed = config
+        .max_publication_visibility_p99_ms
+        .is_none_or(|maximum| mutation_report.publication_visibility_lag.p99_ms <= maximum);
     let all_definitions_offered = [&baseline, &concurrent, &post]
         .iter()
         .all(|phase| phase.offered_definition_count == config.definition_count);
@@ -313,7 +338,8 @@ async fn main() -> Result<()> {
     let responsiveness_passed = zero_query_request_errors_or_timeouts
         && zero_dropped_schedules
         && concurrent_p99_passed
-        && publication_visibility_samples_complete;
+        && publication_visibility_samples_complete
+        && publication_visibility_p99_passed;
     let report = Report {
         schema: "keldra.index-contention-qualification.v1",
         started_unix_milliseconds,
@@ -328,7 +354,7 @@ async fn main() -> Result<()> {
         index_definition_ids: definitions,
         observed_source_node_ids: observed.into_iter().collect(),
         assignment_observability: "public APIs expose source node IDs and placement epochs, but not builder-to-node assignments; definition_count is cluster-wide work and is not labeled per-node concurrency",
-        responsiveness_definition: "every offered open-loop schedule completes within request_timeout with no scheduler drop, request error, timeout, or oracle mismatch; optional concurrent p99 gate is applied when configured, otherwise the matrix comparison supplies the performance acceptance threshold",
+        responsiveness_definition: "every offered open-loop schedule completes within request_timeout with no scheduler drop, request error, timeout, or oracle mismatch; visibility probes use request_timeout per query and a separate observation timeout; optional concurrent-query and publication-visibility p99 gates are applied when configured",
         baseline,
         concurrent,
         mutations: mutation_report,
@@ -355,6 +381,7 @@ async fn main() -> Result<()> {
             zero_dropped_schedules,
             concurrent_query_p99_within_configured_limit: concurrent_p99_passed,
             publication_visibility_samples_complete,
+            publication_visibility_p99_within_configured_limit: publication_visibility_p99_passed,
         },
     };
     let encoded = serde_json::to_vec_pretty(&report)?;
@@ -704,6 +731,7 @@ async fn run_mutations(
     // visibility evidence bounded and independent of definition count and
     // mutation throughput, so it cannot become the load under test.
     let visibility_permits = Arc::new(Semaphore::new(1));
+    let mut visibility_sample_ordinal = 0_u64;
     let mut final_canary: Option<Canary> = None;
     while let Some(event) = result_rx.recv().await {
         match event {
@@ -726,19 +754,39 @@ async fn run_mutations(
                     if canary.id % config.visibility_sample_every_batches == 0 {
                         if let Ok(permit) = visibility_permits.clone().try_acquire_owned() {
                             report.visibility_samples_requested += 1;
+                            let definition_position = visibility_definition_position(
+                                visibility_sample_ordinal,
+                                config.definition_count,
+                            );
+                            visibility_sample_ordinal = visibility_sample_ordinal.saturating_add(1);
                             let channel = visibility_channels
-                                [canary.id as usize % visibility_channels.len()]
+                                [definition_position % visibility_channels.len()]
                             .clone();
-                            let name =
-                                data::index_name(canary.id as usize % config.definition_count);
+                            let name = data::index_name(definition_position);
                             let bucket = config.bucket.clone();
                             let token = token.clone();
                             let poll = config.visibility_poll;
-                            let timeout = config.request_timeout;
+                            let request_timeout = config.request_timeout;
+                            let observation_timeout = config.visibility_observation_timeout;
                             visibility_tasks.spawn(async move {
                                 let _permit = permit;
-                                wait_canary(&channel, &token, &bucket, &name, canary, poll, timeout)
-                                    .await
+                                let result = wait_canary(
+                                    &channel,
+                                    &token,
+                                    &bucket,
+                                    &name,
+                                    canary,
+                                    poll,
+                                    request_timeout,
+                                    observation_timeout,
+                                )
+                                .await;
+                                VisibilitySampleOutcome {
+                                    canary,
+                                    definition_position,
+                                    definition_name: name,
+                                    result,
+                                }
                             });
                         } else {
                             report.visibility_samples_skipped_busy += 1;
@@ -757,12 +805,29 @@ async fn run_mutations(
     }
     sampler.await.context("queue sampler panicked")?;
     while let Some(sample) = visibility_tasks.join_next().await {
-        match sample.context("visibility task panicked")? {
+        let sample = sample.context("visibility task panicked")?;
+        match sample.result {
             Ok(duration) => {
                 report.visibility_samples_completed += 1;
                 visibility_latency.record(duration)?;
             }
-            Err(_) => report.visibility_sample_errors += 1,
+            Err(error) => {
+                report.visibility_sample_errors += 1;
+                if report.visibility_sample_failures.len() < MAX_VISIBILITY_SAMPLE_FAILURE_DETAILS {
+                    report
+                        .visibility_sample_failures
+                        .push(VisibilitySampleFailure {
+                            canary_id: sample.canary.id,
+                            object_version: sample.canary.version,
+                            definition_position: sample.definition_position,
+                            definition_name: sample.definition_name,
+                            error: bounded_error(&format!("{error:#}")),
+                        });
+                } else {
+                    report.visibility_sample_failures_omitted =
+                        report.visibility_sample_failures_omitted.saturating_add(1);
+                }
+            }
         }
     }
     report.minimum_sampled_queue_depth_while_producing = minimum_depth.load(Ordering::Relaxed);
@@ -780,7 +845,7 @@ async fn run_mutations(
         report.accepted_operations as f64 / report.elapsed_seconds;
     report.accepted_bytes_per_second = report.accepted_bytes as f64 / report.elapsed_seconds;
     report.publication_visibility_lag = visibility_latency.report();
-    report.visibility_definition = "publication_visibility_lag: receipt acceptance to first ordinary query hit with the exact canary object_version; samples rotate across definitions and include polling-resolution delay";
+    report.visibility_definition = "publication_visibility_lag: receipt acceptance to first ordinary query hit with the exact canary object_version; samples rotate by sample ordinal across definitions, use a separate total observation timeout, and include polling-resolution delay";
     Ok((report, final_canary))
 }
 
@@ -862,9 +927,10 @@ async fn wait_canary(
     index_name: &str,
     canary: Canary,
     poll: Duration,
-    timeout: Duration,
+    request_timeout: Duration,
+    observation_timeout: Duration,
 ) -> Result<Duration> {
-    let deadline = Instant::now() + timeout;
+    let deadline = canary.accepted_at + observation_timeout;
     let mut client = index_client(channel.clone(), token)?;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -874,11 +940,11 @@ async fn wait_canary(
             canary.id
         );
         let response = tokio::time::timeout(
-            remaining,
+            remaining.min(request_timeout),
             marker_query(&mut client, bucket, index_name, canary.id),
         )
         .await
-        .context("canary query exceeded visibility timeout")??;
+        .context("canary query exceeded per-request timeout")??;
         if response.hits.iter().any(|hit| {
             hit.object_version == canary.version
                 && hit
@@ -913,6 +979,7 @@ async fn wait_canary_on_all(
             name,
             canary,
             config.visibility_poll,
+            config.request_timeout,
             config.drain_timeout,
         )
         .await?;
@@ -929,6 +996,17 @@ async fn wait_canary_on_all(
         }
     }
     Ok((true, source_nodes))
+}
+
+fn visibility_definition_position(sample_ordinal: u64, definition_count: usize) -> usize {
+    (sample_ordinal as usize) % definition_count
+}
+
+fn bounded_error(error: &str) -> String {
+    error
+        .chars()
+        .take(MAX_VISIBILITY_SAMPLE_ERROR_CHARS)
+        .collect()
 }
 
 async fn verify_final_mutable_state(
@@ -1212,5 +1290,22 @@ mod tests {
             ..unavailable
         };
         assert!(!source_has_no_observed_lag(&behind));
+    }
+
+    #[test]
+    fn visibility_samples_rotate_independently_of_canary_interval() {
+        let positions = (0..20)
+            .map(|ordinal| visibility_definition_position(ordinal, 16))
+            .collect::<Vec<_>>();
+        assert_eq!(&positions[..16], &(0..16).collect::<Vec<_>>());
+        assert_eq!(&positions[16..], &[0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn visibility_failure_errors_are_bounded_on_character_boundaries() {
+        let error = "é".repeat(MAX_VISIBILITY_SAMPLE_ERROR_CHARS + 10);
+        let bounded = bounded_error(&error);
+        assert_eq!(bounded.chars().count(), MAX_VISIBILITY_SAMPLE_ERROR_CHARS);
+        assert!(error.starts_with(&bounded));
     }
 }

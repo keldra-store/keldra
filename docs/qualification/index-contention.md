@@ -118,7 +118,9 @@ watch -n 2 cat ../../releases/keldra/index-contention/latest/status.json
 
 `run.json` records the source commit, immutable image ID and revision, image
 platform, topology, matrix, phase durations, host resources, and Docker resource
-allocation. Every cell retains the client report, client stdout/stderr, and
+allocation. It also records the request, drain, visibility polling and total
+visibility-observation timeouts, sampling interval, and both absolute p99
+acceptance bounds. Every cell retains the client report, client stdout/stderr, and
 server logs. Docker cells use `container-resources.jsonl` for CPU, memory,
 network, block-I/O, and process counters; native cells use
 `process-resources.jsonl` for host-reported server CPU and RSS.
@@ -167,13 +169,25 @@ distributions. Smoke results must never be reported as sustained evidence.
 For this harness, “queries remained responsive” means the open-loop driver
 recorded zero dropped schedules, request errors, and timeouts, every completed
 query satisfied its stable-result oracle, and every request stayed within the
-configured request timeout. The p50/p95/p99 values are measured evidence, not an
-SLO claim. The wrapper does enforce a configurable concurrent-query p99 gate,
-defaulting to 2,000 ms. Setting
+configured per-request timeout. Publication probes use that timeout for each
+ordinary query RPC, but may continue polling for the separate total observation
+timeout. The latter defaults to the 600-second drain timeout and is configured
+with `KELDRA_INDEX_CONTENTION_VISIBILITY_OBSERVATION_TIMEOUT_SECONDS`; a slow
+publication is therefore measured rather than incorrectly classified as one
+slow RPC after 30 seconds. Samples rotate across definitions by sample ordinal,
+independently of canary IDs and the sampling interval. Reports retain up to 16
+failed sample identities and bounded error messages, plus an omitted count.
+
+The p50/p95/p99 values are measured evidence, not an SLO claim. The wrapper
+enforces a configurable concurrent-query p99 gate, defaulting to 2,000 ms, and
+a publication-visibility p99 gate, defaulting to 30,000 ms. Setting
 `KELDRA_INDEX_CONTENTION_MAX_CONCURRENT_QUERY_P99_MILLISECONDS=disabled` removes
 that absolute latency assertion and weakens the responsiveness result, although
-the matrix distributions are still recorded. A single matrix pass exposes
-scaling behavior;
+the matrix distributions are still recorded. Likewise,
+`KELDRA_INDEX_CONTENTION_MAX_PUBLICATION_VISIBILITY_P99_MILLISECONDS=disabled`
+removes only the publication p99 assertion; visibility sample completeness and
+final exact convergence remain mandatory. A single matrix pass exposes scaling
+behavior;
 statistically credible release comparison requires repeated sustained runs on
 equivalent hardware, preferably with baseline/candidate order varied between
 runs. Set `KELDRA_INDEX_CONTENTION_COMPARISON_ORDER=candidate-first` on

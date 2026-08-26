@@ -30,8 +30,10 @@ pub struct Config {
     pub request_timeout: Duration,
     pub drain_timeout: Duration,
     pub visibility_poll: Duration,
+    pub visibility_observation_timeout: Duration,
     pub visibility_sample_every_batches: u64,
     pub max_concurrent_query_p99_ms: Option<f64>,
+    pub max_publication_visibility_p99_ms: Option<f64>,
     pub output: Option<PathBuf>,
     pub progress_jsonl: Option<PathBuf>,
 }
@@ -60,8 +62,10 @@ pub struct PublicConfig {
     pub request_timeout_milliseconds: u64,
     pub drain_timeout_seconds: u64,
     pub visibility_poll_milliseconds: u64,
+    pub visibility_observation_timeout_seconds: u64,
     pub visibility_sample_every_batches: u64,
     pub max_concurrent_query_p99_ms: Option<f64>,
+    pub max_publication_visibility_p99_ms: Option<f64>,
 }
 
 impl Config {
@@ -113,7 +117,10 @@ impl Config {
             matches!(durability.as_str(), "LOCAL" | "REPLICATED"),
             "durability must be LOCAL or REPLICATED"
         );
-        let max_concurrent_query_p99_ms = optional_bound("MAX_CONCURRENT_QUERY_P99_MILLISECONDS")?;
+        let max_concurrent_query_p99_ms =
+            optional_bound("MAX_CONCURRENT_QUERY_P99_MILLISECONDS", 2_000.0)?;
+        let max_publication_visibility_p99_ms =
+            optional_bound("MAX_PUBLICATION_VISIBILITY_P99_MILLISECONDS", 30_000.0)?;
         ensure!(
             matches!(
                 (topology.as_str(), durability.as_str()),
@@ -128,6 +135,7 @@ impl Config {
                 && server_source_commit.bytes().all(|b| b.is_ascii_hexdigit()),
             "server source commit must be a full Git commit ID"
         );
+        let drain_timeout = seconds("DRAIN_TIMEOUT_SECONDS", 600)?;
         Ok(Self {
             endpoints,
             tenant: required("TENANT")?,
@@ -151,10 +159,15 @@ impl Config {
             concurrent: seconds("CONCURRENT_SECONDS", 300)?,
             post: seconds("POST_SECONDS", 30)?,
             request_timeout: millis("REQUEST_TIMEOUT_MILLISECONDS", 30_000)?,
-            drain_timeout: seconds("DRAIN_TIMEOUT_SECONDS", 600)?,
+            drain_timeout,
             visibility_poll: millis("VISIBILITY_POLL_MILLISECONDS", 100)?,
+            visibility_observation_timeout: seconds(
+                "VISIBILITY_OBSERVATION_TIMEOUT_SECONDS",
+                drain_timeout.as_secs(),
+            )?,
             visibility_sample_every_batches,
             max_concurrent_query_p99_ms,
+            max_publication_visibility_p99_ms,
             output: env::var_os(name("OUTPUT")).map(PathBuf::from),
             progress_jsonl: env::var_os(name("PROGRESS_JSONL")).map(PathBuf::from),
         })
@@ -184,8 +197,10 @@ impl Config {
             request_timeout_milliseconds: self.request_timeout.as_millis() as u64,
             drain_timeout_seconds: self.drain_timeout.as_secs(),
             visibility_poll_milliseconds: self.visibility_poll.as_millis() as u64,
+            visibility_observation_timeout_seconds: self.visibility_observation_timeout.as_secs(),
             visibility_sample_every_batches: self.visibility_sample_every_batches,
             max_concurrent_query_p99_ms: self.max_concurrent_query_p99_ms,
+            max_publication_visibility_p99_ms: self.max_publication_visibility_p99_ms,
         }
     }
 }
@@ -218,10 +233,9 @@ fn millis(suffix: &str, default: u64) -> Result<Duration> {
     Ok(Duration::from_millis(value))
 }
 
-fn optional_bound(suffix: &str) -> Result<Option<f64>> {
+fn optional_bound(suffix: &str, default: f64) -> Result<Option<f64>> {
     let key = name(suffix);
-    let value = env::var(&key)
-        .with_context(|| format!("{key} is required (positive milliseconds or 'disabled')"))?;
+    let value = env::var(&key).unwrap_or_else(|_| default.to_string());
     if value.eq_ignore_ascii_case("disabled") {
         return Ok(None);
     }
