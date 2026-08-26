@@ -9,9 +9,9 @@ use keldra_index::v4::build::{
     ProjectedSource as NativeProjectedSource, SourcePush,
 };
 use keldra_index::v4::{
-    DocIdRange, LocatorEntry, LocatorStreamRoot, LocatorValue, ObjectIdentity, Schema,
-    SegmentDescriptor, SegmentIdentity, locate_path_values, publish_locator_delta,
-    rewrite_segment_live_mask,
+    DocIdRange, INDEX_ARTIFACT_PACK_BYTES, LocatorEntry, LocatorStreamRoot, LocatorValue,
+    ObjectIdentity, PreparedLiveMaskRewrite, Schema, SegmentDescriptor, SegmentIdentity,
+    locate_path_values, prepare_segment_live_mask, publish_locator_delta,
 };
 use keldra_index::{
     FIXED_INDEX_SEAL_WORKSPACE_BYTES, IndexError, IndexKind, MIN_INDEX_KIND_MEMORY_BYTES,
@@ -62,7 +62,9 @@ use buffer::{
 };
 #[path = "manager/candidate.rs"]
 mod candidate;
-use candidate::{CandidateCommit, manifest_physical_order, runtime_kind};
+use candidate::{
+    CandidateCommit, LIVE_MASK_PREPARED_METADATA_BYTES, manifest_physical_order, runtime_kind,
+};
 #[path = "manager/debt.rs"]
 mod debt;
 use debt::{DebtLimits, DebtSelection};

@@ -130,8 +130,9 @@ use super::publication::{
 
 pub(crate) use prepared_publication::{
     PreparedCurrentPointerPublication, PreparedManifestPublication, PreparedPackPublication,
-    PublishedManifest,
+    PublishedManifest, PublishedPreparedPacks,
 };
+use prepared_publication::{publish_prepared_packs, retryable_pack_publish_status};
 
 #[derive(Clone)]
 pub(crate) struct IndexCommitPublisher {
@@ -212,6 +213,13 @@ impl IndexCommitPublisher {
         );
         sink.progress = Some(progress);
         sink
+    }
+
+    pub(crate) async fn publish_incremental_prepared_packs(
+        &self,
+        prepared: Vec<PreparedPackPublication>,
+    ) -> Result<PublishedPreparedPacks, IndexError> {
+        publish_prepared_packs(&self.cohorts, PublicationCohortClass::Incremental, prepared).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1239,6 +1247,55 @@ impl IndexComponentBatchSink {
         &mut self,
         identity: SegmentIdentity,
     ) -> Result<Vec<ArtifactPackReference>, IndexError> {
+        let prepared = self.prepare_segment_publication(identity).await?;
+        let pack_count = prepared.staged_pack_count();
+        let encoded_bytes = prepared.logical_artifact_bytes()?;
+        let component_count = prepared.staged_component_count()?;
+        let span = tracing::debug_span!(
+            "keldra.index.v4_component_publish",
+            index.id = self.definition.index_id,
+            tenant.id = self.tenant_id,
+            bucket.id = self.bucket_id,
+            component.count = component_count,
+            component.bytes = encoded_bytes,
+            pack.count = pack_count,
+        );
+        let started = std::time::Instant::now();
+        let result = publish_prepared_packs(&self.cohorts, self.cohort_class, vec![prepared])
+            .instrument(span.clone())
+            .await
+            .and_then(|mut published| {
+                published.references.pop().ok_or(IndexError::InvalidFormat(
+                    "single segment publication returned no pack references",
+                ))
+            });
+        let failed = result.is_err();
+        span.in_scope(|| {
+            tracing::debug!(
+                publish.outcome = if failed { "failed" } else { "completed" },
+                monotonic_counter.keldra_index_v4_components_published_total =
+                    if failed { 0 } else { component_count },
+                monotonic_counter.keldra_index_v4_component_publish_failures_total =
+                    u64::from(failed),
+                monotonic_counter.keldra_index_v4_component_bytes_total =
+                    if failed { 0 } else { encoded_bytes },
+                monotonic_counter.keldra_index_v4_packs_published_total =
+                    if failed { 0 } else { pack_count },
+                histogram.keldra_index_v4_component_publish_duration_seconds =
+                    started.elapsed().as_secs_f64(),
+                "format-v4 index components publication finished"
+            );
+        });
+        if !failed && let Some(progress) = &self.progress {
+            progress.record_output(0, encoded_bytes, component_count);
+        }
+        result
+    }
+
+    pub(crate) async fn prepare_segment_publication(
+        &mut self,
+        identity: SegmentIdentity,
+    ) -> Result<PreparedPackPublication, IndexError> {
         let tail = {
             let mut shared = self.lock_active()?;
             let active = shared.as_mut().ok_or(IndexError::InvalidFormat(
@@ -1267,124 +1324,14 @@ impl IndexComponentBatchSink {
                 "component sink has no active segment",
             ))?
             .complete()?;
-        let pack_count = active.staged.len() as u64;
-        let encoded_bytes = active
-            .staged
-            .iter()
-            .try_fold(0_u64, |total, pack| total.checked_add(pack.blob.length))
-            .ok_or(IndexError::OffsetOverflow)?;
-        let component_count = active
-            .staged
-            .iter()
-            .try_fold(0_u64, |total, pack| total.checked_add(pack.component_count))
-            .ok_or(IndexError::OffsetOverflow)?;
-        let span = tracing::debug_span!(
-            "keldra.index.v4_component_publish",
-            index.id = self.definition.index_id,
-            tenant.id = self.tenant_id,
-            bucket.id = self.bucket_id,
-            component.count = component_count,
-            component.bytes = encoded_bytes,
-            pack.count = pack_count,
-        );
-        let started = std::time::Instant::now();
-        let result = self
-            .publish_staged_packs(active)
-            .instrument(span.clone())
-            .await;
-        let failed = result.is_err();
-        span.in_scope(|| {
-            tracing::debug!(
-                publish.outcome = if failed { "failed" } else { "completed" },
-                monotonic_counter.keldra_index_v4_components_published_total =
-                    if failed { 0 } else { component_count },
-                monotonic_counter.keldra_index_v4_component_publish_failures_total =
-                    u64::from(failed),
-                monotonic_counter.keldra_index_v4_component_bytes_total =
-                    if failed { 0 } else { encoded_bytes },
-                monotonic_counter.keldra_index_v4_packs_published_total =
-                    if failed { 0 } else { pack_count },
-                histogram.keldra_index_v4_component_publish_duration_seconds =
-                    started.elapsed().as_secs_f64(),
-                "format-v4 index components publication finished"
-            );
-        });
-        if !failed {
-            if let Some(progress) = &self.progress {
-                progress.record_output(0, encoded_bytes, component_count);
-            }
-        }
-        result
-    }
-
-    async fn publish_staged_packs(
-        &self,
-        active: CompletedSegmentPacks,
-    ) -> Result<Vec<ArtifactPackReference>, IndexError> {
-        let prepared = PreparedPackPublication::new(
+        PreparedPackPublication::new(
             &self.definition,
             self.tenant_id,
             self.bucket_id,
             self.admission,
             active,
-        )?;
-        let mut outcomes = vec![None; prepared.requests().len()];
-        let mut pending = (0..prepared.requests().len()).collect::<Vec<_>>();
-        while !pending.is_empty() {
-            let requests = pending
-                .iter()
-                .map(|&index| prepared.requests()[index].clone())
-                .collect();
-            let published = match self
-                .cohorts
-                .publish_packs(requests, self.cohort_class)
-                .await
-            {
-                Err(error) if retryable_pack_publish_status(&error) => {
-                    tracing::debug!(%error, "retrying retained immutable index pack cohort");
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue;
-                }
-                Err(error) => return Err(IndexError::Io(error.to_string())),
-                Ok(published) if published.len() == pending.len() => published,
-                Ok(_) => {
-                    return Err(IndexError::InvalidFormat(
-                        "grouped pack outcome count differs from submitted pack count",
-                    ));
-                }
-            };
-            let mut retry = Vec::new();
-            for (index, result) in pending.into_iter().zip(published) {
-                match result {
-                    Ok(outcome) => outcomes[index] = Some(outcome),
-                    Err(error) if retryable_pack_publish_status(&error) => retry.push(index),
-                    Err(error) => return Err(IndexError::Io(error.to_string())),
-                }
-            }
-            pending = retry;
-            if !pending.is_empty() {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        }
-        let outcomes =
-            outcomes
-                .into_iter()
-                .collect::<Option<Vec<_>>>()
-                .ok_or(IndexError::InvalidFormat(
-                    "grouped pack publication left an unresolved receipt",
-                ))?;
-        prepared.apply(&outcomes)
+        )
     }
-}
-
-fn retryable_pack_publish_status(error: &Status) -> bool {
-    matches!(
-        error.code(),
-        tonic::Code::Unavailable
-            | tonic::Code::DeadlineExceeded
-            | tonic::Code::Cancelled
-            | tonic::Code::Unknown
-    )
 }
 
 fn commit_artifact_totals(

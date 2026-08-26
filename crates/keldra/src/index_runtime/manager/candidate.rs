@@ -5,6 +5,12 @@ use crate::index_runtime::committed_view::{
     IndexCommitManifest, MAX_PENDING_ATOMIC_BATCHES, ManifestPhysicalOrder, PendingAtomicBatch,
 };
 
+pub(super) const LIVE_MASK_PREPARED_METADATA_BYTES: usize = INDEX_ARTIFACT_PACK_BYTES;
+// The active encoder pack is already part of FIXED_INDEX_SEAL_WORKSPACE_BYTES.
+// This separate reservation covers descriptors and request metadata retained
+// while sequential rewrites are assembled into one drain-local publication.
+const LIVE_MASK_MATERIALIZATION_RESERVE_BYTES: usize = LIVE_MASK_PREPARED_METADATA_BYTES;
+
 pub(super) fn runtime_kind(kind: keldra_index::v4::IndexKind) -> IndexKind {
     match kind {
         keldra_index::v4::IndexKind::Path => IndexKind::Path,
@@ -330,9 +336,17 @@ impl CandidateCommit {
             .ok_or_else(|| {
                 Status::resource_exhausted("pending live-mask invalidation size overflow")
             })?;
-        let peak_bytes = current_bytes.checked_add(allocation).ok_or_else(|| {
-            Status::resource_exhausted("pending live-mask invalidation size overflow")
-        })?;
+        let first_materialization_reserve = if self.pending_live_mask_invalidations.is_empty() {
+            LIVE_MASK_MATERIALIZATION_RESERVE_BYTES
+        } else {
+            0
+        };
+        let peak_bytes = current_bytes
+            .checked_add(first_materialization_reserve)
+            .and_then(|bytes| bytes.checked_add(allocation))
+            .ok_or_else(|| {
+                Status::resource_exhausted("pending live-mask invalidation size overflow")
+            })?;
         Ok((identity, peak_bytes))
     }
 
@@ -341,6 +355,13 @@ impl CandidateCommit {
             self.pending_live_mask_invalidations
                 .capacity()
                 .checked_mul(std::mem::size_of::<PendingLiveMaskInvalidation>())
+                .and_then(|bytes| {
+                    bytes.checked_add(if self.pending_live_mask_invalidations.is_empty() {
+                        0
+                    } else {
+                        LIVE_MASK_MATERIALIZATION_RESERVE_BYTES
+                    })
+                })
                 .ok_or_else(|| {
                     Status::resource_exhausted("pending live-mask invalidation size overflow")
                 })?,
