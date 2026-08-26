@@ -21,6 +21,10 @@ mod rebuild_checkpoint;
 pub(crate) use rebuild_checkpoint::LoadedRebuildRoot;
 #[path = "publisher/merge_rebase.rs"]
 mod merge_rebase;
+#[path = "publisher/prepared_publication.rs"]
+mod prepared_publication;
+#[path = "publisher/revalidation.rs"]
+mod revalidation;
 
 use crate::cluster_object_read::ClusterObjectReader;
 use crate::index_config::IndexRuntimeConfig;
@@ -48,6 +52,15 @@ impl IndexPointerCasClass {
             Self::Retention => "retention",
             Self::Rebuild => "rebuild",
         }
+    }
+}
+
+fn cohort_class(class: IndexPointerCasClass) -> PublicationCohortClass {
+    match class {
+        IndexPointerCasClass::Incremental => PublicationCohortClass::Incremental,
+        IndexPointerCasClass::Merge
+        | IndexPointerCasClass::Retention
+        | IndexPointerCasClass::Rebuild => PublicationCohortClass::Maintenance,
     }
 }
 
@@ -108,9 +121,16 @@ fn emit_pointer_cas_result<T>(
     );
 }
 use super::events::IndexBarrier;
+use super::manager::publication_cohort::{IndexPublicationCohorts, PublicationCohortClass};
 use super::publication::{
-    DefinitionVersionGuard, DerivedArtifactAdmission, IndexArtifactPublish, IndexArtifactRouter,
+    DefinitionVersionGuard, DerivedArtifactAdmission, GuardedIndexArtifactPublish,
+    IndexArtifactOutcome, IndexArtifactPublish, IndexArtifactRouter, IndexCurrentMutationGuard,
     artifact_path, current_path, manifest_path,
+};
+
+pub(crate) use prepared_publication::{
+    PreparedCurrentPointerPublication, PreparedManifestPublication, PreparedPackPublication,
+    PublishedManifest,
 };
 
 #[derive(Clone)]
@@ -118,6 +138,7 @@ pub(crate) struct IndexCommitPublisher {
     store: Store,
     reader: ClusterObjectReader,
     artifacts: IndexArtifactRouter,
+    cohorts: IndexPublicationCohorts,
     config: IndexRuntimeConfig,
 }
 
@@ -141,12 +162,14 @@ impl IndexCommitPublisher {
         store: Store,
         reader: ClusterObjectReader,
         artifacts: IndexArtifactRouter,
+        cohorts: IndexPublicationCohorts,
         config: IndexRuntimeConfig,
     ) -> Self {
         Self {
             store,
             reader,
             artifacts,
+            cohorts,
             config,
         }
     }
@@ -157,14 +180,16 @@ impl IndexCommitPublisher {
         tenant_id: u64,
         bucket_id: u64,
         admission: DerivedArtifactAdmission,
+        cohort_class: PublicationCohortClass,
     ) -> IndexComponentBatchSink {
         IndexComponentBatchSink {
             store: self.store.clone(),
-            artifacts: self.artifacts.clone(),
+            cohorts: self.cohorts.clone(),
             definition: definition.clone(),
             tenant_id,
             bucket_id,
             admission,
+            cohort_class,
             progress: None,
             active: Arc::new(Mutex::new(None)),
         }
@@ -178,7 +203,13 @@ impl IndexCommitPublisher {
         admission: DerivedArtifactAdmission,
         progress: CompactionProgress,
     ) -> IndexComponentBatchSink {
-        let mut sink = self.component_sink(definition, tenant_id, bucket_id, admission);
+        let mut sink = self.component_sink(
+            definition,
+            tenant_id,
+            bucket_id,
+            admission,
+            PublicationCohortClass::Maintenance,
+        );
         sink.progress = Some(progress);
         sink
     }
@@ -218,6 +249,26 @@ impl IndexCommitPublisher {
             let current = expected_current.as_ref();
             segments.sort_by_key(|segment| segment.identity.segment_id);
             locator_roots.sort_by_key(|locator| locator.sequence);
+            // The candidate's exact pack versions must remain protected from
+            // retention from the proof through manifest durability and the
+            // current-pointer CAS. Builders for other indexes retain separate
+            // gates and can join the same publication cohort.
+            let current_guard = self
+                .artifacts
+                .acquire_current_mutation(definition.index_id)
+                .await?;
+            self.revalidate_candidate_while_current_mutation_held(
+                definition,
+                tenant_id,
+                bucket_id,
+                &segments,
+                &locator_roots,
+                current.map(|view| &view.manifest),
+                None,
+                cas_class,
+                &current_guard,
+            )
+            .await?;
             let revision = current
                 .map(|value| value.pointer.current.revision)
                 .unwrap_or(0)
@@ -262,18 +313,14 @@ impl IndexCommitPublisher {
             let manifest_started = std::time::Instant::now();
             let manifest_result = async {
                 let blob = stage_artifact_bytes(&self.store, &manifest_bytes, admission).await?;
-                let path = manifest_path(definition.index_id, blob.hash);
-                let version = self
-                    .publish_immutable(
-                        definition,
-                        tenant_id,
-                        bucket_id,
-                        &path,
-                        blob.clone(),
-                        admission,
-                    )
+                let prepared = PreparedManifestPublication::new(
+                    definition, tenant_id, bucket_id, manifest, blob, admission,
+                );
+                let outcome = self
+                    .cohorts
+                    .publish_manifest(prepared.request().clone(), cohort_class(cas_class))
                     .await?;
-                Ok::<_, Status>((blob, version))
+                prepared.apply(outcome, SystemTime::now())
             }
             .instrument(manifest_span.clone())
             .await;
@@ -293,23 +340,24 @@ impl IndexCommitPublisher {
                     "format-v4 index revision manifest publication finished"
                 );
             });
-            let (manifest_blob, manifest_object_version) = manifest_result?;
+            let PublishedManifest {
+                manifest,
+                reference: current_reference,
+            } = manifest_result?;
             let published_at = SystemTime::now();
-            let current_reference = CommitManifestReference::new(
-                &manifest,
-                manifest_blob,
-                manifest_object_version,
-                published_at,
-            )
-            .map_err(commit_view_status)?;
-            // Serialize the small mutable-root transaction with retention. The
-            // immutable manifest above remains useful even if another commit won;
-            // retention-only rewrites of this same revision are rebased here.
-            let current_guard = self
-                .artifacts
-                .acquire_current_mutation(definition.index_id)
-                .await?;
             let observed = self.load_current(definition, tenant_id, bucket_id).await?;
+            self.revalidate_candidate_while_current_mutation_held(
+                definition,
+                tenant_id,
+                bucket_id,
+                &segments,
+                &locator_roots,
+                observed.as_ref().map(|view| &view.manifest),
+                Some(&current_reference),
+                cas_class,
+                &current_guard,
+            )
+            .await?;
             let expected_revision = current.map(|value| value.pointer.current.revision);
             let observed_revision = observed
                 .as_ref()
@@ -400,9 +448,9 @@ impl IndexCommitPublisher {
                 releasing,
             )
             .map_err(commit_view_status)?;
+            let candidate_reference = pointer.current.clone();
             let pointer_bytes = pointer.encode().map_err(commit_view_status)?;
             let pointer_length = pointer_bytes.len() as u64;
-            let path = current_path(definition.index_id);
             let current_span = tracing::debug_span!(
                 "keldra.index.current_pointer_cas",
                 index.id = definition.index_id,
@@ -416,36 +464,29 @@ impl IndexCommitPublisher {
             let current_started = std::time::Instant::now();
             let current_result = async {
                 let blob = stage_artifact_bytes(&self.store, &pointer_bytes, admission).await?;
-                self.artifacts
-                    .publish_while_current_mutation_held(
-                        IndexArtifactPublish {
-                            storage_tenant: definition.tenant.clone(),
-                            bucket: definition.bucket.clone(),
-                            tenant_id,
-                            bucket_id,
-                            index_id: definition.index_id,
-                            exact_path: path.clone(),
-                            blob: blob.clone(),
-                            expected_version: observed
-                                .as_ref()
-                                .map(|value| value.current_object_version),
-                            command_id: publish_command(
-                                definition.index_id,
-                                &path,
-                                &blob,
-                                observed.as_ref().map(|value| value.current_object_version),
-                            ),
-                            definition_guard: Some(DefinitionVersionGuard {
-                                kind: DefinitionKind::Index,
-                                exact_path: definition_path(&definition.name)?,
-                                expected_version: VersionId(definition_version),
-                            }),
-                            definition_intent: None,
-                            admission,
+                let prepared = PreparedCurrentPointerPublication::new(
+                    definition,
+                    tenant_id,
+                    bucket_id,
+                    definition_version,
+                    pointer,
+                    manifest,
+                    blob,
+                    observed.as_ref().map(|value| value.current_object_version),
+                    admission,
+                )?;
+                let outcome = self
+                    .cohorts
+                    .publish_current(
+                        GuardedIndexArtifactPublish {
+                            request: prepared.request().clone(),
+                            current_guard,
                         },
-                        Some(&current_guard),
+                        barrier.clone(),
+                        cohort_class(cas_class),
                     )
-                    .await
+                    .await?;
+                Ok::<_, Status>((prepared, outcome))
             }
             .instrument(current_span.clone())
             .await;
@@ -472,12 +513,22 @@ impl IndexCommitPublisher {
                     "format-v4 index current-pointer CAS finished"
                 );
             });
-            let outcome = current_result?;
-            return Ok(CommittedIndexView {
-                pointer,
-                current_object_version: outcome.version,
-                manifest,
-            });
+            match current_result {
+                Ok((prepared, outcome)) => return Ok(prepared.apply(outcome)),
+                Err(error) if retryable_pack_publish_status(&error) => {
+                    let resolved = self.load_current(definition, tenant_id, bucket_id).await?;
+                    if let Some(resolved) = resolved
+                        && lost_pointer_response_resolved(
+                            &candidate_reference,
+                            &resolved.pointer.current,
+                        )
+                    {
+                        return Ok(resolved);
+                    }
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            }
         }
     }
 
@@ -727,6 +778,37 @@ impl IndexCommitPublisher {
             }))
     }
 
+    /// Re-proves every exact immutable object named by a candidate while the
+    /// caller excludes retention and current-pointer replacement for this
+    /// index. A successful return is the prerequisite for making the candidate
+    /// manifest reachable from the mutable current pointer.
+    pub(crate) async fn revalidate_candidate_while_current_mutation_held(
+        &self,
+        definition: &StoredIndexDefinition,
+        tenant_id: u64,
+        bucket_id: u64,
+        segments: &[SegmentDescriptor],
+        locator_roots: &[LocatorRoot],
+        rooted: Option<&IndexCommitManifest>,
+        manifest: Option<&CommitManifestReference>,
+        cas_class: IndexPointerCasClass,
+        guard: &IndexCurrentMutationGuard,
+    ) -> Result<(), Status> {
+        revalidation::revalidate_candidate(
+            &self.reader,
+            definition,
+            tenant_id,
+            bucket_id,
+            segments,
+            locator_roots,
+            rooted,
+            manifest,
+            cas_class,
+            guard,
+        )
+        .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn load_committed_view(
         &self,
@@ -852,45 +934,17 @@ impl IndexCommitPublisher {
         validate_manifest_reference(reference, &manifest, index_id)?;
         Ok(manifest)
     }
-
-    async fn publish_immutable(
-        &self,
-        definition: &StoredIndexDefinition,
-        tenant_id: u64,
-        bucket_id: u64,
-        path: &str,
-        blob: BlobRef,
-        admission: DerivedArtifactAdmission,
-    ) -> Result<VersionId, Status> {
-        let outcome = self
-            .artifacts
-            .publish(IndexArtifactPublish {
-                storage_tenant: definition.tenant.clone(),
-                bucket: definition.bucket.clone(),
-                tenant_id,
-                bucket_id,
-                index_id: definition.index_id,
-                exact_path: path.to_owned(),
-                command_id: publish_command(definition.index_id, path, &blob, None),
-                blob,
-                expected_version: None,
-                definition_guard: None,
-                definition_intent: None,
-                admission,
-            })
-            .await?;
-        Ok(outcome.version)
-    }
 }
 
 #[derive(Clone)]
 pub(crate) struct IndexComponentBatchSink {
     store: Store,
-    artifacts: IndexArtifactRouter,
+    cohorts: IndexPublicationCohorts,
     definition: StoredIndexDefinition,
     tenant_id: u64,
     bucket_id: u64,
     admission: DerivedArtifactAdmission,
+    cohort_class: PublicationCohortClass,
     progress: Option<CompactionProgress>,
     active: Arc<Mutex<Option<PendingSegmentPacks>>>,
 }
@@ -1267,60 +1321,59 @@ impl IndexComponentBatchSink {
         &self,
         active: CompletedSegmentPacks,
     ) -> Result<Vec<ArtifactPackReference>, IndexError> {
-        let (unique_pack_indices, pack_outcomes) = deduplicate_staged_packs(&active.staged)?;
-        let published_pack_count = unique_pack_indices.len();
-        let outcomes = loop {
-            let mut requests = Vec::with_capacity(unique_pack_indices.len());
-            for &pack_index in &unique_pack_indices {
-                let pack = &active.staged[pack_index];
-                let path = artifact_path(self.definition.index_id, pack.blob.hash);
-                requests.push(IndexArtifactPublish {
-                    storage_tenant: self.definition.tenant.clone(),
-                    bucket: self.definition.bucket.clone(),
-                    tenant_id: self.tenant_id,
-                    bucket_id: self.bucket_id,
-                    index_id: self.definition.index_id,
-                    exact_path: path.clone(),
-                    blob: pack.blob.clone(),
-                    expected_version: None,
-                    command_id: publish_command(self.definition.index_id, &path, &pack.blob, None),
-                    definition_guard: None,
-                    definition_intent: None,
-                    admission: self.admission,
-                });
-            }
-            match self.artifacts.publish_many(requests).await {
+        let prepared = PreparedPackPublication::new(
+            &self.definition,
+            self.tenant_id,
+            self.bucket_id,
+            self.admission,
+            active,
+        )?;
+        let mut outcomes = vec![None; prepared.requests().len()];
+        let mut pending = (0..prepared.requests().len()).collect::<Vec<_>>();
+        while !pending.is_empty() {
+            let requests = pending
+                .iter()
+                .map(|&index| prepared.requests()[index].clone())
+                .collect();
+            let published = match self
+                .cohorts
+                .publish_packs(requests, self.cohort_class)
+                .await
+            {
                 Err(error) if retryable_pack_publish_status(&error) => {
-                    tracing::debug!(%error, "retrying retained immutable index pack commit");
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    tracing::debug!(%error, "retrying retained immutable index pack cohort");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
                 }
                 Err(error) => return Err(IndexError::Io(error.to_string())),
-                Ok(outcomes) => break outcomes,
+                Ok(published) if published.len() == pending.len() => published,
+                Ok(_) => {
+                    return Err(IndexError::InvalidFormat(
+                        "grouped pack outcome count differs from submitted pack count",
+                    ));
+                }
+            };
+            let mut retry = Vec::new();
+            for (index, result) in pending.into_iter().zip(published) {
+                match result {
+                    Ok(outcome) => outcomes[index] = Some(outcome),
+                    Err(error) if retryable_pack_publish_status(&error) => retry.push(index),
+                    Err(error) => return Err(IndexError::Io(error.to_string())),
+                }
             }
-        };
-        if outcomes.len() != published_pack_count {
-            return Err(IndexError::InvalidFormat(
-                "grouped pack outcome count differs from staged pack count",
-            ));
+            pending = retry;
+            if !pending.is_empty() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
         }
-        let mut references = active.base_packs;
-        references.reserve(active.staged.len());
-        for (pack, outcome_ordinal) in active.staged.into_iter().zip(pack_outcomes) {
-            let outcome = outcomes
-                .get(outcome_ordinal)
+        let outcomes =
+            outcomes
+                .into_iter()
+                .collect::<Option<Vec<_>>>()
                 .ok_or(IndexError::InvalidFormat(
-                    "grouped pack outcome ordinal is missing",
+                    "grouped pack publication left an unresolved receipt",
                 ))?;
-            let path = artifact_path(self.definition.index_id, pack.blob.hash);
-            references.push(ArtifactPackReference::new(
-                self.definition.index_id,
-                path,
-                outcome.version.0,
-                pack.blob.hash,
-                pack.blob.length,
-            )?);
-        }
-        Ok(references)
+        prepared.apply(&outcomes)
     }
 }
 
@@ -1385,6 +1438,13 @@ fn manifest_preserves_pending_atomic_batches(
                     manifest.pending_atomic_batches[position].bundle_hash == pending.bundle_hash
                 })
     })
+}
+
+fn lost_pointer_response_resolved(
+    candidate: &CommitManifestReference,
+    observed: &CommitManifestReference,
+) -> bool {
+    candidate == observed
 }
 
 fn validate_manifest_reference(
@@ -1642,6 +1702,19 @@ mod tests {
             version_3,
             publish_command(11, "_keldra/index", &blob, Some(VersionId(4)))
         );
+    }
+
+    #[test]
+    fn lost_pointer_response_requires_the_exact_manifest_reference() {
+        let candidate = manifest_reference(5, 1_000);
+        assert!(lost_pointer_response_resolved(&candidate, &candidate));
+
+        let mut same_revision_different_object = candidate.clone();
+        same_revision_different_object.object_version = VersionId(99);
+        assert!(!lost_pointer_response_resolved(
+            &candidate,
+            &same_revision_different_object
+        ));
     }
 
     #[test]

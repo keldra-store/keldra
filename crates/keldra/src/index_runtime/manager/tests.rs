@@ -89,8 +89,8 @@ async fn maintenance_waits_for_its_lane_before_leasing_working_memory() {
         occupied.push(budgets.for_kind(kind).acquire(share).await.unwrap());
     }
 
-    let slots = IndexPublicationSlots::new(1, 1);
-    let held_lane = slots.acquire_maintenance().await.unwrap();
+    let slots = IndexMaintenanceWorkSlots::new(1);
+    let held_lane = slots.acquire().await.unwrap();
     let waiting = tokio::spawn({
         let slots = slots.clone();
         let budget = budgets.for_kind(IndexKind::TypedJson).clone();

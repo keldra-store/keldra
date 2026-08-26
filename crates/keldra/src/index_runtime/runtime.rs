@@ -31,7 +31,11 @@ use super::cpu::IndexCpuPool;
 use super::distributed_query::DistributedIndexQueryExecutor;
 use super::events::{ClusterIndexEventSources, DecisionIndexEventAuthority, IndexEventJournal};
 use super::local_query::{ClusterIndexSegmentFetcher, LocalRevisionQueryExecutor};
-use super::manager::{IndexBuilderDependencies, IndexBuilderManagerTask, IndexPublicationSlots};
+use super::manager::publication_cohort::IndexPublicationCohorts;
+use super::manager::{
+    IndexBuilderDependencies, IndexBuilderManagerTask, IndexMaintenanceWorkSlots,
+    IndexPublicationSlots,
+};
 use super::publication::{IndexArtifactCoordinator, IndexArtifactRouter};
 use super::publisher::IndexCommitPublisher;
 use super::query_budget::IndexQueryMemoryBudget;
@@ -127,10 +131,14 @@ pub(crate) async fn start(
     );
     let artifact_router =
         IndexArtifactRouter::new(local_node, coordinator, objects, cluster_peers.clone());
+    let publication_slots = IndexPublicationSlots::default();
+    let publication_cohorts =
+        IndexPublicationCohorts::new(artifact_router.clone(), journal.clone(), publication_slots);
     let publisher = IndexCommitPublisher::new(
         store.clone(),
         reader.clone(),
         artifact_router.clone(),
+        publication_cohorts,
         config,
     );
     let working_memory = IndexWorkingMemory::from_config(config)
@@ -196,7 +204,7 @@ pub(crate) async fn start(
             cpu,
             config,
             derived_progress,
-            publication_slots: IndexPublicationSlots::default(),
+            maintenance_work_slots: IndexMaintenanceWorkSlots::default(),
         },
     );
 

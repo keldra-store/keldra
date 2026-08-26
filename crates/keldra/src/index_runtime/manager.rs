@@ -41,7 +41,7 @@ use super::directory::ManifestArtifactDirectory;
 use super::events::{IndexBarrier, IndexEventError, IndexEventJournal, IndexJournalPage};
 use super::placement::{IndexIdentity, IndexPlacement};
 use super::publication::DerivedArtifactAdmission;
-use super::publisher::{CommittedIndexView, IndexCommitPublisher, IndexPointerCasClass};
+use super::publisher::{CommittedIndexView, IndexCommitPublisher};
 use super::retention::{IndexCommitRetention, IndexRetentionTask};
 use super::scanner::{ClusterIndexScanner, ClusterIndexSourceSnapshot};
 use super::source::{IndexBuildDiagnostics, IndexBuildObject, IndexSourceMutation};
@@ -66,8 +66,11 @@ mod locator_debt;
 mod observability;
 #[path = "manager/publication.rs"]
 mod publication;
-pub(crate) use publication::IndexPublicationSlots;
-use publication::{AbortOnDropTask, publication_cas_class, start_candidate_publication};
+use publication::{AbortOnDropTask, start_candidate_publication};
+pub(crate) use publication::{IndexMaintenanceWorkSlots, IndexPublicationSlots};
+#[path = "manager/publication_cohort.rs"]
+pub(crate) mod publication_cohort;
+pub(crate) use publication_cohort::PublicationCohortClass;
 #[path = "manager/recovery.rs"]
 mod recovery;
 use recovery::{BuilderFailurePhase, recover_builder_failure};
@@ -141,7 +144,7 @@ pub(crate) struct IndexBuilderDependencies {
     pub(crate) cpu: IndexCpuPool,
     pub(crate) config: IndexRuntimeConfig,
     pub(crate) derived_progress: DerivedProgressReporter,
-    pub(crate) publication_slots: IndexPublicationSlots,
+    pub(crate) maintenance_work_slots: IndexMaintenanceWorkSlots,
 }
 
 async fn run_manager(
@@ -1011,8 +1014,6 @@ async fn advance_catch_up(
             admission,
             task,
         } = publication;
-        let publication_class =
-            publication_cas_class(&job.definition, &barrier, &candidate, current.as_ref())?;
         match task.join().await {
             Ok(Ok(published)) => {
                 if catch_up::published_candidate_requires_locator_maintenance(&work, &published)? {
@@ -1038,13 +1039,14 @@ async fn advance_catch_up(
                     )),
                     Ok(Ok(_)) => unreachable!("successful publication handled above"),
                 };
-                if publication_class == IndexPointerCasClass::Merge
-                    && error.code() == tonic::Code::Aborted
-                {
+                if matches!(
+                    error.code(),
+                    tonic::Code::Aborted | tonic::Code::FailedPrecondition
+                ) {
                     tracing::debug!(
                         index.kind = ?job.kind,
                         %error,
-                        "discarding superseded immutable merge output and rescheduling from current"
+                        "discarding publication candidate whose current, source, or definition authority changed"
                     );
                     work.progress.complete();
                     return Ok((BuilderPhase::Inspect, BuilderDisposition::Ready, None));
@@ -1478,7 +1480,7 @@ async fn compact_one_if_needed(
         );
         let budget = dependencies.budgets.for_kind(job.kind);
         let (_publication_slot, _permit) = acquire_maintenance_memory(
-            &dependencies.publication_slots,
+            &dependencies.maintenance_work_slots,
             budget,
             budget.limit(),
             budget.limit(),
@@ -1503,7 +1505,7 @@ async fn compact_one_if_needed(
     );
     let budget = dependencies.budgets.for_kind(job.kind);
     let (_publication_slot, permit) = acquire_maintenance_memory(
-        &dependencies.publication_slots,
+        &dependencies.maintenance_work_slots,
         budget,
         budget.limit(),
         budget.working_memory_limit(),
@@ -1530,7 +1532,7 @@ async fn compact_one_if_needed(
 }
 
 async fn acquire_maintenance_memory(
-    slots: &IndexPublicationSlots,
+    slots: &IndexMaintenanceWorkSlots,
     budget: &super::budget::IndexMemoryBudget,
     minimum: u64,
     preferred: u64,
@@ -1538,7 +1540,7 @@ async fn acquire_maintenance_memory(
     // Queue for the scarce maintenance lane before leasing construction
     // memory. Waiting maintenance must not pin bytes that incremental builders
     // can use while it is not runnable.
-    let slot = slots.acquire_maintenance().await?;
+    let slot = slots.acquire().await?;
     let permit = budget
         .acquire_up_to(minimum, preferred)
         .await
@@ -1588,6 +1590,15 @@ struct NativeSegmentBuild {
 enum SegmentPublicationLane {
     Incremental,
     Maintenance,
+}
+
+impl SegmentPublicationLane {
+    const fn cohort_class(self) -> PublicationCohortClass {
+        match self {
+            Self::Incremental => PublicationCohortClass::Incremental,
+            Self::Maintenance => PublicationCohortClass::Maintenance,
+        }
+    }
 }
 
 struct FrozenSegmentTask {
@@ -1797,12 +1808,12 @@ async fn freeze_builder(
         .plan
         .seal_workspace_bytes(full.writer.buffered_source_bytes())
         .map_err(index_status)?;
-    let publication_slots = dependencies.publication_slots.clone();
     let mut sink = dependencies.publisher.component_sink(
         &definition.stored,
         definition.tenant_id,
         definition.bucket_id,
         DerivedArtifactAdmission::PublicationProgress,
+        publication_lane.cohort_class(),
     );
     builder.frozen = Some(FrozenSegmentTask {
         source_paths: full.source_paths,
@@ -1812,14 +1823,6 @@ async fn freeze_builder(
         // the same reserved bytes.
         resident_charge: seal_workspace as u64,
         task: AbortOnDropTask::new(tokio::spawn(async move {
-            let _publication_slot = match publication_lane {
-                SegmentPublicationLane::Incremental => {
-                    publication_slots.acquire_incremental().await?
-                }
-                SegmentPublicationLane::Maintenance => {
-                    publication_slots.acquire_maintenance().await?
-                }
-            };
             let built = full.writer.seal(&mut sink).await.map_err(index_status)?;
             Ok(FrozenSegment {
                 built,

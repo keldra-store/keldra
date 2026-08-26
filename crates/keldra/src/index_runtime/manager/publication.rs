@@ -59,6 +59,38 @@ impl IndexPublicationSlots {
     }
 }
 
+/// Admission for CPU/memory-heavy maintenance preparation. This is separate
+/// from physical publication admission: a compaction must not hold the
+/// maintenance publication permit and then wait for a cohort which needs that
+/// same permit.
+#[derive(Clone)]
+pub(crate) struct IndexMaintenanceWorkSlots {
+    inner: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for IndexMaintenanceWorkSlots {
+    fn default() -> Self {
+        Self::new(MAX_CONCURRENT_MAINTENANCE_PUBLICATIONS)
+    }
+}
+
+impl IndexMaintenanceWorkSlots {
+    pub(super) fn new(limit: usize) -> Self {
+        assert!(limit > 0, "maintenance work concurrency must be positive");
+        Self {
+            inner: std::sync::Arc::new(tokio::sync::Semaphore::new(limit)),
+        }
+    }
+
+    pub(super) async fn acquire(&self) -> Result<tokio::sync::OwnedSemaphorePermit, Status> {
+        self.inner
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Status::unavailable("index maintenance work admission is closed"))
+    }
+}
+
 pub(super) struct AbortOnDropTask<T> {
     task: Option<tokio::task::JoinHandle<T>>,
 }
@@ -100,17 +132,6 @@ pub(super) fn start_candidate_publication(
     dependencies: IndexBuilderDependencies,
 ) -> AbortOnDropTask<Result<CommittedIndexView, Status>> {
     AbortOnDropTask::new(tokio::spawn(async move {
-        let cas_class = publication_cas_class(&definition, &barrier, &candidate, current.as_ref())?;
-        let _publication_slot = match cas_class {
-            super::super::publisher::IndexPointerCasClass::Incremental => {
-                dependencies.publication_slots.acquire_incremental().await?
-            }
-            super::super::publisher::IndexPointerCasClass::Merge
-            | super::super::publisher::IndexPointerCasClass::Rebuild
-            | super::super::publisher::IndexPointerCasClass::Retention => {
-                dependencies.publication_slots.acquire_maintenance().await?
-            }
-        };
         publish_candidate(
             &definition,
             kind,

@@ -627,10 +627,9 @@ async fn compact_atomic_staged_once(
         else {
             return Ok(false);
         };
-        // Reclaim exactly one segment slot, then measure the replayed atomic
-        // output again. Wider maintenance merges stay off the journal path.
+        // Reclaim one slot; wider maintenance merges stay off the journal path.
         selection.input_segments = 2;
-        let _publication_slot = dependencies.publication_slots.acquire_maintenance().await?;
+        let _maintenance_slot = dependencies.maintenance_work_slots.acquire().await?;
         compact_tier(
             definition,
             kind,
@@ -650,7 +649,7 @@ async fn compact_atomic_staged_once(
     };
     // The oldest two roots are the minimum legal prefix compaction.
     selection.input_roots = 2;
-    let _publication_slot = dependencies.publication_slots.acquire_maintenance().await?;
+    let _maintenance_slot = dependencies.maintenance_work_slots.acquire().await?;
     locator_debt::compact_oldest_prefix(
         definition,
         kind,
@@ -1277,6 +1276,7 @@ async fn apply_incremental_mutations(
             definition.tenant_id,
             definition.bucket_id,
             DerivedArtifactAdmission::PublicationProgress,
+            PublicationCohortClass::Incremental,
         );
         for (segment_id, mut ranges) in invalidations {
             let position = candidate
@@ -1339,6 +1339,7 @@ async fn apply_incremental_mutations(
             definition.tenant_id,
             definition.bucket_id,
             DerivedArtifactAdmission::PublicationProgress,
+            PublicationCohortClass::Incremental,
         );
         sink.begin_segment(identity, &[]).map_err(index_status)?;
         let published = publish_locator_delta(

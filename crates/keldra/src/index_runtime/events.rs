@@ -678,11 +678,28 @@ impl IndexEventJournal {
         &self,
         candidate: &IndexBarrier,
     ) -> Result<(), IndexEventError> {
-        let before = self
-            .authority
-            .current()
-            .map_err(IndexEventError::Placement)?;
-        require_authority_covers(candidate, &before)?;
+        self.validate_publication_barriers(std::slice::from_ref(candidate))
+            .await
+            .pop()
+            .expect("one publication barrier returns one validation outcome")
+    }
+
+    /// Revalidate a physical publication cohort against one shared observation
+    /// of every ACTIVE source. Outcomes retain candidate order so an invalid
+    /// source epoch or checkpoint rejects only the affected current-pointer CAS
+    /// without making the other cohort members ambiguous.
+    pub(crate) async fn validate_publication_barriers(
+        &self,
+        candidates: &[IndexBarrier],
+    ) -> Vec<Result<(), IndexEventError>> {
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+        let before = self.authority.current().map_err(IndexEventError::Placement);
+        let before = match before {
+            Ok(before) => before,
+            Err(error) => return repeated_barrier_error(candidates.len(), error),
+        };
 
         let mut tasks = tokio::task::JoinSet::new();
         for source in before.sources.iter().cloned() {
@@ -694,34 +711,62 @@ impl IndexEventJournal {
         }
         let mut observed = BTreeMap::new();
         while let Some(joined) = tasks.join_next().await {
-            let (source, result) =
-                joined.map_err(|error| IndexEventError::Task(error.to_string()))?;
-            let status = result?;
-            validate_status(source.node, &status)?;
+            let (source, result) = match joined {
+                Ok(joined) => joined,
+                Err(error) => {
+                    return repeated_barrier_error(
+                        candidates.len(),
+                        IndexEventError::Task(error.to_string()),
+                    );
+                }
+            };
+            let status = match result {
+                Ok(status) => status,
+                Err(error) => return repeated_barrier_error(candidates.len(), error),
+            };
+            if let Err(error) = validate_status(source.node, &status) {
+                return repeated_barrier_error(candidates.len(), error);
+            }
             observed.insert(source.node, status);
         }
 
-        let after = self
-            .authority
-            .current()
-            .map_err(IndexEventError::Placement)?;
+        let after = self.authority.current().map_err(IndexEventError::Placement);
+        let after = match after {
+            Ok(after) => after,
+            Err(error) => return repeated_barrier_error(candidates.len(), error),
+        };
         if before.fence != after.fence || before.sources != after.sources {
-            return Err(IndexEventError::BarrierChanged);
+            return repeated_barrier_error(candidates.len(), IndexEventError::BarrierChanged);
         }
-        require_authority_covers(candidate, &after)?;
-        if observed.len() != candidate.sources.len()
-            || candidate.sources.iter().any(|(node, cursor)| {
-                observed.get(node).is_none_or(|latest| {
-                    latest.source_id != cursor.source
-                        || latest.settled_through.saturating_add(1) < cursor.next_offset
-                })
+        candidates
+            .iter()
+            .map(|candidate| {
+                require_authority_covers(candidate, &before)?;
+                require_authority_covers(candidate, &after)?;
+                if observed.len() != candidate.sources.len()
+                    || candidate.sources.iter().any(|(node, cursor)| {
+                        observed.get(node).is_none_or(|latest| {
+                            latest.source_id != cursor.source
+                                || latest.settled_through.saturating_add(1) < cursor.next_offset
+                        })
+                    })
+                {
+                    return Err(IndexEventError::IncompleteSources);
+                }
+                Ok(())
             })
-        {
-            return Err(IndexEventError::IncompleteSources);
-        }
-        Ok(())
+            .collect()
     }
+}
 
+fn repeated_barrier_error(
+    count: usize,
+    error: IndexEventError,
+) -> Vec<Result<(), IndexEventError>> {
+    (0..count).map(|_| Err(error.clone())).collect()
+}
+
+impl IndexEventJournal {
     /// Bind source-local RocksDB snapshot tails to the current membership and
     /// complete atomic-program watermark.
     ///
