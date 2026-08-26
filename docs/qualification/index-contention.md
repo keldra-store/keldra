@@ -96,6 +96,14 @@ includes polling and query observation, so it is not pure server publication
 latency. Raw reports remain the authority for every phase and correctness
 counter.
 
+The final drain authority is exact public `HeadObject` path/version state
+compared with every index definition, plus a complete initial build, no rebuild,
+and the full source set. `observed_tail` is intentionally optional because an
+ordinary query does not synchronously inspect the journal. When every query
+replica supplies it, the report records advisory zero-lag verification;
+otherwise that field is `null` and the exact public state comparison remains
+authoritative.
+
 The server log filter defaults to a production-shaped `info` level rather than
 hot-path debug logging, which would contaminate latency results. Record and
 review the value in `run.json`; use `KELDRA_INDEX_CONTENTION_RUST_LOG` only for a

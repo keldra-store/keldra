@@ -24,7 +24,8 @@ use keldra_storage::v1::object_head::State as ObjectHeadState;
 use keldra_storage::v1::{
     BulkOperation, BulkPutRequest, BulkWriteRequest, CreateBucketRequest, CreateIndexRequest,
     Durability, HeadObjectRequest, IndexPredicate, IndexPredicateOperator, IndexQuery,
-    ObjectAddress, ObjectVersioning, QueryIndexRequest, QueryIndexResponse, TypedJsonIndexQuery,
+    IndexSourceFreshness, ObjectAddress, ObjectVersioning, QueryIndexRequest, QueryIndexResponse,
+    TypedJsonIndexQuery,
 };
 use keldra_storage::{
     BearerToken, KeywordField, RawClient, TypedJsonIndexBuilder, UnsignedIntegerField,
@@ -121,7 +122,8 @@ struct CorrectnessReport {
     stable_oracle_checked_on_every_completed_query: bool,
     final_canary_version_observed_by_every_definition: bool,
     exact_mutable_versions_verified_by_every_definition: bool,
-    zero_lag_freshness_verified_by_every_definition: bool,
+    final_freshness_healthy_by_every_definition: bool,
+    advisory_zero_lag_verified_by_every_definition: Option<bool>,
     zero_query_correctness_errors: bool,
 }
 
@@ -254,7 +256,7 @@ async fn main() -> Result<()> {
     } else {
         (false, BTreeSet::new())
     };
-    let (final_state_verified, final_zero_lag, final_sources) = tokio::time::timeout(
+    let (final_state_verified, advisory_zero_lag, final_sources) = tokio::time::timeout(
         config.drain_timeout,
         verify_final_mutable_state(&config, &names, &query_channels, &token),
     )
@@ -304,8 +306,7 @@ async fn main() -> Result<()> {
     let sustained_nonempty_mutation_queue = mutation_report.queue_depth_samples > 0
         && mutation_report.minimum_sampled_queue_depth_while_producing > 0
         && mutation_report.queue_starvation_samples == 0;
-    let correctness_passed =
-        zero_query_correctness_errors && final_visible && final_state_verified && final_zero_lag;
+    let correctness_passed = zero_query_correctness_errors && final_visible && final_state_verified;
     let workload_passed = all_definitions_offered
         && sustained_nonempty_mutation_queue
         && mutation_requests_complete_and_successful;
@@ -338,7 +339,8 @@ async fn main() -> Result<()> {
             stable_oracle_checked_on_every_completed_query: true,
             final_canary_version_observed_by_every_definition: final_visible,
             exact_mutable_versions_verified_by_every_definition: final_state_verified,
-            zero_lag_freshness_verified_by_every_definition: final_zero_lag,
+            final_freshness_healthy_by_every_definition: final_state_verified,
+            advisory_zero_lag_verified_by_every_definition: advisory_zero_lag,
             zero_query_correctness_errors,
         },
         workload_validity: WorkloadValidityReport {
@@ -934,7 +936,7 @@ async fn verify_final_mutable_state(
     names: &[String],
     channels: &[Channel],
     token: &str,
-) -> Result<(bool, bool, BTreeSet<u64>)> {
+) -> Result<(bool, Option<bool>, BTreeSet<u64>)> {
     let deadline = Instant::now() + config.drain_timeout;
     let mut authority = BTreeMap::new();
     let mut objects = object_client(channels[0].clone(), token)?;
@@ -957,6 +959,7 @@ async fn verify_final_mutable_state(
         authority.insert(path, version);
     }
     let mut nodes = BTreeSet::new();
+    let mut all_observed_tails_available = true;
     for (position, name) in names.iter().enumerate() {
         let mut client = index_client(channels[position % channels.len()].clone(), token)?;
         loop {
@@ -992,18 +995,21 @@ async fn verify_final_mutable_state(
                         .iter()
                         .map(|source| source.node_id)
                         .collect::<BTreeSet<_>>();
-                    let zero_lag = freshness.initial_build_complete
+                    let healthy = freshness.initial_build_complete
                         && !freshness.rebuilding
                         && freshness.sources.len() == config.endpoints.len()
                         && source_ids.len() == config.endpoints.len()
-                        && freshness.sources.iter().all(|source| {
-                            source.node_id != 0
-                                && source.source_epoch.len() == 32
-                                && source.lag_hint == 0
-                                && source.observed_tail.and_then(|tail| tail.checked_add(1))
-                                    == Some(source.indexed_next_offset)
-                        });
-                    if exact && zero_lag {
+                        && freshness
+                            .sources
+                            .iter()
+                            .all(|source| source.node_id != 0 && source.source_epoch.len() == 32);
+                    let observed_tails_available = freshness
+                        .sources
+                        .iter()
+                        .all(|source| source.observed_tail.is_some());
+                    let no_observed_lag = freshness.sources.iter().all(source_has_no_observed_lag);
+                    if exact && healthy && no_observed_lag {
+                        all_observed_tails_available &= observed_tails_available;
                         nodes.extend(
                             freshness
                                 .sources
@@ -1018,7 +1024,14 @@ async fn verify_final_mutable_state(
             tokio::time::sleep(config.visibility_poll).await;
         }
     }
-    Ok((true, true, nodes))
+    Ok((true, all_observed_tails_available.then_some(true), nodes))
+}
+
+fn source_has_no_observed_lag(source: &IndexSourceFreshness) -> bool {
+    source.lag_hint == 0
+        && source
+            .observed_tail
+            .is_none_or(|tail| tail.checked_add(1) == Some(source.indexed_next_offset))
 }
 
 fn put(config: &Config, path: String, bytes: Vec<u8>, command_id: String) -> BulkOperation {
@@ -1174,5 +1187,30 @@ mod tests {
     fn marker_ids_do_not_overlap_small_corpus_ids() {
         assert_eq!((1u64 << 63) | 7, 9_223_372_036_854_775_815);
         assert!(data::marker_path(7).contains("0000000000000007"));
+    }
+
+    #[test]
+    fn optional_observed_tail_never_manufactures_zero_lag() {
+        let unavailable = IndexSourceFreshness {
+            indexed_next_offset: 12,
+            lag_hint: 0,
+            observed_tail: None,
+            ..Default::default()
+        };
+        assert!(source_has_no_observed_lag(&unavailable));
+        assert!(unavailable.observed_tail.is_none());
+
+        let current = IndexSourceFreshness {
+            observed_tail: Some(11),
+            ..unavailable.clone()
+        };
+        assert!(source_has_no_observed_lag(&current));
+
+        let behind = IndexSourceFreshness {
+            observed_tail: Some(12),
+            lag_hint: 1,
+            ..unavailable
+        };
+        assert!(!source_has_no_observed_lag(&behind));
     }
 }
