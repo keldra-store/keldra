@@ -1,14 +1,14 @@
 # keldra
 
 The official Rust client for Keldra. It provides authenticated object upload
-helpers and the complete generated Keldra 0.12 protocol, including object,
+helpers and the complete generated Keldra 0.13 protocol, including object,
 authorization, administration, cluster-wide index, accounting, and PersonalDB
 clients.
 
 ## Install
 
 ```sh
-cargo add keldra@0.12.0
+cargo add keldra@0.13.0
 cargo add tokio --features macros,rt-multi-thread
 ```
 
