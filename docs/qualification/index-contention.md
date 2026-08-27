@@ -58,6 +58,25 @@ KELDRA_INDEX_CONTENTION_MUTATION_QUEUE_DEPTH=8 \
 The evidence records all three settings. A result at one intensity must not be
 compared with another intensity as a before/after performance claim.
 
+To measure sustainable publication capacity instead of saturating ingress, set
+an explicit offered rate. The rate counts every public mutation operation,
+including the per-batch marker used for visibility measurement. Requests are
+scheduled open-loop; a full client queue is recorded as a dropped mutation
+batch and fails workload validity rather than silently lowering the offered
+rate:
+
+```bash
+KELDRA_IMAGE=keldra:qa-<commit> \
+KELDRA_INDEX_CONTENTION_MODE=sustained \
+KELDRA_INDEX_CONTENTION_MATRIX=1,4,16,64 \
+KELDRA_INDEX_CONTENTION_MUTATION_RATE_OPERATIONS_PER_SECOND=1000 \
+  ./scripts/qualify-index-contention.sh
+```
+
+Omit the variable or set it to `disabled` for the saturated-queue workload.
+Matrix entries may be any unique integer from 1 through 64; `1,4,16,64` remains
+the normative scale matrix.
+
 For supplementary three-node Docker evidence, use:
 
 ```bash
@@ -137,7 +156,8 @@ watch -n 2 cat ../../releases/keldra/index-contention/latest/status.json
 
 `run.json` records the source commit, immutable image ID and revision, image
 platform, topology, matrix, phase durations, host resources, and Docker resource
-allocation. It also records mutation workers, batch size and queue depth, plus
+allocation. It also records mutation workers, batch size, queue depth, and the
+optional fixed offered operation rate, plus
 the request, drain, visibility polling and total
 visibility-observation timeouts, sampling interval, and both absolute p99
 acceptance bounds. Every cell retains the client report, client stdout/stderr, and
@@ -177,7 +197,9 @@ review the value in `run.json`; use `KELDRA_INDEX_CONTENTION_RUST_LOG` only for 
 separate diagnostic run when more verbose telemetry is necessary.
 
 An interrupted or failing run retains its evidence and records a terminal
-failure event. Containers and temporary durable state are removed unless
+failure event. Once configuration has been accepted, terminal setup, drain, and
+final-verification errors also produce a structured failure `report.json`.
+Containers and temporary durable state are removed unless
 `KELDRA_INDEX_CONTENTION_KEEP=1`; that option is intended only for diagnosis and
 can consume substantial disk.
 

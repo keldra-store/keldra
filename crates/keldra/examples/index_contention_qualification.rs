@@ -110,8 +110,13 @@ struct QueryPhaseReport {
 
 #[derive(Debug, Default, Serialize)]
 struct MutationReport {
+    load_mode: &'static str,
+    configured_operations_per_second: Option<f64>,
     elapsed_seconds: f64,
+    offered_batches: u64,
     submitted_batches: u64,
+    dropped_batches: u64,
+    offered_operations: u64,
     accepted_batches: u64,
     accepted_operations: u64,
     accepted_bytes: u64,
@@ -150,6 +155,7 @@ struct WorkloadValidityReport {
     passed: bool,
     all_definitions_offered_in_every_phase: bool,
     sustained_nonempty_mutation_queue: bool,
+    mutation_load_shape_valid: bool,
     mutation_requests_complete_and_successful: bool,
 }
 
@@ -192,6 +198,13 @@ struct MutationResult {
     bytes: u64,
     elapsed: Duration,
     canary: Option<Canary>,
+}
+
+#[derive(Default)]
+struct MutationProducerReport {
+    offered_batches: u64,
+    submitted_batches: u64,
+    dropped_batches: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -375,9 +388,15 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
     let sustained_nonempty_mutation_queue = mutation_report.queue_depth_samples > 0
         && mutation_report.minimum_sampled_queue_depth_while_producing > 0
         && mutation_report.queue_starvation_samples == 0;
+    let mutation_load_shape_valid = if config.mutation_rate_operations_per_second.is_some() {
+        mutation_report.dropped_batches == 0
+            && mutation_report.offered_batches == mutation_report.submitted_batches
+    } else {
+        sustained_nonempty_mutation_queue
+    };
     let correctness_passed = zero_query_correctness_errors && final_visible && final_state_verified;
     let workload_passed = all_definitions_offered
-        && sustained_nonempty_mutation_queue
+        && mutation_load_shape_valid
         && mutation_requests_complete_and_successful;
     let responsiveness_passed = zero_query_request_errors_or_timeouts
         && zero_dropped_schedules
@@ -417,6 +436,7 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
             passed: workload_passed,
             all_definitions_offered_in_every_phase: all_definitions_offered,
             sustained_nonempty_mutation_queue,
+            mutation_load_shape_valid,
             mutation_requests_complete_and_successful,
         },
         responsiveness: ResponsivenessReport {
@@ -697,7 +717,12 @@ async fn run_mutations(
     let minimum_depth = Arc::new(AtomicUsize::new(config.mutation_queue_depth));
     let starvation = Arc::new(AtomicU64::new(0));
     let queue_samples = Arc::new(AtomicU64::new(0));
-    for sequence in 0..config.mutation_queue_depth as u64 {
+    let prefilled_batches = if config.mutation_rate_operations_per_second.is_none() {
+        config.mutation_queue_depth as u64
+    } else {
+        0
+    };
+    for sequence in 0..prefilled_batches {
         job_tx
             .send(MutationJob { sequence })
             .await
@@ -706,18 +731,9 @@ async fn run_mutations(
     let producer_config = config.clone();
     let producing_for_task = producing.clone();
     let producer = tokio::spawn(async move {
-        let deadline = Instant::now() + producer_config.concurrent;
-        let mut sequence = producer_config.mutation_queue_depth as u64;
-        while Instant::now() < deadline {
-            if job_tx.send(MutationJob { sequence }).await.is_err() {
-                break;
-            }
-            sequence = sequence
-                .checked_add(1)
-                .context("mutation sequence overflow")?;
-        }
+        let report = produce_mutation_jobs(&producer_config, job_tx, prefilled_batches).await;
         producing_for_task.store(0, Ordering::Release);
-        Ok::<u64, anyhow::Error>(sequence)
+        report
     });
     tokio::task::yield_now().await;
     let sample_config = config.clone();
@@ -765,6 +781,12 @@ async fn run_mutations(
     }
     drop(result_tx);
     let mut report = MutationReport {
+        load_mode: if config.mutation_rate_operations_per_second.is_some() {
+            "fixed-rate"
+        } else {
+            "saturated-queue"
+        },
+        configured_operations_per_second: config.mutation_rate_operations_per_second,
         queue_capacity: config.mutation_queue_depth,
         ..MutationReport::default()
     };
@@ -843,7 +865,13 @@ async fn run_mutations(
     // The mutation workload ends when every submitted response has arrived.
     // Visibility probes measure indexing lag and must not dilute ingest rate.
     let mutation_elapsed = mutation_started.elapsed();
-    report.submitted_batches = producer.await.context("mutation producer panicked")??;
+    let producer_report = producer.await.context("mutation producer panicked")??;
+    report.offered_batches = producer_report.offered_batches;
+    report.submitted_batches = producer_report.submitted_batches;
+    report.dropped_batches = producer_report.dropped_batches;
+    report.offered_operations = producer_report
+        .offered_batches
+        .saturating_mul((config.mutation_batch_size + 1) as u64);
     while let Some(worker) = workers.join_next().await {
         worker.context("mutation worker panicked")??;
     }
@@ -891,6 +919,85 @@ async fn run_mutations(
     report.publication_visibility_lag = visibility_latency.report();
     report.visibility_definition = "publication_visibility_lag: receipt acceptance to first ordinary query hit with the exact canary object_version; samples rotate by sample ordinal across definitions, use a separate total observation timeout, and include polling-resolution delay";
     Ok((report, final_canary))
+}
+
+async fn produce_mutation_jobs(
+    config: &Config,
+    job_tx: mpsc::Sender<MutationJob>,
+    prefilled_batches: u64,
+) -> Result<MutationProducerReport> {
+    let started = Instant::now();
+    let deadline = started + config.concurrent;
+    let mut report = MutationProducerReport {
+        offered_batches: prefilled_batches,
+        submitted_batches: prefilled_batches,
+        dropped_batches: 0,
+    };
+    let mut sequence = prefilled_batches;
+    if let Some(operation_rate) = config.mutation_rate_operations_per_second {
+        return produce_fixed_rate_jobs(
+            config.concurrent,
+            config.mutation_batch_size,
+            operation_rate,
+            job_tx,
+        )
+        .await;
+    } else {
+        while Instant::now() < deadline {
+            if job_tx.send(MutationJob { sequence }).await.is_err() {
+                break;
+            }
+            report.offered_batches = report.offered_batches.saturating_add(1);
+            report.submitted_batches = report.submitted_batches.saturating_add(1);
+            sequence = sequence
+                .checked_add(1)
+                .context("mutation sequence overflow")?;
+        }
+    }
+    Ok(report)
+}
+
+async fn produce_fixed_rate_jobs(
+    duration: Duration,
+    mutation_batch_size: usize,
+    operation_rate: f64,
+    job_tx: mpsc::Sender<MutationJob>,
+) -> Result<MutationProducerReport> {
+    let started = Instant::now();
+    let deadline = started + duration;
+    let batch_rate = operation_rate / (mutation_batch_size + 1) as f64;
+    let schedule_interval = Duration::from_secs_f64(1.0 / batch_rate);
+    let mut report = MutationProducerReport::default();
+    let mut schedule_ordinal = 1_u64;
+    loop {
+        let scheduled = started + Duration::from_secs_f64(schedule_ordinal as f64 / batch_rate);
+        if scheduled >= deadline {
+            break;
+        }
+        tokio::time::sleep_until(scheduled).await;
+        report.offered_batches = report.offered_batches.saturating_add(1);
+        // A delayed producer records missed open-loop schedules instead of
+        // manufacturing a catch-up burst that changes the offered workload.
+        if Instant::now() >= scheduled + schedule_interval {
+            report.dropped_batches = report.dropped_batches.saturating_add(1);
+        } else {
+            match job_tx.try_send(MutationJob {
+                sequence: schedule_ordinal - 1,
+            }) {
+                Ok(()) => report.submitted_batches = report.submitted_batches.saturating_add(1),
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    report.dropped_batches = report.dropped_batches.saturating_add(1)
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    bail!("mutation worker queue closed during fixed-rate production")
+                }
+            }
+        }
+        schedule_ordinal = schedule_ordinal
+            .checked_add(1)
+            .context("mutation schedule overflow")?;
+    }
+    Ok(report)
 }
 
 async fn execute_mutation(
@@ -1351,5 +1458,18 @@ mod tests {
         let bounded = bounded_error(&error);
         assert_eq!(bounded.chars().count(), MAX_VISIBILITY_SAMPLE_ERROR_CHARS);
         assert!(error.starts_with(&bounded));
+    }
+
+    #[tokio::test]
+    async fn fixed_rate_records_every_schedule_and_queue_drop() {
+        let (job_tx, mut job_rx) = mpsc::channel(2);
+        let report = produce_fixed_rate_jobs(Duration::from_millis(70), 32, 3_300.0, job_tx)
+            .await
+            .unwrap();
+        assert_eq!(report.offered_batches, 6);
+        assert_eq!(report.submitted_batches, 2);
+        assert_eq!(report.dropped_batches, 4);
+        assert_eq!(job_rx.recv().await.unwrap().sequence, 0);
+        assert_eq!(job_rx.recv().await.unwrap().sequence, 1);
     }
 }

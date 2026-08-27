@@ -28,6 +28,7 @@ visibility_sample_every_batches="${KELDRA_INDEX_CONTENTION_VISIBILITY_SAMPLE_EVE
 mutation_workers="${KELDRA_INDEX_CONTENTION_MUTATION_WORKERS:-4}"
 mutation_batch_size="${KELDRA_INDEX_CONTENTION_MUTATION_BATCH_SIZE:-32}"
 mutation_queue_depth="${KELDRA_INDEX_CONTENTION_MUTATION_QUEUE_DEPTH:-32}"
+mutation_rate_operations_per_second="${KELDRA_INDEX_CONTENTION_MUTATION_RATE_OPERATIONS_PER_SECOND:-disabled}"
 qualification_backend="${KELDRA_INDEX_CONTENTION_BACKEND:-docker}"
 driver_backend="${KELDRA_INDEX_CONTENTION_DRIVER_BACKEND:-ssh-macos}"
 driver_host="${KELDRA_INDEX_CONTENTION_DRIVER_HOST:-zcourts@192.168.64.1}"
@@ -118,6 +119,14 @@ if ((mutation_queue_depth < mutation_workers)); then
   echo "KELDRA_INDEX_CONTENTION_MUTATION_QUEUE_DEPTH must cover every mutation worker" >&2
   exit 2
 fi
+if [[ "${mutation_rate_operations_per_second}" != disabled ]] \
+  && { [[ ! "${mutation_rate_operations_per_second}" =~ ^[0-9]+([.][0-9]+)?$ ]] \
+    || ! awk -v value="${mutation_rate_operations_per_second}" \
+      'BEGIN {exit !(value > 0 && value <= 1000000)}'; }
+then
+  echo "mutation rate must be in 0..=1000000 operations/s or disabled" >&2
+  exit 2
+fi
 IFS=, read -r -a builder_matrix <<<"${matrix}"
 if ((${#builder_matrix[@]} == 0)); then
   echo "KELDRA_INDEX_CONTENTION_MATRIX must not be empty" >&2
@@ -125,13 +134,13 @@ if ((${#builder_matrix[@]} == 0)); then
 fi
 seen_builder_values=,
 for builders in "${builder_matrix[@]}"; do
-  if [[ ! "${builders}" =~ ^(1|4|16|64)$ ]]; then
-    echo "KELDRA_INDEX_CONTENTION_MATRIX must contain unique values from 1,4,16,64" >&2
+  if [[ ! "${builders}" =~ ^[1-9][0-9]*$ ]] || ((builders > 64)); then
+    echo "KELDRA_INDEX_CONTENTION_MATRIX must contain unique integers from 1 through 64" >&2
     exit 2
   fi
   case "${seen_builder_values}" in
     *,"${builders}",*)
-      echo "KELDRA_INDEX_CONTENTION_MATRIX must contain unique values from 1,4,16,64" >&2
+      echo "KELDRA_INDEX_CONTENTION_MATRIX must contain unique integers from 1 through 64" >&2
       exit 2
       ;;
   esac
@@ -361,6 +370,7 @@ jq -n \
   --argjson mutation_workers "${mutation_workers}" \
   --argjson mutation_batch_size "${mutation_batch_size}" \
   --argjson mutation_queue_depth "${mutation_queue_depth}" \
+  --arg mutation_rate_operations_per_second "${mutation_rate_operations_per_second}" \
   --argjson index_disk_cache_bytes "${index_disk_cache_bytes}" \
   --argjson index_memory_percent "${index_memory_percent}" \
   --argjson index_kind_budget_bytes "${index_kind_budget_bytes}" \
@@ -375,7 +385,7 @@ jq -n \
   --argjson docker_cpus "${docker_cpus}" --argjson docker_memory_bytes "${docker_memory_bytes}" \
   --argjson filesystem_kib "${filesystem_kib}" \
   --argjson filesystem_available_kib "${filesystem_available_kib}" \
-  '{schema_version:1,run_id:$run_id,harness_source_commit:$source_commit,images:$images,execution:{server_backend:$server_backend,driver_backend:$driver_backend,driver_host:$driver_host,driver_repo_root:$driver_repo_root,server_advertise_host:$server_advertise_host},workload:{mode:$mode,topology:$topology,durability:$durability,comparison_order:$comparison_order,index_definition_count_matrix:($matrix|split(",")|map(tonumber)),baseline_seconds:$baseline_seconds,concurrent_seconds:$concurrent_seconds,post_seconds:$post_seconds,mutation_workers:$mutation_workers,mutation_batch_size:$mutation_batch_size,mutation_queue_depth:$mutation_queue_depth,request_timeout_milliseconds:$request_timeout_ms,drain_timeout_seconds:$drain_timeout_seconds,visibility_poll_milliseconds:$visibility_poll_ms,visibility_observation_timeout_seconds:$visibility_observation_timeout_seconds,visibility_sample_every_batches:$visibility_sample_every_batches,max_concurrent_query_p99_milliseconds:(if $max_concurrent_query_p99_ms == "disabled" then null else ($max_concurrent_query_p99_ms|tonumber) end),max_publication_visibility_p99_milliseconds:(if $max_publication_visibility_p99_ms == "disabled" then null else ($max_publication_visibility_p99_ms|tonumber) end)},server:{rust_log:$server_rust_log,index_disk_cache_bytes:$index_disk_cache_bytes,index_memory_percent:$index_memory_percent,index_kind_budget_bytes:$index_kind_budget_bytes,index_compaction_max_lanes:$index_compaction_lanes,index_projection_max_lanes:$index_projection_lanes,index_rayon_workers:$index_rayon_workers,source_journal_max_entries:$source_journal_entries},hardware:{uname:$uname,host_logical_cpus:$host_logical_cpus,host_memory_bytes:$host_memory_bytes,docker_logical_cpus:$docker_cpus,docker_memory_bytes:$docker_memory_bytes,driver_uname:$driver_uname,driver_logical_cpus:$driver_logical_cpus,driver_memory_bytes:$driver_memory_bytes,evidence_filesystem_kib:$filesystem_kib,evidence_filesystem_available_kib:$filesystem_available_kib}}' \
+  '{schema_version:1,run_id:$run_id,harness_source_commit:$source_commit,images:$images,execution:{server_backend:$server_backend,driver_backend:$driver_backend,driver_host:$driver_host,driver_repo_root:$driver_repo_root,server_advertise_host:$server_advertise_host},workload:{mode:$mode,topology:$topology,durability:$durability,comparison_order:$comparison_order,index_definition_count_matrix:($matrix|split(",")|map(tonumber)),baseline_seconds:$baseline_seconds,concurrent_seconds:$concurrent_seconds,post_seconds:$post_seconds,mutation_workers:$mutation_workers,mutation_batch_size:$mutation_batch_size,mutation_queue_depth:$mutation_queue_depth,mutation_rate_operations_per_second:(if $mutation_rate_operations_per_second == "disabled" then null else ($mutation_rate_operations_per_second|tonumber) end),request_timeout_milliseconds:$request_timeout_ms,drain_timeout_seconds:$drain_timeout_seconds,visibility_poll_milliseconds:$visibility_poll_ms,visibility_observation_timeout_seconds:$visibility_observation_timeout_seconds,visibility_sample_every_batches:$visibility_sample_every_batches,max_concurrent_query_p99_milliseconds:(if $max_concurrent_query_p99_ms == "disabled" then null else ($max_concurrent_query_p99_ms|tonumber) end),max_publication_visibility_p99_milliseconds:(if $max_publication_visibility_p99_ms == "disabled" then null else ($max_publication_visibility_p99_ms|tonumber) end)},server:{rust_log:$server_rust_log,index_disk_cache_bytes:$index_disk_cache_bytes,index_memory_percent:$index_memory_percent,index_kind_budget_bytes:$index_kind_budget_bytes,index_compaction_max_lanes:$index_compaction_lanes,index_projection_max_lanes:$index_projection_lanes,index_rayon_workers:$index_rayon_workers,source_journal_max_entries:$source_journal_entries},hardware:{uname:$uname,host_logical_cpus:$host_logical_cpus,host_memory_bytes:$host_memory_bytes,docker_logical_cpus:$docker_cpus,docker_memory_bytes:$docker_memory_bytes,driver_uname:$driver_uname,driver_logical_cpus:$driver_logical_cpus,driver_memory_bytes:$driver_memory_bytes,evidence_filesystem_kib:$filesystem_kib,evidence_filesystem_available_kib:$filesystem_available_kib}}' \
   >"${run_dir}/run.json"
 
 if [[ "${driver_backend}" == ssh-macos ]]; then
@@ -505,6 +515,7 @@ run_qualification_driver() {
     KELDRA_INDEX_CONTENTION_MUTATION_WORKERS="${mutation_workers}" \
     KELDRA_INDEX_CONTENTION_MUTATION_BATCH_SIZE="${mutation_batch_size}" \
     KELDRA_INDEX_CONTENTION_MUTATION_QUEUE_DEPTH="${mutation_queue_depth}" \
+    KELDRA_INDEX_CONTENTION_MUTATION_RATE_OPERATIONS_PER_SECOND="${mutation_rate_operations_per_second}" \
     KELDRA_INDEX_CONTENTION_MAX_CONCURRENT_QUERY_P99_MILLISECONDS="${max_concurrent_query_p99_ms}" \
     KELDRA_INDEX_CONTENTION_MAX_PUBLICATION_VISIBILITY_P99_MILLISECONDS="${max_publication_visibility_p99_ms}" \
     KELDRA_INDEX_CONTENTION_OUTPUT="${output_path}" \
@@ -537,6 +548,7 @@ run_qualification_driver() {
     printf 'export KELDRA_INDEX_CONTENTION_MUTATION_WORKERS=%q\n' "${mutation_workers}"
     printf 'export KELDRA_INDEX_CONTENTION_MUTATION_BATCH_SIZE=%q\n' "${mutation_batch_size}"
     printf 'export KELDRA_INDEX_CONTENTION_MUTATION_QUEUE_DEPTH=%q\n' "${mutation_queue_depth}"
+    printf 'export KELDRA_INDEX_CONTENTION_MUTATION_RATE_OPERATIONS_PER_SECOND=%q\n' "${mutation_rate_operations_per_second}"
     printf 'export KELDRA_INDEX_CONTENTION_MAX_CONCURRENT_QUERY_P99_MILLISECONDS=%q\n' "${max_concurrent_query_p99_ms}"
     printf 'export KELDRA_INDEX_CONTENTION_MAX_PUBLICATION_VISIBILITY_P99_MILLISECONDS=%q\n' "${max_publication_visibility_p99_ms}"
     printf 'export KELDRA_INDEX_CONTENTION_OUTPUT=%q\n' "${remote_run_dir}/${cell}/report.json"

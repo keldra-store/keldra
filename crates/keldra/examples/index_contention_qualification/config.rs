@@ -22,6 +22,7 @@ pub struct Config {
     pub mutation_workers: usize,
     pub mutation_batch_size: usize,
     pub mutation_queue_depth: usize,
+    pub mutation_rate_operations_per_second: Option<f64>,
     pub query_rate: u64,
     pub query_max_in_flight: usize,
     pub baseline: Duration,
@@ -54,6 +55,7 @@ pub struct PublicConfig {
     pub mutation_workers: usize,
     pub mutation_batch_size: usize,
     pub mutation_queue_depth: usize,
+    pub mutation_rate_operations_per_second: Option<f64>,
     pub query_rate_per_second: u64,
     pub query_max_in_flight: usize,
     pub baseline_seconds: u64,
@@ -82,6 +84,8 @@ impl Config {
         let mutation_workers = number("MUTATION_WORKERS", 4)?;
         let mutation_batch_size = number("MUTATION_BATCH_SIZE", 32)?;
         let mutation_queue_depth = number("MUTATION_QUEUE_DEPTH", 32)?;
+        let mutation_rate_operations_per_second =
+            optional_positive("MUTATION_RATE_OPERATIONS_PER_SECOND")?;
         let query_rate = number("QUERY_RATE", 20)?;
         let query_max_in_flight = number("QUERY_MAX_IN_FLIGHT", 64)?;
         ensure!(!endpoints.is_empty(), "at least one endpoint is required");
@@ -153,6 +157,7 @@ impl Config {
             mutation_workers,
             mutation_batch_size,
             mutation_queue_depth,
+            mutation_rate_operations_per_second,
             query_rate,
             query_max_in_flight,
             baseline: seconds("BASELINE_SECONDS", 30)?,
@@ -189,6 +194,7 @@ impl Config {
             mutation_workers: self.mutation_workers,
             mutation_batch_size: self.mutation_batch_size,
             mutation_queue_depth: self.mutation_queue_depth,
+            mutation_rate_operations_per_second: self.mutation_rate_operations_per_second,
             query_rate_per_second: self.query_rate,
             query_max_in_flight: self.query_max_in_flight,
             baseline_seconds: self.baseline.as_secs(),
@@ -243,6 +249,25 @@ fn optional_bound(suffix: &str, default: f64) -> Result<Option<f64>> {
     ensure!(
         parsed.is_finite() && parsed > 0.0,
         "{key} must be positive or 'disabled'"
+    );
+    Ok(Some(parsed))
+}
+
+fn optional_positive(suffix: &str) -> Result<Option<f64>> {
+    let key = name(suffix);
+    let Some(value) = env::var_os(&key) else {
+        return Ok(None);
+    };
+    let value = value
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("{key} must be valid UTF-8"))?;
+    if value.eq_ignore_ascii_case("disabled") {
+        return Ok(None);
+    }
+    let parsed: f64 = value.parse().with_context(|| format!("invalid {key}"))?;
+    ensure!(
+        parsed.is_finite() && parsed > 0.0 && parsed <= 1_000_000.0,
+        "{key} must be in 0..=1000000 or 'disabled'"
     );
     Ok(Some(parsed))
 }
