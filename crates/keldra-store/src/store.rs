@@ -1131,6 +1131,24 @@ impl Store {
         operation().await
     }
 
+    /// Runs one internal orchestration step while holding the ordinary locks
+    /// for a complete bounded logical-path set. The lock manager deduplicates
+    /// the paths and acquires them in canonical [`ObjectPath`] order, so
+    /// callers cannot introduce lock-order inversions by request ordering.
+    pub async fn with_ordinary_object_path_locks<T, F, Fut>(
+        &self,
+        keys: &[ObjectKey],
+        operation: F,
+    ) -> T
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let paths = keys.iter().map(object_path).collect::<Vec<_>>();
+        let _guard = self.ordinary_locks.acquire(&paths).await;
+        operation().await
+    }
+
     /// Adds immutable namespaces. Existing immutable policy may only become
     /// stricter; removing a prefix would silently invalidate a durability
     /// promise made to existing callers.
@@ -1231,7 +1249,7 @@ impl Store {
         // Enabling version retention and an ordinary/program commit must have
         // one order. Once this write returns, no mutation may still commit
         // using the old unversioned replacement rule.
-        let _commit_guard = self.commit_lock.lock().await;
+        let _commit_guard = self.lock_commit("store_metadata").await;
         let _guard = self
             .bucket_options_lock
             .lock()
@@ -1333,6 +1351,8 @@ impl MetadataRuntimeMetrics {
 
 mod authz_journal;
 mod blob_references;
+mod commit_lock;
+pub(crate) use commit_lock::{CommitLockGuard, OwnedCommitLockGuard};
 pub(crate) mod definition_state;
 mod delete_version;
 mod derived_consumers;

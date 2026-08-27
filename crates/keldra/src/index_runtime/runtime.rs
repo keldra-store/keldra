@@ -31,7 +31,11 @@ use super::cpu::IndexCpuPool;
 use super::distributed_query::DistributedIndexQueryExecutor;
 use super::events::{ClusterIndexEventSources, DecisionIndexEventAuthority, IndexEventJournal};
 use super::local_query::{ClusterIndexSegmentFetcher, LocalRevisionQueryExecutor};
-use super::manager::{IndexBuilderDependencies, IndexBuilderManagerTask, IndexPublicationSlots};
+use super::manager::publication_cohort::IndexPublicationCohorts;
+use super::manager::{
+    IndexBuilderDependencies, IndexBuilderManagerTask, IndexMaintenanceWorkSlots,
+    IndexPublicationSlots,
+};
 use super::publication::{IndexArtifactCoordinator, IndexArtifactRouter};
 use super::publisher::IndexCommitPublisher;
 use super::query_budget::IndexQueryMemoryBudget;
@@ -127,10 +131,14 @@ pub(crate) async fn start(
     );
     let artifact_router =
         IndexArtifactRouter::new(local_node, coordinator, objects, cluster_peers.clone());
+    let publication_slots = IndexPublicationSlots::default();
+    let publication_cohorts =
+        IndexPublicationCohorts::new(artifact_router.clone(), journal.clone(), publication_slots);
     let publisher = IndexCommitPublisher::new(
         store.clone(),
         reader.clone(),
         artifact_router.clone(),
+        publication_cohorts,
         config,
     );
     let working_memory = IndexWorkingMemory::from_config(config)
@@ -196,7 +204,7 @@ pub(crate) async fn start(
             cpu,
             config,
             derived_progress,
-            publication_slots: IndexPublicationSlots::default(),
+            maintenance_work_slots: IndexMaintenanceWorkSlots::default(),
         },
     );
 
@@ -234,6 +242,7 @@ fn cgroup_memory_limit() -> Option<u64> {
     (parsed > 0).then_some(parsed)
 }
 
+#[cfg(target_os = "linux")]
 fn host_memory_bytes() -> Option<u64> {
     let contents = std::fs::read_to_string("/proc/meminfo").ok()?;
     let kilobytes = contents
@@ -246,8 +255,44 @@ fn host_memory_bytes() -> Option<u64> {
     kilobytes.checked_mul(1_024)
 }
 
+#[cfg(target_os = "macos")]
+fn host_memory_bytes() -> Option<u64> {
+    unsafe extern "C" {
+        fn sysctlbyname(
+            name: *const std::ffi::c_char,
+            old_value: *mut std::ffi::c_void,
+            old_length: *mut usize,
+            new_value: *mut std::ffi::c_void,
+            new_length: usize,
+        ) -> std::ffi::c_int;
+    }
+
+    let mut bytes = 0_u64;
+    let mut length = std::mem::size_of::<u64>();
+    // SAFETY: the NUL-terminated name is static, `bytes` and `length` point to
+    // writable storage of the documented sizes, and this read-only query does
+    // not retain either pointer.
+    let result = unsafe {
+        sysctlbyname(
+            c"hw.memsize".as_ptr(),
+            (&mut bytes as *mut u64).cast(),
+            &mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (result == 0 && length == std::mem::size_of::<u64>() && bytes > 0).then_some(bytes)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn host_memory_bytes() -> Option<u64> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn configured_percentage_is_applied_without_float_rounding() {
         let total = 1_000_u64;
@@ -256,5 +301,11 @@ mod tests {
             .try_into()
             .unwrap();
         assert_eq!(bytes, 170);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn host_memory_is_available_on_supported_servers() {
+        assert!(host_memory_bytes().is_some_and(|bytes| bytes > 0));
     }
 }

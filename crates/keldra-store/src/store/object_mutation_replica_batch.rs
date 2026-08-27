@@ -23,7 +23,7 @@ impl Store {
             mutation.validate()?;
         }
 
-        let _commit_guard = self.commit_lock.lock().await;
+        let _commit_guard = self.lock_commit("object_mutation_replica").await;
         let now = now_unix_millis()?;
         let mut batch = WriteBatch::default();
         let mut receipt_status = self.mutation_receipt_status()?;

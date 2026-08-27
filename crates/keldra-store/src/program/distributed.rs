@@ -251,7 +251,7 @@ impl Store {
         stage.validate()?;
         self.persist_program_path_stage(&stage).await?;
         loop {
-            let commit_guard = self.commit_lock.lock().await;
+            let commit_guard = self.lock_commit("distributed_program").await;
             self.validate_program_path_policy(&stage)?;
             let identity = stage_identity(&stage);
             let key = stage_key(&stage)?;
@@ -319,7 +319,7 @@ impl Store {
     ) -> Result<ReplicaProgramPathApplied, ProgramStoreError> {
         mutation.validate()?;
         self.persist_program_path_stage(&mutation.stage).await?;
-        let _commit_guard = self.commit_lock.lock().await;
+        let _commit_guard = self.lock_commit("distributed_program").await;
         self.validate_program_path_policy(&mutation.stage)?;
         self.apply_program_path_mutation_locked(mutation, false)
     }

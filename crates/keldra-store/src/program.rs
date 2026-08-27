@@ -1103,7 +1103,7 @@ impl Store {
             }
             verify_prepared_commit(prepared, &commit)?;
             loop {
-                let commit_guard = self.commit_lock.lock().await;
+                let commit_guard = self.lock_commit("atomic_program").await;
                 let loaded = self
                     .load_prepared_bundle(
                         commit.bundle_ref,
@@ -1169,7 +1169,7 @@ impl Store {
             .collect::<Vec<_>>();
         let _guard = self.program_locks.acquire(&paths).await;
         loop {
-            let commit_guard = self.commit_lock.lock().await;
+            let commit_guard = self.lock_commit("atomic_program").await;
             // Re-read and verify under the commit fence so GC cannot retire an
             // awaiting output or bundle between verification and publication.
             let loaded = self
@@ -1246,7 +1246,7 @@ impl Store {
             bundle_hash,
         };
         loop {
-            let _commit_guard = self.commit_lock.lock().await;
+            let _commit_guard = self.lock_commit("atomic_program").await;
             if let Some(existing) = self.read_program_json::<AtomicBatchPublicationMarker>(
                 CF_METADATA,
                 ATOMIC_BATCH_PUBLISHED_KEY,
@@ -1877,7 +1877,7 @@ impl Store {
         let hash = PreparedBundleHash(bundle_ref.hash);
 
         if let Some(allocated) = allocated_versions.into_iter().max() {
-            let _commit_guard = self.commit_lock.lock().await;
+            let _commit_guard = self.lock_commit("atomic_program").await;
             let persisted = self.version_high_watermark()?.unwrap_or(VersionId(0));
             let high = allocated.max(persisted);
             let mut batch = WriteBatch::default();

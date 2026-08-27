@@ -36,7 +36,7 @@ impl Store {
     ) -> Result<(), DerivedConsumerError> {
         validate_fence(fence)?;
         validate_active_nodes(active_nodes)?;
-        let _commit_guard = self.commit_lock.lock().await;
+        let _commit_guard = self.lock_commit("derived_membership").await;
         let source = self.local_status()?;
         let mut batch = WriteBatch::default();
         let changed = self.stage_membership(&mut batch, source, fence, active_nodes)?;
@@ -65,7 +65,7 @@ impl Store {
             return Err(DerivedConsumerError::InactiveConsumer);
         }
 
-        let _commit_guard = self.commit_lock.lock().await;
+        let _commit_guard = self.lock_commit("derived_checkpoint").await;
         let source = self.local_status()?;
         if checkpoint.source_id != source.source_id {
             return Err(DerivedConsumerError::SourceMismatch);

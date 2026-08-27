@@ -336,7 +336,7 @@ async fn schema_and_realm_mutations_use_the_same_tenant_replica_set() {
         local_node: coordinator,
         repository: stores[&coordinator].authz(),
         peers: transport,
-        coordinator_serial: Arc::new(tokio::sync::Mutex::new(())),
+        coordinator_serial: Arc::new(tokio::sync::RwLock::new(())),
     };
 
     let publication = core
@@ -415,7 +415,7 @@ async fn schema_publication_obeys_one_one_two_two_and_two_three_quorums() {
             local_node: coordinator,
             repository: stores[&coordinator].authz(),
             peers: transport,
-            coordinator_serial: Arc::new(tokio::sync::Mutex::new(())),
+            coordinator_serial: Arc::new(tokio::sync::RwLock::new(())),
         };
         let publication = core
             .repository
@@ -456,7 +456,7 @@ async fn lost_apply_response_and_digest_replay_prove_the_existing_quorum() {
         local_node: coordinator,
         repository: stores[&coordinator].authz(),
         peers: transport.clone(),
-        coordinator_serial: Arc::new(tokio::sync::Mutex::new(())),
+        coordinator_serial: Arc::new(tokio::sync::RwLock::new(())),
     };
     let request = publish_request("lost-response");
     let publication = core
@@ -508,7 +508,7 @@ async fn replay_repairs_a_publication_after_total_remote_failure() {
         local_node: coordinator,
         repository: stores[&coordinator].authz(),
         peers: transport.clone(),
-        coordinator_serial: Arc::new(tokio::sync::Mutex::new(())),
+        coordinator_serial: Arc::new(tokio::sync::RwLock::new(())),
     };
     let request = publish_request("no-false-quorum");
     let publication = core
@@ -565,7 +565,7 @@ async fn conflicting_remote_publication_is_not_counted_as_durable() {
         local_node: coordinator,
         repository: stores[&coordinator].authz(),
         peers: transport,
-        coordinator_serial: Arc::new(tokio::sync::Mutex::new(())),
+        coordinator_serial: Arc::new(tokio::sync::RwLock::new(())),
     };
     let request = publish_request("conflicting-lineage");
     let original = core
@@ -599,7 +599,7 @@ async fn exact_quorum_repairs_minority_sibling_and_multi_revision_staleness() {
         local_node: coordinator,
         repository: stores[&coordinator].authz(),
         peers: transport.clone(),
-        coordinator_serial: Arc::new(tokio::sync::Mutex::new(())),
+        coordinator_serial: Arc::new(tokio::sync::RwLock::new(())),
     };
     let published = core
         .repository
@@ -713,7 +713,7 @@ async fn stale_coordinator_is_reconciled_before_it_constructs_the_next_mutation(
         local_node: coordinator,
         repository: stores[&coordinator].authz(),
         peers: transport,
-        coordinator_serial: Arc::new(tokio::sync::Mutex::new(())),
+        coordinator_serial: Arc::new(tokio::sync::RwLock::new(())),
     };
     let published = core
         .repository
@@ -775,7 +775,7 @@ async fn stale_coordinator_is_reconciled_before_it_constructs_the_next_mutation(
 }
 
 #[tokio::test]
-async fn coordinator_gate_serializes_complete_local_sequences() {
+async fn coordinator_gate_allows_reads_and_excludes_writes() {
     let (_root, stores) = stores().await;
     let replicas = replica_set(2718);
     let coordinator = replicas.group.coordinator();
@@ -786,26 +786,163 @@ async fn coordinator_gate_serializes_complete_local_sequences() {
             stores,
             ..Default::default()
         }),
-        coordinator_serial: Arc::new(tokio::sync::Mutex::new(())),
+        coordinator_serial: Arc::new(tokio::sync::RwLock::new(())),
     };
-    let first = core.coordinator_serial.lock().await;
+    let first_reader = core.coordinator_serial.read().await;
+    let second_reader = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        core.coordinator_serial.read(),
+    )
+    .await
+    .expect("independent coordinator readers must overlap");
+
     let contender = core.clone();
-    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::channel(1);
-    let task = tokio::spawn(async move {
-        let _second = contender.coordinator_serial.lock().await;
-        entered_tx.send(()).await.unwrap();
+    let (writer_entered_tx, mut writer_entered_rx) = tokio::sync::mpsc::channel(1);
+    let writer = tokio::spawn(async move {
+        let _writer = contender.coordinator_serial.write().await;
+        writer_entered_tx.send(()).await.unwrap();
     });
     assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(20), entered_rx.recv())
-            .await
-            .is_err()
+        tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            writer_entered_rx.recv()
+        )
+        .await
+        .is_err()
     );
-    drop(first);
-    tokio::time::timeout(std::time::Duration::from_secs(1), entered_rx.recv())
+    drop(second_reader);
+    drop(first_reader);
+    tokio::time::timeout(std::time::Duration::from_secs(1), writer_entered_rx.recv())
         .await
         .unwrap()
         .unwrap();
-    task.await.unwrap();
+    writer.await.unwrap();
+}
+
+#[tokio::test]
+async fn coordinator_gate_writer_excludes_reads() {
+    let (_root, stores) = stores().await;
+    let replicas = replica_set(2719);
+    let coordinator = replicas.group.coordinator();
+    let core = AuthzDistributionCore {
+        local_node: coordinator,
+        repository: stores[&coordinator].authz(),
+        peers: Arc::new(StoreTransport {
+            stores,
+            ..Default::default()
+        }),
+        coordinator_serial: Arc::new(tokio::sync::RwLock::new(())),
+    };
+    let writer = core.coordinator_serial.write().await;
+    let contender = core.clone();
+    let (reader_entered_tx, mut reader_entered_rx) = tokio::sync::mpsc::channel(1);
+    let reader = tokio::spawn(async move {
+        let _reader = contender.coordinator_serial.read().await;
+        reader_entered_tx.send(()).await.unwrap();
+    });
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            reader_entered_rx.recv()
+        )
+        .await
+        .is_err()
+    );
+    drop(writer);
+    tokio::time::timeout(std::time::Duration::from_secs(1), reader_entered_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    reader.await.unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_fresh_reads_install_the_same_quorum_winner() {
+    let (_root, stores) = stores().await;
+    let replicas = replica_set(2720);
+    let coordinator = replicas.group.coordinator();
+    let second = replicas.group.replicas()[1];
+    let third = replicas.group.replicas()[2];
+    let core = AuthzDistributionCore {
+        local_node: coordinator,
+        repository: stores[&coordinator].authz(),
+        peers: Arc::new(StoreTransport {
+            stores: stores.clone(),
+            ..Default::default()
+        }),
+        coordinator_serial: Arc::new(tokio::sync::RwLock::new(())),
+    };
+    let published = core
+        .repository
+        .publish_schema(PublishSchemaRequest {
+            storage_tenant: tenant(),
+            schema_id: SchemaId::parse("documents").unwrap(),
+            schema: schema(),
+            expected_revision: Some(AuthzRevision::ZERO),
+        })
+        .unwrap();
+    let realm = scope();
+    let bind = core
+        .repository
+        .coordinate_bind_schema_mutation(
+            BindSchemaRequest {
+                scope: realm.clone(),
+                schema_ref: published.schema_ref,
+                expected_generation: Some(0),
+                expected_revision: Some(AuthzRevision(1)),
+            },
+            context(coordinator, "bind-concurrent-read", 1),
+        )
+        .unwrap();
+    core.replicate(&replicas, &realm, &bind).await.unwrap();
+
+    let majority = stores[&second]
+        .authz()
+        .coordinate_tuple_mutation(
+            tuple_request("majority-concurrent-read", 2, "majority"),
+            context(second, "majority-concurrent-read", 2),
+        )
+        .unwrap()
+        .mutation
+        .unwrap();
+    stores[&third]
+        .authz()
+        .apply_authz_realm_mutation_replica(&majority)
+        .unwrap();
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..2 {
+        let core = core.clone();
+        let replicas = replicas.clone();
+        let realm = realm.clone();
+        let barrier = barrier.clone();
+        tasks.spawn(async move {
+            barrier.wait().await;
+            let _serial = core.coordinator_serial.read().await;
+            core.fresh_check(
+                &replicas,
+                realm,
+                AuthzConsistency::Latest,
+                AuthorizationCheck::new(
+                    principal("alice"),
+                    ObjectRef::opaque("document", "majority").unwrap(),
+                    "view",
+                ),
+            )
+            .await
+        });
+    }
+    barrier.wait().await;
+    while let Some(result) = tasks.join_next().await {
+        let (allowed, revision) = result.unwrap().unwrap();
+        assert!(allowed);
+        assert_eq!(revision, AuthzRevision(3));
+    }
+    assert_eq!(
+        candidate(&core.repository, &realm).unwrap(),
+        candidate(&stores[&second].authz(), &realm).unwrap()
+    );
 }
 
 #[test]

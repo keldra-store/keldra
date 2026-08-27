@@ -9,7 +9,8 @@ use super::locator::PathLocatorBlockBuilder;
 use super::{
     ArtifactDescriptor, ArtifactDirectoryRead, ArtifactPackReference, ComponentKind,
     ComponentStream, DocId, DocIdRange, LiveMaskBlock, LocatorEntry, LocatorValue,
-    PathLocatorBlock, SegmentDescriptor, SegmentIdentity, read_artifact_component,
+    PathLocatorBlock, SegmentComponent, SegmentDescriptor, SegmentIdentity,
+    read_artifact_component,
 };
 
 pub const LOCATOR_COMPACTION_FAN_IN: usize = 4;
@@ -588,9 +589,125 @@ where
     D: ArtifactDirectoryRead,
     S: ComponentBatchSink,
 {
+    let prepared =
+        prepare_segment_live_mask(directory, sink, segment, routing_codec_version, ranges).await?;
+    if prepared.is_unchanged() {
+        return prepared.finish(Vec::new());
+    }
+    let packs = sink.finalize_segment(prepared.identity()).await?;
+    prepared.finish(packs)
+}
+
+/// A live-mask replacement whose component bytes have been staged but whose
+/// immutable pack receipts have not yet been attached to a segment.
+pub struct PreparedLiveMaskRewrite {
+    segment: SegmentDescriptor,
+    component_index: Option<usize>,
+    replacement: Option<PublishedStream>,
+    old_totals: super::StreamTotals,
+    cleared: u32,
+}
+
+impl PreparedLiveMaskRewrite {
+    pub fn identity(&self) -> SegmentIdentity {
+        self.segment.identity
+    }
+
+    pub fn is_unchanged(&self) -> bool {
+        self.replacement.is_none()
+    }
+
+    pub fn resident_bytes(&self) -> Result<usize, IndexError> {
+        let mut bytes = std::mem::size_of::<Self>()
+            .checked_add(
+                self.segment
+                    .packs
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<ArtifactPackReference>())
+                    .ok_or(IndexError::OffsetOverflow)?,
+            )
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    self.segment
+                        .components
+                        .capacity()
+                        .checked_mul(std::mem::size_of::<SegmentComponent>())?,
+                )
+            })
+            .ok_or(IndexError::OffsetOverflow)?;
+        for pack in &self.segment.packs {
+            bytes = bytes
+                .checked_add(pack.path.capacity())
+                .ok_or(IndexError::OffsetOverflow)?;
+        }
+        if let Some(replacement) = &self.replacement {
+            bytes = bytes
+                .checked_add(replacement.minimum_key.capacity())
+                .and_then(|bytes| bytes.checked_add(replacement.maximum_key.capacity()))
+                .ok_or(IndexError::OffsetOverflow)?;
+        }
+        Ok(bytes)
+    }
+
+    pub fn finish(
+        self,
+        packs: Vec<ArtifactPackReference>,
+    ) -> Result<SegmentDescriptor, IndexError> {
+        let Some(replacement) = self.replacement else {
+            return Ok(self.segment);
+        };
+        let component_index = self.component_index.ok_or(IndexError::InvalidFormat(
+            "prepared live-mask rewrite lost its component ordinal",
+        ))?;
+        let mut components = self.segment.components.clone();
+        components[component_index].artifact = replacement.root;
+        let encoded_bytes = replace_total(
+            self.segment.encoded_bytes,
+            self.old_totals.encoded_bytes,
+            replacement.encoded_bytes,
+        )?;
+        let logical_bytes = replace_total(
+            self.segment.logical_bytes,
+            self.old_totals.logical_bytes,
+            replacement.logical_bytes,
+        )?;
+        SegmentDescriptor::new(
+            self.segment.identity,
+            self.segment.document_count,
+            self.segment
+                .live_document_count
+                .checked_sub(self.cleared)
+                .ok_or(IndexError::InvalidFormat("live-mask count underflow"))?,
+            packs,
+            components,
+            encoded_bytes,
+            logical_bytes,
+        )
+    }
+}
+
+/// Stage a replacement live-mask stream without publishing its immutable
+/// packs. This permits one drain to cohort several segment rewrites.
+pub async fn prepare_segment_live_mask<D, S>(
+    directory: &D,
+    sink: &mut S,
+    segment: &SegmentDescriptor,
+    routing_codec_version: u16,
+    ranges: &[DocIdRange],
+) -> Result<PreparedLiveMaskRewrite, IndexError>
+where
+    D: ArtifactDirectoryRead,
+    S: ComponentBatchSink,
+{
     segment.validate()?;
     if ranges.is_empty() {
-        return Ok(segment.clone());
+        return Ok(PreparedLiveMaskRewrite {
+            segment: segment.clone(),
+            component_index: None,
+            replacement: None,
+            old_totals: super::StreamTotals::default(),
+            cleared: 0,
+        });
     }
     sink.begin_segment(segment.identity, &segment.packs)?;
     let mut previous_end = 0u32;
@@ -712,31 +829,13 @@ where
         ))?
         .finish()
         .await?;
-    let packs = sink.finalize_segment(segment.identity).await?;
-    let mut components = segment.components.clone();
-    components[component_index].artifact = replacement.root;
-    let encoded_bytes = replace_total(
-        segment.encoded_bytes,
-        old_totals.encoded_bytes,
-        replacement.encoded_bytes,
-    )?;
-    let logical_bytes = replace_total(
-        segment.logical_bytes,
-        old_totals.logical_bytes,
-        replacement.logical_bytes,
-    )?;
-    SegmentDescriptor::new(
-        segment.identity,
-        segment.document_count,
-        segment
-            .live_document_count
-            .checked_sub(cleared)
-            .ok_or(IndexError::InvalidFormat("live-mask count underflow"))?,
-        packs,
-        components,
-        encoded_bytes,
-        logical_bytes,
-    )
+    Ok(PreparedLiveMaskRewrite {
+        segment: segment.clone(),
+        component_index: Some(component_index),
+        replacement: Some(replacement),
+        old_totals,
+        cleared,
+    })
 }
 
 fn decode_doc_key(key: &[u8]) -> Result<u32, IndexError> {

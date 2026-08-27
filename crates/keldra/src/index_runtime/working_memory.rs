@@ -314,7 +314,7 @@ fn emit_state(
         .filter(|waiter| waiter.account == account)
         .fold(0_u64, |sum, waiter| sum.saturating_add(waiter.minimum));
     let borrowed = account_used.saturating_sub(account_share);
-    tracing::info!(
+    tracing::debug!(
         memory.class = account.label(),
         gauge.keldra_index_working_memory_configured_bytes = inner.hard_limit,
         gauge.keldra_index_working_memory_used_bytes = state.used,
@@ -327,7 +327,7 @@ fn emit_state(
         "index working-memory budget state"
     );
     if let WorkingMemoryAccount::Builder(kind) = account {
-        tracing::info!(
+        tracing::debug!(
             index.kind = ?kind,
             gauge.keldra_index_construction_configured_bytes = account_share,
             gauge.keldra_index_construction_leased_bytes = account_used,

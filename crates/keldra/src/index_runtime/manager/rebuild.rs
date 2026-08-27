@@ -140,7 +140,6 @@ pub(super) async fn resume_durable_rebuild(
     job: &BuilderJob,
     current: Option<CommittedIndexView>,
     maximum_frame_bytes: u64,
-    progress: BuilderProgress,
     dependencies: &IndexBuilderDependencies,
 ) -> Result<Option<RebuildWork>, Status> {
     let Some(loaded) = dependencies
@@ -200,6 +199,7 @@ pub(super) async fn resume_durable_rebuild(
         )
         .await?;
     let root_version = loaded.object_version;
+    let progress = BuilderProgress::start(job.telemetry_identity(), BuilderProgressPhase::Rebuild);
     match resume_rebuild_work(current, snapshot, loaded, maximum_frame_bytes, progress) {
         Ok(work) => Ok(Some(work)),
         Err(error) if error.code() == tonic::Code::FailedPrecondition => {
@@ -304,8 +304,11 @@ pub(super) async fn checkpoint_catch_up_root(
     let checkpoint = DurableRebuildRoot {
         candidate,
         baseline_complete: true,
-        ..loaded.root
+        ..loaded.root.clone()
     };
+    if checkpoint == loaded.root {
+        return Ok(());
+    }
     dependencies
         .publisher
         .publish_rebuild_root(
@@ -372,7 +375,7 @@ pub(super) async fn advance_rebuild(
     let mut quantum = SourceWorkQuantum::for_rebuild_turn(granted_bytes, work.maximum_frame_bytes);
     loop {
         let scan_started = Instant::now();
-        let scan_span = tracing::info_span!(
+        let scan_span = tracing::debug_span!(
             "keldra.index.bulk_scan",
             index.kind = ?job.kind,
             scan.frame_records = tracing::field::Empty,
@@ -408,7 +411,7 @@ pub(super) async fn advance_rebuild(
             },
         );
         scan_span.in_scope(|| {
-            tracing::info!(
+            tracing::debug!(
                 index.kind = ?job.kind,
                 scan.outcome = if frame.is_err() { "failed" } else { "completed" },
                 monotonic_counter.keldra_index_bulk_scan_reads_total = 1_u64,
@@ -498,7 +501,7 @@ pub(super) async fn advance_rebuild(
         if let Some(path) = last_canonical_path {
             work.last_canonical_path = Some(path);
         }
-        tracing::info!(
+        tracing::debug!(
             index.kind = ?job.kind,
             monotonic_counter.keldra_index_source_payload_bytes_total = source_payload_bytes,
             histogram.keldra_index_source_frame_payload_bytes = source_payload_bytes,
@@ -740,7 +743,7 @@ async fn project_snapshot_batch(
         })
         .fold(0_u64, u64::saturating_add);
     let started = Instant::now();
-    let span = tracing::info_span!(
+    let span = tracing::debug_span!(
         "keldra.index.projection_wave",
         index.kind = ?kind,
         projection.sources = source_count,
@@ -758,7 +761,7 @@ async fn project_snapshot_batch(
         projection.outcome = tracing::field::Empty,
     );
     span.in_scope(|| {
-        tracing::info!(
+        tracing::debug!(
             index.kind = ?kind,
             counter.keldra_index_projection_active_lanes = effective_lanes as i64,
             gauge.keldra_index_projection_configured_lanes = configured_lanes,
@@ -810,12 +813,12 @@ async fn project_snapshot_batch(
         },
     );
     span.in_scope(|| {
-        tracing::info!(
+        tracing::debug!(
             index.kind = ?kind,
             counter.keldra_index_projection_active_lanes = -(effective_lanes as i64),
             "index projection wave released"
         );
-        tracing::info!(
+        tracing::debug!(
             index.kind = ?kind,
             projection.outcome = if result.is_err() { "failed" } else { "completed" },
             monotonic_counter.keldra_index_projection_failures_total =

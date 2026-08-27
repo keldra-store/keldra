@@ -64,8 +64,9 @@ pub use model::{
     decode_component_ordinal_key,
 };
 pub use mutation::{
-    LOCATOR_COMPACTION_FAN_IN, LocatorStreamRoot, compact_locator_roots, locate_path,
-    locate_path_values, locate_paths, publish_locator_delta, rewrite_segment_live_mask,
+    LOCATOR_COMPACTION_FAN_IN, LocatorStreamRoot, PreparedLiveMaskRewrite, compact_locator_roots,
+    locate_path, locate_path_values, locate_paths, prepare_segment_live_mask,
+    publish_locator_delta, rewrite_segment_live_mask,
 };
 pub(crate) use points::POINT_BLOCK_ENTRIES;
 pub use points::{

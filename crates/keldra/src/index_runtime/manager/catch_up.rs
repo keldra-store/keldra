@@ -19,7 +19,7 @@ pub(super) struct JournalPageWork {
     pub(super) processed_records: u64,
     pub(super) processed_encoded_bytes: u64,
     pub(super) through: IndexBarrier,
-    pub(super) first_changed_at: Option<Instant>,
+    pub(super) first_changed_at: Option<BufferAge>,
     pub(super) atomic_pending: bool,
 }
 
@@ -104,11 +104,13 @@ pub(super) async fn stop_at_locator_headroom(
         .await?;
         work.must_publish = true;
         enqueue_candidate_publication(job, &mut work, admission, dependencies).await?;
-        active.started = None;
-        active.operations = 0;
-        active.quantum = SourceWorkQuantum::from_budget_limit(active.permit.bytes());
+        // The sealed candidate owns no active builder state. Release its
+        // working memory while commit admission is pending; a later turn
+        // reacquires an exact permit only after publication completes.
+        drop(active);
+    } else {
+        work.active = Some(active);
     }
-    work.active = Some(active);
     Ok((
         BuilderPhase::CatchUp(work),
         BuilderDisposition::Retry(Duration::from_millis(10)),
@@ -126,27 +128,21 @@ pub(super) const fn should_compact_before_catch_up(
         || debt::locator_headroom_requires_compaction(locator_root_count)
 }
 
-pub(super) fn record_source_page_progress(work: &mut CatchUpWork, through: &IndexBarrier) {
+pub(super) fn record_source_page_progress(
+    work: &mut CatchUpWork,
+    through: &IndexBarrier,
+    runnable: &BuilderRunnableClock,
+) {
     // Persist even zero-effect routed pages so restart cannot forget a proven
     // checkpoint and freshness does not wait on already-inspected source work.
     if work.through != *through {
         work.must_publish = true;
-        work.checkpoint_started.get_or_insert_with(Instant::now);
+        work.checkpoint_started
+            .get_or_insert_with(|| runnable.stamp());
     }
     work.through = through.clone();
     work.candidate
         .prune_finalized_atomic_batches(work.through.atomic.finalized_through());
-}
-
-pub(super) fn earliest_publication_start(
-    mutation_started: Option<Instant>,
-    checkpoint_started: Option<Instant>,
-) -> Option<Instant> {
-    match (mutation_started, checkpoint_started) {
-        (Some(left), Some(right)) => Some(left.min(right)),
-        (Some(started), None) | (None, Some(started)) => Some(started),
-        (None, None) => None,
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -161,7 +157,7 @@ pub(super) async fn process_journal_page(
     candidate: &mut CandidateCommit,
     atomic_projection: &mut Option<AtomicProjectionWork>,
     dependencies: &IndexBuilderDependencies,
-    mut deadline: Option<Instant>,
+    mut deadline: Option<BufferAge>,
     maximum_age: Duration,
 ) -> Result<JournalPageWork, Status> {
     let mut changed = false;
@@ -202,6 +198,12 @@ pub(super) async fn process_journal_page(
                         && !contains_reserved_segment(&mutation.exact_path)
                 });
                 if !has_paths {
+                    invalidation::materialize_pending_live_masks(
+                        definition,
+                        candidate,
+                        dependencies,
+                    )
+                    .await?;
                     candidate.record_atomic_batch(batch.cursor, batch.bundle_hash)?;
                     position = end;
                     processed_encoded_bytes = processed_encoded_bytes
@@ -241,9 +243,9 @@ pub(super) async fn process_journal_page(
                         "pending atomic projection differs from replayed journal event",
                     ));
                 }
-                let changed_at = Instant::now();
+                let changed_at = builder.runnable.stamp();
                 first_changed_at.get_or_insert(changed_at);
-                deadline.get_or_insert(changed_at + maximum_age);
+                deadline.get_or_insert(changed_at);
                 let advance =
                     advance_atomic_projection(definition, kind, projection, dependencies).await;
                 if let Err(error) = advance {
@@ -289,9 +291,9 @@ pub(super) async fn process_journal_page(
                 &page.changes[position..end],
             );
             if !paths.is_empty() {
-                let changed_at = Instant::now();
+                let changed_at = builder.runnable.stamp();
                 first_changed_at.get_or_insert(changed_at);
-                deadline.get_or_insert(changed_at + maximum_age);
+                deadline.get_or_insert(changed_at);
             }
             changed |= !paths.is_empty();
             for paths in paths.chunks(MAX_OBJECT_RECORD_EXPORT_RECORDS as usize) {
@@ -316,7 +318,7 @@ pub(super) async fn process_journal_page(
             .checked_add(processed_journal_encoded_bytes(&page.changes[start..end])?)
             .ok_or_else(|| Status::resource_exhausted("processed journal bytes overflow"))?;
         if locator_publication_required(candidate, builder)
-            || deadline.is_some_and(|deadline| Instant::now() >= deadline)
+            || deadline.is_some_and(|age| age.reached(&builder.runnable, maximum_age))
         {
             break;
         }
@@ -356,6 +358,7 @@ async fn start_atomic_projection(
     // the base graph. Nothing from the atomic event can attach to that graph
     // until its complete exact output is known to fit.
     flush_builder(definition, kind, builder, candidate, dependencies).await?;
+    invalidation::materialize_pending_live_masks(definition, candidate, dependencies).await?;
     let base_segments = candidate.segments.len();
     let staged = candidate.clone();
     // Atomic ingress admits at most one commit's segment-producing source
@@ -370,6 +373,7 @@ async fn start_atomic_projection(
         plan,
         builder.publication_lane,
         staging_segment_limit,
+        builder.runnable.clone(),
         dependencies,
     )?;
     Ok(AtomicProjectionWork {
@@ -393,6 +397,17 @@ async fn advance_atomic_projection(
 ) -> Result<(), Status> {
     match work.phase {
         AtomicProjectionPhase::Project => {
+            // Pending masks consume the same bounded staging permit as source
+            // projection. Drain between source pages so a long atomic batch
+            // cannot accumulate uncharged state across page-sized plans.
+            if work.next_path != 0 && work.staged.has_pending_live_mask_invalidations() {
+                invalidation::materialize_pending_live_masks(
+                    definition,
+                    &mut work.staged,
+                    dependencies,
+                )
+                .await?;
+            }
             let end = work
                 .next_path
                 .saturating_add(MAX_OBJECT_RECORD_EXPORT_RECORDS as usize)
@@ -416,6 +431,15 @@ async fn advance_atomic_projection(
                 false,
             )
             .await?;
+            // An atomic projection can span scheduler turns. Do not carry
+            // pending mask memory across the turn that will admit the next
+            // journal/source page under the same permit.
+            invalidation::materialize_pending_live_masks(
+                definition,
+                &mut work.staged,
+                dependencies,
+            )
+            .await?;
             work.source_payload_bytes = work
                 .source_payload_bytes
                 .checked_add(payload)
@@ -430,6 +454,12 @@ async fn advance_atomic_projection(
                 definition,
                 kind,
                 &mut work.builder,
+                &mut work.staged,
+                dependencies,
+            )
+            .await?;
+            invalidation::materialize_pending_live_masks(
+                definition,
                 &mut work.staged,
                 dependencies,
             )
@@ -619,16 +649,16 @@ async fn compact_atomic_staged_once(
     candidate: &mut CandidateCommit,
     dependencies: &IndexBuilderDependencies,
 ) -> Result<bool, Status> {
+    invalidation::materialize_pending_live_masks(definition, candidate, dependencies).await?;
     let segment_overflow = candidate.segments.len() > MAX_SEGMENTS_PER_COMMIT;
     if segment_overflow {
         let Some(mut selection) = debt::select(&candidate.segments, DebtLimits::new(1, u64::MAX))
         else {
             return Ok(false);
         };
-        // Reclaim exactly one segment slot, then measure the replayed atomic
-        // output again. Wider maintenance merges stay off the journal path.
+        // Reclaim one slot; wider maintenance merges stay off the journal path.
         selection.input_segments = 2;
-        let _publication_slot = dependencies.publication_slots.acquire_maintenance().await?;
+        let _maintenance_slot = dependencies.maintenance_work_slots.acquire().await?;
         compact_tier(
             definition,
             kind,
@@ -648,7 +678,7 @@ async fn compact_atomic_staged_once(
     };
     // The oldest two roots are the minimum legal prefix compaction.
     selection.input_roots = 2;
-    let _publication_slot = dependencies.publication_slots.acquire_maintenance().await?;
+    let _maintenance_slot = dependencies.maintenance_work_slots.acquire().await?;
     locator_debt::compact_oldest_prefix(
         definition,
         kind,
@@ -1082,16 +1112,19 @@ async fn project_catch_up_batch(
     }
     let cpu = dependencies.cpu.clone();
     let projection_schema = definition.schema.clone();
+    let runnable = builder.runnable.clone();
     let cpu_task = tokio::spawn(run_projection_lanes(
         cpu,
         lanes,
         senders,
         move |mut fetched: FetchedProjection| {
-            let reader = fetched
-                .payload
-                .as_mut()
-                .map(|payload| payload as &mut dyn std::io::Read);
-            project_mutation(&projection_schema, fetched.source, reader, lane_limit)
+            runnable.measure(|| {
+                let reader = fetched
+                    .payload
+                    .as_mut()
+                    .map(|payload| payload as &mut dyn std::io::Read);
+                project_mutation(&projection_schema, fetched.source, reader, lane_limit)
+            })
         },
     ));
 
@@ -1229,7 +1262,12 @@ async fn apply_incremental_mutations(
             .await
             .map_err(index_status)?
     };
-    let mut invalidations = BTreeMap::<u64, Vec<DocIdRange>>::new();
+    let pending_workspace = plan
+        .max_source_projection_bytes
+        .checked_sub(mutation_bytes)
+        .ok_or_else(|| {
+            Status::resource_exhausted("catch-up mutations leave no pending invalidation workspace")
+        })?;
     let mut accepted = Vec::with_capacity(pending.len());
     for (ordinal, mutation) in pending.into_iter().enumerate() {
         let identity = mutation_identity(&mutation);
@@ -1254,49 +1292,66 @@ async fn apply_incremental_mutations(
                 "format-v4 locator disagrees with a source mutation at the same version",
             ));
         }
-        if let LocatorValue::Live { ranges, .. } = previous {
-            for range in ranges {
-                invalidations
-                    .entry(range.segment_id)
-                    .or_default()
-                    .push(range);
+        if let LocatorValue::Live { mut ranges, .. } = previous {
+            ranges.sort_by_key(|range| (range.segment_id, range.first_doc_id.get()));
+            let retained_locator_bytes = locator_results_resident_bytes(
+                &previous_by_ordinal,
+                previous_by_ordinal.capacity(),
+            )?;
+            let incoming_range_bytes = ranges
+                .capacity()
+                .checked_mul(std::mem::size_of::<DocIdRange>())
+                .ok_or_else(|| {
+                    Status::resource_exhausted("incoming live-mask range size overflow")
+                })?;
+            let accumulation_workspace = pending_workspace
+                .checked_sub(retained_locator_bytes)
+                .and_then(|bytes| bytes.checked_sub(incoming_range_bytes))
+                .ok_or_else(|| {
+                    Status::resource_exhausted(
+                        "locator results leave no pending invalidation workspace",
+                    )
+                })?;
+            let mut start = 0;
+            while start < ranges.len() {
+                let segment_id = ranges[start].segment_id;
+                let end = ranges[start..]
+                    .iter()
+                    .position(|range| range.segment_id != segment_id)
+                    .map_or(ranges.len(), |relative| start + relative);
+                let mut peak_limit = candidate
+                    .pending_invalidation_resident_bytes()?
+                    .checked_add(accumulation_workspace)
+                    .ok_or_else(|| {
+                        Status::resource_exhausted("pending invalidation workspace overflow")
+                    })?;
+                let (_, peak_bytes) =
+                    candidate.live_mask_invalidation_peak_bytes(segment_id, &ranges[start..end])?;
+                if peak_bytes > peak_limit && candidate.has_pending_live_mask_invalidations() {
+                    invalidation::materialize_pending_live_masks(
+                        definition,
+                        candidate,
+                        dependencies,
+                    )
+                    .await?;
+                    peak_limit = candidate
+                        .pending_invalidation_resident_bytes()?
+                        .checked_add(accumulation_workspace)
+                        .ok_or_else(|| {
+                            Status::resource_exhausted("pending invalidation workspace overflow")
+                        })?;
+                }
+                candidate.record_live_mask_invalidation(
+                    segment_id,
+                    &ranges[start..end],
+                    peak_limit,
+                )?;
+                start = end;
             }
         }
         accepted.push(mutation);
     }
-
-    if !invalidations.is_empty() {
-        let routing_codec = definition
-            .schema
-            .codec_version(keldra_index::v4::ComponentKind::ROUTING_NODE)
-            .map_err(index_status)?;
-        let mut sink = dependencies.publisher.component_sink(
-            &definition.stored,
-            definition.tenant_id,
-            definition.bucket_id,
-            DerivedArtifactAdmission::PublicationProgress,
-        );
-        for (segment_id, mut ranges) in invalidations {
-            let position = candidate
-                .segments
-                .iter()
-                .position(|segment| segment.identity.segment_id == segment_id)
-                .ok_or_else(|| {
-                    Status::data_loss("format-v4 locator names a missing commit segment")
-                })?;
-            normalize_invalidation_ranges(segment_id, &mut ranges)?;
-            let replacement = rewrite_segment_live_mask(
-                &directory,
-                &mut sink,
-                &candidate.segments[position],
-                routing_codec,
-                &ranges,
-            )
-            .await
-            .map_err(index_status)?;
-            candidate.segments[position] = replacement;
-        }
-    }
+    drop(previous_by_ordinal);
 
     let mut tombstones = Vec::new();
     for mutation in accepted {
@@ -1337,6 +1392,7 @@ async fn apply_incremental_mutations(
             definition.tenant_id,
             definition.bucket_id,
             DerivedArtifactAdmission::PublicationProgress,
+            PublicationCohortClass::Incremental,
         );
         sink.begin_segment(identity, &[]).map_err(index_status)?;
         let published = publish_locator_delta(
@@ -1372,50 +1428,6 @@ async fn apply_incremental_mutations(
     Ok(())
 }
 
-fn normalize_invalidation_ranges(
-    segment_id: u64,
-    ranges: &mut Vec<DocIdRange>,
-) -> Result<(), Status> {
-    ranges.sort_by_key(|range| range.first_doc_id.get());
-    let mut write = 0usize;
-    for read in 0..ranges.len() {
-        let current = ranges[read];
-        if current.segment_id != segment_id || current.count == 0 {
-            return Err(Status::data_loss(
-                "path locator returned an invalid live DocId range",
-            ));
-        }
-        let current_end = current
-            .first_doc_id
-            .get()
-            .checked_add(current.count)
-            .ok_or_else(|| Status::data_loss("locator DocId range overflow"))?;
-        if write != 0 {
-            let previous = &mut ranges[write - 1];
-            let previous_end = previous
-                .first_doc_id
-                .get()
-                .checked_add(previous.count)
-                .ok_or_else(|| Status::data_loss("locator DocId range overflow"))?;
-            if current.first_doc_id.get() < previous_end {
-                return Err(Status::data_loss(
-                    "path locator returned overlapping live DocId ranges",
-                ));
-            }
-            if current.first_doc_id.get() == previous_end {
-                previous.count = current_end
-                    .checked_sub(previous.first_doc_id.get())
-                    .ok_or_else(|| Status::data_loss("locator DocId range underflow"))?;
-                continue;
-            }
-        }
-        ranges[write] = current;
-        write += 1;
-    }
-    ranges.truncate(write);
-    Ok(())
-}
-
 fn mutation_batch_resident_bytes(
     mutations: &[MergeMutation],
     capacity: usize,
@@ -1443,6 +1455,33 @@ fn mutation_batch_resident_bytes(
             .ok_or_else(|| Status::resource_exhausted("catch-up mutation reserve overflow"))?;
     }
     Ok(bytes)
+}
+
+fn locator_results_resident_bytes(
+    values: &[Option<LocatorValue>],
+    capacity: usize,
+) -> Result<usize, Status> {
+    values.iter().try_fold(
+        std::mem::size_of::<Vec<Option<LocatorValue>>>()
+            .checked_add(
+                capacity
+                    .checked_mul(std::mem::size_of::<Option<LocatorValue>>())
+                    .ok_or_else(|| Status::resource_exhausted("locator result size overflow"))?,
+            )
+            .ok_or_else(|| Status::resource_exhausted("locator result size overflow"))?,
+        |bytes, value| {
+            let dynamic = match value {
+                Some(LocatorValue::Live { ranges, .. }) => ranges
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<DocIdRange>())
+                    .ok_or_else(|| Status::resource_exhausted("locator result size overflow"))?,
+                Some(LocatorValue::Deleted { .. }) | None => 0,
+            };
+            bytes
+                .checked_add(dynamic)
+                .ok_or_else(|| Status::resource_exhausted("locator result size overflow"))
+        },
+    )
 }
 
 fn borrowed_path_references_resident_bytes(
@@ -1521,48 +1560,6 @@ mod tests {
         assert_eq!(batch.sources.len(), 2);
         assert_eq!(batch.resident_bytes, 20);
         assert_eq!(batch.lane_limit().unwrap(), 10);
-    }
-
-    #[test]
-    fn invalidation_ranges_merge_adjacency_without_expanding_doc_ids() {
-        let mut ranges = vec![
-            DocIdRange {
-                segment_id: 7,
-                first_doc_id: keldra_index::v4::DocId::new(8),
-                count: 2,
-            },
-            DocIdRange {
-                segment_id: 7,
-                first_doc_id: keldra_index::v4::DocId::new(2),
-                count: 3,
-            },
-            DocIdRange {
-                segment_id: 7,
-                first_doc_id: keldra_index::v4::DocId::new(5),
-                count: 3,
-            },
-        ];
-        normalize_invalidation_ranges(7, &mut ranges).unwrap();
-        assert_eq!(ranges.len(), 1);
-        assert_eq!(ranges[0].first_doc_id.get(), 2);
-        assert_eq!(ranges[0].count, 8);
-    }
-
-    #[test]
-    fn invalidation_ranges_reject_overlap_as_locator_corruption() {
-        let mut ranges = vec![
-            DocIdRange {
-                segment_id: 7,
-                first_doc_id: keldra_index::v4::DocId::new(2),
-                count: 4,
-            },
-            DocIdRange {
-                segment_id: 7,
-                first_doc_id: keldra_index::v4::DocId::new(5),
-                count: 2,
-            },
-        ];
-        assert!(normalize_invalidation_ranges(7, &mut ranges).is_err());
     }
 
     #[test]

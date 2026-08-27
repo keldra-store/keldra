@@ -79,6 +79,7 @@ pub(super) async fn compact_oldest_prefix(
         definition.tenant_id,
         definition.bucket_id,
         admission,
+        PublicationCohortClass::Maintenance,
     );
     let span = tracing::info_span!(
         "keldra.index.locator_compaction",

@@ -1788,10 +1788,10 @@ pub(crate) fn bucket_record_key(identity: BucketIdentity) -> Vec<u8> {
 
 fn lock_object_commits(
     store: &Store,
-) -> Result<tokio::sync::MutexGuard<'_, ()>, CredentialRepositoryError> {
-    match store.commit_lock.try_lock() {
+) -> Result<crate::store::CommitLockGuard<'_>, CredentialRepositoryError> {
+    match store.try_lock_commit("bootstrap_identity") {
         Ok(guard) => Ok(guard),
-        Err(_) => Ok(store.commit_lock.blocking_lock()),
+        Err(_) => Ok(store.blocking_lock_commit("bootstrap_identity")),
     }
 }
 

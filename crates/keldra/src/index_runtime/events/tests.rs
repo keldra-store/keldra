@@ -23,6 +23,7 @@ impl IndexEventAuthority for MemoryAuthority {
 #[derive(Clone, Default)]
 struct MemorySources {
     journals: Arc<Mutex<BTreeMap<NodeId, (WatchJournalStatus, Vec<LocalChange>)>>>,
+    status_reads: Arc<Mutex<Vec<NodeId>>>,
     reads: Arc<Mutex<Vec<(NodeId, u64, u64)>>>,
     raw_reads: Arc<Mutex<Vec<NodeId>>>,
 }
@@ -30,6 +31,7 @@ struct MemorySources {
 #[tonic::async_trait]
 impl IndexEventSources for MemorySources {
     async fn status(&self, source: &IndexSource) -> Result<WatchJournalStatus, IndexEventError> {
+        self.status_reads.lock().unwrap().push(source.node);
         self.journals
             .lock()
             .unwrap()
@@ -752,6 +754,68 @@ async fn later_in_progress_program_does_not_invalidate_publication() {
         .validate_publication_barrier(&barrier(captured, 2, 1))
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn publication_cohort_observes_each_source_once() {
+    let clear = AtomicProgramWatermark::new(Some(40), Some(40), 0);
+    let sources = MemorySources::default();
+    sources
+        .journals
+        .lock()
+        .unwrap()
+        .insert(NodeId(1), (status(1, 2), Vec::new()));
+    sources
+        .journals
+        .lock()
+        .unwrap()
+        .insert(NodeId(2), (status(2, 1), Vec::new()));
+    let events = journal(vec![placement(clear)], &sources);
+
+    let outcomes = events
+        .validate_publication_barriers(&[
+            barrier(clear, 2, 1),
+            barrier(clear, 3, 2),
+            barrier(clear, 1, 1),
+        ])
+        .await;
+
+    assert!(outcomes.into_iter().all(|outcome| outcome.is_ok()));
+    let mut reads = sources.status_reads.lock().unwrap().clone();
+    reads.sort();
+    assert_eq!(reads, vec![NodeId(1), NodeId(2)]);
+}
+
+#[tokio::test]
+async fn publication_cohort_rejects_a_candidate_from_an_old_source_epoch() {
+    let clear = AtomicProgramWatermark::new(Some(40), Some(40), 0);
+    let sources = MemorySources::default();
+    let mut restarted = status(1, 2);
+    restarted.source_id.source_epoch = [9; 32];
+    let restarted_source = restarted.source_id;
+    sources
+        .journals
+        .lock()
+        .unwrap()
+        .insert(NodeId(1), (restarted, Vec::new()));
+    sources
+        .journals
+        .lock()
+        .unwrap()
+        .insert(NodeId(2), (status(2, 1), Vec::new()));
+    let events = journal(vec![placement(clear)], &sources);
+    let old_epoch = barrier(clear, 2, 1);
+    let mut current_epoch = old_epoch.clone();
+    current_epoch.sources.get_mut(&NodeId(1)).unwrap().source = restarted_source;
+
+    let outcomes = events
+        .validate_publication_barriers(&[old_epoch, current_epoch])
+        .await;
+
+    assert_eq!(
+        outcomes,
+        vec![Err(IndexEventError::IncompleteSources), Ok(())]
+    );
 }
 
 #[tokio::test]

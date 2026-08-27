@@ -87,7 +87,7 @@ impl Store {
             ));
         }
         loop {
-            let commit_guard = self.commit_lock.lock().await;
+            let commit_guard = self.lock_commit("payload").await;
             if !staged.path().is_file()
                 && !self
                     .blobs

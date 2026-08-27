@@ -97,7 +97,7 @@ impl Store {
                     .collect::<Vec<_>>(),
             )
             .await;
-        let _commit_guard = self.commit_lock.lock().await;
+        let _commit_guard = self.lock_commit("distributed_publish").await;
         let source = self
             .local_watch_status()
             .map_err(|error| MutationError::Storage(error.to_string()))?;
@@ -336,7 +336,7 @@ impl Store {
                     .collect::<Vec<_>>(),
             )
             .await;
-        let _commit_guard = self.commit_lock.lock().await;
+        let _commit_guard = self.lock_commit("distributed_publish").await;
         let source = self
             .local_watch_status()
             .map_err(|error| MutationError::Storage(error.to_string()))?;

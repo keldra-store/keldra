@@ -223,10 +223,10 @@ impl Store {
             "object storage bulk preparation completed"
         );
         let mut completed = BTreeMap::<usize, Result<MutationReceipt, MutationError>>::new();
-
         loop {
             let _policy_guard = self.policy_gate.read().await;
             let lock_started = std::time::Instant::now();
+            let path_lock_started = lock_started;
             let _guards = self
                 .ordinary_locks
                 .acquire(
@@ -236,7 +236,9 @@ impl Store {
                         .collect::<Vec<_>>(),
                 )
                 .await;
-            let _commit_guard = self.commit_lock.lock().await;
+            let path_lock_wait = path_lock_started.elapsed();
+            let _commit_guard = self.lock_commit("bulk_mutation").await;
+            let commit_lock_wait = _commit_guard.wait_duration();
             let lock_duration = lock_started.elapsed();
             let mut batch = WriteBatch::default();
             let now = match now_unix_millis() {
@@ -347,7 +349,6 @@ impl Store {
                 results.insert(*index, outcome.map(|evaluated| evaluated.receipt));
             }
             let evaluate_duration = evaluate_started.elapsed();
-
             let persistence_started = std::time::Instant::now();
             let persistence = (|| {
                 if receipt_status != initial_receipt_status {
@@ -376,6 +377,10 @@ impl Store {
             let persistence_duration = persistence_started.elapsed();
             tracing::info!(
                 histogram.keldra_store_bulk_lock_duration_seconds = lock_duration.as_secs_f64(),
+                histogram.keldra_store_bulk_ordinary_path_lock_wait_duration_seconds =
+                    path_lock_wait.as_secs_f64(),
+                histogram.keldra_store_bulk_commit_lock_wait_duration_seconds =
+                    commit_lock_wait.as_secs_f64(),
                 histogram.keldra_store_bulk_evaluate_duration_seconds =
                     evaluate_duration.as_secs_f64(),
                 histogram.keldra_store_bulk_persist_duration_seconds =
@@ -655,7 +660,7 @@ impl Store {
             .ordinary_locks
             .acquire(&[object_path(prepared.key())])
             .await;
-        let _commit_guard = self.commit_lock.lock().await;
+        let _commit_guard = self.lock_commit("coordinated_object_mutation").await;
         let source = self
             .local_watch_status()
             .map_err(|error| MutationError::Storage(error.to_string()))?;
@@ -771,7 +776,7 @@ impl Store {
         let encoded_version_key =
             exact_version_key(identity, &mutation.exact_path, mutation.version.id);
         let primary_receipt_key = receipt_key(identity, &mutation.command_id);
-        let _commit_guard = self.commit_lock.lock().await;
+        let _commit_guard = self.lock_commit("object_mutation_replica").await;
         let now = now_unix_millis()?;
 
         let retained_identical_receipt = if let Some(existing) =
@@ -1398,7 +1403,7 @@ impl Store {
     /// guarantees progress even when that mutation's WriteBatch must be
     /// discarded atomically.
     pub(super) async fn prune_expired_receipts_for_capacity(&self) -> Result<bool, MutationError> {
-        let _commit_guard = self.commit_lock.lock().await;
+        let _commit_guard = self.lock_commit("receipt_pruning").await;
         let now = now_unix_millis()?;
         let mut status = self.mutation_receipt_status()?;
         let initial = status;

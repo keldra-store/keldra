@@ -9,7 +9,8 @@ pub(super) fn emit_active_buffer(
     kind: IndexKind,
     bytes: u64,
     mutations: u64,
-    oldest_age: Duration,
+    wall_age: Duration,
+    runnable_age: Duration,
 ) {
     tracing::debug!(
         index.id = index_id,
@@ -17,7 +18,8 @@ pub(super) fn emit_active_buffer(
         gauge.keldra_index_active_buffer_count = u64::from(mutations != 0),
         gauge.keldra_index_active_buffer_bytes = bytes,
         gauge.keldra_index_active_buffer_mutations = mutations,
-        gauge.keldra_index_active_buffer_oldest_age_seconds = oldest_age.as_secs_f64(),
+        gauge.keldra_index_active_buffer_wall_age_seconds = wall_age.as_secs_f64(),
+        gauge.keldra_index_active_buffer_runnable_age_seconds = runnable_age.as_secs_f64(),
         "index active mutation buffer state"
     );
 }
@@ -28,11 +30,15 @@ pub(super) fn emit_frozen_buffer(
     count: u64,
     bytes: u64,
     reason: &'static str,
+    wall_age: Duration,
+    runnable_age: Duration,
 ) {
     tracing::debug!(
         index.id = index_id,
         index.kind = ?kind,
         flush.reason = reason,
+        flush.wall_age_seconds = wall_age.as_secs_f64(),
+        flush.runnable_age_seconds = runnable_age.as_secs_f64(),
         gauge.keldra_index_frozen_buffer_count = count,
         gauge.keldra_index_frozen_buffer_bytes = bytes,
         "index frozen mutation buffer state"

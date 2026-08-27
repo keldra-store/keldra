@@ -31,7 +31,7 @@ impl Store {
             })
             .collect::<Result<Vec<_>, ReferenceDeltaError>>()?;
 
-        let _commit_guard = self.commit_lock.lock().await;
+        let _commit_guard = self.lock_commit("reference_delta").await;
         let cursor_key = reference_cursor_key(request.source);
         let cursor = self.reference_delta_cursor_by_key(&cursor_key)?;
         if request.through <= cursor {

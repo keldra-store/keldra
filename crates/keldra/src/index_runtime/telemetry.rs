@@ -81,7 +81,7 @@ pub(crate) fn emit_compaction_debt(
         maximum_segments_per_tier,
         maximum_unmerged_bytes_per_tier,
     );
-    tracing::info!(
+    tracing::debug!(
         index.kind = ?kind,
         compaction.trigger = trigger,
         gauge.keldra_index_compaction_debt_tiers = debt.tiers,
@@ -94,7 +94,7 @@ pub(crate) fn emit_compaction_debt(
     for (tier, current) in tiers {
         let over_limit = current.segments > maximum_segments_per_tier as u64
             || current.bytes > maximum_unmerged_bytes_per_tier;
-        tracing::info!(
+        tracing::debug!(
             index.kind = ?kind,
             index.tier = tier,
             compaction.trigger = trigger,
@@ -336,7 +336,7 @@ impl BuilderProgress {
         let record_rate = emission.records as f64 / emission.interval_seconds.max(0.001);
         let byte_rate = emission.bytes as f64 / emission.interval_seconds.max(0.001);
         let emit = || match self.phase {
-            BuilderProgressPhase::Rebuild => tracing::info!(
+            BuilderProgressPhase::Rebuild => tracing::debug!(
                 index.kind = ?self.identity.kind,
                 monotonic_counter.keldra_index_rebuild_records_total = emission.records,
                 monotonic_counter.keldra_index_rebuild_bytes_total = emission.bytes,
@@ -351,7 +351,7 @@ impl BuilderProgress {
                 gauge.keldra_index_rebuild_bytes_per_second = byte_rate,
                 "index rebuild progress"
             ),
-            BuilderProgressPhase::CatchUp => tracing::info!(
+            BuilderProgressPhase::CatchUp => tracing::debug!(
                 index.kind = ?self.identity.kind,
                 monotonic_counter.keldra_index_catch_up_records_total = emission.records,
                 monotonic_counter.keldra_index_catch_up_bytes_total = emission.bytes,
@@ -720,7 +720,7 @@ impl CompactionTelemetry {
         let output_rate = emission.delta.output_bytes as f64 / emission.interval_seconds.max(0.001);
         let input_rate = emission.delta.input_bytes as f64 / emission.interval_seconds.max(0.001);
         let emit = || {
-            tracing::info!(
+            tracing::debug!(
                 index.kind = ?self.identity.kind,
                 monotonic_counter.keldra_index_compaction_ranges_completed_total =
                     emission.delta.ranges_completed,
@@ -768,7 +768,7 @@ impl CompactionTelemetry {
             );
             // Keep the reason label off unrelated instruments. A tracing event
             // applies all of its attributes to every metric it contains.
-            tracing::info!(
+            tracing::debug!(
                 index.kind = ?self.identity.kind,
                 compaction.lane_limit_reason = lanes.reason,
                 gauge.keldra_index_compaction_effective_lanes = lanes.count,

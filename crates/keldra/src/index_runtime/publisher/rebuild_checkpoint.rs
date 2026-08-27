@@ -55,7 +55,12 @@ impl IndexCommitPublisher {
                     exact_path: path.clone(),
                     blob: blob.clone(),
                     expected_version,
-                    command_id: content_command(definition.index_id, &path, &blob),
+                    command_id: publish_command(
+                        definition.index_id,
+                        &path,
+                        &blob,
+                        expected_version,
+                    ),
                     definition_guard: Some(DefinitionVersionGuard {
                         kind: DefinitionKind::Index,
                         exact_path: definition_path(&definition.name)?,

@@ -276,30 +276,27 @@ mod tests {
     fn segment_locator_is_detached_before_its_segment_is_removed() {
         let identity = SegmentIdentity::new(7, 3, [4; 32], 9).unwrap();
         let selected = vec![segment(identity)];
-        let mut candidate = CandidateCommit {
-            segments: selected.clone(),
-            locator_roots: vec![LocatorRoot {
-                sequence: 1,
-                identity,
-                artifact: keldra_index::v4::ArtifactDescriptor::new(
-                    identity.index_id,
-                    0,
-                    0,
-                    keldra_index::v4::COMPONENT_HEADER_BYTES as u64,
-                    0,
-                    keldra_index::v4::ComponentKind::ROUTING_NODE,
-                    1,
-                    [8; 32],
-                )
-                .unwrap(),
-                pack_ownership: LocatorPackOwnership::Segment,
-                encoded_bytes: 1,
-                logical_bytes: 1,
-            }],
-            pending_atomic_batches: Vec::new(),
-            next_sequence: 2,
-            diagnostics: IndexBuildDiagnostics::default(),
-        };
+        let mut candidate = CandidateCommit::rebuild();
+        candidate.segments = selected.clone();
+        candidate.locator_roots = vec![LocatorRoot {
+            sequence: 1,
+            identity,
+            artifact: keldra_index::v4::ArtifactDescriptor::new(
+                identity.index_id,
+                0,
+                0,
+                keldra_index::v4::COMPONENT_HEADER_BYTES as u64,
+                0,
+                keldra_index::v4::ComponentKind::ROUTING_NODE,
+                1,
+                [8; 32],
+            )
+            .unwrap(),
+            pack_ownership: LocatorPackOwnership::Segment,
+            encoded_bytes: 1,
+            logical_bytes: 1,
+        }];
+        candidate.next_sequence = 2;
 
         detach_selected_locator_packs(&mut candidate, &selected).unwrap();
         candidate.segments.clear();

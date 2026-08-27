@@ -100,6 +100,7 @@ impl WriteBatchIteratorCf for WalOperationCounter {
 
 mod blob_lifecycle;
 mod mutations;
+mod path_lock_sets;
 mod paths;
 mod reads_and_programs;
 mod rocksdb_memory;

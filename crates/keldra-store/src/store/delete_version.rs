@@ -70,7 +70,7 @@ impl Store {
             bucket_id: BucketId(governance.bucket_id),
         };
         let _path_guard = self.ordinary_locks.acquire(&[object_path(key)]).await;
-        let _commit_guard = self.commit_lock.lock().await;
+        let _commit_guard = self.lock_commit("retained_version_delete").await;
         let head_key = identity.head_key(key.path());
         let Some(expected_head) = self.head_by_storage_key(&head_key)? else {
             return Ok(not_found());
@@ -211,7 +211,7 @@ impl Store {
         };
         let key = ObjectKey::new("typed", "delete-version", &mutation.exact_path)
             .map_err(|error| MutationError::InvalidObjectMutation(error.to_string()))?;
-        let _commit_guard = self.commit_lock.lock().await;
+        let _commit_guard = self.lock_commit("retained_version_delete").await;
         let head_key = identity.head_key(&mutation.exact_path);
         let current = self.head_by_storage_key(&head_key)?;
         let replacement_head = mutation

@@ -6,9 +6,7 @@ use keldra_store::{
 
 use crate::index_runtime::events::{AtomicProgramWatermark, IndexJournalChange, IndexSourceCursor};
 
-use super::catch_up::{
-    earliest_publication_start, exact_source, journal_source_paths, record_source_page_progress,
-};
+use super::catch_up::{exact_source, journal_source_paths, record_source_page_progress};
 use super::*;
 
 #[test]
@@ -44,29 +42,96 @@ fn journal_catch_up_never_waits_for_normal_merge_debt() {
 }
 
 #[tokio::test]
-async fn publication_slots_are_fifo_and_bounded() {
-    let slots = IndexPublicationSlots::new(1, 1);
-    let first = slots.acquire_incremental().await.unwrap();
-    let waiting = tokio::spawn({
+async fn default_publication_slots_admit_one_incremental_dispatch_in_fifo_order() {
+    let slots = IndexPublicationSlots::default();
+    let immutable_dispatch = slots.acquire_incremental().await.unwrap();
+    let current_waiter = tokio::spawn({
         let slots = slots.clone();
         async move { slots.acquire_incremental().await.unwrap() }
     });
     tokio::task::yield_now().await;
-    assert!(!waiting.is_finished());
-    drop(first);
-    let _permit = tokio::time::timeout(Duration::from_secs(1), waiting)
+    let next_immutable_waiter = tokio::spawn({
+        let slots = slots.clone();
+        async move { slots.acquire_incremental().await.unwrap() }
+    });
+    tokio::task::yield_now().await;
+    assert!(!current_waiter.is_finished());
+    assert!(!next_immutable_waiter.is_finished());
+    let maintenance = tokio::time::timeout(Duration::from_secs(1), slots.acquire_maintenance())
         .await
-        .expect("the oldest publication waiter must run after capacity is released")
+        .expect("maintenance must overlap the independent incremental writer")
         .unwrap();
+
+    drop(immutable_dispatch);
+    let current_dispatch = tokio::time::timeout(Duration::from_secs(1), current_waiter)
+        .await
+        .expect("the current stage must preserve FIFO after immutable releases")
+        .unwrap();
+    assert!(
+        !next_immutable_waiter.is_finished(),
+        "immutable and current must never overlap on the incremental writer"
+    );
+    drop(current_dispatch);
+    let _next_immutable = tokio::time::timeout(Duration::from_secs(1), next_immutable_waiter)
+        .await
+        .expect("the next immutable stage must make FIFO progress")
+        .unwrap();
+    drop(maintenance);
 }
 
 #[tokio::test]
 async fn maintenance_publication_does_not_consume_incremental_capacity() {
-    let slots = IndexPublicationSlots::new(1, 1);
+    let slots = IndexPublicationSlots::default();
     let _maintenance = slots.acquire_maintenance().await.unwrap();
     let _permit = tokio::time::timeout(Duration::from_secs(1), slots.acquire_incremental())
         .await
         .expect("incremental admission must remain independent of maintenance")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn maintenance_waits_for_its_lane_before_leasing_working_memory() {
+    let share = MIN_INDEX_KIND_MEMORY_BYTES as u64;
+    let budgets = IndexMemoryBudgets::new(share).unwrap();
+    let kinds = [
+        IndexKind::Path,
+        IndexKind::MetadataFilter,
+        IndexKind::TypedJson,
+        IndexKind::FullText,
+        IndexKind::Vector,
+        IndexKind::Hybrid,
+        IndexKind::GitSource,
+        IndexKind::Tensor,
+    ];
+    let mut occupied = Vec::new();
+    for kind in kinds.into_iter().take(7) {
+        occupied.push(budgets.for_kind(kind).acquire(share).await.unwrap());
+    }
+
+    let slots = IndexMaintenanceWorkSlots::new(1);
+    let held_lane = slots.acquire().await.unwrap();
+    let waiting = tokio::spawn({
+        let slots = slots.clone();
+        let budget = budgets.for_kind(IndexKind::TypedJson).clone();
+        async move { acquire_maintenance_memory(&slots, &budget, share, share).await }
+    });
+    tokio::task::yield_now().await;
+    assert!(!waiting.is_finished());
+
+    let last_free_share = tokio::time::timeout(
+        Duration::from_secs(1),
+        budgets.for_kind(IndexKind::Path).acquire(share),
+    )
+    .await
+    .expect("a lane waiter must not lease the last free working-memory share")
+    .unwrap();
+    drop(last_free_share);
+    drop(occupied);
+    drop(held_lane);
+    let (_slot, _permit) = tokio::time::timeout(Duration::from_secs(1), waiting)
+        .await
+        .expect("maintenance must proceed after lane and memory become available")
+        .unwrap()
         .unwrap();
 }
 
@@ -306,12 +371,13 @@ fn routed_nonmatching_progress_gets_a_publication_clock_without_an_active_buffer
     let page = journal_page(vec![journal_change(1, 2, "outside/scope.json", 12)], 13);
 
     assert!(journal_source_paths(1, 2, "records/", &page).is_empty());
-    record_source_page_progress(&mut work, &page.through);
+    let runnable = BuilderRunnableClock::default();
+    record_source_page_progress(&mut work, &page.through, &runnable);
     assert!(!work.changed);
     assert!(work.must_publish);
     assert!(work.checkpoint_started.is_some());
     assert_eq!(
-        earliest_publication_start(None, work.checkpoint_started),
+        BufferAge::earliest(None, work.checkpoint_started),
         work.checkpoint_started
     );
     assert_eq!(work.through, work.target);

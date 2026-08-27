@@ -48,7 +48,7 @@ pub(super) fn emit_source_lag(kind: IndexKind, from: &IndexBarrier, target: &Ind
             latest.next_offset.saturating_sub(cursor.next_offset)
         }))
     });
-    tracing::info!(
+    tracing::debug!(
         index.kind = ?kind,
         gauge.keldra_index_source_lag = lag,
         gauge.keldra_index_publication_fresh = u64::from(lag == 0),
@@ -58,7 +58,7 @@ pub(super) fn emit_source_lag(kind: IndexKind, from: &IndexBarrier, target: &Ind
 
 pub(super) fn emit_publication_age(kind: IndexKind, current: Option<&CommittedIndexView>) {
     let Some(current) = current else {
-        tracing::info!(
+        tracing::debug!(
             index.kind = ?kind,
             gauge.keldra_index_publication_present = 0_u64,
             gauge.keldra_index_publication_age_seconds = 0_f64,
@@ -75,7 +75,7 @@ pub(super) fn emit_publication_age(kind: IndexKind, current: Option<&CommittedIn
     let age_seconds = now_millis.saturating_sub(current.pointer.current.published_at_unix_millis)
         as f64
         / 1_000.0;
-    tracing::info!(
+    tracing::debug!(
         index.kind = ?kind,
         gauge.keldra_index_publication_present = 1_u64,
         gauge.keldra_index_publication_age_seconds = age_seconds,
