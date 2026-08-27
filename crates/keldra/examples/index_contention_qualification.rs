@@ -70,6 +70,22 @@ struct Report {
     responsiveness: ResponsivenessReport,
 }
 
+#[derive(Debug, Serialize)]
+struct TerminalFailureReport {
+    schema: &'static str,
+    started_unix_milliseconds: u128,
+    completed_unix_milliseconds: u128,
+    result: &'static str,
+    configuration: config::PublicConfig,
+    failure: TerminalFailure,
+}
+
+#[derive(Debug, Serialize)]
+struct TerminalFailure {
+    stage: &'static str,
+    error: String,
+}
+
 #[derive(Debug, Default, Serialize)]
 struct QueryPhaseReport {
     scheduling_window_seconds: f64,
@@ -198,6 +214,34 @@ struct QueryOutcome {
 async fn main() -> Result<()> {
     let config = Arc::new(Config::from_env()?);
     let started_unix_milliseconds = unix_millis()?;
+    match run_qualification(config.clone(), started_unix_milliseconds).await {
+        Ok(report) => {
+            write_report(config.output.as_deref(), &report)?;
+            ensure!(
+                report.result == "pass",
+                "contention qualification failed; inspect JSON evidence"
+            );
+            Ok(())
+        }
+        Err(error) => {
+            let report = TerminalFailureReport {
+                schema: "keldra.index-contention-terminal-failure.v1",
+                started_unix_milliseconds,
+                completed_unix_milliseconds: unix_millis()?,
+                result: "fail",
+                configuration: config.public(),
+                failure: TerminalFailure {
+                    stage: "qualification_execution",
+                    error: bounded_error(&format!("{error:#}")),
+                },
+            };
+            write_report(config.output.as_deref(), &report)?;
+            Err(error)
+        }
+    }
+}
+
+async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128) -> Result<Report> {
     let corpus_sha256 =
         data::corpus_digest(config.seed, config.stable_records, config.mutable_records);
     let setup_channels = connect_all(&config.endpoints).await?;
@@ -384,15 +428,15 @@ async fn main() -> Result<()> {
             publication_visibility_p99_within_configured_limit: publication_visibility_p99_passed,
         },
     };
-    let encoded = serde_json::to_vec_pretty(&report)?;
-    if let Some(path) = &config.output {
+    Ok(report)
+}
+
+fn write_report(path: Option<&std::path::Path>, report: &impl Serialize) -> Result<()> {
+    let encoded = serde_json::to_vec_pretty(report)?;
+    if let Some(path) = path {
         std::fs::write(path, &encoded).with_context(|| format!("write {}", path.display()))?;
     }
     println!("{}", String::from_utf8(encoded).expect("JSON is UTF-8"));
-    ensure!(
-        report.result == "pass",
-        "contention qualification failed; inspect JSON evidence"
-    );
     Ok(())
 }
 
