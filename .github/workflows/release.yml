@@ -326,15 +326,14 @@ jobs:
           generate_release_notes: true
           make_latest: true
           body: |
-            Keldra ${{ needs.release-context.outputs.tag }} stores Git
-            repositories as immutable packs, checkpoints, and ordered push
-            batches published through one exact-version current-pointer CAS.
-            Native bare repositories are disposable persistent
-            materializations, so ordinary pushes and warm reads no longer
-            rewrite or rematerialize a complete repository bundle.
+            Keldra ${{ needs.release-context.outputs.tag }} keeps public index
+            queries responsive during sustained mutation load by publishing
+            journal-backed immutable segment cohorts, coalescing live-mask
+            changes, and aligning index publication with the Store commit
+            authority.
 
-            It includes the multi-platform Keldra server image, CLI, and Rust
-            client.
+            It includes the multi-platform Keldra server image, CLI, Rust client,
+            generated API crate, and the public contention qualification client.
 
             - Image: `${{ steps.image.outputs.image }}`
             - Manifest digest: `${{ steps.image.outputs.digest }}`

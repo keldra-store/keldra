@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing 0.11 release tag to publish
+        description: Existing release tag to publish
         required: true
         type: string
       expected_commit:
@@ -31,7 +31,7 @@ concurrency:
 
 jobs:
   publish:
-    name: Resume Keldra 0.11 publication from validated image
+    name: Resume Keldra publication from validated image
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -89,7 +89,7 @@ jobs:
           )"
           required_jobs=(
             'Resolve immutable release context'
-            'Validate Keldra 0.11 release'
+            'Validate Keldra release'
             'Build release image (linux/amd64)'
             'Build release image (linux/arm64)'
           )
@@ -188,11 +188,13 @@ jobs:
           generate_release_notes: true
           make_latest: true
           body: |
-            Keldra 0.11.0 completes the public Keldra product rename. It includes
-            the `keldra` Rust crate and CLI, the multi-platform Keldra server
-            image, and the authorized HTTP plugin broker used by separately
-            deployed protocol plugins. Object, index, PersonalDB, accounting,
-            S3, Git, authorization, and cluster capabilities remain available.
+            Keldra ${{ inputs.tag }} keeps public index queries responsive during
+            sustained mutation load by publishing journal-backed immutable
+            segment cohorts, coalescing live-mask changes, and aligning index
+            publication with the Store commit authority.
+
+            It includes the multi-platform Keldra server image, CLI, Rust client,
+            generated API crate, and the public contention qualification client.
 
             - Image: `${{ steps.image.outputs.image }}`
             - Manifest digest: `${{ steps.image.outputs.digest }}`
