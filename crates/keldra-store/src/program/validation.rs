@@ -1210,9 +1210,15 @@ const fn put_intent(delete: bool) -> ProgramParticipantIntent {
 }
 
 fn nonzero_version_head(condition: &ProgramPathCondition) -> bool {
-    matches!(condition,
-        ProgramPathCondition::Head(ObservedHead::Version { version })
-            if version.parse::<u64>().is_ok_and(|value| value != 0))
+    match condition {
+        ProgramPathCondition::Head(ObservedHead::Version { version }) => {
+            version.parse::<u64>().is_ok_and(|value| value != 0)
+        }
+        ProgramPathCondition::HeadVersion { expected } => expected.id.0 != 0,
+        ProgramPathCondition::Head(ObservedHead::NeverExisted)
+        | ProgramPathCondition::RetainedVersion { .. }
+        | ProgramPathCondition::HeadAndRetainedVersion { .. } => false,
+    }
 }
 
 fn previous_matches(expected: &ObservedHead, previous: Option<&Version>) -> bool {
@@ -1476,6 +1482,28 @@ pub(super) fn conservative_atomic_source_journal_changes(
 #[cfg(test)]
 mod builtin_contract_tests {
     use super::*;
+
+    #[test]
+    fn exact_head_version_is_a_nonzero_version_head() {
+        let mut version = Version {
+            id: VersionId(1),
+            blob: Some(BlobRef {
+                hash: [1; 32],
+                length: 1,
+            }),
+            content_type: None,
+            deleted: false,
+            committed_at_unix_millis: 1,
+            protected_link_descriptor: false,
+        };
+        assert!(nonzero_version_head(&ProgramPathCondition::HeadVersion {
+            expected: version.clone(),
+        }));
+        version.id = VersionId(0);
+        assert!(!nonzero_version_head(&ProgramPathCondition::HeadVersion {
+            expected: version,
+        }));
+    }
 
     #[test]
     fn descriptor_mime_without_protected_origin_is_not_alias_provenance() {
