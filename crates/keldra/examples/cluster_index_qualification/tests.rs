@@ -125,6 +125,7 @@ fn typed_json_qualification_covers_every_type_and_capability() {
                 FieldType::Float(_) => "float",
                 FieldType::Keyword(_) => "keyword",
                 FieldType::Text(_) => "text",
+                FieldType::Date(_) => "date",
             },
         )
         .collect::<BTreeSet<_>>();
@@ -135,7 +136,9 @@ fn typed_json_qualification_covers_every_type_and_capability() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         types,
-        BTreeSet::from(["boolean", "float", "keyword", "signed", "text", "unsigned"])
+        BTreeSet::from([
+            "boolean", "date", "float", "keyword", "signed", "text", "unsigned",
+        ])
     );
     assert_eq!(
         capabilities,
