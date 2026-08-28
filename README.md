@@ -47,7 +47,7 @@ repository are required.
 ### 1. Start a development node
 
 ```sh
-export KELDRA_IMAGE=ghcr.io/keldra-store/keldra:0.13.0
+export KELDRA_IMAGE=ghcr.io/keldra-store/keldra:0.14.0
 export KELDRA_TOKEN_SIGNING_KEY_FILE="$PWD/keldra-data/token-signing-key"
 
 mkdir -p keldra-data
@@ -159,7 +159,7 @@ Zanzibar-authorized object addressed by `(tenant, bucket, path)`.
 ## Use the Rust client
 
 ```sh
-cargo add keldra@0.13.0
+cargo add keldra@0.14.0
 cargo add tokio --features macros,rt-multi-thread
 ```
 
@@ -234,7 +234,7 @@ Zanzibar-authorized independently of ordinary object traffic.
 Add the public client and canonical protocol types:
 
 ```sh
-cargo add keldra@0.13.0 personaldb-protocol@0.2.2 serde_json
+cargo add keldra@0.14.0 personaldb-protocol@0.2.2 serde_json
 ```
 
 Use the same application credential created above to create a source group and
@@ -654,7 +654,7 @@ it neither tokenizes nor stores the source JSON:
 ```rust,no_run
 use keldra::v1::index_query::Query as QueryValue;
 use keldra::v1::*;
-use keldra::{KeywordField, TypedJsonIndexBuilder};
+use keldra::{KeywordField, PredicateExpression, TypedJsonIndexBuilder};
 
 # async fn example(mut indices: keldra::v1::index_service_client::IndexServiceClient<tonic::service::interceptor::InterceptedService<tonic::transport::Channel, keldra::BearerToken>>) -> Result<(), tonic::Status> {
 let definition = TypedJsonIndexBuilder::new("objects", "active-documents")
@@ -671,11 +671,11 @@ let response = indices.query_index(QueryIndexRequest {
     index_name: "active-documents".into(),
     query: Some(IndexQuery {
         query: Some(QueryValue::TypedJson(TypedJsonIndexQuery {
-            predicates: vec![IndexPredicate {
-                field: "status".into(),
-                operator: IndexPredicateOperator::Equal as i32,
-                values_json: vec![br#""active""#.to_vec()],
-            }],
+            predicate: Some(
+                PredicateExpression::equal("status", "active")
+                    .expect("valid predicate")
+                    .into_proto(),
+            ),
             order: vec![],
             facets: vec![],
             aggregates: vec![],
@@ -714,7 +714,7 @@ bundles, establishes peer mTLS, exercises replicated and erasure-coded storage,
 queries every index type, and performs a rolling restart:
 
 ```sh
-KELDRA_IMAGE=ghcr.io/keldra-store/keldra:0.13.0 \
+KELDRA_IMAGE=ghcr.io/keldra-store/keldra:0.14.0 \
   ./scripts/qualify-three-node.sh
 ```
 

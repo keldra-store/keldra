@@ -2018,8 +2018,10 @@ connect to the new format-v4 engine.
   and an active page token remains on its retained generation.
 - A keyword longer than 32,766 bytes supports only hashed `EXACT`; ordered,
   prefix, range, and facet capabilities reject it.
-- Typed JSON's public flat predicate list is a conjunction; `IN` is its
-  same-field disjunction. Arbitrary Boolean trees and `NOT` are not public yet.
+- Public Typed JSON and Metadata Filter predicate expressions are bounded to 32
+  levels of depth and 256 total nodes. Empty Boolean operators are rejected;
+  negation is set complement over indexed live documents rather than SQL
+  three-valued logic.
 - Metadata Filter and the dedicated Full Text kind retain fixed built-in field
   schemas and analysis rather than adding a second capability declaration API.
 - SQL is not a user-visible capability in this release.

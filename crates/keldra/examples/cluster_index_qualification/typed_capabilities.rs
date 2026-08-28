@@ -363,7 +363,10 @@ fn predicate(
 
 fn predicates<const N: usize>(values: [IndexPredicate; N]) -> TypedJsonIndexQuery {
     TypedJsonIndexQuery {
-        predicates: values.into(),
+        predicate: Some(
+            IndexPredicateExpression::all(values.map(IndexPredicateExpression::leaf))
+                .expect("capability query predicate conjunction is non-empty"),
+        ),
         order: typed_json_order(),
         facets: Vec::new(),
         aggregates: Vec::new(),

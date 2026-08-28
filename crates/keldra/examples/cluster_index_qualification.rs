@@ -18,12 +18,12 @@ use keldra_storage::v1::{
     FullTextIndexSpec, GetIndexRequest, GitSourceIndexQuery, GitSourceIndexSpec, HybridIndexQuery,
     HybridIndexSpec, IndexAggregateOperation, IndexAggregateRequest, IndexDefinition,
     IndexFacetRequest, IndexField, IndexFieldCapability, IndexFieldCardinality, IndexFreshness,
-    IndexOrder, IndexOrderDirection, IndexPredicate, IndexPredicateOperator, IndexQuery,
-    IndexQueryHit, IndexSpecification, KeywordIndexField, MetadataFilterIndexQuery,
-    MetadataFilterIndexSpec, ObjectAddress, ObjectVersioning, PathIndexQuery, PathIndexSpec,
-    PutHeader, PutOperation, QueryIndexRequest, QueryIndexResponse, RebuildIndexRequest,
-    SetBucketPublicReadRequest, SignedIntegerIndexField, TensorIndexQuery, TensorIndexSpec,
-    TextAnalyzer, TextIndexField, TypedJsonIndexQuery, TypedJsonIndexSpec,
+    IndexOrder, IndexOrderDirection, IndexPredicate, IndexPredicateExpression,
+    IndexPredicateOperator, IndexQuery, IndexQueryHit, IndexSpecification, KeywordIndexField,
+    MetadataFilterIndexQuery, MetadataFilterIndexSpec, ObjectAddress, ObjectVersioning,
+    PathIndexQuery, PathIndexSpec, PutHeader, PutOperation, QueryIndexRequest, QueryIndexResponse,
+    RebuildIndexRequest, SetBucketPublicReadRequest, SignedIntegerIndexField, TensorIndexQuery,
+    TensorIndexSpec, TextAnalyzer, TextIndexField, TypedJsonIndexQuery, TypedJsonIndexSpec,
     UnsignedIntegerIndexField, VectorIndexQuery, VectorIndexSpec, VectorMetric,
 };
 use keldra_storage::{
@@ -1718,11 +1718,11 @@ fn engine_cases() -> Vec<EngineCase> {
                 physical_order: typed_json_order(),
             })),
             query: query(QueryValue::TypedJson(TypedJsonIndexQuery {
-                predicates: vec![IndexPredicate {
+                predicate: Some(IndexPredicateExpression::leaf(IndexPredicate {
                     field: "status".into(),
                     operator: IndexPredicateOperator::Equal as i32,
                     values_json: vec![br#""active""#.to_vec()],
-                }],
+                })),
                 order: typed_json_order(),
                 facets: Vec::new(),
                 aggregates: Vec::new(),
@@ -1756,11 +1756,11 @@ fn engine_cases() -> Vec<EngineCase> {
                 },
             )),
             query: query(QueryValue::MetadataFilter(MetadataFilterIndexQuery {
-                predicates: vec![IndexPredicate {
+                predicate: Some(IndexPredicateExpression::leaf(IndexPredicate {
                     field: "path".into(),
                     operator: IndexPredicateOperator::Prefix as i32,
                     values_json: vec![br#""docs/keep-""#.to_vec()],
-                }],
+                })),
             })),
             documents: vec![
                 ("docs/keep-a.json", br#"{"value":"a"}"#),

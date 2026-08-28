@@ -20,11 +20,11 @@ use keldra_storage::v1::{
     DeleteRequest, Durability, FullTextField, FullTextIndexQuery, FullTextIndexSpec,
     GitSourceIndexQuery, GitSourceIndexSpec, HeadObjectRequest, HybridIndexQuery, HybridIndexSpec,
     IndexField, IndexFieldCapability, IndexFieldCardinality, IndexPredicate,
-    IndexPredicateOperator, IndexQuery, IndexSpecification, KeywordIndexField,
-    MetadataFilterIndexQuery, MetadataFilterIndexSpec, MutationFailureCode, MutationReceipt,
-    ObjectAddress, ObjectVersioning, PathIndexQuery, PathIndexSpec, PutHeader, PutOperation,
-    QueryIndexRequest, TensorIndexQuery, TensorIndexSpec, TypedJsonIndexQuery, TypedJsonIndexSpec,
-    VectorIndexQuery, VectorIndexSpec, VectorMetric,
+    IndexPredicateExpression, IndexPredicateOperator, IndexQuery, IndexSpecification,
+    KeywordIndexField, MetadataFilterIndexQuery, MetadataFilterIndexSpec, MutationFailureCode,
+    MutationReceipt, ObjectAddress, ObjectVersioning, PathIndexQuery, PathIndexSpec, PutHeader,
+    PutOperation, QueryIndexRequest, TensorIndexQuery, TensorIndexSpec, TypedJsonIndexQuery,
+    TypedJsonIndexSpec, VectorIndexQuery, VectorIndexSpec, VectorMetric,
 };
 use keldra_storage::{
     BearerToken, RawClient, administration_client, connect_channel, exchange_client_credentials,
@@ -1285,11 +1285,11 @@ fn recovery_cases() -> Vec<RecoveryCase> {
                 },
             )),
             query: index_query(QueryValue::MetadataFilter(MetadataFilterIndexQuery {
-                predicates: vec![IndexPredicate {
+                predicate: Some(IndexPredicateExpression::leaf(IndexPredicate {
                     field: "path".into(),
                     operator: IndexPredicateOperator::Prefix as i32,
                     values_json: vec![br#""docs/""#.to_vec()],
-                }],
+                })),
             })),
             documents: ordinary_documents(),
         },
@@ -1306,11 +1306,11 @@ fn recovery_cases() -> Vec<RecoveryCase> {
                 physical_order: Vec::new(),
             })),
             query: index_query(QueryValue::TypedJson(TypedJsonIndexQuery {
-                predicates: vec![IndexPredicate {
+                predicate: Some(IndexPredicateExpression::leaf(IndexPredicate {
                     field: "state".into(),
                     operator: IndexPredicateOperator::Equal as i32,
                     values_json: vec![br#""active""#.to_vec()],
-                }],
+                })),
                 order: Vec::new(),
                 facets: Vec::new(),
                 aggregates: Vec::new(),

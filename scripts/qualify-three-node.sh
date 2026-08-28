@@ -6,7 +6,7 @@ source "${repo_root}/scripts/qualification-scale-evidence.sh"
 source "${repo_root}/scripts/qualification-three-node-phases.sh"
 compose_file="${repo_root}/tests/cluster/docker-compose.yml"
 start_node="${repo_root}/tests/cluster/start-node.sh"
-requested_image="${KELDRA_IMAGE:-keldra:0.13.0}"
+requested_image="${KELDRA_IMAGE:-keldra:0.14.0}"
 qualification_mode="${KELDRA_QUALIFICATION_MODE:-smoke}"
 index_disk_cache_bytes="${KELDRA_QUALIFICATION_INDEX_DISK_CACHE_BYTES:-1073741824}"
 index_memory_percent="${KELDRA_QUALIFICATION_INDEX_MEMORY_PERCENT:-20}"
@@ -206,9 +206,9 @@ client_version="$(
   docker run --rm --platform "${KELDRA_DOCKER_PLATFORM}" \
     "${image_id}" keldra --version
 )"
-if [[ "${server_version}" != "keldra-server 0.13.0" \
-  || "${client_version}" != "keldra 0.13.0" ]]; then
-  echo "qualification requires the exact Keldra 0.13.0 image" >&2
+if [[ "${server_version}" != "keldra-server 0.14.0" \
+  || "${client_version}" != "keldra 0.14.0" ]]; then
+  echo "qualification requires the exact Keldra 0.14.0 image" >&2
   echo "server: ${server_version}" >&2
   echo "client: ${client_version}" >&2
   exit 2

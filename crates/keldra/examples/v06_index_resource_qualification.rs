@@ -27,9 +27,9 @@ use keldra_storage::v1::index_query::Query as QueryValue;
 use keldra_storage::v1::index_service_client::IndexServiceClient;
 use keldra_storage::v1::{
     BulkOperation, BulkPutRequest, BulkWriteRequest, CreateBucketRequest, CreateIndexRequest,
-    DeleteRequest, Durability, IndexFreshness, IndexPredicate, IndexPredicateOperator, IndexQuery,
-    IndexSourceFreshness, ObjectAddress, ObjectVersioning, QueryIndexRequest, QueryIndexResponse,
-    TypedJsonIndexQuery,
+    DeleteRequest, Durability, IndexFreshness, IndexPredicate, IndexPredicateExpression,
+    IndexPredicateOperator, IndexQuery, IndexSourceFreshness, ObjectAddress, ObjectVersioning,
+    QueryIndexRequest, QueryIndexResponse, TypedJsonIndexQuery,
 };
 use keldra_storage::{
     BearerToken, BooleanField, FloatField, KeywordField, RawClient, TypedJsonIndexBuilder,
@@ -1605,11 +1605,11 @@ async fn query_partition(
             index_name: "records-by-field".into(),
             query: Some(IndexQuery {
                 query: Some(QueryValue::TypedJson(TypedJsonIndexQuery {
-                    predicates: vec![IndexPredicate {
+                    predicate: Some(IndexPredicateExpression::leaf(IndexPredicate {
                         field: "partition".into(),
                         operator: IndexPredicateOperator::Equal as i32,
                         values_json: vec![partition.to_string().into_bytes()],
-                    }],
+                    })),
                     order: Vec::new(),
                     facets: Vec::new(),
                     aggregates: Vec::new(),

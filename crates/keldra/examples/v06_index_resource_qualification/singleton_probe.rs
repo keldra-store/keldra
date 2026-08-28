@@ -9,8 +9,8 @@ use anyhow::{Context, Result, anyhow, ensure};
 use keldra_storage::v1::index_query::Query as QueryValue;
 use keldra_storage::v1::index_service_client::IndexServiceClient;
 use keldra_storage::v1::{
-    IndexPredicate, IndexPredicateOperator, IndexQuery, IndexSourceFreshness, QueryIndexRequest,
-    TypedJsonIndexQuery,
+    IndexPredicate, IndexPredicateExpression, IndexPredicateOperator, IndexQuery,
+    IndexSourceFreshness, QueryIndexRequest, TypedJsonIndexQuery,
 };
 use keldra_storage::{BearerToken, connect_channel, exchange_client_credentials};
 use serde::{Deserialize, Serialize};
@@ -107,11 +107,11 @@ pub(super) async fn run(state_path: &Path) -> Result<()> {
             index_name: INDEX_NAME.into(),
             query: Some(IndexQuery {
                 query: Some(QueryValue::TypedJson(TypedJsonIndexQuery {
-                    predicates: vec![IndexPredicate {
+                    predicate: Some(IndexPredicateExpression::leaf(IndexPredicate {
                         field: FIELD.into(),
                         operator: IndexPredicateOperator::Equal as i32,
                         values_json: vec![VALUE_JSON.to_vec()],
-                    }],
+                    })),
                     order: Vec::new(),
                     facets: Vec::new(),
                     aggregates: Vec::new(),
